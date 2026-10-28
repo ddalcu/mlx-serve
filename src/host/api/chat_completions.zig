@@ -1304,9 +1304,9 @@ fn handleNonStreamingGeneration(
             usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"audio_tokens\":{d}}}", .{frames});
             usage_details_allocated = true;
         }
-        const audio_id = speech_api.store.newId();
+        const audio_id = speech_api.Store.newId(stream.io);
         try speech_api.store.put(stream.io, audio_id, nowSecs(stream.io), content_text);
-        audio_field = try std.fmt.allocPrint(allocator, ",\"audio\":{{\"id\":\"audio_{d}\",\"data\":\"{s}\",\"expires_at\":{d},\"transcript\":{s}}}", .{ audio_id, data, nowSecs(stream.io) + speech_api.Store.TTL_SECS, escaped_text });
+        audio_field = try std.fmt.allocPrint(allocator, ",\"audio\":{{\"id\":\"{s}\",\"data\":\"{s}\",\"expires_at\":{d},\"transcript\":{s}}}", .{ &audio_id, data, nowSecs(stream.io) + speech_api.Store.TTL_SECS, escaped_text });
     }
 
     const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, usage_details_json);

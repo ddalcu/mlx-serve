@@ -22,6 +22,7 @@ pub const BAD_MODALITY = "'modalities' must be an array of \"text\" and \"audio\
 pub const BAD_FORMAT = "'audio.format' must be \"wav\" or \"pcm16\"";
 pub const STREAM_FORMAT = "streamed audio is \"pcm16\": set 'audio.format' to \"pcm16\"";
 pub const BAD_VOICE = "this model answers a chat in its own one voice: 'audio.voice' must be \"default\" (its named voices are /v1/audio/speech's)";
+pub const NO_STOP = "'stop' and 'logprobs' do not apply to a spoken reply: drop them or drop \"audio\" from 'modalities'";
 pub const TEXT_TOOLS = "this model answers a request with 'tools' in text: drop \"audio\" from 'modalities'";
 
 /// The request's audio ask. `speaks` = the model has `SpeechFacts`; a streamed reply is 16-bit PCM, as OpenAI's.
@@ -36,6 +37,8 @@ pub fn parse(root: std.json.ObjectMap, speaks: bool, stream: bool) Parse {
     }
     if (!audio) return .none;
     if (!speaks) return .{ .reject = NOT_SPOKEN };
+    if (root.get("stop")) |v| if (v != .null) return .{ .reject = NO_STOP };
+    if (root.get("logprobs")) |v| if (v != .null and !(v == .bool and !v.bool)) return .{ .reject = NO_STOP };
     var format: Format = if (stream) .pcm16 else .wav;
     if (root.get("audio")) |a| if (a == .object) {
         if (a.object.get("format")) |f| {
@@ -87,25 +90,28 @@ pub fn voicesJson(a: std.mem.Allocator) ![]u8 {
     return out.toOwnedSlice(a);
 }
 
-/// Spoken replies' transcripts under their ids (`audio_<n>`) until they expire, so a history turn that names one
+/// An audio id: `audio_` and 128 random bits as hex, so one client cannot name another's reply.
+pub const Id = [6 + 32]u8;
+
+/// Spoken replies' transcripts under their ids (`audio_<hex>`) until they expire, so a history turn that names one
 /// (`{"role": "assistant", "audio": {"id": ...}}`) replays as that text. A bounded ring: the oldest goes first.
 pub const Store = struct {
     mu: std.Io.Mutex = .init,
     entries: [CAP]Entry = @splat(.{}),
     next: usize = 0,
-    ids: std.atomic.Value(u64) = .init(0),
 
     pub const CAP = 256;
     pub const TTL_SECS = 3600;
-    const Entry = struct { id: u64 = 0, expires: i64 = 0, text: []u8 = &.{} };
+    const Entry = struct { id: Id = @splat(0), expires: i64 = 0, text: []u8 = &.{} };
     const gpa = std.heap.c_allocator;
 
-    /// A fresh id: unique for the life of the process.
-    pub fn newId(self: *Store) u64 {
-        return self.ids.fetchAdd(1, .monotonic) + 1;
+    pub fn newId(io: std.Io) Id {
+        var rnd: [16]u8 = undefined;
+        io.random(&rnd);
+        return "audio_".* ++ std.fmt.bytesToHex(rnd, .lower);
     }
 
-    pub fn put(self: *Store, io: std.Io, id: u64, now: i64, text: []const u8) !void {
+    pub fn put(self: *Store, io: std.Io, id: Id, now: i64, text: []const u8) !void {
         const copy = try gpa.dupe(u8, text);
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
@@ -115,13 +121,11 @@ pub const Store = struct {
         self.next = (self.next + 1) % CAP;
     }
 
-    /// The transcript of `audio_<n>` (caller frees); null when unknown or expired.
+    /// The transcript of the reply `name` (caller frees); null when unknown or expired.
     pub fn get(self: *Store, io: std.Io, a: std.mem.Allocator, name: []const u8, now: i64) !?[]u8 {
-        if (!std.mem.startsWith(u8, name, "audio_")) return null;
-        const id = std.fmt.parseInt(u64, name["audio_".len..], 10) catch return null;
         self.mu.lockUncancelable(io);
         defer self.mu.unlock(io);
-        for (self.entries) |e| if (e.id == id and id != 0 and e.expires > now) return try a.dupe(u8, e.text);
+        for (self.entries) |e| if (e.expires > now and std.mem.eql(u8, &e.id, name)) return try a.dupe(u8, e.text);
         return null;
     }
 };
@@ -175,6 +179,8 @@ test "speech ask: audio in modalities asks for speech; the format defaults per t
     // A chat reply speaks in the model's one voice (the card's recipe names none): another voice is refused, not ignored.
     try testing.expectEqualStrings(BAD_VOICE, (try parseJson("{\"modalities\":[\"audio\"],\"audio\":{\"voice\":\"alloy\"}}", true, false)).reject);
     try testing.expectEqualStrings(BAD_VOICE, (try parseJson("{\"modalities\":[\"audio\"],\"audio\":{\"voice\":\"british-english-male\"}}", true, false)).reject);
+    try testing.expectEqualStrings(NO_STOP, (try parseJson("{\"modalities\":[\"audio\"],\"stop\":[\"x\"]}", true, false)).reject);
+    try testing.expectEqualStrings(NO_STOP, (try parseJson("{\"modalities\":[\"audio\"],\"logprobs\":true}", true, true)).reject);
     try testing.expectEqualStrings(NOT_SPOKEN, (try parseJson("{\"modalities\":[\"audio\"]}", false, false)).reject);
     try testing.expectEqualStrings(BAD_MODALITY, (try parseJson("{\"modalities\":[\"video\"]}", true, false)).reject);
     try testing.expectEqualStrings(BAD_MODALITY, (try parseJson("{\"modalities\":\"audio\"}", true, false)).reject);
@@ -200,16 +206,16 @@ test "speech voices: <language>-<gender> ids name the card's TTS languages" {
 test "speech store: a reply's transcript is found by its id until it expires; the ring drops the oldest" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var st: Store = .{};
-    const id = st.newId();
+    const id = Store.newId(io);
     try st.put(io, id, 100, "Paris.");
-    var buf: [32]u8 = undefined;
-    const name = try std.fmt.bufPrint(&buf, "audio_{d}", .{id});
+    const name: []const u8 = &id;
+    try testing.expect(!std.mem.eql(u8, name, &Store.newId(io)));
     const got = (try st.get(io, testing.allocator, name, 200)).?;
     defer testing.allocator.free(got);
     try testing.expectEqualStrings("Paris.", got);
     try testing.expect(try st.get(io, testing.allocator, name, 100 + Store.TTL_SECS) == null);
-    try testing.expect(try st.get(io, testing.allocator, "audio_x", 200) == null);
-    for (0..Store.CAP) |_| try st.put(io, st.newId(), 100, "later");
+    try testing.expect(try st.get(io, testing.allocator, "audio_1", 200) == null);
+    for (0..Store.CAP) |_| try st.put(io, Store.newId(io), 100, "later");
     try testing.expect(try st.get(io, testing.allocator, name, 200) == null);
     for (&st.entries) |*e| Store.gpa.free(e.text);
 }

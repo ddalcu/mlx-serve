@@ -46,7 +46,7 @@ pub fn handle(
     const f = lm.config.?.speech().?;
     const id = io_util.nowMs(stream.io);
     // The id a later history turn names this reply by (`speech.store`).
-    const audio_id = speech_api.store.newId();
+    const audio_id = speech_api.Store.newId(stream.io);
     const created = io_util.nowSecs(stream.io);
     const running = try mlx_engine.Running.submit(http_server.launch().global_scheduler.?, .{
         .model = lm,
@@ -172,20 +172,20 @@ pub fn handle(
 }
 
 /// The transcript past `sent` bytes, held back while its tail is an incomplete UTF-8 sequence (`final` sends all).
-fn sendTranscript(a: std.mem.Allocator, stream: *Conn, id: i64, audio_id: u64, created: i64, model: []const u8, text: []const u8, sent: usize, final: bool) !usize {
+fn sendTranscript(a: std.mem.Allocator, stream: *Conn, id: i64, audio_id: speech_api.Id, created: i64, model: []const u8, text: []const u8, sent: usize, final: bool) !usize {
     if (text.len == 0) return sent;
     const end = if (final) text.len else text.len - format.utf8TrailingIncomplete(text);
     if (end <= sent) return sent;
     const esc = try format.jsonEscape(a, text[sent..end]);
     defer a.free(esc);
-    const delta = try std.fmt.allocPrint(a, "{{\"audio\":{{\"id\":\"audio_{d}\",\"transcript\":{s}}}}}", .{ audio_id, esc });
+    const delta = try std.fmt.allocPrint(a, "{{\"audio\":{{\"id\":\"{s}\",\"transcript\":{s}}}}}", .{ &audio_id, esc });
     defer a.free(delta);
     try chunk(a, stream, id, created, model, delta);
     return end;
 }
 
 /// The samples the codec made final past `sent`, as one base64 16-bit PCM delta.
-fn sendAudio(a: std.mem.Allocator, stream: *Conn, s: anytype, id: i64, audio_id: u64, created: i64, model: []const u8, sent: usize) !usize {
+fn sendAudio(a: std.mem.Allocator, stream: *Conn, s: anytype, id: i64, audio_id: speech_api.Id, created: i64, model: []const u8, sent: usize) !usize {
     s.out_mu.lockUncancelable(s.io);
     const fresh = a.dupe(f32, s.audio_samples.items[@min(sent, s.audio_samples.items.len)..]) catch |e| {
         s.out_mu.unlock(s.io);
@@ -196,7 +196,7 @@ fn sendAudio(a: std.mem.Allocator, stream: *Conn, s: anytype, id: i64, audio_id:
     if (fresh.len == 0) return sent;
     const data = try speech_api.encode(a, fresh, 0, .pcm16);
     defer a.free(data);
-    const delta = try std.fmt.allocPrint(a, "{{\"audio\":{{\"id\":\"audio_{d}\",\"data\":\"{s}\",\"expires_at\":{d}}}}}", .{ audio_id, data, created + speech_api.Store.TTL_SECS });
+    const delta = try std.fmt.allocPrint(a, "{{\"audio\":{{\"id\":\"{s}\",\"data\":\"{s}\",\"expires_at\":{d}}}}}", .{ &audio_id, data, created + speech_api.Store.TTL_SECS });
     defer a.free(delta);
     try chunk(a, stream, id, created, model, delta);
     return sent + fresh.len;

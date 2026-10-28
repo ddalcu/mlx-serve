@@ -109,7 +109,7 @@ if speaks:
         st, r = chat([{"role": "user", "content": [said(wav)]}, {"role": "assistant", "audio": {"id": a["id"]}},
                       {"role": "user", "content": "Repeat the city you named, one word."}])
         ok("[8] a history turn names its audio id", st == 200 and "cambridge" in r["choices"][0]["message"]["content"].lower(), r)
-    st, r = chat([{"role": "assistant", "audio": {"id": "audio_999999999"}}, {"role": "user", "content": "hi"}])
+    st, r = chat([{"role": "assistant", "audio": {"id": "audio_00000000000000000000000000000000"}}, {"role": "user", "content": "hi"}])
     ok("[8] an unknown audio id is a named 400", st == 400 and b"audio.id" in (r if isinstance(r, bytes) else json.dumps(r).encode()), r)
 
     req = urllib.request.Request(base + "/v1/chat/completions", json.dumps({
