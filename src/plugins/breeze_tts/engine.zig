@@ -1838,7 +1838,8 @@ test "frameEmbed sums table rows" {
 test "live synthesize (MLX_SERVE_BREEZE_MODEL)" {
     const dir = std.mem.span(std.c.getenv("MLX_SERVE_BREEZE_MODEL") orelse return error.SkipZigTest);
     const alloc = std.testing.allocator;
-    var engine = try Engine.load(std.Io.Threaded.global_single_threaded.io(), alloc, dir);
+    // Standalone gated test: no host, so this test owns its stream.
+    var engine = try Engine.load(std.Io.Threaded.global_single_threaded.io(), alloc, mlx.mlx_default_gpu_stream_new(), dir);
     defer engine.deinit();
     const synth = try engine.synthesize(alloc, .{ .text = "Hello world, this is Breeze speaking.", .voice = "S0", .seed = 1 });
     try std.testing.expect(synth.pcm.len > 0);

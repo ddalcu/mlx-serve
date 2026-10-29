@@ -1559,3 +1559,81 @@ pub fn loadMimiEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer
     for (e.ac_cbs, 0..) |*cb, i| cb.* = try recomputeCodebookEncode(&w, allocator, s, "encoder.quantizer.acoustic_residual_vector_quantizer.layers.{d}.codebook", .{i});
     return e;
 }
+
+fn readAbsAlloc(io: std.Io, alloc: std.mem.Allocator, path: []const u8, limit: usize) !?[]u8 {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [8192]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    return try rs.interface.allocRemaining(alloc, .limited(limit));
+}
+
+
+test "mimi encoder parity vs oracle (MLX_SERVE_MIMI_ENCODE)" {
+    log.enableStderr();
+    const tok_dir = std.mem.span(std.c.getenv("MLX_SERVE_MIMI_ENCODE") orelse return error.SkipZigTest);
+    const wav_path = std.mem.span(std.c.getenv("MLX_SERVE_MIMI_WAV") orelse return error.SkipZigTest);
+    const oracle_path = std.mem.span(std.c.getenv("MLX_SERVE_MIMI_ORACLE") orelse return error.SkipZigTest);
+
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = if (std.c.getenv("BREEZE_ENC_CPU") != null) mlx.mlx_default_cpu_stream_new() else mlx.mlx_default_gpu_stream_new();
+
+    // Load wav → mono f32 at 24 kHz.
+    const wav_bytes = (try readAbsAlloc(io, alloc, wav_path, 1 << 30)).?;
+    defer alloc.free(wav_bytes);
+    const d = try wav_mod.decode(alloc, wav_bytes);
+    defer alloc.free(d.pcm);
+    std.debug.assert(d.channels == 1 or d.channels == 2);
+
+    var enc = try loadMimiEncoder(io, alloc, s, tok_dir);
+    defer enc.deinit();
+    std.debug.print("mimi-start T={d}\n", .{d.pcm.len});
+    const frames = enc.encodeSamples(d.pcm) catch |e| { std.debug.print("encodeSamples ERR {s}\n", .{@errorName(e)}); return e; };
+    defer {
+        for (frames) |f| alloc.free(f);
+        alloc.free(frames);
+    }
+    std.debug.print("mimi: {d} frames\n", .{frames.len});
+
+    // Load oracle codes via a raw-bytes read.
+    const oracle = (try readAbsAlloc(io, alloc, oracle_path, 1 << 20)).?;
+    defer alloc.free(oracle);
+    const n_frames = oracle.len / (16 * 2);
+    try std.testing.expectEqual(n_frames, frames.len);
+    // Frames t>=1 must be byte-exact; frame 0 rides the left-pad edge where
+    // torch/MLX accumulation order can flip near-tie codebook picks (≤ 16 cells).
+    var mism: usize = 0;
+    var first_mm: usize = 0;
+    var mism_t0: usize = 0;
+    for (frames, 0..) |row, t| {
+        for (0..16) |q| {
+            const ov = @as(u16, oracle[t * 32 + q * 2]) | (@as(u16, oracle[t * 32 + q * 2 + 1]) << 8);
+            if (ov != row[q]) {
+                if (mism == 0) first_mm = t * 16 + q;
+                if (t == 0) mism_t0 += 1 else mism += 1;
+            }
+        }
+    }
+    std.debug.print("mimi parity: t>0 {d}/{d} mismatched (first at {d}); t0 {d}/16\n", .{ mism, (frames.len - 1) * 16, first_mm, mism_t0 });
+    try std.testing.expectEqual(@as(usize, 0), mism);
+    try std.testing.expectEqual(@as(u32, 1517), frames[0][0]);
+    // Little-endian raw dump for external diffing.
+    if (std.c.getenv("MLX_SERVE_MIMI_DUMP") != null) {
+        const buf = try alloc.alloc(u8, frames.len * 16 * 2);
+        defer alloc.free(buf);
+        for (frames, 0..) |row, t| for (0..16) |q| {
+            const v: u16 = @intCast(row[q]);
+            buf[t * 32 + q * 2] = @truncate(v);
+            buf[t * 32 + q * 2 + 1] = @truncate(v >> 8);
+        };
+        const p = std.mem.span(std.c.getenv("MLX_SERVE_MIMI_DUMP") orelse unreachable);
+        const f = try std.Io.Dir.createFileAbsolute(io, p, .{});
+        defer f.close(io);
+        var wb: [8192]u8 = undefined;
+        var fw = f.writer(io, &wb);
+        try fw.interface.writeAll(buf);
+        try fw.interface.flush();
+    }
+    try std.testing.expectEqual(@as(usize, 0), mism);
+}
