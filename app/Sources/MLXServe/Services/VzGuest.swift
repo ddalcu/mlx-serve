@@ -205,7 +205,7 @@ final class VzGuest {
 
     /// How the host talks to the guest.
     ///
-    /// `.vsock` is the real transport: `vz-agent` (`src/vz_agent.zig`) listens
+    /// `.vsock` is the real transport: `vz-agent` (`src/host/sandbox/vz_agent.zig`) listens
     /// on `AF_VSOCK`, one connection per process, so exit codes are real, stdout
     /// and stderr stay separated, and MCP servers get their own connections. It
     /// requires a kernel with `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS`

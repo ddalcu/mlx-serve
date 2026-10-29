@@ -1,0 +1,105 @@
+# Globals a plugin unit (-Dunits) may hold its own copy of: scripts/unit_globals.py. `~` starts a pattern.
+# A global the host sets or reads is never listed here: it is Shared (src/sdk/util/shared.zig).
+
+# the standard library, the compiler, linker temporaries
+~^(std|debug|heap|Progress|Io|c|mh_|ltmp|start|Thread|posix|fmt|os|process|crypto|hash|unicode|math|sort|mem|time|json|array_list|builtin|testing|meta|compiler_rt|Target|zig|MergedGlobals|jmptab|log)(\.|_|$|\d)
+
+# anonymous constants
+~^(__anon|__unnamed|\.str|l_)
+
+# env caches (each unit reads the same environment)
+~^env\.|_env$|\.Env\.on$
+
+# kernel, pipeline and config caches, calibration (per process, rebuilt on first use)
+~(kernel|_kern\b|metallib|pipeline|_cfgs?$|_cfg_keys?$|_keys?$|cfg\d?$|cfg_next$|_next$|plans?$|tables?$|tpls$|header$|prepared$|shapes$|tiled$|memo_\w+$|canaries$|_ok$|declined$|served(_vec)?$|launchable$|threads$|armed(_next)?$|banked$|placeholder$|max_rows$|fused_row_groups$|scalar_tick$|packed_scales$|one_arr$|half_dq$|no_bias$|eps(_val)?$|mma_\w+$|_rows$|_arch(_buf|_read)?$|enabled\.Env)
+
+# one-time log flags and counters a unit keeps for its own lines
+~(engaged|_logged|logged_|\.logged$|_warned|warned|_once$|once_|\.Once$|announced$|_said$|tried$|_hits$|_calls$|launches$|_dispatches$|_graphs$|_seeds$|_appends$|_allocs$|_grows$|_read$|_used(_\w+)?$|unmaps$|syncs$)
+
+# test and diagnostic overrides (never set in a server)
+~(_override$|override$|_test_force$|disabled_for_test$|standin|qwen4_trace|Qwen4AttnProf|_prof_ns$|dsv4_trace|trace_\w+$|dtype_trace_seen$|_build_failed$|_state$|_obj$|decline_bits$|dump_\w+$)
+
+# A Shared global's pointer to the host's copy (its storage is never in a unit).
+~^sdk\.util\.shared\.Shared\(.*\)\.cached$
+
+# Named: device probes, load-time counters each unit logs itself, test-only state.
+engines.mlx.diag.profile.dispatch_probe_cached
+engines.mlx.kv.cache.KVCache.kv_cap_buf_grows
+sdk.weights.load.narrow_1d_cached
+sdk.weights.load.narrowed_1d
+engines.mlx.ssm.checkpoint.cadence_conv_eval_count
+sdk.blocks.conv.depthwise.compact_conv_state_copy_count
+sdk.util.system.gpu_cores
+mlx.device.device_gen_cache
+mlx.device.nax_avail_cache
+mlx.ffi.cuda_cache
+mlx.ffi.cuda_integrated_cache
+mlx.ffi.limited_unified_memory
+mlx.ffi.no_gpu_backend_cache
+mlx.ffi.op_count
+plugins.deepseek_v4.deepseek_v4.dec_chain_cfg_cache
+plugins.deepseek_v4.deepseek_v4.emit_cfg_cache
+plugins.glm5_next.glm5_next.hc_pre_probed
+plugins.glm5_next.glm5_next.hc_pre_tpg
+plugins.glm5_next.stream.fusion.gate_up_route
+plugins.glm5_next.stream.fusion.join
+plugins.glm5_next.stream.fusion.kda_in
+plugins.glm5_next.stream.fusion.kda_route
+plugins.glm5_next.stream.fusion.pair
+plugins.glm5_next.stream.fusion.pred
+plugins.glm5_next.stream.kda_percore.prompt
+plugins.glm5_next.stream.kda_prologue.prompt
+plugins.ltx.diffvae_forward.tile_budget_cached
+plugins.minimax_h3.glue.enabled_cache
+sdk.blocks.moe.moe_affine4.env_enabled
+sdk.blocks.moe.moe_affine4.views_enabled
+plugins.qwen4_exp.ple_gpu.dispatches
+plugins.qwen4_exp.qsa.gather.qsa_nax_os_cached
+plugins.qwen4_exp.qsa.pooled.qsa_pool_rope_tpl_count
+plugins.qwen4_exp.qsa_decode.cfgs
+plugins.qwen4_exp.qsa_decode.env_enabled
+plugins.qwen4_exp.qsa_decode_cuda.env_enabled
+plugins.qwen4_exp.qsa_mask.env_enabled
+plugins.qwen_image.qwen_image.band_budget_bytes
+sdk.ane.offload.chip_brand_buf
+sdk.ane.offload.chip_brand_len
+sdk.blocks.attention.attn256.fused256_last_dispatch_count
+sdk.blocks.attention.decode_attn_quant.attn_dq_requant_cached
+sdk.blocks.attention.lane_attn.chain_cache
+sdk.blocks.attention.sdpa.nax_sdpa_avail_cache
+sdk.blocks.dit.w8a8.signs_cache
+sdk.blocks.gdn.decode.k1_cache
+sdk.blocks.gdn.decode.k1f_cache
+sdk.blocks.gdn.decode.k1p_cache
+sdk.blocks.gdn.decode.k1s_cache
+sdk.blocks.gdn.decode.k1tr_cache
+sdk.blocks.gdn.decode.k2_cache
+sdk.blocks.hc.hc_decode2.env_enabled
+sdk.blocks.linear.verify_qmm.vqmm_scalar_cache
+sdk.blocks.linear.verify_qmm.vqmm_scalar_count
+sdk.blocks.linear.verify_qmm_nax.vqmm_nax_avail_cache
+sdk.blocks.linear.verify_qmm_nax.vqmm_tile_cache
+sdk.blocks.moe.gather_qmv.gqmv_cfg_cache
+engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.2
+engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.3
+engines.mlx.methods.moe.moeMLP2WithRouter.Once.logged.4
+plugins.qwen4_exp.trunk.moe.moeMLP2WithRouter.Once.logged.2
+plugins.qwen4_exp.trunk.moe.moeMLP2WithRouter.Once.logged.3
+plugins.qwen4_exp.trunk.moe.moeMLP2WithRouter.Once.logged.4
+sdk.blocks.moe.moe_cuda.env_enabled
+sdk.blocks.moe.moe_prefill_cuda.env_enabled
+sdk.blocks.qmm.lane_qmm.mdims_cache
+sdk.blocks.qmm.qmm_int8.cfg_cache
+sdk.blocks.qmm.qmv2.cfg_cache
+sdk.blocks.qmm.qmv2.rows_cfg_cache
+sdk.blocks.qmm.qmv_cuda.enabled_cache
+sdk.blocks.qmm.rowqmv.cfg_cache
+
+# the embedded engines open on the inference thread (engine unit, `Served.open`); the host only probes them
+~^engines\.ane\.(dflash\.debug_(alloc|outs)|lm\.build_mu)$
+# a cached sysctl read
+host.registry.memory_ceiling.wired_limit_bytes_cached
+# kernel caches named apart from the patterns above (each unit builds its own once)
+sdk.spec.mtp.mtp.top32_final_cached
+sdk.spec.mtp.mtp.top32_partial_cached
+sdk.blocks.linear.verify_projection.verify_wide_configs

@@ -1,0 +1,93 @@
+{
+ "source": "typical-receipt-20260928-184119.comparison.json (stats and acceptance only)",
+ "stats": {
+  "speculative_depth": 7,
+  "cycles": 114,
+  "verify_calls": 114,
+  "verify_chunks": [
+   8
+  ],
+  "drafted_tokens": 505,
+  "accepted_drafts": 481,
+  "rejected_drafts": 24,
+  "correction_tokens": 24,
+  "bonus_tokens": 90,
+  "generated_tokens": 595,
+  "drafted_by_depth": [
+   114,
+   111,
+   97,
+   91,
+   84,
+   4,
+   4
+  ],
+  "accepted_by_depth": [
+   113,
+   102,
+   93,
+   86,
+   80,
+   4,
+   3
+  ],
+  "accept_rate": 0.9524752475247524,
+  "tokens_per_cycle": 5.219298245614035,
+  "accept_rate_by_depth": [
+   0.9912280701754386,
+   0.918918918918919,
+   0.9587628865979382,
+   0.945054945054945,
+   0.9523809523809523,
+   1.0,
+   0.75
+  ]
+ },
+ "acceptance": {
+  "cycles": 114,
+  "depths": [
+   {
+    "depth": 1,
+    "mechanism": "native",
+    "reached": 114,
+    "accepted": 113
+   },
+   {
+    "depth": 2,
+    "mechanism": "native",
+    "reached": 111,
+    "accepted": 102
+   },
+   {
+    "depth": 3,
+    "mechanism": "native",
+    "reached": 97,
+    "accepted": 93
+   },
+   {
+    "depth": 4,
+    "mechanism": "native",
+    "reached": 91,
+    "accepted": 86
+   },
+   {
+    "depth": 5,
+    "mechanism": "native",
+    "reached": 84,
+    "accepted": 80
+   },
+   {
+    "depth": 6,
+    "mechanism": "lookup",
+    "reached": 4,
+    "accepted": 4
+   },
+   {
+    "depth": 7,
+    "mechanism": "lookup",
+    "reached": 4,
+    "accepted": 3
+   }
+  ]
+ }
+}

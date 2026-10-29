@@ -1,26 +1,9 @@
 #!/bin/bash
-# Concurrent cancellation test (Phase A7).
+# test_concurrent_cancellation.sh — N cycles of "start a long generation, kill the client mid-stream" leak no slot:
+# after each batch /health answers and a final non-cancelled request completes (leaked slots jam the queue), and the
+# `[scheduler]` lines are counted to catch slots that accept submits but never complete.
 #
-# Hammers the server with N cycles of "start a long generation, kill the
-# client mid-stream" and asserts that no slot leaks. The scheduler's slot
-# accounting (queue.in_flight, decoding.items.len) must drop back to 0 once
-# the conn thread tears down. A leak would cause /health to eventually
-# refuse work or, more often, accumulate slot allocations until the server
-# OOMs under load.
-#
-# How we detect a leak: after each batch of cancelled requests we spin until
-# /health responds, then submit a final non-cancelled request to confirm the
-# server can still service work. If the queue is jammed by leaked slots the
-# final request times out. We also log the count of `[scheduler]` lines in
-# the server log to catch silently-stuck slots that accept submits but never
-# complete.
-#
-# Requires:
-#   - A built mlx-serve binary
-#   - A model directory (see PLD_TEST_MODEL fallback chain).
-#
-# Usage:
-#   CANCEL_TEST_MODEL=/path/to/model ./tests/test_concurrent_cancellation.sh [port] [cycles]
+#   CANCEL_TEST_MODEL=<dir> ./tests/test_concurrent_cancellation.sh [port] [cycles]   # PLD_TEST_MODEL fallback chain
 
 set -e
 

@@ -252,6 +252,8 @@ private struct RecommendedModelTable: View {
                    picks: RecommendedModelPick.gemmaCatalog),
             Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
                    picks: RecommendedModelPick.qwenCatalog),
+            Family(id: "liquid", title: "Liquid LFM3", systemImage: "waveform.and.person.filled", tint: .purple,
+                   picks: RecommendedModelPick.liquidCatalog),
             Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
                    picks: RecommendedModelPick.largestCatalog),
         ]
@@ -413,7 +415,7 @@ private struct RecommendedModelTableRow: View {
     /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
     private var usableMedia: (model: LocalModel, modality: MediaModality)? {
         let path = pick.ggufFilename != nil ? ggufFilePath : downloads.existingModelDir(for: pick.repoId)
-        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels)
+        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels, rows: appState.server.allModels)
     }
 
     var body: some View {
@@ -2038,7 +2040,9 @@ private struct LocalModelRow: View {
         let socket = model.quantFile == nil
             ? DrafterGems.badge(override, modelDir: model.path, hasMtpHead: model.hasMtpHead, options: appState.serverOptions)
             : SocketBadge(stone: nil, skull: false)
-        settingBadges = ModelOverrideBadges.badges(override, modelType: model.modelType, socket: socket)
+        settingBadges = ModelOverrideBadges.badges(override, modelType: model.modelType,
+                                                   engines: ModelSettingsApply.row(for: model.path, in: appState.server.allModels)?.engines,
+                                                   socket: socket)
     }
 
     private func revealInFinder() {
@@ -2178,7 +2182,7 @@ private struct LocalModelRow: View {
                     }
                 } else if isDecisionModelType(model.modelType) {
                     UseDecisionModelButton(path: model.path, name: model.name)
-                } else if let modality = MediaModality(modelType: model.modelType) {
+                } else if let modality = MediaModality.of(modelType: model.modelType, path: model.path, rows: appState.server.allModels) {
                     // A media checkpoint is a real, loadable, servable model —
                     // it just is not a CHAT model, and until now that meant the
                     // only verb the browser offered for it was Delete. This

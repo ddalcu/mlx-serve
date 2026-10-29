@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
-# Integration test for Unsloth UD MoE models — verifies the loader handles
-# bf16 router/shared_expert_gate (the v26.5.x UD MoE fix).
-# Usage: UD_MOE_MODEL=/path/to/model PORT=8090 ./tests/test_ud_moe.sh
-# Defaults to ~/.mlx-serve/models/unsloth/Qwen3.6-27B-UD-MLX-4bit/ if present
-# (the UD MoE fix is independent of the specific Qwen 3.6 size — any
-# Unsloth Dynamic-quantization MoE checkpoint exercises the bf16
-# router/shared_expert_gate path).
-# Skips silently when the model isn't available (CI-friendly).
+# test_ud_moe.sh — Unsloth UD MoE packs load and generate (bf16 router / shared_expert_gate on a quantized trunk).
+#
+#   UD_MOE_MODEL=<dir> PORT=8090 ./tests/test_ud_moe.sh   # default unsloth/Qwen3.6-27B-UD-MLX-4bit; SKIPs without
 
 set -euo pipefail
 

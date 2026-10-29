@@ -1,43 +1,20 @@
 #!/usr/bin/env bash
-# REAL community LoRAs, downloaded from the Hub, asserting the renders are
-# USABLE — not merely different.
+# test_real_loras.sh — REAL community LoRAs off the Hub, asserting renders are USABLE, not merely different (the
+# synthetic maths of test_multi_lora.sh is satisfied by static). Four backends x (baseline -> adapter A -> A+B): each
+# render under the tests/lora_noise.py bar, each step differing from the last, the RESOLVED scale equal to what the
+# file declares, the attach line's adapter count. klein-4B (Norod78: BFL fused-QKV keys, no alpha -> 1.0), klein-9B
+# (linoyts dreambooth + Delight: alpha 4 / r 32 inside one JSON metadata string, the red-on-revert row), Krea-2
+# (gokaygokay Realism: PEFT prefix + flat metadata; krea darkbrush: none), LTX-2.3 (joyfox + Cseti: the video path).
+# H3's real adapter (Turbo) stays in test_multi_lora.sh.
 #
-# `test_multi_lora.sh` proves the stacking MATHS exactly (d+d == 2d, byte for
-# byte) with synthetic adapters, and every one of its checks stayed green while
-# a real adapter rendered pure static: its alpha lived in the safetensors
-# `__metadata__` (PEFT) instead of a per-module `.alpha` tensor (kohya), so it
-# ran at 1.0 = rank/alpha = 8x too strong. Bytes changed, deltas summed, noise.
+#   ./tests/test_real_loras.sh [port]
 #
-# So this suite downloads what people actually publish and looks at the result.
-# What each row uniquely covers:
-#
-#   klein-4B   Norod78 vintage-book-cover + old-gods — BFL `diffusion_model.
-#              double_blocks.N.img_attn.qkv` keys, i.e. the FUSED-QKV fan-out
-#              and third-split on a real file. No alpha anywhere (baked into
-#              the weights) -> scale 1.0.
-#   klein-9B   linoyts dreambooth + Delight — THE alpha fix. Both declare
-#              alpha 4 / r 32 inside a JSON document held in one metadata
-#              string; before the fix both ran at 1.0 and the dreambooth one
-#              was static.
-#   krea-2     gokaygokay Realism (flat `lora_alpha`/`lora_rank` metadata,
-#              PEFT `base_model.model.` prefix) + krea darkbrush (NO metadata
-#              at all, `transformer.` prefix, krea aliases like `img_in`).
-#   ltx-2.3    joyfox Transition + Cseti CrossView-Warp — the video path,
-#              `diffusion_model.` prefix, no metadata. (The plan named
-#              Lightricks IC-LoRA-HDR; that repo is gated and 403s even with a
-#              token, so an ungated IC-LoRA stands in.)
-#
-# MiniMax-H3's real adapter is the Turbo file shipped in its own pack, and
-# `test_multi_lora.sh` already owns it (259/259 modules + a noise check on the
-# render). H3 re-stages its whole pipeline per request, so it is not repeated
-# here for zero new information.
-#
-# Adapters download once into ~/claude-tmp/lora-real/ and the renders are kept
-# in ~/claude-tmp/lora-real/out/ — the metric is a tripwire, OPENING them is
-# still the decisive check. A missing model or a failed download SKIPs.
-#
-# Usage: ./tests/test_real_loras.sh [port]
+# Adapters download once into ~/claude-tmp/lora-real/ (~1.9 GB, resumable); renders are KEPT in
+# ~/claude-tmp/lora-real/out/ (the metric is a tripwire, opening them is the decisive check). A missing model or
+# download SKIPs.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11467}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -90,11 +67,8 @@ fetch() {
 boot() {
   "$BIN" --serve --port "$PORT" --model-dir "$MODELS" >"$LOG" 2>&1 &
   SRV=$!
-  for _ in $(seq 1 120); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-    kill -0 $SRV 2>/dev/null || { echo "FAIL: server died"; tail -5 "$LOG"; return 1; }
-    sleep 0.5
-  done
+  srv_wait_health "http://127.0.0.1:$PORT" 120 0.5 "$SRV" && return 0
+  kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server died"; tail -5 "$LOG"; return 1; }
   echo "FAIL: server never became healthy"; return 1
 }
 

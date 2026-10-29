@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # qwen4_exp: the MTP head appends the whole verify row as history and drafts past its dead
 # rows (`Transformer.HeadPlace`). Asserts, at a pinned depth, greedy:
-#   the padded path engages (and `MLX_SERVE_MTP_PADDED_HEAD=0` does not);
+#   the padded path engages;
 #   every answer reruns byte-identical and reads as text;
 #   a short answer still ends on EOS, and a long needle prompt (head QSA engaged) finds its needle.
-# The texts land in $DIR/<arm>-<prompt>-<rep>.txt, the padded-off arm beside them for reading.
+# The texts land in $DIR/<arm>-<prompt>-<rep>.txt.
 #   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_mtp_padded_head.sh [port]
 set -u
 MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit}"
@@ -52,21 +52,21 @@ open('$DIR/$1-$2-$3.txt', 'w').write(r['choices'][0]['message']['content'])
 print(r['choices'][0]['finish_reason'], r['usage']['completion_tokens'])" > "$DIR/$1-$2-$3.meta"
 }
 
-run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_PADDED_HEAD, $3 = reps
+run_arm() { # $1 = arm name, $2 = reps
   local name="$1"
   local log="$DIR/$name.log"
-  MLX_SERVE_MTP_PADDED_HEAD="$2" "$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 \
+  "$BIN" --mtp-min-depth 3 --mtp-max-depth 3 --model "$MODEL" --serve --host 127.0.0.1 \
     --port "$PORT" --log-level info --mtp --prefix-cache-entries 0 > "$log" 2>&1 &
   SPID=$!
   for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$log" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$log"; exit 1; }; sleep 2; done
   for p in $PROMPTS; do
-    for rep in $(seq 1 "$3"); do ask "$name" "$p" "$rep"; done
+    for rep in $(seq 1 "$2"); do ask "$name" "$p" "$rep"; done
   done
   stop_srv
 }
 
 echo "[1] padded head (default)"
-run_arm padded 1 2
+run_arm padded 2
 # Sum of MTP attempts over the log's spec-stats lines (a lookup-only line logs attempts=0).
 mtp_attempts() { grep -o 'mode=mtp attempts=[0-9]*' "$1" | awk -F= '{s += $NF} END {print s + 0}'; }
 check "padded path engaged" "$(grep -c '\[mtp\] padded head history engaged' "$DIR/padded.log")" "1"
@@ -81,14 +81,7 @@ check "short answer ends on EOS" "$(cut -d' ' -f1 "$DIR/padded-short-1.meta")" "
 check "short answer is 5" "$(grep -c '5' "$DIR/padded-short-1.txt" | sed 's/^[1-9][0-9]*$/1/')" "1"
 check "needle found past the head's QSA budget" "$(grep -c 'PELICAN-42' "$DIR/padded-needle-1.txt")" "1"
 
-echo "[2] MLX_SERVE_MTP_PADDED_HEAD=0 keeps the merged step"
-run_arm merged 0 1
-check "padded path off" "$(grep -c '\[mtp\] padded head history engaged' "$DIR/merged.log")" "0"
-check "merged arm ran MTP rounds" "$([ "$(mtp_attempts "$DIR/merged.log")" -gt 0 ] && echo yes)" "yes"
-for p in $PROMPTS; do
-  if cmp -s "$DIR/padded-$p-1.txt" "$DIR/merged-$p-1.txt"; then echo "  info $p: padded == merged"; else echo "  info $p: padded and merged differ (drafts move acceptance, like a width change)"; fi
-done
-grep -h 'spec-stats' "$DIR/padded.log" "$DIR/merged.log" | tail -8
+grep -h 'spec-stats' "$DIR/padded.log" | tail -8
 
 echo "texts: $DIR"
 echo "pass=$pass fail=$fail"

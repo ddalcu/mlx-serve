@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump LTX-2 AUDIO parity fixtures (.raw) for the Zig oracle tests in src/ltx_audio.zig.
+"""Dump LTX-2 AUDIO parity fixtures (.raw) for the Zig oracle tests in src/plugins/ltx/audio.zig.
 
 Runs the Lightricks/LTX-2 PyTorch REFERENCE audio decode path (audio VAE +
 BigVGAN vocoder) on a fixed random latent and writes byte-exact golden tensors
@@ -9,14 +9,14 @@ USER-RUN: you accept LTX-2's license, download the model, and install the
 reference package (`pip install -e packages/ltx-core packages/ltx-pipelines`
 from a Lightricks/LTX-2 checkout, plus torch). This script is NOT run in CI and
 is NOT exercised by the always-on tests — the hermetic + weights-gated
-structural tests in src/ltx_audio.zig cover the port without it.
+structural tests in src/plugins/ltx/audio.zig cover the port without it.
 
 Usage:
     python3 tests/dump_ltx_audio_fixtures.py <AUDIO_VAE.safetensors> [OUT_DIR]
 
 Writes (flat little-endian f32):
     latent.raw   [1, Na, 128]   the DiT-shaped (patchified) audio latent — the
-                                EXACT input src/ltx_audio.zig decodeAudio expects
+                                EXACT input src/plugins/ltx/audio.zig decodeAudio expects
     mel.raw      [1, 2, T, 64]  reference audio_vae.decoder(latent) output
     wave.raw     [L, 2]         reference vocoder(mel), INTERLEAVED L,R,L,R… to
                                 match the Zig vocode() output layout

@@ -722,11 +722,11 @@ final class CoverWeightsFetchTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-        let gen = try String(contentsOf: root.appendingPathComponent("src/gen.zig"), encoding: .utf8)
-        XCTAssertTrue(gen.contains("task == .cover and !music.fsqAvailable()"),
-                      "src/gen.zig no longer gates cover on the FSQ tokenizer")
-        let ace = try String(contentsOf: root.appendingPathComponent("src/acestep.zig"), encoding: .utf8)
+        let gate = try String(contentsOf: root.appendingPathComponent("src/plugins/acestep/plugin.zig"), encoding: .utf8)
+        XCTAssertTrue(gate.contains("req.task == .cover and !fsq_available"),
+                      "src/plugins/acestep/plugin.zig no longer gates cover on the FSQ tokenizer")
+        let ace = try String(contentsOf: root.appendingPathComponent("src/plugins/acestep/acestep.zig"), encoding: .utf8)
         XCTAssertTrue(ace.contains("FSQ_FILE = \"\(CoverWeightsFetch.fileName)\""),
-                      "src/acestep.zig no longer reads \(CoverWeightsFetch.fileName)")
+                      "src/plugins/acestep/acestep.zig no longer reads \(CoverWeightsFetch.fileName)")
     }
 }

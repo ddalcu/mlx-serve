@@ -11,6 +11,7 @@
 #
 #   BATCH_FEAT_MODEL=<qwen3_5 pack> ./tests/test_batched_features.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
 MODEL="${BATCH_FEAT_MODEL:-$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-4B-MLX-4bit}"
@@ -27,8 +28,7 @@ HOME="$WORK/home" "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --model "$MO
     --log-level debug --max-concurrent 8 --prefix-cache-entries 0 > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null' EXIT
-for i in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf -m 2 "$BASE/health" >/dev/null || { echo "FAIL: server did not start"; tail -20 "$WORK/server.log"; exit 1; }
+srv_wait_health "$BASE" 120 1 || { echo "FAIL: server did not start"; tail -20 "$WORK/server.log"; exit 1; }
 # warm the load so the group forms on the first tick of the burst
 curl -s -m 300 "$BASE/v1/chat/completions" -d '{"model":"m","messages":[{"role":"user","content":"hi"}],"max_tokens":3}' >/dev/null
 

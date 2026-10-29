@@ -11,6 +11,7 @@
 #
 # Usage: ./tests/test_prefix_cache_budget_revisit.sh [port]
 set -u
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11441}"
 BASE="http://127.0.0.1:$PORT"
 MODEL_A="$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit"
@@ -29,12 +30,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 0.5
 SRV=$!
 cleanup() { kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; rm -f "$LOG"; }
 trap cleanup EXIT
-for _ in $(seq 1 240); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    kill -0 $SRV 2>/dev/null || break
-    sleep 0.5
-done
-curl -sf "$BASE/health" >/dev/null || { echo -e "${RED}FAIL${NC} server never became healthy"; tail -5 "$LOG"; exit 1; }
+srv_wait_health "$BASE" 240 0.5 "$SRV" || { echo -e "${RED}FAIL${NC} server never became healthy"; tail -5 "$LOG"; exit 1; }
 
 post() { curl -s -o /dev/null -w '%{http_code}' --max-time 300 -X POST "$BASE/v1/$1" -H 'Content-Type: application/json' -d "$2"; }
 chat() { # chat <model path> -> cached_tokens

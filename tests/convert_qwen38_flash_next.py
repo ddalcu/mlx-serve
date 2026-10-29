@@ -37,6 +37,8 @@ reads [C, K, 1].
       --stage ~/claude-tmp/qwen38-flash-next/stage
   python3 tests/convert_qwen38_flash_next.py --add-vision --dst <pack> --stage <dir>   # or --src <hf dir>
 
+`--alloc <json>` (tests/qwen38_flash_next_iq_allocate.py) sets per-layer expert widths; `--ngram-link <bin>`
+hard-links a sibling pack's n-gram table instead of re-quantizing it.
 `--imatrix <safetensors>` (tests/qwen38_flash_next_imatrix_collect.py) switches every
 weight that has an entry to the imatrix-weighted (s, b) search (`dsv4_imatrix.
 weighted_affine_quant`, per expert for the routed banks, `--jobs` processes);

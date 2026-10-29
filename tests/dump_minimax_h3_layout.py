@@ -10,7 +10,7 @@ touch only torch and math; anything that reaches a stub raises rather than
 silently returning a plausible number.
 
 This layer is weightless, so the Zig side is a hermetic test with no env gate
-and no checkpoint -- see `layout fixtures` in src/minimax_h3.zig.
+and no checkpoint -- see `layout fixtures` in src/plugins/minimax_h3/h3.zig.
 
 Usage:
     uv run --with torch --with numpy tests/dump_minimax_h3_layout.py \

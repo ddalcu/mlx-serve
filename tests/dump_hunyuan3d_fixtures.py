@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Dump Hunyuan3D-2.1 SHAPE parity fixtures (.raw f32) for the Zig oracle tests
-in `src/hunyuan3d.zig`.
+in `src/plugins/hunyuan3d/hunyuan3d.zig`.
 
 USER-RUN (needs torch + the ~8 GB HF checkpoints + a clone of the reference repo).
 Runs the REFERENCE PyTorch pipeline and writes byte-exact golden tensors that

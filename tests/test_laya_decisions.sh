@@ -10,9 +10,10 @@
 # fixtures in tests/fixtures/laya/cases.json (tolerance 0.01), then the
 # request latency (3 questions) is measured as the median of 30.
 #
-# Hermetic counterparts: the unit tests in src/laya.zig (LAYA_TEST_MODEL +
+# Hermetic counterparts: the unit tests in src/plugins/laya/laya.zig (LAYA_TEST_MODEL +
 # LAYA_FIXTURES) pin token ids, hidden states and probabilities.
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11441}"
 HF_SNAP="$(command ls -d "$HOME"/.cache/huggingface/hub/models--aac6fef--laya-multilingual-mlx/snapshots/*/ 2>/dev/null | head -1)"
@@ -40,8 +41,7 @@ MODEL_ID="aac6fef/laya-multilingual-mlx"
 
 "$BIN" --serve --port "$PORT" --model-dir "$ROOT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
-for _ in $(seq 1 60); do curl -s -f "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -s -f "localhost:$PORT/health" >/dev/null || { echo "FAIL: server not healthy"; tail -20 "$LOG"; exit 1; }
+srv_wait_health "localhost:$PORT" 60 1 || { echo "FAIL: server not healthy"; tail -20 "$LOG"; exit 1; }
 
 echo "=== discovery ==="
 MODELS="$(curl -s "localhost:$PORT/v1/models")"

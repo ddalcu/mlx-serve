@@ -1,0 +1,12 @@
+const uint first=uint(threadgroup_position_in_grid.y);
+const uint group_lane=uint(thread_index_in_simdgroup);
+const uint group_eid=uint(slots[first]);
+const bool hit=group_lane<uint(NSLOTS) && uint(slots[group_lane])==group_eid;
+const uint mask=uint(static_cast<simd_vote::vote_t>(simd_ballot(hit)));
+const uint rank=popcount(mask&((1u<<first)-1u));
+if(rank%3u!=0u)return;
+uint after=first>=31u?0u:(mask&(0xffffffffu<<(first+1u)));
+uint partner=after?ctz(after):first;
+if(after)after&=after-1u;
+uint third=after?ctz(after):first;
+threadgroup float partial[SERIAL_REDUCTION?1024:3072];

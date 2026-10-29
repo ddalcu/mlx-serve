@@ -1,12 +1,15 @@
 #!/bin/bash
-# A client stop string ends the ANSWER, never the reasoning (#549): a match
-# inside the think block must not cut it. `stop: ["Paris"]` on a thinking model,
-# every text surface, stream and non-stream (+ the tools-gated chat stream).
-# Bar per case: the reasoning (if the model thought) still contains the stop and the
-# answer is cut before it; at least one case must have reasoned past the stop.
+# test_stop_in_reasoning.sh — a client stop string ends the ANSWER, never the reasoning: `stop: ["Paris"]` on a
+# thinking model, every text surface, stream and non-stream (+ the tools-gated chat stream). Per case the reasoning
+# (when the model thought) still contains the stop and the answer is cut before it; at least one case must reason past
+# the stop.
 #
 #   ./tests/test_stop_in_reasoning.sh [model_dir] [port]
+#
+# Hermetic twins: corpus `a stop string ends the answer, never the reasoning`, `a stop string matches the answer`.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
@@ -23,8 +26,7 @@ HOME="$WORK/home" "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --model "$MO
     --log-level debug > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null' EXIT
-for _ in $(seq 1 90); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf -m 2 "$BASE/health" >/dev/null || { echo "FAIL: server did not start"; tail -20 "$WORK/server.log"; exit 1; }
+srv_wait_health "$BASE" 90 1 || { echo "FAIL: server did not start"; tail -20 "$WORK/server.log"; exit 1; }
 
 BASE="$BASE" python3 - <<'PY'
 import json, os, sys, urllib.request

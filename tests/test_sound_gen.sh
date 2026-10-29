@@ -14,6 +14,7 @@
 #
 # Usage: SA3_MODEL=<dir> ./tests/test_sound_gen.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11441}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -32,11 +33,7 @@ LOG="$TMP/server.log"
 "$BIN" --serve --model-dir "$TMP/models" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -rf "$TMP"' EXIT
-for _ in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 
 api() { curl -s -m 600 "http://127.0.0.1:$PORT$1" "${@:2}"; }
 post() { api "$1" -X POST -H 'Content-Type: application/json' -d "$2" "${@:3}"; }

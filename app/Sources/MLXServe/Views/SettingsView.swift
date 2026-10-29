@@ -123,6 +123,10 @@ struct SettingsView: View {
         ) {
             ModelFoldersSectionContent()
             ServerSectionContent()
+            // The Mac App Store build loads no plugins (its sandbox forbids it).
+            if !BuildFeatures.current.isMAS {
+                PluginsSectionContent()
+            }
         }
         SettingsSection(
             category: .memory,
@@ -1964,6 +1968,45 @@ private struct ProviderModelPickerSheet: View {
     }
 }
 
+/// Outside plugins: one switch for all of them, then one per installed plugin with its version, signer and hash
+/// (`OutsidePlugins`). Read by the server at startup.
+private struct PluginsSectionContent: View {
+    @State private var switches = OutsidePlugins.loadSwitches()
+    @State private var receipts = OutsidePlugins.receipts()
+    @State private var saveError: String?
+
+    var body: some View {
+        SettingsRow(title: "Outside plugins",
+                    explainer: "Model, media and quant-format plugins you installed with `mlx-serve plugin install` (in ~/.mlx-serve/plugins). A plugin is native code that runs with your rights. Restart the server to apply.") {
+            Toggle("", isOn: Binding(get: { switches.enabled }, set: { switches.enabled = $0; save() }))
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+        ForEach(receipts) { r in
+            SettingsRow(title: r.name, explainer: OutsidePlugins.summary(r)) {
+                Toggle("", isOn: Binding(get: { switches.isOn(r.name) }, set: { switches.set(r.name, on: $0); save() }))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .disabled(!switches.enabled)
+            }
+        }
+        if let saveError {
+            Text(saveError)
+                .font(.app(.caption))
+                .foregroundStyle(.red)
+        }
+    }
+
+    private func save() {
+        do {
+            try OutsidePlugins.save(switches)
+            saveError = nil
+        } catch {
+            saveError = error.localizedDescription
+        }
+    }
+}
+
 private struct ServerSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -2374,7 +2417,7 @@ private struct SpecDecodeSectionContent: View {
     var body: some View {
         let opts = $appState.serverOptions
         // Drafter and PLD are mutually exclusive at the request level
-        // (`drafter > PLD > regular` in src/server.zig). When drafter is on
+        // (`drafter > PLD > regular` in src/host/http/server.zig). When drafter is on
         // we lock the PLD toggles down so users can't accidentally enable a
         // setting that would never apply.
         let drafterActive = server.chatModelInfo?.drafterLoaded ?? false
@@ -3215,11 +3258,13 @@ private struct VoiceCloneSectionContent: View {
             return "Copies the voice from the clip below using Qwen3-TTS. Slower and much heavier than Kokoro, and it needs the model downloaded from the Audio tile."
         case .kokoro:
             return "A small, very fast model (about 17x realtime, a tenth of the memory of the cloning model) with 54 built-in voices you can blend. It can't copy your voice."
+        case .lfm3:
+            return "LiquidAI's speech model: 19 languages, a female and a male voice each. When your chat model is LFM3 Audio or Omni, that same model reads the answers, with no second model."
         }
     }
 
     var body: some View {
-        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"]) {
+        SearchableRow(searchText: ["Voice engine", "Kokoro", "LFM3", "cloned"]) {
             engineBody
         }
         // The clip control only makes sense for the backend that can USE it —
@@ -3236,28 +3281,9 @@ private struct VoiceCloneSectionContent: View {
                 kokoroBody
             }
         }
-        if appState.serverOptions.voiceEngine == .system {
-            SearchableRow(searchText: ["System voice", "Apple voice"]) {
-                systemVoiceBody
-            }
-        }
-    }
-
-    /// The app-wide Apple voice; an agent with its own voice still overrides it.
-    @ViewBuilder
-    private var systemVoiceBody: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("System voice")).font(.app(.headline).weight(.semibold))
-            HStack(spacing: 8) {
-                Picker("", selection: Binding(get: { appState.voice.selectedVoiceId },
-                                              set: { appState.voice.selectVoice($0) })) {
-                    ForEach(appState.voice.availableVoices) { v in
-                        Text(v.displayName).font(.app(.body)).tag(Optional(v.id))
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 260)
-                Spacer(minLength: 0)
+        if appState.serverOptions.voiceEngine == .lfm3 {
+            SearchableRow(searchText: ["LFM3 voice", "language", "preview"]) {
+                lfm3Body
             }
         }
     }
@@ -3267,7 +3293,7 @@ private struct VoiceCloneSectionContent: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(L10n.text("Voice engine")).font(.app(.rowTitle).weight(.semibold))
             Picker("", selection: $appState.serverOptions.voiceEngine) {
-                ForEach(VoiceEngine.allCases, id: \.self) { e in
+                ForEach(VoiceEngine.selectable, id: \.self) { e in
                     Text(L10n.text(e.label)).tag(e)
                 }
             }
@@ -3344,6 +3370,58 @@ private struct VoiceCloneSectionContent: View {
         // pick would fire a request that can only fail.
         .onChange(of: appState.serverOptions.kokoroVoice) { _, newValue in
             if kokoroReady { previewer.preview(newValue) }
+        }
+        .onDisappear { previewer.stop() }
+    }
+
+    private var lfm3Ready: Bool { LFM3Voice.modelPath(app: appState) != nil }
+
+    @ViewBuilder
+    private var lfm3Body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L10n.text("LFM3 voice")).font(.app(.headline).weight(.semibold))
+            if !lfm3Ready {
+                HStack(spacing: 8) {
+                    Text(L10n.text("Speaking needs LFM3 Audio 2B (about 2.5 GB)."))
+                        .font(.app(.caption)).foregroundStyle(.secondary)
+                    Button {
+                        downloads.start(repoId: LFM3Voice.repo) {
+                            appState.refreshModels()
+                            appState.server.rescanModels()
+                        }
+                    } label: { Text(L10n.text("Download")).font(.app(.body)) }
+                    .disabled(downloads.downloads[LFM3Voice.repo]?.status == .downloading)
+                }
+            }
+            HStack(spacing: 8) {
+                Picker("", selection: $appState.serverOptions.lfm3Voice) {
+                    ForEach(LFM3Voice.voices(appState.server.allModels, current: appState.serverOptions.lfm3Voice), id: \.self) { v in
+                        Text(LFM3Voice.displayName(v)).font(.app(.body)).tag(v)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 260)
+                Button {
+                    previewer.preview(appState.serverOptions.lfm3Voice, engine: .lfm3)
+                } label: {
+                    if previewer.isPreviewing(appState.serverOptions.lfm3Voice) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Play", systemImage: "play.circle").font(.app(.body))
+                    }
+                }
+                .help(lfm3Ready ? "Hear a short sample of this voice" : "Download the model first")
+                .disabled(previewer.active != nil || !lfm3Ready)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let e = previewer.error {
+                Text(L10n.text(e)).font(.app(.caption)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onChange(of: appState.serverOptions.lfm3Voice) { _, newValue in
+            if lfm3Ready { previewer.preview(newValue, engine: .lfm3) }
         }
         .onDisappear { previewer.stop() }
     }

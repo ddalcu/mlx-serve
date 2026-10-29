@@ -10,6 +10,7 @@
 # Gated on a fixture so CI without the model stays green:
 #   G4_UNIFIED_MODEL=/path/to/gemma-4-12b-it-4bit ./tests/test_gemma4_unified_vision.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${G4_UNIFIED_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-12b-it-4bit}"
 PORT="${1:-8231}"
@@ -61,11 +62,7 @@ SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG" "$IMG"; }
 trap cleanup EXIT
 
-for i in $(seq 1 60); do
-    if curl -fs --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then break; fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo -e "${RED}server died${NC}"; tail -20 "$LOG"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo -e "${RED}server died${NC}"; tail -20 "$LOG"; exit 1; }
 
 # 1. The unified (encoder-free) vision embedder loaded — not the SigLIP tower.
 assert_contains "loads unified encoder-free vision embedder" "unified (encoder-free)" "$(cat "$LOG")"

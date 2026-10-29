@@ -1,0 +1,15 @@
+threadgroup uint keys[256];
+const uint lane = thread_index_in_threadgroup;
+const uint block = threadgroup_position_in_grid.x;
+const uint i = block * 256 + lane;
+const bool live = i < uint(ids_shape[0]);
+const uint key = live ? ids[i] : 0xffffffffu;
+keys[lane] = key;
+threadgroup_barrier(mem_flags::mem_threadgroup);
+if (!live || key >= E) return;
+uint rank = 0;
+for (uint j = 0; j < lane; ++j) rank += uint(keys[j] == key);
+const uint pos = offsets[block * E + key] + rank;
+inverse[i] = pos;
+sorted[pos] = key;
+lhs[pos] = i / TOPK;

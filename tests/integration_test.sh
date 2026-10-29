@@ -1,9 +1,9 @@
 #!/bin/bash
-# Integration tests for mlx-serve API endpoints.
-# Usage: ./tests/integration_test.sh [model_dir] [port]
+# integration_test.sh — 36 end-to-end API checks on one model (default gemma-4-e4b-it-8bit).
 #
-# Requires a model to be available. Defaults to gemma-4-e4b-it-8bit.
-# Builds ReleaseFast (SKIP_BUILD=1 skips), starts the server, runs tests, then kills it.
+#   ./tests/integration_test.sh [model_dir] [port]
+#
+# Builds ReleaseFast first (SKIP_BUILD=1 skips), starts the server, runs the checks, kills it.
 
 set -euo pipefail
 

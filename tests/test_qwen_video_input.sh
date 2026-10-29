@@ -1,18 +1,14 @@
 #!/usr/bin/env bash
-# Qwen3-VL video input end-to-end over HTTP: a `video_url` content block
-# carrying multiple DISTINCT frame images (house / robot / street signs / a
-# "not hot dog" app screenshot — no real video clip is checked into fixtures/,
-# so genuinely different still images stand in for genuinely different
-# frames). This is the class guard for the video wire path: a wiring bug that
-# threads only frame 0 into every temporal-patch group (the exact regression
-# `qwen_vision.zig`'s "buildPixelValuesVideo reads REAL per-frame data, not
-# one frame duplicated" unit test guards in isolation) would still answer
-# plausibly here — it would just describe ONE subject instead of several, so
-# the model is asked to enumerate what it saw across frames rather than
-# describe "an image".
+# test_qwen_video_input.sh — Qwen video input: four DISTINCT frames as one `video_url` (house, robot, street signs, an
+# app screenshot). At least two frames' subjects must be named AND something only the PIXELS supply (frame 3's sign
+# text): a wiring bug that threads frame 0 into every temporal-patch group, or encodes frames and never splices them,
+# still answers plausibly about one subject. On a checkpoint that cannot read the signs this is a checkpoint
+# expectation, not a wire failure (qwen4_exp reads them).
 #
-# Usage: tests/test_qwen_video_input.sh [model_dir] [port]
+#   tests/test_qwen_video_input.sh [model_dir] [port]
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
 MODEL="${1:-${QWEN_VISION_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}}"
@@ -34,7 +30,7 @@ SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 90); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "localhost:$PORT" 90 1 || true
 if ! curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; cat "$LOG"; exit 1; fi
 
 mime_for() {

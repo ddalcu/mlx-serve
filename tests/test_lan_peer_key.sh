@@ -1,20 +1,14 @@
 #!/bin/bash
-# A keyed LAN peer: two servers on ONE machine.
+# test_lan_peer_key.sh — a LAN peer running --api-key: A shares with `--api-key K --api-key-strict` (strict, since
+# same-machine discovery arrives over loopback, which a plain key exempts); B discovers with a scratch HOME.
 #
-#   A  --model <dir> --lan-share all --api-key K --api-key-strict
-#      (strict: same-machine discovery arrives over loopback, which a plain
-#      --api-key exempts)
-#   B  headless --lan-discover, HOME pointed at a scratch dir
+#   ./tests/test_lan_peer_key.sh [/path/to/model] [portA]
 #
-#   1. Without a key, B lists A under top-level `lan_needs_key`, no models.
-#   2. Writing $HOME/.mlx-serve/lan-keys.json {"<A>": "K"} brings A's models
-#      in and drops it from `lan_needs_key`.
-#   3. A chat through B on `<id>@<A>` carries the key and completes.
-#
-# SKIPs cleanly when the model dir is missing or the Mac has no non-loopback IP.
-#
-# Usage: ./tests/test_lan_peer_key.sh [/path/to/model] [portA]
+# Without a key B lists A under `lan_needs_key` with no models; writing B's ~/.mlx-serve/lan-keys.json brings A's
+# models in within seconds; a chat on `<id>@<A>` completes through B. SKIPs without the model or a non-loopback IP.
+# Hermetic twins: `peerKeyFromJson`, the keyed-peer fetch and tunnel `Authorization` line (host/lan/lan.zig), LanPeerKeysTests.
 
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit mlx-community/gemma-4-e4b-it-8bit)}"
 PORT_A="${2:-11321}"
@@ -59,10 +53,7 @@ bad()  { FAIL=$((FAIL+1)); echo -e "${RED}FAIL${NC} $1"; }
 check() { if [ "$2" -eq 0 ]; then ok "$1"; else bad "$1"; fi; }
 
 wait_health() { # <port>
-    for _ in $(seq 1 120); do
-        curl -s -m 2 "http://127.0.0.1:$1/health" | grep -q '"ok"' && return 0
-        sleep 1
-    done
+    srv_wait_health "http://127.0.0.1:$1" 120 1 && return 0
     return 1
 }
 

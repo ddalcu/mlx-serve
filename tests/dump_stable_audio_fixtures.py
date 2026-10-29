@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Dump Stable Audio 3 (small) parity fixtures (.raw f32 / i32) for the Zig
-oracle tests in `src/stable_audio.zig`.
+oracle tests in `src/plugins/stable_audio3/stable_audio.zig`.
 
 USER-RUN (needs mlx + numpy + sentencepiece). Runs Stability's own MLX
 reference (github.com/Stability-AI/stable-audio-3, `optimized/mlx/models/defs`)

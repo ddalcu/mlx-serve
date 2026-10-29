@@ -8,12 +8,19 @@ enum VoiceEngine: String, Codable, CaseIterable, Sendable {
     case clone
     /// Kokoro-82M with a built-in or blended voice.
     case kokoro
+    /// LFM3-Audio / Omni's own voices (19 languages, female and male).
+    case lfm3
+
+    /// What Settings and an agent's voice menu offer. `.system` stays for saved agents and as the fallback that keeps
+    /// a failed synthesis from going silent; a saved global `.system` reads as Kokoro.
+    static let selectable: [VoiceEngine] = [.clone, .kokoro, .lfm3]
 
     var label: String {
         switch self {
         case .system: return "System voice"
         case .clone: return "My cloned voice"
         case .kokoro: return "Kokoro (fast, built-in voices)"
+        case .lfm3: return "LFM3 (19 languages)"
         }
     }
 }
@@ -329,11 +336,13 @@ struct ServerOptions: Codable, Equatable {
     /// has no voice list, Kokoro sends `voice` and cannot clone. Sending the
     /// wrong one is a named 400 server-side, so the engine choice decides which
     /// field is sent rather than both being attempted.
-    var voiceEngine: VoiceEngine = .system
+    var voiceEngine: VoiceEngine = .kokoro
     /// Which Kokoro voice to speak with. A comma-separated list BLENDS voices
     /// (`"af_bella,af_sky"`) — the reference's own convention, passed through
     /// verbatim.
     var kokoroVoice: String = "af_heart"
+    /// Which LFM3 voice to speak with (`<language>-<female|male>`, listed on its `/v1/models` row).
+    var lfm3Voice: String = "american-english-female"
     /// Wake phrase for hands-free voice mode ("hey loki" by default). Stored
     /// as the user typed it in Settings ▸ Voice; consumers normalize through
     /// `WakeWord.normalizePhrase` (blank → default). App-side like the other
@@ -986,15 +995,16 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }
-        if let v = try c.decodeIfPresent(VoiceEngine.self, forKey: .voiceEngine) { voiceEngine = v }
+        if let v = try c.decodeIfPresent(VoiceEngine.self, forKey: .voiceEngine) { voiceEngine = v == .system ? .kokoro : v }
         else if let legacy = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) {
             // Configs written before the engine picker existed only carried the
             // clone toggle. Changing a persisted DEFAULT does nothing for
             // existing users, so migrate the old field explicitly rather than
             // stranding them on `.system` with a clip they already recorded.
-            voiceEngine = (legacy && !voiceClonePath.isEmpty) ? .clone : .system
+            voiceEngine = (legacy && !voiceClonePath.isEmpty) ? .clone : .kokoro
         }
         if let v = try c.decodeIfPresent(String.self, forKey: .kokoroVoice) { kokoroVoice = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .lfm3Voice) { lfm3Voice = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .transcriptNotesModel) { transcriptNotesModel = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .transcriptAutoStopMinutes) { transcriptAutoStopMinutes = v }

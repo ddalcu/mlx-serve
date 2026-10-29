@@ -1,2199 +1,725 @@
-# Model loading, configs, converters, media parity — war stories (moved out of CLAUDE.md)
+# Model loading, configs, converters and media parity: gotchas
 
-Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
+One story per gotcha: the defect, the cause, the fix, the guard. The rules live in the root `AGENTS.md` (`## Rules`)
+and in each plugin's `AGENTS.md` (`src/plugins/<name>/`); what is still open lives in `docs/known-issues.md`. An env
+lever a story names that `src/env.zig` no longer lists was retired once its arm was decided.
 
-### ModelOpt's NVFP4 global scale is not MLX's (NVIDIA Flash Next FP4)
+## Configs, prefixes, layouts
 
-NVIDIA's pack loaded and chatted, but every image read as "a blank white canvas". The vision tower's NVFP4 linears were dequantized with `weight_scale_2` passed as MLX's `global_scale`. ModelOpt stores `weight_scale_2 = amax / (448 x 6)`; MLX's kernels divide its `global_scale` by 448 x 6 themselves, so every weight came out 2688x too small. Fix: `modelopt_pack.dequantDense` multiplies by 448 x 6 first. Guard: `ModelOpt NVFP4 dense dequant` checks code x e4m3 x `weight_scale_2` exactly. The routed experts never meet MLX's convention: their per-expert scales ride the gate and the routing weight.
+### A per-layer table and the Gemma vision projection ignored a per-tensor group size (Gemma 4 E4B mixed 4/6-bit)
 
-### RADIO configuration and numerics must follow the checkpoint
+`zecanard/gemma-4-E4B-it-ultra-uncensored-heretic-MLX-4bit-mixed_4_6` declares gs 32 model-wide but stores every language-model tensor and both media projections at gs 64. Warmup died with `Cannot reshape array of size 5376 into shape (1,1,42,256)`, every text turn 500'd and every image turn 500'd. Cause: the plugin loaded the per-layer embedding table with width hint 0, and the vision `quantLinear` took the config gs, so each fell back to the model-wide scheme (a 6-bit gs-64 table read as gs 32 gives half-width rows; the 4-bit projection read as 8-bit gs 32). Fix: the table is loaded at its real row width (`layers x ple_dim`) and `quantLinear` solves each weight from its input width (`quantParamsFromGeometry`), like the other towers. Guard: `quantLinear reads a projection at its own group size inside a model with another one`, `tests/test_gemma4_mixed_quant.sh`.
 
-Defect: native omni packs loaded text-only. Cause: vision keyed on a private `radio_vision` flag instead of `vision_config.model_type: "radio"`. Fix: loader and discovery share `model_discovery.hasRadioVision`; preprocessing follows the official float32 antialiased bicubic and float32 CPE (PIL's uint8 step moved pixels). Guards: native RADIO config tests, format corpus, the executed fp32 fixtures (cosine plus RMS ratio).
+### Read `text_config` first, then the root, per field
+Defect: every unloaded multimodal model advertised `hidden_size: 0` and `is_moe: false` (a 128-expert Gemma read as
+dense, which gates MTP/drafter defaults). Cause: `discovery.parseStubMeta` read the root only. Fix: the nested block
+first, the root per field. Guard: the multimodal + nested-MoE + root-fallback cases of the `parseStubMeta` test.
 
-### Native Nemotron wrappers retain more than an architecture tag
+### Fields a minimal `text_config` omits fell back to another family's defaults
+Defect: `gemma-3-4b-it-4bit` crashed at warmup reshaping into 16 heads. Cause: `ModelConfig` defaults are the Gemma
+12b shape; the pack omits head counts and leans on HF's Gemma3 defaults (8/4/256). Fix: an arm fills HF per-arch
+defaults explicitly for omitted fields. Tell: `[reshape] Cannot reshape array of size N into shape (1,1,H,D)` at
+warmup. Guard: the gemma3 head-count tests.
 
-Defect: Super's `nemotron_h_omni` pack was hidden in the app and failed to load. Cause: exact type lists and flat `backbone`/`mlp1` names. Fix: the language wrapper and `mlp1.layers` projector resolve from the checkpoint's names, quantization per linear; the native config's final vision LayerNorm before pixel shuffle is required. Guards: picker/type parity tests, nested/flat forwards, Super RADIO fixtures.
+### `*_text` siblings and the flat weight prefix
+Defect: `gemma3_text` packs loaded incoherent or crashed with `MISSING WEIGHT: lm_head.weight`. Cause: the tag fell to
+the llama arm; a flat pack keeps weights under `model.*` and is always tied. Fix: accept the sibling, collapse to the
+base type, pick the prefix by `text_config` presence, force tied embeddings for Gemma, and add the tag to both
+visibility allowlists (discovery and the app). Guard: routing + prefix tests, `testGemma3TextIsSupportedArchitecture`.
 
-### A LiLiCorr drafter can own its output head
+### The weight prefix was a config guess (LFM2.5)
+Defect: `LFM2.5-2.6B-8bit` died with `MISSING WEIGHT: model.embed_tokens.weight`; all 600 weights lived under
+`language_model.model.*`. Cause: the arm picked the prefix from `text_config` presence, and this config has none (only
+an empty `vision_config`). Fix: `resolveWeightPrefix` re-points the config when the configured prefix holds nothing
+and the other nesting has weights (only between `model` and `language_model.model`, `.`-boundary match). When
+converters disagree about a name and config.json cannot settle it, probe the tensors.
 
-Defect: Super's drafter proposed through the target's head. Cause: DFlash ignored `has_own_lm_head`. Fix: a declared head is loaded and validated (geometry, token space) and used only for proposals; verify keeps the target head. Separately, `/v1/messages` dropped DFlash because it checked only the Gemma slot: all four surfaces now share `requestEnableDrafter`. Guards: native config corpus, head forwards, malformed-head tests, HTTP defaults on all four APIs.
+### A converter's container name: `mlp.experts` vs `mlp.switch_mlp` (hy_v3)
+Defect: every mlx-lm-converted Hy3 pack died with `MISSING WEIGHT: model.layers.1.mlp.experts.gate_proj.weight`.
+Cause: the binding hardcoded one converter's name. Fix: `hy3ExpertContainer` probes per layer. Guard:
+`hy3ExpertContainer resolves both mlx-lm switch_mlp and ox-ox experts naming`.
+
+### A converter that keeps the HF module layout renames the router (Laguna oQ, #169)
+Defect: oQ Laguna packs died with `MISSING WEIGHT: …mlp.gate.weight`. Cause: poolside's build flattens the router to
+`mlp.gate.weight`; the oQ converter keeps HF's nested `mlp.gate.proj.weight` (the bias buffer never moves). Fix:
+`lagunaRouterBase` probes the flat name first, then the nested one. A module tree is the converter's choice. Guard:
+the router-base test.
+
+### `chat_template` has two legal shapes, and reading the wrong one panicked
+Defect: Mistral-7B-Instruct-v0.3 could not load: `access of union field 'string' while field 'array' is active`.
+Cause: HF allows `chat_template` as a string or a list of `{name, template}`; Mistral v0.3 ships the list. Fix:
+`chatTemplateFromValue` reads both and picks `default` (as transformers does), else the first usable entry, else null.
+`.string` on an unchecked JSON value is a crash, not a miss. Guard: `chat_template accepts HF's
+list-of-named-templates shape`.
+
+### Gemma `<end_of_turn>` leaked when the config declared a scalar eos
+Defect: a minimal Gemma pack with `eos_token_id: 1` never stopped at turn end and leaked `<end_of_turn>`. Cause: id
+106 was added only when the config gave no eos. Fix: `ensureGemmaTerminators` merges 1 and 106 additively;
+`generation_config.json`'s `eos_token_id` joins the stop set (`mergeEosTokens`). Guard: the scalar-eos and idempotence
+tests.
+
+### Llama 3.x answered empty past 1k tokens
+Defect: Llama-3.2-3B answered a 1k prompt and returned whitespace at 1.8k and 3.8k, every build back to 26.9.2. Cause:
+`has_sliding_window` defaulted to Gemma's layout (window 1024) and the llama branch never cleared it; `rope_type:
+"llama3"` was read as nothing, so low frequencies ran 32x fast. Fix: the llama family is full attention in every
+layer, as in mlx-lm; `Llama3Rope` feeds HF's frequencies; llama3 packs get their own SSD root. Every short check had
+missed it. Guard: the llama3 rope parse test, `computeLlama3Freqs` goldens, smoke `long prompt`.
+
+### A config default only one family wants: Muse's rope base
+Defect: pi on Muse looped in its thinking channel on the first turn (54 cuts a day), deterministically at greedy, on
+every quant, on HF-identical prompt and ids; mlx-lm continued clean on the same weights. Cause: sliding layers read
+`rope_local_base_freq`, defaulting to Gemma-3's 10000; Muse ships one theta (500000). Fix: the muse arch sets
+`rope_local_base_freq = rope_theta` when absent. "Coherent for N tokens then loops, deterministic at greedy" is a
+positional-encoding signature. Guard: the config test asserts both values; `tests/test_muse_repetition.sh` replays the
+capture.
+
+### Laguna YaRN: the checkpoint's `attention_factor` is not the trained mscale
+Defect: Laguna-XS ships `attention_factor: 1.0` and would have run 10 of 40 layers with unscaled YaRN RoPE (S matched
+by luck). Cause: poolside's own implementations ignore the field and compute `0.1·ln(factor) + 1`. Fix: the laguna arm
+computes it. When a reference ignores a field, the field is not the truth for that arch. Guard: `laguna YaRN mscale is
+COMPUTED, never read from attention_factor`.
+
+### Malformed model configs reached unchecked reads and casts
+Defect: wrong-typed or out-of-range config fields hit illegal behaviour in ReleaseFast. Fix: checked readers: optional
+nulls are absent, explicit disables (`sliding_window: null`, negative BOS sentinels) keep their meaning, narrowing and
+derived dimensions return named errors; discovery checks root types and metadata ranges. Tensor shapes need their own
+validation. Guard: `parseConfigFromJson rejects invalid field types and ranges`, `preserves optional nulls and skipped
+fields`. Same class: qwen4_exp's n-gram bounds sat behind a `std.debug.assert` (compiled out of ReleaseFast) and wrote
+past fixed arrays; `validateQwen4Config` and `NgramTable.parse` now refuse by name, and a PLE the layer loop never
+installed is a load error.
+
+### An affine bit-width MLX has no kernels for killed the server at warmup
+Defect: `Bonsai-27B-mlx-1bit` loaded everything, then died in warmup with `Unable to load kernel
+affine_dequantize_…_b_1`. Fix: affine bits outside {2,3,4,5,6,8} are refused at config parse
+(`error.UnsupportedQuantBits`); `affineParamsFromGeometry` only returns supported widths. Extend both together when
+MLX adds a width. Guard: `parseConfigFromJson rejects affine bits MLX has no kernels for`.
+
+### Quant resolves per weight (nvfp4 / mxfp4 / mxfp8)
+Defect: mixed QAT packs override some layers to affine 8-bit inside an fp8-mode config; a single per-config rule
+mis-read them. Fix: `computeQuantParams` per weight: uint8 scales take the config's fp mode, float scales are affine
+with bits and group size solved from geometry; `.biases` mandatory under affine, optional otherwise. Guard: the
+quant-resolution tests.
+
+### An fp override inside the fp family is invisible to a scales-dtype rule
+Defect: `LFM2.5-2.6B-MLX/mxfp4` killed the server on its first request (`[dequantize] Shape of scales does not
+match`). Cause: its embedding overrides to mxfp8 inside an mxfp4 model; both store uint8 E8M0 scales, so the
+scales-dtype rule resolved the embedding at 4 bits. Fix: `fpParamsFromGeometry` solves bits and group size from the
+packed geometry, returns null when it agrees with the config, and names a mode only when the pair matches one format's
+block size. Guard: the `computeQuantParams` fp-override test.
+
+### The hybrid layer-init path demanded scales
+Defect: `LFM2.5-2.6B-bf16` died on `MISSING WEIGHT: …conv.in_proj.scales`. Cause: the hybrid layer init fetched scales
+with the mandatory getter; the other paths already treated scales as optional per tensor. Fix: `getLayerScaleOpt`, and
+every contracted dense weight gets `maybeTransposeForBf16`, never the depthwise conv kernel or SSM state (`A_log`,
+`D`, `dt_bias`), which would silently compute the wrong thing. Guard: a synthetic dense 2-layer lfm2 through the
+hybrid init.
+
+### ModelOpt's NVFP4 global scale is not MLX's
+Defect: NVIDIA's Flash Next FP4 pack read every image as "a blank white canvas". Cause: ModelOpt stores
+`weight_scale_2 = amax / (448·6)`; passed raw as MLX's `global_scale`, every tower weight came out 2688x too small.
+Fix: `modelopt_pack.dequantDense` multiplies by 448·6 first. Guard: `ModelOpt NVFP4 dense dequant`.
+
+### A GGUF folder is a shelf of models, not a model
+Defect: the app could offer one quant per GGUF repo; a downloaded quant stopped resolving after relaunch; deleting or
+cancelling one quant took its siblings; a speech tokenizer GGUF could load as the LLM. Fix: one entry per quant
+(`id#<file>`), `existingModelDir` accepts a servable `.gguf`, per-quant delete and cancel, and sidecar classifiers
+(`isGgufSidecar` / `discovery.isGgufSidecarBasename`) kept in sync. Guard: `GgufQuantTests`, `isGgufSidecarBasename`.
+
+### A configless repo shape has to be taught to every "is this a model?" answer
+Defect: every MageFlow checkpoint (no root config.json) and the mflux FLUX.2 klein 9B (no index either) were invisible
+to `list`, `/v1/models` and the app, though `--model` loaded them. Fix: one predicate per shape, the media plugin's
+`claims` (reading a bounded header prefix), read by every classifier through `served.claimIn`; the
+app's bundle markers declare `hasRootConfig: false`. Signal on weight names, not directory shapes. Guard: the
+discovery and `isModelDir` tests for each shape.
+
+### An incomplete media pack read as a model and died in the text loader
+Defect: a Turbo-adapter fetch wrote config.json + tokenizer + LoRA into a fresh dir, which shadowed the complete pack
+in a later root; loading it fell through to the text loader and `unreachable` killed the process. Every H3/LTX
+download holds a valid config.json while its weights are still `.partial`. Fix: one completeness table
+(the plugin's `required_file`, read through `discovery.requiredMediaMarker`) skips incomplete packs; `probeModelDir` answers
+`error.IncompleteMediaPack`; the preload refuses a media dir that failed its marker by name; adapters download into
+the pack's resolved dir and cancel surgically. Guard: `tests/test_model_rescan.sh`, `TurboLoraFetchTargetTests`.
+
+### A directory filter that skips symlinks measured an HF-cache model at zero
+Defect: a 121 GB model loaded from the HF hub cache sent the Mac 34 GB into swap: `[preflight] weights ~0.00 GB`.
+Cause: snapshot dirs hold symlinks and every size sum skipped non-`.file` entries; 0 means "unknown, allow". Fix:
+every entry filter accepts `.sym_link` and stats through it, then checks the result is a file. Same report: an open
+default bind now warns (`shouldWarnOpenBind`). Guard: `modelDiskBytes follows HF-cache symlinks`, the discovery
+symlink test.
+
+### The stub `model_type` is a modality static
+Defect: H3's media preflight billed the 64.5 GB file sum while logging a staged bill. Cause: a media stub's config
+carries the modality (`"AudioVideo"`), never the backend type. Fix: re-peek the directory's real type
+(`gen.peekModelType`). A log line's presence proved nothing: `tests/test_minimax_h3.sh` asserts the printed number
+sits in the staged band.
+
+### A companion pack under its base's `model_type` (Qwen3-ForcedAligner)
+Defect: the forced aligner was listed as a transcription model, loaded with no tower and became the headless default
+chat model, as the ASR itself did. Cause: both roots say `qwen3_asr`; only `thinker_config.model_type` tells them
+apart; any qwen3 trunk behind an audio tower counted as chat-capable. Fix: discovery reports `qwen3_forced_aligner`
+(capability `alignment`, a named 400 on text routes), and an audio-tower trunk is never chat-capable. Japanese and
+Korean go one character per unit (the reference's splitters are Python; word times agree within one 80 ms step).
+Guard: the aligner discovery and parse tests, `tests/test_transcriptions.sh` 6.
+
+### A download bundle that fetches fewer files than the loader names (Pixal3D)
+Defect: the app's Pixal3D bundle skipped the `_mv` weights but fetched `pipeline_mv.json`, and the engine required
+what the JSON named; TRELLIS.2's `pipeline.json` always names the optional 512 texture flow. Cause: a loader reading
+"what exists" from a JSON instead of the disk. Fix: an optional part counts only when its weights are on disk
+(`pixal3d.mvInstalled`, `onDiskOrEmpty`); a multi-view request is then refused by name. Guard: `a pack with
+pipeline_mv.json but no _mv weights serves one view`.
+
+## Tokenizers
 
 ### Metaspace `prepend_scheme: "first"` read as "always" (Mistral v0.3)
-The laya port added HF `Metaspace` support and treated every scheme except `never` as `always`, so Mistral's SentencePiece tokenizer got a ▁ after every special token (`[INST]Use` -> `▁Use`; HF gives `Use`). HF's `first` only prepends to text at original offset 0, and `always` does it per segment after added-token extraction.
-- Found by the smoke matrix: every Mistral cell's prompt grew 11 tokens. Part of that was CORRECT: 26.9.5 dropped every `\n` on byte-fallback tokenizers (no `<0x0A>`), which the same port fixed.
-- Fix: `MetaspacePrepend` enum, `encode` passes `at_start` per segment. Guard: the `"first"` case in the `encodeSentencePiece: Metaspace` test; live `/tokenize` == HF on a prompt with specials.
-
-### The `--no-vision` prefix filter ate MageFlow Edit's vision tower (2026-09-08)
-
-Defect: every Mage-Flow Edit load failed with `MissingMageFlowWeight` (`model.visual.patch_embed.proj.weight`) while the pack on disk carried all 1426 tensors. Cause: `model.shouldKeepWeightKey` gained `model.visual.` in its `--no-vision` drop list on 2026-08-20 for the Alis Qwen3.8 packs, and `mage_flow.VisionTower.load` read its `text_encoder/model.safetensors` through `loadWeights` (load_vision = false), so the loader dropped the 524 tower tensors before the backend saw them. The Turbo pack was unaffected (no tower). Fix: `VisionTower.openWeights` reads through `loadWeightsWithVision`. Guard: `VisionTower.openWeights keeps the model.visual tower keys` (writes a two-tensor safetensors, red on the old loader).
-
-### A reference-image editor that honors the requested size distorts every non-square edit (MageFlow Edit)
-MageFlow's edit path is in-context: each reference is VAE-encoded AT THE TARGET SIZE and its latent tokens are concatenated into the DiT image stream beside the denoising target, so target and references share one (lh, lw) grid. The port took (W,H) straight from the request, which defaults to 1024×1024 — and the app ALWAYS sends an explicit size from its resolution picker, so in practice every edit of a phone photo went through a 3:2 → 1:1 bicubic squash before the model ever saw it. Nothing errors; the output is a competent edit of a distorted picture, which reads as "the model is bad at faces" rather than as a preprocessing bug. The reference pipeline never has this problem because it resolves the target from the primary reference (`resolve_target_size(refs[0], …)`, /16 floor) instead of from a request field. Fix (`gen.fitAspect`, applied on the `editUsesRawBytes` path only): the primary reference's ASPECT wins, the requested size is reinterpreted as the pixel BUDGET it's fitted to, result rounded to /16 and logged (`edit: target 1024x1024 -> 1360x768 (primary reference is 1536x864)`). The FLUX edit path is untouched — its references keep their own aspect and its output grid is independent, which is the same principle reached a different way. Two robustness guards landed with it, both in the same "two independent paths must agree" shape: `encodeEdit` asserts the `<|image_pad|>` count equals the merged vision-feature rows (prompt templating and the ViT grid are computed separately; a mismatch dies inside `mlx_put_along_axis`, which is an uncatchable server kill, not an error), and `buildEditPromptIds` caps the templated prompt at `EDIT_DROP_TOKENS + TE_MAX_COND` exactly like the txt2img path — the LM's causal mask is materialized DENSE on the host, so a client prompt of 120k tokens asked for a ~57 GB allocation before a single matmul (live: that request now returns a normal image in 7 s).
-
-### MageFlow's per-generation memory leak lives in engine-mlx.md
-MageFlow leaked ~2.2 GB per megapixel per generation and survived unload — the cause was an mlx ownership idiom (a `mlx_slice` handle wrapped in `contiguous` and never freed, which pins the parent buffer), not anything model- or precision-specific. Full story, diagnosis ladder and guards: `docs/gotchas/engine-mlx.md`, "A slice handle wrapped in `contiguous` and never freed pins its PARENT's buffer".
-
-### A distilled few-step diffusion model can REQUIRE bf16 — f32 washes the output (MageFlow Turbo)
-Porting Microsoft Mage-Flow Turbo (`src/mage_flow.zig`), every component passed bit-parity at cosine 1.0 in f32 (VAE decode, DiT forward masked+unmasked, Qwen3-VL text encoder), the scheduler/Euler/pack glue was hermetically tested, the tokenizer produced byte-identical HF ids, and a step-by-step e2e replay against the f32 reference matched cosine 1.0 at every step — yet the first live 4-step generation was a grey blob with a faint correctly-colored fox (conditioning right, denoising incomplete), and MORE steps made it NOISIER (grid artifacts at VAE-patch scale), not sharper. The reference at the identical seed/size/steps produced a crisp photorealistic fox. The whole f32 pipeline was the bug: **`ModelConfig.precision = bf16`, and the distilled 4-step model washes in f32**. Isolation ladder (each an inline-decoded reference image): watermark-vs-plain noise → identical N(0,1) stats, both wash in f32; f32-model + bf16-rounded freqs → still washes; **f32 → washed, bf16 → crisp at the same 256px**; bf16-DiT + f32-VAE → crisp (only the DiT/encoder need bf16, the VAE upcasts its latent internally and stays on its f32 parity path). Converting the DiT to bf16 exposed a SECOND layer: my bf16 DiT still washed across all seeds while the reference bf16 was crisp. A per-stage tap comparison (img_in/txt_in/temb/rope/block-0/v0 all cosine ≥0.9999) proved the forward was faithful, but the e2e loop diverged from cosine 0.9999 at step 1 to 0.55 at step 4 — the divergence started at step 2, the first step consuming a NON-integer sigma. Root cause: the reference casts the timestep to the model dtype (`timesteps.astype(img.dtype)`) so the model sees a **bf16-rounded** sigma; I fed the full-precision f32 sigma. A distilled few-step model memorizes the exact bf16 timestep→denoising mapping, so an f32 timestep is out-of-distribution → wash. Fix (`roundBf16` in `timeTextEmbed`): round both the timestep value and its sinusoidal frequency table to bf16 on the bf16 path (f32 path leaves them full). Also required for the bf16 port: RoPE rotates in f32 then casts to the compute dtype (`applyRope` — a bf16 rotation drifts over 12 blocks × N steps), and mlx promotes `bf16 ⊕ f32-scalar → f32` so every scalar constant goes through `scalarLike(dtype)` and the param-free LayerNorm returns its input's dtype (else the modulation chain silently upcasts to f32). Class lessons: (1) component bit-parity in ONE precision does NOT prove the multi-step loop — a tiny per-step bias compounds; debug the LOOP by dumping the reference in its NATIVE dtype and comparing per-step latents, and DECODE a suspect latent to tell "washed" from "different-but-valid" (cosine alone can't). (2) f32 is not universally safer than the training precision. Parity workflow: `tests/dump_mageflow_{te,e2e}_fixture.py` (e2e dumps native bf16 for the loop test; TE/DiT/VAE component fixtures cast f32), Zig oracles env-gated on `MAGEFLOW_{TE,E2E_BF16,DIT,DIT_MASKED,VAE}_FIXTURE`.
-
-### DiffusionGemma numerics: garbage canvases amplify chaos; parity-test on converged canvases
-Logit/argmax comparisons against the reference on RANDOM-token canvases are meaningless for correctness: garbage input puts the sigma-MoE router on knife-edge ties, and a single bf16 kernel-order difference flips expert sets, ballooning into multi-unit logit deltas while both outputs are "valid". The meaningful invariant is SELF-CONSISTENCY on a converged canvas (real prompt + the canvas the reference committed → one decoder forward must reproduce it as argmax; reference 63/64 no-sc / 64/64 with-sc). Related: sliding-layer prefill now takes the `"causal"` fast path whenever `total_kv <= sliding_window` (same kernel + reduction order the mlx-lm/mlx-vlm reference picks) — the `"array"`-mask kernel's different reduction order alone degraded diffusion convergence via router-tie flips. Debug aids: `MLX_SERVE_DIFFUSION_TRACE=1` prints per-step mean entropy + acceptance counts and decoder layer-0/self-conditioning tensor heads.
-
-### Per-token AdaLN (LTX I2V): the t2v path must stay byte-identical; tripwire is uniform-mask equivalence
-LTX image-to-video conditions on a reference image two ways (`src/ltx_video.zig`): (1) VAE-encode the image (`vaeEncode`, the mirror of `vaeDecode`) → clean tokens pinned into latent frame 0 via `applyDenoiseMask` each Euler step; (2) **per-token timestep AdaLN** — the DiT is told frame-0 tokens are at `t=0` (clean) while the rest are at `t=sigma`. The native DiT was scalar-AdaLN (one param set broadcast over all tokens); the per-token path runs the VIDEO stream's 9-param self/ff/text-ca AdaLN, the 4-param AV-cross-video AdaLN, the output-head embedded timestep, AND the x0 sigma subtraction PER-TOKEN. Audio, prompt, and AV gates ALWAYS stay scalar (image-only conditioning never sets `audio_timesteps`). This is a CLASS: an optional per-token modulation path bolted onto a scalar one. Two rules: (a) gate the whole thing behind an optional `cond_mask`/`nv_pt` so `nv_pt==0` hits the EXACT, unchanged scalar code (`adalnUnpack`/`adalnRowN`/`outputBlock` all dispatch `nv_pt==0 → scalar helper`), giving zero t2v overhead and zero regression; (b) the regression tripwire is **uniform-mask equivalence** — with `cond_mask` all-ones every token is at the same timestep, so per-token MUST reproduce scalar (the test `per-token AdaLN uniform-mask equals scalar` runs `ditForward` both ways, cos > 0.9999 on video AND audio — verified 1.0/1.0). An equality test against the reference can't catch a scalar-path regression; the uniform-mask self-equivalence test can. Encoder parity (`vaeEncode`, cos 1.0) is decoupled from image preprocessing by feeding the fixture's dumped PIXELS (not a file), so CRF/resize choices never confound the encoder oracle. Live e2e (`tests/test_video_gen.sh` I2V case): a high-contrast split image pinned as frame 0 reconstructs near-exactly (input 20/235 → decoded 20.2/232.8). Fixtures: `tests/dump_ltx_vae_encoder_fixtures.py`. The encoder (`vae_encoder.safetensors`, ~0.6 GB) is a SEPARATE download from the decoder-only q4 bundle — allowlisted in `MediaBundle.swift` but not a ready marker; missing → graceful t2v fallback (logged), mirroring `ref_audio`.
-
-### Anything reading a model's config must read `text_config` FIRST, then the root (nested-config class)
-A multimodal checkpoint (every Gemma 3/4, every Qwen-VL, i.e. MOST of them) puts **every text dim under `text_config`** and leaves only `model_type` / `vision_config` / `quantization` at the root. Two parsers have now shipped this bug, in opposite directions — treat any new config reader as guilty until it handles the nesting:
-- **`model_discovery.parseStubMeta` (the `/v1/models` stub) read the ROOT ONLY**, so every UNLOADED multimodal model advertised `hidden_size: 0, num_layers: 0, context_length: 0, is_moe: false`. The `is_moe` lie is the dangerous one: gemma-4-26B-A4B (128 experts, declared in `text_config`) and Ornith-1.0-35B (256) both reported dense, so a client could not tell a MoE from a dense model without cold-loading 16 GB of weights — and MoE-ness is exactly what gates MTP/drafter defaults. Fixed 2026-07-14: read the nested block first, fall back to the root PER FIELD (a minimal `text_config` may omit a field the root still carries). Symptom signature: a `/v1/models` entry with `loaded: false` whose dims are all `0` while `quantization` (root-level) is correct. Guarded by the multimodal + nested-MoE + root-fallback cases in the `parseStubMeta` test (`model_discovery.zig`).
-- **`model.zig parseConfigFromJson` reads `text_config` but OMITTED fields silently keep struct defaults** — see below.
-
-### Config fields omitted by nested `text_config` fall back to 12b-shaped struct defaults
-`ModelConfig`'s field defaults (`src/model.zig`) are the Gemma-3/4 **12b/27b** shape — `num_attention_heads=16`, `num_key_value_heads=8`, `hidden_size=3840`, 48 layers. A multimodal checkpoint's nested `text_config` is read at `parseConfigFromJson` (lines 458-460), but **omitted** fields silently keep those struct defaults instead of the model family's HF defaults. `gemma-3-4b-it-4bit`'s `text_config` omits `num_attention_heads`/`num_key_value_heads`/`head_dim` and leans on HF Gemma3TextConfig defaults (8/4/256) — so it loaded with 16/8, and the Q projection (`8*256=2048`) crashed reshaping into `(1,1,16,256)` at warmup (issue #43). Symptom signature: **`MLX error: [reshape] Cannot reshape array of size N into shape (1,1,H,D)` during warmup, where N = (real heads)×head_dim and H = the wrong (default) head count.** Rule: when an arm relies on HF per-arch defaults for fields a minimal `text_config` may omit, fill them explicitly in that arm gated on `cfg_obj.get(field) == null` (see the gemma3 arm). Guarded by the two `ModelConfig … gemma3 … head counts` tests in `model.zig` (omitted → HF defaults; explicit → preserved).
-
-### Text-only `*_text` model_types + flat weight prefix (Gemma3ForCausalLM)
-The arm dispatch in `model.zig` keys on the **top-level** `model_type`, and each multimodal family also ships a flat text-only checkpoint with a sibling tag the arm must accept: `gemma3` ↔ `gemma3_text` (Gemma3ForCausalLM, e.g. the abliterated `-lm-` builds), mirroring the existing `gemma4_text`, `qwen3_5_text`, `qwen3_moe_text` pairs. A flat text-only checkpoint has **no `vision_config`/`text_config`**, so its weights live under `model.*`, NOT the multimodal `language_model.model.*`. Two failure modes if the `_text` tag isn't routed: (1) it falls through to the llama-family else arm → `model_type=unknown`, no QK-norm/embedding-scale/pre-FF-norm → loads-but-incoherent; (2) `tie_word_embeddings` defaults false and Gemma ships no `lm_head` tensor (always tied) → **`MISSING WEIGHT: lm_head.weight` crash at load**. Rule: accept the `_text` sibling in the arm, collapse `config.model_type` onto the base tag, pick the prefix by `root.get("text_config") != null ? "language_model.model" : "model"` (mirrors the LFM2 VL split), and force `tie_word_embeddings = true` for Gemma. Also add the tag to BOTH allowlists that gate visibility — `model_discovery.supported_model_types` (Zig; else it's skipped from `/v1/models`) AND `supportedModelTypes` in `HFModels.swift` (Swift; else the model browser flags it "Unsupported architecture"). Guarded by the flat-`gemma3_text` routing + multimodal-prefix tests in `model.zig`, the discovery test in `model_discovery.zig`, and `testGemma3TextIsSupportedArchitecture` in `DownloadManagerLayoutTests.swift`.
-
-### hy_v3 MoE expert container name varies by converter (`mlp.experts` vs `mlp.switch_mlp`)
-The stacked hy_v3 experts ship under **two different tensor-container names** depending on who converted the checkpoint: ox-ox-style MLX builds use `model.layers.N.mlp.experts.{gate,up,down}_proj.*`, while **mlx-lm's converter** (every `mlx-community/Hy3-oQ2*` and `pipenetwork/Hy3-REAP*` build) names the SAME `[E, out, in]` tensors `model.layers.N.mlp.switch_mlp.{gate,up,down}_proj.*`. The `is_hy3` binding arm (`transformer.zig`) hardcoded `mlp.experts.*`, so every mlx-lm-converted hy_v3 checkpoint died at load with **`MISSING WEIGHT: model.layers.1.mlp.experts.gate_proj.weight`** during "Precomputing MoE layer weights…" (layer 1 = first MoE layer after `first_k_dense_replace`). Live 2026-07-16 (both the default `Hy3-oQ2e` and a REAP-pruned build). Fix: `hy3ExpertContainer` probes `mlp.experts.gate_proj.weight` once per layer and threads the resolved container (`mlp.experts` if present, else `mlp.switch_mlp`) through the 9 expert fetches via `moeExpertSuffix` — same layout, so an ox-ox checkpoint is byte-identical (probe prefers `experts`). Router (`mlp.router.gate.*`, quantized on REAP / bf16 on oQ2e — optional scales handle both), shared expert (`mlp.shared_mlp.*`), and `mlp.expert_bias` names are unchanged across converters. Rule: never hardcode ONE MoE-expert container name for an arch whose checkpoints come from multiple converters — resolve it by probe. Guarded by the `hy3ExpertContainer resolves both mlx-lm switch_mlp and ox-ox experts naming` test (transformer.zig); the ox-ox path stays the default-preferred branch. NOTE: this is a load-path naming alias only — mlx-lm's `switch_mlp` name matches what the qwen3_5_moe arm already uses, so the forward (`moeMLP2`, sigmoid routing) is name-agnostic once bound.
-
-### Gemma `<end_of_turn>` (106) leaks when config declares a scalar eos
-Gemma's chat template always ends turns with `<end_of_turn>` (id 106), but `<end_of_turn>` is NOT the tokenizer's `eos_token` (that's `<eos>`/1) and is only a stop token if it's in `ModelConfig.eos_token_ids`. The full Gemma checkpoints ship `eos_token_id: [1, 106, 50]` (array → all added by the common parse), but minimal checkpoints (the abliterated text-only build) ship a **scalar `eos_token_id: 1`**. Gating the 106 add on `num_eos_tokens == 0` was then defeated by the scalar `1`, leaving 106 out of the stop set → generation never halts at the turn end and **leaks repeated `<end_of_turn>` into the visible content** (`finish_reason` still eventually `stop`). Same class as the Qwen2.5-Coder `<|im_end|>` leak handled by the load-path merge (`main.zig`/`scheduler.zig doLoad`). Rule: never gate a known chat-terminator on "config provided no eos"; merge it ADDITIVELY + dedup-guarded. All three Gemma arms call `config.ensureGemmaTerminators()` (adds 1 + 106 if absent); guarded by the scalar-eos parse test + the `ensureGemmaTerminators` idempotence test in `model.zig`.
-
-### Quantization modes (nvfp4 / mxfp4 / mxfp8)
-`config.json`'s `quantization.mode` lands on `ModelConfig.quant_mode` (default `affine`; unknown → `error.UnsupportedQuantMode` at parse). Non-affine modes store NO `.biases` tensors and use uint8 fp8-encoded scales — but mixed QAT checkpoints (gemma-4 `*-qat-nvfp4`) override some layers to affine 8-bit/gs64 WITH bf16 scales + biases, so resolution is PER WEIGHT (`transformer.computeQuantParams`, cached by scales ctx): uint8 scales → config's fp8 mode; float scales → affine, with (bits, group_size) solved from the activation inner dim (`w_cols*32/s_cols` alone only pins bits×gs). Two loader rules: `.biases` fetches are mandatory under affine, OPTIONAL under non-affine modes (`getLayerBias`) — never skipped, or the affine-override matmuls break; and never gate fp8-vs-affine on `biases.ctx == null` alone (that's the legacy mxfp8-inside-affine heuristic in `qmatmulBits`, kept for NVIDIA Nemotron mxfp8 layers).
-
-### Parity fixtures for fp16-fragile giants must be dumped fp32-CPU (MPS-fp16 fixture-corruption class)
-A cos oracle that fails around ~0.3 while every per-layer bisect of the port is clean means the FIXTURE is corrupt, not the engine. Live bite (2026-07-04, paint DINOv2-giant): the fixture was dumped with torch fp16 on MPS; dinov2-giant's hidden magnitudes grow to ~400 by the deep layers and the MPS fp16 run collapses to corr 0.2985 vs fp32-CPU — while the MLX fp16 engine (fp32-accumulating matmuls) hits 0.999995 against the fp32 truth. No NaN/inf in the bad fixture — it just quietly decorrelates, so nothing "fails" at dump time. Diagnostic that found it (reusable): re-run the SPEC in numpy from the CONVERTED safetensors; if numpy matches the Zig output but not the fixture, bisect fixture-vs-fp32-CPU per layer (`output_hidden_states=True`) — embeddings clean + all layers clean + final mismatch ⇒ the dump dtype/device is the bug. Rules: (1) dump reference fixtures for deep ViTs/DiTs in **fp32 on CPU** unless deliberately reproducing the reference's production dtype (SD-class UNets/VAEs are fp16-safe — the paint VAE fixture at fp16-MPS matched at 0.9999); (2) when an oracle misses badly, suspect the fixture BEFORE rewriting the port — the numpy-spec-repro takes minutes and localizes the fault to spec vs mechanics vs fixture. See `tests/dump_hunyuan3d_paint_fixtures.py` (the fp32 DINO dump carries the war-story comment).
-
-### transformers ≥5.x zeroes custom-model rotary buffers → identity-RoPE reference (fixture-corruption class)
-A SECOND way reference fixtures silently corrupt (beside the MPS-fp16 dtype one): loading a custom-code (`trust_remote_code`-style) checkpoint under transformers 5.x leaves every `Qwen3RotaryEmbedding.inv_freq` NON-PERSISTENT buffer as ZEROS — the meta-device init materializes it empty, the checkpoint doesn't contain it, and the re-init hook only covers transformers' OWN model classes. cos=1/sin=0 → the whole reference runs IDENTITY RoPE and dumps decorrelated-but-plausible fixtures. Live bite (2026-07-05, ACE-Step): the Zig DiT oracle sat at 0.66 while a no-rope variant "passed" at 0.99996 — the tell that the FIXTURE, not the port, was unrotated (my rope was already proven by the AutoModel-based text-encoder oracle, which uses transformers' own class and was unaffected). Diagnostic ladder that found it (reusable): stage-bisect fixtures (timestep/proj_in/layer0) → sub-block bisect (norm/self-attn/cross/mlp, each fed REFERENCE inputs) → a no-rope attention variant → probe `named_modules()` for all-zero `inv_freq`. Fix in `tests/dump_acestep_fixtures.py`: after `from_pretrained`, rebuild each zeroed rotary from a FRESH instance of its own class (`type(mod)(config=mod.config)`) and copy `inv_freq`/`attention_scaling` over. Rules: (1) any fixture-dump script that loads custom modeling code must assert no `*.rotary_emb.inv_freq` is all-zero; (2) when an oracle improves by REMOVING a transform, suspect the fixture's transform was silently disabled before touching the port; (3) to localize a DiT parity miss, dump torch intermediates (timestep/proj_in/per-layer, then per-sub-block fed REFERENCE inputs) and cos-compare stage-by-stage — a throwaway pair of dump script + env-gated Zig test, deleted once the bug is found (the 6 committed `ACESTEP_*` oracles are the permanent gate).
-
-### Voice cloning (Qwen3-TTS Base) = ECAPA-TDNN speaker embedding, and a `TimeDelayNetBlock` is conv + ReLU
-Zero-shot voice cloning on the `-Base` checkpoints runs the reference clip (24 kHz mono) through `mel_spectrogram` (slaney filterbank + symmetric-Hann STFT via `mlx_fft_rfft`) → an **ECAPA-TDNN speaker encoder** (`SpeakerEncoder` in `tts.zig`, weights `speaker_encoder.*` in the main safetensors, stored MLX conv layout `[out,k,in]` — load WITHOUT transpose, unlike the codec) → a `[1, t_hidden]` embedding, spliced as ONE extra position in the talker's codec prefix (mirrors `_prepare_generation_inputs`). API: `/v1/audio/speech` accepts `ref_audio` (base64 24 kHz-mono WAV); the app's `AudioGenService` sends the recorded/picked clip. With-transcript "ICL" cloning (codec encoder + Whisper) is NOT implemented — `ref_text` is ignored; the speaker-embedding path needs no transcript. There are **no predefined voices** on Base models (`spk_id: {}`); named voices are a `custom_voice`-model feature we don't ship. **GOTCHA that cost a fidelity gap:** ECAPA's `AttentiveStatisticsPooling.tdnn` is a `TimeDelayNetBlock`, which is `conv → ReLU` (every `TimeDelayNetBlock.__call__` ends in `nn.relu`). Porting it as bare `conv` (then tanh) — missing the ReLU — gave a deterministic embedding cos 0.9989 / norm +3% (clone voice-sim 0.977 vs the reference's 0.986). Adding the ReLU made the embedding BIT-EXACT vs the Python oracle (cos 1.000000) and lifted clone fidelity. Validated by `tts.zig`'s "speaker encoder (ECAPA-TDNN) matches the Python oracle" test (`TTS_TEST_MODEL`/`TTS_SPK_REF`/`TTS_SPK_EMB`; cos>0.998) + the mel sub-check (`TTS_SPK_MEL`, f32-exact). Rule: in an ECAPA/SpeechBrain port, every TDNN block carries an implicit ReLU — never drop it when fusing with a following activation.
-
-### Embedding lookup must reshape to the table's NATIVE width, not a config-derived `hidden` (Qwen3-TTS 0.6B crash)
-`tts.embed(table, ids, hidden)` gathers rows with `mlx_take_axis` (always the table's native width) then reshapes to `[1, N, width]`. It used to reshape to the PASSED `hidden`, which is only correct when the table's native width equals it. On the Qwen3-TTS **0.6B-Base** checkpoint the `text_embedding` table is 2048-wide but the talker `t_hidden` is 1024 (a `text_projection` fc1/fc2 bridges 2048→1024 right after) — so `projectText` passed `t_hidden`=1024 and the reshape of a `[N,2048]` gather into `[1,N,1024]` threw `MLX error: [reshape] Cannot reshape array of size 24576 into shape (1,12,1024)`, an UNCATCHABLE C++ exception that crashed the whole unified server. The 1.7B-Base worked only because its `text_embedding` happens to be `t_hidden`-wide (2048). Fix: `embed` now reads the width from `getShape(table)` and ignores `hidden` (the gather is always native-width, so this is correct for every caller — text/codec/cp/rvq tables). Rule: an embedding reshape's width comes from the WEIGHT, never from a sibling config dim — they diverge whenever a projection sits between the lookup and the residual stream. Guarded by the `embed uses the table's native width` hermetic test in `tts.zig` (red-on-revert: reshape size-mismatch). Audio panel only offers `qwen3_tts` models — the native engine dispatches on `model_type`, so the old gpt2-based MOSS-TTS can't load (removed from the catalog).
-
-### A GGUF folder is a SHELF OF MODELS, not a model (per-quant identity class)
-An MLX checkpoint is a directory; a GGUF repo is a directory of independently-loadable quants (`Qwen3.5-4B-Q4_K_M.gguf`, `-IQ4_NL.gguf`, `-Q8_0.gguf`, …) PLUS non-LLM sidecars. Every layer that assumed "one folder = one model" broke a different way (all fixed 2026-07-13):
-- **Discovery emitted one model per folder** (`DownloadManager.makeLocalModel` picked the alphabetically-smallest `.gguf`), so the tray picker could only ever offer ONE quant of a repo you had two of — the others were invisible to the entire app. Now `makeLocalModels` (plural) returns one `LocalModel` per quant, `path` = the FILE (which is what the server already loads, so picking a quant needs zero server change), `id` carries a `#<file>` suffix (same id ⇒ SwiftUI collapses the rows), and `LocalModel.displayLabel` = `repo · QUANT` (`name` stays the repo — filters/grouping key off it). `duplicateNames` is computed on `displayLabel`, NOT `name`: macOS `.menu` Pickers key the checkmark by item TITLE, so two same-titled rows both render selected.
-- **`existingModelDir` gated on `config.json`**, which a GGUF download never writes — so it returned nil for every GGUF folder, `isReady`'s GGUF fast-path *underneath that guard* was dead code, and a downloaded quant stopped resolving the moment the in-memory download row went away (i.e. after relaunch). It now accepts config.json OR a servable `.gguf`.
-- **Delete/cancel were folder-scoped.** Deleting one quant (or cancelling a SECOND quant's download — `finalizeIfCancelled` wipes the whole download dir) took every sibling quant with it. `removeGgufQuant` deletes one file and only drops the folder when the last servable quant goes; `startGguf` records the in-flight filename so a cancel is scoped to it.
-- **A repo never reaches a terminal "on disk" state.** Owning Q4_K_M says nothing about wanting Q8_0, so the Discover action cell stays a menu forever (`GgufQuantMenu` + pure `GgufQuantMenuModel`): ✓ on-disk quants (click = Use), the rest downloadable, per-quant Delete. The old `.onDisk` collapse to "✓ On disk" + trash left NO way back to the quant picker.
-- **Not every `.gguf` is a quant — sidecars are the trap.** `mmproj-*.gguf` (CLIP) was known; a SPEECH TOKENIZER is the other (live: `qwen3-tts-tokenizer-f16.gguf`, 341 MB, beside `qwen3-tts-0.6b-f16.gguf`). Enumerating every file in a folder EXPOSES this — the old alphabetical pick dodged the tokenizer only by luck of the name. `DownloadManager.isGgufSidecar` / Zig `model_discovery.isGgufSidecarBasename` (mmproj prefix + `tokenizer` substring) are the filter, and they MUST stay in sync: the app lists every quant as selectable, so a file the client offers and the server can't load is a user-visible dead end (the server's `scanLlmGguf` picks alphabetically and would have loaded a tokenizer as the LLM in any repo whose sidecar sorts first). **Rule: adding a new `.gguf` companion convention means updating BOTH classifiers.** Guards: `GgufQuantTests` (Swift, incl. the tokenizer case) + `isGgufSidecarBasename` (Zig).
-
-### A checkpoint declaring an affine bit-width MLX has no kernels for kills the server at warmup — reject at config parse (2026-07-20)
-MLX ships affine quant Metal kernels only for bits {2,3,4,5,6,8}; `ops.cpp` rejects anything else — but only inside `quantize()`. An ALREADY-quantized checkpoint (config.json `"quantization": {"bits": 1, ...}`) never calls `quantize()`, so it loads all weights, precomputes, compiles kernels, and then dies during warmup with `MLX error: [metal::Device] Unable to load kernel affine_dequantize_bfloat16_t_gs_128_b_1` — an uncatchable process kill (same class as Metal OOM: prevention only). Live bite: `prism-ml/Bonsai-27B-mlx-1bit` (a 1-bit qwen3_5 conversion presumably made against a newer/patched runtime). With `--model` at boot the whole server died; via cold-load it would have killed it mid-traffic.
-- **Fix**: `parseConfigFromJson` validates `quant_bits` against {2,3,4,5,6,8} when `quant_mode == .affine` (non-affine modes have their own bit semantics; bits 0 = dense) → `error.UnsupportedQuantBits` with a message naming the supported set. Headless cold-load now returns a clean 500 `model_load_failed` and the server keeps serving other models (verified live); boot with `--model` exits with the clear message instead of the Metal abort.
-- **Defense in depth already present**: `affineParamsFromGeometry` (the per-weight solver) only ever returns bits in the supported set, so a mixed checkpoint can't sneak an unsupported width past the config guard — the config-level `quant_bits` fallback was the ONLY path to an unsupported dispatch.
-- **Rule**: when bumping the mlx submodule, if upstream adds a bit-width (e.g. 1-bit), extend the switch in `parseConfigFromJson` AND the one in `affineParamsFromGeometry` together. Guard: `parseConfigFromJson rejects affine bits MLX has no kernels for` (model.zig, red pre-fix).
-
-### MageFlow 8-bit: the two things shape alone gets wrong, and what the fixtures actually measure (2026-07-24)
-
-Porting krea's `MixedLinear` into `src/mage_flow.zig` as `MfLinear` (dense bf16 OR affine-quantized, `(bits, group_size)` solved per tensor from packed geometry) was the mechanical half: 43 `linearT` sites, ~32 of which became `MfLinear.forward`, VAE untouched. All ten env-gated bf16 parity fixtures stayed byte-identical afterwards, which is what a `maxAbsDiff == 0.0` unit test on the dense path predicts.
-
-**Lookup tables are invisible to a shape rule.** The converter's `should_quantize` is shape-driven (rank 2, `in % 64 == 0`, `min(out,in) >= 512`) and that is right for every real linear. It is also true of `model.language_model.embed_tokens.weight` [151936, 2560] and `model.visual.pos_embed.weight` [2304, 1024], both of which the engine reads with `mlx_take_axis`. Packing them yields a gather over uint32 words — not an error, just wrong rows. No shape test can distinguish them, so `NEVER_QUANTIZE` is an explicit list. Cost of getting it right: 0.78 GB stays bf16 (the biggest single "keep" in the manifest).
-
-**Sizes, measured.** 17.45 GB of weights → 9.16 GB (txt2img) / 9.74 GB (edit). The DiT is 99.97% 2-D linears so it quantizes almost completely (8.23 → 4.38 GB). Pruning is worth ~1 GB on top: `pipeline.y_embedder.encoder.*` (69 MB) is the VAE's training-time encoder half and is dead in BOTH modes, while `model.visual.*` (830 MB) and `student.dconv_encoder.*` (132 MB) are loaded only when `is_edit`. A wrong prune fails loudly (`ownWeight` errors on a missing key), which is what makes aggressive pruning safe.
-
-**A fixture cosine on an 8×8 latent is a sensitivity probe, not a quality measure.** 8-bit vs the PyTorch reference: DiT forward 0.9956 (bf16: 1.0000), e2e 4-step final 0.9902 (bf16: 0.9998), edit loop 0.9515 (bf16: 0.9942). The edit number looks alarming and is not — same seed, same prompt, the 8-bit edit is indistinguishable from bf16 (same snow placement, same identity, same rug), and multi-reference composition differs only by a slight neon tint. Judge images; the fixtures tell you whether the code path is intact.
-
-**The AdaLN modulation projections are the biggest target AND the riskiest one.** `img_mod.1` + `txt_mod.1` are [18432, 3072] × 12 blocks = 2.72 GB, 33% of the DiT, and they sit on the timestep conditioning path this checkpoint is known to be picky about. Holding them back (`--keep-bf16 img_mod.1,txt_mod.1`) improves DiT forward 0.9956 → 0.9980 and e2e step-4 0.9902 → 0.9953, but barely moves the edit loop (0.9515 → 0.9576) and costs +1.27 GB. Not worth it at 8-bit — nothing shows in the output. Re-measure before assuming that at 4-bit. `MfLinear` reads bits per tensor precisely so this stays a converter flag, never a code change.
-
-### A configless repo shape has to be taught to every "is this a model?" answer (2026-07-24)
-
-MageFlow ships no root `config.json` — `model_index.json` is the only signal, and the weights live in `transformer/`, `text_encoder/`, `vae/`. `peekConfig` knew that (its `peekMageFlowIndex` fallback fires when `config.json` won't open). It was dead code: `tryAddModel` ran `statFile("config.json") catch return false` several lines EARLIER, so the fallback was never reached. Two more facets of the same miss: the byte scan only summed `*.safetensors` at the top level (so a discovered MageFlow model would report a null size), and `cli.zig` carried a third private `isModelDir` testing only config.json-or-gguf.
-
-Net effect: every MageFlow checkpoint — including the two official ones, downloaded and working — was invisible to `mlx-serve list`, `/v1/models` and the app's picker, for as long as the backend has existed. It went unnoticed because the feature was developed and validated with `--model <path>`, which bypasses discovery entirely.
-
-- **Fix**: `tryAddModel` falls through to `peekConfig` when either config.json OR a MageFlow index is present; `sumComponentWeights` sums one level down, but only when the flat scan found nothing (so the common MLX layout pays nothing); `peekMageFlowIndex` is now `pub` and `cli.zig` calls it instead of keeping its own answer.
-- **Rule**: a new repo LAYOUT (not just a new model_type) has to be taught to every classifier that answers "is this a model?" — currently `model_discovery.tryAddModel`, `model_discovery.peekConfig`, `cli.isModelDir`, and Swift's `existingModelDir`. A layout that only `--model` can load is a layout the app cannot see.
-- **Guards**: `discoverModels finds a MageFlow repo (model_index.json, no root config.json)` (asserts the size too — null was the second facet) and `cli: isModelDir accepts a MageFlow repo`, which also pins that an unrelated diffusers pipeline (`StableDiffusionPipeline`) stays hidden.
-
-#### Second instance: an mflux conversion with no index either (2026-07-29)
-
-`mlx-community/flux2-klein-9b-4bit` is the only MLX build of FLUX.2-klein 9B, and its layout is the 4B's minus one file: `transformer/`, `text_encoder/`, `vae/`, `tokenizer/`, no root `config.json`, and no `model_index.json` to fall back to. All three classifiers above had to learn a shape for the second time.
-
-- **Signal**: the DiT's own weight name, `double_stream_modulation_img`, not a directory shape. `transformer/` + `vae/` + `text_encoder/` describes most of diffusers, so a shape test adopts every future MLX conversion of anything; a weight name IS the architecture. `peekMfluxFlux2` reads the shard index when there is one and the first shard's safetensors HEADER when there isn't (a single-file conversion has no index) — in both cases a bounded 1 MB prefix via `readSliceShort`, never `allocRemaining`, which on a 2 GB shard either eats the RAM or (with a cap) errors `StreamTooLong` and silently declines the model.
-- **No third copy**: `model_discovery.zig` imports only `std` + `log`, so `gen.zig` can import IT. `gen.peekModelType` delegates rather than duplicating (the MageFlow round has two copies kept in sync by comment). `cli.isModelDir` calls the same predicate.
-- **App side**: `MediaBundle.flux(...)` listed `config.json` as a ready marker, so a complete 10 GB download of this repo would read as permanently incomplete and the pane would offer Download forever — the Kokoro-reusing-`tts()` bug exactly. `hasRootConfig: false` is a fact about the repo, declared per preset, not a preference.
-- **Guards**: `discoverModels finds an mflux FLUX.2 repo (no root config.json)`, `flux2 detects from an mflux conversion with no root config.json`, `cli: isModelDir accepts an mflux FLUX.2 repo (no config.json at all)` — each also pinning that a same-shaped repo with different weight names stays hidden — plus `testKlein9BBundleDoesNotRequireARootConfigItNeverShips`.
-
-### A model family's geometry belongs to the checkpoint the moment a second size exists (2026-07-29)
-
-Adding klein 9B to the app is a five-line preset. Running it was not: `FluxConfig`'s struct defaults WERE the 4B (5 double / 20 single blocks, inner 3072, 24 heads, joint 7680, encoder 2560/9728), `loadDit` did `d.cfg = .{}` and allocated `cfg.double_layers` blocks from it. Against a 9B checkpoint that loads 5 of its 8 double blocks and 20 of its 24 single blocks, raises NO error (the extra blocks are simply never asked for), and generates a plausible, wrong image.
-
-Reading mflux's `AVAILABLE_MODELS` shows the entire 4B→9B delta is six numbers — `num_layers` 5→8, `num_single_layers` 20→24, `num_attention_heads` 24→32, `joint_attention_dim` 7680→12288, encoder `hidden_size` 2560→4096, `intermediate_size` 9728→12288 — while head_dim 128, in_channels 128, mlp_ratio 3, RoPE theta 2000, the 36 encoder layers and the 9/18/27 taps are shared. The VAE is byte-for-byte the same tensor set (266 tensors, identical shapes), and so is the tokenizer.
-
-- **Source of truth**: the WEIGHT SHAPES. Neither checkpoint carries the numbers in json (the 9B has no config.json at all; the 4B's records only its quantization), and shapes are the one source that cannot disagree with the tensors about to be loaded. `ditConfigFrom`/`teConfigFrom` are pure functions over a probe struct, so they unit-test without mlx; the loaders fill the struct with `rowsOf` / `logicalInDim` / `countIndexed`.
-- **Trap**: encoder head counts come from `q_proj`/`k_proj` ROWS, never `hidden ÷ head_dim`. The latter reads 32 on the 9B (right, by luck) and 20 on the 4B (wrong — it has 32 q heads over a 2560 hidden).
-- **Trap**: `ff.linear_in` emits gate+up fused, so `mlp_ratio` is its rows ÷ 2 ÷ inner. Reading it as rows ÷ inner gives 6.
-- **A zero probe leaves the field alone** rather than writing 0 — an unreadable shape must not produce a `alloc(0 blocks)` that "succeeds". Whatever is actually missing gets named by the weight load a few lines later.
-- **Verified no-op on the 4B**: the derived values log identically to the old hardcoded ones (`inner=3072 heads=24x128 double=5 single=20 joint=7680`, `hidden=2560 layers=36 heads=32/8 inter=9728`) and a live 512² generation is unchanged.
-
-### `fitAspect` preserved the aspect; `normalizeSize` threw it away one step later
-Found by pre-merge review of the MageFlow branch (2026-07-25). The edit path already had the right idea: MageFlow edits AT the target grid, so a square request would squash a 3:2 photo, and `fitAspect` was added to reshape the requested size to the primary reference's aspect at the same pixel budget. Its unit test passed. The integration test passed. The geometry was still wrong for most real inputs.
-
-`fitAspect`'s result goes straight into `engine.normalizeSize`, which clamps width and height **independently** through `clampKreaDim` (`[256, 2048]`). Independent clamping is not aspect-preserving. Verified against the real functions:
-
-```
-source    4032x3024  aspect 1.3333      (a 12 MP 4:3 phone photo)
-fitAspect 4032x3024                     (correct — matches the source)
-clamped   2048x2048  aspect 1.0000      (squared off)
-```
-
-So `fitAspect` did its job and the very next call undid it, producing the exact failure it was written to prevent. Reachable through the most ordinary call there is: `client.images.edit(image=…, prompt=…)` with no `size`, on any photo whose long edge exceeds 2048 — which is every modern phone camera.
-
-Why no test caught it: **every fixture was under the cap.** The unit test's "match source" round-trip used `{1152,768}, {2048,512}, {640,1600}, {512,512}`; `tests/test_mageflow_edit.sh` generates a 1152x768 source. Below 2048 the clamp is a no-op, so the composition looks correct from every angle the suite could see. A test suite that only samples inside a threshold cannot see a bug that lives above it.
-
-- **Fix**: `resolveEditTargetSize` = `fitAspect` (aspect at the budget) → `fitWithinCap` (scale BOTH dimensions by one factor until neither exceeds the cap, /16). The cap comes from `ImageEngine.maxDim()`, so the edit path gets the ceiling as a NUMBER to scale toward rather than a clamp to be squared by.
-- **Drift guard**: `maxDimFor` and the clamps encode the same ceiling in two places, so `maxDim matches what normalizeSize actually clamps to` asserts `clampFluxDim(99999) == maxDimFor(.flux)` and the Krea/MageFlow pair. Widening a clamp without touching `maxDim` reintroduces the squash silently, so the drift test is the actual long-term guard.
-- **Rule**: when one step establishes an invariant and a later step re-derives geometry, test the COMPOSITION, not the step. And pick fixtures that straddle every threshold in the pipeline — an all-under-the-cap corpus proves nothing about the cap.
-- **Guards**: `resolveEditTargetSize keeps the reference's aspect ABOVE the backend cap` (4:3 and 3:2 in both orientations, plus a huge square that must stay square, plus the under-cap round-trip so the existing sizeless behavior is pinned unchanged), and `tests/test_mageflow_edit.sh` now also drives a 3024x2016 source and asserts the output is within the cap AND still 3:2. Verified red on revert.
-
-### Laguna YaRN: the checkpoint's `attention_factor` is not the mscale the model was trained with
-
-Found 2026-07-28 before a single Laguna-XS number was recorded, by reading poolside's own
-MLX implementations rather than trusting the config.
-
-Laguna's full-attention layers use YaRN with `factor: 32.0`. MLX's YaRN computes its
-default mscale as `0.1 * ln(factor) + 1 = 1.3465735…` when `mscale`/`mscale_all_dim` are
-left at their defaults. **Both vendored MLX Laguna implementations deliberately do not
-forward the HF `attention_factor` field** (`LagunaRuntimeModel.swift:42-48`), and
-poolside's fused RoPE kernel hardcodes the computed result, `1.3465735912322998f`.
-
-`model.zig` read the field verbatim into `config.yarn_attention_factor`, which
-`transformer.zig` applies as the mscale on the rotated dims of full-attention layers:
-
-```
-Laguna-S-2.1  config: "attention_factor": 1.3465735902799727   ← equals the computed value
-Laguna-XS-2.1 config: "attention_factor": 1.0                  ← does NOT
-```
-
-So S matched **by luck** and XS would have silently run 10 of its 40 layers with unscaled
-YaRN RoPE. Nothing crashes; the model just attends slightly wrong at long range, and every
-benchmark taken on it would be measuring a subtly different model than the reference.
-
-- **Fix**: the `laguna` arm stops reading `attention_factor` and computes
-  `0.1 * @log(yarn_factor) + 1` (guarded on `yarn_factor > 1.0`). The generic nested-rope
-  YaRN reader is untouched — other architectures legitimately honour the field.
-- **Why S stays provably unchanged**: the computed value equals the value S ships, so the
-  pre-existing S config test passes without modification. That is the regression guard.
-- **Rule**: when an arch's reference implementation deliberately IGNORES a config field,
-  the field is not the source of truth for that arch — pin the value the checkpoint was
-  trained with, and make the two configs agree by construction rather than by luck. A
-  config field that happens to hold the right number on the model you tested is the most
-  expensive kind of coincidence.
-- **Guard**: `ModelConfig: laguna YaRN mscale is COMPUTED, never read from
-  attention_factor (Laguna-XS ships 1.0)` — a config carrying `1.0` must still parse to
-  `1.3465735…`; verified red before the fix.
-
-## An imatrix is only valid for the weights it was collected on (2026-08-01/02)
-
-The imx mirror shipped 2026-08-01 was calibrated with the only published DSV4
-imatrix — antirez's `DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat`,
-committed 2026-05-12, i.e. collected on the PREVIEW checkpoint. 0731 retrained
-the weights. Live symptom that kicked off the investigation: the o-for-0 digit
-class (`1o` for `10`, `#ff0o0o`) making a pi-driven Three.js build loop on
-self-repair (5 of 8 initial file writes corrupted; the model twice
-re-introduced the corruption while rewriting, then got confused by its own
-grep; run cut by `[length]` at 26K ctx — full record in the session
-post-mortem).
-
-Collection: `lib/ds4/ds4 --imatrix-dataset gguf-tools/imatrix/dataset/
-rendered_prompts.txt --imatrix-out … --ctx 32768` over antirez's official
-imatrix-fixed-0731 GGUF (97.6 GB donor, resident on 128 GB; prebuilt Jul-15
-binary no longer matched the checked-in Metal sources — `make ds4` first). Full
-corpus 2.9M tokens / 4,692 prompts / 747.6M routed observations in ~3.2 h at
-~250 tok/s prefill. The known upstream delimiter bug (fixed on the mxfp4
-branch) split exactly 2 prompts that quote the collector's own source —
-negligible, but cherry-pick `0a62b39` on the next ds4 bump.
-
-Numbers that justify the class rule:
-- preview vs our 0731 collection: median Pearson 0.66, top-5%-channel Jaccard
-  0.33; per-expert slices ~85% of experts decorrelated (r<0.9).
-- our collection vs ox-ox's independent 1.5M-token 0731 collection: 0.85 —
-  two same-weights collections agree far better than either agrees with
-  preview, so the movement is the retrain, not donor/sampling noise. (ox-ox
-  published the first 0731 `.dat`; ours doubles the token count. Their README's
-  structural analysis holds here: post-RMSNorm gate/up statistics are near-flat
-  across channels, so an imatrix mostly informs `down`.)
-- pilot on real 0731 shards (L3/21/40 × w1/w2/w3, today's recipe, old-cal vs
-  new-cal, scored under the new statistics): w2 (3b) −5.5..−10.3% weighted
-  error, w1/w3 (2b) −0.4..−0.7%. 7 wins / 2 ties / 0 losses.
-- v2 vs preview-cal build, live: char precision 35 vs 38 slips; task set 4/5
-  both; o-for-0 collapse rate UNCHANGED (1/12 sampled arms each — the collapse
-  is a 2-bit near-tie property: `o`≈`0` in numeric contexts everywhere in
-  training text, quant noise flips the nearest tie first, then the model
-  copies its own slip → all-or-nothing corruption; greedy oracle parity
-  exonerates the engine). test_dsv4.sh 14/14, template 17/17, greedy pins
-  UNCHANGED, DSpark acceptance 3.79/round at 53.3 tok/s sampled.
-
-Two operational traps caught in the same round: (1) re-converting the mtp
-group is NOT byte-stable across sessions (59/149 tensors drifted at rounding
-level in scales+packed words with identical headers) — the stage byte-identical
-rule is enforced by copying the proven shard, never re-converting; (2) the
-memory preflight legitimately refuses the ~102 GB mirror on a box with a
-browser open (~105 GB "available") — `DSV4_TEST_SKIP_PREFLIGHT=1` in
-test_dsv4.sh mirrors how the mirror is actually served, default stays strict.
-
-## The DSV4 echo-precision saga was a TOKENIZER bug (2026-08-02, iq2 week)
-
-Symptom history: DSV4 mirrors slipped single characters in verbatim material
-(`1o` for `10`, invalid hex, split digits, the sampled o-for-0 collapse) at a
-rate that survived the imatrix recalibration (38→35 char-precision slips).
-During iq2-codebook bring-up the
-new mirror slipped 38-40/70 on the char-precision battery while the SAME GGUF
-weights served through the embedded ds4 engine scored 0/70.
-
-Elimination ladder (each step a real discriminator, all on live boots):
-MV kernels off → identical; f32 expert activations → identical; AR fused
-kernels off → identical; affine canonical on our
-engine → 36/70 (same level); the python reference oracle on the canonical →
-uuid echo PERFECT. Per-case table: the ONE clean case everywhere was the one
-without digit-dense payload. The three clean systems (oracle, ds4) tokenize
-with their OWN encoders; every slipping config used tokenizer.zig.
-
-The probe that ended it (no GPU): `/tokenize` "100" → ours [1,0,0] per-digit;
-canonical HF `tokenizers` → [1457] = "100" one token. DSV4's tokenizer.json
-pre_tokenizer rule 1 is `Split(Regex: \p{N}{1,3}, Isolated)` — greedy 3-digit
-groups — while our hand-rolled gpt2PreTokenize implemented the QWEN reference
-(bare `\p{N}`), correct for Qwen3.6 (which declares single digits — surveyed)
-and wrong for DSV4. Every number the model ever read through our server was
-per-digit segmented — off-distribution for a model trained on {1,3} groups —
-so verbatim digit recall degraded exactly like a quantization-quality bug,
-which is what everyone (including the quality batteries) attributed it to.
-
-Fix: `Tokenizer.digit_group` parsed from the Split rule (exact match on
-`\p{N}{1,3}`, conservative default 1), pattern 3 consumes up to that many
-digits. Char-precision went 38-40 → **0/70** on the iq2 mirror. Guards:
-gpt2PreTokenize group tests (["104","857","6"] etc.), digitGroupFromPreTokenizer
-parse tests, Qwen single-digit behavior pinned unchanged.
-
-Meta-lesson: when a quality defect is INVARIANT across engine configs and
-quant recipes, stop ablating the engine — diff the PROMPT ENCODING against an
-independent tokenizer first. It is a two-minute check that would have saved
-days. (Also: the iq2 bring-up's ds4-vs-native cross-check is what surfaced
-this — an independent-implementation oracle earns its keep.)
-
-## Uniform ≤2-bit experts to the last layer cause TURN-LEVEL agent loops (2026-08-02, tail4)
-
-The shipped DSV4 mirror (`ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit`,
-115.4 GB, HF commit `be89f88`) is the **tail4** build: imatrix-calibrated
-2b/g128 gate/up + 3b/g128 down experts on layers 0-38, but AFFINE 4b/gs64
-experts on the last 4 layers (39-42). The 4-bit tail exists because the
-uniform low-bit build had a failure mode no token-level gate could see:
-**turn-level agent repetition loops**.
-
-Mechanism: the same near-tie physics as the o-for-0 collapse, lifted from the
-token level to the DECISION level. At a turn boundary the model weighs "am I
-done" against "verify once more"; 2-bit expert noise in the late layers flips
-that near-tie, and once the transcript contains one redundant verification
-round the model copies its own pattern (error-echo class) and orbits. Every
-INDIVIDUAL response is short, fluent, and correct — the SEQUENCE is what
-loops — so:
-
-- the token-level degenerate-tail guard (`loopStopReason`, even the 9..64
-  long-period tier) never fires — no token window repeats;
-- the char-precision / o0 batteries score the arms identical;
-- task-success scoring is blind too — the looping runs eventually finish
-  with the SAME 50/50 correctness, just 3-5x the tokens.
-
-bench4 (agent tasks via the pi harness, DSpark on): the uniform-2-bit
-canonical looped 3 of 4 task-B runs, burning 16-28K tokens each; tail4
-looped 0 of 3 at 5.4-7.6K tokens. Correctness identical (50/50), throughput
-identical (~53 tok/s DSpark both arms) — the tail bits buy BEHAVIOR, not
-speed or single-token quality.
-
-Rule distilled to CLAUDE.md: quality gates for low-bit mirrors need an
-AGENT-LOOP cell. The loop metric is **max consecutive identical tool calls**
-across a multi-turn agent run; reusable harness:
-`~/claude-tmp/iq2-week/bench3/loop_stats.py` + the bench4.sh pattern
-(paired arms, same tasks, token budgets + loop stats per run).
-
-## The weights MAP pins everything a staged loader frees (MiniMax-H3 AdaLN precompute, 2026-08-03)
-
-H3's AdaLN precompute tables the whole schedule's modulations and frees each
-block's 260M-param AdaLN weight right after its table evals — a designed
-~13 GB residency win on the 8-bit pack. The first live run showed `dit
-resident: 33.36 GB` where ~20 was expected, and the OFF-arm control read the
-same 32.8 GB, proving the free was a no-op. Cause: `generate` kept the
-safetensors `Weights` map alive (`defer dw.deinit()` at scope end), and the
-map holds +1 refs on every raw file-backed array — the model's frees only
-dropped the model's handles. mlx lazy graphs keep their inputs alive
-internally, so the map can be dropped the moment `Model.load` returns; scoping
-it inside a blk took residency to 19.95 GB measured. Two durable lessons: any
-STAGED-residency loader owes the same scoping, and the fix was only visible
-because the load path logs `mlx_get_active_memory` — a memory claim without a
-resident log line is a hope, not a design.
-
-## The stub model_type is a MODALITY static — the per-backend preflight must re-peek (2026-08-03)
-
-`buildStubCpuState(modality)` stamps `modality.modelType()` ("AudioVideo" for
-every video backend) on the stub config, so the new media preflight keyed on
-`params.config.model_type` never matched "minimax_h3" and billed the 64.5 GB
-sum-of-safetensors — while printing a log line that CLAIMED staged billing,
-and while the unit tests for the estimator (called directly with the right
-type) stayed green. Second bite of "a marker belongs to a BACKEND, never a
-modality". Fix: `doLoadGenOnInferenceThread` re-peeks the dir's real type via
-`gen.peekModelType`, the same authority `VideoEngine.load` dispatches on. The
-guard lesson: `tests/test_minimax_h3.sh` now asserts the printed NUMBER sits
-in the staged band — the line's presence proved nothing, which is the same
-class as spec-decode engagement counts vs output equality.
-
-## The weight prefix was a config GUESS, and LFM2.5 nests without saying so (2026-08-04)
-
-`mlx-community/LFM2.5-2.6B-8bit` (and the nvfp4 sibling) refused to load:
-
-```
-Model: lfm2 (30 layers, 2048-dim, head_dim=64, 32h/8kv, 8-bit affine quant)
-Loaded 600 weights from 1 file(s)
-MISSING WEIGHT: model.embed_tokens.weight
-```
-
-All 600 weights were there. They just lived under `language_model.model.*`.
-
-`parseConfigFromJson`'s lfm2 arm picks the prefix the same way the gemma4 arm
-does — `if (root.get("text_config") != null) "language_model.model" else
-"model"` — and this config has NO `text_config`. It declares
-`architectures: ["Lfm2ForCausalLM"]`, a text-only 2.6B, and the only hint that
-anything is nested is an EMPTY `"vision_config": {}`. Reading nesting out of
-that is a coin flip: an empty vision_config is exactly as plausible on a flat
-checkpoint, and the same class already shipped in the opposite direction
-(a nested guess against flat weights).
-
-So the guess stops being the authority. `model.resolveWeightPrefix` runs at
-both trunk load sites (main.zig offline, scheduler.zig serve), right after
-`loadWeights` and before `Transformer.init`, and re-points the config when the
-configured prefix holds NOTHING and the other nesting has weights. Three things
-keep it from being able to break a checkpoint that loads today:
-
-- it only ever alternates between `model` and `language_model.model` — an arch
-  with its own prefix (`backbone`, `model.llm`, `""`) returns immediately;
-- it fires only when the configured prefix matches ZERO keys, so a real VL
-  checkpoint carrying both keeps what the config said;
-- the prefix match requires a `.` boundary, so `model_extra.*` is not a hit for
-  `model`.
-
-Same shape as `hy3ExpertContainer`: when two converters disagree about a name
-and config.json cannot settle it, probe the tensors.
-
-Both variants load and generate after the fix (8-bit 148 tok/s, nvfp4 247
-tok/s on an M-series 128 GB), thinking splits correctly into
-`reasoning_content` under `reasoning_effort`.
-
-Still open, and a SEPARATE gap: LFM2.5 tool calling. Its template emits
-Python-call syntax — `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` —
-which no arm of the parse chain knows, so a tools request comes back with
-empty content and no `tool_calls`. Its template also `raise_exception`s on
-tool-call `arguments` passed as a JSON STRING, which is what
-`serializeMessagesJson` emits — the Inkling rule in reverse, and a raise is the
-silent-fallback class.
-
-## The hybrid layer-init path demanded scales, so it could not load its own arch dense (2026-08-04)
-
-`mlx-community/LFM2.5-2.6B-bf16` refused to load, one line past the prefix
-probe that fixed its 8-bit sibling:
-
-```
-MISSING WEIGHT: language_model.model.layers.0.conv.in_proj.scales
-```
-
-The checkpoint is dense bf16 — no `.scales`, no `.biases`, anywhere. 266
-tensors, all present.
-
-`initHybridLayers` fetched all 17 of its scales tensors with `getLayerWeight`,
-the MANDATORY getter whose miss is `log.err` + `unreachable`. The other two
-layer-init paths never did: `initStandardLayers` and `initMoeLayers` both read
-scales with `getLayerWeightOpt(...) orelse mlx_array_new()`, and `qmatmulBits`
-has had a plain-`mlx_matmul` arm on null-ctx scales since the Unsloth Dynamic
-mixed checkpoints (which leave a SUBSET of layers unquantized — so "the config
-declares no quantization" is not the right gate either; absence is per-tensor).
-The hybrid path was simply written against quantized checkpoints and never
-revisited, which is invisible for as long as every published checkpoint of
-that arch is quantized.
-
-Two halves to the fix, and the second is the one that would have produced
-silent garbage instead of an honest abort:
-
-- scales fetch through `getLayerScaleOpt` (absent ⇒ null-ctx);
-- every weight a matmul CONTRACTS gets `maybeTransposeForBf16`, because the
-  dense arm expects `[in, out]` while the checkpoint stores `[out, in]`. In a
-  hybrid layer that is in_proj/out_proj (gated conv), q/k/v/o, mamba2's
-  in_proj/out_proj, the simple MLP's up/down and the LFM2 SwiGLU's w1/w2/w3 —
-  and NOT `conv.conv.weight` (depthwise kernel, read by `conv1dWithCache`) or
-  any SSM state tensor (`A_log`, `D`, `dt_bias`). Transposing those would
-  either crash in the conv or quietly compute the wrong thing.
-
-`initHybridLayers` now returns `owned_bf16` like its two siblings, wired into
-the same `moe_owned_bf16` list `Transformer.deinit` frees — a transposed array
-is a NEW array, and the load path is the only place that can hand it to the
-teardown.
-
-Guards, both proven red-on-revert:
-
-- a synthetic 2-layer dense lfm2 `Weights` map through `initHybridLayers`,
-  asserting null-ctx scales, `[in, out]` on the matmul operands and an
-  UNTOUCHED conv kernel (instance);
-- a source scan over every `.scales")` fetch in transformer.zig rejecting the
-  mandatory getter (class) — a new arch arm that reaches for scales the same
-  way breaks dense checkpoints of that arch, and a quantized checkpoint of the
-  same arch would pass either way.
-
-Live after the fix: bf16 82.6 tok/s decode, 8-bit 148, nvfp4 247 on a 128 GB
-M-series; `test_hybrid_reuse_equivalence.sh` green on the bf16 (warm reuse
-13.3x, byte-identical) and unchanged on the 8-bit.
-
----
-
-
-## An fp override INSIDE the fp family is invisible to a scales-dtype rule (2026-08-05)
-
-`LiquidAI/LFM2.5-2.6B-MLX/mxfp4` killed the server on its first request:
-
-```
-MLX error: [dequantize] Shape of scales does not match the matrix given the
-quantization parameters. Provided matrix of shape (1,512) and scales of shape (1,64).
-```
-
-Its config declares a model-wide mode AND a per-tensor override:
-
-```json
-"quantization": { "group_size": 32, "bits": 4, "mode": "mxfp4",
-                  "model.embed_tokens": { "group_size": 32, "bits": 8, "mode": "mxfp8" } }
-```
-
-`computeQuantParams` resolves per weight off the SCALES DTYPE — uint8 ⇒ the
-config's fp mode, float ⇒ affine with (bits, gs) solved from the activation's
-inner dim. That rule was written for the mixed shape that existed at the time:
-an *affine* override inside an *fp* model, where the two are told apart by
-their scales (bf16 + biases vs uint8, bias-less). Here BOTH sides are fp —
-MXFP4 and MXFP8 scales are the same uint8 E8M0 byte — so the dtype says
-nothing, the embedding resolved at the model-wide 4 bits, and `mlx_dequantize`
-rejected the shapes. An MLX error is not a Zig error: one request, whole
-process gone. The shape in the message is the GATHERED row (`embedding()` takes
-rows before dequantizing), which is why it reads (1,512) rather than the
-table's [128000, 512].
-
-The geometry states the answer exactly, so `fpParamsFromGeometry` solves it the
-same way the affine arm already solves off-config sidecar quants: a row holds
-`w_cols * 32` packed bits over `in_dim` values ⇒ bits; `s_cols` scales cover
-them ⇒ group size. For the embedding that is `512*32/2048 = 8` bits and
-`2048/64 = 32`; for every linear in the same file, `256*32/2048 = 4` and 32.
-
-Two things keep it conservative:
-
-- it returns **null when the solve AGREES with the config**, so a consistent
-  checkpoint resolves byte-for-byte as it did before this existed (nvfp4 and
-  affine checkpoints re-smoked: unchanged);
-- the mode comes from `fpQuantModeFor`, and each fp format DEFINES its block
-  size (MXFP8/MXFP4 = 32, NVFP4 = 16), so the solved pair names exactly one of
-  them. A pair matching none returns null — the checkpoint's own declaration
-  stands and a genuinely broken file still fails honestly, rather than being
-  relabelled into a mode we invented for it.
-
-Live: mxfp4 serves at 239 tok/s, coherent, alongside the 4-bit variant of the
-same repo (234). Guard: the `computeQuantParams` fp-override test, which pins
-the override, the untouched sibling linear, an nvfp4 model, an unmappable
-geometry and the no-hint path.
-
-## The H3 `<Picture i>` splice: a faithful port that made the model worse (2026-08-05)
-
-MiniMax-H3's reference (`comfy/text_encoders/minimax.py`) splices every fl2va
-keyframe into the Qwen3-VL conditioning as `<Picture i>: <vision block>`, on top
-of conditioning through its VAE latent. Our port had shipped with only the VAE
-path and a `KNOWN DEVIATION` comment. Closing that deviation was supposed to
-improve keyframe fidelity on a checkpoint already on disk.
-
-It inverted it.
-
-### The measurement
-
-Same seed, 256px, 12 steps, `fast: false`, conditioned on a hard 20/235
-left/right split; the numbers are frame 0's left and right half means.
-
-| arm | frame 0 | delta |
-|---|---|---|
-| vision blocks OFF (pre-change) | 16.1 / 231.4 | **+215** |
-| ON, plain 1-D rope | 43.0 / 119.5 | +77 |
-| ON, interleaved mRoPE, no DeepStack | 48.5 / 105.2 | +57 |
-| ON, mRoPE + DeepStack | 150.6 / 53.0 | **-98, INVERTED** |
-
-Turning off EITHER contributor restores the correct polarity. That pattern is
-the whole diagnosis: if one component were broken, disabling the OTHER would not
-help. It is interference.
-
-### The port is not the bug, and proving that took the right instrument
-
-Everything was pinned against ComfyUI's own output before concluding anything:
-patch order (`cos 1.000000`), the tower (`cos 0.999987` merged, ~0.99999 on all
-three DeepStack taps), the mRoPE position ids (exact, including row-index-
-weighted checksums), the interleaved-mRoPE axis map, and the vision delimiter
-ids against H3's actual vocab.
-
-**The instrument that was missing was scale.** A cosine is scale-invariant, and
-a tower whose features came out 40x too large would have scored a perfect 1.0
-while destroying every sequence it was spliced into. Adding `rms_ratio` to the
-parity test answered the real question: `1.0000`.
-
-Which surfaced the actual mechanism. The reference's own merged vision rows
-carry a norm of **61.0** against **1.49** for a token embedding — 41x. Qwen's
-per-layer RMSNorm absorbs most of that on the way into attention, but the
-RESIDUAL stream keeps it, so 64 vision rows dominate a 9-token prompt's
-contribution to what the DiT receives as context. On fl2va that conditioning has
-nothing to add: the keyframe is ALREADY pinned by its VAE cond rows, which is
-why the un-spliced arm reproduces the input almost exactly (16/231 vs 20/235).
-The second path is not extra information, it is a competing one.
-
-### What shipped
-
-Default OFF for fl2va (`MINIMAX_H3_VISION_BLOCKS=1` re-enables for A/Bs), ON for
-ref2va — where a reference image has no cond row to compete with and the prompt
-ADDRESSES it as `<Picture i>`, so the tower is the entire mechanism rather than a
-second opinion.
-
-**The rule: a reference implementation is a spec for what to build, not a
-promise that turning it on helps your checkpoint.** The deviation comment was
-right to exist; what it needed was a measurement, not a fix.
-
-Bisect arms are kept in-tree (`MINIMAX_H3_VISION_BLOCKS`,
-`MINIMAX_H3_VISION_MROPE`, `MINIMAX_H3_VISION_DEEPSTACK`) because the three-way
-split above is what made the interference legible, and any future attempt to
-turn this back on will need exactly the same three.
-
----
-
-## H3 ref2va: two partitions, one file layout, and a cond stream ordered by the layout (2026-08-05)
-
-Ref2VA is MiniMax-H3's reference-conditioning checkpoint: up to 9 images, 3
-clips and 3 audio references that the generation follows for character, style
-and scene continuity. Landing it turned up three classes worth writing down.
-
-### The two partitions are indistinguishable from their files
-
-FL2VA and REF2VA share the text encoder, both VAEs, the tokenizer and every
-geometry number. The Comfy-Org repo ships one text-encoder file that serves
-both. Only the DiT weights differ — and a DiT does not announce what it was
-trained for. So an FL2VA pack handed `ref_images` would load, run, generate a
-perfectly good clip, and ignore every reference the user attached.
-
-The only honest discriminator is the task list our own converter writes into
-`config.json` (`["t2va","ref2va"]` vs `["t2va","fl2va"]`), read once at engine
-load (`gen.h3ConfigDeclaresRef2va`). Absent, malformed or wrong-typed reads as
-NOT ref2va: a pack that cannot say it supports references must not be handed
-them. The server 400s by name; the app's preset carries `supportsReferences`
-through the shared `minimaxH3Preset` factory so the two FL2VA presets cannot
-drift into claiming it; and `requestBody` gates the FIELDS on it rather than
-only the controls — hiding a control is not the same as not sending its field,
-which is the class that once made every H3 request carry `pipeline` and 400.
-
-The integration script reads the same list to pick which half of its assertions
-to run. Asserting fl2va keyframe adherence against a REF2VA DiT would be a
-checkpoint expectation in a server test's clothes.
-
-### The cond stream is ordered by the LAYOUT, not by the request
-
-`PackedLayout` fills its `img_update` / `audio_update` false rows in SEGMENT
-order — keyframe conds, then each reference block in resolver order, then the
-target — and the forward drops the concatenated condition rows straight into
-them. Assemble those rows in REQUEST order instead and every reference lands on
-the wrong block's positions: the model conditions on a smear, the generation
-succeeds, and nothing reports it.
-
-The ordinals are a contract with the checkpoint for the same reason. The prompt
-refers to `<Picture 2>`, and a video's soundtrack consumes an `<Audio j>`
-ordinal emitted BEFORE its own `<Video k>` — so one soundtracked clip plus one
-standalone audio makes the standalone `<Audio 2>`, not `<Audio 1>`.
-
-One function decides order and ordinals (`resolveRefs`); the DiT block is
-DERIVED from a resolved reference through the same function `resolveRefs` itself
-uses (`refBlockFor`), so a second hand-rolled mapping cannot drift from it —
-the class that put the dsv4 spec exclusion in three places.
-
-And the ENGINE consumes that decision rather than re-deriving it. That is forced
-rather than chosen: a reference's canvas comes OUT of the resolver, and the
-server has no image resampler — it resizes by decoding AT a size. So the caller
-must resolve before it can decode, which makes the caller the only place the
-decision can live. It is also why each visual reference carries two decodes: one
-at the VAE canvas for the DiT payload, one at `h3v.fitCanvas` of it for the
-vision tower.
-
-Two details that look like oversights and are not: audio condition rows ride in
-CLEAN (`AUDIO_COND_TIMESTEP` is 1.0 and the reference only augments below 1.0,
-so no noise is ever drawn), and vision blocks are ON for references while they
-are OFF for fl2va keyframes — a reference has no cond row competing with the
-tower, and the prompt addresses it by name.
-
-### The upstream layout was not what the driver assumed
-
-`tests/fetch_convert_minimax_h3_ref2va.py` had been written ahead of the
-release. Two of its assumptions were wrong, and both are the kind that read as
-"upstream did not publish this":
-
-* the Comfy-Org repo has **no `split_files/` prefix** — the paths are
-  `diffusion_models/`, `text_encoders/`, `vae/`;
-* MiniMaxAI's tree is spelled **`Ref2VA/`**, not `REF2VA/`.
-
-A repo listing settles both in seconds and is the right first move before
-concluding a file is unpublished — **but the listing has to be read
-case-INSENSITIVELY.** A `f.startswith("REF2VA")` filter over the same listing
-returned nothing and produced a confident "upstream publishes no REF2VA tree,
-so the partitions must share FL2VA's tokenizer". The conclusion happened to be
-right — `Ref2VA/processor/tokenizer.json` and `chat_template.json` are
-byte-identical to FL2VA's (sha256 a5d85b6d… / 5c72a170…) — which is exactly
-what makes this the dangerous shape: a wrong premise that a correct-looking
-result never contradicts. Hash the two files; do not infer identity from an
-absence you did not actually observe. The driver now also takes `--reuse-from
-<pack>` and CLONES the shared text encoder and both VAEs from an
-already-converted pack (APFS `cp -c`: instant, no extra space), so a second
-partition is one 66 GB download and one conversion instead of two — 21 minutes
-wall clock instead of hours. Copying a proven shard is also the CORRECT move
-rather than merely the fast one: reconversion is not byte-stable across
-converter sessions (the DSV4 mirror round measured 59/149 tensors drifting at
-rounding level).
-
-One ordering bug fell out of the same work: the converter checked its SOURCE
-before its destination, so every resumed run failed on the shard it had already
-finished — the driver deletes each source once converted, by design.
-
-## H3 length planning: a stale cap, a borrowed memory model, and what actually bounds a clip (2026-08-05)
-
-Asked whether the app exposes what MiniMax-H3 supports, three answers came back
-and only one of them was "yes".
-
-**Resolutions: complete.** The card states short side 768 and ratios "21:9,
-16:9, 4:3, 1:1, 3:4, 9:16"; `h3Resolutions` carries all six plus our own
-sub-native 960x544 long-form canvas. The only missing tier is 2K, which needs
-H3-Regenerate-2K — a checkpoint we have not converted.
-
-**Steps: MiniMax publishes nothing.** No default, no range, no maximum; the
-reference Comfy node leaves it to the KSampler. So the range was ours and had
-never been said out loud: the slider was `4...50` with LTX's help text ("LTX runs
-well from ~8") rendered on H3, where 8 steps is below anything we have a verdict
-on and — worse — below the point where the fast recipe's warmup and tail windows
-cover the whole schedule, so those runs pay full price per step while looking
-like the cheap option. Now `stepsRange` / `stepsHelp` are per preset, 16...50 on
-H3.
-
-**Frames: we were short of the model.** MiniMax states 4-15 s at 24 fps; the
-ladder is 17k+5, so 15 s is 362 frames. The picker stopped at 209 — the rap
-demo's length, the longest clip we had shipped a verdict on — behind:
-
-```
-// Trained range is ~124-362 (reference tooltip); 209 is our own
-// validated ceiling (the rap demo), not the untested-by-us 362.
-```
-
-which `MediaGenServiceTests` had already disproved in a comment of its own:
-*"Field measurement on an M5 Max (2026-08-04, our engine): 362 frames — the top
-of the 17k+5 ladder — in ONE generation at 139.6 s/step"*. A cap standing in for
-"we have not measured this" goes stale silently, because nothing fails when the
-measurement finally happens.
-
-### What actually bounds a clip
-
-`RAMChecker.safeFrameCap` was LTX's formula — a fixed load cost plus ~12 GB per
-megapixel per 100 frames of VAE decode staging — applied to every video backend.
-On H3 that is not an approximation but a different model, and it produced two
-useless readings: 677 frames on a 128 GB Mac (so the warning never fired) and 32
-on a 48 GB one (below H3's own 124 floor, so it fired always).
-
-H3's frame-dependent term is the fast recipe's attention-broadcast cache: one
-`[S, hidden]` bf16 per block, held for the whole run.
-
-```
-latent_t = ((frames - 5) / 17) * 5 + 2
-S        = latent_t * (w/32) * (h/32) + 2 * round(frames * 5/3) + text
-cache    = S * 5376 * 2 * 50 blocks
-```
-
-Audio is STEREO — `n_audio_rows = audio_t * 2` — which is easy to drop and worth
-~0.4 GB at 768p. The cache is LINEAR in rows: SDPA is fused, so the `[S, S]`
-score matrix is never materialized, which is the only reason a 108k-row sequence
-exists at all (it would be 1.3 PB). The formula reproduces both measured points
-— 20.4 and 34.1 decimal GB at 124 and 209 frames, 1344x768 — which is what makes
-it worth trusting at 362, where nobody has measured.
-
-Three things fell out of writing it down:
-
-- **"Max quality (slower)" is also the LOW-MEMORY mode.** `bcast_k = 1` never
-  allocates the cache, so 1344x768 x 362f goes from ~85 GiB to the 38 GiB staged
-  load peak, in exchange for roughly 4x the runtime. That is backwards from
-  every other quality toggle in the app and impossible to guess, so the
-  over-budget warning now offers it by name.
-- **The load floor is the pack's MEASURED staged peak, not `approxRAMGB`.**
-  `approxRAMGB` is that number rounded up (26 vs 22.82 GiB for the 4-bit pack)
-  and drives the coarse "does this Mac have enough RAM at all" alert, where
-  erring high is free. In the frame model it is not free: 26 against a 32 GB
-  Mac's 0.8 budget of 25.6 refuses the pack that exists for 32 GB Macs.
-- **A cap with a FLOOR cannot answer "does anything fit".** `frameCap` never
-  returns below the ladder's 124 (below it the model is off-distribution, so a
-  smaller number is not a usable answer), which makes `cap == 124` mean both
-  "124 frames fits" and "nothing fits" — and a 24 GB Mac, which cannot load the
-  8-bit pack at all, saw no warning at exactly 124 frames. `H3Plan.fits` answers
-  the configuration, and the warning asks it.
-
-Ladder reach and quality-TIER defaults also had to be separated. Raising `cap`
-to 362 silently moved `.quality` and `.superQuality` there too, i.e. picking
-"Quality" would have started a five-hour job; `tierMax` stays 209 and the slider
-reaches 362.
-
-### Time
-
-`c + a*S + b*S^2`, fitted on two M4 Max dense measurements (36.6 s/step at
-864x480 x 73f, 275.7 s/step at 1344x768 x 124f). The square term is load-bearing:
-at a matched 124 frames, 1344x768 measured **2.9x** the time of 960x544 for
-**1.98x** the pixels, so a linear-in-pixels model under-promises the wide canvas
-by about half.
-
-The fast recipe is priced from the engine's OWN broadcast schedule
-(`attnBroadcastRefresh`, mirrored) rather than a flat 1/2.83, because those
-windows SCALE with the schedule — at <=6 steps they cover the whole run and the
-recipe is a no-op, so a flat factor would promise a short run 3x faster than it
-can go. Velocity caching then removes a further share of what is left; 0.55
-reproduces the capstone's measured 14-of-30 cached steps.
-
-Reproduces the anchors end to end (measured / modelled): 49 / 51 min at 124f
-fast, 1 h 57 / 1 h 58 at 209f, 2 h 19 / 2 h 21 dense.
-
-Three provenance tiers, because a number extrapolated from someone else's Mac
-and a number measured on yours are different claims: `H3Hardware.current` scans
-`gpu-core-count` off the IORegistry and the chip name off sysctl (the step is at
-the compute roofline — SDPA and the linears both ~13 TFLOPS against ~15 — so
-cores is the figure that tracks); `H3RunHistory` fits ONE scalar (this machine
-vs the anchor) from completed runs, MEDIAN so a thermally-throttled run does not
-own every later estimate, keeping 20; and `H3StepClock` gives a live ETA from
-the run's own cadence, discarding step 0 (graph build + Metal JIT) and taking a
-median rather than the last lap, since a velocity-cached step takes ~0.02 s and
-would make the remaining run look instant.
-
-Also fixed while in here: the card caps ref2va at **12 files across all types**,
-while the three per-type caps (9/3/3) sum to 15 — so a set could clear every
-per-type cap and still be one the model was never given. `MAX_REF_TOTAL` is a
-named 400 server-side and `H3RefLimits` stops the picker offering past it,
-including on an empty list whose own cap has room.
-
-
-
-## H3's two fast levers compounded into stale attention and garbled speech
-The fast recipe pairs a step cache (reuse the last velocity when the step barely moves) with attention broadcast (recompute attention every k-th step, reuse it between). The broadcast schedule went by step index, so when the cache skipped the steps that would have recomputed, the next real forward reused attention from three steps back and the cache then reused that forward's velocity for two more: attention fresh about every sixth step. Each lever alone kept a spoken line intact; together a 10 s REF2VA clip said "deepseek ddeepiki emeng minimax". Fix: a forward right after a cached step always recomputes (`attnBroadcastRefresh(…, after_skip)`); the broadcast now engages 2-3 times instead of 7, about 8% slower. Guard: `a forward after a step-cache skip recomputes attention`; the bar was word errors of the spoken line over six seeds against the full render.
-
-## `chat_template` has two legal shapes, and reading the wrong one is a PANIC (2026-08-07)
-
-Found during 26.8.3 pre-release validation, on a family nobody had exercised
-recently: **Mistral-7B-Instruct-v0.3-4bit could not be loaded at all.**
-
-```
-thread 9501346 panic: access of union field 'string' while field 'array' is active
-src/chat.zig:115:33 in loadChatConfig
-```
-
-`loadChatConfig` did `try allocator.dupe(u8, v.string)` on
-`tokenizer_config.json`'s `chat_template`. HF permits that key to be either:
-
-- a bare template string (what almost everything ships), or
-- a LIST of `{"name": ..., "template": ...}` objects.
-
-Mistral v0.3 ships the list form, with two entries — `default` and `tool_use`:
-
-```python
-[{"name": "default",  "template": "..."},   # no tools
- {"name": "tool_use", "template": "..."}]   # tools
-```
-
-A Zig tagged-union field access on the wrong active field is not a recoverable
-error, so this was not "the template failed to load and we fell back" — it was
-the process dying during model load. One of eight local checkpoints with a
-`chat_template` uses this shape, which is exactly why it went unnoticed.
-
-**Fix.** `chatTemplateFromValue` handles both shapes and selects the entry named
-`"default"`, matching transformers (`apply_chat_template` uses `default` unless
-the caller names another template). Falls back to the first usable entry when
-none is named `default`, and returns null for any other shape so the caller
-drops to its `chat_template.jinja` / family fallback rather than panicking.
-
-**On not selecting `tool_use`.** Only that variant references `tools`, so the
-obvious worry is that tool calling breaks. It does not: our pipeline passes
-`tools_json` into the render and has its own parse/repair chain, and llmprobe
-scores Mistral **8/8** on the tool checks (serialization, streamed argument
-reassembly, results accepted back, parallel calls, `tool_choice: "none"`,
-`parallel_tool_calls: false`, typed arguments). Per-request template selection
-by name is a feature worth having; it is not what a load-time panic needed.
-
-Result: Mistral went from *cannot load* to **99.5% engine conformance**
-(chat 64/64, responses 62/62, messages 57/58, embeddings 4/4, completions 3/3).
-
-**The general rule this leaves:** in a `std.json.Value` reader, `.string` on a
-field you have not shape-checked is a crash, not a graceful miss. Any new
-tokenizer_config/config reader owes both shapes — or an explicit switch whose
-`else` returns null.
-
-## An adapter's alpha lives wherever its exporter put it (`lora.fileAlphaScale`, 2026-08-06)
-
-A LoRA's net strength is alpha/rank, and four real community files ship four conventions — a kohya per-module `.alpha` TENSOR, a PEFT JSON document inside one `lora_adapter_metadata` metadata string (`transformer.lora_alpha`/`transformer.r`), flat `lora_alpha`+`lora_rank`|`r` pairs, kohya's `ss_network_alpha`/`ss_network_dim` — plus files declaring none at all (alpha baked into the weights, 1.0 is correct). Reading only the tensor ran every PEFT export at 1.0 = rank/alpha = **8x too strong** for the common 4/32 pairing, which renders PURE STATIC. Resolution order is nested-JSON > flat > `ss_*` > none, per-module tensor still WINS (more specific), and a non-finite/non-positive alpha or rank is DECLINED — a scale we had to guess at is the bug. The resolved scale is logged per file (`[lora] <file>: scale …`) so a wrong one is visible instead of silent; `lora_scales` stays a MULTIPLIER on top of it.
-
-**The test lesson is the bigger half**: `test_multi_lora.sh`'s 56 checks were all green through this — its exact stacking maths (`d+d == 2d` byte-for-byte, zero-B transparency, order independence) is satisfied by noise, and a second real adapter passed only by being weak enough to survive 8x. Renders now go through `tests/lora_noise.py` (mean abs difference of horizontally adjacent pixels, bar 20: real 4-8, static 43-50) and `tests/test_real_loras.sh` runs published adapters on all four backends asserting scale + attach counts + usable output. A guard that asks "did the bytes change?" must be paired with one that LOOKS.
-
-## A sampler must never draw a RESERVED special (`tokenizer.reservedOutputIds`)
-
-`<|fim_hole|>`-class FIM markers can be EMITTED at temp 0 by a checkpoint whose distribution collapses. Per-model mask = `special: true` added tokens MINUS EOS ids MINUS specials whose text appears in the chat template source (thinking/tool/role markers ride each model's own template; no template ⇒ off, so fallback-formatted models are untouched). The legit-output set is DERIVED, never hardcoded. Built once at load (`generate.installSuppressMask`, `[suppress]` engagement log, `MLX_SERVE_SUPPRESS_RESERVED=0`), sized to the LOGITS dim (`unpadded_vocab_size` when set — inkling), riding `SamplingParams.suppress_mask` through the `initWithOptions` chokepoint into BOTH samplers + both stochastic-verify filters (`mlx_where` + -inf, fully lazy, no host sync; the batched tick reads `gen.sampling`, not `slot.sampling`). Logprobs stay the RAW distribution — under suppression rank 1 may differ from the emitted token BY DESIGN (the field reports the model; the mask is policy).
-
-## The degenerate-tail loop guard needs a LONG-period tier (dsv4, 2026-08-02)
-
-A two-sentence ~58-token cycle repeated 26x sailed through the 8-token scan; `loopStopReason` also fires on periods 9..64 at 10 exact reps (`isDegenerateTailLoopRange` — long periods demand fewer reps: identical long lines in real code repeat a handful of times, not ten).
-
-## A tiled decoder's tiles are not slices of an untiled pass (H3 visual VAE)
-
-`create_token_ids` maps each axis to `(arange(0.5,n)/n)*2-1`, so a 256-px tile's coordinates differ from that region's coordinates in a full-canvas pass — tiling is SEMANTIC, not a memory optimization. `minimax_h3_vae.decode` refuses above the 256-px tile extent (`fitsSingleTile` → `error.TilingUnsupported`) rather than silently decoding untiled and producing off-distribution output that looks like a quality problem. Same reason its TEMPORAL chunking (5-token chunks, 2 overlap, 3-frame pre-pad drop, 5-frame cross-fade) cannot be collapsed into one pass: the VAE was trained on 17-frame clips.
-
-## An oracle that cannot execute the reference must say so (H3 DiT parity)
-
-The reference block calls comfy_kitchen CUDA kernels that do not run on a Mac, so `tests/dump_minimax_h3_fixtures.py` is a TRANSCRIPTION and its header states that a green test proves agreement with an independently written implementation, not with the reference. Where the reference CAN run (`dump_minimax_h3_layout.py` — pure layout/schedule math) it is executed directly, with import stubs that RAISE on attribute access so no golden value can be produced by a mock. Prefer executing the reference; when you cannot, say which one you built.
-
-## A permutation-invariant checksum cannot see a permutation (H3 layout fixture)
-
-The per-axis position SUM passes unchanged when the two stereo channels' pinned `w` coordinates are swapped. Pair any column checksum with a row-index-WEIGHTED one (`pos_weighted`) — found by doing red-on-revert properly rather than by inspection.
-
-## An incomplete media pack reads as a model everywhere and dies in the text loader (live 2026-08-08)
-
-The Video pane's Turbo-adapter fetch wrote to the DESTINATION root while the 4-bit H3 pack lived in another owned root, creating `models-dl/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit/` holding only config.json + tokenizer files + `turbo_lora.safetensors` (0.7 GB). That fragment carries a valid `minimax_h3` config.json, so: (1) server discovery registered it as a model, and first-wins across `--model-dir` roots SHADOWED both complete copies in later roots; (2) the app's `resolveModelDir` walks the same order and resolved it too, so a plain Generate — Turbo unchecked — loaded it; (3) `gen.detectModality` correctly declined it (missing `transformer.safetensors`) but the loader then fell through to the MLX TEXT path, globbed the lora as an LM, and hit `MISSING WEIGHT: model.embed_tokens.weight` → `log.err` + `unreachable` → dead process. Nothing heals the fragment: readiness is checked across ALL owned roots, the pack reads complete elsewhere, so no download is ever offered for the fragment dir.
-
-The class is bigger than the fragment: EVERY H3/LTX pack download holds a valid config.json for the tens of minutes its big weights are still `.partial`, and an interrupted pull stays that way — a boot (or `/v1/models/rescan`) during that window registers a landmine.
-
-Four-part fix, each half load-bearing:
-- `model_discovery.requiredMediaMarker` is the ONE completeness table (`gen.requiredMarkerFor` DELEGATES — gen can import discovery, not the reverse); discovery skips marker-missing media dirs like any half-pulled download, and `probeModelDir` (register-by-path) answers `error.IncompleteMediaPack` → a named 400.
-- The scheduler's preload refuses a media-typed dir that failed its marker BY NAME instead of falling through to the text loader — by-path loads never see discovery, and `unreachable` on a missing weight means one stale dir kills the server.
-- `startTurboLora` downloads INTO the pack's resolved dir (`download(destDirOverride:)`) — an adapter's whole point is to sit beside weights that already exist.
-- The Turbo toggle's off-flip cancels an in-flight fetch via `cancelTurboLora`, which is surgical (drops the one file's `.partial` + sidecar) and a NO-OP with nothing running — the generic `cancel(_:)` no-task fallback wipes the repo's whole download dir, which for an adapter fetch is a live 40-69 GB pack.
-
-Guards: `discovery skips an incomplete media pack` + `probeModelDir refuses…` (model_discovery.zig), `incompleteMediaDir` (gen.zig), `tests/test_model_rescan.sh` (incl. server-survives-the-refused-load), `TurboLoraFetchTargetTests`.
-
-## A directory-entry filter that skips symlinks measures an HF-cache model at ZERO (live 2026-08-09)
-
-A first-launch user loaded `DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw` (121 GB) straight out of the HuggingFace hub cache and the machine went 34 GB into swap within a minute. The log had already said why nothing stopped it: `[preflight] weights ~0.00 GB, available 71.19 GB`. A hub-cache snapshot dir holds SYMLINKS into `../../blobs`; entry iteration reports them as `.sym_link`, and every server-side size sum filtered `if (entry.kind != .file) continue;` — so every weight file measured zero, and `memInsufficientForLoad` deliberately treats 0 as "unknown → allow" (a failed memory query must never block a load).
-
-The class was every size sum, not just the preflight: `scheduler.modelDiskBytes` (the preflight), discovery's `bytes_on_disk` loops in `tryAddModel`/`sumComponentWeights`/`probeModelDir` (feeding `/v1/models`, the app's RAM column, and `scheduler.gateEstimateBytes` — the #126 admission/eviction gate, which also passed at ~0), `gen.sumSafetensorsIn` (media residency), and cli's `list` size loop + GGUF classification. The app was INNOCENT: `DownloadManager` already resolves symlinks for sizes and deliberately scans the hub cache as a read-only root — it is what hands the server these snapshot paths.
-
-Fix: every entry filter also accepts `.sym_link` and stats through it (`Dir.statFile` FOLLOWS symlinks by default — all stat-RESULT checks already worked), plus a post-stat `st.kind == .file` check so a symlink-to-directory can't be summed; dangling links hit the existing `catch continue`. Zero now means a genuinely weightless dir, so the allow-on-zero semantic stands. Guards: `modelDiskBytes follows HF-cache symlinks` (scheduler.zig), `discovery measures a SYMLINKED (HF hub cache) model dir's real bytes` (model_discovery.zig).
-
-Same report, second item: the CLI bound `0.0.0.0` by default, putting a first-launch server on whatever network the laptop joins. Kept (the app and Agent Sandbox need wide binds they set EXPLICITLY) but serve mode now warns when the bind is non-loopback and nobody chose it — no `--host`, no `--lan-share` (`server.shouldWarnOpenBind`); the default flips to 127.0.0.1 in a future release, at which point the helper's host check silences the warning without a code change.
-
-## A combined Split regex hides the digit rule inside an alternation (muse "8 4" echo, 2026-08-10)
-
-First live boot of Muse-Glimmer-30B echoed "What is 8 4 * 3 / 2?" for a prompt
-containing "84" — the DSV4 echo-precision class on a new spelling. The
-tokenizer ships the Llama-3-style COMBINED Split regex: case-classed word
-branches with an attached `(?i:'s|'t|'re|'ve|'m|'ll|'d)` contraction group,
-`\p{N}{1,3}`, ` ?[^\s\p{L}\p{N}]+[\r\n/]*`, and the usual whitespace tail —
-all alternatives of ONE pattern. `digitGroupFromPreTokenizer`'s deliberate
-exact-match (`regex == "\p{N}{1,3}"`) never fires on it, so the model was
-served per-digit numbers.
-
-The fix is a grammar, not a wider digit match: `Tokenizer.pretok_style =
-.llama3` (selected by `llama3StyleFromSplitRegex` — contraction group AND the
-{1,3} digit branch present) runs `llama3PreTokenize`: greedy upper-class run
-then greedy lower-class run per word (reproduces the regex's backtracking for
-disjoint ASCII classes; non-ASCII letters are treated caseless — both classes
-— which coincides on every reachable match END except mid-word case
-transitions in non-Latin cased scripts, a documented gap), attached (?i)
-contractions, {1,3} digit groups, marks riding with punct, and `/` joining
-the punct tail.
-
-Two verification traps burned time:
-
-- HF ENCODE output is not pre-token boundaries. "cat's" encodes as
-  `cat` + `'s` and "don't" as one token — both have the contraction ATTACHED
-  at the pre-token level; the visible splits are BPE-internal merges. Pin the
-  pre-tokenizer against the raw regex `findall` (python `regex` module), and
-  end-to-end ids against HF `tokenizers`.
-- The live tell was subtle: generation was coherent (the model still solved
-  the math) — only the echo spelled the number with spaces. Cross-check
-  `/tokenize` vs HF at bring-up, per the standing rule; it found 8/8 diverse
-  cases byte-identical after the fix.
-
-## A config default only ONE family wants is a silent per-arch trap: muse rope base (first-turn repetition loops, 2026-08-11)
-
-pi on Muse-Glimmer-30B looped in the thinking channel on its FIRST turn — restated the user's
-request ~11 times until `[loop-stop]` cut it (54 cuts in one day's app-server log). The
-discrimination matrix (`~/claude-tmp/muse-loop/matrix.tsv`, fixture = the exact captured pi
-request) exonerated everything else one arm at a time: loops at temp 0 DETERMINISTICALLY (so
-not sampling), with `--no-drafter` (PLD-only — not spec), on 4bit AND 8bit AND the upstream
-bf16 under `--no-decode-attn-quant` (not quant), on the byte-identical HF-rendered prompt fed
-raw through `/v1/completions` (not our chat render), with 0/1673 token-id diffs vs HF
-tokenizers (not the pretokenizer). The decisive arm: the SAME upstream bf16 trunk under
-mlx-lm (PR #1710, key-surgery remap) continued CLEAN where our runtime looped — greedy
-divergence at ~token 13, ours doubling a phrase inside the request echo.
-
-Root cause: every forward path picks the RoPE base as
-`if (is_global) cfg.rope_theta else cfg.rope_local_base_freq`, and `rope_local_base_freq`
-defaults to Gemma-3's 10000. Muse ships ONE theta (500000) for all roped layers — as
-`text_config.rope_parameters.rope_theta`, which the generic parse lands in `rope_theta`
-only — and its global layers are NoPE, so **every rotated layer ran at base 10000 instead of
-500000**. Wrong positional geometry: short-range copying survives (the echo), mid-range
-coherence collapses into restart loops. Fix: the muse arch block sets
-`rope_local_base_freq = rope_theta` when the key is absent (model.zig). The bf16 greedy
-continuation then tracks mlx-lm's (319-char shared prefix, wording-level bf16 noise after),
-and the incident config went 0/6.
-
-Class lessons: (1) a per-layer-TYPE config knob with a family-flavored default must be pinned
-by the arch's config test for EVERY layer type the forward distinguishes — the muse test
-asserted `rope_theta` and never `rope_local_base_freq`, exactly the value the sliding layers
-read; (2) "coherent for N tokens then degenerates into loops, deterministic at greedy" is a
-POSITIONAL-ENCODING symptom signature, not a sampling one; (3) an unmerged reference port
-(mlx-lm PR) is still a usable oracle once weights + token ids are proven identical — behavior
-divergence then isolates the runtime. Guards: the `rope_local_base_freq == 500000` assertion
-in the muse config test (red on revert) + `tests/test_muse_repetition.sh` (replays the real
-capture; exits 1 on any `finish_details.type == "repetition_loop"`).
-
-## A converter that keeps the HF module layout renames the router (laguna oQ, issue #169)
-
-`mlx-community/Laguna-S-2.1-oQ4e-fast` and `-oQ5e` died at load with
-`MISSING WEIGHT: language_model.model.layers.1.mlp.gate.weight`. poolside's own
-NVFP4-mlx build flattens the router module, so the [E, hidden] router matrix is
-`mlp.gate.weight` and the aux-loss-free selection bias sits beside it as
-`mlp.gate.e_score_correction_bias`. The oQ converter keeps HF's module tree, where
-the router is a `proj` Linear INSIDE the gate module: same tensor, same dtype
-(bf16, unquantized in both builds), at `mlp.gate.proj.weight`. The bias is a
-buffer on the gate module in both layouts, so it never moves — only the
-projection does. `lagunaRouterBase` probes for the flat name first (so the
-poolside pack binds byte-identically) and falls back to the nested one, exactly
-like `hy3ExpertContainer` resolves `mlp.experts` vs `mlp.switch_mlp`. Everything
-else about the pack loads generically: the experts are mlx-lm's stacked
-`mlp.switch_mlp.*`, and the mixed-bit affine quantization (4/5/6/8 bits, gs
-64/128, 214 per-tensor overrides) solves from packed geometry per weight.
-
-Two things about that pack that are NOT bugs: the `language_model.` weight
-prefix is resolved from the checkpoint (`resolveWeightPrefix`, logged), and its
-config declares YaRN `factor: 128` / `max_position_embeddings: 1048576` where
-poolside declares 32 / 262144 — a 1M-context rope the loader honours as
-declared (the computed mscale 1.4852 matches the field the pack ships).
-
-Class lesson: a checkpoint's module tree is the CONVERTER's choice, not the
-architecture's. Any name a converter could have flattened or nested gets a probe
-the first time a second converter ships the arch — one probe, resolved once per
-layer, flat name preferred so the reference build cannot shift.
-Guard: transformer.zig `lagunaRouterBase resolves both the flat mlx-lm gate and
-the HF-native gate.proj naming`.
-
-## LTX-2.5 looked soft: three causes, one of them ours (2026-08-13)
-
-Report: "videos generate and look generally good, just not at the bar I see in
-other examples." Three separate things, measured rather than guessed.
-
-**1. The canvas.** The clips were 768×512 / 704×480 — the app's LTX ladder
-topped out there. LTX's own `PipelineParams` default is 1920×1088 (2.09 MP vs
-0.39), and the published examples are 1080p+. Worse, the two-stage "Quality"
-tiers denoise at HALF the requested size and upscale, so picking Quality at
-768×512 ran the dev DiT at 384×256 — softer than the one-stage tier sitting
-above it in the same menu. No amount of steps, guidance or quantization width
-fixes a canvas the model was never asked to fill.
-
-**2. The quantization.** Our pack was affine 4-bit group-64 on all 1632
-transformer linears (the recipe inherited from the community 2.3 pack, where
-q4 is documented as the "fits 16 GB" option and q8 is what the reference's own
-examples use). Measured off the packs themselves — quantizer step over
-per-group weight std, sampled across blocks 0/24/47:
-
-| pack | median injected weight noise |
-|---|---|
-| q4 (affine g64) | **9.87%** (p90 ~12%) |
-| q8 (same recipe) | **0.584%** |
-
-~10% noise on every linear, compounded over 48 blocks × 8 distilled steps.
-Same prompt, same seed, one-stage 97f at 768×512: the 4-bit fox has no visible
-eye, blurred legs and flat fur; the 8-bit one has a defined muzzle, individual
-fur strands and real legs. Cost: 175 s vs 169 s (+3.5%) — the DiT is
-compute-bound at these token counts, so the wider weights are nearly free.
-Upstream's own quants are int8-convrot / fp8 / nvfp4, and every community
-*int4* pack uses ConvRot / W4A8 — plain affine int4 is nobody's shipping
-recipe for this DiT.
-
-Objective per-frame metrics could NOT settle it: a 10% weight perturbation in
-an 8-step schedule moves the trajectory, so the two arms fork CONTENT
-(luma correlation 0.44–0.55) and per-frame detail deltas ran from −20% to +40%
-with a +5.9% clip mean. Same class as the spec-decode rule — when the arms
-fork content, per-frame numbers are variance. The stills decided it.
-
-**3. The decoder we didn't ship.** Upstream ships
-`vae_diffusion_decoder.safetensors` (417M, "DiffVAE 1-step x0 decoder") and
-decodes its demos with it; we used the plain conv decoder, and so does the MLX
-reference. Ported 2026-08-13 — see below.
-
-### The bug the 8-bit pack found
-
-The first 8-bit load died at its first matmul:
-
-```
-MLX error: [quantized_matmul] The shapes of the weight and scales are
-incompatible based on bits and group_size. w.shape() == (4096,1024) and
-scales.shape() == (4096,64) with group_size=64 and bits=4
-```
-
-`ltx_video.zig` passed `mlx_optional_int.some(4)` literally at all three
-quantized reads. The pack's config said `bits: 8`, the geometry said 8, and
-nothing asked either. The error names the shapes, not the assumption, so it
-reads like a corrupt download — which is what makes this class expensive:
-every other quant path in the tree (mtp, dflash, drafter, deepseek_v4) already
-solves `(bits, group_size)` from packed geometry via
-`transformer.affineParamsFromGeometry`. The LTX engine now does too
-(`quantGeom`), pinned by a source scan over its own call sites.
-
-### Building the 8-bit pack
-
-`scripts/quantize_ltx25.py <src> <dst> --bits 8`. Only the two transformers and
-the text encoder need the bf16 source (~100 GB); the connector, both VAEs, the
-vocoder and both upscalers are passthrough and byte-identical to the ones
-already in the 4-bit pack (verified against upstream blob sizes), so they are
-symlinked in rather than re-downloaded. Result: 20.60 GB per transformer,
-12.65 GB encoder, ~59 GB total.
-
-Watch the CLI: `hf download REPO --include a b c` eats `a` as the option's
-value and warns `Ignoring --include since filenames have been explicitly set`
-— which is how `transformer-dev.safetensors` silently didn't download on the
-first pass. Pass filenames POSITIONALLY.
-
-
-## The ANE seam is fp16 end to end, and H3's DiT rendered BLACK (2026-09-10)
-
-Wiring the channel-mode ANE MLP offload into H3's video DiT gave a clean
-1.24x on the denoise step and an all-zero video. The seam MATH was never
-wrong — a per-block parity probe read cos 0.99999 / rms_ratio 1.0000 against
-the plain `mlpForward` at blocks 0-2. The output was NaN from block 36 on.
-
-**Cause**: the compiled ANE program computes in fp16 from input plane to
-output plane, and H3's DiT partials do not fit. Measured at 864x480/22f: the
-fc2 partial peaks at ~1.7M and the intermediate `act = silu(gate)*up` at 52k,
-against an fp16 max of 65504. The plane saturated to INF, the residual stream
-went NaN, and the VAE decoded zeros.
-
-**The fix is a scale, and WHERE it goes is the whole point.** Dividing the
-`up` half of the ANE's weight copy by `ane.OUT_PLANE_SCALE` (256) and
-multiplying the read-back partial by it is EXACT: `up` is linear into the
-product, so `act` and the down-conv output both scale with it, while
-`silu(gate)` is untouched; per-row int8 quantization folds the factor into the
-row scale so the codes are unchanged; and a power of two is exact in fp16.
-Scaling `gate` instead would be wrong (it sits under a nonlinearity), and
-scaling fc2 alone bounds the output but not `act` — that arm was measured and
-still hit INF at block 49.
-
-**Two false starts worth keeping**: scaling fc2 by 16 (output bounded, `act`
-still overflowed); then 64 (same, and the parity probe read 0.92 because it
-was comparing the scaled partial against an unscaled reference — a probe that
-does not follow the fix reports the fix as a regression).
-
-**The class lesson**: the LM prefill seam never hit this because a normed
-decoder hidden is O(1) and its MLP output is O(100). A DiT residual stream is
-not, and neither is any other backend we might point this seam at. The scale
-is now unconditional in both seams. Krea had shipped without it and looked
-correct — it was silently losing precision at the top of the fp16 range: mean
-|diff| vs the GPU arm 5.68/255 -> 2.00 and cos 0.9962 -> 0.9993 once scaled.
-A correct-looking image is not evidence of range headroom.
-
-**Guard**: `ane.OUT_PLANE_SCALE` carries the measured peaks in its doc
-comment; the bar is perceived content plus a finite-output check, never bytes.
-
-## ACE-Step peak-normalizes, so raw RMS cannot measure the ANE arm (2026-09-10)
-
-The first ANE-vs-GPU audio comparison reported a "loudness lift" of +0.7 to
-+1.1 dB RMS that changed SIGN across seeds. It was not energy the offload
-added. `generate()` ends with `peakNormalize(samples, -1 dBFS)`: one global
-max sample sets the gain for the whole 180 s track. In the GPU track that
-peak is an isolated spike (the runner-up frame sits at 0.853 of it); the ANE
-arm rounds that one sample differently, the spike shrinks, and the whole
-track is scaled up to put a different sample at -1 dBFS. Raw RMS and crest
-factor then measure the spike, not the audio.
-
-**Valid measures**: a ROBUST energy (per-frame RMS, trimmed of the top
-percentiles — +1.9%/+2.8% at 0.45/0.75 over 3 seeds, consistent in sign) and
-log-STFT cosine (≥ 0.994). Anything normalized by a single sample is out.
-
-**The class**: a metric taken AFTER a global normalization step measures the
-normalizer's anchor, not the signal. Check for one before trusting any
-whole-track scalar on a generated audio arm.
-
-## A GPU tail built after the ANE wait is serial, and a small one is launch latency (2026-09-11)
-
-The media seam moved to one fixed 256-row tile looped over every request (`ane.mediaMlp`), so a new image size, canvas or song length stops compiling and storing another 1.3-4.9 GB program set. Its first version ran the rows past the last full tile through the full GPU MLP AFTER the tile loop and trailed the whole-request tile by 3-4% on ACE-Step and H3.
-
-The tail was not costing its rows. The whole-request tile had the same shape with a sub-32-row tail, and moving that 23-row tail to go out with the GPU complement, before the first ANE wait, took ACE 30 s whole@0.60 diffusion from 1982 to 1836 ms. Three small matmuls are dispatch latency, and built after a blocking wait nothing overlaps them; built before it they land in whatever GPU slack the ANE-critical block leaves.
-
-Fix: `ane.mediaMlp` async-evals every GPU piece (complement and tail) before the loop. A partial last tile rides the ANE zero-padded when `tail > T x (1 - share)` (`ane.mediaTilePlan`), the balance point where padding the ANE costs less than the tail on the GPU. M4 Max, T = 256: ACE 180 s pads (12.4 s vs 13.6 s unpadded), H3's 116 rows stay on the GPU (7.44 s/step vs 7.64 padded), ACE 30 s ties. Against the whole-request tile: Krea -0.6%, ACE 180 s tie, H3 -1..2%/step, ACE 30 s -7% (140 ms of 2 s).
-
-Guard: the `mediaTilePlan` test; live, the `[ane] <what> offload engaged: tiled N x 256 rows (P padded), tail R on GPU` line.
-
-## A parameter that keys a compiled artifact must not be re-derived per request (2026-09-11)
-
-The media share decides which ANE program set a build compiles, and the lineage prune keeps one share per model. It was re-solved at every build from a GPU probe timed at the request's own row count, so the fixed 256-row tile still recompiled: a 50 s song solved 0.50 where a 30 s one had solved 0.60, and H3 builds on every request. A sweep showed the size was not even the main problem: at 256-4096 rows the M4 Max probe reads 11.2-13.5 TFLOPS on all three models, so the raw share sits at 0.47-0.51, and Krea and H3 straddle the 0.475 rounding line (two consecutive H3 probes at 1024 rows: 0.468, 0.477). Any re-solve can land on the other side and cost a full compile plus a prune.
-
-Fix: the probe runs at a fixed `MEDIA_PROBE_ROWS` (4096), and a model reuses the share of its most recently used compiled set (`ane.cachedShare` over `msv_ane_cache_variant`), tagged `calibrated share=X`. An explicit `--ane-split` tags plain `share=X` and is never reused, and a cache hit re-tags the entry with the current lineage, so a set built by an older binary becomes reusable. The same sweep showed last round's ACE "0.60 match" was an outlier probe (7.8 TFLOPS): the solve cannot tell ACE from Krea or H3 on M4 Max.
-
-Guard: the `shareVariant` test; live, `[ane] <what> offload share X (reused from its compiled set)` on every build after the first.
-
-## A calibration timed on the wrong dtype aims low (2026-09-11)
-
-The media share is calibrated on block 0: its ANE program over one 4096-row run, its GPU complement over the same rows, balanced. The first version fed the complement bf16 ones (the weight-scale dtype) and aimed ACE at 0.50 and H3 at 0.40, below the measured bests of 0.60 and 0.45. Sustained ANE runs (clock ramp) and running both sides at once (bandwidth and power contention) each moved the timings by under 3%. A throwaway seam probe found the gap: at 0.50 ACE's real GPU complement took ~18 ms per block against the 12.9 ms calibration predicted, so every block was GPU-bound. ACE's DiT stream is float32 and so is its complement; Krea's is float32 cast to bf16 inside each linear; only H3's is bf16.
-
-Fix: each backend's calibrator names the dtype its MLP sees (`AneCalib.dtype`), and the complement is timed on that. ACE now calibrates at 0.57 (GPU 32.9 vs 25.9 ms). H3's remaining 0.42 vs 0.45 is its bench canvas's 116-row GPU tail, a per-request cost a per-model share cannot carry.
-
-Guard: the `calibratedShare` test; live, `[ane] <what> offload share calibrated X in Ns: …`.
-
-## The DiffVAE decoder: a faithful port that decoded to static (2026-08-13)
-
-The third cause above, closed. `vae_diffusion_decoder.safetensors` is four
-deterministic neighborhood-attention stages that upsample the latent into a
-full-resolution context volume, then eight diffusion blocks that denoise
-patchified pixel tokens against it. Architecture, geometry and the tiling plan
-live in `src/ltx_diffvae.zig`; the fused NA Metal kernel in
-`src/ltx_diffvae_kernel.zig`; the MLX pass in `src/ltx_diffvae_forward.zig`.
-
-### The kernel came first, and its window semantics are the whole risk
-
-NATTEN SHIFTS its window inward at a boundary — it does not clamp-and-mask.
-Porting the clamp reading gives a decoder that looks right everywhere except a
-`kernel/2`-wide frame around each edge of every tile, which is exactly the kind
-of error a whole-frame cosine cannot see. `naWindowStart` is the one definition
-and the kernel's parity test covers boundary-only volumes (`T=3` against
-`K_t=3`, axes shorter than their kernel) as well as the interior. Verified
-red-on-revert: swapping in a clamp turns both cases red.
-
-One thread per (query, head), 64-float accumulator and an online softmax in
-registers, K/V read THROUGH the cache. Staging K/V in threadgroup memory was
-declined by arithmetic, not by taste: a (1,4,32) query tile under (3,7,7) needs
-(3,10,38) keys = 145 KB of K+V, against Metal's 32 KB and the house occupancy
-rule of ~10 KiB. Neighbouring queries share ~95% of their window, so threads
-walk W first and a simdgroup's 32 windows overlap in L1.
-
-### The failure: a faithful port of a guess
-
-Per-stage parity against a PyTorch transcription of the reference came out at
-cos 0.99997-0.99999 with `rms_ratio` 0.999 on every stage, the context volume,
-the model prediction and the final pixels. Then the first real generation
-decoded to **pure static**.
-
-The port was right. The CONTRACT was wrong. `DiffusionVideoDecoder.__init__`
-takes `model_output_type`, `default_num_inference_steps` and
-`timestep_scale_multiplier` as constructor arguments, read by
-`_build_diffusion_video_decoder` from a `vae` config section — and no LTX pack
-ships one. The class defaults are v-prediction, 2 steps, timestep x1. Run that
-way the model's output is small against the noise it is subtracted from, so
-`x - 0.5*v` twice returns approximately the noise.
-
-The transcription inherited the same defaults, so parity was green against a
-reference that would also have produced static. **A faithful-port oracle proves
-your port; it cannot prove the reference's own unstated arguments.** The tell
-was in the file's own name all along: Lightricks call it a *1-step x0 decoder*.
-
-Measured, one lever at a time, on the same prompt/seed — the metric is
-`tests/lora_noise.py`'s mean absolute difference between horizontally adjacent
-pixels, which is the static detector:
-
-| arm | gradient | verdict |
-|---|---|---|
-| conv decoder (baseline) | 2.2-2.9 | picture |
-| x0, 1 step, t x1000 | **2.4** | picture |
-| x0, 2 steps, t x1000 | 17.7 | static |
-| x0, 1 step, t x1 | 29.5 | static |
-| v, 2 steps, t x1 (reference defaults) | 44.8 | static |
-
-All three matter, and each is provable. `Sampler` owns them with a kill switch
-each (`MLX_SERVE_DIFFVAE_{OUTPUT,STEPS,TSCALE}`), a unit test pins the values,
-and `tests/test_video_gen.sh` asserts the gradient RELATIVELY against the conv
-arm's own number on the same clip — the absolute value is a property of the
-canvas and step count (13.9 on a 4-step 9-frame 384x256 render, 2.2 on a
-25-frame 8-step one), so an absolute bar false-fails a small canvas. Measured
-ratios: 1.04-1.09 healthy, 7.7-15.4 on each broken arm.
-
-### What it buys, and what it costs
-
-Same prompt, same seed, 97f at 768x512 one-stage: the DiffVAE resolves the
-fox's ear, eye and individual fur strands where the conv decoder smears them,
-and the background branches separate. Cost: the decode itself measures 21.2 s
-and peaks at 20.7 GiB. End to end it does not show: 165.7 s (conv) against
-163.8 s (diffusion), same session, same prompt and seed — the conv decoder over
-97x512x768 is not free either, and the DiT dominates. Do not quote a per-clip
-penalty from these two runs; quote the decode stage, which is what was
-isolated.
-
-Per-frame metrics do NOT settle this either — the two decoders share the latent
-so the content does not fork, but detail deltas are still the wrong instrument
-at this size. The stills decided it, as with the quant round above.
-
-### Memory: a per-request decision, not a load-gate term
-
-The diffusion stage carries context + x + q/k/v at 256 wide over the whole
-tile: measured 10 KiB per stage-5 token. Stages 1-3 run on the FULL volume
-(1.6M tokens at dim 512 even for a 1920x1088 clip); only stage 4 and the
-diffusion stage are tiled, cut until one tile fits a budget that
-`tileTokensForMemory` derives from currently-free RAM. Billing that into the
-per-MODEL load gate would newly refuse packs that only ever use the conv
-decoder — the same reason `ltxPeakBytes` carries no activation term. The
-decoder FILE is already in the directory sum.
-
-Tiles overlap by `max(stage-4 halo, diffusion halo)` and blend with trapezoid
-ramps whose two sides sum to exactly 1 (half-offset: `(j+0.5)/L` against
-`(L-j-0.5)/L`), so no weight buffer and no division. Whole-volume against
-forced-tiled on the same seed: cos 0.9999972 overall AND on a band centred on
-the seam — the seam crop is asserted separately because a whole-frame cosine
-will happily hide a visible band down the middle.
-
-Cutting the budget is a real trade: 3M tokens/tile = 21 s and 20.7 GiB, 1.2M =
-46 s and 6.4 GiB (the tiles overlap, and stage 4 re-runs per tile).
-
-## MiniMax Music 3 (`minimax_music3`, src/music3.zig) — the traps behind the port (2026-08-13)
-
-Shipped against the diffusers `minimax-music3-integration` reference (dafe3733)
-with per-component parity oracles (`tests/dump_music3_fixtures.py`, a
-TRANSCRIPTION oracle in plain torch on our dequantized weights — the branch is
-not installable standalone). Everything below is a place where the "obvious"
-implementation is wrong and the oracle or a table test caught or pinned it.
-
-### It looks like ACE-Step; almost every detail differs
-
-Same endpoint, same modality slot, entirely different machine. The DiT's
-timestep is a PREPENDED TOKEN removed after the blocks — `norm1`/`norm2` are
-plain LayerNorm with weight AND bias, there is no `scale_shift_table` anywhere
-in the checkpoint, so reaching for acestep's AdaLN helpers produces a model
-that runs and generates plausible noise. The block FF is REVERSED SwiGLU:
-`ff_in` is fused 2×8192 and the output is `first_chunk * silu(second_chunk)` —
-the usual `silu(first) * second` also runs fine and also produces garbage. The
-vocoder Snake is `x + (α+1e-9)⁻¹·sin²(αx)` — alpha only, NO beta, NO exp;
-ACE-Step's has both. DiT RoPE rotates only the first 32 of 64 head dims at
-theta 10000 — hardcoded in the module default, NOT the LLM's 1e6 and NOT in
-config.json.
-
-### The AR loop's three silent corrupters (reference `encoders.py:282`)
-
-1. **Frame 0 is not emitted.** The loop runs `max_frames + 1` iterations; the
-   first only advances state past `<|audio_start|>` — but its codes STILL feed
-   back through `_embed_audio_frame`. The greedy-replay fixture therefore dumps
-   frame 0's codes too, or the replay desyncs immediately.
-2. **The vocab mask applies three times** in the reference because guiding two
-   `-inf` logits makes NaN. Our engine sidesteps the whole class with a FINITE
-   additive mask (-1e9): CFG arithmetic stays finite, one application, no
-   nan_to_num needed.
-3. **The top-k threshold comes from the CONDITIONAL branch**, strictly-less,
-   ties kept — thresholding the guided distribution instead is a one-line slip
-   the logits oracle sees as a different sampled trajectory.
-
-The per-frame feedback embedding is `(semantic row + Σ residual bank rows) ×
-8^-0.5` — the scale is load-bearing; the depth banks are codebook-major
-(`code + (index-1)*1024`).
-
-### Weight-norm fusion: the bias-length heuristic fails on square convs
-
-The plan said "which conv kind a tensor is can be read off the bias length
-(`bias.len == v.shape[1]` ⇒ transpose)". The vocoder's res-unit convs are
-768×768 — `shape[0] == shape[1]`, the heuristic is ambiguous exactly there.
-`conv_t1` is the only ConvTranspose1d in the stack, so the kind is keyed BY
-NAME, with the load test pinning the fused/swapped shapes
-(`[1536,768,16] → [768,16,1536]`).
-
-### A bare f32 scalar promotes a bf16 stream (`scalarLike`)
-
-`mlx_array_new_float` makes a STRONG f32 rank-0 array; `bf16_tensor * f32_scalar`
-promotes the whole product to f32 and every downstream quantized matmul then
-runs off-dtype. Every scalar op in music3.zig goes through `scalarLike`
-(cast-to-operand-dtype) — the same rule MageFlow established.
-
-### The prompt is a byte contract with cross-line regex semantics
-
-`_clean_caption`'s markdown-rule regex `^\s*[-*_]{3,}\s*$` (MULTILINE) lets
-`\s` cross newlines: a whitespace-only line IMMEDIATELY before a rule is
-absorbed into the match, and the trailing `\s*$` greedily ends at the LAST
-newline inside its run. A line-based reimplementation diverges on exactly
-those captions. The Zig scanners replicate regex retry semantics too (a failed
-`<|…|>` match advances ONE char, so `<|a<|b|>` → `<|ab`), and the whole
-surface is table-pinned against outputs generated by executing the reference's
-own Python regexes.
-
-### Numbers (2026-08-13, M-series 128 GB, 8-bit pack)
-
-AR stage 29.4 ms/frame ReleaseFast after the perf round (43.8 before it;
-60.3 Debug pre-round; probe-armed ladder 30.2/31.4 across two reps, both-off
-arm on the new build 43.7 ≈ the old-code baseline) — a 60 s song is ~45 s of
-AR plus the DiT/vocoder stage. The 4-bit depth requant experiment measured
-26.3 ms/frame (depth 11.7 → 8.0) at a real quality cost (replay agreement
-0.942 → 0.913, ar_hiddens cos 0.9988) — env-only, default OFF. Per-stage attribution (MUSIC3_COST_PROBE laps, eval barriers symmetric
-across arms): lm decode 17.5 ms in EVERY arm (batch-2 q8 8B weight-read
-floor), depth 23.3 → 11.7 ms (KV cache), head+sample 2.6 → 0.5 ms (lm_head
-prune), feed+book ~0.2. Parity after the round: prefill cos 0.99992, lm_head
-logits 0.99998, greedy AR replay agreement 0.942 with prune AND depth-kv
-engaged (identical to pre-round), ar_hiddens cos 0.9999, condition encoder
-0.999999, DiT velocity 0.9990–0.9999, vocoder 1.000000. The QLin preresolve
-is byte-identical (fixed-seed 8 s WAV vs the pre-round build). Multi-window
-stitch (3 windows, 14 s) has no silent seams; the 86/258-latent crops tile
-the song sample-exact (350 frames → exactly 14.00 s).
-
-### A depth KV cache CAN beat a "weight-read floor" — when the naive path was never at it
-
-The bandwidth model priced the depth decoder's 7 full re-forwards at ~11 ms
-of weight reads (7 × 0.65 GB q8), so a KV cache — which still reads every
-weight once per step — was estimated worth 1–3 ms. Measured: 23.3 ms naive,
-11.7 ms cached. The naive path sat 2× ABOVE its own read floor: re-computed
-positions widen every kernel, the per-step concat rebuild and per-forward
-graph-build add CPU, and none of that appears in a bytes-read table. The
-cache took the stage TO the floor — the floor is where a cache stops paying,
-not a reason it can't start. The corollary cuts the other way too: the lm
-decode stage measured 17.5 ms in every arm of the ladder — that one really
-is the read floor, and no cache, prune, or handle preresolve moved it by a
-tenth. Attribute with per-stage laps (MUSIC3_COST_PROBE; barriers symmetric
-across arms so A/B deltas stay honest) before pricing a lever off bandwidth
-arithmetic. Same round, same old trap: one zsh ladder arm passed two kill
-switches via `env $extra` (no word-split), silently dropping the second —
-caught immediately by the engagement line in the arm's own log, which is
-exactly what that rule is for.
-
-### LFM2-VL: a forward ARM with no vision splice answers "a completely black rectangle"
-
-The tower was correct before the model saw an image. Position resample cos
-0.999999 across six grids, tower hidden cos 0.99998, projected features cos
-0.9997 against transformers' own `Siglip2VisionModel` on our pack's weights.
-First live request: *"The image appears to be a completely black rectangle with
-no visible content or details."*
-
-Nothing errored. The encoder logged its boot line, the decode logged
-`grid 26x38 (247 tokens)`, the encode logged `[1,247,2048]`, the prompt logged
-`Inserted 247 image tokens`, `prompt_tokens` came back 265. Every number was
-right. `forwardWith` fans out to one arm per architecture family and the vision
-splice lives inside each arm — `forwardStandardWith` and `forwardMoeWith` have
-it, `forwardHybridWith` never did, because until LFM2-VL no hybrid arch (lfm2,
-nemotron_h, qwen3_next) had a tower. So 247 identical `<image>` placeholder
-embeddings went through the trunk and the model described them faithfully.
-
-The failure mode is the point: a missing splice presents as a bad IMAGE, not as
-a bug. Every observable except the answer is indistinguishable from working, so
-the guard cannot be an output assertion. It is a source scan —
-`every generative forward arm splices vision embeddings` — over every
-`forward*With` the dispatcher reaches, with the encoder-only arms
-(`forwardBertWith`, `forwardGemma3EncoderWith`, which serve `/v1/embeddings` and
-have no `image_token_id`) exempt BY NAME. A new arch is required to splice
-rather than inheriting the hole.
-
-### The reference for a position resample is `bilinear` + antialias, and mlx-vlm's bicubic is a SCALE error
-
-SigLIP2-NaFlex stores one learned 16x16 position table and resamples it onto
-each image's patch grid. transformers uses
-`F.interpolate(mode="bilinear", align_corners=False, antialias=True)`. mlx-vlm
-0.6.3 uses `bicubic_interpolate` there instead. Measured on the real table:
-cos 0.99 and **rms_ratio 1.13** — the resampled table comes out 13% hot, which
-is a scale error added to every patch embedding before block 0, not rounding.
-
-That made mlx-vlm unusable as the oracle even though it is the obvious one
-(installed, has `lfm2_vl`, and the packs are LiquidAI's own MLX conversions).
-The oracle became torch + transformers run on the pack's weights instead, and
-the Zig side reuses the Pillow-convention filter already in `qwen_vision.zig`
-(`resampleWeightMatrix`, new `.bilinear` arm): its footprint widens by
-`input/output` on downscale, which is precisely what torch's antialias does and
-what a fixed 2-tap bilinear does not. Antialias is a no-op when upsampling, so
-this only bites when a grid axis is SHORTER than 16 — which happens whenever an
-extreme aspect ratio fits the token budget (a 200x50 source lands on 32x8).
-Measured after: cos 0.999999 on every grid, both directions.
-
-Two smaller traps in the same file. The patch feature order is `[py, px, c]`
-with channel INNERMOST (`convert_image_to_patches`), where Qwen and Muse both
-put channel outermost — same shapes, same token count, scrambled image, and a
-cosine test on flat colour cannot see it. And the checkpoint carries TWO gelus:
-the encoder MLP is `gelu_pytorch_tanh`, the projector is plain erf `gelu`.
-
-### For a NaFlex model, tiling IS the resolution
-
-`smart_resize` caps a single view at `max_image_tokens` (256 merged tokens =
-a 32x32 patch grid). Anything past `max_image_tokens * 32² *
-max_pixels_tolerance` is instead resized onto a `cols x rows` canvas of 512px
-tiles, cut up, and encoded tile by tile with a thumbnail of the whole image
-appended. A 1800x1400 photo is 2x3 tiles + a 252-token thumbnail = 1788 tokens
-against 252 for the single view.
-
-Skipping tiling is not a small quality delta. Same picture, same prompt, 15px
-print: tiled reads `Serial: QX-88231-KLM`, `Batch code: 7741-ZZ`,
-`Checksum: 0xBEEF42` exactly; the untiled geometry returns
-`Social OS #0001 HLM`, `Batch code: 7941-02`, `Chemist: 100%F1F2` — confident,
-well-formed, wrong. That is why `tests/test_lfm2_vision.sh` runs BOTH arms and
-compares: this checkpoint reads large text fine at thumbnail resolution, so an
-absolute bar on the tiled arm alone would pass a build where tiling silently
-stopped happening.
-
-Two implementation notes. The canvas is resampled ONCE and each tile is a
-WINDOW into it (`buildPixelValuesRegion`) — resizing each tile region on its own
-resamples different pixels and is not what `split_to_tiles` does. And the prompt
-block is not a flat pad run: `lfm2ImageSegment` labels every tile
-`<|img_row_R_col_C|>` and the thumbnail `<|img_thumbnail|>`, so the model knows
-where each tile sits. A flat run still splices — the counts match — and hands
-the model six unordered crops. Marker order has to match the order the encoder
-concatenated the pieces, because the splice is positional. None of those ids
-live in config.json; `populateLfm2ImageTokens` resolves them by string from the
-tokenizer at load, the same way the user-turn marker is.
-## A routing chain that returns f32 by design makes the CALLER responsible for the dtype (2026-08-11)
-
-`groupLimitedRouting` keeps its expert weights in f32 on purpose, and says so: a bf16 round trip AFTER `routed_scaling_factor` (2.5) lands ~0.4% of 2.5 on every token, measured 2.6e-3 max error on the reference MoE block, 500x the tolerance the rest of the dsv4 port holds. Its doc comment ends "The caller casts to the activation dtype" — dsv4's caller does.
-
-Wiring that chain into `moeMLP2` for `bailing_hybrid` inherited the obligation and not the cast. The f32 weights multiplied the routed expert sum, the sum went back into the residual stream, and from the first MoE layer (layer 1 of 24) the whole forward ran in f32 — which promotes every bf16 weight on read for the remaining 23 layers. Nothing is WRONG in the output; it is a uniform slowdown with no single slow op to find, which is precisely why `[dtype-trace]` exists. The whole diagnosis was one line:
-
-```
-[dtype-trace] moe: residual widened at layer 1: bfloat16 -> float32
-```
-
-The fix is a dtype-conditional cast at the ONE place the scores enter the expert combine, so every current and future caller of the grouped chain is covered rather than each remembering. Two rules restated: a helper that deliberately returns a wider dtype than the stream states the caller's obligation IN the doc comment (this one did), and the caller's failure to honor it is invisible except in the dtype trace — so read the trace on every new arch's first forward, not only when something looks slow.
-
-## Chunked vision prefill: the splice row index is per-PREFILL, not per-forward (issue #197, 2026-08-16)
-
-**Live failure.** A coding agent taking browser screenshots worked early in a session and died once the conversation passed ~10k tokens: any request with an image got a 400 from the memory guard (`prompt 39113 tokens needs ~63155MB … rejecting`) while the same conversation text-only prefilled fine. Vision prompts ran the WHOLE prompt as one forward — `generate.zig` set `default_chunk = loop_end` for `has_vision` — and the guard correctly billed that full width (`unchunked_prefill`), which at 39k tokens on a 48 GB Mac is more memory than the machine has. No flag could fix it: `--prefill-chunk` was bypassed on this path, and `--skip-mem-preflight` would admit it into the uncatchable Metal OOM.
-
-**Why vision was unchunked.** `spliceVisionEmbeddings` finds each placeholder's source row via `cumsum(mask) - 1` over the CURRENT forward's tokens. Under chunking every chunk restarts at row 0 and re-splices the first image rows — coherent output, wrong image content. The failure is invisible from the outside: nothing errors, the model just answers about a corrupted image (in the quadrant repro, the bottom quadrants take the top quadrants' colors).
-
-**Fix.** `ForwardCtx.vision_splice_offset` carries the placeholder rows earlier chunks consumed; the prefill loop counts them host-side per chunk (`countSpliceRows`, no GPU sync) and sets the offset before every prefill forward INCLUDING the final-span forward (an image ending there would otherwise re-splice from row 0). The splice adds `offset × hidden` to the cumsum indices. All forward arms are covered for free because they share `applyVisionEmbeddingsWith` (pinned by the existing every-arm-splices scan). The memory guard flips with it: `checkAttentionMemory` now bills the chunk, and both sides read `generate.visionPrefillUnchunked` so the guard and the loop cannot disagree. Kill switch `MLX_SERVE_VISION_CHUNKED=0` restores the whole-prompt forward AND the full-width bill together. SSM checkpointing stays off for vision (prefix reuse excludes image prompts — that exclusion is unchanged).
-
-**Repro traps found while validating (both cost a debugging round):**
-
-1. **`nextChunkEnd`'s TAIL_MERGE_MAX (512) silently un-chunks short repros.** A 90-token vision prompt at `MLX_SERVE_PREFILL_CHUNK=32` runs ONE chunk (the "remainder < 512 merges" rule absorbs everything), so a boundary-inside-the-image A/B that "passed" proved nothing — the trace line `chunks=1` is the tell. A real boundary repro needs prompt length > chunk + 512. This also means a 1-token chunk cannot exist, so the splice's `seq_len <= 1` decode gate can never skip a placeholder.
-2. **Byte-equality between the chunked and unchunked arms is an unsound bar.** Chunk width changes GEMM shapes; a 4-bit checkpoint flips near-tie argmaxes across widths (measured text-only: chunk 512 vs 16384 diverge mid-answer on LFM2.5-VL-1.6B-4bit) — same class as MTP verify-width divergence. The A/B bar is the perceived-content invariant: both arms must name the SAME color set for a quadrant image (checkpoint-agnostic — gemma-4-qat calls dark yellow "brown" in BOTH arms), the off arm must read the top row at all, and the class bug shows as the chunked arm's set collapsing.
-
-**Validated live** on LFM2-VL (hybrid arm, image split across chunks 1–3 at chunk 32: identical answers), gemma-4-12B-qat (standard arm + PLE), and Muse-Glimmer-30B-4bit (muse arm, window-attention ViT). Qwen3.5-VL (M-RoPE) rides the same shared splice but had no local checkpoint in the loop — M-RoPE indexes its position table by absolute offset and rebuilds cos/sin per forward, so a chunk boundary inside an image is positionally safe there by construction. Guards: `tests/test_vision_chunked_prefill.sh` (two-arm engagement + color-set invariant), `spliceVisionRows` chunk-equivalence + audio-ordering tests (transformer.zig), `countSpliceRows` + wiring scan (generate.zig), guard-billing scan (server.zig).
-
----
-
-## A renamed vision tower, and a Conv3d read in the wrong axis order (Alis, 2026-08-19)
-
-`avlp12/Qwen3.8-27B-Alis-MLX-*` stores the Qwen3-VL tower under `model.visual.*` where
-every pack before it said `vision_tower.*` — 333 tensors, substructure identical, a
-pure rename. `src/qwen_vision.zig` hardcoded `vision_tower.` in ~10 `must(...)` keys
-plus `fmtLayer`, so the tower loaded nothing and the boot printed
-`MISSING QWEN VISION WEIGHT: vision_tower.patch_embed.proj.weight` → "vision disabled".
-It degrades gracefully, which is why it is easy to miss: the pack serves text
-perfectly. `shouldKeepWeightKey` did not list the prefix either, so `--no-vision` could
-not drop it and the load carried 0.92 GB it could never read. The prefix is now probed
-once in `QwenVision.init` (`resolveVisionPrefix`, the `model.resolveWeightPrefix`
-pattern) and threaded through every key including `fmtLayer`, and `model.visual.` joins
-the `--no-vision` list. Muse / LFM2 / Gemma already probe; Qwen was the last hardcoded
-one.
-
-**The second half is the one that fails silently.** With the prefix fixed the tower
-ran, the token accounting was right, and the model answered a red square with "black"
-and a 256px red square with "a black and white vertical striped pattern" — the
-signature of scrambled patch features, not of a bad checkpoint. `patch_embed.proj` is a
-Conv3d whose STORED axis order is the converter's choice: mlx_lm writes channels LAST,
-`[out, kT, ps, ps, Cin]` (mlx-community's Qwen3.5-0.8B: `(768, 2, 16, 16, 3)`), while a
-straight torch export keeps channels FIRST, `[out, Cin, kT, ps, ps]` (Alis:
-`(1152, 3, 2, 16, 16)`). Our loader permuted `(0,4,1,2,3)` unconditionally, which is
-correct for the first spelling and a scramble for the second. `patchProjLayout` now
-derives it from the shape against `qv_temporal_patch`/`qv_patch` (the two dims we
-already parse), logs which spelling won, and refuses by name if neither matches; the
-channels-first arm flattens with no transpose at all.
-
-**Probe with three colours.** Red → "black", green → "black", blue → "blue" was the
-broken state: one colour alone cannot tell "saw it" from "guessed", and blue was a
-coin-flip pass. After the fix: red/green/blue all correct, and `--no-vision` drops the
-capability from `/v1/models` entirely. Guards: the `patchProjLayout` + prefix unit
-tests (both spellings, plus the `--no-vision` key gate in `shouldKeepWeightKey`) and
-the live three-colour probe.
-
-**The layout trap is a CLASS, found by fact-checking a table (2026-08-19).** Three
-divergence rows in the Qwen3.8 shootout — `mlx-community/Qwen3.8-27B-8bit`,
-`avlp12/…-Alis-MLX-8bit` and `Youssofal/…-MTPLX-Optimized-Quality` — agreed to 15
-decimal places, which looks like a harness bug. It is not: a byte-level scan (dtype,
-shape, size, head+tail SHA over every tensor, plus full SHA-256 over 20 whole tensors)
-shows all 1847 shared language-model tensors are identical — same deterministic
-`mlx_lm` 8-bit/gs-64 affine quantization of the same bf16 source. The scan surfaced
-exactly ONE differing tensor between mlx-community and MTPLX:
-`vision_tower.patch_embed.proj.weight`, `[1152, 3, 2, 16, 16]` in MTPLX against
-`[1152, 2, 16, 16, 3]` in mlx-community's — and byte-identical to the Alis conv. So
-MTPLX-Optimized-Quality shipped the same scrambled vision under the prefix we DID
-support, where nothing pointed at it: the tower loaded, the token accounting was right,
-and only the answers were wrong. Both packs name colours correctly on the fixed build.
-Same scan explains the `ddalcu-8bit` row sitting 0.8 points apart: exactly one shared
-tensor differs (`embed_tokens`, dense bf16 vs 8-bit) plus its MTP head.
-
----
-
-## Standardizing our own Qwen3.8 packs: embeddings, head norms, DWQ (2026-08-19)
-
-Three changes, each driven by a measurement rather than by "what everyone else does",
-applied by `tests/restandardize_qwen38_pack.py` (source pack in, new pack out; every
-transform is a no-op when the pack is already in the target state).
-
-**1. The embedding is now quantized.** Our 4-bit and 8-bit packs kept `embed_tokens`
-dense bf16 while every other vendor packs it; our own 6-bit and iQ packs already packed
-it, so we were not even self-consistent. The comparison is unusually clean because
-`ddalcu-4bit` and `mlx-community/Qwen3.8-27B-4bit` differ in **exactly one shared
-tensor** (verified by a full-key scan: 2178 common keys, 1 mismatch), as do the two
-8-bit packs. Dense vs quantized: 83.6% / KL 0.322 vs 84.0% / 0.342 at 4-bit, 95.5% /
-0.0136 vs 96.3% / 0.0158 at 8-bit — top-1 nominally favours quantized, KL nominally
-favours dense, all inside ±2se. Cost of dense: 1.8 GB at 4-bit, 1.2 GB at 8-bit. A
-trap worth naming: `mx.quantize` on the raw stored bf16 bytes reproduces mlx_lm's
-output **byte-for-byte**, but routing the same values through an f32 round trip does
-not — and byte-identical codes are what makes a DWQ graft legal, so the repack
-quantizes from the raw bytes.
-
-**2. Head norms are published FOLDED.** Qwen's own release stores them delta-encoded
-(zero-centered, the layer computes `1 + w`) and ddalcu packs were byte-faithful to it.
-The fold is not a numerical improvement: our loader's `+1` (upcast f32, add, cast back
-to bf16) reproduces the folded packs' stored values bit-for-bit on all 7 tensors, so
-both conventions are the same bytes at serve time. It is an interop choice — a loader
-that does not detect the convention multiplies by gamma ≈ 0.03 and drafts at ~0%
-acceptance while looking healthy.
-
-**Do not assume the convention fixes a downstream loader.** Simulating oMLX's actual
-two stages against the real tensors — `sanitize`'s per-key `mean < 0.5 → +1`, then
-`norm_repair`'s backbone-anchor pass — both delta (ddalcu) and folded (jundot) land
-7/7 correct on Qwen3.8-27B. The pack that breaks there is `alis-4bit`, and not because
-of its head: its BACKBONE `post_attention_layernorm` norms sit 0.8 higher than
-mlx-community's, which moves the anchor and makes oMLX double-shift the head's copy —
-the same false-repair class we fixed on our own side the same day.
-
-**3. DWQ is graftable at 4-bit, and only at 4-bit.** `WaveCut/Qwen3.8-27B-MLX-4bit-DWQ`
-is `mlx-community/Qwen3.8-27B-4bit` with learned dequantization: identical packed codes
-(0 of 40 sampled differ), every `.scales` different, some `.biases`, and all the
-un-quantized GDN `conv1d` weights. Our 4-bit codes are byte-identical to that same
-base, so the learned tensors transfer as a file copy — 1044 tensors grafted, the tool
-verifying the underlying codes match PER TENSOR and refusing where they do not.
-Measured on our repacked pack: 83.6% → **84.2%** top-1, KL 0.322 → **0.289** (the best
-4-bit KL in the shootout bar `jundot-oQ4e`), resident 17.67 → **15.85 GB**, decode and
-MTP acceptance unchanged (36 engagement lines, 74–95% per-draft). At 6 or 8 bits the
-scales are meaningless — the codes are a different alphabet — and the shapes still
-MATCH (group size decides scale geometry, not width), so a wrong graft would load and
-produce garbage rather than erroring.
-
-## Reference audio is a conditioning SWAP, and FLF is a mask (#259 / #260, 2026-08-22)
-
-**ACE-Step reference audio.** The Music pane was text-only while every 1.5 DiT (XL-Turbo included) takes "Refer audio". The engine already had the VAE encoder (`vaeEncodeMean`, oracle 6) and the condition encoder's timbre branch — which `generateWav` always fed the SILENCE latent. The reference (`conditioning_embed.infer_refer_latent`) feeds `refer_audio_acoustic_hidden_states_packed` = the clip's VAE latent, and the silence latent `[:, :750]` is exactly what it substitutes when no clip is given. So the feature is one slot with two sources, never both. Reference prep (`io_audio.process_reference_audio`): stereo 48 kHz, clamp [-1,1], TILE a clip shorter than 30 s, then take one 10 s segment from each third at a RANDOM offset and concatenate — always 30 s, and `tiled_encode` SAMPLES the posterior. Ours (`acestep.referenceWindow`) takes the start of each third and the MEAN so a seed is reproducible. The timbre window is the reference's own number (`timbre_fix_frame` 750 = 30 s x 25 Hz), which is why the engagement line reads `750 latent frames` whatever the clip length. Cover / Vocal2BGM landed the same day as a second story below. Parity: oracle 7 (`ACESTEP_REFCOND`, the oracle-6 audio's mean in the slot) measured 2026-08-22 on the fp32 HF checkpoints: whole pack cos 0.99995, timbre row cos 0.99989 — pin the ROW, a whole-tensor cosine over 86 rows cannot see one wrong row (the silence and reference fixtures agree byte-for-byte on the other 85). Live A/B on a real clip (same seed) moves the track but does not make it a cover — that is the feature's ceiling upstream too, one pooled token. Guards assert the log line — a silently ignored clip still yields a perfectly good track.
-
-**LTX first/last frame (#260).** I2V pins one image as latent frame 0 via `cond_mask` + clean latent (`VideoConditionByLatentIndex`). The first cut of last-frame support did the same at `latent_idx = F_lat-1`, reasoning that the last latent frame IS the last pixel frame on the causal VAE. A user's FLF run (start == end image, 97 frames) came back with exactly the last 8 pixel frames decoding as noise and the target image sitting ~9th from last. The cause: the causal VAE encodes a lone image as a 1-pixel-frame "frame 0" latent; every later latent slot decodes as an 8-frame group, so a frame-0-style latent in slot `F_lat-1` is out-of-distribution for the decoder — and the DiT, pinned to it, converged the neighbouring group to the image instead. Upstream (`ltx_pipelines/utils/helpers.py`) only ever replaces at `frame_idx == 0`; any other index goes through `VideoConditionByKeyframeIndex`: HW extra tokens APPENDED to the sequence, clean, denoise mask 0, RoPE positions from `get_pixel_coords(causal_fix=False)` shifted by `frame_idx` with the temporal end narrowed to one frame (midpoint `(num_frames-1+0.5)/fps`), no attention mask for a single guide, trimmed before decode. That is what `keyframeMask`/`keyframePositions`/`buildKeyframeCond` do now on both pipelines (stage 1 trims before the upsampler, stage 2 before the VAE). Second deviation fixed in the same pass: we added the 2.5 `keyframes_abs_pos_embedding` to every `cond_mask == 0` token; the reference marks only GENERATED keyframe slots (`extend_keyframes_mask(marked=False)` for image guidance), so it is never added here (the checkpoint's row is rms 8e-4, so i2v output barely moves). The earlier claim that latent replacement was "Lightricks' older FLF recipe" was wrong: their 0.9.x pipeline also appended non-zero-frame conditioning tokens. `F_lat == 1` still refuses a last anchor (`error.KeyframeCanvasTooShort` → 400). Sidecar now records `last_frame:` too.
-
-## An ACE-Step task is the context stream plus the instruction line (cover / vocal2bgm, 2026-08-22)
-
-**What the modes are.** Read from `modeling_acestep_v15_xl_turbo.py`, not the README: `cover` and `complete` are the SAME 32-layer DiT forward text2music runs. Two things change. (1) The `context_latents` the DiT reads through `proj_in` — `[src_latents | chunk_mask]`, 64+64 channels — which text2music fills with the silence latent and all-ones. `complete` (the gradio "Add stem" button, the vocal2bgm use) puts the source clip's raw VAE latent there. `cover` puts the latent through `tokenize` (pad T to x5 with silence, `audio_acoustic_proj`, a CLS token prepended to every 5-frame window, two `AceStepEncoderLayer`s over each 6-token window, RMSNorm, CLS row → `ResidualFSQ`) and `detokenize` (embed, x5 + per-slot special tokens, two encoder layers over each 5-token window, RMSNorm, `proj_out` 2048→64) — 25 Hz "LM hints" that carry the melody and structure but not the timbre. (2) The instruction line of the SFT prompt: `TASK_INSTRUCTIONS` in `constants.py`, with `complete` taking the instrument list upper-cased and ` | `-joined (`task_utils.generate_instruction`). The target length IS the source length (`conditioning_target.py`). So `acestep.zig` grew a `Task` enum, `taskInstruction`, `contextLatents(src)`, and the cover helpers; the request's `duration_seconds` is ignored with a log line.
-
-**The FSQ grid is not the one the FSQ paper describes, and not the one the class docstring describes either.** `vector-quantize-pytorch`'s `ResidualFSQ` (1.31.1, the version upstream pins to) SOFT-CLAMPS its input first — `soft_clamp_input_value` defaults from the levels to `c = L/(L-1)` per dim and `forward` applies `c * tanh(x / c)` — and then constructs its `FSQ` with `preserve_symmetry=True` and `bound_hard_clamp=True`, so the quantizer is `2/(L-1) * floor((L-1)(clamp(c*tanh(x/c),-1,1)+1)/2 + 0.5) - 1`. Neither the tanh `bound()` a bare `FSQ` uses (the plan was written from it) nor the hard clamp alone (my first reading of the source, which skipped the constructor's `default(...)`) — the second one survived two rounds of parity work because it is right on every value except those the soft clamp pulls across a floor boundary. Indices are `codes_to_indices` with the symmetric `_scale_and_shift` and basis `cumprod([1] ++ L[:-1])`. One quantizer → scale 1. The reference forces the quantizer to fp32; ours runs the whole tokenizer/detokenizer in f32 activations (they are tiny) with the two FSQ projections stored f32 in the pack (`DENSE_F32_PREFIXES`). Don't read a quantizer's formula off its `quantize` method: instantiate it and print its flags (`~/claude-tmp/acestep-cover/tok_diag.py` shape).
-
-**The pooler's windows are a batch.** `encoderStack` was written for `[1,T,D]`; the pooler wants `(b t) p c` — every 5-frame window as its own sequence with RoPE positions 0..5 and a band mask that never bites. Feeding it `[T/5, 6, 2048]` gives exactly that for free (`mlx_fast_rope` restarts positions per batch row, the `[1,1,T,T]` mask broadcasts), so the stack only needed to take its weight map as a parameter (the FSQ weights live in their own map).
-
-**A grid code is a near-tie, and the oracle bar says so — which is also what found the soft clamp.** Oracle 8 first demanded index EXACTNESS and failed 3/10 on the 8-bit pack and 2/10 on a dense-bf16 FSQ build. The bar became the MTP near-tie rule: the dump saves the reference's pre-quantization `z` (`acestep_tok_z.raw`), and a flipped digit is acquitted only where the reference put that dim within 0.05 cells of a floor boundary (`fsqBoundaryDistance`); a wrong RoPE, mask or window layout flips dims 0.3-0.5 cells deep and still fails. Under that bar ONE flip stayed deep at 0.073 cells across every arm — 8-bit weights, dense bf16, fp32 weights, f32 activations — with our `z` equal to the reference's to 2e-5. A value that is bit-right and a level that is wrong is the FORMULA: the soft clamp above. With it, dense-bf16 weights + f32 activations are EXACT (0/10, hints cos 1.000000); an 8-bit pooler moves `z` by up to 0.039 and flips 3/10 codes, all at ≤ 0.012 cells (acquitted by the bar). Detokenizer: cos 1.000000 + rms_ratio 1.0000 in f32. Cover DiT velocity: cos 0.99719.
-
-**Acquitted is not harmless: the FSQ file ships DENSE.** The first Billie Jean cover "sounded nothing like the original". Per-stage oracles were all green, so oracle 11 runs the WHOLE cover pipeline on a real 15.8 s clip against the reference's own 8-step cover (`--cover-clip`): with the 8-bit FSQ file our final latents correlate 0.64 with the reference's; with dense bf16 FSQ weights 0.985 (the text2music e2e on the same 8-bit DiT reads 0.954, so 0.985 is the pack's ceiling). Three near-tie flips on a 2 s chirp become dozens over 79 codes, and every flipped code re-steers five frames of context. `FSQ_BITS = 16` in the converter whatever `--bits` says: 420 MB instead of 223, and it is the only setting under which cover is the reference's cover. Note also that the reference's own cover at strength 1.0 sits at latent cos 0.11 to its source (detok context 0.25) — a cover keeps melody/structure, not the latent, so never grade a cover by latent similarity to the source; grade it against the reference's cover.
-
-**Weights ship as a SEPARATE file, and the engine stats for it.** The converter used to DROP `tokenizer.*`/`detokenizer.*` (60 tensors, 223 MB at 8-bit). Re-uploading a 5 GB pack to add them is not an answer, so they go to `fsq.safetensors` (`--fsq-only` writes just that file into an existing pack) and the engine loads it lazily on the first cover request (`ensureFsq`). `fsqAvailable` is a STAT, not a load-time flag: the app drops the file into a pack that predates it while the engine may already be resident (`DownloadManager.startPackFile`, the Turbo-adapter pattern — TEMPORARY migration code, to go once installs have re-downloaded), and the handler's named 400 for a missing file has to stop being true the moment the file lands. `complete` needs no new weights and must work on the OLD pack — that is why it went first.
-
-**The source clip is encoded in windows.** `vaeEncodeMean` on 600 s would hold 128 channels x 28.8M samples f32 (15 GB) per activation. `vaeEncodeMeanChunked` encodes 30 s windows with a 64-frame halo, cores starting on 1920-sample (one-latent) boundaries so every strided conv lands where the untiled pass would — the decode's own overlap strategy, mirrored; the encoder's receptive field is ~12 frames. And a 10 s WAV's base64 is past ARG_MAX: the integration script passes clips by FILE (`mkreq`), which the #259 `ref_audio` arm had silently been failing on.
-
-**Sampler extras.** `cover_strength < 1` builds a SECOND condition set (text2music instruction re-encoded while the text encoder is still resident — before the low-mem release —, same lyrics/timbre, silence context, its own cross K/V) and switches at `int(steps * strength)`, resetting nothing else (the reference rebuilds its cross KV cache; ours is per set). `cover_noise_strength` starts from `t*noise + (1-t)*RAW source latent` at the schedule entry nearest `1 - strength` (`nearestStep`, earlier step on ties like Python's `min`) and runs the remaining steps — the blend is the raw latent, never the hints. Both are integration-pinned by their log lines.
-
-
-## Qwen3.8-Flash-Next (`qwen4_exp`) port (2026-08-26)
-
-Qwen/Qwen3.8-Flash-Next arrived as `model_type: qwen4_exp` — the Qwen4 preview
-arch, not a qwen3_5 pack: 125B-A6B GDN+MoE trunk (48 layers, 3 GDN : 1
-attention) wrapped in FOUR hyper-connection residual streams, a 51B hashed
-n-gram embedding injected at layer 1 (PLE), Qwen Sparse Attention (QSA:
-indexer-selected 4-token blocks past 2048 tokens) on the attention layers, and a
-1-layer MTP head. HF transformers main (`models/qwen4_exp`) is the trunk oracle
-and ignores `mtp.*`; the MTP forward lives only in the vLLM (#53896) / SGLang
-(#36497) PR branches (see memory notes; not served yet).
-
-What the port reuses: the qwen3_5 split-projection GatedDeltaNet with the
-`kda_sigmoid_out_gate` output gate, the qwen3_5 MoE (softmax top-10 + sigmoid
-shared expert), `gatedFullAttnWith` (q-gate, QK norm, partial rotary 64/256,
-KV cache). What is new: `hcRead`/`hcWrite` (grouped `(1+w)` norm per stream,
-sigmoid mix, `2σ(inject/hc)` write gates), `pleForward` (host n-gram gather →
-key/value → gated → dilated depthwise conv), `qsaMask` (bool mask threaded
-through `ForwardCtx.qsa_mask`), and the final `hyper_connection_mixer` in place
-of `model.norm`.
-
-Traps that cost time:
-
-- **HF `output_hidden_states` records layer INPUTS**: `hidden_states[0]` is the
-  tiled embedding, `hidden_states[i]` the input of layer i. Comparing our layer
-  output with `stream_i` read as "layer 0 already broken" while every sub-module
-  matched at 0.9999.
-- **QSA tail is per query**: the reference concatenates each query's own
-  incomplete block (`visible[num_complete_blocks*ratio:]`), so token j is visible
-  iff selected-block OR `j >= ratio*floor((p+1)/ratio)`. A global `kv % ratio`
-  tail left rows 0..2 with NO visible tokens.
-- **Indexer scores in f32, ties to the lower index**: relu zeroes most blocks
-  early in a sequence; `torch.topk` keeps the lower index among equal scores and
-  `argpartition` does not. Bit-faithful selection needs f32 scores plus a tiny
-  index-descending bias.
-- **The n-gram eos is the text config's**: `_shift_right_ignore_eos` resets on
-  `config.eos_token_id[0]` (248044); the root config has none and
-  `generation_config.json` lists several. Read it into `ngram_eos`.
-- **A freed-but-not-nulled `aux_state`**: `resetCache` re-creates conv/ssm
-  handles; the new field must be nulled with them or the warmup's second forward
-  SIGBUSes on a dead handle.
-- **Toy geometry has to clear the kernels' floors**: the GDN Metal kernel refuses
-  dk 16 (`float state[n_per_t]` zero-length) — the tiny oracle uses dk/dv 64.
-
-Bring-up flow: `dump_qwen4_exp_fixtures.py build` (random tiny model in the
-real naming) → `convert_qwen38_flash_next.py --src` → `dump` (reference on OUR
-dequantized weights, so the fixture measures the engine, not the quantizer) →
-`QWEN4_TEST_MODEL=… QWEN4_FIXTURE=… zig build test -Dtest-filter="qwen4 fixture"`
-(prints a per-layer bisect ladder + layer-0/1/3 sub-module cosines). Final:
-full prefill cos 0.99996, 20/20 argmax; chunked prefill + stepwise decode past
-the budget 6/6.
-
-MTP (phase 2, same day): the head is one more hyper-connected QSA+MoE layer
-fed `fc_hidden(rms_10240(pre-mixer stream)) + fc_embedding(rms_2560(embed))`
-per stream, then its own mixer and the trunk lm_head — vLLM/SGLang agree, HF
-ignores `mtp.*`, so the oracle is a torch rendering of that math on a synthetic
-head (layer-3 tensors + random fc). Wired as `MtpHeadRef.qwen4` / `MtpCacheRef.qwen4`
-(state on `Transformer.qwen4_mtp`, single-flight), so the whole EV controller /
-acceptance / rollback loop is reused. Rollback extends `ssmRollbackFromCapture`:
-the PLE layer captures its conv input + token history during a capturing
-verify (`spec_ple_input/tokens`), attention layers truncate their positional
-QSA key history, the head truncates its own KV + keys. Two traps: draft ids
-arrive as lazy graphs of the sampler's dtype (cast + contiguous before the host
-n-gram read — `TokenIdsUnreadable` otherwise), and the head's key row 0 sits at
-position 1, so `qsaMask` takes a `pos_base` (explicit angle table for the pooled
-keys; a scaled `fast_rope` cannot express a non-multiple base). Bars: head
-parity cos 0.99998 vs the reference, verify→rollback(accept 1)→continue exact
-(cos 1.00000) vs a fresh forward, server MTP-on == MTP-off greedy at 0 accepts.
-
-Known v1 limits: serial (module-owned); PLD/DFlash off; batch 1;
-QSA scores/mask are `[S, kv]`-sized transients per attention layer (long-context
-prefill wants a smaller `--prefill-chunk`); MTP default-off (acceptance audit
-pending, see engine-mlx.md round 3); pooled block keys recomputed per step.
-
-Prefix cache (round 3, same day): `SSMCacheEntrySnapshot` now carries
-`aux_state` (QSA raw-key history), `qsa_pooled`, `qsa_ratio` and `ple_prev`
-(the PLE window tokens) beside conv/ssm; the disk tier writes them as
-`l{d}.aux`/`l{d}.pooled`/`l{d}.ple` with `qsa_ratio` in the manifest, and the
-`HotPrefixCache.shouldUse` refusal is gone. Live two-turn: reused 4385/4502,
-then 4471/4502. The parity bar on this arch is not the hybrid 0.047 nats:
-restored-vs-cold top-5 logprobs differ by 0.14–0.30 nats, while a COLD
-chunk-1024 prefill vs a cold chunk-4096 one differs by 0.34 — the restore
-resumes at a different chunk boundary, so the gap is the chunking-rounding
-class, not a state bug. A restore that drifted past 0.34 would be one.
-
-### Image input (vision tower + M-RoPE + QSA), same day
-
-The checkpoint is `Qwen4ExpForConditionalGeneration`: a 27-layer Qwen3-VL-style
-ViT (hidden 1152, 16 heads, patch 16, temporal 2, merge 2, learned 48x48 pos
-table bilinear-resampled, 2D rope, `out_hidden_size` 2560, no deepstack) whose
-weight names are Qwen3-VL's under `model.visual.` — `qwen_vision.zig` loads it
-unchanged (prefix probe, `patchProjLayout` channels-first). Our pack had dropped
-the tower; `convert_qwen38_flash_next.py --add-vision` fetches the ONE HF shard
-that holds all 333 tensors, passes them through bf16 into
-`model-vision.safetensors`, merges the index and restores `vision_config`
-(idempotent, `--src` for a local tree). The tower is dense bf16 (~0.9 GB); the
-Zig tower is dense-only anyway.
-
-Three engine seams, none of them new code paths for text:
-
-1. **Splice before the tile.** The reference `masked_scatter`s the image rows
-   into the 2560-wide `inputs_embeds` and only THEN `repeat`s them into the 4
-   hyper-connection streams. Our `forwardQwen4With` called
-   `applyVisionEmbeddingsWith` after `mlx_tile` (a no-op on text) — the first
-   real embedding would have met 10240-wide rows. Moved above the tile.
-2. **One M-RoPE preamble.** `forwardMoeWith` built the per-chunk cos/sin inline;
-   `beginMropeChunk`/`endMropeChunk` now serve both forwards, in the stream's
-   dtype (bf16 served, f32 under the fixture oracle), so `gatedFullAttnWith`'s
-   existing mrope branch just works on this arch.
-3. **The QSA indexer reads the same table.** `Qwen4ExpTextQSAIndexer.forward`
-   ropes q with `current_cos/sin` and the pooled block keys with
-   `full_cos[group_starts]` — 3-D positions inside an image, `abs + delta` past
-   the prompt, i.e. exactly `PositionContext.axisPosition`. `qsaMask` takes
-   `ctx`: q via `applyMrope(mrope_cos_cur)` on prefill chunks, scalar
-   `pos_base + offset + delta` past the table; new pooled rows via
-   `mropeCosSinAt(start = pos_base + nb_cached*ratio, stride = ratio)` (pure
-   host fill in `mrope.fillCosSin`, hermetically pinned as "strided rows ==
-   every stride-th row"). Cached pooled rows keep the angles they were built
-   with. Scalar arms now apply the same mscale `fillCosSin` already baked into
-   the M-RoPE tables (`yarnScaleRotated` / `ropeAtFreqs`, never a second
-   scale on the table path).
-
-Oracle: `dump_qwen4_exp_fixtures.py build|dump --vision` (tiny tower: depth 2,
-hidden 64, 4x4 pos grid; one 6x8-patch image = 12 tokens in a 28-token prompt
-crossing the tiny budget 8). `qwen4 fixture vision` asserts tower rows vs
-`pooler_output` (0.99999), `getRopeIndex` == the reference 3-D table + delta,
-our M-RoPE cos table vs the reference's (7e-8), full prefill cos/argmax +
-per-layer streams, the layer-3 QSA mask EXACT (the direct guard for the
-pooled-key angles: scalar-roping them red-probes at 32 mismatches), a two-chunk
-prefill split INSIDE the image span (`vision_splice_offset` + pooled blocks
-built across chunks; bar = our own full forward, 1.00000) and stepwise decode
-past the table. Live arm: `test_qwen4_exp.sh [7]` + the `qwen4-exp` row of
-`test_vision_all.sh`.
-
-The oracle's own trap, found on the way: a random tiny MoE routes NEAR TIES
-everywhere. The first vision run matched every stream to 0.99999 except ONE
-row at layer 3 — a top-2-vs-3rd router gap of 1.1e-4 that our bf16-class
-kernel noise (~0.5%/layer) flipped. Sharpening the router does not help: the
-tie rate is scale-invariant (noise scales with the logits), 224 routing
-decisions always carry one, and no seed in 3..120 clears a 2% floor. Then the
-same thing one level down: layer 7 row 20's second and third QSA block scores
-were BOTH exactly 0.0 (relu), so a near-zero q·k flipping sign selects a
-different block — a tie the lower-index rule cannot resolve. Design that
-survives: every expert active in the tiny config (`num_experts_per_tok =
-num_experts` — a wrong expert mapping still shows, a pick cannot flip), and the
-dump records the reference's OWN margins per row (`qsa_gap` = relative margin
-between the last selected and first rejected block score, min over QSA layers;
-`logit_margin` = top-2 logit gap) so `Qwen4Ties` acquits rows under 3% by the
-reference's numbers, never ours (28-row vision prompt: 8 QSA + 5 argmax
-acquittals, 17 decisive rows; 20-row text prompt: 2 + 0). Same machinery on
-the text fixture, which had been passing by luck.
-
-The live sanity then caught a SHARED-path hole: a 4-frame clip through the
-video path logged `Decoded 4 frames → qwen video grid_t=2 … 690 tokens`,
-`Inserted 0 image + 690 video … soft tokens`, `M-RoPE: 0 images, 1 videos` —
-every engagement line green — and the model described "a person in a white
-shirt standing in front of a plain background". `spliceVisionRows` built its
-mask from `image_token_id | audio_token_id`; `<|video_pad|>` is a third id, so
-the 690 encoded rows were never scattered and the trunk read 690 raw pad
-embeddings. transformer.zig had never mentioned `video_token_id`. The qwen3_5
-video e2e (`test_qwen_video_input.sh`) asks for >= 2 of {house, robot,
-street/sign/road, app/phone} — words a model hallucinates freely — so it
-passed. Fix: the mask and `countSpliceRows` (chunked-prefill row accounting)
-take `video_token_id`; guard = `spliceVisionRows: video placeholders are
-scattered like image rows` (red on the old mask). Rule: an engagement line
-proves the PATH ran, only content the pixels alone could supply proves the
-rows reached the prompt.
-
-
-## A k < E tiny MoE fixture covers selection only through the MTP head (2026-08-26)
-
-`dump_qwen4_exp_fixtures.py build --topk 2` builds the tiny qwen4_exp with 2 of 8 experts. The reference is constructed from `TINY`, so `dump` now reads `num_experts_per_tok` back from the checkpoint (the first dump ran k = 8 against our k = 2 pack: MTP head cos 0.894 with ZERO acquittals — a config mismatch looks exactly like a kernel bug). With k honored, the head matched at cos 1.0000 on every decisive row except one at a 3.5% softmax margin, hence `QWEN4_TIE_REL_ROUTE` = 5% (the router reads a bf16 residual; the QSA scores are f32 and keep 3%). Margins come from forward hooks on every `Qwen4ExpTextTopKRouter` (`route_gap` = min over MoE layers of `(p[k-1] - p[k]) / p[0]`; `mtp_route_gap` from the head's own router).
-
-The trunk cannot be covered this way on a random model: 8 MoE layers x k = 2 leaves 18 of 20 prefill rows and all 6 decode rows under the bar, so the `decisive >= T/2` floor only applies when no routing table is present. The head is one MoE layer and keeps 12/19 decisive rows — that is where top-k selection is hermetically pinned. The k = E fixture remains the CI oracle; the k = 2 pack lives in `~/claude-tmp/qwen4-tiny-k2/`.
-
-Also from this round: the video e2e bar (`tests/test_qwen_video_input.sh`) now demands frame 3's sign text; the informational bf16 logits readout in `qwen4 fixture bf16` reads cos 0.9997 / argmax 20/20 on the k = E pack.
-
-## A latent-to-RGB preview is a FIT, and a hue wheel is not one (#208, PR #308 review, 2026-08-30)
-
-The first cut of `preview.zig` projected latent channel `i` to a colour by walking the hue circle at the golden angle (`cos(i * 2.4)`, `cos(i * 2.4 - 2π/3)`, …), then mean/std-stretched the result per frame so it filled the 0–255 range. Every part of that is defensible in isolation and the whole thing is wrong: the golden angle spreads the channels EVENLY around the wheel, which is precisely the assumption a fit refutes — on MiniMax-H3's published table the largest channel weight is 30x the smallest, so a projection that treats all 24 equally is dominated by channels the decoder barely reads. The output was a colourful blob whose only relationship to the video was that it changed when the video did. The per-frame stretch made it worse in a way that is invisible in a single still: it renormalizes against each step's own statistics, so brightness and contrast jump between consecutive previews even where the latent is converging.
-
-The shell guard passed throughout, because it asserted `FF D8` and a non-zero length. That is the class: an image codec test cannot tell a picture from noise, and there was nothing else.
-
-What ships instead is the projection ComfyUI publishes for each of the two latent spaces — `LTXAV` (128 channels, and NOT `LTXV`, which is LTX-0.9's table at the same geometry over a different latent space) and `MiniMaxH3Video` (24). ComfyUI is GPL-3.0 and this repo is MIT, so its code is a SPECIFICATION here, the same standing every other ported reference has: `tests/dump_latent_rgb_factors.py` imports the reference, EXECUTES `Latent2RGBPreviewer` on a pinned latent, and emits both the coefficient tables (`src/latent_rgb.zig`) and the reference's own outputs (`src/fixtures/latent_rgb.json`). Nothing is transcribed by hand.
-
-Three things the oracle needed before it could fail for the right reason:
-
-- **The stub has to explode, but not everywhere.** ComfyUI's `latent_formats` reaches into `comfy.model_management` and `comfy.taesd`, neither of which is part of the projection. An `_Exploding` module that raises on ANY attribute access fails during import; registering real `types.ModuleType` shells whose *members* explode lets the projection bind and still makes a golden value derived from a stubbed path impossible.
-- **A case must have more pixels than the map has channels.** With 128 channels and 64 pixels a wrong coefficient can be cancelled by the others across the case, so the LTX case is generated large enough to over-determine the fit.
-- **`preview_to_image` clamps and TRUNCATES.** `(x + 1) / 2` clamped, `* 255`, then torch's `.to(uint8)`, which truncates. Rounding instead disagrees with the reference on roughly half of all pixels — which is what the mutation check now proves, since flipping `toU8` back to `+ 0.5` fails the fixture test.
-
-`pinnedLatent` is the shared input: an integer LCG, then `(x >> 8) / 2^24 * 3 - 1.5` in f32 only. A 24-bit numerator over 2^24 is exact in single precision, so Python and Zig land on identical bits and the float comparison is a real tolerance (1e-5, for BLAS reduction order) rather than a fudge factor hiding a disagreement.
-
-**An oracle proves fidelity to the reference, never resemblance to the video.** Byte-equality with ComfyUI would be just as green if ComfyUI's own table were a hue wheel, so the fixture test cannot answer the review's actual question. The perceptual bar is a second, live pair of tests — `minimax h3 vae live: the Latent2RGB preview resembles the decoded frame` and its LTX twin — which encode a real image with the real VAE, project the resulting latent through the shipping map, box-average the real decode down to the latent grid and take a centered Pearson correlation. Three details are load-bearing:
-
-- **The control arm is the retired projection.** A bar that only says "correlation > 0.6" is worthless until something fails it, so both tests also score `preview.goldenAngleControlMap(C)` — the golden-angle table, through the same code path — and require the fit to beat it by 0.3. Measured 2026-08-30: H3 (FL2VA 8-bit, 256 px → a 24x16x16 latent) **fit 0.740, control 0.029**; LTX (2.5 8-bit VAE pair, 512 px → 128x16x16) **fit 0.898, control 0.196**. The absolute floors are sanity bounds; the control MARGIN is the discriminator, and it lands near 0.7 against a bar of 0.3.
-- **Correlation is CENTERED, which is why the control needs no dead code.** The retired projection's per-frame mean/std stretch is an affine map, and Pearson correlation is invariant to it, so scoring a golden-angle `Map` through today's `latentSliceToRgb` measures exactly what the retired code would have measured. Nothing is resurrected to be tested.
-- **The decode is AVERAGED down, never point-sampled.** A preview pixel is one latent position covering 16x16 (H3) or 32x32 (LTX) pixels; sampling one texel of that block scores the fit against whichever detail the sampler landed on.
-- **Content chosen for "the compression can carry it" made the bar meaningless, and only the control arm revealed it.** The first version fed smooth per-channel ramps, and on LTX the golden-angle control scored chroma **0.79** against the fit's 0.94 — a 0.15 margin. A monotone gradient is nearly rank-1, and summing 128 channels at uniform magnitude reproduces one about as well as a fit does, so that arm was passing on the CONTENT rather than on being right. `preview.perceptualTestFrame` now paints one pseudo-random colour per LATENT CELL — 3 independent predictions per cell — and the control falls to 0.26 (LTX) / 0.04 (H3). Note which number moved: the fit's own score barely changed, so nothing except the control could have caught it.
-- **Full RGB is mostly luminance, so chroma is a SEPARATE assertion** (`rgbChromaCorrelation`: each channel minus that pixel's own mean, needing no centering because a pixel's residuals sum to zero). Any sum of latent channels tracks brightness; WHICH COLOUR is what a fit knows and a hue wheel cannot. It is also where the fit scores highest — H3 chroma 0.880 vs 0.740 full-RGB, the gap being a brightness offset the preview never promised to match.
-
-Each test SKIPS on a missing pack and needs only the VAE, not the transformer: `MINIMAX_H3_MODEL=<pack>` (probes `video_vae.safetensors`) and `LTX_TEST_MODEL=<dir with vae_encoder + vae_decoder>` — 1.45 GB of the LTX pack is enough to run it. `tests/test_video_preview.sh` drives both and FAILS when a named pack produced no correlation line, because in a test summary a skipped arm looks exactly like a passing one.
-
-The second half of the review was cost. The app sent `preview: true` on every video generation, so every user paid an x0 solve plus a host copy per step whether or not anyone was watching — and on LTX the copy was the WHOLE `[1,128,F,H,W]` volume, ~25 MB of f32 per step for a 480p 121-frame clip when the strip shows one 0.8 MB frame. The temporal pick moved onto the GPU (`unpatchifyVideoFrames` gathers the wanted frames before the transpose, so the materialized array is n frames wide, not F — H3 already sliced per frame), and the pane owns a toggle that defaults OFF.
-
-## A pinned library's per-op transient is invisible to every residency bill (#321, 2026-09-03)
-
-Two users reported 26.8.11 dying at "Decoding video" on LTX-2.5: an M3 Max 64 GB with the 4-bit pack at 193 frames 1024x576, and a 128 GB Mac with the 8-bit pack at 97 frames 896x1600 beside a resident 27B. Both had a green preflight (33 GB peak against 56 GB available; 40.5 against 92), both kept answering `/health` for minutes, no `.ips`, and the unified log carried the only line that mattered: `kIOGPUCommandBufferCallbackErrorOutOfMemory`. Both worked on 26.8.10. Reverting was the workaround.
-
-The first question was whether the LLM gets evicted for a media gen. It does not, and it is irrelevant: eviction is a LOAD-time decision against `max_resident_models` / `max_resident_mem`, the LTX bill is weights only (`ltxPeakBytes` has no activation term), and the 64 GB report had no LLM loaded at all. Nothing bills a VAE decode per request, and the transient that killed the process is not ours to bill.
-
-The 26.8.10 → 26.8.11 diff to `ltx_video.zig` is three `sdpa` signature bumps. The real diff is the submodule: mlx v0.32.0 → v0.32.2, and in it `Decompose small kernel-depth 3D convs into 2D convs` (mlx #3785, `small_kd_conv_3D_gpu`). Its gate is `N == 1 && kD <= 7 && temporal stride 1 && temporal pad 0 && C % 16 == 0` — every conv in `vaeDecode`, because `decoderConv3d` replicate-pads the depth axis itself and calls `mlx_conv3d` with pad 0. Two things follow at full pixel resolution:
-
-- Each of the `kD` taps allocates a FULL `[F, H, W, O]` output and parks it in `copies` until the op completes, so three outputs plus the accumulator coexist where `implicit_gemm_conv_3D_gpu` used to write straight into `out`.
-- Each tap is a 3x3 stride-1 2D conv with `C, O % 32 == 0`, so it takes Winograd, and `winograd_batch_step` budgets its working set at 75% of `recommendedMaxWorkingSetSize` PER CALL — blind to the engine's weights, the DiT's activations and any resident LLM.
-
-Measured on an M4 Max 128 GB, 4-bit pack (18 GB resident), 97 frames 1024x576, 8 steps, same seed: whole-depth decode peaks at **66.8 GB**, the fix at **36.3 GB**, 235 s vs 239 s wall. A 30 GB transient on top of a 33 GB engine is the 64 GB crash; 193 frames doubles it.
-
-The fix is `conv3dDepthChunked`: the padded input is sliced into overlapping depth windows (`k − 1` frames of overlap), each window convolved with pad 0 and EVALUATED before the next, outputs concatenated on the depth axis. An output frame reads only its `k` input frames, so this is exact per window; the window is sized by `CONV3D_CHUNK_ELEMS` (64M output elements, ~5–13 frames at the decoder's widest stage). The hermetic test pins chunked == whole to the bit on a shape the decomposition gate accepts; live, the two arms differ by at most 1 u8 LSB on a vanishing fraction of pixels — Winograd's batch step and the implicit-gemm fallback are different kernels with different rounding, and the pre-0.32.2 3D kernel was a third one.
-
-Two things learned on the way:
-
-- **No env var for an obvious win.** The first cut shipped a `MLX_SERVE_CONV3D_CHUNK=0` kill switch out of habit. It bought one A/B (the 67 GB number above) and one bug: `maxInt(u32)` handed to a `c_int` is `-1`, and the "off" arm ran a window of −1 frames and killed the server with an MLX shape error. Chunking is exact and free, so nobody ever wants the other arm; the switch is gone. Levers are for paths with two arms worth comparing (lossy or tradeoff perf), not for fixes.
-- **The 128 GB box that "could not reproduce" was the right box to MEASURE on.** The failure is a peak, and `/props` `peak_bytes` after a gen reports it whether or not the box survived — a 30 GB delta is a reproduction.
-
-H3's VAE convs match the same gate too, and "chunked by reference semantics" turned out not to be enough (#424, 26.8.11 through 26.9.2): the encoder slices a reference video into 17-frame clips and 256-px tiles but built ONE lazy graph over all of them, evaluated once after the last tile. A 480x640 124-frame reference is 8 clips x 6 tiles = 48 encoder passes, and MLX's eval keeps ~10 command buffers in flight, each holding its convs' tap copies and Winograd working sets until completion, so the transient stacked past the wired limit. The tell is `kIOGPUCommandBufferCallbackErrorInvalidResource` (residency, not a malloc failure) right after `prompt -> N tokens`, with images and audio still fine. Fix: `encodeMoments` evaluates its output, one barrier per tile pass, nothing else changes; the tiled parity case is unchanged at cos 0.999998. `upConv3d` passes temporal pad 1 and never hits the decomposition; the LTX encoder is single-frame.
-
-## A config-driven bound guarded only by a debug assert is unguarded in every shipped binary (qwen4_exp, PR #363)
-
-`NgramHash.init` wrote `[MAX_HEADS]` and `[MAX_NGRAM_SIZE]` arrays from
-`heads_per_ngram` and `ngram_size` behind a `std.debug.assert`, which is
-compiled out of every ReleaseFast binary we ship: a config claiming 16 heads
-wrote 64 i64s into two 32-element arrays. The indexer's `compress_ratio` was
-never checked (a zero divisor is illegal behaviour, not a trap), the n-gram
-table header was read with bare `.?`/`.string`/`.array` unwraps on a 32 GB
-mmap the engine then slices with, and nothing proved the PLE was ever
-installed (placement is by exact equality against `ple_layer_idx`; an absent
-or out-of-trunk id built a trunk with no n-gram term that emitted plausible
-text). `model.validateQwen4Config` reads every bound strictly and refuses by
-NAME at load (`InvalidQwen4NgramSize/Heads/Vocab/Indexer/PleLayer/ConfigField`,
-reaching the client as `Model load failed: <name>`), `NgramTable.parse`
-checks every header field and proves every region sits inside the mapping,
-and a PLE the layer loop never installed is a load error.
-
-## Spark-X2.5 (`spark2_5`) port (2026-09-09)
-
-XHToken's 1.7B/4B dense models load from the community MLX packs
-(`abenzerps/Spark-X2.5-4B-MLX-{4,8}bit`, mlx-lm layout, same weight names as
-the HF checkpoint) on the standard dense forward. What the arch adds over
-gemma3/muse: exact-erf GELU (`HiddenAct.gelu`, not the tanh approximation the
-compiled GeGLU runs), a fused `q_k_v_proj` row-sliced into q/k/v at load
-(`splitFusedQkvRows`, materialized; dense packs are transposed inside the
-split so the generic transpose pass skips them), an `out_proj` spelling, and
-a PER-HEAD sigmoid output gate (`g_proj` is `[heads, hidden]`, broadcast over
-head_dim in `attnOutGate` — muse's gate is per channel and the same helper
-serves both). Per-type RoPE (sliding: full rotary at 1e4; full: 25% rotary at
-5e6) and the 3:1 sliding(512)/full ladder were already generic
-(`layer_types` + `rope_parameters.{full,sliding}_attention`).
-
-Tokenizer trap: the pre_tokenizer is DeepSeek's (`\p{N}{1,3}` first) but a
-later `Digits(individual_digits)` rule re-splits every group, so the
-checkpoint is per-digit. `digitGroupFromPreTokenizer` used to stop at the
-first `{1,3}` and would have served 3-digit groups. Cross-checked against
-HF `tokenizers` on code, numbers, CJK and contractions: byte-identical ids.
-
-Bar: greedy 8-bit answers (thinking split, GLM `<arg_key>` tool calls,
-tool-response turn, 2.8k-token needle past the 512 window) and the HF
-reference oracle on the bf16 checkpoint (`~/claude-tmp/sparkx/oracle.py`).
-
-## K2-Horizon (`k2_horizon`) port (2026-09-14)
-
-IFM's dense sizes are a Llama trunk (stock weight names, GQA, full-head RoPE
-at theta 1e7, untied head) with ONE arch difference: `K2HorizonRMSNorm`
-normalizes `layernorm_num_groups` (4) channel groups on their own rms before
-the full-width weight. `groupedRmsNorm` does reshape → weight-less rms_norm →
-reshape → multiply, gated inside `rmsNorm` on `norm_groups > 1` and the
-residual width (a per-head q/k norm is already one group per head). The
-first live load answered 17*23 correctly through the generic fallback prompt,
-so the forward was right before the template was.
-
-Three things were not the arch:
-
-- The 51 KB template hit two jinja.cpp gaps: `{% if spec is sameas true %}`
-  (a test with a BARE argument; the parser only knew `is x(arg)`) and
-  `sameas` itself (`not_implemented`). Both fixed in `lib/jinja_cpp`,
-  `libjinja.a` rebuilt. The failure was the usual silent generic fallback.
-- Every marker is a special token spelled `<ifm|…>`: three think openers
-  (`<ifm|think>`, `<ifm|think_fast>`, `<ifm|think_faster>`, picked by
-  `reasoning_effort` high/medium/low, the template raising on any other
-  word) and the GLM tool tags. Threading a fourth think spelling through the
-  ~200 literal sites was the wrong shape; the tokenizer decodes them to the
-  canonical bytes instead (`installMarkerAliases`, decode-only), so parsing,
-  streaming gates and the split all see `<think>` and `<arg_key>`. Only the
-  rendered prompt keeps the pack's spelling, which is why thinking-off's
-  closer is chosen from the rendered tail (`k2ThinkOpenerAt`). The template
-  also raises when an assistant history turn carries no thinking field, so
-  the K2 family always gets a `reasoning_content` (empty when the client sent
-  none).
-- `<|ifm|im_end|>` is declared ONLY in `generation_config.json`'s
-  `eos_token_id` list; config.json names `<|ifm|endoftext|>`. We never read
-  that list, and the model wrote `<|ifm|im_end|>` and kept going. Merged
-  additively at load for every model (`mergeEosTokens`).
-
-Bar: HF `tokenizers` byte-identical ids on numbers, code, CJK, contractions
-and the markers; greedy answers with thinking on/off, effort low, tool calls
-(plain and streamed with thinking), tool-result history, JSON schema and the
-Anthropic surface on the 6-bit pack.
-
-Two more came out of the first llmprobe run (all cells failing were ours):
-
-- Thinking default. The template opens a think marker on EVERY assistant
-  turn and the pack declares no `generation_config` default, so
-  `defaultEnableThinking` answered false and the prompt closed the block.
-  llmprobe's probe saw a non-thinker and budgeted 8..192 tokens, while its
-  `reasoning_effort: medium` opted thinking back on — every cell ended
-  `[length]` with empty content. `k2_horizon` now defaults ON like
-  `bailing_hybrid`; thinking-off is still the committed closer.
-- JSON schema + thinking. The protocol resolves its closer from the DECODED
-  prompt tail, which the alias turns into `<think>`; `</think>` has no atomic
-  id here and its byte matcher fired on a literal `</think>` the model wrote
-  INSIDE its reasoning (it was quoting the schema), so the grammar engaged
-  mid-thought and the model idled on whitespace. `Tokenizer.markerCloserFor`
-  pairs each opener id with its closer; `resolveReasoningProtocol` reads the
-  prompt's last opener token and sets the closer TEXT to the pack's own
-  spelling, so the marker lookup finds the atomic id and no byte spelling is a
-  boundary. Guards: `tests/test_json_schema_protocol_routing.py` on the pack.
-- A GLM call to a parameterless tool (`<tool_call>list_files</tool_call>`)
-  has no `<arg_key>`, the one signal the GLM route keyed on; it fell to the
-  Hermes path and vanished, so every agentic cell read "never used a tool".
-  A bare-identifier body routes to the GLM parser (corpus entry `[k2]`).
-
-- `top_p` near 0 and `top_k: 1` still sampled: both filters masked by VALUE
-  (`logit >= cutoff`), so every token tied with the cutoff survived, and bf16
-  logits tie at the top constantly (three tokens at -1.421875 on the
-  band-name prompt). `applyTopK` now keeps the k argpartition indices and
-  `applyTopP` decides the nucleus in argsort space and scatters the mask back
-  (`generate.zig`); non-tied rows mask identically. Every model, not K2.
-
-## Bonsai 2 served in bf16 (2026-09-18)
-
-- Defect: `prism-ml/Ternary-Bonsai-2-27B-mlx-2bit` ships f16 scales and biases
-  and f32 norm/GDN tables, and Prism's reference runtime runs it in f16 with an
-  f32 GatedDeltaNet state. We narrowed every f16 side tensor to bf16 at load
-  (3 mantissa bits off each group scale), ran bf16 activations and kept the GDN
-  state bf16: KL 1.7e-4 vs an f32 reference of the pack, top-1 98.3%.
-- Fix: `ModelConfig.actDtype` (f16) and `ssmStateDtype` (f32) for Hadamard
-  packs; the loader keeps f16 as stored (`LoadOpts.keep_f16`), f32 tables
-  narrow to f16; every kernel on the path takes f16 (qmv2, gdn_decode, GDN
-  prework/norm-gate, QK-norm+RoPE 256, msv_attn_p256), and the grafted bf16 MTP
-  head casts at its two boundaries. KL 2.9e-6 / top-1 99.1%, the reference's
-  own fp16 distance. Same speed: fp16 GEMMs run at bf16's rate.
-- Two bf16 constants surfaced only under f16: the batched decode mask (sdpa
-  requires the mask to promote to the output dtype, so 4 concurrent MTP
-  requests 500'd) and the M-RoPE full-rotation cast.
-- Guard: `tests/test_hadamard_fidelity.sh` (server greedy logprobs vs a
-  self-contained f32 reference, KL < 1e-5); red on the old engine.
-
-## Qwen3.8 Flash Next's GatedDeltaNet decayed in bf16 (2026-10-10)
-
-- Defect: qwen4_exp kept its GatedDeltaNet state in bf16 and rounded the
-  per-token decay g = exp(-exp(A_log)·softplus(a + dt_bias)) to bf16 in all
-  five gate producers. bf16's spacing below 1 is 2^-8, so a head meant to
-  forget slower than ~2e-3 per token got g = 1.0 exactly: at a = 0, 206 of
-  the shipped packs' 1728 heads never forgot and 469 forgot more than 10% off
-  rate, and the state re-rounded to bf16 every decoded token. The packs declare
-  `mamba_ssm_dtype: float32`; the HF reference and mlx-lm keep both in f32.
-- Fix: `ssmStateDtype` is f32 on qwen4_exp (set at parse, keyed on the arch:
-  HF ignores the key), and under bf16 activations every producer computes the
-  gate at the state's dtype (`gdn_decode.gateDtype`: K1/K1S/K1P and the packed
-  prework's `GT`; the compiled chain); f16 Hadamard packs keep their gate. At
-  f32, serial decode, verify, tree, batched rows and a stock prefill dispatch
-  agree bit for bit. Checkpoints bill twice the state, f32 roots get their own
-  SSD namespace, and `MLX_SERVE_GDN_STATE_F32=0` restores bf16.
-- Guard: `qwen4_exp GDN: a slow-decay head forgets at its own rate on every
-  arm` (g^n of the bf16 A_log) and `... equal serial decode bit for bit`; red
-  on the old engine.
-
-## Qwen-Image-2.1: an 18 GB VAE decode on a 5 GB engine
-
-Defect: the first 1024² generation on the 4-bit pack reported an 18 GB peak process footprint; the staged engine holds 5.5 GB and the 40-step denoise is flat at that. `mlx_get_peak_memory` read 4.9 GB throughout, so nothing MLX-side pointed at it.
-
-Cause: two things in the f32 decoder's last two stages. MLX's 3x3 conv holds an unfolded copy of its input (H·W·9·C_in floats: 11 GB at 288 channels x 1024²), outside its own memory counters. And a stage's ResBlocks keep half a dozen full-resolution intermediates alive at once (1.2 GB each).
-
-Fix: both exact. Large 3x3 convs run in row strips over a once-padded input (`Conv.forwardStrips`). Whole stages run in row bands with a `2·resnets + 2` row halo that is cropped (`Stage.banded`): the channel norm is per-pixel (it is `rms_norm`, which also replaced a five-tensor spelled-out chain), the shortcuts fold/unfold 2x2 cells, so only the 3x3 convs look sideways. Peak 18.1 → 9.5 GB, same pixels.
-
-Guard: `QwenImage VAE parity` re-runs the reference oracle with every stage forced into 8-row bands; `QwenImage strip conv equals the whole-image conv`. An uncapped MLX buffer pool in a test binary also reads as a leak: the e2e test sets the 1 GB cap the server sets in `main()`.
-
-## Nemotron-H: two spellings of the layer pattern, and an MoE arm that was `unreachable`
-
-Symptom: `mlx-community/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-4bit` failed to load with `MISSING WEIGHT: backbone.layers.0.mixer.q_proj.weight`.
-
-Cause 1: Nemotron 3.5 configs write the layer pattern as `layers_block_type: ["mamba", "moe", ...]` instead of `hybrid_override_pattern: "MEM*..."`. Only the string was parsed, so every layer kept the `.attention` default and layer 0 (a Mamba2 block) looked for attention weights.
-
-Cause 2: `initHybridLayers`' `.moe` arm was an `unreachable` TODO. In ReleaseFast that is UB and the compiler folded it into the `.mlp` arm, so the error named a plain-MLP weight. Every `E`-block Nemotron (3 Nano, 3.5) hit it; only dense Nemotron-H ever loaded.
-
-Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, f32 weights until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path at prefill and in-place `gatherQmv` reads at one token (`nemotronMoeDecodeExperts`), shared expert always added. `moe_latent_size` packs are refused by name. The Mamba2 decode step is one fused dispatch (`mamba2_decode.zig`); the op chain serves prefill.
-
-Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (T=5 sorted path and each token alone, kernel engaged), `mamba2Mixer: three single-token fused steps match one three-token chain prefill` (transformer.zig).
-
-## Nemotron-H: attention ran with RoPE the model never had
-
-Symptom: the Lightning 30B-A3B answered short chats fluently, but a code hidden in a 3k-28k token log came back as a wrong code or a run of comma-separated numbers. The MTP head, whose attention has the same bug, accepted about 1.1 tokens per round and only broke even.
-
-Cause: `hybridAttnWith` serves LFM2 and Nemotron-H, and applied RoPE for both. Nemotron-H attention is NoPE (HF `NemotronHAttention`, mlx-lm): the config carries `rope_theta` and `partial_rotary_factor`, but nothing reads them. The Mamba2 layers carry position, so short text survives rotated keys; long-range lookup through the six attention layers does not.
-
-Fix: the `nemotron_h` parse sets `layer_no_rope` for every layer, and the index past the last trunk layer covers the MTP head. `hybridAttnWith` and the head's three RoPE sites skip rotation on it. All three needle prompts answer exactly; the head's acceptance rose to about 1.5 tokens per round. `ModelConfig.cacheLayoutNamespace` gives Nemotron-H a fresh SSD prefix-cache root, because the fingerprint hashes only the model dir, the config's stat and the overrides: keys persisted by the RoPE build would otherwise restore into the NoPE model.
-
-Guards: `nemotron_h: attention is NoPE in every trunk layer and the MTP head` (parse), `hybrid attention: a NoPE layer ignores the order of earlier tokens` (trunk), the cached-key check in `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (head), `modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root`.
-
-## Nemotron-H: the MTP head's input, and why depth must stay shallow on a MoE trunk
-
-Symptom: with the sevren-ai `mtp_head.safetensors` bound, auto-depth MTP ran at depth 6 and decoded slower than serial. (Pre- vs post-norm input measured a wash once NoPE landed; pre-norm stays, per the pack's config.)
-
-Cause: two facts about this family. (1) The head's `hnorm` expects the residual stream BEFORE `norm_f` (DeepSeek-V3 MTP convention, stated in the pack's config); the standard path's capture hands the Qwen heads the post-norm hidden, so the hybrid path needed its own capture. (2) A verify window of 1+m rows routes each row to K experts, so unique experts read per MoE layer grow almost linearly with m; on a 3B-active MoE the verify forward's weight traffic doubles by depth 2, while the head's chained acceptance decays. Depth 2 is the peak (about 1.2x serial once the RoPE fix above landed); depth 1 and depth 3+ are slower.
-
-Fix: `forwardHybridWith` captures `h` before the final norm; `MtpModel.layout == .nemotron` (bare keys, dense `eh_proj`, no QK norms, `nemotronMoe` MLP); `ModelConfig.mtpDepth` returns 2 for `nemotron_h` when no depth is configured; verify windows up to 8 rows ride the in-place expert path (`nemotronMoeDecodeExperts` over (token, expert) pairs) instead of the sort machinery.
-
-Guards: `mtp: loadMtp detects the Nemotron-H layout`, `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (tiny trunk + head on disk, greedy MTP == serial), `nemotronMoe matches a host reference` (in-place window path AND the sorted path), live `tests/test_mtp_equivalence.sh` with `MTP_FORCE_ENABLE=1`.
-
-## Nemotron-H: the fused add+norm path dropped the shared expert
-
-Symptom: after the decode fusions landed, greedy text was coherent for ~30 tokens and then degenerated into word salad; every kernel unit test was green.
-
-Cause: `add_norm.moeCombineAddNorm` (residual add + next norm with the MoE K-sum folded in) was written while the shared expert rode the expert banks as extra rows. When that fold was measured slower and removed, the fused MoE arm in `forwardHybridWith` kept summing only the routed slots — the composed `nemotronMoeCombine` still added the shared expert, so the plain path was right and the fused path was wrong, and nothing compared the two at the forward level.
-
-Fix: the kernel takes the shared expert's output as an input (`XS`, `SHARED` template flag) and mirrors MLX's single-row `rms_norm` reduction exactly, so the fused step is bit-equal to the composed ops. Rule: a fused path that replaces a chain carries every term of the chain, and a forward-level test compares the two.
-
-Guards: `hybrid decode: the fused add+norm path equals the unfused blocks (Nemotron-H)` (tiny Mamba2 + MoE-with-shared trunk, fused vs `add_norm_max_rows = 0`, tolerance 0), `add_norm: plain and MoE-combine arms match the composed ops` (tolerance 0, with and without a shared expert).
-
-## Nemotron-H: a single routing group ran the composed router chain
-
-Symptom: the decode micro-benchmark counted ~1400 ops per forward; the per-MoE-layer routing cost ~30 µs against a ~5 µs router matvec.
-
-Cause: `groupLimitedRouting` only tried the `.sigmoid_bias_grouped` kernel, which declines `n_group <= 1`. Nemotron 3.5 configs set `n_group: 1`, so every MoE layer fell to the astype/sigmoid/add/argpartition/take/sum chain.
-
-Fix: a single group selects the ungrouped `.sigmoid_bias` kernel (the hy3 chain's semantics: sigmoid + bias keys, raw sigmoid weights, renorm, scale). Guard: `nemotronMoe matches a host reference of NemotronHMoE` runs through the fused router.
-
-## Nemotron-H: the Mamba2 SSM output widened the whole residual stream to f32
-
-Symptom: `[dtype-trace] hybrid: residual widened at layer 0: bfloat16 -> float32` on every Nemotron-H run; decode ran at roughly half speed.
-
-Cause: `mamba2Mixer` keeps the SSM state in f32 (correct — `mamba_ssm_cache_dtype: float32`), so `y` is f32. mlx-lm's `ssm_attn` returns `y.astype(x.dtype)`; ours did not, so the gate, the group RMS norm and `out_proj` ran in f32 and returned f32. Layer 0 is a Mamba2 block, so every later layer read its weights wider.
-
-Fix: cast `y` to the SSM input's dtype before the gated norm. Greedy text diverges after a few words (bf16 vs f32 near-tie); both fluent.
-
-Guard: `mamba2Mixer keeps a bf16 residual stream bf16` (one bf16 Mamba2 layer through `forward`, asserts a bf16 result). Hybrid test setup is shared in `testHybridXfm`.
-
-## Malformed model configs reached unchecked reads and casts
-
-Symptom: wrong-typed or out-of-range config fields could cause illegal behavior in ReleaseFast instead of a named load error.
-
-Cause: bare JSON union reads and unchecked integer narrowing or derived dimensions trusted checkpoint input.
-
-Fix: `parseConfigFromJson` checks consumed values and arithmetic. `jsonField` treats optional nulls as absent; explicit disables such as `sliding_window:null`, negative BOS sentinels and guarded skips keep their semantics. Discovery checks root types and metadata ranges. Tensor shapes need separate validation.
-
-Guard: `parseConfigFromJson rejects invalid field types and ranges`, `preserves optional nulls and skipped fields`, `accepts real checkpoint configs`; `config discovery tolerates invalid roots and oversized metadata`.
-
-## The plain Llama-3 pre-tokenizer was served with Muse's cased grammar
-
-Defect: GLM-5.3, Llama-3.2, LFM2.5 and K2 split camelCase (`UserDefaults` -> `User`+`Defaults`, `.indexOf` -> `.index`+`Of`) and `//!\n`, +0.3% tokens on code, every agent prompt off-distribution; LFM2.5 also split vocab words its merges never build (`_tokens`). Cause: the style detector keyed on the contraction group + `\p{N}{1,3}`, which the plain regex shares with Muse's cased one, and BPE `ignore_merges` was never read; `isDigit` was ASCII-only, so `4²` split. Fix: the cased grammar needs `\p{Lu}` in the regex (the plain one is `.gpt2` with 3-digit groups), `ignore_merges` emits a whole vocab word, `\p{N}` is a generated table. Guard: `tests/test_tokenizer_hf_parity.sh` (zero diff vs HF on code, per family).
-
-## Flint's cased pre-tokenizer was served as the gpt2 grammar (2026-10-21)
-
-Defect: tokens differed from HF on code (`Python's` split into `Python`+`'s`, `can't` into `can`+`'t`). Cause: the cased-grammar detector also required a `\p{N}{1,3}` branch in the same regex; Flint isolates digits (and CJK) in Split entries of their own, as DeepSeek does, so it fell to `.gpt2`, and the isolated runs only ever fed the gpt2 grammar. Flint's regex also differs from Muse's in its punctuation branch: `[\p{P}\p{S}]+[\r\n]*` keeps `/` out of the newline tail and leaves a format character (U+200B) unmatched, which HF keeps whole. Fix: the cased signature is `\p{Lu}` + attached contractions; `.cased` is Flint's punctuation branch; isolated runs feed either grammar. Guard: the Flint pre-tokenizer test in `tokenizer.zig` (HF's own pieces) and `tests/test_tokenizer_hf_parity.sh` (Flint now a default pack).
-
-## Hunyuan3D paint unwrapped the raw marching-cubes mesh (2026-10-03)
-
-Defect: no textured `octree_resolution: 320` job ever finished; xatlas ran 10+ minutes at 300% CPU.
-Cause: upstream's paint pipeline (`use_remesh=True`) quadric-decimates the shape mesh to 40,000
-faces before `mesh_uv_wrap`; our port handed xatlas the raw mesh (900k faces at res 320).
-Fix: vendored Fast-Quadric-Mesh-Simplification (`lib/fqms`, the code fast_simplification runs),
-`mesh_simplify.decimate` to `PAINT_MAX_FACES` ahead of the unwrap, normals re-derived from faces.
-The untextured shape output is unchanged, as upstream. A textured res-320 job now takes about a minute.
-Guard: `decimate:` tests (mesh_simplify.zig), `tests/test_3d_paint.sh` at res 320 (decimation line, GLB ≤ 40k faces).
-
-## A resident H3 text encoder crashed the second keyframe request (2026-10-03)
-
-Defect: with residency on, the second video request carrying a keyframe killed the server.
-Cause: the weights map is opened only when something must be read from it, and the guard
-said "resident text encoder with its vision tower loaded: nothing to read"; the load call
-below then unwrapped that unopened map (`&tw.?`) before `loadVision`'s own early return ran.
-Fix: the tower is loaded only when the encoder has none (`needs_vision and te.vision == null`),
-the one condition under which the map was opened.
-Guard: `tests/test_h3_resident.sh` [4], two keyframe requests on one resident server.
-
-## A runtime LoRA bypass cost H3 Turbo half its step (2026-10-05)
-
-Defect: with `"turbo": true` an 864x480/124f step took 18.7 s against 10.1 s without the adapter; the bypass alone was ~8.7 s although its isolated cost at the same shapes was 1.25 s.
-Cause: `lora.delta` multiplied the bf16 low-rank product by an f32 scalar ARRAY, which promotes it: a 1.3-1.8 GB f32 `[S, out]` tensor, a cast back and a separate add, five full passes per adapted linear, 200 big linears a step. Isolated it costs 1.25 s a step; the real graph paid ~8.7 s (why is unproven; allocator pressure from the f32 tensors is the suspect).
-Fix: `lora.addTo` = one skinny GEMM per adapter and `mlx_addmm`, whose epilogue adds onto the base output in its own dtype. H3 now steps at ~10 s with Turbo. flux/krea/LTX still call `deltaSum` and pay the same tax at their own row counts.
-Guard: `addTo equals y + deltaSum in y's dtype` (lora.zig; the dtype assert is the promotion guard).
-
-## A LoRA at scale 0 still changed the image (2026-10-14)
-
-Defect: a Qwen-Image LoRA attached at `lora_scales: [0]` rendered a different picture from no adapter, so a user could not switch an adapter off by scale.
-Cause: `lora.addTo` called `mlx_addmm(y, xa, bt, alpha=scale, beta=1)`; at `alpha == 0` MLX's addmm does not return `beta*c` at DiT-sized shapes in bf16.
-Fix: `addTo` skips an adapter whose scale is 0 and hands back a copy of `y` when nothing remains. This also repairs H3, which shares `addTo`.
-Guard: `addTo with a zero or tiny scale returns y, at DiT-sized shapes` (lora.zig); live `tests/test_qwen_image_lora.sh` check 2 (scale 0 byte-identical to no adapter).
-
-## Stable Audio 3: a fractional length came out as clipped noise (2026-10-05)
-
-Defect: a sound effect at any non-whole length (0.5, 0.9, 1.5 s) came out as near-constant full-scale noise; whole seconds sounded right.
-Cause: training conditions on `seconds_total = math.ceil(n_samples / sample_rate)`, so the model only saw whole seconds >= 1, and the reference UI's slider steps by 1. Stability's own MLX pipeline peaks at 11-25x full scale at 0.5/0.9/1.5 s. Our parity fixtures ran at 5 s, a whole number. Separately, `generate()` samples 6 s past the request (`duration_padding_sec`) and trims, which the MLX port we followed omits.
-Fix: condition on `trainedSeconds` (`ceil(seconds)`, at least 1), sample that plus 6 s (`latentCount`: even, capped at `sample_size`), trim to the request.
-Guard: `sa3 trainedSeconds` and `sa3 latentCount` (stable_audio.zig).
-
-## Llama 3.x answered empty past 1k tokens (2026-10-06)
-
-Defect: Llama-3.2-3B answered a 1k-token prompt and returned whitespace at 1.8k and 3.8k, greedy, every build back to 26.9.2.
-Cause: two. `ModelConfig.has_sliding_window` defaults to Gemma's layout (5 sliding layers to 1 global, window 1024), and the llama-family branch never cleared it; Llama 3.x configs have no `sliding_window` key, so 5 of every 6 layers saw only the last 1024 tokens. And `rope_scaling` `rope_type: "llama3"` was read as nothing (the branch resets the factor to 1), so the low frequencies ran 32x fast.
-Fix: the llama family (llama, mistral, qwen2, qwen3, k2_horizon) is full attention in every layer, as in mlx-lm; `Llama3Rope` feeds HF's frequencies to `mlx_fast_rope`. The keys change, so llama3 packs get their own SSD cache root. Next-token logprobs now match mlx-lm within 0.1 nats at 3.8k tokens.
-Guard: `parseConfigFromJson: Llama 3.x llama3 rope_scaling …` (model.zig), `computeLlama3Freqs` golden values (transformer.zig), and the smoke matrix's ~3k-token `long prompt` check, which every short check had missed.
-
-## A Sushi MiMo pack loaded a stale bf16 copy of o_proj and the head (2026-10-07)
-
-Defect: `MiMo-V2.6-Flash-Sushi-2.3bpw` died in warmup (`quantized_matmul` "weight should be uint32 but received bfloat16"), then, once the biases bound, on a 1024-wide embedding.
-Cause: the pack's source shard still carries bf16 `o_proj`, `embed_tokens` and `lm_head` beside the affine triples in their own shards, and the loader kept whichever file the directory listed last; separately, a config with no `quantization` block (`quant_bits == 0`) made embed/head/o_proj biases read as dense.
-Fix: an EXL3 pack loads each duplicated tensor from the shard its index names (`indexOwners`); embed and head are dense by dtype, not by `quant_bits`; `getLayerBias` probes when there is no block.
-Guard: `indexOwners: the index names the shard…` (model.zig) and `sushi pack: a tensor another shard owns is not billed` (sushi_pack.zig).
-
-## EmbeddingGemma 2: a padded row can NaN a whole batch (2026-10-08)
-
-Defect: the first `embedding_gemma2` forward returned NaN for every row of a mixed-length batch (a 3-token row beside a 12-token one, band radius 2).
-Cause: a sliding layer's mask is band + key padding, both `-inf`. A PADDED query whose whole band is padding softmaxes over `-inf`, and its NaN row reaches the real rows through V in every later layer (0 x NaN). Only the NAX kernels (M5) happen to stay finite; the plain kernels do not. `forwardGemma3EncoderWith` builds the same mask unfloored.
-Fix: `forwardEmbeddingGemma2With` floors the summed mask at -1e9. The projection head returns f32 too: normalizing a bf16 head output left EmbeddingGemma 1 norms up to 0.17% off 1.
-Ported from the reference, none visible in the config: the band radius is INCLUSIVE (`abs(q-kv) <= sliding_window`; the card's 1024 is the width), per-layer inputs are projection-only (`ple.*`, `layers.N.ple_block.*`, no `embed_tokens_per_layer`), the bias-free `embedding_projection` commutes with the mean so it runs after pooling in the dense0 slot, and the trained window is the card's 8192 (the config's 262144 is the rope table). The sentence-transformers 6 pooling sidecar spells `pooling_mode` as a string (the release ships it), which `parsePoolingSidecar` now reads: it used to fall through to the mean default, which would have served a CLS or last-token checkpoint mean-pooled.
-Guard: `EmbeddingGemma 2: forward and pooled embeddings match the transformers reference on a tiny checkpoint` (generate.zig; the band edge, the rope base and the floor each verified red) and `tests/test_embeddings.sh` [4d].
-Not wired: the audio tower (there is no conformer in the tree).
-
-## EmbeddingGemma 2 video frames embedded at 70 tokens, not 140 (2026-10-08)
-
-Defect: the first live video request embedded every frame at 70 soft tokens instead of the 140 the release's `processor_config.json` asks for (332 prompt tokens against the reference's 617).
-Cause: the budgets were parsed with a 16 KB `FixedBufferAllocator`; Google's file (an audio feature extractor and three processors) does not fit, the `OutOfMemory` was swallowed, and the defaults held. A toy-sized JSON in the unit test fit.
-Fix: `parseSoftTokenBudgetsFromJson` takes the allocator and the real file is its test input. `parseVisionProcessorDefaultsFromJson` still has the fixed buffer (Qwen/Muse files are small).
-Also easy to get wrong, none of it in the config: EmbeddingGemma 2 uses Gemma 4's own image processor, not the chat path's 768 square (`vision.budgetSize`: aspect-preserving, sides in multiples of 48, 70..1120 soft tokens); the resize is bicubic antialiased on the uint8 pixels (torchvision's kernel is Pillow's to within one level) and PIL's `convert("RGB")` DROPS alpha; a clip keeps `max_frames` client frames as `np.linspace(0, n-1, kept, dtype=int)` and wraps EVERY frame in its own `<boi>`…`<eoi>`; its grid is never padded to `default_output_length` (a bigger budget indexed past it) and runs fused attention (the eager score matrix alone is 2.4 GB per layer at the top budget).
-Guard: the processor's own tables for `budgetSize`/`sampledFrame`/`resizeToUnitChw` (vision.zig); `the image tower yields the reference's soft tokens` at two budgets and `image, video and mixed prompts embed like the reference` (generate.zig); `embeddingPrompt`/`mediaRunTokens` (server.zig); `tests/test_embeddings.sh` [4d]; real checkpoints via `tests/dump_embeddinggemma2_media.py`.
-
-## YuE2: a Scope held 25 GB of decoder temporaries, and three oracle bars were wrong (2026-10-08)
-
-Defect: the first YuE2 song peaked at 29 GB for 40 seconds of audio (weights 4.5 GB), growing with duration up to one decode tile; the first oracle run also showed a 0.4% VAE gain and a 0.6% logit RMS shortfall, and the sampler's nucleus kept the wrong tokens.
-Cause: `Scope` keeps every handle until it is deinitialized, and a stage-wide scope kept ~70 half-gigabyte Snake/conv temporaries of a 1056-frame tile alive through its eval. The gain is TF32: this NAX-enabled MLX rounds f32 convs, and `MLX_ENABLE_TF32=0` matches the reference to cos 1.000000. The logit shortfall is bf16 rounding moving the whole background one ulp (0.03125), which a softmax does not see. The nucleus bug was overwriting `c[0].v` in the softmax loop and then subtracting it for the other survivors.
-Fix: `snake` and `resUnit` own short-lived scopes and return one kept result (peak now weights + 5.4 GB); the oracles bound what matters: logits by argmax and KL, the decoder by cosine and a 1% scale band, the NAR by cosine and `rms_ratio`.
-Guard: `yue2 sampler: top-k and the nucleus bound the draw, a seed repeats it` (red before the fix), the five `YUE2_*` oracles (`tests/dump_yue2_fixtures.py`), and `tests/test_yue2_gen.sh`. The app side: `tiktoken` was missing from the download allowlist, so an app-downloaded pack had no tokenizer; `Yue2MusicTests.testBundleMarkersAreTheFilesTheServerNeeds` selects a simulated tree against the bundle's own ready markers.
-
-## Whitespace runs split where HF's regex keeps them whole: blank lines holding spaces, U+3000/NBSP, DeepSeek's isolated runs (2026-10-10)
-
-Defect: on the Qwen, Llama-3, GLM, LFM2, Muse and DeepSeek-V4 regexes a blank line holding spaces cost a token (`"\n    \n"` -> `"\n"` + `"    \n"`; HF: one); U+3000, NBSP and the other Unicode spaces were read as punctuation (`你好\u3000世界\u3000\u3000！` glued `\u3000\u3000！`; HF: three); and on DeepSeek-V4, Hunyuan (hy_v3) and Spark-X2.5 a whitespace run before a number or a CJK run was split (`"x  1"` -> `"x"`, `" "`, `" "`, `"1"`; HF keeps `"  "`), so every indented number in code was off. Indented code, Markdown, Chinese prose and Gutenberg headers reached the model off-distribution.
-Cause: pattern 5 `\s*[\r\n]+` stopped at the run's FIRST newline, where Oniguruma's greedy `\s*` gives back characters only down to the LAST one; `\s` was ASCII-only, where Oniguruma's is Unicode White_Space; and those three families put `\p{N}{1,3}` and a CJK class in Split entries of their own AHEAD of the main regex, which then runs on each piece alone, while `.gpt2` ran over the whole text. U+3000 read as punctuation hid that last gap on Chinese prose: fixing `\s` alone split every U+3000 paragraph indent there.
-Fix: patterns 5-7 walk codepoints (`whitespaceLen`); pattern 5 ends after the run's last `\r`/`\n`; `isWhitespaceCp` is the White_Space set; `isolatedRunsPreTokenize` cuts the text at digit and CJK run edges (`Tokenizer.isolated_runs`, exact match on those Split entries) before the gpt2 grammar.
-Guard: the `pre-tokenize:` tests (tokenizer.zig); `tokenizer parity` over `tests/fixtures/tokenizer_parity/{qwen3_8,deepseek_v4}.json` (`tests/dump_tokenizer_parity_fixtures.py`); the qwen3_8 texts per family in `tests/test_tokenizer_hf_parity.sh`.
-Not fixed: the NFC normalizer (U+2000 -> U+2002); DeepSeek's main regex reads zero-width characters as neither punctuation nor space; Spark-X2.5's has `[\r\n]` where the gpt2 regex has `\s*[\r\n]+`, and its vocab merges `\n` with 3, 7, 11 or 15 spaces, so a blank line holding exactly that many (LF or CRLF), at the start of the text or after a line ending in a letter, digit or CJK, and before an unindented line or the end of the text, matched Spark by accident and now differs (124 of 4992 blank-line shapes, none of 900 real-text chunks).
-
-## A placeholder id of 0 is UNSET, not token 0: an audio-only model heard silence (Qwen3-ASR, 2026-10-13)
-
-**Defect.** Qwen3-ASR's first live transcription answered `language None<asr_text>` (no speech) with the tower matching mlx-audio at cos 1.000000. **Cause.** Three splice sites treated `image_token_id` as always set: `applyVisionEmbeddingsWith` returned early when it was 0 (an audio-only model has none, so its rows were never spliced), `spliceVisionRows` matched `token_ids == 0`, and `countSpliceRows` counted it, so a text `!` (Qwen id 0) would have taken an audio row and shifted every later one. **Fix.** All three skip a 0 id, like the audio and video ids already did. **Guards.** `spliceVisionRows: an unset placeholder id (0) never claims token 0`, the `countSpliceRows` case, and `tests/test_transcriptions.sh` (word recall 0.0 on revert).
-
-## A companion pack under its base's `model_type`: Qwen3-ForcedAligner read as an ASR (2026-10-13)
-
-**Defect.** `mlx-community/Qwen3-ForcedAligner-0.6B-*` was listed as a `transcription` model, loaded with no audio tower and a 4096 context (its thinker's type fell to `unknown`), and became the headless default chat model, as the Qwen3-ASR itself did. **Cause.** The aligner's root says `qwen3_asr` like the ASR's; only `thinker_config.model_type` (`qwen3_forced_aligner`) tells them apart, which nothing read, and `chatCapable` let any qwen3 trunk behind an audio tower be the default. **Fix.** Discovery reports the arch hint `qwen3_forced_aligner` (capability `alignment`, a named 400 on every text route), the parser takes the thinker type as the ASR shape plus the timestamp fields, the app lists it under the same type (`DownloadManager.markerModelType`), and an audio-tower trunk is never chat-capable. Japanese and Korean go one character per unit: the reference's nagisa and dictionary splitters are Python, and measured against them word times agree within one 80 ms step (Japanese, 27/27 words) and exactly (Korean, units joined back into its spaced words, 13/13). **Guards.** `a Qwen3-ForcedAligner pack is discovered as the aligner`, `ModelConfig parses Qwen3-ForcedAligner`, the registry promotion test, `AsrAlignerDownloadTests`, `tests/test_transcriptions.sh` section 6.
-
-## A Sushi MiMo pack drafted nothing: its MTP heads kept the source layout (2026-10-13)
-
-Every boot of `beamster/MiMo-V2.6-Flash-Sushi-*` logged `[mimo-mtp] missing model.mtp.layers.0.self_attn.q_proj.weight — MTP off`: the pack stores its three heads like its trunk (fused e4m3 QKV with 128-tile scales, e4m3 MLP), and `sushi_pack` only converted the trunk while billing the heads as unserved. `dequantFp8Trunk` now runs the same QKV split and MLP decode over `model.mtp.layers.N`, in a sliding layer's geometry (`ModelConfig.firstSlidingLayer`, which `mimo_mtp` reads too). Guard: `sushi pack: the MiMo MTP heads get the trunk's split QKV and decoded MLP` + the smoke `mimo_v2_sushi.mtp` cell.
-
-
-## MiMo's own DFlash drafter loaded, drafted garbage and outranked MTP (2026-10-13)
-
-`--drafter <MiMo Sushi pack>/dflash` (Xiaomi's drafter) loaded clean and accepted 2-4% of its drafts, so the gate turned it off and the request ran serial: 32 tok/s against 67 with the pack's MTP heads, because DFlash outranks MTP. Its config declares `partial_rotary_factor` 0.5, `attention_value_scale` and attention-sink biases, and the block forward has no arm for any of them. `parseConfigFromJson` now refuses such a drafter by name (`UnsupportedDflashAttention`), like the unported Markov heads. Guard: `dflash: a drafter whose attention needs unported arms is refused by name`.
-
-## A speaker cache keeps one of many equal frames: past the first chunk, parity is the selection, not the output (Nemotron 3 Diarization, 2026-10-13)
-
-**Defect.** The diarizer agreed with mlx-audio to 0.04 inside its first 27.2 s chunk and drifted to 0.43 after it on the 8-bit pack. **Cause.** Every confidently spoken frame scores about the same in the Arrival-Order Speaker Cache's ranking, so a compression keeps one of many near-equal frames: a 0.036 difference in probabilities swapped 18 of 300 kept frames, and the chunks that attend to the cache moved with them (mlx-audio and the official model disagree the same way). Under it sat a real one: `Scope.geluErf` added an f32 scalar, so a bf16 caller's residual stream ran in f32 from the first feed-forward on. **Fix.** `geluErf` keeps its input's dtype (the ASR tower, f32, is unchanged); the compression runs on the host (`aoscKeep`) so it can be checked on its own. **Guard.** `nemotron diarization: features, speaker activity and the cache match the references` checks every compression against the official one on the same inputs and the activity against both references; on the test conversation the port puts 99.43% of speech frames on the right speaker, mlx-audio 99.48%, the official model 99.49%. A cached-selection model is judged by agreement and accuracy, never by frame-exact output past the first chunk.
-
-## The int8 copy sat BESIDE the packed weights, and the route ran where it could not (`w8a8`, 2026-10-16)
-
-**Defect.** `--w8a8` built an int8 copy of every DiT linear but left the packed weights resident (H3 held 77 GB, a 4-bit pack grew), and once it was the default its int8 ATTENTION ran on every machine: only the linears checked for NAX, so an M1-M4 would have launched a kernel written for the M5 matrix unit. **Cause.** Four paths still read the originals (row floor, LoRA on fused q/k/v and gate/up, the ANE seam, `outFeatures`); the loaders also held their weight maps, whose refs kept every packed buffer alive until the loader returned; the activation memo outlived its job. **Fix.** No row floor; fused q/k/v are row VIEWS (an interleaved gate/up runs the plain GEMM under a LoRA, `forwardPair`); `--ane-*` skip the conversion and the bill follows; a loader drops each converted block from its map (`Weights.dropBlock`); the memo drops at the end of every media job; `w8a8.nax()` gates the kernels (int8 attention included); the route is default-on only with NAX and 64 GiB RAM, since nothing falls back to packed once the copy exists. **Guard.** `int8 attention declines where the matrix unit is absent`, `w8a8 is on by default only with NAX and 64 GiB`, `w8a8 overlay converts the pack's own (bits, group)`, `w8a8 takeLinear`, `Weights.dropPrefix`, `residency bill:` tests, the Hunyuan3D arm's load-peak bound (red without `dropBlock`), and every engine arm (cosine AND rms vs the packed forward, resident bytes vs the bill).
-## A ModelOpt GLM answered with its own prompt: the `up` scale landed after the clamp (2026-10-17)
-
-**Defect.** `GLM-5.3-Flash-FP4-Local` loaded and served, then echoed the question back (12 of 39 `test_glm5_next.sh` checks failed). **Cause.** The loader folded each expert's `up` global scale into the routing weight, which is exact for Flash Next. GLM clamps `up` at +-10 BEFORE that point, and the scales are ~4.5e-5, so the unscaled `up` (~20,000x too large) saturated the clamp in every MoE layer. **Fix.** With a `swiglu_limit` the loader keeps `up_proj.expert_scale` apart (`MoeMlpWeights.up_expert_scale`, applied to `up` before the activation on the sorted path) and `expert_scale` is the down scale alone. **Rule.** A scale folds past an activation only if the activation is linear in that operand. **Guard.** `ModelOpt banks: a clamped SwiGLU keeps the up scale apart`; live `tests/test_glm5_next.sh` (39/39).
-
-## `F_NOCACHE` is ignored for an unaligned read: a 165 GB load filled 120 GB of page cache (2026-10-17)
-
-**Defect.** Loading GLM FP4-Local froze a 256 GB Mac for ~30 s at a time (kernel pressure warning, swap growing) and ended in SIGKILL or a watchdog kill. **Cause.** `F_NOCACHE` bypasses the cache only when file offset, length AND buffer are page-aligned. Expert tensors sit at arbitrary offsets, so every `pread` went through the cache (APFS, 4 GiB read: aligned +0.00 GiB cache, offset +512 +3.0 GiB, plain +4.0 GiB) beside 163 GiB of wired banks. **Fix.** `modelopt_pack.Reader` reads the covering aligned span (`alignedSpan`) through a page-aligned stage; banks are read 6 at a time and copied into MLX's own memory; `status.memoryPressureLevel` is read before each round and stops the load with `InsufficientMemory`; the resident bill adds the decoded scales (`bankExpansionBytes`). The pressure stop is the one place a load reads OS pressure: the next loader should join it, or the preflight absorb it. **Tell.** `File-backed pages` in `vm_stat` climbing as fast as the load. **Guard.** `ModelOpt reads`, `ModelOpt banks`, `residentModelDiskBytes: a ModelOpt pack is billed its decoded expert banks`.
-
-## An f32 norm weight widened a bf16 model's MoE input: GLM FP4 ran the slow chain everywhere (2026-10-17)
-
-**Defect.** `GLM-5.3-Flash-FP4-Local` decoded far slower than the 5.1bpw pack (6400 ops per forward). **Cause.** NVIDIA keeps `post_attention_layernorm` (and the final norm) in f32, and `rms_norm` promotes to the weight's dtype, so the MoE read f32: the fused hyper-connection read (`hcRowsServes` wants the norm dtype to equal the stream's) and the fp4 MoE kernels (16-bit only) both declined, and the clamped SwiGLU plus per-expert up scale had no fused path anyway. **Fix.** `narrowsLoadedF32Norm` casts the language trunk's f32 layer norms to bf16 at load, for ModelOpt packs only (the one reference measured; `MLX_SERVE_F16_NARROW_1D=0` restores them); `moe_fp4` takes the up scale and GLM's whole-number clamp (`Scales`); `moeFp4DecodeEligible` declines a non-16-bit stream instead of throwing. **Guard.** The predicate test (a vision tower's f32 norms stay: the RADIO f32-parity tests went red when it matched `vision_projector.*layernorm`), `loadWeightsOpt: an f32 trunk norm narrows ... for a ModelOpt pack` (any other pack keeps its dtype), `moe fp4 decode: a clamped SwiGLU ...` against fp32 truth, `ops/forward` and the `[moe] fp4 decode kernels engaged` line in `MLX_SERVE_DECODE_FWD_UBENCH`.
-
-## TRELLIS.2's dual grid is not a manifold, and the remesh it needs sits off the surface the colours live on (2026-10-19)
-
-**Defect.** The mesh decoded from the O-Voxel dual grid unwrapped in 80-110 s into ~14k charts and rendered with cracks. **Cause.** The dual grid is arbitrary-topology by design (a fifth of a car's edges are shared by three or more faces); xatlas fragments on that, and Microsoft's own example exports through CuMesh's narrow-band remesh. **Fix.** `trellis2_remesh.zig` takes the unsigned-distance offset iso-surface (no sign needed, slab-parallel marching cubes, edge-keyed weld, one global orientation vote), which unwraps in ~20 s. That skin sits a voxel or two off the decoded surface, so every texel is first snapped to the nearest point of the RAW dual-grid mesh (`snapToSurface`) and only then read from the attribute volume: unsnapped, the bake read black stripes along contours. **Guard.** Hermetic tests in `trellis2_remesh.zig` (sphere skins, a non-manifold book, slab weld, snap) and the end-to-end oracle in `trellis2_pipeline.zig`.
-
-## A flow-DiT forward over tens of thousands of tokens needs a scope per block (TRELLIS.2, 2026-10-19)
-
-**Defect (class).** Fixture-sized oracles never show it: a `Scope` around a whole forward (or a whole sparse decoder) frees nothing until it ends, so every block's attention and MLP intermediates stay alive together, and at 45k tokens that is the difference between one block's working set and thirty. **Fix.** `Dit.forward` and `Decoder.run` evaluate and free per block (a ping-pong handle carries the stream), so a full 1024 request peaks at 21 GiB of MLX memory. **Guard.** The measured peaks are pinned by `gen.trellis2PeakBytes` (512: 5.5 GiB, 1024: 21.1 GiB, 1536: 34.1 GiB for a car-sized subject, billed with ~2.5% margin); a subject with far more surface decodes more voxels than that bill assumes. Pixal3D's NAF encoders were the same class at another layer: one scope over every conv of a 1024 guide image held them all at once (49.9 GB peak); a scope per conv brought the whole request to 21.9 GiB with the same output.
-
-## A fixture script's `.float()` turns a complex buffer real, and the oracle then blames the engine (Pixal3D, 2026-10-19)
-
-**Defect.** The Pixal3D structure-flow oracle diverged (block 0 cos 0.9999, output 0.79) while the two cascade DiTs matched. **Cause.** That one checkpoint stores its RoPE table as a complex64 `rope_phases` buffer, and the dump script cast the state dict with `.float()`, which keeps the real (cosine) half and silently drops the imaginary one, so the reference ran on a broken table. **Fix.** The script keeps complex tensors as they are (`tests/dump_pixal3d_fixtures.py` `build`); the stored phases equal the computed ones to 6e-8, and the oracle reads cos 1.0000000 in f32. **Guard.** The SS DiT oracle in `pixal3d.zig`; rule in AGENTS.md "Parity method".
-
-## A download bundle that fetches fewer files than the loader names ships a pack the server refuses (Pixal3D, 2026-10-20)
-
-**Defect.** The app's Pixal3D bundle skipped the multi-view `*_mv.safetensors` (one photo needs none) but, like every bundle, fetched each `.json`, `pipeline_mv.json` included; `Engine.load` read that JSON, required the four `_mv` weights it names and failed after a "successful" download. The TRELLIS.2 bundle had the sibling gap: the published `pipeline.json` always names the optional 512 texture flow, so `hasResolution512()` was true for a pack without it and `resolution: 512` failed after the structure and shape stages. **Cause.** A loader reading "what exists" from a JSON instead of from the disk. **Fix.** The engine keeps an optional part only when its weights are on disk (`pixal3d.mvInstalled`, `trellis2_pipeline.onDiskOrEmpty`); a several-image request is then refused by name (`viewsRefusal`). **Guard.** `a pack with pipeline_mv.json but no _mv weights serves one view`, `the 512 texture flow counts only when its weights are on disk`; the Swift bundle test pins that `_mv` is not fetched.
-
-## xatlas segments one connected surface on ONE thread, so a 1M-face unwrap used 3 of 36 cores for 7 minutes (TRELLIS.2, 2026-10-20)
-
-**Defect.** The 1M-face Ferrari spent 446 s in `trellis-uv` with the other cores idle (a process sample showed 36 parked workers and one thread in `ClusteredCharts::mergeCharts`); at 2M faces it passed 21 minutes. **Cause.** xatlas parameterizes charts in parallel but segments a *chart group* (a connected set of same-material faces) on one thread, and a car is one group; the merge step also grows faster than linearly with the group. **Fix.** `uvwrap.parametrizeParallel` cuts the mesh into equal spatial regions (`regionLabels`: recursive median split of the triangle centroids, `REGION_FACES` 8192, at most 128, machine-independent) and hands the label as `faceMaterialData`, so every region is its own group on its own core: 424 s → 3.4 s on the same 999,836 faces, with 25.9k charts against 29.1k and the same UV coverage and texel-density spread. Hunyuan3D's paint stage keeps `parametrize` (the reference's all-defaults call). **Guard.** `a connected surface unwraps as one chart group per region` (red when the shim drops the labels).
-
-## A TRELLIS.2 / Pixal3D model's roughness map is flat, so shininess is ONE global finish, and gloss shows every bump (2026-10-20)
-
-**Defect.** The 1M-face Ferrari rendered as satin plastic next to its glossy reference photo. **Cause.** The decoder's roughness channel is nearly constant on a car (paint 0.57, trim 0.58, wheels 0.59; only metallic differs: wheels 0.59, paint 0.16) and the GLB writer shipped `roughnessFactor` 1 with no clearcoat. Lowering roughness alone is not enough: a glossy surface reflects its own geometry, so a lumpy seed looks worse glossy (the hood's pillow dent is the model's shape, not voxel noise; Taubin smoothing helped the flanks and blurred the crisp edges, so it is not wired). **Fix.** `roughness_scale` (multiplies the map, default 1) and `clearcoat` (`KHR_materials_clearcoat`, default 0) on the 3D request, Pixal3D inherits them, Hunyuan3D refuses them by name; per-part gloss is not offered because the map carries no part information. A car wants 0.4 / 1.0, and the seed decides how lumpy it comes out: try two or three (seed 123 was clean where 42 was not). **Guard.** `a textured mesh carries its finish as a roughness factor and a clearcoat extension`, `3D request finish`, the two `tests/test_*_3d.sh` finish checks, `gen.mjs 3d sends the finish only when asked`.
-
-## `gen.mjs glb --max-tris` GREW the file and crumpled a car's hood (2026-10-20)
-
-**Defect.** Simplifying the 1M-face Ferrari asked for 150k and returned 340,720 triangles in a LARGER file (79.8 -> 83.9 MB); at 2M faces asked down to 200k it stopped at 766k and the hood rendered crumpled. **Cause.** The simplifier appended its new index buffer and left the old indices and every unreferenced vertex in the BIN; and with the UV seams of a 25k-55k-chart TRELLIS mesh fixed, all collapses land inside charts, on the smooth panels. **Fix.** `rebuildGlb` repacks the BIN from scratch (only used vertices, 16-bit indices when they fit, images copied or shrunk) after every `--max-tris`, `--max-texture` or `--quantize`; the triangle budget for a hard-surface model comes from the server's seam-free `decimation_target` instead, and `--max-tris` is documented as a small-prop tool. **Guard.** `gen.mjs glb --max-tris leaves no old indices or unused vertices behind`, the quantize and texture tests, and a 200k-vertex repack (a `Math.min(...values)` over that many values overflows the call stack). `--quantize` and `--max-texture` were compared against the original render and are not visible.
-
-
-## A doc that spells the image token failed every DeepSeek-V4.1 request from an agent working in this repo (2026-10-20)
-
-**Defect.** Once pi's session moved to `~/code/mlx-serve`, every request carried AGENTS.md in its system prompt and failed mid-prefill with `Dsv41VisionRowsMissing` (a generic `GenerationFailed` to the client). **Cause.** The V4.1 row spelled the `deepseek_image` token, an added token the tokenizer splits out of any text, so the doc became an image position with no image rows; the server's placeholder check runs only when media is attached, and the module refused. The reference decides image positions by the attached images (`token_types`): a text-only prompt has no image mask at all. **Fix.** Without the request's rows the image token is text in `deepseek_v41.zig`: no splice, no VL routing bias, its own Engram id (`compressedId(t, images)`), snapshot key 0 (`visionKey`). A literal beside a real image is still the named 400 (`MEDIA_PLACEHOLDER_REJECT`). **Guard.** `dsv41 image token: without image rows it is text` (DSV41_TINY): the logits equal those with no image token, resume included; red on the Engram half alone.
+Defect: every Mistral prompt grew tokens: `[INST]Use` became `▁Use`. Cause: `first` was treated as `always`. Fix:
+`MetaspacePrepend` (three-valued), `encode` passes `at_start` per segment. Diff `/tokenize` against HF on a prompt
+with specials. Guard: the `"first"` case of `encodeSentencePiece: Metaspace`.
+
+### A combined Split regex hides the digit rule (Muse "8 4")
+Defect: Muse-Glimmer echoed "8 4" for "84". Cause: its Llama-3-style combined Split regex holds the `\p{N}{1,3}`
+branch inside one alternation, so the exact-match digit rule never fired. Fix: a grammar, not a wider match:
+`pretok_style = .llama3` runs `llama3PreTokenize` (cased word runs, attached contractions, {1,3} digits). HF encode
+output is not pre-token boundaries: pin the pre-tokenizer against the regex `findall`, ids against HF `tokenizers`.
+Guard: `tests/test_tokenizer_hf_parity.sh`.
+
+### Pre-tokenizer grammars served to the wrong family (Llama 3, Flint)
+Defect: GLM-5.3, Llama-3.2, LFM2.5 and K2 split camelCase and `//!\n` (+0.3% tokens on code, every agent prompt
+off-distribution); Flint split `Python's` and `can't`. Cause: the cased-grammar detector keyed on the contraction
+group + `\p{N}{1,3}`, shared by the plain Llama-3 regex, and required that digit branch, which Flint isolates in its
+own Split entry; BPE `ignore_merges` was never read; `isDigit` was ASCII-only. Fix: the cased signature is `\p{Lu}` +
+attached contractions; `.gpt2` + 3-digit groups for plain Llama-3, `.llama3` for Muse, `.cased` for Flint's
+punctuation branch; isolated runs feed either grammar; `ignore_merges` emits a vocab word whole; `\p{N}` is a
+generated table. Guard: `tests/test_tokenizer_hf_parity.sh` (zero diff vs HF per family), the Flint pre-tokenizer
+test.
+
+### Whitespace runs split where HF's regex keeps them whole
+Defect: a blank line holding spaces cost a token on most families; U+3000/NBSP read as punctuation; on DeepSeek-V4,
+Hy3 and Spark a whitespace run before a number or CJK was split, so every indented number in code was
+off-distribution. Cause: `\s*[\r\n]+` stopped at the first newline where Oniguruma backtracks to the last; `\s` was
+ASCII-only; those families isolate digits and CJK in their own Split entries ahead of the main regex. Fix:
+`whitespaceLen`, the White_Space set, `isolatedRunsPreTokenize` (`Tokenizer.isolated_runs`). Guard: `pre-tokenize:`
+tests, `tokenizer parity` over `tests/fixtures/tokenizer_parity/`, `tests/test_tokenizer_hf_parity.sh`.
+
+### The DSV4 echo-precision saga was a tokenizer bug
+Defect: DeepSeek-V4 mirrors slipped characters in verbatim digits (`1o` for `10`), surviving an imatrix recalibration;
+the same GGUF through ds4 scored 0/70. Cause: DSV4's pre-tokenizer splits digits in greedy groups of three
+(`\p{N}{1,3}`); ours split per digit (correct for Qwen), so every number was off-distribution. Fix:
+`Tokenizer.digit_group` parsed from the Split rule: 38-40 slips → 0/70. When a quality defect is invariant across
+engine configs and quant recipes, diff the prompt encoding against an independent tokenizer first. Guard: the
+digit-group tests.
+
+### A sampler never draws a reserved special
+Defect: a collapsing checkpoint emitted `<|fim_hole|>`-class markers at temp 0. Fix: a per-model mask of `special:
+true` tokens minus EOS ids minus specials the chat template uses (derived, never hardcoded; no template = off), sized
+to the logits (`unpadded_vocab_size`), riding `SamplingParams.suppress_mask` into both samplers and the stochastic
+verify; logprobs stay raw, so rank 1 may differ from the emitted token by design. `[suppress]` logs engagement.
+
+### The degenerate-tail loop guard needs a long-period tier
+Defect: a two-sentence 58-token cycle repeated 26 times passed the period-≤8 scan. Fix: `isDegenerateTailLoopRange`
+also convicts periods 9..64 at 10 exact reps (long lines in real code repeat a handful of times, not ten), on span.
+Guard: the degenerate-tail tests.
+
+## Quantized packs and calibration
+
+### An imatrix is only valid for the weights it was collected on
+Defect: the DSV4 0731 mirror was calibrated with an imatrix collected on the preview checkpoint. Cause: the retrain
+decorrelated ~85% of experts' statistics (median Pearson 0.66 vs preview; two independent 0731 collections agree at
+0.85). Fix: collect on the weights being quantized (`ds4 --imatrix-dataset …`); the recollection won 7 of 9 shard
+pilots, mostly on `down`. Trap: re-converting a shard is not byte-stable across sessions; copy proven shards.
+
+### Uniform ≤2-bit experts to the last layer cause turn-level agent loops
+Defect: a uniform 2-bit DSV4 build looped at the decision level ("verify once more"), 3 of 4 agent runs at 16-28K
+tokens, while every single response was fluent and no token window repeated. Fix: a 4-bit tail on the last four layers
+(tail4: 0 of 3 loops). Quality gates for low-bit packs need an agent-loop cell (max consecutive identical tool calls).
+
+## Media backends and parity
+
+### A faithful port that made the model worse (H3 `<Picture i>` splice)
+Defect: splicing fl2va keyframes into the text conditioning as the reference does inverted frame 0 (+215 → -98
+contrast). Cause: the tower's rows carry 41x a token embedding's norm in the residual stream, competing with the
+keyframe already pinned by its VAE cond rows. Cosine could not see it; an `rms_ratio` did. Fix: vision blocks off for
+fl2va keyframes, on for ref2va references (the prompt addresses them and no cond row competes). A reference is a spec
+for what to build, not a promise that turning it on helps your checkpoint.
+
+### H3 ref2va: two partitions, one file layout, a cond stream ordered by the layout
+Defect: an fl2va pack handed `ref_images` would silently ignore them; references assembled in request order landed on
+the wrong blocks' positions. Fix: our converter writes `tasks` (`["t2va","ref2va"]`) into config.json, the only
+discriminator, read at load (absent = not ref2va); one resolver (`resolveRefs`) decides order and `<Picture
+i>`/`<Audio j>` ordinals and the DiT block derives from it (`refBlockFor`); the card's 12-file total cap is a named
+400. Read repo listings case-insensitively and hash files before inferring identity; clone proven shards instead of
+reconverting.
+
+### H3 length planning: a stale cap and a borrowed memory model
+Defect: the app capped H3 at 209 frames (an unmeasured cap that went stale) and priced H3 with LTX's VAE formula (677
+frames on 128 GB, 32 on 48 GB, both useless). Fix: H3's frame term is the fast recipe's per-block attention cache,
+linear in rows (`latent_t·(w/32)·(h/32) + stereo audio + text`), reproducing both measured points; "Max quality" never
+allocates it, so it is also the low-memory mode; the load floor is the measured staged peak; `H3Plan.fits` answers
+"does anything fit". Time is `c + a·S + b·S²` from two anchors, scaled per machine by run history.
+
+### H3's two fast levers compounded into garbled speech
+Defect: a 10 s REF2VA clip said "deepseek ddeepiki emeng minimax" with the step cache and attention broadcast both on.
+Cause: the broadcast schedule went by step index, so after cached steps attention was fresh only every sixth step.
+Fix: a forward right after a cached step recomputes attention (`attnBroadcastRefresh(…, after_skip)`). Guard: `a
+forward after a step-cache skip recomputes attention`; the bar was word errors over six seeds.
+
+### The weights map pins everything a staged loader frees (H3 AdaLN precompute)
+Defect: the DiT stayed at 33 GB resident where ~20 was designed. Cause: the safetensors `Weights` map outlived
+`Model.load` and held +1 refs on every raw array. Fix: scope the map inside the load. A memory claim without a
+resident log line is a hope.
+
+### A tiled decoder's tiles are not slices of an untiled pass (H3 visual VAE)
+Defect: risk of off-distribution output that looks like a quality problem. Cause: token coordinates normalize over the
+extent, so tiling changes semantics; temporal chunking is how the VAE was trained. Fix: refuse above the tile extent
+(`error.TilingUnsupported`) rather than decode untiled.
+
+### A LoRA's alpha lives wherever its exporter put it
+Defect: PEFT exports ran 8x too strong (pure static) while 56 stacking checks stayed green. Cause: only the kohya
+per-module `.alpha` tensor was read. Fix: `lora.fileAlphaScale` reads nested PEFT JSON > flat pairs > `ss_*` > none,
+the per-module tensor wins, a non-finite or non-positive alpha is declined, the scale is logged per file. A guard that
+asks "did the bytes change?" needs one that looks: `tests/lora_noise.py` + `tests/test_real_loras.sh`.
+
+### A distilled few-step diffusion model can require bf16 (MageFlow Turbo)
+Defect: every component passed f32 parity at cosine 1.0, yet the 4-step generation was a grey wash, noisier with more
+steps. Cause: the distilled model memorized bf16 timesteps; the reference casts the timestep to the model dtype. Fix:
+`roundBf16` on the timestep and its frequency table on the bf16 path; RoPE rotates in f32 and casts; scalars through
+`scalarLike`. Component parity in one precision does not prove the multi-step loop: compare per-step latents in the
+reference's native dtype and decode suspects. Fixtures: `tests/dump_mageflow_{te,e2e}_fixture.py`.
+
+### MageFlow 8-bit: lookup tables are invisible to a shape rule
+Defect: a shape-driven converter would pack `embed_tokens` and `pos_embed`, which the engine reads by gather. Fix: an
+explicit `NEVER_QUANTIZE` list (media); LM `embed_tokens` quantize only where a quantized-gather path reads them.
+Fixture cosines on an 8x8 latent are sensitivity probes, not quality: judge images.
+
+### A reference-image editor keeps its input's geometry (MageFlow Edit)
+Defect: every phone-photo edit was squashed to the requested square first; then `fitAspect`'s aspect was undone by
+per-dimension clamping above 2048 (every modern photo). Fix: `resolveEditTargetSize` = `fitAspect` (aspect at the
+budget) → `fitWithinCap` (one factor for both dims); a drift test pins `maxDim` to the clamps; `encodeEdit` asserts
+placeholder count == vision rows; the edit prompt is capped like txt2img (a dense host-side causal mask). Test the
+composition with fixtures that straddle every threshold. Guard: `resolveEditTargetSize keeps the reference's aspect
+ABOVE the backend cap`.
+
+### The `--no-vision` prefix filter ate MageFlow Edit's tower
+Defect: every Edit load failed `MissingMageFlowWeight model.visual.patch_embed.proj.weight`. Cause: the global
+`--no-vision` drop list gained `model.visual.` and the tower read through `loadWeights`. Fix:
+`VisionTower.openWeights` reads through `loadWeightsWithVision`. Guard: `VisionTower.openWeights keeps the
+model.visual tower keys`.
+
+### A family's geometry belongs to the checkpoint once a second size exists (FLUX.2 klein 9B)
+Defect: the 9B loaded 5 of 8 double and 20 of 24 single blocks from the 4B's struct defaults with no error. Fix:
+derive geometry from weight shapes (`ditConfigFrom`, `teConfigFrom`): head counts from `q_proj`/`k_proj` rows,
+`mlp_ratio` from the fused `linear_in` / 2; a zero probe leaves the field alone. Verified a no-op on the 4B.
+
+### Per-token AdaLN (LTX I2V) must leave the t2v path byte-identical
+Defect: risk: an optional per-token modulation path regressing the scalar one. Fix: gate it so `nv_pt == 0` runs the
+unchanged scalar helpers; the tripwire is uniform-mask equivalence (an all-ones mask must reproduce scalar, cos 1.0).
+Encoder parity is fed the fixture's pixels so preprocessing never confounds it. Guard: `per-token AdaLN uniform-mask
+equals scalar`.
+
+### Voice cloning: an ECAPA `TimeDelayNetBlock` is conv + ReLU (Qwen3-TTS)
+Defect: clone fidelity fell short (embedding cos 0.9989). Cause: the pooling block was ported as a bare conv. Fix: the
+implicit ReLU: bit-exact. Guard: "speaker encoder (ECAPA-TDNN) matches the Python oracle".
+
+### An embedding lookup reshapes to the table's width (Qwen3-TTS 0.6B)
+Defect: the 0.6B-Base crashed the server (`[reshape] Cannot reshape array of size 24576 into shape (1,12,1024)`).
+Cause: the reshape used the talker hidden size; the 0.6B text table is 2048 wide with a projection after it. Fix: the
+width comes from the weight. Guard: `embed uses the table's native width`.
+
+### An oracle that cannot execute the reference must say so (H3 DiT)
+The reference block calls CUDA kernels that do not run on a Mac, so `tests/dump_minimax_h3_fixtures.py` is a
+transcription and says so; where the reference can run (layout math) it is executed directly, with import stubs that
+raise on attribute access so no golden value comes from a mock.
+
+### A permutation-invariant checksum cannot see a permutation (H3 layout)
+A per-axis position sum passed with the two stereo channels' `w` coordinates swapped. Pair any column checksum with a
+row-index-weighted one (`pos_weighted`).
+
+### LTX-2.5 looked soft: canvas, quantization, decoder
+Defect: LTX-2.5 clips looked below the published examples. Cause: three measured causes: the app's ladder topped out
+at 768x512 and two-stage tiers denoise at half size; plain affine 4-bit injected ~10% weight noise per linear (8-bit:
+0.6%, +3.5% time); we used the plain conv decoder where upstream decodes with DiffVAE. The 8-bit pack then crashed:
+`video.zig` hardcoded `bits = 4`. Fix: a wider canvas ladder, an 8-bit mirror, geometry-solved quant params
+(`quantGeom`), the DiffVAE decoder. When arms fork content, per-frame metrics are variance: stills decide. Trap: `hf
+download REPO --include a b c` eats `a`; pass filenames positionally.
+
+### The ANE seam is fp16 end to end, and H3's DiT rendered black
+Defect: the ANE MLP offload on H3 gave 1.24x and an all-zero video; per-block parity read cos 0.99999. Cause: the
+program computes in fp16 and H3's fc2 partial peaks at ~1.7M (fp16 max 65504): INF, then NaN. Fix: divide the `up`
+half of the ANE weight copy by `OUT_PLANE_SCALE` (256) and multiply the read-back: exact, since `up` is linear into
+the product and a power of two is exact in fp16 (scaling `gate`, under a nonlinearity, or fc2 alone is wrong). Krea
+had been silently losing precision. A correct-looking image is not evidence of range headroom.
+
+### A metric taken after a global normalization measures the normalizer (ACE-Step)
+Defect: ANE vs GPU audio showed a ±1 dB RMS "loudness lift" that changed sign across seeds. Cause: `peakNormalize`
+sets the whole track's gain from one sample. Fix: measure trimmed per-frame RMS and log-STFT cosine, never a
+whole-track scalar after a normalizer.
+
+### ANE media offload: the tile tail, the share, the calibration dtype
+Defect: the fixed-tile media seam trailed the whole-request tile by 3-4%; the share re-derived per request recompiled
+program sets (shares straddled a rounding line); the calibration aimed low. Cause: a GPU tail built after the blocking
+ANE wait is serial launch latency; a parameter that keys a compiled artifact was re-solved per request; the complement
+was timed in bf16 where ACE's stream is f32. Fix: async-eval every GPU piece before the tile loop and pad a large tail
+onto the ANE (`mediaTilePlan`); probe at fixed `MEDIA_PROBE_ROWS` and reuse the compiled set's share (`cachedShare`);
+each calibrator names its MLP's dtype (`AneCalib.dtype`). Guard: `mediaTilePlan`, `shareVariant`, `calibratedShare`
+tests.
+
+### The DiffVAE decoder: a faithful port that decoded to static (LTX-2.5)
+Defect: per-stage parity read cos 0.99997+ and `rms_ratio` 0.999 everywhere, and the first real generation decoded to
+pure static. Cause: the decoder's output type, steps and timestep scale are constructor arguments no pack ships; the
+class defaults (v-prediction, 2 steps, x1) return the noise, and the transcription inherited them. A faithful-port
+oracle cannot prove the reference's unstated arguments; the file's name said "1-step x0". Fix: `Sampler` pins x0, 1
+step, timesteps x1000; NATTEN shifts its window inward at a boundary (never clamp-and-mask), pinned on boundary-only
+volumes; the tile budget is a per-request decision from free RAM (`tileTokensForMemory`), with blending ramps that sum
+to 1 and a seam-crop assertion. Guard: the `Sampler` test, `tests/test_video_gen.sh` (gradient relative to the conv
+arm).
+
+### MiniMax Music 3 is not an ACE-Step variant
+Defect: the obvious ACE-Step reading runs and produces plausible noise. Cause: the DiT's timestep is a prepended token
+(no AdaLN), the FF is reversed SwiGLU (`first * silu(second)`), the vocoder Snake is alpha-only, the DiT RoPE rotates
+32 of 64 dims at a hardcoded 10000; the AR loop feeds frame 0 back though it is never emitted, top-k thresholds from
+the conditional branch, the feedback embedding scales by 8^-0.5; square convs defeat the bias-length weight-norm
+heuristic (key the transpose by name); `_clean_caption`'s regex crosses lines. Fix: each pinned by a transcription
+oracle (`tests/dump_music3_fixtures.py`) or a table test; a finite additive vocab mask keeps CFG finite. Attribute
+stages with laps (`MLX_SERVE_DIAG=music3-cost-probe`) before pricing a lever off bandwidth arithmetic: a depth KV cache halved a
+stage the model said was at its read floor.
+
+### A bare f32 scalar promotes a bf16 stream
+Defect: `bf16 * f32_scalar` promoted products to f32 and every downstream quantized matmul ran off-dtype. Fix: scalars
+through `scalarLike` (MageFlow, Music3) / `scalarOf(v, dtype)`; a chain that returns f32 by design makes the caller
+cast back. Tell: `[dtype-trace] residual widened`.
+
+### LFM2-VL: a forward arm with no vision splice answered "a completely black rectangle"
+Defect: tower parity was perfect and every log number right, and the model described a black rectangle. Cause: the
+hybrid forward arm had no splice; 247 placeholder embeddings went through the trunk. A missing splice presents as a
+bad image. Fix: every generative forward arm splices vision. Guard: lint pin (formerly a source scan) over the
+forwards; encoder-only arms exempt by name.
+
+### A position resample is `bilinear` + antialias; mlx-vlm's bicubic is a scale error (LFM2-VL)
+Defect: mlx-vlm's resampled position table came out 13% hot (`rms_ratio` 1.13). Fix: torch + transformers as the
+oracle; the Pillow-convention filter's `.bilinear` arm widens its footprint on downscale as antialias does. Patch
+features are `[py, px, c]` with channel innermost; the checkpoint carries two GELUs (tanh in the encoder MLP, erf in
+the projector).
+
+### For a NaFlex model, tiling is the resolution (LFM2-VL)
+Defect: untiled, 15px print was read confidently and wrong. Fix: past `max_image_tokens x 2.0` the image is resized
+once onto a canvas of 512px tiles, each a window into it, plus a thumbnail, labelled `<|img_row_R_col_C|>` /
+`<|img_thumbnail|>` in encoder order. Guard: `tests/test_lfm2_vision.sh` compares the tiled and untiled arms.
+
+### A routing chain that returns f32 by design widened the residual stream (Ling)
+Defect: Ling's forward ran in f32 from its first MoE layer: a uniform slowdown with no slow op. Cause:
+`groupLimitedRouting` returns f32 weights on purpose and the new caller skipped the cast. Fix: a dtype-conditional
+cast where the scores enter the expert combine. Read the dtype trace on every new arch's first forward.
+
+## Vision
+
+### Chunked vision prefill: the splice row index is per prefill, not per forward (#197)
+Defect: an agent's screenshot requests were refused past ~10k tokens (63 GB billed on a 48 GB Mac). Cause: vision
+prompts prefilled whole because the splice counted placeholder rows per forward, so a chunk restarted at row 0 and
+re-spliced the first image rows (coherent answers about the wrong pixels). Fix: `ForwardCtx.vision_splice_offset`,
+counted host-side per chunk (`countSpliceRows`), set on every prefill forward including the final span; the guard
+bills the chunk. Repro traps: the 512-token tail merge un-chunks short repros (check `chunks=1`), and byte equality
+across chunk widths is unsound at 4 bits (assert the perceived color set). Guard:
+`tests/test_vision_chunked_prefill.sh`.
+
+### A renamed vision tower and a Conv3d read in the wrong axis order (Qwen3.8 Alis)
+Defect: the Alis packs disabled vision (`vision_tower.*` renamed `model.visual.*`), and once loaded answered a red
+square "black". Cause: the prefix was hardcoded; `patch_embed.proj` is stored channels-last by mlx_lm and
+channels-first by a straight torch export, and the loader always permuted. Fix: `resolveVisionPrefix` +
+`patchProjLayout` (derive from the shape, refuse by name); `model.visual.` joins the `--no-vision` drop list.
+MTPLX-Optimized-Quality shipped the same scrambled conv under the supported prefix. Probe with three colours: one
+cannot tell seeing from guessing. Guard: the layout and prefix tests.
+
+### An engagement line proves the path ran, not that the rows reached the prompt (Qwen3-VL video)
+Defect: a 4-frame clip logged every engagement line green and the model described a stranger in a white shirt. Cause:
+the splice mask covered image and audio ids, never `video_token_id`; the video e2e accepted words a model hallucinates
+freely. Fix: the mask and `countSpliceRows` take `video_token_id`; the e2e demands frame 3's sign text. Guard:
+`spliceVisionRows: video placeholders are scattered like image rows`.
+
+### A placeholder id of 0 is unset, not token 0 (Qwen3-ASR)
+Defect: Qwen3-ASR's first transcription answered "no speech" with the tower matching mlx-audio at cos 1.0. Cause:
+three splice sites treated `image_token_id` as always set: an audio-only model has 0, so its rows were never spliced,
+and a text `!` (id 0) would have taken an audio row. Fix: all three skip a 0 id. Guard: `spliceVisionRows: an unset
+placeholder id (0) never claims token 0`, `tests/test_transcriptions.sh`.
+
+## Qwen packs
+
+### Standardizing our own Qwen3.8 packs: embeddings, head norms, DWQ
+Defect: our 4/8-bit packs kept `embed_tokens` dense (1.8 / 1.2 GB) where every other pack, including our own 6-bit and
+iQ, quantized it. Fix: `tests/restandardize_qwen38_pack.py`: quantize the embedding from the raw stored bf16 bytes (an
+f32 round trip breaks byte identity with mlx_lm), publish head norms folded (`--fold-mtp-norms`; a loader that misses
+the delta convention drafts at ~0% while looking healthy), and graft DWQ scales at 4-bit only, verified per tensor (at
+other widths the shapes still match and a wrong graft loads garbage).
+
+### Qwen3.8-Flash-Next (`qwen4_exp`) port
+Defect: traps that cost time on the port: HF `hidden_states[i]` is layer i's INPUT; the QSA tail is per query (a
+global tail left rows with nothing visible); indexer scores need f32 and `torch.topk`'s lower-index tie break; the
+n-gram eos is the text config's; a new per-request field must be nulled with the conv/ssm handles; tiny oracle
+geometry must clear the kernels' floors (GDN refuses dk 16); image rows splice before the hyper-connection tile; the
+indexer reads the same M-RoPE table as attention, with one YaRN mscale. Tiny random MoE oracles tie everywhere: the
+dump records the reference's own margins and `Qwen4Ties` acquits by those, never ours. A k < E fixture covers top-k
+selection only through the MTP head's one MoE layer (`--topk 2`, read k back from the checkpoint). Restore parity on
+this arch is the chunking class (~0.3 nats top-5), not the hybrid 0.047. Detail: `src/plugins/qwen4_exp/AGENTS.md`.
+
+## More model ports
+
+### Spark-X2.5: a later `Digits` rule re-splits the groups
+Defect: `digitGroupFromPreTokenizer` stopped at DeepSeek's `\p{N}{1,3}` and would have served 3-digit groups; a later
+`Digits(individual_digits)` rule makes the checkpoint per-digit. Fix: read the whole pre-tokenizer sequence. The arch
+otherwise adds exact-erf GELU, a fused `q_k_v_proj` split at load and a per-head sigmoid output gate. Bar: HF
+`tokenizers` byte-identical ids; the bf16 HF oracle.
+
+### K2-Horizon: markers, a generation-config EOS, and a thinking default
+Defect: the 51 KB template hit two jinja.cpp gaps (`is sameas true` with a bare argument); `<ifm|…>` markers needed a
+fourth think spelling; `<|ifm|im_end|>` is declared only in `generation_config.json`, so the model never stopped;
+thinking defaulted off on a template that always opens a think marker, so every llmprobe cell ended `length`; JSON
+schema + thinking matched a literal `</think>` inside the reasoning; a parameterless GLM call vanished. Fix: the jinja
+gaps; `installMarkerAliases` decodes markers to canonical bytes (only the rendered prompt keeps the pack's spelling,
+`k2ThinkOpenerAt`); `mergeEosTokens` for every model; thinking ON by default; `Tokenizer.markerCloserFor` pairs opener
+and closer ids; a bare-identifier body routes to the GLM parser. Also found here, for every model: `top_k: 1` and
+`top_p` near 0 still sampled because the filters masked by value and bf16 logits tie (filters now cut by rank).
+
+### Bonsai 2 served in bf16
+Defect: Prism's Hadamard packs ship f16 scales and f32 GDN tables, and Prism runs f16 with an f32 GDN state; we
+narrowed to bf16 (KL 1.7e-4). Fix: `actDtype` f16 and `ssmStateDtype` f32 for Hadamard packs, the loader keeps f16
+(`LoadOpts.keep_f16`), every kernel on the path takes f16; two bf16 constants surfaced only under f16 (the batched
+decode mask, the M-RoPE cast). KL 2.9e-6, same speed. Guard: `tests/test_hadamard_fidelity.sh`.
+
+### Qwen3.8 Flash Next's GatedDeltaNet decayed in bf16
+Defect: bf16's spacing below 1 rounded a slow-forgetting head's decay to exactly 1.0: 206 of 1728 heads never forgot,
+and the state re-rounded every token. The packs declare `mamba_ssm_dtype: float32`. Fix: `ssmStateDtype` f32 on
+qwen4_exp and every gate producer computes at the state's dtype (`gdn_decode.gateDtype`); f32 roots get their own SSD
+namespace. Guard: `qwen4_exp GDN: a slow-decay head forgets at its own rate on every arm`.
+
+### Qwen-Image-2.1: an 18 GB VAE decode on a 5 GB engine
+Defect: a 1024² generation peaked at 18 GB of process footprint while MLX's counter read 4.9 GB. Cause: MLX's 3x3 conv
+holds an unfolded input copy outside its counters (11 GB at 288 channels), and a stage keeps several full-resolution
+intermediates alive. Fix: exact row strips for big 3x3 convs (`Conv.forwardStrips`) and banded stages with a cropped
+halo (`Stage.banded`): everything but the 3x3 convs is per pixel. 18.1 → 9.5 GB. Guard: the VAE parity oracle with
+every stage forced into bands.
+
+### Nemotron-H: two layer-pattern spellings, and an MoE arm that was `unreachable`
+Defect: Nemotron 3.5 Lightning failed with `MISSING WEIGHT: backbone.layers.0.mixer.q_proj.weight`. Cause: only
+`hybrid_override_pattern` (a string) was parsed, not `layers_block_type` (a list); the MoE layer-init arm was an
+`unreachable` TODO that ReleaseFast folded into the MLP arm. Fix: both spellings; a real `nemotron_moe` op (grouped
+sigmoid routing, ReLU² experts, shared expert). Guard: the parse tests and the plugin's recorded proofs.
+
+### Nemotron-H: attention ran with RoPE the model never had
+Defect: needle lookups in 3k-28k token logs came back wrong; the MTP head accepted ~1.1 per round. Cause: the shared
+hybrid attention roped both LFM2 and Nemotron-H; Nemotron-H attention is NoPE whatever `rope_theta` its config
+carries. Fix: `layer_no_rope` set at parse for every layer and the MTP head; `cacheLayoutNamespace` gives it a fresh
+SSD root so RoPE-era keys never restore. Guard: `nemotron_h served: a NoPE attention layer ignores the order of
+earlier tokens`.
+
+### Nemotron-H: the MTP head's input and depth on a MoE trunk
+Defect: auto-depth MTP ran at depth 6, slower than serial. Cause: the head expects the residual before `norm_f`; each
+verify row routes to K experts, so weight traffic grows with depth. Fix: the hybrid path captures before the final
+norm; depth is 1 or 2; verify windows ≤ 8 rows ride the in-place expert path. Guard: `nextMtp on a Nemotron-H trunk
+emits the serial greedy stream`.
+
+### Nemotron-H: the fused add+norm path dropped the shared expert
+Defect: after the decode fusions, text degenerated after ~30 tokens with every kernel test green. Cause: the fused
+MoE-combine kept only the routed slots once the shared expert stopped riding the banks. Fix: the kernel takes the
+shared expert's output and mirrors MLX's reduction bit for bit. A fused path carries every term of the chain it
+replaces, and a forward-level test compares the two. Guard: `the fused add+norm decode path equals the unfused
+blocks`.
+
+### Nemotron-H: a single routing group ran the composed router chain
+Defect: ~30 µs per MoE layer of routing against a ~5 µs matvec. Cause: the grouped kernel declines `n_group <= 1` and
+Nemotron 3.5 sets `n_group: 1`. Fix: a single group selects the ungrouped `.sigmoid_bias` kernel.
+
+### Nemotron-H: the Mamba2 output widened the residual stream to f32
+Defect: `[dtype-trace] hybrid: residual widened at layer 0`; decode at half speed. Cause: the f32 SSM state's `y` was
+not cast back as mlx-lm does. Fix: cast `y` to the input dtype before the gated norm.
+
+## Media backends (continued)
+
+### A pinned library's per-op transient is invisible to every residency bill (#321, #424)
+Defect: after an mlx bump, LTX-2.5 died at "Decoding video" with a green preflight
+(`kIOGPUCommandBufferCallbackErrorOutOfMemory`): 66.8 GB peak where 36 GB sufficed. Cause: mlx decomposed small-depth
+3D convs into per-tap 2D convs, each tap a full output held until the op completes, each Winograd call budgeting 75%
+of the working set; H3's encoder built one lazy graph over 48 tiles. Fix: `conv3dDepthChunked` (exact overlapping
+depth windows, each evaluated); H3 `encodeMoments` evaluates per tile pass. No env lever for an exact, free fix. Diff
+conv dispatch on every mlx bump. `/props` `peak_bytes` reproduces a peak on a box that survives it.
+
+### A latent-to-RGB preview is a fit, not a hue wheel (#208)
+Defect: the preview projected channels around the golden angle and stretched each frame: a colourful blob unrelated to
+the video, while the test asserted `FF D8`. Fix: ComfyUI's published table per latent space (`LTXAV`, not `LTXV`;
+`MiniMaxH3Video`), generated by executing the reference (`tests/dump_latent_rgb_factors.py`), with live perceptual
+tests whose control arm is the retired projection (the fit must beat it by 0.3; chroma asserted separately; content of
+one random colour per latent cell). Previews default off in the app, and only the shown frames are copied.
+
+### Hunyuan3D paint unwrapped the raw marching-cubes mesh
+Defect: no textured res-320 job finished (xatlas at 900k faces). Cause: upstream decimates to 40,000 faces before the
+unwrap. Fix: vendored Fast-Quadric-Mesh-Simplification (`lib/fqms`), `mesh_simplify.decimate` before the unwrap.
+Guard: `tests/test_3d_paint.sh` at res 320.
+
+### A resident H3 text encoder crashed the second keyframe request
+Defect: the second keyframe request on a resident server killed it. Cause: the vision load unwrapped a weights map
+that was only opened when something had to be read. Fix: load the tower only when the encoder has none. Guard:
+`tests/test_h3_resident.sh` [4].
+
+### A runtime LoRA bypass cost H3 Turbo half its step
+Defect: a Turbo step took 18.7 s against 10.1 s without the adapter. Cause: `lora.delta` multiplied the bf16 product
+by an f32 scalar array, promoting a 1.3-1.8 GB tensor per adapted linear. Fix: `lora.addTo`: one skinny GEMM per
+adapter and `mlx_addmm` onto the base output in its own dtype. Guard: `addTo equals y + deltaSum in y's dtype`.
+
+### A LoRA at scale 0 still changed the image
+Defect: `lora_scales: [0]` rendered differently from no adapter. Cause: MLX's addmm at `alpha == 0` does not return
+`beta*c` at DiT shapes in bf16. Fix: `addTo` skips a zero-scale adapter. Guard: `addTo with a zero or tiny scale
+returns y`, `tests/test_qwen_image_lora.sh` check 2.
+
+### Stable Audio 3: a fractional length came out as clipped noise
+Defect: any non-whole length (0.5, 0.9, 1.5 s) produced full-scale noise; parity fixtures ran at 5 s. Cause: training
+conditions on `ceil(n_samples / sample_rate)`, whole seconds ≥ 1; the reference also samples 6 s past the request and
+trims. Fix: `trainedSeconds` and `latentCount`. A condition works only as training fed it. Guard: the two sa3 tests.
+
+### A Sushi MiMo pack: a stale bf16 copy, and MTP heads in the source layout
+Defect: `MiMo-V2.6-Flash-Sushi-2.3bpw` died in warmup on a bf16 `o_proj`; later every boot logged MTP off. Cause: the
+source shard still carries bf16 copies beside the affine triples and the loader kept the last listed; the heads were
+stored like the trunk (fused e4m3 QKV) and never converted. Fix: duplicated tensors load from the shard the index
+names (`indexOwners`); embed/head are dense by dtype; the heads get the trunk's QKV split and MLP decode. Guard:
+`indexOwners: the index names the shard…`, the smoke `mimo_v2_sushi.mtp` cell.
+
+### MiMo's own DFlash drafter loaded, drafted garbage and outranked MTP
+Defect: Xiaomi's drafter accepted 2-4%, the gate turned it off, and the request ran serial at 32 tok/s against 67 with
+the MTP heads. Cause: its attention needs partial rotary, a value scale and sink biases the block forward lacks. Fix:
+such a drafter is refused by name (`UnsupportedDflashAttention`). Guard: `dflash: a drafter whose attention needs
+unported arms is refused by name`.
+
+### EmbeddingGemma 2: a padded row can NaN a whole batch
+Defect: every row of a mixed-length batch came back NaN. Cause: a padded query whose whole band is padding softmaxes
+over `-inf`, and the NaN reaches real rows through V; only NAX kernels happened to stay finite. Fix: the summed mask
+is floored at -1e9; the head returns f32. Ported facts not in the config: the band radius is inclusive, per-layer
+inputs are projection-only, the projection runs after pooling, `pooling_mode` is a string in the sidecar.
+EmbeddingGemma 1 still lacks the floor (`docs/known-issues.md`). Guard: the tiny-checkpoint reference test,
+`tests/test_embeddings.sh` [4d].
+
+### EmbeddingGemma 2 video frames embedded at 70 tokens, not 140
+Defect: frames embedded at half the soft tokens the release asks for. Cause: the processor config was parsed with a 16
+KB fixed buffer, the `OutOfMemory` swallowed and defaults kept; a toy JSON fit in the test. Fix: the parser takes an
+allocator and the real file is its test input. Gemma 4's own image processor (aspect-preserving, multiples of 48),
+alpha dropped as PIL does, each frame in its own `<boi>…<eoi>`. Guard: the processor table tests,
+`tests/dump_embeddinggemma2_media.py`.
+
+### YuE2: a Scope held 25 GB of decoder temporaries; three oracle bars were wrong
+Defect: a 40 s song peaked at 29 GB; the oracles showed a 0.4% VAE gain and a logit shortfall, and the nucleus kept
+the wrong tokens. Cause: a stage-wide `Scope` kept ~70 half-gigabyte temporaries alive; the gain is TF32
+(`MLX_ENABLE_TF32=0` matches); the shortfall is one bf16 ulp a softmax cannot see; the nucleus overwrote its own
+pivot. Fix: per-op scopes (weights + 5.4 GB); bars on what matters (argmax + KL, cosine + a 1% scale band,
+`rms_ratio`). Guard: the sampler test, the `YUE2_*` oracles, `tests/test_yue2_gen.sh`.
+
+### A speaker cache keeps one of many equal frames (Nemotron 3 Diarization)
+Defect: agreement with mlx-audio drifted from 0.04 to 0.43 after the first 27.2 s chunk. Cause: confidently spoken
+frames tie in the speaker cache's ranking, so compression keeps one of many near-equal frames (the references disagree
+the same way); underneath, `Scope.geluErf` added an f32 scalar to a bf16 stream. Fix: `geluErf` keeps its dtype;
+compression runs on the host (`aoscKeep`), checked on its own. A cached-selection model is judged by agreement and
+accuracy (99.43% vs 99.48/99.49%), never frame-exact output past the first chunk.
+
+### The int8 copy sat beside the packed weights (`w8a8`)
+Defect: `--w8a8` left packed weights resident (H3 held 77 GB) and its int8 attention ran on M1-M4, where the kernel
+cannot. Cause: four paths still read the originals, loaders held their weight maps, only the linears checked for NAX.
+Fix: fused q/k/v as row views, `Weights.dropBlock` per converted block, the memo dropped per job, `w8a8.nax()` gates
+every kernel, default-on only with NAX + 64 GiB. Guard: the decline and default tests, every engine arm's cosine + rms
+vs packed and resident bytes vs the bill.
+
+### A ModelOpt GLM answered with its own prompt: the `up` scale landed after the clamp
+Defect: GLM-5.3 FP4 echoed the question back. Cause: each expert's `up` global scale was folded into the routing
+weight (exact for Flash Next), but GLM clamps `up` at ±10 before that point. A scale folds past an activation only if
+the activation is linear in that operand. Fix: with a `swiglu_limit` the up scale stays apart (`up_expert_scale`).
+Guard: `ModelOpt banks: a clamped SwiGLU keeps the up scale apart`, `tests/test_glm5_next.sh`.
+
+### `F_NOCACHE` is ignored for an unaligned read
+Defect: loading GLM FP4 froze a 256 GB Mac and ended in SIGKILL. Cause: `F_NOCACHE` bypasses the cache only when
+offset, length and buffer are page-aligned; expert tensors sit anywhere. Fix: read the covering aligned span through
+an aligned stage, 6 banks at a time; `memoryPressureLevel` stops the load with `InsufficientMemory`; the bill adds
+decoded scales. Tell: `File-backed pages` climbing as fast as the load. Guard: the `ModelOpt reads` tests.
+
+### An f32 norm weight widened a bf16 model's MoE input (GLM FP4)
+Defect: GLM FP4 decoded far slower than the 5.1bpw pack. Cause: NVIDIA keeps trunk layer norms in f32 and `rms_norm`
+promotes to the weight's dtype, so the fused reads and fp4 kernels declined. Fix: `narrowsLoadedF32Norm` casts trunk
+f32 norms to bf16 for ModelOpt packs only (vision towers keep theirs); `moe_fp4` takes the up scale and clamp. Guard:
+the predicate test, `moe fp4 decode: a clamped SwiGLU …` vs fp32 truth.
+
+### TRELLIS.2's dual grid is not a manifold, and its remesh sits off the colours' surface
+Defect: unwraps of 80-110 s into ~14k charts, then black stripes after a remesh. Cause: the dual grid is non-manifold
+by design; the remesh skin sits a voxel or two off the decoded surface. Fix: `trellis2_remesh` (unsigned-distance
+offset iso-surface) before xatlas, and every texel snapped to the raw mesh (`snapToSurface`) before the volume read.
+Guard: the remesh tests and the pipeline oracle.
+
+### A flow-DiT forward over tens of thousands of tokens needs a scope per block
+Defect: one scope over a whole forward keeps every block's intermediates alive together; fixture oracles never show
+it. Fix: `Dit.forward` and `Decoder.run` evaluate and free per block (1024 request: 21 GiB); Pixal3D's NAF encoders
+got a scope per conv (49.9 → 21.9 GiB). Guard: the peaks pinned by `trellis2PeakBytes`.
+
+### A fixture script's `.float()` turned a complex buffer real (Pixal3D)
+Defect: one structure-flow oracle diverged (output cos 0.79). Cause: `.float()` dropped the imaginary half of a
+complex64 `rope_phases` buffer in the reference. Fix: keep complex tensors as they are. An oracle that improves when a
+transform is removed had it disabled.
+
+### xatlas segments one connected surface on one thread
+Defect: a 1M-face car spent 446 s unwrapping with 35 idle cores. Cause: xatlas segments a chart group on one thread
+and a car is one group. Fix: `uvwrap.parametrizeParallel` labels equal spatial regions as materials (median split,
+`REGION_FACES` 8192): 3.4 s, same coverage. Hunyuan paint keeps `parametrize`. Guard: `a connected surface unwraps as
+one chart group per region`.
+
+### TRELLIS.2 roughness is flat, so shininess is one global finish
+Defect: a car rendered as satin plastic. Cause: the decoded roughness is nearly constant and the GLB shipped
+`roughnessFactor` 1. Fix: `roughness_scale` and `clearcoat` request fields (Hunyuan3D refuses them by name); gloss
+shows every bump, so the seed matters. Guard: the finish tests.
+
+### `gen.mjs glb --max-tris` grew the file and crumpled a hood
+Defect: simplifying a 1M-face car returned more triangles in a larger file. Cause: the old index buffer and
+unreferenced vertices stayed in the BIN; fixed UV seams put every collapse on the smooth panels. Fix: `rebuildGlb`
+repacks the BIN; hard-surface budgets come from the server's seam-free `decimation_target`. Guard: the `gen.mjs`
+repack tests.
+
+### A doc that spells the image token failed every DeepSeek-V4.1 request
+Defect: an agent working in this repo carried AGENTS.md (which spelled `deepseek_image`) in its prompt, and every
+request failed `Dsv41VisionRowsMissing`. Cause: the added token splits out of any text and became an image position
+with no rows. Fix: without the request's rows the image token is text (no splice, no VL routing bias, its own Engram
+id); a literal beside a real image stays a named 400. Guard: `dsv41 image token: without image rows it is text`.
+
+## Parity method
+
+### Fixtures for fp16-fragile giants are dumped fp32 on CPU
+Defect: a paint DINOv2-giant oracle sat at cos 0.30 while every per-layer bisect of the port was clean. Cause: the
+fixture was dumped in fp16 on MPS; hidden magnitudes reach ~400 and the run silently decorrelated. Fix: dump deep
+ViTs/DiTs in fp32 on CPU; when an oracle misses badly, re-run the spec in numpy from the converted weights before
+rewriting the port.
+
+### transformers ≥ 5 zeroes custom-model rotary buffers
+Defect: the ACE-Step DiT oracle sat at 0.66 while a no-RoPE variant passed at 0.99996. Cause: a `trust_remote_code`
+model's non-persistent `inv_freq` is materialized as zeros, so the reference ran identity RoPE. Fix: rebuild each
+zeroed rotary from a fresh instance of its class; dump scripts assert no `*.rotary_emb.inv_freq` is all-zero. An
+oracle that improves when a transform is removed had it disabled.
+
+### Cosine cannot see scale
+Defect: a tower whose features came out 40x too large would score cos 1.0. Fix: concatenated tensors also assert
+`rms_ratio`; pin a single row where a whole-tensor cosine averages over many (ACE-Step's timbre row).
+
+## Nemotron 3.5 Super and RADIO
+
+### RADIO configuration and numerics follow the checkpoint
+Defect: native omni packs loaded text-only. Cause: vision keyed on a private flag instead of
+`vision_config.model_type: "radio"`. Fix: loader and discovery share `discovery.hasRadioVision`; preprocessing follows
+the official f32 antialiased bicubic and f32 CPE (PIL's uint8 step moved pixels). Guard: the RADIO config tests and
+the executed fp32 fixtures (cosine + RMS ratio).
+
+### Native Nemotron wrappers retain more than an architecture tag
+Defect: Super's `nemotron_h_omni` pack was hidden in the app and failed to load. Cause: exact type lists and flat
+`backbone`/`mlp1` names. Fix: the language wrapper and `mlp1.layers` projector resolve from the checkpoint's names,
+quantization per linear; the native config's final vision LayerNorm before pixel shuffle is required. Guard:
+picker/type parity tests, the Super RADIO fixtures.
+
+### A LiLiCorr drafter can own its output head
+Defect: Super's drafter proposed through the target's head, and `/v1/messages` dropped DFlash. Cause: DFlash ignored
+`has_own_lm_head`; the messages surface checked only the Gemma slot. Fix: a declared head is loaded, validated and
+used for proposals only (verify keeps the target head); all four surfaces share `requestEnableDrafter`. Guard: native
+config corpus, head forwards, the HTTP defaults on all four APIs.
+
+### A plugin's copy of the MoE dropped the arm only ModelOpt packs reach
+Defect: Qwen3.8 Flash Next FP4 (NVIDIA ModelOpt) decoded garbage from the first token after the plugin moved off the
+legacy `Transformer`; the iQ pack was fine. Cause: the trunk's copy of the MoE dropped the `per_expert_scale` routing
+arm (each expert's up x down `weight_scale_2`) as unused, and every proof replayed tapes of a fixture pack that carries
+no such scale. Fix: the arm restored, plus a load-time `unservedLayout` that refuses, by name, any layout an arm the
+fork dropped would read. Guard: `a per-expert scale of 2 doubles the routed experts exactly`, the layout-guard test,
+the real-pack greedy gate.

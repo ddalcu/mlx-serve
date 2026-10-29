@@ -14,6 +14,7 @@
 #
 # SKIPs without a FLUX model dir (default: the 3-bit klein).
 set -euo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${1:-11321}"
@@ -35,7 +36,7 @@ run_one() { # run_one <png-out> <log-out> [env...]
   local png="$1" log="$2"; shift 2
   env "$@" "$BIN" --serve --port "$PORT" --model-dir "$HOME/.mlx-serve/models" --log-level debug >"$log" 2>&1 &
   SRV_PID=$!
-  for _ in $(seq 1 30); do curl -fsS "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+  srv_wait_health "http://127.0.0.1:$PORT" 30 1 || true
   local model_id
   model_id="$(curl -fsS -X POST "http://127.0.0.1:$PORT/v1/load-model" -H 'Content-Type: application/json' \
     --max-time 300 -d "{\"model\":\"$MODEL_DIR\"}" \

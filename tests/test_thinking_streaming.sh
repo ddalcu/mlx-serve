@@ -9,6 +9,7 @@
 # Usage: ./tests/test_thinking_streaming.sh [model_dir] [port]
 # Starts its own server, runs tests, kills it.
 
+source "$(dirname "$0")/lib/server.sh"
 MODEL_DIR=${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/unsloth/Qwen3.6-27B-UD-MLX-4bit}}
 PORT=${2:-8099}
 BASE="http://127.0.0.1:$PORT"
@@ -57,11 +58,7 @@ SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 60); do
-    if curl -sf "$BASE/health" >/dev/null 2>&1; then break; fi
-    if [ $i -eq 60 ]; then echo "FAIL: server did not start"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 || { echo "FAIL: server did not start"; exit 1; }
 echo -e "${GREEN}Server ready${NC}"
 echo ""
 

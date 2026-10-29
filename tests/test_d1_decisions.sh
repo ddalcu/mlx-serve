@@ -8,8 +8,9 @@
 # an LFM2-VL config) and the on-demand load are exercised, not just the forward. Answers are compared against the
 # card's own package on CPU in float32 (tests/fixtures/d1/cases.json, from tests/dump_d1_fixtures.py): bf16 Metal
 # agrees to 0.02 on probabilities, and input token counts must match exactly.
-# Hermetic counterparts: the unit tests in src/d1.zig and the D1 discovery test in src/model_discovery.zig.
+# Hermetic counterparts: the unit tests in src/plugins/d1/d1.zig and the D1 discovery test in src/host/registry/discovery.zig.
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11445}"
 MODEL="${D1_MODEL:-$HOME/.mlx-serve/models/LiquidAI/d1-3B}"
@@ -35,8 +36,7 @@ MODEL_ID="LiquidAI/d1-3B"
 
 "$BIN" --serve --port "$PORT" --model-dir "$ROOT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
-for _ in $(seq 1 60); do curl -s -f "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -s -f "localhost:$PORT/health" >/dev/null || { echo "FAIL: server not healthy"; tail -20 "$LOG"; exit 1; }
+srv_wait_health "localhost:$PORT" 60 1 || { echo "FAIL: server not healthy"; tail -20 "$LOG"; exit 1; }
 
 echo "=== discovery ==="
 MODELS="$(curl -s "localhost:$PORT/v1/models")"

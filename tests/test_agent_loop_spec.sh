@@ -1,42 +1,16 @@
 #!/bin/bash
-# Agent-loop cross-mode regression test for spec-decode.
+# test_agent_loop_spec.sh — one long-running server with --pld (and --drafter on a Gemma 4 target) through a 6-turn
+# conversation crossing every spec-mode transition the agent harness triggers: plain turn, `tools` turn, tool result,
+# a ~2000-token message, the same message again (cache hit after a tool call), `enable_thinking`. Each turn answers
+# 200 with valid JSON, a sensible finish_reason and non-empty content (tool_calls on turn 2), and no turn corrupts the
+# previous one's output.
 #
-# A single long-running server with `--pld` (and `--drafter` when the target
-# is a Gemma 4 checkpoint) is driven through a 6-turn synthetic conversation
-# that exercises every spec-decode mode transition the real agent harness
-# triggers:
+#   AGENT_SPEC_TEST_MODEL=<dir> ./tests/test_agent_loop_spec.sh [port]   # default gemma-4-e4b-it-8bit (+ its drafter)
 #
-#   1. Plain user message → assistant generation        (spec-decode active)
-#   2. User → assistant with `tools` array              (spec auto-disables)
-#   3. User feeds tool result → assistant generation    (spec re-activates)
-#   4. Long user message (~2000 tokens)                 (spec + KV cache reuse)
-#   5. Same long user message again                     (spec + cache hit;
-#                                                        post-tool-call cache
-#                                                        invalidation guard)
-#   6. User → assistant with `enable_thinking:true`     (reasoning_content path)
-#
-# Each turn must:
-#   - Return valid JSON with finish_reason in a sensible set
-#   - Produce non-empty content (or non-empty tool_calls for turn 2)
-#   - Return HTTP 200 (no 500s)
-#   - Not corrupt the previous turn's output across spec-decode mode transitions
-#
-# This catches regressions where:
-#   - A perf change to spec-decode breaks the agent loop in cross-mode flows
-#   - KV cache state leaks across tool-call boundaries
-#   - Sliding-window or speculative state gets out of sync after a re-prefill
-#
-# Usage:
-#   AGENT_SPEC_TEST_MODEL=/path/to/model ./tests/test_agent_loop_spec.sh [port]
-#
-# Defaults:
-#   model   = ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#   drafter = ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16 (only used if
-#             AGENT_SPEC_TEST_MODEL points at a Gemma 4 target)
-#
-# Auto-skips cleanly when the model directory is missing.
+# SKIPs when the model is missing.
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8090}
 BASE="http://127.0.0.1:$PORT"
@@ -97,10 +71,7 @@ cleanup() {
 trap cleanup EXIT
 
 UP=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then UP=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 && UP=1
 if [ "$UP" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
     tail -30 "$LOGFILE" | sed 's/^/    /'

@@ -92,6 +92,20 @@ final class DownloadManagerLayoutTests: XCTestCase {
     /// the nested `mtp/weights.safetensors` head (else the model loses its
     /// speculative-decoding speedup), while NOT pulling unrelated nested
     /// subdirectories (e.g. `original/` alternate-precision shadow weights).
+    /// A model that speaks (LFM3-Audio, Omni) ships its speech codec in `audio_tokenizer/`: without it the pack
+    /// downloads, loads, and cannot answer in speech.
+    func testSelectNeededFilesKeepsTheSpeechCodec() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 100],
+            ["path": "model.safetensors", "type": "file", "size": 2_000_000_000],
+            ["path": "audio_tokenizer/config.json", "type": "file", "size": 1_000],
+            ["path": "audio_tokenizer/model.safetensors", "type": "file", "size": 150_000_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+        XCTAssertTrue(paths.contains("audio_tokenizer/model.safetensors"))
+        XCTAssertTrue(paths.contains("audio_tokenizer/config.json"))
+    }
+
     func testSelectNeededFilesIncludesMtpSidecarSkipsOtherNestedDirs() {
         let entries: [[String: Any]] = [
             ["path": "config.json", "type": "file", "size": 100],

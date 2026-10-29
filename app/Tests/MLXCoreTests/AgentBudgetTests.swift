@@ -14,79 +14,50 @@ import XCTest
 /// these numbers from the context the RUNNING server advertises.
 final class AgentBudgetTests: XCTestCase {
 
-    // MARK: Budget derivation
+    // MARK: The server's numbers
 
-    func testUnknownServerContextFallsBackToTheConservativeDefault() {
-        // No server info yet (not running / pre-metadata build): never guess high.
-        XCTAssertEqual(AgentBudget.forServerContext(nil).context, 32768)
-        XCTAssertEqual(AgentBudget.forServerContext(nil).output, 8192)
-        XCTAssertEqual(AgentBudget.forServerContext(0).context, 32768)
-        XCTAssertEqual(AgentBudget.forServerContext(-1).context, 32768)
+    func testARowsAgentBudgetIsReadVerbatim() {
+        // The server computes the budget (src/host/launch/budget.zig); the app
+        // declares exactly what the row carries.
+        let row: [String: Any] = ["context": 78848, "output": 39424, "compaction_reserve": 19712,
+                                  "too_small_for": ["claude": 65536]]
+        XCTAssertEqual(AgentBudget.parse(row),
+                       AgentBudget.Budget(context: 78848, output: 39424, compactionReserve: 19712,
+                                          tooSmallFor: ["claude": 65536]))
+        XCTAssertNil(AgentBudget.parse(nil), "an older server's row carries none")
+        XCTAssertNil(AgentBudget.parse(["context": 0, "output": 1, "compaction_reserve": 1]))
     }
 
-    func testServerContextIsDeclaredEXACTLY_noSecondMargin() {
-        // The live number a 128 GB Mac running Qwen3.6-27B pins at load.
-        let b = AgentBudget.forServerContext(78848)
-
-        // The server already reserved 15% of the memory ceiling before it
-        // advertised this. Shaving a second margin here double-counted that
-        // headroom AND made the CLI report a different context than Settings
-        // showed (opencode said 75K where the server said 77K). Declare the
-        // server's number verbatim: it IS the enforced limit, and our own
-        // `clampMaxTokens` uses the same one.
-        XCTAssertEqual(b.context, 78848)
-        // Far above the old hardcoded 32768 — that was the original bug.
-        XCTAssertGreaterThan(b.context, 60000)
-        // Enough output budget for a one-shot whole-file write.
-        XCTAssertGreaterThanOrEqual(b.output, 16384)
-        // prompt + output must be expressible inside the window.
-        XCTAssertLessThan(b.output, b.context)
+    func testParseModelInfoCarriesTheBudgetModalityAndEngines() {
+        let m = APIClient.parseModelInfo([
+            "id": "m", "capabilities": ["chat"],
+            "agent_budget": ["context": 24576, "output": 12288, "compaction_reserve": 6144, "too_small_for": [:] as [String: Int]],
+            "engines": ["mlx", "ane"],
+        ])
+        XCTAssertEqual(m.agentBudget?.output, 12288)
+        XCTAssertEqual(m.engines, ["mlx", "ane"])
+        XCTAssertNil(m.modality)
+        let img = APIClient.parseModelInfo(["id": "i", "capabilities": ["image"], "modality": "image"])
+        XCTAssertNil(img.agentBudget)
+        XCTAssertEqual(img.modality, "image")
     }
 
-    func testContextNeverExceedsWhatTheServerAdvertises() {
-        for advertised in [1024, 4096, 8192, 16384, 32768, 65536, 94729, 262144] {
-            let b = AgentBudget.forServerContext(advertised)
-            XCTAssertEqual(b.context, advertised,
-                "declared context must equal the server's \(advertised)")
-            XCTAssertLessThanOrEqual(b.output, b.context,
-                "output \(b.output) > context \(b.context) at advertised=\(advertised)")
-            XCTAssertGreaterThan(b.output, 0)
-        }
-    }
-
-    // Live 2026-07-20 (pi in the sandbox, Qwen3.6-27B at 262K ctx): the flat
-    // 16384 output cap — which thinking tokens share — truncated every
-    // whole-file `write` of a large map.js. The server salvaged path-only
-    // args, the model misread the validation error as "I forgot content",
-    // and the session looped for hours; at 11% context usage pi never
-    // compacted the poisoned history away. The output budget must SCALE with
-    // the advertised context (context/2: thinking shares the cap, and a 24k
-    // window's quarter was spent entirely on one xhigh thought), capped at
-    // 65536 so a degenerate runaway generation stays bounded, floored at 1024.
-    func testOutputBudgetScalesWithContext() {
-        XCTAssertEqual(AgentBudget.forServerContext(262144).output, 65536)
-        XCTAssertEqual(AgentBudget.forServerContext(131072).output, 65536)
-        XCTAssertEqual(AgentBudget.forServerContext(524288).output, 65536,
-                       "runaway cap holds at huge contexts")
-        XCTAssertEqual(AgentBudget.forServerContext(65536).output, 32768)
-        XCTAssertEqual(AgentBudget.forServerContext(24576).output, 12288)
-        XCTAssertEqual(AgentBudget.forServerContext(32768).output, 16384)
-        XCTAssertEqual(AgentBudget.forServerContext(2048).output, 1024, "floor")
-    }
-
-    func testBudgetGrowsMonotonicallyWithServerContext() {
-        var last = 0
-        for advertised in [8192, 16384, 32768, 65536, 94729] {
-            let c = AgentBudget.forServerContext(advertised).context
-            XCTAssertGreaterThanOrEqual(c, last)
-            last = c
-        }
+    func testTheSmallWindowWarningNamesTheFloorTheServerSaysIsMissed() {
+        let b = AgentBudget.Budget(context: 24576, output: 12288, compactionReserve: 6144,
+                                   tooSmallFor: ["claude": 65536, "opencode": 32768])
+        XCTAssertNotNil(AgentBudget.contextWarning(agentId: "claude", budget: b))
+        XCTAssertTrue(AgentBudget.contextWarning(agentId: "opencode", budget: b)?.contains("32768") ?? false)
+        XCTAssertNil(AgentBudget.contextWarning(agentId: "pi", budget: b), "pi's floor is met")
+        let tiny = AgentBudget.Budget(context: 8192, output: 4096, compactionReserve: 2048,
+                                      tooSmallFor: ["claude": 65536, "default": 16384])
+        XCTAssertTrue(AgentBudget.contextWarning(agentId: "pi", budget: tiny)?.contains("16384") ?? false,
+                      "an agent with no floor of its own takes the default")
     }
 
     // MARK: The configs we actually write
 
     func testPiConfigCarriesTheDerivedBudgetNotAHardcodedOne() throws {
-        let b = AgentBudget.forServerContext(94729)
+        let b = AgentBudget.Budget(context: 94729, output: 47364, compactionReserve: 20000)
         let json = AgentConfigs.piModelsJSON(
             baseURL: "http://localhost:11234", model: "Qwen3.6-27B", budget: b)
 
@@ -121,7 +92,7 @@ final class AgentBudgetTests: XCTestCase {
         // inherit provider compat), so they are pinned together.
         let json = AgentConfigs.piModelsJSON(
             baseURL: "http://127.0.0.1:11234", model: "m",
-            budget: AgentBudget.Budget(context: 32768, output: 8192))
+            budget: AgentBudget.Budget(context: 32768, output: 8192, compactionReserve: 8192))
         let js = AgentConfigs.piModelsExtensionJS(baseURL: "http://127.0.0.1:11234")
         XCTAssertTrue(json.contains("\"supportsReasoningEffort\": true"),
                       "models.json must enable reasoning effort: \(json)")
@@ -136,7 +107,7 @@ final class AgentBudgetTests: XCTestCase {
         // `--thinking max` clamps to high and a model's max effort is unreachable.
         let json = AgentConfigs.piModelsJSON(
             baseURL: "http://127.0.0.1:11234", model: "m",
-            budget: AgentBudget.Budget(context: 32768, output: 8192))
+            budget: AgentBudget.Budget(context: 32768, output: 8192, compactionReserve: 8192))
         let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
         let mlx = try XCTUnwrap((obj["providers"] as? [String: Any])?["mlx"] as? [String: Any])
         let m = try XCTUnwrap((mlx["models"] as? [[String: Any]])?.first)
@@ -148,7 +119,7 @@ final class AgentBudgetTests: XCTestCase {
     }
 
     func testPiAgentsMDStatesTheCapAndTheChunkingRecovery() {
-        let b = AgentBudget.forServerContext(262144)
+        let b = AgentBudget.Budget(context: 262144, output: 65536, compactionReserve: 20000)
         let md = AgentConfigs.piAgentsMD(budget: b)
         XCTAssertTrue(md.contains("\(b.output)"),
                       "must state the real response cap, never a hardcode")
@@ -161,7 +132,7 @@ final class AgentBudgetTests: XCTestCase {
     }
 
     func testOpencodeConfigDeclaresPerModelLimits() throws {
-        let b = AgentBudget.forServerContext(94729)
+        let b = AgentBudget.Budget(context: 94729, output: 47364, compactionReserve: 20000)
         let json = AgentConfigs.opencodeJSON(
             baseURL: "http://localhost:11234", model: "Qwen3.6-27B", budget: b)
 
@@ -175,7 +146,7 @@ final class AgentBudgetTests: XCTestCase {
         let limit = try XCTUnwrap(model["limit"] as? [String: Any])
         XCTAssertEqual(limit["context"] as? Int, b.context)
         // opencode never sends max_tokens: limit.output is its compaction reserve.
-        XCTAssertEqual(limit["output"] as? Int, AgentBudget.compactionReserve(b.context))
+        XCTAssertEqual(limit["output"] as? Int, b.compactionReserve)
         XCTAssertNil(obj["compaction"], "opencode 1 gets no compaction block")
         // opencode sends no reasoning_effort unless the model declares one: thinking stayed off.
         XCTAssertEqual((model["options"] as? [String: Any])?["reasoningEffort"] as? String, "medium")
@@ -184,19 +155,9 @@ final class AgentBudgetTests: XCTestCase {
         XCTAssertEqual((variants["high"] as? [String: Any])?["reasoningEffort"] as? String, "high")
     }
 
-    // pi keeps 20000 recent tokens and opencode2 reserves a 20000 buffer by
-    // default, both sized for 200k windows: a 24k window compacted before its
-    // first reply (opencode2) or never (pi, while max_tokens shrank to 1).
-    func testCompactionReserveIsAQuarterCappedAtTheAgentsDefaults() {
-        XCTAssertEqual(AgentBudget.compactionReserve(24576), 6144)
-        XCTAssertEqual(AgentBudget.compactionReserve(8192), 2048)
-        XCTAssertEqual(AgentBudget.compactionReserve(2048), 1024)
-        XCTAssertEqual(AgentBudget.compactionReserve(262144), 20000)
-    }
-
     func testPiSettingsMergeScalesCompactionAndKeepsTheRest() throws {
         let existing = #"{"theme":"dark","compaction":{"enabled":false,"reserveTokens":1}}"#
-        let json = AgentConfigs.piSettingsJSON(existing: existing, context: 24576)
+        let json = AgentConfigs.piSettingsJSON(existing: existing, budget: AgentBudget.Budget(context: 24576, output: 12288, compactionReserve: 6144))
         let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
         XCTAssertEqual(obj["theme"] as? String, "dark")
         let c = try XCTUnwrap(obj["compaction"] as? [String: Any])
@@ -204,7 +165,7 @@ final class AgentBudgetTests: XCTestCase {
         XCTAssertEqual(c["reserveTokens"] as? Int, 10240)
         XCTAssertEqual(c["keepRecentTokens"] as? Int, 6144)
 
-        let big = AgentConfigs.piSettingsJSON(existing: "", context: 262144)
+        let big = AgentConfigs.piSettingsJSON(existing: "", budget: AgentBudget.Budget(context: 262144, output: 65536, compactionReserve: 20000))
         let bo = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(big.utf8)) as? [String: Any])
         let bc = try XCTUnwrap(bo["compaction"] as? [String: Any])
         XCTAssertEqual(bc["reserveTokens"] as? Int, 16384, "big windows keep pi's defaults")
@@ -212,7 +173,7 @@ final class AgentBudgetTests: XCTestCase {
     }
 
     func testOpencode2ConfigCarriesAScaledCompactionBlock() throws {
-        let b = AgentBudget.forServerContext(24576)
+        let b = AgentBudget.Budget(context: 24576, output: 12288, compactionReserve: 6144)
         let json = AgentConfigs.opencodeJSON(
             baseURL: "http://localhost:11234", defaultModel: "m",
             entries: [AgentModelEntry(id: "m", budget: b, vision: false)], pinModel: true, compaction: true)
@@ -224,7 +185,7 @@ final class AgentBudgetTests: XCTestCase {
     }
 
     func testClaudeCodeExportsCapOutputTokens() {
-        let b = AgentBudget.forServerContext(94729)
+        let b = AgentBudget.Budget(context: 94729, output: 47364, compactionReserve: 20000)
         let script = AgentConfigs.claudeCodeExports(
             baseURL: "http://localhost:11234", model: "mlx-serve", budget: b)
 
@@ -242,7 +203,7 @@ final class AgentBudgetTests: XCTestCase {
     /// CLAUDE_CODE_MAX_CONTEXT_TOKENS is the documented override, and like
     /// every other agent's context field it is declared VERBATIM.
     func testClaudeCodeExportsDeclareAdvertisedContext() {
-        let b = AgentBudget.forServerContext(786_432)
+        let b = AgentBudget.Budget(context: 786_432, output: 65536, compactionReserve: 20000)
         let script = AgentConfigs.claudeCodeExports(
             baseURL: "http://localhost:11234", model: "mlx-serve", budget: b)
         XCTAssertTrue(script.contains("export CLAUDE_CODE_MAX_CONTEXT_TOKENS=786432"),
@@ -253,7 +214,7 @@ final class AgentBudgetTests: XCTestCase {
         // An unknown context is not a claim: omit the export.
         let unknown = AgentConfigs.claudeCodeExports(
             baseURL: "http://localhost:11234", model: "mlx-serve",
-            budget: AgentBudget.Budget(context: 0, output: 8192))
+            budget: AgentBudget.Budget(context: 0, output: 8192, compactionReserve: 1024))
         XCTAssertFalse(unknown.contains("CLAUDE_CODE_MAX_CONTEXT_TOKENS"))
         XCTAssertTrue(unknown.contains("export CLAUDE_CODE_MAX_OUTPUT_TOKENS=8192"))
     }

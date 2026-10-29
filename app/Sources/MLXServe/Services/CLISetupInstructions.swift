@@ -95,16 +95,16 @@ enum CLISetupInstructions {
                 export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: servedModelId, entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)], pinModel: true, compaction: true))'
                 \(opencodeV2BinResolver)
                 """),
-            // codex settings ride `-c` overrides over the user's own config;
-            // nothing is written. The resolver line also finds the CLI the
-            // ChatGPT/Codex desktop app bundles, for installs with no codex
-            // on PATH.
+            // codex settings ride `-c` overrides; nothing is written into their Codex
+            // home. The resolver also finds the desktop app's bundled CLI. Local
+            // models get the current-contract instructions file (gate: env =off).
             Tab(id: "codex",
                 title: "Codex",
                 installHint: "Requires the codex CLI (npm install -g @openai/codex) or the ChatGPT desktop app, which bundles it",
                 command: """
-                \(AgentConfigs.codexBinResolver)
-                "$CODEX_BIN" \(AgentConfigs.codexConfigArgs(baseURL: baseURL, model: servedModelId, budget: budget))
+                \(AgentConfigs.codexInstructionsSetup() ?? "")\(AgentConfigs.codexBinResolver)
+                \(AgentConfigs.codexLaunchGate(args: AgentConfigs.codexConfigArgs(baseURL: baseURL, model: servedModelId, budget: budget)))
+                codex_launch
                 """),
             // hermes reads its whole tree from HERMES_HOME; the .env is the
             // first-run wizard kill switch (OPENAI_BASE_URL set = configured).
@@ -192,10 +192,9 @@ enum CLISetupInstructions {
 struct CLISetupInstructionsButton: View {
     let baseURL: String
     let servedModelId: String
-    /// The running server's EFFECTIVE context (`/v1/models` meta.context_length)
-    /// — the numbers written into the user's CLI config derive from it, never
-    /// hardcoded. See `AgentBudget`.
-    let serverContextLength: Int?
+    /// The running server's `agent_budget` for the chat model — the numbers
+    /// written into the user's CLI config, never hardcoded. See `AgentBudget`.
+    let serverBudget: AgentBudget.Budget?
     let isEnabled: Bool
 
     @State private var showPanel = false
@@ -220,7 +219,7 @@ struct CLISetupInstructionsButton: View {
                 tabs: CLISetupInstructions.tabs(
                     baseURL: baseURL,
                     servedModelId: servedModelId,
-                    budget: AgentBudget.forServerContext(serverContextLength)))
+                    budget: serverBudget ?? AgentBudget.fallback))
         }
     }
 }

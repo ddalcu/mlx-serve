@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump YuE2 parity fixtures (.raw f32 / i32) for the Zig oracle tests in `src/yue2.zig`.
+"""Dump YuE2 parity fixtures (.raw f32 / i32) for the Zig oracle tests in `src/plugins/yue2/yue2.zig`.
 
 USER-RUN (needs mlx + numpy + tiktoken). Runs the ahmadw/YuE2-3B-MLX Python reference
 (its yue2_model.py / yue2_vae.py / generate.py) over the SAME pack the engine loads.

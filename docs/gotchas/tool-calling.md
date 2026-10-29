@@ -1,944 +1,340 @@
-# Tool calling & model-output formats — war stories (moved out of CLAUDE.md)
+# Tool calling and model-output formats: gotchas
 
-Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
+One story per gotcha: the defect, the cause, the fix, the guard. The rules live in the root `AGENTS.md` (`## Rules`);
+what is still open lives in `docs/known-issues.md`. Chat code is under `src/host/chat/` (dialect parsers in `tools/`,
+reasoning splits in `reasoning/`, the corpus in `format_corpus_test.zig`, the traffic replay in
+`tool_traffic_replay_test.zig`).
 
-### pi "stalls" on Qwen: the system prompt arrived as role `developer` (issue #348, 2026-09-08)
+## Silent template fallback
 
-Defect: every pi request logged `jinja render failed … Unexpected message role` and fell back to the generic chat format; the model then ran without its template and stop token, tool calls came out malformed and turns ended empty, which read as "pi stalls". Cause: pi 0.84 sends the system prompt as role `developer` for any `reasoning: true` model unless the config carries `compat.supportsDeveloperRole: false` (our launcher writes it, a hand-written config does not), and Qwen's template raises on the role. Fix: `chat.canonicalRole` maps `developer` to `system` at the chat-completions parse site and the Responses input parser; the cache-key system hash reads it too. Every served template treats the two the same (Gemma spells both out). Guards: `canonicalRole` + `requestCacheKey` tests in server.zig, `parseInput reads a developer item` in responses.zig.
+### pi "stalls" on Qwen: the system prompt arrived as role `developer` (#348)
+Defect: every pi request logged `jinja render failed … Unexpected message role`, fell back to the generic format and
+ended turns empty or malformed. Cause: pi sends the system prompt as role `developer` unless its config says
+otherwise, and Qwen's template raises on the role. Fix: `chat.canonicalRole` maps `developer` to `system` at the
+chat-completions and Responses parse sites; the cache-key system hash reads it too. Guard: `canonicalRole` +
+`requestCacheKey` tests, `parseInput reads a developer item`.
 
-### Hand-rolled JSON and control bytes (silent prompt-format downgrade)
-Everything fed to the C++ Jinja engine is hand-serialized JSON (`chat.serializeMessagesJson` → `appendJsonString`), and nlohmann is strict: ONE raw control byte (< 0x20) anywhere in the history makes the whole render fail. `renderChatTemplate` then silently downgrades to `fallbackFormatChat`, whose generic tags are NOT the family's trained format — for Gemma 4 the fallback's `<start_of_turn>`/`<end_of_turn>` aren't even special tokens (its template uses `<|turn>`/`<turn|>`), so the model loses its stop token and degenerates into hallucinating both sides of the conversation. Live failure 2026-06-11: gemma-4-31b via pi went insane on turn 3 because turn 2's tool result captured an interactive npm CLI's ANSI codes (`\x1b[?25l`). Rules:
-- Any string that can carry arbitrary bytes (tool results, model output echoed into history) must be escaped by a helper that `\u`-escapes ALL control chars. `appendJsonString` does this now; never add a new field with ad-hoc escaping (compare `server.zig jsonEscape`, `responses.zig jsonEscape`, `json_schema.zig writeJsonString` — all already correct).
-- The corpus test "history round-trip serialization survives any byte content" (`src/format_corpus_test.zig`) pins the invariant for every corpus entry plus hostile ANSI/control-byte tool results — new corpus entries are covered automatically.
-- A Jinja render failure logs at **warn** (`jinja render failed`), not debug. If a model suddenly emits wrong-family tags (`<start_of_turn>` from a Gemma 4, raw role names like `assistant`), suspect a silent fallback render before suspecting the model or spec-decode.
+### One control byte in history downgraded the whole prompt format
+Defect: gemma-4-31b in pi degenerated on turn 3, hallucinating both sides. Cause: a tool result carried ANSI codes;
+nlohmann rejects one raw byte < 0x20, the render failed, and `fallbackFormatChat` served tags that are not even
+special tokens for Gemma 4, so the model lost its stop token. Fix: every string reaches the template through
+`appendJsonString`, which `\u`-escapes all control bytes and replaces ill-formed UTF-8 with U+FFFD; a render failure
+logs at warn (`jinja render failed`). Guard: corpus `history round-trip serialization survives any byte content`.
+Tell: wrong-family tags in output means a silent fallback first.
 
-### A NUL byte in a message truncates the rendered prompt (empty-turn class)
-The inbound story above, one hop later. `appendJsonString` escapes 0x00 as `\u0000`, nlohmann decodes it back into a real NUL inside the rendered `std::string`, `jinja_render_chat` handed that back as a bare `char*`, and `renderChatTemplate` read it with `std.mem.span`, which stops at the first NUL. Everything after it never reached the model: the rest of that message, every later message, and the `<|im_start|>assistant\n<think>\n` header. Live failure 2026-09-08: an opencode agent ran `grep -a` over its own binary, the shell output (28 NULs) landed in a user message, and the next request logged `prompt=88113 tokens` then `88113+0 tokens streamed [stop]` — a 200 with no content, no reasoning, no tool call, so the agent's turn ended silently. Resuming the session with a new user message logged the identical `prompt=88113` (the new message sat past the cut) and the model emitted four tokens continuing the garbage fragment before the cut, then EOS. Minimal repro on a cold server: a user message `APRICOT.<NUL> … WALNUT` rendered to 11 prompt tokens and answered nothing; with U+FFFD in place of the NUL it rendered to 40 and answered `WALNUT`.
-Fix: the shim reports the rendered length and the Zig side slices `ptr[0..len]`; the byte-level tokenizer already round-trips 0x00 (`/tokenize` then `/detokenize` of `abc<NUL>def` is exact), so the model sees the byte instead of a cut prompt. Guard: the render test with a NUL mid-message asserts the text after it and the assistant header survive. Tell in a log: consecutive requests with the same `prompt=` count while the message list grows.
+### A NUL byte in a message truncated the rendered prompt
+Defect: an opencode agent grepped its own binary; the next request logged `prompt=88113` and streamed `+0` tokens, a
+200 with nothing in it, and every later turn rendered the same count. Cause: jinja decodes `\u0000` to a real NUL and
+the shim's result was read with `std.mem.span`, cutting the prompt at the first NUL. Fix: `jinja_render_chat` reports
+its length and Zig slices `ptr[0..len]`; the tokenizer round-trips 0x00. Guard: the render test with a NUL mid-message
+keeps the text after it and the assistant header. Tell: the same `prompt=` on consecutive turns.
 
-### A parameter value that spells the dialect's own close tags (empty-file class)
-Qwen 3.5+/3.8 tool calls are `<function=NAME>` + `<parameter=K>...</parameter>` inside `<tool_call>`. Three scans took the FIRST occurrence of a close tag: the value end (`</parameter>`), the function end (`</function>`) and the wrapper end (`</tool_call>`). A model writing a file that documents this very format put those strings in a `content` value, and the parser emptied the value (an empty file written and reported as success), dropped the required parameter (the `orelse break` left the loop), or cut the wrapper short. Two neighbours shipped in the same sweep: the truncated-call branch ran the balanced-JSON arm before the `<function=` guard the closed branch already had, so a `write_file` cut mid-`package.json` came back named after the package; and `isJsonLiteral` typed values by `parseFloat` (`0755`, `Infinity`, `.5`), spliced the spelling unquoted, and the repair net then answered the unparseable object with `{}`, path included. Fix: `hermesValueEnd` = the LAST `</parameter>` before the next `<parameter=` opener, `hermesParamSpanEnclosing` skips values while scanning for the outer close tags, the `<function=` guard is hoisted above the truncation arm, and `isJsonNumber` is JSON's grammar. Guards: the hostile-value corpus loop now asserts BYTE equality on `args.content`, plus named corpus entries and parser unit tests. Related: `appendJsonString` now replaces ill-formed UTF-8 with U+FFFD, because nlohmann rejects it exactly as it rejects a raw control byte and the failure was the same silent `fallbackFormatChat`.
+### A `chat_template` can be a pointer to the sidecar file (#169)
+Defect: Laguna answered in Gemma markers with its reasoning in content. Cause: transformers ≥ 5 writes `{% include
+'chat_template.jinja' %}` as the `tokenizer_config.json` value; we read that first, jinja.cpp has no `include`, and
+the render fell back. Fix: `isIncludeStub` reads an include-only value as "no inline template" so the sidecar loads; a
+template with an include AND other text is left to fail by name. Guard: the include-stub cases in `chat_template
+accepts HF's list-of-named-templates shape`. Grep the log for `jinja` before touching the arch.
 
-### Mangled tool-call argument JSON drops the whole call (small-model big-file escaping)
-The OUTBOUND mirror of the inbound gotcha above: when a model emits a tool call, its `arguments` are hand-written JSON the model has to escape itself, and `std.json` (in `tryParseJsonToolCall`/`parseGemma4ToolCall`) is strict. A weak model writing a large file in one shot routinely mangles the `content` string two ways — (1) **raw control bytes**, literal newlines/tabs instead of `\n`/`\t` (the dominant case: code/HTML is full of newlines); (2) **unescaped inner double-quotes** (`<meta charset="UTF-8">`) and invalid backslash escapes (Windows paths, regex `\d`). Strict parse rejects the whole blob, so PRE-FIX the entire `writeFile` call was DROPPED and the file leaked into visible content — wasting the turn. Symptom signature: a writeFile/editFile that "didn't fire", the file content appearing as the assistant's chat text, and (app-side) a `SALVAGED_PATH` log with empty content. Fix: `looseRepairToolCallJson` (`src/chat.zig`) — a position-aware tolerant re-serializer in the parse-failure chain that re-escapes control bytes + inner quotes (a `"` closes a string only at a structural delimiter: `:` after a key, `,`/`}`/`]`/end after a value) and doubles invalid backslashes. It runs ONLY after strict parse fails and the result is re-validated by a strict re-parse, so valid JSON is untouched and a mis-recovery yielding invalid JSON is discarded (residual risk: a value string closed early on pathological literal `"}`/`",` content — still beats dropping the call). It does NOT handle truncation (that stays with `completeUnbalancedJsonObject`). Because `parseToolCalls` is the single chokepoint the server re-serializes from (`server.zig` `jsonEscape(tc.arguments)`), this one fix covers all four HTTP surfaces, streaming + non-streaming, every client. This is the model-agnostic answer to "the model fails the tool call due to escaping" — invisible to the model, helps 1B models enormously, leaves 100B models' valid JSON alone (a system-prompt writeFile-vs-heredoc steer fixes neither, and heredoc is the MORE fragile encoding since it double-escapes through shell + JSON). Guarded by the `parseToolCalls recovers …` instance tests in `chat.zig`, the "Small-model big-file escaping recovery" corpus section + the universal valid-JSON-args invariant in `src/format_corpus_test.zig` (red on revert: call → null → "expected a tool call, got none"), and this gotcha.
+### Templates that raise on our own extra-context values (Inkling, Qwen3.8)
+Defect: 100% of Qwen3.8 requests and many Inkling requests rendered the generic fallback; Qwen3.8's fallback is
+ChatML, so nothing looked wrong except a model that had never heard of the declared tools. Cause: Inkling maps
+`reasoning_effort` through its own table and raises on hy3's `"no_think"`, raises on string `arguments`, and needed
+`tojson(sort_keys=true)`; Qwen3.8 raises on any effort outside `xhigh|medium|low` and (the 2.4T release, not the 27B)
+on thinking-off. Fix: `sort_keys` in jinja.cpp; `serializeExtraContext` sniffs the family (`Thinking effort level`,
+the `'xhigh'` literal) and maps the effort (`qwen38EffortFor`); `enable_thinking:false` is withheld only where the
+template carries the refusal string, and `noThinkTailSuffix` closes the opened `<think>`; history calls carry `"id"`
+so results are named. Guard: hermetic real-template render tests over `src/fixtures/inkling_chat_template.jinja`,
+`qwen38_chat_template.jinja` and `qwen38_27b_chat_template.jinja`.
 
-### Truncated tool-call OPENER is a truncation, not a ghost/malformed call (big-file write class)
-The THIRD failure in the big-file-write class (after the escaping-recovery and Gemma-dropped-delimiter gotchas above): a model dumps a whole file into ONE Hermes/XML tool call and hits the token cap *mid-content*, so the call arrives as an OPENING tag with NO close (`<tool_call><function=writeFile><parameter=content>…novel…` — no `</parameter>`/`</function>`/`</tool_call>`). Live JFK-novel capture (2026-06-20): a 19k-char `writeFile` was cut off, **silently DROPPED, and leaked into chat as text**; the app then fired the WRONG nudge ("malformed tool-call tag… call it with proper JSON" — useless, the JSON was fine, just too long), the model retried identically, and the turn died with nothing written. Two bugs, two layers:
-- **Server (`src/chat.zig` `parseToolCalls`, the `close_rel == null` branch):** it used to only try the JSON shapes (`balancedJsonObject`→`tryParseJsonToolCall`, `attr_name`). A truncated **JSON** writeFile salvaged its path; a truncated **Hermes/XML** one fell through to `break` and was dropped — a format-specific hole. Fix: in that branch, after the JSON attempts, also try `parseHermesToolCall` then `parseXmlElementToolCall` on `effective_text[content_start..]`. `parseHermesToolCall` breaks out of its parameter loop on a missing `</parameter>`, so it recovers the tool NAME with empty `{}` args (a *closed* parameter/function before EOS recovers WITH args — bonus). Recovering the NAME is enough; do **not** salvage the partial content (a half-written file is worse than a re-issued chunked write — the user explicitly rejected fragmentary writes).
-- **App (`ChatTurnEngine.runAgentLoop`):** the existing truncation path is gated on `!receivedToolCalls.isEmpty`, so a *dropped* call (empty calls + `maxTokensHit`) never reached it and fell to the ghost path. Fix: before the `looksLikeGhostToolCall` block, route `maxTokensHit && receivedToolCalls.isEmpty && hasUnclosedToolCallOpener(content)` to the truncation nudge (`allowTruncationRetry()`, budget 2, the shared `truncatedToolCallNudge` = chunk + `append:"true"`), not the ghost nudge (budget 1, "use proper JSON"). `hasUnclosedToolCallOpener` = opener present with no matching close (`<function=`→`</function>`, `<tool_call>`→`</tool_call>`, `<|tool_call>`→`<tool_call|>`). This is defense-in-depth — with the server fix the truncated Hermes call now PARSES (so it takes the existing `!isEmpty` truncation path), but a future format that escapes the parser still gets the right nudge.
-- Guarded by the `parseToolCalls recovers truncated <function=…>` / `recovers EOS-before-close-tag` instance tests (`chat.zig`), the "Truncated tool-call OPENER recovery" corpus section + the universal no-tag-leak invariant (`src/format_corpus_test.zig`, red on revert: call → null → "expected a tool call, got none"), and `ChatTurnEngineTruncationTests` (Swift). **Caveat:** the model-compliance gap (it *says* it'll chunk, then one-shots the whole file anyway) is only *mitigated* (right nudge + budget line), not solved — a hard server-side "single tool-call content exceeds remaining budget" guard is the heavier lever if it recurs.
+### Late system messages were folded ahead of cached history
+Defect: Claude Code's runtime reminders arrive as late system messages; folding them to the front invalidated almost
+all RAM/SSD prefix reuse every tool round. Cause: unconditional folding, because strict templates reject late system
+turns. Fix: parsers merge only the leading run; the renderer probes each late-system boundary with the request's tools
+and kwargs (`templatePreservesMidSystem`) and folds only where the template raises, drops or reorders; byte-pinned
+Qwen revisions render later ChatML system turns. Guard: `mid-system:` tests, the corpus late-note invariant,
+`tests/test_mid_system_cache.sh`.
 
-### Hy3 tool call with a dropped `<tool_sep>` + mangled key-close leaks/loses args (weak-model delimiter-drop class)
-Hunyuan 3's native tool format is `<tool_call:opensource>NAME<tool_sep:opensource><arg_key:opensource>K</arg_key:opensource><arg_value:opensource>V</arg_value:opensource>…</tool_call:opensource>` (parsed by `parseHy3ToolCalls` in `src/chat.zig`). A weak/heavily-pruned model mangles it two ways at once — RAW capture 2026-07-16 (`pipenetwork/Hy3-REAP62`, via `MLX_SERVE_RAW_DUMP_FILE` on a live server): `<tool_call:opensource>bash</arg_value:opensource>\n<arg_key:opensource>command</arg_value:opensource>\n<arg_value:opensource>ls -la</arg_value:opensource></tool_call:opensource>` — it (1) DROPS `<tool_sep>` (closes the NAME with `</arg_value>`) and (2) closes the arg KEY block with `</arg_value>` instead of `</arg_key>`. The VALUE block and the key/value CONTENT are correct. The old parser keyed the NAME on `<tool_sep>` and **bailed entirely when absent**, so the whole call leaked as content (`finish_reason=stop`) → pi saw `bash({})` → "command required" → infinite retry loop (the model emits the format CORRECTLY on most turns — the server log shows many `[tool_calls]` finishes — so this is degraded adherence on SOME turns, the concrete cost of 62%-expert REAP pruning; the full `Hy3-oQ2e`/ox-ox builds are reliable). Fix, in two parts: (1) the name ends at the earliest of `<tool_sep`/`<arg_key`/`<arg_value`/`</tool_call`/`</arg_key`/`</arg_value` (`earliestIndexOfAny`), recovering it without `<tool_sep>`; (2) the arg loop runs whether or not a valid `<tool_sep>` was consumed, SCANS to the next `<arg_key>` (bounded by `</tool_call>`, so the stray name-close tag is skipped), and matches the KEY block's close TOLERANTLY (`</arg_key>` OR `</arg_value>`). The corruption is small and regular, so the FULL call recovers — `{"command":"ls -la"}`, live-verified end-to-end (client receives the command, not `{}`). The good-format path is byte-unchanged (its `<tool_sep>` is consumed, `<arg_key>` is found immediately, `</arg_key>` is the earliest close). Rule: a tag-format tool parser must never bail the whole call on ONE missing/mismatched delimiter — recover from the next structural marker and match closes tolerantly. Guarded by `parseToolCalls hy3: dropped <tool_sep> + mangled key-close still recovers name AND args` (chat.zig, real captured bytes, red-on-revert: call → null → `.?` panic; asserts `command == "ls -la"`), all four existing hy3 tool tests, and the corpus/traffic-replay invariants.
+### A transcribed template's whitespace is a token-level contract (DeepSeek-V4)
+Defect: our transcription of the DSV4 encoder emitted `<bos>## Tools` where the model was trained on `<bos>\n\n##
+Tools` for every no-system tools request. Cause: the separator was conditional on a system turn; the reference renders
+an empty system turn. Fix: unconditional separator; A/B the transcription against the reference over the shapes the
+server emits, converting the INPUT to each side's contract (the reference `json.loads` string arguments) and comparing
+only the output bytes. Guard: `tests/dsv4_template_ab.py` + the hermetic render test.
 
-**Variant — dropped singular `<tool_call:opensource>` opener (2026-07-16 soak, same REAP62 model, RAW capture):** the format nests a PLURAL wrapper `<tool_calls:opensource>` around one or more singular per-call `<tool_call:opensource>` openers, and `parseHy3ToolCalls` keys the call start on the SINGULAR opener (the plural wrapper explicitly falls through — it shares the `<tool_call` prefix but has `s:`/`>` where the singular has `:`). REAP sometimes emits the plural wrapper then jumps STRAIGHT to the NAME, dropping the singular opener (`<tool_calls:opensource>\nwrite_file</arg_value:opensource>\n<arg_key:opensource>path…`), so the parser found no call-start and the whole (complete, well-formed) call LEAKED as content with `finish_reason=stop`. Same weak-model delimiter-drop class as the `<tool_sep>` drop above, one delimiter over. Fix: a plural-wrapper recovery arm keyed strictly on the SUFFIXED form `<tool_calls:` (the BARE DSV4/generic `<tool_calls>` wrapper must still fall through to its own parser — gating on `suffixedTagLenAt` alone regressed 7 DSV4/XML tests because it accepts bare `<tool_calls>` too) — if a real inner `<tool_call:sfx>` opener follows, defer to it (normal path, byte-unchanged); else treat the wrapper's end as the opener. Rule reinforced: recover from the next structural marker AND never let hy3 recovery steal the bare `<tool_calls>` wrapper of another format. Guarded by `parseToolCalls hy3: dropped singular <tool_call> opener (plural wrapper only) still recovers` (chat.zig, real captured bytes incl. quote-bearing content, red-on-revert: call → null → `.?` panic) + the `LIVE: dropped singular <tool_call> opener` corpus entry (`format_corpus_test.zig`, universal no-tag-leak + valid-JSON-args invariants).
+### DeepSeek-V4.1's own template does not render in jinja.cpp
+Defect: every V4.1 request fell back (`Unexpected token: *`). Cause: `dict(schema.d, **{k: v})`, `dict(d, key=v)` and
+chained comparisons are not in jinja.cpp, and block tags differ on trailing newlines. Fix: V4.1 always renders our
+transcription of `encoding/encoding.py` (`src/fixtures/dsv41_chat_template.jinja`); the parser accepts V4.1's spaced
+DSML tag names. Guard: `tests/dsv41_template_ab.py` dumps the cases the render test replays; corpus family
+`dsv41-dsml`.
 
-### A server-side loop cut is an intentional stop: name the cause and never ship fragment values (loop-stop truncation class)
-The SIXTH failure in the big-file-write class (live 2026-07-14, pi → gemma-4-26B-A4B, plang/php.html): the model repetition-looped INSIDE a write call's `content` string ("server-side scripting language, " — a ~6-token cycle), the scheduler's degenerate-tail-loop guard (`scheduler.runSingleDecodeTick`, period ≤ 8 / 16 reps) correctly cut the generation mid-word — and then THREE downstream layers each told a small lie that compounded: the cut was **silent** (no log line — the post-mortem took log archaeology), it finished as **"stop"** (so `toolCallFinishReason` upgraded a server-cut fragment to `"tool_calls"` — a completed-looking call), and the Gemma truncation salvage shipped the **partial value** (`{"content":"<1.1 KB of loop garbage>"}`, no `path` — pi rejected on the missing required prop and echoed the garbage back into context). Symptom signature: a client "missing required property" rejection whose received args carry an obviously-degenerate, mid-word-truncated value, on a round whose token count sits far below max_tokens, with no server log line explaining the early end. Three rules, each fixed + pinned:
-- **A loop cut reports `finish_reason "stop"`, with `finish_details.type "repetition_loop"`** — it did not exhaust the requested budget, and `length` makes pi compact and retry even with most of the context free. `server.shouldParseToolCalls` suppresses parsing for this cause, so the earlier `"stop"` → `"tool_calls"` fragment bug cannot recur. Pinned by `loopStopDecision`, `shouldParseToolCalls`, and the wire test.
-- **Never cut silently** — the guard logs `[loop-stop] degenerate tail loop cut after N generated tokens`.
-- **The Gemma truncation salvage obeys the Hermes rule: fragment values never ship.** When a `<|tool_call>` call has NO `<tool_call|>` close (`parseGemma4ToolCall(…, input_truncated=true)`), any value whose scan runs to end-of-body without its terminator — unterminated `<|"|>` string, unclosed JSON `"` string, bare/rich value with no separator, missing value after `key:`, and unclosed nested containers (a partial `edits[]` is fragmentary work too) — is DROPPED via the converter's `cut` signal; completed pairs before it survive (so `{path}` without the fragment `content` steers a clean re-issue, and the dangerous path-first ordering can never write a garbage file "successfully"). With the close tag present, behavior is byte-identical (the mlx_pi1 ends-with-`}` trim and mars.html dropped-delimiter salvage are complete-call paths and unchanged). Guards: the Gemma truncation instance tests in chat.zig (php.html capture, path-first, bare-rich, edits container, no-over-drop, JSON-quoted), the "Loop-stop truncated Gemma call" corpus section + the `tool_arg_absent` assertion (`src/format_corpus_test.zig` — red on revert: "fragment arg shipped"), and `loopStopReason` (scheduler.zig).
+### jinja.cpp gaps: `x.0` and `\xHH`
+Defect: GLM-5.3 tool history and every Flint turn rendered the generic fallback (Gemma turn markers, wrong stop
+tokens). Cause: jinja.cpp parsed the `0` in `x.0` as a name, and its lexer knew no `\x` escape (Flint's
+`replace("\x00", "")` raised at lex time). Fix: an integer member access indexes like `x[0]`; `\xHH` lexes as U+00HH.
+Guard: the GLM tool-history and Flint render tests (byte-exact against jinja2), `tests/test_glm5_next.sh` [4],
+`tests/test_flint.sh` [4].
 
-### A short exact cycle is honest output far more often than a loop (2026-09-15)
-pi on Qwen3.8-Flash-Next, "make me a counter strike like 3d shooter": the model was designing a 24x24 map in its thinking and wrote a wall row `"111111111111111111111111"`. Qwen tokenizes per digit, so that is 24 identical tokens, and the exact tier (period ≤ 8, 16 reps) cut it at rep 16 as `tier=exact_cycle` — 1383 tokens of thinking, no answer, and since #327 a loop cut is `finish_reason "stop"`, so pi showed an empty turn. The rep bar was set for a 6-token phrase loop; at period 1 or 2 it is reached by a digit row, a zeroed array (`0, 0, 0, …` is period 2), a separator line. Fix: the exact tier also demands `degenerate_loop_min_span` (128) tokens of cycling before it convicts (`exactCyclePeriod` takes the span; the long tier passes 0). A real single-token loop still dies within 128 tokens, ~2 s. Guard: `degenerateTail: a short exact cycle convicts only past the minimum span` (generate.zig).
+### A generic role header rewrote tool results into user turns (MiMo)
+Defect: MiMo-V2.6 got every tool result as a `<tool_response>` user turn. Cause: its template renders `<|im_start|>{{
+message.role }}` and never spells `'tool'`; the literal check read that as no tool role. Fix: a template that renders
+assistant `tool_calls` but names no tool role is probe-rendered with one tool message (`templateRendersToolTurn`).
+Guard: `renderChatTemplate: a tool-aware template with a generic role header renders tool turns natively`.
 
-### A file of identical rows is a loop by every content measure, so the loop tiers convict on SPAN 
-pi on Qwen3.8-Flash-Next, same shooter session as the exact-cycle story above, one turn later: the model started a tool call rewriting `maps.js` with five 24x19 tile maps of `0`/`1`. On a per-digit tokenizer that window has six distinct tokens and sixteen possible interior 4-grams, so the near-repeat tier's three ratios all read "loop" by construction and it cut at exactly window fill, 1024 tokens into the call. Loop-stop suppresses tool parsing and unparsed markup never ships, so pi received `finish_reason "stop"` with no text and no call and ended the turn; the session log holds only the thinking block. A first fix added a fourth measure (8-gram novelty, which a two-symbol alphabet cannot saturate) and it passed a random-grid fixture; live on the 27B it failed in both directions: the model's maps are rows of `100000000000000000000001` nearly throughout, zero novelty at any gram length, and two of three seeds were then cut by the LONG exact tier instead (ten identical rows = a 28-token cycle at 10 reps). No content measure separates that file from a loop. What the file does, and a loop never does, is end: the near-repeat tier now convicts only past a 4096-token degenerate span (`near_repeat_min_span`, measured by the trim walk-back) and the long exact tier past 1024 (`degenerate_loop_long_min_span`: 37 identical map rows, or a 58-token sentence 18 times). Cost: a real restatement loop runs ~50 s and a sentence loop ~13 s before the cut, against destroying a finished file. Live: 5/5 seeds on the 27B now deliver the full tool call (2.8-3k tokens), 0 loop-stops; `tests/test_loop_stop_signal.sh` 15/15. Guard: `degenerateTail acquits a low-entropy STRUCTURED file that ends inside the span bar` (generate.zig: random bit grid, the lazy map, a hex dump). Left alone: a loop cut inside a buffered tool call still delivers nothing, by the #327 design.
+## Parsing tool calls
 
-### Late system messages must not be moved ahead of cached history
-Claude Code appends runtime reminders and hook output as system-role messages.
-Unconditional folding moved each new note before the conversation, invalidating
-nearly all RAM/SSD prefix reuse on every tool round even when the template
-could render the note in place. Strict templates still reject late system turns;
-letting those reach the generic fallback can duplicate the tool catalog.
-Parsers now merge only adjacent leading instructions. The renderer probes each
-late-system boundary with the request's tools and kwargs, checking both tail
-and historical positions. Only byte-pinned Qwen template revisions extend the
-strict system branch to emit later ChatML system turns; native tool, reasoning
-and media bytes are parity-tested. Unknown revisions keep their native contract.
-Templates that raise, drop or reorder notes consolidate; supported templates
-preserve order and system role.
-Responses instruction replacement removes only leading instructions, retaining
-historical notes. Guards: `mid-system:` tests, the cross-family late-note corpus
-invariant, and `tests/test_mid_system_cache.sh` tool rounds plus disk restart.
+### Mangled argument JSON dropped the whole call (big-file escaping)
+Defect: a weak model writing a big file put raw newlines and unescaped quotes in `content`; strict parse failed, the
+call was dropped and the file leaked into chat. Fix: `looseRepairToolCallJson` re-escapes control bytes, inner quotes
+(a `"` closes a string only at a structural delimiter) and bad backslashes, runs only after strict parse fails, and is
+re-validated by a strict parse. Guard: `parseToolCalls recovers …` tests, corpus "Small-model big-file escaping
+recovery" + the valid-JSON-args invariant.
 
-### Tool-arg types must come from the SCHEMA, never from the value's spelling (strict-client rejection class)
-The tag tool formats carry no type information — `<parameter=replace_all>False</parameter>`, Gemma's `key:false` — so the parsers inferred the JSON type from the value's BYTES (`chat.isJsonLiteral`, used by `parseHermesToolCall` + `convertGemma4Value`; `parseXmlElementToolCall` was worse and typed *everything* as a string). That guess is wrong in **both** directions, and strict clients (Claude Code, pi, opencode) reject both:
-- **String where a boolean belongs.** `isJsonLiteral` only knew lowercase `true`/`false`/`null`, so Python's `False` fell through to `appendJsonString` and shipped as `"replace_all":"False"`. Live 2026-07-09 (Qwen3.6-35B-A3B-Claude-4.7-Opus-Distilled via Claude Code, `~/.mlx-serve/logs/mlx-serve-11234.log:109471`): every `Edit` died on `InputValidationError: The parameter 'replace_all' type is expected as 'boolean' but provided as 'string'`. The model **cannot see its own serialized request**, so it burned six rounds "fixing" a value that was already correct, then abandoned `Edit` and rewrote whole files. Symptom signature: a client type-validation error naming a parameter the model demonstrably sent correctly, plus reasoning that spirals into "maybe there's a quoting issue in how I'm constructing the request".
-- **Boolean/number where a string belongs.** The inverse: `<parameter=old_string>false</parameter>` (or `42`) — a code edit whose *content* spells a JSON literal — was promoted to a real bool/number → "expected string, provided boolean".
-The schema is the only disambiguator, and it is already threaded to every parse site as `tools_json`. Fix: `chat.coerceToolArgsToSchema` runs after every parse, coercing SCALARS both ways per the declared `type` (tolerant boolean spellings `False`/`0`/`yes`/`true,` mirroring the app's `appendFlagIsTrue`); an undecidable value is left alone so the client's validation error stays honest, and a call that needs no coercion is byte-unchanged. All five HTTP surfaces go through the ONE chokepoint `server.parseToolCallsForRequest` (parse → bare-JSON inference → coerce) — **never call `chat_mod.parseToolCalls` directly from a handler**, or that surface silently regresses alone (the drafter-dispatch-hole lesson: output-equality tests cannot see it). **Escape hatch:** `--no-tool-autocorrect` (`server.g_tool_autocorrect = false`) gates ONLY the coercion at that chokepoint — args then pass through as the model emitted them. The parse-repair + valid-JSON safety net (below) always run, so this can never make args invalid; it only re-exposes the mistyped-value class to strict clients. Guard: `parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim` (server.zig). Guards: `coerceToolArgsToSchema` instance tests in `chat.zig` (verbatim captured bytes, both directions, pass-through cases) + the **universal declared-type invariant** in `src/format_corpus_test.zig` — any corpus entry that supplies a `tools_json` is auto-checked via `chat.toolCallConformsToSchema`, so new families are covered for free (red on revert: `tool argument type contradicts the declared schema … {"replace_all":"False",…}`).
-- **A parameter value's own whitespace is PAYLOAD; only the template's framing may be removed** (same function, different bug — FIXED). `parseHermesToolCall` trimmed twice: `std.mem.trim(u8, p_val, "\n")` on the raw span and then `std.mem.trim(u8, p_val, " ")` on every value. The Hermes/Qwen template renders `<parameter=NAME>\nVALUE\n</parameter>` — EXACTLY one newline per side, pinned by the Qwen3.8 render test — so both trims over-reached, and an `old_string`/`new_string` lost its leading indentation. The tools that use this format declare the needle must match "exactly, including indentation": the edit then either failed outright, or — the silent half — matched a DIFFERENT, un-indented occurrence of the same line and wrote the replacement at the wrong nesting, which reads as a model mistake in the diff. Trailing whitespace is payload too (a `new_string` ending in the two spaces of a markdown hard line break, a `content` continuing a line). Symptom signature: an Edit that a strict client accepts and applies, whose result is correct text at the wrong indent level — or a "string not found" on a needle the model demonstrably copied out of the file. **Fix:** `chat.stripHermesValueFraming` removes at most ONE leading and ONE trailing newline (a `\r\n` pair as one unit), and nothing else; the value then ships verbatim through `appendJsonString`. The space-trim survives only as the input to the `isJsonLiteral` PROBE — whitespace around a number/boolean/null carries no meaning, so `<parameter=limit> 5 </parameter>` still emits JSON `5` while a string keeps its bytes. Guards (red on revert): the three `parseHermesToolCall` whitespace tests in chat.zig (indentation + trailing spaces, a value with its own blank first/last line, the padded-scalar control that must stay green BOTH ways, plus the CRLF pair), and the two `old_string`/`new_string` assertions added to the live 2026-07-09 `coerceToolArgsToSchema` capture — whose `old_string` was two-space-indented HTML all along, with nothing asserting it.
+### A truncated opener is a truncation, not a ghost call
+Defect: a 19k-char `writeFile` cut by `max_tokens` inside a Hermes call was dropped and leaked as text; the app sent
+the "malformed tag" nudge and the model retried the same one-shot write. Cause: the `close_rel == null` branch tried
+only the JSON shapes. Fix: the truncated branch also runs the XML-function and element parsers, recovering NAME +
+`{}`; partial values never ship (a half-written file is worse than a re-issued chunked write); the app routes
+`maxTokensHit` + an unclosed opener to the truncation nudge. Guard: `recovers truncated <function=…>`, corpus
+"Truncated tool-call OPENER recovery", `ChatTurnEngineTruncationTests`.
 
-### A required tool arg the model BURIED in a container is misplaced, not malformed (buried-param class)
-The sibling of the schema-coercion class above, and the reason it needs its own fix: the args are **valid JSON with correctly-typed values** — nothing to repair, nothing to coerce — they are simply in the wrong PLACE, which only the schema knows. A weak model that has internalized "the edit object holds everything about the edit" writes the required top-level `path` INSIDE each `edits[]` item:
-```json
-{"edits":[{"newText":"…","oldText":"…","path":"us_presidents/generate_site.sh"}]}
-```
-Live 2026-07-13 (pi, gemma-4-26B-A4B-it-qat-4bit): pi answered `Validation failed for tool "edit": - path: must have required properties path` three times; each rejection cost a full multi-thousand-token generation, and the model — which **cannot see its own serialized request** — re-emitted the identical call, then abandoned `edit` entirely and rewrote the whole file with `write`. Symptom signature: a client "missing required property X" error where X *is* present in the args, one level down inside a container; identical retries; eventual fallback from a surgical tool to a whole-file rewrite. **The parse layer is innocent here and you will waste time there** — `convertGemma4Object`/`convertGemma4Array` are a structural walk that preserves the model's own nesting and key order, and `coerceToolArgsToSchema` only rewrites values in place; nothing in the pipeline can relocate a key. Pristine, correctly-escaped args are the tell that no repair path fired.
-- Fix: `chat.hoistMisplacedRequiredParams`, run at the ONE chokepoint `server.parseToolCallsForRequest` BEFORE coercion (so the lifted value is type-checked like any other top-level arg) and gated by `--no-tool-autocorrect` (it corrects the MODEL's output — unlike `filterInferredBySchema`, which corrects OUR heuristic and is deliberately ungated).
-- Every condition is READ OFF THE SCHEMA, never guessed: the param is declared REQUIRED at top level and ABSENT there; it is declared a SCALAR (hoisting a container is too speculative); it sits in a DECLARED container arg whose item schema does NOT declare it (`containerItemDeclares` — a multi-file edit tool whose items legitimately carry their own `path` must never have it stripped out, which would DESTROY data rather than repair it); and every object in that container carries it with the SAME value and the declared type. **Any ambiguity — items disagreeing, two containers offering different values, a wrong-typed value — leaves the call untouched so the client's validation error stays honest.** A compliant call never re-serializes (verified: the hoist fires on 0 of the 4,480 real captured calls in the replay corpus).
-- Guards: verbatim-captured-args + Gemma-parse-path + four over-reach tests in chat.zig, the chokepoint/escape-hatch test in server.zig, and the **universal buried-param invariant** in `src/format_corpus_test.zig` (`chat.requiredParamIsBuried` — every entry with a `tools_json` is checked automatically, so a future family producing this shape is covered for free). Red-on-revert verified at all three layers.
+### The Hermes JSON arm had no truncation salvage
+Defect: a 4.4 KB qwen4_exp `edit` that hit EOS inside a string came back as an empty `stop`. Cause: only the
+balanced-object case was handled, and the stream flush cut the text at `<tool_call>`. Fix: `truncatedJsonCallName`
+finds a depth-1 `"name"` with a complete string value and ships NAME + `{}`. Shipping the raw buffer as content
+re-opens the leak class and is not the fix. Guard: `<tool_call>{JSON} truncated mid-string recovers NAME + {}`.
 
-### The tool-call parse+coerce layer has HARD invariants; a replay harness pins them against real traffic
-An 8-hour agentic soak (`claude -p`/`pi`/`opencode` × every local arch, 2026-07-09) surfaced FIVE more parse-robustness bugs beyond the schema-coercion one above — all in `parseHermesToolCall`, all triggered by weak models (0.5–4B) mangling the Hermes `<function=…>/<parameter=…>` form, all caught by replaying captured traffic through the real parse path. The invariants the layer must NEVER break, and how each bug violated one:
-- **Emitted `arguments` are always valid JSON** (a client parses them). Violated two ways: a malformed `<parameter=limit=1` tag (no closing `>`) made the `>`-scan spill the "name" across a newline into `</parameter`, and the raw (unescaped) name interpolation produced invalid JSON — fix: `isPlausibleParamName` skips the malformed opener (recovering the well-formed sibling param) + the name is `appendJsonString`-escaped. And a repeated `<parameter=edits>` produced a DUPLICATE JSON key, which `std.json` rejects with `error.DuplicateField` — fix: dedup parameter names (first wins). **The Gemma `call:name{…}` converter (`convertGemma4Object`) had the SAME two bugs** — raw-interpolated keys + no dedup — fixed the same way (escape the key via `appendJsonString`, dedup by rolling back `result` on a repeat while still consuming the value). The class is now CLOSED across all three tag-format converters: Hermes + Gemma fixed, DSV4 `parseXmlElementToolCall` already immune (it builds args via `ObjectMap.put` + `Stringify`, which dedups + escapes — pinned by a characterization test). Any NEW tag-format converter must either build through `ObjectMap`/`Stringify` or escape+dedup by hand.
-- **A bare `<function=…>` with the opening `<tool_call>` DROPPED must still parse.** The outer scan triggers on the substring `<tool`, which a lone `<function=Write>…</function></tool_call>` never provides (`</tool_call>` is `</too…`, not `<tool`) — so the whole Write leaked as visible text. Fix: a fallback that runs `parseHermesToolCall` on the whole text when a `<function=` opener AND a `<parameter=` are both present (so prose mentioning the tag can't false-fire).
-- **Coercion never makes conformance WORSE and repairs what's safely fixable.** A container-typed arg (`edits` array) the model mangled with a missing comma stayed a string under strict parse; `looseRepairContainer` (the array-aware sibling of `looseRepairToolCallJson`) re-serializes it tolerantly, re-validated by a strict parse so a mis-repair is discarded.
-- **Genuinely-broken model output is left HONEST, never fabricated.** An unbalanced/nested `edits` array or a `<tool_call>{invalid json}</tool_call>` from a 0.6B model that no tolerant repair can recover stays a string / stays unparsed — the client gets an honest type error and retries, which beats inventing data. These are counted, not failed.
-- **Final safety net (structural, not per-converter):** `parseToolCalls` ends with a pass that strict-parses EVERY built call's arguments; if invalid, it runs `looseRepairToolCallJson` (re-escapes lone backslashes / control bytes / inner quotes), and if THAT still fails, falls back to `{}` (keeping the tool name — a client can retry a named call, but cannot parse invalid JSON at all). This makes "emitted args are always valid JSON" a property of `parseToolCalls` itself, so a pathological value a direct-construction converter copies verbatim (found live: a Gemma JSON-style string with a bad escape `\q` → `{"path":"a\qb"}`) can never reach a client. Any new converter is covered for free. Guard: `parseToolCalls: NO path emits invalid JSON args` (chat.zig) + the replay R1 invariant.
-- Harness: `src/tool_traffic_replay_test.zig` replays `src/fixtures/tool_traffic.jsonl` (real `(tools schema, raw output)` pairs) through parse+coerce and asserts the HARD invariants (valid JSON, no-regression, byte-identical no-op on conforming calls, idempotence, no think/delimiter-tag leak); soft signals (broken-JSON non-conformance, unparseable-wrapper display leaks) are reported, not failed. Grow it by pointing `MLX_SERVE_RAW_DUMP_FILE=<path>` at the server (framed dump written by `server.appendRawToolDump` — schema + raw TOGETHER, because the 16 KB debug-log line cap makes scraping bodies unsound), driving agents, then `tests/harvest_tool_traffic.py --dump <path> --out src/fixtures/tool_traffic.jsonl`. Plus a deterministic fuzz (`fuzz: a conforming tool call round-trips…` in chat.zig) that generates 400 conforming calls whose values deliberately SPELL other JSON types and asserts byte-identity through parse+coerce.
+### Weak models drop one delimiter (Hy3 REAP)
+Defect: `pipenetwork/Hy3-REAP62` closed the NAME with `</arg_value>` (no `<tool_sep>`), closed keys with
+`</arg_value>`, or skipped the singular `<tool_call:opensource>` after the plural wrapper; the call leaked and pi
+looped on `bash({})`. Fix: the name ends at the earliest structural marker, the arg loop scans to the next `<arg_key>`
+and accepts either close; a plural-wrapper arm keys strictly on the SUFFIXED `<tool_calls:` so the bare DSV4
+`<tool_calls>` wrapper still reaches its own parser. Guard: the two hy3 capture tests in `host/chat/chat.zig` +
+corpus.
+
+### A doubled key opener kept markup in the key (Flint)
+Defect: Claude Code got the argument key `<arg_key>file_path` and rejected the `Edit`. Cause: the GLM pair loop took
+everything between the first opener and the close. Fix: the key starts after the LAST opener before its close. Guard:
+corpus family `flint`; universal invariant: no argument key carries a line break or markup.
 
 ### A dropped `>` after the function name became the name (#748)
-`<function=read_file` with no `>`, then `</parameter>`: `parseHermesToolCall` took everything up to the first `>` as the name, so the call shipped as `read_file\n</parameter` (explicit tag calls skip the declared-tool filter). The streamed `/v1/chat/completions` delta formatted that name raw, so the chunk was invalid JSON and its line feed split the SSE `data:` line; the other three emitters escaped it. Fix: a name ends at `>`, a newline or `<` (the body starts there when the `>` is missing), and the stream delta goes through `server.streamToolCallDelta`, which escapes both strings. Guards: the corpus invariant that a name carries no line break or markup, plus `streamed tool-call delta escapes the name and arguments`.
+Defect: `<function=read_file` with no `>` shipped the name `read_file\n</parameter`; the streamed chat delta was
+invalid JSON and its newline split the SSE line. Fix: a name ends at `>`, a newline or `<`; the stream delta goes
+through `server.streamToolCallDelta`, escaping both strings. Guard: corpus invariant (no line break or markup in a
+name), `streamed tool-call delta escapes the name and arguments`.
+
+### A parameter value decided the call (Qwen `<function=` dialect)
+Defect: pi on Qwen3.6-27B kept calling tools named `pi-lfm`, then `voxel-pagoda-garden`. Cause: the template-mandated
+`<function=write>` call rides inside `<tool_call>`, and the JSON arm ran first: it took the package.json being written
+as a flat call and promoted its `"name"`. Fix: a body carrying `<function=` is parsed by the function-tag arm FIRST. A
+value is arbitrary bytes and never decides the call. Guard: "qwen xml: the live `<function=…>` capture (package.json
+class)" + corpus entry.
+
+### A parameter value that spells the dialect's own close tags
+Defect: a model writing a file that documents the Qwen tool format got an empty file (reported as success), a dropped
+required parameter, or a call cut short. Cause: the value end, `</function>` and `</tool_call>` scans each took the
+FIRST occurrence; the truncated branch ran the JSON arm before the `<function=` guard; `isJsonLiteral` typed
+`0755`/`Infinity` via `parseFloat`. Fix: `hermesValueEnd` = the LAST `</parameter>` before the next opener,
+`hermesParamSpanEnclosing` skips values when scanning for outer closes, the guard is hoisted, `isJsonNumber` is JSON's
+grammar. Guard: hostile-value corpus loop asserting byte equality on `args.content`.
+
+### A Hermes value keeps its own whitespace
+Defect: `Edit` calls matched the wrong, un-indented occurrence or failed "string not found". Cause:
+`parseHermesToolCall` trimmed all newlines and spaces; the template frames a value with exactly one newline per side.
+Fix: `stripHermesValueFraming` removes at most one leading and one trailing newline (CRLF as one); the space trim
+survives only for the literal probe (` 5 ` still emits `5`). Guard: the three whitespace tests and the `old_string`
+assertions on the live capture.
+
+### Gemma dropped its `<|"|>` opener on big content
+Defect: gemma-4-e4b writing an HTML page dropped the opening `<|"|>`; the bare-value scan cut `content` at the first
+`,` in the markup and shredded the rest into keys. Fix: a rich bare value (newline or `<`) runs to the confirmed
+closing `<|"|>` (followed by `,`/`}`/`]`), else at top level to the final `}`. Guard: `Gemma 4 dropped … delimiter`
+tests + corpus entry, found by `tests/test_tool_matrix_small.sh`.
+
+### MiniCPM5 attribute XML, and a hand-written prefix ladder missing a rung
+Defect: a MiniCPM5 call streamed a `<funct` fragment as content, then arrived again as a structured call. Cause: the
+stream gate's `tail_prefixes` ladder for `<function` omitted `<funct`, and its unit test was a second copy of the same
+list. Fix: `parseMiniCpm5ToolCalls` (CDATA-aware, dedups first-wins, truncation keeps complete pairs); the ladder test
+is DERIVED by slicing the marker; the gate defers to the parser (`functionOpenerHoldsForTools`) so it stays a strict
+superset. Guard: `EVERY growing prefix of <function holds`, `the gate is a strict SUPERSET of parseMiniCpm5ToolCalls`,
+corpus `no flush boundary lands inside a tool-call opener, any family`.
+
+### Qwen3.8 Flash Next wrote Claude's tool markup (#928)
+Defect: long pi sessions got a complete `<invoke name="bash">…</invoke>` block as content with `stop`, and the agent
+ended. Cause: the checkpoint samples Claude's dialect; no parser, gate or scrubber knew a bare `<invoke`. Fix:
+`BARE_INVOKE` (ATEM's grammar without the namespace) parses after every native dialect as `.inferred`; the gate holds
+`<function_calls>` / `<invoke …` prefixes; `bareInvokeMarkupCut` cuts only beside `<parameter ` or `</invoke>`. Guard:
+corpus family `qwen4_exp`, the prose and in-value negative tests.
+
+### LFM2.5's pythonic call grammar
+Defect: LFM2.5 tool requests came back empty. Cause: `<|tool_call_start|>[get_weather(city='Paris',
+metric=True)]<|tool_call_end|>` matched no parser, and the leak trim cut it. Fix: `pythonicLiteral` parses Python
+literals (types live in the spelling) through one quote- and depth-aware scanner; the marker is unique, so the arm is
+additive; truncation ships NAME + `{}`. Guard: pythonic parse tests + corpus.
+
+### Inkling: single-token message markers and a self-reinforcing name loop
+Defect: Inkling's first real pi session streamed the whole call as content, then pi's "Tool <|content_text|>bash not
+found" taught the model to emit that name itself; back-to-back calls merged into one `{}`. Cause: the stream gate did
+not know the invoke marker; the salvage name included a marker; the body scan ran to the next end tag; Inkling ships
+no `generation_config.json`, so pi ran at 1.0/1.0. Fix: buffer on the invoke marker and hold bare identifier segments;
+NAME = the trailing identifier run (`inklingTrailingNameRun`), never `<|`; body = the balanced object;
+`applyFamilySamplingDefaults` top_p 0.95. Guard: four capture corpus entries, the no-`<|`-in-NAME invariant, the
+stream replay. A format validated by curl has not met an agent.
+
+### A duplicated key defeated container coercion (#402)
+Defect: Qwen Code's `questions` array arrived as a string: `Parameter "questions" must be an array`. Cause: std.json
+rejects duplicate keys and the tolerant emitter kept the repeat. Fix: `parseContainerAllowingRepeats` accepts the
+document only when first-wins and last-wins parses agree. Guard: the identical-vs-conflicting duplicate test.
+
+## The parse chokepoint and its invariants
+
+### Types come from the schema, never the value's spelling
+Defect: Claude Code rejected every `Edit` with `replace_all` "expected boolean, provided string" (Python's `False`),
+and the inverse promoted an `old_string` of `false` to a boolean. The model cannot see its serialized request, so it
+burned rounds "fixing" a correct value. Fix: `coerceToolArgsToSchema` runs after every parse at the ONE chokepoint
+`server.parseToolCallsForRequest`, coercing both ways by the declared type; undecidable values stay as sent;
+`--no-tool-autocorrect` gates only the coercion and hoist. Guard: coercion tests on captured bytes + the corpus
+declared-type invariant (`toolCallConformsToSchema`).
+
+### A required argument buried in a container is misplaced, not malformed
+Defect: Gemma wrote the required `path` inside each `edits[]` item; pi refused three times and the model fell back to
+rewriting the whole file. Pristine args are the tell that the parse layer is innocent. Fix:
+`hoistMisplacedRequiredParams` lifts a required scalar only when every schema condition holds (absent at top level,
+declared container whose items do not declare it, every item agrees on value and type); any ambiguity leaves the call
+alone. Guard: chat tests, the chokepoint test, the corpus buried-param invariant.
+
+### A heuristically inferred call must name a declared tool
+Defect: a truncated data script produced a call named "George Washington"; pi answered "tool not found" and the model
+retried the same 16K-token write. Cause: the raw-JSON fallback accepts any object with a string `"name"`. Fix: such
+calls are `.inferred` and `filterInferredBySchema` drops undeclared names (ungated: it corrects our heuristic);
+explicit tag calls are never filtered. Guard: the chokepoint tests and corpus "Hallucinated raw-JSON tool calls".
+
+### The parse layer's hard invariants, pinned by real traffic
+Defect: an 8-hour agent soak found five more weak-model parse bugs: a malformed `<parameter=limit=1` spilled a name
+across lines, a repeated parameter made a duplicate key (std.json rejects it), a bare `<function=` with the wrapper
+dropped leaked, a mangled container stayed a string. Fix: escape and dedup every name in every converter (Hermes,
+Gemma; element dialect builds through `Stringify`); a bare `<function=` + `<parameter=` fallback;
+`looseRepairContainer`; a final net in `parseToolCalls` that repairs or falls back to `{}`, so emitted args are always
+valid JSON; broken output stays honest. Guard: `src/host/chat/tool_traffic_replay_test.zig` over
+`src/fixtures/tool_traffic.jsonl` (grow it with `MLX_SERVE_RAW_DUMP_FILE` + `tests/harvest_tool_traffic.py`), the
+conforming-call fuzz.
+
+### `tool_choice: "required"` was advice, not a constraint
+Defect: tool-eval-bench TC-45 got text for a required call. Cause: the instruction line reached only templates that
+inline our tool prompt, and a line is advice anyway. Fix: the line reaches every template, and `armToolForce` commits
+the dialect's opener (`forcedToolOpener`) after the think block closes, closing a thought that reaches 3/4 of
+`max_tokens`; the request decodes plain. The opener stops before `=` (Qwen joins `=name` into one token) and skips the
+model's pending token when it matches. Guard: `tests/test_tool_choice_required.sh`, `ToolForce` unit tests.
+
+## Thinking and streams
+
+### `</think>` inside a tool argument destroyed the call
+Defect: a corpus entry writing a file about prompt formats lost its call. Cause: `indexOfThinkCloseTag` took the first
+valid `</think>` anywhere. Fix: `thinkCloseIsToolCallPayload`: a close is payload when the nearest preceding
+`<tool_call` opener is still open AND the block closes afterwards (each half protects a case the other breaks). Guard:
+the unit test's ordinary and edge shapes.
+
+### Think-tag leaks: a re-opened opener and trailing closer spam
+Defect: replies whose whole visible content was a bare `<|channel>thought`, `thought`, sixteen `<channel|>` closes, or
+an orphan `<tool_call|>`. Cause: the trailing strip ignored a pos-0 opener, the content-channel strip treated
+`<|channel>thought` as content, and only openers were trimmed. Fix: report pos-0 unclosed openers;
+`trimTrailingThinkClosers` loops off trailing `<channel|>`, `</think>` and `<tool_call|>`. Guard: corpus entries for
+each shape + the universal no-tag-leak invariant.
+
+### Tool markup leaked into reasoning and content (DSV4)
+Defect: a DSML call the model wrote inside its thought came back in `reasoning_content`, was round-tripped and taught
+the model its own malformed markup; a marker split across tokens and a mangled opener leaked as content. Fix:
+`trimLeakedToolMarkup` cuts at the first wrapper opener, once, in the split wrapper; the end-of-stream flush
+concatenates before cutting; `/v1/messages` non-stream cuts at emission because it parses the split text. Guard: three
+capture corpus entries + the reasoning-side markup invariant.
+
+### No `tools` = raw text on both paths
+Defect: LFM2.5 answering in its own call format with no `tools` field returned `content: ""` non-streamed but raw text
+streamed. Fix: the non-stream split keeps markup when the request has no tools, as vLLM, SGLang, llama.cpp and Ollama
+do. Guard: `tests/test_no_tools_markup_passthrough.sh`.
+
+### A template that always thinks (LFM2.5)
+Defect: LFM2.5 streamed its whole chain of thought as the answer, thinking on or off. Cause: its template renders
+`<think>` unconditionally; `streamThinkGate` keyed on `enable_thinking`, and every call site ANDed `promptOpensThink`
+with it. Fix: whether the prompt ends inside a think block is a property of the rendered bytes (`promptOpensThink`),
+passed to the gate as its own fact. Guard: `test_thinking_streaming.sh`, `test_thinking_tools.sh`,
+`test_messages_stream_thinking_tools.sh`.
+
+### `in_think_block` started from the request flag (Gemma)
+Defect: Gemma streamed `content: ''`, `reasoning: '391'` where non-stream had it right. Cause: the stream assumed the
+model starts inside a think block whenever thinking was requested; Gemma's template lets the model decide. Fix: the
+stream tail is reasoning only on positive evidence (`streamTailIsReasoning`: the prompt opened a block or the model
+emitted a real opener, `saw_think_open`). Guard: the stream/non-stream split invariant per arch. Test lesson: assert
+the server invariant and branch on the model's choice, never "the model must think".
+
+### A model that opens its own think block had no way in
+Defect: Gemma 4, LFM2.5-8B-A1B and Muse streamed their thought as the answer. Cause: the model's own opener
+(`<|channel>` + `thought`, a bare `<think>`, Muse's ` to=self<|message|>`) was swallowed by the marker skip before the
+plain arm saw it. Fix: `modelThinkOpener` latches before the marker skip; `promptOpensMuseHeader` arms the header skip
+at stream start. Guard: `test_thinking_tools.sh` 6b, the smoke matrix stream-vs-non-stream thinking check.
+
+### `.hold_thinking` streamed nothing for seconds with tools
+Defect: with tools and thinking the first reasoning byte arrived after 4.4 s instead of 0.05 s. Cause: the hold arm
+was empty, so the thought went out in one delta at the end. Fix: reaching the gate proves the buffer holds no tool
+markup, so reasoning streams incrementally; every later emit site sends only `unstreamedReasoning` (null when a cut
+shrinks it: an SSE delta cannot be retracted); a reasoning budget keeps buffering. `/v1/responses` got the same arms
+later. Guard: corpus streaming replay, `test_messages_stream_thinking_tools.sh`, `test_responses_streaming.sh` [B2].
+
+### Muse channel headers are ordinary text between single-token markers
+Defect: a thinking-off Muse stream shipped a bare `" to"` before the tool block. Cause: the header `assistant
+to=<recipient>` is plain BPE text, and the hold checked `startsWith(lead, "to=")` against a two-byte buffer. Fix: an
+unresolved header, including strict prefixes of `to=`, always holds; `to=self` is reasoning, `to=user`/bare is
+content, any other recipient is an ATEM tool call (raw string values, JSON keeps its type). Guard: `museStreamVerdict`
+tests, `tests/test_muse_glimmer.sh`.
+
+### Thinking-off is enforced in the prompt; reasoning is always delivered
+Defect: thinking-off on Muse and LFM2.5 still generated the whole reasoning pass, then discarded it. Fix:
+`noThinkTailSuffix` commits ` to=user<|message|>` (Muse, no tools) or `</think>` (an unconditional opener) at the
+render's tail; every delivery site splits with `splitThinkBlock(text, true, …)` and ships whatever reasoning exists.
+`splitMuseChannels` classifies the eom-cut body, not the raw chunk (it once dropped the whole answer). Guard: the
+render tail-commit tests, `tests/test_muse_glimmer.sh` [2]/[2b].
+
+### Assistant-history reasoning must round-trip (Laguna)
+Defect: Laguna thought on turn 1 and never again in a pi session. Cause: `chat.Message` had no `reasoning_content`, so
+the template rendered every prior turn as `<think></think>`, the nothink signature. Fix: `Message.reasoning_content`
+from the chat parser (and vLLM's `reasoning`) and from `/v1/messages` thinking blocks, omitted when absent, in the
+tokenize-cache key. Guard: the serialize and laguna render round-trip tests.
+
+### Muse renders round-tripped reasoning as history, so one loop poisoned every later turn
+Defect: after one cut reasoning loop, every later Muse turn looped. Cause: Muse's template renders history reasoning
+as a full `to=self` segment, so the model re-read its own loop. Fix: `dropPriorTurnReasoning` keeps reasoning only
+after the last user message, Muse family only. Guard: the drop/keep render tests and the regenerated byte-parity
+fixture. Tell: prompt tokens grow by the prior turn's reasoning length.
+
+### `preserve_thinking` keeps the template's default (Qwen3.8)
+Defect: long-context Qwen3.8 pi turns hit `near_repeat`; forcing `preserve_thinking:false` fixed that pack and then
+made every follow-up re-prefill up to 44k tokens. Cause: dropping prior reasoning moves the prefix. Fix: the template
+default stands; `chat_template_kwargs` `preserve_thinking:false` opts out. Guard: the `preserve_thinking` test beside
+`serializeExtraContext`, `resolveChatThinking`.
+
+## Loop stops
+
+### A loop cut is an intentional stop, and fragment values never ship
+Defect: gemma-4-26B looped inside a write call's `content`; the guard cut it silently, `finish_reason "stop"` was
+upgraded to `tool_calls`, and the salvage shipped 1.1 KB of loop garbage without `path`. Fix: a loop cut reports
+`stop` with `finish_details.type "repetition_loop"`, logs `[loop-stop]`, suppresses tool parsing; a truncated Gemma
+call drops any value that runs to end-of-body. Guard: `loopStopDecision`, `shouldParseToolCalls`, the Gemma truncation
+tests, corpus "Loop-stop truncated Gemma call".
+
+### Short cycles and low-entropy files convict on span
+Defect: Qwen3.8 designing a map wrote `"111111111111111111111111"` (24 per-digit tokens) and the exact tier cut it; a
+turn later five tile maps were cut by the near-repeat tier at window fill. Cause: no content measure tells a file of
+identical rows from a loop; what a file does and a loop never does is end. Fix: the exact tier needs
+`degenerate_loop_min_span` (128), the long exact tier `degenerate_loop_long_min_span` (1024), near-repeat
+`near_repeat_min_span` (4096). Guard: `degenerateTail acquits a low-entropy STRUCTURED file that ends inside the span
+bar`, `tests/test_loop_stop_signal.sh`.
+
+### A contract comment is read as a spec (#94)
+Defect: an issue was filed against `coerceToolArgsToSchema` because its doc said "only SCALARS are touched", two weeks
+after the container arm shipped. Fix: the comment describes the code and the container coercion is pinned by a test
+named for the issue. Guard: that test.
+
+## A DSML tool call came back as bare closers with finish "stop" (#980)
+Defect: DeepSeek-V4.1 agent turns ended with text like `</｜DSML｜ calls>` and no `tool_calls`; the client took it as the final answer and went idle. Cause: the scrubber and the stream gate knew only the OPENER `<｜DSML｜`; once the opener and payload were gone (a call inside the think block, or never written) the closers matched nothing and rode out as content, and live they streamed because nothing held them. Fix: `</｜DSML｜` is a cut marker in `trimLeakedToolMarkup` and a hold (with its split lead-in `</`) in `streamShouldBufferForTools`. Guard: the corpus entry `lone DSML closers with no opener never leak into content` plus the two `#980` unit tests. Not fixed: a call the model writes inside its think block is still not recovered as a call.
 
-### A heuristically-inferred tool call must name a DECLARED tool (hallucinated raw-JSON call class)
-`parseToolCalls`' raw-JSON fallback (no tag syntax anywhere) takes the FIRST balanced `{…}` object in the text and — via `tryParseJsonToolCall`'s flat-shape synthesis — accepts ANY object with a string `"name"` key, treating every other key as arguments. That means a generation truncated by max_tokens mid-DATA-script hands the parser something like `{"name": "George Washington", "num": 1, …}` and the client receives a tool call named "George Washington" (live pi capture 2026-07-13, Qwen3.6-35B-A3B distilled writing a presidents site: pi answered `Tool George Washington not found`, the model retried the identical mega-write, two full 16K-token turns burned with zero progress). Symptom signature: a client-side "tool not found" error naming a piece of the model's DATA (not any real tool), right after a max-token truncation, with the "call"'s arguments being the rest of that data record. Fix: `ParsedToolCall.inferred` marks calls born from the bare raw-JSON fallback (array + single-object paths; tag/Hermes/Gemma converters stay explicit), and the chokepoint `server.parseToolCallsForRequest` runs `chat.filterInferredBySchema` — an inferred call whose name isn't declared in the request's `tools_json` (`chat.toolNameIsDeclared`, wrapped + flat forms, unparseable schema never drops) is discarded, so the text stays visible content and `finish_reason="length"` reaches the client untouched (its truncation recovery fires instead of a bogus tool loop). Rules: (1) EXPLICIT tag-format calls are never name-filtered — "tool not found" on a tagged call is model-visible feedback the model corrects from; a heuristic guess is not; (2) the filter is deliberately NOT gated on `--no-tool-autocorrect` (it corrects OUR heuristic's false positive, not the model's output); (3) any new heuristic inference path must set `.inferred = true`. Guards: the George Washington chokepoint tests in server.zig (drop + declared-name-keeps-parsing + tag-undeclared-kept), `filterInferredBySchema`/`toolNameIsDeclared`/provenance-marking unit tests in chat.zig, and the "Hallucinated raw-JSON tool calls" corpus entries — the corpus runner mirrors the chokepoint (filter → coerce), so every future entry with a `tools_json` is covered automatically (verified red-on-revert: `got: George Washington`).
-
-### Gemma 4 tool calling
-Templates render `role: "tool"` natively as `<|turn>tool` — no transformation. Don't add `tool_responses` field (causes duplicate content). Args serialized as JSON strings.
-
-Gemma's custom arg format delimits strings with `<|"|>…<|"|>`. On LARGE content the model sometimes DROPS the opening `<|"|>` while keeping the closing one (live, gemma-4-e4b-it writing a full HTML page: `call:write_file{content:<!DOCTYPE…>…</html><|"|>,path:<|"|>x<|"|>}`). `convertGemma4Value`'s bare-value scan then terminates `content` at the FIRST `,`/`}`/`]` inside the markup (a viewport-meta comma, a CSS brace) and shreds the rest into bogus keys → invalid args → the write call carries garbage (or is dropped). Fix: in the bare-value branch, a non-literal value that is "rich" (contains a newline or `<`) runs to the CLOSING `<|"|>` when present (confirmed a closer by a `,`/`}`/`]` right after it, so a later field's opener isn't grabbed), else — at the top level only — to the object's final `}`. Plain short bare tokens (`command:ls -la`) keep the first-separator behavior. Same big-file-tool-call CLASS as the no-tag-leak / escaping-recovery work; guarded by the `Gemma 4 dropped … delimiter` instance tests in `chat.zig` + the `Gemma 4 dropped opening <|"|> on big content` corpus entry (`src/format_corpus_test.zig`). Surfaced by `tests/test_tool_matrix_small.sh` (the sub-4B cross-model tool-call matrix). The complementary mitigation is app-side: `writeFile` takes `append:"true"` and the tool description tells the model to chunk large files (~200 lines/call) so no single call truncates.
-
-### Streaming with tools + thinking
-Server buffers tokens to detect tool patterns. With thinking enabled, `<|channel>thought` is buffered (not flushed) until closing `<channel|>`. After generation, thinking is split into `reasoning_content`; channel tags stripped from visible content.
-
-### Re-opened thought channel right after a close leaks the bare opener (think-tag-leak class)
-Symptom signature: an assistant reply whose **entire visible content is a bare opener** — `<|channel>thought\n` (thinking off) or a glued `thought` (thinking on) — reaching the user / chat-history.json. 2026-06-19 live (gemma-4 agentic): the model CLOSED its thought channel and IMMEDIATELY re-opened a fresh one with nothing between (`…<channel|>\n<|channel>thought\n`), then the turn ended. The post-processing layer (`chat.stripThinkBlock`/`splitThinkBlock`) strips the leading CLOSED block first, leaving the re-opened opener at **position 0** of the remainder. Two traps combined: (1) `lastUnclosedThinkOpen` used to bail on a `pos==0` opener (it assumed leading openers were already handled), so the trailing-strip never cut it; (2) `splitThinkBlock`'s content-channel strip treated `<|channel>thought` as a `<|channel>` *content* opener and shaved off the prefix, leaving `thought`. `normalizeEmbeddedThinkBlocks` does NOT save this — it returns null for one-leading-closed-block + trailing-unclosed-opener, delegating to the (then-broken) trailing-strip. Rule: the trailing-strip must report a pos-0 unclosed opener (callers strip their leading block first), and a re-opened `<|channel>thought` is never a content channel. This is the same no-tag-leak class as the truncated-template-opener and mid-text-reopened-pair bugs; guarded by the `re-opened thought opener right after close` corpus entries (`src/format_corpus_test.zig`, both thinking on/off) + the universal no-tag-leak invariant, plus the instance tests in `chat.zig`.
-
-**Variant — trailing CLOSE-marker spam (2026-07-09 soak, a Gemma reasoning variant, record 2151):** the model emitted reasoning, one `<channel|>` close, a content scrap, then SPAMMED 16 more bare `<channel|>` close markers. The leading strip cut the FIRST close; the trailing-strip only handled unclosed OPENERS (`lastUnclosedThinkOpen`), so the stray CLOSES leaked. A close marker is never valid at the tail of visible content. Fix: `trimTrailingThinkClosers` loops off trailing `<channel|>` / `</think>` (+ whitespace), applied by BOTH `stripThinkBlock` and `splitThinkBlock`'s content (returns a prefix slice, no alloc). This is why the soak found it and the tiny models didn't — large reasoning models degenerate into tag-spam under load. Guarded by the `trailing <channel|> close-marker spam` corpus entries (both thinking on/off) + `stripThinkBlock`/`splitThinkBlock` instance tests. Rule: strip trailing think/channel CLOSE markers, not just unclosed openers.
-
-**Variant — orphan Gemma tool CLOSE `<tool_call|>` (2026-07-16 soak, gemma-4-26B-A4B):** with tools present and a trivial "no tools needed" probe (temp 0.7), the model degenerated into a bare 1-token `<tool_call|>` CLOSE with NO `<|tool_call>` opener. Tool-call detection keys on the OPENER, so `parseToolCalls` found no call and the orphan control token leaked as the ENTIRE visible content (server response `content == "<tool_call|>"`, `finish_reason=stop`). Same trailing-orphan-close class as the `<channel|>` spam — a tool CLOSE is never valid at the tail of content, and `parseToolCalls` runs BEFORE the strip and extracts any real call, so any residual `<tool_call|>` reaching content is orphan by construction. Fix: `trimTrailingThinkClosers` also loops off a trailing `<tool_call|>`. Degenerate + stochastic (didn't reproduce in 6 re-runs — a single log artifact), so the guard is deterministic/hermetic, not a live red-on-revert: the `stripThinkBlock removes orphan Gemma <tool_call|> close` instance test + the `orphan <tool_call|> close never leaks` corpus entry (universal no-tag-leak invariant).
-
-### Dropped assistant-history reasoning starves reasoning-persisting templates into nothink (laguna, 2026-07-29)
-Symptom signature: a model whose template PRE-OPENS `<think>` thinks on the FIRST turn of a session and never again — while every part of the flag wiring reads correct (request logs `thinking=true`, the template reads `enable_thinking`, the render succeeds, no jinja fallback WARN). Live pi agent on Laguna XS: ONE `reasoning_content` delta on the 2-msg opening turn (log line 87925, port 11234), then ZERO across the next 13k chunks of the same session. Mechanism: pi (like vLLM clients) round-trips `reasoning_content` on assistant HISTORY messages, but `chat.Message` had no field for it — the chat parser dropped it, `serializeMessagesJson` never emitted it, and laguna's `chat_template.jinja` (which persists reasoning across turns: history assistants render `<think>{message.reasoning|reasoning_content}</think>`) rendered EVERY prior turn as the empty `<think></think>` — the GLM-family nothink signature. Sitting inside the pre-opened `<think>` of the current turn, the model's argmax continuation after a history of empty thinks is an immediate `</think>`; the stream gate consumes that lone close, so the output shows pure content and reads as "thinking never enabled". Qwen/Gemma never hit this: their templates strip history reasoning by DESIGN and the models are trained for it. Fix is universal plumbing, template-decided behavior: `Message.reasoning_content` carried from the chat parser (`server.messageReasoningFromObj`: `reasoning_content` then vLLM's `reasoning` spelling, non-empty strings only — an empty string would render the exact signature the field exists to avoid) and from `/v1/messages` history `thinking` blocks, emitted by `serializeMessagesJson` (key OMITTED when absent — templates gate on `is string`), and hashed into `TokenizeCache.keyFor` (two histories differing only in reasoning must not collide on one cached tokenization). Templates that never reference the field render byte-identical prompts. Clients that DON'T round-trip reasoning still see reasoning-persisting models go quiet after turn 1 — that is the model/template contract, not our wiring. Guards: `serializeMessagesJson carries assistant reasoning_content` + the laguna-fragment render round-trip (chat.zig), `messageReasoningFromObj` cases (server.zig), `TokenizeCache key distinguishes assistant reasoning_content` (tokenize_cache.zig).
-
-### Inkling's template raise_exceptions on our own extra-context values, and its output is MESSAGES, not tag pairs (2026-07-30)
-Adding `inkling_mm_model` (Thinking Machines Inkling Small) surfaced a new sub-class of the silent-fallback family: the failure lives in the TEMPLATE's input contract, not the model's output bytes. `chat_template.jinja` (verbatim in `src/fixtures/inkling_chat_template.jinja`) maps `reasoning_effort` strings through its own table (`none/minimal/low/medium/high/max` → a numeric "Thinking effort level: N" system line) and `raise_exception`s on anything else — including the `"no_think"` `serializeExtraContext` sends for hy3. It also raises when a history tool call's `arguments` is a JSON STRING (we already serialize objects — the test at "embeds valid-JSON arguments as object" is now load-bearing for a second family), and it renders tool declares/calls with `tojson(sort_keys=true, separators=(",", ":"))`, which jinja_cpp threw NotImplemented on. Any one of these = render failure = silent `fallbackFormatChat` = wrong-family tags = degeneration, with the flag wiring reading perfectly. Fixes: `sort_keys` implemented in jinja_cpp's `value_to_json` (byte-wise sort == Python's code-point sort for UTF-8); `serializeExtraContext` sniffs the family ("Thinking effort level" in the template) and sends `"none"` for thinking-off; `serializeMessagesJson` now emits the tool call `"id"` — the template names a tool RESULT by matching `message.tool_call_id` against history `tc.id`, and without it every result rendered nameless. All pinned by the hermetic real-template render test (both thinking arms + tool round + reasoning round-trip).
-
-Output side: the model emits role-less MESSAGES — `<|content_thinking|>R<|end_message|>`, then `<|message_model|><|content_text|>C<|end_message|>`, tool calls as their own `NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>` messages, EOS `<|content_model_end_sampling|>` (200006). Every marker is a SINGLE special token, which makes streaming tractable: a marker can never split across deltas, so `chat.isChannelMarkerToken` (shared by all flush paths) filters exactly, `streamThinkGate` decides early off the leading marker, and the three per-surface `in_think_block` machines just needed the opener (`<|content_thinking|>`) and close (`<|end_message|>`) registered plus content-marker strips after the close. `splitInklingChannels` serves both `splitThinkBlock` AND `stripThinkBlock` — the thinking-OFF non-stream path uses the latter, which is exactly where the first live run leaked `<|content_text|>4<|end_message|>` as content. `parseInklingToolCalls` runs ahead of the tag families (its marker is unmistakable); the payload's `"name"` is authoritative with the message-prefix NAME as fallback, and a truncated payload salvages NAME + `{}` per the hard rule. Corpus family "inkling" (6 live-captured/live-shaped entries) + the Inkling markers in `leak_tags` auto-cover future shapes.
-
-### The first REAL Inkling agent session: a compounding four-mechanism loop (2026-07-30)
-The curl-validated Inkling tool support above broke on its first real workload (pi v0.83.0, "build quake 1 in threejs", REAP25 on the app server). Four mechanisms, in causal order, each amplifying the next — raw captures in `mlx-serve-11234.log` lines 61961/62828/63285/63543, now corpus entries:
-
-1. **Streaming leaked the whole call as content.** Under pi the model opens tool turns `<|message_model|><|content_text|>bash<|content_invoke_tool_json|>{…}`. `streamThinkGate` saw the `<|content_text|>` head → `.flush_text`, and `streamShouldBufferForTools` didn't know the invoke marker — so the NAME and the full JSON streamed as visible deltas (only the marker TOKENS were filtered). End-of-turn parse still extracted the calls, so pi got BOTH leaked text and tool_calls; the leak landed in assistant history and contaminated every later turn. Fix: `streamShouldBufferForTools` buffers on the invoke marker (a single special token — arrives whole) and HOLDS while the segment after the last boundary marker is a bare identifier run 1..64 (`inklingSegmentCouldBeToolName`) — prose disambiguates within a token (space/punct), a call at the invoke marker; an EMPTY segment never holds, so thinking splits stay prompt. The /v1/messages stream had drifted back to its own inline subset predicate — re-unified on the shared function.
-2. **The salvage name manufactured garbage, and pi's error echo taught the model the garbage.** The fallback prefix-name was "text since the last `<|message_model|>`/`<|end_message|>`", which included the `<|content_text|>` marker → tool name `<|content_text|>bash` → pi: "Tool <|content_text|>edit not found" → the model began emitting `{"name":"<|content_text|>bash","args":{}}` ITSELF (capture 63285). A self-reinforcing loop the parser started. Fix: NAME = trailing identifier run `[A-Za-z0-9_.-]` before the invoke marker (`inklingTrailingNameRun`); payload names containing `<|` get the same treatment; universal corpus invariant: a parsed NAME never contains `<|`. Related: the bare-JSON inference block is now suppressed on invoke-marker text — it resurrected (as an `.inferred` call) the exact payload the Inkling parser had deliberately skipped for having no recoverable name.
-3. **Back-to-back calls without `<|end_message|>`** (capture 62828: `{…}}write<|content_invoke_tool_json|>{…}`): body extraction scanned to the NEXT end tag, so call 1's "body" swallowed call 2 and the JSON parse failed → both calls degraded to one `{}` salvage. Fix: body = the balanced `{…}` object at body_start (string-aware brace scan, the `balancedJsonObject` helper), `pos` advances past the object; no balance by end of text = truncation → NAME + `{}` as before.
-4. **Wild sampling**: pi omits temperature/top_p/top_k (confirmed null in the logged request) and Inkling ships NO generation_config.json anywhere — requests ran 1.0/1.0/off, the exact 2026-07-13 pi-budget-burn class, showing up as duplicate identical calls (capture 61961). TM publishes no recommendation (their tooling is greedy-only), so the `applyFamilySamplingDefaults` inkling arm's top_p 0.95 is documented as OUR tail cut; body > flags > this default unchanged.
-
-Guards: 4 verbatim-capture corpus entries (duplicate-with-separators, back-to-back-no-separator, marker-echoed name, content_text-prefixed single), the `last_tool_name` corpus field, the universal no-`<|`-in-NAME invariant, the "streaming tool buffer never flushes Inkling call text" replay (atomic-marker tokenization — markers are single tokens, so the replay feeds them whole), and unit tests for the name-run/balanced-body/hold logic. Meta-lesson: a format validated by curl smoke tests has not met an AGENT — the failure modes only compose under multi-turn history contamination, client error echo, and omitted sampling params.
-
-## A transcribed template's whitespace is a token-level contract (dsv4/0731, 2026-07-31)
-
-DeepSeek-V4-Flash ships no `chat_template`, so `src/fixtures/dsv4_chat_template.jinja`
-is our transcription of the release's `encoding/encoding_dsv4.py`, and the converter
-injects it into every mirror we build. Session 2 validated it 5/5 by hand; when 0731
-landed (its ONLY encoder change being `reasoning_effort` → low|high|max) that ad-hoc
-check was rebuilt as a checked-in guard, `tests/dsv4_template_ab.py`, rendering both
-sides over the shapes the server actually emits and demanding BYTE equality.
-
-It went 8/14 on the first run, and every failure was informative:
-
-1. **The reference SILENTLY DROPS tools attached to a user message.** It reads
-   `msg.get("tools")` off the first message and renders the block only from a
-   system/developer turn. Its canonical way to express "tools, no system prompt" is
-   an EMPTY system turn — which renders `content + "\n\n" + tools`, i.e. a leading
-   `\n\n` before `## Tools`. Our template emitted the separator only `if has_system`,
-   so every no-system tool request — the shape most clients send — produced
-   `<bos>## Tools` where the model was trained on `<bos>\n\n## Tools`. Two bytes,
-   but they retokenize everything after the bos. Fixed to unconditional; pinned in
-   both the A/B and the hermetic Zig render test.
-
-2. **`encode_arguments_to_dsml` `json.loads()`es the arguments** — the reference wants
-   a JSON STRING where we serialize OBJECTS (the Inkling rule: a string breaks other
-   families, so we keep objects). Handing it a dict does not raise: it lands in the
-   except branch and renders ONE parameter literally named `arguments` wrapping the
-   whole JSON. A harness that fed both sides "the same" message would have reported
-   our per-key rendering as the bug.
-
-3. A conversation ENDING on an assistant turn while still asking for a generation
-   prompt is not a shape the server produces (the reference has its own `wo_eos`
-   continuation path). The parallel-call case now ends with both tool results — the
-   real agent shape, which also exercises consecutive-`tool_result` merging.
-
-The lesson generalizes past this family: when A/B-ing a transcription against a
-reference implementation, convert the INPUT shapes to each side's own contract and
-compare only the OUTPUT. Every remaining difference is then a real defect in one of
-the two — and here the whitespace one was ours, silently, in production shapes.
-
-## reasoning_content is a client-visible, history-round-tripped field (DSV4, 2026-08-01)
-
-A live agent session on DeepSeek-V4-Flash-0731 came back with a full DSML call block
-sitting inside `reasoning_content`:
-
-```
-"reasoning_content": "…Let me first check the working directory structure.
-<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"listFiles\">\n
-<｜DSML｜parameter name=\"path\" string=\"true\">quake</｜DSML｜parameter>\n
-</｜DSML｜invoke>\n</｜DSML｜tool_calls>"
-```
-
-The model had emitted a complete tool call INSIDE its think block, closed the block,
-then issued two different calls in content. `parseToolCalls` works on the post-think
-text by design, so the in-thought call is deliberately skipped — but nothing then
-removed it, and `splitThinkBlock` handed the whole thing back as reasoning. The client
-round-tripped it into the next request's history (the assistant-history reasoning
-rule), so from that turn on the model was being shown its own malformed markup as an
-example of what thinking looks like. Same family as the Inkling error-echo loop: the
-server taught the model the mistake.
-
-Two more shapes from the same log, same class, different field:
-
-- **A marker split across tokens beats a per-token filter.** DSV4 spells the marker as
-  `<` then `｜DSML｜`. With tools declared the stream buffers correctly (`<` is a
-  tail-prefix), but the END-of-stream flush — reached because nothing parsed — looped
-  the held tokens straight out as content deltas. `isChannelMarkerToken` cannot help:
-  neither piece IS a marker. The flush now concatenates first, then cuts.
-- **A mangled opener leaks the whole block.** `<｜DSML｜toolinvoke name">…` (the model
-  fused `tool_calls>\n<｜DSML｜invoke name=`) parses as nothing and became the visible
-  answer verbatim.
-
-Fix: `chat.trimLeakedToolMarkup` cuts visible text at the first tool-call WRAPPER
-opener (`<｜DSML｜`, `<|tool_call`, `<tool_call`, `<tool_calls:`, Inkling's invoke
-marker — plus, for Inkling, the trailing identifier run before it, since the NAME
-precedes the marker there). It is applied ONCE, in a wrapper around `splitThinkBlock`
-/ `stripThinkBlock`, so a new split arm cannot forget it. The whole tail goes rather
-than just the block: a wrapper we could not parse has no reliable end, and shipping
-half of it is the same leak.
-
-The one caller that must NOT get the cut is `/v1/messages` non-streaming — alone among
-the surfaces it reassigns its working text from the split result and then hands that
-to `parseToolCallsForRequest`, so cutting first would make a real call unparseable.
-That path uses `splitThinkBlockKeepingMarkup` / `stripThinkBlockKeepingMarkup` and cuts
-at the text-block emission instead. Every other surface (chat non-stream + stream,
-`/v1/responses`, `/v1/messages` streaming) already parses from the raw text.
-
-Guards: three verbatim-capture corpus entries and a SECOND universal corpus invariant —
-`reasoning_content` is checked against the tool-markup list exactly as content is
-checked against `leak_tags`. KNOWN GAP recorded in the test: a re-opened
-`<|channel>thought` marker can still sit INSIDE reasoning (excising an interior marker
-needs an allocation the alloc-free `ThinkSplit` contract doesn't have, and Gemma's
-template strips history reasoning, so it is a rendering wart, not a prompt
-contaminant). Second gap: streaming with NO tools declared has no buffer to cut from,
-so a model emitting call markup unprompted still streams it.
-
-## LFM2.5: a pythonic call grammar, and a template that always thinks (2026-08-04)
-
-Two separate bugs, both surfaced by getting `mlx-community/LFM2.5-2.6B-8bit`
-serving. Neither is a parser tolerance failure — both are cases where a new
-template family carries a fact our pipeline had no way to learn.
-
-### 1. The tool-call grammar
-
-A tools request came back with empty content and no `tool_calls`. Raw output,
-captured by rendering the model's own template offline and posting it to
-`/v1/completions` so nothing in the tool pipeline could touch it:
-
-```
-</think><|tool_call_start|>[get_weather(city='Paris', days=3, metric=True, tags=['trip', 'eu'])]<|tool_call_end|>
-```
-
-Nothing in `parseToolCalls` speaks that. The wrapper was being cut by
-`trimLeakedToolMarkup` (it already lists the `<|tool_call` prefix for Gemma),
-which is why the failure presented as empty content rather than a leak — the
-safety net did its job and there was nothing behind it.
-
-The load-bearing detail is the VALUES. `format_arg_value` in the template
-renders strings as Python reprs but containers via `tojson`, so a reasonable
-guess is "strings are pythonic, everything else is JSON". The model does not
-agree: it emits `True` and `['trip', 'eu']`, full repr. A JSON-only value
-reader gets the boolean and the array — the two commonest non-string argument
-types — wrong on the first real call. So `pythonicLiteral` parses the literal
-set (quoted strings either way, `True`/`False`/`None`, ints, floats, lists,
-dicts) and types the value at parse time. In this grammar the type is
-knowable from the spelling, so the schema never has to be consulted.
-
-Everything structural runs through one quote-and-depth-aware scanner
-(`pythonicScan`), because the arg separator, the `=`, the dict `:` and the
-closing paren all need the same blindness to a separator sitting inside a
-value — `shell(cmd='ls -la (tmp), [x]')` breaks a naive scan in three places
-at once.
-
-Additive by construction, which was the whole point given how much live
-tolerance the existing arms encode: `<|tool_call_start|>` is emitted by no
-other family, the generic `<tool` scan never sees it (Gemma keys the exact
-`<|tool_call>`, with the `>`), and both the streaming buffer gate and the
-leaked-markup cut already covered it through the `<|tool_call` prefix. The
-only wiring was one call in `parseToolCalls`.
-
-### 2. The template thinks whether or not you asked
-
-With the parser in, streaming still delivered the model's entire
-chain-of-thought as the answer — with and without tools — while non-streaming
-was clean. The split:
-
-```
-{%- if add_generation_prompt -%}
-    {{- "<|im_start|>assistant\n<think>" -}}
-{%- endif -%}
-```
-
-No `enable_thinking` branch anywhere in the template. LFM2.5 always reasons.
-So with thinking off the opener is in the PROMPT and never in the output, and
-the model's first tokens are tag-free prose that happens to be reasoning.
-Non-streaming survives because by the time it splits, the `</think>` has
-arrived and the leading strip finds it. Streaming has to decide live, and
-`streamThinkGate`'s only signal was `enable_thinking`.
-
-`server.promptOpensThink` already computed exactly the missing fact, but every
-call site ANDed it with `enable_thinking` — so the one case that needed it was
-the one case it was suppressed in. Whether a prompt ends inside a think block
-is a property of the rendered bytes, not of our request flag.
-
-Two changes, both shaped for containment because this is the layer that must
-not move:
-
-- `chat.streamThinkGate2` takes the fact as a 4th argument; the 3-arg
-  `streamThinkGate` stays as "no prompt opener", so every existing call site
-  and test pins the behavior it always had (a test asserts the two agree over
-  the old cases, both flags, both directions).
-- The thinking-OFF case gets its OWN stream arm rather than widening the
-  reasoning arm — that one EMITS `reasoning_content`, and with thinking off
-  the block must be dropped. Nothing in the new arm can run when thinking is
-  on.
-
-The term can only fire on thinking-OFF plus a literal open tag at the prompt
-tail. A scan of every local checkpoint's template found LFM2.5 is the only one
-where that combination is reachable — everything else renders the closed
-`<think></think>` signature when thinking is off, which `promptTailOpensThink`
-already returns false for. Verified live on Qwen3.6-27B across all four
-stream × thinking × tools combinations, plus `test_thinking_streaming.sh`
-(13/13), `test_thinking_tools.sh` (27/27) and
-`test_messages_stream_thinking_tools.sh` (6/6).
-
-Lesson for the next family: check whether its think opener is CONDITIONAL
-before assuming the request flag describes what the model is doing.
-
-### 3. Issue #94 was a stale comment
-
-Filed against `coerceToolArgsToSchema` on the strength of its doc comment
-("Contract: only SCALARS are touched"). The array/object arm had shipped in
-60ba5ec two weeks earlier; the comment never got updated. The container
-coercion is now pinned by a test named for the issue, and the comment
-describes the code. A contract comment is read as a specification — by people
-and by whatever is comparing your implementation against another engine's.
-
-## `in_think_block` started from the request flag, not the prompt (Gemma, 2026-08-04)
-
-Found while regression-testing the LFM2.5 work against `gemma-4-e4b-it-4bit`.
-Streaming and non-streaming disagreed on the same request:
-
-```
-enable_thinking: true, "What is 17 * 23? Just the number after thinking."
-  non-stream → content '391', reasoning None      # correct
-  stream     → content '',    reasoning '391'     # the whole answer misfiled
-```
-
-The streaming loop initialises `in_think_block = enable_thinking` — it ASSUMES
-the model begins inside a think block whenever thinking was requested. That is
-true only for templates that pre-inject the opener. Gemma renders a bare
-`<|turn>model\n` and lets the MODEL decide, so a turn it answers directly
-carries no think markup at all: no opener to recognise, no close tag to split
-on, and at end-of-stream the buffer was flushed as `reasoning_content` on the
-strength of `in_think_block` alone. Content came back EMPTY. Any client
-rendering `content` showed nothing.
-
-Note the shape of the miss: the answer was short ("391"), so the opener-skip
-logic — gated on `think_buf.items.len >= 7` — never even ran. A longer
-non-thinking answer would have reached its final else ("not a known opener —
-the template must have injected one") and been misfiled just the same, for a
-different reason.
-
-The non-streaming path had it right all along, because `splitThinkBlock` asks
-for evidence: no opener + no close + not template-opened ⇒ content. So the fix
-is to make the stream flush use the same rule
-(`chat.streamTailIsReasoning(in_think_block, prompt_opened_think,
-saw_think_open)`) — reasoning only with POSITIVE evidence a block was open:
-the prompt opened one, or the model emitted a literal opener.
-
-`saw_think_open` is new and deliberately distinct from the existing
-`skipped_think_open`, whose else-branch also fires for "no known opener, assume
-the template injected one" — precisely the case that has to be told apart. It
-is set only in the three branches that recognise a REAL opener (`<think`
-family, Inkling's `<|content_thinking|>`, Gemma's `<|channel>thought`).
-
-Truncated thoughts are unaffected: a pre-injecting template sets
-`prompt_opened_think`, so a thought cut by max_tokens is still reasoning and
-still never leaks into content.
-
-### The tests were asserting model behavior
-
-Three integration assertions failed on models that were behaving correctly, all
-the same class — asserting what the MODEL chooses rather than what the server
-guarantees:
-
-- `test_thinking_streaming.sh` Test 2 demanded reasoning >50 chars. Gemma
-  answers that prompt directly. Now: either a streamed think block, or a direct
-  answer as content — never the broken third state (answer filed as reasoning
-  with empty content), which is what the old assertion let through unnoticed.
-- `test_thinking_tools.sh` Test 2 demanded content. Laguna-XS spends >500
-  tokens thinking about 15x17 and ends at `finish_reason: length` still inside
-  the block — empty content is the truncated-thought rule working.
-- Tests 4/8 demanded reasoning before a tool call. Laguna-XS closes its
-  pre-opened block empty and calls the tool in ~35 tokens; LFM2.5 sometimes
-  spends the whole budget thinking and emits neither (~2 runs in 3, so the arm
-  was also nondeterministic).
-
-Each now asserts the invariant and branches on the model's choice. The general
-rule: an integration assertion that a model MUST think, MUST answer, or MUST
-call a tool is a checkpoint-specific expectation wearing a server test's
-clothes — and it either fails on the next family or, worse, passes while
-hiding a real defect.
-
-`test_format_matrix.sh` also learned to look under the sibling model root
-(`~/.mlx-serve/models` vs `~/.lmstudio/models`): its gemma4-e4b arm had been
-skipping while the checkpoint was present, which is missing coverage that reads
-as a pass.
-
-## `.hold_thinking` was an empty block, so tools+thinking streamed nothing for seconds (2026-08-04)
-
-Reported as "with tools and thinking, streaming takes a long time before I see
-anything; without tools I see content right away". Measured on LFM2.5-2.6B:
-
-```
-                            1st reasoning   1st content   prefill
-thinking ON,  no tools           0.05s          n/a         8ms
-thinking ON,  WITH tools         4.40s          n/a        27ms
-```
-
-Prefill is 8-52 ms in every combination, so the wait was not prefill. With
-`tools` present every token goes into a buffer for tool-call detection, and the
-think gate returns `.hold_thinking` until `</think>` arrives — and that arm was
-literally empty:
-
-```zig
-.hold_thinking => {
-    // Incomplete thinking block — keep buffering until closed
-},
-```
-
-So the whole thought landed in ONE delta at the end. 4.4 s here, and it scales
-with the length of the thought.
-
-The fix is small because **the tool side was already fine-grained**:
-`streamShouldBufferForTools` runs immediately above and holds on partial
-prefixes down to a bare `<`. Reaching the gate at all therefore PROVES the
-buffer contains no tool markup and no partial marker at its tail — those bytes
-are reasoning and nothing else, and they can go out now. 4.40 s → 0.09 s,
-matching the no-tools path.
-
-What the change actually has to get right is not the emission, it is that
-**three other sites emit reasoning for the same turn**: the `.split_think` arm,
-the end-of-stream tool-call path, and the end-of-stream no-tool-call path. Each
-now sends only the remainder via `chat.unstreamedReasoning(reasoning,
-reasoning_streamed)`. Its one interesting case is a split that SHRINKS — a tool
-marker appearing mid-thought moves `trimLeakedToolMarkup`'s cut backwards, so
-the reasoning gets shorter than what was already sent. It returns null there:
-an SSE delta cannot be retracted, so sending nothing further is honest, and
-resending from the top would duplicate the entire thought.
-
-A reasoning BUDGET keeps the old buffering. Capping what the client is allowed
-to see cannot be reconciled with having already streamed it, and the guard
-(`reasoning_budget < 0`) also means `reasoning_streamed` is only ever advanced
-when no budget is set — which is what leaves the budget-truncation branches at
-the two end sites provably untouched.
-
-Verification worth copying: stream vs non-stream reasoning compared
-BYTE-IDENTICAL at temperature 0 on LFM2.5 and Gemma, including the tool-call
-turn. That comparison is UNSOUND on Qwen3.6-27B-4bit — INT4 near-tie argmax
-plus MTP makes two temp-0 runs diverge past ~30-80 tokens (documented), and the
-diff looks alarming until you notice the two runs generated different text. For
-that model the property to test is self-duplication within ONE stream (the
-reasoning must not contain its own head twice): 637 reasoning deltas, head
-count 1, no tag leak, tool calls intact.
-
-This is a stopgap for the symptom. The real fix — an incremental parser that
-emits diffs and holds back only the minimal ambiguous suffix, which is what
-vLLM's `extract_tool_calls_streaming` and llama.cpp's `common/chat.cpp` partial
-parse do — is in TODO.md.
-
-### `/v1/responses` never got it (2026-09-30)
-
-The fix above landed on chat and `/v1/messages`; the Responses stream still did
-`if (active_has_tools) continue;`, so after `response.in_progress` a tools
-request sent nothing and its whole thought arrived in the terminal burst beside
-the function call. Codex-style clients always send tools, so none of their turns
-could show thinking live or measure a first token. The Responses arm now runs
-the same order (tool hold, `streamThinkGateScan`, `streamableReasoning`,
-`unstreamedReasoning`) into `response.reasoning_summary_text.delta`, and the end
-sends only the unsent tail before the `.done` events. The answer and the calls
-still wait for the parse. Guard: `tests/test_responses_streaming.sh` [B2].
-
----
-
-## A `</think>` inside a tool ARGUMENT destroyed the whole call (2026-08-05)
-
-Found by WRITING a corpus family, not by a live failure — which is the point of
-having one.
-
-Writing a `format_corpus_test.zig` family for a GLM-tag arch, one entry gave a tool call a
-realistic argument value: a model writing a file about its own prompt format.
-
-```
-<tool_call>write
-<arg_key>content</arg_key>
-<arg_value>The model closes a thought with </think> and "quotes" it.</arg_value>
-</tool_call>
-```
-
-Expected a parsed call; got `expected a tool call, got none`, with the raw text
-falling through as content.
-
-The parse chain works on POST-think text, and `chat.indexOfThinkCloseTag` is
-the single scan every surface uses to find the block boundary — split, strip,
-and the streaming gate. It takes the FIRST syntactically valid `</think>`
-anywhere in the text, with no reference to what encloses it. So the split cut
-through the middle of the call: everything before the close became reasoning
-(or was dropped, thinking-off), and the fragments after it leaked as content.
-The call was simply gone.
-
-This is general to every `<think>` family — qwen, laguna, dsv4 — and the
-traffic that hits it is ordinary: coding agents write files about prompts.
-
-Fix (`chat.thinkCloseIsToolCallPayload`): a close is payload iff the nearest
-preceding `<tool_call`-family opener is still OPEN at that point (no
-`</tool_call` between them) AND the block does close afterwards. Both halves
-are load-bearing and each protects a case the other breaks:
-
-- **Without the first**, a call the model emitted and CLOSED inside its thought
-  (`<think>let me try <tool_call>read</tool_call> hmm</think>The answer is 4.`)
-  would make the real `</think>` after it look like payload, and the answer
-  would vanish into reasoning.
-- **Without the second**, an unclosed opener inside a thought — the documented
-  leaked-markup case that `trimLeakedToolMarkup` handles downstream —
-  (`<think>starting <tool_call>partial</think>Answer.`) would swallow the answer
-  that follows the close.
-
-Only the `<tool_call` family is considered: it is the one whose bodies carry
-free-form argument text. Ordinary shapes (`<think>r</think>a`, and a think
-block followed by a real call) are untouched, pinned in the unit test.
-
-## Muse-Glimmer channel headers are ORDINARY text between single-token markers (2026-08-10)
-
-Muse-Glimmer (`muse_glimmer`) emits harmony-style segments after the prompt's
-bare `<|start|>assistant`:
-
-```
- to=self<|message|>REASONING<|eom|><|start|>assistant to=user<|message|>ANSWER<|eot|>
-```
-
-`<|start|>`/`<|message|>`/`<|eom|>`/`<|eot|>` are single special tokens
-(200022/200023/200007/200008) and arrive atomically, like Inkling's markers.
-The trap is the `assistant to=<recipient>` HEADER between them: unlike every
-prior channel family it is ordinary BPE text, arriving over several deltas.
-Inkling's marker-token filtering can't cover it — a flushed header leaks
-` to=user` fragments into visible content.
-
-First live boot leaked exactly that: a thinking-off `/v1/messages` stream
-shipped a bare `" to"` text delta before the tool block, because both muse
-holds checked `startsWith(lead, "to=")` and the two-byte buffer `" to"` is
-SHORTER than the needle. A strict prefix of `to=` must hold too.
-
-The complete rules, shared by every streaming surface:
-
-- An UNRESOLVED header (no `<|message|>` yet, including sub-`to=` prefixes)
-  always holds (`museStreamVerdict` → `.hold_thinking`,
-  `museHeaderHoldsForTools` → true). Prose that merely starts with `to=` is
-  released at the first byte outside the recipient grammar
-  (`museIsRecipientChar`), so the false-positive cost is a transient
-  one-token hold.
-- Resolved `to=self` → reasoning (streams incrementally; closes at `<|eom|>`);
-  `to=user`/bare → ONE `.split_think` so the handler strips the header, then
-  content flows; anything else names a TOOL and the segment body is ATEM
-  payload — buffered to end-of-generation.
-- In the plain (post-think) arm, `<|start|>` arms a header skip and
-  `<|message|>` disarms it (`museHeaderSkipNext`) — the tokens between are
-  role+recipient text, never content.
-
-ATEM parse rules (`parseAtemToolCalls`): keys on `<atem:invoke` (a dropped
-`<atem:function_calls>` wrapper still parses — delimiter-drop class); string
-values are RAW bytes to the CONFIRMED `</atem:parameter>` close, never trimmed
-(the Hermes trim gap stays Hermes'); a value that parses as complete JSON
-keeps its spelled type, schema coercion gets the final word; truncation ships
-NAME + completed params, fragments dropped.
-
-Also load-bearing: the shipped chat template `raise_exception`s unless
-tool-call `arguments` are dict-shaped — `serializeMessagesJson`'s
-object-passthrough covers it — and the template renders through our jinja.cpp
-byte-identical to python jinja2 (pinned test), so no transcription template
-was needed for this family.
-
-## Thinking-off enforced in the prompt; reasoning always delivered (2026-08-11)
-
-The class: an always-thinking template makes "thinking off" a lie. Muse's
-generation prompt ends with a bare `<|start|>assistant`, so the model opens a
-`to=self` reasoning segment on every turn; LFM2.5's template renders
-`…assistant\n<think>` unconditionally. A thinking-off request on either family
-used to generate the ENTIRE reasoning pass and then strip it — the client paid
-the full latency (time-to-first-visible-token included a hidden thinking pass)
-and saw nothing. Worse than showing it on every axis: slower perceived tok/s,
-less information, same bill.
-
-Two-part fix, and the parts compose:
-
-1. **Prevent the reasoning in the PROMPT** (`chat.noThinkTailSuffix`, applied
-   at the one jinja-success return in `renderChatTemplate`, so every surface —
-   chat/completions, /v1/messages, /v1/responses, ollama, REPL, llama-engine —
-   inherits it). Muse arm: thinking off + NO tools + template reads
-   `reasoning_strength` + render ends `<|start|>assistant` → append
-   ` to=user<|message|>`, byte-exactly the header the template renders for
-   history content turns. The recipient header is spent, `to=self` is
-   unreachable, no reasoning tokens are ever generated. Never with tools — a
-   tool call is a `to=<fn>` header, so the recipient must stay free. Think arm:
-   thinking off + the render's tail still opens a think block
-   (`promptTailOpensThink`) → append `</think>`. Qwen-style templates render a
-   CLOSED block when thinking is off, so the arm self-limits to unconditional
-   openers (LFM2.5 class).
-
-2. **Deliver whatever reasoning still gets generated** (tools present,
-   explicit thinking-off with tools, fallback renders, models that think
-   unprompted). Every delivery site now splits via
-   `splitThinkBlock(text, true, prompt_opened_think)` and ships
-   `reasoning_content`/thinking blocks whenever the split finds reasoning —
-   the request's thinking flag shapes the PROMPT, never the delivery. The
-   `stripThinkBlock` family is DELETED; its leak-guard tests were ported to
-   assert the same invariants on the split's content side. Streaming: the
-   thinking-off drop arm is gone — `in_think_block` starts from
-   `enable_thinking or prompt_opened_think` and the reasoning arm streams the
-   block incrementally.
-
-Defaults that ride on it: muse's `defaultEnableThinking` became
-tools-conditional (`has_tools` — recipient selection is where its reasoning
-earns its keep; a silent no-tools request gets the committed channel), and
-`/v1/messages` consults the arch default when the `thinking` param is absent
-instead of hardcoding off — muse+tools under Claude Code streams thinking
-blocks instead of paying for an invisible reasoning pass every turn.
-
-Two structural traps found on the way:
-
-- `splitMuseChannels` dropped the WHOLE ANSWER when the header was
-  prompt-committed and the model later re-opened a segment: the headerless
-  first segment ("answer`<|eom|><|start|>assistant to=self<|message|>`notes")
-  contained no `<|message|>`, so no arm claimed it and content resolved to
-  `""`. The fix claims leading text before the first `<|start|>` as content —
-  gated on `museThinkOpenerAt(body) == .not_muse` over the eom/eot-CUT body,
-  because the raw chunk's `<|eom|>` byte breaks the recipient grammar and
-  makes a truncated bare header (" to=self<|eom|>…") read as prose.
-- The rule "a truncated header is never content" and the rule "a committed
-  header's body is content" meet exactly there; classify the CUT body, not the
-  raw chunk.
-
-Guards: renderChatTemplate tail-commit tests (muse three-way: off/on/tools;
-LFM-style opener close), the headerless-first-segment split test, the
-tools-conditional `defaultEnableThinking` test, corpus harness runs ONE split
-path for both thinking flags, `tests/test_muse_glimmer.sh` [2] (explicit
-opt-in) + [2b] (silent request: content, NO reasoning_content).
-
-## Muse renders round-tripped reasoning as HISTORY, so one cut loop poisoned every later turn (2026-08-11)
-
-The capture (`~/.mlx-serve/chat-history.json` + app log port 11234): a
-repetition-primed chat (the user asked for the same JFK paragraph ×4 — the
-spec-gate's own read was `ngram-score=0.642` against a 0.010 threshold) hit
-its first thinking-on turn and muse waffle-looped in `to=self` ("Maybe the
-user wants… Could be…"). The loop guard worked (`[loop-stop] … after 809
-tokens tier=long_cycle`). The DAMAGE was the aftermath: the app round-trips
-`reasoning_content` on assistant history (the laguna nothink rule — correct,
-per-family), and muse's template renders that field as a full
-`<|start|>assistant to=self<|message|>…<|eom|>` history segment. So the next
-turn's prompt contained the 160-token loop tail verbatim, the model read its
-own loop, and "it starts repeating itself" became a property of the CHAT, not
-the turn. Replay data: the same 7-message context loops 2-of-3 at the app's
-temp 0.7 AND at temp 0 (Meta ships `do_sample: false`) — the loop is the
-model's continuation of a repetition-primed context; the echo is what made it
-permanent.
-
-Fix (`chat.dropPriorTurnReasoning`, applied in `renderChatTemplate` under the
-same `reasoning_strength` template sniff `noThinkTailSuffix` uses): harmony —
-muse's format ancestor — DROPS analysis from prior turns and keeps it only
-after the last user message. Assistant messages BEFORE the last user message
-get `reasoning_content` nulled before serialization; messages after it (the
-current turn's tool rounds, where the model needs its own chain) keep theirs.
-laguna/inkling are untouched — their templates NEED history reasoning, and
-the round-trip rule stays per-family. The byte-parity fixture
-(`muse_render_reference.txt`) was regenerated minus the prior-turn `to=self`
-segment — the template's reasoning arm is a pure local insertion, so removing
-the segment IS jinja2's render of the preprocessed message set.
-
-Live signature if it regresses: turn-8 prompt tokens GROW by the prior turn's
-reasoning length. The wire check that pinned it: the same turn-8 request with
-a 3,591-char round-tripped chain and an 11-char one must render byte-identical
-prompts (measured: 5371 chars / 1203 tokens both ways).
-
-Guards: `renderChatTemplate: muse drops PRIOR-turn reasoning…` (drop arm,
-current-turn keep arm, non-muse keep arm), the regenerated byte-parity
-fixture. App-side twin (banner-in-content): `docs/gotchas/app.md` + the
-`TruncationNotice` data-not-content rule in app/CLAUDE.md.
-
-## A parameter VALUE decided the call (qwen `<function=` dialect, 2026-08-12)
-
-pi on `ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve`: the model kept calling a tool
-named `pi-lfm`, then `voxel-pagoda-garden`, and pi kept answering `Tool …
-not found`. Each rejection went back into the history, so the model repeated
-the same call for the rest of the turn — the loop was the echo, not the model.
-
-The raw pre-parse buffer (`MLX_SERVE_RAW_DUMP_FILE`) showed a PERFECT call:
-
-```
-<tool_call>
-<function=write>
-<parameter=path>
-/Users/david/.mlx-serve/workspace/pi-lfm/package.json
-</parameter>
-<parameter=content>
-{
-  "name": "voxel-pagoda-garden",
-  …
-}
-</parameter>
-</function>
-</tool_call>
-```
-
-That dialect is not a mangle — the checkpoint's own `chat_template.jinja`
-dictates it ("If you choose to call a function ONLY reply in the following
-format") and renders assistant history in it. We already parsed it
-(`parseHermesToolCall`, the `<function=` branch), but it rides inside the SAME
-`<tool_call>` wrapper the Hermes JSON form uses, and in the closed-tag branch
-the JSON attempt ran first: `balancedJsonObject` snapped the first balanced
-object in the BODY — the package.json being written — and `tryParseJsonToolCall`
-flat-shaped it, promoting its `"name"` key to the tool name and the rest of the
-file to the arguments. The tool name was literally whatever the file's `name`
-field said, which is why it tracked the project being scaffolded.
-
-Fix: when the body carries a `<function=` opener, the function-tag parse runs
-BEFORE the JSON shapes. The JSON shapes can never contain that opener, so
-nothing else reorders. The class: **a parameter value is arbitrary bytes and
-must never be allowed to decide the call** — same family as the Gemma
-"unterminated `<|"|>` string swallowed the closing brace" entry.
-
-Why it looked like a regression: the user bisected it to the 26.8.5 muse
-release. It is not. Same checkpoint, same context, `v26.8.4` and `HEAD` emit
-byte-identical raw output and mis-parse it identically (A/B'd at temp 0 on two
-servers, both spec-off and MTP-on, streamed and non-streamed; rendered prompts
-matched to the byte, 9294 and 11453 chars). Whether the model picks the XML
-dialect or the JSON one for a given turn is sampling, so a clean 26.8.4 session
-is luck, not evidence.
-
-Guards: `chat.zig` "qwen xml: the live `<function=…>/<parameter=…>` capture
-(package.json class)" + the truncation sibling, and the corpus entry
-"function-tag call whose parameter value is itself a JSON object".
-
-## A `chat_template` can be a POINTER to the sidecar file, and taking it literally is a silent fallback (issue #169)
-
-With the laguna router fixed, `Laguna-S-2.1-oQ4e-fast` loaded and then answered
-in Gemma markers — `</start_of_turn>\n<start_of_turn>model` spliced into
-`content`, the whole reasoning pass delivered as content, no `<think>` split.
-One line in the log said why:
-`jinja render failed (Unknown statement: include), falling back to generic chat format`.
-
-transformers >= 5 saves the real template to `chat_template.jinja` and writes
-`{% include 'chat_template.jinja' %}` into `tokenizer_config.json` as the
-`chat_template` value. We read `tokenizer_config.json` FIRST and only fall back
-to the sidecar when that key is absent — so a pack carrying both got the
-one-line pointer, jinja.cpp has no `include` statement, the render failed, and
-`fallbackFormatChat` served a wrong-family prompt. The model was fine; the
-prompt was not. poolside's own pack ships no `chat_template` key at all, which
-is why the same byte-identical template worked there.
-
-Fix: `isIncludeStub` reads a `chat_template` that is exactly one `{% include %}`
-statement as "no inline template" and returns null, so the existing sidecar
-fallback loads the file the stub was pointing at. Scoped tight — a template
-containing an include AND anything else is left alone (it cannot render either
-way, and guessing a different file would be worse than a named failure).
-
-Class lesson: the silent-fallback class again (control bytes, missing template,
-now an unsupported statement) — every one of them presents as MODEL misbehavior,
-and the tell is always the same single log line plus wrong-family markers in the
-output. When a checkpoint answers in another family's tags, grep the log for
-`jinja` before touching anything in the arch. Guard: the include-stub cases in
-chat.zig's `chat_template accepts HF's list-of-named-templates shape`.
-
-### Qwen3.8's template raises on every extra-context value we send, and its fallback is ChatML so nothing looks wrong (2026-08-14)
-Checked ahead of the Qwen3.8-27B release against `Qwen/Qwen3.8-2.4T-A95B` (the first public 3.8 checkpoint; the 27B repo is still gated and every `Qwen3.8-27B-*` repo on HF is a README placeholder). The model side is a non-event: `model_type` is `qwen3_5_moe_text`, the config keys are a strict subset of what `model.zig` already parses, the tokenizer's pre-tokenizer regex and 248320 vocab are byte-identical to 3.6, and the 27B geometry the card advertises (5120 hidden, 64 layers, 24Q/4KV hd256, GDN 48V/16QK hd128, FFN 17408, rope 1e7, 262144 ctx, `mtp_num_hidden_layers: 1`) is the Qwen3.6-27B config we already serve. The break is entirely in `chat_template.jinja`, which grew two `raise_exception` gates 3.6 did not have:
-
-- `{%- if enable_thinking is defined and enable_thinking is false %}{{- raise_exception('Disabling thinking is not supported.') }}`. 3.6 answered the same condition by rendering a CLOSED `<think>\n\n</think>\n\n`; 3.8 refuses. Every thinking-off request raises.
-- `{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}` followed by a raise on anything outside `('xhigh', 'medium', 'low')`. `serializeExtraContext` sends hy3's blanket `"high"` on every thinking request and `"no_think"` on every thinking-off one, so **both** arms raise — 3.6 never read the key at all.
-
-Rendered through our own `libjinja.a` the two failures are `Jinja Exception: Unexpected reasoning effort high. Supported types are xhigh (default), medium, and low.` and `Jinja Exception: Disabling thinking is not supported.` — i.e. 100% of requests would have fallen through to `fallbackFormatChat`. This family is worse to diagnose than Inkling's version of the same class: Inkling's fallback swaps its channel markers for `<|im_start|>`, which is unmissable, while Qwen3.8's own format IS ChatML — the downgrade keeps the right turn markers and stop token and shows up only as a missing tools preamble, a missing `<think>` opener and a model that has never heard of the tools you declared.
-
-Fix: `serializeExtraContext` sniffs the jinja string literal `'xhigh'` (present in both the `|default('xhigh')` line and the accepted-values tuple, so a reworded raise message can't drift the detection), maps the client's effort through `qwen38EffortFor` (`high`/`xhigh`/`max`/unknown → xhigh, the template's own default; `medium` → medium; `low`/`minimal`/`none` → low), and never emits `enable_thinking:false` for the family. Thinking-off is then served the way LFM2.5's unconditional opener already is: render on the low arm, and let `noThinkTailSuffix` close the `<think>` the generation prompt opened, which is what makes thinking-off a real skip instead of a discarded reasoning pass. Guard: `src/fixtures/qwen38_chat_template.jinja` + the hermetic render test, pinning both thinking arms, the effort mapping, and the `</think>` commit.
-
-Two things this checkpoint changes that are NOT bugs but will show up in traffic: `preserve_thinking` now defaults to preserving reasoning on ALL prior turns (3.6 kept it only after the last user message), so round-tripped `reasoning_content` grows the prompt on every later turn; and the generation prompt always ends `<|im_start|>assistant\n<think>\n`, so `promptOpensThink` (not the request flag) is what the streaming surfaces must seed `in_think_block` from — already the rule since LFM2-VL. Still open until the 27B lands: its `vision_config` is not public, and if it enables `deepstack_visual_indexes` (3.6-27B ships the list empty) `qwen_vision.zig` has no DeepStack path.
-
-Addendum (2026-08-14, the 27B shipped): the two gates are NOT one family trait. The released `Qwen/Qwen3.8-27B` keeps the effort raise verbatim but moves it INSIDE `{%- if enable_thinking is undefined or enable_thinking is true %}` and drops the thinking-off refusal entirely, answering that arm the 3.6 way with `<think>\n\n</think>\n\n` and no reasoning-instructions line. Sniffing the shared `'xhigh'` literal for BOTH decisions therefore forced every 27B thinking-off request onto the thinking-on arm at effort low, which injects a system message the checkpoint never renders there (measured: 40 prompt tokens of preamble on a 20-token prompt) and leaves the block to be closed by `noThinkTailSuffix` instead of by the template. The effort mapping stays keyed on `'xhigh'` (both variants raise on OpenAI's "high", so the mapping is what stops 100% of thinking-on requests falling back); the `enable_thinking:false` withholding is now keyed on `Disabling thinking is not supported`, the refusal itself. Guard: `src/fixtures/qwen38_27b_chat_template.jinja` + its own hermetic render test beside the 2.4T one, pinning that the accepting variant renders the closed block with no preamble and nothing appended after it.
-
-
-## The Hermes JSON arm had no truncation salvage (2026-08-28)
-
-Every tag dialect recovers NAME + `{}` when the model runs out of tokens (or emits EOS) mid-call: XML function-tag, pythonic, DSML, ATEM, Gemma. The Hermes `<tool_call>{JSON}` arm only handled the "object balanced, close tag missing" case (`balancedJsonObject`). A qwen4_exp `edit` call of ~4.4 KB that hit EOS inside a string value never balanced, no arm claimed it, `parseToolCalls` returned null, and the stream flush cut the visible text at `<tool_call>` (`trimLeakedToolMarkup`) — an empty `stop` with 1,080 generated tokens and nothing the client could nudge on. A fork "fixed" it by shipping the raw buffer as content; that re-opens the leak class the trim exists for. Fix: `truncatedJsonCallName` — a string-aware scan for a depth-1 `"name"` key with a complete string value; the call ships as NAME + `{}` like the other dialects, so the client fires its truncated-call nudge. Guard: `test "parseToolCalls: <tool_call>{JSON} truncated mid-string recovers NAME + {} (never a fragment)"`. Whether the model emits EOS with budget left is a checkpoint property, not ours.
-
-
-## MiniCPM5 V3 XML, and a hand-maintained prefix ladder that silently omitted a rung (2026-08-29)
-
-MiniCPM5 V3's native tool call is attribute-quoted XML with no outer wrapper — `<function name="shell"><param name="command">pwd</param></function>` — which matched no existing dialect: the marker is `<function` (never `<tool`), and the quoted-attribute shape differs from the equals-sign Hermes function-tag form (`<function=NAME>`) the parser already handled. `parseMiniCpm5ToolCalls` scans it CDATA-aware (`miniCpm5FindCloseTag` jumps `<![CDATA[…]]>` payloads so a literal `</param>`/`</function>` inside a value cannot truncate the call), dedups duplicate `<param name="K">` first-wins, and on truncation recovers the name plus any COMPLETE parameter pairs while dropping the trailing fragment. It sits after every explicit tag arm and before the raw-JSON fallback, gated on `calls.items.len == 0`; the byte after `<function` (`=` vs whitespace) is what keeps it disjoint from both Hermes paths, pinned by `test "parseToolCalls minicpm5: the three <function arms stay disjoint"`.
-
-The interesting failure is the streaming gate, and it is a CLASS, not an instance. `streamShouldBufferForTools` holds a growing marker via `tail_prefixes`, a hand-written ladder of every partial spelling. The MiniCPM5 rungs shipped as `<f`, `<fu`, `<fun`, `<func`, `<functi`, `<functio`, `<function` — **`<funct` was missing**. `<funct` is a real decomposition in this vocabulary (`<f` id 54303 + `unct` id 14185 decode to exactly `<funct`), so a token boundary landing there flushed the fragment as visible content and leaked the rest of the tag; the end-of-stream parse then delivered the same call properly. SSE is append-only, so the leaked bytes are unrecoverable. The unit test could not see it because it was a second hand-written copy of the array and inherited the same gap — **the defect and its test were the same list, written twice**. Symptom signature: a lone tag fragment in visible content followed by the identical call arriving as a proper structured tool call.
-
-Three rules came out of it, and each has a guard:
-
-1. **Derive a ladder's test from the marker string, never enumerate it.** `test "streamShouldBufferForTools: EVERY growing prefix of <function holds"` generates its assertions by slicing `"<function"`, so a rung missing from the array fails even if nobody adds an assertion. (SGLang's reference `MiniCPM5Detector` computes the same check at runtime via `_ends_with_partial_token` — independent corroboration of the class, not of the fix.)
-2. **A gate check must be a strict SUPERSET of its parser.** The original `<function` branch held on any following whitespace, so one `<function foo>` in prose silenced the rest of a tool-enabled turn (the hold is monotonic over a buffer that never shrinks). The tightening is an ARRIVAL-STATE predicate, `functionOpenerHoldsForTools`: unresolved (no `>` yet) holds, resolved-with-a-quoted-`name=` holds, resolved-without releases and keeps scanning. It cannot be tightened to "`name=` immediately after the whitespace" — `miniCpm5AttrValue` finds `name=` anywhere in the opener, so `<function foo name="x">` IS a real call, and a gate stricter than its parser flushes that opener as content and then emits the call anyway: leak AND duplicate. Delegating the test to `miniCpm5AttrValue` makes the gate's acceptance derived from the parser's rather than hand-mirrored, which is the drift channel that produced both defects. Pinned by `test "…: the gate is a strict SUPERSET of parseMiniCpm5ToolCalls"`, which walks every prefix of parser-accepted MiniCPM5 fixtures. It covers the ATTRIBUTE form only — the bare `<function=` dialect is the known gap below, and this test deliberately does not claim it.
-3. **The class guard belongs in the corpus, not in the dialect's own tests.** `test "format corpus: no flush boundary lands inside a tool-call opener, any family"` replays the gate at every interior byte offset of every splittable opener across every entry, so upstream's `<tool_call>`, `<|tool_call`, `<atem:` and `<｜DSML｜` ladders are retroactively covered. Its marker list is a deliberately DECORRELATED second list, not an automatic one: a dialect added later inherits nothing until its marker is added there, and the walk covers only bytes INTERIOR to a marker — a gap in what follows a completed marker (see below) is out of its reach and needs a full-call prefix replay instead. Scope is deliberate on both sides: only markers a tokenizer can split (Inkling's `<|content_*|>` and Muse's `<|start|>` are single special tokens that arrive whole — no interior offset is reachable and upstream gives them no rungs by design), and only entries that produce a call (`<function` also occurs inside the prose word `<functional`, which must flush). Verified red-on-revert at BOTH levels: deleting the `<funct` rung fails the derived unit test *and* the corpus invariant independently.
-
-### Known gap, deliberately NOT closed here: bare Hermes `<function=NAME>`
-
-`parseToolCalls` accepts bare Hermes with the `<tool_call>` wrapper dropped (the `<function=` + `<parameter=` fallback), but the streaming gate has no arm for it, so the opener can stream as content and the same call then arrive structurally. That is a leak-and-duplicate of the same shape as this gotcha, one byte past the marker the ladder covers — and it PREDATES MiniCPM5: `main`'s gate has no `<function` handling at all.
-
-It is not closed in this change, and the attempt is worth recording. Two designs were tried and both were wrong. An unconditional hold on `=` can never resolve to false, so any prose spelling the tag out — docs, changelogs, this file — buffered to end of stream and was then truncated by `trimLeakedToolMarkup`. An arrival-state hold (release once the text after `>` is neither whitespace nor a `<parameter=` prefix) fixes the prose but breaks the superset the other way: replaying `src/fixtures/tool_traffic.jsonl` shows **84 of 3,236** real `<function=` openers have a NON-adjacent first `<parameter=`, so the gate would release on ~2.6% of genuine calls. Closing this properly needs the parser and gate to agree on one grammar, which is a parser change with its own evidence and its own tests — a separate PR, not a rider on this one.
-
-The generalisable lesson is about the INSTRUMENTS: a ladder test derived from a marker proves the ladder, and a corpus walk over marker interiors proves the interiors — **neither says anything about the byte after the marker.** A dialect whose discriminator is that byte needs a prefix replay over a complete parser-accepted call.
-
-Comparative note (SGLang `MiniCPM5Detector`, read-only reference, never a dependency): on the same eight dimensions mlx-serve is stronger on CDATA-held close tags (SGLang's non-greedy `<function.*?</function>` regex loses the whole first call) and on truncation salvage; it deliberately diverges on unknown/duplicate/missing-required parameters, where SGLang rejects the entire call and re-emits the block as `normal_text` — which is markup leaking as visible content by design, the one reference behaviour we must not copy. Value typing matches at the chokepoint (`coerceToolArgsToSchema` turns `"3"` into `3`), not at the parser. Value trimming diverges deliberately: SGLang `.strip()`s all surrounding whitespace; mlx-serve removes only the template's own framing, sharing `stripHermesValueFraming` with the `<parameter=>` dialect so `<param>` inherits the exactly-one-newline-per-side rule instead of re-deriving a looser one.
-
-## A model that opens its OWN think block had no way in (Gemma 4, LFM2.5-8B-A1B, muse; 2026-09-07/08)
-
-Three checkpoints streamed their whole chain of thought as the visible answer
-while the same request non-streamed split correctly. A stream enters the think
-block only from `prompt_opened_think` or, on the tools path, from the buffered
-gate; when the template opens nothing the MODEL emits the opener, and the plain
-content arm had no way to see it:
-
-- Gemma 4: `<|channel>` then the bare word `thought`, the marker dropped by
-  `isChannelMarkerToken`, so only `thought` reached the arm.
-- LFM2.5-8B-A1B (`<|im_start|>assistant\n`, no `<think>` in the prompt): the
-  model's first token is `<think>`, which the SAME marker skip swallowed.
-- Muse-Glimmer with `enable_thinking:true` and no tools (prompt ends at
-  `<|start|>assistant`): the model writes ` to=self<|message|>` itself, and the
-  header skip only armed on a `<|start|>` TOKEN, which sat in the prompt.
-
-Fix: `chat.modelThinkOpener` latches on a bare `<think>` or the armed `thought`,
-checked BEFORE the marker skip, seeding `think_buf` so the in-block arm strips
-it like a template-injected one; `promptOpensMuseHeader` arms the header skip at
-stream start and `museHeaderOpensReasoning` routes a `self` header to reasoning
-(the Anthropic site opens its `thinking` block there via
-`openAnthropicThinkingBlock`). All streaming surfaces.
-
-Guard: `tests/test_thinking_tools.sh` Test 6b and the per-arch
-`tests/test_smoke_matrix.sh` thinking check: the same temp-0 request streamed
-and not must agree on the split. A tag grep cannot see this class.
-
-
-## A duplicated key defeated container coercion (#402, 2026-09-12)
-
-Qwen Code's `ask_user_question` declares `questions` as an array; Flash Next
-shipped it through the Hermes XML dialect as a string whose items repeated
-`header` with the same value. `coerceValueToType` strict-parses such a string
-(std.json rejects duplicate keys), then re-emits it tolerantly and strict-parses
-again, and the tolerant emitter keeps the repeat, so both parses failed and the
-string reached the client unchanged: `Parameter "questions" must be an array`.
-
-Fix: `parseContainerAllowingRepeats` parses first-wins and last-wins and accepts
-the document only when both agree. An identical repeat carries no ambiguity; a
-conflicting one stays a string rather than picking a value. A failed container
-coercion now logs at debug. Guard: the identical-vs-conflicting duplicate test
-beside `coerceToolArgsToSchema`.
-
-## Thinking loops at long context were the model re-reading its own reasoning (2026-09-22)
-
-A pi session on Qwen3.8 hit `[loop-stop] near_repeat` on every long turn past
-~100k tokens ("OK I'm going in circles"), on every quant and on the 27B.
-Spec decode, the prefix cache and the sampler were each ruled out by replaying
-the captured request with them off.
-
-Cause: pi round-trips `reasoning_content` for every assistant turn, and the
-Qwen3.8 template renders `<think>` for ALL of them when `preserve_thinking` is
-undefined. Half the rendered prompt was prior reasoning, including the
-previous turn's loop.
-
-Fix: `serializeExtraContext` forced `preserve_thinking:false`. Reversed on
-2026-10-04: on the imatrix Flash Next pack a real 162-turn pi session replayed
-at 60k-170k tokens looped 0 of 24 times either way, preserve-on scored +2.5 on
-tool-eval-bench (the multi-turn scenarios), and preserve-off re-prefilled up to
-44k tokens at every user follow-up because dropping prior reasoning moves the
-prefix. The template default stands; `chat_template_kwargs`
-`preserve_thinking:false` (request or `model-settings.json`) restores the old
-behaviour. A loop in history is the re-seed: non-streaming replies arrive with
-it cut (`loopTrimmedIds`), a streamed one cannot be retracted.
-Guard: the `preserve_thinking` test beside `serializeExtraContext`,
-`resolveChatThinking` in `server.zig`.
-
-## A no-tools reply was scrubbed to nothing, but only when not streaming (LFM2.5, 2026-09-24)
-
-A system prompt that listed a tool in LFM's own format, with no `tools` field,
-made LFM2.5 answer `<|tool_call_start|>[get_weather(city='Paris')]<|tool_call_end|>`.
-Streaming sent it raw; non-stream returned `content: ""` with `finish_reason: stop`
-on chat, messages and responses.
-
-Cause: `splitThinkBlock` runs `trimLeakedToolMarkup` on every non-stream reply,
-and `"<|tool_call"` is a prefix of LFM's opener. The stream gate only runs with
-tools. vLLM, SGLang, llama.cpp and Ollama parse tool calls only when the request
-has tools and otherwise pass the text through.
-
-Fix: the non-stream split keeps markup when the request has no tools (chat,
-messages, responses), matching the stream and the other engines.
-Guard: `tests/test_no_tools_markup_passthrough.sh`.
-
-## Tool results were rewritten into user turns on a generic role header (MiMo, 2026-10-02)
-
-MiMo-V2.6's template renders every non-assistant turn as
-`<|im_start|>{{ message.role }}`, so it never spells `'tool'`. Our literal
-check read that as "no tool role" and rewrote each tool result into a user
-turn wrapped in `<tool_response>`, a format the model was not trained on.
-
-Cause: `templateReferencesToolRole` looked for the `'tool'` string only.
-
-Fix: a template that renders assistant `tool_calls` but names no tool role is
-probe-rendered with one tool message (`templateRendersToolTurn`); when its
-content survives, tool turns render natively. Templates without tool-call
-support keep the rewrite.
-Guard: `renderChatTemplate: a tool-aware template with a generic role header
-renders tool turns natively` in `chat.zig`.
-
-## jinja.cpp read `x.0` as a name, and GLM-5 tool history fell back
-
-GLM-5.3-Flash's template renders tool-call history through `tc.arguments.items()` reached via an integer property (`obj.0`). jinja.cpp parsed the `0` after the dot as an identifier, the lookup raised, and every conversation with a tool turn went to the generic fallback: the model saw Gemma-style turns, wrote `<end_of_turn>` into its reply and lost its own stop token.
-
-Fix: `parser.cpp` marks a member access whose property is an integer literal as computed, so `x.0` indexes like `x[0]`.
-Guard: the GLM tool-history render test in `chat.zig` (native `<tool_call>` turns, no fallback markers) and `tests/test_glm5_next.sh` [4].
-
-## jinja.cpp did not lex `\x00`, and every Flint turn fell back (2026-10-21)
-
-Recursive Flint's template strips NUL bytes from user text with `replace("\x00", "")`. jinja.cpp's lexer knew no `\x` escape, so the template raised at LEX time and every request rendered `fallbackFormatChat`: Gemma turn markers, no `<|assistant|>` header, the wrong stop tokens. Nothing in the log looked arch-specific.
-
-Fix: `lexer.cpp` reads `\xHH` as Python does: code point U+00HH, emitted as UTF-8.
-Guard: the Flint render test in `chat.zig` (byte-exact against jinja2 with HF's settings) and `tests/test_flint.sh` [4].
-
-## `tool_choice: "required"` was a request, not a constraint (2026-10-04)
-
-tool-eval-bench TC-45 sent `tool_choice: "required"` with "What is 7 times 8?" to Qwen3.8 Flash Next and got text. Its probe ("Reply with the single word OK. Do not call any tools.") then showed why a fix in the prompt is not enough: with the instruction line delivered, the model obeyed the user and the bench excluded the scenario as unenforced.
-
-Cause: all three surfaces turned `tool_choice` into an instruction line, which `renderChatTemplate` passed only to the paths that inline our own tool prompt; a template that renders the tools itself dropped it. Even delivered, a line is advice.
-
-Fix: the line reaches every template (`synthesizeToolFallbackMessages`), and the call is forced at decode: `armToolForce` arms a `ToolForce` whose opener (`chat.forcedToolOpener`, `<tool_call>\n<function` plus `=name>` for a named choice) `toolForceTick` commits once the think block closes. A thought still open with a quarter of `max_tokens` left is closed for the call (at `xhigh` the probe's 256 tokens were all thought). The request decodes plain so no draft round passes the closer. Dialects without a known opener keep the line only.
-Follow-up: llmprobe's forced weather call came back as `tool`, `weather` or `functions.get_weather`. The opener ended on a lone `=`, but Qwen's pre-tokenizer joins `=` to the name (`=get` is one token), so the model wrote a name that tokenizes after a lone `=`; and when its own next token was already `<tool_call>` it was published before the opener, which then opened the call twice. The opener now stops before `=` and skips the model's pending token when it matches.
-Guard: `tests/test_tool_choice_required.sh` (red with the enforcement or the deadline stubbed, and on the old opener: a call the model makes anyway must keep the declared name on every surface), `ToolForce` + `forcedToolOpener` unit tests.
-
-## DeepSeek-V4.1's own chat template does not render in jinja.cpp (2026-10-06)
-
-Defect: DeepSeek's `chat_template.jinja` failed on every request in jinja.cpp (`Unexpected token: *`), which is the silent generic fallback.
-Cause: it builds tool schemas with `dict(schema.d, **{k: v})`; jinja.cpp has no `**` unpacking, and `dict(d, key=v)` and chained comparisons also fail there. It also drops a newline right after a block tag where jinja2 keeps it.
-Fix: V4.1 always renders OUR transcription of `encoding/encoding.py` (`src/fixtures/dsv41_chat_template.jinja`), newlines after tags spelled out; V4.1 also spaces its DSML tag names (`<｜DSML｜ invoke`), so the parser accepts both spellings.
-Guard: `tests/dsv41_template_ab.py` (byte-exact vs the encoder) dumps the cases `chat: the embedded V4.1 template renders through jinja.cpp byte-exact` replays; corpus family `dsv41-dsml`.
-
-## Qwen3.8 Flash Next wrote Claude's tool markup, and the agent's turn ended (#928)
-
-Defect: in long pi sessions the iQ-MLX-4.7bpw pack sometimes answered with a complete `<invoke name="bash"><parameter name="command">…</parameter></invoke>` block as plain content, `finish_reason: "stop"`, no `tool_calls`. The agent took it as a final answer and stopped.
-Cause: the checkpoint has seen Claude transcripts and samples their dialect in place of its own `<tool_call>`. No parser knew a bare `<invoke` (only ATEM's `<atem:invoke` and DSML's), and neither the stream gate nor the scrubber held or cut it.
-Fix: `BARE_INVOKE` is ATEM's grammar without the namespace, parsed when no other family matched, as `.inferred` so an undeclared name stays prose; `invokeOpenerHoldsForTools` holds `<function_calls>` and `<invoke …` with every growing prefix; `bareInvokeMarkupCut` cuts it only beside a `<parameter ` or `</invoke>`.
-Guard: corpus family `qwen4_exp` (call, undeclared name, prose), `parseToolCalls: Anthropic-style bare <invoke> markup…`, `…a bare <invoke> in prose or inside another dialect's value is not a call` (it once ran before the `<tool` scan, so an echoed `<invoke>` inside a native call's value replaced the call) and the derived-prefix gate test in `chat.zig`.
-
-## Flint doubled its key opener, and Claude Code saw the key `<arg_key>file_path` (2026-10-22)
-
-Defect: in a Claude Code session on Flint (release agent run) an `Edit` call arrived with the argument key `<arg_key>file_path`; Claude Code rejected it as an unexpected parameter and the agent spent a turn retrying.
-Cause: the GLM pair loop takes the key as everything between the `<arg_key>` opener and the next close, so a doubled opener (`<arg_key><arg_key>file_path</arg_key>`) kept the inner opener in the key.
-Fix: the key starts after the LAST opener before its close (`parseHy3ToolCalls`).
-Guard: corpus family `flint`, "a doubled <arg_key> opener keeps the key", and the universal invariant that no parsed argument KEY carries a line break or markup.

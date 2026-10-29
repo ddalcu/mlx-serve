@@ -50,7 +50,7 @@ final class KoreanLocalizationTests: XCTestCase {
 
     func testKoreanPermissionDescriptionsResolve() throws {
         let bundle = try XCTUnwrap(Bundle(url: resources.appendingPathComponent("ko.lproj")))
-        for key in ["NSAppleEventsUsageDescription", "NSLocalNetworkUsageDescription", "NSMicrophoneUsageDescription", "NSSpeechRecognitionUsageDescription"] {
+        for key in ["NSAppleEventsUsageDescription", "NSLocalNetworkUsageDescription", "NSMicrophoneUsageDescription"] {
             let value = bundle.localizedString(forKey: key, value: nil, table: "InfoPlist")
             XCTAssertNotEqual(value, key)
             XCTAssertTrue(value.unicodeScalars.contains { (0xAC00...0xD7A3).contains($0.value) })

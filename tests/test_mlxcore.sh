@@ -1,27 +1,15 @@
 #!/bin/bash
-# End-to-end test for MLX Core app via AppleScript UI automation + API monitoring.
+# test_mlxcore.sh — the MLX Core app end to end through AppleScript UI automation + API monitoring: builds and launches
+# the app if it is not running (waits 90 s for its embedded server on $PORT), opens a chat, enables agent mode, sends
+# prompts, and validates tool calls and responses from the server log, chat history and API requests.
 #
-# Self-bootstraps: if MLX Core isn't running, this script builds (if needed)
-# and launches the app, then waits up to 90s for its embedded mlx-serve to
-# come up on $PORT. If no model is configured to auto-load on launch and the
-# server never appears, the script SKIPs cleanly (exit 0) with instructions
-# so CI doesn't see it as a hard failure.
+#   ./tests/test_mlxcore.sh [port]
 #
-# Requires:
-#   - Accessibility permissions for Terminal (System Settings → Privacy → Accessibility)
-#     for the UI-automation half. API-only tests still run without it.
-#
-# What it does:
-#   1. Builds and launches MLX Core if not running
-#   2. Opens a chat window in MLX Core
-#   3. Enables agent mode
-#   4. Types test prompts and sends them
-#   5. Monitors server logs, chat history, and API requests
-#   6. Validates tool calls and responses
-#
-# Usage: ./tests/test_mlxcore.sh [port]
+# The UI half needs Accessibility permission for Terminal; API-only checks run without it. SKIPs (exit 0) when no
+# model auto-loads and the server never appears.
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"
@@ -105,10 +93,7 @@ pass "MLX Core app is running"
 # 90s — if it never comes up, that's a "model not configured" SKIP, not a
 # test failure.
 SERVER_UP=0
-for _ in $(seq 1 180); do
-    if curl -sf "$BASE/health" > /dev/null 2>&1; then SERVER_UP=1; break; fi
-    sleep 0.5
-done
+srv_wait_health "$BASE" 180 0.5 && SERVER_UP=1
 if [[ "$SERVER_UP" -eq 1 ]]; then
     pass "Server is healthy on port $PORT"
 else

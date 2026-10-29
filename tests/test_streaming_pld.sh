@@ -1,27 +1,8 @@
 #!/bin/bash
-# Streaming PLD byte-equivalence test.
+# test_streaming_pld.sh — streaming PLD byte-equivalence: concatenated temp-0 stream deltas with --pld equal the same
+# stream without it (the streaming adapter must not drop, duplicate or reorder tokens across multi-token verifies).
 #
-# Verifies that running the same temp=0 chat completion request with
-# `stream: true` against `--pld` produces *identical* concatenated text to
-# the same request without `--pld`. PLD's streaming path uses the new
-# StreamingTokenStream adapter; this is the regression check that the
-# adapter doesn't drop / duplicate / reorder tokens vs the regular path.
-#
-# The chosen prompt is echo-heavy on purpose: the model is asked to repeat
-# a code snippet with a small rename. That gives PLD's n-gram lookup plenty
-# of long matches → high acceptance and a real exercise of the multi-token
-# verify path.
-#
-# Requires:
-#   - A built mlx-serve binary (run `zig build -Doptimize=ReleaseFast` first)
-#   - Either:
-#       PLD_TEST_MODEL set to a model directory, OR
-#       a default MLX checkpoint at ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#
-# Usage:
-#   PLD_TEST_MODEL=/path/to/model ./tests/test_streaming_pld.sh [port]
-#
-# Exits 0 with a SKIP message if no model is available.
+#   PLD_TEST_MODEL=<dir> ./tests/test_streaming_pld.sh [port]   # default gemma-4-e4b-it-8bit; SKIP without one
 
 set -e
 

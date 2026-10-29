@@ -19,6 +19,7 @@
 #   BINARY   Path to mlx-serve. Default ./zig-out/bin/mlx-serve.
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${PORT:-19101}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -45,11 +46,7 @@ trap cleanup EXIT INT TERM
 "$BIN" --model "$MODEL" --serve --port "$PORT" --ctx-size 4096 \
     --log-level warn > "$LOG" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 180); do
-    curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && break
-    kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$LOG"; exit 1; }
-    sleep 0.5
-done
+srv_wait_health "$BASE" 180 0.5 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$LOG"; exit 1; }
 
 EC=0
 RESULTS=()

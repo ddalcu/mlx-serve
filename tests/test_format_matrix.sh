@@ -1,34 +1,16 @@
 #!/bin/bash
-# test_format_matrix.sh — cross-model-family format-correctness matrix.
+# test_format_matrix.sh — live format matrix: 7 format-family representatives (Qwen think tags, Gemma 4 channel tags,
+# Qwen MoE raw JSON, Gemma 3 fallback, GGUF/llama.cpp, DSV4-Flash/ds4) x 7 checks, one model at a time on port 11297.
 #
-# Live layer of the format test suite (the hermetic layer is
-# src/format_corpus_test.zig — run `zig build test -Dtest-filter="format corpus"`).
-# Boots ~6 format-class representatives one at a time and asserts, per model:
+#   FORMAT_MODELS=qwen36,gemma4-e4b ./tests/test_format_matrix.sh   # csv of logical names; gemma4-e4b ~3 min
 #
-#   1. Thinking OFF baseline: answer in content, no control-tag leak
-#   2. Thinking ON truncated: reasoning_content only, content empty/clean
-#      (pins the Qwen template-opened-thinking leak at the HTTP level)
-#   3. Thinking ON full round: answer in content, reasoning separated,
-#      usage.completion_tokens_details.reasoning_tokens > 0
-#   4. Stream + tools (+thinking where supported): answer arrives as CONTENT
-#      deltas, no leak (pins the answer-misfiled-as-reasoning stream bug)
-#   5. Tool-call fidelity, non-stream: write tool, path byte-exact
-#      (pins the unterminated <|"|> brace-swallow bug live)
-#   6. Tool-call fidelity, stream: same via accumulated delta.tool_calls
-#   7. Omitted max_tokens: long answer must NOT truncate at the old 256 default
-#
-# Servers boot with --log-level debug; on any FAIL the model's raw-output dump
-# lines ("raw generated text before tool parse") are echoed for instant
-# harvesting into src/format_corpus_test.zig.
-#
-# Usage: ./tests/test_format_matrix.sh
-#   FORMAT_MODELS=qwen36,gemma4-e4b  — csv filter of logical names
-#   Missing model paths skip cleanly (exit 0 if nothing ran but nothing failed).
-#
-# Runtime: ~3–6 min/model, ~20–30 min full matrix.
-# FORMAT_MODELS=gemma4-e4b is the ~3 min smoke run.
+# Checks: thinking off/on/truncated split, stream + tools content routing, tool-argument byte fidelity (chat and
+# /v1/messages tool_use, stream and not), omitted max_tokens not cut at the old 256 default. Missing models skip.
+# On a FAIL the server's `raw generated text before tool parse` lines are echoed for harvesting into the hermetic
+# layer, src/host/chat/format_corpus_test.zig (`zig build test -Dtest-filter="format corpus"`).
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 cd "$(dirname "$0")/.."
 source tests/_lib_models.sh
@@ -185,11 +167,7 @@ run_model() {
 
     # MoE models can take 90+ s on cold weight pages — allow 240 s.
     local up=0
-    for _ in $(seq 1 120); do
-        if curl -sf "$BASE/health" >/dev/null 2>&1; then up=1; break; fi
-        if ! kill -0 "$sp" 2>/dev/null; then break; fi
-        sleep 2
-    done
+    srv_wait_health "$BASE" 120 2 "$sp" && up=1
     if [ "$up" != "1" ]; then
         check "[$logical] server boots" 0
         echo "  server log tail:"; tail -10 "$log" | sed 's/^/    /'

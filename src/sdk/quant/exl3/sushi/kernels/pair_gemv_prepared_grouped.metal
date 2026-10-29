@@ -1,0 +1,16 @@
+constexpr uint TILE = 16u;
+constexpr uint N = uint(NHW);
+constexpr uint PACKED_W = N / 2u;
+constexpr uint IT = uint(IDIM) / TILE;
+constexpr uint OT = uint(ODIM) / TILE;
+constexpr uint SGS = 4u;
+threadgroup float partial[4 * 16 * uint(OTPT) * uint(GROUP)];
+const uint ot = uint(threadgroup_position_in_grid.x) * uint(OTPT);
+const uint first = uint(threadgroup_position_in_grid.y);
+const uint split = uint(threadgroup_position_in_grid.z);
+const uint sg = uint(simdgroup_index_in_threadgroup);
+const uint lane = uint(thread_index_in_simdgroup);
+const uint lid = uint(thread_index_in_threadgroup);
+const uint tiles_per_split = (IT + uint(NSPLIT) - 1u) / uint(NSPLIT);
+const uint tk0 = split * tiles_per_split;
+const uint tk1 = min(tk0 + tiles_per_split, IT);

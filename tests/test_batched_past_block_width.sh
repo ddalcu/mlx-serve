@@ -7,6 +7,7 @@
 #
 # Usage: [BLOCK_WIDTH_MODEL=<model-dir>] ./tests/test_batched_past_block_width.sh [port]
 set -u
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 MODEL="${BLOCK_WIDTH_MODEL:-$(find_fitting_model ddalcu/Qwen3.8-27B-MLX-Serve-4bit)}"
 PORT="${1:-11433}"
@@ -19,9 +20,8 @@ LOG=$(mktemp); OUT=$(mktemp -d)
 SRV=$!
 cleanup() { kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; rm -rf "$LOG" "$OUT"; }
 trap cleanup EXIT
-for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null && break; sleep 1; done
-curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL server did not become healthy"; tail -20 "$LOG"; exit 1; }
-EXCERPT=$(head -c 5000 src/pld_index.zig | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
+srv_wait_health "http://127.0.0.1:$PORT" 600 1 || { echo "FAIL server did not become healthy"; tail -20 "$LOG"; exit 1; }
+EXCERPT=$(head -c 5000 src/engines/mlx/spec/pld_index.zig | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')
 PIDS=()
 for i in $(seq 1 $STREAMS); do
     printf '{"model":"m","stream":true,"max_tokens":128,"temperature":0.7,"messages":[{"role":"user","content":"Reviewer %d of %d. Explain this Zig excerpt and list three improvements:\\n\\n%s"}]}' "$i" "$STREAMS" "$(echo "$EXCERPT" | sed 's/^"//; s/"$//')" > "$OUT/req$i.json"

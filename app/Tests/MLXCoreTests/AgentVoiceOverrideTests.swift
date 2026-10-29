@@ -24,6 +24,16 @@ final class AgentVoiceOverrideTests: XCTestCase {
             .clone(clipPath: "/c.wav"))
     }
 
+    /// Settings offers Qwen3-TTS, Kokoro and LFM3 only; Kokoro is the default, and a saved system voice becomes it.
+    func testSettingsOfferNoSystemVoiceAndASavedOneBecomesKokoro() throws {
+        XCTAssertEqual(VoiceEngine.selectable, [.clone, .kokoro, .lfm3])
+        XCTAssertEqual(ServerOptions().voiceEngine, .kokoro)
+        let saved = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"voiceEngine":"system"}"#.utf8))
+        XCTAssertEqual(saved.voiceEngine, .kokoro)
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"voiceCloneEnabled":false}"#.utf8))
+        XCTAssertEqual(legacy.voiceEngine, .kokoro)
+    }
+
     func testBlankGlobalKokoroVoiceStillFallsBackToTheDefaultVoice() {
         XCTAssertEqual(ActiveAgentVoice.neuralVoice(
             agent: nil, options: options { $0.voiceEngine = .kokoro; $0.kokoroVoice = "  " }),

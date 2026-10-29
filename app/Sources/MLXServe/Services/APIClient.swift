@@ -193,6 +193,8 @@ class APIClient {
         // never be true without supportsVision, since video piggybacks the
         // same vision tower server-side.
         let supportsVideo = supportsVision && mods.contains("video")
+        // A model that answers in speech itself (LFM3-Audio / Omni): its own voice replaces dictation + TTS.
+        let speaks = (first["output_modalities"] as? [String] ?? []).contains("audio")
         // Encoder-only entries advertise "embeddings" even as unloaded stubs
         // (the server peeks model_type at discovery); architecture is the
         // belt-and-suspenders signal for loaded entries.
@@ -213,6 +215,8 @@ class APIClient {
             supportsVision: supportsVision,
             supportsVideo: supportsVideo,
             supportsEmbeddings: supportsEmbeddings,
+            speaks: speaks,
+            voices: first["voices"] as? [String] ?? [],
             capabilities: caps,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
@@ -232,7 +236,10 @@ class APIClient {
             recTopP: meta["gen_top_p"] as? Double,
             recTopK: meta["gen_top_k"] as? Int,
             lanPeer: (first["lan_peer"] as? String) ?? (first["provider"] as? String),
-            provider: first["provider"] as? String
+            provider: first["provider"] as? String,
+            agentBudget: AgentBudget.parse(first["agent_budget"]),
+            modality: first["modality"] as? String,
+            engines: first["engines"] as? [String] ?? []
         )
     }
 

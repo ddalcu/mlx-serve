@@ -200,11 +200,11 @@ enum ModelBrowserUse {
     /// answer — a media checkpoint is never chat-pickable and a chat model has
     /// no modality. Every on-disk row can then offer a Use, instead of Discover
     /// and the Media pane quietly ending at Delete the way My Models did (#228).
-    static func mediaModel(atPath path: String?, in models: [LocalModel]) -> (model: LocalModel, modality: MediaModality)? {
+    static func mediaModel(atPath path: String?, in models: [LocalModel], rows: [ModelInfo] = []) -> (model: LocalModel, modality: MediaModality)? {
         guard let path, !path.isEmpty else { return nil }
         let wanted = normalize(path)
         guard let m = models.first(where: { normalize($0.path) == wanted }),
-              let modality = MediaModality(modelType: m.modelType) else { return nil }
+              let modality = MediaModality.of(modelType: m.modelType, path: m.path, rows: rows) else { return nil }
         return (m, modality)
     }
 

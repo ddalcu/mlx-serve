@@ -364,7 +364,7 @@ assert(estimateDecodeTps({ id: "gemma-4-e4b", paramsB: 8, activeB: 4, tags: [] }
 // ── USABLE RAM: a fixed OS/driver reserve, NOT a flat percentage ──────────
 // A flat 75% is roughly right at 8 GB and badly wrong at 128 GB, where the
 // absolute overhead is a much smaller share. The anchor is Metal's own
-// max_recommended_working_set_size, which src/server.zig records as ~115 GB
+// max_recommended_working_set_size, which src/host/http/server.zig records as ~115 GB
 // on a 128 GB Mac (see the #64 note there) — not the 96 GB a 75% rule gives.
 {
   assert(Math.abs(usableRamGb(128) - 115) <= 1,

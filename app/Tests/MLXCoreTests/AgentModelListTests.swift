@@ -15,11 +15,11 @@ final class AgentModelListTests: XCTestCase {
 
     private func model(_ name: String, ctx: Int = 65536, caps: [String] = ["chat"],
                        vision: Bool = false, embeddings: Bool = false,
-                       lanPeer: String? = nil) -> ModelInfo {
+                       lanPeer: String? = nil, budget: AgentBudget.Budget? = nil) -> ModelInfo {
         ModelInfo(name: name, quantBits: 4, layers: 32, hiddenSize: 4096,
                   vocabSize: 32000, contextLength: ctx, modelMaxTokens: ctx,
                   supportsVision: vision, supportsEmbeddings: embeddings,
-                  capabilities: caps, lanPeer: lanPeer)
+                  capabilities: caps, lanPeer: lanPeer, agentBudget: budget)
     }
 
     // MARK: entry selection — what the configs list
@@ -36,18 +36,17 @@ final class AgentModelListTests: XCTestCase {
                        "media + embedding entries must never reach an agent CLI's chat picker")
     }
 
-    func testChatEntriesDeriveBudgetsPerModelNotFromTheLoadedOne() {
+    func testChatEntriesTakeEachRowsOwnBudget() {
         // The old single-model plumbing stamped the LOADED model's budget on
         // whatever the config declared. Per-model contexts differ wildly
-        // (262K Qwen vs a 32K GGUF) — each entry derives its own.
+        // (262K Qwen vs a 32K GGUF) — each entry carries its own row's.
+        let big = AgentBudget.Budget(context: 262144, output: 65536, compactionReserve: 20000)
+        let small = AgentBudget.Budget(context: 32768, output: 16384, compactionReserve: 8192)
         let entries = AgentModelEntry.chatEntries(from: [
-            model("big", ctx: 262144),
-            model("small", ctx: 32768),
+            model("big", ctx: 262144, budget: big),
+            model("small", ctx: 32768, budget: small),
         ])
-        XCTAssertEqual(entries[0].budget, AgentBudget.forServerContext(262144))
-        XCTAssertEqual(entries[1].budget, AgentBudget.forServerContext(32768))
-        XCTAssertEqual(entries[0].budget.output, 65536)
-        XCTAssertEqual(entries[1].budget.output, 16384)
+        XCTAssertEqual(entries.map(\.budget), [big, small])
     }
 
     func testChatEntriesIncludeLanPeersWithEmptyCapsAndFlagVision() {
@@ -72,7 +71,7 @@ final class AgentModelListTests: XCTestCase {
         ])
         XCTAssertEqual(entries.map(\.id), ["m", "stub"])
         XCTAssertEqual(entries[1].budget, AgentBudget.fallback,
-                       "a stub with no context metadata gets the conservative fallback, never 0")
+                       "a row with no agent_budget (an older server) gets the conservative fallback")
     }
 
     // MARK: pi live-list extension
@@ -93,14 +92,14 @@ final class AgentModelListTests: XCTestCase {
         XCTAssertTrue(js.contains("openai-completions"))
     }
 
-    func testPiExtensionMirrorsTheAgentBudgetRule() {
-        // The extension computes per-model maxTokens where Swift can't reach
-        // (live fetch, in-guest). The rule must be AgentBudget.forServerContext
-        // verbatim: min(65536, max(1024, ctx/2)), fallback context 32768.
+    func testPiExtensionDeclaresTheServersBudget() {
+        // The extension fetches the rows in-guest where Swift can't reach; it
+        // declares each row's `agent_budget` as served, the fallback only for
+        // an older server's row.
         let js = AgentConfigs.piModelsExtensionJS(baseURL: "http://h:1")
-        XCTAssertTrue(js.contains("Math.min(65536, Math.max(1024, Math.floor(ctx / 2)))"),
-                      "budget rule drifted from AgentBudget: \(js)")
-        XCTAssertTrue(js.contains("32768"), "fallback context missing")
+        XCTAssertTrue(js.contains("row.agent_budget || FALLBACK_BUDGET"), js)
+        XCTAssertTrue(js.contains("contextWindow: budget.context") && js.contains("maxTokens: budget.output"), js)
+        XCTAssertTrue(js.contains("{ context: 32768, output: 8192 }"), "fallback budget missing: \(js)")
     }
 
     func testPiExtensionCarriesCompatOnEveryModel() {
@@ -145,9 +144,9 @@ final class AgentModelListTests: XCTestCase {
 
     func testOpencodeConfigListsEveryEntryWithItsOwnLimits() throws {
         let entries = [
-            AgentModelEntry(id: "qwen3.6-27b", budget: AgentBudget.forServerContext(94729), vision: false),
-            AgentModelEntry(id: "gemma-4-12b", budget: AgentBudget.forServerContext(131072), vision: true),
-            AgentModelEntry(id: "remote@peer1", budget: AgentBudget.forServerContext(32768), vision: false),
+            AgentModelEntry(id: "qwen3.6-27b", budget: AgentBudget.Budget(context: 94729, output: 47364, compactionReserve: 20000), vision: false),
+            AgentModelEntry(id: "gemma-4-12b", budget: AgentBudget.Budget(context: 131072, output: 65536, compactionReserve: 20000), vision: true),
+            AgentModelEntry(id: "remote@peer1", budget: AgentBudget.Budget(context: 32768, output: 16384, compactionReserve: 8192), vision: false),
         ]
         let json = AgentConfigs.opencodeJSON(baseURL: "http://localhost:11234",
                                              defaultModel: "qwen3.6-27b", entries: entries)
@@ -159,7 +158,7 @@ final class AgentModelListTests: XCTestCase {
         let gemma = try XCTUnwrap(models["gemma-4-12b"] as? [String: Any])
         let limit = try XCTUnwrap(gemma["limit"] as? [String: Any])
         XCTAssertEqual(limit["context"] as? Int, 131072)
-        XCTAssertEqual(limit["output"] as? Int, AgentBudget.compactionReserve(131072))
+        XCTAssertEqual(limit["output"] as? Int, 20000)
         XCTAssertEqual(gemma["attachment"] as? Bool, true, "vision entry allows image attachments")
         let qwen = try XCTUnwrap(models["qwen3.6-27b"] as? [String: Any])
         XCTAssertNil(qwen["attachment"], "non-vision entries stay minimal")
@@ -169,7 +168,7 @@ final class AgentModelListTests: XCTestCase {
 
     func testOpencodeSingleModelWrapperStaysCompatible() throws {
         // The MAS instructions panel still renders the single-model shape.
-        let b = AgentBudget.forServerContext(94729)
+        let b = AgentBudget.Budget(context: 94729, output: 47364, compactionReserve: 20000)
         let json = AgentConfigs.opencodeJSON(baseURL: "http://h:1", model: "m", budget: b)
         let obj = try XCTUnwrap(try JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
         let provider = try XCTUnwrap(obj["provider"] as? [String: Any])
@@ -182,12 +181,12 @@ final class AgentModelListTests: XCTestCase {
 
     func testHermesConfigListsEveryEntryWithContextLength() {
         let entries = [
-            AgentModelEntry(id: "qwen3.6-27b", budget: AgentBudget.forServerContext(94729), vision: false),
-            AgentModelEntry(id: "remote@peer1", budget: AgentBudget.forServerContext(78848), vision: false),
+            AgentModelEntry(id: "qwen3.6-27b", budget: AgentBudget.Budget(context: 94729, output: 47364, compactionReserve: 20000), vision: false),
+            AgentModelEntry(id: "remote@peer1", budget: AgentBudget.Budget(context: 78848, output: 39424, compactionReserve: 19712), vision: false),
         ]
         let yaml = AgentConfigs.hermesConfigYAML(
             baseURL: "http://__MLX_HOST__:11234", apiKey: "k1",
-            model: "qwen3.6-27b", budget: AgentBudget.forServerContext(94729),
+            model: "qwen3.6-27b", budget: AgentBudget.Budget(context: 94729, output: 47364, compactionReserve: 20000),
             entries: entries)
         // hermes /model switches among models already in the config
         // (custom_providers[].models.<id>.context_length — per-model key).
@@ -203,7 +202,7 @@ final class AgentModelListTests: XCTestCase {
         // Defensive: registry snapshot empty (server just started) — the
         // config must still carry the served model or hermes re-runs its
         // wizard. Same shape the wizard saves.
-        let b = AgentBudget.Budget(context: 65536, output: 16384)
+        let b = AgentBudget.Budget(context: 65536, output: 16384, compactionReserve: 16384)
         let yaml = AgentConfigs.hermesConfigYAML(baseURL: "http://h:1", apiKey: "k",
                                                  model: "m", budget: b, entries: [])
         XCTAssertTrue(yaml.contains("default: \"m\""), yaml)

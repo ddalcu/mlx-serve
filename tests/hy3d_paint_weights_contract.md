@@ -3,7 +3,7 @@
 BINDING converted-tensor-name contract for the Hunyuan3D-2.1 **paint / texture** pipeline
 (image → multiview albedo + metallic-roughness maps → baked PBR texture). Implemented by
 `tests/convert_hunyuan3d_paint_weights.py` and consumed by the native Zig paint engine
-(`src/hunyuan3d_paint.zig`, in progress) plus the fixture/oracle dumps.
+(`src/plugins/hunyuan3d/paint.zig`, in progress) plus the fixture/oracle dumps.
 
 Sibling of the SHAPE contract implemented by `tests/convert_hunyuan3d_weights.py`. **Read that
 script first** — this stage reuses its `Source` strict-accounting pattern, its `should_quantize`

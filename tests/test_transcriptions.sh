@@ -18,6 +18,7 @@
 #
 # Usage: ASR_MODEL=<dir> ALIGNER_MODEL=<dir> DIARIZER_MODEL=<dir> BINARY=<mlx-serve> ./tests/test_transcriptions.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11443}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BINARY:-$ROOT/zig-out/bin/mlx-serve}"
@@ -36,11 +37,8 @@ trap '[ -n "$SRV" ] && kill $SRV 2>/dev/null; rm -rf "$TMP"' EXIT
 boot() { # extra flags...
   HOME="$TMP/home" "$BIN" --serve --model-dir "$TMP/models" --port "$PORT" --host 127.0.0.1 "$@" >"$LOG" 2>&1 &
   SRV=$!
-  for _ in $(seq 1 60); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-    kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-    sleep 1
-  done
+  srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" && return 0
+  kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
   echo "FAIL: server not healthy"; exit 1
 }
 T=/v1/audio/transcriptions

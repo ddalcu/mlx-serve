@@ -805,7 +805,7 @@
   // NOT a flat percentage. macOS/Metal hold back a roughly FIXED amount, so a
   // 75% rule that looks sane at 8 GB is badly wrong at 128 GB: it would give
   // 96 GB where Metal's own max_recommended_working_set_size is ~115 GB (the
-  // figure src/server.zig's #64 note records on a real 128 GB Mac). Getting
+  // figure src/host/http/server.zig's #64 note records on a real 128 GB Mac). Getting
   // this wrong hid our own 115.4 GB DeepSeek mirror from every 128 GB Mac.
   // ONE rule feeds the board's RAM tiers AND the playground's verdict.
   function usableRamGb(ramGb) { return ramGb - Math.max(3, Math.min(13, ramGb * 0.28)); }

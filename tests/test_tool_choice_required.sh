@@ -1,18 +1,16 @@
 #!/bin/bash
-# `tool_choice` that obliges a call is ENFORCED, not asked for: the prompt tells
-# the model not to call anything, and the reply must still be a call (the
-# tool-eval-bench probe). After the thought closes the server commits the
-# family's tool-call opener; the model writes the call from there.
+# test_tool_choice_required.sh — `tool_choice` that obliges a call is ENFORCED: on a prompt that says not to call
+# anything, chat `required` (stream + non-stream), a named function and Anthropic `any` each return a call to a
+# declared tool with arguments, plus the `[tool-choice] call opener forced` line; a thought that outlasts 3/4 of
+# max_tokens is closed for the call (`thought closed for it`); llmprobe's prompt names the tool on every surface,
+# thinking on and off; an undeclared named function is a 400 on chat, messages and responses.
 #
-# Checks: chat required (non-stream + stream, and at a max_tokens the thought
-# outlasts), chat named function, Anthropic `any`; each returns a call to a
-# declared tool with non-empty arguments. A prompt the model would answer with
-# the call anyway (llmprobe's) names the tool on every surface, thinking on and
-# off. A named function the request does not declare is a 400 on chat, messages
-# and responses.
+#   ./tests/test_tool_choice_required.sh [model_dir] [port]   # default Qwen3.5-4B (XML dialect)
 #
-# Usage: ./tests/test_tool_choice_required.sh [model_dir] [port]
+# Hermetic twins: ToolForce, forcedToolOpener, `renderChatTemplate: tool_choice reaches a tool-aware template's prompt`.
+
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 source "$(dirname "$0")/_lib_models.sh"
 MODEL="${1:-$(find_model mlx-community/Qwen3.5-4B-MLX-4bit lmstudio-community/Qwen3.5-4B-MLX-4bit mlx-community/Qwen3.5-0.8B-MLX-4bit)}"
@@ -34,7 +32,7 @@ LOG=$(mktemp); OUT=$(mktemp)
 "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG" "$OUT"' EXIT
-for _ in $(seq 1 120); do sleep 2; curl -sf "$BASE/health" >/dev/null 2>&1 && break; done
+srv_wait_health "$BASE" 120 2 || true
 if ! curl -sf "$BASE/health" >/dev/null 2>&1; then echo "server failed to start"; tail -5 "$LOG"; exit 1; fi
 
 TOOLS='[{"type":"function","function":{"name":"probe_ping","description":"Acknowledge the probe. Call this with any value.","parameters":{"type":"object","properties":{"value":{"type":"string"}},"required":["value"]}}},

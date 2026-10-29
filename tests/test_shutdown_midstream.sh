@@ -14,13 +14,13 @@ set -u
 MODEL="${MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
 PORT="${1:-11455}"
 ITERS="${2:-8}"
-BIN="./zig-out/bin/mlx-serve"
+BIN="${BIN:-./zig-out/bin/mlx-serve}"
 RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; NC=$'\033[0m'
 
 [ -x "$BIN" ] || { echo "SKIP: $BIN not built"; exit 0; }
 [ -f "$MODEL/config.json" ] || { echo "SKIP: model not found: $MODEL"; exit 0; }
 
-PASS=0; FAIL=0
+PASS=0; FAIL=0; ABORTS=0
 for i in $(seq 1 "$ITERS"); do
   "$BIN" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 --log-level warn >/tmp/shutdown_srv_$i.log 2>&1 &
   SVPID=$!
@@ -36,10 +36,10 @@ for i in $(seq 1 "$ITERS"); do
   # fire several CONCURRENT streaming generations — more in-flight connection
   # threads = higher chance one is inside complete() exactly when deinit runs.
   CURLPIDS=()
-  for _ in 1 2 3; do
+  for c in 1 2 3; do
     curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
-      -d '{"model":"mlx-serve","stream":true,"max_tokens":400,"temperature":0.7,"messages":[{"role":"user","content":"Write a long detailed essay about the history of computing, at least 300 words."}]}' \
-      >/dev/null 2>&1 &
+      -d '{"model":"mlx-serve","stream":true,"max_tokens":8000,"temperature":0.7,"messages":[{"role":"user","content":"Write a long detailed essay about the history of computing, at least 300 words."}]}' \
+      >/tmp/shutdown_sse_${i}_$c.txt 2>&1 &
     CURLPIDS+=($!)
   done
 
@@ -48,13 +48,18 @@ for i in $(seq 1 "$ITERS"); do
   sleep "$d"
   kill -TERM "$SVPID" 2>/dev/null
 
-  # wait for exit within the drain bound (+margin); detect hang
+  # a cancelled stream ends at once, so exit lands well inside the 30 s drain bound; detect hang
   exited=0
-  for _ in $(seq 1 70); do   # 35s
+  for _ in $(seq 1 20); do   # 10s
     kill -0 "$SVPID" 2>/dev/null || { exited=1; break; }
     sleep 0.5
   done
   for cp in "${CURLPIDS[@]}"; do kill -9 "$cp" 2>/dev/null; done
+  # A stream cut by shutdown never claims the token budget ran out (8000 tokens cannot finish in 2 s).
+  if grep -q '"finish_reason":"length"' /tmp/shutdown_sse_${i}_*.txt 2>/dev/null; then
+    echo -e "  ${RED}FAIL${NC} iter $i: a stream cut by SIGTERM finished as \"length\""; FAIL=$((FAIL+1))
+  fi
+  ABORTS=$((ABORTS + $(cat /tmp/shutdown_sse_${i}_*.txt 2>/dev/null | grep -c '"finish_reason":"abort"')))
   if [ "$exited" != 1 ]; then
     echo -e "  ${RED}FAIL${NC} iter $i (delay ${d}s): server HUNG after SIGTERM"
     kill -9 "$SVPID" 2>/dev/null; FAIL=$((FAIL+1)); continue
@@ -70,5 +75,5 @@ for i in $(seq 1 "$ITERS"); do
   fi
 done
 
-echo "=== shutdown-midstream: $PASS passed, $FAIL failed ($ITERS iters) ==="
+echo "=== shutdown-midstream: $PASS passed, $FAIL failed ($ITERS iters), $ABORTS stream(s) ended \"abort\" ==="
 [ "$FAIL" -eq 0 ]

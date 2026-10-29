@@ -1,25 +1,17 @@
 #!/bin/bash
-# Issue #390: a 1-token-tail commit that inherits checkpoints from a shared
-# prefix must not poison later restores with QsaHistoryGap.
+# test_prefix_inherit_qsa.sh — a 1-token-tail commit that inherits checkpoints from a shared prefix must not poison
+# later restores with QsaHistoryGap (qwen4_exp). Two conversations share a ~15k-token prefix; A grows past it, B
+# restores, prefills a 1-token tail at an odd position, commits, restores again. Every turn answers 200 and the log has
+# no `prefill failed for slot: QsaHistoryGap` (the self-heal line is a WARN); one request is sent TWICE verbatim so the
+# full-reuse shape (a tail inside the 30-token snapshot backoff) happens, else FAIL. Warm and cold (entries 0) arms run
+# one after the other on ONE port, waiting for free pages between them.
 #
-# Two conversations share one ~15k-token prefix. Conversation A grows past
-# the prefix (donor bank sits above the shared position). Conversation B
-# restores, prefills a 1-token tail at an odd position, commits (cps=null
-# shape), then restores again. Every turn must 200; the log must not contain
-# `prefill failed for slot: QsaHistoryGap`. The self-heal line is allowed
-# and counted as WARN. After inherit, one request is posted TWICE verbatim so
-# the full-reuse shape (a tail inside the 30-token snapshot backoff) actually
-# occurs; the script fails if it never did.
+#   ./tests/test_prefix_inherit_qsa.sh [/path/to/qwen4_exp pack] [port]
 #
-# Warm and cold run sequentially on ONE port: warm phase, capture greedy
-# texts, stop, wait for the port and for free+inactive+speculative pages,
-# then boot `--prefix-cache-entries 0` and replay. Never two servers at once.
-#
-# Usage: ./tests/test_prefix_inherit_qsa.sh [/path/to/qwen4_exp] [port]
-#
-# Coordinator runs this. Do not start a model server from the agent.
+# The coordinator runs this; an agent does not start a model server for it.
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit}"
 PORT="${2:-11490}"
@@ -117,10 +109,7 @@ start_server() {
     SERVER_PID=$!
     local up=0
     local i
-    for i in $(seq 1 180); do
-        curl -s -f "$BASE/health" > /dev/null 2>&1 && { up=1; break; }
-        sleep 1
-    done
+    srv_wait_health "$BASE" 180 1 && up=1
     if [ "$up" != "1" ]; then
         echo -e "${RED}FAIL${NC} server did not become healthy"; tail -40 "$log"; exit 1
     fi

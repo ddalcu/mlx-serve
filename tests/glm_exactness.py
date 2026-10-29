@@ -38,9 +38,9 @@ def source(path, chars):
 def prompts():
     """name -> request body (no model/stream). Text prompts run thinking off so logprobs cover the
     whole reply; the agent-shaped ones keep the model's default thinking."""
-    mid = "Here is a source file:\n\n" + source("src/round_cost.zig", 11000) + "\n\nSummarize what it does in five bullet points."
+    mid = "Here is a source file:\n\n" + source("src/engines/mlx/spec/round_cost.zig", 11000) + "\n\nSummarize what it does in five bullet points."
     long = ("The deploy password for the Aldergate cluster is ORCHID-7714.\n\nHere is a source file:\n\n"
-            + source("src/round_cost.zig", 34000)
+            + source("src/engines/mlx/spec/round_cost.zig", 34000)
             + "\n\nFirst give the deploy password for the Aldergate cluster, then list three public functions in the file.")
     lp = {"logprobs": True, "top_logprobs": 5}
     return {

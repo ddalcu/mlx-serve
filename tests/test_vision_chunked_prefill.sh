@@ -1,25 +1,17 @@
 #!/bin/bash
-# Vision prefill chunking: an image-bearing prompt must prefill in chunks like
-# text does, instead of one whole-prompt forward (issue #197 — the unchunked
-# width is what the memory guard bills, so long conversations + one screenshot
-# hit a 400 no flag can fix).
+# test_vision_chunked_prefill.sh — an image prompt prefills in chunks like text (the guard bills the chunk width; an
+# unchunked image turn 400'd long conversations). Two arms of one binary, --prefill-chunk 8192 (one chunk) vs 32, with
+# the prompt padded past TAIL_MERGE_MAX so boundaries land INSIDE the image span: [1] only the 32 arm logs
+# `[vision] chunked prefill`; [2] both arms name the same quadrant colors (a splice that restarts its row index per
+# chunk loses the bottom quadrants). Byte equality across arms is NOT asserted: chunk width changes GEMM shapes and
+# 4-bit near-ties flip.
 #
-# Two arms, same binary: MLX_SERVE_VISION_CHUNKED=0 (old whole-prompt forward)
-# vs default-on, both at MLX_SERVE_PREFILL_CHUNK=32 so chunk boundaries land
-# INSIDE the image's placeholder span (the image splices at prompt start; the
-# prompt is padded past nextChunkEnd's TAIL_MERGE_MAX so chunking actually
-# engages). Asserts: [1] the on arm logs "[vision] chunked prefill" and the
-# off arm doesn't (silent-no-op class); [2] BOTH arms name all four quadrant
-# colors — a splice that restarts its row index at a chunk boundary re-reads
-# the first image rows in every chunk, so the bottom quadrants (green/yellow)
-# vanish from the answer. Byte-equality across arms is deliberately NOT
-# asserted: chunk width changes GEMM shapes and a 4-bit checkpoint flips
-# near-tie argmaxes across widths (same class as MTP verify — legit).
+#   VISION_CHUNK_TEST_MODEL=<vision model> ./tests/test_vision_chunked_prefill.sh [port]   # default LFM2.5-VL-1.6B
 #
-# Requires a vision model; SKIPs without one.
-#   VISION_CHUNK_TEST_MODEL=/path ./tests/test_vision_chunked_prefill.sh [port]
+# SKIPs without a vision model. Hermetic twins: spliceVisionRows chunk / audio / video tests, countSpliceRows.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11499}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -86,19 +78,15 @@ with open(f"{work}/req.json", "w") as f:
 PYEOF
 
 run_arm() {
-    local arm="$1" env_val="$2"
+    local arm="$1" chunk="$2"
     local log="$WORK/$arm.log"
-    MLX_SERVE_VISION_CHUNKED="$env_val" MLX_SERVE_PREFILL_CHUNK=32 \
-        "$BINARY" --serve --model "$MODEL" \
+    "$BINARY" --serve --model "$MODEL" --prefill-chunk "$chunk" \
         --host 127.0.0.1 --port "$PORT" --prefix-cache-entries 0 \
         --log-level debug --log-file "$log" \
         >"$WORK/$arm.stdout" 2>&1 &
     SERVER_PID=$!
     local ready=0
-    for _ in $(seq 1 240); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { ready=1; break; }
-        sleep 0.5
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 240 0.5 && ready=1
     if [ "$ready" -ne 1 ]; then
         echo "[fail] server did not start ($arm arm)"
         exit 1
@@ -112,8 +100,8 @@ run_arm() {
     sleep 1
 }
 
-run_arm off 0
-run_arm on 1
+run_arm off 8192
+run_arm on 32
 
 OFF_TXT=$(python3 -c "import json; print(json.load(open('$WORK/off.resp.json'))['choices'][0]['message']['content'])")
 ON_TXT=$(python3 -c "import json; print(json.load(open('$WORK/on.resp.json'))['choices'][0]['message']['content'])")
@@ -126,7 +114,7 @@ if ! grep -q '\[vision\] chunked prefill' "$WORK/on.log"; then
     exit 1
 fi
 if grep -q '\[vision\] chunked prefill' "$WORK/off.log"; then
-    echo "[fail] off arm logged [vision] chunked prefill — kill switch is a no-op"
+    echo "[fail] the one-chunk arm logged [vision] chunked prefill — its prompt did not fit one chunk"
     exit 1
 fi
 # Perceived-color set per arm. Checkpoint-agnostic bar: a model may call the

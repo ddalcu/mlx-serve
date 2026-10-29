@@ -1,7 +1,7 @@
 import Foundation
 
 /// Host half of the Agent Sandbox guest protocol. The guest half is
-/// `src/vz_agent.zig`; the two are pinned together by golden bytes asserted in
+/// `src/host/sandbox/vz_agent.zig`; the two are pinned together by golden bytes asserted in
 /// BOTH test suites (`GuestProtocolTests` here, `"frame header is exactly the
 /// bytes Swift expects"` there). Changing one side alone silently desyncs the
 /// transport.

@@ -13,7 +13,7 @@
 #
 # Flint decides on each turn whether to think (its template has no switch), so [1] and [2] assert
 # the split, never that it thought. Hermetic counterparts: the config-parse and uint8-weight tests in
-# model.zig, the template render test in chat.zig, and `flint fixture` in transformer.zig.
+# engines/mlx/model.zig, the template render test in host/chat/chat.zig, and `flint fixture` in engines/mlx/transformer.zig.
 
 set -euo pipefail
 

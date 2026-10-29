@@ -1,36 +1,12 @@
 #!/bin/bash
-# Asserts that the KV cache reuses BOTH the prompt prefix AND the previous
-# turn's generated tokens across requests.
+# test_cache_reuses_generated_tokens.sh — the KV cache reuses the previous turn's GENERATED tokens, not just its prompt:
+# turn 2 resends turn 1 + its ~120-token reply + a follow-up, and `[hot-cache] reused N/M` must cover turn 1's prompt
+# plus its completion (within a template slack of 8), with a faster prefill than turn 1. Re-prefilling them wastes work
+# and moves K/V (decode qmv and prefill qmm reduce in different orders).
 #
-# Why this matters: in a real multi-turn agent loop, each request carries the
-# previous turn's assistant output back as part of the prompt. The K/V for
-# those generated tokens was already correctly computed during the previous
-# request — re-prefilling them on every turn is wasted work AND introduces
-# subtle K/V drift (AR `[1,1,d]` qmv vs prefill `[1,K,d]` qmm have different
-# float reduction orders at INT4/FP16, so the K/V values for the same tokens
-# change between AR-then-cached and re-prefilled).
+#   ./tests/test_cache_reuses_generated_tokens.sh [port]   # own server on 8092, or pass a running one's port
 #
-# The test:
-#   1. Drives turn 1: short system+user, generates ~120 tokens at temp=0.
-#   2. Drives turn 2: same conversation + the assistant reply + a short
-#      follow-up user message. Captures wall time.
-#   3. Greps the server log for the `[hot-cache] reused N/M tokens` line
-#      emitted by the hot prefix cache restore. Asserts:
-#        a. Reused N covers the previous turn's PROMPT *plus* its generation
-#           — within a small slack to allow the chat template to insert a
-#           newline or a turn boundary token between the assistant block and
-#           the next user block.
-#        b. Turn 2's prefill is meaningfully faster than turn 1's.
-#
-# Failure signature pre-fix: line (a) reports `reusing P1/P2` where P1 is
-# only turn-1's prompt length, NOT including its generation. The test then
-# asserts P1 >= turn_1_prompt + turn_1_completion - 8 and fails because P1
-# is short by `turn_1_completion - 8` tokens.
-#
-# On a hybrid (GDN) model the reuse comes from the decode-end SSM checkpoint:
-# run it with CACHE_GEN_TEST_MODEL=<a Qwen3.5/3.8 dir>.
-#
-# Default port 8092 (own server). Pass [port] to reuse a running one.
+# On a hybrid (GDN) model the reuse comes from the decode-end SSM checkpoint: CACHE_GEN_TEST_MODEL=<Qwen3.5/3.8 dir>.
 
 set -u
 

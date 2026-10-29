@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump a MageFlow VAE-encoder parity fixture for src/mage_flow.zig (E7.1).
+"""Dump a MageFlow VAE-encoder parity fixture for src/plugins/mage_flow/mage_flow.zig (E7.1).
 
 Runs the pure-MLX REFERENCE (ivanfioravanti/mflux@mage-flow-mlx) MageVAE encoder
 in FP32 over a DETERMINISTIC synthetic pixel tensor (no image file — the plan

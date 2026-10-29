@@ -1,17 +1,13 @@
 #!/bin/bash
-# Muse-Glimmer-30B (muse_glimmer) integration test — env-gated on a local
-# checkpoint (the 33 GB 8-bit mirror):
+# test_muse_glimmer.sh — Muse-Glimmer-30B live end to end on the 33 GB 8-bit mirror: tokenizer digit grouping ("84"
+# one token), channel split (to=self reasoning / to=user content, no marker or ` to=` header leak) with thinking ON,
+# the committed ` to=user<|message|>` channel on a silent no-tools request (content, no reasoning pass), an ATEM tool
+# call with typed arguments + round trip, clean streaming. Asserts invariants and branches on the model's choice.
 #
-#   MUSE_TEST_MODEL=~/.mlx-serve/models/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit \
-#       ./tests/test_muse_glimmer.sh
+#   MUSE_TEST_MODEL=<mirror dir> [MUSE_TEST_DRAFTER=<assistant dir>] ./tests/test_muse_glimmer.sh   # MUSE_TEST_PORT
 #
-# Pins the live surface end-to-end: tokenizer digit grouping (the "8 4" echo
-# class), channel split (to=self reasoning / to=user content), the committed
-# to=user channel on silent no-tools requests (no reasoning pass at all), an
-# ATEM tool round (call → typed args → result → answer), and streaming delta
-# cleanliness (no channel markers or ` to=` header fragments in content).
-# Complements the hermetic layers: the byte-pinned render test, the muse
-# format-corpus entries, and the channel/ATEM/pretokenizer unit tests.
+# SKIPs without the env var; MUSE_TEST_DRAFTER runs the whole suite with DFlash engaged. Hermetic twins: the
+# byte-pinned render test, corpus family "muse_glimmer", the channel/ATEM/llama3-pretokenizer unit tests.
 
 set -euo pipefail
 

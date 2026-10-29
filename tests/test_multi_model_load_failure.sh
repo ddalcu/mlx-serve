@@ -1,30 +1,14 @@
 #!/bin/bash
-# Plan 05 Phase F — a model that fails to LOAD surfaces as a named 500.
+# test_multi_model_load_failure.sh — two failure shapes under one temp --model-dir. weightless-model (a discoverable arch
+# with no weight files) registers, then its first request is a 500 `model_load_failed`, state "error", and the error
+# NAME crosses the inference-thread boundary intact (loadErrorFromName). unknown-arch-model (a model_type nothing
+# serves) is refused by discovery and absent from /v1/models; an unknown id falls back to the default model by design
+# (clients send ids like gpt-4o). A valid sibling keeps answering throughout.
 #
-# Two failure shapes live under one temp --model-dir root, because they are
-# handled at different layers and only one of them is a load failure:
-#
-#   weightless-model — a DISCOVERABLE dir (arch the server knows, plausible
-#     config) with no weight files. It registers, then dies on first request:
-#     HTTP 500 model_load_failed, state="error", and the error NAME crosses the
-#     inference-thread boundary intact (req.error_name -> loadErrorFromName).
-#
-#   unknown-arch-model — config.json with a model_type nothing serves. Discovery
-#     REFUSES it, so it never becomes a registry entry at all (same rule that
-#     skips incomplete media packs). It must be absent from /v1/models.
-#
-# The second case used to be this script's only case, asserting a 500 for it.
-# It cannot produce one: an id the registry does not hold falls back to the
-# default model, deliberately — Claude Code launches with
-# ANTHROPIC_DEFAULT_*_MODEL=mlx-serve, and clients hardcode ids like gpt-4o.
-# Asserting 500 there would break that fallback, so the assertion is now that
-# it is skipped, which is the real behaviour and was previously unpinned.
-#
-# A valid sibling model keeps working throughout (isolation).
-#
-# Usage: ./tests/test_multi_model_load_failure.sh [valid_model] [port]
+#   ./tests/test_multi_model_load_failure.sh [valid_model] [port]
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 VALID="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-8098}"
@@ -77,10 +61,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in $(seq 1 30); do
-    curl -fs "$BASE/health" >/dev/null 2>&1 && break
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || true
 
 FAIL=0
 

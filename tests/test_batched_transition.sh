@@ -1,33 +1,15 @@
 #!/bin/bash
-# Batched-decode transition consistency test.
+# test_batched_transition.sh — a stream that starts alone and then joins a batched decode group must not duplicate or
+# drop tokens (the solo pipelined slot carries a forwarded lookahead and pending logits into the group).
 #
-# Regression for the legacy→batched decode-tick transition bug: a slot that
-# starts generating alone (legacy single-slot pipelined decode) keeps a
-# lookahead token ALREADY FORWARDED into its KV cache plus pending logits.
-# When a second request arrives mid-generation, the slot joins a batched
-# decode tick — which used to DROP that pending state and re-forward
-# `next_token_id`, appending a duplicate position to the KV cache and
-# re-emitting an already-emitted token. Symptom (llmprobe parity tests):
+#   BATCH_TEST_MODEL=<dir> ./tests/test_batched_transition.sh [port]   # default gemma-4-e4b-it-8bit
 #
-#   non-stream: Mercury,Venus,Earth
-#       stream: MercuryMercury,Venus      <- dup first token, early stop
-#
-# This test:
-#   1. captures a solo streaming baseline at temp=0
-#   2. re-runs the same stream while injecting a concurrent request
-#      mid-generation (legacy→batched transition), 3 rounds
-#   3. fires two identical streams + one other request simultaneously
-#      (fresh-from-prefill batch join), 2 rounds
-# and asserts every captured stream equals the baseline byte-for-byte.
-#
-# Requires:
-#   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
-#   - BATCH_TEST_MODEL or ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#
-# Usage:
-#   ./tests/test_batched_transition.sh [port]
+# A solo temp-0 baseline, then the same stream with a request injected mid-generation (3 rounds) and two identical
+# streams + one other fired at once (2 rounds): every stream must equal the baseline byte for byte. On a GDN trunk
+# (qwen3_5 / qwen4 pack) this is also batched-then-serial == all-serial (the tick advances each slot's moe_seq_offset).
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8099}
 BASE="http://127.0.0.1:$PORT"
@@ -109,10 +91,7 @@ cleanup() { kill $SERVER_PID 2>/dev/null || true; }
 trap cleanup EXIT
 
 up=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 && up=1
 if [ "$up" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
     tail -20 "$LOGFILE"

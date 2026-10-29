@@ -12,6 +12,7 @@
 #
 # Env: MEDIA_REUSE_MODEL (default Qwen3.5-0.8B-MLX-4bit), PORT (default 19091), BINARY.
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 source tests/_lib_models.sh
 MODEL="${MEDIA_REUSE_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit)}"
@@ -33,7 +34,8 @@ boot() { # $1 log, $2.. extra flags
     HOME="$WORK/home" "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level debug \
         --no-mtp --no-pld --no-drafter "$@" > "$log" 2>&1 &
     PID=$!
-    for _ in $(seq 240); do curl -sf "$B/health" >/dev/null 2>&1 && return 0; kill -0 $PID 2>/dev/null || return 1; sleep 0.5; done
+    srv_wait_health "$B" 240 0.5 "$PID" && return 0
+    kill -0 "$PID" 2>/dev/null || return 1
     return 1
 }
 stop() { kill $PID 2>/dev/null; wait $PID 2>/dev/null; PID=""; }

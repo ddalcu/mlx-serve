@@ -1,24 +1,19 @@
 #!/bin/bash
-# test_logprobs.sh — the logprobs wire contract, on every surface that serves it.
+# test_logprobs.sh — the logprobs wire contract on every surface that serves it. [1-3] at temp 0 rank 1 of
+# top_logprobs IS the emitted token, its logprob does not move between temp 0 and 2 (the model's distribution, not
+# the sampler's), no saturation to 0.0, and /v1/completions answers the legacy shape. [4][5] STREAMING carries them and
+# agrees with non-streaming token and value for value; legacy text_offset ascends across chunks. [4b] with a stop
+# string the entries never run ahead of the delivered content. [6] the entries reconstruct message.content on a
+# thinking request and number fewer than completion_tokens (they describe the answer, not the stripped thought);
+# streaming is held to its own deltas. [7] every body is valid UTF-8. [7b] completions `echo`: one entry per prompt
+# and generated token, the first null, a warm repeat returns every row, echo + stream a named 400.
 #
-# Three defects fixed 2026-08-05 (temperature-scaled logits, float-equality id
-# recovery, a one-token offset) all reduce to ONE observable bar: at temp 0 the
-# emitted token IS the argmax, so rank 1 of top_logprobs must equal it. A broken
-# instrument is worse than none — an early "-0.004, therefore 99.6% confident"
-# read off this field sent a quantization hunt down the wrong path for a day.
+#   LOGPROBS_TEST_MODEL=<dir> ./tests/test_logprobs.sh [port]   # any chat model; default LFM2.5-2.6B-8bit, SKIP without
 #
-# Section [4] pins the class those three did NOT cover: STREAMING chat accepted
-# `logprobs`, disabled speculation to honor it (paying the throughput), had the
-# generator compute every entry — and then dropped them, because the SSE chunk
-# template had no `logprobs` field at all. Silently-ignored-field class. It is
-# invisible to llmprobe (which probes logprobs non-streaming only, and scored
-# this server 100% on `Logprob consistency` while streaming returned nothing),
-# and invisible to any output-equality test, since the deltas are unchanged.
-#
-#   LOGPROBS_TEST_MODEL=<dir> ./tests/test_logprobs.sh [port]
-#
-# Any chat model works; defaults to LFM2.5-2.6B-8bit. SKIPs without one.
+# Hermetic twins: computeLogprobs, formatCompletionsLogprobs, contentTokenRange, the UTF-8 lossy escape.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${LOGPROBS_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/LFM2.5-2.6B-8bit}"
 PORT="${1:-11293}"
@@ -35,8 +30,7 @@ pkill -f "mlx-serve --serve.*port $PORT" 2>/dev/null; sleep 1
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT
 
-for _ in $(seq 1 180); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 || { echo "fail: server never came up"; tail -20 "$LOG"; exit 1; }
+srv_wait_health "$BASE" 180 1 || { echo "fail: server never came up"; tail -20 "$LOG"; exit 1; }
 
 python3 - "$BASE" "$ID" <<'PY'
 import json, sys, urllib.request

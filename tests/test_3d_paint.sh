@@ -13,6 +13,7 @@
 #
 # Usage: HY3D_MODEL=<dir> HY3D_PAINT_MODEL=<dir> ./tests/test_3d_paint.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11437}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -29,11 +30,7 @@ HUB=~/.cache/huggingface/hub
 "$BIN" --serve --model-dir "$HUB" --port "$PORT" >/tmp/test_3d_paint_server.log 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for i in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 /tmp/test_3d_paint_server.log; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 /tmp/test_3d_paint_server.log; exit 1; }
 
 api() { curl -s -m 7200 "http://127.0.0.1:$PORT$1" "${@:2}"; }
 HY3D_ID="$(basename "$HY3D")"

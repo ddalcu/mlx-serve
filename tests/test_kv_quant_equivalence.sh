@@ -1,35 +1,11 @@
 #!/bin/bash
-# KV-cache quantization equivalence test.
+# test_kv_quant_equivalence.sh — --kv-quant 4 and 8 agree with --kv-quant off on the first N greedy tokens
+# (KV_QUANT_FIRST_N_4BIT / _8BIT, default 30: a kernel bug diverges early, INT4 weight noise only past ~30).
 #
-# Verifies that running the same greedy (temp=0) chat completion request
-# against the server with `--kv-quant 4` or `--kv-quant 8` produces the same
-# first-N tokens as `--kv-quant off`. KV quant is mathematically lossy, so we
-# tolerate divergence past a per-bit-width threshold — same approach as the
-# PLD/drafter long-greedy tests at INT4 weights (see CLAUDE.md "PLD/drafter
-# long-greedy byte-divergence at INT4").
+#   ./tests/test_kv_quant_equivalence.sh [/path/to/model] [port]   # default gemma-4-e4b-it-4bit
 #
-# Thresholds (empirical; override via env vars per architecture):
-#   - 4-bit KV: $KV_QUANT_FIRST_N_4BIT tokens must match (default 30)
-#   - 8-bit KV: $KV_QUANT_FIRST_N_8BIT tokens must match (default 30)
-#
-# The 30-token bar catches kernel bugs (wrong dequantize, off-by-one in
-# slice_update, NaN propagation). Beyond ~30 tokens at INT4 *weights* the
-# long-greedy float-reduction noise tail dominates regardless of KV bits,
-# so a stricter bar would test float-reduction stability, not the quant
-# code path. See CLAUDE.md "PLD/drafter long-greedy byte-divergence at INT4".
-#
-# Empirical per-arch numbers (loose first-N where we observed divergence;
-# raise via env var for stricter testing on a given family):
-#   gemma-4-e4b-it-4bit:   30-token threshold passes for both 4 and 8 bit;
-#                          8-bit happens to stay identical out past 60.
-#   Qwen3.5-4B-MLX-4bit:   4-bit passes 30; 8-bit diverges around 41 from
-#                          MoE + GatedDeltaNet float-reduction order.
-#   LFM2.5-350M-MLX-8bit:  4-bit diverges ~12 tokens — override with
-#                          KV_QUANT_FIRST_N_4BIT=10 for this family.
-#
-# Requires a built mlx-serve binary (zig build -Doptimize=ReleaseFast).
-# Default model is gemma-4-e4b-it-4bit; pass any model dir as $1:
-#   ./tests/test_kv_quant_equivalence.sh [/path/to/model] [port]
+# Known per-arch bars: LFM2.5-350M 4-bit KV diverges ~12 tokens (KV_QUANT_FIRST_N_4BIT=10). The batched x kv-quant
+# crash guard is the last section of test_batched_equivalence.sh.
 
 set -e
 

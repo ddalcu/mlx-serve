@@ -1,18 +1,16 @@
 #!/bin/bash
-# Guard: a model that FAILED to load is never answered by another model (#585).
+# test_load_failure_no_fallback.sh — a pack that failed to load is never answered by another model. The model is
+# cloned (APFS, instant) with one tensor renamed in the safetensors header (same length, offsets hold): a failed
+# `--model` load exits non-zero in the app's launch shape; on a server booted with the GOOD copy the broken pack named
+# by id, path or path-with-slash on chat and /v1/messages answers the named 500, an unregistered path is a 404, and
+# the good path, the `mlx-serve` alias and an SDK name still answer.
 #
-# A request naming a pack by its absolute path (the id the app and scripts hand
-# /v1/load-model) missed the registry's org/name keys, fell through to "unknown
-# id -> default model", and a pack with a renamed tensor was answered 200 by
-# the model already resident, its path echoed back as `model`.
+#   ./tests/test_load_failure_no_fallback.sh [model_dir] [port]
 #
-# The test clones the model into a temp dir (APFS clone, instant), renames one
-# tensor in the safetensors header (same length, so offsets hold), boots the
-# GOOD model, and asserts every way of naming the BROKEN one fails by name.
-#
-# Usage: ./tests/test_load_failure_no_fallback.sh [model_dir] [port]
+# Hermetic twin: resolveRequestModelId.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
 PORT=${2:-8133}
@@ -87,11 +85,7 @@ SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-for i in $(seq 1 300); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    if [ "$i" -eq 300 ]; then echo "FAIL: server did not start within 300s"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 300 1 || { echo "FAIL: server did not start within 300s"; exit 1; }
 
 
 # expect <label> <url path> <json body> <want http code> [want body substring]

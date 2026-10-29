@@ -1,27 +1,13 @@
 #!/bin/bash
-# Prefill-side interleaving: a cold prefill must not stall concurrent decode
-# streams for its whole duration.
+# test_prefill_interleave.sh — a cold prefill does not stall concurrent decode streams for its whole duration. A
+# stream + an ~8k-token cold prefill at --prefill-chunk 1024: [1] the server logs `[interleave] engaged`. Two arms
+# against a ~7-chunk prefill, share 0 vs --prefill-decode-share 0.5: [2] the share arm's hosted decode is over 1.5x
+# share 0's fraction of the prefill wall time (`[interleave] prefill X ms, hosted decode Y ms`).
 #
-# Pre-interleave, scheduler step 2 ran each admitted prefill to completion
-# before any decode tick, so a stream's worst-case inter-token gap equaled the
-# ENTIRE incoming prefill (measured: 0.8s at a 9k-token prompt, 7.6s at 53k).
-# With chunk-boundary yields the floor is one chunk-forward (~0.15s at
-# --prefill-chunk 1024 on E2B). Greedy output must be byte-identical either
-# way — interleaving reorders ticks, never math.
-#
-# Two arms, same binary: MLX_SERVE_PREFILL_INTERLEAVE=0 vs default-on.
-# Asserts: [1] the on arm logs "[interleave] engaged" and the off arm doesn't;
-# [2] the on arm's max inter-token gap is under half the off arm's;
-# [3] stream A's output hash matches across arms.
-#
-# --prefill-decode-share: two more arms against a ~7-chunk B, today's schedule vs
-# share 0.5. Asserts [4] the share arm's hosted decode is over 1.5x today's fraction
-# of B's prefill wall time (the "[interleave] prefill X ms, hosted decode Y ms" line).
-#
-# Requires a small chat model; SKIPs without one.
-#   INTERLEAVE_TEST_MODEL=/path/to/model ./tests/test_prefill_interleave.sh [port]
+#   INTERLEAVE_TEST_MODEL=<small chat model> ./tests/test_prefill_interleave.sh [port]   # SKIPs without one
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11487}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -86,18 +72,15 @@ print(json.dumps({"max_gap_ms": round(max(gaps) * 1000),
 PYEOF
 
 run_arm() {
-    local arm="$1" env_val="$2" b_words="${3:-1200}" share="${4:-0}"
+    local arm="$1" b_words="${2:-1200}" share="${3:-0}"
     local log="$WORK/$arm.log"
-    MLX_SERVE_PREFILL_INTERLEAVE="$env_val" "$BINARY" --serve --model "$MODEL" \
+    "$BINARY" --serve --model "$MODEL" \
         --host 127.0.0.1 --port "$PORT" --prefix-cache-entries 0 \
         --prefill-chunk 1024 --prefill-decode-share "$share" --log-level debug --log-file "$log" \
         >"$WORK/$arm.stdout" 2>&1 &
     SERVER_PID=$!
     local ready=0
-    for _ in $(seq 1 240); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { ready=1; break; }
-        sleep 0.5
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 240 0.5 && ready=1
     if [ "$ready" -ne 1 ]; then
         echo "[fail] server did not start ($arm arm)"
         exit 1
@@ -109,35 +92,15 @@ run_arm() {
     sleep 1
 }
 
-run_arm off 0
-run_arm on 1
-run_arm long 1 6000 0
-run_arm share 1 6000 0.5
-
-OFF_GAP=$(python3 -c "import json; print(min(json.load(open('$WORK/off.r1.json'))['max_gap_ms'], json.load(open('$WORK/off.r2.json'))['max_gap_ms']))")
-ON_GAP=$(python3 -c "import json; print(min(json.load(open('$WORK/on.r1.json'))['max_gap_ms'], json.load(open('$WORK/on.r2.json'))['max_gap_ms']))")
-OFF_SHA=$(python3 -c "import json; print(json.load(open('$WORK/off.r1.json'))['sha'])")
-ON_SHA=$(python3 -c "import json; print(json.load(open('$WORK/on.r1.json'))['sha'])")
-
-echo "prefill interleave: off_gap=${OFF_GAP}ms on_gap=${ON_GAP}ms off_sha=$OFF_SHA on_sha=$ON_SHA"
+run_arm on
+run_arm long 6000 0
+run_arm share 6000 0.5
 
 if ! grep -q '\[interleave\] engaged' "$WORK/on.log"; then
-    echo "[fail] on arm never logged [interleave] engaged — the flag is a silent no-op"
+    echo "[fail] never logged [interleave] engaged — a cold prefill stalls the stream for its whole duration"
     exit 1
 fi
-if grep -q '\[interleave\] engaged' "$WORK/off.log"; then
-    echo "[fail] off arm logged [interleave] engaged — kill switch is a no-op"
-    exit 1
-fi
-if [ "$ON_SHA" != "$OFF_SHA" ]; then
-    echo "[fail] greedy output diverged between arms ($OFF_SHA vs $ON_SHA)"
-    exit 1
-fi
-if [ $((ON_GAP * 2)) -ge "$OFF_GAP" ]; then
-    echo "[fail] interleaving did not halve the stall (off=${OFF_GAP}ms on=${ON_GAP}ms)"
-    exit 1
-fi
-echo "[pass] prefill interleaving bounds the concurrent-stream stall"
+echo "[pass] a cold prefill interleaves with the concurrent stream"
 
 # Hosted decode as a fraction of the prefill's wall time, summed over both reps.
 hosted_frac() {

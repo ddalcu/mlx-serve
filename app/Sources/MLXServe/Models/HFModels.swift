@@ -47,13 +47,13 @@ let streamOnlyModelTypes: Set<String> = ["glm_moe_dsa"]
 let supportedModelTypes: Set<String> = [
     "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
-    "diffusion_gemma", // DiffusionGemma block diffusion (text-only; vision tower not wired)
     "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
     "qwen3_moe", "qwen3_moe_text",
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "qwen2",
     "llama", "mistral",
-    "lfm2", "lfm2_vl", "lfm2_moe", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
+    "lfm2", "lfm2_vl", "lfm2-vl", "lfm2_moe", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
+    "lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni", // Liquid LFM3: text, VL, speech in + out, all of it
     "nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
@@ -77,7 +77,7 @@ let supportedModelTypes: Set<String> = [
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
-    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/deepseek_v41.zig), the EXL3 repack on mlx-stream
+    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/plugins/deepseek_v41/deepseek_v41.zig), the EXL3 repack on mlx-stream
     "gpt_oss",
 ]
 
@@ -87,9 +87,10 @@ let supportedModelTypes: Set<String> = [
 /// so they must pass the architecture gate (not show "Unsupported
 /// architecture" in the Downloaded tab) while still being excluded from
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
-/// Mirrors `model_discovery.isMediaModelType` (Zig).
+/// Mirrors the server's media plugins (their `model_types`) for rows no server
+/// has classified: a Discover search hit, a download on disk.
 private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "qwen_image", "moss_image", "hunyuan3d"]
-// Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
+// Mirrors the media plugins' `model_types` on the server. Drift here is not cosmetic:
 // a media model missing from this list fails the ARCHITECTURE gate outright,
 // so the browser draws it a red "Unsupported" — which is what happened to
 // `minimax_music3` on the same screen that offers to download it, and to bare
@@ -100,9 +101,8 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // architecture" are different decisions, and it was getting both. Exclusion
 // from pickers is `isChatPickable`'s job, which reads this same list. #228.
 //
-// `MediaModalityParityTests` reads `media_model_types` out of src/gen.zig and
-// asserts this agrees. Zig already pinned its own two copies against each
-// other; nothing pinned Swift, which is why this drifted unnoticed.
+// `MediaModalityParityTests` reads every media plugin's `model_types` out of src/plugins/*/config.zig and
+// asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
     "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
@@ -141,9 +141,29 @@ func discoverableMediaModelType(_ modelType: String) -> Bool {
 /// Use button that only knew "audio" would drop a music model on the Voice
 /// tab. `CustomMediaModels.musicFamily` is the existing discriminator; this is
 /// the same split, minus the running-server requirement (a browser row is a
-/// filesystem `LocalModel` with no capabilities).
+/// filesystem `LocalModel` with no capabilities; a server row names it as `modality`).
 enum MediaModality: CaseIterable {
     case image, voice, music, sound, video, mesh
+
+    /// A `/v1/models` row's `modality` (src/host/api/model_row_facts.zig); nil for one with no create pane.
+    init?(served: String) {
+        switch served {
+        case "image": self = .image
+        case "speech": self = .voice
+        case "music": self = .music
+        case "sound": self = .sound
+        case "video": self = .video
+        case "3d": self = .mesh
+        default: return nil
+        }
+    }
+
+    /// The pane of the local pack at `path`: what the server says of it when it lists the pack (an outside
+    /// plugin's packs included), else the app's own map of `modelType` (no server, or an older one).
+    static func of(modelType: String, path: String, rows: [ModelInfo]) -> MediaModality? {
+        if let served = ModelSettingsApply.row(for: path, in: rows)?.modality { return MediaModality(served: served) }
+        return MediaModality(modelType: modelType)
+    }
 
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
@@ -217,7 +237,7 @@ struct HFConfigMeta: Codable {
 /// (they come through the main door); their raw upstream layouts are not
 /// served, so their classes deliberately map nowhere.
 private let servedDiffusersClasses: [String: String] = [
-    "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
+    "MageFlowPipeline": "mage_flow", // mirrors the mage_flow plugin's `claims`
     "MOSSImagePipeline": "moss_image", // mirrors model_discovery.peekMossImageIndex
 ]
 

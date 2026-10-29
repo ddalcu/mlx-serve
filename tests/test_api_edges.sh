@@ -11,6 +11,7 @@
 # fell open silently, an undecodable image_url vanished from the prompt, an
 # empty embedding input was a 500, and Ollama's load handshake was a 400.
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
@@ -27,8 +28,7 @@ HOME="$WORK/home" "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --model "$MO
     --log-level debug --max-concurrent 4 > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null' EXIT
-for i in $(seq 1 90); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf -m 2 "$BASE/health" >/dev/null || { echo "FAIL: server did not start"; tail -20 "$WORK/server.log"; exit 1; }
+srv_wait_health "$BASE" 90 1 || { echo "FAIL: server did not start"; tail -20 "$WORK/server.log"; exit 1; }
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  PASS $1"; }

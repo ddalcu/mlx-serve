@@ -1,32 +1,17 @@
 #!/bin/bash
-# test_cancel_commit.sh — cancelled requests preserve their committed KV.
+# test_cancel_commit.sh — cancelled requests PRESERVE their committed KV. [1] a stream killed mid-decode commits
+# prompt + emitted tokens from the cleanup drain: an identical re-issue reports cached_tokens ~ the prompt and
+# `[hot-cache] reused`. [2] a kill mid-prefill (hybrid and plain attention) commits the FORWARDED prefix: the boot pins
+# --prefill-chunk / --ssm-checkpoint-stride 512 so the window spans stride boundaries, hybrids salvage their captured
+# checkpoints, the re-issue restores at the last one <= matched. The killed body tells the phase (any content or
+# reasoning delta = decode, where [2] skips). Warm-up request first.
 #
-# Two contracts, one per cancellation phase:
-#   [1] decode-phase cancel: a streaming request killed mid-generation
-#       (client disconnect) must COMMIT prompt + emitted tokens to the hot
-#       prefix cache — `complete()` pulls the slot straight into the cleanup
-#       queue, so without the drain-hook commit its KV dies with the slot.
-#       Proven by an identical re-issue reporting `cached_tokens` ≈ the full
-#       prompt (full-match reuse) where it previously reported ~0.
-# [2] prefill-phase cancel: a long prompt killed while still prefilling must
-#     commit the FORWARDED PREFIX (chunk-aligned). Hybrids ride the
-#     Cancelled-checkpoint salvage: `initWithOptions` hands its captured
-#     SSM stride checkpoints to the slot on abort, so the commit carries
-#     them and the re-issue restores at the last checkpoint ≤ matched (the
-#     boot pins --prefill-chunk/--ssm-checkpoint-stride at 512 so the
-#     cancelled window always spans checkpoint boundaries — the effective
-#     stride otherwise coarsens to the prefill chunk and a short window may
-#     salvage nothing).
-#     The killed stream's captured body tells us which phase we were in:
-#     no content/reasoning chunks ⇒ still prefilling (the strict
-#     "committed N/M prompt tokens from a cancelled prefill" log line is
-#     then REQUIRED); content chunks ⇒ prefill had finished and the
-#     decode-cancel contract of [1] covers it (section skipped, not failed).
+#   ./tests/test_cancel_commit.sh [model_dir] [port]   # starts its own server; default Gemma 4 E4B 4-bit
 #
-# Usage: ./tests/test_cancel_commit.sh [model_dir] [port]
-#   Starts its own server. Default model: Gemma 4 E4B 4-bit.
+# Hermetic twin: `cancelledPrefillCommitLen`.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-11272}"
@@ -70,11 +55,8 @@ boot_server() {
         --kv-quant 4 --prefix-cache-entries 4 \
         > "$LOG" 2>&1 &
     SERVER_PID=$!
-    for _ in $(seq 1 120); do
-        curl -sf "$BASE/health" >/dev/null 2>&1 && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "ERR: server died" >&2; return 1; }
-        sleep 1
-    done
+    srv_wait_health "$BASE" 120 1 "$SERVER_PID" && return 0
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "ERR: server died" >&2; return 1; }
     echo "ERR: server never became healthy" >&2; return 1
 }
 

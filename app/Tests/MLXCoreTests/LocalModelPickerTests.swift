@@ -28,7 +28,7 @@ final class LocalModelPickerTests: XCTestCase {
     }
 
     func testChatModelsRemainPickable() {
-        for mt in ["gemma4", "gemma3_text", "qwen3_5_moe", "diffusion_gemma", "gguf", "deepseek_v4"] {
+        for mt in ["gemma4", "gemma3_text", "qwen3_5_moe", "gguf", "deepseek_v4"] {
             XCTAssertTrue(model(mt).isChatPickable, "\"\(mt)\" must stay chat-pickable")
         }
     }

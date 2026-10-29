@@ -1,25 +1,9 @@
 #!/bin/bash
-# Wave 1.A — per-request `kv_quant` body field.
+# test_kv_quant_per_request.sh — the per-request `kv_quant` body field: on a `--kv-quant off` server, no field, `4` and
+# `"off"` all answer non-empty (a broken plumb answers garbage or pad-only), and a scheme flip on the same prompt never
+# reuses a prefix committed under the other scheme (`[hot-cache] reused 0/…`).
 #
-# Starts the server with `--kv-quant off` (the process-level default) and
-# fires three back-to-back requests against /v1/chat/completions:
-#   1. no `kv_quant` field         → inherits process default (off)
-#   2. {"kv_quant": 4}              → per-request override to 4-bit affine
-#   3. {"kv_quant": "off"}          → explicit override back to dense
-# All three must complete with non-empty content. The 4-bit request is the
-# critical one — if SubmitParams.kv_quant_config plumbing or the slot's
-# KVCache.initWithConfig is broken, the request returns garbage / pad-only.
-#
-# Hot-prefix-cache scheme isolation: a follow-up identical request under
-# scheme A must NOT pick up a cache hit from a prior scheme-B commit. We
-# assert that the second 4-bit request emits a `[hot-cache] reused N/M`
-# line whose match length is 0 against the dense-default first request.
-# (Tightly testing this requires same prompt + different scheme; we do
-# scheme-flip while pinning the prompt and assert no cross-scheme hit.)
-#
-# Usage:
-#   ./tests/test_kv_quant_per_request.sh [/path/to/model] [port]
-# Defaults: model = ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit, port = 8094.
+#   ./tests/test_kv_quant_per_request.sh [/path/to/model] [port]   # default gemma-4-e4b-it-4bit, port 8094
 
 set -e
 

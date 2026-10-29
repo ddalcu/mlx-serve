@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""Nemotron RADIO image/video integration and LiLiCorr measurements (stdlib only)."""
+"""Nemotron 3.5 Bolt/Super live checks: RADIO image and 128/256-frame video, literal HTML, LiLiCorr drafting,
+prefix restore, on/off decode timing (stdlib only).
+
+  python3 tests/test_nemotron_bolt.py --model <native-config MLX pack> --output <dir>
+      --checks vision|defaults|drafter|restore|bench [--drafter <dir>] [--reps 3]
+
+Starts and stops its own loopback server (scratch HOME; prefix cache, PLD and MTP off for timing; `restore` turns on
+only the RAM prefix cache). The pack's drafter/ is found on its own; drafter checks assert default engagement and
+acceptance plus explicit opt-out on Chat, raw Completions, Messages and Responses, streamed and not (`defaults` runs
+only that matrix). Super's vision check needs no drafter. A failure names the surface and the check.
+"""
 import argparse
 import base64
 import hashlib
@@ -15,6 +25,8 @@ import time
 import urllib.error
 import urllib.request
 import zlib
+
+from lib.server import wait_health
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -54,17 +66,10 @@ class Server:
         self.process = subprocess.Popen(self.command, cwd=REPO, stdout=self.console, stderr=subprocess.STDOUT,
                                         env={**os.environ, 'HOME': str(test_home)})
         try:
-            deadline = time.monotonic() + 240
-            while time.monotonic() < deadline:
-                if self.process.poll() is not None:
-                    raise RuntimeError(f'server exited {self.process.returncode}; see {self.log}')
-                try:
-                    self.request('/health', timeout=2)
-                    break
-                except (OSError, ValueError):
-                    time.sleep(1)
-            else:
-                raise RuntimeError('server startup timed out')
+            try:
+                wait_health(self.base, 240, self.process)
+            except RuntimeError as error:
+                raise RuntimeError(f'{error}; see {self.log}') from error
             loaded = [m for m in self.request('/v1/models')['data'] if m.get('loaded')]
             assert len(loaded) == 1, loaded
             self.model = loaded[0]

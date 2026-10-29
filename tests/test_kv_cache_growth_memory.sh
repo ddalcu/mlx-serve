@@ -1,29 +1,17 @@
 #!/usr/bin/env bash
-# Long-context decode must not ratchet the process footprint (issue #110).
+# test_kv_cache_growth_memory.sh — long-context decode does not ratchet the process footprint. Boots the reporter's
+# model (ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve, --metrics --prefix-cache-entries 0), runs three GROWING turns and
+# samples /props active_bytes + cache_bytes and /metrics mlx_serve:memory_mb: cache_bytes <= 10 GB at every sample,
+# memory_mb - active_bytes <= 12 GB, <= 2 GB of ratchet from turn 1 to 3. Asserts `[spec-stats] mode=mtp`: MTP is the
+# default decode path for this checkpoint, and without the line the script measures the wrong path.
 #
-# The class: MLX parks freed buffers in a size-keyed pool instead of returning
-# them to the OS, and its own trim limits are ~121 GB / ~91 GB on a 128 GB Mac
-# (`backend/metal/allocator.cpp`) — so anything that frees never-repeating sizes
-# in a loop grows the footprint unbounded. Two defects fed that pool:
+#   KV_MEM_MODEL=<dir> ./tests/test_kv_cache_growth_memory.sh [port]   # KV_MEM_FULL=1: 120K ctx, ~78K prompt (~10 min)
 #
-#   * the KV cache grew by a fixed 256 tokens, orphaning a whole capacity-sized
-#     buffer every 256 generated tokens (~5.6 GB each at the reporter's 89 K
-#     context on a 64 KiB/token model);
-#   * the drafter / MTP / batched decode paths never called `mlx_clear_cache()`
-#     at ALL — and a `-mtp` checkpoint on a dense trunk defaults onto one.
-#
-# The reporter's process reached 81.4 GB while the app panel read 19.6 GB. That
-# gap is the whole bug, so the assertions are written against the gap:
-# `cache_bytes` (now served by /props) and `memory_mb - active_bytes`.
-#
-# `[spec-stats] mode=mtp` is asserted in the server log — without it this script
-# silently measures the wrong decode path, which is the same class as the two
-# hardcoded `use_drafter=false` call sites that shipped for a month.
-#
-# Skips gracefully when the checkpoint isn't downloaded.
-# Usage: KV_MEM_MODEL=<dir> ./tests/test_kv_cache_growth_memory.sh [port]
-#        KV_MEM_FULL=1 ...   reproduce the reporter's shape verbatim (~10 min)
+# SKIPs without the 15 GB checkpoint. Hermetic twins: `KVCache growth strands bounded bytes`, `KV growth does not
+# ratchet the MLX buffer pool`, `clear cadence survives variable spec strides`, mlxCacheLimitBytes.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11419}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -51,11 +39,7 @@ LOG=/tmp/test_kv_cache_growth_memory_server.log
        --metrics --prefix-cache-entries 0 >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for i in $(seq 1 300); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -20 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 300 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -20 "$LOG"; exit 1; }
 
 props() { # field -> bytes, -1 on failure
   curl -s "http://127.0.0.1:$PORT/props" | python3 -c "

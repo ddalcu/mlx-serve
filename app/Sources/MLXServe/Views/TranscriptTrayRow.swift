@@ -92,7 +92,7 @@ final class TrayTranscript: ObservableObject {
         switch phase { case .idle, .note: phase = .starting; default: return }
         guard await AudioRecorder.requestPermission() else { phase = .note("Microphone access is off"); return }
         // Voice mode would hear, and answer, what is being transcribed.
-        if app.voice.isActive { app.voice.end() }
+        for voice in [app.voice, app.chatVoice] where voice.isActive { voice.end() }
         let since = Date()
         stamp = Self.stamp(of: since)
         do {
@@ -367,9 +367,15 @@ final class TrayTranscript: ObservableObject {
     /// One request: what the server heard, timed from the start of `wav`, with
     /// its speakers when asked.
     nonisolated static func transcribe(_ wav: Data, model: String, server: String, speakers: Bool) async throws -> [Segment] {
+        let data = try await post(wav, model: model, server: server, format: speakers ? "diarized_json" : "verbose_json")
+        return try JSONDecoder().decode(Verbose.self, from: data).segments
+    }
+
+    /// `POST /v1/audio/transcriptions` with `wav` as the file; the body of a 200, else the server's own error.
+    nonisolated static func post(_ wav: Data, model: String, server: String, format: String) async throws -> Data {
         let boundary = UUID().uuidString
         var body = Data()
-        for (name, value) in [("model", model), ("response_format", speakers ? "diarized_json" : "verbose_json")] {
+        for (name, value) in [("model", model), ("response_format", format)] {
             body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
         }
         body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"file\"; filename=\"recording.wav\"\r\nContent-Type: audio/wav\r\n\r\n".utf8))
@@ -381,7 +387,7 @@ final class TrayTranscript: ObservableObject {
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         let (data, response) = try await URLSession.shared.upload(for: request, from: body)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw serverError(data, "Transcription failed") }
-        return try JSONDecoder().decode(Verbose.self, from: data).segments
+        return data
     }
 }
 

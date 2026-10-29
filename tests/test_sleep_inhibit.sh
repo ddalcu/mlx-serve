@@ -1,8 +1,11 @@
 #!/bin/bash
-# The Mac stays awake only while mlx-serve has work in flight.
-# Usage: ./tests/test_sleep_inhibit.sh [model_dir] [port]
+# test_sleep_inhibit.sh — the Mac stays awake only while mlx-serve has work: no power assertion while idle, one during
+# generation and during a startup load, released after, none with --no-prevent-sleep.
+#
+#   ./tests/test_sleep_inhibit.sh [model_dir] [port]   # macOS + a small chat model; skips otherwise
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL=${1:-"$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"}
 PORT=${2:-8138}
@@ -42,10 +45,7 @@ start_server() {
     ./zig-out/bin/mlx-serve serve --port "$PORT" --host 127.0.0.1 --log-level info \
         --model-dir "$ROOT" "$@" >/tmp/mlx-serve-sleep-inhibit.log 2>&1 &
     SERVER_PID=$!
-    for i in $(seq 1 120); do
-        curl -sf "$BASE/health" >/dev/null 2>&1 && return 0
-        sleep 0.5
-    done
+    srv_wait_health "$BASE" 120 0.5 && return 0
     echo "FAIL: server did not start within 60s"; exit 1
 }
 

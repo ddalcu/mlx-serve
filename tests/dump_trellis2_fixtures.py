@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Oracle for src/trellis2.zig: Microsoft's TRELLIS.2-4B reference modules run in
+"""Oracle for src/plugins/trellis2/trellis2.zig: Microsoft's TRELLIS.2-4B reference modules run in
 fp32 on the CPU, on the real weights.
 
 The reference needs CUDA for flash-attn, FlexGEMM's sparse conv, CuMesh and

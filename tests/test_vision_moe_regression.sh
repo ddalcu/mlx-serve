@@ -8,6 +8,7 @@
 # Default port: 8097
 
 set -euo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}"
 PORT="${2:-8097}"
@@ -333,10 +334,7 @@ if [ "$HAS_VISION" = "yes" ]; then
         "$BINARY" --model "$MODEL_DIR" --serve --port "$PORT" --log-level warn --ctx-size 4096 > "$LOG" 2>&1 &
         SERVER_PID=$!
 
-        for i in $(seq 1 30); do
-            if curl -sf "$BASE/health" 2>/dev/null | grep -q ok; then break; fi
-            sleep 2
-        done
+        srv_wait_health "$BASE" 30 2 || true
         echo -e "${GREEN}Server restored for remaining tests${NC}"
     else
         run_test "--no-vision server start" "FAIL" "server did not start within 60s"
@@ -346,10 +344,7 @@ if [ "$HAS_VISION" = "yes" ]; then
         # Restore normal server
         "$BINARY" --model "$MODEL_DIR" --serve --port "$PORT" --log-level warn --ctx-size 4096 > "$LOG" 2>&1 &
         SERVER_PID=$!
-        for i in $(seq 1 30); do
-            if curl -sf "$BASE/health" 2>/dev/null | grep -q ok; then break; fi
-            sleep 2
-        done
+        srv_wait_health "$BASE" 30 2 || true
     fi
 else
     run_test "--no-vision tests" "SKIP" "model has no vision config"

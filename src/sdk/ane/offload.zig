@@ -1,0 +1,1916 @@
+//! ANE prefill-MLP offload (perf-plan-aug-17 P5, `--ane-prefill`).
+//!
+//! Splits each full-width prefill chunk's dense SwiGLU MLP (and GDN input
+//! projections) between the GPU (existing MLX chain) and the Apple Neural
+//! Engine (private framework via lib/ane, int8 per-row weights, fp16
+//! datapath). Scope: qwen3_5 family; opt-in, default OFF, LOSSY by design
+//! (the decode-attn-quant precedent — quality is A/B'd per arch, bytes are
+//! not expected to match).
+//!
+//! Programs are BANKS: every covered layer's slice is one `procedureNNN`
+//! function inside one compiled program, because the private runtime
+//! accepts only ~121 resident model handles (oMLX probe) and our 27B alone
+//! wants 112 — twice that under dual ANE.
+//!
+//! Threading contract: the inference thread stays the sole MLX caller — it
+//! does the plane memcpys and mlx array creation; ONLY `msv_ane_mlp_eval`
+//! runs on a dedicated ANE thread. Within ONE unit evals are strictly
+//! serial (one in-flight kick/wait), which is what makes that unit's shared
+//! I/O planes legal (A9). Separate UNITS eval concurrently, so each owns
+//! its own planes.
+//!
+//! Stage-A measured facts this file encodes (harness at
+//! ~/claude-tmp/perf-aug17/p5-ane-mlp): full-MLP-in-one-program parity
+//! cos 0.9999 vs fp32; 11.8 TFLOPS eval with the down conv K-chunked
+//! (a single K=17408 conv is a 2.6x cliff — chunking lives in
+//! lib/ane/ane_mlp.m); fp16 range safe to 16x with the always-on
+//! (1/16 .. x16) down-conv wrap.
+
+const std = @import("std");
+const env = @import("../../env.zig");
+const builtin = @import("builtin");
+const log = @import("../util/log.zig");
+const mlx = @import("../../mlx/ffi.zig");
+const status = @import("../util/system.zig");
+
+// ── C ABI (lib/ane/ane_mlp.h) ──
+
+pub const MsvAneMlp = opaque {};
+pub const MsvAneBank = opaque {};
+pub const MsvAnePlane = opaque {};
+extern fn msv_ane_available() c_int;
+extern fn msv_ane_internal_free_disk() u64;
+extern fn msv_ane_cache_lineage(group: [*:0]const u8, variant: [*:0]const u8) void;
+extern fn msv_ane_cache_variant(group: [*:0]const u8, out: [*]u8, out_len: c_int) void;
+extern fn msv_ane_plane_create(bytes: usize) ?*MsvAnePlane;
+extern fn msv_ane_plane_free(p: ?*MsvAnePlane) void;
+extern fn msv_ane_plane_base(p: ?*MsvAnePlane) ?[*]f16;
+extern fn msv_ane_bank_create() ?*MsvAneBank;
+extern fn msv_ane_bank_free(b: ?*MsvAneBank) void;
+extern fn msv_ane_bank_count(b: ?*const MsvAneBank) u32;
+extern fn msv_ane_bank_bytes(b: ?*const MsvAneBank) u64;
+extern fn msv_ane_bank_add_mlp(
+    b: ?*MsvAneBank,
+    hidden: u32,
+    ffn: u32,
+    rows: u32,
+    gate_q: [*]const i8,
+    gate_s: [*]const f32,
+    up_q: [*]const i8,
+    up_s: [*]const f32,
+    down_q: [*]const i8,
+    down_s: [*]const f32,
+    err: [*]u8,
+    err_size: usize,
+) c_int;
+extern fn msv_ane_bank_add_gdn(
+    b: ?*MsvAneBank,
+    hidden: u32,
+    qkv_out: u32,
+    z_out: u32,
+    rows: u32,
+    qkv_q: [*]const i8,
+    qkv_s: [*]const f32,
+    z_q: [*]const i8,
+    z_s: [*]const f32,
+    err: [*]u8,
+    err_size: usize,
+) c_int;
+extern fn msv_ane_bank_finish(
+    b: ?*MsvAneBank,
+    name: [*:0]const u8,
+    ane_instance: c_int,
+    input_plane: ?*MsvAnePlane,
+    output_plane: ?*MsvAnePlane,
+    err: [*]u8,
+    err_size: usize,
+) ?*MsvAneMlp;
+extern fn msv_ane_mlp_free(m: ?*MsvAneMlp) void;
+extern fn msv_ane_mlp_input(m: ?*MsvAneMlp) ?[*]f16;
+extern fn msv_ane_mlp_output(m: ?*MsvAneMlp) ?[*]f16;
+extern fn msv_ane_mlp_eval(m: ?*MsvAneMlp, procedure: u32, err: [*]u8, err_size: usize) c_int;
+extern fn msv_ane_mlp_compile_seconds(m: ?*const MsvAneMlp) f64;
+extern fn msv_ane_mlp_cache_hit(m: ?*const MsvAneMlp) c_int;
+
+/// Whether the private AppleNeuralEngine framework is present and usable.
+pub fn available() bool {
+    return msv_ane_available() != 0;
+}
+
+/// Minimum useful ANE tile: below this the per-layer kick/join overhead
+/// outweighs the offloaded work (the engagement floor, not a correctness
+/// bound — Stage A measured flat TFLOPS down to 512 rows).
+pub const ANE_MIN_ROWS: u32 = 256;
+
+/// Total physical RAM (`hw.memsize` on Darwin, `/proc/meminfo` on Linux);
+/// 0 when the read fails (gates that consume this must treat 0 as "unknown",
+/// never as "tiny machine").
+pub fn totalMemBytes() u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return status.getTotalMemBytes();
+    var mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    _ = std.c.sysctlbyname("hw.memsize", @ptrCast(&mem), &len, null, 0);
+    return mem;
+}
+
+/// Chip name via sysctl ("Apple M3 Ultra"); empty on failure — callers fall
+/// to their default row. Canonical copy (dflash.zig delegates here); the GPU
+/// arch string cannot tell Ultra from Max, hence the CPU brand.
+var chip_brand_buf: [128]u8 = undefined;
+var chip_brand_len: usize = 0;
+/// 0 = unread, 1 = one thread is reading it, 2 = published.
+var chip_brand_state = std.atomic.Value(u8).init(0);
+
+/// Cached `machdep.cpu.brand_string` — THE accessor for every per-silicon
+/// table (ANE share, MTP depth cap, DFlash block cap). The chip cannot change
+/// under a running process and these are read on request-shaped paths
+/// (Generator init), so the sysctl runs exactly once. Callers that need to
+/// inject a chip string take it as a parameter; nobody re-wraps this.
+pub fn chipBrand() []const u8 {
+    if (chip_brand_state.load(.acquire) != 2) {
+        if (chip_brand_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+            chip_brand_len = chipBrandString(&chip_brand_buf).len;
+            chip_brand_state.store(2, .release);
+        } else {
+            while (chip_brand_state.load(.acquire) != 2) std.atomic.spinLoopHint();
+        }
+    }
+    return chip_brand_buf[0..chip_brand_len];
+}
+
+pub fn chipBrandString(buf: []u8) []const u8 {
+    // machdep.cpu.brand_string is an Apple-Silicon sysctl; the ANE offload is
+    // macOS-only, so non-Darwin gets the empty brand (defaults downstream).
+    if (comptime !builtin.os.tag.isDarwin()) return "";
+    var len: usize = buf.len;
+    if (std.c.sysctlbyname("machdep.cpu.brand_string", buf.ptr, &len, null, 0) != 0) return "";
+    if (len > 0 and buf[len - 1] == 0) len -= 1;
+    return buf[0..len];
+}
+
+/// Per-silicon default share. Every row is a MEASURED optimum of its own sweep, never interpolated (a share change
+/// needs its own A/B):
+///   M4 Max: 0.45 (Qwen3.8-27B oQ4e: 0.40/0.45/0.50 ranked 305/311/297 at 16k — rollover at 0.50).
+///   M3 Ultra: 0.35 ( tester, 0.45/0.40/0.35/0.30 ranked 398/421/440/438 at 32k; the smaller share
+///     also drops the int8 copy 9.47 → 7.30 GB); dual 0.50. The share is the TOTAL ANE share, halved across units.
+pub fn defaultShare(chip: []const u8) f32 {
+    return defaultShareFor(chip, dualDefault(chip));
+}
+
+/// M3 Ultra: 0.35 on one ANE ( tester: 0.45 was nothing, 0.35
+/// +8.5%/+13.7% at 16k/32k); with BOTH ANEs 0.50 ( sweep, 16k
+/// prefill: single 0.35 465 tok/s, dual 0.35 471, 0.45 482-492, 0.50 498,
+/// 0.55 490, 0.65 466 — the rollover is one notch past 0.50).
+pub fn defaultShareFor(chip: []const u8, dual: bool) f32 {
+    if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return if (dual) 0.50 else 0.35;
+    return 0.45;
+}
+
+/// Dual ANE is the default on the M3 Ultra: measured on a 512 GB
+/// box, both instances at equal eval counts, zero failures, both IOReport
+/// ANE0_ counters moving, +7.1% 16k prefill over the single-ANE best.
+pub fn dualDefault(chip: []const u8) bool {
+    return std.mem.indexOf(u8, chip, "M3 Ultra") != null;
+}
+
+/// The ANE's TOTAL share of each covered projection (channel mode: fraction
+/// of output channels, split evenly across the units; row mode: fraction of
+/// chunk token rows), per (mode, silicon) — see `defaultShare`. Prefill runs channel mode.
+pub fn splitShare() f32 {
+    return defaultShare(chipBrand());
+}
+
+// ── Media offload (image / video / audio DiTs) ──
+
+/// The three media seams' switches and the explicit share, set ONCE in
+/// `main()` from `--ane-image/--ane-video/--ane-audio` + `--ane-split`. The seams sit under gen.zig with no server config
+/// in reach, so this is process-global like `applyMlxCacheLimit`.
+pub const MediaOffload = struct {
+    image: bool = false,
+    video: bool = false,
+    audio: bool = false,
+    share: ?f32 = null,
+};
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const AneState = struct {
+    media_offload: MediaOffload = .{},
+    /// Live ANE totals across resident engines, for the `--metrics` gauges and
+    /// anything else that wants "what is the ANE holding right now" without
+    /// walking the registry. Published by `publishLive` after a successful
+    /// build, retired by deinit; zero whenever no engine is resident (the
+    /// zero-when-off metrics invariant).
+    live_int8_bytes: std.atomic.Value(u64) = .init(0),
+    live_layers: std.atomic.Value(u64) = .init(0),
+};
+pub const aneState_shared = @import("../util/shared.zig").Shared(AneState, "ane_offload", .{});
+pub inline fn aneState() *AneState {
+    return aneState_shared.get();
+}
+
+/// The share a media seam falls back to when nothing can be solved.
+pub const DEFAULT_MEDIA_SHARE: f32 = 0.45;
+
+/// Every media request loops ONE compiled tile of this many rows, so every
+/// request size shares one program set: disk stays fixed per model and share,
+/// and a new size never cold-compiles.
+pub const MEDIA_TILE_ROWS: u32 = 256;
+
+/// The compiled tile for a `seq`-row request; 0 = shorter than one tile.
+pub fn mediaTileRows(seq: u32) u32 {
+    return if (seq < MEDIA_TILE_ROWS) 0 else MEDIA_TILE_ROWS;
+}
+
+/// One 16-core ANE's measured rate on our int8/fp16 MLP program (the
+/// Stage-A harness in the file header). M1 through M4 all ship that engine.
+pub const ANE_TFLOPS_M1_M4: f64 = 11.8;
+
+/// Total ANE rate for `units` engines, or null on silicon nobody measured
+/// (M5+ NAX-class GPUs, an unreadable brand): the caller keeps the default
+/// rather than guessing. Token-exact family match, never a substring.
+pub fn aneTflopsFor(chip: []const u8, units: u32) ?f64 {
+    var it = std.mem.splitScalar(u8, chip, ' ');
+    while (it.next()) |tok| {
+        for ([_][]const u8{ "M1", "M2", "M3", "M4" }) |fam| {
+            if (std.mem.eql(u8, tok, fam)) return ANE_TFLOPS_M1_M4 * @as(f64, @floatFromInt(units));
+        }
+    }
+    return null;
+}
+
+/// Balance point of a split where both units work the same rows:
+/// s* = A / (A + G), A the ANE's rate, G the GPU's EFFECTIVE rate at this
+/// model's MLP shape. Clamped to the measured sweep range and rounded to its
+/// 0.05 grid: the plateau near the peak is ~6% wide, and a finer answer lets
+/// probe jitter pick a new slice width (a cold compile) on every boot. A
+/// degenerate probe answers the default.
+pub fn solveShare(a_tflops: f64, g_tflops: f64) f32 {
+    if (!(a_tflops > 0) or !(g_tflops > 0)) return DEFAULT_MEDIA_SHARE;
+    const s = std.math.clamp(a_tflops / (a_tflops + g_tflops), 0.25, 0.85);
+    return @floatCast(@round(s * 20) / 20);
+}
+
+/// One affine-quantized weight [out_dim, in_dim] the GPU probe times.
+pub const QuantWeight = struct {
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    biases: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    in_dim: u32,
+    out_dim: u32,
+};
+
+/// The GPU's effective rate at this model's MLP shape: the best of three
+/// timed quantized matmuls `[rows, in] x [in, out]^T` on the real block-0
+/// weight after one warm-up. No ANE compile is involved, so the solve
+/// happens before the programs are built.
+pub fn probeGpuTflops(io: std.Io, s: mlx.mlx_stream, rows: u32, qw: QuantWeight) !f64 {
+    const shape = [_]c_int{ @intCast(rows), @intCast(qw.in_dim) };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &shape, 2, mlx.mlx_array_dtype(qw.scales), s));
+    try mlx.check(mlx.mlx_array_eval(x));
+    var best_ns: u64 = std.math.maxInt(u64);
+    for (0..4) |i| {
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        var o = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_quantized_matmul(&o, x, qw.w, qw.scales, qw.biases, true, mlx.mlx_optional_int.some(@intCast(qw.group_size)), mlx.mlx_optional_int.some(@intCast(qw.bits)), "affine", s));
+        try mlx.check(mlx.mlx_array_eval(o));
+        const ns: u64 = @intCast(t0.untilNow(io, .awake).nanoseconds);
+        if (i > 0) best_ns = @min(best_ns, ns);
+    }
+    if (best_ns == 0) return error.AneProbeClock;
+    const flops = 2.0 * @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(qw.in_dim)) * @as(f64, @floatFromInt(qw.out_dim));
+    return flops / @as(f64, @floatFromInt(best_ns)) * 1e-3;
+}
+
+/// Rows the media share probe times: enough that the GPU matmul runs at its
+/// steady rate, so the solve depends on the Mac and the model, never on the
+/// request size.
+pub const MEDIA_PROBE_ROWS: u32 = 4096;
+
+/// The seed share calibration starts from: the silicon's ANE row against one
+/// timed GPU matmul at the model's shape; unknown silicon or a failed probe
+/// keeps the default.
+fn probeShare(io: std.Io, s: mlx.mlx_stream, what: []const u8, qw: QuantWeight, units: u32) f32 {
+    const a = aneTflopsFor(chipBrand(), units) orelse {
+        log.info("[ane] {s} offload share seed {d:.2} (default: no ANE rate row for '{s}')\n", .{ what, DEFAULT_MEDIA_SHARE, chipBrand() });
+        return DEFAULT_MEDIA_SHARE;
+    };
+    const g = probeGpuTflops(io, s, MEDIA_PROBE_ROWS, qw) catch |err| {
+        log.warn("[ane] {s} offload share seed {d:.2} (default: GPU probe failed {s})\n", .{ what, DEFAULT_MEDIA_SHARE, @errorName(err) });
+        return DEFAULT_MEDIA_SHARE;
+    };
+    const share = solveShare(a, g);
+    log.info("[ane] {s} offload share seed {d:.2}: gpu {d:.1} TFLOPS at [{d} x {d}] x [{d} x {d}], ane {d:.1} TFLOPS ({d} unit(s))\n", .{ what, share, g, MEDIA_PROBE_ROWS, qw.in_dim, qw.in_dim, qw.out_dim, a, units });
+    return share;
+}
+
+/// The share that balances ANE and GPU, from one block timed at `s0`: `ane_s`
+/// for its ANE tiles and `gpu_s` for its GPU complement over the same rows.
+/// A 0.01 grid: it is solved once, so no probe jitter to absorb, and its
+/// two-decimal cache tag reads back as the same share.
+pub fn calibratedShare(s0: f32, ane_s: f64, gpu_s: f64) f32 {
+    const a = @as(f64, s0) / ane_s;
+    const g = (1 - @as(f64, s0)) / gpu_s;
+    if (!(a > 0) or !(g > 0)) return s0;
+    const x = std.math.clamp(a / (a + g), 0.25, 0.85);
+    return @floatCast(@round(x * 100) / 100);
+}
+
+/// Block 0 measured both ways at the seed share: its compiled ANE program over
+/// one tile and its GPU complement over MEDIA_PROBE_ROWS rows of the dtype the
+/// MLP really sees. `calib` builds block 0 alone (`buildBlock0(k, units,
+/// share)`), runs its complement (`complement(x)`), names that input dtype
+/// (`dtype`) and drops both (`teardown()`). Null = keep the seed.
+fn calibrate(io: std.Io, s: mlx.mlx_stream, what: []const u8, group: [:0]const u8, s0: f32, k0: u32, units: u32, calib: anytype) ?f32 {
+    // Its own lineage group, so the one-block program never prunes the model's sets.
+    var cb: [104]u8 = undefined;
+    tagCacheLineage(std.fmt.bufPrintSentinel(&cb, "{s}-cal", .{group}, 0) catch return null, s0, false);
+    const start = std.Io.Timestamp.now(io, .awake);
+    const eng = calib.buildBlock0(k0, units, s0) catch |err| {
+        log.warn("[ane] {s} offload calibration build failed ({s}) — keeping share {d:.2}\n", .{ what, @errorName(err), s0 });
+        return null;
+    };
+    defer calib.teardown();
+    const t = timeOverlapped(io, s, eng, calib.dtype, calib) catch |err| {
+        log.warn("[ane] {s} offload calibration: timing failed ({s}) — keeping share {d:.2}\n", .{ what, @errorName(err), s0 });
+        return null;
+    };
+    const ane_s = t.ane;
+    const gpu_s = t.gpu;
+    const share = calibratedShare(s0, ane_s, gpu_s);
+    const secs: f64 = @as(f64, @floatFromInt(@as(u64, @intCast(start.untilNow(io, .awake).nanoseconds)))) / 1e9;
+    log.info("[ane] {s} offload share calibrated {d:.2} in {d:.1}s: at {d:.2} one block takes {d:.1} ms on the ANE, {d:.1} ms on the GPU for {d} rows\n", .{ what, share, secs, s0, ane_s * 1e3, gpu_s * 1e3, MEDIA_PROBE_ROWS });
+    return share;
+}
+
+/// Block 0 run the way the seam runs it: MEDIA_PROBE_ROWS worth of ANE tiles
+/// on a helper thread while this thread evaluates the GPU complement over the
+/// same rows, so each side is timed under the other's load (they share memory
+/// bandwidth and the power budget). Best of three after a warm-up round.
+fn timeOverlapped(io: std.Io, s: mlx.mlx_stream, eng: *AnePrefill, dt: mlx.mlx_dtype, calib: anytype) !struct { ane: f64, gpu: f64 } {
+    if (!eng.mlpReady(0)) return error.AneNoProgram;
+    for (eng.units) |*u| {
+        const plane = u.inputBase() orelse return error.AnePlaneMissing;
+        @memset(plane[0 .. @as(usize, eng.hidden) * eng.rows], 0);
+    }
+    const shape = [_]c_int{ @intCast(MEDIA_PROBE_ROWS), @intCast(eng.hidden) };
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_ones(&x, &shape, 2, dt, s));
+    try mlx.check(mlx.mlx_array_eval(x));
+    const AneLoop = struct {
+        eng: *AnePrefill,
+        io: std.Io,
+        ns: u64 = 0,
+        ok: bool = true,
+        fn run(self: *@This()) void {
+            const t0 = std.Io.Timestamp.now(self.io, .awake);
+            for (0..MEDIA_PROBE_ROWS / self.eng.rows) |_| {
+                self.eng.kickMlp(0);
+                if (!self.eng.waitAll()) self.ok = false;
+            }
+            self.ns = @intCast(t0.untilNow(self.io, .awake).nanoseconds);
+        }
+    };
+    var ane_ns: u64 = std.math.maxInt(u64);
+    var gpu_ns: u64 = std.math.maxInt(u64);
+    for (0..4) |i| {
+        var loop: AneLoop = .{ .eng = eng, .io = io };
+        const th = try std.Thread.spawn(.{}, AneLoop.run, .{&loop});
+        const t0 = std.Io.Timestamp.now(io, .awake);
+        const y = calib.complement(x) catch |err| {
+            th.join();
+            return err;
+        };
+        defer _ = mlx.mlx_array_free(y);
+        const rc = mlx.mlx_array_eval(y);
+        const g: u64 = @intCast(t0.untilNow(io, .awake).nanoseconds);
+        th.join();
+        try mlx.check(rc);
+        if (!loop.ok) return error.AneEvalFailed;
+        if (i > 0) {
+            ane_ns = @min(ane_ns, loop.ns);
+            gpu_ns = @min(gpu_ns, g);
+        }
+    }
+    return .{ .ane = @as(f64, @floatFromInt(ane_ns)) / 1e9, .gpu = @as(f64, @floatFromInt(gpu_ns)) / 1e9 };
+}
+
+/// The host-side peak of one layer's build: gate/up/down (or fused fc1 +
+/// fc2) dequantized to f32 and alive together, plus the MLX-side f32
+/// dequant transient of the weight in flight.
+pub fn buildPeakBytes(hidden: u64, ffn: u64) u64 {
+    return 4 * hidden * ffn * 4;
+}
+
+pub const MediaPlan = struct { share: f32, units: u32, k: u32 };
+
+/// Everything a media seam decides before its build: units, share (explicit,
+/// reused from the model's compiled set, or calibrated on block 0 through
+/// `calib`), the per-unit slice, the memory gate and the disk floor. Every
+/// decline is one named `[ane] <what> offload …` line; null = GPU only.
+pub fn planMediaOffload(io: std.Io, s: mlx.mlx_stream, what: []const u8, layers: usize, hidden: u32, ffn: u32, rows: u32, probe: QuantWeight, calib: anytype) ?MediaPlan {
+    var gb: [96]u8 = undefined;
+    const group = lineageGroup(&gb, what, layers, hidden, ffn) catch return null;
+    const units = unitCount(chipBrand(), dualEnabled());
+    const fixed: ?f32 = if (aneState().media_offload.share) |v| blk: {
+        log.info("[ane] {s} offload share {d:.2} (explicit)\n", .{ what, v });
+        break :blk v;
+    } else if (cachedShare(group)) |v| blk: {
+        log.info("[ane] {s} offload share {d:.2} (reused from its compiled set)\n", .{ what, v });
+        break :blk v;
+    } else null;
+    var share = fixed orelse probeShare(io, s, what, probe, units);
+    var k = channelSliceWidthUnits(ffn, share, units);
+    if (k == 0) {
+        log.warn("[ane] {s} offload: share {d:.2} of ffn {d} over {d} unit(s) leaves no usable slice — GPU only\n", .{ what, share, ffn, units });
+        return null;
+    }
+    if (!mediaFits(what, layers, hidden, ffn, k, rows, units, "GPU only")) return null;
+    var calibrated = false;
+    if (fixed == null) {
+        if (calibrate(io, s, what, group, share, k, units, calib)) |c| {
+            const kc = channelSliceWidthUnits(ffn, c, units);
+            if (kc > 0 and (kc <= k or mediaFits(what, layers, hidden, ffn, kc, rows, units, "keeping the seed share"))) {
+                share = c;
+                k = kc;
+                calibrated = true;
+            }
+        }
+    }
+    tagCacheLineage(group, share, calibrated);
+    return .{ .share = share, .units = units, .k = k };
+}
+
+/// Whether a `k`-wide build fits memory and the disk floor; a refusal is one
+/// named line ending in `fallback`.
+fn mediaFits(what: []const u8, layers: usize, hidden: u32, ffn: u32, k: u32, rows: u32, units: u32, fallback: []const u8) bool {
+    const gib = 1024 * 1024 * 1024;
+    const bill = engineBillBytes(layers, 0, hidden, k, 0, 0, rows, units);
+    const peak = buildPeakBytes(hidden, ffn);
+    var resident: usize = 0;
+    _ = mlx.mlx_get_active_memory(&resident);
+    const avail_mem = status.getAvailableMemBytes();
+    if (mediaGateRefusal(totalMemBytes(), avail_mem, resident, bill, peak)) |why| {
+        switch (why) {
+            .total_ram => log.warn("[ane] {s} offload bills ~{d:.1} GB on top of {d:.1} GB resident, over {d} GB total RAM — {s}\n", .{ what, @as(f64, @floatFromInt(bill)) / gib, @as(f64, @floatFromInt(resident)) / gib, totalMemBytes() / gib, fallback }),
+            .swap_floor => log.warn("[ane] {s} offload: ~{d:.1} GB int8 + ~{d:.1} GB build transient would leave {d:.1} GB available under the {d} GB swap floor — {s}\n", .{ what, @as(f64, @floatFromInt(bill)) / gib, @as(f64, @floatFromInt(peak)) / gib, @as(f64, @floatFromInt(avail_mem)) / gib, SWAP_FLOOR_BYTES / gib, fallback }),
+        }
+        return false;
+    }
+    const free_disk = internalFreeDiskBytes();
+    if (free_disk > 0 and free_disk < BUILD_DISK_FLOOR_BYTES) {
+        log.warn("[ane] {s} offload: under the {d} GB internal-disk build floor, where compiles fail bare — {s}\n", .{ what, BUILD_DISK_FLOOR_BYTES / gib, fallback });
+        return false;
+    }
+    return true;
+}
+
+/// Tag the entries the coming build will store so a share sweep prunes its
+/// predecessors instead of stacking one program set per value.
+pub fn setCacheLineage(what: []const u8, layers: usize, hidden: u32, ffn: u32, share: f32) void {
+    var gb: [96]u8 = undefined;
+    const group = lineageGroup(&gb, what, layers, hidden, ffn) catch return;
+    tagCacheLineage(group, share, false);
+}
+
+fn lineageGroup(buf: []u8, what: []const u8, layers: usize, hidden: u32, ffn: u32) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}:{d}x{d}x{d}", .{ what, layers, hidden, ffn }, 0);
+}
+
+fn tagCacheLineage(group: [:0]const u8, share: f32, reusable: bool) void {
+    var vb: [32]u8 = undefined;
+    const variant = shareVariant(&vb, share, reusable) catch return;
+    msv_ane_cache_lineage(group.ptr, variant.ptr);
+}
+
+/// A set's lineage variant. Only a calibrated media share is tagged reusable,
+/// so a bench's `--ane-split`, an uncalibrated seed or the LM seam's fixed
+/// share is never reused as one.
+fn shareVariant(buf: []u8, share: f32, reusable: bool) ![:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}share={d:.2}", .{ if (reusable) "calibrated " else "", share }, 0);
+}
+
+fn parseShareVariant(v: []const u8) ?f32 {
+    const prefix = "calibrated share=";
+    if (!std.mem.startsWith(u8, v, prefix)) return null;
+    const x = std.fmt.parseFloat(f32, v[prefix.len..]) catch return null;
+    return if (x > 0 and x <= 1) x else null;
+}
+
+/// The calibrated share of the most recently used set compiled for `group`.
+fn cachedShare(group: [:0]const u8) ?f32 {
+    var buf: [32]u8 = @splat(0);
+    msv_ane_cache_variant(group.ptr, &buf, buf.len);
+    return parseShareVariant(std.mem.sliceTo(&buf, 0));
+}
+
+/// ANE prefill is for M4-and-below: on NAX-class GPUs (M5+) the GPU prefill
+/// already outruns the seam — measured a LOSS on M5 Max (channel 0.45 median
+/// -11%/-7.5% at 16k/32k,, two testers). MLX_SERVE_ANE_FORCE=1 keeps
+/// the build for future silicon measurement (M6 etc.). Pure so it is
+/// hermetically testable; the scheduler passes the live NAX probe + env.
+pub fn anePrefillAllowed(nax_available: bool, force_env: ?[]const u8) bool {
+    if (!nax_available) return true;
+    if (force_env) |v| return v.len > 0 and v[0] == '1';
+    return false;
+}
+
+/// Every projection splits by output CHANNEL: all units see ALL chunk tokens through sliced weights — the ANE holds
+/// output channels [0..k) of gate/up (and qkv/z), the GPU the rest; the down projection contributes PARTIAL sums
+/// added at the seam, so the resident int8 copy scales with the share. Measured (27B oQ4e, M4 Max,
+/// medians): channel-0.45 306.4/301.1 vs a token-row split at 0.40 300.7/294.3 vs off 258.2/239.0 at 16k/32k, at
+/// 9.3 GB ANE bytes against the row split's 20.4.
+/// Dual-ANE split: two pinned units computing disjoint channel slices
+/// concurrently. Default ON where it was measured (M3 Ultra), off elsewhere
+/// (unmeasurable on single-ANE silicon; private API on top of private API).
+pub fn dualEnabled() bool {
+    return dualDefault(chipBrand());
+}
+
+/// Neural Engine instances a chip carries. Ultra parts fuse two dies and
+/// expose two ANE services with two IOReport counters (H11ANE/H11ANE1,
+/// `macpow --dump | grep ANE0_` — measured on an M3 Ultra,, where
+/// all energy landed on ANE0_0 because nothing named a die); everything
+/// else has one.
+pub fn aneInstanceCount(chip: []const u8) u32 {
+    return if (std.mem.indexOf(u8, chip, "Ultra") != null) 2 else 1;
+}
+
+/// Ceiling on units — the seams size their fixed part arrays from it, and
+/// no shipping silicon exposes more than two Neural Engines.
+pub const MAX_UNITS: usize = 2;
+
+/// Units the engine builds: two only on silicon that has a second instance to pin to — a dual request on a
+/// single-ANE machine self-disables rather than failing the boot.
+pub fn unitCount(chip: []const u8, dual: bool) u32 {
+    if (!dual) return 1;
+    return aneInstanceCount(chip);
+}
+
+/// Channel-slice boundary alignment: a multiple of 128 keeps the GPU-side
+/// complement slices legal for every quant geometry we serve (group sizes
+/// 32/64/128; packed-word boundaries at any bits in {2,3,4,5,6,8}) and the
+/// ANE-side weights nicely tiled.
+pub const CHANNEL_ALIGN: u32 = 128;
+
+/// PER-UNIT slice of a projection's output channels at a TOTAL `share`
+/// spread over `units`: floored to CHANNEL_ALIGN, clamped so the GPU keeps
+/// at least CHANNEL_ALIGN channels after every unit's slice, 0 when the
+/// slice degenerates. Unit u takes [u*k, (u+1)*k); the GPU takes
+/// [units*k, width). The down conv's K-chunkability is guaranteed by
+/// construction for 128-aligned widths (a power-of-two divisor <= 16 always
+/// lands under the K cliff), mirrored in the test rather than walked here.
+pub fn channelSliceWidthUnits(width: u32, share: f32, units: u32) u32 {
+    if (units == 0 or !(share > 0)) return 0;
+    if (width < (units + 1) * CHANNEL_ALIGN) return 0;
+    const raw: f32 = @as(f32, @floatFromInt(width)) * share / @as(f32, @floatFromInt(units));
+    if (!(raw > 0) or raw != raw) return 0;
+    var k: u32 = @intFromFloat(raw);
+    k -= k % CHANNEL_ALIGN;
+    const room = (width - CHANNEL_ALIGN) / units;
+    const cap = room - room % CHANNEL_ALIGN;
+    if (k > cap) k = cap;
+    if (k < CHANNEL_ALIGN) return 0;
+    return k;
+}
+
+pub fn channelSliceWidth(width: u32, share: f32) u32 {
+    return channelSliceWidthUnits(width, share, 1);
+}
+
+/// What the offload will actually cost in bytes, computable from the config
+/// BEFORE any dequant: the int8 weight copies (dense MLP: gate/up/down; GDN:
+/// the fused qkv+z stack) plus the fp16 IOSurface planes. Widths are
+/// PER-UNIT, so the int8 total is `units` x the per-unit slice — i.e. the
+/// same channels either way, which is exactly why the dual bill is not
+/// bigger than the single one. Planes are per UNIT (concurrent evals cannot
+/// share an output surface) but shared per shape class WITHIN a unit (A9):
+/// input, MLP output, GDN output — ~11 GB back on the 27B vs the old
+/// per-program pairs. Per-row fp16 scales are noise next to these (out_dim
+/// × 2 bytes per weight) and deliberately not billed.
+pub fn engineBillBytes(dense_layers: u64, gdn_layers: u64, hidden: u64, ffn: u64, qkv_out: u64, z_out: u64, rows: u64, units: u64) u64 {
+    const dense_int8 = dense_layers * 3 * hidden * ffn;
+    const gdn_int8 = gdn_layers * (qkv_out + z_out) * hidden;
+    var planes: u64 = 0;
+    if (dense_layers > 0 or gdn_layers > 0) planes += hidden * rows * 2; // input
+    if (dense_layers > 0) planes += hidden * rows * 2; // MLP output
+    if (gdn_layers > 0) planes += (qkv_out + z_out) * rows * 2; // GDN output
+    return (dense_int8 + gdn_int8 + planes) * units;
+}
+
+/// The non-model part of the gate's headroom: OS, other apps, MLX's own
+/// reclaimable pool. Everything that scales with the checkpoint is computed
+/// per model by `server.aneGateHeadroom`.
+pub const GATE_BASELINE_BYTES: u64 = 3 * 1024 * 1024 * 1024;
+
+/// Context the gate RESERVES KV for before admitting an offload.
+///
+/// This is what keeps the offload from eating the advertised context. The ANE
+/// int8 copies come out of the same memory the KV cache is sized from, and
+/// auto-context is pinned AFTER the build — so with no reserve, admitting the
+/// offload silently shrank the number clients read once per session (measured
+/// Qwen3.8-27B iQ on a 32 GB M1 Pro: 97,280 tokens off, 5,120 on).
+/// Reserving the KV up front means an offload is admitted only if a usable
+/// context still fits beside it, and the sizer then finds that memory free.
+pub const MIN_CONTEXT_TOKENS: u32 = 32768;
+
+/// The per-model admission gate (replaces the v1 flat 96 GB total-RAM
+/// check, which refused a 1 GB bill on a 64 GB Mac and said nothing about
+/// WHY): the bill is admitted when resident + bill + headroom fits total
+/// RAM. An unknown total (sysctl failure) is no information — allow, the
+/// server's other memory guards still stand.
+pub fn gateAllows(total_mem: u64, resident: u64, bill: u64, headroom: u64) bool {
+    if (total_mem == 0) return true;
+    return resident +| bill +| headroom <= total_mem;
+}
+
+pub const GateRefusal = enum { total_ram, swap_floor };
+
+/// What the offload must leave the SYSTEM after its build: under this macOS
+/// is already compressing and the next allocation swaps. The total-RAM gate
+/// alone admitted a 6.8 GB copy on a 32 GB M1 Pro beside a 14.7 GB pack and
+/// the ranked request churned ~380 MB of swap with nothing logged.
+pub const SWAP_FLOOR_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// The media seams' gate: the total-RAM bill first, then the resident copy
+/// plus the build's f32 transient against what is available now. An unknown
+/// `avail_mem` (probe failure) is no information.
+pub fn mediaGateRefusal(total_mem: u64, avail_mem: u64, resident: u64, bill: u64, build_peak: u64) ?GateRefusal {
+    if (!gateAllows(total_mem, resident, bill, GATE_BASELINE_BYTES)) return .total_ram;
+    if (avail_mem == 0) return null;
+    if (avail_mem < bill +| build_peak +| SWAP_FLOOR_BYTES) return .swap_floor;
+    return null;
+}
+
+/// The hard floor for starting an ANE build at all: below this much free
+/// internal disk even cache RESTORES and the framework's own model saves
+/// start failing bare ("Write weightsFilePath failed" in the unified log),
+/// and the build ships silent partial coverage — the class. The
+/// build is SKIPPED with a named refusal instead.
+pub const BUILD_DISK_FLOOR_BYTES: u64 = 1 << 30;
+
+/// Ceiling on ONE bank's weight blob. Two things bound it: oMLX hit an
+/// 0x20004 load failure past roughly a 4 GiB per-instance device address
+/// window, and the builder holds a group's quantized payloads AND its
+/// assembled blob at once, so the cap is also the build's transient host
+/// peak (2x). Under the cap a model banks monolithically — which is what
+/// oMLX measured bit-stable across five greedy runs, against split banks
+/// that were ~1% faster but occasionally diverged at a tie.
+pub const DEFAULT_BANK_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Programs the next bank takes from `sizes[start..]`: at least one (a
+/// single program over the cap still has to be its own bank — refusing it
+/// would only move the failure), then as many more as fit under `cap`,
+/// never more than `group`. `group` is the split ladder's current rung: a
+/// failed bank retries at half this count, down to one, and only then does
+/// the program get dropped to the GPU.
+pub fn bankGroupLen(sizes: []const u64, start: usize, group: usize, cap: u64) usize {
+    if (start >= sizes.len or group == 0) return 0;
+    var n: usize = 1;
+    var bytes: u64 = sizes[start];
+    while (n < group and start + n < sizes.len) : (n += 1) {
+        const next = bytes + sizes[start + n];
+        if (next > cap) break;
+        bytes = next;
+    }
+    return n;
+}
+
+/// Free bytes on the internal volume that bounds the ANE compile-session
+/// budget (aned's per-compile scratch lives in root tmp for the client's
+/// lifetime, wherever OUR staging is). 0 = probe failed, no information.
+pub fn internalFreeDiskBytes() u64 {
+    return msv_ane_internal_free_disk();
+}
+
+pub const RowQuant = struct {
+    q: []i8,
+    s: []f32,
+
+    pub fn deinit(self: *RowQuant, allocator: std.mem.Allocator) void {
+        allocator.free(self.q);
+        allocator.free(self.s);
+    }
+};
+
+/// Per-output-row symmetric int8 quantization of a dense row-major [n, k]
+/// f32 weight: s[i] = max|row i| / 127, q = round(w / s) clamped to ±127.
+/// An all-zero row gets scale 0 and zero codes (dequantizes to zero).
+pub fn quantizeRowsInt8(allocator: std.mem.Allocator, w: []const f32, n: usize, k: usize) !RowQuant {
+    std.debug.assert(w.len == n * k);
+    const q = try allocator.alloc(i8, n * k);
+    errdefer allocator.free(q);
+    const s = try allocator.alloc(f32, n);
+    errdefer allocator.free(s);
+    for (0..n) |i| {
+        const row = w[i * k .. (i + 1) * k];
+        var amax: f32 = 0;
+        for (row) |v| {
+            const a = @abs(v);
+            if (a > amax) amax = a;
+        }
+        if (amax == 0) {
+            s[i] = 0;
+            @memset(q[i * k .. (i + 1) * k], 0);
+            continue;
+        }
+        const scale = amax / 127.0;
+        s[i] = scale;
+        const inv = 1.0 / scale;
+        for (row, 0..) |v, j| {
+            const r = @round(v * inv);
+            q[i * k + j] = @intFromFloat(std.math.clamp(r, -127.0, 127.0));
+        }
+    }
+    return .{ .q = q, .s = s };
+}
+
+/// Where one layer's slice lives: which compiled bank, and which procedure
+/// inside it.
+pub const ProgramRef = struct { bank: *MsvAneMlp, proc: u32 };
+
+/// One program awaiting banking: the quantized payloads stay owned here
+/// until a bank is assembled, so a failed bank can be rebuilt at a smaller
+/// rung without re-dequantizing on the inference thread.
+const Pending = struct {
+    layer: u32,
+    gdn: bool,
+    ffn: u32 = 0,
+    qkv_out: u32 = 0,
+    z_out: u32 = 0,
+    a: RowQuant, // gate | qkv
+    b: RowQuant, // up   | z
+    c: ?RowQuant = null, // down (MLP only)
+
+    fn bytes(self: *const Pending) u64 {
+        var n: u64 = self.a.q.len + self.b.q.len;
+        if (self.c) |c| n += c.q.len;
+        return n;
+    }
+
+    fn deinit(self: *Pending, allocator: std.mem.Allocator) void {
+        self.a.deinit(allocator);
+        self.b.deinit(allocator);
+        if (self.c) |*c| c.deinit(allocator);
+    }
+};
+
+/// One Neural Engine's worth of the offload: its own compiled banks, its
+/// own I/O planes, and its own eval thread. Single-ANE is exactly one unit
+/// at instance 0 (no affinity hint — byte-identical to every build before
+/// the dual round).
+pub const Unit = struct {
+    parent: *AnePrefill,
+    /// 0 = no affinity hint; 1..N name a die (M3 Ultra's are 1 and 2).
+    instance: c_int,
+    /// Per-layer MLP procedure refs; null = not offloaded on this unit.
+    layers: []?ProgramRef,
+    /// Per-layer GDN input-projection refs (fused qkv+z).
+    gdn_layers: []?ProgramRef,
+    banks: std.ArrayList(*MsvAneMlp) = .empty,
+    plane_in: ?*MsvAnePlane = null,
+    plane_mlp_out: ?*MsvAnePlane = null,
+    plane_gdn_out: ?*MsvAnePlane = null,
+
+    pending: std.ArrayList(Pending) = .empty,
+    pending_bytes: u64 = 0,
+    /// A bank is homogeneous (one output surface), so MLP and GDN
+    /// programs never share one — a kind switch flushes.
+    pending_gdn: bool = false,
+    dropped: usize = 0,
+
+    thread: ?std.Thread = null,
+    mu: std.Io.Mutex = .init,
+    cond: std.Io.Condition = .init,
+    /// Protected by mu: .idle → .requested → .done.
+    state: enum { idle, requested, done } = .idle,
+    pending_bank: ?*MsvAneMlp = null,
+    pending_proc: u32 = 0,
+    eval_ok: bool = true,
+    stop_flag: bool = false,
+    eval_err: [512]u8 = @splat(0),
+    /// Lifetime eval counts, read by /props from the server thread (the M3
+    /// Ultra tester could not verify DISPATCH from /props — the one-shot
+    /// engagement lines live in the log, but a props probe is what a bench
+    /// harness reads, and under dual it is the ONLY in-process evidence
+    /// that both dies were addressed). Written on the eval thread, hence
+    /// atomics.
+    evals_ok: std.atomic.Value(u64) = .init(0),
+    evals_failed: std.atomic.Value(u64) = .init(0),
+
+    fn allocator(self: *Unit) std.mem.Allocator {
+        return self.parent.allocator;
+    }
+
+    /// Number of layers with a compiled MLP procedure on this unit.
+    pub fn coveredLayers(self: *const Unit) usize {
+        var n: usize = 0;
+        for (self.layers) |h| {
+            if (h != null) n += 1;
+        }
+        return n;
+    }
+
+    pub fn coveredGdnLayers(self: *const Unit) usize {
+        var n: usize = 0;
+        for (self.gdn_layers) |h| {
+            if (h != null) n += 1;
+        }
+        return n;
+    }
+
+    pub fn inputBase(self: *Unit) ?[*]f16 {
+        return msv_ane_plane_base(self.plane_in);
+    }
+
+    pub fn mlpOutputBase(self: *Unit) ?[*]f16 {
+        return msv_ane_plane_base(self.plane_mlp_out);
+    }
+
+    pub fn gdnOutputBase(self: *Unit) ?[*]f16 {
+        return msv_ane_plane_base(self.plane_gdn_out);
+    }
+
+    /// Hand a procedure to this unit's eval thread. One in-flight eval per
+    /// unit; the caller must `wait()` before the next kick.
+    pub fn kick(self: *Unit, ref: ProgramRef) void {
+        self.mu.lockUncancelable(self.parent.io);
+        std.debug.assert(self.state == .idle);
+        self.pending_bank = ref.bank;
+        self.pending_proc = ref.proc;
+        self.state = .requested;
+        self.cond.broadcast(self.parent.io);
+        self.mu.unlock(self.parent.io);
+    }
+
+    /// Block until this unit's in-flight eval finishes. False = the eval
+    /// failed (the caller recomputes on the GPU).
+    pub fn wait(self: *Unit) bool {
+        self.mu.lockUncancelable(self.parent.io);
+        while (self.state != .done) self.cond.waitUncancelable(self.parent.io, &self.mu);
+        const ok = self.eval_ok;
+        self.state = .idle;
+        self.mu.unlock(self.parent.io);
+        return ok;
+    }
+
+    fn evalLoop(self: *Unit) void {
+        while (true) {
+            self.mu.lockUncancelable(self.parent.io);
+            while (self.state != .requested and !self.stop_flag)
+                self.cond.waitUncancelable(self.parent.io, &self.mu);
+            if (self.stop_flag) {
+                self.mu.unlock(self.parent.io);
+                return;
+            }
+            const bank = self.pending_bank;
+            const proc = self.pending_proc;
+            self.mu.unlock(self.parent.io);
+
+            const ok = msv_ane_mlp_eval(bank, proc, &self.eval_err, self.eval_err.len) != 0;
+            if (ok) {
+                _ = self.evals_ok.fetchAdd(1, .monotonic);
+            } else {
+                _ = self.evals_failed.fetchAdd(1, .monotonic);
+                log.warn("[ane] unit {d} eval failed: {s}\n", .{ self.instance, std.mem.sliceTo(&self.eval_err, 0) });
+            }
+
+            self.mu.lockUncancelable(self.parent.io);
+            self.eval_ok = ok;
+            self.state = .done;
+            self.cond.broadcast(self.parent.io);
+            self.mu.unlock(self.parent.io);
+        }
+    }
+
+    /// Queue one layer's MLP slice. Row-major [ffn, hidden] gate/up and
+    /// [hidden, ffn] down f32 weights — already sliced to THIS unit's
+    /// channel range by the caller.
+    fn addMlp(self: *Unit, layer: usize, gate: []const f32, up: []const f32, down: []const f32) !void {
+        const alloc = self.allocator();
+        const hidden = self.parent.hidden;
+        const ffn = self.parent.ffn;
+        if (self.pending.items.len > 0 and self.pending_gdn) self.flushPending();
+        var p = Pending{ .layer = @intCast(layer), .gdn = false, .ffn = ffn, .a = undefined, .b = undefined };
+        p.a = try quantizeRowsInt8(alloc, gate, ffn, hidden);
+        errdefer p.a.deinit(alloc);
+        p.b = try quantizeRowsInt8(alloc, up, ffn, hidden);
+        errdefer p.b.deinit(alloc);
+        p.c = try quantizeRowsInt8(alloc, down, hidden, ffn);
+        errdefer p.c.?.deinit(alloc);
+        try self.enqueue(p);
+    }
+
+    /// Queue one layer's GDN input projections (fused qkv+z).
+    fn addGdn(self: *Unit, layer: usize, qkv: []const f32, z: []const f32) !void {
+        const alloc = self.allocator();
+        const hidden = self.parent.hidden;
+        const qkv_out = self.parent.gdn_qkv_out;
+        const z_out = self.parent.gdn_z_out;
+        if (qkv_out == 0 or z_out == 0) return error.AneGdnPlaneMismatch;
+        if (self.pending.items.len > 0 and !self.pending_gdn) self.flushPending();
+        var p = Pending{ .layer = @intCast(layer), .gdn = true, .qkv_out = qkv_out, .z_out = z_out, .a = undefined, .b = undefined };
+        p.a = try quantizeRowsInt8(alloc, qkv, qkv_out, hidden);
+        errdefer p.a.deinit(alloc);
+        p.b = try quantizeRowsInt8(alloc, z, z_out, hidden);
+        errdefer p.b.deinit(alloc);
+        try self.enqueue(p);
+    }
+
+    /// Takes ownership of `p` ONLY on success — a failed append leaves the
+    /// caller's errdefers to free the payloads (freeing here as well is the
+    /// double-free).
+    fn enqueue(self: *Unit, p: Pending) !void {
+        // Bound the builder's transient host peak: the queue holds the
+        // quantized payloads and the flush assembles a blob of the same
+        // size beside them, so the cap governs both.
+        const cap = DEFAULT_BANK_MAX_BYTES;
+        if (self.pending.items.len > 0 and self.pending_bytes + p.bytes() > cap) self.flushPending();
+        try self.pending.append(self.allocator(), p);
+        self.pending_gdn = p.gdn;
+        self.pending_bytes += p.bytes();
+    }
+
+    /// Assemble one bank from `pending[start..start+n)`. Returns false when
+    /// the compile or load was refused — the caller walks the split ladder.
+    fn buildBank(self: *Unit, start: usize, n: usize) bool {
+        const bank = msv_ane_bank_create() orelse return false;
+        var err: [512]u8 = @splat(0);
+        var ok = true;
+        for (self.pending.items[start..][0..n]) |*p| {
+            const rc = if (p.gdn)
+                msv_ane_bank_add_gdn(bank, self.parent.hidden, p.qkv_out, p.z_out, self.parent.rows, p.a.q.ptr, p.a.s.ptr, p.b.q.ptr, p.b.s.ptr, &err, err.len)
+            else
+                msv_ane_bank_add_mlp(bank, self.parent.hidden, p.ffn, self.parent.rows, p.a.q.ptr, p.a.s.ptr, p.b.q.ptr, p.b.s.ptr, p.c.?.q.ptr, p.c.?.s.ptr, &err, err.len);
+            if (rc < 0) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok) {
+            log.warn("[ane] unit {d} bank assembly failed: {s}\n", .{ self.instance, std.mem.sliceTo(&err, 0) });
+            msv_ane_bank_free(bank);
+            return false;
+        }
+        const kind: []const u8 = if (self.pending.items[start].gdn) "gdn" else "mlp";
+        var name_buf: [96]u8 = undefined;
+        const name = std.fmt.bufPrintSentinel(&name_buf, "{s}_u{d}_b{d}_l{d}n{d}_r{d}", .{
+            kind, self.instance, self.banks.items.len, self.pending.items[start].layer, n, self.parent.rows,
+        }, 0) catch "ane_bank";
+        const out_plane = if (self.pending.items[start].gdn) self.plane_gdn_out else self.plane_mlp_out;
+        const compiled = msv_ane_bank_finish(bank, name.ptr, self.instance, self.plane_in, out_plane, &err, err.len) orelse {
+            log.warn("[ane] unit {d} bank of {d} programs failed: {s}\n", .{ self.instance, n, std.mem.sliceTo(&err, 0) });
+            return false;
+        };
+        self.banks.append(self.allocator(), compiled) catch {
+            msv_ane_mlp_free(compiled);
+            return false;
+        };
+        for (self.pending.items[start..][0..n], 0..) |*p, i| {
+            const ref = ProgramRef{ .bank = compiled, .proc = @intCast(i) };
+            if (p.gdn) self.gdn_layers[p.layer] = ref else self.layers[p.layer] = ref;
+        }
+        return true;
+    }
+
+    /// Compile everything queued, walking the split ladder: one bank for
+    /// the whole group, then halves, then progressively smaller, and only a
+    /// bank of ONE that still fails drops its layer to the GPU.
+    fn flushPending(self: *Unit) void {
+        defer {
+            for (self.pending.items) |*p| p.deinit(self.allocator());
+            self.pending.clearRetainingCapacity();
+            self.pending_bytes = 0;
+        }
+        if (self.pending.items.len == 0) return;
+        const alloc = self.allocator();
+        const sizes = alloc.alloc(u64, self.pending.items.len) catch {
+            log.warn("[ane] unit {d}: out of memory partitioning {d} queued programs — they stay on GPU\n", .{ self.instance, self.pending.items.len });
+            self.dropped += self.pending.items.len;
+            return;
+        };
+        defer alloc.free(sizes);
+        for (self.pending.items, 0..) |*p, i| sizes[i] = p.bytes();
+
+        const cap = DEFAULT_BANK_MAX_BYTES;
+        var start: usize = 0;
+        var group: usize = self.pending.items.len;
+        while (start < self.pending.items.len) {
+            const n = bankGroupLen(sizes, start, group, cap);
+            if (n == 0) break;
+            if (self.buildBank(start, n)) {
+                start += n;
+                continue;
+            }
+            if (n == 1) {
+                log.warn("[ane] unit {d} layer {d} program dropped — stays on GPU\n", .{ self.instance, self.pending.items[start].layer });
+                self.dropped += 1;
+                start += 1;
+                continue;
+            }
+            group = n / 2;
+            log.warn("[ane] unit {d} bank of {d} refused — retrying at {d} programs per bank\n", .{ self.instance, n, group });
+        }
+    }
+
+    fn deinit(self: *Unit) void {
+        if (self.thread) |t| {
+            self.mu.lockUncancelable(self.parent.io);
+            self.stop_flag = true;
+            self.cond.broadcast(self.parent.io);
+            self.mu.unlock(self.parent.io);
+            t.join();
+        }
+        const alloc = self.allocator();
+        for (self.pending.items) |*p| p.deinit(alloc);
+        self.pending.deinit(alloc);
+        for (self.banks.items) |b| msv_ane_mlp_free(b);
+        self.banks.deinit(alloc);
+        alloc.free(self.layers);
+        alloc.free(self.gdn_layers);
+        msv_ane_plane_free(self.plane_in);
+        msv_ane_plane_free(self.plane_mlp_out);
+        msv_ane_plane_free(self.plane_gdn_out);
+    }
+};
+
+/// Per-model ANE prefill engine: one or more units (one Neural Engine
+/// each), each holding compiled procedure banks at a FIXED row tile. Built
+/// at model load (scheduler), owned by the Transformer, freed on unload.
+pub const AnePrefill = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    /// Constructed units. During init this is a growing prefix of the
+    /// `units_cap`-long allocation so a failed plane alloc unwinds only
+    /// what exists; afterwards it is the whole thing.
+    units: []Unit,
+    units_cap: usize,
+    hidden: u32,
+    /// PER-UNIT MLP output-channel slice width in channel mode; the full
+    /// intermediate size in row mode.
+    ffn: u32,
+    /// PER-UNIT GDN projection output widths the compiled programs are
+    /// built at (0 = no GDN offload). The seam reads these to slice the
+    /// output plane.
+    gdn_qkv_out: u32 = 0,
+    gdn_z_out: u32 = 0,
+    /// The fixed ANE row tile every compiled program expects (== chunk_rows
+    /// in channel mode: every unit sees all chunk tokens there).
+    rows: u32,
+    /// The full chunk width the tile was derived from — the forward seam
+    /// only engages on chunks of exactly this width.
+    chunk_rows: u32,
+    /// row = token-row split through full weights; channel = output-channel
+    /// split through sliced weights (partial-sum down join).
+    /// The TOTAL share the engine was built at and the int8 bytes it holds
+    /// — set by the builder after the layer loop, read by /props and the
+    /// metrics gauges. 0 until publishLive.
+    share: f32 = 0,
+    int8_bytes: u64 = 0,
+    published: bool = false,
+    engaged_logged: bool = false,
+    gdn_engaged_logged: bool = false,
+
+    /// `gdn_qkv_out`/`gdn_z_out` of 0 skips the GDN output plane (MLP-only
+    /// engine); non-zero sizes it for the fused qkv+z programs. In channel
+    /// mode `ffn`/`gdn_*_out` are the PER-UNIT sliced widths and
+    /// rows == chunk_rows. `units` > 1 pins unit u to ANE instance u+1.
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, num_layers: usize, hidden: u32, ffn: u32, rows: u32, chunk_rows: u32, gdn_qkv_out: u32, gdn_z_out: u32, units: u32) !*AnePrefill {
+        std.debug.assert(units >= 1 and units <= MAX_UNITS);
+        const self = try allocator.create(AnePrefill);
+        errdefer allocator.destroy(self);
+        const unit_slice = try allocator.alloc(Unit, units);
+        errdefer allocator.free(unit_slice);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .units = unit_slice[0..0],
+            .units_cap = units,
+            .hidden = hidden,
+            .ffn = ffn,
+            .gdn_qkv_out = gdn_qkv_out,
+            .gdn_z_out = gdn_z_out,
+            .rows = rows,
+            .chunk_rows = chunk_rows,
+        };
+        errdefer for (self.units) |*u| u.deinit();
+        const io_bytes = @as(usize, hidden) * rows * 2;
+        for (0..units) |u| {
+            const layers = try allocator.alloc(?ProgramRef, num_layers);
+            @memset(layers, null);
+            const gdn_layers = allocator.alloc(?ProgramRef, num_layers) catch |e| {
+                allocator.free(layers);
+                return e;
+            };
+            @memset(gdn_layers, null);
+            unit_slice[u] = .{
+                .parent = self,
+                .instance = if (units > 1) @intCast(u + 1) else 0,
+                .layers = layers,
+                .gdn_layers = gdn_layers,
+            };
+            // The unit is live in `units` before any fallible plane alloc,
+            // so errdefer self.deinit() frees what it already owns.
+            self.units = unit_slice[0 .. u + 1];
+            unit_slice[u].plane_in = msv_ane_plane_create(io_bytes) orelse return error.AnePlaneAlloc;
+            unit_slice[u].plane_mlp_out = msv_ane_plane_create(io_bytes) orelse return error.AnePlaneAlloc;
+            if (gdn_qkv_out > 0 and gdn_z_out > 0)
+                unit_slice[u].plane_gdn_out = msv_ane_plane_create(@as(usize, gdn_qkv_out + gdn_z_out) * rows * 2) orelse return error.AnePlaneAlloc;
+            unit_slice[u].thread = try std.Thread.spawn(.{}, Unit.evalLoop, .{&unit_slice[u]});
+        }
+        if (self.units[0].plane_gdn_out == null) {
+            self.gdn_qkv_out = 0;
+            self.gdn_z_out = 0;
+        }
+        return self;
+    }
+
+    /// Record this engine's built totals into the live gauges (once).
+    pub fn publishLive(self: *AnePrefill, share: f32, int8_bytes: u64) void {
+        std.debug.assert(!self.published);
+        self.share = share;
+        self.int8_bytes = int8_bytes;
+        self.published = true;
+        _ = aneState().live_int8_bytes.fetchAdd(int8_bytes, .monotonic);
+        _ = aneState().live_layers.fetchAdd(@intCast(self.coveredLayers() + self.coveredGdnLayers()), .monotonic);
+    }
+
+    pub fn deinit(self: *AnePrefill) void {
+        if (self.published) {
+            _ = aneState().live_int8_bytes.fetchSub(self.int8_bytes, .monotonic);
+            _ = aneState().live_layers.fetchSub(@intCast(self.coveredLayers() + self.coveredGdnLayers()), .monotonic);
+        }
+        const allocator = self.allocator;
+        const base = self.units.ptr;
+        const cap = self.units_cap;
+        for (self.units) |*u| u.deinit();
+        allocator.free(base[0..cap]);
+        allocator.destroy(self);
+    }
+
+    /// Layers whose MLP slice is covered on EVERY unit (a layer covered by
+    /// only some units cannot be dispatched — the seam needs every partial).
+    pub fn coveredLayers(self: *const AnePrefill) usize {
+        var n: usize = 0;
+        for (self.units[0].layers, 0..) |_, i| {
+            if (self.mlpReady(i)) n += 1;
+        }
+        return n;
+    }
+
+    pub fn coveredGdnLayers(self: *const AnePrefill) usize {
+        var n: usize = 0;
+        for (self.units[0].gdn_layers, 0..) |_, i| {
+            if (self.gdnReady(i)) n += 1;
+        }
+        return n;
+    }
+
+    pub fn mlpReady(self: *const AnePrefill, layer: usize) bool {
+        if (layer >= self.units[0].layers.len) return false;
+        for (self.units) |*u| {
+            if (u.layers[layer] == null) return false;
+        }
+        return true;
+    }
+
+    pub fn gdnReady(self: *const AnePrefill, layer: usize) bool {
+        if (layer >= self.units[0].gdn_layers.len) return false;
+        for (self.units) |*u| {
+            if (u.gdn_layers[layer] == null) return false;
+        }
+        return true;
+    }
+
+    /// Queue one unit's slice of a layer's MLP / GDN weights.
+    pub fn addMlpLayer(self: *AnePrefill, unit: usize, layer: usize, gate: []const f32, up: []const f32, down: []const f32) !void {
+        try self.units[unit].addMlp(layer, gate, up, down);
+    }
+
+    pub fn addGdnLayer(self: *AnePrefill, unit: usize, layer: usize, qkv: []const f32, z: []const f32) !void {
+        try self.units[unit].addGdn(layer, qkv, z);
+    }
+
+    /// Compile every queued program. After this call each layer is either
+    /// dispatchable on all units or null everywhere it failed.
+    pub fn finishPending(self: *AnePrefill) void {
+        for (self.units) |*u| u.flushPending();
+    }
+
+    /// Programs the ladder had to drop this build (each = one layer that
+    /// stays on the GPU).
+    pub fn droppedPrograms(self: *const AnePrefill) usize {
+        var n: usize = 0;
+        for (self.units) |*u| n += u.dropped;
+        return n;
+    }
+
+    pub fn resetDropped(self: *AnePrefill) void {
+        for (self.units) |*u| u.dropped = 0;
+    }
+
+    pub fn compiledBanks(self: *const AnePrefill) usize {
+        var n: usize = 0;
+        for (self.units) |*u| n += u.banks.items.len;
+        return n;
+    }
+
+    /// Kick every unit's slice of a layer, then wait for all of them.
+    /// Returns false when ANY unit's eval failed — the seam then recomputes
+    /// the whole layer on the GPU (a subset of the partials is not an
+    /// answer).
+    pub fn kickMlp(self: *AnePrefill, layer: usize) void {
+        for (self.units) |*u| u.kick(u.layers[layer].?);
+    }
+
+    pub fn kickGdn(self: *AnePrefill, layer: usize) void {
+        for (self.units) |*u| u.kick(u.gdn_layers[layer].?);
+    }
+
+    pub fn waitAll(self: *AnePrefill) bool {
+        var ok = true;
+        for (self.units) |*u| {
+            if (!u.wait()) ok = false;
+        }
+        return ok;
+    }
+
+    /// One-shot engagement lines, one PER SEAM — a built-but-never-
+    /// dispatched program is exactly the dispatch-hole class, so each seam
+    /// proves its own dispatch in the log (the expectNoSpec rule).
+    /// `what` names the CALLER's surface ("prefill", "image", "video",
+    /// "audio"): one engine serves all of them, and a media seam logging
+    /// "prefill offload engaged (--ane-prefill)" reads as a flag nobody
+    /// passed.
+    pub fn logEngagedOnce(self: *AnePrefill, what: []const u8) void {
+        if (self.engaged_logged) return;
+        self.engaged_logged = true;
+        log.info("[ane] {s} offload engaged: units={d} mlp={d} rows={d}/{d}\n", .{ what, self.units.len, self.coveredLayers(), self.rows, self.chunk_rows });
+    }
+
+    pub fn logGdnEngagedOnce(self: *AnePrefill) void {
+        if (self.gdn_engaged_logged) return;
+        self.gdn_engaged_logged = true;
+        log.info("[ane] gdn offload engaged: units={d} {d} layers, rows={d}/{d}\n", .{ self.units.len, self.coveredGdnLayers(), self.rows, self.chunk_rows });
+    }
+
+    /// The dual-ANE proof line: which instances the units were pinned to
+    /// and how wide a slice each computes. A silently IGNORED affinity hint
+    /// cannot be detected in-process — both units' evals succeed and both
+    /// land on one die — so this line is the pointer to the out-of-process
+    /// check (`macpow --dump | grep ANE0_` must move BOTH counters).
+    pub fn logDualReady(self: *AnePrefill) void {
+        if (self.units.len < 2) return;
+        log.info("[ane] dual engaged: {d} units pinned to instances {d}..{d}, {d} channels each of mlp / {d}+{d} of gdn (verify BOTH IOReport ANE0_ counters move)\n", .{
+            self.units.len,
+            self.units[0].instance,
+            self.units[self.units.len - 1].instance,
+            self.ffn,
+            self.gdn_qkv_out,
+            self.gdn_z_out,
+        });
+    }
+};
+
+// ── Seam plane I/O ──
+//
+// Shared by every offload seam (LM prefill in transformer.zig, media DiT
+// blocks in the backends): the planes are fp16 CHANNEL-major, so a [1,R,W]
+// activation transposes to [W][R] going in and back on the way out.
+
+/// Pack a [1, R, W] activation into an ANE input plane. bf16→fp16 is exact in
+/// fp16's normal range and the graph computes fp16 anyway. Blocks on the eval:
+/// the caller is the sole MLX caller and the plane must be filled before kick.
+pub fn packPlane(s: mlx.mlx_stream, x_rows: mlx.mlx_array, plane: [*]f16) !void {
+    const sh = mlx.getShape(x_rows); // [1, R, W]
+    const rows = sh[1];
+    const width = sh[2];
+    var x_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_flat);
+    {
+        var x2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x2d);
+        const shape2 = [_]c_int{ rows, width };
+        try mlx.check(mlx.mlx_reshape(&x2d, x_rows, &shape2, 2, s));
+        var xt_view = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xt_view);
+        const perm = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&xt_view, x2d, &perm, 2, s));
+        var xf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xf);
+        try mlx.check(mlx.mlx_astype(&xf, xt_view, .float16, s));
+        const flat_shape = [_]c_int{width * rows};
+        try mlx.check(mlx.mlx_reshape(&x_flat, xf, &flat_shape, 1, s));
+    }
+    try mlx.check(mlx.mlx_array_eval(x_flat));
+    const src = mlx.mlx_array_data_float16(x_flat) orelse return error.AnePackReadFailed;
+    const count: usize = @intCast(width * rows);
+    @memcpy(plane[0..count], src[0..count]);
+}
+
+/// Read an ANE output plane ([width][R] fp16 channel-major) back as a
+/// [1, R, width] tensor in `dtype`.
+pub fn readPlane(s: mlx.mlx_stream, plane: [*]f16, width: c_int, rows: c_int, dtype: mlx.mlx_dtype) !mlx.mlx_array {
+    const t_shape = [_]c_int{ width, rows };
+    // mlx_array_new_data COPIES at construction, so the plane is free for the
+    // next program the moment this returns.
+    const y_f16 = mlx.mlx_array_new_data(plane, &t_shape, 2, .float16);
+    defer _ = mlx.mlx_array_free(y_f16);
+    var y_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_t);
+    const perm = [_]c_int{ 1, 0 };
+    try mlx.check(mlx.mlx_transpose_axes(&y_t, y_f16, &perm, 2, s));
+    var y_cast = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_cast);
+    try mlx.check(mlx.mlx_astype(&y_cast, y_t, dtype, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const shape3 = [_]c_int{ 1, rows, width };
+    try mlx.check(mlx.mlx_reshape(&out, y_cast, &shape3, 3, s));
+    return out;
+}
+
+/// The ANE program computes in fp16 throughout, so both its INTERNAL
+/// activation (`silu(gate) * up`) and its output plane must stay under 65504.
+/// The `up` half of the ANE's weight copy is divided by this at build time and
+/// the read-back partial multiplied back: `up` is linear into the product, so
+/// `act` and the down-conv output both scale by it exactly, while `silu(gate)`
+/// is untouched. EXACT — per-row int8 quantization folds the factor into the
+/// row scale, and a power of two is exact in fp16.
+///
+/// Measured on H3's DiT (864x480, 21f): the fc2 partial peaks at ~1.7M and
+/// `act` at 52k, so an unscaled seam saturates to INF from block 36 on and the
+/// video renders BLACK. 256 leaves ~10x headroom over that peak; entries it
+/// pushes subnormal sit 7+ orders below the max and are already fp16 noise.
+pub const OUT_PLANE_SCALE: f32 = 256.0;
+
+/// Dequantize an affine-packed weight to host f32 [out_dim, in_dim] row-major
+/// — the layout `quantizeRowsInt8` expects. THE dequant for every seam.
+pub fn dequantToHostF32(
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    biases: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    in_dim: u32,
+    out_dim: u32,
+) ![]f32 {
+    if (scales.ctx == null) return error.AneDenseBf16Unsupported;
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(
+        &deq,
+        w,
+        scales,
+        biases,
+        mlx.mlx_optional_int.some(@intCast(group_size)),
+        mlx.mlx_optional_int.some(@intCast(bits)),
+        "affine",
+        .{}, // global_scale
+        .{ .value = .float32, .has_value = true },
+        s,
+    ));
+    const sh = mlx.getShape(deq);
+    if (sh.len != 2 or sh[0] != @as(c_int, @intCast(out_dim)) or sh[1] != @as(c_int, @intCast(in_dim))) return error.AneWeightShape;
+    const n: c_int = @intCast(out_dim * in_dim);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    const fs = [_]c_int{n};
+    try mlx.check(mlx.mlx_reshape(&flat, deq, &fs, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    const ptr = mlx.mlx_array_data_float32(flat) orelse return error.AneDequantRead;
+    const out = try allocator.alloc(f32, @intCast(n));
+    @memcpy(out, ptr[0..@intCast(n)]);
+    return out;
+}
+
+/// Fill every unit's input plane with the same packed activation. The pack is
+/// done ONCE and memcpy'd into the other units (~1.7 ms on the 27B against a
+/// ~20 ms eval). The wait stays BLOCKING and on this thread: oMLX measured that
+/// moving it to a worker, or launching the ANE from the Metal completion
+/// callback, destroyed device overlap (a fused layer 47.5 -> 71.0 ms).
+pub fn packUnitPlanes(s: mlx.mlx_stream, eng: *AnePrefill, x: mlx.mlx_array) !void {
+    const first = eng.units[0].inputBase() orelse return error.AnePlaneMissing;
+    try packPlane(s, x, first);
+    if (eng.units.len == 1) return;
+    const count: usize = @as(usize, eng.hidden) * eng.rows;
+    for (eng.units[1..]) |*u| {
+        const plane = u.inputBase() orelse return error.AnePlaneMissing;
+        @memcpy(plane[0..count], first[0..count]);
+    }
+}
+
+// ── Media seam (image / video / audio DiT blocks) ──
+
+pub const TilePlan = struct { tiles: u32, cover: u32 };
+
+/// How `seq` rows map onto T-row tiles: `tiles` ANE evals covering rows
+/// [0, cover), the rest on the full GPU MLP. A partial last tile rides the ANE
+/// zero-padded only when its rows cost the GPU more alone than a whole tile
+/// costs the ANE at a balanced share: tail > T x (1 - share).
+pub fn mediaTilePlan(seq: u32, t: u32, share: f32) TilePlan {
+    const full = seq / t;
+    const tail = seq - full * t;
+    if (tail > 0 and @as(f32, @floatFromInt(tail)) > @as(f32, @floatFromInt(t)) * (1 - share))
+        return .{ .tiles = full + 1, .cover = seq };
+    return .{ .tiles = full, .cover = full * t };
+}
+
+/// One DiT block's SwiGLU with the channel split, `x` [..., W]. Rows
+/// [0, cover) ride the compiled T-row tile (T = eng.rows) one tile at a time
+/// while the GPU complement `ctx.complement(head)` computes over all of them;
+/// the rest run the full GPU MLP `ctx.full`. A failed eval recomputes the
+/// block on the GPU: a subset of the partials is not an answer.
+pub fn mediaMlp(s: mlx.mlx_stream, eng: *AnePrefill, layer: usize, what: []const u8, x: mlx.mlx_array, ctx: anytype) !mlx.mlx_array {
+    const shape = mlx.getShape(x);
+    const w: c_int = @intCast(eng.hidden);
+    var numel: c_int = 1;
+    for (shape) |d| numel *= d;
+    const seq: u32 = @intCast(@divExact(numel, w));
+    const t = eng.rows;
+    const plan = mediaTilePlan(seq, t, eng.share);
+    const n = plan.tiles;
+    if (n == 0) return ctx.full(x);
+    const tc: c_int = @intCast(t);
+    const nc: c_int = @intCast(n);
+    const cover: c_int = @intCast(plan.cover);
+
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    const s2 = [_]c_int{ @intCast(seq), w };
+    try mlx.check(mlx.mlx_reshape(&x2, x, &s2, 2, s));
+    const head = try rowsView(x2, 0, cover, s);
+    defer _ = mlx.mlx_array_free(head);
+    const packed_tiles = try packTiles(s, head, nc, tc, w);
+    defer _ = mlx.mlx_array_free(packed_tiles);
+    const src = mlx.mlx_array_data_float16(packed_tiles) orelse return error.AnePackReadFailed;
+    const tile_len: usize = @as(usize, eng.hidden) * t;
+
+    try fillInputs(eng, src[0..tile_len]);
+    eng.kickMlp(layer);
+    var in_flight = true;
+    defer if (in_flight) {
+        _ = eng.waitAll();
+    };
+    // Every GPU piece goes out before the tile loop so it overlaps all of it.
+    const y_gpu = try ctx.complement(head);
+    defer _ = mlx.mlx_array_free(y_gpu);
+    var tail_out: ?mlx.mlx_array = null;
+    defer if (tail_out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    if (plan.cover < seq) {
+        const tail_in = try rowsView(x2, cover, @intCast(seq), s);
+        defer _ = mlx.mlx_array_free(tail_in);
+        tail_out = try ctx.full(tail_in);
+    }
+    {
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        _ = mlx.mlx_vector_array_append_value(ev, y_gpu);
+        if (tail_out) |a| _ = mlx.mlx_vector_array_append_value(ev, a);
+        _ = mlx.mlx_async_eval(ev);
+    }
+
+    const units = eng.units.len;
+    var outs: [MAX_UNITS]mlx.mlx_vector_array = undefined;
+    for (outs[0..units]) |*v| v.* = mlx.mlx_vector_array_new();
+    defer for (outs[0..units]) |v| {
+        _ = mlx.mlx_vector_array_free(v);
+    };
+    const plane_shape = [_]c_int{ w, tc };
+    for (0..n) |i| {
+        const ok = eng.waitAll();
+        in_flight = false;
+        if (!ok) return ctx.full(x);
+        for (eng.units, outs[0..units]) |*u, v| {
+            const plane = u.mlpOutputBase() orelse return error.AnePlaneMissing;
+            // COPIES, so the plane is free for the next tile on return.
+            const y = mlx.mlx_array_new_data(plane, &plane_shape, 2, .float16);
+            defer _ = mlx.mlx_array_free(y);
+            _ = mlx.mlx_vector_array_append_value(v, y);
+        }
+        if (i + 1 < n) {
+            try fillInputs(eng, src[(i + 1) * tile_len ..][0..tile_len]);
+            eng.kickMlp(layer);
+            in_flight = true;
+        }
+    }
+
+    const dt = mlx.mlx_array_dtype(y_gpu);
+    var ane_part = try sumUnitTiles(s, outs[0..units], nc, tc, w, dt);
+    defer _ = mlx.mlx_array_free(ane_part);
+    if (cover < nc * tc) {
+        const cut = try rowsView(ane_part, 0, cover, s);
+        _ = mlx.mlx_array_free(ane_part);
+        ane_part = cut;
+    }
+    // Undo the build-time `up` scale that keeps the fp16 graph in range.
+    const sc_f32 = mlx.mlx_array_new_float(OUT_PLANE_SCALE);
+    defer _ = mlx.mlx_array_free(sc_f32);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_astype(&sc, sc_f32, dt, s));
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, ane_part, sc, s));
+    var head_out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(head_out);
+    try mlx.check(mlx.mlx_add(&head_out, scaled, y_gpu, s));
+
+    if (!eng.engaged_logged) {
+        eng.engaged_logged = true;
+        log.info("[ane] {s} offload engaged: tiled {d} x {d} rows ({d} padded), tail {d} on GPU, units={d} mlp={d}\n", .{ what, n, t, n * t - plan.cover, seq - plan.cover, units, eng.coveredLayers() });
+    }
+
+    var joined = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(joined);
+    if (tail_out) |tail| {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, head_out);
+        _ = mlx.mlx_vector_array_append_value(vec, tail);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 0, s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&joined, head_out));
+    }
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, joined, shape.ptr, shape.len, s));
+    return out;
+}
+
+fn rowsView(x: mlx.mlx_array, lo: c_int, hi: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const start = [_]c_int{ lo, 0 };
+    const stop = [_]c_int{ hi, mlx.getShape(x)[1] };
+    const step = [_]c_int{ 1, 1 };
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, &start, 2, &stop, 2, &step, 2, s));
+    return o;
+}
+
+/// [rows, W] -> n contiguous [W][T] fp16 plane images in ONE eval, zero rows
+/// padding the last tile (each ANE row is independent, so they only cost time).
+fn packTiles(s: mlx.mlx_stream, head: mlx.mlx_array, n: c_int, t: c_int, w: c_int) !mlx.mlx_array {
+    var full = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full);
+    const rows = mlx.getShape(head)[0];
+    if (rows < n * t) {
+        const zero_f32 = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(zero_f32);
+        var zero = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zero);
+        try mlx.check(mlx.mlx_astype(&zero, zero_f32, mlx.mlx_array_dtype(head), s));
+        const axes = [_]c_int{0};
+        const lo = [_]c_int{0};
+        const hi = [_]c_int{n * t - rows};
+        try mlx.check(mlx.mlx_pad(&full, head, &axes, 1, &lo, 1, &hi, 1, zero, "constant", s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&full, head));
+    }
+    var r3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r3);
+    const s3 = [_]c_int{ n, t, w };
+    try mlx.check(mlx.mlx_reshape(&r3, full, &s3, 3, s));
+    var tr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tr);
+    const perm = [_]c_int{ 0, 2, 1 };
+    try mlx.check(mlx.mlx_transpose_axes(&tr, r3, &perm, 3, s));
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, tr, .float16, s));
+    var flat = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(flat);
+    const fs = [_]c_int{n * w * t};
+    try mlx.check(mlx.mlx_reshape(&flat, f, &fs, 1, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    return flat;
+}
+
+fn fillInputs(eng: *AnePrefill, tile: []const f16) !void {
+    var last: ?[*]f16 = null;
+    for (eng.units) |*u| {
+        const plane = u.inputBase() orelse return error.AnePlaneMissing;
+        if (plane == last) continue; // shared input surface
+        @memcpy(plane[0..tile.len], tile);
+        last = plane;
+    }
+}
+
+/// Each unit's n [W, T] fp16 output tiles back to [n*T, W] rows in `dt`,
+/// summed across units.
+fn sumUnitTiles(s: mlx.mlx_stream, outs: []const mlx.mlx_vector_array, n: c_int, t: c_int, w: c_int, dt: mlx.mlx_dtype) !mlx.mlx_array {
+    var acc = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(acc);
+    for (outs, 0..) |tiles, u| {
+        var cat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cat);
+        try mlx.check(mlx.mlx_concatenate_axis(&cat, tiles, 0, s));
+        var r3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r3);
+        const s3 = [_]c_int{ n, w, t };
+        try mlx.check(mlx.mlx_reshape(&r3, cat, &s3, 3, s));
+        var tr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tr);
+        const perm = [_]c_int{ 0, 2, 1 };
+        try mlx.check(mlx.mlx_transpose_axes(&tr, r3, &perm, 3, s));
+        var cast = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cast);
+        try mlx.check(mlx.mlx_astype(&cast, tr, dt, s));
+        var part = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(part);
+        const s2 = [_]c_int{ n * t, w };
+        try mlx.check(mlx.mlx_reshape(&part, cast, &s2, 2, s));
+        if (u == 0) {
+            try mlx.check(mlx.mlx_array_set(&acc, part));
+        } else {
+            var sum = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(sum);
+            try mlx.check(mlx.mlx_add(&sum, acc, part, s));
+            _ = mlx.mlx_array_free(acc);
+            acc = sum;
+        }
+    }
+    return acc;
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "defaultShare: per-silicon channel rows, row mode keeps its M4 optimum" {
+    // M3 Ultra channel row ( tester): 0.45 measured ≈ nothing, 0.35
+    // measured +8.5%/+13.7% at 16k/32k — the default must be the measured
+    // optimum for the machine, never one machine's number everywhere.
+    try std.testing.expectEqual(@as(f32, 0.50), defaultShare("Apple M3 Ultra")); // dual by default
+    try std.testing.expectEqual(@as(f32, 0.35), defaultShareFor("Apple M3 Ultra", false));
+    try std.testing.expect(dualDefault("Apple M3 Ultra"));
+    try std.testing.expect(!dualDefault("Apple M4 Max"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare("Apple M4 Max"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare("Apple M3 Max"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare(""));
+    // Row mode is only measured on M4; every chip keeps that row.
+}
+
+test "anePrefillAllowed: NAX-class GPUs refuse the seam unless forced" {
+    // No NAX (M1-M4): allowed regardless of the force env.
+    try std.testing.expect(anePrefillAllowed(false, null));
+    try std.testing.expect(anePrefillAllowed(false, "0"));
+    // NAX present (M5+): refused — the GPU prefill measured faster.
+    try std.testing.expect(!anePrefillAllowed(true, null));
+    try std.testing.expect(!anePrefillAllowed(true, "0"));
+    try std.testing.expect(!anePrefillAllowed(true, ""));
+    // MLX_SERVE_ANE_FORCE=1 keeps the build for future-silicon measurement.
+    try std.testing.expect(anePrefillAllowed(true, "1"));
+}
+
+test "unitCount: dual is channel-mode on two-instance silicon, self-disabling elsewhere" {
+    // Two ANE services (H11ANE/H11ANE1) exist on the Ultra parts only.
+    try testing.expectEqual(@as(u32, 2), aneInstanceCount("Apple M3 Ultra"));
+    try testing.expectEqual(@as(u32, 2), aneInstanceCount("Apple M2 Ultra"));
+    try testing.expectEqual(@as(u32, 1), aneInstanceCount("Apple M4 Max"));
+    try testing.expectEqual(@as(u32, 1), aneInstanceCount(""));
+    // Off by default, whatever the machine.
+    try testing.expectEqual(@as(u32, 1), unitCount("Apple M3 Ultra", false));
+    // On, and the machine has a second die: two units.
+    try testing.expectEqual(@as(u32, 2), unitCount("Apple M3 Ultra", true));
+    // A dual request on a single-ANE machine must self-disable, never fail
+    // the boot.
+    try testing.expectEqual(@as(u32, 1), unitCount("Apple M4 Max", true));
+    // Row mode is not the default and is unmeasured under dual: refused.
+}
+
+test "engineBillBytes: int8 weights + per-unit fp16 planes (A9 sharing within a unit)" {
+    // Within a unit evals are strictly serial, so the planes are per SHAPE
+    // CLASS, not per program: one input (hidden x rows), one MLP output
+    // (hidden x rows), one GDN output ((qkv+z) x rows). Hand-computed small
+    // case: dense 2 layers (3 weights of [ffn=8, hidden=4] -> 192 int8) +
+    // one GDN layer ((6+2)*4 = 32 int8); planes 128 (in) + 128 (mlp out) +
+    // 256 (gdn out).
+    try testing.expectEqual(@as(u64, 736), engineBillBytes(2, 1, 4, 8, 6, 2, 16, 1));
+    // The 27B at full coverage, rows 3264: int8 ~19.7 GiB + ~166 MB planes
+    // (the per-program planes billed ~10.3 GiB here before A9).
+    try testing.expectEqual(
+        @as(u64, 21_313_093_632),
+        engineBillBytes(64, 48, 5120, 17408, 10240, 6144, 3264, 1),
+    );
+    // No GDN coverage bills neither GDN int8 nor a GDN output plane.
+    try testing.expectEqual(@as(u64, 448), engineBillBytes(2, 0, 4, 8, 6, 2, 16, 1));
+    // No dense coverage bills no MLP output plane.
+    try testing.expectEqual(@as(u64, 32 + 128 + 256), engineBillBytes(0, 1, 4, 8, 6, 2, 16, 1));
+    // Dual: the widths passed are PER UNIT, so two units at half the slice
+    // hold the SAME int8 as one unit at the full slice — only the planes
+    // double (concurrent evals cannot share an output surface).
+    const single = engineBillBytes(2, 1, 4, 8, 6, 2, 16, 1);
+    const dual = engineBillBytes(2, 1, 4, 4, 4, 2, 16, 2);
+    try testing.expectEqual(@as(u64, 2 * (2 * 3 * 4 * 4 + 1 * 6 * 4 + 128 + 128 + 192)), dual);
+    try testing.expect(dual > single); // the extra planes, nothing else
+}
+
+test "gateAllows: per-model bill vs total RAM, unknown total allows" {
+    const gib = 1024 * 1024 * 1024;
+    const hr = 12 * gib;
+    // Unknown total (sysctl failure) is no information — allow, the old
+    // `total_mem > 0` behavior.
+    try testing.expect(gateAllows(0, 16 * gib, 32 * gib, hr));
+    // 64 GB Mac, 16 GB resident, ~32 GB bill: 16+32+12 headroom = 60 <= 64.
+    try testing.expect(gateAllows(64 * gib, 16 * gib, 32 * gib, hr));
+    // 36 GB Mac, same model: refused.
+    try testing.expect(!gateAllows(36 * gib, 16 * gib, 32 * gib, hr));
+    // A small model on a small Mac passes (the flat 96 GB gate refused it).
+    try testing.expect(gateAllows(16 * gib, 1 * gib, 1 * gib, hr));
+    // Exact fit allows.
+    try testing.expect(gateAllows(60 * gib, 16 * gib, 32 * gib, hr));
+
+    // The headroom is a PARAMETER, which is the fix: the measured M1 Pro case
+    // (32 GB, 12.5 GB resident, 10.3 GB bill) is refused under the flat 12 GB
+    // the constant used to be, and admitted under the ~7 GB this model needs
+    // at its chunk-1024 envelope — an arm measured at +38% prefill.
+    const resident = 12_500 * 1024 * 1024;
+    const bill = 10_300 * 1024 * 1024;
+    try testing.expect(!gateAllows(32 * gib, resident, bill, 12 * gib));
+    try testing.expect(gateAllows(32 * gib, resident, bill, 7 * gib));
+
+    // Saturating: an absurd headroom refuses rather than wrapping to allow.
+    try testing.expect(!gateAllows(32 * gib, resident, bill, std.math.maxInt(u64)));
+}
+
+test "calibratedShare: balanced timings keep the seed, a slower GPU hands the ANE more" {
+    // ANE tiles and GPU complement took the same time at 0.45: already balanced.
+    try testing.expectEqual(@as(f32, 0.45), calibratedShare(0.45, 1.0, 1.0));
+    // The complement took twice as long: 0.45 / (0.45 + 0.275) = 0.62.
+    try testing.expectEqual(@as(f32, 0.62), calibratedShare(0.45, 1.0, 2.0));
+}
+
+test "shareVariant: a calibrated set's tag reads back as its share, any other never does" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqual(@as(?f32, 0.6), parseShareVariant(try shareVariant(&buf, 0.6, true)));
+    try testing.expectEqual(@as(?f32, null), parseShareVariant(try shareVariant(&buf, 0.4, false)));
+}
+
+test "mediaTilePlan: a partial last tile pads onto the ANE only when that beats the GPU tail" {
+    // ACE 30 s at 0.60: the 119-row tail outweighs 256 x 0.40 rows of ANE work.
+    try testing.expectEqual(TilePlan{ .tiles = 2, .cover = 375 }, mediaTilePlan(375, 256, 0.60));
+    // H3 at 0.45: 116 < 256 x 0.55, so the tail stays on the GPU.
+    try testing.expectEqual(TilePlan{ .tiles = 11, .cover = 2816 }, mediaTilePlan(2932, 256, 0.45));
+}
+
+test "channelSliceWidth: 128-aligned slice, GPU remainder, degenerate shares" {
+    // The 27B geometries at the default share (the spike's probed widths).
+    try testing.expectEqual(@as(u32, 6912), channelSliceWidth(17408, 0.40));
+    try testing.expectEqual(@as(u32, 4096), channelSliceWidth(10240, 0.40));
+    try testing.expectEqual(@as(u32, 2432), channelSliceWidth(6144, 0.40));
+    // Degenerate: tiny width, zero/negative share, NaN-safe.
+    try testing.expectEqual(@as(u32, 0), channelSliceWidth(128, 0.5));
+    try testing.expectEqual(@as(u32, 0), channelSliceWidth(17408, 0.0));
+    try testing.expectEqual(@as(u32, 0), channelSliceWidth(17408, -1.0));
+    // Oversized share clamps so the GPU keeps >= 128 channels.
+    const clamped = channelSliceWidth(17408, 1.5);
+    try testing.expect(clamped <= 17408 - 128 and clamped % 128 == 0 and clamped > 0);
+    // Every 128-aligned width has a power-of-two K-chunk divisor <= 16
+    // landing under the ANE down-conv cliff (mirrors down_chunks_for).
+    var k: u32 = 128;
+    while (k <= 17408) : (k += 128) {
+        var ok = false;
+        var n: u32 = 1;
+        while (n <= 16) : (n += 1) {
+            if (k % n == 0 and k / n <= 4608) ok = true;
+        }
+        try testing.expect(ok);
+    }
+}
+
+test "channelSliceWidthUnits: the share is TOTAL, halved across units, GPU keeps a slice" {
+    // The share is the total fraction taken off the GPU, so every single-ANE measurement carries over: two units at 0.40
+    // take the same 40% of channels one unit at 0.40 does.
+    const k1 = channelSliceWidthUnits(17408, 0.40, 1);
+    const k2 = channelSliceWidthUnits(17408, 0.40, 2);
+    try testing.expectEqual(@as(u32, 6912), k1);
+    try testing.expectEqual(@as(u32, 3456), k2);
+    try testing.expectEqual(k1, 2 * k2);
+    // Every unit's boundary stays 128-aligned and the GPU keeps at least
+    // CHANNEL_ALIGN channels after ALL units.
+    for ([_]u32{ 17408, 10240, 6144, 4096, 1024 }) |w| {
+        for ([_]f32{ 0.2, 0.35, 0.5, 0.9, 1.5 }) |s| {
+            const k = channelSliceWidthUnits(w, s, 2);
+            if (k == 0) continue;
+            try testing.expect(k % CHANNEL_ALIGN == 0);
+            try testing.expect(2 * k <= w - CHANNEL_ALIGN);
+        }
+    }
+    // Degenerate: a width that cannot seat two slices plus the GPU's.
+    try testing.expectEqual(@as(u32, 0), channelSliceWidthUnits(256, 0.5, 2));
+    try testing.expectEqual(@as(u32, 0), channelSliceWidthUnits(17408, 0.0, 2));
+    try testing.expectEqual(@as(u32, 0), channelSliceWidthUnits(17408, 0.4, 0));
+}
+
+test "bankGroupLen: monolithic under the cap, the ladder's rungs, never zero programs" {
+    const sizes = [_]u64{ 100, 100, 100, 100, 100 };
+    // Under the cap the whole group banks monolithically (oMLX measured
+    // that bit-stable across five greedy runs; split banks occasionally
+    // diverged at a tie).
+    try testing.expectEqual(@as(usize, 5), bankGroupLen(&sizes, 0, 5, 1000));
+    // The cap partitions: 250 seats two.
+    try testing.expectEqual(@as(usize, 2), bankGroupLen(&sizes, 0, 5, 250));
+    try testing.expectEqual(@as(usize, 2), bankGroupLen(&sizes, 2, 5, 250));
+    try testing.expectEqual(@as(usize, 1), bankGroupLen(&sizes, 4, 5, 250));
+    // The ladder's rungs cap the count regardless of bytes.
+    try testing.expectEqual(@as(usize, 2), bankGroupLen(&sizes, 0, 2, 1000));
+    try testing.expectEqual(@as(usize, 1), bankGroupLen(&sizes, 0, 1, 1000));
+    // A single program over the cap still gets its own bank — refusing it
+    // would only move the failure, and the ladder's last rung IS one.
+    try testing.expectEqual(@as(usize, 1), bankGroupLen(&sizes, 0, 5, 1));
+    // Past the end / no rung left.
+    try testing.expectEqual(@as(usize, 0), bankGroupLen(&sizes, 5, 5, 1000));
+    try testing.expectEqual(@as(usize, 0), bankGroupLen(&sizes, 0, 0, 1000));
+    // The ladder walk covers every program exactly once at any rung.
+    for ([_]usize{ 5, 2, 1 }) |group| {
+        var start: usize = 0;
+        var seen: usize = 0;
+        while (start < sizes.len) {
+            const n = bankGroupLen(&sizes, start, group, 10_000);
+            try testing.expect(n > 0);
+            seen += n;
+            start += n;
+        }
+        try testing.expectEqual(sizes.len, seen);
+    }
+}
+
+test "quantizeRowsInt8: round-trip, per-row scales, zero row" {
+    const w = [_]f32{
+        1.0, -2.0, 0.5, 0.25, // row 0: amax 2
+        0.0, 0.0, 0.0, 0.0, // row 1: all zero
+        -0.1, 0.05, 0.02, 0.1, // row 2: amax 0.1
+    };
+    var rq = try quantizeRowsInt8(testing.allocator, &w, 3, 4);
+    defer rq.deinit(testing.allocator);
+    try testing.expectApproxEqAbs(@as(f32, 2.0 / 127.0), rq.s[0], 1e-7);
+    try testing.expectEqual(@as(f32, 0), rq.s[1]);
+    try testing.expectApproxEqAbs(@as(f32, 0.1 / 127.0), rq.s[2], 1e-7);
+    // Extremes hit exactly ±127; zero row stays zero codes.
+    try testing.expectEqual(@as(i8, -127), rq.q[1]);
+    try testing.expectEqual(@as(i8, 0), rq.q[4]);
+    try testing.expectEqual(@as(i8, 127), rq.q[11]);
+    // Dequantized max error <= half a step per row.
+    for (0..3) |i| {
+        for (0..4) |j| {
+            const deq = @as(f32, @floatFromInt(rq.q[i * 4 + j])) * rq.s[i];
+            try testing.expect(@abs(deq - w[i * 4 + j]) <= rq.s[i] * 0.5 + 1e-9);
+        }
+    }
+}
+
+test "solveShare: lands on the four measured optima, clamps, degenerate probe = default" {
+    const a = ANE_TFLOPS_M1_M4;
+    // (implied GPU rate, measured optimum) from the sweeps.
+    const rows = [_]struct { g: f64, want: f32 }{
+        .{ .g = 0.18 * a, .want = 0.85 }, // M4 base / ACE-Step
+        .{ .g = 0.33 * a, .want = 0.75 }, // M1 Pro / ACE-Step
+        .{ .g = 0.67 * a, .want = 0.60 }, // M4 Max / ACE-Step
+        .{ .g = 1.22 * a, .want = 0.45 }, // M4 Max / H3
+    };
+    for (rows) |r| {
+        try testing.expectEqual(r.want, solveShare(a, r.g));
+        // A few % of probe jitter must not move it: a new share is a cold compile.
+        try testing.expectEqual(r.want, solveShare(a, r.g * 0.97));
+        try testing.expectEqual(r.want, solveShare(a, r.g * 1.03));
+    }
+    try testing.expectEqual(@as(f32, 0.85), solveShare(a, 0.01 * a));
+    try testing.expectEqual(@as(f32, 0.25), solveShare(a, 10 * a));
+    try testing.expectEqual(DEFAULT_MEDIA_SHARE, solveShare(a, 0));
+    try testing.expectEqual(DEFAULT_MEDIA_SHARE, solveShare(0, a));
+}
+
+test "aneTflopsFor: one row for M1-M4 per unit, unknown silicon is no row" {
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M1 Pro", 1));
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M4", 1));
+    try testing.expectEqual(@as(?f64, 2 * ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M3 Ultra", 2));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M5 Max", 1));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M45", 1));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("", 1));
+}
+
+test "mediaGateRefusal: total-RAM bill, then the build peak against a swap floor" {
+    const gib = 1024 * 1024 * 1024;
+    // Fits total RAM and leaves the floor: admitted.
+    try testing.expectEqual(@as(?GateRefusal, null), mediaGateRefusal(128 * gib, 60 * gib, 40 * gib, 4 * gib, 2 * gib));
+    // The old gate: resident + bill + baseline over total.
+    try testing.expectEqual(@as(?GateRefusal, .total_ram), mediaGateRefusal(32 * gib, 20 * gib, 26 * gib, 5 * gib, 1 * gib));
+    // The M1 Pro case: passes total RAM, but the int8 copy + the build's f32
+    // transient would leave the system under the swap floor.
+    try testing.expectEqual(@as(?GateRefusal, .swap_floor), mediaGateRefusal(32 * gib, 10 * gib, 15 * gib, 7 * gib, 2 * gib));
+    // Unknown available (probe failed) is no information.
+    try testing.expectEqual(@as(?GateRefusal, null), mediaGateRefusal(32 * gib, 0, 15 * gib, 7 * gib, 2 * gib));
+}
+
+test "buildPeakBytes: three host f32 copies plus the MLX dequant transient" {
+    try testing.expectEqual(@as(u64, 4 * 4 * 8 * 4), buildPeakBytes(4, 8));
+}

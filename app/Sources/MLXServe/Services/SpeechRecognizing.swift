@@ -1,162 +1,105 @@
 import Foundation
 import AVFoundation
 @preconcurrency import AVFAudio
-import Speech
 
-/// Speech-to-text for voice mode. Drives a hands-free turn: emits partial
-/// transcripts as the user talks, fires `onFinalTranscript` once a silence
-/// gap ends the utterance, and publishes a 0…1 mic `level` for the orb. The
-/// controller depends only on this protocol so it can be faked in tests.
+/// Speech-to-text for voice mode and dictation, on our own server: an energy VAD cuts the mic into utterances
+/// (silence ends one), and each utterance is transcribed by Qwen3-ASR (`VoiceASR`). Publishes a 0…1 mic `level` for
+/// the orb. The controller depends only on this protocol so it can be faked in tests.
 @MainActor
 protocol SpeechRecognizing: AnyObject {
-    var partialTranscript: String { get }
     var level: Float { get }
 
     var onSpeechStarted: (() -> Void)? { get set }
-    var onPartialTranscript: ((String) -> Void)? { get set }
     var onFinalTranscript: ((String) -> Void)? { get set }
-    /// A turn where the mic clearly heard speech (RMS crossed the threshold) but
-    /// recognition produced NOTHING. The signature of on-device dictation being
-    /// off / unavailable while the mic itself works — surfaced to the user as an
-    /// actionable notice after a couple of consecutive occurrences.
+    /// The mic heard sound but the speech model found no words in it (a cough, a door).
     var onUnrecognizedSpeech: (() -> Void)? { get set }
     var onError: ((String) -> Void)? { get set }
 
-    /// Request mic + speech-recognition permission. Safe to call repeatedly.
+    /// Request microphone permission. Safe to call repeatedly.
     func requestAuthorization() async -> Bool
-    /// Granular prerequisite read (prompting for mic/speech if undecided) so the
-    /// UI can show a precise, non-invasive "what's missing" notice before opening
-    /// the mic. A protocol requirement (not just an extension) so the concrete
-    /// recognizer's override is dynamically dispatched; fakes fall back to the
-    /// extension default below.
+    /// What voice needs, read before opening the mic (prompting for the mic if undecided). A protocol requirement so
+    /// the concrete recognizer's override is dynamically dispatched; fakes fall back to the extension default.
     func preflight() async -> VoicePreflight.Snapshot
-    /// Open the mic and begin recognizing. Throws if the engine can't start.
+    /// Open the mic and begin listening. Throws if the engine can't start.
     func start() throws
-    /// Stop the mic and tear down recognition.
+    /// Stop the mic; a transcription still in flight is dropped.
     func stop()
+    /// The audio of the utterance `onFinalTranscript` just finalized, 16 kHz mono (native voice sends it).
+    var utterancePCM: [Float] { get }
+    /// false: the utterance is the turn as it is (a model that hears it), finalized with no transcript.
+    var wantsWords: (() -> Bool)? { get set }
 }
 
 extension SpeechRecognizing {
-    /// Default for test fakes only: derive from the combined
-    /// `requestAuthorization()` and assume the on-device model is present.
-    /// Each concrete backend implements its own per-prerequisite read.
+    var utterancePCM: [Float] { [] }
     func preflight() async -> VoicePreflight.Snapshot {
-        let ok = await requestAuthorization()
-        return VoicePreflight.Snapshot(micAuthorized: ok, speechAuthorized: ok,
-                                       onDeviceAvailable: true, locale: Locale.current.identifier)
+        VoicePreflight.Snapshot(micAuthorized: await requestAuthorization(), asrReady: true)
     }
 }
 
-extension SpeechLocale {
-    /// The ONE legacy-engine probe: preferred languages against the Speech
-    /// framework's own supported/installed set. Both call sites (voice mode and
-    /// file transcription) resolve through here so they can't drift.
-    static func legacyResolution() -> Resolution {
-        resolve(
-            preferredLanguages: Locale.preferredLanguages,
-            supportedLocales: Array(SFSpeechRecognizer.supportedLocales()),
-            isAvailable: {
-                SFSpeechRecognizer(locale: $0)?.supportsOnDeviceRecognition ?? false
-            },
-            fallback: .current)
-    }
-}
-
-/// Choose the speech-to-text backend.
-///
-/// IMPORTANT: macOS 26's `SpeechAnalyzer`/`SpeechTranscriber` requires its
-/// on-device model assets to be fully provisioned. When they are not (e.g.
-/// Apple Intelligence "assetIsNotReady" / the locale's model isn't installed),
-/// `SpeechAnalyzer.start` *hard-traps* (SIGTRAP) deep inside the framework —
-/// it's a `fatalError`, not a throwable error, so it takes the whole app down
-/// and can't be caught. Until we can robustly gate on installed assets and
-/// fall back without ever calling `start` on an unready analyzer, we use the
-/// mature `SFSpeechRecognizer` path, which is reliable on macOS 14–26 and runs
-/// on-device on Apple Silicon. `ModernSpeechRecognizer` is kept for that future
-/// gated opt-in.
 @MainActor
 func makeSpeechRecognizer() -> any SpeechRecognizing {
-    return LegacySpeechRecognizer()
+    ServerSpeechRecognizer()
 }
 
-// MARK: - Shared mic tap + silence endpointing
-
-/// Owns the mic input tap, RMS metering and silence endpointing; subclasses
-/// plug in a concrete recognizer via the `feed`/`reset`/`teardown` hooks.
-/// Only the concrete backends conform to `SpeechRecognizing` themselves.
+/// `SpeechRecognizing` over the mic's input tap: RMS metering, the adaptive VAD, and one `VoiceASR` request per
+/// utterance.
 @MainActor
-class BaseSpeechRecognizer: NSObject {
+final class ServerSpeechRecognizer: SpeechRecognizing {
     let engine = AVAudioEngine()
 
-    private(set) var partialTranscript = ""
     private(set) var level: Float = 0
+    private(set) var utterancePCM: [Float] = []
 
     var onSpeechStarted: (() -> Void)?
-    var onPartialTranscript: ((String) -> Void)?
     var onFinalTranscript: ((String) -> Void)?
     var onUnrecognizedSpeech: (() -> Void)?
     var onError: ((String) -> Void)?
+    var wantsWords: (() -> Bool)?
 
-    /// Quiet-room speech bar (absolute RMS). The EFFECTIVE threshold is
-    /// `VoiceActivity.speechThreshold` — this floored value scaled above the
-    /// tracked ambient level, so fan/AC noise reads as silence instead of
-    /// pinning `lastVoiceAt` forever (the 2026-07-05 never-finalizes wedge).
+    /// Quiet-room speech bar (absolute RMS). The EFFECTIVE threshold is `VoiceActivity.speechThreshold` — this floored
+    /// value scaled above the tracked ambient level, so fan/AC noise reads as silence.
     var voiceThreshold: Float = VoiceActivity.minSpeechThreshold
-    /// Silence this long after speech ends a turn.
+    /// Silence this long after speech ends an utterance.
     var silenceTimeout: TimeInterval = 1.1
-    /// Backstop: with words in hand and no NEW word for this long, finalize
-    /// even if the energy VAD still reads "speech" (noise misclassification).
-    var transcriptStallTimeout: TimeInterval = 2.0
+    /// The longest utterance: past it the turn ends even mid-speech.
+    var maxUtterance: TimeInterval = 30
+    /// With no words asked for, an utterance needs this much speech-level audio to be a turn: a cough or a door is
+    /// shorter, and there is no transcript to tell it from words.
+    static let minVoicedSeconds: TimeInterval = 0.3
+    private var voicedSeconds: TimeInterval = 0
 
+    private let transcribe: @MainActor ([Float]) async -> String?
+    private let ready: @MainActor () -> Bool
     private var speaking = false
+    private var speechStartedAt = Date()
     private var lastVoiceAt = Date()
     private var silenceTimer: Timer?
-    /// Sliding-minimum ambient tracker feeding the adaptive threshold.
     private var ambient = AmbientFloor()
-    /// When recognition last produced DIFFERENT text (the stall clock).
-    private var lastTranscriptChangeAt = Date()
+    private var utterance = UtteranceAudio()
+    /// An utterance is with the speech model; the mic's VAD waits for its words.
+    private var transcribing = false
+    /// Bumped by `stop()`: a transcript arriving after it belongs to a session that is gone.
+    private var generation = 0
 
-    /// The transcript the silence finalizer will emit. Subclasses set this as
-    /// recognition results arrive (and call `publishPartial`).
-    var currentTranscript = ""
-
-    // Hooks for subclasses ---------------------------------------------------
-    /// Begin recognition against the engine's input format (already running).
-    func prepareRecognition(inputFormat: AVAudioFormat) throws {}
-    /// Feed one captured buffer to the recognizer.
-    func feed(_ buffer: AVAudioPCMBuffer) {}
-    /// Start a fresh utterance (called right after each finalize).
-    func resetForNextUtterance() {}
-    /// Release recognition resources.
-    func teardownRecognition() {}
-
-    func requestAuthorization() async -> Bool {
-        let (mic, speech) = await permissions()
-        return mic && speech
+    init(transcribe: (@MainActor ([Float]) async -> String?)? = nil, ready: (@MainActor () -> Bool)? = nil) {
+        self.transcribe = transcribe ?? { await VoiceASR.transcribe($0) }
+        self.ready = ready ?? { VoiceASR.ready }
     }
 
-    func permissions() async -> (mic: Bool, speech: Bool) {
-        let mic = await AudioRecorder.requestPermission()
-        let speech = await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
-            SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0 == .authorized) }
-        }
-        return (mic, speech)
+    func requestAuthorization() async -> Bool { await AudioRecorder.requestPermission() }
+
+    func preflight() async -> VoicePreflight.Snapshot {
+        VoicePreflight.Snapshot(micAuthorized: await AudioRecorder.requestPermission(),
+                                asrReady: VoicePreflight.asrReady(wantsWords: wantsWords?() ?? true, onDisk: ready()))
     }
 
     func start() throws {
-        // Idempotent start: tear down any existing tap/engine/recognition first.
-        // `AVAudioEngine` raises (and aborts the app) if a second tap is installed
-        // on a bus that already has one, so a stray double-`start()` — e.g. a
-        // barge-in that reopens the mic while it's still live — must never reach
-        // `installTap` with the old tap in place. `stop()` is a safe no-op when
-        // nothing is running. Belt-and-suspenders with the controller's own
-        // stop-before-restart; this guarantees it engine-side for every caller.
+        // Idempotent: `AVAudioEngine` raises (and aborts the app) if a second tap is installed on a bus that already
+        // has one, so a stray double-`start()` must never reach `installTap` with the old tap in place.
         stop()
 
         let input = engine.inputNode
-        // (Voice-processing/echo-cancellation IO was here for talk-over barge-in;
-        // the mic is off while the assistant speaks, so it isn't needed in v1 and
-        // enabling it has caused input-format instability on some devices.)
         let format = input.inputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else {
             throw NSError(domain: "SpeechRecognizer", code: 1,
@@ -164,19 +107,19 @@ class BaseSpeechRecognizer: NSObject {
         }
 
         speaking = false
-        currentTranscript = ""
-        partialTranscript = ""
         lastVoiceAt = Date()
-        lastTranscriptChangeAt = Date()
         ambient = AmbientFloor()
-
-        try prepareRecognition(inputFormat: format)
+        utterance = UtteranceAudio()
 
         input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             let rms = Self.rms(of: buffer)
-            self.feed(buffer)
-            DispatchQueue.main.async { self.noteAudio(rms: rms) }
+            let heard = Self.mono16k(buffer)
+            let seconds = Double(buffer.frameLength) / buffer.format.sampleRate
+            DispatchQueue.main.async {
+                self.utterance.append(heard)
+                self.noteAudio(rms: rms, seconds: seconds)
+            }
         }
         engine.prepare()
         try engine.start()
@@ -187,54 +130,66 @@ class BaseSpeechRecognizer: NSObject {
     }
 
     func stop() {
+        generation += 1
+        transcribing = false
         silenceTimer?.invalidate(); silenceTimer = nil
         engine.inputNode.removeTap(onBus: 0)
         if engine.isRunning { engine.stop() }
-        teardownRecognition()
         speaking = false
         level = 0
     }
 
-    /// Subclasses call this when a new (partial) transcript is available.
-    func publishPartial(_ text: String) {
-        if text != currentTranscript { lastTranscriptChangeAt = Date() }
-        currentTranscript = text
-        partialTranscript = text
-        onPartialTranscript?(text)
-    }
-
     // MARK: VAD + endpointing (main actor)
 
-    private func noteAudio(rms: Float) {
+    private func noteAudio(rms: Float, seconds: TimeInterval) {
         level = min(1, rms * 6)
         let floor = ambient.ingest(rms)
-        if rms > VoiceActivity.speechThreshold(floor: floor, minThreshold: voiceThreshold) {
-            lastVoiceAt = Date()
-            if !speaking { speaking = true; onSpeechStarted?() }
+        guard !transcribing, rms > VoiceActivity.speechThreshold(floor: floor, minThreshold: voiceThreshold) else { return }
+        lastVoiceAt = Date()
+        if !speaking {
+            speaking = true
+            speechStartedAt = lastVoiceAt
+            voicedSeconds = 0
+            utterance.markSpeechStart()
+            onSpeechStarted?()
         }
+        voicedSeconds += seconds
     }
 
     private func checkSilence() {
         guard speaking else { return }
-        let text = currentTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard VoiceActivity.shouldFinalize(
-            silenceElapsed: Date().timeIntervalSince(lastVoiceAt),
-            silenceTimeout: silenceTimeout,
-            hasTranscript: !text.isEmpty,
-            transcriptStallElapsed: Date().timeIntervalSince(lastTranscriptChangeAt),
-            stallTimeout: transcriptStallTimeout) else { return }
+        let now = Date()
+        guard VoiceActivity.shouldFinalize(silenceElapsed: now.timeIntervalSince(lastVoiceAt), silenceTimeout: silenceTimeout,
+                                           speechElapsed: now.timeIntervalSince(speechStartedAt), maxUtterance: maxUtterance)
+        else { return }
         speaking = false
-        currentTranscript = ""
-        partialTranscript = ""
-        resetForNextUtterance()
-        if !text.isEmpty {
-            onFinalTranscript?(text)
-        } else {
-            // Heard speech, transcribed nothing → recognition isn't working
-            // (on-device dictation off / unavailable). The controller decides
-            // when to surface a notice (after a couple of these in a row).
-            onUnrecognizedSpeech?()
+        let pcm = utterance.take()
+        if wantsWords?() == false {
+            guard voicedSeconds >= Self.minVoicedSeconds else { onUnrecognizedSpeech?(); return }
+            utterancePCM = pcm
+            onFinalTranscript?("")
+            return
         }
+        transcribing = true
+        let gen = generation
+        Task { [weak self, transcribe] in
+            let text = await transcribe(pcm)
+            guard let self, gen == self.generation else { return }
+            self.transcribing = false
+            if let text {
+                self.utterancePCM = pcm
+                self.onFinalTranscript?(text)
+            } else {
+                self.onUnrecognizedSpeech?()
+            }
+        }
+    }
+
+    static func mono16k(_ buffer: AVAudioPCMBuffer) -> [Float] {
+        guard let ch = buffer.floatChannelData, buffer.frameLength > 0 else { return [] }
+        let n = Int(buffer.frameLength)
+        let channels = (0..<Int(buffer.format.channelCount)).map { Array(UnsafeBufferPointer(start: ch[$0], count: n)) }
+        return UtteranceAudio.downmix16k(channels: channels, sampleRate: buffer.format.sampleRate)
     }
 
     static func rms(of buffer: AVAudioPCMBuffer) -> Float {
@@ -243,248 +198,5 @@ class BaseSpeechRecognizer: NSObject {
         var sum: Float = 0
         for i in 0..<n { let s = ch[0][i]; sum += s * s }
         return (sum / Float(n)).squareRoot()
-    }
-}
-
-// MARK: - Legacy backend (SFSpeechRecognizer, macOS 14+)
-
-@MainActor
-final class LegacySpeechRecognizer: BaseSpeechRecognizer, SpeechRecognizing {
-    private let localeResolution: SpeechLocale.Resolution
-    private let recognizer: SFSpeechRecognizer?
-    private var request: SFSpeechAudioBufferRecognitionRequest?
-    private var task: SFSpeechRecognitionTask?
-
-    override init() {
-        let resolution = SpeechLocale.legacyResolution()
-        localeResolution = resolution
-        switch resolution {
-        case .available(let locale), .unavailable(let locale):
-            recognizer = SFSpeechRecognizer(locale: locale)
-        case .unsupported:
-            recognizer = nil
-        }
-        super.init()
-    }
-
-    func preflight() async -> VoicePreflight.Snapshot {
-        let (mic, speech) = await permissions()
-        // Re-probe the model on the held locale (not the init-time verdict) so
-        // installing the dictation dictionary clears the card without a relaunch.
-        return VoicePreflight.Snapshot(
-            micAuthorized: mic,
-            speechAuthorized: speech,
-            onDeviceAvailable: recognizer?.supportsOnDeviceRecognition ?? false,
-            locale: localeResolution.locale.identifier)
-    }
-
-    override func prepareRecognition(inputFormat: AVAudioFormat) throws {
-        guard let recognizer, recognizer.isAvailable else {
-            throw NSError(domain: "SpeechRecognizer", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "Speech recognition unavailable for this locale."])
-        }
-        // Privacy gate: Voice mode is on-device only. If the on-device model isn't
-        // installed for this locale, refuse rather than let SFSpeechRecognizer
-        // stream audio to Apple's servers (its default fallback).
-        if let msg = OnDeviceSpeech.unavailableMessage(
-            supportsOnDevice: recognizer.supportsOnDeviceRecognition,
-            locale: recognizer.locale.identifier) {
-            throw NSError(domain: "SpeechRecognizer", code: 3,
-                          userInfo: [NSLocalizedDescriptionKey: msg])
-        }
-        startRequest()
-    }
-
-    private func startRequest() {
-        guard let recognizer else { return }
-        let req = SFSpeechAudioBufferRecognitionRequest()
-        req.shouldReportPartialResults = true
-        // Always on-device — `prepareRecognition` has already verified support, so
-        // audio never leaves the Mac and recognition works offline.
-        req.requiresOnDeviceRecognition = true
-        request = req
-        task = recognizer.recognitionTask(with: req) { [weak self] result, error in
-            Task { @MainActor in
-                guard let self else { return }
-                if let result { self.publishPartial(result.bestTranscription.formattedString) }
-                // Recognition errors here are routine (end-of-audio on reset,
-                // no-speech timeouts) and must NOT flip voice mode into an error
-                // state — the silence timer owns turn endpointing. Just log.
-                if let error { NSLog("[voice] SF recognition note: %@", error.localizedDescription) }
-            }
-        }
-    }
-
-    override func feed(_ buffer: AVAudioPCMBuffer) {
-        request?.append(buffer)
-    }
-
-    override func resetForNextUtterance() {
-        request?.endAudio()
-        task?.cancel()
-        request = nil
-        task = nil
-        startRequest()
-    }
-
-    override func teardownRecognition() {
-        request?.endAudio()
-        task?.cancel()
-        request = nil
-        task = nil
-    }
-}
-
-// MARK: - Modern backend (SpeechTranscriber / SpeechAnalyzer, macOS 26+)
-
-@available(macOS 26, *)
-@MainActor
-final class ModernSpeechRecognizer: BaseSpeechRecognizer, SpeechRecognizing {
-    private var transcriber: SpeechTranscriber?
-    private var localeResolution: SpeechLocale.Resolution = .unsupported(
-        SpeechLocale.reportingLocale(preferredLanguages: Locale.preferredLanguages, fallback: .current))
-    private var preparationTask: Task<Bool, Never>?
-    private var analyzer: SpeechAnalyzer?
-    private var inputContinuation: AsyncStream<AnalyzerInput>.Continuation?
-    private var analyzerFormat: AVAudioFormat?
-    private var converter: AVAudioConverter?
-    private var resultsTask: Task<Void, Never>?
-    private var runTask: Task<Void, Never>?
-
-    private var finalizedText = ""
-    private var volatileText = ""
-
-    override func requestAuthorization() async -> Bool {
-        guard await super.requestAuthorization() else { return false }
-        return await prepareTranscriber()
-    }
-
-    func preflight() async -> VoicePreflight.Snapshot {
-        let (mic, speech) = await permissions()
-        let available = mic && speech ? await prepareTranscriber() : false
-        return VoicePreflight.Snapshot(
-            micAuthorized: mic,
-            speechAuthorized: speech,
-            onDeviceAvailable: available,
-            locale: localeResolution.locale.identifier)
-    }
-
-    private func prepareTranscriber() async -> Bool {
-        if transcriber != nil { return true }
-        if let preparationTask { return await preparationTask.value }
-
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return false }
-            let resolution = SpeechLocale.resolve(
-                preferredLanguages: Locale.preferredLanguages,
-                supportedLocales: await SpeechTranscriber.supportedLocales,
-                isAvailable: { _ in true },
-                fallback: .current)
-            self.localeResolution = resolution
-            guard case .available(let locale) = resolution else { return false }
-
-            let transcriber = SpeechTranscriber(locale: locale, preset: .progressiveTranscription)
-            do {
-                if let request = try await AssetInventory.assetInstallationRequest(
-                    supporting: [transcriber]) {
-                    try await request.downloadAndInstall()
-                }
-                self.transcriber = transcriber
-                return true
-            } catch {
-                return false
-            }
-        }
-        preparationTask = task
-        let result = await task.value
-        preparationTask = nil
-        return result
-    }
-
-    override func prepareRecognition(inputFormat: AVAudioFormat) throws {
-        guard let transcriber else {
-            throw NSError(domain: "SpeechRecognizer", code: 2,
-                          userInfo: [NSLocalizedDescriptionKey: "Speech recognition unavailable for this locale."])
-        }
-        finalizedText = ""; volatileText = ""
-
-        let analyzer = SpeechAnalyzer(modules: [transcriber])
-        self.analyzer = analyzer
-
-        let (stream, cont) = AsyncStream<AnalyzerInput>.makeStream()
-        inputContinuation = cont
-
-        // Consume transcripts: volatile results refine the current word, final
-        // results commit it. We keep a running transcript for the silence timer.
-        resultsTask = Task { @MainActor [weak self] in
-            guard let self else { return }
-            do {
-                for try await result in transcriber.results {
-                    let piece = String(result.text.characters)
-                    if result.isFinal {
-                        self.finalizedText = (self.finalizedText + " " + piece)
-                            .trimmingCharacters(in: .whitespaces)
-                        self.volatileText = ""
-                    } else {
-                        self.volatileText = piece
-                    }
-                    let combined = (self.finalizedText + " " + self.volatileText)
-                        .trimmingCharacters(in: .whitespaces)
-                    self.publishPartial(combined)
-                }
-            } catch {
-                self.onError?(error.localizedDescription)
-            }
-        }
-
-        runTask = Task { [weak self] in
-            do { try await analyzer.start(inputSequence: stream) }
-            catch { await MainActor.run { self?.onError?(error.localizedDescription) } }
-        }
-
-        // Resolve the format the analyzer wants and build a converter if needed.
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            let best = await SpeechAnalyzer.bestAvailableAudioFormat(compatibleWith: [transcriber])
-            self.analyzerFormat = best
-            if let best, best != inputFormat {
-                self.converter = AVAudioConverter(from: inputFormat, to: best)
-            }
-        }
-    }
-
-    override func feed(_ buffer: AVAudioPCMBuffer) {
-        guard let cont = inputContinuation else { return }
-        guard let target = analyzerFormat, let converter else {
-            cont.yield(AnalyzerInput(buffer: buffer))   // formats match (or not resolved yet)
-            return
-        }
-        let ratio = target.sampleRate / buffer.format.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
-        guard let out = AVAudioPCMBuffer(pcmFormat: target, frameCapacity: capacity) else { return }
-        var fed = false
-        var err: NSError?
-        converter.convert(to: out, error: &err) { _, status in
-            if fed { status.pointee = .noDataNow; return nil }
-            fed = true; status.pointee = .haveData; return buffer
-        }
-        if err == nil, out.frameLength > 0 { cont.yield(AnalyzerInput(buffer: out)) }
-    }
-
-    override func resetForNextUtterance() {
-        // Keep the analyzer streaming; just clear the accumulated turn transcript.
-        finalizedText = ""
-        volatileText = ""
-    }
-
-    override func teardownRecognition() {
-        inputContinuation?.finish()
-        inputContinuation = nil
-        resultsTask?.cancel(); resultsTask = nil
-        let analyzer = self.analyzer
-        runTask = nil
-        self.analyzer = nil
-        converter = nil
-        Task { try? await analyzer?.finalizeAndFinishThroughEndOfInput() }
     }
 }

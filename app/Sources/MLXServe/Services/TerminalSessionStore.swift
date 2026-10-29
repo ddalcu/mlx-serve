@@ -131,8 +131,8 @@ final class TerminalSessionStore: ObservableObject {
                 sessions.markFailed(id, message: L10n.format("the server isn't running — load a model first; %@ talks to it", cli.displayName))
                 return
             }
-            let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)
-            warnIfSmallContext(agentId: cli.id, context: budget.context)
+            let budget = server.chatModelInfo?.agentBudget ?? AgentBudget.fallback
+            warnIfSmallContext(agentId: cli.id, budget: budget)
             let run = { (detection: OpenCodeDetection?) in
                 let cmd = CLILauncher.launchCommand(
                     cli, baseURL: self.server.baseURL, servedModelId: self.server.chatModelId ?? "mlx-serve",
@@ -179,7 +179,7 @@ final class TerminalSessionStore: ObservableObject {
         // running server whose resident model had no chat id yet.
         let model = server.chatModelId ?? "mlx-serve"
         let port = server.port
-        let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)
+        let budget = server.chatModelInfo?.agentBudget ?? AgentBudget.fallback
         let key = options().apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         let entries = AgentModelEntry.chatEntries(from: server.allModels)
         Task {

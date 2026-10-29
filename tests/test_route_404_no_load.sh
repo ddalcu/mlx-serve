@@ -1,19 +1,14 @@
 #!/bin/bash
-# Guard: a path this server does not serve costs NOTHING.
+# test_route_404_no_load.sh — a path the server does not serve costs NOTHING: a POST to a typo or probe route naming a
+# real model id answers 404 AND the entry stays `unloaded` (the state is the assertion; the 404 passes either way). A
+# real route and `/props` with no default still answer 200. Headless over --model-dir with no --model.
 #
-# Model resolution ran ahead of dispatch, so a POST to a non-existent endpoint
-# carrying a `model` field cold-loaded that model and only then answered 404.
-# Found by typing /v1/load instead of /v1/load-model: 2m42s and 121 GB resident
-# for a wrong URL, and a one-liner for any client to pin the box.
+#   ./tests/test_route_404_no_load.sh [model_dir] [port]
 #
-# The server boots headless over a --model-dir with NO --model, so every entry
-# starts `unloaded` and the assertion is that a 404'd request leaves it that
-# way. Nothing loads when the fix holds; the small default model loads when it
-# doesn't, so the test is fast either way.
-#
-# Usage: ./tests/test_route_404_no_load.sh [model_dir] [port]
+# Nothing loads when the fix holds; the small model loads when it does not, so it is fast either way.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
 PORT=${2:-8132}
@@ -39,11 +34,7 @@ SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 60); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    if [ "$i" -eq 60 ]; then echo "FAIL: server did not start within 60s"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 || { echo "FAIL: server did not start within 60s"; exit 1; }
 
 run_test() {
     TOTAL=$((TOTAL + 1))

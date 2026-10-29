@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Dump ACE-Step v1.5 XL Turbo parity fixtures (.raw f32) for the Zig oracle
-tests in `src/acestep.zig`.
+tests in `src/plugins/acestep/acestep.zig`.
 
 USER-RUN (needs torch + transformers + diffusers + vector-quantize-pytorch +
 einops + the HF checkpoints). Runs the REFERENCE PyTorch modeling code and

@@ -1,16 +1,10 @@
 #!/bin/bash
-# Test: KV cache poisoning after pad-only generation
+# test_kv_cache_poison.sh — a pad-only generation must not poison the KV cache: request A answers, request B (a long
+# noisy tool result) produces only <pad>, then A again must still answer as on a fresh server.
 #
-# Bug: When the model generates only <pad> tokens (e.g., due to a confusing prompt),
-# the KV cache retains the corrupted state. ALL subsequent requests then also
-# produce <pad> tokens, even requests that would normally succeed on a fresh server.
+#   ./tests/test_kv_cache_poison.sh [port]
 #
-# Reproduction:
-#   1. Fresh server → request A succeeds (e.g., 14+ tokens)
-#   2. Send request B that causes pad-only output (e.g., long noisy tool result)
-#   3. Re-send request A → FAILS with pad-only output (cache poisoned)
-#
-# Expected: Request A should always succeed, regardless of prior requests.
+# A failure means pad-only state was committed to the prefix cache (commitDeclinesPadOnly).
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"

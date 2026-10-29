@@ -1,26 +1,9 @@
 #!/bin/bash
-# Concurrent decode throughput test (Phase A7).
+# test_concurrent_throughput.sh — continuous batching pays: with --max-concurrent 4, four parallel requests reach an
+# aggregate tok/s >= 1.6x a single stream on the same server, prompt and max_tokens (a loose bar that catches
+# "batching is serialized", not a speed claim).
 #
-# Asserts that with `--max-concurrent 4`, four parallel client requests
-# generate aggregate tokens-per-second meaningfully faster than a single
-# request running alone — the whole point of continuous batching. Threshold:
-# aggregate_tps >= 1.6 * single_stream_tps. (At full pipelining we'd expect
-# closer to 4×, but real-world overhead — prefill serialization, sampling per
-# slot, attention scaling with N — pushes the achievable speedup down. 1.6×
-# catches "batching is broken / completely serialized" without being so tight
-# that variance flips the test.)
-#
-# Single-stream baseline runs first against the same server config, on the
-# same prompt, with the same max_tokens, to keep the numerator and
-# denominator comparable.
-#
-# Requires:
-#   - A built mlx-serve binary
-#   - Either CONCURRENT_TEST_MODEL set or default at
-#     ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#
-# Usage:
-#   CONCURRENT_TEST_MODEL=/path/to/model ./tests/test_concurrent_throughput.sh [port]
+#   CONCURRENT_TEST_MODEL=<dir> ./tests/test_concurrent_throughput.sh [port]   # default gemma-4-e4b-it-8bit
 
 set -e
 

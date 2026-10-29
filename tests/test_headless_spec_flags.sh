@@ -1,26 +1,15 @@
 #!/bin/bash
-# Regression test: headless serve mode must honor the CLI's spec-decode flags.
+# test_headless_spec_flags.sh — headless serve (`--serve --model-dir`, the mode the app always launches) honours the
+# CLI's spec flags: the boot banner echoes non-default --pld-draft-len / --pld-key-len, --no-pld still wins, a bare
+# boot reports 5/3. [4/4] endpoint existence never depends on model state: an unknown path is a 404 while served
+# endpoints answer 503 with no default model (llmprobe read a catch-all 503 as every surface absent).
 #
-# `runHeadlessServe` builds its own ServerConfig literal. It shipped with all
-# three PLD fields hardcoded (`false`/`5`/`3`), so nothing the user passed on
-# the command line reached a headless request. #95 threaded `--pld`; the
-# neighbouring `--pld-draft-len` / `--pld-key-len` stayed literals and were
-# still silently dropped.
+#   ./tests/test_headless_spec_flags.sh [port]
 #
-# This is the mode that matters: the Swift app ALWAYS launches headless
-# (`--serve --model-dir`, no `--model` — ServerOptions.swift:455) and ALWAYS
-# emits all three flags (:497-499), so every app-launched server ran on the
-# hardcoded values regardless of Settings.
-#
-# Fully hermetic: an EMPTY --model-dir discovers zero models and never loads
-# one, so the boot banner is reachable with no checkpoint on disk (same trick
-# as tests/test_3d_gen.sh). The banner is the observable — server.zig's
-# `PLD speculative decoding: ENABLED (draft_len=N, key_len=M...)` line reads
-# the exact ServerConfig fields a request would.
-#
-# Usage: ./tests/test_headless_spec_flags.sh [port]
+# FULLY HERMETIC: an empty --model-dir discovers nothing and loads nothing; runs in seconds. Hermetic twin: PldDefaults.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11265}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -61,11 +50,7 @@ boot() {
     : > "$LOG"
     "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off "$@" > "$LOG" 2>&1 &
     local pid=$!
-    for _ in $(seq 1 60); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-        sleep 0.5
-        kill -0 "$pid" 2>/dev/null || break
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 60 0.5 "$pid" || true
     curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || {
         echo "  (server did not come up; log follows)"; cat "$LOG"; kill "$pid" 2>/dev/null; return 1
     }
@@ -133,11 +118,7 @@ sleep 0.5
 : > "$LOG"
 "$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
 HPID=$!
-for _ in $(seq 1 60); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 0.5
-    kill -0 "$HPID" 2>/dev/null || break
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 0.5 "$HPID" || true
 post_code() {
     curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT$1" \
         -H 'Content-Type: application/json' -d '{}'

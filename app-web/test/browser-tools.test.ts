@@ -8,14 +8,14 @@ import { browserTools } from "../src/lib/state/chat-tools";
 import { imageProfile } from "../src/lib/state/image-state.svelte";
 import { pageServer } from "../src/lib/core/console";
 
-const model = (id: string, capabilities: string[], architecture: string) =>
-  ({ id, capabilities, architecture, meta: { architecture } }) as Model;
+const model = (id: string, capabilities: string[], architecture: string, modality?: string) =>
+  ({ id, capabilities, architecture, modality, meta: { architecture } }) as Model;
 const models = [
   model("flux", ["image"], "flux2"),
   model("mage-base", ["image"], "mage_flow"),
-  model("kokoro", ["audio"], "kokoro"),
-  model("ace", ["audio", "music"], "acestep"),
-  model("qwen-tts", ["audio"], "qwen3_tts"),
+  model("kokoro", ["audio"], "kokoro", "speech"),
+  model("ace", ["audio", "music"], "acestep", "music"),
+  model("qwen-tts", ["audio"], "qwen3_tts", "speech"),
 ];
 const noLibrary = {} as Library;
 const client = (parts: Record<string, unknown>) => ({ baseUrl: "https://host", ...parts }) as unknown as Client;
@@ -29,6 +29,8 @@ describe("browser tool resolution", () => {
   it("capabilities separate speech, music and edit-capable image models", () => {
     const parsed = parseModels({ data: models });
     expect(parsed.filter((m) => m.capabilities.includes("speech")).map((m) => m.id)).toEqual(["kokoro", "qwen-tts"]);
+    // The row's modality decides it, whatever the architecture.
+    expect(parseModels({ data: [{ id: "tts", capabilities: ["audio"], modality: "speech", meta: { architecture: "new_tts" } }] })[0].capabilities).toContain("speech");
     const { tools } = browserTools(client({}), models, noLibrary, { server: "https://host", messages: [] } as unknown as Session);
     expect(enumOf(asTools(tools), "generate_speech")).toEqual(["kokoro", "qwen-tts"]);
     expect(enumOf(asTools(tools), "generate_music")).toEqual(["ace"]);

@@ -1,14 +1,14 @@
 #!/bin/bash
-# Static guard for .github/workflows/release.yml event gating.
+# test_release_workflow_gates.sh — static guard for release packaging. release.yml event gating: the PR trigger and
+# fork-PR guard, Create Release + Homebrew push OFF for pull_request, tag creation dispatch-only, notarize steps never
+# excluded on PRs, artifact upload covers PRs (the class "a PR build releases" / "PR DMGs stop being notarized").
+# app/build.sh: the CalVer timezone, license packaging, every Contents/Resources entry staged outside the App
+# Store-only block is staged by release.yml too, and FAST_DEV (default 0, Debug Swift only under its gate, one
+# ReleaseFast default, `-Doptimize=Debug` only under the ZIG_DEBUG gate, which is FAST_DEV-only and refused by name,
+# signing skipped only with the staging that invalidates it, the FAST_DEV exit after signing and before notarizing).
 #
-# The release workflow triples as (1) the tag/dispatch RELEASE pipeline,
-# (2) the dry-run packaging check, and (3) the PR packaging build that
-# signs + notarizes a DMG artifact WITHOUT releasing. The class of bug this
-# pins: someone edits a step's `if:` and a PR suddenly creates a tag, a
-# GitHub release, or a Homebrew formula push — or the opposite, PR builds
-# silently stop notarizing and the artifact regresses to unsigned.
-#
-# Hermetic — parses the YAML, no network, no runners.
+#   ./tests/test_release_workflow_gates.sh   # hermetic: PyYAML parse, no runners
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -1,25 +1,15 @@
 #!/bin/bash
-# Guard: a tool call still parses at long context, where the sliding-window
-# block trim and speculative verify interact.
+# test_tools_long_context.sh — a tool call still PARSES at 16k/32k/64k, where the sliding-window block trim and
+# speculative verify interact (below ~8k nothing is trimmed, so short tool tests pass for the wrong reason).
 #
-# The trim changed what every sliding layer READS on any block-wide forward —
-# spec verify and prefill chunks — and spec verify is exactly where a tool call
-# is being detected. Both are guarded for SPEED and for byte-identity on prose;
-# neither guarded a TOOL CALL at the context lengths where the trim actually
-# engages (below ~8k there is nothing to trim, so short tool tests pass for the
-# wrong reason).
+#   LONGCTX_TEST_MODEL=<dir> ./tests/test_tools_long_context.sh [port]   # LONGCTX_RUNGS=16000,32000,64000
 #
-# Per rung: a long filler prompt puts the request past the trim threshold, then
-# the model is asked for one concrete tool call. Assertions are correctness, not
-# speed: the call FIRES, its name is the declared one, its arguments are valid
-# JSON carrying the value the prompt planted, and no tool markup leaks into
-# visible content. The engagement line is checked too — a rung that silently
-# fell back to short-context handling proves nothing.
-#
-# Usage: LONGCTX_TEST_MODEL=<dir> ./tests/test_tools_long_context.sh [port]
-#   LONGCTX_RUNGS=16000,32000,64000   — override the token rungs
+# Per rung: the call fires with the declared name, valid-JSON arguments carry the identifier the prompt planted, no
+# markup leaks into content, and the log shows `[sliding] block trim engaged` (a rung that fell back to short-context
+# handling proves nothing). A failure is the trim or verify reading the wrong rows on a block-wide forward.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${LONGCTX_TEST_MODEL:-}"
 PORT="${1:-8135}"
@@ -41,8 +31,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -f "$LOG"; }
 trap cleanup EXIT
-for i in $(seq 1 600); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not start"; exit 1; }
+srv_wait_health "$BASE" 600 1 || { echo "FAIL: server did not start"; exit 1; }
 
 IFS=',' read -r -a RUNG_LIST <<< "$RUNGS"
 CARRIED_ANY=0

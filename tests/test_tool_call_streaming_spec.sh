@@ -15,6 +15,7 @@
 #   TOOL_STREAM_TEST_MODEL=/path/to/model ./tests/test_tool_call_streaming_spec.sh [port]
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8090}
 BASE="http://127.0.0.1:$PORT"
@@ -71,10 +72,7 @@ cleanup() {
 trap cleanup EXIT
 
 UP=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then UP=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 && UP=1
 if [ "$UP" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
     tail -30 "$LOGFILE"

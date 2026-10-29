@@ -13,7 +13,7 @@ mlx-serve on NVIDIA GPUs: MLX's CUDA backend on Linux (x86_64 and aarch64) and W
 ## Kernels
 
 - **Custom MSL kernels run on Metal only** (`mlx.metalKernelsAvailable`; `mlx.streamIsGpu` is false on CUDA, so every Metal helper declines). mlx-omarchy's Vulkan backend translates a subset of MSL and refuses the rest at EVAL, which fails the request. Vulkan and CUDA run MLX ops.
-- **A CUDA kernel of our own goes through `mlx_fast_cuda_kernel`**, not an MLX patch (`qmv_cuda.zig`, the GDN recurrence in `transformer.zig`):
+- **A CUDA kernel of our own goes through `mlx_fast_cuda_kernel`**, not an MLX patch (`sdk/blocks/qmm/qmv_cuda.zig`, the GDN recurrence in `engines/mlx/transformer.zig`):
   - The source is the kernel BODY. MLX writes the signature from the input and output names: typed pointers (`__nv_bfloat16*`, `uint32_t*`); helpers go in the header.
   - `<input>_shape` / `_strides` / `_ndim` are passed only when the body names them, so shapes cost nothing. Read them instead of compiling one variant per shape.
   - Template arguments become `constexpr` / `using` lines at the top of the body; each distinct set is one NVRTC compile.
@@ -22,25 +22,25 @@ mlx-serve on NVIDIA GPUs: MLX's CUDA backend on Linux (x86_64 and aarch64) and W
   - A new file's tests run only once `src/tests.zig` imports it.
 - **Decode mat-vecs run `row_dot`** (`patches/mlx-cuda-row-dot-matvec.patch`): bf16 gemv, mxfp8/mxfp4/nvfp4 `quantized_matmul` and the fp expert gather read 16 bytes per load, split short-N rows over up to 256 threads, and share each weight load across up to 8 rows of x. On GB10 the fp modes take it through 8 rows (affine stays at the rows kernel's 6, `MLX_CUDA_QMV_MAX_ROWS` decides when set): with 8 batched slots the tiled `qmm_sm80` was 9% slower per token, and a row's bits are then the same alone or batched. A gather with fewer than 8 rows per expert takes it: rows on different experts share no weights, so `qmm_sm80`'s tile bought nothing at top-10 decode.
 - **A sorted fp expert gather runs CTAs per (N tile, expert)** (`patches/mlx-cuda-sorted-gather-experts.patch`): a 64-row tile over sorted rows spanned 2-3 experts at Flash Next's ~40 rows each, one serial K-loop per expert run. A popular expert's M tiles split over up to 8 CTAs, the grid kept near 16k CTAs (more empty CTAs made the down GEMM slower).
-- **qwen4 decode glue runs as `cuda_kernel`s**: the hyper-connection read (`hc_cuda.zig`, `hc_decode2`'s two launches: norm + down, up + mix, with the deferred write folded in) and the fp-bank MoE (`moe_cuda.zig`: gate+up+SwiGLU, then down with the routing-weighted sum). The MoE kernels include `row_dot`'s arithmetic (`device/row_dot_ops.cuh`, a JIT header the `row_dot` patch installs) and use MLX's own functors, so a decode row is bit-identical to the composed chain; the hc read sums in its own order, no further from an f32 truth than the chain; `MLX_SERVE_HC_FUSED=0` / `MLX_SERVE_MOE_CUDA=0` restore the chains. A multi-row read (MTP verify) loops its rows inside each block, so the hyper-connection weights load once per read, not once per row.
-- **Prefill experts over fp banks run `moe_prefill_cuda.zig`**: gate+up+SwiGLU in one launch (x rows read through the routing map), the down GEMM, and the weighted top-k sum. Outputs are bit-identical to the chain: the same `mma.m16n8k16` in `qmm_sm80`'s K order on exact bf16 weights, MLX's functors, MLX's sequential bf16 sum. `MLX_SERVE_MOE_PREFILL_CUDA=0` restores the chain.
+- **qwen4 decode glue runs as `cuda_kernel`s**: the hyper-connection read (`sdk/blocks/hc/hc_cuda.zig`, `hc_decode2`'s two launches: norm + down, up + mix, with the deferred write folded in) and the fp-bank MoE (`sdk/blocks/moe/moe_cuda.zig`: gate+up+SwiGLU, then down with the routing-weighted sum). The MoE kernels include `row_dot`'s arithmetic (`device/row_dot_ops.cuh`, a JIT header the `row_dot` patch installs) and use MLX's own functors, so a decode row is bit-identical to the composed chain; the hc read sums in its own order, no further from an f32 truth than the chain. A multi-row read (MTP verify) loops its rows inside each block, so the hyper-connection weights load once per read, not once per row.
+- **Prefill experts over fp banks run `sdk/blocks/moe/moe_prefill_cuda.zig`**: gate+up+SwiGLU in one launch (x rows read through the routing map), the down GEMM, and the weighted top-k sum. Outputs are bit-identical to the chain: the same `mma.m16n8k16` in `qmm_sm80`'s K order on exact bf16 weights, MLX's functors, MLX's sequential bf16 sum.
 - **Below 4 rows per expert a sorted fp gather runs `row_dot_sorted_kernel`** (`patches/mlx-cuda-sorted-gather-matvec.patch`): a block takes 8 sorted rows and loads a weight row once per run on the same expert, with `row_dot`'s per-row arithmetic at the same threads per row, so the bits are the per-row mat-vec's.
 - **On an integrated GPU prefill runs without CUDA graphs** (`mlx.setCudaGraphs`, `patches/mlx-cuda-graphs-switch.patch`); decode, and the decode ticks interleaved into a prefill, keep them.
 - **The GDN short conv runs `depthwiseConvCuda` at prefill widths**: MLX's grouped conv1d is cuDNN's direct kernel there, ~7 ms per 2048-row chunk. Its own summation order, no further from an f64 truth than cuDNN's.
 - **The GDN recurrence (`gdnRecurCuda`) gives a warp 16 Dv rows of one head at prefill lengths**: the rows share each step's k/q/g/beta loads, issued a step ahead; a row's arithmetic is the one-row kernel's, so the outputs are bit-identical to one row per warp (4.6 to 2.7 ms per 2048-token call on Flash Next). Against the op chain it sums in its own order: over 8 seeds its error to an f64 truth is 0.96x the chain's in `y` and 0.88x in the state.
-- **The qwen4 hyper-connection read runs `hc_prefill_cuda.zig` at prefill widths**: the deferred stream write, each stream's RMS norm and weight in one launch, the sigmoid-gated mean in another, in place of the compiled closures, `rms_norm_small` and `col_reduce_small` (`MLX_SERVE_HC_PREFILL_CUDA=0` restores them). Bit-identical to the compiled chain.
-- **One QSA decode token, and each row of a solo verify block, attends through `qsa_decode_cuda.zig`** (the CUDA twin of `qsa_decode.zig`): the indexer's picks and the tail go straight to a split pass and a merge pass in f32, replacing the index arithmetic, gathers and the masked SDPA's matmul fallback (~11 ms a token at 5k context). Not MLX's summation order: 2.6x less RMS error than the gathered SDPA against an f64 truth (`MLX_SERVE_QSA_DEC_KERNEL=0` restores it). Verify rows (2..16) ride a third grid axis, each with its own picks and causal tail; before, they took the dense mask arm over the whole cache, and MTP at 32k context decoded slower than plain decode (20.5 vs 21.4 tok/s, now 34.3).
+- **The qwen4 hyper-connection read runs `sdk/blocks/hc/hc_prefill_cuda.zig` at prefill widths**: the deferred stream write, each stream's RMS norm and weight in one launch, the sigmoid-gated mean in another, in place of the compiled closures, `rms_norm_small` and `col_reduce_small`. Bit-identical to the compiled chain.
+- **One QSA decode token, and each row of a solo verify block, attends through `plugins/qwen4_exp/qsa_decode_cuda.zig`** (the CUDA twin of `plugins/qwen4_exp/qsa_decode.zig`): the indexer's picks and the tail go straight to a split pass and a merge pass in f32, replacing the index arithmetic, gathers and the masked SDPA's matmul fallback (~11 ms a token at 5k context). Not MLX's summation order: 2.6x less RMS error than the gathered SDPA against an f64 truth. Verify rows (2..16) ride a third grid axis, each with its own picks and causal tail; before, they took the dense mask arm over the whole cache, and MTP at 32k context decoded slower than plain decode (20.5 vs 21.4 tok/s, now 34.3).
 - **MTP drafts shortlist on the coarse head on CUDA too**: `draftTop32`'s Metal kernels decline there, and every draft read the full bf16 `lm_head` (1.27 GB on Flash Next); `draftTop32Partition` takes the same 32 ids through MLX's argpartition (proposal side only, so outputs never depend on its tie order).
 - **QSA's mask arm hands MLX's SDPA an additive mask on CUDA** (`qsaMaskArm`): MLX broadcasts a bool mask over the heads, then fills two `[B, H, S, kv]` arrays to select 0 / -inf into a third (~7 ms per layer against a 5 ms attention at 7k tokens); the same values over one head reach cuDNN as a view.
 - **The compute capability is `mlx.cudaComputeCapability(.major / .minor)`** (MLX's `device_info`): sm_120 is `12.0`, GB10 is `12.1`.
 
 ## Per-device defaults
 
-- **A fast path is on by default only where it was MEASURED**, and every one has an env switch.
+- **A fast path is on by default only where it was MEASURED**; one whose verdict differs per device keeps an env switch to measure the next device.
   - Mac-tuned paths are re-measured on CUDA: `prefillDqGemm` ran 13% slower there and stacked ~5 GB into the prefill peak (default off on CUDA), and a prefill chunk past 2048 bought no speed for GBs of peak (`autoPrefillChunkCap`).
   - A path tuned on one CUDA device loses on another: GB10 (128 GB unified memory) and a discrete RTX 5060 Ti flip on the same kernel.
 - **Quantized matmul at 2..8 rows** (speculative verify, batched decode):
-  - sm_120 runs `qmv_cuda.zig` (`MLX_SERVE_CUDA_QMV_TC=0|1`).
+  - sm_120 runs `sdk/blocks/qmm/qmv_cuda.zig` (`MLX_SERVE_CUDA_QMV_TC=0|1`).
   - GB10 runs 2..6 rows through `patches/mlx-cuda-qmv-rows.patch` (`MLX_CUDA_QMV_MAX_ROWS`).
   - Other devices stay on MLX's `qmm_sm80`.
   - `qmv_cuda` declines unless the weight is 4-bit affine, group 32/64/128, bf16/f16, and `k % 128 == 0`.
@@ -54,7 +54,7 @@ mlx-serve on NVIDIA GPUs: MLX's CUDA backend on Linux (x86_64 and aarch64) and W
 ## Measuring
 
 - **A kernel microbench must rotate its weights past L2.** The 5060 Ti's L2 held a 28 MB matrix and read it at 760 GB/s on a 448 GB/s card. Rotate copies that total more than ~5x L2.
-- **The forward ladder is the in-situ meter**: `MLX_SERVE_DECODE_FWD_UBENCH=30 MLX_SERVE_DECODE_FWD_UBENCH_S=<rows> MLX_SERVE_DECODE_FWD_UBENCH_KV=2048 tests/fwd_ubench.sh <model>`. `MLX_CUDA_QMV_MAX_ROWS=1` plus `MLX_SERVE_CUDA_QMV_TC=0` is MLX's stock path.
+- **The forward ladder is the in-situ meter**: `MLX_SERVE_DIAG=decode-fwd-ubench-s=<rows>,decode-fwd-ubench-kv=2048 tests/fwd_ubench.sh <model> 30`. `MLX_CUDA_QMV_MAX_ROWS=1` plus `MLX_SERVE_CUDA_QMV_TC=0` is MLX's stock path.
 - **Tok/s comes from llmprobe** (`tests/bench.sh --url`, `/bench`), with each arm proven by its own log: `[spec-stats] mode=` and `[qmv-cuda] tensor-core rows kernel engaged`.
 
 ## Tests
@@ -68,7 +68,7 @@ mlx-serve on NVIDIA GPUs: MLX's CUDA backend on Linux (x86_64 and aarch64) and W
 
 Defect: MLX's tiled `qmm_sm80` made a 2..8-row verify cost ~1.45 decode steps on an RTX 5060 Ti. A CUDA-core rows kernel (one weight read, one FMA per weight per row) won on GB10, but on the 5060 it cost ~10 ms more per row (91 ms at 8 rows against 24).
 Cause: the arithmetic, not memory traffic. Staging x in shared memory did not help; both shapes grew linearly with the rows.
-Fix: `qmv_cuda.zig` puts 16 weight rows x 8 x rows into one `mma.m16n8k16`, so 8 rows cost about one decode step. A lane owns 32 consecutive k of each 128-k block, so its packed words and its x slice load as 16-byte vectors. A and B take the same k permutation, which leaves the dot product unchanged. 16 warps split K over each 16-row tile.
+Fix: `sdk/blocks/qmm/qmv_cuda.zig` puts 16 weight rows x 8 x rows into one `mma.m16n8k16`, so 8 rows cost about one decode step. A lane owns 32 consecutive k of each 128-k block, so its packed words and its x slice load as 16-byte vectors. A and B take the same k permutation, which leaves the dot product unchanged. 16 warps split K over each 16-row tile.
 Guard: `qmv_cuda: no worse than stock quantized_matmul against f32 truth` (rows 2..8, bf16 + f16, groups 32/64/128).
 
 ### Flash Next's 8192-row prefill failed in MLX's expert gather on a DGX Spark
@@ -139,7 +139,7 @@ Guard: `ModelOpt: an FP8 linear loaded into the GPU's pool stays there` (reads t
 
 | Patch | What it changes | Could be a kernel we pass in? |
 |---|---|---|
-| `mlx-cuda-qmv-rows.patch` | rows kernel inside `quantized_matmul` | Done on sm_120 (`qmv_cuda.zig`); GB10 keeps the patch until it is measured there |
+| `mlx-cuda-qmv-rows.patch` | rows kernel inside `quantized_matmul` | Done on sm_120 (`sdk/blocks/qmm/qmv_cuda.zig`); GB10 keeps the patch until it is measured there |
 | `mlx-cuda-qmm-read-weights-once.patch` | folds `[B, M, K]` batches into rows | Yes: `qmv_cuda` flattens leading dims; the stock path could reshape before the call |
 | `mlx-cuda-sdpa-head-dim-256-512.patch` | fused attention at head dims 256 and 512 | Possible, as a custom attention kernel (as `msv_attn_p256` is on Metal) |
 | `mlx-cuda-gather-qmm-rhs.patch` | upstream #4554: sorted fp4/fp8 expert gather, one group per expert | No: drop it once the pin includes #4554 |

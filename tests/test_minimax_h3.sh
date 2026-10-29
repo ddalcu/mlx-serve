@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# MiniMax-H3 (Hailuo 3.0) text-to-audio-video endpoint test.
+# test_minimax_h3.sh — MiniMax-H3 audio-video end to end on the converted pack: `video` capability, the staged
+# preflight's NUMBER in the 30-50 GB band (max(TE,DiT)+VAEs, never the sum), named 400s (LoRA, a non-/32 canvas, chat
+# against a video model), a small generation returning rgb8 + pcm_s16le of the right lengths with audio/video in sync,
+# SSE progress -> complete with 40 frames snapping UP to 56 on the 17k+5 ladder, fl2va adherence at 256px with
+# "fast": false, and the fast recipe by engagement (`fast:false` logs no reuse; the default logs `step-cache reused` and
+# `attn-broadcast reused`). The pack's own config.json `tasks` decides which half runs: ref2va pins its eight named 400s
+# and one image + soundtracked clip + audio generation whose resolver order and cond-row budgets are counted in the log.
+# Residency is pinned OFF (staged-plan properties).
 #
-# Boots a server over the converted pack and pins the whole H3 request surface:
-# video capability advertised, a small generation returns rgb8 frames + a
-# pcm_s16le stereo track of the RIGHT lengths (frame count snapped to the
-# model's 17k+5 ladder), the named-400 surface (LoRA is the one field the
-# backend cannot honor in any form; a non-/32 canvas; chat against a video
-# model), SSE progress -> complete, and the staged-residency media preflight
-# engagement line (max(TE,DiT)+VAEs, never the 64.5 GB sum).
+#   H3_MODEL=<dir> ./tests/test_minimax_h3.sh [port]   # default ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit; SKIP without
 #
-# Usage: [H3_MODEL=<dir>] ./tests/test_minimax_h3.sh [port]
+# Hermetic twins: the layout/schedule/vision/VAE fixture tests (minimax_h3*.zig), h3PeakBytes; live parity:
+# MINIMAX_H3_DIR, MINIMAX_H3_VAE_ENC_FIXTURE, _AUDIO_ENC_FIXTURE (max-abs, not cosine), _VIT_FIXTURE (+ rms_ratio).
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11361}"
 MODEL="${H3_MODEL:-$HOME/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit}"
 [ -f "$MODEL/transformer.safetensors" ] || { echo "SKIP: no MiniMax-H3 pack at $MODEL (set H3_MODEL)"; exit 0; }
@@ -23,11 +27,7 @@ LOG=/tmp/test_minimax_h3_server.log
 MLX_SERVE_H3_RESIDENT=0 "$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for i in $(seq 1 90); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -8 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 90 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -8 "$LOG"; exit 1; }
 rc=0
 
 # Which PARTITION this pack is. The two ship identical files and geometry —

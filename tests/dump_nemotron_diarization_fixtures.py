@@ -3,7 +3,7 @@
 
 Runs mlx-audio's `nemotron_diarization` (the pack layout our loader matches)
 and the official model in 🤗 Transformers (float32, CPU) on a 16 kHz mono WAV,
-and saves what `src/nemotron_diarization.zig` has to reproduce:
+and saves what `src/plugins/nemotron_diarization/diarization.zig` has to reproduce:
   pcm              the 16 kHz samples (f32)
   features         mlx-audio's log-mel of the first window [128, frames] (f32)
   mlx_probs        mlx-audio's speaker activity [frames, 8] with the pack (f32)

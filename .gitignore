@@ -12,6 +12,7 @@ zig-out/
 # WEIGHTS out; src/fixtures holds a 1.8 MB toy-geometry parity fixture, and a
 # test that silently skips because its fixture is untracked protects nothing.
 !src/fixtures/*.safetensors
+!src/plugins/lfm3/fixtures/*/*.safetensors
 
 # llama.cpp libllama, staged at build time by scripts/fetch-llama.sh (not vendored)
 /lib/llama/
@@ -106,3 +107,7 @@ data
 
 # Studio web console (app-web/): dev tooling output only
 app-web/node_modules/
+
+# Generated at configure time by build/plugins.zig
+/src/plugins/registry.zig
+/src/unit_*.zig

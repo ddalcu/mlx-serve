@@ -444,9 +444,9 @@ final class MediaBundleTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-        let src = try String(contentsOf: root.appendingPathComponent("src/ltx_video.zig"), encoding: .utf8)
+        let src = try String(contentsOf: root.appendingPathComponent("src/plugins/ltx/video.zig"), encoding: .utf8)
         XCTAssertTrue(src.contains("\"\(MediaBundle.ltx25TextEncoderDir)\""),
-                      "src/ltx_video.zig does not name \(MediaBundle.ltx25TextEncoderDir) — the app would fetch an encoder the server never looks for")
+                      "src/plugins/ltx/video.zig does not name \(MediaBundle.ltx25TextEncoderDir) — the app would fetch an encoder the server never looks for")
     }
 
     func testFluxAndTtsBundlesAreRecursiveSingleComponent() {

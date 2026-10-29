@@ -18,6 +18,7 @@
 #
 # Usage: ./tests/test_reasoning_budget_stream.sh [model_dir] [port]
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-4B-MLX-4bit}"
 PORT="${2:-11267}"
@@ -39,7 +40,7 @@ LOG=$(mktemp); OUT=$(mktemp)
 "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG" "$OUT"' EXIT
-for _ in $(seq 1 120); do sleep 2; curl -sf "$BASE/health" >/dev/null 2>&1 && break; done
+srv_wait_health "$BASE" 120 2 || true
 if ! curl -sf "$BASE/health" >/dev/null 2>&1; then echo "server failed to start"; tail -5 "$LOG"; exit 1; fi
 
 echo "[budget-stream] === $(basename "$MODEL") ==="

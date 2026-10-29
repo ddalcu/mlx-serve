@@ -506,6 +506,11 @@ extern "C" int32_t mlx_llama_seq_sample(mlx_llama_ctx *c, int32_t seq, float tem
     return sample_row(c, c->out_idx[seq], c->pos[seq], temperature, top_k, top_p, min_p, rng);
 }
 
+extern "C" float *mlx_llama_seq_logits(mlx_llama_ctx *c, int32_t seq) {
+    if (!valid_seq(c, seq) || c->out_idx[seq] < 0) return nullptr;
+    return llama_get_logits_ith(c->tgt, c->out_idx[seq]);
+}
+
 // Greedy drafts from the head: each step reads (token, hidden one position
 // earlier) and predicts the next token and the hidden that goes with it.
 static int32_t draft(mlx_llama_ctx *c, int32_t seq, llama_token id_last, llama_pos pos0, int32_t k) {

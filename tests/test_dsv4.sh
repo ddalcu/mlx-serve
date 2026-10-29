@@ -1,20 +1,15 @@
 #!/bin/bash
-# DeepSeek-V4-Flash NATIVE engine integration test — env-gated on the local
-# mixed-quant mirror (~118 GB; loading takes minutes and wants the machine
-# otherwise idle):
+# test_dsv4.sh — DeepSeek-V4-Flash NATIVE engine live end to end on the ~115 GB mirror (loading takes minutes; keep the
+# machine idle). [0] template A/B vs the release's encoding_dsv4.py (byte-exact, when the encoder is staged), a greedy
+# raw-completion prefix (oracle ground truth), chat on both thinking arms, clean streaming, a DSML tool call + round
+# trip, and [7] single-flight admission: a second concurrent request queues and never clobbers the module-owned
+# dec_state (a long greedy solo baseline equals the same request with a marker chat fired mid-generation, and the
+# marker never leaks into the other stream). Booted --pld --mtp to prove the dsv4 spec hard-off guards hold.
 #
-#   DSV4_TEST_MODEL=~/.mlx-serve/models/ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit \
-#       ./tests/test_dsv4.sh
+#   DSV4_TEST_MODEL=<mirror dir> ./tests/test_dsv4.sh   # DSV4_TEST_PORT (11351), DSV4_TEST_SKIP_PREFLIGHT=1 on 128 GB
 #
-# Pins the live serving surface end-to-end: greedy raw-completion prefix (the
-# python-oracle ground truth), chat on both thinking arms, DSML tool calling
-# (call → result → answer), streaming delta cleanliness, and single-flight
-# admission (a concurrent request must queue, never clobber the module-owned
-# dec_state). Booted WITH
-# --pld --mtp to prove the scheduler's dsv4 spec hard-off guards hold (the
-# app always passes both flags). Complements the hermetic layers: the
-# DSV4_MINI fixture/decode-equivalence gates, the template render test, and
-# the format-corpus "dsv4-dsml" family.
+# SKIPs without the env var. Hermetic twins: DSV4_MINI fixture/decode-equivalence gates, admitPendingTick, corpus
+# family "dsv4-dsml".
 
 set -euo pipefail
 

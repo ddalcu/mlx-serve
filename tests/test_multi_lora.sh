@@ -1,31 +1,18 @@
 #!/usr/bin/env bash
-# Multi-LoRA stacking across every backend that takes adapters, over the API.
+# test_multi_lora.sh — multi-LoRA STACKING over the API on every backend that takes adapters (FLUX.2, Krea-2, LTX-2.3,
+# MiniMax-H3) + H3's Turbo adapter. Proven exactly: two identical adapters at 1.0 are byte-for-byte one at 2.0 (d+d ==
+# 2d in IEEE; last-one-wins, a dropped second file and a double-counted first all break it), and 1.0 differs from the
+# baseline and from 2.0 so it cannot pass on a zero delta. Also: zero-B byte transparency, order independence, mixed
+# scales (0.5+1.5 == 1+1), the legacy singular field == a one-file array, named 400s (foreign architecture, 9 > the cap
+# of 8, a relative path). NOISE passes all of that, so baseline / one-adapter / stacked / H3-turbo renders also go
+# through tests/lora_noise.py (bar 20; numpy/PIL missing SKIPs loudly). H3 arms: turbo attaches all 259 modules,
+# changes the render, and a style adapter stacks on it (`lora 2/2`). Adapters are SYNTHETIC rank-2 pairs sized from
+# each checkpoint; every render runs at the backend's floor (512x512/2 steps, 9 LTX frames, 5 H3 frames).
 #
-# The claim under test is not "a LoRA attaches" (test_image_gen.sh already pins
-# that for one file) but that SEVERAL attach at once and their deltas SUM.
-# That is provable exactly, with no eyeballing and no reference image:
-#
-#   two IDENTICAL adapters at scale 1.0 must produce byte-for-byte the same
-#   output as ONE of them at scale 2.0
-#
-# because d+d == 2*d exactly in IEEE floating point. A "last one wins" merge
-# gives d, a dropped second file gives d, a doubled first file gives 2d from
-# the wrong place — every one of those breaks the equality. The companion
-# inequality (one adapter at 1.0 differs from 2.0) proves the delta is real,
-# so the equality above cannot pass vacuously on a no-op adapter.
-#
-# Every generation runs at MINIMUM settings: the pixels are never looked at,
-# only compared, so steps/size/frames are as low as each backend allows.
-#
-# That last sentence was also this suite's blind spot, and it cost a live bug:
-# NOISE passes every comparison above. A real community LoRA rendered pure
-# static (its alpha lived in the file metadata, so it ran 8x too strong) while
-# all 56 checks here were green. `tests/lora_noise.py` is the companion that
-# LOOKS — one number per render, bar 20 — applied to the generations that are
-# supposed to be usable pictures.
-#
-# Usage: ./tests/test_multi_lora.sh [port]
+#   ./tests/test_multi_lora.sh [port]   # missing models SKIP; real published adapters are test_real_loras.sh
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11466}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -93,11 +80,8 @@ PY
 boot() {
   "$BIN" --serve --port "$PORT" --model-dir "$MODELS" >"$LOG" 2>&1 &
   SRV=$!
-  for _ in $(seq 1 120); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-    kill -0 $SRV 2>/dev/null || { echo "FAIL: server died"; tail -5 "$LOG"; return 1; }
-    sleep 0.5
-  done
+  srv_wait_health "http://127.0.0.1:$PORT" 120 0.5 "$SRV" && return 0
+  kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server died"; tail -5 "$LOG"; return 1; }
   echo "FAIL: server never became healthy"; return 1
 }
 # An interrupted download leaves only `.partial` parts; discovery skips it, so must we.

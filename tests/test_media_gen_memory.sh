@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
-# Media-gen memory accounting: a generation must hand back every byte it took.
+# test_media_gen_memory.sh — a media generation hands back every byte it took, read as `mlx_active` from /props (RSS
+# is blind to Metal buffers). Generations at VARYING sizes (512², 768², 640x896) must not ratchet the resident footprint
+# (a fixed size cannot tell a leak from size-keyed caching), and three load -> generate -> unload cycles return to the
+# pre-load baseline. A failure is the class "a helper materializes a view and never frees it, pinning its parent".
 #
-# The class: MageFlow's `sliceSeq` wrapped an `mlx_slice` handle in `contiguous`
-# and never freed it, and a live slice pins its PARENT's buffer — so each DiT
-# block retained the img+txt pair it was handed (~47 MB), 12 blocks x 4 steps =
-# ~2.2 GB per megapixel, per generation, compounding and surviving unload.
+#   MEDIA_MEM_MODEL=<dir> ./tests/test_media_gen_memory.sh [port]   # default Mage-Flow-Turbo-MLX-Serve-8bit; SKIP
 #
-# Two things this must do that a naive memory test does not:
-#   * measure `mlx_active` from /props, NOT RSS — Metal buffers never appear in
-#     RSS on Apple Silicon (it sat flat at 8.5 GB while 10 GB leaked);
-#   * VARY the size-driving shape — a fixed-size replay cannot tell a leak from
-#     ordinary size-keyed caching.
-#
-# Skips gracefully when the checkpoint isn't downloaded.
-# Usage: MEDIA_MEM_MODEL=<dir> ./tests/test_media_gen_memory.sh [port]
+# Hermetic twin: `materializing helpers hand back every array they take` (plugins/mage_flow/mage_flow.zig).
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11413}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -31,11 +26,7 @@ LOG=/tmp/test_media_gen_memory_server.log
 "$BIN" --serve --port "$PORT" --model-dir "$MODEL_DIR" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for i in $(seq 1 180); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 180 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 
 # Bytes MLX currently holds in live arrays. Freed buffers drop out of this
 # immediately (they move to the allocator cache), so it is the leak signal.

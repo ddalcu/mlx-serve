@@ -660,7 +660,7 @@ struct StatusMenuView: View {
                     CLISetupInstructionsButton(
                         baseURL: server.baseURL,
                         servedModelId: server.chatModelId ?? "mlx-serve",
-                        serverContextLength: server.chatModelInfo?.contextLength,
+                        serverBudget: server.chatModelInfo?.agentBudget,
                         isEnabled: server.status == .running
                     )
                 }
@@ -1128,7 +1128,7 @@ struct EndpointsSection: View {
 /// already relying on that implicitly; presenting it through `AppActivation`
 /// (which touches `NSApp`) just makes the requirement explicit.
 @MainActor
-func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil) {
+func launchClaudeCodeWithPicker(baseURL: String, serverBudget: AgentBudget.Budget? = nil) {
     let panel = OpenPanel.make()
     panel.canChooseDirectories = true
     panel.canChooseFiles = false
@@ -1141,18 +1141,18 @@ func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil
     panel.directoryURL = URL(fileURLWithPath: defaultWS)
     guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
     launchClaudeCode(baseURL: baseURL, workingDirectory: url.path,
-                     serverContextLength: serverContextLength)
+                     serverBudget: serverBudget)
 }
 
 /// Launch Claude Code CLI configured to use the local mlx-serve server.
 /// Shares `AgentConfigs.claudeCodeExports` with the CLI-launcher dropdown — the
 /// env block must not drift between the two entry points.
 func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
-                      serverContextLength: Int? = nil) {
+                      serverBudget: AgentBudget.Budget? = nil) {
     let model = "mlx-serve"
     let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
-    let budget = AgentBudget.forServerContext(serverContextLength)
-    warnIfSmallContext(agentId: "claude", context: budget.context)
+    let budget = serverBudget ?? AgentBudget.fallback
+    warnIfSmallContext(agentId: "claude", budget: budget)
     let scriptContent = """
     #!/bin/zsh -l
     \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))

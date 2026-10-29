@@ -1,27 +1,12 @@
 #!/bin/bash
-# PLD + tools equivalence test.
+# test_pld_tools.sh — PLD with tools present (agent traffic is the ideal PLD workload): a tools request with
+# enable_pld runs PLD (`[spec-stats] mode=pld`); its tool call (name + arguments) and an echo-heavy answer with tools
+# defined are byte-identical to a no-PLD baseline; a streaming /v1/messages tools request still parses its call.
 #
-# Agent clients (Claude Code, the app's agent loop) send `tools` on every
-# request, and agent traffic is the ideal PLD workload — tool results echo
-# file contents the model then quotes back. Historically PLD was blanket-
-# disabled whenever tools were present ("pld=disabled (tools present)"), a
-# conservative gate from the original PLD checkpoint that predates streaming
-# PLD, scheduler slots, and the runtime acceptance gate.
-#
-# This test asserts:
-#   1. a tools request with enable_pld:true actually runs PLD
-#      (log shows "[spec-stats] mode=pld", not "pld=disabled (tools present)")
-#   2. the tool call (name + args) is identical to a no-PLD baseline
-#   3. an echo-heavy text answer with tools defined is byte-identical
-#   4. a streaming /v1/messages tools request still parses the tool call
-#
-# Requires:
-#   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
-#   - PLD_TEST_MODEL or ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#
-# Usage: ./tests/test_pld_tools.sh [port]
+#   PLD_TEST_MODEL=<dir> ./tests/test_pld_tools.sh [port]   # default gemma-4-e4b-it-8bit; starts its own servers
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8098}
 BASE="http://127.0.0.1:$PORT"
@@ -74,10 +59,7 @@ start_server() {
     local logfile="$1"; shift
     "$BINARY" --model "$MODEL" --serve --port "$PORT" "$@" > "$logfile" 2>&1 &
     SERVER_PID=$!
-    for i in $(seq 1 60); do
-        curl -s -f "$BASE/health" > /dev/null 2>&1 && return 0
-        sleep 1
-    done
+    srv_wait_health "$BASE" 60 1 && return 0
     echo -e "${RED}FAIL${NC} server did not become healthy"; tail -5 "$logfile"; return 1
 }
 stop_server() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; }

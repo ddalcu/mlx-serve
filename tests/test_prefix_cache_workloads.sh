@@ -1,25 +1,16 @@
 #!/bin/bash
-# Workload-fair hot-cache eviction (issue #378).
+# test_prefix_cache_workloads.sh — workload-fair hot-cache eviction: one model, a 4-entry hot cache, a conversation under
+# a system prompt and a sweep of six documents. Eviction takes the LRU of the workload key holding the most entries
+# (`requestCacheKey`: prompt_cache_key > metadata.user_id > system-prompt hash > anonymous), so the sweep evicts only
+# its own documents. [1] turn 2 is warm (cached_tokens > 1000); [2] six docs keyed "batch", turn 3 still warm; [3] every
+# sweep eviction names the batch key; [4] six unkeyed, system-less docs, turn 4 still warm; [5] that control sweep
+# evicts key-0 entries. Only the NEWEST conversation entry is the bar (a turn may evict its own stale entry; a tie
+# between groups falls back to plain LRU).
 #
-# One model, two workloads sharing a 4-entry hot prefix cache: a conversation
-# under a system prompt, and a sweep of six distinct documents. Plain LRU let
-# the sweep evict the conversation every time. Eviction now picks the LRU of
-# the workload key holding the most entries (`server.requestCacheKey`:
-# prompt_cache_key > metadata.user_id > system-prompt hash > anonymous), so the
-# sweep only evicts its own documents.
-#
-#   [1] conversation turn 2 is warm (cached_tokens > 1000: the system prompt, not a 2-token BOS match)
-#   [2] six docs with prompt_cache_key:"batch"; turn 3 is still warm
-#   [3] every eviction during that sweep names the ONE batch key
-#   [4] control: six unkeyed, system-less docs (anonymous group); turn 4 still warm
-#   [5] the control sweep evicts key-0 entries (it pays for itself)
-# A turn may evict the conversation's own stale earlier entry, and a tie between
-# groups falls back to plain LRU: both are the policy, so only the NEWEST
-# conversation entry ([2], [4]) is the bar.
-#
-# Usage: ./tests/test_prefix_cache_workloads.sh [/path/to/model] [port]
+#   ./tests/test_prefix_cache_workloads.sh [/path/to/model] [port]
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-11433}"
@@ -54,10 +45,7 @@ cleanup() {
 trap cleanup EXIT
 
 up=0
-for i in $(seq 1 90); do
-    curl -s -f "$BASE/health" > /dev/null 2>&1 && { up=1; break; }
-    sleep 1
-done
+srv_wait_health "$BASE" 90 1 && up=1
 if [ "$up" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy"; tail -30 "$LOGFILE"; exit 1
 fi

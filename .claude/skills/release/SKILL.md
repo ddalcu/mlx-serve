@@ -41,6 +41,7 @@ Rules:
 - **Paste the printed rows into the `Decode tok/s by release` table**, one new column, mode suffix included. A cell that lost its mode suffix is the signal that speculation stopped engaging — chase it before shipping.
 - **`--full`** takes median-of-3 per rung and climbs to 32k/64k; the default is one run per rung to 16k. For a regression CLAIM on a spec cell, sample across runs and boot orders regardless of depth.
 - **The one chart left is `docs/perf-vs-engines.png`**, frozen at the release it was rendered for and named as such in its `docs/performance.md` caption. There is no longer a script that regenerates it, and `benchmarks.md` no longer carries a cross-engine table (dropped 26.9.2).
+- **The cross-machine view (previous release vs this one, every machine and model)** is `scripts/release_compare.py --old <prev> --new <ver> --dir "<machine>=<reports>#<commit>" ... [--csv other-machines.csv] --md compare.md --html compare.html`, written into `~/claude-tmp/bench-<tag>/` (never `docs/`). Reports are llmprobe JSONs labelled `<baseline|final>-<arm>` (`llmprobe --label final-default`; old release = baseline); a machine without its reports here goes in the CSV. Exit 1 = a cell slower than `--noise` (3%): chase it before shipping.
 - **The README's Speed table quotes `benchmarks.md` only** (one machine, one released column, no other engine): refresh it from the new column when you cut a release.
 
 ## Versioning & Releases

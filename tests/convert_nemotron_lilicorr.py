@@ -1,17 +1,14 @@
 #!/usr/bin/env python3
-"""Convert NVIDIA's W4A16 NVFP4 LiLiCorr checkpoint to dense MLX bf16.
+"""Convert NVIDIA's W4A16 NVFP4 LiLiCorr checkpoint (Nemotron 3.5 Super) to dense MLX bf16, the target's drafter/.
 
-Requires torch and safetensors. Download the pinned Model Optimizer source:
+  python tests/convert_nemotron_lilicorr.py --source <download> --out <new dir> --reference <nvfp4_tensor.py>
+
+Needs torch + safetensors and NVIDIA Model Optimizer's nvfp4_tensor.py at the pinned commit:
   https://raw.githubusercontent.com/NVIDIA/Model-Optimizer/6bf36980e1d73a46750c947b7ff4c3cc3fa9c34d/modelopt/torch/quantization/qtensor/nvfp4_tensor.py
-Then run:
-  python tests/convert_nemotron_lilicorr.py --source <download> --out <new directory> \
-    --reference <nvfp4_tensor.py>
-
-Every packed matrix is checked against the unmodified NVIDIA CPU dequantizer,
-including its E4M3 block scales and fp32 global scale. Conversion preserves the
-checkpoint's own LM head. Explicit LiLiCorr layout changes are recorded in the
-manifest. Existing output directories are refused; no source files are changed.
-The bf16 weights expand the source checkpoint; no new quantization is applied.
+Every packed matrix is checked against that unmodified CPU dequantizer (E4M3 block scales, fp32 global scale), every
+source tensor is consumed, layout changes go in the manifest, shards are hashed. The checkpoint's own LM head is
+kept; no new quantization. An existing output dir is refused; install only a completed output as `drafter/`.
+CPU regressions: python tests/test_convert_nemotron_lilicorr.py.
 """
 
 import argparse

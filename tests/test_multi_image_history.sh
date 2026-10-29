@@ -1,11 +1,13 @@
 #!/bin/bash
-# Every image in a conversation reaches the model where the template put it.
-# Only the LAST turn's media used to be encoded: an agent that read page1..3
-# saw page3's pixels only. Here turn 1 carries image A, turn 2 image B, and
-# turn 3 asks about A: the answer needs A's pixels, the log must show both
-# items encoded, and a repeat of turn 3 (a prefix-cache hit across two media
-# spans) must answer with the same bytes. An image inside an Anthropic
-# tool_result (Claude Code's Read tool) must reach the model too.
+# test_multi_image_history.sh — every image in a conversation reaches the model where the template put it: turn 1
+# image A, turn 2 image B, turn 3 asks about A (the answer needs A's pixels, the log shows `Multimodal: 2 item(s)`);
+# a repeat of turn 3 is warm across both media spans with the same bytes; an image inside an Anthropic tool_result
+# (Claude Code's Read) and one in a Responses function_call_output (Codex's view_image) are described.
+#
+#   ./tests/test_multi_image_history.sh [model] [port]   # default Qwen3.5-2B
+#
+# Hermetic twins: expandMediaPlaceholders, `media renders one template placeholder per item`.
+
 set -u
 MODEL="${MULTI_IMAGE_MODEL:-${1:-$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-2B-MLX-4bit}}"
 PORT="${2:-11236}"
@@ -75,6 +77,30 @@ PY
 echo "  $r3"
 check "tool_result image encoded" "$(grep -c 'Multimodal: 1 item' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"
 check "answer describes the house" "$(has "$r3" 'house|home|building')" "1"
+
+echo "[4] Responses function_call_output image reaches the model"
+n4=$(grep -c 'Multimodal: 1 item' "$LOG")
+r4=$(python3 - "$B" <<'PY' | curl -s -m 600 "$U/v1/responses" -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); print(''.join(c.get('text','') for o in d.get('output',[]) if o.get('type')=='message' for c in o.get('content',[])).replace(chr(10),' '))"
+import base64, json, sys
+data = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
+print(json.dumps({
+    "model": "mlx-serve", "max_output_tokens": 1024, "temperature": 0, "tool_choice": "none",
+    "tools": [{"type": "function", "name": "view_image", "description": "View an image file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}],
+    "input": [
+        {"role": "user", "content": "Open photo.jpg and tell me what it shows."},
+        {"type": "function_call", "call_id": "c1", "name": "view_image", "arguments": "{\"path\":\"photo.jpg\"}"},
+        {"type": "function_call_output", "call_id": "c1", "output": [
+            {"type": "input_text", "text": "Read photo.jpg"},
+            {"type": "input_image", "image_url": "data:image/jpeg;base64," + data},
+        ]},
+        {"role": "user", "content": "What is the main subject of that photo? One short sentence, no tool calls."},
+    ],
+}))
+PY
+)
+echo "  $r4"
+check "function_call_output image encoded" "$(( $(grep -c 'Multimodal: 1 item' "$LOG") - n4 ))" "1"
+check "function_call_output answer describes the house" "$(has "$r4" 'house|home|building')" "1"
 
 echo "pass=$pass fail=$fail"
 [ "$fail" = "0" ] && echo "PASS: multi-image history" || { echo "FAIL: multi-image history"; grep -E "Multimodal|hot-cache|cache\]|-> 4|-> 5" "$LOG" | tail -20; }

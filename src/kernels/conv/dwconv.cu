@@ -1,0 +1,12 @@
+const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+const int lin = x_shape[1];
+const int l = lin - K + 1;
+if (idx >= (long)x_shape[0] * l * C) return;
+const int c = idx % C;
+const long bt = idx / C;
+const long t = bt % l;
+const long b = bt / l;
+const auto* xp = x + (b * lin + t) * C + c;
+float acc = 0.0f;
+for (int j = 0; j < K; ++j) acc += static_cast<float>(xp[(long)j * C]) * static_cast<float>(w[c * K + j]);
+y[idx] = static_cast<OutT>(acc);

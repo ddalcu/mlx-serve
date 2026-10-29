@@ -1,5 +1,10 @@
 #!/bin/bash
-# Exercise production OpenCode detection with isolated login shells and a fixture HTTP server.
+# test_opencode_probe.sh — production OpenCode detection with isolated login shells and a fixture HTTP server (no
+# model): generation routing, canonical/alias shell counts, rc banners, explicit missing vs executable failure, legacy
+# probe completion, config written before launch.
+#
+#   TMPDIR="$PWD/tmp" bash tests/test_opencode_probe.sh [binary]
+
 set -eu
 : "${TMPDIR:?set TMPDIR to a workspace scratch directory}"
 python3 - "${1:-./zig-out/bin/mlx-serve}" "$TMPDIR" <<'PY'

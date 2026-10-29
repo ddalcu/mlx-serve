@@ -1,0 +1,3939 @@
+{
+  "architectures": [
+    "DeepseekV41ForCausalLM"
+  ],
+  "model_type": "deepseek_v41",
+  "dtype": "bfloat16",
+  "transformers_version": "5.6.0",
+  "bos_token_id": 0,
+  "eos_token_id": 1,
+  "pad_token_id": 2,
+  "image_token_id": 129264,
+  "text_config": {
+    "model_type": "deepseek_v41_text",
+    "vocab_size": 129280,
+    "hidden_size": 5120,
+    "moe_intermediate_size": 2304,
+    "num_hidden_layers": 40,
+    "num_attention_heads": 64,
+    "num_key_value_heads": 1,
+    "head_dim": 512,
+    "qk_rope_head_dim": 64,
+    "q_lora_rank": 1280,
+    "o_lora_rank": 1024,
+    "o_groups": 8,
+    "hidden_act": "silu",
+    "swiglu_limit": 10.0,
+    "rms_norm_eps": 1e-20,
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "initializer_range": 0.02,
+    "use_cache": true,
+    "tie_word_embeddings": false,
+    "max_position_embeddings": 1048576,
+    "rope_theta": 10000,
+    "rope_scaling": {
+      "rope_type": "yarn",
+      "factor": 16,
+      "beta_fast": 32,
+      "beta_slow": 1,
+      "original_max_position_embeddings": 65536
+    },
+    "n_routed_experts": 384,
+    "n_shared_experts": 1,
+    "num_experts_per_tok": 6,
+    "scoring_func": "sqrtsoftplus",
+    "topk_method": "noaux_tc",
+    "norm_topk_prob": true,
+    "routed_scaling_factor": 1.5,
+    "sliding_window": 128,
+    "compress_ratios": [
+      0,
+      0,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      0,
+      0,
+      0
+    ],
+    "compress_rope_theta": 160000,
+    "kv_source_layer_ids": [
+      2,
+      8,
+      14,
+      20
+    ],
+    "index_source_layer_ids": [
+      2,
+      8,
+      14,
+      20,
+      24,
+      28,
+      32,
+      36
+    ],
+    "index_n_heads": 32,
+    "index_head_dim": 128,
+    "index_topk": 512,
+    "candidate_source_layer_id": 20,
+    "candidate_topk_blocks": 2048,
+    "candidate_block_size": 8,
+    "hc_mult": 4,
+    "hc_sinkhorn_iters": 20,
+    "hc_eps": 1e-06,
+    "engram_layer_ids": [
+      1,
+      14
+    ],
+    "engram_num_embeddings": [
+      384006168,
+      384016682
+    ],
+    "engram_max_ngram_size": 4,
+    "engram_vocab_size": 16000000,
+    "engram_n_heads": 8,
+    "engram_head_dim": 256,
+    "engram_pad_token_id": 2,
+    "engram_compressed_vocab_size": 99092,
+    "num_nextn_predict_layers": 3,
+    "dspark_block_size": 5,
+    "dspark_noise_token_id": 128799,
+    "dspark_target_layer_ids": [
+      37,
+      38,
+      39
+    ],
+    "dspark_markov_rank": 256,
+    "dspark_n_routed_experts": 128,
+    "dspark_num_experts_per_tok": 3
+  },
+  "vision_config": {
+    "model_type": "deepseek_v41_vision",
+    "num_hidden_layers": 32,
+    "hidden_size": 1024,
+    "num_attention_heads": 16,
+    "intermediate_size": 2816,
+    "patch_size": 14,
+    "rope_theta": 10000,
+    "downsample_ratio": 3,
+    "max_image_tokens": 1024,
+    "min_pixels": 295936,
+    "max_wh_ratio": null
+  },
+  "omlx_deepseek_v41": {
+    "version": 1,
+    "quantized_modules": {
+      "language_model.layers.6.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.6.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.engram.wkv": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.layers.14.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.attn.compressor.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.14.attn.compressor.wgate": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.14.attn.indexer.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.attn.indexer.weights_proj": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.14.attn.indexer.wk": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.14.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.ffn.experts.w1": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.ffn.experts.w3": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.14.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.22.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.30.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.38.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.7.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.ffn.experts.w1": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.ffn.experts.w3": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.15.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.23.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.31.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.ffn.experts.w1": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.ffn.experts.w3": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.39.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.0.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.attn.compressor.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.8.attn.compressor.wgate": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.8.attn.indexer.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.attn.indexer.weights_proj": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.8.attn.indexer.wk": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.8.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.8.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.ffn.experts.w1": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.ffn.experts.w3": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.16.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.attn.indexer.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.attn.indexer.weights_proj": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.24.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.24.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.attn.indexer.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.attn.indexer.weights_proj": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.32.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.32.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.engram.wkv": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.layers.1.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.1.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.9.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.ffn.experts.w1": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.ffn.experts.w3": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.17.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.25.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.33.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.mtp.0.attn.wq_a": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.0.attn.wq_b": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.0.attn.wkv": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.0.attn.wo_b": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.0.ffn.shared_experts.w1": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.0.ffn.shared_experts.w3": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.0.ffn.shared_experts.w2": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.0.ffn.experts.w1": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.mtp.0.ffn.experts.w3": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.mtp.0.ffn.experts.w2": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.mtp.0.main_proj": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.layers.2.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.attn.compressor.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.2.attn.compressor.wgate": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.2.attn.indexer.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.attn.indexer.weights_proj": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.2.attn.indexer.wk": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.2.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.2.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.10.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.ffn.experts.w1": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.ffn.experts.w3": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.18.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.26.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.34.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.mtp.1.attn.wq_a": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.1.attn.wq_b": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.1.attn.wkv": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.1.attn.wo_b": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.1.ffn.shared_experts.w1": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.1.ffn.shared_experts.w3": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.1.ffn.shared_experts.w2": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.1.ffn.experts.w1": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.mtp.1.ffn.experts.w3": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.mtp.1.ffn.experts.w2": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.layers.3.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.3.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.11.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.19.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.27.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.35.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.mtp.2.attn.wq_a": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.2.attn.wq_b": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.2.attn.wkv": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.2.attn.wo_b": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.2.ffn.shared_experts.w1": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.2.ffn.shared_experts.w3": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.2.ffn.shared_experts.w2": {
+        "bits": 8,
+        "mode": "mxfp8"
+      },
+      "language_model.mtp.2.ffn.experts.w1": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.mtp.2.ffn.experts.w3": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.mtp.2.ffn.experts.w2": {
+        "bits": 4,
+        "mode": "mxfp4"
+      },
+      "language_model.layers.4.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.4.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.12.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.attn.compressor.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.20.attn.indexer.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.attn.indexer.weights_proj": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.20.attn.indexer.wk": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.20.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.20.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.attn.indexer.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.attn.indexer.weights_proj": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.28.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.28.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.attn.indexer.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.attn.indexer.weights_proj": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": false
+      },
+      "language_model.layers.36.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.36.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.5.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.13.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.21.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.29.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.attn.wq_a": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.attn.wq_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.attn.wkv": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.attn.wo_b": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.ffn.shared_experts.w1": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.ffn.shared_experts.w3": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.ffn.shared_experts.w2": {
+        "bits": 8,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.ffn.experts.w1": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.ffn.experts.w3": {
+        "bits": 2,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      },
+      "language_model.layers.37.ffn.experts.w2": {
+        "bits": 3,
+        "group_size": 64,
+        "mode": "affine",
+        "quantize_input": true
+      }
+    },
+    "engram_tables": {
+      "language_model.layers.14.engram.embed": {
+        "weight_file": "model-00001-of-00053.safetensors",
+        "weight_key": "language_model.layers.14.engram.embed.weight",
+        "scale_file": "model-00001-of-00053.safetensors",
+        "scale_key": "language_model.layers.14.engram.embed.scales",
+        "bias_key": "language_model.layers.14.engram.embed.biases",
+        "bits": 4,
+        "group_size": 32,
+        "mode": "affine"
+      },
+      "language_model.layers.1.engram.embed": {
+        "weight_file": "model-00002-of-00053.safetensors",
+        "weight_key": "language_model.layers.1.engram.embed.weight",
+        "scale_file": "model-00002-of-00053.safetensors",
+        "scale_key": "language_model.layers.1.engram.embed.scales",
+        "bias_key": "language_model.layers.1.engram.embed.biases",
+        "bits": 4,
+        "group_size": 32,
+        "mode": "affine"
+      }
+    },
+    "engram_in_index": true,
+    "preserve_mtp": true,
+    "excluded_draft_tensors": 0,
+    "quantization_report": {
+      "remaining_weights": {
+        "logical_parameters": 566591466194,
+        "tensor_bytes": 219828499272,
+        "effective_bpw": 3.1038730709965345
+      },
+      "engram": {
+        "logical_parameters": 196613849600,
+        "tensor_bytes": 122883656000,
+        "effective_bpw": 5.0,
+        "bits": 4,
+        "group_size": 32,
+        "mode": "affine"
+      },
+      "tensor_bytes": 342712155272,
+      "preserved_source_draft_tensors": 2401,
+      "oq_level": 2.5,
+      "enhanced_requested": true,
+      "target_bpw": 3.1,
+      "hard_cap_bpw": 3.3,
+      "allocation": "measured_layer_sensitivity_affine",
+      "budget_scope": "remaining_weights_excluding_engram",
+      "calibration": {
+        "tensor_bytes": 219828499272,
+        "effective_bpw": 3.1038730709965345,
+        "fixed_source_bytes": 14990291784,
+        "preserved_modules": {
+          "vision.patch_embed.proj": "precision_policy",
+          "vision.blocks.0.norm1": "precision_policy",
+          "vision.blocks.0.attn.wqkv": "precision_policy",
+          "vision.blocks.0.attn.wo": "precision_policy",
+          "vision.blocks.0.norm2": "precision_policy",
+          "vision.blocks.0.ffn.w1": "precision_policy",
+          "vision.blocks.0.ffn.w2": "precision_policy",
+          "vision.blocks.1.norm1": "precision_policy",
+          "vision.blocks.1.attn.wqkv": "precision_policy",
+          "vision.blocks.1.attn.wo": "precision_policy",
+          "vision.blocks.1.norm2": "precision_policy",
+          "vision.blocks.1.ffn.w1": "precision_policy",
+          "vision.blocks.1.ffn.w2": "precision_policy",
+          "vision.blocks.2.norm1": "precision_policy",
+          "vision.blocks.2.attn.wqkv": "precision_policy",
+          "vision.blocks.2.attn.wo": "precision_policy",
+          "vision.blocks.2.norm2": "precision_policy",
+          "vision.blocks.2.ffn.w1": "precision_policy",
+          "vision.blocks.2.ffn.w2": "precision_policy",
+          "vision.blocks.3.norm1": "precision_policy",
+          "vision.blocks.3.attn.wqkv": "precision_policy",
+          "vision.blocks.3.attn.wo": "precision_policy",
+          "vision.blocks.3.norm2": "precision_policy",
+          "vision.blocks.3.ffn.w1": "precision_policy",
+          "vision.blocks.3.ffn.w2": "precision_policy",
+          "vision.blocks.4.norm1": "precision_policy",
+          "vision.blocks.4.attn.wqkv": "precision_policy",
+          "vision.blocks.4.attn.wo": "precision_policy",
+          "vision.blocks.4.norm2": "precision_policy",
+          "vision.blocks.4.ffn.w1": "precision_policy",
+          "vision.blocks.4.ffn.w2": "precision_policy",
+          "vision.blocks.5.norm1": "precision_policy",
+          "vision.blocks.5.attn.wqkv": "precision_policy",
+          "vision.blocks.5.attn.wo": "precision_policy",
+          "vision.blocks.5.norm2": "precision_policy",
+          "vision.blocks.5.ffn.w1": "precision_policy",
+          "vision.blocks.5.ffn.w2": "precision_policy",
+          "vision.blocks.6.norm1": "precision_policy",
+          "vision.blocks.6.attn.wqkv": "precision_policy",
+          "vision.blocks.6.attn.wo": "precision_policy",
+          "vision.blocks.6.norm2": "precision_policy",
+          "vision.blocks.6.ffn.w1": "precision_policy",
+          "vision.blocks.6.ffn.w2": "precision_policy",
+          "vision.blocks.7.norm1": "precision_policy",
+          "vision.blocks.7.attn.wqkv": "precision_policy",
+          "vision.blocks.7.attn.wo": "precision_policy",
+          "vision.blocks.7.norm2": "precision_policy",
+          "vision.blocks.7.ffn.w1": "precision_policy",
+          "vision.blocks.7.ffn.w2": "precision_policy",
+          "vision.blocks.8.norm1": "precision_policy",
+          "vision.blocks.8.attn.wqkv": "precision_policy",
+          "vision.blocks.8.attn.wo": "precision_policy",
+          "vision.blocks.8.norm2": "precision_policy",
+          "vision.blocks.8.ffn.w1": "precision_policy",
+          "vision.blocks.8.ffn.w2": "precision_policy",
+          "vision.blocks.9.norm1": "precision_policy",
+          "vision.blocks.9.attn.wqkv": "precision_policy",
+          "vision.blocks.9.attn.wo": "precision_policy",
+          "vision.blocks.9.norm2": "precision_policy",
+          "vision.blocks.9.ffn.w1": "precision_policy",
+          "vision.blocks.9.ffn.w2": "precision_policy",
+          "vision.blocks.10.norm1": "precision_policy",
+          "vision.blocks.10.attn.wqkv": "precision_policy",
+          "vision.blocks.10.attn.wo": "precision_policy",
+          "vision.blocks.10.norm2": "precision_policy",
+          "vision.blocks.10.ffn.w1": "precision_policy",
+          "vision.blocks.10.ffn.w2": "precision_policy",
+          "vision.blocks.11.norm1": "precision_policy",
+          "vision.blocks.11.attn.wqkv": "precision_policy",
+          "vision.blocks.11.attn.wo": "precision_policy",
+          "vision.blocks.11.norm2": "precision_policy",
+          "vision.blocks.11.ffn.w1": "precision_policy",
+          "vision.blocks.11.ffn.w2": "precision_policy",
+          "vision.blocks.12.norm1": "precision_policy",
+          "vision.blocks.12.attn.wqkv": "precision_policy",
+          "vision.blocks.12.attn.wo": "precision_policy",
+          "vision.blocks.12.norm2": "precision_policy",
+          "vision.blocks.12.ffn.w1": "precision_policy",
+          "vision.blocks.12.ffn.w2": "precision_policy",
+          "vision.blocks.13.norm1": "precision_policy",
+          "vision.blocks.13.attn.wqkv": "precision_policy",
+          "vision.blocks.13.attn.wo": "precision_policy",
+          "vision.blocks.13.norm2": "precision_policy",
+          "vision.blocks.13.ffn.w1": "precision_policy",
+          "vision.blocks.13.ffn.w2": "precision_policy",
+          "vision.blocks.14.norm1": "precision_policy",
+          "vision.blocks.14.attn.wqkv": "precision_policy",
+          "vision.blocks.14.attn.wo": "precision_policy",
+          "vision.blocks.14.norm2": "precision_policy",
+          "vision.blocks.14.ffn.w1": "precision_policy",
+          "vision.blocks.14.ffn.w2": "precision_policy",
+          "vision.blocks.15.norm1": "precision_policy",
+          "vision.blocks.15.attn.wqkv": "precision_policy",
+          "vision.blocks.15.attn.wo": "precision_policy",
+          "vision.blocks.15.norm2": "precision_policy",
+          "vision.blocks.15.ffn.w1": "precision_policy",
+          "vision.blocks.15.ffn.w2": "precision_policy",
+          "vision.blocks.16.norm1": "precision_policy",
+          "vision.blocks.16.attn.wqkv": "precision_policy",
+          "vision.blocks.16.attn.wo": "precision_policy",
+          "vision.blocks.16.norm2": "precision_policy",
+          "vision.blocks.16.ffn.w1": "precision_policy",
+          "vision.blocks.16.ffn.w2": "precision_policy",
+          "vision.blocks.17.norm1": "precision_policy",
+          "vision.blocks.17.attn.wqkv": "precision_policy",
+          "vision.blocks.17.attn.wo": "precision_policy",
+          "vision.blocks.17.norm2": "precision_policy",
+          "vision.blocks.17.ffn.w1": "precision_policy",
+          "vision.blocks.17.ffn.w2": "precision_policy",
+          "vision.blocks.18.norm1": "precision_policy",
+          "vision.blocks.18.attn.wqkv": "precision_policy",
+          "vision.blocks.18.attn.wo": "precision_policy",
+          "vision.blocks.18.norm2": "precision_policy",
+          "vision.blocks.18.ffn.w1": "precision_policy",
+          "vision.blocks.18.ffn.w2": "precision_policy",
+          "vision.blocks.19.norm1": "precision_policy",
+          "vision.blocks.19.attn.wqkv": "precision_policy",
+          "vision.blocks.19.attn.wo": "precision_policy",
+          "vision.blocks.19.norm2": "precision_policy",
+          "vision.blocks.19.ffn.w1": "precision_policy",
+          "vision.blocks.19.ffn.w2": "precision_policy",
+          "vision.blocks.20.norm1": "precision_policy",
+          "vision.blocks.20.attn.wqkv": "precision_policy",
+          "vision.blocks.20.attn.wo": "precision_policy",
+          "vision.blocks.20.norm2": "precision_policy",
+          "vision.blocks.20.ffn.w1": "precision_policy",
+          "vision.blocks.20.ffn.w2": "precision_policy",
+          "vision.blocks.21.norm1": "precision_policy",
+          "vision.blocks.21.attn.wqkv": "precision_policy",
+          "vision.blocks.21.attn.wo": "precision_policy",
+          "vision.blocks.21.norm2": "precision_policy",
+          "vision.blocks.21.ffn.w1": "precision_policy",
+          "vision.blocks.21.ffn.w2": "precision_policy",
+          "vision.blocks.22.norm1": "precision_policy",
+          "vision.blocks.22.attn.wqkv": "precision_policy",
+          "vision.blocks.22.attn.wo": "precision_policy",
+          "vision.blocks.22.norm2": "precision_policy",
+          "vision.blocks.22.ffn.w1": "precision_policy",
+          "vision.blocks.22.ffn.w2": "precision_policy",
+          "vision.blocks.23.norm1": "precision_policy",
+          "vision.blocks.23.attn.wqkv": "precision_policy",
+          "vision.blocks.23.attn.wo": "precision_policy",
+          "vision.blocks.23.norm2": "precision_policy",
+          "vision.blocks.23.ffn.w1": "precision_policy",
+          "vision.blocks.23.ffn.w2": "precision_policy",
+          "vision.blocks.24.norm1": "precision_policy",
+          "vision.blocks.24.attn.wqkv": "precision_policy",
+          "vision.blocks.24.attn.wo": "precision_policy",
+          "vision.blocks.24.norm2": "precision_policy",
+          "vision.blocks.24.ffn.w1": "precision_policy",
+          "vision.blocks.24.ffn.w2": "precision_policy",
+          "vision.blocks.25.norm1": "precision_policy",
+          "vision.blocks.25.attn.wqkv": "precision_policy",
+          "vision.blocks.25.attn.wo": "precision_policy",
+          "vision.blocks.25.norm2": "precision_policy",
+          "vision.blocks.25.ffn.w1": "precision_policy",
+          "vision.blocks.25.ffn.w2": "precision_policy",
+          "vision.blocks.26.norm1": "precision_policy",
+          "vision.blocks.26.attn.wqkv": "precision_policy",
+          "vision.blocks.26.attn.wo": "precision_policy",
+          "vision.blocks.26.norm2": "precision_policy",
+          "vision.blocks.26.ffn.w1": "precision_policy",
+          "vision.blocks.26.ffn.w2": "precision_policy",
+          "vision.blocks.27.norm1": "precision_policy",
+          "vision.blocks.27.attn.wqkv": "precision_policy",
+          "vision.blocks.27.attn.wo": "precision_policy",
+          "vision.blocks.27.norm2": "precision_policy",
+          "vision.blocks.27.ffn.w1": "precision_policy",
+          "vision.blocks.27.ffn.w2": "precision_policy",
+          "vision.blocks.28.norm1": "precision_policy",
+          "vision.blocks.28.attn.wqkv": "precision_policy",
+          "vision.blocks.28.attn.wo": "precision_policy",
+          "vision.blocks.28.norm2": "precision_policy",
+          "vision.blocks.28.ffn.w1": "precision_policy",
+          "vision.blocks.28.ffn.w2": "precision_policy",
+          "vision.blocks.29.norm1": "precision_policy",
+          "vision.blocks.29.attn.wqkv": "precision_policy",
+          "vision.blocks.29.attn.wo": "precision_policy",
+          "vision.blocks.29.norm2": "precision_policy",
+          "vision.blocks.29.ffn.w1": "precision_policy",
+          "vision.blocks.29.ffn.w2": "precision_policy",
+          "vision.blocks.30.norm1": "precision_policy",
+          "vision.blocks.30.attn.wqkv": "precision_policy",
+          "vision.blocks.30.attn.wo": "precision_policy",
+          "vision.blocks.30.norm2": "precision_policy",
+          "vision.blocks.30.ffn.w1": "precision_policy",
+          "vision.blocks.30.ffn.w2": "precision_policy",
+          "vision.blocks.31.norm1": "precision_policy",
+          "vision.blocks.31.attn.wqkv": "precision_policy",
+          "vision.blocks.31.attn.wo": "precision_policy",
+          "vision.blocks.31.norm2": "precision_policy",
+          "vision.blocks.31.ffn.w1": "precision_policy",
+          "vision.blocks.31.ffn.w2": "precision_policy",
+          "vision.norm": "precision_policy",
+          "aligner.w1": "precision_policy",
+          "aligner.w2": "precision_policy",
+          "language_model.layers.6.attn.q_norm": "ineligible_shape",
+          "language_model.layers.6.attn.wo_a": "uncalibrated",
+          "language_model.layers.6.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.6.attn_norm": "ineligible_shape",
+          "language_model.layers.6.ffn_norm": "ineligible_shape",
+          "language_model.layers.6.ffn.gate": "uncalibrated",
+          "language_model.layers.14.engram.wkv": "outside_layer_sensitivity",
+          "language_model.layers.14.attn.q_norm": "ineligible_shape",
+          "language_model.layers.14.attn.wo_a": "uncalibrated",
+          "language_model.layers.14.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.14.attn.compressor.norm": "ineligible_shape",
+          "language_model.layers.14.attn.indexer.k_norm": "ineligible_shape",
+          "language_model.layers.14.attn_norm": "ineligible_shape",
+          "language_model.layers.14.ffn_norm": "ineligible_shape",
+          "language_model.layers.14.ffn.gate": "uncalibrated",
+          "language_model.layers.22.attn.q_norm": "ineligible_shape",
+          "language_model.layers.22.attn.wo_a": "uncalibrated",
+          "language_model.layers.22.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.22.attn_norm": "ineligible_shape",
+          "language_model.layers.22.ffn_norm": "ineligible_shape",
+          "language_model.layers.22.ffn.gate": "uncalibrated",
+          "language_model.layers.30.attn.q_norm": "ineligible_shape",
+          "language_model.layers.30.attn.wo_a": "uncalibrated",
+          "language_model.layers.30.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.30.attn_norm": "ineligible_shape",
+          "language_model.layers.30.ffn_norm": "ineligible_shape",
+          "language_model.layers.30.ffn.gate": "uncalibrated",
+          "language_model.layers.38.attn.q_norm": "ineligible_shape",
+          "language_model.layers.38.attn.wo_a": "uncalibrated",
+          "language_model.layers.38.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.38.attn_norm": "ineligible_shape",
+          "language_model.layers.38.ffn_norm": "ineligible_shape",
+          "language_model.layers.38.ffn.gate": "uncalibrated",
+          "language_model.embed": "uncalibrated",
+          "language_model.layers.7.attn.q_norm": "ineligible_shape",
+          "language_model.layers.7.attn.wo_a": "uncalibrated",
+          "language_model.layers.7.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.7.attn_norm": "ineligible_shape",
+          "language_model.layers.7.ffn_norm": "ineligible_shape",
+          "language_model.layers.7.ffn.gate": "uncalibrated",
+          "language_model.layers.15.attn.q_norm": "ineligible_shape",
+          "language_model.layers.15.attn.wo_a": "uncalibrated",
+          "language_model.layers.15.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.15.attn_norm": "ineligible_shape",
+          "language_model.layers.15.ffn_norm": "ineligible_shape",
+          "language_model.layers.15.ffn.gate": "uncalibrated",
+          "language_model.layers.23.attn.q_norm": "ineligible_shape",
+          "language_model.layers.23.attn.wo_a": "uncalibrated",
+          "language_model.layers.23.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.23.attn_norm": "ineligible_shape",
+          "language_model.layers.23.ffn_norm": "ineligible_shape",
+          "language_model.layers.23.ffn.gate": "uncalibrated",
+          "language_model.layers.31.attn.q_norm": "ineligible_shape",
+          "language_model.layers.31.attn.wo_a": "uncalibrated",
+          "language_model.layers.31.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.31.attn_norm": "ineligible_shape",
+          "language_model.layers.31.ffn_norm": "ineligible_shape",
+          "language_model.layers.31.ffn.gate": "uncalibrated",
+          "language_model.layers.39.attn.q_norm": "ineligible_shape",
+          "language_model.layers.39.attn.wo_a": "uncalibrated",
+          "language_model.layers.39.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.39.attn_norm": "ineligible_shape",
+          "language_model.layers.39.ffn_norm": "ineligible_shape",
+          "language_model.layers.39.ffn.gate": "uncalibrated",
+          "language_model.layers.0.attn.q_norm": "ineligible_shape",
+          "language_model.layers.0.attn.wo_a": "uncalibrated",
+          "language_model.layers.0.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.0.attn_norm": "ineligible_shape",
+          "language_model.layers.0.ffn_norm": "ineligible_shape",
+          "language_model.layers.0.ffn.gate": "uncalibrated",
+          "language_model.layers.8.attn.q_norm": "ineligible_shape",
+          "language_model.layers.8.attn.wo_a": "uncalibrated",
+          "language_model.layers.8.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.8.attn.compressor.norm": "ineligible_shape",
+          "language_model.layers.8.attn.indexer.k_norm": "ineligible_shape",
+          "language_model.layers.8.attn_norm": "ineligible_shape",
+          "language_model.layers.8.ffn_norm": "ineligible_shape",
+          "language_model.layers.8.ffn.gate": "uncalibrated",
+          "language_model.layers.16.attn.q_norm": "ineligible_shape",
+          "language_model.layers.16.attn.wo_a": "uncalibrated",
+          "language_model.layers.16.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.16.attn_norm": "ineligible_shape",
+          "language_model.layers.16.ffn_norm": "ineligible_shape",
+          "language_model.layers.16.ffn.gate": "uncalibrated",
+          "language_model.layers.24.attn.q_norm": "ineligible_shape",
+          "language_model.layers.24.attn.wo_a": "uncalibrated",
+          "language_model.layers.24.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.24.attn_norm": "ineligible_shape",
+          "language_model.layers.24.ffn_norm": "ineligible_shape",
+          "language_model.layers.24.ffn.gate": "uncalibrated",
+          "language_model.layers.32.attn.q_norm": "ineligible_shape",
+          "language_model.layers.32.attn.wo_a": "uncalibrated",
+          "language_model.layers.32.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.32.attn_norm": "ineligible_shape",
+          "language_model.layers.32.ffn_norm": "ineligible_shape",
+          "language_model.layers.32.ffn.gate": "uncalibrated",
+          "language_model.norm": "ineligible_shape",
+          "language_model.head": "uncalibrated",
+          "language_model.layers.1.engram.wkv": "outside_layer_sensitivity",
+          "language_model.layers.1.attn.q_norm": "ineligible_shape",
+          "language_model.layers.1.attn.wo_a": "uncalibrated",
+          "language_model.layers.1.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.1.attn_norm": "ineligible_shape",
+          "language_model.layers.1.ffn_norm": "ineligible_shape",
+          "language_model.layers.1.ffn.gate": "uncalibrated",
+          "language_model.layers.9.attn.q_norm": "ineligible_shape",
+          "language_model.layers.9.attn.wo_a": "uncalibrated",
+          "language_model.layers.9.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.9.attn_norm": "ineligible_shape",
+          "language_model.layers.9.ffn_norm": "ineligible_shape",
+          "language_model.layers.9.ffn.gate": "uncalibrated",
+          "language_model.layers.17.attn.q_norm": "ineligible_shape",
+          "language_model.layers.17.attn.wo_a": "uncalibrated",
+          "language_model.layers.17.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.17.attn_norm": "ineligible_shape",
+          "language_model.layers.17.ffn_norm": "ineligible_shape",
+          "language_model.layers.17.ffn.gate": "uncalibrated",
+          "language_model.layers.25.attn.q_norm": "ineligible_shape",
+          "language_model.layers.25.attn.wo_a": "uncalibrated",
+          "language_model.layers.25.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.25.attn_norm": "ineligible_shape",
+          "language_model.layers.25.ffn_norm": "ineligible_shape",
+          "language_model.layers.25.ffn.gate": "uncalibrated",
+          "language_model.layers.33.attn.q_norm": "ineligible_shape",
+          "language_model.layers.33.attn.wo_a": "uncalibrated",
+          "language_model.layers.33.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.33.attn_norm": "ineligible_shape",
+          "language_model.layers.33.ffn_norm": "ineligible_shape",
+          "language_model.layers.33.ffn.gate": "uncalibrated",
+          "language_model.mtp.0.attn.wq_a": "uncalibrated",
+          "language_model.mtp.0.attn.wq_b": "uncalibrated",
+          "language_model.mtp.0.attn.q_norm": "ineligible_shape",
+          "language_model.mtp.0.attn.wo_a": "uncalibrated",
+          "language_model.mtp.0.attn.wkv": "uncalibrated",
+          "language_model.mtp.0.attn.kv_norm": "ineligible_shape",
+          "language_model.mtp.0.attn.wo_b": "uncalibrated",
+          "language_model.mtp.0.attn_norm": "ineligible_shape",
+          "language_model.mtp.0.ffn_norm": "ineligible_shape",
+          "language_model.mtp.0.ffn.shared_experts.w1": "uncalibrated",
+          "language_model.mtp.0.ffn.shared_experts.w3": "uncalibrated",
+          "language_model.mtp.0.ffn.shared_experts.w2": "uncalibrated",
+          "language_model.mtp.0.ffn.experts.w1": "uncalibrated",
+          "language_model.mtp.0.ffn.experts.w3": "uncalibrated",
+          "language_model.mtp.0.ffn.experts.w2": "uncalibrated",
+          "language_model.mtp.0.ffn.gate": "uncalibrated",
+          "language_model.mtp.0.main_proj": "uncalibrated",
+          "language_model.mtp.0.main_norm": "ineligible_shape",
+          "language_model.layers.2.attn.q_norm": "ineligible_shape",
+          "language_model.layers.2.attn.wo_a": "uncalibrated",
+          "language_model.layers.2.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.2.attn.compressor.norm": "ineligible_shape",
+          "language_model.layers.2.attn.indexer.k_norm": "ineligible_shape",
+          "language_model.layers.2.attn_norm": "ineligible_shape",
+          "language_model.layers.2.ffn_norm": "ineligible_shape",
+          "language_model.layers.2.ffn.gate": "uncalibrated",
+          "language_model.layers.10.attn.q_norm": "ineligible_shape",
+          "language_model.layers.10.attn.wo_a": "uncalibrated",
+          "language_model.layers.10.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.10.attn_norm": "ineligible_shape",
+          "language_model.layers.10.ffn_norm": "ineligible_shape",
+          "language_model.layers.10.ffn.gate": "uncalibrated",
+          "language_model.layers.18.attn.q_norm": "ineligible_shape",
+          "language_model.layers.18.attn.wo_a": "uncalibrated",
+          "language_model.layers.18.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.18.attn_norm": "ineligible_shape",
+          "language_model.layers.18.ffn_norm": "ineligible_shape",
+          "language_model.layers.18.ffn.gate": "uncalibrated",
+          "language_model.layers.26.attn.q_norm": "ineligible_shape",
+          "language_model.layers.26.attn.wo_a": "uncalibrated",
+          "language_model.layers.26.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.26.attn_norm": "ineligible_shape",
+          "language_model.layers.26.ffn_norm": "ineligible_shape",
+          "language_model.layers.26.ffn.gate": "uncalibrated",
+          "language_model.layers.34.attn.q_norm": "ineligible_shape",
+          "language_model.layers.34.attn.wo_a": "uncalibrated",
+          "language_model.layers.34.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.34.attn_norm": "ineligible_shape",
+          "language_model.layers.34.ffn_norm": "ineligible_shape",
+          "language_model.layers.34.ffn.gate": "uncalibrated",
+          "language_model.mtp.1.attn.wq_a": "uncalibrated",
+          "language_model.mtp.1.attn.wq_b": "uncalibrated",
+          "language_model.mtp.1.attn.q_norm": "ineligible_shape",
+          "language_model.mtp.1.attn.wo_a": "uncalibrated",
+          "language_model.mtp.1.attn.wkv": "uncalibrated",
+          "language_model.mtp.1.attn.kv_norm": "ineligible_shape",
+          "language_model.mtp.1.attn.wo_b": "uncalibrated",
+          "language_model.mtp.1.attn_norm": "ineligible_shape",
+          "language_model.mtp.1.ffn_norm": "ineligible_shape",
+          "language_model.mtp.1.ffn.shared_experts.w1": "uncalibrated",
+          "language_model.mtp.1.ffn.shared_experts.w3": "uncalibrated",
+          "language_model.mtp.1.ffn.shared_experts.w2": "uncalibrated",
+          "language_model.mtp.1.ffn.experts.w1": "uncalibrated",
+          "language_model.mtp.1.ffn.experts.w3": "uncalibrated",
+          "language_model.mtp.1.ffn.experts.w2": "uncalibrated",
+          "language_model.mtp.1.ffn.gate": "uncalibrated",
+          "language_model.layers.3.attn.q_norm": "ineligible_shape",
+          "language_model.layers.3.attn.wo_a": "uncalibrated",
+          "language_model.layers.3.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.3.attn_norm": "ineligible_shape",
+          "language_model.layers.3.ffn_norm": "ineligible_shape",
+          "language_model.layers.3.ffn.gate": "uncalibrated",
+          "language_model.layers.11.attn.q_norm": "ineligible_shape",
+          "language_model.layers.11.attn.wo_a": "uncalibrated",
+          "language_model.layers.11.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.11.attn_norm": "ineligible_shape",
+          "language_model.layers.11.ffn_norm": "ineligible_shape",
+          "language_model.layers.11.ffn.gate": "uncalibrated",
+          "language_model.layers.19.attn.q_norm": "ineligible_shape",
+          "language_model.layers.19.attn.wo_a": "uncalibrated",
+          "language_model.layers.19.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.19.attn_norm": "ineligible_shape",
+          "language_model.layers.19.ffn_norm": "ineligible_shape",
+          "language_model.layers.19.ffn.gate": "uncalibrated",
+          "language_model.layers.27.attn.q_norm": "ineligible_shape",
+          "language_model.layers.27.attn.wo_a": "uncalibrated",
+          "language_model.layers.27.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.27.attn_norm": "ineligible_shape",
+          "language_model.layers.27.ffn_norm": "ineligible_shape",
+          "language_model.layers.27.ffn.gate": "uncalibrated",
+          "language_model.layers.35.attn.q_norm": "ineligible_shape",
+          "language_model.layers.35.attn.wo_a": "uncalibrated",
+          "language_model.layers.35.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.35.attn_norm": "ineligible_shape",
+          "language_model.layers.35.ffn_norm": "ineligible_shape",
+          "language_model.layers.35.ffn.gate": "uncalibrated",
+          "language_model.mtp.2.attn.wq_a": "uncalibrated",
+          "language_model.mtp.2.attn.wq_b": "uncalibrated",
+          "language_model.mtp.2.attn.q_norm": "ineligible_shape",
+          "language_model.mtp.2.attn.wo_a": "uncalibrated",
+          "language_model.mtp.2.attn.wkv": "uncalibrated",
+          "language_model.mtp.2.attn.kv_norm": "ineligible_shape",
+          "language_model.mtp.2.attn.wo_b": "uncalibrated",
+          "language_model.mtp.2.attn_norm": "ineligible_shape",
+          "language_model.mtp.2.ffn_norm": "ineligible_shape",
+          "language_model.mtp.2.ffn.shared_experts.w1": "uncalibrated",
+          "language_model.mtp.2.ffn.shared_experts.w3": "uncalibrated",
+          "language_model.mtp.2.ffn.shared_experts.w2": "uncalibrated",
+          "language_model.mtp.2.ffn.experts.w1": "uncalibrated",
+          "language_model.mtp.2.ffn.experts.w3": "uncalibrated",
+          "language_model.mtp.2.ffn.experts.w2": "uncalibrated",
+          "language_model.mtp.2.ffn.gate": "uncalibrated",
+          "language_model.mtp.2.norm": "ineligible_shape",
+          "language_model.mtp.2.markov_head.embed": "uncalibrated",
+          "language_model.mtp.2.markov_head.head": "uncalibrated",
+          "language_model.mtp.2.confidence_head.proj": "uncalibrated",
+          "language_model.layers.4.attn.q_norm": "ineligible_shape",
+          "language_model.layers.4.attn.wo_a": "uncalibrated",
+          "language_model.layers.4.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.4.attn_norm": "ineligible_shape",
+          "language_model.layers.4.ffn_norm": "ineligible_shape",
+          "language_model.layers.4.ffn.gate": "uncalibrated",
+          "language_model.layers.12.attn.q_norm": "ineligible_shape",
+          "language_model.layers.12.attn.wo_a": "uncalibrated",
+          "language_model.layers.12.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.12.attn_norm": "ineligible_shape",
+          "language_model.layers.12.ffn_norm": "ineligible_shape",
+          "language_model.layers.12.ffn.gate": "uncalibrated",
+          "language_model.layers.20.attn.q_norm": "ineligible_shape",
+          "language_model.layers.20.attn.wo_a": "uncalibrated",
+          "language_model.layers.20.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.20.attn.compressor.norm": "ineligible_shape",
+          "language_model.layers.20.attn.indexer.k_norm": "ineligible_shape",
+          "language_model.layers.20.attn_norm": "ineligible_shape",
+          "language_model.layers.20.ffn_norm": "ineligible_shape",
+          "language_model.layers.20.ffn.gate": "uncalibrated",
+          "language_model.layers.28.attn.q_norm": "ineligible_shape",
+          "language_model.layers.28.attn.wo_a": "uncalibrated",
+          "language_model.layers.28.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.28.attn_norm": "ineligible_shape",
+          "language_model.layers.28.ffn_norm": "ineligible_shape",
+          "language_model.layers.28.ffn.gate": "uncalibrated",
+          "language_model.layers.36.attn.q_norm": "ineligible_shape",
+          "language_model.layers.36.attn.wo_a": "uncalibrated",
+          "language_model.layers.36.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.36.attn_norm": "ineligible_shape",
+          "language_model.layers.36.ffn_norm": "ineligible_shape",
+          "language_model.layers.36.ffn.gate": "uncalibrated",
+          "language_model.layers.5.attn.q_norm": "ineligible_shape",
+          "language_model.layers.5.attn.wo_a": "uncalibrated",
+          "language_model.layers.5.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.5.attn_norm": "ineligible_shape",
+          "language_model.layers.5.ffn_norm": "ineligible_shape",
+          "language_model.layers.5.ffn.gate": "uncalibrated",
+          "language_model.layers.13.attn.q_norm": "ineligible_shape",
+          "language_model.layers.13.attn.wo_a": "uncalibrated",
+          "language_model.layers.13.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.13.attn_norm": "ineligible_shape",
+          "language_model.layers.13.ffn_norm": "ineligible_shape",
+          "language_model.layers.13.ffn.gate": "uncalibrated",
+          "language_model.layers.21.attn.q_norm": "ineligible_shape",
+          "language_model.layers.21.attn.wo_a": "uncalibrated",
+          "language_model.layers.21.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.21.attn_norm": "ineligible_shape",
+          "language_model.layers.21.ffn_norm": "ineligible_shape",
+          "language_model.layers.21.ffn.gate": "uncalibrated",
+          "language_model.layers.29.attn.q_norm": "ineligible_shape",
+          "language_model.layers.29.attn.wo_a": "uncalibrated",
+          "language_model.layers.29.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.29.attn_norm": "ineligible_shape",
+          "language_model.layers.29.ffn_norm": "ineligible_shape",
+          "language_model.layers.29.ffn.gate": "uncalibrated",
+          "language_model.layers.37.attn.q_norm": "ineligible_shape",
+          "language_model.layers.37.attn.wo_a": "uncalibrated",
+          "language_model.layers.37.attn.kv_norm": "ineligible_shape",
+          "language_model.layers.37.attn_norm": "ineligible_shape",
+          "language_model.layers.37.ffn_norm": "ineligible_shape",
+          "language_model.layers.37.ffn.gate": "uncalibrated"
+        },
+        "unobserved_experts": {
+          "language_model.layers.24.ffn.experts.w1": [
+            350
+          ],
+          "language_model.layers.24.ffn.experts.w3": [
+            350
+          ],
+          "language_model.layers.24.ffn.experts.w2": [
+            350
+          ],
+          "language_model.layers.18.ffn.experts.w1": [
+            197
+          ],
+          "language_model.layers.18.ffn.experts.w3": [
+            197
+          ],
+          "language_model.layers.18.ffn.experts.w2": [
+            197
+          ],
+          "language_model.layers.21.ffn.experts.w1": [
+            207
+          ],
+          "language_model.layers.21.ffn.experts.w3": [
+            207
+          ],
+          "language_model.layers.21.ffn.experts.w2": [
+            207
+          ]
+        },
+        "unobserved_expert_policy": "uniform_importance_at_allocated_bits",
+        "imatrix_cache_path": "/Users/jun/tmp/dsv41-1017/.oqe_imatrix/DeepSeek-V4.1-Flash-1017-cbad4cbaf011-s128-l512.npz",
+        "imatrix_cache_reused": true,
+        "expert_coverage": {
+          "has_expert_counts": true,
+          "expert_modules": 120,
+          "total_experts": 46080,
+          "active_experts": 46071,
+          "zero_count_experts": 9,
+          "active_ratio": 0.9998046875,
+          "min_count": 0,
+          "p05_count": 1299.800000000001,
+          "p10_count": 1909.0,
+          "median_count": 5947.5,
+          "max_count": 228785,
+          "min_required_count": 16,
+          "required_percentile": 5
+        },
+        "sensitivity": {
+          "0": 0.04474417029199872,
+          "1": 0.04030139388663488,
+          "2": 0.051570368923974264,
+          "3": 0.042997408942025785,
+          "4": 0.05462212620017427,
+          "5": 0.06137342778179467,
+          "6": 0.08405816019269183,
+          "7": 0.07375746087963812,
+          "8": 0.03678644640148044,
+          "9": 0.04378628861036251,
+          "10": 0.049803465908909494,
+          "11": 0.06649895549583208,
+          "12": 0.06658138064246069,
+          "13": 0.06309647293682716,
+          "14": 0.09755579907566302,
+          "15": 0.14034614984753943,
+          "16": 0.09078184107376286,
+          "17": 0.09465632928752075,
+          "18": 0.11515719875093787,
+          "19": 0.06951975104970937,
+          "20": 0.024990038299969514,
+          "21": 0.05878319073044939,
+          "22": 0.036104776418096236,
+          "23": 0.042393698306544096,
+          "24": 0.03223544086267966,
+          "25": 0.048752819546282584,
+          "26": 0.07859850071092067,
+          "27": 0.02744375917964441,
+          "28": 0.03615902797382722,
+          "29": 0.03304770205761812,
+          "30": 0.023750207118439528,
+          "31": 0.04023848409135159,
+          "32": 0.04117495800868515,
+          "33": 0.03707175956374652,
+          "34": 0.055374970527803845,
+          "35": 0.044039960546329686,
+          "36": 0.0574832131996394,
+          "37": 0.043055112847425664,
+          "38": 0.04910777390802342,
+          "39": 0.3314371912206845
+        },
+        "calibration_model": "/Users/jun/tmp/dsv41-1017/DeepSeek-V4.1-Flash-1017",
+        "uncalibrated_policy": "preserve_source_precision"
+      },
+      "imatrix_applied_modules": [
+        "language_model.layers.6.attn.wq_a",
+        "language_model.layers.6.attn.wq_b",
+        "language_model.layers.6.attn.wkv",
+        "language_model.layers.6.attn.wo_b",
+        "language_model.layers.6.ffn.shared_experts.w1",
+        "language_model.layers.6.ffn.shared_experts.w3",
+        "language_model.layers.6.ffn.shared_experts.w2",
+        "language_model.layers.6.ffn.experts.w1",
+        "language_model.layers.6.ffn.experts.w3",
+        "language_model.layers.6.ffn.experts.w2",
+        "language_model.layers.14.attn.wq_a",
+        "language_model.layers.14.attn.wq_b",
+        "language_model.layers.14.attn.wkv",
+        "language_model.layers.14.attn.compressor.wkv",
+        "language_model.layers.14.attn.compressor.wgate",
+        "language_model.layers.14.attn.indexer.wq_b",
+        "language_model.layers.14.attn.indexer.weights_proj",
+        "language_model.layers.14.attn.indexer.wk",
+        "language_model.layers.14.attn.wo_b",
+        "language_model.layers.14.ffn.shared_experts.w1",
+        "language_model.layers.14.ffn.shared_experts.w3",
+        "language_model.layers.14.ffn.shared_experts.w2",
+        "language_model.layers.14.ffn.experts.w1",
+        "language_model.layers.14.ffn.experts.w3",
+        "language_model.layers.14.ffn.experts.w2",
+        "language_model.layers.22.attn.wq_a",
+        "language_model.layers.22.attn.wq_b",
+        "language_model.layers.22.attn.wkv",
+        "language_model.layers.22.attn.wo_b",
+        "language_model.layers.22.ffn.shared_experts.w1",
+        "language_model.layers.22.ffn.shared_experts.w3",
+        "language_model.layers.22.ffn.shared_experts.w2",
+        "language_model.layers.22.ffn.experts.w1",
+        "language_model.layers.22.ffn.experts.w3",
+        "language_model.layers.22.ffn.experts.w2",
+        "language_model.layers.30.attn.wq_a",
+        "language_model.layers.30.attn.wq_b",
+        "language_model.layers.30.attn.wkv",
+        "language_model.layers.30.attn.wo_b",
+        "language_model.layers.30.ffn.shared_experts.w1",
+        "language_model.layers.30.ffn.shared_experts.w3",
+        "language_model.layers.30.ffn.shared_experts.w2",
+        "language_model.layers.30.ffn.experts.w1",
+        "language_model.layers.30.ffn.experts.w3",
+        "language_model.layers.30.ffn.experts.w2",
+        "language_model.layers.38.attn.wq_a",
+        "language_model.layers.38.attn.wq_b",
+        "language_model.layers.38.attn.wkv",
+        "language_model.layers.38.attn.wo_b",
+        "language_model.layers.38.ffn.shared_experts.w1",
+        "language_model.layers.38.ffn.shared_experts.w3",
+        "language_model.layers.38.ffn.shared_experts.w2",
+        "language_model.layers.38.ffn.experts.w1",
+        "language_model.layers.38.ffn.experts.w3",
+        "language_model.layers.38.ffn.experts.w2",
+        "language_model.layers.7.attn.wq_a",
+        "language_model.layers.7.attn.wq_b",
+        "language_model.layers.7.attn.wkv",
+        "language_model.layers.7.attn.wo_b",
+        "language_model.layers.7.ffn.shared_experts.w1",
+        "language_model.layers.7.ffn.shared_experts.w3",
+        "language_model.layers.7.ffn.shared_experts.w2",
+        "language_model.layers.7.ffn.experts.w1",
+        "language_model.layers.7.ffn.experts.w3",
+        "language_model.layers.7.ffn.experts.w2",
+        "language_model.layers.15.attn.wq_a",
+        "language_model.layers.15.attn.wq_b",
+        "language_model.layers.15.attn.wkv",
+        "language_model.layers.15.attn.wo_b",
+        "language_model.layers.15.ffn.shared_experts.w1",
+        "language_model.layers.15.ffn.shared_experts.w3",
+        "language_model.layers.15.ffn.shared_experts.w2",
+        "language_model.layers.15.ffn.experts.w1",
+        "language_model.layers.15.ffn.experts.w3",
+        "language_model.layers.15.ffn.experts.w2",
+        "language_model.layers.23.attn.wq_a",
+        "language_model.layers.23.attn.wq_b",
+        "language_model.layers.23.attn.wkv",
+        "language_model.layers.23.attn.wo_b",
+        "language_model.layers.23.ffn.shared_experts.w1",
+        "language_model.layers.23.ffn.shared_experts.w3",
+        "language_model.layers.23.ffn.shared_experts.w2",
+        "language_model.layers.23.ffn.experts.w1",
+        "language_model.layers.23.ffn.experts.w3",
+        "language_model.layers.23.ffn.experts.w2",
+        "language_model.layers.31.attn.wq_a",
+        "language_model.layers.31.attn.wq_b",
+        "language_model.layers.31.attn.wkv",
+        "language_model.layers.31.attn.wo_b",
+        "language_model.layers.31.ffn.shared_experts.w1",
+        "language_model.layers.31.ffn.shared_experts.w3",
+        "language_model.layers.31.ffn.shared_experts.w2",
+        "language_model.layers.31.ffn.experts.w1",
+        "language_model.layers.31.ffn.experts.w3",
+        "language_model.layers.31.ffn.experts.w2",
+        "language_model.layers.39.attn.wq_a",
+        "language_model.layers.39.attn.wq_b",
+        "language_model.layers.39.attn.wkv",
+        "language_model.layers.39.attn.wo_b",
+        "language_model.layers.39.ffn.shared_experts.w1",
+        "language_model.layers.39.ffn.shared_experts.w3",
+        "language_model.layers.39.ffn.shared_experts.w2",
+        "language_model.layers.39.ffn.experts.w1",
+        "language_model.layers.39.ffn.experts.w3",
+        "language_model.layers.39.ffn.experts.w2",
+        "language_model.layers.0.attn.wq_a",
+        "language_model.layers.0.attn.wq_b",
+        "language_model.layers.0.attn.wkv",
+        "language_model.layers.0.attn.wo_b",
+        "language_model.layers.0.ffn.shared_experts.w1",
+        "language_model.layers.0.ffn.shared_experts.w3",
+        "language_model.layers.0.ffn.shared_experts.w2",
+        "language_model.layers.0.ffn.experts.w1",
+        "language_model.layers.0.ffn.experts.w3",
+        "language_model.layers.0.ffn.experts.w2",
+        "language_model.layers.8.attn.wq_a",
+        "language_model.layers.8.attn.wq_b",
+        "language_model.layers.8.attn.wkv",
+        "language_model.layers.8.attn.compressor.wkv",
+        "language_model.layers.8.attn.compressor.wgate",
+        "language_model.layers.8.attn.indexer.wq_b",
+        "language_model.layers.8.attn.indexer.weights_proj",
+        "language_model.layers.8.attn.indexer.wk",
+        "language_model.layers.8.attn.wo_b",
+        "language_model.layers.8.ffn.shared_experts.w1",
+        "language_model.layers.8.ffn.shared_experts.w3",
+        "language_model.layers.8.ffn.shared_experts.w2",
+        "language_model.layers.8.ffn.experts.w1",
+        "language_model.layers.8.ffn.experts.w3",
+        "language_model.layers.8.ffn.experts.w2",
+        "language_model.layers.16.attn.wq_a",
+        "language_model.layers.16.attn.wq_b",
+        "language_model.layers.16.attn.wkv",
+        "language_model.layers.16.attn.wo_b",
+        "language_model.layers.16.ffn.shared_experts.w1",
+        "language_model.layers.16.ffn.shared_experts.w3",
+        "language_model.layers.16.ffn.shared_experts.w2",
+        "language_model.layers.16.ffn.experts.w1",
+        "language_model.layers.16.ffn.experts.w3",
+        "language_model.layers.16.ffn.experts.w2",
+        "language_model.layers.24.attn.wq_a",
+        "language_model.layers.24.attn.wq_b",
+        "language_model.layers.24.attn.wkv",
+        "language_model.layers.24.attn.indexer.wq_b",
+        "language_model.layers.24.attn.indexer.weights_proj",
+        "language_model.layers.24.attn.wo_b",
+        "language_model.layers.24.ffn.shared_experts.w1",
+        "language_model.layers.24.ffn.shared_experts.w3",
+        "language_model.layers.24.ffn.shared_experts.w2",
+        "language_model.layers.24.ffn.experts.w1",
+        "language_model.layers.24.ffn.experts.w3",
+        "language_model.layers.24.ffn.experts.w2",
+        "language_model.layers.32.attn.wq_a",
+        "language_model.layers.32.attn.wq_b",
+        "language_model.layers.32.attn.wkv",
+        "language_model.layers.32.attn.indexer.wq_b",
+        "language_model.layers.32.attn.indexer.weights_proj",
+        "language_model.layers.32.attn.wo_b",
+        "language_model.layers.32.ffn.shared_experts.w1",
+        "language_model.layers.32.ffn.shared_experts.w3",
+        "language_model.layers.32.ffn.shared_experts.w2",
+        "language_model.layers.32.ffn.experts.w1",
+        "language_model.layers.32.ffn.experts.w3",
+        "language_model.layers.32.ffn.experts.w2",
+        "language_model.layers.1.attn.wq_a",
+        "language_model.layers.1.attn.wq_b",
+        "language_model.layers.1.attn.wkv",
+        "language_model.layers.1.attn.wo_b",
+        "language_model.layers.1.ffn.shared_experts.w1",
+        "language_model.layers.1.ffn.shared_experts.w3",
+        "language_model.layers.1.ffn.shared_experts.w2",
+        "language_model.layers.1.ffn.experts.w1",
+        "language_model.layers.1.ffn.experts.w3",
+        "language_model.layers.1.ffn.experts.w2",
+        "language_model.layers.9.attn.wq_a",
+        "language_model.layers.9.attn.wq_b",
+        "language_model.layers.9.attn.wkv",
+        "language_model.layers.9.attn.wo_b",
+        "language_model.layers.9.ffn.shared_experts.w1",
+        "language_model.layers.9.ffn.shared_experts.w3",
+        "language_model.layers.9.ffn.shared_experts.w2",
+        "language_model.layers.9.ffn.experts.w1",
+        "language_model.layers.9.ffn.experts.w3",
+        "language_model.layers.9.ffn.experts.w2",
+        "language_model.layers.17.attn.wq_a",
+        "language_model.layers.17.attn.wq_b",
+        "language_model.layers.17.attn.wkv",
+        "language_model.layers.17.attn.wo_b",
+        "language_model.layers.17.ffn.shared_experts.w1",
+        "language_model.layers.17.ffn.shared_experts.w3",
+        "language_model.layers.17.ffn.shared_experts.w2",
+        "language_model.layers.17.ffn.experts.w1",
+        "language_model.layers.17.ffn.experts.w3",
+        "language_model.layers.17.ffn.experts.w2",
+        "language_model.layers.25.attn.wq_a",
+        "language_model.layers.25.attn.wq_b",
+        "language_model.layers.25.attn.wkv",
+        "language_model.layers.25.attn.wo_b",
+        "language_model.layers.25.ffn.shared_experts.w1",
+        "language_model.layers.25.ffn.shared_experts.w3",
+        "language_model.layers.25.ffn.shared_experts.w2",
+        "language_model.layers.25.ffn.experts.w1",
+        "language_model.layers.25.ffn.experts.w3",
+        "language_model.layers.25.ffn.experts.w2",
+        "language_model.layers.33.attn.wq_a",
+        "language_model.layers.33.attn.wq_b",
+        "language_model.layers.33.attn.wkv",
+        "language_model.layers.33.attn.wo_b",
+        "language_model.layers.33.ffn.shared_experts.w1",
+        "language_model.layers.33.ffn.shared_experts.w3",
+        "language_model.layers.33.ffn.shared_experts.w2",
+        "language_model.layers.33.ffn.experts.w1",
+        "language_model.layers.33.ffn.experts.w3",
+        "language_model.layers.33.ffn.experts.w2",
+        "language_model.layers.2.attn.wq_a",
+        "language_model.layers.2.attn.wq_b",
+        "language_model.layers.2.attn.wkv",
+        "language_model.layers.2.attn.compressor.wkv",
+        "language_model.layers.2.attn.compressor.wgate",
+        "language_model.layers.2.attn.indexer.wq_b",
+        "language_model.layers.2.attn.indexer.weights_proj",
+        "language_model.layers.2.attn.indexer.wk",
+        "language_model.layers.2.attn.wo_b",
+        "language_model.layers.2.ffn.shared_experts.w1",
+        "language_model.layers.2.ffn.shared_experts.w3",
+        "language_model.layers.2.ffn.shared_experts.w2",
+        "language_model.layers.2.ffn.experts.w1",
+        "language_model.layers.2.ffn.experts.w3",
+        "language_model.layers.2.ffn.experts.w2",
+        "language_model.layers.10.attn.wq_a",
+        "language_model.layers.10.attn.wq_b",
+        "language_model.layers.10.attn.wkv",
+        "language_model.layers.10.attn.wo_b",
+        "language_model.layers.10.ffn.shared_experts.w1",
+        "language_model.layers.10.ffn.shared_experts.w3",
+        "language_model.layers.10.ffn.shared_experts.w2",
+        "language_model.layers.10.ffn.experts.w1",
+        "language_model.layers.10.ffn.experts.w3",
+        "language_model.layers.10.ffn.experts.w2",
+        "language_model.layers.18.attn.wq_a",
+        "language_model.layers.18.attn.wq_b",
+        "language_model.layers.18.attn.wkv",
+        "language_model.layers.18.attn.wo_b",
+        "language_model.layers.18.ffn.shared_experts.w1",
+        "language_model.layers.18.ffn.shared_experts.w3",
+        "language_model.layers.18.ffn.shared_experts.w2",
+        "language_model.layers.18.ffn.experts.w1",
+        "language_model.layers.18.ffn.experts.w3",
+        "language_model.layers.18.ffn.experts.w2",
+        "language_model.layers.26.attn.wq_a",
+        "language_model.layers.26.attn.wq_b",
+        "language_model.layers.26.attn.wkv",
+        "language_model.layers.26.attn.wo_b",
+        "language_model.layers.26.ffn.shared_experts.w1",
+        "language_model.layers.26.ffn.shared_experts.w3",
+        "language_model.layers.26.ffn.shared_experts.w2",
+        "language_model.layers.26.ffn.experts.w1",
+        "language_model.layers.26.ffn.experts.w3",
+        "language_model.layers.26.ffn.experts.w2",
+        "language_model.layers.34.attn.wq_a",
+        "language_model.layers.34.attn.wq_b",
+        "language_model.layers.34.attn.wkv",
+        "language_model.layers.34.attn.wo_b",
+        "language_model.layers.34.ffn.shared_experts.w1",
+        "language_model.layers.34.ffn.shared_experts.w3",
+        "language_model.layers.34.ffn.shared_experts.w2",
+        "language_model.layers.34.ffn.experts.w1",
+        "language_model.layers.34.ffn.experts.w3",
+        "language_model.layers.34.ffn.experts.w2",
+        "language_model.layers.3.attn.wq_a",
+        "language_model.layers.3.attn.wq_b",
+        "language_model.layers.3.attn.wkv",
+        "language_model.layers.3.attn.wo_b",
+        "language_model.layers.3.ffn.shared_experts.w1",
+        "language_model.layers.3.ffn.shared_experts.w3",
+        "language_model.layers.3.ffn.shared_experts.w2",
+        "language_model.layers.3.ffn.experts.w1",
+        "language_model.layers.3.ffn.experts.w3",
+        "language_model.layers.3.ffn.experts.w2",
+        "language_model.layers.11.attn.wq_a",
+        "language_model.layers.11.attn.wq_b",
+        "language_model.layers.11.attn.wkv",
+        "language_model.layers.11.attn.wo_b",
+        "language_model.layers.11.ffn.shared_experts.w1",
+        "language_model.layers.11.ffn.shared_experts.w3",
+        "language_model.layers.11.ffn.shared_experts.w2",
+        "language_model.layers.11.ffn.experts.w1",
+        "language_model.layers.11.ffn.experts.w3",
+        "language_model.layers.11.ffn.experts.w2",
+        "language_model.layers.19.attn.wq_a",
+        "language_model.layers.19.attn.wq_b",
+        "language_model.layers.19.attn.wkv",
+        "language_model.layers.19.attn.wo_b",
+        "language_model.layers.19.ffn.shared_experts.w1",
+        "language_model.layers.19.ffn.shared_experts.w3",
+        "language_model.layers.19.ffn.shared_experts.w2",
+        "language_model.layers.19.ffn.experts.w1",
+        "language_model.layers.19.ffn.experts.w3",
+        "language_model.layers.19.ffn.experts.w2",
+        "language_model.layers.27.attn.wq_a",
+        "language_model.layers.27.attn.wq_b",
+        "language_model.layers.27.attn.wkv",
+        "language_model.layers.27.attn.wo_b",
+        "language_model.layers.27.ffn.shared_experts.w1",
+        "language_model.layers.27.ffn.shared_experts.w3",
+        "language_model.layers.27.ffn.shared_experts.w2",
+        "language_model.layers.27.ffn.experts.w1",
+        "language_model.layers.27.ffn.experts.w3",
+        "language_model.layers.27.ffn.experts.w2",
+        "language_model.layers.35.attn.wq_a",
+        "language_model.layers.35.attn.wq_b",
+        "language_model.layers.35.attn.wkv",
+        "language_model.layers.35.attn.wo_b",
+        "language_model.layers.35.ffn.shared_experts.w1",
+        "language_model.layers.35.ffn.shared_experts.w3",
+        "language_model.layers.35.ffn.shared_experts.w2",
+        "language_model.layers.35.ffn.experts.w1",
+        "language_model.layers.35.ffn.experts.w3",
+        "language_model.layers.35.ffn.experts.w2",
+        "language_model.layers.4.attn.wq_a",
+        "language_model.layers.4.attn.wq_b",
+        "language_model.layers.4.attn.wkv",
+        "language_model.layers.4.attn.wo_b",
+        "language_model.layers.4.ffn.shared_experts.w1",
+        "language_model.layers.4.ffn.shared_experts.w3",
+        "language_model.layers.4.ffn.shared_experts.w2",
+        "language_model.layers.4.ffn.experts.w1",
+        "language_model.layers.4.ffn.experts.w3",
+        "language_model.layers.4.ffn.experts.w2",
+        "language_model.layers.12.attn.wq_a",
+        "language_model.layers.12.attn.wq_b",
+        "language_model.layers.12.attn.wkv",
+        "language_model.layers.12.attn.wo_b",
+        "language_model.layers.12.ffn.shared_experts.w1",
+        "language_model.layers.12.ffn.shared_experts.w3",
+        "language_model.layers.12.ffn.shared_experts.w2",
+        "language_model.layers.12.ffn.experts.w1",
+        "language_model.layers.12.ffn.experts.w3",
+        "language_model.layers.12.ffn.experts.w2",
+        "language_model.layers.20.attn.wq_a",
+        "language_model.layers.20.attn.wq_b",
+        "language_model.layers.20.attn.wkv",
+        "language_model.layers.20.attn.compressor.wkv",
+        "language_model.layers.20.attn.indexer.wq_b",
+        "language_model.layers.20.attn.indexer.weights_proj",
+        "language_model.layers.20.attn.indexer.wk",
+        "language_model.layers.20.attn.wo_b",
+        "language_model.layers.20.ffn.shared_experts.w1",
+        "language_model.layers.20.ffn.shared_experts.w3",
+        "language_model.layers.20.ffn.shared_experts.w2",
+        "language_model.layers.20.ffn.experts.w1",
+        "language_model.layers.20.ffn.experts.w3",
+        "language_model.layers.20.ffn.experts.w2",
+        "language_model.layers.28.attn.wq_a",
+        "language_model.layers.28.attn.wq_b",
+        "language_model.layers.28.attn.wkv",
+        "language_model.layers.28.attn.indexer.wq_b",
+        "language_model.layers.28.attn.indexer.weights_proj",
+        "language_model.layers.28.attn.wo_b",
+        "language_model.layers.28.ffn.shared_experts.w1",
+        "language_model.layers.28.ffn.shared_experts.w3",
+        "language_model.layers.28.ffn.shared_experts.w2",
+        "language_model.layers.28.ffn.experts.w1",
+        "language_model.layers.28.ffn.experts.w3",
+        "language_model.layers.28.ffn.experts.w2",
+        "language_model.layers.36.attn.wq_a",
+        "language_model.layers.36.attn.wq_b",
+        "language_model.layers.36.attn.wkv",
+        "language_model.layers.36.attn.indexer.wq_b",
+        "language_model.layers.36.attn.indexer.weights_proj",
+        "language_model.layers.36.attn.wo_b",
+        "language_model.layers.36.ffn.shared_experts.w1",
+        "language_model.layers.36.ffn.shared_experts.w3",
+        "language_model.layers.36.ffn.shared_experts.w2",
+        "language_model.layers.36.ffn.experts.w1",
+        "language_model.layers.36.ffn.experts.w3",
+        "language_model.layers.36.ffn.experts.w2",
+        "language_model.layers.5.attn.wq_a",
+        "language_model.layers.5.attn.wq_b",
+        "language_model.layers.5.attn.wkv",
+        "language_model.layers.5.attn.wo_b",
+        "language_model.layers.5.ffn.shared_experts.w1",
+        "language_model.layers.5.ffn.shared_experts.w3",
+        "language_model.layers.5.ffn.shared_experts.w2",
+        "language_model.layers.5.ffn.experts.w1",
+        "language_model.layers.5.ffn.experts.w3",
+        "language_model.layers.5.ffn.experts.w2",
+        "language_model.layers.13.attn.wq_a",
+        "language_model.layers.13.attn.wq_b",
+        "language_model.layers.13.attn.wkv",
+        "language_model.layers.13.attn.wo_b",
+        "language_model.layers.13.ffn.shared_experts.w1",
+        "language_model.layers.13.ffn.shared_experts.w3",
+        "language_model.layers.13.ffn.shared_experts.w2",
+        "language_model.layers.13.ffn.experts.w1",
+        "language_model.layers.13.ffn.experts.w3",
+        "language_model.layers.13.ffn.experts.w2",
+        "language_model.layers.21.attn.wq_a",
+        "language_model.layers.21.attn.wq_b",
+        "language_model.layers.21.attn.wkv",
+        "language_model.layers.21.attn.wo_b",
+        "language_model.layers.21.ffn.shared_experts.w1",
+        "language_model.layers.21.ffn.shared_experts.w3",
+        "language_model.layers.21.ffn.shared_experts.w2",
+        "language_model.layers.21.ffn.experts.w1",
+        "language_model.layers.21.ffn.experts.w3",
+        "language_model.layers.21.ffn.experts.w2",
+        "language_model.layers.29.attn.wq_a",
+        "language_model.layers.29.attn.wq_b",
+        "language_model.layers.29.attn.wkv",
+        "language_model.layers.29.attn.wo_b",
+        "language_model.layers.29.ffn.shared_experts.w1",
+        "language_model.layers.29.ffn.shared_experts.w3",
+        "language_model.layers.29.ffn.shared_experts.w2",
+        "language_model.layers.29.ffn.experts.w1",
+        "language_model.layers.29.ffn.experts.w3",
+        "language_model.layers.29.ffn.experts.w2",
+        "language_model.layers.37.attn.wq_a",
+        "language_model.layers.37.attn.wq_b",
+        "language_model.layers.37.attn.wkv",
+        "language_model.layers.37.attn.wo_b",
+        "language_model.layers.37.ffn.shared_experts.w1",
+        "language_model.layers.37.ffn.shared_experts.w3",
+        "language_model.layers.37.ffn.shared_experts.w2",
+        "language_model.layers.37.ffn.experts.w1",
+        "language_model.layers.37.ffn.experts.w3",
+        "language_model.layers.37.ffn.experts.w2"
+      ],
+      "storage_layout": "unified_safetensors_index",
+      "shard_count": 53
+    }
+  }
+}

@@ -1,0 +1,733 @@
+{
+ "format": "mlx-stream-mimo-kernels-v1",
+ "headers": [
+  {
+   "bytes": 2282,
+   "file": "header_mimo_prefill_combine.metal",
+   "id": "mimo_prefill_combine",
+   "sha256": "02fe76aebf00d52c9da4b8b89e32fac1b1b8358f1d9e462b7bb222cbbb486005"
+  }
+ ],
+ "kernels": [
+  {
+   "atomic_outputs": false,
+   "class": "exact (the stock reduction tile's Metal fold: f32 products, +0 init, k = 0..7, bf16 once)",
+   "donor": "mlx-stream src/kernels/exl3/dsv41_jl_combine_bf16.metal (JOINLESS: 24 (source, row) slots, the arithmetic contract only); geometry derived for MiMo H = 4096, TOPK = 8",
+   "ensure_row_contiguous": true,
+   "family": "mimo_prefill_combine",
+   "header": {
+    "id": "mimo_prefill_combine"
+   },
+   "inputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "s0",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r0"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s1",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r1"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s2",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r2"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s3",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r3"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s4",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r4"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s5",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r5"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s6",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r6"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s7",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r7"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s8",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r8"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s9",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r9"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s10",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r10"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s11",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r11"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s12",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r12"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s13",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r13"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s14",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r14"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s15",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r15"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s16",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r16"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s17",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r17"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s18",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r18"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s19",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r19"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s20",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r20"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s21",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r21"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s22",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r22"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "bfloat16",
+     "name": "s23",
+     "shape": [
+      {
+       "m": 1,
+       "v": "r23"
+      },
+      {
+       "m": 4096
+      }
+     ]
+    },
+    {
+     "dtype": "int32",
+     "name": "loc",
+     "shape": [
+      {
+       "m": 1,
+       "v": "n"
+      },
+      {
+       "m": 8
+      },
+      {
+       "m": 2
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "w",
+     "shape": [
+      {
+       "m": 1,
+       "v": "n"
+      },
+      {
+       "m": 8
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      7168,
+      1,
+      1
+     ],
+     "note": "grid (n x H/4): 4 columns per thread, 256 threads = 1,024 columns of one token per threadgroup",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       7,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "TOPK"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "n",
+       "value": 7
+      }
+     ]
+    },
+    {
+     "grid": [
+      1061888,
+      1,
+      1
+     ],
+     "note": "one 1,024-token gather tile plus a 13-token tail, as one launch",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       1037,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "TOPK"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "n",
+       "value": 1037
+      }
+     ]
+    },
+    {
+     "grid": [
+      16777216,
+      1,
+      1
+     ],
+     "note": "the std-16k prompt pass: one launch per routed layer",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       16384,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "TOPK"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "n",
+       "value": 16384
+      }
+     ]
+    }
+   ],
+   "name": "mimo_prefill_combine",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "prefill",
+   "source": {
+    "bytes": 1087,
+    "file": "mimo_prefill_combine.metal",
+    "sha256": "7b0f9aa388d0608ac7653545a19e5f97d886067b39f7fb1f812439499e8cf81f"
+   },
+   "vars": [
+    {
+     "hi": 16384,
+     "lo": 2,
+     "name": "n"
+    },
+    {
+     "lo": 1,
+     "name": "r0"
+    },
+    {
+     "lo": 1,
+     "name": "r1"
+    },
+    {
+     "lo": 1,
+     "name": "r2"
+    },
+    {
+     "lo": 1,
+     "name": "r3"
+    },
+    {
+     "lo": 1,
+     "name": "r4"
+    },
+    {
+     "lo": 1,
+     "name": "r5"
+    },
+    {
+     "lo": 1,
+     "name": "r6"
+    },
+    {
+     "lo": 1,
+     "name": "r7"
+    },
+    {
+     "lo": 1,
+     "name": "r8"
+    },
+    {
+     "lo": 1,
+     "name": "r9"
+    },
+    {
+     "lo": 1,
+     "name": "r10"
+    },
+    {
+     "lo": 1,
+     "name": "r11"
+    },
+    {
+     "lo": 1,
+     "name": "r12"
+    },
+    {
+     "lo": 1,
+     "name": "r13"
+    },
+    {
+     "lo": 1,
+     "name": "r14"
+    },
+    {
+     "lo": 1,
+     "name": "r15"
+    },
+    {
+     "lo": 1,
+     "name": "r16"
+    },
+    {
+     "lo": 1,
+     "name": "r17"
+    },
+    {
+     "lo": 1,
+     "name": "r18"
+    },
+    {
+     "lo": 1,
+     "name": "r19"
+    },
+    {
+     "lo": 1,
+     "name": "r20"
+    },
+    {
+     "lo": 1,
+     "name": "r21"
+    },
+    {
+     "lo": 1,
+     "name": "r22"
+    },
+    {
+     "lo": 1,
+     "name": "r23"
+    }
+   ]
+  },
+  {
+   "atomic_outputs": false,
+   "class": "exact (the same text and fold as mimo_prefill_combine; its sources read through a table of GPU addresses)",
+   "donor": "mimo_prefill_combine (this manifest): the same source file, its 24 bound sources replaced by `tbl` at construction (prefill_combine.zig tableText)",
+   "ensure_row_contiguous": true,
+   "family": "mimo_prefill_combine",
+   "header": {
+    "id": "mimo_prefill_combine"
+   },
+   "inputs": [
+    {
+     "dtype": "uint64",
+     "name": "tbl",
+     "shape": [
+      {
+       "m": 1,
+       "v": "n_src"
+      }
+     ]
+    },
+    {
+     "dtype": "int32",
+     "name": "loc",
+     "shape": [
+      {
+       "m": 1,
+       "v": "n"
+      },
+      {
+       "m": 8
+      },
+      {
+       "m": 2
+      }
+     ]
+    },
+    {
+     "dtype": "float32",
+     "name": "w",
+     "shape": [
+      {
+       "m": 1,
+       "v": "n"
+      },
+      {
+       "m": 8
+      }
+     ]
+    }
+   ],
+   "launch_samples": [
+    {
+     "grid": [
+      16777216,
+      1,
+      1
+     ],
+     "note": "the std-16k prompt pass: one launch per routed layer",
+     "output_dtypes": [
+      "bfloat16"
+     ],
+     "output_shapes": [
+      [
+       16384,
+       4096
+      ]
+     ],
+     "template": [
+      {
+       "dtype": "bfloat16",
+       "name": "T"
+      },
+      {
+       "int": 8,
+       "name": "TOPK"
+      },
+      {
+       "int": 4096,
+       "name": "H"
+      }
+     ],
+     "threadgroup": [
+      256,
+      1,
+      1
+     ],
+     "vars": [
+      {
+       "name": "n",
+       "value": 16384
+      }
+     ]
+    }
+   ],
+   "name": "mimo_prefill_combine_inplace",
+   "outputs": [
+    {
+     "dtype": "bfloat16",
+     "name": "y"
+    }
+   ],
+   "phase": "prefill",
+   "source": {
+    "bytes": 1087,
+    "file": "mimo_prefill_combine.metal",
+    "sha256": "7b0f9aa388d0608ac7653545a19e5f97d886067b39f7fb1f812439499e8cf81f",
+    "note": "mimo_prefill_combine.metal with every mimo_pc_pick(loc, s0, ..., s23) argument list replaced by `tbl` (comptime)"
+   },
+   "vars": [
+    {
+     "hi": 16384,
+     "lo": 2,
+     "name": "n"
+    },
+    {
+     "hi": 255,
+     "lo": 1,
+     "name": "n_src"
+    }
+   ]
+  }
+ ],
+ "note": "Lever 1 of prefill-attr-20261008: the prompt pass's routed combine read in place from the wide call's <= 24 sources (deepseek_v41_experts.mergeJoinless), replacing the 1,024-token gather tiles, the 256-token reduction tiles and the output concatenate. Unused source slots alias source 0. P7 inplace: the same text over a table of the call's sources' GPU addresses (any number up to 255, none merged).",
+ "port_addenda": []
+}

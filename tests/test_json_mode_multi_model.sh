@@ -1,17 +1,15 @@
 #!/bin/bash
-# Integration test: the JSON grammar mask is built PER MODEL.
+# test_json_mode_multi_model.sh — the JSON grammar mask is built PER MODEL: one server, two resident models,
+# `json_object` + `json_schema` against A then B then A (which model breaks depends on request order). Both must
+# answer parseable JSON, and the log must show one `[grammar] building token-byte table for <id>` line PER id (a
+# shared table logs one).
 #
-# Live 2026-08-11: the token-byte table backing the mask was a process-wide
-# singleton, built from whichever model served the first schema-constrained
-# request. With two models resident (hot switching / multi-model registry) the
-# second one masked its logits with the FIRST one's vocabulary — ids mean
-# different bytes in every vocabulary, so the mask allowed tokens whose real
-# bytes are off-schema and `json_object` answered with "## Attributes".
+#   ./tests/test_json_mode_multi_model.sh [modelA] [modelB] [port]   # default Qwen3.5-0.8B + LFM2.5-2.6B; SKIP without
 #
-# The guard is two-sided: both models must return parseable JSON, and the log
-# must show a table built for EACH id (a shared table logs exactly one build).
+# Hermetic twin: `grammar token-byte table is per MODEL` (model_registry).
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL_A=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
 MODEL_B=${2:-~/.mlx-serve/models/LiquidAI/LFM2.5-2.6B-MLX-mxfp4}
@@ -56,11 +54,7 @@ SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 60); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    if [ "$i" -eq 60 ]; then echo "FAIL: server did not start within 60s"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 || { echo "FAIL: server did not start within 60s"; exit 1; }
 
 run_test() {
     TOTAL=$((TOTAL + 1))

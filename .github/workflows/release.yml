@@ -41,6 +41,7 @@ jobs:
     runs-on: macos-26
     permissions:
       contents: write
+      actions: read # the CI-passed check before the Zig tests
     outputs:
       tag: ${{ steps.version.outputs.tag }}
 
@@ -198,7 +199,7 @@ jobs:
           key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.mlxpin.outputs.submodules }}-${{ steps.mlxpin.outputs.xcode }}
 
       - name: Build mlx-serve (Zig)
-        run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}
+        run: zig build -Doptimize=ReleaseFast -Dstrip -Dversion=${{ steps.version.outputs.version }} -Dgit-sha=${{ github.sha }}
 
       # The Agent Sandbox's guest-side binary (static aarch64-linux ELF). It
       # rides inside the .app at Resources/guest/vz-agent — without it the
@@ -206,6 +207,10 @@ jobs:
       # connect (issue #89: the release bundle shipped without it).
       - name: Build vz-agent guest binary
         run: zig build vz-agent
+
+      # The plugin kit (sdk + abi source, C header, examples, build glue) as a release asset.
+      - name: Build the plugin kit
+        run: zig build kit -Dversion=${{ steps.version.outputs.version }}
 
       - name: Smoke test mlx-serve binary
         run: |
@@ -220,11 +225,27 @@ jobs:
       - name: Verify staged mlx (NAX kernels + minos)
         run: bash tests/test_mlx_staged_nax.sh
 
+      # ci.yml runs the same suite (plus -Dslow-tests) on every push to main; a
+      # release of a commit it already passed skips the second run. A commit CI
+      # has not passed yet (still running, failed, never pushed) runs it here.
+      - name: Check whether CI already passed this commit
+        id: ci_passed
+        if: github.event_name != 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          n=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&event=push&status=success" --jq '.total_count' || echo 0)
+          echo "CI push runs passed on ${{ github.sha }}: ${n:-0}"
+          if [ "${n:-0}" -gt 0 ]; then echo "passed=1" >> "$GITHUB_OUTPUT"; fi
+
       - name: Run Zig tests
         # PR commits already run the identical suite in ci.yml — don't pay for
-        # it twice; releases keep the belt-and-braces run.
-        if: github.event_name != 'pull_request'
+        # it twice.
+        if: github.event_name != 'pull_request' && steps.ci_passed.outputs.passed != '1'
         run: zig build test --summary all
+
+      - name: Plugin kit end to end
+        run: bash tests/test_plugin_kit.sh
 
       # Same cache as ci.yml, own key: this one also holds the release products.
       - name: Cache SwiftPM build
@@ -575,6 +596,7 @@ jobs:
           files: |
             mlx-serve-bin-macos-arm64.tar.gz
             MLX-Serve.dmg
+            zig-out/kit/mlx-serve-plugin-kit-*.tar.gz
 
       - name: Upload PR / dry-run artifacts
         if: ${{ inputs.dry_run || github.event_name == 'pull_request' }}
@@ -586,6 +608,7 @@ jobs:
           path: |
             mlx-serve-bin-macos-arm64.tar.gz
             MLX-Serve.dmg
+            zig-out/kit/mlx-serve-plugin-kit-*.tar.gz
           retention-days: 7
 
   # The Linux/CUDA tarballs are the ones linux.yml already built for this commit

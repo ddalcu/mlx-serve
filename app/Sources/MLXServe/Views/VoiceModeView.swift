@@ -89,7 +89,7 @@ struct VoiceOrbView: View {
     /// talking, otherwise the state — which is also where a mic-permission
     /// failure becomes visible (the old sheet's status text did that job).
     private var caption: some View {
-        Text(L10n.text(controller.partialTranscript.isEmpty ? statusText : controller.partialTranscript))
+        Text(L10n.text(statusText))
             .font(.app(.caption))
             .foregroundStyle(isError ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
             .multilineTextAlignment(.center)
@@ -133,11 +133,15 @@ struct VoiceComposerToggle: View {
     /// session voice is BOUND to (see `VoiceModeController.boundSessionId`).
     var sessionId: UUID?
     var disabled: Bool
+    /// The chat's model hears you itself (LFM3 Audio, Omni): the button takes the purple look.
+    var hears: Bool = false
     /// Starts voice with the surrounding chat's toggles/agent (ChatView's
     /// `startVoiceMode`). Clicking the (off-tinted) toggle in another chat
     /// while voice runs elsewhere MOVES voice here: end + start, adopting this
     /// chat's agent/toggles.
     var start: () -> Void
+
+    private var look: VoiceToggleLook { .for(hears: hears) }
 
     private var ownedHere: Bool {
         VoiceModeController.voiceOwnedHere(isActive: controller.isActive,
@@ -154,19 +158,16 @@ struct VoiceComposerToggle: View {
                 start()
             }
         } label: {
-            Image(systemName: "waveform")
+            Image(systemName: look.symbol)
                 .font(.app(.body, weight: .medium))
-                .foregroundStyle(ownedHere ? Color.white : Color.secondary)
+                .foregroundStyle(ownedHere ? Color.white : (hears ? look.onTint : Color.secondary))
                 .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
-                .background(ownedHere ? Color.accentColor : Color.secondary.opacity(0.15))
+                .background(ownedHere ? look.onTint : (hears ? look.onTint.opacity(0.15) : Color.secondary.opacity(0.15)))
                 .clipShape(Circle())
         }
         .buttonStyle(.plain)
         .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
         .disabled(disabled)
-        .help(L10n.format(
-            "Voice mode (%@) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).",
-            L10n.text(ownedHere ? "ON in this chat" : controller.isActive ? "ON in another chat — click to move it here" : "OFF")
-        ))
+        .help(L10n.text(look.help) + " — " + L10n.text(ownedHere ? "ON in this chat" : controller.isActive ? "ON in another chat — click to move it here" : "OFF"))
     }
 }

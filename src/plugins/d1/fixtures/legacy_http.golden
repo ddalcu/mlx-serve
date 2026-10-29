@@ -1,0 +1,42 @@
+== decision 0 458 3d0fdfb4f0a3a2b021714d7b5eb372d6cc887e84ac8230aa043e9bbda9f37923
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 335
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"model":"m","answers":{"tone":{"type":"choice","choice":"calm","confidence":0.7873,"probabilities":{"calm":0.7873,"angry":0.2127}},"urgency":{"type":"score","score":0.6397,"confidence":0.4628,"probabilities":{"0":0.4628,"1":0.4348,"2":0.1025},"legend":{"0":"low","1":"mid","2":"high"}}},"usage":{"input_tokens":207,"output_tokens":0}}
+== decision 1 179 94ca910d610bd97049e9e19576ed029d5efcb97599afbb32272ded83d52e1bc5
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 54
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"request body is not valid JSON"}}
+== decision 2 183 cc9c9987aef7199c0ed2c87f3089ba3ff6127435cde8d03d68be4492014a6c45
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 58
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"request body must be a JSON object"}}
+== decision 3 164 e6c37f0e16fbd5ab2f0246890c1fcdf47201502d597ed29a81f4186e48f3a0a0
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 39
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"missing 'state'"}}
+== decision 4 193 c42002eb19e5be96b84ed12b145a184d4fc6565281c0d497921ce014a3d9fc8a
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 68
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"\"type\" must be one of: choice, score, noul"}}
+== row 685 ceb6f9faaeb697360a378986816eaca63111c11105e586d9ed23d5b954832d74
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["decisions"],"input_modalities":["text"],"modality":"decisions","engines":["mlx"],"meta":{"architecture":"d1","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

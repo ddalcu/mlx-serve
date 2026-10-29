@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
-# Mage-Flow-Edit: the capabilities the app's UI now advertises for this backend,
-# and the ones it deliberately hides. `test_image_gen.sh` is FLUX-shaped (img2img,
-# LoRA, conditioning rebalance) and Mage-Flow has none of those, so the checks
-# that matter here live in their own script.
+# test_mageflow_edit.sh — Mage-Flow-Edit (test_image_gen.sh is FLUX-shaped: img2img, LoRA, rebalance): EDIT capability
+# from the boot banner (both repos ship identical configs), txt2img on the edit checkpoint, a sizeless edit keeps the
+# SOURCE resolution (non-square fixture), an explicit size is a pixel budget at the source aspect, multi-reference
+# composition + `edit ref 2`, named 400s for the hidden capabilities (variation, LoRA), the OpenAI multipart surface,
+# and a SECOND headless server naming the model in the multipart `model` field (the default model cannot see an
+# ignored id).
 #
-# Skips gracefully when the checkpoint isn't downloaded (~17 GB).
-# Usage: MAGEFLOW_EDIT_MODEL=<dir> ./tests/test_mageflow_edit.sh [port]
+#   MAGEFLOW_EDIT_MODEL=<dir> ./tests/test_mageflow_edit.sh [port]   # SKIPs without the ~17 GB checkpoint
+#
+# Hermetic twins: fitAspect, openaiEditFormToJson, the multipart parser; the MAGEFLOW_* cos oracles.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11402}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -18,11 +23,7 @@ LOG=/tmp/test_mageflow_edit_server.log
 "$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for i in $(seq 1 180); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 180 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 
 # The edit capability is gated on the checkpoint (dir name — both repos ship
 # byte-identical configs), and the banner is the only place it's observable.
@@ -160,11 +161,7 @@ MODEL_ID="$(basename "$(dirname "$MODEL")")/$(basename "$MODEL")"
 HPORT=$((PORT + 40))
 "$BIN" --serve --port "$HPORT" --model-dir "$MODEL_ROOT" >/tmp/test_mageflow_edit_headless.log 2>&1 &
 HSRV=$!
-for i in $(seq 1 180); do
-  curl -sf "http://127.0.0.1:$HPORT/health" >/dev/null 2>&1 && break
-  kill -0 $HSRV 2>/dev/null || { echo "FAIL: headless server did not start"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$HPORT" 180 1 "$HSRV" || kill -0 "$HSRV" 2>/dev/null || { echo "FAIL: headless server did not start"; exit 1; }
 hcode=$(curl -s -o /tmp/test_mageflow_edit_headless_body.json -w '%{http_code}' --max-time 900 \
   -X POST "http://127.0.0.1:$HPORT/v1/images/edits" \
   -F "model=$MODEL_ID" -F "prompt=make it winter" -F "image=@$SRC;type=image/png")

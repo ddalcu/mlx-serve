@@ -1,34 +1,13 @@
 #!/bin/bash
-# Batched-kernel byte-equivalence test (Phase A7).
+# test_batched_equivalence.sh — the batched-decode kernel is byte-identical to single-slot decode at temp 0:
+# MLX_SERVE_FORCE_BATCHED=1 routes even one slot through forwardBatchedDecode (a [N,1,d] layout single-slot never
+# runs), compared on the first FIRST_N_TOKENS (INT4 near-ties may flip past ~30). Also a real two-stream arm, and a
+# last section under --kv-quant 8 (the batched kernel once fed raw packed KV to SDPA and crashed).
 #
-# Verifies that the scheduler's batched-decode kernel produces *byte-identical*
-# output to the single-slot decode path at temp=0, single client. The default
-# scheduler routes single-slot ticks through `runSingleDecodeTick` (the legacy
-# path) — that's the auto-gate at `active.len == 1`. Setting
-# `MLX_SERVE_FORCE_BATCHED=1` flips the gate so even N=1 routes through
-# `forwardBatchedDecode`. If the two paths diverge, this catches it.
-#
-# Why test it: the batched kernel laid out tensors differently (positions
-# stacked into a [N, 1, d] mvm vs a [1, 1, d] mvm), so even at N=1 it exercises
-# code that the single-slot path doesn't. Any silent shape/cache/RoPE bug
-# that only shows up under the batched kernel will produce divergent token
-# IDs, which this test asserts against.
-#
-# Like `test_pld_equivalence.sh`, we tolerate float-noise tail past
-# FIRST_N_TOKENS at INT4 — the AR/verify quantized matmul reduction order
-# differs slightly across the two paths, so near-tie argmax tokens can flip
-# on long greedy generations. The first ~30 tokens are stable.
-#
-# Requires:
-#   - A built mlx-serve binary (run `zig build -Doptimize=ReleaseFast`)
-#   - Either:
-#       BATCHED_TEST_MODEL set to a model directory, OR
-#       a default MLX checkpoint at ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#
-# Usage:
-#   BATCHED_TEST_MODEL=/path/to/model ./tests/test_batched_equivalence.sh [port]
+#   BATCHED_TEST_MODEL=<dir> ./tests/test_batched_equivalence.sh [port]   # default gemma-4-e4b-it-8bit
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8092}
 BASE="http://127.0.0.1:$PORT"
@@ -60,7 +39,7 @@ fi
 # Short prompt for the strict byte-identical assertion. The model's response
 # is short enough to land entirely within the float-noise-stable window.
 read -r -d '' PROMPT <<'EOF' || true
-What is 2+2? Answer with just the number, no explanation.
+List the first ten prime numbers, separated by commas, with nothing else.
 EOF
 
 JSON_PAYLOAD=$(python3 -c "
@@ -298,10 +277,7 @@ CONC_LOG=$(mktemp)
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$CONC_LOG" 2>&1 &
 CONC_PID=$!
 up=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 && up=1
 if [ "$up" != "1" ]; then
     echo -e "${RED}FAIL${NC} concurrent server did not become healthy in 60s"
     tail -20 "$CONC_LOG"; kill $CONC_PID 2>/dev/null || true; rm -f "$CONC_LOG"; exit 1
@@ -513,10 +489,7 @@ PW_PYEOF
     "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --no-mtp --max-concurrent 4 > "$PW_LOG" 2>&1 &
     PW_PID=$!
     up=0
-    for i in $(seq 1 90); do
-        if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-        sleep 1
-    done
+    srv_wait_health "$BASE" 90 1 && up=1
     if [ "$up" != "1" ]; then
         echo -e "${RED}FAIL${NC} pad-waste server did not become healthy in 90s"
         tail -20 "$PW_LOG"; cleanup_padwaste; exit 1
