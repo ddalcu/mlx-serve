@@ -82,6 +82,16 @@ fn refSamples(b: *const job.Body) union(enum) { none, samples: []f32, bad_base64
     return .{ .samples = wav.decodePcm16Mono(gpa, bytes) catch return .bad_wav };
 }
 
+/// `language`: absent or `auto` (null) lets the model infer it from the text; otherwise a name the checkpoint declares.
+fn languageOf(e: *const Engine, b: *const job.Body) error{UnsupportedLanguage}!?i32 {
+    const v = b.get("language") orelse return null;
+    if (v == .null) return null;
+    if (v != .string) return error.UnsupportedLanguage;
+    const name = v.string;
+    if (std.ascii.eqlIgnoreCase(name, "auto")) return null;
+    return e.synth.model.cfg.languageId(name) orelse error.UnsupportedLanguage;
+}
+
 fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) callconv(.c) Verdict {
     const e: *Engine = @ptrCast(@alignCast(ep));
     var body = job.Body.parse(gpa, req.body.slice()) orelse return bad("invalid JSON body");
@@ -104,7 +114,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .bad_base64 => return bad("ref_audio is not valid base64"),
         .bad_wav => return bad("ref_audio is not a decodable WAV"),
     }
-    const out = e.synth.synthesizeWav(text, max_frames, job.progressOf(progress), ref) catch |err| return switch (err) {
+    const language = languageOf(e, &body) catch return bad("language is not one this model supports (auto, or a name in its codec_language_id)");
+    const out = e.synth.synthesizeWav(text, max_frames, job.progressOf(progress), ref, language) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
         else => job.failure(err, "synthesis failed"),
     };
@@ -229,7 +240,8 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
             \\{"model_type":"qwen3_tts","talker_config":{"hidden_size":32,"intermediate_size":64,"num_hidden_layers":1,
             \\ "num_attention_heads":2,"num_key_value_heads":1,"head_dim":16,"vocab_size":3072,"text_vocab_size":151936,
             \\ "code_predictor_config":{"hidden_size":32,"intermediate_size":64,"num_hidden_layers":1,"num_attention_heads":2,
-            \\ "num_key_value_heads":1,"head_dim":16,"num_code_groups":16}}}
+            \\ "num_key_value_heads":1,"head_dim":16,"num_code_groups":16},
+            \\ "codec_think_id":2154,"codec_language_id":{"english":2050,"portuguese":2071,"beijing_dialect":2074}}}
             },
             .{ .name = "tokenizer.json", .bytes = try sdk.byte_tokenizer.json(a, &.{}) },
             .{ .name = "model.safetensors", .bytes = try t.bytes() },
@@ -313,6 +325,23 @@ test "qwen3_tts plugin: an unusable ref_audio is refused by name, not synthesize
         try testing.expectEqualStrings(c.why, (try pack.run(body)).refused.why.slice());
     }
     try testing.expectEqualStrings("RIFF", (try pack.run("{\"input\":\"hi\",\"ref_audio\":\"\"}")).ok[0..4]);
+}
+
+test "qwen3_tts plugin: a named language conditions the codec prefix; auto is the plain path; others are refused" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var pack = try MediaPack.open(al);
+    defer pack.close();
+    const plain = try al.dupe(u8, (try pack.run("{\"input\":\"hi there\"}")).ok);
+    try testing.expectEqualSlices(u8, plain, (try pack.run("{\"input\":\"hi there\",\"language\":\"Auto\"}")).ok);
+    const pt = (try pack.run("{\"input\":\"hi there\",\"language\":\"Portuguese\"}")).ok;
+    try testing.expectEqualStrings("RIFF", pt[0..4]);
+    try testing.expect(!std.mem.eql(u8, plain, pt));
+    const why = "language is not one this model supports (auto, or a name in its codec_language_id)";
+    try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":\"klingon\"}")).refused.why.slice());
+    try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":\"beijing_dialect\"}")).refused.why.slice());
+    try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":2071}")).refused.why.slice());
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());
