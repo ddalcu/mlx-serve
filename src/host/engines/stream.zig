@@ -64,6 +64,10 @@ pub const Stream = struct {
     /// The whole generation was token id 0 (the server drops its prefix-cache state).
     was_pad_only: bool = true,
     logprobs_buf: std.ArrayList(LogprobResult) = .empty,
+    /// A spoken reply (`.audio` events): its frames' codes and its samples, at `sample_rate`, under `out_mu`.
+    audio_codes: std.ArrayList(u32) = .empty,
+    audio_samples: std.ArrayList(f32) = .empty,
+    sample_rate: u32 = 0,
     prompt_logprobs_buf: std.ArrayList(LogprobResult) = .empty,
     /// Forwards `cancel` to the engine running the request.
     canceller: ?Canceller = null,
@@ -92,6 +96,8 @@ pub const Stream = struct {
         self.logprobs_buf.deinit(self.allocator);
         for (self.prompt_logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
         self.prompt_logprobs_buf.deinit(self.allocator);
+        self.audio_codes.deinit(self.allocator);
+        self.audio_samples.deinit(self.allocator);
         self.out_buf.deinit(self.allocator);
         self.allocator.destroy(self);
     }
@@ -258,6 +264,15 @@ pub fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.A
             if (ev.constraint_at != std.math.maxInt(u32)) s.publishConstraintSpan(ev.constraint_at, ev.constraint_offset);
             const lps = abi.items(abi.Logprob, ev.logprobs);
             for (abi.items(u32, ev.tokens), 0..) |t, i| s.pushTokenWithLogprob(t, if (i < lps.len) fromEvent(s.allocator, lps[i]) else null);
+        },
+        .audio => {
+            s.out_mu.lockUncancelable(s.io);
+            defer s.out_mu.unlock(s.io);
+            s.sample_rate = ev.sample_rate;
+            s.audio_codes.appendSlice(s.allocator, abi.items(u32, ev.codes)) catch return .stop;
+            s.audio_samples.appendSlice(s.allocator, abi.items(f32, ev.samples)) catch return .stop;
+            s.out_cond.broadcast(s.io);
+            s.out_event.set(s.io);
         },
         .finished => {
             defer s.release();

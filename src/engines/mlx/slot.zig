@@ -118,6 +118,8 @@ pub const Slot = struct {
     kv_attn_fused: bool,
     cached_tokens: u32,
     logprobs_n: u32,
+    /// A spoken reply (`SubmitParams.speech`).
+    speech: ?@import("../../sdk/request/speech.zig").Request = null,
     serial_reason_logged: bool = false,
     memory_hold_logged: bool = false,
     memory_promised: u64 = 0,
@@ -313,11 +315,12 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .enable_thinking = params.enable_thinking,
-            .enable_pld = params.enable_pld,
+            // A spoken reply forwards one row a slot: no speculative round.
+            .enable_pld = params.enable_pld and params.speech == null,
             // Muse and Nemotron RADIO DFlash consume vision-conditioned
             // trunk captures; Qwen's external drafter lacks M-RoPE positions.
             .enable_drafter = assistantSidecarEnabledForRequest(
-                params.enable_drafter,
+                params.enable_drafter and params.speech == null,
                 params.vision_embeddings != null,
                 params.mrope_pos != null,
                 params.dflash != null,
@@ -326,7 +329,8 @@ pub const Slot = struct {
             .drafter = params.drafter,
             .dflash = params.dflash,
             .drafter_block_size = params.drafter_block_size,
-            .enable_mtp = params.enable_mtp,
+            .enable_mtp = params.enable_mtp and params.speech == null,
+            .speech = params.speech,
             .allow_batch_mtp = params.allow_batch_mtp,
             .mtp = if (params.mtp) |m| m.* else null,
             .mtp_depth = params.mtp_depth,
@@ -603,6 +607,13 @@ pub const Slot = struct {
             .constraint_at = if (span) |c| c[0] else std.math.maxInt(u32),
             .constraint_offset = if (span) |c| c[1] else 0,
         };
+        if (sk.event(sk.ctx, @intFromPtr(self), &ev) == .stop) self.cancelled.store(true, .release);
+    }
+
+    /// Spoken frames and the samples they made final (`.audio`); a request without a stream has no reader for them.
+    pub fn emitAudio(self: *Slot, codes: []const u32, samples: []const f32, sample_rate: u32) void {
+        const sk = self.sink orelse return;
+        const ev: abi.Event = .{ .kind = .audio, .codes = abi.span(u32, codes), .samples = abi.span(f32, samples), .sample_rate = sample_rate };
         if (sk.event(sk.ctx, @intFromPtr(self), &ev) == .stop) self.cancelled.store(true, .release);
     }
 

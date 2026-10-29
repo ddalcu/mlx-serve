@@ -97,6 +97,8 @@ fn loadSplit(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config: *M
     errdefer w.deinit();
     try model.narrowHadamardPackTables(config, &w, mlx.gpuStream());
     const t = tower orelse return w;
+    // A plugin running its own towers reads their tensors through its load, beside the trunk's.
+    if (config.plugin_media) return w;
     var keys: std.ArrayList([]const u8) = .empty;
     defer keys.deinit(a);
     var it = w.map.keyIterator();
@@ -206,12 +208,16 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
     var settings_buf: [128]u8 = undefined;
+    const original_caps = b.parsed.caps;
+    var runtime_caps = original_caps;
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
         .parsed = &b.parsed,
+        .runtime_caps = &runtime_caps,
         .settings_json = abi.Str.of(loadSettings(&settings_buf, config)),
         .stream = .{ .ctx = s.ctx },
+        .host = @import("../../../host/host_table.zig").get(),
         .weights = &src,
         .stream_room = streamRoom(config),
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
@@ -225,6 +231,8 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         return if (std.mem.eql(u8, why.why.slice(), "MissingWeight")) error.MissingWeight else error.PluginLoadFailed;
     };
     errdefer b.table.unload(m);
+    b.parsed.caps = runtime_caps;
+    errdefer b.parsed.caps = original_caps;
     var xfm = try moduleShell(a, config.*, s);
     errdefer xfm.deinit();
     xfm.cache.deinit();
@@ -451,6 +459,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         } else .{},
         .pipeline_every = ctx.pipeline_build,
         .mask_add = .{ .ctx = if (ctx.prefill_mask_add) |m| m.ctx else null },
+        .embeds = .{ .ctx = if (ctx.step_embeds) |e| e.ctx else null },
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);
@@ -686,6 +695,31 @@ pub fn auxPrefixKey(xfm: *const Transformer, ids: []const u32, media: ?Array, ou
 pub fn auxBeginPrompt(xfm: *const Transformer, slot: u32, prompt: []const u32, media: ?Array, restored_at: u64, capture: bool) abi.Verdict {
     const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
     return b.hooks.begin_prompt(b.model, slot, .of(prompt), .{ .ctx = if (media) |m| m.ctx else null }, restored_at, capture);
+}
+
+pub fn auxImportPlan(xfm: *const Transformer, header: []const u8, out_peak_bytes: *u64) abi.Verdict {
+    out_peak_bytes.* = 0;
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    return b.hooks.import_plan(b.model, .of(header), out_peak_bytes);
+}
+
+pub fn auxExportArrays(xfm: *const Transformer, snap: abi.Handle, out: *abi.AuxExport) abi.Verdict {
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    if (out.size < @sizeOf(abi.AuxExport)) return abi.Verdict.refuse(.unsupported, "auxiliary export storage is too short");
+    out.tensor_len = 0;
+    out.names_len = 0;
+    out.header_len = 0;
+    if (snap == null) return abi.Verdict.refuse(.unsupported, "no auxiliary snapshot to export");
+    return b.hooks.export_arrays(b.model, snap, out);
+}
+
+pub fn auxImportArrays(xfm: *const Transformer, ids: []const u32, header: []const u8, arrays: []const abi.AuxTensor, out: *abi.Handle) abi.Verdict {
+    out.* = null;
+    const b = auxBinding(xfm) orelse return abi.Verdict.refuse(.unsupported, "model auxiliary hooks are unavailable or too short");
+    for (arrays) |*a| {
+        if (a.size != @sizeOf(abi.AuxTensor)) return abi.Verdict.refuse(.unsupported, "auxiliary tensor descriptor size differs from this host's");
+    }
+    return b.hooks.import_arrays(b.model, .of(ids), .of(header), .of(arrays), out);
 }
 
 /// Exact-position restore borrows the snapshot; success and failure both leave it for the caller to free.
@@ -996,6 +1030,7 @@ test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the 
 
 const AuxFake = struct {
     on: bool = true,
+    disk: bool = false,
     captured: bool = true,
     fail_snapshot: bool = false,
     fail_restore: bool = false,
@@ -1073,6 +1108,44 @@ const AuxFake = struct {
         f.calls += 1;
         f.frees += 1;
     }
+    fn importPlan(m: *anyopaque, header: abi.Str, out: *u64) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        out.* = 0;
+        if (!f.disk) return abi.Verdict.refuse(.unsupported, "fake disk planning unavailable");
+        if (!std.mem.eql(u8, header.slice(), "codec")) return abi.Verdict.refuse(.failed, "unexpected header");
+        out.* = 6144;
+        return .ok;
+    }
+    fn exportArrays(m: *anyopaque, snap: abi.Handle, out: *abi.AuxExport) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        if (!f.disk) return abi.Verdict.refuse(.unsupported, "fake disk export unavailable");
+        if (snap != m) return abi.Verdict.refuse(.failed, "foreign snapshot");
+        if (out.tensor_cap < 1 or out.names_cap < 4 or out.header_cap < 5)
+            return abi.Verdict.refuse(.too_large, "fake export storage too small");
+        @memcpy(out.names.?[0..4], "rows");
+        @memcpy(out.header.?[0..5], "codec");
+        out.tensors.?[0] = .{ .name = .of(out.names.?[0..4]), .array = .{ .ctx = m } };
+        out.tensor_len = 1;
+        out.names_len = 4;
+        out.header_len = 5;
+        return .ok;
+    }
+    fn importArrays(m: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) abi.Verdict {
+        const f = get(m);
+        f.calls += 1;
+        out.* = null;
+        if (!f.disk) return abi.Verdict.refuse(.unsupported, "fake disk import unavailable");
+        if (!std.mem.eql(u32, ids.slice(), &f.ids) or !std.mem.eql(u8, header.slice(), "codec"))
+            return abi.Verdict.refuse(.failed, "unexpected import identity");
+        if (arrays.len != 1) return abi.Verdict.refuse(.failed, "unexpected tensor count");
+        const tensor = arrays.slice()[0];
+        if (!std.mem.eql(u8, tensor.name.slice(), "rows") or tensor.array.ctx != m)
+            return abi.Verdict.refuse(.failed, "unexpected tensor");
+        out.* = m;
+        return .ok;
+    }
     const hooks: abi.AuxHooks = .{
         .reserve = undefined,
         .commit = undefined,
@@ -1082,12 +1155,13 @@ const AuxFake = struct {
         .handoff = undefined,
         .free = &free,
         .bytes = &bytes,
-        .serialize = undefined,
-        .deserialize = undefined,
         .enabled = &enabled,
         .describe = &describe,
         .prefix_key = &prefixKey,
         .begin_prompt = &beginPrompt,
+        .import_plan = &importPlan,
+        .export_arrays = &exportArrays,
+        .import_arrays = &importArrays,
     };
     const weights: abi.WeightHooks = .{};
 
@@ -1096,7 +1170,7 @@ const AuxFake = struct {
     }
 };
 
-test "plugin aux: absent and short tables refuse without calling hooks" {
+test "absent and short auxiliary tables refuse without calling hooks" {
     const t = std.testing;
     var fake: AuxFake = .{};
     var cache: abi.CacheHooks = .{};
@@ -1106,11 +1180,14 @@ test "plugin aux: absent and short tables refuse without calling hooks" {
     x.plugin = null;
     var info: abi.AuxSnapshotInfo = .{};
     var key: u64 = 0;
+    var peak: u64 = 0;
+    var exported: abi.AuxExport = .{};
+    var imported: abi.Handle = null;
     // The allocation ends before any callback, including the original table's members.
     var short: [@alignOf(abi.AuxHooks)]u8 align(@alignOf(abi.AuxHooks)) = @splat(0);
     @as(*u32, @ptrCast(&short)).* = @sizeOf(u32);
     var hooks = AuxFake.hooks;
-    for (0..9) |case| {
+    for (0..12) |case| {
         switch (case) {
             0 => x.plugin = null,
             1 => x.plugin = &bound,
@@ -1122,8 +1199,11 @@ test "plugin aux: absent and short tables refuse without calling hooks" {
             4 => hooks.size = @offsetOf(abi.AuxHooks, "describe"),
             5 => hooks.size = @offsetOf(abi.AuxHooks, "prefix_key"),
             6 => hooks.size = @offsetOf(abi.AuxHooks, "begin_prompt"),
-            7 => hooks.size = @sizeOf(abi.AuxHooks) - 1,
-            8 => {
+            7 => hooks.size = @offsetOf(abi.AuxHooks, "import_plan"),
+            8 => hooks.size = @offsetOf(abi.AuxHooks, "export_arrays"),
+            9 => hooks.size = @offsetOf(abi.AuxHooks, "import_arrays"),
+            10 => hooks.size = @sizeOf(abi.AuxHooks) - 1,
+            11 => {
                 hooks.size = @sizeOf(abi.AuxHooks);
                 cache.size = @offsetOf(abi.CacheHooks, "aux");
             },
@@ -1134,6 +1214,9 @@ test "plugin aux: absent and short tables refuse without calling hooks" {
         try t.expectEqual(abi.Verdict.Code.unsupported, auxDescribe(&x, &fake, &info).code);
         try t.expectEqual(abi.Verdict.Code.unsupported, auxPrefixKey(&x, &fake.ids, null, &key).code);
         try t.expectEqual(abi.Verdict.Code.unsupported, auxBeginPrompt(&x, 7, &.{ 4, 8, 15, 16 }, null, 0, false).code);
+        try t.expectEqual(abi.Verdict.Code.unsupported, auxImportPlan(&x, "codec", &peak).code);
+        try t.expectEqual(abi.Verdict.Code.unsupported, auxExportArrays(&x, &fake, &exported).code);
+        try t.expectEqual(abi.Verdict.Code.unsupported, auxImportArrays(&x, &fake.ids, "codec", &.{}, &imported).code);
         const v = auxRestoreAt(&x, 7, &fake, 3);
         try t.expectEqual(abi.Verdict.Code.unsupported, v.code);
         try t.expect(v.why.len > 0);
@@ -1229,4 +1312,163 @@ test "plugin aux: model-local snapshots describe restore and free exactly once" 
     }
     try t.expectEqual(@as(usize, 1), models[0].frees);
     try t.expectEqual(@as(usize, 1), models[1].frees);
+}
+
+test "larger auxiliary tables forward disk hooks through caller storage" {
+    const t = std.testing;
+    var fake: AuxFake = .{ .disk = true };
+    var hooks = AuxFake.hooks;
+    hooks.size += 8;
+    const cache: abi.CacheHooks = .{ .aux = &hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    var peak: u64 = 0;
+    try t.expect(auxImportPlan(&x, "codec", &peak).isOk());
+    try t.expectEqual(@as(u64, 6144), peak);
+    var tensors: [1]abi.AuxTensor = .{.{}};
+    var names: [4]u8 = undefined;
+    var header: [5]u8 = undefined;
+    var exported: abi.AuxExport = .{
+        .tensors = &tensors,
+        .tensor_cap = tensors.len,
+        .names = &names,
+        .names_cap = names.len,
+        .header = &header,
+        .header_cap = header.len,
+    };
+    exported.size += 8;
+    try t.expect(auxExportArrays(&x, &fake, &exported).isOk());
+    try t.expectEqual(@as(usize, 1), exported.tensor_len);
+    try t.expectEqual(@as(usize, 4), exported.names_len);
+    try t.expectEqual(@as(usize, 5), exported.header_len);
+    try t.expectEqualStrings("rows", tensors[0].name.slice());
+    try t.expectEqual(@as(?*anyopaque, &fake), tensors[0].array.ctx);
+    try t.expectEqualStrings("codec", header[0..exported.header_len]);
+    var imported: abi.Handle = null;
+    try t.expect(auxImportArrays(&x, &fake.ids, &header, &tensors, &imported).isOk());
+    try t.expectEqual(@as(abi.Handle, &fake), imported);
+    try t.expectEqual(@as(usize, 3), fake.calls);
+}
+
+test "short auxiliary export storage refuses before its tail or callback" {
+    const t = std.testing;
+    var fake: AuxFake = .{ .disk = true };
+    const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    var short: [@alignOf(abi.AuxExport)]u8 align(@alignOf(abi.AuxExport)) = @splat(0);
+    @as(*u32, @ptrCast(&short)).* = @sizeOf(u32);
+    const v = auxExportArrays(&x, &fake, @ptrCast(&short));
+    try t.expectEqual(abi.Verdict.Code.unsupported, v.code);
+    try t.expect(v.why.len > 0);
+    try t.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "incompatible auxiliary tensor descriptors refuse before callback" {
+    const t = std.testing;
+    var fake: AuxFake = .{ .disk = true };
+    const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    var tensors: [1]abi.AuxTensor = .{.{}};
+    for ([_]u32{ @sizeOf(u32), @sizeOf(abi.AuxTensor) - 1, @sizeOf(abi.AuxTensor) + 8 }) |size| {
+        tensors[0].size = size;
+        var imported: abi.Handle = &fake;
+        const v = auxImportArrays(&x, &fake.ids, "codec", &tensors, &imported);
+        try t.expectEqual(abi.Verdict.Code.unsupported, v.code);
+        try t.expect(v.why.len > 0);
+        try t.expectEqual(@as(abi.Handle, null), imported);
+    }
+    try t.expectEqual(@as(usize, 0), fake.calls);
+}
+
+test "unsupported disk hooks preserve RAM auxiliary snapshots" {
+    const t = std.testing;
+    var fake: AuxFake = .{};
+    const cache: abi.CacheHooks = .{ .aux = &AuxFake.hooks };
+    const table = AuxFake.table(&cache);
+    var bound: Bound = .{ .table = &table, .model = &fake };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    var peak: u64 = 99;
+    var exported: abi.AuxExport = .{};
+    var imported: abi.Handle = null;
+    const verdicts = [_]abi.Verdict{
+        auxImportPlan(&x, "codec", &peak),
+        auxExportArrays(&x, &fake, &exported),
+        auxImportArrays(&x, &fake.ids, "codec", &.{}, &imported),
+    };
+    for (verdicts) |v| {
+        try t.expectEqual(abi.Verdict.Code.unsupported, v.code);
+        try t.expect(v.why.len > 0);
+    }
+    try t.expectEqual(@as(u64, 0), peak);
+    try t.expectEqual(@as(abi.Handle, null), imported);
+    try t.expect(auxEnabled(&x));
+    const snap = auxSnapshot(&x, 7) orelse return error.TestExpectedSnapshot;
+    try t.expect(auxRestoreAt(&x, 7, snap, fake.ids.len).isOk());
+    try t.expectEqual(fake.resident, auxBytes(&x, snap));
+    auxFree(&x, snap);
+    try t.expectEqual(@as(usize, 1), fake.restores);
+    try t.expectEqual(@as(usize, 1), fake.frees);
+}
+
+test "plugin load runtime caps: publish only successful load results to host admission" {
+    const llama = @import("../../../plugins/llama/plugin.zig");
+    const proof = @import("proof.zig");
+    const fixture = @import("../../../sdk/bases/proof/fixture.zig");
+    const T = struct {
+        fn effective(ctx: *const abi.LoadCtx) abi.Caps {
+            var caps = ctx.parsed.caps;
+            caps.slot_state = true;
+            caps.active_slots = 2;
+            caps.whole_prompt_prefill = false;
+            return caps;
+        }
+        fn accept(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
+            const m = llama.table.load(ctx, out) orelse return null;
+            ctx.publishRuntimeCaps(effective(ctx));
+            return m;
+        }
+        fn refuse(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
+            ctx.publishRuntimeCaps(effective(ctx));
+            out.* = abi.Verdict.refuse(.unsupported, "runtime caps fixture load refused");
+            return null;
+        }
+        const accepted: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.load = &accept;
+            break :blk t;
+        };
+        const refused: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.load = &refuse;
+            break :blk t;
+        };
+    };
+    var sv: proof.Served = undefined;
+    try sv.open(.{ .quantized = true }, 0xca95);
+    defer sv.close();
+    const binding = sv.cfg.plugin.?;
+    const original_table = binding.table;
+    defer binding.table = original_table;
+    const original_caps = binding.parsed.caps;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    binding.table = &T.refused;
+    try std.testing.expectError(error.PluginLoadFailed, load(io, std.testing.allocator, &sv.cfg, sv.dir, fixture.stream()));
+    try std.testing.expectEqual(@as(u64, @bitCast(original_caps)), @as(u64, @bitCast(sv.cfg.caps())));
+    binding.table = &T.accepted;
+    var x = try load(io, std.testing.allocator, &sv.cfg, sv.dir, fixture.stream());
+    defer x.deinit();
+    try std.testing.expectEqual(@as(u8, 2), sv.cfg.caps().active_slots);
+    try std.testing.expectEqual(@as(u64, @bitCast(sv.cfg.caps())), @as(u64, @bitCast(x.config.caps())));
+    try std.testing.expect(sv.cfg.caps().slot_state and !sv.cfg.caps().whole_prompt_prefill);
+    try std.testing.expectEqual(@as(usize, 1), @import("../admission/pending.zig").activeLimit(sv.cfg.caps().active_slots, 1));
+    try std.testing.expectEqual(@as(usize, 2), @import("../admission/pending.zig").activeLimit(sv.cfg.caps().active_slots, 8));
 }

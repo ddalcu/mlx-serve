@@ -353,6 +353,7 @@ pub fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []c
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return;
     if (!hc.ssd_first) return;
     const d = if (hc.disk) |*dd| dd else return;
+    if (d.module_context != null) return;
     if (d.writer == null) return;
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
@@ -417,6 +418,7 @@ fn writeThroughEnabled() bool {
 /// worth at least one chunk.
 pub fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return false;
+    if (hc.disk) |*d| if (d.module_context != null) return false;
     if (!writeThroughEnabled()) {
         if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {
             log.info("  [disk-cache] prefill write-through disabled by MLX_SERVE_SSD_WRITE_THROUGH=0 — the end-of-request commit persists every turn\n", .{});
@@ -441,15 +443,11 @@ pub const ChunkWidthCtx = struct {
     sch: *Scheduler,
     cfg: ?*const model_mod.ModelConfig,
     kv_bits: u64,
-    /// This slot's own per-model cache, never `sch.hot_prefix_cache`; only `stagedHostBytes`
-    /// is read, on the inference thread.
-    hc: ?*prefix_cache_mod.HotPrefixCache,
 };
 
-/// Host bytes the SSD writer is holding for this slot right now.
+/// All resident writers and unaccepted module files share the prefill's memory ceiling.
 fn chunkWidthStagedBytes(wc: *ChunkWidthCtx) u64 {
-    const hc = wc.hc orelse return 0;
-    return hc.stagedHostBytes();
+    return @import("cache/budget.zig").stagedHostBytes(wc.sch);
 }
 
 pub fn chunkWidenConfirmCb(opaque_ctx: *anyopaque, pos: usize, want: u32) bool {
@@ -560,6 +558,36 @@ pub fn interleaveDecodeTick(sch: *Scheduler) u64 {
 }
 
 // ── tests ──
+
+test "module disk tiers never arm or execute KV prefill write-through" {
+    const disk = @import("cache/ssd/disk_tier.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const Check = struct {
+        fn header(_: ?*anyopaque, _: []const u8, _: *const disk.module_record.Envelope) bool {
+            return true;
+        }
+    };
+    var hc = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    defer hc.deinit();
+    hc.disk = try disk.DiskTier.initWithModule(testing.allocator, testing.io, base, "module", 0, 512, .{ .identity = "fixture", .validate = &Check.header });
+    hc.disk.?.enableBackgroundWriter();
+    hc.ssd_first = true;
+    var entry: @import("../../host/registry/registry.zig").LoadedModel = undefined;
+    entry.prefix_cache = &hc;
+    var slot: Slot = undefined;
+    slot.model = &entry;
+    var prompt: [512]u32 = @splat(3);
+    slot.full_prompt = &prompt;
+    var ctx: WriteThroughCtx = .{ .slot = &slot };
+    try testing.expect(!writeThroughArmed(&slot, 512));
+    prefillWriteThroughCb(&ctx, 512, &.{});
+    try testing.expectEqual(@as(u32, 0), ctx.chunks);
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entries.items.len);
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
+}
 
 test "boundaryEligible: a small plain request is admitted only under a share, never nested, never beside an exclusive model" {
     const base_cand: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .module_state = false, .tail = 31 };

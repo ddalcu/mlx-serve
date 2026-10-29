@@ -24,6 +24,7 @@ const Transformer = transformer_mod.Transformer;
 const plugin_driver = @import("plugin/driver.zig");
 const distributed = @import("cluster/distributed.zig");
 const plugin_head = @import("plugin/head.zig");
+const plugin_media = @import("plugin/media.zig");
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("spec/dflash/dflash.zig");
 const round_cost_mod = @import("spec/round_cost.zig");
@@ -244,6 +245,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (params.load_vision) if (xfm_ptr.plugin) |b| if (params.config.plugin.?.parsed.caps.images and params.config.plugin.?.outside) if (b.table.media) |hooks| {
         const v = try sch.allocator.create(VisionEncoder);
         v.* = VisionEncoder.initPlugin(sch.allocator, params.config.*, hooks, b.model);
+        vision_ptr = v;
+    };
+    // An in-tree plugin's towers run on the engine: decoded media in, its own prepare and tower.
+    if (params.load_vision and vision_ptr == null) if (pluginMedia(sch.allocator, params.config, xfm_ptr)) |pm| {
+        const v = try sch.allocator.create(VisionEncoder);
+        v.* = VisionEncoder.initPluginMedia(sch.allocator, params.config.*, pm);
         vision_ptr = v;
     };
     if (params.load_vision and vision_ptr == null) {
@@ -792,9 +799,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (plugin_driver.auxBinding(xfm_ptr) != null and !plugin_driver.auxEnabled(xfm_ptr)) {
         log.info("[hot-cache] module auxiliary retention is disabled for this loaded instance; using legacy resume\n", .{});
     }
-    if (module_binding != null and disk_prefix_cache) {
-        log.info("[hot-cache] --prefix-cache-disk does not apply to module snapshots yet; using RAM retention when enabled\n", .{});
-    }
     // Such a model keeps no conversation of its own any more: without a RAM prefix cache every turn prefills cold.
     if (module_binding != null and (params.prefix_cache_capacity == 0 or !ram_prefix_cache)) {
         log.warn("[hot-cache] no RAM prefix cache (--prefix-cache-entries 0 or --no-prefix-cache-ram): this model retains no conversation, every prompt prefills cold\n", .{});
@@ -838,7 +842,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // RAM cache is unaffected.
         const has_ssm_layers = params.config.hasSsmLayers();
         entry.prefix_cache.?.hybrid = has_ssm_layers;
-        const disk_ok = module_binding == null and (!has_ssm_layers or enable_ssm_cps);
+        const disk_ok = module_binding != null or !has_ssm_layers or enable_ssm_cps;
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
             const fp = kv_disk_cache.modelFingerprintWithLayout(
                 sch.allocator,
@@ -852,13 +856,15 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             defer sch.allocator.free(fp);
             const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
             defer sch.allocator.free(base);
-            entry.prefix_cache.?.disk = kv_disk_cache.DiskTier.init(
+            entry.prefix_cache.?.disk = initPrefixDisk(
                 sch.allocator,
                 sch.io,
                 base,
                 fp,
                 params.prefix_cache_disk_bytes,
                 kv_disk_cache.DEFAULT_CHUNK_TOKENS,
+                module_binding,
+                entry.path,
             ) catch |err| {
                 log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
@@ -922,4 +928,149 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     publishHotCacheResidency(sch);
 }
 
+/// A module tier borrows its loaded transformer and keeps its compatibility identity in its own root.
+pub fn initPrefixDisk(a: std.mem.Allocator, io: std.Io, base: []const u8, fingerprint: []const u8, cap: u64, chunk: u32, binding: ?prefix_cache_mod.ModuleBinding, path: []const u8) !kv_disk_cache.DiskTier {
+    const b = binding orelse return kv_disk_cache.DiskTier.init(a, io, base, fingerprint, cap, chunk);
+    const identity = try modulePackFingerprint(a, io, path, fingerprint);
+    defer a.free(identity);
+    var tier = try kv_disk_cache.DiskTier.initWithModule(a, io, base, identity, cap, chunk, .{
+        .identity = identity,
+        .user = @constCast(b.xfm),
+        .validate = &validateModuleHeader,
+    });
+    tier.module_context.?.identity = std.fs.path.basename(tier.root);
+    return tier;
+}
+
+fn validateModuleHeader(user: ?*anyopaque, header: []const u8, _: *const kv_disk_cache.module_record.Envelope) bool {
+    const xfm: *const Transformer = @ptrCast(@alignCast(user orelse return false));
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    var peak: u64 = 0;
+    const verdict = plugin_driver.auxImportPlan(xfm, header, &peak);
+    if (!verdict.isOk()) log.debug("[disk-cache] module header declined: {s}\n", .{verdict.why.slice()});
+    return verdict.isOk();
+}
+
+fn modulePackFingerprint(a: std.mem.Allocator, io: std.Io, path: []const u8, fingerprint: []const u8) ![]u8 {
+    if (!std.fs.path.isAbsolute(path)) return error.BadDiskCacheDir;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    const resident = @import("../../sdk/weights/resident.zig");
+    var selected = resident.indexShardSet(io, dir);
+    defer if (selected) |*s| resident.freeShardSet(s);
+    var names = std.ArrayList([]const u8).empty;
+    if (selected) |*s| {
+        var keys = s.keyIterator();
+        while (keys.next()) |name| try appendPackFile(aa, &names, name.*);
+    } else {
+        var it = dir.iterate();
+        while (try it.next(io)) |file| {
+            if (file.kind != .file and file.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, file.name, ".safetensors")) continue;
+            try appendPackFile(aa, &names, file.name);
+        }
+    }
+    try appendPackFile(aa, &names, "engram/engram-residents.safetensors");
+    const config: []const u8 = dir.readFileAlloc(io, "config.json", aa, .limited(64 << 20)) catch |err| blk: {
+        if (err != error.FileNotFound) return err;
+        break :blk "{}";
+    };
+    try configuredPackFiles(aa, &names, try std.json.parseFromSliceLeaky(std.json.Value, aa, config, .{}));
+    const token_map: kv_disk_cache.module_record.TokenMap = blk: {
+        for ([_][]const u8{ "engram-token-map.u32", "engram_token_map.json" }) |name| {
+            _ = dir.statFile(io, name, .{}) catch |err| {
+                if (err == error.FileNotFound) continue;
+                return err;
+            };
+            break :blk .{ .file = name };
+        }
+        break :blk .builtin;
+    };
+    const stamp = try kv_disk_cache.module_record.packStamp(aa, io, path, names.items, token_map);
+    return std.fmt.allocPrint(a, "{s}-m{x}", .{ fingerprint, std.hash.Wyhash.hash(0, stamp) });
+}
+
+fn appendPackFile(a: std.mem.Allocator, names: *std.ArrayList([]const u8), name: []const u8) !void {
+    for (names.items) |old| if (std.mem.eql(u8, old, name)) return;
+    try names.append(a, try a.dupe(u8, name));
+}
+
+fn configuredPackFiles(a: std.mem.Allocator, names: *std.ArrayList([]const u8), value: std.json.Value) std.mem.Allocator.Error!void {
+    switch (value) {
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                const key = entry.key_ptr.*;
+                const v = entry.value_ptr.*;
+                if (v == .string and (std.mem.eql(u8, key, "weight_file") or std.mem.eql(u8, key, "scale_file") or std.mem.eql(u8, key, "bias_file"))) {
+                    try appendPackFile(a, names, v.string);
+                    continue;
+                }
+                try configuredPackFiles(a, names, v);
+            }
+        },
+        .array => |arr| for (arr.items) |v| try configuredPackFiles(a, names, v),
+        else => {},
+    }
+}
+
+/// The towers of a plugin that declares media hooks, over its loaded model.
+fn pluginMedia(a: std.mem.Allocator, config: *const model_mod.ModelConfig, xfm: *const Transformer) ?plugin_media.PluginMedia {
+    if (!config.plugin_media) return null;
+    const b = config.plugin orelse return null;
+    const hooks = b.table.media orelse return null;
+    const bound = xfm.plugin orelse return null;
+    return .{ .hooks = hooks, .model = bound.model, .parsed = &b.parsed, .a = a };
+}
+
 // ── tests ──
+
+test "module pack identity follows selected weights and token map precedence" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "unused.safetensors", .data = "unused" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model.safetensors\"}}" });
+    var buf: [512]u8 = undefined;
+    const path = buf[0..try tmp.dir.realPath(io, &buf)];
+    const first = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(first);
+    try tmp.dir.writeFile(io, .{ .sub_path = "unused.safetensors", .data = "changed unused shard" });
+    const same = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(same);
+    try testing.expectEqualStrings(first, same);
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram_token_map.json", .data = "[0,1]" });
+    const json = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(json);
+    try testing.expect(!std.mem.eql(u8, first, json));
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram-token-map.u32", .data = "binary" });
+    const binary = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(binary);
+    try testing.expect(!std.mem.eql(u8, json, binary));
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram_token_map.json", .data = "[1,2,3]" });
+    const same_binary = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(same_binary);
+    try testing.expectEqualStrings(binary, same_binary);
+    try tmp.dir.createDirPath(io, "engram");
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram/engram-residents.safetensors", .data = "resident side weights" });
+    const side = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(side);
+    try testing.expect(!std.mem.eql(u8, binary, side));
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"tables\":{\"layer\":{\"weight_file\":\"engram/table.safetensors\"}}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram/table.safetensors", .data = "table" });
+    const table = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(table);
+    try tmp.dir.writeFile(io, .{ .sub_path = "engram/table.safetensors", .data = "changed table weights" });
+    const changed_table = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(changed_table);
+    try testing.expect(!std.mem.eql(u8, table, changed_table));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "changed selected weights" });
+    const changed = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(changed);
+    try testing.expect(!std.mem.eql(u8, binary, changed));
+}

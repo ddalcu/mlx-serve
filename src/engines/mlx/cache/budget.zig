@@ -157,17 +157,65 @@ pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) 
     );
 }
 
-/// Caller holds `queue_mu`. Shared with the wait condition below.
 /// One bounded SSD slice per resident model that still owes one (its oldest owed session first);
-/// returns whether any still does. The caller re-checks for work between calls.
+/// returns progress, busy, or done. The caller re-checks for work between calls.
 /// Inference thread only: unloads run here too, so the collected pointers stay valid.
-pub fn flushOwedDiskSlices(sch: *Scheduler) bool {
+pub fn flushOwedDiskSlices(sch: *Scheduler) prefix_cache_mod.FlushResult {
     var owed: [16]prefix_cache_mod.FlushTarget = undefined;
-    var still = false;
+    var result: prefix_cache_mod.FlushResult = .done;
     for (owed[0..diskCaches(sch, &owed, true)]) |o| {
-        if (o.hc.flushOwedSlice(o.s)) still = true;
+        const slice = if (admitModuleStaging(sch, o.hc)) o.hc.flushOwedSlice(o.s) else .busy;
+        if (slice == .progress) result = .progress;
+        if (slice == .busy and result == .done) result = .busy;
     }
-    return still;
+    return result;
+}
+
+/// Staged CPU bytes share the unified-memory ceiling with every resident binding's tensors.
+pub fn stagedHostBytes(sch: *Scheduler) u64 {
+    var bytes: u64 = 0;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        if (entry.prefix_cache) |hc| bytes +|= hc.stagedHostBytes();
+    }
+    return bytes;
+}
+
+const ModuleStagingProbe = struct {
+    sch: *Scheduler,
+    hc: *prefix_cache_mod.HotPrefixCache,
+    cfg: *const model_mod.ModelConfig,
+
+    fn fits(ctx: ?*anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const need = self.hc.nextModuleStagingBytes();
+        if (need == 0) return true;
+        return need <= @import("../admission/prefill_chunk.zig").prefillHeadroomNow(self.cfg, stagedHostBytes(self.sch));
+    }
+};
+
+fn admitModuleStaging(sch: *Scheduler, hc: *prefix_cache_mod.HotPrefixCache) bool {
+    if (hc.nextModuleStagingBytes() == 0) return true;
+    const cfg = cacheConfig(sch, hc) orelse return false;
+    var probe: ModuleStagingProbe = .{ .sch = sch, .hc = hc, .cfg = cfg };
+    const report = hc.evictLruToAdmit(0, &probe, ModuleStagingProbe.fits, false);
+    if (report.entries > 0) publishHotCacheResidency(sch);
+    return report.admitted;
+}
+
+fn cacheConfig(sch: *Scheduler, hc: *prefix_cache_mod.HotPrefixCache) ?*const model_mod.ModelConfig {
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry.state == .ready and entry.prefix_cache == hc) return entry.config;
+    }
+    return null;
 }
 
 /// Neural Engine requests run on their workers while this thread parks, and still keep the Mac awake.
@@ -224,6 +272,91 @@ pub fn persistAtShutdown(sch: *Scheduler) void {
 pub const armShutdownDeadline = @import("../../../host/http/server.zig").armShutdownDeadline;
 
 // ── tests ──
+
+test "staged host bytes include every ready model writer regardless of the current cache view" {
+    const disk = @import("ssd/disk_tier.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 4, 0, null);
+    defer reg.deinit();
+    const a = try reg.registerStub("a", "/a", 1);
+    const b = try reg.registerStub("b", "/b", 1);
+    for ([_]*LoadedModel{ a, b }) |e| {
+        e.state = .ready;
+        e.prefix_cache = try testHotCache();
+        const hc = e.prefix_cache.?;
+        hc.disk = try disk.DiskTier.init(testing.allocator, testing.io, base, e.id, 0, 512);
+        hc.disk.?.enableBackgroundWriter();
+        const w = hc.disk.?.writer.?;
+        w.setPaused(true);
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/staged", .{hc.disk.?.root});
+        const bytes = try testing.allocator.dupe(u8, if (e == a) "one" else "second");
+        try testing.expectEqual(.accepted, try w.trySubmit(path, bytes));
+    }
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    sch.hot_prefix_cache = b.prefix_cache;
+    try testing.expectEqual(@as(u64, 9), stagedHostBytes(&sch));
+    a.state = .unloaded;
+    try testing.expectEqual(@as(u64, 6), stagedHostBytes(&sch));
+    a.state = .ready;
+}
+
+test "idle flush reports busy while submitted module files await their writer" {
+    const disk = @import("ssd/disk_tier.zig");
+    const mlx = @import("../../../mlx/ffi.zig");
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 4, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("module", "/module", 1);
+    entry.state = .ready;
+    entry.prefix_cache = try testHotCache();
+    const hc = entry.prefix_cache.?;
+    const Check = struct {
+        fn header(_: ?*anyopaque, _: []const u8, _: *const disk.module_record.Envelope) bool {
+            return true;
+        }
+    };
+    hc.disk = try disk.DiskTier.initWithModule(testing.allocator, testing.io, base, "busy", 0, 512, .{ .identity = "fixture", .validate = &Check.header });
+    const d = &hc.disk.?;
+    d.armTestSpace(1 << 40, 2 << 40);
+    d.enableBackgroundWriter();
+    const tokens = @as([512]u32, @splat(7));
+    const id = (try d.registerModule(.{ .tokens = &tokens, .prefix_key = 1, .has_tools = false, .quant = @import("kv_quant.zig").KVQuantConfig.dense, .header = "header", .tensors = &.{.{ .name = "ring", .dtype = "F32", .shape = &.{1}, .bytes = 4 }} })).?;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const arr = mlx.mlx_array_new_data(&[_]f32{1}, &[_]c_int{1}, 1, .float32);
+    var tensors = [_]disk.DiskTier.NamedTensor{.{ .key = @constCast("ring"), .arr = arr }};
+    // Staging swaps each list entry for its contiguous copy and frees the original.
+    defer _ = mlx.mlx_array_free(tensors[0].arr);
+    for (0..3) |_| {
+        try testing.expectEqual(.progress, try d.stageModulePart(id, &tensors, cpu));
+        d.drainWriter();
+    }
+    d.writer.?.setPaused(true);
+    try testing.expectEqual(.done, try d.submitModuleMeta(id));
+    hc.disk_dirty = true;
+    var xfm: @import("../transformer.zig").Transformer = undefined;
+    xfm.s = cpu;
+    entry.transformer = &xfm;
+    defer entry.transformer = null;
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = testing.io;
+    try testing.expectEqual(.busy, flushOwedDiskSlices(&sch));
+    try testing.expectEqual(.busy, flushOwedDiskSlices(&sch));
+    try testing.expectEqual(disk.module_record.State.submitted, d.moduleState(id).?);
+    d.writer.?.setPaused(false);
+    d.drainWriter();
+    try testing.expectEqual(.done, flushOwedDiskSlices(&sch));
+    try testing.expect(d.entryWholeOnDisk(id));
+}
 
 test "a parked inference thread keeps the Mac awake only while Neural Engine requests run" {
     var sch: Scheduler = undefined;

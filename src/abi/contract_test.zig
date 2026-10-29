@@ -254,6 +254,7 @@ fn onEvent(ctx: *anyopaque, id: u64, ev: *const abi.Event) callconv(.c) abi.Acti
                 if (ev.cached > t.prompt_len) s.fail(error.CachedPastPrompt);
                 t.prefilled += 1;
             },
+            .audio => if (t.prefilled == 0) s.fail(error.TokensBeforePrefilled),
             .tokens => {
                 if (t.prefilled == 0) s.fail(error.TokensBeforePrefilled);
                 if (ev.tokens.len == 0) s.fail(error.EmptyTokens);

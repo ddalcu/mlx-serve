@@ -38,6 +38,7 @@ Reasoning, budgets, agents:
 - **Schema-mask surfaces share one policy** (`schemaMasksThinking`, #331): defer only across bare `<think>` + atomic closer with no finite budget; tools present = no mask. Guard: `tests/test_json_schema_thinking.sh`.
 
 Request parsing + media:
+- **OpenAI audio OUT is the card's recipe, never a free prompt** (`api/speech.zig`): `modalities` + `audio{voice, format}` injects the voice-chat system line and prefills `mixed_start`; a spoken reply is stored (`Store`, 1 h) so a later turn's `audio.id` replays its transcript; with `tools` only where the card speaks them (`SpeechFacts.tools`, the `speech_tools` capability: no prefill, a reply that never speaks is parsed for `tool_calls`), else a named 400; unknown id, mp3, a wav stream are named 400s. Guard: `tests/test_lfm3.sh`.
 - **`messages.deinit` frees the Message array and NOTHING it points at**: media is owned by ONE `server.RequestMedia`; `Message` BORROWS; slots are INDICES.
 - **Undecodable media anywhere in the conversation is a NAMED 400** (`IMAGE_DECODE_REJECT`; remote URLs never fetched); `stop: ""` skipped; schema-less `json_schema` 400; empty embedding input 400; Ollama promptless generate = load handshake. Guard: `tests/test_api_edges.sh`.
 - **Latest-turn user media on a tower-less model is refused by NAME** (`mediaRejectReason`), older/tool media replaced by a note the agent can read (`dropMedia`); non-text model on a text surface 400s BEFORE prefill (`textGenRejectReason`; new surface → `isTextGenRoute`, new modality → `modalityFromType`).

@@ -1014,7 +1014,7 @@ pub const RopeTail = struct {
         g.out(&.{ ci(s.rows), ci(s.n), ci(s.k) }, p.ot);
         g.int("RD", RD);
         g.int("ROW", s.n * s.k);
-        g.int("QK", @intFromEnum(p.qk));
+        g.int("QK", @backingInt(p.qk));
         g.dtype("T", act);
         g.dtype("OT", p.ot);
         return g;

@@ -314,15 +314,19 @@ final class TelegramBridge: ObservableObject {
             defer { try? FileManager.default.removeItem(at: decoded.fileURL) }
 
             if transcribe {
-                // Model can't hear — transcribe on-device and send the words.
-                switch await VoiceTranscriber.transcribe(fileURL: decoded.fileURL) {
-                case .success(let transcript):
-                    let combined = text.isEmpty ? "[voice] \(transcript)" : "\(text)\n\n[voice] \(transcript)"
-                    let reply = await generateReply(chatId: chatId, senderName: update.senderName, text: combined)
-                    await sendReply(token: token, chatId: chatId, reply: reply)
-                case .failure(let failure):
-                    await send(token: token, chatId: chatId, text: Self.transcriptionMessage(for: failure))
+                // Model can't hear — transcribe on this Mac (Qwen3-ASR) and send the words.
+                guard VoiceASR.ready else {
+                    await send(token: token, chatId: chatId, text: "🎙️ Voice notes need Qwen3-ASR on the Mac: download it from MLX-Serve's Models.")
+                    return
                 }
+                let samples = decoded.pcm.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+                guard let transcript = await VoiceASR.transcribe(samples) else {
+                    await send(token: token, chatId: chatId, text: "🎙️ I couldn't make out any speech in that clip. Try recording again.")
+                    return
+                }
+                let combined = text.isEmpty ? "[voice] \(transcript)" : "\(text)\n\n[voice] \(transcript)"
+                let reply = await generateReply(chatId: chatId, senderName: update.senderName, text: combined)
+                await sendReply(token: token, chatId: chatId, reply: reply)
             } else {
                 // Model is audio-capable — feed the decoded PCM so it "hears" it.
                 let clip = ChatAudio(name: "voice.m4a", pcm: decoded.pcm)
@@ -552,14 +556,6 @@ final class TelegramBridge: ObservableObject {
         return "m4a"
     }
 
-    private static func transcriptionMessage(for failure: VoiceTranscriber.Failure) -> String {
-        switch failure {
-        case .unavailable(let message): return "🎙️ \(message)"
-        case .noSpeech: return "🎙️ I couldn't make out any speech in that clip. Try recording again."
-        case .failed(let message): return "🎙️ I couldn't transcribe that voice clip: \(message)"
-        }
-    }
-
     // MARK: - Copy
 
     private func startHelp() -> String {
@@ -569,7 +565,7 @@ final class TelegramBridge: ObservableObject {
         return """
         👋 Connected to MLX-Serve in \(mode).
         Send a message and I'll relay it to your local model.
-        You can also send 📷 photos (vision models will look at them) and 🎙️ voice notes (audio models hear them; other models read an on-device transcript).
+        You can also send 📷 photos (vision models will look at them) and 🎙️ voice notes (audio models hear them; other models read a transcript).
         Commands:
         /new — start a fresh conversation
         """

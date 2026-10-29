@@ -22,7 +22,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
 
 ## Facts the table declares
-- `owns_decode_state`, `slot_state` + `batches_decode` (EXL3: at most two active slots, serial decode; streamed MLX: single-flight): active state in `dec_state`,
+- `owns_decode_state`, `slot_state` + `batches_decode` (portable M2 EXL3: two active slots, serial decode; other streamed paths: single-flight): active state in `dec_state`,
   other live slots in `parked`; plain decode batches through `extendBatched`. Each State owns its pending capture.
 - `prefix_cache` for resident packs; `aux.enabled` also excludes Thunderbolt pairs. Snapshots retain every buffer
   and restore only at their exact position; the engine owns finished history. Streamed/paired keep legacy resume.
@@ -57,16 +57,16 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   measured slower than the pair (their threadgroup shapes differ): keep one dispatch a stage.
 
 ## Streamed packs (`experts.bin`)
-- EXL3 loads on M2 through the portable DIG tiles, or with available M5-class NAX units. M1, M3/M4, phone-family
-  M2 identifiers and unknown devices remain refused; eligibility reads the real architecture, never a test override.
-  This exception is DeepSeek-specific; other families retain their own EXL3 capability guards.
+- Non-NAX EXL3 loads run the portable DIG tiles' numerical self-check once at load; failures refuse the pack.
+  Only the real portable M2 architecture enables two-state scheduling and reservation; a generation override cannot.
+  NAX and other passing portable devices keep single-flight, whole-prompt prefill and the legacy memory bill.
 - The routed experts come from `sdk/weights/streamed.zig` `Exl3` (`exl3_source.zig`: the EXL3 lane, event-gated
   waves, the next layer's reads predicted, the wide prompt feed, the decode forms / banked waves / hoist / device
   route); the trunk's own MoE never runs for them (`moe`'s `source` arm; the DSpark stages stay resident).
 - The prompt runs in calls of up to `bill.stream_call_rows`, each one MoE call a layer over all its rows
   (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
-- EXL3 admission caps owners at `min(Caps.active_slots, --max-concurrent)`; the plugin also refuses excess claims.
-  Load-time bank sizing reserves two live states with snapshots/backing capacity and one shared workspace.
+- Portable M2 EXL3 admission caps owners at `min(Caps.active_slots, --max-concurrent)`; the plugin also refuses excess claims.
+  Its bank sizing reserves two live states with snapshots/backing capacity and one shared workspace.
   Idle legacy-resume state is adopted or freed before a cold forward could allocate a third context.
 - Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
   grows the rows into what the prompt's working set held.
@@ -79,7 +79,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
 
 ## Known issues
-- Auxiliary snapshots are RAM-only; serialization and shortened slices return named unsupported verdicts.
+- Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization
+  and shortened slices still return named unsupported verdicts. SSD-only module retention is unsupported.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Prefill compute-bound at ~16 TFLOPS; the MoE at 2048 rows streams each layer's expert bank 4x per 8192 chunk
   (M about 32 per expert): the single biggest inefficiency.

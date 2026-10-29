@@ -54,8 +54,9 @@ pub fn streamRetainedBytes(c: *const cfg_mod.Config, context: u64) u64 {
     return backing *| 2 +| context *| 32;
 }
 
-/// All retained contexts, but only one prompt/decode workspace and one active growth/verify coexistence term.
+/// Zero slots retains the single-flight bill; bounded slots share one workspace and one active growth term.
 pub fn streamReserveAt(c: *const cfg_mod.Config, context: u64, chunk: u64, slots: u8) u64 {
+    if (slots == 0) return prefillAt(c, context, chunk);
     const old_state = context *| kvPerToken(c) +| @as(u64, c.num_hidden_layers) *| (c.sliding_window + @as(u64, 16)) *| c.head_dim *| 2;
     const retained = streamRetainedBytes(c, context);
     const workspace = prefillAt(c, context, chunk) -| (old_state *| 5 / 4);
@@ -66,12 +67,12 @@ pub fn streamReserveAt(c: *const cfg_mod.Config, context: u64, chunk: u64, slots
 /// `--wired-margin-gib`) and `stream_host_bytes`, the memory in use now (the residents loaded, every other process)
 /// and the phase's working set at `context` positions (a prompt: one `stream_call_rows` call's; decode: the state at
 /// `context + stream_generation`).
-pub fn streamBudget(config: *const cfg_mod.Config, context: u64, wired_margin: u64) struct { prompt: u64, decode: u64 } {
+pub fn streamBudget(config: *const cfg_mod.Config, context: u64, wired_margin: u64, active_slots: u8) struct { prompt: u64, decode: u64 } {
     const in_use = system.getTotalMemBytes() -| system.getAvailableMemBytes();
     const box = @as(u64, mlx.maxRecommendedWorkingSet()) -| wired_margin -| stream_host_bytes -| in_use;
     return .{
-        .prompt = box -| streamReserveAt(config, context, stream_call_rows, stream_active_slots),
-        .decode = box -| streamReserveAt(config, context + stream_generation, 1, stream_active_slots),
+        .prompt = box -| streamReserveAt(config, context, stream_call_rows, active_slots),
+        .decode = box -| streamReserveAt(config, context + stream_generation, 1, active_slots),
     };
 }
 
@@ -132,4 +133,27 @@ test "deepseek_v41 streamed reserve: two retained contexts share one workspace a
     c.dsv4_n_compress_ratios = 5;
     c.dsv4_n_dspark_target_layers = 3;
     try std.testing.expect(streamRetainedBytes(&c, ctx) > retained);
+}
+
+test "deepseek_v41 streamed reserve: legacy policy retains the exact upstream workspace bill" {
+    var c: cfg_mod.Config = .{};
+    c.num_hidden_layers = 2;
+    c.hidden_size = 5120;
+    c.head_dim = 512;
+    c.sliding_window = 128;
+    c.num_attention_heads = 64;
+    c.dsv4_hc_mult = 4;
+    c.dsv4_index_topk = 512;
+    c.dsv4_index_head_dim = 128;
+    c.dsv4_n_compress_ratios = 2;
+    c.dsv4_compress_ratios[0] = 1;
+    c.dsv4_compress_ratios[1] = 2;
+    c.dsv41_kv_sources = 3;
+    c.dsv41_index_sources = 3;
+    for ([_]u64{ 16384, 196608, 204800 }) |context| {
+        for ([_]u64{ 1, stream_call_rows }) |chunk| {
+            try std.testing.expectEqual(prefillAt(&c, context, chunk), streamReserveAt(&c, context, chunk, 0));
+            try std.testing.expect(streamReserveAt(&c, context, chunk, stream_active_slots) > streamReserveAt(&c, context, chunk, 0));
+        }
+    }
 }

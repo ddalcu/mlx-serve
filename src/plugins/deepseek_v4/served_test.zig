@@ -187,7 +187,7 @@ test "deepseek_v41 served: two slots decode in one batched tick through the driv
     }
 }
 
-test "deepseek_v41 served: generic request prefill and commit retain alternating conversations after slot release" {
+test "deepseek_v41 served: disk-disabled requests retain alternating RAM conversations after slot release" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -196,6 +196,7 @@ test "deepseek_v41 served: generic request prefill and commit retain alternating
     defer p.close();
     const h = try Requests.open(p);
     defer h.close();
+    try testing.expect(h.entry.prefix_cache.?.disk == null);
     const a = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
     const b = [_]u32{ 5, 8, 13, 21, 34, 55, 89, 4 };
     for ([_][]const u32{ &a, &b, &a, &b, &a, &b }, 0..) |prompt, i| {
@@ -298,7 +299,376 @@ const Requests = struct {
         try prefill_request.runPrefill(&h.sch, s);
         return s;
     }
+
+    fn attachDisk(h: *Requests, p: *Served) !void {
+        var buf: [512]u8 = undefined;
+        const path = buf[0..try p.tmp.dir.realPath(h.sch.io, &buf)];
+        const hc = h.entry.prefix_cache.?;
+        hc.disk = try @import("../../engines/mlx/load.zig").initPrefixDisk(testing.allocator, h.sch.io, path, "module-requests", 0, 512, prefix_cache.ModuleBinding.init(&p.xfm).?, path);
+        hc.disk.?.armTestSpace(1 << 40, 2 << 40);
+        hc.armDiskTier(&p.cfg);
+        try testing.expect(!hc.ssd_first);
+        try testing.expect(hc.disk.?.writer != null);
+    }
+
+    fn finishDisk(h: *Requests) !void {
+        const hc = h.entry.prefix_cache.?;
+        for (0..32) |_| {
+            const result = hc.flushOwedSlice(h.entry.transformer.?.s);
+            hc.disk.?.drainWriter();
+            hc.disk.?.pollModuleWrites();
+            if (result == .done) return;
+        }
+        return error.ModuleFlushDidNotFinish;
+    }
+
+    fn seedDisk(h: *Requests, prompt: []const u32) !u64 {
+        const s = try h.prefill(prompt);
+        defer s.deinit();
+        return h.commitDisk(s);
+    }
+
+    fn commitDisk(h: *Requests, s: *RequestSlot) !u64 {
+        commit_request.commitSlotIfApplicable(&h.sch, s);
+        finish_request.releasePluginSlot(s);
+        const hc = h.entry.prefix_cache.?;
+        const id = hc.entries.items[0].module.?.disk_id.?;
+        try h.finishDisk();
+        try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+        hc.setBudget(1);
+        hc.setBudget(0);
+        try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
+        return id;
+    }
+
+    fn mediaSlot(h: *Requests, prompt: []const u32, rows: Array, media: []const prefix_cache.MediaSpan) !*RequestSlot {
+        var owned = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(owned);
+        try mlx.check(mlx.mlx_array_set(&owned, rows));
+        return RequestSlot.init(testing.allocator, h.sch.io, h.entry.config.?, .{
+            .model = h.entry,
+            .prompt_ids = prompt,
+            .vision_embeddings = owned,
+            .media = media,
+            .sampling = .{ .temperature = 0 },
+            .eos_token_ids = &.{},
+            .max_tokens = 2,
+        }, KVQuantConfig.dense);
+    }
 };
+
+fn diskPrompt() [513]u32 {
+    var prompt: [513]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast(3 + i % 80);
+    return prompt;
+}
+
+test "deepseek_v41 served: disk import restores exact counters and cold-reference logits" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_]bool{ false, true }) |dspark| {
+        const files = if (dspark) try fixture.v41DsparkFiles(arena.allocator(), 7) else try fixture.v41Files(arena.allocator(), 7);
+        const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+        defer p.close();
+        const h = try Requests.open(p);
+        defer h.close();
+        try h.attachDisk(p);
+        const prompt = diskPrompt();
+        const id = try h.seedDisk(&prompt);
+        const warm = try h.prefill(&prompt);
+        defer warm.deinit();
+        try testing.expectEqual(@as(u32, 512), warm.cached_tokens);
+        try testing.expectEqual(@as(usize, 513), warm.cache.step);
+        try testing.expect(h.entry.prefix_cache.?.disk.?.entryWholeOnDisk(id));
+        var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+        defer g.deinit();
+        const probe = try g.fromSlice(i32, &.{44}, &.{ 1, 1 });
+        const logits = try g.adopt(try p.xfm.forwardWith(&warm.legacy_gen.?.ctx, probe));
+        try ops.eval(logits);
+        const token = warm.legacy_gen.?.next_token_id;
+        finish_request.releasePluginSlot(warm);
+        const cold = try h.newSlot(&prompt);
+        defer cold.deinit();
+        cold.skip_prefix_cache = true;
+        try prefill_request.runPrefill(&h.sch, cold);
+        try testing.expectEqual(@as(u32, 0), cold.cached_tokens);
+        try testing.expectEqual(token, cold.legacy_gen.?.next_token_id);
+        const reference = try g.adopt(try p.xfm.forwardWith(&cold.legacy_gen.?.ctx, probe));
+        try testing.expect(try sameValues(&g, logits, reference));
+        finish_request.releasePluginSlot(cold);
+    }
+}
+
+test "deepseek_v41 served: entries zero and RAM disabled bypass a valid disk history" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    try h.attachDisk(p);
+    const prompt = diskPrompt();
+    const id = try h.seedDisk(&prompt);
+    const hc = h.entry.prefix_cache.?;
+    for ([_]bool{ false, true }) |ram| {
+        hc.ram_enabled = ram;
+        hc.max_entries = if (ram) 0 else 4;
+        const s = try h.prefill(&prompt);
+        defer s.deinit();
+        try testing.expectEqual(@as(u32, 0), s.cached_tokens);
+        commit_request.commitSlotIfApplicable(&h.sch, s);
+        finish_request.releasePluginSlot(s);
+        try testing.expectEqual(@as(usize, 0), hc.entries.items.len);
+        try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+    }
+}
+
+test "deepseek_v41 served: peak refusal precedes tensor loading and preserves the disk record" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    const old_fits = scheduler.prefill_admission_fits;
+    defer scheduler.prefill_admission_fits = old_fits;
+    scheduler.prefill_admission_fits = null;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    try h.attachDisk(p);
+    const prompt = diskPrompt();
+    const id = try h.seedDisk(&prompt);
+    const part = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}/m000.safetensors", .{ h.entry.prefix_cache.?.disk.?.root, id });
+    defer testing.allocator.free(part);
+    const original = try std.Io.Dir.cwd().readFileAlloc(h.sch.io, part, testing.allocator, .limited(64 << 20));
+    defer testing.allocator.free(original);
+    try std.Io.Dir.cwd().writeFile(h.sch.io, .{ .sub_path = part, .data = "temporarily unavailable tensor file" });
+    const limits = @import("../../host/registry/memory_ceiling.zig").overrides();
+    const old = limits.*;
+    defer limits.* = old;
+    limits.* = .{ .static_ceiling = 1, .wired_limit_mb = 0 };
+    const s = try h.prefill(&prompt);
+    defer s.deinit();
+    try testing.expectEqual(@as(u32, 0), s.cached_tokens);
+    finish_request.releasePluginSlot(s);
+    try std.Io.Dir.cwd().writeFile(h.sch.io, .{ .sub_path = part, .data = original });
+    try testing.expect(h.entry.prefix_cache.?.disk.?.entryWholeOnDisk(id));
+    limits.* = old;
+    const warm = try h.prefill(&prompt);
+    defer warm.deinit();
+    try testing.expectEqual(@as(u32, 512), warm.cached_tokens);
+    finish_request.releasePluginSlot(warm);
+}
+
+test "deepseek_v41 served: idle staging pressure cancels its source before materialization" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    try h.attachDisk(p);
+    const prompt = diskPrompt();
+    const s = try h.prefill(&prompt);
+    defer s.deinit();
+    commit_request.commitSlotIfApplicable(&h.sch, s);
+    finish_request.releasePluginSlot(s);
+    const hc = h.entry.prefix_cache.?;
+    try testing.expect(hc.nextModuleStagingBytes() > 0);
+    const limits = @import("../../host/registry/memory_ceiling.zig").overrides();
+    const old = limits.*;
+    defer limits.* = old;
+    limits.* = .{ .static_ceiling = 1, .wired_limit_mb = 0 };
+    try testing.expectEqual(.done, @import("../../engines/mlx/cache/budget.zig").flushOwedDiskSlices(&h.sch));
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
+    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+}
+
+test "deepseek_v41 served: unsupported disk hooks preserve RAM reuse" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    try h.attachDisk(p);
+    const Refuse = struct {
+        var calls: usize = 0;
+        fn plan(_: *anyopaque, _: abi.Str, out: *u64) callconv(.c) abi.Verdict {
+            calls += 1;
+            out.* = 0;
+            return abi.Verdict.refuse(.unsupported, "fixture has RAM snapshots only");
+        }
+    };
+    const bound = p.xfm.plugin.?;
+    const old = bound.table;
+    defer bound.table = old;
+    var hooks = old.cache.aux.?.*;
+    hooks.import_plan = &Refuse.plan;
+    var cache_hooks = old.cache.*;
+    cache_hooks.aux = &hooks;
+    var table = old.*;
+    table.cache = &cache_hooks;
+    bound.table = &table;
+    Refuse.calls = 0;
+    const prompt = diskPrompt();
+    for (0..2) |i| {
+        const s = try h.prefill(&prompt);
+        defer s.deinit();
+        try testing.expectEqual(@as(u32, if (i == 0) 0 else 512), s.cached_tokens);
+        commit_request.commitSlotIfApplicable(&h.sch, s);
+        finish_request.releasePluginSlot(s);
+    }
+    try testing.expect(Refuse.calls > 0);
+    try testing.expectEqual(@as(usize, 0), h.entry.prefix_cache.?.disk.?.entries.items.len);
+    try testing.expectEqual(@as(u64, 0), h.entry.prefix_cache.?.disk.?.bytes_persisted);
+}
+
+fn expectDiskMedia(appended: bool) !void {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const json = try std.mem.replaceOwned(u8, arena.allocator(), files[0].bytes, "\"eos_token_id\": 1,", "\"eos_token_id\": 1, \"image_token_id\": 5,");
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, &.{ .{ .name = "config.json", .bytes = json }, files[1] }, "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    try h.attachDisk(p);
+    var prompt = @as([515]u32, @splat(3));
+    prompt[64] = 5;
+    prompt[513] = 5;
+    const spans = [_]prefix_cache.MediaSpan{ .{ .start = 64, .key = 42 }, .{ .start = 513, .key = 99 } };
+    var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const original = try g.astype(try g.fromSlice(f32, &@as([128]f32, @splat(0.25)), &.{ 1, 1, 128 }), .bfloat16);
+    const seed = try h.mediaSlot(prompt[0..513], original, spans[0..1]);
+    defer seed.deinit();
+    try prefill_request.runPrefill(&h.sch, seed);
+    const id = try h.commitDisk(seed);
+    var values = @as([256]f32, @splat(0.75));
+    if (appended) @memset(values[0..128], 0.25);
+    const changed = try g.astype(try g.fromSlice(f32, &values, &.{ 1, 2, 128 }), .bfloat16);
+    const next = try h.mediaSlot(&prompt, changed, &spans);
+    defer next.deinit();
+    try prefill_request.runPrefill(&h.sch, next);
+    try testing.expectEqual(@as(u32, if (appended) 512 else 0), next.cached_tokens);
+    finish_request.releasePluginSlot(next);
+    try testing.expect(h.entry.prefix_cache.?.disk.?.entryWholeOnDisk(id));
+    const again = try h.mediaSlot(prompt[0..513], original, spans[0..1]);
+    defer again.deinit();
+    try prefill_request.runPrefill(&h.sch, again);
+    try testing.expectEqual(@as(u32, 512), again.cached_tokens);
+    finish_request.releasePluginSlot(again);
+}
+
+test "deepseek_v41 served: changed covered media rows miss without poisoning disk history" {
+    try expectDiskMedia(false);
+}
+
+test "deepseek_v41 served: appended media leaves an exact disk checkpoint eligible" {
+    try expectDiskMedia(true);
+}
+
+test "deepseek_v41 served: disk imports use their owning model with a foreign cache view" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+    defer p.close();
+    const q = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+    defer q.close();
+    const a = try Requests.open(p);
+    defer a.close();
+    const b = try Requests.open(q);
+    defer b.close();
+    try a.attachDisk(p);
+    try b.attachDisk(q);
+    const prompt = diskPrompt();
+    _ = try a.seedDisk(&prompt);
+    _ = try b.seedDisk(&prompt);
+    a.sch.hot_prefix_cache = b.entry.prefix_cache;
+    b.sch.hot_prefix_cache = a.entry.prefix_cache;
+    for ([_]*Requests{ a, b }) |h| {
+        const s = try h.prefill(&prompt);
+        defer s.deinit();
+        try testing.expectEqual(@as(u32, 512), s.cached_tokens);
+        finish_request.releasePluginSlot(s);
+        try testing.expectEqual(@as(u64, 0), driver.stateBytes(h.entry.transformer.?));
+    }
+}
+
+test "deepseek_v41 served: failed imported restore resets the prompt and retires only its record" {
+    try expectImportFallback(.restore);
+}
+
+test "deepseek_v41 served: failed restored prompt setup retries cold with zero cached tokens" {
+    try expectImportFallback(.prompt);
+}
+
+test "deepseek_v41 served: failed tensor import releases its inputs and prefills cold" {
+    try expectImportFallback(.arrays);
+}
+
+fn expectImportFallback(comptime failure: enum { arrays, restore, prompt }) !void {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    try h.attachDisk(p);
+    const prompt = diskPrompt();
+    const id = try h.seedDisk(&prompt);
+    const Refuse = struct {
+        var calls: usize = 0;
+        var original: *const abi.AuxHooks = undefined;
+        fn arrays(_: *anyopaque, _: abi.Span(u32), _: abi.Str, _: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) abi.Verdict {
+            calls += 1;
+            out.* = null;
+            return abi.Verdict.refuse(.failed, "injected import failure");
+        }
+        fn restore(_: *anyopaque, _: u32, _: abi.Handle, _: u64) callconv(.c) abi.Verdict {
+            calls += 1;
+            return abi.Verdict.refuse(.failed, "injected restore failure");
+        }
+        fn beginPrompt(mp: *anyopaque, slot: u32, ids: abi.Span(u32), rows: abi.Array, n: u64, capture: bool) callconv(.c) abi.Verdict {
+            if (n == 0) return original.begin_prompt(mp, slot, ids, rows, n, capture);
+            calls += 1;
+            return abi.Verdict.refuse(.failed, "injected prompt setup failure");
+        }
+    };
+    const bound = p.xfm.plugin.?;
+    const old = bound.table;
+    defer bound.table = old;
+    var hooks = old.cache.aux.?.*;
+    switch (failure) {
+        .arrays => hooks.import_arrays = &Refuse.arrays,
+        .restore => hooks.restore_at = &Refuse.restore,
+        .prompt => hooks.begin_prompt = &Refuse.beginPrompt,
+    }
+    Refuse.original = old.cache.aux.?;
+    var cache_hooks = old.cache.*;
+    cache_hooks.aux = &hooks;
+    var table = old.*;
+    table.cache = &cache_hooks;
+    bound.table = &table;
+    Refuse.calls = 0;
+    const s = try h.prefill(&prompt);
+    defer s.deinit();
+    try testing.expectEqual(@as(usize, 1), Refuse.calls);
+    try testing.expectEqual(@as(u32, 0), s.cached_tokens);
+    try testing.expectEqual(@as(usize, 513), s.cache.step);
+    try testing.expect(h.entry.prefix_cache.?.disk.?.entryPoisoned(id));
+    finish_request.releasePluginSlot(s);
+    try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
+}
 
 test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snapshot IDs commit nothing" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;

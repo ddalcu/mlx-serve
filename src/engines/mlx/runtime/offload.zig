@@ -112,6 +112,7 @@ fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.Actio
             slot.state = .decoding;
             slot.emitPrefilled();
         },
+        .audio => slot.emitAudio(abi.items(u32, ev.codes), abi.items(f32, ev.samples), ev.sample_rate),
         .tokens => {
             const lps = abi.items(abi.Logprob, ev.logprobs);
             for (abi.items(u32, ev.tokens), 0..) |t, i| {

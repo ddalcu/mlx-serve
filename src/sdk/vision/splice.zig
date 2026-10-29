@@ -12,6 +12,11 @@ const testing = std.testing;
 /// keeps a chunk boundary inside an image from restarting the scatter at
 /// row 0. Frees `h` and returns the spliced replacement.
 pub fn spliceVisionRows(h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32, video_token_id: u32, row_offset: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    return spliceRows(h, token_ids, vision_emb, &.{ image_token_id, audio_token_id, video_token_id }, row_offset, s);
+}
+
+/// `spliceVisionRows` over any set of placeholder ids (0 = unset).
+pub fn spliceRows(h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, placeholder_ids: []const u32, row_offset: usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const h_shape = mlx.getShape(h);
 
     // mask = token_ids is any placeholder id. Every modality splices through
@@ -23,7 +28,7 @@ pub fn spliceVisionRows(h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: 
     defer _ = mlx.mlx_array_free(mask_2d);
     const ids_shape = mlx.getShape(token_ids);
     try mlx.check(mlx.mlx_zeros(&mask_2d, ids_shape.ptr, ids_shape.len, .bool_, s));
-    for ([_]u32{ image_token_id, audio_token_id, video_token_id }) |extra_id| {
+    for (placeholder_ids) |extra_id| {
         if (extra_id == 0) continue;
         const extra_arr = mlx.mlx_array_new_int(@intCast(extra_id));
         defer _ = mlx.mlx_array_free(extra_arr);

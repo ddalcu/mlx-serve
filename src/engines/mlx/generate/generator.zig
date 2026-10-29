@@ -122,6 +122,8 @@ pub const Generator = struct {
     // partial-accept rollback.
     last_hidden: mlx.mlx_array = .{},
     has_last_hidden: bool = false,
+    /// A spoken reply's state (`speech.zig`), owned with the generator's allocator.
+    speech: ?*@import("speech.zig").State = null,
     /// PRNG for PLD / drafter stochastic-verify accept test (probability-
     /// ratio requires a uniform draw per draft step). Seeded from
     /// `sampling.seed` when set, otherwise from system time at init.
@@ -577,6 +579,11 @@ pub const Generator = struct {
         if (self.has_last_hidden) {
             _ = mlx.mlx_array_free(self.last_hidden);
             self.has_last_hidden = false;
+        }
+        if (self.speech) |st| {
+            st.deinit();
+            st.a.destroy(st);
+            self.speech = null;
         }
         if (self.prompt_ids_alloc) |a| {
             a.free(self.prompt_ids_owned);

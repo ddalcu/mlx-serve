@@ -548,12 +548,19 @@ const SlotReadiness = struct {
         var parsed: abi.Parsed = .{};
         try testing.expect(plugin.table.parse(&pd, .of(exl3_config_json), .{}, null, false, &parsed).isOk());
         errdefer plugin.table.free_parsed(&parsed);
-        try testing.expect(parsed.caps.slot_state and !parsed.caps.batches_decode);
-        try testing.expectEqual(@as(u8, 2), parsed.caps.active_slots);
+        try testing.expect(!parsed.caps.slot_state and parsed.caps.whole_prompt_prefill);
+        try testing.expectEqual(@as(u8, 0), parsed.caps.active_slots);
+        var runtime_caps = parsed.caps;
         var verdict: abi.Verdict = .{};
         const s = mlx.gpuStream();
         errdefer _ = mlx.mlx_stream_free(s);
-        const mp = plugin.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &parsed, .settings_json = .of("{\"ctx_size\":1024}"), .stream = .{ .ctx = s.ctx } }, &verdict) orelse return error.M2ServedExl3Refused;
+        const mp = plugin.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &parsed, .runtime_caps = &runtime_caps, .settings_json = .of("{\"ctx_size\":1024}"), .stream = .{ .ctx = s.ctx } }, &verdict) orelse return error.M2ServedExl3Refused;
+        errdefer plugin.table.unload(mp);
+        try testing.expect(runtime_caps.slot_state and !runtime_caps.batches_decode and !runtime_caps.whole_prompt_prefill);
+        try testing.expectEqual(@as(u8, 2), runtime_caps.active_slots);
+        const loaded: *plugin.Model = @ptrCast(@alignCast(mp));
+        try testing.expectEqual(@as(u64, @bitCast(runtime_caps)), @as(u64, @bitCast(loaded.caps)));
+        parsed.caps = runtime_caps;
         return .{ .parsed = parsed, .mp = mp, .stream = s };
     }
 

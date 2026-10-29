@@ -1,6 +1,7 @@
 //! modelEngineName, mlxGgufClaims; ReadyCaps, readyCapsJson; loadedSupportsVideo, renderModelEntry, handleModels;
 //! renderModelsBody, load progress, rescan, handleLoadModelStrict; unload
 
+const speech_api = @import("speech.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
@@ -101,6 +102,9 @@ const ReadyCaps = struct {
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
     has_decision_engine: bool = false,
+    has_speech: bool = false,
+    /// It speaks its reply to a request with tools (`SpeechFacts.tools`).
+    has_speech_tools: bool = false,
 };
 
 /// Chat capability for a READY entry. Template presence is NOT the gate for
@@ -136,6 +140,8 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_vision) try append_cap(allocator, &caps, &n_caps, "vision");
     if (c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
     if (c.has_transcription) try append_cap(allocator, &caps, &n_caps, "transcription");
+    if (c.has_speech) try append_cap(allocator, &caps, &n_caps, "speech");
+    if (c.has_speech_tools) try append_cap(allocator, &caps, &n_caps, "speech_tools");
     if (c.has_alignment) try append_cap(allocator, &caps, &n_caps, "alignment");
     if (c.has_diarization) try append_cap(allocator, &caps, &n_caps, "diarization");
     if (c.has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
@@ -202,16 +208,20 @@ pub fn renderModelEntry(
             .has_mesh_engine = PluginEngine.serves(entry.media_plugin, media_mod.Modality.mesh),
             .has_decision_engine = PluginEngine.serves(entry.media_plugin, media_mod.Modality.decision),
             .has_diarization = PluginEngine.serves(entry.media_plugin, media_mod.Modality.diarization),
+            .has_speech = config.speech() != null,
+            .has_speech_tools = if (config.speech()) |f| f.tools else false,
         });
         defer caps.deinit(allocator);
+        // A model that speaks answers in audio too (`modalities` on chat, `/v1/audio/speech` in its voices).
+        const speech_part = if (config.speech() != null) blk: {
+            const voices = try speech_api.voicesJson(allocator);
+            defer allocator.free(voices);
+            break :blk try std.fmt.allocPrint(allocator, ",\"output_modalities\":[\"text\",\"audio\"],\"voices\":{s}", .{voices});
+        } else try allocator.dupe(u8, "");
+        defer allocator.free(speech_part);
 
-        var mods = std.ArrayList(u8).empty;
-        defer mods.deinit(allocator);
-        try mods.appendSlice(allocator, "[\"text\"");
-        if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
-        if (mf.video) try mods.appendSlice(allocator, ",\"video\"");
-        if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
-        try mods.append(allocator, ']');
+        const mods = try inputModalities(allocator, has_vision, mf.video, has_audio);
+        defer allocator.free(mods);
 
         // Loaded and unloaded rows report the same `architecture` — the
         // registry's arch hint (the pack's real model_type), never the stub
@@ -255,7 +265,7 @@ pub fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s}{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s}{s}{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id_json,
             nowSecs(io),
@@ -269,7 +279,8 @@ pub fn renderModelEntry(
             ctx_str,
             if (batchVerdictFor(entry) == .ok) "true" else "false",
             caps.items,
-            mods.items,
+            mods,
+            speech_part,
             facts,
             arch_label,
             modelEngineName(if (entry.engine) |e| e.kind else null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.config, entry.path, entry.arch_hint),
@@ -388,14 +399,19 @@ pub fn renderModelEntry(
     const facts = try row_facts.forEntry(allocator, io, entry, entry.arch_hint, if (stub_chat) (if (sm.found) sm.max_position_embeddings else 0) else null, mlxGgufClaims(io, entry));
     defer allocator.free(facts);
 
-    const mods_part: []const u8 = if (sm.found and sm.has_vision and sm.has_video)
-        ",\"input_modalities\":[\"text\",\"image\",\"video\"]"
-    else if (sm.found and sm.has_vision)
-        ",\"input_modalities\":[\"text\",\"image\"]"
-    else if ((sm.found and sm.has_chat) or is_gguf_stub)
-        ",\"input_modalities\":[\"text\"]"
-    else
-        "";
+    const mods_part: []const u8 = if (sm.found and (sm.has_vision or sm.has_audio or sm.has_chat) or is_gguf_stub) blk: {
+        const m = try inputModalities(allocator, sm.found and sm.has_vision, sm.found and sm.has_vision and sm.has_video, sm.found and sm.has_audio);
+        defer allocator.free(m);
+        break :blk try std.fmt.allocPrint(allocator, ",\"input_modalities\":{s}", .{m});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(mods_part);
+    // The same speech facts a loaded row carries: the app picks its native-voice mic before the model loads.
+    const stub_speech = if (sm.found and sm.has_speech) blk: {
+        const voices = try speech_api.voicesJson(allocator);
+        defer allocator.free(voices);
+        break :blk try std.fmt.allocPrint(allocator, ",\"output_modalities\":[\"text\",\"audio\"],\"voices\":{s}", .{voices});
+    } else try allocator.dupe(u8, "");
+    defer allocator.free(stub_speech);
 
     const arch_part: []const u8 = if (entry.arch_hint.len > 0) blk: {
         // arch_hint comes from config.json's model_type via discovery — the
@@ -441,8 +457,8 @@ pub fn renderModelEntry(
     const id_json = try jsonEscape(allocator, entry.id);
     defer allocator.free(id_json);
     return std.fmt.allocPrint(allocator,
-        \\{{"id":{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ id_json, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, facts, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ id_json, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, stub_speech, facts, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 pub fn handleModels(
@@ -1004,6 +1020,33 @@ test "input_modalities renders resident video weights and native unloaded capabi
     try expect_modalities(a, io, entry, &.{ "text", "image" });
     entry.state = .unloaded;
     try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
+}
+
+/// A row's `input_modalities`, loaded or not: text, then what the model reads besides.
+fn inputModalities(a: std.mem.Allocator, vision: bool, video: bool, audio: bool) ![]u8 {
+    return std.fmt.allocPrint(a, "[\"text\"{s}{s}{s}]", .{
+        if (vision) ",\"image\"" else "", if (video) ",\"video\"" else "", if (audio) ",\"audio\"" else "",
+    });
+}
+
+test "an unloaded pack that sees and hears lists both, as its loaded row does" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("../../engines/mlx/plugin/fixtures/mlx_lm/LiquidAI_LFM3-Omni-2B-MLX-8bit.json") });
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("omni", path, 0);
+    const json = try renderModelEntry(a, io, entry);
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const mods = parsed.value.object.get("input_modalities").?.array.items;
+    try testing.expectEqual(@as(usize, 4), mods.len);
+    try testing.expectEqualStrings("audio", mods[3].string);
 }
 
 test "an unloaded row carries its agent budget, media modality and engines" {

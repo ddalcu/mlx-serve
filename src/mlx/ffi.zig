@@ -1447,8 +1447,10 @@ fn FaultSite(comptime name: @EnumLiteral()) type {
     };
 }
 
-var fault_chunk = FaultSite(.MLX_FAULT_CHUNK){ .msg = FAULT_CHUNK_MSG };
-var fault_step = FaultSite(.MLX_FAULT_STEP){ .msg = FAULT_STEP_MSG };
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): the host's plugin table and the engine count one checkpoint
+/// sequence.
+pub const fault_chunk = @import("../sdk/util/shared.zig").Shared(FaultSite(.MLX_FAULT_CHUNK), "mlx_fault_chunk", .{ .msg = FAULT_CHUNK_MSG });
+pub const fault_step = @import("../sdk/util/shared.zig").Shared(FaultSite(.MLX_FAULT_STEP), "mlx_fault_step", .{ .msg = FAULT_STEP_MSG });
 
 /// Consume a latched failure: `error.OutOfMemory` for the memory class, else `error.MlxFailure`.
 fn consumeLatch() !void {
@@ -1461,14 +1463,14 @@ fn consumeLatch() !void {
 
 /// Prefill checkpoint: once per chunk plus once after the last.
 pub fn checkError() !void {
-    fault_chunk.maybeFire();
+    fault_chunk.get().maybeFire();
     return consumeLatch();
 }
 
 /// Decode checkpoint: once per decode tick, after the forward. Without it a failed decode
 /// forward finished 200 with garbage and handed the latch to the NEXT request's prefill.
 pub fn checkErrorDecode() !void {
-    fault_step.maybeFire();
+    fault_step.get().maybeFire();
     return consumeLatch();
 }
 
@@ -1477,8 +1479,8 @@ pub fn latchErrorForTest(msg: [:0]const u8) void {
 }
 
 pub fn resetFaultChunkForTest() void {
-    fault_chunk.reset();
-    fault_step.reset();
+    fault_chunk.get().reset();
+    fault_step.get().reset();
     var buf: [512]u8 = undefined;
     _ = takeError(&buf);
 }

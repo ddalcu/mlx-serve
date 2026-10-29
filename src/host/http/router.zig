@@ -35,6 +35,7 @@ const renderLoadProgressBody = @import("../api/models.zig").renderLoadProgressBo
 const handleModelsRescan = @import("../api/models.zig").handleModelsRescan;
 const handleLoadModelStrict = @import("../api/models.zig").handleLoadModelStrict;
 const handleTranscriptions = @import("../api/audio.zig").handleTranscriptions;
+const handleSpeech = @import("../api/audio.zig").handleSpeech;
 const handleGen = @import("../media_jobs/http.zig").handleGen;
 const handleUnloadModelStrict = @import("../api/models.zig").handleUnloadModelStrict;
 const handleProps = @import("../api/props.zig").handleProps;
@@ -656,7 +657,9 @@ pub fn handleConnection(
     } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/audio/speech")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleGen(allocator, stream, body, lm, .speech);
+        // A language model that speaks (LFM3-Audio) answers here itself; media TTS backends go through the gen path.
+        const speaks = if (lm.config) |c| c.speech() != null else false;
+        if (speaks) try handleSpeech(allocator, stream, body, lm) else try handleGen(allocator, stream, body, lm, .speech);
     } else if (std.mem.eql(u8, method, "POST") and (isRoute(path, "/v1/decisions") or isRoute(path, "/v1/systemone"))) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];

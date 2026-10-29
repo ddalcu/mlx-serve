@@ -57,6 +57,8 @@ pub fn parseServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, conf
 pub fn adapted(b: *Binding) ModelConfig {
     var cfg = modelConfig(&b.parsed);
     applyLayout(&cfg, b.table, &b.parsed);
+    // An outside plugin's images ride the host's patch-grid path (`host/media/plugin_media.zig`).
+    if (!b.outside) applyMedia(&cfg, b.table, &b.parsed);
     cfg.plugin = b;
     return cfg;
 }
@@ -186,7 +188,7 @@ pub fn stubOf(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json:
     var p: abi.Parsed = .{};
     if (!table.parse(&dir, abi.Str.of(config_json), .{}, null, true, &p).isOk()) return null;
     defer table.free_parsed(&p);
-    return .{ .shell = p.shell, .caps = p.caps };
+    return .{ .shell = p.shell, .caps = p.caps, .speaks = p.speech.codebooks != 0 };
 }
 
 fn optF32(v: f32) ?f32 {
@@ -268,6 +270,13 @@ fn applySamplingDefaults(c: *ModelConfig, d: abi.SamplingDefaults) void {
     if (wild) if (optF32(d.wild_temp_override)) |t| {
         c.gen_temperature = t;
     };
+}
+
+/// A plugin with its own towers: an encoder loads for any media its caps declare.
+pub fn applyMedia(c: *ModelConfig, table: *const abi.ModelTable, p: *const abi.Parsed) void {
+    if (table.media == null) return;
+    c.plugin_media = true;
+    c.has_vision = p.caps.images or p.caps.video or p.caps.audio;
 }
 
 /// The per-layer facts the engine reads off the config (`isGlobalLayer`, the sliding window, KV sharing), from the

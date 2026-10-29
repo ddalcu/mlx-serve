@@ -24,6 +24,8 @@ pub const Failure = struct { path: []u8, err_name: []const u8 };
 /// Where an injected failure strikes. See `Writer.fail_at`.
 pub const FailAt = enum { write, submit };
 
+pub const SubmitResult = enum { accepted, busy };
+
 /// Failed paths kept for attribution; past this `unattributed_failure` is raised.
 pub const MAX_RECORDED_FAILURES: usize = 256;
 
@@ -157,6 +159,25 @@ pub const Writer = struct {
         self.work.signal(self.io);
     }
 
+    /// Stage without waiting for the byte permit. Only `accepted` transfers both buffers;
+    /// `busy` and errors leave them with the caller and the queue unchanged.
+    pub fn trySubmit(self: *Writer, path: []u8, bytes: []u8) !SubmitResult {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (!self.running or self.deinited) return error.WriterStopped;
+        if (self.injectedLocked(path, .submit)) return error.InjectedSubmitFailure;
+        if (self.pending_bytes + self.inflight_bytes + bytes.len > self.permit_bytes and
+            (self.queue.items.len > 0 or self.inflight_bytes > 0)) return .busy;
+        try self.queue.append(self.allocator, .{
+            .path = path,
+            .bytes = bytes,
+            .epoch = self.epoch,
+        });
+        self.pending_bytes += bytes.len;
+        self.work.signal(self.io);
+        return .accepted;
+    }
+
     /// Wait until the files staged for `path_prefix` have been written (or dropped); null = all.
     pub fn drainPrefix(self: *Writer, path_prefix: ?[]const u8) void {
         const pre = path_prefix orelse {
@@ -231,6 +252,21 @@ pub const Writer = struct {
     pub fn fence(self: *Writer, path_prefix: ?[]const u8) void {
         self.mutex.lockUncancelable(self.io);
         if (path_prefix == null) self.epoch += 1;
+        self.discardQueuedLocked(path_prefix);
+        while (self.running and self.inflight_bytes > 0) self.done.waitUncancelable(self.io, &self.mutex);
+        self.mutex.unlock(self.io);
+    }
+
+    /// Drop only queued files for this prefix. An in-flight file finishes normally;
+    /// `pendingPrefix` tells the caller when it is safe to remove the directory.
+    pub fn discardPrefix(self: *Writer, path_prefix: []const u8) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.discardQueuedLocked(path_prefix);
+    }
+
+    /// Caller holds the mutex. Discarding one prefix never changes the epoch.
+    fn discardQueuedLocked(self: *Writer, path_prefix: ?[]const u8) void {
         var i: usize = 0;
         while (i < self.queue.items.len) {
             const b = &self.queue.items[i];
@@ -245,8 +281,6 @@ pub const Writer = struct {
             self.files_dropped += 1;
         }
         self.done.broadcast(self.io);
-        while (self.running and self.inflight_bytes > 0) self.done.waitUncancelable(self.io, &self.mutex);
-        self.mutex.unlock(self.io);
     }
 
     /// Test-only: hold / release the writer thread.
@@ -437,6 +471,214 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
 // ── Tests ──
 
 const testing = std.testing;
+
+test "a full paused queue returns busy and the caller can retry both buffers" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+
+    var w = Writer.init(testing.allocator, testing.io);
+    w.permit_bytes = 4;
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    const first = try std.fmt.allocPrint(testing.allocator, "{s}/first.bin", .{root});
+    w.submit(first, try testing.allocator.dupe(u8, "full"));
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/retry.bin", .{root});
+    const bytes = try testing.allocator.dupe(u8, "next");
+    var caller_owns = true;
+    defer if (caller_owns) {
+        testing.allocator.free(path);
+        testing.allocator.free(bytes);
+    };
+    const result = try w.trySubmit(path, bytes);
+    if (result == .accepted) caller_owns = false;
+    try testing.expectEqual(.busy, result);
+    try testing.expectEqualStrings("next", bytes);
+    try testing.expect(w.isPending(first));
+    try testing.expect(!w.isPending(path));
+    try testing.expectEqual(@as(u64, 4), w.queuedBytes());
+    try testing.expectEqual(@as(u64, 0), w.files_dropped);
+
+    bytes[0] = 'N';
+    w.setPaused(false);
+    w.drain();
+    const retried = try w.trySubmit(path, bytes);
+    if (retried == .accepted) caller_owns = false;
+    try testing.expectEqual(.accepted, retried);
+    w.drain();
+    const got = try tmp.dir.readFileAlloc(testing.io, "retry.bin", testing.allocator, .limited(16));
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings("Next", got);
+    try testing.expectEqual(@as(u64, 2), w.filesWritten());
+}
+
+test "an oversized singleton is accepted and billed at its actual size" {
+    var w = Writer.init(testing.allocator, testing.io);
+    w.permit_bytes = 4;
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    w.injectFailure("oversized", .write);
+    const path = try testing.allocator.dupe(u8, "/oversized.bin");
+    const bytes = try testing.allocator.dupe(u8, "oversized");
+    var caller_owns = true;
+    defer if (caller_owns) {
+        testing.allocator.free(path);
+        testing.allocator.free(bytes);
+    };
+    const result = try w.trySubmit(path, bytes);
+    if (result == .accepted) caller_owns = false;
+    try testing.expectEqual(.accepted, result);
+    try testing.expectEqual(@as(u64, 9), w.pendingBytes());
+    try testing.expect(w.pendingPrefix("/oversized"));
+    w.setPaused(false);
+    w.drain();
+    try testing.expectEqual(@as(u64, 0), w.pendingBytes());
+    try testing.expectEqual(@as(u64, 1), w.writeErrorCount());
+}
+
+test "in-flight bytes hold the permit even when the queue is empty" {
+    var w = Writer.init(testing.allocator, testing.io);
+    defer w.deinit();
+    w.running = true;
+    w.permit_bytes = 4;
+    w.inflight_path = "/other/inflight.bin";
+    w.inflight_bytes = 4;
+    const path = try testing.allocator.dupe(u8, "/next.bin");
+    const bytes = try testing.allocator.dupe(u8, "x");
+    var caller_owns = true;
+    defer if (caller_owns) {
+        testing.allocator.free(path);
+        testing.allocator.free(bytes);
+    };
+    const result = try w.trySubmit(path, bytes);
+    if (result == .accepted) caller_owns = false;
+    try testing.expectEqual(.busy, result);
+    try testing.expectEqualStrings("x", bytes);
+    try testing.expectEqual(@as(u64, 0), w.queuedBytes());
+    try testing.expectEqual(@as(u64, 4), w.pendingBytes());
+    try testing.expect(w.pendingPrefix("/other/"));
+    try testing.expect(!w.isPending(path));
+}
+
+test "a stopped or deinited writer returns an error with caller ownership" {
+    var w = Writer.init(testing.allocator, testing.io);
+    defer w.deinit();
+    const path = try testing.allocator.dupe(u8, "/stopped.bin");
+    defer testing.allocator.free(path);
+    const bytes = try testing.allocator.dupe(u8, "held");
+    defer testing.allocator.free(bytes);
+    try testing.expectError(error.WriterStopped, w.trySubmit(path, bytes));
+    try testing.expectEqualStrings("held", bytes);
+    try testing.expectEqual(@as(u64, 0), w.pendingBytes());
+    try testing.expectEqual(@as(u64, 0), w.files_dropped);
+    w.deinit();
+    try testing.expectError(error.WriterStopped, w.trySubmit(path, bytes));
+    try testing.expectEqualStrings("/stopped.bin", path);
+}
+
+test "injected submission failure leaves both buffers and the queue untouched" {
+    var w = Writer.init(testing.allocator, testing.io);
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    w.injectFailure("reject", .submit);
+    const path = try testing.allocator.dupe(u8, "/reject.bin");
+    defer testing.allocator.free(path);
+    const bytes = try testing.allocator.dupe(u8, "held");
+    defer testing.allocator.free(bytes);
+    try testing.expectError(error.InjectedSubmitFailure, w.trySubmit(path, bytes));
+    try testing.expectEqualStrings("/reject.bin", path);
+    try testing.expectEqualStrings("held", bytes);
+    try testing.expectEqual(@as(u64, 0), w.pendingBytes());
+    try testing.expect(!w.pendingPrefix("/reject"));
+    try testing.expectEqual(@as(u64, 0), w.files_dropped);
+}
+
+test "queue allocation failure returns OutOfMemory with caller ownership" {
+    var failing = testing.FailingAllocator.init(testing.allocator, .{});
+    const a = failing.allocator();
+    var w = Writer.init(a, testing.io);
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    const path = try a.dupe(u8, "/oom.bin");
+    defer a.free(path);
+    const bytes = try a.dupe(u8, "held");
+    defer a.free(bytes);
+    failing.fail_index = failing.alloc_index;
+    try testing.expectError(error.OutOfMemory, w.trySubmit(path, bytes));
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqualStrings("/oom.bin", path);
+    try testing.expectEqualStrings("held", bytes);
+    try testing.expectEqual(@as(u64, 0), w.pendingBytes());
+    try testing.expect(!w.isPending(path));
+    try testing.expectEqual(@as(u64, 0), w.files_dropped);
+}
+
+test "prefix cancellation discards queued files without waiting on any in-flight prefix" {
+    const Discard = struct {
+        writer: *Writer,
+        mutex: std.Io.Mutex = .init,
+        done: std.Io.Condition = .init,
+        finished: bool = false,
+
+        fn run(self: *@This()) void {
+            self.writer.discardPrefix("/cancel/");
+            self.mutex.lockUncancelable(testing.io);
+            defer self.mutex.unlock(testing.io);
+            self.finished = true;
+            self.done.broadcast(testing.io);
+        }
+
+        fn wait(self: *@This()) bool {
+            const timeout: std.Io.Timeout = .{ .duration = .{ .raw = .fromSeconds(5), .clock = .boot } };
+            const deadline = timeout.toDeadline(testing.io);
+            self.mutex.lockUncancelable(testing.io);
+            defer self.mutex.unlock(testing.io);
+            while (!self.finished) self.done.waitTimeout(testing.io, &self.mutex, deadline) catch return false;
+            return true;
+        }
+    };
+
+    for ([_][]const u8{ "/cancel/inflight.bin", "/other/inflight.bin" }) |inflight| {
+        var w = Writer.init(testing.allocator, testing.io);
+        defer w.deinit();
+        // Hold an in-flight file independently of the queue, without timing a disk write.
+        w.running = true;
+        w.inflight_path = inflight;
+        w.inflight_bytes = 4;
+        for ([_][]const u8{ "/cancel/first.bin", "/other/keep.bin", "/cancel/last.bin" }) |p| {
+            w.submit(try testing.allocator.dupe(u8, p), try testing.allocator.dupe(u8, "held"));
+        }
+        const epoch = w.epoch;
+        var discard: Discard = .{ .writer = &w };
+        const thread = try std.Thread.spawn(.{}, Discard.run, .{&discard});
+        const returned = discard.wait();
+        const pending_inflight = w.pendingPrefix(inflight);
+        w.mutex.lockUncancelable(testing.io);
+        const retained_inflight = w.inflight_bytes == 4 and std.mem.eql(u8, w.inflight_path.?, inflight);
+        const epoch_unchanged = w.epoch == epoch;
+        w.inflight_path = null;
+        w.inflight_bytes = 0;
+        w.done.broadcast(testing.io);
+        w.mutex.unlock(testing.io);
+        thread.join();
+
+        try testing.expect(returned);
+        try testing.expect(pending_inflight);
+        try testing.expect(retained_inflight);
+        try testing.expect(epoch_unchanged);
+        try testing.expect(!w.pendingPrefix("/cancel/"));
+        try testing.expect(w.pendingPrefix("/other/"));
+        try testing.expect(w.isPending("/other/keep.bin"));
+        try testing.expectEqual(@as(u64, 4), w.queuedBytes());
+        try testing.expectEqual(@as(u64, 2), w.files_dropped);
+    }
+}
 
 test "kv_disk_writer: files land off-thread, in FIFO order, and atomically" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });

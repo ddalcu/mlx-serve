@@ -257,6 +257,37 @@ pub const PlaceholderIds = extern struct {
     eoa: u32 = 0,
     vision_start: u32 = 0,
     vision_end: u32 = 0,
+    /// A spoken frame of the model's own (`SpeechFacts.frame_token`): a replayed turn's frame rows splice here.
+    speech: u32 = 0,
+};
+
+/// Speech output: each `frame_token` slot is one frame of `codebooks` codes the model's `SpeechHooks.frame` draws from
+/// the trunk's last hidden row; `codebooks` 0 = the model does not speak. A generation starts in text, or in speech
+/// after `audio_start`, or interleaved after `mixed_start`: `interleave_text` text slots, then `interleave_audio`
+/// frames, until `text_end` ends the block's text; a frame of `eos_code` ends the speech.
+pub const SpeechFacts = extern struct {
+    size: u32 = @sizeOf(SpeechFacts),
+    codebooks: u32 = 0,
+    codebook_size: u32 = 0,
+    eos_code: u32 = 0,
+    frame_token: u32 = 0,
+    audio_start: u32 = 0,
+    mixed_start: u32 = 0,
+    text_end: u32 = 0,
+    interleave_text: u32 = 0,
+    interleave_audio: u32 = 0,
+    /// The codec's output: mono samples per second, samples per frame.
+    sample_rate: u32 = 0,
+    frame_samples: u32 = 0,
+    /// The speech sampling a request leaves unset (`top_k` 0 = every code); the penalty reads the last
+    /// `repetition_window` frames.
+    temperature: f32 = 1.0,
+    top_k: u32 = 0,
+    repetition_penalty: f32 = 1.0,
+    repetition_window: u32 = 0,
+    /// The model speaks its reply to a request with tools (its card's tools recipe: no prefill, a call or speech).
+    /// false: such a request answers in text.
+    tools: bool = false,
 };
 
 /// The model's interleaved M-RoPE spectrum, from which the engine builds a prompt chunk's angles off the prompt's
@@ -304,6 +335,7 @@ pub const Parsed = extern struct {
     mrope: MropeFacts = .{},
     /// The plugin's own parsed config, read by its `bill` and `load`.
     private: ?*anyopaque = null,
+    speech: SpeechFacts = .{},
 };
 
 // ── Bill ──
@@ -343,7 +375,7 @@ pub const LoadCtx = extern struct {
     settings_json: Str = .{},
     span: ?*const LayerSpan = null,
     stream: Stream = .{},
-    /// The host table (P2 step 8); opaque until it lands.
+    /// The process's host table (`host/plugin_host_impl.zig`); null outside a server.
     host: ?*const Host = null,
     /// The pack's tensors as the engine loaded them (`sdk/weights/resident.zig`); null = the plugin reads its own.
     weights: ?*const Source = null,
@@ -354,6 +386,13 @@ pub const LoadCtx = extern struct {
     pair_remote: LayerSpan = .{},
     /// The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned.
     wired_margin_bytes: u64 = 8 << 30,
+    /// Optional load result: effective device-dependent capabilities, committed by the host only on success.
+    runtime_caps: ?*Caps = null,
+
+    pub fn publishRuntimeCaps(ctx: *const LoadCtx, caps: Caps) void {
+        if (ctx.size < @offsetOf(LoadCtx, "runtime_caps") + @sizeOf(?*Caps)) return;
+        if (ctx.runtime_caps) |out| out.* = caps;
+    }
 };
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };
@@ -373,7 +412,7 @@ pub const Forward = extern struct {
     caches: Span(Handle) = .{},
     /// Layers whose hidden rows the forward publishes (DFlash); filled into `ForwardOut.captured`.
     capture_layers: Span(u32) = .{},
-    /// Media rows `[n, hidden]` to splice at the placeholder ids (`Parsed.placeholder_ids`) in token order, from row
+    /// Media rows `[1, n, hidden]` to splice at the placeholder ids (`Parsed.placeholder_ids`) in token order, from row
     /// `media_offset` on (a chunked prefill resumes there).
     media: Array = .{},
     media_offset: u32 = 0,
@@ -416,6 +455,9 @@ pub const Forward = extern struct {
     accept_cap: u32 = 0,
     /// The sampler's suppress mask `[vocab]` (true = never drawn), which a round's greedy accept applies; empty = none.
     suppress_mask: Array = .{},
+    /// Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`);
+    /// empty = embed the ids.
+    embeds: Array = .{},
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs
@@ -575,6 +617,29 @@ pub const AuxSnapshotInfo = extern struct {
     prefix_key: u64 = 0,
 };
 
+/// A named array reference. Export transfers the reference to the caller; import borrows it and the name.
+/// As an array element, this layout is frozen for ABI version 1.
+pub const AuxTensor = extern struct {
+    size: u32 = @sizeOf(AuxTensor),
+    name: Str = .{},
+    array: Array = .{},
+};
+
+/// Caller-owned bounded storage. Names and header bytes live in the supplied buffers; each returned tensor owns
+/// a new array reference. Failure releases partial references and leaves the output lengths zero.
+pub const AuxExport = extern struct {
+    size: u32 = @sizeOf(AuxExport),
+    tensors: ?[*]AuxTensor = null,
+    tensor_cap: usize = 0,
+    tensor_len: usize = 0,
+    names: ?[*]u8 = null,
+    names_cap: usize = 0,
+    names_len: usize = 0,
+    header: ?[*]u8 = null,
+    header_cap: usize = 0,
+    header_len: usize = 0,
+};
+
 /// A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache, the SSD tier and restores.
 /// Every call runs on the inference thread, except `free` at process teardown, which runs on the thread tearing the
 /// model down after the inference thread has exited. A snapshot's caller owns it until `free`.
@@ -593,9 +658,6 @@ pub const AuxHooks = extern struct {
     free: *const fn (m: *anyopaque, snap: Handle) callconv(.c) void,
     /// Resident bytes, including retained buffer capacities; encoded size is a separate quantity.
     bytes: *const fn (m: *anyopaque, snap: Handle) callconv(.c) u64,
-    /// Writes the encoding into `buf` up to `cap`, setting `len`; refuses insufficient capacity by name.
-    serialize: *const fn (m: *anyopaque, snap: Handle, buf: [*]u8, cap: usize, len: *usize) callconv(.c) Verdict,
-    deserialize: *const fn (m: *anyopaque, bytes: Str, out: *Handle) callconv(.c) Verdict,
     /// Whether this loaded instance supports auxiliary caching, including its runtime configuration.
     enabled: *const fn (m: *anyopaque) callconv(.c) bool,
     /// Describes the snapshot's own boundary and identity; `ids` remains borrowed until its `free`.
@@ -605,6 +667,15 @@ pub const AuxHooks = extern struct {
     /// Activates `slot`; zero `restored_at` resets it, otherwise verifies its position. Arms that slot's capture
     /// at `prompt.len - 1` only when `capture` is true; media rows are borrowed for this call.
     begin_prompt: *const fn (m: *anyopaque, slot: u32, prompt: Span(u32), media_rows: Array, restored_at: u64, capture: bool) callconv(.c) Verdict,
+    /// Allocation-free validation of the complete header/inventory against the loaded instance. Reports the
+    /// additional simultaneous load/construction/restore peak, including MLX copy scratch. Disk hooks may return
+    /// named `.unsupported` while the instance retains its RAM snapshot capability.
+    import_plan: *const fn (m: *anyopaque, header: Str, out_peak_bytes: *u64) callconv(.c) Verdict,
+    /// Exports used rows, not spare capacity, into caller-owned storage; insufficient capacity is named.
+    export_arrays: *const fn (m: *anyopaque, snap: Handle, out: *AuxExport) callconv(.c) Verdict,
+    /// Borrows all inputs; validates every name/shape/dtype before allocating destination state. Success returns
+    /// an evaluated, independent snapshot with growth headroom; failure frees partial state and leaves out null.
+    import_arrays: *const fn (m: *anyopaque, ids: Span(u32), header: Str, arrays: Span(AuxTensor), out: *Handle) callconv(.c) Verdict,
 };
 
 pub const CacheHooks = extern struct {
@@ -684,6 +755,21 @@ pub const SpecHooks = extern struct {
 
 pub const MediaKind = enum(u8) { image, video, audio };
 
+/// One request's media item as the host decoded it: RGB8 frames (an image is one frame) or mono f32 samples.
+pub const MediaInput = extern struct {
+    size: u32 = @sizeOf(MediaInput),
+    kind: MediaKind = .image,
+    /// Packed RGB8, `frames` frames of `width x height`, frame after frame.
+    rgb: Span(u8) = .{},
+    width: u32 = 0,
+    height: u32 = 0,
+    frames: u32 = 0,
+    /// The rate a video's frames were sampled at; 0 = the client did not say.
+    fps: f32 = 0,
+    samples: Span(f32) = .{},
+    sample_rate: u32 = 0,
+};
+
 /// One prepared media item: its pixels (or samples) as a new reference the host owns, and its row plan.
 pub const MediaItem = extern struct {
     size: u32 = @sizeOf(MediaItem),
@@ -700,19 +786,57 @@ pub const MediaItem = extern struct {
     /// calls MLX, so an outside plugin returns its pixels this way.
     bytes: Span(u8) = .{},
     free: ?*const fn (item: *MediaItem) callconv(.c) void = null,
+    /// A video's frame rate as prepared and its frames before any padding (its run's timestamps); 0 elsewhere.
+    fps: f32 = 0,
+    frames: u32 = 0,
 };
 
+/// The model's tokenizer, for text inside a placeholder run (a video's timestamps): writes `text`'s ids into `out`
+/// (`cap` entries) and returns their count.
+pub const TextTokens = extern struct {
+    ctx: ?*anyopaque,
+    encode: *const fn (ctx: ?*anyopaque, text: Str, out: [*]u32, cap: u32) callconv(.c) u32,
+};
+
+/// Every hook runs on the inference thread, `tower` in the same encode as the `prepare` that made its item.
 pub const MediaHooks = extern struct {
     size: u32 = @sizeOf(MediaHooks),
-    /// The tower forward: the item's rows.
+    /// The tower forward: the item's rows `[rows, hidden]`.
     tower: *const fn (m: *anyopaque, item: *const MediaItem, out: *Array) callconv(.c) Verdict,
-    /// Decodes and resizes one item's `bytes` within the pixel `budget`.
-    prepare: *const fn (p: *const Parsed, kind: MediaKind, bytes: Str, budget: u64, out: *MediaItem) callconv(.c) Verdict,
-    /// Writes the item's placeholder token run into `out` (`cap` entries); returns its length.
-    placeholder_rows: ?*const fn (p: *const Parsed, item: *const MediaItem, out: [*]u32, cap: u32) callconv(.c) u32 = null,
+    /// Resizes and lays out one decoded input as the model's processor does, within `budget` pixels a frame.
+    prepare: *const fn (p: *const Parsed, in: *const MediaInput, budget: u64, out: *MediaItem) callconv(.c) Verdict,
+    /// Writes the token run replacing the item's one placeholder into `out` (`cap` entries); returns its length,
+    /// 0 when it does not fit. Null: `rows` of the kind's placeholder id.
+    placeholder_rows: ?*const fn (p: *const Parsed, item: *const MediaItem, tok: *const TextTokens, out: [*]u32, cap: u32) callconv(.c) u32 = null,
     /// The M-RoPE table over the expanded prompt `ids`.
     positions: ?*const fn (p: *const Parsed, ids: Span(u32), items: Span(MediaItem), out: *Array) callconv(.c) Verdict = null,
     video_prune: ?*const fn (m: *anyopaque, item: *const MediaItem, rows: Array, out: *Array) callconv(.c) Verdict = null,
+};
+
+/// How one frame samples (`SpeechFacts` holds the defaults). `order` empty = MaskGIT reveals codebooks in a random
+/// order drawn from `key`; else the codebook permutation it reveals in.
+pub const SpeechSampling = extern struct {
+    size: u32 = @sizeOf(SpeechSampling),
+    temperature: f32 = 1.0,
+    top_k: u32 = 0,
+    repetition_penalty: f32 = 1.0,
+    key: u64 = 0,
+    order: Span(u32) = .{},
+};
+
+/// Speech output (`Parsed.speech`); every hook runs on the inference thread.
+pub const SpeechHooks = extern struct {
+    size: u32 = @sizeOf(SpeechHooks),
+    /// One frame's `codebooks` codes into `out` from the trunk's final-normed last row `hidden` `[1, hidden]`;
+    /// `history` = earlier frames' codes, frame after frame, for the penalty. A frame holding `eos_code` is all of it.
+    frame: *const fn (m: *anyopaque, hidden: Array, how: *const SpeechSampling, history: Span(u32), out: [*]u32) callconv(.c) Verdict,
+    /// The input rows `[1, frames, hidden]` of whole frames of `codes` (`Forward.embeds`, a replayed turn's media).
+    frame_rows: *const fn (m: *anyopaque, codes: Span(u32), out: *Array) callconv(.c) Verdict,
+    /// A streaming decode of frames into samples: `push` appends whole frames and writes the samples now final into
+    /// `out` (`cap` at least `frame_samples` per frame pushed, plus one frame), `finish` true also the tail.
+    codec_open: *const fn (m: *anyopaque, out: *Handle) callconv(.c) Verdict,
+    codec_push: *const fn (m: *anyopaque, h: Handle, codes: Span(u32), finish: bool, out: [*]f32, cap: usize, len: *usize) callconv(.c) Verdict,
+    codec_close: *const fn (m: *anyopaque, h: Handle) callconv(.c) void,
 };
 
 pub const EmbedHooks = extern struct {
@@ -780,6 +904,7 @@ pub const ModelTable = extern struct {
     /// `slot`'s arm counters for its request's summary lines (each a full log line), in memory the plugin owns until
     /// the next call on `m`; the counters reset.
     meters: ?*const fn (m: *anyopaque, slot: u32, out: *Str) callconv(.c) void = null,
+    speech: ?*const SpeechHooks = null,
 };
 
 /// The modes a model serves: prefill, decode and verify always; the rest as its caps declare. An encoder (`embed`)
@@ -803,13 +928,21 @@ test "abi plugin: caps fit one word with the generic defaults" {
 }
 
 test "abi plugin: every struct opens with its size, set by default" {
-    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem }) |T| {
+    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem, MediaInput, SpeechFacts, SpeechSampling }) |T| {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
         const v: T = .{};
         try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);
     }
-    inline for (.{ LoadCtx, Forward, Offload, CacheOps, AuxHooks, HeadHooks, NativeDrafter, MediaHooks, DistHooks, ModelTable }) |T|
+    inline for (.{ LoadCtx, Forward, Offload, CacheOps, AuxHooks, HeadHooks, NativeDrafter, MediaHooks, DistHooks, ModelTable, SpeechHooks }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
+}
+
+test "auxiliary tensor structures start with their size" {
+    inline for (.{ AuxTensor, AuxExport }) |T| {
+        try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
+        const v: T = .{};
+        try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);
+    }
 }
 
 test "abi plugin: auxiliary callbacks are required function pointers" {
@@ -830,4 +963,21 @@ test "abi plugin: prefill, decode and verify are always declared; batched rows f
     try testing.expect(declaresMode(.{}, .verify) and !declaresMode(.{}, .batched_rows));
     try testing.expect(declaresMode(.{ .batches_decode = true }, .batched_rows));
     try testing.expect(declaresMode(.{ .embed = true }, .prefill) and !declaresMode(.{ .embed = true }, .decode));
+}
+
+test "plugin runtime caps: appended load output is optional and respects an older host's size" {
+    try std.testing.expectEqual(@offsetOf(LoadCtx, "wired_margin_bytes") + @sizeOf(u64), @offsetOf(LoadCtx, "runtime_caps"));
+    try std.testing.expectEqual(@offsetOf(LoadCtx, "runtime_caps") + @sizeOf(?*Caps), @sizeOf(LoadCtx));
+    var published: Caps = .{ .active_slots = 7 };
+    var ctx: LoadCtx = .{ .model_dir = .{}, .dir = undefined, .parsed = undefined };
+    try std.testing.expect(ctx.runtime_caps == null);
+    ctx.publishRuntimeCaps(.{ .active_slots = 2 });
+    ctx.runtime_caps = &published;
+    ctx.size = @offsetOf(LoadCtx, "runtime_caps");
+    ctx.publishRuntimeCaps(.{ .active_slots = 2 });
+    try std.testing.expectEqual(@as(u8, 7), published.active_slots);
+    ctx.size = @sizeOf(LoadCtx);
+    const effective: Caps = .{ .active_slots = 2, .slot_state = true };
+    ctx.publishRuntimeCaps(effective);
+    try std.testing.expectEqual(@as(u64, @bitCast(effective)), @as(u64, @bitCast(published)));
 }

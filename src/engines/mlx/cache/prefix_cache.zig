@@ -182,7 +182,15 @@ pub const ModuleBinding = struct {
 };
 
 /// A selection survives eviction by carrying identity, never an index into the entry array.
-pub const ModuleMatch = struct { entry_id: u64, n: usize };
+pub const ModuleMatch = struct {
+    source: enum { ram, disk } = .ram,
+    entry_id: u64 = 0,
+    disk_id: u64 = 0,
+    n: usize,
+    prefix_key: u64,
+};
+
+pub const FlushResult = enum { progress, busy, done };
 
 const ModulePayload = struct {
     binding: ModuleBinding,
@@ -190,9 +198,107 @@ const ModulePayload = struct {
     n: usize,
     prefix_key: u64,
     aux_bytes: u64,
+    disk_id: ?u64 = null,
 };
 
 const ModuleRequest = struct { binding: ModuleBinding, media_rows: ?Array };
+
+/// Bounded caller storage; only the selected part transfers references into the tier.
+const ModuleExport = struct {
+    tensors: [1024]plugin_abi.AuxTensor = undefined,
+    names: [kv_disk_cache.module_record.MAX_ENVELOPE_BYTES]u8 = undefined,
+    header: [kv_disk_cache.module_record.MAX_HEADER_BYTES]u8 = undefined,
+    out: plugin_abi.AuxExport = .{},
+
+    fn create(a: std.mem.Allocator, m: ModulePayload) !*ModuleExport {
+        const self = try a.create(ModuleExport);
+        self.* = .{};
+        self.out = .{
+            .tensors = &self.tensors,
+            .tensor_cap = self.tensors.len,
+            .names = &self.names,
+            .names_cap = self.names.len,
+            .header = &self.header,
+            .header_cap = self.header.len,
+        };
+        errdefer self.destroy(a);
+        if (!plugin_driver.auxExportArrays(m.binding.xfm, m.snapshot, &self.out).isOk()) return error.ModuleExportFailed;
+        if (self.out.tensor_len == 0 or self.out.tensor_len > self.tensors.len or
+            self.out.names_len > self.names.len or self.out.header_len > self.header.len)
+            return error.BadModuleExport;
+        return self;
+    }
+
+    fn destroy(self: *ModuleExport, a: std.mem.Allocator) void {
+        for (self.tensors[0..@min(self.out.tensor_len, self.tensors.len)]) |t| {
+            if (t.array.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = t.array.ctx });
+        }
+        a.destroy(self);
+    }
+
+    fn inventory(self: *const ModuleExport, a: std.mem.Allocator) ![]kv_disk_cache.module_record.Tensor {
+        const tensors = try a.alloc(kv_disk_cache.module_record.Tensor, self.out.tensor_len);
+        for (self.tensors[0..self.out.tensor_len], tensors) |t, *item| {
+            if (t.size != @sizeOf(plugin_abi.AuxTensor) or t.array.ctx == null) return error.BadModuleExport;
+            const arr: mlx.mlx_array = .{ .ctx = t.array.ctx };
+            const dims = mlx.getShape(arr);
+            if (dims.len > 8) return error.BadModuleExport;
+            const shape = try a.alloc(u64, dims.len);
+            for (dims, shape) |dim, *out| {
+                if (dim <= 0) return error.BadModuleExport;
+                out.* = @intCast(dim);
+            }
+            item.* = .{
+                .name = t.name.slice(),
+                .dtype = try moduleDtype(mlx.mlx_array_dtype(arr)),
+                .shape = shape,
+                .bytes = try std.math.mul(u64, mlx.mlx_array_size(arr), mlx.mlx_array_itemsize(arr)),
+            };
+        }
+        return tensors;
+    }
+
+    fn takePart(self: *ModuleExport, d: *kv_disk_cache.DiskTier, id: u64) !std.ArrayList(kv_disk_cache.DiskTier.NamedTensor) {
+        const part = d.modulePartIndex(id) orelse return error.BadModuleExport;
+        const inventory_ = d.moduleInventory(id) orelse return error.BadModuleExport;
+        var list = std.ArrayList(kv_disk_cache.DiskTier.NamedTensor).empty;
+        errdefer d.freeNamed(&list);
+        for (inventory_) |item| {
+            if (item.part != part) continue;
+            const tensor = self.tensorNamed(item.name) orelse return error.BadModuleExport;
+            try list.ensureUnusedCapacity(d.allocator, 1);
+            const key = try d.allocator.dupe(u8, item.name);
+            list.appendAssumeCapacity(.{ .key = key, .arr = .{ .ctx = tensor.array.ctx } });
+            tensor.array.ctx = null;
+        }
+        return list;
+    }
+
+    fn tensorNamed(self: *ModuleExport, name: []const u8) ?*plugin_abi.AuxTensor {
+        for (self.tensors[0..self.out.tensor_len]) |*t| {
+            if (std.mem.eql(u8, t.name.slice(), name)) return t;
+        }
+        return null;
+    }
+};
+
+fn moduleDtype(dtype: mlx.mlx_dtype) ![]const u8 {
+    return switch (dtype) {
+        .bool_ => "BOOL",
+        .uint8 => "U8",
+        .uint16 => "U16",
+        .uint32 => "U32",
+        .uint64 => "U64",
+        .int8 => "I8",
+        .int16 => "I16",
+        .int32 => "I32",
+        .int64 => "I64",
+        .float16 => "F16",
+        .float32 => "F32",
+        .bfloat16 => "BF16",
+        else => error.BadModuleExport,
+    };
+}
 
 const Entry = struct {
     /// `prompt_ids ++ generated_ids` from the request that produced this snapshot.
@@ -355,8 +461,13 @@ pub const FlushTarget = struct { hc: *HotPrefixCache, s: mlx.mlx_stream };
 pub fn shutdownPersist(targets: []const FlushTarget, clock: anytype, deadline_ms: i64) ShutdownTally {
     var t: ShutdownTally = .{};
     var errors_before: u64 = 0;
+    var modules_before: u32 = 0;
     for (targets) |x| {
-        if (x.hc.disk) |*d| errors_before += d.writeErrors();
+        if (x.hc.disk) |*d| {
+            d.pollModuleWrites();
+            errors_before += d.writeErrors();
+        }
+        modules_before += x.hc.moduleCommittedCount();
     }
     var longest: i64 = 0;
     var cut = false;
@@ -369,22 +480,40 @@ pub fn shutdownPersist(targets: []const FlushTarget, clock: anytype, deadline_ms
                 cut = true;
                 break;
             }
-            x.hc.shutdownSlice(x.s, &t);
+            const r = x.hc.shutdownSlice(x.s, &t);
             longest = @max(longest, clock.nowMs() - start);
+            if (r == .busy) shutdownWaitForWriter(x.hc, clock, deadline_ms);
             sliced = true;
         }
         if (!sliced) break;
     }
     var errors_after: u64 = 0;
+    var modules_after: u32 = 0;
     for (targets) |x| {
         const d = if (x.hc.disk) |*dd| dd else continue;
-        if (cut) t.left_deadline += x.hc.owedCount();
+        d.pollModuleWrites();
+        const unfinished = x.hc.moduleUnfinishedCount();
+        const committed = x.hc.moduleCommittedCount();
+        if (cut) t.left_deadline += x.hc.owedKvCount();
         t.checked_out += x.hc.checkedOutOwed();
         t.dropped_bytes += d.drainWriterUntil(clock, deadline_ms);
+        d.pollModuleWrites();
+        modules_after += x.hc.moduleCommittedCount();
+        t.left_deadline += unfinished -| (x.hc.moduleCommittedCount() -| committed);
+        x.hc.cancelModuleExports(.shutdown_expiry);
         errors_after += d.writeErrors();
     }
+    t.written += modules_after -| modules_before;
     t.failures += errors_after -| errors_before;
     return t;
+}
+
+fn shutdownWaitForWriter(hc: *HotPrefixCache, clock: anytype, deadline_ms: i64) void {
+    const left = deadline_ms - clock.nowMs();
+    if (left <= 0) return;
+    const d = if (hc.disk) |*dd| dd else return;
+    const w = d.writer orelse return;
+    _ = w.drainUntil(.{ .duration = .{ .raw = .fromMilliseconds(@min(left, 1)), .clock = .boot } });
 }
 
 /// The SSD-first predicate: arch, env switch, AND a disk tier. Without the tier the mode used
@@ -405,8 +534,10 @@ const PendingDiskFlush = struct {
     ssm_cps: ?[]SSMCheckpoint = null,
     dflash: ?DflashSnap = null,
     mtp: ?DflashSnap = null,
+    module: ?ModulePayload = null,
 
     fn deinit(self: *PendingDiskFlush, allocator: std.mem.Allocator) void {
+        if (self.module) |m| plugin_driver.auxFree(m.binding.xfm, m.snapshot);
         self.snapshot.deinit();
         allocator.free(self.tokens);
         allocator.free(self.media);
@@ -548,6 +679,8 @@ pub const HotPrefixCache = struct {
     /// An earlier session's pending snapshot a newer commit displaced before it landed whole;
     /// flushes finish it first, one slice each, so no commit pays for its write.
     finishing_disk: ?PendingDiskFlush = null,
+    /// Registered exports that failed or were cancelled, including after metadata submission.
+    module_export_losses_total: u64 = 0,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
     restore_pin_min_bytes: u64 = RESTORE_PIN_MIN_BYTES,
 
@@ -567,6 +700,8 @@ pub const HotPrefixCache = struct {
     }
 
     pub fn deinit(self: *HotPrefixCache) void {
+        if (self.disk) |*d| d.pollModuleWrites();
+        self.cancelModuleExports(.unload);
         for (self.entries.items) |*e| {
             freeEntryOwnedState(self.allocator, e);
         }
@@ -806,8 +941,8 @@ pub const HotPrefixCache = struct {
         return true;
     }
 
-    /// Load-time gate after the plugin has loaded. Auxiliary-only caches are RAM-only:
-    /// the caller must not attach a DiskTier, and must use the module commit/restore functions.
+    /// Load-time gate after the plugin has loaded. Auxiliary-only caches use the module
+    /// commit/restore functions; their disk tier, if any, is a module tier (`DiskTier.initWithModule`).
     pub fn shouldUseInstance(config: *const model_mod.ModelConfig, enable_ssm_checkpoints: bool, xfm: *const transformer_mod.Transformer) bool {
         // A module snapshot holds this rank's state only: a pipeline or tensor-parallel worker holds the rest.
         // Other models keep `shouldUse` exactly (a tensor-parallel rank 0 keeps its KV cache: the worker is stateless).
@@ -1185,10 +1320,10 @@ pub const HotPrefixCache = struct {
         return null;
     }
 
-    /// Read-only exact-checkpoint selection. Keys use each candidate's IDs and the request's
-    /// media rows; an ineligible longer entry cannot hide a shorter one. Retain only the ID.
+    /// Exact-checkpoint selection across RAM and committed disk records, with RAM winning ties.
+    /// Keys use each candidate's IDs and the request's media rows. Retain the source and stable ID.
     pub fn findModuleMatch(
-        self: *const HotPrefixCache,
+        self: *HotPrefixCache,
         binding: ModuleBinding,
         prompt_ids: []const u32,
         has_tools: bool,
@@ -1196,12 +1331,30 @@ pub const HotPrefixCache = struct {
         media_rows: ?Array,
         quant_config: kv_quant.KVQuantConfig,
     ) ?ModuleMatch {
-        const m = self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, false, null, .{ .binding = binding, .media_rows = media_rows }) orelse return null;
-        return .{ .entry_id = self.entries.items[m.idx].id, .n = m.shared };
+        var best: ?ModuleMatch = null;
+        if (self.findBestRestorableMatchWithModule(prompt_ids, has_tools, media, quant_config, false, null, .{ .binding = binding, .media_rows = media_rows })) |m| {
+            const e = &self.entries.items[m.idx];
+            best = .{ .entry_id = e.id, .n = m.shared, .prefix_key = e.module.?.prefix_key };
+        }
+        const d = if (self.disk) |*dd| dd else return best;
+        var candidates = std.ArrayList(kv_disk_cache.DiskTier.ModuleCandidate).empty;
+        defer candidates.deinit(d.allocator);
+        defer self.syncModuleLosses();
+        d.moduleCandidates(prompt_ids, has_tools, quant_config, media, &candidates) catch return best;
+        for (candidates.items) |candidate| {
+            if (best) |b| if (candidate.n <= b.n) break;
+            var key: u64 = 0;
+            const had_error = mlx.errorPending();
+            const verdict = plugin_driver.auxPrefixKey(binding.xfm, prompt_ids[0..candidate.n], media_rows, &key);
+            mlx.dropLatchedErrorUnless(had_error);
+            if (!verdict.isOk() or key != candidate.prefix_key) continue;
+            return .{ .source = .disk, .disk_id = candidate.id, .n = candidate.n, .prefix_key = candidate.prefix_key };
+        }
+        return best;
     }
 
-    /// Re-find by ID after any admission eviction. Removes the entry before restore and frees
-    /// its wrapper on every outcome; the slot keeps its own references. Zero means go cold.
+    /// Re-find by ID after admission. The slot keeps restored references; an owed export moves
+    /// into a holder, or is cancelled if both are full. Zero means go cold.
     /// Caller updates slot counters and calls auxBeginPrompt at the returned n (zero establishes a cold slot).
     pub fn consumeModule(self: *HotPrefixCache, binding: ModuleBinding, entry_id: u64, slot: u32) usize {
         self.last_restored_used = null;
@@ -1213,7 +1366,7 @@ pub const HotPrefixCache = struct {
             if (!ModuleBinding.same(payload.binding, binding)) return 0;
             var detached = self.entries.swapRemove(i);
             self.current_kv_bytes -|= detached.kv_bytes;
-            defer freeEntryOwnedState(self.allocator, &detached);
+            defer self.releaseModuleEntry(&detached, null);
             const had_error = mlx.errorPending();
             if (!plugin_driver.auxRestoreAt(binding.xfm, slot, payload.snapshot, payload.n).isOk()) {
                 mlx.dropLatchedErrorUnless(had_error);
@@ -1755,7 +1908,8 @@ pub const HotPrefixCache = struct {
     ) !CommitStatus {
         var retained = false;
         defer if (!retained) plugin_driver.auxFree(binding.xfm, snapshot);
-        if (!self.ram_enabled or self.max_entries == 0 or self.disk != null) return .declined;
+        if (!self.ram_enabled or self.max_entries == 0) return .declined;
+        if (snapshot == null) return .declined;
         if (ids.len == 0) return .declined;
         var info: plugin_abi.AuxSnapshotInfo = .{};
         if (!plugin_driver.auxDescribe(binding.xfm, snapshot, &info).isOk()) return .declined;
@@ -1779,14 +1933,7 @@ pub const HotPrefixCache = struct {
             self.evictAt(i, "module checkpoint replaced");
             break;
         }
-        while (self.entries.items.len >= self.max_entries) {
-            if (!self.evictOneLruProgress("count cap", cache_key)) return .declined;
-        }
-        if (self.max_kv_bytes > 0) {
-            while (self.current_kv_bytes > self.max_kv_bytes - aux_bytes) {
-                if (!self.evictOneLruProgress("byte budget", cache_key)) return .declined;
-            }
-        }
+        if (!self.makeModuleRoom(aux_bytes, cache_key)) return .declined;
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -1802,8 +1949,129 @@ pub const HotPrefixCache = struct {
         });
         retained = true;
         self.current_kv_bytes += aux_bytes;
+        self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
         self.logResident();
         return .{ .ok = ids.len };
+    }
+
+    fn makeModuleRoom(self: *HotPrefixCache, bytes: u64, cache_key: u64) bool {
+        while (self.entries.items.len >= self.max_entries) {
+            if (!self.evictOneLruProgress("count cap", cache_key)) return false;
+        }
+        if (self.max_kv_bytes == 0) return true;
+        if (self.residentBytes() > self.max_kv_bytes - bytes) self.cancelPendingModules(.memory_pressure);
+        while (self.residentBytes() > self.max_kv_bytes - bytes) {
+            const idx = self.lruIndexExcluding(null, cache_key) orelse return false;
+            self.evictAtWithCancellation(idx, "byte budget", .memory_pressure);
+        }
+        return true;
+    }
+
+    fn registerModuleEntry(self: *HotPrefixCache, e: *Entry) void {
+        const d = if (self.disk) |*dd| dd else return;
+        if (d.module_context == null or e.tokens.len < kv_disk_cache.MIN_PERSIST_TOKENS) return;
+        const had_error = mlx.errorPending();
+        defer mlx.dropLatchedErrorUnless(had_error);
+        defer self.syncModuleLosses();
+        const exported = ModuleExport.create(self.allocator, e.module.?) catch return;
+        defer exported.destroy(self.allocator);
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const inventory_ = exported.inventory(arena.allocator()) catch return;
+        const id = d.registerModule(.{
+            .tokens = e.tokens,
+            .prefix_key = e.module.?.prefix_key,
+            .has_tools = e.has_tools,
+            .quant = e.quant_config,
+            .media = e.media,
+            .header = exported.header[0..exported.out.header_len],
+            .tensors = inventory_,
+        }) catch |err| {
+            log.warn("  [disk-cache] module registration failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        e.module.?.disk_id = id;
+        e.disk_dirty = id != null;
+        if (e.disk_dirty) self.disk_dirty = true;
+    }
+
+    fn syncModuleLosses(self: *HotPrefixCache) void {
+        if (self.disk) |*d| self.module_export_losses_total = d.module_export_losses_total;
+    }
+
+    fn moduleExportOwed(self: *const HotPrefixCache, m: ModulePayload) bool {
+        const id = m.disk_id orelse return false;
+        const d = if (self.disk) |*dd| dd else return false;
+        const state = d.moduleState(id) orelse return false;
+        return state == .registered or state == .exporting;
+    }
+
+    /// A removal moves its bill into a free holder; pressure and holder exhaustion cancel only it.
+    fn releaseModuleEntry(self: *HotPrefixCache, e: *Entry, cancellation: ?kv_disk_cache.DiskTier.ModuleCancellation) void {
+        defer freeEntryOwnedState(self.allocator, e);
+        const m = e.module orelse return;
+        if (!self.moduleExportOwed(m)) return;
+        if (cancellation) |reason| {
+            self.cancelModule(m, reason);
+            return;
+        }
+        const holder = self.freePendingHolder() orelse {
+            self.cancelModule(m, .holder_exhaustion);
+            return;
+        };
+        holder.* = .{
+            .snapshot = e.snapshot,
+            .tokens = e.tokens,
+            .has_tools = e.has_tools,
+            .media = e.media,
+            .module = m,
+        };
+        e.module = null;
+        e.tokens = &.{};
+        e.media = &.{};
+        e.snapshot.entries = &.{};
+        self.disk_dirty = true;
+    }
+
+    fn freePendingHolder(self: *HotPrefixCache) ?*?PendingDiskFlush {
+        if (self.finishing_disk == null) return &self.finishing_disk;
+        if (self.pending_disk == null) return &self.pending_disk;
+        return null;
+    }
+
+    fn cancelModule(self: *HotPrefixCache, m: ModulePayload, reason: kv_disk_cache.DiskTier.ModuleCancellation) void {
+        if (self.disk) |*d| if (m.disk_id) |id| d.cancelModule(id, reason);
+        self.syncModuleLosses();
+    }
+
+    fn cancelPendingModule(self: *HotPrefixCache, slot: *?PendingDiskFlush, reason: kv_disk_cache.DiskTier.ModuleCancellation) void {
+        const p = if (slot.*) |*pp| pp else return;
+        const m = p.module orelse return;
+        self.cancelModule(m, reason);
+        p.deinit(self.allocator);
+        slot.* = null;
+    }
+
+    fn cancelPendingModules(self: *HotPrefixCache, reason: kv_disk_cache.DiskTier.ModuleCancellation) void {
+        self.cancelPendingModule(&self.finishing_disk, reason);
+        self.cancelPendingModule(&self.pending_disk, reason);
+        self.disk_dirty = self.diskOwed();
+    }
+
+    fn cancelModuleExports(self: *HotPrefixCache, reason: kv_disk_cache.DiskTier.ModuleCancellation) void {
+        self.cancelPendingModules(reason);
+        if (self.disk) |*d| {
+            for (d.entries.items) |*e| {
+                if (e.kind != .module) continue;
+                const state = e.module.?.state;
+                if (state == .registered or state == .exporting or state == .submitted) d.cancelModule(e.id, reason);
+            }
+        }
+        for (self.entries.items) |*e| if (e.module != null) {
+            e.disk_dirty = false;
+        };
+        self.syncModuleLosses();
+        self.disk_dirty = self.diskOwed();
     }
 
     /// Commit the current `source_cache` state under the given key. Updates
@@ -1887,8 +2155,10 @@ pub const HotPrefixCache = struct {
         // The record shares the live KV; on an error return nothing consumes it and the slot's
         // KVCache deinit then frees nothing. Function scope on purpose.
         errdefer if (self.pending_disk) |*p| {
-            p.deinit(self.allocator);
-            self.pending_disk = null;
+            if (p.module == null) {
+                p.deinit(self.allocator);
+                self.pending_disk = null;
+            }
         };
 
         if (!self.ram_enabled) {
@@ -2411,6 +2681,12 @@ pub const HotPrefixCache = struct {
         dflash: ?DflashCommit,
         mtp: ?DflashCommit,
     ) void {
+        if (self.pending_disk) |p| if (p.module != null) {
+            if (self.finishing_disk != null) return;
+            self.finishing_disk = p;
+            self.pending_disk = null;
+        };
+        if (self.finishing_disk) |p| if (p.module != null and self.pending_disk != null) return;
         if (self.pending_disk) |*old| {
             // A commit that extends the pending prefix covers it; another session's is parked for
             // the flushes to finish. At most one waits: an older one still parked is dropped.
@@ -2626,11 +2902,13 @@ pub const HotPrefixCache = struct {
         return "partial copy";
     }
 
-    /// What one slice did to its record. Every result but `owed` gives the record up until its
+    /// What one slice did to its record. Results other than `owed`/`busy` give it up until its
     /// next commit: retrying a failed or empty slice would spin the idle loop.
     const SliceResult = enum {
         /// Bytes landed and the tier owes the record more.
         owed,
+        /// Writer retained the current file; retry its blob and cursor later.
+        busy,
         /// The tier holds the record whole.
         whole,
         /// Nothing to write: under the floor, unpersistable, the store declined, or nothing landed.
@@ -2671,6 +2949,13 @@ pub const HotPrefixCache = struct {
     /// One slice of a parked snapshot; dropped once whole or given up.
     fn slicePending(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, slot: *?PendingDiskFlush, s: mlx.mlx_stream) ?SliceResult {
         const p = if (slot.*) |*pp| pp else return null;
+        if (p.module) |m| {
+            const r = self.sliceModule(d, m, s);
+            if (r == .owed or r == .busy) return r;
+            p.deinit(self.allocator);
+            slot.* = null;
+            return r;
+        }
         const specs: EntrySpecs = .{
             .dflash = if (p.dflash) |*df| .{
                 .entries = df.snapshot.entries,
@@ -2696,11 +2981,41 @@ pub const HotPrefixCache = struct {
     }
 
     /// One slice of a RAM entry; its flag stays set only while the tier owes it more.
-    fn sliceEntry(d: *kv_disk_cache.DiskTier, e: *Entry, s: mlx.mlx_stream) SliceResult {
+    fn sliceEntry(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, e: *Entry, s: mlx.mlx_stream) SliceResult {
         // A media entry's spec payloads stay behind (they describe rows past the first item).
-        const r = appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, if (e.media.len == 0) entrySpecCommits(e) else .{}, s);
-        e.disk_dirty = r == .owed;
+        const r = if (e.module) |m| self.sliceModule(d, m, s) else appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, if (e.media.len == 0) entrySpecCommits(e) else .{}, s);
+        e.disk_dirty = r == .owed or r == .busy;
         return r;
+    }
+
+    fn sliceModule(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, m: ModulePayload, s: mlx.mlx_stream) SliceResult {
+        const id = m.disk_id orelse return .skipped;
+        const had_error = mlx.errorPending();
+        defer mlx.dropLatchedErrorUnless(had_error);
+        defer self.syncModuleLosses();
+        const result = self.stageModule(d, m, id, s) catch |err| {
+            if (err == error.DiskCacheModuleMissing) return .poisoned;
+            _ = d.poisonId(id, @errorName(err));
+            return .failed;
+        };
+        return switch (result) {
+            .progress => .owed,
+            .busy => .busy,
+            .done => .whole,
+        };
+    }
+
+    fn stageModule(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, m: ModulePayload, id: u64, s: mlx.mlx_stream) !kv_disk_cache.DiskTier.ModuleSlice {
+        if (d.pending_module == null and d.modulePartIndex(id) != null) {
+            const exported = try ModuleExport.create(self.allocator, m);
+            defer exported.destroy(self.allocator);
+            var part = try exported.takePart(d, id);
+            defer d.freeNamed(&part);
+            return d.stageModulePart(id, part.items, s);
+        }
+        const r = try d.stageModulePart(id, &.{}, s);
+        if (r != .done) return r;
+        return d.submitModuleMeta(id);
     }
 
     /// The owed entry the next slice goes to, newest or oldest; never one checked out (its
@@ -2722,7 +3037,16 @@ pub const HotPrefixCache = struct {
     fn diskOwed(self: *const HotPrefixCache) bool {
         if (self.disk == null) return false;
         if (self.finishing_disk != null or self.pending_disk != null) return true;
-        return self.owedEntryIndex(false) != null;
+        if (self.owedEntryIndex(false) != null) return true;
+        return self.modulePublicationPending();
+    }
+
+    fn modulePublicationPending(self: *const HotPrefixCache) bool {
+        const d = if (self.disk) |*dd| dd else return false;
+        for (d.entries.items) |e| {
+            if (e.kind == .module and e.module.?.state == .submitted) return true;
+        }
+        return false;
     }
 
     const SliceOrder = enum { newest_first, oldest_first };
@@ -2730,45 +3054,113 @@ pub const HotPrefixCache = struct {
     /// One bounded slice, then `disk_dirty` says whether anything is still owed. A parked
     /// snapshot goes first: it is an earlier session's, and RAM holds at most a trimmed copy.
     fn flushSlice(self: *HotPrefixCache, s: mlx.mlx_stream, order: SliceOrder) ?SliceResult {
-        if (!self.disk_dirty) return null;
-        defer self.disk_dirty = self.diskOwed();
         const d = if (self.disk) |*dd| dd else return null;
+        d.pollModuleWrites();
+        d.cleanupModules();
+        self.syncModuleLosses();
+        if (!self.diskOwed()) {
+            self.disk_dirty = false;
+            return null;
+        }
+        defer self.disk_dirty = self.diskOwed();
+        if (self.sliceStagedModule(d, s)) |r| return r;
         if (self.finishing_disk != null) return self.slicePending(d, &self.finishing_disk, s);
         // The live state captured at commit, not what the RAM entry kept after its trim.
         if (order == .newest_first and self.pending_disk != null) return self.slicePending(d, &self.pending_disk, s);
-        if (self.owedEntryIndex(order == .newest_first)) |i| return sliceEntry(d, &self.entries.items[i], s);
-        return self.slicePending(d, &self.pending_disk, s);
+        if (self.owedEntryIndex(order == .newest_first)) |i| return self.sliceEntry(d, &self.entries.items[i], s);
+        if (self.slicePending(d, &self.pending_disk, s)) |r| return r;
+        return if (self.modulePublicationPending()) .busy else null;
+    }
+
+    fn sliceStagedModule(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, s: mlx.mlx_stream) ?SliceResult {
+        const pending = d.pending_module orelse return null;
+        if (self.finishing_disk) |p| if (p.module) |m| {
+            if (m.disk_id == pending.id) return self.slicePending(d, &self.finishing_disk, s);
+        };
+        if (self.pending_disk) |p| if (p.module) |m| {
+            if (m.disk_id == pending.id) return self.slicePending(d, &self.pending_disk, s);
+        };
+        for (self.entries.items) |*e| {
+            const m = e.module orelse continue;
+            if (m.disk_id == pending.id) return self.sliceEntry(d, e, s);
+        }
+        return null;
     }
 
     /// The finish path: one slice of the turn that just committed. Called AFTER `markFinished`,
     /// on the inference thread; snapshot arrays are refcount-shared with the RAM entry.
+    /// A new module part stages host bytes, so only the idle loop's admitted flush starts one.
     pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
+        if (self.nextSliceStartsModulePart(.newest_first)) return;
         _ = self.flushSlice(s, .newest_first);
     }
 
+    /// Mirrors `flushSlice`'s pick: would this slice begin staging a module part? A part already
+    /// staged (`pending_module`) was admitted when it started, so continuing it is not a new one.
+    fn nextSliceStartsModulePart(self: *const HotPrefixCache, order: SliceOrder) bool {
+        const d = if (self.disk) |*dd| dd else return false;
+        if (d.pending_module != null) return false;
+        if (self.finishing_disk) |p| return p.module != null;
+        if (order == .newest_first) if (self.pending_disk) |p| return p.module != null;
+        if (self.owedEntryIndex(order == .newest_first)) |i| return self.entries.items[i].module != null;
+        if (self.pending_disk) |p| return p.module != null;
+        return false;
+    }
+
     /// The idle loop's flush: one bounded slice to the OLDEST owed session (the next the LRU
-    /// drops), so every finished session lands whole, not only the newest. True while owed.
-    pub fn flushOwedSlice(self: *HotPrefixCache, s: mlx.mlx_stream) bool {
-        _ = self.flushSlice(s, .oldest_first);
-        return self.disk_dirty;
+    /// drops). Busy retains the file and source; the scheduler should wait before retrying it.
+    pub fn flushOwedSlice(self: *HotPrefixCache, s: mlx.mlx_stream) FlushResult {
+        const r = self.flushSlice(s, .oldest_first) orelse return .done;
+        if (r == .busy) return .busy;
+        return if (self.disk_dirty) .progress else .done;
     }
 
     /// One shutdown slice in the idle loop's order, tallied. The caller saw `diskOwed()`.
-    fn shutdownSlice(self: *HotPrefixCache, s: mlx.mlx_stream, t: *ShutdownTally) void {
-        const d = if (self.disk) |*dd| dd else return;
+    fn shutdownSlice(self: *HotPrefixCache, s: mlx.mlx_stream, t: *ShutdownTally) FlushResult {
+        const d = if (self.disk) |*dd| dd else return .done;
         self.disk_dirty = true;
         const before = d.bytes_persisted;
-        const r = self.flushSlice(s, .oldest_first) orelse return;
+        const r = self.flushSlice(s, .oldest_first) orelse return .done;
         const landed = d.bytes_persisted - before;
         t.bytes += landed;
         switch (r) {
             // A record already covered on disk (a parked snapshot's RAM twin) writes nothing.
-            .whole => t.written += @intFromBool(landed > 0),
+            .whole => t.written += @intFromBool(landed > 0 and d.module_context == null),
             .skipped => t.left_declined += @intFromBool(d.store_declined),
             .failed => t.failures += 1,
             // The writer's failure that poisoned it is counted from the writer.
-            .owed, .poisoned => {},
+            .owed, .busy, .poisoned => {},
         }
+        if (r == .busy) return .busy;
+        return if (self.disk_dirty) .progress else .done;
+    }
+
+    fn moduleCommittedCount(self: *const HotPrefixCache) u32 {
+        const d = if (self.disk) |*dd| dd else return 0;
+        var n: u32 = 0;
+        for (d.entries.items) |e| {
+            if (e.kind == .module and e.module.?.state == .committed) n += 1;
+        }
+        return n;
+    }
+
+    fn moduleUnfinishedCount(self: *const HotPrefixCache) u32 {
+        const d = if (self.disk) |*dd| dd else return 0;
+        var n: u32 = 0;
+        for (d.entries.items) |e| {
+            if (e.kind != .module) continue;
+            const state = e.module.?.state;
+            if (state == .registered or state == .exporting or state == .submitted) n += 1;
+        }
+        return n;
+    }
+
+    fn owedKvCount(self: *const HotPrefixCache) u32 {
+        var n = self.owedCount();
+        if (self.finishing_disk) |p| n -= @intFromBool(p.module != null);
+        if (self.pending_disk) |p| n -= @intFromBool(p.module != null);
+        for (self.entries.items) |e| n -= @intFromBool(e.module != null and e.disk_dirty and e.checked_out_by == null);
+        return n;
     }
 
     /// How many records the tier still owes and a slice could write.
@@ -2790,6 +3182,7 @@ pub const HotPrefixCache = struct {
     pub fn armDiskTier(self: *HotPrefixCache, config: *const model_mod.ModelConfig) void {
         self.ssd_first = ssdFirstActive(config, self.disk != null, self.ram_enabled);
         const d = if (self.disk) |*dd| dd else return;
+        if (d.module_context != null) self.ssd_first = false;
         d.ssd_first = self.ssd_first;
         d.enableBackgroundWriter();
         // Startup sweep of strays + root-wide LRU across sibling fingerprints.
@@ -3059,8 +3452,10 @@ pub const HotPrefixCache = struct {
         const shrank = budgetShrinks(self.max_kv_bytes, max_kv_bytes);
         self.max_kv_bytes = max_kv_bytes;
         if (!shrank) return;
-        while (self.current_kv_bytes > max_kv_bytes and self.entries.items.len > 0) {
-            if (!self.evictOneLruProgress("budget revised", null)) break;
+        if (self.residentBytes() > max_kv_bytes) self.cancelPendingModules(.memory_pressure);
+        while (self.residentBytes() > max_kv_bytes) {
+            const idx = self.lruIndexExcluding(null, null) orelse break;
+            self.evictAtWithCancellation(idx, "budget revised", .memory_pressure);
         }
         self.shedCheckpointsToFit();
         self.logResident();
@@ -3104,6 +3499,10 @@ pub const HotPrefixCache = struct {
     }
 
     fn evictAt(self: *HotPrefixCache, lru_idx: usize, reason: []const u8) void {
+        self.evictAtWithCancellation(lru_idx, reason, null);
+    }
+
+    fn evictAtWithCancellation(self: *HotPrefixCache, lru_idx: usize, reason: []const u8, cancellation: ?kv_disk_cache.DiskTier.ModuleCancellation) void {
         var evicted = self.entries.swapRemove(lru_idx);
         const tokens_len = evicted.tokens.len;
         const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
@@ -3111,7 +3510,7 @@ pub const HotPrefixCache = struct {
         const ssm_mb = @as(f64, @floatFromInt(evicted.ssm_bytes)) / (1024.0 * 1024.0);
         const key = evicted.cache_key;
         self.current_kv_bytes -|= evicted.kv_bytes;
-        freeEntryOwnedState(self.allocator, &evicted);
+        self.releaseModuleEntry(&evicted, cancellation);
         if (had_ssm) {
             log.info("  [hot-cache] evicted LRU entry ({s}; key={x}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
                 reason, key, tokens_len, kv_mb, ssm_mb,
@@ -3133,7 +3532,30 @@ pub const HotPrefixCache = struct {
     }
 
     pub fn residentBytes(self: *const HotPrefixCache) u64 {
-        return self.current_kv_bytes;
+        var bytes = self.current_kv_bytes;
+        if (self.finishing_disk) |p| if (p.module) |m| {
+            bytes +|= m.aux_bytes;
+        };
+        if (self.pending_disk) |p| if (p.module) |m| {
+            bytes +|= m.aux_bytes;
+        };
+        return bytes;
+    }
+
+    /// Additional host/readback scratch before the next module slice, beyond stagedHostBytes.
+    pub fn nextModuleStagingBytes(self: *const HotPrefixCache) u64 {
+        const d = if (self.disk) |*dd| dd else return 0;
+        if (d.pending_module != null) return 0;
+        if (self.finishing_disk) |p| if (p.module) |m| {
+            return d.modulePartStagingBytes(m.disk_id orelse return 0);
+        };
+        if (self.owedEntryIndex(false)) |idx| if (self.entries.items[idx].module) |m| {
+            return d.modulePartStagingBytes(m.disk_id orelse return 0);
+        };
+        if (self.pending_disk) |p| if (p.module) |m| {
+            return d.modulePartStagingBytes(m.disk_id orelse return 0);
+        };
+        return 0;
     }
 
     /// Bytes an eviction pass can prove it will get back: the residency minus the largest
@@ -3149,7 +3571,7 @@ pub const HotPrefixCache = struct {
             }
             largest = @max(largest, e.kv_bytes);
         }
-        return self.current_kv_bytes -| checked_out -| largest;
+        return self.residentBytes() -| checked_out -| largest;
     }
 
     /// One resident entry, reduced to what a connection thread may know about it (it may never
@@ -3219,7 +3641,7 @@ pub const HotPrefixCache = struct {
             if (shared < MIN_CANCELLED_COMMIT_TOKENS) continue;
             pinned = @max(pinned, e.kv_bytes);
         }
-        return self.current_kv_bytes -| checked_out -| pinned;
+        return self.residentBytes() -| checked_out -| pinned;
     }
 
     /// Evict least-recently-used entries until `fits()` says the request fits (#353): a cached
@@ -3256,18 +3678,17 @@ pub const HotPrefixCache = struct {
     ) EvictionReport {
         var report = EvictionReport{};
         while (!fits(ctx)) {
-            const idx = self.lruIndexExcluding(if (protect_restored) self.last_restored_used else null, null) orelse break;
             // Accounting bytes are what the entry was billed; live bytes are what the allocator got back.
             var live_before: usize = 0;
             _ = mlx.mlx_get_active_memory(&live_before);
-            const acct_before = self.current_kv_bytes;
-            self.evictAt(idx, "admitting a long prefill");
+            const acct_before = self.residentBytes();
+            if (!self.evictForAdmission(if (protect_restored) self.last_restored_used else null)) break;
             var live_after: usize = 0;
             _ = mlx.mlx_get_active_memory(&live_after);
             const freed_live: u64 = @as(u64, live_before) -| @as(u64, live_after);
             report.entries += 1;
             report.bytes += freed_live;
-            const acct_delta = acct_before -| self.current_kv_bytes;
+            const acct_delta = acct_before -| self.residentBytes();
             report.accounted_bytes += acct_delta;
             // Judge only entries big enough for the ratio to mean something.
             if (acct_delta >= SHARED_RATIO_MIN_BYTES and
@@ -3288,6 +3709,20 @@ pub const HotPrefixCache = struct {
             });
         }
         return report;
+    }
+
+    fn evictForAdmission(self: *HotPrefixCache, protect: ?u64) bool {
+        if (self.finishing_disk) |p| if (p.module != null) {
+            self.cancelPendingModule(&self.finishing_disk, .memory_pressure);
+            return true;
+        };
+        if (self.pending_disk) |p| if (p.module != null) {
+            self.cancelPendingModule(&self.pending_disk, .memory_pressure);
+            return true;
+        };
+        const idx = self.lruIndexExcluding(protect, null) orelse return false;
+        self.evictAtWithCancellation(idx, "admitting a long prefill", .memory_pressure);
+        return true;
     }
 
     /// Least-recently-used entry index, skipping the one whose `last_used` equals `protect`.
@@ -3335,7 +3770,9 @@ pub const HotPrefixCache = struct {
     /// prompt, tools toggle change).
     pub fn invalidateAll(self: *HotPrefixCache, reason: []const u8) void {
         // Suspect state must die on both tiers.
+        self.cancelModuleExports(.invalidation);
         if (self.disk) |*d| d.invalidateAll();
+        self.syncModuleLosses();
         self.disk_dirty = false;
         self.dropPendingSnapshots();
         if (self.entries.items.len == 0) return;
@@ -9053,13 +9490,13 @@ test "HotPrefixCache: idle flushes land every finished session whole, oldest owe
     }
     for (&toks) |*t| try testing.expectEqual(@as(u32, 128), testDiskKvLen(d, t));
 
-    try testing.expect(hc.flushOwedSlice(s));
+    try testing.expect(hc.flushOwedSlice(s) == .progress);
     try testing.expectEqual(@as(u32, 256), testDiskKvLen(d, &toks[0]));
     try testing.expectEqual(@as(u32, 128), testDiskKvLen(d, &toks[1]));
     try testing.expectEqual(@as(u32, 128), testDiskKvLen(d, &toks[2]));
 
     var calls: usize = 1;
-    while (calls < 50 and hc.flushOwedSlice(s)) calls += 1;
+    while (calls < 50 and hc.flushOwedSlice(s) != .done) calls += 1;
     try testing.expect(calls < 50);
     try testing.expect(!hc.disk_dirty);
     for (&toks) |*t| try testing.expect(testWholeOnDisk(d, &cache, t));
@@ -9090,13 +9527,13 @@ test "HotPrefixCache: the idle flush skips a checked-out entry and never reports
     (try testEntryFor(&hc, &toks[0])).checked_out_by = 1;
 
     var calls: usize = 0;
-    while (calls < 5 and hc.flushOwedSlice(s)) calls += 1;
+    while (calls < 5 and hc.flushOwedSlice(s) != .done) calls += 1;
     try testing.expect(calls < 5);
     try testing.expectEqual(@as(usize, 0), d.entryCount());
 
     hc.releaseCheckout(1, "test");
     calls = 0;
-    while (calls < 5 and hc.flushOwedSlice(s)) calls += 1;
+    while (calls < 5 and hc.flushOwedSlice(s) != .done) calls += 1;
     try testing.expect(calls < 5);
     try testing.expect(testWholeOnDisk(d, &cache, &toks[0]));
 }
@@ -9131,7 +9568,7 @@ test "HotPrefixCache: a failed background write costs only its own session; the 
     d.writer.?.injectFailure("/e1/c000002", .write);
 
     var calls: usize = 0;
-    while (calls < 50 and hc.flushOwedSlice(s)) {
+    while (calls < 50 and hc.flushOwedSlice(s) != .done) {
         d.drainWriter(); // let each failure land before the next slice reads the index
         calls += 1;
     }
@@ -9182,10 +9619,10 @@ test "HotPrefixCache: a qwen3_5 RAM-first cache arms the background writer and c
         try testing.expectEqual(@as(u64, 512 * 1024 * 1024), d.max_flush_bytes);
 
         _ = try hc.commit(&cache, &tok_a, false);
-        while (hc.flushOwedSlice(s)) {}
+        while (hc.flushOwedSlice(s) != .done) {}
         d.drainWriter();
         _ = try hc.commit(&cache, &tok_b, false);
-        while (hc.flushOwedSlice(s)) {}
+        while (hc.flushOwedSlice(s) != .done) {}
         d.drainWriter();
         try testing.expectEqual(@as(usize, 2), d.entryCount());
         var inherited: u32 = 0;
@@ -10345,6 +10782,10 @@ const ModuleFake = struct {
     slot: u32 = 0,
     key_ids_len: usize = 0,
     fail_key_at: usize = 0,
+    exports: usize = 0,
+    fail_export: bool = false,
+    large_export: bool = false,
+    loaded: bool = true,
 
     const Snap = struct {
         owner: *ModuleFake,
@@ -10411,9 +10852,36 @@ const ModuleFake = struct {
     }
     fn free(m: *anyopaque, snap: plugin_abi.Handle) callconv(.c) void {
         const s = snapOf(snap);
-        std.debug.assert(s.owner == get(m) and s.frees == 0);
+        std.debug.assert(get(m).loaded and s.owner == get(m) and s.frees == 0);
         s.frees += 1;
         get(m).frees += 1;
+    }
+    fn exportArrays(m: *anyopaque, snap: plugin_abi.Handle, out: *plugin_abi.AuxExport) callconv(.c) plugin_abi.Verdict {
+        const f = get(m);
+        std.debug.assert(f.loaded and snapOf(snap).frees == 0);
+        f.exports += 1;
+        if (f.fail_export) {
+            mlx.latchErrorForTest("module export failure");
+            return plugin_abi.Verdict.refuse(.failed, "fake export failed");
+        }
+        if (out.tensor_cap < 2 or out.names_cap < 8 or out.header_cap < 13)
+            return plugin_abi.Verdict.refuse(.unsupported, "fake export storage short");
+        @memcpy(out.names.?[0..8], "ringhist");
+        @memcpy(out.header.?[0..13], "test-codec-v1");
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        const scalar = mlx.mlx_array_new_float(1.25);
+        defer _ = mlx.mlx_array_free(scalar);
+        for (0..2) |i| {
+            var arr = mlx.mlx_array_new();
+            const shape = [_]c_int{if (i == 0 and f.large_export) 4 * 1024 * 1024 + 1 else 4};
+            _ = mlx.mlx_full(&arr, &shape, 1, scalar, .float32, cpu);
+            out.tensors.?[i] = .{ .name = .of(out.names.?[i * 4 ..][0..4]), .array = .{ .ctx = arr.ctx } };
+            out.tensor_len += 1;
+        }
+        out.names_len = 8;
+        out.header_len = 13;
+        return .ok;
     }
     const hooks: plugin_abi.AuxHooks = .{
         .reserve = undefined,
@@ -10424,12 +10892,13 @@ const ModuleFake = struct {
         .handoff = undefined,
         .free = &free,
         .bytes = &bytes,
-        .serialize = undefined,
-        .deserialize = undefined,
         .enabled = &on,
         .describe = &describe,
         .prefix_key = &prefixKey,
         .begin_prompt = &begin,
+        .import_plan = undefined,
+        .export_arrays = &exportArrays,
+        .import_arrays = undefined,
     };
     const cache_hooks: plugin_abi.CacheHooks = .{ .aux = &hooks };
     const weights: plugin_abi.WeightHooks = .{};
@@ -10823,4 +11292,617 @@ test "HotPrefixCache module: failed restore clears only its own error latch" {
         try testing.expectEqual(@as(usize, 1), snap.frees);
         try testing.expectEqual(@as(usize, 0), cache.entryCount());
     }
+}
+
+const ModuleDiskTest = struct {
+    const context: kv_disk_cache.module_record.Context = .{ .identity = "fake-weights:16:42", .validate = &validate };
+
+    fn validate(_: ?*anyopaque, header: []const u8, _: *const kv_disk_cache.module_record.Envelope) bool {
+        return std.mem.eql(u8, header, "test-codec-v1");
+    }
+
+    fn init(tmp: *testing.TmpDir, count: u32) !HotPrefixCache {
+        var buf: [512]u8 = undefined;
+        const base = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+        var hc = HotPrefixCache.initWithMem(testing.allocator, count, 0);
+        hc.disk = try kv_disk_cache.DiskTier.initWithModule(testing.allocator, testing.io, base, "module-lifetime", 0, 512, context);
+        hc.disk.?.armTestSpace(1024 * kv_disk_cache.DISK_STORE_FLOOR, 2048 * kv_disk_cache.DISK_STORE_FLOOR);
+        hc.disk.?.enableBackgroundWriter();
+        return hc;
+    }
+
+    fn ids(seed: u32) [513]u32 {
+        var out: [513]u32 = undefined;
+        for (&out, 0..) |*id, i| id.* = seed + @as(u32, @intCast(i));
+        return out;
+    }
+
+    fn snap(fake: *ModuleFake, tokens: []const u32) ModuleFake.Snap {
+        var key: u64 = 0;
+        for (tokens) |id| key += id;
+        return .{ .owner = fake, .ids = tokens, .key = key };
+    }
+
+    fn finish(hc: *HotPrefixCache, s: mlx.mlx_stream) !void {
+        var calls: usize = 0;
+        while (hc.disk_dirty and calls < 32) : (calls += 1) {
+            _ = hc.flushOwedSlice(s);
+            hc.disk.?.drainWriter();
+        }
+        try testing.expect(calls < 32);
+        hc.disk.?.pollModuleWrites();
+    }
+};
+
+test "under-floor module commits remain RAM-only" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 2);
+    defer hc.deinit();
+    try testing.expectEqual(@as(CommitStatus, .declined), try hc.commitModule(binding, null, &.{ 1, 2 }, 3, &.{}, false, kv_quant.KVQuantConfig.dense, 0));
+    var snap = ModuleDiskTest.snap(&fake, &.{ 1, 2 });
+    try testing.expectEqual(@as(CommitStatus, .{ .ok = 2 }), try snap.put(&hc, binding, &.{}));
+    try testing.expectEqual(@as(usize, 0), fake.exports);
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+    const hit = hc.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.ram, hit.source);
+    try testing.expectEqual(@as(usize, 2), hc.consumeModule(binding, hit.entry_id, 0));
+    try testing.expectEqual(@as(usize, 1), snap.frees);
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+}
+
+test "module registration OOM preserves RAM" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 2);
+    defer hc.deinit();
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    hc.disk.?.allocator = failing.allocator();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    const result = try snap.put(&hc, binding, &.{});
+    hc.disk.?.allocator = testing.allocator;
+    try testing.expectEqual(@as(CommitStatus, .{ .ok = 512 }), result);
+    try testing.expect(failing.has_induced_failure);
+    try testing.expectEqual(@as(usize, 0), snap.frees);
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+    const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(@as(usize, 512), hc.consumeModule(binding, hit.entry_id, 0));
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+}
+
+test "replacement and count eviction preserve module exports" {
+    for ([_]bool{ false, true }) |replacement| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var hc = try ModuleDiskTest.init(&tmp, 1);
+        defer hc.deinit();
+        const ids = ModuleDiskTest.ids(7);
+        const other = ModuleDiskTest.ids(1000);
+        var old = ModuleDiskTest.snap(&fake, ids[0..512]);
+        var next = ModuleDiskTest.snap(&fake, if (replacement) &ids else other[0..512]);
+        _ = try old.put(&hc, binding, &.{});
+        const disk_id = hc.entries.items[0].module.?.disk_id.?;
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        _ = hc.flushOwedSlice(cpu);
+        _ = try next.put(&hc, binding, &.{});
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        try testing.expectEqual(@as(usize, 0), old.frees);
+        try testing.expectEqual(@as(u64, 80), hc.residentBytes());
+        try testing.expectEqual(@as(u64, 40), hc.current_kv_bytes);
+        try testing.expectEqual(@as(u64, 40), hc.reclaimableBytes());
+        try ModuleDiskTest.finish(&hc, cpu);
+        try testing.expect(hc.disk.?.entryWholeOnDisk(disk_id));
+        try testing.expectEqual(@as(usize, 1), old.frees);
+        try testing.expectEqual(@as(u64, 40), hc.residentBytes());
+        try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+    }
+}
+
+test "full holders cancel the evicted module export" {
+    for ([_]bool{ false, true }) |replacement| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var hc = try ModuleDiskTest.init(&tmp, 1);
+        defer hc.deinit();
+        const ids = [_][513]u32{ ModuleDiskTest.ids(7), ModuleDiskTest.ids(1000), ModuleDiskTest.ids(2000), ModuleDiskTest.ids(3000) };
+        var snaps: [4]ModuleFake.Snap = undefined;
+        var disk_ids: [3]u64 = undefined;
+        for (&snaps, 0..) |*snap, i| {
+            const tokens: []const u32 = if (i == 3 and replacement) &ids[2] else ids[i][0..512];
+            snap.* = ModuleDiskTest.snap(&fake, tokens);
+            _ = try snap.put(&hc, binding, &.{});
+            if (i < 3) disk_ids[i] = hc.entries.items[0].module.?.disk_id.?;
+        }
+        try testing.expectEqual(@as(usize, 0), snaps[0].frees);
+        try testing.expectEqual(@as(usize, 0), snaps[1].frees);
+        try testing.expectEqual(@as(usize, 1), snaps[2].frees);
+        try testing.expect(!hc.disk.?.entryWholeOnDisk(disk_ids[2]));
+        try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        try ModuleDiskTest.finish(&hc, cpu);
+        for (disk_ids[0..2]) |id| try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+    }
+}
+
+test "full holders preserve exact module consumption" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = [_][513]u32{ ModuleDiskTest.ids(7), ModuleDiskTest.ids(1000), ModuleDiskTest.ids(2000) };
+    var snaps: [3]ModuleFake.Snap = undefined;
+    var disk_ids: [3]u64 = undefined;
+    for (&snaps, 0..) |*snap, i| {
+        snap.* = ModuleDiskTest.snap(&fake, ids[i][0..512]);
+        _ = try snap.put(&hc, binding, &.{});
+        disk_ids[i] = hc.entries.items[0].module.?.disk_id.?;
+        const hit = hc.findModuleMatch(binding, &ids[i], false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        try testing.expectEqual(.ram, hit.source);
+        try testing.expectEqual(@as(usize, 512), hc.consumeModule(binding, hit.entry_id, @intCast(i)));
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(usize, @intFromBool(i == 2)), snap.frees);
+    }
+    try testing.expectEqual(@as(usize, 3), fake.restores);
+    try testing.expectEqual(@as(u64, 80), hc.residentBytes());
+    try testing.expectEqual(@as(u64, 80), hc.reclaimableBytesFor(&ids[2]));
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+    try testing.expectEqual(.cancelled, hc.disk.?.moduleState(disk_ids[2]).?);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try ModuleDiskTest.finish(&hc, cpu);
+    for (disk_ids[0..2]) |id| try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    for (snaps) |snap| try testing.expectEqual(@as(usize, 1), snap.frees);
+}
+
+test "module failures preserve ownership and error latches" {
+    defer mlx.dropLatchedErrorUnless(false);
+    const Case = enum { export_arrays, existing_error, allocation, submit };
+    for ([_]Case{ .export_arrays, .existing_error, .allocation, .submit }) |case| {
+        mlx.dropLatchedErrorUnless(false);
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var hc = try ModuleDiskTest.init(&tmp, 1);
+        defer hc.deinit();
+        const ids = ModuleDiskTest.ids(7);
+        var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+        _ = try snap.put(&hc, binding, &.{});
+        const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        const id = hc.entries.items[0].module.?.disk_id.?;
+        try testing.expectEqual(@as(usize, 512), hc.consumeModule(binding, hit.entry_id, 0));
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        _ = hc.flushOwedSlice(cpu);
+        hc.disk.?.drainWriter();
+        _ = hc.flushOwedSlice(cpu);
+        hc.disk.?.drainWriter();
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+        switch (case) {
+            .export_arrays, .existing_error => fake.fail_export = true,
+            .allocation => hc.disk.?.allocator = failing.allocator(),
+            .submit => hc.disk.?.writer.?.injectFailure("m000.", .submit),
+        }
+        if (case == .existing_error) mlx.latchErrorForTest("module export pre-existing failure");
+        _ = hc.flushOwedSlice(cpu);
+        hc.disk.?.allocator = testing.allocator;
+        try testing.expectEqual(case == .existing_error, mlx.errorPending());
+        try testing.expect(!hc.disk_dirty);
+        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expectEqual(.failed, hc.disk.?.moduleState(id).?);
+        try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+    }
+}
+
+test "module lookup ranks disk boundaries and prefers RAM ties" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 2);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const id = hc.entries.items[0].module.?.disk_id.?;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try ModuleDiskTest.finish(&hc, cpu);
+    const ram = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.ram, ram.source);
+    try testing.expectEqual(@as(usize, 512), hc.consumeModule(binding, ram.entry_id, 1));
+    const disk = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.disk, disk.source);
+    try testing.expectEqual(id, disk.disk_id);
+    try testing.expectEqual(@as(usize, 512), disk.n);
+    try testing.expect(hc.findModuleMatch(binding, ids[0..512], false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expect(hc.findModuleMatch(binding, &ids, true, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expect(hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.affine(4)) == null);
+    fake.fail_key_at = 512;
+    try testing.expect(hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    try testing.expect(!mlx.errorPending());
+    fake.fail_key_at = 0;
+    var short = ModuleDiskTest.snap(&fake, ids[0..2]);
+    _ = try short.put(&hc, binding, &.{});
+    const longer = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.disk, longer.source);
+    try testing.expectEqual(id, longer.disk_id);
+    try testing.expectEqual(snap.key, longer.prefix_key);
+}
+
+test "invalidation retires queued module exports" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    _ = hc.consumeModule(binding, hit.entry_id, 0);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    hc.disk.?.writer.?.setPaused(true);
+    _ = hc.flushOwedSlice(cpu);
+    try testing.expect(hc.stagedHostBytes() > 0);
+    hc.invalidateAll("test invalidation");
+    try testing.expectEqual(@as(usize, 1), snap.frees);
+    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    try testing.expectEqual(@as(u64, 0), hc.stagedHostBytes());
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+    hc.disk.?.writer.?.setPaused(false);
+    hc.disk.?.drainWriter();
+    try testing.expect(hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
+    hc.invalidateAll("again");
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+}
+
+test "expired shutdown starts no module files" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const id = hc.entries.items[0].module.?.disk_id.?;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 1 }, 0);
+    try testing.expectEqual(@as(u32, 0), t.written);
+    try testing.expectEqual(@as(u32, 1), t.left_deadline);
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.bytes_persisted);
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+    try testing.expectEqual(.cancelled, hc.disk.?.moduleState(id).?);
+    try testing.expect(!hc.disk_dirty);
+}
+
+test "shutdown stops after one overdue module file" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    hc.disk.?.writer.?.setPaused(true);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 10 }, 15);
+    try testing.expectEqual(@as(u32, 0), t.written);
+    try testing.expectEqual(@as(u32, 1), t.left_deadline);
+    try testing.expectEqual(@as(u64, 512 * 4), hc.disk.?.bytes_persisted);
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+    try testing.expect(!hc.disk_dirty);
+    hc.disk.?.writer.?.setPaused(false);
+}
+
+test "busy module slices retain blob and cursor" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const w = hc.disk.?.writer.?;
+    w.setPaused(true);
+    w.permit_bytes = 1;
+    try testing.expectEqual(.progress, hc.flushOwedSlice(cpu));
+    try testing.expectEqual(.busy, hc.flushOwedSlice(cpu));
+    const blob = hc.disk.?.pending_module.?.bytes;
+    const exports = fake.exports;
+    const bill = hc.stagedHostBytes();
+    try testing.expectEqual(.busy, hc.flushOwedSlice(cpu));
+    try testing.expectEqual(blob.ptr, hc.disk.?.pending_module.?.bytes.ptr);
+    try testing.expectEqual(exports, fake.exports);
+    try testing.expectEqual(bill, hc.stagedHostBytes());
+    try testing.expect(hc.disk_dirty);
+    w.setPaused(false);
+    hc.disk.?.drainWriter();
+    w.permit_bytes = 1024 * 1024;
+    try ModuleDiskTest.finish(&hc, cpu);
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+}
+
+test "busy module shutdown expires without fencing" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    hc.disk.?.writer.?.setPaused(true);
+    hc.disk.?.writer.?.permit_bytes = 1;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 1 }, 12);
+    try testing.expectEqual(@as(u32, 0), t.written);
+    try testing.expectEqual(@as(u32, 1), t.left_deadline);
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+    // The shutdown drain unpauses the writer, so the one accepted file may still be in flight: expiry
+    // fences only queued files and lets a started write finish. Nothing is left queued or unsent.
+    try testing.expectEqual(@as(u64, 0), hc.disk.?.writer.?.queuedBytes());
+    try testing.expect(hc.disk.?.pending_module == null);
+    hc.disk.?.writer.?.drain();
+    try testing.expectEqual(@as(u64, 0), hc.stagedHostBytes());
+    hc.disk.?.writer.?.setPaused(false);
+}
+
+test "unload frees module snapshots before binding destruction" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    _ = hc.consumeModule(binding, hit.entry_id, 0);
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    hc.disk.?.writer.?.setPaused(true);
+    _ = hc.flushOwedSlice(cpu);
+    hc.deinit();
+    fake.loaded = false;
+    try testing.expectEqual(@as(usize, 1), snap.frees);
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+    var reopened = try ModuleDiskTest.init(&tmp, 1);
+    defer reopened.deinit();
+    try testing.expectEqual(@as(usize, 0), reopened.disk.?.entryCount());
+}
+
+test "failed and cancelled requests leave the old module export owed" {
+    for ([_]bool{ false, true }) |cancelled| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var hc = try ModuleDiskTest.init(&tmp, 1);
+        defer hc.deinit();
+        const ids = ModuleDiskTest.ids(7);
+        var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+        _ = try snap.put(&hc, binding, &.{});
+        const id = hc.entries.items[0].module.?.disk_id.?;
+        const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        _ = hc.consumeModule(binding, hit.entry_id, 0);
+        var model: @import("../../../host/registry/registry.zig").LoadedModel = undefined;
+        model.prefix_cache = &hc;
+        model.transformer = &xfm;
+        var slot: @import("../slot.zig").Slot = undefined;
+        slot.model = &model;
+        slot.error_code = if (cancelled) null else "test_failed_request";
+        slot.cancelled = std.atomic.Value(bool).init(cancelled);
+        var scheduler: @import("../scheduler.zig").Scheduler = undefined;
+        @import("../commit.zig").commitSlotIfApplicable(&scheduler, &slot);
+        try testing.expectEqual(@as(usize, 0), snap.frees);
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        try ModuleDiskTest.finish(&hc, cpu);
+        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+        const disk = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        try testing.expectEqual(.disk, disk.source);
+        try testing.expectEqual(id, disk.disk_id);
+        try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+    }
+}
+
+test "budget shrink cancels pending module sources" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    _ = hc.consumeModule(binding, hit.entry_id, 0);
+    try testing.expectEqual(@as(u64, 40), hc.residentBytes());
+    hc.setBudget(20);
+    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    try testing.expectEqual(@as(usize, 1), snap.frees);
+    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
+}
+
+test "module slices materialize one tensor part" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{ .large_export = true };
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const id = hc.entries.items[0].module.?.disk_id.?;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const evals = kv_disk_cache.serialize_eval_count.load(.monotonic);
+    for (0..4) |i| {
+        try testing.expectEqual(.progress, hc.flushOwedSlice(cpu));
+        hc.disk.?.drainWriter();
+        try testing.expectEqual(evals + (if (i < 2) @as(u64, 0) else i - 1), kv_disk_cache.serialize_eval_count.load(.monotonic));
+        try testing.expect(!hc.disk.?.entryWholeOnDisk(id));
+    }
+    _ = hc.flushOwedSlice(cpu);
+    hc.disk.?.drainWriter();
+    try testing.expectEqual(.done, hc.flushOwedSlice(cpu));
+    try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+}
+
+test "the finish flush never stages a module part" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{ .large_export = true };
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const id = hc.entries.items[0].module.?.disk_id.?;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const evals = kv_disk_cache.serialize_eval_count.load(.monotonic);
+    const staged = hc.stagedHostBytes();
+    // Staging bypasses the idle loop's admission gate here, so the finish path leaves it owed.
+    for (0..3) |_| hc.flushPendingDisk(cpu);
+    try testing.expect(hc.disk.?.pending_module == null);
+    try testing.expectEqual(evals, kv_disk_cache.serialize_eval_count.load(.monotonic));
+    try testing.expectEqual(staged, hc.stagedHostBytes());
+    try testing.expect(hc.diskOwed());
+    try testing.expect(!hc.disk.?.entryWholeOnDisk(id));
+    try testing.expectEqual(.progress, hc.flushOwedSlice(cpu));
+}
+
+test "busy tensor retries avoid another readback" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const id = hc.entries.items[0].module.?.disk_id.?;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const w = hc.disk.?.writer.?;
+    w.setPaused(true);
+    w.permit_bytes = 512 * 4 + 13;
+    try testing.expectEqual(.progress, hc.flushOwedSlice(cpu));
+    try testing.expectEqual(.progress, hc.flushOwedSlice(cpu));
+    try testing.expect(hc.nextModuleStagingBytes() > 0);
+    const evals = kv_disk_cache.serialize_eval_count.load(.monotonic);
+    try testing.expectEqual(.busy, hc.flushOwedSlice(cpu));
+    const ptr = hc.disk.?.pending_module.?.bytes.ptr;
+    const exports = fake.exports;
+    try testing.expectEqual(evals + 1, kv_disk_cache.serialize_eval_count.load(.monotonic));
+    try testing.expectEqual(@as(u32, 0), hc.disk.?.modulePartIndex(id).?);
+    try testing.expectEqual(@as(u64, 0), hc.nextModuleStagingBytes());
+    try testing.expectEqual(.busy, hc.flushOwedSlice(cpu));
+    try testing.expectEqual(ptr, hc.disk.?.pending_module.?.bytes.ptr);
+    try testing.expectEqual(exports, fake.exports);
+    try testing.expectEqual(evals + 1, kv_disk_cache.serialize_eval_count.load(.monotonic));
+    w.setPaused(false);
+    hc.disk.?.drainWriter();
+    w.permit_bytes = 1024 * 1024;
+    try ModuleDiskTest.finish(&hc, cpu);
+    try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+}
+
+test "shutdown counts published module records" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 1);
+    defer hc.deinit();
+    const ids = ModuleDiskTest.ids(7);
+    var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+    _ = try snap.put(&hc, binding, &.{});
+    const id = hc.entries.items[0].module.?.disk_id.?;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var now: i64 = 0;
+    const t = shutdownPersist(&.{.{ .hc = &hc, .s = cpu }}, TestStepClock{ .now = &now, .step = 1 }, 1_000_000);
+    try testing.expectEqual(@as(u32, 1), t.written);
+    try testing.expectEqual(@as(u32, 0), t.left_deadline);
+    try testing.expectEqual(@as(u64, 0), t.failures);
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+    try testing.expect(hc.disk.?.entryWholeOnDisk(id));
 }

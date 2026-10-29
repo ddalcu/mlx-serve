@@ -19,6 +19,8 @@ const decodeImageToPixels = @import("decode.zig").decodeImageToPixels;
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    // The plugin's own `prepare` resizes: the host only decodes.
+    if (config.plugin_media) return .{ .mode = .plugin_rgb };
     if (config.radio_vision) return .{ .mode = .radio, .patch = radio_vision.PATCH, .merge = radio_vision.DOWNSAMPLE };
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the

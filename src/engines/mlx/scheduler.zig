@@ -1169,6 +1169,7 @@ fn batchable(self: *const Scheduler, slot: *const Slot) bool {
 /// and `decode_serial_total{reason}` name.
 pub fn batchVerdict(self: *const Scheduler, slot: *const Slot) BatchVerdict {
     _ = self;
+    if (slot.legacy_gen != null and slot.legacy_gen.?.speech != null) return .speech;
     if (!slotTicksRegular(slot)) return .spec_active;
     // A slot whose module-head release is armed but not landed still holds the head.
     if (slotReleasePending(slot)) return .head_release_pending;

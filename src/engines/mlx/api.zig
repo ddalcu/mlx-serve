@@ -152,6 +152,7 @@ fn pairFields(gpa: std.mem.Allocator) ?[]u8 {
 
 fn supportsVideo(lm: *const LoadedModel) bool {
     const ve = lm.vision_encoder orelse return false;
+    if (ve.plugin_media) |p| return p.parsed.caps.video;
     if (ve.radio) |radio| return radio.video_w.ctx != null;
     const c = lm.config orelse return false;
     return ve.supportsImages() and c.video_token_id != 0;
@@ -164,7 +165,8 @@ fn facts(lm: *const LoadedModel, out: *host.Facts) void {
         .module_owned = if (lm.transformer) |t| t.ownsModuleDecodeState() else false,
         .images = if (lm.vision_encoder) |ve| ve.supportsImages() else false,
         .audio = if (lm.vision_encoder) |ve| ve.supportsAudio() else false,
-        .hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null else false,
+        // Transcription: Qwen3-ASR's tower, or a speech model's own (its card's ASR recipe, `handleTranscriptions`).
+        .hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null or (ve.supportsAudio() and lm.config.?.speech() != null) else false,
         .video = supportsVideo(lm),
         .batches_decode = if (lm.config) |c| verdict.configBatchesDecode(c) else false,
         .hot_cache_bytes = hotCacheBytes(lm),
@@ -181,6 +183,7 @@ test "RADIO video availability follows loaded embedder weights" {
     var encoder: @import("vision_encoder.zig").VisionEncoder = undefined;
     encoder.radio = radio;
     encoder.qwen_audio = null;
+    encoder.plugin_media = null;
     var entry: LoadedModel = undefined;
     entry.vision_encoder = &encoder;
     var config = ModelConfig{ .radio_vision = true };

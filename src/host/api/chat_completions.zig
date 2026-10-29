@@ -86,6 +86,8 @@ const countRejected = @import("../http/errors.zig").countRejected;
 const contextOverflowMessage = @import("../http/errors.zig").contextOverflowMessage;
 const sendErrorResponse = @import("../http/errors.zig").sendErrorResponse;
 const cachedFormatChat = @import("format.zig").cachedFormatChat;
+const speech_stream = @import("speech_stream.zig");
+const speech_api = @import("speech.zig");
 const formatChatUsage = @import("format.zig").formatChatUsage;
 const formatTimingsObject = @import("format.zig").formatTimingsObject;
 const formatPerfBracket = @import("format.zig").formatPerfBracket;
@@ -97,7 +99,8 @@ const MropeData = @import("../media/encode.zig").MropeData;
 const MultimodalPrompt = @import("../media/encode.zig").MultimodalPrompt;
 const prepareMultimodalPrompt = @import("../media/encode.zig").prepareMultimodalPrompt;
 const multimodalFailure = @import("../media/encode.zig").multimodalFailure;
-const parseAudioContent = @import("../media/encode.zig").parseAudioContent;
+const parseAudioInput = @import("../media/encode.zig").parseAudioInput;
+const AUDIO_DECODE_REJECT = @import("../media/request_media.zig").AUDIO_DECODE_REJECT;
 const visionPreprocFromConfig = @import("../media/prepare.zig").visionPreprocFromConfig;
 const RequestMedia = @import("../media/request_media.zig").RequestMedia;
 const appendImageUrlContent = @import("../media/request_media.zig").appendImageUrlContent;
@@ -166,6 +169,7 @@ pub fn handleChatCompletions(
 
     var messages = std.ArrayList(chat_mod.Message).empty;
     var image_decode_failed = false;
+    var audio_decode_failed = false;
     defer messages.deinit(allocator);
 
     // Decoded image/video/audio buffers for every message in this request.
@@ -232,21 +236,30 @@ pub fn handleChatCompletions(
                         for (frames_val.array.items) |f| {
                             if (f == .string) frame_urls.append(allocator, f.string) catch continue;
                         }
+                        const before = media.videos(vid_slot).items.len;
                         appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config));
+                        // The rate the client sampled the frames at (a plugin tower's timestamps read it).
+                        if (vid_obj.object.get("fps")) |f| if (media.videos(vid_slot).items.len > before) {
+                            const rate: f64 = switch (f) {
+                                .float => |x| x,
+                                .integer => |x| @floatFromInt(x),
+                                else => 0,
+                            };
+                            if (rate > 0 and rate <= 1000) media.videos(vid_slot).items[before].fps = @floatCast(rate);
+                        };
                     } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
-                        // OpenAI-style audio block. For the Gemma 4 12B unified
-                        // engine the client sends raw 16 kHz mono float32-LE PCM
-                        // (format "mlx_pcm_f32") base64-encoded in `data`.
+                        // OpenAI's audio part (`data` + `format`), decoded to 16 kHz mono f32 (`parseAudioInput`).
                         const a_obj = part.object.get("input_audio") orelse continue;
                         if (a_obj != .object) continue;
                         const data_val = a_obj.object.get("data") orelse continue;
                         if (data_val != .string) continue;
-                        if (parseAudioContent(allocator, data_val.string)) |aud| {
+                        const format: ?[]const u8 = if (a_obj.object.get("format")) |f| (if (f == .string) f.string else null) else null;
+                        if (parseAudioInput(allocator, data_val.string, format)) |aud| {
                             media.audio(aud_slot).append(allocator, aud) catch {
                                 allocator.free(aud.samples);
                                 continue;
                             };
-                        }
+                        } else audio_decode_failed = true;
                     }
                 }
                 msg_images = media.imagesSlice(img_slot);
@@ -301,12 +314,27 @@ pub fn handleChatCompletions(
         else
             null;
 
+        // A spoken reply comes back as its id (OpenAI's history shape): it replays as its transcript.
+        var spoken = content;
+        if (content.len == 0 and std.mem.eql(u8, role_val.string, "assistant")) if (obj.get("audio")) |au| if (au == .object) if (au.object.get("id")) |aid| {
+            const text = if (aid == .string) try speech_api.store.get(stream.io, allocator, aid.string, nowSecs(stream.io)) else null;
+            if (text) |t| {
+                try content_allocs.append(allocator, t);
+                spoken = t;
+            } else {
+                log.warn("POST /v1/chat/completions -> 400 (unknown audio id)\n", .{});
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", speech_api.UNKNOWN_AUDIO_ID, 400);
+                return;
+            }
+        };
+        const content_out = spoken;
+
         // Skip messages with no content, no tool_calls, and no images/videos/audio
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        if (content_out.len == 0 and msg_tool_calls == null and msg_images == null and msg_videos == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = chat_mod.canonicalRole(role_val.string),
-            .content = content,
+            .content = content_out,
             .tool_calls = msg_tool_calls,
             .tool_call_id = tool_call_id,
             .images = msg_images,
@@ -319,6 +347,11 @@ pub fn handleChatCompletions(
     if (image_decode_failed) {
         log.warn("POST /v1/chat/completions -> 400 (undecodable image)\n", .{});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", IMAGE_DECODE_REJECT, 400);
+        return;
+    }
+    if (audio_decode_failed) {
+        log.warn("POST /v1/chat/completions -> 400 (undecodable audio)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", AUDIO_DECODE_REJECT, 400);
         return;
     }
     if (messages.items.len == 0) {
@@ -340,6 +373,15 @@ pub fn handleChatCompletions(
     const max_tokens_origin = maxTokensOrigin(requested_max_tokens, launchMaxTokensDefault());
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const speech_ask: ?speech_api.Ask = switch (speech_api.parse(root, config.speech() != null, is_stream)) {
+        .none => null,
+        .ask => |ask| ask,
+        .reject => |why| {
+            log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{why});
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", why, 400);
+            return;
+        },
+    };
 
     const sampled = resolveSampling(gen, root, config);
     const temperature = sampled.temperature;
@@ -405,6 +447,12 @@ pub fn handleChatCompletions(
                 tools_json = tools_str;
             }
         }
+    }
+    // Refused before the prompt or any media is built: only a card that speaks tool turns takes both.
+    if (speech_ask != null and has_tools and !config.speech().?.tools) {
+        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{speech_api.TEXT_TOOLS});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", speech_api.TEXT_TOOLS, 400);
+        return;
     }
     if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
         const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
@@ -527,7 +575,8 @@ pub fn handleChatCompletions(
     const default_budget = defaultReasoningBudget(gen);
     const thinking = resolveChatThinking(root, gen, config.defaultEnableThinking(tools_json != null), default_budget, effortWordOnly(allocator, lm, tok));
     const effort_cfg = thinking.effort;
-    var enable_thinking = thinking.enable;
+    // The card's spoken recipes open no think block (`handleSpeech` likewise): the reply speaks from its first slot.
+    var enable_thinking = thinking.enable and speech_ask == null;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
     // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
@@ -636,6 +685,15 @@ pub fn handleChatCompletions(
     // POST assistant-last history here and expect a fresh turn, and turning
     // that into a prefill would change what every one of them gets back.
     // Asked for by name, so a model that cannot serve it is refused by name.
+    // A spoken reply: the card's voice-chat recipe closes the system prompt (the tool list follows it).
+    if (speech_ask != null) {
+        const line = speech_api.recipe(has_tools);
+        if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
+            const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, line });
+            try rf_allocs.append(allocator, combined);
+            messages.items[0].content = combined;
+        } else try messages.insert(allocator, 0, .{ .role = "system", .content = line, .tool_calls = null, .tool_call_id = null });
+    }
     const continue_final = continueFinalMessageRequested(root, messages.items);
     if (continue_final) if (continuationRejectReason(lm.engineOwnsTemplate())) |reason| {
         log.warn("  -> 400 (continuation unsupported by the embedded engine)\n", .{});
@@ -687,6 +745,11 @@ pub fn handleChatCompletions(
             schema_proto = rp_mod.Protocol.jsonOnly();
         }
         schema_proto_active = true;
+    }
+    // The card prefills a voice-chat turn with `<|mixed_start|>`; with tools the model picks a call or speech itself.
+    if (speech_ask != null and !has_tools) {
+        prompt_ids_raw = try allocator.realloc(prompt_ids_raw, prompt_ids_raw.len + 1);
+        prompt_ids_raw[prompt_ids_raw.len - 1] = config.speech().?.mixed_start;
     }
     const tokenize_ns = tokenize_sw.read();
 
@@ -843,14 +906,19 @@ pub fn handleChatCompletions(
     mm.embeddings = null;
     const sub_mrope = mm.mrope;
     mm.mrope = .{}; // ownership transferred to the sub-handler → slot
-    if (is_stream) {
+    if (is_stream and speech_ask != null) {
+        speech_stream.handle(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, model_name, include_usage, if (has_tools) tools_json else null, allow_parallel_tools, sub_ve, mm.media, cache_key, sub_mrope, tokenize_ns) catch |err| {
+            logStreamError(err);
+            sendGenerationError(allocator, stream, err, .openai) catch {};
+        };
+    } else if (is_stream) {
         handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             logStreamError(err);
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns, speech_ask) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -974,6 +1042,8 @@ fn handleNonStreamingGeneration(
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
+    /// A spoken reply (`modalities` asked for audio).
+    speech: ?speech_api.Ask,
 ) !void {
     // Phase A8: this handler owns the vision array on entry; ownership
     // transfers to the slot on submit (the scheduler's `Slot.deinit` frees
@@ -1003,13 +1073,15 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, stream);
+    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, if (speech != null) .{} else null, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {
         for (lps) |*lp| allocator.free(lp.top_logprobs);
         allocator.free(lps);
     };
+    defer if (result.audio_samples) |x| allocator.free(x);
+    defer if (result.audio_codes) |x| allocator.free(x);
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
     // Not ANDed with enable_thinking: generated reasoning is always DELIVERED,
@@ -1221,17 +1293,34 @@ fn handleNonStreamingGeneration(
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
 
+    // A spoken reply is OpenAI's `message.audio`: the speech, its id, and the text as its transcript.
+    var audio_field: []const u8 = "";
+    defer if (audio_field.len > 0) allocator.free(audio_field);
+    if (speech) |ask| {
+        const data = try speech_api.encode(allocator, result.audio_samples orelse &.{}, result.sample_rate, ask.format);
+        defer allocator.free(data);
+        const frames = if (result.audio_codes) |c| c.len / lm.config.?.speech().?.codebooks else 0;
+        if (!usage_details_allocated) {
+            usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"audio_tokens\":{d}}}", .{frames});
+            usage_details_allocated = true;
+        }
+        const audio_id = speech_api.Store.newId(stream.io);
+        try speech_api.store.put(stream.io, audio_id, nowSecs(stream.io), content_text);
+        audio_field = try std.fmt.allocPrint(allocator, ",\"audio\":{{\"id\":\"{s}\",\"data\":\"{s}\",\"expires_at\":{d},\"transcript\":{s}}}", .{ &audio_id, data, nowSecs(stream.io) + speech_api.Store.TTL_SECS, escaped_text });
+    }
+
     const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, usage_details_json);
     defer allocator.free(usage_obj);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}{s}}},"logprobs":{s},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
     , .{
         nowMs(stream.io),
         nowSecs(stream.io),
         model_name,
-        escaped_text,
+        if (speech != null) "null" else escaped_text,
         reasoning_json,
+        audio_field,
         logprobs_json,
         finish_reason,
         finishDetailsField(finish_reason, result.finish_details),

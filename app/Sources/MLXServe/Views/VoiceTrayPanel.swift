@@ -93,9 +93,7 @@ struct VoiceTrayPanel: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             Button {
-                if let url = URL(string: VoicePreflight.settingsURLString(for: issue)) {
-                    NSWorkspace.shared.open(url)
-                }
+                appState.fixVoiceSetup(issue)
             } label: { Text(L10n.text(VoicePreflight.actionLabel(for: issue)))
                 .font(.app(.body)) }
             .controlSize(.small).font(.app(.body))
@@ -123,13 +121,6 @@ struct VoiceTrayPanel: View {
             Text(L10n.text(statusText))
                 .font(.app(.caption).weight(.medium))
                 .foregroundStyle(isError ? .red : .secondary)
-            if !voice.partialTranscript.isEmpty {
-                Text("“\(voice.partialTranscript)”")
-                    .font(.app(.caption2))
-                    .foregroundStyle(.tertiary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-            }
             Spacer(minLength: 0)
         }
     }

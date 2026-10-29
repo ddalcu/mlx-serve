@@ -72,7 +72,7 @@ pub fn Decoder(comptime spec: anytype) type {
             var c = run.ctx(g, shared);
             var memo: block.Memo = .{ .g = g };
             c.memo = &memo;
-            var h = try run.splice(g, try Embed.forward(&w.embed, &c, ids), ids);
+            var h = try run.input(g, try Embed.forward(&w.embed, &c, ids), ids);
             if (@hasDecl(Hooks, "afterEmbed")) h = try Hooks.afterEmbed(&w.extra, &c, h);
             var dt = mlx.DtypeTrace.begin("decoder", h, null);
 

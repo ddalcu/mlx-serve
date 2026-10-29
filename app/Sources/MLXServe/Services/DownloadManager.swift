@@ -286,6 +286,7 @@ class DownloadManager: ObservableObject {
             } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
                     || path.hasPrefix("engram/") || path.hasPrefix("tensors/") || path == "optiq/mtp.safetensors"
+                    || path.hasPrefix("audio_tokenizer/")   // a model that speaks: its speech codec (LFM3-Audio, Omni)
                     || indexedShards.contains(path) else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()

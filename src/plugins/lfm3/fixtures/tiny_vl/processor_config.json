@@ -1,0 +1,21 @@
+{
+ "image_processor": {
+  "patch_size": 4,
+  "temporal_patch_size": 2,
+  "merge_size": 2,
+  "size": {
+   "shortest_edge": 256,
+   "longest_edge": 4096
+  }
+ },
+ "video_processor": {
+  "patch_size": 4,
+  "temporal_patch_size": 2,
+  "merge_size": 2,
+  "fps": 2.0,
+  "size": {
+   "shortest_edge": 256,
+   "longest_edge": 8192
+  }
+ }
+}

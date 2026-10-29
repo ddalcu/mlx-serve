@@ -55,14 +55,10 @@ enum VoiceActivity {
         max(minThreshold, floor * factor)
     }
 
-    /// End the utterance? Either the mic went quiet for `silenceTimeout`, or
-    /// recognition stalled with words in hand (`stallTimeout`, the noisy-room
-    /// backstop). No-transcript stalls never finalize — ambient noise that
-    /// transcribes to nothing has nothing to submit.
+    /// End the utterance? The mic went quiet for `silenceTimeout`, or it has run `maxUtterance` (a room the energy
+    /// VAD reads as endless speech still hands over what it heard).
     static func shouldFinalize(silenceElapsed: TimeInterval, silenceTimeout: TimeInterval,
-                               hasTranscript: Bool, transcriptStallElapsed: TimeInterval,
-                               stallTimeout: TimeInterval) -> Bool {
-        if silenceElapsed >= silenceTimeout { return true }
-        return hasTranscript && transcriptStallElapsed >= stallTimeout
+                               speechElapsed: TimeInterval, maxUtterance: TimeInterval) -> Bool {
+        silenceElapsed >= silenceTimeout || speechElapsed >= maxUtterance
     }
 }

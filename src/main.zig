@@ -1460,7 +1460,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split));
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @backingInt(mode), group_model, dist_split));
     }
 
     if (serve_mode) {

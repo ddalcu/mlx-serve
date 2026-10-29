@@ -1,0 +1,113 @@
+{
+ "model_type": "lfm3_audio",
+ "codebooks": 3,
+ "audio_vocab_size": 17,
+ "maskgit_steps": 3,
+ "interleaved_n_text": 6,
+ "interleaved_n_audio": 12,
+ "audio_token_id": 110,
+ "audio_out_token_id": 111,
+ "audio_start_token_id": 112,
+ "text_end_token_id": 113,
+ "mixed_start_token_id": 114,
+ "eos_token_id": [
+  2,
+  113
+ ],
+ "encoder": {
+  "dim_in": 128,
+  "dim_conv": 16,
+  "dim_out": 32,
+  "sliding_window": 4,
+  "lfm": {
+   "model_type": "lfm2",
+   "vocab_size": 2,
+   "hidden_size": 32,
+   "intermediate_size": 48,
+   "block_auto_adjust_ff_dim": false,
+   "conv_bias": false,
+   "block_multiple_of": 16,
+   "block_ffn_dim_multiplier": 1.0,
+   "num_hidden_layers": 3,
+   "num_attention_heads": 2,
+   "num_key_value_heads": 1,
+   "conv_L_cache": 3,
+   "norm_eps": 1e-05,
+   "max_position_embeddings": 1024,
+   "rope_parameters": {
+    "rope_theta": 100.0,
+    "rope_type": "default"
+   },
+   "layer_types": [
+    "conv",
+    "full_attention",
+    "conv"
+   ]
+  }
+ },
+ "depthformer": {
+  "model_type": "lfm3",
+  "vocab_size": 1,
+  "hidden_size": 32,
+  "intermediate_size": 48,
+  "num_hidden_layers": 2,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 1,
+  "head_dim": 16,
+  "norm_eps": 1e-05,
+  "max_position_embeddings": 12,
+  "conv_L_cache": 7,
+  "sliding_window": 256,
+  "use_sandwich_norm": false,
+  "tie_word_embeddings": true,
+  "layer_types": [
+   "full_attention",
+   "full_attention"
+  ],
+  "rope_parameters": {
+   "full_attention": {
+    "rope_type": "default",
+    "rope_theta": 1000000.0,
+    "partial_rotary_factor": 1.0
+   }
+  }
+ },
+ "lfm": {
+  "model_type": "lfm3",
+  "vocab_size": 128,
+  "hidden_size": 32,
+  "intermediate_size": 48,
+  "num_hidden_layers": 5,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 1,
+  "head_dim": 16,
+  "norm_eps": 1e-05,
+  "conv_L_cache": 7,
+  "conv_bias": false,
+  "layer_types": [
+   "conv",
+   "full_attention",
+   "sliding_attention",
+   "conv",
+   "full_attention"
+  ],
+  "rope_parameters": {
+   "full_attention": {
+    "rope_theta": 10.0,
+    "partial_rotary_factor": 0.5,
+    "rope_type": "default"
+   },
+   "sliding_attention": {
+    "rope_theta": 100.0,
+    "rope_type": "default"
+   }
+  },
+  "sliding_window": 4,
+  "use_sandwich_norm": true,
+  "tie_word_embeddings": true,
+  "max_position_embeddings": 4096,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "dtype": "float32"
+ }
+}

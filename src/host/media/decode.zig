@@ -88,6 +88,7 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
     if (vp.mode == .plugin) return plugin_media.prepareImage(allocator, @ptrCast(@alignCast(vp.plugin.?)), encoded);
 
     const src = decodeRgbOwned(allocator, encoded, vp.composite_alpha) orelse return null;
+    if (vp.mode == .plugin_rgb) return .{ .pixels = src.rgb, .width = src.w, .height = src.h };
     defer src.deinit(allocator);
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
@@ -254,6 +255,7 @@ fn decodeBudgetVideo(allocator: std.mem.Allocator, frame_urls: []const []const u
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
     if (vp.mode == .gemma_budget) return decodeBudgetVideo(allocator, frame_urls, vp);
     if (vp.mode == .radio) return decodeRadioVideo(allocator, frame_urls);
+    if (vp.mode == .plugin_rgb) return decodePluginVideo(allocator, frame_urls);
     if (vp.mode != .qwen or frame_urls.len == 0) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
@@ -328,6 +330,30 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         frame_urls.len, grid_t, gh, gw, grid_t * n_per_group / (@as(usize, vp.merge) * vp.merge), rw, rh,
     });
     return .{ .pixels = pv_bytes, .grid_t = @intCast(grid_t), .grid_h = gh, .grid_w = gw };
+}
+
+/// A plugin tower's clip: every frame decoded to RGB8 back to back, all at the first frame's size (the plugin
+/// resizes; frames of a clip share one size). Null for an undecodable frame or one of another size.
+fn decodePluginVideo(allocator: std.mem.Allocator, frame_urls: []const []const u8) ?chat_mod.VideoData {
+    if (frame_urls.len == 0) return null;
+    var bytes: []u8 = &.{};
+    var w: u32 = 0;
+    var h: u32 = 0;
+    var done = false;
+    defer if (!done and bytes.len > 0) allocator.free(bytes);
+    for (frame_urls, 0..) |url, k| {
+        const rgb = decodeFrameUrl(allocator, url, true) orelse return null;
+        defer rgb.deinit(allocator);
+        if (k == 0) {
+            w = rgb.w;
+            h = rgb.h;
+            bytes = allocator.alloc(u8, frame_urls.len * rgb.rgb.len) catch return null;
+        }
+        if (rgb.w != w or rgb.h != h) return null;
+        @memcpy(bytes[k * rgb.rgb.len ..][0..rgb.rgb.len], rgb.rgb);
+    }
+    done = true;
+    return .{ .pixels = bytes, .grid_t = @intCast(frame_urls.len), .grid_h = h, .grid_w = w };
 }
 
 /// Decode a `video_url` block's `frames` array into `list`, mirroring

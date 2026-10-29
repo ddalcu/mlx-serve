@@ -23,6 +23,8 @@ const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
 const engram = @import("engram.zig");
+const cache_codec = @import("cache_codec.zig");
+const cache_abi = @import("../../abi/plugin.zig");
 const glm5 = @import("../glm5_next/glm5_next.zig");
 const mxfp8_qmv = @import("../../sdk/blocks/qmm/mxfp8_qmv.zig");
 const dsv4 = @import("../deepseek_v4/deepseek_v4.zig");
@@ -1630,8 +1632,9 @@ pub const Rows = struct {
     fn append(self: *Rows, x: A, s: S) !void {
         const n = dim(x, 0);
         if (n == 0) return;
-        if (self.used + n > self.cap) {
-            const cap = @max(self.used + n, @max(64, self.cap + self.cap / 4));
+        const end = try std.math.add(usize, self.used, n);
+        if (end > self.cap) {
+            const cap = try cache_codec.rowCapacity(self.cap, end);
             var z = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{ ci(cap), ci(self.width) }, 2, self.dtype, s));
             if (self.used > 0) {
@@ -1651,15 +1654,16 @@ pub const Rows = struct {
         defer _ = mlx.mlx_array_free(xc);
         try mlx.check(mlx.mlx_astype(&xc, x, self.dtype, s));
         var up = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_slice_update(&up, self.buf, xc, &[_]c_int{ ci(self.used), 0 }, 2, &[_]c_int{ ci(self.used + n), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        try mlx.check(mlx.mlx_slice_update(&up, self.buf, xc, &[_]c_int{ ci(self.used), 0 }, 2, &[_]c_int{ ci(end), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
         _ = mlx.mlx_array_free(self.buf);
         self.buf = up;
-        self.used += n;
+        self.used = end;
     }
 
     /// Rows [0, n) (caller frees).
     fn view(self: *const Rows, n: usize, s: S) !A {
         var o = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o);
         try mlx.check(mlx.mlx_slice(&o, self.buf, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(n), ci(self.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
         return o;
     }
@@ -4172,7 +4176,9 @@ pub const Snap = struct {
             if (l.comp) |*r| r.deinit();
             if (l.idx_k) |*r| r.deinit();
         }
-        for (self.ds) |a| _ = mlx.mlx_array_free(a);
+        for (self.ds) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
         if (self.mh.ctx != null) _ = mlx.mlx_array_free(self.mh);
         gpa.free(self.layers);
         gpa.free(self.ds);
@@ -4219,6 +4225,214 @@ pub const Snap = struct {
         };
     }
 };
+
+fn cacheSetting(h: *std.hash.Wyhash, value: anytype) void {
+    switch (@typeInfo(@TypeOf(value))) {
+        .float => |f| std.hash.autoHash(h, @as(@Int(.unsigned, f.bits), @bitCast(value))),
+        .@"struct" => |info| inline for (info.field_names) |name| cacheSetting(h, @field(value, name)),
+        .pointer => std.hash.autoHashStrat(h, value, .Deep),
+        .optional => {
+            std.hash.autoHash(h, value != null);
+            if (value) |v| cacheSetting(h, v);
+        },
+        else => std.hash.autoHash(h, value),
+    }
+}
+
+fn cacheLayout(m: *const Dsv41Model) !cache_codec.Layout {
+    if (m.n_layers > 64) return error.Dsv41CacheGeometry;
+    var h = std.hash.Wyhash.init(0x4141);
+    // Hash values rather than struct padding or the model_type slice's process-local address.
+    cacheSetting(&h, m.cfg);
+    std.hash.autoHash(&h, .{ m.n_mtp, m.ds_block, m.span, m.moe_rows, m.ced_split, m.ced_min_skip, m.hc_tg, m.topk_tg, m.qat_off, m.attn_f16, m.head.qp });
+    var l: cache_codec.Layout = .{
+        .layers = m.n_layers,
+        .stages = m.n_mtp,
+        .ring = try std.math.add(usize, m.cfg.sliding_window, RING_SLACK),
+        .width = m.cfg.head_dim,
+        .index_width = m.cfg.dsv4_index_head_dim,
+        .hidden_width = try std.math.mul(usize, m.cfg.dsv4_n_dspark_target_layers, m.cfg.hidden_size),
+        .dtype = m.act,
+        .kv_sources = m.cfg.dsv41_kv_sources,
+        .index_sources = m.cfg.dsv41_index_sources,
+        .engram = m.hash != null,
+        .settings = h.final(),
+    };
+    @memcpy(l.ratios[0..m.n_layers], m.cfg.dsv4_compress_ratios[0..m.n_layers]);
+    return l;
+}
+
+pub fn snapshotImportPlan(m: *const Dsv41Model, header: []const u8) !u64 {
+    const p = try cache_codec.Plan.decode(try cacheLayout(m), header);
+    return p.peak;
+}
+
+fn checkSnapshotRows(r: ?Rows, expected: bool, used: usize, width: usize, dt: mlx.mlx_dtype) !void {
+    if ((r != null) != expected) return error.Dsv41CacheGeometry;
+    const rows = r orelse return;
+    if (rows.used != used or rows.width != width or rows.dtype != dt or rows.cap < used) return error.Dsv41CacheGeometry;
+}
+
+fn snapshotPlan(m: *const Dsv41Model, sn: *const Snap) !cache_codec.Plan {
+    if (sn.n != sn.ids.len) return error.Dsv41CacheBoundary;
+    const l = try cacheLayout(m);
+    const p = try cache_codec.Plan.init(l, sn.n, sn.vision_key);
+    if (sn.layers.len != l.layers or sn.ds.len != l.stages) return error.Dsv41CacheGeometry;
+    if (sn.hist.len != (if (l.engram) sn.n else @as(usize, 0))) return error.Dsv41CacheGeometry;
+    for (sn.layers, 0..) |saved, i| {
+        const used = if (l.source(i)) sn.n / l.ratios[i] else 0;
+        try checkSnapshotRows(saved.comp, l.source(i), used, l.width, l.dtype);
+        try checkSnapshotRows(saved.idx_k, l.owner(i), used, l.index_width, l.dtype);
+    }
+    return p;
+}
+
+fn retained(x: A) !A {
+    if (x.ctx == null) return error.Dsv41CacheTensor;
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_set(&out, x));
+    return out;
+}
+
+fn snapshotTensor(m: *const Dsv41Model, sn: *const Snap, spec: cache_codec.Spec) !A {
+    return switch (spec.kind) {
+        .win => retained(sn.layers[spec.layer].win),
+        .comp => sn.layers[spec.layer].comp.?.view(spec.rows, m.s),
+        .index => sn.layers[spec.layer].idx_k.?.view(spec.rows, m.s),
+        .pend_kv => retained(sn.layers[spec.layer].pend_kv),
+        .pend_gate => retained(sn.layers[spec.layer].pend_gate),
+        .ds => retained(sn.ds[spec.layer]),
+        .mh => retained(sn.mh),
+        .hist => mlx.mlx_array_new_data(sn.hist.ptr, &[_]c_int{ci(sn.hist.len)}, 1, .uint32),
+    };
+}
+
+fn exportStorage(p: *const cache_codec.Plan, out: *const cache_abi.AuxExport) !usize {
+    if (out.tensors == null or out.names == null or out.header == null) return error.Dsv41CacheStorage;
+    if (out.tensor_cap < p.len) return error.Dsv41CacheStorage;
+    var size: usize = 0;
+    var buf: [40]u8 = undefined;
+    for (p.specs()) |spec| size += (try spec.name(&buf)).len;
+    if (out.names_cap < size) return error.Dsv41CacheStorage;
+    return size;
+}
+
+pub fn exportSnapshot(m: *const Dsv41Model, sn: *const Snap, out: *cache_abi.AuxExport) !void {
+    out.tensor_len = 0;
+    out.names_len = 0;
+    out.header_len = 0;
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    if (had_error) return error.Dsv41CacheMlxErrorPending;
+    const p = try snapshotPlan(m, sn);
+    const names_len = try exportStorage(&p, out);
+    const header = try p.encode(out.header.?[0..out.header_cap]);
+    errdefer {
+        for (out.tensors.?[0..out.tensor_len]) |t| _ = mlx.mlx_array_free(.{ .ctx = t.array.ctx });
+        out.tensor_len = 0;
+    }
+    var cursor: usize = 0;
+    for (p.specs()) |spec| {
+        var buf: [40]u8 = undefined;
+        const name = try spec.name(&buf);
+        @memcpy(out.names.?[cursor..][0..name.len], name);
+        const x = try snapshotTensor(m, sn, spec);
+        errdefer _ = mlx.mlx_array_free(x);
+        try cache_codec.validateArray(spec, x);
+        out.tensors.?[out.tensor_len] = .{ .name = .of(out.names.?[cursor..][0..name.len]), .array = .{ .ctx = x.ctx } };
+        out.tensor_len += 1;
+        cursor += name.len;
+    }
+    if (mlx.errorPending()) return error.MlxError;
+    out.names_len = names_len;
+    out.header_len = header.len;
+}
+
+fn importedRows(used: usize, width: usize, dt: mlx.mlx_dtype, s: S) !Rows {
+    const cap = try cache_codec.rowCapacity(used, try std.math.add(usize, used, 1));
+    var buf = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(buf);
+    try mlx.check(mlx.mlx_zeros(&buf, &[_]c_int{ ci(cap), ci(width) }, 2, dt, s));
+    try evalImported(buf);
+    return .{ .buf = buf, .used = used, .cap = cap, .width = width, .dtype = dt };
+}
+
+fn evalImported(x: A) !void {
+    try mlx.check(mlx.mlx_array_eval(x));
+    if (mlx.errorPending()) return error.MlxError;
+}
+
+fn copyImported(x: A, s: S) !A {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_copy(&out, x, s));
+    try evalImported(out);
+    return out;
+}
+
+fn fillImportedRows(rows: *Rows, x: A, s: S) !void {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_slice_update(&out, rows.buf, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ ci(rows.used), ci(rows.width) }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    try evalImported(out);
+    _ = mlx.mlx_array_free(rows.buf);
+    rows.buf = out;
+}
+
+fn importTensor(sn: *Snap, spec: cache_codec.Spec, x: A, gpa: std.mem.Allocator, s: S) !void {
+    switch (spec.kind) {
+        .comp => try fillImportedRows(&sn.layers[spec.layer].comp.?, x, s),
+        .index => try fillImportedRows(&sn.layers[spec.layer].idx_k.?, x, s),
+        .hist => {
+            try evalImported(x);
+            const data = mlx.mlx_array_data_uint32(x) orelse return error.NoData;
+            sn.hist = try gpa.dupe(u32, data[0..spec.rows]);
+        },
+        else => {
+            const dest = switch (spec.kind) {
+                .win => &sn.layers[spec.layer].win,
+                .pend_kv => &sn.layers[spec.layer].pend_kv,
+                .pend_gate => &sn.layers[spec.layer].pend_gate,
+                .ds => &sn.ds[spec.layer],
+                .mh => &sn.mh,
+                else => unreachable,
+            };
+            dest.* = try copyImported(x, s);
+        },
+    }
+}
+
+/// Inputs are validated before host or GPU destinations. Copies/updates are evaluated one at a time;
+/// only the padded snapshot survives, independent of the loader's arrays and the caller's storage.
+pub fn importSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: []const u32, header: []const u8, arrays: []const cache_abi.AuxTensor) !*Snap {
+    const had_error = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_error);
+    if (had_error) return error.Dsv41CacheMlxErrorPending;
+    const p = try cache_codec.Plan.decode(try cacheLayout(m), header);
+    if (ids.len != p.n) return error.Dsv41CacheBoundary;
+    for (ids) |id| if (id >= m.vocab) return error.TokenPastVocabulary;
+    const order = try p.validateArrays(arrays);
+    const sn = try gpa.create(Snap);
+    sn.* = .{ .gen = 0, .vision_key = p.vision_key, .n = p.n, .ids = &.{}, .layers = &.{}, .ds = &.{}, .mh = none, .hist = &.{} };
+    errdefer {
+        sn.deinit(gpa);
+        gpa.destroy(sn);
+    }
+    sn.ids = try gpa.dupe(u32, ids);
+    sn.layers = try gpa.alloc(Snap.LSnap, p.layout.layers);
+    for (sn.layers) |*saved| saved.* = .{ .win = none, .comp = null, .idx_k = null, .pend_kv = none, .pend_gate = none };
+    sn.ds = try gpa.alloc(A, p.layout.stages);
+    @memset(sn.ds, none);
+    for (sn.layers, 0..) |*saved, i| {
+        if (!p.layout.source(i)) continue;
+        const used = p.n / p.layout.ratios[i];
+        saved.comp = try importedRows(used, p.layout.width, p.layout.dtype, m.s);
+        if (p.layout.owner(i)) saved.idx_k = try importedRows(used, p.layout.index_width, p.layout.dtype, m.s);
+    }
+    for (p.specs(), 0..) |spec, i| try importTensor(sn, spec, .{ .ctx = arrays[order[i]].array.ctx }, gpa, m.s);
+    return sn;
+}
 
 fn refRows(rows: ?Rows) ?Rows {
     var r = rows orelse return null;
@@ -6184,17 +6398,17 @@ test "dsv41 state bytes: snapshots bill window, compressed and index capacities 
     try layers[1].comp.?.append(row, s); // the first append allocates 64 rows of capacity
     try testing.expectEqual(@as(u64, 2 * 144 * 512 * 2 + 64 * 512 * 2), stateBytes(&st));
     try layers[1].idx_k.?.append(row, s);
-    const retained: u64 = 2 * 144 * 512 * 2 + 64 * 512 * 2 + 64 * 512 * 4;
+    const retained_bytes: u64 = 2 * 144 * 512 * 2 + 64 * 512 * 2 + 64 * 512 * 4;
     st.n = 1;
     st.snap_at = 1;
     st.snap_ids = try gpa.dupe(u32, &.{3});
     try snapshotStateIfDue(&st, 1);
-    try testing.expectEqual(2 * retained, stateBytes(&st));
+    try testing.expectEqual(2 * retained_bytes, stateBytes(&st));
     var sn = st.snap.?;
     st.snap = null;
     defer sn.deinit(gpa);
-    try testing.expectEqual(retained, sn.bytes());
-    try testing.expectEqual(retained, stateBytes(&st));
+    try testing.expectEqual(retained_bytes, sn.bytes());
+    try testing.expectEqual(retained_bytes, stateBytes(&st));
 }
 
 test "dsv41 router: the wide f32 matmul gives the logits the decode kernel gives" {

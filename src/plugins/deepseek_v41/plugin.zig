@@ -207,9 +207,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     };
     const c = config.of(ctx.parsed);
-    if (c.dsv41_exl3_bank and !exl3GpuAvailable()) {
-        out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack requires an M2 GPU or available M5-class matrix units; stream the MLX pack with the stream_experts setting instead");
-        return null;
+    if (c.dsv41_exl3_bank and !device.naxAvailable()) {
+        checkPortableExl3(s) catch |err| {
+            out.* = if (err == error.OutOfMemory)
+                Verdict.refuse(.failed, "deepseek_v41: out of memory checking portable EXL3 kernels")
+            else
+                Verdict.refuse(.unsupported, "deepseek_v41: the portable EXL3 numerical self-check failed on this device; stream the MLX pack with the stream_experts setting instead");
+            return null;
+        };
     }
     return loadModel(ctx, s) catch |e| {
         // Too little free memory is a refusal the host answers by name, not a fault.
@@ -225,15 +230,25 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
-fn exl3GpuSupported(arch: []const u8, has_nax: bool) bool {
+fn portableM2From(arch: []const u8, has_nax: bool) bool {
     const gpu = device.naxArchGeneration(arch);
-    return (gpu.gen == 14 and !gpu.phone) or (has_nax and device.naxArchSupportedFrom(arch));
+    return !has_nax and gpu.gen == 14 and !gpu.phone;
 }
 
-fn exl3GpuAvailable() bool {
-    // Read the real architecture: a generation override must never enable an unverified streamed load.
+fn portableM2() bool {
+    // A generation override must not opt another device into the two-state memory policy.
     var buf: [128]u8 = undefined;
-    return exl3GpuSupported(device.gpuArchitecture(&buf) orelse "", device.naxAvailable());
+    return portableM2From(device.gpuArchitecture(&buf) orelse "", device.naxAvailable());
+}
+
+fn checkPortableExl3(s: mlx.mlx_stream) !void {
+    if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
+    const kernels = @import("mlx_stream").exl3_kernels;
+    var diag: kernels.Diag = .{};
+    kernels.selfcheck.portablePrefill(gpa, .{ .stream = s }, &diag) catch |err| {
+        std.log.err("deepseek_v41: portable EXL3 self-check: {t}: {s}", .{ err, diag.message() });
+        return err;
+    };
 }
 
 /// The host's stream when it is a GPU one, else this thread's GPU stream; null off Metal: the module's kernels are
@@ -266,7 +281,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     // The worker's layers when the driver's load planned a Thunderbolt pair.
     const pair: ?dsv41.Pair = if (ctx.pair_remote.count > 0) .{ .lo = ctx.pair_remote.first, .hi = ctx.pair_remote.first + ctx.pair_remote.count, .worker = false } else null;
     m.s = s;
-    m.caps = ctx.parsed.caps;
+    m.caps = config.runtimeCaps(c, ctx.parsed.caps, portableM2());
     m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
     errdefer m.mdl.deinit();
     m.bank = null;
@@ -279,6 +294,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     }
     errdefer closeBank(m);
     m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
+    ctx.publishRuntimeCaps(m.caps);
     return m;
 }
 
@@ -295,11 +311,11 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin
     const c = &m.cfg;
     const geo: streamed.Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(mdl.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
     const context = ctx_size orelse for (bill_mod.stream_context_rungs) |rung| {
-        const at = bill_mod.streamBudget(c, rung, wired_margin);
+        const at = bill_mod.streamBudget(c, rung, wired_margin, m.caps.active_slots);
         const fit = streamed.Exl3.billOf(gpa, io, dir, geo, .{ .prompt = at.prompt, .decode = at.decode }) catch continue;
         if (fit.rows.prompt >= bill_mod.stream_min_rows) break rung;
     } else bill_mod.stream_context;
-    const budget = bill_mod.streamBudget(c, context, wired_margin);
+    const budget = bill_mod.streamBudget(c, context, wired_margin, m.caps.active_slots);
     const b = try streamed.Exl3.Source.open(gpa, io, dir, m.s, geo, gates, .{ .prompt = budget.prompt, .decode = budget.decode });
     std.log.info("deepseek_v41: streamed experts, {d} prompt / {d} decode slot rows per layer for a {d}-token context ({d} B a row)", .{ b.bill.rows.prompt, b.bill.rows.decode, context, b.bill.row_bytes });
     m.bank = .{ .exl3 = b };
@@ -528,6 +544,9 @@ const aux_hooks = abi.AuxHooks{
     .describe = &auxDescribe,
     .prefix_key = &auxPrefixKey,
     .begin_prompt = &auxBeginPrompt,
+    .import_plan = &auxImportPlan,
+    .export_arrays = &auxExportArrays,
+    .import_arrays = &auxImportArrays,
     .reserve = &auxReserve,
     .commit = &auxCommit,
     .snapshot = &auxSnapshot,
@@ -536,8 +555,6 @@ const aux_hooks = abi.AuxHooks{
     .handoff = &auxHandoff,
     .free = &auxFree,
     .bytes = &auxBytes,
-    .serialize = &auxSerialize,
-    .deserialize = &auxDeserialize,
 };
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
@@ -664,14 +681,32 @@ fn auxBytes(_: *anyopaque, handle: abi.Handle) callconv(.c) u64 {
     return sn.bytes();
 }
 
-fn auxSerialize(_: *anyopaque, _: abi.Handle, _: [*]u8, _: usize, len: *usize) callconv(.c) Verdict {
-    len.* = 0;
-    return Verdict.refuse(.unsupported, "deepseek_v41: snapshot serialization is unavailable");
+fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdict {
+    out.* = 0;
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    out.* = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
 }
 
-fn auxDeserialize(_: *anyopaque, _: abi.Str, out: *abi.Handle) callconv(.c) Verdict {
+fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) callconv(.c) Verdict {
+    if (out.size < @sizeOf(abi.AuxExport)) return Verdict.refuse(.unsupported, "deepseek_v41: export storage is too short");
+    out.tensor_len = 0;
+    out.names_len = 0;
+    out.header_len = 0;
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const sn = snapOf(handle) orelse return Verdict.refuse(.failed, "deepseek_v41: no snapshot to export");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    dsv41.exportSnapshot(m.mdl, sn, out) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
+}
+
+fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    return Verdict.refuse(.unsupported, "deepseek_v41: snapshot deserialization is unavailable");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    const m: *Model = @ptrCast(@alignCast(mp));
+    out.* = dsv41.importSnapshot(m.mdl, gpa, ids.slice(), header.slice(), arrays.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    return .ok;
 }
 
 /// The load reads its Engram tables from disk per lookup and drops the tensors it never loads
@@ -742,10 +777,14 @@ test {
     _ = @import("decode/decode.zig");
 }
 
-test "deepseek_v41 streamed EXL3 eligibility: M2 portable or available NAX, other devices refused" {
+test "deepseek_v41 streamed policy: only portable M2 selects two retained states" {
     const expect = std.testing.expect;
-    for ([_][]const u8{ "applegpu_g14d", "AppleGPU_G14S", "g14" }) |arch| try expect(exl3GpuSupported(arch, false));
-    for ([_][]const u8{ "", "air64_v27", "applegpu_g14_extra", "g14p", "g13d", "g15d", "g16s", "g17d", "g18d" }) |arch| try expect(!exl3GpuSupported(arch, false));
-    for ([_][]const u8{ "applegpu_g17d", "g18d" }) |arch| try expect(exl3GpuSupported(arch, true));
-    for ([_][]const u8{ "", "air64_v27", "g13d", "g14p", "g15d", "g16s", "g17p" }) |arch| try expect(!exl3GpuSupported(arch, true));
+    for ([_][]const u8{ "applegpu_g14d", "AppleGPU_G14S", "g14" }) |arch| {
+        try expect(portableM2From(arch, false));
+        try expect(!portableM2From(arch, true));
+    }
+    for ([_][]const u8{ "", "air64_v27", "applegpu_g14_extra", "g14p", "g13d", "g15d", "g16s", "g17d", "g18d" }) |arch| {
+        try expect(!portableM2From(arch, false));
+        try expect(!portableM2From(arch, true));
+    }
 }

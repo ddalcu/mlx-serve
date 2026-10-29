@@ -95,7 +95,7 @@ pub const Offline = struct {
 };
 
 /// What discovery reads of a served pack: the stub parse's shell and caps.
-pub const PluginStub = struct { shell: abi_plugin.Shell, caps: abi_plugin.Caps };
+pub const PluginStub = struct { shell: abi_plugin.Shell, caps: abi_plugin.Caps, speaks: bool = false };
 
 /// What the host reads about a loaded MLX model.
 pub const Facts = struct {

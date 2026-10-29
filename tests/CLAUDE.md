@@ -149,6 +149,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_dense_vision.sh` · `test_vision_moe_regression.sh` · `test_gemma4_unified_vision.sh`, `test_gemma4_unified_audio.sh`
 - `test_vision_chunked_prefill.sh` · `test_vision_prefix_cache.sh` · `test_multi_image_history.sh` · `test_decode_end_media_reuse.sh`
 - `test_embeddings.sh` /v1/embeddings · `test_transcriptions.sh` ASR + aligner + diarization
+- `test_lfm3.sh` **E** LFM3 text/VL/Audio/Omni: tools, images, speech out (chat audio, stream, TTS, ASR round trip)
 
 **Media generation**
 - `test_unified_gen.sh` load/gen/unload · `test_gen_chat_interleave.sh` chat during media · `test_gen_chat_mix.sh` release battery

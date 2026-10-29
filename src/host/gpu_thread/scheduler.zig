@@ -44,6 +44,8 @@ pub const BatchVerdict = enum {
     embedded_engine,
     arch,
     pad_waste,
+    /// A spoken reply: one row a slot, its frames drawn between forwards.
+    speech,
 };
 
 /// Options for re-clamping the hot-cache budgets after residency changed.

@@ -10,7 +10,7 @@ const block = @import("block.zig");
 const Array = ops.Array;
 const Graph = ops.Graph;
 const Ctx = block.Ctx;
-const spliceVisionRows = @import("../vision/splice.zig").spliceVisionRows;
+const spliceRows = @import("../vision/splice.zig").spliceRows;
 const row_exact = @import("blocks/row_exact.zig");
 const prefillHeadDimFused = @import("../blocks/attention/attn256.zig").prefillHeadDimFused;
 
@@ -50,6 +50,8 @@ pub const Run = struct {
     media: Array = .{},
     media_offset: u32 = 0,
     placeholders: abi.PlaceholderIds = .{},
+    /// `Forward.embeds`.
+    embeds: Array = .{},
     /// `Ctx.offload` (`Forward.offload`).
     offload: ?*const abi.Offload = null,
 
@@ -60,10 +62,19 @@ pub const Run = struct {
     /// The embedded rows `h` with the media rows at their placeholders (a prompt chunk only, as the engine splices).
     pub fn splice(r: *const Run, g: *Graph, h: Array, ids: Array) !Array {
         const p = r.placeholders;
-        if (r.media.ctx == null or r.rows <= 1 or p.image | p.audio | p.video == 0) return h;
+        if (r.media.ctx == null or r.rows <= 1 or p.image | p.audio | p.video | p.speech == 0) return h;
         var own = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&own, h));
-        return g.adopt(try spliceVisionRows(own, ids, r.media, p.image, p.audio, p.video, r.media_offset, g.s));
+        return g.adopt(try spliceRows(own, ids, r.media, &.{ p.image, p.audio, p.video, p.speech }, r.media_offset, g.s));
+    }
+
+    /// The forward's input rows: `Forward.embeds` when given, else `embedded` (the ids' embedding) with the media.
+    pub fn input(r: *const Run, g: *Graph, embedded: Array, ids: Array) !Array {
+        if (r.embeds.ctx == null) return r.splice(g, embedded, ids);
+        // The caller keeps its rows: the forward drops the graph's own reference as the residual moves on.
+        var own = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&own, r.embeds));
+        return g.adopt(own);
     }
 
     /// Publishes `h`, layer `layer`'s output, where it was asked for.
@@ -206,6 +217,7 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
         .mask_add = .{ .ctx = f.mask_add.ctx },
         .media_offset = f.media_offset,
         .placeholders = m.placeholders,
+        .embeds = .{ .ctx = f.embeds.ctx },
         .row_exact = if (f.row_exact) m.row_exact else .off,
         .offload = f.offload,
         .tree = if (f.tree.table.ctx == null) null else .{

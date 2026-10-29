@@ -788,6 +788,9 @@ pub const StubMeta = struct {
     /// Qwen3-VL-family video input: a `video_token_id` alongside `has_vision`
     /// (video piggybacks the vision tower — see src/sdk/vision/qwen_vision.zig).
     has_video: bool = false,
+    /// A served pack's audio input and speech output (`Parsed.speech`).
+    has_audio: bool = false,
+    has_speech: bool = false,
     has_chat: bool = false,
     /// Speech to text on `/v1/audio/transcriptions` (Qwen3-ASR).
     has_transcription: bool = false,
@@ -933,6 +936,8 @@ fn applyServedStub(meta: *StubMeta, st: mlx_engine.PluginStub) void {
     meta.is_moe = st.caps.moe;
     meta.has_vision = st.caps.images;
     meta.has_video = st.caps.video;
+    meta.has_audio = st.caps.audio;
+    meta.has_speech = st.speaks;
 }
 
 /// Read `StubMeta` for the model directory at `abs_path` (config.json + a

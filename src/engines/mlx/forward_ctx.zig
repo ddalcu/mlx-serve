@@ -54,6 +54,9 @@ pub const ForwardCtx = struct {
     ssm_entries: ?[]SSMCacheEntry,
     ssm_member_gen: u64 = 0,
     capture_hidden: ?*mlx.mlx_array,
+    /// A spoken frame's input rows `[1, rows, hidden]` in place of the ids' embedding (`Forward.embeds`); served
+    /// models only.
+    step_embeds: ?mlx.mlx_array = null,
     /// Like `capture_hidden` but receives the FULL post-final-norm hidden
     /// `[B, L, H]` (all positions, refcount-shared) instead of the last
     /// position only. Used by the Qwen MTP head, whose committed-history

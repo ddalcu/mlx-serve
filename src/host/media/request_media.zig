@@ -223,6 +223,7 @@ pub fn appendAnthropicImageBlock(allocator: std.mem.Allocator, list: *std.ArrayL
     return appendImageUrlContent(allocator, list, url, vp);
 }
 
+pub const AUDIO_DECODE_REJECT = "input_audio could not be decoded: send base64 `wav`, `pcm16` (24 kHz s16le mono) or `mlx_pcm_f32` (16 kHz f32le mono) in `data` with its `format`";
 pub const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL (data:image/jpeg|png|webp|gif|bmp;base64,...) with a readable payload; remote URLs are not fetched";
 
 // ── tests ──

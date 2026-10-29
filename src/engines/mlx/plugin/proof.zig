@@ -454,6 +454,7 @@ test {
     _ = @import("proof_mtp.zig");
     _ = @import("proof_settle.zig");
     _ = @import("mlx_lm_configs_test.zig");
+    _ = @import("media.zig");
     _ = @import("intree.zig");
     _ = plugin_config;
 }

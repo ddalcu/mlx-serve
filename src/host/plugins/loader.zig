@@ -278,9 +278,11 @@ pub fn homePath(a: Allocator, rel: []const u8) ![]u8 {
     return std.fs.path.join(a, &.{ home, ".mlx-serve", rel });
 }
 
-/// At startup: loads the installed plugins when `plugins.json` switches them on and `--no-plugins` was not given,
-/// logging each plugin loaded or refused and each built-in an outside plugin replaces.
+/// At startup: publishes the process's `Host` table, which every model load hands its plugin, then loads the installed
+/// plugins when `plugins.json` switches them on and `--no-plugins` was not given, logging each plugin loaded or refused
+/// and each built-in an outside plugin replaces.
 pub fn loadAtStartup(io: std.Io, a: Allocator, builtins: []const sdk_plugin.Entry, cli_off: bool, host_mlx: []const u8) void {
+    _ = @import("../plugin_host_impl.zig").processHost();
     if (!supported) return;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

@@ -281,6 +281,8 @@ pub const VisionVideoPixels = struct {
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
+    /// A plugin tower's frames: the rate the client sampled them at (0 = not given).
+    fps: f32 = 0,
 };
 
 /// One encoder input. `audio` is raw float32-LE 16 kHz mono PCM, framed into
@@ -318,6 +320,9 @@ pub const VisionEncodeRequest = struct {
     /// count (true = keep). Null entries are not video. Owned by `allocator`
     /// on success; the caller frees each mask and the array.
     item_keep: ?[]?[]bool = null,
+    /// Plugin towers only, parallel to `items` and allocated by the caller: each item's placeholder run, filled
+    /// with `allocator`; the caller frees each run.
+    item_runs: [][]u32 = &.{},
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
     /// this flips true.
     done: bool = false,

@@ -223,12 +223,12 @@ fn checkFormTwin(h: *H, k: Kernel) !void {
 }
 
 /// How much of each kernel's manifest plan runs.
-/// - `compile` (the construction's acceptance): every kernel compiles, binds and completes one launch on generated inputs;
-///   no numeric comparison (David 10-05: the server's startup runs no numeric probes). A kernel that does not compile or
+/// - `compile` (the standard construction's acceptance): every kernel compiles, binds and completes one launch on generated inputs;
+///   no numeric comparison. A kernel that does not compile or
 ///   bind refuses the load by name (SelfCheckFailed).
-/// - `full` (the device test, `DSV41_SELFCHECK_DEVICE`, and the window smoke tests): every check of the manifest: the
+/// - `full` (portable EXL3 loads, the device test, `DSV41_SELFCHECK_DEVICE`, and window smoke tests): every check of the manifest: the
 ///   exact references (host f64, the MLX chain, the decode table, the join, golden tiles, compositions), the per-site row
-///   invariance and the twins. The numeric probes live there only.
+///   invariance and the twins.
 pub const Depth = kset.CheckDepth;
 
 /// The checks of `want`'s entries at `depth`, per kernel, in registry order (`stubPlan` runs the same plan).
@@ -276,12 +276,38 @@ fn runOver(a: Allocator, reg: *const xk.Registry, bound: *const xk.Bound, want: 
     }
 }
 
-
 /// The acceptance verdict over a finished plan: refused (error.SelfCheckFailed, `diag` naming
 /// the first failing kernel / check / site) unless every result passed and the plan ran.
 pub fn judge(report: *const Report, diag: ?*xk.Diag) error{SelfCheckFailed}!void {
     logResults(report, if (env.get(.DSV41_SELFCHECK_REPORT)) |v| v[0] == '1' else false);
     return scaffold.judge(report, "exl3 kernels", diag);
+}
+
+/// Portable loads must prove the numerical plan before accepting their expert kernels.
+pub fn portablePrefill(a: Allocator, device: kset.KernelSet(xk).Device, diag: *xk.Diag) !void {
+    const set = try kset.KernelSet(xk).Set.init(a, .{ .device = device }, diag);
+    defer set.deinit();
+    defer switch (device) {
+        .stream => |s| _ = mlx.mlx_synchronize(s),
+        .stub => {},
+    };
+    var report: Report = .{};
+    defer report.deinit(a);
+    try set.selfCheck(a, &xk.portable_prefill_kernels, .full, &report, diag);
+    switch (device) {
+        .stream => |s| try mlx.check(mlx.mlx_synchronize(s)),
+        .stub => {},
+    }
+}
+
+test "dsv41 portable load gate: numerical failure refuses a compilable device" {
+    const a = testing.allocator;
+    var diag: xk.Diag = .{};
+    try portablePrefill(a, .{ .stub = .{} }, &diag);
+    try testing.expectError(error.SelfCheckFailed, portablePrefill(a, .{ .stub = .{
+        .fail = .{ .kernel = .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3, .check = .f64 },
+    } }, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "f64") != null);
 }
 
 /// One line per failed result (every result when `all`): kernel, check, site, words / bad, metric / limit, the error
@@ -2046,6 +2072,17 @@ test "dsv41 kernels: an HCTAPE combine word is judged against its f32 chain, not
 
 // GPU only: DSV41_KERNELS_GPU=1.
 // DSV41_KERNELS_RECEIPT=<path> keeps the per-check JSON lines.
+test "dsv41 portable prefill gpu: load gate releases its set and preserves the borrowed stream" {
+    if (env.get(.DSV41_KERNELS_GPU) == null) return error.SkipZigTest;
+    if (@import("mlx_host").naxAvailable()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var diag: xk.Diag = .{};
+    try portablePrefill(testing.allocator, .{ .stream = s }, &diag);
+    try mlx.check(mlx.mlx_synchronize(s));
+}
+
 test "dsv41 portable prefill gpu: all nine DIG tiles pass their numerical plans" {
     if (env.get(.DSV41_KERNELS_GPU) == null) return error.SkipZigTest;
     if (@import("mlx_host").naxAvailable()) return error.SkipZigTest;

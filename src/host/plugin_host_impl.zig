@@ -64,6 +64,23 @@ pub const Builtin = struct {
     }
 };
 
+/// The process's table: one kernel cache, latch and log for every plugin, built at the server's start and kept for the
+/// process.
+const Process = struct { builtin: Builtin = undefined, ready: bool = false };
+pub const process_shared = @import("../sdk/util/shared.zig").Shared(Process, "plugin_host_table", .{});
+
+/// The process's `Host` table, built on the first call and published (`host_table.zig`), where every model load reads
+/// it for its plugin (`LoadCtx.host`). The host's plugin startup calls it, before any model loads.
+pub fn processHost() *const abi.Host {
+    const p = process_shared.get();
+    if (!p.ready) {
+        p.builtin.init(.{ .allocator = std.heap.c_allocator });
+        p.ready = true;
+    }
+    @import("host_table.zig").published.get().host = p.builtin.host();
+    return p.builtin.host();
+}
+
 fn self_(ctx: ?*anyopaque) *Builtin {
     return @ptrCast(@alignCast(ctx.?));
 }
@@ -351,6 +368,18 @@ test {
 
 fn fixedCeiling(ctx: ?*anyopaque) u64 {
     return @as(*const u64, @ptrCast(@alignCast(ctx.?))).*;
+}
+
+test "process host: built once and published where the engine's loads read it" {
+    const host_table = @import("host_table.zig");
+    const saved = host_table.published.get().*;
+    defer host_table.published.get().* = saved;
+    host_table.published.get().* = .{};
+    try testing.expect(host_table.get() == null);
+    const h = processHost();
+    try testing.expectEqual(h, host_table.get().?);
+    try testing.expectEqual(h, processHost());
+    try testing.expectEqual(@as(u32, @sizeOf(abi.Host)), h.size);
 }
 
 test "builtin host: the allocator round-trips through the table (std.mem.Allocator over it)" {

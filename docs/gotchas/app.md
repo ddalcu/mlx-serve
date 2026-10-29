@@ -87,7 +87,8 @@ shadows it). Guard: the lazy-init tests in `VoiceActivityTests`.
 ### A fixed-threshold VAD wedged on ambient noise
 Defect: voice mode transcribed forever and never answered (one long recognition task, run-on partials). Cause: an
 absolute RMS threshold; fan noise refreshed `lastVoiceAt` forever. Fix: threshold relative to a minimum-statistics
-ambient floor, plus a transcript-stall backstop. Guard: `VoiceActivityTests`.
+ambient floor, plus a longest-utterance cap (`maxUtterance`, server ASR has no partials to stall on). Guard:
+`VoiceActivityTests`.
 
 ### Multi-input AVAssetWriter deadlocks if one track is pushed before the other
 Defect: LTX with audio sat at "Encoding mp4…" forever. Cause: the writer applies backpressure across inputs, and audio

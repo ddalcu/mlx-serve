@@ -289,6 +289,7 @@ fn onEvent(ctx: *anyopaque, id: u64, ev: *const abi.Event) callconv(.c) abi.Acti
     const r = &s.replies[@intCast(id - s.base)];
     switch (ev.kind) {
         .prefilled => r.cached = ev.cached,
+        .audio => {},
         .tokens => for (abi.items(u32, ev.tokens)) |t| {
             if (r.len == r.buf.len) {
                 r.overflow = true;

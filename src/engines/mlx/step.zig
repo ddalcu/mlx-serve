@@ -34,6 +34,12 @@ const publishFirstToken = @import("spec/wiring.zig").publishFirstToken;
 const hasWorkPendingLocked = @import("runtime/loop.zig").hasWorkPendingLocked;
 const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
 
+/// Caller holds queue_mu. Recheck arrivals under the lock before the short, wakeable retry wait.
+fn waitForDiskRetryLocked(sch: *Scheduler) void {
+    if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) return;
+    sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .boot } }) catch {};
+}
+
 const ChatPassMode = enum { main, yield };
 pub const ChatPassResult = enum { shutdown, idle, ran };
 
@@ -130,8 +136,10 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 // Idle: land owed SSD slices before parking, so a later commit rarely finds one.
                 if (disk_owed) {
                     sch.queue_mu.unlock(sch.io);
-                    disk_owed = flushOwedDiskSlices(sch);
+                    const flushed = flushOwedDiskSlices(sch);
                     sch.queue_mu.lockUncancelable(sch.io);
+                    disk_owed = flushed != .done;
+                    if (flushed == .busy) waitForDiskRetryLocked(sch);
                     continue;
                 }
                 // No later tick runs while parked, so release here.
@@ -372,3 +380,26 @@ fn slotStateBytes(s: *const Slot) u64 {
 }
 
 // ── tests ──
+
+test "a busy disk retry parks until its bounded timeout or pending work" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.shutdown = .init(false);
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.vision_queue = .empty;
+    sch.embed_queue = .empty;
+    sch.cleanup_queue = .empty;
+    sch.load_queue = .empty;
+    sch.gen_queue = .empty;
+    sch.unload_queue = .empty;
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    const before = io_util.Stopwatch.init(sch.io);
+    waitForDiskRetryLocked(&sch);
+    try testing.expect(before.read() >= 5 * std.time.ns_per_ms);
+    sch.shutdown.store(true, .release);
+    waitForDiskRetryLocked(&sch);
+}

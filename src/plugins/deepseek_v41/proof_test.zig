@@ -231,7 +231,7 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
     }
 }
 
-test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint, codecs refuse by name" {
+test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -249,16 +249,6 @@ test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint,
         try testing.expect(sn == null);
         v41.table.release_slot.?(t.m, 1);
     }
-    var buf: [1]u8 = undefined;
-    var len: usize = 99;
-    const encoded = aux.serialize(t.m, null, &buf, buf.len, &len);
-    try testing.expectEqual(abi.Verdict.Code.unsupported, encoded.code);
-    try testing.expect(encoded.why.len > 0);
-    try testing.expectEqual(@as(usize, 0), len);
-    var sn: abi.Handle = null;
-    const decoded = aux.deserialize(t.m, .of(&.{}), &sn);
-    try testing.expectEqual(abi.Verdict.Code.unsupported, decoded.code);
-    try testing.expect(decoded.why.len > 0 and sn == null);
 }
 
 test "deepseek_v41 aux: candidate image key ignores later rows and eligibility excludes streamed and paired instances" {
@@ -291,6 +281,396 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
     m.mdl.pair = .{ .lo = 2, .hi = 4, .worker = false };
     defer m.mdl.pair = null;
     try testing.expect(!aux.enabled(t.m));
+}
+
+const codec = @import("cache_codec.zig");
+const dsv41 = @import("deepseek_v41.zig");
+
+const Exported = struct {
+    tensors: [codec.max_tensors]abi.AuxTensor = undefined,
+    names: [16 * 1024]u8 = undefined,
+    header: [codec.max_header]u8 = undefined,
+    out: abi.AuxExport = .{},
+
+    fn capture(self: *Exported, t: *Twin, p: []const u32) !void {
+        const aux = v41.table.cache.aux.?;
+        try testing.expect(aux.begin_prompt(t.m, 1, .of(p), .{}, 0, true).isOk());
+        const first = @min(2, p.len - 1);
+        testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[0..first], &.{0}));
+        if (first < p.len - 1) testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[first .. p.len - 1], &.{@intCast(first)}));
+        var sn: abi.Handle = null;
+        try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
+        defer aux.free(t.m, sn);
+        try testing.expect(sn != null);
+        self.out = .{ .tensors = &self.tensors, .tensor_cap = self.tensors.len, .names = &self.names, .names_cap = self.names.len, .header = &self.header, .header_cap = self.header.len };
+        const v = aux.export_arrays(t.m, sn, &self.out);
+        if (!v.isOk()) std.debug.print("export: {s}\n", .{v.why.slice()});
+        try testing.expect(v.isOk());
+        v41.table.release_slot.?(t.m, 1);
+    }
+
+    fn deinit(self: *Exported) void {
+        for (self.arrays()) |t| _ = mlx.mlx_array_free(.{ .ctx = t.array.ctx });
+        self.out.tensor_len = 0;
+    }
+
+    fn arrays(self: *Exported) []abi.AuxTensor {
+        return self.tensors[0..self.out.tensor_len];
+    }
+
+    fn bytes(self: *Exported) abi.Str {
+        return .of(self.header[0..self.out.header_len]);
+    }
+};
+
+fn expectImportRefused(t: *Twin, e: *Exported, ids: []const u32, arrays: []const abi.AuxTensor) !void {
+    var sn: abi.Handle = null;
+    const v = v41.table.cache.aux.?.import_arrays(t.m, .of(ids), e.bytes(), .of(arrays), &sn);
+    defer v41.table.cache.aux.?.free(t.m, sn);
+    try testing.expectEqual(abi.Verdict.Code.failed, v.code);
+    try testing.expect(v.why.len > 0 and sn == null);
+}
+
+fn expectInvalidImport(t: *Twin, e: *Exported, ids: []const u32, arrays: []const abi.AuxTensor) !void {
+    try expectImportRefused(t, e, ids, arrays);
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    const unexpected = dsv41.importSnapshot(m.mdl, failing.allocator(), ids, e.bytes().slice(), arrays) catch {
+        try testing.expect(!failing.has_induced_failure);
+        return;
+    };
+    unexpected.deinit(failing.allocator());
+    failing.allocator().destroy(unexpected);
+    return error.InvalidTensorAccepted;
+}
+
+test "codec rejects duplicate, missing, unexpected and malformed tensors before construction" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41DsparkFiles(arena.allocator(), 7), "");
+    defer t.close();
+    const p = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    var e: Exported = .{};
+    try e.capture(t, &p);
+    defer e.deinit();
+    const ids = p[0 .. p.len - 1];
+    try expectInvalidImport(t, &e, ids, e.arrays()[0 .. e.arrays().len - 1]);
+    const last = e.arrays().len - 1;
+    const saved = e.tensors[last];
+    e.tensors[last] = e.tensors[0];
+    try expectInvalidImport(t, &e, ids, e.arrays());
+    e.tensors[last] = saved;
+    for (e.arrays()) |*tensor| {
+        const original = tensor.*;
+        tensor.name = .of("unexpected");
+        try expectInvalidImport(t, &e, ids, e.arrays());
+        tensor.* = original;
+        tensor.array = .{};
+        try expectInvalidImport(t, &e, ids, e.arrays());
+        tensor.* = original;
+        tensor.size = 0;
+        try expectInvalidImport(t, &e, ids, e.arrays());
+        tensor.* = original;
+        const x: mlx.mlx_array = .{ .ctx = tensor.array.ctx };
+        const shape = mlx.getShape(x);
+        var wrong = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wrong);
+        try mlx.check(mlx.mlx_zeros(&wrong, shape.ptr, shape.len, .int32, t.s));
+        tensor.array = .{ .ctx = wrong.ctx };
+        try expectInvalidImport(t, &e, ids, e.arrays());
+        tensor.* = original;
+        var dims: [2]c_int = .{ 1, 1 };
+        @memcpy(dims[0..shape.len], shape);
+        dims[0] += 1;
+        try mlx.check(mlx.mlx_zeros(&wrong, &dims, 2, mlx.mlx_array_dtype(x), t.s));
+        tensor.array = .{ .ctx = wrong.ctx };
+        try expectInvalidImport(t, &e, ids, e.arrays());
+        tensor.* = original;
+        try mlx.check(mlx.mlx_zeros(&wrong, &.{1}, 1, mlx.mlx_array_dtype(x), t.s));
+        tensor.array = .{ .ctx = wrong.ctx };
+        try expectInvalidImport(t, &e, ids, e.arrays());
+        tensor.* = original;
+    }
+    try expectInvalidImport(t, &e, ids[1..], e.arrays());
+    try testing.expectEqual(@as(u64, 0), v41.stateBytes(t.m));
+}
+
+test "codec import unwinds every allocation and checked MLX failure" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41DsparkFiles(arena.allocator(), 7), "");
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const p = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    var e: Exported = .{};
+    try e.capture(t, &p);
+    defer e.deinit();
+    const ids = p[0 .. p.len - 1];
+    for (e.arrays()) |x| try mlx.check(mlx.mlx_array_eval(.{ .ctx = x.array.ctx }));
+    try mlx.check(mlx.mlx_synchronize(t.s));
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    for (0..8) |at| {
+        var failing = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = at });
+        const sn = dsv41.importSnapshot(m.mdl, failing.allocator(), ids, e.bytes().slice(), e.arrays()) catch |err| {
+            try testing.expectEqual(error.OutOfMemory, err);
+            try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+            continue;
+        };
+        sn.deinit(failing.allocator());
+        failing.allocator().destroy(sn);
+        try testing.expect(!failing.has_induced_failure);
+    }
+    var completed = false;
+    for (1..512) |at| {
+        mlx.fault.arm(at);
+        var sn: abi.Handle = null;
+        const v = v41.table.cache.aux.?.import_arrays(t.m, .of(ids), e.bytes(), .of(e.arrays()), &sn);
+        const fired = mlx.fault.didFire();
+        mlx.fault.disarm();
+        defer v41.table.cache.aux.?.free(t.m, sn);
+        if (!fired) {
+            try testing.expect(v.isOk() and sn != null);
+            completed = true;
+            break;
+        }
+        try testing.expectEqual(abi.Verdict.Code.failed, v.code);
+        try testing.expect(sn == null);
+    }
+    try testing.expect(completed);
+    try mlx.check(mlx.mlx_synchronize(t.s));
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    try testing.expectEqual(before, after);
+    try testing.expectEqual(@as(u64, 0), v41.stateBytes(t.m));
+}
+
+test "optional codec failure preserves the original MLX error latch" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const p = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    var e: Exported = .{};
+    try e.capture(t, &p);
+    defer e.deinit();
+    const original = "[matmul] original codec-test failure";
+    mlx.latchErrorForTest(original);
+    defer {
+        var buf: [512]u8 = undefined;
+        _ = mlx.takeError(&buf);
+    }
+    mlx.fault.arm(3);
+    defer mlx.fault.disarm();
+    try expectImportRefused(t, &e, p[0 .. p.len - 1], e.arrays());
+    var buf: [512]u8 = undefined;
+    try testing.expectEqualStrings(original, mlx.takeError(&buf).?);
+    mlx.fault.disarm();
+    mlx.armLatchingFaultForTest(3);
+    try expectImportRefused(t, &e, p[0 .. p.len - 1], e.arrays());
+    try testing.expect(mlx.latchingFaultFiredForTest());
+    try testing.expect(!mlx.errorPending());
+}
+
+fn codecRoundTrip(files: []const sdk.fixture.File, p: []const u32, dspark: bool) !void {
+    const aux = v41.table.cache.aux.?;
+    var e: Exported = .{};
+    defer e.deinit();
+    {
+        const origin = try Twin.open(files, "");
+        defer origin.close();
+        try e.capture(origin, p);
+    }
+    const t = try Twin.open(files, "");
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    try testing.expectEqual(@as(usize, if (dspark) 2 else 0), m.mdl.n_mtp);
+    var peak: u64 = 0;
+    try testing.expect(aux.import_plan(t.m, e.bytes(), &peak).isOk());
+    try testing.expect(peak > 0);
+    std.mem.reverse(abi.AuxTensor, e.arrays());
+    var sn: abi.Handle = null;
+    const input_ids = try testing.allocator.dupe(u32, p[0 .. p.len - 1]);
+    defer testing.allocator.free(input_ids);
+    try testing.expect(aux.import_arrays(t.m, .of(input_ids), e.bytes(), .of(e.arrays()), &sn).isOk());
+    defer aux.free(t.m, sn);
+    e.deinit();
+    @memset(input_ids, 0);
+    @memset(&e.header, 0);
+    @memset(&e.names, 0);
+    var info: abi.AuxSnapshotInfo = .{};
+    try testing.expect(aux.describe(t.m, sn, &info).isOk());
+    try testing.expectEqual(p.len - 1, info.n);
+    try testing.expectEqualSlices(u32, p[0 .. p.len - 1], info.ids.slice());
+    try testing.expect(peak > aux.bytes(t.m, sn));
+    try testing.expect(aux.restore_at(t.m, 1, sn, info.n).isOk());
+    var caps: [64][2]usize = @splat(.{ 0, 0 });
+    for (m.mdl.dec_state.?.layers, 0..) |l, i| caps[i] = .{ if (l.comp) |r| r.cap else 0, if (l.idx_k) |r| r.cap else 0 };
+    try testing.expect(aux.begin_prompt(t.m, 1, .of(p), .{}, info.n, false).isOk());
+    const warm = try slotForward(t, .prefill, &.{1}, p[info.n..], &.{@intCast(info.n)});
+    defer testing.allocator.free(warm);
+    for (m.mdl.dec_state.?.layers, 0..) |l, i| {
+        if (l.comp) |r| try testing.expectEqual(caps[i][0], r.cap);
+        if (l.idx_k) |r| try testing.expectEqual(caps[i][1], r.cap);
+    }
+    const reference = try Twin.open(files, "");
+    defer reference.close();
+    const first = @min(2, p.len - 1);
+    testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[0..first], &.{0}));
+    if (first < p.len - 1) testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[first .. p.len - 1], &.{@intCast(first)}));
+    const cold = try slotForward(reference, .prefill, &.{1}, p[p.len - 1 ..], &.{@intCast(p.len - 1)});
+    defer testing.allocator.free(cold);
+    for (cold) |x| try testing.expect(std.math.isFinite(x));
+    try testing.expectEqualSlices(f32, cold, warm);
+}
+
+test "codec round trip survives origin destruction at odd and even compressor boundaries with DSpark on and off" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var p: [27]u32 = undefined;
+    for (&p, 0..) |*id, i| id.* = @intCast((i * 13 + 3) % 96);
+    for ([_]bool{ false, true }) |dspark| {
+        const files = if (dspark) try fixture.v41DsparkFiles(arena.allocator(), 7) else try fixture.v41Files(arena.allocator(), 7);
+        for ([_]usize{ 2, 3, 8, 9, 26, 27 }) |len| try codecRoundTrip(files, p[0..len], dspark);
+    }
+}
+
+test "codec refuses changed loaded settings and invalid IDs before allocating" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41DsparkFiles(arena.allocator(), 7), "");
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const p = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    var e: Exported = .{};
+    try e.capture(t, &p);
+    defer e.deinit();
+    const ids = p[0 .. p.len - 1];
+    const cfg = m.mdl.cfg;
+    defer m.mdl.cfg = cfg;
+    for (0..5) |change| {
+        switch (change) {
+            0 => m.mdl.cfg.sliding_window += 1,
+            1 => m.mdl.cfg.dsv4_dspark_target_layers[0] += 1,
+            2 => m.mdl.cfg.quant_bits += 1,
+            3 => m.mdl.cfg.dsv41_engram_compressed_vocab += 1,
+            4 => m.mdl.cfg.dsv4_compress_ratios[2] += 1,
+            else => unreachable,
+        }
+        var peak: u64 = 123;
+        const verdict = v41.table.cache.aux.?.import_plan(t.m, e.bytes(), &peak);
+        try testing.expectEqual(abi.Verdict.Code.failed, verdict.code);
+        try testing.expectEqual(@as(u64, 0), peak);
+        try expectInvalidImport(t, &e, ids, e.arrays());
+        m.mdl.cfg = cfg;
+    }
+    const stages = m.mdl.n_mtp;
+    m.mdl.n_mtp = 0;
+    try expectInvalidImport(t, &e, ids, e.arrays());
+    m.mdl.n_mtp = stages;
+    var invalid = p;
+    invalid[0] = @intCast(m.mdl.vocab);
+    try expectInvalidImport(t, &e, invalid[0..ids.len], e.arrays());
+    try expectInvalidImport(t, &e, ids[1..], e.arrays());
+}
+
+test "codec export refuses short buffers and unwinds partially created references" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const aux = v41.table.cache.aux.?;
+    const p = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    try testing.expect(aux.begin_prompt(t.m, 1, .of(&p), .{}, 0, true).isOk());
+    testing.allocator.free(try slotForward(t, .prefill, &.{1}, &p, &.{0}));
+    var sn: abi.Handle = null;
+    try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
+    defer aux.free(t.m, sn);
+    var e: Exported = .{};
+    const storage: abi.AuxExport = .{ .tensors = &e.tensors, .tensor_cap = e.tensors.len, .names = &e.names, .names_cap = e.names.len, .header = &e.header, .header_cap = e.header.len };
+    for (0..3) |small| {
+        var out = storage;
+        switch (small) {
+            0 => out.tensor_cap = 1,
+            1 => out.names_cap = 1,
+            2 => out.header_cap = 1,
+            else => unreachable,
+        }
+        try testing.expectEqual(abi.Verdict.Code.failed, aux.export_arrays(t.m, sn, &out).code);
+        try testing.expectEqual(@as(usize, 0), out.tensor_len + out.names_len + out.header_len);
+    }
+    var completed = false;
+    for (1..512) |at| {
+        var out = storage;
+        mlx.fault.arm(at);
+        const v = aux.export_arrays(t.m, sn, &out);
+        const fired = mlx.fault.didFire();
+        mlx.fault.disarm();
+        if (!fired) {
+            try testing.expect(v.isOk());
+            e.out = out;
+            e.deinit();
+            completed = true;
+            break;
+        }
+        try testing.expectEqual(abi.Verdict.Code.failed, v.code);
+        try testing.expectEqual(@as(usize, 0), out.tensor_len + out.names_len + out.header_len);
+    }
+    try testing.expect(completed);
+}
+
+const engram = @import("engram.zig");
+
+test "codec preserves compressed Engram history including dead sentinels through export, import and restore" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    const pm: *v41.Model = @ptrCast(@alignCast(t.m));
+    const m = pm.mdl;
+    const ids = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    try dsv41.reset(m, gpa);
+    try dsv41.armPrompt(m, &ids, null, true);
+    _ = mlx.mlx_array_free(try dsv41.extendResumable(m, gpa, &ids, null));
+    const sn = &m.dec_state.?.snap.?;
+    const history = [_]u32{ 9, engram.Hash.DEAD, 2, 4, engram.Hash.DEAD, 7, 1 };
+    // The tiny pack has no Engram projections; supply its already-compressed history at the codec boundary.
+    m.hash = .{ .n_layers = 0, .max_ngram = 2, .heads = 1, .pad = 0 };
+    sn.hist = try gpa.dupe(u32, &history);
+    var tensors: [codec.max_tensors]abi.AuxTensor = undefined;
+    var names: [16 * 1024]u8 = undefined;
+    var header: [codec.max_header]u8 = undefined;
+    var out: abi.AuxExport = .{ .tensors = &tensors, .tensor_cap = tensors.len, .names = &names, .names_cap = names.len, .header = &header, .header_cap = header.len };
+    try dsv41.exportSnapshot(m, sn, &out);
+    defer for (tensors[0..out.tensor_len]) |x| {
+        _ = mlx.mlx_array_free(.{ .ctx = x.array.ctx });
+    };
+    m.dec_state.?.deinit();
+    m.dec_state = null;
+    try testing.checkAllAllocationFailures(gpa, importForAllocationTest, .{ m, ids[0..history.len], header[0..out.header_len], tensors[0..out.tensor_len] });
+    const imported = try dsv41.importSnapshot(m, gpa, ids[0..history.len], header[0..out.header_len], tensors[0..out.tensor_len]);
+    defer {
+        imported.deinit(gpa);
+        gpa.destroy(imported);
+    }
+    try testing.expectEqualSlices(u32, &history, imported.hist);
+    var restored = try dsv41.stateFromSnapshot(m, gpa, imported);
+    defer restored.deinit();
+    try testing.expectEqualSlices(u32, &history, restored.hist.items);
+}
+
+fn importForAllocationTest(gpa: std.mem.Allocator, m: *const dsv41.Dsv41Model, ids: []const u32, header: []const u8, arrays: []const abi.AuxTensor) !void {
+    const sn = try dsv41.importSnapshot(m, gpa, ids, header, arrays);
+    defer gpa.destroy(sn);
+    defer sn.deinit(gpa);
 }
 
 test "deepseek_v41 slot request: Engram prompt and confidence follow the State across slots" {
