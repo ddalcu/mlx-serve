@@ -571,6 +571,7 @@ test "deepseek_v41 served: changed covered media rows miss without poisoning dis
 }
 
 test "deepseek_v41 served: appended media leaves an exact disk checkpoint eligible" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectDiskMedia(true);
 }
 
@@ -614,6 +615,7 @@ test "deepseek_v41 served: failed restored prompt setup retries cold with zero c
 }
 
 test "deepseek_v41 served: failed tensor import releases its inputs and prefills cold" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     try expectImportFallback(.arrays);
 }
 
