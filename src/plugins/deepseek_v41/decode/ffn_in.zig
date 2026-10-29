@@ -1161,6 +1161,7 @@ fn sameBytes(rig: *metal.Rig, a: A, b: A) !bool {
 }
 
 test "dsv41 dec ffn_in: the contract's launches write the shipped wrapper's bytes" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const ks = try build();
