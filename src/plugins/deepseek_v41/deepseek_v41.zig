@@ -3524,7 +3524,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     const p0 = st.n;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
-    if (m.streamed) |src| try src.phase(L > region_rows);
+    if (m.streamed) |src| try src.phase(promptPass(L, c.num_experts_per_tok, src.decode_ids));
     if (ids == .gpu) {
         if (L != 1 or m.pair != null) return error.Dsv41GpuIdsUnsupported;
         const tv = mlx.mlx_vector_array_new_value(ids.gpu);
@@ -4932,6 +4932,12 @@ pub fn maxVerifyDrafts(m: *const Dsv41Model) usize {
     return verifyDraftsFor(if (m.streamed) |src| src.decode_ids else null, m.cfg.num_experts_per_tok);
 }
 
+/// Whether a pass of `rows` is a prompt pass for a streamed bank: past the compiled regions, or wider than the bank's
+/// decode lane (`Routed.decode_ids`), which the bank refuses in decode.
+fn promptPass(rows: usize, top_k: usize, decode_ids: usize) bool {
+    return rows > region_rows or rows * top_k > decode_ids;
+}
+
 fn verifyDraftsFor(decode_ids: ?usize, top_k: usize) usize {
     const ids = decode_ids orelse return VERIFY_MAX_DRAFTS;
     return @min(VERIFY_MAX_DRAFTS, ids / top_k -| 1);
@@ -4942,6 +4948,14 @@ test "dsv41 verify drafts: a streamed bank's verify (drafts + the committed toke
     const d = verifyDraftsFor(48, 6);
     try std.testing.expectEqual(@as(usize, 7), d);
     try std.testing.expect((d + 1) * 6 <= 48);
+}
+
+test "dsv41 phase: a pass wider than a streamed bank's decode lane is a prompt pass" {
+    // EXL3's decode lane: 48 ids, 8 top-6 rows.
+    for (1..33) |rows| try std.testing.expectEqual(rows > 8, promptPass(rows, 6, 48));
+    // A bank with no narrower lane keeps the compiled regions' cut.
+    const max_call_ids = @import("../../sdk/weights/routed.zig").max_call_ids;
+    for (1..33) |rows| try std.testing.expectEqual(rows > region_rows, promptPass(rows, 6, max_call_ids));
 }
 
 /// Arm the rollback anchors and append `[t1, drafts…]` as a verify chunk;
