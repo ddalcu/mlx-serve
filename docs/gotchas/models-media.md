@@ -442,6 +442,21 @@ placeholder id (0) never claims token 0`, `tests/test_transcriptions.sh`.
 
 ## Qwen packs
 
+### Raw HF RMS deltas arrive as gains (Swift-1.5)
+Defect: a `qwen3_5` pack whose RMS weights are HF's zero-centered deltas decoded to repeated `U+FFFD`. Cause: the
+loader multiplied by the raw tensor, so every trunk norm gained `w` where the reference computes `1 + w`. Fix:
+`foldRawQwen35Norms` detects the convention from `layers.0.input_layernorm` and folds the trunk roles to FP32 gains,
+leaving GDN's direct gains alone; a folded pack takes the `qwen35-raw-rms-f32-v1` SSD namespace. Guard: `qwen3_5 raw
+delta RMS norms load as FP32 gains without changing converted packs or GDN`.
+
+### FP32 norm gains must not leak into the activation dtype
+Defect: once the gains are FP32 every fused norm+RoPE kernel declines, and the residual stream silently became FP32.
+Cause: `rmsNorm` promotes BF16 activations when the gain is FP32, and the composed Q/K path had no cast-back. Fix:
+the plugin's `RmsNorm` and the composed Q/K norm restore the residual dtype; a tree row takes stock dynamic RoPE at
+`offset + depth` instead of `SpecTreeUnsupported`. Guard: `qwen3_5 FP32 norm gains preserve BF16 activations and
+small deltas`, `qk norm rope fused declines mismatched FP32 norm gains`, `gated attention tree RoPE uses each row's
+depth when composed QK norm declines`.
+
 ### Standardizing our own Qwen3.8 packs: embeddings, head norms, DWQ
 Defect: our 4/8-bit packs kept `embed_tokens` dense (1.8 / 1.2 GB) where every other pack, including our own 6-bit and
 iQ, quantized it. Fix: `tests/restandardize_qwen38_pack.py`: quantize the embedding from the raw stored bf16 bytes (an

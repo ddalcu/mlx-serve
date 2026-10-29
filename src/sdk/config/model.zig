@@ -327,6 +327,8 @@ pub const ModelConfig = struct {
     split_ngram_parts: u32 = 128,
     embedded_ple_payload_bytes: ?u64 = null,
     qwen4_norm_convention: ?Qwen4NormConvention = null,
+    /// Set from loaded trunk tensors; corrected raw-pack K/V must not restore the previous SSD root.
+    qwen35_raw_norms: bool = false,
     indexer_n_heads: u32 = 0, // 0 = dense attention
     indexer_head_dim: u32 = 0,
     indexer_budget: u32 = 0,
@@ -1171,6 +1173,7 @@ pub const ModelConfig = struct {
     /// Nemotron-H keys were RoPE-rotated before its attention became NoPE; the
     /// marker gives it a fresh root. Null keeps every other arch's root.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (self.qwen35_raw_norms) return "qwen35-raw-rms-f32-v1";
         if (self.plugin) |b| return if (b.parsed.cache.layout_namespace.len > 0) b.parsed.cache.layout_namespace.slice() else null;
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
         if (self.rope_llama3 != null) return "llama3-rope-v1";
@@ -4983,7 +4986,8 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         .shard => |sh| try config.applyShard(sh),
         .remote => |r| config.pairDsv41(.{ .lo = r.start, .hi = r.end, .worker = false }),
     };
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null or config.pluginHears(), .keep_f16 = config.actDtype() == .float16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
+    const qwen35_norms = std.mem.startsWith(u8, config.model_type, "qwen3_5") and config.hadamard_block == 0;
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null or config.pluginHears(), .keep_f16 = config.actDtype() == .float16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .defer_narrow = if (qwen35_norms) qwen35NormNeedsFold else null, .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainPart(&weights, sp);
@@ -4999,12 +5003,203 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         defer _ = mlx.mlx_stream_free(s);
         try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
     }
+    if (qwen35_norms) {
+        defer reportF16Narrowing();
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        config.qwen35_raw_norms = try foldRawQwen35Norms(&weights, s);
+    }
     if (config.exl3 != null or config.modelopt or (config.expert_bank and config.isGlm5())) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
         try sushi_pack.adapt(config, &weights, s);
     }
     return weights;
+}
+
+fn qwen35NormNeedsFold(name: []const u8) bool {
+    for ([_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX }) |prefix| {
+        if (!std.mem.startsWith(u8, name, prefix) or name.len <= prefix.len or name[prefix.len] != '.') continue;
+        const leaf = name[prefix.len + 1 ..];
+        if (std.mem.eql(u8, leaf, "norm.weight")) return true;
+        if (std.mem.startsWith(u8, leaf, "layers.") and
+            (std.mem.endsWith(u8, leaf, ".input_layernorm.weight") or
+                std.mem.endsWith(u8, leaf, ".post_attention_layernorm.weight") or
+                std.mem.endsWith(u8, leaf, ".self_attn.q_norm.weight") or
+                std.mem.endsWith(u8, leaf, ".self_attn.k_norm.weight"))) return true;
+    }
+    return false;
+}
+
+/// Raw HF RMS gains share one convention across the trunk; a positive Q/K or final delta is not a folded gain.
+fn foldRawQwen35Norms(weights: *Weights, s: mlx.mlx_stream) !bool {
+    var folded_raw = false;
+    for ([_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX }) |prefix| {
+        var buf: [256]u8 = undefined;
+        const anchor = weights.get(try std.fmt.bufPrint(&buf, "{s}.layers.0.input_layernorm.weight", .{prefix})) orelse continue;
+        const n = mlx.mlx_array_size(anchor);
+        const dt = mlx.mlx_array_dtype(anchor);
+        if (mlx.mlx_array_ndim(anchor) != 1 or n == 0 or n > 1024 * 1024 or
+            (dt != .bfloat16 and dt != .float16 and dt != .float32)) return error.InvalidNormWeight;
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_astype(&f, anchor, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(f));
+        const values = mlx.mlx_array_data_float32(f) orelse return error.InvalidNormWeight;
+        var negative: usize = 0;
+        var sum: f64 = 0;
+        for (values[0..n]) |v| {
+            if (!std.math.isFinite(v)) return error.InvalidNormWeight;
+            if (v < 0) negative += 1;
+            sum += v;
+        }
+        const raw = negative * 4 >= n and sum / @as(f64, @floatFromInt(n)) < 0.5;
+        const layers = try std.fmt.bufPrint(&buf, "{s}.layers.", .{prefix});
+        var final_buf: [128]u8 = undefined;
+        const final = try std.fmt.bufPrint(&final_buf, "{s}.norm.weight", .{prefix});
+        const one = mlx.mlx_array_new_float(1);
+        defer _ = mlx.mlx_array_free(one);
+        var it = weights.map.iterator();
+        while (it.next()) |entry| {
+            const name = entry.key_ptr.*;
+            const trunk_layer = std.mem.startsWith(u8, name, layers) and qwen35NormNeedsFold(name);
+            if (!trunk_layer and !std.mem.eql(u8, name, final)) continue;
+            const old = entry.value_ptr.*;
+            if (!raw) {
+                if (!narrowsLoadedF16(name, mlx.mlx_array_ndim(old), mlx.mlx_array_dtype(old)) or !narrow1dEnabled()) continue;
+                var cast = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(cast);
+                try mlx.check(mlx.mlx_astype(&cast, old, .bfloat16, s));
+                entry.value_ptr.* = cast;
+                _ = mlx.mlx_array_free(old);
+                weights_load.narrowed_1d += 1;
+                continue;
+            }
+            var wide = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wide);
+            try mlx.check(mlx.mlx_astype(&wide, old, .float32, s));
+            var gain = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(gain);
+            try mlx.check(mlx.mlx_add(&gain, wide, one, s));
+            entry.value_ptr.* = gain;
+            _ = mlx.mlx_array_free(old);
+        }
+        if (raw) {
+            folded_raw = true;
+            log.info("[norm] folded raw Qwen3.5 RMS deltas in FP32 under {s}\n", .{prefix});
+        }
+    }
+    return folded_raw;
+}
+
+test "qwen3_5 raw delta RMS norms load as FP32 gains without changing converted packs or GDN" {
+    const io = testing.io;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [512]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer a.free(path);
+    const leaves = [_][]const u8{
+        "layers.0.input_layernorm.weight",  "layers.0.post_attention_layernorm.weight",
+        "layers.1.self_attn.q_norm.weight", "layers.1.self_attn.k_norm.weight",
+        "norm.weight",
+    };
+    const raw = [_][4]f32{
+        .{ -0.062469482421875, 0.00012218952178955078, -0.12493896484375, 0.250244140625 },
+        .{ -0.296875, -0.21875, -0.25, -0.1943359375 },
+        .{ 0.2021484375, 0.25390625, 0.2578125, 0.2265625 },
+        .{ 0.28125, 0.248046875, 0.298828125, 0.251953125 },
+        .{ 0.9609375, 0.75, 0.9375, 0.828125 },
+    };
+    const controls = [_][]const u8{ "layers.0.linear_attn.norm.weight", "layers.0.linear_attn.dt_bias" };
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe" }) |arch| for ([_][]const u8{ "language_model.model", "model.language_model", "model" }) |prefix| for ([_]mlx.mlx_dtype{ .bfloat16, .float16 }) |stored_dtype| for ([_]bool{ false, true }) |folded| {
+        {
+            const map = mlx.mlx_map_string_to_array_new();
+            defer _ = mlx.mlx_map_string_to_array_free(map);
+            const meta = mlx.mlx_map_string_to_string_new();
+            defer _ = mlx.mlx_map_string_to_string_free(meta);
+            for (0..leaves.len + controls.len) |i| {
+                var data = if (i < leaves.len) raw[i] else [4]f32{ 0.875, 0.875, 0.875, 0.875 };
+                if (folded and i < leaves.len) for (&data) |*v| {
+                    v.* += 1;
+                };
+                const f = mlx.mlx_array_new_data(&data, &[_]c_int{4}, 1, .float32);
+                defer _ = mlx.mlx_array_free(f);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f, stored_dtype, s));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                const name = try std.fmt.allocPrintSentinel(a, "{s}.{s}", .{ prefix, if (i < leaves.len) leaves[i] else controls[i - leaves.len] }, 0);
+                defer a.free(name);
+                try mlx.check(mlx.mlx_map_string_to_array_insert(map, name, bf));
+            }
+            try mlx.check(mlx.mlx_save_safetensors(path, map, meta));
+        }
+        var config = ModelConfig{ .model_type = arch, .weight_prefix = prefix, .num_hidden_layers = 2 };
+        var weights = try loadModelWeights(io, a, dir, &config, false);
+        defer weights.deinit();
+        for (0..leaves.len + controls.len) |i| {
+            const name = try std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, if (i < leaves.len) leaves[i] else controls[i - leaves.len] });
+            defer a.free(name);
+            const w = weights.get(name).?;
+            if (!folded and i < leaves.len) try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(w));
+            var f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f);
+            try mlx.check(mlx.mlx_astype(&f, w, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(f));
+            const data = mlx.mlx_array_data_float32(f).?;
+            for (0..4) |j| {
+                const stored: f32 = if (i >= leaves.len) 0.875 else if (folded) 1 + raw[i][j] else raw[i][j];
+                const source: f32 = if (stored_dtype == .float16) @floatCast(@as(f16, @floatCast(stored))) else @bitCast((@as(u32, @bitCast(stored)) + 0x7fff + ((@as(u32, @bitCast(stored)) >> 16) & 1)) & 0xffff0000);
+                const expected: f32 = if (folded or i >= leaves.len)
+                    @bitCast((@as(u32, @bitCast(source)) + 0x7fff + ((@as(u32, @bitCast(source)) >> 16) & 1)) & 0xffff0000)
+                else
+                    1 + source;
+                try testing.expectEqual(expected, data[j]);
+            }
+        }
+    };
+}
+
+test "qwen3_5 raw delta norms isolate the SSD fingerprint only after loading a raw pack" {
+    const disk = @import("../../engines/mlx/cache/ssd/disk_tier.zig");
+    const io = testing.io;
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [512]u8 = undefined;
+    const dir = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
+    const path = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
+    defer a.free(path);
+    const old = try disk.modelFingerprint(a, io, dir);
+    defer a.free(old);
+    for ([_][]const u8{ "qwen3_5", "qwen3_5_moe" }) |arch| for ([_]bool{ false, true }) |served| for ([_]bool{ false, true }) |folded| {
+        {
+            const map = mlx.mlx_map_string_to_array_new();
+            defer _ = mlx.mlx_map_string_to_array_free(map);
+            const meta = mlx.mlx_map_string_to_string_new();
+            defer _ = mlx.mlx_map_string_to_string_free(meta);
+            const data = if (folded) [_]f32{ 0.875, 1.125 } else [_]f32{ -0.125, 0.125 };
+            const value = mlx.mlx_array_new_data(&data, &[_]c_int{2}, 1, .float32);
+            defer _ = mlx.mlx_array_free(value);
+            try mlx.check(mlx.mlx_map_string_to_array_insert(map, "model.layers.0.input_layernorm.weight", value));
+            try mlx.check(mlx.mlx_save_safetensors(path, map, meta));
+        }
+        var binding: plugin_config.Binding = .{ .table = undefined, .parsed = .{} };
+        var config = ModelConfig{ .model_type = arch, .plugin = if (served) &binding else null };
+        try testing.expect(config.cacheLayoutNamespace() == null);
+        var weights = try loadModelWeights(io, a, dir, &config, false);
+        defer weights.deinit();
+        const fp = try disk.modelFingerprintWithLayout(a, io, dir, config.cacheLayoutNamespace());
+        defer a.free(fp);
+        if (folded) try testing.expectEqualStrings(old, fp) else try testing.expect(!std.mem.eql(u8, old, fp));
+    };
 }
 
 pub const dsv41VisionKey = weights_load.dsv41VisionKey;
