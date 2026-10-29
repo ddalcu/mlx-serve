@@ -35,8 +35,15 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
 
 ## Gaps
 
-- `conformanceFixture` is a stub: the conformance suite needs a tiny converted pack (a 2-layer
-  backbone via the convert script). Until then the suite reports `error.MissingFixture`.
+- `conformanceFixture` generates the engine's widths at their published values (they are compile
+  constants, not config-driven): the full 262,158-row TE table and real Mimi decoder, with 512-wide
+  MLPs (intermediates are tensor-driven) — ~2.5 GB of tensors, so `test_min_ram_gib = 24` gates the
+  suite on small machines. Config-driven dims would let the pack shrink to yue2 sizes; follow-up.
+- `fixtures/mimi_clip.wav` + `fixtures/mimi_codes.bin` are the encoder-parity oracle: u16-LE codes
+  from the `qwen_tts` reference tokenizer pointed at a real pack's `audio_tokenizer/`. The parity
+  test defaults to these; `MLX_SERVE_MIMI_ENCODE` must still name a real pack (the encoder is
+  real-sized). Regenerate with `qwen_tts.Qwen3TTSTokenizer.encode` on an exact multiple of 1920
+  samples — partial trailing frames floor on this side and ceil in torch.
 - Chunked PCM out is not in the media ABI: `encode` hands the host one WAV. Real-time consumers
   (fleet's WS lane) currently re-request short turns; a `step`-side PCM chunk callback would make the
   media ABI cover streaming speech.
