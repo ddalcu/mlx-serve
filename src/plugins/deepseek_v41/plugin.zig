@@ -246,10 +246,15 @@ fn checkPortableExl3(s: mlx.mlx_stream) !void {
     if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
     const kernels = @import("mlx_stream").exl3_kernels;
     var diag: kernels.Diag = .{};
-    kernels.selfcheck.portablePrefill(gpa, .{ .stream = s }, &diag) catch |err| {
-        std.log.err("deepseek_v41: portable EXL3 self-check: {t}: {s}", .{ err, diag.message() });
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const start = std.Io.Timestamp.now(io, .awake);
+    const result = kernels.selfcheck.portablePrefill(gpa, .{ .stream = s }, &diag);
+    const ms = @divTrunc(std.Io.Timestamp.now(io, .awake).toNanoseconds() - start.toNanoseconds(), std.time.ns_per_ms);
+    result catch |err| {
+        std.log.err("deepseek_v41: portable EXL3 self-check: {t} after {d} ms: {s}", .{ err, ms, diag.message() });
         return err;
     };
+    std.log.info("deepseek_v41: portable EXL3 self-check passed in {d} ms", .{ms});
 }
 
 /// The host's stream when it is a GPU one, else this thread's GPU stream; null off Metal: the module's kernels are
