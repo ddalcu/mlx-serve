@@ -75,6 +75,8 @@ Feature = unit test that fails without it (+ integration script if HTTP-observab
 
 Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -Dtest-filter="tool traffic"` (the replay is gated behind `-Dslow-tests`; the bare filter compiles and reports success without running it). Full suite: `zig build test -Dslow-tests`. Full matrix: `tests/CLAUDE.md`.
 
+**A test that dispatches a Metal kernel skips on a virtual GPU.** CI's `macos-26` runner reports the device `air64_v27`, caps threadgroups at 384-896 and kills command buffers with `Insufficient Memory`, so an unguarded kernel test fails or exits 255 there and turns the `zig` job red. Start it with `if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;` (`mlx.virtualGpu()` alone when it has no other skip). A bulk patch must scan the whole test body for the guard, not the next few lines. PR runs omit `-Dslow-tests` unless the diff touches the replay's paths and pushes to main add it, so a green PR can still hide a slow-test failure on main.
+
 ## Releases & benchmarking
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).
