@@ -964,8 +964,8 @@ fn perSlot(xfm: *Transformer, x: Array, n: usize) ![]Array {
 pub fn fundAuxCache(config: *ModelConfig, capacity: u32, ram_enabled: bool, requested: u64) void {
     const b = config.plugin orelse return;
     b.aux_cache_budget_bytes = null;
-    if (!b.parsed.caps.streamed_weights) return;
-    b.aux_cache_budget_bytes = if (capacity == 0 or !ram_enabled) 0 else if (requested == 0)
+    if (!b.parsed.caps.streamed_weights or capacity == 0 or !ram_enabled) return;
+    b.aux_cache_budget_bytes = if (requested == 0)
         @import("../../../host/http/server.zig").PREFIX_CACHE_MEM_DEFAULT
     else
         requested;
@@ -1485,7 +1485,7 @@ test "plugin load runtime caps: publish only successful load results to host adm
     try std.testing.expectEqual(@as(usize, 2), @import("../admission/pending.zig").activeLimit(sv.cfg.caps().active_slots, 8));
 }
 
-test "EXL3 cache funding: streamed load gets a finite allowance and disabled caches get zero" {
+test "EXL3 cache funding: streamed load gets a positive allowance and disabled caches get none" {
     var binding: plugin_config.Binding = .{ .table = undefined, .parsed = .{ .caps = .{ .streamed_weights = true } } };
     var cfg: ModelConfig = .{ .plugin = &binding };
     fundAuxCache(&cfg, 8, true, 1234);
@@ -1493,9 +1493,10 @@ test "EXL3 cache funding: streamed load gets a finite allowance and disabled cac
     fundAuxCache(&cfg, 8, true, 0);
     try std.testing.expectEqual(@as(?u64, @import("../../../host/http/server.zig").PREFIX_CACHE_MEM_DEFAULT), binding.aux_cache_budget_bytes);
     fundAuxCache(&cfg, 0, true, 1234);
-    try std.testing.expectEqual(@as(?u64, 0), binding.aux_cache_budget_bytes);
+    try std.testing.expect(binding.aux_cache_budget_bytes == null);
+    fundAuxCache(&cfg, 8, true, 1234);
     fundAuxCache(&cfg, 8, false, 1234);
-    try std.testing.expectEqual(@as(?u64, 0), binding.aux_cache_budget_bytes);
+    try std.testing.expect(binding.aux_cache_budget_bytes == null);
     binding.parsed.caps.streamed_weights = false;
     fundAuxCache(&cfg, 8, true, 1234);
     try std.testing.expect(binding.aux_cache_budget_bytes == null);

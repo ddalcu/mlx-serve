@@ -626,7 +626,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     const sn = if (st.snap) |*snapshot| snapshot else return .ok;
     if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
     const owned = gpa.create(dsv41.Snap) catch |e| return Verdict.named(.failed, @errorName(e));
-    if (m.bank != null) sn.compactViews(m.s) catch |e| {
+    if (m.bank != null) sn.compactViews(gpa, m.s) catch |e| {
         gpa.destroy(owned);
         return Verdict.named(.failed, @errorName(e));
     };

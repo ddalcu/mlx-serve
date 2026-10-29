@@ -31,6 +31,7 @@ const dsv4 = @import("../deepseek_v4/deepseek_v4.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const dkern = @import("decode/decode.zig");
 const device = @import("../../mlx/device.zig");
+const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
@@ -4198,17 +4199,22 @@ pub const Snap = struct {
     }
 
     /// A small pending slice must not pin a whole prompt after the cache takes ownership.
-    pub fn compactViews(self: *Snap, s: S) !void {
-        if (self.layers.len > 64) return error.Dsv41SnapshotGeometry;
-        var copies: [129]A = @splat(none);
-        defer for (copies) |a| {
-            if (a.ctx != null) _ = mlx.mlx_array_free(a);
-        };
+    pub fn compactViews(self: *Snap, gpa: std.mem.Allocator, s: S) !void {
+        // Two pending arrays a layer, then the Markov history.
+        const copies = try gpa.alloc(A, 2 * self.layers.len + 1);
+        @memset(copies, none);
+        defer {
+            for (copies) |a| if (a.ctx != null) {
+                _ = mlx.mlx_array_free(a);
+            };
+            gpa.free(copies);
+        }
+        const mh = copies.len - 1;
         for (self.layers, 0..) |layer, i| {
             if (layer.pend_kv.ctx != null) copies[2 * i] = try compactSnapshotRows(layer.pend_kv, s);
             if (layer.pend_gate.ctx != null) copies[2 * i + 1] = try compactSnapshotRows(layer.pend_gate, s);
         }
-        if (self.mh.ctx != null) copies[128] = try compactSnapshotRows(self.mh, s);
+        if (self.mh.ctx != null) copies[mh] = try compactSnapshotRows(self.mh, s);
         // Publish only after every copy has evaluated; any failure leaves all original handles intact.
         for (self.layers, 0..) |*layer, i| {
             if (layer.pend_kv.ctx != null) _ = mlx.mlx_array_free(layer.pend_kv);
@@ -4219,8 +4225,8 @@ pub const Snap = struct {
             copies[2 * i + 1] = none;
         }
         if (self.mh.ctx != null) _ = mlx.mlx_array_free(self.mh);
-        self.mh = copies[128];
-        copies[128] = none;
+        self.mh = copies[mh];
+        copies[mh] = none;
     }
 
     pub fn clone(self: *const Snap, gpa: std.mem.Allocator) !Snap {
@@ -4389,14 +4395,10 @@ fn evalImported(x: A) !void {
     if (mlx.errorPending()) return error.MlxError;
 }
 
-// MLX Copy aliases its input; an identity gather allocates exactly the retained rows.
+// MLX Copy aliases its input; the owned copy allocates exactly the retained rows.
 fn compactSnapshotRows(x: A, s: S) !A {
-    var indices = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(indices);
-    try mlx.check(mlx.mlx_arange(&indices, 0, @floatFromInt(dim(x, 0)), 1, .int32, s));
-    var out = mlx.mlx_array_new();
+    const out = try materializedOwnedCopy(s, x);
     errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_take_axis(&out, x, indices, 0, s));
     try evalImported(out);
     return out;
 }
@@ -7504,7 +7506,7 @@ test "dsv41 cache snapshot: shared pending views own compact buffers" {
     var sn: Snap = .{ .gen = 0, .vision_key = 0, .n = 1, .ids = &.{}, .layers = try gpa.alloc(Snap.LSnap, 1), .ds = &.{}, .mh = ref(row), .hist = &.{} };
     sn.layers[0] = .{ .win = none, .comp = null, .idx_k = null, .pend_kv = ref(row), .pend_gate = ref(row) };
     defer sn.deinit(gpa);
-    try sn.compactViews(sc.s);
+    try sn.compactViews(gpa, sc.s);
     for ([_]A{ sn.layers[0].pend_kv, sn.layers[0].pend_gate, sn.mh }) |a| {
         try mlx.check(mlx.mlx_array_eval(a));
         const compact = mlx.mlx_array_data_float32(a) orelse return error.NoData;
@@ -7512,4 +7514,28 @@ test "dsv41 cache snapshot: shared pending views own compact buffers" {
         try testing.expectEqualSlices(f32, original[0..16], compact[0..16]);
     }
     try testing.expectEqual(@as(u64, 3 * 16 * @sizeOf(f32)), sn.bytes());
+}
+
+test "dsv41 cache snapshot: compaction serves any layer count and keeps the rows' dtype" {
+    const gpa = testing.allocator;
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    var bits: [8 * 4]u16 = undefined;
+    for (&bits, 0..) |*v, i| v.* = 0x3f80 + @as(u16, @intCast(i));
+    const whole = try sc.keep(mlx.mlx_array_new_data(&bits, &.{ 8, 4 }, 2, .bfloat16));
+    const row = try sc.slice(whole, 0, 5, 6);
+    try mlx.check(mlx.mlx_array_eval(row));
+    const original = mlx.mlx_array_data_bfloat16(row) orelse return error.NoData;
+    const n_layers = 65;
+    var sn: Snap = .{ .gen = 0, .vision_key = 0, .n = 1, .ids = &.{}, .layers = try gpa.alloc(Snap.LSnap, n_layers), .ds = &.{}, .mh = ref(row), .hist = &.{} };
+    for (sn.layers) |*l| l.* = .{ .win = none, .comp = null, .idx_k = null, .pend_kv = ref(row), .pend_gate = ref(row) };
+    defer sn.deinit(gpa);
+    try sn.compactViews(gpa, sc.s);
+    for (sn.layers) |l| for ([_]A{ l.pend_kv, l.pend_gate }) |a| {
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(a));
+        const compact = mlx.mlx_array_data_bfloat16(a) orelse return error.NoData;
+        try testing.expect(@intFromPtr(compact) != @intFromPtr(original));
+        try testing.expectEqualSlices(u16, original[0..4], compact[0..4]);
+    };
+    try testing.expectEqual(@as(u64, (2 * n_layers + 1) * 4 * @sizeOf(u16)), sn.bytes());
 }

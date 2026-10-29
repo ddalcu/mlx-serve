@@ -379,14 +379,13 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
     return plan.budget;
 }
 
-// ── tests ──
-
 pub fn boundedModuleCacheBudget(config: *const model_mod.ModelConfig, budget: u64) u64 {
     const b = config.plugin orelse return budget;
     const funded = b.aux_cache_budget_bytes orelse return budget;
-    const limit = @max(funded, 1);
-    return if (budget == 0) limit else @min(budget, limit);
+    return if (budget == 0) funded else @min(budget, funded);
 }
+
+// ── tests ──
 
 test "effectiveSsmCheckpointStride: zero capacity disables both tiers, RAM-off preserves disk" {
     try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, true, 4 << 30));
@@ -601,9 +600,6 @@ test "EXL3 cache funding: initial and revised cache caps never exceed the funded
     try testing.expectEqual(@as(u64, 256), boundedModuleCacheBudget(&cfg, 512));
     try testing.expectEqual(@as(u64, 128), boundedModuleCacheBudget(&cfg, 128));
     try testing.expectEqual(@as(u64, 256), boundedModuleCacheBudget(&cfg, 0));
-    binding.aux_cache_budget_bytes = 0;
-    try testing.expectEqual(@as(u64, 1), boundedModuleCacheBudget(&cfg, 0));
-    try testing.expectEqual(@as(u64, 1), boundedModuleCacheBudget(&cfg, 512));
     binding.aux_cache_budget_bytes = null;
     try testing.expectEqual(@as(u64, 512), boundedModuleCacheBudget(&cfg, 512));
     try testing.expectEqual(@as(u64, 0), boundedModuleCacheBudget(&cfg, 0));
