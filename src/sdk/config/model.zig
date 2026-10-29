@@ -1007,10 +1007,11 @@ pub const ModelConfig = struct {
         }
     }
 
-    /// The widest prompt chunk the arch's prompt pass gains from (0 = the ladder's): DeepSeek-V4.1 was tuned at 2048,
-    /// and its Engram layer slows per row past 4096.
+    /// The widest prompt chunk the arch's prompt pass gains from (0 = the ladder's): DeepSeek-V4.1 peaks at 8192 (each
+    /// chunk replays a window through its decoder layers, reading their whole expert banks, and fuller expert tiles
+    /// pay; past 8192 its per-row costs grow).
     pub fn prefillChunkMax(self: *const ModelConfig) u32 {
-        return if (self.isDsv41()) 2048 else 0;
+        return if (self.isDsv41()) 8192 else 0;
     }
 
     /// Rows a sliding layer keeps past its window on an arch that caches only the window

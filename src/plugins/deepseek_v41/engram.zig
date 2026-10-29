@@ -393,6 +393,48 @@ pub const Table = struct {
     };
 
     pub fn read(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
+        // A prompt's spans repeat rows (common n-grams): each distinct row is read once.
+        if (ids.len > GCD_ROWS) if (try self.readDistinct(gpa, ids)) |r| return r;
+        return self.readAll(gpa, ids);
+    }
+
+    /// `read` of the distinct ids, copied out to every position; null when no id repeats.
+    fn readDistinct(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !?Raw {
+        const n = ids.len;
+        const order = try gpa.alloc(u64, n);
+        defer gpa.free(order);
+        for (order, ids, 0..) |*o, id, i| o.* = (@as(u64, id) << 32) | i;
+        std.mem.sort(u64, order, {}, std.sort.asc(u64));
+        const uniq = try gpa.alloc(u32, n);
+        defer gpa.free(uniq);
+        const slot = try gpa.alloc(u32, n);
+        defer gpa.free(slot);
+        var nu: usize = 0;
+        for (order) |o| {
+            const id: u32 = @intCast(o >> 32);
+            if (nu == 0 or uniq[nu - 1] != id) {
+                uniq[nu] = id;
+                nu += 1;
+            }
+            slot[@as(u32, @truncate(o))] = @intCast(nu - 1);
+        }
+        if (nu == n) return null;
+        const u = try self.readAll(gpa, uniq[0..nu]);
+        defer u.deinit(gpa);
+        const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
+        errdefer gpa.free(w);
+        const sc = try gpa.alignedAlloc(u8, .@"4", n * self.slen);
+        errdefer gpa.free(sc);
+        const bi = try gpa.alignedAlloc(u8, .@"4", if (self.mode == .affine) n * self.slen else 0);
+        for (slot, 0..) |k, i| {
+            @memcpy(w[i * self.wlen ..][0..self.wlen], u.w[k * self.wlen ..][0..self.wlen]);
+            @memcpy(sc[i * self.slen ..][0..self.slen], u.s[k * self.slen ..][0..self.slen]);
+            if (bi.len > 0) @memcpy(bi[i * self.slen ..][0..self.slen], u.b[k * self.slen ..][0..self.slen]);
+        }
+        return .{ .w = w, .s = sc, .b = bi };
+    }
+
+    fn readAll(self: *const Table, gpa: std.mem.Allocator, ids: []const u32) !Raw {
         const n = ids.len;
         const w = try gpa.alignedAlloc(u8, .@"4", n * self.wlen);
         errdefer gpa.free(w);
@@ -413,12 +455,12 @@ pub const Table = struct {
         if (parts > 1) {
             var threads: [PAR_THREADS]?std.Thread = @splat(null);
             for (threads[1..parts], 1..) |*t, k| t.* = std.Thread.spawn(.{}, Job.runVoid, .{ &job, k, parts }) catch null;
-            var failed = !job.run(0, parts);
+            var failed = !job.run(0, parts, false);
             for (threads[1..parts], 1..) |t, k| {
-                if (t) |th| th.join() else failed = !job.run(k, parts) or failed;
+                if (t) |th| th.join() else failed = !job.run(k, parts, false) or failed;
             }
             if (failed or job.bad.load(.acquire)) return error.EngramRead;
-        } else if (!job.run(0, 1)) return error.EngramRead;
+        } else if (!job.run(0, 1, true)) return error.EngramRead;
         return .{ .w = w, .s = sc, .b = bi };
     }
 
@@ -475,18 +517,19 @@ pub const Table = struct {
 
         fn applyOne(ctx: ?*anyopaque, i: usize) callconv(.c) void {
             const job: *const Job = @ptrCast(@alignCast(ctx.?));
-            _ = job.run(i, job.ids.len);
+            _ = job.run(i, job.ids.len, true);
         }
 
         fn runVoid(self: *const Job, first: usize, stride: usize) void {
-            _ = self.run(first, stride);
+            _ = self.run(first, stride, false);
         }
 
-        /// Every `stride`-th row from `first`, asked of the kernel first: preads run in parallel where
-        /// faults on one mapping would serialize.
-        fn run(self: *const Job, first: usize, stride: usize) bool {
+        /// Every `stride`-th row from `first` (`advise`: asked of the kernel first): preads run in parallel where
+        /// faults on one mapping would serialize. A prompt's threads skip the advice: at 32 of them the preads alone
+        /// keep the SSD's queue full, and the advice doubles the requests.
+        fn run(self: *const Job, first: usize, stride: usize, advise_first: bool) bool {
             const t = self.t;
-            t.advise(self.ids, first, stride);
+            if (advise_first) t.advise(self.ids, first, stride);
             var i = first;
             while (i < self.ids.len) : (i += stride) {
                 const r: u64 = self.ids[i];
@@ -621,7 +664,7 @@ extern "c" fn dispatch_get_global_queue(identifier: isize, flags: usize) ?*anyop
 extern "c" fn dispatch_apply_f(iterations: usize, queue: ?*anyopaque, context: ?*anyopaque, work: *const fn (?*anyopaque, usize) callconv(.c) void) void;
 
 const PAR_ROWS_PER_THREAD = 16;
-const PAR_THREADS = 16;
+const PAR_THREADS = 32;
 
 fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
     return crt.pread(fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));

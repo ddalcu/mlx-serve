@@ -52,6 +52,8 @@ pub fn prefillTransientReserveAtKv(
     kv_len: u64,
 ) u64 {
     const seq: u64 = @max(kv_len, chunk);
+    // The arch that bills its own prompt pass is priced the same way here as at admission (`prefillNeededAtChunk`).
+    if (config.isDsv41()) return @import("prefill_chunk.zig").dsv41PrefillMemoryNeeded(config, seq, chunk);
     return prefillMemoryNeeded(
         seq,
         config.num_attention_heads,

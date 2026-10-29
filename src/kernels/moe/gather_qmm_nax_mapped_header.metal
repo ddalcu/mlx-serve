@@ -132,7 +132,8 @@ METAL_FUNC void gather_mapped_seg(
     threadgroup typename Q::WT* Ws,
     const uint sgid,
     const uint lane,
-    const device T* sigtab) {
+    const device T* sigtab,
+    const int up_off = 0) {
   using WT = typename Q::WT;
   constexpr bool kPair = EPI != 0;
   static_assert(!kPair || ALIGN_N, "paired gate/up tiles are full");
@@ -150,11 +151,12 @@ METAL_FUNC void gather_mapped_seg(
   const int w_col = kPair ? y_col / 2 : y_col;
   const int ldy = kPair ? half_n : N;
 
-  const size_t w_row = size_t(expert) * (kPair ? half_n : N) + w_col;
+  // `up_off`: a gate/up bank fused along its rows (gate rows then up rows an expert) passes the up rows' offset.
+  const size_t w_row = size_t(expert) * (kPair ? half_n + up_off : N) + w_col;
   q.advance(w_row * K_g);
-  up_q.advance(w_row * K_g);
+  up_q.advance((w_row + up_off) * K_g);
   TileLoader<Q, G, kPair> loader(
-      w + w_row * K_w, up_w + w_row * K_w, K, q, up_q, sgid * 32 + lane);
+      w + w_row * K_w, up_w + (w_row + up_off) * K_w, K, q, up_q, sgid * 32 + lane);
   const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
   const bool row_live = ALIGN_N || loader.row < tgp_bn;
 
@@ -262,7 +264,8 @@ METAL_FUNC void gather_mapped_db(
     threadgroup typename Q::WT* Ws,
     const uint sgid,
     const uint lane,
-    const device T* sigtab) {
+    const device T* sigtab,
+    const int up_off = 0) {
   using WT = typename Q::WT;
   static_assert(G::kBK == 64, "db runs 64-deep K steps");
   constexpr bool kPair = EPI != 0;
@@ -278,11 +281,12 @@ METAL_FUNC void gather_mapped_db(
   const int half_n = N / 2;
   const int w_col = kPair ? y_col / 2 : y_col;
 
-  const size_t w_row = size_t(expert) * (kPair ? half_n : N) + w_col;
+  // `up_off`: a gate/up bank fused along its rows (gate rows then up rows an expert) passes the up rows' offset.
+  const size_t w_row = size_t(expert) * (kPair ? half_n + up_off : N) + w_col;
   q.advance(w_row * K_g);
-  up_q.advance(w_row * K_g);
+  up_q.advance((w_row + up_off) * K_g);
   TileLoader<Q, G, kPair> loader(
-      w + w_row * K_w, up_w + w_row * K_w, K, q, up_q, sgid * 32 + lane);
+      w + w_row * K_w, up_w + (w_row + up_off) * K_w, K, q, up_q, sgid * 32 + lane);
   const bool loads = G::kLT == G::kThreads || sgid * 32 + lane < uint(G::kLT);
 
   const int m0 = kSM * int(sgid / kWN);
