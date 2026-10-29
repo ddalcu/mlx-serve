@@ -21,6 +21,7 @@ const testing = std.testing;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
+const capture = @import("../media_jobs/plugin/test_conn.zig").capture;
 const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
 const mtpCapable = @import("request_options.zig").mtpCapable;
 const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
@@ -1073,22 +1074,13 @@ test "a streamed turn's result keeps the prompt-cache hit and timings the slot m
 
 /// The SSE `data:` payloads `sendStreamTail` writes, as parsed JSON (`[DONE]` dropped).
 fn testStreamTail(a: std.mem.Allocator, usage_json: ?[]const u8, timings: ?[]const u8) ![]std.json.Value {
-    var sv: [2]std.posix.fd_t = undefined;
-    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
-    defer _ = std.c.close(sv[1]);
-    var conn: Conn = undefined;
-    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
-    try sendStreamTail(a, &conn, 1, "m", .{ .reason = "stop", .details = null }, null, usage_json, timings);
-    _ = std.c.close(sv[0]);
-    var buf: [8192]u8 = undefined;
-    var len: usize = 0;
-    while (true) {
-        const n = std.c.read(sv[1], buf[len..].ptr, buf.len - len);
-        if (n <= 0) break;
-        len += @intCast(n);
-    }
+    const raw = try capture(a, struct {
+        fn run(conn: *Conn, al: std.mem.Allocator, u: ?[]const u8, t: ?[]const u8) !void {
+            try sendStreamTail(al, conn, 1, "m", .{ .reason = "stop", .details = null }, null, u, t);
+        }
+    }.run, .{ a, usage_json, timings });
     var events = std.ArrayList(std.json.Value).empty;
-    var it = std.mem.tokenizeSequence(u8, buf[0..len], "\n\n");
+    var it = std.mem.tokenizeSequence(u8, raw, "\n\n");
     while (it.next()) |ev| {
         const data = ev["data: ".len..];
         if (std.mem.eql(u8, data, "[DONE]")) continue;
