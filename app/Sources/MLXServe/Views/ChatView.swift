@@ -514,6 +514,8 @@ struct ChatView: View {
                 ModelBrowserPane(section: Binding(
                     get: { section },
                     set: { appState.selectModelSection($0) }))
+            } else if appState.chatWorkspace.isMonitoring {
+                MonitoringView(store: appState.monitoring, openSettings: { appState.showSettings() })
             } else if appState.chatWorkspace.isSettings {
                 SettingsView()
             } else if case .terminal(let id) = appState.chatWorkspace {
@@ -541,13 +543,7 @@ struct ChatView: View {
             }
         }
         .navigationTitle("")
-        // No toolbar material in ANY of this split's modes — the transcript,
-        // Models, Settings and the Create pages alike (the three-column split
-        // carries the same modifier). On the SPLIT, not on ChatDetailView:
-        // there it covered only conversation mode, and the chrome flipped as
-        // you switched panes. The BAR itself stays — the traffic lights and
-        // the sidebar-collapse button live in it (live 2026-08-09); see the
-        // long note above `threeColumnSplitView` and ChatDetailView's body.
+        // Keep the window controls while sharing the same clear chrome across workspaces.
         .toolbarBackground(.hidden, for: .windowToolbar)
         // Blocking: the setter drops SwiftUI's own dismissals, so nothing but
         // Cancel takes this sheet down. The getter is recomputed every update,
@@ -1271,6 +1267,10 @@ struct ChatSidebar: View {
                 destinationRow("Tasks", icon: "clock.badge.checkmark",
                                selected: appState.chatWorkspace.isTasks) {
                     appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
+                }
+                destinationRow("Monitoring", icon: "waveform.path.ecg",
+                               selected: appState.chatWorkspace.isMonitoring) {
+                    appState.chatWorkspace.isMonitoring ? appState.showConversation() : appState.showMonitoring()
                 }
                 // No "Chats" heading here: the list carries its own section
                 // headers ("Agents", "Sessions"), and one of them appears only

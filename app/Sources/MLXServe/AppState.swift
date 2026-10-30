@@ -20,6 +20,7 @@ class AppState: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
+    let monitoring = MonitoringStore()
 
     private let libraryRefresher = ModelLibraryRefresher()
     /// Chat is answered by Apple's on-device model rather than the server.
@@ -440,6 +441,11 @@ class AppState: ObservableObject {
         pendingChatOpenTick += 1
     }
 
+    func showMonitoring() {
+        chatWorkspace = .monitoring
+        pendingChatOpenTick += 1
+    }
+
     /// The checkpoint dir the Laya Decisions window shows.
     @Published var decisionsModelPath: String?
 
@@ -635,6 +641,7 @@ class AppState: ObservableObject {
         self.defaultAgentId = UserDefaults.standard.string(forKey: "defaultAgentId")
             .flatMap(UUID.init(uuidString:))
         self.quickLauncherEnabled = UserDefaults.standard.bool(forKey: "quickLauncherEnabled")
+        if startServerAtLaunch { monitoring.observe(server) }
         clusterWorker.reconcile(opts)
         server.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }

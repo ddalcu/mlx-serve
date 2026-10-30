@@ -64,3 +64,7 @@ And it goes well beyond text-to-X:
 Outputs go to `~/.mlx-serve/generations/` under per-modality, per-date folders.
 
 > The app won't let you start a generation if there isn't enough free RAM. If the mlx-serve server is running and competing for memory, you'll be prompted to stop it first.
+
+## Monitoring
+
+- **Monitoring** — open **Monitoring** below **Tasks** for native live metrics, charts, sessions, request observations and model status. Collection continues while the app runs; Live, 10m, 30m, 1h and 24h views use a local, per-server history retained for up to 24 hours. Metrics must be enabled in Server settings. Browser history is separate; no prompts, responses or API keys are stored.
