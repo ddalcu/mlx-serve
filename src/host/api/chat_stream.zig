@@ -50,7 +50,43 @@ const formatTimingsObject = @import("format.zig").formatTimingsObject;
 const formatPerfBracket = @import("format.zig").formatPerfBracket;
 const MropeData = @import("../media/encode.zig").MropeData;
 const sendStreamKeepalive = @import("../http/sse.zig").sendStreamKeepalive;
+const sendSSEProgressChunk = @import("../http/sse.zig").sendSSEProgressChunk;
 const beatStreamKeepalive = @import("../http/sse.zig").beatStreamKeepalive;
+
+/// How often a `return_progress` stream polls the engine's prefill progress. Shorter than the
+/// keepalive interval: a progress bar fed every 5 s barely moves.
+const PROGRESS_POLL_MS: i64 = 1000;
+
+/// One prefill-progress frame from the engine's live counters, or null while the engine has not
+/// started the prefill (queue wait) — that stretch keeps the bare keepalive comment.
+fn prefillProgressFrame(st: *const Stream, now_ns: u64) ?struct { total: u32, cached: u32, processed: u32, time_ms: u64 } {
+    const s = st.prefill_progress.snapshot();
+    if (s.total == 0) return null;
+    return .{
+        .total = s.total,
+        .cached = s.cached,
+        .processed = s.pos,
+        .time_ms = now_ns / std.time.ns_per_ms,
+    };
+}
+
+/// The `.idle` write while a prefill runs: a `prompt_progress` chunk when the request asked and
+/// the engine has numbers, else the plain keepalive comment.
+fn sendIdleProgress(
+    allocator: std.mem.Allocator,
+    conn: *Conn,
+    chat_id: i64,
+    model_name: []const u8,
+    st: *Stream,
+    return_progress: bool,
+) !void {
+    if (!return_progress or conn.ws_mode != null) return sendStreamKeepalive(conn);
+    const elapsed_ns: u64 = @intCast(st.request_start_ts.untilNow(st.io, .boot).nanoseconds);
+    const frame = prefillProgressFrame(st, elapsed_ns) orelse return sendStreamKeepalive(conn);
+    const progress_json = try std.fmt.allocPrint(allocator, "{{\"total\":{d},\"cache\":{d},\"processed\":{d},\"time_ms\":{d}}}", .{ frame.total, frame.cached, frame.processed, frame.time_ms });
+    defer allocator.free(progress_json);
+    try sendSSEProgressChunk(allocator, conn, chat_id, model_name, progress_json);
+}
 
 /// Token-stream adapter that drives the streaming SSE state machine the same
 /// way regardless of whether speculative decoding (PLD / drafter) is on. Each
@@ -155,6 +191,9 @@ pub fn handleStreamingGeneration(
     stop_sequences: []const []const u8,
     model_name: []const u8,
     include_usage: bool,
+    /// The request asked to watch the prefill (`return_progress`): mid-prefill idle turns carry a
+    /// `prompt_progress` chunk instead of the bare keepalive comment.
+    return_progress: bool,
     has_tools: bool,
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
@@ -257,6 +296,7 @@ pub fn handleStreamingGeneration(
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
+        .return_progress = return_progress,
     });
     var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
@@ -357,7 +397,8 @@ pub fn handleStreamingGeneration(
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
         if (stopped or stop_stream.flushed) break;
-        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        const idle_wait_ms: i64 = if (return_progress) PROGRESS_POLL_MS else Conn.STREAM_KEEPALIVE_MS;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, idle_wait_ms)) {
             .token => |t| t,
             .done => if (stop_stream.holding()) null else break,
             .idle => {
@@ -371,7 +412,7 @@ pub fn handleStreamingGeneration(
                     client_gone = true;
                     break;
                 }
-                sendStreamKeepalive(stream) catch {
+                sendIdleProgress(allocator, stream, chat_id, model_name, running.?.stream, return_progress) catch {
                     log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                     running.?.stream.cancel();
                     client_gone = true;
@@ -1060,4 +1101,18 @@ test "a streamed turn's result keeps the prompt-cache hit and timings the slot m
     try t.expectEqual(@as(u32, 2985), r.cached_tokens);
     try t.expectEqual(ts.prefill_ns, r.prefill_ns);
     try t.expectEqual(ts.decode_ns, r.decode_ns);
+}
+
+test "a prefill-progress frame appears once the engine published, never during the queue wait" {
+    const st = try Stream.create(testing.allocator, testing.io);
+    defer st.release();
+    try testing.expect(prefillProgressFrame(st, 1_500_000_000) == null);
+    st.prefill_progress.cached.store(30000, .release);
+    st.prefill_progress.pos.store(31744, .release);
+    st.prefill_progress.total.store(32768, .release);
+    const frame = prefillProgressFrame(st, 1_500_000_000).?;
+    try testing.expectEqual(@as(u32, 32768), frame.total);
+    try testing.expectEqual(@as(u32, 30000), frame.cached);
+    try testing.expectEqual(@as(u32, 31744), frame.processed);
+    try testing.expectEqual(@as(u64, 1500), frame.time_ms);
 }

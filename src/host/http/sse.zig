@@ -161,6 +161,27 @@ pub fn sendSSEUsageChunk(
     try stream.flush();
 }
 
+/// A prefill-progress chunk (`return_progress`): OpenAI's empty-`choices` shape, same as the
+/// usage chunk, with the progress object llama.cpp and vLLM send beside it.
+pub fn sendSSEProgressChunk(
+    allocator: std.mem.Allocator,
+    stream: *Conn,
+    chat_id: i64,
+    model_name: []const u8,
+    progress_json: []const u8,
+) !void {
+    const chunk = try std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[],"prompt_progress":{s}}}
+    , .{ chat_id, nowSecs(stream.io), model_name, progress_json });
+    defer allocator.free(chunk);
+
+    logHttpSseData(chunk);
+    try stream.writeAllNoFlush("data: ");
+    try stream.writeAllNoFlush(chunk);
+    try stream.writeAllNoFlush("\n\n");
+    try stream.flush();
+}
+
 // ── Shared utilities ──
 
 /// SSE comment keepalive for the OpenAI-style streaming surfaces. Comments
@@ -193,4 +214,28 @@ pub fn beatStreamKeepalive(stream: *Conn, style: KeepaliveStyle) !void {
     // The WS transport no-ops both senders; stamp regardless so a bridged
     // connection doesn't re-evaluate the deadline on every token.
     stream.heartbeat.noteWrite(nowMsMonotonic(stream.io));
+}
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "a prefill-progress chunk is an empty-choices SSE event carrying the progress object" {
+    var sv: [2]std.posix.fd_t = undefined;
+    const AF_UNIX: c_uint = 1;
+    const SOCK_STREAM: c_uint = 1;
+    try testing.expect(std.c.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, std.Io.Threaded.global_single_threaded.io());
+    defer _ = std.c.close(sv[0]);
+
+    try sendSSEProgressChunk(testing.allocator, &conn, 42, "test-model", "{\"total\":128,\"cache\":64,\"processed\":96,\"time_ms\":1500}");
+
+    var buf: [512]u8 = undefined;
+    const n = try std.posix.read(sv[1], &buf);
+    const line = buf[0..n];
+    try testing.expect(std.mem.indexOf(u8, line, "\"choices\":[]") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "\"prompt_progress\":{\"total\":128,\"cache\":64,\"processed\":96,\"time_ms\":1500}") != null);
+    try testing.expect(std.mem.indexOf(u8, line, "data: ") != null);
 }

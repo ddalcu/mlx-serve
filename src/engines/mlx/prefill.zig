@@ -546,6 +546,12 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     if (slot.model.prefix_cache) |hc| hc.donateCheckout(@intFromPtr(slot));
     const graphs_were = mlx.setCudaGraphs(mlx.prefillKeepsCudaGraphs());
     defer _ = mlx.setCudaGraphs(graphs_were);
+    // The request's progress starts here: the restored prefix is already in, nothing forwarded yet.
+    if (slot.prefill_progress) |p| {
+        p.cached.store(hot_matched, .monotonic);
+        p.pos.store(hot_matched, .monotonic);
+        p.total.store(@intCast(slot.full_prompt.len), .monotonic);
+    }
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -613,6 +619,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
+            .live_progress = slot.prefill_progress,
             .interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb },
             .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }

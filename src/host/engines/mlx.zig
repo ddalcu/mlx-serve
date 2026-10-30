@@ -253,6 +253,7 @@ pub const Running = struct {
         errdefer stream.release();
         var q = p;
         q.sink = stream.sink();
+        if (q.return_progress) q.prefill_progress = &stream.prefill_progress;
         stream.prompt_len = (p.full_prompt orelse p.prompt_ids).len;
         stream.engineHolds();
         var out: ?*Slot = null;

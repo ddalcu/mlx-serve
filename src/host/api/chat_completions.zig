@@ -567,6 +567,10 @@ pub fn handleChatCompletions(
         break :blk false;
     } else false;
 
+    // Live prefill progress (the llama.cpp/vLLM `return_progress` flag): mid-prefill chunks
+    // carry a top-level `prompt_progress` object.
+    const return_progress = if (root.get("return_progress")) |v| v == .bool and v.bool else false;
+
     // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
     // vendor `enable_thinking` bool (Qwen/vLLM chat_template_kwargs family).
     // Either switch turns thinking on; effort "none" alone never does.
@@ -912,7 +916,7 @@ pub fn handleChatCompletions(
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, return_progress, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             logStreamError(err);
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};

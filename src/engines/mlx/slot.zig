@@ -22,6 +22,7 @@ const dflash_mod = @import("spec/dflash/dflash.zig");
 const DflashModel = dflash_mod.DflashModel;
 
 const SubmitParams = @import("scheduler/params.zig").SubmitParams;
+const prefill_progress = @import("../../sdk/request/prefill_progress.zig");
 const assistantSidecarEnabledForRequest = @import("spec/wiring.zig").assistantSidecarEnabledForRequest;
 
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
@@ -138,6 +139,9 @@ pub const Slot = struct {
     state: SlotState,
     /// The host's stream (`SubmitParams.sink`): every token and the terminator also go out as `abi.Event`s.
     sink: ?abi.Sink = null,
+    /// The host stream's live prefill progress (`SubmitParams.prefill_progress`): written per chunk
+    /// while this slot prefills; the connection thread reads it between chunks.
+    prefill_progress: ?*prefill_progress.PrefillProgress = null,
     /// A constraint span published before the token that carries it rides that token's event.
     sink_constraint: ?[2]u32 = null,
 
@@ -341,6 +345,7 @@ pub const Slot = struct {
             .logprobs_n = params.logprobs_n,
             .state = .pending_prefill,
             .sink = params.sink,
+            .prefill_progress = params.prefill_progress,
             .out_mu = .init,
             .out_cond = .init,
             .out_event = .unset,
