@@ -263,7 +263,7 @@ test "bailing_hybrid plugin: prefill, decode, verify and later chunks equal the 
 
 // Two MoE row groups: a tick of two groups is two trunk forwards in one evaluation.
 test "glm5_next plugin: batched rows equal the legacy batched decode bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/batched.tape");

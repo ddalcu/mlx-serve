@@ -28,6 +28,9 @@ var paired_engaged_logged = false;
 pub fn plan(rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) Plan {
     if (@rem(k, 64) != 0 or @rem(n, 64) != 0) return .{ .sched = .seg, .bm = 64, .bk = 64, .gx = 0, .pad = 0 };
     const per_expert = @divTrunc(rows, @max(experts, 1));
+    // A prompt's few rows an expert (a replay's 128 rows over 384 experts): the weight reads bound it, so the
+    // smallest tile wastes the least tensor work.
+    if (per_expert < 4) return .{ .sched = .db, .bm = 32, .bk = 64, .gx = 0, .pad = 0 };
     if (per_expert < 36 or (k < 1024 and per_expert < 120)) return .{ .sched = .db, .bm = 64, .bk = 64, .gx = 0, .pad = 0 };
     if (k < 1024 and paired) return .{ .sched = .seg, .bm = 96, .bk = 128, .gx = 32, .pad = 0 };
     if (k >= 1024 and per_expert < 48) return .{ .sched = .db, .bm = 64, .bk = 64, .gx = 32, .pad = 0 };
@@ -35,7 +38,7 @@ pub fn plan(rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) Plan 
     return .{ .sched = .seg, .bm = 128, .bk = 128, .gx = 32, .pad = 8192 };
 }
 
-fn supported(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, row_map: ?mlx.mlx_array) bool {
+fn supported(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, row_map: ?mlx.mlx_array, prompt: bool) bool {
     if (x.ctx == null or w.ctx == null or sc.ctx == null or idx.ctx == null) return false;
     if (mx) {
         if (bits != 4 or (group != 32 and group != 16) or bi.ctx != null or mlx.mlx_array_dtype(sc) != .uint8) return false;
@@ -60,8 +63,8 @@ fn supported(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_
     if (ws[0] <= 0 or ws[0] > 2048 or ws[1] <= 0 or @rem(ws[1], 32) != 0 or @as(i64, ws[2]) * 32 != @as(i64, xs[2]) * bits) return false;
     // Take only the calls MLX sends to its sorted row-block kernel (`B >= 16 && B / E >= 4`,
     // quantized.cpp GatherQMM::eval_gpu); below that it runs gather_qmv, which sums in another
-    // order, and MTP verify rounds must keep its bits.
-    if (ids[0] < 16 or @divTrunc(ids[0], ws[0]) < 4) return false;
+    // order, and MTP verify rounds must keep its bits. A prompt (`prompt`) keeps no such bits: any 16 rows.
+    if (ids[0] < 16 or (!prompt and @divTrunc(ids[0], ws[0]) < 4)) return false;
     return ss[0] == ws[0] and ss[1] == ws[1] and ss[2] == @divTrunc(xs[2], @as(c_int, @intCast(group)));
 }
 
@@ -104,12 +107,12 @@ fn mapKernel(paired: bool) !mlx.mlx_fast_metal_kernel {
     return value;
 }
 
-const Tiles = struct {
+pub const Tiles = struct {
     tiles: mlx.mlx_array,
     count: mlx.mlx_array,
     max_tiles: c_int,
 
-    fn deinit(self: Tiles) void {
+    pub fn deinit(self: Tiles) void {
         _ = mlx.mlx_array_free(self.tiles);
         _ = mlx.mlx_array_free(self.count);
     }
@@ -117,7 +120,7 @@ const Tiles = struct {
 
 /// The expert-run tile pre-pass both matmul kernels read. Configs are built per call: their
 /// output shapes carry the row count, so a cache keyed on it grew with every prompt length.
-fn scanTiles(idx: mlx.mlx_array, m: c_int, e: c_int, bm: c_int, s: mlx.mlx_stream) !Tiles {
+pub fn scanTiles(idx: mlx.mlx_array, m: c_int, e: c_int, bm: c_int, s: mlx.mlx_stream) !Tiles {
     const max_tiles = @divTrunc(m + bm - 1, bm) + @min(e, m);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -169,8 +172,9 @@ fn mmConfig(key: MmKey) !mlx.mlx_fast_metal_kernel_config {
     return cfg;
 }
 
-/// `limit`: a `swiglu_limit` the epilogue clamps at (whole numbers; 0 = none).
-const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32 = 0 };
+/// `limit`: a `swiglu_limit` the epilogue clamps at (whole numbers; 0 = none). `up_off`: the up rows' offset in an
+/// expert of a bank fused along its rows (gate rows, then up rows; `w` is then the gate's bank too), else 0.
+const Pair = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32 = 0, up_off: c_int = 0 };
 
 /// An MXFP4 bank has no biases; the kernel signature still binds the slot. 16
 /// elements: MLX binds an array under 8 in `constant`, not `device`.
@@ -186,11 +190,12 @@ fn launchMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: 
     const ws = mlx.getShape(w);
     const m = mlx.getShape(idx)[0];
     const e = ws[0];
-    const n = ws[1];
+    const up_off: c_int = if (pair) |v| v.up_off else 0;
+    const n = ws[1] - up_off;
     const k = xs[2];
     const t = try scanTiles(idx, m, e, p.bm, s);
     defer t.deinit();
-    const params = mlx.mlx_array_new_data(&[_]c_int{ if (pair != null) n * 2 else n, k }, &[_]c_int{2}, 1, .int32);
+    const params = mlx.mlx_array_new_data(&[_]c_int{ if (pair != null) n * 2 else n, k, up_off }, &[_]c_int{3}, 1, .int32);
     defer _ = mlx.mlx_array_free(params);
     const pw = if (pair) |v| v.w else w;
     const ps = if (pair) |v| v.sc else sc;
@@ -359,8 +364,18 @@ fn armed(key: CanaryKey, s: mlx.mlx_stream) bool {
 
 /// Sorted rhs indices must be one contiguous run per expert.
 pub fn sortedGather(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGatherAt(x, w, sc, bi, idx, bits, group, mx, nax_available, false, s);
+}
+
+/// `sortedGather` for a prompt's rows, which keep no stock kernel's bits: it also takes calls of under four rows an
+/// expert, which MLX would run as one gather_qmv a row (each row reading its experts' weights again).
+pub fn sortedGatherPrompt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGatherAt(x, w, sc, bi, idx, bits, group, mx, nax_available, true, s);
+}
+
+fn sortedGatherAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, prompt: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!nax_available or !mlx.streamIsGpu(s)) return null;
-    if (!supported(x, w, sc, bi, idx, bits, group, mx, null)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, null, prompt)) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(w);
     const p = plan(xs[0], ws[0], xs[2], ws[1], false);
@@ -497,8 +512,17 @@ fn mappedKey(x: mlx.mlx_array, w: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, 
 }
 
 pub fn sortedGatherMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGatherMappedAt(x, row_map, w, sc, bi, idx, bits, group, mx, nax_available, false, s);
+}
+
+/// `sortedGatherMapped` for a prompt's rows (`sortedGatherPrompt`).
+pub fn sortedGatherMappedPrompt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    return sortedGatherMappedAt(x, row_map, w, sc, bi, idx, bits, group, mx, nax_available, true, s);
+}
+
+fn sortedGatherMappedAt(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, bits: u32, group: u32, mx: bool, nax_available: bool, prompt: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!nax_available or !mlx.streamIsGpu(s)) return null;
-    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, prompt)) return null;
     const key = mappedKey(x, w, idx, bits, group, mx, false);
     if (!armed(key, s) or !armedMapped(key, false, s)) return null;
     const out = try launchMapped(x, row_map, w, sc, bi, idx, null, bits, group, mx, key.plan, s);
@@ -511,7 +535,7 @@ pub fn sortedGatherMapped(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_a
 
 pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, up_w: mlx.mlx_array, up_sc: mlx.mlx_array, up_bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!nax_available or !mlx.streamIsGpu(s)) return null;
-    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map) or !supported(x, up_w, up_sc, up_bi, idx, bits, group, mx, row_map)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, false) or !supported(x, up_w, up_sc, up_bi, idx, bits, group, mx, row_map, false)) return null;
     if (!std.mem.eql(c_int, mlx.getShape(w), mlx.getShape(up_w)) or @rem(mlx.getShape(w)[1], 32) != 0) return null;
     if (sigtab.ctx == null or mlx.mlx_array_dtype(sigtab) != .bfloat16 or mlx.mlx_array_size(sigtab) != 65536) return null;
     const key = mappedKey(x, w, idx, bits, group, mx, true);
@@ -520,6 +544,27 @@ pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, 
     if (!paired_engaged_logged) {
         paired_engaged_logged = true;
         log.info("[gather-nax] paired SwiGLU engaged: M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], mlx.getShape(w)[0], mlx.getShape(w)[1], mlx.getShape(x)[2] });
+    }
+    return out;
+}
+
+/// `sortedGateUp` over one bank `[E, 2 n, K]` holding each expert's gate rows then its up rows, for a prompt's rows
+/// (`sortedGatherPrompt`): `[M, 1, n]`, the SwiGLU of the two products.
+pub fn sortedGateUpFused(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, idx: mlx.mlx_array, sigtab: mlx.mlx_array, limit: u32, bits: u32, group: u32, mx: bool, nax_available: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!nax_available or !mlx.streamIsGpu(s)) return null;
+    if (!supported(x, w, sc, bi, idx, bits, group, mx, row_map, true)) return null;
+    if (sigtab.ctx == null or mlx.mlx_array_dtype(sigtab) != .bfloat16 or mlx.mlx_array_size(sigtab) != 65536) return null;
+    const ws = mlx.getShape(w);
+    const xs = mlx.getShape(x);
+    if (@rem(ws[1], 64) != 0) return null;
+    const n = @divExact(ws[1], 2);
+    const p = plan(mlx.getShape(idx)[0], ws[0], xs[2], n, true);
+    const key: CanaryKey = .{ .plan = p, .bits = bits, .group = group, .align_n = @rem(n, 64) == 0, .align_k = @rem(xs[2], p.bk) == 0, .mx = mx };
+    if (!armed(key, s) or !armedMapped(key, false, s) or !armedMapped(key, true, s)) return null;
+    const out = try launchMapped(x, row_map, w, sc, bi, idx, .{ .w = w, .sc = sc, .bi = bi, .sigtab = sigtab, .limit = limit, .up_off = n }, bits, group, mx, p, s);
+    if (!paired_engaged_logged) {
+        paired_engaged_logged = true;
+        log.info("[gather-nax] paired SwiGLU engaged (fused bank): M={d} E={d} N={d} K={d}\n", .{ mlx.getShape(idx)[0], ws[0], n, xs[2] });
     }
     return out;
 }
@@ -845,6 +890,56 @@ test "segmented NAX sorted gather row map and paired SwiGLU match composed proje
     }
 }
 
+test "segmented NAX sorted gather: a gate/up bank fused along its rows gives the paired kernel's bits" {
+    try requireNax();
+    errdefer dropOwnLatch();
+    const s = mlx.gpuStream();
+    const alloc = std.testing.allocator;
+    const tokens: c_int = 700;
+    const rows = tokens * 6;
+    const experts: c_int = 32;
+    const n: c_int = 256;
+    const k: c_int = 1024;
+    const ids_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(ids_data);
+    skewedRouting(ids_data, @intCast(experts));
+    const map_data = try alloc.alloc(u32, @intCast(rows));
+    defer alloc.free(map_data);
+    for (map_data, 0..) |*v, i| v.* = @intCast((i * 73 + 11) % @as(usize, @intCast(tokens)));
+    const ids = mlx.mlx_array_new_data(ids_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(ids);
+    const row_map = mlx.mlx_array_new_data(map_data.ptr, &[_]c_int{rows}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(row_map);
+    for ([_]u32{ 2, 3 }) |bits| {
+        const gate = try randomBank(experts, n, k, bits, 64, false, 0x2267, s);
+        defer gate.deinit();
+        const up = try randomBank(experts, n, k, bits, 64, false, 0x4521, s);
+        defer up.deinit();
+        var fused: [3]mlx.mlx_array = undefined;
+        for ([_][2]mlx.mlx_array{ .{ gate.w, up.w }, .{ gate.sc, up.sc }, .{ gate.bi, up.bi } }, &fused) |pair, *o| {
+            const v = mlx.mlx_vector_array_new_data(&pair, 2);
+            defer _ = mlx.mlx_vector_array_free(v);
+            o.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_concatenate_axis(o, v, 1, s));
+            try mlx.check(mlx.mlx_array_eval(o.*));
+        }
+        defer for (fused) |f| {
+            _ = mlx.mlx_array_free(f);
+        };
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ tokens, 1, k }, 3, .bfloat16, 0, 0.5, gate.key, s));
+        const sigtab = try @import("../hc/hc_prefill.zig").sigmoidTable(s);
+        for ([_]u32{ 0, 10 }) |limit| {
+            const want = (try sortedGateUp(x, row_map, gate.w, gate.sc, gate.bi, up.w, up.sc, up.bi, ids, sigtab, limit, bits, 64, false, true, s)) orelse return error.KernelDeclinedTestShape;
+            defer _ = mlx.mlx_array_free(want);
+            const got = (try sortedGateUpFused(x, row_map, fused[0], fused[1], fused[2], ids, sigtab, limit, bits, 64, false, true, s)) orelse return error.KernelDeclinedTestShape;
+            defer _ = mlx.mlx_array_free(got);
+            try expectBitEqual(want, got, s);
+        }
+    }
+}
+
 /// `a` and `b` interleaved per rep after one warm run each: per-arm medians of the wall
 /// time of the build plus the eval of what it returns.
 fn abMedianMs(reps: comptime_int, ctx: BenchArm, a: BenchBuild, b: BenchBuild) ![2]f64 {
@@ -943,6 +1038,10 @@ test "segmented NAX sorted gather µbench vs stock at 8192-token chunks (diag gq
         .{ .name = "flash-next nvfp4 gate 2560->640", .experts = 512, .top_k = 10, .n = 640, .k = 2560, .bits = 4, .group = 16, .mx = true },
         .{ .name = "flash-next nvfp4 gate+up+SwiGLU", .experts = 512, .top_k = 10, .n = 640, .k = 2560, .bits = 4, .group = 16, .mx = true, .paired = true },
         .{ .name = "flash-next nvfp4 down 640->2560", .experts = 512, .top_k = 10, .n = 2560, .k = 640, .bits = 4, .group = 16, .mx = true },
+        .{ .name = "dsv41 gate+up 5120->4608 2-bit", .experts = 384, .top_k = 6, .n = 4608, .k = 5120, .bits = 2, .group = 64, .mx = false },
+        .{ .name = "dsv41 gate+up 5120->4608 3-bit", .experts = 384, .top_k = 6, .n = 4608, .k = 5120, .bits = 3, .group = 64, .mx = false },
+        .{ .name = "dsv41 down 2304->5120 3-bit", .experts = 384, .top_k = 6, .n = 5120, .k = 2304, .bits = 3, .group = 64, .mx = false },
+        .{ .name = "dsv41 gate+up+SwiGLU 2-bit", .experts = 384, .top_k = 6, .n = 2304, .k = 5120, .bits = 2, .group = 64, .mx = false, .paired = true },
     };
     for (shapes) |shape| {
         const rows = tokens * shape.top_k;

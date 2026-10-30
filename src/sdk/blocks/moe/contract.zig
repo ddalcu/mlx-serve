@@ -2422,7 +2422,7 @@ const GqmmNax = struct {
             v[2] = try rig.input(.bfloat16, &.{16}, &zeros);
         };
         const width: f64 = @floatFromInt(if (self.kind == .paired) 2 * shape.n else shape.n);
-        const params = try rig.input(.int32, &.{2}, &.{ width, @floatFromInt(shape.k) });
+        const params = try rig.input(.int32, &.{3}, &.{ width, @floatFromInt(shape.k), 0 });
         if (self.kind == .mm) {
             self.args[0..7].* = .{ x, b[0][0], b[0][1], b[0][2], t, count_, params };
             self.n_args = 7;

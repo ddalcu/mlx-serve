@@ -713,7 +713,7 @@ fn expectRows(label: []const u8, got: []const i32, want: []const i32, width: usi
 const widths = [_]c_int{ 1024, 512, 256 };
 
 test "dsv41 dec topk: picks and candidate blocks equal the reference on scores with ties and -inf, at every width" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var ks = try Kernels.build();
@@ -771,7 +771,7 @@ test "dsv41 dec topk: picks and candidate blocks equal the reference on scores w
 }
 
 test "dsv41 dec topk: gathered picks equal the picks of the full row masked to the candidate blocks" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var ks = try Kernels.build();
@@ -944,7 +944,7 @@ fn todayModel() !dsv41.Dsv41Model {
 }
 
 test "dsv41 dec topk: picks and candidate blocks equal today's topkRows chain" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var ks = try Kernels.build();
@@ -1175,7 +1175,7 @@ test "dsv41 dec topk: ubench" {
 }
 
 test "dsv41 dec topk: each declared launch is the wrapper's, byte for byte" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const a = testing.allocator;
     var ks = try Kernels.build();
@@ -1225,7 +1225,7 @@ test "dsv41 dec topk: each declared launch is the wrapper's, byte for byte" {
 }
 
 test "dsv41 dec topk: the kernel contract's gates 1-4 hold for every registered launch" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const a = testing.allocator;
     var set = kc.Set.init(a);
@@ -1267,7 +1267,7 @@ fn fixtureScores(sc: *Scope, fx: *fixture.Fixture, li: usize, x: A, qr: A, p0: u
 }
 
 test "dsv41 dec topk: the fixture's real scores at layers 20 and 24 give today's picks and candidate blocks" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var ks = try Kernels.build();

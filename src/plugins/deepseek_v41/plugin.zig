@@ -380,6 +380,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m: *Model = @ptrCast(@alignCast(mp));
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "deepseek_v41: forward mode not declared");
     if (f.capture_layers.len > 0) return Verdict.refuse(.unsupported, "deepseek_v41: no layer capture");
+    // Before any forward: a position-0 run would reset the live state for rows nobody reads.
+    if (f.want_hidden) return Verdict.refuse(.unsupported, "deepseek_v41: no hidden-state output (embeddings)");
     if (f.mode == .batched_rows) return forwardBatched(m, f, out);
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "deepseek_v41: one slot's rows at a time");
     if (f.slots.len == 1) {

@@ -138,6 +138,7 @@ Spec decode:
 - **`--no-mtp` gates an IN-CHECKPOINT head too** (`entry.mtp` reads `params.mtp_enabled`).
 - **Per-arch exclusions read ONE predicate** (`ownsModuleDecodeState()` + `specInitWiring`); "module-owned" is a property of the STATE (`module_owned_state_fields` vs `module_shared_readonly_fields`); only the slot driving a module-owned head is exclusive (`slotExclusiveDecode`).
 - **A module-owned forward must honour `ctx.capture_hidden`** (publish last-row + all-rows via `skip_lm_head`).
+- **A forward asked for hidden rows returns them or refuses** (`Forward.want_hidden`): the driver fails an `.ok` with none (`no hidden rows`); `/v1/embeddings` refuses a module-owned-state model by name before any forward.
 - **Round cost is MEASURED** (`round_cost.zig`): per model/width/KV bucket from solo SINGLE-CHUNK rounds; `tok` is a workload MIXTURE (plan on `planTok`); per-silicon rows are COLD-START caps (`mtp_depth_free`), never deleted.
 - **Table hygiene**: interleaved prefill drops the round clock; refuse past `IMPLAUSIBLE_STEP` 1.5x / `SELF_SPIKE` 3x at fold AND load; load sweep also `IMPLAUSIBLE_WIDER` 1.25x (#382). Persistence OPT-IN (`MLX_SERVE_ROUND_COST_PERSIST=1`), keyed on chip/model/quant/OS/engine build.
 - **Width trials** (`mtpWidthTrialTarget`): m_lo then m_lo+1, NEVER m_lo−1; `[spec-stats]` carries `width_trials= table=`.

@@ -161,6 +161,26 @@ test "kit examples: the model plugin's fixture written as a pack is one it claim
     try testing.expectError(error.NotClaimed, cli.checkPack(testing.io, a, inst.set.plugins.items[1], pack));
 }
 
+test "kit examples: a plugin with no fixture is told apart from one failing the suite, and its pack still checks" {
+    var inst = try Installed.init();
+    defer inst.deinit();
+    const a = inst.arena.allocator();
+    const p = inst.set.plugins.items[0];
+    const pack = try inst.path("pack");
+    try cli.writeFixture(testing.io, a, p, pack);
+    // The model example as a plugin whose packs have no tiny form: `plugin check --model` checks the pack alone.
+    var m = p.manifest.*;
+    m.fixture = &noFixture;
+    var bare = p;
+    bare.manifest = &m;
+    try testing.expectError(error.NoFixture, cli.checkPlugin(testing.io, testing.allocator, bare));
+    try testing.expectEqualStrings("_example, 2 layers, hidden 16, vocab 260 (by_type)", try cli.checkPack(testing.io, a, bare, pack));
+}
+
+fn noFixture(_: *dylib_abi.Fixture) callconv(.c) dylib_abi.Verdict {
+    return dylib_abi.Verdict.refuse(.unsupported, "no tiny form");
+}
+
 test "kit examples: the model plugin's fixture pack tokenizes and renders its chat template as the server will" {
     var inst = try Installed.init();
     defer inst.deinit();

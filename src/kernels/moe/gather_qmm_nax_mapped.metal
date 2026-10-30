@@ -13,10 +13,10 @@ Q uq{up_scales, up_biases};
 if constexpr (SCHED == 1) {
   omlx_gqmm::gather_mapped_db<T, Q, G, EPI, true>(x, rmap, (const device uint8_t*)w,
       (const device uint8_t*)up_w, q, uq, desc, y_col, y, params[0], params[1],
-      Ws, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, sigtab);
+      Ws, simdgroup_index_in_threadgroup, thread_index_in_simdgroup, sigtab, params[2]);
 } else {
   omlx_gqmm::gather_mapped_seg<T, Q, G, ALIGN_N, ALIGN_K, EPI, true>(x, rmap,
       (const device uint8_t*)w, (const device uint8_t*)up_w, q, uq, desc, y_col,
       y, params[0], params[1], Ws, simdgroup_index_in_threadgroup,
-      thread_index_in_simdgroup, sigtab);
+      thread_index_in_simdgroup, sigtab, params[2]);
 }

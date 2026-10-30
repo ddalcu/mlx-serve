@@ -568,8 +568,7 @@ pub const CacheOps = extern struct {
     }
 };
 
-/// The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number
-/// of slots (`.last_row`) or of tokens (`.all_rows`).
+/// The most tokens a native drafter's round commits (`Round.tokens`).
 pub const max_round_tokens = 32;
 
 /// What a native drafter's round committed.
@@ -587,6 +586,8 @@ pub const Round = extern struct {
     tokens: [max_round_tokens]u32 = @splat(0),
 };
 
+/// The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number
+/// of slots (`.last_row`) or of tokens (`.all_rows`).
 pub const ForwardOut = extern struct {
     size: u32 = @sizeOf(ForwardOut),
     logits: Array = .{},

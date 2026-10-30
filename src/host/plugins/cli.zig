@@ -25,7 +25,7 @@ pub const usage =
     \\  new      A plugin folder from the kit's example (model, or --media / --quant). The kit is the
     \\           release's mlx-serve-plugin-kit tarball, extracted to --kit, $MLX_SERVE_KIT or ~/.mlx-serve/kit.
     \\  check    Loads the dylib (a folder: its zig-out/lib/*.dylib) and runs the conformance suite on its fixture;
-    \\           with --model, also has it claim and parse the pack in <dir>.
+    \\           with --model, also has it claim and parse the pack in <dir> (the pack alone when it has no fixture).
     \\  fixture  Writes the plugin's own tiny pack (its conformance fixture) into <dir>, to serve.
     \\  install  Copies it into ~/.mlx-serve/plugins/ with a receipt of its hash and signature. A downloaded
     \\           (quarantined) file installs only once you confirm (--yes confirms). Plugins load at startup once
@@ -71,8 +71,12 @@ pub fn cmdPlugin(gpa: Allocator, io: std.Io, args: []const []const u8) !void {
             } else return fail("plugin check: unknown argument '{s}'\n{s}", .{ args[i], usage });
         }
         const p = try opened(io, a, "check", args[1]);
-        checkPlugin(io, a, p) catch return fail("plugin check: {s} fails the conformance suite (above)", .{p.name()});
-        try out(io, "{s} ({t}) passes the conformance suite\n", .{ p.name(), p.manifest.kind });
+        if (checkPlugin(io, a, p)) |_| {
+            try out(io, "{s} ({t}) passes the conformance suite\n", .{ p.name(), p.manifest.kind });
+        } else |e| {
+            if (e != error.NoFixture or model == null) return fail("plugin check: {s} fails the conformance suite (above)", .{p.name()});
+            try out(io, "{s} ({t}) has no conformance fixture: the suite is skipped\n", .{ p.name(), p.manifest.kind });
+        }
         if (model) |dir| {
             const what = checkPack(io, a, p, dir) catch |e| return fail("plugin check: {s} on {s}: {s}", .{ p.name(), dir, packError(e) });
             try out(io, "{s} claims and parses {s}: {s}\n", .{ p.name(), dir, what });
@@ -214,7 +218,7 @@ pub fn checkPlugin(io: std.Io, gpa: Allocator, p: loader.Plugin) !void {
     const v = m.fixture(&f);
     if (!v.isOk()) {
         log.err("conformance: plugin {s}: its fixture ({s})\n", .{ p.name(), v.why.slice() });
-        return error.Conformance;
+        return error.NoFixture;
     }
     defer m.fixture_free(&f);
     var arena = std.heap.ArenaAllocator.init(gpa);

@@ -86,8 +86,10 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization
   and shortened slices still return named unsupported verdicts. SSD-only module retention is unsupported.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
-- Prefill compute-bound at ~16 TFLOPS; the MoE at 2048 rows streams each layer's expert bank 4x per 8192 chunk
-  (M about 32 per expert): the single biggest inefficiency.
+- Prefill is chunked at 8192 (`prefillChunkMax`), one MoE call per chunk: each chunk still reads every expert bank
+  once (the CED replay runs the decoder layers), so a narrower chunk pays that read twice as often.
+- Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
+  allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.
 - DSpark on prose falls back to plain (acceptance 1.04/round): correct, prose runs ~54 tok/s.
 - Kernel contract (`contract.zig`; kernels unchanged): `idx_score` / `idx_tile` score a NaN q.k dot as 0 (relu
   via Metal's max); `rope_tail` fp4 arms and `kv_row` write a NaN in a quantized block as a finite code (max drops

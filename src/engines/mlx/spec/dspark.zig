@@ -130,6 +130,13 @@ fn nativeSampledRound(self: *Generator, allocator: std.mem.Allocator, cap: u32) 
 /// One round of the served plugin's own drafter (`NativeDrafter.step`): its tokens and the trunk token after them.
 fn nativeRound(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
     try plugin_settle.activate(self.xfm, &self.ctx);
+    // A forced commit (`commitForcedTokens`) leaves its last token in the model's state, whatever `dspark_pol` is:
+    // publish it and sample `t1` from its logits, so the drafter never takes it a second time.
+    if (self.has_pending_logits or self.has_pending_token) switch (try self.drainPipelineForSpec(allocator)) {
+        .drained => |tok| return try mtpSerialOneToken(allocator, tok),
+        .stopped => return null,
+        .already_clean, .stay_disabled => return error.PipelineHalfState,
+    };
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
     if (self.dspark_stochastic) return nativeSampledRound(self, allocator, @min(cap, abi.max_round_tokens - 1));
     const r = try plugin_driver.nativeRound(self.xfm, &self.ctx, self.next_token_id, @min(cap, abi.max_round_tokens - 1));

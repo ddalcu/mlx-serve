@@ -36,6 +36,8 @@ const settle = @import("settle.zig");
 const rht = @import("../../../sdk/quant/hadamard/rht.zig");
 const hadamard = @import("../../../sdk/quant/hadamard/format.zig");
 const intree = @import("intree.zig");
+const distributed = @import("../cluster/distributed.zig");
+const weights_load = @import("../../../sdk/weights/load.zig");
 const group = @import("../ssm/group.zig");
 const entry_mod = @import("../ssm/entry.zig");
 
@@ -181,7 +183,24 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: [
 /// plugin never sees them).
 pub fn loadWith(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, tower: ?*model.Weights) !Transformer {
     if (config.plugin == null) return error.NotPluginServed;
-    return loadTensors(io, a, config, model_dir, s, try loadSplit(io, a, model_dir, config, tower));
+    // A table that keeps none of the pack's tensors reads its own (`LoadCtx.weights` null). A pack the cluster serves
+    // still loads here: the load plans its split.
+    if (tower == null and !distributed.serves(model_dir) and !keepsAny(io, a, config.plugin.?, model_dir))
+        return loadTensors(io, a, config, model_dir, s, model.Weights.init(a), false);
+    return loadTensors(io, a, config, model_dir, s, try loadSplit(io, a, model_dir, config, tower), true);
+}
+
+/// Whether `b`'s table keeps a tensor the pack's index names (`WeightHooks.keep_key`); no hook or no index: it does.
+fn keepsAny(io: std.Io, a: std.mem.Allocator, b: *const plugin_config.Binding, model_dir: []const u8) bool {
+    const keep = b.table.weights.keep_key orelse return true;
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return true;
+    defer dir.close(io);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const owners = weights_load.indexOwners(io, arena.allocator(), dir) orelse return true;
+    var it = owners.keyIterator();
+    while (it.next()) |k| if (keep(&b.parsed, .of(k.*))) return true;
+    return false;
 }
 
 /// `load` over a tensor map the caller prepared (renamed or converted from the pack's own), which it hands over.
@@ -191,10 +210,11 @@ pub fn loadMap(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         m.deinit();
         return error.NotPluginServed;
     }
-    return loadTensors(io, a, config, model_dir, s, map);
+    return loadTensors(io, a, config, model_dir, s, map, true);
 }
 
-fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights) !Transformer {
+/// `lend`: the plugin is handed `map` (`LoadCtx.weights`), else null.
+fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir: []const u8, s: mlx.mlx_stream, map: model.Weights, lend: bool) !Transformer {
     const b = config.plugin.?;
     var res = Resident.adopt(map);
     // The model holds its own references: the map's go once the plugin has read it.
@@ -219,7 +239,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .settings_json = abi.Str.of(loadSettings(&settings_buf, config)),
         .stream = .{ .ctx = s.ctx },
         .host = @import("../../../host/host_table.zig").get(),
-        .weights = &src,
+        .weights = if (lend) &src else null,
         .stream_room = streamRoom(config),
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},
@@ -493,6 +513,11 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     }
     if (ctx.capture_hidden_all) |target| _ = mlx.mlx_array_set(target, hidden);
     if (!head) {
+        // An `.ok` that wrote no hidden rows is a plugin that serves none: fail here, not as an empty array downstream.
+        if (hidden.ctx == null) {
+            log.err("[plugin] {s}: forward returned no hidden rows\n", .{b.table.name.slice()});
+            return error.PluginForwardUnsupported;
+        }
         var h = mlx.mlx_array_new();
         _ = mlx.mlx_array_set(&h, hidden);
         return h;
@@ -519,8 +544,8 @@ pub fn nativeStages(xfm: *const Transformer) u32 {
     return xfm.config.plugin.?.parsed.spec.native_stages;
 }
 
-/// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state and `ctx.cache.step`
-/// move to the round's position.
+/// One native drafter round from the committed token `t1` (`NativeDrafter.step`); the model's state,
+/// `ctx.cache.step` and `ctx.moe_seq_offset` move to the round's position.
 pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.Round {
     const b = xfm.plugin.?;
     const nd = nativeDrafter(xfm).?;
@@ -546,6 +571,8 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
     }
     if (out.round.n == 0 or out.round.n > abi.max_round_tokens) return error.PluginForwardFailed;
     ctx.cache.step = @intCast(out.round.position);
+    // A recurrent model's next forward is positioned from it (`Positions`): the round's rows ran inside the plugin.
+    ctx.moe_seq_offset.* = @intCast(out.round.position);
     return out.round;
 }
 
@@ -582,7 +609,8 @@ pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Ver
     return .{ .round = out.round, .logits = .{ .ctx = out.logits.ctx } };
 }
 
-/// The second half (`NativeDrafter.finish`): keeps `accepted` drafts and moves `ctx.cache.step` to the model's position.
+/// The second half (`NativeDrafter.finish`): keeps `accepted` drafts and moves `ctx.cache.step` and
+/// `ctx.moe_seq_offset` to the model's position.
 pub fn nativeFinish(xfm: *Transformer, ctx: *ForwardCtx, accepted: u32) !u64 {
     const b = xfm.plugin.?;
     const nd = nativeDrafter(xfm).?;
@@ -593,6 +621,7 @@ pub fn nativeFinish(xfm: *Transformer, ctx: *ForwardCtx, accepted: u32) !u64 {
         return error.PluginForwardFailed;
     }
     ctx.cache.step = @intCast(out.round.position);
+    ctx.moe_seq_offset.* = @intCast(out.round.position);
     return out.round.position;
 }
 
@@ -1542,4 +1571,40 @@ test "EXL3 cache funding: discovered native pack carries its allowance through t
         try t.expectEqual(case.expected, Probe.received);
         try t.expect(!cfg.expert_bank);
     }
+}
+
+test "plugin driver: a native round and a finish move moe_seq_offset with cache.step" {
+    const t = std.testing;
+    const Fake = struct {
+        fn step(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            out.round = .{ .n = 3, .accepted = 2, .next_token = 9, .rows = 3, .position = f.positions.slice()[0] + 3 };
+            return .ok;
+        }
+        fn finish(_: *anyopaque, accepted: u32, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            out.round = .{ .position = 20 + accepted };
+            return .ok;
+        }
+        const drafter: abi.NativeDrafter = .{ .step = &step, .finish = &finish };
+        const spec: abi.SpecHooks = .{ .native_drafter = &drafter };
+        const cache: abi.CacheHooks = .{};
+        const weights: abi.WeightHooks = .{};
+        const table: abi.ModelTable = .{ .name = .of("native_fixture"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .spec = &spec, .weights = &weights };
+    };
+    var m: u8 = 0;
+    // A recurrent model: its forward is positioned from `moe_seq_offset`.
+    var bound: Bound = .{ .table = &Fake.table, .model = &m, .positions = .hybrid };
+    var x: Transformer = undefined;
+    x.plugin = &bound;
+    x.suppress_mask = null;
+    var kv: KVCache = undefined;
+    kv.step = 12;
+    var off: usize = 12;
+    var ctx: ForwardCtx = .{ .cache = &kv, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    const r = try nativeRound(&x, &ctx, 5, 4);
+    try t.expectEqual(@as(u64, 15), r.position);
+    try t.expectEqual(@as(usize, 15), kv.step);
+    try t.expectEqual(kv.step, off);
+    try t.expectEqual(@as(u64, 21), try nativeFinish(&x, &ctx, 1));
+    try t.expectEqual(@as(usize, 21), kv.step);
+    try t.expectEqual(kv.step, off);
 }

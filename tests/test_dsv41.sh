@@ -155,6 +155,11 @@ else
 fi
 check "single-flight marker answered" "$MARKER" 'Kangaroo'
 refuse "single-flight no cross-request leak" "$CONC" 'Kangaroo'
+# [7a] Embeddings: refused by name before any forward, and the conversation state is untouched (a repeat is solo).
+EMB=$(post /v1/embeddings '{"model":"mlx-serve","input":"hello"}')
+check "embeddings refused by name" "$EMB" 'does not serve embeddings'
+AFTER_EMB=$(post /v1/completions "$SF_BODY" | text_of)
+if [ "$AFTER_EMB" = "$SOLO" ]; then echo "PASS: greedy bytes unchanged after an embeddings request"; pass=$((pass+1)); else echo "FAIL: greedy bytes changed after an embeddings request"; fail=$((fail+1)); fi
 refuse "no MLX error" "$(cat "$LOG")" '[mlx]'
 
 # [7b] Prefix resume (one conversation): a repeat resumes one token short of its prompt and keeps the

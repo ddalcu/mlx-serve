@@ -76,6 +76,7 @@ curl http://localhost:11234/v1/responses \
 
 在 `POST /v1/audio/speech` 上，Qwen3-TTS 使用 `ref_audio`（base64 编码的 WAV）提取说话人嵌入，并不使用参考音频的转录文本进行条件生成：
 
-- 当前后端不读取 `language` 或 `ref_text`。发送这些字段不会指定语言，也不会提供参考转录文本。`/v1/audio/transcriptions` 的 `language` 选项不适用于语音生成。
+- `language` 指定朗读语言：取值为检查点 `talker_config.codec_language_id` 中的名称（不区分大小写，如 `english`、`portuguese`、`spanish`）。省略或传 `auto` 时，与以前一样由模型根据文本推断语言。其他取值（包括方言键）返回 HTTP 400。当文本可能被误认为相近语言时（例如巴西葡萄牙语被读成西班牙语发音），请指定该字段。
+- 后端不读取 `ref_text`；参考音频的转录文本不参与音色克隆的条件生成。
 - 非空的 `ref_audio` 必须是可解码的 WAV，且模型必须具有说话人编码器。无效的 base64/WAV 或缺少编码器时，会在合成开始或发送 SSE 响应头之前返回 HTTP 400。省略 `ref_audio`（或传空字符串）可使用默认音色。
 - 若要检查参考音频而不生成语音，可向同一端点发送 `"warm_only": true` 和 `ref_audio`。参考音频缺失或无法解码、或模型没有说话人编码器时，会返回 HTTP 400，而不是静默回退。这只检查参考音频的处理，不验证发音或口音质量。

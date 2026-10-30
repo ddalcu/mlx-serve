@@ -12,6 +12,7 @@ const Spelling = struct { layer_prefix: []const u8, shard_marker: []const u8, sc
 const spellings = [_]Spelling{
     .{ .layer_prefix = "language_model.model.layers.", .shard_marker = ".ple.ple_embedding.ngram_embedding.shards.", .scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale", .fmt = .affine },
     .{ .layer_prefix = "model.language_model.layers.", .shard_marker = ".ple.ple_embedding.ngram_embedding.shard_", .scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale_2", .fmt = .nvfp4 },
+    .{ .layer_prefix = "language_model.model.layers.", .shard_marker = ".ple.ple_embedding.ngram_embedding.shard_", .scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale", .fmt = .affine },
 };
 const Part = enum(u2) { weight, scales, biases };
 
@@ -630,4 +631,36 @@ test "embedded PLE indexed checkpoint metadata validates without tensor reads" {
     const path = std.mem.sliceTo(raw, 0);
     const info = (try inspectEmbedded(path, .{ .rows = 320_001_536, .dim = 160, .shards = 128 })).?;
     try std.testing.expectEqual(@as(u64, 32_000_153_602), info.payload_bytes);
+}
+
+test "embedded PLE reads TensorFold affine shard_ names with the same rows and scale" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeFixture(&td, .scale_nonunit);
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_][]const u8{ "model.safetensors.index.json", "a.safetensors", "b.safetensors" }) |name| {
+        const original = try td.dir.readFileAlloc(io, name, a, .limited(16384));
+        defer a.free(original);
+        const is_index = std.mem.endsWith(u8, name, ".json");
+        const header_len: usize = if (is_index) original.len else @intCast(std.mem.readInt(u64, original[0..8], .little));
+        const header = if (is_index) original else original[8 .. 8 + header_len];
+        const renamed = try std.mem.replaceOwned(u8, a, header, ".shards.", ".shard_");
+        defer a.free(renamed);
+        if (is_index) {
+            try td.dir.writeFile(io, .{ .sub_path = name, .data = renamed });
+        } else {
+            try writeSafetensors(&td, name, renamed, original[8 + header_len ..]);
+        }
+    }
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var table = (try openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 })).?;
+    defer table.close();
+    try std.testing.expectEqual(Format.affine, table.fmt);
+    try std.testing.expectEqual(@as(f32, 2), table.scale);
+    try std.testing.expectEqual(@as(u64, 122), table.payload_bytes);
+    for (0..6) |r| try std.testing.expectEqual(@as(u8, @intCast(r * 0x11)), table.rowParts(r).weight[0]);
+    try std.testing.expect(embeddedTensorName("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"));
+    try std.testing.expect(parseKey("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_01.weight") == null);
 }

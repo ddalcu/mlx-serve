@@ -15,7 +15,7 @@ const testing = std.testing;
 const Twin = proof.Twin(v41);
 test "deepseek_v41 plugin: prefill, GPU decode, a verify block and a later chunk equal the legacy seam bit for bit" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), @embedFile("fixtures/steps.tape"));
@@ -25,7 +25,7 @@ test "deepseek_v41 plugin: prefill, GPU decode, a verify block and a later chunk
 
 test "deepseek_v41 plugin: excluded configuration keeps the legacy resume and continues bit-equal" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const first = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
@@ -53,7 +53,7 @@ test "deepseek_v41 plugin: excluded configuration keeps the legacy resume and co
 
 test "deepseek_v41 plugin: a decode token on the device equals the legacy decode" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), @embedFile("fixtures/device-decode.tape"));
@@ -131,7 +131,7 @@ test "deepseek_v41 plugin: a slot's row in a batch depends on its own state only
 
 test "deepseek_v41 plugin: a one-slot batch is the slot's own decode step, bit for bit" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try fixture.v41Files(arena.allocator(), 7);
@@ -152,7 +152,7 @@ test "deepseek_v41 plugin: a one-slot batch is the slot's own decode step, bit f
 }
 
 test "deepseek_v41 aux: overlapping captures survive either release order and restore independently" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try fixture.v41Files(arena.allocator(), 7);
@@ -232,7 +232,7 @@ test "deepseek_v41 aux: overlapping captures survive either release order and re
 }
 
 test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
@@ -252,7 +252,7 @@ test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint"
 }
 
 test "deepseek_v41 aux: candidate image key ignores later rows and eligibility excludes streamed and paired instances" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
@@ -345,7 +345,7 @@ fn expectInvalidImport(t: *Twin, e: *Exported, ids: []const u32, arrays: []const
 }
 
 test "codec rejects duplicate, missing, unexpected and malformed tensors before construction" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41DsparkFiles(arena.allocator(), 7), "");
@@ -397,7 +397,7 @@ test "codec rejects duplicate, missing, unexpected and malformed tensors before 
 }
 
 test "codec import unwinds every allocation and checked MLX failure" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41DsparkFiles(arena.allocator(), 7), "");
@@ -540,7 +540,7 @@ test "codec round trip survives origin destruction at odd and even compressor bo
 }
 
 test "codec refuses changed loaded settings and invalid IDs before allocating" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41DsparkFiles(arena.allocator(), 7), "");
@@ -580,7 +580,7 @@ test "codec refuses changed loaded settings and invalid IDs before allocating" {
 }
 
 test "codec export refuses short buffers and unwinds partially created references" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
@@ -628,7 +628,7 @@ test "codec export refuses short buffers and unwinds partially created reference
 const engram = @import("engram.zig");
 
 test "codec preserves compressed Engram history including dead sentinels through export, import and restore" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();

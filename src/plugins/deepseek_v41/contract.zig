@@ -493,6 +493,38 @@ const MoeAct = struct {
     }
 };
 
+/// A fused gate/up's activation `a` [rows, 1, n] times its routing weight, one rounding.
+const MoeWt = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const total = s.rows * s.n;
+        if (total == 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci((total + 255) / 256 * 256), 1, 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{ ci(s.rows), 1, ci(s.n) }, act);
+        g.int("N", s.n);
+        g.dtype("T", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const a = try k.add(act, &.{ k.shape.rows, 1, k.shape.n });
+        const wts = try k.add(.float32, &.{k.shape.rows});
+        kit.uniform(rng, a, -8, 8);
+        kit.uniform(rng, wts, 0, 2.5);
+        if (f == .nonfinite) kit.plantRows(a, k.shape.rows, k.shape.n);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        for (out, 0..) |*o, i| o.* = k.in(0)[i] * k.in(1)[i / k.shape.n];
+        @memset(mag, 0);
+    }
+};
+
 const MoeCombine = struct {
     pub const Params = struct { k: usize = TOPK };
 
@@ -2128,6 +2160,283 @@ const AttnSoftmax = struct {
     }
 };
 
+// ── the prompt-width core on the matrix units (`attnGather`): QK, the masked softmax, PV ──
+
+/// The keys every gather kernel reads: row l's window (key c < W is window row wp + l - W + 1 + c, absent outside
+/// [0, wp + L)) then its picks (absent below 0); window [wp + L, HD], compressed rows [nc, HD], picks [L, K]
+/// (a 9-int `meta` stands in at K = 0), meta (wp, W, wp + L, K, H, HD, p0, L, o_groups).
+const Gathered = struct {
+    pub const Params = struct { wp: usize = 100, nc: usize = 700, p0: usize = 40, grouped: bool = false, og: usize = 8 };
+
+    fn ok(s: Shape) bool {
+        return s.rows > 0 and s.n == HEADS and s.k % 64 == 0 and WINDOW + s.k <= 1024;
+    }
+
+    fn addKeys(k: anytype, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const K = k.shape.k;
+        const kw = try k.add(act, &.{ k.p.wp + L, HD });
+        const comp = try k.add(act, &.{ k.p.nc, HD });
+        const picks = try k.add(.int32, if (K > 0) &.{ L, K } else &.{9});
+        const meta = try k.add(.int32, &.{9});
+        kit.uniform(rng, kw, -2, 2);
+        kit.uniform(rng, comp, -2, 2);
+        @memcpy(meta, &[_]f64{ @floatFromInt(k.p.wp), WINDOW, @floatFromInt(k.p.wp + L), @floatFromInt(K), HEADS, HD, @floatFromInt(k.p.p0), @floatFromInt(L), @floatFromInt(k.p.og) });
+        if (K > 0) {
+            for (picks, 0..) |*v, i| v.* = if (i % 37 == 5) -1 else @floatFromInt((i * 13) % k.p.nc);
+        } else @memcpy(picks, meta);
+    }
+
+    /// Key `c` of row `l` (inputs from `first`: window, compressed rows, picks), or null where it is absent.
+    fn key(k: anytype, first: usize, l: usize, c: usize) ?[]const f64 {
+        const K = k.shape.k;
+        if (c < WINDOW) {
+            const r = @as(i64, @intCast(k.p.wp + l + c)) - (WINDOW - 1);
+            if (r < 0 or r >= k.p.wp + k.shape.rows) return null;
+            return k.in(first)[@as(usize, @intCast(r)) * HD ..][0..HD];
+        }
+        const r = k.in(first + 2)[l * K + c - WINDOW];
+        if (r < 0) return null;
+        return k.in(first + 1)[@as(usize, @intFromFloat(r)) * HD ..][0..HD];
+    }
+};
+
+const AttnQk = struct {
+    pub const Params = Gathered.Params;
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (!Gathered.ok(s)) return null;
+        const NK = WINDOW + s.k;
+        var g = metal.Geometry{ .grid = .{ ci(NK / 64 * 128), ci(s.rows), 1 }, .tg = .{ 128, 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n), ci(NK) }, .float32);
+        g.int("HS", s.n / 4);
+        g.dtype("T", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const q = try k.add(act, &.{ k.shape.rows, k.shape.n, HD });
+        kit.uniform(rng, q, -2, 2);
+        try Gathered.addKeys(k, rng);
+        switch (f) {
+            .random => {},
+            .nonfinite => kit.plantRows(q, k.shape.rows * k.shape.n, HD),
+            // Every query row one stress vector, every key row a stress row against it.
+            .stress => {
+                const kw = k.in(1);
+                const comp = k.in(2);
+                try stressDot(rng, q[0..HD], kw, kw.len / HD, HD, 64, 7, k.scratch());
+                for (0..comp.len / HD) |r| @memcpy(comp[r * HD ..][0..HD], kw[(r % (kw.len / HD)) * HD ..][0..HD]);
+                for (1..q.len / HD) |r| @memcpy(q[r * HD ..][0..HD], q[0..HD]);
+            },
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n * (WINDOW + s.k);
+    }
+
+    /// An absent key stages as zeros: its score is q . 0 (0, or NaN where q is not finite).
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const NK = WINDOW + k.shape.k;
+        const t = try k.scratch().alloc(f64, HD);
+        defer k.scratch().free(t);
+        for (0..L) |l| for (0..H) |h| for (0..NK) |c| {
+            const q = k.in(0)[(l * H + h) * HD ..][0..HD];
+            const row = Gathered.key(k, 1, l, c);
+            var m: f64 = 0;
+            for (t, q, 0..) |*v, x, d| {
+                v.* = x * (if (row) |r| r[d] else 0);
+                m += @abs(v.*);
+            }
+            const i = (l * H + h) * NK + c;
+            out[i] = sum.of(t);
+            mag[i] = m;
+        };
+    }
+};
+
+const AttnSm = struct {
+    pub const Params = struct { wp: usize = 100, scal: f64 = 1.4 };
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (!Gathered.ok(s)) return null;
+        const NK = WINDOW + s.k;
+        var g = metal.Geometry{ .grid = .{ ci(s.n * 32), ci(s.rows), 1 }, .tg = .{ 128, 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n), ci(NK) }, .float16);
+        g.int("NJ", (NK + 31) / 32);
+        g.dtype("PT", .float16);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const K = k.shape.k;
+        const NK = WINDOW + K;
+        const s = try k.add(.float32, &.{ L, H, NK });
+        const picks = try k.add(.int32, if (K > 0) &.{ L, K } else &.{9});
+        const sink = try k.add(.float32, &.{ 1, H, 1 });
+        const meta = try k.add(.int32, &.{9});
+        const scal = try k.add(.float32, &.{1});
+        kit.uniform(rng, s, -4, 4);
+        kit.uniform(rng, sink, -3, 3);
+        @memcpy(meta, &[_]f64{ @floatFromInt(k.p.wp), WINDOW, @floatFromInt(k.p.wp + L), @floatFromInt(K), @floatFromInt(H), HD, 0, @floatFromInt(L), 8 });
+        if (K > 0) {
+            for (picks, 0..) |*v, i| v.* = if (i % 37 == 5) -1 else @floatFromInt(i % 400);
+        } else @memcpy(picks, meta);
+        scal[0] = k.p.scal;
+        if (f == .nonfinite) kit.plantRows(s, L * H, NK);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n * (WINDOW + s.k);
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const K = k.shape.k;
+        const NK = WINDOW + K;
+        const sv = try k.scratch().alloc(f64, NK);
+        defer k.scratch().free(sv);
+        const scale = spec.roundTo(.f32, k.p.scal);
+        for (0..L) |l| for (0..H) |h| {
+            const rw = (l * H + h) * NK;
+            var mx = -inf;
+            for (sv, 0..) |*v, c| {
+                const live = if (c < WINDOW) k.p.wp + l + c >= WINDOW - 1 else k.in(1)[l * K + c - WINDOW] >= 0;
+                v.* = if (live) scale * k.in(0)[rw + c] else -inf;
+                mx = maxN(mx, v.*);
+            }
+            const M = maxN(mx, k.in(2)[h]);
+            for (sv) |*v| v.* = @exp(v.* - M);
+            const den = sum.of(sv) + @exp(k.in(2)[h] - M);
+            for (sv, 0..) |v, c| {
+                out[rw + c] = v / den;
+                mag[rw + c] = @abs(v / den);
+            }
+        };
+    }
+};
+
+const AttnPv = struct {
+    pub const Params = Gathered.Params;
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (!Gathered.ok(s) or (p.grouped and s.n % p.og != 0)) return null;
+        var g = metal.Geometry{ .grid = .{ HD / 128 * 128, ci(s.rows), 1 }, .tg = .{ 128, 1, 1 } };
+        if (p.grouped) g.out(&.{ ci(p.og), ci(s.rows), ci(s.n / p.og * HD) }, act) else g.out(&.{ ci(s.rows), ci(s.n), HD }, act);
+        g.int("HS", s.n / 4);
+        g.int("GROUPED", @intFromBool(p.grouped));
+        g.int("RD", RD);
+        g.dtype("T", act);
+        g.dtype("PT", .float16);
+        g.dtype("OT", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const NK = WINDOW + k.shape.k;
+        const p = try k.add(.float16, &.{ L, H, NK });
+        kit.uniform(rng, p, 0, 2.0 / @as(f64, @floatFromInt(NK)));
+        try Gathered.addKeys(k, rng);
+        const periods = try k.add(.float32, &.{RD / 2});
+        periodsFill(periods, -1);
+        switch (f) {
+            .random => {},
+            .nonfinite => kit.plantRows(p, L * H, NK),
+            // Row 0's live keys (an even count of them) carry one stress vector, column d of their rows a stress row
+            // against it; absent keys get probability 0. Every probability row copies row 0's.
+            .stress => {
+                const a = k.scratch();
+                const rows = try a.alloc(?[]f64, NK);
+                defer a.free(rows);
+                const live = try a.alloc(usize, NK);
+                defer a.free(live);
+                var n: usize = 0;
+                for (rows, 0..) |*row, c| {
+                    row.* = if (c < WINDOW) blk: {
+                        const r = @as(i64, @intCast(k.p.wp + c)) - (WINDOW - 1);
+                        break :blk if (r < 0) null else k.in(1)[@as(usize, @intCast(r)) * HD ..][0..HD];
+                    } else blk: {
+                        const r = k.in(3)[c - WINDOW];
+                        break :blk if (r < 0) null else k.in(2)[@as(usize, @intFromFloat(r)) * HD ..][0..HD];
+                    };
+                    if (row.* != null) {
+                        live[n] = c;
+                        n += 1;
+                    }
+                }
+                n -= n % 2;
+                const x = try a.alloc(f64, n);
+                defer a.free(x);
+                const w = try a.alloc(f64, HD * n);
+                defer a.free(w);
+                // f16 probabilities hold integers to 2048, bf16 values to 256: every sum stays exact in fp32.
+                try stressDot(rng, x, w, HD, n, 256, 31, a);
+                @memset(p[0..NK], 0);
+                for (live[0..n], 0..) |c, j| {
+                    p[c] = x[j];
+                    for (rows[c].?, 0..) |*v, d| v.* = w[d * n + j];
+                }
+                for (1..L * H) |r| @memcpy(p[r * NK ..][0..NK], p[0..NK]);
+            },
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n * HD;
+    }
+
+    /// An absent key stages as zeros. Grouped: the last RD channels rotate at position p0 + l (adjacent pairs, the
+    /// inverse periods) and head h lands at [h / hg, l, (h % hg) * HD].
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const NK = WINDOW + k.shape.k;
+        const a = k.scratch();
+        const t = try a.alloc(f64, NK);
+        defer a.free(t);
+        const row = try a.alloc(f64, 2 * HD);
+        defer a.free(row);
+        const hg = H / k.p.og;
+        for (0..L) |l| for (0..H) |h| {
+            const pr = k.in(0)[(l * H + h) * NK ..][0..NK];
+            for (0..HD) |d| {
+                var m: f64 = 0;
+                for (t, pr, 0..) |*v, x, c| {
+                    v.* = x * (if (Gathered.key(k, 1, l, c)) |r| r[d] else 0);
+                    m += @abs(v.*);
+                }
+                row[d] = sum.of(t);
+                row[HD + d] = m;
+            }
+            if (k.p.grouped) {
+                const pos: f64 = @floatFromInt(k.p.p0 + l);
+                var d: usize = HD - RD;
+                while (d < HD) : (d += 2) {
+                    const th = pos / spec.roundTo(.f32, k.in(5)[(d - (HD - RD)) / 2]);
+                    const x0 = row[d];
+                    const x1 = row[d + 1];
+                    row[d] = x0 * @cos(th) - x1 * @sin(th);
+                    row[d + 1] = x0 * @sin(th) + x1 * @cos(th);
+                    const mm = row[HD + d] + row[HD + d + 1];
+                    row[HD + d] = mm;
+                    row[HD + d + 1] = mm;
+                }
+            }
+            const base = if (k.p.grouped) ((h / hg) * L + l) * hg * HD + (h % hg) * HD else (l * H + h) * HD;
+            @memcpy(out[base..][0..HD], row[0..HD]);
+            @memcpy(mag[base..][0..HD], row[HD..][0..HD]);
+        };
+    }
+};
+
 // ── the decode MoE: one token's routed + shared gate+up (`moe_gu`), its down + shared + hc expand (`moe_dn`) ──
 
 /// `codes` packed densely (element i at bit i * bits of the little-endian stream, as `mx.quantize` packs), into
@@ -2506,6 +2815,12 @@ fn depthSoftmax(s: Shape) usize {
 pub fn depthAttn(s: Shape) usize {
     return HD + WINDOW + s.k;
 }
+fn depthHd(_: Shape) usize {
+    return HD;
+}
+fn depthGather(s: Shape) usize {
+    return WINDOW + s.k + 1;
+}
 
 /// A launch of one of the module's kernels: `metal_kernel` input / output names as `buildKernel` gives them; `m12`
 /// the M1 and M2 limit Xcode's `metal-tt` compiles it for (`kernel contract offline`).
@@ -2537,6 +2852,10 @@ const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods
 const split_attn_l = launch("dsv41_attn_split", attn_ins, &.{ "pacc", "pm", "pl" }, v41.ATTN_SPLIT_SOURCE, "", 4 * (AttnSplit.NSG * HD + 2 * AttnSplit.NSG), 768, false);
 const merge_l = launch("dsv41_attn_merge", &.{ "pacc", "pm", "pl", "sink", "meta", "periods" }, &.{"out"}, v41.ATTN_MERGE_SOURCE, v41.UNROPE_HEADER, 0, 928, false);
 const softmax_l = launch("dsv41_attn_softmax", &.{ "lw", "lc", "topk", "sink", "meta", "scal" }, &.{ "pw", "pc" }, v41.ATTN_SOFTMAX_SOURCE, "", 0, 928, false);
+const qk_l = metal.Launch{ .name = "dsv41_attn_qk", .inputs = &.{ "q", "kw", "comp", "picks", "meta" }, .outputs = &.{"s"}, .source = v41.ATTN_QK_SOURCE, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
+const sm_l = metal.Launch{ .name = "dsv41_attn_sm", .inputs = &.{ "s", "picks", "sink", "meta", "scal" }, .outputs = &.{"p"}, .source = v41.ATTN_SM_SOURCE, .tg_bytes = 0, .offline = false, .min_gen = 17 };
+const pv_l = metal.Launch{ .name = "dsv41_attn_pv", .inputs = &.{ "p", "kw", "comp", "picks", "meta", "periods" }, .outputs = &.{"o"}, .source = v41.ATTN_PV_SOURCE, .header = v41.MPP_HEADER, .tg_bytes = 2 * 32 * 128 * 2, .offline = false, .min_gen = 17 };
+const wt_l = launch("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, v41.MOE_WT_SOURCE, "", 0, 1024, false);
 const gu_l = launch("dsv41_moe_gu", moe_gu_ins, &.{"out"}, v41.MOE_GU_SOURCE, v41.MOE_HEADER, 0, 1024, false);
 const dn_l = launch("dsv41_moe_dn", moe_dn_ins, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER, 0, 928, false);
 const act_l = launch("dsv41_moe_act", &.{ "y", "wts", "lim" }, &.{"out"}, v41.MOE_ACT_SOURCE, "", 0, 1024, false);
@@ -2765,6 +3084,49 @@ pub fn register(set: *kc.Set) !void {
         .out = .f16,
         .served = &.{ .{ .rows = 17, .n = 8, .k = 512 }, .{ .rows = 64, .n = 8, .k = 0 } },
         .sums = softmax_sums,
+    });
+    const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
+    try kit.add(set, AttnQk, &qk_l, .{}, .{
+        .name = "dsv41 attn_qk (prompt width, matrix units)",
+        .accum = .f32,
+        .depth = depthHd,
+        .out = .f32,
+        .nax = true,
+        .served = gather_served,
+    });
+    try kit.add(set, AttnSm, &sm_l, .{}, .{
+        .name = "dsv41 attn_sm (masked softmax, sink)",
+        .accum = .f32,
+        .depth = depthGather,
+        .ops = 8,
+        .out = .f16,
+        .served = gather_served,
+        .sums = softmax_sums,
+    });
+    try kit.add(set, AttnPv, &pv_l, .{}, .{
+        .name = "dsv41 attn_pv (prompt width, matrix units)",
+        .accum = .f32,
+        .depth = depthGather,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+    });
+    try kit.add(set, AttnPv, &pv_l, .{ .grouped = true }, .{
+        .name = "dsv41 attn_pv grouped (inverse rope, wo_a layout)",
+        .accum = .f32,
+        .depth = depthGather,
+        .ops = 4,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+        .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "the rotation after the sums rounds in f32; the plain arm proves the sums" },
+    });
+    try kit.add(set, MoeWt, &wt_l, .{}, .{
+        .name = "dsv41 moe_wt (routing weight on a fused gate/up activation)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 102, .n = INTER, .k = 1 }, .{ .rows = 7, .n = 64, .k = 1 } },
     });
     inline for (.{ 2, 3, 4 }) |bits| {
         try kit.add(set, MoeGu, &gu_l, .{ .bits = bits }, .{

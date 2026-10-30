@@ -721,7 +721,7 @@ pub fn register(set: *kc.Set) !void {
 }
 
 test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte for byte" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     const kn = try Kernels.build();
@@ -759,7 +759,7 @@ test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte f
 }
 
 test "dsv41 dec in_proj: the registered kernels pass the contract's gates 1-4" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var set = kc.Set.init(gpa);
@@ -978,6 +978,7 @@ fn expectLayer(gpa: std.mem.Allocator, fx: *fixture.Fixture, k: *const Kernels, 
 }
 
 test "dsv41 dec in_proj: layers 20..25 and 2..4 (KV sources, index sources, plain) match today's chain at R = 1, 2, 4, 6" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const k = try Kernels.build();

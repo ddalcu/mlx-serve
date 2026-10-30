@@ -89,6 +89,11 @@ pub fn handleEmbeddings(
     }
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
+    // A model whose plugin owns its decode state (DeepSeek-V4/V4.1, GLM-5.3) runs no stateless hidden-state forward.
+    if (config.caps().owns_decode_state) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "This model does not serve embeddings. Load an MLX embedding model instead.", null);
+        return;
+    }
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", null);
         return;

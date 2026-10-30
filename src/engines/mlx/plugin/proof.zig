@@ -359,6 +359,37 @@ test "plugin load: a tower map takes the pack's vision tower tensors, a text loa
     y.deinit();
 }
 
+test "plugin load: a table that keeps none of the pack's tensors reads its own, the engine loads none" {
+    const T = struct {
+        var lent: ?bool = null;
+        fn keepNone(_: *const abi.Parsed, _: abi.Str) callconv(.c) bool {
+            return false;
+        }
+        fn load(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
+            lent = ctx.weights != null;
+            out.* = abi.Verdict.refuse(.failed, "the fixture reads only its load context");
+            return null;
+        }
+        const hooks: abi.WeightHooks = .{ .keep_key = &keepNone };
+        const table: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.weights = &hooks;
+            t.load = &load;
+            break :blk t;
+        };
+    };
+    var b: Served = undefined;
+    try b.open(.{}, 0x6eed);
+    defer b.close();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try b.tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"model.norm.weight\":\"model.safetensors\"}}" });
+    const llama_table = b.cfg.plugin.?.table;
+    b.cfg.plugin.?.table = &T.table;
+    defer b.cfg.plugin.?.table = llama_table;
+    try testing.expectError(error.PluginLoadFailed, driver.load(io, testing.allocator, &b.cfg, b.dir, fixture.stream()));
+    try testing.expectEqual(@as(?bool, false), T.lent);
+}
+
 test "plugin cache: a module-owned state's resume point and resident bytes come from the table" {
     const T = struct {
         var media_seen = false;
@@ -452,6 +483,7 @@ fn expectLegacy(got: ?model.ModelConfig) !void {
 test {
     _ = @import("served.zig");
     _ = @import("proof_mtp.zig");
+    _ = @import("proof_native.zig");
     _ = @import("proof_settle.zig");
     _ = @import("mlx_lm_configs_test.zig");
     _ = @import("media.zig");

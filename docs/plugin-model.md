@@ -42,8 +42,9 @@ The example is a fixture, not a loader for real packs. Check the checkpoint's `c
   `vocab x hidden` matrix.
 - **Config JSON is untrusted.** Bounds-check every field before use (the scaffold does); refuse what you do not
   implement by name.
-- **Dense only.** The example's matmul takes unquantized weights. Quantized packs need the SDK's quant linear blocks
-  (`kit.sdk`), or [a quant plugin](plugin-quant.md).
+- **Dense only.** The example's matmul takes unquantized weights. An MLX-quantized pack (affine, mxfp4/8, nvfp4)
+  runs through mlx-c's own `mlx_quantized_matmul` and `mlx_gather_qmm`; any other encoding is
+  [a quant plugin](plugin-quant.md).
 
 Weight names and config keys should match mlx-lm so packs load across engines.
 
@@ -78,14 +79,16 @@ A plugin is a table (`abi.ModelTable`) of C-ABI functions. The host calls them i
   `cache_ops.release(&view)`. `fwd.logits` says `last_row`, `all_rows` or `none`. Everything you allocate per step
   is freed per step (the scaffold's `Graph` does this).
 - **MLX** is the mlx-c API (`@import("mlx_c")`): ops like `mlx_fast_rms_norm`, `mlx_fast_rope`,
-  `mlx_fast_scaled_dot_product_attention`, `mlx_matmul`. `kit.sdk` also ships blocks (attention, MLP, MoE, norms, RoPE)
-  and test fixtures; read what it exports in `src/sdk/root.zig` before hand-writing a layer.
+  `mlx_fast_scaled_dot_product_attention`, `mlx_matmul`. The kit ships no layer blocks: the server's attention,
+  MoE, GDN and quant blocks live in its `src/sdk` and are not part of the plugin contract, so a plugin writes its
+  layers on mlx-c (or vendors its own). `kit.sdk` holds the claim helpers and the test fixtures (`src/sdk/root.zig`).
 
 ## Read these in the kit
 
 The kit carries the contract and a working example, so a plain decoder needs nothing from the mlx-serve repo.
 
 - `examples/_example/plugin.zig`: a complete working decoder (about 270 lines). Start from `plugin new`, which copies it.
+- [plugin-abi.md](plugin-abi.md): every table, struct, field and enum of the ABI, generated from `src/abi/`.
 - `src/abi/plugin.zig`: every struct above with field comments (`Shell`, `Caps`, `Parsed`, `Bill`, `LoadCtx`,
   `Forward`, `CacheOps`, `ForwardOut`). The authoritative reference.
 - `src/sdk/root.zig` and `src/kit.zig`: what `kit.sdk` and `kit.generation` export.

@@ -99,6 +99,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m: *Model = @ptrCast(@alignCast(mp));
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "deepseek_v4: forward mode not declared");
     if (f.capture_layers.len > 0) return Verdict.refuse(.unsupported, "deepseek_v4: no layer capture");
+    // Before any forward: a position-0 run would reset the live state for rows nobody reads.
+    if (f.want_hidden) return Verdict.refuse(.unsupported, "deepseek_v4: no hidden-state output (embeddings)");
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "deepseek_v4: one slot's rows at a time");
     const in = Ids.of(f) catch return Verdict.refuse(.failed, "deepseek_v4: the token ids do not read back");
     defer in.deinit();

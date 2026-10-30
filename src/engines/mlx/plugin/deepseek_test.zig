@@ -69,12 +69,12 @@ test "deepseek_v41 bill: the plugin's terms equal the engine's on the release co
     }
 }
 
-test "dsv41 prefill chunk: pinned at 2048 on a big machine, and kept there however long the prompt" {
+test "dsv41 prefill chunk: pinned at 8192 on a big machine, and kept there however long the prompt" {
     const t = std.testing;
     var cfg = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
     const gb: u64 = 1 << 30;
     cfg.pinned_prefill_chunk = resolvePrefillChunk(&cfg, 16, 240 * gb, 140 * gb, 0, 0);
-    try t.expectEqual(@as(u32, 2048), cfg.pinned_prefill_chunk);
-    for ([_]usize{ 2048, 65536, 131_072, 1 << 20 }) |ctx|
-        try t.expectEqual(@as(usize, 2048), effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, ctx, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), cfg.pinned_prefill_chunk));
+    try t.expectEqual(@as(u32, 8192), cfg.pinned_prefill_chunk);
+    for ([_]usize{ 8192, 65536, 131_072, 1 << 20 }) |ctx|
+        try t.expectEqual(@as(usize, 8192), effectivePrefillChunk(cfg.prefillScoreHeadDim(), cfg.num_attention_heads, ctx, cfg.has_sliding_window, cfg.isMoe(), cfg.longCtxGated(), cfg.pinned_prefill_chunk));
 }
