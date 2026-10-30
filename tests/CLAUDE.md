@@ -60,7 +60,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 **API surfaces**
 - `test_api_edges.sh` 60 request-validation contracts · `test_anthropic_api.sh` **R** /v1/messages · `test_anthropic_vision.sh` image blocks
 - `test_responses_api.sh`, `test_responses_streaming.sh` /v1/responses · `test_output_config.sh` Anthropic `output_config`
-- `test_ollama_api.sh` /api/* · `test_continuation.sh` continue a partial reply · `test_timings.sh` `timings` block
+- `test_ollama_api.sh` /api/* · `test_continuation.sh` continue a partial reply · `test_timings.sh` `timings` block · `test_prefill_progress.sh` `return_progress` chunks
 - `test_models_capabilities.sh` /v1/models capabilities · `test_metrics.sh`, `test_metrics_outcomes.sh` --metrics
 - `test_index_page.sh` **H** console at GET / · `test_route_404_no_load.sh` unknown path loads nothing
 - `test_headless_spec_flags.sh` **H** headless honours spec flags, 404 before resolution
