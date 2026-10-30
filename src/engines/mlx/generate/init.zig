@@ -55,7 +55,6 @@ const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
 const intree = @import("../plugin/intree.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 
-
 pub fn initWithOptions(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -602,6 +601,8 @@ pub fn initWithOptions(
             // Publish progress once per chunk — same cadence discipline as
             // `inflight_generated_tokens` (once per decode tick), never per token.
             if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
+            // The request's own progress, in ABSOLUTE positions (`ssm_cp_offset` is the restored prefix).
+            if (options.live_progress) |p| p.pos.store(@intCast(ssm_cp_offset + pos), .monotonic);
             // Persist this chunk now: the KV bytes for [0, pos) are final.
             if (options.write_through_hook) |wt| {
                 wt.call(wt.ctx, pos + ssm_cp_offset, ssm_checkpoints.items);
