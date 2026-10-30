@@ -111,6 +111,7 @@ pub fn specObserveRound(self: *Generator, width: u32, wall_ms: f32, tokens: f32,
     self.spec_round_prev_width2 = self.spec_round_prev_width;
     self.spec_round_prev_width = width;
     if (!observe) {
+        self.xfm.round_cost.noteUnpricedRound();
         log.debug("  [spec-cost] w{d} ms={d:.2} tok={d:.0} -> unobserved\n", .{ width, wall_ms, tokens });
         return;
     }

@@ -76,6 +76,8 @@ pub const BETA: f32 = 0.10;
 /// otherwise lose trust on every trial, reopen the horizon, and cycle.
 pub const RESEED_GAP: u32 = 64;
 pub const RESEED_WEIGHT: f32 = 0.5;
+/// Serial decisions need a current measurement; speculative rounds otherwise never age the serial clock.
+pub const SERIAL_REFRESH_ROUNDS: u32 = 256;
 /// Measured widths a bucket needs before the table replaces the prior: ONE
 /// trusted width anchors the prior's shape (scale) and lets raw cells floor
 /// it — two were required first, and with w5 settled as clearly worse
@@ -87,7 +89,7 @@ pub const MIN_WIDTHS: u32 = 1;
 /// cell on the M4 base 9B, activated the table on {w2, w4} and anchored it
 /// at 2 — the plan then read w3 as a bargain and lost 6.6%).
 pub const MIN_SAMPLES: u32 = 3;
-/// Serial probes a bucket may attempt per process before it gives up.
+/// Failed serial probes per refresh interval before cooling down.
 pub const MAX_SERIAL_PROBES: u8 = 3;
 /// A width whose FIRST sample already reads this much worse per token than
 /// a trusted reference is settled as worse: the plan only needs "not
@@ -153,11 +155,17 @@ pub const Table = struct {
     /// A draft count whose verify shape has run once this process. Spec-warmup compiles MTP
     /// widths only, so the first lookup round at a count pays its kernel compile.
     lookup_compiled: [MAX_WIDTH + 1]bool = @splat(false),
-    /// Serial probes attempted per bucket this process. A count, not a flag: an interrupted
-    /// probe must not burn the bucket's only chance. Runtime only, never serialized.
+    /// Attempts in the current refresh interval; interrupted probes get bounded retries.
     serial_probes: [N_BUCKETS]u8 = @splat(0),
+    serial_probe_at: [N_BUCKETS]?u32 = @splat(null),
+    /// Speculative-round clock at the latest accepted serial sample. Restored cells start unknown.
+    serial_fresh_at: [N_BUCKETS]?u32 = @splat(null),
+    /// A stale estimate is replaced only after enough accepted samples from the new probe.
+    serial_refresh: [N_BUCKETS]Cell = @splat(.{}),
     /// Samples offered (accepted or not): the width grid's reseed clock.
     seq: u32 = 0,
+    /// Two-chunk and warmup rounds do not price a width, but still age serial evidence.
+    serial_unpriced_seq: u32 = 0,
     /// The serial row's own reseed clock: a serial tick is a token, a width sample is a round.
     serial_seq: u32 = 0,
     folded: u32 = 0,
@@ -307,11 +315,30 @@ pub const Table = struct {
             return .transition;
         }
         const bucket = self.bucketOf(kv_len);
-        if (selfSpike(self.serial[bucket], ms, self.serial_seq)) {
+        const stale = self.serial[bucket].n >= MIN_SAMPLES and self.freshSerialMsPerTok(bucket) == null;
+        const refresh = &self.serial_refresh[bucket];
+        const spike = if (stale)
+            refresh.n > 0 and ms > refresh.ms * SELF_SPIKE
+        else
+            selfSpike(self.serial[bucket], ms, self.serial_seq);
+        if (spike) {
             self.dropped_implausible += 1;
             return .implausible;
         }
         self.serial_folded += 1;
+        if (stale) {
+            // A slow first sample must not keep its weight after the machine becomes quiet.
+            if (refresh.n > 0 and ms * SELF_SPIKE < refresh.ms) refresh.* = .{};
+            _ = foldInto(refresh, ms, 1.0, self.serial_seq);
+            if (refresh.n < MIN_SAMPLES) return .folded;
+            self.serial[bucket] = refresh.*;
+            refresh.* = .{};
+            self.serial_fresh_at[bucket] = self.serialClock();
+            self.serial_probes[bucket] = 0;
+            return .reseeded;
+        }
+        self.serial_fresh_at[bucket] = self.serialClock();
+        self.serial_probes[bucket] = 0;
         return foldInto(&self.serial[bucket], ms, 1.0, self.serial_seq);
     }
 
@@ -382,13 +409,41 @@ pub const Table = struct {
         return self.serial[bucket].msPerTok();
     }
 
+    /// Historical cells remain visible, but cannot trigger a switch until refreshed.
+    pub fn freshSerialMsPerTok(self: *const Table, bucket: usize) ?f32 {
+        const ms = self.serialMsPerTok(bucket) orelse return null;
+        const at = self.serial_fresh_at[bucket] orelse return null;
+        return if (self.serialClock() -% at <= SERIAL_REFRESH_ROUNDS) ms else null;
+    }
+
+    pub fn noteUnpricedRound(self: *Table) void {
+        self.serial_unpriced_seq +%= 1;
+    }
+
+    fn serialClock(self: *const Table) u32 {
+        return self.seq +% self.serial_unpriced_seq;
+    }
+
+    pub fn armSerialProbe(self: *Table, bucket: usize) bool {
+        if (bucket >= N_BUCKETS or self.freshSerialMsPerTok(bucket) != null) return false;
+        if (self.serial_probes[bucket] >= MAX_SERIAL_PROBES) {
+            const at = self.serial_probe_at[bucket] orelse return false;
+            if (self.serialClock() -% at <= SERIAL_REFRESH_ROUNDS) return false;
+            self.serial_probes[bucket] = 0;
+        }
+        self.serial_probes[bucket] += 1;
+        self.serial_probe_at[bucket] = self.serialClock();
+        self.serial_refresh[bucket] = .{};
+        return true;
+    }
+
     /// Whether a round at `width` is measured to emit tokens cheaper than a plain
     /// step at this KV length: the width-0 cell (plain rounds) or the serial row
     /// (MTP's probe ticks); null until both sides are trusted.
     pub fn roundBeatsSerial(self: *const Table, width: u32, kv_len: u32) ?bool {
         const b = self.bucketOf(kv_len);
         const round = self.msPerTok(width, b) orelse return null;
-        const serial = self.msPerTok(0, b) orelse self.serialMsPerTok(b) orelse return null;
+        const serial = self.msPerTok(0, b) orelse self.freshSerialMsPerTok(b) orelse return null;
         return round < serial;
     }
 
@@ -1306,6 +1361,123 @@ test "round_cost: the serial row folds, trusts at MIN_SAMPLES and round-trips be
     try testing.expectEqual(@as(u8, 0), back.serial_probes[0]);
 }
 
+test "serial freshness: the drafter gate cannot fall back to a stale serial price" {
+    var table = Table{ .layout = .long };
+    const kv: u32 = 40_000;
+    for (0..MIN_SAMPLES) |_| {
+        _ = table.observe(4, kv, 50.0, 3.0, true, false);
+        _ = table.observeSerial(kv, 30.0, true, false);
+    }
+    try testing.expectEqual(@as(?bool, true), table.roundBeatsSerial(4, kv));
+    for (0..SERIAL_REFRESH_ROUNDS + 1) |_| table.noteUnpricedRound();
+    try testing.expect(table.roundBeatsSerial(4, kv) == null);
+}
+
+test "serial freshness: three consistent fresh samples can establish a slower regime" {
+    var table = Table{ .layout = .long };
+    const kv: u32 = 40_000;
+    const bucket = table.bucketOf(kv);
+    for (0..MIN_SAMPLES) |_| _ = table.observeSerial(kv, 20.0, true, false);
+    for (0..SERIAL_REFRESH_ROUNDS + 1) |_| table.noteUnpricedRound();
+    for (0..MIN_SAMPLES - 1) |_| {
+        _ = table.observeSerial(kv, 100.0, true, false);
+        try testing.expect(table.freshSerialMsPerTok(bucket) == null);
+    }
+    _ = table.observeSerial(kv, 100.0, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 100.0), table.freshSerialMsPerTok(bucket) orelse return error.TestUnexpectedResult, 0.001);
+}
+
+test "serial freshness: refreshed serial prices discard old busy-period weight" {
+    for ([_]Layout{ .legacy, .long }) |layout| {
+        var table = Table{ .layout = layout };
+        const kv: u32 = 40_000;
+        const bucket = table.bucketOf(kv);
+        for (0..100) |_| _ = table.observeSerial(kv, 60.0, true, false);
+        for (0..SERIAL_REFRESH_ROUNDS + 1) |_| _ = table.observe(2, kv, 60.0, 3.0, true, false);
+        try testing.expect(table.freshSerialMsPerTok(bucket) == null);
+        for (0..MIN_SAMPLES - 1) |_| {
+            _ = table.observeSerial(kv, 20.0, true, false);
+            try testing.expect(table.freshSerialMsPerTok(bucket) == null);
+        }
+        try testing.expectEqual(Verdict.reseeded, table.observeSerial(kv, 20.0, true, false));
+        try testing.expectApproxEqAbs(@as(f32, 20.0), table.freshSerialMsPerTok(bucket).?, 0.001);
+        try testing.expectEqual(@as(u32, MIN_SAMPLES), table.serial[bucket].n);
+    }
+}
+
+test "serial freshness: rejected samples cannot refresh or replace a price" {
+    var table = Table{ .layout = .long };
+    const kv: u32 = 40_000;
+    const bucket = table.bucketOf(kv);
+    for (0..MIN_SAMPLES) |_| _ = table.observeSerial(kv, 20.0, true, false);
+    try testing.expectEqual(Verdict.implausible, table.observeSerial(kv, 100.0, true, false));
+    try testing.expectApproxEqAbs(@as(f32, 20.0), table.freshSerialMsPerTok(bucket).?, 0.001);
+    for (0..SERIAL_REFRESH_ROUNDS + 1) |_| _ = table.observe(2, kv, 60.0, 3.0, true, false);
+    try testing.expectEqual(Verdict.contended, table.observeSerial(kv, 10.0, false, false));
+    try testing.expectEqual(Verdict.transition, table.observeSerial(kv, 10.0, true, true));
+    try testing.expectEqual(Verdict.bad_sample, table.observeSerial(kv, 0.0, true, false));
+    try testing.expect(table.freshSerialMsPerTok(bucket) == null);
+    try testing.expectEqual(@as(u32, 0), table.serial_refresh[bucket].n);
+    try testing.expectApproxEqAbs(@as(f32, 20.0), table.serialMsPerTok(bucket).?, 0.001);
+}
+
+test "serial freshness: a refresh rejects spikes and abandons an isolated slow first sample" {
+    var table = parse("rc3\ns 5 20.0 1.0 300\n", .long) orelse return error.TestUnexpectedResult;
+    const kv: u32 = 40_000;
+    _ = table.observeSerial(kv, 100.0, true, false);
+    _ = table.observeSerial(kv, 20.0, true, false);
+    try testing.expectEqual(@as(u32, 1), table.serial_refresh[5].n);
+    try testing.expectEqual(Verdict.implausible, table.observeSerial(kv, 200.0, true, false));
+    _ = table.observeSerial(kv, 20.0, true, false);
+    try testing.expect(table.freshSerialMsPerTok(5) == null);
+    _ = table.observeSerial(kv, 20.0, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 20.0), table.freshSerialMsPerTok(5).?, 0.001);
+}
+
+test "serial freshness: repeated refresh cycles remain bounded and replace the old regime" {
+    var table = parse("rc3\ns 5 60.0 1.0 300\n", .long) orelse return error.TestUnexpectedResult;
+    const kv: u32 = 40_000;
+    for (0..6) |cycle| {
+        for (0..SERIAL_REFRESH_ROUNDS + 1) |_| table.noteUnpricedRound();
+        try testing.expect(table.armSerialProbe(5));
+        const price: f32 = if (cycle % 2 == 0) 20.0 else 60.0;
+        for (0..MIN_SAMPLES) |_| _ = table.observeSerial(kv, price, true, false);
+        try testing.expectApproxEqAbs(price, table.freshSerialMsPerTok(5).?, 0.001);
+        try testing.expectEqual(@as(u8, 0), table.serial_probes[5]);
+        for (0..100) |_| try testing.expect(!table.armSerialProbe(5));
+    }
+}
+
+test "serial freshness: unpriced rounds age serial evidence without teaching width costs" {
+    var table = Table{ .layout = .long };
+    const kv: u32 = 40_000;
+    const bucket = table.bucketOf(kv);
+    for (0..MIN_SAMPLES) |_| _ = table.observeSerial(kv, 20.0, true, false);
+    for (0..SERIAL_REFRESH_ROUNDS + 1) |_| table.noteUnpricedRound();
+    try testing.expect(table.freshSerialMsPerTok(bucket) == null);
+    try testing.expectEqual(@as(u32, 0), table.seq);
+    try testing.expectEqual(@as(u32, 0), table.foldedCells());
+    try testing.expect(table.armSerialProbe(bucket));
+}
+
+test "serial freshness: freshness survives clock wrap and is not renewed by persistence" {
+    var table = Table{ .layout = .long };
+    const kv: u32 = 40_000;
+    const bucket = table.bucketOf(kv);
+    table.seq = std.math.maxInt(u32) - 10;
+    for (0..MIN_SAMPLES) |_| _ = table.observeSerial(kv, 20.0, true, false);
+    for (0..SERIAL_REFRESH_ROUNDS) |_| _ = table.observe(2, kv, 60.0, 3.0, true, false);
+    try testing.expect(table.freshSerialMsPerTok(bucket) != null);
+    _ = table.observe(2, kv, 60.0, 3.0, true, false);
+    try testing.expect(table.freshSerialMsPerTok(bucket) == null);
+    var bytes: [2048]u8 = undefined;
+    var restored = parse(try serialize(&bytes, &table), .long) orelse return error.TestUnexpectedResult;
+    try testing.expect(restored.freshSerialMsPerTok(bucket) == null);
+    try testing.expect(restored.armSerialProbe(bucket));
+    for (0..MIN_SAMPLES) |_| _ = restored.observeSerial(kv, 25.0, true, false);
+    try testing.expectApproxEqAbs(@as(f32, 25.0), restored.freshSerialMsPerTok(bucket).?, 0.001);
+}
+
 test "round_cost: the serial row and the width grid keep SEPARATE reseed clocks" {
     var t = Table{};
     feed(&t, 3, 1000, 30.0, 3.0);
@@ -1320,7 +1492,7 @@ test "round_cost: the serial row and the width grid keep SEPARATE reseed clocks"
     while (i < MIN_SAMPLES) : (i += 1) _ = u.observeSerial(1000, 16.0, true, false);
     const ser = u.serialMsPerTok(0).?;
     var j: u32 = 0;
-    while (j <= RESEED_GAP * 4) : (j += 1) _ = u.observe(3, 1000, 30.0, 3.0, true, false);
+    while (j <= RESEED_GAP) : (j += 1) _ = u.observe(3, 1000, 30.0, 3.0, true, false);
     _ = u.observeSerial(1000, 20.0, true, false);
     try testing.expectApproxEqAbs(ser + BETA * (20.0 - ser), u.serialMsPerTok(0).?, 1e-3);
 }
