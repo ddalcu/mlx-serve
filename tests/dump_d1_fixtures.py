@@ -1,4 +1,4 @@
-"""Dump LiquidAI D1 reference fixtures from the card's own package (ground truth for src/d1.zig).
+"""Dump LiquidAI D1 reference fixtures from the card's own package (ground truth for src/plugins/d1/d1.zig).
 
   python -I tests/dump_d1_fixtures.py ~/.mlx-serve/models/LiquidAI/d1-3B
 

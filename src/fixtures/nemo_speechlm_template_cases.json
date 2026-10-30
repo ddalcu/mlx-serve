@@ -1,0 +1,398 @@
+[
+ {
+  "label": "audio then text, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "Transcribe it."
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nTranscribe it. <|audio|><|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "audio only, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio|><|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "two audios, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "Compare these."
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nCompare these. <|audio|> <|audio|><|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "text only list, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "hello"
+     },
+     {
+      "type": "text",
+      "text": "world"
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhello\nworld<|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "plain string, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi there"
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "locator in text, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "What is this? <|audio|>"
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is this? <|audio|><|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "system and audio, thinking off",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "Summarize."
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nSummarize. <|audio|><|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "vllm front locator, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "<|audio|>\nTranscribe."
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nTranscribe. <|audio|><|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "history, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q1"
+   },
+   {
+    "role": "assistant",
+    "content": "a1",
+    "reasoning_content": "because"
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "q2"
+     }
+    ]
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think></think>a1<|im_end|>\n<|im_start|>user\nq2 <|audio|><|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "tool round trip, thinking off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "weather?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": {
+        "x": 1
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "sunny"
+   }
+  ],
+  "thinking": false,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "label": "audio then text, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "Transcribe it."
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nTranscribe it. <|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "audio only, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n<|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "two audios, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "Compare these."
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nCompare these. <|audio|> <|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "text only list, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "hello"
+     },
+     {
+      "type": "text",
+      "text": "world"
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhello\nworld<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "plain string, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": "hi there"
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nhi there<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "locator in text, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "What is this? <|audio|>"
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nWhat is this? <|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "system and audio, thinking on",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "Summarize."
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nSummarize. <|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "vllm front locator, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": "<|audio|>\nTranscribe."
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nTranscribe. <|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "history, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q1"
+   },
+   {
+    "role": "assistant",
+    "content": "a1",
+    "reasoning_content": "because"
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "audio"
+     },
+     {
+      "type": "text",
+      "text": "q2"
+     }
+    ]
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nq1<|im_end|>\n<|im_start|>assistant\n<think></think>a1<|im_end|>\n<|im_start|>user\nq2 <|audio|><|im_end|>\n<|im_start|>assistant\n<think>\n"
+ },
+ {
+  "label": "tool round trip, thinking on",
+  "messages": [
+   {
+    "role": "user",
+    "content": "weather?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "f",
+       "arguments": {
+        "x": 1
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "sunny"
+   }
+  ],
+  "thinking": true,
+  "expected": "<|im_start|>system\n<|im_end|>\n<|im_start|>user\nweather?<|im_end|>\n<|im_start|>assistant\n<think></think>\n<tool_call>\n<function=f>\n<parameter=x>\n1\n</parameter>\n</function>\n</tool_call>\n<|im_end|>\n<|im_start|>user\n<tool_response>\nsunny\n</tool_response>\n<|im_end|>\n<|im_start|>assistant\n<think>\n"
+ }
+]

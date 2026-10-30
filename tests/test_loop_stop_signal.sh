@@ -1,31 +1,17 @@
 #!/bin/bash
-# The degenerate-tail guard's WIRE contract, on every surface that can emit it.
+# test_loop_stop_signal.sh — the degenerate-tail guard's WIRE contract on every surface that can emit it: a loop cut
+# reports `finish_reason: "stop"` (never "length": agents compacted on it) with `finish_details:{"type":
+# "repetition_loop"}` beside it, on chat and completions, stream and non-stream; tool-call parsing is suppressed for
+# that cause. [1/5] a non-streaming body is TRIMMED to the span start (an agent resends the cut turn and resumes its
+# own loop); with thinking on the same holds for reasoning_content. Streaming keeps the tail (a delta cannot be
+# retracted).
 #
-# Live 2026-08-05 (under pi): five loop-stops in a row, each
-# firing sooner than the last, surfaced to the user as "Model stopped because
-# it reached the maximum output token limit" while the session's own status
-# bar read 32.4%/66k. The mismatch came from `finish_reason: "length"`: pi
-# treated the loop guard as context/output exhaustion and compacted at 18% of
-# a 256k window. A loop guard now reports "stop" and carries the specific cause
-# beside it as `finish_details`. Tool-call parsing is suppressed for that cause
-# so a cut fragment cannot become an executable `tool_calls` response.
+#   LOOP_TEST_MODEL=<small chat model> ./tests/test_loop_stop_signal.sh [port]   # SKIPs without one
 #
-# Two things are asserted, because either alone can silently regress:
-#   1. the SIGNAL — `finish_details.type == "repetition_loop"` on chat
-#      (stream + non-stream) and completions (stream + non-stream). A missing
-#      field is invisible to any output-equality test.
-#   2. the TRIM — a non-streaming response must NOT carry the degenerate tail
-#      back to the client. An agent re-sends the cut turn as history, the
-#      model reads its own loop and resumes it; that is the death spiral.
-#      Streaming deliberately keeps the tail: a delta cannot be retracted.
-#
-# Needs any chat model — the prompt loops on all of them. Point LOOP_TEST_MODEL
-# at a small one to keep this cheap.
-#
-# Usage: LOOP_TEST_MODEL=~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit \
-#          ./tests/test_loop_stop_signal.sh [port]
+# Hermetic twins: degenerateTail, loopStopDecision, shouldParseToolCalls, finishDetailsField, loopTrimmedIds.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11266}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -60,11 +46,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 0.5
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --log-file off --log-level info > "$LOG" 2>&1 &
 SRV=$!
-for _ in $(seq 1 240); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 1
-    kill -0 "$SRV" 2>/dev/null || break
-done
+srv_wait_health "http://127.0.0.1:$PORT" 240 1 "$SRV" || true
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || {
     echo "[fail] server did not come up"; tail -20 "$LOG"; exit 1
 }
@@ -77,7 +59,7 @@ LOOP_PROMPT="Output the exact line 'ping pong ping pong' over and over, hundreds
 echo "Loop-stop wire contract on $MODEL_ID (port $PORT)"
 
 # ── 1. chat, non-streaming: signal AND trim ──────────────────────────────
-echo "[1/6] /v1/chat/completions non-streaming"
+echo "[1/5] /v1/chat/completions non-streaming"
 BODY=$(curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,\"enable_thinking\":false}")
 echo "$BODY" | python3 -c '
@@ -128,7 +110,7 @@ grep -q "^verdict trimmed$" "$LOG.trimthink"; check "thinking on: reasoning + co
 # every per-event client rendered the ending twice — PR #147's doubled
 # truncation banner. Three assertions: the signal is present, it appears on
 # EXACTLY one chunk, and the usage chunk carries an empty choices array.
-echo "[2/6] /v1/chat/completions streaming"
+echo "[2/5] /v1/chat/completions streaming"
 curl -sN "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,\"enable_thinking\":false,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
   > "$LOG.rawstream"
@@ -154,7 +136,7 @@ grep -q "^finish_chunks 1$" "$LOG.usage"; check "finish_reason appears on exactl
 grep -q "^usage_choices_empty True$" "$LOG.usage"; check "the usage chunk ships \"choices\":[]" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 # ── 3. completions, non-streaming ────────────────────────────────────────
-echo "[3/6] /v1/completions non-streaming"
+echo "[3/5] /v1/completions non-streaming"
 CMPL=$(curl -s "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"ping pong ping pong ping pong ping pong ping pong ping pong\",\"max_tokens\":3000,\"temperature\":0}")
 echo "$CMPL" | grep -c '"finish_details":{"type":"repetition_loop"}' > "$LOG.cmpl"
@@ -164,7 +146,7 @@ echo "$CMPL" | grep -q '"finish_reason":"stop"'; check "completions finish_reaso
 # ── 4. completions, streaming ────────────────────────────────────────────
 # Same usage-chunk contract as chat: with include_usage the usage rides its
 # own empty-choices chunk, never the finish chunk.
-echo "[4/6] /v1/completions streaming"
+echo "[4/5] /v1/completions streaming"
 curl -sN "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"ping pong ping pong ping pong ping pong ping pong ping pong\",\"max_tokens\":3000,\"temperature\":0,\"stream\":true,\"stream_options\":{\"include_usage\":true}}" \
   > "$LOG.rawcmpl"
@@ -189,37 +171,11 @@ grep -q "^usage_choices_empty True$" "$LOG.cmplusage"; check "the completions us
 grep -q "^finish_reason stop$" "$LOG.cmplusage"; check "streaming completions finish_reason is \"stop\"" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 # ── 5. an ORDINARY response must be byte-unchanged ───────────────────────
-echo "[5/6] a normal answer says nothing new"
+echo "[5/5] a normal answer says nothing new"
 curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in five words.\"}],\"max_tokens\":50,\"temperature\":0,\"enable_thinking\":false}" \
   | grep -c 'finish_details' > "$LOG.clean"
 [ "$(cat "$LOG.clean")" -eq 0 ]; check "no finish_details on a response that finished normally" "$([ $? -eq 0 ] && echo 1 || echo 0)"
-
-# ── 6. the trim's own kill switch, which is also red-on-revert ───────────
-# Without this the trim assertion above could pass because the model happened
-# to be terse. Same server, same prompt, trim disabled: the loop must come
-# back. Needs its own boot — the switch is read server-side, once.
-echo "[6/6] MLX_SERVE_LOOP_TRIM=0 restores the untrimmed body"
-kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null
-sleep 1
-MLX_SERVE_LOOP_TRIM=0 "$BINARY" --model "$MODEL" --serve --port "$PORT" --log-file off > "$LOG.off" 2>&1 &
-SRV=$!
-for _ in $(seq 1 240); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 1
-    kill -0 "$SRV" 2>/dev/null || break
-done
-OFF=$(curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
-  -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,\"enable_thinking\":false}")
-python3 - "$OFF" <<'PY' > "$LOG.off2"
-import json,sys,re
-c = json.loads(sys.argv[1])["choices"][0]["message"].get("content") or ""
-reps = len(re.findall(r"ping pong", c))
-print("reps", reps)
-print("verdict", "carries the loop" if reps > 4 else "trimmed anyway")
-PY
-grep -q "^verdict carries the loop$" "$LOG.off2"
-check "trim off = the loop is still in the body ($(grep '^reps' "$LOG.off2"))" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 
 kill "$SRV" 2>/dev/null
 rm -f "$LOG".* 2>/dev/null

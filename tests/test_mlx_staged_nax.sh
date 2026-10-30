@@ -1,25 +1,12 @@
 #!/bin/bash
-# test_mlx_staged_nax.sh — static guard for the self-built, NAX-enabled MLX runtime.
+# test_mlx_staged_nax.sh — static guard for the self-built, NAX-enabled mlx + mlx-c (scripts/build-mlx.sh from the
+# pinned submodules at deployment target 26.2; the Homebrew bottle ships NAX off): the staged dylibs + metallib +
+# .version stamp exist, the metallib contains `*_nax` kernels (MLX's CMake gate fails SILENTLY below 26.2),
+# libmlx.dylib minos >= 26.2, libmlxc.dylib links the staged mlx, a built zig-out/bin/mlx-serve links no Homebrew
+# mlx/mlx-c, and when it loads @rpath/libmlx.dylib itself (the mlx-stream shims) its rpaths reach libmlx in the
+# app's Frameworks/ and the CLI zip's lib/.
 #
-# mlx-serve pins mlx + mlx-c as git submodules and builds them via
-# scripts/build-mlx.sh with CMAKE_OSX_DEPLOYMENT_TARGET=26.2 so MLX's NAX
-# (M5 neural-accelerator) kernels are compiled in — the Homebrew bottle is
-# built at deployment target 26.0 and silently ships with MLX_METAL_NO_NAX
-# (is_nax_available() hard-wired false, even on M5 hardware).
-#
-# Verifies, without running any GPU code:
-#   1. the staged runtime exists: lib/mlx/lib/{libmlx.dylib,libmlxc.dylib,mlx.metallib}
-#   2. the metallib actually contains *_nax kernels (the whole point — the
-#      CMake gate fails SILENTLY when the SDK/deployment target < 26.2)
-#   3. libmlx.dylib's minos (LC_BUILD_VERSION) is >= 26.2, proving the
-#      deployment target that unlocks the gate
-#   4. libmlxc.dylib links the staged libmlx, not /opt/homebrew's bottle
-#   5. the .version stamp exists (build-mlx.sh provenance)
-#   6. if zig-out/bin/mlx-serve is built: it links no Homebrew mlx/mlx-c
-#   7. ... and when it loads @rpath/libmlx.dylib itself (the mlx-stream shims), its own rpaths reach libmlx in both
-#      shipped layouts, so the packaging scripts need not rewire it
-#
-# Usage: ./tests/test_mlx_staged_nax.sh
+#   ./tests/test_mlx_staged_nax.sh   # hermetic: no GPU, no server
 
 set -u
 cd "$(dirname "$0")/.." || exit 1

@@ -45,6 +45,9 @@ enum ActiveAgentVoice {
                 if !path.trimmingCharacters(in: .whitespaces).isEmpty {
                     return .clone(clipPath: path)
                 }
+            case .lfm3(let v):
+                let name = v.trimmingCharacters(in: .whitespaces)
+                if !name.isEmpty { return .lfm3(voice: name) }
             }
         }
         switch options.voiceEngine {
@@ -55,6 +58,9 @@ enum ActiveAgentVoice {
             return .kokoro(voice: v.isEmpty ? "af_heart" : v)
         case .clone:
             return options.voiceClonePath.isEmpty ? nil : .clone(clipPath: options.voiceClonePath)
+        case .lfm3:
+            let v = options.lfm3Voice.trimmingCharacters(in: .whitespaces)
+            return .lfm3(voice: v.isEmpty ? "american-english-female" : v)
         }
     }
 

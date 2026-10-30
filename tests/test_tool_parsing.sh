@@ -8,6 +8,7 @@
 # Usage: ./tests/test_tool_parsing.sh [model_dir] [port]
 # Starts its own server, runs tests, kills it.
 
+source "$(dirname "$0")/lib/server.sh"
 MODEL_DIR=${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}
 PORT=${2:-8097}
 BASE="http://127.0.0.1:$PORT"
@@ -70,11 +71,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for i in $(seq 1 30); do
-    if curl -sf "$BASE/health" > /dev/null 2>&1; then break; fi
-    if [ $i -eq 30 ]; then echo "FAIL: Server did not start"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || { echo "FAIL: Server did not start"; exit 1; }
 echo -e "${GREEN}Server ready${NC}"
 echo ""
 

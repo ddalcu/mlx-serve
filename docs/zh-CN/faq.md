@@ -38,7 +38,7 @@
 
 ## 支持哪些模型？
 
-原生 MLX 调度支持 Gemma 3/4、DiffusionGemma、Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next、Meta 的 Muse-Glimmer-30B、inclusionAI Ling 3.0、腾讯混元 3（295B）、Thinking Machines Inkling Small（276B）、poolside Laguna S 2.1、Llama 3.x、Mistral、Nemotron-H、LFM2.5（包括 VL 视觉版本）以及 DeepSeek V4 Flash。其他一切都可以作为 GGUF 通过内置的 llama.cpp 运行 —— Qwen、Llama、Mistral、Gemma、DeepSeek、Phi、Yi 以及 HuggingFace 上可用的数千个模型。完整表格：[models.md](models.md)。
+原生 MLX 调度支持 Gemma 3/4、Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next、Meta 的 Muse-Glimmer-30B、inclusionAI Ling 3.0、腾讯混元 3（295B）、Thinking Machines Inkling Small（276B）、poolside Laguna S 2.1、Llama 3.x、Mistral、Nemotron-H、LFM2.5（包括 VL 视觉版本）以及 DeepSeek V4 Flash。其他一切都可以作为 GGUF 通过内置的 llama.cpp 运行 —— Qwen、Llama、Mistral、Gemma、DeepSeek、Phi、Yi 以及 HuggingFace 上可用的数千个模型。完整表格：[models.md](models.md)。
 
 ## mlx-serve 能在本地运行腾讯混元 3（295B）吗？
 

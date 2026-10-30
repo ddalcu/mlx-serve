@@ -5,7 +5,7 @@ import XCTest
 /// per-session bootstrap script, and the preflight gates. All pure — no VM.
 final class SandboxAgentRegistryTests: XCTestCase {
 
-    private let budget = AgentBudget.Budget(context: 65536, output: 16384)
+    private let budget = AgentBudget.Budget(context: 65536, output: 16384, compactionReserve: 16384)
 
     // MARK: registry shape
 
@@ -139,8 +139,8 @@ final class SandboxAgentRegistryTests: XCTestCase {
 
     func testHermesConfigFilesCarryTheModelListEntries() {
         let entries = [
-            AgentModelEntry(id: "qwen3.6-27b", budget: AgentBudget.forServerContext(94729), vision: false),
-            AgentModelEntry(id: "small-gguf", budget: AgentBudget.forServerContext(32768), vision: false),
+            AgentModelEntry(id: "qwen3.6-27b", budget: AgentBudget.Budget(context: 94729, output: 47364, compactionReserve: 20000), vision: false),
+            AgentModelEntry(id: "small-gguf", budget: AgentBudget.Budget(context: 32768, output: 16384, compactionReserve: 8192), vision: false),
         ]
         let files = SandboxAgentRegistry.hermes.configFiles("qwen3.6-27b", 11234, budget, nil, entries)
         let yaml = files[0].content

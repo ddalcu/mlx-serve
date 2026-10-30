@@ -1,0 +1,74 @@
+{
+ "model_type": "lfm3_vl",
+ "downsample_factor": 2,
+ "projector_hidden_size": 48,
+ "projector_hidden_act": "gelu",
+ "projector_bias": true,
+ "projector_layer_norm_eps": 1e-06,
+ "image_token_id": 120,
+ "video_token_id": 121,
+ "vision_start_token_id": 122,
+ "vision_end_token_id": 123,
+ "eos_token_id": 2,
+ "vision_config": {
+  "model_type": "lfm3_vl_vision",
+  "hidden_size": 32,
+  "intermediate_size": 48,
+  "num_hidden_layers": 3,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 1,
+  "in_channels": 3,
+  "patch_size": 4,
+  "temporal_patch_size": 2,
+  "spatial_merge_size": 2,
+  "conv_kernel_size": 3,
+  "norm_eps": 1e-05,
+  "layer_types": [
+   "conv",
+   "full_attention",
+   "conv"
+  ],
+  "rope_parameters": {
+   "rope_type": "axial",
+   "rope_theta": 100.0
+  }
+ },
+ "text_config": {
+  "model_type": "lfm3",
+  "vocab_size": 128,
+  "hidden_size": 32,
+  "intermediate_size": 48,
+  "num_hidden_layers": 5,
+  "num_attention_heads": 2,
+  "num_key_value_heads": 1,
+  "head_dim": 16,
+  "norm_eps": 1e-05,
+  "conv_L_cache": 7,
+  "conv_bias": false,
+  "layer_types": [
+   "conv",
+   "full_attention",
+   "sliding_attention",
+   "conv",
+   "full_attention"
+  ],
+  "rope_parameters": {
+   "full_attention": {
+    "rope_theta": 10.0,
+    "partial_rotary_factor": 0.5,
+    "rope_type": "default"
+   },
+   "sliding_attention": {
+    "rope_theta": 100.0,
+    "rope_type": "default"
+   }
+  },
+  "sliding_window": 4,
+  "use_sandwich_norm": true,
+  "tie_word_embeddings": true,
+  "max_position_embeddings": 4096,
+  "bos_token_id": 1,
+  "eos_token_id": 2,
+  "dtype": "float32"
+ }
+}

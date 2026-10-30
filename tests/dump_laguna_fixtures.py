@@ -8,7 +8,7 @@ config and dump per-module oracles the Zig engine is checked against:
 
   * yarn.inv_freq / yarn.freqs  — the full-attention YaRN rotary frequencies
     (mlx_fast_rope consumes `freqs`; angle = pos/freqs). Pinned in Zig by
-    `computeYarnFreqs` under LAGUNA_FIXTURES (src/transformer.zig).
+    `computeYarnFreqs` under LAGUNA_FIXTURES (src/engines/mlx/transformer.zig).
   * attn_full / attn_sliding    — one LagunaAttention block I/O (softplus gate,
     per-layer heads, YaRN vs default rope, sliding window).
   * router                      — sigmoid + e_score_correction_bias top-k select

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Oracle for src/pixal3d.zig and src/naf.zig: TencentARC's Pixal3D reference modules (its TRELLIS.2
+"""Oracle for src/plugins/pixal3d/pixal3d.zig and src/plugins/pixal3d/naf.zig: TencentARC's Pixal3D reference modules (its TRELLIS.2
 backbone with pixel-aligned projection conditioning) and valeoai's NAF upsampler, run in fp32 on the CPU.
 
 The reference needs CUDA for natten (NAF's neighbourhood attention), FlexGEMM, CuMesh and o_voxel; none

@@ -2,7 +2,7 @@ import Foundation
 
 /// `~/.mlx-serve/lan-keys.json`: the API key each LAN peer running with
 /// `--api-key` requires, by peer name. The SERVER reads it on every discovery
-/// fetch and proxied request (`src/lan.zig`), so a save applies with no restart.
+/// fetch and proxied request (`src/host/lan/lan.zig`), so a save applies with no restart.
 enum LanPeerKeys {
     static let defaultPath = NSString(string: "~/.mlx-serve/lan-keys.json").expandingTildeInPath
 

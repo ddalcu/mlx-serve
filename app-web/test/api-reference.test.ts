@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import { apiReference } from "../src/lib/core/console";
 
 // The routes the server answers, read out of the Zig source: the reference below must not drift from them.
-const zig = readFileSync(`${import.meta.dirname}/../../src/server.zig`, "utf8");
+const zig = readFileSync(`${import.meta.dirname}/../../src/host/http/router.zig`, "utf8");
 const block = /const ROUTE_PATHS = \[_\]\[\]const u8\{([^}]*)\};/s.exec(zig)?.[1] ?? "";
 const routes = [...block.matchAll(/"([^"]+)"/g)].map((m) => m[1]!);
 const documented = new Set(apiReference.map((r) => r.path));

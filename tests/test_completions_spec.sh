@@ -1,22 +1,12 @@
 #!/bin/bash
-# /v1/completions speculative-decode test.
+# test_completions_spec.sh — speculative decoding on /v1/completions (FIM / code completion): enable_pld engages PLD
+# and enable_drafter the drafter (`[spec-stats] mode=...`), each byte-identical to a no-spec temp-0 baseline, stream
+# and non-stream agree on the leading space. The drafter arm SKIPs without a drafter checkpoint.
 #
-# The legacy text-completions endpoint is the surface FIM / code-completion
-# clients use, with prompts full of repetitive code — prime PLD territory.
-# Both completions handlers used to hardcode enable_pld/enable_drafter=false
-# at slot submit, so --pld/--drafter silently never applied there (same
-# day-one-gate pattern as the tools blanket disable).
-#
-# Asserts:
-#   1. non-stream + stream /v1/completions with enable_pld:true engage PLD
-#      ("[spec-stats] mode=pld") and produce byte-identical text to a no-PLD
-#      baseline at temp=0
-#   2. enable_drafter:true engages the drafter ("[spec-stats] mode=drafter")
-#      with byte-identical text (skipped if no drafter checkpoint)
-#
-# Usage: ./tests/test_completions_spec.sh [port]
+#   ./tests/test_completions_spec.sh [port]   # starts its own servers
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8095}
 BASE="http://127.0.0.1:$PORT"
@@ -82,10 +72,7 @@ start_server() {
     local logfile="$1"; shift
     "$BINARY" --model "$MODEL" --serve --port "$PORT" "$@" > "$logfile" 2>&1 &
     SERVER_PID=$!
-    for i in $(seq 1 90); do
-        curl -s -f "$BASE/health" > /dev/null 2>&1 && return 0
-        sleep 1
-    done
+    srv_wait_health "$BASE" 90 1 && return 0
     echo -e "${RED}FAIL${NC} server did not become healthy"; tail -5 "$logfile"; return 1
 }
 stop_server() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; }

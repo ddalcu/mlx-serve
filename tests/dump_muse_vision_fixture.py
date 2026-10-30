@@ -3,7 +3,7 @@
 
 Runs `transformers.models.muse_glimmer`'s own vision half (tower + adapter +
 projection + the weight-less perception norm) on OUR checkpoint's weights and
-saves every stage src/muse_vision.zig has to reproduce. The tower's output is
+saves every stage src/plugins/muse_glimmer/vision.zig has to reproduce. The tower's output is
 spliced straight into the LM sequence, so a wrong window order, rotary axis or
 pixel-shuffle interleave produces conditioning that is silently WRONG rather
 than absent.

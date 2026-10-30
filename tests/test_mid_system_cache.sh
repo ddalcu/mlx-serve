@@ -1,5 +1,13 @@
 #!/bin/bash
-# Late system notes preserve the conversation prefix across tool rounds and restart.
+# test_mid_system_cache.sh — late system notes keep the conversation prefix reusable across Anthropic tool rounds, a
+# new user turn and a restart; streaming and non-streaming, native-template and cached-token guards. Isolated HOME;
+# RAM+SSD by default, MID_SYSTEM_CACHE_ENTRIES=0 adds the SSD-only mode.
+#
+#   bash tests/test_mid_system_cache.sh <model_dir> [port]
+#
+# Hermetic: the `mid-system:` and cross-family late-note corpus tests; a downloaded pack through loadChatConfig with
+# `QWEN_MID_SYSTEM_MODEL_DIR=<pack> zig build test -Doptimize=ReleaseFast -Dtest-filter="mid-system: real Qwen pack"`.
+
 set -euo pipefail
 MODEL="${1:?Usage: test_mid_system_cache.sh <model_dir> [port]}"
 PORT="${2:-11368}"

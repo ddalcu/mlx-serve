@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
-# Kokoro TTS end-to-end over HTTP.
+# test_kokoro_tts.sh — Kokoro TTS end to end: discovery, load by path, WAV validity (RIFF, non-silent, bounded),
+# distinct voices and a comma-separated BLEND that is not an alias of its first voice, speed scaling the duration, the
+# named 400s (ref_audio on a non-cloning backend, unknown voice, one bad voice in a blend, speed out of range, empty
+# input, music and chat endpoints), SSE, and text normalization reaching the audio (the vocab has no digits, so an
+# unexpanded "42" is silently DROPPED: the test compares durations with and without the number).
 #
-#   KOKORO_MODEL=<dir> ./tests/test_kokoro_tts.sh [port]
+#   KOKORO_MODEL=<dir> ./tests/test_kokoro_tts.sh [port]   # SKIPs without tests/convert_kokoro_weights.py output
 #
-# SKIPs without a converted checkpoint (tests/convert_kokoro_weights.py).
-# Hermetic counterparts: the ~30 unit tests in src/kokoro.zig + src/kokoro_g2p.zig,
-# and the KOKORO_FIXTURES parity oracles (durations exact, f0/n/asr cos 1.000000,
-# audio cos 0.9968 vs a reference self-similarity floor of 0.9941-0.9960).
+# Build each JSON body into a variable first: `check "l" "$(status "{\"a\":1}")" "400"` mis-splits in bash.
+# Hermetic twins: src/plugins/kokoro/{kokoro,g2p}.zig; parity via KOKORO_FIXTURES (tests/dump_kokoro_fixtures.py).
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11439}"
 source "$(dirname "$0")/_lib_models.sh"
@@ -48,7 +52,7 @@ ROOT="$(dirname "$(dirname "$MODEL")")"
 [ -d "$ROOT" ] || ROOT="$HOME/.mlx-serve/models"
 "$BIN" --serve --port "$PORT" --model-dir "$ROOT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
-for _ in $(seq 1 40); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 0.5; done
+srv_wait_health "localhost:$PORT" 40 0.5 || true
 
 ID="$(curl -s "localhost:$PORT/v1/models" | python3 -c "
 import sys,json

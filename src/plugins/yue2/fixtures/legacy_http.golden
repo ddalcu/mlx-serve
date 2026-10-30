@@ -1,0 +1,101 @@
+== speech 0 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== speech 1 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== speech 2 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== speech 3 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== speech 4 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== music 0 958627 953531b7e93c11b3f0e6bd90d9ea0be3825f2743dd5cdd17ca3620ec211680b5
+== music 1 1278898 1d68d199537e4e5ce0e63a91c9f07f587ed9a825a32ca191bbb3d2b4b5d8b1cd
+== music 2 1289267 5c21e4b72a04ffece7fe5a7ee40dae29c84d74f691934752b802040c213f0a40
+== music 3 211 29d58b3d05ca0eab66879cd1fa8d71c4e479a252ff5affb903a7b0d073f9f1ec
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 86
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"missing 'prompt' (style tags: genre, instruments, mood, vocal)"}}
+== music 4 273 e671c0798999b7215164d9bc67fb69c981abea96d57b6a5e1861b4f839342cb7
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 147
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"'bpm' is not supported by YuE2 (style and lyrics go in 'prompt' and 'lyrics'; a cover needs your own melody score in 'abc')"}}
+== sound 0 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== sound 1 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== sound 2 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== sound 3 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== sound 4 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 97
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
+== row 687 659e22dcb9b770a2f405bc06615f30cbdedb9792efd8ef136b91e93b03e97b13
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["audio","music"],"input_modalities":["text"],"modality":"music","engines":["mlx"],"meta":{"architecture":"yue2","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

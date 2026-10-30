@@ -144,7 +144,7 @@ def main():
     # HF's construction (Qwen3-Next-style rotary): emb = cat(freqs, freqs) with
     # cos/sin multiplied by attention_factor. For TEXT positions t==h==w, so the
     # interleaved 3-D selection collapses onto one scalar position — the exact
-    # property mlx-serve's mrope.zig relies on.
+    # property mlx-serve's sdk/vision/mrope.zig relies on.
     #
     # The rows are built from the float64 spectrum on purpose. HF and vLLM both
     # compute inv_freq in float32 and then multiply it by the position, so at a

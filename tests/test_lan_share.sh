@@ -1,27 +1,16 @@
 #!/bin/bash
-# LAN model sharing (src/lan.zig): two servers on ONE machine.
+# test_lan_share.sh — LAN sharing with two servers on one machine: A `--model <dir> --lan-share all --lan-discover`,
+# B headless `--lan-discover`.
 #
-#   A  --model <dir> --lan-share all --lan-name lantest-a --lan-discover
-#   B  headless (--model-dir <empty>) --lan-discover
+#   ./tests/test_lan_share.sh [/path/to/model] [portA]
 #
-#   1. B discovers A over Bonjour: /v1/models on B gains `<id>@lantest-a`.
-#   2. Chat through B naming the remote id → proxied to A, real completion
-#      back (non-stream + SSE stream with [DONE]).
-#   3. /v1/load-model + /v1/unload-model on B with the remote id → 200 no-ops.
-#   4. Share gate on A via the machine's LAN IP (non-loopback): /metrics,
-#      GET /, /v1/load-model are 403 host-local, while the same requests
-#      from loopback keep today's behavior. `@peer` ids from a DIRECT
-#      non-loopback client are ALLOWED to proxy one hop (the agent-sandbox
-#      guest reaches the host over the VM NAT interface — live 2026-07-21);
-#      a request carrying the tunnel marker (X-MLX-LAN) never hops again.
-#   5. Self-detection: A (also discovering) never lists its own shared
-#      models as remote entries.
-#
-# SKIPs cleanly when the model dir is missing or the Mac has no non-loopback
-# IP (discovery + gate need a routable interface).
-#
-# Usage: ./tests/test_lan_share.sh [/path/to/model] [portA]
+# Checks: B lists `<id>@lantest-a` with the `lan_peer` badge; chat through B is proxied (non-stream and SSE [DONE],
+# `[lan] proxy` line); load/unload of a remote id are 200 no-ops; A's gate via the LAN IP 403s metrics, GET /,
+# load-model while /health and the filtered /v1/models stay open and loopback is untouched; a direct non-loopback
+# `@peer` request hops once, a tunneled one never again; A never lists itself. SKIPs without the model or a
+# non-loopback IP. Hermetic twins: host/lan/lan.zig (incl. the tunnel pump against a fake peer) and `lanShareDenial`.
 
+source "$(dirname "$0")/lib/server.sh"
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT_A="${2:-11311}"
 PORT_B=$((PORT_A + 1))
@@ -69,10 +58,7 @@ check() { # <desc> <cond-exit-code>
 }
 
 wait_health() { # <port>
-    for _ in $(seq 1 120); do
-        curl -s -m 2 "http://127.0.0.1:$1/health" | grep -q '"ok"' && return 0
-        sleep 1
-    done
+    srv_wait_health "http://127.0.0.1:$1" 120 1 && return 0
     return 1
 }
 

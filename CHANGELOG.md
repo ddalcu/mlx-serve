@@ -1,5 +1,17 @@
 # Changelog
 
+## v26.11.1 — Outside Plugins
+
+- **TensorFold Flash-Next packs.** The embedded PLE loader accepts affine `shard_N` tensor names alongside `shards.N`, without repacking or downloading additional weights.
+- **Model plugins you can build and install.** `mlx-serve plugin new` starts a model or media plugin from the plugin kit, `plugin check` tests it, and `plugin install` adds it after showing its signature; Settings lists installed plugins with a switch each.
+- **Outside plugins can draft and see.** A plugin can run its own speculative drafter (greedy or sampled requests), serve images through its own vision tower, and read the model's `ctx_size` to size its memory.
+- **NVIDIA Nemotron 3.5 Transcribe.** Speech to text in 40 languages, translation, speaker-tagged transcripts, word timestamps with `srt`, `vtt` and `diarized_json` (its own CTC head and speaker model, no aligner or diarizer download), faster decoding from its MTP head, and questions about a recording, on `/v1/audio/transcriptions` and as audio in chat; Settings ▸ Voice can use it for dictation and meeting transcripts. Convert NVIDIA's checkpoint with `scripts/convert_nemotron_transcribe.py`.
+- **DiffusionGemma is no longer supported.**
+- **Codex prompts that fit a local model.** `mlx-serve launch codex` and the app's Codex tab hand codex a current base-instructions file instead of its stale built-in fallback, which names tools the binary no longer declares; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override.
+- **DeepSeek-V4.1-Flash reads long prompts faster.** Prompts are read 8,192 tokens at a time where memory allows, and the attention, expert and Engram work behind each chunk is faster on M5 Macs.
+- **An embeddings request no longer crashes a DeepSeek server.** Asking DeepSeek-V4 or V4.1 for embeddings now returns a clear error instead of stopping the server.
+- **Outside plugins can use the server's layer blocks.** The plugin kit ships `kit.blocks` (norms, conv, ssm, schedulers, vae, dit pieces, embedding, and the linear, quantized-matmul, MLP, RoPE, attention, MoE, hyper-connection and GDN blocks), versioned with the kit, and `kit.foreign` to register a weight layout of your own, so a plugin calls them instead of rewriting the layer.
+
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 
 ### Highlights

@@ -19,6 +19,7 @@
 # Usage: ./tests/test_prefix_cache_hot.sh [model_dir] [port]
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL_DIR="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-19040}"
@@ -78,11 +79,7 @@ run_with_capacity() {
     "$BINARY" --model "$MODEL_DIR" --serve --port "$PORT" --ctx-size 4096 \
         --prefix-cache-entries "$cap" --log-level info > /tmp/test_prefix_cache.log 2>&1 &
     local pid=$!
-    for _ in $(seq 1 240); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-        sleep 0.5
-        kill -0 "$pid" 2>/dev/null || { echo "ERR: server died" >&2; return 1; }
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 240 0.5 "$pid" || kill -0 "$pid" 2>/dev/null || { echo "ERR: server died" >&2; return 1; }
 
     # Step 1-2: prime conversations A and B (single-turn).
     # Step 3-4: A and B follow-up multi-turn (history = system+user1+ASSISTANT+user2).

@@ -1041,6 +1041,7 @@ private struct AgentEditor: View {
         AgentEditorRow("Voice", caption: voiceCaption) {
             AgentVoiceMenu(voice: $agent.voice,
                            systemVoices: appState.voice.availableVoices,
+                           lfm3Voices: LFM3Voice.voices(appState.server.allModels, current: appState.serverOptions.lfm3Voice),
                            clips: clips,
                            globalClipPath: appState.serverOptions.voiceClonePath,
                            globalClipLabel: appState.serverOptions.voiceCloneLabel,
@@ -1091,11 +1092,13 @@ private struct AgentEditor: View {
             previewer.preview(v)
         case .clone(let path) where !path.isEmpty:
             previewer.playClip(path: path)
+        case .lfm3(let v) where !v.isEmpty:
+            previewer.preview(v, engine: .lfm3)
         case .system(let id):
             previewer.stop()
             systemPreview.voiceIdentifier = id.isEmpty ? nil : id
             systemPreview.enqueue("Hi, this is how I'll sound.")
-        case .kokoro, .clone, .none:
+        case .kokoro, .clone, .lfm3, .none:
             onNotify("Pick a voice first.")
         }
     }
@@ -1162,13 +1165,14 @@ private struct AgentEditor: View {
 
 // MARK: - Voice picker (writes the AGENT, not the app settings)
 
-/// Kokoro, your voices, system — bound to an AGENT's own voice, with an explicit
+/// Kokoro, LFM3, your voices — bound to an AGENT's own voice, with an explicit
 /// "App voice" entry for the nil case and the uploaded-clip library in between.
 /// A `Menu` rather than a `Picker` because it also carries ACTIONS (add a clip,
 /// open the folder), which a Picker can't hold.
 private struct AgentVoiceMenu: View {
     @Binding var voice: AgentVoice?
     let systemVoices: [VoiceOption]
+    let lfm3Voices: [String]
     let clips: [VoiceClipLibrary.Clip]
     let globalClipPath: String
     let globalClipLabel: String
@@ -1196,6 +1200,11 @@ private struct AgentVoiceMenu: View {
                         }
                     }
                 }
+                Menu("LFM3") {
+                    ForEach(lfm3Voices, id: \.self) { v in
+                        choice(LFM3Voice.displayName(v), isOn: voice == .lfm3(v)) { voice = .lfm3(v) }
+                    }
+                }
                 Menu("Your voices") {
                     if !globalClipPath.isEmpty {
                         choice(globalClipLabel.isEmpty ? "Settings clip" : L10n.format("%@ (Settings)", globalClipLabel),
@@ -1217,12 +1226,6 @@ private struct AgentVoiceMenu: View {
                         .font(.app(.body)) })
                     Button(action: onRevealClips, label: { Text("Open Voices Folder")
                         .font(.app(.body)) })
-                }
-                Menu("System") {
-                    ForEach(systemVoices) { v in
-                        choice(v.displayName, isOn: voice == .system(v.id)) { voice = .system(v.id) }
-                    }
-                    if systemVoices.isEmpty { Text("No voices installed") }
                 }
             } label: {
                 Text(L10n.text(label))
@@ -1254,6 +1257,8 @@ private struct AgentVoiceMenu: View {
             return VoiceClipLibrary.displayName(forPath: path)
         case .system(let id):
             return systemVoices.first { $0.id == id }?.displayName ?? "System voice"
+        case .lfm3(let v):
+            return v.isEmpty ? "App voice" : LFM3Voice.displayName(v)
         }
     }
 }

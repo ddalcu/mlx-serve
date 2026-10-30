@@ -1,18 +1,16 @@
 #!/bin/bash
-# --idle-evict-secs: a model nobody is using leaves residency, and the next
-# request cold-loads it back.
+# test_idle_evict.sh — --idle-evict-secs: a model nobody uses leaves residency (read from /api/ps, never the `state`
+# field: "unloaded" with the memory still held is the failure) and the next request cold-loads it back. Each cycle
+# fires /api/tags, /api/show and a chat (the three readers of retained CPU state that hold no refcount) concurrently
+# with the reload; a status poll (GET /props) must not reload; RSS stays flat across cycles that end with nothing
+# resident (64 MB bar on settled readings, cycles 4..9); a boot without the flag keeps the model resident. 2 s window.
 #
-# The reload this makes routine is also what the test is for. Three endpoints
-# read an entry's RETAINED CPU state (config, chat template) without holding a
-# refcount — /api/tags, /api/show, and the pre-load text-gen gate on a chat
-# request — and a reload frees that state. So each cycle fires all three
-# concurrently with the reload. Residency is read back from /api/ps rather than
-# trusting the `state` field: "unloaded" with the memory still held is the
-# failure this flag exists to prevent.
+#   ./tests/test_idle_evict.sh [root] [port]   # IDLE_EVICT_CYCLES, IDLE_EVICT_RSS_LIMIT_MB
 #
-# Usage: ./tests/test_idle_evict.sh [root] [port]
+# Hermetic twins: idleEvictable, pickIdleEvictable, idleEvictTickMs, the `.loading` reader predicates.
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 ROOT="${1:-$HOME/.mlx-serve/models}"
 PORT="${2:-8098}"
@@ -58,10 +56,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in $(seq 1 30); do
-    curl -fs "$BASE/health" >/dev/null 2>&1 && break
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || true
 FAIL=0
 
 chat() {  # prints the HTTP status
@@ -171,7 +166,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 "$BINARY" --model-dir "$ROOT" --serve --port "$PORT" ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 30); do curl -fs "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "$BASE" 30 1 || true
 [ "$(chat)" = "200" ] || { echo -e "${RED}FAIL${NC} control server did not serve"; FAIL=1; }
 sleep 8
 if [ "$(resident_count)" = "1" ]; then

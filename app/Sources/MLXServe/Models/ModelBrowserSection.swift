@@ -15,6 +15,8 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
     case downloads
     /// Media-gen model catalog (image/audio/video/music), grouped by modality.
     case media
+    /// Outside plugins: the catalog, installed ones with their switches, and agent install instructions.
+    case plugins
 
     var id: String { rawValue }
 
@@ -25,6 +27,7 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
         case .myModels:     return "My Models"
         case .downloads:    return "Downloads"
         case .media:        return "Media"
+        case .plugins:      return "Plugins"
         }
     }
 
@@ -35,6 +38,7 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
         case .myModels:     return "internaldrive"
         case .downloads:    return "arrow.down.circle"
         case .media:        return "photo.on.rectangle.angled"
+        case .plugins:      return "puzzlepiece.extension"
         }
     }
 
@@ -85,6 +89,7 @@ struct ModelBrowserBadgeCounts: Equatable {
         case .myModels:     n = myModels
         case .downloads:    n = activeDownloads
         case .media:        n = mediaReady
+        case .plugins:      return nil
         }
         return n > 0 ? "\(n)" : nil
     }
@@ -200,11 +205,11 @@ enum ModelBrowserUse {
     /// answer — a media checkpoint is never chat-pickable and a chat model has
     /// no modality. Every on-disk row can then offer a Use, instead of Discover
     /// and the Media pane quietly ending at Delete the way My Models did (#228).
-    static func mediaModel(atPath path: String?, in models: [LocalModel]) -> (model: LocalModel, modality: MediaModality)? {
+    static func mediaModel(atPath path: String?, in models: [LocalModel], rows: [ModelInfo] = []) -> (model: LocalModel, modality: MediaModality)? {
         guard let path, !path.isEmpty else { return nil }
         let wanted = normalize(path)
         guard let m = models.first(where: { normalize($0.path) == wanted }),
-              let modality = MediaModality(modelType: m.modelType) else { return nil }
+              let modality = MediaModality.of(modelType: m.modelType, path: m.path, rows: rows) else { return nil }
         return (m, modality)
     }
 

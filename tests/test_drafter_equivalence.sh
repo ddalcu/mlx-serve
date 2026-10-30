@@ -1,23 +1,10 @@
 #!/bin/bash
-# Gemma 4 assistant drafter byte-equivalence test.
+# test_drafter_equivalence.sh — the Gemma 4 assistant drafter is byte-equivalent at temp 0 to no drafter, and a
+# seeded sampled request replays byte-identical x3 under the drafter.
 #
-# Verifies that running the same temp=0 chat completion request against the
-# server with --drafter <dir> produces *identical* output text to running it
-# without --drafter. The drafter is Gemma 4-specific, so the target must be
-# a Gemma 4 checkpoint paired with the matching assistant drafter.
+#   DRAFTER_TEST_TARGET=<gemma-4 dir> DRAFTER_TEST_DRAFTER=<assistant dir> ./tests/test_drafter_equivalence.sh [port]
 #
-# Default pair (Apple Silicon, ~3.3 GB peak RSS):
-#   target  = ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#   drafter = ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16
-#
-# Override with env vars:
-#   DRAFTER_TEST_TARGET=/path/to/gemma-4-target
-#   DRAFTER_TEST_DRAFTER=/path/to/gemma-4-{E2B,E4B,...}-it-assistant-bf16
-#
-# Usage:
-#   ./tests/test_drafter_equivalence.sh [port]
-#
-# Exits 0 with a SKIP message if either checkpoint is missing.
+# Defaults gemma-4-e4b-it-8bit + gemma-4-E4B-it-assistant-bf16; SKIPs when either is missing.
 
 set -e
 

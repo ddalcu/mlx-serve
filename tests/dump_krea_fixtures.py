@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump Krea-2-Turbo parity fixtures (.raw) for the Zig oracle tests in src/krea.zig.
+"""Dump Krea-2-Turbo parity fixtures (.raw) for the Zig oracle tests in src/plugins/krea/krea.zig.
 
 This runs the pure-MLX REFERENCE (avlp12/krea2_alis_mlx) and writes byte-exact
 golden tensors that `zig build test` compares the Zig port against (cosine
@@ -34,7 +34,7 @@ import sys
 import numpy as np
 
 # Fixed, reproducible fixture parameters. Keep in sync with the env defaults in
-# the krea.zig e2e oracle (W/H 512, seed 0, steps 8).
+# the plugins/krea/krea.zig e2e oracle (W/H 512, seed 0, steps 8).
 PROMPT = "a red fox in the snow, photorealistic"
 W, H, STEPS, SEED = 512, 512, 8, 0
 

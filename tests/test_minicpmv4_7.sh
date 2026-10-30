@@ -11,9 +11,9 @@
 #   [4] a large image is SLICED (3x3 crops): small print and a footer far from the top are read exactly
 #   [5] two images in one prompt are both seen, and a repeated image turn reuses the prefix
 #   [6] --no-vision (second boot) serves text and refuses an image by name; a pack that ships no tower takes
-#       the same path (hermetic: `a pack without the tower disables vision` in minicpm_vision.zig)
+#       the same path (hermetic: `a pack without the tower disables vision` in plugins/qwen3_5/minicpm_vision.zig)
 #
-# Hermetic counterparts: minicpm_vision.zig (slicing, position ids), minicpm_canvas.zig and the server.zig
+# Hermetic counterparts: plugins/qwen3_5/minicpm_vision.zig (slicing, position ids), plugins/qwen3_5/minicpm_canvas.zig and the host/http/server.zig
 # `MiniCPM-V 4.7` test (expanded prompt + canvas positions == the processor and get_rope_index), and the
 # parity test against the executed reference (tests/dump_minicpmv4_7_vision_fixtures.py, then
 # MINICPM_VISION_MODEL=<pack> MINICPM_VISION_FIXTURE=<file> zig-out/tests/test).

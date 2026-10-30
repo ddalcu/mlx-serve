@@ -9,6 +9,7 @@
 # Usage: ./tests/test_no_tools_markup_passthrough.sh [model_dir] [port]
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/LiquidAI/LFM2.5-2.6B-MLX-4bit}"
 PORT="${2:-11262}"
@@ -34,11 +35,7 @@ sleep 1
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
-for _ in $(seq 1 60); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 1
-done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"; exit 1; }
+srv_wait_health "$BASE" 60 1 || { echo "FAIL: server did not come up"; exit 1; }
 
 SYS='List of tools: [{"name": "get_weather", "description": "Get current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]'
 USER="What's the weather in Paris right now? Use the tool."

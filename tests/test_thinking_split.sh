@@ -16,6 +16,7 @@
 # Starts its own server on [port].
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.lmstudio/models/mlx-community/Qwen3.6-35B-A3B-4bit}"
 PORT="${2:-11261}"
@@ -48,11 +49,7 @@ sleep 1
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
-for _ in $(seq 1 90); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 2
-done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"; exit 1; }
+srv_wait_health "$BASE" 90 2 || { echo "FAIL: server did not come up"; exit 1; }
 
 PROMPT='{"role":"user","content":"What is 17*23? Be brief."}'
 

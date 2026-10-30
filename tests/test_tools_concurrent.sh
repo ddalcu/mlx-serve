@@ -1,23 +1,15 @@
 #!/bin/bash
-# Guard: concurrent agent loops each get THEIR OWN tool calls.
+# test_tools_concurrent.sh — concurrent agent loops each get THEIR OWN tool calls: batched decode and tool buffering
+# together, where a cross-slot leak shows as one client receiving another's arguments.
 #
-# Batched decode and tool buffering are individually tested and have never been
-# tested together. With tools present the server buffers tokens for detection
-# per slot, and slots entering a batch mid-generation drain lazy pipeline state
-# first — so a cross-slot leak here looks like one client receiving another
-# client's arguments, which no single-stream test can see.
+#   CONC_TEST_MODEL=<dir> ./tests/test_tools_concurrent.sh [port]   # CONC_N=4 streams
 #
-# N concurrent streams, each planting a DIFFERENT unique token in its prompt and
-# asking for one tool call carrying it back. Assertions:
-#   • every stream completes (no lost request, [DONE] seen)
-#   • every stream's call carries ITS OWN token and no other stream's
-#   • every stream's arguments are valid JSON, no markup in visible content
-#   • the server is alive and functional afterwards
-#
-# Usage: CONC_TEST_MODEL=<dir> ./tests/test_tools_concurrent.sh [port]
-#   CONC_N=4  — number of concurrent agent loops
+# Each stream plants a distinct code and asks for one call carrying it back. Every stream must reach [DONE], its
+# call must carry its own code and no other stream's, arguments must be valid JSON with no markup in content, and the
+# server must still answer afterwards.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${CONC_TEST_MODEL:-}"
 PORT="${1:-8136}"
@@ -40,8 +32,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -rf "$OUTDIR"; rm -f "$LOG"; }
 trap cleanup EXIT
-for i in $(seq 1 300); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not start"; exit 1; }
+srv_wait_health "$BASE" 300 1 || { echo "FAIL: server did not start"; exit 1; }
 
 # Distinct, non-overlapping tokens so a cross-slot leak is unambiguous.
 TOKENS=(ZULU-1001 YANKEE-2002 XRAY-3003 WHISKEY-4004 VICTOR-5005 TANGO-6006 SIERRA-7007 ROMEO-8008)

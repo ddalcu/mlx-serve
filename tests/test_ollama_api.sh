@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
-# Ollama-compatible API (/api/*) end-to-end: version/tags/show/ps, chat
-# (stream NDJSON + non-stream + tool calls + done_reason), generate
-# (templated + raw), embed (new + legacy), name resolution ("qwen3.5:latest"
-# style), pull fast-path (already on disk -> success, no network), and the
-# `mlx-serve list` CLI. Complements the hermetic translation/sink tests in
-# src/ollama.zig — this pins the routing + Conn-sink plumbing live.
+# test_ollama_api.sh — Ollama API (/api/*) end-to-end: version/tags/show/ps, chat (NDJSON stream, non-stream, tool
+# arguments as objects, done_reason), generate (templated + raw), embed (new + legacy), `name:tag` resolution, pull
+# fast path (on disk, no network), `mlx-serve list`.
 #
-# Usage: [OLLAMA_CHAT_MODEL=<dir>] [OLLAMA_EMBED_ID=<id>] ./tests/test_ollama_api.sh [port]
+#   [OLLAMA_CHAT_MODEL=<dir>] [OLLAMA_EMBED_ID=<id>] ./tests/test_ollama_api.sh [port]
+#   OLLAMA_PULL_NET=1 (a real HF download into a scratch HOME), OLLAMA_RUN_REPL=1 (pty REPL round trip)
+#
+# Hermetic twins: the translate/sink tests in src/host/api/ollama/translate.zig, alias/REPL tests in host/cli/cli.zig.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11436}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -21,11 +23,7 @@ CHAT_ID="$(basename "$CHAT")"
 "$BIN" --serve --model "$CHAT" --model-dir "$HOME/.mlx-serve/models" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for i in $(seq 1 120); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -8 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 120 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -8 "$LOG"; exit 1; }
 
 api() { curl -s -m 300 "http://127.0.0.1:$PORT$1" "${@:2}"; }
 PASS=0; FAIL=0

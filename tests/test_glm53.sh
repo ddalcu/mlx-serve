@@ -9,10 +9,11 @@
 #   [2] thinking on by default            [5] mlx-stream serves the pack, no MLX error
 #   [2b] low effort answers, no think tags
 #
-# Hermetic counterparts: the glm_moe_dsa parse and routing tests in model.zig, the GLM-5.3 context test in
-# arch/mlx_stream.zig, and the GLM effort and tool-history render tests in chat.zig.
+# Hermetic counterparts: the glm_moe_dsa parse and routing tests in engines/mlx/model.zig, the GLM-5.3 context test in
+# src/engines/mlx/modules/stream_glue.zig, and the GLM effort and tool-history render tests in host/chat/chat.zig.
 
 set -euo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${GLM53_TEST_MODEL:-}"
 if [ -z "$MODEL" ]; then echo "SKIP: GLM53_TEST_MODEL not set"; exit 0; fi
@@ -33,11 +34,7 @@ cleanup() { kill "$SERVER_PID" 2>/dev/null || true; wait "$SERVER_PID" 2>/dev/nu
 trap cleanup EXIT
 
 echo "waiting for server (load takes minutes)..."
-for _ in $(seq 1 600); do
-    curl -sf -m 2 "$BASE/health" > /dev/null 2>&1 && break
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1; fi
-    sleep 3
-done
+srv_wait_health "$BASE" 600 3 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo "FAIL: server died during load"; tail -20 "$LOG"; exit 1; }
 curl -s -m 3 "$BASE/health" | grep -q '"ok"' || { echo "FAIL: no health"; tail -20 "$LOG"; exit 1; }
 
 pass=0; fail=0

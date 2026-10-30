@@ -27,7 +27,7 @@ final class EngineVersionsTests: XCTestCase {
     }
 
     func testNaxRowDisplayLabelAndExplainer() {
-        // The `nax` line ("on (...)"/"off (<reason>)", src/transformer.zig
+        // The `nax` line ("on (...)"/"off (<reason>)", src/engines/mlx/transformer.zig
         // naxStatusFrom) gets a human label + explainer in Settings; every
         // engine name must have a non-defaulted label so a new Zig line can't
         // silently render as its raw token.

@@ -1,19 +1,19 @@
 #!/usr/bin/env bash
-# Qwen-Image-2.1 on the ONE main server: headless boot -> load the converted
-# pack by absolute path -> txt2img PNG of the requested size -> real CFG engages
-# (two forwards per step, by the log) and changes the render -> img2img ->
-# instruction edit (mode:"edit", the pack's Qwen3-VL tower): happy path,
-# no-size output aspect from the LAST reference, multi-reference + the cap,
-# edit CFG, the named 400s, the OpenAI multipart surface -> a SECOND
-# short-lived server on a towerless pack refusing edits by name -> unload.
+# test_qwen_image_gen.sh — Qwen-Image-2.1 end to end on a tower pack: load by path (`image` capability + the backend's
+# ready line), txt2img PNG at the requested size, CFG by ENGAGEMENT (`one forward per step` at guidance 1.0, `two
+# forwards per step` with guidance_scale, and the render differs), img2img, instruction edit (mode:"edit": `[qwen-image]
+# edit … refs=N`; a sizeless edit takes the LAST reference's aspect, 4:3 -> 1184x896 exact; multi-ref refs=3 + the
+# 4-image cap 400; edit CFG; the named 400s), the OpenAI multipart surface, `transparent:true` RGBA (JSON, SSE, edit)
+# and RGB restored after, the Q4 wide-GEMM arm at 768x768 on a 4-bit pack, and a SECOND server on a towerless pack
+# refusing edits by name. Alive + no MLX error. 6 steps: the wire contract, never picture quality.
 #
-# SKIPs without a pack (tests/convert_qwen_image21_weights.py). Few steps:
-# only the wire contract is asserted, never picture quality.
+#   QWEN_IMAGE_MODEL=<dir> ./tests/test_qwen_image_gen.sh [port]
+#   QWEN_IMAGE_NOTOWER_MODEL=<dir>   pack without model.visual.* (default: the tiny fixture pack under ~/claude-tmp)
 #
-# Usage: QWEN_IMAGE_MODEL=<dir> ./tests/test_qwen_image_gen.sh [port]
-#        QWEN_IMAGE_NOTOWER_MODEL=<dir> — pack without model.visual.* for the
-#        400 arm (default: the tiny fixture pack under ~/claude-tmp)
+# SKIPs without a pack. Parity: tests/dump_qwen_image21_fixtures.py + QWEN_IMAGE_TEST_MODEL / QWEN_IMAGE_FIXTURE.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11398}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -30,11 +30,7 @@ LOG="$OUT/server.log"
 SRV=$!
 SRV2=""
 trap 'kill $SRV $SRV2 2>/dev/null' EXIT
-for _ in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 FAILS=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILS=$((FAILS + 1)); }
@@ -280,11 +276,7 @@ if [ -f "$NOTOWER/config.json" ]; then
   "$BIN" --model "$NOTOWER" --serve --port "$PORT2" >"$LOG2" 2>&1 &
   SRV2=$!
   up2=""
-  for _ in $(seq 1 60); do
-    curl -sf "http://127.0.0.1:$PORT2/health" >/dev/null 2>&1 && { up2=1; break; }
-    kill -0 $SRV2 2>/dev/null || break
-    sleep 1
-  done
+  srv_wait_health "http://127.0.0.1:$PORT2" 60 1 "$SRV2" && up2=1
   if [ -n "$up2" ]; then
     code="$(curl -s "http://127.0.0.1:$PORT2/v1/images/generations" -H 'Content-Type: application/json' \
       -d "{\"prompt\":\"add a small red hat\",\"mode\":\"edit\",\"image\":\"$(cat "$OUT/src43.b64")\"}" \

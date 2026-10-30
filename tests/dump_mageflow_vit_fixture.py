@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump a MageFlow Qwen3-VL vision-tower parity fixture for src/mage_flow.zig (E7.2).
+"""Dump a MageFlow Qwen3-VL vision-tower parity fixture for src/plugins/mage_flow/mage_flow.zig (E7.2).
 
 Runs the pure-MLX REFERENCE (ivanfioravanti/mflux@mage-flow-mlx) vision model in
 FP32 over the reference PROCESSOR's pixel_values for one synthetic image, and

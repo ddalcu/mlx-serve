@@ -1,17 +1,13 @@
 #!/bin/bash
-# Integration test: launch flags survive a COLD load (hot model switch,
-# /v1/load-model, first request naming an unloaded model).
+# test_cold_load_launch_flags.sh — launch flags survive ensureLoaded's COLD-load LoadRequest (hot switch,
+# /v1/load-model, a first request naming an unloaded model), not just the `--model` primary. Isolated HOME; a symlink
+# clone cold-loads through /v1/load-model: a config-only in-dir DFlash sidecar is probed by default (that arm's load
+# fails loudly) while --no-drafter skips it and reaches `ready`. RAM+SSD and --no-prefix-cache-ram arms generate on
+# the clone and require hot-cache residency, or a complete SSD prefix with no idle RAM retention.
 #
-# Three rounds of the same bug have shipped — prefix-cache settings, then MTP +
-# llama settings, then the drafter group — each time a flag reached only the
-# `--model` primary while `ensureLoaded`'s LoadRequest used a struct default.
-# `--no-drafter` became load-bearing on this path when `resolveInDirDrafter`
-# started probing `<model_dir>/drafter` at load: a server launched with
-# speculation OFF re-enabled it on every model it switched to.
+#   ./tests/test_cold_load_launch_flags.sh [model] [port]   # any chat model; SKIPs without one
 #
-# The drafter sidecar here is a config.json only — the probe reads nothing else,
-# so the arm that probes fails its load loudly and the arm that doesn't is
-# silent. That is the observable difference, and it needs no real drafter.
+# Hermetic twins: coldLoadDrafterDir, coldLoadVision.
 
 set -u
 

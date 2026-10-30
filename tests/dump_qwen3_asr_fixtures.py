@@ -2,7 +2,7 @@
 """Dump Qwen3-ASR parity fixtures — the reference EXECUTES.
 
 Runs mlx-audio's own `qwen3_asr` model (the layout our pack loader matches) on a
-16 kHz mono WAV and saves every stage `src/qwen_audio.zig` and the transcription
+16 kHz mono WAV and saves every stage `src/plugins/qwen3_asr/audio_tower.zig` and the transcription
 endpoint have to reproduce:
   pcm           the 16 kHz samples the feature extractor read (f32)
   features      WhisperFeatureExtractor log-mel [128, frames] (f32)

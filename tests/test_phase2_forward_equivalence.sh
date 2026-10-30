@@ -1,38 +1,15 @@
 #!/bin/bash
-# test_phase2_forward_equivalence.sh — Phase 2 of performance-plan.md.
+# test_phase2_forward_equivalence.sh — tripwire: the first N greedy tokens of the forward pass stay byte-identical to a
+# baseline recorded by this script's own first run (tests/fixtures/phase2_forward_equivalence/). Covers a hybrid SSM
+# (Qwen3.5-4B: GDN + chunked prefill) and plain attention (Gemma 4 E4B: sliding window).
 #
-# Pins the first N greedy temp=0 tokens of mlx-serve's forward pass against
-# a baseline captured on main. Any change to the forward path (compileForward
-# wiring, op-fusion, kernel rework, dtype tweak, ...) must keep this test
-# byte-identical. The test is a TRIPWIRE — its own first run records the
-# baseline; subsequent runs compare against it. To re-baseline (intentional
-# behavior change), delete the cached fixtures under
-# tests/fixtures/phase2_forward_equivalence/ and rerun.
+#   QWEN_MLX_MODEL=<dir> GEMMA4_MLX_MODEL=<dir> ./tests/test_phase2_forward_equivalence.sh   # PORT (19099), BINARY
 #
-# Coverage:
-#   - Hybrid SSM (Qwen3.5-4B-MLX-4bit) — exercises gatedDeltaNet + the SSM
-#     scan kernel + chunked-prefill (forward dispatched per chunk).
-#   - Plain attention (Gemma 4 E4B 4-bit) — exercises forwardStandard +
-#     sliding-window attention.
-# Add MoE / DSV4 fixtures as they become available.
-#
-# Env:
-#   QWEN_MLX_MODEL     Path to Qwen3.5-4B MLX dir (or compatible hybrid). If
-#                      unset / missing, that case is skipped (test still
-#                      records pass/skip).
-#   GEMMA4_MLX_MODEL   Path to Gemma 4 E4B 4-bit dir. Skipped if unset.
-#   PORT               Server port. Default 19099.
-#   PHASE2_REBASELINE  If set to "1", overwrite the fixture instead of
-#                      comparing. Use after an intentional behavior change.
-#   BINARY             Path to mlx-serve. Default ./zig-out/bin/mlx-serve.
-#
-# Exit codes:
-#   0  all pinned cases byte-identical (or skipped because model missing)
-#   1  at least one case mismatched
-#
-# Outputs fixture content under tests/fixtures/phase2_forward_equivalence/
+# PHASE2_REBASELINE=1 overwrites the fixture after an intentional change. Exit 1 = a case mismatched; a missing model
+# skips its case.
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${PORT:-19099}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -64,11 +41,8 @@ start_server() {
     "$BIN" --model "$model" --serve --port "$PORT" --ctx-size 8192 \
         --prefix-cache-entries 4 --log-level warn > "$LOG" 2>&1 &
     SERVER_PID=$!
-    for _ in $(seq 1 180); do
-        curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$LOG"; return 1; }
-        sleep 0.5
-    done
+    srv_wait_health "$BASE" 180 0.5 "$SERVER_PID" && return 0
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$LOG"; return 1; }
     echo "fail: server didn't come up"
     tail -20 "$LOG"
     return 1

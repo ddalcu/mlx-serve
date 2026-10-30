@@ -2,7 +2,7 @@
 """Dump LFM2-VL VISION TOWER parity fixtures — the reference EXECUTES.
 
 Runs transformers' own `Siglip2VisionModel` plus LFM2-VL's projector on OUR
-pack's weights and saves every stage `src/lfm2_vision.zig` has to reproduce.
+pack's weights and saves every stage `src/plugins/lfm2/vision.zig` has to reproduce.
 The tower's output is spliced straight into the LM sequence, so a wrong patch
 order, position resample or unshuffle interleave produces conditioning that is
 silently WRONG rather than absent.

@@ -1,33 +1,14 @@
 #!/bin/bash
-# End-to-end acceptance for MiniCPM5 V3's native tool-call XML
-# (`<function name="X"><param name="K">V</param></function>`) across ALL FOUR
-# (API shape x mode) combinations, against a real local model.
+# test_minicpm5_tool_call.sh — MiniCPM5 V3's native tool-call XML (`<function name="X"><param name="K">V</param>`)
+# on all four (surface x mode) rows: /v1/messages stream and non-stream, /v1/chat/completions non-stream and stream.
+# Per row no MiniCPM5 XML reaches visible content and a valid call arrives as that surface's structured tool call.
+# A leak is a property of the SURFACE: each row runs its own buffering path, so one passing row proves nothing about
+# the others (the messages stream once streamed the raw XML AND emitted a tool_use for it).
 #
-#   1. /v1/messages          streaming
-#   2. /v1/messages          non-streaming
-#   3. /v1/chat/completions  non-streaming
-#   4. /v1/chat/completions  streaming
-#
-# Acceptance rule, applied to every row: no MiniCPM5 XML may reach the client
-# as visible content, and a valid call must arrive as the surface's proper
-# structured tool-call object. A leak is a property of the SURFACE, not of the
-# dialect -- each combination runs its own buffering path, so one passing row
-# proves nothing about the other three.
-#
-# Row 1 pins the original Claude Code failure (2026-07-22): the Anthropic
-# streaming handler used to carry its OWN narrow, hand-rolled tool-detection
-# gate -- only `<tool_call`/`<|tool_call`/raw-JSON -- completely blind to
-# `<function`. The raw XML streamed to the client as a LIVE text_delta before
-# the end-of-stream parse ever ran, and a SEPARATE, correct tool_use block was
-# then emitted for the same call: duplicated, XML-leaking content, not a
-# missing call. Upstream has since routed that gate through the shared
-# chat.streamShouldBufferForTools(), which is what makes this row pass.
-#
-# Usage: ./tests/test_minicpm5_tool_call.sh [model_dir] [port]
-#   Default model: the local mlx-community/MiniCPM5-1B-OptiQ-4bit pull.
-#   SKIPs cleanly (exit 0) when the weights are absent.
+#   ./tests/test_minicpm5_tool_call.sh [model_dir] [port]   # default mlx-community/MiniCPM5-1B-OptiQ-4bit; SKIP
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/MiniCPM5-1B-OptiQ-4bit}"
 PORT="${2:-11264}"
@@ -73,11 +54,7 @@ MLX_SERVE_RAW_DUMP_FILE="$RAW_DUMP" \
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
-for _ in $(seq 1 120); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 2
-done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"; exit 1; }
+srv_wait_health "$BASE" 120 2 || { echo "FAIL: server did not come up"; exit 1; }
 
 TOOLS='[{"name":"shell","description":"Run a shell command","input_schema":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}]'
 OAI_TOOLS='[{"type":"function","function":{"name":"shell","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]'

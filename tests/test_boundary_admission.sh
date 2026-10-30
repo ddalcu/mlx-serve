@@ -1,26 +1,17 @@
 #!/bin/bash
-# Boundary admission: a small request that arrives while a long prefill runs must not wait for
-# the whole prefill.
+# test_boundary_admission.sh — a small request arriving mid-prefill is admitted at a chunk boundary instead of waiting
+# for the whole prefill. Two arms of one binary: --prefill-decode-share 0.5 vs 0, each with a decoding stream, a
+# ~4k-token prefill B and a 30-token request C sent 0.8 s into B. [1] with a share, C's first-token wait is under half
+# of B's remaining prefill; [2] at share 0 it is at least 80% (that schedule must not change); [3] every request ends
+# with text; [4] only the share arm logs `[boundary] admitted`; [5] C dropping while it waits, and B dropping after C
+# was admitted, leave every other request finishing and the server answering.
 #
-# With --prefill-decode-share the long prefill (B) runs in 1024-row chunks and ticks the streams
-# that are already decoding between chunks. A request that arrives mid-prefill (C) is not
-# decoding yet: before this change it sat in `pending` until B finished. Now the chunk-boundary
-# hook admits it, prefills it and decodes it beside B.
+#   BOUNDARY_TEST_MODEL=<dir> BINARY=./zig-out/bin/mlx-serve ./tests/test_boundary_admission.sh [port]
 #
-# Two arms, same binary:
-#   share   --prefill-decode-share 0.5  C's first token comes well before B's prefill ends
-#   share0  --prefill-decode-share 0    today's schedule: C waits for B (nothing may change)
-# Asserts: [1] share arm: C's first-token wait is under half of B's remaining prefill;
-# [2] share0 arm: C waits at least 80% of B's remaining prefill; [3] every request finished
-# with text; [4] the share arm logs "[boundary] admitted" and the share0 arm does not;
-# [5] cancel arm: a client that disconnects while its request waits for a boundary, and one that
-# disconnects from the big prefill after a small request was admitted beside it, leave every other
-# request finishing with text and the server answering.
-#
-# Requires a chat model with at least ~2x the prefill chunk of prompt budget; SKIPs without one.
-#   BOUNDARY_TEST_MODEL=/path/to/model BINARY=./zig-out/bin/mlx-serve ./tests/test_boundary_admission.sh [port]
+# Needs ~2x the prefill chunk of prompt budget; SKIPs without a model.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11488}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -159,10 +150,7 @@ run_arm() {
         --log-level debug --log-file "$log" >"$WORK/$arm.stdout" 2>&1 &
     SERVER_PID=$!
     local ready=0
-    for _ in $(seq 1 480); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { ready=1; break; }
-        sleep 0.5
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 480 0.5 && ready=1
     if [ "$ready" -ne 1 ]; then
         echo "[fail] server did not start ($arm arm)"
         exit 1
@@ -183,10 +171,7 @@ run_arm share0 0
     --max-concurrent 8 --prefill-chunk 1024 --prefill-decode-share 0.5 \
     --log-level debug --log-file "$WORK/cancel.log" >"$WORK/cancel.stdout" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 480); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 0.5
-done
+srv_wait_health "http://127.0.0.1:$PORT" 480 0.5 || true
 python3 "$WORK/probe.py" "$PORT" "$B_WORDS" cancel > "$WORK/cancel.json" || { echo "[fail] cancel probe crashed"; exit 1; }
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || { echo "[fail] server stopped answering after the cancel cases"; exit 1; }
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""

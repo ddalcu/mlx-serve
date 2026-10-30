@@ -102,6 +102,28 @@ final class TrayTranscriptTests: XCTestCase {
         XCTAssertNil(TrayTranscript.notesModel(setting: "", chatModel: "", models: models))
     }
 
+    /// Nemotron Transcribe is the one pack a transcript needs: no aligner, no diarizer, no repo to fetch, and it writes
+    /// the notes itself; the setting also picks which pack dictation and voice mode transcribe with.
+    func testNemotronTranscribeNeedsOnlyItsOwnPackAndWritesTheNotes() {
+        func pack(_ type: String, path: String, downloading: Bool = false) -> LocalModel {
+            var m = LocalModel(id: path, name: path, path: path, sizeFormatted: "1 GB", modelType: type, source: .mlxServe, kind: .base)
+            m.isDownloading = downloading
+            return m
+        }
+        let qwen = pack("qwen3_asr", path: "/m/asr"), nemo = pack("nemo_speechlm", path: "/m/nemo")
+        XCTAssertEqual(TrayTranscript.missingRepos([], engine: .nemotron), [])
+        XCTAssertNil(TrayTranscript.asrPath([qwen], engine: .nemotron))
+        XCTAssertEqual(TrayTranscript.asrPath([qwen, nemo], engine: .nemotron), "/m/nemo")
+        XCTAssertEqual(TrayTranscript.asrPath([qwen, nemo], engine: .combo), "/m/asr")
+        XCTAssertNil(TrayTranscript.asrPath([pack("nemo_speechlm", path: "/m/nemo", downloading: true)], engine: .nemotron))
+        XCTAssertEqual(VoiceASR.modelPath([qwen, nemo], engine: .nemotron), "/m/nemo")
+        XCTAssertEqual(VoiceASR.modelPath([qwen, nemo]), "/m/asr")
+        // The notes model is the transcribing one, whatever the Meeting notes setting held.
+        let chat = LocalModel(id: "/m/chat", name: "chat", path: "/m/chat", sizeFormatted: "1 GB", modelType: "qwen3", source: .mlxServe, kind: .base)
+        XCTAssertEqual(TrayTranscript.notesModel(setting: ServerOptions.notesOff, chatModel: "/m/chat", models: [chat, nemo], engine: .nemotron, asr: "/m/nemo"), "/m/nemo")
+        XCTAssertEqual(TrayTranscript.notesModel(setting: "", chatModel: "/m/chat", models: [chat, nemo], engine: .combo, asr: "/m/asr"), "/m/chat")
+    }
+
     func testTheNotesGoAboveTheTranscript() {
         let segments: [(start: Double, text: String, speaker: String?)] = [(0, "Hi.", "Speaker A"), (3, "Yes.", "You")]
         XCTAssertEqual(TrayTranscript.markdown(title: "2026-10-13 21:59:00", notes: "# Release plan\n\n## Summary\nShip on Thursday.", segments: segments),

@@ -1,4 +1,4 @@
-"""HF `tokenizers` reference ids for the env-gated "tokenizer parity" test in src/tokenizer.zig.
+"""HF `tokenizers` reference ids for the env-gated "tokenizer parity" test in src/sdk/tokenizer/tokenizer.zig.
 
 Each case is {name, text, ids}, ids from the Python `tokenizers` library (no special tokens) on the model's own
 tokenizer.json: whitespace runs (blank lines holding spaces, CRLF, tabs), Unicode White_Space and zero-width

@@ -3,12 +3,13 @@
 # concurrent users, MTP on and off. One CSV row per (binary, model, mode, N).
 # Usage: BENCH_MODEL=<dir> [BENCH_LABEL=x] [MLX_SERVE_BINARY=..] ./tests/bench_concurrency_ladder.sh <port> <csv> ["1 2 3 4 6 8"] [max_tokens]
 set -u
+source "$(dirname "$0")/lib/server.sh"
 MODEL="${BENCH_MODEL:?}"; PORT=$1; CSV=$2; NS="${3:-1 2 3 4 6 8}"; MAXTOK=${4:-200}
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"; LABEL="${BENCH_LABEL:-$(basename $(dirname $(dirname $BINARY)))}"
 LOG=$(mktemp)
 MLX_SERVE_ROUND_COST_PERSIST=0 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --mtp --max-concurrent 16 --prefix-cache-entries 0 > "$LOG" 2>&1 &
 PID=$!; trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -f "$LOG"' EXIT
-for i in $(seq 1 300); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "http://127.0.0.1:$PORT" 300 1 || true
 P=("Write a short essay about the history of quantum computing." "Explain how a compiler turns source code into machine code." "Describe the water cycle for a graduate seminar." "Summarize the causes of the French revolution." "Write a poem about the sea in the style of Whitman." "Explain TCP congestion control to a junior engineer." "Describe how vaccines train the immune system." "Outline a beginner's plan to learn the piano.")
 req() { # prompt mtp -> "tokens wall_s"
     local t0=$(python3 -c 'import time; print(time.time())')

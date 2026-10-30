@@ -257,7 +257,8 @@ class ServerManager: ObservableObject {
 
         errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
+            if data.isEmpty { handle.readabilityHandler = nil; return }  // EOF: see ProcessRegistry.capture
+            guard let str = String(data: data, encoding: .utf8) else { return }
             // Pure off-main append. No `Task @MainActor`, no `DispatchQueue.main`,
             // no `@Published` publish — none of which the inference path can
             // afford. The log views poll `currentServerLogSnapshot()` on their

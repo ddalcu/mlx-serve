@@ -59,9 +59,7 @@ bool msv_ane_model_cache_hit(const msv_ane_model *model);
  * (the hash covers the MIL text AND the weights, so same-shape
  * different-weight models never collide; MLX_SERVE_ANE_CACHE_DIR overrides
  * the root). Only the compiled artifacts are kept; the `data` file embeds
- * the constants. MLX_SERVE_ANE_CACHE=0 disables reuse, and freeing a model
- * while disabled also evicts its entry. */
-bool msv_ane_cache_enabled(void);
+ * the constants. */
 
 /* Names the (seam + shape, share) the next compiles belong to: entries of
  * the same group at a different variant are pruned on the cold-compile

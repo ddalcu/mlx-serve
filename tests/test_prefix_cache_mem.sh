@@ -1,28 +1,15 @@
 #!/bin/bash
-# Wave 1.B — `--prefix-cache-mem` memory budget enforcement.
+# test_prefix_cache_mem.sh — the --prefix-cache-mem byte budget: under a tiny budget, long-prompt traffic keeps
+# `[hot-cache] resident=X / Y MB` with X <= Y, logs LRU evictions, and stays healthy. One growing conversation past the
+# budget must log `trimmed oversized entry to N/…` and later `reused M/…` with M >= N (only the log tells a trim that
+# stopped engaging from a legit decline). A hybrid whose smallest checkpoint outweighs the budget declines
+# legitimately: WARN, keyed on the `; ssm` clause; on plain attention a decline FAILs.
 #
-# Starts the server with a deliberately tiny prefix-cache memory budget and
-# fires several long-prompt requests in sequence. Asserts:
-#   * `[hot-cache] resident=X.XX / Y.YY MB` log lines appear and X.XX never
-#     exceeds Y.YY.
-#   * At least one `[hot-cache] evicted LRU entry (byte budget; …)` log line
-#     fires once the resident bytes would exceed the budget.
-#   * The server stays healthy through all requests.
-#   * (#330) ONE growing conversation crossing the budget gets TRIMMED, not
-#     flat-declined — a `trimmed oversized entry to N/…` line appears and a
-#     later turn logs `reused M/…` with M >= N. From the outside a trim that
-#     silently stops engaging looks exactly like a legit decline, so only the
-#     log can pin it; the unit tests own the trim's correctness. A hybrid
-#     whose single checkpoint outweighs the whole budget legitimately
-#     declines (`skipped oversized entry`) — that arm WARNs instead.
-#
-# Tunables (env): SHORT_BUDGET_MB (default 64), N_REQ (default 5),
-#                 PROMPT_REPEATS (default 200), GROW_TURNS (default 5),
-#                 GROW_WORDS (default 2000).
-#
-# Usage: ./tests/test_prefix_cache_mem.sh [/path/to/model] [port]
+#   ./tests/test_prefix_cache_mem.sh [/path/to/model] [port]
+#   SHORT_BUDGET_MB=64 N_REQ=5 PROMPT_REPEATS=200 GROW_TURNS=5 GROW_WORDS=2000
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-8094}"
@@ -65,10 +52,7 @@ cleanup() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null |
 trap cleanup EXIT
 
 up=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 && up=1
 if [ "$up" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
     tail -30 "$LOGFILE"

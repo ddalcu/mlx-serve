@@ -6,23 +6,28 @@ final class ModelOverrideBadgesTests: XCTestCase {
 
     private let none = SocketBadge(stone: nil, skull: false)
 
-    private func badges(_ o: ModelOverride, type: String = "qwen3", socket: SocketBadge? = nil) -> [OverrideBadge] {
-        ModelOverrideBadges.badges(o, modelType: type, socket: socket ?? none)
+    private func badges(_ o: ModelOverride, type: String = "qwen3", engines: [String]? = nil,
+                        socket: SocketBadge? = nil) -> [OverrideBadge] {
+        ModelOverrideBadges.badges(o, modelType: type, engines: engines, socket: socket ?? none)
     }
 
     func testAnUntouchedModelHasNoBadges() {
         XCTAssertEqual(badges(ModelOverride()), [])
     }
 
-    func testTheNeuralEngineIsShownOnlyWhereTheModelCanRunThere() {
+    func testTheEngineIsShownOnlyWhereTheServerSaysTheModelCanRunThere() {
         var o = ModelOverride()
         o.ane = true
-        XCTAssertEqual(badges(o, type: "qwen3_5").map(\.text), ["ANE"])
+        XCTAssertEqual(badges(o, engines: ["mlx", "ane"]).map(\.text), ["ANE"])
         o.ane = false
-        XCTAssertEqual(badges(o, type: "qwen3_5").map(\.text), ["GPU"], "an explicit Off is a choice worth showing")
-        XCTAssertEqual(badges(o, type: "gemma4"), [], "a stored value on a model the engine cannot take is not in effect")
-        o.ane = nil
-        XCTAssertEqual(badges(o, type: "qwen3_5"), [])
+        XCTAssertEqual(badges(o, engines: ["mlx", "ane"]).map(\.text), ["MLX"], "an explicit GPU choice is worth showing")
+        o.engineChoice = "ane"
+        XCTAssertEqual(badges(o, engines: ["mlx"]), [], "a stored value on a model the engine cannot take is not in effect")
+        XCTAssertEqual(badges(o).map(\.text), ["ANE"], "with no server row the stored choice shows")
+        o.engineChoice = "llama"
+        XCTAssertEqual(badges(o, engines: ["llama", "ds4"]).map(\.text), ["llama.cpp"])
+        o.engineChoice = nil
+        XCTAssertEqual(badges(o, engines: ["mlx", "ane"]), [])
     }
 
     func testInt8PrefillIsLossyAndOnlyOnPrismPacks() {

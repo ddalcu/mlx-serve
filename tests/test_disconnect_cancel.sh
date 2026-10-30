@@ -1,27 +1,12 @@
 #!/bin/bash
-# Regression tests for client-disconnect handling during long prefills.
+# test_disconnect_cancel.sh — client disconnects during a long prefill: SSE keepalives flow every 5 s while a request
+# waits for its first token (Anthropic `ping`, OpenAI `: keepalive`), and a vanished client cancels its slot within
+# one probe interval (the chunk loop aborts with error.Cancelled) instead of prefilling for a ghost.
 #
-# Pins the 2026-06-10 live failure: Claude Code with a huge MCP toolset sent a
-# ~40K-token prompt to gemma-4-12b, timed out waiting on the multi-minute cold
-# prefill, disconnected, and RETRIED — but the server only checks the peer
-# socket after a token arrives, so the handler sat blocked in waitNext for the
-# whole prefill. Abandoned prefills piled up serially; `lsof` showed ZERO
-# clients connected while the GPU ground away for minutes. The server looked
-# dead ("not returning anything") and memory climbed with each ghost KV.
-#
-# Two contracts:
-#   1. Keepalive: during a long prefill, streaming responses emit periodic
-#      SSE pings (Anthropic `event: ping` / OpenAI `: keepalive` comments) so
-#      clients don't hit their idle timeout in the first place.
-#   2. Disconnect-cancel: when the client vanishes mid-prefill, the server
-#      notices within one keepalive interval, cancels the slot (aborting the
-#      prefill at the next chunk boundary), and the next request isn't stuck
-#      behind a ghost.
-#
-# Usage: ./tests/test_disconnect_cancel.sh [model_dir] [port]
-#   Starts its own server. Default model: Gemma 4 E4B 8-bit.
+#   ./tests/test_disconnect_cancel.sh [model_dir] [port]   # starts its own server; default Gemma 4 E4B 8-bit
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 source "$(dirname "$0")/_lib_models.sh"
 # The ~27k-token prompt needs ~4 GB of KV beside the weights.
@@ -62,11 +47,7 @@ CTX=$(( (WORDS * 3 + 8191) / 8192 * 8192 + 8192 ))
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
-for _ in $(seq 1 120); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 2
-done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"; exit 1; }
+srv_wait_health "$BASE" 120 2 || { echo "FAIL: server did not come up"; exit 1; }
 
 # ~27K-token unique-ish prompts (≈40-60s cold prefill on E4B) — slow enough
 # that keepalives and the disconnect window are clearly observable. Distinct

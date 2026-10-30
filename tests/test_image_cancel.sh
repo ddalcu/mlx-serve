@@ -3,7 +3,7 @@
 #
 # A cancelled image request (client hung up mid-denoise) must abort at the
 # next step — flux/krea/mage_flow poll progress.cancelled() like every other
-# media backend — and gen.zig logs it as a cancellation, not a failure.
+# media backend — and host/media_jobs/gen.zig logs it as a cancellation, not a failure.
 # Red on trees without the checks: the server burns through every remaining
 # step + VAE decode + PNG encode for a peer that is gone (the log shows
 # "[image] -> N PNG bytes" with nobody connected) while other requests queue
@@ -11,6 +11,7 @@
 #
 # Usage: FLUX_MODEL=<dir> ./tests/test_image_cancel.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11299}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -28,11 +29,7 @@ BASE="http://127.0.0.1:$PORT"
 SRV=$!
 CURL_PID=""
 trap 'kill $CURL_PID $SRV 2>/dev/null' EXIT
-for i in $(seq 1 60); do
-  curl -sf "$BASE/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "$BASE" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 
 curl -s -m 300 "$BASE/v1/load-model" -X POST -H 'Content-Type: application/json' \
   -d "{\"model\":\"$FLUX\"}" >/dev/null
@@ -62,7 +59,7 @@ echo "client disconnected mid-denoise"
 # ("[image] -> N PNG bytes") is the bug.
 VERDICT=""
 for i in $(seq 1 240); do
-  if grep -q '\[image\] generation cancelled' "$LOG"; then VERDICT=cancelled; break; fi
+  if grep -qE '\[gen\] [a-z0-9_]+ job cancelled: the client left' "$LOG"; then VERDICT=cancelled; break; fi
   if grep -q '\[image\] -> ' "$LOG"; then VERDICT=completed; break; fi
   sleep 1
 done

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Oracle for src/h3_vsa.zig: FastVideo's own MLX VSA-H3 reference
+"""Oracle for src/plugins/minimax_h3/vsa.zig: FastVideo's own MLX VSA-H3 reference
 (`fastvideo/mlx_runtime/minimax_h3_vsa.py`, `impl="reference"`), run on the CPU
 over a small packed sequence shaped like a FastH3 Omni request: text, an image
 reference, a reference video with its soundtrack, the target audio and a

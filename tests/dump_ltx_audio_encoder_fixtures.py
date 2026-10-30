@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Dump LTX-2.3 audio VAE ENCODER parity fixtures (.raw) for the Zig oracle in
-src/ltx_audio.zig ("audio VAE encoder matches the reference latent").
+src/plugins/ltx/audio.zig ("audio VAE encoder matches the reference latent").
 
 Runs the ltx-2-mlx REFERENCE encode path (AudioProcessor mel + AudioVAEEncoder)
 on a fixed deterministic stereo waveform and writes the patchified DiT-shaped

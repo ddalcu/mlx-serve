@@ -4,7 +4,7 @@
 USER-RUN, from a kev checkout with its serve extras (mlx-lm, torch, huggingface_hub):
     cd ~/kev && uv run --extra serve python /path/to/mlx-serve/tests/convert_kev_weights.py \\
         jaredpalmer/kev-4b --out ~/.mlx-serve/models/jaredpalmer/Kev-4B-MLX-Serve-8bit --q-bits 8
-Produces the dir `src/kev.zig` loads:
+Produces the dir `src/plugins/kev/kev.zig` loads:
     <out>/config.json, model*.safetensors   the base Qwen3.5 text model with the LoRA MERGED
     <out>/tokenizer files        kev's tokenizer (the pinned base's, as transformers loads it)
     <out>/kev_head.safetensors   pointer head: q.weight [P,H], q.bias [P], k.weight [P,H], k.bias [P], f32

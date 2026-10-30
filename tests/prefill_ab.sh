@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# Prefill-time A/B for a kill switch. Boots once per arm and reads the SERVER's
-# own `timings.prompt_ms`, never client-side timing.
+# prefill_ab.sh — prefill-time A/B for a kill switch, reading the SERVER's `timings.prompt_ms`, never client-side
+# timing. Boots on/off/on/off so a drifting machine cannot land on one arm.
 #
 #   tests/prefill_ab.sh <model-dir> <ENV_VAR> <on-value> <off-value> [reps]
 #
-# Every request carries a unique nonce so the prefix cache cannot serve it, and
-# the script FLAGS a reading whose cached token count exceeds the chat-template
-# header (~40) — a cached prefill is not a prefill (the trap in docs/gotchas:
-# vary the leading text and assert the cache did not serve the body).
+# Every request carries a unique nonce, and a reading whose cached token count exceeds the chat-template header (~40)
+# is FLAGGED: a cached prefill is not a prefill.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:?usage: prefill_ab.sh <model-dir> <ENV_VAR> <on-value> <off-value> [reps]}"
 VAR="${2:?}"; ONV="${3:?}"; OFFV="${4:?}"; REPS="${5:-3}"
@@ -24,11 +24,7 @@ arm() {
   pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 2
   env "$VAR=$val" "$BIN" --model "$MODEL" --serve --port "$PORT" >"$HOME/claude-tmp/prefill-ab/$PORT-${label// /}.log" 2>&1 &
   local pid=$!
-  for _ in $(seq 1 900); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-  done
+  srv_wait_health "http://127.0.0.1:$PORT" 900 1 "$pid" || true
   for r in $(seq 1 "$REPS"); do
     python3 - "$PORT" "$r" "$label" <<PY
 import json, sys, urllib.request, uuid

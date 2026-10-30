@@ -8,8 +8,12 @@
 # engagement lines, exactly 8 forwards and no fast-recipe reuse (a cached
 # velocity is meaningless across fused blocks).
 #
-# Usage: [OMNI_MODEL=<pack dir>] ./tests/test_fasth3_omni.sh [port]
+# Usage: [OMNI_MODEL=<pack dir>] ./tests/test_fasth3_omni.sh [port]   # SKIPs without the pack
+#
+# Hermetic twins: the `PDD` tests in plugins/minimax_h3/h3.zig, `zig build test -Dtest-filter="h3 vsa:"` (H3_VSA_FIXTURE from
+# tests/dump_h3_vsa_fixtures.py), `h3 vsa kernel` (GPU; H3_VSA_UBENCH=1), tests/test_convert_minimax_h3_omni.py.
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11363}"
 MODEL="${OMNI_MODEL:-$HOME/.mlx-serve/models/ddalcu/FastH3-Omni-MLX-Serve-8bit}"
 [ -f "$MODEL/transformer.safetensors" ] || { echo "SKIP: no FastH3 Omni pack at $MODEL (set OMNI_MODEL)"; exit 0; }
@@ -21,11 +25,7 @@ LOG="$WORK/server.log"
 MLX_SERVE_H3_RESIDENT=0 "$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for _ in $(seq 1 90); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -8 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 90 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -8 "$LOG"; exit 1; }
 rc=0
 
 python3 - "$WORK" <<'PY'

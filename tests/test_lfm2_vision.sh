@@ -1,14 +1,17 @@
 #!/usr/bin/env bash
-# LFM2-VL image input end-to-end over HTTP (OpenAI + Anthropic surfaces).
+# test_lfm2_vision.sh — LFM2-VL image input; the split decision and the splice's token accounting come from the server
+# log (a tiled image that fell back to one low-res view still answers, it just cannot read small text). The tower's
+# boot line + image marker ids from the TOKENIZER; a single-tile image on the reference geometry (730x487 -> 26x38,
+# 247 tokens); a large image SPLITTING (1800x1400 -> 2x3 tiles + a 252-token thumbnail = 1788, `7 image(s)`, all pads
+# in the prompt); OCR both ways (15px print at full size vs downscaled to the untiled geometry: an absolute bar on the
+# tiled arm alone passes a build that stopped tiling); /v1/messages.
 #
-# The two things output alone cannot see are asserted from the server's own log:
-# the SPLIT DECISION (one resized image vs a tile grid + thumbnail) and the token
-# accounting the splice depends on. A tiled image that silently fell back to one
-# low-res view still answers plausibly — it just cannot read anything small,
-# which is the whole reason the tiling exists.
+#   tests/test_lfm2_vision.sh [model_dir] [port]   # default the 3B 4-bit pack; SKIPs without it or PIL
 #
-# Usage: tests/test_lfm2_vision.sh [model_dir] [port]
+# Parity: the LFM2_VISION_MODEL / LFM2_VISION_FIXTURE oracle in src/plugins/lfm2/vision.zig.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
 source tests/_lib_models.sh
@@ -27,7 +30,7 @@ SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; rm -rf "$WORK"; }
 trap cleanup EXIT
 
-for i in $(seq 1 240); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "localhost:$PORT" 240 1 || true
 if ! curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; tail -20 "$LOG"; exit 1; fi
 
 FAIL=0

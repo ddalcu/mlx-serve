@@ -8,6 +8,7 @@
 #
 # Usage: ./tests/test_pull_registers_org_id.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11379}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -24,11 +25,7 @@ printf '0123' > "$MODEL/model.safetensors"
 
 HOME="$TMP/home" "$BIN" --serve --host 127.0.0.1 --port "$PORT" --model-dir "$TMP/empty" >"$TMP/server.log" 2>&1 &
 SRV=$!
-for _ in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$TMP/server.log"; exit 1; }
-  sleep 0.5
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 0.5 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$TMP/server.log"; exit 1; }
 
 rc=0
 pull=$(curl -s -X POST "http://127.0.0.1:$PORT/api/pull" -H 'Content-Type: application/json' \

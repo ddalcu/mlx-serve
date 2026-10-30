@@ -6,7 +6,6 @@
 |---|---|---|---|---|
 | **Gemma 4** | `gemma4`, `gemma4_unified` | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit`, `gemma-4-12b-unified` | Gemma turns | SigLIP (unified adds audio) |
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
-| **DiffusionGemma** | `diffusion_gemma` | `diffusiongemma-26B-A4B-it-4bit` | Gemma turns (block diffusion) | -- |
 | **Qwen 2 / 3 / 3.5 / 3.6 / 3.8** | `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-27B`, `Qwen3.6-35B-A3B`, [`Qwen3.8-27B`](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit) (18.2 GB, draft head baked in, effort levels `xhigh`/`medium`/`low`) | ChatML | Qwen3-VL |
 | **MiMo V2.6 Flash** | `mimo_v2`, `mimo_v2_flash` | Xiaomi MiMo-V2.6-Flash (309B-A15B): `mlx-community/MiMo-V2.6-Flash-RL-mxfp4-q8` and the other mlx-lm-layout packs, or the MOPD release via `tests/convert_mimo_v2.py` (158 GB: the release's MXFP4 experts unchanged, 8-bit trunk). The MOPD release prepared for mlx-stream (residents + `experts.bin`, its config declares `expert_streaming`) streams its experts from SSD on a 128 GB Mac | ChatML + XML tool calls, thinking default on | -- |
 | **MiniCPM-V 4.7** | `minicpmv4_7` | OpenBMB MiniCPM-V 4.7 35B-A3B (Qwen3.6 trunk, SigLIP2 tower): convert the HF checkpoint with `tests/convert_minicpmv4_7.py`, or use a community pack in the same mlx-vlm layout | ChatML, XML tool calls | SigLIP2, big images sliced into crops |
@@ -21,6 +20,7 @@
 | **Laguna** | `laguna` | poolside Laguna S 2.1 / XS (117.6B-A8.5B MoE coder, nvfp4) | GLM tags, pre-opened think | -- |
 | **Kolibri-1** | `kolibri1` | [`here-be-dragons-ai/Kolibri-1-MLX-3bit`](https://huggingface.co/here-be-dragons-ai/Kolibri-1-MLX-3bit) (78B-A3.5B MoE, 33 GiB) | ChatML, `reasoning_effort` | -- |
 | **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | ChatML | -- |
+| **Nemotron 3.5 Transcribe** | `nemo_speechlm` | `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` (34B-A4B, speech in), converted with `scripts/convert_nemotron_transcribe.py` (8-bit group 128 by default). Transcription, translation, speaker tags and audio questions on `/v1/audio/transcriptions` and chat `input_audio`; word timestamps, `srt`/`vtt` and `diarized_json` from its own CTC head and speaker expert; MTP drafting | ChatML, thinking via `enable_thinking` | ASR and speaker encoders |
 | **LFM2 / LFM2.5** | `lfm2`, `lfm2_vl` | LFM2.5-2.6B (8-bit, bf16, nvfp4, mxfp4), LFM2.5-VL 3B / 1.6B | ChatML, Pythonic tool calls | SigLIP2, big images tiled |
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral turns | -- |

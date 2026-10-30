@@ -4,7 +4,7 @@
 # models (gemma-4-e4b-it-4bit etc.), but those ship a *quantized* projector
 # (`embed_vision.embedding_projection.{weight,scales,biases}`). A fully-dense
 # bf16 checkpoint (gemma-4-E2B-it-qat-bf16) ships only `.weight` — no scales — so
-# the projector takes vision.zig's dense `transpose+matmul` fallback, which the
+# the projector takes engines/mlx/vision_encoder.zig's dense `transpose+matmul` fallback, which the
 # quantized fixtures never exercise. mlx-c throws on `mlx_array_ndim` of the
 # null-ctx scales handle, so this is the live guard against that regression.
 #

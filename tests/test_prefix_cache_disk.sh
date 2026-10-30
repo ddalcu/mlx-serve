@@ -1,26 +1,21 @@
 #!/bin/bash
-# SSD prefix-cache persistence (`--prefix-cache-disk`, src/kv_disk_cache.zig).
+# test_prefix_cache_disk.sh — SSD prefix-cache persistence (--prefix-cache-disk), scratch HOME (never the real
+# kv-cache). [1-3] restart round trip: persist -> kill -> reboot -> `[disk-cache] restored N/M`, byte-identical temp-0
+# output, >= 2x TTFT win, chunked on-disk layout. [4] a multi-turn extension appends chunks. [5] --prefix-cache-disk off
+# never touches the dir. [6] --no-prefix-cache-ram persists and restores with no hot residency; entries 0 disables
+# both tiers. Hybrid section (Qwen3.5-0.8B): SSM checkpoints persist and restore `(ssm@pos)` byte-identical.
+# [9] image (VISION_DISK_MODEL): text + image + text, launchd-style TERM/5 s/KILL, turn 2 restores past the logged
+# `media: item 0 at row N` within one chunk, RAM-first and SSD-only; another image in that slot stops at or before the
+# row. [10] idle flush (IDLE_FLUSH_MODEL, a qwen3_5): two ~24k sessions both land `e<N> complete on disk` before the
+# stop and restore after it. [11] SIGTERM twice mid-prefill: one `[disk-cache] shutdown persist:` summary, exit before
+# the KILL, both sessions restore; at --shutdown-persist-secs 1 no half-written entry.
 #
-# End-to-end restart round-trip:
-#   1. Boot with an isolated HOME, fire a long-prompt request (cold prefill),
-#      capture output + TTFT. Assert `[disk-cache] persisted` fires after the
-#      response.
-#   2. Kill the server. Assert chunked entries exist on disk
-#      (~/.mlx-serve/kv-cache/<fp>/e*/{meta.json,tokens.bin,c*.safetensors}).
-#   3. Boot again, re-issue the identical request. Assert:
-#        * `[disk-cache] restored N/M tokens from SSD` fires,
-#        * the restart TTFT beats the cold TTFT by >= 2x,
-#        * the output is byte-identical to run 1 (temp 0).
-#   4. Multi-turn extension after restart appends chunks, doesn't rewrite
-#      the whole entry (`persisted` with a small chunk count).
-#   5. `--prefix-cache-disk off` boots clean, serves, and never touches the
-#      kv-cache dir.
-#   6. `--no-prefix-cache-ram` keeps RAM residency at zero while SSD still
-#      persists and restores prefixes across a restart.
+#   ./tests/test_prefix_cache_disk.sh [/path/to/model] [port]
 #
-# Usage: ./tests/test_prefix_cache_disk.sh [/path/to/model] [port]
+# Hermetic twins: kv_disk_cache / disk_tier, prefix_cache two-tier, kv_disk_writer and armShutdownDeadline tests.
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-8096}"
@@ -71,11 +66,8 @@ start_server() { # extra args...
       HOME="$SCRATCH_HOME" exec "$BINARY" --model "$MODEL" --serve --port "$PORT" \
         --ctx-size 8192 --no-pld --log-level info --prefix-cache-disk 4GB "$@" ) > "$LOGFILE" 2>&1 &
     SERVER_PID=$!
-    for i in $(seq 1 90); do
-        if curl -s -f "$BASE/health" > /dev/null 2>&1; then return 0; fi
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "server died:"; tail -20 "$LOGFILE"; return 1; }
-        sleep 1
-    done
+    srv_wait_health "$BASE" 90 1 "$SERVER_PID" && return 0
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "server died:"; tail -20 "$LOGFILE"; return 1; }
     return 1
 }
 

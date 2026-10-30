@@ -277,7 +277,6 @@
 "Premium" = "프리미엄";
 "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}" = "오류: cwd에는 path 매개변수가 필요합니다. 예: {\"path\": \"myproject\"}";
 "Advanced" = "고급";
-"Speech Recognition is off" = "음성 인식이 꺼져 있음";
 "No chat model is running yet — start the server (or pick a model) and try again." = "아직 실행 중인 채팅 모델이 없습니다 — 서버를 시작하거나 모델을 선택한 후 다시 시도하세요.";
 "This looks like a task for the agent (creating files, running commands, browsing the web…), but Tools is off. Turn it on so the model can use them?" = "파일 생성, 명령 실행, 웹 탐색 등 에이전트 작업으로 보이지만 도구가 꺼져 있습니다. 모델이 사용할 수 있도록 켤까요?";
 "Quit" = "종료";
@@ -478,7 +477,6 @@
 "Compact mode" = "컴팩트 모드";
 "Vietnamese" = "베트남어";
 "Chosen to run smoothly on your %@ Mac, with memory to spare for everything else." = "%@ Mac에서 원활하게 실행되고 다른 작업을 위한 메모리 여유도 남도록 선택했습니다.";
-"On-device dictation isn't available" = "온디바이스 받아쓰기를 사용할 수 없음";
 "Video" = "비디오";
 "Can run shell commands too. File writes still stay in the folder." = "셸 명령도 실행할 수 있습니다. 파일 쓰기는 해당 폴더 안으로 제한됩니다.";
 "1536 × 640 (cinematic)" = "1536 × 640 (시네마틱)";
@@ -691,7 +689,6 @@
 "off" = "꺼짐";
 "Composing frames" = "프레임 구성 중";
 "Generate music with no singing. The lyrics below are not used." = "노래 없이 음악을 생성합니다. 아래 가사는 사용하지 않습니다.";
-"Voice mode (%@) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled)." = "음성 모드(%@) — 손을 쓰지 않고 모델과 대화합니다. 음성-텍스트 변환과 텍스트-음성 변환은 Mac에서 로컬로 실행되며, 모델은 텍스트(및 활성화된 경우 도구/생각)만 처리합니다.";
 "The model invents a soundtrack from your prompt. Attach speech to make characters say exact words." = "모델이 프롬프트를 바탕으로 사운드트랙을 만듭니다. 캐릭터가 정확한 대사를 말하게 하려면 음성을 첨부하세요.";
 "boondoggling" = "이것저것 해 보는 중";
 "Frontier model, native MLX" = "최첨단 모델, 네이티브 MLX";
@@ -1136,7 +1133,6 @@
 "More options" = "추가 옵션";
 "No background processes have been started in this chat." = "이 채팅에서 시작된 백그라운드 프로세스가 없습니다.";
 "A download into this folder was interrupted and never finished. Re-download it or delete it." = "이 폴더로의 다운로드가 중단되어 완료되지 않았습니다. 다시 다운로드하거나 삭제하세요.";
-"Open Keyboard Settings" = "키보드 설정 열기";
 "No audio yet" = "아직 오디오 없음";
 "Steps (%lld)" = "스텝(%lld)";
 "Create at github.com/settings/tokens (needs repo + read:org)" = "github.com/settings/tokens에서 생성하세요 (repo + read:org 필요)";
@@ -1329,7 +1325,6 @@
 "This overwrites ~/.mlx-serve/system-prompt.md and the built-in skills in ~/.mlx-serve/skills with the latest versions. Anything you changed is backed up first so you can restore it." = "~/.mlx-serve/system-prompt.md와 ~/.mlx-serve/skills의 내장 스킬을 최신 버전으로 덮어씁니다. 변경한 내용은 먼저 백업하여 복원할 수 있습니다.";
 "Loading quants…" = "양자화 버전 로드 중…";
 "Untitled task" = "제목 없는 작업";
-"Voice mode needs Speech Recognition access (a separate permission from Microphone). " = "음성 모드에는 음성 인식 접근 권한이 필요합니다(마이크와는 별도의 권한). ";
 "Music generation failed." = "음악 생성에 실패했습니다.";
 "Tasks" = "작업";
 "Neural Engine video boost" = "Neural Engine 비디오 가속";
@@ -1414,7 +1409,6 @@
 "Pinned llama.cpp release serving `.gguf` models. Ships inside the app download." = "`.gguf` 모델을 제공하는 고정된 llama.cpp 릴리스. 앱 다운로드에 포함되어 있습니다.";
 "From a pose skeleton" = "포즈 골격에서";
 "Clear %@" = "%@ 지우기";
-"Voice mode needs Speech Recognition access (a separate permission from Microphone). Turn it on in System Settings → Privacy & Security → Speech Recognition, then enable Voice again." = "음성 모드에는 마이크와 별개로 음성 인식 권한이 필요합니다. 시스템 설정 → 개인정보 보호 및 보안 → 음성 인식에서 허용한 뒤 음성 모드를 다시 켜세요.";
 "Map → photo" = "맵 → 사진";
 "Modern pop" = "모던 팝";
 "896 × 1152 (portrait 3:4)" = "896 × 1152 (세로 3:4)";
@@ -1475,7 +1469,6 @@
 "Couldn't read the picture %@." = "이미지 %@을(를) 읽지 못했습니다.";
 "CLI install isn't available in the App Store build (it can't symlink outside the sandbox). Download the CLI from GitHub, or use the direct-download build of the app." = "App Store 빌드에서는 CLI를 설치할 수 없습니다(샌드박스 밖으로 심볼릭 링크를 만들 수 없음). GitHub에서 CLI를 다운로드하거나 앱의 직접 다운로드 빌드를 사용하세요.";
 "Follow a clip's look and pacing (video reference)" = "클립의 룩과 템포 따르기(비디오 참조)";
-"Voice mode transcribes on-device — your audio never leaves this Mac — but on-device dictation isn't available for %@: it's either turned off or the language isn't installed. Turn on System Settings → Keyboard → Dictation (and add your language), then enable Voice again." = "음성 모드는 기기 내에서 받아쓰므로 오디오가 이 Mac을 벗어나지 않습니다. 하지만 %@의 기기 내 받아쓰기가 꺼져 있거나 언어가 설치되지 않아 사용할 수 없습니다. 시스템 설정 → 키보드 → 받아쓰기를 켜고 해당 언어를 추가한 뒤 음성 모드를 다시 켜세요.";
 "~7.1 GB, needs 16 GB+ RAM" = "~7.1 GB, 16 GB 이상 RAM 필요";
 "Control maps" = "컨트롤 맵";
 "Fast decode for bf16-attention models (recommended)" = "bf16 어텐션 모델용 빠른 디코딩(권장)";
@@ -1837,7 +1830,6 @@
 "App voice" = "앱 음성";
 "1024 × 1024 (square) · ~6s" = "1024 × 1024 (정사각형) · ~6초";
 "Change the pose" = "포즈 변경";
-"Voice mode transcribes on-device — your audio never leaves this Mac — but on-device " = "음성 모드는 기기에서 받아쓰기를 하므로 오디오가 이 Mac 밖으로 나가지 않습니다 — 하지만 기기 내 ";
 "Host" = "호스트";
 "Apple's MLX array framework — the native engine for `.safetensors` models." = "Apple의 MLX 배열 프레임워크 — `.safetensors` 모델용 네이티브 엔진.";
 "4-bit (≈4× smaller KV)" = "4비트 (KV ≈4× 축소)";
@@ -2356,3 +2348,24 @@
 "Handwritten note (Chinese text)" = "손글씨 메모 (중국어)";
 "Whiteboard (Chinese text)" = "유리 보드 (중국어)";
 "Layout poster (1024 × 1024)" = "레이아웃 포스터 (1024 × 1024)";
+"Outside plugins" = "외부 플러그인";
+"Model, media and quant-format plugins you installed with `mlx-serve plugin install` (in ~/.mlx-serve/plugins). A plugin is native code that runs with your rights. Restart the server to apply." = "`mlx-serve plugin install`로 설치한 모델, 미디어, 양자화 형식 플러그인(~/.mlx-serve/plugins)입니다. 플러그인은 사용자의 권한으로 실행되는 네이티브 코드입니다. 적용하려면 서버를 재시작하세요.";
+"%@ %@ · signed: %@ · sha256 %@" = "%@ %@ · 서명: %@ · sha256 %@";
+"Voice needs its speech model" = "음성 모드에 음성 인식 모델이 필요합니다";
+"Voice mode turns what you say into words on this Mac with Qwen3-ASR (about 1 GB). Download it, then enable Voice again." = "음성 모드는 이 Mac에서 Qwen3-ASR(약 1GB)로 말한 내용을 글로 바꿉니다. 다운로드한 다음 음성을 다시 켜세요.";
+"Download Qwen3-ASR" = "Qwen3-ASR 다운로드";
+"Voice mode — talk to the model hands-free. What you say is transcribed on this Mac and the answer spoken in your chosen voice." = "음성 모드 — 손을 쓰지 않고 모델과 대화하세요. 말한 내용은 이 Mac에서 받아쓰고, 답은 선택한 목소리로 읽어 줍니다.";
+"LFM3 (19 languages)" = "LFM3 (19개 언어)";
+"LFM3 voice" = "LFM3 목소리";
+"Speaking needs LFM3 Audio 2B (about 2.5 GB)." = "읽어 주려면 LFM3 Audio 2B(약 2.5GB)가 필요합니다.";
+"Couldn't play a preview. The voice model may not be downloaded yet." = "미리 듣기를 재생할 수 없습니다. 음성 모델이 아직 다운로드되지 않았을 수 있습니다.";
+"Tiny and quick" = "작고 빠름";
+"Liquid's small text model: answers in a blink, thinks before it answers, and calls tools. A good fit for quick questions on any Mac." = "Liquid의 작은 텍스트 모델: 눈 깜짝할 새 답하고, 답하기 전에 생각하며, 도구를 호출합니다. 어느 Mac에서나 빠른 질문에 잘 맞습니다.";
+"Sees pictures and video" = "사진과 동영상을 봅니다";
+"The same small model with eyes: describe a photo, read a screenshot, or ask about a short clip." = "같은 작은 모델에 눈을 더했습니다: 사진을 설명하고, 스크린샷을 읽고, 짧은 영상에 대해 물어보세요.";
+"Hears and speaks" = "듣고 말합니다";
+"Talk to it and it answers in its own voice: native voice mode, transcription and text to speech in 19 languages, all in one small model." = "말을 걸면 자기 목소리로 답합니다: 네이티브 음성 모드, 받아쓰기, 19개 언어 텍스트 음성 변환을 작은 모델 하나에 모두 담았습니다.";
+"Sees, hears and speaks" = "보고, 듣고, 말합니다";
+"Everything at once: pictures, video and your voice in, text or its own voice out. Native voice mode in a model under 3 GB." = "한 번에 모두: 사진, 동영상, 목소리를 넣으면 글이나 자기 목소리로 답합니다. 3GB 미만 모델로 쓰는 네이티브 음성 모드.";
+"Voice mode — the model hears you itself, and the voice chosen in Settings reads its answer." = "음성 모드 — 모델이 직접 듣고, 설정에서 고른 목소리가 답을 읽어 줍니다.";
+"LiquidAI's speech model: 19 languages, a female and a male voice each. When your chat model is LFM3 Audio or Omni, that same model reads the answers, with no second model." = "LiquidAI의 음성 모델: 19개 언어, 언어마다 여성과 남성 목소리가 하나씩 있습니다. 채팅 모델이 LFM3 Audio나 Omni이면 두 번째 모델 없이 같은 모델이 답을 읽어 줍니다.";

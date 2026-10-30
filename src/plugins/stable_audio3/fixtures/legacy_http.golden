@@ -1,0 +1,84 @@
+== speech 0 231 33fef3e31d6b087c3ce5d72585594c04009c8b171b6bb783ea51d6dbdfa9485b
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 105
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations"}}
+== speech 1 231 33fef3e31d6b087c3ce5d72585594c04009c8b171b6bb783ea51d6dbdfa9485b
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 105
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations"}}
+== speech 2 231 33fef3e31d6b087c3ce5d72585594c04009c8b171b6bb783ea51d6dbdfa9485b
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 105
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations"}}
+== speech 3 231 33fef3e31d6b087c3ce5d72585594c04009c8b171b6bb783ea51d6dbdfa9485b
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 105
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations"}}
+== music 0 231 33fef3e31d6b087c3ce5d72585594c04009c8b171b6bb783ea51d6dbdfa9485b
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 105
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations"}}
+== music 1 231 33fef3e31d6b087c3ce5d72585594c04009c8b171b6bb783ea51d6dbdfa9485b
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 105
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations"}}
+== music 2 231 33fef3e31d6b087c3ce5d72585594c04009c8b171b6bb783ea51d6dbdfa9485b
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 105
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations"}}
+== music 3 231 33fef3e31d6b087c3ce5d72585594c04009c8b171b6bb783ea51d6dbdfa9485b
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 105
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations"}}
+== sound 0 176563 56494909e50e0b4ae7e53c4d4dd833fe97cee91ba55d4584068181da304d6418
+== sound 1 235757 c40859ef916a6fd96d5a4603b998068886f43eb18130b08e7c834f90d439667f
+== sound 2 185 1c46ed016e032d1e7a2b51d149ee1c5b39fbb402b5b02c8aabc7aeec30f125ae
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 60
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"'steps' must be an integer in [1,50]"}}
+== sound 3 194 f63e1f9c78342acf6db27fb8d351d31729399d404f39b9a7090f5455ddc08411
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 69
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"missing 'prompt' (a description of the sound)"}}
+== row 696 d97ed0afba45b61a37bb9c84a05d8567dbefc90519c0715960be1dc1682ac23d
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["audio","sound"],"input_modalities":["text"],"modality":"sound","engines":["mlx"],"meta":{"architecture":"stable_audio3","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

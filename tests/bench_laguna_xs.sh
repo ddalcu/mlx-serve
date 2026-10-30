@@ -1,39 +1,18 @@
 #!/bin/bash
-# bench_laguna_xs.sh — Laguna XS 2.1 NVFP4 decode/prefill bench.
+# bench_laguna_xs.sh — Laguna XS 2.1 NVFP4 decode/prefill bench in the mlx.fast challenge's frozen window (512-token
+# prompt, 128 decode steps, temp 0; decode in ms/token, their unit) so numbers compare with Layr-Labs/mlxfast-challenge.
+# Two cells, never merged: `serial` (PLD/drafter/MTP off, their non-speculative rule: the only comparable one) and
+# `unconstrained` (mlx-serve's best config). Timing is the SERVER's `timings`, never client-side; a per-request nonce
+# defeats the prefix cache and a cell whose cached_n exceeds the template header FAILS.
 #
-# Deliberately mirrors the mlx.fast challenge's frozen timed window so our
-# numbers are directly comparable to the Layr-Labs/mlxfast-challenge tree:
-# 512-token prompt prefill, 128 decode steps, temperature 0, and DECODE
-# REPORTED IN ms/token (their unit) alongside tok/s.
+#   ./tests/bench_laguna_xs.sh [--cells serial|unconstrained] [--runs N] [--label L] [--note N] [--no-csv]
 #
-# Two cells per run, never merged:
-#   serial         PLD/drafter/MTP all off — their non-speculative rule. This
-#                  is the apples-to-apples number and the only one that may be
-#                  compared against their tree.
-#   unconstrained  whatever mlx-serve's best configuration is (spec decode
-#                  included). Reported separately; the challenge bans it.
-#
-# Timing comes from the SERVER's own `timings` object (prompt_ms / predicted_n
-# / predicted_ms), measured around the forward passes — never from timing the
-# HTTP response client-side, which folds in queueing and transport (the
-# console's 937-tok/s lesson).
-#
-# Every request prepends a unique nonce so the prefix cache cannot serve the
-# prefill; the script ASSERTS cached_n == 0 and fails the cell otherwise.
-#
-# Usage:
-#   ./tests/bench_laguna_xs.sh                      # both cells, 3 runs, write CSV
-#   ./tests/bench_laguna_xs.sh --runs 5
-#   ./tests/bench_laguna_xs.sh --cells serial
-#   ./tests/bench_laguna_xs.sh --label nvfp4-gatherqmv --note "3a on"
-#   ./tests/bench_laguna_xs.sh --no-csv             # stdout only (A/B iteration)
-#
-# Env passthrough: any MLX_SERVE_* already exported is inherited by the server,
-# so kill-switch A/Bs are `MLX_SERVE_FOO=0 ./tests/bench_laguna_xs.sh --no-csv`.
-# ALWAYS rebuild with -Doptimize=ReleaseFast first: `zig build test` does NOT
-# refresh zig-out/bin/mlx-serve.
+# Writes ~/claude-tmp/bench-laguna/laguna-xs-<date>.csv. Exported MLX_SERVE_* reach the server (kill-switch A/Bs).
+# Rebuild ReleaseFast first. When a number looks wrong: tests/fwd_ubench.sh, MLX_SERVE_DIAG=layer-cap=N, and the
+# `diagProjBench` rung ladder (story in docs/gotchas/engine-mlx.md, the f32-mscale promotion).
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 MODEL="${MODEL:-$HOME/.mlx-serve/models/poolside/Laguna-XS-2.1-NVFP4-mlx}"
@@ -109,11 +88,8 @@ start_server() {
     "$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size "$CTX" \
         --log-level info >/tmp/bench_laguna_xs_server.log 2>&1 &
     SERVER_PID=$!
-    for _ in $(seq 1 480); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-        sleep 0.5
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "server died:" >&2; tail -20 /tmp/bench_laguna_xs_server.log >&2; return 1; }
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 480 0.5 "$SERVER_PID" && return 0
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "server died:" >&2; tail -20 /tmp/bench_laguna_xs_server.log >&2; return 1; }
     echo "server never became healthy" >&2
     return 1
 }

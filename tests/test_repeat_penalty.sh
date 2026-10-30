@@ -1,15 +1,16 @@
 #!/bin/bash
-# test_repeat_penalty.sh — a penalty shapes the reply on every path that serves it.
+# test_repeat_penalty.sh — a penalty shapes the reply on every path that serves it. At temp 0 repeat / frequency /
+# presence penalties change a looping reply without logprobs, the same bytes as with them, streamed or not, and under
+# a json_schema; frequency_penalty (OpenAI's additive one) is read on chat and /v1/completions. Engagement from the
+# log: the plain request runs `[spec-stats] mode=pld`, the penalized one none, and a penalized request beside a plain
+# one keeps its solo bytes (`[batched] slot serial: penalty`).
 #
-# Bar: at temp 0, repeat/frequency/presence penalties change a looping reply
-# without logprobs, the same bytes as with them, streamed or not, and under a
-# json_schema; frequency_penalty is read on chat and /v1/completions; a
-# penalized request never runs a PLD round (verify reads raw logits).
+#   PENALTY_TEST_MODEL=<dir> ./tests/test_repeat_penalty.sh [port]   # default Qwen3.5-0.8B-MLX-4bit; SKIP without
 #
-#   PENALTY_TEST_MODEL=<dir> ./tests/test_repeat_penalty.sh [port]
-#
-# Any chat model works; defaults to Qwen3.5-0.8B-MLX-4bit. SKIPs without one.
+# Zig twin: `repeat penalty shapes every sampling path` (engines/mlx/generate.zig, LOGPROBS_TEST_MODEL).
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${PENALTY_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
 PORT="${1:-11294}"
@@ -26,8 +27,7 @@ for _ in $(seq 1 30); do lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || brea
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT
 
-for _ in $(seq 1 180); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 || { echo "fail: server never came up"; tail -20 "$LOG"; exit 1; }
+srv_wait_health "$BASE" 180 1 || { echo "fail: server never came up"; tail -20 "$LOG"; exit 1; }
 
 python3 - "$BASE" "$LOG" <<'PY'
 import json, sys, urllib.request

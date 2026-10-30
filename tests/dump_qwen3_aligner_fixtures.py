@@ -3,7 +3,7 @@
 
 Runs mlx-audio's own `qwen3_forced_aligner` (the layout our pack loader
 matches) on a 16 kHz mono WAV and its transcript, and saves every stage
-`src/forced_align.zig` has to reproduce:
+`src/plugins/qwen3_asr/forced_align.zig` has to reproduce:
   text          the transcript, UTF-8 (u8)
   pcm           the 16 kHz samples the feature extractor read (f32)
   features      WhisperFeatureExtractor log-mel [128, frames] (f32)

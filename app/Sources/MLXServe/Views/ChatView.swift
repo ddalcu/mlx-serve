@@ -2127,6 +2127,8 @@ struct ChatDetailView: View {
     /// Highlighted row; Escape hides the menu without clearing what was typed.
     @State private var slashSelection: Int = 0
     @State private var slashDismissed: Bool = false
+    /// What turning Voice on was missing (the mic, the speech model): its alert offers the fix.
+    @State private var voiceSetupIssue: VoicePreflight.Issue?
 
     /// Skills answering the half-typed command, or none when the menu is
     /// closed. Guarded by `SlashCommands.query` FIRST: the skills folder is
@@ -2897,7 +2899,7 @@ struct ChatDetailView: View {
                 // not a sheet over the transcript (the sheet hid the
                 // conversation and duplicated the composer's own toggles).
                 // Renders nothing while voice is off.
-                VoiceOrbView(controller: appState.voice, sessionId: sessionId)
+                VoiceOrbView(controller: appState.chatVoice, sessionId: sessionId)
 
                 // The note waiting for the agent's next step, where the user
                 // is looking during a long run.
@@ -3369,9 +3371,20 @@ struct ChatDetailView: View {
 
     /// Composer-row voice toggle — see `VoiceComposerToggle` for why it's an
     /// observing child view rather than a Button reading `appState.voice` here.
+    /// The chat window's voice button: purple when the model hears you itself (LFM3 Audio, Omni).
     private var voiceToggle: some View {
-        VoiceComposerToggle(controller: appState.voice, sessionId: sessionId,
-                            disabled: server.status != .running) { startVoiceMode() }
+        VoiceComposerToggle(controller: appState.chatVoice, sessionId: sessionId,
+                            disabled: server.status != .running,
+                            hears: server.chatModelInfo?.speaks == true) { startVoiceMode() }
+        .alert(L10n.text(voiceSetupIssue.map { VoicePreflight.shortMessage(for: $0) } ?? ""),
+               isPresented: Binding(get: { voiceSetupIssue != nil }, set: { if !$0 { voiceSetupIssue = nil } }),
+               presenting: voiceSetupIssue) { issue in
+            Button(L10n.text(VoicePreflight.actionLabel(for: issue))) { appState.fixVoiceSetup(issue) }
+                .keyboardShortcut(.defaultAction)
+            Button(L10n.text("Cancel"), role: .cancel) {}
+        } message: { issue in
+            Text(VoicePreflight.detail(for: issue))
+        }
     }
 
     // MARK: - Document Folder (mini RAG)
@@ -3913,20 +3926,13 @@ struct ChatDetailView: View {
     /// "move it here" click), so by the time this runs the mic is free. The
     /// orb renders inline in the BOUND session's tab — nothing to "present".
     private func startVoiceMode() {
-        guard !appState.voice.isActive else { return }
-        // Sync the voice toggles to the chat session being opened — talking should
-        // start in the same Think/Tools/MCP mode as the chat you launched it from.
-        if let s = session {
-            appState.voice.enableThinking = s.enableThinking
-            appState.voice.agentMode = s.mode == .agent
-            appState.voice.mcpMode = s.useMCP
-            // …and to the same AGENT. Voice routes each turn into its agent's own
-            // thread, so without this a tray default of "Chef" would pull the
-            // conversation out of the tab you launched voice from.
-            appState.defaultAgentId = s.agentId
+        let voice = appState.chatVoice
+        guard !voice.isActive else { return }
+        // Talk in this tab: each turn takes its toggles and agent then (the tray's pick stays the tray's).
+        Task {
+            // A missing prerequisite (the mic, the speech model) asks for its fix here, where Voice was turned on.
+            if !(await voice.begin(session: sessionId)) { voiceSetupIssue = voice.setupIssue }
         }
-        appState.sessionForAgent(session?.agentId)
-        Task { _ = await appState.voice.begin() }   // on permission failure the orb shows the error
     }
 
     // MARK: - Send Message

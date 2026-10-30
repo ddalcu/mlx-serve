@@ -1,25 +1,16 @@
 #!/bin/bash
-# GLM-5.3-Flash (glm5_next) live end-to-end on an MLX pack (TensorFold's GLM-5.3-Flash-MLX-*):
+# test_glm5_next.sh — GLM-5.3-Flash (glm5_next) live end to end on an MLX pack, scratch HOME: [0] advertised arch,
+# [1] short answer thinking off, [2] thinking on by default and low effort thinking less, [3] parallel tool calls,
+# [4] a tool round trip through the template (no fallback markup), [5] a needle past the indexer's 2048-token budget,
+# [6] prefix reuse, [7] clean streaming, [8] the MTP head drafting (`mode=mtp`), [9] concurrent requests in one batched
+# forward, [11] images (tower boot line, house.jpeg on the 36x54 grid with all 486 soft tokens, the street signs read,
+# a /v1/messages image block, image prefix reuse), no MLX error. [10] with GLM5_DRAFTER (a second boot): the DFlash2
+# policy engages on predictable text, stays armed on novel text, and leaves answers, streams, tool calls unchanged.
 #
-#   GLM5_PACK=~/.mlx-serve/models/TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP ./tests/test_glm5_next.sh
-#   (add GLM5_DRAFTER=~/.mlx-serve/models/incoai/GLM-5.3-Flash-DFlash2 for [10])
+#   GLM5_PACK=<pack> [GLM5_DRAFTER=<incoai/GLM-5.3-Flash-DFlash2>] ./tests/test_glm5_next.sh   # GLM5_TEST_PORT
 #
-#   [0] advertised as glm5_next      [4] tool round-trip renders the template, not the fallback
-#   [1] short answer, thinking off   [5] needle past the indexer's 2048-token budget (sparse path)
-#   [2] thinking on by default, and  [6] prefix reuse: cached tokens, same answer
-#       low effort thinks less       [7] streaming carries no think/tool markup
-#   [3] parallel tool calls             [8] the pack's MTP head loads and drafts
-#                                       [9] concurrent requests share one batched forward
-#   [11] images: the tower loads, house.jpeg lands on the reference's 36x54 grid (486 tokens) and all of
-#        them reach the prompt, the street signs' names are read (pixel-only content), /v1/messages takes an
-#        image block, and a repeated image turn reuses the prefix
-#   [10] with GLM5_DRAFTER=<incoai/GLM-5.3-Flash-DFlash2> (second boot): the DFlash2 round policy engages on
-#        predictable text, stays armed on novel text (plain rounds, never the sticky serial fallback), and
-#        leaves the answer, the stream, a tool call and concurrent requests unchanged
-#
-# Hermetic counterparts: the config-parse tests in model.zig, the effort and tool-history
-# render tests in chat.zig, and the `glm5_next fixture` + `glm5_next MTP fixture` parity
-# tests in transformer.zig.
+# Hermetic twins: the config-parse, effort and tool-history render tests, `glm5_next fixture` / `MTP fixture`.
+# Vision parity: tests/dump_glm5_next_vision_fixtures.py then GLM5_VISION_MODEL / GLM5_VISION_FIXTURE `glm vision`.
 
 set -euo pipefail
 

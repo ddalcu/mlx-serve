@@ -11,6 +11,7 @@
 #
 # Usage: FLUX_MODEL=<dir> CHAT_MODEL=<dir> ./tests/test_unified_gen.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11398}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -26,11 +27,7 @@ HUB=~/.cache/huggingface/hub
 "$BIN" --serve --model-dir "$HUB" --port "$PORT" >/tmp/test_unified_server.log 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for i in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: headless server did not start"; tail -5 /tmp/test_unified_server.log; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: headless server did not start"; tail -5 /tmp/test_unified_server.log; exit 1; }
 
 api() { curl -s -m 600 "http://127.0.0.1:$PORT$1" "${@:2}"; }
 

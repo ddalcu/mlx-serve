@@ -1,0 +1,5 @@
+# Rules `zig build lint -Dlint-strict=true` fails on (one rule id per line, ids from scripts/lint.py RULES).
+# P5 turns rules on one by one; every other rule is report-only.
+pin-unmatched
+source-scan-test
+history-comment

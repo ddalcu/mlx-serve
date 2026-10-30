@@ -1,0 +1,2 @@
+{"model_type":"glm5_next","layers":2,"experts":8,"counts":[[0,9,0,7,0,5,0,3],[8,0,6,0,4,0,2,1]],
+"source":{"requests":2,"prompt_tokens":52,"decode_tokens":24,"sessions":[{"prompt_set":"unit","binary_sha256":"89297e60","requests":2,"prompt_tokens":52,"decode_tokens":24}]}}

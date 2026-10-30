@@ -65,9 +65,8 @@ refuse() { # name, got, forbidden-substring
 #     kernel-order divergence past the first tokens is the sanctioned class, and
 #     this checkpoint is 2-bit REAP-pruned — it answers " Paris." correctly and
 #     then repeats the sentence instead of moving on to Germany. That is the
-#     checkpoint's continuation behaviour, not a serving defect: identical with
-#     MLX_SERVE_SLIDING_BLOCK_TRIM=0 (and the trim never engages at this prompt
-#     length), and all 12 chat/tool/thinking checks below pass. Asserting the
+#     checkpoint's continuation behaviour, not a serving defect: the sliding
+#     block trim never engages at this prompt length, and all 12 chat/tool/thinking checks below pass. Asserting the
 #     whole sentence made this a capability expectation, so it asserted more
 #     than the comment claimed.
 RAW=$(curl -s -m 300 "http://127.0.0.1:$PORT/v1/completions" -H 'Content-Type: application/json' \

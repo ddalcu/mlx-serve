@@ -560,11 +560,11 @@ extension H3PlanningTests {
             .deletingLastPathComponent()  // Tests
             .deletingLastPathComponent()  // app
             .deletingLastPathComponent()  // repo root
-        let genZig = repo.appendingPathComponent("src/gen.zig")
+        let genZig = repo.appendingPathComponent("src/host/media_jobs/gen.zig")
         // NOT a skip on failure: a skip reads as a pass, and the whole point
         // is to notice a rename nobody would otherwise see.
         let source = try String(contentsOf: genZig, encoding: .utf8)
         XCTAssertTrue(source.contains(TurboLoraFetch.fileName),
-                      "src/gen.zig no longer spells \(TurboLoraFetch.fileName) — the app would fetch a file the server never looks for")
+                      "src/host/media_jobs/gen.zig no longer spells \(TurboLoraFetch.fileName) — the app would fetch a file the server never looks for")
     }
 }

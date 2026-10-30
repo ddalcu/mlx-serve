@@ -174,7 +174,7 @@ final class AudioPaneGapTests: XCTestCase {
 
     func testAPeersMusicModelIsNotOfferedAsASpeechVoice() {
         // The server advertises a music backend ADDITIVELY as ["audio","music"]
-        // (src/server.zig, ready and stub paths alike), so "audio" is the
+        // (src/host/http/server.zig, ready and stub paths alike), so "audio" is the
         // MODALITY and not a speech tag. Asking for "audio" in the Voice pane
         // put a peer's ACE-Step / MiniMax Music 3 in the voice picker.
         let music = APIClient.parseModelInfo([

@@ -11,6 +11,7 @@
 #
 # Usage: [H3_MODEL=<dir>] ./tests/test_h3_resident.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11363}"
 MODEL="${H3_MODEL:-$HOME/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit}"
 [ -f "$MODEL/transformer.safetensors" ] || { echo "SKIP: no MiniMax-H3 pack at $MODEL (set H3_MODEL)"; exit 0; }
@@ -26,11 +27,8 @@ boot() { # <log> [env assignment]
   [ -n "$SRV" ] && { kill $SRV 2>/dev/null; wait $SRV 2>/dev/null; }
   env ${2:-X=1} "$BIN" --model "$MODEL" --serve --port "$PORT" >"$1" 2>&1 &
   SRV=$!
-  for i in $(seq 1 90); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-    kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -8 "$1"; exit 1; }
-    sleep 1
-  done
+  srv_wait_health "http://127.0.0.1:$PORT" 90 1 "$SRV" && return 0
+  kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -8 "$1"; exit 1; }
 }
 
 # gen <turbo true|false> <steps> -> "<sha1> <seconds>"

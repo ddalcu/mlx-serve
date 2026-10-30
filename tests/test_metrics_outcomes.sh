@@ -12,6 +12,7 @@
 #   Starts its own server. Default model: Gemma 4 E4B 8-bit.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
 PORT="${2:-11293}"
@@ -46,11 +47,7 @@ sleep 1
 SERVER_PID=$!
 trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true' EXIT
 
-for _ in $(seq 1 90); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 1
-done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server never became healthy on port $PORT"; exit 1; }
+srv_wait_health "$BASE" 90 1 || { echo "FAIL: server never became healthy on port $PORT"; exit 1; }
 
 # "success cancelled failed rejected" from /metrics.json.
 counters() {

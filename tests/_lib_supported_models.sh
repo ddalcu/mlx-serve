@@ -5,8 +5,8 @@
 # downloaded or wrong-arch checkpoints (e.g. a `deepseek_v4` directory that
 # would crash mlx-serve on tokenizer load).
 #
-# Must stay in sync with `supported_model_types` in src/model_discovery.zig
-# and the `model_type` branches in src/model.zig:parseConfigFromJson.
+# Must stay in sync with `supported_model_types` in src/host/registry/discovery.zig
+# and the `model_type` branches in src/engines/mlx/model.zig:parseConfigFromJson.
 #
 # Usage:
 #   source "$(dirname "$0")/_lib_supported_models.sh"

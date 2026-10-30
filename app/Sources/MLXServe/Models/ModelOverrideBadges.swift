@@ -24,13 +24,14 @@ enum ModelOverrideBadges {
 
     /// `socket` is the speculation the server will dispatch (`DrafterGems.badge`),
     /// which shows without any override: a pack's own MTP head is not a setting.
-    static func badges(_ o: ModelOverride, modelType: String, socket: SocketBadge) -> [OverrideBadge] {
+    /// `engines` is what the running server says can serve the model (nil or empty:
+    /// unknown); a stored engine outside it is not in effect and shows no badge.
+    static func badges(_ o: ModelOverride, modelType: String, engines: [String]?, socket: SocketBadge) -> [OverrideBadge] {
         var out: [OverrideBadge] = []
 
-        if ModelSettingsApply.offersNeuralEngine(modelType: modelType), let ane = o.ane {
-            out.append(OverrideBadge(
-                kind: .engine, text: ane ? "ANE" : "GPU",
-                help: ane ? "Engine: Neural Engine" : "Engine: GPU (Neural Engine switched off for this model)"))
+        if let e = o.engineChoice, engines.map({ $0.isEmpty || $0.contains(e) }) ?? true {
+            out.append(OverrideBadge(kind: .engine, text: e == "llama" ? "llama.cpp" : e.uppercased(),
+                                     help: "Engine: " + ModelSettingsApply.engineLabel(e)))
         } else if ModelSettingsApply.hasInt8PrefillRoute(modelType: modelType), o.int8Prefill == true {
             out.append(OverrideBadge(kind: .engine, text: "Int8", help: "Engine: lossy int8 prefill", lossy: true))
         }

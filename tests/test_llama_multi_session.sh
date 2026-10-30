@@ -1,32 +1,12 @@
 #!/bin/bash
-# test_llama_multi_session.sh — Iteration 3-5 of overnight perf push.
+# test_llama_multi_session.sh — llama.cpp keeps one KV session per conversation: with --llama-cache-entries 2,
+# alternating long-doc QA (A, B, A, B) reports cached_n == 0 on the first A and B and cached_n > 0 on their second
+# visits (a single shared session evicts one with the other).
 #
-# Phase 5 #1 of performance-plan.md: the embedded llama.cpp engine had a
-# single persistent KV session per LoadedModel. Alternating long-doc QA
-# (prompt A → prompt B → prompt A → prompt B) evicted each other's KV
-# on every flip, so the second visit to A was a cold prefill.
-#
-# With --llama-cache-entries 2 the cache holds both A and B simultaneously
-# and the second visit to A hits its own resident KV (cached_n > 0).
-#
-# This test exercises that. It boots the server with --llama-cache-entries 2
-# and asserts:
-#   1. First A: cached_n == 0  (cold)
-#   2. First B: cached_n == 0  (cold; B's slot is fresh)
-#   3. Second A: cached_n > 0  (A's slot survived B)
-#   4. Second B: cached_n > 0  (B's slot survived A's second visit)
-#
-# Reverting to the single-session model flips (3) and (4) red — A's session
-# was overwritten by B and re-overwritten by A on the second visit, with
-# no slack for B.
-#
-# Env:
-#   LLAMA_GGUF_MODEL   Path to a .gguf model (auto-routes through llama.cpp).
-#                      Default: Qwen3.5-4B-IQ4_NL under Sandisk.
-#   PORT               Server port. Default 19107.
-#   BINARY             Default ./zig-out/bin/mlx-serve.
+#   LLAMA_GGUF_MODEL=<file.gguf> ./tests/test_llama_multi_session.sh   # PORT (19107), BINARY
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${PORT:-19107}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -54,11 +34,7 @@ trap cleanup EXIT INT TERM
 "$BIN" --model "$MODEL" --serve --port "$PORT" --ctx-size 4096 \
     --llama-cache-entries 2 --log-level warn > "$LOG" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 240); do
-    curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && break
-    kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -30 "$LOG"; exit 1; }
-    sleep 0.5
-done
+srv_wait_health "$BASE" 240 0.5 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -30 "$LOG"; exit 1; }
 
 # Two distinct prompts, each long enough that the prefix differs in the first
 # few tokens (so commonPrefixLen between A and B is near zero — neither acts

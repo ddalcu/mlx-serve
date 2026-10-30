@@ -12,8 +12,9 @@ import json
 import os
 import subprocess
 import sys
-import time
 import urllib.request
+
+from lib.server import wait_health
 
 MODEL = os.environ.get("KOLIBRI1_MODEL", "")
 PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 11412
@@ -56,13 +57,9 @@ def check(name, ok, detail=""):
 
 
 try:
-    for _ in range(240):
-        try:
-            if call("/health", timeout=2).get("status") == "ok":
-                break
-        except Exception:
-            time.sleep(1)
-    else:
+    try:
+        wait_health(URL, 240, server)
+    except (RuntimeError, TimeoutError):
         sys.exit(f"server did not come up, see {LOG}")
 
     ids = [m["id"] for m in call("/v1/models")["data"]]

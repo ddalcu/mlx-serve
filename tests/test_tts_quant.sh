@@ -7,6 +7,7 @@
 # SKIPs cleanly when the 8-bit model isn't downloaded.
 # Usage: [TTS_QUANT_MODEL=<dir>] ./tests/test_tts_quant.sh [port]
 set -euo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11319}"
 MODEL="${TTS_QUANT_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit}"
 [ -d "$MODEL" ] || { echo "SKIP: no 8-bit qwen3_tts model at $MODEL (set TTS_QUANT_MODEL)"; exit 0; }
@@ -15,11 +16,7 @@ LOG=/tmp/test_tts_quant_server.log
 
 "$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
-for i in $(seq 1 120); do
-  curl -sf --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server exited during boot"; cat "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 120 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server exited during boot"; cat "$LOG"; exit 1; }
 curl -s --max-time 2 "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL: server did not start"; cat "$LOG"; exit 1; }
 
 # 1) Plain synthesis through the quantized talker + code predictor.

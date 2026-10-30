@@ -74,7 +74,7 @@ struct ResolutionOption: Hashable, Identifiable {
 
 /// The resolution grid a backend actually samples on.
 ///
-/// This MIRRORS `clampFluxDim` / `clampKreaDim` in `src/gen.zig` — the server
+/// This MIRRORS `clampFluxDim` / `clampKreaDim` in `src/host/media_jobs/gen.zig` — the server
 /// stays the authority and rewrites anything off-grid regardless of what the
 /// app sends. The mirror exists so the pane can say what will happen BEFORE
 /// the request, instead of the user reading a size back off a finished image.
@@ -1354,7 +1354,7 @@ struct VideoModelPreset: Identifiable, Hashable {
 // MARK: - Audio presets (TTS / voice cloning)
 
 /// A neural text-to-speech model served by mlx-serve's NATIVE Qwen3-TTS engine
-/// (`src/tts.zig`). Only the `qwen3_tts` architecture is supported — the engine
+/// (`src/plugins/qwen3_tts/tts.zig`). Only the `qwen3_tts` architecture is supported — the engine
 /// dispatches on `config.json`'s `model_type`, so non-Qwen3-TTS checkpoints
 /// (e.g. the old gpt2-based MOSS-TTS) can't load and aren't offered here.
 ///

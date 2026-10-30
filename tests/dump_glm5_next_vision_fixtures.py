@@ -3,7 +3,7 @@
 
 Runs transformers' own `Glm5NextImageProcessorPil` and `Glm5NextVisionModel`
 (fp32, CPU) on OUR pack's tower weights and saves every stage
-`src/glm_vision.zig` has to reproduce. TensorFold's MLX packs ship the tower
+`src/plugins/glm5_next/vision.zig` has to reproduce. TensorFold's MLX packs ship the tower
 dense bf16, so both sides read the same numbers and a diff is a layout/math bug.
 
 Preprocessing cases start from RGB bytes decoded here (our server decodes with

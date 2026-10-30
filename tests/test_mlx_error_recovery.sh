@@ -1,12 +1,15 @@
 #!/bin/bash
-# An MLX error costs ONE REQUEST, never the server (#353). mlx-c's default handler was
-# exit(-1). `MLX_SERVE_MLX_FAULT_CHUNK=<n>` / `_STEP=<n>` latch a synthetic Metal OOM at the
-# n-th prefill-chunk / decode-step checkpoint and disarm (`MLX_SERVE_MLX_FAULT_KIND=cuda_lost`: a sticky CUDA
-# error instead, which refuses everything after it), so one boot exercises the failure
-# (a 503 with a body, `[mlx]` in the log) and the recovery (200 on the next request).
+# test_mlx_error_recovery.sh — an MLX error costs ONE REQUEST, never the server. MLX_SERVE_DIAG=mlx-fault-chunk=<n> /
+# mlx-fault-step=<n> latch a synthetic Metal OOM at the n-th prefill-chunk / decode-step checkpoint and disarm: the faulting
+# request gets a 503 with a body (streaming: the SSE `error` event), `[mlx]` is logged, the process lives, and the
+# next request is a 200 with content; plus a long prompt with no max_tokens. mlx-fault-kind=cuda_lost: the
+# faulting and every later request answer the named 503 `gpu_context_lost`, /health answers 503 `cuda context lost`,
+# the loss is logged once, the process stays up.
 #
-# Usage: ./tests/test_mlx_error_recovery.sh [model_dir] [port]
+#   ./tests/test_mlx_error_recovery.sh [model_dir] [port]
+
 set -u
+source "$(dirname "$0")/lib/server.sh"
 MODEL=${1:-"$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"}
 PORT=${2:-8151}
 BASE="http://127.0.0.1:$PORT"
@@ -19,11 +22,11 @@ bad()  { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
 LOG=$(mktemp -t mlxerr.XXXXXX).log
 # Chunk 2, not 1, so real forward work precedes the fault.
-MLX_SERVE_MLX_FAULT_CHUNK=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+MLX_SERVE_DIAG=mlx-fault-chunk=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for _ in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "$BASE" 120 1 || true
 
 req() { # $1 = prompt
   curl -s -o /tmp/mlxerr_body.json -w '%{http_code}' -m 300 \
@@ -66,11 +69,11 @@ kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 # The decode checkpoint: a decode-time failure used to finish 200 and become the next request's 503.
 echo "[4] an MLX error during DECODE fails that request, not the next one"
 LOG2=$(mktemp -t mlxerr2.XXXXXX).log
-MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+MLX_SERVE_DIAG=mlx-fault-step=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG2" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for _ in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "$BASE" 120 1 || true
 CODE4=$(req "Write one sentence about the sea.")
 case "$CODE4" in
   503|500) ok "decode-time MLX error answered $CODE4" ;;
@@ -90,11 +93,11 @@ fi
 echo "[6] a decode-time MLX error on a STREAMING request sends the mapped SSE error"
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 LOG3=$(mktemp -t mlxerr3.XXXXXX).log
-MLX_SERVE_MLX_FAULT_STEP=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+MLX_SERVE_DIAG=mlx-fault-step=2 ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG3" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for _ in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "$BASE" 120 1 || true
 curl -s -m 300 -N -H 'content-type: application/json' \
   -d '{"model":"mlx-serve","messages":[{"role":"user","content":"Write one sentence about the sea."}],"max_tokens":32,"temperature":0,"stream":true}' \
   "$BASE/v1/chat/completions" > /tmp/mlxerr_stream.txt 2>&1
@@ -149,11 +152,11 @@ fi
 echo "[7] a lost GPU context: every request is a named 503, /health says so, the process stays up"
 kill $SRV 2>/dev/null; wait $SRV 2>/dev/null
 LOG7=$(mktemp -t mlxerr7.XXXXXX).log
-MLX_SERVE_MLX_FAULT_STEP=2 MLX_SERVE_MLX_FAULT_KIND=cuda_lost ./zig-out/bin/mlx-serve serve --model "$MODEL" \
+MLX_SERVE_DIAG=mlx-fault-step=2,mlx-fault-kind=cuda_lost ./zig-out/bin/mlx-serve serve --model "$MODEL" \
   --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG7" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for _ in $(seq 1 120); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "$BASE" 120 1 || true
 CODE8=$(req "Write one sentence about the sea.")
 [ "$CODE8" = "503" ] && grep -q 'GPU context was lost' /tmp/mlxerr_body.json &&
   ok "the faulting request answered the named 503" ||

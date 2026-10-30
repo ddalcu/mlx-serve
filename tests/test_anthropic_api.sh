@@ -1,8 +1,8 @@
 #!/bin/bash
-# Integration tests for the Anthropic Messages API (/v1/messages).
-# Tests both non-streaming and streaming, tool calling, thinking, and error handling.
-# Usage: ./tests/test_anthropic_api.sh [port]
-# Requires a running mlx-serve server with a loaded model.
+# test_anthropic_api.sh — Anthropic Messages API (/v1/messages): non-streaming and streaming, tool calling, thinking,
+# error handling. Needs a RUNNING mlx-serve with a loaded model on the port.
+#
+#   ./tests/test_anthropic_api.sh [port]
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"

@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
-# Greedy on/off comparison for a decode-path change. Boots the same model twice,
-# once per arm of a kill switch, and diffs the temp-0 continuation.
+# greedy_ab.sh — the acceptance bar for any change that claims to preserve output: boots the same model twice, once per
+# arm of a kill switch, and diffs the temp-0 chat continuation.
 #
 #   tests/greedy_ab.sh <model-dir> <ENV_VAR> <off-value> [max_tokens] [prompt]
 #
-# The switch's OFF arm is the control; a byte-identical diff is the acceptance
-# bar for any change that claims to preserve output.
+# Reports completion_tokens and finish_reason so an early stop cannot pass as agreement. Use >= 200 tokens: INT4
+# near-tie and 1-in-65536 rounding classes surface between tokens 50 and 100.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:?usage: greedy_ab.sh <model-dir> <ENV_VAR> <off-value> [max_tokens] [prompt]}"
 VAR="${2:?}"
@@ -26,11 +28,7 @@ run_arm() {
     "$BIN" --model "$MODEL" --serve --port "$PORT" >/tmp/greedy-ab-$PORT.log 2>&1 &
   fi
   local pid=$!
-  for _ in $(seq 1 600); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    kill -0 "$pid" 2>/dev/null || break
-    sleep 1
-  done
+  srv_wait_health "http://127.0.0.1:$PORT" 600 1 "$pid" || true
   curl -s "http://127.0.0.1:$PORT/v1/chat/completions" \
     -H 'content-type: application/json' \
     -d "$(printf '{"model":"m","messages":[{"role":"user","content":%s}],"max_tokens":%d,"temperature":0}' \

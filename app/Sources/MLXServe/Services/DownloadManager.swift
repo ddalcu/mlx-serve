@@ -286,6 +286,7 @@ class DownloadManager: ObservableObject {
             } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
                     || path.hasPrefix("engram/") || path.hasPrefix("tensors/") || path == "optiq/mtp.safetensors"
+                    || path.hasPrefix("audio_tokenizer/")   // a model that speaks: its speech codec (LFM3-Audio, Omni)
                     || indexedShards.contains(path) else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
@@ -339,7 +340,7 @@ class DownloadManager: ObservableObject {
     /// root markers made its complete 8.9 GB download read as absent forever
     /// (the Kokoro-vs-`tts()` bug: the pane offers Download, the click reverts).
     /// The server has the same problem and solves it the same way — it
-    /// classifies that repo from the DiT's weight NAMES (`peekMfluxFlux2`), not
+    /// classifies that repo from the DiT's weight NAMES (the flux2 plugin's `claims`), not
     /// from a root file.
     nonisolated static func holdsWeightLayout(_ dir: String) -> Bool {
         let fm = FileManager.default
@@ -386,12 +387,12 @@ class DownloadManager: ObservableObject {
     }
 
     /// Laya typed-decision checkpoints ship no root config.json; these two
-    /// files identify one. Twin of `model_discovery.peekLayaCheckpoint`.
+    /// files identify one. Twin of the laya plugin's `claims`.
     nonisolated static let layaMarkers = ["rl_agent_config.json", "encoder/config.json"]
 
     /// The model_type a marker file decides, or nil. Laya has no root config.json;
     /// a Kev pack's names its Qwen trunk, so `kev_config.json` wins. Twin of
-    /// `model_discovery.peekKevPack`.
+    /// the kev plugin's `claims`.
     nonisolated static func markerModelType(inDir dir: String) -> String? {
         let fm = FileManager.default
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("joint_head_config.json")) { return "clef" }
@@ -408,7 +409,7 @@ class DownloadManager: ObservableObject {
     }
 
     /// A D1 decision checkpoint (LiquidAI/d1-3B): its LFM2-VL config's `auto_map` names the card's own class,
-    /// which is what tells it from a chat LFM2.5-VL. Twin of `model_discovery.isD1Root`.
+    /// which is what tells it from a chat LFM2.5-VL. Twin of the d1 plugin's `claims`.
     nonisolated static func isD1Config(atPath path: String) -> Bool {
         guard let data = FileManager.default.contents(atPath: path),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -440,7 +441,7 @@ class DownloadManager: ObservableObject {
 
     /// A stable-audio-tools inpainting model conditioned on T5Gemma: the
     /// Stable Audio 3 family as Stability publishes it. Twin of
-    /// `model_discovery.peekStableAudio3Config`.
+    /// the stable_audio3 plugin's `claims`.
     nonisolated static func isStableAudio3Config(atPath path: String) -> Bool {
         guard let data = FileManager.default.contents(atPath: path),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],

@@ -38,7 +38,7 @@ STATES = {
     "cuneiform": {"body": "𒀀𒁀 renders as boxes in the PDF export, blocking our release."},
 }
 
-# HF `tokenizers` reference for the byte-fallback unit test in src/tokenizer.zig.
+# HF `tokenizers` reference for the byte-fallback unit test in src/sdk/tokenizer/tokenizer.zig.
 TOKENIZER_TEXTS = {
     "emoji": "I love it 😀🎉🚀",
     "emoji_2024": "new face 🫩 and 🪾",

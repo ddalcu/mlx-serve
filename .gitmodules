@@ -10,14 +10,3 @@
 [submodule "lib/opencode2-mlx-serve"]
 	path = lib/opencode2-mlx-serve
 	url = https://github.com/beamivalice/opencode2-mlx-serve
-[submodule "lib/sushi"]
-	path = lib/sushi
-	url = https://github.com/ddalcu/sushi
-	branch = exl3-module
-[submodule "lib/mlx-serve-gguf"]
-	path = lib/mlx-serve-gguf
-	url = https://github.com/ddalcu/mlx-serve-gguf
-[submodule "lib/mlx-stream"]
-	path = lib/mlx-stream
-	url = https://github.com/ddalcu/mlx-stream
-	branch = main

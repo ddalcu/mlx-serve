@@ -1,37 +1,14 @@
 #!/usr/bin/env python3
-"""
-Repro probe: "agent suddenly stops mid-task with no apparent reason."
+"""Repro probe for "the agent stops mid-task for no reason": drives a copy of the Swift `ChatView.runAgentLoop` (the
+app's system prompt and tool definitions inline, canned tool outputs, no filesystem writes) against a RUNNING
+mlx-serve and records per turn completion_tokens, visible content and reasoning lengths, finish_reason and parsed
+tool calls. A turn is flagged when it has no tool call, >= MIN_TOKENS_FOR_SUSPICION (100) tokens, under
+MIN_VISIBLE_CHARS (200) visible characters, and a finish_reason other than "length".
 
-Drives a faithful copy of the Swift `ChatView.runAgentLoop` against a live
-mlx-serve, with canned tool outputs so it runs entirely in-memory (no real
-filesystem mutations). The same system prompt and tool definitions used by
-the macOS app are embedded inline so the model sees an identical request to
-what it gets in production.
+    python3 tests/test_agent_stop_repro.py [--port 11234] [--max-tokens 4096] [--max-turns 15]
+                                           [--task ...] [--runs 1] [--out repro.json]
 
-What it watches for, per turn:
-  * completion_tokens reported by the server (`usage`)
-  * length of visible content the client sees
-  * length of `reasoning_content` (if any)
-  * finish_reason (last seen in the stream — useful for distinguishing
-    `stop` / `length` / `tool_calls`)
-  * whether any tool_calls parsed
-
-The "agent stops" pattern is flagged when a turn has:
-    receivedToolCalls is empty
-    AND completion_tokens >= MIN_TOKENS_FOR_SUSPICION (default 100)
-    AND len(content) + len(reasoning) < MIN_VISIBLE_CHARS (default 200)
-    AND finish_reason != "length" (length is its own bug, retried elsewhere)
-
-That's the exact shape from the user's report: hundreds of tokens generated
-but only ~120 chars of visible content and no tool to execute.
-
-Usage:
-    python3 tests/test_agent_stop_repro.py [--port 11234] [--max-tokens 4096]
-                                           [--max-turns 15] [--task ...]
-                                           [--runs 1] [--out repro.json]
-
-Exit code 0 if no suspicious stops detected, 1 otherwise. The full captured
-chunk(s) get dumped to --out (default repro_<timestamp>.json) for analysis.
+Exit 1 when a suspicious stop was seen; the captured chunks go to --out (default repro_<timestamp>.json).
 """
 
 import argparse

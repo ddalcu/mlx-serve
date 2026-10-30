@@ -2,7 +2,7 @@
 """Convert ACE-Step v1.5 XL Turbo checkpoints into mlx-serve's layout.
 
 USER-RUN (needs torch + mlx + safetensors + the HF checkpoints). Not run in CI.
-Produces the model dir the native Zig engine (`src/acestep.zig`) loads:
+Produces the model dir the native Zig engine (`src/plugins/acestep/acestep.zig`) loads:
 
     <out>/config.json          {"model_type":"acestep", ...}
     <out>/model.safetensors    DiT decoder + condition encoder + silence_latent

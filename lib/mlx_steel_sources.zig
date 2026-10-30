@@ -1,5 +1,5 @@
 // MLX's steel NAX tile headers, embedded for the kernels that reuse its tile
-// matmul in their own `metal_kernel` source (src/lane_qmm.zig). Order matters:
+// matmul in their own `metal_kernel` source (src/sdk/blocks/qmm/lane_qmm.zig). Order matters:
 // each header only uses the ones before it; their `#include "mlx/...` lines are
 // stripped by the consumer.
 

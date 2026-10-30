@@ -3,7 +3,7 @@ import XCTest
 
 final class CLISetupInstructionsTests: XCTestCase {
 
-    private let budget = AgentBudget.Budget(context: 90112, output: 16384)
+    private let budget = AgentBudget.Budget(context: 90112, output: 16384, compactionReserve: 20000)
     private var tabs: [CLISetupInstructions.Tab] {
         CLISetupInstructions.tabs(baseURL: "http://localhost:11234",
                                   servedModelId: "gemma-4-e4b-it-4bit",
@@ -131,7 +131,7 @@ final class CLISetupInstructionsTests: XCTestCase {
 
     func testZCodeConfigForceIncludesTheServedModelWithItsBudget() throws {
         let served = "served/model\"with-quote"
-        let other = AgentModelEntry(id: "other", budget: AgentBudget.Budget(context: 8192, output: 4096), vision: true)
+        let other = AgentModelEntry(id: "other", budget: AgentBudget.Budget(context: 8192, output: 4096, compactionReserve: 2048), vision: true)
         let json = AgentConfigs.zcodeProviderJSON(baseURL: "http://localhost:11234", model: served,
                                                  budget: budget, entries: [other])
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
@@ -498,8 +498,8 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// carries its own budget.
     func testOmpConfigBakesTheChatEntriesStatically() {
         let entries = [
-            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024), vision: false),
-            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536), vision: true),
+            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024, compactionReserve: 1024), vision: false),
+            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536, compactionReserve: 20000), vision: true),
         ]
         let yml = AgentConfigs.ompModelsYML(
             baseURL: "http://localhost:11234", defaultModel: "m1", entries: entries)
@@ -515,24 +515,25 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertTrue(yml.contains("efforts: [minimal, low, medium, high, xhigh]"), yml)
     }
 
-    /// The tab and the launcher carry the SAME override builder and write nothing.
-    func testCodexTabAndLauncherShareTheOverridesAndWriteNothing() throws {
+    /// Tab and launcher share the overrides and the instructions gate; neither writes into ~/.codex.
+    func testCodexTabAndLauncherShareTheOverridesAndGate() throws {
         let tab = try XCTUnwrap(tabs.first { $0.id == "codex" })
         let args = AgentConfigs.codexConfigArgs(baseURL: "http://localhost:11234",
                                                 model: "gemma-4-e4b-it-4bit", budget: budget)
         let script = LauncherCLI.codex.scriptBody("http://localhost:11234",
                                                   "gemma-4-e4b-it-4bit", "", budget, [])
         for surface in [tab.command, script] {
-            XCTAssertTrue(surface.contains("\"$CODEX_BIN\" \(args)"), surface)
-            XCTAssertFalse(surface.contains("CODEX_HOME"), surface)
-            XCTAssertFalse(surface.contains("mkdir"), surface)
-            XCTAssertFalse(surface.contains("cat >"), surface)
+            XCTAssertTrue(surface.contains(AgentConfigs.codexLaunchGate(args: args)), surface)
+            XCTAssertTrue(surface.contains("codex_launch"), surface)
+            XCTAssertFalse(surface.contains("export CODEX_HOME"), surface)
+            XCTAssertFalse(surface.contains("> ~/.codex"), "nothing writes into the user's Codex home")
+            XCTAssertFalse(surface.contains("mkdir -p ~/.codex"), surface)
         }
     }
 
     func testCodexConfigArgsOmitsTheContextWhenUnknown() {
         let zero = AgentConfigs.codexConfigArgs(baseURL: "http://x:1", model: "m1",
-                                                budget: AgentBudget.Budget(context: 0, output: 0))
+                                                budget: AgentBudget.Budget(context: 0, output: 0, compactionReserve: 1024))
         XCTAssertFalse(zero.contains("model_context_window"), zero)
         XCTAssertTrue(zero.contains(#"-c 'model_providers.mlx.base_url="http://x:1/v1"'"#), zero)
     }
@@ -540,7 +541,7 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// Byte-identical to launch.zig's "codex overrides escape a model id" test.
     func testCodexConfigArgsEscapeForTOMLThenShell() {
         let args = AgentConfigs.codexConfigArgs(baseURL: "http://x:1", model: #"o'ne"il\m"#,
-                                                budget: AgentBudget.Budget(context: 0, output: 0))
+                                                budget: AgentBudget.Budget(context: 0, output: 0, compactionReserve: 1024))
         XCTAssertTrue(args.hasPrefix(#"-c 'model="o'\''ne\"il\\m"' -c 'model_provider="mlx"'"#), args)
     }
 
@@ -627,11 +628,11 @@ final class CLISetupInstructionsTests: XCTestCase {
 
     func testAiderMetadataDeclaresEveryChatEntryWithItsOwnBudget() throws {
         let entries = [
-            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024), vision: false),
-            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536), vision: true),
+            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024, compactionReserve: 1024), vision: false),
+            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536, compactionReserve: 20000), vision: true),
         ]
         let json = AgentConfigs.aiderModelMetadataJSON(
-            model: "m1", budget: .init(context: 4096, output: 1024), entries: entries)
+            model: "m1", budget: .init(context: 4096, output: 1024, compactionReserve: 1024), entries: entries)
         let obj = try XCTUnwrap(JSONSerialization.jsonObject(
             with: Data(json.utf8)) as? [String: [String: Any]])
         XCTAssertEqual(obj["openai/m1"]?["max_input_tokens"] as? Int, 4096)
@@ -645,8 +646,8 @@ final class CLISetupInstructionsTests: XCTestCase {
     func testFxSettingsMergeOwnsOnlyOurProvider() throws {
         let existing = #"{"provider":"gateway","models":{"gateway":"x/y"},"providers":{"other":{"base_url":"https://o/v1"},"mlx-serve":{"base_url":"stale"}}}"#
         let entries = [
-            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384), vision: false),
-            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536), vision: true),
+            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384, compactionReserve: 8192), vision: false),
+            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536, compactionReserve: 20000), vision: true),
         ]
         let json = try XCTUnwrap(AgentConfigs.fxSettingsJSON(
             existing: existing, baseURL: "http://127.0.0.1:11234", entries: entries))
@@ -693,8 +694,8 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// its own key; xAI-named helper models are pinned to the launched one.
     func testGrokConfigDeclaresEveryModelAndPinsTheHelpers() {
         let entries = [
-            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384), vision: false),
-            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536), vision: true),
+            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384, compactionReserve: 8192), vision: false),
+            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536, compactionReserve: 20000), vision: true),
         ]
         let toml = AgentConfigs.grokConfigTOML(baseURL: "http://127.0.0.1:11234", model: "org/m2", budget: budget, entries: entries)
         for key in ["default", "session_summary", "image_description", "prompt_suggestion"] {
@@ -728,7 +729,7 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// A heredoc body containing its own delimiter line would truncate the
     /// config silently — assert the builders never emit one.
     func testHeredocBodiesNeverContainTheDelimiterLine() {
-        for tab in tabs where tab.command.contains("<<'EOF'") {
+        for tab in tabs where tab.command.contains("<<'EOF'\n") {
             let body = tab.command
                 .components(separatedBy: "<<'EOF'\n")[1]
                 .components(separatedBy: "\nEOF")[0]

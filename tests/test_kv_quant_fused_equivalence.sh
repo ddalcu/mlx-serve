@@ -1,36 +1,20 @@
 #!/bin/bash
-# Fused quant-attention equivalence test (Plan ricky Phase 2).
+# test_kv_quant_fused_equivalence.sh — packed quantized-KV reads at --kv-quant 4: dense vs fused agree on the first
+# KV_FUSED_FIRST_N (25) greedy tokens AND engage both ways (fused logs `[kv-attn] fused engaged` + `decode kernel
+# engaged`, dense neither). Both prompts carry a filler preamble past the 2048-token KV floor of the fused paths. The
+# spec-on arm
+# (PLD, echo prompt) pins the decode kernel to t_q == 1 (`Tq=1`) and greedy equivalence; the third arm
+# (KV_VERIFY_SPEC_MODEL, default Qwen3.5-0.8B, hd 256) asserts `[kv-attn] verify kernel engaged` + PLD engagement
+# (off NAX GPUs, where dense verify attention wins).
+# Rates are never asserted (one-run spec cells are variance).
 #
-# Verifies that running the same greedy chat-completion request against the
-# server with `--kv-attn-mode dense` (default) and `--kv-attn-mode fused`
-# produces the same first-N tokens at `--kv-quant 4`. Both paths read the
-# same quantized K/V triples; the only difference is whether SDPA dequantizes
-# into a dense tensor first (dense) or consumes the triples directly via
-# mlx_quantized_matmul (fused).
-#
-# The fused path uses Apple's `mlx_quantized_matmul` for the Q@K^T and
-# attn@V steps and `mlx_softmax` between. Reduction order differs from the
-# fused flash-attention kernel, so the first-N bar exists to catch real
-# bugs (wrong transpose, wrong group_size, NaN propagation, GQA broadcast
-# mistakes), not to enforce bit-identity.
-#
-# Fused reads are DECODE-WIDTH (T_q == 1) only since 2026-08-15; the spec-on
-# section at the bottom pins that verify widths stay off the composed chain
-# (engagement counts + the logged Tq), with greedy equivalence vs dense.
-#
-# Threshold:
-#   $KV_FUSED_FIRST_N tokens must match (default 25). The fused path
-#   reorders reductions vs. the flash-attention kernel inside
-#   mlx_fast_scaled_dot_product_attention; observed drift on
-#   gemma-4-e4b-it-4bit + --kv-quant 4 is ~26 tokens out (vs. 30 for
-#   --kv-quant 4 itself vs. --kv-quant off). 25 is the catch-real-bugs
-#   bar (wrong transpose, NaN propagation, GQA broadcast mistakes) —
-#   raise per-arch via env var for stricter testing.
-#
-# Usage:
 #   ./tests/test_kv_quant_fused_equivalence.sh [/path/to/model] [port]
+#
+# Hermetic twins: grouped-Q/strided parity tests in engines/mlx/cache/kv_quant.zig, `qkvVerParityCase`, kvAttnFusedEligible /
+# kvAttnVerifyEligible, resolveKvAttnFusedPure.
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
 PORT="${2:-8094}"
@@ -57,12 +41,14 @@ fi
 
 # Long-greedy memorized prompt (same as test_kv_quant_equivalence.sh).
 PROMPT='Recite the first paragraph of "A Tale of Two Cities" by Charles Dickens.'
+# Past the fused paths' 2048-token KV floor.
+FILLER=$(python3 -c "print('Reference notes, ignore them: ' + ' '.join(f'note{i}.' for i in range(900)))")
 
 JSON_PAYLOAD=$(python3 -c "
 import json
 print(json.dumps({
     'model': 'mlx-serve',
-    'messages': [{'role': 'user', 'content': '''$PROMPT'''}],
+    'messages': [{'role': 'user', 'content': '''$FILLER''' + '\\n\\n' + '''$PROMPT'''}],
     'max_tokens': 200,
     'temperature': 0.0,
     'stream': False,
@@ -79,9 +65,7 @@ run_and_tokenize() {
     echo "  starting server ($label)..." >&2
     local logfile
     logfile=$(mktemp)
-    # MIN_TK=1: the per-layer kv floor is a PERF gate; this test's short
-    # prompt must still exercise the fused read paths for correctness.
-    MLX_SERVE_KV_ATTN_MIN_TK=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 $extra ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$logfile" 2>&1 &
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 $extra ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$logfile" 2>&1 &
     local pid=$!
     local up=0 i
     for i in $(seq 1 60); do
@@ -230,7 +214,7 @@ SPEC_PAYLOAD=$(python3 -c "
 import json
 print(json.dumps({
     'model': 'mlx-serve',
-    'messages': [{'role': 'user', 'content': '''$SPEC_PROMPT'''}],
+    'messages': [{'role': 'user', 'content': '''$FILLER''' + '\\n\\n' + '''$SPEC_PROMPT'''}],
     'max_tokens': 96,
     'temperature': 0.0,
     'stream': False,
@@ -280,9 +264,9 @@ a='$3'.split(','); b='$4'.split(',')
 print(next(i for i,(x,y) in enumerate(zip(a,b)) if x!=y))")
     lp_payload=$(echo "$SPEC_PAYLOAD" | python3 -c "import sys,json; d=json.load(sys.stdin); d.update(max_tokens=$idx+1, logprobs=True, top_logprobs=2); print(json.dumps(d))")
     echo "  starting server (tie probe)..." >&2
-    MLX_SERVE_KV_ATTN_MIN_TK=1 "$BINARY" --model "$2" --serve --port "$PORT" --kv-quant 4 --kv-attn-mode dense --no-pld > /dev/null 2>&1 &
+    "$BINARY" --model "$2" --serve --port "$PORT" --kv-quant 4 --kv-attn-mode dense --no-pld > /dev/null 2>&1 &
     tp_pid=$!
-    for i in $(seq 1 60); do curl -s -f "$BASE/health" > /dev/null 2>&1 && break; sleep 1; done
+    srv_wait_health "$BASE" 60 1 || true
     gap=$(echo "$lp_payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" | python3 -c "
 import sys,json
 try:
@@ -324,14 +308,15 @@ fi
 sleep 2
 VER_FUSED_COMPL=""
 VER_FUSED_TOK=""
-# =1 keeps every width on the kernel (the default declines past 12 q rows).
-MLX_SERVE_KV_ATTN_VERIFY=1 run_and_tokenize "verify fused" "--kv-attn-mode fused --pld --no-drafter" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "verify fused" "--kv-attn-mode fused --pld --no-drafter" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
 MODEL="$SAVED_MODEL"
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} verify-arm fused boot never engaged PLD — the arm proves nothing."
     exit 1
 fi
-if [ "${ENGAGED_VERIFY:-0}" = "0" ]; then
+if [ "${ENGAGED_VERIFY:-0}" = "0" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q "M5"; then
+    echo -e "${YELLOW}SKIP${NC} verify kernel declined: a NAX GPU keeps dense verify attention."
+elif [ "${ENGAGED_VERIFY:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} fused arm never logged '[kv-attn] verify kernel engaged' — verify widths silently fell to dense (dispatch hole; output equality cannot see it)."
     exit 1
 fi

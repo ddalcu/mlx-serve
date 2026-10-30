@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# `--model-dir` is REPEATABLE, and every folder it names is actually served.
+# test_multi_model_dir.sh — `--model-dir` is REPEATABLE and every folder it names is served: three folders all
+# discovered; a duplicate id resolves to the FIRST folder (the copies declare different model_types, so
+# meta.architecture names the winner) and the skip is logged; one folder is unchanged; an unreachable folder is
+# SKIPPED with a warning, not fatal; a 9th --model-dir is REFUSED by name, never silently dropped.
 #
-# Before this the flag took ONE directory, so a user whose models lived in more
-# than one place (the app's download folder, the folder it used to be, an
-# LM Studio tree) had the rest listed by the app's own picker and absent from
-# /v1/models — switching to one cost a full server restart instead of a hot
-# swap, because the id was not in the registry.
+#   ./tests/test_multi_model_dir.sh [port]
 #
-# FULLY HERMETIC: the "models" are empty dirs holding a config.json. Nothing is
-# ever loaded — this pins DISCOVERY and the arg loop, which is where the bug was.
-#
-# Usage: ./tests/test_multi_model_dir.sh [port]
+# FULLY HERMETIC: the "models" are dirs holding a config.json; nothing loads. Hermetic twins: discoverModelsMany,
+# ModelRootsTests (swift).
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11378}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -35,11 +34,8 @@ boot() { # boot <logfile> <dir...>
   for d in "$@"; do args+=(--model-dir "$d"); done
   HOME="$TMP" "$BIN" --serve --port "$PORT" "${args[@]}" >"$log" 2>&1 &
   SRV=$!
-  for _ in $(seq 1 60); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-    kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$log"; return 1; }
-    sleep 0.5
-  done
+  srv_wait_health "http://127.0.0.1:$PORT" 60 0.5 "$SRV" && return 0
+  kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$log"; return 1; }
   echo "FAIL: server never became healthy"; return 1
 }
 stop() { [ -n "$SRV" ] && { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; }; SRV=""; }

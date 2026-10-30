@@ -1,19 +1,14 @@
 #!/usr/bin/env bash
-# Vision ARCH-DISPATCH sweep: one image turn against every vision code path we
-# support, asserting both a relevant answer and the encoder-engagement line that
-# proves the right path ran. This is the guard for shared-path edits (the image
-# decode branch, VisionPreproc, the encode dispatch) — a change that quietly
-# routes one arch into another's encoder passes an answer-only check and fails
-# here. The per-arch scripts (test_qwen_vision / test_muse_vision /
-# test_gemma4_unified_vision / test_dense_vision / test_vision_moe_regression)
-# stay the DEPTH coverage; this is breadth.
+# test_vision_all.sh — vision ARCH-DISPATCH sweep, the guard for shared-path edits (image decode, VisionPreproc, the
+# encode dispatch): one image turn per vision path (gemma SigLIP, gemma4_unified encoder-free, Qwen3-VL, Muse-Glimmer,
+# LFM2-VL, qwen4_exp), each asserting a relevant answer AND the encoder's own boot line. Patch-grid archs also get the
+# Gemma-only `x-mlx-pixels` buffer at the app's size and must survive it with a logged refusal. EVERY present pack per
+# arch runs across the known model roots (packs differ: dense bf16 `vision_tower.` vs quantized `model.` towers);
+# per-arch SKIP keeps it green on a partial library. gemma-3 is absent on purpose (mlx-community ships SigLIP under HF
+# names, so it serves text-only). Depth stays in the per-arch scripts.
 #
-# EVERY present candidate runs, not just the first: the packs differ in ways the
-# loader has to absorb (mlx-community's muse ships the tower DENSE bf16 under
-# bare `vision_tower.` prefixes, ours ships it quantized under `model.`), and a
-# per-arch representative cannot see that.
-#
-# Usage: tests/test_vision_all.sh [port] [arch-filter-substring]
+#   tests/test_vision_all.sh [port] [arch-filter-substring]
+
 set -uo pipefail
 cd "$(dirname "$0")/.."
 

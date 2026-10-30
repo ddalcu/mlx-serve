@@ -109,7 +109,7 @@ final class FileDescriptorStreamTests: XCTestCase {
 /// codes, hangup-kills-the-child.
 ///
 /// `zig build vz-agent-host` produces a macOS-native build of the very same
-/// `src/vz_agent.zig` that ships into the guest, listening on a unix socket
+/// `src/host/sandbox/vz_agent.zig` that ships into the guest, listening on a unix socket
 /// instead of vsock.
 ///
 ///     zig build vz-agent-host

@@ -1,32 +1,19 @@
 #!/usr/bin/env bash
-# Qwen-Image-2.1 runtime LoRAs, end to end, on BOTH variants (Turbo + base):
-# a real CHARACTER adapter and a real STYLE adapter from the Hub.
+# test_qwen_image_lora.sh — Qwen-Image-2.1 runtime LoRAs on BOTH variants (Turbo + base) with a real CHARACTER and a
+# real STYLE adapter. Per variant, same prompt + seed: no adapter twice is byte-identical; scale 0 == the control;
+# each adapter at 1.0 moves the render past DIFF_MIN and stays a picture; 0.5 lands strictly between 0 and 1.0; the
+# stack differs from either alone; an edit with the style adapter differs from the same edit without; `matched N
+# module-attachment(s)` equals the lora_A tensors in the FILE (a fused gate_up counts twice), with no "attached X of Y"
+# and no `unsupported lora format`. An eight-tile contact sheet per variant is kept for opening by eye.
 #
-# Per variant (every render same prompt + seed unless stated):
-#   1  control      no adapter twice -> byte-identical, so any later change is the adapter
-#   2  scale 0      adapter attached at 0 -> byte-identical to the control
-#   3  effect       character@1.0 and style@1.0 each move the render past DIFF_MIN and
-#                   stay a picture (not static, not a flat fill)
-#   4  scale        @0.5 lands strictly between @0 and @1.0 (the scale is really applied)
-#   5  stack        character+style differs from either alone
-#   6  edit         mode:"edit" with the style adapter differs from the same edit without
-#   7  coverage     the server's `matched N module-attachment(s)` equals what the adapter
-#                   FILE holds (lora_A tensors; a fused gate_up counts twice), no
-#                   "attached X of Y" warning, no `unsupported lora format`
+#   ./tests/test_qwen_image_lora.sh [port]   # QWEN_LORA_DIR, QWEN_LORA_STEPS (30), DIFF_MIN (2.0)
 #
-# The eight-tile contact sheet per variant (row 1: prompts WITH the trigger words,
-# row 2: the same seeds with NO trigger word) is kept for opening by eye — the metrics
-# prove the adapter acts, they cannot prove it looks like the character.
-#
-# Adapters (downloaded once into $QWEN_LORA_DIR):
-#   character  bghira/cog-qwen-image-2.1-domokun-lora  trigger 🟫   license: other -> local testing only
-#   style      wesjos/Qwen-Image2.1-ZenlessZoneZero-Lora v1.7_4000  trigger `zenlesszonezero`  apache-2.0
-#              (its modules include the fused img_mlp.gate_up the loader must split)
-#
-# SKIPs a variant whose pack is not downloaded.
-# Usage: ./tests/test_qwen_image_lora.sh [port]
-#        QWEN_LORA_DIR=<dir>  QWEN_LORA_STEPS=<base-variant steps, default 30>  DIFF_MIN=<default 2.0>
+# Adapters (downloaded once): bghira/cog-qwen-image-2.1-domokun-lora (trigger 🟫, license other: local testing only),
+# wesjos/Qwen-Image2.1-ZenlessZoneZero-Lora v1.7_4000 (`zenlesszonezero`, apache-2.0, a fused img_mlp.gate_up).
+# SKIPs a variant whose pack is absent.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11471}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -71,11 +58,8 @@ EXP_STYLE=$(python3 "$M" expected "$STYLE")
 boot() {
   "$BIN" --serve --port "$PORT" --model-dir "$MODELS" >"$LOG" 2>&1 &
   SRV=$!
-  for _ in $(seq 1 120); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-    kill -0 $SRV 2>/dev/null || { echo "FAIL: server died"; tail -5 "$LOG"; return 1; }
-    sleep 0.5
-  done
+  srv_wait_health "http://127.0.0.1:$PORT" 120 0.5 "$SRV" && return 0
+  kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server died"; tail -5 "$LOG"; return 1; }
   echo "FAIL: server never became healthy"; return 1
 }
 post() { curl -s --max-time 3600 -o "$2" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/$1" -H 'Content-Type: application/json' -d "$3"; }

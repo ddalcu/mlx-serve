@@ -1,20 +1,15 @@
 #!/bin/bash
-# Make-room eviction must return the victim's memory to the OS before the next
-# load's preflight reads OS-level availability. Two red bars, either one fails
-# the run: (1) the load after a make-room eviction must answer 200 — without
-# the clear the preflight reads OS availability with the victim's bytes still
-# parked in the allocator pool and refuses a load that fits (the live
-# 503-run of InsufficientMemory refusals); (2) window samples of
-# mlx_serve:mlx_cache_bytes across the evict→ready window must stay BELOW the
-# pool bar — a parked pool is the defect even when the next load happens to
-# fit. The sampler's own /metrics read contends on the registry mutex held
-# across the window, so samples are sparse, not absent; a pool-sized parking
-# holds long enough to be caught.
+# test_evict_returns_memory.sh — make-room eviction returns the victim's memory to the OS before the next load's
+# preflight reads OS availability. Two red bars: the load after the eviction answers 200 (a parked allocator pool
+# refuses a load that fits), and samples of mlx_serve:mlx_cache_bytes across the evict -> ready window stay below the
+# pool bar (sparse, since the /metrics read contends on the registry mutex). --max-resident-models 1 forces the
+# make-room; both packs must sit on a root and fit 3/4 of RAM together (a big victim + small next tips the preflight).
 #
-# Usage: ./tests/test_evict_returns_memory.sh [port]
-# Env: EVICT_TEST_ROOT (model root), EVICT_VICTIM=<org/repo>, EVICT_NEXT=<org/repo>,
-#      EVICT_CACHE_LIMIT_MB (default 1024)
+#   ./tests/test_evict_returns_memory.sh [port]
+#   EVICT_TEST_ROOT, EVICT_VICTIM=<org/repo>, EVICT_NEXT=<org/repo>, EVICT_CACHE_LIMIT_MB (1024)
+
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11293}"
 BASE="http://127.0.0.1:$PORT"
@@ -50,8 +45,7 @@ cleanup() {
     rm -f "$LOG" "$SAMPLER"
 }
 trap cleanup EXIT
-for _ in $(seq 1 60); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf "$BASE/health" >/dev/null || { echo -e "${RED}FAIL${NC}: server never came up"; exit 1; }
+srv_wait_health "$BASE" 60 1 || { echo -e "${RED}FAIL${NC}: server never came up"; exit 1; }
 
 cache_bytes() {  # one sample of mlx_serve:mlx_cache_bytes, empty when --metrics is off
     # --max-time 2: a sample in flight while the inference thread holds the

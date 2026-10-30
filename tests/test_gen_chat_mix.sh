@@ -1,34 +1,20 @@
 #!/usr/bin/env bash
-# Release battery: an agent keeps working while every media modality runs on the
-# same server. The 2026-10-03 incident (a pi session "hung" for 10+ minutes while
-# its own asset script ran a textured Hunyuan3D job) plus the rest of the media
-# set, against a real agent-sized chat model with its DFlash drafter.
+# test_gen_chat_mix.sh — release battery: two agents keep working while every media modality runs on one server
+# (scratch HOME, --max-resident-models = the set size; Metal only, chat never interleaves with media on CUDA). Chat: Qwen3.8-27B 4-bit + its DFlash2
+# drafter, two pi-shaped agents (streaming, tools, low effort; one alternating with plain turns). Media: FLUX klein,
+# Qwen3-TTS, ACE-Step, and a textured res-320 Hunyuan3D job when the pack + paint/ exist.
+# [1] every model loads eviction-free, the drafter binds; [2] solo references (a dflash-engaged agent turn, a seeded
+# image); [3] all media queued at once beside both agents: valid PNG/WAV/GLB, the image byte-identical to solo, >=
+# MIX_MIN_CHATS clean turns from both agents, slowest first token < MIX_MAX_TTFT (30 s), `[gen-yield] engaged`;
+# [4] streamed music and speech cancelled mid-generation each free the server; [5] alive, no `[mlx]` error.
 #
-# One server, scratch HOME, `--log-level debug`:
-#   chat  Qwen3.8-27B 4-bit + its shipped DFlash2 drafter, TWO concurrent agents
-#         (pi-shaped turns: streaming, tools, low reasoning effort; one of them
-#         alternating with plain turns), so batched decode runs beside media
-#   media FLUX klein image, Qwen3-TTS speech, ACE-Step music, Hunyuan3D textured
-#         res-320 mesh (optional, the incident's job)
-# Asserts:
-#   [1] every model loads, the drafter binds (`DFlash drafter ready`)
-#   [2] solo references: one agent turn (dflash must engage), one seeded image
-#   [3] the mix: all media jobs queued at once while both agents run turns back to back.
-#       Every media request answers 200 with a valid payload, the image is
-#       byte-identical to the solo one, at least MIX_MIN_CHATS turns finish
-#       while media is running, every turn is clean (stream ends, tool args are
-#       JSON, no markup in content), both agents land turns, the slowest first
-#       token stays under MIX_MAX_TTFT, and the log shows `[gen-yield] engaged`
-#   [4] cancel: a music client and a speech client hanging up mid-generation
-#       each free the server
-#   [5] alive: a final turn answers, no MLX error in the log
+#   ./tests/test_gen_chat_mix.sh [port]   # MIX_CHAT_MODEL, MIX_IMAGE_MODEL, MIX_TTS_MODEL, MIX_MUSIC_MODEL,
+#                                         # MIX_MESH_MODEL ("" skips), MIX_MAX_TTFT, MIX_MIN_CHATS
 #
-# Needs every pack below on a model root and the set inside this box's GPU
-# budget; SKIPs otherwise. Overrides: MIX_CHAT_MODEL, MIX_IMAGE_MODEL,
-# MIX_TTS_MODEL, MIX_MUSIC_MODEL, MIX_MESH_MODEL ("" skips the mesh job),
-# MIX_MAX_TTFT (seconds, default 30), MIX_MIN_CHATS (default 3).
-# Usage: ./tests/test_gen_chat_mix.sh [port]
+# SKIPs when a pack is missing or the set exceeds the box's budget (~45 GB).
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11463}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -53,19 +39,16 @@ total=0
 for m in "${MODELS[@]}"; do total=$((total + $(model_gb "$m"))); done
 [ "$total" -le "$(max_model_gb)" ] || { echo "SKIP: the set is ${total} GB, this box admits $(max_model_gb) GB"; exit 0; }
 
+[ "$(uname)" = Darwin ] || { echo "SKIP: chat does not interleave with media jobs on CUDA"; exit 0; }
+
 TMP=$(mktemp -d)
 LOG="$TMP/server.log"
 mkdir -p "$TMP/home"
 # The default cap of 3 resident models would evict the set into churn mid-mix.
-# Interleaving is opt-in on CUDA (off by default there); the mix asserts it engages.
-HOME="$TMP/home" MLX_SERVE_GEN_YIELD=1 "$BIN" --serve --port "$PORT" --log-level debug --max-resident-models "${#MODELS[@]}" >"$LOG" 2>&1 &
+HOME="$TMP/home" "$BIN" --serve --port "$PORT" --log-level debug --max-resident-models "${#MODELS[@]}" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $(jobs -p) 2>/dev/null; wait $SRV 2>/dev/null' EXIT
-for i in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 URL="http://127.0.0.1:$PORT"
 api() { curl -s -m 1800 "$URL$1" "${@:2}"; }
 now() { python3 -c 'import time; print(time.time())'; }
@@ -264,8 +247,8 @@ kill $CUR 2>/dev/null; wait $CUR 2>/dev/null
 python3 "$TMP/turn.py" "$URL" "$CHAT" plain >"$TMP/after.json"
 python3 -c "import json,sys; d=json.load(open('$TMP/after.json')); sys.exit(0 if d['ok'] and d['ttft'] < $MAX_TTFT else 1)" ||
   fail "[4] turn after the cancel: $(cat "$TMP/after.json")"
-for i in $(seq 1 100); do grep -q "\[music\] generation failed: error.Cancelled" "$LOG" && break; sleep 0.2; done
-grep -q "\[music\] generation failed: error.Cancelled" "$LOG" || fail "[4] the abandoned music job was not cancelled"
+for i in $(seq 1 100); do grep -q "\[gen\] acestep job cancelled: the client left" "$LOG" && break; sleep 0.2; done
+grep -q "\[gen\] acestep job cancelled: the client left" "$LOG" || fail "[4] the abandoned music job was not cancelled"
 sed 's/"}$/","stream":true}/' "$TMP/speech.json" >"$TMP/speech_stream.json"
 curl -sN -m 1800 "$URL/v1/audio/speech" -H 'Content-Type: application/json' -d @"$TMP/speech_stream.json" >"$TMP/cancel_speech.sse" &
 CUR=$!
@@ -274,8 +257,8 @@ kill $CUR 2>/dev/null; wait $CUR 2>/dev/null
 python3 "$TMP/turn.py" "$URL" "$CHAT" plain >"$TMP/after_speech.json"
 python3 -c "import json,sys; d=json.load(open('$TMP/after_speech.json')); sys.exit(0 if d['ok'] and d['ttft'] < $MAX_TTFT else 1)" ||
   fail "[4] turn after the speech cancel: $(cat "$TMP/after_speech.json")"
-for i in $(seq 1 100); do grep -q "\[audio\] synthesis cancelled" "$LOG" && break; sleep 0.2; done
-grep -q "\[audio\] synthesis cancelled" "$LOG" || fail "[4] the abandoned speech job was not cancelled"
+for i in $(seq 1 100); do grep -q "\[gen\] qwen3_tts job cancelled: the client left" "$LOG" && break; sleep 0.2; done
+grep -q "\[gen\] qwen3_tts job cancelled: the client left" "$LOG" || fail "[4] the abandoned speech job was not cancelled"
 echo "PASS: [4] cancelled music and speech jobs each freed the server (first token $(python3 -c "import json; print(round(json.load(open('$TMP/after.json'))['ttft'], 2), 's /', round(json.load(open('$TMP/after_speech.json'))['ttft'], 2), 's')"))"
 
 # [5] Alive and clean.

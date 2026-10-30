@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # qwen4_exp: the in-checkpoint MTP head's committed history rides the prefix cache. The head
-# is not KV-only (it owns a QSA key history), so a cache hit used to draft from an empty head.
+# is not KV-only (it owns a QSA key history): a hit that restored only the KV drafted from an empty head.
 # Asserts the invariant: the second turn is a hot-cache hit AND the head is restored, the
-# answer matches the persist-OFF answer, and `MLX_SERVE_MTP_HEAD_PERSIST=0` shows no restore line.
+# answer matches the cold turn's answer.
 #   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_mtp_head_persist.sh [port]
 set -u
 MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}"
@@ -71,20 +71,20 @@ import json,sys
 filler=('The archivist catalogued the shelves in the long hall. ')*700
 print(json.dumps({'messages':[{'role':'user','content':filler+' The secret code is PELICAN-42. '+filler+' What is the secret code? Answer with the code only.'}],'max_tokens':24,'temperature':0,'enable_thinking':False,'enable_mtp':True}))"; }
 
-run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_HEAD_PERSIST value
+run_arm() { # $1 = arm name
   # One declaration per line: `local a="$1" b="$DIR/$a.log"` expands before assigning.
   local name="$1"
-  local persist="$2"
   local log="$DIR/$name.log"
   local u="http://127.0.0.1:$PORT"
   local b
-  MLX_SERVE_MTP_HEAD_PERSIST="$persist" "$BIN" --model "$MODEL" --serve --host 127.0.0.1 \
+  "$BIN" --model "$MODEL" --serve --host 127.0.0.1 \
     --port "$PORT" --log-level info --mtp --prefix-cache-entries 4 > "$log" 2>&1 &
   SPID=$!
   for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && grep -q "ready" "$log" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$log"; exit 1; }; sleep 2; done
   b=$(body)
   # Turn 1 cold-prefills and COMMITS the head; turn 2 is the cache hit.
-  curl -s -m 1800 "$u/v1/chat/completions" -H 'content-type: application/json' -d "$b" >/dev/null
+  curl -s -m 1800 "$u/v1/chat/completions" -H 'content-type: application/json' -d "$b" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" > "$DIR/$name.cold"
   curl -s -m 1800 "$u/v1/chat/completions" -H 'content-type: application/json' -d "$b" \
     | python3 -c "import sys,json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" > "$DIR/$name.answer"
   # Through the same helper the trap uses; SPID is captured before the call.
@@ -96,23 +96,16 @@ run_arm() { # $1 = arm name, $2 = MLX_SERVE_MTP_HEAD_PERSIST value
 BASELINE_FREE_MB=$(free_mb)
 echo "baseline free+inactive before any boot: ${BASELINE_FREE_MB} MB"
 
-echo "[1] persistence ON: the second turn restores the head"
-run_arm on 1
+echo "[1] the second turn restores the head"
+run_arm on
 check "hot-cache hit on turn 2" "$(grep -c '\[hot-cache\] reused' "$DIR/on.log" | sed 's/^[1-9][0-9]*$/1/')" "1"
 check "MTP head restored" "$(grep -c '\[qwen4\] MTP head restored' "$DIR/on.log" | sed 's/^[1-9][0-9]*$/1/')" "1"
 check "head restore never declined" "$(grep -c '\[qwen4\] MTP head restore declined' "$DIR/on.log")" "0"
 check "needle recovered on the restored turn" "$(grep -c 'PELICAN-42' "$DIR/on.answer")" "1"
 
-echo "[2] MLX_SERVE_MTP_HEAD_PERSIST=0 restores the old behaviour"
-run_arm off 0
-check "hot-cache hit on turn 2" "$(grep -c '\[hot-cache\] reused' "$DIR/off.log" | sed 's/^[1-9][0-9]*$/1/')" "1"
-check "no head restore line" "$(grep -c '\[qwen4\] MTP head restore' "$DIR/off.log")" "0"
-check "needle still recovered (blind head costs acceptance, never a token)" "$(grep -c 'PELICAN-42' "$DIR/off.answer")" "1"
-
-echo "[3] the restored head answers what the blind head answers"
-# Greedy verify decides every emitted token on BOTH arms — drafts steer
-# acceptance only — so a restored head must not change the answer.
-check "restored == blind (first 20 chars)" "$(head -c 20 "$DIR/on.answer")" "$(head -c 20 "$DIR/off.answer")"
+echo "[2] the restored head answers what the cold turn answered"
+# Greedy verify decides every emitted token — drafts steer acceptance only — so a restored head must not change the answer.
+check "restored == cold (first 20 chars)" "$(head -c 20 "$DIR/on.answer")" "$(head -c 20 "$DIR/on.cold")"
 
 echo "pass=$pass fail=$fail"
 [ "$fail" -eq 0 ]

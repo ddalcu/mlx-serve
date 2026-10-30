@@ -1,0 +1,602 @@
+//! Fused single-token GatedDeltaNet step for Hadamard packs (B=1, S=1, swish
+//! output gate; activations T, recurrent state StT): two dispatches instead of
+//! prework + recurrence + norm-gate + rotation. K1 runs one head over SPLIT threadgroups, each
+//! recomputing the conv/silu/q-k norm prework for its head (cheaper than a
+//! barrier between kernels) before its slice of the recurrence rows. K2 does
+//! the per-head gated RMS norm over one Hadamard block of heads and rotates it
+//! for out_proj. Bit-identical to the composed chain.
+const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
+const mlx = @import("../../../mlx/ffi.zig");
+const log = @import("../../util/log.zig");
+const rht = @import("../../quant/hadamard/rht.zig");
+
+pub const HEADER = kernelSource("kernels/gdn/log1p.metal");
+
+/// The dtype every kernel here (GT) rounds the decay gate a + dt_bias -> g to. Under bf16
+/// activations it is the state's: a bf16 gate near one is exactly 1.0 and that head never
+/// forgets. f16-activation (Hadamard) packs keep the f16 gate their fidelity guard measured.
+pub fn gateDtype(act: mlx.mlx_dtype, state: mlx.mlx_dtype) mlx.mlx_dtype {
+    return if (act == .bfloat16) state else act;
+}
+
+pub const K1_SOURCE = kernelSource("kernels/gdn/decode_k1.metal");
+
+pub const K2_SOURCE = kernelSource("kernels/gdn/decode_k2.metal");
+
+// K1 over TL tokens (verify widths): the same per-token prework and recurrence,
+// token after token, plus the per-step state capture MTP rollback reads
+// (state_seq[TL-1] is never written, as in the stock capture kernel).
+const K1S_HEAD = kernelSource("kernels/gdn/decode_k1s_head.metal");
+const K1S_TAIL = kernelSource("kernels/gdn/decode_k1s_tail.metal");
+pub const K1S_SOURCE = K1S_HEAD ++ "\n    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);\n" ++ K1S_TAIL;
+
+// K1S at one threadgroup per head (NT=1024, SPLIT=1: the same 4 rows per
+// simdgroup, so each row's recurrence is unchanged) with the verify epilogues
+// folded in. A head's 128 y values stay in threadgroup
+// memory, rounded to T as the stored y was, and simdgroup t runs the norm-gate
+// kernel's exact reduction for token t. The conv-input rows rollback slices are copied out as well.
+pub const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));\n" ++ K1S_TAIL ++ "\n" ++ kernelSource("kernels/gdn/decode_k1s_fold_epilogue.metal");
+
+// A draft tree runs in two launches, one simdgroup per job: K1P does each
+// row's conv/silu/q-k norm prework once per head (K1S's arithmetic), reading
+// qkv (row stride QS) and a, b (row stride ABS, at AOFF/BOFF) in place, so
+// the columns of the joined in-projection need no copies. Then K1TR
+// walks the rows parents first, one dv row per simdgroup in 128-thread
+// threadgroups, a restart row's state kept in registers.
+pub const K1P_SOURCE = kernelSource("kernels/gdn/decode_k1p.metal");
+
+// Row t restarts from its parent's state unless the parent is row t - 1.
+pub const K1TR_SOURCE = kernelSource("kernels/gdn/decode_k1tr.metal");
+
+// The recurrence along `path` (window rows, oldest first) from the round's
+// input state, the tree kernel's ops and per-token rounding: the state serial
+// decoding holds after the path's last row. K1TR's grid. The same launch
+// copies the kept conv window: rows `conv_rows` of the conv input.
+pub const K1R_SOURCE = kernelSource("kernels/gdn/decode_k1r.metal");
+
+const SPLIT: c_int = 4;
+const NT: c_int = 256; // 4 dv rows per simdgroup
+/// Multi-token rows run one dv row per simdgroup on NAX: a token's rows then
+/// take one reduction pair in sequence, not four (a row's arithmetic is the
+/// same, so the rows are bit-identical either way). Other GPUs cap this
+/// kernel's threadgroup below 1024 and keep K1's 256.
+fn seqNt() c_int {
+    return if (@import("../../../mlx/device.zig").naxAvailable()) 1024 else NT;
+}
+
+var k1_cache: ?mlx.mlx_fast_metal_kernel = null;
+var k2_cache: ?mlx.mlx_fast_metal_kernel = null;
+
+fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [*:0]const u8, header: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
+    const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, header, true, false);
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    return k;
+}
+
+pub const Geometry = struct { hk: c_int, hv: c_int, dk: c_int, dv: c_int };
+
+pub const Inputs = struct {
+    qkv: mlx.mlx_array, // [1,1,C]
+    z: mlx.mlx_array, // [1,1,Hv*Dv]
+    a: mlx.mlx_array, // [1,1,Hv]
+    b: mlx.mlx_array, // [1,1,Hv]
+    conv_state: mlx.mlx_array, // [1,3,C]
+    ssm_state: mlx.mlx_array, // [1,Hv,Dv,Dk]
+    conv_w: mlx.mlx_array,
+    A_log: mlx.mlx_array,
+    dt_bias: mlx.mlx_array,
+    q_scale: mlx.mlx_array, // 0-dim bf16
+    k_scale: mlx.mlx_array, // 0-dim bf16
+    norm_w: mlx.mlx_array,
+    eps: mlx.mlx_array, // 0-dim f32
+    signs: mlx.mlx_array, // [Hv*Dv] f32, out_proj's
+};
+
+fn rowsAre(a: mlx.mlx_array, t_len: c_int, width: c_int) bool {
+    const sh = mlx.getShape(a);
+    return sh.len == 3 and sh[0] == 1 and sh[1] == t_len and sh[2] == width;
+}
+
+fn sizeIs(a: mlx.mlx_array, n: c_int) bool {
+    return mlx.mlx_array_size(a) == @as(usize, @intCast(n));
+}
+
+/// The kernels index every input as a row-major block of a fixed size, so a
+/// wrong width would read a neighbour's row. Per-token rows must be exactly
+/// [1,T,width]; weights and states must hold exactly the elements indexed.
+/// `gate`: z, norm_w and eps are read too.
+fn inputsFit(g: Geometry, t_len: c_int, in: Inputs, gate: bool) bool {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const base = rowsAre(in.qkv, t_len, c) and rowsAre(in.a, t_len, g.hv) and rowsAre(in.b, t_len, g.hv) and
+        sizeIs(in.conv_state, 3 * c) and sizeIs(in.ssm_state, g.hv * g.dv * g.dk) and sizeIs(in.conv_w, 4 * c) and
+        sizeIs(in.A_log, g.hv) and sizeIs(in.dt_bias, g.hv) and sizeIs(in.q_scale, 1) and sizeIs(in.k_scale, 1);
+    if (!gate) return base;
+    return base and rowsAre(in.z, t_len, g.hv * g.dv) and sizeIs(in.norm_w, g.dv) and sizeIs(in.eps, 1);
+}
+
+pub const Outputs = struct { rot: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array };
+
+const CfgKey = struct { g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype };
+var cfg_key: ?CfgKey = null;
+var cfg1: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
+const Cfg2Key = struct { vd: c_int, dv: c_int, dt: mlx.mlx_dtype, block: c_int };
+var cfg2_key: ?Cfg2Key = null;
+var cfg2: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
+
+fn buildConfigs(g: Geometry, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !void {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const c1 = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c1);
+    const y_shape = [_]c_int{ 1, 1, g.hv, g.dv };
+    const cs_shape = [_]c_int{ 1, 3, c };
+    const st_shape = [_]c_int{ 1, g.hv, g.dv, g.dk };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &y_shape, 4, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &cs_shape, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c1, &st_shape, 4, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c1, g.hv * SPLIT * NT, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c1, NT, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "StT", st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c1, "GT", gateDtype(dt, st)));
+    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", NT }, .{ "SPLIT", SPLIT } }) |kv|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c1, kv[0], kv[1]));
+    if (cfg1.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(cfg1);
+    cfg1 = c1;
+    cfg_key = .{ .g = g, .dt = dt, .st = st };
+}
+
+fn buildConfig2(key: Cfg2Key) !void {
+    const c2 = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c2);
+    const rot_shape = [_]c_int{ 1, 1, key.vd };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c2, &rot_shape, 3, key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c2, @divExact(key.vd, key.block) * 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c2, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c2, "T", key.dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c2, "DV", key.dv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c2, "J", @divExact(key.block, 32)));
+    if (cfg2.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(cfg2);
+    cfg2 = c2;
+    cfg2_key = key;
+}
+
+pub const Recur = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array };
+
+/// K1 alone: prework + recurrence, y as [1,1,Hv,Dv]; z, norm_w, eps and signs
+/// are not read. Null when the geometry or dtypes are outside the kernel.
+pub fn recur(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Recur {
+    if (!mlx.streamIsGpu(s)) return null;
+    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0 or @rem(g.hv * g.dv, 1024) != 0) return null;
+    const dt = mlx.mlx_array_dtype(in.qkv);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale }) |arr|
+        if (mlx.mlx_array_dtype(arr) != dt) return null;
+    const st = mlx.mlx_array_dtype(in.ssm_state);
+    if (st != dt and st != .float32) return null;
+    if (!inputsFit(g, 1, in, false)) return null;
+    if (k1_cache == null) k1_cache = try makeKernel("msv_gdn_decode_recur", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out" }, K1_SOURCE, HEADER);
+    const key = CfgKey{ .g = g, .dt = dt, .st = st };
+    if (cfg_key == null or !std.meta.eql(cfg_key.?, key)) try buildConfigs(g, dt, st);
+
+    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale };
+    const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
+    defer _ = mlx.mlx_vector_array_free(v1);
+    var o1 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1_cache.?, v1, cfg1, s));
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    var conv_out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(conv_out);
+    var state_out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(state_out);
+    try mlx.check(mlx.mlx_vector_array_get(&y, o1, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&conv_out, o1, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&state_out, o1, 2));
+    return .{ .y = y, .conv_state = conv_out, .ssm_state = state_out };
+}
+
+/// Null when the geometry or dtypes are outside the kernels (caller keeps the chain).
+/// `block`: the pack's Hadamard block, a whole number of heads per simdgroup.
+pub fn step(g: Geometry, block: c_int, in: Inputs, s: mlx.mlx_stream) !?Outputs {
+    if (!mlx.streamIsGpu(s)) return null;
+    for ([_]mlx.mlx_array{ in.z, in.norm_w }) |arr|
+        if (mlx.mlx_array_dtype(arr) != mlx.mlx_array_dtype(in.qkv)) return null;
+    if (!inputsFit(g, 1, in, true) or !sizeIs(in.signs, g.hv * g.dv)) return null;
+    if (!rht.kernelBlock(block) or @rem(g.hv * g.dv, block) != 0 or @rem(block, 4 * g.dv) != 0) return null;
+    const r = (try recur(g, in, s)) orelse return null;
+    defer _ = mlx.mlx_array_free(r.y);
+    errdefer _ = mlx.mlx_array_free(r.conv_state);
+    errdefer _ = mlx.mlx_array_free(r.ssm_state);
+    if (k2_cache == null) k2_cache = try makeKernel("msv_gdn_decode_normgate_rot", &.{ "y", "z", "norm_w", "eps", "signs" }, &.{"rot"}, K2_SOURCE, "");
+    const key2 = Cfg2Key{ .vd = g.hv * g.dv, .dv = g.dv, .dt = mlx.mlx_array_dtype(in.qkv), .block = block };
+    if (cfg2_key == null or !std.meta.eql(cfg2_key.?, key2)) try buildConfig2(key2);
+
+    const in2 = [_]mlx.mlx_array{ r.y, in.z, in.norm_w, in.eps, in.signs };
+    const v2 = mlx.mlx_vector_array_new_data(&in2, in2.len);
+    defer _ = mlx.mlx_vector_array_free(v2);
+    var o2 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o2);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k2_cache.?, v2, cfg2, s));
+    var rot = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&rot, o2, 0));
+    return .{ .rot = rot, .conv_state = r.conv_state, .ssm_state = r.ssm_state };
+}
+
+/// A tree round's per-row recurrence inputs (f32): k [T,Hk,Dk], v [T,Hv,Dv],
+/// g|beta [T,Hv,2].
+pub const Prework = struct { k: mlx.mlx_array = .{ .ctx = null }, v: mlx.mlx_array = .{ .ctx = null }, gb: mlx.mlx_array = .{ .ctx = null } };
+
+pub const RecurSeq = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array };
+
+pub const MAX_SEQ: c_int = 16;
+/// The fold keeps a head's y rows in threadgroup memory beside K1S's q/k/v rows; past 8 they pass 32 KB.
+pub const FOLD_MAX_SEQ: c_int = 8;
+var k1s_cache: ?mlx.mlx_fast_metal_kernel = null;
+var seq_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+var seq_cfg_key: ?CfgKey = null;
+
+fn buildSeqConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype) !mlx.mlx_fast_metal_kernel_config {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, t_len, g.hv, g.dv }, 4, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * SPLIT * seqNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, seqNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gateDtype(dt, st)));
+    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", seqNt() }, .{ "SPLIT", SPLIT } }) |kv|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TL", t_len));
+    return cfg;
+}
+
+/// The input dtypes the multi-token kernels take: null when outside them.
+fn seqDtypes(g: Geometry, t_len: c_int, in: Inputs) ?CfgKey {
+    if (t_len < 1 or t_len > MAX_SEQ) return null;
+    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
+    const dt = mlx.mlx_array_dtype(in.qkv);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale }) |arr|
+        if (mlx.mlx_array_dtype(arr) != dt) return null;
+    const st = mlx.mlx_array_dtype(in.ssm_state);
+    if (st != dt and st != .float32) return null;
+    if (!inputsFit(g, t_len, in, false)) return null;
+    return .{ .g = g, .dt = dt, .st = st };
+}
+
+/// K1 over t_len tokens (2..MAX_SEQ) with per-step state capture: y as
+/// [1,T,Hv,Dv], the next conv state, the final state and state_seq
+/// ([T,1,Hv,Dv,Dk], row T-1 unwritten). Null outside the kernel's geometry.
+pub fn recurSeq(g: Geometry, t_len: c_int, in: Inputs, s: mlx.mlx_stream) !?RecurSeq {
+    if (!mlx.streamIsGpu(s)) return null;
+    const key = seqDtypes(g, t_len, in) orelse return null;
+    if (k1s_cache == null) k1s_cache = try makeKernel("msv_gdn_decode_recur_seq", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale" }, &.{ "y", "conv_out", "state_out", "state_seq" }, K1S_SOURCE, HEADER);
+    if (seq_cfg_key == null or !std.meta.eql(seq_cfg_key.?, key)) {
+        for (&seq_cfgs) |*slot| if (slot.*) |c| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(c);
+            slot.* = null;
+        };
+        seq_cfg_key = key;
+    }
+    const idx: usize = @intCast(t_len);
+    if (seq_cfgs[idx] == null) seq_cfgs[idx] = try buildSeqConfig(g, t_len, key.dt, key.st);
+
+    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale };
+    const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
+    defer _ = mlx.mlx_vector_array_free(v1);
+    var o1 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1s_cache.?, v1, seq_cfgs[idx].?, s));
+    var out: [4]mlx.mlx_array = @splat(.{ .ctx = null });
+    errdefer for (out) |a| if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*a, i| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
+    }
+    return .{ .y = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3] };
+}
+
+/// The joined in-projection `[1,T,W]` whose columns [0,C) are qkv, [a_off,
+/// a_off+Hv) a and [b_off, b_off+Hv) b, read in place instead of the slices.
+pub const Joined = struct { all: mlx.mlx_array, a_off: c_int, b_off: c_int };
+
+pub const RecurTree = struct { y: mlx.mlx_array, conv_input: mlx.mlx_array, prework: Prework };
+
+var k1p_cache: ?mlx.mlx_fast_metal_kernel = null;
+var k1tr_cache: ?mlx.mlx_fast_metal_kernel = null;
+var tree_cfgs: [MAX_SEQ + 1]?[2]mlx.mlx_fast_metal_kernel_config = @splat(null);
+const TreeKey = struct { k: CfgKey, cols: [4]c_int };
+var tree_cfg_key: ?TreeKey = null;
+
+fn buildTreeConfigs(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, cols: [4]c_int) ![2]mlx.mlx_fast_metal_kernel_config {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const pre = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(pre);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pre, &[_]c_int{ t_len, g.hk, g.dk }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pre, &[_]c_int{ t_len, g.hk, g.dk }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pre, &[_]c_int{ t_len, g.hv, g.dv }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pre, &[_]c_int{ t_len, g.hv, 2 }, 3, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(pre, &[_]c_int{ 1, 3 + t_len, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(pre, 32, 2 * g.hk + g.hv, t_len));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(pre, 32, 1, 1));
+    inline for (.{ "QS", "ABS", "AOFF", "BOFF" }, 0..) |name, i| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(pre, name, cols[i]));
+    const tree = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(tree);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(tree, &[_]c_int{ 1, t_len, g.hv, g.dv }, 4, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(tree, 32, g.dv, g.hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(tree, 32, 4, 1));
+    for ([_]mlx.mlx_fast_metal_kernel_config{ pre, tree }) |cfg| {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gateDtype(dt, st)));
+        inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "TL", t_len } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+    }
+    return .{ pre, tree };
+}
+
+/// A draft tree's rows (`table` from `treeTable`): y [1,T,Hv,Dv] (each row
+/// the last row of a chain over its own path), the conv input [1,3+T,C] the
+/// commit slices, and the per-row recurrence inputs `replay` reads. The
+/// states stay where they were: the commit replays the kept path. `joined`,
+/// when in.qkv/a/b are slices of it, is read in place.
+pub fn recurTree(g: Geometry, t_len: c_int, in: Inputs, joined: ?Joined, table: mlx.mlx_array, s: mlx.mlx_stream) !?RecurTree {
+    if (!mlx.streamIsGpu(s)) return null;
+    const key = seqDtypes(g, t_len, in) orelse return null;
+    if (!sizeIs(table, 6 * t_len)) return null;
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    var cols = [4]c_int{ c, g.hv, 0, 0 };
+    var srcs = [3]mlx.mlx_array{ in.qkv, in.a, in.b };
+    if (joined) |j| {
+        const w = mlx.getShape(j.all)[2];
+        if (!rowsAre(j.all, t_len, w) or mlx.mlx_array_dtype(j.all) != key.dt or j.a_off < c or j.b_off < c or j.a_off + g.hv > w or j.b_off + g.hv > w) return null;
+        cols = .{ w, w, j.a_off, j.b_off };
+        srcs = .{ j.all, j.all, j.all };
+    }
+    if (k1p_cache == null) k1p_cache = try makeKernel("msv_gdn_decode_tree_pre", &.{ "qkv", "a_in", "b_in", "conv_state", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "parents" }, &.{ "pq", "pk", "pv", "pg", "conv_in" }, K1P_SOURCE, HEADER);
+    if (k1tr_cache == null) k1tr_cache = try makeKernel("msv_gdn_decode_tree", &.{ "pq", "pk", "pv", "pg", "state_in", "parents" }, &.{"y"}, K1TR_SOURCE, "");
+    const tkey = TreeKey{ .k = key, .cols = cols };
+    if (tree_cfg_key == null or !std.meta.eql(tree_cfg_key.?, tkey)) {
+        for (&tree_cfgs) |*slot| if (slot.*) |cs| {
+            for (cs) |cfg| _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+            slot.* = null;
+        };
+        tree_cfg_key = tkey;
+    }
+    const idx: usize = @intCast(t_len);
+    if (tree_cfgs[idx] == null) tree_cfgs[idx] = try buildTreeConfigs(g, t_len, key.dt, key.st, cols);
+    const cfgs = tree_cfgs[idx].?;
+
+    const in1 = [_]mlx.mlx_array{ srcs[0], srcs[1], srcs[2], in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, table };
+    const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
+    defer _ = mlx.mlx_vector_array_free(v1);
+    var o1 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1p_cache.?, v1, cfgs[0], s));
+    var pre: [5]mlx.mlx_array = @splat(.{ .ctx = null });
+    defer _ = mlx.mlx_array_free(pre[0]);
+    errdefer for (pre[1..]) |a| if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&pre, 0..) |*a, i| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
+    }
+    const in2 = [_]mlx.mlx_array{ pre[0], pre[1], pre[2], pre[3], in.ssm_state, table };
+    const v2 = mlx.mlx_vector_array_new_data(&in2, in2.len);
+    defer _ = mlx.mlx_vector_array_free(v2);
+    var o2 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o2);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o2, k1tr_cache.?, v2, cfgs[1], s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, o2, 0));
+    return .{ .y = y, .conv_input = pre[4], .prework = .{ .k = pre[1], .v = pre[2], .gb = pre[3] } };
+}
+
+/// `recurTree`'s table for rows with `parents` (-1 = the root): the parents,
+/// each row's four conv-input sources oldest first (< 3 a conv-state row, else
+/// 3 + a window row), resolved on the host once instead of per channel, then
+/// which rows a later node restarts from.
+pub fn treeTable(parents: []const i32, out: []i32) void {
+    const n = parents.len;
+    std.debug.assert(out.len == 6 * n);
+    @memcpy(out[0..n], parents);
+    @memset(out[5 * n ..], 0);
+    for (parents, 0..) |p, t| {
+        if (p >= 0 and p != @as(i32, @intCast(t)) - 1) out[5 * n + @as(usize, @intCast(p))] = 1;
+    }
+    for (0..n) |t| {
+        var depth: i32 = 0;
+        var r: i32 = @intCast(t);
+        while (parents[@intCast(r)] >= 0) : (r = parents[@intCast(r)]) depth += 1;
+        for (0..4) |tap| {
+            const up: i32 = 3 - @as(i32, @intCast(tap));
+            const dd = depth - up;
+            if (dd < 0) {
+                out[n + t * 4 + tap] = dd + 3;
+                continue;
+            }
+            var a: i32 = @intCast(t);
+            var k = up;
+            while (k > 0) : (k -= 1) a = parents[@intCast(a)];
+            out[n + t * 4 + tap] = 3 + a;
+        }
+    }
+}
+
+test "treeTable: a chain reads t + tap, a branch reads its own ancestors" {
+    var out: [6 * 4]i32 = undefined;
+    treeTable(&.{ -1, 0, 1, 2 }, &out);
+    for (0..4) |t| for (0..4) |tap| try std.testing.expectEqual(@as(i32, @intCast(t + tap)), out[4 + t * 4 + tap]);
+    var tree: [6 * 3]i32 = undefined;
+    treeTable(&.{ -1, 0, 0 }, &tree);
+    // row 2 (depth 1, parent 0): conv rows 1, 2, then window rows 0 and 2.
+    try std.testing.expectEqualSlices(i32, &.{ 1, 2, 3, 5 }, tree[3 + 8 .. 3 + 12]);
+}
+
+var k1r_cache: ?mlx.mlx_fast_metal_kernel = null;
+var replay_cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null };
+var replay_key: ?CfgKey = null;
+
+pub const Commit = struct { ssm_state: mlx.mlx_array, conv_state: mlx.mlx_array };
+
+/// The state after the window rows `path` (oldest first), recurred from
+/// `state_in` with a tree round's `prework` (the state serial decoding holds
+/// there), and the conv state: rows `conv_rows` of `conv_input` [1,3+T,C].
+/// Null outside the kernel's geometry.
+pub fn replay(g: Geometry, state_in: mlx.mlx_array, pw: Prework, path: []const i32, conv_input: mlx.mlx_array, conv_rows: [3]i32, s: mlx.mlx_stream) !?Commit {
+    if (!mlx.streamIsGpu(s) or pw.k.ctx == null or path.len == 0) return null;
+    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const csh = mlx.getShape(conv_input);
+    if (csh.len != 3 or csh[0] != 1 or csh[2] != c or 3 * c > 32 * g.dv * g.hv) return null;
+    for (conv_rows) |r| if (r < 0 or r >= csh[1]) return null;
+    const st = mlx.mlx_array_dtype(state_in);
+    const dt = mlx.mlx_array_dtype(conv_input);
+    if (k1r_cache == null) k1r_cache = try makeKernel("msv_gdn_decode_replay", &.{ "state_in", "pk", "pv", "pg", "path", "n_path", "conv_in", "conv_rows" }, &.{ "state_out", "conv_out" }, K1R_SOURCE, HEADER);
+    const key = CfgKey{ .g = g, .dt = dt, .st = st };
+    if (replay_key == null or !std.meta.eql(replay_key.?, key)) {
+        if (replay_cfg.ctx != null) _ = mlx.mlx_fast_metal_kernel_config_free(replay_cfg);
+        replay_cfg = mlx.mlx_fast_metal_kernel_config_new();
+        replay_key = null;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(replay_cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(replay_cfg, &[_]c_int{ 1, 3, c }, 3, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(replay_cfg, 32, g.dv, g.hv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(replay_cfg, 32, 4, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(replay_cfg, "StT", st));
+        inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(replay_cfg, kv[0], kv[1]));
+        replay_key = key;
+    }
+    const path_arr = mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(path_arr);
+    const n: i32 = @intCast(path.len);
+    const n_arr = mlx.mlx_array_new_data(&n, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(n_arr);
+    const rows_arr = mlx.mlx_array_new_data(&conv_rows, &[_]c_int{3}, 1, .int32);
+    defer _ = mlx.mlx_array_free(rows_arr);
+    const ins = [_]mlx.mlx_array{ state_in, pw.k, pw.v, pw.gb, path_arr, n_arr, conv_input, rows_arr };
+    const v = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    var o = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, k1r_cache.?, v, replay_cfg, s));
+    var st_out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(st_out);
+    try mlx.check(mlx.mlx_vector_array_get(&st_out, o, 0));
+    var conv_out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&conv_out, o, 1));
+    return .{ .ssm_state = st_out, .conv_state = conv_out };
+}
+
+pub const RecurSeqFold = struct { gated: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array, conv_input: mlx.mlx_array };
+
+const FOLD_NT: c_int = 1024; // one threadgroup per head, 4 dv rows per simdgroup
+pub var fold_nt_override: ?c_int = null; // test seam: 2048 exceeds every GPU's limit
+fn foldNt() c_int {
+    return fold_nt_override orelse FOLD_NT;
+}
+var k1f_cache: ?mlx.mlx_fast_metal_kernel = null;
+var fold_cfgs: [FOLD_MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+// Whether this GPU's pipeline runs each width's 1024-thread fold; null = not dispatched yet.
+var fold_ok: [FOLD_MAX_SEQ + 1]?bool = @splat(null);
+const FoldKey = struct { k: CfgKey, swish: bool, nt: c_int };
+
+/// Did this GPU's pipeline refuse the fold at width `t_len`?
+pub fn foldDeclined(t_len: c_int) bool {
+    if (t_len < 0 or t_len > FOLD_MAX_SEQ) return false;
+    return fold_ok[@intCast(t_len)] == false;
+}
+var fold_cfg_key: ?FoldKey = null;
+
+fn buildFoldConfig(g: Geometry, t_len: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, swish: bool) !mlx.mlx_fast_metal_kernel_config {
+    const c = 2 * g.hk * g.dk + g.hv * g.dv;
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, t_len, g.hv * g.dv }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, g.hv, g.dv, g.dk }, 4, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ t_len, 1, g.hv, g.dv, g.dk }, 5, st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3 + t_len, c }, 3, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.hv * foldNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, foldNt(), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "GT", gateDtype(dt, st)));
+    inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "DK", g.dk }, .{ "DV", g.dv }, .{ "C", c }, .{ "NT", foldNt() }, .{ "SPLIT", @as(c_int, 1) }, .{ "TL", t_len } }) |kv|
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SWISH", @intFromBool(swish)));
+    return cfg;
+}
+
+/// A chain's recurSeq with the norm-gate and the rollback conv-input concat
+/// folded in: gated [1,T,Hv*Dv] (rms_norm(y) * gate(z), swish or sigmoid), the
+/// next conv state, the final state, state_seq (row T-1 unwritten) and
+/// conv_input [1,3+T,C]. Bit-identical to recurSeq -> gdnNormGateFused ->
+/// concat. Null outside the kernel's geometry or dtypes (caller keeps the
+/// unfolded path). Draft trees take `recurTree` and `replay`.
+pub fn recurSeqFold(g: Geometry, t_len: c_int, in: Inputs, swish: bool, s: mlx.mlx_stream) !?RecurSeqFold {
+    if (!mlx.streamIsGpu(s)) return null;
+    if (t_len < 1 or t_len > FOLD_MAX_SEQ) return null;
+    if (g.dk != 128 or g.dv != 128 or @rem(g.hv, g.hk) != 0) return null;
+    const dt = mlx.mlx_array_dtype(in.qkv);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w }) |arr|
+        if (mlx.mlx_array_dtype(arr) != dt) return null;
+    if (mlx.mlx_array_dtype(in.eps) != .float32) return null;
+    const st = mlx.mlx_array_dtype(in.ssm_state);
+    if (st != dt and st != .float32) return null;
+    if (!inputsFit(g, t_len, in, true)) return null;
+    if (k1f_cache == null) k1f_cache = try makeKernel("msv_gdn_decode_recur_seq_fold", &.{ "qkv", "a_in", "b_in", "conv_state", "state_in", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "z", "norm_w", "eps" }, &.{ "gated", "conv_out", "state_out", "state_seq", "conv_in" }, K1S_FOLD_SOURCE, HEADER);
+    const key = FoldKey{ .k = .{ .g = g, .dt = dt, .st = st }, .swish = swish, .nt = foldNt() };
+    if (fold_cfg_key == null or !std.meta.eql(fold_cfg_key.?, key)) {
+        for (&fold_cfgs) |*slot| if (slot.*) |c| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(c);
+            slot.* = null;
+        };
+        fold_ok = @splat(null);
+        fold_cfg_key = key;
+    }
+    const idx: usize = @intCast(t_len);
+    if (fold_ok[idx] == false) return null;
+    if (fold_cfgs[idx] == null) fold_cfgs[idx] = try buildFoldConfig(g, t_len, dt, st, swish);
+
+    const in1 = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.ssm_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, in.z, in.norm_w, in.eps };
+    const v1 = mlx.mlx_vector_array_new_data(&in1, in1.len);
+    defer _ = mlx.mlx_vector_array_free(v1);
+    var o1 = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o1);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o1, k1f_cache.?, v1, fold_cfgs[idx].?, s));
+    var out: [5]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, o1, i));
+    // A pipeline's thread limit is per GPU and known only once MLX builds it (896 for this
+    // kernel on some GPUs). The first dispatch per width evaluates here; a refusal is taken
+    // off the latch and the caller keeps the unfolded chain. Any other error stays latched.
+    if (fold_ok[idx] == null and !mlx.errorPending()) {
+        _ = mlx.mlx_eval(o1);
+        if (mlx.takeErrorIf("maximum allowed threads per threadgroup")) {
+            fold_ok[idx] = false;
+            log.info("[gdn-fold] declined at T={d}: this GPU's pipeline runs fewer than {d} threads per threadgroup\n", .{ t_len, foldNt() });
+            for (out) |a| _ = mlx.mlx_array_free(a);
+            return null;
+        }
+        // Only a clean eval says the pipeline runs; any other error stays latched and decides nothing.
+        if (!mlx.errorPending()) fold_ok[idx] = true;
+    }
+    return .{ .gated = out[0], .conv_state = out[1], .ssm_state = out[2], .state_seq = out[3], .conv_input = out[4] };
+}

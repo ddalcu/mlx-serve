@@ -1,34 +1,14 @@
 #!/bin/bash
-# Ling 3.0 (bailing_hybrid) integration test — env-gated on a local checkpoint
-# (the 4.2 GB 4-bit mirror):
+# test_bailing_hybrid.sh — Ling 3.0 (bailing_hybrid, KDA + MLA hybrid) live end to end on the 4.2 GB 4-bit mirror,
+# checks chosen to fail loudly if either new mixer is wrong: [1] a short answer, [2] the thinking split by DEFAULT (the
+# template's `thinking_option` is on), [3] a GLM-style tool call, [4] its round trip, [5] a needle ~5K tokens back (a
+# wrong gate stride, mis-strided KDA decay or wrong MLA rope mode fails here while [1]-[4] pass), [6] prefix reuse with
+# cached tokens AND the same answer (the hybrid restores recurrent state), [7] clean streaming.
 #
-#   LING_TEST_MODEL=~/.mlx-serve/models/rapid-mlx/Ling-3.0-tiny-MLX-4bit \
-#       ./tests/test_bailing_hybrid.sh
+#   LING_TEST_MODEL=<mirror dir> ./tests/test_bailing_hybrid.sh   # LING_TEST_PORT (11357); SKIPs without it
 #
-# The arch is a KDA + MLA hybrid: three Kimi-Delta-Attention (linear,
-# fixed-size recurrent state) layers for every Multi-head-Latent-Attention
-# layer. Both mixers are new here, so the checks are chosen to fail loudly if
-# either is wrong rather than to pin the model's prose:
-#
-#   [1] short answer            — the forward composes at all
-#   [2] thinking split          — the template's `thinking_option` default is
-#                                 'on', so a request that names no preference
-#                                 must come back with reasoning_content
-#   [3] GLM-style tool call     — <tool_call>name<arg_key>…<arg_value> grammar
-#   [4] tool round-trip         — the result reaches the answer
-#   [5] needle at long range    — MLA's rope/cache and the KDA recurrence both
-#                                 have to be right thousands of tokens back;
-#                                 this is the check a broken gate index, a
-#                                 mis-strided per-channel decay or a wrong
-#                                 rope mode fails while [1]-[4] still pass
-#   [6] prefix reuse            — the same prompt twice reports cached tokens
-#                                 AND returns the same answer (the hybrid
-#                                 SSM-checkpoint path)
-#   [7] streaming cleanliness   — no think tags or tool markup in the deltas
-#
-# Complements the hermetic layers: the config-parse test in model.zig, the
-# vectorized-gate kernel equivalence and kdaGateChain tests in transformer.zig,
-# and the asymmetric-KV-cache test.
+# Hermetic twins: the config parse and kdaUsesBoundedGate, the vectorized-gate kernel equivalence, kdaGateChain, the
+# dense and affine asymmetric-KV-cache tests, kvBytesPerToken. Live `--kv-quant 8` on this arch is checked by hand.
 
 set -euo pipefail
 

@@ -91,6 +91,7 @@ On an M4 Max, the same models decode 10% to 51% faster than they did in v26.8. E
 - [CLI and server flags](docs/cli.md)
 - [The Mac app](docs/app.md), with the media tour
 - [Supported models](docs/models.md)
+- Write a plugin without rebuilding the server: [model](docs/plugin-model.md), [media](docs/plugin-media.md), [quant](docs/plugin-quant.md)
 - [Performance and tuning](docs/performance.md)
 - [Building from source](docs/building.md) and [NVIDIA GPUs](docs/CUDA.md)
 - [FAQ](docs/faq.md) and the [changelog](CHANGELOG.md)

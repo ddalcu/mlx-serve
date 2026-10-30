@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
-# Muse-Glimmer image input end-to-end over HTTP (OpenAI + Anthropic surfaces).
-# Asserts a relevant answer, the token accounting the splice depends on, two
-# images in one turn, and that --no-vision drops the tower. Skips cleanly when
-# the model is absent so CI stays green.
+# test_muse_vision.sh — Muse-Glimmer image input: the vision capability on /v1/models, OpenAI + Anthropic image turns
+# on tests/fixtures/house.jpeg, the exact grid/pad accounting the splice depends on (730x487 -> 756x504 -> grid 36x54
+# -> 486 pads), two images in one turn, and --no-vision dropping the tower.
 #
-# Usage: tests/test_muse_vision.sh [model_dir] [port]
+#   tests/test_muse_vision.sh [model_dir] [port]   # default the 4-bit mirror; SKIPs when absent
+#
+# Parity: the MUSE_VISION_MODEL / MUSE_VISION_FIXTURE oracle in src/plugins/muse_glimmer/vision.zig.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
 MODEL="${1:-${MUSE_VISION_MODEL:-$HOME/.mlx-serve/models/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit}}"
@@ -22,7 +25,7 @@ SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 240); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "localhost:$PORT" 240 1 || true
 if ! curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; tail -20 "$LOG"; exit 1; fi
 
 B_HOUSE=$(base64 -i "$HOUSE"); B_ROBOT=$(base64 -i "$ROBOT")
@@ -52,7 +55,7 @@ echo "== token accounting (the splice depends on it) =="
 # 730x487 → smart_resize 756x504 → grid 54x36 patches → (54/2)*(36/2) = 486 pads,
 # plus <|image_start|>/<|image_end|>. A drift here scatters the tower's rows
 # into the wrong positions rather than failing loudly.
-# The arch name comes from `@tagName(vp.mode)` (server.zig), i.e. a Zig enum
+# The arch name comes from `@tagName(vp.mode)` (host/http/server.zig), i.e. a Zig enum
 # tag, so it is always lowercase — an older literal "Muse" in this pattern
 # broke the assertion on a refactor while the math stayed correct. Match
 # case-insensitively; the NUMBERS are the contract.
@@ -90,7 +93,7 @@ kill "$SRV" 2>/dev/null; sleep 2
 echo "== --no-vision drops the tower =="
 ./zig-out/bin/mlx-serve --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --no-vision --log-level info > "$NVLOG" 2>&1 &
 SRV=$!
-for i in $(seq 1 240); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "localhost:$PORT" 240 1 || true
 if grep -q "Muse-Glimmer ViT" "$NVLOG"; then echo "  FAIL: tower loaded under --no-vision"; FAIL=1; else echo "  OK: tower not loaded"; fi
 curl -s "localhost:$PORT/v1/models" | grep -q '"vision"' \
   && { echo "  FAIL: vision still advertised"; FAIL=1; } || echo "  OK: vision not advertised"

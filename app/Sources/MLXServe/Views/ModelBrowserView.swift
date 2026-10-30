@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Model Browser: five sections (`ModelBrowserSection`), switched by the bar
+/// Model Browser: six sections (`ModelBrowserSection`), switched by the bar
 /// across the top of the content area.
 struct ModelBrowserPane: View {
     /// Which section is showing. The pane's own bar drives it: the sidebar is
@@ -84,13 +84,14 @@ struct ModelBrowserPane: View {
         case .myModels:     MyModelsPane(filter: $localFilter)
         case .downloads:    DownloadsPane(items: activeDownloads)
         case .media:        MediaPane()
+        case .plugins:      PluginsPane()
         }
     }
 }
 
 // MARK: - Section bar
 
-/// The browser's five sections, across the top of the content area.
+/// The browser's six sections, across the top of the content area.
 private struct ModelBrowserSectionBar: View {
     @Binding var section: ModelBrowserSection
     let badges: ModelBrowserBadgeCounts
@@ -252,6 +253,8 @@ private struct RecommendedModelTable: View {
                    picks: RecommendedModelPick.gemmaCatalog),
             Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
                    picks: RecommendedModelPick.qwenCatalog),
+            Family(id: "liquid", title: "Liquid LFM3", systemImage: "waveform.and.person.filled", tint: .purple,
+                   picks: RecommendedModelPick.liquidCatalog),
             Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
                    picks: RecommendedModelPick.largestCatalog),
         ]
@@ -413,7 +416,7 @@ private struct RecommendedModelTableRow: View {
     /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
     private var usableMedia: (model: LocalModel, modality: MediaModality)? {
         let path = pick.ggufFilename != nil ? ggufFilePath : downloads.existingModelDir(for: pick.repoId)
-        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels)
+        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels, rows: appState.server.allModels)
     }
 
     var body: some View {
@@ -2038,7 +2041,9 @@ private struct LocalModelRow: View {
         let socket = model.quantFile == nil
             ? DrafterGems.badge(override, modelDir: model.path, hasMtpHead: model.hasMtpHead, options: appState.serverOptions)
             : SocketBadge(stone: nil, skull: false)
-        settingBadges = ModelOverrideBadges.badges(override, modelType: model.modelType, socket: socket)
+        settingBadges = ModelOverrideBadges.badges(override, modelType: model.modelType,
+                                                   engines: ModelSettingsApply.row(for: model.path, in: appState.server.allModels)?.engines,
+                                                   socket: socket)
     }
 
     private func revealInFinder() {
@@ -2178,7 +2183,7 @@ private struct LocalModelRow: View {
                     }
                 } else if isDecisionModelType(model.modelType) {
                     UseDecisionModelButton(path: model.path, name: model.name)
-                } else if let modality = MediaModality(modelType: model.modelType) {
+                } else if let modality = MediaModality.of(modelType: model.modelType, path: model.path, rows: appState.server.allModels) {
                     // A media checkpoint is a real, loadable, servable model —
                     // it just is not a CHAT model, and until now that meant the
                     // only verb the browser offered for it was Delete. This

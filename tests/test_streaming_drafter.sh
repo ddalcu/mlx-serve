@@ -1,27 +1,13 @@
 #!/bin/bash
-# Streaming drafter byte-equivalence test.
+# test_streaming_drafter.sh — streaming with the Gemma 4 assistant drafter is byte-identical (concatenated deltas, temp 0,
+# an echo-heavy code-rename prompt) to the same stream without it; test_streaming_pld.sh's drafter twin.
 #
-# Verifies that running the same temp=0 chat completion request with
-# `stream: true` against `--drafter <dir>` produces *identical* concatenated
-# text to the same request without `--drafter` (= regular streaming).
+#   DRAFTER_TEST_TARGET=<gemma-4 dir> DRAFTER_TEST_DRAFTER=<assistant dir> ./tests/test_streaming_drafter.sh [port]
 #
-# Mirrors `tests/test_streaming_pld.sh` for the drafter path — same prompt
-# (echo-heavy code rename) so the drafter's verify path is well exercised.
-#
-# Default pair (Apple Silicon, ~3.3 GB peak RSS):
-#   target  = ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#   drafter = ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16
-#
-# Override with env vars:
-#   DRAFTER_TEST_TARGET=/path/to/gemma-4-target
-#   DRAFTER_TEST_DRAFTER=/path/to/gemma-4-{E2B,E4B,...}-it-assistant-bf16
-#
-# Usage:
-#   ./tests/test_streaming_drafter.sh [port]
-#
-# Exits 0 with SKIP if either checkpoint is missing.
+# Defaults gemma-4-e4b-it-8bit + gemma-4-E4B-it-assistant-bf16; SKIPs when either is missing.
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8090}
 BASE="http://127.0.0.1:$PORT"
@@ -104,10 +90,7 @@ run_request() {
     "$BINARY" --model "$TARGET" --serve --port "$PORT" "${extra_args[@]}" > "$logfile" 2>&1 &
     local pid=$!
     local up=0
-    for i in $(seq 1 60); do
-        if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-        sleep 1
-    done
+    srv_wait_health "$BASE" 60 1 && up=1
     if [ "$up" != "1" ]; then
         echo -e "  ${RED}FAIL${NC} server did not become healthy in 60s" >&2
         tail -20 "$logfile" >&2

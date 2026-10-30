@@ -1,17 +1,15 @@
 #!/bin/bash
-# DFlash block-drafter integration test — env-gated on a local target +
-# assistant pair (Muse-Glimmer-30B + its DFlash assistant today):
+# test_dflash.sh — DFlash block-drafter live end to end (Muse-Glimmer-30B 8-bit + its assistant today): the sidecar
+# probe classifies it (`DFlash drafter ready`), rounds ENGAGE (`[spec-stats] mode=dflash attempts>0`: the fallback is
+# output-identical, so equality alone misses a dispatch hole), greedy dflash-on == off over an exact 30-token budget,
+# the adaptive gate (`runtime_disabled` only when avg_per_round < gate_min; either branch may be right), exact
+# stream and non-stream clipping at max_tokens=17, per-request opt-out, a tool round, machine-width resolution, and
+# an aligned assistant-context prefix restore ([12] is the live dflash disk arm).
 #
-#   DFLASH_TEST_MODEL=~/claude-tmp/muse-glimmer/Muse-Glimmer-30B-MLX-Serve-8bit \
-#   DFLASH_TEST_DRAFTER=~/.mlx-serve/models/meta-models/Muse-Glimmer-30B-assistant \
-#       ./tests/test_dflash.sh
+#   DFLASH_TEST_MODEL=<target dir> DFLASH_TEST_DRAFTER=<assistant dir> ./tests/test_dflash.sh   # DFLASH_TEST_PORT
 #
-# Pins the live contract: the sidecar probe classifies the assistant as
-# DFlash (boot log), rounds ENGAGE (`[spec-stats] mode=dflash attempts>0` —
-# engagement COUNTS, never output shape), greedy dflash-on equals greedy
-# dflash-off byte-for-byte over reasoning+content (always-thinking target),
-# per-request enable_drafter:false opts out, and tool calls still parse with
-# the drafter engaged.
+# SKIPs without the env vars. Hermetic twins: engines/mlx/spec/dflash/dflash.zig config/mask/forward/cache tests + fixture parity
+# (DFLASH_FIXTURES, tests/dump_dflash_fixtures.py), nextDflash greedy equivalence, specInitWiring / specTickMode.
 
 set -euo pipefail
 
@@ -158,8 +156,7 @@ fi
 # block-wide `qmm` where serial decode runs `qmv`, and at 4 bits a near-tie
 # argmax flips between them — the sanctioned INT4 divergence class. Measured on
 # Muse-Glimmer-30B: the 8-bit build is byte-identical 6/6, the 4-bit build
-# diverges reproducibly while each arm stays perfectly self-consistent, and the
-# divergence is unchanged with MLX_SERVE_SLIDING_BLOCK_TRIM=0.
+# diverges reproducibly while each arm stays perfectly self-consistent.
 #
 # So: byte-equality at 8-bit or wider; at narrower widths assert what must still
 # hold — each arm REPRODUCIBLE (a broken verify or rollback shows as run-to-run

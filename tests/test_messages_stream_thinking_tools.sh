@@ -1,27 +1,15 @@
 #!/bin/bash
-# Regression tests for /v1/messages STREAMING with thinking + tools together —
-# the exact Claude Code shape (Claude Code always sends tools, and Qwen 3.5/3.6
-# templates inject the `<think>\n` opener into the generation prompt).
+# test_messages_stream_thinking_tools.sh — /v1/messages STREAMING with thinking + tools on a template-opened-think model
+# (Claude Code's exact shape): no `<think>`/`</think>` in any text_delta, thinking arrives as MORE than one
+# thinking_delta, tool_use emitted, and the content-block lifecycle is valid (every delta/stop names an open block,
+# no index reused while open, nothing open at message_stop).
 #
-# Pins the 2026-06-10 live Claude Code failure on Qwen3.6-35B-A3B:
-#   1. Template-opened thinking streamed as visible text_delta events,
-#      leaking a raw `</think>` token into the transcript (the tools branch
-#      only recognized think OPENERS present in the model's output).
-#   2. On a tool-call turn, the end-of-stream emission opened a thinking
-#      block at an index already occupied by the open text block, then
-#      closed the text block at a never-started index — Claude Code aborted
-#      the turn with "API Error: Content block not found".
+#   ./tests/test_messages_stream_thinking_tools.sh [model_dir] [port]   # Qwen 3.5/3.6; starts its own server
 #
-# Checks (per prompt): no `</think>`/`<think>` in any text_delta, thinking
-# arrives as thinking_delta events, and the content-block lifecycle is
-# protocol-valid (every delta/stop references an open block, no index reuse
-# while open, nothing left open at message_stop).
-#
-# Usage: ./tests/test_messages_stream_thinking_tools.sh [model_dir] [port]
-#   model_dir should be a template-opened-think model (Qwen 3.5/3.6).
-#   Default: the model family from the live failure. Starts its own server.
+# Hermetic twins: `chat.streamThinkGate` tests and the format corpus streaming replay.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit}"
 PORT="${2:-11263}"
@@ -54,11 +42,7 @@ sleep 1
 SERVER_PID=$!
 trap 'kill $SERVER_PID 2>/dev/null' EXIT
 
-for _ in $(seq 1 120); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 2
-done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"; exit 1; }
+srv_wait_health "$BASE" 120 2 || { echo "FAIL: server did not come up"; exit 1; }
 
 TOOLS='[{"name":"get_weather","description":"Get current weather for a city","input_schema":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}]'
 

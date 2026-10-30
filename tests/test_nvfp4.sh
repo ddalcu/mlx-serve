@@ -1,14 +1,11 @@
 #!/usr/bin/env bash
-# Integration test for NVFP4-quantized MLX models (issue #24) — verifies the
-# loader accepts `quantization.mode: "nvfp4"` (uint8 fp8 scales, NO biases
-# tensors), the forward pass routes bias-less weights to mode "nvfp4" (not the
-# legacy mxfp8 heuristic), mixed QAT checkpoints with affine 8-bit/gs64
-# override layers (which DO carry biases) resolve per weight, and discovery
-# lists nvfp4 models.
-# Usage: NVFP4_TEST_MODEL=/path/to/model PORT=8096 ./tests/test_nvfp4.sh
-# Defaults to ~/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4 (arthurcollet/Qwen3-0.6B-mlx-nvfp4).
-# Pass a gemma-4-*-qat-nvfp4 dir to exercise the mixed-override path.
-# Skips silently when the model isn't available (CI-friendly).
+# test_nvfp4.sh — NVFP4 packs: the loader takes `quantization.mode: "nvfp4"` (uint8 fp8 scales, no biases), the banner
+# reports nvfp4, a temp-0 coherence canary answers, discovery lists the pack. A gemma-4 QAT nvfp4 dir exercises the
+# mixed affine-8-bit override layers resolving per weight.
+#
+#   NVFP4_TEST_MODEL=<dir> PORT=8096 ./tests/test_nvfp4.sh   # default mlx-community/Qwen3-0.6B-nvfp4; SKIPs without
+#
+# Hermetic twins: `computeQuantParams` and the nvfp4 qmatmul/gather tests in engines/mlx/transformer.zig.
 
 set -euo pipefail
 
