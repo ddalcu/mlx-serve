@@ -30,7 +30,8 @@ refused or mismatched profile, a strength outside [0, 1], an unknown field, a mo
 
 A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"version": 1`, `hidden_size`,
 `base_config_sha256`: sha256 of the base pack's exact `config.json` bytes) and `direction.safetensors` (one tensor
-`direction`, `[hidden]`, F32/F16/BF16, normalized at load). A module-owned model's prefix cache keys its entries by
+`direction`, `[hidden]`, F32/F16/BF16, normalized at load). Make the key with `openssl rand -hex 32 > key && chmod 600 key`, and expose the server only over TLS (Tailscale Serve) or
+loopback: the header is a bearer secret. A module-owned model's prefix cache keys its entries by
 the request's profile and strength, so an ablated conversation reuses its own prefix and nothing else's.
 
 ## POST /v1/messages (Anthropic)

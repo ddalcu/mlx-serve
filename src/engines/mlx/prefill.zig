@@ -279,9 +279,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         publishHotCacheResidency(sch);
     } else {
         // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
-        const resumed: u64 = if (slot.ctx.ablation != null)
-            0
-        else if (plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings)) |n|
+        const resume_at = if (slot.ctx.ablation == null) plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings) else null;
+        const resumed: u64 = if (resume_at) |n|
             n
         else if (xfm_ptr.mlx_stream_ext) |m|
             try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))

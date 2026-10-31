@@ -193,6 +193,8 @@ pub fn handleConnection(
     };
     const raw = (try readRequest(allocator, stream)) orelse return;
     defer allocator.free(raw.buf);
+    // The request's ablation key points into `raw.buf`.
+    defer stream.clearAblation();
     const total_read = raw.len;
     const header_end_pos = raw.header_end;
     const request = raw.buf[0..total_read];

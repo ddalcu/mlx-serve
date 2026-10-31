@@ -1385,7 +1385,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items, 0..) |*e, i| {
             if (e.id != entry_id) continue;
             const payload = e.module orelse return 0;
-            if (!ModuleBinding.same(payload.binding, binding)) return 0;
+            if (!ModuleBinding.same(payload.binding, binding) or payload.binding.variant != binding.variant) return 0;
             const had_error = mlx.errorPending();
             if (!plugin_driver.auxRestoreAt(binding.xfm, slot, payload.snapshot, payload.n).isOk()) {
                 mlx.dropLatchedErrorUnless(had_error);
