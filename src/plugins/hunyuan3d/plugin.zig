@@ -344,6 +344,7 @@ test "hunyuan3d: the paint stage resolves inside the pack first, then as the loc
 }
 
 test "hunyuan3d: a job whose GPU stage latched a failure is refused by class, never a GLB of zeros" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());
@@ -359,6 +360,7 @@ test "hunyuan3d: a job whose GPU stage latched a failure is refused by class, ne
 }
 
 test "hunyuan3d: a job on the tiny pack is a GLB; fields and a missing paint stage are refused by name" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());
@@ -378,6 +380,7 @@ test "hunyuan3d: a job on the tiny pack is a GLB; fields and a missing paint sta
 }
 
 test "hunyuan3d: the tiny pack's latent and SDF grid are bit-equal to its golden run" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());
