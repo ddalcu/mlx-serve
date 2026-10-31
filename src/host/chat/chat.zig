@@ -62,6 +62,7 @@ pub const coerceToolArgsToSchema = @import("tools/schema.zig").coerceToolArgsToS
 pub const hoistMisplacedRequiredParams = @import("tools/schema.zig").hoistMisplacedRequiredParams;
 pub const filterInferredBySchema = @import("tools/schema.zig").filterInferredBySchema;
 pub const inferBareJsonToolCalls = @import("tools/json_infer.zig").inferBareJsonToolCalls;
+pub const inferCollapsedParamToolCalls = @import("tools/json_infer.zig").inferCollapsedParamToolCalls;
 pub const isJsonNumber = @import("../../sdk/util/json_text.zig").isJsonNumber;
 pub const utf8Next = @import("../../sdk/util/json_text.zig").utf8Next;
 pub const utf8Sanitize = @import("../../sdk/util/json_text.zig").utf8Sanitize;
