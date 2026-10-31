@@ -78,7 +78,8 @@ const Repo = struct {
     /// The norm folded into the gate | content maps (dense packs): `fold` f32 `[C, PARTS * 2 hidden]` the maps with the
     /// norm's weight folded in, `cs` its column sums and `bw` the norm's bias through the maps (`glue.repoFold`). h's
     /// f16 values are exact in TF32, so where MLX rounds f32 matmuls to TF32 only the maps split: their TF32-exact part
-    /// beside the rest (PARTS 2) keeps the f32 reference's precision in one GEMM.
+    /// beside the rest (PARTS 2) keeps the f32 reference's precision in one GEMM. The mean comes off after the GEMM,
+    /// so a token whose mean is far above its spread loses digits there (300x: 3e-4; Idol's are under 0.21x).
     fold: A = NONE,
     cs: A = NONE,
     bw: A = NONE,
@@ -531,15 +532,19 @@ test "idol: a dense RePo layer's rotary tables keep f32 precision where MLX's ma
         owned.deinit(a);
     }
     try r.fuse(a, &owned);
-    const got = try r.angles(&sc, h, 8);
     // The chain on the CPU: its f32 products are exact FMAs.
     var cpu = Scope.init(a, mlx.mlx_default_cpu_stream_new());
     defer {
         _ = mlx.mlx_stream_free(cpu.s);
         cpu.deinit();
     }
-    const want = try r.angles(&cpu, h, 8);
-    // Plain TF32 misses by ~4e-3.
-    try std.testing.expect(try w8a8.relRms(got.sin, want.sin, cpu.s) < 1e-4);
-    try std.testing.expect(try w8a8.relRms(got.cos, want.cos, cpu.s) < 1e-4);
+    // Centred tokens and tokens whose mean is twice their spread (Idol's hidden states: at most 0.21x). Plain TF32
+    // misses by ~4e-3.
+    for ([_]f32{ 0, 2 }) |offset| {
+        const x = try L.asDtype(&sc, try sc.add(try L.asDtype(&sc, h, .float32), try sc.scalar(offset)), .float16);
+        const got = try r.angles(&sc, x, 8);
+        const want = try r.angles(&cpu, x, 8);
+        try std.testing.expect(try w8a8.relRms(got.sin, want.sin, cpu.s) < 1e-4);
+        try std.testing.expect(try w8a8.relRms(got.cos, want.cos, cpu.s) < 1e-4);
+    }
 }
