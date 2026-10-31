@@ -1341,3 +1341,12 @@ returned `.ok` with no hidden rows, and the driver handed the empty array to the
 `want_hidden` before any forward; the driver fails a hidden-only forward that returns none; the embeddings handler
 refuses a module-owned-state model (`Caps.owns_decode_state`) with a named 400. Guard: `tests/test_dsv41.sh` [7a]
 (refused by name, the next greedy request byte-equal to solo, no `[mlx]` line).
+
+### A cancelled DeepSeek-V4.1 request threw away the conversation
+Defect: stop a DeepSeek-V4.1 reply, send the next message, and without `--prefix-cache-disk` the whole conversation
+prefilled again. Cause: a RAM restore of a module checkpoint removed the entry and handed its buffers to the slot; a
+cancelled request commits nothing, so the state died with the slot. Fix: the restore shares the entry (`restoreModule`:
+MLX copies a shared buffer on the slot's first write, and the prefill bill already prices the state whole); the KV
+checkout refuses module entries. Guard: `HotPrefixCache module: a restore shares the checkpoint, so a request that never
+commits leaves it resumable`.
+

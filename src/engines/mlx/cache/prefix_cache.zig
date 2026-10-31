@@ -1358,10 +1358,11 @@ pub const HotPrefixCache = struct {
         return best;
     }
 
-    /// Re-find by ID after admission. The slot keeps restored references; an owed export moves
-    /// into a holder, or is cancelled if both are full. Zero means go cold.
+    /// Re-find by ID after admission. The entry stays: the slot's state shares its buffers until its
+    /// first write copies them, so a request that ends without committing leaves it resumable. A failed
+    /// restore loses the candidate. Zero means go cold.
     /// Caller updates slot counters and calls auxBeginPrompt at the returned n (zero establishes a cold slot).
-    pub fn consumeModule(self: *HotPrefixCache, binding: ModuleBinding, entry_id: u64, slot: u32) usize {
+    pub fn restoreModule(self: *HotPrefixCache, binding: ModuleBinding, entry_id: u64, slot: u32) usize {
         self.last_restored_used = null;
         self.last_restored_shared = 0;
         self.last_restored_disk_id = null;
@@ -1369,14 +1370,16 @@ pub const HotPrefixCache = struct {
             if (e.id != entry_id) continue;
             const payload = e.module orelse return 0;
             if (!ModuleBinding.same(payload.binding, binding)) return 0;
-            var detached = self.entries.swapRemove(i);
-            self.current_kv_bytes -|= detached.kv_bytes;
-            defer self.releaseModuleEntry(&detached, null);
             const had_error = mlx.errorPending();
             if (!plugin_driver.auxRestoreAt(binding.xfm, slot, payload.snapshot, payload.n).isOk()) {
                 mlx.dropLatchedErrorUnless(had_error);
+                self.evictAt(i, "module restore failed");
                 return 0;
             }
+            e.last_used = self.bumpCounter();
+            e.touched_ms = crt.monotonicMs();
+            // Evicting the entry this request runs on frees nothing while the slot shares it.
+            self.last_restored_used = e.last_used;
             return payload.n;
         }
         return 0;
@@ -1851,7 +1854,8 @@ pub const HotPrefixCache = struct {
         const used = self.last_restored_used orelse return false;
         for (self.entries.items) |*e| {
             if (e.last_used != used) continue;
-            if (e.checked_out_by != null) return false;
+            // A module snapshot has no KV handles to donate.
+            if (e.checked_out_by != null or e.module != null) return false;
             if (!checkoutEligible(true, restoreMoveEnabled(), self.pending_disk != null or self.finishing_disk != null, e.tokens.len, self.last_restored_shared, prompt_len, true)) return false;
             e.checked_out_by = slot_id;
             log.info("  [hot-cache] checked out {d}-token entry to the slot (the share does not fit; the append donates in place)\n", .{e.tokens.len});
@@ -10981,7 +10985,7 @@ test "HotPrefixCache module: longest exact checkpoint wins and KV lookup cannot 
     var cache = HotPrefixCache.init(testing.allocator, 4);
     defer cache.deinit();
     try testing.expect(cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
-    try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, 42, 0));
+    try testing.expectEqual(@as(usize, 0), cache.restoreModule(binding, 42, 0));
     var long: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3, 4 }, .key = 10 };
     var short: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
     try testing.expectEqual(CommitStatus{ .ok = 4 }, try long.put(&cache, binding, &.{}));
@@ -10991,13 +10995,27 @@ test "HotPrefixCache module: longest exact checkpoint wins and KV lookup cannot 
     try testing.expectEqual(@as(usize, 4), fake.key_ids_len);
     try testing.expect(cache.findBestMatch(&.{ 1, 2, 3, 4, 5 }, false, &.{}, kv_quant.KVQuantConfig.dense) == null);
     try testing.expectEqual(@as(u64, 80), cache.current_kv_bytes);
-    try testing.expectEqual(@as(usize, 4), cache.consumeModule(binding, hit.entry_id, 17));
+    try testing.expectEqual(@as(usize, 4), cache.restoreModule(binding, hit.entry_id, 17));
     try testing.expectEqual(@as(?*ModuleFake.Snap, &long), fake.restored);
     try testing.expectEqual(@as(u32, 17), fake.slot);
-    try testing.expectEqual(@as(usize, 1), long.frees);
-    try testing.expectEqual(@as(usize, 1), cache.entryCount());
+}
+
+test "HotPrefixCache module: a restore shares the checkpoint, so a request that never commits leaves it resumable" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    var snap: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    _ = try snap.put(&cache, binding, &.{});
+    for (0..2) |_| {
+        const hit = cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        try testing.expectEqual(@as(usize, 2), cache.restoreModule(binding, hit.entry_id, 0));
+    }
+    try testing.expectEqual(@as(usize, 2), fake.restores);
+    try testing.expectEqual(@as(usize, 0), snap.frees);
     try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
-    try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, hit.entry_id, 17));
 }
 
 test "HotPrefixCache module: an ineligible longer checkpoint cannot hide a shorter one" {
@@ -11036,7 +11054,7 @@ test "HotPrefixCache module: an ineligible longer checkpoint cannot hide a short
         };
         const hit = cache.findModuleMatch(binding, prompt, false, request_media, .{ .ctx = &rows }, kv_quant.KVQuantConfig.dense).?;
         try testing.expectEqual(@as(usize, 2), hit.n);
-        try testing.expectEqual(@as(usize, 2), cache.consumeModule(binding, hit.entry_id, 0));
+        try testing.expectEqual(@as(usize, 2), cache.restoreModule(binding, hit.entry_id, 0));
         try testing.expectEqual(@as(?*ModuleFake.Snap, &short), fake.restored);
         try testing.expectEqual(@as(usize, 0), long.frees);
         try testing.expect(!mlx.errorPending());
@@ -11057,7 +11075,7 @@ test "HotPrefixCache module: appended media uses candidate ids and only covered 
     const hit = cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5, 6 }, false, &media, .{ .ctx = &rows }, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(@as(usize, 4), hit.n);
     try testing.expectEqual(@as(usize, 4), fake.key_ids_len);
-    try testing.expectEqual(@as(usize, 4), cache.consumeModule(binding, hit.entry_id, 0));
+    try testing.expectEqual(@as(usize, 4), cache.restoreModule(binding, hit.entry_id, 0));
     // The span at the checkpoint itself belongs to the suffix.
     var text: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
     const appended = [_]MediaSpan{.{ .start = 2, .key = 77 }};
@@ -11080,7 +11098,7 @@ test "HotPrefixCache module: alternating conversations remain resumable within c
         s.* = .{ .owner = &fake, .ids = if (a) &.{ 1, 2 } else &.{ 8, 9 }, .key = if (a) 3 else 17 };
         if (i >= 2) {
             const hit = cache.findModuleMatch(binding, if (a) &.{ 1, 2, 3 } else &.{ 8, 9, 10 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-            try testing.expectEqual(@as(usize, 2), cache.consumeModule(binding, hit.entry_id, @intCast(i)));
+            try testing.expectEqual(@as(usize, 2), cache.restoreModule(binding, hit.entry_id, @intCast(i)));
         }
         _ = try s.put(&cache, binding, &.{});
         try testing.expectEqual(@min(i + 1, 2), cache.entryCount());
@@ -11109,7 +11127,7 @@ test "HotPrefixCache module: replacement count byte invalidation and deinit free
             try testing.expectEqual(@as(usize, 1), old.frees);
             try testing.expectEqual(@as(usize, 1), cache.entryCount());
             try testing.expectEqual(@as(u64, 40), cache.current_kv_bytes);
-            try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, selected.entry_id, 0));
+            try testing.expectEqual(@as(usize, 0), cache.restoreModule(binding, selected.entry_id, 0));
             try testing.expectEqual(@as(usize, 0), fake.restores);
         }
         if (case == .invalidate) {
@@ -11167,12 +11185,12 @@ test "HotPrefixCache module: failed restore loses candidate and stale id never s
     const stale = cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
     _ = try c.put(&cache, binding, &.{});
     try testing.expectEqual(@as(usize, 1), a.frees);
-    try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, stale.entry_id, 0));
+    try testing.expectEqual(@as(usize, 0), cache.restoreModule(binding, stale.entry_id, 0));
     try testing.expectEqual(@as(usize, 0), fake.restores);
     try testing.expectEqual(@as(usize, 0), b.frees);
     const hit = cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
     fake.fail_restore = true;
-    try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, hit.entry_id, 0));
+    try testing.expectEqual(@as(usize, 0), cache.restoreModule(binding, hit.entry_id, 0));
     try testing.expectEqual(@as(usize, 1), b.frees);
     try testing.expect(cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
     try testing.expectEqual(@as(usize, 1), cache.entryCount());
@@ -11191,15 +11209,15 @@ test "HotPrefixCache module: model bindings cannot select or consume each other'
     _ = try a.put(&cache, bindings[0], &.{});
     const hit = cache.findModuleMatch(bindings[0], &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
     try testing.expect(cache.findModuleMatch(bindings[1], &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense) == null);
-    try testing.expectEqual(@as(usize, 0), cache.consumeModule(bindings[1], hit.entry_id, 0));
+    try testing.expectEqual(@as(usize, 0), cache.restoreModule(bindings[1], hit.entry_id, 0));
     _ = try b.put(&cache, bindings[1], &.{});
     try testing.expectEqual(@as(usize, 2), cache.entryCount());
-    try testing.expectEqual(@as(usize, 2), cache.consumeModule(bindings[0], hit.entry_id, 0));
+    try testing.expectEqual(@as(usize, 2), cache.restoreModule(bindings[0], hit.entry_id, 0));
     try testing.expectEqual(@as(usize, 1), models[0].restores);
     try testing.expectEqual(@as(usize, 0), models[1].restores);
     try testing.expectEqual(@as(usize, 0), b.frees);
     const b_hit = cache.findModuleMatch(bindings[1], &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-    try testing.expectEqual(@as(usize, 2), cache.consumeModule(bindings[1], b_hit.entry_id, 1));
+    try testing.expectEqual(@as(usize, 2), cache.restoreModule(bindings[1], b_hit.entry_id, 1));
     try testing.expectEqual(@as(usize, 1), models[1].restores);
     try testing.expectEqual(@as(?*ModuleFake.Snap, &b), models[1].restored);
 }
@@ -11338,7 +11356,7 @@ test "HotPrefixCache module: failed restore clears only its own error latch" {
         _ = try snap.put(&cache, binding, &.{});
         const hit = cache.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
         if (preexisting) mlx.latchErrorForTest("module cache pre-existing failure");
-        try testing.expectEqual(@as(usize, 0), cache.consumeModule(binding, hit.entry_id, 0));
+        try testing.expectEqual(@as(usize, 0), cache.restoreModule(binding, hit.entry_id, 0));
         try testing.expectEqual(preexisting, mlx.errorPending());
         try testing.expectEqual(@as(usize, 1), snap.frees);
         try testing.expectEqual(@as(usize, 0), cache.entryCount());
@@ -11401,8 +11419,7 @@ test "under-floor module commits remain RAM-only" {
     try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
     const hit = hc.findModuleMatch(binding, &.{ 1, 2, 3 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(.ram, hit.source);
-    try testing.expectEqual(@as(usize, 2), hc.consumeModule(binding, hit.entry_id, 0));
-    try testing.expectEqual(@as(usize, 1), snap.frees);
+    try testing.expectEqual(@as(usize, 2), hc.restoreModule(binding, hit.entry_id, 0));
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
 }
 
@@ -11426,7 +11443,7 @@ test "module registration OOM preserves RAM" {
     try testing.expectEqual(@as(usize, 0), snap.frees);
     try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
     const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-    try testing.expectEqual(@as(usize, 512), hc.consumeModule(binding, hit.entry_id, 0));
+    try testing.expectEqual(@as(usize, 512), hc.restoreModule(binding, hit.entry_id, 0));
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
 }
 
@@ -11494,41 +11511,6 @@ test "full holders cancel the evicted module export" {
     }
 }
 
-test "full holders preserve exact module consumption" {
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var fake: ModuleFake = .{};
-    var bound: plugin_driver.Bound = undefined;
-    var xfm: transformer_mod.Transformer = undefined;
-    const binding = fake.bind(&bound, &xfm);
-    var hc = try ModuleDiskTest.init(&tmp, 1);
-    defer hc.deinit();
-    const ids = [_][513]u32{ ModuleDiskTest.ids(7), ModuleDiskTest.ids(1000), ModuleDiskTest.ids(2000) };
-    var snaps: [3]ModuleFake.Snap = undefined;
-    var disk_ids: [3]u64 = undefined;
-    for (&snaps, 0..) |*snap, i| {
-        snap.* = ModuleDiskTest.snap(&fake, ids[i][0..512]);
-        _ = try snap.put(&hc, binding, &.{});
-        disk_ids[i] = hc.entries.items[0].module.?.disk_id.?;
-        const hit = hc.findModuleMatch(binding, &ids[i], false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-        try testing.expectEqual(.ram, hit.source);
-        try testing.expectEqual(@as(usize, 512), hc.consumeModule(binding, hit.entry_id, @intCast(i)));
-        try testing.expectEqual(@as(usize, 0), hc.entryCount());
-        try testing.expectEqual(@as(usize, @intFromBool(i == 2)), snap.frees);
-    }
-    try testing.expectEqual(@as(usize, 3), fake.restores);
-    try testing.expectEqual(@as(u64, 80), hc.residentBytes());
-    try testing.expectEqual(@as(u64, 80), hc.reclaimableBytesFor(&ids[2]));
-    try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
-    try testing.expectEqual(.cancelled, hc.disk.?.moduleState(disk_ids[2]).?);
-    const cpu = mlx.weightLoadStream();
-    defer _ = mlx.mlx_stream_free(cpu);
-    try ModuleDiskTest.finish(&hc, cpu);
-    for (disk_ids[0..2]) |id| try testing.expect(hc.disk.?.entryWholeOnDisk(id));
-    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
-    for (snaps) |snap| try testing.expectEqual(@as(usize, 1), snap.frees);
-}
-
 test "module failures preserve ownership and error latches" {
     defer mlx.dropLatchedErrorUnless(false);
     const Case = enum { export_arrays, existing_error, allocation, submit };
@@ -11545,9 +11527,10 @@ test "module failures preserve ownership and error latches" {
         const ids = ModuleDiskTest.ids(7);
         var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
         _ = try snap.put(&hc, binding, &.{});
-        const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
         const id = hc.entries.items[0].module.?.disk_id.?;
-        try testing.expectEqual(@as(usize, 512), hc.consumeModule(binding, hit.entry_id, 0));
+        // An under-floor commit evicts it by count, moving its export into a holder.
+        var under_floor = ModuleDiskTest.snap(&fake, &.{ 1, 2 });
+        _ = try under_floor.put(&hc, binding, &.{});
         const cpu = mlx.weightLoadStream();
         defer _ = mlx.mlx_stream_free(cpu);
         _ = hc.flushOwedSlice(cpu);
@@ -11589,7 +11572,7 @@ test "module lookup ranks disk boundaries and prefers RAM ties" {
     try ModuleDiskTest.finish(&hc, cpu);
     const ram = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(.ram, ram.source);
-    try testing.expectEqual(@as(usize, 512), hc.consumeModule(binding, ram.entry_id, 1));
+    hc.evictAt(0, "test: drop the RAM copy");
     const disk = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
     try testing.expectEqual(.disk, disk.source);
     try testing.expectEqual(id, disk.disk_id);
@@ -11622,7 +11605,7 @@ test "invalidation retires queued module exports" {
     var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
     _ = try snap.put(&hc, binding, &.{});
     const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-    _ = hc.consumeModule(binding, hit.entry_id, 0);
+    _ = hc.restoreModule(binding, hit.entry_id, 0);
     const cpu = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(cpu);
     hc.disk.?.writer.?.setPaused(true);
@@ -11766,7 +11749,7 @@ test "unload frees module snapshots before binding destruction" {
     var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
     _ = try snap.put(&hc, binding, &.{});
     const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-    _ = hc.consumeModule(binding, hit.entry_id, 0);
+    _ = hc.restoreModule(binding, hit.entry_id, 0);
     const cpu = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(cpu);
     hc.disk.?.writer.?.setPaused(true);
@@ -11780,7 +11763,7 @@ test "unload frees module snapshots before binding destruction" {
     try testing.expectEqual(@as(usize, 0), reopened.disk.?.entryCount());
 }
 
-test "failed and cancelled requests leave the old module export owed" {
+test "failed and cancelled requests keep the restored module entry and its export owed" {
     for ([_]bool{ false, true }) |cancelled| {
         var tmp = testing.tmpDir(.{ .iterate = true });
         defer tmp.cleanup();
@@ -11795,7 +11778,7 @@ test "failed and cancelled requests leave the old module export owed" {
         _ = try snap.put(&hc, binding, &.{});
         const id = hc.entries.items[0].module.?.disk_id.?;
         const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-        _ = hc.consumeModule(binding, hit.entry_id, 0);
+        _ = hc.restoreModule(binding, hit.entry_id, 0);
         var model: @import("../../../host/registry/registry.zig").LoadedModel = undefined;
         model.prefix_cache = &hc;
         model.transformer = &xfm;
@@ -11809,11 +11792,11 @@ test "failed and cancelled requests leave the old module export owed" {
         const cpu = mlx.weightLoadStream();
         defer _ = mlx.mlx_stream_free(cpu);
         try ModuleDiskTest.finish(&hc, cpu);
-        try testing.expectEqual(@as(usize, 1), snap.frees);
+        try testing.expectEqual(@as(usize, 0), snap.frees);
         try testing.expect(hc.disk.?.entryWholeOnDisk(id));
-        const disk = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-        try testing.expectEqual(.disk, disk.source);
-        try testing.expectEqual(id, disk.disk_id);
+        const again = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+        try testing.expectEqual(.ram, again.source);
+        try testing.expectEqual(hit.entry_id, again.entry_id);
         try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
     }
 }
@@ -11831,7 +11814,7 @@ test "budget shrink cancels pending module sources" {
     var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
     _ = try snap.put(&hc, binding, &.{});
     const hit = hc.findModuleMatch(binding, &ids, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-    _ = hc.consumeModule(binding, hit.entry_id, 0);
+    _ = hc.restoreModule(binding, hit.entry_id, 0);
     try testing.expectEqual(@as(u64, 40), hc.residentBytes());
     hc.setBudget(20);
     try testing.expectEqual(@as(u64, 0), hc.residentBytes());
