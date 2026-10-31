@@ -45,6 +45,8 @@ Vision:
 Media backends:
 - **A condition works only as TRAINING fed it**: `instrumental` as TEXT (`[Instrumental]`; + lyrics = NAMED 400, `instrumentalConflicts`); Stable Audio 3 `seconds_total` as whole seconds >= 1 (`trainedSeconds`; a fraction is noise, reference too).
 - **xatlas segments one connected surface on ONE thread** (`uvwrap.parametrizeParallel`: median-split regions as `faceMaterialData` = one chart group per core; 1M faces 424 s → 3.4 s). Hunyuan paint keeps `parametrize`.
+- **A plugin whose load moves to a GPU stream runs its kernels in the conformance suite** even though the suite hands it a
+  CPU one: where they cannot run (a virtual GPU) its load refuses `.unsupported` by name, else the registry test aborts.
 - **A flow-DiT forward over tens of thousands of tokens needs a scope PER BLOCK**, an encoder one per stage (`Dit.forward`, `Decoder.run`, DINOv3, the FLUX.2 `VaeEncoder`): one scope around the whole forward keeps every block's intermediates alive together, each a fresh first-touch per request; fixture-sized oracles never show it.
 - **A full-resolution f32 VAE stage is BANDED, exact because everything but its 3x3 convs is per-pixel** (`qwen_image.Stage.banded` + `Conv.forwardStrips`); MLX's peak counter does not see the whole-stage peak. Bar = the fixture oracle with bands forced.
 - **A pinned library's op TRANSIENT is invisible to residency bills** (#321, #424): `conv3dDepthChunked` windows decoder convs; H3 `encodeMoments` EVALS per tile pass. Diff conv DISPATCH per mlx bump.

@@ -191,6 +191,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         out.* = Verdict.refuse(.unsupported, "deepseek_v41: its kernels run on Metal only");
         return null;
     };
+    // Its kernels launch wider threadgroups than a virtual GPU allows; there they abort the process.
+    if (mlx.virtualGpu()) {
+        out.* = Verdict.refuse(.unsupported, "deepseek_v41: its kernels need a physical Apple GPU (a virtual GPU caps their threadgroups)");
+        return null;
+    }
     const c = config.of(ctx.parsed);
     // The EXL3 prompt GEMMs are built on MLX's NAX tiles: below the M5 they compute wrong (f64 self-check, M4).
     if (c.dsv41_exl3_bank and !@import("../../mlx/device.zig").naxAvailable()) {

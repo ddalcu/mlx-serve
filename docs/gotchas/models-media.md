@@ -698,6 +698,14 @@ numbers).
 
 ## Parity method
 
+### A plugin that moves to the GPU aborted every plugin's conformance on CI
+Defect: from #1041 on, CI's zig job failed on every PR: the registry conformance test (every plugin, one test) and
+three DeepSeek-V4.1 tests exited 255 on the hosted runner's virtual GPU. Cause: the suite loads each tiny pack on a
+CPU stream, but `deepseek_v41`'s load swaps in a GPU stream (its kernels are Metal-only), and those kernels launch
+1024-thread groups a virtual GPU refuses (Insufficient Memory, abort). Fix: its load refuses `.unsupported` on a
+virtual GPU, which the suite treats as "nothing to check here"; the three tests carry the `virtualGpu()` guard.
+Guard: the root rule (every GPU test skips on a virtual GPU) and the plugins rule on loads that change stream.
+
 ### Fixtures for fp16-fragile giants are dumped fp32 on CPU
 Defect: a paint DINOv2-giant oracle sat at cos 0.30 while every per-layer bisect of the port was clean. Cause: the
 fixture was dumped in fp16 on MPS; hidden magnitudes reach ~400 and the run silently decorrelated. Fix: dump deep
