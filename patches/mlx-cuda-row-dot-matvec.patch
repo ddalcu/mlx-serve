@@ -8,15 +8,17 @@ stock kernel is faster. fp4 decodes through the cvt instruction where the target
 (sm_120a, sm_121a) and through an exact byte-permute table elsewhere (plain sm_120 emulated it).
 The fp modes take the mat-vec through 8 rows on GB10, where one weight read beats the
 tiled kernel (MLX_CUDA_QMV_MAX_ROWS still decides).
+Upstream's fp_gather_qmv (one row per gather) takes only the gathers this arm does not:
+the row_dot arm shares its arithmetic with mlx-serve's fused MoE kernels, so supports_row_dot_gather
+decides first. A batch of few-row gathers (top-k decode) takes the mat-vec at any batch count.
 
 Retires when upstream MLX's CUDA gemv and quantized mat-vecs read 16-byte vectors for these
 formats at decode widths. Not reported upstream yet.
 
-diff --git a/docs/src/usage/environment_variables.rst b/docs/src/usage/environment_variables.rst
-index c2012d530..abb05dd42 100644
+
 --- a/docs/src/usage/environment_variables.rst
 +++ b/docs/src/usage/environment_variables.rst
-@@ -180,7 +180,8 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
+@@ -208,7 +208,8 @@
     Rows of one batch (``1`` to ``8``) that a CUDA quantized matmul runs through
     the mat-vec kernel, reading the weights once for all of them. A speculative
     verify and a batched decode both arrive as those rows. Unset, a GB10
@@ -26,9 +28,6 @@ index c2012d530..abb05dd42 100644
  
  .. envvar:: MLX_ENABLE_CACHE_THRASHING_CHECK
  
-diff --git a/mlx/backend/cuda/device/row_dot_ops.cuh b/mlx/backend/cuda/device/row_dot_ops.cuh
-new file mode 100644
-index 0000000..afd818a
 --- /dev/null
 +++ b/mlx/backend/cuda/device/row_dot_ops.cuh
 @@ -0,0 +1,205 @@
@@ -237,11 +236,9 @@ index 0000000..afd818a
 +}
 +
 +} // namespace mlx::core::cu
-diff --git a/mlx/backend/cuda/device_info.cpp b/mlx/backend/cuda/device_info.cpp
-index a4a15e2..e58d926 100644
 --- a/mlx/backend/cuda/device_info.cpp
 +++ b/mlx/backend/cuda/device_info.cpp
-@@ -150,6 +150,7 @@ device_info_impl(int device_index) {
+@@ -150,6 +150,7 @@
        // Compute capability as size_t (to match Metal's variant type)
        dev.info["compute_capability_major"] = static_cast<size_t>(prop.major);
        dev.info["compute_capability_minor"] = static_cast<size_t>(prop.minor);
@@ -249,8 +246,6 @@ index a4a15e2..e58d926 100644
  
        devices.push_back(std::move(dev));
      }
-diff --git a/mlx/backend/cuda/gemms/gemv.cu b/mlx/backend/cuda/gemms/gemv.cu
-index e48317d..4573a04 100644
 --- a/mlx/backend/cuda/gemms/gemv.cu
 +++ b/mlx/backend/cuda/gemms/gemv.cu
 @@ -1,6 +1,7 @@
@@ -261,10 +256,11 @@ index e48317d..4573a04 100644
  #include "mlx/backend/cuda/kernel_utils.cuh"
  #include "mlx/dtype_utils.h"
  
-@@ -238,6 +239,27 @@ void gemv(
+@@ -237,6 +238,27 @@
+       mat = gpu_ptr<DataType>(a);
        vec = gpu_ptr<DataType>(b);
        rows = M;
-     }
++    }
 +    if constexpr (sizeof(DataType) == 2) {
 +      if (batch_count == 1 && K % 8 == 0 && row_dot_aligned(mat) &&
 +          row_dot_aligned(vec)) {
@@ -285,13 +281,9 @@ index e48317d..4573a04 100644
 +            0);
 +        return;
 +      }
-+    }
+     }
      uint32_t num_blocks_x = (rows + rows_per_block - 1) / rows_per_block;
      int n_per_t;
-     if (K % 128 == 0 && is_aligned<4>(mat) && is_aligned<4>(vec)) {
-diff --git a/mlx/backend/cuda/gemms/row_dot.cuh b/mlx/backend/cuda/gemms/row_dot.cuh
-new file mode 100644
-index 0000000..d7dbfd6
 --- /dev/null
 +++ b/mlx/backend/cuda/gemms/row_dot.cuh
 @@ -0,0 +1,237 @@
@@ -532,11 +524,9 @@ index 0000000..d7dbfd6
 +}
 +
 +} // namespace mlx::core::cu
-diff --git a/mlx/backend/cuda/jit_module.cpp b/mlx/backend/cuda/jit_module.cpp
-index 0d107a8..9c1d98a 100644
 --- a/mlx/backend/cuda/jit_module.cpp
 +++ b/mlx/backend/cuda/jit_module.cpp
-@@ -274,6 +274,7 @@ constexpr const char* g_include_names[] = {
+@@ -273,6 +273,7 @@
      INCLUDE_PREFIX "qmm_naive.cuh",
      INCLUDE_PREFIX "qmm_sm80.cuh",
      INCLUDE_PREFIX "qmm_sm90.cuh",
@@ -544,7 +534,7 @@ index 0d107a8..9c1d98a 100644
      INCLUDE_PREFIX "scatter_ops.cuh",
      INCLUDE_PREFIX "unary_ops.cuh",
      INCLUDE_PREFIX "ternary_ops.cuh",
-@@ -296,6 +297,7 @@ constexpr const char* g_headers[] = {
+@@ -295,6 +296,7 @@
      jit_source_qmm_naive,
      jit_source_qmm_sm80,
      jit_source_qmm_sm90,
@@ -552,8 +542,6 @@ index 0d107a8..9c1d98a 100644
      jit_source_scatter_ops,
      jit_source_unary_ops,
      jit_source_ternary_ops,
-diff --git a/mlx/backend/cuda/quantized/qmm/fp_qmv.cu b/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
-index 41de03e..f19c049 100644
 --- a/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
 +++ b/mlx/backend/cuda/quantized/qmm/fp_qmv.cu
 @@ -2,6 +2,7 @@
@@ -564,10 +552,10 @@ index 41de03e..f19c049 100644
  #include "mlx/backend/cuda/kernel_utils.cuh"
  #include "mlx/backend/cuda/quantized/qmm/qmm.h"
  #include "mlx/backend/cuda/quantized/quantized_utils.h"
-@@ -270,6 +271,33 @@ void fp_qmv(
-            cu::is_aligned<2>(vec_ptr))) {
-         n = 2;
-       }
+@@ -311,6 +312,33 @@
+       const uint32_t* mat_ptr = gpu_ptr<uint32_t>(mat);
+       const T* vec_ptr = gpu_ptr<T>(vec);
+       int n = fp_qmv_n_per_thread(mat_ptr, vec_ptr, K, bits);
 +      if constexpr (sizeof(T) == 2) {
 +        // row_dot pays here on an integrated GPU (GB10); on a discrete card
 +        // the stock kernel below is faster, most at small N.
@@ -598,8 +586,26 @@ index 41de03e..f19c049 100644
        dispatch_1_2_4(n, [&](auto n) {
          if (B == 1) {
            auto kernel =
-diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
-index 728db42..fa2bdb0 100644
+--- a/mlx/backend/cuda/quantized/qmm/qmm.h
++++ b/mlx/backend/cuda/quantized/qmm/qmm.h
+@@ -195,6 +195,17 @@
+     QuantizationMode mode,
+     cu::CommandEncoder& encoder);
+ 
++// Whether gather_qmv runs the row_dot arm: the fp modes without a global scale
++// at 16-bit activations. Its arithmetic is the one mlx-serve's fused MoE kernels
++// reproduce bit for bit, so callers choose it over fp_gather_qmv when it applies.
++bool supports_row_dot_gather(
++    const array& x,
++    const array& w,
++    const array& scales,
++    const std::optional<array>& global_scale,
++    const array& out,
++    QuantizationMode mode);
++
+ void gather_qmv(
+     const array& x,
+     const array& w,
 --- a/mlx/backend/cuda/quantized/qmm/qmv.cu
 +++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
 @@ -1,6 +1,7 @@
@@ -610,16 +616,33 @@ index 728db42..fa2bdb0 100644
  #include "mlx/backend/cuda/kernel_utils.cuh"
  #include "mlx/backend/cuda/quantized/qmm/qmm.h"
  #include "mlx/dtype_utils.h"
-@@ -650,6 +651,47 @@ void gather_qmv(
-   int k = x.shape(-1);
-   int l = out.size() / (m * n);
- 
-+  if (mode != QuantizationMode::Affine && !global_scale &&
-+      out.dtype() != float32 && k % 32 == 0 && w.ndim() == 3 &&
+@@ -629,6 +630,21 @@
+               });
+         });
+   });
++}
++
++bool supports_row_dot_gather(
++    const array& x,
++    const array& w,
++    const array& scales,
++    const std::optional<array>& global_scale,
++    const array& out,
++    QuantizationMode mode) {
++  return mode != QuantizationMode::Affine && !global_scale &&
++      out.dtype() != float32 && x.shape(-1) % 32 == 0 && w.ndim() == 3 &&
 +      scales.ndim() == 3 && w.strides(0) == w.shape(1) * w.shape(2) &&
 +      scales.strides(0) == scales.shape(1) * scales.shape(2) &&
 +      cu::row_dot_aligned(gpu_ptr<void>(x)) &&
-+      cu::row_dot_aligned(gpu_ptr<void>(w))) {
++      cu::row_dot_aligned(gpu_ptr<void>(w));
+ }
+ 
+ void gather_qmv(
+@@ -650,6 +666,42 @@
+   int k = x.shape(-1);
+   int l = out.size() / (m * n);
+ 
++  if (supports_row_dot_gather(x, w, scales, global_scale, out, mode)) {
 +    encoder.set_input_array(x);
 +    encoder.set_input_array(w);
 +    encoder.set_input_array(scales);
@@ -658,8 +681,6 @@ index 728db42..fa2bdb0 100644
    dispatch_element_types(out.dtype(), tag, [&]<typename T>() {
      dispatch_quant_types<T>(
          bits,
-diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
-index 8ed9b72bd..d998e9197 100644
 --- a/mlx/backend/cuda/quantized/quantized.cpp
 +++ b/mlx/backend/cuda/quantized/quantized.cpp
 @@ -13,6 +13,20 @@
@@ -683,7 +704,7 @@ index 8ed9b72bd..d998e9197 100644
  void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
    nvtx3::scoped_range r("QuantizedMatmul::eval_gpu");
    auto& s = stream();
-@@ -118,9 +132,11 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -118,9 +132,11 @@
      return;
    }
  
@@ -697,7 +718,7 @@ index 8ed9b72bd..d998e9197 100644
        call_qmv();
      } else {
        call_qmm_sm80();
-@@ -129,7 +145,7 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -129,7 +145,7 @@
    }
  
    if (can_use_qmm_naive) {
@@ -706,25 +727,26 @@ index 8ed9b72bd..d998e9197 100644
        call_qmv();
      } else {
        call_qmm_naive();
-@@ -272,8 +288,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-     return;
-   }
- 
+@@ -207,7 +223,9 @@
+   bool can_use_qmm_naive = supports(supports_qmm_naive);
+   bool can_use_fp_gather_qmv = supports(supports_fp_gather_qmv);
+   bool can_use_qmv = supports(supports_qmv) || can_use_fp_gather_qmv;
+-  bool prefer_qmv = can_use_fp_gather_qmv || (can_use_qmv && M * B < 8);
 +  // Gathered rows on different experts share no weights, so a tile buys nothing
 +  // there: the mat-vec takes any batch of few-row gathers (top-k decode).
-+  bool gather_rows_few = M < 8;
-   if (can_use_qmm_sm80) {
--    if (can_use_qmv && (M * B < 8)) {
-+    if (can_use_qmv && gather_rows_few) {
-       call_qmv();
-     } else {
-       call_qmm_sm80();
-@@ -282,7 +301,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-   }
++  bool prefer_qmv = can_use_fp_gather_qmv || (can_use_qmv && M < 8);
  
-   if (can_use_qmm_naive) {
--    if (can_use_qmv && (M * B < 8)) {
-+    if (can_use_qmv && gather_rows_few) {
-       call_qmv();
-     } else {
-       call_qmm_naive();
+   auto call_qmm_sm80 = [&]() {
+     out.set_data(cu::malloc_async(out.nbytes(), encoder));
+@@ -243,7 +261,10 @@
+   };
+   auto call_qmv = [&]() {
+     out.set_data(cu::malloc_async(out.nbytes(), encoder));
+-    if (can_use_fp_gather_qmv) {
++    // row_dot's gather arm (in gather_qmv) first: it shares the arithmetic of
++    // mlx-serve's fused MoE kernels.
++    if (can_use_fp_gather_qmv &&
++        !supports_row_dot_gather(x, w, scales, global_scale, out, mode_)) {
+       fp_gather_qmv(
+           x,
+           w,

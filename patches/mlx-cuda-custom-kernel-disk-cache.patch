@@ -1,15 +1,16 @@
-cuda_kernel modules go to the disk kernel cache like MLX's own JIT kernels (MLX passed
+cuda_kernel modules go to the disk kernel cache like MLX's own JIT kernels (MLX passes
 use_disk_cache = false for them), so NVRTC compiles each once per machine instead of once per
-process. The module name hashes the generated source, and mlx-serve keys the cache directory by
-its MLX build stamp, so a cached module never outlives its source or its headers.
+process. The module name is `{kernel name}_{source_hash}`: since ml-explore/mlx#4568 the hash is
+the one the CustomKernel carries (computed once per generated source, std::hash of the full
+source), so this patch only turns the write on and hashes nothing itself. mlx-serve keys the
+cache directory by its MLX build stamp, so a cached module never outlives its source or its
+headers.
 
 Retires when upstream caches custom kernels on disk. Not reported upstream yet.
 
-diff --git a/mlx/backend/cuda/custom_kernel.cpp b/mlx/backend/cuda/custom_kernel.cpp
-index c230656d8..35f725c25 100644
 --- a/mlx/backend/cuda/custom_kernel.cpp
 +++ b/mlx/backend/cuda/custom_kernel.cpp
-@@ -319,7 +319,8 @@ void CustomKernel::eval_gpu(
+@@ -302,7 +302,8 @@
          return std::make_tuple(
              is_precompiled_, source_, std::vector{kernel_name});
        },

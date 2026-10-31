@@ -1,5 +1,3 @@
-diff --git a/mlx/backend/cuda/delayload.cpp b/mlx/backend/cuda/delayload.cpp
-index 44f6d16..349f8e2 100644
 --- a/mlx/backend/cuda/delayload.cpp
 +++ b/mlx/backend/cuda/delayload.cpp
 @@ -5,6 +5,8 @@
@@ -10,8 +8,8 @@ index 44f6d16..349f8e2 100644
 +#include <vector>
  // clang-format on
  
- namespace mlx::core::cu {
-@@ -57,6 +59,14 @@ fs::path load_cudnn() {
+ #include <cuda_runtime.h>
+@@ -81,6 +83,14 @@
    // Internally cuDNN loads some libs dynamically, add to search dirs.
    load_nvrtc();
    ::AddDllDirectory(cudnn_dir.c_str());
@@ -26,8 +24,6 @@ index 44f6d16..349f8e2 100644
    ::AddDllDirectory(cublas_dir().c_str());
    return cudnn_dir;
  }
-diff --git a/mlx/backend/cuda/dirs.cpp b/mlx/backend/cuda/dirs.cpp
-index bd24853..7efb197 100644
 --- a/mlx/backend/cuda/dirs.cpp
 +++ b/mlx/backend/cuda/dirs.cpp
 @@ -2,6 +2,7 @@
@@ -38,7 +34,7 @@ index bd24853..7efb197 100644
  #include <filesystem>
  #include <string>
  
-@@ -28,8 +29,36 @@ const char* cccl_dir() {
+@@ -28,8 +29,36 @@
  #endif
  }
  
@@ -76,7 +72,7 @@ index bd24853..7efb197 100644
    static const std::string dir = resolve_bin_dir(MLX_CUDA_BIN_DIR);
    return dir.c_str();
  #else
-@@ -38,7 +67,10 @@ const char* cuda_bin_dir() {
+@@ -38,7 +67,10 @@
  }
  
  const char* cudnn_bin_dir() {
