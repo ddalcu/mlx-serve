@@ -2603,7 +2603,7 @@ fn int8Joint(aw: *const DitAttnW, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx
     defer _ = mlx.mlx_array_free(kb);
     const vb = try astype(v, .bfloat16, s);
     defer _ = mlx.mlx_array_free(vb);
-    const o = (try int8_attn.attention(qb, kb, vb, scale, s)) orelse return null;
+    const o = (try int8_attn.attention(qb, kb, vb, scale, null, s)) orelse return null;
     defer _ = mlx.mlx_array_free(o);
     const seq = mlx.getShape(o)[0];
     const flat = try reshape(o, &[_]c_int{ 1, seq, width }, s);

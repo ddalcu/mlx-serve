@@ -1532,7 +1532,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     }
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
-    if (w8a8.w8a8State().enabled and vsa == null and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
+    if (w8a8.w8a8State().enabled and vsa == null and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, null, s)) |flat8| {
         defer _ = mlx.mlx_array_free(flat8);
         const out8 = try aw.out.forward(flat8, null, s);
         return lora_mod.addSlot(out8, flat8, &aw.out_lora, s);

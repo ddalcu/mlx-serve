@@ -4,6 +4,7 @@ const std = @import("std");
 const env = @import("../../../../env.zig");
 const kernelSource = @import("../../../../mlx/kernels.zig").source;
 const mlx = @import("../../../../mlx/ffi.zig");
+const device = @import("../../../../mlx/device.zig");
 const log = @import("../../../util/log.zig");
 const select = @import("select.zig");
 const QsaCfgCache = @import("../../../../mlx/kernel_cache.zig").QsaCfgCache;
@@ -69,35 +70,12 @@ pub fn qsaScoreFusedActiveFor(batch: c_int, n_idx: c_int, idx_hd: c_int) bool {
     return qsaScoreFusedActive() and batch == 1 and n_idx == 4 and idx_hd == 128;
 }
 
-fn qsaScoreTf32ValueOn(raw: []const u8) bool {
-    var i: usize = 0;
-    while (i < raw.len and std.ascii.isWhitespace(raw[i])) : (i += 1) {}
-    if (i >= raw.len) return false;
-    var sign: i32 = 1;
-    if (raw[i] == '-') {
-        sign = -1;
-        i += 1;
-    } else if (raw[i] == '+') {
-        i += 1;
-    }
-    var val: i64 = 0;
-    var any = false;
-    while (i < raw.len) : (i += 1) {
-        const c = raw[i];
-        if (c < '0' or c > '9') break;
-        any = true;
-        val = val * 10 + @as(i64, c - '0');
-    }
-    if (!any) return false;
-    return (if (sign < 0) -val else val) != 0;
-}
-
 fn qsaScoreTf32Enabled() bool {
     if (qsa_score_tf32_override) |v| return v;
     if (qsa_score_tf32_env) |v| return v;
     const v = blk: {
         const raw = env.get(.MLX_ENABLE_TF32) orelse break :blk true;
-        break :blk qsaScoreTf32ValueOn(std.mem.sliceTo(raw, 0));
+        break :blk device.tf32ValueOn(std.mem.sliceTo(raw, 0));
     };
     qsa_score_tf32_env = v;
     return v;
@@ -745,13 +723,6 @@ test "qsa score kernel: TF32 off declines" {
 }
 
 test "qsa score fused: sizing policy" {
-    try testing.expect(qsaScoreTf32ValueOn("1"));
-    try testing.expect(qsaScoreTf32ValueOn(" 1"));
-    try testing.expect(!qsaScoreTf32ValueOn("0"));
-    try testing.expect(!qsaScoreTf32ValueOn("00"));
-    try testing.expect(!qsaScoreTf32ValueOn("false"));
-    try testing.expect(!qsaScoreTf32ValueOn(" 0"));
-    try testing.expect(!qsaScoreTf32ValueOn("0x0"));
     try testing.expectEqual(QsaScoreLayout.base, qsaScoreLayoutFor(1));
     try testing.expectEqual(QsaScoreLayout.base, qsaScoreLayoutFor(127));
     try testing.expectEqual(QsaScoreLayout.h4, qsaScoreLayoutFor(128));

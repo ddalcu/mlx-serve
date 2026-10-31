@@ -1,4 +1,6 @@
 constexpr int BK = 32, SM = 16, NSG = 4;
+// The destination layout of an SM x D tensor op: its slot shift is 3 + log2(D / 16).
+constexpr int DSH = D == 64 ? 5 : D == 128 ? 6 : 7;
 const int H = qi_shape[1];
 const int LQ = qi_shape[2];
 const int L = ki_shape[2];
@@ -8,22 +10,22 @@ const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup
 const int head = int(threadgroup_position_in_grid.y);
 const int kvh = head / (H / KVH);
 const int q0 = int(threadgroup_position_in_grid.x) * (SM * NSG) + int(sg) * SM;
-tensor<device int8_t, dextents<int, 2>, tensor_inline> Qt((device int8_t*)qi + (size_t)head * LQ * 128, dextents<int, 2>(128, LQ));
-tensor<device int8_t, dextents<int, 2>, tensor_inline> Kt((device int8_t*)ki + (size_t)kvh * L * 128, dextents<int, 2>(128, L));
-tensor<device int8_t, dextents<int, 2>, tensor_inline> Vt((device int8_t*)vi + (size_t)kvh * L * 128, dextents<int, 2>(128, L));
-constexpr auto dS = matmul2d_descriptor(SM, BK, 128, false, true, false, matmul2d_descriptor::mode::multiply);
+tensor<device int8_t, dextents<int, 2>, tensor_inline> Qt((device int8_t*)qi + (size_t)head * LQ * D, dextents<int, 2>(D, LQ));
+tensor<device int8_t, dextents<int, 2>, tensor_inline> Kt((device int8_t*)ki + (size_t)kvh * L * D, dextents<int, 2>(D, L));
+tensor<device int8_t, dextents<int, 2>, tensor_inline> Vt((device int8_t*)vi + (size_t)kvh * L * D, dextents<int, 2>(D, L));
+constexpr auto dS = matmul2d_descriptor(SM, BK, D, false, true, false, matmul2d_descriptor::mode::multiply);
 matmul2d<dS, execution_simdgroup> opS;
-constexpr auto dO = matmul2d_descriptor(SM, 128, BK, false, false, false, matmul2d_descriptor::mode::multiply);
+constexpr auto dO = matmul2d_descriptor(SM, D, BK, false, false, false, matmul2d_descriptor::mode::multiply);
 matmul2d<dO, execution_simdgroup> opO;
-auto qsl = Qt.template slice<128, SM>(0, q0);
-auto ks0 = Kt.template slice<128, BK>(0, 0);
-auto vs0 = Vt.template slice<128, BK>(0, 0);
+auto qsl = Qt.template slice<D, SM>(0, q0);
+auto ks0 = Kt.template slice<D, BK>(0, 0);
+auto vs0 = Vt.template slice<D, BK>(0, 0);
 auto qT = opS.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
 qT.load(qsl);
 auto sT = opS.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(qT)>, decltype(ks0), int32_t>();
 auto pT = opO.template get_left_input_cooperative_tensor<int8_t, int8_t, int32_t>();
 auto oT = opO.template get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(pT)>, decltype(vs0), int32_t>();
-constexpr int NS = SM / 8, SC = SM * BK / 32, OC = SM * 128 / 32;
+constexpr int NS = SM / 8, SC = SM * BK / 32, OC = SM * D / 32;
 const int rb = int((lane >> 1) & 3) + 4 * int((lane >> 4) & 1);
 const int cb = 4 * int(lane & 1) + 8 * int((lane >> 3) & 1);
 float of[OC];
@@ -36,11 +38,12 @@ for (int r = 0; r < NS; r++) {
   qsc[r] = row < LQ ? qs[(size_t)head * LQ + row] * scale : 0.0f;
   m[r] = -INFINITY; l[r] = 0.0f;
 }
-const device float* kbs = ks + (size_t)kvh * NB;
+// auto: MLX binds a small ks (kv heads x key blocks under 8) in constant space.
+const auto kbs = ks + (size_t)kvh * NB;
 const float LOG127 = 6.98868468677f;
 for (int kb = 0; kb < NB; kb++) {
   const int k0 = kb * BK;
-  auto ksl = Kt.template slice<128, BK>(0, k0);
+  auto ksl = Kt.template slice<D, BK>(0, k0);
   opS.run(qT, ksl, sT);
   if (k0 + BK > L) {
 #pragma clang loop unroll(full)
@@ -50,20 +53,38 @@ for (int kb = 0; kb < NB; kb++) {
       for (int e = 0; e < 4; e++) if (c + e >= L) sT[g + e] = INT_MIN;
     }
   }
-  int imx[NS];
-#pragma clang loop unroll(full)
-  for (int r = 0; r < NS; r++) imx[r] = INT_MIN;
-#pragma clang loop unroll(full)
-  for (int g = 0; g < SC; g++) { const int sl = ((g >> 2) & 1) + 2 * (g >> 4); imx[sl] = max(imx[sl], sT[g]); }
   const float kscale = kbs[kb];
   float c[NS], off[NS], fac[NS], bs[NS];
   int rs[NS];
+  // With a key bias each score is a float (its logit plus the key's base-2 bias), the block max among them.
+  float fs[HAS_BIAS ? SC : 1];
+  float fmx[NS];
+  int imx[NS];
+#pragma clang loop unroll(full)
+  for (int r = 0; r < NS; r++) { imx[r] = INT_MIN; fmx[r] = -INFINITY; c[r] = qsc[r] * kscale; }
+  if (HAS_BIAS) {
+#pragma clang loop unroll(full)
+    for (int g = 0; g < SC; g++) {
+      const int sl = ((g >> 2) & 1) + 2 * (g >> 4);
+      const int col = k0 + cb + 16 * ((g >> 3) & 1) + (g & 3);
+      fs[g] = sT[g] == INT_MIN ? -INFINITY : fma(float(sT[g]), c[sl], kbias[col]);
+      fmx[sl] = max(fmx[sl], fs[g]);
+    }
+  } else {
+#pragma clang loop unroll(full)
+    for (int g = 0; g < SC; g++) { const int sl = ((g >> 2) & 1) + 2 * (g >> 4); imx[sl] = max(imx[sl], sT[g]); }
+  }
 #pragma clang loop unroll(full)
   for (int r = 0; r < NS; r++) {
-    int t = max(imx[r], simd_shuffle_xor(imx[r], 1));
-    t = max(t, simd_shuffle_xor(t, 8));
-    c[r] = qsc[r] * kscale;
-    const float mb = float(t) * c[r];
+    float mb;
+    if (HAS_BIAS) {
+      mb = max(fmx[r], simd_shuffle_xor(fmx[r], 1));
+      mb = max(mb, simd_shuffle_xor(mb, 8));
+    } else {
+      int t = max(imx[r], simd_shuffle_xor(imx[r], 1));
+      t = max(t, simd_shuffle_xor(t, 8));
+      mb = float(t) * c[r];
+    }
     const float mn = max(m[r], mb);
     fac[r] = exp2(m[r] - mn);
     bs[r] = exp2(mb - mn);
@@ -74,7 +95,7 @@ for (int kb = 0; kb < NB; kb++) {
 #pragma clang loop unroll(full)
   for (int g = 0; g < SC; g++) {
     const int sl = ((g >> 2) & 1) + 2 * (g >> 4);
-    const int p = sT[g] == INT_MIN ? 0 : int(rint(exp2(fma(float(sT[g]), c[sl], off[sl]))));
+    const int p = sT[g] == INT_MIN ? 0 : HAS_BIAS ? int(rint(exp2(fs[g] + off[sl]))) : int(rint(exp2(fma(float(sT[g]), c[sl], off[sl]))));
     rs[sl] += p;
     pT[g] = int8_t(p);
   }
@@ -84,19 +105,19 @@ for (int kb = 0; kb < NB; kb++) {
     t += simd_shuffle_xor(t, 8);
     l[r] = fma(l[r], fac[r], float(t) * bs[r]);
   }
-  auto vsl = Vt.template slice<128, BK>(0, k0);
+  auto vsl = Vt.template slice<D, BK>(0, k0);
   opO.run(pT, vsl, oT);
 #pragma clang loop unroll(full)
-  for (int i = 0; i < OC; i++) { const int sl = ((i >> 2) & 1) + 2 * (i >> 6); of[i] = fma(of[i], fac[sl], float(oT[i]) * bs[sl]); }
+  for (int i = 0; i < OC; i++) { const int sl = ((i >> 2) & 1) + 2 * (i >> DSH); of[i] = fma(of[i], fac[sl], float(oT[i]) * bs[sl]); }
 }
 #pragma clang loop unroll(full)
 for (int g = 0; g < OC; g += 4) {
-  const int slot = ((g >> 2) & 1) + 2 * (g >> 6);
+  const int slot = ((g >> 2) & 1) + 2 * (g >> DSH);
   const int row = q0 + rb + 8 * slot;
-  const int col = cb + 16 * ((g >> 3) & 7);
+  const int col = cb + 16 * ((g >> 3) & (D / 16 - 1));
   if (row < LQ) {
-    const float4 vc = max(*(const device float4*)(vm + (size_t)kvh * 128 + col), float4(1e-20f)) * (1.0f / (127.0f * l[slot]));
-    *(device vec<T, 4>*)(o + ((size_t)row * H + head) * 128 + col) =
+    const float4 vc = max(*(const device float4*)(vm + (size_t)kvh * D + col), float4(1e-20f)) * (1.0f / (127.0f * l[slot]));
+    *(device vec<T, 4>*)(o + ((size_t)row * H + head) * D + col) =
         vec<T, 4>(T(of[g] * vc.x), T(of[g + 1] * vc.y), T(of[g + 2] * vc.z), T(of[g + 3] * vc.w));
   }
 }

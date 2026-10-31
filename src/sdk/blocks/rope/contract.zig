@@ -7,6 +7,8 @@ const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
 const kc = @import("../../testing/kernel_contract/root.zig");
 const qk = @import("qk_norm_rope.zig");
+const scope_mod = @import("../../../mlx/scope.zig");
+const dinov3 = @import("../../vision/dinov3.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -368,6 +370,138 @@ const registrations = .{
     .{ "qk_norm_rope_256 bf16 (rope only, rd 256)", spark_rope_only, positions(&.{1}), launch256(1024) },
 };
 
+// ── DINOv3: rotate-half RoPE on the patch tokens + heads-major layout ──
+
+const dinov3_launch: metal.Launch = .{ .name = "msv_dinov3_rope", .inputs = &.{ "X", "COS", "SIN" }, .outputs = &.{"O"}, .source = dinov3.ROPE_SOURCE, .tg_bytes = 0, .m1 = 1024, .m2 = 1024 };
+
+/// x [L, H*D] token-major, cos and sin [L - P, D] -> [1, H, L, D]: `rows` L, `n` H, `k` D; P = 5 (CLS + 4 registers).
+const Dinov3Rope = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &dinov3_launch,
+    dt: mlx.mlx_dtype,
+    shape: Shape = undefined,
+    arena: std.heap.ArenaAllocator,
+    x: []f64 = &.{},
+    cos: []f64 = &.{},
+    sin: []f64 = &.{},
+    args: [3]mlx.mlx_array = undefined,
+
+    const P = 5;
+
+    fn init(a: std.mem.Allocator, dt: mlx.mlx_dtype) Dinov3Rope {
+        return .{ .rig = metal.Rig.init(a), .dt = dt, .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Dinov3Rope) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(self: *const Dinov3Rope, shape: Shape) ?metal.Geometry {
+        if (shape.rows < P or shape.n == 0 or shape.k == 0 or shape.k % 2 != 0) return null;
+        const pairs: c_int = @intCast(shape.n * shape.k / 2);
+        var g = metal.Geometry{ .grid = .{ pairs, @intCast(shape.rows), 1 }, .tg = .{ @min(pairs, 256), 1, 1 } };
+        g.out(&.{ 1, @intCast(shape.n), @intCast(shape.rows), @intCast(shape.k) }, self.dt);
+        g.dtype("T", self.dt);
+        g.int("H", shape.n);
+        g.int("D", shape.k);
+        g.int("P", P);
+        return g;
+    }
+
+    pub fn prepare(self: *Dinov3Rope, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const width = shape.n * shape.k;
+        const table = (shape.rows - P) * shape.k;
+        self.x = try host.uniform(a, rng, shape.rows * width, -4, 4, self.dt);
+        self.cos = try host.uniform(a, rng, table, -1, 1, self.dt);
+        self.sin = try host.uniform(a, rng, table, -1, 1, self.dt);
+        if (fill == .nonfinite) host.plant(self.x, shape.rows, width);
+        self.rig.reset();
+        const tab = [_]c_int{ @intCast(shape.rows - P), @intCast(shape.k) };
+        self.args = .{
+            try self.rig.input(self.dt, &.{ @intCast(shape.rows), @intCast(width) }, self.x),
+            try self.rig.input(self.dt, &tab, self.cos),
+            try self.rig.input(self.dt, &tab, self.sin),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Dinov3Rope) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Dinov3Rope) usize {
+        return self.shape.rows * self.shape.n * self.shape.k;
+    }
+
+    /// Prefix tokens as they are; each product rounded to T, the sum exact.
+    pub fn reference(self: *const Dinov3Rope, want: []f64, mag: []f64) !void {
+        const e = host.elemOf(self.dt);
+        const n = self.shape.n;
+        const d = self.shape.k;
+        const half = d / 2;
+        for (0..self.shape.rows) |r| for (0..n) |h| for (0..d) |j| {
+            const at = (h * self.shape.rows + r) * d + j;
+            const x = self.x[r * n * d + h * d + j];
+            if (r < P) {
+                want[at] = x;
+                mag[at] = @abs(x);
+                continue;
+            }
+            const partner = self.x[r * n * d + h * d + (j + half) % d];
+            const t = (r - P) * d + j;
+            const a = spec.roundTo(e, x * self.cos[t]);
+            const b = spec.roundTo(e, (if (j < half) -partner else partner) * self.sin[t]);
+            want[at] = a + b;
+            mag[at] = @max(@abs(a), @abs(b));
+        };
+    }
+
+    /// DINOv3's chain: reshape, transpose to heads, then `Encoder.rope`.
+    pub fn replaced(self: *Dinov3Rope) ![]const u8 {
+        var sc = scope_mod.Scope.init(self.rig.a, self.rig.stream());
+        defer sc.deinit();
+        const n = self.shape.n;
+        const enc: dinov3.Encoder = .{ .gpa = self.rig.a, .cfg = .{ .hidden = n * self.shape.k, .heads = n, .layers = 0, .mlp = 0, .patch = 16, .registers = P - 1, .rope_theta = 100, .eps = 1e-5 }, .w = undefined, .cls = undefined, .registers = undefined, .patch_w = undefined, .patch_b = undefined, .layers = &.{} };
+        const x = try sc.transpose(try sc.reshape(self.args[0], &.{ 1, @intCast(self.shape.rows), @intCast(n), @intCast(self.shape.k) }), &.{ 0, 2, 1, 3 });
+        return self.rig.bytesOf(&.{try enc.rope(&sc, x, self.args[1], self.args[2])});
+    }
+
+    /// The shipped wrapper on the same inputs.
+    fn wrapper(self: *Dinov3Rope) ![]const u8 {
+        var sc = scope_mod.Scope.init(self.rig.a, self.rig.stream());
+        defer sc.deinit();
+        const y = try sc.reshape(self.args[0], &.{ 1, @intCast(self.shape.rows), @intCast(self.shape.n * self.shape.k) });
+        const got = (try dinov3.ropeHeads(y, self.args[1], self.args[2], @intCast(self.shape.n), P, self.rig.stream())) orelse return error.Declined;
+        return self.rig.bytesOf(&.{try sc.keep(got)});
+    }
+};
+
+fn noDepth(_: Shape) usize {
+    return 0;
+}
+
+fn dinov3Spec(comptime name: []const u8, dt: mlx.mlx_dtype, served: []const Shape) spec.Spec {
+    return .{
+        .name = name,
+        .accum = .none,
+        .depth = noDepth,
+        // The rotation's two products and its add.
+        .ops = 3,
+        .mids = 2,
+        .out = host.elemOf(dt),
+        .replaces = "transpose -> rotate-half rope (patch tokens)",
+        .tiles = .{ .{ .size = 5, .min = 5 }, .{}, .{ .size = 2, .step = 2, .min = 2 } },
+        .served = served,
+    };
+}
+
 pub fn register(set: *kc.Set) !void {
     const a = set.a;
     inline for (registrations) |r| {
@@ -376,6 +510,9 @@ pub fn register(set: *kc.Set) !void {
         }.launch;
         try set.add(QkRope, .init(a, l, r[1]), qkSpec(r[0], r[1], r[2]), null);
     }
+    // Idol's ViT-H+ in bf16 (20 heads); TRELLIS.2's ViT-L in f32 (16 heads).
+    try set.add(Dinov3Rope, .init(a, .bfloat16), dinov3Spec("dinov3_rope bf16 (rotate-half, heads-major)", .bfloat16, &.{ .{ .rows = 69, .n = 20, .k = 64 }, .{ .rows = 21, .n = 2, .k = 16 } }), null);
+    try set.add(Dinov3Rope, .init(a, .float32), dinov3Spec("dinov3_rope f32 (rotate-half, heads-major)", .float32, &.{ .{ .rows = 69, .n = 16, .k = 64 }, .{ .rows = 21, .n = 2, .k = 16 } }), null);
 }
 
 // ── tests ──
@@ -389,6 +526,15 @@ test "kernel contract rope: each declared launch is the shipped wrapper's, byte 
     defer set.deinit();
     try register(&set);
     for (set.kernels.items) |k| {
+        if (std.mem.startsWith(u8, k.spec.name, "dinov3_rope")) {
+            const t: *Dinov3Rope = @ptrCast(@alignCast(k.ctx));
+            try std.testing.expect(try t.prepare(k.spec.served[0], .random, 7));
+            try t.run();
+            const ours = try a.dupe(u8, t.rig.outputBytes());
+            defer a.free(ours);
+            try std.testing.expectEqualSlices(u8, try t.wrapper(), ours);
+            continue;
+        }
         const t: *QkRope = @ptrCast(@alignCast(k.ctx));
         try std.testing.expect(try t.prepare(k.spec.served[0], .random, 7));
         try t.run();

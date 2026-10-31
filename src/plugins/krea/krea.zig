@@ -683,7 +683,7 @@ const Attention = struct {
         const L: c_int = ops.shape(qkv)[1];
         const h = try self.projectHeads(&g, qkv, cos, sin);
         const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(self.head_dim)));
-        const attn8 = if (w8a8.w8a8State().enabled and mask == null) try int8_attn.attention(h.q, h.k, h.v, scale, g.s) else null;
+        const attn8 = if (w8a8.w8a8State().enabled and mask == null) try int8_attn.attention(h.q, h.k, h.v, scale, null, g.s) else null;
         const merged = if (attn8) |a8|
             try g.adopt(a8)
         else

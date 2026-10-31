@@ -303,7 +303,7 @@ pub const Conditioner = struct {
             for (views[0..done]) |*v| v.deinit();
             alloc.free(views);
         }
-        var enc = try dino.Encoder.open(io, alloc, dino_dir);
+        var enc = try dino.Encoder.open(io, alloc, dino_dir, .float32);
         defer enc.deinit();
         const prefix: c_int = @intCast(1 + enc.cfg.registers);
         for (images, cams, views) |img, cam, *v| {

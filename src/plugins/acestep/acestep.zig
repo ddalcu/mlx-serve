@@ -385,7 +385,7 @@ fn ropeInPlace(x: mlx.mlx_array, hd: c_int, theta: f32, s: S) !mlx.mlx_array {
 /// Unmasked attention merged to [1, T, H*128]: on the int8 kernel when the route takes it
 /// (`--w8a8`), else sdpa then `mergeHeads`.
 fn attnMerged(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) !mlx.mlx_array {
-    if (w8a8.w8a8State().enabled) if (try int8_attn.attention(q, k, v, scale, s)) |o| {
+    if (w8a8.w8a8State().enabled) if (try int8_attn.attention(q, k, v, scale, null, s)) |o| {
         defer _ = mlx.mlx_array_free(o);
         const sh = mlx.getShape(o);
         return reshape(o, &[_]c_int{ 1, sh[0], sh[1] }, s);
