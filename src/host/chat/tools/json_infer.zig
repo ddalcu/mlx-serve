@@ -5,6 +5,7 @@ const log = @import("../../../sdk/util/log.zig");
 const testing = std.testing;
 
 const ParsedToolCall = @import("parse.zig").ParsedToolCall;
+const dsmlAttr = @import("dsml.zig").dsmlAttr;
 
 /// Last-resort tool-call inference for models that emit JUST the arguments
 /// object — no tool name, no wrapper syntax. Observed live from Gemma 4 12B
@@ -99,6 +100,233 @@ pub fn inferBareJsonToolCalls(allocator: std.mem.Allocator, text: []const u8, to
     calls[0] = .{ .name = name_owned, .arguments = try allocator.dupe(u8, obj_slice) };
     log.info("  [tool-parse] inferred bare-args call to '{s}' via unique schema match\n", .{name});
     return calls;
+}
+
+/// Last-resort inference for DeepSeek-V4.1's degraded tool-call markup (the
+/// #928 Anthropic-markup family, DeepSeek-V4.1 signature; same class as #980).
+/// Under prefill mode-lock the model drops the `<function=NAME>` layer and
+/// collapses a call to the hybrid
+///
+///     <tool call>
+///     <parameter name="bash">cd /x && …</parameter>
+///
+/// — a Hermes-ish `<tool call>`/`<tool_call>` wrapper (note the SPACE variant),
+/// no `<invoke`/`<function=` middle layer, and the TOOL NAME carried as the
+/// first `<parameter name="…">` (Anthropic spelling) whose value is the tool's
+/// sole argument; often truncated right after the open tag. `parseHermesToolCall`
+/// wants `<function=>` and `parseInvokeToolCalls` wants an `<invoke` opener, so
+/// neither matches and the block leaks into `content` with finish "stop".
+///
+/// Conservative contract — fires ONLY when parseToolCalls returned null:
+///   • text must carry the `<tool call>`/`<tool_call>` wrapper, and params are
+///     scanned only AFTER it (a lone `<parameter>` in prose is out of scope);
+///   • the first `<parameter name="X">` whose X names a DECLARED tool wins — a
+///     parameter named after a tool, inside a tool-call wrapper, is the tell (a
+///     real param is `command`/`path`/…, never the tool's own name); none → null;
+///   • the value (to `</parameter>`, else truncated) maps to that tool's sole/
+///     main parameter via the schema; no value or no mappable param → NAME + {}
+///     (ship the call, never a fragment — the ATEM/Harmony truncation rule).
+pub fn inferCollapsedParamToolCalls(allocator: std.mem.Allocator, text: []const u8, tools_json: []const u8) !?[]ParsedToolCall {
+    const w_space = std.mem.indexOf(u8, text, "<tool call");
+    const w_under = std.mem.indexOf(u8, text, "<tool_call");
+    const wrapper_pos = blk: {
+        if (w_space) |a| break :blk if (w_under) |b| @min(a, b) else a;
+        break :blk w_under orelse return null;
+    };
+
+    const tools_parsed = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return null;
+    defer tools_parsed.deinit();
+    if (tools_parsed.value != .array) return null;
+
+    var pos: usize = wrapper_pos;
+    while (std.mem.indexOfPos(u8, text, pos, "<parameter")) |p| {
+        const after = p + "<parameter".len;
+        if (after >= text.len) break;
+        // Must be the attribute form `<parameter name=…>`, not `<parameters>`.
+        if (!std.ascii.isWhitespace(text[after])) {
+            pos = after;
+            continue;
+        }
+        const seg = text[after..];
+        const te = std.mem.indexOfScalar(u8, seg, '>') orelse break; // truncated open tag
+        const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
+            pos = after + te + 1;
+            continue;
+        };
+        // X must name a declared tool; capture its `parameters` for mapping.
+        const params = findToolParameters(tools_parsed.value.array, pname) orelse {
+            pos = after + te + 1;
+            continue;
+        };
+
+        // Value runs to the confirmed `</parameter>` close; absent = truncated.
+        const vstart = after + te + 1;
+        var value: ?[]const u8 = null;
+        if (std.mem.indexOf(u8, text[vstart..], "</parameter>")) |vend| {
+            const raw = std.mem.trim(u8, text[vstart .. vstart + vend], " \n\t\r");
+            if (raw.len > 0) value = raw;
+        }
+
+        const arguments = try buildCollapsedArgs(allocator, params, value);
+        errdefer allocator.free(arguments);
+        const name_owned = try allocator.dupe(u8, pname);
+        errdefer allocator.free(name_owned);
+        const calls = try allocator.alloc(ParsedToolCall, 1);
+        calls[0] = .{ .name = name_owned, .arguments = arguments };
+        log.info("  [tool-parse] recovered collapsed <tool call><parameter name=\"{s}\"> call\n", .{pname});
+        return calls;
+    }
+    return null;
+}
+
+/// The `parameters` object of a declared tool, by function name (null if the
+/// name is not a declared tool). A tool with no `parameters` key yields a null
+/// Value so an argless collapsed call (`get_goal`) still resolves to NAME + {}.
+fn findToolParameters(tools: std.json.Array, name: []const u8) ?std.json.Value {
+    for (tools.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const func_val = tool_val.object.get("function") orelse continue;
+        if (func_val != .object) continue;
+        const name_val = func_val.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        if (!std.mem.eql(u8, name_val.string, name)) continue;
+        return func_val.object.get("parameters") orelse std.json.Value{ .null = {} };
+    }
+    return null;
+}
+
+/// Pick the schema parameter a collapsed value should fill: the sole property,
+/// else the sole required param, else a conventionally-named one. null = no
+/// mappable parameter (argless tool, or ambiguous multi-param).
+fn pickMainParam(params: std.json.Value) ?[]const u8 {
+    if (params != .object) return null;
+    const props_v = params.object.get("properties") orelse return null;
+    if (props_v != .object) return null;
+    const props = props_v.object;
+    if (props.count() == 0) return null;
+    if (props.count() == 1) return props.keys()[0];
+    if (params.object.get("required")) |req_v| {
+        if (req_v == .array and req_v.array.items.len == 1 and req_v.array.items[0] == .string)
+            return req_v.array.items[0].string;
+    }
+    const conventional = [_][]const u8{ "command", "cmd", "input", "text", "content", "code", "script", "query", "path" };
+    for (conventional) |c| if (props.get(c) != null) return c;
+    return null;
+}
+
+/// Build the arguments JSON for a collapsed call. A present value maps to the
+/// main parameter (spelled JSON keeps its type, else a raw string — the schema
+/// coercion chokepoint still gets the final word); no value or no mappable
+/// parameter ships `{}` so the call fires without a fabricated fragment.
+fn buildCollapsedArgs(allocator: std.mem.Allocator, params: std.json.Value, value: ?[]const u8) ![]const u8 {
+    const v = value orelse return try allocator.dupe(u8, "{}");
+    const key = pickMainParam(params) orelse return try allocator.dupe(u8, "{}");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var map: std.json.ObjectMap = .empty;
+    const jv: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, aa, v, .{}) catch std.json.Value{ .string = v };
+    try map.put(aa, key, jv);
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = map }, .{});
+}
+
+test "inferCollapsedParamToolCalls: complete <tool call><parameter name=bash> maps value to the command arg" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}},
+        \\ {"type":"function","function":{"name":"get_goal","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const text = "查 guest。\n\n</br>\n\n<tool call>\n<parameter name=\"bash\">cd /x && echo hi</parameter>\n</parameter>\n</invoke>";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("cd /x && echo hi", parsed.value.object.get("command").?.string);
+}
+
+test "inferCollapsedParamToolCalls: truncated after the open tag ships NAME + {}" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    const text = "x\n\n<tool call>\n<parameter name=\"bash\">";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "inferCollapsedParamToolCalls: argless tool resolves to NAME + {}" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_goal","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const text = "status.\n\n<tool call>\n<parameter name=\"get_goal\"></parameter>\n</invoke>";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_goal", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "inferCollapsedParamToolCalls: sole required param wins over extra optionals" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"search","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}}]
+    ;
+    const text = "<tool call>\n<parameter name=\"search\">lions of massachusetts</parameter>";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqualStrings("search", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("lions of massachusetts", parsed.value.object.get("query").?.string);
+}
+
+test "inferCollapsedParamToolCalls: a parameter NOT named after a tool is never promoted" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    // `command` is a real param name, not a tool name — no tool is identifiable.
+    const text = "<tool call>\n<parameter name=\"command\">ls -la</parameter>";
+    try testing.expect((try inferCollapsedParamToolCalls(allocator, text, tools)) == null);
+}
+
+test "inferCollapsedParamToolCalls: no <tool call> wrapper is prose, never a call" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    const text = "Claude wraps params as <parameter name=\"bash\"> in its docs.";
+    try testing.expect((try inferCollapsedParamToolCalls(allocator, text, tools)) == null);
 }
 
 /// Strip a leading `<parameters>` / trailing `</parameters>` pair if both

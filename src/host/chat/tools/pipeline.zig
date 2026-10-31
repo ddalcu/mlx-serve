@@ -133,6 +133,10 @@ pub fn parseToolCallsForRequest(
     }
     var calls = parsed_calls orelse
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
+        // DeepSeek-V4.1 collapsed `<tool call><parameter name="TOOL">…` leak
+        // (#928 family / #980 class): schema-aware, fires only when every other
+        // dialect found nothing. See inferCollapsedParamToolCalls.
+        (if (tools_json) |tj| try chat_mod.inferCollapsedParamToolCalls(allocator, text, tj) else null) orelse
         return null;
     if (!allow_parallel and calls.len > 1) {
         log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
