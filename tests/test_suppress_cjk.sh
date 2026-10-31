@@ -1,7 +1,7 @@
 #!/bin/bash
-# test_suppress_cjk.sh — `suppress_cjk` on the three chat surfaces: without it a CJK-provoking prompt writes
-# CJK, with it no reply carries a CJK character; a non-boolean is a 400, null leaves it off, and a greedy
-# PLD round cannot copy CJK from the prompt past the mask.
+# test_suppress_cjk.sh — `suppress_cjk` on the three chat surfaces and /v1/completions: without it a
+# CJK-provoking prompt writes CJK, with it no reply carries a CJK character; a non-boolean is a 400, null
+# leaves it off, and a greedy PLD round cannot copy CJK from the prompt past the mask.
 #
 #   SUPPRESS_CJK_MODEL=<dir> ./tests/test_suppress_cjk.sh [port]   # default Qwen3.5-4B-MLX-8bit; RUNS=10 per arm
 set -uo pipefail
@@ -50,22 +50,26 @@ def walk(v):
 print(sum(1 for s in walk(json.load(open(sys.argv[1]))) for c in s if any(lo <= ord(c) <= hi for lo, hi in R)))
 PY
 }
-route() { case "$1" in chat) echo /v1/chat/completions ;; messages) echo /v1/messages ;; responses) echo /v1/responses ;; esac; }
+route() { case "$1" in chat) echo /v1/chat/completions ;; messages) echo /v1/messages ;; responses) echo /v1/responses ;; completions) echo /v1/completions ;; esac; }
 body() { # <surface> <prompt> <max tokens> <extra fields>
     case "$1" in
         responses) echo "{\"model\":\"m\",\"max_output_tokens\":$3,\"input\":\"$2\"$4}" ;;
+        completions) echo "{\"model\":\"m\",\"max_tokens\":$3,\"prompt\":\"$2\"$4}" ;;
         *)         echo "{\"model\":\"m\",\"max_tokens\":$3,\"messages\":[{\"role\":\"user\",\"content\":\"$2\"}]$4}" ;;
     esac
 }
 Q='Wie heisst die Hauptstadt Chinas in Originalschrift? Antworte nur mit dem Namen.'
+# A raw prompt has no chat turn to ask in: a list that continues in Han. The reply does not echo it.
+QC='English: Shanghai\nChinese: 上海\nEnglish: Guangzhou\nChinese: 广州\nEnglish: Beijing\nChinese:'
 
 echo "=== CJK with and without the field ($RUNS runs each) ==="
-for s in chat messages responses; do
-    off=0; on=0; errs=0
+for s in chat messages responses completions; do
+    off=0; on=0; errs=0; q=$Q; n=512
+    [[ $s == completions ]] && { q=$QC; n=16; }
     for i in $(seq 1 "$RUNS"); do
-        [[ "$(post "$(route $s)" "$(body $s "$Q" 512 ',"temperature":0.7')")" == 200 ]] || errs=$((errs+1))
+        [[ "$(post "$(route $s)" "$(body $s "$q" $n ',"temperature":0.7')")" == 200 ]] || errs=$((errs+1))
         [[ "$(cjk)" -gt 0 ]] && off=$((off+1))
-        [[ "$(post "$(route $s)" "$(body $s "$Q" 512 ',"temperature":0.7,"suppress_cjk":true')")" == 200 ]] || errs=$((errs+1))
+        [[ "$(post "$(route $s)" "$(body $s "$q" $n ',"temperature":0.7,"suppress_cjk":true')")" == 200 ]] || errs=$((errs+1))
         [[ "$(cjk)" -gt 0 ]] && on=$((on+1))
     done
     [[ $errs == 0 ]] && ok "$s: all answered" || bad "$s: $errs errors"
@@ -74,7 +78,7 @@ for s in chat messages responses; do
 done
 
 echo "=== field validation ==="
-for s in chat messages responses; do
+for s in chat messages responses completions; do
     code=$(post "$(route $s)" "$(body $s hi 8 ',"suppress_cjk":"true"')")
     [[ $code == 400 ]] && ok "$s: string is a 400" || bad "$s: string" "got $code"
     code=$(post "$(route $s)" "$(body $s hi 8 ',"suppress_cjk":null')")
