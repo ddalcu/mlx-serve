@@ -2222,21 +2222,7 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
         try ls.win.write(kv, p0, sc.s);
     }
 
-    var comp_rows = none;
-    var topk = none;
-    if (ly.ratio > 0) {
-        const r: usize = ly.ratio;
-        const clen = (p0 + L) / r;
-        if (ly.comp) |*cw| if (sh.floor == null) try compress(sc, m, st, li, cw, x, p0);
-        if (ly.idx) |*iw| {
-            sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
-        }
-        topk = sh.topk;
-        if (clen > 0 and topk.ctx != null) {
-            const src = m.latest(li, Dsv41Model.isKvSource);
-            comp_rows = try sc.keep(try st.layers[src].comp.?.view(clen, sc.s));
-        }
-    }
+    const comp_rows, const topk = try compressed(sc, m, st, li, x, qr, p0, sh);
 
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
     if (compiled) {
@@ -2263,6 +2249,28 @@ pub fn attention(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: us
 
     if (pre != null) return o;
     return attnOut(sc, m, ly, ropeFor(m, li).inv, o, pos);
+}
+
+/// The compressed rows the rows at [p0, p0 + L) attend and the indexer's picks among them (none at ratio 0): the
+/// compressor and the indexer run first.
+fn compressed(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, qr: A, p0: usize, sh: *Shared) ![2]A {
+    const ly = &m.layers[li];
+    if (ly.ratio == 0) return .{ none, none };
+    const clen = (p0 + dim(x, 0)) / ly.ratio;
+    if (ly.comp) |*cw| if (sh.floor == null) try compress(sc, m, st, li, cw, x, p0);
+    if (ly.idx) |*iw| sh.topk = if (clen == 0) none else try indexer(sc, m, st, li, iw, x, qr, p0, sh);
+    if (clen == 0 or sh.topk.ctx == null) return .{ none, sh.topk };
+    return .{ try sc.keep(try st.layers[m.latest(li, Dsv41Model.isKvSource)].comp.?.view(clen, sc.s)), sh.topk };
+}
+
+/// A batch's state at decode width: its rows' projections `pj` (made over the whole batch) at [p0, p0 + L), its heads
+/// `[L, H, hd]` back inverse-roped for the batch's one `attnOutRoped`.
+fn attentionHeads(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: usize, sh: *Shared, pj: Proj) !A {
+    const ls = &st.layers[li];
+    try ls.win.write(pj.kv, p0, sc.s);
+    const comp_rows, const topk = try compressed(sc, m, st, li, x, pj.qr, p0, sh);
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(m.cfg.head_dim)));
+    return attnDecode(sc, m, &m.layers[li], pj.q, ls.win, comp_rows, topk, p0, scale, ropeFor(m, li).inv);
 }
 
 /// `attnGather`'s heads as `attnOut`'s grouped projection reads them: inverse-roped with `periods` at `p0` on, laid out
@@ -2560,6 +2568,11 @@ pub const Proj = struct { q: A, kv: A, qr: A };
 /// Rows at `pos` -> the roped query heads, the window row (roped, fp8
 /// round-trip) and the query latent the indexer reads.
 pub fn qkvProj(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: A, pos: A) !Proj {
+    return ropeProj(sc, m, ly, periods, try qkvRows(sc, m, ly, x), pos);
+}
+
+/// `qkvProj` before the rope: the query heads `[L, H, hd]`, the window row unnormed, the query latent.
+pub fn qkvRows(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A) !Proj {
     const c = &m.cfg;
     const qa, const kv = if (ly.q_kv) |*f| blk: {
         const y = try f.apply(sc, x);
@@ -2568,8 +2581,12 @@ pub fn qkvProj(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, x: A, p
     } else .{ try ly.wq_a.apply(sc, x), try ly.wkv.apply(sc, x) };
     const qr = try sc.rms(qa, ly.q_norm, c.rms_norm_eps);
     const qb = try ly.wq_b.apply(sc, qr);
-    const q = try ropeTail(sc, m, try sc.reshape(qb, &.{ ci(dim(x, 0)), ci(c.num_attention_heads), ci(c.head_dim) }), periods, pos, 1.0);
-    return .{ .q = q, .kv = try kvRow(sc, m, ly, periods, kv, pos), .qr = qr };
+    return .{ .q = try sc.reshape(qb, &.{ ci(dim(x, 0)), ci(c.num_attention_heads), ci(c.head_dim) }), .kv = kv, .qr = qr };
+}
+
+/// `qkvRows`' rows at `pos` roped (the window row normed and fp8 round-tripped too).
+pub fn ropeProj(sc: *Scope, m: *Dsv41Model, ly: *const Layer, periods: A, rows: Proj, pos: A) !Proj {
+    return .{ .q = try ropeTail(sc, m, rows.q, periods, pos, 1.0), .kv = try kvRow(sc, m, ly, periods, rows.kv, pos), .qr = rows.qr };
 }
 
 /// The projected window row `kv` normed, roped and fp8 round-tripped.
@@ -3440,10 +3457,10 @@ pub const Want = enum { last, all };
 /// One block over one span: the staggered hyper-connections around
 /// attention and the MoE. Returns the new stream; `pre` becomes the FFN's
 /// mix, which the next layer's attention collapses with.
-pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared, ds_main: ?A) !A {
-    if (ds_main == null and sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x, 0) <= dkern.max_rows and compiledAt(m, dim(x, 0)))
+pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p0: usize, sh: *Shared) !A {
+    if (sh.floor == null and sh.img.ctx == null and m.streamed == null and li < m.regions.len and dim(x, 0) <= dkern.max_rows and compiledAt(m, dim(x, 0)))
         if (try blockFused(sc, m, st, li, x, pre, p0, sh)) |y| return y;
-    if (ds_main == null and sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
+    if (sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
         try runRegion(sc, m, li, .attn_in, &.{ x, pre.* }, &a);
         const ao = try attention(sc, m, st, li, a[3], p0, sh, null);
@@ -3467,7 +3484,7 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
         pre.* = o[1];
         return o[0];
     }
-    const mid = try blockAttn(sc, m, st, li, x, pre.*, p0, sh, ds_main);
+    const mid = try blockAttn(sc, m, st, li, x, pre.*, p0, sh);
     const y = try moe(sc, m, li, mid.h, sh.img);
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
     pre.* = mid.sf.pre;
@@ -3529,7 +3546,7 @@ fn ffnInFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, oa: A, x: A, s
 /// normed FFN input.
 pub const Mid = struct { x1: A, sf: Split, h: A };
 
-pub fn blockAttn(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: A, p0: usize, sh: *Shared, ds_main: ?A) !Mid {
+pub fn blockAttn(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: A, p0: usize, sh: *Shared) !Mid {
     const ly = &m.layers[li];
     const pa = try hcPreNorm(sc, m, x, pre, &ly.hc_attn, ly.attn_norm);
     const sa = pa.sp;
@@ -3540,7 +3557,7 @@ pub fn blockAttn(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: A
         try t.put("hc_comb_{d}", .{li}, sa.comb);
         try t.put("attn_in_{d}", .{li}, h);
     }
-    h = if (ds_main) |mk| try dsparkAttention(sc, m, li, h, mk, p0) else try attention(sc, m, st, li, h, p0, sh, null);
+    h = try attention(sc, m, st, li, h, p0, sh, null);
     if (m.trace) |t| try t.put("attn_{d}", .{li}, h);
     const pf = try hcExpandPreNorm(sc, m, x, h, &sa, sa.pre, &ly.hc_ffn, ly.ffn_norm);
     return .{ .x1 = pf.x1, .sf = pf.sp, .h = pf.h };
@@ -3820,7 +3837,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             const a, const b = sp.bounds(k);
             var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k], .floor = sp.floor, .img = try sp.imgSlice(&sc, a, b) };
             var pre = sp.pres[k];
-            x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh, null);
+            x = try block(&sc, m, st, li, x, &pre, sp.p0 + k * sp.span, &sh);
             if (m.trace) |t| try t.put("stream_{d}", .{li}, x);
             hold(&sp.xs[k], x);
             hold(&sp.pres[k], pre);
@@ -4014,8 +4031,11 @@ pub const Spans = struct {
     /// `[L]` bool, the chunk's rows inside an image span (none for text): they route by the VL bias and
     /// Engram leaves them untouched.
     img: A = none,
+    /// A batch of states (`extendBatched`): span k is rows [offs[k], offs[k + 1]), each its own width.
+    offs: []const usize = &.{},
 
     fn bounds(sp: *const Spans, k: usize) [2]usize {
+        if (sp.offs.len > 0) return .{ sp.offs[k], sp.offs[k + 1] };
         const lo = k * sp.span;
         return .{ lo, @min(sp.L, lo + sp.span) };
     }
@@ -4065,7 +4085,8 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
         if (e.layer != li) continue;
         const nc = sp.ncols;
         const rows = if (sp.prefetch) |pf| blk: {
-            const raw = try pf.take(sp.p0, ek, k);
+            // A batch reads grid k, state k's rows, as one span.
+            const raw = if (sp.offs.len > 0) try pf.take(k, ek, 0) else try pf.take(sp.p0, ek, k);
             defer raw.deinit(gpa);
             break :blk try sc.keep(try e.table.dequant(raw, (hi - lo) * nc, sc.s));
         } else blk: {
@@ -4094,7 +4115,7 @@ pub const region_rows = 16;
 
 /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
 /// barrier, cut where `ffn` has no fusable op across the cut.
-pub const Region = enum { attn_in, q_kv, attn_out, ffn, ffn_pre, ffn_act, ffn_post };
+pub const Region = enum { attn_in, q_kv, q_rows, attn_out, ffn, ffn_pre, ffn_act, ffn_post };
 
 const LayerRegions = struct {
     m: *Dsv41Model,
@@ -4172,6 +4193,11 @@ fn RegionBody(comptime kind: Region) type {
                 // the attention's input and position -> its query, window row and query latent
                 .q_kv => {
                     const pj = try qkvProj(&sc, m, ly, ropeFor(m, li).fwd, a[0], a[1]);
+                    res.* = mlx.mlx_vector_array_new_data(&.{ pj.q, pj.kv, pj.qr }, 3);
+                },
+                // a batch's attention inputs -> their query heads, window rows and query latents, before the rope
+                .q_rows => {
+                    const pj = try qkvRows(&sc, m, ly, a[0]);
                     res.* = mlx.mlx_vector_array_new_data(&.{ pj.q, pj.kv, pj.qr }, 3);
                 },
                 // the inverse-roped attention heads -> the attention's output
@@ -4750,28 +4776,62 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
     return out;
 }
 
-/// One decode token for each of `states` (identities `gens`, for their snapshots) as one batch of rows: the
-/// hyper-connection mixes, norms and FFN run over every row, attention per state at its own position. Returns the
-/// `[N, V]` f32 logits, row k for `states[k]` (caller frees).
-pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, toks: []const u32) !A {
+/// Each of `states` (identities `gens`, for their snapshots) advanced by its own rows `chunks[k]` as one batch: the
+/// hyper-connection mixes, norms and FFN run over every row, attention per state at its own position. A plain batch
+/// is one decode token a state; with `verify` each chunk is a DSpark verify `[t1, drafts…]` (`dsparkBeginWith`'s
+/// rollback anchors, kept by `finishVerify`). Returns every row's `[R, V]` f32 logits, state by state (caller frees).
+pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, chunks: []const []const u32, verify: bool) !A {
     const c = &m.cfg;
-    const N = toks.len;
+    const N = chunks.len;
     if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
+    const offs = try gpa.alloc(usize, N + 1);
+    defer gpa.free(offs);
+    offs[0] = 0;
+    for (chunks, 0..) |ch, k| {
+        if (ch.len == 0 or ch.len > VERIFY_MAX_DRAFTS + 1 or (!verify and ch.len != 1)) return error.Dsv41BatchUnsupported;
+        for (ch) |t| if (t >= m.vocab) return error.TokenPastVocabulary;
+        offs[k + 1] = offs[k] + ch.len;
+    }
+    const R = offs[N];
+    for (states, 0..) |st, k| for (states[0..k]) |o| if (o == st) return error.Dsv41BatchUnsupported;
     for (states, gens) |st, g| {
         if (st.verify != null) return error.Dsv41BatchUnsupported;
         try snapshotStateIfDue(st, g);
     }
-    for (toks) |t| if (t >= m.vocab) return error.TokenPastVocabulary;
-    const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
-    // Each state's Engram row ids off its own look-back, one span (row) per state.
-    const ncols: usize = if (m.hash) |*hs| hs.cols() else 0;
-    const eng_ids = try gpa.alloc(u32, N * m.engrams.len * ncols);
-    defer gpa.free(eng_ids);
-    if (m.hash != null) for (states, toks, 0..) |st, t, k| {
-        const one = try engramIds(m, gpa, st, &.{t}, false);
-        defer gpa.free(one);
-        @memcpy(eng_ids[k * one.len ..][0..one.len], one);
+    if (verify) for (states, 0..) |st, k| armVerify(st, m.n_layers) catch |e| {
+        for (states[0..k]) |s| s.dropVerify();
+        return e;
     };
+    errdefer if (verify) for (states) |st| st.dropVerify();
+    const targets: usize = if (m.n_mtp > 0) c.dsv4_n_dspark_target_layers else 0;
+    // Each state's Engram row ids off its own look-back, laid out by row as one chunk's.
+    const ncols: usize = if (m.hash) |*hs| hs.cols() else 0;
+    const eng_ids = try gpa.alloc(u32, R * m.engrams.len * ncols);
+    defer gpa.free(eng_ids);
+    if (m.hash != null) {
+        var at: usize = 0;
+        for (states, chunks) |st, ch| {
+            const mine = try engramIds(m, gpa, st, ch, false);
+            defer gpa.free(mine);
+            @memcpy(eng_ids[at..][0..mine.len], mine);
+            at += mine.len;
+        }
+    }
+    // Every state's Engram rows come off the SSD on a thread while the layers before them run: grid k is state k's.
+    var prefetch: ?*engram.Prefetch = null;
+    defer if (prefetch) |pf| pf.finish();
+    if (m.engrams.len > 0 and m.hash != null) {
+        const per_row = m.engrams.len * ncols;
+        var specs: [region_rows]engram.Prefetch.Spec = undefined;
+        var widest: usize = 0;
+        for (chunks, 0..) |ch, k| {
+            specs[k] = .{ .at = k, .len = ch.len, .ids = eng_ids[offs[k] * per_row ..][0 .. ch.len * per_row] };
+            widest = @max(widest, ch.len);
+        }
+        var tables: [8]*const engram.Table = undefined;
+        for (m.engrams, tables[0..m.engrams.len]) |*e, *t| t.* = &e.table;
+        prefetch = try engram.Prefetch.startBatch(gpa, tables[0..m.engrams.len], specs[0..N], ncols, widest);
+    }
     const held = try gpa.alloc(A, N * (4 + targets));
     defer {
         for (held) |x| if (x.ctx != null) {
@@ -4780,16 +4840,22 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         gpa.free(held);
     }
     @memset(held, none);
-    var sp = spansOf(held, N, targets, 1, N, 0);
+    var sp = spansOf(held, N, targets, 1, R, 0);
+    sp.offs = offs;
     sp.eng_ids = eng_ids;
     sp.ncols = ncols;
+    sp.prefetch = prefetch;
     {
         var sc = Scope.init(gpa, m.s);
         defer sc.deinit();
-        const emb = try m.embed.rows(&sc, try sc.ints(@ptrCast(toks), &.{ci(N)}), m.act);
+        const all = try gpa.alloc(u32, R);
+        defer gpa.free(all);
+        for (chunks, 0..) |ch, k| @memcpy(all[offs[k]..offs[k + 1]], ch);
+        const emb = try m.embed.rows(&sc, try sc.ints(@ptrCast(all), &.{ci(R)}), m.act);
         for (0..N) |k| {
-            hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, k, k + 1), 1), &.{ 1, ci(c.dsv4_hc_mult), ci(c.hidden_size) }));
-            hold(&sp.pres[k], try onehotPre(&sc, m, 1));
+            const lo, const hi = sp.bounds(k);
+            hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, lo, hi), 1), &.{ ci(hi - lo), ci(c.dsv4_hc_mult), ci(c.hidden_size) }));
+            hold(&sp.pres[k], try onehotPre(&sc, m, hi - lo));
         }
     }
     for (0..m.n_layers) |li| {
@@ -4807,9 +4873,10 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     if (m.n_mtp > 0) for (states, 0..) |st, k| {
-        try commitMain(&sc, m, st, try sc.concat(sp.mh[k * targets ..][0..targets], -1), st.n);
+        const mh = try sc.concat(sp.mh[k * targets ..][0..targets], -1);
+        if (verify) st.verify.?.mh = sc.out(mh) else try commitMain(&sc, m, st, mh, st.n);
     };
-    for (states) |st| st.n += 1;
+    for (states, chunks) |st, ch| st.n += ch.len;
     const rows = try gpa.alloc(A, N);
     defer gpa.free(rows);
     for (rows, 0..) |*h, k| h.* = try hcCollapse(&sc, sp.xs[k], sp.pres[k]);
@@ -4824,11 +4891,11 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     const vec = mlx.mlx_vector_array_new_data(ev.items.ptr, ev.items.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_async_eval(vec));
-    for (states, gens) |st, g| try snapshotStateIfDue(st, g);
+    if (!verify) for (states, gens) |st, g| try snapshotStateIfDue(st, g);
     return sc.out(logits);
 }
 
-/// Layer `li` of `extendBatched`: the compiled stretches over every state's row, attention per state.
+/// Layer `li` of `extendBatched`: the compiled stretches over every state's rows, attention per state.
 fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, sp: *const Spans, li: usize) !void {
     const N = sp.xs.len;
     var sc = Scope.init(gpa, m.s);
@@ -4836,12 +4903,12 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     const parts = try gpa.alloc(A, N);
     defer gpa.free(parts);
     for (parts, 0..) |*p, k| p.* = try spanIn(&sc, m, gpa, sp, li, k);
-    if (li >= m.regions.len or !compiledAt(m, N)) {
+    if (li >= m.regions.len or !compiledAt(m, sp.L)) {
         // No compiled stretch at this width: each state's block alone.
         for (parts, states, 0..) |x, st, k| {
             var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
             var pre = sp.pres[k];
-            const y = try block(&sc, m, st, li, x, &pre, st.n, &sh, null);
+            const y = try block(&sc, m, st, li, x, &pre, st.n, &sh);
             hold(&sp.xs[k], y);
             hold(&sp.pres[k], pre);
             hold(&sp.topks[k], sh.topk);
@@ -4852,21 +4919,31 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     const x = try sc.concat(parts, 0);
     var a: [4]A = undefined; // the attention's pre, post, comb; its input
     try runRegion(&sc, m, li, .attn_in, &.{ x, try sc.concat(sp.pres, 0) }, &a);
+    // The projections read their weights once for every state's rows; the rope, the state and the attention are each
+    // state's own.
+    var q: [3]A = undefined; // query heads, window rows, query latents
+    try runRegion(&sc, m, li, .q_rows, &.{a[3]}, &q);
     const heads = try gpa.alloc(A, N);
     defer gpa.free(heads);
     for (heads, states, 0..) |*o, st, k| {
         var ssc = Scope.init(gpa, m.s);
         defer ssc.deinit();
+        const lo, const hi = sp.bounds(k);
         var sh: Shared = .{ .topk = sp.topks[k], .cand = sp.cands[k] };
-        o.* = try sc.keep(ssc.out(try attention(&ssc, m, st, li, try ssc.slice(a[3], 0, k, k + 1), st.n, &sh, null)));
+        const rows: Proj = .{ .q = try ssc.slice(q[0], 0, lo, hi), .kv = try ssc.slice(q[1], 0, lo, hi), .qr = try ssc.slice(q[2], 0, lo, hi) };
+        const pj = try ropeProj(&ssc, m, &m.layers[li], ropeFor(m, li).fwd, rows, try ssc.i(ci(st.n)));
+        o.* = try sc.keep(ssc.out(try attentionHeads(&ssc, m, st, li, try ssc.slice(a[3], 0, lo, hi), st.n, &sh, pj)));
         hold(&sp.topks[k], sh.topk);
         hold(&sp.cands[k], sh.cand);
     }
+    var ao: [1]A = undefined;
+    try runRegion(&sc, m, li, .attn_out, &.{try sc.concat(heads, 0)}, &ao);
     var o: [2]A = undefined; // the new stream, the FFN's mix
-    try runRegion(&sc, m, li, .ffn, &.{ x, try sc.concat(heads, 0), a[0], a[1], a[2] }, &o);
+    try runRegion(&sc, m, li, .ffn, &.{ x, ao[0], a[0], a[1], a[2] }, &o);
     for (0..N) |k| {
-        hold(&sp.xs[k], try sc.slice(o[0], 0, k, k + 1));
-        hold(&sp.pres[k], try sc.slice(o[1], 0, k, k + 1));
+        const lo, const hi = sp.bounds(k);
+        hold(&sp.xs[k], try sc.slice(o[0], 0, lo, hi));
+        hold(&sp.pres[k], try sc.slice(o[1], 0, lo, hi));
     }
 }
 
@@ -4887,22 +4964,21 @@ fn commitMain(sc: *Scope, m: *Dsv41Model, st: *State, mh: A, p0: usize) !void {
     }
 }
 
-/// A stage's attention for the draft rows at [p0, p0 + B): every row sees
-/// the stage's window of committed main rows and every draft row.
-fn dsparkAttention(sc: *Scope, m: *Dsv41Model, li: usize, x: A, main_keys: A, p0: usize) !A {
-    const ly = &m.layers[li];
+/// A stage's attention heads for one state's draft rows at [p0, p0 + B) from their projections `rows` (made over every
+/// state's rows), inverse-roped for `attnOutRoped`: every row sees the stage's window of committed main rows and every
+/// draft row.
+fn dsparkHeads(sc: *Scope, m: *Dsv41Model, ly: *const Layer, rows: Proj, main_keys: A, p0: usize) !A {
     const hd = m.cfg.head_dim;
     const pos = try sc.i(ci(p0));
-    const pj = try qkvProj(sc, m, ly, m.rope_plain.fwd, x, pos);
-    const q = pj.q;
+    const pj = try ropeProj(sc, m, ly, m.rope_plain.fwd, rows, pos);
     const keys = try sc.astype(try sc.concat(&.{ main_keys, pj.kv }, 0), .float32);
-    const qf = try sc.astype(q, .float32);
+    const qf = try sc.astype(pj.q, .float32);
     const logits = try sc.mul(try sc.matmul(qf, try sc.t2(keys)), try sc.f(1.0 / @sqrt(@as(f32, @floatFromInt(hd)))));
     const mx = try sc.op2(mlx.mlx_maximum, try sc.max(logits, -1, true), ly.sink);
     const p = try sc.op1(mlx.mlx_exp, try sc.sub(logits, mx));
     const denom = try sc.add(try sc.sum(p, -1, true), try sc.op1(mlx.mlx_exp, try sc.sub(ly.sink, mx)));
     const o = try sc.astype(try sc.div(try sc.matmul(p, keys), denom), m.act);
-    return attnOut(sc, m, ly, m.rope_plain.inv, o, pos);
+    return ropeTail(sc, m, o, m.rope_plain.inv, pos, 1.0);
 }
 
 pub const DsparkDraft = dsv4.DsparkDraft;
@@ -4921,66 +4997,106 @@ pub fn dsparkDraft(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32) 
 
 /// `keep_logits` also copies the Markov-biased rows to the host.
 fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
+    var out: [1]DsparkDraft = undefined;
+    try dsparkDraftBatched(m, gpa, &.{st}, &.{t1}, keep_logits, &out);
+    return out[0];
+}
+
+/// `dsparkDraft` of each of `states` from its committed token `t1s[k]`, into `out[k]` (each owned by the caller): the
+/// stages run once over every state's block, attention per state against its own window of committed main rows, and
+/// the Markov chain steps every state's row at once. `keep_logits` also copies the Markov-biased rows to the host.
+pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     const c = &m.cfg;
     const B = m.ds_block;
-    const n = st.n;
+    const N = states.len;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
     const ds = &m.dspark.?;
-    var ids: [16]i32 = undefined;
-    for (0..B) |k| ids[k] = @intCast(if (k == 0) t1 else c.dsv4_dspark_noise_token_id);
-    const emb = try m.embed.rows(&sc, try sc.ints(ids[0..B], &.{ci(B)}), m.act);
-    var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
-    var pre = try onehotPre(&sc, m, B);
-    const window = @min(c.sliding_window, n);
-    var dummy: Shared = .{};
-    for (0..m.n_mtp) |si| {
-        const keys = try st.ds[si].read(&sc, n - window, n);
-        x = try block(&sc, m, st, m.n_layers + si, x, &pre, n, &dummy, keys);
-    }
-    const hout = try hcCollapse(&sc, x, pre);
-    const logits = try sc.astype(try m.head.apply(&sc, try sc.rms(hout, ds.norm, c.rms_norm_eps)), .float32);
-    var cur = try sc.ints(ids[0..1], &.{1});
+    const ids = try gpa.alloc(i32, N * B);
+    defer gpa.free(ids);
+    for (t1s, 0..) |t1, k| for (0..B) |j| {
+        ids[k * B + j] = @intCast(if (j == 0) t1 else c.dsv4_dspark_noise_token_id);
+    };
+    const emb = try m.embed.rows(&sc, try sc.ints(ids, &.{ci(N * B)}), m.act);
+    var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(hc), ci(d) });
+    var pre = try onehotPre(&sc, m, N * B);
+    for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B);
+    const flat = try hcCollapse(&sc, x, pre);
+    const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
+    const logits = try sc.reshape(try sc.astype(try m.head.apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
+    const firsts = try gpa.alloc(i32, N);
+    defer gpa.free(firsts);
+    for (firsts, t1s) |*f, t| f.* = @intCast(t);
+    var cur = try sc.ints(firsts, &.{ci(N)});
     const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
     var toks: [16]A = undefined;
     var confs: [16]A = undefined;
     var rows_k: [16]A = undefined;
     for (0..B) |k| {
-        const e = try sc.take(ds.markov_embed, cur, 0); // [1, rank]
+        const e = try sc.take(ds.markov_embed, cur, 0); // [N, rank]
         const me = try sc.astype(e, .float32);
         const bias = try sc.astype(try sc.matmul(try sc.astype(e, m.act), try sc.t2(ds.markov_head)), .float32);
-        const row = try sc.add(try sc.slice(logits, 0, k, k + 1), bias);
+        const row = try sc.add(try sc.reshape(try sc.slice(logits, 1, k, k + 1), &.{ ci(N), -1 }), bias);
         rows_k[k] = row;
-        if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.slice(hout, 0, k, k + 1), .float32), me }, -1), try sc.t2(ds.conf));
+        if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.reshape(try sc.slice(hout, 1, k, k + 1), &.{ ci(N), ci(d) }), .float32), me }, -1), try sc.t2(ds.conf));
         cur = try sc.astype(try sc.argmax(row, -1), .int32);
         toks[k] = cur;
     }
-    const all = try sc.concat(toks[0..B], 0);
-    const rows_all = if (keep_logits) try sc.concat(rows_k[0..B], 0) else all;
-    var ev = [_]A{ all, if (want_conf) try sc.concat(confs[0..B], 0) else all, rows_all };
+    const all = try sc.stack(toks[0..B], 1); // [N, B]
+    const rows_all = if (keep_logits) try sc.stack(rows_k[0..B], 1) else all;
+    var ev = [_]A{ all, if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all, rows_all };
     try evalAll(&ev);
-    const out_ids = try gpa.alloc(u32, B + 1);
-    errdefer gpa.free(out_ids);
-    out_ids[0] = t1;
     const data = mlx.mlx_array_data_int32(all) orelse return error.NoData;
-    for (0..B) |k| out_ids[k + 1] = @intCast(data[k]);
-    const conf = try gpa.alloc(f32, B);
-    errdefer gpa.free(conf);
-    var len = B;
-    if (want_conf) {
-        @memcpy(conf, (mlx.mlx_array_data_float32(try sc.astype(ev[1], .float32)) orelse return error.NoData)[0..B]);
-        for (conf, 0..) |v, k| {
-            if (v < m.ds_conf_thr) {
-                len = k;
-                break;
+    const conf_data: []const f32 = if (want_conf) (mlx.mlx_array_data_float32(ev[1]) orelse return error.NoData)[0 .. N * B] else &.{};
+    const logit_data: []const f32 = if (keep_logits) (mlx.mlx_array_data_float32(rows_all) orelse return error.NoData)[0 .. N * B * m.vocab] else &.{};
+    var made: usize = 0;
+    errdefer for (out[0..made]) |*o| o.deinit(gpa);
+    for (out[0..N], t1s, 0..) |*o, t1, k| {
+        const out_ids = try gpa.alloc(u32, B + 1);
+        errdefer gpa.free(out_ids);
+        out_ids[0] = t1;
+        for (0..B) |j| out_ids[j + 1] = @intCast(data[k * B + j]);
+        const conf = try gpa.alloc(f32, B);
+        errdefer gpa.free(conf);
+        var len = B;
+        if (want_conf) {
+            @memcpy(conf, conf_data[k * B ..][0..B]);
+            for (conf, 0..) |v, j| {
+                if (v < m.ds_conf_thr) {
+                    len = j;
+                    break;
+                }
             }
-        }
-    } else @memset(conf, 0);
-    const host_logits = try gpa.alloc(f32, if (keep_logits) B * m.vocab else 0);
-    if (keep_logits) @memcpy(host_logits, (mlx.mlx_array_data_float32(rows_all) orelse return error.NoData)[0 .. B * m.vocab]);
-    return .{ .ids = out_ids, .len = len, .logits = host_logits, .confidence = conf };
+        } else @memset(conf, 0);
+        const host_logits = try gpa.alloc(f32, if (keep_logits) B * m.vocab else 0);
+        if (keep_logits) @memcpy(host_logits, logit_data[k * B * m.vocab ..][0 .. B * m.vocab]);
+        o.* = .{ .ids = out_ids, .len = len, .logits = host_logits, .confidence = conf };
+        made += 1;
+    }
+}
+
+/// A DSpark stage over `B` draft rows a state: the mixes, norms and FFN over every row, each state's attention
+/// against its own window of committed main rows.
+fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize) !A {
+    const ly = &m.layers[li];
+    const si = li - m.n_layers;
+    const pa = try hcPreNorm(sc, m, x, pre.*, &ly.hc_attn, ly.attn_norm);
+    // The projections read their weights once for every state's rows; the rope and the attention are each state's.
+    const rows = try qkvRows(sc, m, ly, pa.h);
+    var heads: [region_rows]A = undefined;
+    for (states, heads[0..states.len], 0..) |st, *o, k| {
+        const window = @min(m.cfg.sliding_window, st.n);
+        const keys = try st.ds[si].read(sc, st.n - window, st.n);
+        const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
+        o.* = try dsparkHeads(sc, m, ly, mine, keys, st.n);
+    }
+    const h = try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
+    const pf = try hcExpandPreNorm(sc, m, x, h, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
+    const y = try moe(sc, m, li, pf.h, none);
+    pre.* = pf.sp.pre;
+    return hcExpand(sc, pf.x1, y, &pf.sp);
 }
 
 pub const DsparkPending = struct {
@@ -5091,15 +5207,10 @@ fn rollbackVerify(m: *Dsv41Model, st: *State, keep_n: usize) !void {
 /// each pooling compressor's open group is re-cut from the chunk's rows, and
 /// the kept positions' main rows go to the DSpark windows.
 pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending: *DsparkPending, accepted: usize, next_token: u32) !DsparkRound {
-    var sc = Scope.init(gpa, m.s);
-    defer sc.deinit();
-    defer st.dropVerify();
-    const v = &st.verify.?;
     const keep_n = accepted + 1;
     const t0 = monoUs();
-    if (keep_n < pending.b + 1) try rollbackVerify(m, st, keep_n);
+    try finishVerify(m, gpa, st, keep_n);
     const t1 = monoUs();
-    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
     const tokens = try gpa.alloc(u32, keep_n);
     @memcpy(tokens, pending.verify[0..keep_n]);
     var ph = pending.phases;
@@ -5110,6 +5221,17 @@ pub fn dsparkFinish(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, pending:
     ph.committed = @intCast(keep_n);
     ph.submitted = @intCast(pending.b);
     return .{ .tokens = tokens, .next_token = next_token, .accepted = @intCast(accepted), .phases = ph };
+}
+
+/// Keep the first `keep_n` positions of `st`'s open verify chunk (`extendBatched` with `verify`, or
+/// `dsparkBeginWith`): the rest rolls back and the kept positions' main rows go to the DSpark windows.
+pub fn finishVerify(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, keep_n: usize) !void {
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    defer st.dropVerify();
+    const v = &st.verify.?;
+    if (v.n0 + keep_n < st.n) try rollbackVerify(m, st, keep_n);
+    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
 }
 
 pub fn dsparkObserve(m: *Dsv41Model, ph: DsparkPhases) void {
@@ -6966,6 +7088,115 @@ test "dsv41 verify width: time of a verify block per draft count (DSV41_VERIFY_R
             if (k >= 3) total += dt;
         }
         std.debug.print("[verify] ctx {d} drafts {d} rows {d}: {d:.2} ms warm, {d:.0} ms first call\n", .{ ctx, b, b + 1, @as(f64, @floatFromInt(total)) / reps / 1000, @as(f64, @floatFromInt(cold)) / 1000 });
+    }
+}
+
+test "dsv41 group: greedy DSpark group rounds against batched plain steps, by states (DSV41_GROUP)" {
+    // DSV41_GROUP = a pack dir; DSV41_ROUND_TEXT = a text whose stretches are the states' prompts (else synthetic
+    // ids); DSV41_STEP_CTX prompt tokens a state (default 1024).
+    const dir = std.mem.span(std.c.getenv("DSV41_GROUP") orelse return error.SkipZigTest);
+    const ctx = if (std.c.getenv("DSV41_STEP_CTX")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else 1024;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../sdk/util/io_util.zig");
+    const cfg = try testConfig(io, dir);
+    var w = try loadPack(io, gpa, dir, false);
+    defer w.deinit();
+    const m = try init(gpa, &cfg, &w, mlx.gpuStream(), .{ .pack_dir = dir, .head_8bit = true, .dspark = true });
+    defer m.deinit();
+    const max_n = 4;
+    var sts: [max_n]State = undefined;
+    var ptrs: [max_n]*State = undefined;
+    var t1s: [max_n]u32 = undefined;
+    const gens: [max_n]u64 = @splat(0);
+    var text_ids: []u32 = &.{};
+    defer gpa.free(text_ids);
+    if (std.c.getenv("DSV41_ROUND_TEXT")) |tp| {
+        var tok = try @import("../../sdk/tokenizer/tokenizer.zig").loadTokenizer(io, gpa, dir);
+        defer tok.deinit();
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, std.mem.span(tp), gpa, .limited(64 << 20));
+        defer gpa.free(text);
+        text_ids = try tok.encode(gpa, text);
+        if (text_ids.len < ctx * max_n) return error.SkipZigTest;
+    }
+    for (0..max_n) |k| {
+        const prompt = try gpa.alloc(u32, ctx);
+        defer gpa.free(prompt);
+        if (text_ids.len > 0) {
+            @memcpy(prompt, text_ids[k * (text_ids.len - ctx) / max_n ..][0..ctx]);
+        } else for (prompt, 0..) |*t, i| {
+            t.* = @intCast((i * 7919 + 13 + k * 104729) % @min(m.vocab, 100000));
+        }
+        sts[k] = try initState(m, gpa);
+        ptrs[k] = &sts[k];
+        const l = try meterPrefill(m, gpa, &sts[k], prompt);
+        defer _ = mlx.mlx_array_free(l);
+        t1s[k] = try argmaxHost(l);
+    }
+    defer for (&sts) |*st| st.deinit();
+    const rounds = 24;
+    const warm = 4;
+    for ([_]usize{ 1, 2, 3, 4 }) |n| {
+        // Batched plain: one greedy token a state a step.
+        var plain_us: i64 = 0;
+        for (0..rounds + warm) |r| {
+            var chunks: [max_n][]const u32 = undefined;
+            for (chunks[0..n], t1s[0..n]) |*ch, *t| ch.* = t[0..1];
+            const t0 = iou.nowUsMonotonic(io);
+            const l = try extendBatched(m, gpa, ptrs[0..n], gens[0..n], chunks[0..n], false);
+            defer _ = mlx.mlx_array_free(l);
+            var sc = Scope.init(gpa, m.s);
+            defer sc.deinit();
+            const best = try hostI32(try sc.astype(try sc.argmax(l, -1), .int32));
+            defer gpa.free(best);
+            for (t1s[0..n], best) |*t, b| t.* = @intCast(b);
+            if (r >= warm) plain_us += iou.nowUsMonotonic(io) - t0;
+        }
+        // Group rounds: every state's stage block, all of it verified, greedy accept.
+        var us: [3]i64 = @splat(0); // draft, verify (+ the argmax read), finish
+        var tokens: usize = 0;
+        var rows: usize = 0;
+        for (0..rounds + warm) |r| {
+            var drafts: [max_n]DsparkDraft = undefined;
+            const t0 = iou.nowUsMonotonic(io);
+            try dsparkDraftBatched(m, gpa, ptrs[0..n], t1s[0..n], false, drafts[0..n]);
+            defer for (drafts[0..n]) |*d| d.deinit(gpa);
+            const t_d = iou.nowUsMonotonic(io);
+            var chunks: [max_n][]const u32 = undefined;
+            for (chunks[0..n], drafts[0..n]) |*ch, d| ch.* = d.ids[0..@min(d.len + 1, region_rows / n)];
+            const l = try extendBatched(m, gpa, ptrs[0..n], gens[0..n], chunks[0..n], true);
+            defer _ = mlx.mlx_array_free(l);
+            var sc = Scope.init(gpa, m.s);
+            defer sc.deinit();
+            const best = try hostI32(try sc.astype(try sc.argmax(l, -1), .int32));
+            defer gpa.free(best);
+            const t_v = iou.nowUsMonotonic(io);
+            var off: usize = 0;
+            for (0..n) |k| {
+                const ch = chunks[k];
+                var a: usize = 0;
+                while (a + 1 < ch.len and @as(u32, @intCast(best[off + a])) == ch[a + 1]) a += 1;
+                try finishVerify(m, gpa, ptrs[k], a + 1);
+                t1s[k] = @intCast(best[off + a]);
+                if (r >= warm) tokens += a + 1;
+                if (r >= warm) rows += ch.len;
+                off += ch.len;
+            }
+            if (r < warm) continue;
+            us[0] += t_d - t0;
+            us[1] += t_v - t_d;
+            us[2] += iou.nowUsMonotonic(io) - t_v;
+        }
+        const plain_ms = @as(f64, @floatFromInt(plain_us)) / rounds / 1000;
+        const round_ms = @as(f64, @floatFromInt(us[0] + us[1] + us[2])) / rounds / 1000;
+        std.debug.print("[group] ctx {d} states {d}: plain step {d:.2} ms = {d:.1} tok/s | round {d:.2} ms (draft {d:.2}, verify {d:.2} of {d:.1} rows, finish {d:.2}), {d:.2} tokens a state = {d:.1} tok/s\n", .{
+            ctx,                                                          n,
+            plain_ms,                                                     @as(f64, @floatFromInt(n)) * 1000 / plain_ms,
+            round_ms,                                                     @as(f64, @floatFromInt(us[0])) / rounds / 1000,
+            @as(f64, @floatFromInt(us[1])) / rounds / 1000,               @as(f64, @floatFromInt(rows)) / rounds,
+            @as(f64, @floatFromInt(us[2])) / rounds / 1000,               @as(f64, @floatFromInt(tokens)) / rounds / @as(f64, @floatFromInt(n)),
+            @as(f64, @floatFromInt(tokens)) * 1000 / rounds / round_ms,
+        });
     }
 }
 

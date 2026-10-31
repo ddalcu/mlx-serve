@@ -66,6 +66,7 @@ pub fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.Lay
 }
 
 pub const Module = dsv41.Dsv41Model;
+pub const State = dsv41.State;
 
 /// The module a loaded model runs on (`engines/mlx/plugin/intree.zig`).
 pub fn moduleOf(mp: *anyopaque) *Module {
@@ -363,23 +364,42 @@ fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdic
             alone = true;
             continue;
         }
-        if (slot == m.owner and m.mdl.dec_state != null) {
-            states[k] = &m.mdl.dec_state.?;
-            gens[k] = m.mdl.state_gen;
-        } else if (m.parked.getPtr(slot)) |kept| {
-            states[k] = &kept.st;
-            gens[k] = kept.gen;
-        } else return Verdict.refuse(.failed, "deepseek_v41: a batched slot has no state");
+        const live = stateOf(m, slot) orelse return Verdict.refuse(.failed, "deepseek_v41: a batched slot has no state");
+        states[k] = live.st;
+        gens[k] = live.gen;
         if (f.positions.len == n and f.positions.slice()[k] != states[k].n) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the slot's state");
         if (states[k].verify != null) alone = true;
     }
     for (f.tokens.slice()) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");
-    const logits = if (alone) eachAlone(m, f) else dsv41.extendBatched(m.mdl, gpa, states[0..n], gens[0..n], f.tokens.slice());
+    var chunks: [max_batch][]const u32 = undefined;
+    for (chunks[0..n], f.tokens.slice()) |*ch, *t| ch.* = t[0..1];
+    const logits = if (alone) eachAlone(m, f) else dsv41.extendBatched(m.mdl, gpa, states[0..n], gens[0..n], chunks[0..n], false);
     out.logits = .{ .ctx = (logits catch return Verdict.refuse(.failed, "deepseek_v41: the batched forward failed")).ctx };
     return .ok;
 }
 
 const max_batch = 16;
+
+/// `slot`'s live state and its identity: the module's own when the slot owns it, else the one parked for it.
+fn stateOf(m: *Model, slot: u32) ?struct { st: *dsv41.State, gen: u64 } {
+    if (slot == m.owner and m.mdl.dec_state != null) return .{ .st = &m.mdl.dec_state.?, .gen = m.mdl.state_gen };
+    const kept = m.parked.getPtr(slot) orelse return null;
+    return .{ .st = &kept.st, .gen = kept.gen };
+}
+
+/// The live state of each of `slots` and its identity, for engine code that batches the module's own rounds
+/// (`engines/mlx/spec/dspark_group.zig`); false where the module runs no batch or a slot has no state. The pointers
+/// hold until a slot is activated or released.
+pub fn slotStates(mp: *anyopaque, slots: []const u32, states: []*dsv41.State, gens: []u64) bool {
+    const m: *Model = @ptrCast(@alignCast(mp));
+    if (m.mdl.pair != null or m.mdl.streamed != null) return false;
+    for (slots, states, gens) |slot, *st, *g| {
+        const live = stateOf(m, slot) orelse return false;
+        st.* = live.st;
+        g.* = live.gen;
+    }
+    return true;
+}
 
 /// `forwardBatched`'s rows one slot at a time, as each slot's own decode step.
 fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {

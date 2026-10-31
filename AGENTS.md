@@ -132,7 +132,7 @@ DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDr
 | `gpt_oss`, `spark2_5`, `k2_horizon`, `muse_glimmer(_text)` | same | Sink attention / sliding dense / grouped-RMS Llama / Muse VL (Harmony channels, ATEM tools) |
 | `mimo_v2`, `mimo_v2_flash` | `mimo_v2` | MiMo-V2.6-Flash, mlx-lm's layout (release refused by name); legacy forward deleted; MTP = 3 heads (`mtp_head.zig`); stream packs (`expert_streaming`) stream their `experts.bin` through the same table |
 | `inkling_mm_model` | `inkling` | NO RoPE (relative-logit bias + short convs); serial, spec off |
-| `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state (V4 single-flight; V4.1 one state per slot, plain decode batched), DSML tools on our byte-pinned templates, DSpark; V4.1 images + EXL3 stream packs |
+| `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state (V4 single-flight; V4.1 one state per slot, decode and DSpark rounds batched), DSML tools on our byte-pinned templates, DSpark; V4.1 images + EXL3 stream packs |
 | `bailing_hybrid` | `bailing_hybrid` | Ling 3.0: KDA + MLA hybrid MoE |
 | `glm5_next(_text)`, `glm_moe_dsa` | `glm5_next` | GLM-5.3-Flash: KDA + DSA inside mHC, 288-expert MoE, batched decode, `mtp.0` head, vision |
 | `kev`, `laya`, `d1`, `clef` | same | Typed decisions (`POST /v1/decisions`) |

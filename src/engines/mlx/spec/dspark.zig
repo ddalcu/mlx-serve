@@ -298,7 +298,7 @@ pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, com
 /// The sampled accept of a verify chunk: `verify` is `[t1, drafts...]` and `vl_g` its logits `[rows, vocab]`. Keeps each
 /// draft (a point mass) with the probability the request's filtered density gives it; the token pending after the kept
 /// prefix is the residual sample at the first reject, or the bonus draw from the last row on a full accept.
-fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32) !struct { accepted: u32, next_token: u32 } {
+pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32) !struct { accepted: u32, next_token: u32 } {
     const s = self.xfm.s;
     const b: u32 = @intCast(verify.len - 1);
 

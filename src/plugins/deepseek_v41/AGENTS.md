@@ -22,8 +22,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
 
 ## Facts the table declares
-- `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`,
-  other live slots in `parked`; plain decode batches through `extendBatched`. Each State owns its pending capture.
+- `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
+  live slots in `parked`; decode and DSpark rounds batch through `extendBatched` (rows a state, projections shared,
+  attention per state) and `dsparkDraftBatched`. Each State owns its pending capture.
 - `prefix_cache` for resident packs; `aux.enabled` also excludes Thunderbolt pairs. Snapshots retain every buffer
   and restore only at their exact position; the engine owns finished history. Streamed/paired keep legacy resume.
 - No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
@@ -35,8 +36,9 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - Weights from the driver's map (`intree.takeWeights`; the tower stays in the engine's map, whose encoder hands the
   rows to `Forward.media`).
 - DSpark rounds, the policy's confidence (`ds_want_conf`) and `ds_block` reach the module through `intree.dsv41`
-  (rounds proven equal to the legacy shell's, greedy and seeded: `../deepseek_v4/served_test.zig`). ABI needed: V4's
-  list plus the copy-step drafts and the policy's per-round confidence.
+  (rounds proven equal to the legacy shell's, greedy and seeded: `../deepseek_v4/served_test.zig`); a group round's
+  slot states through `intree.dsv41States`. ABI needed: V4's list plus the copy-step drafts, the policy's per-round
+  confidence, and a round over several slots.
 
 ## Rules (moved from root AGENTS.md)
 - V4.1 images: every span position carries `image_token_id` (without the request's rows that id is TEXT, as in the
@@ -46,10 +48,13 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - DSpark = DFlash + Markov head: `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1`
   DENSE; sampled requests via one-hot acceptance. Per-model `mtp:false` keeps the
   stages off (`mtpSetting`).
+- The confidence head is calibrated: a draft is accepted at about the sigmoid of its logit, at every block position.
+  The policy's bins start from it (`Calibration.head`); the GLM-fitted prior read 0.93 as 0.65 and starved rows.
 - Engine code that drives the module directly (a DSpark round) activates its slot first (`activate_slot`); a
   resume names its slot, so it never touches another live slot's state.
 - A row in a batch depends on its own state only, but two rows take the MoE's gather kernels where one row takes
-  the one-expert kernels: batched logits match a solo step to kernel numerics, not bits.
+  the one-expert kernels: batched logits match a solo step to kernel numerics, not bits. Past one row they match bit
+  for bit on the fixture, so a slot's greedy group rounds never depend on who shares them.
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).
 - A fused decode stage is judged against an f32 model (`decode.expectNoWorse`), not against the chain's bits: greedy
   texts diverge from the chain's at bf16 near-ties. Two dependent stages merged into one ticket-ordered dispatch
@@ -94,7 +99,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 
 ## The row from the root architecture table
 
-DeepSeek-V4/V4.1 Flash, 1M ctx. Spec off but DSpark; V4 single-flight, V4.1 batches plain decode across slots; DSML tools, OUR byte-pinned templates. V4:
+DeepSeek-V4/V4.1 Flash, 1M ctx. Spec off but DSpark; V4 single-flight, V4.1 batches decode and DSpark rounds across slots; DSML tools, OUR byte-pinned templates. V4:
 prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resident unpaired auxiliary snapshots keyed on
 image rows; the EXL3 repack's experts streamed from its bank. V4.1 images: every span position carries `image_token_id` (without the
 request's rows that id is TEXT, as in the reference), the module splices the rows itself, image rows route by
