@@ -3,6 +3,7 @@
 //! A profile is a directory: `manifest.json` plus `direction.safetensors`, one `[hidden]` direction normalized here.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const log = @import("../../sdk/util/log.zig");
 const Request = @import("../../sdk/request/ablation.zig").Request;
 const Conn = @import("../http/conn.zig").Conn;
@@ -81,7 +82,7 @@ pub fn launch(gpa: std.mem.Allocator, io: std.Io, profiles_dir: ?[]const u8, key
     return set;
 }
 
-const KeyError = error{ NotRegular, NotOwner, GroupOrOtherAccess, TooShort, Unreadable, OutOfMemory };
+const KeyError = error{ NotRegular, NotOwner, GroupOrOtherAccess, TooShort, Unreadable, Unsupported, OutOfMemory };
 
 fn keyRule(e: KeyError) []const u8 {
     return switch (e) {
@@ -90,21 +91,26 @@ fn keyRule(e: KeyError) []const u8 {
         error.GroupOrOtherAccess => "mode must be 0600 (no group or other access)",
         error.TooShort => "the key must be at least 32 bytes",
         error.Unreadable, error.OutOfMemory => "unreadable",
+        error.Unsupported => "directional ablation needs a POSIX host",
     };
 }
 
 /// The key file's sha256: a regular file the server's user owns, no group or other bits, at least 32 bytes trimmed.
+/// The key file's digest; POSIX hosts only (the owner and mode rules have no Windows form).
+fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
+    return if (builtin.os.tag == .windows) error.Unsupported else readKeyPosix(a, path);
+}
+
 /// One open without following a symlink, the checks on that descriptor, and the read from it: the file checked is the
 /// file read.
-fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
+fn readKeyPosix(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
     const path_z = a.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     defer a.free(path_z);
     const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return if (std.c._errno().* == @intFromEnum(std.c.E.LOOP)) error.NotRegular else error.Unreadable;
     defer _ = std.c.close(fd);
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(fd, &st) != 0) return error.Unreadable;
-    if (st.mode & std.c.S.IFMT != std.c.S.IFREG) return error.NotRegular;
+    const st = try ownerMode(fd);
+    if (st.mode & std.posix.S.IFMT != std.posix.S.IFREG) return error.NotRegular;
     if (st.uid != std.c.getuid()) return error.NotOwner;
     if (st.mode & 0o077 != 0) return error.GroupOrOtherAccess;
     var buf: [4096]u8 = undefined;
@@ -125,6 +131,20 @@ fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
     var d: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &d, .{});
     return d;
+}
+
+/// The owner and mode of an open file: `statx` on Linux, whose libc binding Zig leaves out, `fstat` elsewhere.
+fn ownerMode(fd: std.c.fd_t) KeyError!struct { uid: u32, mode: u32, size: u64 } {
+    if (builtin.os.tag == .linux) {
+        const linux = std.os.linux;
+        var sx: linux.Statx = undefined;
+        const rc = linux.statx(fd, "", 0x1000, .{ .TYPE = true, .MODE = true, .UID = true, .SIZE = true }, &sx); // AT_EMPTY_PATH
+        if (linux.errno(rc) != .SUCCESS) return error.Unreadable;
+        return .{ .uid = sx.uid, .mode = sx.mode, .size = sx.size };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0) return error.Unreadable;
+    return .{ .uid = @intCast(st.uid), .mode = @intCast(st.mode), .size = @intCast(st.size) };
 }
 
 fn trim(s: []const u8) []const u8 {
