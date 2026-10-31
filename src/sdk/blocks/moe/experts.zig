@@ -11,6 +11,8 @@ const splitPackedGateUp = @import("../../../mlx/array.zig").splitPackedGateUp;
 const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
+const TruthErr = @import("../../testing/parity.zig").TruthErr;
+const testErrVsTruth = @import("../../testing/parity.zig").testErrVsTruth;
 const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 const prefillComputeDtype = @import("../linear/prefill_dq_gemm.zig").prefillComputeDtype;
 const pdg = @import("../linear/prefill_dq_gemm.zig");
@@ -194,7 +196,7 @@ test "gatherExpertMm: the fp16 lever on a sorted affine bf16 gather is no worse 
     const pack = try pdg.testAffinePack(&sc, prng.random(), &.{ 4, 128, 256 });
     const in = try testSortedRows(&sc, prng.random(), pack.w32, 4096, 16);
 
-    var errs: [2]pdg.TruthErr = undefined;
+    var errs: [2]TruthErr = undefined;
     for ([_]bool{ false, true }, 0..) |lever, i| {
         pdg.f16_prefill_override = lever;
         const before = pdg.f16_prefill_engaged;
@@ -204,7 +206,7 @@ test "gatherExpertMm: the fp16 lever on a sorted affine bf16 gather is no worse 
         try testing.expectEqual(before + @intFromBool(lever), pdg.f16_prefill_engaged);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out));
         try testing.expectEqualSlices(c_int, mlx.getShape(in.truth), mlx.getShape(out));
-        errs[i] = try pdg.testErrVsTruth(out, in.truth, s);
+        errs[i] = try testErrVsTruth(out, in.truth, s);
     }
     try testing.expect(errs[1].rms <= 1.05 * errs[0].rms);
     try testing.expect(errs[1].max <= 1.05 * errs[0].max);

@@ -501,7 +501,7 @@ test "glm5_next plugin: a batched tick over unevaluated prefill states equals on
 }
 
 test "glm5_next plugin: a decode token on the device equals the host token's decode" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), null);

@@ -208,28 +208,8 @@ test "prefillDqGemm: 2-bit weights take the dequant route from 384 rows, other w
     }
 }
 
-pub const TruthErr = struct { rms: f64, max: f64 };
-
-/// rms and max |y - truth| over an f32 reference (test helper for the fp16 lever arms).
-pub fn testErrVsTruth(y: mlx.mlx_array, truth: mlx.mlx_array, s: mlx.mlx_stream) !TruthErr {
-    const n = mlx.mlx_array_size(truth);
-    if (mlx.mlx_array_size(y) != n) return error.ShapeMismatch;
-    const a = try testing.allocator.alloc(f32, n);
-    defer testing.allocator.free(a);
-    const b = try testing.allocator.alloc(f32, n);
-    defer testing.allocator.free(b);
-    try testReadF32(y, a, s);
-    try testReadF32(truth, b, s);
-    var sq: f64 = 0;
-    var max: f64 = 0;
-    for (a, b) |got, want| {
-        const d: f64 = @abs(@as(f64, got) - @as(f64, want));
-        if (!std.math.isFinite(d)) return error.NonFiniteValue;
-        sq += d * d;
-        max = @max(max, d);
-    }
-    return .{ .rms = @sqrt(sq / @as(f64, @floatFromInt(n))), .max = max };
-}
+const TruthErr = @import("../../testing/parity.zig").TruthErr;
+const testErrVsTruth = @import("../../testing/parity.zig").testErrVsTruth;
 
 /// An affine 4-bit gs64 pack of a random bf16 weight `shape`: q, scales, biases, and the f32 dequant (the truth's weight).
 pub fn testAffinePack(sc: *Scope, rnd: std.Random, shape: []const c_int) !struct { q: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array, w32: mlx.mlx_array } {
