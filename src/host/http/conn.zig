@@ -421,3 +421,30 @@ test "Conn names the client from each request's User-Agent and keeps no header t
     conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
     try std.testing.expectEqual(instr.Client.other, conn.client);
 }
+
+test "Conn: a request's X-Ablation line rides both response heads, and the next request starts without it or the key" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]bool{ false, true }) |sse| {
+        var sv: [2]std.posix.fd_t = undefined;
+        try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+        defer _ = std.c.close(sv[1]);
+        var conn: Conn = undefined;
+        Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, io);
+        defer _ = std.c.close(sv[0]);
+        conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nX-Ablation-Key: secret-value\r\n\r\n");
+        try testing.expectEqualStrings("secret-value", conn.ablation_key.?);
+        const line = "X-Ablation: profile=p; strength=1.000; hash=00000000000000aa\r\n";
+        @memcpy(conn.ablation_header[0..line.len], line);
+        conn.ablation_header_len = line.len;
+        if (sse) try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT) else try sendResponseFramed(&conn, "200 OK", "application/json", "{}");
+        var buf: [1024]u8 = undefined;
+        const n = std.c.recv(sv[1], &buf, buf.len, 0);
+        try testing.expect(n > 0);
+        const got = buf[0..@intCast(n)];
+        const head = got[0 .. std.mem.indexOf(u8, got, "\r\n\r\n").? + 4];
+        try testing.expect(std.mem.indexOf(u8, head, "\r\n" ++ line) != null);
+        try testing.expect(std.mem.indexOf(u8, got, "secret-value") == null);
+        conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");
+        try testing.expect(conn.ablation_key == null and conn.ablation == null and conn.ablationHeader().len == 0);
+    }
+}

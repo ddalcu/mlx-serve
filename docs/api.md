@@ -18,6 +18,21 @@ curl http://localhost:11234/v1/chat/completions \
 
 Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `stream_options`, `tools`, `response_format`, `repetition_penalty`, `presence_penalty`, `logprobs` / `top_logprobs`, `reasoning_effort` / `enable_thinking` / `reasoning_budget_tokens`, plus per-request `kv_quant` and `kv_attn_mode` overrides. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models. Usage always carries `prompt_tokens_details.cached_tokens`, and a reply cut short because the model went in circles reports `finish_details: {"type": "repetition_loop"}` beside `finish_reason`.
 
+### Directional ablation
+
+With `--ablation-profiles <dir>` and `--ablation-key-file <path>`, `/v1/chat/completions` and `/v1/completions` take
+`"ablation": {"profile": "<name>", "strength": 0.0-1.0}` (strength defaults to 1) with the key in the
+`X-Ablation-Key` header. The model removes the profile's direction from everything it writes to its residual stream,
+for that request only (Arditi et al. 2024, "Refusal in Language Models Is Mediated by a Single Direction"). The
+response carries `X-Ablation: profile=<name>; strength=<s>; hash=<hex>`. A missing or wrong key is a 401; an unknown,
+refused or mismatched profile, a strength outside [0, 1], an unknown field, a model whose plugin does not declare
+`Caps.ablation`, or the field on another endpoint is a named 400. Requests without the field run unchanged.
+
+A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"version": 1`, `hidden_size`,
+`base_config_sha256`: sha256 of the base pack's exact `config.json` bytes) and `direction.safetensors` (one tensor
+`direction`, `[hidden]`, F32/F16/BF16, normalized at load). A module-owned model's prefix cache keys its entries by
+the request's profile and strength, so an ablated conversation reuses its own prefix and nothing else's.
+
 ## POST /v1/messages (Anthropic)
 
 ```bash
