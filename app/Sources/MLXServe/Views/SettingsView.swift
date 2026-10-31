@@ -1984,6 +1984,11 @@ private struct ServerSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
 
+    /// Crash handling is a display pref, not a `ServerOptions` field (no CLI
+    /// flag exists for it), so it lives in `@AppStorage` beside the Interface
+    /// prefs rather than in the section's Reset to Defaults set.
+    @AppStorage(CrashRecoveryMode.prefKey) private var crashMode: CrashRecoveryMode = .ask
+
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
@@ -2176,6 +2181,19 @@ private struct ServerSectionContent: View {
                     .labelsHidden()
                     .toggleStyle(.switch).font(.app(.body))
             }
+        }
+        SettingsRow(
+            title: "If the server exits on its own",
+            explainer: "For a crash or an out-of-memory kill while the server is running. Restart brings it back after 1, 2, 4, 8, 16, then 30 seconds, then stops trying so a model that cannot load still shows its error instead of restarting forever. Stop cancels a pending restart."
+        ) {
+            Picker("", selection: $crashMode) {
+                ForEach(CrashRecoveryMode.allCases) { mode in
+                    Text(L10n.text(mode.label)).font(.app(.body)).tag(mode)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            .frame(minWidth: 180).font(.app(.body))
         }
     }
 }
