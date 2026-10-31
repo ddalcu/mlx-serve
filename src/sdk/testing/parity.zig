@@ -130,6 +130,29 @@ pub fn rmsVsTruth(a: mlx.mlx_array, truth: []const f64) !f64 {
     return @sqrt(e / @as(f64, @floatFromInt(truth.len)));
 }
 
+pub const TruthErr = struct { rms: f64, max: f64 };
+
+/// rms and max |y - truth| over an f32 reference (test helper for the fp16 lever arms).
+pub fn testErrVsTruth(y: mlx.mlx_array, truth: mlx.mlx_array, s: mlx.mlx_stream) !TruthErr {
+    const n = mlx.mlx_array_size(truth);
+    if (mlx.mlx_array_size(y) != n) return error.ShapeMismatch;
+    const a = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(a);
+    const b = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(b);
+    try testReadF32(y, a, s);
+    try testReadF32(truth, b, s);
+    var sq: f64 = 0;
+    var max: f64 = 0;
+    for (a, b) |got, want| {
+        const d: f64 = @abs(@as(f64, got) - @as(f64, want));
+        if (!std.math.isFinite(d)) return error.NonFiniteValue;
+        sq += d * d;
+        max = @max(max, d);
+    }
+    return .{ .rms = @sqrt(sq / @as(f64, @floatFromInt(n))), .max = max };
+}
+
 pub fn jsonToMlxArray(allocator: std.mem.Allocator, v: std.json.Value) !mlx.mlx_array {
     var shape: [8]c_int = undefined;
     var ndim: usize = 0;
