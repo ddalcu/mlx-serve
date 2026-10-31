@@ -36,6 +36,18 @@ test "qmvBatchLimit mirrors MLX's qmv/qmm split on single- and dual-die gen-17 G
     try testing.expectEqual(@as(c_int, 12), qmvBatchLimit(true, 6144, 2560));
 }
 
+test "qmvRows: 8 or more rows leave the per-row qmv kernels where MLX takes its NAX split-K matmul" {
+    const qmvRows = qmatmul.qmvRows;
+    // Under 8 rows it is always qmv; at 8 the split-K matmul needs m * n >= 16384 and a grid within 256 threadgroups.
+    try testing.expect(qmvRows(false, 7, 640, 2560, 64));
+    try testing.expect(!qmvRows(false, 8, 640, 2560, 64));
+    try testing.expect(qmvRows(false, 8, 2560, 640, 64)); // m * n = 5120
+    try testing.expect(qmvRows(false, 8, 2560, 10240, 64)); // 160 tiles x 2 > 256 threadgroups
+    // Past the batch limit it is a qmm either way.
+    try testing.expect(!qmvRows(false, 13, 2560, 10240, 64));
+    try testing.expect(!@import("../qmm/lane_qmm.zig").qmmNaxSplitK(8, 2560, 100, 64)); // K not a multiple of 64
+}
+
 test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it stays stock" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();

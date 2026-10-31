@@ -72,6 +72,14 @@ pub fn qmvBatchLimit(dual_die: bool, k: c_int, n: c_int) c_int {
     return if (small) 33 else if (mid) 25 else 13;
 }
 
+/// Whether MLX's `quantized_matmul` of `m` rows of a transposed affine weight reduces each row through its per-row
+/// qmv kernels on a NAX GPU: below `qmvBatchLimit`, and not the NAX split-K matmul that takes 8 or more rows once
+/// `m * n >= 16384` (quantized.cpp, "For mid rows use NAX qmm").
+pub fn qmvRows(dual_die: bool, m: c_int, k: c_int, n: c_int, group_size: c_int) bool {
+    if (m >= qmvBatchLimit(dual_die, k, n)) return false;
+    return !(m >= 8 and m * n >= 16384 and lane_qmm.qmmNaxSplitK(m, n, k, group_size));
+}
+
 pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
     if (try foreign.linear(x, w, sc, s)) |y| return y;
     // A weight re-ordered in place is read in its tiled layout only.

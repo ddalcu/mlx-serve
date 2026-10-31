@@ -11,7 +11,7 @@ const concatAxis0 = @import("../../../mlx/array.zig").concatAxis0;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
 const affineParamsFromGeometry = @import("../../quant/params.zig").affineParamsFromGeometry;
-const qmvBatchLimit = @import("qmatmul.zig").qmvBatchLimit;
+const qmvRows = @import("qmatmul.zig").qmvRows;
 const cachedScalarInt = @import("verify_qmm.zig").cachedScalarInt;
 const mixedNaxShapeEnabled = @import("verify_qmm.zig").mixedNaxShapeEnabled;
 const mixedPlainEnabled = @import("verify_qmm.zig").mixedPlainEnabled;
@@ -278,7 +278,7 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
         }
     }
     const arch = verifyArch() orelse return null;
-    if (total >= qmvBatchLimit(dualDieArch(arch), k, n)) return null;
+    if (!qmvRows(dualDieArch(arch), total, k, n, @intCast(qp.group_size))) return null;
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_quantized_matmul(&result, x, w, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
