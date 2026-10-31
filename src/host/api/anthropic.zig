@@ -23,6 +23,7 @@ const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
+const parseSuppressCjk = @import("sampling.zig").parseSuppressCjk;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
 const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
@@ -236,6 +237,12 @@ pub fn handleAnthropicMessages(
         return;
     }
     const root = parsed.value.object;
+    var suppress_cjk = false;
+    if (parseSuppressCjk(root, lm, &suppress_cjk)) |msg| {
+        log.warn("POST /v1/messages -> 400 ({s})\n", .{msg});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+        return;
+    }
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.
@@ -780,6 +787,7 @@ pub fn handleAnthropicMessages(
         .presence_penalty = sampled.presence_penalty,
         .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
+        .suppress_cjk = suppress_cjk,
     };
 
     // Grammar-constrained sampling for `output_config.format` json_schema —
