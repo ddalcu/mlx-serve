@@ -378,6 +378,19 @@ pub fn configDigest(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) ?[6
     return std.fmt.bytesToHex(d, .lower);
 }
 
+/// `configDigest` of `lm`'s pack, read and hashed once per load; a request racing the first one hashes its own copy.
+pub fn modelDigest(io: std.Io, lm: *LoadedModel) ?[64]u8 {
+    if (lm.config_digest_state.load(.acquire) == 2) return lm.config_digest;
+    var a = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer a.deinit();
+    const d = configDigest(io, a.allocator(), lm.path) orelse return null;
+    if (lm.config_digest_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
+        lm.config_digest = d;
+        lm.config_digest_state.store(2, .release);
+    }
+    return d;
+}
+
 /// The `X-Ablation` response header line (CRLF-terminated) for `sel`; the profile name is a directory name the
 /// operator chose, kept to header-safe bytes.
 pub fn headerLine(buf: []u8, sel: Selected) []const u8 {
@@ -389,19 +402,17 @@ pub fn headerLine(buf: []u8, sel: Selected) []const u8 {
 
 /// Resolves a parsed body's `ablation` field for `conn`'s request on `lm`: a run or a strength-0 request sets the
 /// conn's response header (and, for a run, `conn.ablation`); a refusal is returned for the caller to send.
-pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *const LoadedModel) ?Refusal {
+pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *LoadedModel) ?Refusal {
     const field = root.get("ablation") orelse return null;
     const set = http_server.g_ablation;
     const config = lm.config orelse return bad("this model does not serve ablation").refused;
     const serves = if (config.plugin) |pb| pb.parsed.caps.ablation else false;
     // The pack's config is read only for a request that holds the key (`resolve` checks it first).
     const authorized = if (set) |s| if (conn.ablation_key) |k| s.keyMatches(k) else false else false;
-    var a = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer a.deinit();
     const served: Served = .{
         .hidden = config.hidden_size,
         .serves = serves,
-        .config_sha256 = if (authorized and serves) configDigest(conn.io, a.allocator(), lm.path) else null,
+        .config_sha256 = if (authorized and serves) modelDigest(conn.io, lm) else null,
     };
     const out = resolve(set, field, conn.ablation_key, served, &conn.ablation_header);
     const sel = switch (out) {
@@ -425,6 +436,10 @@ pub fn bodyNamesAblation(a: std.mem.Allocator, body: []const u8) bool {
     defer parsed.deinit();
     return parsed.value == .object and parsed.value.object.get("ablation") != null;
 }
+
+/// The refusal for a request a proxy would forward (a provider or a LAN peer): the field would reach a third party and
+/// run unablated.
+pub const proxied_refusal = "ablation is not forwarded to a provider or a LAN peer; send it to a local model";
 
 /// The surfaces that do not serve the field refuse it rather than ignore it.
 pub fn refuseOnSurface(root: std.json.ObjectMap) ?Refusal {
@@ -605,6 +620,23 @@ test "ablation key file: mode, length and trim rules" {
     try testing.expect(std.c.symlink(path_z, link_z) == 0);
     try testing.expectError(error.NotRegular, readKey(a, link));
     try testing.expectError(error.Unreadable, readKey(a, "/nonexistent/key"));
+}
+
+test "ablation model digest: hashed once per load, the cached value served after" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(testing.io, &buf)];
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"a\":1}" });
+    var lm: LoadedModel = undefined;
+    lm.path = root;
+    lm.config_digest_state = .init(0);
+    const first = modelDigest(testing.io, &lm).?;
+    try testing.expectEqual(@as(u8, 2), lm.config_digest_state.load(.acquire));
+    // The file changes on disk; the load's digest does not.
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"a\":2}" });
+    try testing.expectEqualSlices(u8, &first, &modelDigest(testing.io, &lm).?);
+    try testing.expect(!std.mem.eql(u8, &first, &configDigest(testing.io, testing.allocator, root).?));
 }
 
 test "ablation header: names the profile and strength, header-safe" {
