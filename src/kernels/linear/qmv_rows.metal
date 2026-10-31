@@ -25,7 +25,7 @@ for (int k = 0; k < in_vec_size; k += block_size) {
   U sum = 0;
   if (BITS == 3) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3] + xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+      sum += U(xp[i]) + U(xp[i + 1]) + U(xp[i + 2]) + U(xp[i + 3]) + U(xp[i + 4]) + U(xp[i + 5]) + U(xp[i + 6]) + U(xp[i + 7]);
       x_thread[i] = xp[i];
       x_thread[i + 1] = xp[i + 1] / 8.0f;
       x_thread[i + 2] = xp[i + 2] / 64.0f;
@@ -37,7 +37,7 @@ for (int k = 0; k < in_vec_size; k += block_size) {
     }
   } else if (BITS == 4) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+      sum += U(xp[i]) + U(xp[i + 1]) + U(xp[i + 2]) + U(xp[i + 3]);
       x_thread[i] = xp[i];
       x_thread[i + 1] = xp[i + 1] / 16.0f;
       x_thread[i + 2] = xp[i + 2] / 256.0f;
@@ -45,7 +45,7 @@ for (int k = 0; k < in_vec_size; k += block_size) {
     }
   } else if (BITS == 5) {
     for (int i = 0; i < values_per_thread; i += 8) {
-      sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3] + xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+      sum += U(xp[i]) + U(xp[i + 1]) + U(xp[i + 2]) + U(xp[i + 3]) + U(xp[i + 4]) + U(xp[i + 5]) + U(xp[i + 6]) + U(xp[i + 7]);
       x_thread[i] = xp[i];
       x_thread[i + 1] = xp[i + 1] / 32.0f;
       x_thread[i + 2] = xp[i + 2] / 4.0f;
@@ -57,7 +57,7 @@ for (int k = 0; k < in_vec_size; k += block_size) {
     }
   } else if (BITS == 6) {
     for (int i = 0; i < values_per_thread; i += 4) {
-      sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+      sum += U(xp[i]) + U(xp[i + 1]) + U(xp[i + 2]) + U(xp[i + 3]);
       x_thread[i] = xp[i];
       x_thread[i + 1] = xp[i + 1] / 64.0f;
       x_thread[i + 2] = xp[i + 2] / 16.0f;

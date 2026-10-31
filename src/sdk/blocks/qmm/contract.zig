@@ -5,8 +5,8 @@
 //! host-built in MLX's packed layout (`host.quantize`); N is cut below the served models' widest projections where
 //! the float64 reference would not fit a Debug test, K is always a served width.
 //! References carry their own forward error (`host.Val`, `host.allowance`): f32 sums of any order bounded by
-//! gamma(K + 16) over the terms' magnitudes, plus every rounding the kernel makes before them (MLX qmv's bf16 runs of
-//! four inputs, a weight dequantized into T). Kernels that factor a group's scale and bias out of the dot
+//! gamma(K + 16) over the terms' magnitudes, plus every rounding the kernel makes before them (a weight dequantized
+//! into T; MLX's qmv sums its inputs in f32 since the pin moved to 4ca8d5d5, where it added them in bf16 before). Kernels that factor a group's scale and bias out of the dot
 //! (s * sum(x q) + b * sum(x)) are referenced that way, so their NaN classes are the factored ones (0 * Inf).
 //! rowqmv's contract is row exactness (a verify row equals the serial decode row), not stock bits: at whole passes it
 //! also equals MLX's one-row quantized_matmul, and at Nemotron's K 2688 and 1856, where stock splits K differently,
@@ -162,16 +162,6 @@ fn simDots(a: std.mem.Allocator, x: []const f64, wr: []const f64, m: usize, n: u
 
 // ── rowqmv: one simdgroup per input row ──
 
-/// MLX qmv_fast's input sum at 4 and 6 bits: runs of four added in bf16 (a + b, + c, + d, each rounded), then in f32.
-fn bf16Runs(x: []const f64) Val {
-    var v: f64 = 0;
-    var i: usize = 0;
-    while (i < x.len) : (i += 4) {
-        v += host.rt(.bfloat16, host.rt(.bfloat16, host.rt(.bfloat16, x[i] + x[i + 1]) + x[i + 2]) + x[i + 3]);
-    }
-    return .{ .v = v, .e = sumErr(x.len / 4, host.sumAbs(x)) };
-}
-
 const rq_inputs: []const [*:0]const u8 = &.{ "x", "w", "scales", "biases" };
 const rq_launch = metal.Launch{ .name = "msv_rowqmv", .inputs = rq_inputs, .outputs = &.{"y"}, .source = rowqmv.QMV_SOURCE, .header = rowqmv.HEADER, .tg_bytes = 0, .m1 = 1024, .m2 = 1024 };
 const rq_up_launch = metal.Launch{ .name = "msv_rowqmv_expert_up", .inputs = &.{ "x", "ids", "w", "scales", "biases" }, .outputs = &.{"y"}, .source = rowqmv.EXPERT_UP_SOURCE, .header = rowqmv.HEADER, .tg_bytes = 0, .m1 = 1024, .m2 = 1024 };
@@ -308,7 +298,7 @@ const Rq = struct {
             for (terms, x, self.w.q.w[wrow * sh.k ..][0..sh.k]) |*t, xv, wv| t.* = xv * wv;
             return .{ .v = spec.sumIn(ac, order, terms) };
         }
-        return factored(x, self.w, wrow, sh.k, c.gs, if (c.bits == 4) 16 else 8, if (c.bits == 8) null else &bf16Runs);
+        return factored(x, self.w, wrow, sh.k, c.gs, if (c.bits == 4) 16 else 8, null);
     }
 
     fn outputs(self: *const Rq, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {

@@ -14,7 +14,7 @@ const threadgroup T* x2 = act + lane * 8;
 float xt2[8];
 float sum2 = 0;
 for (int i = 0; i < 8; i += 4) {
-  sum2 += x2[i] + x2[i + 1] + x2[i + 2] + x2[i + 3];
+  sum2 += float(x2[i]) + float(x2[i + 1]) + float(x2[i + 2]) + float(x2[i + 3]);
   xt2[i] = x2[i];
   xt2[i + 1] = x2[i + 1] / 16.0f;
   xt2[i + 2] = x2[i + 2] / 256.0f;
