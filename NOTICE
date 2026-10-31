@@ -33,8 +33,9 @@ Licensed under the Apache License, Version 2.0.
 
 The Idol denoiser in src/plugins/idol/denoiser.zig follows idol/mlx_dit.py in running the unconditional
 image tokens as two keys whose biases carry their count and in sharing the latent stream between the two
-guidance passes; src/plugins/idol/kernels/{norm_mod,repo_norm,repo_angles}.metal follow its fused
-LayerNorm + adaLN and RePo passes. Written in Zig and Metal here.
+guidance passes; src/plugins/idol/kernels/{norm_mod,repo_angles}.metal follow its fused
+LayerNorm + adaLN and RePo angle passes, and src/plugins/idol/kernels/attention.metal ports its NAX
+flash attention with a key bias. Written in Zig and Metal here.
 
 --------------------------------------------------------------------------------
 NVIDIA NeMo Speech: Nemotron 3.5 Transcribe word timestamps

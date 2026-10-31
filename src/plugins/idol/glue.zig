@@ -11,9 +11,11 @@ pub const QKV_SOURCE = kernelSource("plugins/idol/kernels/qkv_prep.metal");
 pub const GELU_SOURCE = kernelSource("plugins/idol/kernels/bias_gelu.metal");
 pub const GATE_SOURCE = kernelSource("plugins/idol/kernels/gate_residual.metal");
 pub const NORM_MOD_SOURCE = kernelSource("plugins/idol/kernels/norm_mod.metal");
-pub const REPO_NORM_SOURCE = kernelSource("plugins/idol/kernels/repo_norm.metal");
+pub const REPO_FOLD_SOURCE = kernelSource("plugins/idol/kernels/repo_fold.metal");
 pub const REPO_ANGLES_SOURCE = kernelSource("plugins/idol/kernels/repo_angles.metal");
 pub const DEFORM_SOURCE = kernelSource("plugins/idol/kernels/deform_cols.metal");
+pub const ATTN_SOURCE = kernelSource("plugins/idol/kernels/attention.metal");
+pub const ATTN_HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 
 const HD: c_int = 64;
 
@@ -57,9 +59,47 @@ var qkv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gelu_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var norm_mod_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var repo_norm_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var repo_fold_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var repo_angles_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var deform_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var attn_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// softmax(q k^T * scale + kbias) v for q, k, v f16 heads-major `[1, H, L, 64]` and `kbias` f32 `[L]` in base 2 (the
+/// score bias times log2 e) on the NAX tensor unit; out f16 token-major `[L, H*64]`. MLX's sdpa is as fast unmasked;
+/// with a bias this is ~6% faster than sdpa's mask. Null off NAX or outside those shapes.
+pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, kbias: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (disabled_for_test or !mlx.streamIsGpu(s) or !@import("../../mlx/device.zig").naxAvailable()) return null;
+    const sh = mlx.getShape(q);
+    if (sh.len != 4 or sh[0] != 1 or sh[3] != HD) return null;
+    for ([_]mlx.mlx_array{ q, k, v }) |a| {
+        if (mlx.mlx_array_dtype(a) != .float16) return null;
+        const o = mlx.getShape(a);
+        if (o.len != 4 or o[1] != sh[1] or o[2] != sh[2] or o[3] != HD) return null;
+    }
+    const h = sh[1];
+    const l = sh[2];
+    if (mlx.mlx_array_dtype(kbias) != .float32 or mlx.mlx_array_size(kbias) != @as(usize, @intCast(l))) return null;
+    if (attn_kernel == null) {
+        const iv = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{ "q", "k", "v", "scale", "kbias" }, 5);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{"out"}, 1);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const kn = mlx.mlx_fast_metal_kernel_new("msv_idol_attention", iv, ov, ATTN_SOURCE, ATTN_HEADER, true, false);
+        if (kn.ctx == null) return error.MetalKernelCompileFailed;
+        attn_kernel = kn;
+    }
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ l, h * HD }, 2, .float16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(l + 63, 64) * 128, h, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "HAS_BIAS", true));
+    const sc = mlx.mlx_array_new_float(scale);
+    defer _ = mlx.mlx_array_free(sc);
+    var out: [1]mlx.mlx_array = undefined;
+    try apply(attn_kernel.?, cfg, &.{ q, k, v, sc, kbias }, &out, s);
+    return out[0];
+}
 
 /// torchvision `deform_conv2d`'s columns for BiRefNet's decoder: `x` `[h*w, C]` (f16 or bf16, C a multiple of 4),
 /// `off` f32 `[h*w, 2K]` (each tap's row then column offset), `msk` `[h*w, K]` of x's dtype, K = k*k taps. Out
@@ -206,40 +246,47 @@ pub fn qkvPrep(y: mlx.mlx_array, bias: mlx.mlx_array, q_gamma: mlx.mlx_array, k_
     return .{ .q = outs[0], .k = outs[1], .v = outs[2] };
 }
 
-/// The RePo layer's LayerNorm of `x` `[.., N]` (f16 or bf16) with f32 `w` and `b`: statistics and output in f32. N a
-/// multiple of 128, at most 4096. `split` writes each row as `[hi | hi | lo]` `[.., 3N]` (hi exact in TF32, lo the
-/// rest): times `[w_hi; w_lo; w_hi]`, one TF32 GEMM gives the 3xTF32 product.
-pub fn repoNorm(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, eps: f32, split: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+/// The RePo layer's LayerNorm folded into its gate | content projection: `p` `[.., PARTS * N2]` f32 is the row of `h`
+/// `[.., C]` (f16 or bf16) times the stacked maps with the norm's weight folded in (their TF32-exact part, then the
+/// rest when PARTS is 2); `cs` `[N2]` their column sums, `bw` `[N2]` the norm's bias through the maps. Out `[.., N2]`
+/// f32: rstd * (p's parts summed - mean * cs) + bw, the statistics of h's row two-pass in f32.
+pub fn repoFold(p: mlx.mlx_array, h: mlx.mlx_array, cs: mlx.mlx_array, bw: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (disabled_for_test or !mlx.streamIsGpu(s)) return null;
-    const dt = mlx.mlx_array_dtype(x);
-    if (!eligible(dt) or mlx.mlx_array_dtype(w) != .float32 or mlx.mlx_array_dtype(b) != .float32) return null;
-    const sh = mlx.getShape(x);
-    if (sh.len == 0 or sh.len > 8) return null;
-    const n: c_int = sh[sh.len - 1];
-    if (@rem(n, 128) != 0 or n > 4096 or mlx.mlx_array_size(w) != @as(usize, @intCast(n)) or mlx.mlx_array_size(b) != @as(usize, @intCast(n))) return null;
-    const x2 = try rowsOf(x, n, s);
-    defer _ = mlx.mlx_array_free(x2);
-    if (repo_norm_kernel == null) repo_norm_kernel = try makeKernel("msv_idol_repo_norm", &.{ "X", "W", "BI", "eps" }, &.{"O"}, REPO_NORM_SOURCE);
+    if (!eligible(mlx.mlx_array_dtype(h))) return null;
+    for ([_]mlx.mlx_array{ p, cs, bw }) |a| if (mlx.mlx_array_dtype(a) != .float32) return null;
+    const n2: c_int = @intCast(mlx.mlx_array_size(cs));
+    const ps = mlx.getShape(p);
+    const hs = mlx.getShape(h);
+    if (n2 == 0 or ps.len == 0 or ps.len > 8 or hs.len == 0 or mlx.mlx_array_size(bw) != @as(usize, @intCast(n2))) return null;
+    const width = ps[ps.len - 1];
+    const parts = @divTrunc(width, n2);
+    if ((parts != 1 and parts != 2) or parts * n2 != width) return null;
+    const rows: c_int = @intCast(mlx.mlx_array_size(p) / @as(usize, @intCast(width)));
+    const c: c_int = hs[hs.len - 1];
+    if (mlx.mlx_array_size(h) != @as(usize, @intCast(rows)) * @as(usize, @intCast(c))) return null;
+    const p2 = try rowsOf(p, width, s);
+    defer _ = mlx.mlx_array_free(p2);
+    const h2 = try rowsOf(h, c, s);
+    defer _ = mlx.mlx_array_free(h2);
+    if (repo_fold_kernel == null) repo_fold_kernel = try makeKernel("msv_idol_repo_fold", &.{ "P", "H", "CS", "BW", "eps" }, &.{"GC"}, REPO_FOLD_SOURCE);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-    const rows = mlx.getShape(x2)[0];
-    const width = if (split) 3 * n else n;
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, width }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * @divExact(n, 4), 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @divExact(n, 4), 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "SPLIT", split));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, n2 }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", mlx.mlx_array_dtype(h)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PARTS", parts));
     const eps_a = mlx.mlx_array_new_float(eps);
     defer _ = mlx.mlx_array_free(eps_a);
     var out: [1]mlx.mlx_array = undefined;
-    try apply(repo_norm_kernel.?, cfg, &.{ x2, w, b, eps_a }, &out, s);
-    var shape: [8]c_int = undefined;
-    @memcpy(shape[0..sh.len], sh);
-    shape[sh.len - 1] = width;
+    try apply(repo_fold_kernel.?, cfg, &.{ p2, h2, cs, bw, eps_a }, &out, s);
     defer _ = mlx.mlx_array_free(out[0]);
+    var shape: [8]c_int = undefined;
+    @memcpy(shape[0..ps.len], ps);
+    shape[ps.len - 1] = n2;
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
-    try mlx.check(mlx.mlx_reshape(&o, out[0], &shape, sh.len, s));
+    try mlx.check(mlx.mlx_reshape(&o, out[0], &shape, ps.len, s));
     return o;
 }
 

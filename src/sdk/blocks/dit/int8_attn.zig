@@ -24,7 +24,7 @@ const NSG: c_int = 4;
 /// bandwidth bound; otherwise scalar reads through x's strides.
 pub const QUANT_SOURCE = kernelSource("kernels/dit/int8_attn_quant.metal");
 
-/// One simdgroup per (kv head, row) of v [1, KV, L, D] (D 64 or 128), over its per-channel |max| `vm`.
+/// One simdgroup per (kv head, row) of v [1, KV, L, 128], over its per-channel |max| `vm`.
 pub const VPREP_SOURCE = kernelSource("kernels/dit/int8_attn_vprep.metal");
 
 /// One simdgroup per 16 query rows of one head. Element i of an SM x N tensor-op
@@ -54,16 +54,13 @@ fn newKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0
 const Out = struct { shape: []const c_int, dtype: mlx.mlx_dtype };
 
 /// Launch `kernel` over `threads` x `rows` (threadgroup `tg` x 1) with template `T` = `dt`.
-/// ... and the head width `D`, and `HAS_BIAS` when given.
-fn launch(kernel: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, outs: []const Out, threads: c_int, rows: c_int, tg: c_int, dt: mlx.mlx_dtype, d: c_int, has_bias: ?bool, results: []mlx.mlx_array, s: mlx.mlx_stream) !void {
+fn launch(kernel: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, outs: []const Out, threads: c_int, rows: c_int, tg: c_int, dt: mlx.mlx_dtype, results: []mlx.mlx_array, s: mlx.mlx_stream) !void {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dtype));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, threads, rows, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", d));
-    if (has_bias) |b| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "HAS_BIAS", b));
     const iv = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
@@ -126,12 +123,12 @@ pub fn quantRows(x: mlx.mlx_array, rows: c_int, mean: ?mlx.mlx_array, eps: f32, 
     return out;
 }
 
-/// q [1, H, L, D]: int8 codes and one scale per row.
+/// q [1, H, L, 128]: int8 codes and one scale per row.
 pub fn prepQ(q: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
     return quantRows(q, 1, null, 1e-20, true, true, s);
 }
 
-/// k [1, KV, L, D] less its per-channel mean: int8 codes and one scale per 32-key block.
+/// k [1, KV, L, 128] less its per-channel mean: int8 codes and one scale per 32-key block.
 pub fn prepK(k: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
     var mu = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mu);
@@ -139,15 +136,14 @@ pub fn prepK(k: mlx.mlx_array, s: mlx.mlx_stream) ![2]mlx.mlx_array {
     return quantRows(k, BK, mu, 1e-20, true, true, s);
 }
 
-/// Softmax(q k^T * scale + key_bias) v for heads-major q [1, H, Lq, D] and k, v [1, KV, L, D] (D 64 or 128, H a
-/// multiple of KV), returned token-major [Lq, H*D] in q's dtype; `key_bias` is f32 [L] in base-2 units (an
-/// additive score bias times log2 e), or null. Null when the shape is outside the kernel.
-pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, key_bias: ?mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
+/// Softmax(q k^T * scale) v for heads-major q [1, H, Lq, 128] and k, v
+/// [1, KV, L, 128] (H a multiple of KV), unmasked, returned token-major
+/// [Lq, H*128] in q's dtype; null when the shape is outside the kernel.
+pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!@import("w8a8.zig").nax()) return null; // the kernels are written for the NAX matrix unit
     const qs_ = mlx.getShape(q);
     const ks_ = mlx.getShape(k);
-    if (qs_.len != 4 or qs_[0] != 1 or (qs_[3] != 128 and qs_[3] != 64) or ks_[3] != qs_[3]) return null;
-    const d = qs_[3];
+    if (qs_.len != 4 or qs_[0] != 1 or qs_[3] != 128 or ks_[3] != 128) return null;
     const h = qs_[1];
     const kv = ks_[1];
     const lq = qs_[2];
@@ -155,10 +151,9 @@ pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f3
     if (@rem(h, kv) != 0 or l < BK) return null;
     const dt = mlx.mlx_array_dtype(q);
     if (dt != .bfloat16 and dt != .float16) return null;
-    if (key_bias) |b| if (mlx.mlx_array_dtype(b) != .float32 or mlx.mlx_array_size(b) != @as(usize, @intCast(l))) return null;
     if (vprep_kernel == null) {
         vprep_kernel = try newKernel("msv_i8attn_vprep", &.{ "v", "vm" }, &.{"vi"}, VPREP_SOURCE, "");
-        attn_kernel = try newKernel("msv_i8attn", &.{ "qi", "qs", "ki", "ks", "vi", "vm", "scale", "kbias" }, &.{"o"}, ATTN_SOURCE, HEADER);
+        attn_kernel = try newKernel("msv_i8attn", &.{ "qi", "qs", "ki", "ks", "vi", "vm", "scale" }, &.{"o"}, ATTN_SOURCE, HEADER);
     }
     const qp = try prepQ(q, s);
     defer for (qp) |a| {
@@ -179,16 +174,16 @@ pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f3
     defer _ = mlx.mlx_array_free(vm);
     try mlx.check(mlx.mlx_astype(&vm, vmx, .float32, s));
     var vp: [1]mlx.mlx_array = undefined;
-    try launch(vprep_kernel.?, &.{ v, vm }, &.{.{ .shape = &.{ kv, l, d }, .dtype = .int8 }}, simdGrid(kv * l), 1, 256, dt, d, null, &vp, s);
+    try launch(vprep_kernel.?, &.{ v, vm }, &.{.{ .shape = &.{ kv, l, 128 }, .dtype = .int8 }}, simdGrid(kv * l), 1, 256, dt, &vp, s);
     defer _ = mlx.mlx_array_free(vp[0]);
 
     const sc = mlx.mlx_array_new_float(scale * std.math.log2e);
     defer _ = mlx.mlx_array_free(sc);
     var o: [1]mlx.mlx_array = undefined;
-    try launch(attn_kernel.?, &.{ qp[0], qp[1], kp[0], kp[1], vp[0], vm, sc, key_bias orelse qp[1] }, &.{.{ .shape = &.{ lq, h * d }, .dtype = dt }}, @divTrunc(lq + SM * NSG - 1, SM * NSG) * 32 * NSG, h, 32 * NSG, dt, d, key_bias != null, &o, s);
+    try launch(attn_kernel.?, &.{ qp[0], qp[1], kp[0], kp[1], vp[0], vm, sc }, &.{.{ .shape = &.{ lq, h * 128 }, .dtype = dt }}, @divTrunc(lq + SM * NSG - 1, SM * NSG) * 32 * NSG, h, 32 * NSG, dt, &o, s);
     if (!engaged_logged) {
         engaged_logged = true;
-        log.info("[int8-attn] engaged: NAX int8 QK and PV (first H={d} KV={d} Lq={d} L={d} D={d})\n", .{ h, kv, lq, l, d });
+        log.info("[int8-attn] engaged: NAX int8 QK and PV (first H={d} KV={d} Lq={d} L={d})\n", .{ h, kv, lq, l });
     }
     return o[0];
 }
@@ -220,7 +215,7 @@ pub fn attentionHeads(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scal
             const ish = mlx.getShape(src);
             try mlx.check(mlx.mlx_slice(d, src, &[_]c_int{ b, 0, 0, 0 }, 4, &[_]c_int{ b + 1, ish[1], ish[2], ish[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
         }
-        const o = (try attention(one[0], one[1], one[2], scale, null, s)) orelse return null;
+        const o = (try attention(one[0], one[1], one[2], scale, s)) orelse return null;
         defer _ = mlx.mlx_array_free(o);
         rows[done] = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(rows[done]);
@@ -262,19 +257,14 @@ fn bf16(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     return y;
 }
 
-/// Error of `attention` against MLX's sdpa, relative to the reference's RMS; head width `d`, and with `key_bias` a
-/// per-key score bias (a few keys raised by up to e^8, as a collapsed run of thousands is).
+/// Error of `attention` against MLX's sdpa, relative to the reference's RMS.
 fn attnError(h: c_int, kv: c_int, lq: c_int, l: c_int, seed: u64, s: mlx.mlx_stream) !f32 {
-    return attnErrorAt(h, kv, lq, l, 128, false, seed, s);
-}
-
-fn attnErrorAt(h: c_int, kv: c_int, lq: c_int, l: c_int, d: c_int, key_bias: bool, seed: u64, s: mlx.mlx_stream) !f32 {
-    const qf = try randn(&.{ 1, h, lq, d }, seed, s);
+    const qf = try randn(&.{ 1, h, lq, 128 }, seed, s);
     defer _ = mlx.mlx_array_free(qf);
-    const kf = try randn(&.{ 1, kv, l, d }, seed + 1, s);
+    const kf = try randn(&.{ 1, kv, l, 128 }, seed + 1, s);
     defer _ = mlx.mlx_array_free(kf);
     // A per-channel offset on every key, the bias smoothing removes.
-    const bias = try randn(&.{ 1, kv, 1, d }, seed + 2, s);
+    const bias = try randn(&.{ 1, kv, 1, 128 }, seed + 2, s);
     defer _ = mlx.mlx_array_free(bias);
     const two = mlx.mlx_array_new_float(2.0);
     defer _ = mlx.mlx_array_free(two);
@@ -284,7 +274,7 @@ fn attnErrorAt(h: c_int, kv: c_int, lq: c_int, l: c_int, d: c_int, key_bias: boo
     var kb = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(kb);
     try mlx.check(mlx.mlx_add(&kb, kf, b2, s));
-    const vf = try randn(&.{ 1, kv, l, d }, seed + 3, s);
+    const vf = try randn(&.{ 1, kv, l, 128 }, seed + 3, s);
     defer _ = mlx.mlx_array_free(vf);
     const q = try bf16(qf, s);
     defer _ = mlx.mlx_array_free(q);
@@ -292,35 +282,21 @@ fn attnErrorAt(h: c_int, kv: c_int, lq: c_int, l: c_int, d: c_int, key_bias: boo
     defer _ = mlx.mlx_array_free(k);
     const v = try bf16(vf, s);
     defer _ = mlx.mlx_array_free(v);
-    // The bias as sdpa's additive bf16 mask (values exact in bf16), and the same in base 2 for the kernel.
-    var mask_host: [1024]f32 = undefined;
-    var base2: [1024]f32 = undefined;
-    const nl: usize = @intCast(l);
-    for (mask_host[0..nl], base2[0..nl], 0..) |*m, *e, j| {
-        m.* = if (j % 97 == 3) 8.0 else if (j % 89 == 5) -5.0 else 0.0;
-        e.* = m.* * std.math.log2e;
-    }
-    const mask = mlx.mlx_array_new_data(&mask_host, &[_]c_int{ 1, 1, 1, l }, 4, .float32);
-    defer _ = mlx.mlx_array_free(mask);
-    const mask_bf = try bf16(mask, s);
-    defer _ = mlx.mlx_array_free(mask_bf);
-    const kbias = mlx.mlx_array_new_data(&base2, &[_]c_int{l}, 1, .float32);
-    defer _ = mlx.mlx_array_free(kbias);
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
-    const y = (try attention(q, k, v, scale, if (key_bias) kbias else null, s)).?;
+    const scale: f32 = 1.0 / @sqrt(128.0);
+    const y = (try attention(q, k, v, scale, s)).?;
     defer _ = mlx.mlx_array_free(y);
     try testing.expectEqual(lq, mlx.getShape(y)[0]);
-    try testing.expectEqual(h * d, mlx.getShape(y)[1]);
+    try testing.expectEqual(h * 128, mlx.getShape(y)[1]);
     const none = mlx.mlx_array{ .ctx = null };
     var r = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(r);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&r, q, k, v, scale, if (key_bias) "array" else "", if (key_bias) mask_bf else none, none, false, s));
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&r, q, k, v, scale, "", none, none, false, s));
     var rt = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(rt);
     try mlx.check(mlx.mlx_transpose_axes(&rt, r, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
     var ref = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ref);
-    try mlx.check(mlx.mlx_reshape(&ref, rt, &[_]c_int{ lq, h * d }, 2, s));
+    try mlx.check(mlx.mlx_reshape(&ref, rt, &[_]c_int{ lq, h * 128 }, 2, s));
     return @import("w8a8.zig").relRms(y, ref, s);
 }
 
@@ -343,14 +319,6 @@ test "int8 attention equals sdpa within quantization error (fewer queries than k
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     try testing.expect(try attnError(4, 4, 200, 517, 41, s) < 0.03);
-}
-
-test "int8 attention equals sdpa within quantization error at head width 64, with and without a key bias" {
-    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    try testing.expect(try attnErrorAt(4, 4, 333, 517, 64, false, 71, s) < 0.03);
-    try testing.expect(try attnErrorAt(4, 4, 333, 517, 64, true, 72, s) < 0.03);
 }
 
 test "int8 attention heads: a batch of f16 rows equals sdpa row for row, in sdpa's layout and dtype" {
@@ -393,6 +361,6 @@ test "int8 attention declines where the matrix unit is absent, so a default-on m
     const q = try bf16(try randn(&.{ 1, 4, 64, 128 }, 61, s), s);
     defer _ = mlx.mlx_array_free(q);
     const scale: f32 = 1.0 / @sqrt(128.0);
-    try testing.expect((try attention(q, q, q, scale, null, s)) == null);
+    try testing.expect((try attention(q, q, q, scale, s)) == null);
     try testing.expect((try attentionHeads(q, q, q, scale, s)) == null);
 }

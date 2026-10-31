@@ -7,9 +7,11 @@ const ops = @import("../../../mlx/ops.zig");
 const kc = @import("../../testing/kernel_contract/root.zig");
 const add_norm = @import("add_norm.zig");
 const residual_norm = @import("residual_norm.zig");
+const gn = @import("group_norm.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
+const host = kc.host;
 const Shape = spec.Shape;
 
 const Cap = metal.Cap;
@@ -546,8 +548,213 @@ const chain_add = "add -> fast::rms_norm";
 const looped_probe: spec.Known = .{ .gate = .limits, .finding = "M1/M2 build these looped widths (D > 4096) for 928 threads and the launch is 1024; the wrapper probes only the first dispatch past 256 threads in a process (one `looped_ok` for every arm and width), so after another width's probe passes, a looped dispatch goes unprobed and fails on M1/M2" };
 const seam_unprobed: spec.Known = .{ .gate = .limits, .finding = "M1/M2 build this flag set for 928 threads; fusedResidualNorm launches ceil(D / 4) rounded to 32 (1024 at D 3969..4096) with no probe (no served Gemma 4 width reaches it: 2816 launches 704)" };
 
+// ── GroupNorm + SiLU, two passes (`gn.groupNormSilu`) ──
+
+const gn_stats_launch: metal.Launch = .{ .name = "msv_group_norm_stats", .inputs = &.{ "X", "PV" }, .outputs = &.{"OP"}, .source = gn.STATS_SOURCE, .tg_bytes = 2048, .m1 = 1024, .m2 = 1024 };
+const gn_silu_launch: metal.Launch = .{ .name = "msv_group_norm_silu", .inputs = &.{ "X", "ST", "W", "BI" }, .outputs = &.{"O"}, .source = gn.SILU_SOURCE, .tg_bytes = 0, .m1 = 1024, .m2 = 1024 };
+
+/// x [1, P, 1, C] (bf16) in 32 groups: pass 1's per-chunk sums of x - pivot and their squares [1, chunks, 32, 2], or
+/// pass 2's silu((x - mean) * rstd * w + b) given each group's mean and rstd. `rows` is P (pixels), `k` is C.
+const Gn = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch,
+    pass: enum { stats, silu },
+    dt: mlx.mlx_dtype = .bfloat16,
+    shape: Shape = undefined,
+    arena: std.heap.ArenaAllocator,
+    x: []f64 = &.{},
+    pv: []f64 = &.{},
+    st: []f64 = &.{},
+    w: []f64 = &.{},
+    b: []f64 = &.{},
+    args: [4]mlx.mlx_array = undefined,
+
+    const G = 32;
+
+    fn init(a: std.mem.Allocator, pass: @FieldType(Gn, "pass")) Gn {
+        return .{ .rig = metal.Rig.init(a), .launch = if (pass == .stats) &gn_stats_launch else &gn_silu_launch, .pass = pass, .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Gn) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    fn chunks(shape: Shape) usize {
+        const pix: usize = @intCast(gn.PIX);
+        return (shape.rows + pix - 1) / pix;
+    }
+
+    pub fn geometry(self: *const Gn, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.k % (4 * G) != 0 or shape.k > 1024) return null;
+        const p: c_int = @intCast(shape.rows);
+        const c: c_int = @intCast(shape.k);
+        var g: metal.Geometry = undefined;
+        if (self.pass == .stats) {
+            const nch: c_int = @intCast(chunks(shape));
+            g = .{ .grid = .{ nch * 256, 1, 1 }, .tg = .{ 256, 1, 1 } };
+            g.out(&.{ 1, nch, G, 2 }, .float32);
+            g.dtype("T", self.dt);
+            g.int("GROUPS", G);
+            g.int("PIX", gn.PIX);
+        } else {
+            g = .{ .grid = .{ @divExact(p * c, 4), 1, 1 }, .tg = .{ 256, 1, 1 } };
+            g.out(&.{ 1, p, 1, c }, self.dt);
+            g.dtype("T", self.dt);
+            g.dtype("OT", self.dt);
+            g.int("GROUPS", G);
+        }
+        return g;
+    }
+
+    pub fn prepare(self: *Gn, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const p = shape.rows;
+        const c = shape.k;
+        self.x = try host.uniform(a, rng, p * c, 26, 34, self.dt);
+        self.pv = try a.alloc(f64, G);
+        for (self.pv, 0..) |*v, g| v.* = self.x[g * (c / G)];
+        self.st = try a.alloc(f64, 2 * G);
+        for (0..G) |g| {
+            self.st[2 * g] = spec.roundTo(.f32, 30 + rng.float(f64) * 0.5);
+            self.st[2 * g + 1] = spec.roundTo(.f32, 0.3 + rng.float(f64));
+        }
+        self.w = try host.uniform(a, rng, c, -2, 2, .float32);
+        self.b = try host.uniform(a, rng, c, -1, 1, .float32);
+        switch (fill) {
+            .random => {},
+            .nonfinite => host.plant(self.x, p, c),
+            .stress => {
+                // Gate 4 (4 pixels): integers 1..256 above each group's first value 0, its pivot. Exact in bf16 and
+                // every sum exact in fp32; past fp16's and bf16's integers, and fp16's range for the squares.
+                for (self.x) |*v| v.* = @floatFromInt(1 + rng.uintLessThan(u32, 256));
+                for (self.pv, 0..) |*v, g| {
+                    self.x[g * (c / G)] = 0;
+                    v.* = 0;
+                }
+            },
+        }
+        self.rig.reset();
+        const pi: c_int = @intCast(p);
+        const ci: c_int = @intCast(c);
+        self.args[0] = try self.rig.input(self.dt, &.{ 1, pi, 1, ci }, self.x);
+        if (self.pass == .stats) {
+            self.args[1] = try self.rig.input(.float32, &.{ 1, G }, self.pv);
+        } else {
+            self.args[1] = try self.rig.input(.float32, &.{ 1, G, 2 }, self.st);
+            self.args[2] = try self.rig.input(.float32, &.{ci}, self.w);
+            self.args[3] = try self.rig.input(.float32, &.{ci}, self.b);
+        }
+        return true;
+    }
+
+    pub fn run(self: *Gn) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..if (self.pass == .stats) 2 else 4]);
+    }
+
+    pub fn count(self: *const Gn) usize {
+        return if (self.pass == .stats) chunks(self.shape) * G * 2 else self.shape.rows * self.shape.k;
+    }
+
+    /// Pass 1: the chunk's sums in `acc` and `order` (null: float64), |terms| summed for `mag`. Pass 2: the affine's
+    /// and the SiLU's exact values.
+    fn outputsIn(self: *const Gn, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
+        const c = self.shape.k;
+        const cg = c / G;
+        if (self.pass == .silu) {
+            for (self.x, 0..) |x, i| {
+                const ch = i % c;
+                const g = ch / cg;
+                const lin = (x - self.st[2 * g]) * self.st[2 * g + 1] * self.w[ch];
+                const y = lin + self.b[ch];
+                want[i] = y / (1 + @exp(-y));
+                if (mag) |m| m[i] = @abs(lin) + @abs(self.b[ch]) + @abs(want[i]);
+            }
+            return;
+        }
+        const al = self.arena.child_allocator;
+        const pix: usize = @intCast(gn.PIX);
+        const terms = try al.alloc(f64, pix * cg);
+        defer al.free(terms);
+        const sq = try al.alloc(f64, pix * cg);
+        defer al.free(sq);
+        for (0..chunks(self.shape)) |ch| for (0..G) |g| {
+            const p0 = ch * pix;
+            const p1 = @min(self.shape.rows, p0 + pix);
+            var n: usize = 0;
+            var abs: f64 = 0;
+            for (p0..p1) |px| for (0..cg) |j| {
+                const d = spec.roundTo(.f32, self.x[px * c + g * cg + j] - self.pv[g]);
+                terms[n] = d;
+                sq[n] = spec.roundTo(.f32, d * d);
+                abs += @abs(d);
+                n += 1;
+            };
+            const at = (ch * G + g) * 2;
+            want[at] = if (acc) |ac| spec.sumIn(ac, order, terms[0..n]) else sumF64(terms[0..n]);
+            want[at + 1] = if (acc) |ac| spec.sumIn(ac, order, sq[0..n]) else sumF64(sq[0..n]);
+            if (mag) |m| {
+                m[at] = abs;
+                m[at + 1] = @abs(want[at + 1]);
+            }
+        };
+    }
+
+    pub fn reference(self: *const Gn, want: []f64, mag: []f64) !void {
+        try self.outputsIn(want, mag, null, .sequential);
+    }
+
+    pub fn simulate(self: *const Gn, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.outputsIn(out, null, acc, order);
+    }
+
+    /// The shipped pass on the same inputs.
+    fn wrapper(self: *Gn) ![]const u8 {
+        var g = ops.Graph.init(self.rig.a, self.rig.stream());
+        defer g.deinit();
+        const y = if (self.pass == .stats)
+            try gn.statsPass(&g, self.args[0], self.args[1], G)
+        else
+            try gn.siluPass(&g, self.args[0], self.args[1], self.args[2], self.args[3], G, self.dt);
+        return self.rig.bytesOf(&.{y});
+    }
+};
+
+fn gnDepth(shape: Shape) usize {
+    return @min(shape.rows, @as(usize, @intCast(gn.PIX))) * (shape.k / Gn.G);
+}
+
+fn noDepth(_: Shape) usize {
+    return 0;
+}
+
 pub fn register(set: *kc.Set) !void {
     const a = set.a;
+    try set.add(Gn, .init(a, .stats), .{
+        .name = "group_norm_stats bf16 (32 groups: per-chunk sums about the pivot)",
+        .accum = .f32,
+        .depth = gnDepth,
+        // The pivot's subtraction and the square.
+        .ops = 2,
+        .out = .f32,
+        .tiles = .{ .{ .size = 1024, .step = 1024 }, .{}, .{} },
+        .served = &.{ .{ .rows = 2100, .n = 32, .k = 128 }, .{ .rows = 300, .n = 32, .k = 512 } },
+        .sums = .{ .f16 = 1, .bf16 = 1 },
+    }, null);
+    try set.add(Gn, .init(a, .silu), .{
+        .name = "group_norm_silu bf16 (32 groups: affine, then SiLU)",
+        .accum = .none,
+        .depth = noDepth,
+        // The difference, rstd's and the weight's products, the bias's sum, exp (2 ulp), its sum and the division.
+        .ops = 8,
+        .out = .bf16,
+        .served = &.{ .{ .rows = 300, .n = 32, .k = 128 }, .{ .rows = 77, .n = 32, .k = 512 } },
+    }, null);
     try set.add(Norm, .init(a, &plain_bf16, .plain, .bfloat16), normSpec("add_norm bf16", .bf16, chain_add, 1, 4096, add_shapes, looped_probe), null);
     try set.add(Norm, .init(a, &plain_f16, .plain, .float16), normSpec("add_norm f16", .f16, chain_add, 1, 4096, add_shapes, looped_probe), null);
     try set.add(Norm, .init(a, &moe_bf16, .moe, .bfloat16), normSpec("moe_combine_add_norm bf16 (K 8, shared)", .bf16, "multiply -> sum f32 -> astype -> add shared -> " ++ chain_add, 1, 4096, moe_shapes, null), null);
@@ -569,6 +776,15 @@ test "kernel contract norms: each declared launch is the shipped wrapper's, byte
     defer set.deinit();
     try register(&set);
     for (set.kernels.items) |k| {
+        if (std.mem.startsWith(u8, k.spec.name, "group_norm")) {
+            const t: *Gn = @ptrCast(@alignCast(k.ctx));
+            try std.testing.expect(try t.prepare(k.spec.served[0], .random, 7));
+            try t.run();
+            const ours = try a.dupe(u8, t.rig.outputBytes());
+            defer a.free(ours);
+            try std.testing.expectEqualSlices(u8, try t.wrapper(), ours);
+            continue;
+        }
         const n: *Norm = @ptrCast(@alignCast(k.ctx));
         try std.testing.expect(try n.prepare(k.spec.served[0], .random, 7));
         try n.run();

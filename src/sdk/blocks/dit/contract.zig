@@ -491,8 +491,6 @@ const vprep_launch = metal.Launch{ .name = "msv_i8attn_vprep", .inputs = &.{ "v"
 const VPrep = struct {
     rig: metal.Rig,
     launch: *const metal.Launch = &vprep_launch,
-    /// The head width.
-    d: usize,
     dt: mlx.mlx_dtype = .bfloat16,
     shape: Shape = undefined,
     v: []f64 = &.{},
@@ -500,8 +498,8 @@ const VPrep = struct {
     args: [2]mlx.mlx_array = undefined,
     msg: [256]u8 = undefined,
 
-    fn init(a: std.mem.Allocator, d: usize) VPrep {
-        return .{ .rig = metal.Rig.init(a), .d = d };
+    fn init(a: std.mem.Allocator) VPrep {
+        return .{ .rig = metal.Rig.init(a) };
     }
 
     pub fn deinit(self: *VPrep) void {
@@ -515,9 +513,8 @@ const VPrep = struct {
         if (shape.rows == 0 or shape.n == 0) return null;
         const items: c_int = @intCast(shape.n * shape.rows);
         var g = metal.Geometry{ .grid = .{ 256 * @divTrunc(items + 7, 8), 1, 1 }, .tg = .{ 256, 1, 1 } };
-        g.out(&.{ @intCast(shape.n), @intCast(shape.rows), @intCast(self.d) }, .int8);
+        g.out(&.{ @intCast(shape.n), @intCast(shape.rows), 128 }, .int8);
         g.dtype("T", self.dt);
-        g.int("D", self.d);
         return g;
     }
 
@@ -529,24 +526,23 @@ const VPrep = struct {
         a.free(self.vm);
         self.v = &.{};
         self.vm = &.{};
-        const d = self.d;
-        self.v = try a.alloc(f64, shape.n * shape.rows * d);
-        self.vm = try a.alloc(f64, shape.n * d);
+        self.v = try a.alloc(f64, shape.n * shape.rows * 128);
+        self.vm = try a.alloc(f64, shape.n * 128);
         var prng = std.Random.DefaultPrng.init(seed);
         host.uniformInto(prng.random(), self.v, -4, 4, self.dt);
-        if (fill == .nonfinite) plant(self.v, shape.n * shape.rows, d, .{ 3, 5, 7, 9 });
+        if (fill == .nonfinite) plant(self.v, shape.n * shape.rows, 128, .{ 3, 5, 7, 9 });
         // The channel max |v| as the wrapper's MLX max forms it (a NaN stays NaN).
-        for (0..shape.n) |h| for (0..d) |c| {
+        for (0..shape.n) |h| for (0..128) |c| {
             var m: f64 = 0;
             for (0..shape.rows) |t| {
-                const x = @abs(self.v[(h * shape.rows + t) * d + c]);
+                const x = @abs(self.v[(h * shape.rows + t) * 128 + c]);
                 m = if (std.math.isNan(x) or std.math.isNan(m)) std.math.nan(f64) else @max(m, x);
             }
-            self.vm[h * d + c] = m;
+            self.vm[h * 128 + c] = m;
         };
         self.rig.reset();
-        self.args[0] = try self.rig.input(self.dt, &.{ 1, @intCast(shape.n), @intCast(shape.rows), @intCast(d) }, self.v);
-        self.args[1] = try self.rig.input(.float32, &.{ 1, @intCast(shape.n), @intCast(d) }, self.vm);
+        self.args[0] = try self.rig.input(self.dt, &.{ 1, @intCast(shape.n), @intCast(shape.rows), 128 }, self.v);
+        self.args[1] = try self.rig.input(.float32, &.{ 1, @intCast(shape.n), 128 }, self.vm);
         return true;
     }
 
@@ -568,7 +564,7 @@ const VPrep = struct {
         const out = self.rig.outputBytes();
         var skipped: usize = 0;
         for (self.v, 0..) |x, i| {
-            const vm = self.vm[(i / (self.shape.rows * self.d)) * self.d + i % self.d];
+            const vm = self.vm[(i / (self.shape.rows * 128)) * 128 + i % 128];
             if (!std.math.isFinite(x) or !std.math.isFinite(vm)) {
                 skipped += 1;
                 continue;
@@ -588,11 +584,10 @@ const VPrep = struct {
 
 // ── int8 attention (NAX) ──
 
-const attn_launch = metal.Launch{ .name = "msv_i8attn", .inputs = &.{ "qi", "qs", "ki", "ks", "vi", "vm", "scale", "kbias" }, .outputs = &.{"o"}, .source = ia.ATTN_SOURCE, .header = ia.HEADER, .tg_bytes = 0, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
+const attn_launch = metal.Launch{ .name = "msv_i8attn", .inputs = &.{ "qi", "qs", "ki", "ks", "vi", "vm", "scale" }, .outputs = &.{"o"}, .source = ia.ATTN_SOURCE, .header = ia.HEADER, .tg_bytes = 0, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
 
-/// Softmax(q k^T * scale + key bias) v over int8 codes: q [1, H, LQ, D] with one scale a row, k [1, KV, L, D] with
-/// one a 32-key block, v [KV, L, D] with one a channel (`vm` / 127). Shape: rows LQ, k L; heads, D and the bias fixed
-/// per registration.
+/// Softmax(q k^T * scale) v over int8 codes: q [1, H, LQ, 128] with one scale a row, k [1, KV, L, 128] with one a
+/// 32-key block, v [KV, L, 128] with one a channel (`vm` / 127). Shape: rows LQ, k L; heads fixed per registration.
 const Attn = struct {
     rig: metal.Rig,
     launch: *const metal.Launch = &attn_launch,
@@ -600,10 +595,6 @@ const Attn = struct {
     kv: usize,
     /// Gate 1 also plants a NaN channel max (the registration carrying that finding).
     nan_channel: bool,
-    d: usize,
-    /// A per-key base-2 bias added to the scores (Idol's collapsed image tokens).
-    bias: bool,
-    kb: []f64 = &.{},
     dt: mlx.mlx_dtype = .bfloat16,
     shape: Shape = undefined,
     scale: f64 = 0,
@@ -613,47 +604,19 @@ const Attn = struct {
     ks: []f64 = &.{},
     vi: []f64 = &.{},
     vm: []f64 = &.{},
-    args: [8]mlx.mlx_array = undefined,
+    args: [7]mlx.mlx_array = undefined,
     msg: [256]u8 = undefined,
 
     const BK = 32;
 
-    fn init(a: std.mem.Allocator, heads: usize, kv: usize, nan_channel: bool, d: usize, bias: bool) Attn {
-        return .{ .rig = metal.Rig.init(a), .heads = heads, .kv = kv, .nan_channel = nan_channel, .d = d, .bias = bias };
+    fn init(a: std.mem.Allocator, heads: usize, kv: usize, nan_channel: bool) Attn {
+        return .{ .rig = metal.Rig.init(a), .heads = heads, .kv = kv, .nan_channel = nan_channel };
     }
 
     pub fn deinit(self: *Attn) void {
         const a = self.rig.a;
         self.rig.deinit();
-        for ([_][]f64{ self.qi, self.qs, self.ki, self.ks, self.vi, self.vm, self.kb }) |v| a.free(v);
-    }
-
-    /// The per-key bias: a few keys raised by up to 2^12 (as a collapsed run of 4101 keys is), one lowered.
-    fn fillBias(self: *Attn, l: usize) void {
-        @memset(self.kb, 0);
-        if (!self.bias) return;
-        self.kb[l / 2] = 12.0;
-        self.kb[l / 2 + 1] = 3.5;
-        self.kb[l - 1] = -6.0;
-        self.kb[0] = 1.25;
-    }
-
-    /// Binds the codes, scales and bias in the kernel's input order.
-    fn bind(self: *Attn) !void {
-        const lq = self.shape.rows;
-        const l = self.shape.k;
-        const h: c_int = @intCast(self.heads);
-        const kvh: c_int = @intCast(self.kv);
-        const d: c_int = @intCast(self.d);
-        self.rig.reset();
-        self.args[0] = try self.rig.input(.int8, &.{ 1, h, @intCast(lq), d }, self.qi);
-        self.args[1] = try self.rig.input(.float32, &.{@intCast(self.qs.len)}, self.qs);
-        self.args[2] = try self.rig.input(.int8, &.{ 1, kvh, @intCast(l), d }, self.ki);
-        self.args[3] = try self.rig.input(.float32, &.{@intCast(self.ks.len)}, self.ks);
-        self.args[4] = try self.rig.input(.int8, &.{ kvh, @intCast(l), d }, self.vi);
-        self.args[5] = try self.rig.input(.float32, &.{ 1, kvh, d }, self.vm);
-        self.args[6] = try self.rig.scalar(@floatCast(self.scale));
-        self.args[7] = if (self.bias) try self.rig.input(.float32, &.{@intCast(l)}, self.kb) else self.args[1];
+        for ([_][]f64{ self.qi, self.qs, self.ki, self.ks, self.vi, self.vm }) |v| a.free(v);
     }
 
     fn nb(l: usize) usize {
@@ -664,10 +627,8 @@ const Attn = struct {
         if (shape.rows == 0 or shape.k < BK) return null;
         const lq: c_int = @intCast(shape.rows);
         var g = metal.Geometry{ .grid = .{ @divTrunc(lq + 63, 64) * 128, @intCast(self.heads), 1 }, .tg = .{ 128, 1, 1 } };
-        g.out(&.{ lq, @intCast(self.heads * self.d) }, self.dt);
+        g.out(&.{ lq, @intCast(self.heads * 128) }, self.dt);
         g.dtype("T", self.dt);
-        g.int("D", self.d);
-        g.flag("HAS_BIAS", self.bias);
         return g;
     }
 
@@ -678,8 +639,7 @@ const Attn = struct {
         self.shape = shape;
         const lq = shape.rows;
         const l = shape.k;
-        const d = self.d;
-        for ([_]*[]f64{ &self.qi, &self.qs, &self.ki, &self.ks, &self.vi, &self.vm, &self.kb }, [_]usize{ self.heads * lq * d, self.heads * lq, self.kv * l * d, self.kv * nb(l), self.kv * l * d, self.kv * d, l }) |p, len| {
+        for ([_]*[]f64{ &self.qi, &self.qs, &self.ki, &self.ks, &self.vi, &self.vm }, [_]usize{ self.heads * lq * 128, self.heads * lq, self.kv * l * 128, self.kv * nb(l), self.kv * l * 128, self.kv * 128 }) |p, len| {
             a.free(p.*);
             p.* = &.{};
             p.* = try a.alloc(f64, len);
@@ -692,15 +652,23 @@ const Attn = struct {
         host.uniformInto(rng, self.qs, 0.001, 0.004, .float32);
         host.uniformInto(rng, self.ks, 0.001, 0.004, .float32);
         host.uniformInto(rng, self.vm, 0.5, 4, .float32);
-        self.scale = spec.roundTo(.f32, 1.0 / @sqrt(@as(f64, @floatFromInt(d))) * std.math.log2e);
-        self.fillBias(l);
+        self.scale = spec.roundTo(.f32, 1.0 / @sqrt(128.0) * std.math.log2e);
         if (fill == .nonfinite) {
             // The float inputs: one row's q scale, one channel's max (Inf; NaN when asked).
             self.qs[0] = std.math.nan(f64);
             self.vm[9] = std.math.inf(f64);
             if (self.nan_channel) self.vm[5] = std.math.nan(f64);
         }
-        try self.bind();
+        self.rig.reset();
+        const h: c_int = @intCast(self.heads);
+        const kvh: c_int = @intCast(self.kv);
+        self.args[0] = try self.rig.input(.int8, &.{ 1, h, @intCast(lq), 128 }, self.qi);
+        self.args[1] = try self.rig.input(.float32, &.{@intCast(self.qs.len)}, self.qs);
+        self.args[2] = try self.rig.input(.int8, &.{ 1, kvh, @intCast(l), 128 }, self.ki);
+        self.args[3] = try self.rig.input(.float32, &.{@intCast(self.ks.len)}, self.ks);
+        self.args[4] = try self.rig.input(.int8, &.{ kvh, @intCast(l), 128 }, self.vi);
+        self.args[5] = try self.rig.input(.float32, &.{ 1, kvh, 128 }, self.vm);
+        self.args[6] = try self.rig.scalar(@floatCast(self.scale));
         return true;
     }
 
@@ -709,7 +677,7 @@ const Attn = struct {
     }
 
     pub fn count(self: *const Attn) usize {
-        return self.shape.rows * self.heads * self.d;
+        return self.shape.rows * self.heads * 128;
     }
 
     /// Exact attention over the dequantized codes (base-2 logits: `scale` carries log2 e), and each output's
@@ -725,16 +693,15 @@ const Attn = struct {
         defer a.free(wgt);
         const fb = try a.alloc(f64, nb(l));
         defer a.free(fb);
-        const d = self.d;
         for (0..self.heads) |h| {
             const kvh = h / (self.heads / self.kv);
             for (0..lq) |r| {
-                const qrow = self.qi[(h * lq + r) * d ..][0..d];
+                const qrow = self.qi[(h * lq + r) * 128 ..][0..128];
                 const c0 = self.qs[h * lq + r] * self.scale;
                 var m = -std.math.inf(f64);
                 for (s, 0..) |*o, j| {
-                    const dot = host.dot(qrow, self.ki[(kvh * l + j) * d ..][0..d])[0];
-                    o.* = dot * c0 * self.ks[kvh * nb(l) + j / BK] + self.kb[j];
+                    const dot = host.dot(qrow, self.ki[(kvh * l + j) * 128 ..][0..128])[0];
+                    o.* = dot * c0 * self.ks[kvh * nb(l) + j / BK];
                     m = @max(m, o.*);
                 }
                 // A block's weight relative to the row max: 2^(block max - row max).
@@ -748,17 +715,17 @@ const Attn = struct {
                     w.* = std.math.exp2(x - m);
                     den += w.*;
                 }
-                for (0..d) |c| {
-                    const vc = self.vm[kvh * d + c] / 127;
+                for (0..128) |c| {
+                    const vc = self.vm[kvh * 128 + c] / 127;
                     var num: f64 = 0;
-                    for (wgt, 0..) |w, j| num += w * self.vi[(kvh * l + j) * d + c];
+                    for (wgt, 0..) |w, j| num += w * self.vi[(kvh * l + j) * 128 + c];
                     const o = num * vc / den;
-                    const i = (r * self.heads + h) * d + c;
+                    const i = (r * self.heads + h) * 128 + c;
                     want[i] = o;
                     var spread: f64 = 0;
                     var mag: f64 = 0;
                     for (0..l) |j| {
-                        const v = self.vi[(kvh * l + j) * d + c] * vc;
+                        const v = self.vi[(kvh * l + j) * 128 + c] * vc;
                         spread += fb[j / BK] * @abs(v - o);
                         mag += wgt[j] * @abs(v);
                     }
@@ -797,19 +764,16 @@ const Attn = struct {
         const rng = prng.random();
         const lq = self.shape.rows;
         const l = self.shape.k;
-        const d = self.d;
-        const di: c_int = @intCast(d);
-        var vals = try a.alloc(f64, (self.heads * lq + 2 * self.kv * l) * d);
+        var vals = try a.alloc(f64, (self.heads * lq + 2 * self.kv * l) * 128);
         defer a.free(vals);
         host.uniformInto(rng, vals, -2, 2, .bfloat16);
         var scratch = metal.Rig.init(a);
         defer scratch.deinit();
-        const q = try scratch.input(.bfloat16, &.{ 1, @intCast(self.heads), @intCast(lq), di }, vals[0 .. self.heads * lq * d]);
-        const k = try scratch.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), di }, vals[self.heads * lq * d ..][0 .. self.kv * l * d]);
-        const v = try scratch.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), di }, vals[(self.heads * lq + self.kv * l) * d ..]);
-        const sc: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
-        const kbias: ?mlx.mlx_array = if (self.bias) try scratch.input(.float32, &.{@intCast(l)}, self.kb) else null;
-        const theirs_arr = (try ia.attention(q, k, v, sc, kbias, s)) orelse return error.Declined;
+        const q = try scratch.input(.bfloat16, &.{ 1, @intCast(self.heads), @intCast(lq), 128 }, vals[0 .. self.heads * lq * 128]);
+        const k = try scratch.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), 128 }, vals[self.heads * lq * 128 ..][0 .. self.kv * l * 128]);
+        const v = try scratch.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), 128 }, vals[(self.heads * lq + self.kv * l) * 128 ..]);
+        const sc: f32 = 1.0 / @sqrt(128.0);
+        const theirs_arr = (try ia.attention(q, k, v, sc, s)) orelse return error.Declined;
         defer _ = mlx.mlx_array_free(theirs_arr);
         const theirs = try a.dupe(u8, try scratch.bytesOf(&.{theirs_arr}));
         errdefer a.free(theirs);
@@ -822,20 +786,20 @@ const Attn = struct {
         defer for (kp) |x| {
             _ = mlx.mlx_array_free(x);
         };
-        var vp = VPrep.init(a, d);
+        var vp = VPrep.init(a);
         defer vp.deinit();
-        vp.shape = .{ .rows = l, .n = self.kv, .k = d };
+        vp.shape = .{ .rows = l, .n = self.kv, .k = 128 };
         const vhost = try host.read(a, v, s);
         defer a.free(vhost);
         vp.v = try a.dupe(f64, vhost);
-        vp.vm = try a.alloc(f64, self.kv * d);
-        for (0..self.kv) |hh| for (0..d) |c| {
+        vp.vm = try a.alloc(f64, self.kv * 128);
+        for (0..self.kv) |hh| for (0..128) |c| {
             var m: f64 = 0;
-            for (0..l) |t| m = @max(m, @abs(vhost[(hh * l + t) * d + c]));
-            vp.vm[hh * d + c] = m;
+            for (0..l) |t| m = @max(m, @abs(vhost[(hh * l + t) * 128 + c]));
+            vp.vm[hh * 128 + c] = m;
         };
-        vp.args[0] = try vp.rig.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), di }, vp.v);
-        vp.args[1] = try vp.rig.input(.float32, &.{ 1, @intCast(self.kv), di }, vp.vm);
+        vp.args[0] = try vp.rig.input(.bfloat16, &.{ 1, @intCast(self.kv), @intCast(l), 128 }, vp.v);
+        vp.args[1] = try vp.rig.input(.float32, &.{ 1, @intCast(self.kv), 128 }, vp.vm);
         try vp.run();
         const vi = try host.read(a, vp.rig.output(0), s);
         defer a.free(vi);
@@ -851,7 +815,16 @@ const Attn = struct {
         self.vm = &.{};
         self.vm = try a.dupe(f64, vp.vm);
         self.scale = sc * std.math.log2e;
-        try self.bind();
+        self.rig.reset();
+        const h: c_int = @intCast(self.heads);
+        const kvh: c_int = @intCast(self.kv);
+        self.args[0] = try self.rig.input(.int8, &.{ 1, h, @intCast(lq), 128 }, self.qi);
+        self.args[1] = try self.rig.input(.float32, &.{@intCast(self.qs.len)}, self.qs);
+        self.args[2] = try self.rig.input(.int8, &.{ 1, kvh, @intCast(l), 128 }, self.ki);
+        self.args[3] = try self.rig.input(.float32, &.{@intCast(self.ks.len)}, self.ks);
+        self.args[4] = try self.rig.input(.int8, &.{ kvh, @intCast(l), 128 }, self.vi);
+        self.args[5] = try self.rig.input(.float32, &.{ 1, kvh, 128 }, self.vm);
+        self.args[6] = try self.rig.scalar(@floatCast(self.scale));
         try self.run();
         return .{ try a.dupe(u8, self.rig.outputBytes()), theirs };
     }
@@ -1151,21 +1124,16 @@ pub fn register(set: *kc.Set) !void {
     const nax_served: []const Shape = &.{ .{ .rows = 200, .n = 4, .k = 256 }, .{ .rows = 333, .n = 2, .k = 256 } };
     try set.add(Quant, .init(a, &quant_strided, 64, 256, false, false, false, 1e-6), quantSpec("int8_attn_quant bf16 (strided q: 64 rows, D 256, multiply)", 64, nax_served, scale_drops_nan), null);
     try set.add(Quant, .init(a, &quant_strided, 32, 256, true, false, false, 1e-6), quantSpec("int8_attn_quant bf16 (strided k: 32 rows less the mean, D 256, multiply)", 32, nax_served, scale_drops_nan), null);
-    const qkv64_served: []const Shape = &.{ .{ .rows = 1024, .n = 4, .k = 64 }, .{ .rows = 333, .n = 2, .k = 64 } };
-    try set.add(Quant, .init(a, &quant_contig, 1, 64, false, true, true, 1e-20), quantSpec("int8_attn_quant bf16 (q rows: 1 row, D 64, divide)", 1, qkv64_served, scale_drops_nan), null);
-    try set.add(Quant, .init(a, &quant_contig, 32, 64, true, true, true, 1e-20), quantSpec("int8_attn_quant bf16 (k blocks: 32 rows less the mean, D 64, divide)", 32, qkv64_served, scale_drops_nan), null);
-    inline for (.{ 128, 64 }) |d| try set.add(VPrep, .init(a, d), .{
-        .name = std.fmt.comptimePrint("int8_attn_vprep bf16 (D {d})", .{d}),
+    try set.add(VPrep, .init(a), .{
+        .name = "int8_attn_vprep bf16",
         .accum = .none,
         .depth = zero,
         .out = .f32,
         .nan = .{ .stated = "codes exist where v and its channel max are finite" },
-        .served = &.{ .{ .rows = 1024, .n = 4, .k = d }, .{ .rows = 333, .n = 2, .k = d } },
+        .served = &.{ .{ .rows = 1024, .n = 4, .k = 128 }, .{ .rows = 333, .n = 2, .k = 128 } },
     }, null);
-    try set.add(Attn, .init(a, 8, 8, true, 128, false), attnSpec("int8_attn bf16 (NAX; 8 heads)", attn_drops_nan), null);
-    try set.add(Attn, .init(a, 2, 1, false, 128, false), attnSpec("int8_attn bf16 (NAX; 2 heads over 1 kv head)", null), null);
-    try set.add(Attn, .init(a, 8, 8, true, 64, false), attnSpec("int8_attn bf16 (NAX; 8 heads, D 64)", attn_drops_nan), null);
-    try set.add(Attn, .init(a, 8, 8, true, 64, true), attnSpec("int8_attn bf16 (NAX; 8 heads, D 64, key bias)", attn_drops_nan), null);
+    try set.add(Attn, .init(a, 8, 8, true), attnSpec("int8_attn bf16 (NAX; 8 heads)", attn_drops_nan), null);
+    try set.add(Attn, .init(a, 2, 1, false), attnSpec("int8_attn bf16 (NAX; 2 heads over 1 kv head)", null), null);
     try set.add(Rq, .init(a), rqSpec("w8a8_rq bf16", scale_drops_nan), null);
     try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; BM 128)", false, &.{ .{ .rows = 129, .n = 256, .k = 3072 }, .{ .rows = 300, .n = 320, .k = 512 } }), null);
     try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; BM 64 past 8192 rows)", false, &.{.{ .rows = 8200, .n = 128, .k = 256 }}), null);

@@ -32,6 +32,8 @@ const Resnet = resnet_blk.Resnet;
 
 /// The VAE's GroupNorm: 32 groups, f32 statistics, bf16 out.
 const vae_norm: resnet_blk.Norm = .{ .flat = .{ .eps = 1e-6, .out = .bfloat16 } };
+/// The encoder's: a 1024 image's top stages are 128 channels at full resolution, where the norm's op chain moved ~10 GB.
+const vae_enc_norm: resnet_blk.Norm = .{ .flat = .{ .eps = 1e-6, .out = .bfloat16, .fused = true } };
 
 // ── Weight loading ──
 
@@ -689,7 +691,7 @@ fn attention(parent: *Graph, q: Array, k: Array, v: Array, ctx: StepCtx) !Array 
     const kr = try rope_blk.ropePairs(&g, k, ctx.cos, ctx.sin, .bfloat16);
     const out_sh = [_]c_int{ 1, ctx.nj, ctx.heads * ctx.hd };
     const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(ctx.hd)));
-    if (w8a8.w8a8State().enabled) if (try int8_attn.attention(qr, kr, v, scale, null, g.s)) |o|
+    if (w8a8.w8a8State().enabled) if (try int8_attn.attention(qr, kr, v, scale, g.s)) |o|
         return parent.keep(try g.reshape(try g.adopt(o), &out_sh));
     const at = try g.transpose(try g.sdpa(qr, kr, v, scale, .none), &.{ 0, 2, 1, 3 });
     return parent.keep(try g.reshape(at, &out_sh));
@@ -1134,13 +1136,13 @@ pub const VaeEncoder = struct {
         var h = try g.astype(try g.transpose(signed, &.{ 0, 2, 3, 1 }), .bfloat16);
         try endStage(&g, &c, &h, try conv_blk.conv2d(&c, h, self.conv_in_w, self.conv_in_b, 1, 1, 1));
         for (0..4) |bi| {
-            for (&self.down_resnets[bi]) |*r| try endStage(&g, &c, &h, try r.forward(&c, vae_norm, h));
+            for (&self.down_resnets[bi]) |*r| try endStage(&g, &c, &h, try r.forward(&c, vae_enc_norm, h));
             if (bi < 3) try endStage(&g, &c, &h, try conv_blk.downsample2x(&c, h, self.down_conv_w[bi], self.down_conv_b[bi]));
         }
-        try endStage(&g, &c, &h, try self.mid_r0.forward(&c, vae_norm, h));
+        try endStage(&g, &c, &h, try self.mid_r0.forward(&c, vae_enc_norm, h));
         try endStage(&g, &c, &h, try resnet_blk.midAttention(&c, vae_norm, h, self.mid_attn.gnw, self.mid_attn.gnb, &self.mid_attn));
-        try endStage(&g, &c, &h, try self.mid_r1.forward(&c, vae_norm, h));
-        h = try g.silu(try gn_blk.groupNormFlat(&g, h, self.norm_out_w, self.norm_out_b, 32, 1e-6, .bfloat16));
+        try endStage(&g, &c, &h, try self.mid_r1.forward(&c, vae_enc_norm, h));
+        h = try vae_enc_norm.applySilu(&g, h, self.norm_out_w, self.norm_out_b);
         h = try conv_blk.conv2d(&g, h, self.conv_out_w, self.conv_out_b, 1, 1, 1);
         const qc = try conv_blk.conv2d(&g, h, self.quant_w, self.quant_b, 1, 0, 1);
         // The mean is the first 32 channels, the log-variance the next 32.

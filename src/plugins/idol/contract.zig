@@ -7,6 +7,7 @@ const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const L = @import("layers.zig");
 const den = @import("denoiser.zig");
 const glue = @import("glue.zig");
+const w8 = @import("../../sdk/blocks/dit/w8a8.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -467,111 +468,125 @@ const NormMod = struct {
     }
 };
 
-// ── RePo LayerNorm ──
+// ── RePo LayerNorm folded into the gate | content maps ──
 
-const repo_norm_f16: metal.Launch = .{ .name = "msv_idol_repo_norm", .inputs = &.{ "X", "W", "BI", "eps" }, .outputs = &.{"O"}, .source = glue.REPO_NORM_SOURCE, .tg_bytes = 128, .m1 = 1024, .m2 = 1024 };
+const repo_fold_f16: metal.Launch = .{ .name = "msv_idol_repo_fold", .inputs = &.{ "P", "H", "CS", "BW", "eps" }, .outputs = &.{"GC"}, .source = glue.REPO_FOLD_SOURCE, .tg_bytes = 32, .m1 = 1024, .m2 = 1024 };
 
-/// LayerNorm(x) * w + b in f32, x [rows, N] f16, w and b [N] f32: `k` is N. The unsplit arm; the split one is its
-/// output's TF32 halves (`idol: the split RePo norm is its output's TF32 halves`).
-const RepoNorm = struct {
+/// rstd(h) * (P's parts summed - mean(h) * cs) + bw: h [rows, C] f16, P [rows, PARTS * N2] f32, cs and bw [N2] f32.
+/// `n` is N2, `k` is C.
+const RepoFold = struct {
     rig: metal.Rig,
-    launch: *const metal.Launch,
-    dt: mlx.mlx_dtype,
+    launch: *const metal.Launch = &repo_fold_f16,
+    dt: mlx.mlx_dtype = .float16,
+    parts: usize,
     shape: Shape = undefined,
     arena: std.heap.ArenaAllocator,
-    x: []f64 = &.{},
-    w: []f64 = &.{},
-    b: []f64 = &.{},
-    args: [4]mlx.mlx_array = undefined,
+    h: []f64 = &.{},
+    p: []f64 = &.{},
+    cs: []f64 = &.{},
+    bw: []f64 = &.{},
+    args: [5]mlx.mlx_array = undefined,
 
-    fn init(a: std.mem.Allocator, launch: *const metal.Launch, dt: mlx.mlx_dtype) RepoNorm {
-        return .{ .rig = metal.Rig.init(a), .launch = launch, .dt = dt, .arena = .init(a) };
+    fn init(a: std.mem.Allocator, parts: usize) RepoFold {
+        return .{ .rig = metal.Rig.init(a), .parts = parts, .arena = .init(a) };
     }
 
-    pub fn deinit(self: *RepoNorm) void {
+    pub fn deinit(self: *RepoFold) void {
         self.rig.deinit();
         self.arena.deinit();
     }
 
-    pub fn geometry(self: *const RepoNorm, shape: Shape) ?metal.Geometry {
-        _ = self;
+    pub fn geometry(self: *const RepoFold, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.n == 0 or shape.k == 0) return null;
         const rows: c_int = @intCast(shape.rows);
-        const n: c_int = @intCast(shape.k);
-        if (n == 0 or @rem(n, 128) != 0 or n > 4096) return null;
-        var g = metal.Geometry{ .grid = .{ rows * @divExact(n, 4), 1, 1 }, .tg = .{ @divExact(n, 4), 1, 1 } };
-        g.out(&.{ rows, n }, .float32);
-        g.dtype("T", .float16);
-        g.flag("SPLIT", false);
+        var g = metal.Geometry{ .grid = .{ rows * 256, 1, 1 }, .tg = .{ 256, 1, 1 } };
+        g.out(&.{ rows, @intCast(shape.n) }, .float32);
+        g.dtype("T", self.dt);
+        g.int("PARTS", self.parts);
         return g;
     }
 
-    pub fn prepare(self: *RepoNorm, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+    pub fn prepare(self: *RepoFold, shape: Shape, fill: spec.Fill, seed: u64) !bool {
         if (self.geometry(shape) == null) return false;
         self.shape = shape;
         _ = self.arena.reset(.retain_capacity);
         const a = self.arena.allocator();
         var prng = std.Random.DefaultPrng.init(seed);
         const rng = prng.random();
-        const n = shape.k;
-        self.x = try host.uniform(a, rng, shape.rows * n, -3, 5, self.dt);
-        self.w = try host.uniform(a, rng, n, 0.5, 1.5, .float32);
-        self.b = try host.uniform(a, rng, n, -0.5, 0.5, .float32);
+        const n2 = shape.n;
+        const c = shape.k;
+        self.h = try host.uniform(a, rng, shape.rows * c, -3, 5, self.dt);
+        self.p = try host.uniform(a, rng, shape.rows * self.parts * n2, -40, 40, .float32);
+        self.cs = try host.uniform(a, rng, n2, -8, 8, .float32);
+        self.bw = try host.uniform(a, rng, n2, -0.5, 0.5, .float32);
         switch (fill) {
             .random => {},
-            .nonfinite => host.plant(self.x, shape.rows, n),
+            .nonfinite => host.plant(self.h, shape.rows, c),
             .stress => {
-                // Gate 4: integer rows of mean zero (each value beside its negation), so both sums are exact in fp32.
-                for (0..shape.rows) |r| for (0..n / 2) |i| {
+                // Gate 4: integer rows of mean zero (each value beside its negation), so both sums are exact in fp32;
+                // positive parts and no bias leave the steps after them free of cancellation.
+                for (0..shape.rows) |r| for (0..c / 2) |i| {
                     const v: f64 = @floatFromInt(@as(i32, @intCast(rng.uintLessThan(u32, 65))) - 32);
-                    self.x[r * n + 2 * i] = v;
-                    self.x[r * n + 2 * i + 1] = -v;
+                    self.h[r * c + 2 * i] = v;
+                    self.h[r * c + 2 * i + 1] = -v;
                 };
-                @memset(self.w, 1);
-                @memset(self.b, 0);
+                for (self.p) |*v| v.* = @abs(v.*) + 1;
+                @memset(self.bw, 0);
             },
         }
         self.rig.reset();
+        const rows: c_int = @intCast(shape.rows);
         self.args = .{
-            try self.rig.input(self.dt, &.{ @intCast(shape.rows), @intCast(n) }, self.x),
-            try self.rig.input(.float32, &.{@intCast(n)}, self.w),
-            try self.rig.input(.float32, &.{@intCast(n)}, self.b),
+            try self.rig.input(.float32, &.{ rows, @intCast(self.parts * n2) }, self.p),
+            try self.rig.input(self.dt, &.{ rows, @intCast(c) }, self.h),
+            try self.rig.input(.float32, &.{@intCast(n2)}, self.cs),
+            try self.rig.input(.float32, &.{@intCast(n2)}, self.bw),
             try self.rig.scalar(1e-5),
         };
         return true;
     }
 
-    pub fn run(self: *RepoNorm) !void {
+    pub fn run(self: *RepoFold) !void {
         try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
     }
 
-    pub fn count(self: *const RepoNorm) usize {
-        return self.shape.rows * self.shape.k;
+    pub fn count(self: *const RepoFold) usize {
+        return self.shape.rows * self.shape.n;
     }
 
-    fn outputsIn(self: *const RepoNorm, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
-        const n = self.shape.k;
-        const nf: f64 = @floatFromInt(n);
-        const d = try self.arena.child_allocator.alloc(f64, n);
+    /// The statistics' sums in `acc` and `order` (null: float64). `mag` covers the mean's error through cs (its
+    /// sum's error is relative to mean |h|) and the roundings of each term before the cancelling subtraction.
+    fn outputsIn(self: *const RepoFold, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
+        const c = self.shape.k;
+        const n2 = self.shape.n;
+        const cf: f64 = @floatFromInt(c);
+        const d = try self.arena.child_allocator.alloc(f64, c);
         defer self.arena.child_allocator.free(d);
         for (0..self.shape.rows) |r| {
-            const row = self.x[r * n ..][0..n];
-            const mean = (if (acc) |ac| spec.sumIn(ac, order, row) else sumF64(row)) / nf;
-            for (d, row) |*o, v| o.* = (v - mean) * (v - mean);
+            const row = self.h[r * c ..][0..c];
+            const mean = (if (acc) |ac| spec.sumIn(ac, order, row) else sumF64(row)) / cf;
+            var abs: f64 = 0;
+            for (d, row) |*o, v| {
+                o.* = (v - mean) * (v - mean);
+                abs += @abs(v);
+            }
             const ss = if (acc) |ac| spec.sumIn(ac, order, d) else sumF64(d);
-            const inv = 1 / @sqrt(ss / nf + 1e-5);
-            for (0..n) |i| {
-                const scaled = (row[i] - mean) * inv * self.w[i];
-                want[r * n + i] = scaled + self.b[i];
-                if (mag) |m| m[r * n + i] = @max(@abs(want[r * n + i]), @abs(scaled));
+            const inv = 1 / @sqrt(ss / cf + 1e-5);
+            for (0..n2) |k| {
+                const pr = self.p[r * self.parts * n2 ..];
+                const sum = if (self.parts == 2) pr[k] + pr[n2 + k] else pr[k];
+                const at = r * n2 + k;
+                want[at] = inv * (sum - mean * self.cs[k]) + self.bw[k];
+                if (mag) |m| m[at] = inv * (@abs(sum) + (@abs(mean) + abs / cf) * @abs(self.cs[k])) + @abs(self.bw[k]) + @abs(want[at]);
             }
         }
     }
 
-    pub fn reference(self: *const RepoNorm, want: []f64, mag: []f64) !void {
+    pub fn reference(self: *const RepoFold, want: []f64, mag: []f64) !void {
         try self.outputsIn(want, mag, null, .sequential);
     }
 
-    pub fn simulate(self: *const RepoNorm, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+    pub fn simulate(self: *const RepoFold, acc: spec.Accum, order: spec.Order, out: []f64) !void {
         try self.outputsIn(out, null, acc, order);
     }
 };
@@ -720,6 +735,150 @@ const RepoAngles = struct {
 
     pub fn simulate(self: *const RepoAngles, acc: spec.Accum, order: spec.Order, out: []f64) !void {
         try self.outputsIn(out, null, acc, order);
+    }
+};
+
+// ── NAX attention with a key bias (the unconditional pass) ──
+
+const attn_f16: metal.Launch = .{ .name = "msv_idol_attention", .inputs = &.{ "q", "k", "v", "scale", "kbias" }, .outputs = &.{"out"}, .source = glue.ATTN_SOURCE, .header = glue.ATTN_HEADER, .tg_bytes = 0, .m1 = 1024, .m2 = 1024, .offline = false, .min_gen = 17 };
+
+/// softmax(q k^T scale + kbias) v, q k v f16 [1, H, L, 64] and kbias f32 [L] in base 2, out [L, H*64]: `rows` is L,
+/// `n` is H.
+const Attn = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch = &attn_f16,
+    shape: Shape = undefined,
+    arena: std.heap.ArenaAllocator,
+    q: []f64 = &.{},
+    k: []f64 = &.{},
+    v: []f64 = &.{},
+    kb: []f64 = &.{},
+    args: [5]mlx.mlx_array = undefined,
+    msg: [256]u8 = undefined,
+
+    const SCALE: f64 = 0.125;
+
+    fn init(a: std.mem.Allocator) Attn {
+        return .{ .rig = metal.Rig.init(a), .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Attn) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const Attn, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.n == 0) return null;
+        const l: c_int = @intCast(shape.rows);
+        var g = metal.Geometry{ .grid = .{ @divTrunc(l + 63, 64) * 128, @intCast(shape.n), 1 }, .tg = .{ 128, 1, 1 } };
+        g.out(&.{ l, @intCast(shape.n * HD) }, .float16);
+        g.flag("HAS_BIAS", true);
+        return g;
+    }
+
+    pub fn prepare(self: *Attn, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        if (!w8.nax()) return error.NaxOnly;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const n = shape.n * shape.rows * HD;
+        self.q = try host.uniform(a, rng, n, -2, 2, .float16);
+        self.k = try host.uniform(a, rng, n, -2, 2, .float16);
+        self.v = try host.uniform(a, rng, n, -2, 2, .float16);
+        self.kb = try a.alloc(f64, shape.rows);
+        // A few keys raised (as the collapsed image tokens are by up to 2^12), one lowered.
+        for (self.kb, 0..) |*b, j| b.* = if (j % 97 == 3) 12.0 else if (j % 89 == 5) -6.0 else 0.0;
+        if (fill == .nonfinite) {
+            // One query's and one value channel's NaN: that query's row and that channel's column turn NaN.
+            self.q[3 * HD + 5] = std.math.nan(f64);
+            self.v[7 * HD + 9] = std.math.nan(f64);
+        }
+        self.rig.reset();
+        const sh = [_]c_int{ 1, @intCast(shape.n), @intCast(shape.rows), HD };
+        self.args = .{
+            try self.rig.input(.float16, &sh, self.q),
+            try self.rig.input(.float16, &sh, self.k),
+            try self.rig.input(.float16, &sh, self.v),
+            try self.rig.scalar(@floatCast(SCALE)),
+            try self.rig.input(.float32, &.{@intCast(shape.rows)}, self.kb),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Attn) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Attn) usize {
+        return self.shape.rows * self.shape.n * HD;
+    }
+
+    pub fn reference(self: *const Attn, want: []f64, mag: []f64) !void {
+        try self.outputs(want, mag);
+    }
+
+    /// Exact attention (base-2 scores: scale times log2 e plus the bias) and each output's allowance: P rounded to f16
+    /// moves it by 2^-11 of sum p |v|, the scores' 64-term f32 sum and the fast exp2 by their own error through exp.
+    fn outputs(self: *const Attn, want: []f64, allow: []f64) !void {
+        const al = self.arena.child_allocator;
+        const l = self.shape.rows;
+        const h = self.shape.n;
+        const s = try al.alloc(f64, l);
+        defer al.free(s);
+        const se = try al.alloc(f64, l);
+        defer al.free(se);
+        for (0..h) |hh| for (0..l) |r| {
+            const qrow = self.q[(hh * l + r) * HD ..][0..HD];
+            var m = -std.math.inf(f64);
+            for (s, se, 0..) |*o, *e, j| {
+                const kr = self.k[(hh * l + j) * HD ..][0..HD];
+                var dot: f64 = 0;
+                var abs: f64 = 0;
+                for (qrow, kr) |x, y| {
+                    dot += x * y;
+                    abs += @abs(x * y);
+                }
+                o.* = dot * SCALE * std.math.log2e + self.kb[j];
+                e.* = abs * SCALE * std.math.log2e;
+                m = @max(m, o.*);
+            }
+            var total: f64 = 0;
+            var spread: f64 = 0;
+            for (s, se) |x, e| {
+                total += std.math.exp2(x - m);
+                spread = @max(spread, e);
+            }
+            for (0..HD) |c| {
+                var num: f64 = 0;
+                var mag: f64 = 0;
+                for (s, 0..) |x, j| {
+                    const w = std.math.exp2(x - m);
+                    const vv = self.v[(hh * l + j) * HD + c];
+                    num += w * vv;
+                    mag += w * @abs(vv);
+                }
+                const o = num / total;
+                const at = (r * h + hh) * HD + c;
+                want[at] = o;
+                const rel = 0x1p-11 + (spec.gamma(HD + 4, 0x1p-24) * spread + 0x1p-20) * std.math.ln2 * 2 + spec.gamma(@floatFromInt(l + 8), 0x1p-24);
+                const work = rel * (mag / total + @abs(o));
+                allow[at] = work + 0x1p-11 * (@abs(o) + work) + 0x1p-24;
+            }
+        };
+    }
+
+    /// The rule: within the allowance of `outputs`; a NaN in a query or a value reaches the outputs it touches.
+    pub fn check(self: *Attn, at: spec.Gate) !?[]const u8 {
+        const a = self.rig.a;
+        const n = self.count();
+        const buf = try a.alloc(f64, 3 * n);
+        defer a.free(buf);
+        try self.outputs(buf[0..n], buf[n .. 2 * n]);
+        for (buf[2 * n ..], 0..) |*g, i| g.* = spec.read(.f16, self.rig.outputBytes(), i);
+        return host.within(&self.msg, at, buf[2 * n ..], buf[0..n], buf[n .. 2 * n]);
     }
 };
 
@@ -923,16 +1082,15 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 64, .n = 1, .k = 1024 }, .{ .rows = 7, .n = 1, .k = 128 } },
         .sums = .{ .f16 = 1, .bf16 = 1 },
     }, null);
-    try set.add(RepoNorm, .init(a, &repo_norm_f16, .float16), .{
-        .name = "idol repo_norm f16 -> f32 (layer norm with its weight and bias)",
+    inline for (.{ 2, 1 }) |parts| try set.add(RepoFold, .init(a, parts), .{
+        .name = std.fmt.comptimePrint("idol repo_fold f16 -> f32 ({d} part maps: the RePo norm folded into its projection)", .{parts}),
         .accum = .f32,
         .depth = headWidth,
-        // f32 roundings after the sums: the mean, the difference, the variance, + eps, rsqrt (2), the two products
-        // and the bias's sum.
-        .ops = 9,
+        // f32 roundings: the mean, the difference, the variance, + eps, rsqrt (2), the parts' sum, the mean's
+        // product, the subtraction, rstd's product and the bias's sum.
+        .ops = 11,
         .out = .f32,
-        .tiles = .{ .{}, .{}, .{ .size = 128, .step = 128, .min = 128 } },
-        .served = &.{ .{ .rows = 64, .n = 1, .k = 1024 }, .{ .rows = 7, .n = 1, .k = 128 } },
+        .served = &.{ .{ .rows = 64, .n = 256, .k = 1024 }, .{ .rows = 7, .n = 32, .k = 128 } },
         .sums = .{ .f16 = 1, .bf16 = 1 },
     }, null);
     try set.add(RepoAngles, .init(a, &repo_angles_f32), .{
@@ -956,6 +1114,16 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 32, .n = 7, .k = 64 }, .{ .rows = 16, .n = 3, .k = 64 }, .{ .rows = 8, .n = 1, .k = 64 } },
         .sums = .{ .f16 = 0, .bf16 = 0, .why = "four corners of samples within the output's own range: an fp16 sum stays near its rounding" },
     }, null);
+    try set.add(Attn, .init(a), .{
+        .name = "idol attention f16 (NAX, key bias)",
+        .accum = .none,
+        .depth = noDepth,
+        .out = .f16,
+        .nan = .{ .stated = "a NaN query turns its row NaN, a NaN value channel its column" },
+        // 64 query rows a threadgroup, keys in 32-key blocks.
+        .tiles = .{ .{ .size = 64, .min = 1 }, .{}, .{} },
+        .served = &.{ .{ .rows = 300, .n = 2, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
+    }, null);
 }
 
 // ── tests ──
@@ -969,7 +1137,7 @@ test "kernel contract idol: the fused kernels pass gates 1-4" {
     var t: kc.gates.Tally = .{};
     try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
     try std.testing.expectEqual(@as(usize, 0), t.problems());
-    try std.testing.expectEqual(@as(usize, 7), t.passed);
+    try std.testing.expectEqual(@as(usize, 9), t.passed);
 }
 
 test "kernel contract idol: each declared launch is the shipped wrapper's, byte for byte" {
@@ -1013,15 +1181,15 @@ test "kernel contract idol: each declared launch is the shipped wrapper's, byte 
     defer _ = mlx.mlx_array_free(modded);
     try std.testing.expectEqualSlices(u8, try m.rig.bytesOf(&.{modded}), normed);
 
-    var rn = RepoNorm.init(a, &repo_norm_f16, .float16);
-    defer rn.deinit();
-    try std.testing.expect(try rn.prepare(.{ .rows = 7, .n = 1, .k = 128 }, .random, 7));
-    try rn.run();
-    const rn_bytes = try a.dupe(u8, rn.rig.outputBytes());
-    defer a.free(rn_bytes);
-    const rn_out = (try glue.repoNorm(rn.args[0], rn.args[1], rn.args[2], 1e-5, false, rn.rig.stream())) orelse return error.Declined;
-    defer _ = mlx.mlx_array_free(rn_out);
-    try std.testing.expectEqualSlices(u8, try rn.rig.bytesOf(&.{rn_out}), rn_bytes);
+    var rf = RepoFold.init(a, 2);
+    defer rf.deinit();
+    try std.testing.expect(try rf.prepare(.{ .rows = 7, .n = 32, .k = 128 }, .random, 7));
+    try rf.run();
+    const rf_bytes = try a.dupe(u8, rf.rig.outputBytes());
+    defer a.free(rf_bytes);
+    const rf_out = (try glue.repoFold(rf.args[0], rf.args[1], rf.args[2], rf.args[3], 1e-5, rf.rig.stream())) orelse return error.Declined;
+    defer _ = mlx.mlx_array_free(rf_out);
+    try std.testing.expectEqualSlices(u8, try rf.rig.bytesOf(&.{rf_out}), rf_bytes);
 
     var ra = RepoAngles.init(a, &repo_angles_f32);
     defer ra.deinit();
@@ -1044,31 +1212,48 @@ test "kernel contract idol: each declared launch is the shipped wrapper's, byte 
     const cols = (try glue.deformCols(dc.args[0], dc.args[1], dc.args[2], 3, 16, 16, dc.rig.stream())) orelse return error.Declined;
     defer _ = mlx.mlx_array_free(cols);
     try std.testing.expectEqualSlices(u8, try dc.rig.bytesOf(&.{cols}), dc_bytes);
+
+    if (!w8.nax()) return;
+    var at = Attn.init(a);
+    defer at.deinit();
+    try std.testing.expect(try at.prepare(.{ .rows = 300, .n = 2, .k = HD }, .random, 10));
+    try at.run();
+    const at_bytes = try a.dupe(u8, at.rig.outputBytes());
+    defer a.free(at_bytes);
+    const att = (try glue.attention(at.args[0], at.args[1], at.args[2], @floatCast(Attn.SCALE), at.args[4], at.rig.stream())) orelse return error.Declined;
+    defer _ = mlx.mlx_array_free(att);
+    try std.testing.expectEqualSlices(u8, try at.rig.bytesOf(&.{att}), at_bytes);
 }
 
-test "idol: the split RePo norm is its output's TF32 halves: rows [hi | hi | lo], hi + lo the norm" {
-    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+test "idol: the NAX attention with a key bias equals sdpa with that bias as a mask" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var rn = RepoNorm.init(a, &repo_norm_f16, .float16);
-    defer rn.deinit();
-    const n = 256;
-    try std.testing.expect(try rn.prepare(.{ .rows = 7, .n = 1, .k = n }, .random, 11));
-    try rn.run();
-    const whole = try a.dupe(u8, rn.rig.outputBytes());
-    defer a.free(whole);
-    const f = (try glue.repoNorm(rn.args[0], rn.args[1], rn.args[2], 1e-5, true, rn.rig.stream())) orelse return error.Declined;
-    defer _ = mlx.mlx_array_free(f);
-    const three = try rn.rig.bytesOf(&.{f});
-    const word = struct {
-        fn at(b: []const u8, i: usize) u32 {
-            return std.mem.readInt(u32, b[4 * i ..][0..4], .little);
-        }
-    }.at;
-    for (0..7) |r| for (0..n) |i| {
-        const o: f32 = @bitCast(word(whole, r * n + i));
-        const hi = word(three, r * 3 * n + i);
-        try std.testing.expectEqual(@as(u32, @bitCast(o)) & 0xFFFFE000, hi);
-        try std.testing.expectEqual(hi, word(three, r * 3 * n + n + i));
-        try std.testing.expectEqual(o, @as(f32, @bitCast(hi)) + @as(f32, @bitCast(word(three, r * 3 * n + 2 * n + i))));
-    };
+    var rig = metal.Rig.init(a);
+    defer rig.deinit();
+    var prng = std.Random.DefaultPrng.init(17);
+    const rng = prng.random();
+    const h = 4;
+    const l = 300;
+    const n = h * l * HD;
+    const vals = try host.uniform(a, rng, 3 * n, -2, 2, .float16);
+    defer a.free(vals);
+    var bias: [l]f64 = undefined;
+    var mask: [l]f64 = undefined;
+    for (&bias, &mask, 0..) |*b, *m, j| {
+        m.* = if (j % 97 == 3) 8.0 else if (j % 89 == 5) -5.0 else 0.0;
+        b.* = m.* * std.math.log2e;
+    }
+    const shape = [_]c_int{ 1, h, l, HD };
+    const q = try rig.input(.float16, &shape, vals[0..n]);
+    const k = try rig.input(.float16, &shape, vals[n .. 2 * n]);
+    const v = try rig.input(.float16, &shape, vals[2 * n ..]);
+    const kb = try rig.input(.float32, &.{l}, &bias);
+    const mk = try rig.input(.float16, &.{ 1, 1, 1, l }, &mask);
+    const scale: f32 = 0.125;
+    const got = (try glue.attention(q, k, v, scale, kb, rig.stream())).?;
+    defer _ = mlx.mlx_array_free(got);
+    var sc = L.Scope.init(a, rig.stream());
+    defer sc.deinit();
+    const ref = try sc.reshape(try sc.transpose(try sc.sdpaMasked(q, k, v, scale, mk), &.{ 0, 2, 1, 3 }), &.{ l, h * HD });
+    try std.testing.expect(try w8.relRms(got, ref, rig.stream()) < 2e-3);
 }

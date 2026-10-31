@@ -1010,7 +1010,7 @@ pub const Dit = struct {
         defer if (full_v) |a| free(a);
         const qi = try sliceAxis(q, 2, T, sh[1], s);
         defer free(qi);
-        if (w8a8.w8a8State().enabled) if (try int8_attn.attention(qi, full_k orelse k, full_v orelse v, scale, null, s)) |img8| {
+        if (w8a8.w8a8State().enabled) if (try int8_attn.attention(qi, full_k orelse k, full_v orelse v, scale, s)) |img8| {
             defer free(img8);
             const all = if (T == 0) try contig(img8, s) else blk: {
                 const qt = try sliceAxis(q, 2, 0, T, s);

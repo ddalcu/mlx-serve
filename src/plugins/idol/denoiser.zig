@@ -10,7 +10,6 @@ const L = @import("layers.zig");
 const glue = @import("glue.zig");
 const device = @import("../../mlx/device.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
-const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
 
 const A = L.A;
 const Scope = L.Scope;
@@ -76,11 +75,13 @@ const Repo = struct {
     wf: A = NONE,
     fq: A = NONE,
     axis: A = NONE,
-    /// The gate and content maps as one projection to `[.., 2 hidden]`: quantized ones stacked, dense ones f32
-    /// `[C, 2 hidden]`; where MLX rounds f32 matmul operands to TF32, `[w_hi; w_lo; w_hi]` `[3C, 2 hidden]` against
-    /// the norm's `[hi | hi | lo]` rows (`split`): one GEMM, the f32 reference's precision. A null `gc.w`: two projections.
-    gc: Linear = .{ .w = NONE },
-    split: bool = false,
+    /// The norm folded into the gate | content maps (dense packs): `fold` f32 `[C, PARTS * 2 hidden]` the maps with the
+    /// norm's weight folded in, `cs` its column sums and `bw` the norm's bias through the maps (`glue.repoFold`). h's
+    /// f16 values are exact in TF32, so where MLX rounds f32 matmuls to TF32 only the maps split: their TF32-exact part
+    /// beside the rest (PARTS 2) keeps the f32 reference's precision in one GEMM.
+    fold: A = NONE,
+    cs: A = NONE,
+    bw: A = NONE,
 
     fn load(w: *const Weights, comptime name: []const u8, i: usize, c: u32) !Repo {
         const hidden: u32 = c / 8;
@@ -123,27 +124,22 @@ const Repo = struct {
         };
         if (at != axis.len) return error.UnsupportedIdolRepo;
         const ax = try sc.fromI32(&axis, &.{32});
-        // Stacked maps: [gc.w, scales, biases] while built.
-        var gc = [3]A{ NONE, NONE, NONE };
-        var split = false;
+        var fold = [3]A{ NONE, NONE, NONE };
         const g = self.gate;
         const c = self.content;
-        const plain = g.bias == null and c.bias == null and g.w8 == null and c.w8 == null and !g.transposed and !c.transposed;
-        if (plain and g.scales != null and c.scales != null and g.biases.ctx != null and c.biases.ctx != null and g.bits == c.bits and g.group_size == c.group_size) {
-            self.gc = .{ .w = NONE, .bits = g.bits, .group_size = g.group_size };
-            gc = .{ try sc.concat(&.{ g.w, c.w }, 0), try sc.concat(&.{ g.scales.?, c.scales.? }, 0), try sc.concat(&.{ g.biases, c.biases }, 0) };
-        } else if (plain and g.scales == null and c.scales == null) {
-            self.gc = .{ .w = NONE, .transposed = true };
+        if (g.scales == null and c.scales == null and g.bias == null and c.bias == null and g.w8 == null and c.w8 == null and !g.transposed and !c.transposed) {
+            const stacked = try L.asDtype(&sc, try sc.concat(&.{ g.w, c.w }, 0), .float32);
+            const folded = try sc.mul(stacked, try L.asDtype(&sc, self.norm_w, .float32));
             var t2 = mlx.mlx_array_new();
-            const whole = try sc.res(mlx.mlx_contiguous(&t2, try sc.transpose(try L.asDtype(&sc, try sc.concat(&.{ g.w, c.w }, 0), .float32), &.{ 1, 0 }), false, sc.s), &t2);
-            split = device.tf32Matmul();
-            gc[0] = if (split) blk: {
-                const p = try tf32Split(&sc, whole);
-                break :blk try sc.concat(&.{ p[0], p[1], p[0] }, 0);
-            } else whole;
+            const wt = try sc.res(mlx.mlx_contiguous(&t2, try sc.transpose(folded, &.{ 1, 0 }), false, sc.s), &t2);
+            fold[0] = if (device.tf32Matmul()) blk: {
+                const p = try tf32Split(&sc, wt);
+                break :blk try sc.concat(&p, 1);
+            } else wt;
+            fold[1] = try sc.sumAxis(folded, 1);
+            fold[2] = try sc.sumAxis(try sc.mul(stacked, try L.asDtype(&sc, self.norm_b, .float32)), 1);
         }
-        var sca: A = NONE;
-        for ([_]*A{ &self.wf, &self.fq, &self.axis, &self.gc.w, &sca, &self.gc.biases }, [_]A{ wf, fq, ax, gc[0], gc[1], gc[2] }) |slot, v| {
+        for ([_]*A{ &self.wf, &self.fq, &self.axis, &self.fold, &self.cs, &self.bw }, [_]A{ wf, fq, ax, fold[0], fold[1], fold[2] }) |slot, v| {
             if (v.ctx == null) continue;
             try mlx.check(mlx.mlx_array_eval(v));
             const kept = sc.out(v);
@@ -151,30 +147,20 @@ const Repo = struct {
             try owned.append(gpa, kept);
             slot.* = kept;
         }
-        if (sca.ctx != null) self.gc.scales = sca;
-        self.split = split;
-    }
-
-    /// The gate and content projections side by side, `[1, L, 2 hidden]` f32, of the RePo LayerNorm of `h`.
-    fn gateContent(self: *const Repo, sc: *Scope, h: A) !A {
-        const n = if (try glue.repoNorm(h, self.norm_w, self.norm_b, 1e-5, self.split, sc.s)) |f| try sc.keep(f) else blk: {
-            const v = try sc.layerNorm(try L.asDtype(sc, h, .float32), self.norm_w, self.norm_b, 1e-5);
-            if (!self.split) break :blk v;
-            const p = try tf32Split(sc, v);
-            break :blk try sc.concat(&.{ p[0], p[0], p[1] }, 2);
-        };
-        if (self.gc.w.ctx == null) return sc.concat(&.{ try self.gate.forward(sc, n), try self.content.forward(sc, n) }, 2);
-        return self.gc.project(sc, n);
     }
 
     /// cos and sin `[1, L, H, 32]` f32 for `h` `[1, L, C]`.
     fn angles(self: *const Repo, sc: *Scope, h: A, heads: c_int) !struct { cos: A, sin: A } {
         const l = mlx.getShape(h)[1];
-        const gc = try self.gateContent(sc, h);
-        if (try glue.repoAngles(gc, self.wf, self.fq, self.axis, heads, sc.s)) |t| return .{ .cos = try sc.keep(t.cos), .sin = try sc.keep(t.sin) };
-        const k = @divExact(mlx.getShape(gc)[2], 2);
-        const g = try sc.slice(gc, 2, 0, k);
-        const c = try sc.slice(gc, 2, k, 2 * k);
+        if (self.fold.ctx != null) {
+            const p = try sc.matmul(try L.asDtype(sc, h, .float32), self.fold);
+            if (try glue.repoFold(p, h, self.cs, self.bw, 1e-5, sc.s)) |gc| {
+                if (try glue.repoAngles(try sc.keep(gc), self.wf, self.fq, self.axis, heads, sc.s)) |t| return .{ .cos = try sc.keep(t.cos), .sin = try sc.keep(t.sin) };
+            }
+        }
+        const n = try sc.layerNorm(try L.asDtype(sc, h, .float32), self.norm_w, self.norm_b, 1e-5);
+        const g = try self.gate.forward(sc, n);
+        const c = try self.content.forward(sc, n);
         const act = try sc.mul(try sc.silu(g), c);
         const delta = try sc.reshape(try self.final.forward(sc, act), &.{ 1, l, heads, 3 });
         var parts: [3]A = undefined;
@@ -340,7 +326,7 @@ pub const Denoiser = struct {
     }
 
     /// Attention of the normalized tokens `n`: the qkv projection, its bias, q and k rotated, then RMS-normalized
-    /// per head (fused into one pass on the GPU), heads-major, then int8 QK and PV under `--w8a8` (LOSSY) or sdpa.
+    /// per head (fused into one pass on the GPU), heads-major, then attention (the biased pass on `glue.attention`).
     /// Returns `[1, L, C]`.
     fn attention(self: *const Denoiser, sc: *Scope, b: *const Block, n: A, rope: anytype, bias: KeyBias) !A {
         const h = self.heads();
@@ -350,7 +336,7 @@ pub const Denoiser = struct {
             const q = try sc.keep(f.q);
             const k = try sc.keep(f.k);
             const v = try sc.keep(f.v);
-            if (w8a8.w8a8State().enabled) if (try int8_attn.attention(q, k, v, 1.0 / @sqrt(@as(f32, L.HEAD_DIM)), if (bias.base2.ctx != null) bias.base2 else null, sc.s)) |o| {
+            if (bias.base2.ctx != null) if (try glue.attention(q, k, v, 1.0 / @sqrt(@as(f32, L.HEAD_DIM)), bias.base2, sc.s)) |o| {
                 return sc.reshape(try sc.keep(o), &.{ 1, mlx.getShape(q)[2], h * d });
             };
             return L.attendHeads(sc, q, k, v, bias.mask);
@@ -503,7 +489,7 @@ pub const Denoiser = struct {
     }
 };
 
-test "idol: a dense RePo layer's gate and content projections keep f32 precision where MLX's matmul rounds to TF32" {
+test "idol: a dense RePo layer's rotary tables keep f32 precision where MLX's matmul rounds to TF32" {
     if (mlx.noGpuBackend() or mlx.virtualGpu() or !device.tf32Matmul()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const c = 256;
@@ -518,6 +504,9 @@ test "idol: a dense RePo layer's gate and content projections keep f32 precision
     const vals = try a.alloc(f32, l * c + 2 * c + 2 * k * c + 24 * k + 32);
     defer a.free(vals);
     for (vals) |*v| v.* = rng.random().floatNorm(f32);
+    // The maps at their checkpoint scale (unit outputs), so the angles stay within a few turns.
+    for (vals[l * c + 2 * c ..][0 .. 2 * k * c]) |*v| v.* /= 16;
+    for (vals[l * c + 2 * c + 2 * k * c ..][0 .. 24 * k]) |*v| v.* /= 6;
     var at: usize = 0;
     const take = struct {
         fn f(s: *Scope, v: []const f32, i: *usize, shape: []const c_int) !A {
@@ -542,14 +531,15 @@ test "idol: a dense RePo layer's gate and content projections keep f32 precision
         owned.deinit(a);
     }
     try r.fuse(a, &owned);
-    const got = try r.gateContent(&sc, h);
-    // The CPU's f32 products are exact FMAs.
+    const got = try r.angles(&sc, h, 8);
+    // The chain on the CPU: its f32 products are exact FMAs.
     var cpu = Scope.init(a, mlx.mlx_default_cpu_stream_new());
     defer {
         _ = mlx.mlx_stream_free(cpu.s);
         cpu.deinit();
     }
-    const n = try cpu.layerNorm(try L.asDtype(&cpu, h, .float32), r.norm_w, r.norm_b, 1e-5);
-    const want = try cpu.concat(&.{ try cpu.matmul(n, try cpu.transpose(r.gate.w, &.{ 1, 0 })), try cpu.matmul(n, try cpu.transpose(r.content.w, &.{ 1, 0 })) }, 2);
-    try std.testing.expect(try w8a8.relRms(got, want, cpu.s) < 1e-5);
+    const want = try r.angles(&cpu, h, 8);
+    // Plain TF32 misses by ~4e-3.
+    try std.testing.expect(try w8a8.relRms(got.sin, want.sin, cpu.s) < 1e-4);
+    try std.testing.expect(try w8a8.relRms(got.cos, want.cos, cpu.s) < 1e-4);
 }

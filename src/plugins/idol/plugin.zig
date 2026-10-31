@@ -515,28 +515,6 @@ test "idol: identical image tokens run as two keys with a summed bias and keep t
     try testing.expect(distinct.bias.mask.ctx == null and distinct.bias.base2.ctx == null);
 }
 
-test "idol: under --w8a8 the attention runs int8, the collapsed tokens' key bias in it, close to sdpa" {
-    if (!@import("../../mlx/device.zig").naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
-    var t: TinyDenoiser = undefined;
-    try t.open();
-    defer t.close();
-    const z1, const z2 = try t.zeros();
-    const st = try t.stream();
-    const short = try t.d.context(&t.sc, z1, z2);
-    try testing.expect(short.bias.base2.ctx != null);
-    const prev = w8a8.w8a8State().enabled;
-    defer w8a8.w8a8State().enabled = prev;
-    var v: [2]den.Denoiser.Velocity = undefined;
-    for (&v, 0..) |*out, arm| {
-        w8a8.w8a8State().enabled = arm == 1;
-        out.* = try t.d.joint(&t.sc, st, short);
-        try mlx.check(mlx.mlx_array_eval(out.latent));
-    }
-    const err = try w8a8.relRms(v[1].latent, v[0].latent, t.s);
-    try testing.expect(err > 0); // the int8 route engaged: sdpa twice is identical
-    try testing.expect(err < 0.01);
-}
-
 test "idol: DINOv3 loaded in bf16 runs in bf16 and keeps the f32 encoder's tokens" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;

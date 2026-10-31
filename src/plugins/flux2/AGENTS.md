@@ -29,6 +29,9 @@ single-stream DiT, FlowMatchEuler, the 32-channel VAE with its encoder. Port of 
   (`resolveEditTargetSize`), an explicit size is honoured as asked within 1536. Variation covers the output grid.
 - Low-memory mode (the host's `Machine.low_mem`: iOS, `MLXSERVE_LOWMEM=1`, ≤ 16 GB) loads the encoder per request, frees it
   after the MATERIALIZED prompt encode (`encodePrompt` evaluates: a lazy graph would pin the weights).
+- The VAE encoder runs a stage at a time with one in flight (`endStage`) and its GroupNorm + SiLU fused
+  (`gn.groupNormSilu`, not bit-equal to the chain): a 1024 image's top stages are 128 channels at full resolution,
+  where one scope over the whole encoder first-touched every intermediate and the norm's op chain moved ~10 GB.
 - `--w8a8` converts the block linears (not modulation/embedders) and drops each block's packed arrays as it goes;
   the bill reads the DiT at its int8 size (`pack_bytes.residentWeights(.., converts = true)`).
 - LoRA arch `flux2`: diffusers, BFL and kohya spellings resolve onto `transformer_blocks.N.attn.to_q` etc.,

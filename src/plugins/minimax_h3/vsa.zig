@@ -744,7 +744,7 @@ test "h3 vsa kernel: ubench against dense attention at a 720p clip's packed shap
             const t0 = std.Io.Timestamp.now(io, .boot);
             const o = switch (arm) {
                 0 => try sc.sdpa(x[0], x[1], x[2], scale),
-                1 => try sc.keep((try @import("../../sdk/blocks/dit/int8_attn.zig").attention(x[0], x[1], x[2], scale, null, s)) orelse return error.SkipZigTest),
+                1 => try sc.keep((try @import("../../sdk/blocks/dit/int8_attn.zig").attention(x[0], x[1], x[2], scale, s)) orelse return error.SkipZigTest),
                 2 => try sc.keep(try attend(&plan, x[0], x[1], x[2], x[3], scale, s)),
                 else => try sc.matmul(xin, gate_w),
             };
