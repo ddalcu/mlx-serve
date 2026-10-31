@@ -4,7 +4,7 @@
 # non-stream, spaced-DSML tool call + round trip, single-flight (a concurrent request queues, byte-equal to solo, no
 # leak), prefix resume (a repeat resumes one token short and keeps the bytes; a fresh prompt starts over),
 # the repack's experts streamed from its bank. DSV41_TEST_DSPARK=1: rounds engaged, a --no-mtp boot keeps the greedy bytes,
-# a sampled seeded request engages the lane and repeats byte-equal from cold. [9] with a tower: house.jpeg on the
+# a sampled seeded request engages the lane and repeats byte-equal from cold, two requests at once run group rounds. [9] with a tower: house.jpeg on the
 # release's 35x53 grid as 230 span tokens, the street signs read, a /v1/messages image block, a warm repeat.
 #
 #   DSV41_TEST_MODEL=<pack> ./tests/test_dsv41.sh   # DSV41_TEST_PORT (11353), DSV41_TEST_FLAGS (e.g. --no-mtp)
@@ -253,6 +253,22 @@ if [ "${DSV41_TEST_DSPARK:-0}" = "1" ]; then
     else
         echo "FAIL: seeded sampled repeat differs"; echo "  1: $(echo "$S1" | head -c 200)"; echo "  2: $(echo "$S2" | head -c 200)"; fail=$((fail+1))
     fi
+    # [8b] Two requests at once keep drafting, as one DSpark group round, instead of decoding plain side by side.
+    GROUP='{"model":"mlx-serve","prompt":"<｜begin▁of▁sentence｜><｜User｜>Write a Python function that merges two sorted lists, with a docstring and three asserts.<｜Assistant｜></think>","max_tokens":160,"temperature":0}'
+    G_FILE=$(mktemp /tmp/dsv41_group.XXXXXX)
+    post /v1/completions "$GROUP" > "$G_FILE" &
+    G_PID=$!
+    G2=$(post /v1/completions "$GROUP" | text_of)
+    wait "$G_PID" || true
+    G1=$(text_of < "$G_FILE" 2>/dev/null || echo "")
+    rm -f "$G_FILE"
+    check "dspark group rounds engaged" "$(grep -o 'group_rounds=[1-9][0-9]*' "$LOG" || true)" 'group_rounds='
+    if [ -n "$G1" ] && [ -n "$G2" ]; then
+        echo "PASS: both grouped requests answered"; pass=$((pass+1))
+    else
+        echo "FAIL: a grouped request came back empty"; fail=$((fail+1))
+    fi
+    refuse "grouped rounds no MLX error" "$(cat "$LOG")" '[mlx]'
     cleanup; SERVER_PID=""
     boot --no-mtp
     speculation_contract 0

@@ -9,8 +9,9 @@ const io_util = @import("../../../sdk/util/io_util.zig");
 const split = @import("split.zig");
 
 pub const fns = struct {
-    // DeepSeek-V4/V4.1: a DSpark round on the module, V4.1's vision tower
+    // DeepSeek-V4/V4.1: a DSpark round on the module (V4.1: also several slots' at once), V4.1's vision tower
     pub const dspark_round = @import("../spec/dspark.zig").moduleRound;
+    pub const dspark_group_round = @import("../spec/dspark_group.zig").moduleGroupRound;
     pub const dsv41_vision_init = @import("../vision_encoder.zig").initDsv41Tower;
     pub const dsv41_vision_forward = Dsv41Vision.forward;
     pub const dsv41_vision_deinit = Dsv41Vision.deinit;

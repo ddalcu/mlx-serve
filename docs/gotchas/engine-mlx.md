@@ -1350,3 +1350,17 @@ MLX copies a shared buffer on the slot's first write, and the prefill bill alrea
 checkout refuses module entries. Guard: `HotPrefixCache module: a restore shares the checkpoint, so a request that never
 commits leaves it resumable`.
 
+### DeepSeek-V4.1's DSpark rounds verified almost nothing their head was sure of
+Defect: DSpark group rounds verified no draft in a quarter of rounds while verified drafts landed 96-100% a position.
+Cause: the round policy's calibration started from a logistic prior fitted on GLM-5.3's DFlash drafter; DSpark's
+confidence head is itself calibrated (1,535 full-block verifies: accepted ≈ sigmoid of the logit, every position), and
+the prior read its 0.93 as 0.65, under the group's row threshold, so those bins never saw a verify to learn from. Fix:
+DSpark's calibration starts from the head (`Calibration.head`); the recorded tapes pin the old prior. Guard:
+`Calibration: a head prior reads the drafter's confidence as its acceptance until verifies say otherwise`.
+
+### A slot in a DSpark group round stopped drafting because of its partner
+Defect: two DeepSeek-V4.1 coding streams; the second slot skipped drafting in 143 of 162 rounds although its drafts
+landed 86-100% a position. Cause: each slot's drafting backoff weighed its tokens against the whole round's wall,
+which holds the other slot's verify rows. Fix: a slot is charged its share of the stage pass and its own rows, against
+its accepted drafts at the group's plain cost a token (`moduleGroupRound`). Guard: `tests/test_dsv41.sh` [8b]
+(`group_rounds=` engaged); read `plain_ticks=` on a two-stream code run when the backoff changes.

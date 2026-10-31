@@ -19,6 +19,7 @@ const adaptiveChunkWidthFor = @import("scheduler/params.zig").adaptiveChunkWidth
 const Slot = @import("slot.zig").Slot;
 const mtpCrowdThresholdFor = @import("spec/mtp_groups.zig").mtpCrowdThresholdFor;
 const SpecTickMode = @import("spec/wiring.zig").SpecTickMode;
+const dspark_group = @import("spec/dspark_group.zig");
 const slotSpecMode = @import("spec/wiring.zig").slotSpecMode;
 const prefillAdmitted = @import("step.zig").prefillAdmitted;
 const publishLiveKvResidency = @import("step.zig").publishLiveKvResidency;
@@ -49,12 +50,12 @@ pub fn companyStreak(streak: u8, has_company: bool) u8 {
     return if (has_company) streak +| 1 else 0;
 }
 
-/// Spec modes that give way to the batched group once a slot has company: DSpark, DFlash on a
-/// sparse target (its wide verify reads every expert the block routes to), PLD on CUDA. A dense
-/// DFlash slot yields only to a crowd (`crowd` others): below it the yielded slot ticks plain
-/// beside the MTP verify group instead of inside it, which costs everyone a forward.
-pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool, sparse_target: bool, others: usize, crowd: usize) bool {
-    return mode == .dspark or (mode == .dflash and (sparse_target or others >= crowd)) or (mode == .pld and cuda);
+/// Spec modes that give way to the batched group once a slot has company: DSpark where the model runs no
+/// group rounds (`dspark_groups`), DFlash on a sparse target (its wide verify reads every expert the block
+/// routes to), PLD on CUDA. A dense DFlash slot yields only to a crowd (`crowd` others): below it the yielded
+/// slot ticks plain beside the MTP verify group instead of inside it, which costs everyone a forward.
+pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool, sparse_target: bool, others: usize, crowd: usize, dspark_groups: bool) bool {
+    return (mode == .dspark and !dspark_groups) or (mode == .dflash and (sparse_target or others >= crowd)) or (mode == .pld and cuda);
 }
 
 /// The first request of a burst was admitted alone, so it armed speculation and ticks
@@ -68,7 +69,8 @@ pub fn specYieldTick(active: []const *Slot) void {
         for (active) |o| {
             if (o != s and o.model == s.model) others += 1;
         }
-        if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), others, mtpCrowdThresholdFor(s))) {
+        const groups = if (s.model.transformer) |t| dspark_group.groupable(t) else false;
+        if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), others, mtpCrowdThresholdFor(s), groups)) {
             s.company_ticks = 0;
             continue;
         }
@@ -684,20 +686,26 @@ test "companyStreak: only consecutive ticks with company count" {
 }
 
 test "yieldsToCompany: DSpark and sparse-target DFlash everywhere, PLD only on CUDA" {
-    try testing.expect(yieldsToCompany(.dspark, false, false, 1, 5));
-    try testing.expect(yieldsToCompany(.dspark, true, true, 1, 5));
-    try testing.expect(yieldsToCompany(.dflash, false, true, 1, 5));
-    try testing.expect(yieldsToCompany(.dflash, true, true, 1, 5));
-    try testing.expect(yieldsToCompany(.pld, true, false, 1, 5));
-    try testing.expect(!yieldsToCompany(.pld, false, false, 1, 5));
-    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true, true, 9, 5));
+    try testing.expect(yieldsToCompany(.dspark, false, false, 1, 5, false));
+    try testing.expect(yieldsToCompany(.dspark, true, true, 1, 5, false));
+    try testing.expect(yieldsToCompany(.dflash, false, true, 1, 5, false));
+    try testing.expect(yieldsToCompany(.dflash, true, true, 1, 5, false));
+    try testing.expect(yieldsToCompany(.pld, true, false, 1, 5, false));
+    try testing.expect(!yieldsToCompany(.pld, false, false, 1, 5, false));
+    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true, true, 9, 5, false));
 }
 
 test "yieldsToCompany: a dense DFlash slot keeps speculating until the others are a crowd" {
-    try testing.expect(!yieldsToCompany(.dflash, false, false, 1, 5));
-    try testing.expect(!yieldsToCompany(.dflash, true, false, 4, 5));
-    try testing.expect(yieldsToCompany(.dflash, false, false, 5, 5));
-    try testing.expect(yieldsToCompany(.dflash, false, false, 7, 5));
+    try testing.expect(!yieldsToCompany(.dflash, false, false, 1, 5, false));
+    try testing.expect(!yieldsToCompany(.dflash, true, false, 4, 5, false));
+    try testing.expect(yieldsToCompany(.dflash, false, false, 5, 5, false));
+    try testing.expect(yieldsToCompany(.dflash, false, false, 7, 5, false));
+}
+
+test "yieldsToCompany: a DSpark slot on a model with group rounds keeps drafting beside company" {
+    try testing.expect(!yieldsToCompany(.dspark, false, true, 1, 5, true));
+    try testing.expect(!yieldsToCompany(.dspark, false, true, 9, 5, true));
+    try testing.expect(yieldsToCompany(.dflash, false, true, 1, 5, true));
 }
 
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {
