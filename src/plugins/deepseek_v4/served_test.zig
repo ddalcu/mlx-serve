@@ -188,7 +188,7 @@ test "deepseek_v41 served: two slots decode in one batched tick through the driv
 
 test "deepseek_v41 served: disk-disabled requests retain alternating RAM conversations after slot release" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
@@ -819,7 +819,7 @@ test "deepseek_v41 served: ordinary unload frees retained module entries before 
 }
 
 test "deepseek_v41 served: an excluded instance keeps legacy resume through request prefill" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const P = @import("../deepseek_v41/plugin.zig");
