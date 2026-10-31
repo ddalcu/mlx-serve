@@ -91,6 +91,16 @@ final class UsageTrackerTests: XCTestCase {
         XCTAssertNil(t.decodeTPS, "nothing moved: the figure goes quiet instead of showing the last burst")
     }
 
+    func testThePrefillRateIsThePromptTokensReadBetweenTwoLooks() {
+        let t = tracker()
+        var a = snapshot([:], at: 0), b = snapshot([:], at: 2)
+        a.prefillLive = 1000
+        b.prefillLive = 9000
+        t.ingest(a)
+        t.ingest(b)
+        XCTAssertEqual(t.prefillTPS ?? 0, 4000, accuracy: 0.001)
+    }
+
     func testAServerThatStopsAnsweringClearsTheLiveReading() {
         let t = tracker()
         t.ingest(snapshot([:], at: 0, generatedLive: 100, generated: 0))

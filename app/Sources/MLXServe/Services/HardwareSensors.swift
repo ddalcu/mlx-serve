@@ -6,6 +6,10 @@ import IOKit
 /// The sensors macOS answers only through private interfaces, read the way iTherm reads them (the author's own
 /// menu-bar thermal monitor, same MIT licence). The Mac App Store build compiles this out and reads neither.
 final class HardwareSensors {
+    /// One for the process: another would hold its own IOReport subscription and redo the SMC key scan.
+    static let shared = HardwareSensors()
+    private init() {}
+
     // Opened by the first read, which runs on the sampler's queue: the SMC key scan is thousands of calls.
     private lazy var smc = SMCGPUTemperature()
     private lazy var ane = ANELoad()
@@ -63,19 +67,20 @@ private final class SMCGPUTemperature {
 /// ANE load from IOReport, the private library behind powermetrics: the share of time the ANE's performance-floor
 /// requests sat above their lowest state (its Energy Model counters stopped counting in macOS 27).
 private final class ANELoad {
-    private typealias Sample = @convention(c) (OpaquePointer, CFMutableDictionary, CFTypeRef?) -> Unmanaged<CFDictionary>?
+    private typealias Sample = @convention(c) (CFTypeRef, CFMutableDictionary, CFTypeRef?) -> Unmanaged<CFDictionary>?
     private typealias Delta = @convention(c) (CFDictionary, CFDictionary, CFTypeRef?) -> Unmanaged<CFDictionary>?
     private typealias Name = @convention(c) (CFDictionary) -> Unmanaged<CFString>?
     private typealias Count = @convention(c) (CFDictionary) -> Int32
     private typealias Residency = @convention(c) (CFDictionary, Int32) -> Int64
-    private let sub: OpaquePointer, channels: CFMutableDictionary
+    // Both +1 from IOReport, released by ARC with this object.
+    private let sub: CFTypeRef, channels: CFMutableDictionary
     private let sample: Sample, delta: Delta, count: Count, residency: Residency
     private var last: CFDictionary?
 
     init?() {
         typealias Copy = @convention(c) (CFString, CFString?, UInt64, UInt64, UInt64) -> Unmanaged<CFDictionary>?
         typealias Subscribe = @convention(c) (UnsafeRawPointer?, CFMutableDictionary, UnsafeMutablePointer<Unmanaged<CFMutableDictionary>?>,
-                                              UInt64, CFTypeRef?) -> OpaquePointer?
+                                              UInt64, CFTypeRef?) -> Unmanaged<CFTypeRef>?
         guard let h = dlopen("/usr/lib/libIOReport.dylib", RTLD_NOW) else { return nil }
         func fn<T>(_ s: String, _: T.Type) -> T? { dlsym(h, s).map { unsafeBitCast($0, to: T.self) } }
         guard let copy = fn("IOReportCopyChannelsInGroup", Copy.self), let subscribe = fn("IOReportCreateSubscription", Subscribe.self),
@@ -90,7 +95,8 @@ private final class ANELoad {
             (name($0)?.takeUnretainedValue() as String? ?? "").hasPrefix("ANE") && (group($0)?.takeUnretainedValue() as String? ?? "").contains("Floor")
         }
         var subscribed: Unmanaged<CFMutableDictionary>?
-        guard !wanted.isEmpty, let sub = subscribe(nil, NSMutableDictionary(dictionary: ["IOReportChannels": wanted]), &subscribed, 0, nil),
+        guard !wanted.isEmpty,
+              let sub = subscribe(nil, NSMutableDictionary(dictionary: ["IOReportChannels": wanted]), &subscribed, 0, nil)?.takeRetainedValue(),
               let subscribed else { return nil }
         self.sub = sub
         channels = subscribed.takeRetainedValue()
@@ -114,6 +120,8 @@ private final class ANELoad {
 #else
 
 final class HardwareSensors {
+    static let shared = HardwareSensors()
+    private init() {}
     func gpuTemperature() -> Double? { nil }
     func aneLoad() -> Double? { nil }
 }

@@ -30,13 +30,14 @@ struct SystemLoad: Equatable {
 final class SystemLoadSampler: ObservableObject {
     @Published private(set) var load: SystemLoad?
 
-    private let queue = DispatchQueue(label: "mlx-serve.system-load", qos: .utility)
+    /// Every sampler's: the shared sensors are not thread-safe.
+    private static let queue = DispatchQueue(label: "mlx-serve.system-load", qos: .utility)
     private var timer: DispatchSourceTimer?
 
     func start() {
         guard timer == nil else { return }
-        let sensors = HardwareSensors()   // opens its private interfaces on first use, on `queue`
-        let source = DispatchSource.makeTimerSource(queue: queue)
+        let sensors = HardwareSensors.shared   // opens its private interfaces on first use, on `queue`
+        let source = DispatchSource.makeTimerSource(queue: Self.queue)
         source.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
         source.setEventHandler { [weak self] in
             let load = SystemLoad(gpu: Int(SystemMetrics.gpuUtilization()), gpuTemperature: sensors.gpuTemperature(),
