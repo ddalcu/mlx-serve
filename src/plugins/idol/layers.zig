@@ -62,18 +62,19 @@ pub fn headNorm(sc: *Scope, x: A, gamma: A, ones: A) !A {
     return asDtype(sc, try sc.mul(n, try asDtype(sc, gamma, .float32)), dt);
 }
 
-/// Attention over heads-major `[1, H, L, D]` q and `[1, H, Lk, D]` k, v; returns `[1, L, H*D]`.
-pub fn attendHeads(sc: *Scope, q: A, k: A, v: A) !A {
+/// Attention over heads-major `[1, H, L, D]` q and `[1, H, Lk, D]` k, v, `mask` an additive key bias or a null
+/// handle; returns `[1, L, H*D]`.
+pub fn attendHeads(sc: *Scope, q: A, k: A, v: A, mask: A) !A {
     const sh = mlx.getShape(q);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(sh[3])));
-    const o = try sc.sdpa(q, k, v, scale);
+    const o = try sc.sdpaMasked(q, k, v, scale, mask);
     return sc.reshape(try sc.transpose(o, &.{ 0, 2, 1, 3 }), &.{ sh[0], sh[2], sh[1] * sh[3] });
 }
 
 /// `attendHeads` over `[1, L, H, D]` q and `[1, Lk, H, D]` k, v.
-pub fn attend(sc: *Scope, q: A, k: A, v: A) !A {
+pub fn attend(sc: *Scope, q: A, k: A, v: A, mask: A) !A {
     const perm = [_]c_int{ 0, 2, 1, 3 };
-    return attendHeads(sc, try sc.transpose(q, &perm), try sc.transpose(k, &perm), try sc.transpose(v, &perm));
+    return attendHeads(sc, try sc.transpose(q, &perm), try sc.transpose(k, &perm), try sc.transpose(v, &perm), mask);
 }
 
 /// One column group `[1, L, n, D]` of a fused `[1, L, k*n*D]` projection, `i` of `k`.
@@ -112,14 +113,14 @@ pub const Mha = struct {
             const y = try qkv.forward(sc, x);
             const q = try headNorm(sc, try part(sc, y, 3, 0, heads, d), self.q_gamma, ones);
             const k = try headNorm(sc, try part(sc, y, 3, 1, heads, d), self.k_gamma, ones);
-            return self.out.forward(sc, try attend(sc, q, k, try part(sc, y, 3, 2, heads, d)));
+            return self.out.forward(sc, try attend(sc, q, k, try part(sc, y, 3, 2, heads, d), NONE));
         }
         const ctx = context orelse return error.MissingContext;
         const l = mlx.getShape(x)[1];
         const q = try headNorm(sc, try sc.reshape(try self.q.?.forward(sc, x), &.{ 1, l, heads, d }), self.q_gamma, ones);
         const kv = try self.kv.?.forward(sc, ctx);
         const k = try headNorm(sc, try part(sc, kv, 2, 0, heads, d), self.k_gamma, ones);
-        return self.out.forward(sc, try attend(sc, q, k, try part(sc, kv, 2, 1, heads, d)));
+        return self.out.forward(sc, try attend(sc, q, k, try part(sc, kv, 2, 1, heads, d), NONE));
     }
 };
 
@@ -137,13 +138,17 @@ pub const Mlp = struct {
         };
     }
 
-    pub fn forward(self: *const Mlp, sc: *Scope, x: A) !A {
+    /// The activations fc2 reads.
+    pub fn activate(self: *const Mlp, sc: *Scope, x: A) !A {
         const y = try self.fc1.project(sc, x);
-        const hidden = if (self.fc1.bias) |b|
+        return if (self.fc1.bias) |b|
             if (try glue.biasGelu(y, b, sc.s)) |g| try sc.keep(g) else try geluTanh(sc, try sc.add(y, b))
         else
             try geluTanh(sc, y);
-        return self.fc2.forward(sc, hidden);
+    }
+
+    pub fn forward(self: *const Mlp, sc: *Scope, x: A) !A {
+        return self.fc2.forward(sc, try self.activate(sc, x));
     }
 };
 
@@ -217,6 +222,38 @@ pub fn castTensor(w: *Weights, key: []const u8, dt: mlx.mlx_dtype) !void {
     e.* = o;
 }
 
+/// Every dense float Linear weight under `prefixes` stored transposed and contiguous as `<name>.weight_t` (`[in, out]`,
+/// what MLX's GEMM reads fastest) in place of `<name>.weight`.
+pub fn transposeLinears(gpa: std.mem.Allocator, w: *Weights, prefixes: []const []const u8) !void {
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer keys.deinit(gpa);
+    var it = w.map.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        var in_prefix = false;
+        for (prefixes) |p| in_prefix = in_prefix or std.mem.startsWith(u8, key, p);
+        const dt = mlx.mlx_array_dtype(e.value_ptr.*);
+        if (!in_prefix or !std.mem.endsWith(u8, key, ".weight") or mlx.mlx_array_ndim(e.value_ptr.*) != 2) continue;
+        if (dt != .float16 and dt != .bfloat16 and dt != .float32) continue;
+        try keys.append(gpa, key);
+    }
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    for (keys.items) |key| {
+        var buf: [160]u8 = undefined;
+        const base = key[0 .. key.len - ".weight".len];
+        var t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(t);
+        try mlx.check(mlx.mlx_transpose_axes(&t, w.get(key).?, &[_]c_int{ 1, 0 }, 2, s));
+        var c = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_contiguous(&c, t, false, s));
+        try mlx.check(mlx.mlx_array_eval(c));
+        try w.put(try std.fmt.bufPrint(&buf, "{s}.weight_t", .{base}), c);
+        w.remove(key);
+    }
+}
+
 /// Casts every f32 Linear (`*.weight` matrix and its `.bias`) under one of `prefixes` to `dt`, as the reference's
 /// `convert_module_to_f16` does; norm weights (1-D), gammas and shift tables stay f32.
 pub fn castLinears(gpa: std.mem.Allocator, w: *Weights, prefixes: []const []const u8, dt: mlx.mlx_dtype) !void {
@@ -238,4 +275,36 @@ pub fn castLinears(gpa: std.mem.Allocator, w: *Weights, prefixes: []const []cons
         }
     }
     for (keys.items) |k| try castTensor(w, k, dt);
+}
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "idol: a block Linear stored transposed projects as the original" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    var w = Weights.init(a);
+    defer w.deinit();
+    var sc = Scope.init(a, s);
+    defer sc.deinit();
+    var vals: [6 * 8 + 6 + 3 * 8]f32 = undefined;
+    for (&vals, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 7 % 13)) - 6)) / 8;
+    try w.put("blocks.0.fc.weight", sc.out(try sc.astype(try sc.fromF32(vals[0..48], &.{ 6, 8 }), .float16)));
+    try w.put("blocks.0.fc.bias", sc.out(try sc.astype(try sc.fromF32(vals[48..54], &.{6}), .float16)));
+    const x = try sc.astype(try sc.fromF32(vals[54..], &.{ 3, 8 }), .float16);
+    const want = try (try scope_mod.linear(&w, "blocks.0.fc", .{}, 8)).forward(&sc, x);
+    try mlx.check(mlx.mlx_array_eval(want));
+    try transposeLinears(a, &w, &.{"blocks."});
+    try testing.expect(w.get("blocks.0.fc.weight") == null);
+    try testing.expectEqualSlices(c_int, &.{ 8, 6 }, mlx.getShape(w.get("blocks.0.fc.weight_t").?));
+    const got = try (try scope_mod.linear(&w, "blocks.0.fc", .{}, 8)).forward(&sc, x);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, got, want, false, s));
+    var same = false;
+    try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+    try testing.expect(same);
 }

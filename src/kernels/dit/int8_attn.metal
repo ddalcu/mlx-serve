@@ -36,7 +36,8 @@ for (int r = 0; r < NS; r++) {
   qsc[r] = row < LQ ? qs[(size_t)head * LQ + row] * scale : 0.0f;
   m[r] = -INFINITY; l[r] = 0.0f;
 }
-const device float* kbs = ks + (size_t)kvh * NB;
+// auto: MLX binds a small ks (kv heads x key blocks under 8) in constant space.
+const auto kbs = ks + (size_t)kvh * NB;
 const float LOG127 = 6.98868468677f;
 for (int kb = 0; kb < NB; kb++) {
   const int k0 = kb * BK;

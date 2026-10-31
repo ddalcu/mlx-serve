@@ -247,7 +247,7 @@ pub const Engine = struct {
 
     fn conditioning(self: *Engine, alloc: std.mem.Allocator, img: Prepared, want_1024: bool, prog: ?sse.Progress) !Cond {
         if (prog) |p| p.emit("trellis-cond", 0, 1);
-        var enc = try dino.Encoder.open(self.io, alloc, self.dino_dir);
+        var enc = try dino.Encoder.open(self.io, alloc, self.dino_dir, .float32);
         defer enc.deinit();
         var out = Cond{ .c512 = try encodeAt(alloc, &enc, self.s, img, 512), .c1024 = null };
         errdefer out.deinit();

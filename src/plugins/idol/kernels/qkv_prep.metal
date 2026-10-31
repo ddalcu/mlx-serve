@@ -6,7 +6,10 @@ if (slot >= 3 * uint(H)) return;
 const uint which = slot / uint(H);
 const uint head = slot - which * uint(H);
 const size_t o = (size_t(head) * uint(Y_shape[0]) + row) * HD + lane * 2;
-const vec<T, 2> v = *(const device vec<T, 2>*)(Y + size_t(row) * (3 * uint(H) * HD) + size_t(slot) * HD + lane * 2);
+const vec<T, 2> y = *(const device vec<T, 2>*)(Y + size_t(row) * (3 * uint(H) * HD) + size_t(slot) * HD + lane * 2);
+const vec<T, 2> b = *(const device vec<T, 2>*)(B + size_t(slot) * HD + lane * 2);
+// The projection's bias, rounded to T as the chain's add rounds it.
+const vec<T, 2> v = vec<T, 2>(T(float(y[0]) + float(b[0])), T(float(y[1]) + float(b[1])));
 if (which == 2) {
     *(device vec<T, 2>*)(OV + o) = v;
     return;

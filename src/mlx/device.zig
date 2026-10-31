@@ -152,6 +152,37 @@ pub fn naxAvailable() bool {
     return nax_avail_cache.?;
 }
 
+/// Whether MLX's f32 matmuls round their operands to TF32 (~1e-3 relative): on NAX unless `MLX_ENABLE_TF32` is off.
+pub fn tf32Matmul() bool {
+    if (!naxAvailable()) return false;
+    const raw = env.get(.MLX_ENABLE_TF32) orelse return true;
+    return tf32ValueOn(std.mem.sliceTo(raw, 0));
+}
+
+/// MLX's reading of `MLX_ENABLE_TF32` (`std::stoi`): a leading integer, on when nonzero; anything else is off.
+pub fn tf32ValueOn(raw: []const u8) bool {
+    var i: usize = 0;
+    while (i < raw.len and std.ascii.isWhitespace(raw[i])) : (i += 1) {}
+    if (i >= raw.len) return false;
+    var sign: i32 = 1;
+    if (raw[i] == '-') {
+        sign = -1;
+        i += 1;
+    } else if (raw[i] == '+') {
+        i += 1;
+    }
+    var val: i64 = 0;
+    var any = false;
+    while (i < raw.len) : (i += 1) {
+        const c = raw[i];
+        if (c < '0' or c > '9') break;
+        any = true;
+        val = val * 10 + @as(i64, c - '0');
+    }
+    if (!any) return false;
+    return (if (sign < 0) -val else val) != 0;
+}
+
 /// Total physical RAM (`hw.memsize`); 0 when the read fails (gates that
 /// consume this must treat 0 as "unknown", never as "tiny machine").
 pub fn totalMemBytes() u64 {
@@ -234,4 +265,14 @@ test "naxArchSupportedFrom: desktop gen>=17, phone gen>=18" {
     try std.testing.expect(naxArchSupportedFrom("g18p"));
     try std.testing.expect(!naxArchSupportedFrom("garbage"));
     try std.testing.expect(!naxArchSupportedFrom(""));
+}
+
+test "MLX_ENABLE_TF32 reads as MLX's stoi does" {
+    try std.testing.expect(tf32ValueOn("1"));
+    try std.testing.expect(tf32ValueOn(" 1"));
+    try std.testing.expect(!tf32ValueOn("0"));
+    try std.testing.expect(!tf32ValueOn("00"));
+    try std.testing.expect(!tf32ValueOn("false"));
+    try std.testing.expect(!tf32ValueOn(" 0"));
+    try std.testing.expect(!tf32ValueOn("0x0"));
 }

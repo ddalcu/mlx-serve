@@ -14,7 +14,8 @@ const Graph = ops.Graph;
 const Array = ops.Array;
 
 pub const Norm = union(enum) {
-    flat: struct { groups: c_int = 32, eps: f32, out: ops.Dtype },
+    /// `fused`: the norm and the SiLU after it in one kernel pass where it applies (`gn.groupNormSilu`; not bit-equal).
+    flat: struct { groups: c_int = 32, eps: f32, out: ops.Dtype, fused: bool = false },
     axes: struct { groups: c_int = 32, eps: f32 },
     /// mlx's fused RMS norm over channels (no bias).
     rms: f32,
@@ -27,6 +28,14 @@ pub const Norm = union(enum) {
             .axes => |a| try gn.groupNormAxes(&g, x, w, b.?, a.groups, a.eps),
             .rms => |eps| try g.rmsNorm(x, w, eps),
         });
+    }
+
+    /// `silu(apply(..))`.
+    pub fn applySilu(n: Norm, parent: *Graph, x: Array, w: Array, b: ?Array) !Array {
+        if (n == .flat and n.flat.fused) if (try gn.groupNormSilu(parent, x, w, b.?, n.flat.groups, n.flat.eps, n.flat.out)) |y| return y;
+        var g = parent.scope();
+        defer g.deinit();
+        return parent.keep(try g.silu(try n.apply(&g, x, w, b)));
     }
 };
 
@@ -46,8 +55,8 @@ pub const Resnet = struct {
     pub fn forward(r: *const Resnet, parent: *Graph, norm: Norm, x: Array) !Array {
         var g = parent.scope();
         defer g.deinit();
-        const h1 = try conv.conv2d(&g, try g.silu(try norm.apply(&g, x, r.n1w, r.n1b)), r.c1w, r.c1b, 1, 1, 1);
-        const h2 = try conv.conv2d(&g, try g.silu(try norm.apply(&g, h1, r.n2w, r.n2b)), r.c2w, r.c2b, 1, 1, 1);
+        const h1 = try conv.conv2d(&g, try norm.applySilu(&g, x, r.n1w, r.n1b), r.c1w, r.c1b, 1, 1, 1);
+        const h2 = try conv.conv2d(&g, try norm.applySilu(&g, h1, r.n2w, r.n2b), r.c2w, r.c2b, 1, 1, 1);
         const skip = if (r.sw) |sw| try conv.conv2d(&g, x, sw, r.sb.?, 1, 0, 1) else x;
         return parent.keep(try g.add(h2, skip));
     }

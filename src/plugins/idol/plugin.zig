@@ -370,6 +370,13 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 const testing = std.testing;
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack;
+const mlx = @import("../../mlx/ffi.zig");
+const scope = @import("../../mlx/scope.zig");
+const weights = @import("../../sdk/weights/load.zig");
+const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
+const den = @import("denoiser.zig");
+const layers = @import("layers.zig");
+const dinov3 = @import("../../sdk/vision/dinov3.zig");
 
 fn parsed(json: []const u8) !Parsed {
     var b = job.Body.parse(testing.allocator, json).?;
@@ -424,4 +431,118 @@ test "idol: a job on the tiny pack is a splat GLB of the requested size; bad req
     try testing.expect(std.mem.indexOf(u8, glb[20 .. 20 + jlen], "\"count\":32768") != null);
     try testing.expectEqualStrings("missing 'image' (base64 PNG/JPEG of the subject)", (try pack.runInputs("{}", &.{})).refused.why.slice());
     try testing.expectEqualStrings("'steps' must be a whole number in [1,200]", (try pack.runInputs("{\"image\":\"x\",\"steps\":0}", &one)).refused.why.slice());
+}
+
+/// The tiny pack's denoiser on the GPU, with a step's stream and the unconditional (all-zero) image features.
+const TinyDenoiser = struct {
+    arena: std.heap.ArenaAllocator,
+    tmp: testing.TmpDir,
+    w: weights.Weights,
+    d: den.Denoiser,
+    s: mlx.mlx_stream,
+    sc: scope.Scope,
+    noise: []f32,
+
+    const n = 21;
+
+    fn open(self: *TinyDenoiser) !void {
+        const a = testing.allocator;
+        self.arena = std.heap.ArenaAllocator.init(a);
+        errdefer self.arena.deinit();
+        self.tmp = testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        try self.tmp.dir.writeFile(testing.io, .{ .sub_path = "denoiser.safetensors", .data = try denoiserPack(self.arena.allocator()) });
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        self.w = try weights.loadWeightsFile(a, pbuf[0..try self.tmp.dir.realPath(testing.io, &pbuf)], "denoiser.safetensors");
+        errdefer self.w.deinit();
+        try layers.castLinears(a, &self.w, &.{ "blocks.", "noise_refiner.", "context_refiner." }, .float16);
+        self.d = try den.Denoiser.load(a, &self.w, .{ .q_token_length = 64, .model_channels = 128, .cond_channels = DINO, .num_blocks = 1, .num_refiner_blocks = 1, .num_heads = HEADS }, .float16);
+        self.s = mlx.gpuStream();
+        self.sc = scope.Scope.init(a, self.s);
+        var rng = std.Random.DefaultPrng.init(5);
+        self.noise = try self.arena.allocator().alloc(f32, n * DINO + 64 * 16 + 5);
+        for (self.noise) |*v| v.* = rng.random().floatNorm(f32);
+    }
+
+    fn close(self: *TinyDenoiser) void {
+        self.sc.deinit();
+        _ = mlx.mlx_stream_free(self.s);
+        self.d.deinit();
+        self.w.deinit();
+        self.tmp.cleanup();
+        self.arena.deinit();
+    }
+
+    fn stream(self: *TinyDenoiser) !den.Denoiser.Stream {
+        const sc = &self.sc;
+        return self.d.stream(sc, try sc.fromF32(self.noise[n * DINO ..][0 .. 64 * 16], &.{ 1, 64, 16 }), try sc.fromF32(self.noise[self.noise.len - 5 ..], &.{ 1, 1, 5 }), 700);
+    }
+
+    fn zeros(self: *TinyDenoiser) ![2]mlx.mlx_array {
+        return .{ try self.sc.zeros(&.{ 1, n, DINO }, .float32), try self.sc.zeros(&.{ 1, n, 128 }, .float32) };
+    }
+};
+
+test "idol: identical image tokens run as two keys with a summed bias and keep the velocity; distinct ones stay" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var t: TinyDenoiser = undefined;
+    try t.open();
+    defer t.close();
+    const d = &t.d;
+    const sc = &t.sc;
+    const s = t.s;
+    const n = TinyDenoiser.n;
+    const z1, const z2 = try t.zeros();
+    const st = try t.stream();
+
+    const short = try d.context(sc, z1, z2);
+    try testing.expectEqual(@as(c_int, 2), mlx.getShape(short.tokens)[1]);
+    const full = blk: {
+        den.collapse_disabled_for_test = true;
+        defer den.collapse_disabled_for_test = false;
+        break :blk try d.context(sc, z1, z2);
+    };
+    try testing.expectEqual(@as(c_int, n), mlx.getShape(full.tokens)[1]);
+    const vs = try d.joint(sc, st, short);
+    const vf = try d.joint(sc, st, full);
+    for ([_][2]mlx.mlx_array{ .{ vs.latent, vf.latent }, .{ vs.camera, vf.camera } }) |pair| {
+        const g = try w8a8.agreement(pair[0], pair[1], s);
+        try testing.expect(g.cos > 0.99999);
+        try testing.expectApproxEqAbs(@as(f64, 1), g.rms_ratio, 1e-3);
+    }
+    const distinct = try d.context(sc, try sc.fromF32(t.noise[0 .. n * DINO], &.{ 1, n, DINO }), z2);
+    try testing.expectEqual(@as(c_int, n), mlx.getShape(distinct.tokens)[1]);
+    try testing.expect(distinct.bias.mask.ctx == null and distinct.bias.base2.ctx == null);
+}
+
+test "idol: DINOv3 loaded in bf16 runs in bf16 and keeps the f32 encoder's tokens" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = tiny_dino });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "model.safetensors", .data = try dinoPack(arena.allocator()) });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pbuf[0..try tmp.dir.realPath(testing.io, &pbuf)];
+    const s = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(s);
+    var sc = scope.Scope.init(a, s);
+    defer sc.deinit();
+    var rng = std.Random.DefaultPrng.init(9);
+    const px = try arena.allocator().alloc(f32, 64 * 64 * 3);
+    for (px) |*v| v.* = rng.random().floatNorm(f32);
+    const pixels = try sc.fromF32(px, &.{ 1, 64, 64, 3 });
+    var out: [2]mlx.mlx_array = undefined;
+    for (&out, [_]mlx.mlx_dtype{ .float32, .bfloat16 }) |*o, dt| {
+        var e = try dinov3.Encoder.open(testing.io, a, dir, dt);
+        defer e.deinit();
+        o.* = try e.forward(&sc, pixels);
+        try mlx.check(mlx.mlx_array_eval(o.*));
+        try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(o.*));
+    }
+    const g = try w8a8.agreement(out[1], out[0], s);
+    try testing.expect(g.cos < 0.9999999); // bf16 engaged: an f32 run would be identical
+    try testing.expect(g.cos > 0.999);
 }

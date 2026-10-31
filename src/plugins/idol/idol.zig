@@ -136,12 +136,14 @@ pub const Engine = struct {
             const n = try self.w_den.w8.convert(gpa, &self.w_den.map, .{ .base = "blocks.0.attn.qkv", .in_features = raw.denoiser.args.model_channels }, s);
             log.info("[idol] int8: {d} denoiser linears\n", .{n});
         }
+        try L.transposeLinears(gpa, &self.w_den, &.{ "blocks.", "noise_refiner.", "context_refiner." });
         self.denoiser = try den.Denoiser.load(gpa, &self.w_den, raw.denoiser.args, act);
         errdefer self.denoiser.deinit();
 
         self.w_oct = try model_mod.loadWeightsFile(gpa, dir, "decoder.safetensors");
         errdefer self.w_oct.deinit();
         try L.castLinears(gpa, &self.w_oct, &.{"blocks."}, act);
+        try L.transposeLinears(gpa, &self.w_oct, &.{"blocks."});
         try scope_mod.evalAll(&self.w_oct);
         self.octree = try dec.Octree.load(gpa, &self.w_oct, act, raw.decoder.args);
         errdefer self.octree.deinit();
@@ -149,13 +151,14 @@ pub const Engine = struct {
         self.w_gs = try model_mod.loadWeightsFile(gpa, dir, "decoder_gs.safetensors");
         errdefer self.w_gs.deinit();
         try L.castLinears(gpa, &self.w_gs, &.{"blocks."}, act);
+        try L.transposeLinears(gpa, &self.w_gs, &.{"blocks."});
         try scope_mod.evalAll(&self.w_gs);
         self.gaussians = try dec.GaussianDecoder.load(gpa, &self.w_gs, act, .{ .model_channels = raw.decoder_gs.args.model_channels, .cond_channels = raw.decoder_gs.args.cond_channels, .num_blocks = raw.decoder_gs.args.num_blocks });
         errdefer self.gaussians.deinit();
 
         const dino_dir = try std.fmt.allocPrint(gpa, "{s}/dinov3", .{dir});
         defer gpa.free(dino_dir);
-        self.dino = try dino.Encoder.open(io, gpa, dino_dir);
+        self.dino = try dino.Encoder.open(io, gpa, dino_dir, .bfloat16);
         errdefer self.dino.deinit();
         self.dino.affine_final = true;
         self.vae = try flux.loadVaeEncoder(io, gpa, s, dir);
@@ -246,8 +249,8 @@ pub const Engine = struct {
         // Both context branches are refined once: they depend on neither the latent nor the time.
         const zero1 = try top.zeros(mlx.getShape(cond.f1), .float32);
         const zero2 = try top.zeros(mlx.getShape(cond.f2), .float32);
-        const ctx_c = try top.keep(try self.denoiser.context(&top, cond.f1, cond.f2));
-        const ctx_u = try top.keep(try self.denoiser.context(&top, zero1, zero2));
+        const ctx_c = try self.denoiser.context(&top, cond.f1, cond.f2);
+        const ctx_u = try self.denoiser.context(&top, zero1, zero2);
 
         var key = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(key);
@@ -270,11 +273,12 @@ pub const Engine = struct {
             const tp = timeAt(@intCast(i + 1), o.steps, o.rescale_t);
             var sc = Scope.init(gpa, self.s);
             defer sc.deinit();
-            const vc = try self.denoiser.velocity(&sc, z, cam, 1000 * t, ctx_c);
+            const st = try self.denoiser.stream(&sc, z, cam, 1000 * t);
+            const vc = try self.denoiser.joint(&sc, st, ctx_c);
             var vl = vc.latent;
             var vm = vc.camera;
             if (o.cfg_strength > 0) {
-                const vu = try self.denoiser.velocity(&sc, z, cam, 1000 * t, ctx_u);
+                const vu = try self.denoiser.joint(&sc, st, ctx_u);
                 const w = o.cfg_strength;
                 vl = try sc.sub(try sc.mulS(vc.latent, 1 + w), try sc.mulS(vu.latent, w));
                 vm = try sc.sub(try sc.mulS(vc.camera, 1 + w), try sc.mulS(vu.camera, w));
@@ -502,8 +506,8 @@ test "idol oracle: one velocity, guided and not, matches the reference (IDOL_FIX
     defer sc.deinit();
     const f1 = fx.get("feature1").?;
     const f2 = fx.get("feature2").?;
-    const ctx = try sc.keep(try e.denoiser.context(&sc, f1, f2));
-    const ctx_u = try sc.keep(try e.denoiser.context(&sc, try sc.zeros(mlx.getShape(f1), .float32), try sc.zeros(mlx.getShape(f2), .float32)));
+    const ctx = try e.denoiser.context(&sc, f1, f2);
+    const ctx_u = try e.denoiser.context(&sc, try sc.zeros(mlx.getShape(f1), .float32), try sc.zeros(mlx.getShape(f2), .float32));
     const t = try t2.hostF32(&sc, fx.get("t").?);
     const v = try e.denoiser.velocity(&sc, fx.get("noise_latent").?, fx.get("noise_camera").?, t[0], ctx);
     try t2.expectClose("v_latent", &sc, v.latent, fx.get("v_latent").?, 0.995, 0.05);
@@ -541,7 +545,7 @@ test "idol oracle: the fused glue keeps the velocity as close to the reference a
     for (&got, 0..) |*out, arm| {
         glue.disabled_for_test = arm == 0;
         defer glue.disabled_for_test = false;
-        const ctx = try sc.keep(try e.denoiser.context(&sc, fx.get("feature1").?, fx.get("feature2").?));
+        const ctx = try e.denoiser.context(&sc, fx.get("feature1").?, fx.get("feature2").?);
         out.* = try t2.hostF32(&sc, (try e.denoiser.velocity(&sc, fx.get("noise_latent").?, fx.get("noise_camera").?, t[0], ctx)).latent);
     }
     const chain = cosine(got[0], want);
@@ -568,7 +572,7 @@ test "idol oracle: the w8a8 route stays within its bar of the packed velocity (I
         w8a8.w8a8State().enabled = arm == 1;
         const e = try openEngine(s);
         defer e.deinit();
-        const ctx = try sc.keep(try e.denoiser.context(&sc, fx.get("feature1").?, fx.get("feature2").?));
+        const ctx = try e.denoiser.context(&sc, fx.get("feature1").?, fx.get("feature2").?);
         out.* = (try e.denoiser.velocity(&sc, fx.get("noise_latent").?, fx.get("noise_camera").?, t[0], ctx)).latent;
         try mlx.check(mlx.mlx_array_eval(out.*));
     }

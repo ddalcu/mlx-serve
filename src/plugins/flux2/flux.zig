@@ -6,6 +6,7 @@
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
+const scope_mod = @import("../../mlx/scope.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
 const sse = @import("../../sdk/media/progress.zig");
@@ -31,6 +32,8 @@ const Resnet = resnet_blk.Resnet;
 
 /// The VAE's GroupNorm: 32 groups, f32 statistics, bf16 out.
 const vae_norm: resnet_blk.Norm = .{ .flat = .{ .eps = 1e-6, .out = .bfloat16 } };
+/// The encoder's: GroupNorm + SiLU in one kernel pass, its top stages being 128 channels at full resolution.
+const vae_enc_norm: resnet_blk.Norm = .{ .flat = .{ .eps = 1e-6, .out = .bfloat16, .fused = true } };
 
 // ── Weight loading ──
 
@@ -1126,17 +1129,20 @@ pub const VaeEncoder = struct {
     fn encodeWith(self: *const VaeEncoder, parent: *Graph, img: Array, key: ?Array) !Array {
         var g = parent.scope();
         defer g.deinit();
+        // Each stage in its own child, evaluated before the next is built (`endStage`).
+        var c = g.scope();
+        defer c.deinit();
         const signed = try g.sub(try g.mul(img, try g.scalar(2.0, .float32)), try g.scalar(1.0, .float32));
         var h = try g.astype(try g.transpose(signed, &.{ 0, 2, 3, 1 }), .bfloat16);
-        h = try conv_blk.conv2d(&g, h, self.conv_in_w, self.conv_in_b, 1, 1, 1);
+        try endStage(&g, &c, &h, try conv_blk.conv2d(&c, h, self.conv_in_w, self.conv_in_b, 1, 1, 1));
         for (0..4) |bi| {
-            for (&self.down_resnets[bi]) |*r| h = try r.forward(&g, vae_norm, h);
-            if (bi < 3) h = try conv_blk.downsample2x(&g, h, self.down_conv_w[bi], self.down_conv_b[bi]);
+            for (&self.down_resnets[bi]) |*r| try endStage(&g, &c, &h, try r.forward(&c, vae_enc_norm, h));
+            if (bi < 3) try endStage(&g, &c, &h, try conv_blk.downsample2x(&c, h, self.down_conv_w[bi], self.down_conv_b[bi]));
         }
-        h = try self.mid_r0.forward(&g, vae_norm, h);
-        h = try resnet_blk.midAttention(&g, vae_norm, h, self.mid_attn.gnw, self.mid_attn.gnb, &self.mid_attn);
-        h = try self.mid_r1.forward(&g, vae_norm, h);
-        h = try g.silu(try gn_blk.groupNormFlat(&g, h, self.norm_out_w, self.norm_out_b, 32, 1e-6, .bfloat16));
+        try endStage(&g, &c, &h, try self.mid_r0.forward(&c, vae_enc_norm, h));
+        try endStage(&g, &c, &h, try resnet_blk.midAttention(&c, vae_norm, h, self.mid_attn.gnw, self.mid_attn.gnb, &self.mid_attn));
+        try endStage(&g, &c, &h, try self.mid_r1.forward(&c, vae_enc_norm, h));
+        h = try vae_enc_norm.applySilu(&g, h, self.norm_out_w, self.norm_out_b);
         h = try conv_blk.conv2d(&g, h, self.conv_out_w, self.conv_out_b, 1, 1, 1);
         const qc = try conv_blk.conv2d(&g, h, self.quant_w, self.quant_b, 1, 0, 1);
         // The mean is the first 32 channels, the log-variance the next 32.
@@ -1152,6 +1158,18 @@ pub const VaeEncoder = struct {
         return parent.keep(try g.div(try g.sub(packed_lat, bn.mean), bn.std));
     }
 };
+
+/// Ends an encoder stage: `y` (built in `c`) queued and kept by `g` as the new `h`, the previous stage waited for, and
+/// the stage's handles and the old `h` freed. One stage in flight: the next reuses their buffers, so a request touches
+/// one or two stages' working set, not the whole encoder's (each full-resolution tensor is hundreds of MB).
+fn endStage(g: *Graph, c: *Graph, h: *Array, y: Array) !void {
+    const kept = try g.keep(y);
+    try scope_mod.queue(kept, h.*);
+    c.deinit();
+    c.* = g.scope();
+    g.drop(h.*);
+    h.* = kept;
+}
 
 pub fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !VaeEncoder {
     const dir = try fmtKey(allocator, "{s}/vae", .{model_dir});

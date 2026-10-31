@@ -23,6 +23,9 @@ Weights, quant, loading:
 - **Dense checkpoints**: scales absence PER-TENSOR (`getLayerScaleOpt`); dense contracted weights owe `maybeTransposeForBf16` — never depthwise conv or SSM state.
 - **ModelOpt's NVFP4 `weight_scale_2` is amax / (448 x 6); MLX's nvfp4 `global_scale` is the amax** (`modelopt_pack.dequantDense`): passed through raw, every weight shrank 2688x and the vision tower saw a blank image.
 - **A pack runs in its reference's numerics** (`actDtype`, `LoadOpts.keep_f16`; Bonsai 2 f16 + f32 GDN state; qwen4 f32 GDN state + gate, `MLX_SERVE_GDN_STATE_F32=0` = bf16); constants take the activation dtype. Guard: `test_hadamard_fidelity.sh`.
+- **`Scope.mulS` / `addS` / `scalar` make a 0-d f32 array: on an f16/bf16 activation the result PROMOTES to f32** (DINOv3's
+  rotate-half ran every bf16 layer in f32, BiRefNet's modulator its whole decoder); use `mulLike`, `scalarLike`, `neg`.
+  Guard: `dinov3: RoPE keeps a bf16 head in bf16`.
 - **A plugin's fork of an SDK function keeps every arm its loader can bind**, else refuses that layout at load BY NAME (`qwen4_exp` `unservedLayout`): the trunk copy dropped `per_expert_scale`; ModelOpt FP4 decoded garbage, tapes stayed green.
 - **Every new LM or media port supports a bf16 pack AND the quantized ones**: loader, converter presets and app catalog carry both; quantized is the default download, bf16 the quality reference.
 - **A gather-read table is quantized only where the READER has a quantized-gather path** (media `NEVER_QUANTIZE`; LM `embed_tokens` via `gatherQuantizedRows`).
@@ -42,7 +45,7 @@ Vision:
 Media backends:
 - **A condition works only as TRAINING fed it**: `instrumental` as TEXT (`[Instrumental]`; + lyrics = NAMED 400, `instrumentalConflicts`); Stable Audio 3 `seconds_total` as whole seconds >= 1 (`trainedSeconds`; a fraction is noise, reference too).
 - **xatlas segments one connected surface on ONE thread** (`uvwrap.parametrizeParallel`: median-split regions as `faceMaterialData` = one chart group per core; 1M faces 424 s → 3.4 s). Hunyuan paint keeps `parametrize`.
-- **A flow-DiT forward over tens of thousands of tokens needs a scope PER BLOCK** (`Dit.forward`, `Decoder.run`): one scope around the whole forward keeps every block's intermediates alive together; fixture-sized oracles never show it.
+- **A flow-DiT forward over tens of thousands of tokens needs a scope PER BLOCK**, an encoder one per stage (`Dit.forward`, `Decoder.run`, DINOv3, the FLUX.2 `VaeEncoder`): one scope around the whole forward keeps every block's intermediates alive together, each a fresh first-touch per request; fixture-sized oracles never show it.
 - **A full-resolution f32 VAE stage is BANDED, exact because everything but its 3x3 convs is per-pixel** (`qwen_image.Stage.banded` + `Conv.forwardStrips`); MLX's peak counter does not see the whole-stage peak. Bar = the fixture oracle with bands forced.
 - **A pinned library's op TRANSIENT is invisible to residency bills** (#321, #424): `conv3dDepthChunked` windows decoder convs; H3 `encodeMoments` EVALS per tile pass. Diff conv DISPATCH per mlx bump.
 - **Canvas**: `recommendedResolution(totalGB:)` per Mac, capped by `autoCanvasCapPixels`; two-stage denoises at HALF; `maxFramePayloadBytes` is a TRANSPORT limit. A tiled decoder whose positions normalize over the EXTENT refuses (`error.TilingUnsupported`).

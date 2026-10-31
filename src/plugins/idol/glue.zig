@@ -9,6 +9,13 @@ const log = @import("../../sdk/util/log.zig");
 
 pub const QKV_SOURCE = kernelSource("plugins/idol/kernels/qkv_prep.metal");
 pub const GELU_SOURCE = kernelSource("plugins/idol/kernels/bias_gelu.metal");
+pub const GATE_SOURCE = kernelSource("plugins/idol/kernels/gate_residual.metal");
+pub const NORM_MOD_SOURCE = kernelSource("plugins/idol/kernels/norm_mod.metal");
+pub const REPO_FOLD_SOURCE = kernelSource("plugins/idol/kernels/repo_fold.metal");
+pub const REPO_ANGLES_SOURCE = kernelSource("plugins/idol/kernels/repo_angles.metal");
+pub const DEFORM_SOURCE = kernelSource("plugins/idol/kernels/deform_cols.metal");
+pub const ATTN_SOURCE = kernelSource("plugins/idol/kernels/attention.metal");
+pub const ATTN_HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 
 const HD: c_int = 64;
 
@@ -50,19 +57,171 @@ fn apply(kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_confi
 
 var qkv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gelu_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var norm_mod_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var repo_fold_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var repo_angles_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var deform_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var attn_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
-pub const Qkv = struct { q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array };
+/// softmax(q k^T * scale + kbias) v for q, k, v f16 heads-major `[1, H, L, 64]` and `kbias` f32 `[L]` in base 2 (the
+/// score bias times log2 e) on the NAX tensor unit; out f16 token-major `[L, H*64]`. For a biased pass: MLX's sdpa is
+/// as fast unmasked, slower with a mask. Null off NAX or outside those shapes.
+pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, kbias: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (disabled_for_test or !mlx.streamIsGpu(s) or !@import("../../mlx/device.zig").naxAvailable()) return null;
+    const sh = mlx.getShape(q);
+    if (sh.len != 4 or sh[0] != 1 or sh[3] != HD) return null;
+    for ([_]mlx.mlx_array{ q, k, v }) |a| {
+        if (mlx.mlx_array_dtype(a) != .float16) return null;
+        const o = mlx.getShape(a);
+        if (o.len != 4 or o[1] != sh[1] or o[2] != sh[2] or o[3] != HD) return null;
+    }
+    const h = sh[1];
+    const l = sh[2];
+    if (mlx.mlx_array_dtype(kbias) != .float32 or mlx.mlx_array_size(kbias) != @as(usize, @intCast(l))) return null;
+    if (attn_kernel == null) {
+        const iv = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{ "q", "k", "v", "scale", "kbias" }, 5);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{"out"}, 1);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const kn = mlx.mlx_fast_metal_kernel_new("msv_idol_attention", iv, ov, ATTN_SOURCE, ATTN_HEADER, true, false);
+        if (kn.ctx == null) return error.MetalKernelCompileFailed;
+        attn_kernel = kn;
+    }
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ l, h * HD }, 2, .float16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divTrunc(l + 63, 64) * 128, h, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "HAS_BIAS", true));
+    const sc = mlx.mlx_array_new_float(scale);
+    defer _ = mlx.mlx_array_free(sc);
+    var out: [1]mlx.mlx_array = undefined;
+    try apply(attn_kernel.?, cfg, &.{ q, k, v, sc, kbias }, &out, s);
+    return out[0];
+}
 
-/// `y` the fused qkv projection `[.., 3*H*64]` (q | k | v, head-major inside each); `cos` / `sin` f32 `[.., H, 32]`
-/// per token and head; `q_gamma` / `k_gamma` f32 `[H, 64]`. q and k are rotated (adjacent pairs, f32 math, rounded to
-/// y's dtype) and then RMS-normalized per head; all three come out heads-major `[1, H, L, 64]`.
-pub fn qkvPrep(y: mlx.mlx_array, q_gamma: mlx.mlx_array, k_gamma: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, eps: f32, heads: c_int, s: mlx.mlx_stream) !?Qkv {
+/// torchvision `deform_conv2d`'s columns for BiRefNet's decoder: `x` `[h*w, C]` (f16 or bf16, C a multiple of 4),
+/// `off` f32 `[h*w, 2K]` (each tap's row then column offset), `msk` `[h*w, K]` of x's dtype, K = k*k taps. Out
+/// `[h*w, K*C]`, tap-major: each tap's bilinear sample (zero outside the plane) times its modulator.
+pub fn deformCols(x: mlx.mlx_array, off: mlx.mlx_array, msk: mlx.mlx_array, k: c_int, h: c_int, w: c_int, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (disabled_for_test or !mlx.streamIsGpu(s)) return null;
+    const dt = mlx.mlx_array_dtype(x);
+    if (!eligible(dt) or mlx.mlx_array_dtype(msk) != dt or mlx.mlx_array_dtype(off) != .float32) return null;
+    const hw: usize = @intCast(h * w);
+    const taps = k * k;
+    const c: c_int = @intCast(mlx.mlx_array_size(x) / @max(hw, 1));
+    if (hw == 0 or @rem(c, 4) != 0 or mlx.mlx_array_size(x) != hw * @as(usize, @intCast(c))) return null;
+    if (mlx.mlx_array_size(off) != hw * @as(usize, @intCast(2 * taps)) or mlx.mlx_array_size(msk) != hw * @as(usize, @intCast(taps))) return null;
+    const x2 = try rowsOf(x, c, s);
+    defer _ = mlx.mlx_array_free(x2);
+    const off2 = try rowsOf(off, 2 * taps, s);
+    defer _ = mlx.mlx_array_free(off2);
+    const msk2 = try rowsOf(msk, taps, s);
+    defer _ = mlx.mlx_array_free(msk2);
+    if (deform_kernel == null) deform_kernel = try makeKernel("msv_idol_deform_cols", &.{ "X", "OFF", "MSK" }, &.{"O"}, DEFORM_SOURCE);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ h * w, taps * c }, 2, dt));
+    const cx = @min(@divExact(c, 4), 32);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(c, 4), taps, h * w));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, cx, 1, @divTrunc(256, cx)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KS", k));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", h));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "W", w));
+    var out: [1]mlx.mlx_array = undefined;
+    try apply(deform_kernel.?, cfg, &.{ x2, off2, msk2 }, &out, s);
+    return out[0];
+}
+
+/// `x` as `[rows, n]` (its last axis `n`): the row-major view a kernel reads.
+fn rowsOf(x: mlx.mlx_array, n: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const rows: c_int = @intCast(mlx.mlx_array_size(x) / @as(usize, @intCast(n)));
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_reshape(&o, x, &[_]c_int{ rows, n }, 2, s));
+    return o;
+}
+
+/// One output shaped like `like`.
+fn shapedLike(out: mlx.mlx_array, like: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    defer _ = mlx.mlx_array_free(out);
+    const sh = mlx.getShape(like);
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_reshape(&o, out, sh.ptr, sh.len, s));
+    return o;
+}
+
+/// `x + (y + bias) * gate` for `x`, `y` `[.., N]` and `bias`, `gate` N values, all one dtype: each op rounds to that
+/// dtype as the chain's add, multiply and add do (bit-equal).
+pub fn gateResidual(x: mlx.mlx_array, y: mlx.mlx_array, bias: mlx.mlx_array, gate: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (disabled_for_test or !mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(y);
     if (!eligible(dt)) return null;
+    for ([_]mlx.mlx_array{ x, bias, gate }) |a| if (mlx.mlx_array_dtype(a) != dt) return null;
+    const sh = mlx.getShape(y);
+    if (sh.len == 0 or mlx.mlx_array_size(x) != mlx.mlx_array_size(y)) return null;
+    const n: c_int = sh[sh.len - 1];
+    if (@rem(n, 4) != 0 or mlx.mlx_array_size(bias) != @as(usize, @intCast(n)) or mlx.mlx_array_size(gate) != @as(usize, @intCast(n))) return null;
+    const x2 = try rowsOf(x, n, s);
+    defer _ = mlx.mlx_array_free(x2);
+    const y2 = try rowsOf(y, n, s);
+    defer _ = mlx.mlx_array_free(y2);
+    if (gate_kernel == null) gate_kernel = try makeKernel("msv_idol_gate_residual", &.{ "X", "Y", "B", "G" }, &.{"O"}, GATE_SOURCE);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const rows = mlx.getShape(y2)[0];
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, n }, 2, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @divExact(rows * n, 4), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    var out: [1]mlx.mlx_array = undefined;
+    try apply(gate_kernel.?, cfg, &.{ x2, y2, bias, gate }, &out, s);
+    return try shapedLike(out[0], y, s);
+}
+
+/// LayerNorm of `x` `[.., N]` (no affine, statistics in f32) then `* (1 + scale) + shift`, `scale` and `shift` N
+/// values of x's dtype; each step rounds to that dtype as the chain's do. N a multiple of 128, at most 4096.
+pub fn normMod(x: mlx.mlx_array, scale: mlx.mlx_array, shift: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (disabled_for_test or !mlx.streamIsGpu(s)) return null;
+    const dt = mlx.mlx_array_dtype(x);
+    if (!eligible(dt) or mlx.mlx_array_dtype(scale) != dt or mlx.mlx_array_dtype(shift) != dt) return null;
+    const sh = mlx.getShape(x);
+    if (sh.len == 0) return null;
+    const n: c_int = sh[sh.len - 1];
+    if (@rem(n, 128) != 0 or n > 4096 or mlx.mlx_array_size(scale) != @as(usize, @intCast(n)) or mlx.mlx_array_size(shift) != @as(usize, @intCast(n))) return null;
+    const x2 = try rowsOf(x, n, s);
+    defer _ = mlx.mlx_array_free(x2);
+    if (norm_mod_kernel == null) norm_mod_kernel = try makeKernel("msv_idol_norm_mod", &.{ "X", "SC", "SH", "eps" }, &.{"O"}, NORM_MOD_SOURCE);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const rows = mlx.getShape(x2)[0];
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, n }, 2, dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * @divExact(n, 4), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @divExact(n, 4), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    const eps_a = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_a);
+    var out: [1]mlx.mlx_array = undefined;
+    try apply(norm_mod_kernel.?, cfg, &.{ x2, scale, shift, eps_a }, &out, s);
+    return try shapedLike(out[0], x, s);
+}
+
+pub const Qkv = struct { q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array };
+
+/// `y` the fused qkv projection `[.., 3*H*64]` (q | k | v, head-major inside each) before its `bias`; `cos` / `sin`
+/// f32 `[.., H, 32]` per token and head; `q_gamma` / `k_gamma` f32 `[H, 64]`. The bias is added (rounded to y's dtype),
+/// q and k are rotated (adjacent pairs, f32 math, rounded to y's dtype) and then RMS-normalized per head; all three
+/// come out heads-major `[1, H, L, 64]`.
+pub fn qkvPrep(y: mlx.mlx_array, bias: mlx.mlx_array, q_gamma: mlx.mlx_array, k_gamma: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, eps: f32, heads: c_int, s: mlx.mlx_stream) !?Qkv {
+    if (disabled_for_test or !mlx.streamIsGpu(s)) return null;
+    const dt = mlx.mlx_array_dtype(y);
+    if (!eligible(dt) or mlx.mlx_array_dtype(bias) != dt) return null;
     const width: c_int = 3 * heads * HD;
     const sh = mlx.getShape(y);
-    if (sh.len == 0 or sh[sh.len - 1] != width) return null;
+    if (sh.len == 0 or sh[sh.len - 1] != width or mlx.mlx_array_size(bias) != @as(usize, @intCast(width))) return null;
     const rows: c_int = @intCast(mlx.mlx_array_size(y) / @as(usize, @intCast(width)));
     const table: usize = @as(usize, @intCast(rows)) * @as(usize, @intCast(heads)) * @as(usize, @intCast(HD / 2));
     for ([_]mlx.mlx_array{ cos, sin }) |t| if (mlx.mlx_array_dtype(t) != .float32 or mlx.mlx_array_size(t) != table) return null;
@@ -71,7 +230,7 @@ pub fn qkvPrep(y: mlx.mlx_array, q_gamma: mlx.mlx_array, k_gamma: mlx.mlx_array,
     var y2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(y2);
     try mlx.check(mlx.mlx_reshape(&y2, y, &[_]c_int{ rows, width }, 2, s));
-    if (qkv_kernel == null) qkv_kernel = try makeKernel("msv_idol_qkv_prep", &.{ "Y", "COS", "SIN", "QG", "KG", "eps" }, &.{ "OQ", "OK", "OV" }, QKV_SOURCE);
+    if (qkv_kernel == null) qkv_kernel = try makeKernel("msv_idol_qkv_prep", &.{ "Y", "B", "COS", "SIN", "QG", "KG", "eps" }, &.{ "OQ", "OK", "OV" }, QKV_SOURCE);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     for (0..3) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, heads, rows, HD }, 4, dt));
@@ -83,8 +242,84 @@ pub fn qkvPrep(y: mlx.mlx_array, q_gamma: mlx.mlx_array, k_gamma: mlx.mlx_array,
     const eps_a = mlx.mlx_array_new_float(eps);
     defer _ = mlx.mlx_array_free(eps_a);
     var outs: [3]mlx.mlx_array = undefined;
-    try apply(qkv_kernel.?, cfg, &.{ y2, cos, sin, q_gamma, k_gamma, eps_a }, &outs, s);
+    try apply(qkv_kernel.?, cfg, &.{ y2, bias, cos, sin, q_gamma, k_gamma, eps_a }, &outs, s);
     return .{ .q = outs[0], .k = outs[1], .v = outs[2] };
+}
+
+/// The RePo layer's LayerNorm folded into its gate | content projection: `p` `[.., PARTS * N2]` f32 is the row of `h`
+/// `[.., C]` (f16 or bf16) times the stacked maps with the norm's weight folded in (their TF32-exact part, then the
+/// rest when PARTS is 2); `cs` `[N2]` their column sums, `bw` `[N2]` the norm's bias through the maps. Out `[.., N2]`
+/// f32: rstd * (p's parts summed - mean * cs) + bw, the statistics of h's row two-pass in f32.
+pub fn repoFold(p: mlx.mlx_array, h: mlx.mlx_array, cs: mlx.mlx_array, bw: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (disabled_for_test or !mlx.streamIsGpu(s)) return null;
+    if (!eligible(mlx.mlx_array_dtype(h))) return null;
+    for ([_]mlx.mlx_array{ p, cs, bw }) |a| if (mlx.mlx_array_dtype(a) != .float32) return null;
+    const n2: c_int = @intCast(mlx.mlx_array_size(cs));
+    const ps = mlx.getShape(p);
+    const hs = mlx.getShape(h);
+    if (n2 == 0 or ps.len == 0 or ps.len > 8 or hs.len == 0 or mlx.mlx_array_size(bw) != @as(usize, @intCast(n2))) return null;
+    const width = ps[ps.len - 1];
+    const parts = @divTrunc(width, n2);
+    if ((parts != 1 and parts != 2) or parts * n2 != width) return null;
+    const rows: c_int = @intCast(mlx.mlx_array_size(p) / @as(usize, @intCast(width)));
+    const c: c_int = hs[hs.len - 1];
+    if (mlx.mlx_array_size(h) != @as(usize, @intCast(rows)) * @as(usize, @intCast(c))) return null;
+    const p2 = try rowsOf(p, width, s);
+    defer _ = mlx.mlx_array_free(p2);
+    const h2 = try rowsOf(h, c, s);
+    defer _ = mlx.mlx_array_free(h2);
+    if (repo_fold_kernel == null) repo_fold_kernel = try makeKernel("msv_idol_repo_fold", &.{ "P", "H", "CS", "BW", "eps" }, &.{"GC"}, REPO_FOLD_SOURCE);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, n2 }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", mlx.mlx_array_dtype(h)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "PARTS", parts));
+    const eps_a = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_a);
+    var out: [1]mlx.mlx_array = undefined;
+    try apply(repo_fold_kernel.?, cfg, &.{ p2, h2, cs, bw, eps_a }, &out, s);
+    defer _ = mlx.mlx_array_free(out[0]);
+    var shape: [8]c_int = undefined;
+    @memcpy(shape[0..ps.len], ps);
+    shape[ps.len - 1] = n2;
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_reshape(&o, out[0], &shape, ps.len, s));
+    return o;
+}
+
+pub const Tables = struct { cos: mlx.mlx_array, sin: mlx.mlx_array };
+
+/// The rotary tables of a RePo layer from its gate and content projections side by side, `gc` `[.., 2K]` f32: `wf` its
+/// final map dense f32 `[K, 3H]` (transposed), `freqs` the 32 per-pair frequencies (f32) and `axis` the axis each reads
+/// (i32). cos and sin of `delta * freq * pi` out, f32 `[.., H, 32]`. K at most 1024, H at most 64.
+pub fn repoAngles(gc: mlx.mlx_array, wf: mlx.mlx_array, freqs: mlx.mlx_array, axis: mlx.mlx_array, heads: c_int, s: mlx.mlx_stream) !?Tables {
+    if (disabled_for_test or !mlx.streamIsGpu(s)) return null;
+    for ([_]mlx.mlx_array{ gc, wf, freqs }) |a| if (mlx.mlx_array_dtype(a) != .float32) return null;
+    if (mlx.mlx_array_dtype(axis) != .int32 or heads > 64 or heads < 1) return null;
+    const sh = mlx.getShape(gc);
+    if (sh.len == 0 or @rem(sh[sh.len - 1], 2) != 0) return null;
+    const k: c_int = @divExact(sh[sh.len - 1], 2);
+    if (k > 1024 or mlx.mlx_array_size(wf) != @as(usize, @intCast(k * 3 * heads)) or mlx.mlx_array_size(freqs) != 32 or mlx.mlx_array_size(axis) != 32) return null;
+    const gc2 = try rowsOf(gc, 2 * k, s);
+    defer _ = mlx.mlx_array_free(gc2);
+    if (repo_angles_kernel == null) repo_angles_kernel = try makeKernel("msv_idol_repo_angles", &.{ "GC", "WF", "FQ", "AXIS" }, &.{ "OC", "OS" }, REPO_ANGLES_SOURCE);
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const rows = mlx.getShape(gc2)[0];
+    var out_shape: [8]c_int = undefined;
+    @memcpy(out_shape[0 .. sh.len - 1], sh[0 .. sh.len - 1]);
+    out_shape[sh.len - 1] = heads;
+    out_shape[sh.len] = 32;
+    for (0..2) |_| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, sh.len + 1, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, rows * 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", heads));
+    var out: [2]mlx.mlx_array = undefined;
+    try apply(repo_angles_kernel.?, cfg, &.{ gc2, wf, freqs, axis }, &out, s);
+    return .{ .cos = out[0], .sin = out[1] };
 }
 
 /// `gelu_tanh(y + bias)` for `y` `[.., N]` and `bias` `[N]` of one dtype: the sum rounds to that dtype as an add

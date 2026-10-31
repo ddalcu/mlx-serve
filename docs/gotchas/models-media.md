@@ -688,6 +688,14 @@ rounding, as PyTorch's fused GELU; the chain's eight f16 roundings flatten that 
 `mx.fast.metal_kernel` in the Python venv against the Python chain, byte for byte. Guard: `kernel contract idol`
 (the bit-equal gate), `idol oracle: the fused glue keeps the velocity as close to the reference as the chain`.
 
+### A 0-d f32 scalar silently ran a bf16 encoder in f32
+Defect: Idol's DINOv3, loaded in bf16, took as long as the f32 one, and BiRefNet in f16 barely sped up. Cause:
+`sc.mulS(x, -1)` in the rotate-half (and `mulS(sigmoid, 2)` on BiRefNet's modulator) multiplies by a 0-d f32 array,
+which MLX promotes like any f32 array: q and k came out f32 and the residual stream followed for every layer. A test
+that only checked the outputs differ from the f32 run passed, since bf16-rounded weights differ too. Fix: `neg`,
+`mulLike` (a scalar in x's dtype). Guard: `dinov3: RoPE keeps a bf16 head in bf16` (it asserts the dtype, not the
+numbers).
+
 ## Parity method
 
 ### Fixtures for fp16-fragile giants are dumped fp32 on CPU
