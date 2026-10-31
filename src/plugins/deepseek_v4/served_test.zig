@@ -58,6 +58,7 @@ const Served = struct {
     after_greedy: bool = false,
 
     fn open(table: *const abi.ModelTable, files: []const sdk.fixture.File, tape: []const u8) !*Served {
+        mlx.installErrorHandler();
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         const p = try a.create(Served);
@@ -959,4 +960,102 @@ test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by t
     var buf: [512]u8 = undefined;
     const dir = buf[0..try tmp.dir.realPath(io, &buf)];
     try testing.expectError(error.PluginDeclinedNoLegacy, model.parseConfig(io, testing.allocator, dir));
+}
+
+const BoundaryProbe = struct {
+    served: *Served,
+    other: *Slot,
+    outer_id: u32,
+    calls: usize = 0,
+    failure: ?anyerror = null,
+
+    fn call(raw: *anyopaque) void {
+        const self: *BoundaryProbe = @ptrCast(@alignCast(raw));
+        self.tick() catch |err| {
+            self.failure = err;
+        };
+    }
+
+    fn tick(self: *BoundaryProbe) !void {
+        const P = @import("../deepseek_v41/plugin.zig");
+        const m: *P.Model = @ptrCast(@alignCast(self.served.xfm.plugin.?.model));
+        try testing.expectEqual(self.outer_id, m.owner);
+        const token: i32 = 13;
+        const ids = mlx.mlx_array_new_data(&token, &.{ 1, 1 }, 2, .int32);
+        defer _ = mlx.mlx_array_free(ids);
+        const out = try self.served.xfm.forwardWith(&self.other.ctx, ids);
+        defer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_array_eval(out));
+        try testing.expectEqual(self.other.ctx.plugin_slot, m.owner);
+        const outer = m.parked.get(self.outer_id) orelse return error.OuterStateNotParked;
+        try testing.expect(outer.st.snap_at != null);
+        self.calls += 1;
+    }
+};
+
+test "deepseek_v41 served boundaries: a co-tenant decode preserves the outer context and prompt snapshot" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    const generate = @import("../../engines/mlx/generate.zig");
+    const previous = generate.prefillCli().*;
+    defer generate.prefillCli().* = previous;
+    generate.prefillCli().override = 256;
+    generate.prefillCli().explicit = true;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const P = @import("../deepseek_v41/plugin.zig");
+    var ids: [1200]u32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast(3 + i % 90);
+    var reference: u32 = 0;
+    var reference_logits: [96]f32 = undefined;
+    for ([_]bool{ false, true }) |interleave| {
+        const p = try Served.open(&P.table, try fixture.v41Files(arena.allocator(), 7), "");
+        defer p.close();
+        const m: *P.Model = @ptrCast(@alignCast(p.xfm.plugin.?.model));
+        // Exercise the excluded-cache module's own prompt snapshot on the resident tiny fixture.
+        m.cfg.dsv41_streamed = true;
+        try testing.expect(!p.xfm.prefillsWholePrompt());
+        var other: Slot = undefined;
+        try other.init();
+        defer other.kv.deinit();
+        if (interleave) {
+            const prefix = [_]i32{ 5, 8, 13 };
+            const input = mlx.mlx_array_new_data(&prefix, &.{ 1, 3 }, 2, .int32);
+            defer _ = mlx.mlx_array_free(input);
+            const out = try p.xfm.forwardWith(&other.ctx, input);
+            defer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_array_eval(out));
+        }
+        try testing.expectEqual(@as(?u64, 0), driver.resumePrompt(&p.xfm, &p.slot.ctx, &ids, null));
+        var probe: BoundaryProbe = .{ .served = p, .other = &other, .outer_id = p.slot.ctx.plugin_slot };
+        var tok: Tokenizer = undefined;
+        var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), testing.allocator, &p.xfm, &tok, &ids, 4, .{ .temperature = 0 }, &.{}, .{
+            .ctx = p.slot.ctx,
+            .lookup_prompt = &ids,
+            .skip_lazy_preforward = true,
+            .interleave_hook = if (interleave) .{ .ctx = &probe, .call = BoundaryProbe.call } else null,
+        });
+        defer gen.deinit(testing.allocator);
+        if (probe.failure) |err| return err;
+        if (interleave) try testing.expect(probe.calls >= 2);
+        try testing.expectEqual(p.slot.ctx.plugin_slot, gen.ctx.plugin_slot);
+        try testing.expectEqual(gen.ctx.plugin_slot, m.owner);
+        try testing.expectEqual(ids.len, gen.ctx.cache.step);
+        try testing.expectEqual(ids.len, m.mdl.dec_state.?.n);
+        const snapshot = m.mdl.dec_state.?.snap orelse return error.PromptSnapshotMissing;
+        try testing.expectEqual(ids.len - 1, snapshot.n);
+        try testing.expectEqual(m.mdl.state_gen, snapshot.gen);
+        if (!interleave) reference = gen.next_token_id else try testing.expectEqual(reference, gen.next_token_id);
+        const next_id: i32 = 44;
+        const next_input = mlx.mlx_array_new_data(&next_id, &.{ 1, 1 }, 2, .int32);
+        defer _ = mlx.mlx_array_free(next_input);
+        const continued = try p.xfm.forwardWith(&gen.ctx, next_input);
+        defer _ = mlx.mlx_array_free(continued);
+        try mlx.check(mlx.mlx_array_eval(continued));
+        try testing.expectEqual(reference_logits.len, mlx.mlx_array_size(continued));
+        const values = (mlx.mlx_array_data_float32(continued) orelse return error.NoContinuationData)[0..reference_logits.len];
+        if (!interleave) @memcpy(&reference_logits, values) else try testing.expectEqualSlices(f32, &reference_logits, values);
+        const next_prompt = ids ++ [_]u32{ 44, 71 };
+        try testing.expectEqual(@as(?u64, ids.len - 1), driver.resumePrompt(&p.xfm, &gen.ctx, &next_prompt, null));
+        @import("../../engines/mlx/plugin/settle.zig").release(&p.xfm, &other.ctx);
+    }
 }

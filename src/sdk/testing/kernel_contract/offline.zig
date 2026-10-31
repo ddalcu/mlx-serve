@@ -117,6 +117,15 @@ fn familyLimit(x: Ctx, lib: []const u8, fun: []const u8, archs: []const []const 
     return least;
 }
 
+/// Measures one captured launch with the same compiler and family sweep as the offline registry test.
+pub fn measureSource(a: std.mem.Allocator, io: std.Io, dir: []const u8, source: []const u8) ![2]u32 {
+    const x: Ctx = .{ .a = a, .io = io, .dir = dir, .os_major = osMajor() };
+    try std.Io.Dir.cwd().createDirPath(io, dir);
+    const fun = functionName(source) orelse return error.NoKernelName;
+    const lib = try library(x, source);
+    return .{ try familyLimit(x, lib, fun, &m1_archs), try familyLimit(x, lib, fun, &m2_archs) };
+}
+
 /// The function MLX compiles: the template instantiation's host name, else the kernel itself.
 fn functionName(source: []const u8) ?[]const u8 {
     if (std.mem.indexOf(u8, source, "[[host_name(\"")) |at| {

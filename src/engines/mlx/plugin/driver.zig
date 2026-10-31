@@ -228,10 +228,14 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
     var settings_buf: [128]u8 = undefined;
+    const original_caps = b.parsed.caps;
+    var runtime_caps = original_caps;
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
         .parsed = &b.parsed,
+        .runtime_caps = &runtime_caps,
+        .aux_cache_budget_bytes = b.aux_cache_budget_bytes orelse 0,
         .settings_json = abi.Str.of(loadSettings(&settings_buf, config)),
         .stream = .{ .ctx = s.ctx },
         .host = @import("../../../host/host_table.zig").get(),
@@ -248,6 +252,8 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         return if (std.mem.eql(u8, why.why.slice(), "MissingWeight")) error.MissingWeight else error.PluginLoadFailed;
     };
     errdefer b.table.unload(m);
+    b.parsed.caps = runtime_caps;
+    errdefer b.parsed.caps = original_caps;
     var xfm = try moduleShell(a, config.*, s);
     errdefer xfm.deinit();
     xfm.cache.deinit();
@@ -283,6 +289,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     bound.* = .{ .table = b.table, .model = m, .drafters = caps.dflash_capture and trunk, .trunk = trunk };
     bind(bound, &b.parsed);
     xfm.plugin = bound;
+    if (!auxEnabled(&xfm)) b.aux_cache_budget_bytes = null;
     log.info("[plugin] {s} serves {s} ({d} layers)\n", .{ b.table.name.slice(), config.model_type, config.num_hidden_layers });
     return xfm;
 }
@@ -984,6 +991,16 @@ fn perSlot(xfm: *Transformer, x: Array, n: usize) ![]Array {
     return rows;
 }
 
+pub fn fundAuxCache(config: *ModelConfig, capacity: u32, ram_enabled: bool, requested: u64) void {
+    const b = config.plugin orelse return;
+    b.aux_cache_budget_bytes = null;
+    if (!b.parsed.caps.streamed_weights or capacity == 0 or !ram_enabled) return;
+    b.aux_cache_budget_bytes = if (requested == 0)
+        @import("../../../host/http/server.zig").PREFIX_CACHE_MEM_DEFAULT
+    else
+        requested;
+}
+
 test "driver: the load settings JSON carries the head and stream_experts settings a model states" {
     var buf: [96]u8 = undefined;
     var config: ModelConfig = .{ .lm_head_mxfp8_override = false };
@@ -1005,6 +1022,42 @@ test "plugin driver: the load settings carry the model's lm_head_mxfp8 and mtp" 
     // A plugin that sizes memory for a request reads the context the model is set to.
     c.ctx_override = 262144;
     try std.testing.expectEqualStrings("{\"lm_head_mxfp8\":false,\"mtp\":false,\"ctx_size\":262144}", loadSettings(&buf, &c));
+}
+
+test "plugin driver: load settings preserve manual context precedence and auto mode" {
+    const state = @import("../../../host/http/server.zig").serverState();
+    const saved = state.server_config.max_context_size;
+    defer state.server_config.max_context_size = saved;
+    var buf: [128]u8 = undefined;
+    var c: ModelConfig = .{};
+    state.server_config.max_context_size = 196608;
+    try std.testing.expectEqualStrings("{\"ctx_size\":196608}", loadSettings(&buf, &c));
+    c.ctx_override = 65536;
+    try std.testing.expectEqualStrings("{\"ctx_size\":65536}", loadSettings(&buf, &c));
+    c.ctx_override = 0;
+    try std.testing.expectEqualStrings("{\"ctx_size\":196608}", loadSettings(&buf, &c));
+    state.server_config.max_context_size = 0;
+    try std.testing.expectEqualStrings("{}", loadSettings(&buf, &c));
+}
+
+test "plugin driver: all load settings and maximum context fit the buffer" {
+    var buf: [128]u8 = undefined;
+    const c: ModelConfig = .{
+        .ctx_override = std.math.maxInt(u32),
+        .lm_head_mxfp8_override = false,
+        .mtp_override = false,
+        .int8_prefill_override = false,
+        .stream_experts_override = .{ .rows = std.math.maxInt(u32) },
+    };
+    const out = loadSettings(&buf, &c);
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out, .{});
+    defer parsed.deinit();
+    const ctx = parsed.value.object.get("ctx_size") orelse return error.ContextMissing;
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(u32)), ctx.integer);
+    try std.testing.expectEqual(@as(i64, std.math.maxInt(u32)), parsed.value.object.get("stream_experts").?.integer);
+    try std.testing.expect(!parsed.value.object.get("mtp").?.bool);
+    try std.testing.expect(!parsed.value.object.get("int8_prefill").?.bool);
+    try std.testing.expect(!parsed.value.object.get("lm_head_mxfp8").?.bool);
 }
 
 test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the tower; its trunk stays" {
@@ -1406,6 +1459,119 @@ test "unsupported disk hooks preserve RAM auxiliary snapshots" {
     auxFree(&x, snap);
     try t.expectEqual(@as(usize, 1), fake.restores);
     try t.expectEqual(@as(usize, 1), fake.frees);
+}
+
+test "plugin load runtime caps: publish only successful load results to host admission" {
+    const llama = @import("../../../plugins/llama/plugin.zig");
+    const proof = @import("proof.zig");
+    const fixture = @import("../../../sdk/bases/proof/fixture.zig");
+    const T = struct {
+        fn effective(ctx: *const abi.LoadCtx) abi.Caps {
+            var caps = ctx.parsed.caps;
+            caps.slot_state = true;
+            caps.active_slots = 2;
+            caps.whole_prompt_prefill = false;
+            return caps;
+        }
+        fn accept(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
+            const m = llama.table.load(ctx, out) orelse return null;
+            ctx.publishRuntimeCaps(effective(ctx));
+            return m;
+        }
+        fn refuse(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
+            ctx.publishRuntimeCaps(effective(ctx));
+            out.* = abi.Verdict.refuse(.unsupported, "runtime caps fixture load refused");
+            return null;
+        }
+        const accepted: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.load = &accept;
+            break :blk t;
+        };
+        const refused: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.load = &refuse;
+            break :blk t;
+        };
+    };
+    var sv: proof.Served = undefined;
+    try sv.open(.{ .quantized = true }, 0xca95);
+    defer sv.close();
+    const binding = sv.cfg.plugin.?;
+    const original_table = binding.table;
+    defer binding.table = original_table;
+    const original_caps = binding.parsed.caps;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    binding.table = &T.refused;
+    try std.testing.expectError(error.PluginLoadFailed, load(io, std.testing.allocator, &sv.cfg, sv.dir, fixture.stream()));
+    try std.testing.expectEqual(@as(u64, @bitCast(original_caps)), @as(u64, @bitCast(sv.cfg.caps())));
+    binding.table = &T.accepted;
+    var x = try load(io, std.testing.allocator, &sv.cfg, sv.dir, fixture.stream());
+    defer x.deinit();
+    try std.testing.expectEqual(@as(u8, 2), sv.cfg.caps().active_slots);
+    try std.testing.expectEqual(@as(u64, @bitCast(sv.cfg.caps())), @as(u64, @bitCast(x.config.caps())));
+    try std.testing.expect(sv.cfg.caps().slot_state and !sv.cfg.caps().whole_prompt_prefill);
+    try std.testing.expectEqual(@as(usize, 1), @import("../admission/pending.zig").activeLimit(sv.cfg.caps().active_slots, 1));
+    try std.testing.expectEqual(@as(usize, 2), @import("../admission/pending.zig").activeLimit(sv.cfg.caps().active_slots, 8));
+}
+
+test "EXL3 cache funding: streamed load gets a positive allowance and disabled caches get none" {
+    var binding: plugin_config.Binding = .{ .table = undefined, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var cfg: ModelConfig = .{ .plugin = &binding };
+    fundAuxCache(&cfg, 8, true, 1234);
+    try std.testing.expectEqual(@as(?u64, 1234), binding.aux_cache_budget_bytes);
+    fundAuxCache(&cfg, 8, true, 0);
+    try std.testing.expectEqual(@as(?u64, @import("../../../host/http/server.zig").PREFIX_CACHE_MEM_DEFAULT), binding.aux_cache_budget_bytes);
+    fundAuxCache(&cfg, 0, true, 1234);
+    try std.testing.expect(binding.aux_cache_budget_bytes == null);
+    fundAuxCache(&cfg, 8, true, 1234);
+    fundAuxCache(&cfg, 8, false, 1234);
+    try std.testing.expect(binding.aux_cache_budget_bytes == null);
+    binding.parsed.caps.streamed_weights = false;
+    fundAuxCache(&cfg, 8, true, 1234);
+    try std.testing.expect(binding.aux_cache_budget_bytes == null);
+}
+
+test "EXL3 cache funding: discovered native pack carries its allowance through the driver load context" {
+    const t = std.testing;
+    const Probe = struct {
+        var received: u64 = 0;
+        fn load(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
+            received = ctx.auxCacheBudget();
+            out.* = abi.Verdict.refuse(.unsupported, "funding probe stops before model allocation");
+            return null;
+        }
+    };
+    for ([_]struct { bank: bool, entries: u32 = 4, ram: bool = true, expected: u64 }{
+        .{ .bank = true, .expected = 8 << 30 },
+        .{ .bank = true, .entries = 0, .expected = 0 },
+        .{ .bank = true, .ram = false, .expected = 0 },
+        .{ .bank = false, .expected = 0 },
+    }) |case| {
+        var tmp = t.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.writeFile(t.io, .{ .sub_path = "config.json", .data = @embedFile("../../../fixtures/model-configs/deepseek_v41-iq-mlx-3.0bpw.json") });
+        if (case.bank) try tmp.dir.writeFile(t.io, .{ .sub_path = "experts.bin", .data = "" });
+        var path: [512]u8 = undefined;
+        const dir = path[0..try tmp.dir.realPath(t.io, &path)];
+        var cfg = try model.parseConfig(t.io, t.allocator, dir);
+        defer cfg.deinit(t.allocator);
+        const binding = cfg.plugin orelse return error.TestExpectedPlugin;
+        try t.expect(!cfg.expert_bank);
+        try t.expectEqual(case.bank, binding.parsed.caps.streamed_weights);
+        fundAuxCache(&cfg, case.entries, case.ram, 8 << 30);
+        const original = binding.table;
+        var probe_table = original.*;
+        probe_table.load = &Probe.load;
+        binding.table = &probe_table;
+        defer binding.table = original;
+        Probe.received = std.math.maxInt(u64);
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        try t.expectError(error.PluginLoadFailed, loadMap(t.io, t.allocator, &cfg, dir, cpu, model.Weights.init(t.allocator)));
+        try t.expectEqual(case.expected, Probe.received);
+        try t.expect(!cfg.expert_bank);
+    }
 }
 
 test "plugin driver: a native round and a finish move moe_seq_offset with cache.step" {

@@ -130,6 +130,7 @@ pub const Loaded = struct {
     model: *anyopaque = undefined,
 
     pub fn open(io: std.Io, a: Allocator, name: []const u8, table: *const model_abi.ModelTable, fx: fixture.Fixture) !Loaded {
+        mlx.installErrorHandler();
         const cfg = fx.file("config.json") orelse return error.FixtureWithoutConfig;
         var self: Loaded = .{ .name = name, .table = table, .staged = try Staged.init(io, a, fx), .stream = mlx.mlx_default_cpu_stream_new() };
         errdefer {
@@ -427,7 +428,7 @@ pub fn expectOneClaimant(list: []const sdk_plugin.Entry, packs: []const fixture.
         _ = common.pick(got) catch {
             const top = std.mem.max(u8, std.mem.sliceAsBytes(got));
             std.debug.print("claims: {s} is claimed at one rank by", .{pack.name});
-            for (list, got) |e, c| if (@intFromEnum(c) == top) std.debug.print(" {s}", .{e.plugin.name});
+            for (list, got) |e, c| if (@backingInt(c) == top) std.debug.print(" {s}", .{e.plugin.name});
             std.debug.print("\n", .{});
             return error.TwoClaimants;
         };

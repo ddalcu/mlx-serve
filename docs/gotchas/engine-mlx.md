@@ -1333,6 +1333,12 @@ the out-of-table `<|audio|>` id for a stand-in in `f.tokens`, but the engine sen
 Fix: the swap covers both forms. Rule: a plugin that reads or rewrites ids handles `f.ids` as well as `f.tokens`.
 Guard: the splice proof runs the same prefill through host tokens and through a device array and demands equal logits.
 
+### Native slot switches shared Engram prompt and confidence policy
+DeepSeek-V4.1 parked its State while its Engram prompt, read-ahead and confidence demand stayed on the model.
+Switching back could read another request's prompt and policy. These fields now follow the State; parking drains
+read-ahead after reserving map capacity, and arming a fresh prompt clears confidence demand. Guard: the
+`deepseek_v41 slot request` regressions cover resident auxiliary-cache and legacy streamed configurations.
+
 ### An embeddings request killed a DeepSeek-V4.1 server
 Defect: `POST /v1/embeddings` against a loaded DeepSeek-V4.1 logged `[mlx] expected a non-empty mlx_array` twice, then
 segfaulted the server. Cause: the embedding forward asks the plugin for hidden rows only (`want_hidden`, no logits);

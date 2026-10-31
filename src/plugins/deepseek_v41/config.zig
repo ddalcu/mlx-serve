@@ -14,6 +14,7 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
 };
 
 pub const model_types = [_][]const u8{"deepseek_v41"};
+pub const stream_active_slots: u8 = 2;
 
 pub const claims = sdk.claimsByType(&model_types);
 
@@ -30,8 +31,20 @@ const ParseError = v4.ParseError;
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
     _ = span;
     const result = v4.parseInto(dir, config_json, stub, true, streamsPack(settings_json.slice()), out, &extend);
-    if (result.isOk()) out.caps.prefix_cache = !of(out).dsv41_streamed;
+    if (result.isOk()) {
+        out.caps.prefix_cache = !of(out).dsv41_streamed;
+    }
     return result;
+}
+
+/// Discovery stays single-flight; only the validated portable M2 path opts into interleaved prompt chunks.
+pub fn runtimeCaps(c: *const Config, parsed: abi.Caps, portable_m2: bool) abi.Caps {
+    if (!c.dsv41_exl3_bank) return parsed;
+    var caps = parsed;
+    caps.whole_prompt_prefill = !portable_m2;
+    caps.slot_state = portable_m2;
+    caps.active_slots = if (portable_m2) stream_active_slots else 0;
+    return caps;
 }
 
 /// The per-model `stream_experts` setting (`true` or a row count) asks for an MLX pack's routed experts to stream.
@@ -191,13 +204,14 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expectEqual(@as(u32, 3), p.spec.native_stages);
 }
 
-test "deepseek_v41 config: an experts.bin bank streams, its prompt passed whole" {
+test "deepseek_v41 config: an experts.bin bank defers device policy until load" {
     var p: abi.Parsed = .{};
     const v = parseFiles(&.{ .{ .name = "config.json", .bytes = iq3 }, .{ .name = "experts.bin", .bytes = "" } }, true, &p);
     try testing.expect(v.isOk());
     defer freeParsed(&p);
     try testing.expect(of(&p).dsv41_streamed and of(&p).dsv41_exl3_bank and p.caps.whole_prompt_prefill and p.caps.streamed_weights);
     try testing.expect(!p.caps.slot_state and !p.caps.batches_decode);
+    try testing.expectEqual(@as(u8, 0), p.caps.active_slots);
     try testing.expect(!p.caps.prefix_cache);
     var q: abi.Parsed = .{};
     try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &q).isOk());
@@ -230,4 +244,38 @@ test "deepseek_v41 config: a layer that would read another ratio's cache is refu
     var p: abi.Parsed = .{};
     const v = parseFiles(&.{.{ .name = "config.json", .bytes = bad }}, true, &p);
     try testing.expect(!v.isOk() and v.code == .unsupported and p.private == null);
+}
+
+test "deepseek_v41 EXL3 discovery preserves the single-flight policy before device validation" {
+    var p: abi.Parsed = .{};
+    try testing.expect(parseFiles(&.{ .{ .name = "config.json", .bytes = iq3 }, .{ .name = "experts.bin", .bytes = "" } }, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expect(p.caps.whole_prompt_prefill);
+    try testing.expect(!p.caps.slot_state and !p.caps.batches_decode);
+    try testing.expectEqual(@as(u8, 0), p.caps.active_slots);
+}
+
+test "deepseek_v41 runtime caps: only portable M2 EXL3 changes discovery policy" {
+    var p: abi.Parsed = .{};
+    try testing.expect(parseFiles(&.{ .{ .name = "config.json", .bytes = iq3 }, .{ .name = "experts.bin", .bytes = "" } }, true, &p).isOk());
+    defer freeParsed(&p);
+    const legacy = runtimeCaps(of(&p), p.caps, false);
+    try testing.expectEqual(@as(u64, @bitCast(p.caps)), @as(u64, @bitCast(legacy)));
+    var expected = p.caps;
+    expected.slot_state = true;
+    expected.active_slots = 2;
+    expected.whole_prompt_prefill = false;
+    const m2 = runtimeCaps(of(&p), p.caps, true);
+    try testing.expectEqual(@as(u64, @bitCast(expected)), @as(u64, @bitCast(m2)));
+    try testing.expectEqual(@as(u64, @bitCast(legacy)), @as(u64, @bitCast(runtimeCaps(of(&p), m2, false))));
+
+    var resident: abi.Parsed = .{};
+    try testing.expect(parseFiles(&.{.{ .name = "config.json", .bytes = iq3 }}, true, &resident).isOk());
+    defer freeParsed(&resident);
+    var streamed: abi.Parsed = .{};
+    try testing.expect(parseWithSettings("{\"stream_experts\":true}", &streamed).isOk());
+    defer freeParsed(&streamed);
+    for ([_]*const abi.Parsed{ &resident, &streamed }) |other| for ([_]bool{ false, true }) |portable_m2| {
+        try testing.expectEqual(@as(u64, @bitCast(other.caps)), @as(u64, @bitCast(runtimeCaps(of(other), other.caps, portable_m2))));
+    };
 }

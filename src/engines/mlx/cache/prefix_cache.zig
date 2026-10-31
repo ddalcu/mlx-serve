@@ -952,8 +952,8 @@ pub const HotPrefixCache = struct {
         // A module snapshot holds this rank's state only: a pipeline or tensor-parallel worker holds the rest.
         // Other models keep `shouldUse` exactly (a tensor-parallel rank 0 keeps its KV cache: the worker is stateless).
         if (plugin_driver.auxBinding(xfm) != null) {
-            if (config.glm_stream or config.dist_span != null or config.dist_shard != null or config.expert_bank) return false;
-            // The plugin's eligibility hook also excludes paired and streamed loaded instances.
+            if (config.glm_stream or config.dist_span != null or config.dist_shard != null) return false;
+            // The plugin's loaded-instance hook decides whether its bank can restore module state.
             return ModuleBinding.init(xfm) != null;
         }
         return shouldUse(config, enable_ssm_checkpoints);
@@ -1939,7 +1939,7 @@ pub const HotPrefixCache = struct {
             self.evictAt(i, "module checkpoint replaced");
             break;
         }
-        if (!self.makeModuleRoom(aux_bytes, cache_key)) return .declined;
+        if (!self.makeModuleRoom(binding, aux_bytes, cache_key)) return .declined;
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -1961,13 +1961,17 @@ pub const HotPrefixCache = struct {
         return .{ .ok = ids.len };
     }
 
-    fn makeModuleRoom(self: *HotPrefixCache, bytes: u64, cache_key: u64) bool {
+    fn moduleRetentionFits(self: *HotPrefixCache, binding: ModuleBinding, bytes: u64) bool {
+        if (self.max_kv_bytes > 0 and (bytes > self.max_kv_bytes or self.residentBytes() > self.max_kv_bytes - bytes)) return false;
+        return @import("budget.zig").moduleCacheFundingFits(&binding.xfm.config, self.residentBytes(), self.stagedHostBytes(), bytes);
+    }
+
+    fn makeModuleRoom(self: *HotPrefixCache, binding: ModuleBinding, bytes: u64, cache_key: u64) bool {
         while (self.entries.items.len >= self.max_entries) {
             if (!self.evictOneLruProgress("count cap", cache_key)) return false;
         }
-        if (self.max_kv_bytes == 0) return true;
-        if (self.residentBytes() > self.max_kv_bytes - bytes) self.cancelPendingModules(.memory_pressure);
-        while (self.residentBytes() > self.max_kv_bytes - bytes) {
+        if (!self.moduleRetentionFits(binding, bytes)) self.cancelPendingModules(.memory_pressure);
+        while (!self.moduleRetentionFits(binding, bytes)) {
             const idx = self.lruIndexExcluding(null, cache_key) orelse return false;
             self.evictAtWithCancellation(idx, "byte budget", .memory_pressure);
         }
@@ -3015,6 +3019,13 @@ pub const HotPrefixCache = struct {
     }
 
     fn stageModule(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, m: ModulePayload, id: u64, s: mlx.mlx_stream) !kv_disk_cache.DiskTier.ModuleSlice {
+        // Shutdown reaches this boundary without the scheduler's staging probe.
+        if (d.pending_module == null and !@import("budget.zig").moduleCacheFundingFits(
+            &m.binding.xfm.config,
+            self.residentBytes(),
+            d.stagedHostBytes(),
+            d.modulePartStagingBytes(id),
+        )) return .busy;
         if (d.pending_module == null and d.modulePartIndex(id) != null) {
             const exported = try ModuleExport.create(self.allocator, m);
             defer exported.destroy(self.allocator);
@@ -10968,6 +10979,7 @@ const ModuleFake = struct {
 
     fn bind(self: *ModuleFake, bound: *plugin_driver.Bound, xfm: *transformer_mod.Transformer) ModuleBinding {
         bound.* = .{ .table = &table, .model = self };
+        xfm.config = .{};
         xfm.plugin = bound;
         return ModuleBinding.init(xfm).?;
     }
@@ -11204,7 +11216,7 @@ test "HotPrefixCache module: model bindings cannot select or consume each other'
     try testing.expectEqual(@as(?*ModuleFake.Snap, &b), models[1].restored);
 }
 
-test "HotPrefixCache module: loaded instance gate keeps distributed and streamed packs cold" {
+test "HotPrefixCache module: loaded instance gate keeps distributed and unsupported packs cold" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
     var xfm: transformer_mod.Transformer = undefined;
@@ -11223,7 +11235,7 @@ test "HotPrefixCache module: loaded instance gate keeps distributed and streamed
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.glm_stream = false;
     cfg.expert_bank = true;
-    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.expert_bank = false;
     cfg.dist_span = .{ .start = 0, .end = 1, .total = 2 };
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
@@ -11244,7 +11256,6 @@ test "HotPrefixCache module: loaded instance gate keeps distributed and streamed
     try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
     cfg.dist_shard = null;
 }
-
 
 test "HotPrefixCache module: incoming workload pays for eviction before an older conversation" {
     var fake: ModuleFake = .{};
@@ -11640,6 +11651,86 @@ test "invalidation retires queued module exports" {
     try testing.expectEqual(@as(u64, 1), hc.module_export_losses_total);
 }
 
+test "EXL3 staged cache funding: commit shares its allowance with a paused writer" {
+    for ([_]u64{ 103, 104 }) |funded| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var config_binding: @import("../plugin/config.zig").Binding = .{ .table = &ModuleFake.table, .aux_cache_budget_bytes = funded };
+        xfm.config.plugin = &config_binding;
+        var hc = try ModuleDiskTest.init(&tmp, 2);
+        defer hc.deinit();
+        const writer = hc.disk.?.writer.?;
+        writer.setPaused(true);
+        defer writer.setPaused(false);
+        const path = try std.fmt.allocPrint(testing.allocator, "{s}/paused-fixture", .{hc.disk.?.root});
+        const bytes = try testing.allocator.alloc(u8, 64);
+        @memset(bytes, 0);
+        try testing.expectEqual(.accepted, try writer.trySubmit(path, bytes));
+        try testing.expectEqual(@as(u64, 64), hc.stagedHostBytes());
+        var first: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+        const expected: CommitStatus = if (funded == 104) .{ .ok = 2 } else .declined;
+        try testing.expectEqual(expected, try first.put(&hc, binding, &.{}));
+        try testing.expectEqual(@as(usize, if (funded == 104) 0 else 1), first.frees);
+        try testing.expect(hc.residentBytes() + hc.stagedHostBytes() <= funded);
+        writer.setPaused(false);
+        writer.drain();
+        config_binding.aux_cache_budget_bytes = 40;
+        var next: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 3, 4 }, .key = 7 };
+        try testing.expectEqual(CommitStatus{ .ok = 2 }, try next.put(&hc, binding, &.{}));
+        try testing.expectEqual(@as(usize, 1), first.frees);
+        try testing.expectEqual(@as(u64, 40), hc.residentBytes());
+        try testing.expectEqual(@as(u64, 0), hc.stagedHostBytes());
+    }
+}
+
+test "EXL3 staged cache funding: direct and shutdown slices refuse unfunded materialization" {
+    for ([_]bool{ false, true }) |shutdown| for (0..3) |cursor| {
+        var tmp = testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        var fake: ModuleFake = .{};
+        var bound: plugin_driver.Bound = undefined;
+        var xfm: transformer_mod.Transformer = undefined;
+        const binding = fake.bind(&bound, &xfm);
+        var config_binding: @import("../plugin/config.zig").Binding = .{ .table = &ModuleFake.table };
+        xfm.config.plugin = &config_binding;
+        var hc = try ModuleDiskTest.init(&tmp, 1);
+        defer hc.deinit();
+        const ids = ModuleDiskTest.ids(7);
+        var snap = ModuleDiskTest.snap(&fake, ids[0..512]);
+        _ = try snap.put(&hc, binding, &.{});
+        const id = hc.entries.items[0].module.?.disk_id.?;
+        const cpu = mlx.weightLoadStream();
+        defer _ = mlx.mlx_stream_free(cpu);
+        for (0..cursor) |_| {
+            try testing.expectEqual(.progress, hc.flushOwedSlice(cpu));
+            hc.disk.?.drainWriter();
+        }
+        const persisted = hc.disk.?.bytes_persisted;
+        const need = hc.disk.?.modulePartStagingBytes(id);
+        try testing.expect(need > 0);
+        config_binding.aux_cache_budget_bytes = hc.residentBytes() + need - 1;
+        const exports = fake.exports;
+        var tally: ShutdownTally = .{};
+        const result = if (shutdown) hc.shutdownSlice(cpu, &tally) else hc.flushOwedSlice(cpu);
+        try testing.expectEqual(.busy, result);
+        try testing.expectEqual(exports, fake.exports);
+        try testing.expectEqual(@as(u64, 0), hc.stagedHostBytes());
+        try testing.expectEqual(persisted, hc.disk.?.bytes_persisted);
+        try testing.expectEqual(@as(usize, 0), snap.frees);
+        try testing.expect(hc.disk_dirty);
+        // The exact funded boundary admits the same slice without changing its source.
+        config_binding.aux_cache_budget_bytes.? += 1;
+        try testing.expectEqual(.progress, if (shutdown) hc.shutdownSlice(cpu, &tally) else hc.flushOwedSlice(cpu));
+        if (cursor == 2) try testing.expect(fake.exports > exports);
+        try testing.expect(hc.disk.?.bytes_persisted > persisted);
+        hc.disk.?.drainWriter();
+    };
+}
+
 test "expired shutdown starts no module files" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -11956,4 +12047,26 @@ test "shutdown counts published module records" {
     try testing.expectEqual(@as(u64, 0), t.failures);
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
     try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+}
+
+test "HotPrefixCache EXL3: an enabled module bank uses the shared cache without enabling shell restore" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    _ = fake.bind(&bound, &xfm);
+    var cfg: model_mod.ModelConfig = .{ .expert_bank = true };
+    cfg.legacy.caps.prefix_cache = false;
+    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    fake.enabled = false;
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    fake.enabled = true;
+    cfg.dist_shard = .{ .rank = 0, .size = 2 };
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    cfg.dist_shard = null;
+    cfg.dist_span = .{ .start = 0, .end = 1, .total = 2 };
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
+    cfg.dist_span = null;
+    xfm.plugin = null;
+    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, false, &xfm));
 }

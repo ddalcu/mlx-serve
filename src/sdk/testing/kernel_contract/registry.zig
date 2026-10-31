@@ -30,6 +30,7 @@ const areas = .{
     @import("../../../plugins/ltx/contract.zig"),
     @import("../../quant/gguf/contract.zig"),
     @import("../../quant/exl3/contract.zig"),
+    @import("../../quant/exl3/stream_contract.zig"),
     @import("../../blocks/mlp/contract.zig"),
     @import("../../quant/contract.zig"),
     @import("../../blocks/dit/contract.zig"),

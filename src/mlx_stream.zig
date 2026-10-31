@@ -25,7 +25,6 @@ pub const glm = struct {
     pub const generation_headroom: u64 = @import("plugins/glm_moe_dsa/settings.zig").Config.default_max_output;
 };
 
-
 /// Every arch the package serves through the SDK's table (`sdk.Arch.of`), in claim order (the conformance suite's list;
 /// the host's glue binds each arch by its own entry: `glm`).
 pub const archs = .{@import("plugins/glm_moe_dsa/arch.zig")};
@@ -38,9 +37,10 @@ pub const bank_source = @import("sdk/weights/streamed/bank_source.zig");
 pub const mlx_pack = @import("sdk/weights/streamed/mlx_pack.zig");
 /// An EXL3 expert bank streamed for a resident trunk (`sdk/weights/streamed.zig` `Exl3`).
 pub const exl3_source = @import("sdk/weights/streamed/exl3_source.zig");
+/// The streamed EXL3 launch contract, shared with the host's kernel-contract tests.
+pub const exl3_kernels = @import("sdk/quant/exl3/stream/kernels.zig");
 /// GLM-5.3-Flash's EXL3 bank for the glm5_next trunk (the stream of record behind `Routed`).
 pub const glm5n_source = @import("sdk/weights/streamed/glm5n_source.zig");
 /// The streamed halves of the dupes parity harnesses (test builds only): each arch's trunk over a pack, for the main
 /// test module's `plugins/<model>/stream/dupes_test.zig` to compare against the resident arch.
-pub const dupes = if (@import("builtin").is_test) struct {
-} else struct {};
+pub const dupes = if (@import("builtin").is_test) struct {} else struct {};

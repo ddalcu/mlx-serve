@@ -156,6 +156,32 @@ fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, ma
     if (!plugin_driver.auxRestoreAt(binding.xfm, id, snapshot, match.n).isOk()) return error.ModuleRestoreFailed;
 }
 
+const PrefillProbe = struct {
+    sch: *Scheduler,
+    hc: ?*prefix_cache_mod.HotPrefixCache,
+    cfg: *const model_mod.ModelConfig,
+    seq: usize,
+    max_tokens: u32,
+    kv_cfg: transformer_mod.KVQuantConfig,
+    /// The prefix the hot cache restored and the capacity its buffers hold: already
+    /// inside active memory, so billing them again invents a copy.
+    warm_matched: u64,
+    warm_capacity: u64,
+    /// Only a checked-out restore is credited: a refcount share is copied by the first append.
+    warm_will_donate: bool,
+    enable_mtp: bool,
+    fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) bool,
+    fn call(ctx: ?*anyopaque) bool {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        if (!self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp)) return false;
+        const binding = self.cfg.plugin orelse return true;
+        if (binding.aux_cache_budget_bytes == null) return true;
+        const hc = self.hc orelse return true;
+        const budget = @import("cache/budget.zig");
+        return budget.moduleCacheFundingFits(self.cfg, hc.residentBytes(), budget.stagedHostBytes(self.sch), 0);
+    }
+};
+
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
     // exit path (success, cancel, error). `requests_prefilling` flips at entry
@@ -399,25 +425,9 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     if (scheduler_mod.prefill_admission_fits) |fits_fn| {
         if (slot.model.config) |cfg| {
             // Bills the request's own kv-quant scheme and vision chunking, not the process defaults.
-            const Probe = struct {
-                cfg: *const model_mod.ModelConfig,
-                seq: usize,
-                max_tokens: u32,
-                kv_cfg: transformer_mod.KVQuantConfig,
-                /// The prefix the hot cache restored and the capacity its buffers hold: already
-                /// inside active memory, so billing them again invents a copy.
-                warm_matched: u64,
-                warm_capacity: u64,
-                /// Only a checked-out restore is credited: a refcount share is copied by the first append.
-                warm_will_donate: bool,
-                enable_mtp: bool,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) bool,
-                fn call(ctx: ?*anyopaque) bool {
-                    const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
-                }
-            };
-            var probe = Probe{
+            var probe = PrefillProbe{
+                .sch = sch,
+                .hc = slot.model.prefix_cache,
                 .cfg = cfg,
                 .seq = slot.full_prompt.len,
                 .max_tokens = slot.max_tokens,
@@ -428,24 +438,24 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .enable_mtp = slot.enable_mtp,
                 .fits = fits_fn,
             };
-            var fits = Probe.call(&probe);
+            var fits = PrefillProbe.call(&probe);
             // The encoder cache is the cheapest memory to give back: a miss costs one encode.
             if (!fits) if (slot.model.vision_encoder) |ve| if (ve.emb_cache.bytes > 0) {
                 log.info("[scheduler] prefill does not fit: dropping {d}MB of cached media embeddings\n", .{ve.emb_cache.bytes / (1024 * 1024)});
                 ve.emb_cache.clear();
-                fits = Probe.call(&probe);
+                fits = PrefillProbe.call(&probe);
             };
             // A resident video pack is memory its next request can reload: give it back before refusing.
             if (!fits) if (gen_mod.releaseMediaResidency() > 0) {
                 log.info("[scheduler] prefill does not fit: released the resident media cache\n", .{});
-                fits = Probe.call(&probe);
+                fits = PrefillProbe.call(&probe);
             };
             // A shared restore is billed a whole second copy; taking the entry over moves it instead.
             if (!fits and !hot_checked_out and hot_matched > 0) if (slot.model.prefix_cache) |hc| {
                 if (hc.checkoutRestored(@intFromPtr(slot), slot.full_prompt.len)) {
                     hot_checked_out = true;
                     probe.warm_will_donate = true;
-                    fits = Probe.call(&probe);
+                    fits = PrefillProbe.call(&probe);
                 }
             };
             if (!fits) {
@@ -457,7 +467,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 // Captured by pointer: a `|hc|` capture would evict from a stack copy.
                 const report = if (slot.model.prefix_cache) |hc|
                     // Never evict the entry this request restored from: its buffers are shared.
-                    hc.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, true)
+                    hc.evictLruToAdmit(slot.full_prompt.len, &probe, PrefillProbe.call, true)
                 else
                     prefix_cache_mod.EvictionReport{ .admitted = false };
                 publishHotCacheResidency(sch);
@@ -476,7 +486,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                     probe.warm_will_donate = false;
                     publishHotCacheResidency(sch);
                     // Dropping the restore can also unpin buffers shared with remaining entries.
-                    const cold_report = slot.model.prefix_cache.?.evictLruToAdmit(slot.full_prompt.len, &probe, Probe.call, false);
+                    const cold_report = slot.model.prefix_cache.?.evictLruToAdmit(slot.full_prompt.len, &probe, PrefillProbe.call, false);
                     evicted_live_bytes += cold_report.bytes;
                     fits = cold_report.admitted;
                     publishHotCacheResidency(sch);
@@ -719,4 +729,59 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     a.finished = true;
     b.finished = true;
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
+}
+
+test "EXL3 staged cache funding: a zero GPU bill still refuses staged bytes beyond its cache allowance" {
+    const t = std.testing;
+    const Registry = @import("../../host/registry/registry.zig").ModelRegistry;
+    const disk = @import("cache/ssd/disk_tier.zig");
+    var tmp = t.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(t.io, &buf)];
+    const reg = try Registry.init(t.allocator, t.io, null, 4, 0, null);
+    defer reg.deinit();
+    var binding: @import("plugin/config.zig").Binding = .{ .table = undefined, .aux_cache_budget_bytes = 127 };
+    var cfg: model_mod.ModelConfig = .{ .plugin = &binding };
+    const m = try reg.registerStub("staged", "/staged", 1);
+    defer m.config = null;
+    m.config = &cfg;
+    m.state = .ready;
+    const hc = try t.allocator.create(prefix_cache_mod.HotPrefixCache);
+    hc.* = prefix_cache_mod.HotPrefixCache.initWithMem(t.allocator, 8, 256);
+    m.prefix_cache = hc;
+    hc.current_kv_bytes = 64;
+    hc.disk = try disk.DiskTier.init(t.allocator, t.io, base, "staged", 0, 512);
+    hc.disk.?.enableBackgroundWriter();
+    const writer = hc.disk.?.writer.?;
+    writer.setPaused(true);
+    defer writer.setPaused(false);
+    const path = try std.fmt.allocPrint(t.allocator, "{s}/staged", .{hc.disk.?.root});
+    const bytes = try t.allocator.alloc(u8, 64);
+    @memset(bytes, 0);
+    try t.expectEqual(.accepted, try writer.trySubmit(path, bytes));
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = t.io;
+    const Fits = struct {
+        fn call(_: *const model_mod.ModelConfig, _: usize, _: u32, _: transformer_mod.KVQuantConfig, _: u64, _: u64, _: bool, _: bool) bool {
+            return true;
+        }
+    };
+    var probe: PrefillProbe = .{ .sch = &sch, .hc = hc, .cfg = &cfg, .seq = 1, .max_tokens = 1, .kv_cfg = .dense, .warm_matched = 0, .warm_capacity = 0, .warm_will_donate = false, .enable_mtp = false, .fits = &Fits.call };
+    try t.expect(!PrefillProbe.call(&probe));
+    binding.aux_cache_budget_bytes = 128;
+    try t.expect(PrefillProbe.call(&probe));
+    binding.aux_cache_budget_bytes = 127;
+    writer.setPaused(false);
+    writer.drain();
+    try t.expect(PrefillProbe.call(&probe));
+    hc.current_kv_bytes = 128;
+    try t.expect(!PrefillProbe.call(&probe));
+    hc.current_kv_bytes = 64;
+    try t.expect(PrefillProbe.call(&probe));
+    binding.aux_cache_budget_bytes = null;
+    hc.current_kv_bytes = std.math.maxInt(u64);
+    try t.expect(PrefillProbe.call(&probe));
+    hc.current_kv_bytes = 0;
 }
