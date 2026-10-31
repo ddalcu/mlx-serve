@@ -845,7 +845,7 @@ test "deepseek_v41 served: an excluded instance keeps legacy resume through requ
 
 test "deepseek_v41 served: image rows from Forward.media splice as the legacy seam splices them, across a chunk boundary" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();

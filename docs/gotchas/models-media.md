@@ -703,7 +703,8 @@ Defect: from #1041 on, CI's zig job failed on every PR: the registry conformance
 three DeepSeek-V4.1 tests exited 255 on the hosted runner's virtual GPU. Cause: the suite loads each tiny pack on a
 CPU stream, but `deepseek_v41`'s load swaps in a GPU stream (its kernels are Metal-only), and those kernels launch
 1024-thread groups a virtual GPU refuses (Insufficient Memory, abort). Fix: its load refuses `.unsupported` on a
-virtual GPU, which the suite treats as "nothing to check here"; the three tests carry the `virtualGpu()` guard.
+virtual GPU, which the suite treats as "nothing to check here"; every test that loads or runs it skips there
+(`deepseek_v4/served_test.zig` loads it through the driver too: grep for the table, not the folder).
 Guard: the root rule (every GPU test skips on a virtual GPU) and the plugins rule on loads that change stream.
 
 ### Fixtures for fp16-fragile giants are dumped fp32 on CPU
