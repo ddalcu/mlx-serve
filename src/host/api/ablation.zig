@@ -21,7 +21,8 @@ pub const Profile = struct {
     /// Unit direction `[hidden]`; empty when the profile was refused.
     direction: []const f32 = &.{},
     hidden: u32 = 0,
-    /// Lowercase hex sha256 of the pack's `config.json` the profile was computed on.
+    /// Lowercase hex sha256 of the exact `config.json` bytes of the pack the profile was computed on (the field name LoRA
+    /// overlays use for the same binding).
     config_sha256: [64]u8 = @splat('0'),
     /// Content hash of the manifest and tensor bytes.
     hash: u64 = 0,
@@ -173,12 +174,10 @@ pub fn parseProfile(a: std.mem.Allocator, name: []const u8, manifest: []const u8
     }
     p.hidden = @intCast(hidden_v.integer);
     const sha = blk: {
-        const model = root.get("model") orelse break :blk null;
-        if (model != .object) break :blk null;
-        const v = model.object.get("config_sha256") orelse break :blk null;
+        const v = root.get("base_config_sha256") orelse break :blk null;
         break :blk if (v == .string and v.string.len == 64 and isHex(v.string)) v.string else null;
     } orelse {
-        p.refused = "model.config_sha256 is missing or not 64 hex digits";
+        p.refused = "base_config_sha256 is missing or not 64 hex digits";
         return p;
     };
     for (&p.config_sha256, sha) |*o, c| o.* = std.ascii.toLower(c);
@@ -413,7 +412,7 @@ fn safetensors(a: std.mem.Allocator, dtype: []const u8, shape: []const u8, data:
 }
 
 const sha_a = "abababababababababababababababababababababababababababababababab";
-const good_manifest = "{\"format\":\"mlx-serve-ablation\",\"version\":1,\"hidden_size\":4,\"model\":{\"config_sha256\":\"" ++ sha_a ++ "\"}}";
+const good_manifest = "{\"format\":\"mlx-serve-ablation\",\"version\":1,\"hidden_size\":4,\"base_config_sha256\":\"" ++ sha_a ++ "\"}";
 
 fn f32Bytes(comptime v: [4]f32) [16]u8 {
     var out: [16]u8 = undefined;
@@ -444,7 +443,7 @@ test "ablation profile: each malformed input is refused by name, never loaded" {
         .{ .m = "nope", .t = ok, .why = "not JSON" },
         .{ .m = "{\"format\":\"other\",\"version\":1}", .t = ok, .why = "format" },
         .{ .m = "{\"format\":\"mlx-serve-ablation\",\"version\":2,\"hidden_size\":4}", .t = ok, .why = "version" },
-        .{ .m = "{\"format\":\"mlx-serve-ablation\",\"version\":1,\"hidden_size\":4,\"model\":{}}", .t = ok, .why = "config_sha256" },
+        .{ .m = "{\"format\":\"mlx-serve-ablation\",\"version\":1,\"hidden_size\":4}", .t = ok, .why = "base_config_sha256" },
         .{ .m = good_manifest, .t = null, .why = "missing" },
         .{ .m = good_manifest, .t = try safetensors(a, "F32", "[3]", &f32Bytes(.{ 1, 0, 0, 0 })), .why = "shape" },
         .{ .m = good_manifest, .t = try safetensors(a, "I32", "[4]", &f32Bytes(.{ 1, 0, 0, 0 })), .why = "dtype" },

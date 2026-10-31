@@ -47,7 +47,7 @@ const intree = @import("plugin/intree.zig");
 
 fn beginModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, n: usize) !void {
     const id = plugin_settle.slotId(slot.model.transformer.?.plugin.?, &slot.ctx);
-    const capture = if (slot.model.prefix_cache) |hc| !slot.no_commit and hc.ram_enabled and hc.max_entries > 0 else false;
+    const capture = if (slot.model.prefix_cache) |hc| hc.ram_enabled and hc.max_entries > 0 else false;
     const v = plugin_driver.auxBeginPrompt(binding.xfm, id, slot.full_prompt, slot.vision_embeddings, n, capture);
     if (!v.isOk()) {
         log.err("[hot-cache] module prompt setup failed: {s}\n", .{v.why.slice()});
@@ -152,7 +152,7 @@ fn importModuleSnapshot(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, ma
     if (!plugin_driver.auxImportArrays(binding.xfm, ids, header, tensors, &snapshot).isOk()) return error.ModuleImportFailed;
     var info: plugin_abi.AuxSnapshotInfo = .{};
     if (!plugin_driver.auxDescribe(binding.xfm, snapshot, &info).isOk()) return error.ModuleImportDescriptionFailed;
-    if (info.n != match.n or info.prefix_key != match.prefix_key or !std.mem.eql(u32, info.ids.slice(), ids)) return error.ModuleImportIdentityMismatch;
+    if (info.n != match.n or prefix_cache_mod.variantKey(info.prefix_key, binding.variant) != match.prefix_key or !std.mem.eql(u32, info.ids.slice(), ids)) return error.ModuleImportIdentityMismatch;
     if (!plugin_driver.auxRestoreAt(binding.xfm, id, snapshot, match.n).isOk()) return error.ModuleRestoreFailed;
 }
 
@@ -268,7 +268,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
-    const module_binding = prefix_cache_mod.ModuleBinding.init(xfm_ptr);
+    const module_binding = prefix_cache_mod.ModuleBinding.forVariant(xfm_ptr, slot.cache_variant);
     errdefer if (module_binding != null) {
         @import("finish.zig").releasePluginSlot(slot);
         publishHotCacheResidency(sch);
@@ -331,7 +331,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
                 if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head, .tail_hidden = &mtp_tail } else null,
                 @intFromPtr(slot),
-                slot.skip_prefix_cache,
+                slot.skip_prefix_cache or slot.cache_variant != 0,
             ) catch |err| blk: {
                 log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
                 break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
