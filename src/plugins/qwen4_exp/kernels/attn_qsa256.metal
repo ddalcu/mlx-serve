@@ -72,7 +72,14 @@ for (int t0 = 0; t0 < L; t0 += BK) {
       const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
       w = *((const device uint4*)(Kp + (long)pos * k_strides[2]) + c8);
     }
-    thread T* e = (thread T*)&w;
+    T e[8];
+    {
+      vec<T, 2> p;
+      p = as_type<vec<T, 2>>(w.x); e[0] = p.x; e[1] = p.y;
+      p = as_type<vec<T, 2>>(w.y); e[2] = p.x; e[3] = p.y;
+      p = as_type<vec<T, 2>>(w.z); e[4] = p.x; e[5] = p.y;
+      p = as_type<vec<T, 2>>(w.w); e[6] = p.x; e[7] = p.y;
+    }
     const int cb = c8 * 8;
     for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = e[j];
   }
