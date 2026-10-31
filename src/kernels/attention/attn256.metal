@@ -140,15 +140,8 @@ for (; kb < kb_lim; kb++) {
     if (r < rows_k) {
       w = *((const device uint4*)(Kp + (long)(c0 + r) * k_strides[2]) + c8);
     }
-    // as_type, not a thread-pointer pun of w: macOS 14's Metal backend compiler crashes on the pun.
     T e[8];
-    {
-      vec<T, 2> p;
-      p = as_type<vec<T, 2>>(w.x); e[0] = p.x; e[1] = p.y;
-      p = as_type<vec<T, 2>>(w.y); e[2] = p.x; e[3] = p.y;
-      p = as_type<vec<T, 2>>(w.z); e[4] = p.x; e[5] = p.y;
-      p = as_type<vec<T, 2>>(w.w); e[6] = p.x; e[7] = p.y;
-    }
+    msv_unpack8(w, e);
     const int cb = c8 * 8;
     Ks[(cb + 0) * LDK + r] = e[0];
     Ks[(cb + 1) * LDK + r] = e[1];

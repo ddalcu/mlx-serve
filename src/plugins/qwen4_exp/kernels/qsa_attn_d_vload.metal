@@ -13,7 +13,7 @@
       } else {
         T e[8];
         for (int j = 0; j < 8; ++j) e[j] = vq[rb + (long)(c8 * 8 + j) * vqS[3]];
-        w = uint4(as_type<uint>(vec<T, 2>(e[0], e[1])), as_type<uint>(vec<T, 2>(e[2], e[3])), as_type<uint>(vec<T, 2>(e[4], e[5])), as_type<uint>(vec<T, 2>(e[6], e[7])));
+        w = msv_pack8(e);
       }
     }
     *((threadgroup uint4*)(Vs + r * LDV) + c8) = w;

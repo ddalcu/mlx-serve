@@ -429,6 +429,16 @@ def check_pins(pins, files):
             yield n, f"{pat}: {needle!r} not found ({rule or 'no rule'})"
 
 
+def pin_files(pins_text, files):
+    """The files a pin glob names beyond the scanned .zig ones (kernel .metal), for the pins alone."""
+    out = {}
+    for _, pat, _, _ in read_pins(pins_text):
+        for p in glob.glob(pat):
+            if p not in files and os.path.isfile(p):
+                out[p] = open(p, errors="replace").read()
+    return out
+
+
 def folder_of(path):
     """The reporting folder: src/<area>/<name> under engines, plugins, host, sdk; else src/<area>."""
     parts = path.split("/")
@@ -475,7 +485,7 @@ def run(files, pins_text, enforced):
                 viol[rid].append((path, i, msg, f.is_test[i] if i < len(f.is_test) else False))
         for i, src in forks(f):
             fork_list.append((path, i, src))
-    for n, msg in check_pins(read_pins(pins_text), files):
+    for n, msg in check_pins(read_pins(pins_text), {**files, **pin_files(pins_text, files)}):
         viol["pin-unmatched"].append((PINS, n - 1, msg, False))
     return {"viol": viol, "prod_by_folder": prod_by_folder, "forks": fork_list, "enforced": enforced,
             "files": len(files)}
