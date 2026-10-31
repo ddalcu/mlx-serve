@@ -65,8 +65,8 @@ var deform_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var attn_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// softmax(q k^T * scale + kbias) v for q, k, v f16 heads-major `[1, H, L, 64]` and `kbias` f32 `[L]` in base 2 (the
-/// score bias times log2 e) on the NAX tensor unit; out f16 token-major `[L, H*64]`. MLX's sdpa is as fast unmasked;
-/// with a bias this is ~6% faster than sdpa's mask. Null off NAX or outside those shapes.
+/// score bias times log2 e) on the NAX tensor unit; out f16 token-major `[L, H*64]`. For a biased pass: MLX's sdpa is
+/// as fast unmasked, slower with a mask. Null off NAX or outside those shapes.
 pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, kbias: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (disabled_for_test or !mlx.streamIsGpu(s) or !@import("../../mlx/device.zig").naxAvailable()) return null;
     const sh = mlx.getShape(q);

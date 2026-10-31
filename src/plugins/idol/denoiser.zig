@@ -78,8 +78,8 @@ const Repo = struct {
     /// The norm folded into the gate | content maps (dense packs): `fold` f32 `[C, PARTS * 2 hidden]` the maps with the
     /// norm's weight folded in, `cs` its column sums and `bw` the norm's bias through the maps (`glue.repoFold`). h's
     /// f16 values are exact in TF32, so where MLX rounds f32 matmuls to TF32 only the maps split: their TF32-exact part
-    /// beside the rest (PARTS 2) keeps the f32 reference's precision in one GEMM. The mean comes off after the GEMM,
-    /// so a token whose mean is far above its spread loses digits there (300x: 3e-4; Idol's are under 0.21x).
+    /// beside the rest (PARTS 2) keeps the f32 reference's precision in one GEMM. The mean comes off after the GEMM:
+    /// the fold assumes a token's mean is small against its spread, as Idol's hidden states are.
     fold: A = NONE,
     cs: A = NONE,
     bw: A = NONE,
@@ -538,8 +538,7 @@ test "idol: a dense RePo layer's rotary tables keep f32 precision where MLX's ma
         _ = mlx.mlx_stream_free(cpu.s);
         cpu.deinit();
     }
-    // Centred tokens and tokens whose mean is twice their spread (Idol's hidden states: at most 0.21x). Plain TF32
-    // misses by ~4e-3.
+    // Centred tokens and tokens whose mean is twice their spread; plain TF32 misses the bar.
     for ([_]f32{ 0, 2 }) |offset| {
         const x = try L.asDtype(&sc, try sc.add(try L.asDtype(&sc, h, .float32), try sc.scalar(offset)), .float16);
         const got = try r.angles(&sc, x, 8);

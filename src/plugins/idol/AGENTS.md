@@ -36,7 +36,7 @@ places the anchors (a CPU systematic-sampling descent) -> the Gaussian decoder t
 - Identical image tokens stay identical through every block (RoPE comes from each token's features), so the
   unconditional branch runs them as TWO keys whose f16 biases satisfy e^b1 + e^b2 = n (`keyBias`; one f16 bias is
   off by up to 0.4%): 8195 tokens instead of 12294. Guard: `idol: identical image tokens run as two keys`.
-- That biased pass runs the SDK's NAX attention (`kernels/attention.metal`, ~6% faster than sdpa's mask, out token-major);
+- That biased pass runs the SDK's NAX attention (`kernels/attention.metal`, faster than sdpa's mask, out token-major);
   the conditional pass keeps sdpa, as fast unmasked.
 - Widths come from `config.json` and the weights (the tiny pack is 128 wide at 64 px); head width is 64 everywhere.
 - The octree RNG (systematic sampling, in-cell jitter) is ours: only its distribution matches the reference's.
@@ -52,8 +52,8 @@ places the anchors (a CPU systematic-sampling descent) -> the Gaussian decoder t
   deformable sampling positions stay f32 (f16 has a quarter-pixel step at 256). The tap-by-tap gather chain was
   ~34k ops per matte: `deform_cols.metal` writes the columns in one pass.
 - `--w8a8` converts the joint blocks' linears (`blocks.*`) to int8 copies at load (`Weights.w8`). Bar: cos 0.9994 to the
-  packed velocity; attention stays f16 (`int8_attn`'s ~2% per call put it at 0.906). Dense block linears left are
-  stored `.weight_t` (`transposeLinears`): MLX's GEMM reads that faster.
+  packed velocity; attention stays f16 (`int8_attn`'s error per call, compounded over the blocks, misses it by far).
+  Dense block linears left are stored `.weight_t` (`transposeLinears`): MLX's GEMM reads that faster.
 - A RePo layer's LayerNorm folds into its gate | content maps (`Repo.fold`, `repo_fold.metal`): h's f16 values are exact
   in TF32, so where MLX rounds f32 matmuls to TF32 (`device.tf32Matmul`) only the maps split, hi | lo in one GEMM (the
   angles amplify TF32's 1e-3). Guard: `idol: a dense RePo layer's rotary tables keep f32 precision`.

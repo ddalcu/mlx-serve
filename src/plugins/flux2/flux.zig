@@ -32,7 +32,7 @@ const Resnet = resnet_blk.Resnet;
 
 /// The VAE's GroupNorm: 32 groups, f32 statistics, bf16 out.
 const vae_norm: resnet_blk.Norm = .{ .flat = .{ .eps = 1e-6, .out = .bfloat16 } };
-/// The encoder's: a 1024 image's top stages are 128 channels at full resolution, where the norm's op chain moved ~10 GB.
+/// The encoder's: GroupNorm + SiLU in one kernel pass, its top stages being 128 channels at full resolution.
 const vae_enc_norm: resnet_blk.Norm = .{ .flat = .{ .eps = 1e-6, .out = .bfloat16, .fused = true } };
 
 // ── Weight loading ──
