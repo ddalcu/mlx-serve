@@ -16,6 +16,7 @@ const jsonNestingDepth = @import("../../http/request.zig").jsonNestingDepth;
 const mapGenerationError = @import("../../http/errors.zig").mapGenerationError;
 const jsonEscape = @import("../format.zig").jsonEscape;
 const handleResponses = @import("handler.zig").handleResponses;
+const ablation = @import("../ablation.zig");
 
 /// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
 /// transport instead of HTTP/SSE. When `Conn.ws_mode` is set, `sendResponse`
@@ -228,6 +229,11 @@ pub fn handleResponsesWebSocket(
             continue;
         }
         const root = parsed.value.object;
+        // The turn's body is rebuilt from known fields, which would drop the field and run the turn unablated.
+        if (ablation.refuseOnSurface(root)) |r| {
+            try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", r.msg);
+            continue;
+        }
         const type_val = root.get("type");
         if (type_val == null or type_val.? != .string or !std.mem.eql(u8, type_val.?.string, "response.create")) {
             try wsSendErrorTurn(allocator, &ws_conn, 400, "invalid_request_error", "Expected type=response.create");
