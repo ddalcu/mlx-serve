@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const testing = std.testing;
+const log = @import("../../../sdk/util/log.zig");
 
 const HARMONY_START_TAG = @import("../reasoning/harmony.zig").HARMONY_START_TAG;
 const HARMONY_CHANNEL_TAG = @import("../reasoning/harmony.zig").HARMONY_CHANNEL_TAG;
@@ -386,4 +387,259 @@ test "parseToolCalls: a bare <invoke> in prose or inside another dialect's value
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("write", calls[0].name);
     try testing.expect(!calls[0].inferred);
+}
+
+// ── Collapsed <tool call><parameter name="TOOL"> recovery (DeepSeek-V4.1) ──
+/// BARE_INVOKE with the `<invoke name=…>` layer dropped: a `<tool call>`/
+/// `<tool_call>` wrapper whose first `<parameter name="X">` carries the TOOL NAME
+/// (not a parameter) with the sole argument as its value. Unlike the other invoke
+/// arms this is schema-aware (`.inferred`) — the arg key lives in the schema, not
+/// the markup — so the request chokepoint calls it after every dialect returned
+/// null, gated on the wrapper plus the parameter naming a declared tool (a
+/// declared-tool name in a tool-call wrapper is the tell — a real parameter is
+/// never the tool's own name).
+pub fn inferCollapsedParamToolCalls(allocator: std.mem.Allocator, text: []const u8, tools_json: []const u8) !?[]ParsedToolCall {
+    const w_space = std.mem.indexOf(u8, text, "<tool call");
+    const w_under = std.mem.indexOf(u8, text, "<tool_call");
+    const wrapper_pos = blk: {
+        if (w_space) |a| break :blk if (w_under) |b| @min(a, b) else a;
+        break :blk w_under orelse return null;
+    };
+
+    const tools_parsed = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return null;
+    defer tools_parsed.deinit();
+    if (tools_parsed.value != .array) return null;
+
+    var pos: usize = wrapper_pos;
+    while (std.mem.indexOfPos(u8, text, pos, "<parameter")) |p| {
+        const after = p + "<parameter".len;
+        if (after >= text.len) break;
+        // Must be the attribute form `<parameter name=…>`, not `<parameters>`.
+        if (!std.ascii.isWhitespace(text[after])) {
+            pos = after;
+            continue;
+        }
+        const seg = text[after..];
+        const te = std.mem.indexOfScalar(u8, seg, '>') orelse break; // truncated open tag
+        const pname = dsmlAttr(seg[0 .. te + 1], "name") orelse {
+            pos = after + te + 1;
+            continue;
+        };
+        // X must name a declared tool; capture its `parameters` for mapping.
+        const params = findToolParameters(tools_parsed.value.array, pname) orelse {
+            pos = after + te + 1;
+            continue;
+        };
+
+        // Value runs to the confirmed `</parameter>` close; absent = truncated.
+        const vstart = after + te + 1;
+        var value: ?[]const u8 = null;
+        if (std.mem.indexOf(u8, text[vstart..], "</parameter>")) |vend| {
+            const raw = std.mem.trim(u8, text[vstart .. vstart + vend], " \n\t\r");
+            if (raw.len > 0) value = raw;
+        }
+
+        const arguments = try buildCollapsedArgs(allocator, params, value);
+        errdefer allocator.free(arguments);
+        const name_owned = try allocator.dupe(u8, pname);
+        errdefer allocator.free(name_owned);
+        const calls = try allocator.alloc(ParsedToolCall, 1);
+        // A heuristic recovery, like BARE_INVOKE: mark it inferred so the
+        // chokepoint never treats a guessed call as an explicit one.
+        calls[0] = .{ .name = name_owned, .arguments = arguments, .inferred = true };
+        log.info("  [tool-parse] recovered collapsed tool-call markup into '{s}'\n", .{pname});
+        return calls;
+    }
+    return null;
+}
+
+/// The `parameters` object of a declared tool, by function name (null if the
+/// name is not a declared tool). A tool with no `parameters` key yields a null
+/// Value so an argless collapsed call (`get_goal`) still resolves to NAME + {}.
+fn findToolParameters(tools: std.json.Array, name: []const u8) ?std.json.Value {
+    for (tools.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const func_val = tool_val.object.get("function") orelse continue;
+        if (func_val != .object) continue;
+        const name_val = func_val.object.get("name") orelse continue;
+        if (name_val != .string) continue;
+        if (!std.mem.eql(u8, name_val.string, name)) continue;
+        return func_val.object.get("parameters") orelse std.json.Value{ .null = {} };
+    }
+    return null;
+}
+
+/// The one schema parameter a collapsed value can safely fill: the sole
+/// property, else the sole required param. null when the schema names no single
+/// target — argless, or two-plus params with no single required one — so the
+/// caller ships NAME + {} rather than guess a field (a wrong guess would write a
+/// real argument into the wrong slot, e.g. a path into `content`).
+fn pickMainParam(params: std.json.Value) ?[]const u8 {
+    if (params != .object) return null;
+    const props_v = params.object.get("properties") orelse return null;
+    if (props_v != .object) return null;
+    const props = props_v.object;
+    if (props.count() == 1) return props.keys()[0];
+    if (params.object.get("required")) |req_v| {
+        if (req_v == .array and req_v.array.items.len == 1 and req_v.array.items[0] == .string) {
+            const only = req_v.array.items[0].string;
+            if (props.get(only) != null) return only;
+        }
+    }
+    return null;
+}
+
+/// Build the arguments JSON for a collapsed call. The value ships as a RAW
+/// STRING under the mapped parameter; types come from the schema at the coercion
+/// chokepoint, never from the value's spelling (a command reading `true` or
+/// `[1,2]` is a string, not a bool/array). No value or no single target → `{}`.
+fn buildCollapsedArgs(allocator: std.mem.Allocator, params: std.json.Value, value: ?[]const u8) ![]const u8 {
+    const v = value orelse return try allocator.dupe(u8, "{}");
+    const key = pickMainParam(params) orelse return try allocator.dupe(u8, "{}");
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    var map: std.json.ObjectMap = .empty;
+    try map.put(aa, key, std.json.Value{ .string = v });
+    return try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = map }, .{});
+}
+
+test "inferCollapsedParamToolCalls: complete <tool call><parameter name=bash> maps value to the command arg" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}},
+        \\ {"type":"function","function":{"name":"get_goal","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const text = "查 guest。\n\n</br>\n\n<tool call>\n<parameter name=\"bash\">cd /x && echo hi</parameter>\n</parameter>\n</invoke>";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("cd /x && echo hi", parsed.value.object.get("command").?.string);
+}
+
+test "inferCollapsedParamToolCalls: truncated after the open tag ships NAME + {}" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    const text = "x\n\n<tool call>\n<parameter name=\"bash\">";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "inferCollapsedParamToolCalls: argless tool resolves to NAME + {}" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"get_goal","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const text = "status.\n\n<tool call>\n<parameter name=\"get_goal\"></parameter>\n</invoke>";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_goal", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "inferCollapsedParamToolCalls: sole required param wins over extra optionals" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"search","parameters":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}}]
+    ;
+    const text = "<tool call>\n<parameter name=\"search\">lions of massachusetts</parameter>";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqualStrings("search", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("lions of massachusetts", parsed.value.object.get("query").?.string);
+}
+
+test "inferCollapsedParamToolCalls: a parameter NOT named after a tool is never promoted" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    // `command` is a real param name, not a tool name — no tool is identifiable.
+    const text = "<tool call>\n<parameter name=\"command\">ls -la</parameter>";
+    try testing.expect((try inferCollapsedParamToolCalls(allocator, text, tools)) == null);
+}
+
+test "inferCollapsedParamToolCalls: no <tool call> wrapper is prose, never a call" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    const text = "Claude wraps params as <parameter name=\"bash\"> in its docs.";
+    try testing.expect((try inferCollapsedParamToolCalls(allocator, text, tools)) == null);
+}
+
+test "inferCollapsedParamToolCalls: a JSON-looking value stays a string (schema types it, not the spelling)" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"bash","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    // The command happens to read as a JSON literal; it must NOT ship as a bool.
+    const text = "<tool call>\n<parameter name=\"bash\">true</parameter>";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("command").? == .string);
+    try testing.expectEqualStrings("true", parsed.value.object.get("command").?.string);
+}
+
+test "inferCollapsedParamToolCalls: two required params name no single target -> NAME + {}" {
+    const allocator = testing.allocator;
+    // write_file(path, content), both required: a value could be either, so the
+    // schema names no single target and we must NOT guess a slot.
+    const tools =
+        \\[{"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
+    ;
+    const text = "<tool call>\n<parameter name=\"write_file\">/tmp/x</parameter>";
+    const calls = (try inferCollapsedParamToolCalls(allocator, text, tools)).?;
+    defer {
+        for (calls) |c| {
+            allocator.free(c.name);
+            allocator.free(c.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
 }
