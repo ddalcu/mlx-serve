@@ -229,6 +229,54 @@ test "deepseek_v41 served: disk-disabled requests retain alternating RAM convers
     }
 }
 
+test "deepseek_v41 served: an ablated request neither restores nor commits, and the next standard request restores the standard entry" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    // The cache rules are the host's; the in-tree forward ignores the direction it is handed.
+    p.cfg.plugin.?.parsed.caps.ablation = true;
+    const prompt = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    const hidden: usize = @intCast(p.cfg.hidden_size);
+    const dir = try arena.allocator().alloc(f32, hidden);
+    @memset(dir, 0);
+    dir[1] = 1;
+    const first = try h.prefill(&prompt);
+    defer first.deinit();
+    commit_request.commitSlotIfApplicable(&h.sch, first);
+    finish_request.releasePluginSlot(first);
+    try testing.expectEqual(@as(usize, 1), h.entry.prefix_cache.?.entries.items.len);
+    // The cached prompt is not restored; a new prompt is not committed.
+    const other = [_]u32{ 5, 8, 13, 21, 34, 55, 89, 4 };
+    for ([_][]const u32{ &prompt, &other }) |ids| {
+        const ab = try RequestSlot.init(testing.allocator, h.sch.io, h.entry.config.?, .{
+            .model = h.entry,
+            .prompt_ids = ids,
+            .sampling = .{ .temperature = 0 },
+            .eos_token_ids = &.{},
+            .max_tokens = 2,
+            .ablation = .{ .direction = dir, .strength = 1, .key = 7 },
+        }, KVQuantConfig.dense);
+        defer ab.deinit();
+        try prefill_request.runPrefill(&h.sch, ab);
+        try testing.expectEqual(@as(u32, 0), ab.cached_tokens);
+        commit_request.commitSlotIfApplicable(&h.sch, ab);
+        finish_request.releasePluginSlot(ab);
+        try testing.expectEqual(@as(usize, 1), h.entry.prefix_cache.?.entries.items.len);
+    }
+    const fresh = try h.prefill(&other);
+    defer fresh.deinit();
+    try testing.expectEqual(@as(u32, 0), fresh.cached_tokens);
+    finish_request.releasePluginSlot(fresh);
+    const next = try h.prefill(&prompt);
+    defer next.deinit();
+    try testing.expectEqual(@as(u32, 7), next.cached_tokens);
+    finish_request.releasePluginSlot(next);
+}
+
 /// Real request functions over a tiny plugin and a registry; no inference worker is started.
 const Requests = struct {
     sch: scheduler.Scheduler = undefined,

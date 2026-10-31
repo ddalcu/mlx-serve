@@ -68,6 +68,9 @@ pub var g_api_key: ?[]const u8 = null;
 /// unless `--api-key` is set.
 pub var g_api_key_strict: bool = false;
 
+/// `--ablation-profiles` + `--ablation-key-file` (`api/ablation.zig`), set once before serving; null = off.
+pub var g_ablation: ?*const @import("../api/ablation.zig").Set = null;
+
 /// Tool-call ARGUMENT auto-correct. When true (default), parsed tool-call
 /// arguments are coerced to the types the request's tool schema declares
 /// (`chat.coerceToolArgsToSchema` — e.g. Python's `False` → JSON `false`, an

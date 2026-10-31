@@ -152,7 +152,8 @@ Model facts the host keeps once at load. Defaults are the generic model's.
 | `verify_truncates` | `bool` | `false` | A rejected draft rolls back by truncating the KV cache (an attention trunk): no snapshot, no re-forward. |
 | `merged_state` | `bool` | `false` | A batch's recurrent state is read and written only through `CacheOps.state_rows` / `set_state_rows`, so the engine may keep it merged across batched ticks instead of re-stacking every layer each tick. |
 | `slot_state` | `bool` | `false` | Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`): requests interleave and batch instead of running single-flight. |
-| `_` | `u34` | `0` |  |
+| `ablation` | `bool` | `false` | The forward honours `Forward.ablation` on every pass that writes the residual stream (a native drafter's rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes only under the same `Ablation.keys` entry. |
+| `_` | `u33` | `0` |  |
 
 ### `ThinkingDefault` (enum(u8))
 
@@ -531,6 +532,18 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `suppress_mask` | `Array` | `.{}` | The sampler's suppress mask `[vocab]` (true = never drawn), which a round's greedy accept applies; empty = none. |
 | `embeds` | `Array` | `.{}` | Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`); empty = embed the ids. |
 | `progress` | `?*u64` | `null` | A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching. |
+| `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
+
+### `Ablation` (extern struct)
+
+Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its unit direction from everything it writes to the residual stream (the embedding and each sublayer's output), so `y <- y - s (y . r) r`. The arrays are the host's, valid for the call.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(Ablation)` |  |
+| `directions` | `Array` | `.{}` | Unit directions `[slots, hidden]` f32, one row per `Forward.slots` entry. |
+| `strengths` | `Span(f32)` | `.{}` | One per slot, in [0, 1]; 0 = that slot is not ablated. |
+| `keys` | `Span(u64)` | `.{}` | One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = none. |
 
 ### `Offload` (extern struct)
 

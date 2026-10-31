@@ -72,7 +72,7 @@ fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usiz
 pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return;
-    if (slot.error_code != null) return;
+    if (slot.no_commit or slot.error_code != null) return;
     // `finishSlot` can be reached on an EOS the failing forward itself produced, before the
     // tick wrapper reads the latch: an unread latch means the KV under this commit may be garbage.
     if (mlx.errorPending()) return;

@@ -1,6 +1,7 @@
 //! Ollama sink, early routes, quantization json; tags, show, pull, chat, generate, embed
 
 const std = @import("std");
+const ablation = @import("ablation.zig");
 const env = @import("../../env.zig");
 const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
@@ -378,6 +379,10 @@ fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u
 }
 
 pub fn handleOllamaChat(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
+    if (ablation.bodyNamesAblation(allocator, body)) {
+        try sendOllamaError(allocator, stream, "400 Bad Request", "ablation is served on /v1/chat/completions and /v1/completions only");
+        return;
+    }
     var tr = ollama_mod.translateChatRequest(allocator, body) catch |err| switch (err) {
         error.InvalidRequest => {
             log.warn("POST /api/chat -> 400 (invalid request)\n", .{});
@@ -405,6 +410,10 @@ pub fn handleOllamaChat(allocator: std.mem.Allocator, stream: *Conn, body: []con
 }
 
 pub fn handleOllamaGenerate(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
+    if (ablation.bodyNamesAblation(allocator, body)) {
+        try sendOllamaError(allocator, stream, "400 Bad Request", "ablation is served on /v1/chat/completions and /v1/completions only");
+        return;
+    }
     var tr = ollama_mod.translateGenerateRequest(allocator, body) catch |err| switch (err) {
         error.InvalidRequest => {
             log.warn("POST /api/generate -> 400 (invalid request)\n", .{});
