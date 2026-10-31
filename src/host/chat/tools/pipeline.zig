@@ -133,6 +133,9 @@ pub fn parseToolCallsForRequest(
     }
     var calls = parsed_calls orelse
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
+        // Collapsed `<tool call><parameter name="TOOL">…` markup: schema-aware,
+        // so it runs here where the schema is, after every dialect found nothing.
+        (if (tools_json) |tj| try chat_mod.inferCollapsedParamToolCalls(allocator, text, tj) else null) orelse
         return null;
     if (!allow_parallel and calls.len > 1) {
         log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});

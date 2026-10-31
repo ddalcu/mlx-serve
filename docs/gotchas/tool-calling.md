@@ -86,6 +86,9 @@ Guard: `renderChatTemplate: a tool-aware template with a generic role header ren
 
 ## Parsing tool calls
 
+### DeepSeek-V4.1 collapsed a tool call into `<tool call><parameter name="TOOL">`
+Defect: under prefill mode-lock V4.1 drops the `<function=NAME>` layer and emits `<tool call>\n<parameter name="bash">cmd</parameter>` — a Hermes-style wrapper (note the SPACE) with the tool NAME in the first `<parameter name=…>` and the command as its value, often truncated right after the open tag. Neither the Hermes parser (`<function=>`) nor the invoke parser (`<invoke` opener) matched, so the block shipped as `content` with `finish_reason:"stop"` and the agent silently stopped until a human typed continue; one leaked block in history re-seeded the next turn. Cause: a tool-call shape no dialect scanned; unlike `BARE_INVOKE`, the argument KEY is not in the markup (the first parameter carries the tool NAME), so mapping the value needs the schema. Fix: `inferCollapsedParamToolCalls` — a schema-aware last resort in the pipeline fallback chain (after `inferBareJsonToolCalls`), gated on the `<tool call>`/`<tool_call>` wrapper plus the parameter naming a declared tool; the value maps to the tool's sole / single-required parameter as a raw string (types come from `coerceToolArgsToSchema`, never the value's spelling), and no single target or no value ships `NAME + {}`. Guard: corpus family `deepseek` (complete, truncated, parameterless, plus the prose-`<parameter>` and no-wrapper negatives); the corpus runner now also runs the chokepoint's recovery fallbacks so the no-tag-leak / valid-JSON invariants cover them.
+
 ### Mangled argument JSON dropped the whole call (big-file escaping)
 Defect: a weak model writing a big file put raw newlines and unescaped quotes in `content`; strict parse failed, the
 call was dropped and the file leaked into chat. Fix: `looseRepairToolCallJson` re-escapes control bytes, inner quotes

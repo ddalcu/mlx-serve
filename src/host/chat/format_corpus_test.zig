@@ -2043,6 +2043,50 @@ const corpus = [_]Expect{
         .tool_name = "list_files",
         .tool_count = 1,
     },
+    // ── DeepSeek-V4.1 collapsed <tool call><parameter name="TOOL"> (LIVE,
+    //    waf-re agent): prefill mode-lock drops the <function=> layer, the tool
+    //    NAME rides in the first parameter and its value is the sole argument.
+    //    Recovered schema-aware (inferCollapsedParamToolCalls); the name/value
+    //    live in different layers than Hermes or invoke, so both miss it. ──
+    .{
+        .family = "deepseek",
+        .name = "collapsed <tool call>: name in the parameter, value is the command",
+        .raw = "查 guest shell。\n\n</br>\n\n</br>\n\n<tool call>\n<parameter name=\"bash\">cd /x && echo hi</parameter>\n</parameter>\n</invoke>",
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_key = "command",
+        .tool_arg_value = "cd /x && echo hi",
+    },
+    .{
+        .family = "deepseek",
+        .name = "collapsed <tool call> truncated after the open tag ships NAME + {}",
+        .raw = "probe guest。\n\n</br>\n\n<tool call>\n<parameter name=\"bash\">",
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_absent = "command",
+    },
+    .{
+        .family = "deepseek",
+        .name = "collapsed <tool call> for a parameterless tool resolves to NAME + {}",
+        .raw = "status。\n\n<tool call>\n<parameter name=\"get_goal\"></parameter>\n</invoke>",
+        .tools_json = "[{\"type\":\"function\",\"function\":{\"name\":\"get_goal\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]",
+        .tool_name = "get_goal",
+        .tool_arg_absent = "command",
+    },
+    .{
+        .family = "deepseek",
+        .name = "collapsed form: a parameter NOT named after a tool is prose, not a call",
+        .raw = "<tool call>\n<parameter name=\"command\">ls -la</parameter>",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "deepseek",
+        .name = "collapsed form: a <parameter> with no <tool call> wrapper is prose",
+        .raw = "Claude wraps params as <parameter name=\"bash\"> in its docs.",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+    },
 };
 
 /// Control tags that must never appear in visible content, regardless of
@@ -2102,6 +2146,15 @@ test "format corpus: recorded model outputs across families" {
                 allocator.free(tc.arguments);
             }
             allocator.free(cs);
+        };
+
+        // When no dialect parsed, the request chokepoint tries its schema-aware
+        // recovery fallbacks in order — bare-JSON, then collapsed `<tool call>`
+        // markup. Run them here too (defer above frees whichever we end with),
+        // or their no-tag-leak / valid-JSON invariants never execute.
+        if (calls == null) if (entry.tools_json) |tj| {
+            calls = (try chat.inferBareJsonToolCalls(allocator, raw, tj)) orelse
+                (try chat.inferCollapsedParamToolCalls(allocator, raw, tj));
         };
 
         // Mirror the server chokepoint (server.parseToolCallsForRequest): when
