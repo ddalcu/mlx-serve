@@ -130,7 +130,11 @@ pub const Caps = packed struct(u64) {
     /// Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`):
     /// requests interleave and batch instead of running single-flight.
     slot_state: bool = false,
-    _: u34 = 0,
+    /// The forward honours `Forward.ablation` on every pass that writes the residual stream (a native drafter's
+    /// rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes
+    /// only under the same `Ablation.keys` entry.
+    ablation: bool = false,
+    _: u33 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -451,6 +455,21 @@ pub const Forward = extern struct {
     /// A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores
     /// the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching.
     progress: ?*u64 = null,
+    /// Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged.
+    ablation: ?*const Ablation = null,
+};
+
+/// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its
+/// unit direction from everything it writes to the residual stream (the embedding and each sublayer's output), so
+/// `y <- y - s (y . r) r`. The arrays are the host's, valid for the call.
+pub const Ablation = extern struct {
+    size: u32 = @sizeOf(Ablation),
+    /// Unit directions `[slots, hidden]` f32, one row per `Forward.slots` entry.
+    directions: Array = .{},
+    /// One per slot, in [0, 1]; 0 = that slot is not ablated.
+    strengths: Span(f32) = .{},
+    /// One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = none.
+    keys: Span(u64) = .{},
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs
@@ -930,7 +949,7 @@ test "abi plugin: caps fit one word with the generic defaults" {
 }
 
 test "abi plugin: every struct opens with its size, set by default" {
-    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem, MediaInput, SpeechFacts, SpeechSampling }) |T| {
+    inline for (.{ Ablation, LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem, MediaInput, SpeechFacts, SpeechSampling }) |T| {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
         const v: T = .{};
         try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);

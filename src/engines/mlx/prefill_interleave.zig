@@ -427,6 +427,7 @@ fn writeThroughEnabled() bool {
 /// worth at least one chunk.
 pub fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return false;
+    if (slot.no_commit) return false;
     if (hc.disk) |*d| if (d.module_context != null) return false;
     if (!writeThroughEnabled()) {
         if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {

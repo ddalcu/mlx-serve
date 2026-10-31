@@ -74,6 +74,8 @@ pub const Slot = struct {
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
+    /// The slot's state never enters the prefix cache (RAM or SSD): it ran a directional ablation.
+    no_commit: bool = false,
     /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
     /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
     boundary_max_tail: ?usize = null,
@@ -368,7 +370,8 @@ pub const Slot = struct {
             .logprobs_buf = .empty,
             .prompt_logprobs = params.prompt_logprobs,
             .prompt_logprobs_buf = .empty,
-            .skip_prefix_cache = params.prompt_logprobs,
+            .skip_prefix_cache = params.prompt_logprobs or params.ablation != null,
+            .no_commit = params.ablation != null,
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the
@@ -385,6 +388,7 @@ pub const Slot = struct {
             .mrope_delta = slot.mrope_delta,
             .capture_hidden = null,
             .kv_attn_fused = params.kv_attn_fused,
+            .ablation = params.ablation,
         };
 
         return slot;

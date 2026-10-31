@@ -17,6 +17,7 @@ const sendResponseFramed = @import("respond.zig").sendResponseFramed;
 const SSE_ALLOW_HEADERS_DEFAULT = @import("respond.zig").SSE_ALLOW_HEADERS_DEFAULT;
 const sendSseHeaders = @import("respond.zig").sendSseHeaders;
 const findHeaderValue = @import("request.zig").findHeaderValue;
+const AblationRequest = @import("../../sdk/request/ablation.zig").Request;
 const readRequestOver = @import("request.zig").readRequestOver;
 
 /// Tracks how long a streaming connection has been SILENT so the token loops
@@ -81,11 +82,19 @@ pub const Conn = struct {
     ollama_sink: ?*ollama_mod.Sink = null,
     /// Agent named by the current request's User-Agent.
     client: instr.Client = .other,
+    /// The current request's `X-Ablation-Key` header, borrowed from the request buffer; never logged.
+    ablation_key: ?[]const u8 = null,
+    /// The current request's directional ablation (`api/ablation.zig`), and the `X-Ablation` line every response
+    /// head of the request carries (empty = none).
+    ablation: ?AblationRequest = null,
+    ablation_header: [192]u8 = undefined,
+    ablation_header_len: usize = 0,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
         c.client = .other;
+        c.clearAblation();
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
@@ -98,6 +107,19 @@ pub const Conn = struct {
     /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
     pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
         c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
+        c.clearAblation();
+        c.ablation_key = findHeaderValue(headers, "x-ablation-key");
+    }
+
+    pub fn clearAblation(c: *Conn) void {
+        c.ablation_key = null;
+        c.ablation = null;
+        c.ablation_header_len = 0;
+    }
+
+    /// The `X-Ablation` line of this request's response heads.
+    pub fn ablationHeader(c: *const Conn) []const u8 {
+        return c.ablation_header[0..c.ablation_header_len];
     }
 
     /// True when the connection has been silent long enough that a streaming

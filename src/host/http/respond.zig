@@ -33,11 +33,12 @@ pub fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []con
         return;
     }
 
-    var hdr_buf: [512]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
+    var hdr_buf: [768]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n{s}\r\n", .{
         status,
         content_type,
         body.len,
+        stream.ablationHeader(),
     }) catch return error.Overflow;
     try stream.writeAll(hdr);
     stream.length_framed = true;
@@ -89,7 +90,9 @@ pub fn sendSseHeaders(stream: *Conn, kind: []const u8, allow_headers: []const u8
         "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
         "Access-Control-Allow-Headers: ");
     try stream.writeAllNoFlush(allow_headers);
-    try stream.writeAll("\r\n\r\n");
+    try stream.writeAllNoFlush("\r\n");
+    try stream.writeAllNoFlush(stream.ablationHeader());
+    try stream.writeAll("\r\n");
     stream.sse_headers_sent = true;
     logHttpStreamStart(kind);
 }

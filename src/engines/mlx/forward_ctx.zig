@@ -147,6 +147,8 @@ pub const ForwardCtx = struct {
     /// the cache scheme is .affine (.off has no quant triple to consume).
     /// Default false → unchanged dense SDPA path.
     kv_attn_fused: bool = false,
+    /// The request's directional ablation (`abi.Forward.ablation`); null = none.
+    ablation: ?@import("../../sdk/request/ablation.zig").Request = null,
     /// Batched-embeddings: additive key-padding mask [B, 1, 1, T] consumed
     /// by the BERT encoder forward so padded positions never attend. Null
     /// (the default) keeps the unmasked single-sequence path.

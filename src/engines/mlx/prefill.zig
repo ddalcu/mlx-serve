@@ -47,7 +47,7 @@ const intree = @import("plugin/intree.zig");
 
 fn beginModulePrompt(slot: *Slot, binding: prefix_cache_mod.ModuleBinding, n: usize) !void {
     const id = plugin_settle.slotId(slot.model.transformer.?.plugin.?, &slot.ctx);
-    const capture = if (slot.model.prefix_cache) |hc| hc.ram_enabled and hc.max_entries > 0 else false;
+    const capture = if (slot.model.prefix_cache) |hc| !slot.no_commit and hc.ram_enabled and hc.max_entries > 0 else false;
     const v = plugin_driver.auxBeginPrompt(binding.xfm, id, slot.full_prompt, slot.vision_embeddings, n, capture);
     if (!v.isOk()) {
         log.err("[hot-cache] module prompt setup failed: {s}\n", .{v.why.slice()});
@@ -279,7 +279,9 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         publishHotCacheResidency(sch);
     } else {
         // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
-        const resumed: u64 = if (plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings)) |n|
+        const resumed: u64 = if (slot.ctx.ablation != null)
+            0
+        else if (plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings)) |n|
             n
         else if (xfm_ptr.mlx_stream_ext) |m|
             try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
