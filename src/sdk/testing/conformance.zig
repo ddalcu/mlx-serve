@@ -238,6 +238,9 @@ fn expectModel(io: std.Io, a: Allocator, s: Subject, t: *const model_abi.ModelTa
     inline for (@typeInfo(model_abi.Bill).@"struct".field_names) |f| if (@field(b1, f) != @field(b2, f)) return fail(name, "bill is not deterministic: " ++ f, .{});
     if (attention == 0 and b1.kv_per_token != 0) return fail(name, "bills KV with no attention layer", .{});
 
+    // A virtual GPU refuses a forward's kernels (its threadgroup caps, Insufficient Memory): the checks above are the
+    // proof there, as in `expectMedia`.
+    if (mlx.virtualGpu()) return;
     inline for (@typeInfo(model_abi.Mode).@"enum".field_names) |f| try expectForward(a, &pack, @field(model_abi.Mode, f));
 }
 
