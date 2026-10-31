@@ -229,7 +229,7 @@ test "deepseek_v41 served: disk-disabled requests retain alternating RAM convers
     }
 }
 
-test "deepseek_v41 served: an ablated request neither restores nor commits, and the next standard request restores the standard entry" {
+test "deepseek_v41 served: an ablated request restores and commits only entries of its own profile and strength" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -239,42 +239,40 @@ test "deepseek_v41 served: an ablated request neither restores nor commits, and 
     defer h.close();
     // The cache rules are the host's; the in-tree forward ignores the direction it is handed.
     p.cfg.plugin.?.parsed.caps.ablation = true;
-    const prompt = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    const a = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
+    const b = [_]u32{ 5, 8, 13, 21, 34, 55, 89, 4 };
     const hidden: usize = @intCast(p.cfg.hidden_size);
     const dir = try arena.allocator().alloc(f32, hidden);
     @memset(dir, 0);
     dir[1] = 1;
-    const first = try h.prefill(&prompt);
-    defer first.deinit();
-    commit_request.commitSlotIfApplicable(&h.sch, first);
-    finish_request.releasePluginSlot(first);
-    try testing.expectEqual(@as(usize, 1), h.entry.prefix_cache.?.entries.items.len);
-    // The cached prompt is not restored; a new prompt is not committed.
-    const other = [_]u32{ 5, 8, 13, 21, 34, 55, 89, 4 };
-    for ([_][]const u32{ &prompt, &other }) |ids| {
-        const ab = try RequestSlot.init(testing.allocator, h.sch.io, h.entry.config.?, .{
+    const Run = struct { prompt: []const u32, key: u64, cached: u32, entries: usize };
+    // standard a; ablated a misses it; ablated b commits; the same ablation of b restores it; a standard b misses it;
+    // standard a still restores its own entry; another strength of b misses (its commit evicts the oldest).
+    const runs = [_]Run{
+        .{ .prompt = &a, .key = 0, .cached = 0, .entries = 1 },
+        .{ .prompt = &a, .key = 7, .cached = 0, .entries = 2 },
+        .{ .prompt = &b, .key = 7, .cached = 0, .entries = 3 },
+        .{ .prompt = &b, .key = 7, .cached = 7, .entries = 3 },
+        .{ .prompt = &b, .key = 0, .cached = 0, .entries = 4 },
+        .{ .prompt = &a, .key = 0, .cached = 7, .entries = 4 },
+        .{ .prompt = &b, .key = 8, .cached = 0, .entries = 4 },
+    };
+    for (runs) |r| {
+        const s = try RequestSlot.init(testing.allocator, h.sch.io, h.entry.config.?, .{
             .model = h.entry,
-            .prompt_ids = ids,
+            .prompt_ids = r.prompt,
             .sampling = .{ .temperature = 0 },
             .eos_token_ids = &.{},
             .max_tokens = 2,
-            .ablation = .{ .direction = dir, .strength = 1, .key = 7 },
+            .ablation = if (r.key == 0) null else .{ .direction = dir, .strength = 1, .key = r.key },
         }, KVQuantConfig.dense);
-        defer ab.deinit();
-        try prefill_request.runPrefill(&h.sch, ab);
-        try testing.expectEqual(@as(u32, 0), ab.cached_tokens);
-        commit_request.commitSlotIfApplicable(&h.sch, ab);
-        finish_request.releasePluginSlot(ab);
-        try testing.expectEqual(@as(usize, 1), h.entry.prefix_cache.?.entries.items.len);
+        defer s.deinit();
+        try prefill_request.runPrefill(&h.sch, s);
+        try testing.expectEqual(r.cached, s.cached_tokens);
+        commit_request.commitSlotIfApplicable(&h.sch, s);
+        finish_request.releasePluginSlot(s);
+        try testing.expectEqual(r.entries, h.entry.prefix_cache.?.entries.items.len);
     }
-    const fresh = try h.prefill(&other);
-    defer fresh.deinit();
-    try testing.expectEqual(@as(u32, 0), fresh.cached_tokens);
-    finish_request.releasePluginSlot(fresh);
-    const next = try h.prefill(&prompt);
-    defer next.deinit();
-    try testing.expectEqual(@as(u32, 7), next.cached_tokens);
-    finish_request.releasePluginSlot(next);
 }
 
 /// Real request functions over a tiny plugin and a registry; no inference worker is started.
