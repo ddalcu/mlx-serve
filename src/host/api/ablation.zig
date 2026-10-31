@@ -99,7 +99,7 @@ fn keyRule(e: KeyError) []const u8 {
 fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
     const path_z = a.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     defer a.free(path_z);
-    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return if (std.c._errno().* == @intFromEnum(std.c.E.LOOP)) error.NotRegular else error.Unreadable;
     defer _ = std.c.close(fd);
     var st: std.c.Stat = undefined;
@@ -110,9 +110,13 @@ fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
     var buf: [4096]u8 = undefined;
     defer std.crypto.secureZero(u8, &buf);
     var len: usize = 0;
+    if (st.size >= buf.len) return error.Unreadable;
     while (len < buf.len) {
         const n = std.c.read(fd, buf[len..].ptr, buf.len - len);
-        if (n < 0) return error.Unreadable;
+        if (n < 0) {
+            if (std.c._errno().* == @intFromEnum(std.c.E.INTR)) continue;
+            return error.Unreadable;
+        }
         if (n == 0) break;
         len += @intCast(n);
     }
