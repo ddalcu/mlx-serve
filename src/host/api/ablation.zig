@@ -64,7 +64,7 @@ pub fn launch(gpa: std.mem.Allocator, io: std.Io, profiles_dir: ?[]const u8, key
     }
     var set: Set = .{ .arena = .init(gpa), .profiles = &.{}, .key_digest = undefined };
     errdefer set.deinit();
-    set.key_digest = readKey(set.arena.allocator(), io, key_file.?) catch |e| {
+    set.key_digest = readKey(set.arena.allocator(), key_file.?) catch |e| {
         log.err("[ablation] key file {s} refused: {s}\n", .{ key_file.?, keyRule(e) });
         return error.AblationKeyFileRefused;
     };
@@ -94,20 +94,29 @@ fn keyRule(e: KeyError) []const u8 {
 }
 
 /// The key file's sha256: a regular file the server's user owns, no group or other bits, at least 32 bytes trimmed.
-fn readKey(a: std.mem.Allocator, io: std.Io, path: []const u8) KeyError![32]u8 {
+/// One open without following a symlink, the checks on that descriptor, and the read from it: the file checked is the
+/// file read.
+fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
     const path_z = a.dupeSentinel(u8, path, 0) catch return error.OutOfMemory;
     defer a.free(path_z);
+    const fd = std.c.open(path_z, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true }, @as(std.c.mode_t, 0));
+    if (fd < 0) return if (std.c._errno().* == @intFromEnum(std.c.E.LOOP)) error.NotRegular else error.Unreadable;
+    defer _ = std.c.close(fd);
     var st: std.c.Stat = undefined;
-    if (std.c.stat(path_z, &st) != 0) return error.Unreadable;
+    if (std.c.fstat(fd, &st) != 0) return error.Unreadable;
     if (st.mode & std.c.S.IFMT != std.c.S.IFREG) return error.NotRegular;
     if (st.uid != std.c.getuid()) return error.NotOwner;
     if (st.mode & 0o077 != 0) return error.GroupOrOtherAccess;
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 16)) catch return error.Unreadable;
-    defer {
-        std.crypto.secureZero(u8, bytes);
-        a.free(bytes);
+    var buf: [4096]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    var len: usize = 0;
+    while (len < buf.len) {
+        const n = std.c.read(fd, buf[len..].ptr, buf.len - len);
+        if (n < 0) return error.Unreadable;
+        if (n == 0) break;
+        len += @intCast(n);
     }
-    const key = trim(bytes);
+    const key = trim(buf[0..len]);
     if (key.len < min_key_len) return error.TooShort;
     var d: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(key, &d, .{});
@@ -228,7 +237,7 @@ fn readDirection(a: std.mem.Allocator, bytes: []const u8, hidden: u32) TensorErr
     var n: u64 = 1;
     for (shape.array.items) |d| {
         if (d != .integer or d.integer < 0) return error.Malformed;
-        n *= @intCast(d.integer);
+        n = std.math.mul(u64, n, @intCast(d.integer)) catch return error.Malformed;
     }
     const dims = shape.array.items;
     const shaped = (dims.len == 1 or (dims.len == 2 and dims[0].integer == 1)) and n == hidden;
@@ -361,12 +370,14 @@ pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *const LoadedModel)
     const set = http_server.g_ablation;
     const config = lm.config orelse return bad("this model does not serve ablation").refused;
     const serves = if (config.plugin) |pb| pb.parsed.caps.ablation else false;
+    // The pack's config is read only for a request that holds the key (`resolve` checks it first).
+    const authorized = if (set) |s| if (conn.ablation_key) |k| s.keyMatches(k) else false else false;
     var a = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer a.deinit();
     const served: Served = .{
         .hidden = config.hidden_size,
         .serves = serves,
-        .config_sha256 = if (set != null and serves) configDigest(conn.io, a.allocator(), lm.path) else null,
+        .config_sha256 = if (authorized and serves) configDigest(conn.io, a.allocator(), lm.path) else null,
     };
     const out = resolve(set, field, conn.ablation_key, served, &conn.ablation_header);
     const sel = switch (out) {
@@ -554,15 +565,22 @@ test "ablation key file: mode, length and trim rules" {
     defer a.free(path_z);
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "key", .data = test_key ++ "\n" });
     _ = std.c.chmod(path_z, 0o644);
-    try testing.expectError(error.GroupOrOtherAccess, readKey(a, testing.io, path));
+    try testing.expectError(error.GroupOrOtherAccess, readKey(a, path));
     _ = std.c.chmod(path_z, 0o600);
     var want: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(test_key, &want, .{});
-    try testing.expectEqualSlices(u8, &want, &(try readKey(a, testing.io, path)));
+    try testing.expectEqualSlices(u8, &want, &(try readKey(a, path)));
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "key", .data = "short\n" });
-    try testing.expectError(error.TooShort, readKey(a, testing.io, path));
-    try testing.expectError(error.NotRegular, readKey(a, testing.io, root));
-    try testing.expectError(error.Unreadable, readKey(a, testing.io, "/nonexistent/key"));
+    try testing.expectError(error.TooShort, readKey(a, path));
+    try testing.expectError(error.NotRegular, readKey(a, root));
+    const link = try std.fs.path.join(a, &.{ root, "link" });
+    defer a.free(link);
+    const link_z = try a.dupeSentinel(u8, link, 0);
+    defer a.free(link_z);
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "key", .data = test_key });
+    try testing.expect(std.c.symlink(path_z, link_z) == 0);
+    try testing.expectError(error.NotRegular, readKey(a, link));
+    try testing.expectError(error.Unreadable, readKey(a, "/nonexistent/key"));
 }
 
 test "ablation header: names the profile and strength, header-safe" {

@@ -414,6 +414,14 @@ fn freeOut(out: *const abi.ForwardOut, captured: []const abi.Array) void {
     };
 }
 
+/// A draft round never runs a feature the served plugin lacks: its forwards skip `unservedFeature`.
+fn roundServes(xfm: *const Transformer, b: *Bound, ctx: *const ForwardCtx) !void {
+    if (unservedFeature(xfm, ctx)) |what| {
+        log.err("[plugin] {s}: {s} is not served on the plugin path yet\n", .{ b.table.name.slice(), what });
+        return error.PluginForwardUnsupported;
+    }
+}
+
 /// What an ablated forward hands the plugin (`abi.Forward.ablation`): a direction row, strength and key per slot; a
 /// slot without one gets a zero row at strength 0.
 const Ablated = struct {
@@ -444,8 +452,10 @@ const Ablated = struct {
             self.strengths[i] = a.strength;
             self.keys[i] = a.key;
         }
+        const dirs = mlx.mlx_array_new_data(rows.ptr, &[_]c_int{ @intCast(n), @intCast(hidden) }, 2, .float32);
+        if (dirs.ctx == null) return error.OutOfMemory;
         self.abl = .{
-            .directions = .{ .ctx = mlx.mlx_array_new_data(rows.ptr, &[_]c_int{ @intCast(n), @intCast(hidden) }, 2, .float32).ctx },
+            .directions = .{ .ctx = dirs.ctx },
             .strengths = .of(self.strengths[0..n]),
             .keys = .of(self.keys[0..n]),
         };
@@ -590,6 +600,7 @@ pub fn nativeStages(xfm: *const Transformer) u32 {
 /// `ctx.cache.step` and `ctx.moe_seq_offset` move to the round's position.
 pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.Round {
     const b = xfm.plugin.?;
+    if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
     const tokens = [_]u32{t1};
     const slot_ids = [_]u32{settle.slotId(b, ctx)};
@@ -633,6 +644,7 @@ pub const Verified = struct { round: abi.Round, logits: Array };
 /// verify left open until `nativeFinish`. The caller frees `logits`.
 pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Verified {
     const b = xfm.plugin.?;
+    if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
     const tokens = [_]u32{t1};
     const slot_ids = [_]u32{settle.slotId(b, ctx)};
