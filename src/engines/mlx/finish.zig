@@ -140,6 +140,7 @@ pub fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: met
         slot.prompt_tokens,
         slot.completion_tokens,
         slot.cached_tokens,
+        slot.model.id,
     );
 }
 
@@ -262,6 +263,7 @@ const OutcomeStub = struct {
     prompt_tokens: u32 = 100,
     completion_tokens: u32 = 10,
     cached_tokens: u32 = 0,
+    model: struct { id: []const u8 } = .{ .id = "org/m" },
 
     /// `finishSlot` on the inference thread: records, then publishes the terminator.
     fn finish(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {

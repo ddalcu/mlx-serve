@@ -14,7 +14,8 @@
 //! Thread-safety: every write is `std.atomic.Value(u64)` with `.monotonic`
 //! (relaxed) ordering. Writers are N connection threads + the inference
 //! thread; readers (render) tolerate a slightly inconsistent cross-counter
-//! snapshot — fine for metrics. No mutex anywhere on the write path.
+//! snapshot — fine for metrics. No mutex on the write path: the one lock is the
+//! per-model table's CLAIM of a row, taken the first time a model id is seen.
 
 const std = @import("std");
 
@@ -42,6 +43,39 @@ const TOKEN_BOUNDS: [8]u64 = .{ 32, 128, 256, 512, 1024, 2048, 4096, 8192 };
 
 /// How a request that owned a slot ended.
 pub const Outcome = enum { success, cancelled, failed };
+
+/// Rows of the per-model table, the last one the shared `other` row.
+pub const MAX_USAGE_MODELS: usize = 64;
+const USAGE_NAME_MAX: usize = 160;
+
+/// One model id's share of the success counters since the process started: what a usage dashboard sums per day.
+pub const ModelUsage = struct {
+    /// Written once, under `Metrics.usage_lock`, before `usage_count` publishes the row.
+    name_len: u8,
+    name: [USAGE_NAME_MAX]u8,
+    requests: Counter,
+    prompt_tokens: Counter,
+    /// Prompt tokens restored from the hot prefix cache (`prompt_tokens` includes them).
+    cached_tokens: Counter,
+    generation_tokens: Counter,
+    prefill_ns: Counter,
+    decode_ns: Counter,
+
+    fn init(name: []const u8) ModelUsage {
+        var u: ModelUsage = .{
+            .name_len = @intCast(name.len),
+            .name = @splat(0),
+            .requests = Counter.init(),
+            .prompt_tokens = Counter.init(),
+            .cached_tokens = Counter.init(),
+            .generation_tokens = Counter.init(),
+            .prefill_ns = Counter.init(),
+            .decode_ns = Counter.init(),
+        };
+        @memcpy(u.name[0..name.len], name);
+        return u;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Metrics — the single global struct allocated when --metrics is on
@@ -130,6 +164,12 @@ pub const Metrics = struct {
     batched_group_size: Gauge,
     // Slot-ticks that decoded serial beside live company, per `BatchVerdict` reason.
     decode_serial_total: [SERIAL_REASONS.len]Counter,
+    /// The success counters split by model id (`usageFor`): a row is claimed on a model's FIRST request and never moves,
+    /// so every write after that is an atomic add. A model past the table folds into `usage_other`.
+    usage: [MAX_USAGE_MODELS - 1]ModelUsage,
+    usage_other: ModelUsage,
+    usage_count: std.atomic.Value(u32),
+    usage_lock: std.atomic.Mutex,
 
     pub fn init() Metrics {
         return .{
@@ -165,7 +205,32 @@ pub const Metrics = struct {
             .ngram_warm_bytes = Gauge.init(),
             .batched_group_size = Gauge.init(),
             .decode_serial_total = @splat(Counter.init()),
+            .usage = @splat(ModelUsage.init("")),
+            .usage_other = ModelUsage.init("other"),
+            .usage_count = std.atomic.Value(u32).init(0),
+            .usage_lock = .unlocked,
         };
+    }
+
+    /// The row `model` accounts to. Found without a lock once it exists; claimed under `usage_lock` the first time only.
+    fn usageFor(self: *Metrics, model: []const u8) *ModelUsage {
+        const name = model[0..@min(model.len, USAGE_NAME_MAX)];
+        if (self.findUsage(name)) |u| return u;
+        while (!self.usage_lock.tryLock()) std.atomic.spinLoopHint();
+        defer self.usage_lock.unlock();
+        if (self.findUsage(name)) |u| return u; // another thread claimed it while this one waited
+        const n = self.usage_count.load(.monotonic);
+        if (n == self.usage.len) return &self.usage_other;
+        const u = &self.usage[n];
+        u.* = ModelUsage.init(name);
+        self.usage_count.store(n + 1, .release);
+        return u;
+    }
+
+    fn findUsage(self: *Metrics, name: []const u8) ?*ModelUsage {
+        const n = self.usage_count.load(.acquire);
+        for (self.usage[0..n]) |*u| if (std.mem.eql(u8, u.name[0..u.name_len], name)) return u;
+        return null;
     }
 
     /// A request refused before it owned a slot (context overflow, memory preflight).
@@ -192,6 +257,7 @@ pub const Metrics = struct {
     ///   - `prefill_ns`: model prefill phase only (no queue wait).
     ///   - `decode_ns`: decode phase duration.
     ///   - e2e latency = real_ttft_ns + decode_ns (= queue_wait + prefill + decode).
+    ///   - `model`: the id whose row of the per-model split a success adds to.
     pub fn recordRequest(
         self: *Metrics,
         outcome: Outcome,
@@ -201,6 +267,7 @@ pub const Metrics = struct {
         prompt_tokens: u32,
         completion_tokens: u32,
         cached_tokens: u32,
+        model: []const u8,
     ) void {
         // Wire prefix-cache stats unconditionally: every request queries the cache.
         self.prefix_cache_queries_total.inc();
@@ -227,6 +294,14 @@ pub const Metrics = struct {
         self.prefill_tokens_total.add(prompt_tokens - restored);
         self.prefix_cache_tokens_total.add(restored);
         self.generation_tokens_total.add(completion_tokens);
+
+        const u = self.usageFor(model);
+        u.requests.inc();
+        u.prompt_tokens.add(prompt_tokens);
+        u.cached_tokens.add(restored);
+        u.generation_tokens.add(completion_tokens);
+        u.prefill_ns.add(prefill_ns);
+        u.decode_ns.add(decode_ns);
 
         self.ttft_ns.observe(real_ttft_ns);
         self.prefill_time_ns.observe(prefill_ns);
@@ -483,7 +558,20 @@ pub fn renderJson(m: *const Metrics, sessions: []const Session, w: *std.Io.Write
             @tagName(s.phase), s.context_tokens, s.context_length, s.cached_tokens, s.generated_tokens, s.state_bytes, s.request_id, s.client.label(),
         });
     }
+    try w.print("],\"usage\":[", .{});
+    var first_row = true;
+    for (m.usage[0..m.usage_count.load(.acquire)]) |*u| try writeUsageRow(w, u, &first_row);
+    if (m.usage_other.requests.load() > 0) try writeUsageRow(w, &m.usage_other, &first_row);
     try w.print("]}}", .{});
+}
+
+fn writeUsageRow(w: *std.Io.Writer, u: *const ModelUsage, first: *bool) !void {
+    try w.print("{s}{{\"model\":", .{if (first.*) "" else ","});
+    first.* = false;
+    try std.json.Stringify.encodeJsonString(u.name[0..u.name_len], .{}, w);
+    try w.print(",\"requests\":{d},\"prompt_tokens\":{d},\"cached_tokens\":{d},\"generation_tokens\":{d},\"prefill_ns\":{d},\"decode_ns\":{d}}}", .{
+        u.requests.load(), u.prompt_tokens.load(), u.cached_tokens.load(), u.generation_tokens.load(), u.prefill_ns.load(), u.decode_ns.load(),
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +769,7 @@ test "prefill throughput must exclude cache-restored tokens" {
     // a 91% token-level cache hit rate reported 9.8K tok/s where the server's
     // own log line said ~220-1100. The panel needs the FORWARDED token count.
     var m = Metrics.init();
-    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900, "m");
 
     // vLLM semantics preserved: every prompt token is billed.
     try testing.expectEqual(@as(u64, 1000), m.prompt_tokens_total.load());
@@ -696,12 +784,12 @@ test "prefill throughput must exclude cache-restored tokens" {
     );
 
     // A cold request (no cache hit) forwards everything.
-    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 400, 10, 0);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 400, 10, 0, "m");
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 900), m.prefix_cache_tokens_total.load());
 
     // Degenerate: cached >= prompt must saturate (restore 10, not 99) and never wrap.
-    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 10, 1, 99);
+    m.recordRequest(.success, 1_000_000, 100_000_000, 500_000_000, 10, 1, 99, "m");
     try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
     try testing.expectEqual(@as(u64, 910), m.prefix_cache_tokens_total.load());
     // Invariant survives the saturation.
@@ -829,7 +917,7 @@ test "Metrics.recordRequest increments correct fields on success" {
     const testing = std.testing;
     var m = Metrics.init();
     // real_ttft=60ms (includes 10ms queue wait + 50ms prefill), prefill=50ms, decode=200ms
-    m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20);
+    m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20, "m");
 
     try testing.expectEqual(@as(u64, 1), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
@@ -856,7 +944,7 @@ test "Metrics.recordRequest increments correct fields on success" {
 test "Metrics.recordRequest skips histograms on cancelled request" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest(.cancelled, 50_000_000, 50_000_000, 0, 128, 0, 0);
+    m.recordRequest(.cancelled, 50_000_000, 50_000_000, 0, 128, 0, 0, "m");
 
     try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
     try testing.expectEqual(@as(u64, 1), m.requests_cancelled_total.load());
@@ -1101,7 +1189,7 @@ test "process_start_time_seconds is exposed as a gauge in both feeds" {
 test "Metrics.recordRequest counts a failed request and leaves histograms and token counters alone" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest(.failed, 50_000_000, 50_000_000, 100_000_000, 128, 5, 0);
+    m.recordRequest(.failed, 50_000_000, 50_000_000, 100_000_000, 128, 5, 0, "m");
 
     try testing.expectEqual(@as(u64, 1), m.requests_failed_total.load());
     try testing.expectEqual(@as(u64, 0), m.requests_success_total.load());
@@ -1123,7 +1211,7 @@ test "Metrics.recordRejected moves only the rejected counter" {
 test "failed and rejected counters render under their Prometheus and JSON names" {
     const testing = std.testing;
     var m = Metrics.init();
-    m.recordRequest(.failed, 0, 0, 0, 1, 0, 0);
+    m.recordRequest(.failed, 0, 0, 0, 1, 0, 0, "m");
     m.recordRejected();
     m.recordRejected();
 
@@ -1142,4 +1230,68 @@ test "failed and rejected counters render under their Prometheus and JSON names"
     const counters = parsed.value.object.get("counters").?.object;
     try testing.expectEqual(@as(i64, 1), counters.get("requests_failed_total").?.integer);
     try testing.expectEqual(@as(i64, 2), counters.get("requests_rejected_total").?.integer);
+}
+
+test "per-model usage rows carry each model's tokens and add up to the global counters" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.recordRequest(.success, 60_000_000, 50_000_000, 200_000_000, 128, 64, 20, "org/a");
+    m.recordRequest(.success, 10_000_000, 5_000_000, 100_000_000, 40, 10, 0, "org/b \"q\"");
+    m.recordRequest(.success, 10_000_000, 5_000_000, 100_000_000, 10, 6, 10, "org/a");
+    // A cancelled or failed request holds no tokens in the global counters, so it holds none in a model's row.
+    m.recordRequest(.cancelled, 1, 1, 1, 999, 999, 0, "org/a");
+    m.recordRequest(.failed, 1, 1, 1, 999, 999, 0, "org/c");
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{}, &w);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w.end], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("usage").?.array.items;
+    try testing.expectEqual(@as(usize, 2), rows.len);
+    const a = rows[0].object;
+    try testing.expectEqualStrings("org/a", a.get("model").?.string);
+    try testing.expectEqual(@as(i64, 2), a.get("requests").?.integer);
+    try testing.expectEqual(@as(i64, 138), a.get("prompt_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 30), a.get("cached_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 70), a.get("generation_tokens").?.integer);
+    try testing.expectEqual(@as(i64, 55_000_000), a.get("prefill_ns").?.integer);
+    try testing.expectEqual(@as(i64, 300_000_000), a.get("decode_ns").?.integer);
+    try testing.expectEqualStrings("org/b \"q\"", rows[1].object.get("model").?.string);
+
+    // The rows split the global counters; they are never a second count.
+    var prompt: i64 = 0;
+    var generated: i64 = 0;
+    var requests: i64 = 0;
+    for (rows) |r| {
+        prompt += r.object.get("prompt_tokens").?.integer;
+        generated += r.object.get("generation_tokens").?.integer;
+        requests += r.object.get("requests").?.integer;
+    }
+    const counters = parsed.value.object.get("counters").?.object;
+    try testing.expectEqual(counters.get("prompt_tokens_total").?.integer, prompt);
+    try testing.expectEqual(counters.get("generation_tokens_total").?.integer, generated);
+    try testing.expectEqual(counters.get("requests_success_total").?.integer, requests);
+}
+
+test "a model past the table's capacity folds into an other row, so the split still adds up" {
+    const testing = std.testing;
+    var m = Metrics.init();
+    var name: [16]u8 = undefined;
+    const models = MAX_USAGE_MODELS + 5;
+    for (0..models) |i| m.recordRequest(.success, 1, 1, 1, 10, 5, 0, std.fmt.bufPrint(&name, "model-{d}", .{i}) catch unreachable);
+
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderJson(&m, &.{}, &w);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, buf[0..w.end], .{});
+    defer parsed.deinit();
+    const rows = parsed.value.object.get("usage").?.array.items;
+    try testing.expectEqual(MAX_USAGE_MODELS, rows.len);
+    const other = rows[rows.len - 1].object;
+    try testing.expectEqualStrings("other", other.get("model").?.string);
+    try testing.expectEqual(@as(i64, 6), other.get("requests").?.integer);
+    var generated: i64 = 0;
+    for (rows) |r| generated += r.object.get("generation_tokens").?.integer;
+    try testing.expectEqual(@as(i64, 5 * models), generated);
 }

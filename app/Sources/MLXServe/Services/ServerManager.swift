@@ -89,6 +89,11 @@ class ServerManager: ObservableObject {
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
     let api = APIClient()
+    /// What this server serves, counted day by day for the dashboard: polled for as long as the process runs.
+    private(set) lazy var usage = UsageTracker { [weak self] in
+        guard let self else { return nil }
+        return try? await self.api.fetchThroughput(port: self.port)
+    }
     /// True while the tray popover is on screen. Drives the live /props
     /// ticker — when the popover is closed there's nothing to render, so we
     /// stop polling entirely instead of burning 3 s ticks in the background.
@@ -277,6 +282,7 @@ class ServerManager: ObservableObject {
             process = proc
             startHealthPolling()
             startLoadProgressPolling()
+            usage.start()
         } catch {
             status = .error(error.localizedDescription)
             lastError = error.localizedDescription
@@ -304,6 +310,7 @@ class ServerManager: ObservableObject {
         pollSource?.cancel()
         pollSource = nil
         stopLoadProgressPolling()
+        usage.stop()
         healthTask?.cancel()
         healthTask = nil
         healthTimer?.invalidate()
@@ -401,6 +408,7 @@ class ServerManager: ObservableObject {
         pollSource?.cancel()
         pollSource = nil
         stopLoadProgressPolling()
+        usage.stop()
         healthTask?.cancel()
         healthTask = nil
         healthTimer?.invalidate()
