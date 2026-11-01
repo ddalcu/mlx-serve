@@ -7,6 +7,7 @@ const testing = std.testing;
 const BARE_THINK_OPENER = @import("muse.zig").BARE_THINK_OPENER;
 const splitThinkBlock = @import("split.zig").splitThinkBlock;
 const nextThinkOpen = @import("split.zig").nextThinkOpen;
+const MINIMAX_NAMESPACE = @import("../tools/minimax.zig").MINIMAX_NAMESPACE;
 
 /// The FIRST unclosed think/thought opener: the earliest `<|channel>thought`
 /// or `<think>` in `text` with no matching close tag anywhere after it.
@@ -132,22 +133,30 @@ pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
 fn thinkCloseIsToolCallPayload(text: []const u8, pos: usize) bool {
     // `streamThinkGate2` calls the close scan once per TOKEN on a growing
     // buffer, so the common case — text with no tool markup at all — must cost
-    // one substring scan, not a walk per opener spelling. Both spellings share
-    // this needle.
-    if (std.mem.indexOf(u8, text[0..pos], "tool_call") == null) return false;
-    // Nearest `<tool_call`-family opener before `pos`. Only this family is
-    // considered: it is the one whose bodies carry free-form argument text.
+    // one substring scan per family, not a walk per opener spelling.
+    if (std.mem.indexOf(u8, text[0..pos], "tool_call") == null and
+        std.mem.indexOf(u8, text[0..pos], MINIMAX_NAMESPACE) == null) return false;
+    // Nearest opener before `pos` among the families whose bodies carry
+    // free-form argument text, paired with that family's closer.
     var open: ?usize = null;
-    for ([_][]const u8{ "<tool_call", "<|tool_call" }) |m| {
+    var closer: []const u8 = "</tool_call";
+    for ([_][2][]const u8{
+        .{ "<tool_call", "</tool_call" },
+        .{ "<|tool_call", "</tool_call" },
+        .{ MINIMAX_NAMESPACE ++ "<invoke", MINIMAX_NAMESPACE ++ "</invoke>" },
+    }) |pair| {
         var i: usize = 0;
-        while (std.mem.indexOfPos(u8, text, i, m)) |p| {
+        while (std.mem.indexOfPos(u8, text, i, pair[0])) |p| {
             if (p >= pos) break;
-            if (open == null or p > open.?) open = p;
+            if (open == null or p > open.?) {
+                open = p;
+                closer = pair[1];
+            }
             i = p + 1;
         }
     }
     const o = open orelse return false;
-    if (std.mem.indexOfPos(u8, text, o, "</tool_call")) |c| {
+    if (std.mem.indexOfPos(u8, text, o, closer)) |c| {
         if (c < pos) return false; // that call already closed — a real block close
         return true;
     }

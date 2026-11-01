@@ -9,6 +9,7 @@ const inklingIsNameChar = @import("inkling.zig").inklingIsNameChar;
 const BARE_INVOKE = @import("invoke.zig").BARE_INVOKE;
 const FUNCTION_CALLS_TAG = @import("invoke.zig").FUNCTION_CALLS_TAG;
 const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
+const miniMaxEnvelopeStart = @import("minimax.zig").miniMaxEnvelopeStart;
 
 /// Tool-call WRAPPER openers (and DSML's closer, which no prose spells) that must never survive into text a client
 /// renders. Every entry is the opening marker of a call block, so whatever
@@ -94,9 +95,8 @@ fn miniCpm5MarkupCut(text: []const u8) ?usize {
     return null;
 }
 
-/// Cut visible text at the first unparsed tool-call marker. Returns a prefix
-/// slice (no alloc); text with no marker is returned untouched.
-pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
+/// Start of the first recognized tool envelope, before any payload bytes.
+pub fn toolMarkupStart(text: []const u8) ?usize {
     var cut: usize = text.len;
     var is_inkling = false;
     for (tool_markup_openers) |m| {
@@ -122,13 +122,27 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
             is_inkling = false;
         }
     }
-    if (cut == text.len) return text;
+    // MiniMax: its namespace prefixes every structural tag, but alone it is prose, and in a JSON answer payload.
+    if (miniMaxEnvelopeStart(text)) |p| {
+        if (p < cut) {
+            cut = p;
+            is_inkling = false;
+        }
+    }
+    if (cut == text.len) return null;
     // Inkling puts the tool NAME immediately BEFORE its invoke marker, so the
     // cut takes the trailing identifier run with it — otherwise the bare name
     // is what the client renders as the answer.
     if (is_inkling) {
         while (cut > 0 and inklingIsNameChar(text[cut - 1])) cut -= 1;
     }
+    return cut;
+}
+
+/// Cut visible text at the first unparsed tool-call marker. Returns a prefix
+/// slice (no alloc); text with no marker is returned untouched.
+pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
+    const cut = toolMarkupStart(text) orelse return text;
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
 }
 
@@ -262,4 +276,14 @@ test "minicpm5 COMBINED: parser and scrubber agree on the same bytes" {
             };
         }
     }
+}
+
+test "MiniMax native incomplete markup is not visible content" {
+    try testing.expectEqualStrings("Run this.", trimLeakedToolMarkup("Run this.]<]minimax[>[<invoke name=\"shell\">unfinished"));
+    try testing.expectEqualStrings("Run this.", trimLeakedToolMarkup("Run this.]<]minimax[>["));
+    const prose = "The marker is ]<]minimax[>[, spelled out.";
+    try testing.expectEqualStrings(prose, trimLeakedToolMarkup(prose));
+    // A JSON answer's strings are payload, as the parser takes them.
+    const json = "{\"marker\": \"]<]minimax[>[<invoke name=\\\"shell\\\">\"}";
+    try testing.expectEqualStrings(json, trimLeakedToolMarkup(json));
 }
