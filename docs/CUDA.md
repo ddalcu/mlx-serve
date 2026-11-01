@@ -75,7 +75,7 @@ Guard: `qmv_cuda: no worse than stock quantized_matmul against f32 truth` (rows 
 
 Defect: NVIDIA's Flash Next FP4 pack chose an 8192-row chunk on a GB10 and every prompt past it failed with `cuGraphAddKernelNode ... invalid argument`.
 Cause: MLX's `GatherQMM` runs `qmm_sm80` with one block per (token, expert) pair on grid z, capped at 65,535; 8192 rows x top-10 is 81,920. The 2048-row CUDA cap (`autoPrefillChunkCap`) bound only the load-time pin, and Flash Next picks its width per request and widens per chunk.
-Fix: MLX's `gather_qmm_rhs_sm80` (upstream #4554, in the pin since the 4ca8d5d5 bump; it replaced `mlx-cuda-gather-qmm-rhs.patch`) runs sorted fp4/fp8 gathers one group per expert, ~10x faster at a 2048-row chunk; `generate.machine_prefill_chunk_cap` bounds every auto width in `effectivePrefillChunk`. Affine banks and expert widths not a multiple of 128 keep the old gather and its limit.
+Fix: MLX's `gather_qmm_rhs_sm80` (upstream #4554) runs sorted fp4/fp8 gathers one group per expert, ~10x faster at a 2048-row chunk; `generate.machine_prefill_chunk_cap` bounds every auto width in `effectivePrefillChunk`. Affine banks and expert widths not a multiple of 128 keep the old gather and its limit.
 Guard: `gatherExpertMm: a sorted nvfp4 gather past 65,535 rows…`, `effectivePrefillChunk: the machine cap bounds every auto width…`, `chooseRequestPrefillChunk: the machine's chunk cap bounds…`.
 
 ### `bf16 + bf16` in a JIT kernel is not MLX's add
@@ -103,7 +103,7 @@ Guard: `below 4 rows per expert MLX's sorted mat-vec is bit-identical to its per
 ### A fixed kernel kept running its racy build from MLX's PTX cache
 
 Defect: on a DGX Spark the same greedy request drifted from run to run (logprobs ~0.1 apart, another token after 15-150), and one 64-token prefill forward repeated in a process moved logits by up to 5. The first output to differ was a `qmm_sm80` quantized matmul whose inputs were bit-identical.
-Cause: `qmm_sm80`'s epilogue writes C into the shared memory of the A/B pipeline while its last prefetches can still land. the sorted gather's `gather_qmm_rhs_sm80` kernel (patched by #899 until the pin took upstream's, which carries the same `cp_async_wait<0>` fix) waits for them, but MLX caches compiled kernels by module name under `<tmp>/mlx/<version>/ptx`, so a box that compiled the kernel before the patch kept running the racy build.
+Cause: `qmm_sm80`'s epilogue writes C into the shared memory of the A/B pipeline while its last prefetches can still land. The sorted gather's `gather_qmm_rhs_sm80` kernel (#899, now upstream) waits for them, but MLX caches compiled kernels by module name under `<tmp>/mlx/<version>/ptx`, so a box that compiled the kernel before the patch kept running the racy build.
 Fix: `mlx.exportPtxCacheDir` points `MLX_PTX_CACHE_DIR` (unless set) at `<tmp>/mlx-serve-ptx/<id>`, the id hashing `lib/mlx/.version` (MLX commits, patch inputs, CUDA arch), so each patch set compiles its own kernels. The stamp reaches the binary through the build graph (module `mlx_stamp`): read at configure time, it was cached and an incremental build after an MLX update kept the old id. A hand edit to `lib/mlx-src` keeps the id: delete that directory.
 Guard: `ptxCacheDir: each staged MLX build compiles into its own kernel cache`, `stampId: a rebuilt MLX gets a cache of its own`; `QWEN4_TEST_MODEL=<pack> zig build test -Dtest-filter="one lazy 64-token forward"` (4 of 4 repeats differ on the pre-#899 kernel).
 
