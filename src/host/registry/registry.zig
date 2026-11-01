@@ -25,6 +25,7 @@ const tokenize_cache_mod = @import("../tokenizer/cache.zig");
 const token_mask_mod = @import("../../sdk/grammar/token_mask.zig");
 const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const model_discovery = @import("discovery.zig");
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const load_progress = @import("load_progress.zig");
 const Served = @import("../engines/served.zig").Served;
@@ -772,7 +773,27 @@ pub const ModelRegistry = struct {
             defer self.mutex.unlock(self.io);
             if (self.peekByPathLocked(path)) |e| return e;
         }
-        // The same directory under another spelling: a symlink, either way round.
+        if (self.peekByRealPath(path)) |e| return e;
+        // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it. Only the file the
+        // folder serves: another quant beside it is a model of its own.
+        if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| if (self.peekByPath(dir)) |e| {
+            if (self.folderServes(e.path, path)) return e;
+        };
+        return null;
+    }
+
+    fn folderServes(self: *ModelRegistry, folder: []const u8, file: []const u8) bool {
+        const pick = gguf_files.resolveGgufFile(self.io, self.allocator, folder) catch return false;
+        defer self.allocator.free(pick);
+        var a: [std.fs.max_path_bytes]u8 = undefined;
+        var b: [std.fs.max_path_bytes]u8 = undefined;
+        const ra = a[0 .. std.Io.Dir.realPathFileAbsolute(self.io, pick, &a) catch return false];
+        const rb = b[0 .. std.Io.Dir.realPathFileAbsolute(self.io, file, &b) catch return false];
+        return std.mem.eql(u8, ra, rb);
+    }
+
+    /// The same directory under another spelling: a symlink, either way round.
+    fn peekByRealPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         if (!std.fs.path.isAbsolute(path)) return null;
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const real = buf[0 .. std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return null];
@@ -1587,6 +1608,40 @@ test "ModelRegistry: peekByPath finds an entry through a symlinked path in eithe
     defer reg2.deinit();
     const via_real = try reg2.registerStubWithArch("m", real, 64, "qwen3");
     try testing.expectEqual(via_real, reg2.peekByPath(link) orelse return error.TestUnexpectedResult);
+}
+
+test "ModelRegistry: peekByPath finds a GGUF pack by the .gguf file inside it, also through a symlink" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real/pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pack/m.gguf", .data = "GGUF" });
+    try tmp.dir.createDirPath(io, "links");
+    try tmp.dir.symLink(io, "../real/pack", "links/pack", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const link = try std.fs.path.join(testing.allocator, &.{ root, "links", "pack" });
+    defer testing.allocator.free(link);
+    const real_file = try std.fs.path.join(testing.allocator, &.{ root, "real", "pack", "m.gguf" });
+    defer testing.allocator.free(real_file);
+    const link_file = try std.fs.path.join(testing.allocator, &.{ root, "links", "pack", "m.gguf" });
+    defer testing.allocator.free(link_file);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("pack", link, 64, "gguf");
+    try testing.expectEqual(e, reg.peekByPath(link_file) orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(e, reg.peekByPath(real_file) orelse return error.TestUnexpectedResult);
+    // Another quant beside the one the folder serves is not that entry.
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pack/z.gguf", .data = "GGUF" });
+    const other = try std.fs.path.join(testing.allocator, &.{ root, "real", "pack", "z.gguf" });
+    defer testing.allocator.free(other);
+    try testing.expect(reg.peekByPath(other) == null);
+    try testing.expectEqual(e, reg.peekByPath(real_file) orelse return error.TestUnexpectedResult);
+    // Only a .gguf falls back to its folder.
+    const readme = try std.fs.path.join(testing.allocator, &.{ link, "README.md" });
+    defer testing.allocator.free(readme);
+    try testing.expect(reg.peekByPath(readme) == null);
 }
 
 test "ModelRegistry: registerByPath rejects a nonexistent directory" {

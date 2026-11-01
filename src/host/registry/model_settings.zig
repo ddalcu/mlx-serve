@@ -11,6 +11,7 @@ const mtp_acceptance = @import("../../sdk/spec/mtp_acceptance.zig");
 const generation = @import("../api/generation_settings.zig");
 const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
 
 /// What can serve a model; the per-model `engine` setting (Model Settings' engine picker) and each
 /// `/v1/models` row's `engines` use these names. No setting leaves the choice to the server.
@@ -356,13 +357,25 @@ pub fn ggufEngineFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u
     return o.ggufEngine();
 }
 
+/// `model_path`'s entry; a GGUF pack, registered by its folder, also answers to the `.gguf` the folder serves (the
+/// app keys a GGUF by its file), under that spelling or its real path. The folder's own key wins.
+fn lookupPack(s: *const Settings, alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) Override {
+    if (s.entry(model_path) != null or std.mem.endsWith(u8, model_path, ".gguf")) return s.lookup(alloc, model_path);
+    if (!std.fs.path.isAbsolute(model_path)) return .{};
+    const file = gguf_files.resolveGgufFile(io, alloc, model_path) catch return .{};
+    defer alloc.free(file);
+    if (s.entry(file) != null) return s.lookup(alloc, file);
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    return s.lookup(alloc, buf[0 .. std.Io.Dir.realPathFileAbsolute(io, file, &buf) catch return .{}]);
+}
+
 /// The one call load sites make: read the default file, look the model up, log
 /// a hit. The caller owns the result (`Override.deinit`).
 pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) Override {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     var s = load(alloc, io, defaultPath(&buf));
     defer s.deinit();
-    var o = s.lookup(alloc, model_path);
+    var o = lookupPack(&s, alloc, io, model_path);
     if (o.drafter) |d| if (std.fs.path.isAbsolute(d)) {
         var cfg_buf: [std.fs.max_path_bytes]u8 = undefined;
         const cfg = std.fmt.bufPrint(&cfg_buf, "{s}/config.json", .{d}) catch "";
@@ -409,6 +422,36 @@ test "model_settings: parse + lookup with and without trailing slash" {
     try std.testing.expectEqual(@as(u8, 4), b.kv_quant.?.bits);
     try std.testing.expectEqual(@as(?bool, null), b.mtp);
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: a GGUF folder answers to the key of the .gguf it serves, by its spelling or real path" {
+    const t = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real/pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pack/m.gguf", .data = "GGUF" });
+    try tmp.dir.symLink(io, "real/pack", "link", .{ .is_directory = true });
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(io, &rbuf)];
+    const link = try std.fs.path.join(t, &.{ root, "link" });
+    defer t.free(link);
+    const json = try std.fmt.allocPrint(t, "{{\"{s}/real/pack/m.gguf\": {{\"ctx_size\": 393216}}}}", .{root});
+    defer t.free(json);
+    var s = try parse(t, json);
+    defer s.deinit();
+    // The scan registers the pack by its symlinked folder; the app keyed the real .gguf.
+    try std.testing.expectEqual(@as(?u32, 393216), lookupPack(&s, t, io, link).ctx_size);
+    const both = try std.fmt.allocPrint(t, "{{\"{s}\": {{\"ctx_size\": 65536}}, \"{s}/real/pack/m.gguf\": {{\"ctx_size\": 393216}}}}", .{ link, root });
+    defer t.free(both);
+    var s2 = try parse(t, both);
+    defer s2.deinit();
+    try std.testing.expectEqual(@as(?u32, 65536), lookupPack(&s2, t, io, link).ctx_size);
+    // A folder with no GGUF has no fallback.
+    try tmp.dir.createDirPath(io, "mlx");
+    const mlx = try std.fs.path.join(t, &.{ root, "mlx" });
+    defer t.free(mlx);
+    try std.testing.expect(lookupPack(&s, t, io, mlx).isEmpty());
 }
 
 test "model_settings: entry is the model's raw object, keys the Override does not read included" {
