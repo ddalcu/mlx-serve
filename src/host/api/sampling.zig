@@ -219,9 +219,10 @@ pub fn optSamplingRecJson(allocator: std.mem.Allocator, comptime T: type, v: ?T)
     return allocator.dupe(u8, "null");
 }
 
-/// The multiplicative `repeat_penalty` (llama.cpp's); a value <= 0 is an omission.
+/// The multiplicative `repeat_penalty` (llama.cpp's) or `repetition_penalty` (vLLM's); a value <= 0 is an omission.
 fn requestRepeatPenalty(root: std.json.ObjectMap, gen: generation_settings.Profile) f32 {
-    const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
+    var repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
+    if (repeat <= 0) repeat = parseJsonFloat(root, "repetition_penalty", 0.0, 0.0, 10.0);
     return gen.resolve(f32, .repeat_penalty, if (repeat > 0) repeat else null, 1.0);
 }
 
@@ -536,6 +537,26 @@ test "OpenAI frequency_penalty is its own additive penalty, never a repeat_penal
     const got = resolveSampling(.{}, body.value.object, &.{});
     try std.testing.expectEqual(@as(f32, 1.0), got.frequency_penalty);
     try std.testing.expectEqual(@as(f32, 1.0), got.repeat_penalty);
+}
+
+test "requestRepeatPenalty: repetition_penalty alias and repeat_penalty precedence" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { json: []const u8, want: f32 }{
+        .{ .json = "{\"repetition_penalty\":1.05}", .want = 1.05 },
+        .{ .json = "{\"repetition_penalty\":2}", .want = 2.0 },
+        .{ .json = "{\"repeat_penalty\":1.2,\"repetition_penalty\":1.05}", .want = 1.2 },
+        .{ .json = "{\"repeat_penalty\":0,\"repetition_penalty\":1.05}", .want = 1.05 },
+        .{ .json = "{\"repetition_penalty\":0}", .want = 1.0 },
+        .{ .json = "{\"repetition_penalty\":-1.5}", .want = 1.0 },
+        .{ .json = "{\"repetition_penalty\":\"1.5\"}", .want = 1.0 },
+        .{ .json = "{\"repetition_penalty\":25.0}", .want = 10.0 },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, c.json, .{});
+        defer parsed.deinit();
+        const got = resolveSampling(.{}, parsed.value.object, &.{});
+        try std.testing.expectApproxEqAbs(c.want, got.repeat_penalty, 1e-6);
+    }
 }
 
 test "generationMaxTokens: an auto request (0, negative, omitted) takes the rule, a forced rule takes everything" {
