@@ -9,11 +9,12 @@
 #   ./tests/test_prefix_inherit_qsa.sh [/path/to/qwen4_exp pack] [port]
 #
 # The coordinator runs this; an agent does not start a model server for it.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit}"
+MODEL="${1:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit")}"
 PORT="${2:-11490}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'

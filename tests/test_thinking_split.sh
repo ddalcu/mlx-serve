@@ -47,7 +47,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 1
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 8192 --log-level info > /tmp/test_thinking_split.log 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
 srv_wait_health "$BASE" 90 2 || { echo "FAIL: server did not come up"; exit 1; }
 

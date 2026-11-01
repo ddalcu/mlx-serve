@@ -7,11 +7,12 @@
 #   ./tests/test_messages_stream_thinking_tools.sh [model_dir] [port]   # Qwen 3.5/3.6; starts its own server
 #
 # Hermetic twins: `chat.streamThinkGate` tests and the format corpus streaming replay.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit}"
+MODEL="${1:-$(find_model mlx-community/Qwen3.6-35B-A3B-6bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.6-35B-A3B-6bit")}"
 PORT="${2:-11263}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -40,7 +41,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 1
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size 8192 --log-level info > /tmp/test_messages_stream_thinking_tools.log 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
 srv_wait_health "$BASE" 120 2 || { echo "FAIL: server did not come up"; exit 1; }
 

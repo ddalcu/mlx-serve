@@ -250,12 +250,10 @@ private struct RecommendedModelTable: View {
 
     private var families: [Family] {
         [
-            Family(id: "gemma", title: "Gemma 4", systemImage: "g.circle", tint: .blue,
-                   picks: RecommendedModelPick.gemmaCatalog),
-            Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
-                   picks: RecommendedModelPick.qwenCatalog),
             Family(id: "liquid", title: "Liquid LFM3", systemImage: "waveform.and.person.filled", tint: .purple,
                    picks: RecommendedModelPick.liquidCatalog),
+            Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
+                   picks: RecommendedModelPick.qwenCatalog),
             Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
                    picks: RecommendedModelPick.largestCatalog),
         ]

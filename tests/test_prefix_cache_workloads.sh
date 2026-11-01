@@ -8,11 +8,12 @@
 # between groups falls back to plain LRU).
 #
 #   ./tests/test_prefix_cache_workloads.sh [/path/to/model] [port]
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 PORT="${2:-11433}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'

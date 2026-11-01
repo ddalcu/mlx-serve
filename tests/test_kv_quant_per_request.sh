@@ -4,10 +4,11 @@
 # reuses a prefix committed under the other scheme (`[hot-cache] reused 0/…`).
 #
 #   ./tests/test_kv_quant_per_request.sh [/path/to/model] [port]   # default gemma-4-e4b-it-4bit, port 8094
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 PORT="${2:-8094}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'

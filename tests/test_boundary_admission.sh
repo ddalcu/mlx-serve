@@ -9,13 +9,14 @@
 #   BOUNDARY_TEST_MODEL=<dir> BINARY=./zig-out/bin/mlx-serve ./tests/test_boundary_admission.sh [port]
 #
 # Needs ~2x the prefill chunk of prompt budget; SKIPs without a model.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11488}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${BOUNDARY_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E2B-it-qat-4bit}"
+MODEL="${BOUNDARY_TEST_MODEL:-$(find_model mlx-community/gemma-4-E2B-it-qat-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E2B-it-qat-4bit")}"
 B_WORDS="${B_WORDS:-4000}"
 WORK="$(mktemp -d)"
 SERVER_PID=""

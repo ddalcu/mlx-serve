@@ -3,6 +3,7 @@
 # stream without it (the streaming adapter must not drop, duplicate or reorder tokens across multi-token verifies).
 #
 #   PLD_TEST_MODEL=<dir> ./tests/test_streaming_pld.sh [port]   # default gemma-4-e4b-it-8bit; SKIP without one
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 
@@ -13,7 +14,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${PLD_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
+MODEL="${PLD_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_streaming_pld: model directory not found."

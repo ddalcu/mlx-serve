@@ -61,8 +61,8 @@ fn sized(comptime T: type, p: ?*const anyopaque) bool {
 /// The host's checks on a manifest, before any other member is read: refuses by name a manifest, table or hook table
 /// of another version or a smaller size, another MLX, or a name a plugin cannot have.
 pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
-    if (m.version != version) return Verdict.refuse(.unsupported, "plugin manifest version is not this host's");
-    if (m.size < @sizeOf(Manifest)) return Verdict.refuse(.unsupported, "plugin manifest is older than this host's");
+    if (m.version != version) return Verdict.refuse(.unsupported, "plugin manifest version is not this host's: rebuild it with this release's kit");
+    if (m.size < @sizeOf(Manifest)) return Verdict.refuse(.unsupported, "plugin manifest is older than this host's: rebuild it with this release's kit");
     if (!validName(m.name.slice())) return Verdict.refuse(.failed, "plugin name is not [a-z0-9_], 1 to 64 bytes");
     if (!std.mem.eql(u8, std.mem.trim(u8, m.mlx.slice(), " \t\r\n"), std.mem.trim(u8, host_mlx, " \t\r\n")))
         return Verdict.refuse(.unsupported, "plugin was built against another MLX: rebuild it with this release's kit");
@@ -142,12 +142,12 @@ test "abi dylib: negotiation accepts its own build and refuses each mismatch by 
 
     const Case = struct { []const u8, *const fn (*Manifest, *quant_abi.QuantTable) void };
     const cases = [_]Case{
-        .{ "plugin manifest version is not this host's", struct {
+        .{ "plugin manifest version is not this host's: rebuild it with this release's kit", struct {
             fn f(x: *Manifest, _: *quant_abi.QuantTable) void {
                 x.version = version + 1;
             }
         }.f },
-        .{ "plugin manifest is older than this host's", struct {
+        .{ "plugin manifest is older than this host's: rebuild it with this release's kit", struct {
             fn f(x: *Manifest, _: *quant_abi.QuantTable) void {
                 x.size -= 8;
             }

@@ -16,10 +16,5 @@ layout), claimed by that marker (`by_marker` outranks the gemma3 plugin's claim 
 - `embed.has_projection` stays false at parse: the head rides inside `model.safetensors`; `project` returns the
   pooled rows unchanged when the pack has none.
 
-## Known issues
-- No floor under the band + key mask (the engine's): a padded query whose band holds only padding is NaN and, through
-  V, so is its row in every later layer. A padded batch whose length gap exceeds `sliding_window` (512 on the
-  release) returns NaN for the short row on BOTH paths; EmbeddingGemma 2 floors at -1e9. Fix both sides together.
-
 ## Fixtures
 See `fixtures/README.md`.

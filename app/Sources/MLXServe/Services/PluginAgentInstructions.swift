@@ -41,8 +41,8 @@ enum PluginAgentInstructions {
         Steps:
         1. Clone: `git clone --depth 1 \(PluginCatalog.repoURL) ~/.mlx-serve/plugin-src` (if that folder exists, `git -C ~/.mlx-serve/plugin-src pull --ff-only` instead). Work in it.
         2. Read plugins/\(plugin)/plugin.json, plugins/\(plugin)/README.md and the plugin's *.zig and build.zig. A plugin is native code that runs with my rights: tell me in a few lines what it does, and stop and ask me before building if it touches the network, files outside ~/.mlx-serve or the model folders, or starts other processes.
-        3. `scripts/setup.sh` (stages the pinned Zig and kit; the first run downloads them).
-        4. `scripts/install.sh \(plugin) --yes` (runs the plugin's tests, compiles it, then runs `mlx-serve plugin install`). To try it first without touching my setup, use `scripts/install.sh \(plugin) --home ~/tmp/h` and serve with `HOME=~/tmp/h mlx-serve --model <pack dir>`.
+        3. `scripts/setup.sh` (stages the pinned Zig and kit; the first run downloads them). If it cannot download the kit (a version with no release yet) and ~/.mlx-serve/kit/build.zig.zon has my mlx-serve version, `export MLX_SERVE_KIT=~/.mlx-serve/kit` and run it again.
+        4. `scripts/build.sh \(plugin)` (runs the plugin's tests and compiles it), then `mlx-serve plugin install plugins/\(plugin)/zig-out/lib/lib\(plugin).dylib --yes`. To try it first without touching my setup, use `scripts/install.sh \(plugin) --home ~/tmp/h` and serve with `HOME=~/tmp/h mlx-serve --model <pack dir>`.
         5. Plugins load only when ~/.mlx-serve/plugins.json has "enabled": true and "disabled" does not list \(plugin). Edit it keeping any other keys (or switch it on in the app: Models > Plugins).
         6. Restart mlx-serve (quit and reopen the app, or restart the server). Confirm the server log has `[plugin] \(plugin) serves <model_type>` and that /v1/models shows "plugin": "\(plugin)" for a pack it serves.
 

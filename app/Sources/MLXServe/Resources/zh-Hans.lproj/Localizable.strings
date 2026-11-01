@@ -2412,10 +2412,7 @@
 "The size of the picture painted onto the surface. Larger keeps finer surface detail and uses more memory." = "贴在表面上的图片尺寸。越大，表面细节越精细，占用内存也越多。";
 "How many refinement passes Idol makes. Time grows with the count; 50 is the published setting, and fewer steps finish sooner but refine the result less." = "Idol 进行多少次细化。耗时随步数增加；50 是官方发布的设置，步数越少完成越快，但结果的细化程度也越低。";
 "How strongly Idol is pushed toward your picture. Higher follows it more closely. 0 turns guidance off and makes each step about twice as fast." = "Idol 向你的图片靠拢的力度。数值越高，越贴近图片。设为 0 会关闭引导，每一步的速度约快一倍。";
-"Total Tokens" = "总 Token 数";
-"%@ tok/s" = "%@ Token/秒";
-"%@ tokens since the last reset. Click to open the usage dashboard." = "自上次重置以来共 %@ 个 Token。点击打开用量面板。";
-"Average since the server started" = "服务器启动以来的平均值";
+"Tokens per second, dimmed when it is the average since the server started. Click to open the usage dashboard." = "每秒 Token 数，灰色为服务器启动以来的平均值。点击打开用量面板。";
 "Usage" = "用量";
 "Reset…" = "重置…";
 "Nothing counted yet. Tokens are tallied as the server finishes each request." = "尚无统计。服务器每完成一个请求，Token 就会计入。";
@@ -2443,3 +2440,43 @@
 "Last used %@ · %lld%% of all tokens" = "最近使用 %@ · 占全部 Token 的 %lld%%";
 "Reset %@…" = "重置 %@…";
 "Less" = "更少";
+
+/* Models > Plugins (list + detail) */
+"%@ installed. Switch it on, then restart the server." = "%@ 已安装。打开它，然后重启服务器。";
+"Checked against this hash every time the server loads it." = "服务器每次加载它时都会核对这个哈希值。";
+"Community code, compiled on this Mac. Changes apply when the server restarts." = "社区代码，在这台 Mac 上编译。更改在服务器重启后生效。";
+"Compile and install" = "编译并安装";
+"Compile and install %@ %@?" = "编译并安装 %@ %@？";
+"Compiling %@ (the first build also downloads Zig)…" = "正在编译 %@（首次构建还会下载 Zig）…";
+"Dismiss" = "关闭";
+"Fetching the source for %@…" = "正在获取 %@ 的源码…";
+"Install compiles the source here with a pinned Zig" = "安装时会用固定版本的 Zig 在本机编译源码";
+"Installed file" = "已安装的文件";
+"Load at server start" = "服务器启动时加载";
+"Needs" = "需要";
+"Needs mlx-serve %@" = "需要 mlx-serve %@";
+"Needs update" = "需要更新";
+"Not installed" = "未安装";
+"Nothing more to install." = "没有更多可安装的插件。";
+"Off: turn on Load at server start above" = "关闭：请先打开上方的“服务器启动时加载”";
+"Outside plugins are not available in the Mac App Store build. Get the direct download to use them." = "Mac App Store 版本不支持外部插件。请使用直接下载的版本。";
+"Packs it serves" = "它支持的模型包";
+"Paste this into a coding agent (pi, Claude Code, Codex...) to have it install a plugin safely. Each plugin's page also has its own copy button." = "把这段粘贴到编程智能体（pi、Claude Code、Codex……）中，让它安全地安装插件。每个插件的页面也有自己的复制按钮。";
+"Plugins load at server start" = "服务器启动时加载插件";
+"Quant format" = "量化格式";
+"Rather have a coding agent install it?" = "想让编程智能体来安装？";
+"Remove" = "移除";
+"Signed" = "签名";
+"Source" = "来源";
+"Source: %@ at commit %@. A plugin is native code that runs with your rights: install it only if you trust this code. It will be compiled on this Mac and installed into ~/.mlx-serve/plugins." = "来源：%@，提交 %@。插件是以你的权限运行的原生代码：只在你信任这段代码时安装。它会在这台 Mac 上编译并安装到 ~/.mlx-serve/plugins。";
+"This Mac runs %@" = "这台 Mac 运行 %@";
+"Turn on Load at server start first" = "请先打开“服务器启动时加载”";
+"Update to %@" = "更新到 %@";
+"Xcode Command Line Tools" = "Xcode 命令行工具";
+"no plugin kit for mlx-serve %@: it is not released yet. Put the kit for %@ in ~/.mlx-serve/kit (in an mlx-serve checkout: zig build kit), then install again" = "没有 mlx-serve %@ 的插件工具包：该版本尚未发布。把 %@ 的工具包放到 ~/.mlx-serve/kit（在 mlx-serve 源码中运行 zig build kit），然后重新安装";
+"unknown" = "未知";
+
+/* Usage strip: the speed line */
+"%@ not measured yet" = "%@ 尚未测量";
+"%@ %@ tokens per second" = "%@ 每秒 %@ 个 Token";
+"Opens the usage dashboard" = "打开用量面板";

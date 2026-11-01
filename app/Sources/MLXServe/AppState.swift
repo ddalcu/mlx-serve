@@ -382,7 +382,7 @@ class AppState: ObservableObject {
     /// the thing that opens it is a menu command with no view to talk to.
     @Published var modelPalettePresented = false
 
-    /// Is the usage dashboard up? A sheet on the chat window like the palette, opened from the status strip's Total Tokens.
+    /// Is the usage dashboard up? A sheet on the chat window like the palette, opened from the status strip's speed line.
     @Published var usageDashboardPresented = false
 
     /// Refused while the welcome sheet is up, for the one-sheet rule.

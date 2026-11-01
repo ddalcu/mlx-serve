@@ -5,6 +5,7 @@
 #   DRAFTER_TEST_TARGET=<gemma-4 dir> DRAFTER_TEST_DRAFTER=<assistant dir> ./tests/test_streaming_drafter.sh [port]
 #
 # Defaults gemma-4-e4b-it-8bit + gemma-4-E4B-it-assistant-bf16; SKIPs when either is missing.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
@@ -16,8 +17,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-TARGET="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
-DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
+TARGET="${DRAFTER_TEST_TARGET:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
+DRAFTER="${DRAFTER_TEST_DRAFTER:-$(find_model mlx-community/gemma-4-E4B-it-assistant-bf16 || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16")}"
 
 if [ ! -d "$TARGET" ]; then
     echo -e "${YELLOW}SKIP${NC} test_streaming_drafter: target directory not found ($TARGET)."

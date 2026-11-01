@@ -17,11 +17,12 @@
 # became the default.
 #
 # Usage: ./tests/test_prefix_cache_hot.sh [model_dir] [port]
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL_DIR="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL_DIR="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 PORT="${2:-19040}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 

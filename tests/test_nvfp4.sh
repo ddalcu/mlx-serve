@@ -6,10 +6,11 @@
 #   NVFP4_TEST_MODEL=<dir> PORT=8096 ./tests/test_nvfp4.sh   # default mlx-community/Qwen3-0.6B-nvfp4; SKIPs without
 #
 # Hermetic twins: `computeQuantParams` and the nvfp4 qmatmul/gather tests in engines/mlx/transformer.zig.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -euo pipefail
 
-MODEL="${NVFP4_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4}"
+MODEL="${NVFP4_TEST_MODEL:-$(find_model mlx-community/Qwen3-0.6B-nvfp4 || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4")}"
 PORT="${PORT:-8096}"
 HOST="127.0.0.1"
 

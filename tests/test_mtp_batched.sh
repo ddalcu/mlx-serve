@@ -7,7 +7,9 @@
 # Usage: MTP_BATCHED_MODEL=<dir with an MTP head> ./tests/test_mtp_batched.sh [port]
 set -u
 source "$(dirname "$0")/lib/server.sh"
-MODEL="${MTP_BATCHED_MODEL:?set MTP_BATCHED_MODEL}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${MTP_BATCHED_MODEL:-$(find_fitting_model ddalcu/Qwen3.8-27B-MLX-Serve-4bit ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit)}"
+[ -n "$MODEL" ] || { echo "SKIP: no MTP checkpoint on this box (set MTP_BATCHED_MODEL)"; exit 0; }
 PORT=${1:-18850}; BASE="http://127.0.0.1:$PORT"
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'

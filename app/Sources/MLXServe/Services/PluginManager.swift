@@ -2,9 +2,10 @@ import Foundation
 
 /// Drives Settings > Server > Plugins > Manage: loads the catalog, and installs a plugin in two steps so the user
 /// confirms what will be compiled. (1) `prepare` fetches the repo at `PluginCatalog.ref` into
-/// ~/.mlx-serve/plugin-src and reports the exact commit; (2) `confirmInstall` runs the repo's own
-/// `scripts/install.sh <name> --yes`, which compiles that source with the pinned Zig and calls
-/// `mlx-serve plugin install` (hash + signature receipt). Nothing prebuilt is ever downloaded or run.
+/// ~/.mlx-serve/plugin-src and reports the exact commit; (2) `confirmInstall` runs the repo's
+/// `scripts/build.sh <name>` (the pinned Zig, the plugin's tests) and then this app's own
+/// `mlx-serve plugin install <dylib> --yes` (hash + signature receipt): `installSteps`.
+/// Nothing prebuilt is ever downloaded or run.
 @MainActor
 final class PluginManager: ObservableObject {
     enum Phase: Equatable {
@@ -108,8 +109,11 @@ final class PluginManager: ObservableObject {
                 var env = ServerManager.launchEnvironment()
                 let binDir = (Self.binaryPath() as NSString).deletingLastPathComponent
                 env["PATH"] = [binDir, "/usr/bin", "/bin", "/usr/sbin", "/sbin", env["PATH"] ?? ""].filter { !$0.isEmpty }.joined(separator: ":")
-                let status = try await stream("/bin/bash", [Self.sourceDir + "/scripts/install.sh", name, "--yes"], cwd: Self.sourceDir, env: env)
-                guard status == 0 else { throw Failure("build or install failed (exit \(status)); see the log") }
+                if let kit = PluginCatalog.kit(at: PluginCatalog.homeKitDir, matching: runningVersion) { env["MLX_SERVE_KIT"] = kit }
+                for step in Self.installSteps(name: name, sourceDir: Self.sourceDir, binary: Self.binaryPath()) {
+                    let status = try await stream(step.exe, step.args, cwd: Self.sourceDir, env: env)
+                    guard status == 0 else { throw Failure(PluginCatalog.installFailure(status: status, log: log, running: runningVersion)) }
+                }
                 refreshReceipts()
                 phase = .done(name: name)
             } catch {
@@ -143,6 +147,14 @@ final class PluginManager: ObservableObject {
     }
 
     nonisolated static func binaryPath() -> String { ServerManager.resolveBinaryPath() }
+
+    /// The two processes an install runs, in order: the repo's build (its pinned Zig and kit, the plugin's own tests,
+    /// a ReleaseFast dylib), then this app's mlx-serve copying that dylib in, confirmed because the user just accepted
+    /// the commit. `name` is a `isSafeName` identifier.
+    nonisolated static func installSteps(name: String, sourceDir: String, binary: String) -> [(exe: String, args: [String])] {
+        [("/bin/bash", [sourceDir + "/scripts/build.sh", name]),
+         (binary, ["plugin", "install", "\(sourceDir)/plugins/\(name)/zig-out/lib/lib\(name).dylib", "--yes"])]
+    }
 
     /// git and the Zig build both need the Command Line Tools; say so by name instead of letting the shim pop a dialog.
     private static func requireDeveloperTools() throws {

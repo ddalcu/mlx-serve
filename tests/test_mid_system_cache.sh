@@ -3,13 +3,16 @@
 # new user turn and a restart; streaming and non-streaming, native-template and cached-token guards. Isolated HOME;
 # RAM+SSD by default, MID_SYSTEM_CACHE_ENTRIES=0 adds the SSD-only mode.
 #
-#   bash tests/test_mid_system_cache.sh <model_dir> [port]
+#   bash tests/test_mid_system_cache.sh [model_dir] [port]   # default Qwen3.8-27B 4-bit
 #
 # Hermetic: the `mid-system:` and cross-family late-note corpus tests; a downloaded pack through loadChatConfig with
 # `QWEN_MID_SYSTEM_MODEL_DIR=<pack> zig build test -Doptimize=ReleaseFast -Dtest-filter="mid-system: real Qwen pack"`.
 
 set -euo pipefail
-MODEL="${1:?Usage: test_mid_system_cache.sh <model_dir> [port]}"
+source "$(dirname "$0")/_lib_models.sh"
+# A byte-pinned Qwen3.8 template renders a late system turn in place (`qwenLateSystemTemplate`).
+MODEL="${1:-$(find_fitting_model ddalcu/Qwen3.8-27B-MLX-Serve-4bit)}"
+[ -n "$MODEL" ] || { echo "SKIP: no Qwen3.8 pack on this box (pass <model_dir>)"; exit 0; }
 PORT="${2:-11368}"
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
 CACHE_ENTRIES="${MID_SYSTEM_CACHE_ENTRIES:-2}"

@@ -1,13 +1,14 @@
 # Changelog
 
-## v26.11.1 — Outside Plugins, Full Rewrite
+## v26.11.1 — Outside Plugins, Full Rewrite, Faster Deepseek
 
-- **Plugins you can build and install.** `mlx-serve plugin new` starts a plugin for a new model, `plugin check` tests it, and `plugin install` adds it after showing who signed it. Settings lists your plugins with an on/off switch for each. Plugins can draft ahead, look at images and reuse the server's own building blocks. Thanks @davidtai and @STRML for helping here. Point your agent here: https://github.com/CommunityServe/plugins 
+- **Plugins you can build and install.** `mlx-serve plugin new` starts a plugin for a new model, `plugin check` tests it, and `plugin install` adds it after showing who signed it. Models ▸ Plugins lists every plugin beside a page that shows what it needs, the packs it serves (one click to download) and its on/off switch. Plugins can draft ahead, look at images and reuse the server's own building blocks. Thanks @davidtai and @STRML for helping here. Point your agent here: https://github.com/CommunityServe/plugins 
 - **DeepSeek-V4.1-Flash is faster and remembers more.** It reads long prompts faster (most of all on M5 Macs), writes faster, stays fast when several people use it at once, and keeps your conversation cached even after you stop a reply, so the next message starts right away. Asking a DeepSeek model for embeddings now gives a clear error instead of stopping the server. Thanks @STRML.
 - **Idol: one photo to a 3D model.** Drop a photo into the 3D pane and Idol turns it into a 3D model you can open in Preview or any 3D viewer. It cuts out the background by itself, runs faster than the original, and is now the recommended 3D model.
 - **LFM3 chats, sees, listens and talks.** Liquid's LFM3 models can read pictures, understand speech and answer out loud, and the app can use them for voice input without Apple's dictation.
 - **NVIDIA Nemotron 3.5 Transcribe.** Speech to text in 40 languages, with translation, who said what, word timings and subtitles, and you can ask questions about a recording. Settings ▸ Voice can use it for dictation and meeting notes. Thanks @beamivalice.
-- **A usage dashboard in the chat window.** The corner of the chat sidebar shows how busy your Mac is, how fast the model is going and how many tokens you have used. Click it for daily activity, the last 30 days, average and top speeds, and a breakdown per model. The history survives restarts.
+- **A usage dashboard in the chat window.** The corner of the chat sidebar shows how busy your Mac is and how fast the model is going. Click the speeds for daily activity, the last 30 days, average and top speeds, and a breakdown per model. The history survives restarts.
+- **Recommended models.** Liquid LFM3 leads the list, and DeepSeek-V4.1-Flash is there for Macs with 256 GB of memory.
 - **Enhance works with thinking models.** The Enhance buttons on the Image, Video and Music panes and the storyboard planner no longer come back empty when the model thinks first.
 - **Text to speech in the language you pick.** Qwen3-TTS can be told which language to speak. Thanks @lborloz.
 - **Clearer text-to-speech errors.** A reference voice Qwen3-TTS cannot use is refused with a clear message. Thanks @ianalitis.
@@ -17,11 +18,11 @@
 - **Draft heads stored one expert at a time load.** Thanks @brandondyal.
 - **Build draft heads for MoE models.** `tests/build_mtp_sidecar.py` now builds them for mixture-of-experts models too. Thanks @Dankpaws.
 - **Codex works better with local models.** `mlx-serve launch codex` and the app's Codex tab give Codex up-to-date instructions for the tools it really has. Thanks @kmahara.
-- **Answers come out right.** A thinking budget no longer switches off speculative decoding for the answer, text that looks like a special token is read as plain text, and stray tool-call markers no longer show up as the answer.
+- **Answers come out right.** A thinking budget no longer switches off speculative decoding for the answer, text that looks like a special token is read as plain text, and stray tool-call markers no longer show up as the answer. Mistral 7B follows a system prompt and calls tools instead of rambling in the wrong format, Gemma 3 prompts start with one start token instead of two, and EmbeddingGemma gives proper vectors when a batch mixes very short and very long texts.
 - **Drafting stays within the rules.** Drafting ahead from your prompt can no longer slip in a word the model must never write. Thanks @dmumber.
 - **The Responses API keeps reasoning.** Replayed replies keep their reasoning text. Thanks @shikyo13.
 - **The Responses API sees tool images.** An image returned by a tool now reaches the model. Thanks @yerbolgmailcom.
-- **A steadier server.** A schema the server cannot enforce is refused up front instead of being ignored, the prompt cache holds up better on long-running servers, and the server shuts down promptly.
+- **A steadier server.** A schema the server cannot enforce is refused up front instead of being ignored, the prompt cache holds up better on long-running servers, and the server shuts down promptly. Ollama clients get non-streamed replies without a wait at the end, `ignore_eos` requests run to their token limit, GLM-5.3-Flash no longer offers video input it cannot read, and a plugin built for an older release is refused with a note to rebuild it. Style LoRAs no longer turn FLUX.2 klein pictures into noise on Macs that run media models in int8.
 - **The SSD cache keeps what it just saved.** Thanks @lborloz.
 - **Models are found where they are.** Models in symlinked folders are found, and Qwen-Image downloads and MTP badges show correctly in the app. Thanks @elkaix.
 - **A finished agent stops using CPU.** Thanks @jondestoppeleire.

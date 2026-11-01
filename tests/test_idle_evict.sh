@@ -3,7 +3,8 @@
 # field: "unloaded" with the memory still held is the failure) and the next request cold-loads it back. Each cycle
 # fires /api/tags, /api/show and a chat (the three readers of retained CPU state that hold no refcount) concurrently
 # with the reload; a status poll (GET /props) must not reload; RSS stays flat across cycles that end with nothing
-# resident (64 MB bar on settled readings, cycles 4..9); a boot without the flag keeps the model resident. 2 s window.
+# resident (64 MB bar on settled readings, cycles 6..12: the allocator grows for ~5 cycles, then holds); a boot
+# without the flag keeps the model resident. 2 s window.
 #
 #   ./tests/test_idle_evict.sh [root] [port]   # IDLE_EVICT_CYCLES, IDLE_EVICT_RSS_LIMIT_MB
 #
@@ -15,7 +16,7 @@ source "$(dirname "$0")/lib/server.sh"
 ROOT="${1:-$HOME/.mlx-serve/models}"
 PORT="${2:-8098}"
 BASE="http://127.0.0.1:$PORT"
-CYCLES="${IDLE_EVICT_CYCLES:-9}"
+CYCLES="${IDLE_EVICT_CYCLES:-12}"
 # Resident bytes may not grow across cycles that all end with NOTHING loaded:
 # each reload replaces the previous generation of CPU state and must free it.
 # Measured from cycle 4 — the first concurrent cycles pay a one-time warm-up
@@ -147,14 +148,14 @@ for i in $(seq 2 "$CYCLES"); do
     curl -fs "$BASE/health" >/dev/null || { echo -e "${RED}FAIL${NC} cycle $i: server died"; FAIL=1; break; }
     wait_unloaded || { echo -e "${RED}FAIL${NC} cycle $i: never went idle"; FAIL=1; break; }
     CYCLE_RSS=$(server_rss_mb)
-    [ "$i" -lt 4 ] || [ -n "$BASE_RSS" ] || BASE_RSS="$CYCLE_RSS"   # cycle 4 = the warm baseline
+    [ "$i" -lt 6 ] || [ -n "$BASE_RSS" ] || BASE_RSS="$CYCLE_RSS"   # cycle 6 = the warm baseline
     echo "    cycle $i ok — RSS ${CYCLE_RSS} MB"
 done
 
 if [ "$FAIL" = "0" ] && [ -n "$BASE_RSS" ]; then
     END_RSS=$(server_rss_mb)
     GROWTH=$((END_RSS - BASE_RSS))
-    echo "  RSS across cycles 4..$CYCLES, nothing resident at either end: ${BASE_RSS} → ${END_RSS} MB (+${GROWTH})"
+    echo "  RSS across cycles 6..$CYCLES, nothing resident at either end: ${BASE_RSS} → ${END_RSS} MB (+${GROWTH})"
     if [ "$GROWTH" -gt "$RSS_GROWTH_LIMIT_MB" ]; then
         echo -e "${RED}FAIL${NC} +${GROWTH} MB with nothing resident — a reload is orphaning its CPU state"
         FAIL=1

@@ -6,8 +6,9 @@
 #   a short answer still ends on EOS, and a long needle prompt (head QSA engaged) finds its needle.
 # The texts land in $DIR/<arm>-<prompt>-<rep>.txt.
 #   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_mtp_padded_head.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -u
-MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit}"
+MODEL="${QWEN4_MODEL:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit")}"
 PORT="${1:-11417}"
 BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 DIR="${OUT_DIR:-$HOME/claude-tmp/qwen4-padded-head}"

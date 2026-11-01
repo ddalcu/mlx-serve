@@ -2,7 +2,7 @@
 
 DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its vision tower, as a native,
 module-owned arch. Resident unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
-`ddalcu/DeepSeek-V4.1-Flash-1017-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
+`ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank, streamed).
 
 ## Files

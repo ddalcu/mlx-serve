@@ -7,9 +7,10 @@
 #   ./tests/test_multi_image_history.sh [model] [port]   # default Qwen3.5-2B
 #
 # Hermetic twins: expandMediaPlaceholders, `media renders one template placeholder per item`.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
-MODEL="${MULTI_IMAGE_MODEL:-${1:-$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-2B-MLX-4bit}}"
+MODEL="${MULTI_IMAGE_MODEL:-${1:-$(find_model lmstudio-community/Qwen3.5-2B-MLX-4bit || echo "$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-2B-MLX-4bit")}}"
 PORT="${2:-11236}"
 BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 LOG="$HOME/claude-tmp/multi-image/server-$PORT.log"

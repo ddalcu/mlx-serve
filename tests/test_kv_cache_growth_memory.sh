@@ -9,6 +9,7 @@
 #
 # SKIPs without the 15 GB checkpoint. Hermetic twins: `KVCache growth strands bounded bytes`, `KV growth does not
 # ratchet the MLX buffer pool`, `clear cadence survives variable spec strides`, mlxCacheLimitBytes.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
@@ -16,7 +17,7 @@ PORT="${1:-11419}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
-MODEL="${KV_MEM_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve}"
+MODEL="${KV_MEM_MODEL:-$(find_model ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve")}"
 [ -f "$MODEL/config.json" ] || { echo "SKIP: no checkpoint at $MODEL"; exit 0; }
 
 # Default shape keeps a full run near 3 minutes while still crossing several KV

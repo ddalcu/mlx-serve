@@ -9,9 +9,10 @@
 #
 # Hermetic twins: `HotPrefixCache: media spans bound the reusable prefix at the first differing item`,
 # `vision prefill checkpoints SSM state only when it chunks like text`.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
-MODEL="${VISION_CACHE_MODEL:-${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}}"
+MODEL="${VISION_CACHE_MODEL:-${1:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}}"
 PORT="${2:-11419}"
 BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 LOG="$HOME/claude-tmp/vision-cache/server-$PORT.log"

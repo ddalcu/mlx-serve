@@ -13,7 +13,7 @@ source "$(dirname "$0")/lib/server.sh"
 
 PORT="${PORT:-19099}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
-QWEN="${QWEN_MLX_MODEL:-$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-4B-MLX-4bit}"
+QWEN="${QWEN_MLX_MODEL:-$(find_model lmstudio-community/Qwen3.5-4B-MLX-4bit || echo "$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-4B-MLX-4bit")}"
 source "$(dirname "$0")/_lib_models.sh"
 GEMMA="${GEMMA4_MLX_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-4bit)}"
 REBASELINE="${PHASE2_REBASELINE:-0}"

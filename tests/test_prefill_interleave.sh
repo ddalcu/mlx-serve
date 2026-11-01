@@ -5,13 +5,14 @@
 # share 0's fraction of the prefill wall time (`[interleave] prefill X ms, hosted decode Y ms`).
 #
 #   INTERLEAVE_TEST_MODEL=<small chat model> ./tests/test_prefill_interleave.sh [port]   # SKIPs without one
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11487}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${INTERLEAVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E2B-it-qat-4bit}"
+MODEL="${INTERLEAVE_TEST_MODEL:-$(find_model mlx-community/gemma-4-E2B-it-qat-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E2B-it-qat-4bit")}"
 WORK="$(mktemp -d)"
 SERVER_PID=""
 

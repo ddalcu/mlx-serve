@@ -52,28 +52,22 @@ Declared today:
 - **Special-token injection on GGUF and ds4**: a literal control token in user, system or tool content becomes a real
   special token. Fixed for the MLX chat path; libllama tokenizes the rendered string with `parse_special=true`, ds4
   renders its own prompt, and control tokens inside the `tools` JSON are not marked.
-- **Gemma-3 doubled BOS**: `add_bos_token: true` prepends BOS while the template already writes `{{ bos_token }}`; HF
-  gives one.
 - **Mistral-7B-Instruct-v0.3**: the streamed reply starts with a space the non-streamed one trims (stream and
-  non-stream must be the same bytes); a system message plus tools renders Gemma turn markers and runs to `max_tokens`
-  (the silent generic fallback template).
-- **EmbeddingGemma 1**: no floor under the band + key mask, so a padded batch whose length gap exceeds
-  `sliding_window` (512) returns NaN for the short row. EmbeddingGemma 2 floors at -1e9.
-- **GLM-5.3 advertises video** for packs with `video_token_id` beside `vision_config`, and the engine never reads it
-  for GLM: `/v1/models` claims a capability it cannot serve.
-- **`hunyuan3d` `steps: 1`** passes the request check and fails in `buildSigmas` (needs 2): a 500 instead of a named
-  400.
+  non-stream must be the same bytes); tools render through the `default` template as injected text, not the pack's
+  named `tool_use` template (`[AVAILABLE_TOOLS]`, which transformers picks but which drops the system turn).
 - **A bare `Infinity` in config.json** (`mlx-community/NVIDIA-Nemotron-Nano-9B-v2-4bits`, `time_step_limit`) is a JSON
   syntax error, so the pack is refused; sanitize bare `Infinity`/`NaN` at the config read.
 - **`gpt_oss` YaRN `truncate: false`** is ignored; check against mlx-lm.
-- **Media image backends do not poll cancel**: a cancelled image job runs to its end.
 - **A loop cut inside a buffered tool call delivers nothing** on a tools request (the cut lands before the call
   resolves).
 - **Streaming gate gaps**: a bare Hermes `<function=` opener with no `<tool_call>` can leak through the stream gate,
   and a re-opened `<|channel>thought` inside reasoning is not re-latched.
-- **Ollama sink**: SSE keepalive comments are dropped, and an Ollama non-stream reply (and the LAN tunnel) is not
-  marked `length_framed`, so its close waits for the peer.
+- **Ollama sink**: SSE keepalive comments are dropped, and a LAN-tunnelled reply is not marked `length_framed`, so
+  its close waits for the peer.
 - **K2-Horizon** with a JSON schema keeps thinking off.
+- **`--kv-attn-mode fused` is a silent no-op on Gemma 4**: sliding layers keep a 512-key ring (under the packed reads'
+  2048-key floor) and the hd-512 global layers at GQA 4 overflow the decode kernel's 10 KB threadgroup budget
+  (`qkvDecBlockFor`), so every read stays dense (`tests/test_kv_quant_fused_equivalence.sh` defaults to Gemma 4 E4B).
 
 ## Kernels
 
