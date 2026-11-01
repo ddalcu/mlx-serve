@@ -23,8 +23,9 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// `dsv41` also reads past the page cache (`nocache_reader`): its weights all load at init, and a pack near the
 /// RAM size would have them compressed under the file cache.
 /// `index_owners`: a tensor two shards carry loads from the shard the index names.
+/// `defer_narrow`: keep selected tensors in their stored dtype until the model resolves their convention.
 /// `skip`: a tensor it names never enters the map (qwen4's embedded n-gram table, read from disk per lookup).
-pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, skip: ?*const fn (key: []const u8) bool = null, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, skip: ?*const fn (key: []const u8) bool = null, defer_qwen4_norms: bool = false, defer_narrow: ?*const fn (key: []const u8) bool = null, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
 
 pub const Owners = std.StringHashMapUnmanaged([]const u8);
 
@@ -165,7 +166,7 @@ pub fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std
 
     try viewByteAffineWeights(&weights, s);
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
-    if (!opts.defer_qwen4_norms) reportF16Narrowing();
+    if (!opts.defer_qwen4_norms and opts.defer_narrow == null) reportF16Narrowing();
     return weights;
 }
 
@@ -302,6 +303,7 @@ pub fn loadSafetensorsFile(
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
         if (!(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
+            !(if (opts.defer_narrow) |deferred| deferred(key_str) else false) and
             !opts.keep_f16 and (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) or (opts.modelopt and narrowsLoadedF32Norm(key_str, ndim, mlx.mlx_array_dtype(value)))) and
             (ndim != 1 or narrow1dEnabled()))
         {
