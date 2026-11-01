@@ -137,6 +137,10 @@ pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
     }
     const ctx = @import("../../../host/http/server.zig").manualContext(config);
     if (ctx > 0) w.print("{s}\"ctx_size\":{d}", .{ if (w.end > 1) "," else "", ctx }) catch unreachable;
+    if (config.caps().owns_decode_state and config.caps().streamed_weights) {
+        const kv = @import("../../../host/http/server.zig").configuredKvQuantFor(config);
+        w.print("{s}\"kv_quant\":\"{s}\"", .{ if (w.end > 1) "," else "", kv.wireName() }) catch unreachable;
+    }
     w.writeByte('}') catch unreachable;
     return w.buffered();
 }
@@ -166,12 +170,65 @@ fn quantizeHead(w: *model.Weights, b: *const plugin_config.Binding, config: *con
     log.info("[lm-head] mxfp8 (lossy): the {d}x{d} bf16 head quantized at load\n", .{ shape[0], shape[1] * 32 });
 }
 
-/// `LoadCtx.stream_room` for a streamed GLM-5 bank: the ceiling less one prompt at 16K + 1K and the wired margin.
+/// A streamed bank shares the ceiling with one prompt at 16K + 1K and the wired margin.
 fn streamRoom(config: *const ModelConfig) u64 {
-    if (!config.isGlm5() or !config.expert_bank) return 0;
-    const need = @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, 16_384 + 1_024, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK, .{});
-    return @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling() -| need -|
-        @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes;
+    return streamRoomAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
+        @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
+}
+
+fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
+    const seq = 16_384 + 1_024;
+    const chunk = @import("../generate.zig").WIDE_PREFILL_CHUNK;
+    const need = if (config.isGlm5() and config.expert_bank)
+        @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, seq, 1, 16, chunk, .{})
+    else blk: {
+        const b = config.plugin orelse return 0;
+        if (!b.parsed.caps.streamed_weights) return 0;
+        var bill: abi.Bill = .{};
+        b.table.bill(&b.parsed, &.{ .context = seq }, &bill);
+        const prefill = bill.prefill_bytes orelse return 0;
+        break :blk prefill(&b.parsed, seq, chunk, 16, 0);
+    };
+    return ceiling -| need -| margin;
+}
+
+test "driver: streamed plugin room follows its own bill and preserves the margin" {
+    const Probe = struct {
+        fn prefill(_: *const abi.Parsed, seq: u64, _: u32, bits: u8, warm: u64) callconv(.c) u64 {
+            return if (seq == 17_408 and bits == 16 and warm == 0) 3 << 30 else std.math.maxInt(u64);
+        }
+        fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill };
+        }
+        fn empty(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{};
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.bill;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var cfg = ModelConfig{ .plugin = &binding };
+    try std.testing.expectEqual(@as(u64, 16 << 30), streamRoomAt(&cfg, 20 << 30, 1 << 30));
+    try std.testing.expectEqual(@as(u64, 0), streamRoomAt(&cfg, 2 << 30, 1 << 30));
+    table.bill = &Probe.empty;
+    try std.testing.expectEqual(@as(u64, 0), streamRoomAt(&cfg, 20 << 30, 1 << 30));
+    table.bill = &Probe.bill;
+    binding.parsed.caps.streamed_weights = false;
+    try std.testing.expectEqual(@as(u64, 0), streamRoomAt(&cfg, 20 << 30, 1 << 30));
+    cfg.plugin = null;
+    try std.testing.expectEqual(@as(u64, 0), streamRoomAt(&cfg, 20 << 30, 1 << 30));
+}
+
+test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
+    var cfg = ModelConfig{};
+    cfg.legacy.caps.owns_decode_state = true;
+    cfg.legacy.caps.streamed_weights = true;
+    cfg.kv_quant_override = @import("../../../sdk/blocks/attention/kv_quant.zig").KVQuantConfig.affine(8);
+    var buf: [256]u8 = undefined;
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, loadSettings(&buf, &cfg), .{});
+    defer parsed.deinit();
+    const value = parsed.value.object.get("kv_quant") orelse return error.MissingKvPrecision;
+    try std.testing.expectEqualStrings("8", value.string);
 }
 
 /// Loads the served pack at `model_dir` (`config.plugin` set) and returns the shell that forwards through it.
