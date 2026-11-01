@@ -26,7 +26,13 @@ With `--ablation-profiles <dir>` and `--ablation-key-file <path>`, `/v1/chat/com
 for that request only (Arditi et al. 2024, "Refusal in Language Models Is Mediated by a Single Direction"). The
 response carries `X-Ablation: profile=<name>; strength=<s>; hash=<hex>`. A missing or wrong key is a 401; an unknown,
 refused or mismatched profile, a strength outside [0, 1], an unknown field, a model whose plugin does not declare
-`Caps.ablation`, or the field on another endpoint is a named 400. Requests without the field run unchanged.
+`Caps.ablation`, or the field on `/v1/messages`, `/v1/responses` (its WebSocket included), the Ollama routes or a
+`<id>@<provider>` / `<id>@<peer>` proxied model is a named 400. Other endpoints (embeddings, audio, media generation,
+`/v1/models`) do not read the field and ignore it: the `X-Ablation` response header is the only confirmation that a
+request ran ablated. Requests without the field run unchanged. The key is compared after trimming surrounding
+whitespace on both sides (header values exclude it per RFC 9110, and the key file's trailing newline is dropped).
+Browsers may send `X-Ablation-Key` cross-origin (it is in `Access-Control-Allow-Headers`) and read `X-Ablation`
+(`Access-Control-Expose-Headers`).
 
 A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"version": 1`, `hidden_size`,
 `base_config_sha256`: sha256 of the base pack's exact `config.json` bytes) and `direction.safetensors` (one tensor
