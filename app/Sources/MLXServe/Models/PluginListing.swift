@@ -41,9 +41,10 @@ enum PluginListing {
         return switches.enabled && switches.isOn(item.name) ? .on : .off
     }
 
-    struct Pack: Equatable {
+    struct Pack: Equatable, Identifiable {
         let text: String
         let repo: String?
+        var id: String { repo ?? text }
     }
 
     /// A catalog `models` line, `<what> (<org>/<name>)`: the trailing parentheses are a repo only in that shape.
