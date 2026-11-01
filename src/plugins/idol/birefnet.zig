@@ -1,13 +1,15 @@
 //! BiRefNet (ZhengPeng7/BiRefNet, Swin-L backbone, as Idol ships it): the background matte of a photo with no alpha.
 //! The image runs through the Swin-L twice, at 1024 and at 512, the two feature pyramids are concatenated, and a
 //! decoder of deformable-ASPP blocks (the sampling is a gather, the offsets and masks come from convs) turns them
-//! into one alpha plane. f32 throughout, channels-last. The released tensors load as they are (OIHW convs are turned
-//! to OHWI here, batch norms folded to a scale and shift).
+//! into one alpha plane. f16 as the reference runs it on a Mac, channels-last; the deformable sampling positions in f32.
+//! The released tensors load as they are (OIHW convs are turned to OHWI here, batch norms folded to a scale and shift
+//! in f32 first).
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
+const glue = @import("glue.zig");
 
 const A = mlx.mlx_array;
 const Scope = scope_mod.Scope;
@@ -24,6 +26,9 @@ const BN_EPS: f32 = 1e-5;
 const LN_EPS: f32 = 1e-5;
 const MEAN = [3]f32{ 0.485, 0.456, 0.406 };
 const STD = [3]f32{ 0.229, 0.224, 0.225 };
+const ACT: mlx.mlx_dtype = .float16;
+/// The padded planes of a 1024 image's two passes (1024 and 512) through the four stages; a shift mask per size.
+const PLANES = [_]c_int{ 264, 132, 72, 36, 24 };
 
 pub const Net = struct {
     gpa: std.mem.Allocator,
@@ -31,6 +36,8 @@ pub const Net = struct {
     w: Weights,
     /// The relative-position bias of every Swin block, `[1, heads, 144, 144]`, built once.
     bias: [4][]A,
+    /// The shifted windows' additive mask per padded plane in `PLANES`, built at first use.
+    masks: [PLANES.len]?A = @splat(null),
 
     /// Takes ownership of `w` (a `birefnet.safetensors`).
     pub fn load(gpa: std.mem.Allocator, s: mlx.mlx_stream, w_in: Weights) !Net {
@@ -55,6 +62,9 @@ pub const Net = struct {
             for (bs) |b| _ = mlx.mlx_array_free(b);
             self.gpa.free(bs);
         }
+        for (self.masks) |m| if (m) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
         self.w.deinit();
     }
 
@@ -64,7 +74,7 @@ pub const Net = struct {
         e.* = v;
     }
 
-    /// Floats to f32, OIHW convs to OHWI, and each batch norm's folded `scale` / `shift` beside it.
+    /// OIHW convs to OHWI, each batch norm's folded `scale` / `shift` beside it (in f32), then every float in `ACT`.
     fn prepare(self: *Net) !void {
         const s = self.s;
         var keys: std.ArrayList([]const u8) = .empty;
@@ -105,6 +115,16 @@ pub const Net = struct {
             const k2 = try std.fmt.allocPrint(self.gpa, "{s}.shift", .{base});
             try self.w.map.put(k1, sc.out(scale));
             try self.w.map.put(k2, sc.out(shift));
+        }
+        var all = self.w.map.valueIterator();
+        while (all.next()) |v| {
+            if (mlx.mlx_array_dtype(v.*) != .float32) continue;
+            var o = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(o);
+            try mlx.check(mlx.mlx_astype(&o, v.*, ACT, s));
+            try mlx.check(mlx.mlx_array_eval(o));
+            _ = mlx.mlx_array_free(v.*);
+            v.* = o;
         }
     }
 
@@ -174,8 +194,9 @@ pub const Net = struct {
         const h = sh[1];
         const w = sh[2];
         const c = sh[3];
-        const wy = try self.interp(sc, oh, h);
-        const wx = try self.interp(sc, ow, w);
+        const dt = mlx.mlx_array_dtype(x);
+        const wy = try sc.astype(try self.interp(sc, oh, h), dt);
+        const wx = try sc.astype(try self.interp(sc, ow, w), dt);
         const rows = try sc.matmul(wy, try sc.reshape(x, &.{ h, w * c })); // [oh, W*C]
         const t = try sc.transpose(try sc.reshape(rows, &.{ oh, w, c }), &.{ 1, 0, 2 }); // [W, oh, C]
         const cols = try sc.matmul(wx, try sc.reshape(t, &.{ w, oh * c })); // [ow, oh*C]
@@ -198,6 +219,18 @@ pub const Net = struct {
     }
 
     // ── Swin-L ──
+
+    /// `shiftMask` of a padded square plane, made once (`ACT`).
+    fn cachedMask(self: *Net, hp: c_int) !A {
+        const i = std.mem.indexOfScalar(c_int, &PLANES, hp) orelse return error.UnexpectedPlane;
+        if (self.masks[i]) |m| return m;
+        var sc = Scope.init(self.gpa, self.s);
+        defer sc.deinit();
+        const m = try sc.astype(try self.shiftMask(&sc, hp, hp), ACT);
+        try mlx.check(mlx.mlx_array_eval(m));
+        self.masks[i] = sc.out(m);
+        return self.masks[i].?;
+    }
 
     /// The additive attention mask of the shifted windows over a padded `hp` x `wp` plane, `[nW, 1, 144, 144]`.
     fn shiftMask(self: *const Net, sc: *Scope, hp: c_int, wp: c_int) !A {
@@ -263,7 +296,7 @@ pub const Net = struct {
     }
 
     /// The four feature maps `[1, H/4.., W/4.., 192..1536]` of the Swin-L over `x` `[1, H, W, 3]`.
-    fn backbone(self: *const Net, sc: *Scope, x: A) ![4]A {
+    fn backbone(self: *Net, sc: *Scope, x: A) ![4]A {
         const sh = mlx.getShape(x);
         var h = @divExact(sh[1], 4);
         var w = @divExact(sh[2], 4);
@@ -274,7 +307,8 @@ pub const Net = struct {
             const c: c_int = EMBED << @intCast(stage);
             const hp = @divTrunc(h + WINDOW - 1, WINDOW) * WINDOW;
             const wp = @divTrunc(w + WINDOW - 1, WINDOW) * WINDOW;
-            const mask = try self.shiftMask(sc, hp, wp);
+            if (hp != wp) return error.UnexpectedPlane;
+            const mask = try self.cachedMask(hp);
             for (0..DEPTHS[stage]) |blk| {
                 var bs = Scope.init(sc.a, sc.s);
                 defer bs.deinit();
@@ -317,7 +351,7 @@ pub const Net = struct {
             const yc = try clampIdx(sc, yy, h);
             const xc = try clampIdx(sc, xx, w);
             const idx = try sc.astype(try sc.add(try sc.mulS(yc, @floatFromInt(w)), xc), .int32);
-            const rows = try sc.mul(try sc.take(x2, idx), try sc.reshape(inside, &.{ h * w, 1 }));
+            const rows = try sc.mul(try sc.take(x2, idx), try sc.astype(try sc.reshape(inside, &.{ h * w, 1 }), mlx.mlx_array_dtype(x2)));
             acc = if (acc) |a| try sc.add(a, rows) else rows;
         };
         return acc.?;
@@ -348,9 +382,20 @@ pub const Net = struct {
         const w = sh[2];
         const c = sh[3];
         const pad = @divTrunc(k, 2);
-        const off = try self.conv(sc, x, fmt ++ ".offset_conv", args, 1, pad); // [1, H, W, 2 K]
-        const msk = try sc.mulS(try sc.sigmoid(try self.conv(sc, x, fmt ++ ".modulator_conv", args, 1, pad)), 2);
+        const off = try sc.astype(try self.conv(sc, x, fmt ++ ".offset_conv", args, 1, pad), .float32); // [1, H, W, 2 K]
+        const msk = try sc.mulLike(try sc.sigmoid(try self.conv(sc, x, fmt ++ ".modulator_conv", args, 1, pad)), 2);
         const x2 = try sc.reshape(x, &.{ h * w, c });
+        const stacked = if (try glue.deformCols(x2, off, msk, k, h, w, sc.s)) |cols| try sc.keep(cols) else try tapColumns(sc, x2, off, msk, k, h, w); // [HW, K*C]
+        // weight [O, k, k, C] -> [K*C, O] in tap-major order
+        const wt = try self.get(fmt ++ ".regular_conv.weight", args);
+        const o = mlx.getShape(wt)[0];
+        const w2 = try sc.transpose(try sc.reshape(wt, &.{ o, k * k * c }), &.{ 1, 0 });
+        return sc.reshape(try sc.matmul(stacked, w2), &.{ 1, h, w, o });
+    }
+
+    /// `deformCols` as an op chain, tap by tap.
+    fn tapColumns(sc: *Scope, x2: A, off: A, msk: A, k: c_int, h: c_int, w: c_int) !A {
+        const pad = @divTrunc(k, 2);
         var ys = mlx.mlx_array_new();
         var xs = mlx.mlx_array_new();
         const ay = try sc.res(mlx.mlx_arange(&ys, 0, @floatFromInt(h), 1, .float32, sc.s), &ys);
@@ -370,12 +415,7 @@ pub const Net = struct {
             const m = try sc.reshape(try sc.slice(msk, 3, @intCast(p), @intCast(p + 1)), &.{ h * w, 1 });
             cols[p] = try sc.mul(try sample(sc, x2, py, px, h, w), m);
         }
-        const stacked = if (taps == 1) cols[0] else try sc.concat(cols, 1); // [HW, K*C]
-        // weight [O, k, k, C] -> [K*C, O] in tap-major order
-        const wt = try self.get(fmt ++ ".regular_conv.weight", args);
-        const o = mlx.getShape(wt)[0];
-        const w2 = try sc.transpose(try sc.reshape(wt, &.{ o, k * k * c }), &.{ 1, 0 });
-        return sc.reshape(try sc.matmul(stacked, w2), &.{ 1, h, w, o });
+        return if (taps == 1) cols[0] else sc.concat(cols, 1);
     }
 
     fn relu(sc: *Scope, x: A) !A {
@@ -404,9 +444,11 @@ pub const Net = struct {
         return relu(sc, try self.bn(sc, y, pfx ++ ".bn1", args));
     }
 
+    /// The mean over the plane, summed in f32.
     fn meanHw(sc: *Scope, x: A) !A {
         var o = mlx.mlx_array_new();
-        return sc.res(mlx.mlx_mean_axes(&o, x, &[_]c_int{ 1, 2 }, 2, false, sc.s), &o);
+        const m = try sc.res(mlx.mlx_mean_axes(&o, try sc.astype(x, .float32), &[_]c_int{ 1, 2 }, 2, false, sc.s), &o);
+        return sc.astype(m, mlx.mlx_array_dtype(x));
     }
 
     /// `BasicDecBlk`: conv, bn, relu, deformable ASPP, conv, bn.
@@ -439,7 +481,7 @@ pub const Net = struct {
     }
 
     /// The alpha plane `[1, 1024, 1024, 1]` in [0, 1] for the normalized image `x` `[1, 1024, 1024, 3]`.
-    fn forward(self: *const Net, sc: *Scope, x: A) !A {
+    fn forward(self: *Net, sc: *Scope, x: A) !A {
         const f = try self.backbone(sc, x);
         const half = try self.resize(sc, x, SIZE / 2, SIZE / 2);
         const g = try self.backbone(sc, half);
@@ -476,7 +518,7 @@ pub const Net = struct {
 
     /// The alpha matte of straight RGB8 `rgb` (`w` x `h`), one byte per pixel (caller frees): the image bilinearly to
     /// 1024 x 1024, normalized, through the network, and the plane back to `w` x `h`.
-    pub fn matte(self: *const Net, rgb: []const u8, w: u32, h: u32) ![]u8 {
+    pub fn matte(self: *Net, rgb: []const u8, w: u32, h: u32) ![]u8 {
         var sc = Scope.init(self.gpa, self.s);
         defer sc.deinit();
         const px = try self.gpa.alloc(f32, @as(usize, w) * h * 3);
@@ -486,8 +528,8 @@ pub const Net = struct {
         const small = try self.resize(&sc, img, SIZE, SIZE);
         const mean = try sc.fromF32(&MEAN, &.{ 1, 1, 1, 3 });
         const std_ = try sc.fromF32(&STD, &.{ 1, 1, 1, 3 });
-        const x = try sc.div(try sc.sub(small, mean), std_);
-        const alpha = try self.forward(&sc, x);
+        const x = try sc.astype(try sc.div(try sc.sub(small, mean), std_), ACT);
+        const alpha = try sc.astype(try self.forward(&sc, x), .float32);
         const back = try self.resize(&sc, alpha, @intCast(h), @intCast(w));
         var cl = mlx.mlx_array_new();
         const clipped = try sc.res(mlx.mlx_clip(&cl, back, try sc.scalar(0), try sc.scalar(1), sc.s), &cl);

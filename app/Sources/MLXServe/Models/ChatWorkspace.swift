@@ -83,13 +83,14 @@ enum ChatWorkspace: Equatable {
     /// - Parameter palettePresented: the ⌘L model switcher. Two sheets on one
     ///   window is one sheet plus a thing nobody can see, so the gate stands
     ///   down for it exactly as it does for the welcome sheet and the models
-    ///   pane — deferred, not dismissed.
+    ///   pane — deferred, not dismissed. The usage dashboard is the same case.
     static func gateShouldPresent(gateIsBlocking: Bool,
                                   cancelled: Bool,
                                   workspace: ChatWorkspace,
                                   welcomePresented: Bool,
-                                  palettePresented: Bool = false) -> Bool {
+                                  palettePresented: Bool = false,
+                                  usagePresented: Bool = false) -> Bool {
         gateIsBlocking && !cancelled && workspace.isConversation
-            && !welcomePresented && !palettePresented
+            && !welcomePresented && !palettePresented && !usagePresented
     }
 }

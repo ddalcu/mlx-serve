@@ -971,7 +971,7 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
-            .dspark_pol = if (dspark_active and intree.dsv41(xfm) != null) .{} else null,
+            .dspark_pol = if (dspark_active and intree.dsv41(xfm) != null) .{ .calib = .{ .head = true } } else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

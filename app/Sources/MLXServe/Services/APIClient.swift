@@ -96,6 +96,9 @@ class APIClient {
         config.waitsForConnectivity = true
         return URLSession(configuration: config)
     }()
+    /// For a poll that has to fail at once on a server that is not listening yet: a request on `session`, which waits
+    /// for connectivity, stays pending on a closed port and does not recover when the server comes up.
+    private let pollSession = URLSession(configuration: .ephemeral)
     private let decoder = JSONDecoder()
 
     /// Build a URL pointing at the server, honouring `host`. The settings
@@ -465,7 +468,7 @@ class APIClient {
     /// `--metrics`, which reads as nil (the tray hides the rows).
     func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
         let url = serverURL(port: port, path: "/metrics.json")
-        let (data, response) = try await session.data(from: url)
+        let (data, response) = try await pollSession.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return ThroughputSnapshot.parse(json, at: Date().timeIntervalSinceReferenceDate)

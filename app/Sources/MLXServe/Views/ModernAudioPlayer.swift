@@ -494,6 +494,8 @@ struct ModernPlaylist: View {
     let onPlay: (String) -> Void
     let onStop: () -> Void
     @State private var hovered: String?
+    /// Grouped when `paths` changes, not on every redraw: grouping parses a date out of every row.
+    @State private var days: [TrackDay] = []
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -505,7 +507,7 @@ struct ModernPlaylist: View {
             .padding(.horizontal, 14).padding(.top, 12).padding(.bottom, 4)
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 1) {
-                    ForEach(TrackDay.group(paths, date: { TrackMeta.date(stem: Self.stem($0)) })) { day in
+                    ForEach(days) { day in
                         Text(verbatim: day.label)
                             .font(.app(.caption, weight: .semibold))
                             .foregroundStyle(.secondary)
@@ -517,6 +519,9 @@ struct ModernPlaylist: View {
             }
         }
         .background(RoundedRectangle(cornerRadius: 10).fill(ModernAudioPlayer.ground))
+        .onChange(of: paths, initial: true) { _, paths in
+            days = TrackDay.group(paths, date: { TrackMeta.date(stem: Self.stem($0)) })
+        }
     }
 
     static func stem(_ path: String) -> String {

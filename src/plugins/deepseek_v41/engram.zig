@@ -558,6 +558,8 @@ pub const Prefetch = struct {
     nc: usize,
     stop: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
+    /// A batch's grids (one a state, `startBatch`) read a layer at a time across all of them, as its forward asks.
+    across: bool = false,
 
     /// `ids` is `[len][tables.len][nc]` row ids (`Hash.rows`).
     pub const Spec = struct { at: usize, len: usize, ids: []const u32 };
@@ -578,6 +580,15 @@ pub const Prefetch = struct {
 
     /// Reads `specs` in order. Copies what it is given; the returned value must not move (the thread holds it).
     pub fn start(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize) !*Prefetch {
+        return startOrdered(gpa, tables, specs, nc, span, false);
+    }
+
+    /// `start` for a batch of states, one grid each: every grid's rows of a layer before the next layer's.
+    pub fn startBatch(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize) !*Prefetch {
+        return startOrdered(gpa, tables, specs, nc, span, true);
+    }
+
+    fn startOrdered(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize, across: bool) !*Prefetch {
         const self = try gpa.create(Prefetch);
         errdefer gpa.destroy(self);
         const own_tables = try gpa.dupe(*const Table, tables);
@@ -596,7 +607,7 @@ pub const Prefetch = struct {
             g.* = .{ .at = sp.at, .len = sp.len, .ids = ids, .items = items };
             made += 1;
         }
-        self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc };
+        self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc, .across = across };
         self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
@@ -608,15 +619,21 @@ pub const Prefetch = struct {
     }
 
     fn run(self: *Prefetch) void {
-        for (self.grids) |*g| {
-            const n_spans = g.items.len / self.tables.len;
-            for (self.tables, 0..) |table, layer| for (0..n_spans) |k| {
-                if (self.stop.load(.acquire)) return;
-                const item = &g.items[layer * n_spans + k];
-                item.raw = self.readSpan(g, table, layer, k) catch null;
-                item.state.store(if (item.raw != null) done else failed, .release);
-            };
+        if (self.across) {
+            for (0..self.tables.len) |layer| for (self.grids) |*g| if (!self.readGrid(g, layer)) return;
+        } else for (self.grids) |*g| for (0..self.tables.len) |layer| if (!self.readGrid(g, layer)) return;
+    }
+
+    /// Every span of `layer` in `g`; false once stopped.
+    fn readGrid(self: *Prefetch, g: *Grid, layer: usize) bool {
+        const n_spans = g.items.len / self.tables.len;
+        for (0..n_spans) |k| {
+            if (self.stop.load(.acquire)) return false;
+            const item = &g.items[layer * n_spans + k];
+            item.raw = self.readSpan(g, self.tables[layer], layer, k) catch null;
+            item.state.store(if (item.raw != null) done else failed, .release);
         }
+        return true;
     }
 
     fn readSpan(self: *Prefetch, g: *const Grid, table: *const Table, layer: usize, k: usize) !Table.Raw {

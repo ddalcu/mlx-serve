@@ -5,8 +5,7 @@
 //! Heads and lengths are runtime arguments of these kernels (only the dtypes, the layout and the quantizer's block are
 //! template arguments), so the served shapes keep a few heads: the float64 references fit a Debug build.
 //! Known issues: the quantizers and the attention drop a NaN from a scale or a channel max (`metal::max`), so a NaN
-//! input gives finite scales and outputs (gate 1: `scale_drops_nan`, `attn_drops_nan`); the NAX attention does not
-//! build when kv heads x key blocks is under 8 (MLX binds `ks` in `constant`; gate 3: `attn_short_keys`).
+//! input gives finite scales and outputs (gate 1: `scale_drops_nan`, `attn_drops_nan`).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -1113,7 +1112,6 @@ fn gemmSpec(comptime name: []const u8, swiglu: bool, served: []const Shape) spec
 }
 
 const scale_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "the absmax runs through metal::max, which returns the other operand for a NaN: a block or row holding a NaN gets a finite scale (and an undefined code) where float64 gives NaN" };
-const attn_short_keys: spec.Known = .{ .gate = .shapes, .finding = "the source binds `const device float* kbs = ks`; when kv heads x key blocks is under 8, MLX passes ks in constant space and the library fails to build (1 kv head at 32..224 keys)" };
 const attn_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "the channel max enters through metal::max(vm, 1e-20), which returns 1e-20 for a NaN: a NaN channel max gives finite outputs where float64 gives NaN" };
 
 pub fn register(set: *kc.Set) !void {
@@ -1135,7 +1133,7 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 1024, .n = 4, .k = 128 }, .{ .rows = 333, .n = 2, .k = 128 } },
     }, null);
     try set.add(Attn, .init(a, 8, 8, true), attnSpec("int8_attn bf16 (NAX; 8 heads)", attn_drops_nan), null);
-    try set.add(Attn, .init(a, 2, 1, false), attnSpec("int8_attn bf16 (NAX; 2 heads over 1 kv head)", attn_short_keys), null);
+    try set.add(Attn, .init(a, 2, 1, false), attnSpec("int8_attn bf16 (NAX; 2 heads over 1 kv head)", null), null);
     try set.add(Rq, .init(a), rqSpec("w8a8_rq bf16", scale_drops_nan), null);
     try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; BM 128)", false, &.{ .{ .rows = 129, .n = 256, .k = 3072 }, .{ .rows = 300, .n = 320, .k = 512 } }), null);
     try set.add(Gemm, .init(a, false), gemmSpec("w8a8 gemm bf16 (NAX; BM 64 past 8192 rows)", false, &.{.{ .rows = 8200, .n = 128, .k = 256 }}), null);

@@ -688,7 +688,24 @@ rounding, as PyTorch's fused GELU; the chain's eight f16 roundings flatten that 
 `mx.fast.metal_kernel` in the Python venv against the Python chain, byte for byte. Guard: `kernel contract idol`
 (the bit-equal gate), `idol oracle: the fused glue keeps the velocity as close to the reference as the chain`.
 
+### A 0-d f32 scalar silently ran a bf16 encoder in f32
+Defect: Idol's DINOv3, loaded in bf16, took as long as the f32 one, and BiRefNet in f16 barely sped up. Cause:
+`sc.mulS(x, -1)` in the rotate-half (and `mulS(sigmoid, 2)` on BiRefNet's modulator) multiplies by a 0-d f32 array,
+which MLX promotes like any f32 array: q and k came out f32 and the residual stream followed for every layer. A test
+that only checked the outputs differ from the f32 run passed, since bf16-rounded weights differ too. Fix: `neg`,
+`mulLike` (a scalar in x's dtype). Guard: `dinov3: RoPE keeps a bf16 head in bf16` (it asserts the dtype, not the
+numbers).
+
 ## Parity method
+
+### A plugin that moves to the GPU aborted every plugin's conformance on CI
+Defect: from #1041 on, CI's zig job failed on every PR: the registry conformance test (every plugin, one test) and
+three DeepSeek-V4.1 tests exited 255 on the hosted runner's virtual GPU. Cause: the suite loads each tiny pack on a
+CPU stream, but `deepseek_v41`'s load swaps in a GPU stream (its kernels are Metal-only), and those kernels launch
+1024-thread groups a virtual GPU refuses (Insufficient Memory, abort). Fix: its load refuses `.unsupported` on a
+virtual GPU, which the suite treats as "nothing to check here"; every test that loads or runs it skips there
+(`deepseek_v4/served_test.zig` loads it through the driver too: grep for the table, not the folder).
+Guard: the root rule (every GPU test skips on a virtual GPU) and the plugins rule on loads that change stream.
 
 ### Fixtures for fp16-fragile giants are dumped fp32 on CPU
 Defect: a paint DINOv2-giant oracle sat at cos 0.30 while every per-layer bisect of the port was clean. Cause: the

@@ -463,6 +463,10 @@ struct ChatView: View {
                 .environmentObject(appState)
                 .environmentObject(server)
         }
+        // Reads one object, handed over explicitly: no environment to forget at the sheet.
+        .sheet(isPresented: $appState.usageDashboardPresented) {
+            UsageDashboardSheet(usage: server.usage)
+        }
     }
 
     /// The three-column modes (Tasks, Agents), in ONE split view.
@@ -558,7 +562,8 @@ struct ChatView: View {
                                                 cancelled: gateCancelled,
                                                 workspace: appState.chatWorkspace,
                                                 welcomePresented: appState.showWelcome,
-                                                palettePresented: appState.modelPalettePresented)
+                                                palettePresented: appState.modelPalettePresented,
+                                                usagePresented: appState.usageDashboardPresented)
             },
             set: { _ in })) {
             ChatModelGateSheet(pick: starterPick, onCancel: cancelGate)
@@ -976,7 +981,10 @@ struct ChatSidebar: View {
     }
 
     var body: some View {
-        conversationsSidebar
+        VStack(spacing: 0) {
+            conversationsSidebar
+            UsageStrip(usage: appState.server.usage) { appState.showUsageDashboard() }
+        }
     }
 
     /// ⌘1…⌘9 jumps to the row wearing that number; ⌃⌘1…⌃⌘9 ranges to it from

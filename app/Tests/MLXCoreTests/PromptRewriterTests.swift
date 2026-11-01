@@ -122,6 +122,20 @@ final class PromptRewriterTests: XCTestCase {
         XCTAssertTrue(both.user(seeingImage: true).contains("<Picture 1>"))
     }
 
+    func testEveryEnhanceRequestThinksAtMediumWithNoOutputCap() {
+        let requests = [
+            PromptRewriter.image(text: "a fox", editing: false, groups: ImagePromptExamples.textToImage, denseText: false),
+            PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10),
+            PromptRewriter.storyboard(idea: "they dance", format: .h3Base, totalSeconds: 120, shotSeconds: 5...10),
+            MusicPromptRewriter.request(.lyrics, text: "la la", family: .acestep, other: "", instrumental: false, language: "en"),
+            MusicPromptRewriter.request(.style, text: "jazz", family: .acestep, other: "", instrumental: false, language: "en"),
+        ]
+        for r in requests {
+            XCTAssertEqual(r.maxTokens, 0, "0 = no cap: the server allows the rest of the context")
+            XCTAssertEqual(r.reasoningEffort, "medium")
+        }
+    }
+
     func testNoFirstFrameMeansNoPicture() {
         let r = PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10)
         XCTAssertNil(r.firstFrame)

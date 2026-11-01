@@ -214,7 +214,7 @@ test "defaultMinP: ds4 keeps its own 0.05 floor; the others draw without one" {
     try testing.expectEqual(@as(f32, 0), defaultMinP(.ane));
 }
 
-test "submit: the engine's events land in the slot from its thread — prefilled, the tokens, then the terminator" {
+test "submit: the engine's events land in the slot from its thread — prefilled, the tokens, then the terminator; the request counts under its model" {
     const fake = @import("../../../testing/fake_engine.zig");
     const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
     const LoadedModel = @import("../../../host/registry/registry.zig").LoadedModel;
@@ -224,7 +224,8 @@ test "submit: the engine's events land in the slot from its thread — prefilled
     };
     var progress: @import("../../../host/registry/load_progress.zig").Progress = .{};
     var gauges: served_mod.Gauges = .{};
-    var s: Served = .{ .gpa = testing.allocator, .kind = .llama, .table = &fake.own_thread, .handle = undefined, .info = undefined, .host = undefined, .progress = &progress, .gauges = &gauges, .metrics = null };
+    var metrics = @import("../../../host/metrics/metrics.zig").Metrics.init();
+    var s: Served = .{ .gpa = testing.allocator, .kind = .llama, .table = &fake.own_thread, .handle = undefined, .info = undefined, .host = undefined, .progress = &progress, .gauges = &gauges, .metrics = &metrics };
     s.host = .{ .ctx = &s, .log = Quiet.log, .wake = Quiet.wake };
     const o: abi.Open = .{ .model_dir = .{}, .model_type = .{}, .config_json = .{}, .context = 0, .max_concurrent = 1, .memory_budget = 0, .settings_json = .{}, .options_json = .{}, .host = &s.host };
     var v: abi.Verdict = .{};
@@ -234,6 +235,7 @@ test "submit: the engine's events land in the slot from its thread — prefilled
     var lm: LoadedModel = undefined;
     lm.engine = &s;
     lm.transformer = null;
+    lm.id = "org/gguf-model";
     var cfg: ModelConfig = .{};
     const slot = try Slot.init(testing.allocator, testing.io, &cfg, .{ .model = &lm, .prompt_ids = &.{ 5, 6, 7 }, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 5 }, .dense);
     defer slot.deinit();
@@ -255,4 +257,11 @@ test "submit: the engine's events land in the slot from its thread — prefilled
     try testing.expectEqual(@as(u32, 5), slot.completion_tokens);
     while (slot.in_pass.load(.acquire) != 0) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
     try testing.expectEqual(@as(u64, 0), gauges.prefilling.load(.monotonic) + gauges.generated.load(.monotonic));
+    // The usage dashboard counts an embedded engine's traffic like MLX's: one row, under the model's id.
+    try testing.expectEqual(@as(u32, 1), metrics.usage_count.load(.acquire));
+    const row = &metrics.usage[0];
+    try testing.expectEqualStrings("org/gguf-model", row.name[0..row.name_len]);
+    try testing.expectEqual(@as(u64, 1), row.requests.load());
+    try testing.expectEqual(@as(u64, 3), row.prompt_tokens.load());
+    try testing.expectEqual(@as(u64, 5), row.generation_tokens.load());
 }
