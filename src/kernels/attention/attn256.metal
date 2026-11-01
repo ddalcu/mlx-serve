@@ -140,7 +140,8 @@ for (; kb < kb_lim; kb++) {
     if (r < rows_k) {
       w = *((const device uint4*)(Kp + (long)(c0 + r) * k_strides[2]) + c8);
     }
-    thread T* e = (thread T*)&w;
+    T e[8];
+    msv_unpack8(w, e);
     const int cb = c8 * 8;
     Ks[(cb + 0) * LDK + r] = e[0];
     Ks[(cb + 1) * LDK + r] = e[1];

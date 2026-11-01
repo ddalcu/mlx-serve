@@ -11,8 +11,9 @@
       if (v_vec) {
         w = *((const device uint4*)(vq + rb) + c8);
       } else {
-        thread T* e = (thread T*)&w;
+        T e[8];
         for (int j = 0; j < 8; ++j) e[j] = vq[rb + (long)(c8 * 8 + j) * vqS[3]];
+        w = msv_pack8(e);
       }
     }
     *((threadgroup uint4*)(Vs + r * LDV) + c8) = w;

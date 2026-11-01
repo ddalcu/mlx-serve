@@ -14,8 +14,9 @@ float ss = 0.f;
 for (int k = 0; k < NB; ++k) {
   uint4 av = a4[k * 128 + t];
   uint4 bv = HAS_ADD ? b4[k * 128 + t] : uint4(0);
-  thread const T* ae = (thread const T*)&av;
-  thread const T* be = (thread const T*)&bv;
+  T ae[8], be[8];
+  msv_unpack8(av, ae);
+  msv_unpack8(bv, be);
   for (int q = 0; q < 8; ++q) {
     float e = float(ae[q]);
     if (HAS_ADD) e = float(static_cast<T>(e + float(be[q])));
@@ -29,15 +30,16 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 float inv = metal::precise::rsqrt((red[0] + red[1] + red[2] + red[3]) / H + eps);
 uint cb = blk * BLK + 8 * t;
 uint rb = row * H + cb;
-if (HAS_ADD) { T sv[8]; for (int q = 0; q < 8; ++q) sv[q] = static_cast<T>(own[q]); *(device uint4*)(sum + rb) = *(thread uint4*)sv; }
+if (HAS_ADD) { T sv[8]; for (int q = 0; q < 8; ++q) sv[q] = static_cast<T>(own[q]); *(device uint4*)(sum + rb) = msv_pack8(sv); }
 uint4 wv = *(const device uint4*)(w + cb);
-thread const T* we = (thread const T*)&wv;
+T we[8];
+msv_unpack8(wv, we);
 float4 s0 = *(const device float4*)(signs + cb), s1 = *(const device float4*)(signs + cb + 4);
 float sgn8[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
 float v[8];
 T nv[8];
 for (int q = 0; q < 8; ++q) { nv[q] = we[q] * static_cast<T>(own[q] * inv); v[q] = float(nv[q]) * sgn8[q]; }
-if (WRITE_NORMED) *(device uint4*)(normed + rb) = *(thread uint4*)nv;
+if (WRITE_NORMED) *(device uint4*)(normed + rb) = msv_pack8(nv);
 for (int h = 1; h < 8; h <<= 1)
   for (int q = 0; q < 8; ++q) if ((q & h) == 0) { float x0 = v[q], x1 = v[q + h]; v[q] = x0 + x1; v[q + h] = x0 - x1; }
 for (uint m = 1; m < 32; m <<= 1) {

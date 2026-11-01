@@ -4,7 +4,7 @@ scripts/unit_globals.py's scan of a unit object's symbols.
 
   python3 scripts/lint_test.py   # or: zig build lint-test
 """
-import os, sys, unittest
+import os, sys, tempfile, unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import lint  # noqa: E402
@@ -132,6 +132,20 @@ class PinsForksRatchets(unittest.TestCase):
         self.assertEqual(count("pin-unmatched", {"src/host/x.zig": HDR}, pins), 0)
         self.assertEqual(count("pin-unmatched", {"src/host/x.zig": HDR + "cache.step += 1;\n"}, pins), 1)
         self.assertEqual(count("pin-unmatched", {"src/engines/x.zig": HDR + "cache.step += 1;\n"}, pins), 0)
+
+    def test_forbid_pin_reads_metal_files(self):
+        # Kernels are .metal files outside the scanned .zig dict: pin_files must read them from the tree.
+        pins = "src/kernels/*.metal\t!(thread T*)&\tno pointer pun\n"
+        cwd = os.getcwd()
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(os.path.join(d, "src", "kernels"))
+            with open(os.path.join(d, "src", "kernels", "k.metal"), "w") as f:
+                f.write("thread T* e = (thread T*)&w;\n")
+            os.chdir(d)
+            try:
+                self.assertEqual(count("pin-unmatched", {}, pins), 1)
+            finally:
+                os.chdir(cwd)
 
     def test_file_over_cap(self):
         prod = HDR + "const a = 1;\n" * lint.SOFT_CAP

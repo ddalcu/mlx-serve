@@ -72,7 +72,8 @@ for (int t0 = 0; t0 < L; t0 += BK) {
       const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
       w = *((const device uint4*)(Kp + (long)pos * k_strides[2]) + c8);
     }
-    thread T* e = (thread T*)&w;
+    T e[8];
+    msv_unpack8(w, e);
     const int cb = c8 * 8;
     for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = e[j];
   }

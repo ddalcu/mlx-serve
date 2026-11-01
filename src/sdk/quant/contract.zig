@@ -17,7 +17,7 @@ const host = kc.host;
 const Shape = spec.Shape;
 
 const rotate_launch = metal.Launch{ .name = "msv_hadamard_block", .inputs = &.{ "x", "signs" }, .outputs = &.{"y"}, .source = rht.KERNEL_SOURCE, .tg_bytes = 4096 * 4, .m1 = 512, .m2 = 512 };
-const norm_rotate_launch = metal.Launch{ .name = "msv_norm_rotate", .inputs = &.{ "a", "b", "w", "eps", "signs" }, .outputs = &.{ "sum", "normed", "rot" }, .source = rht.NORM_ROTATE_SOURCE, .tg_bytes = 1024 * 4 + 4 * 4, .m1 = 1024, .m2 = 1024 };
+const norm_rotate_launch = metal.Launch{ .name = "msv_norm_rotate", .inputs = &.{ "a", "b", "w", "eps", "signs" }, .outputs = &.{ "sum", "normed", "rot" }, .source = rht.NORM_ROTATE_SOURCE, .header = rht.NORM_ROTATE_HEADER, .tg_bytes = 1024 * 4 + 4 * 4, .m1 = 1024, .m2 = 1024 };
 /// The bf16 rotation-only instantiations: M1/M2 compile hidden 4096 (NB 4) for 96 threads, 5120 for 768
 /// (`offline.zig`); the launch is 128.
 const norm_rotate_rot_bf16_launch = blk: {

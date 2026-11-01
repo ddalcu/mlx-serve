@@ -121,6 +121,7 @@ fn transformComposed(x: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, inver
 /// re-reads the whole row for the sum of squares instead of syncing with the
 /// others. Rounds through T exactly where the composed ops would.
 pub const NORM_ROTATE_SOURCE = kernelSource("kernels/quant/norm_rotate.metal");
+pub const NORM_ROTATE_HEADER = kernelSource("kernels/common/pack8.metal");
 
 var norm_rotate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -157,7 +158,7 @@ pub fn normRotate(a: mlx.mlx_array, b: ?mlx.mlx_array, w: mlx.mlx_array, eps: ml
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        const k = mlx.mlx_fast_metal_kernel_new("msv_norm_rotate", in_vec, out_vec, NORM_ROTATE_SOURCE, "", true, false);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_norm_rotate", in_vec, out_vec, NORM_ROTATE_SOURCE, NORM_ROTATE_HEADER, true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         norm_rotate_kernel = k;
     }
