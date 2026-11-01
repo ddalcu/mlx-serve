@@ -37,6 +37,7 @@ pub const Affine4 = struct {
     launch: *const metal.Launch,
     part: Part,
     shared: Shared,
+    bits: u32 = 4,
     /// Fill both dispatches' inputs (the drift guard chains them).
     both: bool = false,
     sp: spec.Spec = undefined,
@@ -56,8 +57,15 @@ pub const Affine4 = struct {
     dn: [11]mlx.mlx_array = undefined,
     msg: [256]u8 = undefined,
 
-    pub fn init(a: std.mem.Allocator, part: Part, shared: Shared) Affine4 {
-        return .{ .rig = metal.Rig.init(a), .launch = &launches[@backingInt(part)], .part = part, .shared = shared };
+    pub fn init(a: std.mem.Allocator, part: Part, shared: Shared, bits: u32) Affine4 {
+        return .{
+            .rig = metal.Rig.init(a),
+            .launch = &launches[@backingInt(part)],
+            .part = part,
+            .shared = shared,
+            .bits = bits,
+            .banks = @splat(.{ .bits = bits, .gs = GS, .n = 0, .k = 0 }),
+        };
     }
 
     pub fn deinit(self: *Affine4) void {
@@ -113,6 +121,7 @@ pub const Affine4 = struct {
             g.int("N", ci);
             g.int("GS", GS);
             g.int("TOPK", topk);
+            g.int("BITS", self.bits);
         } else {
             g.int("I", ci);
             g.int("H", ch);
@@ -120,6 +129,7 @@ pub const Affine4 = struct {
             g.int("TOPK", topk);
             g.int("SHARED", @intFromBool(self.shared == .gated));
             g.int("SI", self.se() * i);
+            g.int("BITS", self.bits);
         }
         return g;
     }
@@ -194,14 +204,15 @@ pub const Affine4 = struct {
 
     fn bank3(rig: *metal.Rig, b: *const host.Affine, lead: ?usize, n: usize, k: usize) ![3]mlx.mlx_array {
         const ci: c_int = @intCast(n);
+        const wpr: c_int = @intCast(k * b.bits / 32);
         var w: [3]mlx.mlx_array = undefined;
         if (lead) |e| {
             const ce: c_int = @intCast(e);
-            w[0] = try rig.input(.uint32, &.{ ce, ci, @intCast(k / 8) }, b.words);
+            w[0] = try rig.input(.uint32, &.{ ce, ci, wpr }, b.words);
             w[1] = try rig.input(DT, &.{ ce, ci, @intCast(k / GS) }, b.scales);
             w[2] = try rig.input(DT, &.{ ce, ci, @intCast(k / GS) }, b.biases);
         } else {
-            w[0] = try rig.input(.uint32, &.{ ci, @intCast(k / 8) }, b.words);
+            w[0] = try rig.input(.uint32, &.{ ci, wpr }, b.words);
             w[1] = try rig.input(DT, &.{ ci, @intCast(k / GS) }, b.scales);
             w[2] = try rig.input(DT, &.{ ci, @intCast(k / GS) }, b.biases);
         }
@@ -468,20 +479,24 @@ fn specOf(comptime name: []const u8, served: []const Shape) spec.Spec {
     };
 }
 
-fn add(set: *kc.Set, comptime name: []const u8, part: Part, shared: Shared, served: []const Shape) !void {
-    var k = Affine4.init(set.a, part, shared);
+fn add(set: *kc.Set, comptime name: []const u8, part: Part, shared: Shared, bits: u32, served: []const Shape) !void {
+    var k = Affine4.init(set.a, part, shared, bits);
     k.sp = specOf(name, served);
     try set.add(Affine4, k, k.sp, null);
 }
 
 /// Flash Next: top-10 of 640-wide experts over hidden 2560, a gated shared expert; the ungated arm (Flint) on a
-/// smaller layer.
+/// smaller layer; 3-bit affine on Qwen3-Coder-30B-A3B (top-8 of 768-wide experts over hidden 2048).
 pub fn register(set: *kc.Set) !void {
-    try add(set, "moe_affine4 gate+up bf16 (top-10, 640 x 2560)", .gateup, .none, &.{.{ .rows = 10, .n = 640, .k = 2560 }});
-    try add(set, "moe_affine4 gate+up bf16 (top-6 + an ungated shared slice)", .gateup, .ungated, &.{.{ .rows = 6, .n = 256, .k = 1024 }});
-    try add(set, "moe_affine4 down+reduce bf16 (top-10, a gated shared expert)", .downred, .gated, &.{.{ .rows = 10, .n = 2560, .k = 640 }});
-    try add(set, "moe_affine4 down+reduce bf16 (top-10, no shared expert)", .downred, .none, &.{.{ .rows = 10, .n = 2560, .k = 640 }});
-    try add(set, "moe_affine4 down+reduce bf16 (top-6 + an ungated shared slice)", .downred, .ungated, &.{.{ .rows = 6, .n = 1024, .k = 256 }});
+    try add(set, "moe_affine4 gate+up bf16 (top-10, 640 x 2560)", .gateup, .none, 4, &.{.{ .rows = 10, .n = 640, .k = 2560 }});
+    try add(set, "moe_affine4 gate+up bf16 (top-6 + an ungated shared slice)", .gateup, .ungated, 4, &.{.{ .rows = 6, .n = 256, .k = 1024 }});
+    try add(set, "moe_affine4 down+reduce bf16 (top-10, a gated shared expert)", .downred, .gated, 4, &.{.{ .rows = 10, .n = 2560, .k = 640 }});
+    try add(set, "moe_affine4 down+reduce bf16 (top-10, no shared expert)", .downred, .none, 4, &.{.{ .rows = 10, .n = 2560, .k = 640 }});
+    try add(set, "moe_affine4 down+reduce bf16 (top-6 + an ungated shared slice)", .downred, .ungated, 4, &.{.{ .rows = 6, .n = 1024, .k = 256 }});
+    try add(set, "moe_affine4 gate+up bf16 3-bit (top-8, 768 x 2048)", .gateup, .none, 3, &.{.{ .rows = 8, .n = 768, .k = 2048 }});
+    try add(set, "moe_affine4 gate+up bf16 3-bit (top-6 + an ungated shared slice)", .gateup, .ungated, 3, &.{.{ .rows = 6, .n = 256, .k = 1024 }});
+    try add(set, "moe_affine4 down+reduce bf16 3-bit (top-8, no shared expert)", .downred, .none, 3, &.{.{ .rows = 8, .n = 2048, .k = 768 }});
+    try add(set, "moe_affine4 down+reduce bf16 3-bit (top-6 + an ungated shared slice)", .downred, .ungated, 3, &.{.{ .rows = 6, .n = 1024, .k = 256 }});
 }
 
 // ── tests ──
@@ -489,14 +504,14 @@ pub fn register(set: *kc.Set) !void {
 test "kernel contract qwen4_exp: the affine-4 launches, chained, are moe_affine4.decode's bytes" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = std.testing.allocator;
-    for ([_]Shared{ .none, .gated, .ungated }) |sh| {
-        var k = Affine4.init(a, .gateup, sh);
+    for ([_]u32{ 4, 3 }) |bits| for ([_]Shared{ .none, .gated, .ungated }) |sh| {
+        var k = Affine4.init(a, .gateup, sh, bits);
         defer k.deinit();
         k.both = true;
         k.sp = specOf("t", &.{.{ .rows = 6, .n = 256, .k = 1024 }});
-        try std.testing.expect(try k.prepare(.{ .rows = 6, .n = 256, .k = 1024 }, .random, 11));
+        try std.testing.expect(try k.prepare(.{ .rows = 6, .n = 256, .k = 1024 }, .random, 11 + bits));
         const got = try k.chained();
         defer a.free(got[0]);
         try std.testing.expectEqualSlices(u8, got[1], got[0]);
-    }
+    };
 }

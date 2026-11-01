@@ -465,7 +465,7 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
         cost_arm = 1;
     } else if (B * S == 1 and (swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp) orelse 1) == 0 and cfg.hidden_act == .silu and
         gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
-        gate_qp.bits == 4 and up_qp.bits == 4 and down_qp.bits == 4 and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
+        (gate_qp.bits == 3 or gate_qp.bits == 4) and gate_qp.bits == up_qp.bits and gate_qp.bits == down_qp.bits and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
         try self.moeAffine4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size, if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null, null))
     {
         moe_reduced = true;

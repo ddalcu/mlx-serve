@@ -7,6 +7,8 @@ const bool sh = int(e) >= TOPK;
 const size_t row = sh ? size_t(int(e) - TOPK) * N + row0 : size_t(inds[e]) * N + row0;
 const device uint2* gw = (const device uint2*)(sh ? sg_q : wg_q) + row * KW2 + lane;
 const device uint2* uw = (const device uint2*)(sh ? su_q : wu_q) + row * KW2 + lane;
+const device ushort* gw3 = (const device ushort*)(sh ? sg_q : wg_q) + (row * KW2 + lane) * 3;
+const device ushort* uw3 = (const device ushort*)(sh ? su_q : wu_q) + (row * KW2 + lane) * 3;
 const device T* gsc = sh ? sg_scales : g_scales;
 const device T* gbi = sh ? sg_biases : g_biases;
 const device T* usc = sh ? su_scales : u_scales;
@@ -22,8 +24,10 @@ for (int k = 0; k < K; k += 512) {
     const int gi = kk / GS;
     for (int r = 0; r < ROWS; ++r) {
       const size_t sg = (row + r) * KG + gi;
-      ag[r] += float(gsc[sg]) * mlxserve_a4_dot16(gw[r * KW2 + k / 16], xr) + float(gbi[sg]) * xs;
-      au[r] += float(usc[sg]) * mlxserve_a4_dot16(uw[r * KW2 + k / 16], xr) + float(ubi[sg]) * xs;
+      const float dg = BITS == 3 ? mlxserve_a3_dot16(gw3 + (r * KW2 + k / 16) * 3, xr) : mlxserve_a4_dot16(gw[r * KW2 + k / 16], xr);
+      const float du = BITS == 3 ? mlxserve_a3_dot16(uw3 + (r * KW2 + k / 16) * 3, xr) : mlxserve_a4_dot16(uw[r * KW2 + k / 16], xr);
+      ag[r] += float(gsc[sg]) * dg + float(gbi[sg]) * xs;
+      au[r] += float(usc[sg]) * du + float(ubi[sg]) * xs;
     }
   }
 }

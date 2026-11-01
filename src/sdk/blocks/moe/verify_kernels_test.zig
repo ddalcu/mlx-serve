@@ -175,18 +175,20 @@ test "verify expert reduction preserves unsort multiply and sum" {
     if (mlx.noGpuBackend() or !verifySharedHardware()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xE55E);
-    for ([_]c_int{ 2, 3, 4, 5, 6, 8, 10, 12, 20, 32 }) |tokens| {
-        const count = tokens * 10;
-        const down = try attn256RandBf16(prng.random(), &.{ count, 2560 }, s);
+    for ([_][2]c_int{ .{ 8, 2048 }, .{ 10, 2560 }, .{ 8, 4096 } }) |kh| for ([_]c_int{ 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 32 }) |tokens| {
+        const topk = kh[0];
+        const hidden = kh[1];
+        const count = tokens * topk;
+        const down = try attn256RandBf16(prng.random(), &.{ count, hidden }, s);
         defer _ = mlx.mlx_array_free(down);
-        const scores = try attn256RandBf16(prng.random(), &.{ 1, tokens, 10 }, s);
+        const scores = try attn256RandBf16(prng.random(), &.{ 1, tokens, topk }, s);
         defer _ = mlx.mlx_array_free(scores);
         var perm: [320]u32 = undefined;
         for (perm[0..@intCast(count)], 0..) |*id, i| id.* = @intCast(i);
         prng.random().shuffle(u32, perm[0..@intCast(count)]);
         const inverse = mlx.mlx_array_new_data(&perm, &.{count}, 1, .uint32);
         defer _ = mlx.mlx_array_free(inverse);
-        if (tokens == 4) {
+        if (tokens == 4 and topk == 10) {
             try testing.expect((try verifyExpertReduce(s, down, inverse, .{})) == null);
             const cpu = mlx.mlx_default_cpu_stream_new();
             defer _ = mlx.mlx_stream_free(cpu);
@@ -209,15 +211,15 @@ test "verify expert reduction preserves unsort multiply and sum" {
         const actual = (try verifyExpertReduce(s, down, inverse, scores)) orelse return error.ExpertReduceDeclined;
         defer _ = mlx.mlx_array_free(actual);
         try testing.expect(try qsaArraysAllEqual(expected, actual, s));
-    }
+    };
 }
 
 test "prefill expert reduction is bit-identical to unsort multiply and sum" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5EED_3A11);
-    // (top_k, hidden): the qwen3.6 35B and MiMo-V2.6 geometries.
-    for ([_][2]c_int{ .{ 10, 2560 }, .{ 8, 4096 } }) |kh| for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
+    // (top_k, hidden): Qwen3-30B-A3B (8, 2048), Qwen3.6-35B (10, 2560), and MiMo-V2.6 (8, 4096) geometries.
+    for ([_][2]c_int{ .{ 8, 2048 }, .{ 10, 2560 }, .{ 8, 4096 } }) |kh| for ([_][2]c_int{ .{ 1, 33 }, .{ 1, 2048 }, .{ 2, 1024 }, .{ 1, 8192 } }) |shape| {
         const count = shape[0] * shape[1] * kh[0];
         const down = try testRandWeightBf16(prng.random(), &.{ count, kh[1] }, s);
         defer _ = mlx.mlx_array_free(down);
