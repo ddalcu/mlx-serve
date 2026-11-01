@@ -11,11 +11,10 @@ MLX_CUDA_QMV_MAX_ROWS=<1..8> overrides either choice.
 Drop this file and its step in build-mlx-linux.sh once lib/mlx-src includes
 it.
 
-diff --git a/docs/src/usage/environment_variables.rst b/docs/src/usage/environment_variables.rst
-index 4641411..c2012d5 100644
+
 --- a/docs/src/usage/environment_variables.rst
 +++ b/docs/src/usage/environment_variables.rst
-@@ -175,6 +175,13 @@ The MLX-prefixed variables in this section are advanced CUDA backend controls.
+@@ -203,6 +203,13 @@
     Set the CUDA backward scaled dot-product attention cache capacity. The
     default is ``64``.
  
@@ -29,8 +28,6 @@ index 4641411..c2012d5 100644
  .. envvar:: MLX_ENABLE_CACHE_THRASHING_CHECK
  
     Detect consecutive CUDA cache misses (more than twice the capacity with no
-diff --git a/mlx/backend/cuda/quantized/qmm/qmm.h b/mlx/backend/cuda/quantized/qmm/qmm.h
-index 6991baa..37f6c8c 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmm.h
 +++ b/mlx/backend/cuda/quantized/qmm/qmm.h
 @@ -5,6 +5,8 @@
@@ -42,7 +39,7 @@ index 6991baa..37f6c8c 100644
  #include <optional>
  
  namespace mlx::core {
-@@ -118,6 +120,21 @@ bool supports_qmv(
+@@ -166,6 +168,21 @@
      QuantizationMode mode,
      cu::Device& device);
  
@@ -64,8 +61,6 @@ index 6991baa..37f6c8c 100644
  void qmv(
      const array& x,
      const array& w,
-diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
-index 63c8478..728db42 100644
 --- a/mlx/backend/cuda/quantized/qmm/qmv.cu
 +++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
 @@ -8,8 +8,19 @@
@@ -88,22 +83,21 @@ index 63c8478..728db42 100644
  namespace cu {
  
  namespace cg = cooperative_groups;
-@@ -208,6 +219,105 @@ __global__ void qmv_kernel(
+@@ -208,7 +219,10 @@
        x, w, scales, biases, global_scale, out, row, w_batch, n, k);
  }
  
 +// 2..8 rows of x against one weight matrix: each warp dequantizes its row of w
 +// once and takes its dot product with every row of x.
-+template <
+ template <
 +    int ROWS,
-+    int rows_per_block,
-+    int elems_per_thread,
-+    int group_size,
-+    bool has_bias,
-+    bool has_residue_k,
-+    typename T,
-+    typename Q,
-+    typename S>
+     int rows_per_block,
+     int elems_per_thread,
+     int group_size,
+@@ -217,6 +231,102 @@
+     typename T,
+     typename Q,
+     typename S>
 +__global__ void qmv_rows_kernel(
 +    const T* x,
 +    const Q* w,
@@ -191,10 +185,19 @@ index 63c8478..728db42 100644
 +  }
 +}
 +
- template <
-     int rows_per_block,
-     int elems_per_thread,
-@@ -272,6 +382,7 @@ void qmv(
++template <
++    int rows_per_block,
++    int elems_per_thread,
++    int group_size,
++    bool has_bias,
++    bool has_residue_k,
++    typename T,
++    typename Q,
++    typename S>
+ __global__ void gather_qmv_kernel(
+     const T* x,
+     const Q* w,
+@@ -272,6 +382,7 @@
      int k,
      int l,
      bool broadcast_w,
@@ -202,10 +205,11 @@ index 63c8478..728db42 100644
      F&& launch_kernel) {
    constexpr int rows_per_block = 8;
    constexpr int elems_per_thread =
-@@ -283,6 +394,51 @@ void qmv(
+@@ -282,6 +393,51 @@
+   dim3 block_dims{WARP_SIZE, rows_per_block};
    void* args[] = {
        &x, &w, &scales, &biases, &global_scale, &out, &n, &k, &broadcast_w};
- 
++
 +  if (m >= 2 && m <= max_rows && l == 1 && !global_scale) {
 +    dim3 row_blocks{uint32_t(cuda::ceil_div(n, rows_per_block)), 1, 1};
 +    void* row_args[] = {&x, &w, &scales, &biases, &out, &n, &k};
@@ -250,11 +254,10 @@ index 63c8478..728db42 100644
 +    });
 +    return;
 +  }
-+
+ 
    dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
      auto* kernel = &qmv_kernel<
-         rows_per_block,
-@@ -466,6 +622,7 @@ void qmv(
+@@ -466,6 +622,7 @@
                k,
                l,
                broadcast_w,
@@ -262,11 +265,9 @@ index 63c8478..728db42 100644
                [&](auto* kernel, dim3 num_blocks, dim3 block_dims, void** args) {
                  encoder.add_kernel_node_raw(
                      kernel, num_blocks, block_dims, {}, 0, args);
-diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
-index 68012cb..c374714 100644
 --- a/mlx/backend/cuda/quantized/quantized.cpp
 +++ b/mlx/backend/cuda/quantized/quantized.cpp
-@@ -119,7 +119,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
+@@ -119,7 +119,8 @@
    }
  
    if (can_use_qmm_sm80) {
@@ -276,19 +277,17 @@ index 68012cb..c374714 100644
        call_qmv();
      } else {
        call_qmm_sm80();
-diff --git a/tests/cuda_tests.cpp b/tests/cuda_tests.cpp
-index fee796e..ef63fc1 100644
 --- a/tests/cuda_tests.cpp
 +++ b/tests/cuda_tests.cpp
-@@ -2,6 +2,7 @@
+@@ -1,6 +1,7 @@
+ // Copyright © 2026 Apple Inc.
  
  #include "doctest/doctest.h"
- #include "mlx/backend/cuda/lru_cache.h"
 +#include "mlx/backend/cuda/quantized/qmm/qmm.h"
  #include "mlx/mlx.h"
  
  #ifdef _WIN32
-@@ -195,3 +196,36 @@ TEST_CASE("test quantized matmul over a few rows") {
+@@ -187,3 +188,36 @@
      }
    }
  }

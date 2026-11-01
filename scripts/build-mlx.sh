@@ -39,9 +39,15 @@ die() { echo "[build-mlx] ERROR: $*" >&2; exit 1; }
 
 MLX_SHA="$(git -C "$MLX_SRC" rev-parse --short=12 HEAD)"
 MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
-# The mlx-c patch below is part of the build: an edited patch must rebuild.
-MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
-PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
+# The mlx and mlx-c patches below are part of the build: an edited patch must rebuild.
+MLX_PATCHES=(
+  "$REPO_ROOT/patches/mlx-metal-sdpa-split-off.patch"
+)
+MLXC_PATCHES=(
+  "$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
+  "$REPO_ROOT/patches/mlxc-sdpa-window-size.patch"
+)
+PATCH_SHA="$(cat "${MLX_PATCHES[@]}" "${MLXC_PATCHES[@]}" | shasum | cut -c1-12)"
 WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
@@ -70,6 +76,12 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 NCPU="$(sysctl -n hw.ncpu)"
 
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
+# MLX's own patches (the sdpa_split kernel of #4723 is inaccurate: ml-explore/mlx#4808). The files each patch
+# touches are reset first, so an edited patch replaces the old one.
+for patch in "${MLX_PATCHES[@]}"; do
+  git -C "$MLX_SRC" checkout -- $(git -C "$MLX_SRC" apply --numstat -p1 "$patch" | cut -f3)
+  git -C "$MLX_SRC" apply -p1 "$patch"
+done
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
@@ -81,12 +93,15 @@ cmake --build "$BUILD_ROOT/mlx" -j "$NCPU"
 cmake --install "$BUILD_ROOT/mlx" >/dev/null
 
 # ── mlx-c against the staged mlx (same pairing brew uses: USE_SYSTEM_MLX) ────
-# MLX 0.32.3's gather_qmm takes a global_scale before sorted_indices; the
-# pinned mlx-c predates it (the same patch the Linux build applies). The files
-# the patch touches are reset first, so an edited patch replaces the old one;
+# MLX 0.32.3's gather_qmm takes a global_scale before sorted_indices, and MLX
+# after 0.32.5 puts a window_size before the SDPA mask mode; the pinned mlx-c
+# predates both (the Linux build applies the gather_qmm patch too). The files
+# each patch touches are reset first, so an edited patch replaces the old one;
 # local edits anywhere else in the submodule are kept.
-git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$MLXC_PATCH" | cut -f3)
-git -C "$MLXC_SRC" apply -p1 "$MLXC_PATCH"
+for patch in "${MLXC_PATCHES[@]}"; do
+  git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$patch" | cut -f3)
+  git -C "$MLXC_SRC" apply -p1 "$patch"
+done
 cmake -S "$MLXC_SRC" -B "$BUILD_ROOT/mlxc" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \

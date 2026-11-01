@@ -1,0 +1,17 @@
+MLX after 0.32.5 (ml-explore/mlx#4734, sliding window attention) inserted
+`int window_size = -1` into fast::scaled_dot_product_attention before
+`mask_mode`; the pinned mlx-c @56b2d39 predates that and passes the mask mode
+string in its place, which fails to compile. Shim: pass -1 (no window), the
+default every existing caller gets today. The C ABI has no surface for it yet.
+
+--- a/mlx/c/fast.cpp
++++ b/mlx/c/fast.cpp
+@@ -620,6 +620,8 @@ extern "C" int mlx_fast_scaled_dot_product_attention(
+             mlx_array_get_(keys),
+             mlx_array_get_(values),
+             scale,
++            /* window_size: no C ABI surface yet */
++            -1,
+             std::string(mask_mode),
+             (mask_arr.ctx ? std::make_optional(mlx_array_get_(mask_arr))
+                           : std::nullopt),

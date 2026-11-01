@@ -7,7 +7,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const verify_qmm = @import("verify_qmm.zig");
 const testing = std.testing;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
-const qmvBatchLimit = @import("qmatmul.zig").qmvBatchLimit;
+const qmvRows = @import("qmatmul.zig").qmvRows;
 const msvQmvRows = @import("qmv_rows.zig").msvQmvRows;
 const dualDieArch = verify_projection.dualDieArch;
 const mtpCoarsePairs = verify_projection.mtpCoarsePairs;
@@ -24,6 +24,13 @@ const mtp_mod = @import("../../spec/mtp/mtp.zig");
 const qmatmulBits = @import("qmatmul.zig").qmatmulBits;
 const model_mod = @import("../../weights/load.zig");
 const qsaArraysAllEqual = @import("../../testing/parity.zig").qsaArraysAllEqual;
+
+/// Whether the joined projection of `total` rows declines: 8-bit group 64 rows go to the 12-row dense tile before the
+/// stock-qmv check, and every other joined batch needs stock to reduce its rows through qmv (qmvRows).
+fn joinedDeclines(arch: []const u8, total: c_int, k: c_int, n: c_int, gs: c_int) bool {
+    if (total == 12 and n >= 2560 and gs == 64) return false;
+    return !qmvRows(dualDieArch(arch), total, k, n, gs);
+}
 
 test "shared expert gate tail admits the joined verifier envelope only" {
     try testing.expect(sharedGateRowsEligible(&.{ 2, 2, 2, 2 }));
@@ -82,7 +89,7 @@ test "verify shared projection preserves solo qmv values across request widths, 
             const x = try attn256RandBf16(prng.random(), &.{ 1, total, k }, s);
             defer _ = mlx.mlx_array_free(x);
             const arch = verifyArch().?;
-            if (total > 24 or total >= qmvBatchLimit(dualDieArch(arch), k, n)) {
+            if (total > 24 or joinedDeclines(arch, total, k, n, @intCast(gs))) {
                 try testing.expect((try verifySharedProjection(s, x, w, sc, bi, lengths[0..count])) == null);
                 continue;
             }
@@ -144,7 +151,7 @@ test "verify GDN projections preserve solo qmv values across request widths" {
             for (lengths[0..count]) |width| total += width;
             const x = try attn256RandBf16(prng.random(), &.{ 1, total, k }, s);
             defer _ = mlx.mlx_array_free(x);
-            if (total > 12 or lengths[0] > 6) {
+            if (total > 12 or lengths[0] > 6 or joinedDeclines(verifyArch().?, total, k, n, 64)) {
                 try testing.expect((try verifyGdnProjection(s, x, w, sc, bi, lengths[0..count])) == null);
                 continue;
             }
@@ -206,7 +213,7 @@ test "verify attention projections preserve solo qmv values across request width
             for (lengths[0..count]) |width| total += width;
             const x = try attn256RandBf16(prng.random(), &.{ 1, total, k }, s);
             defer _ = mlx.mlx_array_free(x);
-            if (total > 12 or lengths[0] > 6) {
+            if (total > 12 or lengths[0] > 6 or joinedDeclines(verifyArch().?, total, k, n, 64)) {
                 try testing.expect((try verifyAttnProjection(s, x, w, sc, bi, lengths[0..count])) == null);
                 continue;
             }
@@ -296,6 +303,34 @@ test "verify vocabulary projections preserve solo logits across request widths (
     }
 }
 
+/// What the slots compute alone for `m` joined rows: stock `quantized_matmul` over chunks of 6 rows, each of which takes
+/// the per-row qmv path. One stock call over all `m` rows takes the NAX split-K matmul at some shapes.
+fn soloChunks(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, m: c_int, k: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var parts: [2]mlx.mlx_array = undefined;
+    var count: usize = 0;
+    errdefer for (parts[0..count]) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    var at: c_int = 0;
+    while (at < m) : (at += 6) {
+        var chunk = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(chunk);
+        try mlx.check(mlx.mlx_slice(&chunk, x, &.{ 0, at, 0 }, 3, &.{ 1, @min(at + 6, m), k }, 3, &.{ 1, 1, 1 }, 3, s));
+        parts[count] = try qmatmulBits(chunk, w, sc, bi, 8, 64, .affine, s);
+        count += 1;
+    }
+    if (count == 1) return parts[0];
+    defer for (parts[0..count]) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    const vec = mlx.mlx_vector_array_new_data(&parts, count);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
 test "the wide dense verify tile preserves the stock QMV reduction" {
     if (mlx.noGpuBackend() or !verifySharedHardware()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -326,9 +361,8 @@ test "the wide dense verify tile preserves the stock QMV reduction" {
             try testing.expect((try verifyWideProjection(s, .{}, w, sc, bi, 6)) == null);
             try testing.expect((try verifyWideProjection(s, x, w, sc, .{}, 6)) == null);
             try testing.expect((try verifyWideProjection(s, x, w, sc, bi, 7)) == null);
-            var reference = mlx.mlx_array_new();
+            const reference = try soloChunks(x, w, sc, bi, m, k, s);
             defer _ = mlx.mlx_array_free(reference);
-            try mlx.check(mlx.mlx_quantized_matmul(&reference, x, w, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", s));
             for ([_]c_int{ 4, 6, 8, 12 }) |nv| {
                 const got = (try verifyWideProjection(s, x, w, sc, bi, nv)) orelse return error.WideTileDeclined;
                 defer _ = mlx.mlx_array_free(got);

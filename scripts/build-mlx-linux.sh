@@ -101,12 +101,6 @@ if [[ "$MLX_COMMIT" != unknown && -f "$STAGE/lib/libmlx.so" && -f "$STAGE/lib/li
 fi
 
 if [[ "$MLX_BACKEND" == cuda ]]; then
-  echo "== patch mlx: CUDA LRU thrashing check counts consecutive misses"
-  if grep -q 'any hit resets it' "$MLX_SOURCE/mlx/backend/cuda/lru_cache.h"; then
-    echo "   lru cache: already applied"
-  else
-    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-lru-consecutive-misses.patch"
-  fi
   echo "== patch mlx: CUDA fused attention at head dims 256 and 512"
   if grep -q 'load_lane_row' "$MLX_SOURCE/mlx/backend/cuda/scaled_dot_product_attention.cu"; then
     echo "   sdpa: already applied"
@@ -118,12 +112,6 @@ if [[ "$MLX_BACKEND" == cuda ]]; then
     echo "   qmm: already applied"
   else
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmm-read-weights-once.patch"
-  fi
-  echo "== patch mlx: CUDA sorted expert gather (upstream #4554)"
-  if grep -q 'gather_qmm_rhs_sm80' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
-    echo "   gather qmm rhs: already applied"
-  else
-    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-gather-qmm-rhs.patch"
   fi
   echo "== patch mlx: CUDA mat-vec rows kernel (GB10 default, MLX_CUDA_QMV_MAX_ROWS)"
   if grep -q 'qmv_rows_kernel' "$MLX_SOURCE/mlx/backend/cuda/quantized/qmm/qmv.cu"; then
@@ -193,6 +181,15 @@ if grep -q 'global_scale: no C ABI surface yet' "$MLXC_SRC/mlx/c/ops.cpp"; then
   echo "   gather_qmm: already applied"
 else
   git -C "$MLXC_SRC" apply -p1 "$ROOT/patches/mlxc-gather-qmm-global-scale.patch"
+fi
+# Newer MLX put `int window_size` into fast::scaled_dot_product_attention before mask_mode; the
+# pinned mlx-c passes the mask mode in its place. The omarchy tree builds an older MLX without it.
+if ! grep -q 'int window_size' "$MLX_SOURCE/mlx/fast.h"; then
+  echo "   sdpa window_size: not in this mlx"
+elif grep -q 'window_size: no C ABI surface yet' "$MLXC_SRC/mlx/c/fast.cpp"; then
+  echo "   sdpa window_size: already applied"
+else
+  git -C "$MLXC_SRC" apply -p1 "$ROOT/patches/mlxc-sdpa-window-size.patch"
 fi
 if grep -q 'no baseline _Float16' "$MLXC_SRC/mlx/c/half.h"; then
   echo "   f16 alias: already applied"

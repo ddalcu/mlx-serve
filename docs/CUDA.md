@@ -75,7 +75,7 @@ Guard: `qmv_cuda: no worse than stock quantized_matmul against f32 truth` (rows 
 
 Defect: NVIDIA's Flash Next FP4 pack chose an 8192-row chunk on a GB10 and every prompt past it failed with `cuGraphAddKernelNode ... invalid argument`.
 Cause: MLX's `GatherQMM` runs `qmm_sm80` with one block per (token, expert) pair on grid z, capped at 65,535; 8192 rows x top-10 is 81,920. The 2048-row CUDA cap (`autoPrefillChunkCap`) bound only the load-time pin, and Flash Next picks its width per request and widens per chunk.
-Fix: `mlx-cuda-gather-qmm-rhs.patch` (upstream #4554) runs sorted fp4/fp8 gathers one group per expert, ~10x faster at a 2048-row chunk; `generate.machine_prefill_chunk_cap` bounds every auto width in `effectivePrefillChunk`. Affine banks and expert widths not a multiple of 128 keep the old gather and its limit.
+Fix: MLX's `gather_qmm_rhs_sm80` (upstream #4554) runs sorted fp4/fp8 gathers one group per expert, ~10x faster at a 2048-row chunk; `generate.machine_prefill_chunk_cap` bounds every auto width in `effectivePrefillChunk`. Affine banks and expert widths not a multiple of 128 keep the old gather and its limit.
 Guard: `gatherExpertMm: a sorted nvfp4 gather past 65,535 rows…`, `effectivePrefillChunk: the machine cap bounds every auto width…`, `chooseRequestPrefillChunk: the machine's chunk cap bounds…`.
 
 ### `bf16 + bf16` in a JIT kernel is not MLX's add
@@ -103,7 +103,7 @@ Guard: `below 4 rows per expert MLX's sorted mat-vec is bit-identical to its per
 ### A fixed kernel kept running its racy build from MLX's PTX cache
 
 Defect: on a DGX Spark the same greedy request drifted from run to run (logprobs ~0.1 apart, another token after 15-150), and one 64-token prefill forward repeated in a process moved logits by up to 5. The first output to differ was a `qmm_sm80` quantized matmul whose inputs were bit-identical.
-Cause: `qmm_sm80`'s epilogue writes C into the shared memory of the A/B pipeline while its last prefetches can still land. `mlx-cuda-gather-qmm-rhs.patch` (#899) waits for them, but MLX caches compiled kernels by module name under `<tmp>/mlx/<version>/ptx`, so a box that compiled the kernel before the patch kept running the racy build.
+Cause: `qmm_sm80`'s epilogue writes C into the shared memory of the A/B pipeline while its last prefetches can still land. The sorted gather's `gather_qmm_rhs_sm80` kernel (#899, now upstream) waits for them, but MLX caches compiled kernels by module name under `<tmp>/mlx/<version>/ptx`, so a box that compiled the kernel before the patch kept running the racy build.
 Fix: `mlx.exportPtxCacheDir` points `MLX_PTX_CACHE_DIR` (unless set) at `<tmp>/mlx-serve-ptx/<id>`, the id hashing `lib/mlx/.version` (MLX commits, patch inputs, CUDA arch), so each patch set compiles its own kernels. The stamp reaches the binary through the build graph (module `mlx_stamp`): read at configure time, it was cached and an incremental build after an MLX update kept the old id. A hand edit to `lib/mlx-src` keeps the id: delete that directory.
 Guard: `ptxCacheDir: each staged MLX build compiles into its own kernel cache`, `stampId: a rebuilt MLX gets a cache of its own`; `QWEN4_TEST_MODEL=<pack> zig build test -Dtest-filter="one lazy 64-token forward"` (4 of 4 repeats differ on the pre-#899 kernel).
 
@@ -142,11 +142,9 @@ Guard: `ModelOpt: an FP8 linear loaded into the GPU's pool stays there` (reads t
 | `mlx-cuda-qmv-rows.patch` | rows kernel inside `quantized_matmul` | Done on sm_120 (`sdk/blocks/qmm/qmv_cuda.zig`); GB10 keeps the patch until it is measured there |
 | `mlx-cuda-qmm-read-weights-once.patch` | folds `[B, M, K]` batches into rows | Yes: `qmv_cuda` flattens leading dims; the stock path could reshape before the call |
 | `mlx-cuda-sdpa-head-dim-256-512.patch` | fused attention at head dims 256 and 512 | Possible, as a custom attention kernel (as `msv_attn_p256` is on Metal) |
-| `mlx-cuda-gather-qmm-rhs.patch` | upstream #4554: sorted fp4/fp8 expert gather, one group per expert | No: drop it once the pin includes #4554 |
 | `mlx-cuda-row-dot-matvec.patch` | 16-byte mat-vecs for bf16/fp8/fp4 rows and few-row fp gathers; `device_info` reports `integrated` | Partly: a `cuda_kernel` could take the expert gather, but gemv and `quantized_matmul` dispatch inside MLX |
 | `mlx-cuda-sorted-gather-experts.patch` | the sorted fp expert gather's grid: CTAs per (N tile, expert), heavy experts split | No: it reuses `qmm_sm80`'s mainloop |
 | `mlx-cuda-graphs-switch.patch` | `mlx_cuda_set_graphs`: CUDA graphs on or off at runtime | No: the encoder's mode |
 | `mlx-cuda-sorted-gather-matvec.patch` | below 4 rows per expert, the sorted fp gather's mat-vec loads each expert once per run of rows | Yes: a `cuda_kernel` could take it, if it reproduced `row_dot`'s arithmetic |
 | `mlx-cuda-custom-kernel-disk-cache.patch` | `cuda_kernel` modules go to the disk kernel cache like MLX's own | No: MLX's JIT cache |
-| `mlx-cuda-lru-consecutive-misses.patch` | MLX's internal LRU cache | No: not a kernel |
 | `mlx-cuda-windows-toolkit-dirs.patch` | DLL search folders on Windows | No: not a kernel |
