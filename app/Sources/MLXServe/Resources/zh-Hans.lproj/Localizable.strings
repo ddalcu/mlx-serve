@@ -2480,3 +2480,8 @@
 "%@ not measured yet" = "%@ 尚未测量";
 "%@ %@ tokens per second" = "%@ 每秒 %@ 个 Token";
 "Opens the usage dashboard" = "打开用量面板";
+
+/* Quit command */
+"Quit MLX-Serve" = "退出 MLX-Serve";
+"Keep running when I press ⌘Q" = "按 ⌘Q 时保持运行";
+"⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q 关闭窗口，服务器继续运行。菜单栏中的“退出”仍会同时停止两者。";

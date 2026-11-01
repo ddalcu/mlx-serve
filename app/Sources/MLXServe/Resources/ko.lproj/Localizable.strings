@@ -2412,3 +2412,8 @@
 "%@ not measured yet" = "%@ 아직 측정 안 됨";
 "%@ %@ tokens per second" = "%@ 초당 %@ 토큰";
 "Opens the usage dashboard" = "사용량 대시보드를 엽니다";
+
+/* Quit command */
+"Quit MLX-Serve" = "MLX-Serve 종료";
+"Keep running when I press ⌘Q" = "⌘Q를 눌러도 계속 실행";
+"⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q는 창을 닫고 서버는 계속 실행됩니다. 메뉴 막대의 종료는 여전히 둘 다 중지합니다.";
