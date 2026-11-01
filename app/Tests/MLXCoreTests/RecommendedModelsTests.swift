@@ -136,7 +136,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testMtpScoredPicksAreTheOnesShippingADraftHead() {
         let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
         XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next",
-                             "sushi-2bpw"])
+                             "sushi-2bpw", "deepseek-v41-flash"])
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
         XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
         XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
@@ -176,7 +176,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
         XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b",
-                                   "sushi-2bpw", "lfm3-1.7b", "lfm3-vl-2b", "lfm3-audio-2b", "lfm3-omni-2b"])
+                                   "sushi-2bpw", "lfm3-1.7b", "lfm3-omni-2b", "deepseek-v41-flash"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -433,7 +433,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// then the ~130 GB native-MLX DeepSeek-V4-Flash mirror.
     func testLargestSectionHoldsFlashNextThenDeepseek() {
         XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id),
-                       ["sushi-2bpw", "qwen38-flash-next", "deepseek-v4-flash"])
+                       ["sushi-2bpw", "qwen38-flash-next", "deepseek-v4-flash", "deepseek-v41-flash"])
         let fn = RecommendedModelPick.qwen38FlashNext
         XCTAssertEqual(fn.repoId, "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw")
         XCTAssertEqual(fn.quantLabel, "iQ-MLX 4.7 bpw")
@@ -462,6 +462,22 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertNil(RecommendedModelPick.gemmaE4B.ggufFilename, "safetensors picks fetch the whole repo")
         XCTAssertFalse(RecommendedModelPick.allCatalogs.contains { $0.repoId == "antirez/deepseek-v4-gguf" },
                        "the ds4 GGUF pick is superseded by the native mirror")
+    }
+
+    /// DeepSeek-V4.1-Flash is our iQ-MLX 3.0 pack, gated on its ~213 GB wired
+    /// peak: a 256 GB Mac's pick, never a 192 GB one's.
+    func testDeepseekV41FlashIsOurPackForA256GBMac() {
+        let ds = RecommendedModelPick.deepseekV41Flash
+        XCTAssertEqual(ds.repoId, "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw")
+        XCTAssertEqual(ds.quantLabel, "iQ-MLX 3.0 bpw")
+        XCTAssertEqual(ds.contextTokens, 1_048_576)
+        XCTAssertTrue(ds.meetsSystemRequirements(physicalMemoryBytes: 256 * GiB))
+        XCTAssertFalse(ds.meetsSystemRequirements(physicalMemoryBytes: 192 * GiB))
+    }
+
+    /// The Liquid section is the small text model and the Omni, nothing else.
+    func testLiquidSectionIsTheTextModelAndTheOmni() {
+        XCTAssertEqual(RecommendedModelPick.liquidCatalog.map(\.id), ["lfm3-1.7b", "lfm3-omni-2b"])
     }
 
     /// The entry-level Qwen row is the MiMo 9B (7.1 GB) — and the ancient

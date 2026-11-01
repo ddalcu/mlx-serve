@@ -2412,10 +2412,7 @@
 "The size of the picture painted onto the surface. Larger keeps finer surface detail and uses more memory." = "贴在表面上的图片尺寸。越大，表面细节越精细，占用内存也越多。";
 "How many refinement passes Idol makes. Time grows with the count; 50 is the published setting, and fewer steps finish sooner but refine the result less." = "Idol 进行多少次细化。耗时随步数增加；50 是官方发布的设置，步数越少完成越快，但结果的细化程度也越低。";
 "How strongly Idol is pushed toward your picture. Higher follows it more closely. 0 turns guidance off and makes each step about twice as fast." = "Idol 向你的图片靠拢的力度。数值越高，越贴近图片。设为 0 会关闭引导，每一步的速度约快一倍。";
-"Total Tokens" = "总 Token 数";
-"%@ tok/s" = "%@ Token/秒";
-"%@ tokens since the last reset. Click to open the usage dashboard." = "自上次重置以来共 %@ 个 Token。点击打开用量面板。";
-"Average since the server started" = "服务器启动以来的平均值";
+"Tokens per second, dimmed when it is the average since the server started. Click to open the usage dashboard." = "每秒 Token 数，灰色为服务器启动以来的平均值。点击打开用量面板。";
 "Usage" = "用量";
 "Reset…" = "重置…";
 "Nothing counted yet. Tokens are tallied as the server finishes each request." = "尚无统计。服务器每完成一个请求，Token 就会计入。";

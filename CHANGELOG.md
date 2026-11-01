@@ -7,7 +7,8 @@
 - **Idol: one photo to a 3D model.** Drop a photo into the 3D pane and Idol turns it into a 3D model you can open in Preview or any 3D viewer. It cuts out the background by itself, runs faster than the original, and is now the recommended 3D model.
 - **LFM3 chats, sees, listens and talks.** Liquid's LFM3 models can read pictures, understand speech and answer out loud, and the app can use them for voice input without Apple's dictation.
 - **NVIDIA Nemotron 3.5 Transcribe.** Speech to text in 40 languages, with translation, who said what, word timings and subtitles, and you can ask questions about a recording. Settings ▸ Voice can use it for dictation and meeting notes. Thanks @beamivalice.
-- **A usage dashboard in the chat window.** The corner of the chat sidebar shows how busy your Mac is, how fast the model is going and how many tokens you have used. Click it for daily activity, the last 30 days, average and top speeds, and a breakdown per model. The history survives restarts.
+- **A usage dashboard in the chat window.** The corner of the chat sidebar shows how busy your Mac is and how fast the model is going. Click the speeds for daily activity, the last 30 days, average and top speeds, and a breakdown per model. The history survives restarts.
+- **Recommended models.** Liquid LFM3 leads the list, and DeepSeek-V4.1-Flash is there for Macs with 256 GB of memory.
 - **Enhance works with thinking models.** The Enhance buttons on the Image, Video and Music panes and the storyboard planner no longer come back empty when the model thinks first.
 - **Text to speech in the language you pick.** Qwen3-TTS can be told which language to speak. Thanks @lborloz.
 - **Clearer text-to-speech errors.** A reference voice Qwen3-TTS cannot use is refused with a clear message. Thanks @ianalitis.
