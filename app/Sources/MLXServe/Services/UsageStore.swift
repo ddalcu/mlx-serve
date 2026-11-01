@@ -22,6 +22,15 @@ final class UsageStore {
                 PRIMARY KEY (day, model)
             )
             """)
+        guard try db.userVersion() < 1 else { return }
+        try db.transaction {
+            guard try db.userVersion() < 1 else { return }   // another process may have added them since
+            try db.execute("""
+                ALTER TABLE usage_daily ADD COLUMN peak_decode_tps REAL NOT NULL DEFAULT 0;
+                ALTER TABLE usage_daily ADD COLUMN peak_prefill_tps REAL NOT NULL DEFAULT 0;
+                """)
+            try db.setUserVersion(1)
+        }
     }
 
     /// Adds each delta to its day's row for that model, all or nothing.
@@ -32,18 +41,22 @@ final class UsageStore {
                 let c = d.counters
                 try db.run("""
                     INSERT INTO usage_daily
-                        (day, model, requests, prompt_tokens, cached_tokens, generation_tokens, prefill_ns, decode_ns)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        (day, model, requests, prompt_tokens, cached_tokens, generation_tokens, prefill_ns, decode_ns,
+                         peak_decode_tps, peak_prefill_tps)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (day, model) DO UPDATE SET
                         requests = requests + excluded.requests,
                         prompt_tokens = prompt_tokens + excluded.prompt_tokens,
                         cached_tokens = cached_tokens + excluded.cached_tokens,
                         generation_tokens = generation_tokens + excluded.generation_tokens,
                         prefill_ns = prefill_ns + excluded.prefill_ns,
-                        decode_ns = decode_ns + excluded.decode_ns
+                        decode_ns = decode_ns + excluded.decode_ns,
+                        peak_decode_tps = MAX(peak_decode_tps, excluded.peak_decode_tps),
+                        peak_prefill_tps = MAX(peak_prefill_tps, excluded.peak_prefill_tps)
                     """, [.text(d.day), .text(d.model), .integer(Int(c.requests)), .integer(Int(c.promptTokens)),
                           .integer(Int(c.cachedTokens)), .integer(Int(c.generatedTokens)),
-                          .integer(Int(c.prefillNs)), .integer(Int(c.decodeNs))])
+                          .integer(Int(c.prefillNs)), .integer(Int(c.decodeNs)),
+                          .real(c.peakDecodeTPS), .real(c.peakPrefillTPS)])
             }
         }
     }
@@ -52,13 +65,15 @@ final class UsageStore {
     func rows() throws -> [UsageRow] {
         var out: [UsageRow] = []
         try db.query("""
-            SELECT day, model, requests, prompt_tokens, cached_tokens, generation_tokens, prefill_ns, decode_ns
+            SELECT day, model, requests, prompt_tokens, cached_tokens, generation_tokens, prefill_ns, decode_ns,
+                   peak_decode_tps, peak_prefill_tps
             FROM usage_daily ORDER BY day, model
             """) { r in
             out.append(UsageRow(day: r.text(0) ?? "", model: r.text(1) ?? "",
                                 counters: UsageCounters(requests: Int64(r.integer(2)), promptTokens: Int64(r.integer(3)),
                                                         cachedTokens: Int64(r.integer(4)), generatedTokens: Int64(r.integer(5)),
-                                                        prefillNs: Int64(r.integer(6)), decodeNs: Int64(r.integer(7)))))
+                                                        prefillNs: Int64(r.integer(6)), decodeNs: Int64(r.integer(7)),
+                                                        peakDecodeTPS: r.real(8), peakPrefillTPS: r.real(9))))
         }
         return out
     }

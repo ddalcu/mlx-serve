@@ -1,21 +1,41 @@
 # Changelog
 
-## v26.11.1 — Outside Plugins
+## v26.11.1 — Outside Plugins, Full Rewrite
 
-- **Idol: one photo to a 3D Gaussian splat.** speridlabs' Idol runs natively (its own background cutout included): drop a photo or render into the 3D pane, pick steps, guidance and up to a million Gaussians, and get a GLB that opens solid in Preview and any viewer (`geometry: "splat"` returns the `KHR_gaussian_splatting` points instead) and previews in the app. Downloads from `ddalcu/Idol-MLX-Serve-8bit` (3.0 GB, float16 also published); `tests/convert_idol_weights.py` rebuilds either.
-- **A usage dashboard in the chat window.** The bottom-left corner of the chat sidebar shows the Mac's GPU, Neural Engine and memory load, how fast the server decodes and reads prompts (a bar fills while a long prompt is read) and a running token total. Click the total for a dashboard: tokens per day as a green activity chart, the last 30 days, and every model's requests, tokens in and out, cache share and speed, with a reset for one model or all. The history is kept per day across restarts.
-- **TensorFold Flash-Next packs.** The embedded PLE loader accepts affine `shard_N` tensor names alongside `shards.N`, without repacking or downloading additional weights.
-- **Model plugins you can build and install.** `mlx-serve plugin new` starts a model or media plugin from the plugin kit, `plugin check` tests it, and `plugin install` adds it after showing its signature; Settings lists installed plugins with a switch each.
-- **Outside plugins can draft and see.** A plugin can run its own speculative drafter (greedy or sampled requests), serve images through its own vision tower, and read the model's `ctx_size` to size its memory.
-- **NVIDIA Nemotron 3.5 Transcribe.** Speech to text in 40 languages, translation, speaker-tagged transcripts, word timestamps with `srt`, `vtt` and `diarized_json` (its own CTC head and speaker model, no aligner or diarizer download), faster decoding from its MTP head, and questions about a recording, on `/v1/audio/transcriptions` and as audio in chat; Settings ▸ Voice can use it for dictation and meeting transcripts. Convert NVIDIA's checkpoint with `scripts/convert_nemotron_transcribe.py`.
-- **DiffusionGemma is no longer supported.**
-- **Codex prompts that fit a local model.** `mlx-serve launch codex` and the app's Codex tab hand codex a current base-instructions file instead of its stale built-in fallback, which names tools the binary no longer declares; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` drops the override.
-- **DeepSeek-V4.1-Flash reads long prompts faster.** Prompts are read 8,192 tokens at a time where memory allows, and the attention, expert and Engram work behind each chunk is faster on M5 Macs.
-- **DeepSeek-V4.1 keeps DSpark on when several requests run at once.** Concurrent requests draft and verify together instead of dropping to plain decoding, and several requests decoding together run faster with or without DSpark.
-- **Stopping a DeepSeek-V4.1 reply keeps the conversation cached.** The next message picks up from the last finished turn instead of reading the whole conversation again, with or without the SSD cache.
-- **An embeddings request no longer crashes a DeepSeek server.** Asking DeepSeek-V4 or V4.1 for embeddings now returns a clear error instead of stopping the server.
-- **Outside plugins can use the server's layer blocks.** The plugin kit ships `kit.blocks` (norms, conv, ssm, schedulers, vae, dit pieces, embedding, and the linear, quantized-matmul, MLP, RoPE, attention, MoE, hyper-connection and GDN blocks), versioned with the kit, and `kit.foreign` to register a weight layout of your own, so a plugin calls them instead of rewriting the layer.
-- **Hardening before release.** A JSON schema the grammar cannot enforce (a typo'd type, tuple items, a pattern it cannot compile) now answers HTTP 400 on chat completions, Messages and Responses instead of free text with a 200; a long-running server no longer lets finished sessions' lone prompt-cache entries force a live multi-stream workload to evict itself; and Flash-Next packs with mixed 5-bit/group-64 hyper-connection weights no longer fail their first request.
+- **Plugins you can build and install.** `mlx-serve plugin new` starts a plugin for a new model, `plugin check` tests it, and `plugin install` adds it after showing who signed it. Settings lists your plugins with an on/off switch for each. Plugins can draft ahead, look at images and reuse the server's own building blocks. Thanks @davidtai and @STRML for helping here. Point your agent here: https://github.com/CommunityServe/plugins 
+- **DeepSeek-V4.1-Flash is faster and remembers more.** It reads long prompts faster (most of all on M5 Macs), writes faster, stays fast when several people use it at once, and keeps your conversation cached even after you stop a reply, so the next message starts right away. Asking a DeepSeek model for embeddings now gives a clear error instead of stopping the server. Thanks @STRML.
+- **Idol: one photo to a 3D model.** Drop a photo into the 3D pane and Idol turns it into a 3D model you can open in Preview or any 3D viewer. It cuts out the background by itself, runs faster than the original, and is now the recommended 3D model.
+- **LFM3 chats, sees, listens and talks.** Liquid's LFM3 models can read pictures, understand speech and answer out loud, and the app can use them for voice input without Apple's dictation.
+- **NVIDIA Nemotron 3.5 Transcribe.** Speech to text in 40 languages, with translation, who said what, word timings and subtitles, and you can ask questions about a recording. Settings ▸ Voice can use it for dictation and meeting notes. Thanks @beamivalice.
+- **A usage dashboard in the chat window.** The corner of the chat sidebar shows how busy your Mac is, how fast the model is going and how many tokens you have used. Click it for daily activity, the last 30 days, average and top speeds, and a breakdown per model. The history survives restarts.
+- **Enhance works with thinking models.** The Enhance buttons on the Image, Video and Music panes and the storyboard planner no longer come back empty when the model thinks first.
+- **Text to speech in the language you pick.** Qwen3-TTS can be told which language to speak. Thanks @lborloz.
+- **Clearer text-to-speech errors.** A reference voice Qwen3-TTS cannot use is refused with a clear message. Thanks @ianalitis.
+- **Faster prompts on M1 and M2.** `MLX_SERVE_F16_PREFILL=1` reads prompts faster for bf16 models on Macs without fast bf16 math. Thanks @hyeoktae.
+- **Other's Flash-Next packs load.** Thanks @jasontitus.
+- **Gemma 4 packs that mix quantization settings load.** Thanks @lborloz.
+- **Draft heads stored one expert at a time load.** Thanks @brandondyal.
+- **Build draft heads for MoE models.** `tests/build_mtp_sidecar.py` now builds them for mixture-of-experts models too. Thanks @Dankpaws.
+- **Codex works better with local models.** `mlx-serve launch codex` and the app's Codex tab give Codex up-to-date instructions for the tools it really has. Thanks @kmahara.
+- **Answers come out right.** A thinking budget no longer switches off speculative decoding for the answer, text that looks like a special token is read as plain text, and stray tool-call markers no longer show up as the answer.
+- **Drafting stays within the rules.** Drafting ahead from your prompt can no longer slip in a word the model must never write. Thanks @dmumber.
+- **The Responses API keeps reasoning.** Replayed replies keep their reasoning text. Thanks @shikyo13.
+- **The Responses API sees tool images.** An image returned by a tool now reaches the model. Thanks @yerbolgmailcom.
+- **A steadier server.** A schema the server cannot enforce is refused up front instead of being ignored, the prompt cache holds up better on long-running servers, and the server shuts down promptly.
+- **The SSD cache keeps what it just saved.** Thanks @lborloz.
+- **Models are found where they are.** Models in symlinked folders are found, and Qwen-Image downloads and MTP badges show correctly in the app. Thanks @elkaix.
+- **A finished agent stops using CPU.** Thanks @jondestoppeleire.
+- **No more web console timeouts on long replies.** Thanks @lborloz.
+- **Streams report their speed.** The last chunk of a streamed reply carries its timings, on the OpenAI and Anthropic APIs alike. Thanks @hyeoktae.
+- **Retired settings.** DiffusionGemma is no longer supported, and many old `MLX_SERVE_*` tuning variables are gone: what they switched on is now the default.
+
+### Thank you
+
+Everyone below sent a pull request for this release. Thank you!
+
+@beamivalice, @brandondyal, @Dankpaws, @davidtai, @dmumber, @elkaix, @hyeoktae, @ianalitis, @jasontitus, @jondestoppeleire, @kmahara, @lborloz, @shikyo13, @STRML, @yerbolgmailcom
+
+---
 
 ## v26.10.3 — New Models, Transcripts, RDMA, Faster
 

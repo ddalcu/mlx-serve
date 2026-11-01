@@ -2428,8 +2428,8 @@
 "Last 7 days" = "最近 7 天";
 "Requests" = "请求";
 "%lld%% of prompt cached" = "%lld%% 的提示词来自缓存";
-"Average speed" = "平均速度";
-"Prefill %@" = "预填充 %@";
+"Speed (tok/s)" = "速度（Token/秒）";
+"Average" = "平均";
 "Days in a row" = "连续天数";
 "Busiest day: %@" = "最忙的一天：%@";
 "Activity" = "活动";
