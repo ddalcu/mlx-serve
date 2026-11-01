@@ -2443,3 +2443,6 @@
 "Last used %@ · %lld%% of all tokens" = "最近使用 %@ · 占全部 Token 的 %lld%%";
 "Reset %@…" = "重置 %@…";
 "Less" = "更少";
+"Quit MLX-Serve" = "退出 MLX-Serve";
+"Keep running when I press ⌘Q" = "按 ⌘Q 时保持运行";
+"⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q 关闭窗口，服务器继续运行。菜单栏中的“退出”仍会同时停止两者。";

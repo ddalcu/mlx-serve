@@ -2369,3 +2369,6 @@
 "Everything at once: pictures, video and your voice in, text or its own voice out. Native voice mode in a model under 3 GB." = "한 번에 모두: 사진, 동영상, 목소리를 넣으면 글이나 자기 목소리로 답합니다. 3GB 미만 모델로 쓰는 네이티브 음성 모드.";
 "Voice mode — the model hears you itself, and the voice chosen in Settings reads its answer." = "음성 모드 — 모델이 직접 듣고, 설정에서 고른 목소리가 답을 읽어 줍니다.";
 "LiquidAI's speech model: 19 languages, a female and a male voice each. When your chat model is LFM3 Audio or Omni, that same model reads the answers, with no second model." = "LiquidAI의 음성 모델: 19개 언어, 언어마다 여성과 남성 목소리가 하나씩 있습니다. 채팅 모델이 LFM3 Audio나 Omni이면 두 번째 모델 없이 같은 모델이 답을 읽어 줍니다.";
+"Quit MLX-Serve" = "MLX-Serve 종료";
+"Keep running when I press ⌘Q" = "⌘Q를 눌러도 계속 실행";
+"⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q는 창을 닫고 서버는 계속 실행됩니다. 메뉴 막대의 종료는 여전히 둘 다 중지합니다.";
