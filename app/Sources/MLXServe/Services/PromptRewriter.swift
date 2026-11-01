@@ -44,6 +44,17 @@ enum PromptRewriter {
         makes the video cut away from the picture.
         """
 
+    /// Video models speak only words written out in their notation; speech described without its words comes out as
+    /// gibberish.
+    private static func speechRule(_ format: VideoPromptFormat) -> String {
+        let notation = format == .ltx
+            ? "in double quotes, naming its language (\"speaking English\")"
+            : "inside <d>[Language] …</d> right after the speaker's id, as in (S1) says <d>[English] …</d>"
+        return "Write every spoken, sung or rapped line word for word \(notation). Use the language the user asks for, "
+            + "else the language of the words they give, else English. When the user implies speech but gives no words, "
+            + "write short lines that fit the clip: never describe talking, singing or rapping without its words."
+    }
+
     /// A reference model follows its pictures, so a prompt that describes a subject differently
     /// fights them.
     static func referencesRule(count: Int, afterFirstFrame: Bool) -> String {
@@ -124,9 +135,10 @@ enum PromptRewriter {
     static func video(text: String, format: VideoPromptFormat, seconds: Int, firstFrame: Data? = nil,
                       references: [Data] = []) -> Request {
         let labels = H3PromptExamples.sections(for: format)
-        let shape = labels.isEmpty
-            ? "Write ONE paragraph of 4-8 sentences like the examples: subject, action, camera movement, lighting, setting, sound. Keep spoken dialogue in double quotes."
-            : "Write the prompt in the exact labelled format of the examples, with these labels in order, each on its own line: \(labels.joined(separator: ", ")). Keep any <Picture N>, <Video N> or <Audio N> references verbatim."
+        let shape = (labels.isEmpty
+            ? "Write ONE paragraph of 4-8 sentences like the examples: subject, action, camera movement, lighting, setting, sound."
+            : "Write the prompt in the exact labelled format of the examples, with these labels in order, each on its own line: \(labels.joined(separator: ", ")). Keep any <Picture N>, <Video N> or <Audio N> references verbatim.")
+            + " " + speechRule(format)
         var r = request(noun: "video prompt", shape: shape,
                         examples: H3PromptExamples.examples(for: format).prefix(3).map(\.body), text: text,
                         note: "The clip is \(seconds) seconds long. Describe only what happens in that time: no more action than fits.")
@@ -142,9 +154,10 @@ enum PromptRewriter {
     static func storyboard(idea: String, format: VideoPromptFormat, totalSeconds: Int,
                            shotSeconds: ClosedRange<Int>, firstFrame: Data? = nil) -> Request {
         let labels = H3PromptExamples.sections(for: format)
-        let shape = labels.isEmpty
-            ? "one paragraph of 4-8 sentences: subject, action, camera movement, lighting, setting, sound. Keep spoken dialogue in double quotes."
-            : "the exact labelled format of the examples, with these labels in order, each on its own line: \(labels.joined(separator: ", "))."
+        let shape = (labels.isEmpty
+            ? "one paragraph of 4-8 sentences: subject, action, camera movement, lighting, setting, sound."
+            : "the exact labelled format of the examples, with these labels in order, each on its own line: \(labels.joined(separator: ", ")).")
+            + " " + speechRule(format)
         let shots = max(1, Int((Double(totalSeconds) / Double(shotSeconds.upperBound)).rounded(.up)))
         return Request(system: """
             You plan a long video as a storyboard of shots for a generative video model. \

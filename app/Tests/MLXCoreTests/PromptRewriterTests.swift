@@ -22,6 +22,17 @@ final class PromptRewriterTests: XCTestCase {
         XCTAssertFalse(r.system.contains("integrated_multimodal_description:"))
     }
 
+    func testEveryVideoRewriteWritesTheSpokenWordsInItsModelsNotation() {
+        for format in [VideoPromptFormat.ltx, .h3Base, .h3Reference] {
+            for r in [PromptRewriter.video(text: "a man raps to camera", format: format, seconds: 15),
+                      PromptRewriter.storyboard(idea: "a man raps to camera", format: format, totalSeconds: 30, shotSeconds: 5...15)] {
+                XCTAssertTrue(r.system.contains("rapped line word for word"), "\(format)")
+                XCTAssertTrue(r.system.contains("else English"), "\(format)")
+                XCTAssertEqual(r.system.contains("<d>[Language]"), format != .ltx, "\(format)")
+            }
+        }
+    }
+
     func testVideoRewriteCapsTheActionAtTheClipLength() {
         for seconds in [2, 8] {
             let r = PromptRewriter.video(text: "a dog runs", format: .ltx, seconds: seconds)
