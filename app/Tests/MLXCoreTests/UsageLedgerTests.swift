@@ -15,6 +15,12 @@ final class UsageLedgerTests: XCTestCase {
         return s
     }
 
+    /// The strip's speed line shows bare numbers; VoiceOver reads them with their unit, or says there is none yet.
+    func testTheSpeedLineIsSpokenWithItsUnit() {
+        XCTAssertEqual(UsageStrip.speedSpoken(decode: 54.24, prefill: 480.4), "Decode 54.2 tokens per second, Prefill 480 tokens per second")
+        XCTAssertEqual(UsageStrip.speedSpoken(decode: nil, prefill: 0), "Decode not measured yet, Prefill not measured yet")
+    }
+
     func testTheFirstSnapshotOnlySetsTheBaseline() {
         // A server already running when the app first looks has a past nobody here can date.
         var ledger = UsageLedger()

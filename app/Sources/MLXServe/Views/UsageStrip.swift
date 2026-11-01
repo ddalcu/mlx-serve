@@ -44,6 +44,15 @@ struct UsageStrip: View {
         load.gpuTemperature.map { "\(load.gpu)% · \(Int($0))°" } ?? "\(load.gpu)%"
     }
 
+    /// VoiceOver's reading of the speed line, whose numbers leave their unit to the tooltip.
+    static func speedSpoken(decode: Double?, prefill: Double?) -> String {
+        func part(_ name: String, _ tps: Double?) -> String {
+            guard let tps, tps > 0 else { return L10n.format("%@ not measured yet", L10n.text(name)) }
+            return L10n.format("%@ %@ tokens per second", L10n.text(name), ThroughputSnapshot.formatTPS(tps))
+        }
+        return part("Decode", decode) + ", " + part("Prefill", prefill)
+    }
+
     private var speedButton: some View {
         Button(action: openDashboard) {
             HStack(spacing: 4) {
@@ -63,6 +72,9 @@ struct UsageStrip: View {
         .padding(.horizontal, -4)
         .onHover { hoveringSpeed = $0 }
         .help(L10n.text("Tokens per second, dimmed when it is the average since the server started. Click to open the usage dashboard."))
+        .accessibilityLabel(Self.speedSpoken(decode: usage.decodeTPS ?? usage.live?.avgDecodeTPS,
+                                             prefill: usage.prefillTPS ?? usage.live?.avgPrefillTPS))
+        .accessibilityHint(L10n.text("Opens the usage dashboard"))
     }
 }
 

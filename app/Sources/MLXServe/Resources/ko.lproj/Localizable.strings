@@ -2406,3 +2406,9 @@
 "Xcode Command Line Tools" = "Xcode 명령줄 도구";
 "no plugin kit for mlx-serve %@: it is not released yet. Put the kit for %@ in ~/.mlx-serve/kit (in an mlx-serve checkout: zig build kit), then install again" = "mlx-serve %@용 플러그인 키트가 없습니다. 아직 릴리스되지 않았습니다. %@용 키트를 ~/.mlx-serve/kit에 두고(mlx-serve 체크아웃에서 zig build kit) 다시 설치하세요";
 "unknown" = "알 수 없음";
+
+/* Usage strip: the speed line */
+"Tokens per second, dimmed when it is the average since the server started. Click to open the usage dashboard." = "초당 토큰 수입니다. 서버 시작 이후 평균값이면 흐리게 표시됩니다. 클릭하면 사용량 대시보드가 열립니다.";
+"%@ not measured yet" = "%@ 아직 측정 안 됨";
+"%@ %@ tokens per second" = "%@ 초당 %@ 토큰";
+"Opens the usage dashboard" = "사용량 대시보드를 엽니다";

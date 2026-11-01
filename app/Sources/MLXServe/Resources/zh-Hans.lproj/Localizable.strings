@@ -2475,3 +2475,8 @@
 "Xcode Command Line Tools" = "Xcode 命令行工具";
 "no plugin kit for mlx-serve %@: it is not released yet. Put the kit for %@ in ~/.mlx-serve/kit (in an mlx-serve checkout: zig build kit), then install again" = "没有 mlx-serve %@ 的插件工具包：该版本尚未发布。把 %@ 的工具包放到 ~/.mlx-serve/kit（在 mlx-serve 源码中运行 zig build kit），然后重新安装";
 "unknown" = "未知";
+
+/* Usage strip: the speed line */
+"%@ not measured yet" = "%@ 尚未测量";
+"%@ %@ tokens per second" = "%@ 每秒 %@ 个 Token";
+"Opens the usage dashboard" = "打开用量面板";
