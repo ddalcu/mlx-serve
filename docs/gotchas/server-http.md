@@ -248,6 +248,12 @@ Defect: shard 1 of a split carries no tensors; ds4 printed to stderr and called 
 and a split goes to llama.cpp (`preferredEngine`); `Ds4Engine.open` refuses one by name. Guard: `preferredEngine: a
 split GGUF goes to llama.cpp`.
 
+### The embedded ds4 sized its SSD-streaming cache for 4096 tokens
+Defect: DeepSeek-V4.1 under `--ssd-streaming` planned a 82.5 GiB expert cache where standalone ds4 planned 75.5 GiB
+at the same ctx. Cause: `Ds4Engine.open` passed no `context_size`, and ds4 plans its cache and V4.1 memory admission
+for 4096 tokens at 0, then the real session allocates on top. Fix: `load.open` takes the session ctx (`context_size`
++ `placement_ctx_hint`). Guard: `ds4 adapter: the engine opens sized for the session's context`.
+
 ### A DeepSeek-V4 GGUF refused to open with default flags
 Defect: every antirez DSV4 GGUF failed without `--no-mtp`. Cause: in-checkpoint MTP armed for any arch declaring
 `nextn_predict_layers`; DSV4 ships its head apart. Fix: `ds4_embedded_mtp_archs`. Guard: the embedded-MTP test,

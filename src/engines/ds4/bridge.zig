@@ -28,6 +28,7 @@ pub const Error = error{
     SplitGgufUnsupported,
     SessionCreateFailed,
     SessionSyncFailed,
+    SyncInterrupted,
     SessionEvalFailed,
     SessionSpecFailed,
     SnapshotFailed,
@@ -239,6 +240,8 @@ pub const OpenOptions = struct {
     ssd_streaming_cache_experts: u32 = 0,
     ssd_streaming_cache_bytes: u64 = 0,
     ssd_streaming_preload_experts: u32 = 0,
+    /// The session ctx the engine will serve; 0 = ds4 plans for 4096.
+    context_size: u32 = 0,
     /// Graph prefill chunk (`--prefill-chunk`); 0 = ds4's default. Its scratch
     /// scales with it, so a small GPU needs a small chunk to stream experts.
     prefill_chunk: u32 = 0,
@@ -330,6 +333,8 @@ pub const Ds4Engine = struct {
             .ssd_streaming_cache_bytes = opts.ssd_streaming_cache_bytes,
             .ssd_streaming_preload_experts = opts.ssd_streaming_preload_experts,
             .prefill_chunk = opts.prefill_chunk,
+            .context_size = @intCast(opts.context_size),
+            .placement_ctx_hint = @intCast(opts.context_size),
         };
 
         var raw: ?*ffi.Engine = null;
@@ -541,15 +546,24 @@ pub const Ds4Session = struct {
 
     /// Sync the live session to a full prompt prefix. Reuses common prefix
     /// against the live KV cache; otherwise rebuilds from scratch.
-    pub fn sync(self: *Ds4Session, prompt_ids: []const i32) Error!void {
+    /// `cancel`, when raised, interrupts the prefill at ds4's next poll (`SyncInterrupted`).
+    pub fn sync(self: *Ds4Session, prompt_ids: []const i32, cancel: ?*std.atomic.Value(bool)) Error!void {
         var holder = try TokenHolder.init(self.allocator, prompt_ids);
         defer holder.deinit();
         var err_buf: [256]u8 = undefined;
+        ffi.ds4_session_set_cancel(self.handle, if (cancel != null) cancelRaised else null, cancel);
+        defer ffi.ds4_session_set_cancel(self.handle, null, null);
         const rc = ffi.ds4_session_sync(self.handle, &holder.tv, &err_buf, err_buf.len);
+        if (rc == ffi.session_sync_interrupted) return Error.SyncInterrupted;
         if (rc != 0) {
             log.err("[ds4] session_sync rc={d} err={s}\n", .{ rc, std.mem.sliceTo(&err_buf, 0) });
             return Error.SessionSyncFailed;
         }
+    }
+
+    fn cancelRaised(ud: ?*anyopaque) callconv(.c) bool {
+        const flag: *std.atomic.Value(bool) = @ptrCast(@alignCast(ud.?));
+        return flag.load(.acquire);
     }
 
     pub fn commonPrefix(self: *Ds4Session, prompt_ids: []const i32) Error!i32 {

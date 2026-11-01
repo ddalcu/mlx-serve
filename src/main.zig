@@ -1674,6 +1674,7 @@ pub fn main(init: std.process.Init) !void {
             .llama = server_mod.llama_settings,
             .ds4_mtp = ds4_mtp,
             .ds4_dspark = ds4_dspark,
+            .ds4_ssd_streaming = ds4_ssd_streaming,
             .metrics = server_mod.g_metrics,
         };
         try server_mod.serve(io, allocator, params, config, host, port, .{
@@ -1818,6 +1819,7 @@ fn runGenServe(
         .tokenize_cache_entries = 0,
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
+        .ds4_ssd_streaming = ds4_ssd_streaming,
         .ane_prefill = ane_prefill,
         .ane = ane_serve,
         .ane_slots = ane_slots,
@@ -1966,6 +1968,7 @@ fn runHeadlessServe(
         // --no-ds4-mtp / --dspark for every embedded-engine load.
         .ds4_mtp = ds4_mtp,
         .ds4_dspark = ds4_dspark,
+        .ds4_ssd_streaming = ds4_ssd_streaming,
         .ane_prefill = ane_prefill,
         .ane = ane_serve,
         .ane_slots = ane_slots,
