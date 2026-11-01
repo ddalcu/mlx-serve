@@ -6,6 +6,7 @@ float acc[ROWS] = {0.0f};
 for (int e = 0; e < TOPK; ++e) {
   const size_t row = size_t(inds[e]) * H + row0;
   const device uint2* dw = (const device uint2*)wd_q + row * KW2 + lane;
+  const device ushort* dw3 = (const device ushort*)wd_q + (row * KW2 + lane) * 3;
   const float sc = float(scores[e]);
   for (int k = 0; k < I; k += 512) {
     const int kk = k + int(lane) * 16;
@@ -16,7 +17,8 @@ for (int e = 0; e < TOPK; ++e) {
       const int gi = kk / GS;
       for (int r = 0; r < ROWS; ++r) {
         const size_t sg = (row + r) * KG + gi;
-        acc[r] += sc * (float(d_scales[sg]) * mlxserve_a4_dot16(dw[r * KW2 + k / 16], xr) + float(d_biases[sg]) * xs);
+        const float dd = BITS == 3 ? mlxserve_a3_dot16(dw3 + (r * KW2 + k / 16) * 3, xr) : mlxserve_a4_dot16(dw[r * KW2 + k / 16], xr);
+        acc[r] += sc * (float(d_scales[sg]) * dd + float(d_biases[sg]) * xs);
       }
     }
   }
@@ -25,6 +27,7 @@ if (SI > 0) {
   constexpr int SW2 = SI / 16;
   constexpr int SG = SI / GS;
   const device uint2* sw = (const device uint2*)sd_q + size_t(row0) * SW2 + lane;
+  const device ushort* sw3 = (const device ushort*)sd_q + (size_t(row0) * SW2 + lane) * 3;
   for (int k = 0; k < SI; k += 512) {
     const int kk = k + int(lane) * 16;
     if (kk < SI) {
@@ -34,7 +37,8 @@ if (SI > 0) {
       const int gi = kk / GS;
       for (int r = 0; r < ROWS; ++r) {
         const size_t sg = size_t(row0 + r) * SG + gi;
-        acc[r] += float(sd_scales[sg]) * mlxserve_a4_dot16(sw[r * SW2 + k / 16], xr) + float(sd_biases[sg]) * xs;
+        const float sd = BITS == 3 ? mlxserve_a3_dot16(sw3 + (r * SW2 + k / 16) * 3, xr) : mlxserve_a4_dot16(sw[r * SW2 + k / 16], xr);
+        acc[r] += float(sd_scales[sg]) * sd + float(sd_biases[sg]) * xs;
       }
     }
   }

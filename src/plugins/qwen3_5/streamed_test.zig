@@ -197,6 +197,11 @@ test "qwen3_5 streamed: 4-bit experts streamed from the pack (3 of 64 slot rows 
     try parity(64, 4, 3, 0x57e1);
 }
 
+test "qwen3_5 streamed: 3-bit experts streamed from the pack (3 of 64 slot rows a layer) give the resident's logits bit for bit" {
+    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    try parity(64, 3, 3, 0x57e3);
+}
+
 test "qwen3_5 streamed: 8-bit experts streamed from the pack (every one of 256 in slot rows) give the resident's logits bit for bit" {
     if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
     try parity(256, 8, null, 0x57e2);

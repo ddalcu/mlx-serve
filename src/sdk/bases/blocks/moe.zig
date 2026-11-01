@@ -285,7 +285,7 @@ fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_d
     var out: Array = undefined;
     var reduced = false;
     var shared_fused = false;
-    const ungated_a4: ?moe_affine4.Ungated = if (B * S != 1) null else ungatedA4(w, gq.group_size);
+    const ungated_a4: ?moe_affine4.Ungated = if (B * S != 1) null else ungatedA4(w, gq.bits, gq.group_size);
     const fp4_shared: ?moe_affine4.Shared = if (B * S == 1) if (shared_down) |sd| .{ .down = sd, .logit = r.gate_logit.? } else null else null;
     const cuda_fmt = if (mlx.cudaAvailable()) gather_qmv_rows.moeCudaFormat(B * S, gq.mode, uq.mode, dq.mode, true, false, w.up.expert_scale.ctx != null, w.clamp_limit > 0) else null;
     if (w.format_banks) |fb| {
@@ -302,7 +302,7 @@ fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_d
         reduced = true;
         shared_fused = fp4_shared != null;
     } else if (B * S == 1 and (w.clamp orelse 1) == 0 and gq.mode == .affine and uq.mode == .affine and dq.mode == .affine and
-        gq.bits == 4 and uq.bits == 4 and dq.bits == 4 and gq.group_size == uq.group_size and gq.group_size == dq.group_size and
+        (gq.bits == 3 or gq.bits == 4) and gq.bits == uq.bits and gq.bits == dq.bits and gq.group_size == uq.group_size and gq.group_size == dq.group_size and
         try affine4Decode(w, g, &out, x, r, if (shared_down) |sd| .{ .down = sd, .logit = r.gate_logit.? } else null, ungated_a4))
     {
         reduced = true;
@@ -350,12 +350,13 @@ fn sharedDown(w: *const Moe.Weights, parent: *Graph, se: *const SharedExpert, x:
     return parent.keep(try se.down.forward(g, try geglu(w, g, try se.gate.forward(g, x), try se.up.forward(g, x))));
 }
 
-/// An ungated shared expert the affine-4 kernels carry: 4-bit affine at the routed group size.
-fn ungatedA4(w: *const Moe.Weights, group_size: u32) ?moe_affine4.Ungated {
+/// An ungated shared expert the affine-4 kernels carry: 3- or 4-bit affine at the routed bit-width and group size.
+fn ungatedA4(w: *const Moe.Weights, bits: u32, group_size: u32) ?moe_affine4.Ungated {
+    if (bits != 3 and bits != 4) return null;
     const se = w.shared orelse return null;
     if (se.gated() or se.gate.s.ctx == null) return null;
     for ([_]*const Linear{ &se.gate, &se.up, &se.down }) |l| {
-        if (l.mode != .affine or l.bits != 4 or l.group_size != group_size) return null;
+        if (l.mode != .affine or l.bits != bits or l.group_size != group_size) return null;
     }
     return .{
         .gate = .{ .w = se.gate.w, .s = se.gate.s, .b = se.gate.b },

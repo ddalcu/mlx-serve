@@ -99,14 +99,14 @@ pub fn moeSharedGateTail(self: *Transformer, expert_sum: mlx.mlx_array, gate_log
     return result;
 }
 
-/// An ungated shared expert the affine-4 decode kernels can carry: 4-bit affine at the routed group size.
-pub fn ungatedSharedA4(self: *Transformer, mw: *const MoeMlpWeights, group_size: u32) ?moe_affine4.Ungated {
-    if (!mw.shared_ungated or mw.shared_gate_w.ctx == null or mw.shared_gate_s.ctx == null) return null;
+/// An ungated shared expert the affine-4 decode kernels can carry: 3- or 4-bit affine at the routed bit-width and group size.
+pub fn ungatedSharedA4(self: *Transformer, mw: *const MoeMlpWeights, bits: u32, group_size: u32) ?moe_affine4.Ungated {
+    if ((bits != 3 and bits != 4) or !mw.shared_ungated or mw.shared_gate_w.ctx == null or mw.shared_gate_s.ctx == null) return null;
     const hidden: u32 = self.config.hidden_size;
     const inter: ?u32 = if (self.config.shared_expert_intermediate_size > 0) self.config.shared_expert_intermediate_size else null;
     inline for (.{ .{ mw.shared_gate_w, mw.shared_gate_s, hidden }, .{ mw.shared_up_w, mw.shared_up_s, hidden }, .{ mw.shared_down_w, mw.shared_down_s, inter } }) |t| {
         const qp = self.quantParamsHinted(t[0], t[1], t[2]);
-        if (qp.mode != .affine or qp.bits != 4 or qp.group_size != group_size) return null;
+        if (qp.mode != .affine or qp.bits != bits or qp.group_size != group_size) return null;
     }
     return .{
         .gate = .{ .w = mw.shared_gate_w, .s = mw.shared_gate_s, .b = mw.shared_gate_b },
@@ -364,7 +364,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
     var cost_arm: u8 = 4;
 
     const cuda_fmt = if (mlx.cudaAvailable()) moeCudaFormat(B * S, gate_qp.mode, up_qp.mode, down_qp.mode, cfg.hidden_act == .silu, false, mw.up_expert_scale.ctx != null, cfg.swiglu_clamp or cfg.swiglu_limit > 0.0) else null;
-    const ungated_a4: ?moe_affine4.Ungated = if (skip_shared or B * S != 1) null else self.ungatedSharedA4(mw, gate_qp.group_size);
+    const ungated_a4: ?moe_affine4.Ungated = if (skip_shared or B * S != 1) null else self.ungatedSharedA4(mw, gate_qp.bits, gate_qp.group_size);
     const fp4_shared: ?moe_affine4.Shared = if (B * S == 1) if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null else null;
     if (moeFp4DecodeEligible(B * S, false, swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp), mlx.mlx_array_dtype(expert_x), gate_qp.mode, up_qp.mode, down_qp.mode) and
         try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.mode, gate_qp.group_size, fp4_shared))
@@ -374,7 +374,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         cost_arm = 1;
     } else if (B * S == 1 and (swigluClampLimit(self.config.swiglu_limit, self.config.swiglu_clamp) orelse 1) == 0 and cfg.hidden_act == .silu and
         gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
-        gate_qp.bits == 4 and up_qp.bits == 4 and down_qp.bits == 4 and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
+        (gate_qp.bits == 3 or gate_qp.bits == 4) and gate_qp.bits == up_qp.bits and gate_qp.bits == down_qp.bits and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
         try self.moeAffine4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size, if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null, ungated_a4))
     {
         moe_reduced = true;
