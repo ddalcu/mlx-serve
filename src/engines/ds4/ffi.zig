@@ -4,8 +4,6 @@
 // wrapper that owns lifetimes, errors, and Metal-kernel extraction lives in
 // `src/engines/ds4/bridge.zig`. Keeping this layer mechanical means an upstream `ds4.h`
 // drift shows up as a Zig compile error here rather than in the bridge.
-//
-// Submodule pin: lib/ds4 @ 9139e2a.
 
 const std = @import("std");
 
@@ -74,7 +72,7 @@ pub const DistributedOptions = extern struct {
     debug: bool = false,
 };
 
-// Two-machine tensor parallelism (pin 9139e2a). Never enabled by mlx-serve —
+// Two-machine tensor parallelism. Never enabled by mlx-serve —
 // mirrored only because ds4_engine_options embeds it by value.
 pub const TpRole = enum(c_int) {
     none = 0,

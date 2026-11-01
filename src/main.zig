@@ -748,7 +748,7 @@ pub fn main(init: std.process.Init) !void {
                 .ggml_commit = ggmlEngineCommit(),
                 .llama_tag = build_options.llama_tag,
                 .gguf_format = GGUF_FORMAT_VERSION,
-                .ds4_commit = build_options.ds4_commit,
+                .ds4_commit = @import("ds4_pin").commit,
             };
             var ver_buf: [512]u8 = undefined;
             var ver_w = std.Io.File.stdout().writer(io, &ver_buf);

@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const libs = @import("libs.zig");
+const config = @import("config.zig");
 
 /// `ios-lib`, `ios-lib-sim`.
 pub fn add(b: *std.Build, version: []const u8, brew_prefix: []const u8) void {
@@ -45,7 +46,6 @@ fn addLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice: Sl
     ios_options.addOption(bool, "mlx_stream", false);
     ios_options.addOption(bool, "plugin_profile", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
-    ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
     ios_options.addOption([]const u8, "git_sha", "");
 
@@ -58,6 +58,7 @@ fn addLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice: Sl
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = ios_options.createModule() },
+            .{ .name = "ds4_pin", .module = config.ds4PinModule(b, "unknown") },
             .{ .name = "mlx_steel_sources", .module = embedded.mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = embedded.opencode2_plugin },
             .{ .name = "agent_skills", .module = embedded.agent_skills },
