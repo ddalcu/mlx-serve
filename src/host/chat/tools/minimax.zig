@@ -8,6 +8,25 @@ pub const MINIMAX_NAMESPACE = "]<]minimax[>[";
 const MINIMAX_INVOKE = MINIMAX_NAMESPACE ++ "<invoke";
 const MINIMAX_INVOKE_CLOSE = MINIMAX_NAMESPACE ++ "</invoke>";
 
+/// The first namespace that opens a tag (or ends the text, a cut-off envelope): the namespace alone is prose.
+pub fn miniMaxMarkupStart(text: []const u8) ?usize {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, MINIMAX_NAMESPACE)) |p| {
+        const after = p + MINIMAX_NAMESPACE.len;
+        if (after == text.len or text[after] == '<') return p;
+        pos = after;
+    }
+    return null;
+}
+
+/// While streaming: a namespace tag, or a growing lead-in of one at the end, holds the text back.
+pub fn miniMaxMarkupHolds(buf: []const u8) bool {
+    if (miniMaxMarkupStart(buf) != null) return true;
+    const opener = MINIMAX_NAMESPACE ++ "<";
+    for (1..opener.len) |n| if (std.mem.endsWith(u8, buf, opener[0..n])) return true;
+    return false;
+}
+
 /// Native MiniMax XML marks every structural tag with its namespace, leaving
 /// markup in string argument values untouched. Schema coercion types leaves.
 pub fn parseMiniMaxToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {

@@ -9,7 +9,7 @@ const inklingIsNameChar = @import("inkling.zig").inklingIsNameChar;
 const BARE_INVOKE = @import("invoke.zig").BARE_INVOKE;
 const FUNCTION_CALLS_TAG = @import("invoke.zig").FUNCTION_CALLS_TAG;
 const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
-const MINIMAX_NAMESPACE = @import("minimax.zig").MINIMAX_NAMESPACE;
+const miniMaxMarkupStart = @import("minimax.zig").miniMaxMarkupStart;
 
 /// Tool-call WRAPPER openers (and DSML's closer, which no prose spells) that must never survive into text a client
 /// renders. Every entry is the opening marker of a call block, so whatever
@@ -20,7 +20,6 @@ const MINIMAX_NAMESPACE = @import("minimax.zig").MINIMAX_NAMESPACE;
 /// skips). The whole tail is cut rather than excised: a wrapper we could not
 /// parse has no reliable end, and shipping half of it is the same leak.
 const tool_markup_openers = [_][]const u8{
-    MINIMAX_NAMESPACE, // MiniMax native: prefixes every structural tag
     "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
     "</｜DSML｜", // its closers, once the opener is gone (a call lost to the think split or never written)
     "<|tool_call", // Gemma 4
@@ -118,6 +117,13 @@ pub fn toolMarkupStart(text: []const u8) ?usize {
         }
     }
     if (bareInvokeMarkupCut(text)) |p| {
+        if (p < cut) {
+            cut = p;
+            is_inkling = false;
+        }
+    }
+    // MiniMax: its namespace prefixes every structural tag, but alone it is prose.
+    if (miniMaxMarkupStart(text)) |p| {
         if (p < cut) {
             cut = p;
             is_inkling = false;
@@ -274,4 +280,7 @@ test "minicpm5 COMBINED: parser and scrubber agree on the same bytes" {
 
 test "MiniMax native incomplete markup is not visible content" {
     try testing.expectEqualStrings("Run this.", trimLeakedToolMarkup("Run this.]<]minimax[>[<invoke name=\"shell\">unfinished"));
+    try testing.expectEqualStrings("Run this.", trimLeakedToolMarkup("Run this.]<]minimax[>["));
+    const prose = "The marker is ]<]minimax[>[, spelled out.";
+    try testing.expectEqualStrings(prose, trimLeakedToolMarkup(prose));
 }

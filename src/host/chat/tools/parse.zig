@@ -33,12 +33,13 @@ const parseHermesToolCall = @import("hermes.zig").parseHermesToolCall;
 const parseMiniCpm5ToolCalls = @import("minicpm5.zig").parseMiniCpm5ToolCalls;
 const MINIMAX_NAMESPACE = @import("minimax.zig").MINIMAX_NAMESPACE;
 const parseMiniMaxToolCalls = @import("minimax.zig").parseMiniMaxToolCalls;
+const miniMaxMarkupStart = @import("minimax.zig").miniMaxMarkupStart;
 const toolMarkupStart = @import("markup_trim.zig").toolMarkupStart;
 
 /// MiniMax owns the text only when its namespace opens the first tool envelope:
 /// inside a JSON or `<function=` call it is that call's argument payload.
 fn miniMaxOwnsSyntax(text: []const u8) bool {
-    const native = std.mem.indexOf(u8, text, MINIMAX_NAMESPACE) orelse return false;
+    const native = miniMaxMarkupStart(text) orelse return false;
     const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
     if (std.mem.startsWith(u8, trimmed, "{") or std.mem.startsWith(u8, trimmed, "[")) return false;
     if (std.mem.indexOf(u8, text[0..native], "<function=") != null) return false;
@@ -71,7 +72,11 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             if (tryParseJsonToolCall(allocator, trimmed)) |call| {
                 var tc = call;
                 tc.inferred = true;
-                try calls.append(allocator, tc);
+                calls.append(allocator, tc) catch |e| {
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                    return e;
+                };
                 return try calls.toOwnedSlice(allocator);
             }
         } else if (std.mem.startsWith(u8, trimmed, "[")) {
@@ -1454,6 +1459,46 @@ test "MiniMax native namespaced calls preserve nested values and XML strings" {
     try testing.expectEqualStrings("echo '<tag>x</tag>'", parsed.value.object.get("command").?.string);
     try testing.expectEqualStrings("/tmp", parsed.value.object.get("options").?.object.get("cwd").?.string);
     try testing.expectEqualStrings("b", parsed.value.object.get("args").?.array.items[1].string);
+}
+
+test "MiniMax namespace alone is prose; a namespaced tag after it still opens the call" {
+    const ns = "]<]minimax[>[";
+    try testing.expect((try parseToolCalls(testing.allocator, "The marker is " ++ ns ++ ", spelled out.")) == null);
+    const text = "The marker is " ++ ns ++ ".\n" ++ ns ++ "<invoke name=\"shell\">" ++ ns ++ "<command>ls" ++ ns ++ "</command>" ++ ns ++ "</invoke>";
+    const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedNativeCall;
+    defer @import("dsml.zig").freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+}
+
+test "MiniMax native values are raw text, as the template's to_xml writes them (no entity decoding)" {
+    const ns = "]<]minimax[>[";
+    const value = "a &lt; b && c > d &amp;";
+    const text = ns ++ "<invoke name=\"shell\">" ++ ns ++ "<command>" ++ value ++ ns ++ "</command>" ++ ns ++ "</invoke>";
+    const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedNativeCall;
+    defer @import("dsml.zig").freeParsedCalls(calls);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(value, parsed.value.object.get("command").?.string);
+}
+
+test "a JSON call that carries the MiniMax namespace leaks nothing when any allocation fails" {
+    const text = "{\"name\":\"shell\",\"arguments\":{\"command\":\"]<]minimax[>[\"}}";
+    // The repairs swallow their own failures, so every outcome is allowed; only a leaked byte fails.
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const a = failing.allocator();
+        if (parseToolCalls(a, text)) |result| {
+            if (result) |calls| {
+                for (calls) |tc| {
+                    a.free(tc.name);
+                    a.free(tc.arguments);
+                }
+                a.free(calls);
+            }
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
 }
 
 test "MiniMax native incomplete arguments never execute" {
