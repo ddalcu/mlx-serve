@@ -47,6 +47,8 @@ pub const Set = struct {
     }
 
     /// Whether `presented` is the key: sha256 digests compared in constant time, so neither length nor content leaks.
+    /// Both sides are trimmed on purpose: a header value excludes surrounding whitespace (RFC 9110 section 5.5) and the
+    /// key file's trailing newline is dropped at load, so `key` and `key\n` are one key (docs/api.md says so).
     pub fn keyMatches(self: *const Set, presented: []const u8) bool {
         var d: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(trim(presented), &d, .{});
