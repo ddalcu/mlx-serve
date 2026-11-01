@@ -275,7 +275,7 @@ private struct PluginPage: View {
 
     private var packList: some View {
         PluginSection(title: "Packs it serves") {
-            ForEach(packs, id: \.text) { pack in
+            ForEach(packs) { pack in
                 HStack(alignment: .center, spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(pack.text).font(.app(.rowTitle))

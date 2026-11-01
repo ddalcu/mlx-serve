@@ -43,6 +43,13 @@ final class PluginListingTests: XCTestCase {
         XCTAssertEqual(PluginListing.packs(turbo).last?.text, "bare text (not a repo)")
     }
 
+    func testPacksSharingADescriptionStillGetOneIdEach() {
+        let exl3 = PluginCatalog.Entry(name: "turboexl3_qwen38", kind: "model", version: "0.1.0", models: [
+            "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-EXL3-2.05-mlx-serve)",
+            "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-EXL3-3.05-mlx-serve)"])
+        XCTAssertEqual(Set(PluginListing.packs(exl3).map(\.id)).count, 2, "a list keyed on the description draws the first pack for every row")
+    }
+
     func testSelectionStaysOnAListedPluginAndFallsBackToTheFirst() {
         let lists = PluginListing.items(receipts: [receipt("sushi_ds41", "0.2.0")], catalog: [sushi, turbo])
         XCTAssertEqual(PluginListing.resolve(.plugin("turboexl3_qwen38"), lists), .plugin("turboexl3_qwen38"))
