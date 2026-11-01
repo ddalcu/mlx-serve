@@ -74,6 +74,9 @@ pub const Slot = struct {
     /// Hot-cache entry this request restored from (`LookupResult.entry_id`).
     restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
+    /// What the request changes about the model's state (`ModuleBinding.variant`; a directional ablation's key): a
+    /// module-owned cache keys its entries by it, the KV prefix cache is neither read nor written.
+    cache_variant: u64 = 0,
     /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
     /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
     boundary_max_tail: ?usize = null,
@@ -369,6 +372,7 @@ pub const Slot = struct {
             .prompt_logprobs = params.prompt_logprobs,
             .prompt_logprobs_buf = .empty,
             .skip_prefix_cache = params.prompt_logprobs,
+            .cache_variant = if (params.ablation) |a| a.key else 0,
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the
@@ -385,6 +389,7 @@ pub const Slot = struct {
             .mrope_delta = slot.mrope_delta,
             .capture_hidden = null,
             .kv_attn_fused = params.kv_attn_fused,
+            .ablation = params.ablation,
         };
 
         return slot;

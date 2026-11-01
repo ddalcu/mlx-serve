@@ -1,6 +1,7 @@
 //! extractResponseId, extractCompletedStatus; get/delete/compact, handleResponsesInner
 
 const std = @import("std");
+const ablation = @import("../ablation.zig");
 const schema_check = @import("../schema_check.zig");
 const request_mod = @import("../../../sdk/request/request.zig");
 const chat_mod = @import("../../chat/chat.zig");
@@ -361,6 +362,10 @@ fn handleResponsesInner(
         return;
     }
     const root = parsed.value.object;
+    if (ablation.refuseOnSurface(root)) |r| {
+        try sendErrorResponse(allocator, stream, r.status, "invalid_request_error", r.msg, r.code);
+        return;
+    }
 
     // ── input (required) ──
     const input_val = root.get("input") orelse {

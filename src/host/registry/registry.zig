@@ -166,6 +166,10 @@ pub const LoadedModel = struct {
     /// `path` with symlinks resolved, so a request naming the same directory
     /// another way finds this entry (`peekByPath`). Empty when it does not resolve.
     real_path: []const u8 = "",
+    /// Hex sha256 of this load's `config.json` for the ablation profile check (`api/ablation.zig` `modelDigest`): taken
+    /// once, by the first ablated request. `config_digest_state` 0 = not taken, 1 = being taken, 2 = ready.
+    config_digest: [64]u8 = undefined,
+    config_digest_state: std.atomic.Value(u8) = .init(0),
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,

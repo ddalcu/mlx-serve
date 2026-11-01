@@ -18,6 +18,28 @@ curl http://localhost:11234/v1/chat/completions \
 
 Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `stream_options`, `tools`, `response_format`, `repetition_penalty`, `presence_penalty`, `logprobs` / `top_logprobs`, `reasoning_effort` / `enable_thinking` / `reasoning_budget_tokens`, plus per-request `kv_quant` and `kv_attn_mode` overrides. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models. Usage always carries `prompt_tokens_details.cached_tokens`, and a reply cut short because the model went in circles reports `finish_details: {"type": "repetition_loop"}` beside `finish_reason`.
 
+### Directional ablation
+
+With `--ablation-profiles <dir>` and `--ablation-key-file <path>`, `/v1/chat/completions` and `/v1/completions` take
+`"ablation": {"profile": "<name>", "strength": 0.0-1.0}` (strength defaults to 1) with the key in the
+`X-Ablation-Key` header. The model removes the profile's direction from everything it writes to its residual stream,
+for that request only (Arditi et al. 2024, "Refusal in Language Models Is Mediated by a Single Direction"). The
+response carries `X-Ablation: profile=<name>; strength=<s>; hash=<hex>`. A missing or wrong key is a 401; an unknown,
+refused or mismatched profile, a strength outside [0, 1], an unknown field, a model whose plugin does not declare
+`Caps.ablation`, or the field on `/v1/messages`, `/v1/responses` (its WebSocket included), the Ollama routes or a
+`<id>@<provider>` / `<id>@<peer>` proxied model is a named 400. Other endpoints (embeddings, audio, media generation,
+`/v1/models`) do not read the field and ignore it: the `X-Ablation` response header is the only confirmation that a
+request ran ablated. Requests without the field run unchanged. The key is compared after trimming surrounding
+whitespace on both sides (header values exclude it per RFC 9110, and the key file's trailing newline is dropped).
+Browsers may send `X-Ablation-Key` cross-origin (it is in `Access-Control-Allow-Headers`) and read `X-Ablation`
+(`Access-Control-Expose-Headers`).
+
+A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"version": 1`, `hidden_size`,
+`base_config_sha256`: sha256 of the base pack's exact `config.json` bytes) and `direction.safetensors` (one tensor
+`direction`, `[hidden]`, F32/F16/BF16, normalized at load). Make the key with `openssl rand -hex 32 > key && chmod 600 key`, and expose the server only over TLS (Tailscale Serve) or
+loopback: the header is a bearer secret. A module-owned model's prefix cache keys its entries by
+the request's profile and strength, so an ablated conversation reuses its own prefix and nothing else's.
+
 ## POST /v1/messages (Anthropic)
 
 ```bash

@@ -491,6 +491,74 @@ test "plugin forward: a prompt forward hands the plugin the host's prefill count
     try testing.expect(!T.saw_progress);
 }
 
+test "plugin forward: an ablated request hands every forward and draft round its direction, a plain one none, a plugin without the cap refuses" {
+    const T = struct {
+        var seen: ?struct { rows: c_int, cols: c_int, strength: f32, key: u64, first: f32 } = null;
+        var calls: u32 = 0;
+        fn note(f: *const abi.Forward) void {
+            calls += 1;
+            const a = f.ablation orelse {
+                seen = null;
+                return;
+            };
+            const d: Array = .{ .ctx = a.directions.ctx };
+            _ = mlx.mlx_array_eval(d);
+            const sh = ops.shape(d);
+            seen = .{ .rows = sh[0], .cols = sh[1], .strength = a.strengths.slice()[0], .key = a.keys.slice()[0], .first = mlx.mlx_array_data_float32(d).?[0] };
+        }
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            note(f);
+            return llama.table.forward(m, f, out);
+        }
+        fn step(_: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            note(f);
+            out.round = .{ .n = 1, .rows = 1, .position = f.positions.slice()[0] + 1 };
+            out.round.tokens[0] = f.tokens.slice()[0];
+            return .ok;
+        }
+        const drafter: abi.NativeDrafter = .{ .step = &step };
+        const spec: abi.SpecHooks = .{ .native_drafter = &drafter };
+        const table: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.forward = &forward;
+            t.spec = &spec;
+            break :blk t;
+        };
+    };
+    var b: Served = undefined;
+    try b.open(.{}, 0xab1a);
+    defer b.close();
+    b.xfm.plugin.?.table = &T.table;
+    var s: Slot = undefined;
+    try s.init(b.layers);
+    defer s.deinit();
+    const hidden: usize = @intCast(b.xfm.config.hidden_size);
+    const dir = try testing.allocator.alloc(f32, hidden);
+    defer testing.allocator.free(dir);
+    @memset(dir, 0);
+    dir[0] = 1;
+    var g = ops.Graph.init(testing.allocator, fixture.stream());
+    defer g.deinit();
+    s.ctx.ablation = .{ .direction = dir, .strength = 0.5, .key = 0x5eed };
+    // The served plugin has not declared `Caps.ablation`: the host refuses rather than run it unablated.
+    try testing.expectError(error.PluginForwardUnsupported, b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9 })));
+    try testing.expectEqual(@as(u32, 0), T.calls);
+    b.xfm.config.plugin.?.parsed.caps.ablation = true;
+    _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9 })));
+    const seen = T.seen orelse return error.TestExpectedAblation;
+    try testing.expectEqual(@as(c_int, 1), seen.rows);
+    try testing.expectEqual(@as(c_int, @intCast(hidden)), seen.cols);
+    try testing.expectEqual(@as(f32, 0.5), seen.strength);
+    try testing.expectEqual(@as(u64, 0x5eed), seen.key);
+    try testing.expectEqual(@as(f32, 1), seen.first);
+    T.seen = null;
+    _ = try driver.nativeRound(&b.xfm, &s.ctx, 9, 4);
+    try testing.expect(T.seen != null);
+    s.ctx.ablation = null;
+    _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{10})));
+    try testing.expect(T.seen == null);
+}
+
 test "plugin caps: module decode state, readonly sharing, spec rollback, whole-prompt prefill and the prefix cache read the served caps" {
     var b: Served = undefined;
     try b.open(.{}, 0xca95);

@@ -72,6 +72,7 @@ const loginPageHtml = @import("auth.zig").loginPageHtml;
 const sendUnauthorized = @import("auth.zig").sendUnauthorized;
 const sendEnsureLoadedError = @import("errors.zig").sendEnsureLoadedError;
 const sendErrorResponse = @import("errors.zig").sendErrorResponse;
+const ablation = @import("../api/ablation.zig");
 const sendAnthropicError = @import("../api/anthropic.zig").sendAnthropicError;
 const handleAnthropicMessages = @import("../api/anthropic.zig").handleAnthropicMessages;
 const handleResponsesGet = @import("../api/responses/handler.zig").handleResponsesGet;
@@ -193,6 +194,8 @@ pub fn handleConnection(
     };
     const raw = (try readRequest(allocator, stream)) orelse return;
     defer allocator.free(raw.buf);
+    // The request's ablation key points into `raw.buf`.
+    defer stream.clearAblation();
     const total_read = raw.len;
     const header_end_pos = raw.header_end;
     const request = raw.buf[0..total_read];
@@ -458,12 +461,14 @@ pub fn handleConnection(
     if (http_server.g_providers) |prov| if (lan_mod.splitRemoteId(requested_model_id)) |rid| if (prov.isProvider(rid.peer) and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
+        if (try refuseProxiedAblation(allocator, stream, request_body)) return;
         try handleProviderProxy(allocator, stream, prov, path, request_body, body_model, requested_model_id);
         return;
     };
     if (http_server.g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
         !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
+        if (try refuseProxiedAblation(allocator, stream, request_body)) return;
         try handleLanProxy(allocator, stream, http_server.g_lan.?, method, raw_path, request_body, body_model, requested_model_id);
         return;
     }
@@ -773,6 +778,13 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 
 // ── tests ──
 
+/// A body that asks for directional ablation never leaves the server: a provider or a LAN peer would run it unablated.
+fn refuseProxiedAblation(allocator: std.mem.Allocator, stream: *Conn, body: []const u8) !bool {
+    if (!ablation.bodyNamesAblation(allocator, body)) return false;
+    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", ablation.proxied_refusal, 400);
+    return true;
+}
+
 test "routeExists answers endpoint existence without consulting the model" {
     // Whether a path EXISTS has nothing to do with which models are loaded, but
     // model resolution runs ahead of dispatch — so on a headless boot (`--serve
@@ -892,4 +904,23 @@ test "the 413 names both counts it compared" {
     const msg = payloadTooLargeMessage(&buf, 97 * 1024 * 1024 + 1, 64 * 1024 * 1024);
     try std.testing.expect(std.mem.indexOf(u8, msg, "98 MB") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "64 MB") != null);
+}
+
+test "a <id>@<provider> or <id>@<peer> body that asks for ablation is refused before any proxy sees it" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    defer _ = std.c.close(sv[1]);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, io);
+    defer _ = std.c.close(sv[0]);
+    const a = std.testing.allocator;
+    try std.testing.expect(!try refuseProxiedAblation(a, &conn, "{\"model\":\"m@cloud\",\"messages\":[]}"));
+    try std.testing.expect(try refuseProxiedAblation(a, &conn, "{\"model\":\"m@cloud\",\"messages\":[],\"ablation\":{\"profile\":\"p\"}}"));
+    var buf: [1024]u8 = undefined;
+    const n = std.c.recv(sv[1], &buf, buf.len, 0);
+    try std.testing.expect(n > 0);
+    const got = buf[0..@intCast(n)];
+    try std.testing.expect(std.mem.startsWith(u8, got, "HTTP/1.1 400"));
+    try std.testing.expect(std.mem.indexOf(u8, got, "not forwarded to a provider") != null);
 }

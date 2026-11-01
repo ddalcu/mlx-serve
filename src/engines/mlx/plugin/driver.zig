@@ -353,6 +353,7 @@ pub fn unbind(b: *Bound, a: std.mem.Allocator) void {
 /// The first `ForwardCtx` field a served forward has no hook for; null when it serves them all.
 fn unservedFeature(xfm: *const Transformer, ctx: *const ForwardCtx) ?[]const u8 {
     if (ctx.stream_in != null) return "a pipeline rank's stream input";
+    if (ctx.ablation != null and !(if (xfm.config.plugin) |pb| pb.parsed.caps.ablation else false)) return "directional ablation";
     if (ctx.prefill_mask_add != null and !(if (xfm.config.plugin) |pb| pb.parsed.caps.prefill_mask else false)) return "an additive prefill mask";
     if (ctx.tree != null and !(if (xfm.config.plugin) |pb| pb.parsed.caps.spec_tree else false)) return "a draft tree";
     if (ctx.key_pad_mask != null and !xfm.embedding_mode) return "a key padding mask";
@@ -413,6 +414,59 @@ fn freeOut(out: *const abi.ForwardOut, captured: []const abi.Array) void {
     };
 }
 
+/// A draft round never runs a feature the served plugin lacks: its forwards skip `unservedFeature`.
+fn roundServes(xfm: *const Transformer, b: *Bound, ctx: *const ForwardCtx) !void {
+    if (unservedFeature(xfm, ctx)) |what| {
+        log.err("[plugin] {s}: {s} is not served on the plugin path yet\n", .{ b.table.name.slice(), what });
+        return error.PluginForwardUnsupported;
+    }
+}
+
+/// What an ablated forward hands the plugin (`abi.Forward.ablation`): a direction row, strength and key per slot; a
+/// slot without one gets a zero row at strength 0.
+const Ablated = struct {
+    abl: abi.Ablation = .{},
+    strengths: [MAX_BATCH_ROWS]f32 = undefined,
+    keys: [MAX_BATCH_ROWS]u64 = undefined,
+
+    /// Null when no slot of the forward is ablated; else the table, valid until `deinit`.
+    fn init(self: *Ablated, ctxs: []const *const ForwardCtx) !?*const abi.Ablation {
+        const first = for (ctxs) |c| {
+            if (c.ablation) |a| break a;
+        } else return null;
+        const n = ctxs.len;
+        const hidden = first.direction.len;
+        if (n > MAX_BATCH_ROWS or hidden == 0) return error.PluginForwardUnsupported;
+        const rows = try std.heap.c_allocator.alloc(f32, n * hidden);
+        defer std.heap.c_allocator.free(rows);
+        for (ctxs, 0..) |c, i| {
+            const dst = rows[i * hidden ..][0..hidden];
+            const a = c.ablation orelse {
+                @memset(dst, 0);
+                self.strengths[i] = 0;
+                self.keys[i] = 0;
+                continue;
+            };
+            if (a.direction.len != hidden) return error.PluginForwardUnsupported;
+            @memcpy(dst, a.direction);
+            self.strengths[i] = a.strength;
+            self.keys[i] = a.key;
+        }
+        const dirs = mlx.mlx_array_new_data(rows.ptr, &[_]c_int{ @intCast(n), @intCast(hidden) }, 2, .float32);
+        if (dirs.ctx == null) return error.OutOfMemory;
+        self.abl = .{
+            .directions = .{ .ctx = dirs.ctx },
+            .strengths = .of(self.strengths[0..n]),
+            .keys = .of(self.keys[0..n]),
+        };
+        return &self.abl;
+    }
+
+    fn deinit(self: *Ablated) void {
+        if (self.abl.directions.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = self.abl.directions.ctx });
+    }
+};
+
 /// `forwardWith` for a served model: logits `[1, rows, vocab]` as the legacy forward returns them (the final-normed
 /// hidden instead under `skip_lm_head`), with the capture targets `ctx` names filled.
 pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array) !Array {
@@ -447,6 +501,9 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     const mode: abi.Mode = if (capture) .verify else if (rows == 1) .decode else if (ctx.spec_verify) .verify else .prefill;
     // The ANE prefill programs (`--ane-prefill`) serve prompt chunks only.
     const offload: ?abi.Offload = if (mode == .prefill and xfm.ane_prefill != null) xfm.aneOffload() else null;
+    var ablated: Ablated = .{};
+    defer ablated.deinit();
+    const ablation = try ablated.init(&.{ctx});
     const f: abi.Forward = .{
         .mode = mode,
         .row_exact = xfm.config.dflash_bound,
@@ -476,6 +533,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .mask_add = .{ .ctx = if (ctx.prefill_mask_add) |m| m.ctx else null },
         .embeds = .{ .ctx = if (ctx.step_embeds) |e| e.ctx else null },
         .progress = if (mode != .prefill) null else if (ctx.prefill_progress) |p| &p.raw else null,
+        .ablation = ablation,
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);
@@ -542,10 +600,13 @@ pub fn nativeStages(xfm: *const Transformer) u32 {
 /// `ctx.cache.step` and `ctx.moe_seq_offset` move to the round's position.
 pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.Round {
     const b = xfm.plugin.?;
+    if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
     const tokens = [_]u32{t1};
     const slot_ids = [_]u32{settle.slotId(b, ctx)};
     const pos = [_]u32{@intCast(ctx.cache.step)};
+    var ablated: Ablated = .{};
+    defer ablated.deinit();
     const f: abi.Forward = .{
         .mode = .decode,
         .rows = 1,
@@ -554,6 +615,7 @@ pub fn nativeRound(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !abi.
         .positions = .of(&pos),
         .accept_cap = cap,
         .suppress_mask = .{ .ctx = if (xfm.suppress_mask) |m| m.ctx else null },
+        .ablation = try ablated.init(&.{ctx}),
     };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
@@ -582,11 +644,14 @@ pub const Verified = struct { round: abi.Round, logits: Array };
 /// verify left open until `nativeFinish`. The caller frees `logits`.
 pub fn nativeVerify(xfm: *Transformer, ctx: *ForwardCtx, t1: u32, cap: u32) !Verified {
     const b = xfm.plugin.?;
+    if (ctx.ablation != null) try roundServes(xfm, b, ctx);
     const nd = nativeDrafter(xfm).?;
     const tokens = [_]u32{t1};
     const slot_ids = [_]u32{settle.slotId(b, ctx)};
     const pos = [_]u32{@intCast(ctx.cache.step)};
-    const f: abi.Forward = .{ .mode = .verify, .rows = 1, .tokens = .of(&tokens), .slots = .of(&slot_ids), .positions = .of(&pos), .accept_cap = cap };
+    var ablated: Ablated = .{};
+    defer ablated.deinit();
+    const f: abi.Forward = .{ .mode = .verify, .rows = 1, .tokens = .of(&tokens), .slots = .of(&slot_ids), .positions = .of(&pos), .accept_cap = cap, .ablation = try ablated.init(&.{ctx}) };
     var out: abi.ForwardOut = .{};
     intree.enter(ctx);
     const v = nd.verify.?(b.model, &f, &out);
@@ -791,6 +856,8 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
     }
     const mg = try bindMerged(xfm, ctxs);
     defer if (mg) |m| m.deinit(xfm);
+    var ablated: Ablated = .{};
+    defer ablated.deinit();
     if (mg) |m| for (slots[0..n]) |*sl| {
         sl.merged = m.merged;
     };
@@ -805,6 +872,7 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
         .defer_host = settle.defersHost(xfm),
         .caches = .of(handles[0..n]),
         .cache_ops = &cache_ops.ops,
+        .ablation = try ablated.init(ctxs),
     };
     var out: abi.ForwardOut = .{};
     const v = b.table.forward(b.model, &f, &out);
@@ -855,6 +923,8 @@ pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs
     }
     const mg = try bindMerged(xfm, ctxs);
     defer if (mg) |m| m.deinit(xfm);
+    var ablated: Ablated = .{};
+    defer ablated.deinit();
     if (mg) |m| for (slots[0..n]) |*sl| {
         sl.merged = m.merged;
     };
@@ -871,6 +941,7 @@ pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs
         .defer_host = settle.defersHost(xfm),
         .caches = .of(handles[0..n]),
         .cache_ops = &cache_ops.ops,
+        .ablation = try ablated.init(ctxs),
     };
     var out: abi.ForwardOut = .{};
     const v = b.table.forward(b.model, &f, &out);

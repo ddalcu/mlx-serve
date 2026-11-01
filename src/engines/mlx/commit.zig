@@ -76,7 +76,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // `finishSlot` can be reached on an EOS the failing forward itself produced, before the
     // tick wrapper reads the latch: an unread latch means the KV under this commit may be garbage.
     if (mlx.errorPending()) return;
-    if (slot.model.transformer) |xfm| if (prefix_cache_mod.ModuleBinding.init(xfm)) |binding| {
+    if (slot.model.transformer) |xfm| if (prefix_cache_mod.ModuleBinding.forVariant(xfm, slot.cache_variant)) |binding| {
         if (slot.cancelled.load(.acquire)) return;
         const gen = if (slot.legacy_gen) |*g| g else return;
         if (commitDeclinesPadOnly(gen.generated_ids.items.len, slot.was_pad_only)) return;
@@ -97,6 +97,8 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         publishHotCacheResidency(sch);
         return;
     };
+    // The KV cache keys no variant: a slot that ran one leaves nothing there.
+    if (slot.cache_variant != 0) return;
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
         // A Generator-less slot whose cache is non-empty is a prefill the
         // client disconnected from mid-chunk-loop: initWithOptions threw
