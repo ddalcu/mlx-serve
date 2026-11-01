@@ -56,6 +56,20 @@ pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers
     return base + @min(base / 10, TEXT_GATE_MARGIN_CAP_BYTES);
 }
 
+/// `gateEstimateBytes`, except a ds4 GGUF under `--ssd-streaming` (`streaming_ceiling` > 0, the Metal working
+/// set): ds4 sizes its resident weights + expert cache inside that ceiling, so the file is not the bill.
+pub fn gateEstimateBytesFor(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers: u32, hidden_size: u32, streaming_ceiling: u64) u64 {
+    if (streaming_ceiling > 0) if (bytes_on_disk) |b| return ds4StreamingBill(b, streaming_ceiling);
+    return gateEstimateBytes(media_peak, bytes_on_disk, num_hidden_layers, hidden_size);
+}
+
+/// What a ds4 load holds once ready: the engine's figure, capped when it streams (ceiling 0 = not). The cap is
+/// 15/16 of the working set: a bill equal to the cap never fits beside the host's own live MLX bytes, while any
+/// other resident model past the last sixteenth is still evicted (ds4 sizes itself to the whole working set).
+pub fn ds4StreamingBill(engine_bytes: u64, streaming_ceiling: u64) u64 {
+    return if (streaming_ceiling > 0) @min(engine_bytes, streaming_ceiling / 16 * 15) else engine_bytes;
+}
+
 /// Where a media peak lives. Unified memory holds it in one pool. CUDA keeps file-loaded
 /// weights in managed memory backed by host RAM and the engine's working buffers on the GPU,
 /// so there the weights (capped by the peak: a staged pack never holds its whole sum) are
@@ -362,6 +376,21 @@ test "a text pack's gate margin stops growing with its weights" {
     try std.testing.expect(gateEstimateBytes(0, ds, 43, 4096) < 222 * GiB);
     // Up to 100 GiB the margin is still 10%.
     try std.testing.expectEqual(@as(u64, 66 * GiB), gateEstimateBytes(0, 60 * GiB, 48, 2560));
+}
+
+test "a ds4 SSD-streaming GGUF is billed the working set it confines itself to, not its file" {
+    const GiB: u64 = 1024 * 1024 * 1024;
+    const ws: u64 = 115 * GiB;
+    // DeepSeek-V4.1 1017 Q2: a 340.6 GiB file fits a cap equal to the working set, beside a few GiB of live host bytes.
+    try std.testing.expect(gateEstimateBytesFor(0, 341 * GiB, 43, 4096, ws) + 4 * GiB <= ws);
+    // A resident 8 GiB model beside it does not fit: the planner must evict it.
+    try std.testing.expect(gateEstimateBytesFor(0, 341 * GiB, 43, 4096, ws) + 8 * GiB > ws);
+    try std.testing.expectEqual(40 * GiB, gateEstimateBytesFor(0, 40 * GiB, 43, 4096, ws));
+    // The commit after the load agrees with the gate.
+    try std.testing.expectEqual(gateEstimateBytesFor(0, 374 * GiB, 43, 4096, ws), ds4StreamingBill(374 * GiB, ws));
+    try std.testing.expectEqual(374 * GiB, ds4StreamingBill(374 * GiB, 0));
+    // Off (0): the usual text bill, margin included.
+    try std.testing.expectEqual(gateEstimateBytes(0, 60 * GiB, 48, 2560), gateEstimateBytesFor(0, 60 * GiB, 48, 2560, 0));
 }
 
 test "a load over the memory cap on its own is named as such, not as a busy registry" {

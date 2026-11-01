@@ -15,14 +15,16 @@ pub const Flags = struct {
 };
 
 /// Opens the GGUF at `path` on `bridge` (`bridge.zig`, or a test double). ds4 refuses `--mtp` together with
-/// `--ssd-streaming`, so the support GGUF is only sought when streaming is off.
-pub fn open(comptime bridge: type, io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: Flags) !*bridge.Ds4Engine {
+/// `--ssd-streaming`, so the support GGUF is only sought when streaming is off. `ctx` is the session it will serve:
+/// ds4 sizes its expert cache and memory admission around it.
+pub fn open(comptime bridge: type, io: std.Io, gpa: std.mem.Allocator, path: []const u8, flags: Flags, ctx: u32) !*bridge.Ds4Engine {
     log.info("[ds4] opening engine: {s}\n", .{path});
     const mtp_path: ?[]u8 = if (flags.mtp and !flags.ssd_streaming) model_discovery.findDs4MtpSidecar(io, gpa, path) else null;
     defer if (mtp_path) |p| gpa.free(p);
     if (mtp_path) |p| log.info("[ds4] MTP draft head: {s}\n", .{p});
     const engine = try bridge.Ds4Engine.open(gpa, path, .{
         .warm_weights = true,
+        .context_size = ctx,
         .ssd_streaming = flags.ssd_streaming,
         .prefill_chunk = flags.prefill_chunk,
         .mtp_path = mtp_path,
