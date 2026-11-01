@@ -152,7 +152,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             const startup = std.fmt.bufPrint(&st.startup_buf, "ds4: {d}-token session, {d} draft tokens per round", .{ ctx, engine.mtpDraftTokens() }) catch "";
             info.* = .{
                 .name = abi.span(u8, "ds4"),
-                .version = abi.span(u8, build_options.ds4_commit),
+                .version = abi.span(u8, @import("ds4_pin").commit),
                 .caps = st.caps,
                 .threading = .own_thread,
                 .context_window = ctx,
@@ -476,6 +476,23 @@ test "ds4 adapter: the contract holds over a model-free bridge, speculative roun
     inline for (.{ "", "{\"prefill_chunk\":1}" }) |settings| { // drafts on, then off
         try contract.run(&Fake.table, .{ .model_dir = path, .model_type = "gguf", .config_json = "", .prompt = &.{ 5, 6, 7 }, .settings_json = settings, .gate_ms = 500 });
     }
+}
+
+test "ds4 adapter: the reported version is the checked-out submodule commit" {
+    const pin = @import("ds4_pin");
+    if (pin.overridden) return error.SkipZigTest;
+    const cwd = std.Io.Dir.cwd();
+    const link = cwd.readFileAlloc(testing.io, "lib/ds4/.git", testing.allocator, .limited(512)) catch return error.SkipZigTest;
+    defer testing.allocator.free(link);
+    const line = std.mem.trim(u8, link, " \t\r\n");
+    if (!std.mem.startsWith(u8, line, "gitdir: ")) return error.SkipZigTest;
+    const head_path = try std.fs.path.resolveAlloc(testing.allocator, &.{ "lib/ds4", line["gitdir: ".len..], "HEAD" });
+    defer testing.allocator.free(head_path);
+    const raw = try cwd.readFileAlloc(testing.io, head_path, testing.allocator, .limited(256));
+    defer testing.allocator.free(raw);
+    const head = std.mem.trim(u8, raw, " \t\r\n");
+    if (head.len < 7 or std.mem.startsWith(u8, head, "ref:")) return error.SkipZigTest;
+    try testing.expectEqualStrings(head[0..7], pin.commit);
 }
 
 test "ds4 adapter: probe reads the GGUF header" {

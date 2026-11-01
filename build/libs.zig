@@ -94,7 +94,7 @@ pub fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     // only ds4_ssd.h) implementing the streaming expert cache the engine_options
     // ssd_streaming_* fields drive. Added upstream after the previous pin.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_ssd.c"), .flags = c_flags });
-    // Two-machine tensor parallelism + multi-GPU layer placement (pin 9139e2a):
+    // Two-machine tensor parallelism + multi-GPU layer placement:
     // ds4.c references ds4_tp_* and ds4_compute_layer_placement/ds4_layer_pack_print
     // unconditionally, so both TUs must link even though we never enable TP.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_tp.c"), .flags = c_flags });
