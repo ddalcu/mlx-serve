@@ -85,6 +85,14 @@ tokens). Cause: jinja.cpp parsed the `0` in `x.0` as a name, and its lexer knew 
 Guard: the GLM tool-history and Flint render tests (byte-exact against jinja2), `tests/test_glm5_next.sh` [4],
 `tests/test_flint.sh` [4].
 
+### jinja.cpp kept a loop's `set` across iterations (GLM-5.3-Flash, #1046)
+Defect: a GLM-5.3-Flash assistant turn sent without `reasoning_content` rendered the PREVIOUS turn's reasoning
+inside its `<think>` block, so agents that omit the field re-sent thousands of stale characters every turn. Cause: every
+`{% for %}` iteration ran in one shared scope, so `{% set reasoning_content = ... %}` from one message was still defined
+for the next; Jinja2 starts each iteration fresh. Fix: a child scope per iteration (as ggml-org/llama.cpp#30533);
+`namespace()` attributes still carry. Guard: `renderChatTemplate: a set inside a for loop does not carry into the next
+iteration`.
+
 ### A generic role header rewrote tool results into user turns (MiMo)
 Defect: MiMo-V2.6 got every tool result as a `<tool_response>` user turn. Cause: its template renders `<|im_start|>{{
 message.role }}` and never spells `'tool'`; the literal check read that as no tool role. Fix: a template that renders
