@@ -285,6 +285,33 @@ const shell_tool_schema =
 ;
 
 const corpus = [_]Expect{
+    // ── MiniMax (namespaced XML, `<mm:think>` aliased to `<think>`) ─────────
+    .{
+        .family = "minimax",
+        .name = "native namespaced call preserves a reasoning closer in its argument",
+        .raw = "]<]minimax[>[<invoke name=\"shell\">]<]minimax[>[<command>echo '</think>']<]minimax[>[</command>]<]minimax[>[</invoke>",
+        .tool_name = "shell",
+        .tool_count = 1,
+        .tool_arg_key = "command",
+        .tool_arg_value = "echo '</think>'",
+        .tools_json = shell_tool_schema,
+    },
+    .{
+        .family = "minimax",
+        .name = "incomplete native argument cannot become a bare invoke call",
+        .raw = "]<]minimax[>[<invoke name=\"shell\">]<]minimax[>[<command>partial]<]minimax[>[</invoke>",
+        .no_tool_calls = true,
+        .tools_json = shell_tool_schema,
+    },
+    .{
+        .family = "qwen",
+        .name = "MiniMax namespace literal does not own a Hermes argument",
+        .raw = "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"]<]minimax[>[\"}}</tool_call>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "]<]minimax[>[",
+        .tools_json = shell_tool_schema,
+    },
     // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
     .{
         .family = "qwen",

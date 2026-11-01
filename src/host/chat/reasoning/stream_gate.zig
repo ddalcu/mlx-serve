@@ -23,6 +23,7 @@ const museHeaderHoldsForTools = @import("muse.zig").museHeaderHoldsForTools;
 const parseToolCalls = @import("../tools/parse.zig").parseToolCalls;
 const inklingIsNameChar = @import("../tools/inkling.zig").inklingIsNameChar;
 const miniCpm5AttrValue = @import("../tools/minicpm5.zig").miniCpm5AttrValue;
+const MINIMAX_NAMESPACE = @import("../tools/minimax.zig").MINIMAX_NAMESPACE;
 
 /// Streaming-only: true when the buffer TAIL is a partial prefix of a think
 /// opener (`<think>` / `<|channel>thought`). The buffered-stream flush must
@@ -76,6 +77,10 @@ pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
 /// that happens to mention HTML-ish tags flowing through normally.
 pub fn streamShouldBufferForTools(buf: []const u8) bool {
     if (buf.len == 0) return false;
+
+    // MiniMax's namespace prefixes every structural tag, so it or any split lead-in holds.
+    if (std.mem.indexOf(u8, buf, MINIMAX_NAMESPACE) != null) return true;
+    for (1..MINIMAX_NAMESPACE.len) |n| if (std.mem.endsWith(u8, buf, MINIMAX_NAMESPACE[0..n])) return true;
 
     // Raw JSON tool-call shape: starts with `{` and has `"name"` somewhere.
     if (buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) return true;
@@ -1038,4 +1043,11 @@ test "streamShouldBufferForTools: the gate is a strict SUPERSET of parseMiniCpm5
             };
         }
     }
+}
+
+test "MiniMax native streaming holds every namespace prefix" {
+    const marker = "]<]minimax[>[";
+    for (1..marker.len + 1) |n| try testing.expect(streamShouldBufferForTools(marker[0..n]));
+    try testing.expect(streamShouldBufferForTools("Run this." ++ marker ++ "<invoke name=\"shell\">"));
+    try testing.expect(!streamShouldBufferForTools("Ordinary prose about MiniMax."));
 }

@@ -9,6 +9,7 @@ const inklingIsNameChar = @import("inkling.zig").inklingIsNameChar;
 const BARE_INVOKE = @import("invoke.zig").BARE_INVOKE;
 const FUNCTION_CALLS_TAG = @import("invoke.zig").FUNCTION_CALLS_TAG;
 const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
+const MINIMAX_NAMESPACE = @import("minimax.zig").MINIMAX_NAMESPACE;
 
 /// Tool-call WRAPPER openers (and DSML's closer, which no prose spells) that must never survive into text a client
 /// renders. Every entry is the opening marker of a call block, so whatever
@@ -19,6 +20,7 @@ const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
 /// skips). The whole tail is cut rather than excised: a wrapper we could not
 /// parse has no reliable end, and shipping half of it is the same leak.
 const tool_markup_openers = [_][]const u8{
+    MINIMAX_NAMESPACE, // MiniMax native: prefixes every structural tag
     "<｜DSML｜", // DeepSeek-V4 native (covers tool_calls/invoke/parameter)
     "</｜DSML｜", // its closers, once the opener is gone (a call lost to the think split or never written)
     "<|tool_call", // Gemma 4
@@ -94,9 +96,8 @@ fn miniCpm5MarkupCut(text: []const u8) ?usize {
     return null;
 }
 
-/// Cut visible text at the first unparsed tool-call marker. Returns a prefix
-/// slice (no alloc); text with no marker is returned untouched.
-pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
+/// Start of the first recognized tool envelope, before any payload bytes.
+pub fn toolMarkupStart(text: []const u8) ?usize {
     var cut: usize = text.len;
     var is_inkling = false;
     for (tool_markup_openers) |m| {
@@ -122,13 +123,20 @@ pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
             is_inkling = false;
         }
     }
-    if (cut == text.len) return text;
+    if (cut == text.len) return null;
     // Inkling puts the tool NAME immediately BEFORE its invoke marker, so the
     // cut takes the trailing identifier run with it — otherwise the bare name
     // is what the client renders as the answer.
     if (is_inkling) {
         while (cut > 0 and inklingIsNameChar(text[cut - 1])) cut -= 1;
     }
+    return cut;
+}
+
+/// Cut visible text at the first unparsed tool-call marker. Returns a prefix
+/// slice (no alloc); text with no marker is returned untouched.
+pub fn trimLeakedToolMarkup(text: []const u8) []const u8 {
+    const cut = toolMarkupStart(text) orelse return text;
     return std.mem.trimEnd(u8, text[0..cut], "\n\r\t ");
 }
 
@@ -262,4 +270,8 @@ test "minicpm5 COMBINED: parser and scrubber agree on the same bytes" {
             };
         }
     }
+}
+
+test "MiniMax native incomplete markup is not visible content" {
+    try testing.expectEqualStrings("Run this.", trimLeakedToolMarkup("Run this.]<]minimax[>[<invoke name=\"shell\">unfinished"));
 }

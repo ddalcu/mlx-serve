@@ -369,7 +369,7 @@ pub fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: 
         .eos_id = eos_id,
         .parsed_json = parsed,
     };
-    if (built.installMarkerAliases()) log.info("Tokenizer: K2-Horizon markers alias to <think> / GLM tool tags\n", .{});
+    if (built.installMarkerAliases()) log.info("Tokenizer: native markers alias to shared reasoning / tool tags\n", .{});
     return built;
 }
 
