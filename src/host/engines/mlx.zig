@@ -115,6 +115,8 @@ pub const Facts = struct {
     /// The model batches decode at all (`configBatchesDecode`).
     batches_decode: bool = false,
     hot_cache_bytes: u64 = 0,
+    /// A `suppress_cjk` request is honored: the CJK mask is built and the generator's sampler draws.
+    suppress_cjk: bool = false,
 };
 
 /// Engine-wide settings `/props` reports.

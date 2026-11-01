@@ -9,6 +9,7 @@ const model_mod = @import("../../sdk/config/model.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
+const mlx_engine = @import("../engines/mlx.zig");
 const model_settings_mod = @import("../registry/model_settings.zig");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
@@ -31,6 +32,20 @@ pub fn resolveSampling(gen: generation_settings.Profile, root: std.json.ObjectMa
         .presence_penalty = gen.resolve(f32, .presence_penalty, parseJsonFloatOpt(root, "presence_penalty", 0.0, 2.0), 0.0),
         .frequency_penalty = gen.resolve(f32, .frequency_penalty, parseJsonFloatOpt(root, "frequency_penalty", 0.0, 2.0), 0.0),
     };
+}
+
+/// Null = accepted, else the 400 message; checked before tokenizing. Only the generator's sampler applies
+/// the mask, so engines and archs that draw elsewhere refuse it instead of ignoring it.
+pub fn parseSuppressCjk(root: std.json.ObjectMap, lm: *const LoadedModel, on: *bool) ?[]const u8 {
+    const want = switch (root.get("suppress_cjk") orelse return null) {
+        .null => return null,
+        .bool => |b| b,
+        else => return "suppress_cjk must be a boolean",
+    };
+    if (!want) return null;
+    if (lm.engineBacked() or !mlx_engine.facts(lm).suppress_cjk) return "suppress_cjk is not available for this model";
+    on.* = true;
+    return null;
 }
 
 /// A zero rule means remaining context; an omitted rule uses the surface's fallback.

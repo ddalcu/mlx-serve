@@ -794,10 +794,8 @@ pub fn maskAndArgmax(s: mlx.mlx_stream, logits_in: mlx.mlx_array, suppress_mask:
     defer _ = mlx.mlx_array_free(logits);
     try mlx.check(mlx.mlx_array_set(&logits, logits_in));
     if (suppress_mask) |m| {
-        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-        defer _ = mlx.mlx_array_free(neg_inf);
         var masked = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
+        try maskRows(s, &masked, m, logits);
         _ = mlx.mlx_array_free(logits);
         logits = masked;
     }
@@ -860,12 +858,26 @@ fn rerankMaskCoarse(s: mlx.mlx_stream, logits: *mlx.mlx_array, suppress_mask: ?m
     // The mask goes on the COARSE row: a reserved id that never enters the
     // shortlist cannot be re-scored back into the draft.
     const m = suppress_mask orelse return;
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-    defer _ = mlx.mlx_array_free(neg_inf);
     var masked = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits.*, s));
+    try maskRows(s, &masked, m, logits.*);
     _ = mlx.mlx_array_free(logits.*);
     logits.* = masked;
+}
+
+/// `where(mask, -inf, logits)`. A group's per-row mask is `[N,1,V]`; against a
+/// 2-D `[N,V]` readout it must drop its middle axis, or broadcasting pairs
+/// every row with every row's mask.
+fn maskRows(s: mlx.mlx_stream, out: *mlx.mlx_array, mask: mlx.mlx_array, logits: mlx.mlx_array) !void {
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    const msh = mlx.getShape(mask);
+    if (msh.len == 3 and mlx.getShape(logits).len == 2) {
+        var rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_reshape(&rows, mask, &[_]c_int{ msh[0], msh[2] }, 2, s));
+        return mlx.check(mlx.mlx_where(out, rows, neg_inf, logits, s));
+    }
+    try mlx.check(mlx.mlx_where(out, mask, neg_inf, logits, s));
 }
 
 /// The exact re-scored shortlist behind every rerank draft: the coarse head's

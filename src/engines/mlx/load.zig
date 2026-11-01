@@ -193,6 +193,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
     // specials): derived per model from tokenizer + template + eos.
     generate_mod.installSuppressMask(xfm_ptr, params.tok, params.chat_config.chat_template, params.config.eosTokenSlice());
+    generate_mod.installCjkMask(xfm_ptr, params.tok);
 
     // Propagate the kv-quant config to the Transformer's own cache. Slot
     // caches in serve mode honor this independently in `Slot.init`; this

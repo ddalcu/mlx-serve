@@ -73,7 +73,10 @@ pub fn initWithOptions(
     // stochastic-verify filters, batched decode via `gen.sampling`)
     // inherits the model's mask without per-site wiring.
     var sampling = sampling_in;
-    sampling.suppress_mask = xfm.suppress_mask;
+    sampling.suppress_mask = if (sampling_in.suppress_cjk)
+        xfm.suppress_mask_cjk orelse return error.SuppressCjkUnavailable
+    else
+        xfm.suppress_mask;
     sampling.keyed = xfm.config.rowExactDecode() and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
     sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
     // Spec drafts and verify rows share the serial sampler's keys (and
@@ -1147,4 +1150,36 @@ pub fn initWithOptions(
 
     attachCp(&gen, &ssm_checkpoints, allocator);
     return gen;
+}
+
+// ── tests ──
+
+const testing = std.testing;
+const model_mod = @import("../../../sdk/config/model.zig");
+
+test "initWithOptions: suppress_cjk wires the CJK mask and fails without one" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp.dir, path, s);
+    var cfg = try model_mod.parseConfig(io, a, path);
+    defer cfg.deinit(a);
+    var xfm = try plugin_driver.load(io, a, &cfg, path, s);
+    defer xfm.deinit();
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1 };
+    const cjk: SamplingParams = .{ .temperature = 0, .suppress_cjk = true };
+    try testing.expectError(error.SuppressCjkUnavailable, initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{}));
+    const mask_buf = try a.alloc(bool, cfg.vocab_size);
+    defer a.free(mask_buf);
+    @memset(mask_buf, false);
+    xfm.suppress_mask_cjk = mlx.mlx_array_new_data(mask_buf.ptr, &[_]c_int{@intCast(cfg.vocab_size)}, 1, .bool_);
+    var gen = try initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{ .skip_lazy_preforward = true });
+    defer gen.deinit(a);
+    try testing.expectEqual(xfm.suppress_mask_cjk.?.ctx, gen.sampling.suppress_mask.?.ctx);
 }
