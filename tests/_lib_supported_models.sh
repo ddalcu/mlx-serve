@@ -64,6 +64,11 @@ for name in candidates(root):
         continue
     if mt not in supported and not mt.startswith("lfm2"):
         continue
+    # A DFlash sidecar (discovery's dflash_contract: block_size + mask_token_id + target_layer_ids, at the root or under
+    # dflash_config) is a drafter whatever its model_type says, never a chat row.
+    dc = data.get("dflash_config") if isinstance(data.get("dflash_config"), dict) else {}
+    if all(k in data or k in dc for k in ("block_size", "mask_token_id", "target_layer_ids")):
+        continue
     # Decision packs answer /v1/decisions only: a D1 root names its own class, a Kev pack ships kev_config.json.
     if (data.get("auto_map") or {}).get("AutoModel") == "modeling_d1.D1Model" or os.path.isfile(os.path.join(root, name, "kev_config.json")):
         continue

@@ -13,16 +13,17 @@
 #      catch a silent fallback to the resident path (spec-decode lesson)
 #
 # SKIPs without a FLUX model dir (default: the 3-bit klein).
+source "$(dirname "$0")/_lib_models.sh"
 set -euo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PORT="${1:-11321}"
-MODEL_DIR="${FLUX_LOWMEM_MODEL:-$HOME/.mlx-serve/models/mlx-community/FLUX.2-Klein-4B-3bit}"
+MODEL_DIR="${FLUX_LOWMEM_MODEL:-$(find_model mlx-community/FLUX.2-Klein-4B-3bit || echo "$HOME/.mlx-serve/models/mlx-community/FLUX.2-Klein-4B-3bit")}"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 TMP="$(mktemp -d)"
 SRV_PID=""   # seeded: the EXIT trap runs on the SKIP path too, before any server starts
-trap 'kill $SRV_PID 2>/dev/null || true; rm -rf "$TMP"' EXIT
+trap 'srv_stop $SRV_PID; rm -rf "$TMP"' EXIT
 
 pass() { echo "  ✅ $1"; }
 fail() { echo "  ❌ $1"; exit 1; }

@@ -37,7 +37,7 @@ final class HostEscapeAuditTests: XCTestCase {
         "MCPSpawner.swift":
             "HostMCPSpawner's login zsh, used only when the Agent Sandbox is OFF. Compiled out under MAS_BUILD.",
         "PluginManager.swift":
-            "Model Browser ▸ Plugins: git clone/fetch, xcode-select and the catalog's install.sh (the pinned Zig compile) on the host. Needs the Xcode Command Line Tools, so it cannot work in the App Sandbox; the pane is not yet hidden under MAS_BUILD.",
+            "Model Browser ▸ Plugins: git clone/fetch, xcode-select, the catalog's build.sh (the pinned Zig compile) and this app's `mlx-serve plugin install` on the host. Needs the Xcode Command Line Tools, so it cannot work in the App Sandbox; the pane is not yet hidden under MAS_BUILD.",
         "ProcessRegistry.swift":
             "login zsh for the agent's host shell tool. Guest-only under MAS_BUILD (Phase 4).",
         "SandboxSSH.swift":

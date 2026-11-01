@@ -105,10 +105,31 @@ test "embedding_gemma plugin: a 4-bit pack's hidden rows (one sequence, a padded
     var b = try Both.openAs(&embedding_gemma.table, &p, config_json, oracle("4bit"));
     defer b.close();
     try testing.expect(b.cfg.use_bidirectional_attention and b.xfm.plugin != null and b.xfm.hasEmbedProjection());
-    // The short row's padding stays inside the band of its last real key: without the floor (EmbeddingGemma 2's) a
-    // padded query seeing only padding is NaN, and so is the row, on both paths.
+    // The short row's padding stays inside the band of its last real key: the legacy encoder the tape replays has no
+    // floor, so a padded query seeing only padding is NaN on its side.
     try expectServed(&b, &.{ 2, 17, 42, 99, 7, 250, 31, 8, 66, 9, 4, 1 }, &.{ 2, 17, 42, 99, 7, 250, 31, 8, 66, 1, 2, 9, 33, 77, 140, 5, 61, 1, 0, 0 }, &.{ 10, 8 });
     try b.expectDone();
+}
+
+test "embedding_gemma plugin: a padded batch whose length gap passes the band is finite on every row" {
+    var p = fixture.Pack.init(0xe3b1);
+    defer p.deinit();
+    try writePack(&p, .{});
+    var b = try Both.openAs(&embedding_gemma.table, &p, config_json, .none);
+    defer b.close();
+    const a = testing.allocator;
+    var g = ops.Graph.init(a, b.xfm.s);
+    defer g.deinit();
+    // The second row is 3 tokens padded to 12: its padded queries past the band (4) see only padding keys.
+    const batch = [_]i32{ 2, 17, 42, 99, 7, 250, 31, 8, 66, 9, 4, 1, 2, 9, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    const ids = try g.fromSlice(i32, &batch, &.{ 2, 12 });
+    const mask = try g.adopt(try pooling.buildKeyPadMask(a, &.{ 12, 3 }, 12, b.xfm.s));
+    const hidden = try g.adopt(try b.xfm.forwardEmbeddingMasked(ids, mask, null));
+    const finite = try g.call(mlx.mlx_all, .{ try g.call(mlx.mlx_isfinite, .{hidden}), false });
+    try mlx.check(mlx.mlx_array_eval(finite));
+    var all = false;
+    try mlx.check(mlx.mlx_array_item_bool(&all, finite));
+    try testing.expect(all);
 }
 
 test "embedding_gemma plugin: the parse equals the engine's on the shell, the encoder flag and the pooling contract" {

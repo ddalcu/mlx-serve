@@ -7,12 +7,13 @@
 #   ./tests/test_cache_reuses_generated_tokens.sh [port]   # own server on 8092, or pass a running one's port
 #
 # On a hybrid (GDN) model the reuse comes from the decode-end SSM checkpoint: CACHE_GEN_TEST_MODEL=<Qwen3.5/3.8 dir>.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 
 PORT="${1:-8092}"
 BASE="http://127.0.0.1:$PORT"
-MODEL="${CACHE_GEN_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
+MODEL="${CACHE_GEN_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; CYAN='\033[0;36m'; NC='\033[0m'
 

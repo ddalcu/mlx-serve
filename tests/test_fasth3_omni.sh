@@ -12,10 +12,11 @@
 #
 # Hermetic twins: the `PDD` tests in plugins/minimax_h3/h3.zig, `zig build test -Dtest-filter="h3 vsa:"` (H3_VSA_FIXTURE from
 # tests/dump_h3_vsa_fixtures.py), `h3 vsa kernel` (GPU; H3_VSA_UBENCH=1), tests/test_convert_minimax_h3_omni.py.
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11363}"
-MODEL="${OMNI_MODEL:-$HOME/.mlx-serve/models/ddalcu/FastH3-Omni-MLX-Serve-8bit}"
+MODEL="${OMNI_MODEL:-$(find_model ddalcu/FastH3-Omni-MLX-Serve-8bit || echo "$HOME/.mlx-serve/models/ddalcu/FastH3-Omni-MLX-Serve-8bit")}"
 [ -f "$MODEL/transformer.safetensors" ] || { echo "SKIP: no FastH3 Omni pack at $MODEL (set OMNI_MODEL)"; exit 0; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${MLX_SERVE_BIN:-$ROOT/zig-out/bin/mlx-serve}"

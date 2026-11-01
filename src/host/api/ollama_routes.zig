@@ -402,6 +402,7 @@ pub fn handleOllamaChat(allocator: std.mem.Allocator, stream: *Conn, body: []con
     try handleChatCompletions(allocator, stream, tr.body, lm);
     stream.ollama_sink = null;
     try sink.finish();
+    stream.length_framed = sink.length_framed;
 }
 
 pub fn handleOllamaGenerate(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
@@ -446,6 +447,7 @@ pub fn handleOllamaGenerate(allocator: std.mem.Allocator, stream: *Conn, body: [
     }
     stream.ollama_sink = null;
     try sink.finish();
+    stream.length_framed = sink.length_framed;
 }
 
 pub fn handleOllamaEmbed(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel, legacy: bool) !void {

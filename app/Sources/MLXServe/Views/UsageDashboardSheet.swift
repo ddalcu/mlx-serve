@@ -11,7 +11,7 @@ enum UsageReset: Equatable {
     }
 }
 
-/// Everything the server has served, day by day and model by model: opened from the status strip's Total Tokens.
+/// Everything the server has served, day by day and model by model: opened from the status strip's speed line.
 struct UsageDashboardSheet: View {
     @ObservedObject var usage: UsageTracker
     @Environment(\.dismiss) private var dismiss

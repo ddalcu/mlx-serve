@@ -159,6 +159,8 @@ final class ChatWorkspaceTests: XCTestCase {
                       // trap the Tasks columns hit, invisible to this audit for
                       // exactly as long as the file was missing from this list.
                       "Sources/MLXServe/Views/AgentsWindow.swift",
+                      // Models ▸ Plugins reads the download manager for its pack rows.
+                      "Sources/MLXServe/Views/PluginsPane.swift",
                       "Sources/MLXServe/Views/TerminalPane.swift"]
         let pattern = try NSRegularExpression(pattern: #"@EnvironmentObject\s+var\s+\w+\s*:\s*(\w+)"#)
         var types = Set<String>()

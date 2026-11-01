@@ -6,12 +6,13 @@
 # expectation, not a wire failure (qwen4_exp reads them).
 #
 #   tests/test_qwen_video_input.sh [model_dir] [port]
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-${QWEN_VISION_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}}"
+MODEL="${1:-${QWEN_VISION_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}}"
 PORT="${2:-11386}"
 F1="tests/fixtures/house.jpeg"
 F2="tests/fixtures/robot.png"

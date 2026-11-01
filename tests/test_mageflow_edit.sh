@@ -9,6 +9,7 @@
 #   MAGEFLOW_EDIT_MODEL=<dir> ./tests/test_mageflow_edit.sh [port]   # SKIPs without the ~17 GB checkpoint
 #
 # Hermetic twins: fitAspect, openaiEditFormToJson, the multipart parser; the MAGEFLOW_* cos oracles.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
@@ -16,7 +17,7 @@ PORT="${1:-11402}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
-MODEL="${MAGEFLOW_EDIT_MODEL:-$HOME/.mlx-serve/models/microsoft/Mage-Flow-Edit-Turbo}"
+MODEL="${MAGEFLOW_EDIT_MODEL:-$(find_model microsoft/Mage-Flow-Edit-Turbo || echo "$HOME/.mlx-serve/models/microsoft/Mage-Flow-Edit-Turbo")}"
 [ -f "$MODEL/model_index.json" ] || { echo "SKIP: no Mage-Flow-Edit checkpoint at $MODEL"; exit 0; }
 
 LOG=/tmp/test_mageflow_edit_server.log

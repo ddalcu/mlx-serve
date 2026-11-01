@@ -10,11 +10,12 @@
 # proves nothing.
 #
 #   BATCH_FEAT_MODEL=<qwen3_5 pack> ./tests/test_batched_features.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
-MODEL="${BATCH_FEAT_MODEL:-$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-4B-MLX-4bit}"
+MODEL="${BATCH_FEAT_MODEL:-$(find_model lmstudio-community/Qwen3.5-4B-MLX-4bit || echo "$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-4B-MLX-4bit")}"
 PORT="${1:-11513}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"

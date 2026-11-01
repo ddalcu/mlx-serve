@@ -87,7 +87,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--llama-mtp-drafts N` | `2` | Draft tokens per MTP round for a GGUF with an MTP head (its own, or an `mtp-*.gguf` beside it); drafts only while one request decodes; `0` = off |
 | `--llama-ubatch N` | libllama's 512 | llama.cpp prefill batch in tokens; 1024-2048 prefill faster, mostly on MoE, for more scratch memory |
 | `--tokenize-cache-entries N` | `4` | Chat-template + tokenize cache size |
-| `--max-concurrent N` | `1` | Continuous-batch decode parallelism |
+| `--max-concurrent N` | `1` | Sizes the request queue (N + 32 wait before a new one blocks) and caps how many decoders a long prefill admits a newcomer beside; concurrent requests batch-decode either way |
 | `--prefill-decode-share S` | `0.25` | Wall-time fraction (0..0.9) decoding streams keep during another request's prefill; the prefill runs 1024-token chunks meanwhile and admits small newcomers at its chunk boundaries. `0` = the old schedule. |
 | `--prefix-cache-entries N` | auto | Shared-prefix KV cache entry cap |
 | `--prefix-cache-mem N{KB,MB,GB}` | `2 GB`, or one session at the working context on hybrid (Qwen3.5+, GLM-5.3, Nemotron-H, LFM2, Ling), sliding-ring (MiMo) and qwen4_exp models when larger | Shared-prefix KV cache memory cap |

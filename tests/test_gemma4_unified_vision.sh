@@ -9,10 +9,11 @@
 #
 # Gated on a fixture so CI without the model stays green:
 #   G4_UNIFIED_MODEL=/path/to/gemma-4-12b-it-4bit ./tests/test_gemma4_unified_vision.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${G4_UNIFIED_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-12b-it-4bit}"
+MODEL="${G4_UNIFIED_MODEL:-$(find_model mlx-community/gemma-4-12b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-12b-it-4bit")}"
 PORT="${1:-8231}"
 BASE="http://127.0.0.1:$PORT"
 BIN="./zig-out/bin/mlx-serve"

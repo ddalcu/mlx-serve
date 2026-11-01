@@ -9,11 +9,12 @@
 # card's own package on CPU in float32 (tests/fixtures/d1/cases.json, from tests/dump_d1_fixtures.py): bf16 Metal
 # agrees to 0.02 on probabilities, and input token counts must match exactly.
 # Hermetic counterparts: the unit tests in src/plugins/d1/d1.zig and the D1 discovery test in src/host/registry/discovery.zig.
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11445}"
-MODEL="${D1_MODEL:-$HOME/.mlx-serve/models/LiquidAI/d1-3B}"
+MODEL="${D1_MODEL:-$(find_model LiquidAI/d1-3B || echo "$HOME/.mlx-serve/models/LiquidAI/d1-3B")}"
 BIN="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
 FIXTURES="tests/fixtures/d1/cases.json"
 LOG="/tmp/d1-test-$PORT.log"

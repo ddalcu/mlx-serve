@@ -12,6 +12,7 @@
 #
 # Hermetic twins: buildPaddedBatch / maskedMeanPoolNormalize / embedSubBatchEnd, the EmbeddingGemma 2 tiny-fixture
 # tests (tests/dump_embeddinggemma2_fixtures.py). Real-checkpoint parity: tests/dump_embeddinggemma{,2_media}*.py.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
@@ -23,8 +24,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-EMBED_MODEL="${EMBED_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit}"
-CHAT_MODEL="${CHAT_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4}"
+EMBED_MODEL="${EMBED_TEST_MODEL:-$(find_model mlx-community/bge-small-en-v1.5-8bit || echo "$HOME/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit")}"
+CHAT_MODEL="${CHAT_TEST_MODEL:-$(find_model mlx-community/Qwen3-0.6B-nvfp4 || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4")}"
 if [ ! -d "$EMBED_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_embeddings: encoder model not found at $EMBED_MODEL"
     exit 0
@@ -55,7 +56,7 @@ start_server() {
     echo -e "${RED}FAIL${NC} server did not become healthy"; tail -5 "$logfile"; return 1
 }
 stop_server() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; }
-trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
 embed() { # embed <json-input> [model]
     local input="$1" model="${2:-mlx-serve}"
@@ -223,7 +224,7 @@ stop_server
 # --- 4c. decoder-arch embedder across sub-batches ---
 # Qwen3-Embedding forwards through the KV cache, and a request past EMBED_TOKEN_BUDGET
 # (64 x 512 padded tokens) splits into sub-batches that must each start from an empty one.
-QWEN3_EMBED_MODEL="${QWEN3_EMBED_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ}"
+QWEN3_EMBED_MODEL="${QWEN3_EMBED_TEST_MODEL:-$(find_model mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ")}"
 echo "=== /v1/embeddings: decoder-arch embedder across sub-batches ==="
 if [ ! -d "$QWEN3_EMBED_MODEL" ]; then
     echo -e "  ${YELLOW}SKIP${NC} Qwen3-Embedding model not found at $QWEN3_EMBED_MODEL"
@@ -301,7 +302,7 @@ fi
 # A batch pads its short rows out to the long one. Past the band radius (512) a padded query sees
 # only padding in the sliding layers, and a NaN row there reaches the real rows through V in every
 # later layer: the long row below crosses the band, and every vector must come back finite.
-EG2_MODEL="${EG2_TEST_MODEL:-$HOME/.mlx-serve/models/google/embeddinggemma-2}"
+EG2_MODEL="${EG2_TEST_MODEL:-$(find_model google/embeddinggemma-2 || echo "$HOME/.mlx-serve/models/google/embeddinggemma-2")}"
 echo "=== /v1/embeddings: EmbeddingGemma 2 ==="
 if [ ! -d "$EG2_MODEL" ]; then
     echo -e "  ${YELLOW}SKIP${NC} EmbeddingGemma 2 not found at $EG2_MODEL"

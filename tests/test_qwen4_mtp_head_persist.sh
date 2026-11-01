@@ -4,8 +4,9 @@
 # Asserts the invariant: the second turn is a hot-cache hit AND the head is restored, the
 # answer matches the cold turn's answer.
 #   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_mtp_head_persist.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -u
-MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}"
+MODEL="${QWEN4_MODEL:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit")}"
 PORT="${1:-11413}"
 BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 DIR="$HOME/claude-tmp/qwen4-head-persist"

@@ -10,12 +10,13 @@
 # Writes ~/claude-tmp/bench-laguna/laguna-xs-<date>.csv. Exported MLX_SERVE_* reach the server (kill-switch A/Bs).
 # Rebuild ReleaseFast first. When a number looks wrong: tests/fwd_ubench.sh, MLX_SERVE_DIAG=layer-cap=N, and the
 # `diagProjBench` rung ladder (story in docs/gotchas/engine-mlx.md, the f32-mscale promotion).
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${MODEL:-$HOME/.mlx-serve/models/poolside/Laguna-XS-2.1-NVFP4-mlx}"
+MODEL="${MODEL:-$(find_model poolside/Laguna-XS-2.1-NVFP4-mlx || echo "$HOME/.mlx-serve/models/poolside/Laguna-XS-2.1-NVFP4-mlx")}"
 PORT="${PORT:-8712}"
 CTX="${CTX:-4096}"
 MAX_TOKENS=128          # their decode window

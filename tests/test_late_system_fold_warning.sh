@@ -1,7 +1,10 @@
 #!/bin/bash
 # A template that cannot keep a late system note in place warns once per template.
 set -euo pipefail
-MODEL="${1:?Usage: test_late_system_fold_warning.sh <model_dir whose template rejects late system turns> [port]}"
+source "$(dirname "$0")/_lib_models.sh"
+# Default: Qwen3.5's template raises "System message must be at the beginning."
+MODEL="${1:-$(find_model mlx-community/Qwen3.5-4B-MLX-4bit lmstudio-community/Qwen3.5-4B-MLX-4bit)}"
+[ -n "$MODEL" ] || { echo "SKIP: no model whose template rejects late system turns (pass <model_dir>)"; exit 0; }
 PORT="${2:-11369}"
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
 SCRATCH=$(mktemp -d)

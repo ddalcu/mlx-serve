@@ -45,7 +45,7 @@ WORDS="${DISCONNECT_PROMPT_WORDS:-9000}"
 CTX=$(( (WORDS * 3 + 8191) / 8192 * 8192 + 8192 ))
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --ctx-size "$CTX" --no-pld --metrics --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
 srv_wait_health "$BASE" 120 2 || { echo "FAIL: server did not come up"; exit 1; }
 

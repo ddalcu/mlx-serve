@@ -12,11 +12,12 @@
 #
 # Hermetic twins: the layout/schedule/vision/VAE fixture tests (minimax_h3*.zig), h3PeakBytes; live parity:
 # MINIMAX_H3_DIR, MINIMAX_H3_VAE_ENC_FIXTURE, _AUDIO_ENC_FIXTURE (max-abs, not cosine), _VIT_FIXTURE (+ rms_ratio).
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11361}"
-MODEL="${H3_MODEL:-$HOME/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit}"
+MODEL="${H3_MODEL:-$(find_model ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit || echo "$HOME/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit")}"
 [ -f "$MODEL/transformer.safetensors" ] || { echo "SKIP: no MiniMax-H3 pack at $MODEL (set H3_MODEL)"; exit 0; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${MLX_SERVE_BIN:-$ROOT/zig-out/bin/mlx-serve}"

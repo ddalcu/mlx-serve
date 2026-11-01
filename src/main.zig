@@ -211,6 +211,8 @@ fn printUsage(io: std.Io) void {
         \\                        MLX allocates); use this if a load you know fits
         \\                        is being refused. A genuine over-commit can
         \\                        hard-crash the server.
+        \\  --no-warmup-eager   Skip the eager warmup at boot (benchmarking,
+        \\                        minimal-footprint deployments).
         \\  --pld               Enable Prompt Lookup Decoding (default: ON).
         \\                        Model-agnostic speculative decoding via n-gram
         \\                        matches in the prompt + generated tokens. Big
@@ -219,6 +221,10 @@ fn printUsage(io: std.Io) void {
         \\                        auto-disables it on novel content. Pass
         \\                        --no-pld to force-disable.
         \\  --no-pld            Force-disable Prompt Lookup Decoding.
+        \\  --max-concurrent <n>  Sizes the request queue (n + 32 wait before a new
+        \\                        one blocks) and caps how many decoders a long
+        \\                        prefill admits a newcomer beside (default: 1).
+        \\                        Concurrent requests batch-decode either way.
         \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
         \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
         \\  --drafter <dir>     Path to an assistant drafter checkpoint —
@@ -437,6 +443,9 @@ fn printUsage(io: std.Io) void {
         \\                      llama.cpp prefill batch in tokens (default:
         \\                        libllama's 512). 1024-2048 prefill faster,
         \\                        mostly on MoE models, for more scratch memory.
+        \\  --llama-kv-quant {{off|q8|q4}}
+        \\                      KV-cache quantization for GGUF models on
+        \\                        llama.cpp (default: off).
         \\  --engine {{auto|ds4|llama}}
         \\                      Engine selector for `.gguf` inputs ONLY.
         \\                        Safetensors models always run on the native

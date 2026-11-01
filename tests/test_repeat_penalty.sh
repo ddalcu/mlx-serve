@@ -8,11 +8,12 @@
 #   PENALTY_TEST_MODEL=<dir> ./tests/test_repeat_penalty.sh [port]   # default Qwen3.5-0.8B-MLX-4bit; SKIP without
 #
 # Zig twin: `repeat penalty shapes every sampling path` (engines/mlx/generate.zig, LOGPROBS_TEST_MODEL).
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${PENALTY_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+MODEL="${PENALTY_TEST_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 PORT="${1:-11294}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 BASE="http://127.0.0.1:$PORT"

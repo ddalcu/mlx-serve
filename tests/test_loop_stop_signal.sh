@@ -9,13 +9,14 @@
 #   LOOP_TEST_MODEL=<small chat model> ./tests/test_loop_stop_signal.sh [port]   # SKIPs without one
 #
 # Hermetic twins: degenerateTail, loopStopDecision, shouldParseToolCalls, finishDetailsField, loopTrimmedIds.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11266}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${LOOP_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL="${LOOP_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 PASS=0
 FAIL=0
 

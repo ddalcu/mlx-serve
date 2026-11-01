@@ -12,11 +12,12 @@
 #
 # Hermetic twins: grouped-Q/strided parity tests in engines/mlx/cache/kv_quant.zig, `qkvVerParityCase`, kvAttnFusedEligible /
 # kvAttnVerifyEligible, resolveKvAttnFusedPure.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 PORT="${2:-8094}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'
@@ -288,7 +289,7 @@ compare_or_acquit_tie "spec fused vs spec dense" "$MODEL" "$SPEC_DENSE_TOK" "$SP
 # the shapes the Phase-2 A/B measured wins on. A dispatch hole here is
 # output-invisible (dense fallback is equivalent), so ENGAGEMENT is the
 # assertion, per the spec-test rule.
-VERIFY_MODEL="${KV_VERIFY_SPEC_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+VERIFY_MODEL="${KV_VERIFY_SPEC_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 if [ ! -d "$VERIFY_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} verify-kernel arm: $VERIFY_MODEL not found (KV_VERIFY_SPEC_MODEL overrides)."
     exit $FAIL
