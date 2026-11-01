@@ -35,9 +35,9 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
   `both.zig`): steps, pipelined greedy, media; the head through `MtpHeadRef.plugin` incl. a pinned-depth round loop.
 - Bill: `kv_per_token` (latent + indexer key and gate per DSA layer), `ssm_checkpoint` (f32). The prefill bill stays
   `bill.zig`'s `glm5PrefillMemoryNeeded` (the served config is the legacy parse, so `isGlm5()` arms still read it).
-- Discovery: caps advertise what legacy discovery did (no images for a `_text` pack's vestigial tower; video beside a
-  `video_token_id`, which the engine never reads). One change: a ModelOpt pack's unloaded row names 4 bits, as its
-  loaded row always did (legacy discovery read only `quantization.bits`).
+- Discovery: caps advertise what legacy discovery did (no images for a `_text` pack's vestigial tower), with two
+  changes: never video (a `video_token_id` is a token the engine never reads for GLM), and a ModelOpt pack's unloaded
+  row names 4 bits, as its loaded row always did (legacy discovery read only `quantization.bits`).
 
 Served, legacy forward deleted (`engines/mlx/plugin/served.zig` `legacy_removed`: a pack the plugin declines is
 refused by name). Streamed packs (`expert_streaming`, `glm_moe_dsa`) stay mlx-stream's.

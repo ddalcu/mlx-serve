@@ -6,11 +6,12 @@
 # Usage: ./tests/test_vision_moe_regression.sh [model_dir] [port]
 # Default model: ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
 # Default port: 8097
+source "$(dirname "$0")/_lib_models.sh"
 
 set -euo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}"
+MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}}"
 PORT="${2:-8097}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"

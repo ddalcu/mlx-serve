@@ -7,6 +7,7 @@
 #   MEDIA_MEM_MODEL=<dir> ./tests/test_media_gen_memory.sh [port]   # default Mage-Flow-Turbo-MLX-Serve-8bit; SKIP
 #
 # Hermetic twin: `materializing helpers hand back every array they take` (plugins/mage_flow/mage_flow.zig).
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
@@ -14,7 +15,7 @@ PORT="${1:-11413}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
-MODEL="${MEDIA_MEM_MODEL:-$HOME/.mlx-serve/models/ddalcu/Mage-Flow-Turbo-MLX-Serve-8bit}"
+MODEL="${MEDIA_MEM_MODEL:-$(find_model ddalcu/Mage-Flow-Turbo-MLX-Serve-8bit || echo "$HOME/.mlx-serve/models/ddalcu/Mage-Flow-Turbo-MLX-Serve-8bit")}"
 [ -f "$MODEL/model_index.json" ] || [ -f "$MODEL/config.json" ] \
   || { echo "SKIP: no media-gen checkpoint at $MODEL"; exit 0; }
 

@@ -73,15 +73,6 @@ final class UsageTrackerTests: XCTestCase {
         XCTAssertTrue(relaunched.summary.rows.isEmpty)
     }
 
-    func testTheStripTotalGrowsWithTheTokensAReplyHasWrittenSoFar() {
-        let t = tracker()
-        t.ingest(snapshot(["org/a": counters()], at: 0, generatedLive: 0, generated: 0))
-        t.ingest(snapshot(["org/a": counters(requests: 2, prompt: 200, generated: 20)], at: 1, generatedLive: 20, generated: 20))
-        XCTAssertEqual(t.totalTokens, 110, "nothing in flight: the finished request's tokens")
-        t.ingest(snapshot(["org/a": counters(requests: 2, prompt: 200, generated: 20)], at: 2, generatedLive: 55, generated: 20))
-        XCTAssertEqual(t.totalTokens, 145, "35 more tokens are on their way")
-    }
-
     func testRatesAreTheTokensMovedBetweenTwoLooks() {
         let t = tracker()
         t.ingest(snapshot([:], at: 0, generatedLive: 100, generated: 0))

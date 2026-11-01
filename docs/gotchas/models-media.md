@@ -750,3 +750,11 @@ arm (each expert's up x down `weight_scale_2`) as unused, and every proof replay
 no such scale. Fix: the arm restored, plus a load-time `unservedLayout` that refuses, by name, any layout an arm the
 fork dropped would read. Guard: `a per-expert scale of 2 doubles the routed experts exactly`, the layout-guard test,
 the real-pack greedy gate.
+
+### A LoRA turned every FLUX.2 klein picture into noise with int8 media on
+Defect: on an M5 (int8 media on by default) any style LoRA, even at scale 0.125, rendered FLUX.2 klein as static; the
+baseline and `--no-w8a8` were clean. Cause: the attached delta keeps the f32 modulated input's dtype, so an adapted
+`v_proj` came out f32 beside bf16 q/k, and `int8_attn.attention` instantiates its V prep for q's dtype
+(`vec<T, 4>`), reading the f32 buffer as bf16. `attentionHeads` already cast; the bare call did not. Fix: the wrapper
+casts `v` to q's dtype. Guard: `int8 attention reads a v wider than q`, `tests/test_real_loras.sh` (open the renders:
+the 9B's broken one scored under the noise bar).

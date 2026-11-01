@@ -11,7 +11,7 @@ enum UsageReset: Equatable {
     }
 }
 
-/// Everything the server has served, day by day and model by model: opened from the status strip's Total Tokens.
+/// Everything the server has served, day by day and model by model: opened from the status strip's speed line.
 struct UsageDashboardSheet: View {
     @ObservedObject var usage: UsageTracker
     @Environment(\.dismiss) private var dismiss
@@ -131,15 +131,10 @@ struct UsageDashboardSheet: View {
                       detail: L10n.format("Requests: %lld", week.requests))
             UsageTile(label: "Requests", value: ThroughputSnapshot.formatTokens(total.requests),
                       detail: L10n.format("%lld%% of prompt cached", cachedShare))
-            UsageTile(label: "Average speed", value: Self.speed(total.decodeTPS),
-                      detail: L10n.format("Prefill %@", Self.speed(total.prefillTPS)))
+            UsageSpeedTile(counters: total)
             UsageTile(label: "Days in a row", value: "\(s.currentStreak(today: today))",
                       detail: s.busiestDay.map { L10n.format("Busiest day: %@", UsageDay.text($0.day)) } ?? "")
         }
-    }
-
-    private static func speed(_ tps: Double?) -> String {
-        tps.flatMap { $0 > 0 ? L10n.format("%@ tok/s", ThroughputSnapshot.formatTPS($0)) : nil } ?? "—"
     }
 
     // MARK: - Charts
@@ -186,11 +181,51 @@ private struct UsageTile: View {
             Text(verbatim: value).font(.app(valueStyle, weight: .semibold)).lineLimit(1).minimumScaleFactor(0.7)
             Text(verbatim: detail).font(.app(.annotation)).foregroundStyle(.tertiary).lineLimit(1)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
-        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.08)))
-        .accessibilityElement(children: .combine)
+        .usageTile()
+    }
+}
+
+/// Decode and prefill: the average over every request beside the fastest one.
+private struct UsageSpeedTile: View {
+    let counters: UsageCounters
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Speed (tok/s)").font(.app(.annotation)).foregroundStyle(.secondary)
+            Grid(alignment: .trailing, horizontalSpacing: 16, verticalSpacing: 2) {
+                GridRow {
+                    Color.clear.gridCellUnsizedAxes([.horizontal, .vertical])
+                    Text("Average")
+                    Text("Max")
+                }
+                .font(.app(.annotation))
+                .foregroundStyle(.tertiary)
+                row("Decode", average: counters.decodeTPS, peak: counters.peakDecodeTPS)
+                row("Prefill", average: counters.prefillTPS, peak: counters.peakPrefillTPS)
+            }
+        }
+        .usageTile()
+    }
+
+    private func row(_ label: LocalizedStringKey, average: Double?, peak: Double) -> some View {
+        GridRow(alignment: .firstTextBaseline) {
+            Text(label).font(.app(.annotation)).foregroundStyle(.secondary).gridColumnAlignment(.leading)
+            Text(verbatim: ThroughputSnapshot.formatTPS(average))
+            Text(verbatim: ThroughputSnapshot.formatTPS(peak))
+        }
+        .font(.app(.title3, weight: .semibold))
+        .monospacedDigit()
+    }
+}
+
+private extension View {
+    /// A tile's ground: content from the top left, a faint fill and edge.
+    func usageTile() -> some View {
+        frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(12)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.04)))
+            .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(Color.primary.opacity(0.08)))
+            .accessibilityElement(children: .combine)
     }
 }
 

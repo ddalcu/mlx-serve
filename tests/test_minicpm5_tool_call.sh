@@ -6,11 +6,12 @@
 # the others (the messages stream once streamed the raw XML AND emitted a tool_use for it).
 #
 #   ./tests/test_minicpm5_tool_call.sh [model_dir] [port]   # default mlx-community/MiniCPM5-1B-OptiQ-4bit; SKIP
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/MiniCPM5-1B-OptiQ-4bit}"
+MODEL="${1:-$(find_model mlx-community/MiniCPM5-1B-OptiQ-4bit || echo "$HOME/.mlx-serve/models/mlx-community/MiniCPM5-1B-OptiQ-4bit")}"
 PORT="${2:-11264}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -52,7 +53,7 @@ rm -f "$RAW_DUMP"
 MLX_SERVE_RAW_DUMP_FILE="$RAW_DUMP" \
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --log-level debug > /tmp/test_messages_stream_minicpm5_tool_call.log 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
 srv_wait_health "$BASE" 120 2 || { echo "FAIL: server did not come up"; exit 1; }
 

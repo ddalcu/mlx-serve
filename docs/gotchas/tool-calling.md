@@ -71,6 +71,13 @@ transcription of `encoding/encoding.py` (`src/fixtures/dsv41_chat_template.jinja
 DSML tag names. Guard: `tests/dsv41_template_ab.py` dumps the cases the render test replays; corpus family
 `dsv41-dsml`.
 
+### A template that raises on any system turn (Mistral-7B v0.3)
+Defect: every Mistral request with a system prompt echoed `<start_of_turn>` and ran to `max_tokens`. Cause: the pack's
+`default` template allows only alternating user/assistant turns and raises on `system`; the raise is the silent generic
+fallback, whose turn markers are Gemma's. Fix: after a failed render `renderChatTemplate` retries once with the leading
+system text inside the first user turn (`systemInFirstUser`), warning once per template. Guard: `renderChatTemplate: a
+template that rejects a system turn renders it inside the first user turn`.
+
 ### jinja.cpp gaps: `x.0` and `\xHH`
 Defect: GLM-5.3 tool history and every Flint turn rendered the generic fallback (Gemma turn markers, wrong stop
 tokens). Cause: jinja.cpp parsed the `0` in `x.0` as a name, and its lexer knew no `\x` escape (Flint's

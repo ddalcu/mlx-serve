@@ -1,13 +1,13 @@
 import SwiftUI
 
-/// The chat window's bottom-left corner: how hard the machine is working, how fast the server is going, and the
-/// running token tally, which opens the usage dashboard. The gauges follow iTherm's status bar (the author's own
-/// menu-bar thermal monitor): green, yellow from 60%, red from 85%.
+/// The chat window's bottom-left corner: how hard the machine is working and how fast the server is going, which
+/// opens the usage dashboard. The gauges follow iTherm's status bar (the author's own menu-bar thermal monitor):
+/// green, yellow from 60%, red from 85%.
 struct UsageStrip: View {
     @ObservedObject var usage: UsageTracker
     let openDashboard: () -> Void
     @StateObject private var system = SystemLoadSampler()
-    @State private var hoveringTotal = false
+    @State private var hoveringSpeed = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -15,12 +15,10 @@ struct UsageStrip: View {
             VStack(alignment: .leading, spacing: 3) {
                 gauges
                 Divider().padding(.vertical, 3)
-                SpeedRow(label: "Decode", live: usage.decodeTPS, average: usage.live?.avgDecodeTPS)
-                SpeedRow(label: "Prefill", live: usage.prefillTPS, average: usage.live?.avgPrefillTPS)
-                // Always laid out, drawn only while a prefill runs, so the rows below do not jump.
+                speedButton
+                // Always laid out, drawn only while a prefill runs, so the strip does not jump.
                 LoadBar(fraction: usage.live?.prefillProgress ?? 0, tint: .accentColor, height: 3)
                     .opacity(usage.live?.prefillProgress == nil ? 0 : 1)
-                totalButton
             }
             .font(.app(.annotation))
             .padding(.horizontal, ChatMetrics.sidebarGutter + 4)
@@ -46,26 +44,37 @@ struct UsageStrip: View {
         load.gpuTemperature.map { "\(load.gpu)% · \(Int($0))°" } ?? "\(load.gpu)%"
     }
 
-    private var totalButton: some View {
+    /// VoiceOver's reading of the speed line, whose numbers leave their unit to the tooltip.
+    static func speedSpoken(decode: Double?, prefill: Double?) -> String {
+        func part(_ name: String, _ tps: Double?) -> String {
+            guard let tps, tps > 0 else { return L10n.format("%@ not measured yet", L10n.text(name)) }
+            return L10n.format("%@ %@ tokens per second", L10n.text(name), ThroughputSnapshot.formatTPS(tps))
+        }
+        return part("Decode", decode) + ", " + part("Prefill", prefill)
+    }
+
+    private var speedButton: some View {
         Button(action: openDashboard) {
             HStack(spacing: 4) {
-                Text("Total Tokens").foregroundStyle(.secondary)
-                Spacer(minLength: 4)
-                Text(verbatim: UsageFormat.compact(usage.totalTokens)).monospacedDigit()
+                SpeedRate(label: "Decode", live: usage.decodeTPS, average: usage.live?.avgDecodeTPS)
+                Spacer(minLength: 8)
+                SpeedRate(label: "Prefill", live: usage.prefillTPS, average: usage.live?.avgPrefillTPS)
                 Image(systemName: "chevron.right").imageScale(.small).foregroundStyle(.tertiary)
             }
             .font(.app(.annotation))
             .padding(.vertical, 3)
             .padding(.horizontal, 4)
-            .background(RoundedRectangle(cornerRadius: 5).fill(SidebarRowStyle.fill(selected: false, hovering: hoveringTotal)))
+            .background(RoundedRectangle(cornerRadius: 5).fill(SidebarRowStyle.fill(selected: false, hovering: hoveringSpeed)))
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
         // The hover fill reaches into the gutter, so the words line up with the rows above.
         .padding(.horizontal, -4)
-        .onHover { hoveringTotal = $0 }
-        .help(L10n.format("%@ tokens since the last reset. Click to open the usage dashboard.",
-                          ThroughputSnapshot.formatTokens(usage.totalTokens)))
+        .onHover { hoveringSpeed = $0 }
+        .help(L10n.text("Tokens per second, dimmed when it is the average since the server started. Click to open the usage dashboard."))
+        .accessibilityLabel(Self.speedSpoken(decode: usage.decodeTPS ?? usage.live?.avgDecodeTPS,
+                                             prefill: usage.prefillTPS ?? usage.live?.avgPrefillTPS))
+        .accessibilityHint(L10n.text("Opens the usage dashboard"))
     }
 }
 
@@ -92,21 +101,18 @@ private struct LoadRow: View {
 }
 
 /// Tokens per second: the live rate while tokens move, the session average (in a quieter ink) at rest.
-private struct SpeedRow: View {
+private struct SpeedRate: View {
     let label: String
     let live: Double?
     let average: Double?
 
     var body: some View {
-        let tps = live ?? average
-        HStack {
+        HStack(spacing: 4) {
             Text(L10n.text(label)).foregroundStyle(.secondary)
-            Spacer(minLength: 4)
-            Text(verbatim: tps.flatMap { $0 > 0 ? L10n.format("%@ tok/s", ThroughputSnapshot.formatTPS($0)) : nil } ?? "—")
+            Text(verbatim: ThroughputSnapshot.formatTPS(live ?? average))
                 .monospacedDigit()
                 .foregroundStyle(live != nil ? .primary : .tertiary)
         }
-        .help(live == nil && average != nil ? L10n.text("Average since the server started") : "")
     }
 }
 

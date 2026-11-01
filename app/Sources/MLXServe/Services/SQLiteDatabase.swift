@@ -17,6 +17,7 @@ final class SQLiteDatabase {
     enum Value: Equatable {
         case text(String)
         case integer(Int)
+        case real(Double)
         case null
     }
 
@@ -33,6 +34,10 @@ final class SQLiteDatabase {
 
         func integer(_ column: Int32) -> Int {
             Int(sqlite3_column_int64(statement, column))
+        }
+
+        func real(_ column: Int32) -> Double {
+            sqlite3_column_double(statement, column)
         }
     }
 
@@ -135,6 +140,8 @@ final class SQLiteDatabase {
                 status = sqlite3_bind_text(statement, index, text, Int32(text.utf8.count), transient)
             case .integer(let number):
                 status = sqlite3_bind_int64(statement, index, sqlite3_int64(number))
+            case .real(let number):
+                status = sqlite3_bind_double(statement, index, number)
             case .null:
                 status = sqlite3_bind_null(statement, index)
             }

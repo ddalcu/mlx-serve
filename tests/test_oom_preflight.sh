@@ -14,10 +14,11 @@
 #
 # Usage: ./tests/test_oom_preflight.sh [model_dir] [port]
 #   Needs any loadable model dir for CPU-side setup (config.json + tokenizer).
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e2b-it-8bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e2b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e2b-it-8bit")}"
 PORT="${2:-11293}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 FAKE="/tmp/test_oom_preflight_model"

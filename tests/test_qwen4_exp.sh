@@ -12,9 +12,10 @@
 #
 # Tie-aware = a divergence only at a near-tie (top-2 gap <= 0.15 nats), on lead-STRIPPED text. Hermetic twins: the
 # qwen4 GDN fused-path and batched decode tests, `ssm checkpoint carries the qwen4_exp aux state`, DiskTier hybrid.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
-MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}"
+MODEL="${QWEN4_MODEL:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit")}"
 PORT="${1:-11411}"
 BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 LOG="$HOME/claude-tmp/qwen4-live/server-$PORT.log"

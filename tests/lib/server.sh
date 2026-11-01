@@ -35,7 +35,7 @@ srv_wait_log() {
 # srv_stop <pid>: TERM the server this script started and reap it. Never kills by name or binary path.
 srv_stop() {
     [ -n "${1:-}" ] || return 0
-    kill "$1" 2>/dev/null
-    wait "$1" 2>/dev/null
-    return 0
+    # `|| true`: under `set -e` a failing kill (already reaped) would end an EXIT trap with status 1.
+    kill "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
 }

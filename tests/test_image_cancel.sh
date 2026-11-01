@@ -28,7 +28,7 @@ BASE="http://127.0.0.1:$PORT"
 "$BIN" --serve --model-dir "$(dirname "$FLUX")" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 CURL_PID=""
-trap 'kill $CURL_PID $SRV 2>/dev/null' EXIT
+trap 'kill $CURL_PID 2>/dev/null; srv_stop $SRV' EXIT
 srv_wait_health "$BASE" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 
 curl -s -m 300 "$BASE/v1/load-model" -X POST -H 'Content-Type: application/json' \

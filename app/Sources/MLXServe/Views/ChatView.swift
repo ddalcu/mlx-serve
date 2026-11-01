@@ -889,8 +889,8 @@ struct SidebarRowSpansKey: PreferenceKey {
     }
 }
 
-/// The bottom edge of the frosted destination block, measured in the column's
-/// own space — rows above this line are behind glass.
+/// The bottom edge of the destination block, measured in the column's own
+/// space — rows above this line have scrolled out of sight.
 struct SidebarClearBandTopKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
@@ -959,9 +959,9 @@ struct ChatSidebar: View {
     /// Holding ⌘ numbers the conversation rows. A modifier held down is STATE,
     /// which SwiftUI does not report outside a hovered view — see the monitor.
     @StateObject private var modifiers = ModifierKeyMonitor()
-    /// Where the frosted destination block ENDS, and where the panel ends, in
-    /// the column's own space — the band a conversation row has to sit inside
-    /// to be readable. Measured rather than derived from the inset's height:
+    /// Where the destination block ENDS, and where the panel ends, in the
+    /// column's own space — the band a conversation row has to sit inside to
+    /// be readable. Measured rather than derived from the block's height:
     /// the block's contents vary (the Create list, the download badge), so the
     /// one number that cannot go stale is the one the block reports itself.
     @State private var clearBandTop: CGFloat = 0
@@ -969,7 +969,7 @@ struct ChatSidebar: View {
     /// Each conversation row's vertical extent, reported only while ⌘ is down.
     @State private var rowSpans: [UUID: SidebarRowSpan] = [:]
 
-    /// The rows a number may land on: those fully clear of the frosted block
+    /// The rows a number may land on: those fully clear of the destination block
     /// and inside the panel. `nil` means "not measured" — before the first
     /// layout after ⌘ goes down — and numbers everything, which is the old
     /// behaviour rather than a sidebar of blank rows for one frame.
@@ -1075,7 +1075,7 @@ struct ChatSidebar: View {
         }
     }
 
-    private var conversationsSidebar: some View {
+    private var sessionList: some View {
         // No `selection:` binding: a List draws its own selection tint UNDER
         // `listRowBackground`, which is the double highlight — two grays, the
         // inner one a different value from the destinations above, and an accent
@@ -1217,11 +1217,9 @@ struct ChatSidebar: View {
                 }
             }
         }
-        // The platform's own scroll-edge effect at BOTH ends: rows pass under
-        // the window's top edge and under the New Chat row (a `safeAreaInset`,
-        // so content scrolls beneath it), and a soft edge is how macOS frosts
-        // that overlap. Not a hand-drawn band — a custom strip pulled into this
-        // area once looked native and swallowed every click in it.
+        // The platform's own soft scroll edge at both ends. Not a hand-drawn
+        // band — a custom strip pulled into this area once looked native and
+        // swallowed every click in it.
         .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
         // No blanket `.onChange(of: activeChatId) { showConversation() }`:
         // every deliberate route into a conversation (the row button above,
@@ -1229,6 +1227,9 @@ struct ChatSidebar: View {
         // the id ALSO moves on deleteSession's fallback — which yanked the
         // user out of the Models/Create/Settings pane they were browsing when
         // they deleted the active chat from the sidebar.
+    }
+
+    private var destinations: some View {
         // No Agents entry here: "Manage Agents…" lives in the composer's agent
         // chip, next to the control it configures, and a second route to the
         // same window only competed with the conversation list. Models is a
@@ -1238,77 +1239,81 @@ struct ChatSidebar: View {
         // window can BE, then what you've said. Selecting any of them changes
         // only the content area — the sidebar never rearranges itself, so the
         // list of places stays where the eye learned it.
-        .safeAreaInset(edge: .top) {
-            VStack(spacing: 2) {
-                // Starting something new (a chat, a coding CLI) is the +
-                // beside the Sessions heading — one place, next to the list
-                // it adds to — rather than two destination rows up here.
-                destinationRow("Models", icon: "square.stack.3d.up",
-                               selected: appState.chatWorkspace.isModels,
-                               badge: activeDownloadCount) {
-                    appState.chatWorkspace.isModels ? appState.showConversation() : appState.showModels()
-                }
-                destinationRow("Settings", icon: "gearshape",
-                               selected: appState.chatWorkspace.isSettings) {
-                    appState.chatWorkspace.isSettings ? appState.showConversation() : appState.showSettings()
-                }
+        VStack(spacing: 2) {
+            // Starting something new (a chat, a coding CLI) is the +
+            // beside the Sessions heading — one place, next to the list
+            // it adds to — rather than two destination rows up here.
+            destinationRow("Models", icon: "square.stack.3d.up",
+                           selected: appState.chatWorkspace.isModels,
+                           badge: activeDownloadCount) {
+                appState.chatWorkspace.isModels ? appState.showConversation() : appState.showModels()
+            }
+            destinationRow("Settings", icon: "gearshape",
+                           selected: appState.chatWorkspace.isSettings) {
+                appState.chatWorkspace.isSettings ? appState.showConversation() : appState.showSettings()
+            }
 
-                // The Create pages, from the SAME catalogue the discovery chips
-                // and the Tools menu iterate (`sidebarCreateItems` — a filter on
-                // `mediaItems`, so the three surfaces cannot drift). Each row is
-                // the mode switch for its generator page, exactly like Models.
-                sectionHeader("Create")
-                ForEach(ChatEmptyState.sidebarCreateItems) { item in
-                    if case .create(let experiment) = item.action {
-                        destinationRow(item.title, icon: item.systemImage,
-                                       selected: appState.chatWorkspace.experiment == experiment) {
-                            if appState.chatWorkspace.experiment == experiment {
-                                appState.showConversation()
-                            } else {
-                                appState.showCreate(experiment)
-                            }
+            // The Create pages, from the SAME catalogue the discovery chips
+            // and the Tools menu iterate (`sidebarCreateItems` — a filter on
+            // `mediaItems`, so the three surfaces cannot drift). Each row is
+            // the mode switch for its generator page, exactly like Models.
+            sectionHeader("Create")
+            ForEach(ChatEmptyState.sidebarCreateItems) { item in
+                if case .create(let experiment) = item.action {
+                    destinationRow(item.title, icon: item.systemImage,
+                                   selected: appState.chatWorkspace.experiment == experiment) {
+                        if appState.chatWorkspace.experiment == experiment {
+                            appState.showConversation()
+                        } else {
+                            appState.showCreate(experiment)
                         }
                     }
                 }
+            }
 
-                // The agent/automation cluster, below Create. A GAP on its
-                // first row instead of a heading: nothing here is a Create
-                // item, and proximity is what would say otherwise.
-                agentsRow
-                    .padding(.top, 10)
-                destinationRow("Tasks", icon: "clock.badge.checkmark",
-                               selected: appState.chatWorkspace.isTasks) {
-                    appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
-                }
-                // No "Chats" heading here: the list carries its own section
-                // headers ("Agents", "Sessions"), and one of them appears only
-                // when it has rows. A heading pinned in this inset could not
-                // do that — it would sit above an empty list announcing a
-                // section that isn't there.
+            // The agent/automation cluster, below Create. A GAP on its
+            // first row instead of a heading: nothing here is a Create
+            // item, and proximity is what would say otherwise.
+            agentsRow
+                .padding(.top, 10)
+            destinationRow("Tasks", icon: "clock.badge.checkmark",
+                           selected: appState.chatWorkspace.isTasks) {
+                appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
             }
-            // One gutter for the whole panel — the conversation rows below
-            // apply the same constant, so the two halves are the same width by
-            // construction rather than by two numbers that happen to agree.
-            .padding(.horizontal, ChatMetrics.sidebarGutter)
-            .padding(.top, 10)
-            .padding(.bottom, 8)
-            // Where the frost ENDS. This block is what conversation rows scroll
-            // under, so its own bottom edge is the line between "readable" and
-            // "behind glass" — no constant to keep in step with its contents.
-            .background {
-                GeometryReader { proxy in
-                    Color.clear.preference(
-                        key: SidebarClearBandTopKey.self,
-                        value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
-                }
+            // No "Chats" heading here: the list carries its own section
+            // headers ("Agents", "Sessions"), and one of them appears only
+            // when it has rows. A heading pinned in this inset could not
+            // do that — it would sit above an empty list announcing a
+            // section that isn't there.
+        }
+        // One gutter for the whole panel — the conversation rows below
+        // apply the same constant, so the two halves are the same width by
+        // construction rather than by two numbers that happen to agree.
+        .padding(.horizontal, ChatMetrics.sidebarGutter)
+        .padding(.top, 10)
+        .padding(.bottom, 8)
+        // Where the visible list begins: rows above this line have scrolled
+        // out of sight. No constant to keep in step with the block's contents.
+        .background {
+            GeometryReader { proxy in
+                Color.clear.preference(
+                    key: SidebarClearBandTopKey.self,
+                    value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
             }
-            // No backdrop: the toolbar's BAR is back, so `scrollEdgeEffectStyle`
-            // has something to attach to again and the platform frosts what
-            // scrolls beneath this block.
+        }
+    }
+
+    /// The destinations ABOVE the session list, never a `safeAreaInset` over it:
+    /// the platform frosts only what scrolls under the toolbar's bar, so rows
+    /// scrolled under the inset drew straight over Agents and Tasks.
+    private var conversationsSidebar: some View {
+        VStack(spacing: 0) {
+            destinations
+            sessionList
         }
         // The panel's own bottom edge closes the band — in this space that is
         // the column's HEIGHT, which is the whole "how much window is there?"
-        // question the badge count answers. Applied OUTSIDE the safeAreaInset
+        // question the badge count answers. Applied to the stack holding both
         // so it measures the whole column, and so the three readers below are
         // ancestors of the block that publishes the top edge — a preference
         // only travels up.
@@ -1328,8 +1333,8 @@ struct ChatSidebar: View {
                     value: proxy.frame(in: .named(ChatSidebar.bandSpace)).maxY)
             }
         }
-        // Declared here, OUTSIDE both readers and the inset, so the block, the
-        // column and every row resolve against the same origin.
+        // Declared here, OUTSIDE both readers, so the block, the column and
+        // every row resolve against the same origin.
         .coordinateSpace(.named(ChatSidebar.bandSpace))
         .onPreferenceChange(SidebarClearBandTopKey.self) { value in
             applyMeasurement(value, to: $clearBandTop)
@@ -1678,8 +1683,8 @@ struct ChatSidebar: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        // Where this row sits, so the numbering can skip whatever is under the
-        // frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+        // Where this row sits, so the numbering can skip whatever has scrolled
+        // above the list. Attached ONLY while ⌘ is down: a probe on every row is
         // a preference write per row per scroll frame, and outside this
         // transient mode nothing reads the answer.
         .background(rowSpanProbe(session.id))
@@ -1858,8 +1863,8 @@ struct ChatSidebar: View {
         }
     }
 
-    /// Where a row sits, so the numbering can skip whatever is under the
-    /// frosted block. Attached ONLY while ⌘ is down: a probe on every row is
+    /// Where a row sits, so the numbering can skip whatever has scrolled
+    /// above the list. Attached ONLY while ⌘ is down: a probe on every row is
     /// a preference write per row per scroll frame, and outside this
     /// transient mode nothing reads the answer.
     @ViewBuilder
@@ -1875,7 +1880,7 @@ struct ChatSidebar: View {
     }
 
     /// The ⌘-digit badge for a row, nil when it wears none (⌘ up, or the row
-    /// is under the frost). Shared by chat and terminal rows — one panel, one
+    /// has scrolled out of sight). Shared by chat and terminal rows — one panel, one
     /// numbering.
     private func quickSwitchBadge(for id: UUID) -> AnyView? {
         guard modifiers.commandHeld,

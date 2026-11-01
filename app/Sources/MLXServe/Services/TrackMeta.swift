@@ -152,7 +152,7 @@ struct TrackMeta: Equatable {
 struct TrackDay: Identifiable, Equatable {
     let id: String
     let label: String
-    let paths: [String]
+    var paths: [String]
 
     /// Consecutive paths that share a day form one group; a clip with no date
     /// joins "Earlier".
@@ -162,7 +162,7 @@ struct TrackDay: Identifiable, Equatable {
             let day = date(path).map { calendar.startOfDay(for: $0) }
             let id = day.map { "\($0.timeIntervalSinceReferenceDate)" } ?? "earlier"
             if let last = days.last, last.id == id {
-                days[days.count - 1] = TrackDay(id: id, label: last.label, paths: last.paths + [path])
+                days[days.count - 1].paths.append(path)
             } else {
                 days.append(TrackDay(id: id, label: label(day, now: now, calendar: calendar), paths: [path]))
             }

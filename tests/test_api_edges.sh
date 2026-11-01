@@ -10,11 +10,12 @@
 # stop "" matched at position 0 (empty reply), json_schema without a schema
 # fell open silently, an undecodable image_url vanished from the prompt, an
 # empty embedding input was a 500, and Ollama's load handshake was a 400.
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+MODEL="${1:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 PORT="${2:-11512}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"

@@ -9,6 +9,12 @@ struct UsageCounters: Equatable {
     var generatedTokens: Int64 = 0
     var prefillNs: Int64 = 0
     var decodeNs: Int64 = 0
+    /// The fastest look's rates, tokens per second. Gauges, not counts: adding keeps the larger, the server sends none.
+    var peakDecodeTPS: Double = 0
+    var peakPrefillTPS: Double = 0
+
+    /// Fewer tokens than this are too few to time, so a look that short sets no peak.
+    static let peakMinTokens: Int64 = 32
 
     var totalTokens: Int64 { promptTokens + generatedTokens }
     var isEmpty: Bool { self == UsageCounters() }
@@ -29,7 +35,8 @@ struct UsageCounters: Equatable {
     static func + (l: Self, r: Self) -> Self {
         Self(requests: l.requests + r.requests, promptTokens: l.promptTokens + r.promptTokens,
              cachedTokens: l.cachedTokens + r.cachedTokens, generatedTokens: l.generatedTokens + r.generatedTokens,
-             prefillNs: l.prefillNs + r.prefillNs, decodeNs: l.decodeNs + r.decodeNs)
+             prefillNs: l.prefillNs + r.prefillNs, decodeNs: l.decodeNs + r.decodeNs,
+             peakDecodeTPS: max(l.peakDecodeTPS, r.peakDecodeTPS), peakPrefillTPS: max(l.peakPrefillTPS, r.peakPrefillTPS))
     }
 
     static func - (l: Self, r: Self) -> Self {
@@ -42,6 +49,14 @@ struct UsageCounters: Equatable {
     func fell(below base: Self) -> Bool {
         requests < base.requests || promptTokens < base.promptTokens || cachedTokens < base.cachedTokens
             || generatedTokens < base.generatedTokens || prefillNs < base.prefillNs || decodeNs < base.decodeNs
+    }
+
+    /// These counters with their own rates as the peaks, where they hold enough tokens to time.
+    func withOwnPeaks() -> Self {
+        var c = self
+        if generatedTokens >= Self.peakMinTokens { c.peakDecodeTPS = decodeTPS ?? 0 }
+        if promptTokens - cachedTokens >= Self.peakMinTokens { c.peakPrefillTPS = prefillTPS ?? 0 }
+        return c
     }
 }
 
@@ -111,7 +126,7 @@ struct UsageLedger {
         return snapshot.usage.compactMap { model, now in
             let base = restarted ? UsageCounters() : (before[model] ?? UsageCounters())
             let added = now.fell(below: base) ? now : now - base
-            return added.isEmpty ? nil : UsageDelta(day: day, model: model, counters: added)
+            return added.isEmpty ? nil : UsageDelta(day: day, model: model, counters: added.withOwnPeaks())
         }
         .sorted { $0.model < $1.model }
     }

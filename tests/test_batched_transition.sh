@@ -7,6 +7,7 @@
 # A solo temp-0 baseline, then the same stream with a request injected mid-generation (3 rounds) and two identical
 # streams + one other fired at once (2 rounds): every stream must equal the baseline byte for byte. On a GDN trunk
 # (qwen3_5 / qwen4 pack) this is also batched-then-serial == all-serial (the tick advances each slot's moe_seq_offset).
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
@@ -18,7 +19,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${BATCH_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
+MODEL="${BATCH_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_batched_transition: model directory not found."

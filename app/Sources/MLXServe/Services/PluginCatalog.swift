@@ -82,9 +82,30 @@ enum PluginCatalog {
         return compare(running, String(requirement.dropFirst(2)).trimmingCharacters(in: .whitespaces)) != .orderedAscending
     }
 
-    /// The mlx-serve version line of `mlx-serve --version`, if any.
+    /// mlx-serve's own kit folder (`plugin new` reads it too, `src/host/plugins/cli.zig`).
+    static let homeKitDir = NSString(string: "~/.mlx-serve/kit").expandingTildeInPath
+
+    /// `dir` when it holds a plugin kit for `running` (its `build.zig.zon` version), else nil: the install script
+    /// otherwise downloads the plugins repo's KIT_VERSION from a release, and a plugin built on another server's kit
+    /// is refused at load.
+    static func kit(at dir: String, matching running: String?) -> String? {
+        guard let running, FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("build.zig")),
+              let zon = try? String(contentsOfFile: (dir as NSString).appendingPathComponent("build.zig.zon"), encoding: .utf8),
+              let match = zon.range(of: #"\.version\s*=\s*"([^"]+)""#, options: .regularExpression) else { return nil }
+        let version = zon[match].split(separator: "\"").dropFirst().first.map(String.init)
+        return version == running ? dir : nil
+    }
+
+    /// Why an install step exited non-zero: a kit no release carries yet is named, everything else is the log's.
+    static func installFailure(status: Int32, log: String, running: String?) -> String {
+        guard log.contains("[fetch-kit] cannot download") else { return "build or install failed (exit \(status)); see the log" }
+        let version = running ?? "?"
+        return L10n.format("no plugin kit for mlx-serve %@: it is not released yet. Put the kit for %@ in ~/.mlx-serve/kit (in an mlx-serve checkout: zig build kit), then install again", version, version)
+    }
+
+    /// The release on the mlx-serve line of `mlx-serve --version`, if any, without a dev build's flavor (`26.11.1 (fast)`).
     static func runningVersion(fromVersionOutput text: String) -> String? {
-        EngineVersions.parse(text).first { $0.name == "mlx-serve" }?.version
+        EngineVersions.parse(text).first { $0.name == "mlx-serve" }?.version.split(separator: " ").first.map(String.init)
     }
 
     /// Removes an installed plugin's dylib and receipt. Plugins load at startup, so it takes effect on restart.

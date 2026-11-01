@@ -26,12 +26,6 @@ final class UsageTracker: ObservableObject {
         self.fetch = fetch
     }
 
-    /// Every token counted since the last reset, plus the ones a reply in flight has written so far.
-    var totalTokens: Int64 {
-        let inFlight = live.map { max(0, $0.displayedTokens - $0.generatedTokens) } ?? 0
-        return summary.total.totalTokens + inFlight
-    }
-
     /// How often to look: every second while a request is served, so the rates and the prefill bar move, else at rest.
     nonisolated static func interval(busy: Bool) -> Duration { busy ? .seconds(1) : .seconds(2) }
 

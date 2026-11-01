@@ -7,12 +7,13 @@
 #   ./tests/test_stop_in_reasoning.sh [model_dir] [port]
 #
 # Hermetic twins: corpus `a stop string ends the answer, never the reasoning`, `a stop string matches the answer`.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+MODEL="${1:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 PORT="${2:-11549}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"

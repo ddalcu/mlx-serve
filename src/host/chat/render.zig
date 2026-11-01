@@ -143,22 +143,17 @@ pub fn renderChatTemplate(
 
     if (try renderJinja(allocator, effective_messages, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
         defer allocator.free(rendered);
-        const collapsed = try collapseDoubledThinkTags(allocator, rendered);
-        // A continuation commits the content channel and then hands the model
-        // its own unfinished sentence. It runs INSTEAD of the thinking-off
-        // tail, never beside it — both append the same channel commit, and
-        // twice is a malformed turn header.
-        if (prefill) |partial| {
-            defer allocator.free(collapsed);
-            return std.mem.concat(allocator, u8, &.{
-                collapsed, contentChannelTail(tpl, collapsed, true), partial,
-            });
+        return finishRendered(allocator, rendered, tpl, prefill, enable_thinking, tools_json != null);
+    }
+    // A template that rejects a system turn (Mistral v0.3's `default`: roles alternate from user) gets it inside the
+    // first user turn: the generic format below speaks another family's turn markers.
+    if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+    if (try systemInFirstUser(fallback_arena.?.allocator(), effective_messages)) |folded| {
+        if (try renderJinja(allocator, folded, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
+            defer allocator.free(rendered);
+            if (lateFoldWarningId(tpl)) |id| log.warn("chat template {x:0>16} rejects a system turn; it is rendered inside the first user turn\n", .{id});
+            return finishRendered(allocator, rendered, tpl, prefill, enable_thinking, tools_json != null);
         }
-        if (noThinkTailSuffix(tpl, collapsed, enable_thinking, tools_json != null)) |suffix| {
-            defer allocator.free(collapsed);
-            return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
-        }
-        return collapsed;
     }
 
     // WARN, not debug: a failed render silently swaps the prompt into
@@ -192,6 +187,39 @@ fn lateFoldWarningId(tpl: []const u8) ?u64 {
     late_fold_warned[late_fold_warned_len] = id;
     late_fold_warned_len += 1;
     return id;
+}
+
+/// The rendered prompt's tail: doubled think tags collapsed, then the continuation's partial reply or the
+/// thinking-off suffix.
+fn finishRendered(allocator: std.mem.Allocator, rendered: []const u8, tpl: []const u8, prefill: ?[]const u8, enable_thinking: bool, has_tools: bool) ![]const u8 {
+    const collapsed = try collapseDoubledThinkTags(allocator, rendered);
+    // A continuation commits the content channel and then hands the model
+    // its own unfinished sentence. It runs INSTEAD of the thinking-off
+    // tail, never beside it — both append the same channel commit, and
+    // twice is a malformed turn header.
+    if (prefill) |partial| {
+        defer allocator.free(collapsed);
+        return std.mem.concat(allocator, u8, &.{
+            collapsed, contentChannelTail(tpl, collapsed, true), partial,
+        });
+    }
+    if (noThinkTailSuffix(tpl, collapsed, enable_thinking, has_tools)) |suffix| {
+        defer allocator.free(collapsed);
+        return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
+    }
+    return collapsed;
+}
+
+/// `messages` with a leading system turn moved to the front of the first user turn's text; null without one.
+fn systemInFirstUser(a: std.mem.Allocator, messages: []const Message) !?[]const Message {
+    if (messages.len < 2 or !std.mem.eql(u8, messages[0].role, "system")) return null;
+    const u = for (messages[1..], 1..) |m, i| {
+        if (std.mem.eql(u8, m.role, "user")) break i;
+    } else return null;
+    const out = try a.alloc(Message, messages.len - 1);
+    @memcpy(out, messages[1..]);
+    out[u - 1].content = try std.mem.concat(a, u8, &.{ messages[0].content, "\n\n", messages[u].content });
+    return out;
 }
 
 pub fn hasExtraSystemMessages(messages: []const Message) bool {
@@ -530,6 +558,22 @@ test "collapseDoubledThinkTags handles multiple separated doublings" {
     const out = try collapseDoubledThinkTags(testing.allocator, "A</think></think>B</think></think>C");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("A</think>B</think>C", out);
+}
+
+test "renderChatTemplate: a template that rejects a system turn renders it inside the first user turn, never the generic format" {
+    // Mistral-7B-Instruct-v0.3's `default` template: roles must alternate starting with user, no system role.
+    const a = testing.allocator;
+    const mistral = "{{bos_token}}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message['role'] == 'user' %}{{ ' [INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' ' + message['content'] + ' ' + eos_token}}{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}{% endfor %}";
+    const messages = [_]Message{
+        .{ .role = "system", .content = "Be brief." },
+        .{ .role = "user", .content = "Hi" },
+        .{ .role = "assistant", .content = "Hello." },
+        .{ .role = "user", .content = "Bye" },
+    };
+    const config = ChatConfig{ .chat_template = mistral, .bos_token = "<s>", .eos_token = "</s>", .add_bos_token = false, .allocator = a };
+    const out = try renderChatTemplate(a, &messages, &config, null, null, false, null, false);
+    defer a.free(out);
+    try testing.expectEqualStrings("<s> [INST] Be brief.\n\nHi [/INST] Hello. </s> [INST] Bye [/INST]", out);
 }
 
 test "renderChatTemplate: a tool-aware template with a generic role header renders tool turns natively" {

@@ -10,7 +10,10 @@ enum PromptRewriter {
     struct Request: Equatable {
         let system: String
         let user: String
-        var maxTokens = 2048
+        /// 0 = no cap, the server allows the rest of the context: a capped reply let a thinking model spend it all on the
+        /// think. The think itself is bounded by the effort.
+        var maxTokens = 0
+        var reasoningEffort = "medium"
         /// The clip's first frame, shown to a chat model that can see it.
         var firstFrame: Data? = nil
         /// What the model must do with the picture; said only when it is sent.
@@ -159,8 +162,6 @@ enum PromptRewriter {
             \(H3PromptExamples.examples(for: format).prefix(2).map(\.body).joined(separator: "\n\n---\n\n"))
             """,
             user: "Story:\n\n\(idea)\n\nTotal length: \(totalSeconds) seconds, about \(shots) shots.",
-            // A labelled shot runs to a few hundred tokens, and a long story is dozens of shots.
-            maxTokens: 1024 + 512 * shots,
             firstFrame: firstFrame,
             firstFrameRule: firstFrameRule + " Shot 1 opens on it, and every later shot keeps that look.")
     }

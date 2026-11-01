@@ -164,9 +164,15 @@ pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f3
         _ = mlx.mlx_array_free(a);
     };
 
+    // The V prep reads `v` as q's dtype (`vec<T, 4>`): a LoRA delta in f32 leaves an adapted v_proj wider.
+    var vc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vc);
+    const wide = mlx.mlx_array_dtype(v) != dt;
+    if (wide) try mlx.check(mlx.mlx_astype(&vc, v, dt, s));
+    const vt = if (wide) vc else v;
     var av = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(av);
-    try mlx.check(mlx.mlx_abs(&av, v, s));
+    try mlx.check(mlx.mlx_abs(&av, vt, s));
     var vmx = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vmx);
     try mlx.check(mlx.mlx_max_axis(&vmx, av, 2, false, s));
@@ -174,7 +180,7 @@ pub fn attention(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f3
     defer _ = mlx.mlx_array_free(vm);
     try mlx.check(mlx.mlx_astype(&vm, vmx, .float32, s));
     var vp: [1]mlx.mlx_array = undefined;
-    try launch(vprep_kernel.?, &.{ v, vm }, &.{.{ .shape = &.{ kv, l, 128 }, .dtype = .int8 }}, simdGrid(kv * l), 1, 256, dt, &vp, s);
+    try launch(vprep_kernel.?, &.{ vt, vm }, &.{.{ .shape = &.{ kv, l, 128 }, .dtype = .int8 }}, simdGrid(kv * l), 1, 256, dt, &vp, s);
     defer _ = mlx.mlx_array_free(vp[0]);
 
     const sc = mlx.mlx_array_new_float(scale * std.math.log2e);
@@ -319,6 +325,27 @@ test "int8 attention equals sdpa within quantization error (fewer queries than k
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     try testing.expect(try attnError(4, 4, 200, 517, 41, s) < 0.03);
+}
+
+test "int8 attention reads a v wider than q (a LoRA-adapted v_proj comes out f32) as the same values" {
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const q = try bf16(try randn(&.{ 1, 4, 256, 128 }, 51, s), s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try bf16(try randn(&.{ 1, 4, 256, 128 }, 52, s), s);
+    defer _ = mlx.mlx_array_free(k);
+    const vb = try bf16(try randn(&.{ 1, 4, 256, 128 }, 53, s), s);
+    defer _ = mlx.mlx_array_free(vb);
+    var vf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vf);
+    try mlx.check(mlx.mlx_astype(&vf, vb, .float32, s));
+    const scale: f32 = 1.0 / @sqrt(128.0);
+    const want = (try attention(q, k, vb, scale, s)).?;
+    defer _ = mlx.mlx_array_free(want);
+    const got = (try attention(q, k, vf, scale, s)).?;
+    defer _ = mlx.mlx_array_free(got);
+    try testing.expect(try @import("w8a8.zig").relRms(got, want, s) < 1e-6);
 }
 
 test "int8 attention heads: a batch of f16 rows equals sdpa row for row, in sdpa's layout and dtype" {

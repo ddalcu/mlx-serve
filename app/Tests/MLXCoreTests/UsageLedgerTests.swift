@@ -15,6 +15,12 @@ final class UsageLedgerTests: XCTestCase {
         return s
     }
 
+    /// The strip's speed line shows bare numbers; VoiceOver reads them with their unit, or says there is none yet.
+    func testTheSpeedLineIsSpokenWithItsUnit() {
+        XCTAssertEqual(UsageStrip.speedSpoken(decode: 54.24, prefill: 480.4), "Decode 54.2 tokens per second, Prefill 480 tokens per second")
+        XCTAssertEqual(UsageStrip.speedSpoken(decode: nil, prefill: 0), "Decode not measured yet, Prefill not measured yet")
+    }
+
     func testTheFirstSnapshotOnlySetsTheBaseline() {
         // A server already running when the app first looks has a past nobody here can date.
         var ledger = UsageLedger()
@@ -60,6 +66,34 @@ final class UsageLedgerTests: XCTestCase {
         XCTAssertEqual(c.prefillTPS ?? 0, 200, accuracy: 0.001, "only the tokens that were computed, not the cached ones")
         XCTAssertNil(UsageCounters().decodeTPS)
         XCTAssertEqual(c.totalTokens, 1090)
+    }
+
+    func testEachLookCarriesItsOwnRatesAsItsPeaks() {
+        var ledger = UsageLedger()
+        _ = ledger.ingest(snapshot(["org/a": counters()]), day: "2026-10-31")
+        var now = counters(requests: 2, prompt: 2100, generated: 90)
+        now.prefillNs += 1_000_000_000   // 2000 prompt tokens in one more second
+        now.decodeNs += 2_000_000_000    // 80 generated tokens in two more seconds
+        let peak = ledger.ingest(snapshot(["org/a": now]), day: "2026-10-31").first?.counters
+        XCTAssertEqual(peak?.peakDecodeTPS ?? 0, 40, accuracy: 0.001)
+        XCTAssertEqual(peak?.peakPrefillTPS ?? 0, 2000, accuracy: 0.001)
+    }
+
+    func testAStretchTooShortToTimeSetsNoPeak() {
+        var ledger = UsageLedger()
+        _ = ledger.ingest(snapshot(["org/a": counters()]), day: "2026-10-31")
+        var now = counters(requests: 2, prompt: 110, generated: 13)
+        now.prefillNs += 1_000
+        now.decodeNs += 1_000
+        let short = ledger.ingest(snapshot(["org/a": now]), day: "2026-10-31").first?.counters
+        XCTAssertEqual(short?.peakDecodeTPS, 0)
+        XCTAssertEqual(short?.peakPrefillTPS, 0)
+    }
+
+    func testAddingKeepsTheFasterPeak() {
+        let slow = UsageCounters(requests: 1, peakDecodeTPS: 30, peakPrefillTPS: 900)
+        let fast = UsageCounters(requests: 1, peakDecodeTPS: 50, peakPrefillTPS: 700)
+        XCTAssertEqual(slow + fast, UsageCounters(requests: 2, peakDecodeTPS: 50, peakPrefillTPS: 900))
     }
 
     func testTheDayKeyIsTheLocalCalendarDay() {

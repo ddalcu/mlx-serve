@@ -7,11 +7,12 @@
 #
 #   ./tests/test_prefix_cache_mem.sh [/path/to/model] [port]
 #   SHORT_BUDGET_MB=64 N_REQ=5 PROMPT_REPEATS=200 GROW_TURNS=5 GROW_WORDS=2000
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 PORT="${2:-8094}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'

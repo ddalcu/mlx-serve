@@ -7,12 +7,13 @@
 #
 # Env: QWEN4_MODEL (pack), MLX_SERVE_BIN (a control binary must sit in zig-out/bin/ for its rpath), QWEN4_AB_OUT
 # (~/claude-tmp/qwen4-ab), QWEN4_AB_PORT. Engine env (MLX_SERVE_DIAG=mtp-trace, ...) passes to the server.
+source "$(dirname "$0")/_lib_models.sh"
 
 setopt nonomatch
 mode=$1; tag=$2; shift 2
 D=${0:A:h}/fixtures/qwen4_ab
 O=${QWEN4_AB_OUT:-$HOME/claude-tmp/qwen4-ab}; mkdir -p $O
-PACK=${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}
+PACK=${QWEN4_MODEL:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit")}
 BIN=${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}
 PORT=${QWEN4_AB_PORT:-11414}
 LOG=$O/${mode}_$tag.log
