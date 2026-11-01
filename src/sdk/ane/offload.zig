@@ -220,19 +220,22 @@ pub fn mediaTileRows(seq: u32) u32 {
     return if (seq < MEDIA_TILE_ROWS) 0 else MEDIA_TILE_ROWS;
 }
 
-/// One 16-core ANE's measured rate on our int8/fp16 MLP program (the
-/// Stage-A harness in the file header). M1 through M4 all ship that engine.
+/// One 16-core ANE's rate on our int8/fp16 MLP program (the Stage-A harness
+/// in the file header). M1 through M4 ship one engine generation; M5 ships the
+/// faster next-gen 16-core engine.
 pub const ANE_TFLOPS_M1_M4: f64 = 11.8;
+pub const ANE_TFLOPS_M5: f64 = 14.6;
 
 /// Total ANE rate for `units` engines, or null on silicon nobody measured
-/// (M5+ NAX-class GPUs, an unreadable brand): the caller keeps the default
-/// rather than guessing. Token-exact family match, never a substring.
+/// (M6+, an unreadable brand): the caller keeps the default rather than
+/// guessing. Token-exact family match, never a substring.
 pub fn aneTflopsFor(chip: []const u8, units: u32) ?f64 {
     var it = std.mem.splitScalar(u8, chip, ' ');
     while (it.next()) |tok| {
         for ([_][]const u8{ "M1", "M2", "M3", "M4" }) |fam| {
             if (std.mem.eql(u8, tok, fam)) return ANE_TFLOPS_M1_M4 * @as(f64, @floatFromInt(units));
         }
+        if (std.mem.eql(u8, tok, "M5")) return ANE_TFLOPS_M5 * @as(f64, @floatFromInt(units));
     }
     return null;
 }
@@ -1889,12 +1892,17 @@ test "solveShare: lands on the four measured optima, clamps, degenerate probe = 
     try testing.expectEqual(DEFAULT_MEDIA_SHARE, solveShare(0, a));
 }
 
-test "aneTflopsFor: one row for M1-M4 per unit, unknown silicon is no row" {
+test "aneTflopsFor: M1-M4 and M5 rows per unit, unknown silicon is no row" {
     try testing.expectEqual(@as(?f64, ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M1 Pro", 1));
     try testing.expectEqual(@as(?f64, ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M4", 1));
     try testing.expectEqual(@as(?f64, 2 * ANE_TFLOPS_M1_M4), aneTflopsFor("Apple M3 Ultra", 2));
-    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M5 Max", 1));
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M5), aneTflopsFor("Apple M5", 1));
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M5), aneTflopsFor("Apple M5 Pro", 1));
+    try testing.expectEqual(@as(?f64, ANE_TFLOPS_M5), aneTflopsFor("Apple M5 Max", 1));
+    try testing.expectEqual(@as(?f64, 2 * ANE_TFLOPS_M5), aneTflopsFor("Apple M5 Ultra", 2));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M6 Max", 1));
     try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M45", 1));
+    try testing.expectEqual(@as(?f64, null), aneTflopsFor("Apple M50", 1));
     try testing.expectEqual(@as(?f64, null), aneTflopsFor("", 1));
 }
 
