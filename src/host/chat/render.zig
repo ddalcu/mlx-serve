@@ -1127,6 +1127,37 @@ test "assistant history reasoning_content reaches a template that reads it (lagu
     try testing.expect(std.mem.indexOf(u8, rendered, "<think>two plus two is four</think>4") != null);
 }
 
+test "renderChatTemplate: a set inside a for loop does not carry into the next iteration (GLM-5.3-Flash)" {
+    // Jinja2 starts every iteration from the loop's outer scope; a pre-loop value comes back each time.
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = "{%- set rc = 'OUTER' -%}{%- for m in messages -%}{%- if m.role == 'assistant' -%}" ++
+            "{%- if m.reasoning_content is string -%}{%- set rc = m.reasoning_content -%}{%- endif -%}" ++
+            "{%- if m.reasoning_content is string -%}{%- set fresh = m.reasoning_content -%}{%- endif -%}" ++
+            "[{{ rc }}|<think>{{ fresh if fresh is defined else '' }}</think>{{ m.content }}]" ++
+            "{%- endif -%}{%- endfor -%}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{
+        .{ .role = "user", .content = "hi" },
+        .{ .role = "assistant", .content = "one", .reasoning_content = "THOUGHT-1" },
+        .{ .role = "user", .content = "again" },
+        .{ .role = "assistant", .content = "two" },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings("[THOUGHT-1|<think>THOUGHT-1</think>one][OUTER|<think></think>two]", rendered);
+
+    config.chat_template = @embedFile("../../fixtures/glm5_next_chat_template.jinja");
+    const glm = try renderChatTemplate(allocator, &messages, &config, null, null, false, null, false);
+    defer allocator.free(glm);
+    try testing.expect(std.mem.indexOf(u8, glm, "<|assistant|><think>THOUGHT-1</think>one") != null);
+    try testing.expect(std.mem.indexOf(u8, glm, "<|assistant|><think></think>two") != null);
+}
+
 test "templateReferencesToolRole detects role branches" {
     try testing.expect(templateReferencesToolRole("{% if message['role'] == 'tool' %}"));
     try testing.expect(templateReferencesToolRole("{% if message.role == \"tool\" %}"));
