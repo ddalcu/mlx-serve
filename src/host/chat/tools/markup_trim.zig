@@ -9,7 +9,7 @@ const inklingIsNameChar = @import("inkling.zig").inklingIsNameChar;
 const BARE_INVOKE = @import("invoke.zig").BARE_INVOKE;
 const FUNCTION_CALLS_TAG = @import("invoke.zig").FUNCTION_CALLS_TAG;
 const freeParsedCalls = @import("dsml.zig").freeParsedCalls;
-const miniMaxMarkupStart = @import("minimax.zig").miniMaxMarkupStart;
+const miniMaxEnvelopeStart = @import("minimax.zig").miniMaxEnvelopeStart;
 
 /// Tool-call WRAPPER openers (and DSML's closer, which no prose spells) that must never survive into text a client
 /// renders. Every entry is the opening marker of a call block, so whatever
@@ -122,8 +122,8 @@ pub fn toolMarkupStart(text: []const u8) ?usize {
             is_inkling = false;
         }
     }
-    // MiniMax: its namespace prefixes every structural tag, but alone it is prose.
-    if (miniMaxMarkupStart(text)) |p| {
+    // MiniMax: its namespace prefixes every structural tag, but alone it is prose, and in a JSON answer payload.
+    if (miniMaxEnvelopeStart(text)) |p| {
         if (p < cut) {
             cut = p;
             is_inkling = false;
@@ -283,4 +283,7 @@ test "MiniMax native incomplete markup is not visible content" {
     try testing.expectEqualStrings("Run this.", trimLeakedToolMarkup("Run this.]<]minimax[>["));
     const prose = "The marker is ]<]minimax[>[, spelled out.";
     try testing.expectEqualStrings(prose, trimLeakedToolMarkup(prose));
+    // A JSON answer's strings are payload, as the parser takes them.
+    const json = "{\"marker\": \"]<]minimax[>[<invoke name=\\\"shell\\\">\"}";
+    try testing.expectEqualStrings(json, trimLeakedToolMarkup(json));
 }

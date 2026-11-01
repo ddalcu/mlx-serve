@@ -19,9 +19,24 @@ pub fn miniMaxMarkupStart(text: []const u8) ?usize {
     return null;
 }
 
-/// While streaming: a namespace tag, or a growing lead-in of one at the end, holds the text back.
+/// The first MiniMax tag in text MiniMax can own: not in a JSON answer or call (text opening with `{` or `[`), nor
+/// after a `<function=` call's opener, whose strings are payload. The parser, the stream gate and the trimmer share it.
+pub fn miniMaxEnvelopeStart(text: []const u8) ?usize {
+    if (jsonShaped(text)) return null;
+    const p = miniMaxMarkupStart(text) orelse return null;
+    if (std.mem.indexOf(u8, text[0..p], "<function=") != null) return null;
+    return p;
+}
+
+fn jsonShaped(text: []const u8) bool {
+    const t = std.mem.trimStart(u8, text, " \t\r\n");
+    return std.mem.startsWith(u8, t, "{") or std.mem.startsWith(u8, t, "[");
+}
+
+/// While streaming: a MiniMax tag, or a growing lead-in of one at the end, holds the text back.
 pub fn miniMaxMarkupHolds(buf: []const u8) bool {
-    if (miniMaxMarkupStart(buf) != null) return true;
+    if (miniMaxEnvelopeStart(buf) != null) return true;
+    if (jsonShaped(buf) or std.mem.indexOf(u8, buf, "<function=") != null) return false;
     const opener = MINIMAX_NAMESPACE ++ "<";
     for (1..opener.len) |n| if (std.mem.endsWith(u8, buf, opener[0..n])) return true;
     return false;

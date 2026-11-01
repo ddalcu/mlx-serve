@@ -33,16 +33,13 @@ const parseHermesToolCall = @import("hermes.zig").parseHermesToolCall;
 const parseMiniCpm5ToolCalls = @import("minicpm5.zig").parseMiniCpm5ToolCalls;
 const MINIMAX_NAMESPACE = @import("minimax.zig").MINIMAX_NAMESPACE;
 const parseMiniMaxToolCalls = @import("minimax.zig").parseMiniMaxToolCalls;
-const miniMaxMarkupStart = @import("minimax.zig").miniMaxMarkupStart;
+const miniMaxEnvelopeStart = @import("minimax.zig").miniMaxEnvelopeStart;
 const toolMarkupStart = @import("markup_trim.zig").toolMarkupStart;
 
 /// MiniMax owns the text only when its namespace opens the first tool envelope:
 /// inside a JSON or `<function=` call it is that call's argument payload.
 fn miniMaxOwnsSyntax(text: []const u8) bool {
-    const native = miniMaxMarkupStart(text) orelse return false;
-    const trimmed = std.mem.trimStart(u8, text, " \t\r\n");
-    if (std.mem.startsWith(u8, trimmed, "{") or std.mem.startsWith(u8, trimmed, "[")) return false;
-    if (std.mem.indexOf(u8, text[0..native], "<function=") != null) return false;
+    const native = miniMaxEnvelopeStart(text) orelse return false;
     return toolMarkupStart(text) == native;
 }
 

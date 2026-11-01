@@ -1050,4 +1050,7 @@ test "MiniMax native streaming holds every namespace prefix" {
     try testing.expect(streamShouldBufferForTools("Run this." ++ marker ++ "<invoke name=\"shell\">"));
     try testing.expect(!streamShouldBufferForTools("Ordinary prose about MiniMax."));
     try testing.expect(!streamShouldBufferForTools("The marker is " ++ marker ++ ", spelled out."));
+    // A JSON answer's strings are payload, as the parser takes them.
+    try testing.expect(!streamShouldBufferForTools("{\"marker\": \"" ++ marker ++ "<command>ls\"}"));
+    try testing.expect(!streamShouldBufferForTools("[\"" ++ marker ++ "<item>\"]"));
 }
