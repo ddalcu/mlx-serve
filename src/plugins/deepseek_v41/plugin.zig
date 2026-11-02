@@ -8,6 +8,7 @@ const build_options = @import("build_options");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
+const device = @import("../../mlx/device.zig");
 const dsv41 = @import("deepseek_v41.zig");
 const vision = @import("vision.zig");
 const media = @import("media.zig");
@@ -84,6 +85,7 @@ pub const Model = struct {
     /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for.
     bank: ?Bank = null,
     bank_context: u64 = 0,
+    aux_cache_budget_bytes: u64 = 0,
     /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
     /// other live slot's waits in `parked`. Excluded configurations keep the last finished state in `idle`.
     owner: u32 = 0,
@@ -103,9 +105,11 @@ const Kept = struct {
 
 /// Parks a live slot; excluded configurations retain an unclaimed state for legacy resume.
 fn park(m: *Model) !void {
-    const st = m.mdl.dec_state orelse return;
-    const k: Kept = .{ .st = st, .gen = m.mdl.state_gen };
-    if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
+    const st = if (m.mdl.dec_state) |*st| st else return;
+    if (m.owner != 0) try m.parked.ensureUnusedCapacity(gpa, 1);
+    st.dropAhead();
+    const k: Kept = .{ .st = st.*, .gen = m.mdl.state_gen };
+    if (m.owner != 0) m.parked.putAssumeCapacity(m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
         var orphan = k;
         orphan.deinit();
     }
@@ -126,6 +130,16 @@ fn activate(m: *Model, slot: u32) !void {
         if (auxEnabled(m)) try park(m);
         return;
     }
+    const known = m.parked.contains(slot);
+    const owners = m.parked.count() + @as(usize, @intFromBool(m.owner != 0));
+    if (!known and m.caps.active_slots > 0 and owners >= m.caps.active_slots) return error.ActiveSlotLimit;
+    if (comptime build_options.mlx_stream) if (m.bank) |bank| switch (bank) {
+        .exl3 => |src| {
+            try mlx.check(mlx.mlx_synchronize(m.s));
+            try src.settle();
+        },
+        .pack => {},
+    };
     const mine = m.parked.fetchRemove(slot);
     if (mine == null and m.owner == 0) {
         m.owner = slot;
@@ -163,7 +177,10 @@ fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
 
 fn activateSlot(mp: *anyopaque, slot: u32) callconv(.c) Verdict {
     const m: *Model = @ptrCast(@alignCast(mp));
-    activate(m, slot) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");
+    activate(m, slot) catch |err| return switch (err) {
+        error.ActiveSlotLimit => Verdict.refuse(.too_large, "deepseek_v41: active streamed slot limit reached"),
+        else => Verdict.refuse(.failed, "deepseek_v41: failed to settle or park a slot's state"),
+    };
     return .ok;
 }
 
@@ -197,10 +214,14 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     }
     const c = config.of(ctx.parsed);
-    // The EXL3 prompt GEMMs are built on MLX's NAX tiles: below the M5 they compute wrong (f64 self-check, M4).
-    if (c.dsv41_exl3_bank and !@import("../../mlx/device.zig").naxAvailable()) {
-        out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack needs an M5 or newer GPU (its prompt kernels run on the M5's matrix units); stream the MLX pack with the stream_experts setting instead");
-        return null;
+    if (c.dsv41_exl3_bank and !device.naxAvailable()) {
+        checkPortableExl3(s) catch |err| {
+            out.* = if (err == error.OutOfMemory)
+                Verdict.refuse(.failed, "deepseek_v41: out of memory checking portable EXL3 kernels")
+            else
+                Verdict.refuse(.unsupported, "deepseek_v41: the portable EXL3 numerical self-check failed on this device; stream the MLX pack with the stream_experts setting instead");
+            return null;
+        };
     }
     return loadModel(ctx, s) catch |e| {
         // Too little free memory is a refusal the host answers by name, not a fault.
@@ -214,6 +235,32 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         };
         return null;
     };
+}
+
+fn portableM2From(arch: []const u8, has_nax: bool) bool {
+    const gpu = device.naxArchGeneration(arch);
+    return !has_nax and gpu.gen == 14 and !gpu.phone;
+}
+
+fn portableM2() bool {
+    // A generation override must not opt another device into the two-state memory policy.
+    var buf: [128]u8 = undefined;
+    return portableM2From(device.gpuArchitecture(&buf) orelse "", device.naxAvailable());
+}
+
+fn checkPortableExl3(s: mlx.mlx_stream) !void {
+    if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
+    const kernels = @import("mlx_stream").exl3_kernels;
+    var diag: kernels.Diag = .{};
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const start = std.Io.Timestamp.now(io, .awake);
+    const result = kernels.selfcheck.portablePrefill(gpa, .{ .stream = s }, &diag);
+    const ms = @divTrunc(std.Io.Timestamp.now(io, .awake).toNanoseconds() - start.toNanoseconds(), std.time.ns_per_ms);
+    result catch |err| {
+        std.log.err("deepseek_v41: portable EXL3 self-check: {t} after {d} ms: {s}", .{ err, ms, diag.message() });
+        return err;
+    };
+    std.log.info("deepseek_v41: portable EXL3 self-check passed in {d} ms", .{ms});
 }
 
 /// The host's stream when it is a GPU one, else this thread's GPU stream; null off Metal: the module's kernels are
@@ -246,7 +293,8 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     // The worker's layers when the driver's load planned a Thunderbolt pair.
     const pair: ?dsv41.Pair = if (ctx.pair_remote.count > 0) .{ .lo = ctx.pair_remote.first, .hi = ctx.pair_remote.first + ctx.pair_remote.count, .worker = false } else null;
     m.s = s;
-    m.caps = ctx.parsed.caps;
+    m.caps = config.runtimeCaps(c, ctx.parsed.caps, portableM2());
+    m.aux_cache_budget_bytes = if (c.dsv41_exl3_bank and m.caps.active_slots > 0 and pair == null) ctx.auxCacheBudget() else 0;
     m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
     errdefer m.mdl.deinit();
     m.bank = null;
@@ -259,6 +307,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     }
     errdefer closeBank(m);
     m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
+    ctx.publishRuntimeCaps(m.caps);
     return m;
 }
 
@@ -275,11 +324,11 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin
     const c = &m.cfg;
     const geo: streamed.Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(mdl.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
     const context = ctx_size orelse for (bill_mod.stream_context_rungs) |rung| {
-        const at = bill_mod.streamBudget(c, rung, wired_margin);
+        const at = bill_mod.streamBudget(c, rung, wired_margin, m.caps.active_slots, m.aux_cache_budget_bytes);
         const fit = streamed.Exl3.billOf(gpa, io, dir, geo, .{ .prompt = at.prompt, .decode = at.decode }) catch continue;
         if (fit.rows.prompt >= bill_mod.stream_min_rows) break rung;
     } else bill_mod.stream_context;
-    const budget = bill_mod.streamBudget(c, context, wired_margin);
+    const budget = bill_mod.streamBudget(c, context, wired_margin, m.caps.active_slots, m.aux_cache_budget_bytes);
     const b = try streamed.Exl3.Source.open(gpa, io, dir, m.s, geo, gates, .{ .prompt = budget.prompt, .decode = budget.decode });
     std.log.info("deepseek_v41: streamed experts, {d} prompt / {d} decode slot rows per layer for a {d}-token context ({d} B a row)", .{ b.bill.rows.prompt, b.bill.rows.decode, context, b.bill.row_bytes });
     m.bank = .{ .exl3 = b };
@@ -341,7 +390,15 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (f.want_hidden) return Verdict.refuse(.unsupported, "deepseek_v41: no hidden-state output (embeddings)");
     if (f.mode == .batched_rows) return forwardBatched(m, f, out);
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "deepseek_v41: one slot's rows at a time");
-    if (f.slots.len == 1) activate(m, f.slots.slice()[0]) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");
+    if (f.slots.len == 1) {
+        const activated = activateSlot(mp, f.slots.slice()[0]);
+        if (!activated.isOk()) return activated;
+    }
+    // resumePrompt may adopt idle state; a direct cold forward must free it before allocating a third context.
+    if (m.mdl.dec_state == null and m.caps.active_slots > 0 and m.parked.count() + @as(usize, @intFromBool(m.owner != 0)) >= m.caps.active_slots) {
+        if (m.idle) |*old| old.deinit();
+        m.idle = null;
+    }
     const in = v4plugin.Ids.of(f) catch return Verdict.refuse(.failed, "deepseek_v41: the token ids do not read back");
     defer in.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
@@ -350,7 +407,10 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
-    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
+    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch |err| {
+        std.log.err("deepseek_v41: forward at {d} with {d} rows failed: {s}", .{ pos, in.host.len, if (err == error.EngineFailed) @import("../../sdk/util/err_name.zig").last() else @errorName(err) });
+        return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
+    };
     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
     return .ok;
 }
@@ -533,7 +593,11 @@ const aux_hooks = abi.AuxHooks{
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
     const m: *Model = @ptrCast(@alignCast(mp));
-    return !m.cfg.dsv41_streamed and m.bank == null and m.mdl.streamed == null and m.mdl.pair == null;
+    if (m.mdl.pair != null) return false;
+    if (comptime build_options.mlx_stream) if (m.bank) |bank| {
+        return bank == .exl3 and m.cfg.dsv41_exl3_bank and m.caps.active_slots > 0 and m.aux_cache_budget_bytes > 0;
+    };
+    return !m.cfg.dsv41_streamed and m.bank == null and m.mdl.streamed == null;
 }
 
 fn liveState(m: *Model, slot: u32) ?*dsv41.State {
@@ -561,7 +625,7 @@ fn auxPrefixKey(mp: *anyopaque, ids: abi.Span(u32), rows: abi.Array, out: *u64) 
 }
 
 fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), rows: abi.Array, restored_at: u64, capture: bool) callconv(.c) Verdict {
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache is unavailable for this loaded instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     if (restored_at != 0) {
         const st = liveState(m, slot) orelse return Verdict.refuse(.failed, "deepseek_v41: restored slot has no state");
@@ -588,20 +652,24 @@ fn auxCommit(mp: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict {
 
 fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache is unavailable for this loaded instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     const st = liveState(m, slot) orelse return .ok;
-    const sn = st.snap orelse return .ok;
+    const sn = if (st.snap) |*snapshot| snapshot else return .ok;
     if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
     const owned = gpa.create(dsv41.Snap) catch |e| return Verdict.named(.failed, @errorName(e));
-    owned.* = sn;
+    if (m.bank != null) sn.compactViews(gpa, m.s) catch |e| {
+        gpa.destroy(owned);
+        return Verdict.named(.failed, @errorName(e));
+    };
+    owned.* = sn.*;
     st.snap = null;
     out.* = owned;
     return .ok;
 }
 
 fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callconv(.c) Verdict {
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache is unavailable for this loaded instance");
     const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to restore");
     if (pos != sn.n or sn.n != sn.ids.len) return Verdict.refuse(.unsupported, "deepseek_v41: restore requires the snapshot's exact position");
     const m: *Model = @ptrCast(@alignCast(mp));
@@ -657,7 +725,7 @@ fn auxBytes(_: *anyopaque, handle: abi.Handle) callconv(.c) u64 {
 
 fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdict {
     out.* = 0;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache is unavailable for this loaded instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     out.* = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
@@ -668,7 +736,7 @@ fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) call
     out.tensor_len = 0;
     out.names_len = 0;
     out.header_len = 0;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache is unavailable for this loaded instance");
     const sn = snapOf(handle) orelse return Verdict.refuse(.failed, "deepseek_v41: no snapshot to export");
     const m: *Model = @ptrCast(@alignCast(mp));
     dsv41.exportSnapshot(m.mdl, sn, out) catch |e| return Verdict.named(.failed, @errorName(e));
@@ -677,7 +745,7 @@ fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) call
 
 fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache is unavailable for this loaded instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     out.* = dsv41.importSnapshot(m.mdl, gpa, ids.slice(), header.slice(), arrays.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
@@ -749,4 +817,16 @@ test {
     _ = media;
     _ = @import("contract.zig");
     _ = @import("decode/decode.zig");
+}
+
+test "deepseek_v41 streamed policy: only portable M2 selects two retained states" {
+    const expect = std.testing.expect;
+    for ([_][]const u8{ "applegpu_g14d", "AppleGPU_G14S", "g14" }) |arch| {
+        try expect(portableM2From(arch, false));
+        try expect(!portableM2From(arch, true));
+    }
+    for ([_][]const u8{ "", "air64_v27", "applegpu_g14_extra", "g14p", "g13d", "g15d", "g16s", "g17d", "g18d" }) |arch| {
+        try expect(!portableM2From(arch, false));
+        try expect(!portableM2From(arch, true));
+    }
 }

@@ -3,6 +3,7 @@
 
 const mlx = @import("../../mlx/ffi.zig");
 const Transformer = @import("transformer.zig").Transformer;
+const plugin_settle = @import("plugin/settle.zig");
 
 /// Pre-fault weight pages and trigger first-touch kernel compiles before
 /// the first real request so cold prefill doesn't pay 800+ms of GPU page
@@ -13,11 +14,16 @@ const Transformer = @import("transformer.zig").Transformer;
 /// Idempotent — calling twice is wasted work but not incorrect.
 pub fn warmup(self: *Transformer) !void {
     if (self.mlx_stream_ext != null) return; // mlx-stream warms its own kernels at construction
+    var ctx = self.defaultCtx();
+    defer {
+        self.discardDeferredPle(&ctx);
+        plugin_settle.release(self, &ctx);
+    }
     const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
     const decode_shape = [_]c_int{ 1, 1 };
     const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);
     defer _ = mlx.mlx_array_free(decode_input);
-    const decode_logits = try self.forward(decode_input);
+    const decode_logits = try self.forwardWith(&ctx, decode_input);
     _ = mlx.mlx_array_free(decode_logits);
     // Materialize the cache update so subsequent forwards see initialized entries.
     {
@@ -42,7 +48,7 @@ pub fn warmup(self: *Transformer) !void {
         const prefill_shape = [_]c_int{ 1, width };
         const prefill_input = mlx.mlx_array_new_data(&ids, &prefill_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(prefill_input);
-        const prefill_logits = try self.forward(prefill_input);
+        const prefill_logits = try self.forwardWith(&ctx, prefill_input);
         _ = mlx.mlx_array_free(prefill_logits);
         {
             const eval_vec = mlx.mlx_vector_array_new();
