@@ -146,6 +146,11 @@ pub const HostGpu = extern struct {
     launch: *const fn (ctx: ?*anyopaque, outputs: *VectorArray, kernel: ?*anyopaque, inputs: VectorArray, config: KernelConfig, stream: Stream) callconv(.c) Verdict,
     /// Each evaluated, row-contiguous GPU array's buffer address + offset, for kernels reading sources from a table.
     buffer_addresses: *const fn (ctx: ?*anyopaque, arrays: [*]const Array, n: usize, out: [*]u64) callconv(.c) Verdict,
+    /// `out` (a fresh handle) becomes an evaluated [shape] array of `dtype` (mlx-c's `mlx_dtype` value) over `base`'s
+    /// bytes from `offset`, an MTLBuffer of its own over the same pages: MLX orders its work apart from `base`'s.
+    /// Refused unless `base` is evaluated at its buffer's start, `offset` is page-aligned and the range fits. It holds
+    /// `base` and adds no active memory; MLX cannot see aliases overlap, so tensors alive at once take disjoint ranges.
+    alias: *const fn (ctx: ?*anyopaque, base: Array, offset: u64, shape: [*]const i32, ndim: usize, dtype: i32, out: *Array) callconv(.c) Verdict,
 };
 
 test "abi host: the table layouts are pinned (size first, offsets fixed, growth only at the end)" {
@@ -168,10 +173,10 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
         .{ "event_metal", 16 },      .{ "event_host", 24 },   .{ "wait", 32 },
         .{ "signal", 40 },           .{ "event_set", 48 },    .{ "event_value", 56 },
         .{ "event_stats", 64 },      .{ "alloc_uninit", 72 }, .{ "launch", 80 },
-        .{ "buffer_addresses", 88 },
+        .{ "buffer_addresses", 88 }, .{ "alias", 96 },
     };
     inline for (gpu_fields) |f| try t.expectEqual(f[1], @offsetOf(HostGpu, f[0]));
-    try t.expectEqual(@as(usize, 96), @sizeOf(HostGpu));
+    try t.expectEqual(@as(usize, 104), @sizeOf(HostGpu));
     try t.expectEqual(gpu_fields.len, @typeInfo(HostGpu).@"struct".field_names.len);
 
     // By-pointer structs open with `size`; by-value ones are frozen per version.
