@@ -364,8 +364,8 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(on.disabled, false)
     }
 
-    /// A declared input's env key follows the field (blank clears it) and arg
-    /// placeholders are re-spliced; a hand-added env key beside them survives.
+    /// A plain env input follows its field (blank clears it); a hand-added env
+    /// key beside it survives.
     func testCatalogMaterializeFormInputsOverlayTheStoredEnv() {
         guard let github = MCPCatalog.entry(for: "github") else { return XCTFail("github missing") }
         var stored = github.materialize(values: ["github_token": "ghp_old"])
@@ -429,6 +429,43 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual((servers["shell"] as? [String: Any])?["alwaysAllow"] as? [String], ["run"])
         XCTAssertEqual((servers["filesystem"] as? [String: Any])?["args"] as? [String],
                        ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/ws"])
+    }
+
+    /// An encoded secret is never shown (`extractValues` skips it), so its blank
+    /// field keeps the stored key and the args its presence added.
+    func testCatalogMaterializeKeepsAnEncodedSecretItCannotShow() {
+        guard let ado = MCPCatalog.entry(for: "azure-devops") else { return XCTFail("azure-devops missing") }
+        let stored = ado.materialize(values: ["ado_org": "contoso", "ado_pat": "secret"])
+        let pat = stored.env?["PERSONAL_ACCESS_TOKEN"]
+        XCTAssertNotNil(pat)
+        XCTAssertEqual(stored.args, ["-y", "@azure-devops/mcp", "contoso", "--authentication", "pat"])
+
+        let toggled = MCPMarketplaceView.materialized(ado, over: stored, values: ado.extractValues(from: stored))
+        XCTAssertEqual(toggled.env?["PERSONAL_ACCESS_TOKEN"], pat)
+        XCTAssertEqual(toggled.args, stored.args)
+
+        let reOrg = MCPMarketplaceView.materialized(ado, over: stored, values: ["ado_org": "fabrikam"])
+        XCTAssertEqual(reOrg.env?["PERSONAL_ACCESS_TOKEN"], pat)
+        XCTAssertEqual(reOrg.args, ["-y", "@azure-devops/mcp", "fabrikam", "--authentication", "pat"])
+
+        let retyped = MCPMarketplaceView.materialized(ado, over: stored, values: ["ado_org": "contoso", "ado_pat": "other"])
+        XCTAssertEqual(retyped.env?["PERSONAL_ACCESS_TOKEN"],
+                       ado.materialize(values: ["ado_org": "contoso", "ado_pat": "other"]).env?["PERSONAL_ACCESS_TOKEN"])
+    }
+
+    /// `args` stay as stored, hand-added flags included, until a form value
+    /// that feeds them changes; then they are rebuilt from the catalog.
+    func testCatalogMaterializeRebuildsArgsOnlyWhenAFormArgChanges() {
+        guard let fs = MCPCatalog.entry(for: "filesystem") else { return XCTFail("filesystem missing") }
+        let stored = MCPServerEntry(command: "npx",
+                                    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/ws", "--readonly"],
+                                    env: nil, disabled: true)
+
+        let toggled = MCPMarketplaceView.materialized(fs, over: stored, values: fs.extractValues(from: stored))
+        XCTAssertEqual(toggled.args, stored.args)
+
+        let moved = MCPMarketplaceView.materialized(fs, over: stored, values: ["root_path": "/Users/me/other"])
+        XCTAssertEqual(moved.args, ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/other"])
     }
 
     func testCatalogMaterializeReplacesArgPlaceholder() {

@@ -146,9 +146,11 @@ mutable setting needs a subscriber that re-evaluates live instances.
 Defect: `shell` and `filesystem` entries hand-edited to `/opt/homebrew/bin/npx` + `env.PATH` came back as bare `npx`
 with no `env` after every toggle, so no Homebrew-node server could be launched from the UI; a custom row survived.
 Cause: a catalog row is rebuilt by `MCPCatalogEntry.materialize` from the catalog's own `command` and its declared
-inputs, and `MCPMarketplaceView.materialized` carried only `extra` across. Fix: the stored entry is the base and the
-form overlays only the fields it renders (its inputs' env keys and the arg slots). Guard: `MCPTests`
-`testCatalogMaterializeKeepsTheStoredCommandEnvAndCwd`, `testMarketplaceSavePathRoundTripsAbsoluteCommandAndEnv`.
+inputs, and `MCPMarketplaceView.materialized` carried only `extra` across. Fix: the stored entry is the base and an
+input writes only when its value changed from what the form shows; `args` are rebuilt from the catalog only when
+an input that feeds them changed, and a blank encoded secret (never shown) keeps its key and its flag. Guard:
+`MCPTests` `testCatalogMaterializeKeepsTheStoredCommandEnvAndCwd`, `...KeepsAnEncodedSecretItCannotShow`,
+`...RebuildsArgsOnlyWhenAFormArgChanges`, `testMarketplaceSavePathRoundTripsAbsoluteCommandAndEnv`.
 
 ### The sandbox gated only shell; file tools wrote to the host
 Defect: with the sandbox on, `writeFile` wrote 23 KB to the host while `shell` was declined. Cause: routing lived only
