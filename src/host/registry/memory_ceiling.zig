@@ -161,8 +161,8 @@ pub fn staticGpuMemoryCeiling() u64 {
     return getGpuWorkingSetLimit();
 }
 
-/// Diagnostic: `MLX_SERVE_GPU_CEILING_MB=N` stands in for the working-set limit in every bill
-/// (absent or 0 = the machine's). It bounds the guards' arithmetic, not what Metal will grant.
+/// Diagnostic: `MLX_SERVE_GPU_CEILING_MB=N` forces the GPU ceiling in every bill (`staticGpuMemoryCeiling`
+/// and `currentGpuMemoryCeiling`; absent or 0 = the machine's). It bounds the guards' arithmetic, not what Metal will grant.
 pub fn applyGpuCeilingEnv() void {
     const raw = env.get(.MLX_SERVE_GPU_CEILING_MB) orelse return;
     const mb = std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10) catch return;
@@ -174,6 +174,7 @@ pub fn applyGpuCeilingEnv() void {
 /// THE ceiling helper: `available`, `/props`, the hot-cache clamp, the auto-context pin and the
 /// admission bill all read it, so the wired-limit floor cannot reach some of them and not others.
 pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u64) u64 {
+    if (overrides().static_ceiling) |v| return v;
     // The ANE's int8 copies are wired host buffers: invisible to MLX's own
     // accounting, but genuinely gone from free RAM. Left to leak in through
     // the noisy free-RAM term they made auto-context swing across boots of the
@@ -284,4 +285,17 @@ test "the MLX buffer pool is inside `available` by construction, so a refusal ca
     try t.expectEqual(pool + free_system, ceiling - active);
     const cleared = physicalMemoryCeiling(wired, active, free_system + pool);
     try t.expectEqual(ceiling, cleared);
+}
+
+test "currentGpuMemoryCeiling honors overrides().static_ceiling both below and above live RAM" {
+    const t = std.testing;
+    const saved = overrides().static_ceiling;
+    defer overrides().static_ceiling = saved;
+
+    for ([_]u64{ 1, 20_000 << 20, 512 << 30 }) |forced| {
+        overrides().static_ceiling = forced;
+        try t.expectEqual(forced, staticGpuMemoryCeiling());
+        try t.expectEqual(forced, currentGpuMemoryCeiling(null, 0));
+        try t.expectEqual(forced, currentGpuMemoryCeiling(null, 13_066 << 20));
+    }
 }
