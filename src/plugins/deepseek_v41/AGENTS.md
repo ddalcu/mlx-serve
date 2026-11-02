@@ -20,6 +20,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - `decode/`: the fused decode kernels (`kernels/dec_*.metal`, one file a stage) a step or verify of up to `max_rows`
   rows runs through `blockFused`; `decode/fixture.zig` builds release-shape layers on random weights for their
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
+- `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
+  without NAX (unmeasured on M5); `moe_up` / `moe_down` serve the affine 2/3-bit packs. Otherwise `routed` runs.
 
 ## Facts the table declares
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
@@ -82,6 +84,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization
   and shortened slices still return named unsupported verdicts. SSD-only module retention is unsupported.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
+- Without NAX (M3 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
+  pre-NAX split kernel and the compiled regions. The MoE kernels need no NAX.
 - Prefill is chunked at 8192 (`prefillChunkMax`), one MoE call per chunk: each chunk still reads every expert bank
   once (the CED replay runs the decoder layers), so a narrower chunk pays that read twice as often.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
