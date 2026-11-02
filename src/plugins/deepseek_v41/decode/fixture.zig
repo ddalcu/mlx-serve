@@ -24,6 +24,8 @@ pub const Opts = struct {
     act: mlx.mlx_dtype = .bfloat16,
     /// The model decodes on the fused kernels (`Dsv41Model.dec`); off, today's chain, what a kernel is measured against.
     fused: bool = false,
+    /// The routed experts as the release ships them (mxfp4, group 32) instead of the iQ pack's affine 2/3-bit.
+    experts_fp4: bool = false,
 };
 
 pub const Fixture = struct {
@@ -40,7 +42,7 @@ pub const Fixture = struct {
         cfg.num_experts = opts.experts;
         fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed };
         errdefer fx.w.deinit();
-        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, li, opts.experts);
+        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, li, opts.experts, opts.experts_fp4);
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act });
         errdefer fx.m.deinit();
         if (!opts.fused) fx.m.dec.deinit();
@@ -149,9 +151,9 @@ pub const Fixture = struct {
                 try mlx.check(mlx.mlx_array_eval(d));
                 return fx.putNamed(base ++ ".weight", args, d);
             },
-            .mxfp8, .affine => {
+            .mxfp8, .mxfp4, .affine => {
                 defer _ = mlx.mlx_array_free(w);
-                const q = if (fmt == .mxfp8) try quantize(w, 32, 8, "mxfp8") else try quantize(w, 64, @intCast(fmt.affine), "affine");
+                const q = if (fmt == .mxfp8) try quantize(w, 32, 8, "mxfp8") else if (fmt == .mxfp4) try quantize(w, 32, 4, "mxfp4") else try quantize(w, 64, @intCast(fmt.affine), "affine");
                 try fx.putNamed(base ++ ".weight", args, q[0]);
                 try fx.putNamed(base ++ ".scales", args, q[1]);
                 if (q[2].ctx != null) try fx.putNamed(base ++ ".biases", args, q[2]);
@@ -164,7 +166,7 @@ pub const Fixture = struct {
     }
 
     /// One trunk layer's tensors under the names `loadLayer` reads, in the release's formats.
-    fn putLayer(fx: *Fixture, c: *const config.Config, li: usize, E: u32) !void {
+    fn putLayer(fx: *Fixture, c: *const config.Config, li: usize, E: u32, fp4: bool) !void {
         const d: c_int = @intCast(c.hidden_size);
         const hc: c_int = @intCast(c.dsv4_hc_mult);
         const mix = (2 + hc) * hc;
@@ -219,14 +221,14 @@ pub const Fixture = struct {
         try fx.putLin(pfx ++ "ffn.shared_experts.w2", .{li}, &.{ d, inter }, .mxfp8);
         // One tensor an expert (the loader stacks them), so a full 384-expert bank never exists in bf16.
         for (0..E) |x| {
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w1", .{ li, x }, &.{ inter, d }, .{ .affine = gu_bits });
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w3", .{ li, x }, &.{ inter, d }, .{ .affine = gu_bits });
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w2", .{ li, x }, &.{ d, inter }, .{ .affine = 3 });
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w1", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w3", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w2", .{ li, x }, &.{ d, inter }, if (fp4) .mxfp4 else .{ .affine = 3 });
         }
     }
 };
 
-const Fmt = union(enum) { bf16, fp8_exact, mxfp8, affine: u32 };
+const Fmt = union(enum) { bf16, fp8_exact, mxfp8, mxfp4, affine: u32 };
 
 fn quantize(w: A, gs: c_int, bits: c_int, mode: [*:0]const u8) ![3]A {
     var qv = mlx.mlx_vector_array_new();

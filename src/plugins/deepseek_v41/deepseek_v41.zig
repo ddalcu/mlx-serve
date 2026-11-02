@@ -573,12 +573,13 @@ pub const Dec = struct {
     wo_a_counter: A = none,
     ffn_in: ?dkern.ffn_in.Kernels = null,
     moe_up: ?dkern.moe_up.Kernel = null,
+    moe_fp4: ?dkern.moe_fp4.Kernels = null,
     moe_down: ?mlx.mlx_fast_metal_kernel = null,
     /// `dkern.moe_down.probe`'s output rows a threadgroup on this GPU.
     moe_down_rb: usize = 0,
 
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (device.naxAvailable()) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = try dkern.moe_up.build(cfg.dsv4_swiglu_limit), .moe_down = try dkern.moe_down.build() };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (device.naxAvailable()) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = try dkern.moe_up.build(cfg.dsv4_swiglu_limit), .moe_fp4 = if (device.naxAvailable()) null else try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = try dkern.moe_down.build() };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         d.moe_down_rb = dkern.moe_down.probe(gpa, d.moe_down.?, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -595,6 +596,7 @@ pub const Dec = struct {
         if (d.idx_score) |*k| k.deinit();
         if (d.topk) |*k| k.deinit();
         if (d.moe_up) |k| k.deinit();
+        if (d.moe_fp4) |k| k.deinit();
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
         inline for (.{ d.wq_b, d.attn, d.wo_a, d.moe_down }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
@@ -1495,6 +1497,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const Config, w: *Weights, s: S, opts:
     }
     try evalWeights(m);
     log.info("deepseek_v41: {d} layers, engram {d} layers, DSpark {d} stages\n", .{ n_layers, m.engrams.len, n_stages });
+    if (m.dec.moe_fp4 != null) log.info("deepseek_v41: fused mxfp4 MoE decode kernels on\n", .{});
     return m;
 }
 
@@ -2879,6 +2882,8 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
     const sgu = ly.shared_gu orelse return null;
     const dn = &ly.experts.down;
     const sdn = &ly.shared[2];
+    if (m.dec.moe_fp4) |kf| if (try dkern.moe_fp4.moeUp(sc, m, kf, ly, h, idx, wts)) |act|
+        if (try dkern.moe_fp4.moeDown(sc, kf, ly, act, idx, x1, sp)) |y| return y;
     if (m.dec.moe_up) |ku| if (m.dec.moe_down) |kd| if (ly.experts.views) |v| if (try dkern.moe_up.moeUp(sc, m, ku, ly, h, idx, wts)) |act|
         if (try dkern.moe_down.moeDown(sc, kd, m.dec.moe_down_rb, &v[1], sdn, act, idx, x1, sp)) |y| return y;
     if (dim(h, 0) != 1 or mlx.mlx_array_dtype(h) == .float32 or !mlx.streamIsGpu(sc.s)) return null;
