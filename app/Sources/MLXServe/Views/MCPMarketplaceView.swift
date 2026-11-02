@@ -287,16 +287,29 @@ struct MCPMarketplaceView: View {
         Task { await mcpManager.startEnabled() }
     }
 
-    /// Materialize a catalog row over whatever entry is already stored. The
-    /// memberwise init drops the keys this build does not model, and this screen
-    /// is a second writer of the same file: hand-added `alwaysAllow`/`timeout`
-    /// survive a re-install only if they are carried across explicitly.
+    /// Materialize a catalog row over whatever entry is already stored. This
+    /// screen is a second writer of a file the user also edits by hand, so the
+    /// form owns only the fields it renders: each input's env key and the arg
+    /// slots. An absolute `command`, a hand-added `env.PATH`, `cwd` and keys
+    /// this build does not model survive.
     static func materialized(_ entry: MCPCatalogEntry,
                              over existing: MCPServerEntry?,
                              values: [String: String]) -> MCPServerEntry {
-        var materialized = entry.materialize(values: values)
-        if let existing, !existing.extra.isEmpty { materialized.extra = existing.extra }
-        return materialized
+        let fresh = entry.materialize(values: values)
+        guard var kept = existing else { return fresh }
+        kept.command = kept.command ?? fresh.command
+        if !entry.inputs.isEmpty { kept.args = fresh.args }
+        var env = kept.env ?? [:]
+        for input in entry.inputs {
+            switch input.kind {
+            case .env(let key), .envEncoded(let key, _): env[key] = nil
+            case .arg: break
+            }
+        }
+        env.merge(fresh.env ?? [:]) { _, form in form }
+        kept.env = env.isEmpty ? nil : env
+        kept.disabled = false
+        return kept
     }
 
     // MARK: - State helpers
