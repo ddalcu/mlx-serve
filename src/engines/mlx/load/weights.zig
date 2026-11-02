@@ -7,6 +7,7 @@ const WeightField = @import("../transformer.zig").WeightField;
 const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");
 const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
+const gguf_kernels = @import("../../../sdk/quant/gguf/root.zig").kernels;
 const Weights = @import("../../../sdk/config/model.zig").Weights;
 const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 const loadHcWeights = @import("../../../plugins/qwen4_exp/load.zig").loadHcWeights;
@@ -395,8 +396,19 @@ pub fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []co
 pub fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig) error{MissingWeight}!mlx.mlx_array {
     // A pack with no `quantization` block (Sushi's) still stores affine trunk linears beside dense ones.
     if (config.quant_bits == 0) return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
-    if (config.quant_mode.hasBiases()) return try getLayerWeight(weights, buf, prefix, layer, suffix);
+    if (config.quant_mode.hasBiases() and !rawGgmlAt(weights, prefix, layer, suffix)) return try getLayerWeight(weights, buf, prefix, layer, suffix);
     return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
+}
+
+/// Whether the weight beside `<…>.biases` is a raw ggml table (its scales the GGUF type sentinel), which has none.
+fn rawGgmlAt(weights: *const Weights, prefix: []const u8, layer: u32, bias_suffix: []const u8) bool {
+    if (!std.mem.endsWith(u8, bias_suffix, ".biases")) return false;
+    const stem = bias_suffix[0 .. bias_suffix.len - "biases".len];
+    var nb: [256]u8 = undefined;
+    var sb: [128]u8 = undefined;
+    const w = getLayerWeightOpt(weights, &nb, prefix, layer, std.fmt.bufPrint(&sb, "{s}weight", .{stem}) catch return false) orelse return false;
+    const sc = getLayerWeightOpt(weights, &nb, prefix, layer, std.fmt.bufPrint(&sb, "{s}scales", .{stem}) catch return false) orelse return false;
+    return gguf_kernels.infoOf(w, sc) != null;
 }
 
 /// Optional-typed variant for fields stored as `?mlx_array` (e.g. PLE projections).
@@ -436,6 +448,31 @@ test "a missing weight is a load ERROR, not a process exit (issue #217)" {
     var buf: [256]u8 = undefined;
     try std.testing.expectError(error.MissingWeight, getLayerWeight(&w, &buf, "model", 0, "mlp.w1.weight"));
     try std.testing.expectError(error.MissingWeight, getWeightFmt(&w, &buf, "{s}.norm.weight", "model"));
+}
+
+test "a raw ggml layer weight needs no biases under an affine config; an affine one still does" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var w = model_mod.Weights.init(std.testing.allocator);
+    defer w.deinit();
+    var config: ModelConfig = .{};
+    config.quant_bits = 4;
+    config.quant_mode = .affine;
+    const Leaf = struct { name: []const u8, shape: []const c_int, dt: mlx.mlx_dtype };
+    for ([_]Leaf{
+        .{ .name = "model.layers.0.k.weight", .shape = &.{ 8, 136 }, .dt = .uint8 },
+        .{ .name = "model.layers.0.k.scales", .shape = &.{24}, .dt = .bool_ }, // IQ4_XS + 1: the GGUF type sentinel
+        .{ .name = "model.layers.0.q.weight", .shape = &.{ 8, 32 }, .dt = .uint32 },
+        .{ .name = "model.layers.0.q.scales", .shape = &.{ 8, 8 }, .dt = .bfloat16 },
+    }) |l| {
+        var a = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&a, l.shape.ptr, @intCast(l.shape.len), l.dt, s));
+        try w.map.put(try std.testing.allocator.dupe(u8, l.name), a);
+    }
+    var buf: [256]u8 = undefined;
+    const b = try getLayerBias(&w, &buf, "model", 0, "k.biases", &config);
+    try std.testing.expect(b.ctx == null);
+    try std.testing.expectError(error.MissingWeight, getLayerBias(&w, &buf, "model", 0, "q.biases", &config));
 }
 
 test "a quantized block_inject_weight loads as the dense checkpoint holding its dequantized values" {

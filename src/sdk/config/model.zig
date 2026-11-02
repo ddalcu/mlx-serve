@@ -1751,7 +1751,8 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.pack_dir = try allocator.dupe(u8, model_dir);
         config.glm_stream = true;
     }
-    if (config.isQwen4()) {
+    // A GGUF's table is inside the file (the qwen4_exp plugin finds it there).
+    if (config.isQwen4() and !std.mem.endsWith(u8, model_dir, ".gguf")) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
             config.embedded_ple_payload_bytes = info.payload_bytes;

@@ -758,3 +758,16 @@ baseline and `--no-w8a8` were clean. Cause: the attached delta keeps the f32 mod
 (`vec<T, 4>`), reading the f32 buffer as bf16. `attentionHeads` already cast; the bare call did not. Fix: the wrapper
 casts `v` to q's dtype. Guard: `int8 attention reads a v wider than q`, `tests/test_real_loras.sh` (open the renders:
 the 9B's broken one scored under the noise bar).
+
+### A GGUF weight resolved as affine 8-bit
+Defect: on the MLX GGUF path every ggml weight reported `.affine` 8-bit g64 to `computeQuantParams`, so an affine-keyed
+fast path (the qwen4 hc read, `msvQmvRows`, MoE gathers) could take raw ggml blocks for MLX codes. Cause: the scales are
+a 1-D bool type sentinel; no 2-D geometry to solve, so the solver fell through to its last default. Fix: a bool scale
+answers `.gguf`. Guard: `computeQuantParams: a GGUF weight's type sentinel resolves to the gguf mode`.
+
+### A raw ggml out_proj with tiled heads read garbage
+Defect: ISTA-DASLab's Q2_0 Flash Next pack answered `!!` on the MLX GGUF path while llama.cpp answered right. Cause:
+`loadQuantized`'s `tiled_input` branch handed MLX the file's interleaved bytes, where every other branch repacks
+split-layout types (`packedRows`), so two Q6_K `ssm_out` layers fed the kernels a wrong layout; any qwen35 GGUF with a
+split-type out_proj and r > 1 had it too. Found by loading one tensor class raw at a time, the rest as 8-bit affine.
+Fix: the branch packs too. Guard: `a tiled-input weight of a split-layout type loads in the kernels' layout`.

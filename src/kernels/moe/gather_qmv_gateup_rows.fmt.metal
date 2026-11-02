@@ -6,7 +6,7 @@ uint row = combo / uint(TOPK);
 
 int K = int(K_size);
 int N = int(N_size);
-constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
+constexpr int VPW = mlxserve_vpw<BITS>();
 int K_by_p = K / VPW;
 int K_by_w = K * BITS / 32;
 int K_by_gs = K / GS;
@@ -18,8 +18,8 @@ size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K
 size_t xrow = (size_t)row * (size_t)K;
 
 constexpr int IT = (KP + 31) / 32;
-uint32_t pg[IT];
-uint32_t pu[IT];
+mlxserve_pack_t<BITS> pg[IT];
+mlxserve_pack_t<BITS> pu[IT];
 for (int i = 0; i < IT; ++i) {{
   int pack = int(lane) + 32 * i;
   pg[i] = (pack < KP) ? mlxserve_qpack<BITS>(wg_q, wbase, pack) : 0u;
@@ -30,8 +30,8 @@ float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
 for (int i = 0; i < IT; ++i) {{
   int pack = int(lane) + 32 * i;
   if (pack >= KP) break;
-  uint32_t packed_g = pg[i];
-  uint32_t packed_u = pu[i];
+  mlxserve_pack_t<BITS> packed_g = pg[i];
+  mlxserve_pack_t<BITS> packed_u = pu[i];
   int k_base = pack * VPW;
   int gi = k_base / GS;
 {s}

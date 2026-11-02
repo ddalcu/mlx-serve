@@ -746,8 +746,11 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: anytype, bits: u32) ?RerankC
     // A dense bf16 head ([V, H], 16 bits) always reads more than the coarse copy.
     const dense = target.lm_head_s.ctx == null;
     const head_qp: params_mod.QuantParams = if (dense) .{ .bits = 16, .group_size = 0, .mode = .affine } else headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    if (head_qp.mode == .gguf) return null; // raw ggml blocks: no affine rows to requantize
     if (bits >= head_qp.bits) return null; // no byte saving over the head we already read
 
+    // A refusal below is reported here, so its MLX error must not fail the next request.
+    const had_error = mlx.errorPending();
     var rc = requantizeRows(
         s,
         target.lm_head_w,
@@ -760,6 +763,7 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: anytype, bits: u32) ?RerankC
         bits,
         32768,
     ) catch |err| {
+        mlx.dropLatchedErrorUnless(had_error);
         log.warn("[mtp] draft rerank coarse build failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
         return null;
     };
@@ -770,6 +774,7 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: anytype, bits: u32) ?RerankC
     _ = mlx.mlx_vector_array_append_value(eval_vec, rc.b);
     mlx.check(mlx.mlx_eval(eval_vec)) catch {
         rc.deinit();
+        mlx.dropLatchedErrorUnless(had_error);
         log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
         return null;
     };
@@ -4571,6 +4576,27 @@ test "mtp: an mxfp4 sidecar loads bias-less and forwards in its own mode" {
 
 test "mtp: an mxfp8 sidecar loads bias-less and forwards in its own mode" {
     try fpSidecarCase("mxfp8", 8, 32, .mxfp8);
+}
+
+test "mtp: a raw ggml lm_head gets no coarse rerank copy, and leaves no MLX error for the next request" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ TOP32_MIN_ROWS, 136 }, 2, .uint8, s));
+    var sentinel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sentinel);
+    try mlx.check(mlx.mlx_zeros(&sentinel, &[_]c_int{24}, 1, .bool_, s)); // IQ4_XS + 1: the GGUF type sentinel
+    const Target = struct {
+        config: struct { hidden_size: u32 = 256, quant_bits: u32 = 4, quant_group_size: u32 = 32, quant_mode: params_mod.QuantMode = .affine } = .{},
+        lm_head_w: mlx.mlx_array,
+        lm_head_s: mlx.mlx_array,
+        lm_head_b: mlx.mlx_array = .{ .ctx = null },
+    };
+    const target: Target = .{ .lm_head_w = w, .lm_head_s = sentinel };
+    const had = mlx.errorPending();
+    try testing.expect(buildRerankCoarse(s, &target, 3) == null);
+    try testing.expectEqual(had, mlx.errorPending());
 }
 
 test "mtp: rerankCoarseBytes prices the packed weights AND both bf16 group tables" {

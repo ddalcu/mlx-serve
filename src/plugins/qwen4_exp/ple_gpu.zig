@@ -158,7 +158,7 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
     const src = table.embedded;
     // A fresh anonymous mapping is page-aligned by construction.
     const base: usize = if (src != null) 0 else @intFromPtr(table.map.ptr);
-    const len: usize = if (src) |e| @intCast(e.repackedLen()) else table.map.len;
+    const len: usize = if (src) |e| @intCast(e.repackedLen()) else if (table.fmt == .ggml) table.rows * table.row_bytes else table.map.len;
     const arm = chooseArm(on, table.bits, base, len, b);
     if (arm == .off) {
         log.info("[qwen4] ple gather: cpu (--ple-gpu keeps the {d:.1} GB table resident for the GPU gather)\n", .{gb(len)});

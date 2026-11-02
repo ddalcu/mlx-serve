@@ -10,6 +10,7 @@ pub const lfm2 = @import("arch/lfm2.zig");
 pub const gpt_oss = @import("arch/gpt_oss.zig");
 pub const nemotron_h = @import("arch/nemotron_h.zig");
 pub const qwen3next = @import("arch/qwen3next.zig");
+pub const qwen4exp = @import("arch/qwen4exp.zig");
 
 /// What loading has to do to a tensor's bytes. Most of them undo llama.cpp's
 /// value-head tiling of the GatedDeltaNet, see arch/qwen35.zig.
@@ -52,6 +53,7 @@ pub const Arch = union(enum) {
     gpt_oss: gpt_oss.Hparams,
     nemotron_h: nemotron_h.Hparams,
     qwen3next: qwen3next.Hparams,
+    qwen4exp: qwen4exp.Hparams,
 
     /// error.UnsupportedArch for anything not in the table.
     pub fn read(f: *const gguf.File) !Arch {
@@ -63,6 +65,7 @@ pub const Arch = union(enum) {
         if (std.mem.eql(u8, name, gpt_oss.arch_name)) return .{ .gpt_oss = try gpt_oss.Hparams.read(f) };
         if (nemotron_h.handles(name)) return .{ .nemotron_h = try nemotron_h.Hparams.read(f, name) };
         if (std.mem.eql(u8, name, qwen3next.arch_name)) return .{ .qwen3next = try qwen3next.Hparams.read(f) };
+        if (std.mem.eql(u8, name, qwen4exp.arch_name)) return .{ .qwen4exp = try qwen4exp.Hparams.read(f) };
         return error.UnsupportedArch;
     }
 
@@ -76,6 +79,7 @@ pub const Arch = union(enum) {
             .gpt_oss => |hp| gpt_oss.configJson(allocator, hp),
             .nemotron_h => |hp| nemotron_h.configJson(allocator, hp),
             .qwen3next => |hp| qwen3next.configJson(allocator, hp),
+            .qwen4exp => |hp| qwen4exp.configJson(allocator, hp),
         };
     }
 
@@ -90,6 +94,26 @@ pub const Arch = union(enum) {
             .gpt_oss => |hp| gpt_oss.mapTensor(buf, name, hp),
             .nemotron_h => |hp| nemotron_h.mapTensor(buf, name, hp),
             .qwen3next => |hp| qwen3next.mapTensor(buf, name, hp),
+            .qwen4exp => |hp| qwen4exp.mapTensor(buf, name, hp),
+        };
+    }
+
+    /// Affine-coded tensors load in MLX's affine layout (`affine.zig`): the model's own kernels are affine-keyed.
+    pub fn affineKernels(self: Arch) bool {
+        return self == .qwen4exp;
+    }
+
+    /// Whether this arch's loader serves `ty`: Q2_0 has no ggml kernel here, only its affine layout reads it.
+    pub fn serves(self: Arch, ty: @import("quants.zig").GgmlType) bool {
+        return ty.supported() and (ty != .q2_0 or self.affineKernels());
+    }
+
+    /// The GatedDeltaNet geometry the un-tiling transforms read (zeroes for an arch that has none).
+    pub fn gdn(self: Arch) qwen35.Hparams {
+        return switch (self) {
+            .qwen35 => |hp| hp,
+            .qwen4exp => |hp| hp.base,
+            else => std.mem.zeroes(qwen35.Hparams),
         };
     }
 };
@@ -111,6 +135,14 @@ pub fn splitLayer(name: []const u8, n_layers: u32) ?struct { layer: u32, leaf: [
     return .{ .layer = layer, .leaf = rest[dot + 1 ..] };
 }
 
+test "Q2_0 is served only where it loads as affine" {
+    const qwen4: Arch = .{ .qwen4exp = std.mem.zeroes(qwen4exp.Hparams) };
+    const qwen: Arch = .{ .qwen35 = std.mem.zeroes(qwen35.Hparams) };
+    try std.testing.expect(qwen4.serves(.q2_0) and qwen4.serves(.iq4_xs));
+    try std.testing.expect(!qwen.serves(.q2_0) and qwen.serves(.q4_k));
+    try std.testing.expect(!qwen4.serves(@fromBackingInt(@intCast(144))));
+}
+
 test {
     _ = qwen35;
     _ = gemma4;
@@ -119,4 +151,5 @@ test {
     _ = gpt_oss;
     _ = nemotron_h;
     _ = qwen3next;
+    _ = qwen4exp;
 }

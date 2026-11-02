@@ -17,6 +17,7 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const log = @import("../../sdk/util/log.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const embedded_ple = @import("ple_table.zig");
+const gguf = @import("../../sdk/quant/gguf/core.zig");
 pub const EmbeddedSpec = embedded_ple.EmbeddedSpec;
 pub const EmbeddedInfo = embedded_ple.EmbeddedInfo;
 pub const inspectEmbedded = embedded_ple.inspectEmbedded;
@@ -210,6 +211,9 @@ pub const NgramTable = struct {
     gpu_owns_map: bool = false,
     embedded: ?*embedded_ple.EmbeddedTable = null,
     fmt: embedded_ple.Format = .affine,
+    /// A GGUF table (`fmt == .ggml`): its rows' block type and bytes.
+    ggml: gguf.quants.GgmlType = .f32,
+    row_bytes: u32 = 0,
 
     pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !NgramTable {
         var source = (try embedded_ple.openEmbedded(model_dir, expected)) orelse return error.EmbeddedPleMissing;
@@ -254,12 +258,68 @@ pub const NgramTable = struct {
         const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
         errdefer std.posix.munmap(map);
         if (size < 8) return error.NgramTableTruncated;
+        if (std.mem.eql(u8, map[0..4], "GGUF")) {
+            std.posix.munmap(map);
+            crt.close(fd);
+            return openGguf(path);
+        }
         const hlen: usize = @intCast(std.mem.readInt(u64, map[0..8], .little));
         if (hlen > size - 8) return error.NgramTableTruncated;
         var t = try parse(map, map[8 .. 8 + hlen], 8 + hlen);
         t.fd = fd;
         t.pool = PrefetchPool.create() catch null;
         return t;
+    }
+
+    /// A GGUF's `per_layer_token_embd` read in place from the shard that holds it (`path` names the set's first shard).
+    fn openGguf(path: []const u8) !NgramTable {
+        const a = std.heap.page_allocator;
+        var f = try gguf.gguf.File.open(a, path);
+        defer f.deinit();
+        const at = f.locate(gguf.arch.qwen4exp.table_name) orelse return error.NgramTableHeader;
+        const t = at.tensor;
+        if (t.n_dims != 2 or !t.ty.isQuantized() or t.dims[0] > std.math.maxInt(u32)) return error.NgramTableHeader;
+        const dim: u32 = @intCast(t.dims[0]);
+        const row_bytes: u32 = @intCast(dim / t.ty.blockElems() * t.ty.blockBytes());
+        var probe: [4096]f32 = undefined;
+        if (dim > probe.len) return error.NgramTableHeader;
+        gguf.quants.dequantize(t.ty, t.data[0..row_bytes], probe[0..dim]) catch return error.NgramTableBits;
+
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (at.path.len >= pbuf.len) return error.NameTooLong;
+        @memcpy(pbuf[0..at.path.len], at.path);
+        pbuf[at.path.len] = 0;
+        const fd = crt.openRead(pbuf[0..at.path.len :0]);
+        if (fd < 0) return error.FileNotFound;
+        errdefer crt.close(fd);
+        const size: usize = @intCast(@max(crt.seekEnd(fd), 0));
+        if (size < at.offset + t.data.len) return error.NgramTableTruncated;
+        const map = try std.posix.mmap(null, size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, fd, 0);
+        var table: NgramTable = .{
+            .map = map,
+            .rows = t.dims[1],
+            .dim = dim,
+            .bits = 0,
+            .group_size = @intCast(t.ty.blockElems()),
+            .w_off = at.offset,
+            .s_off = 0,
+            .b_off = 0,
+            .wcols = 0,
+            .scols = 0,
+            .fd = fd,
+            .fmt = .ggml,
+            .ggml = t.ty,
+            .row_bytes = row_bytes,
+        };
+        table.pool = PrefetchPool.create() catch null;
+        log.info("[qwen4] n-gram table: {s} rows read in place from {s}\n", .{ @tagName(t.ty), std.fs.path.basename(at.path) });
+        return table;
+    }
+
+    /// Bytes of one row's `part` (weight, scales, biases; a GGUF row is all weight).
+    fn partLen(self: *const NgramTable, part: usize) usize {
+        if (self.fmt == .ggml) return if (part == 0) self.row_bytes else 0;
+        return if (part == 0) self.wcols * 4 else self.scols * embedded_ple.scaleBytes(self.fmt);
     }
 
     /// Widths `mx.quantize` packs and `dequantRow` unpacks, plus 16 = raw
@@ -399,7 +459,7 @@ pub const NgramTable = struct {
         if (self.bits == 16 or plePrefillPrefetchMode() != .kv_gated) return;
         const p = self.pool orelse return;
         if ((self.fd < 0 and self.embedded == null) or self.rows < 2 * PLE_CALIBRATION_ROWS) return;
-        if (self.wcols * 4 + self.scols * 4 > PrefetchPool.ROW_BUF) return;
+        if (self.partLen(0) + 2 * self.partLen(1) > PrefetchPool.ROW_BUF) return;
 
         // Each arm times the gather's own read + dequant on fresh rows, and the verdict is
         // the median trial, so one stalled sample cannot pick the arm.
@@ -440,8 +500,8 @@ pub const NgramTable = struct {
     /// Workers pread each round's rows, the caller dequantizes them. False when a round
     /// fails; `out` is then partial and the caller re-reads it serially.
     fn gatherPooled(self: *const NgramTable, p: *PrefetchPool, row_ids: []const i64, out: []f32) bool {
-        const wl: usize = self.wcols * 4;
-        const sl: usize = self.scols * embedded_ple.scaleBytes(self.fmt);
+        const wl: usize = self.partLen(0);
+        const sl: usize = self.partLen(1);
         var start: usize = 0;
         while (start < row_ids.len) : (start += PrefetchPool.MAX_ROWS) {
             const end = @min(start + PrefetchPool.MAX_ROWS, row_ids.len);
@@ -459,7 +519,10 @@ pub const NgramTable = struct {
     /// The `i`-th byte range the warm reads: the whole file, or an embedded pack's shard parts.
     fn warmRegion(self: *const NgramTable, i: usize) ?embedded_ple.Region {
         if (self.embedded) |source| return source.region(i);
-        return if (i == 0 and self.fd >= 0) .{ .fd = self.fd, .off = 0, .len = self.map.len } else null;
+        if (i != 0 or self.fd < 0) return null;
+        // A GGUF shard holds other tensors beside the table.
+        if (self.fmt == .ggml) return .{ .fd = self.fd, .off = self.w_off, .len = self.rows * self.row_bytes };
+        return .{ .fd = self.fd, .off = 0, .len = self.map.len };
     }
 
     /// Read the whole table through its fds once, in the background, so the
@@ -523,6 +586,7 @@ pub const NgramTable = struct {
             self.dequantRow(parts.weight, parts.scales, parts.biases, out);
             return;
         }
+        if (self.fmt == .ggml) return self.dequantRow(self.map[self.w_off + r * self.row_bytes ..][0..self.row_bytes], &.{}, &.{}, out);
         // Raw BF16 arm: straight convert, no scales/biases.
         if (self.bits == 16) {
             const raw = self.map[self.w_off + r * self.dim * 2 ..][0 .. self.dim * 2];
@@ -540,6 +604,8 @@ pub const NgramTable = struct {
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
         if (self.fmt == .nvfp4) return dequantNvfp4Row(words, scales, self.embedded.?.scale, out[0..self.dim]);
+        // The type and the row length were proven by a row at open.
+        if (self.fmt == .ggml) return gguf.quants.dequantize(self.ggml, words, out[0..self.dim]) catch unreachable;
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         // An embedded pack's global weight scale; 1.0 leaves every other table exact.
         const ws: f32 = if (self.embedded) |source| source.scale else 1.0;
@@ -564,7 +630,7 @@ pub const NgramTable = struct {
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
         // Raw BF16 arm rides no pool (single region, no dequant): serial walk.
         if (self.bits == 16) return self.gatherSerial(row_ids, out);
-        const need: usize = self.wcols * 4 + self.scols * embedded_ple.scaleBytes(self.fmt) * 2;
+        const need: usize = self.partLen(0) + 2 * self.partLen(1);
         // Avoid pool wakeups on resident tables unless calibration or long KV warrants them.
         const wide = row_ids.len > PrefetchPool.MAX_ROWS;
         if (wide) self.refreshAfterWarm();
@@ -583,8 +649,8 @@ pub const NgramTable = struct {
     /// One (row, region) pread into the pool's row buffer. False on a short read.
     fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
         if (comptime @import("builtin").os.tag == .windows) unreachable; // `open` refuses on Windows
-        const wl: usize = self.wcols * 4;
-        const sl: usize = self.scols * embedded_ple.scaleBytes(self.fmt);
+        const wl: usize = self.partLen(0);
+        const sl: usize = self.partLen(1);
         const off: usize, const dst: []u8 = switch (region) {
             0 => .{ self.w_off + r * wl, buf[0..wl] },
             1 => .{ self.s_off + r * sl, buf[wl .. wl + sl] },
@@ -1171,6 +1237,96 @@ test "ngram prefill calibration: sampled rows are bounded and disjoint" {
         calibrationRows(rows, &serial_rows, &pool_rows, .load, 1);
         if (rows > 1 << 20) try testing.expect(!std.mem.eql(i64, &load_rows, &serial_rows));
     }
+}
+
+test "ngram table: a split GGUF's IQ4_NL table reads in place from the shard that holds it" {
+    const quants = gguf.quants;
+    const ROWS: u64 = 300;
+    const DIM: u64 = 64;
+    const RB: usize = DIM / 32 * 18;
+    const W = struct {
+        b: std.ArrayList(u8) = .empty,
+        fn num(w: *@This(), v: anytype) !void {
+            try w.b.appendSlice(testing.allocator, std.mem.asBytes(&v));
+        }
+        fn str(w: *@This(), s: []const u8) !void {
+            try w.num(@as(u64, s.len));
+            try w.b.appendSlice(testing.allocator, s);
+        }
+        fn head(w: *@This(), tensors: u64, no: u16) !void {
+            try w.b.appendSlice(testing.allocator, "GGUF");
+            try w.num(@as(u32, 3));
+            try w.num(tensors);
+            try w.num(@as(u64, 2));
+            for ([_][]const u8{ "split.no", "split.count" }, [_]u16{ no, 2 }) |k, v| {
+                try w.str(k);
+                try w.num(@as(u32, 2));
+                try w.num(v);
+            }
+        }
+        fn tensor(w: *@This(), name: []const u8, d0: u64, d1: u64, ty: u32, off: u64) !void {
+            try w.str(name);
+            try w.num(@as(u32, 2));
+            try w.num(d0);
+            try w.num(d1);
+            try w.num(ty);
+            try w.num(off);
+        }
+    };
+    var s1: W = .{};
+    defer s1.b.deinit(testing.allocator);
+    try s1.head(0, 0);
+    var s2: W = .{};
+    defer s2.b.deinit(testing.allocator);
+    try s2.head(2, 1);
+    // Another tensor first, so the table sits at a nonzero offset of its shard.
+    try s2.tensor("x.weight", 32, 1, @backingInt(quants.GgmlType.q8_0), 0);
+    try s2.tensor(gguf.arch.qwen4exp.table_name, DIM, ROWS, @backingInt(quants.GgmlType.iq4_nl), 64);
+    while (s2.b.items.len % 32 != 0) try s2.b.append(testing.allocator, 0);
+    try s2.b.appendNTimes(testing.allocator, 0, 64);
+    const table_at = s2.b.items.len;
+    var prng = std.Random.DefaultPrng.init(0x1a4);
+    for (0..ROWS * DIM / 32) |blk| {
+        var block: [18]u8 = undefined;
+        prng.random().bytes(&block);
+        const d: f16 = @floatCast(0.01 * @as(f32, @floatFromInt(blk % 7 + 1)));
+        @memcpy(block[0..2], std.mem.asBytes(&d));
+        try s2.b.appendSlice(testing.allocator, &block);
+    }
+
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "t-00001-of-00002.gguf", .data = s1.b.items });
+    try td.dir.writeFile(io, .{ .sub_path = "t-00002-of-00002.gguf", .data = s2.b.items });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try td.dir.realPath(io, &pbuf);
+    var full: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&full, "{s}/t-00001-of-00002.gguf", .{pbuf[0..root_len]});
+
+    warm_override = false;
+    defer warm_override = null;
+    var t = try NgramTable.open(path);
+    defer t.close();
+    try testing.expectEqual(embedded_ple.Format.ggml, t.fmt);
+    try testing.expectEqual(ROWS, t.rows);
+    try testing.expectEqual(@as(u32, DIM), t.dim);
+    var want: [DIM]f32 = undefined;
+    var got: [DIM]f32 = undefined;
+    const ids = [_]i64{ 0, 299, 17, 150 };
+    for (ids) |r| {
+        const at = table_at + @as(usize, @intCast(r)) * RB;
+        try quants.dequantize(.iq4_nl, s2.b.items[at..][0..RB], &want);
+        t.row(@intCast(r), &got);
+        try testing.expectEqualSlices(f32, &want, &got);
+    }
+    // The reader pool's preads land on the same bytes as the mmap walk.
+    const p = t.pool orelse return error.SkipZigTest;
+    var serial: [ids.len * DIM]f32 = undefined;
+    var pooled: [ids.len * DIM]f32 = undefined;
+    t.gatherSerial(&ids, &serial);
+    try testing.expect(t.gatherPooled(p, &ids, &pooled));
+    try testing.expectEqualSlices(f32, &serial, &pooled);
 }
 
 test "ngram prefill gather: 4096 rows through the pool equal the direct mmap read" {

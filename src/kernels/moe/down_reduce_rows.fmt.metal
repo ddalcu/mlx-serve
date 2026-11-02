@@ -5,7 +5,7 @@ uint row = threadgroup_position_in_grid.y;
 
 int K = int(K_size);
 int N = int(N_size);
-constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
+constexpr int VPW = mlxserve_vpw<BITS>();
 int K_by_w = K * BITS / 32;
 int K_by_gs = K / GS;
 uint mask = (1u << BITS) - 1u;
@@ -20,7 +20,7 @@ size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_w + (size_t)n * (size_t)K_
 size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
 float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
 constexpr int IT = (KP + LPR - 1) / LPR;
-uint32_t pw[IT];
+mlxserve_pack_t<BITS> pw[IT];
 for (int i = 0; i < IT; ++i) {{
   int pack = int(sub) + LPR * i;
   pw[i] = (pack < KP) ? mlxserve_qpack<BITS>(w_q, wbase, pack) : 0u;
@@ -28,7 +28,7 @@ for (int i = 0; i < IT; ++i) {{
 for (int i = 0; i < IT; ++i) {{
   int pack = int(sub) + LPR * i;
   if (pack >= KP) break;
-  uint32_t packed = pw[i];
+  mlxserve_pack_t<BITS> packed = pw[i];
   int k_base = pack * VPW;
   int gi = k_base / GS;
 {s}

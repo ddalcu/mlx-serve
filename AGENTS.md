@@ -100,6 +100,9 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 - **No source-scan tests** (`@embedFile` + "this string appears in that function"): they pin text, not behaviour, and pass against their own needles (lint enforces it). Test the behaviour; a class guard that can only be text is one line in `scripts/lint_pins.txt` (`!needle` forbids). A test comment is one line saying what the bar is.
 - **One story per gotcha, one line per rule.** A gotcha entry is the defect, the cause, the fix and the guard in under 20 lines, written once after the work lands. No round-by-round logs, no ledgers, no "what the reviewer said". CHANGELOG: one user-facing sentence per change, no provisional numbers.
 - **New model support starts from mlx-lm's layout**: before writing a converter or loader, read mlx-lm's model file (merged or open PR) and the MLX packs already on Hugging Face, and match their weight names, config keys and quant layout so packs load across engines. Invent only what mlx-lm has no answer for.
+- **A kernel or model port covers every quant layout its arch ships in, when it is written**: affine 2-8 bits at g32/64/128,
+  nvfp4/mxfp8, bf16, GGUF (transcoded and raw ggml); one contract case per width; a gate asks the kernel's own width
+  check (`affineQmvUnitOk`), never a hand list; a layout left out is refused by name, never silently slower.
 - **Code two plugins need belongs in the SDK** (recommendation): when a second plugin wants a block, kernel or helper, promote it to `sdk/blocks/` or `sdk/bases/blocks/` with both plugins' tests rather than copying it, and land a speed-up in `sdk/` first. A deliberate one-model change copies the block into the plugin, marked `//! copied_from: <sdk path>`: a debt to fold back.
 - **One feature, one PR**: UI + Zig in the same PR; split only genuinely unrelated features.
 
@@ -108,8 +111,8 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 Dispatch on `config.json` `model_type`: the first plugin whose `config.zig` claims it serves it (`build/plugins.zig`
 registry). Each plugin's `AGENTS.md` holds its rules, quirks, packs and oracles (`src/plugins/<name>/AGENTS.md`; the
 name column below is the folder). With `--mlx-gguf` (opt-in, experimental) a GGUF that `sdk/quant/gguf/claim.zig`
-`servablePath` accepts (arch `qwen35`/`qwen35moe`/`gemma4`, every tensor type known) runs on the MLX path as the
-matching arch; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header
+`servablePath` accepts (arch `qwen35`/`qwen35moe`/`gemma4`/`qwen4exp`, every tensor type known; a split set opens
+from its first shard) runs on the MLX path as the matching arch; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header
 (`engine_pick.preferredEngine`: antirez DSV4-Flash + the ds4-only archs `deepseek41`/`qwen4exp`/`glm-dsa`/`glm5-next`
 → ds4, else llama.cpp); a SPLIT GGUF (`split.count` > 1) always → llama.cpp (ds4 `exit()`s on a missing shard). ds4
 DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDraftTokens() > 1`, not `hasMtp()`).

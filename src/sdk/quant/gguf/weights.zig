@@ -6,6 +6,7 @@ const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const gguf = @import("gguf.zig");
 const kernels = @import("kernels.zig");
+const affine = @import("affine.zig");
 const arch_mod = @import("arch.zig");
 const qwen35 = arch_mod.qwen35;
 const Arch = arch_mod.Arch;
@@ -15,8 +16,9 @@ pub const WeightMap = std.StringHashMap(mlx.mlx_array);
 /// Fills `out` (keys owned by `allocator`, the contract of mlx-serve's Weights).
 pub fn load(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, s: mlx.mlx_stream) !void {
     const arch = try Arch.read(f);
-    // Only the qwen35 map yields un-tiling transforms, the rest never look at this.
-    const hp = if (arch == .qwen35) arch.qwen35 else std.mem.zeroes(qwen35.Hparams);
+    // Only the GatedDeltaNet maps yield un-tiling transforms, the rest never look at this.
+    const hp = arch.gdn();
+    const to_affine = arch.affineKernels();
     var name_buf: [160]u8 = undefined;
     var it = f.tensors.iterator();
     while (it.next()) |e| {
@@ -24,12 +26,339 @@ pub fn load(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, 
         if (mapped.name.len == 0) continue;
         const t = e.value_ptr.*;
         if (t.ty.isQuantized()) {
+            if (to_affine and try loadAffine(allocator, t, mapped, hp, out)) continue;
             try loadQuantized(allocator, t, mapped, hp, out, s);
         } else {
             try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
         }
     }
+    if (arch == .qwen4exp) for (0..arch.qwen4exp.base.n_layers) |li| {
+        var lb: [64]u8 = undefined;
+        const layer = std.fmt.bufPrint(&lb, "language_model.model.layers.{d}.", .{li}) catch unreachable;
+        try joinIndexer(allocator, out, layer, s);
+        try quantizeGdnGates(allocator, out, layer, s);
+        // Our qwen4_exp packs ship A_log in bf16, the dtype the fused GDN decode kernel reads.
+        var nb: [96]u8 = undefined;
+        if (out.getPtr(std.fmt.bufPrint(&nb, "{s}linear_attn.A_log", .{layer}) catch unreachable)) |a_log| {
+            var cast = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&cast, a_log.*, .bfloat16, s));
+            try mlx.check(mlx.mlx_array_eval(cast));
+            _ = mlx.mlx_array_free(a_log.*);
+            a_log.* = cast;
+        }
+    };
 }
+
+/// A GatedDeltaNet layer's a and b projections (dense in the file, 48 rows) quantized to the affine width its qkv
+/// and z projections share, so the four join one row group as in our packs (the group's fused GDN arms need it).
+fn quantizeGdnGates(allocator: std.mem.Allocator, out: *WeightMap, layer: []const u8, s: mlx.mlx_stream) !void {
+    var nb: [160]u8 = undefined;
+    const qkv_w = out.get(std.fmt.bufPrint(&nb, "{s}linear_attn.in_proj_qkv.weight", .{layer}) catch unreachable) orelse return;
+    const qkv_s = out.get(std.fmt.bufPrint(&nb, "{s}linear_attn.in_proj_qkv.scales", .{layer}) catch unreachable) orelse return;
+    if (mlx.mlx_array_dtype(qkv_s) != .bfloat16 or mlx.mlx_array_dtype(qkv_w) != .uint32) return;
+    // The join needs z at qkv's layout; below 4 bits the gates would lose more than the join saves.
+    const z_w = out.get(std.fmt.bufPrint(&nb, "{s}linear_attn.in_proj_z.weight", .{layer}) catch unreachable) orelse return;
+    const z_s = out.get(std.fmt.bufPrint(&nb, "{s}linear_attn.in_proj_z.scales", .{layer}) catch unreachable) orelse return;
+    if (mlx.getShape(z_w)[1] != mlx.getShape(qkv_w)[1] or mlx.getShape(z_s)[1] != mlx.getShape(qkv_s)[1] or mlx.mlx_array_dtype(z_s) != .bfloat16) return;
+    const a_w = out.get(std.fmt.bufPrint(&nb, "{s}linear_attn.in_proj_a.weight", .{layer}) catch unreachable) orelse return;
+    if (@divExact(mlx.getShape(qkv_w)[1] * 32, mlx.getShape(a_w)[1]) < 4) return;
+    for ([_][]const u8{ "in_proj_a", "in_proj_b" }) |part| {
+        if (out.get(std.fmt.bufPrint(&nb, "{s}linear_attn.{s}.scales", .{ layer, part }) catch unreachable) != null) continue;
+        const dense = out.fetchRemove(std.fmt.bufPrint(&nb, "{s}linear_attn.{s}.weight", .{ layer, part }) catch unreachable) orelse continue;
+        defer allocator.free(dense.key);
+        defer _ = mlx.mlx_array_free(dense.value);
+        const in = mlx.getShape(dense.value)[1];
+        const gs = @divExact(in, mlx.getShape(qkv_s)[1]);
+        const bits = @divExact(mlx.getShape(qkv_w)[1] * 32, in);
+        var q = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(q);
+        try mlx.check(mlx.mlx_quantize(&q, dense.value, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+        for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |leaf, i| {
+            var arr = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&arr, q, i));
+            try mlx.check(mlx.mlx_array_eval(arr));
+            try put(allocator, out, std.fmt.bufPrint(&nb, "{s}linear_attn.{s}.{s}", .{ layer, part, leaf }) catch unreachable, arr);
+        }
+    }
+}
+
+/// A qwen4exp MTP sidecar's head (`mtp-*.gguf`, arch/qwen4exp.zig `mapMtpTensor`) into `out` beside the trunk.
+pub fn loadMtp(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, s: mlx.mlx_stream) !void {
+    const q4 = arch_mod.qwen4exp;
+    if (!std.mem.eql(u8, f.getString("general.architecture") orelse "", q4.arch_name)) return error.UnsupportedArch;
+    if ((f.getInt(q4.arch_name ++ ".nextn_predict_layers") orelse 0) != 1) return error.BadMetadata;
+    const base = try qwen35.Hparams.read(f, q4.arch_name);
+    var name_buf: [160]u8 = undefined;
+    var it = f.tensors.iterator();
+    while (it.next()) |e| {
+        const mapped = q4.mapMtpTensor(&name_buf, e.key_ptr.*, base) orelse return error.UnsupportedTensor;
+        if (mapped.name.len == 0) continue;
+        const t = e.value_ptr.*;
+        if (std.mem.endsWith(u8, mapped.name, "block_inject_weight.weight") and t.ty.isQuantized()) {
+            // The trunk's injects are dense: the head's quantized ones join them as bf16.
+            try put(allocator, out, mapped.name, try dequantized(allocator, t));
+        } else if (t.ty.isQuantized()) {
+            if (try loadAffine(allocator, t, mapped, base, out)) {
+                if (headBits(mapped.name, t)) |bits| try requantHead(out, mapped.name, t, bits, s);
+                continue;
+            }
+            try loadQuantized(allocator, t, mapped, base, out, s);
+        } else try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, base, s));
+    }
+    try joinIndexer(allocator, out, q4.mtp_prefix ++ "layers.0.", s);
+    try splitEhProj(allocator, out, s);
+}
+
+/// The head only proposes (the trunk verifies every token), so it loads in our qwen4 packs' head layout and rides
+/// their kernels: routed experts at 4 bits, every other affine projection at 8, group 64. The width `t` (loaded by
+/// `loadAffine`) is requantized to, null when it already is that layout or narrower at group 64.
+fn headBits(name: []const u8, t: gguf.Tensor) ?u32 {
+    const from = affine.bitsOf(t.ty) orelse return null;
+    if (t.dims[0] % 64 != 0) return null;
+    const bits: u32 = if (std.mem.indexOf(u8, name, ".switch_mlp.") != null) 4 else 8;
+    return if (affine.groupOf(t.ty) == 64 and from <= bits) null else bits;
+}
+
+fn requantHead(out: *WeightMap, name: []const u8, t: gguf.Tensor, bits: u32, s: mlx.mlx_stream) !void {
+    const stem = name[0 .. name.len - "weight".len];
+    var nb: [3][160]u8 = undefined;
+    var slots: [3]*mlx.mlx_array = undefined;
+    for ([_][]const u8{ "weight", "scales", "biases" }, &slots, &nb) |leaf, *slot, *buf|
+        slot.* = out.getPtr(std.fmt.bufPrint(buf, "{s}{s}", .{ stem, leaf }) catch return error.NameTooLong) orelse return error.MissingWeight;
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    const from_g: c_int = @intCast(affine.groupOf(t.ty));
+    const from_b: c_int = @intCast(affine.bitsOf(t.ty).?);
+    try mlx.check(mlx.mlx_dequantize(&dense, slots[0].*, slots[1].*, slots[2].*, mlx.mlx_optional_int.some(from_g), mlx.mlx_optional_int.some(from_b), "affine", .{}, .{ .value = .bfloat16, .has_value = true }, s));
+    var q = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(q);
+    try mlx.check(mlx.mlx_quantize(&q, dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
+    for (slots, 0..) |slot, i| {
+        var arr = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&arr, q, i));
+        try mlx.check(mlx.mlx_array_eval(arr));
+        _ = mlx.mlx_array_free(slot.*);
+        slot.* = arr;
+    }
+}
+
+/// A small quantized tensor as bf16 `[rows, in]`, through the reference dequant.
+fn dequantized(allocator: std.mem.Allocator, t: gguf.Tensor) !mlx.mlx_array {
+    const n: usize = @intCast(t.elems());
+    const f = try allocator.alloc(f32, n);
+    defer allocator.free(f);
+    try @import("quants.zig").dequantize(t.ty, t.data, f);
+    const h = try allocator.alloc(u16, n);
+    defer allocator.free(h);
+    for (f, h) |v, *o| o.* = affine.bf16(v);
+    return mlx.mlx_array_new_data(h.ptr, &[_]c_int{ @intCast(t.dims[1]), @intCast(t.dims[0]) }, 2, .bfloat16);
+}
+
+/// The head's `[fc_embedding | fc_hidden]` combiner as our packs' two projections, its input split in half,
+/// embedding first (the converter's `cat([fc_embedding, fc_hidden], dim=1)`). Affine layouts only.
+fn splitEhProj(allocator: std.mem.Allocator, out: *WeightMap, s: mlx.mlx_stream) !void {
+    const q4 = arch_mod.qwen4exp;
+    const stem = q4.mtp_eh_proj[0 .. q4.mtp_eh_proj.len - "weight".len];
+    if (out.get(stem ++ "scales")) |sc| if (mlx.mlx_array_dtype(sc) == .bool_) return error.UnsupportedTensor;
+    for ([_][]const u8{ "weight", "scales", "biases" }) |leaf| {
+        var nb: [96]u8 = undefined;
+        const whole = out.fetchRemove(std.fmt.bufPrint(&nb, "{s}{s}", .{ stem, leaf }) catch unreachable) orelse return error.UnsupportedTensor;
+        defer allocator.free(whole.key);
+        defer _ = mlx.mlx_array_free(whole.value);
+        const sh = mlx.getShape(whole.value);
+        if (sh.len != 2 or @rem(sh[1], 2) != 0) return error.BadShape;
+        const half = @divExact(sh[1], 2);
+        for ([_][]const u8{ "fc_embedding", "fc_hidden" }, 0..) |part, i| {
+            const lo: c_int = @intCast(i * @as(usize, @intCast(half)));
+            var view = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(view);
+            try mlx.check(mlx.mlx_slice(&view, whole.value, &[_]c_int{ 0, lo }, 2, &[_]c_int{ sh[0], lo + half }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            const copy = try @import("../../../mlx/array.zig").materializedOwnedCopy(s, view);
+            try mlx.check(mlx.mlx_array_eval(copy));
+            var pb: [96]u8 = undefined;
+            try put(allocator, out, std.fmt.bufPrint(&pb, q4.mtp_prefix ++ "{s}.{s}", .{ part, leaf }) catch unreachable, copy);
+        }
+    }
+}
+
+/// One full layer's indexer q and k rows back into the one `index_qk_proj` our qwen4_exp packs carry, q first.
+/// `layer` is the layer's name prefix; a layer without an indexer is left alone.
+fn joinIndexer(allocator: std.mem.Allocator, out: *WeightMap, layer: []const u8, s: mlx.mlx_stream) !void {
+    const q4 = arch_mod.qwen4exp;
+    var qb: [160]u8 = undefined;
+    var kb: [160]u8 = undefined;
+    const q = out.fetchRemove(std.fmt.bufPrint(&qb, "{s}" ++ q4.idx_q, .{layer}) catch unreachable) orelse return;
+    defer allocator.free(q.key);
+    defer _ = mlx.mlx_array_free(q.value);
+    const k = out.fetchRemove(std.fmt.bufPrint(&kb, "{s}" ++ q4.idx_k, .{layer}) catch unreachable) orelse return error.UnsupportedTensor;
+    defer allocator.free(k.key);
+    defer _ = mlx.mlx_array_free(k.value);
+    const parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    _ = mlx.mlx_vector_array_append_value(parts, q.value);
+    _ = mlx.mlx_vector_array_append_value(parts, k.value);
+    var joined = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&joined, parts, 0, s));
+    try mlx.check(mlx.mlx_array_eval(joined));
+    var nb: [160]u8 = undefined;
+    try put(allocator, out, std.fmt.bufPrint(&nb, "{s}self_attn.indexer.index_qk_proj.weight", .{layer}) catch unreachable, joined);
+}
+
+/// Bytes `load` copies into MLX arrays (an upper bound: f32 tensors land as bf16); the tensors the arch skips stay in the file.
+pub fn residentBytes(f: *const gguf.File) !u64 {
+    const arch = try Arch.read(f);
+    const to_affine = arch.affineKernels();
+    var name_buf: [160]u8 = undefined;
+    var total: u64 = 0;
+    var it = f.tensors.iterator();
+    while (it.next()) |e| {
+        const mapped = arch.mapTensor(&name_buf, e.key_ptr.*) orelse return error.UnsupportedTensor;
+        if (mapped.name.len != 0) total += loadedBytes(e.value_ptr.*, to_affine);
+    }
+    return total;
+}
+
+/// `residentBytes` of an MTP sidecar (`loadMtp`).
+pub fn mtpResidentBytes(f: *const gguf.File) !u64 {
+    const base = try qwen35.Hparams.read(f, arch_mod.qwen4exp.arch_name);
+    var name_buf: [160]u8 = undefined;
+    var total: u64 = 0;
+    var it = f.tensors.iterator();
+    while (it.next()) |e| {
+        const mapped = arch_mod.qwen4exp.mapMtpTensor(&name_buf, e.key_ptr.*, base) orelse return error.UnsupportedTensor;
+        if (mapped.name.len == 0) continue;
+        const t = e.value_ptr.*;
+        total += if (headBits(mapped.name, t)) |bits| t.elems() * bits / 8 + t.elems() / 64 * 4 else loadedBytes(t, true);
+    }
+    return total;
+}
+
+/// A tensor's bytes as loaded: an affine copy is the codes plus a bf16 scale and bias per group.
+fn loadedBytes(t: gguf.Tensor, to_affine: bool) u64 {
+    const bits = if (to_affine) affine.bitsOf(t.ty) else null;
+    return if (bits) |b| t.elems() * b / 8 + t.elems() / affine.groupOf(t.ty) * 4 else t.data.len;
+}
+
+/// A tensor of an affine-coded type (affine.zig) in MLX's layout: `<base>.weight` u32 codes, `.scales` and `.biases`
+/// bf16, one per `affine.groupOf` weights. False when its type or transform keeps the ggml blocks.
+fn loadAffine(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.Mapped, hp: qwen35.Hparams, out: *WeightMap) !bool {
+    const bits = affine.bitsOf(t.ty) orelse return false;
+    if (!std.mem.endsWith(u8, mapped.name, ".weight") or t.n_dims < 2 or t.n_dims > 3) return false;
+    const in: usize = @intCast(t.dims[0]);
+    const rows: usize = @intCast(t.elems() / t.dims[0]);
+    const row_bytes = in / t.ty.blockElems() * t.ty.blockBytes();
+    var src = t.data;
+    var untiled: []u8 = &.{};
+    defer allocator.free(untiled);
+    switch (mapped.transform) {
+        .none => {},
+        .untile_rows => |u| {
+            // Rows are whole blocks, so moving a row moves its bytes and nothing else.
+            if (t.n_dims != 2 or u.start + hp.nv * u.unit != rows) return error.BadShape;
+            untiled = try allocator.alloc(u8, t.data.len);
+            untile(untiled, t.data, u.start * row_bytes, u.unit * row_bytes, hp);
+            src = untiled;
+        },
+        // Value heads of whole groups move after the decode.
+        .tiled_input => if (t.n_dims != 2 or hp.dv % affine.groupOf(t.ty) != 0 or in != hp.nv * hp.dv) return false,
+        else => return false,
+    }
+    const job: AffineJob = .{
+        .ty = t.ty,
+        .bits = bits,
+        .in = in,
+        .row_bytes = row_bytes,
+        .src = src,
+        .tiled = mapped.transform == .tiled_input,
+        .hp = hp,
+        .w = try allocator.alloc(u32, rows * in * bits / 32),
+        .sc = try allocator.alloc(u16, rows * in / affine.groupOf(t.ty)),
+        .bi = try allocator.alloc(u16, rows * in / affine.groupOf(t.ty)),
+    };
+    defer allocator.free(job.w);
+    defer allocator.free(job.sc);
+    defer allocator.free(job.bi);
+    // Large tensors (expert banks) decode on several threads, rows split evenly.
+    const n_threads: usize = if (rows * in < 1 << 22) 1 else @min(16, std.Thread.getCpuCount() catch 1);
+    var threads: [16]?std.Thread = @splat(null);
+    const per = (rows + n_threads - 1) / n_threads;
+    var ok = std.atomic.Value(bool).init(true);
+    for (0..n_threads) |i| {
+        const lo = @min(rows, i * per);
+        const hi = @min(rows, lo + per);
+        if (i + 1 == n_threads) {
+            job.run(lo, hi, &ok);
+        } else threads[i] = std.Thread.spawn(.{}, AffineJob.run, .{ &job, lo, hi, &ok }) catch blk: {
+            job.run(lo, hi, &ok);
+            break :blk null;
+        };
+    }
+    for (threads) |th| if (th) |x| x.join();
+    if (!ok.load(.acquire)) return error.OutOfMemory;
+
+    var shape: [3]c_int = undefined;
+    const nd: usize = t.n_dims;
+    for (0..nd) |i| shape[i] = @intCast(t.dims[nd - 1 - i]);
+    const base = mapped.name[0 .. mapped.name.len - "weight".len];
+    var nb: [160]u8 = undefined;
+    shape[nd - 1] = @intCast(in * bits / 32);
+    try put(allocator, out, mapped.name, mlx.mlx_array_new_data(job.w.ptr, &shape, @intCast(nd), .uint32));
+    shape[nd - 1] = @intCast(in / affine.groupOf(t.ty));
+    try put(allocator, out, std.fmt.bufPrint(&nb, "{s}scales", .{base}) catch return error.NameTooLong, mlx.mlx_array_new_data(job.sc.ptr, &shape, @intCast(nd), .bfloat16));
+    try put(allocator, out, std.fmt.bufPrint(&nb, "{s}biases", .{base}) catch return error.NameTooLong, mlx.mlx_array_new_data(job.bi.ptr, &shape, @intCast(nd), .bfloat16));
+    return true;
+}
+
+const AffineJob = struct {
+    ty: @import("quants.zig").GgmlType,
+    bits: u32,
+    in: usize,
+    row_bytes: usize,
+    src: []const u8,
+    /// The input's value heads are in llama.cpp's tiled order (arch/qwen35.zig): put them back grouped.
+    tiled: bool,
+    hp: qwen35.Hparams,
+    w: []u32,
+    sc: []u16,
+    bi: []u16,
+
+    fn run(self: *const AffineJob, lo: usize, hi: usize, ok: *std.atomic.Value(bool)) void {
+        const a = std.heap.page_allocator;
+        const n_groups = self.in / affine.groupOf(self.ty);
+        const buf = a.alloc(u8, 2 * self.in) catch return ok.store(false, .release);
+        defer a.free(buf);
+        const fbuf = a.alloc(f32, 4 * n_groups) catch return ok.store(false, .release);
+        defer a.free(fbuf);
+        const words = self.in * self.bits / 32;
+        for (lo..hi) |r| {
+            var q = buf[0..self.in];
+            var scale = fbuf[0..n_groups];
+            var bias = fbuf[n_groups .. 2 * n_groups];
+            affine.decodeRow(self.ty, self.src[r * self.row_bytes ..][0..self.row_bytes], q, scale, bias);
+            if (self.tiled) {
+                const dv = self.hp.dv;
+                const gpv = dv / affine.groupOf(self.ty);
+                const q2 = buf[self.in..];
+                const s2 = fbuf[2 * n_groups .. 3 * n_groups];
+                const b2 = fbuf[3 * n_groups ..];
+                for (0..self.hp.nv) |tiled| {
+                    const h = qwen35.groupedIndex(@intCast(tiled), self.hp.nk, self.hp.r());
+                    @memcpy(q2[h * dv ..][0..dv], q[tiled * dv ..][0..dv]);
+                    @memcpy(s2[h * gpv ..][0..gpv], scale[tiled * gpv ..][0..gpv]);
+                    @memcpy(b2[h * gpv ..][0..gpv], bias[tiled * gpv ..][0..gpv]);
+                }
+                q = q2;
+                scale = s2;
+                bias = b2;
+            }
+            affine.packCodes(self.bits, q, self.w[r * words ..][0..words]);
+            for (scale, bias, self.sc[r * n_groups ..][0..n_groups], self.bi[r * n_groups ..][0..n_groups]) |sv, bv, *so, *bo| {
+                so.* = affine.bf16(sv);
+                bo.* = affine.bf16(bv);
+            }
+        }
+    }
+};
 
 /// Runs the decode and the prefill kernel of every distinct (type, shape) in
 /// `map` once, so Metal compiles them during load and not inside the first
@@ -77,7 +406,8 @@ fn put(allocator: std.mem.Allocator, out: *WeightMap, name: []const u8, arr: mlx
 }
 
 fn loadQuantized(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.Mapped, hp: qwen35.Hparams, out: *WeightMap, s: mlx.mlx_stream) !void {
-    if (!std.mem.endsWith(u8, mapped.name, ".weight")) return error.UnsupportedTensor;
+    // Q2_0 has no ggml kernel: only its affine layout (`loadAffine`) serves it.
+    if (!std.mem.endsWith(u8, mapped.name, ".weight") or t.ty == .q2_0) return error.UnsupportedTensor;
     const rows: usize = @intCast(t.dims[1]);
     if (t.n_dims == 3) {
         // An expert bank, experts outermost: [experts, rows, row bytes].
@@ -117,7 +447,7 @@ fn loadQuantized(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.
         .none => try packedRows(allocator, t.ty, t.data, &shape, s),
         .tiled_input => blk: {
             info.tiled = .{ .nk = @intCast(hp.nk), .r = @intCast(hp.r()) };
-            break :blk mlx.mlx_array_new_data(t.data.ptr, &shape, 2, .uint8);
+            break :blk try packedRows(allocator, t.ty, t.data, &shape, s);
         },
         .untile_rows => |u| blk: {
             // Rows are whole blocks, so moving a row moves its bytes and nothing else.
@@ -256,6 +586,284 @@ test "untile moves tiled value-head chunks to grouped order and keeps the prefix
     try std.testing.expectEqualStrings("PPa0a1a2b0b1b2", &dst);
 }
 
+test "GDN gates join the qkv and z layout they share at 4 bits or more, else stay dense" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const layer = "language_model.model.layers.0.";
+    const Layout = struct { bits: c_int, gs: c_int };
+    const Case = struct { qkv: Layout, z: ?Layout, joins: bool };
+    for ([_]Case{
+        .{ .qkv = .{ .bits = 4, .gs = 32 }, .z = .{ .bits = 4, .gs = 32 }, .joins = true },
+        .{ .qkv = .{ .bits = 2, .gs = 64 }, .z = .{ .bits = 2, .gs = 64 }, .joins = false },
+        .{ .qkv = .{ .bits = 4, .gs = 32 }, .z = .{ .bits = 8, .gs = 32 }, .joins = false },
+        .{ .qkv = .{ .bits = 4, .gs = 32 }, .z = null, .joins = false },
+    }) |c| {
+        var map = WeightMap.init(a);
+        defer {
+            var it = map.iterator();
+            while (it.next()) |e| {
+                _ = mlx.mlx_array_free(e.value_ptr.*);
+                a.free(e.key_ptr.*);
+            }
+            map.deinit();
+        }
+        var prng = std.Random.DefaultPrng.init(0x9a7e);
+        var buf: [16 * 128]f32 = undefined;
+        for (&buf) |*v| v.* = prng.random().floatNorm(f32) * 0.02;
+        const parts = [_]struct { name: []const u8, rows: c_int, q: ?Layout }{
+            .{ .name = "in_proj_qkv", .rows = 16, .q = c.qkv },
+            .{ .name = "in_proj_z", .rows = 16, .q = c.z },
+            .{ .name = "in_proj_a", .rows = 4, .q = null },
+            .{ .name = "in_proj_b", .rows = 4, .q = null },
+        };
+        for (parts) |part| {
+            const f = mlx.mlx_array_new_data(&buf, &[_]c_int{ part.rows, 128 }, 2, .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var bf = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&bf, f, .bfloat16, s));
+            var nb: [128]u8 = undefined;
+            const q = part.q orelse {
+                try put(a, &map, try std.fmt.bufPrint(&nb, "{s}linear_attn.{s}.weight", .{ layer, part.name }), bf);
+                continue;
+            };
+            defer _ = mlx.mlx_array_free(bf);
+            var v = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(v);
+            try mlx.check(mlx.mlx_quantize(&v, bf, mlx.mlx_optional_int.some(q.gs), mlx.mlx_optional_int.some(q.bits), "affine", .{}, s));
+            for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |leaf, li| {
+                var arr = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(&arr, v, li));
+                try mlx.check(mlx.mlx_array_eval(arr));
+                try put(a, &map, try std.fmt.bufPrint(&nb, "{s}linear_attn.{s}.{s}", .{ layer, part.name, leaf }), arr);
+            }
+        }
+        try quantizeGdnGates(a, &map, layer, s);
+        for ([_][]const u8{ "in_proj_a", "in_proj_b" }) |gate| {
+            var nb: [128]u8 = undefined;
+            const sc = map.get(try std.fmt.bufPrint(&nb, "{s}linear_attn.{s}.scales", .{ layer, gate }));
+            try std.testing.expectEqual(c.joins, sc != null);
+            if (sc) |x| try std.testing.expectEqual(@divExact(@as(c_int, 128), c.qkv.gs), mlx.getShape(x)[1]);
+        }
+    }
+}
+
+test "the MTP head loads in our packs' head layout: experts 4-bit g64, the rest 8-bit g64, narrower g64 kept" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const quants = @import("quants.zig");
+    const q4 = arch_mod.qwen4exp;
+    // rel: the RMS error against ggml's weights the stored layout may cost (a re-rounding at 4 or 8 bits, else bf16 scales).
+    const Case = struct { name: []const u8, ty: quants.GgmlType, fixture: []const u8, in: usize, bits: ?u32, rel: f32 };
+    inline for ([_]Case{
+        .{ .name = q4.mtp_prefix ++ "layers.0.mlp.switch_mlp.gate_proj.weight", .ty = .q8_0, .fixture = "q8_0.bin", .in = 128, .bits = 4, .rel = 0.15 },
+        .{ .name = q4.mtp_prefix ++ "fc_embedding.weight", .ty = .q8_0, .fixture = "q8_0.bin", .in = 128, .bits = 8, .rel = 0.02 },
+        .{ .name = q4.mtp_prefix ++ "layers.0.mlp.switch_mlp.down_proj.weight", .ty = .q2_0, .fixture = "q2_0.bin", .in = 256, .bits = null, .rel = 0.005 },
+    }) |c| {
+        const data = @embedFile("fixtures/" ++ c.fixture);
+        const n_blocks = data.len / (c.ty.blockBytes() + 4 * c.ty.blockElems());
+        const rows = n_blocks * c.ty.blockElems() / c.in;
+        const t = gguf.Tensor{ .dims = .{ c.in, rows, 1, 1 }, .n_dims = 2, .ty = c.ty, .data = data[0 .. rows * c.in / c.ty.blockElems() * c.ty.blockBytes()] };
+        const ref = try a.alloc(f32, rows * c.in);
+        defer a.free(ref);
+        try quants.dequantize(c.ty, t.data, ref);
+        var map = WeightMap.init(a);
+        defer {
+            var it = map.iterator();
+            while (it.next()) |e| {
+                _ = mlx.mlx_array_free(e.value_ptr.*);
+                a.free(e.key_ptr.*);
+            }
+            map.deinit();
+        }
+        try std.testing.expect(try loadAffine(a, t, .{ .name = c.name, .transform = .none }, std.mem.zeroes(qwen35.Hparams), &map));
+        try std.testing.expectEqual(c.bits, headBits(c.name, t));
+        if (c.bits) |bits| try requantHead(&map, c.name, t, bits, s);
+        const stem = c.name[0 .. c.name.len - "weight".len];
+        const w = map.get(c.name).?;
+        const sc = map.get(stem ++ "scales").?;
+        const bits: c_int = @intCast(c.bits orelse affine.bitsOf(c.ty).?);
+        try std.testing.expectEqual(@divExact(@as(c_int, @intCast(c.in)) * bits, 32), mlx.getShape(w)[1]);
+        try std.testing.expectEqual(@as(c_int, @intCast(c.in / 64)), mlx.getShape(sc)[1]);
+        var back = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(back);
+        try mlx.check(mlx.mlx_dequantize(&back, w, sc, map.get(stem ++ "biases").?, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(bits), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+        try mlx.check(mlx.mlx_array_eval(back));
+        const got = mlx.mlx_array_data_float32(back).?;
+        var err: f64 = 0;
+        var mag: f64 = 0;
+        for (ref, 0..) |r, i| {
+            err += (got[i] - r) * (got[i] - r);
+            mag += r * r;
+        }
+        try std.testing.expect(@sqrt(err / mag) < c.rel);
+    }
+}
+
+test "the MTP combiner splits into fc_embedding | fc_hidden along its input, embedding first" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var map = WeightMap.init(a);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            a.free(e.key_ptr.*);
+        }
+        map.deinit();
+    }
+    // 2 rows of 64 inputs at 8 bits: 16 words and 2 groups a row; word i holds i, scale g holds g.
+    var w: [32]u32 = undefined;
+    for (&w, 0..) |*v, i| v.* = @intCast(i % 16);
+    var sc: [4]u16 = undefined;
+    for (&sc, 0..) |*v, i| v.* = affine.bf16(@floatFromInt(i % 2));
+    const stem = arch_mod.qwen4exp.mtp_prefix ++ "eh_proj.";
+    try put(a, &map, stem ++ "weight", mlx.mlx_array_new_data(&w, &[_]c_int{ 2, 16 }, 2, .uint32));
+    try put(a, &map, stem ++ "scales", mlx.mlx_array_new_data(&sc, &[_]c_int{ 2, 2 }, 2, .bfloat16));
+    try put(a, &map, stem ++ "biases", mlx.mlx_array_new_data(&sc, &[_]c_int{ 2, 2 }, 2, .bfloat16));
+    try splitEhProj(a, &map, s);
+    try std.testing.expect(map.get(stem ++ "weight") == null);
+    for ([_][]const u8{ "fc_embedding", "fc_hidden" }, 0..) |part, half| {
+        var nb: [96]u8 = undefined;
+        const pw = map.get(try std.fmt.bufPrint(&nb, arch_mod.qwen4exp.mtp_prefix ++ "{s}.weight", .{part})).?;
+        try std.testing.expectEqualSlices(c_int, &.{ 2, 8 }, mlx.getShape(pw));
+        try std.testing.expectEqual(@as(u32, @intCast(half * 8)), mlx.mlx_array_data_uint32(pw).?[0]);
+        const ps = map.get(try std.fmt.bufPrint(&nb, arch_mod.qwen4exp.mtp_prefix ++ "{s}.scales", .{part})).?;
+        try std.testing.expectEqualSlices(c_int, &.{ 2, 1 }, mlx.getShape(ps));
+    }
+}
+
+test "an affine-coded tensor loads as MLX affine: mlx's dequant equals ggml's, value heads un-tiled" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const quants = @import("quants.zig");
+    const Case = struct { ty: quants.GgmlType, fixture: []const u8, in: usize };
+    var hp = std.mem.zeroes(qwen35.Hparams);
+    hp.nk = 2;
+    hp.nv = 4;
+    inline for ([_]Case{ .{ .ty = .q4_k, .fixture = "q4_k.bin", .in = 256 }, .{ .ty = .q5_1, .fixture = "q5_1.bin", .in = 128 }, .{ .ty = .q8_0, .fixture = "q8_0.bin", .in = 128 }, .{ .ty = .q2_0, .fixture = "q2_0.bin", .in = 256 } }) |c| {
+        const g = affine.groupOf(c.ty);
+        hp.dv = @intCast(c.in / hp.nv);
+        const data = @embedFile("fixtures/" ++ c.fixture);
+        const n_blocks = data.len / (c.ty.blockBytes() + 4 * c.ty.blockElems());
+        const rows = n_blocks * c.ty.blockElems() / c.in;
+        const row_bytes = c.in / c.ty.blockElems() * c.ty.blockBytes();
+        const t = gguf.Tensor{ .dims = .{ c.in, rows, 1, 1 }, .n_dims = 2, .ty = c.ty, .data = data[0 .. rows * row_bytes] };
+        const ref = try a.alloc(f32, rows * c.in);
+        defer a.free(ref);
+        try quants.dequantize(c.ty, t.data, ref);
+        // The bound bf16 scales and biases allow: half a bf16 ulp of each term.
+        const tol = try a.alloc(f32, rows * c.in);
+        defer a.free(tol);
+        {
+            const q = try a.alloc(u8, rows * c.in);
+            defer a.free(q);
+            const sc = try a.alloc(f32, rows * c.in / g);
+            defer a.free(sc);
+            const bi = try a.alloc(f32, rows * c.in / g);
+            defer a.free(bi);
+            affine.decodeRow(c.ty, t.data, q, sc, bi);
+            for (tol, q, 0..) |*o, code, i| o.* = (@abs(sc[i / g] * @as(f32, @floatFromInt(code))) + @abs(bi[i / g])) / 256 + 1e-6;
+        }
+        for ([_]arch_mod.Transform{ .none, .tiled_input }) |tr| {
+            var map = WeightMap.init(a);
+            defer {
+                var it = map.iterator();
+                while (it.next()) |e| {
+                    _ = mlx.mlx_array_free(e.value_ptr.*);
+                    a.free(e.key_ptr.*);
+                }
+                map.deinit();
+            }
+            try std.testing.expect(try loadAffine(a, t, .{ .name = "x.weight", .transform = tr }, hp, &map));
+            // f32 scales: mlx's dequant computes in the scales' dtype, the matmul kernels in f32.
+            var sc32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sc32);
+            try mlx.check(mlx.mlx_astype(&sc32, map.get("x.scales").?, .float32, s));
+            var bi32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(bi32);
+            try mlx.check(mlx.mlx_astype(&bi32, map.get("x.biases").?, .float32, s));
+            var y = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(y);
+            try mlx.check(mlx.mlx_dequantize(&y, map.get("x.weight").?, sc32, bi32, mlx.mlx_optional_int.some(@intCast(g)), mlx.mlx_optional_int.some(@intCast(affine.bitsOf(c.ty).?)), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+            try mlx.check(mlx.mlx_array_eval(y));
+            const got = mlx.mlx_array_data_float32(y).?[0 .. rows * c.in];
+            for (0..rows) |r| for (0..c.in) |col| {
+                // Tiled input: grouped head h reads the tiled head holding it.
+                const src_col = if (tr == .tiled_input) blk: {
+                    var t_head: u32 = 0;
+                    while (qwen35.groupedIndex(t_head, hp.nk, hp.r()) != col / hp.dv) t_head += 1;
+                    break :blk t_head * hp.dv + col % hp.dv;
+                } else col;
+                try std.testing.expectApproxEqAbs(ref[r * c.in + src_col], got[r * c.in + col], tol[r * c.in + src_col]);
+            };
+        }
+    }
+}
+
+test "a tiled-input weight of a split-layout type loads in the kernels' layout: its linear equals the un-tiled weights" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const quants = @import("quants.zig");
+    const Case = struct { ty: quants.GgmlType, fixture: []const u8, in: usize };
+    var hp = std.mem.zeroes(qwen35.Hparams);
+    hp.nk = 2;
+    hp.nv = 4;
+    inline for ([_]Case{ .{ .ty = .q8_0, .fixture = "q8_0.bin", .in = 128 }, .{ .ty = .q6_k, .fixture = "q6_k.bin", .in = 256 } }) |c| {
+        hp.dv = @intCast(c.in / hp.nv);
+        const data = @embedFile("fixtures/" ++ c.fixture);
+        const n_blocks = data.len / (c.ty.blockBytes() + 4 * c.ty.blockElems());
+        const rows = n_blocks * c.ty.blockElems() / c.in;
+        const t = gguf.Tensor{ .dims = .{ c.in, rows, 1, 1 }, .n_dims = 2, .ty = c.ty, .data = data[0 .. rows * c.in / c.ty.blockElems() * c.ty.blockBytes()] };
+        const wref = try a.alloc(f32, rows * c.in);
+        defer a.free(wref);
+        try quants.dequantize(c.ty, t.data, wref);
+        var map = WeightMap.init(a);
+        defer {
+            var it = map.iterator();
+            while (it.next()) |e| {
+                _ = mlx.mlx_array_free(e.value_ptr.*);
+                a.free(e.key_ptr.*);
+            }
+            map.deinit();
+        }
+        try loadQuantized(a, t, .{ .name = "x.weight", .transform = .tiled_input }, hp, &map, s);
+        // x in grouped head order (what the model hands the projection), exact in bf16.
+        const M = 2;
+        var xs: [M * 256]f32 = undefined;
+        for (xs[0 .. M * c.in], 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast(i * 7 % 17)) - 8)) / 8;
+        const xf = mlx.mlx_array_new_data(&xs, &[_]c_int{ M, @intCast(c.in) }, 2, .float32);
+        defer _ = mlx.mlx_array_free(xf);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, xf, .bfloat16, s));
+        const w = map.get("x.weight").?;
+        const y = try kernels.linear(kernels.infoOf(w, map.get("x.scales").?).?, x, w, s);
+        defer _ = mlx.mlx_array_free(y);
+        var y32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(y32);
+        try mlx.check(mlx.mlx_astype(&y32, y, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(y32));
+        const got = mlx.mlx_array_data_float32(y32).?;
+        for (0..M) |m| for (0..rows) |r| {
+            // Weight column c sits in tiled head c / dv; the activation it meets is that head's grouped position.
+            var want: f32 = 0;
+            var mag: f32 = 0;
+            for (0..c.in) |col| {
+                const gh = qwen35.groupedIndex(@intCast(col / hp.dv), hp.nk, hp.r());
+                const xv = xs[m * c.in + gh * hp.dv + col % hp.dv];
+                want += xv * wref[r * c.in + col];
+                mag += @abs(xv * wref[r * c.in + col]);
+            }
+            try std.testing.expectApproxEqAbs(want, got[m * rows + r], mag / 64 + 1e-4);
+        };
+    }
+}
+
 test "real model loads into a weight map (a real GGUF, env-gated)" {
     const path = std.mem.span(env.get(.MLX_SERVE_GGUF_TEST_MODEL) orelse return error.SkipZigTest);
     const a = std.testing.allocator;
@@ -282,7 +890,7 @@ test "real model loads into a weight map (a real GGUF, env-gated)" {
         .nemotron_h => "backbone.",
         else => p,
     };
-    const norm_name = try std.fmt.allocPrint(a, "{s}{s}norm{s}.weight", .{ prefix, if (arch == .lfm2) "embedding_" else "", if (arch == .nemotron_h) "_f" else "" });
+    const norm_name = if (arch == .qwen4exp) try a.dupe(u8, p ++ "hyper_connection_mixer.hc_norm.weight") else try std.fmt.allocPrint(a, "{s}{s}norm{s}.weight", .{ prefix, if (arch == .lfm2) "embedding_" else "", if (arch == .nemotron_h) "_f" else "" });
     defer a.free(norm_name);
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(map.get(norm_name).?));
     switch (arch) {
@@ -319,6 +927,13 @@ test "real model loads into a weight map (a real GGUF, env-gated)" {
         .gpt_oss => |hp| {
             try std.testing.expectEqualSlices(c_int, &.{@intCast(hp.n_heads)}, mlx.getShape(map.get("model.layers.0.self_attn.sinks").?));
             try std.testing.expect(map.get("model.layers.0.mlp.experts.gate_proj.bias") != null);
+        },
+        .qwen4exp => |hp| {
+            const li = hp.base.full_attn_interval - 1;
+            var nb: [128]u8 = undefined;
+            const qk = map.get(try std.fmt.bufPrint(&nb, p ++ "layers.{d}.self_attn.indexer.index_qk_proj.weight", .{li})).?;
+            try std.testing.expectEqual(@as(c_int, @intCast((hp.idx_heads + 1) * hp.idx_dim)), mlx.getShape(qk)[0]);
+            try std.testing.expect(map.get(arch_mod.qwen4exp.table_name) == null);
         },
         .gemma3 => |hp| {
             const q = map.get("model.layers.0.self_attn.q_proj.weight").?;

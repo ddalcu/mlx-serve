@@ -59,15 +59,31 @@ pub fn sidecar(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, 
     };
 }
 
-/// Size of the GGUF this engine would load for `model_dir` (what ends up
-/// resident: tensors are copied as is), null when `model_dir` is not ours.
+/// Bytes of the tensors this engine would load for `model_dir` (what ends up
+/// resident: tensors are copied as is, skipped ones stay on disk), null when
+/// `model_dir` is not ours.
 pub fn weightBytes(io: std.Io, model_dir: []const u8) ?u64 {
     const allocator = std.heap.page_allocator;
     const path = servablePath(io, allocator, model_dir) orelse return null;
     defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
-    defer file.close(io);
-    return (file.stat(io) catch return null).size;
+    var f = gguf.gguf.File.open(allocator, path) catch return null;
+    defer f.deinit();
+    var bytes = gguf.weights.residentBytes(&f) catch return null;
+    if (mtpHead(io, allocator, &f, path)) |head| {
+        defer allocator.free(head);
+        var h = gguf.gguf.File.open(allocator, head) catch return bytes;
+        defer h.deinit();
+        bytes += gguf.weights.mtpResidentBytes(&h) catch 0;
+    }
+    return bytes;
+}
+
+/// The MTP head GGUF that drafts for the model at `path` (`gguf_files.findMtpSidecar`): a qwen4exp trunk only.
+/// Caller frees.
+fn mtpHead(io: std.Io, allocator: std.mem.Allocator, f: *const gguf.gguf.File, path: []const u8) ?[]u8 {
+    const arch = gguf.gguf_arch.Arch.read(f) catch return null;
+    if (arch != .qwen4exp) return null;
+    return gguf_files.findMtpSidecar(io, allocator, path);
 }
 
 /// Fill `out` from the GGUF. False when `model_dir` is not ours.
@@ -78,6 +94,13 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var f = try gguf.gguf.File.open(allocator, path);
     defer f.deinit();
     try gguf.weights.load(allocator, &f, out, mlx.gpuStream());
+    if (mtpHead(io, allocator, &f, path)) |head| {
+        defer allocator.free(head);
+        var h = try gguf.gguf.File.open(allocator, head);
+        defer h.deinit();
+        try gguf.weights.loadMtp(allocator, &h, out, mlx.gpuStream());
+        log.info("[gguf] mlx engine: MTP head from {s}\n", .{std.fs.path.basename(head)});
+    }
     try gguf.weights.warmKernels(allocator, out, mlx.gpuStream());
     log.info("[gguf] mlx engine: {d} tensors from {s}\n", .{ f.tensors.count(), path });
     return true;
@@ -109,4 +132,5 @@ test "declines everything that is not a servable GGUF" {
 
 test {
     _ = gguf;
+    _ = gguf_files;
 }

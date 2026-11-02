@@ -19,7 +19,7 @@ pub fn unsupportedReason(f: *const gguf.File, buf: []u8) ?[]const u8 {
     var name_buf: [160]u8 = undefined;
     var it = f.tensors.iterator();
     while (it.next()) |e| {
-        if (!e.value_ptr.ty.supported()) return std.fmt.bufPrint(buf, "tensor type of {s}", .{e.key_ptr.*}) catch "tensor type";
+        if (!arch.serves(e.value_ptr.ty)) return std.fmt.bufPrint(buf, "tensor type of {s}", .{e.key_ptr.*}) catch "tensor type";
         if (arch.mapTensor(&name_buf, e.key_ptr.*) == null) return std.fmt.bufPrint(buf, "tensor {s}", .{e.key_ptr.*}) catch "tensor";
     }
     return null;
