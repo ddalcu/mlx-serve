@@ -184,6 +184,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Transformer — owns the bulk of the GPU memory.
     const xfm_ptr = try sch.allocator.create(Transformer);
     errdefer sch.allocator.destroy(xfm_ptr);
+    if (served) plugin_driver.fundAuxCache(params.config, params.prefix_cache_capacity, params.prefix_cache_ram_enabled, params.prefix_cache_mem_bytes);
     xfm_ptr.* = if (served)
         try plugin_driver.loadWith(sch.io, sch.allocator, params.config, params.model_dir, mlx.gpuStream(), if (params.load_vision) weights_ptr else null)
     else
@@ -812,12 +813,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // cap beside a ~70 GB pack was the uncatchable Metal OOM).
         // Disk-only mode retains no reusable KV in RAM, so it asks for no RAM budget.
         var ssd_idle_mem: u64 = 0;
-        const clamped_prefix_mem: u64 = if (!ram_prefix_cache)
+        const resolved_prefix_mem: u64 = if (!ram_prefix_cache)
             0
         else if (sch.prefix_cache_mem_resolver) |resolve|
             resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
+        const clamped_prefix_mem = @import("admission/hot_cache_plan.zig").boundedModuleCacheBudget(params.config, resolved_prefix_mem);
         const new_hc = try sch.allocator.create(prefix_cache_mod.HotPrefixCache);
         new_hc.* = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
@@ -974,6 +976,12 @@ fn modulePackFingerprint(a: std.mem.Allocator, io: std.Io, path: []const u8, fin
             try appendPackFile(aa, &names, file.name);
         }
     }
+    if (dir.statFile(io, "experts.bin", .{})) |_| {
+        for ([_][]const u8{ "experts.bin", "expert-manifest.json", "expert-manifest-v2.json" }) |name|
+            try appendPackFile(aa, &names, name);
+    } else |err| {
+        if (err != error.FileNotFound) return err;
+    }
     try appendPackFile(aa, &names, "engram/engram-residents.safetensors");
     const config: []const u8 = dir.readFileAlloc(io, "config.json", aa, .limited(64 << 20)) catch |err| blk: {
         if (err != error.FileNotFound) return err;
@@ -1073,4 +1081,46 @@ test "module pack identity follows selected weights and token map precedence" {
     const changed = try modulePackFingerprint(testing.allocator, io, path, "root");
     defer testing.allocator.free(changed);
     try testing.expect(!std.mem.eql(u8, binary, changed));
+}
+
+test "module pack identity includes the selected EXL3 bank and both manifests" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "selected trunk" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"w\":\"model.safetensors\"}}" });
+    const bank_files = [_][]const u8{ "experts.bin", "expert-manifest.json", "expert-manifest-v2.json" };
+    for (bank_files) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "original" });
+    var buf: [512]u8 = undefined;
+    const path = buf[0..try tmp.dir.realPath(io, &buf)];
+    for (bank_files) |name| {
+        const before = try modulePackFingerprint(testing.allocator, io, path, "root");
+        defer testing.allocator.free(before);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "changed selected bank input" });
+        const after = try modulePackFingerprint(testing.allocator, io, path, "root");
+        defer testing.allocator.free(after);
+        try testing.expect(!std.mem.eql(u8, before, after));
+    }
+    const before_unrelated = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(before_unrelated);
+    try tmp.dir.writeFile(io, .{ .sub_path = "unselected.bin", .data = "unrelated" });
+    const after_unrelated = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(after_unrelated);
+    try testing.expectEqualStrings(before_unrelated, after_unrelated);
+}
+
+test "module pack identity ignores expert manifests without a selected bank" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const io = testing.io;
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "resident weights" });
+    var buf: [512]u8 = undefined;
+    const path = buf[0..try tmp.dir.realPath(io, &buf)];
+    const before = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(before);
+    try tmp.dir.writeFile(io, .{ .sub_path = "expert-manifest.json", .data = "not selected" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "expert-manifest-v2.json", .data = "not selected either" });
+    const after = try modulePackFingerprint(testing.allocator, io, path, "root");
+    defer testing.allocator.free(after);
+    try testing.expectEqualStrings(before, after);
 }

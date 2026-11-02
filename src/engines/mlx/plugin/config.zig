@@ -23,6 +23,9 @@ pub const Binding = struct {
     parsed: abi.Parsed = .{},
     /// An outside plugin's (`host/plugins`): the legacy parse knows nothing of its packs.
     outside: bool = false,
+    /// Finite RAM history allowance funded before a streamed model allocates its expert bank. Never 0, which a byte
+    /// cap reads as unbounded: without a RAM cache, or for a model that keeps no history, it is null.
+    aux_cache_budget_bytes: ?u64 = null,
 
     pub fn destroy(b: *Binding, a: std.mem.Allocator) void {
         b.table.free_parsed(&b.parsed);

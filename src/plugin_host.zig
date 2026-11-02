@@ -3,6 +3,7 @@
 //! their root, which re-exports each name; `plugin_host_check.zig` fails their
 //! build on a missing one.
 pub const mlx = @import("mlx/ffi.zig");
+pub const naxAvailable = @import("mlx/device.zig").naxAvailable;
 pub const log = @import("sdk/util/log.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
 pub const shared = @import("sdk/util/shared.zig");

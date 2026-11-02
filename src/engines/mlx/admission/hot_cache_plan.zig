@@ -316,13 +316,13 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
             getEffectiveContextLength(config) +| slotFixedKvBytes(config, kv_bits, chunk);
         const ask = ungatedHotCacheAsk(config, requested, http_server.launch().prefix_cache_mem_explicit, kv_bits, getEffectiveContextLength(config), chunk);
-        const clamped = clampedPrefixCacheMem(
+        const clamped = boundedModuleCacheBudget(config, clampedPrefixCacheMem(
             ask,
             currentGpuMemoryCeiling(config, active_mem),
             active_mem,
             ctx_kv,
             prefillTransientReserve(config, kv_bits, chunk),
-        );
+        ));
         // Publishing the resolved budget is kept on every arch: the ANE gate used to reserve the raw ask.
         publishResolvedPrefixCacheMem(clamped);
         if (revise.quiet) return clamped;
@@ -377,6 +377,12 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; chunk {d}, reserve at width {d} = {d} MB, ctx KV {d} MB)\n", .{ plan.budget >> 20, plan.chunk, plan.reserve_chunk, plan.reserve >> 20, plan.ctx_kv >> 20 });
     }
     return plan.budget;
+}
+
+pub fn boundedModuleCacheBudget(config: *const model_mod.ModelConfig, budget: u64) u64 {
+    const b = config.plugin orelse return budget;
+    const funded = b.aux_cache_budget_bytes orelse return budget;
+    return if (budget == 0) funded else @min(budget, funded);
 }
 
 // ── tests ──
@@ -586,4 +592,15 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(http_server.launch().prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(http_server.launch().prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+}
+
+test "EXL3 cache funding: initial and revised cache caps never exceed the funded bank allowance" {
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = undefined, .aux_cache_budget_bytes = 256 };
+    const cfg: model_mod.ModelConfig = .{ .plugin = &binding };
+    try testing.expectEqual(@as(u64, 256), boundedModuleCacheBudget(&cfg, 512));
+    try testing.expectEqual(@as(u64, 128), boundedModuleCacheBudget(&cfg, 128));
+    try testing.expectEqual(@as(u64, 256), boundedModuleCacheBudget(&cfg, 0));
+    binding.aux_cache_budget_bytes = null;
+    try testing.expectEqual(@as(u64, 512), boundedModuleCacheBudget(&cfg, 512));
+    try testing.expectEqual(@as(u64, 0), boundedModuleCacheBudget(&cfg, 0));
 }

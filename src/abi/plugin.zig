@@ -130,7 +130,10 @@ pub const Caps = packed struct(u64) {
     /// Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`):
     /// requests interleave and batch instead of running single-flight.
     slot_state: bool = false,
-    _: u34 = 0,
+    /// Maximum live request owners, 0 = no plugin limit. Hosts hold excess requests; the plugin also refuses
+    /// excess activation before allocating state, so hosts predating this field remain memory-safe.
+    active_slots: u8 = 0,
+    _: u26 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -383,6 +386,20 @@ pub const LoadCtx = extern struct {
     pair_remote: LayerSpan = .{},
     /// The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned.
     wired_margin_bytes: u64 = 8 << 30,
+    /// Optional load result: effective device-dependent capabilities, committed by the host only on success.
+    runtime_caps: ?*Caps = null,
+    /// RAM history funded before a streamed bank fills memory; zero keeps its legacy resume path.
+    aux_cache_budget_bytes: u64 = 0,
+
+    pub fn auxCacheBudget(ctx: *const LoadCtx) u64 {
+        if (ctx.size < @offsetOf(LoadCtx, "aux_cache_budget_bytes") + @sizeOf(u64)) return 0;
+        return ctx.aux_cache_budget_bytes;
+    }
+
+    pub fn publishRuntimeCaps(ctx: *const LoadCtx, caps: Caps) void {
+        if (ctx.size < @offsetOf(LoadCtx, "runtime_caps") + @sizeOf(?*Caps)) return;
+        if (ctx.runtime_caps) |out| out.* = caps;
+    }
 };
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };
@@ -965,4 +982,32 @@ test "abi plugin: prefill, decode and verify are always declared; batched rows f
     try testing.expect(declaresMode(.{}, .verify) and !declaresMode(.{}, .batched_rows));
     try testing.expect(declaresMode(.{ .batches_decode = true }, .batched_rows));
     try testing.expect(declaresMode(.{ .embed = true }, .prefill) and !declaresMode(.{ .embed = true }, .decode));
+}
+
+test "plugin runtime caps: appended load output is optional and respects an older host's size" {
+    try std.testing.expectEqual(@offsetOf(LoadCtx, "wired_margin_bytes") + @sizeOf(u64), @offsetOf(LoadCtx, "runtime_caps"));
+    try std.testing.expectEqual(@offsetOf(LoadCtx, "runtime_caps") + @sizeOf(?*Caps), @offsetOf(LoadCtx, "aux_cache_budget_bytes"));
+    var published: Caps = .{ .active_slots = 7 };
+    var ctx: LoadCtx = .{ .model_dir = .{}, .dir = undefined, .parsed = undefined };
+    try std.testing.expect(ctx.runtime_caps == null);
+    ctx.publishRuntimeCaps(.{ .active_slots = 2 });
+    ctx.runtime_caps = &published;
+    ctx.size = @offsetOf(LoadCtx, "runtime_caps");
+    ctx.publishRuntimeCaps(.{ .active_slots = 2 });
+    try std.testing.expectEqual(@as(u8, 7), published.active_slots);
+    ctx.size = @sizeOf(LoadCtx);
+    const effective: Caps = .{ .active_slots = 2, .slot_state = true };
+    ctx.publishRuntimeCaps(effective);
+    try std.testing.expectEqual(@as(u64, @bitCast(effective)), @as(u64, @bitCast(published)));
+}
+
+test "EXL3 cache funding: load allowance is append-only and absent for old hosts" {
+    var ctx: LoadCtx = .{ .model_dir = .{}, .dir = undefined, .parsed = undefined, .aux_cache_budget_bytes = 1234 };
+    try std.testing.expectEqual(@as(u64, 1234), ctx.auxCacheBudget());
+    ctx.size = @offsetOf(LoadCtx, "aux_cache_budget_bytes");
+    try std.testing.expectEqual(@as(u64, 0), ctx.auxCacheBudget());
+    ctx.size = @sizeOf(LoadCtx);
+    ctx.aux_cache_budget_bytes = 0;
+    try std.testing.expectEqual(@as(u64, 0), ctx.auxCacheBudget());
+    try std.testing.expectEqual(@offsetOf(LoadCtx, "aux_cache_budget_bytes") + @sizeOf(u64), @sizeOf(LoadCtx));
 }

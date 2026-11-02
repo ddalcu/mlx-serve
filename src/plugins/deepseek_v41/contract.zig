@@ -1046,7 +1046,7 @@ pub const RopeTail = struct {
         g.out(&.{ ci(s.rows), ci(s.n), ci(s.k) }, p.ot);
         g.int("RD", RD);
         g.int("ROW", s.n * s.k);
-        g.int("QK", @intFromEnum(p.qk));
+        g.int("QK", @backingInt(p.qk));
         g.dtype("T", act);
         g.dtype("OT", p.ot);
         return g;
@@ -3038,7 +3038,7 @@ pub fn register(set: *kc.Set) !void {
         .ops = 16,
         .out = .bf16,
         .replaces = "engramGateOps (the op chain)",
-        .known = .{ .gate = .limits, .finding = "at the release's 5120 wide rows it launches MLX's row-sum thread count, 1024, and M1/M2 compile it for 928 with no probe: a decode-width Engram write fails on M1/M2 (the op chain past region_rows does not)" },
+        .known = .{ .gate = .limits, .finding = "the raw kernel needs 1024 threads at 5120-wide rows and M1/M2 compile it for 928; the served wrapper uses the op chain for oversized M1/M2 or unknown-device launches" },
         .served = &.{ .{ .rows = 1, .n = HC, .k = DIM }, .{ .rows = REGION, .n = HC, .k = DIM } },
         .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "bit-equal to the op chain's MLX row sums (gate 3); random rows, not a stress" },
     });

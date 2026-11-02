@@ -352,12 +352,12 @@ const Mode = enum { pick, gathered, whole, chunk, merge };
 /// One test type for the five launches: random rows (ties, -inf, the planted non-finite), the host reference of every
 /// output, an exact check.
 const Sel = struct {
-    pub const Params = struct { mode: Mode, kbl: usize = 2048 };
+    pub const Params = struct { mode: Mode, kbl: usize = 2048, tg: usize = contract_tg };
     const g: Geom = .{};
 
     fn plan(p: Params, s: Shape) ?Plan {
         if (s.rows < 1 or s.rows > decode.max_rows) return null;
-        const tg = contract_tg;
+        const tg = p.tg;
         return switch (p.mode) {
             .pick => if (s.n < 1 or s.n > route_ept * tg) null else pickPlan(g, tg, s.rows, s.n, false),
             .gathered => if (s.n != g.kb * g.bs) null else pickPlan(g, tg, s.rows, s.n, true),
@@ -414,7 +414,7 @@ const Sel = struct {
         if (f == .nonfinite) kit.plantRows(x, rows, c.width);
         if (k.p.mode != .merge) return;
         // The chunks' pairs the merge reads: the chunk reference of the (planted) rows.
-        const l = longPlans(g, contract_tg, rows, c.width, k.p.kbl).?;
+        const l = longPlans(g, k.p.tg, rows, c.width, k.p.kbl).?;
         const ck = try k.add(.uint32, &.{ rows, l.chunks, k.p.kbl });
         const cid = try k.add(.int32, &.{ rows, l.chunks, k.p.kbl });
         const ks = try gpa.alloc(u32, k.p.kbl);
@@ -437,7 +437,7 @@ const Sel = struct {
         return switch (p.mode) {
             .pick, .gathered => s.rows * g.k,
             .whole, .merge => s.rows * (g.k + p.kbl),
-            .chunk => 2 * s.rows * longPlans(g, contract_tg, s.rows, s.n, p.kbl).?.chunks * p.kbl,
+            .chunk => 2 * s.rows * longPlans(g, p.tg, s.rows, s.n, p.kbl).?.chunks * p.kbl,
         };
     }
 
@@ -462,7 +462,7 @@ const Sel = struct {
                     try refCand(gpa, row, g.bs, lens, want[rows * g.k + r * k.p.kbl ..][0..k.p.kbl]);
                 },
                 .chunk => {
-                    const l = longPlans(g, contract_tg, rows, c.width, k.p.kbl).?;
+                    const l = longPlans(g, k.p.tg, rows, c.width, k.p.kbl).?;
                     const ks = try gpa.alloc(u32, k.p.kbl);
                     defer gpa.free(ks);
                     const half = rows * l.chunks * k.p.kbl;
@@ -503,18 +503,22 @@ fn depthOne(_: Shape) usize {
 }
 
 pub fn register(set: *kc.Set) !void {
+    try registerWidth(set, contract_tg);
+}
+
+fn registerWidth(set: *kc.Set, comptime tg: usize) !void {
     const nan_rule: spec.Nan = .{ .stated = "a NaN takes its order key's place (positive NaN above +inf, negative below -inf), as the reference's selection does on the keys" };
     const rows_edge: spec.Tile = .{ .size = decode.max_rows };
-    try kit.add(set, Sel, &pick_l, .{ .mode = .pick }, .{
+    try kit.add(set, Sel, &pick_l, .{ .tg = tg, .mode = .pick }, .{
         .name = "dsv41 dec topk (picks, row in registers)",
         .accum = .none,
         .depth = depthOne,
         .out = .u32,
         .nan = nan_rule,
-        .tiles = .{ rows_edge, .{ .size = route_ept * contract_tg }, .{} },
-        .served = &.{ .{ .rows = 6, .n = 4096, .k = 1 }, .{ .rows = 1, .n = 3, .k = 1 }, .{ .rows = 2, .n = route_ept * contract_tg, .k = 1 } },
+        .tiles = .{ rows_edge, .{ .size = route_ept * tg }, .{} },
+        .served = &.{ .{ .rows = 6, .n = 4096, .k = 1 }, .{ .rows = 1, .n = 3, .k = 1 }, .{ .rows = 2, .n = route_ept * tg, .k = 1 } },
     });
-    try kit.add(set, Sel, &pick_l, .{ .mode = .gathered }, .{
+    try kit.add(set, Sel, &pick_l, .{ .tg = tg, .mode = .gathered }, .{
         .name = "dsv41 dec topk (picks, gathered to the candidate blocks)",
         .accum = .none,
         .depth = depthOne,
@@ -524,15 +528,15 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 6, .n = 16384, .k = 1 }, .{ .rows = 1, .n = 16384, .k = 1 } },
     });
     inline for (.{ 2048, 513 }) |kbl| {
-        const whole_n = comptime wholeBlocks(kbl, contract_tg) * 8;
-        try kit.add(set, Sel, &whole_l, .{ .mode = .whole, .kbl = kbl }, .{
+        const whole_n = comptime wholeBlocks(kbl, tg) * 8;
+        try kit.add(set, Sel, &whole_l, .{ .tg = tg, .mode = .whole, .kbl = kbl }, .{
             .name = std.fmt.comptimePrint("dsv41 dec topk (blocks and picks of a row, {d} blocks)", .{kbl}),
             .accum = .none,
             .depth = depthOne,
             .out = .u32,
             .nan = nan_rule,
-            .tiles = .{ rows_edge, .{ .size = whole_n, .min = route_ept * contract_tg + 1 }, .{} },
-            .served = &.{ .{ .rows = 2, .n = 20000, .k = 1 }, .{ .rows = 6, .n = whole_n, .k = 1 } },
+            .tiles = .{ rows_edge, .{ .size = whole_n, .min = route_ept * tg + 1 }, .{} },
+            .served = &.{ .{ .rows = 2, .n = @min(20000, whole_n), .k = 1 }, .{ .rows = 6, .n = whole_n, .k = 1 } },
         });
         const long_max = max_chunks * chunk_blocks_cand * 8;
         const long_tiles: [3]spec.Tile = .{ rows_edge, .{ .size = long_max, .min = whole_n + 1 }, .{} };
@@ -542,7 +546,7 @@ pub fn register(set: *kc.Set) !void {
             [_]Shape{.{ .rows = 1, .n = whole_n + 1, .k = 1 }} ++ ladder
         else
             [_]Shape{ .{ .rows = 1, .n = whole_n + 1, .k = 1 }, .{ .rows = 1, .n = 65537, .k = 1 }, .{ .rows = 1, .n = 131073, .k = 1 } } ++ ladder);
-        try kit.add(set, Sel, &chunk_l, .{ .mode = .chunk, .kbl = kbl }, .{
+        try kit.add(set, Sel, &chunk_l, .{ .tg = tg, .mode = .chunk, .kbl = kbl }, .{
             .name = std.fmt.comptimePrint("dsv41 dec topk (a chunk's best blocks, {d} blocks)", .{kbl}),
             .accum = .none,
             .depth = depthOne,
@@ -551,7 +555,7 @@ pub fn register(set: *kc.Set) !void {
             .tiles = long_tiles,
             .served = long_served,
         });
-        try kit.add(set, Sel, &merge_l, .{ .mode = .merge, .kbl = kbl }, .{
+        try kit.add(set, Sel, &merge_l, .{ .tg = tg, .mode = .merge, .kbl = kbl }, .{
             .name = std.fmt.comptimePrint("dsv41 dec topk (the chunks' merge, {d} blocks)", .{kbl}),
             .accum = .none,
             .depth = depthOne,
@@ -714,6 +718,9 @@ test "dsv41 dec topk: picks and candidate blocks equal the reference on scores w
     const gpa = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(gpa, &ks, mlx.gpuStream());
+    const granted = ks.tg;
+    try testing.expect(granted >= widths[widths.len - 1]);
     const g: Geom = .{};
     var prng = std.Random.DefaultPrng.init(11);
     const rng = prng.random();
@@ -737,6 +744,7 @@ test "dsv41 dec topk: picks and candidate blocks equal the reference on scores w
             if (ceilDiv(c.n, g.bs) > g.kb) try refCand(gpa, scores[r * c.n ..][0..c.n], g.bs, lensOf(c, r), want_cand[r * g.kb ..][0..g.kb]);
         }
         for (widths) |tg| {
+            if (tg > granted) continue;
             ks.tg = tg;
             for ([_]bool{ false, true }) |made| {
                 var sc = Scope.init(gpa, mlx.gpuStream());
@@ -768,6 +776,9 @@ test "dsv41 dec topk: gathered picks equal the picks of the full row masked to t
     const gpa = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(gpa, &ks, mlx.gpuStream());
+    const granted = ks.tg;
+    try testing.expect(granted >= widths[widths.len - 1]);
     const g: Geom = .{};
     var prng = std.Random.DefaultPrng.init(12);
     const rng = prng.random();
@@ -796,6 +807,7 @@ test "dsv41 dec topk: gathered picks equal the picks of the full row masked to t
             try refPicks(gpa, masked, g.k, lensOf(c, r), want[r * g.k ..][0..g.k]);
         }
         for (widths) |tg| {
+            if (tg > granted) continue;
             ks.tg = tg;
             var sc = Scope.init(gpa, mlx.gpuStream());
             defer sc.deinit();
@@ -917,6 +929,17 @@ fn todayModel() !dsv41.Dsv41Model {
     var m: dsv41.Dsv41Model = undefined;
     m.topk_kernel = try dsv41.buildKernel("dsv41_topk", &.{"x"}, &.{"out"}, dsv41.TOPK_SOURCE, dsv41.TOPK_HEADER);
     m.topk_tg = 1024;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const x = try zeros(&sc, &.{ 1, 64 }, .float32);
+    while (true) {
+        dsv41.evalAll(&.{try dsv41.topkRows(&sc, &m, x, 8)}) catch |err| {
+            if (err != error.MlxError or m.topk_tg <= 32 or !mlx.takeErrorIf("Thread group size")) return err;
+            m.topk_tg /= 2;
+            continue;
+        };
+        break;
+    }
     return m;
 }
 
@@ -926,6 +949,7 @@ test "dsv41 dec topk: picks and candidate blocks equal today's topkRows chain" {
     const gpa = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(gpa, &ks, mlx.gpuStream());
     var m = try todayModel();
     defer _ = mlx.mlx_fast_metal_kernel_free(m.topk_kernel);
     const g: Geom = .{};
@@ -1156,6 +1180,7 @@ test "dsv41 dec topk: each declared launch is the wrapper's, byte for byte" {
     const a = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(a, &ks, mlx.gpuStream());
     const g: Geom = .{};
     const Served = struct { l: *const metal.Launch, p: Sel.Params, shape: Shape, made: bool };
     for ([_]Served{
@@ -1167,12 +1192,21 @@ test "dsv41 dec topk: each declared launch is the wrapper's, byte for byte" {
         .{ .l = &merge_l, .p = .{ .mode = .merge, .kbl = 513 }, .shape = .{ .rows = 2, .n = 140001, .k = 1 }, .made = false },
     }) |sv| {
         const c = try a.create(kit.Case(Sel));
-        c.* = .init(a, sv.l, sv.p);
+        var params = sv.p;
+        params.tg = @intCast(ks.tg);
+        var shape = sv.shape;
+        switch (params.mode) {
+            .pick => shape.n = @min(shape.n, route_ept * params.tg),
+            .whole => shape.n = wholeBlocks(params.kbl, params.tg) * g.bs,
+            .merge => shape.n = wholeBlocks(params.kbl, params.tg) * g.bs + 1,
+            else => {},
+        }
+        c.* = .init(a, sv.l, params);
         defer {
             c.deinit();
             a.destroy(c);
         }
-        try testing.expect(try c.prepare(sv.shape, .random, 7));
+        try testing.expect(try c.prepare(shape, .random, 7));
         try c.run();
         const want = try a.dupe(u8, c.rig.outputBytes());
         defer a.free(want);
@@ -1196,7 +1230,13 @@ test "dsv41 dec topk: the kernel contract's gates 1-4 hold for every registered 
     const a = testing.allocator;
     var set = kc.Set.init(a);
     defer set.deinit();
-    try register(&set);
+    var ks = try Kernels.build();
+    defer ks.deinit();
+    try probe(a, &ks, mlx.gpuStream());
+    inline for (.{ 1024, 512, 256, 128, 64 }) |tg| {
+        if (ks.tg == tg) try registerWidth(&set, tg);
+    }
+    try testing.expectEqual(@as(usize, 8), set.kernels.items.len);
     var t: kc.gates.Tally = .{};
     try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
     std.debug.print("[dec] topk contract: {d}/{d} launches pass gates 1-4 (virtual GPU {})\n", .{ t.passed, t.kernels, mlx.virtualGpu() });
@@ -1232,6 +1272,7 @@ test "dsv41 dec topk: the fixture's real scores at layers 20 and 24 give today's
     const gpa = testing.allocator;
     var ks = try Kernels.build();
     defer ks.deinit();
+    try probe(gpa, &ks, mlx.gpuStream());
     const g: Geom = .{};
     // More keys than the candidate source keeps blocks for: layer 20 has 20 000 keys, 2 500 blocks.
     const ctx = 20000;

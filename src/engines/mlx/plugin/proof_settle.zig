@@ -144,3 +144,64 @@ test "plugin settle: a batched tick settles its slots in one call" {
     try testing.expectEqual(@as(u32, 2), seen.flushed_slots);
     for (ctxs) |c| try testing.expectEqual(abi.Owed.none, c.plugin_owed);
 }
+
+var warmup_owners: struct {
+    ids: [2]u32 = @splat(0),
+    calls: usize = 0,
+    fail_call: usize = 0,
+} = .{};
+
+fn boundedWarmupForward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+    for (f.slots.slice()) |id| {
+        var found = false;
+        for (warmup_owners.ids) |held| if (held == id) {
+            found = true;
+        };
+        if (!found) {
+            const vacant = std.mem.indexOfScalar(u32, &warmup_owners.ids, 0) orelse return abi.Verdict.refuse(.too_large, "two owners already live");
+            warmup_owners.ids[vacant] = id;
+        }
+    }
+    warmup_owners.calls += 1;
+    if (warmup_owners.calls == warmup_owners.fail_call) return abi.Verdict.refuse(.failed, "injected warmup failure");
+    return llama.table.forward(m, f, out);
+}
+
+fn boundedWarmupRelease(m: *anyopaque, slot: u32) callconv(.c) void {
+    for (&warmup_owners.ids) |*id| if (id.* == slot) {
+        id.* = 0;
+    };
+    if (llama.table.release_slot) |release| release(m, slot);
+}
+
+const bounded_warmup_table: abi.ModelTable = blk: {
+    var t = llama.table;
+    t.forward = &boundedWarmupForward;
+    t.release_slot = &boundedWarmupRelease;
+    break :blk t;
+};
+
+test "plugin warmup: its owner is released on success and failure before two request owners arrive" {
+    var b: proof.Served = undefined;
+    try b.open(.{ .quantized = true }, 0x5e79);
+    defer b.close();
+    b.xfm.plugin.?.table = &bounded_warmup_table;
+    for ([_]usize{ 0, 2 }) |fail_call| {
+        warmup_owners = .{ .fail_call = fail_call };
+        try b.xfm.resetCache();
+        if (fail_call == 0) try b.xfm.warmup() else try testing.expectError(error.PluginForwardFailed, b.xfm.warmup());
+        try testing.expectEqualSlices(u32, &.{ 0, 0 }, &warmup_owners.ids);
+        var slots: [2]proof.Slot = undefined;
+        for (&slots) |*s| try s.init(b.layers);
+        defer for (&slots) |*s| s.deinit();
+        var g = ops.Graph.init(testing.allocator, fixture.stream());
+        defer g.deinit();
+        for (&slots, [_][]const i32{ &.{ 4, 8, 15 }, &.{ 42, 7 } }) |*s, prompt| {
+            _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, prompt)));
+        }
+        try testing.expect(warmup_owners.ids[0] != 0 and warmup_owners.ids[1] != 0);
+        try testing.expect(warmup_owners.ids[0] != warmup_owners.ids[1]);
+        for (&slots) |*s| @import("settle.zig").release(&b.xfm, &s.ctx);
+        try testing.expectEqualSlices(u32, &.{ 0, 0 }, &warmup_owners.ids);
+    }
+}

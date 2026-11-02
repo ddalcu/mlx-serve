@@ -185,6 +185,16 @@ pub fn stagedHostBytes(sch: *Scheduler) u64 {
     return bytes;
 }
 
+/// Cache retention and SSD scratch share the allowance reserved before the expert bank loads.
+pub fn moduleCacheFundingFits(config: *const model_mod.ModelConfig, resident: u64, staged: u64, proposed: u64) bool {
+    const binding = config.plugin orelse return true;
+    const funded = binding.aux_cache_budget_bytes orelse return true;
+    if (resident > funded) return false;
+    const remaining = funded - resident;
+    if (staged > remaining) return false;
+    return proposed <= remaining - staged;
+}
+
 const ModuleStagingProbe = struct {
     sch: *Scheduler,
     hc: *prefix_cache_mod.HotPrefixCache,
@@ -194,7 +204,9 @@ const ModuleStagingProbe = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
         const need = self.hc.nextModuleStagingBytes();
         if (need == 0) return true;
-        return need <= @import("../admission/prefill_chunk.zig").prefillHeadroomNow(self.cfg, stagedHostBytes(self.sch));
+        const staged = stagedHostBytes(self.sch);
+        if (!moduleCacheFundingFits(self.cfg, self.hc.residentBytes(), staged, need)) return false;
+        return need <= @import("../admission/prefill_chunk.zig").prefillHeadroomNow(self.cfg, staged);
     }
 };
 
@@ -514,4 +526,22 @@ test "module live residency is counted once per model and cannot be credited as 
         try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
     }
     try testing.expectEqual(@as(u64, 0), sch.resident_hot_cache_bytes.load(.monotonic));
+}
+
+test "EXL3 staged cache funding: exact bounds, releases and overflow preserve the funded allowance" {
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = undefined, .aux_cache_budget_bytes = 256 };
+    const cfg: model_mod.ModelConfig = .{ .plugin = &binding };
+    try testing.expect(moduleCacheFundingFits(&cfg, 128, 64, 64));
+    try testing.expect(!moduleCacheFundingFits(&cfg, 128, 64, 65));
+    try testing.expect(!moduleCacheFundingFits(&cfg, 192, 64, 64));
+    try testing.expect(moduleCacheFundingFits(&cfg, 128, 64, 64));
+    try testing.expect(moduleCacheFundingFits(&cfg, 192, 0, 64));
+    try testing.expect(!moduleCacheFundingFits(&cfg, std.math.maxInt(u64), 1, 0));
+    try testing.expect(!moduleCacheFundingFits(&cfg, 0, std.math.maxInt(u64), 1));
+    binding.aux_cache_budget_bytes = 0;
+    try testing.expect(moduleCacheFundingFits(&cfg, 0, 0, 0));
+    try testing.expect(!moduleCacheFundingFits(&cfg, 0, 0, 1));
+    binding.aux_cache_budget_bytes = null;
+    try testing.expect(moduleCacheFundingFits(&cfg, std.math.maxInt(u64), 1, 1));
+    try testing.expect(moduleCacheFundingFits(&.{}, std.math.maxInt(u64), 1, 1));
 }

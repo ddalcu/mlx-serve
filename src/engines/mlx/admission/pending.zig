@@ -41,22 +41,33 @@ pub fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
-/// admission needs: an opaque model identity + the exclusive-decode bit.
-pub const AdmitCand = struct { model: usize, exclusive: bool };
+/// admission needs: model identity, exclusivity, and an optional bounded owner count.
+pub const AdmitCand = struct { model: usize, exclusive: bool, limit: usize = 0, occupied: usize = 0 };
 
 /// FIFO admission for one drain tick. An EXCLUSIVE candidate admits only if
 /// no EXCLUSIVE `active` slot (live decoding) holds its model and no earlier
 /// admitted exclusive candidate claimed it this tick
 /// (a same-tick sibling is not in `decoding` yet — the claim covers the
-/// window). Non-exclusive candidates always admit — no head-of-line
-/// blocking behind a held exclusive request. Writes admitted candidate
+/// window). Bounded plugins also hold when their owner limit is reached. Other
+/// models can still pass a held candidate. Writes admitted candidate
 /// indices to `out` (queue order preserved), returns the count. Held
 /// candidates stay where they are and retry next tick; no release
-/// bookkeeping exists — the busy signal IS presence in `decoding`.
+/// bookkeeping exists — ownership follows the scheduler's active slots.
 pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out: []usize) usize {
     var n: usize = 0;
     outer: for (cands, 0..) |c, i| {
         if (n >= out.len) break;
+        if (c.limit > 0) {
+            var live: usize = 0;
+            for (active) |a| if (a.model == c.model) {
+                live += 1;
+            };
+            live = @max(live, c.occupied);
+            for (out[0..n]) |j| if (cands[j].model == c.model) {
+                live += 1;
+            };
+            if (live >= c.limit) continue;
+        }
         if (c.exclusive) {
             for (active) |a| if (a.exclusive and a.model == c.model) continue :outer;
             for (out[0..n]) |j| {
@@ -66,6 +77,35 @@ pub fn admitPendingTick(cands: []const AdmitCand, active: []const AdmitCand, out
         out[n] = i;
         n += 1;
     }
+    return n;
+}
+
+/// The CLI narrows a bounded plugin; zero preserves existing unbounded plugin admission.
+pub fn activeLimit(plugin_limit: u8, cli_limit: u32) usize {
+    return if (plugin_limit == 0) 0 else @min(plugin_limit, @max(cli_limit, 1));
+}
+
+pub fn slotLimit(sch: *const Scheduler, slot: *const Slot) usize {
+    const cfg = slot.model.config orelse return 0;
+    return activeLimit(cfg.caps().active_slots, sch.max_concurrent);
+}
+
+/// Count owners until their release/cull, plus this pass's not-yet-completed prefills. A cancelled request still
+/// owns its module state until cull; excluding it early would turn the next admission into a plugin refusal.
+pub fn occupiedSlots(sch: *const Scheduler, slot: *const Slot) usize {
+    var n: usize = 0;
+    var outer_counted = false;
+    for (sch.decoding.items) |s| {
+        if (s.model == slot.model) n += 1;
+        if (sch.boundary_outer == s) outer_counted = true;
+    }
+    for (sch.prefilling[sch.prefilling_from..sch.n_prefilling]) |s| {
+        if (s.model == slot.model) n += 1;
+        if (sch.boundary_outer == s) outer_counted = true;
+    }
+    if (!outer_counted) if (sch.boundary_outer) |s| {
+        if (s.model == slot.model) n += 1;
+    };
     return n;
 }
 
@@ -173,4 +213,59 @@ test "admitPendingTick: non-exclusive concurrency and queue order preserved" {
         try testing.expectEqual(@as(usize, 0), small[0]);
         try testing.expectEqual(@as(usize, 1), small[1]);
     }
+}
+
+test "admitPendingTick: bounded streamed owners hold a third, including same-tick claims and cancellation" {
+    const candidates = [_]AdmitCand{
+        .{ .model = 1, .exclusive = false, .limit = 2 },
+        .{ .model = 1, .exclusive = false, .limit = 2 },
+        .{ .model = 1, .exclusive = false, .limit = 2 },
+        .{ .model = 2, .exclusive = false },
+    };
+    var out: [4]usize = undefined;
+    try testing.expectEqual(@as(usize, 3), admitPendingTick(&candidates, &.{}, &out));
+    try testing.expectEqualSlices(usize, &.{ 0, 1, 3 }, out[0..3]);
+    const active = [_]AdmitCand{ candidates[0], candidates[1] };
+    try testing.expectEqual(@as(usize, 1), admitPendingTick(candidates[2..], &active, &out));
+    try testing.expectEqual(@as(usize, 1), out[0]);
+    // Capacity returns only after the cancelled owner's release removes it from the active set.
+    try testing.expectEqual(@as(usize, 2), admitPendingTick(candidates[2..], active[0..1], &out));
+    try testing.expectEqualSlices(usize, &.{ 0, 1 }, out[0..2]);
+    const single = [_]AdmitCand{.{ .model = 1, .exclusive = false, .limit = 1 }};
+    try testing.expectEqual(@as(usize, 0), admitPendingTick(&single, active[0..1], &out));
+}
+
+test "bounded plugin active limit honors CLI without changing unbounded admission" {
+    try testing.expectEqual(@as(usize, 0), activeLimit(0, 1));
+    try testing.expectEqual(@as(usize, 1), activeLimit(2, 1));
+    try testing.expectEqual(@as(usize, 2), activeLimit(2, 2));
+    try testing.expectEqual(@as(usize, 2), activeLimit(2, 32));
+    try testing.expectEqual(@as(usize, 1), activeLimit(2, 0));
+}
+
+test "bounded plugin occupancy includes cancelled owners until cull and counts an outer prefill once" {
+    var models: [2]@import("../../../host/registry/registry.zig").LoadedModel = undefined;
+    var slots: [4]Slot = undefined;
+    for (&slots, 0..) |*s, i| s.model = &models[if (i == 3) @as(usize, 1) else 0];
+    slots[0].cancelled = .init(true);
+    var decoding = [_]*Slot{ &slots[0], &slots[1] };
+    var sch: Scheduler = undefined;
+    sch.decoding = .empty;
+    sch.decoding.items = &decoding;
+    sch.decoding.capacity = decoding.len;
+    sch.prefilling[0] = &slots[2];
+    sch.prefilling[1] = &slots[3];
+    sch.prefilling_from = 0;
+    sch.n_prefilling = 2;
+    sch.boundary_outer = &slots[2];
+    try testing.expectEqual(@as(usize, 3), occupiedSlots(&sch, &slots[1]));
+    try testing.expectEqual(@as(usize, 1), occupiedSlots(&sch, &slots[3]));
+    sch.decoding.items = decoding[1..];
+    try testing.expectEqual(@as(usize, 2), occupiedSlots(&sch, &slots[1]));
+    sch.prefilling_from = 1;
+    try testing.expectEqual(@as(usize, 2), occupiedSlots(&sch, &slots[1]));
+    sch.boundary_outer = null;
+    try testing.expectEqual(@as(usize, 1), occupiedSlots(&sch, &slots[1]));
+    var out: [1]usize = undefined;
+    try testing.expectEqual(@as(usize, 0), admitPendingTick(&.{.{ .model = 1, .exclusive = false, .limit = 2, .occupied = 2 }}, &.{}, &out));
 }

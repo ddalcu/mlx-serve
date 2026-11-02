@@ -84,11 +84,11 @@ pub fn plan(rows: c_int, heads: c_int, splits: c_int, dim: c_int, groups: c_int,
         .out = .{ rows, groups * out_rank },
         .parts = .{ @divExact(heads, groups), rows, groups * out_rank },
         .ints = .{
-            .{ .name = "R", .v = rows },      .{ .name = "S", .v = splits },
-            .{ .name = "H", .v = heads },     .{ .name = "D", .v = dim },
-            .{ .name = "RD", .v = ci(rd) },   .{ .name = "HPG", .v = @divExact(heads, groups) },
-            .{ .name = "OL", .v = out_rank }, .{ .name = "OW", .v = groups * out_rank },
-            .{ .name = "NSG", .v = nsg },     .{ .name = "NR", .v = nr },
+            .{ .name = "R", .v = rows },                .{ .name = "S", .v = splits },
+            .{ .name = "H", .v = heads },               .{ .name = "D", .v = dim },
+            .{ .name = "RD", .v = ci(rd) },             .{ .name = "HPG", .v = @divExact(heads, groups) },
+            .{ .name = "OL", .v = out_rank },           .{ .name = "OW", .v = groups * out_rank },
+            .{ .name = "NSG", .v = nsg },               .{ .name = "NR", .v = nr },
             .{ .name = "NAX", .v = @intFromBool(nax) },
         },
     };
@@ -401,6 +401,7 @@ pub fn register(set: *kc.Set) !void {
     });
     try kit.add(set, WoA, &decl_nax, .{ .nax = true }, .{
         .name = "dsv41 dec wo_a (matrix units)",
+        .nax = true,
         .accum = .f32,
         .depth = depthWoA,
         .ops = 8,

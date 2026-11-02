@@ -222,17 +222,18 @@ pub const Source = struct {
     /// keeping the residents decode left.
     pub fn setPhase(self: *Source, p: Phase) !void {
         if (p == self.phase) return;
+        // A snapshot split can change phase before its asynchronous forward has completed.
+        // Finish readers before unpinning routes or checking that their bank storage was released.
+        try mlx.check(mlx.mlx_synchronize(self.g.s));
         try self.hook.flush();
         switch (p) {
             .decode => {
                 self.released = (try self.hook.releaseTransient()) > 0;
-                _ = mlx.mlx_synchronize(self.g.s);
                 self.g.clearCache();
                 try self.hook.grow(&self.g, self.decode_rows);
             },
             .prompt => {
                 _ = try self.hook.shrink(self.prompt_rows, .keep);
-                _ = mlx.mlx_synchronize(self.g.s);
                 self.g.clearCache();
                 _ = try self.hook.regrowTransient(&self.g, self.released);
             },

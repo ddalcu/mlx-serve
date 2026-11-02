@@ -34,6 +34,7 @@ pub const Fixture = struct {
     draws: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, opts: Opts) !*Fixture {
+        mlx.installErrorHandler();
         const fx = try gpa.create(Fixture);
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();

@@ -6,6 +6,7 @@ Exit 77 means an optional fixture or a scheduling window could not be exercised.
 """
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -49,8 +50,9 @@ def cached(result):
     return value
 
 
-def initial_messages():
-    lines = ["Read this project log before answering."]
+def initial_messages(conversation_id=None):
+    lines = ([f"Conversation marker: {conversation_id}. Read this project log before answering."]
+             if conversation_id else ["Read this project log before answering."])
     lines += [f"Entry {i}: subsystem {i % 17}, latency {i * 7 % 131} ms, checksum {i * i % 9973}."
               for i in range(1, 161)]
     lines.append("What integer is the sum of 17 and 25? Reply with just the integer.")
@@ -62,12 +64,35 @@ def continuation(seed):
                                {"role": "user", "content": "What integer is the sum of 18 and 25? Reply with just the integer."}]
 
 
-def chat(base, messages, max_tokens=24, first_token=None, cancel=False):
+def auth_headers(api_key, extra_headers=()):
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    for raw in extra_headers:
+        require(isinstance(raw, str) and "\r" not in raw and "\n" not in raw,
+                "request header must be a single line")
+        name, separator, value = raw.partition(":")
+        require(separator and re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name.strip()),
+                "request header must use a valid name: value form")
+        name = name.strip()
+        require(name.lower() not in ("authorization", "content-type"),
+                f"--header cannot override {name}")
+        headers[name] = value.strip()
+    return headers
+
+
+def build_chat_request(base, messages, max_tokens=24, api_key=None, extra_headers=()):
     body = {"model": "mlx-serve", "messages": messages, "temperature": 0.0,
             "enable_thinking": False, "max_tokens": max_tokens, "stream": True,
             "stream_options": {"include_usage": True}}
     req = urllib.request.Request(base + "/v1/chat/completions", data=json.dumps(body).encode(),
-                                 headers={"Content-Type": "application/json"})
+                                 headers=auth_headers(api_key, extra_headers))
+    return req, body
+
+
+def chat(base, messages, max_tokens=24, first_token=None, cancel=False, api_key=None,
+         extra_headers=()):
+    req, body = build_chat_request(base, messages, max_tokens, api_key, extra_headers)
     started = time.monotonic()
     first, usage, finish = None, None, None
     pieces = {"content": [], "reasoning_content": []}
@@ -100,8 +125,12 @@ def chat(base, messages, max_tokens=24, first_token=None, cancel=False):
 
 
 def request(a):
-    msgs = continuation(read(a.seed)) if a.seed else initial_messages()
-    result = chat(a.base, msgs, max_tokens=a.max_tokens)
+    msgs = continuation(read(a.seed)) if a.seed else initial_messages(a.conversation_id)
+    api_key = os.environ.get(a.api_key_env) if a.request_url else None
+    if a.request_url and a.api_key_env and not api_key:
+        raise AssertionError(f"{a.api_key_env} is required when --request-url is set")
+    result = chat(a.request_url or a.base, msgs, max_tokens=a.max_tokens, api_key=api_key,
+                  extra_headers=a.header)
     write(a.output, result)
     print(f"{a.output}: cached={cached(result)}/{result['usage']['prompt_tokens']}, ttft={result['ttft_s']:.3f}s")
 
@@ -109,8 +138,22 @@ def request(a):
 def result(a):
     got = read(a.result)
     n = boundary(a.boundary) if a.boundary else a.cached
-    require(cached(got) == n, f"cached={cached(got)}, expected exactly {n}")
-    require(0 <= n < got["usage"]["prompt_tokens"], "restore must leave a token to forward")
+    if n is not None:
+        require(cached(got) == n, f"cached={cached(got)}, expected exactly {n}")
+        require(0 <= n < got["usage"]["prompt_tokens"], "restore must leave a token to forward")
+    else:
+        require(0 <= cached(got) < got["usage"]["prompt_tokens"],
+                "cached count must leave a token to forward")
+    if a.min_cached is not None:
+        require(cached(got) >= a.min_cached,
+                f"cached={cached(got)}, expected at least {a.min_cached}")
+    if a.legacy_log:
+        log = Path(a.legacy_log).read_text()
+        matches = re.findall(r"\[dsv41\] resumed (\d+) of (\d+) prompt tokens", log)
+        require(matches, "missing EXL3 legacy idle-resume log")
+        resumed, prompt = map(int, matches[-1])
+        require(resumed == cached(got) and prompt == got["usage"]["prompt_tokens"],
+                "legacy resume log does not match this request's cached-token counts")
     if a.cold:
         cold = read(a.cold)
         require(got["request"] == cold["request"], "cold control used a different request")
@@ -217,33 +260,59 @@ def copy_cache(a):
 def fixture(a):
     source, dest = Path(a.model).resolve(), Path(a.dest)
     require(read(source / "config.json").get("model_type") == "deepseek_v41", "expected a DeepSeek-V4.1 pack")
-    require(not (source / "experts.bin").exists(), "module snapshots require a resident, unpaired pack")
+    bank = (source / "experts.bin").is_file()
+    if bank:
+        require(any((source / name).is_file() for name in ("expert-manifest.json", "expert-manifest-v2.json")),
+                "EXL3 bank fixture lacks an expert manifest")
     dest.mkdir()
     for path in source.iterdir():
         (dest / path.name).symlink_to(path)
-    # Keep the pack path and config stat fixed while changing only a selected file's stat.
-    mutable = next((source / name for name in ("engram-token-map.u32", "engram_token_map.json")
-                    if (source / name).is_file()), None)
-    if mutable:
+    # Mutation candidates live in this disposable wrapper. Big inputs are cloned copy-on-write;
+    # a failed clone stays a symlink and makes that mutation arm SKIP.
+    requested = a.identity_file
+    if requested:
+        mutable = source / requested
+        require(mutable.is_file(), f"identity input is absent: {requested}")
+        require(Path(requested).name == requested, f"identity input must be a pack-root file: {requested}")
+        require(requested in {"experts.bin", "expert-manifest.json", "expert-manifest-v2.json",
+                              "engram-token-map.u32", "engram_token_map.json"} or
+                requested.endswith(".safetensors"), f"unsupported identity input: {requested}")
+    else:
+        mutable = next((source / name for name in ("engram-token-map.u32", "engram_token_map.json")
+                        if (source / name).is_file()), None)
+        if mutable is None and bank:
+            mutable = next((source / name for name in ("expert-manifest-v2.json", "expert-manifest.json")
+                            if (source / name).is_file()), None)
+        if mutable is None:
+            index = source / "model.safetensors.index.json"
+            selected = sorted(set(read(index).get("weight_map", {}).values())) if index.is_file() else []
+            mutable = next((source / name for name in selected if (source / name).is_file()), None)
+            mutable = mutable or next(source.glob("*.safetensors"), None)
+    cloned = mutable
+    if mutable and mutable.name in {"expert-manifest.json", "expert-manifest-v2.json",
+                                    "engram-token-map.u32", "engram_token_map.json"}:
         (dest / mutable.name).unlink()
         shutil.copy2(mutable, dest / mutable.name)
-    else:
-        index = source / "model.safetensors.index.json"
-        selected = sorted(set(read(index).get("weight_map", {}).values())) if index.is_file() else []
-        mutable = next((source / name for name in selected if (source / name).is_file()), None)
-        mutable = mutable or next(source.glob("*.safetensors"), None)
-        if mutable:
-            target = dest / mutable.name
-            target.unlink()
-            command = ["cp", "-c"] if sys.platform == "darwin" else ["cp", "--reflink=always"]
-            cloned = subprocess.run(command + [str(mutable), str(target)], capture_output=True)
-            if cloned.returncode:
+    elif mutable:
+        target = dest / mutable.name
+        target.unlink()
+        command = ["cp", "-c"] if sys.platform == "darwin" else ["cp", "--reflink=always"]
+        size = mutable.stat().st_size
+        free = shutil.disk_usage(dest).free
+        if free < size + (2 << 30):
+            print(f"SKIP: insufficient free space for a guarded identity clone ({size >> 30} GiB input)")
+            target.symlink_to(mutable)
+            cloned = None
+        else:
+            clone = subprocess.run(command + [str(mutable), str(target)], capture_output=True)
+            if clone.returncode:
                 target.unlink(missing_ok=True)
                 target.symlink_to(mutable)
-                mutable = None
+                cloned = None
     stamp = None
-    if mutable:
-        stat = (dest / mutable.name).stat()
+    if cloned:
+        require(not (dest / cloned.name).is_symlink(), "fixture mutation input still points at the source pack")
+        stat = (dest / cloned.name).stat()
         stamp = {"name": mutable.name, "atime_ns": stat.st_atime_ns, "mtime_ns": stat.st_mtime_ns}
     require(not (dest / "module-test-fixture.json").exists(), "fixture bookkeeping name already exists")
     write(dest / "module-test-fixture.json", stamp)
@@ -252,7 +321,7 @@ def fixture(a):
 def touch_pack(a):
     stamp = read(Path(a.pack) / "module-test-fixture.json")
     if stamp is None:
-        print("SKIP: no shipped token map and copy-on-write weight clone unavailable")
+        print("SKIP: no disposable copy-on-write identity input is available")
         return 77
     path = Path(a.pack) / stamp["name"]
     require(not path.is_symlink(), "refusing to touch the original pack")
@@ -260,9 +329,21 @@ def touch_pack(a):
     require(path.stat().st_mtime_ns != stamp["mtime_ns"], "pack mtime did not change")
 
 
+def touch_ready(a):
+    stamp = read(Path(a.pack) / "module-test-fixture.json")
+    if stamp is None:
+        print("SKIP: no disposable copy-on-write identity input is available")
+        return 77
+    path = Path(a.pack) / stamp["name"]
+    require(not path.is_symlink(), "refusing to mutate an identity input linked to the source pack")
+    print(f"disposable identity input ready: {path.name}")
+
+
 def restore_stat(a):
     stamp = read(Path(a.pack) / "module-test-fixture.json")
-    os.utime(Path(a.pack) / stamp["name"], ns=(stamp["atime_ns"], stamp["mtime_ns"]))
+    path = Path(a.pack) / stamp["name"]
+    require(not path.is_symlink(), "refusing to restore stat through a source-pack symlink")
+    os.utime(path, ns=(stamp["atime_ns"], stamp["mtime_ns"]))
 
 
 def changed_root(a):
@@ -290,9 +371,16 @@ def dropped(a):
 
 
 def disabled(a):
-    require(not list(cache_root(a.root).glob("**/*")), "disabled cache wrote to disk")
     log = Path(a.log).read_text()
-    require("[disk-cache]" not in log, "disabled cache performed SSD work")
+    if a.legacy_resume:
+        require(not module_records(a.root), "disabled EXL3 control wrote shared module records to disk")
+        require(re.search(r"\[dsv41\] resumed [1-9]\d* of \d+ prompt tokens", log),
+                "EXL3 control did not preserve a legacy idle resume")
+        require(not re.search(r"module restored source=(?:ram|disk)", log),
+                "disabled EXL3 control restored shared module history")
+    else:
+        require(not list(cache_root(a.root).glob("**/*")), "disabled cache wrote to disk")
+        require("[disk-cache]" not in log, "disabled cache performed SSD work")
     if a.reason:
         require("this model retains no conversation" in log, "missing disabled module history diagnostic")
 
@@ -311,13 +399,28 @@ def available_bytes():
 
 
 def mem_wait(a):
-    # A SIGKILLed server's wired weights return to the OS over seconds, not at exit; a restart
-    # inside that window fails its own preflight. Wait for the weights plus headroom to be free.
-    need = sum(p.stat().st_size for p in Path(a.model).glob("*.safetensors")) + (8 << 30)
+    # A stopped server's resident weights can take seconds to return to the OS. Prove the old
+    # process is gone and the port is free, then wait for resident shards plus fixed headroom.
+    if a.previous_pid is not None:
+        if alive(a.previous_pid):
+            current_start = ps(a.previous_pid, "lstart")
+            require(a.previous_start is not None and current_start != a.previous_start,
+                    f"previous server PID {a.previous_pid} is still present")
+    if a.port is not None:
+        port_free(a)
+    need = required_model_bytes(a.model)
     until = time.monotonic() + a.timeout
     while available_bytes() < need and time.monotonic() < until:
         time.sleep(1)
     require(available_bytes() >= need, f"memory not released: {available_bytes() >> 30} GiB free, {need >> 30} GiB needed")
+
+
+def required_model_bytes(model):
+    # experts.bin is an mmap-backed streamed bank, not a resident allocation. Its file size
+    # must never become a RAM threshold; resident trunk shards retain the old safety bound.
+    root = Path(model)
+    need = sum(path.stat().st_size for path in root.glob("*.safetensors"))
+    return need + (8 << 30)
 
 
 def alive(pid):
@@ -413,7 +516,12 @@ def cancel(a):
         try:
             msgs = initial_messages() + [{"role": "assistant", "content": "Noted."},
                                          {"role": "user", "content": "Write 4000 numbered lines, one integer per line, starting at one."}]
-            state["reply"] = chat(a.base, msgs, max_tokens=8192, cancel=True,
+            api_key = os.environ.get(a.api_key_env) if a.request_url else None
+            if a.request_url and a.api_key_env and not api_key:
+                raise AssertionError(f"{a.api_key_env} is required when --request-url is set")
+            state["reply"] = chat(a.request_url or a.base, msgs, max_tokens=8192, cancel=True,
+                                  api_key=api_key,
+                                  extra_headers=a.header,
                                   first_token=lambda: state.update(dirty=not bool(module_records(a.root))))
         except Exception as error:
             state["error"] = str(error)
@@ -480,6 +588,33 @@ def unit_owners(_):
         print(f'  src/engines/mlx/{filename}: test "{name}"')
 
 
+def receipt(a):
+    log = Path(a.log).read_text() if a.log and Path(a.log).is_file() else ""
+    passed = [line.strip() for line in log.splitlines() if line.strip().startswith("PASS:")]
+    skipped = [line.strip() for line in log.splitlines() if line.strip().startswith("SKIP:")]
+    binary = Path(a.binary)
+    output = Path(a.output)
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(output.parent, 0o700)
+    write(output, {
+        "schema": 1,
+        "test": "test_module_prefix_cache_disk.sh",
+        "status": "passed" if a.exit_code == 0 else "failed",
+        "exit_code": a.exit_code,
+        "started_utc": a.started_utc,
+        "finished_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "model": Path(a.model).name,
+        "binary": binary.name,
+        "binary_sha256": digest(binary) if binary.is_file() else None,
+        "prefix_cache_ram_budget": a.ram_budget,
+        "prefix_cache_disk_budget": a.disk_budget,
+        "passed_cases": passed,
+        "skipped_cases": skipped,
+    })
+    os.chmod(output, 0o600)
+    print(f"receipt: {output}")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -491,6 +626,7 @@ def main():
         "copy-cache": (copy_cache, "source dest", ""),
         "fixture": (fixture, "model dest", ""),
         "touch-pack": (touch_pack, "pack", ""),
+        "touch-ready": (touch_ready, "pack", ""),
         "restore-stat": (restore_stat, "pack", ""),
         "changed-root": (changed_root, "root snapshot", ""),
         "truncate": (truncate, "root boundary", ""),
@@ -506,15 +642,30 @@ def main():
         "inject-module": (inject_module, "root source output", ""),
         "kv-result": (kv_result, "cold log injected", ""),
         "unit-owners": (unit_owners, "", ""),
+        "receipt": (receipt, "output", "log"),
     }
     extra = {
-        "result": [("result", {}), ("--cached", {"type": int})],
+        "result": [("result", {}), ("--cached", {"type": int}),
+                   ("--min-cached", {"type": int}), ("--legacy-log", {})],
         "kv-result": [("result", {})],
-        "disabled": [("--reason", {"action": "store_true"})],
+        "disabled": [("--reason", {"action": "store_true"}),
+                     ("--legacy-resume", {"action": "store_true"})],
         "layout": [("--wait", {"type": float, "default": 0}), ("--only", {"action": "store_true"})],
-        "request": [("--max-tokens", {"type": int, "default": 24})],
+        "request": [("--max-tokens", {"type": int, "default": 24}),
+                    ("--request-url", {}), ("--api-key-env", {"default": "MLX_SERVE_API_KEY"}),
+                    ("--header", {"action": "append", "default": []}),
+                    ("--conversation-id", {})],
+        "fixture": [("--identity-file", {})],
+        "cancel": [("--request-url", {}), ("--api-key-env", {"default": "MLX_SERVE_API_KEY"}),
+                   ("--header", {"action": "append", "default": []})],
         "port-free": [("--port", {"required": True, "type": int})],
-        "mem-wait": [("--timeout", {"type": float, "default": 180})],
+        "mem-wait": [("--timeout", {"type": float, "default": 180}),
+                     ("--previous-pid", {"type": int}), ("--previous-start", {}),
+                     ("--port", {"type": int})],
+        "receipt": [("--exit-code", {"required": True, "type": int}),
+                    ("--started-utc", {"required": True}),
+                    ("--model", {"required": True}), ("--binary", {"required": True}),
+                    ("--ram-budget", {"required": True}), ("--disk-budget", {"required": True})],
         "stop": [("--pid", {"required": True, "type": int}), ("--timeout", {"required": True, "type": float})],
         "crash-window": [("--pid", {"required": True, "type": int})],
         "summary": [("--deadline", {"required": True, "type": int})],

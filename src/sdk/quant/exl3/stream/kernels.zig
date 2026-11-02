@@ -15,6 +15,27 @@ pub const selfcheck = @import("selfcheck.zig");
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Allocator = std.mem.Allocator;
 
+const portable_prefill = @embedFile("kernels/exl3/portable_prefill.metal");
+const portable_prefill_sha256 = "40caf0aded802585774154813ee2611b0cf0124db46e3938ae3890289cd0d203";
+
+fn checkPortablePrefill(text: []const u8, diag: ?*Diag) Refusal!void {
+    try kset.checkText(text, portable_prefill_sha256, portable_prefill.len, "exl3 kernels", "portable_prefill.metal", diag);
+}
+
+/// Only these DIG tiles use the A/device, transposed-B/threadgroup and accumulator layouts
+/// implemented by the portable header. Other NAX kernels retain their own capability guards.
+pub const portable_prefill_kernels = [_]Kernel{
+    .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3,
+    .q3_prefill_dig_gemm_2304x5120_xmul1hk3,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut,
+    .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128,
+    .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1,
+};
+
 /// sha256 of kernels/exl3/manifest.json: pins the manifest, which pins every text.
 pub const manifest_sha256 = "921f7a69c4b356b31e78f8b3d6ef743caae7cfa7bf7aae4cfd541f0e6d919d81";
 
@@ -476,6 +497,7 @@ pub const Registry = struct {
     /// Parses the manifest, checks it against `pin` (hex sha256) and every text against it,
     /// once. Production passes `embedded` and `manifest_sha256`.
     pub fn init(gpa: Allocator, texts: *const Texts, pin: []const u8, diag: ?*Diag) (Refusal || Allocator.Error)!Registry {
+        try checkPortablePrefill(portable_prefill, diag);
         const got = try kset.checkPin(texts.manifest, pin, "exl3 kernels", diag);
         var reg: Registry = .{
             .arena = std.heap.ArenaAllocator.init(gpa),
@@ -530,6 +552,11 @@ pub const Registry = struct {
         return if (e.header) |h| self.compiled[@backingInt(h)] else "";
     }
 
+    fn portableHeader(self: *const Registry, a: Allocator, e: *const Entry, has_nax: bool) Allocator.Error!?[:0]u8 {
+        if (has_nax or std.mem.indexOfScalar(Kernel, &portable_prefill_kernels, e.kernel) == null) return null;
+        return try std.mem.concatWithSentinel(a, u8, &.{ self.header(e), "\n", portable_prefill }, 0);
+    }
+
     /// Every embedded addendum is listed once, with its text's sha256 and size, and every listed
     /// one is embedded; the compiled header is the lane header followed by it.
     fn adoptAddenda(self: *Registry, a: Allocator, texts: *const Texts, js: []const JText, diag: ?*Diag) (Refusal || Allocator.Error)!void {
@@ -566,12 +593,17 @@ pub const Registry = struct {
         if (!mlx.streamIsGpu(stream)) return refuse(diag, error.NotGpuStream, "exl3 kernels: bind needs a GPU stream", .{});
         var b: Bound = .{ .reg = self, .stream = stream, .kernels = @splat(.{}) };
         errdefer b.deinit();
+        const has_nax = @import("mlx_host").naxAvailable();
         for (&self.entries, 0..) |*e, i| {
             var in_names: [max_inputs][*:0]const u8 = undefined;
             var out_names: [max_outputs][*:0]const u8 = undefined;
             for (e.inputs, 0..) |arg, n| in_names[n] = arg.name.ptr;
             for (e.outputs, 0..) |arg, n| out_names[n] = arg.name.ptr;
-            b.kernels[i] = kset.newKernel(e.mlx_name.ptr, in_names[0..e.inputs.len], out_names[0..e.outputs.len], e.source.ptr, self.header(e).ptr, e.ensure_row_contiguous) orelse
+            const extra = self.portableHeader(std.heap.page_allocator, e, has_nax) catch
+                return refuse(diag, error.KernelCreateFailed, "exl3 kernels: portable header allocation failed", .{});
+            defer if (extra) |h| std.heap.page_allocator.free(h);
+            const compile_header = extra orelse self.header(e);
+            b.kernels[i] = kset.newKernel(e.mlx_name.ptr, in_names[0..e.inputs.len], out_names[0..e.outputs.len], e.source.ptr, compile_header.ptr, e.ensure_row_contiguous) orelse
                 return refuse(diag, error.KernelCreateFailed, "exl3 kernels: mlx_fast_metal_kernel_new({t}) failed", .{e.kernel});
         }
         return b;
@@ -1075,6 +1107,45 @@ fn initOrPrint(texts: *const Texts, pin: []const u8) !Registry {
 }
 
 const shaHex = kset.shaHex;
+
+test "dsv41 portable prefill: changed header bytes are refused" {
+    try checkPortablePrefill(portable_prefill, null);
+    const changed = try testing.allocator.dupe(u8, portable_prefill);
+    defer testing.allocator.free(changed);
+    changed[changed.len / 2] ^= 1;
+    var diag: Diag = .{};
+    try testing.expectError(error.TextSha256Mismatch, checkPortablePrefill(changed, &diag));
+    try testing.expect(std.mem.indexOf(u8, diag.message(), "portable_prefill.metal") != null);
+}
+
+test "dsv41 portable prefill: only DIG GEMMs receive the non-NAX tile implementation" {
+    var reg = try initOrPrint(&embedded, manifest_sha256);
+    defer reg.deinit();
+    const portable = [_]Kernel{
+        .q3_prefill_dig_gemm_5120x2304_gu_xmul1hk3,
+        .q3_prefill_dig_gemm_2304x5120_xmul1hk3,
+        .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128,
+        .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128,
+        .dsv41_prefill_dig_gemm_2304x5120_xmul1hk3_m128w1,
+        .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk3_m128lut,
+        .dsv41_prefill_dig_gemm_5120x2304_gu_xmul1hk2_m128,
+        .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128,
+        .dsv41_prefill_dig_gemm_2304x5120_xmul1hk2_m128w1,
+    };
+    for (&reg.entries) |*e| {
+        const nax = try reg.portableHeader(testing.allocator, e, true);
+        defer if (nax) |h| testing.allocator.free(h);
+        try testing.expect(nax == null);
+        const simd = try reg.portableHeader(testing.allocator, e, false);
+        defer if (simd) |h| testing.allocator.free(h);
+        const wanted = std.mem.indexOfScalar(Kernel, &portable, e.kernel) != null;
+        try testing.expectEqual(wanted, simd != null);
+        if (simd) |h| {
+            try testing.expect(std.mem.startsWith(u8, h, reg.header(e)));
+            try testing.expect(std.mem.indexOf(u8, h, "#define NAXTile Dsv41SimdTile") != null);
+        }
+    }
+}
 
 test "dsv41 kernels: the embedded manifest is the pinned one and every text matches it" {
     var reg = try initOrPrint(&embedded, manifest_sha256);

@@ -1,23 +1,40 @@
 #!/bin/bash
 # DeepSeek-V4.1 module records: controls, restart, corruption, pack stats and cancellation.
-# DSV41_TEST_MODEL=<resident pack> MLX_SERVE_BINARY=<ReleaseFast binary> bash tests/test_module_prefix_cache_disk.sh
+# DSV41_TEST_MODEL=<resident or EXL3 pack> MLX_SERVE_BINARY=<ReleaseFast binary> bash tests/test_module_prefix_cache_disk.sh
 # Optional MODULE_CACHE_KV_MODEL + MODULE_CACHE_OLD_BINARY exercise KV compatibility and an older reader.
+# MODULE_CACHE_REQUEST_URL routes generations separately; MLX_SERVE_API_KEY is read by name, never printed.
+# Optional MODULE_CACHE_REQUEST_HEADERS is newline-separated and passed as repeated --header values.
 # Timing windows that cannot be observed are SKIP, never PASS. Hermetic row owners are listed by the probe.
 
 set -euo pipefail
+umask 077
 source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${DSV41_TEST_MODEL:-}"
 [ -n "$MODEL" ] || { echo "SKIP: DSV41_TEST_MODEL not set"; exit 0; }
+SOURCE_MODEL="$MODEL"
 BINARY="${MLX_SERVE_BINARY:-${BINARY:-./zig-out/bin/mlx-serve}}"
 [ -x "$BINARY" ] || { echo "FAIL: $BINARY not found. Build first."; exit 1; }
 [ -f "$MODEL/config.json" ] || { echo "FAIL: $MODEL/config.json not found"; exit 1; }
 PORT="${MODULE_CACHE_TEST_PORT:-19046}"
 BASE="http://127.0.0.1:$PORT"
+MODULE_CACHE_RAM_BUDGET="${MODULE_CACHE_RAM_BUDGET:-8GB}"
+MODULE_CACHE_DISK_BUDGET="${MODULE_CACHE_DISK_BUDGET:-32GB}"
 PROBE="$(dirname "$0")/module_prefix_cache_disk_probe.py"
 mkdir -p "$HOME/claude-tmp"
 OUT=$(mktemp -d "$HOME/claude-tmp/module-prefix-disk.XXXXXX")
+chmod 700 "$OUT"
+STARTED_UTC=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+RECEIPT_ID=$(date -u +%Y%m%dT%H%M%SZ)-$$
+RECEIPT_DIR="${MODULE_CACHE_RECEIPTS_DIR:-$HOME/claude-tmp/module-prefix-cache-receipts}"
+mkdir -p "$RECEIPT_DIR"
+chmod 700 "$RECEIPT_DIR"
+RECEIPT_PATH="$RECEIPT_DIR/module-prefix-cache-$RECEIPT_ID.json"
+exec > >(tee "$OUT/driver.log") 2>&1
 SERVER_PID=""
+SERVER_START=""
+LAST_SERVER_PID=""
+LAST_SERVER_START=""
 WATCH_PID=""
 LOGFILE=""
 CASE_HOME=""
@@ -51,6 +68,13 @@ cleanup() {
         kill -KILL "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+    sleep 0.1
+    if ! probe receipt "$RECEIPT_PATH" --log "$OUT/driver.log" --exit-code "$rc" \
+        --started-utc "$STARTED_UTC" --model "$SOURCE_MODEL" --binary "$BINARY" \
+        --ram-budget "$MODULE_CACHE_RAM_BUDGET" --disk-budget "$MODULE_CACHE_DISK_BUDGET"; then
+        rc=1
+        echo "FAIL: could not write the run receipt"
+    fi
     if [ "$rc" = 0 ]; then rm -rf "$OUT"; else echo "artifacts: $OUT"; fi
     exit "$rc"
 }
@@ -62,49 +86,99 @@ start_server() { # label, HOME, extra flags
     shift 2
     mkdir -p "$CASE_HOME"
     LOGFILE="$OUT/$label.server.log"
-    probe mem-wait --model "$MODEL"
+    if [ -n "$LAST_SERVER_PID" ]; then
+        probe mem-wait --model "$MODEL" --port "$PORT" \
+            --previous-pid "$LAST_SERVER_PID" --previous-start "$LAST_SERVER_START"
+    else
+        probe mem-wait --model "$MODEL" --port "$PORT"
+    fi
     # Refuse an occupied port; never kill a server owned by another test.
     probe port-free --port "$PORT"
     HOME="$CASE_HOME" "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
         --ctx-size 16384 --no-pld --no-mtp --no-drafter --no-vision --kv-quant off --metrics \
-        --prefix-cache-entries 4 --prefix-cache-mem 8GB --prefix-cache-disk 32GB \
+        --prefix-cache-entries 4 --prefix-cache-mem "$MODULE_CACHE_RAM_BUDGET" \
+        --prefix-cache-disk "$MODULE_CACHE_DISK_BUDGET" \
         --shutdown-persist-secs 45 --log-level debug \
         ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} "$@" > "$LOGFILE" 2>&1 &
     SERVER_PID=$!
     srv_wait_health "$BASE" 1200 1 "$SERVER_PID"
+    SERVER_START=$(ps -p "$SERVER_PID" -o lstart= | sed 's/^ *//')
 }
 stop_server() {
     # Shutdown persistence is bounded; Writer teardown can still join an in-flight write.
     probe stop --pid "$SERVER_PID" --timeout 120
     wait "$SERVER_PID" 2>/dev/null || true
+    LAST_SERVER_PID="$SERVER_PID"
+    LAST_SERVER_START="$SERVER_START"
     SERVER_PID=""
+    SERVER_START=""
 }
-request() { probe request --base "$BASE" "$@"; }
+request() {
+    local route=()
+    if [ -n "${MODULE_CACHE_REQUEST_URL:-}" ]; then
+        route+=(--request-url "$MODULE_CACHE_REQUEST_URL"
+                --api-key-env "${MODULE_CACHE_API_KEY_ENV:-MLX_SERVE_API_KEY}")
+        while IFS= read -r header; do
+            [ -z "$header" ] || route+=(--header "$header")
+        done <<< "${MODULE_CACHE_REQUEST_HEADERS:-}"
+    fi
+    probe request --base "$BASE" ${route[@]+"${route[@]}"} "$@"
+}
+cancel_route=()
+if [ -n "${MODULE_CACHE_REQUEST_URL:-}" ]; then
+    cancel_route+=(--request-url "$MODULE_CACHE_REQUEST_URL"
+                   --api-key-env "${MODULE_CACHE_API_KEY_ENV:-MLX_SERVE_API_KEY}")
+    while IFS= read -r header; do
+        [ -z "$header" ] || cancel_route+=(--header "$header")
+    done <<< "${MODULE_CACHE_REQUEST_HEADERS:-}"
+fi
 copy_seed() { probe copy-cache --source "$OUT/seed-home" --dest "$1"; }
 
 # ── Tests ──
 
-echo "entries zero and module RAM disabled retain no history"
+echo "entries zero and module RAM disabled retain no shared history"
 probe fixture --model "$MODEL" --dest "$OUT/pack"
 MODEL="$OUT/pack"
+EXL3_MODEL=0
+[ ! -f "$MODEL/experts.bin" ] || EXL3_MODEL=1
 start_server r02-zero "$OUT/zero-home" --prefix-cache-entries 0
 request --output "$OUT/cold1.json"
 request --seed "$OUT/cold1.json" --output "$OUT/cold2.json"
 probe result "$OUT/cold1.json" --cached 0
-probe result "$OUT/cold2.json" --cached 0
-stop_server
-probe disabled --root "$OUT/zero-home" --log "$LOGFILE" --reason
-start_server r02-no-ram "$OUT/no-ram-home" --no-prefix-cache-ram
-request --output "$OUT/no-ram1.json"
-request --seed "$OUT/cold1.json" --output "$OUT/no-ram2.json"
-probe result "$OUT/no-ram2.json" --cached 0 --cold "$OUT/cold2.json"
-stop_server
-probe disabled --root "$OUT/no-ram-home" --log "$LOGFILE" --reason
-echo "PASS: entries zero and module RAM disabled retain no history"
+if [ "$EXL3_MODEL" = 1 ]; then
+    probe result "$OUT/cold2.json" --min-cached 1 --legacy-log "$LOGFILE"
+    request --conversation-id "module-cache-interleave-B" --output "$OUT/no-share-b.json"
+    request --seed "$OUT/cold2.json" --output "$OUT/no-share-a-after-b.json"
+    probe result "$OUT/no-share-a-after-b.json" --cached 0
+    stop_server
+    probe disabled --root "$OUT/zero-home" --log "$LOGFILE" --legacy-resume
+    start_server r02-no-ram "$OUT/no-ram-home" --no-prefix-cache-ram
+    request --output "$OUT/no-ram1.json"
+    request --seed "$OUT/no-ram1.json" --output "$OUT/no-ram2.json"
+    probe result "$OUT/no-ram2.json" --min-cached 1 --legacy-log "$LOGFILE"
+    request --conversation-id "module-cache-no-ram-B" --output "$OUT/no-ram-b.json"
+    request --seed "$OUT/no-ram2.json" --output "$OUT/no-ram-a-after-b.json"
+    probe result "$OUT/no-ram-a-after-b.json" --cached 0
+    stop_server
+    probe disabled --root "$OUT/no-ram-home" --log "$LOGFILE" --legacy-resume
+    echo "PASS: EXL3 legacy idle resume is separate from shared RAM/SSD module history"
+else
+    probe result "$OUT/cold2.json" --cached 0
+    stop_server
+    probe disabled --root "$OUT/zero-home" --log "$LOGFILE" --reason
+    start_server r02-no-ram "$OUT/no-ram-home" --no-prefix-cache-ram
+    request --output "$OUT/no-ram1.json"
+    request --seed "$OUT/cold1.json" --output "$OUT/no-ram2.json"
+    probe result "$OUT/no-ram2.json" --cached 0 --cold "$OUT/cold2.json"
+    stop_server
+    probe disabled --root "$OUT/no-ram-home" --log "$LOGFILE" --reason
+    echo "PASS: entries zero and module RAM disabled retain no history"
+fi
 
 echo "disk disabled preserves exact RAM restore"
 start_server r01 "$OUT/off-home" --prefix-cache-disk off
 request --output "$OUT/off1.json"
+request --conversation-id "module-cache-ram-interleave-B" --output "$OUT/off-b.json"
 request --seed "$OUT/cold1.json" --output "$OUT/off2.json"
 probe result "$OUT/off2.json" --boundary "$OUT/cold1.json" --cold "$OUT/cold2.json" --log "$LOGFILE" --source ram
 stop_server
@@ -155,6 +229,36 @@ else
     [ "$rc" = 77 ] || exit "$rc"
 fi
 
+if [ "$EXL3_MODEL" = 1 ]; then
+    for identity_file in expert-manifest-v2.json expert-manifest.json experts.bin; do
+        [ -f "$SOURCE_MODEL/$identity_file" ] || continue
+        label="identity-${identity_file//./-}"
+        variant="$OUT/$label-pack"
+        variant_home="$OUT/$label-home"
+        variant_snapshot="$OUT/$label-records.json"
+        probe fixture --model "$SOURCE_MODEL" --dest "$variant" --identity-file "$identity_file"
+        if probe touch-ready --pack "$variant"; then
+            MODEL="$variant"
+            start_server "$label-seed" "$variant_home"
+            request --output "$OUT/$label-seed.json"
+            stop_server
+            probe layout --root "$variant_home" --boundary "$OUT/$label-seed.json" \
+                --snapshot "$variant_snapshot" --wait 120
+            probe touch-pack --pack "$variant"
+            start_server "$label-mutated" "$variant_home"
+            request --seed "$OUT/$label-seed.json" --output "$OUT/$label-request.json"
+            probe result "$OUT/$label-request.json" --cached 0 --cold "$OUT/cold2.json"
+            stop_server
+            probe changed-root --root "$variant_home" --snapshot "$variant_snapshot"
+            echo "PASS: selected EXL3 identity input $identity_file selects a distinct module root"
+        else
+            rc=$?
+            [ "$rc" = 77 ] || exit "$rc"
+        fi
+        MODEL="$OUT/pack"
+    done
+fi
+
 echo "SIGKILL before metadata leaves no accepted record"
 start_server r16-seed "$OUT/crash-home"
 probe crash-window --pid "$SERVER_PID" --root "$CASE_HOME" --output "$OUT/crash-window.json" &
@@ -162,8 +266,11 @@ WATCH_PID=$!
 request --output "$OUT/crash1.json" > "$OUT/crash-client.log" 2>&1 || true
 if wait "$WATCH_PID"; then
     WATCH_PID=""
+    LAST_SERVER_PID="$SERVER_PID"
+    LAST_SERVER_START="$SERVER_START"
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
+    SERVER_START=""
     start_server r16-restart "$OUT/crash-home"
     probe crash-scan --root "$CASE_HOME" --log "$LOGFILE" --window "$OUT/crash-window.json"
     request --output "$OUT/crash-restart1.json"
@@ -188,7 +295,7 @@ echo "PASS: shutdown log controls (expiry during a slice remains unit-owned)"
 
 echo "cancelling a continuation preserves the consumed dirty export"
 start_server r47-seed "$OUT/cancel-home"
-if probe cancel --base "$BASE" --root "$CASE_HOME" --log "$LOGFILE" --output "$OUT/cancel1.json"; then
+if probe cancel --base "$BASE" ${cancel_route[@]+"${cancel_route[@]}"} --root "$CASE_HOME" --log "$LOGFILE" --output "$OUT/cancel1.json"; then
     probe layout --root "$CASE_HOME" --boundary "$OUT/cancel1.json" --wait 120
     stop_server
     probe layout --root "$CASE_HOME" --boundary "$OUT/cancel1.json" --only

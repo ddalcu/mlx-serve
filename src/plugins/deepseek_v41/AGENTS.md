@@ -1,13 +1,13 @@
 # deepseek_v41
 
 DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its vision tower, as a native,
-module-owned arch. Resident unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
+module-owned arch. Resident unpaired and funded portable-M2 EXL3 captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank, streamed).
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;
-  a streamed pack's bank (`openBank`) and its prompt calls (`runPrompt`).
+  a streamed pack's bank (`openBank`), funded auxiliary cache and prompt calls (`runPrompt`).
 - `config.zig`: claims + V4.1 fields on top of `../deepseek_v4/config.zig`; `bill.zig`: compressed caches per
   token, attended keys, `dsv41_mod.prefillBytes`; a streamed bank's budget (`streamBudget`).
 - `media.zig`: decode, the release's processor (`vision.preprocess`), tower, placeholder run.
@@ -22,11 +22,11 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
 
 ## Facts the table declares
-- `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
-  live slots in `parked`; decode and DSpark rounds batch through `extendBatched` (rows a state, projections shared,
+- `owns_decode_state`, `slot_state` + `batches_decode` (portable M2 EXL3: two active slots, serial decode; other streamed paths: single-flight): active state in `dec_state`,
+  other live slots in `parked`; decode and DSpark rounds batch through `extendBatched` (rows a state, projections shared,
   attention per state) and `dsparkDraftBatched`. Each State owns its pending capture.
-- `prefix_cache` for resident packs; `aux.enabled` also excludes Thunderbolt pairs. Snapshots retain every buffer
-  and restore only at their exact position; the engine owns finished history. Streamed/paired keep legacy resume.
+- `prefix_cache` for resident packs; `aux.enabled` admits unpaired resident packs and portable-M2 EXL3 with a positive load-funded allowance (it also excludes Thunderbolt pairs); the host owns RAM/SSD history.
+  NAX, other streamed devices, pairs and unfunded EXL3 keep legacy resume. Snapshots retain every buffer and restore only at their exact position.
 - No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
@@ -45,6 +45,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   reference); the module splices the rows itself; image rows route by `gate.bias_vl` and get no Engram write
   (`Hash.DEAD`).
 - The resume key includes the image rows: a different image at the same tokens is a cold prompt.
+- The State owns its Engram prompt and confidence demand; parking drains its read-ahead before switching owners.
 - DSpark = DFlash + Markov head: `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1`
   DENSE; sampled requests via one-hot acceptance. Per-model `mtp:false` keeps the
   stages off (`mtpSetting`).
@@ -61,13 +62,21 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   measured slower than the pair (their threadgroup shapes differ): keep one dispatch a stage.
 
 ## Streamed packs (`experts.bin`)
-- M5 and newer only (`naxAvailable`), refused by name below, as are GLM-5.3's EXL3 repacks: the prompt GEMMs are built
-  on MLX's NAX tiles and miss their f64 self-check on M4. The MLX pack streams anywhere.
+- Non-NAX EXL3 loads run the portable DIG tiles' numerical self-check once at load; failures refuse the pack.
+  Only the real portable M2 architecture enables two-state scheduling and reservation; a generation override cannot.
+  NAX and other passing portable devices keep single-flight, whole-prompt prefill and the legacy memory bill.
 - The routed experts come from `sdk/weights/streamed.zig` `Exl3` (`exl3_source.zig`: the EXL3 lane, event-gated
   waves, the next layer's reads predicted, the wide prompt feed, the decode forms / banked waves / hoist / device
   route); the trunk's own MoE never runs for them (`moe`'s `source` arm; the DSpark stages stay resident).
 - The prompt runs in calls of up to `bill.stream_call_rows`, each one MoE call a layer over all its rows
   (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
+- Portable M2 EXL3 admission caps owners at `min(Caps.active_slots, --max-concurrent)`; the plugin also refuses excess claims.
+  Its bank sizing reserves two live states with snapshots/backing capacity and one shared workspace.
+  Idle legacy-resume state is adopted or freed before a cold forward could allocate a third context.
+- Shared EXL3 cache bytes are reserved before both bank phases; initial and revised RAM caps cannot exceed that allowance.
+  SSD staging shares the funded pool with retained snapshots, including direct/shutdown writes; pending writes may drain.
+- Shared captures compact pending pooling rows and Markov history before transfer; they never own expert-bank rows.
+  RAM ownership and v10 SSD export/import use the existing auxiliary hooks and shared disk tier.
 - Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
   grows the rows into what the prompt's working set held.
 - The bank bills its rows at the load (`streamBudget`: the GPU working set less the host's wired margin and
@@ -90,8 +99,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - Kernel contract (`contract.zig`; kernels unchanged): `idx_score` / `idx_tile` score a NaN q.k dot as 0 (relu
   via Metal's max); `rope_tail` fp4 arms and `kv_row` write a NaN in a quantized block as a finite code (max drops
   it, the fp8 encoder saturates it); `moe_gu` / `moe_act` turn a NaN gate sum into the clip limit (Metal's min);
-  `engram` launches 1024 threads at 5120-wide rows where M1/M2 compile it for 928, unprobed: decode-width Engram
-  writes fail on M1/M2.
+  `engram` needs 1024 threads at 5120-wide rows where M1/M2 compile it for 928; `engramFusedAvailable` sends
+  oversized M1/M2 or unknown-device launches through the existing op chain, preserving its reduction order.
 
 ## Fixtures
 - `conformanceFixture`: `fixture.v41Files` (the `tests/dump_dsv41_fixtures.py` pipe layout, 8 layers, no Engram or
@@ -100,7 +109,7 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 ## The row from the root architecture table
 
 DeepSeek-V4/V4.1 Flash, 1M ctx. Spec off but DSpark; V4 single-flight, V4.1 batches decode and DSpark rounds across slots; DSML tools, OUR byte-pinned templates. V4:
-prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resident unpaired auxiliary snapshots keyed on
+prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resident unpaired and funded portable-M2 EXL3 auxiliary snapshots keyed on
 image rows; the EXL3 repack's experts streamed from its bank. V4.1 images: every span position carries `image_token_id` (without the
 request's rows that id is TEXT, as in the reference), the module splices the rows itself, image rows route by
 `gate.bias_vl` and get no Engram write (`Hash.DEAD`)
