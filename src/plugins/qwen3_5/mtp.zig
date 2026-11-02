@@ -119,7 +119,8 @@ fn moeWeights(c: *const config.Config, mw: anytype) !moe_block.Moe.Weights {
         .down = try bankOf(mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, inter),
         .shared = shared,
         .top_k = @intCast(c.num_experts_per_tok),
-        .experts = @intCast(c.num_experts),
+        // The head's own router: a pruned (REAP) trunk's `num_experts` is smaller than the head it ships.
+        .experts = mlx.getShape(mw.switch_gate_w)[0],
     };
 }
 

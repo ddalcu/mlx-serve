@@ -17,10 +17,11 @@
 #      finishes with content or a tool call, never `length` (stream + non-stream)
 #
 # Usage: ./tests/test_reasoning_budget_stream.sh [model_dir] [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-4B-MLX-4bit}"
+MODEL="${1:-$(find_model mlx-community/Qwen3.5-4B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-4B-MLX-4bit")}"
 PORT="${2:-11267}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"

@@ -3,7 +3,7 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const mlx_gguf = @import("../../quant/gguf/root.zig");
+const foreign = @import("../../quant/foreign.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const QuantMode = @import("../../quant/params.zig").QuantMode;
 const testing = std.testing;
@@ -11,7 +11,14 @@ const splitPackedGateUp = @import("../../../mlx/array.zig").splitPackedGateUp;
 const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
+const TruthErr = @import("../../testing/parity.zig").TruthErr;
+const testErrVsTruth = @import("../../testing/parity.zig").testErrVsTruth;
 const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
+const prefillComputeDtype = @import("../linear/prefill_dq_gemm.zig").prefillComputeDtype;
+const pdg = @import("../linear/prefill_dq_gemm.zig");
+const vqmm = @import("../linear/verify_qmm_nax.zig");
+const Scope = @import("../../../mlx/scope.zig").Scope;
+const maxAbsDiffF32 = @import("../../testing/parity.zig").maxAbsDiffF32;
 
 /// Gathered matmul for MoE expert dispatch — handles both quantized and dense bf16.
 /// Quantized (sc.ctx != null): mlx_gather_qmm with transpose_w=true, w stored [E,out,in].
@@ -19,8 +26,7 @@ const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmN
 /// (maybeTransposeForBf16 + generalized transposeBf16Weight), so x @ w is correct with no
 /// transpose flag — mirrors mlx-lm's `gather_mm(x, weight.swapaxes(-1,-2))`.
 pub fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, sorted: bool, s: mlx.mlx_stream) !void {
-    if (mlx_gguf.kernels.infoOf(w, sc)) |info| {
-        const y = try mlx_gguf.kernels.gatherLinear(info, x, w, lhs_idx, rhs_idx, s);
+    if (try foreign.gather(x, w, sc, lhs_idx, rhs_idx, s)) |y| {
         _ = mlx.mlx_array_free(res.*);
         res.* = y;
         return;
@@ -58,7 +64,31 @@ pub fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, s
                 return;
             }
         };
-        try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
+        // MLX_SERVE_F16_PREFILL (see prefill_dq_gemm.zig): a sorted affine gather of a bf16 activation
+        // multiplies in fp16 and casts back.
+        const xd = mlx.mlx_array_dtype(x);
+        const cd = if (sorted) prefillComputeDtype(xd, mode, bi.ctx != null) else xd;
+        const cast = cd != xd;
+        var xc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xc);
+        var scc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scc);
+        var bic = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bic);
+        if (cast) {
+            try mlx.check(mlx.mlx_astype(&xc, x, cd, s));
+            try mlx.check(mlx.mlx_astype(&scc, sc, cd, s));
+            try mlx.check(mlx.mlx_astype(&bic, bi, cd, s));
+            pdg.f16_prefill_engaged += 1;
+        }
+        try mlx.check(mlx.mlx_gather_qmm(res, if (cast) xc else x, w, if (cast) scc else sc, if (cast) bic else bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
+        if (cast) {
+            var back = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(back);
+            try mlx.check(mlx.mlx_astype(&back, res.*, xd, s));
+            _ = mlx.mlx_array_free(res.*);
+            res.* = back;
+        }
     }
 }
 
@@ -124,6 +154,105 @@ test "gatherExpertMm: a sorted nvfp4 gather past 65,535 rows matches the dequant
     try mlx.check(mlx.mlx_array_item_float32(&e2, err));
     try mlx.check(mlx.mlx_array_item_float32(&n2, nrm));
     try testing.expect(n2 > 0 and @sqrt(e2 / n2) < 0.01);
+}
+
+/// A sorted prefill gather's inputs: R rows of x [R,1,K] split evenly over E experts (rhs sorted),
+/// and the f32 truth from each expert's contiguous rows against `w32` [E,N,K].
+fn testSortedRows(sc: *Scope, rnd: std.Random, w32: mlx.mlx_array, R: c_int, scale: f32) !struct { x: mlx.mlx_array, rhs: mlx.mlx_array, truth: mlx.mlx_array } {
+    const ws = mlx.getShape(w32);
+    const E: usize = @intCast(ws[0]);
+    const K = ws[2];
+    const xr = try sc.keep(try testRandWeightBf16(rnd, &.{ R, 1, K }, sc.s));
+    const x = try sc.astype(try sc.mulS(try sc.astype(xr, .float32), scale), .bfloat16);
+    const ids = try testing.allocator.alloc(i32, @intCast(R));
+    defer testing.allocator.free(ids);
+    for (ids, 0..) |*v, i| v.* = @intCast(i * E / @as(usize, @intCast(R)));
+    const rhs = try sc.astype(try sc.fromI32(ids, &.{R}), .uint32);
+    const x2 = try sc.astype(try sc.reshape(x, &.{ R, K }), .float32);
+    const parts = try testing.allocator.alloc(mlx.mlx_array, E);
+    defer testing.allocator.free(parts);
+    for (parts, 0..) |*p, e| {
+        const lo: c_int = @intCast(e * @as(usize, @intCast(R)) / E);
+        const hi: c_int = @intCast((e + 1) * @as(usize, @intCast(R)) / E);
+        const w_e = try sc.reshape(try sc.slice(w32, 0, @intCast(e), @intCast(e + 1)), &.{ ws[1], K });
+        p.* = try sc.matmul(try sc.slice(x2, 0, lo, hi), try sc.transpose(w_e, &.{ 1, 0 }));
+    }
+    return .{ .x = x, .rhs = rhs, .truth = try sc.reshape(try sc.concat(parts, 0), &.{ R, 1, ws[1] }) };
+}
+
+test "gatherExpertMm: the fp16 lever on a sorted affine bf16 gather is no worse than the bf16 arm against f32 truth" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    // The plain gather_qmm, as on M1-M4: on NAX the sorted kernel claims the gather first.
+    const saved_nax = vqmm.vqmm_nax_probe_override;
+    defer vqmm.vqmm_nax_probe_override = saved_nax;
+    vqmm.vqmm_nax_probe_override = false;
+    const saved_lever = pdg.f16_prefill_override;
+    defer pdg.f16_prefill_override = saved_lever;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const s = sc.s;
+    var prng = std.Random.DefaultPrng.init(0xF18);
+    // A 2048-token prefill chunk, top-2 over 4 experts.
+    const pack = try pdg.testAffinePack(&sc, prng.random(), &.{ 4, 128, 256 });
+    const in = try testSortedRows(&sc, prng.random(), pack.w32, 4096, 16);
+
+    var errs: [2]TruthErr = undefined;
+    for ([_]bool{ false, true }, 0..) |lever, i| {
+        pdg.f16_prefill_override = lever;
+        const before = pdg.f16_prefill_engaged;
+        var out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out);
+        try gatherExpertMm(&out, in.x, pack.q, pack.scales, pack.biases, .{ .ctx = null }, in.rhs, 4, 64, .affine, true, s);
+        try testing.expectEqual(before + @intFromBool(lever), pdg.f16_prefill_engaged);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(out));
+        try testing.expectEqualSlices(c_int, mlx.getShape(in.truth), mlx.getShape(out));
+        errs[i] = try testErrVsTruth(out, in.truth, s);
+    }
+    try testing.expect(errs[1].rms <= 1.05 * errs[0].rms);
+    try testing.expect(errs[1].max <= 1.05 * errs[0].max);
+}
+
+test "gatherExpertMm: the fp16 lever leaves an unsorted (decode) gather and a non-affine pack alone" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const saved_nax = vqmm.vqmm_nax_probe_override;
+    defer vqmm.vqmm_nax_probe_override = saved_nax;
+    vqmm.vqmm_nax_probe_override = false;
+    const saved_lever = pdg.f16_prefill_override;
+    defer pdg.f16_prefill_override = saved_lever;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const s = sc.s;
+    var prng = std.Random.DefaultPrng.init(0xF19);
+    const pack = try pdg.testAffinePack(&sc, prng.random(), &.{ 4, 128, 256 });
+    const wb = try sc.keep(try testRandWeightBf16(prng.random(), &.{ 4, 128, 256 }, s));
+    var pair = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(pair);
+    try mlx.check(mlx.mlx_quantize(&pair, wb, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+    var wq = mlx.mlx_array_new();
+    var wsc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&wq, pair, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&wsc, pair, 1));
+    _ = try sc.keep(wq);
+    _ = try sc.keep(wsc);
+    const in = try testSortedRows(&sc, prng.random(), pack.w32, 4096, 1);
+
+    const cases = [_]struct { q: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array, gs: u32, mode: QuantMode, sorted: bool }{
+        .{ .q = pack.q, .scales = pack.scales, .biases = pack.biases, .gs = 64, .mode = .affine, .sorted = false },
+        .{ .q = wq, .scales = wsc, .biases = .{ .ctx = null }, .gs = 16, .mode = .nvfp4, .sorted = true },
+    };
+    for (cases) |c| {
+        var ys = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+        defer for (ys) |y| {
+            _ = mlx.mlx_array_free(y);
+        };
+        for ([_]bool{ false, true }, 0..) |lever, i| {
+            pdg.f16_prefill_override = lever;
+            const before = pdg.f16_prefill_engaged;
+            try gatherExpertMm(&ys[i], in.x, c.q, c.scales, c.biases, .{ .ctx = null }, in.rhs, 4, c.gs, c.mode, c.sorted, s);
+            try testing.expectEqual(before, pdg.f16_prefill_engaged);
+        }
+        try testing.expectEqual(@as(f32, 0), try maxAbsDiffF32(ys[0], ys[1], s));
+    }
 }
 
 test "splitPackedGateUp slices a packed experts.gate_up_proj into gate/up halves" {

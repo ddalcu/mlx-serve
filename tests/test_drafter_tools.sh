@@ -5,6 +5,7 @@
 # no-drafter baseline byte for byte.
 #
 #   DRAFTER_TEST_TARGET=<gemma-4 dense dir> DRAFTER_TEST_DRAFTER=<assistant dir> ./tests/test_drafter_tools.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
@@ -16,8 +17,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
-DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
+MODEL="${DRAFTER_TEST_TARGET:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
+DRAFTER="${DRAFTER_TEST_DRAFTER:-$(find_model mlx-community/gemma-4-E4B-it-assistant-bf16 || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16")}"
 if [ ! -d "$MODEL" ] || [ ! -d "$DRAFTER" ]; then
     echo -e "${YELLOW}SKIP${NC} test_drafter_tools: target or drafter checkpoint not found."
     exit 0
@@ -62,7 +63,7 @@ start_server() {
     echo -e "${RED}FAIL${NC} server did not become healthy"; tail -5 "$logfile"; return 1
 }
 stop_server() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; }
-trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
 tool_request() {
     local extra="$1"

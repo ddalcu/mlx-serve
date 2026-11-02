@@ -28,7 +28,8 @@ test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const model_mod = @import("../config/model.zig");
-    const config = try model_mod.parseConfig(io, alloc, dir);
+    var config = try model_mod.parseConfig(io, alloc, dir);
+    defer config.deinit(alloc);
     try std.testing.expect(config.qwen_vision);
     var weights = try model_mod.loadWeightsWithVision(io, alloc, dir);
     defer weights.deinit();

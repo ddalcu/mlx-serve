@@ -14,7 +14,7 @@ import census  # noqa: E402
 # The one list of media plugins: the 16 media backends plus the per-request job plugins (.bb/decisions.md P0); they
 # reach only sdk/, mlx/, abi/. Moves to src/abi/media.zig's registry once plugins register (P3).
 MEDIA_PLUGINS = {"flux2", "krea", "mage_flow", "qwen_image", "moss_image", "ltx", "minimax_h3", "hunyuan3d",
-                 "trellis2", "pixal3d", "acestep", "music3", "stable_audio3", "yue2", "qwen3_tts", "kokoro",
+                 "trellis2", "pixal3d", "idol", "acestep", "music3", "stable_audio3", "yue2", "qwen3_tts", "kokoro",
                  "laya", "kev", "d1", "clef", "nemotron_diarization"}
 
 SRC = "src"

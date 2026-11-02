@@ -129,25 +129,33 @@ final class MediaModelPicksTests: XCTestCase {
             MediaModelPicks.featured(AudioModelPreset.all,
                                      physicalMemoryBytes: 64 * gb,
                                      capabilityOf: \.capabilityLabel).count, 1)
-        // 3D: one family, and it rides `MediaModelSizing` alone — conforming it
-        // to the fuller `MediaModelPreset` would pull it into the Model
-        // Browser's Media tab, which deliberately covers four modalities.
+        // 3D: meshes are one job and Gaussian splats another.
+        let meshes = Model3DModelPreset.all.filter { $0.family != .idol }
         XCTAssertEqual(
-            MediaModelPicks.featured(Model3DModelPreset.all,
+            MediaModelPicks.featured(meshes,
                                      physicalMemoryBytes: 64 * gb,
                                      capabilityOf: \.capabilityLabel).count, 1)
     }
 
-    /// TRELLIS.2 and Pixal3D tie on RAM; the catalogue order breaks the tie, so TRELLIS.2 (the better car and
-    /// object model in our A/B) leads wherever it fits, and a small Mac keeps Hunyuan3D.
-    func testThe3DCatalogueLeadsWithTRELLIS2WhereItFits() {
+    /// Idol is the recommended 3D model, so it leads wherever it fits. Behind it the mesh pick is as it was: TRELLIS.2
+    /// and Pixal3D tie on RAM and the catalogue order breaks the tie (TRELLIS.2 is the better car and object model in
+    /// our A/B), and a small Mac keeps Hunyuan3D.
+    func testThe3DCatalogueLeadsWithIdolThenTheBestMeshModel() {
         let big = MediaModelPicks.featured(Model3DModelPreset.all, physicalMemoryBytes: 64 * gb,
                                            capabilityOf: \.capabilityLabel)
-        XCTAssertEqual(big.first?.preset.id, Model3DModelPreset.trellis2_8bit.id)
+        XCTAssertEqual(big.map(\.preset.id), [Model3DModelPreset.idol_8bit.id, Model3DModelPreset.trellis2_8bit.id])
         let small = MediaModelPicks.featured(Model3DModelPreset.all, physicalMemoryBytes: 16 * gb,
                                              capabilityOf: \.capabilityLabel)
-        XCTAssertEqual(small.first?.preset.id, Model3DModelPreset.hunyuan3d21_8bit.id)
+        XCTAssertEqual(small.map(\.preset.id), [Model3DModelPreset.idol_8bit.id, Model3DModelPreset.hunyuan3d21_8bit.id])
         XCTAssertEqual(MediaModelPicks.others(Model3DModelPreset.all, featured: big).map(\.id),
                        [Model3DModelPreset.hunyuan3d21_8bit.id, Model3DModelPreset.pixal3d_8bit.id])
+    }
+
+    /// Idol makes splats, not meshes: it is featured beside the best mesh model, never ranked against it.
+    func testIdolIsFeaturedForItsOwnJobBesideTheBestMeshModel() {
+        let picks = MediaModelPicks.featured(Model3DModelPreset.all, physicalMemoryBytes: 64 * gb,
+                                             capabilityOf: \.capabilityLabel)
+        XCTAssertEqual(picks.count, 2)
+        XCTAssertNotEqual(picks[0].capability, picks[1].capability)
     }
 }

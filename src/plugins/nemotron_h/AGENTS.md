@@ -6,7 +6,8 @@ the trunk under `llm_config`, the RADIO tower beside it). Packs: mlx-community's
 ## Files
 - `plugin.zig`: the table. `Hybrid(TableEmbed, RmsNorm, Either(Either(Mamba2, HybridAttention), Either(NemotronMoe,
   ReluSq)), -, AddNorm, LmHead)`; the MoE folds its combine + shared expert into the closing add_norm seam (the
-  latent trunk declines the fold, as legacy). Prefix `backbone` or `language_model.backbone` (probed).
+  latent trunk declines the fold, as legacy). Prefix `backbone`, `language_model.backbone` or `llm.backbone` (probed;
+  the last is `nemotron_transcribe`'s wrapper).
 - `config.zig`: MLX-free claim + parse (+ `layout`: Mamba2 = conv window + scan state, attention = NoPE full KV).
 - `proof_test.zig`: tables bit-equal to the deleted legacy forward, replayed from `fixtures/` (harness
   `../lfm2/proof.zig`), with a drafter bound too (`Forward.row_exact`), where a verify also equals serial decode row

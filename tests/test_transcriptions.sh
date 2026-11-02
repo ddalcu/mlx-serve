@@ -17,13 +17,14 @@
 #   hf download mlx-community/Nemotron-3-Diarization-8bit --local-dir ~/.mlx-serve/models/mlx-community/Nemotron-3-Diarization-8bit
 #
 # Usage: ASR_MODEL=<dir> ALIGNER_MODEL=<dir> DIARIZER_MODEL=<dir> BINARY=<mlx-serve> ./tests/test_transcriptions.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11443}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${BINARY:-$ROOT/zig-out/bin/mlx-serve}"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
-ASR="${ASR_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-ASR-0.6B-8bit}"
+ASR="${ASR_MODEL:-$(find_model mlx-community/Qwen3-ASR-0.6B-8bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3-ASR-0.6B-8bit")}"
 [ -f "$ASR/config.json" ] || { echo "SKIP: no Qwen3-ASR pack at $ASR (set ASR_MODEL)"; exit 0; }
 command -v say >/dev/null || { echo "SKIP: needs macOS say to speak the test clips"; exit 0; }
 
@@ -133,7 +134,7 @@ b400 "JSON body" "multipart" -H 'Content-Type: application/json' -d "{\"model\":
 grep -q "\[mlx\]" "$LOG" && { echo "FAIL: MLX error in the log"; grep "\[mlx\]" "$LOG" | head -3; exit 1; }
 
 # 6. Word times from the forced aligner, rescanned in beside the ASR.
-ALIGNER="${ALIGNER_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-ForcedAligner-0.6B-8bit}"
+ALIGNER="${ALIGNER_MODEL:-$(find_model mlx-community/Qwen3-ForcedAligner-0.6B-8bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3-ForcedAligner-0.6B-8bit")}"
 if [ ! -f "$ALIGNER/config.json" ]; then
   echo "SKIP: word times (no Qwen3-ForcedAligner pack at $ALIGNER; set ALIGNER_MODEL)"
 else
@@ -240,7 +241,7 @@ assert w[-1]['end']>d-10 and all(x['end']<=d for x in w), (w[-1], d)" || { echo 
   echo "PASS: a 210 s clip is two pieces, timed end to end"
 
   # 6b. Speakers from Nemotron 3 Diarization, rescanned in beside the aligner.
-  DIARIZER="${DIARIZER_MODEL:-$HOME/.mlx-serve/models/mlx-community/Nemotron-3-Diarization-8bit}"
+  DIARIZER="${DIARIZER_MODEL:-$(find_model mlx-community/Nemotron-3-Diarization-8bit || echo "$HOME/.mlx-serve/models/mlx-community/Nemotron-3-Diarization-8bit")}"
   pick_voice() { # preferred name, else the first voice of a locale
     say -v '?' | grep -q "^$1 " && { echo "$1"; return; }
     say -v '?' | sed -n "s/^\(.*[^ ]\)  *$2 .*/\1/p" | head -1

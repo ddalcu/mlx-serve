@@ -4,11 +4,13 @@
 //!
 //! Matches transformers' `DINOv3ViTModel` (published layout `layer.N.*`): a 16x16 patch conv, CLS and
 //! register tokens, 2-axis RoPE on the PATCH tokens only (centres normalized to [-1, 1], rotate-half
-//! pairing), pre-norm blocks with per-channel layer scale. Runs f32, as the reference extractor does.
+//! pairing), pre-norm blocks with per-channel layer scale. The blocks run in the caller's dtype (f32 as TRELLIS.2's
+//! extractor, bf16 as Idol's), the final non-affine norm in f32.
 //! Parity: `dinov3 oracle` against transformers on a tiny random model (tests/dump_trellis2_fixtures.py).
 
 const std = @import("std");
 const env = @import("../../env.zig");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const qvis = @import("qwen_vision.zig");
@@ -21,6 +23,56 @@ const loadWeightsFile = @import("../weights/resident.zig").loadWeightsFile;
 const NONE = A{ .ctx = null };
 
 const FINAL_LN_EPS: f32 = 1e-5;
+
+/// The rotate-half RoPE of the patch tokens and the heads-major layout in one pass (`ropeHeads`).
+pub const ROPE_SOURCE = kernelSource("kernels/rope/dinov3_rope.metal");
+var rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
+
+/// `y` `[1, L, H*D]` token-major as heads `[1, H, L, D]`, RoPE on all but its first `prefix` tokens (`cos`, `sin`
+/// `[L - prefix, D]` of y's dtype): bit-equal to the transpose then `Encoder.rope`. Null off the GPU.
+pub fn ropeHeads(y: A, cos: A, sin: A, heads: c_int, prefix: c_int, s: mlx.mlx_stream) !?A {
+    if (!mlx.streamIsGpu(s)) return null;
+    const dt = mlx.mlx_array_dtype(y);
+    if (dt != .float32 and dt != .float16 and dt != .bfloat16) return null;
+    if (mlx.mlx_array_dtype(cos) != dt or mlx.mlx_array_dtype(sin) != dt) return null;
+    const sh = mlx.getShape(y);
+    if (sh.len != 3 or sh[0] != 1 or @rem(sh[2], heads) != 0) return null;
+    const l = sh[1];
+    const d = @divExact(sh[2], heads);
+    const table: usize = @intCast(@max(l - prefix, 0) * d);
+    if (@rem(d, 2) != 0 or l < prefix or mlx.mlx_array_size(cos) != table or mlx.mlx_array_size(sin) != table) return null;
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_reshape(&rows, y, &[_]c_int{ l, sh[2] }, 2, s));
+    if (rope_kernel == null) {
+        const iv = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{ "X", "COS", "SIN" }, 3);
+        defer _ = mlx.mlx_vector_string_free(iv);
+        const ov = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{"O"}, 1);
+        defer _ = mlx.mlx_vector_string_free(ov);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_dinov3_rope", iv, ov, ROPE_SOURCE, "", true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        rope_kernel = k;
+    }
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, heads, l, d }, 4, dt));
+    const pairs = heads * @divExact(d, 2);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, pairs, l, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, @min(pairs, 256), 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "H", heads));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", d));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "P", prefix));
+    const iv = mlx.mlx_vector_array_new_data(&[_]A{ rows, cos, sin }, 3);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, rope_kernel.?, iv, cfg, s));
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_vector_array_get(&o, ov, 0));
+    return o;
+}
 pub const IMAGENET_MEAN = [3]f32{ 0.485, 0.456, 0.406 };
 pub const IMAGENET_STD = [3]f32{ 0.229, 0.224, 0.225 };
 
@@ -33,6 +85,8 @@ pub const Cfg = struct {
     registers: usize,
     rope_theta: f32,
     eps: f32,
+    /// SwiGLU feed-forward (`gate_proj`, `up_proj`, `down_proj`) instead of GELU (ViT-H+).
+    gated: bool = false,
 };
 
 const Layer = struct {
@@ -46,6 +100,7 @@ const Layer = struct {
     norm2_w: A,
     norm2_b: A,
     up: Linear,
+    gate: ?Linear,
     down: Linear,
     ls2: A,
 };
@@ -61,9 +116,14 @@ pub const Encoder = struct {
     patch_b: A,
     layers: []Layer,
     owned: std.ArrayList(A) = .empty,
+    /// The checkpoint's own final LayerNorm, applied before the non-affine one when set: what `last_hidden_state`
+    /// is in transformers (Idol reads it so; TRELLIS.2 reads the block output).
+    affine_final: bool = false,
+    /// The blocks' dtype: f32 as TRELLIS.2's extractor runs them, bf16 as Idol's does.
+    act: mlx.mlx_dtype = .float32,
 
-    /// `<dir>/config.json` + `<dir>/model.safetensors`.
-    pub fn open(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) !Encoder {
+    /// `<dir>/config.json` + `<dir>/model.safetensors`, the blocks run in `act`.
+    pub fn open(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, act: mlx.mlx_dtype) !Encoder {
         const cfg_path = try std.fmt.allocPrint(gpa, "{s}/config.json", .{dir});
         defer gpa.free(cfg_path);
         const bytes = try readFile(io, gpa, cfg_path);
@@ -82,7 +142,6 @@ pub const Encoder = struct {
         var parsed = try std.json.parseFromSlice(Raw, gpa, bytes, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         const r = parsed.value;
-        if (r.use_gated_mlp) return error.UnsupportedDinov3;
         if (r.hidden_size % r.num_attention_heads != 0 or (r.hidden_size / r.num_attention_heads) % 4 != 0) return error.UnsupportedDinov3;
         const w = try loadWeightsFile(gpa, dir, "model.safetensors");
         return load(gpa, w, .{
@@ -94,20 +153,35 @@ pub const Encoder = struct {
             .registers = r.num_register_tokens,
             .rope_theta = r.rope_theta,
             .eps = r.layer_norm_eps,
-        });
+            .gated = r.use_gated_mlp,
+        }, act);
     }
 
     /// Takes ownership of `w`.
-    pub fn load(gpa: std.mem.Allocator, w: Weights, cfg: Cfg) !Encoder {
-        var e = Encoder{ .gpa = gpa, .cfg = cfg, .w = w, .cls = undefined, .registers = undefined, .patch_w = undefined, .patch_b = undefined, .layers = try gpa.alloc(Layer, 0) };
+    pub fn load(gpa: std.mem.Allocator, w: Weights, cfg: Cfg, act: mlx.mlx_dtype) !Encoder {
+        var e = Encoder{ .gpa = gpa, .cfg = cfg, .w = w, .cls = undefined, .registers = undefined, .patch_w = undefined, .patch_b = undefined, .layers = try gpa.alloc(Layer, 0), .act = act };
         errdefer e.deinit();
         const hid: u32 = @intCast(cfg.hidden);
+        const s = mlx.gpuStream();
+        defer _ = mlx.mlx_stream_free(s);
+        // Every float weight in the blocks' dtype, cast once before the layers borrow their handles.
+        if (act != .float32) {
+            var it = e.w.map.valueIterator();
+            while (it.next()) |v| {
+                const dt = mlx.mlx_array_dtype(v.*);
+                if (dt == act or (dt != .float32 and dt != .float16 and dt != .bfloat16)) continue;
+                var o = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(o);
+                try mlx.check(mlx.mlx_astype(&o, v.*, act, s));
+                try mlx.check(mlx.mlx_array_eval(o));
+                _ = mlx.mlx_array_free(v.*);
+                v.* = o;
+            }
+        }
         e.cls = try scope_mod.getW(&e.w, "embeddings.cls_token", .{});
         e.registers = try scope_mod.getW(&e.w, "embeddings.register_tokens", .{});
         e.patch_b = try scope_mod.getW(&e.w, "embeddings.patch_embeddings.bias", .{});
         // Conv2d weight [out, in, kh, kw] -> [out, kh, kw, in] for MLX's channels-last conv.
-        const s = mlx.gpuStream();
-        defer _ = mlx.mlx_stream_free(s);
         var pw = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_transpose_axes(&pw, try scope_mod.getW(&e.w, "embeddings.patch_embeddings.weight", .{}), &[_]c_int{ 0, 2, 3, 1 }, 4, s));
         errdefer _ = mlx.mlx_array_free(pw);
@@ -132,6 +206,7 @@ pub const Encoder = struct {
                     .norm2_w = try scope_mod.getW(&e.w, pre ++ ".norm2.weight", .{i}),
                     .norm2_b = try scope_mod.getW(&e.w, pre ++ ".norm2.bias", .{i}),
                     .up = try scope_mod.linear(&e.w, pre ++ ".mlp.up_proj", .{i}, hid),
+                    .gate = if (cfg.gated) try scope_mod.linear(&e.w, pre ++ ".mlp.gate_proj", .{i}, hid) else null,
                     .down = try scope_mod.linear(&e.w, pre ++ ".mlp.down_proj", .{i}, @intCast(cfg.mlp)),
                     .ls2 = try scope_mod.getW(&e.w, pre ++ ".layer_scale2.lambda1", .{i}),
                 };
@@ -183,11 +258,11 @@ pub const Encoder = struct {
         const d: c_int = mlx.getShape(x)[3];
         const x1 = try sc.slice(x, 3, 0, @divExact(d, 2));
         const x2 = try sc.slice(x, 3, @divExact(d, 2), d);
-        return sc.concat(&.{ try sc.mulS(x2, -1), x1 }, 3);
+        return sc.concat(&.{ try sc.neg(x2), x1 }, 3);
     }
 
     /// RoPE on the patch tokens of `x` `[1, H, L, D]`; the prefix (CLS + registers) passes through.
-    fn rope(self: *const Encoder, sc: *Scope, x: A, cos: A, sin: A) !A {
+    pub fn rope(self: *const Encoder, sc: *Scope, x: A, cos: A, sin: A) !A {
         const l: c_int = mlx.getShape(x)[2];
         const p: c_int = @intCast(1 + self.cfg.registers);
         const patches = try sc.slice(x, 2, p, l);
@@ -202,33 +277,75 @@ pub const Encoder = struct {
         const hp: usize = @intCast(@divExact(sh[1], @as(c_int, @intCast(self.cfg.patch))));
         const wp: usize = @intCast(@divExact(sh[2], @as(c_int, @intCast(self.cfg.patch))));
         const hid: c_int = @intCast(self.cfg.hidden);
+        var o = mlx.mlx_array_new();
+        const conv = try sc.res(mlx.mlx_conv2d(&o, try asDtype(sc, image, self.act), self.patch_w, @intCast(self.cfg.patch), @intCast(self.cfg.patch), 0, 0, 1, 1, 1, sc.s), &o);
+        const patches = try sc.reshape(try sc.add(conv, self.patch_b), &.{ 1, @intCast(hp * wp), hid });
+        const embedded = try sc.concat(&.{ try asLike(sc, self.cls, patches), try asLike(sc, self.registers, patches), patches }, 1);
+        const f32_tables = try self.ropeTables(sc, hp, wp);
+        const cos = try asDtype(sc, f32_tables.cos, self.act);
+        const sin = try asDtype(sc, f32_tables.sin, self.act);
+        // A scope per block, one queued ahead: each block's buffers are free for the next, so a request touches one
+        // block's working set rather than all of them.
+        var cur: ?A = sc.out(embedded);
+        errdefer if (cur) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        for (self.layers) |*ly| {
+            var bs = Scope.init(sc.a, sc.s);
+            defer bs.deinit();
+            const y = try self.block(&bs, ly, cur.?, cos, sin);
+            try scope_mod.queue(y, cur.?);
+            _ = mlx.mlx_array_free(cur.?);
+            cur = bs.out(y);
+        }
+        const last = cur.?;
+        cur = null;
+        var h = try sc.keep(last);
+        if (self.affine_final) {
+            const w = try scope_mod.getW(&self.w, "norm.weight", .{});
+            const b = try scope_mod.getW(&self.w, "norm.bias", .{});
+            h = try sc.layerNorm(h, try asLike(sc, w, h), try asLike(sc, b, h), self.cfg.eps);
+        }
+        return sc.layerNorm(try asDtype(sc, h, .float32), NONE, NONE, FINAL_LN_EPS);
+    }
+
+    /// One pre-norm block on `h` `[1, L, hidden]`.
+    fn block(self: *const Encoder, sc: *Scope, ly: *const Layer, h: A, cos: A, sin: A) !A {
+        const l: c_int = mlx.getShape(h)[1];
+        const hid: c_int = @intCast(self.cfg.hidden);
         const heads: c_int = @intCast(self.cfg.heads);
         const hd: c_int = @intCast(self.headDim());
-        var o = mlx.mlx_array_new();
-        const conv = try sc.res(mlx.mlx_conv2d(&o, image, self.patch_w, @intCast(self.cfg.patch), @intCast(self.cfg.patch), 0, 0, 1, 1, 1, sc.s), &o);
-        const patches = try sc.reshape(try sc.add(conv, self.patch_b), &.{ 1, @intCast(hp * wp), hid });
-        var h = try sc.concat(&.{ try asLike(sc, self.cls, patches), try asLike(sc, self.registers, patches), patches }, 1);
-        const l: c_int = mlx.getShape(h)[1];
-        const tables = try self.ropeTables(sc, hp, wp);
         const perm = [_]c_int{ 0, 2, 1, 3 };
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(self.headDim())));
-        for (self.layers) |*ly| {
-            const x = try sc.layerNorm(h, try asLike(sc, ly.norm1_w, h), try asLike(sc, ly.norm1_b, h), self.cfg.eps);
-            const q = try self.rope(sc, try sc.transpose(try sc.reshape(try ly.q.forward(sc, x), &.{ 1, l, heads, hd }), &perm), tables.cos, tables.sin);
-            const k = try self.rope(sc, try sc.transpose(try sc.reshape(try ly.k.forward(sc, x), &.{ 1, l, heads, hd }), &perm), tables.cos, tables.sin);
-            const v = try sc.transpose(try sc.reshape(try ly.v.forward(sc, x), &.{ 1, l, heads, hd }), &perm);
-            const att = try sc.reshape(try sc.transpose(try sc.sdpa(q, k, v, scale), &perm), &.{ 1, l, hid });
-            h = try sc.add(h, try sc.mul(try ly.o.forward(sc, att), try asLike(sc, ly.ls1, h)));
-            const y = try sc.layerNorm(h, try asLike(sc, ly.norm2_w, h), try asLike(sc, ly.norm2_b, h), self.cfg.eps);
-            const m = try ly.down.forward(sc, try sc.geluErf(try ly.up.forward(sc, y)));
-            h = try sc.add(h, try sc.mul(m, try asLike(sc, ly.ls2, h)));
-        }
-        return sc.layerNorm(h, NONE, NONE, FINAL_LN_EPS);
+        const x = try sc.layerNorm(h, try asLike(sc, ly.norm1_w, h), try asLike(sc, ly.norm1_b, h), self.cfg.eps);
+        const q = try self.headsRoped(sc, try ly.q.forward(sc, x), cos, sin);
+        const k = try self.headsRoped(sc, try ly.k.forward(sc, x), cos, sin);
+        const v = try sc.transpose(try sc.reshape(try ly.v.forward(sc, x), &.{ 1, l, heads, hd }), &perm);
+        const att = try sc.reshape(try sc.transpose(try sc.sdpa(q, k, v, scale), &perm), &.{ 1, l, hid });
+        const h1 = try sc.add(h, try sc.mul(try ly.o.forward(sc, att), try asLike(sc, ly.ls1, h)));
+        const y = try sc.layerNorm(h1, try asLike(sc, ly.norm2_w, h1), try asLike(sc, ly.norm2_b, h1), self.cfg.eps);
+        const up = try ly.up.forward(sc, y);
+        const act = if (ly.gate) |g| try sc.mul(try sc.silu(try g.forward(sc, y)), up) else try sc.geluErf(up);
+        const m = try ly.down.forward(sc, act);
+        return sc.add(h1, try sc.mul(m, try asLike(sc, ly.ls2, h1)));
+    }
+
+    /// A q or k projection `[1, L, hidden]` as heads `[1, H, L, D]` with the patch tokens rotated.
+    fn headsRoped(self: *const Encoder, sc: *Scope, y: A, cos: A, sin: A) !A {
+        const heads: c_int = @intCast(self.cfg.heads);
+        const prefix: c_int = @intCast(1 + self.cfg.registers);
+        if (try ropeHeads(y, cos, sin, heads, prefix, sc.s)) |o| return sc.keep(o);
+        const l: c_int = mlx.getShape(y)[1];
+        const heads_first = try sc.transpose(try sc.reshape(y, &.{ 1, l, heads, @intCast(self.headDim()) }), &.{ 0, 2, 1, 3 });
+        return self.rope(sc, heads_first, cos, sin);
     }
 };
 
 fn asLike(sc: *Scope, x: A, like: A) !A {
-    const dt = mlx.mlx_array_dtype(like);
+    return asDtype(sc, x, mlx.mlx_array_dtype(like));
+}
+
+fn asDtype(sc: *Scope, x: A, dt: mlx.mlx_dtype) !A {
     return if (mlx.mlx_array_dtype(x) == dt) x else sc.astype(x, dt);
 }
 
@@ -256,6 +373,17 @@ pub fn preprocess(gpa: std.mem.Allocator, rgb: []const u8, w: u32, h: u32, size:
 
 const testing = std.testing;
 
+test "dinov3: RoPE keeps a bf16 head in bf16" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var sc = Scope.init(testing.allocator, s);
+    defer sc.deinit();
+    const enc: Encoder = .{ .gpa = testing.allocator, .cfg = .{ .hidden = 8, .heads = 1, .layers = 0, .mlp = 8, .patch = 16, .registers = 0, .rope_theta = 100, .eps = 1e-5 }, .w = undefined, .cls = undefined, .registers = undefined, .patch_w = undefined, .patch_b = undefined, .layers = &.{} };
+    const x = try sc.astype(try sc.zeros(&.{ 1, 1, 5, 8 }, .float32), .bfloat16);
+    const t = try sc.astype(try sc.zeros(&.{ 4, 8 }, .float32), .bfloat16);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(try enc.rope(&sc, x, t, t)));
+}
+
 test "dinov3 preprocess: a flat image keeps its value through the resize and is ImageNet-normalized" {
     const gpa = testing.allocator;
     const src = try gpa.alloc(u8, 5 * 7 * 3);
@@ -278,7 +406,7 @@ test "dinov3 oracle: every token matches transformers' DINOv3ViTModel on a tiny 
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try std.fmt.allocPrint(gpa, "{s}/dinov3_tiny", .{fixtures});
     defer gpa.free(dir);
-    var enc = try Encoder.open(io, gpa, dir);
+    var enc = try Encoder.open(io, gpa, dir, .float32);
     defer enc.deinit();
     var fx = try loadWeightsFile(gpa, fixtures, "dinov3.safetensors");
     defer fx.deinit();
@@ -333,7 +461,7 @@ test "dinov3: a checkpoint missing its tensors is a named error and frees its we
     try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"hidden_size\":64,\"intermediate_size\":128,\"num_hidden_layers\":1,\"num_attention_heads\":4}" });
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const dir = path_buf[0..try td.dir.realPath(io, &path_buf)];
-    if (Encoder.open(io, testing.allocator, dir)) |*e| {
+    if (Encoder.open(io, testing.allocator, dir, .float32)) |*e| {
         var enc = e.*;
         enc.deinit();
         return error.TestUnexpectedResult;

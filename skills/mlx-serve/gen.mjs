@@ -25,6 +25,8 @@ Generate (picks the model by capability from /v1/models; --model <id> overrides)
   node gen.mjs sound "<prompt>" -o door.wav [--duration 2]
   node gen.mjs 3d "<object prompt>" -o lantern.glb [--height 1.6] [--max-tris 8000] [--max-texture 2048] [--quantize] [--vehicle] [--roughness-scale 0.5 --clearcoat 0.6] [--resolution 512]
   node gen.mjs 3d ref.png -o lantern.glb          (from an image of one object)
+                                    -> Idol is the default 3D model: without it the command stops and says how to download it;
+                                       --model <id> names another (TRELLIS.2 for a textured mesh with a triangle budget)
   node gen.mjs batch assets.json [--force] [--keep-loaded]
   node gen.mjs models
 
@@ -76,7 +78,13 @@ const WANTS = {
   video: (m) => has(m, "video"),
 };
 // Several models qualify: a clip is cut in from a still, which is MiniMax-H3's first-frame pack (REF2VA takes no frame).
-const PREFER = { video: /fl2va/i, "3d": /trellis/i };
+const PREFER = { video: /fl2va/i, "3d": /idol/i };
+// A kind whose preferred model is its DEFAULT: when it is not installed the user is told to download it, never handed another
+// model unasked (Idol needs about 6 GB of GPU memory beside the chat model, a mesh model 22 GB or more).
+const MISSING = {
+  "3d": "Idol, the default 3D model, is not installed: download it in the MLX Core app (Models > Media > 3D, about 3 GB), "
+    + "or run `mlx-serve pull ddalcu/Idol-MLX-Serve-8bit` and POST /v1/models/rescan; --model <id> picks another 3D model",
+};
 
 let modelList = null;
 export async function listModels() {
@@ -93,8 +101,10 @@ export async function pickModel(kind, explicit, prefer = PREFER[kind]) {
   if (explicit) return explicit;
   const rank = (m) => (m.state === "ready" ? 0 : m.state === "remote" ? 2 : 1);
   const found = (await listModels()).filter(WANTS[kind]).sort((a, b) => rank(a) - rank(b));
+  const preferred = prefer && found.find((m) => prefer.test(m.id));
+  if (!preferred && MISSING[kind]) throw new Error(MISSING[kind] + (found.length ? ` (installed: ${found.map((m) => m.id).join(", ")})` : ""));
   if (!found.length) throw new Error(`no model with the ${kind} capability: download one in the MLX Core app (Models)`);
-  return ((prefer && found.find((m) => prefer.test(m.id))) || found[0]).id;
+  return (preferred || found[0]).id;
 }
 
 /** POST a streamed media job; returns the SSE `complete` event. */
@@ -344,9 +354,14 @@ async function runBatch(specFile, opts) {
   const manifest = existsSync(manifestFile) ? JSON.parse(readFileSync(manifestFile, "utf8")) : { assets: {} };
   manifest.generated_by = "mlx-serve gen.mjs";
   let failed = 0;
+  // Every job's model is settled before the first job runs: a missing one (Idol, say) stops the batch before it spends minutes.
+  const models = [];
   for (const job of spec.jobs || []) {
     if (!job.id || !job.type) throw new Error(`every job needs "id" and "type": ${JSON.stringify(job)}`);
-    const model = await pickModel(job.type, job.model);
+    models.push(await pickModel(job.type, job.model));
+  }
+  for (const [i, job] of (spec.jobs || []).entries()) {
+    const model = models[i];
     const hash = createHash("sha256").update(JSON.stringify({ job, model })).digest("hex").slice(0, 16);
     const prev = manifest.assets[job.id];
     if (!opts.force && prev?.hash === hash && Object.values(prev.files).every((f) => existsSync(join(out, f)))) {

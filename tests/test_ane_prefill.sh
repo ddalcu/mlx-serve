@@ -10,10 +10,11 @@
 #
 # SKIPs when the private framework is absent. Hermetic twins: unitCount / bankGroupLen / engineBillBytes /
 # gateAllows in sdk/ane/offload.zig, anePropsJson.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
-MODEL="${1:-${ANE_PREFILL_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}}"
+MODEL="${1:-${ANE_PREFILL_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}}"
 PORT="${2:-8098}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"

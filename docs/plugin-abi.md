@@ -530,6 +530,7 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `accept_cap` | `u32` | `0` | A native drafter's round (`NativeDrafter.step`): the most drafts it may keep, the tokens still allowed less one. |
 | `suppress_mask` | `Array` | `.{}` | The sampler's suppress mask `[vocab]` (true = never drawn), which a round's greedy accept applies; empty = none. |
 | `embeds` | `Array` | `.{}` | Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`); empty = embed the ids. |
+| `progress` | `?*u64` | `null` | A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching. |
 
 ### `Offload` (extern struct)
 
@@ -860,6 +861,8 @@ Every hook runs on the inference thread, `tower` in the same encode as the `prep
 | `placeholder_rows` | `?*const fn (p: *const Parsed, item: *const MediaItem, tok: *const TextTokens, out: [*]u32, cap: u32) callconv(.c) u32` | `null` | Writes the token run replacing the item's one placeholder into `out` (`cap` entries); returns its length, 0 when it does not fit. Null: `rows` of the kind's placeholder id. |
 | `positions` | `?*const fn (p: *const Parsed, ids: Span(u32), items: Span(MediaItem), out: *Array) callconv(.c) Verdict` | `null` | The M-RoPE table over the expanded prompt `ids`. |
 | `video_prune` | `?*const fn (m: *anyopaque, item: *const MediaItem, rows: Array, out: *Array) callconv(.c) Verdict` | `null` |  |
+| `word_times` | `?*const fn (m: *anyopaque, pcm: Span(f32), units: Span(Str), activity: Span(f32), speakers: u32, out: *Span(u32)) callconv(.c) Verdict` | `null` | Times a transcript over its clip (16 kHz mono f32 `pcm`): `units` are its words in spoken order (a `<spk:N>` turn tag is a unit of its own); `activity` is the clip's `[frames][speakers]` 10 ms speaker probabilities (empty = no speaker information). Writes 3 values per unit into `out`, plugin-owned until the next call: a start and an end in ms from the clip's start, and the speaker's column (`u32` max = none). |
+| `diarize` | `?*const fn (m: *anyopaque, pcm: Span(f32), speakers: *u32, out: *Span(f32)) callconv(.c) Verdict` | `null` | Speaker activity over the clip: `speakers` and f32 probabilities [frames][speakers], one row per 10 ms into `out` (plugin-owned until the next call). |
 
 ### `SpeechSampling` (extern struct)
 

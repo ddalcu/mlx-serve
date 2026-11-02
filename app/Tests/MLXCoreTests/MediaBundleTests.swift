@@ -154,6 +154,26 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
+    /// Qwen-Image-2.1 as Qwen publishes it (and as mlx-community mirrors it): no root
+    /// `config.json`, which the server classifies by `model_index.json` alone.
+    func testQwenImageOfficialLayoutReadyWithoutRootConfig() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "qwenimagetest-\(UUID().uuidString)"
+        let comp = ImageModelPreset.qwenImage21_8bit.asCustom(id: "Qwen-Image-2.1-Turbo").bundle.components[0]
+        let modelDir = (root as NSString).appendingPathComponent(comp.repo)
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("model_index.json"),
+                      contents: Data(#"{"_class_name":"QwenImage21Pipeline"}"#.utf8))
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        for sub in ["transformer", "vae", "text_encoder", "processor", "scheduler"] {
+            try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("transformer/diffusion_pytorch_model.safetensors"), contents: Data([0, 1, 2]))
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
     // MARK: - Bundle mappings
 
     func testLtxBundleBundlesGemmaDependency() {
@@ -669,6 +689,20 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
+    func testIdolIsAPublishedPackWhoseBundleNamesEveryFileTheServerLoads() {
+        let p = Model3DModelPreset.idol_8bit
+        XCTAssertEqual(p.repo, "ddalcu/Idol-MLX-Serve-8bit")
+        XCTAssertFalse(p.isLocalOnly)
+        XCTAssertEqual(p.family, .idol)
+        let comp = p.bundle.components[0]
+        for f in ["config.json", "denoiser.safetensors", "decoder.safetensors", "decoder_gs.safetensors",
+                  "birefnet.safetensors", "dinov3/config.json", "dinov3/model.safetensors", "vae/model.safetensors"] {
+            XCTAssertTrue(comp.readyMarkers.contains(f), f)
+        }
+        // Twin of the idol plugin's `required_file`: the FLUX.2 VAE lands last.
+        XCTAssertEqual(DownloadManager.requiredMediaMarker(modelType: "idol"), "vae/model.safetensors")
+    }
+
     func testThePublishedTrellisPacksAreCatalogEntriesThatFetchOnlyWhatTheyServe() {
         XCTAssertEqual(Model3DModelPreset.trellis2_8bit.repo, "ddalcu/TRELLIS.2-4B-MLX-Serve-8bit")
         XCTAssertEqual(Model3DModelPreset.pixal3d_8bit.repo, "ddalcu/Pixal3D-MLX-Serve-8bit")
@@ -858,6 +892,7 @@ final class MediaBundleTests: XCTestCase {
         assertUnique(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertUnique(VideoModelPreset.all, "video")
         assertUnique(MusicModelPreset.all, "music")
+        assertUnique(Model3DModelPreset.modelBrowserCatalog, "3d")
     }
 
     /// Every preset resolves to a real bundle with a primary repo and a
@@ -873,6 +908,7 @@ final class MediaBundleTests: XCTestCase {
         assertDisplayable(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDisplayable(VideoModelPreset.all, "video")
         assertDisplayable(MusicModelPreset.all, "music")
+        assertDisplayable(Model3DModelPreset.modelBrowserCatalog, "3d")
     }
 
     /// Every preset needs a real, non-stub plain-English description — the
@@ -888,6 +924,12 @@ final class MediaBundleTests: XCTestCase {
         assertDescribed(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDescribed(VideoModelPreset.all, "video")
         assertDescribed(MusicModelPreset.all, "music")
+        assertDescribed(Model3DModelPreset.modelBrowserCatalog, "3d")
+    }
+
+    /// 3D has a catalogue of four for its Create pane, but the Media tab lists the recommended model alone.
+    func testTheMediaTabListsOnlyIdolFor3D() {
+        XCTAssertEqual(Model3DModelPreset.modelBrowserCatalog, [.idol_8bit])
     }
 
     // MARK: - MediaModelPreset.meetsSystemRequirements

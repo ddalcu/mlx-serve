@@ -102,4 +102,107 @@ final class GLBMeshLoaderTests: XCTestCase {
         XCTAssertNotNil(material.diffuse.contents as? NSImage,
                         "albedo texture did not decode into the diffuse slot")
     }
+
+    // MARK: - Gaussian splat (Idol)
+
+    /// A GLB the way the server's splat writer lays one out: one POINTS primitive, `COLOR_0` as normalized bytes.
+    private func splatGlb(points: [(Float, Float, Float)], colors: [[UInt8]]) throws -> URL {
+        func le(_ v: UInt32) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+        var bin = Data()
+        for p in points { for v in [p.0, p.1, p.2] { bin.append(withUnsafeBytes(of: v.bitPattern.littleEndian) { Data($0) }) } }
+        let colorOffset = bin.count
+        for c in colors { bin.append(contentsOf: c) }
+        while bin.count % 4 != 0 { bin.append(0) }
+        let json: [String: Any] = [
+            "asset": ["version": "2.0"],
+            "extensionsUsed": ["KHR_gaussian_splatting"],
+            "buffers": [["byteLength": bin.count]],
+            "bufferViews": [["buffer": 0, "byteOffset": 0, "byteLength": colorOffset],
+                            ["buffer": 0, "byteOffset": colorOffset, "byteLength": colors.count * 4]],
+            "accessors": [["bufferView": 0, "componentType": 5126, "count": points.count, "type": "VEC3"],
+                          ["bufferView": 1, "componentType": 5121, "normalized": true, "count": colors.count, "type": "VEC4"]],
+            "meshes": [["primitives": [["mode": 0, "attributes": ["POSITION": 0, "COLOR_0": 1],
+                                        "extensions": ["KHR_gaussian_splatting": ["kernel": "ellipse", "colorSpace": "srgb_rec709_display"]]]]]],
+        ]
+        var body = try JSONSerialization.data(withJSONObject: json)
+        while body.count % 4 != 0 { body.append(0x20) }
+        var out = le(0x46546C67) + le(2) + le(UInt32(12 + 8 + body.count + 8 + bin.count))
+        out += le(UInt32(body.count)) + le(0x4E4F534A) + body + le(UInt32(bin.count)) + le(0x004E4942) + bin
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("splat-\(UUID().uuidString).glb")
+        try out.write(to: url)
+        return url
+    }
+
+    func testASplatGlbPreviewsAsColouredPointsAndDropsTheNearlyTransparentOnes() throws {
+        let url = try splatGlb(points: [(0, 0, 0), (0.1, 0.2, 0.3), (-0.2, 0.1, 0)],
+                               colors: [[255, 0, 0, 255], [0, 255, 0, 200], [0, 0, 255, 10]])
+        defer { try? FileManager.default.removeItem(at: url) }
+        let scene = try XCTUnwrap(GLBMeshLoader.loadScene(url: url))
+        let geo = try XCTUnwrap(GLBMeshLoader.firstGeometryNode(in: scene)?.geometry)
+        XCTAssertEqual(geo.elements.first?.primitiveType, .point)
+        // The third point's opacity is 10/255: left out.
+        XCTAssertEqual(try XCTUnwrap(geo.sources(for: .vertex).first).vectorCount, 2)
+        let colour = try XCTUnwrap(geo.sources(for: .color).first)
+        XCTAssertEqual(colour.vectorCount, 2)
+        XCTAssertEqual(colour.componentsPerVector, 4)
+    }
+
+    /// A splat GLB with the extension's own attributes (linear opacity and scale, quaternion x y z w, SH0).
+    private func fullSplatGlb() throws -> Data {
+        func le(_ v: UInt32) -> Data { withUnsafeBytes(of: v.littleEndian) { Data($0) } }
+        func f(_ xs: [Float]) -> Data { xs.withUnsafeBytes { Data($0) } }
+        var bin = Data()
+        var views: [[String: Any]] = []
+        var accessors: [[String: Any]] = []
+        let attrs: [(String, String, [Float])] = [
+            ("POSITION", "VEC3", [0.1, 0.2, 0.3]),
+            ("KHR_gaussian_splatting:ROTATION", "VEC4", [0.5, 0, 0, Float(0.75).squareRoot()]),
+            ("KHR_gaussian_splatting:SCALE", "VEC3", [0.01, 0.02, 0.03]),
+            ("KHR_gaussian_splatting:OPACITY", "SCALAR", [0.5]),
+            ("KHR_gaussian_splatting:SH_DEGREE_0_COEF_0", "VEC3", [0.25, -0.5, 1.0]),
+        ]
+        var map: [String: Int] = [:]
+        for (i, a) in attrs.enumerated() {
+            views.append(["buffer": 0, "byteOffset": bin.count, "byteLength": a.2.count * 4])
+            accessors.append(["bufferView": i, "componentType": 5126, "count": 1, "type": a.1])
+            bin.append(f(a.2))
+            map[a.0] = i
+        }
+        let json: [String: Any] = [
+            "asset": ["version": "2.0"], "buffers": [["byteLength": bin.count]], "bufferViews": views, "accessors": accessors,
+            "meshes": [["primitives": [["mode": 0, "attributes": map, "extensions": ["KHR_gaussian_splatting": ["kernel": "ellipse"]]]]]],
+        ]
+        var body = try JSONSerialization.data(withJSONObject: json)
+        while body.count % 4 != 0 { body.append(0x20) }
+        return le(0x46546C67) + le(2) + le(UInt32(12 + 8 + body.count + 8 + bin.count))
+            + le(UInt32(body.count)) + le(0x4E4F534A) + body + le(UInt32(bin.count)) + le(0x004E4942) + bin
+    }
+
+    func testASplatGlbExportsAsTheStandardPly() throws {
+        let ply = try XCTUnwrap(SplatPLYExport.ply(fromGLB: try fullSplatGlb()))
+        let end = try XCTUnwrap(ply.range(of: Data("end_header\n".utf8))).upperBound
+        let header = String(decoding: ply.prefix(end), as: UTF8.self)
+        XCTAssertTrue(header.hasPrefix("ply\nformat binary_little_endian 1.0\nelement vertex 1\n"))
+        XCTAssertEqual(header.components(separatedBy: "property float ").count - 1, 17)
+        XCTAssertEqual(ply.count, end + 17 * 4)
+        let row: [Float] = ply.suffix(from: end).withUnsafeBytes { raw in (0..<17).map { raw.loadUnaligned(fromByteOffset: $0 * 4, as: Float.self) } }
+        // glTF y-up back to the reference's PLY axes: (x, y, z) -> (x, -y, -z).
+        XCTAssertEqual(row[0], 0.1, accuracy: 1e-6)
+        XCTAssertEqual(row[1], -0.2, accuracy: 1e-6)
+        XCTAssertEqual(row[2], -0.3, accuracy: 1e-6)
+        XCTAssertEqual(row[6], 0.25, accuracy: 1e-6)          // SH0 as stored
+        XCTAssertEqual(row[9], 0, accuracy: 1e-6)             // logit(0.5)
+        XCTAssertEqual(row[10], logf(0.01), accuracy: 1e-5)   // log scale
+        XCTAssertNil(SplatPLYExport.ply(fromGLB: Data([1, 2, 3])))
+    }
+
+    func testASplatWithRotationAndScaleBecomesOneOrientedDiscPerGaussian() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("disc-\(UUID().uuidString).glb")
+        try fullSplatGlb().write(to: url)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let geo = try XCTUnwrap(GLBMeshLoader.firstGeometryNode(in: try XCTUnwrap(GLBMeshLoader.loadScene(url: url)))?.geometry)
+        XCTAssertEqual(geo.elements.first?.primitiveType, .triangles)
+        XCTAssertEqual(try XCTUnwrap(geo.sources(for: .vertex).first).vectorCount, 4, "a quad per Gaussian")
+        XCTAssertEqual(geo.elements.first?.primitiveCount, 2)
+    }
 }

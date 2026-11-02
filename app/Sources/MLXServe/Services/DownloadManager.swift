@@ -371,6 +371,7 @@ class DownloadManager: ObservableObject {
         case "moss_image": return "vae/diffusion_pytorch_model.safetensors"
         case "trellis2": return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"
         case "pixal3d": return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"
+        case "idol": return "vae/model.safetensors"
         default: return nil
         }
     }
@@ -402,6 +403,7 @@ class DownloadManager: ObservableObject {
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
         if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
+        if isIdolConfig(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "idol" }
         if isPixal3dPipeline(inDir: dir) { return "pixal3d" }
         if isTrellis2Pipeline(atPath: (dir as NSString).appendingPathComponent("pipeline.json")) { return "trellis2" }
         if qwen3AsrThinker(dir) == "qwen3_forced_aligner" { return "qwen3_forced_aligner" }
@@ -415,6 +417,14 @@ class DownloadManager: ObservableObject {
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let map = cfg["auto_map"] as? [String: Any] else { return false }
         return map["AutoModel"] as? String == "modeling_d1.D1Model"
+    }
+
+    /// speridlabs' Idol release: its config.json has no `model_type`, its denoiser's class name tells it. Twin of the
+    /// idol plugin's `claims`.
+    nonisolated static func isIdolConfig(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return false }
+        return (cfg["denoiser"] as? [String: Any])?["name"] as? String == "LatentSeqMMFlowModel"
     }
 
     /// Microsoft's TRELLIS.2 image-to-3D pack: no root config.json, its `pipeline.json` names the pipeline.
@@ -2056,7 +2066,7 @@ class DownloadManager: ObservableObject {
         guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("model.safetensors.index.json")),
               let text = String(data: data, encoding: .utf8) else { return false }
         return ["\"mtp.fc.weight\"", "\"language_model.mtp.fc.weight\"", "\"mtp.eh_proj.weight\"",
-                "\"language_model.mtp.eh_proj.weight\"", "\"language_model.mtp.fc_hidden.weight\""]
+                "\"language_model.mtp.eh_proj.weight\"", "\"language_model.mtp.fc_hidden.weight\"", "\"mtp.fc_hidden.weight\""]
             .contains { text.contains($0) }
     }
 

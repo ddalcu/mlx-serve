@@ -695,6 +695,9 @@ pub const Sink = struct {
     out_impl: *anyopaque,
     outFn: *const fn (impl: *anyopaque, data: []const u8) anyerror!void,
     nowMsFn: *const fn (impl: *anyopaque) i64,
+    /// The reply went out whole with a Content-Length: the route marks the conn (`Conn.length_framed`) so its close
+    /// does not wait for the peer.
+    length_framed: bool = false,
 
     buf: std.ArrayList(u8) = .empty,
     headers_done: bool = false,
@@ -1050,6 +1053,7 @@ pub const Sink = struct {
         try w.writeAll("Connection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
         try w.writeAll(body);
         try self.outFn(self.out_impl, out.written());
+        self.length_framed = true;
     }
 };
 
@@ -1358,6 +1362,8 @@ test "ollama: sink streams chat NDJSON" {
 
     try feedStandardChatStream(&sink);
     try sink.finish();
+    // NDJSON has no Content-Length: the conn's close must wait for the peer.
+    try testing.expect(!sink.length_framed);
 
     try testing.expect(std.mem.startsWith(u8, out.buf.items, "HTTP/1.1 200 OK"));
     try testing.expect(std.mem.indexOf(u8, out.buf.items, "application/x-ndjson") != null);
@@ -1397,6 +1403,8 @@ test "ollama: sink aggregates non-stream chat" {
 
     try testing.expect(std.mem.indexOf(u8, out.buf.items, "Content-Type: application/json") != null);
     try testing.expect(std.mem.indexOf(u8, out.buf.items, "Content-Length:") != null);
+    // A Content-Length reply closes at once (`Conn.length_framed`), never waiting minutes for the peer.
+    try testing.expect(sink.length_framed);
     var parsed = try parseTestJson(allocator, out.body());
     defer parsed.deinit();
     const root = parsed.value.object;

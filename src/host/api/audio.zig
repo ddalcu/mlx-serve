@@ -13,6 +13,7 @@ const scheduler_mod = @import("../gpu_thread/requests.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const transcription_mod = @import("audio/transcription.zig");
 const forced_align_mod = @import("../../plugins/qwen3_asr/forced_align.zig");
+const err_name = @import("../../sdk/util/err_name.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const PluginEngine = @import("../media_jobs/plugin/engine.zig").Engine;
 const plugin_http = @import("../media_jobs/plugin/http.zig");
@@ -79,6 +80,10 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "this model's transcription takes no 'prompt': send the language alone", 400);
         return;
     }
+    if (form.prompt != null and form.language != null and lm.config.?.isNemoSpeech()) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "this model's context recipe names no language: send 'prompt' or 'language', not both", 400);
+        return;
+    }
     const pcm = transcription_mod.decodeWav(allocator, form.file) catch |err| {
         log.warn("POST /v1/audio/transcriptions -> 400 (audio: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "`file` must be a WAV file (16- or 24-bit PCM, or 32-bit float)", 400);
@@ -88,8 +93,11 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
     const seconds = @as(f64, @floatFromInt(pcm.len)) / transcription_mod.SAMPLE_RATE;
     log.info("POST /v1/audio/transcriptions ({d:.1} s, language={s}, format={s}, prompt={d}b)\n", .{ seconds, form.language orelse "auto", @tagName(form.format), if (form.prompt) |p| p.len else 0 });
 
-    var aligner: ?Aligner = if (transcription_mod.timed(form.format)) try findAligner(allocator) else null;
-    if (aligner == null and (form.format == .srt or form.format == .vtt)) {
+    // A speech model that times and tells speakers apart itself (Nemotron Transcribe's CTC head and speaker expert) needs
+    // neither companion.
+    const own = lm.config.?.isNemoSpeech();
+    var aligner: ?Aligner = if (!own and transcription_mod.timed(form.format)) try findAligner(allocator) else null;
+    if (!own and aligner == null and (form.format == .srt or form.format == .vtt)) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "srt and vtt need word times from Qwen3-ForcedAligner, which is not on disk or did not load: download " ++ ALIGNER_REPO ++ " beside the ASR model", 400);
         return;
     }
@@ -99,7 +107,9 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
     var diarizer: ?*LoadedModel = null;
     defer if (diarizer) |m| http_server.launch().global_scheduler.?.release(m);
     var speakers: u32 = 0;
-    if (form.format == .diarized_json) {
+    if (own and form.format == .diarized_json) {
+        speaker_probs = (try diarizeOwn(allocator, stream, lm, pcm, &speakers)) orelse return;
+    } else if (form.format == .diarized_json) {
         const id = (findCompanion("nemotron_diarization") orelse {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "diarized_json needs Nemotron 3 Diarization, which is not on disk or did not load: download " ++ DIARIZER_REPO ++ " beside the ASR model", 400);
             return;
@@ -112,7 +122,8 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
     }
     const who: ?transcription_mod.Activity = if (speaker_probs) |p| .{ .probs = p, .speakers = speakers } else null;
 
-    const piece_seconds: usize = if (aligner != null) transcription_mod.ALIGN_MAX_SECONDS else TRANSCRIPTION_MAX_SECONDS;
+    const times_words = aligner != null or (own and transcription_mod.timed(form.format));
+    const piece_seconds: usize = if (times_words) transcription_mod.ALIGN_MAX_SECONDS else TRANSCRIPTION_MAX_SECONDS;
     const ends = try transcription_mod.splitPoints(allocator, pcm, piece_seconds * transcription_mod.SAMPLE_RATE);
     defer allocator.free(ends);
 
@@ -126,6 +137,9 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
         const t = heard.t;
         var timed: ?Aligned = null;
         defer if (timed) |*x| x.deinit(allocator);
+        if (own and transcription_mod.timed(form.format) and t.text.len > 0) {
+            timed = (try alignOwn(allocator, stream, lm, pcm[start..end], t.text, who, start * 1000 / transcription_mod.SAMPLE_RATE, form.format != .srt and form.format != .vtt)) orelse return;
+        }
         if (aligner) |*al| {
             if (t.text.len > 0 and al.languages & transcription_mod.languageBit(t.language orelse "") != 0) {
                 if (al.lm == null) al.lm = http_server.launch().global_scheduler.?.ensureLoaded(al.id) catch |err| blk: {
@@ -143,7 +157,7 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
         }
         const rate: f64 = transcription_mod.SAMPLE_RATE;
         const speaker = if (who) |w| w.speakerOver(start * 1000 / transcription_mod.SAMPLE_RATE, end * 1000 / transcription_mod.SAMPLE_RATE, 0) else 0;
-        try tl.add(allocator, t.text, t.language, @as(f64, @floatFromInt(start)) / rate, @as(f64, @floatFromInt(end - start)) / rate, if (timed) |x| x.words else null, if (timed) |x| x.segments else null, speaker);
+        try tl.add(allocator, if (timed) |x| (x.text orelse t.text) else t.text, t.language, @as(f64, @floatFromInt(start)) / rate, @as(f64, @floatFromInt(end - start)) / rate, if (timed) |x| x.words else null, if (timed) |x| x.segments else null, speaker);
         start = end;
     }
 
@@ -182,7 +196,7 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
     const config = lm.config.?;
     const tok = lm.tokenizer.?;
     const audio = chat_mod.AudioData{ .samples = std.mem.sliceAsBytes(pcm) };
-    var prompt_ids = if (config.speech() != null) try speechModelPrompt(allocator, stream, lm, form, &audio) else blk: {
+    var prompt_ids = if (config.speech() != null) try speechModelPrompt(allocator, stream, lm, form, &audio) else if (config.isNemoSpeech()) try nemoSpeechPrompt(allocator, stream, lm, form, &audio) else blk: {
         const prompt_text = try transcription_mod.buildPrompt(allocator, form.prompt, form.language);
         defer allocator.free(prompt_text);
         break :blk try encodeText(allocator, lm, tok, prompt_text, false);
@@ -211,9 +225,11 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
     const slot_ve = mm.embeddings;
     mm.embeddings = null;
     const enable_thinking = false;
+    // Nemotron Transcribe drafts with its own MTP head (a transcript is what it predicts best); the rest decode plainly.
     const spec = false;
+    const mtp = config.isNemoSpeech();
     var timer = Stopwatch.init(stream.io);
-    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, spec, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, null, stream) catch |err| {
+    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, mtp, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, null, stream) catch |err| {
         log.err("  -> {s}\n", .{@errorName(err)});
         sendGenerationError(allocator, stream, err, .openai) catch {};
         return null;
@@ -314,6 +330,14 @@ fn speechModelPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedMod
     return cachedFormatChat(allocator, stream.io, lm, lm.tokenizer.?, lm.chat_config.?, &msgs, null, null, false, null, false);
 }
 
+/// Nemotron 3.5 Transcribe's card recipe as the user turn over the clip, thinking off (the template's `<think></think>`).
+fn nemoSpeechPrompt(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, form: transcription_mod.Form, audio: *const chat_mod.AudioData) ![]u32 {
+    const instruction = try transcription_mod.nemoPrompt(allocator, form.prompt, form.language, form.format == .diarized_json);
+    defer allocator.free(instruction);
+    const msgs = [_]chat_mod.Message{.{ .role = "user", .content = instruction, .audio = (audio)[0..1] }};
+    return cachedFormatChat(allocator, stream.io, lm, lm.tokenizer.?, lm.chat_config.?, &msgs, null, null, false, null, false);
+}
+
 /// The forced aligner a timed transcription uses: its registry id, the
 /// languages its config lists, and the model once loaded (refcounted).
 const Aligner = struct { id: []const u8, languages: u32, lm: ?*LoadedModel = null };
@@ -353,9 +377,12 @@ fn findAligner(allocator: std.mem.Allocator) !?Aligner {
 const Aligned = struct {
     words: []const forced_align_mod.Timed,
     segments: []const forced_align_mod.Segment,
+    /// The piece's text as its spans read it, when that is not the transcript as heard (turn tags dropped).
+    text: ?[]u8 = null,
     fn deinit(self: *Aligned, allocator: std.mem.Allocator) void {
         allocator.free(self.words);
         allocator.free(self.segments);
+        if (self.text) |t| allocator.free(t);
     }
 };
 
@@ -412,6 +439,170 @@ fn alignPiece(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm
     const segments = try forced_align_mod.segments(allocator, text, words, said_by);
     log.info("  aligned {d} words into {d} segments ({d} tokens, {d}ms)\n", .{ words.len, segments.len, ids.len, timer.read() / std.time.ns_per_ms });
     return .{ .words = words, .segments = segments };
+}
+
+/// `<spk:N>`: a turn tag of the speaker-attributed transcript, never a word.
+fn isSpeakerTag(w: []const u8) bool {
+    return w.len > 6 and std.ascii.startsWithIgnoreCase(w, "<spk:") and w[w.len - 1] == '>';
+}
+
+/// The words of `text` (a t-SOT transcript: whitespace words, `<spk:N>` turn tags among them) timed by the speech model's
+/// own CTC head over `pcm`, `offset_ms` into the clip; null when it already sent the error. `who` (the clip's speaker
+/// activity) steers the alignment when the transcript carries turn tags, and names each word's speaker. `soft`: a head
+/// that is not there or fails leaves the words untimed (verbose_json and diarized_json answer without them) instead of
+/// an error. A transcript with tags answers its text without them (`Aligned.text`), the offsets of its words in that text.
+fn alignOwn(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm: []const f32, text: []const u8, who: ?transcription_mod.Activity, offset_ms: u64, soft: bool) !?Aligned {
+    var all: std.ArrayList([]const u8) = .empty;
+    defer all.deinit(allocator);
+    var tagged = false;
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    while (it.next()) |w| {
+        tagged = tagged or isSpeakerTag(w);
+        try all.append(allocator, w);
+    }
+    if (all.items.len == 0) return .{ .words = &.{}, .segments = &.{} };
+
+    // The words as the host shows them, in a text without the tags when there were any.
+    var clean: std.ArrayList(u8) = .empty;
+    errdefer clean.deinit(allocator);
+    var units: std.ArrayList(forced_align_mod.Unit) = .empty;
+    defer {
+        for (units.items) |u| allocator.free(u.text);
+        units.deinit(allocator);
+    }
+    const slot = try allocator.alloc(i64, all.items.len);
+    defer allocator.free(slot);
+    for (all.items, slot) |w, *sl| {
+        if (isSpeakerTag(w)) {
+            sl.* = -1;
+            continue;
+        }
+        var start = @intFromPtr(w.ptr) - @intFromPtr(text.ptr);
+        if (tagged) {
+            if (clean.items.len > 0) try clean.append(allocator, ' ');
+            start = clean.items.len;
+            try clean.appendSlice(allocator, w);
+        }
+        sl.* = @intCast(units.items.len);
+        try units.append(allocator, .{ .text = try allocator.dupe(u8, w), .start = start, .end = start + w.len, .word = units.items.len });
+    }
+
+    // Speaker activity over this piece's frames (10 ms), for transcripts that say who speaks.
+    var activity: []const f32 = &.{};
+    var speakers: u32 = 0;
+    if (tagged) if (who) |wh| {
+        const lo = @min(wh.probs.len / wh.speakers, @as(usize, @intCast(offset_ms)) / 10);
+        const hi = @min(wh.probs.len / wh.speakers, lo + pcm.len / 160);
+        activity = wh.probs[lo * wh.speakers .. hi * wh.speakers];
+        speakers = @intCast(wh.speakers);
+    };
+
+    var job = OwnTimesJob{ .allocator = allocator, .lm = lm, .pcm = pcm, .units = all.items, .activity = activity, .speakers = speakers };
+    var timer = Stopwatch.init(stream.io);
+    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = ownTimesRun, .model = lm };
+    http_server.launch().global_scheduler.?.runGeneration(&req) catch |err| {
+        if (err != error.Shutdown) return err;
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+        return null;
+    };
+    const got = job.ms orelse {
+        if (soft) {
+            log.warn("  word timing unavailable ({s}): segments without word times\n", .{job.err});
+            return .{ .words = &.{}, .segments = &.{}, .text = if (tagged) try clean.toOwnedSlice(allocator) else null };
+        }
+        if (std.mem.eql(u8, job.err, "NoCtcHead") or std.mem.eql(u8, job.err, "NoAlignmentTokenizer")) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "srt and vtt need the word times of the CTC timestamp head, which this pack lacks: convert NVIDIA's checkpoint again with scripts/convert_nemotron_transcribe.py", 400);
+            return null;
+        }
+        var buf: [200]u8 = undefined;
+        const why = std.fmt.bufPrint(&buf, "word timing failed: {s}", .{job.err}) catch "word timing failed";
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", why, 500);
+        return null;
+    };
+    defer allocator.free(got);
+    // 2 values a unit for the host's words (tag entries dropped), and the speakers the head named.
+    const ms = try allocator.alloc(u32, 2 * units.items.len);
+    defer allocator.free(ms);
+    const said_by = try allocator.alloc(u8, units.items.len);
+    defer allocator.free(said_by);
+    var named = false;
+    for (slot, 0..) |sl, i| {
+        if (sl < 0) continue;
+        const k: usize = @intCast(sl);
+        ms[2 * k] = got[3 * i];
+        ms[2 * k + 1] = got[3 * i + 1];
+        const col = got[3 * i + 2];
+        said_by[k] = if (col == std.math.maxInt(u32)) 255 else @intCast(@min(col, 254));
+        named = named or col != std.math.maxInt(u32);
+    }
+    const words = try forced_align_mod.timedWords(allocator, units.items, ms, .spaced);
+    errdefer allocator.free(words);
+    // A word no turn tag covers (or any word, when the transcript has none) is whoever the activity says spoke it.
+    const by_overlap = if (who) |w| try w.wordSpeakers(allocator, words, offset_ms) else null;
+    defer if (by_overlap) |x| allocator.free(x);
+    for (said_by, 0..) |*x, k| if (x.* == 255) {
+        x.* = if (by_overlap) |o| o[k] else 0;
+    };
+    const shown = if (tagged) clean.items else text;
+    const segments = try forced_align_mod.segments(allocator, shown, words, if (named or by_overlap != null) said_by else null);
+    log.info("  timed {d} words into {d} segments ({d}ms)\n", .{ words.len, segments.len, timer.read() / std.time.ns_per_ms });
+    return .{ .words = words, .segments = segments, .text = if (tagged) try clean.toOwnedSlice(allocator) else null };
+}
+
+const OwnTimesJob = struct {
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    pcm: []const f32,
+    units: []const []const u8,
+    activity: []const f32,
+    speakers: u32,
+    ms: ?[]u32 = null,
+    err: []const u8 = "failed",
+};
+
+fn ownTimesRun(ctx: *anyopaque) void {
+    const job: *OwnTimesJob = @ptrCast(@alignCast(ctx));
+    job.ms = mlx_engine.pluginWordTimes(job.allocator, job.lm, job.pcm, job.units, job.activity, job.speakers) catch |err| {
+        // A plugin's own error name travels as the engine's `last`.
+        job.err = if (err == error.EngineFailed) err_name.last() else @errorName(err);
+        log.err("  word timing failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+}
+
+/// Speaker activity over `pcm` from the speech model's own speaker expert; null when it already sent the error.
+fn diarizeOwn(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm: []const f32, speakers: *u32) !?[]f32 {
+    var job = OwnDiarizeJob{ .allocator = allocator, .lm = lm, .pcm = pcm };
+    var timer = Stopwatch.init(stream.io);
+    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = ownDiarizeRun, .model = lm };
+    http_server.launch().global_scheduler.?.runGeneration(&req) catch |err| {
+        if (err != error.Shutdown) return err;
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+        return null;
+    };
+    const probs = job.probs orelse {
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "speaker diarization failed", 500);
+        return null;
+    };
+    speakers.* = job.speakers;
+    log.info("  diarized {d:.1} s ({d}ms)\n", .{ @as(f64, @floatFromInt(pcm.len)) / transcription_mod.SAMPLE_RATE, timer.read() / std.time.ns_per_ms });
+    return probs;
+}
+
+const OwnDiarizeJob = struct {
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    pcm: []const f32,
+    probs: ?[]f32 = null,
+    speakers: u32 = 0,
+};
+
+fn ownDiarizeRun(ctx: *anyopaque) void {
+    const job: *OwnDiarizeJob = @ptrCast(@alignCast(ctx));
+    job.probs = mlx_engine.pluginDiarize(job.allocator, job.lm, job.pcm, &job.speakers) catch |err| {
+        log.err("  diarization failed: {s}\n", .{@errorName(err)});
+        return;
+    };
 }
 
 /// One aligner pass, run on the inference thread (the sole mlx caller).

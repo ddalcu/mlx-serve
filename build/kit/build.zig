@@ -22,7 +22,7 @@ pub fn plugin(b: *std.Build, opts: Options) *std.Build.Step.Compile {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const kit = b.dependency("mlx_serve_kit", .{});
-    const mlx_serve = b.createModule(.{ .root_source_file = kit.path("src/kit.zig"), .target = target, .optimize = optimize });
+    const mlx_serve = kitModule(b, kit, target, optimize);
     const tc = b.addTranslateC(.{ .root_source_file = kit.path("include/mlx/c/mlx.h"), .target = target, .optimize = optimize });
     tc.addIncludePath(kit.path("include"));
     const imports: []const std.Build.Module.Import = &.{
@@ -53,4 +53,31 @@ pub fn plugin(b: *std.Build, opts: Options) *std.Build.Step.Compile {
     const tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("config.zig"), .target = target, .optimize = optimize, .imports = imports }) });
     b.step("test", "Run the plugin's MLX-free tests").dependOn(&b.addRunArtifact(tests).step);
     return lib;
+}
+
+/// The kit's one Zig module, `mlx_serve`, with the `mlx_steel_sources` module `kit.blocks.qmm` embeds.
+fn kitModule(b: *std.Build, kit: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    const steel = b.createModule(.{ .root_source_file = kit.path("lib/mlx_steel_sources.zig"), .target = target, .optimize = optimize });
+    return b.createModule(.{
+        .root_source_file = kit.path("src/kit.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "mlx_steel_sources", .module = steel }},
+    });
+}
+
+/// Builds an object compiled from the build folder's `check.zig` over the kit (`checks/blocks`): the kit's own proof that
+/// every public function of `kit.blocks` builds from what the kit ships.
+pub fn blocksCheck(b: *std.Build) void {
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+    const kit = b.dependency("mlx_serve_kit", .{});
+    const obj = b.addObject(.{ .name = "blocks_check", .root_module = b.createModule(.{
+        .root_source_file = b.path("check.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_serve", .module = kitModule(b, kit, target, optimize) }},
+    }) });
+    b.getInstallStep().dependOn(&obj.step);
 }

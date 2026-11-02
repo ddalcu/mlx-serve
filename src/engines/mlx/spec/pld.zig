@@ -21,6 +21,7 @@ const sampleFromProbs = @import("../sampling/spec_sampling.zig").sampleFromProbs
 const sampleResidual = @import("../sampling/spec_sampling.zig").sampleResidual;
 const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
 const specShouldReenable = @import("gates.zig").specShouldReenable;
+const verifyArgmax = @import("verify.zig").verifyArgmax;
 const yieldGateShouldDisable = @import("gates.zig").yieldGateShouldDisable;
 
 
@@ -352,13 +353,10 @@ pub fn nextPld(
     } else {
         var i: u32 = 0;
         while (i < m) : (i += 1) {
-            var argmax_arr = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(argmax_arr);
-            try mlx.check(mlx.mlx_argmax_axis(&argmax_arr, per_pos_logits[i], 2, false, s));
-            try mlx.check(mlx.mlx_array_eval(argmax_arr));
-            var argmax_val: i32 = 0;
-            try mlx.check(mlx.mlx_array_item_int32(&argmax_val, argmax_arr));
-            if (@as(u32, @intCast(argmax_val)) != draft[i]) break;
+            var picked = try verifyArgmax(per_pos_logits[i], self.sampling.suppress_mask, s);
+            defer picked.deinit();
+            try mlx.check(mlx.mlx_array_eval(picked.lazy()));
+            if (@as(u32, @intCast((try picked.ids(1))[0])) != draft[i]) break;
             accepted += 1;
         }
     }

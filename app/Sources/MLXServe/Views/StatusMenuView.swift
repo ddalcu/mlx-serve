@@ -526,32 +526,9 @@ struct StatusMenuView: View {
                         breakdown: mem.gpuBreakdown
                     )
                 }
-                if let t = server.throughput {
-                    TrayRowSeparator()
-                    throughputRows(t)
-                }
+                TrayThroughputRows(usage: server.usage)
             }
         }
-    }
-
-    /// Serving throughput, from `/metrics.json` (present only when the server
-    /// was launched with --metrics). "now" is the gauge delta between the last
-    /// two polls; the averages are whole-session.
-    @ViewBuilder private func throughputRows(_ t: ThroughputSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
-            statRow("Decode", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.decodeTPSNow), ThroughputSnapshot.formatTPS(t.avgDecodeTPS)))
-            statRow("Prefill", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.prefillTPSNow), ThroughputSnapshot.formatTPS(t.avgPrefillTPS)))
-        }
-    }
-
-    @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(L10n.text(label)).foregroundStyle(.secondary)
-            Spacer()
-            Text(value).monospacedDigit()
-        }
-        .font(.app(.caption2))
     }
 
     // MARK: - Media generation
@@ -1449,5 +1426,31 @@ private struct WorkerPartRow: View {
                     .padding(.leading, 22)
             }
         }
+    }
+}
+
+/// Serving throughput, from the usage tracker the chat window's strip reads, so the two show the same figures. "now" is
+/// the gauge delta between its last two looks; the averages are whole-session.
+private struct TrayThroughputRows: View {
+    @ObservedObject var usage: UsageTracker
+
+    var body: some View {
+        if let t = usage.live {
+            TrayRowSeparator()
+            VStack(alignment: .leading, spacing: 2) {
+                statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
+                statRow("Decode", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(usage.decodeTPS), ThroughputSnapshot.formatTPS(t.avgDecodeTPS)))
+                statRow("Prefill", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(usage.prefillTPS), ThroughputSnapshot.formatTPS(t.avgPrefillTPS)))
+            }
+        }
+    }
+
+    @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(L10n.text(label)).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).monospacedDigit()
+        }
+        .font(.app(.caption2))
     }
 }

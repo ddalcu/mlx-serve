@@ -354,6 +354,26 @@ struct ServerOptions: Codable, Equatable {
     /// for the chat model in use, or `notesOff`.
     var transcriptNotesModel: String = ""
     static let notesOff = "off"
+    /// What turns speech into words: the Qwen3-ASR pack with its aligner and diarizer, or Nemotron 3.5 Transcribe
+    /// alone (it times and tells speakers apart itself, and writes the notes).
+    var transcribeEngine: TranscribeEngine = .combo
+    enum TranscribeEngine: String, Codable, CaseIterable, Identifiable {
+        case combo, nemotron
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .combo:    return "Qwen3-ASR + aligner + diarizer"
+            case .nemotron: return "Nemotron 3.5 Transcribe"
+            }
+        }
+        /// The `config.json` model_types of the packs that transcribe (NVIDIA's name and mlx-audio's).
+        var asrModelTypes: [String] {
+            switch self {
+            case .combo:    return ["qwen3_asr"]
+            case .nemotron: return ["nemo_speechlm", "nemotron_transcribe"]
+            }
+        }
+    }
     /// Minutes of silence after which a tray recording stops itself; 0 never.
     var transcriptAutoStopMinutes: Int = 10
     /// Start a tray recording when an app turns the camera on.
@@ -1006,6 +1026,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .kokoroVoice) { kokoroVoice = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lfm3Voice) { lfm3Voice = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
+        if let v = try c.decodeIfPresent(TranscribeEngine.self, forKey: .transcribeEngine) { transcribeEngine = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .transcriptNotesModel) { transcriptNotesModel = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .transcriptAutoStopMinutes) { transcriptAutoStopMinutes = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .transcriptAutoStartCamera) { transcriptAutoStartCamera = v }

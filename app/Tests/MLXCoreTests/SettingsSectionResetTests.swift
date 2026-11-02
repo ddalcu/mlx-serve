@@ -51,7 +51,7 @@ final class SettingsSectionResetTests: XCTestCase {
         o.sandbox.enabled = true; o.toolsOnlyWhenAsked = true
         o.voiceClonePath = "/tmp/clip.wav"; o.voiceCloneEnabled = false
         o.voiceCloneLabel = "My clip"; o.wakePhrase = "hey robot"
-        o.transcriptNotesModel = ServerOptions.notesOff; o.transcriptAutoStopMinutes = 60; o.transcriptAutoStartCamera = true
+        o.transcribeEngine = .nemotron; o.transcriptNotesModel = ServerOptions.notesOff; o.transcriptAutoStopMinutes = 60; o.transcriptAutoStartCamera = true
         return o
     }
 
@@ -108,6 +108,7 @@ final class SettingsSectionResetTests: XCTestCase {
         // Voice fields went back to default…
         XCTAssertEqual(after.wakePhrase, ServerOptions().wakePhrase)
         XCTAssertEqual(after.voiceClonePath, "")
+        XCTAssertEqual(after.transcribeEngine, .combo)
         XCTAssertEqual(after.transcriptNotesModel, "")
         XCTAssertEqual(after.transcriptAutoStopMinutes, 10)
         XCTAssertFalse(after.transcriptAutoStartCamera)

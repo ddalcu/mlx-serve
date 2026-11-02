@@ -114,10 +114,9 @@ pub const Config = struct {
     boi_token_id: u32 = 0,
     eoi_token_id: u32 = 0,
     glm_vision: bool = false,
-    /// What discovery advertises: no images for a `_text` pack's vestigial tower, video for a `video_token_id`
-    /// beside the tower (which the engine never reads for GLM).
+    /// What discovery advertises: no images for a `_text` pack's vestigial tower. Never video: a `video_token_id`
+    /// beside the tower is a token the engine never reads for GLM.
     advertises_images: bool = false,
-    advertises_video: bool = false,
     qv_depth: u32 = 0,
     qv_hidden: u32 = 0,
     qv_heads: u32 = 0,
@@ -441,9 +440,6 @@ fn readGlm(c: *Config, o: Objects) ParseError!void {
         c.glm_vision = true;
         const mt = field(root, "model_type");
         c.advertises_images = !(mt != null and mt.? == .string and std.mem.endsWith(u8, mt.?.string, "_text"));
-        if (c.advertises_images) for ([_]std.json.ObjectMap{ cfg, root }) |obj| if (field(obj, "video_token_id")) |v| if (v == .integer and v.integer > 0) {
-            c.advertises_video = true;
-        };
         try readQvGeometry(c, vc);
         if (field(vc, "projection_intermediate_size")) |v| c.glmv_proj_intermediate = try u32v(v);
         if (field(vc, "rms_norm_eps")) |v| c.glmv_eps = try f32v(v);
@@ -616,7 +612,6 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
         .dflash_capture = true,
         .dflash_policy = true,
         .images = c.advertises_images,
-        .video = c.advertises_video,
         .streamed_weights = c.streamed,
     };
     // A streamed bank's decode lane takes a few rows a call: one request decodes at a time.

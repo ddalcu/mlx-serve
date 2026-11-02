@@ -1,6 +1,7 @@
 //! sendAnthropicError; sendAnthropicEvent; stop reasons, tools json, handleAnthropicMessages, non-streaming
 
 const std = @import("std");
+const schema_check = @import("schema_check.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
@@ -574,6 +575,10 @@ pub fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", "output_config.format.schema must be a JSON object when format.type is json_schema", 400);
         return;
     }
+    if (output_cfg.schema) |sv| if (schema_check.grammarSchemaError(allocator, sv)) |msg| {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+        return;
+    };
     const request_effort = if (output_cfg.effort) |word| reasoningEffortFromWord(word, default_budget, word_only) else null;
     const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(root.get("tools") != null), default_budget, word_only);
     var enable_thinking = thinking.enable;

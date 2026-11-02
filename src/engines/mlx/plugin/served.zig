@@ -34,6 +34,8 @@ pub const types = [_][]const u8{
     "lfm2_vl",
     "lfm2-vl",
     "nemotron_h_omni",
+    "nemo_speechlm",
+    "nemotron_transcribe",
     "qwen3_moe",
     "qwen3_moe_text",
     "qwen3_next",

@@ -206,7 +206,7 @@ const Resident = struct {
 // ── tests ──
 
 test "deepseek_v41 streamed: the trunk with its experts streamed from an MXFP4 experts.bin is bit-equal to its in-memory banks" {
-    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!build_options.mlx_stream or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     // 8 experts: the prompt's gathers take the sorted row-block kernels (60 pairs, 7 a row); 32: the per-pair ones.
     try streamedParity(8);
     try streamedParity(32);

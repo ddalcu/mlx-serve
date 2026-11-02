@@ -13,11 +13,12 @@
 #   ./tests/test_prefix_cache_disk.sh [/path/to/model] [port]
 #
 # Hermetic twins: kv_disk_cache / disk_tier, prefix_cache two-tier, kv_disk_writer and armShutdownDeadline tests.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 PORT="${2:-8096}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'
@@ -303,8 +304,7 @@ echo "== 7. hybrid SSM arch (Qwen 3.5 GatedDeltaNet) persists + restores SSM sta
 # beside the KV chunks and restore both across a restart. Gated on a local
 # Qwen3.5-0.8B; SKIPs cleanly otherwise (the attention sections above cover the
 # non-hybrid path either way).
-HYBRID_MODEL="$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
-[ -d "$HYBRID_MODEL" ] || HYBRID_MODEL="$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
+HYBRID_MODEL="$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")"
 if [ ! -d "$HYBRID_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} hybrid section: Qwen3.5-0.8B-MLX-4bit not found."
 else
@@ -367,7 +367,7 @@ echo "== 8. a restore wider than the fd limit, and a failed restore's fallback =
 # A restore reads one chunk file per 1024 tokens. It must fit under a soft
 # RLIMIT_NOFILE smaller than its chunk count, and an unreadable chunk must
 # fall back to a cold prefill that answers 200.
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 FD_HOME=$(mktemp -d "$HOME/claude-tmp/prefix-disk-fd.XXXXXX")
 SCRATCH_HOME="$FD_HOME"
 KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
@@ -424,7 +424,7 @@ echo "== 9. an image session persists and restores past its first image =="
 # must stop at or before that row: its rows are keyed on the pixels.
 # Arms: default (RAM-first), --no-prefix-cache-ram (SSD-first + write-through), and
 # the swapped image. Needs a vision model; SKIPs otherwise.
-VISION_MODEL="${VISION_DISK_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+VISION_MODEL="${VISION_DISK_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 IMG_A="tests/fixtures/street-name-signs.jpg"
 IMG_B="tests/fixtures/house.jpeg"
 if [ ! -f "$VISION_MODEL/config.json" ] || ! grep -q vision_config "$VISION_MODEL/config.json" || [ ! -f "$IMG_A" ] || [ ! -f "$IMG_B" ]; then

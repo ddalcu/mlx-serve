@@ -413,6 +413,8 @@ pub const Transformer = struct {
     /// spans only its own max_tokens. Inference thread only.
     round_cost: round_cost_mod.Table = .{},
     mtp_group_cost: group_cost_mod.Table = .{},
+    /// What a DSpark group round's verify costs on this model (`spec/dspark_group.zig`). Inference thread only.
+    dspark_group_cost: @import("spec/dflash/policy.zig").GroupCost = .{},
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
     cost_moe: u8 = 0,

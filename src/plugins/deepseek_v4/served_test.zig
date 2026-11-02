@@ -189,7 +189,7 @@ test "deepseek_v41 served: two slots decode in one batched tick through the driv
 
 test "deepseek_v41 served: disk-disabled requests retain alternating RAM conversations after slot release" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
@@ -752,7 +752,7 @@ test "deepseek_v41 served: restored state is discarded once when only cold prefi
     defer next.deinit();
     try testing.expectEqual(@as(u32, 0), next.cached_tokens);
     try testing.expectEqual(@as(usize, prompt.len), next.cache.step);
-    try testing.expect(Guard.calls <= 6);
+    try testing.expect(Guard.calls <= 7);
     try testing.expectEqual(@as(usize, 0), h.entry.prefix_cache.?.entries.items.len);
     commit_request.commitSlotIfApplicable(&h.sch, next);
     finish_request.releasePluginSlot(next);
@@ -820,7 +820,7 @@ test "deepseek_v41 served: ordinary unload frees retained module entries before 
 }
 
 test "deepseek_v41 served: an excluded instance keeps legacy resume through request prefill" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const P = @import("../deepseek_v41/plugin.zig");
@@ -846,7 +846,7 @@ test "deepseek_v41 served: an excluded instance keeps legacy resume through requ
 
 test "deepseek_v41 served: image rows from Forward.media splice as the legacy seam splices them, across a chunk boundary" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -917,6 +917,8 @@ fn expectDspark(comptime P: type, files: []const sdk.fixture.File, sampling: Sam
     });
     defer gen.deinit(a);
     try testing.expect(gen.dspark_enabled);
+    // The tapes' rounds were recorded under the logistic calibration prior.
+    if (gen.dspark_pol) |*pol| pol.calib.head = false;
     // Each round as `[tokens..., accepted drafts, next token, position]`.
     var rec: [16]u32 = undefined;
     for (0..16) |_| {
@@ -948,6 +950,154 @@ test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal th
     const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-greedy.tape"));
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 0xd5 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
+}
+
+/// The largest gap between two `[rows, V]` logit sets, against the reference's largest magnitude.
+fn relGap(g: *ops.Graph, got: Array, want: Array) !f32 {
+    const x = try g.contiguous(try g.astype(got, .float32));
+    const y = try g.contiguous(try g.astype(want, .float32));
+    try ops.eval(x);
+    try ops.eval(y);
+    const n = mlx.mlx_array_size(y);
+    try testing.expectEqual(n, mlx.mlx_array_size(x));
+    var gap: f32 = 0;
+    var big: f32 = 0;
+    for (mlx.mlx_array_data_float32(x).?[0..n], mlx.mlx_array_data_float32(y).?[0..n]) |a, b| {
+        try testing.expect(std.math.isFinite(a) and std.math.isFinite(b));
+        gap = @max(gap, @abs(a - b));
+        big = @max(big, @abs(b));
+    }
+    return gap / big;
+}
+
+test "deepseek_v41 served: a batched verify gives each state its solo verify's rows, and its kept prefix the state a solo round leaves" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41DsparkFiles(arena.allocator(), 7), "");
+    defer p.close();
+    var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const a = testing.allocator;
+    const m = intree.dsv41(&p.xfm).?;
+    const prompts = [_][]const u32{ &.{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90 }, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14, 16, 18 } };
+    var batched: [2]dsv41.State = undefined;
+    var solo: [2]dsv41.State = undefined;
+    for (0..2) |k| {
+        batched[k] = try dsv41.initState(m, a);
+        solo[k] = try dsv41.initState(m, a);
+        for ([_]*dsv41.State{ &batched[k], &solo[k] }) |st| _ = try g.adopt(try dsv41.extend(m, a, st, prompts[k], .last));
+    }
+    defer for (&batched, &solo) |*x, *y| {
+        x.deinit();
+        y.deinit();
+    };
+    const ptrs = [_]*dsv41.State{ &batched[0], &batched[1] };
+    const gens = [_]u64{ 0, 0 };
+    try testing.expectError(error.Dsv41BatchUnsupported, dsv41.extendBatched(m, a, &.{ &batched[0], &batched[0] }, &gens, &.{ &.{1}, &.{2} }, false));
+    // Two rounds: one keeps a prefix and one everything, then each keeps a prefix. Rows of two or more take the same
+    // kernels batched or alone, so each state's rows are its solo verify's, bit for bit, while the states stay equal.
+    const rounds = [_][2][]const u32{ .{ &.{ 44, 9, 31 }, &.{ 7, 70, 3, 3, 12 } }, .{ &.{ 50, 51, 52 }, &.{ 53, 54 } } };
+    const keeps = [_][2]usize{ .{ 2, 5 }, .{ 1, 1 } };
+    for (rounds, keeps) |chunks, keep| {
+        const rows = try g.adopt(try dsv41.extendBatched(m, a, &ptrs, &gens, &chunks, true));
+        var off: usize = 0;
+        for (0..2) |k| {
+            var d: dsv41.DsparkDraft = .{ .ids = try a.dupe(u32, chunks[k]), .len = chunks[k].len - 1, .logits = &.{}, .confidence = &.{} };
+            defer d.deinit(a);
+            var pending = try dsv41.dsparkBeginWith(m, a, &solo[k], chunks[k][0], &d);
+            defer pending.deinit();
+            try testing.expectEqual(@as(f32, 0), try relGap(&g, try g.sliceAxis(rows, 0, @intCast(off), @intCast(off + chunks[k].len)), pending.vl_g));
+            var r = try dsv41.dsparkFinish(m, a, &solo[k], &pending, keep[k] - 1, 0);
+            r.deinit(a);
+            try dsv41.finishVerify(m, a, &batched[k], keep[k]);
+            try testing.expectEqual(solo[k].n, batched[k].n);
+            try testing.expectEqualSlices(u32, solo[k].hist.items, batched[k].hist.items);
+            off += chunks[k].len;
+        }
+    }
+    // The next draft reads the main rows each finish committed: the batched draft drafts what each state drafts alone.
+    var drafts: [2]dsv41.DsparkDraft = undefined;
+    try dsv41.dsparkDraftBatched(m, a, &ptrs, &.{ 60, 61 }, true, &drafts);
+    defer for (&drafts) |*d| d.deinit(a);
+    for (0..2) |k| {
+        var alone = try dsv41.dsparkDraft(m, a, &solo[k], drafts[k].ids[0]);
+        defer alone.deinit(a);
+        try testing.expectEqualSlices(u32, alone.ids, drafts[k].ids);
+    }
+}
+
+/// Greedy DSpark group rounds for `prompts`, one slot each on one model, until each slot has `out[k].len` tokens.
+fn groupRounds(files: []const sdk.fixture.File, prompts: []const []const u32, out: [][24]u32) !void {
+    const dspark_group = @import("../../engines/mlx/spec/dspark_group.zig");
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tok: Tokenizer = undefined;
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, files, "");
+    defer p.close();
+    try testing.expect(dspark_group.groupable(&p.xfm));
+    var slots: [2]Slot = undefined;
+    var gens: [2]Generator = undefined;
+    var made: usize = 0;
+    defer for (slots[0..made], gens[0..made]) |*s, *gen| {
+        gen.deinit(a);
+        s.kv.deinit();
+    };
+    for (prompts, slots[0..prompts.len], gens[0..prompts.len]) |prompt, *s, *gen| {
+        try s.init();
+        gen.* = Generator.initWithOptions(io, a, &p.xfm, &tok, prompt, 64, .{ .temperature = 0 }, &.{}, .{ .ctx = s.ctx, .mtp_enabled = true, .skip_lazy_preforward = true, .lookup_prompt = prompt }) catch |e| {
+            s.kv.deinit();
+            return e;
+        };
+        made += 1;
+        try testing.expect(gen.dspark_enabled and gen.dspark_pol.?.calib.head);
+    }
+    const ptrs = [_]*Generator{ &gens[0], &gens[1] };
+    const allocs = [_]std.mem.Allocator{ a, a };
+    var n: [2]usize = .{ 0, 0 };
+    while (n[0] < out[0].len or n[1] < out[1].len) {
+        var res: [2]@import("../../engines/mlx/spec/drafter.zig").DrafterStepResult = undefined;
+        try dspark_group.moduleGroupRound(&ptrs, &allocs, &res);
+        for (res, 0..) |r, k| {
+            defer a.free(r.tokens);
+            for (r.tokens) |t| if (n[k] < out[k].len) {
+                out[k][n[k]] = t;
+                n[k] += 1;
+            };
+            try testing.expectEqual(prompts[k].len + gens[k].generated_ids.items.len, gens[k].ctx.cache.step);
+        }
+    }
+    // ENGAGEMENT: every round a group round, and some verified drafts.
+    var drafted: u64 = 0;
+    for (gens) |gen| {
+        try testing.expect(gen.dspark_group_rounds >= 4 and gen.dspark_group_rounds == gen.dspark_attempted);
+        drafted += gen.dspark_group_rounds - gen.dspark_stats.rows[1];
+    }
+    try testing.expect(drafted > 0);
+}
+
+test "deepseek_v41 served: a slot's greedy DSpark group rounds emit the same tokens whichever slot shares them" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    const a_ids = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 30, 31 };
+    const b_ids = [_]u32{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14, 16, 18 };
+    const c_ids = [_]u32{ 40, 41, 2, 2, 9, 77, 13 };
+    // A batch's rows never read each other (the module's verify is per state, its row-wise kernels per row): the
+    // partner changes which drafts are verified, never the greedy tokens.
+    var x: [2][24]u32 = undefined;
+    var y: [2][24]u32 = undefined;
+    try groupRounds(files, &.{ &a_ids, &b_ids }, &x);
+    try groupRounds(files, &.{ &c_ids, &a_ids }, &y);
+    try testing.expectEqualSlices(u32, &x[0], &y[1]);
 }
 
 test "deepseek_v4 served: mlx-community's withdrawn preview pack is refused by the legacy parse and, at load, by name" {

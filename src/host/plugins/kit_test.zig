@@ -195,3 +195,25 @@ test "kit examples: the model plugin's fixture pack tokenizes and renders its ch
     const prompt = try @import("../chat/render.zig").renderChatTemplate(a, &[_]Message{.{ .role = "user", .content = "hi" }}, &chat_config, null, null, false, null, false);
     try testing.expectEqualStrings("<|user|>hi<|end|><|assistant|>", prompt);
 }
+
+test "kit blocks: every block file of an exposed area is in kit.blocks, or is a test, contract or CUDA file" {
+    inline for (comptime std.meta.declarations(@import("../../kit.zig").blocks)) |area| try expectAreaExposed(area);
+}
+
+/// `area` is a folder of `src/sdk/blocks/` when it has one (`embedding` is a file, not an area).
+fn expectAreaExposed(comptime area: []const u8) !void {
+    const exposed = @field(@import("../../kit.zig").blocks, area);
+    var dir = std.Io.Dir.cwd().openDir(testing.io, "src/sdk/blocks/" ++ area, .{ .iterate = true }) catch return;
+    defer dir.close(testing.io);
+    var it = dir.iterate();
+    while (try it.next(testing.io)) |e| {
+        if (e.kind != .file or !std.mem.endsWith(u8, e.name, ".zig")) continue;
+        const stem = e.name[0 .. e.name.len - 4];
+        if (std.mem.endsWith(u8, stem, "_test") or std.mem.startsWith(u8, stem, "contract") or std.mem.eql(u8, stem, "testkit")) continue;
+        if (std.mem.indexOf(u8, stem, "_cuda") != null or std.mem.indexOf(u8, stem, "ubench") != null) continue;
+        var listed = false;
+        inline for (comptime std.meta.declarations(exposed)) |d| listed = listed or std.mem.eql(u8, d, stem);
+        if (!listed) std.debug.print("src/sdk/blocks/{s}/{s} is not in kit.blocks.{s} (src/kit.zig)\n", .{ area, e.name, area });
+        try testing.expect(listed);
+    }
+}

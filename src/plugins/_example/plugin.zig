@@ -139,6 +139,22 @@ const Graph = struct {
     fn reshape(g: *Graph, x: c.mlx_array, shape: []const c_int) !c.mlx_array {
         return g.op(c.mlx_reshape, .{ x, shape.ptr, shape.len });
     }
+    /// `sum = x + o` and `normed = rms_norm(sum, w, eps)`: the SDK's fused block (`kit.blocks`, bit-identical to the
+    /// pair) where it is eligible, else the two mlx-c ops. A block takes `kit.mlx` handles, which are `{ctx}` like these.
+    fn addNorm(g: *Graph, x: c.mlx_array, o: c.mlx_array, w: c.mlx_array, eps: f32) !struct { sum: c.mlx_array, normed: c.mlx_array } {
+        const eps_arr = c.mlx_array_new_float32(eps);
+        try g.live.append(gpa, eps_arr);
+        const fused = try kit.blocks.norms.residual_norm.fusedAddRmsNorm(.{ .ctx = g.s.ctx }, .{ .ctx = x.ctx }, .{ .ctx = o.ctx }, .{ .ctx = w.ctx }, .{ .ctx = eps_arr.ctx });
+        if (fused) |r| {
+            const sum: c.mlx_array = .{ .ctx = r.sum.ctx };
+            const normed: c.mlx_array = .{ .ctx = r.normed.ctx };
+            try g.live.append(gpa, sum);
+            try g.live.append(gpa, normed);
+            return .{ .sum = sum, .normed = normed };
+        }
+        const sum = try g.op(c.mlx_add, .{ x, o });
+        return .{ .sum = sum, .normed = try g.op(c.mlx_fast_rms_norm, .{ sum, w, eps }) };
+    }
     fn swap12(g: *Graph, x: c.mlx_array) !c.mlx_array {
         const axes = [_]c_int{ 0, 2, 1, 3 };
         return g.op(c.mlx_transpose_axes, .{ x, &axes, axes.len });
@@ -218,8 +234,9 @@ fn decoder(m: *Model, g: *Graph, ops: *const abi.CacheOps, cache: abi.Handle, id
         defer ops.release(&view);
         const attn = try g.op(c.mlx_fast_scaled_dot_product_attention, .{ q, c.mlx_array{ .ctx = view.k.ctx }, c.mlx_array{ .ctx = view.v.ctx }, scale, if (t > 1) "causal" else "", no_array, no_array, false });
         const o = try g.linear(try g.reshape(try g.swap12(attn), &.{ 1, t, nh * hd }), l.o);
-        x = try g.op(c.mlx_add, .{ x, o });
-        const h2 = try g.op(c.mlx_fast_rms_norm, .{ x, l.ln2, k.rms_norm_eps });
+        const added = try g.addNorm(x, o, l.ln2, k.rms_norm_eps);
+        x = added.sum;
+        const h2 = added.normed;
         const gate = try g.linear(h2, l.gate);
         const act = try g.op(c.mlx_multiply, .{ gate, try g.op(c.mlx_sigmoid, .{gate}) });
         const mlp = try g.linear(try g.op(c.mlx_multiply, .{ act, try g.linear(h2, l.up) }), l.down);

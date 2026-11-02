@@ -10,7 +10,8 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 - `src/{host,host/chat,engines/mlx,plugins}/AGENTS.md` — each area's rules, one line each. `docs/recipes/` — add a model, extend one, a media backend, a kernel, an engine, an API field. `docs/plugins.md` — the plugin guide.
 - `docs/CUDA.md` — NVIDIA (Linux, Windows): builds, our own CUDA kernels, per-device defaults, memory, measuring, MLX patches.
 - `tests/CLAUDE.md` — integration-test matrix. `app/CLAUDE.md` — Swift app layout + rules; `app-web/CLAUDE.md` — console source (auto-load in their dirs).
-- Skills: `/release` (pre-release checklist, CalVer, CHANGELOG), `/bench` (llmprobe methodology + comparison traps).
+- Skills: `/release` (pre-release checklist, CalVer, CHANGELOG), `/bench` (llmprobe methodology + comparison traps),
+  `/plugin` (create, check, install and A/B an outside plugin dylib).
 - `containers/{agent-shell-mlxserve,guest-kernel}/` — Agent Sandbox guest image + kernel, two pinned artifacts that BUMP TOGETHER. Detail: `docs/reference.md`.
 - `website/` — GitHub Pages site + `llm-tier-list/`. Design: `docs/reference.md`. Guards: `tests/test_website_pages.sh`, `tests/website_tier_list_logic.mjs`.
 - **Growth policy (ENFORCED)**: this file stays under 30k bytes (the map, the global rules, the inner loop), a folder's rules live in its own `AGENTS.md`, short-form and minimal; EVERY rule bullet is ≤ 3 lines. Be PICKY: a rule earns a line only for a real bug or a strong gotcha we actually hit and that someone would repeat. Not a diary: no log of what happened, no measurements, no round-by-round notes, no restating what the code or git history says. Same bar for `docs/gotchas/*.md` (one short story per gotcha) and `docs/reference.md` (one section per subsystem). When in doubt, leave it out; App content → `app/CLAUDE.md`.
@@ -75,6 +76,8 @@ Feature = unit test that fails without it (+ integration script if HTTP-observab
 
 Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -Dtest-filter="tool traffic"` (the replay is gated behind `-Dslow-tests`; the bare filter compiles and reports success without running it). Full suite: `zig build test -Dslow-tests`. Full matrix: `tests/CLAUDE.md`.
 
+**A test that dispatches a Metal kernel skips on a virtual GPU.** CI's `macos-26` runner reports the device `air64_v27`, caps threadgroups at 384-896 and kills command buffers with `Insufficient Memory`, so an unguarded kernel test fails or exits 255 there and turns the `zig` job red. Start it with `if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;` (`mlx.virtualGpu()` alone when it has no other skip). A bulk patch must scan the whole test body for the guard, not the next few lines. PR runs omit `-Dslow-tests` unless the diff touches the replay's paths and pushes to main add it, so a green PR can still hide a slow-test failure on main.
+
 ## Releases & benchmarking
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).
@@ -122,20 +125,21 @@ DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDr
 | `prism_hadamard_qwen35` | `prism_hadamard_qwen35` | Bonsai 2: qwen3_5 behind block Hadamard rotations, f16 activations, exact 2-bit GEMVs |
 | `qwen4_exp(_text)` | `qwen4_exp` | Qwen3.8-Flash-Next: hyper-connections, n-gram PLE, QSA; batched text, exclusive MTP slot |
 | `nemotron_h`, `nemotron_h_puzzle`, `nemotron_h_omni` | `nemotron_h` | Transformer + Mamba2 hybrid, NoPE attention, RADIO vision, LiLiCorr DFlash, MTP sidecar |
+| `nemo_speechlm` | `nemotron_transcribe` | Nemotron 3.5 Transcribe: the Nemotron-H trunk (weights under `llm.`) + ASR and speaker encoders via `MediaHooks`; `/v1/audio/transcriptions` and chat `input_audio` |
 | `lfm2`, `lfm2_moe`, `lfm2_vl` (`lfm2-vl`) | `lfm2` | Gated conv + attention hybrid; SigLIP2 NaFlex tower with tiling |
 | `lfm3`, `lfm3_vl`, `lfm3_audio`, `lfm3_omni` | `lfm3` | Gated conv + full/sliding gated attention, sandwich norms, zero-tail partial RoPE; VL + speech towers via `MediaHooks`; speech OUT via `SpeechHooks` (OpenAI `modalities`, `/v1/audio/speech`) |
 | `laguna`, `kolibri1`, `flint` | same | Sliding + NoPE attention arms with sigmoid MoE and an UNGATED shared expert |
 | `gpt_oss`, `spark2_5`, `k2_horizon`, `muse_glimmer(_text)` | same | Sink attention / sliding dense / grouped-RMS Llama / Muse VL (Harmony channels, ATEM tools) |
 | `mimo_v2`, `mimo_v2_flash` | `mimo_v2` | MiMo-V2.6-Flash, mlx-lm's layout (release refused by name); legacy forward deleted; MTP = 3 heads (`mtp_head.zig`); stream packs (`expert_streaming`) stream their `experts.bin` through the same table |
 | `inkling_mm_model` | `inkling` | NO RoPE (relative-logit bias + short convs); serial, spec off |
-| `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state (V4 single-flight; V4.1 one state per slot, plain decode batched), DSML tools on our byte-pinned templates, DSpark; V4.1 images + EXL3 stream packs |
+| `deepseek_v4`, `deepseek_v41` | `deepseek_v4`, `deepseek_v41` | 1M ctx, module-owned state (V4 single-flight; V4.1 one state per slot, decode and DSpark rounds batched), DSML tools on our byte-pinned templates, DSpark; V4.1 images + EXL3 stream packs |
 | `bailing_hybrid` | `bailing_hybrid` | Ling 3.0: KDA + MLA hybrid MoE |
 | `glm5_next(_text)`, `glm_moe_dsa` | `glm5_next` | GLM-5.3-Flash: KDA + DSA inside mHC, 288-expert MoE, batched decode, `mtp.0` head, vision |
 | `kev`, `laya`, `d1`, `clef` | same | Typed decisions (`POST /v1/decisions`) |
 | `qwen3_asr` | `qwen3_asr` | `/v1/audio/transcriptions` only, + the forced aligner (`qwen3_forced_aligner`) |
 | `nemotron_diarization` | `nemotron_diarization` | `diarized_json` speakers, run once over the whole clip |
 | `*.gguf` | engines | ds4 / llama.cpp (above); GGUF presence WINS over a stray config.json |
-| media | `flux2`, `krea`, `mage_flow`, `qwen_image`, `moss_image`, `ltx`, `minimax_h3`, `hunyuan3d`, `trellis2`, `pixal3d`, `acestep`, `music3`, `stable_audio3`, `yue2`, `qwen3_tts`, `kokoro` | Media plugins (`abi/media.zig`); configless packs are claimed from `model_index.json` / `pipeline.json` / `model_config.json` (`sdk/media/pack_claims.zig`) |
+| media | `flux2`, `krea`, `mage_flow`, `qwen_image`, `moss_image`, `ltx`, `minimax_h3`, `hunyuan3d`, `trellis2`, `pixal3d`, `idol`, `acestep`, `music3`, `stable_audio3`, `yue2`, `qwen3_tts`, `kokoro` | Media plugins (`abi/media.zig`); configless packs are claimed from `model_index.json` / `pipeline.json` / `model_config.json` (`sdk/media/pack_claims.zig`) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
 

@@ -48,7 +48,12 @@ fn isOutputOnlySpecial(content: []const u8) bool {
     // harmony (gpt_oss): declares a tool call's argument content type inside
     // the header the MODEL writes — `to=functions.x <|constrain|>json`. The
     // template renders tool calls only when replaying history, and omits it.
-    return std.mem.eql(u8, content, "<|constrain|>");
+    if (std.mem.eql(u8, content, "<|constrain|>")) return true;
+    // Nemotron Transcribe's speaker, non-speech event and speaking-style tags: the model writes them, no prompt does.
+    inline for (.{ "<spk:", "<ev:", "<sty:" }) |prefix| {
+        if (std.mem.startsWith(u8, content, prefix)) return true;
+    }
+    return false;
 }
 
 pub fn reservedOutputIds(

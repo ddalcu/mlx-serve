@@ -20,6 +20,7 @@
 | **Laguna** | `laguna` | poolside Laguna S 2.1 / XS (117.6B-A8.5B MoE coder, nvfp4) | GLM tags, pre-opened think | -- |
 | **Kolibri-1** | `kolibri1` | [`here-be-dragons-ai/Kolibri-1-MLX-3bit`](https://huggingface.co/here-be-dragons-ai/Kolibri-1-MLX-3bit) (78B-A3.5B MoE, 33 GiB) | ChatML, `reasoning_effort` | -- |
 | **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | ChatML | -- |
+| **Nemotron 3.5 Transcribe** | `nemo_speechlm` | `nvidia/NVIDIA-Nemotron-3.5-Transcribe-30B-A4B` (34B-A4B, speech in), converted with `scripts/convert_nemotron_transcribe.py` (8-bit group 128 by default). Transcription, translation, speaker tags and audio questions on `/v1/audio/transcriptions` and chat `input_audio`; word timestamps, `srt`/`vtt` and `diarized_json` from its own CTC head and speaker expert; MTP drafting | ChatML, thinking via `enable_thinking` | ASR and speaker encoders |
 | **LFM2 / LFM2.5** | `lfm2`, `lfm2_vl` | LFM2.5-2.6B (8-bit, bf16, nvfp4, mxfp4), LFM2.5-VL 3B / 1.6B | ChatML, Pythonic tool calls | SigLIP2, big images tiled |
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
 | **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral turns | -- |

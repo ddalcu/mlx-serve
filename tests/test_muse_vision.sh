@@ -6,12 +6,13 @@
 #   tests/test_muse_vision.sh [model_dir] [port]   # default the 4-bit mirror; SKIPs when absent
 #
 # Parity: the MUSE_VISION_MODEL / MUSE_VISION_FIXTURE oracle in src/plugins/muse_glimmer/vision.zig.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-${MUSE_VISION_MODEL:-$HOME/.mlx-serve/models/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit}}"
+MODEL="${1:-${MUSE_VISION_MODEL:-$(find_model ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit || echo "$HOME/.mlx-serve/models/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit")}}"
 PORT="${2:-11386}"
 HOUSE="tests/fixtures/house.jpeg"
 ROBOT="tests/fixtures/robot.png"

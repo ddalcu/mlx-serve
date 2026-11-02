@@ -7,9 +7,10 @@
 #
 # Usage: ./tests/test_tool_parsing.sh [model_dir] [port]
 # Starts its own server, runs tests, kills it.
+source "$(dirname "$0")/_lib_models.sh"
 
 source "$(dirname "$0")/lib/server.sh"
-MODEL_DIR=${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}
+MODEL_DIR=${1:-${MLX_SERVE_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}}
 PORT=${2:-8097}
 BASE="http://127.0.0.1:$PORT"
 BINARY="./zig-out/bin/mlx-serve"

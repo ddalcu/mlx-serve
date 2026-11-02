@@ -458,6 +458,39 @@ test "plugin forward: a module-owned model's prompt reads only the last row's lo
     try testing.expectEqual(@as(usize, 5), s[1].kv.step);
 }
 
+test "plugin forward: a prompt forward hands the plugin the host's prefill counter, a decode step does not" {
+    const T = struct {
+        var saw_progress = false;
+        /// A whole-prompt prefill reports the rows it has forwarded once its last chunk lands.
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            saw_progress = f.progress != null;
+            if (f.progress) |p| @atomicStore(u64, p, f.rows, .monotonic);
+            return llama.table.forward(m, f, out);
+        }
+        const table: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.forward = &forward;
+            break :blk t;
+        };
+    };
+    var b: Served = undefined;
+    try b.open(.{}, 0x9f11);
+    defer b.close();
+    b.xfm.plugin.?.table = &T.table;
+    var s: Slot = undefined;
+    try s.init(b.layers);
+    defer s.deinit();
+    var counter = std.atomic.Value(u64).init(0);
+    s.ctx.prefill_progress = &counter;
+    var g = ops.Graph.init(testing.allocator, fixture.stream());
+    defer g.deinit();
+    _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9, 10, 11 })));
+    try testing.expect(T.saw_progress);
+    try testing.expectEqual(@as(u64, 5), counter.load(.monotonic));
+    _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{12})));
+    try testing.expect(!T.saw_progress);
+}
+
 test "plugin caps: module decode state, readonly sharing, spec rollback, whole-prompt prefill and the prefix cache read the served caps" {
     var b: Served = undefined;
     try b.open(.{}, 0xca95);

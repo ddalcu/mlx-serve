@@ -9,13 +9,14 @@
 #   VISION_CHUNK_TEST_MODEL=<vision model> ./tests/test_vision_chunked_prefill.sh [port]   # default LFM2.5-VL-1.6B
 #
 # SKIPs without a vision model. Hermetic twins: spliceVisionRows chunk / audio / video tests, countSpliceRows.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11499}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${VISION_CHUNK_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/LFM2.5-VL-1.6B-4bit}"
+MODEL="${VISION_CHUNK_TEST_MODEL:-$(find_model mlx-community/LFM2.5-VL-1.6B-4bit || echo "$HOME/.mlx-serve/models/mlx-community/LFM2.5-VL-1.6B-4bit")}"
 WORK="$(mktemp -d)"
 SERVER_PID=""
 

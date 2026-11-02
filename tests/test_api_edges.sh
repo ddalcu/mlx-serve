@@ -10,11 +10,12 @@
 # stop "" matched at position 0 (empty reply), json_schema without a schema
 # fell open silently, an undecodable image_url vanished from the prompt, an
 # empty embedding input was a 500, and Ollama's load handshake was a 400.
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+MODEL="${1:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 PORT="${2:-11512}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -167,6 +168,13 @@ req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_for
 expect_status 400 "json_schema without a schema"
 req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":20,\"output_config\":{\"format\":{\"type\":\"json_schema\"}},\"messages\":[$U]}"
 expect_status 400 "messages: output_config json_schema without a schema"
+BADS='{"type":"object","properties":{"a":{"type":"strng"}},"required":["a"]}'
+req POST /v1/chat/completions "{\"model\":\"m\",\"messages\":[$U],\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{\"name\":\"x\",\"schema\":$BADS}},\"max_tokens\":20}"
+expect_status 400 "json_schema the grammar cannot compile"
+req POST /v1/messages "{\"model\":\"m\",\"max_tokens\":20,\"output_config\":{\"format\":{\"type\":\"json_schema\",\"schema\":$BADS}},\"messages\":[$U]}"
+expect_status 400 "messages: output_config schema the grammar cannot compile"
+req POST /v1/responses "{\"model\":\"m\",\"max_output_tokens\":20,\"text\":{\"format\":{\"type\":\"json_schema\",\"name\":\"x\",\"schema\":$BADS}},\"input\":\"hi\"}"
+expect_status 400 "responses: text.format schema the grammar cannot compile"
 req POST /v1/responses '{"model":"m","max_output_tokens":20,"text":{"format":{"type":"json_schema","name":"x","schema":"nope"}},"input":"hi"}'
 expect_status 400 "responses: text.format json_schema with a non-object schema"
 req POST /v1/chat/completions '{"model":"m","messages":[{"role":"user","content":"Describe a cat."}],"response_format":{"type":"json_schema","json_schema":{"name":"x","strict":true,"schema":{"type":"object","properties":{"kind":{"type":"string","enum":["cat","dog"]},"legs":{"type":"integer"},"tags":{"type":"array","items":{"type":"string"}},"meta":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}},"required":["kind","legs","tags","meta"],"additionalProperties":false}}},"max_tokens":120,"temperature":0}'

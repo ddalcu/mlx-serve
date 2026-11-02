@@ -7,13 +7,14 @@
 #
 # Uses a server already on the port, else starts E4B + drafter (the Claude Code launch shape). A failed recall is
 # the "acts like it is the first time" class: thinking leaking back as input, a dropped turn, a bad cache reset.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"
-MODEL="${LONG_AGENT_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
-DRAFTER="${LONG_AGENT_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
+MODEL="${LONG_AGENT_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
+DRAFTER="${LONG_AGENT_TEST_DRAFTER:-$(find_model mlx-community/gemma-4-E4B-it-assistant-bf16 || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16")}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'

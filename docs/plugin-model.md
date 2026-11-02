@@ -79,9 +79,16 @@ A plugin is a table (`abi.ModelTable`) of C-ABI functions. The host calls them i
   `cache_ops.release(&view)`. `fwd.logits` says `last_row`, `all_rows` or `none`. Everything you allocate per step
   is freed per step (the scaffold's `Graph` does this).
 - **MLX** is the mlx-c API (`@import("mlx_c")`): ops like `mlx_fast_rms_norm`, `mlx_fast_rope`,
-  `mlx_fast_scaled_dot_product_attention`, `mlx_matmul`. The kit ships no layer blocks: the server's attention,
-  MoE, GDN and quant blocks live in its `src/sdk` and are not part of the plugin contract, so a plugin writes its
-  layers on mlx-c (or vendors its own). `kit.sdk` holds the claim helpers and the test fixtures (`src/sdk/root.zig`).
+  `mlx_fast_scaled_dot_product_attention`, `mlx_matmul`. A plugin can write its layers on mlx-c, or call the
+  server's own blocks through `kit.blocks`: norms, conv, ssm, schedulers, vae, dit pieces, embedding, and the
+  transformer blocks (linear, qmm, mlp, rope, attention, moe, hc, gdn; Metal only, no CUDA files). Blocks are
+  compiled into your dylib and take `kit.mlx` handles (`{ ctx }`, like mlx-c's: convert with `.{ .ctx = x.ctx }`).
+  They are versioned with the kit and a newer kit may rename or change them: build against one kit and pin it.
+  A block that does not apply returns null and the caller keeps its own ops (`_example`'s `addNorm`).
+- **Your own weight layout.** `qmatmul` and the expert matmul read a layout they do not know through
+  `kit.foreign`: register a `Format` (`claims` the (weight, scales) pair, `linear`, optionally `gather`) in `load`,
+  before the first forward. The server's own foreign formats (GGUF, fp8) are not in the kit's list. Beyond that,
+  `kit.sdk` holds the claim helpers and the test fixtures.
 
 ## Read these in the kit
 

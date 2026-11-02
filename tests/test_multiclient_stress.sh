@@ -16,11 +16,11 @@ PORT=${1:-8135}
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
-MODELS_ROOT="$HOME/.mlx-serve/models"
-CHAT_A="${STRESS_CHAT_A:-$MODELS_ROOT/mlx-community/gemma-4-e4b-it-4bit}"
-CHAT_B="${STRESS_CHAT_B:-$MODELS_ROOT/mlx-community/gemma-4-e2b-it-4bit}"
-TTS="${STRESS_TTS-$MODELS_ROOT/ddalcu/Kokoro-82M-MLX-Serve}"
-IMAGE="${STRESS_IMAGE-$MODELS_ROOT/Runpod/FLUX.2-klein-4B-mflux-4bit}"
+source "$(dirname "$0")/_lib_models.sh"
+CHAT_A="${STRESS_CHAT_A:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
+CHAT_B="${STRESS_CHAT_B:-$(find_model mlx-community/gemma-4-e2b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e2b-it-4bit")}"
+TTS="${STRESS_TTS-$(find_model ddalcu/Kokoro-82M-MLX-Serve || echo "$HOME/.mlx-serve/models/ddalcu/Kokoro-82M-MLX-Serve")}"
+IMAGE="${STRESS_IMAGE-$(find_model Runpod/FLUX.2-klein-4B-mflux-4bit || echo "$HOME/.mlx-serve/models/Runpod/FLUX.2-klein-4B-mflux-4bit")}"
 N_AGENTS=${N_AGENTS:-3}
 N_PLAIN=${N_PLAIN:-2}
 N_TTS=${N_TTS:-3}
@@ -218,7 +218,9 @@ PY
 
 # ---------------------------------------------------------------- server ----
 echo "== booting headless server on :$PORT (log: $LOG) =="
-"$BINARY" --serve --port "$PORT" --model-dir "$MODELS_ROOT" \
+# Every model root, so a pack find_model located on any of them is served.
+ROOTS=(); while IFS= read -r r; do ROOTS+=(--model-dir "$r"); done < <(model_roots)
+"$BINARY" --serve --port "$PORT" "${ROOTS[@]}" \
     --max-concurrent 8 --metrics --log-level info --log-file "$LOG" > "$TMP/stdout.log" 2>&1 &
 SRV=$!
 srv_wait_health "$BASE" 60 0.5 || { echo -e "${RED}FAIL${NC} server did not come up"; tail -20 "$TMP/stdout.log"; exit 1; }
@@ -339,8 +341,8 @@ engaged() {  # pattern expected_count leg
 }
 engaged "model id=$ID_A ready" 1 "chat A load"
 engaged "model id=$ID_B ready" 1 "chat B load"
-[ -n "$ID_IMG" ] && engaged '\[image\] -> [0-9]+ PNG bytes' $((N_IMG * SOAK_WAVES)) "image generations"
-[ -n "$ID_TTS" ] && engaged ' -> [0-9]+ WAV bytes' $((N_TTS * SOAK_WAVES)) "TTS generations"
+[ -n "$ID_IMG" ] && engaged '\[gen\] [a-z0-9_]+ -> [0-9]+ bytes|\[image\] -> [0-9]+ PNG bytes' $((N_IMG * SOAK_WAVES)) "image generations"
+[ -n "$ID_TTS" ] && engaged '\[gen\] (qwen3_tts|kokoro) -> [0-9]+ bytes| -> [0-9]+ WAV bytes' $((N_TTS * SOAK_WAVES)) "TTS generations"
 
 if [ "$FAILED" -gt 0 ]; then
     echo -e "${RED}FAIL${NC} $FAILED worker(s) failed (server survived)"

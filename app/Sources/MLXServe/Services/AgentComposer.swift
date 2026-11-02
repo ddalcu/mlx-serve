@@ -56,7 +56,7 @@ enum AgentComposer {
 
     /// Same request, every stage as it arrives. `image` rides the user turn.
     static func events(userText: String, systemPrompt: String, images: [Data] = [], appState: AppState,
-                       maxTokens: Int = 512) -> AsyncThrowingStream<Event, Error> {
+                       maxTokens: Int = 512, reasoningEffort: String? = nil) -> AsyncThrowingStream<Event, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -81,6 +81,8 @@ enum AgentComposer {
                         messages: messages,
                         maxTokens: maxTokens,
                         temperature: 0.7,
+                        enableThinking: reasoningEffort != nil,
+                        reasoningEffort: reasoningEffort,
                         defaults: APIClient.RequestDefaults.from(appState.serverOptions),
                         modelId: server.chatRequestModelId(selectedPath: path))
                     for try await event in stream {

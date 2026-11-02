@@ -1285,6 +1285,21 @@ test "reservedOutputIds: an OUTPUT-ONLY special is legit output the template can
     try testing.expectEqual(@as(u32, 200013), ids[0]);
 }
 
+test "reservedOutputIds: Nemotron Transcribe's speaker, event and style tags are output the template never writes" {
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 11, .content = "<spk:0>" },
+        .{ .id = 12, .content = "<ev:laughter>" },
+        .{ .id = 13, .content = "<sty:end:flat>" },
+        .{ .id = 14, .content = "<SPECIAL_14>" },
+    };
+    const eos = [_]u32{2};
+    const ids = try reservedOutputIds(alloc, &flagged, "<|im_start|>{{ content }}", &eos);
+    defer alloc.free(ids);
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqual(@as(u32, 14), ids[0]);
+}
+
 test "reservedOutputIds: specials minus template markers minus eos" {
     // A reserved marker (`<|fim_hole|>` at a collapsed position) in
     // chat output is always a bug; the suppression set is every `special:

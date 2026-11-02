@@ -47,6 +47,21 @@ pub fn dsv41(xfm: *const Transformer) ?*v41plugin.Module {
     return if (served(b.table, @import("../../../plugins/deepseek_v41/config.zig").plugin.name)) v41plugin.moduleOf(b.model) else null;
 }
 
+/// The DeepSeek-V4.1 live state of each slot behind `ctxs` and its identity, for a DSpark group round
+/// (`spec/dspark_group.zig`); false where the module runs no batch or a slot has none.
+pub fn dsv41States(xfm: *const Transformer, ctxs: []const *ForwardCtx, states: []*v41plugin.State, gens: []u64) bool {
+    const b = xfm.plugin orelse return false;
+    if (dsv41(xfm) == null or ctxs.len > max_dsv41_group) return false;
+    var slots: [max_dsv41_group]u32 = undefined;
+    for (ctxs, slots[0..ctxs.len]) |c, *s| {
+        if (c.plugin_slot == 0) return false;
+        s.* = c.plugin_slot;
+    }
+    return v41plugin.slotStates(b.model, slots[0..ctxs.len], states, gens);
+}
+
+const max_dsv41_group = 16;
+
 /// Whether `table` is the plugin named `name`. By name: under `-Dunits` the served table is the plugin unit's export,
 /// and this unit's copy of it sits at another address.
 fn served(table: *const abi.ModelTable, name: []const u8) bool {

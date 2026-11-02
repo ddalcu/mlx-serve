@@ -85,7 +85,7 @@ fn modulePromptMatch(slot: *Slot, binding: prefix_cache_mod.ModuleBinding) ?pref
 }
 
 fn restoreModuleMatch(sch: *Scheduler, slot: *Slot, binding: prefix_cache_mod.ModuleBinding, match: prefix_cache_mod.ModuleMatch, id: u32) usize {
-    if (match.source == .ram) return slot.model.prefix_cache.?.consumeModule(binding, match.entry_id, id);
+    if (match.source == .ram) return slot.model.prefix_cache.?.restoreModule(binding, match.entry_id, id);
     const restored = restoreDiskModule(sch, slot, binding, match, id) catch |err| {
         log.warn("[disk-cache] module import id={d} failed: {s}; prefilling cold\n", .{ match.disk_id, @errorName(err) });
         return 0;
@@ -302,7 +302,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     if (module_binding) |binding| {
         hot_matched = @intCast(try restoreModulePrompt(sch, slot, binding));
         prefill_tokens = slot.full_prompt[hot_matched..];
-        hot_checked_out = hot_matched > 0;
         publishHotCacheResidency(sch);
     } else {
         // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
@@ -475,10 +474,9 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 evicted_live_bytes = report.bytes;
                 fits = report.admitted;
                 if (!fits and hot_matched > 0) if (module_binding) |binding| {
-                    // Consumed snapshots have no donor left to evict. Drop their live state once.
+                    // The live state pins the buffers it shares with its entry. Drop it once.
                     try beginModulePrompt(slot, binding, 0);
                     hot_matched = 0;
-                    hot_checked_out = false;
                     prefill_tokens = slot.full_prompt;
                     slot.restored_entry = 0;
                     probe.warm_matched = 0;

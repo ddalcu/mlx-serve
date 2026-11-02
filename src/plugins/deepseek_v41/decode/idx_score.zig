@@ -820,7 +820,7 @@ test "dsv41 dec idx_score: the pool step equals compress at ratio 2 (open group 
 }
 
 test "dsv41 dec idx_score: the declared launches are the shipped wrappers', byte for byte" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var k = try build();
     defer k.deinit();

@@ -65,9 +65,6 @@ pub const Weights = struct {
     final_norm: Array,
     /// The sliding layers' band: keys with `|i - j| < band` (0 = every layer attends over all keys).
     band: u32 = 0,
-    /// Floor the band under the key mask at a finite value: a padded query whose band holds only padding would
-    /// softmax over -inf and its NaN row reach the real rows through V (EmbeddingGemma 2).
-    floor_pad: bool = false,
     /// The per-layer inputs' projection and norm (`ple_dim` 0 = none).
     ple_proj: Linear = .{},
     ple_proj_norm: Array = .{},
@@ -117,8 +114,10 @@ pub fn forward(w: *const Weights, shared: *const bases.Shared, g: *Graph, ids: A
         const band = try g.adopt(try encoderBandMask(gpa, t, w.band, g.s));
         sliding = band;
         if (key_mask.ctx != null) {
+            // Floored: a padded query whose band holds only padding would softmax over -inf, and its NaN row reach the
+            // real rows through V. exp(-1e9) is 0 in f32, so every other row is unchanged.
             const sum = try g.add(band, key_mask);
-            sliding = if (w.floor_pad) try g.maximum(sum, try g.scalar(-1.0e9, ops.dtype(sum))) else sum;
+            sliding = try g.maximum(sum, try g.scalar(-1.0e9, ops.dtype(sum)));
         }
     }
 
@@ -210,7 +209,6 @@ pub fn load(ctx: *const abi.LoadCtx, kind: Kind) !*Loaded {
         .layers = m.layers,
         .final_norm = try r.norm(o, try r.name(&nb, "norm.weight", .{}), off),
         .band = if (!c.has_sliding_window) 0 else if (kind == .embedding_gemma2) c.sliding_window + 1 else c.sliding_window,
-        .floor_pad = kind == .embedding_gemma2,
         .compiled = &m.compiled,
     };
     switch (kind) {

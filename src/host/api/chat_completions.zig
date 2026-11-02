@@ -1,6 +1,7 @@
 //! handleChatCompletions; constrained emit, handleNonStreamingGeneration
 
 const std = @import("std");
+const schema_check = @import("schema_check.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
@@ -503,6 +504,10 @@ pub fn handleChatCompletions(
                 const declared: ?std.json.Value = if (rf.object.get("json_schema")) |js| (if (js == .object) js.object.get("schema") else null) else null;
                 if (declared == null or declared.? != .object) {
                     try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "response_format.json_schema.schema must be a JSON object (use {\"type\":\"json_object\"} for unconstrained JSON)", 400);
+                    return;
+                }
+                if (schema_check.grammarSchemaError(allocator, declared.?)) |msg| {
+                    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
                     return;
                 }
                 // Extract the schema JSON string from the raw body

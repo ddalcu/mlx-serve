@@ -107,7 +107,7 @@ fn int(body: *const job.Body, key: []const u8) ?i64 {
 const Job = struct { shape: hy3d.MeshOpts, texture: bool, paint: paint.PaintOpts };
 const Parsed = union(enum) { ok: Job, bad: Verdict };
 
-/// `steps` (1..100, 30), `octree_resolution` (64..512, 256), `guidance_scale` (0..20, 5), `seed`, and `texture`
+/// `steps` (2..100, 30: the flow sampler needs two sigmas), `octree_resolution` (64..512, 256), `guidance_scale` (0..20, 5), `seed`, and `texture`
 /// (the paint stage, `texture_steps` 1..100); TRELLIS.2's finish fields are refused by name.
 fn parseJob(body: *const job.Body, has_paint: bool) Parsed {
     const obj = &body.parsed.value.object;
@@ -115,7 +115,7 @@ fn parseJob(body: *const job.Body, has_paint: bool) Parsed {
         return .{ .bad = bad("'roughness_scale' and 'clearcoat' are TRELLIS.2 and Pixal3D fields (a Hunyuan3D texture's finish comes from its paint)") };
     var o = Job{ .shape = .{ .steps = 30, .guidance = 5, .seed = body.uint("seed") orelse 42, .octree_resolution = 256 }, .texture = body.flag("texture"), .paint = .{} };
     if (int(body, "steps")) |n| {
-        if (n < 1 or n > 100) return .{ .bad = bad("'steps' must be in [1,100]") };
+        if (n < 2 or n > 100) return .{ .bad = bad("'steps' must be in [2,100]") };
         o.shape.steps = @intCast(n);
     }
     if (int(body, "octree_resolution")) |r| {
@@ -344,6 +344,7 @@ test "hunyuan3d: the paint stage resolves inside the pack first, then as the loc
 }
 
 test "hunyuan3d: a job whose GPU stage latched a failure is refused by class, never a GLB of zeros" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());
@@ -359,6 +360,7 @@ test "hunyuan3d: a job whose GPU stage latched a failure is refused by class, ne
 }
 
 test "hunyuan3d: a job on the tiny pack is a GLB; fields and a missing paint stage are refused by name" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());
@@ -369,7 +371,7 @@ test "hunyuan3d: a job on the tiny pack is a GLB; fields and a missing paint sta
     const cases = [_][2][]const u8{
         .{ "{\"images\":[\"x\",\"y\"]}", "'images' (several views of one object) is served by Pixal3D; this model takes one 'image'" },
         .{ "{\"image\":\"x\",\"clearcoat\":0.5}", "'roughness_scale' and 'clearcoat' are TRELLIS.2 and Pixal3D fields (a Hunyuan3D texture's finish comes from its paint)" },
-        .{ "{\"image\":\"x\",\"steps\":0}", "'steps' must be in [1,100]" },
+        .{ "{\"image\":\"x\",\"steps\":1}", "'steps' must be in [2,100]" },
         .{ "{\"image\":\"x\",\"octree_resolution\":32}", "'octree_resolution' must be in [64,512]" },
         .{ "{\"image\":\"x\",\"guidance_scale\":21}", "'guidance_scale' must be in [0,20]" },
         .{ "{\"image\":\"x\",\"texture\":true}", "texture requested but the paint weights are not installed (run tests/convert_hunyuan3d_paint_weights.py, or set HY3D_PAINT_DIR)" },
@@ -378,6 +380,7 @@ test "hunyuan3d: a job on the tiny pack is a GLB; fields and a missing paint sta
 }
 
 test "hunyuan3d: the tiny pack's latent and SDF grid are bit-equal to its golden run" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());

@@ -8,13 +8,13 @@
 ~^(__anon|__unnamed|\.str|l_)
 
 # env caches (each unit reads the same environment)
-~^env\.|_env$|\.Env\.on$
+~^env\.|_env$|_env_cached$|\.Env\.on$
 
 # kernel, pipeline and config caches, calibration (per process, rebuilt on first use)
-~(kernel|_kern\b|metallib|pipeline|_cfgs?$|_cfg_keys?$|_keys?$|cfg\d?$|cfg_next$|_next$|plans?$|tables?$|tpls$|header$|prepared$|shapes$|tiled$|memo_\w+$|canaries$|_ok$|declined$|served(_vec)?$|launchable$|threads$|armed(_next)?$|banked$|placeholder$|max_rows$|fused_row_groups$|scalar_tick$|packed_scales$|one_arr$|half_dq$|no_bias$|eps(_val)?$|mma_\w+$|_rows$|_arch(_buf|_read)?$|enabled\.Env)
+~(kernel|_kern\b|metallib|pipeline|_cfgs?$|cfg_cache$|_cfg_keys?$|_keys?$|cfg\d?$|cfg_next$|_next$|plans?$|tables?$|tpls$|header$|prepared$|shapes$|tiled$|memo_\w+$|canaries$|_ok$|declined$|served(_vec)?$|launchable$|threads$|armed(_next)?$|banked$|placeholder$|max_rows$|fused_row_groups$|scalar_tick$|packed_scales$|one_arr$|half_dq$|no_bias$|eps(_val)?$|mma_\w+$|_rows$|_arch(_buf|_read)?$|enabled\.Env)
 
 # one-time log flags and counters a unit keeps for its own lines
-~(engaged|_logged|logged_|\.logged$|_warned|warned|_once$|once_|\.Once$|announced$|_said$|tried$|_hits$|_calls$|launches$|_dispatches$|_graphs$|_seeds$|_appends$|_allocs$|_grows$|_read$|_used(_\w+)?$|unmaps$|syncs$)
+~(engaged|_logged|logged_|\.logged$|_warned|warned|late_fold_mu$|_once$|once_|\.Once$|announced$|_said$|tried$|_hits$|_calls$|launches$|_dispatches$|_evals$|_graphs$|_seeds$|_appends$|_allocs$|_grows$|_read$|_used(_\w+)?$|unmaps$|syncs$)
 
 # test and diagnostic overrides (never set in a server)
 ~(_override$|override$|_test_force$|disabled_for_test$|standin|qwen4_trace|Qwen4AttnProf|_prof_ns$|dsv4_trace|trace_\w+$|dtype_trace_seen$|_build_failed$|_state$|_obj$|decline_bits$|dump_\w+$)
@@ -103,3 +103,5 @@ host.registry.memory_ceiling.wired_limit_bytes_cached
 sdk.spec.mtp.mtp.top32_final_cached
 sdk.spec.mtp.mtp.top32_partial_cached
 sdk.blocks.linear.verify_projection.verify_wide_configs
+# foreign quant layouts an outside plugin registers in its own dylib; a server unit holds an empty copy
+sdk.quant.foreign.registry

@@ -49,6 +49,10 @@ pub const Api = struct {
     encode_vision: *const fn (*Scheduler, *requests.VisionEncodeRequest, *mlx.mlx_array) Err,
     /// Qwen3-ForcedAligner: the 80 ms step each `<timestamp>` in `ids` lands on, run on the inference thread.
     timestamp_classes: *const fn (std.mem.Allocator, *LoadedModel, []const u32, mlx.mlx_array, u32, *[]u32) Err,
+    /// A speech plugin's own timing (`MediaHooks.word_times`): a start and an end in ms per unit, inference thread.
+    plugin_word_times: *const fn (std.mem.Allocator, *LoadedModel, []const f32, []const []const u8, []const f32, u32, *[]u32) Err,
+    /// A speech plugin's own speaker activity (`MediaHooks.diarize`): `[frames][speakers]` per 10 ms, inference thread.
+    plugin_diarize: *const fn (std.mem.Allocator, *LoadedModel, []const f32, *u32, *[]f32) Err,
     // ── what the host reports
     batches_decode: *const fn (*const ModelConfig) bool,
     facts: *const fn (*const LoadedModel, *Facts) void,
@@ -213,6 +217,18 @@ pub fn encodeVision(sch: *Scheduler, req: *requests.VisionEncodeRequest) !mlx.ml
 pub fn timestampClasses(gpa: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, rows: mlx.mlx_array, timestamp_token: u32) ![]u32 {
     var out: []u32 = &.{};
     try err_name.check(api().timestamp_classes(gpa, lm, ids, rows, timestamp_token, &out));
+    return out;
+}
+
+pub fn pluginWordTimes(gpa: std.mem.Allocator, lm: *LoadedModel, pcm: []const f32, units: []const []const u8, activity: []const f32, speakers: u32) ![]u32 {
+    var out: []u32 = &.{};
+    try err_name.check(api().plugin_word_times(gpa, lm, pcm, units, activity, speakers, &out));
+    return out;
+}
+
+pub fn pluginDiarize(gpa: std.mem.Allocator, lm: *LoadedModel, pcm: []const f32, speakers: *u32) ![]f32 {
+    var out: []f32 = &.{};
+    try err_name.check(api().plugin_diarize(gpa, lm, pcm, speakers, &out));
     return out;
 }
 

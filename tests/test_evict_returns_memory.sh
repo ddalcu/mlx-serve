@@ -6,14 +6,13 @@
 # make-room; both packs must sit on a root and fit 3/4 of RAM together (a big victim + small next tips the preflight).
 #
 #   ./tests/test_evict_returns_memory.sh [port]
-#   EVICT_TEST_ROOT, EVICT_VICTIM=<org/repo>, EVICT_NEXT=<org/repo>, EVICT_CACHE_LIMIT_MB (1024)
+#   EVICT_VICTIM=<org/repo>, EVICT_NEXT=<org/repo>, EVICT_CACHE_LIMIT_MB (1024)
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11293}"
 BASE="http://127.0.0.1:$PORT"
-ROOT="${EVICT_TEST_ROOT:-$HOME/.mlx-serve/models}"
 VICTIM="${EVICT_VICTIM:-ddalcu/Qwen3.8-27B-MLX-Serve-4bit}"
 NEXT="${EVICT_NEXT:-prism-ml/Ternary-Bonsai-2-27B-mlx-2bit}"
 CACHE_LIMIT_MB="${EVICT_CACHE_LIMIT_MB:-1024}"
@@ -37,7 +36,8 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
 sleep 1
 LOG=$(mktemp)
 SAMPLER=$(mktemp)
-"$BINARY" --model-dir "$ROOT" --serve --host 127.0.0.1 --port "$PORT" --metrics \
+# Each pack is served from the root find_model found it on (a repeatable --model-dir).
+"$BINARY" --model-dir "${VICTIM_DIR%/"$VICTIM"}" --model-dir "${NEXT_DIR%/"$NEXT"}" --serve --host 127.0.0.1 --port "$PORT" --metrics \
     --max-resident-models 1 --log-level info >"$LOG" 2>&1 &
 SRV=$!
 cleanup() {

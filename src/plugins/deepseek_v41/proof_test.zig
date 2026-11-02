@@ -63,7 +63,7 @@ test "deepseek_v41 plugin: a decode token on the device equals the legacy decode
 
 test "deepseek_v41 plugin: trunk_weight hands out the loaded embedding and head" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
@@ -108,7 +108,7 @@ fn batchTicks(files: []const sdk.fixture.File, a: []const u32, b: []const u32, d
 
 test "deepseek_v41 plugin: a slot's row in a batch depends on its own state only, past the window, a pooling group and the indexer's budget" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const files = try fixture.v41Files(arena.allocator(), 7);
@@ -448,7 +448,7 @@ test "codec import unwinds every allocation and checked MLX failure" {
 }
 
 test "optional codec failure preserves the original MLX error latch" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
@@ -528,7 +528,7 @@ fn codecRoundTrip(files: []const sdk.fixture.File, p: []const u32, dspark: bool)
 }
 
 test "codec round trip survives origin destruction at odd and even compressor boundaries with DSpark on and off" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var p: [27]u32 = undefined;

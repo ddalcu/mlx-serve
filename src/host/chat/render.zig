@@ -4,6 +4,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const jinja_c = @import("jinja_c");
 const log = @import("../../sdk/util/log.zig");
+const os_mutex = @import("../../sdk/util/os_mutex.zig");
 const testing = std.testing;
 
 const ToolCall = @import("types.zig").ToolCall;
@@ -133,28 +134,26 @@ pub fn renderChatTemplate(
         var prepared = std.ArrayList(Message).empty;
         try prepared.appendSlice(a, effective_messages);
         const preserve = try templatePreservesMidSystem(a, effective_messages, chat_config, effective_tools_json, extra_json, empty_content);
+        if (!preserve) if (lateFoldWarningId(tpl)) |id| {
+            log.warn("chat template {x:0>16} cannot keep a late system message in place; it is folded into the leading system prompt, so each new note changes the prompt head and prefix reuse stops there (render a non-first system turn in place to keep it)\n", .{id});
+        };
         _ = try foldSystemMessages(a, &prepared, preserve);
         effective_messages = prepared.items;
     }
 
     if (try renderJinja(allocator, effective_messages, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
         defer allocator.free(rendered);
-        const collapsed = try collapseDoubledThinkTags(allocator, rendered);
-        // A continuation commits the content channel and then hands the model
-        // its own unfinished sentence. It runs INSTEAD of the thinking-off
-        // tail, never beside it — both append the same channel commit, and
-        // twice is a malformed turn header.
-        if (prefill) |partial| {
-            defer allocator.free(collapsed);
-            return std.mem.concat(allocator, u8, &.{
-                collapsed, contentChannelTail(tpl, collapsed, true), partial,
-            });
+        return finishRendered(allocator, rendered, tpl, prefill, enable_thinking, tools_json != null);
+    }
+    // A template that rejects a system turn (Mistral v0.3's `default`: roles alternate from user) gets it inside the
+    // first user turn: the generic format below speaks another family's turn markers.
+    if (fallback_arena == null) fallback_arena = std.heap.ArenaAllocator.init(allocator);
+    if (try systemInFirstUser(fallback_arena.?.allocator(), effective_messages)) |folded| {
+        if (try renderJinja(allocator, folded, chat_config, effective_tools_json, extra_json, empty_content)) |rendered| {
+            defer allocator.free(rendered);
+            if (lateFoldWarningId(tpl)) |id| log.warn("chat template {x:0>16} rejects a system turn; it is rendered inside the first user turn\n", .{id});
+            return finishRendered(allocator, rendered, tpl, prefill, enable_thinking, tools_json != null);
         }
-        if (noThinkTailSuffix(tpl, collapsed, enable_thinking, tools_json != null)) |suffix| {
-            defer allocator.free(collapsed);
-            return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
-        }
-        return collapsed;
     }
 
     // WARN, not debug: a failed render silently swaps the prompt into
@@ -171,6 +170,56 @@ pub fn renderChatTemplate(
         return std.mem.concat(allocator, u8, &.{ base, partial });
     }
     return base;
+}
+
+var late_fold_warned: [32]u64 = undefined;
+var late_fold_warned_len: usize = 0;
+var late_fold_mu: os_mutex.Mutex = .{};
+
+/// The template's id the first time it is seen here, else null: the late-system
+/// fold warns once per template (and stops once the table is full).
+fn lateFoldWarningId(tpl: []const u8) ?u64 {
+    const id = std.hash.Wyhash.hash(0, tpl);
+    late_fold_mu.lock();
+    defer late_fold_mu.unlock();
+    for (late_fold_warned[0..late_fold_warned_len]) |seen| if (seen == id) return null;
+    if (late_fold_warned_len == late_fold_warned.len) return null;
+    late_fold_warned[late_fold_warned_len] = id;
+    late_fold_warned_len += 1;
+    return id;
+}
+
+/// The rendered prompt's tail: doubled think tags collapsed, then the continuation's partial reply or the
+/// thinking-off suffix.
+fn finishRendered(allocator: std.mem.Allocator, rendered: []const u8, tpl: []const u8, prefill: ?[]const u8, enable_thinking: bool, has_tools: bool) ![]const u8 {
+    const collapsed = try collapseDoubledThinkTags(allocator, rendered);
+    // A continuation commits the content channel and then hands the model
+    // its own unfinished sentence. It runs INSTEAD of the thinking-off
+    // tail, never beside it — both append the same channel commit, and
+    // twice is a malformed turn header.
+    if (prefill) |partial| {
+        defer allocator.free(collapsed);
+        return std.mem.concat(allocator, u8, &.{
+            collapsed, contentChannelTail(tpl, collapsed, true), partial,
+        });
+    }
+    if (noThinkTailSuffix(tpl, collapsed, enable_thinking, has_tools)) |suffix| {
+        defer allocator.free(collapsed);
+        return std.mem.concat(allocator, u8, &.{ collapsed, suffix });
+    }
+    return collapsed;
+}
+
+/// `messages` with a leading system turn moved to the front of the first user turn's text; null without one.
+fn systemInFirstUser(a: std.mem.Allocator, messages: []const Message) !?[]const Message {
+    if (messages.len < 2 or !std.mem.eql(u8, messages[0].role, "system")) return null;
+    const u = for (messages[1..], 1..) |m, i| {
+        if (std.mem.eql(u8, m.role, "user")) break i;
+    } else return null;
+    const out = try a.alloc(Message, messages.len - 1);
+    @memcpy(out, messages[1..]);
+    out[u - 1].content = try std.mem.concat(a, u8, &.{ messages[0].content, "\n\n", messages[u].content });
+    return out;
 }
 
 pub fn hasExtraSystemMessages(messages: []const Message) bool {
@@ -509,6 +558,22 @@ test "collapseDoubledThinkTags handles multiple separated doublings" {
     const out = try collapseDoubledThinkTags(testing.allocator, "A</think></think>B</think></think>C");
     defer testing.allocator.free(out);
     try testing.expectEqualStrings("A</think>B</think>C", out);
+}
+
+test "renderChatTemplate: a template that rejects a system turn renders it inside the first user turn, never the generic format" {
+    // Mistral-7B-Instruct-v0.3's `default` template: roles must alternate starting with user, no system role.
+    const a = testing.allocator;
+    const mistral = "{{bos_token}}{% for message in messages %}{% if (message['role'] == 'user') != (loop.index0 % 2 == 0) %}{{ raise_exception('Conversation roles must alternate user/assistant/user/assistant/...') }}{% endif %}{% if message['role'] == 'user' %}{{ ' [INST] ' + message['content'] + ' [/INST]' }}{% elif message['role'] == 'assistant' %}{{ ' ' + message['content'] + ' ' + eos_token}}{% else %}{{ raise_exception('Only user and assistant roles are supported!') }}{% endif %}{% endfor %}";
+    const messages = [_]Message{
+        .{ .role = "system", .content = "Be brief." },
+        .{ .role = "user", .content = "Hi" },
+        .{ .role = "assistant", .content = "Hello." },
+        .{ .role = "user", .content = "Bye" },
+    };
+    const config = ChatConfig{ .chat_template = mistral, .bos_token = "<s>", .eos_token = "</s>", .add_bos_token = false, .allocator = a };
+    const out = try renderChatTemplate(a, &messages, &config, null, null, false, null, false);
+    defer a.free(out);
+    try testing.expectEqualStrings("<s> [INST] Be brief.\n\nHi [/INST] Hello. </s> [INST] Bye [/INST]", out);
 }
 
 test "renderChatTemplate: a tool-aware template with a generic role header renders tool turns natively" {
@@ -2072,6 +2137,33 @@ test "mid-system: unsupported templates fold without generic fallback or lost no
     }
 }
 
+test "mid-system: only a template that folds a late note claims its one warning" {
+    const a = testing.allocator;
+    const strict = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('System message must be at the beginning.') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}";
+    const leading_only = try std.mem.concat(a, u8, &.{ strict, "{# leading only #}" });
+    defer a.free(leading_only);
+    const qwen = @embedFile("../../fixtures/qwen38_chat_template.jinja");
+    const late = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "user", .content = "question" },
+        .{ .role = "system", .content = "late note" },
+    };
+    const leading = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "system", .content = "hook" },
+        .{ .role = "user", .content = "question" },
+    };
+    for ([_]struct { tpl: []const u8, msgs: []const Message, folds: bool }{
+        .{ .tpl = strict, .msgs = &late, .folds = true },
+        .{ .tpl = leading_only, .msgs = &leading, .folds = false },
+        .{ .tpl = qwen, .msgs = &late, .folds = false },
+    }) |case| {
+        const config = ChatConfig{ .chat_template = case.tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        for (0..2) |_| a.free(try renderChatTemplate(a, case.msgs, &config, null, null, false, null, false));
+        try testing.expectEqual(!case.folds, lateFoldWarningId(case.tpl) != null);
+    }
+}
+
 test "media renders one template placeholder per item, a tool image inside its tool response" {
     // Every vision template we serve must place a tool message's image: one it
     // drops is a named 400 on every later turn of an agent session.
@@ -2184,6 +2276,33 @@ test "chat: the embedded V4.1 template renders through jinja.cpp byte-exact with
         defer if (tools_z) |t| a.free(t);
         var len: usize = 0;
         const ptr = jinja_c.jinja_render_chat(tpl_z.ptr, msgs_z.ptr, if (tools_z) |t| t.ptr else null, extra_z.ptr, 1, &len) orelse {
+            std.debug.print("{s}: {s}\n", .{ o.get("label").?.string, if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "render failed" });
+            return error.RenderFailed;
+        };
+        defer jinja_c.jinja_str_free(ptr);
+        testing.expectEqualStrings(o.get("expected").?.string, ptr[0..len]) catch |e| {
+            std.debug.print("case: {s}\n", .{o.get("label").?.string});
+            return e;
+        };
+    }
+}
+
+test "chat: the embedded Nemotron Transcribe template renders through jinja.cpp byte-exact with NVIDIA's" {
+    // Cases and reference bytes from tests/nemo_speechlm_template_ab.py (the original template under jinja2).
+    const a = testing.allocator;
+    const tpl_z = try a.dupeSentinel(u8, @embedFile("../../fixtures/nemo_speechlm_chat_template.jinja"), 0);
+    defer a.free(tpl_z);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, @embedFile("../../fixtures/nemo_speechlm_template_cases.json"), .{});
+    defer parsed.deinit();
+    for (parsed.value.array.items) |case| {
+        const o = case.object;
+        const msgs = try std.json.Stringify.valueAlloc(a, o.get("messages").?, .{});
+        defer a.free(msgs);
+        const msgs_z = try a.dupeSentinel(u8, msgs, 0);
+        defer a.free(msgs_z);
+        const extra: [:0]const u8 = if (o.get("thinking").?.bool) "{}" else "{\"enable_thinking\":false}";
+        var len: usize = 0;
+        const ptr = jinja_c.jinja_render_chat(tpl_z.ptr, msgs_z.ptr, null, extra.ptr, 1, &len) orelse {
             std.debug.print("{s}: {s}\n", .{ o.get("label").?.string, if (jinja_c.jinja_last_error()) |e| std.mem.span(e) else "render failed" });
             return error.RenderFailed;
         };

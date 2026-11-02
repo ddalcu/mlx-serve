@@ -2369,3 +2369,46 @@
 "Everything at once: pictures, video and your voice in, text or its own voice out. Native voice mode in a model under 3 GB." = "한 번에 모두: 사진, 동영상, 목소리를 넣으면 글이나 자기 목소리로 답합니다. 3GB 미만 모델로 쓰는 네이티브 음성 모드.";
 "Voice mode — the model hears you itself, and the voice chosen in Settings reads its answer." = "음성 모드 — 모델이 직접 듣고, 설정에서 고른 목소리가 답을 읽어 줍니다.";
 "LiquidAI's speech model: 19 languages, a female and a male voice each. When your chat model is LFM3 Audio or Omni, that same model reads the answers, with no second model." = "LiquidAI의 음성 모델: 19개 언어, 언어마다 여성과 남성 목소리가 하나씩 있습니다. 채팅 모델이 LFM3 Audio나 Omni이면 두 번째 모델 없이 같은 모델이 답을 읽어 줍니다.";
+
+/* Models > Plugins (list + detail) */
+"%@ installed. Switch it on, then restart the server." = "%@ 설치됨. 켠 다음 서버를 다시 시작하세요.";
+"Available" = "사용 가능";
+"Checked against this hash every time the server loads it." = "서버가 로드할 때마다 이 해시와 대조합니다.";
+"Community code, compiled on this Mac. Changes apply when the server restarts." = "커뮤니티 코드를 이 Mac에서 컴파일합니다. 변경 사항은 서버를 다시 시작하면 적용됩니다.";
+"Compile and install" = "컴파일 후 설치";
+"Compile and install %@ %@?" = "%@ %@을(를) 컴파일하고 설치할까요?";
+"Compiling %@ (the first build also downloads Zig)…" = "%@ 컴파일 중(첫 빌드는 Zig도 내려받습니다)…";
+"Dismiss" = "닫기";
+"Fetching the source for %@…" = "%@ 소스를 가져오는 중…";
+"Install compiles the source here with a pinned Zig" = "설치는 고정된 Zig로 이 Mac에서 소스를 컴파일합니다";
+"Install with an AI agent" = "AI 에이전트로 설치";
+"Installed file" = "설치된 파일";
+"Load at server start" = "서버 시작 시 로드";
+"Needs" = "필요 조건";
+"Needs mlx-serve %@" = "mlx-serve %@ 필요";
+"Needs update" = "업데이트 필요";
+"Not installed" = "설치 안 됨";
+"Nothing more to install." = "더 설치할 항목이 없습니다.";
+"Off: turn on Load at server start above" = "꺼짐: 위의 '서버 시작 시 로드'를 켜세요";
+"Outside plugins are not available in the Mac App Store build. Get the direct download to use them." = "Mac App Store 빌드에서는 외부 플러그인을 쓸 수 없습니다. 직접 다운로드 버전을 사용하세요.";
+"Packs it serves" = "지원하는 팩";
+"Paste this into a coding agent (pi, Claude Code, Codex...) to have it install a plugin safely. Each plugin's page also has its own copy button." = "이 내용을 코딩 에이전트(pi, Claude Code, Codex...)에 붙여 넣어 플러그인을 안전하게 설치하게 하세요. 각 플러그인 페이지에도 복사 버튼이 있습니다.";
+"Plugins load at server start" = "서버 시작 시 플러그인 로드";
+"Quant format" = "양자화 형식";
+"Rather have a coding agent install it?" = "코딩 에이전트에게 설치를 맡길까요?";
+"Remove" = "제거";
+"Signed" = "서명";
+"Source" = "소스";
+"Source: %@ at commit %@. A plugin is native code that runs with your rights: install it only if you trust this code. It will be compiled on this Mac and installed into ~/.mlx-serve/plugins." = "소스: %@ 커밋 %@. 플러그인은 사용자 권한으로 실행되는 네이티브 코드입니다. 이 코드를 신뢰할 때만 설치하세요. 이 Mac에서 컴파일되어 ~/.mlx-serve/plugins에 설치됩니다.";
+"This Mac runs %@" = "이 Mac은 %@ 실행 중";
+"Turn on Load at server start first" = "먼저 '서버 시작 시 로드'를 켜세요";
+"Update to %@" = "%@(으)로 업데이트";
+"Xcode Command Line Tools" = "Xcode 명령줄 도구";
+"no plugin kit for mlx-serve %@: it is not released yet. Put the kit for %@ in ~/.mlx-serve/kit (in an mlx-serve checkout: zig build kit), then install again" = "mlx-serve %@용 플러그인 키트가 없습니다. 아직 릴리스되지 않았습니다. %@용 키트를 ~/.mlx-serve/kit에 두고(mlx-serve 체크아웃에서 zig build kit) 다시 설치하세요";
+"unknown" = "알 수 없음";
+
+/* Usage strip: the speed line */
+"Tokens per second, dimmed when it is the average since the server started. Click to open the usage dashboard." = "초당 토큰 수입니다. 서버 시작 이후 평균값이면 흐리게 표시됩니다. 클릭하면 사용량 대시보드가 열립니다.";
+"%@ not measured yet" = "%@ 아직 측정 안 됨";
+"%@ %@ tokens per second" = "%@ 초당 %@ 토큰";
+"Opens the usage dashboard" = "사용량 대시보드를 엽니다";

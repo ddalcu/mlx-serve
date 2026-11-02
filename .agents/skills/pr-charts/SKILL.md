@@ -13,7 +13,7 @@ The chart goes above the table in "How I verified it". A reviewer sees in two se
    uv run tests/bench_chart.py --out charts/ main='~/claude-tmp/bench-main-*/*.json' pr='~/claude-tmp/bench-pr-*/*.json'
    ```
    The script writes `decode.png`, `prefill.png` and `ttft.png`. Each point is the median across that arm's reports, and the caption names the machine, model, engine version and report count. It reads `bench.contextScaling` and times nothing itself.
-3. **Look at the PNGs before posting.** A flat line at zero, a missing arm, or two arms that match to the digit means a bad run, not a result. Check each arm's server log for the engagement line (`.claude/skills/bench/SKILL.md`).
+3. **Look at the PNGs before posting.** A flat line at zero, a missing arm, or two arms that match to the digit means a bad run, not a result. Check each arm's server log for the engagement line (`.agents/skills/bench/SKILL.md`).
 4. **Host them.** `gh` can't attach images. Commit the PNGs to a branch of your public fork, for example `pr-charts` with a directory per PR, and link the raw URL. A private repo's raw URL renders for nobody else.
    ```markdown
    | Prompt processing | Generation |

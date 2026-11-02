@@ -60,6 +60,36 @@ final class Model3DGenServiceTests: XCTestCase {
         }
     }
 
+    func testIdolRequestCarriesTheSplatFieldsAndTheRawPhoto() {
+        var req = Model3DGenRequest(model: .idol_8bit, photoPath: "/tmp/boot.jpg")
+        req.splatSteps = 30
+        req.splatGuidance = 2.5
+        req.splatGaussians = 524_288
+        req.splatPhoto = .photo
+        let json = Model3DGenService.requestJson(for: req, modelName: "Idol-MLX-Serve", imageB64: "QUJD", seed: 5)
+        XCTAssertEqual(json["model"] as? String, "Idol-MLX-Serve")
+        XCTAssertEqual(json["image"] as? String, "QUJD")
+        XCTAssertEqual(json["seed"] as? Int, 5)
+        XCTAssertEqual(json["steps"] as? Int, 30)
+        XCTAssertEqual(json["guidance_scale"] as? Double, 2.5)
+        XCTAssertEqual(json["num_gaussians"] as? Int, 524_288)
+        XCTAssertEqual(json["mode"] as? String, "real")
+        XCTAssertEqual(json["geometry"] as? String, "splat")
+        // No mesh controls: Idol has no resolution, faces, texture or finish.
+        for key in ["resolution", "decimation_target", "texture_size", "octree_resolution", "texture", "roughness_scale"] {
+            XCTAssertNil(json[key], key)
+        }
+        // The model cuts the subject out itself, so the photo goes as it is.
+        XCTAssertTrue(Model3DFamily.idol.sendsRawPhoto)
+        XCTAssertFalse(Model3DFamily.idol.cutoutKeepsAlpha)
+        XCTAssertFalse(Model3DFamily.idol.hasCascadeControls)
+        XCTAssertFalse(Model3DFamily.idol.hasPaintStage)
+        let render = Model3DGenService.requestJson(for: Model3DGenRequest(model: .idol_8bit, photoPath: "/tmp/x.png"), modelName: "m", imageB64: "QQ==", seed: 1)
+        XCTAssertEqual(render["mode"] as? String, "synthetic")
+        XCTAssertEqual(render["steps"] as? Int, 50)
+        XCTAssertEqual(render["num_gaussians"] as? Int, 262_144)
+    }
+
     func testPixal3DRequestSharesTheCascadeFieldsAndKeepsTheAlpha() {
         var req = Model3DGenRequest(model: .pixal3d_8bit, photoPath: "/tmp/car.png")
         req.trellisResolution = 1536

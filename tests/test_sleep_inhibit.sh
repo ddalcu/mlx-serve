@@ -3,11 +3,12 @@
 # generation and during a startup load, released after, none with --no-prevent-sleep.
 #
 #   ./tests/test_sleep_inhibit.sh [model_dir] [port]   # macOS + a small chat model; skips otherwise
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL=${1:-"$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"}
+MODEL="${1:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 PORT=${2:-8138}
 BASE="http://127.0.0.1:$PORT"
 PASS=0

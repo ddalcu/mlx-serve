@@ -465,6 +465,9 @@ pub const Forward = extern struct {
     /// Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`);
     /// empty = embed the ids.
     embeds: Array = .{},
+    /// A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores
+    /// the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching.
+    progress: ?*u64 = null,
 };
 
 /// The engine's calls a forward makes at a layer's projections: each returns true with new references in its outputs
@@ -819,6 +822,14 @@ pub const MediaHooks = extern struct {
     /// The M-RoPE table over the expanded prompt `ids`.
     positions: ?*const fn (p: *const Parsed, ids: Span(u32), items: Span(MediaItem), out: *Array) callconv(.c) Verdict = null,
     video_prune: ?*const fn (m: *anyopaque, item: *const MediaItem, rows: Array, out: *Array) callconv(.c) Verdict = null,
+    /// Times a transcript over its clip (16 kHz mono f32 `pcm`): `units` are its words in spoken order (a `<spk:N>` turn
+    /// tag is a unit of its own); `activity` is the clip's `[frames][speakers]` 10 ms speaker probabilities (empty = no
+    /// speaker information). Writes 3 values per unit into `out`, plugin-owned until the next call: a start and an end in
+    /// ms from the clip's start, and the speaker's column (`u32` max = none).
+    word_times: ?*const fn (m: *anyopaque, pcm: Span(f32), units: Span(Str), activity: Span(f32), speakers: u32, out: *Span(u32)) callconv(.c) Verdict = null,
+    /// Speaker activity over the clip: `speakers` and f32 probabilities [frames][speakers], one row per 10 ms into `out`
+    /// (plugin-owned until the next call).
+    diarize: ?*const fn (m: *anyopaque, pcm: Span(f32), speakers: *u32, out: *Span(f32)) callconv(.c) Verdict = null,
 };
 
 /// How one frame samples (`SpeechFacts` holds the defaults). `order` empty = MaskGIT reveals codebooks in a random

@@ -5,13 +5,15 @@ const std = @import("std");
 const mlx = @import("ffi.zig");
 const log = @import("../sdk/util/log.zig");
 const params = @import("../sdk/quant/params.zig");
+const w8a8 = @import("../sdk/blocks/dit/w8a8.zig");
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
 const Weights = @import("../sdk/weights/resident.zig").Weights;
 
 /// A projection resolved once at load: affine-quantized (width solved from the packed
-/// geometry, never a literal) or dense, with an optional bias. Handles are borrowed from `Weights`.
+/// geometry, never a literal) or dense, with an optional bias; or, where `Weights.w8` holds an int8 copy of it
+/// (`--w8a8`), that copy. Handles are borrowed from `Weights`.
 pub const Linear = struct {
     w: A,
     scales: ?A = null,
@@ -19,12 +21,21 @@ pub const Linear = struct {
     bias: ?A = null,
     bits: u32 = 0,
     group_size: u32 = 0,
+    w8: ?*const w8a8.Weight = null,
+    /// A dense `w` stored `[in, out]` (a `.weight_t` tensor): the layout MLX's GEMM reads fastest.
+    transposed: bool = false,
+
+    /// `x @ w^T`, no bias.
+    pub fn project(self: *const Linear, sc: *Scope, x: A) !A {
+        if (self.w8) |q| return sc.keep(try w8a8.forward(x, q, sc.s));
+        return if (self.scales) |sca|
+            sc.qmm(x, self.w, sca, self.biases, self.group_size, self.bits)
+        else
+            sc.matmul(x, if (self.transposed) self.w else try sc.transpose(self.w, &.{ 1, 0 }));
+    }
 
     pub fn forward(self: *const Linear, sc: *Scope, x: A) !A {
-        const y = if (self.scales) |sca|
-            try sc.qmm(x, self.w, sca, self.biases, self.group_size, self.bits)
-        else
-            try sc.matmul(x, try sc.transpose(self.w, &.{ 1, 0 }));
+        const y = try self.project(sc, x);
         return if (self.bias) |b| sc.add(y, b) else y;
     }
 };
@@ -41,6 +52,8 @@ pub fn getW(w: *const Weights, comptime fmt: []const u8, args: anytype) !A {
 pub fn linear(w: *const Weights, comptime fmt: []const u8, args: anytype, in_dim: u32) !Linear {
     var buf: [160]u8 = undefined;
     const prefix = try std.fmt.bufPrint(&buf, fmt, args);
+    if (w.w8.get(prefix)) |q| return .{ .w = .{ .ctx = null }, .w8 = q, .bias = w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.bias", .{prefix})) };
+    if (w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.weight_t", .{prefix}))) |wt| return .{ .w = wt, .transposed = true, .bias = w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.bias", .{prefix})) };
     var l = Linear{ .w = try getW(w, "{s}.weight", .{prefix}) };
     if (w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.scales", .{prefix}))) |sca| {
         l.scales = sca;
@@ -63,6 +76,15 @@ pub fn evalAll(w: *const Weights) !void {
     var it = w.map.valueIterator();
     while (it.next()) |v| _ = mlx.mlx_vector_array_append_value(vec, v.*);
     try mlx.check(mlx.mlx_eval(vec));
+}
+
+/// Queues `y` on the GPU, then waits for `prev`: the CPU builds the next block while the GPU runs this one, with one
+/// block's intermediates in flight at a time.
+pub fn queue(y: A, prev: A) !void {
+    const v = mlx.mlx_vector_array_new_data(&[_]A{y}, 1);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_async_eval(v));
+    try mlx.check(mlx.mlx_array_eval(prev));
 }
 
 pub const Scope = struct {

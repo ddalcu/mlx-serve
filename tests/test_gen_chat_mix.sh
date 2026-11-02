@@ -23,7 +23,7 @@ source "$ROOT/tests/_lib_models.sh"
 
 CHAT="${MIX_CHAT_MODEL:-$(find_model ddalcu/Qwen3.8-27B-MLX-Serve-4bit)}"
 IMAGE="${MIX_IMAGE_MODEL:-$(find_model Runpod/FLUX.2-klein-4B-mflux-4bit)}"
-TTS="${MIX_TTS_MODEL:-$(find_model mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit)}"
+TTS="${MIX_TTS_MODEL:-$(find_model mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit)}"
 MUSIC="${MIX_MUSIC_MODEL:-$(find_model ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit)}"
 MESH="${MIX_MESH_MODEL-$(find_model ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit)}"
 MAX_TTFT="${MIX_MAX_TTFT:-30}"

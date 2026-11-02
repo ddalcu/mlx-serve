@@ -53,6 +53,13 @@ pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 
+/// `loopStopDecision` for a slot: none for a request that ignores EOS, which reaches the engine as an empty EOS set
+/// (`requestEosSlice`) and runs to `max_tokens` by contract; bench clients force equal decode lengths with it.
+fn slotLoopStop(eos_token_ids: []const u32, generated_ids: []const u32) ?LoopStop {
+    if (eos_token_ids.len == 0) return null;
+    return loopStopDecision(generated_ids);
+}
+
 const LoopAction = enum { cut, close_thought };
 
 /// A loop convicted INSIDE an open think block is recoverable once per request:
@@ -78,7 +85,7 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
     const loop_guard_start = gen.loopGuardStart();
-    if (loopStopDecision(gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+    if (slotLoopStop(slot.eos_token_ids, gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
         if (gen.hasPrePayloadConstraint()) {
             switch (try gen.forceConstraintTransition(slot.allocator)) {
                 .committed => |boundary| {
@@ -204,6 +211,17 @@ test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
     for (&healthy, 0..) |*v, i| v.* = @intCast(i);
     try testing.expect(loopStopDecision(&healthy) == null);
     try testing.expect(loopStopReason(&healthy) == null);
+}
+
+test "slotLoopStop: a request that ignores EOS runs to its cap, every other request is still cut" {
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
+        try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
+    }
+    try testing.expect(slotLoopStop(&[_]u32{1}, ids.items) != null);
+    // `ignore_eos` reaches the engine as an empty EOS set (`requestEosSlice`): only max_tokens ends that reply.
+    try testing.expect(slotLoopStop(&.{}, ids.items) == null);
 }
 
 test "loopStopReason: periods past the long tier stay uncut" {

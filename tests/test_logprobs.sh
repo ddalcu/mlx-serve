@@ -11,11 +11,12 @@
 #   LOGPROBS_TEST_MODEL=<dir> ./tests/test_logprobs.sh [port]   # any chat model; default LFM2.5-2.6B-8bit, SKIP without
 #
 # Hermetic twins: computeLogprobs, formatCompletionsLogprobs, contentTokenRange, the UTF-8 lossy escape.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${LOGPROBS_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/LFM2.5-2.6B-8bit}"
+MODEL="${LOGPROBS_TEST_MODEL:-$(find_model mlx-community/LFM2.5-2.6B-8bit || echo "$HOME/.mlx-serve/models/mlx-community/LFM2.5-2.6B-8bit")}"
 PORT="${1:-11293}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 BASE="http://127.0.0.1:$PORT"

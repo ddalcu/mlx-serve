@@ -56,6 +56,7 @@ final class Model3DGenService: ObservableObject {
         let outputPath = Self.makeOutputPath(photoPath: request.photoPath)
         let photoPath = request.photoPath
         let keepsAlpha = request.model.family.cutoutKeepsAlpha
+        let rawPhoto = request.model.family.sendsRawPhoto
         let steps = request.steps
         // Send a concrete seed so "random" (-1) actually varies per run.
         let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
@@ -74,6 +75,7 @@ final class Model3DGenService: ObservableObject {
                 // alpha-on-white itself.
                 let imageB64: String? = await Task.detached(priority: .userInitiated) {
                     guard let raw = try? Data(contentsOf: URL(fileURLWithPath: photoPath)) else { return nil }
+                    if rawPhoto { return raw.base64EncodedString() }
                     let cut = keepsAlpha ? SubjectCutout.cutoutKeepingAlpha(imageData: raw) : SubjectCutout.cutoutOnWhite(imageData: raw)
                     return cut.base64EncodedString()
                 }.value
@@ -172,6 +174,19 @@ final class Model3DGenService: ObservableObject {
                 body["clearcoat"] = request.finish.clearcoat
             }
             return body
+        case .idol:
+            return [
+                "model": modelName,
+                "image": imageB64,
+                "seed": seed,
+                "steps": request.splatSteps,
+                "guidance_scale": request.splatGuidance,
+                "num_gaussians": request.splatGaussians,
+                "mode": request.splatPhoto.serverMode,
+                // The pane draws its own discs and saves a PLY from the splat attributes; the server's default (a disc
+                // mesh for other viewers) would carry neither.
+                "geometry": "splat",
+            ]
         }
     }
 

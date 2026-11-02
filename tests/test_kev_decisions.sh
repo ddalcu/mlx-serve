@@ -10,11 +10,12 @@
 #
 # Hermetic counterparts: the unit tests in src/plugins/kev/kev.zig (KEV_TEST_MODEL + KEV_FIXTURES pin token ids and
 # probabilities) and the Kev discovery test in src/host/registry/discovery.zig.
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11443}"
-MODEL="${KEV_MODEL:-$HOME/.mlx-serve/models/jaredpalmer/Kev-4B-MLX-Serve-8bit}"
+MODEL="${KEV_MODEL:-$(find_model jaredpalmer/Kev-4B-MLX-Serve-8bit || echo "$HOME/.mlx-serve/models/jaredpalmer/Kev-4B-MLX-Serve-8bit")}"
 BIN="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
 FIXTURES="tests/fixtures/kev/cases.json"
 LOG="/tmp/kev-test-$PORT.log"

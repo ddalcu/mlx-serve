@@ -382,6 +382,15 @@ class AppState: ObservableObject {
     /// the thing that opens it is a menu command with no view to talk to.
     @Published var modelPalettePresented = false
 
+    /// Is the usage dashboard up? A sheet on the chat window like the palette, opened from the status strip's speed line.
+    @Published var usageDashboardPresented = false
+
+    /// Refused while the welcome sheet is up, for the one-sheet rule.
+    func showUsageDashboard() {
+        guard !showWelcome else { return }
+        usageDashboardPresented = true
+    }
+
     /// Open the model switcher — the ONE way in, same shape as `showModels()`:
     /// it must both raise the picker AND bring the chat window forward, or ⌘L
     /// from the tray opens a sheet on a window nobody is looking at.

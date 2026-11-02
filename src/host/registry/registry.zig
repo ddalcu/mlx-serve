@@ -163,6 +163,9 @@ pub const LoadedModel = struct {
     id: []const u8,
     /// Full absolute path on disk. Allocator-owned dupe.
     path: []const u8,
+    /// `path` with symlinks resolved, so a request naming the same directory
+    /// another way finds this entry (`peekByPath`). Empty when it does not resolve.
+    real_path: []const u8 = "",
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,
@@ -421,6 +424,7 @@ pub const LoadedModel = struct {
         if (self.arch_hint.len > 0) self.allocator.free(self.arch_hint);
         self.allocator.free(self.id);
         self.allocator.free(self.path);
+        if (self.real_path.len > 0) self.allocator.free(self.real_path);
     }
 
     /// Free the CPU-only state `unloadResident` deliberately RETAINS —
@@ -664,11 +668,14 @@ pub const ModelRegistry = struct {
         errdefer self.allocator.free(path_owned);
         const arch_owned: []const u8 = if (arch_hint.len > 0) try self.allocator.dupe(u8, arch_hint) else "";
         errdefer if (arch_owned.len > 0) self.allocator.free(arch_owned);
+        const real_owned = try self.realPathDupe(path);
+        errdefer if (real_owned.len > 0) self.allocator.free(real_owned);
 
         stub.* = .{
             .allocator = self.allocator,
             .id = id_owned,
             .path = path_owned,
+            .real_path = real_owned,
             .bytes_on_disk = bytes_on_disk,
             .arch_hint = arch_owned,
             .config = null,
@@ -760,9 +767,27 @@ pub const ModelRegistry = struct {
     /// basename-derived id differs from the discovered `org/name` id —
     /// two ids for one path would let the same weights load twice.
     pub fn peekByPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+        {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            if (self.peekByPathLocked(path)) |e| return e;
+        }
+        // The same directory under another spelling: a symlink, either way round.
+        if (!std.fs.path.isAbsolute(path)) return null;
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const real = buf[0 .. std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return null];
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        return self.peekByPathLocked(path);
+        var it = self.entries.valueIterator();
+        while (it.next()) |e| if (e.*.real_path.len > 0 and std.mem.eql(u8, e.*.real_path, real)) return e.*;
+        return null;
+    }
+
+    fn realPathDupe(self: *ModelRegistry, path: []const u8) ![]const u8 {
+        if (!std.fs.path.isAbsolute(path)) return "";
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return "";
+        return try self.allocator.dupe(u8, buf[0..n]);
     }
 
     fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
@@ -1536,6 +1561,32 @@ test "ModelRegistry: peekByPath dedupes org/name discovery ids against basename 
     const id = try reg.registerByPath(io, "/models/mlx-community/gemma-x/", null);
     try testing.expectEqualStrings("mlx-community/gemma-x", id);
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
+}
+
+test "ModelRegistry: peekByPath finds an entry through a symlinked path in either direction" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real/m");
+    try tmp.dir.createDirPath(io, "links");
+    try tmp.dir.symLink(io, "../real/m", "links/m", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const real = try std.fs.path.join(testing.allocator, &.{ root, "real", "m" });
+    defer testing.allocator.free(real);
+    const link = try std.fs.path.join(testing.allocator, &.{ root, "links", "m" });
+    defer testing.allocator.free(link);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const via_link = try reg.registerStubWithArch("m", link, 64, "qwen3");
+    try testing.expectEqual(via_link, reg.peekByPath(real) orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(via_link, reg.peekByPath(link) orelse return error.TestUnexpectedResult);
+
+    var reg2 = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg2.deinit();
+    const via_real = try reg2.registerStubWithArch("m", real, 64, "qwen3");
+    try testing.expectEqual(via_real, reg2.peekByPath(link) orelse return error.TestUnexpectedResult);
 }
 
 test "ModelRegistry: registerByPath rejects a nonexistent directory" {

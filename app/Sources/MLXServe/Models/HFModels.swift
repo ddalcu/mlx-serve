@@ -55,6 +55,7 @@ let supportedModelTypes: Set<String> = [
     "lfm2", "lfm2_vl", "lfm2-vl", "lfm2_moe", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
     "lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni", // Liquid LFM3: text, VL, speech in + out, all of it
     "nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni",
+    "nemo_speechlm", "nemotron_transcribe", // NVIDIA Nemotron 3.5 Transcribe (speech in, Nemotron-H trunk); mlx-audio names it the second
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
@@ -105,7 +106,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
+    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d", "idol",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -169,7 +170,7 @@ enum MediaModality: CaseIterable {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
             || modelType.hasPrefix("qwen_image") || modelType == "moss_image" { self = .image; return }
-        if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" { self = .mesh; return }
+        if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" || modelType == "idol" { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
         case "acestep", "minimax_music3", "yue2": self = .music

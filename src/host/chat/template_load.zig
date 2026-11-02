@@ -106,8 +106,13 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     // and the repack's departs from encoding.py; ours is pinned to the encoder.
     const dsv41 = dirModelTypeIs(io, allocator, model_dir, "deepseek_v41");
     if (dsv41) log.info("chat: deepseek_v41 — using the embedded V4.1 transcription\n", .{});
+    // Nemotron Transcribe's own template repeats a list (`["<|audio|>"] * n`), which jinja.cpp cannot run; a failed render
+    // drops to the generic format, which carries no audio placeholder.
+    const nemo_speech = dirModelTypeIs(io, allocator, model_dir, "nemo_speechlm") or dirModelTypeIs(io, allocator, model_dir, "nemotron_transcribe");
     const chat_template: []const u8 = if (dsv41)
         try allocator.dupe(u8, @embedFile("../../fixtures/dsv41_chat_template.jinja"))
+    else if (nemo_speech)
+        try allocator.dupe(u8, @embedFile("../../fixtures/nemo_speechlm_chat_template.jinja"))
     else if (chatTemplateFromValue(root.get("chat_template"))) |t|
         try allocator.dupe(u8, t)
     else blk: {
@@ -186,14 +191,12 @@ pub fn formatChat(
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
 
-    if (chat_config.add_bos_token) {
-        if (tok.bos_id) |bos| {
-            try ids.append(allocator, bos);
-        }
-    }
-
     const body = try tok.encodeMarked(allocator, rendered);
     defer allocator.free(body);
+    // A template that writes `{{ bos_token }}` itself already opens with it (Gemma 3): one BOS, as mlx-lm and HF give.
+    if (chat_config.add_bos_token) if (tok.bos_id) |bos| if (body.len == 0 or body[0] != bos) {
+        try ids.append(allocator, bos);
+    };
     try ids.appendSlice(allocator, body);
     log.debug("  prompt: {d} chars -> {d} tokens\n", .{ rendered.len, ids.items.len });
 
@@ -307,6 +310,24 @@ test "chat_template accepts HF's list-of-named-templates shape" {
     }
 }
 
+test "formatChat: add_bos_token gives one BOS, also when the template writes its own (Gemma 3)" {
+    const a = std.testing.allocator;
+    var tok = try radioTestTokenizer(a);
+    defer tok.deinit();
+    const bos_text = try a.dupe(u8, "<bos>");
+    try tok.special_tokens.put(bos_text, 2000);
+    try tok.id_to_token.put(2000, bos_text);
+    tok.bos_id = 2000;
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    for ([_][]const u8{ "{{ bos_token }}{% for m in messages %}{{ m.content }}{% endfor %}", "{% for m in messages %}{{ m.content }}{% endfor %}" }) |template| {
+        const config = ChatConfig{ .chat_template = template, .bos_token = "<bos>", .eos_token = null, .add_bos_token = true, .allocator = a, .renders_tool_turn = true };
+        const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false);
+        defer a.free(ids);
+        try std.testing.expectEqual(@as(u32, 2000), ids[0]);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{2000}));
+    }
+}
+
 test "RADIO video placeholders: literal HTML stays text in every role" {
     const a = std.testing.allocator;
     var tok = try radioTestTokenizer(a);
@@ -396,4 +417,18 @@ test "loadChatConfig: deepseek_v41 always gets the embedded V4.1 transcription" 
     var cc2 = try loadChatConfig(io, allocator, pbuf[0..plen]);
     defer cc2.deinit();
     try testing.expectEqualStrings(embedded, cc2.chat_template);
+}
+
+test "loadChatConfig: nemo_speechlm always gets the embedded template, whatever the pack ships" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"eos_token\": \"e\", \"chat_template\": \"{{ shipped }}\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\": \"nemo_speechlm\"}" });
+    var pbuf: [512]u8 = undefined;
+    const plen = try tmp.dir.realPath(io, &pbuf);
+    var cc = try loadChatConfig(io, allocator, pbuf[0..plen]);
+    defer cc.deinit();
+    try testing.expectEqualStrings(@embedFile("../../fixtures/nemo_speechlm_chat_template.jinja"), cc.chat_template);
 }

@@ -7,9 +7,7 @@ const qmv_cuda = @import("../qmm/qmv_cuda.zig");
 const rowqmv = @import("../qmm/rowqmv.zig");
 const lane_qmm = @import("../qmm/lane_qmm.zig");
 const simd_qmm = @import("../qmm/simd_qmm.zig");
-const mlx_gguf = @import("../../quant/gguf/root.zig");
-const sushi_pack = @import("../../quant/exl3/sushi_pack.zig");
-const fp8_block128 = @import("../../quant/fp8_block128.zig");
+const foreign = @import("../../quant/foreign.zig");
 const qmv_nax2 = @import("../qmm/qmv_nax2.zig");
 const qmm_int8 = @import("../qmm/qmm_int8.zig");
 const log = @import("../../util/log.zig");
@@ -75,9 +73,7 @@ pub fn qmvBatchLimit(dual_die: bool, k: c_int, n: c_int) c_int {
 }
 
 pub fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
-    if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, s);
-    if (fp8_block128.isBlockScaled(w, sc)) return fp8_block128.linear(x, w, sc, s);
-    if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, s);
+    if (try foreign.linear(x, w, sc, s)) |y| return y;
     // A weight re-ordered in place is read in its tiled layout only.
     if (try lane_qmm.tiledQmm(x, w, s)) |y| return y;
     // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth

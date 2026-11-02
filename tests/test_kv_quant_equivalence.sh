@@ -6,10 +6,11 @@
 #
 # Known per-arch bars: LFM2.5-350M 4-bit KV diverges ~12 tokens (KV_QUANT_FIRST_N_4BIT=10). The batched x kv-quant
 # crash guard is the last section of test_batched_equivalence.sh.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
 PORT="${2:-8094}"
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'

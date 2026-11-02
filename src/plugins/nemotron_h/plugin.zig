@@ -83,10 +83,10 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
 }
 
-fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
+pub fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     const c = config.of(ctx.parsed);
-    // The omni wrapper nests the trunk under `language_model`; the checkpoint decides.
-    const prefix = try reader.probePrefix(ctx, "backbone", &.{"language_model.backbone"}, "embeddings.weight");
+    // The omni wrapper nests the trunk under `language_model`, the speech wrapper under `llm`; the checkpoint decides.
+    const prefix = try reader.probePrefix(ctx, "backbone", &.{ "language_model.backbone", "llm.backbone" }, "embeddings.weight");
     var r = try reader.Reader.open(ctx, c.block_json, prefix);
     defer r.close();
     const m = try gpa.create(Loaded);
@@ -249,7 +249,7 @@ pub fn moeOf(own: *reader.Owned, r: *reader.Reader, c: *const config.Config, bas
 /// then at the root, then the tied embedding.
 fn headOf(r: *reader.Reader, m: *Loaded, embed: Linear, hidden: u32, tied: bool) !Linear {
     var nb: [160]u8 = undefined;
-    const nested = if (std.mem.eql(u8, r.prefix, "language_model.backbone")) "language_model" else r.prefix;
+    const nested = if (std.mem.eql(u8, r.prefix, "language_model.backbone")) "language_model" else if (std.mem.eql(u8, r.prefix, "llm.backbone")) "llm" else r.prefix;
     for ([_][]const u8{ try std.fmt.bufPrint(&nb, "{s}.lm_head", .{nested}), "lm_head" }) |base| {
         var kb: [176]u8 = undefined;
         if (!r.has(try std.fmt.bufPrint(&kb, "{s}.weight", .{base}))) continue;
@@ -277,56 +277,64 @@ fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv
     const m: *Loaded = @ptrCast(@alignCast(mp));
     return run_mod.tableForward(Model, &m.base, f, out);
 }
-/// The tiny pack the conformance suite runs: Mamba2, attention, MoE and MLP layers, width 64, seeded f32 weights.
-pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+/// The tiny trunk's tensors (Mamba2, attention, MoE and MLP layers, width 64, seeded f32 weights) under `root`, its
+/// head under `head`; the speech wrapper's fixture nests the same trunk.
+pub fn trunkTensors(t: *sdk.tensors.Tensors, comptime root: []const u8, comptime head: []const u8) !void {
     const h = 64;
-    var t = sdk.tensors.Tensors.init(a, 1);
-    try t.rand("backbone.embeddings.weight", .{}, &.{ 64, h }, .F32, 0.5);
-    try t.fill("backbone.norm_f.weight", .{}, &.{h}, .F32, 1);
-    try t.rand("lm_head.weight", .{}, &.{ 64, h }, .F32, 0.1);
+    try t.rand(root ++ ".embeddings.weight", .{}, &.{ 64, h }, .F32, 0.5);
+    try t.fill(root ++ ".norm_f.weight", .{}, &.{h}, .F32, 1);
+    try t.rand(head ++ ".weight", .{}, &.{ 64, h }, .F32, 0.1);
     for ("M*E-", 0..) |kind, i| {
-        try t.fill("backbone.layers.{d}.norm.weight", .{i}, &.{h}, .F32, 1);
+        try t.fill(root ++ ".layers.{d}.norm.weight", .{i}, &.{h}, .F32, 1);
         switch (kind) {
             // 2 heads x 32, 1 group, state 16: conv dim 64 + 32.
             'M' => {
-                try t.rand("backbone.layers.{d}.mixer.in_proj.weight", .{i}, &.{ 64 + 96 + 2, h }, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.conv1d.weight", .{i}, &.{ 96, 4, 1 }, .F32, 0.3);
-                try t.rand("backbone.layers.{d}.mixer.conv1d.bias", .{i}, &.{96}, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.A_log", .{i}, &.{2}, .F32, 0.3);
-                try t.fill("backbone.layers.{d}.mixer.D", .{i}, &.{2}, .F32, 1);
-                try t.rand("backbone.layers.{d}.mixer.dt_bias", .{i}, &.{2}, .F32, 0.3);
-                try t.fill("backbone.layers.{d}.mixer.norm.weight", .{i}, &.{64}, .F32, 1);
-                try t.rand("backbone.layers.{d}.mixer.out_proj.weight", .{i}, &.{ h, 64 }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.in_proj.weight", .{i}, &.{ 64 + 96 + 2, h }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.conv1d.weight", .{i}, &.{ 96, 4, 1 }, .F32, 0.3);
+                try t.rand(root ++ ".layers.{d}.mixer.conv1d.bias", .{i}, &.{96}, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.A_log", .{i}, &.{2}, .F32, 0.3);
+                try t.fill(root ++ ".layers.{d}.mixer.D", .{i}, &.{2}, .F32, 1);
+                try t.rand(root ++ ".layers.{d}.mixer.dt_bias", .{i}, &.{2}, .F32, 0.3);
+                try t.fill(root ++ ".layers.{d}.mixer.norm.weight", .{i}, &.{64}, .F32, 1);
+                try t.rand(root ++ ".layers.{d}.mixer.out_proj.weight", .{i}, &.{ h, 64 }, .F32, 0.1);
             },
             '*' => {
-                try t.rand("backbone.layers.{d}.mixer.q_proj.weight", .{i}, &.{ 64, h }, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.k_proj.weight", .{i}, &.{ 32, h }, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.v_proj.weight", .{i}, &.{ 32, h }, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.o_proj.weight", .{i}, &.{ h, 64 }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.q_proj.weight", .{i}, &.{ 64, h }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.k_proj.weight", .{i}, &.{ 32, h }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.v_proj.weight", .{i}, &.{ 32, h }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.o_proj.weight", .{i}, &.{ h, 64 }, .F32, 0.1);
             },
             'E' => {
-                try t.rand("backbone.layers.{d}.mixer.gate.weight", .{i}, &.{ 4, h }, .F32, 0.3);
-                try t.rand("backbone.layers.{d}.mixer.gate.e_score_correction_bias", .{i}, &.{4}, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.switch_mlp.fc1.weight", .{i}, &.{ 4, 32, h }, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.switch_mlp.fc2.weight", .{i}, &.{ 4, h, 32 }, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.shared_experts.up_proj.weight", .{i}, &.{ 64, h }, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.shared_experts.down_proj.weight", .{i}, &.{ h, 64 }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.gate.weight", .{i}, &.{ 4, h }, .F32, 0.3);
+                try t.rand(root ++ ".layers.{d}.mixer.gate.e_score_correction_bias", .{i}, &.{4}, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.switch_mlp.fc1.weight", .{i}, &.{ 4, 32, h }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.switch_mlp.fc2.weight", .{i}, &.{ 4, h, 32 }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.shared_experts.up_proj.weight", .{i}, &.{ 64, h }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.shared_experts.down_proj.weight", .{i}, &.{ h, 64 }, .F32, 0.1);
             },
             else => {
-                try t.rand("backbone.layers.{d}.mixer.up_proj.weight", .{i}, &.{ 128, h }, .F32, 0.1);
-                try t.rand("backbone.layers.{d}.mixer.down_proj.weight", .{i}, &.{ h, 128 }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.up_proj.weight", .{i}, &.{ 128, h }, .F32, 0.1);
+                try t.rand(root ++ ".layers.{d}.mixer.down_proj.weight", .{i}, &.{ h, 128 }, .F32, 0.1);
             },
         }
     }
+}
+
+pub const fixture_trunk_json =
+    \\{"model_type":"nemotron_h","vocab_size":64,"hidden_size":64,"intermediate_size":128,"num_hidden_layers":4,
+    \\ "num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"max_position_embeddings":4096,
+    \\ "layer_norm_epsilon":1e-5,"hybrid_override_pattern":"M*E-","mamba_num_heads":2,"mamba_head_dim":32,
+    \\ "n_groups":1,"ssm_state_size":16,"conv_kernel":4,"n_routed_experts":4,"num_experts_per_tok":2,
+    \\ "moe_intermediate_size":32,"moe_shared_expert_intermediate_size":64,"routed_scaling_factor":2.5,
+    \\ "n_group":1,"topk_group":1,"norm_topk_prob":true,"eos_token_id":2}
+;
+
+/// The tiny pack the conformance suite runs.
+pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+    var t = sdk.tensors.Tensors.init(a, 1);
+    try trunkTensors(&t, "backbone", "lm_head");
     return .{ .files = try a.dupe(sdk.fixture.File, &.{
-        .{ .name = "config.json", .bytes =
-        \\{"model_type":"nemotron_h","vocab_size":64,"hidden_size":64,"intermediate_size":128,"num_hidden_layers":4,
-        \\ "num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,"max_position_embeddings":4096,
-        \\ "layer_norm_epsilon":1e-5,"hybrid_override_pattern":"M*E-","mamba_num_heads":2,"mamba_head_dim":32,
-        \\ "n_groups":1,"ssm_state_size":16,"conv_kernel":4,"n_routed_experts":4,"num_experts_per_tok":2,
-        \\ "moe_intermediate_size":32,"moe_shared_expert_intermediate_size":64,"routed_scaling_factor":2.5,
-        \\ "n_group":1,"topk_group":1,"norm_topk_prob":true,"eos_token_id":2}
-        },
+        .{ .name = "config.json", .bytes = fixture_trunk_json },
         .{ .name = "model.safetensors", .bytes = try t.bytes() },
     }) };
 }

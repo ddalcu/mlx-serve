@@ -106,7 +106,7 @@ check "[7] streamed answer carries 12" "$S" "12"
 check_absent "[7] no think tags streamed" "$S" "<think"
 check_absent "[7] no tool markup streamed" "$S" "<tool_call"
 
-check "[8] MTP head loaded" "$(cat "$LOG")" "GLM MTP head ready"
+check "[8] MTP head loaded" "$(cat "$LOG")" "MTP head ready"
 check "[8] MTP drafted" "$(cat "$LOG")" "[spec-stats] mode=mtp"
 
 # [9] Concurrent requests decode in ONE batched forward (rows of a window; each slot's KDA state and
@@ -141,7 +141,7 @@ check "[9] 30-count stream correct under batching" "$CONC" "count30=True"
 check "[9] 45-count stream correct under batching" "$CONC" "count45=True"
 check "[9] 60-count stream correct under batching" "$CONC" "count60=True"
 check "[9] needle recovered under batching" "$CONC" "needle=741952"
-check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] glm batched decode engaged"
+check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] gdn batched decode engaged"
 
 # [11] Images. The grid and token accounting come from the log: a run of pads that missed the
 # splice still answers plausibly, so the signs' names (only the pixels carry them) are the bar.

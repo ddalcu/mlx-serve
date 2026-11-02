@@ -10,12 +10,14 @@
 #   3. its greedy answer equals a cold server's, or first differs where the reference itself is close (<= 0.5 nats, the hybrid chunking class): a
 #      wrong position offset diverges at a confident token.
 #
-# Env: MEDIA_REUSE_MODEL (default Qwen3.5-0.8B-MLX-4bit), PORT (default 19091), BINARY.
+# Check 2 needs a template that re-renders the previous reply as it was generated: Qwen3.5's drops an earlier turn's
+# think block (no `preserve_thinking`), so its history diverges 4 tokens before the reply and check 2 is skipped there.
+# Env: MEDIA_REUSE_MODEL (default Qwen3.8-27B 4-bit, else Qwen3.5-0.8B-MLX-4bit), PORT (default 19091), BINARY.
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 source tests/_lib_models.sh
-MODEL="${MEDIA_REUSE_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit)}"
+MODEL="${MEDIA_REUSE_MODEL:-$(find_fitting_model ddalcu/Qwen3.8-27B-MLX-Serve-4bit mlx-community/Qwen3.5-0.8B-MLX-4bit)}"
 PORT="${PORT:-19091}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 B="http://127.0.0.1:$PORT"
@@ -72,8 +74,10 @@ PY
 curl -s "$B/v1/chat/completions" -H 'Content-Type: application/json' -d @"$WORK/turn2.json" > "$WORK/warm2.json"
 reused=$(/usr/bin/grep -aoE "reused [0-9]+/[0-9]+ tokens" "$WORK/warm.log" | tail -1 | awk '{print $2}' | cut -d/ -f1)
 t1=$(cat "$WORK/turn1_total")
-[ "${reused:-0}" -ge $((t1 - 2)) ] && pass "turn 2 restores past turn 1's reply ($reused >= $t1 - 2)" \
-    || fail "turn 2 restores past turn 1's reply (reused ${reused:-0}, turn 1 was $t1)"
+if ! /usr/bin/grep -q preserve_thinking "$MODEL/chat_template.jinja" 2>/dev/null; then
+    echo "SKIP turn 2 restore: the template drops the previous turn's think block (reused ${reused:-0} of $t1)"
+elif [ "${reused:-0}" -ge $((t1 - 2)) ]; then pass "turn 2 restores past turn 1's reply ($reused >= $t1 - 2)"
+else fail "turn 2 restores past turn 1's reply (reused ${reused:-0}, turn 1 was $t1)"; fi
 stop
 
 boot "$WORK/cold.log" --prefix-cache-entries 0 || { fail "cold server boots"; exit 1; }

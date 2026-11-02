@@ -1,6 +1,7 @@
 //! extractResponseId, extractCompletedStatus; get/delete/compact, handleResponsesInner
 
 const std = @import("std");
+const schema_check = @import("../schema_check.zig");
 const request_mod = @import("../../../sdk/request/request.zig");
 const chat_mod = @import("../../chat/chat.zig");
 const rp_mod = @import("../../../sdk/grammar/protocol.zig");
@@ -400,6 +401,12 @@ fn handleResponsesInner(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "text.format.schema must be a JSON object when format.type is json_schema (use {\"type\":\"json_object\"} for unconstrained JSON)", 400);
         return;
     }
+    if (text_format.schema_value) |sv| if (std.mem.eql(u8, text_format.kind, "json_schema")) {
+        if (schema_check.grammarSchemaError(allocator, sv)) |msg| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+            return;
+        }
+    };
     const wants_json = std.mem.eql(u8, text_format.kind, "json_schema") or std.mem.eql(u8, text_format.kind, "json_object");
     // Belt + braces, mirroring the chat-completions path: bare `json_object`
     // carries no schema, so without a synthesized permissive one there is no

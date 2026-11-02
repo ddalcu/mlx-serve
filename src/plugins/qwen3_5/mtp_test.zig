@@ -60,8 +60,8 @@ fn writeHead(path: []const u8, geo: Geo) !void {
     try mlx.check(mlx.mlx_save_safetensors(file.ptr, map, meta));
 }
 
-/// A MoE trunk's head (4-bit): the router, eight stacked experts and the gated shared expert in place of the SwiGLU.
-fn writeMoeHead(path: []const u8) !void {
+/// A MoE trunk's head (4-bit): the router, `experts` stacked experts and the gated shared expert in place of the SwiGLU.
+fn writeMoeHead(path: []const u8, experts: c_int) !void {
     var hp = fixture.Pack.init(0x47b0);
     defer hp.deinit();
     try hp.weight("mtp.fc", H, 2 * H, true);
@@ -73,10 +73,10 @@ fn writeMoeHead(path: []const u8) !void {
     try hp.weight("mtp.layers.0.self_attn.k_proj", 2 * 256, H, true);
     try hp.weight("mtp.layers.0.self_attn.v_proj", 2 * 256, H, true);
     try hp.weight("mtp.layers.0.self_attn.o_proj", H, 4 * 256, true);
-    try hp.weight("mtp.layers.0.mlp.gate", 8, H, true);
-    try hp.tensor("mtp.layers.0.mlp.switch_mlp.gate_proj", &.{ 8, 128, H }, true);
-    try hp.tensor("mtp.layers.0.mlp.switch_mlp.up_proj", &.{ 8, 128, H }, true);
-    try hp.tensor("mtp.layers.0.mlp.switch_mlp.down_proj", &.{ 8, H, 128 }, true);
+    try hp.weight("mtp.layers.0.mlp.gate", experts, H, true);
+    try hp.tensor("mtp.layers.0.mlp.switch_mlp.gate_proj", &.{ experts, 128, H }, true);
+    try hp.tensor("mtp.layers.0.mlp.switch_mlp.up_proj", &.{ experts, 128, H }, true);
+    try hp.tensor("mtp.layers.0.mlp.switch_mlp.down_proj", &.{ experts, H, 128 }, true);
     try hp.weight("mtp.layers.0.mlp.shared_expert.gate_proj", 128, H, true);
     try hp.weight("mtp.layers.0.mlp.shared_expert.up_proj", 128, H, true);
     try hp.weight("mtp.layers.0.mlp.shared_expert.down_proj", H, 128, true);
@@ -154,7 +154,21 @@ test "qwen3_5 MTP head: a qwen3_next trunk's routed-expert head equals the legac
     try expectHead(&@import("../qwen3_next/plugin.zig").table, &pk, json, true, "mtp-next");
 }
 
-pub fn expectHead(table: *const @import("../../abi/plugin.zig").ModelTable, pk: *fixture.Pack, json: []const u8, comptime moe: bool, comptime tape: []const u8) !void {
+test "qwen3_5 MTP head: a head routing over more experts than a pruned trunk sizes its MoE block by its own router" {
+    var pk = fixture.Pack.init(0x47a5);
+    defer pk.deinit();
+    try pack.writePack(&pk, true, true, 8);
+    var p: served_test.Pair = undefined;
+    try p.openWith(&qwen3_5.table, &pk, pack.config(true, true, 8), &noCapture, try served_test.oracle("qwen3_5", "mtp-moe"));
+    defer p.close();
+    try writeMoeHead(p.dir, 16);
+    var heads = try Heads.open(&p);
+    defer heads.deinit();
+    const loaded: *qwen3_5.Loaded = @ptrCast(@alignCast(p.xfm.plugin.?.model));
+    try testing.expectEqual(@as(c_int, 16), loaded.head.?.moe.?.experts);
+}
+
+pub fn expectHead(table:*const @import("../../abi/plugin.zig").ModelTable, pk: *fixture.Pack, json: []const u8, comptime moe: bool, comptime tape: []const u8) !void {
     return expectHeadAt(table, pk, json, moe, .{}, "qwen3_5", tape);
 }
 
@@ -167,7 +181,7 @@ pub fn expectHeadAt(table: *const @import("../../abi/plugin.zig").ModelTable, pk
     try p.openWith(table, pk, json, &noCapture, try served_test.oracle(family, tape));
     defer p.close();
     try testing.expect(!p.xfm.plugin.?.drafters and p.xfm.plugin.?.trunk);
-    if (moe) try writeMoeHead(p.dir) else try writeHead(p.dir, geo);
+    if (moe) try writeMoeHead(p.dir, 8) else try writeHead(p.dir, geo);
 
     var heads = try Heads.open(&p);
     defer heads.deinit();
@@ -319,7 +333,7 @@ fn expectLanes(comptime moe: bool, comptime seed: u64) !void {
     var p: served_test.Pair = undefined;
     try p.openWith(&qwen3_5.table, &pk, pack.config(moe, true, 8), &noCapture, try served_test.oracle("qwen3_5", std.fmt.comptimePrint("mtp-lanes-{x}", .{seed})));
     defer p.close();
-    if (moe) try writeMoeHead(p.dir) else try writeHead(p.dir, .{});
+    if (moe) try writeMoeHead(p.dir, 8) else try writeHead(p.dir, .{});
     var hb = try Heads.open(&p);
     defer hb.deinit();
     const heads = hb.refs();

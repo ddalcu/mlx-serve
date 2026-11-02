@@ -97,7 +97,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     const root = json.parseRoot(arena.allocator(), config_json.slice()) catch return invalid("config.json is not a JSON object");
     var type_name = json.string(json.field(root, "model_type")) orelse return unsupported("no model_type");
     var cfg = if (json.field(root, "text_config")) |tc| (json.object(tc) orelse return invalid("text_config")) else root;
-    if (std.mem.eql(u8, type_name, "nemotron_h_omni")) if (json.object(json.field(root, "llm_config"))) |lc| {
+    if (std.mem.eql(u8, type_name, "nemotron_h_omni") or std.mem.eql(u8, type_name, "nemo_speechlm") or std.mem.eql(u8, type_name, "nemotron_transcribe")) if (json.object(json.field(root, "llm_config"))) |lc| {
         cfg = lc;
         if (json.string(json.field(lc, "model_type"))) |mt| type_name = mt;
     };

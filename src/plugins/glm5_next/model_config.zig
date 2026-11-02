@@ -92,7 +92,8 @@ fn expectDiscoveryStub(json: []const u8, parse: Parse) !void {
     try testing.expectEqual(if (glm_config.of(&p).modelopt) 4 else want.quant_bits, p.shell.quant.bits);
     try testing.expectEqual(want.is_moe, p.caps.moe);
     try testing.expectEqual(want.has_vision, p.caps.images);
-    try testing.expectEqual(want.has_video, p.caps.video);
+    // The engine never reads video for GLM: a `video_token_id` beside the tower is no capability.
+    try testing.expect(!p.caps.video);
 }
 
 test "glm plugins: discovery reads every fixture pack as the legacy stub reading does" {

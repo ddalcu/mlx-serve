@@ -271,6 +271,8 @@ test "autoContextFor: the safety margin applies to MEMORY, never to the model's 
     small.head_dim = 64;
     small.hidden_size = 512;
     small.intermediate_size = 1024;
+    // Free RAM is shared with the other test shards: a box too short for the margined 4096 proves nothing here.
+    if (safeAutoContext(computeMemoryContext(&small)) < 4096) return error.SkipZigTest;
     try testing.expectEqual(@as(u32, 4096), autoContextFor(&small));
 
     // No declared max: fall back to the margined memory ceiling.

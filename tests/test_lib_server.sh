@@ -62,6 +62,7 @@ srv_wait_log "$LOG" "never printed" 100 0.1 "$DEAD"; ok "a dead pid stops the lo
 echo "── srv_stop ──"
 srv_stop "$LIVE"; kill -0 "$LIVE" 2>/dev/null; ok "the server is gone" "$?" 1
 srv_stop ""; ok "an empty pid is a no-op" "$?" 0
+bash -c "set -e; source lib/server.sh; trap 'srv_stop $DEAD' EXIT; true"; ok "an EXIT trap under set -e keeps the exit status on a reaped pid" "$?" 0
 
 echo "── lib/server.py ──"
 py() { python3 -c "

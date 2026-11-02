@@ -543,11 +543,11 @@ def cancel(a):
     require(cancellation_count(a.base) == before + 1, "disconnect did not cancel exactly one request")
     log = Path(a.log).read_text()[offset:]
     require(re.search(rf"module restored source=ram id=\d+ position={seed['usage']['prompt_tokens'] - 1}(?:\s|$)", log),
-            "cancelled continuation did not consume the previous RAM snapshot")
+            "cancelled continuation did not restore the previous RAM snapshot")
     if not state.get("dirty"):
-        print("SKIP: dirty consumption: old record was already published when continuation streamed")
+        print("SKIP: dirty restore: old record was already published when continuation streamed")
         return 77
-    print("consumed an unpublished RAM checkpoint, disconnected and observed cancellation")
+    print("restored an unpublished RAM checkpoint, disconnected and observed cancellation")
 
 
 def inject_module(a):

@@ -14,7 +14,7 @@ HTTP surfaces, request parsing, streams, sampling surfaces, LAN. Stories: `docs/
 - `/v1/models` rows carry `context_length`+`max_model_len` at TOP level twinning `meta.context_length` (#188): discovery clients never read `meta.*`; an outside plugin's pack adds `plugin`. Both emitters. Guard: `tests/test_models_capabilities.sh` [4b].
 - **Providers**: `<model>@<name>` from `~/.mlx-serve/providers.json` proxies `/v1/chat/completions` ONLY (other surfaces = named 400) through curl with the provider's key; rows ride `/v1/models` with a `provider` badge while the probe answers, a non-empty `models` list FILTERS the provider's list (and IS the list when it has none), none when unreachable. Never shared to the LAN. Design: `docs/reference.md`.
 - **LAN sharing**: proxy is a TRANSPORT; keyless gate = `routeClass` × `SharedSet`; `<id>@<peer>` mirroring; loops impossible by construction (self-token + tunnel marker, one hop). Design: `docs/reference.md`.
-- **Observability** (`--metrics`): zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick. `--api-key`: loopback exempt; `/health`+OPTIONS open; `constTimeEql`. No admin surface.
+- **Observability** (`--metrics`): zero cost off; TTFT at prefill completion; live tok/s via ONE atomic per tick; `/metrics.json` `usage` = the success counters split per model id (64 rows, `other` past them). `--api-key`: loopback exempt; `/health`+OPTIONS open; `constTimeEql`. No admin surface.
 
 ### Tool calling (server pipeline)
 

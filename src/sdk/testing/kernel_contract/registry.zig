@@ -38,6 +38,7 @@ const areas = .{
     @import("../../blocks/moe/contract.zig"),
     @import("../../../plugins/deepseek_v4/contract.zig"),
     @import("../../../plugins/deepseek_v41/contract.zig"),
+    @import("../../../plugins/idol/contract.zig"),
 };
 
 pub const Set = @import("set.zig").Set;

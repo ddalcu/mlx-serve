@@ -27,6 +27,28 @@ generators in tests/dump_radio_* and tests/dump_lilicorr_fixtures.py execute
 those references to validate the native engine.
 
 --------------------------------------------------------------------------------
+idol-sdk-mlx: Idol's MLX denoiser
+https://github.com/ivanfioravanti/idol-sdk-mlx
+Licensed under the Apache License, Version 2.0.
+
+The Idol denoiser in src/plugins/idol/denoiser.zig follows idol/mlx_dit.py in running the unconditional
+image tokens as two keys whose biases carry their count and in sharing the latent stream between the two
+guidance passes; src/plugins/idol/kernels/{norm_mod,repo_angles}.metal follow its fused
+LayerNorm + adaLN and RePo angle passes, and src/plugins/idol/kernels/attention.metal ports its NAX
+flash attention with a key bias. Written in Zig and Metal here.
+
+--------------------------------------------------------------------------------
+NVIDIA NeMo Speech: Nemotron 3.5 Transcribe word timestamps
+https://github.com/NVIDIA-NeMo/Speech
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under the Apache License, Version 2.0.
+
+src/plugins/nemotron_transcribe/ctc_align.zig ports the single-pass banded aligner of
+nemo/collections/speechlm2/parts/ctc_timestamp_utils.py (speaker mapping, anchor band, banded max-sum DP, boundary
+refinement), and the CTC head in src/plugins/nemotron_transcribe/perception.zig follows its TransformerCTCDecoder.
+tests/dump_ctc_align_fixtures.py executes NVIDIA's functions to make the fixtures the Zig tests demand.
+
+--------------------------------------------------------------------------------
 Cloudflare Clef and mlx-community Clef MLX
 https://huggingface.co/Cloudflare/clef
 https://huggingface.co/mlx-community/clef-flash-4bit

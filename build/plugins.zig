@@ -125,7 +125,7 @@ fn splitTemplates(a: std.mem.Allocator, names: []const []const u8) !Split {
 }
 
 /// The `@import` strings of a Zig source, line comments excluded.
-fn importsOf(a: std.mem.Allocator, src: []const u8) ![]const []const u8 {
+pub fn importsOf(a: std.mem.Allocator, src: []const u8) ![]const []const u8 {
     var out: std.ArrayList([]const u8) = .empty;
     var lines = std.mem.splitScalar(u8, src, '\n');
     while (lines.next()) |full| {
@@ -149,7 +149,7 @@ pub const FsReader = struct {
     dir: std.Io.Dir,
     io: std.Io,
 
-    fn read(self: FsReader, path: []const u8) ![]const u8 {
+    pub fn read(self: FsReader, path: []const u8) ![]const u8 {
         self.b.dependOnFileContents(self.b.path(path));
         return self.dir.readFileAlloc(self.io, path, self.b.allocator, .limited(16 << 20));
     }

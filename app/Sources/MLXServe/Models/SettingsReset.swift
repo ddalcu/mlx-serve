@@ -151,6 +151,7 @@ enum SettingsReset {
                 f("kokoroVoice") { $0.kokoroVoice = $1.kokoroVoice },
                 f("lfm3Voice") { $0.lfm3Voice = $1.lfm3Voice },
                 f("wakePhrase") { $0.wakePhrase = $1.wakePhrase },
+                f("transcribeEngine") { $0.transcribeEngine = $1.transcribeEngine },
                 f("transcriptNotesModel") { $0.transcriptNotesModel = $1.transcriptNotesModel },
                 f("transcriptAutoStopMinutes") { $0.transcriptAutoStopMinutes = $1.transcriptAutoStopMinutes },
                 f("transcriptAutoStartCamera") { $0.transcriptAutoStartCamera = $1.transcriptAutoStartCamera },

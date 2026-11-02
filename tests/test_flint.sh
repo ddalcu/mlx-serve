@@ -110,7 +110,7 @@ chat '{"max_tokens":2000,"temperature":0,"messages":[{"role":"user","content":"N
 wait "$J1" "$J2"
 check "[9] concurrent answer 1" "$(content < "$P1")" "Tokyo"
 check "[9] concurrent answer 2" "$(content < "$P2")" "Jupiter"
-check "[9] batched decode engaged" "$(cat "$LOG")" "[batched] gdn batched decode engaged"
+check "[9] batched decode engaged" "$(cat "$LOG")" "batched decode engaged"
 rm -f "$P1" "$P2"
 
 check_absent "no MLX error" "$(cat "$LOG")" "[mlx]"

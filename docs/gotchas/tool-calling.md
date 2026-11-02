@@ -52,8 +52,10 @@ Defect: Claude Code's runtime reminders arrive as late system messages; folding 
 all RAM/SSD prefix reuse every tool round. Cause: unconditional folding, because strict templates reject late system
 turns. Fix: parsers merge only the leading run; the renderer probes each late-system boundary with the request's tools
 and kwargs (`templatePreservesMidSystem`) and folds only where the template raises, drops or reorders; byte-pinned
-Qwen revisions render later ChatML system turns. Guard: `mid-system:` tests, the corpus late-note invariant,
-`tests/test_mid_system_cache.sh`.
+Qwen revisions render later ChatML system turns; a folding template logs one warning (`lateFoldWarningId`), since a
+Qwen-derived template outside the pinned revisions lost reuse every tool round with nothing in the log. Guard:
+`mid-system:` tests, the corpus late-note invariant, `tests/test_mid_system_cache.sh`,
+`tests/test_late_system_fold_warning.sh`.
 
 ### A transcribed template's whitespace is a token-level contract (DeepSeek-V4)
 Defect: our transcription of the DSV4 encoder emitted `<bos>## Tools` where the model was trained on `<bos>\n\n##
@@ -68,6 +70,13 @@ chained comparisons are not in jinja.cpp, and block tags differ on trailing newl
 transcription of `encoding/encoding.py` (`src/fixtures/dsv41_chat_template.jinja`); the parser accepts V4.1's spaced
 DSML tag names. Guard: `tests/dsv41_template_ab.py` dumps the cases the render test replays; corpus family
 `dsv41-dsml`.
+
+### A template that raises on any system turn (Mistral-7B v0.3)
+Defect: every Mistral request with a system prompt echoed `<start_of_turn>` and ran to `max_tokens`. Cause: the pack's
+`default` template allows only alternating user/assistant turns and raises on `system`; the raise is the silent generic
+fallback, whose turn markers are Gemma's. Fix: after a failed render `renderChatTemplate` retries once with the leading
+system text inside the first user turn (`systemInFirstUser`), warning once per template. Guard: `renderChatTemplate: a
+template that rejects a system turn renders it inside the first user turn`.
 
 ### jinja.cpp gaps: `x.0` and `\xHH`
 Defect: GLM-5.3 tool history and every Flint turn rendered the generic fallback (Gemma turn markers, wrong stop

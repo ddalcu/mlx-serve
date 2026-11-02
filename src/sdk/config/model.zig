@@ -1227,6 +1227,12 @@ pub const ModelConfig = struct {
         return self.plugin_media and b.parsed.caps.audio;
     }
 
+    /// Nemotron 3.5 Transcribe: a Nemotron-H trunk whose plugin takes speech, told what to do by its user turn.
+    pub fn isNemoSpeech(self: *const ModelConfig) bool {
+        const b = self.plugin orelse return false;
+        return self.pluginHears() and std.mem.eql(u8, b.table.name.slice(), "nemotron_transcribe");
+    }
+
     pub fn isDsv41(self: *const ModelConfig) bool {
         return std.mem.eql(u8, self.model_type, "deepseek_v41");
     }
@@ -4900,6 +4906,16 @@ test "a V4.1 pair serves one request at a time: no per-slot state, no batched de
     var c: ModelConfig = .{ .plugin = &b };
     c.pairDsv41(.{ .lo = 20, .hi = 43, .worker = false });
     try std.testing.expect(c.dist_dsv41 != null and !b.parsed.caps.slot_state and !b.parsed.caps.batches_decode);
+}
+
+test "isNemoSpeech names the Transcribe plugin, not any Nemotron-H trunk that hears" {
+    var table: abi.ModelTable = undefined;
+    table.name = abi.Str.of("nemotron_h");
+    var b: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .audio = true } } };
+    const c: ModelConfig = .{ .plugin = &b, .plugin_media = true, .model_type = "nemotron_h" };
+    try std.testing.expect(!c.isNemoSpeech());
+    table.name = abi.Str.of("nemotron_transcribe");
+    try std.testing.expect(c.isNemoSpeech());
 }
 
 test "a DeepSeek-V4.1 pair keeps each Mac's layers under their own numbers" {

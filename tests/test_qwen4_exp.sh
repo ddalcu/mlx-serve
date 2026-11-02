@@ -12,9 +12,10 @@
 #
 # Tie-aware = a divergence only at a near-tie (top-2 gap <= 0.15 nats), on lead-STRIPPED text. Hermetic twins: the
 # qwen4 GDN fused-path and batched decode tests, `ssm checkpoint carries the qwen4_exp aux state`, DiskTier hybrid.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
-MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}"
+MODEL="${QWEN4_MODEL:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit")}"
 PORT="${1:-11411}"
 BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 LOG="$HOME/claude-tmp/qwen4-live/server-$PORT.log"
@@ -75,7 +76,8 @@ filler=' '.join(f'Fact {i}: the sky over city number {i} is blue.' for i in rang
 print(json.dumps({'messages':[{'role':'user','content':filler+' The secret code is PELICAN-42. '+filler+' What is the secret code? Answer with the code only.'}],'max_tokens':32,'temperature':0,'enable_thinking':False}))")
 la=$(curl -s -m 1200 "$U/v1/chat/completions" -H 'content-type: application/json' -d "$long" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['usage']['prompt_tokens'], '|', d['choices'][0]['message']['content'])")
 echo "  prompt_tokens|answer: $la"
-check "qsa engaged line" "$(grep -c '\[qsa\] sparse attention engaged' "$LOG")" "1"
+# The trunk and its MTP head each log the once-per-process line: at least one is the bar.
+check "qsa engaged line" "$(grep -c '\[qsa\] sparse attention engaged' "$LOG" | awk '{print ($1 >= 1) ? 1 : 0}')" "1"
 check "needle recovered" "$(echo "$la" | grep -c 'PELICAN-42')" "1"
 # Assert the invariant (some QSA attention arm engaged), never one kernel's name.
 check "qsa prefill attention arm engaged (gather kernel or msv_attn_p256 mask arm)" "$(grep -cE '\[qsa-gather\] engaged|\[qsa-fused\] engaged' "$LOG" | sed 's/^[1-9][0-9]*$/1/')" "1"

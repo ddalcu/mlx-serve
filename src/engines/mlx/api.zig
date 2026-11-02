@@ -4,6 +4,7 @@
 const std = @import("std");
 const local = @import("../../sdk/util/io_util.zig").local;
 const mlx = @import("../../mlx/ffi.zig");
+const abi_plugin = @import("../../abi/plugin.zig");
 const host = @import("../../host/engines/mlx.zig");
 const params = @import("../../host/gpu_thread/params.zig");
 const requests = @import("../../host/gpu_thread/requests.zig");
@@ -42,6 +43,8 @@ pub const table: host.Api = .{
     .compute_embeddings = computeEmbeddings,
     .encode_vision = encodeVision,
     .timestamp_classes = timestampClasses,
+    .plugin_word_times = pluginWordTimes,
+    .plugin_diarize = pluginDiarize,
     .batches_decode = verdict.configBatchesDecode,
     .facts = facts,
     .draft_stages = request_policy.dsv4DraftStages,
@@ -146,6 +149,34 @@ fn timestampClasses(gpa: std.mem.Allocator, lm: *LoadedModel, ids: []const u32, 
     return null;
 }
 
+fn pluginHooks(lm: *LoadedModel) ?struct { hooks: *const abi_plugin.MediaHooks, model: *anyopaque } {
+    const pm = (lm.vision_encoder orelse return null).plugin_media orelse return null;
+    return .{ .hooks = pm.hooks, .model = pm.model };
+}
+
+fn pluginWordTimes(gpa: std.mem.Allocator, lm: *LoadedModel, pcm: []const f32, units: []const []const u8, activity: []const f32, speakers: u32, out: *[]u32) ?[]const u8 {
+    const p = pluginHooks(lm) orelse return "NotLoaded";
+    const run = p.hooks.word_times orelse return "Unsupported";
+    const strs = gpa.alloc(abi_plugin.Str, units.len) catch return "OutOfMemory";
+    defer gpa.free(strs);
+    for (units, strs) |u, *s| s.* = abi_plugin.Str.of(u);
+    var got: abi_plugin.Span(u32) = .{};
+    const v = run(p.model, .of(pcm), .of(strs), .of(activity), speakers, &got);
+    if (!v.isOk()) return v.why.slice();
+    out.* = gpa.dupe(u32, got.slice()) catch return "OutOfMemory";
+    return null;
+}
+
+fn pluginDiarize(gpa: std.mem.Allocator, lm: *LoadedModel, pcm: []const f32, speakers: *u32, out: *[]f32) ?[]const u8 {
+    const p = pluginHooks(lm) orelse return "NotLoaded";
+    const run = p.hooks.diarize orelse return "Unsupported";
+    var got: abi_plugin.Span(f32) = .{};
+    const v = run(p.model, .of(pcm), speakers, &got);
+    if (!v.isOk()) return v.why.slice();
+    out.* = gpa.dupe(f32, got.slice()) catch return "OutOfMemory";
+    return null;
+}
+
 fn pairFields(gpa: std.mem.Allocator) ?[]u8 {
     return distributed.pairFields(gpa) catch null;
 }
@@ -166,7 +197,7 @@ fn facts(lm: *const LoadedModel, out: *host.Facts) void {
         .images = if (lm.vision_encoder) |ve| ve.supportsImages() else false,
         .audio = if (lm.vision_encoder) |ve| ve.supportsAudio() else false,
         // Transcription: Qwen3-ASR's tower, or a speech model's own (its card's ASR recipe, `handleTranscriptions`).
-        .hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null or (ve.supportsAudio() and lm.config.?.speech() != null) else false,
+        .hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null or (ve.supportsAudio() and (lm.config.?.speech() != null or lm.config.?.isNemoSpeech())) else false,
         .video = supportsVideo(lm),
         .batches_decode = if (lm.config) |c| verdict.configBatchesDecode(c) else false,
         .hot_cache_bytes = hotCacheBytes(lm),

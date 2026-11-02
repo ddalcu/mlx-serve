@@ -12,7 +12,15 @@ final class TrayTranscript: ObservableObject {
     static let shared = TrayTranscript()
     nonisolated static let asrRepo = "mlx-community/Qwen3-ASR-0.6B-8bit"
     /// What a transcript needs, by model type, and the repo the tray fetches for each.
-    nonisolated static let packs = [(type: "qwen3_asr", repo: asrRepo), (type: "qwen3_forced_aligner", repo: DownloadManager.alignerRepo), (type: "nemotron_diarization", repo: DownloadManager.diarizerRepo)]
+    nonisolated static let packs = requiredPacks(for: .combo)
+    /// Nemotron Transcribe times and tells speakers apart itself: its pack is the only one it needs, and no repo is
+    /// fetched for it (it is converted from NVIDIA's checkpoint, `scripts/convert_nemotron_transcribe.py`).
+    nonisolated static func requiredPacks(for engine: ServerOptions.TranscribeEngine) -> [(type: String, repo: String)] {
+        switch engine {
+        case .combo:    return [(type: "qwen3_asr", repo: asrRepo), (type: "qwen3_forced_aligner", repo: DownloadManager.alignerRepo), (type: "nemotron_diarization", repo: DownloadManager.diarizerRepo)]
+        case .nemotron: return []
+        }
+    }
     nonisolated static let folder = URL(fileURLWithPath: NSString(string: "~/.mlx-serve/transcripts").expandingTildeInPath)
     /// The audio of recordings not yet transcribed, written as it arrives.
     nonisolated static let recordings = folder.appendingPathComponent(".recording")
@@ -58,8 +66,9 @@ final class TrayTranscript: ObservableObject {
 
     /// The ASR to transcribe with, once the server runs and every pack is whole.
     private var readyASR: String? {
-        guard let app, app.server.status == .running, Self.missingRepos(app.localModels).isEmpty else { return nil }
-        return app.localModels.first { $0.modelType == "qwen3_asr" && $0.defect == nil && !$0.isDownloading }?.path
+        let engine = app?.serverOptions.transcribeEngine ?? .combo
+        guard let app, app.server.status == .running, Self.missingRepos(app.localModels, engine: engine).isEmpty else { return nil }
+        return Self.asrPath(app.localModels, engine: engine)
     }
 
     private func tick() async {
@@ -137,7 +146,8 @@ final class TrayTranscript: ObservableObject {
         guard let app else { return }
         tried.insert(stamp)
         phase = .transcribing
-        let notesModel = Self.notesModel(setting: app.serverOptions.transcriptNotesModel, chatModel: app.selectedModelPath, models: app.localModels)
+        let notesModel = Self.notesModel(setting: app.serverOptions.transcriptNotesModel, chatModel: app.selectedModelPath, models: app.localModels,
+                                         engine: app.serverOptions.transcribeEngine, asr: model)
         do {
             let saved = try await Self.save(stamp, model: model, server: app.server.baseURL, notesModel: notesModel)
             guard let file = saved.file else { phase = .note("Nothing was heard"); return }
@@ -195,7 +205,9 @@ final class TrayTranscript: ObservableObject {
 
     /// The chat model that writes the notes: the one chosen in Settings, else
     /// the chat model in use; nil when notes are off or there is none.
-    nonisolated static func notesModel(setting: String, chatModel: String, models: [LocalModel]) -> String? {
+    nonisolated static func notesModel(setting: String, chatModel: String, models: [LocalModel], engine: ServerOptions.TranscribeEngine = .combo, asr: String? = nil) -> String? {
+        // Nemotron writes its own notes: the model that heard the meeting reads it back, so no second model loads.
+        if engine == .nemotron { return asr }
         guard setting != ServerOptions.notesOff else { return nil }
         let usable = { (path: String) in models.contains { $0.path == path && $0.isChatPickable } }
         if usable(setting) { return setting }
@@ -279,9 +291,14 @@ final class TrayTranscript: ObservableObject {
     /// The repos to fetch before a transcript can start: none once every pack is
     /// on disk, whole and not still arriving. Without the ASR only it, since its
     /// aligner and diarizer follow it.
-    nonisolated static func missingRepos(_ models: [LocalModel]) -> [String] {
-        let missing = packs.filter { pack in !models.contains { $0.modelType == pack.type && $0.defect == nil && !$0.isDownloading } }
+    nonisolated static func missingRepos(_ models: [LocalModel], engine: ServerOptions.TranscribeEngine = .combo) -> [String] {
+        let missing = requiredPacks(for: engine).filter { pack in !models.contains { $0.modelType == pack.type && $0.defect == nil && !$0.isDownloading } }
         return missing.first?.type == "qwen3_asr" ? [asrRepo] : missing.map(\.repo)
+    }
+
+    /// The pack that transcribes under `engine`: on disk, whole, not still arriving.
+    nonisolated static func asrPath(_ models: [LocalModel], engine: ServerOptions.TranscribeEngine) -> String? {
+        models.first { engine.asrModelTypes.contains($0.modelType) && $0.defect == nil && !$0.isDownloading }?.path
     }
 
     /// The microphone with the desktop audio on top, for as long as the microphone ran.
@@ -410,9 +427,12 @@ struct TranscriptTrayRow: View {
     }
 
     private var row: some View {
-        let missing = TrayTranscript.missingRepos(appState.localModels)
-        let downloading = TrayTranscript.packs.contains { downloads.downloads[$0.repo]?.status == .downloading }
-        return TrayFeatureRow(icon: "record.circle", title: "Transcript", subtitle: subtitle(ready: missing.isEmpty, downloading: downloading), isOn: recording, tint: .red) {
+        let engine = appState.serverOptions.transcribeEngine
+        let missing = TrayTranscript.missingRepos(appState.localModels, engine: engine)
+        // Nemotron has no repo to fetch: its pack is converted by hand, so a missing one is a pointer to the model list.
+        let engineMissing = engine == .nemotron && TrayTranscript.asrPath(appState.localModels, engine: engine) == nil
+        let downloading = TrayTranscript.requiredPacks(for: engine).contains { downloads.downloads[$0.repo]?.status == .downloading }
+        return TrayFeatureRow(icon: "record.circle", title: "Transcript", subtitle: subtitle(ready: missing.isEmpty && !engineMissing, downloading: downloading, engine: engine), isOn: recording, tint: .red) {
             Button {
                 try? FileManager.default.createDirectory(at: TrayTranscript.folder, withIntermediateDirectories: true)
                 NSWorkspace.shared.open(TrayTranscript.folder)
@@ -421,7 +441,7 @@ struct TranscriptTrayRow: View {
             }
             .buttonStyle(.plain)
             .help("Open the transcripts folder")
-            if missing.isEmpty || recording {
+            if (missing.isEmpty && !engineMissing) || recording {
                 Toggle("", isOn: Binding(get: { recording }, set: { on in
                     Task {
                         if on { await transcript.start() } else { await transcript.stop() }
@@ -432,6 +452,9 @@ struct TranscriptTrayRow: View {
                 .controlSize(.small)
                 // Stopping always works; starting needs the server.
                 .disabled(transcript.phase == .transcribing || transcript.phase == .starting || !recording && appState.server.status != .running)
+            } else if engineMissing {
+                Button("Models") { appState.showModels(.myModels) }
+                    .controlSize(.small)
             } else {
                 // The progress shows in the Downloads tab, which also closes the tray.
                 Button("Download") {
@@ -449,9 +472,11 @@ struct TranscriptTrayRow: View {
         return false
     }
 
-    private func subtitle(ready: Bool, downloading: Bool) -> String {
+    private func subtitle(ready: Bool, downloading: Bool, engine: ServerOptions.TranscribeEngine) -> String {
         switch transcript.phase {
-        case .idle, .starting: return ready ? "Record, then open as Markdown" : downloading ? "Downloading speech models…" : "Needs speech models"
+        case .idle, .starting:
+            if ready { return "Record, then open as Markdown" }
+            return downloading ? "Downloading speech models…" : engine == .nemotron ? "Needs Nemotron 3.5 Transcribe" : "Needs speech models"
         case .recording(let since, _): return L10n.format("Recording since %@", since.formatted(date: .omitted, time: .shortened))
         case .transcribing: return "Transcribing…"
         case .note(let note): return note

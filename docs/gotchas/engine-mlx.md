@@ -1326,6 +1326,12 @@ write-through and, another day, in `HotPrefixCache.deinit`. Cause: the commit pi
 arrays or filed rows under another prompt. Fix: the target crosses the refresh by id (`indexOfId`); an evicted target is
 a fresh store. Guard: the two `across an SSD-first refresh that evicts` tests, each in both orders.
 
+### A plugin that rewrote `Forward.tokens` heard nothing in the live engine (nemo_speechlm)
+Defect: Nemotron Transcribe answered "We are." to a spoken sentence; unit tests were green. Cause: its `forward` swapped
+the out-of-table `<|audio|>` id for a stand-in in `f.tokens`, but the engine sends ids as a device array
+(`Forward.ids`) and leaves `tokens` empty, so the swap never ran, the splice never matched and the rows were dropped.
+Fix: the swap covers both forms. Rule: a plugin that reads or rewrites ids handles `f.ids` as well as `f.tokens`.
+Guard: the splice proof runs the same prefill through host tokens and through a device array and demands equal logits.
 
 ### Native slot switches shared Engram prompt and confidence policy
 DeepSeek-V4.1 parked its State while its Engram prompt, read-ahead and confidence demand stayed on the model.
@@ -1341,3 +1347,26 @@ returned `.ok` with no hidden rows, and the driver handed the empty array to the
 `want_hidden` before any forward; the driver fails a hidden-only forward that returns none; the embeddings handler
 refuses a module-owned-state model (`Caps.owns_decode_state`) with a named 400. Guard: `tests/test_dsv41.sh` [7a]
 (refused by name, the next greedy request byte-equal to solo, no `[mlx]` line).
+
+### A cancelled DeepSeek-V4.1 request threw away the conversation
+Defect: stop a DeepSeek-V4.1 reply, send the next message, and without `--prefix-cache-disk` the whole conversation
+prefilled again. Cause: a RAM restore of a module checkpoint removed the entry and handed its buffers to the slot; a
+cancelled request commits nothing, so the state died with the slot. Fix: the restore shares the entry (`restoreModule`:
+MLX copies a shared buffer on the slot's first write, and the prefill bill already prices the state whole); the KV
+checkout refuses module entries. Guard: `HotPrefixCache module: a restore shares the checkpoint, so a request that never
+commits leaves it resumable`.
+
+### DeepSeek-V4.1's DSpark rounds verified almost nothing their head was sure of
+Defect: DSpark group rounds verified no draft in a quarter of rounds while verified drafts landed 96-100% a position.
+Cause: the round policy's calibration started from a logistic prior fitted on GLM-5.3's DFlash drafter; DSpark's
+confidence head is itself calibrated (1,535 full-block verifies: accepted ≈ sigmoid of the logit, every position), and
+the prior read its 0.93 as 0.65, under the group's row threshold, so those bins never saw a verify to learn from. Fix:
+DSpark's calibration starts from the head (`Calibration.head`); the recorded tapes pin the old prior. Guard:
+`Calibration: a head prior reads the drafter's confidence as its acceptance until verifies say otherwise`.
+
+### A slot in a DSpark group round stopped drafting because of its partner
+Defect: two DeepSeek-V4.1 coding streams; the second slot skipped drafting in 143 of 162 rounds although its drafts
+landed 86-100% a position. Cause: each slot's drafting backoff weighed its tokens against the whole round's wall,
+which holds the other slot's verify rows. Fix: a slot is charged its share of the stage pass and its own rows, against
+its accepted drafts at the group's plain cost a token (`moduleGroupRound`). Guard: `tests/test_dsv41.sh` [8b]
+(`group_rounds=` engaged); read `plain_ticks=` on a two-stream code run when the backoff changes.

@@ -10,6 +10,7 @@
 # NEEDS A REAL MODEL: skips when MODEL is absent.
 #
 # Usage: MODEL=<org/name dir> ./tests/test_model_alias.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11385}"
@@ -17,7 +18,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
-MODEL="${MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+MODEL="${MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 MODEL="${MODEL%/}"
 [ -f "$MODEL/config.json" ] || { echo "SKIP: needs a local chat model (MODEL=$MODEL)"; exit 0; }
 ALIAS="shorty"

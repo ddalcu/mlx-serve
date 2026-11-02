@@ -161,14 +161,14 @@ else
 fi
 
 # --no-mtp the same way: the --no-drafter arm above is its baseline.
-if grep -q "MTP sidecar" "$ROOT/headless-nodrafter.log"; then
+if grep -qiE "mtp sidecar|\[mtp\] missing" "$ROOT/headless-nodrafter.log"; then
     run_test "in-dir MTP sidecar probed on a headless cold load (baseline)" PASS ""
 else
     run_test "in-dir MTP sidecar probed on a headless cold load (baseline)" FAIL "no MTP sidecar line — test setup is not exercising the probe"
 fi
 cold_load_with "--no-drafter --no-mtp" "$ROOT/headless-nomtp.log" headless || exit 1
-if grep -q "MTP sidecar" "$ROOT/headless-nomtp.log"; then
-    run_test "--no-mtp survives a headless cold load" FAIL "cold-loaded model still probed: $(grep -m1 "MTP sidecar" "$ROOT/headless-nomtp.log")"
+if grep -qiE "mtp sidecar|\[mtp\] missing" "$ROOT/headless-nomtp.log"; then
+    run_test "--no-mtp survives a headless cold load" FAIL "cold-loaded model still probed: $(grep -m1 -iE "mtp sidecar|\[mtp\] missing" "$ROOT/headless-nomtp.log")"
 else
     run_test "--no-mtp survives a headless cold load" PASS ""
 fi

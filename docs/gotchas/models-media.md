@@ -678,7 +678,34 @@ request failed `Dsv41VisionRowsMissing`. Cause: the added token splits out of an
 with no rows. Fix: without the request's rows the image token is text (no splice, no VL routing bias, its own Engram
 id); a literal beside a real image stays a named 400. Guard: `dsv41 image token: without image rows it is text`.
 
+### A fused kernel is bit-equal to its chain only if it keeps the chain's roundings and sum order
+Defect: Idol's fused q/k prep (RoPE, RMS norm, head-major layout) flipped about one f16 output in 10^4 against the chain,
+and its first fused GELU missed its bound in the negative tail. Cause: the compiler fused `x0*c - x1*s` into one
+multiply-add (the chain rounds each product); the sum of squares added in another order than MLX's `rms_single_row`
+(thread t sums elements 4t..4t+3, lane t < 16 enters one `simd_sum`); `0.5 x (1 + tanh a)` cancels in f32 where
+`tanh` rounds to -1. Fix: the products in separate statements, the rms order mirrored, GELU as `x / (1 + e^-2a)` (one
+rounding, as PyTorch's fused GELU; the chain's eight f16 roundings flatten that tail). Probe in seconds with
+`mx.fast.metal_kernel` in the Python venv against the Python chain, byte for byte. Guard: `kernel contract idol`
+(the bit-equal gate), `idol oracle: the fused glue keeps the velocity as close to the reference as the chain`.
+
+### A 0-d f32 scalar silently ran a bf16 encoder in f32
+Defect: Idol's DINOv3, loaded in bf16, took as long as the f32 one, and BiRefNet in f16 barely sped up. Cause:
+`sc.mulS(x, -1)` in the rotate-half (and `mulS(sigmoid, 2)` on BiRefNet's modulator) multiplies by a 0-d f32 array,
+which MLX promotes like any f32 array: q and k came out f32 and the residual stream followed for every layer. A test
+that only checked the outputs differ from the f32 run passed, since bf16-rounded weights differ too. Fix: `neg`,
+`mulLike` (a scalar in x's dtype). Guard: `dinov3: RoPE keeps a bf16 head in bf16` (it asserts the dtype, not the
+numbers).
+
 ## Parity method
+
+### A plugin that moves to the GPU aborted every plugin's conformance on CI
+Defect: from #1041 on, CI's zig job failed on every PR: the registry conformance test (every plugin, one test) and
+three DeepSeek-V4.1 tests exited 255 on the hosted runner's virtual GPU. Cause: the suite loads each tiny pack on a
+CPU stream, but `deepseek_v41`'s load swaps in a GPU stream (its kernels are Metal-only), and those kernels launch
+1024-thread groups a virtual GPU refuses (Insufficient Memory, abort). Fix: its load refuses `.unsupported` on a
+virtual GPU, which the suite treats as "nothing to check here"; every test that loads or runs it skips there
+(`deepseek_v4/served_test.zig` loads it through the driver too: grep for the table, not the folder).
+Guard: the root rule (every GPU test skips on a virtual GPU) and the plugins rule on loads that change stream.
 
 ### Fixtures for fp16-fragile giants are dumped fp32 on CPU
 Defect: a paint DINOv2-giant oracle sat at cos 0.30 while every per-layer bisect of the port was clean. Cause: the
@@ -723,3 +750,11 @@ arm (each expert's up x down `weight_scale_2`) as unused, and every proof replay
 no such scale. Fix: the arm restored, plus a load-time `unservedLayout` that refuses, by name, any layout an arm the
 fork dropped would read. Guard: `a per-expert scale of 2 doubles the routed experts exactly`, the layout-guard test,
 the real-pack greedy gate.
+
+### A LoRA turned every FLUX.2 klein picture into noise with int8 media on
+Defect: on an M5 (int8 media on by default) any style LoRA, even at scale 0.125, rendered FLUX.2 klein as static; the
+baseline and `--no-w8a8` were clean. Cause: the attached delta keeps the f32 modulated input's dtype, so an adapted
+`v_proj` came out f32 beside bf16 q/k, and `int8_attn.attention` instantiates its V prep for q's dtype
+(`vec<T, 4>`), reading the f32 buffer as bf16. `attentionHeads` already cast; the bare call did not. Fix: the wrapper
+casts `v` to q's dtype. Guard: `int8 attention reads a v wider than q`, `tests/test_real_loras.sh` (open the renders:
+the 9B's broken one scored under the noise bar).

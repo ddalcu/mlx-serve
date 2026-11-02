@@ -340,7 +340,8 @@ jobs:
           for lib in "$STAGING/lib/"*.dylib; do
             [ -f "$lib" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$lib"
           done
-          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/mlx-serve"
+          # Outside plugins are compiled on the user's Mac (ad-hoc signed): library validation would refuse them.
+          codesign --force --options runtime --entitlements app/mlx-serve.entitlements --sign "$SIGNING_IDENTITY" "$STAGING/mlx-serve"
 
           codesign --verify --deep --strict --verbose=2 "$STAGING/mlx-serve"
 
@@ -374,6 +375,10 @@ jobs:
             case "$f" in *.test.ts) continue ;; esac
             cp "$f" "$CONTENTS/Resources/opencode2-mlx-serve/"
           done
+
+          # The codex current-contract instructions (AgentConfigs.codexInstructionsText). Mirrors app/build.sh.
+          mkdir -p "$CONTENTS/Resources/codex"
+          cp src/assets/codex_model_instructions.md "$CONTENTS/Resources/codex/model-instructions.md"
 
           # This .app is assembled by hand, so SwiftPM's SwaTex font bundle
           # must be embedded explicitly (Xcode normally does this for us).
@@ -511,7 +516,7 @@ jobs:
           for fw in "$CONTENTS/Frameworks/"*.framework; do
             [ -d "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
           done
-          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/mlx-serve"
+          codesign --force --options runtime --entitlements app/mlx-serve.entitlements --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/mlx-serve"
           # MLXCore + the .app need the mic entitlement, or Voice mode is denied
           # microphone access under hardened runtime without ever prompting.
           # Frameworks/dylibs and the headless mlx-serve must NOT carry it.

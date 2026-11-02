@@ -109,6 +109,8 @@ pub const ForwardCtx = struct {
     /// without this every chunk would restart at vision row 0. Set per chunk
     /// by the generate.zig prefill loop; 0 for unchunked/decode forwards.
     vision_splice_offset: usize = 0,
+    /// The scheduler's prefill-progress gauge, handed to a plugin that chunks a whole-prompt prefill itself.
+    prefill_progress: ?*std.atomic.Value(u64) = null,
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens

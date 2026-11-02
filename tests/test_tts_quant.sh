@@ -6,10 +6,11 @@
 #   2) /v1/audio/speech with ref_audio (zero-shot voice clone) → plausible WAV
 # SKIPs cleanly when the 8-bit model isn't downloaded.
 # Usage: [TTS_QUANT_MODEL=<dir>] ./tests/test_tts_quant.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -euo pipefail
 source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11319}"
-MODEL="${TTS_QUANT_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit}"
+MODEL="${TTS_QUANT_MODEL:-$(find_model mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit")}"
 [ -d "$MODEL" ] || { echo "SKIP: no 8-bit qwen3_tts model at $MODEL (set TTS_QUANT_MODEL)"; exit 0; }
 BIN="${BIN:-./zig-out/bin/mlx-serve}"
 LOG=/tmp/test_tts_quant_server.log

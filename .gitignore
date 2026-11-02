@@ -3,9 +3,10 @@ zig-out/
 
 # Pinned Zig release, staged at build time by scripts/fetch-zig.sh (not vendored)
 /.zig-toolchain
-# .claude stays private (settings.local.json, locks) EXCEPT checked-in project skills
+# .claude stays private (settings.local.json, locks) EXCEPT the skills symlink; the skills live in .agents/skills
+# (the cross-agent Agent Skills location: pi, Codex, Cursor and others read it; Claude Code reads the symlink)
 .claude/*
-!.claude/skills/
+!.claude/skills
 /models/
 *.safetensors
 # ...except small hermetic TEST fixtures. The rule above exists to keep model

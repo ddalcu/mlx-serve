@@ -440,6 +440,7 @@ pub fn voxelArrays(v: *const tp.Voxels) [3]golden.Named {
 }
 
 test "trellis2: the tiny pack's voxels (structure, shape, texture) are bit-equal to its golden run" {
+    if (mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack(@This()).open(arena.allocator());

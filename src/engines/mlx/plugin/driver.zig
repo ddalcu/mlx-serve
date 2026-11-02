@@ -482,6 +482,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .pipeline_every = ctx.pipeline_build,
         .mask_add = .{ .ctx = if (ctx.prefill_mask_add) |m| m.ctx else null },
         .embeds = .{ .ctx = if (ctx.step_embeds) |e| e.ctx else null },
+        .progress = if (mode != .prefill) null else if (ctx.prefill_progress) |p| &p.raw else null,
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

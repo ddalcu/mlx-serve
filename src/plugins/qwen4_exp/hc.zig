@@ -145,6 +145,12 @@ pub fn hcReadPending(self: *Trunk, h: *mlx.mlx_array, w: *const HcWeights, batch
     return self.hcRead(h.*, w, batch, seq_len);
 }
 
+/// The up projection reads the down projection's output, so its input width is the down weight's row count.
+/// An unhinted lookup reads a 5-bit/gs-64 override as 10-bit/gs-32 and the scales-keyed cache keeps that.
+fn upInputDim(w: *const HcWeights) u32 {
+    return @intCast(mlx.getShape(w.down_w)[0]);
+}
+
 pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, batch: c_int, seq_len: c_int, pend: ?HcPending) !?HcFusedOut {
     const hc: c_int = @intCast(self.config.hc_count);
     const hidden: c_int = @intCast(self.config.hidden_size);
@@ -167,7 +173,7 @@ pub fn hcReadFusedFor(self: *Trunk, stream: mlx.mlx_array, w: *const HcWeights, 
     if (w.down_rows.ctx != null) return hcReadFused(self.s, stream, batch, seq_len, w.norm_w, w.down_rows, .{ .ctx = null }, .{ .ctx = null }, w.up_rows, .{ .ctx = null }, .{ .ctx = null }, w.inject_flat, self.config.rms_norm_eps, hc, hidden, 16, 16, pend);
     if (w.down_s.ctx == null or w.up_s.ctx == null) return null;
     const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
-    const uqp = self.quantParamsFor(w.up_w, w.up_s);
+    const uqp = self.quantParamsHinted(w.up_w, w.up_s, upInputDim(w));
     if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
     return hcReadFused(self.s, stream, batch, seq_len, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, self.config.rms_norm_eps, hc, hidden, dqp.bits, dqp.group_size, pend);
 }
@@ -199,7 +205,7 @@ pub fn hcReadVerifyRows(self: *Trunk, rows: anytype, w: *const HcWeights) !?[]Hc
     }
     const dense = w.down_rows.ctx != null;
     const dqp: QuantParams = if (dense) .{ .bits = 16, .group_size = 16 } else self.quantParamsHinted(w.down_w, w.down_s, 10240);
-    const uqp: QuantParams = if (dense) dqp else self.quantParamsFor(w.up_w, w.up_s);
+    const uqp: QuantParams = if (dense) dqp else self.quantParamsHinted(w.up_w, w.up_s, upInputDim(w));
     if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
     const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, dqp.bits, dqp.group_size, if (has_pending) pending[0..rows.len] else null)) orelse return null;
     defer self.allocator.free(joined);
@@ -374,4 +380,15 @@ pub fn hcWrite(self: *Trunk, stream: mlx.mlx_array, out: mlx.mlx_array, inj: mlx
     try mlx.check(mlx.mlx_reshape(&next, next4, &flat_shape, 3, self.s));
     _ = mlx.mlx_array_free(stream);
     return next;
+}
+
+test "upInputDim: the up projection's input is the down projection's output width" {
+    var down: mlx.mlx_array = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(down);
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try mlx.check(mlx.mlx_zeros(&down, &[_]c_int{ 24, 640 }, 2, .uint32, cpu));
+    var w: HcWeights = undefined;
+    w.down_w = down;
+    try std.testing.expectEqual(@as(u32, 24), upInputDim(&w));
 }

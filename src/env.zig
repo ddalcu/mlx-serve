@@ -275,7 +275,7 @@ pub const vars = struct {
     pub const LTX_GEMMA_DIR: Var = .{ .kind = .public, .type = .text, .default = "the Gemma encoder under ~/.mlx-serve/models", .owner = "plugins/ltx", .since = "26.6.13", .doc = "LTX text encoder (Gemma) dir, absolute" };
     pub const MLXSERVE_DEVICE: Var = .{ .kind = .public, .type = .text, .default = "the GPU", .owner = "mlx", .since = "26.7.2", .doc = "iOS: `cpu` forces the CPU device" };
     pub const MLXSERVE_LOWMEM: Var = .{ .kind = .public, .type = .flag, .default = "by total RAM", .owner = "host/media_jobs", .since = "26.7.2", .doc = "low-memory media mode (1 on, 0 off)" };
-    pub const MLX_ENABLE_TF32: Var = .{ .kind = .public, .type = .flag, .default = "on", .owner = "plugins/qwen4_exp/qsa", .since = "26.9.3", .doc = "MLX's own TF32 switch; the QSA score follows it" };
+    pub const MLX_ENABLE_TF32: Var = .{ .kind = .public, .type = .flag, .default = "on", .owner = "mlx", .since = "26.9.3", .doc = "MLX's own TF32 switch; the QSA score and Idol's 3xTF32 RePo follow it" };
     pub const MLX_PTX_CACHE_DIR: Var = .{ .kind = .public, .type = .text, .default = "$TMPDIR/mlx/<mlx stamp>/ptx", .owner = "mlx", .since = "26.10.3", .doc = "MLX's CUDA PTX cache; exported per MLX build when unset" };
     pub const MLX_SERVE_ANE_CACHE_CAP_GB: Var = .{ .kind = .public, .type = .int, .default = "40", .owner = "engines/ane", .since = "26.10.3", .doc = "ANE compile cache cap, GB (read by lib/ane)" };
     pub const MLX_SERVE_ANE_CACHE_DIR: Var = .{ .kind = .public, .type = .text, .default = "~/.mlx-serve/ane-cache", .owner = "engines/ane", .since = "26.10.3", .doc = "ANE compile cache root (read by lib/ane)" };
@@ -306,6 +306,7 @@ pub const vars = struct {
     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+    pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
 
@@ -457,6 +458,7 @@ pub const vars = struct {
     pub const DSV41_KERNEL_OPS_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel ops gate: the reference runtime's fixture dir" };
     pub const DSV41_KERNEL_PREFILL2_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel prefill2 gate: the reference runtime's fixture dir" };
     pub const DSV41_KERNEL_PREFILL_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel prefill gate: the reference runtime's fixture dir" };
+    pub const DSV41_GROUP: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "dsv41 group: batched plain steps, verifies and drafts timed by states and rows (DSV41_GROUP)" };
     pub const DSV41_PHASE0B_MLX: Var = .{ .kind = .fixture, .type = .flag, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "26.10.2", .doc = "streamed-bank MLX device tests (a GPU-lock-held run)" };
     pub const DSV41_PHASE0_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed/expert", .since = "26.10.2", .doc = "dsv41 oracle fixture from the reference runtime" };
     pub const DSV41_PHASE1_ROUTE_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "26.10.2", .doc = "dsv41 oracle fixture from the reference runtime" };
@@ -739,6 +741,11 @@ pub const vars = struct {
     pub const PIXAL3D_PACK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/pixal3d", .since = "26.10.3", .doc = "pixal3d end to end: a cutout (PIXAL3D_IMAGE) or posed views (PIXAL3D_VIEWS) become a textured GLB…" };
     pub const PIXAL3D_RES: Var = .{ .kind = .fixture, .type = .int, .default = "the test's own", .owner = "plugins/pixal3d", .since = "26.10.3", .doc = "pixal3d end to end: a cutout (PIXAL3D_IMAGE) or posed views (PIXAL3D_VIEWS) become a textured GLB…" };
     pub const PIXAL3D_STEPS: Var = .{ .kind = .fixture, .type = .int, .default = "the test's own", .owner = "plugins/pixal3d", .since = "26.10.3", .doc = "pixal3d end to end: a cutout (PIXAL3D_IMAGE) or posed views (PIXAL3D_VIEWS) become a textured GLB…" };
+    pub const IDOL_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/idol", .since = "26.11.1", .doc = "Idol reference fixtures dir (tests/dump_idol_fixtures.py)" };
+    pub const IDOL_PACK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/idol", .since = "26.11.1", .doc = "Idol pack dir the oracles and the end-to-end run load" };
+    pub const IDOL_IMAGE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/idol", .since = "26.11.1", .doc = "idol end to end: an image becomes a splat (PLY + GLB)" };
+    pub const IDOL_OUT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/idol", .since = "26.11.1", .doc = "idol end to end: the dir the PLY and GLB are written to" };
+    pub const IDOL_STEPS: Var = .{ .kind = .fixture, .type = .int, .default = "the test's own", .owner = "plugins/idol", .since = "26.11.1", .doc = "idol end to end: sampler steps" };
     pub const PIXAL3D_TEX: Var = .{ .kind = .fixture, .type = .int, .default = "the test's own", .owner = "plugins/pixal3d", .since = "26.10.3", .doc = "pixal3d end to end: a cutout (PIXAL3D_IMAGE) or posed views (PIXAL3D_VIEWS) become a textured GLB…" };
     pub const PIXAL3D_VIEWS: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/pixal3d", .since = "26.10.3", .doc = "pixal3d end to end: a cutout (PIXAL3D_IMAGE) or posed views (PIXAL3D_VIEWS) become a textured GLB…" };
     pub const PIXAL3D_WEIGHTS: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/pixal3d", .since = "26.10.3", .doc = "test input read by `ditOracle`" };

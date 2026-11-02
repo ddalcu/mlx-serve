@@ -37,6 +37,8 @@ const Names = struct {
 
     const sevren = Names{ .attn = "attn", .moe = "moe", .eh_proj = "eh_proj", .enorm = "enorm", .hnorm = "hnorm", .final_norm = "final_norm" };
     const tensorfold = Names{ .attn = "layers.0", .moe = "layers.1", .eh_proj = "layers.0.eh_proj", .enorm = "layers.0.enorm.weight", .hnorm = "layers.0.hnorm.weight", .final_norm = "layers.1.final_layernorm.weight" };
+    /// TensorFold's layout inside the main pack, under `llm.mtp.` (Nemotron 3.5 Transcribe ships its head there).
+    const inline_pack = Names{ .attn = "llm.mtp.layers.0", .moe = "llm.mtp.layers.1", .eh_proj = "llm.mtp.layers.0.eh_proj", .enorm = "llm.mtp.layers.0.enorm.weight", .hnorm = "llm.mtp.layers.0.hnorm.weight", .final_norm = "llm.mtp.layers.1.final_layernorm.weight" };
 };
 
 /// The sidecar files a Nemotron-H head ships as, in the engine's order.
@@ -66,11 +68,12 @@ pub const Head = struct {
     }
 };
 
-/// The head in `dir`, read through the trunk's quant block; null when the pack ships none.
+/// The head in `dir`, read through the trunk's quant block; null when the pack ships none: a sidecar file, else
+/// `llm.mtp.*` tensors inside the main pack.
 pub fn load(ctx: *const abi.LoadCtx, c: *const config.Config) !?*Head {
     const rel = for (files) |f| {
         if (ctx.dir.has(f)) break f;
-    } else return null;
+    } else return loadInline(ctx, c);
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ ctx.model_dir.slice(), rel });
     var res = Resident.adopt(try model.loadWeightsSingleFile(gpa, path));
@@ -86,7 +89,23 @@ pub fn load(ctx: *const abi.LoadCtx, c: *const config.Config) !?*Head {
         Names.tensorfold
     else
         return error.UnknownMtpLayout;
+    return build(&r, c, names);
+}
 
+/// The head a pack carries under `llm.mtp.` (the shards holding those keys, read lazily); null without one.
+fn loadInline(ctx: *const abi.LoadCtx, c: *const config.Config) !?*Head {
+    var res = Resident.adopt(reader.headWeights(ctx, &.{}, "llm.mtp.layers.0.eh_proj.weight", "llm.mtp.") catch return null);
+    defer res.deinit();
+    const src = res.source();
+    var lctx = ctx.*;
+    lctx.weights = &src;
+    var r = try reader.Reader.open(&lctx, c.block_json, "");
+    defer r.close();
+    if (!r.has("llm.mtp.layers.0.eh_proj.weight") or !r.has("llm.mtp.layers.1.final_layernorm.weight")) return null;
+    return build(&r, c, Names.inline_pack);
+}
+
+fn build(r: *reader.Reader, c: *const config.Config, names: Names) !?*Head {
     const h = try gpa.create(Head);
     errdefer gpa.destroy(h);
     var own: reader.Owned = .{};
@@ -114,7 +133,7 @@ pub fn load(ctx: *const abi.LoadCtx, c: *const config.Config) !?*Head {
         l.* = try r.proj(try std.fmt.bufPrint(&nb, "{s}.mixer.{s}", .{ names.attn, leaf }), if (k == 3) c.num_attention_heads * c.head_dim else hidden);
         try own.linear(l.*);
     }
-    const moe = try @import("plugin.zig").moeOf(&own, &r, c, names.moe);
+    const moe = try @import("plugin.zig").moeOf(&own, r, c, names.moe);
     for (own.list.items) |a| _ = mlx.mlx_array_eval(a);
     h.* = .{
         .owned = own,

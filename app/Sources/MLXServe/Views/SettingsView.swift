@@ -1968,41 +1968,14 @@ private struct ProviderModelPickerSheet: View {
     }
 }
 
-/// Outside plugins: one switch for all of them, then one per installed plugin with its version, signer and hash
-/// (`OutsidePlugins`). Read by the server at startup.
+/// Outside plugins live in Models > Plugins; Settings keeps a door to them.
 private struct PluginsSectionContent: View {
-    @State private var switches = OutsidePlugins.loadSwitches()
-    @State private var receipts = OutsidePlugins.receipts()
-    @State private var saveError: String?
+    @EnvironmentObject var appState: AppState
 
     var body: some View {
         SettingsRow(title: "Outside plugins",
-                    explainer: "Model, media and quant-format plugins you installed with `mlx-serve plugin install` (in ~/.mlx-serve/plugins). A plugin is native code that runs with your rights. Restart the server to apply.") {
-            Toggle("", isOn: Binding(get: { switches.enabled }, set: { switches.enabled = $0; save() }))
-                .labelsHidden()
-                .toggleStyle(.switch)
-        }
-        ForEach(receipts) { r in
-            SettingsRow(title: r.name, explainer: OutsidePlugins.summary(r)) {
-                Toggle("", isOn: Binding(get: { switches.isOn(r.name) }, set: { switches.set(r.name, on: $0); save() }))
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .disabled(!switches.enabled)
-            }
-        }
-        if let saveError {
-            Text(saveError)
-                .font(.app(.caption))
-                .foregroundStyle(.red)
-        }
-    }
-
-    private func save() {
-        do {
-            try OutsidePlugins.save(switches)
-            saveError = nil
-        } catch {
-            saveError = error.localizedDescription
+                    explainer: "Install, update, remove and switch on community plugins in Models > Plugins. The server reads the switches once at startup.") {
+            Button("Open Plugins") { appState.showModels(.plugins) }
         }
     }
 }
@@ -3197,9 +3170,21 @@ private struct TranscribeSectionContent: View {
         }, set: { appState.serverOptions.transcriptNotesModel = $0 })
     }
 
+    private var nemotron: Bool { appState.serverOptions.transcribeEngine == .nemotron }
+
     var body: some View {
-        SettingsRow(title: "Meeting notes", explainer: "The model that writes a title, summary, decisions and action items above each transcript.") {
-            Picker("", selection: notesModel) {
+        SettingsRow(title: "Transcription model", explainer: "What turns speech into words for dictation, voice mode, Telegram voice notes and tray transcripts. Nemotron 3.5 Transcribe is one model that also times words, tells speakers apart and writes the notes; it has to be on this Mac (convert NVIDIA's checkpoint with scripts/convert_nemotron_transcribe.py).") {
+            Picker("", selection: $appState.serverOptions.transcribeEngine) {
+                ForEach(ServerOptions.TranscribeEngine.allCases) { engine in
+                    Text(verbatim: engine.label).font(.app(.body)).tag(engine)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 260).font(.app(.body))
+        }
+        SettingsRow(title: "Meeting notes", explainer: nemotron ? "Nemotron 3.5 Transcribe writes the notes itself." : "The model that writes a title, summary, decisions and action items above each transcript.") {
+            Picker("", selection: nemotron ? Binding<String>.constant("nemotron") : notesModel) {
+                if nemotron { Text(verbatim: "Nemotron").font(.app(.body)).tag("nemotron") }
                 Text(L10n.text("Chat model in use")).font(.app(.body)).tag("")
                 Text(L10n.text("Off")).font(.app(.body)).tag(ServerOptions.notesOff)
                 ForEach(pickable) { model in
@@ -3207,6 +3192,7 @@ private struct TranscribeSectionContent: View {
                 }
             }
             .labelsHidden()
+            .disabled(nemotron)
             .frame(width: 220).font(.app(.body))
         }
         SettingsRow(title: "Stop after silence", explainer: "Ends a recording when nothing has been heard for this long, then transcribes it.") {
