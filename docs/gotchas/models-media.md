@@ -758,3 +758,10 @@ baseline and `--no-w8a8` were clean. Cause: the attached delta keeps the f32 mod
 (`vec<T, 4>`), reading the f32 buffer as bf16. `attentionHeads` already cast; the bare call did not. Fix: the wrapper
 casts `v` to q's dtype. Guard: `int8 attention reads a v wider than q`, `tests/test_real_loras.sh` (open the renders:
 the 9B's broken one scored under the noise bar).
+
+### Headless Qwen3 embedding packs and failed-load cleanup
+Some Qwen3-Embedding packs declare untied embeddings but contain no language-model head. The Qwen3 loader previously
+required that head even for embedding inference; its error cleanup then released the same owned arrays twice. The loader
+now accepts the missing head only for recognized embedding packs, refuses generation and drafter access without a head,
+and releases owned arrays once. Guard: a headless pack's embedding rows match identical tied weights, while an untied
+chat pack without a head returns `MissingWeight` without crashing.

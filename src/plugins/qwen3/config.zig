@@ -40,6 +40,7 @@ pub const Config = struct {
     rope: rope_scaling.Scaling = .none,
     max_position_embeddings: u32 = 0,
     tie_word_embeddings: bool = false,
+    embedding_pack: bool = false,
     num_experts: u32 = 0,
     num_experts_per_tok: u32 = 0,
     moe_intermediate_size: u32 = 0,
@@ -185,7 +186,6 @@ pub fn tied(root: std.json.ObjectMap, cfg: std.json.ObjectMap) bool {
     return t;
 }
 
-
 /// Keys whose presence means a shape this plugin does not serve (another family's, or a feature the base lacks).
 const foreign_keys = [_][]const u8{
     "vision_config",               "audio_config", "linear_num_key_heads",        "full_attention_interval", "expert_quant",
@@ -267,6 +267,7 @@ pub fn parseAs(comptime asr: bool, dir: *const abi.PackDir, config_json: abi.Str
     c.max_position_embeddings = int(field(cfg, "max_position_embeddings")) orelse int(field(root, "max_position_embeddings")) orelse 0;
     if (c.rope == .dynamic and c.max_position_embeddings == 0) c.rope = .unmodeled;
     c.tie_word_embeddings = tied(root, cfg);
+    c.embedding_pack = !moe and !asr and (field(root, "pooling_mode") != null or dir.has("1_Pooling/config.json"));
     if (moe) {
         c.num_experts = int(field(cfg, "num_experts")) orelse return unsupported(P, "num_experts");
         c.num_experts_per_tok = int(field(cfg, "num_experts_per_tok")) orelse return unsupported(P, "num_experts_per_tok");

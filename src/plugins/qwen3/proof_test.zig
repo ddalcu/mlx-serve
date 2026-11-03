@@ -36,6 +36,7 @@ pub const Geo = struct {
     experts: u32 = 0,
     quantized: bool = false,
     tied: bool = false,
+    omit_head: bool = false,
     /// Qwen3-Embedding's explicit `pooling_mode`.
     last_token_pooling: bool = false,
 };
@@ -65,7 +66,7 @@ pub fn writePack(p: *fixture.Pack, g: Geo) !void {
     const q = g.quantized;
     try p.weight("model.embed_tokens", @intCast(g.vocab), h, q);
     try p.norm("model.norm.weight", h);
-    if (!g.tied) try p.weight("lm_head", @intCast(g.vocab), h, q);
+    if (!g.tied and !g.omit_head) try p.weight("lm_head", @intCast(g.vocab), h, q);
     for (0..g.layers) |i| {
         try p.norm(try at(&buf, i, "input_layernorm.weight"), h);
         try p.norm(try at(&buf, i, "post_attention_layernorm.weight"), h);
@@ -379,13 +380,42 @@ const embed_batches = [_][]const []const u32{
 };
 
 test "qwen3 plugin: a Qwen3-Embedding pack's pooled rows equal the legacy dense forward's (one sequence, padded batches)" {
-    inline for (.{ .{ Geo{ .quantized = true, .last_token_pooling = true }, 0x3e01 }, .{ Geo{ .head_dim = 256, .tied = true, .last_token_pooling = true }, 0x3e02 } }) |case| {
+    inline for (.{ .{ Geo{ .quantized = true, .last_token_pooling = true }, 0x3e01 }, .{ Geo{ .head_dim = 256, .tied = true, .last_token_pooling = true }, 0x3e02 }, .{ Geo{ .head_dim = 256, .omit_head = true, .last_token_pooling = true }, 0x3e02 } }) |case| {
         var b: Both = undefined;
         try b.open(case[0], case[1]);
         defer b.close();
         try testing.expect(b.xfm.plugin != null and b.cfg.pooling_mode.? == .last_token);
         for (embed_batches) |seqs| try expectEmbeddings(&b, seqs);
         try b.oracle.done();
+    }
+}
+
+test "qwen3 plugin: missing untied chat head fails without double cleanup" {
+    var b: Both = undefined;
+    try testing.expectError(error.MissingWeight, b.open(.{ .head_dim = 256, .omit_head = true }, 0x3e02));
+}
+
+test "qwen3 plugin: headless embeddings match identical tied weights" {
+    var tied: Both = undefined;
+    try tied.open(.{ .head_dim = 256, .tied = true, .last_token_pooling = true }, 0x3e02);
+    defer tied.close();
+    var headless: Both = undefined;
+    try headless.open(.{ .head_dim = 256, .omit_head = true, .last_token_pooling = true }, 0x3e02);
+    defer headless.close();
+    for (embed_batches) |seqs| {
+        const a = testing.allocator;
+        const expected = try pooling.computeEmbeddingsBatchWith(a, &tied.xfm, seqs, null);
+        defer {
+            for (expected) |row| a.free(row);
+            a.free(expected);
+        }
+        const actual = try pooling.computeEmbeddingsBatchWith(a, &headless.xfm, seqs, null);
+        defer {
+            for (actual) |row| a.free(row);
+            a.free(actual);
+        }
+        try testing.expectEqual(expected.len, actual.len);
+        for (expected, actual) |want, got| try testing.expectEqualSlices(f32, want, got);
     }
 }
 
