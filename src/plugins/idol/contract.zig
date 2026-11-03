@@ -1123,6 +1123,7 @@ pub fn register(set: *kc.Set) !void {
         // 64 query rows a threadgroup, keys in 32-key blocks.
         .tiles = .{ .{ .size = 64, .min = 1 }, .{}, .{} },
         .served = &.{ .{ .rows = 300, .n = 2, .k = HD }, .{ .rows = 64, .n = 1, .k = HD } },
+        .nax = true,
     }, null);
 }
 
@@ -1137,7 +1138,26 @@ test "kernel contract idol: the fused kernels pass gates 1-4" {
     var t: kc.gates.Tally = .{};
     try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
     try std.testing.expectEqual(@as(usize, 0), t.problems());
-    try std.testing.expectEqual(@as(usize, 9), t.passed);
+    // The NAX-only attention kernel runs only on M5-class GPUs; on M4 it is
+    // explicitly skipped (not counted as a pass, not a failure).
+    const nax_here = @import("../../mlx/device.zig").naxAvailable();
+    if (nax_here) {
+        try std.testing.expectEqual(@as(usize, 9), t.passed);
+        try std.testing.expectEqual(@as(usize, 0), t.skipped);
+    } else {
+        // Only the registered NAX attention kernel may be skipped on this device.
+        try std.testing.expectEqual(@as(usize, 9), set.kernels.items.len);
+        var nax_kernels: usize = 0;
+        for (set.kernels.items) |kernel| {
+            if (kernel.spec.nax) {
+                nax_kernels += 1;
+                try std.testing.expectEqualStrings("idol attention f16 (NAX, key bias)", kernel.spec.name);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), nax_kernels);
+        try std.testing.expectEqual(@as(usize, 8), t.passed);
+        try std.testing.expectEqual(@as(usize, 1), t.skipped);
+    }
 }
 
 test "kernel contract idol: each declared launch is the shipped wrapper's, byte for byte" {
