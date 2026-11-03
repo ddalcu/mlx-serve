@@ -39,6 +39,17 @@ struct GgDot {
     }
 };
 
+// One unit against M activation rows already in registers (`x`: the unit's G groups of 4 values, row after row):
+// the column-major matvec loads a unit's activations once and reuses them for every weight row it decodes.
+template <uint M, uint G>
+struct GgDotRegs {
+    thread const float4 *x;
+    float4 acc[M];
+    void emit(uint i, float4 v) {
+        for (uint m = 0; m < M; m++) acc[m] += v * x[m * G + i];
+    }
+};
+
 // Weights of one row into a [column][row] tile of 8 rows, the layout an 8x8
 // simdgroup_matrix load reads column block by column block.
 struct GgTile {
@@ -71,6 +82,11 @@ inline uint32_t gg_u32(const device uint8_t *b, uint off) {
 inline float4 gg_signs(uint bits, bool hi) {
     const uint4 mask = hi ? uint4(16, 32, 64, 128) : uint4(1, 2, 4, 8);
     return select(float4(1.0f), float4(-1.0f), (uint4(bits) & mask) != 0);
+}
+
+// ggml's ksigns_iq2xs[i]: 7 sign bits plus an eighth that makes the count of minus signs even.
+inline uint gg_ksigns(uint i) {
+    return i | ((popcount(i) & 1) << 7);
 }
 
 // The 4 magnitudes packed in one 32-bit grid word, low byte first.

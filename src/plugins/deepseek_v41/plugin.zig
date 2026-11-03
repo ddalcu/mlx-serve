@@ -708,6 +708,21 @@ fn engramResident(dir: []const u8, settings_json: []const u8, shards: u64) !u64 
     return out;
 }
 
+test "deepseek_v41 resident bill: a --mlx-gguf set (a file, not a pack dir) bills what its loader keeps" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try td.dir.writeFile(io, .{ .sub_path = "set-00001-of-00004.gguf", .data = "GGUF" });
+    var buf: [512]u8 = undefined;
+    const root = buf[0..try td.dir.realPath(io, &buf)];
+    var pb: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&pb, "{s}/set-00001-of-00004.gguf", .{root});
+    var c: config.Config = .{ .model_type = "deepseek_v41" };
+    var out: u64 = 0;
+    try std.testing.expect(residentBytes(&.{ .private = &c }, .of(path), .of(""), 10_000, &out).isOk());
+    try std.testing.expectEqual(@as(u64, 10_000), out);
+}
+
 test "deepseek_v41 resident bill: the Engram tables it preads are not billed" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});

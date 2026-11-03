@@ -1,6 +1,6 @@
 //! gpt-oss routed experts: a biased router (softmax over the top-k), per-expert ADDITIVE biases on gate, up and down,
-//! and the clamped SwiGLU `clip(gate, max=l) * sigmoid(alpha * gate) * (clip(up, ±l) + 1)`. The biases force the
-//! sorted path at every width (no fused decode arm has a bias slot), as the legacy.
+//! and the clamped SwiGLU `clip(gate, max=l) * sigmoid(alpha * gate) * (clip(up, ±l) + 1)`. The biases keep it off
+//! the fused decode arms (none has a bias slot): sorted past one token, routing order at one.
 //! copied_from: sdk/bases/blocks/moe.zig (`route`'s softmax arm, `sorted`), sdk/blocks/moe/moe.zig
 //! (`moeMLP2WithRouter`'s bias and gpt_oss activation arms), sdk/blocks/moe/experts.zig (`addExpertBias`).
 
@@ -88,11 +88,11 @@ fn route(w: *const Moe.Weights, g: *Graph, logits: Array) ![2]Array {
     return .{ inds, try g.adopt(r.norm_scores) };
 }
 
-fn expertMm(parent: *Graph, x: Array, bank: *const Bank, lhs: Array, rhs: Array) !Array {
+fn expertMm(parent: *Graph, x: Array, bank: *const Bank, lhs: Array, rhs: Array, is_sorted: bool) !Array {
     var t = parent.scope();
     defer t.deinit();
     var y = mlx.mlx_array_new();
-    gatherExpertMm(&y, x, bank.w, bank.s, bank.b, lhs, rhs, bank.qp.bits, bank.qp.group_size, bank.qp.mode, true, t.s) catch |e| {
+    gatherExpertMm(&y, x, bank.w, bank.s, bank.b, lhs, rhs, bank.qp.bits, bank.qp.group_size, bank.qp.mode, is_sorted, t.s) catch |e| {
         _ = mlx.mlx_array_free(y);
         return e;
     };
@@ -112,6 +112,18 @@ fn sorted(w: *const Moe.Weights, g: *Graph, x: Array, inds: Array, scores: Array
     const gq = w.gate.qp;
     const uq = w.up.qp;
     const flat = try g.reshape(inds, &.{total});
+    const none = Array{ .ctx = null };
+    if (B * S == 1) {
+        // One token: its experts in routing order, the order the sort's inverse puts them back in; the sort and its
+        // index chain are a score of dispatches a layer at decode.
+        const x1 = try g.reshape(x, &.{ 1, 1, D });
+        const gate = try addBias(g, try g.call(mlx.mlx_squeeze, .{try expertMm(g, x1, &w.gate, none, flat, false)}), w.gate_bias, flat);
+        const up = try addBias(g, try g.call(mlx.mlx_squeeze, .{try expertMm(g, x1, &w.up, none, flat, false)}), w.up_bias, flat);
+        const act = try g.adopt(try gptOssSwiGLU(g.s, gate, up, w.limit, w.alpha));
+        const down3 = try expertMm(g, try g.expandDims(act, -2), &w.down, none, flat, false);
+        const down = try addBias(g, try g.call(mlx.mlx_squeeze, .{down3}), w.down_bias, flat);
+        return .{ .out = try g.reshape(down, &.{ B, S, K, ops.shape(down)[1] }), .reduced = false };
+    }
     var inv: Array = undefined;
     var sorted_inds: Array = undefined;
     var lhs: Array = undefined;
@@ -143,13 +155,12 @@ fn sorted(w: *const Moe.Weights, g: *Graph, x: Array, inds: Array, scores: Array
         }
     }
     const x_rep: ?Array = if (mapped_gate == null) try g.reshape(try g.take(x_flat, lhs, 0), &.{ total, 1, D }) else null;
-    const none = Array{ .ctx = null };
-    const gate3 = mapped_gate orelse try expertMm(g, x_rep.?, &w.gate, none, sorted_inds);
+    const gate3 = mapped_gate orelse try expertMm(g, x_rep.?, &w.gate, none, sorted_inds, true);
     const gate = try addBias(g, try g.call(mlx.mlx_squeeze, .{gate3}), w.gate_bias, sorted_inds);
-    const up3 = mapped_up orelse try expertMm(g, x_rep.?, &w.up, none, sorted_inds);
+    const up3 = mapped_up orelse try expertMm(g, x_rep.?, &w.up, none, sorted_inds, true);
     const up = try addBias(g, try g.call(mlx.mlx_squeeze, .{up3}), w.up_bias, sorted_inds);
     const act = try g.adopt(try gptOssSwiGLU(g.s, gate, up, w.limit, w.alpha));
-    const down3 = try expertMm(g, try g.expandDims(act, -2), &w.down, none, sorted_inds);
+    const down3 = try expertMm(g, try g.expandDims(act, -2), &w.down, none, sorted_inds, true);
     const down = try addBias(g, try g.call(mlx.mlx_squeeze, .{down3}), w.down_bias, sorted_inds);
     if (try verify_kernels.moePrefillExpertReduce(g.s, down, inv, scores)) |sum| return .{ .out = try g.adopt(sum), .reduced = true };
     const unsorted = try g.take(down, inv, 0);

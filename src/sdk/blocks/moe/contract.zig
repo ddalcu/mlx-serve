@@ -334,7 +334,7 @@ const Gather = struct {
         const n: c_int = @intCast(shape.n);
         const k = shape.k;
         if (shape.rows == 0 or shape.n == 0 or k == 0 or k % self.gs() != 0) return null;
-        const kp: c_int = @intCast(if (self.bits() == 3) k / 8 else k * self.bits() / 32);
+        const kp: c_int = gq.affineQmvPackUnits(@intCast(k), self.bits());
         var g: metal.Geometry = undefined;
         switch (self.kind) {
             .qmv, .gateup, .gateup_rows => {
@@ -737,7 +737,7 @@ const act2_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "ReLU^2 run
 const limit_drops_nan: spec.Known = .{ .gate = .nonfinite, .finding = "metal::min / max return the other operand for a NaN, where MLX's Minimum and Clip (the clampedSwiGLU chain it replaces) keep the NaN: a NaN gate or up gives a finite output" };
 
 fn gatherSpec(comptime name: []const u8, g: Gather, served: []const Shape, replaces: ?[]const u8, known: ?spec.Known) spec.Spec {
-    const vpw: usize = if (g.bits() == 3) 8 else 32 / g.bits();
+    const vpw: usize = @intCast(@divExact(@as(c_int, 32 * 8), gq.affineQmvPackUnits(32 * 8, g.bits())));
     const lanes: usize = if (g.kind == .down or g.kind == .down_rows) g.lpr else 32;
     const n_tile: spec.Tile = if (g.kind == .down or g.kind == .down_rows) .{ .size = 8, .step = 4, .min = 4 } else .{ .size = 16, .step = 8, .min = 8 };
     return .{
@@ -2721,7 +2721,7 @@ fn registerGathers(set: *kc.Set) !void {
     // Gate/up projections (one x, top-k 8), the down projection (x per expert), Nemotron's fc1 with ReLU^2.
     const up_served: []const Shape = &.{ .{ .rows = 8, .n = 256, .k = 2048 }, .{ .rows = 6, .n = 512, .k = 1024 } };
     const down_served: []const Shape = &.{ .{ .rows = 8, .n = 1024, .k = 512 }, .{ .rows = 8, .n = 512, .k = 768 } };
-    inline for (.{ .{ 4, 64 }, .{ 3, 64 }, .{ 2, 64 }, .{ 8, 32 } }) |bg| {
+    inline for (.{ .{ 4, 64 }, .{ 3, 64 }, .{ 2, 64 }, .{ 8, 32 }, .{ 5, 32 }, .{ 6, 64 } }) |bg| {
         try add(set, .init(a, .qmv, .affine, bg[0], bg[1]), std.fmt.comptimePrint("gather_qmv bf16 ({d}-bit g{d})", .{ bg[0], bg[1] }), up_served, null, null);
     }
     {
@@ -2753,7 +2753,7 @@ fn registerGathers(set: *kc.Set) !void {
     }
     const chain = "gather_qmv gate and up -> sigmoid -> multiply -> multiply";
     const clamp_chain = "gather_qmv gate and up -> minimum, clip -> sigmoid -> multiply -> multiply";
-    inline for (.{ .{ 4, 64 }, .{ 3, 64 }, .{ 8, 64 } }) |bg| {
+    inline for (.{ .{ 4, 64 }, .{ 3, 64 }, .{ 8, 64 }, .{ 5, 32 }, .{ 6, 64 }, .{ 2, 64 } }) |bg| {
         try add(set, .init(a, .gateup, .affine, bg[0], bg[1]), std.fmt.comptimePrint("gather_qmv_gateup bf16 ({d}-bit g{d})", .{ bg[0], bg[1] }), up_served, chain, null);
     }
     {
@@ -2770,6 +2770,10 @@ fn registerGathers(set: *kc.Set) !void {
     const per_row = "gather_qmv gate and up per row -> sigmoid -> multiply -> multiply";
     try add(set, .init(a, .gateup_rows, .affine, 4, 64), "gather_qmv_gateup_rows bf16 (4-bit g64)", rows_served, per_row, null);
     try add(set, .init(a, .gateup_rows, .affine, 3, 64), "gather_qmv_gateup_rows bf16 (3-bit g64)", rows_served, per_row, null);
+    try add(set, .init(a, .gateup_rows, .affine, 5, 32), "gather_qmv_gateup_rows bf16 (5-bit g32)", rows_served, per_row, null);
+    try add(set, .init(a, .gateup_rows, .affine, 6, 64), "gather_qmv_gateup_rows bf16 (6-bit g64)", rows_served, per_row, null);
+    // GGUF Q2_0 expert banks load as 2-bit g64 (sdk/quant/gguf/affine.zig).
+    try add(set, .init(a, .gateup_rows, .affine, 2, 64), "gather_qmv_gateup_rows bf16 (2-bit g64)", rows_served, per_row, null);
     try add(set, .init(a, .gateup_rows, .nvfp4, 4, 16), "gather_qmv_gateup_rows bf16 (NVFP4)", rows_served, per_row, null);
     {
         var g = Gather.init(a, .gateup_rows, .nvfp4, 4, 16);
@@ -2787,18 +2791,34 @@ fn registerGathers(set: *kc.Set) !void {
         g = Gather.init(a, .down_rows, .affine, 4, 64);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (4-bit g64, {d} lanes)", .{lpr}), &.{ .{ .rows = 4, .n = 1024, .k = 512 }, .{ .rows = 8, .n = 256, .k = 768 } }, "down_reduce per row", null);
+        // GGUF Q5_1 down banks load as 5-bit g32 (sdk/quant/gguf/affine.zig).
+        g = Gather.init(a, .down, .affine, 5, 32);
+        g.lpr = lpr;
+        try add(set, g, std.fmt.comptimePrint("down_reduce bf16 (5-bit g32, {d} lanes)", .{lpr}), down_served, null, null);
+        g = Gather.init(a, .down_rows, .affine, 5, 32);
+        g.lpr = lpr;
+        try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (5-bit g32, {d} lanes)", .{lpr}), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
+        g = Gather.init(a, .down_rows, .affine, 6, 64);
+        g.lpr = lpr;
+        try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (6-bit g64, {d} lanes)", .{lpr}), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
+        g = Gather.init(a, .down, .affine, 2, 64);
+        g.lpr = lpr;
+        try add(set, g, std.fmt.comptimePrint("down_reduce bf16 (2-bit g64, {d} lanes)", .{lpr}), down_served, null, null);
+        g = Gather.init(a, .down_rows, .affine, 2, 64);
+        g.lpr = lpr;
+        try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (2-bit g64, {d} lanes)", .{lpr}), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
         g = Gather.init(a, .down_rows, .nvfp4, 4, 16);
         g.lpr = lpr;
         try add(set, g, std.fmt.comptimePrint("down_reduce_rows bf16 (NVFP4, {d} lanes)", .{lpr}), &.{.{ .rows = 4, .n = 1024, .k = 512 }}, "down_reduce per row", null);
     }
     {
-        var g = Gather.init(a, .down, .affine, 2, 64);
-        g.lpr = 8;
-        try add(set, g, "down_reduce bf16 (2-bit g64, 8 lanes)", down_served, null, null);
-        g = Gather.init(a, .down, .affine, 8, 64);
+        var g = Gather.init(a, .down, .affine, 8, 64);
         g.dt = .float16;
         g.lpr = 8;
         try add(set, g, "down_reduce f16 (8-bit g64, 8 lanes)", down_served, null, null);
+        g = Gather.init(a, .down, .affine, 6, 64);
+        g.lpr = 8;
+        try add(set, g, "down_reduce bf16 (6-bit g64, 8 lanes)", down_served, null, null);
     }
 }
 

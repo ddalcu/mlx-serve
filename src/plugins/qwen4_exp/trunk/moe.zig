@@ -38,6 +38,7 @@ const swigluFusedEnabled = @import("../../../sdk/blocks/mlp/fused_activations.zi
 const swigluSigTable = @import("../../../sdk/blocks/mlp/fused_activations.zig").swigluSigTable;
 const moeFp4DecodeEligible = @import("../../../sdk/blocks/moe/decode.zig").moeFp4DecodeEligible;
 const gatherExpertMm = @import("../../../sdk/blocks/moe/experts.zig").gatherExpertMm;
+const gguf_kernels = @import("../../../sdk/quant/gguf/kernels.zig");
 const moeCudaFormat = gather_qmv_rows.moeCudaFormat;
 const moeDecodeDispatchArm = gather_qmv_rows.moeDecodeDispatchArm;
 const gatherQmvGateUpRows = gather_qmv_rows.gatherQmvGateUpRows;
@@ -621,6 +622,7 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
             }
         }
 
+        if (fused_act == null and mapped_gate == null and input_view == null) fused_act = try self.ggufSwiGLU(x_rep, mw, gate_qp, up_qp, sorted_inds);
         const expert_act = if (fused_act) |act| act else blk: {
             const use_mapped_gate = mapped_gate != null;
             var gate_out_3d = mapped_gate orelse mlx.mlx_array_new();
@@ -721,21 +723,23 @@ pub fn moeMLP2WithRouter(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx
         defer _ = mlx.mlx_array_free(x_exp);
         try mlx.check(mlx.mlx_reshape(&x_exp, expert_x, &exp_shape, 5, self.s));
 
-        var gate_out_5d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(gate_out_5d);
-        try gatherExpertMm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, false, self.s);
-        var gate_out = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(gate_out);
-        try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
+        const expert_act = (try self.ggufSwiGLU(x_exp, mw, gate_qp, up_qp, inds)) orelse blk: {
+            var gate_out_5d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate_out_5d);
+            try gatherExpertMm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, false, self.s);
+            var gate_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate_out);
+            try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
 
-        var up_out_5d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(up_out_5d);
-        try gatherExpertMm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, up_qp.bits, up_qp.group_size, up_qp.mode, false, self.s);
-        var up_out = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(up_out);
-        try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
+            var up_out_5d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(up_out_5d);
+            try gatherExpertMm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, up_qp.bits, up_qp.group_size, up_qp.mode, false, self.s);
+            var up_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(up_out);
+            try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
 
-        const expert_act = try self.computeGeglu(gate_out, up_out);
+            break :blk try self.computeGeglu(gate_out, up_out);
+        };
         defer _ = mlx.mlx_array_free(expert_act);
 
         var act_exp = mlx.mlx_array_new();
@@ -1106,6 +1110,25 @@ pub fn moeFp4Decode(self: *Trunk, out: *mlx.mlx_array, expert_x: mlx.mlx_array, 
 /// expert_x: input for expert computation (possibly normalized).
 pub fn moeMLP2(self: *Trunk, router_x: mlx.mlx_array, expert_x_in: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
     return self.moeMLP2WithRouter(router_x, expert_x_in, mw, null, false);
+}
+
+/// A GGUF pack's raw ggml gate and up banks through one gather with the SwiGLU fused (`gguf_kernels.gatherSwiGLU`),
+/// bit for bit the two gathers and `computeGeglu` it replaces, squeezed as they are. Null where it does not serve.
+/// The loader refuses a clamped SwiGLU (`trunk_load.unservedLayout`), so none is checked here.
+pub fn ggufSwiGLU(self: *Trunk, x: mlx.mlx_array, mw: *const MoeMlpWeights, gate_qp: QuantParams, up_qp: QuantParams, ids: mlx.mlx_array) !?mlx.mlx_array {
+    if (gate_qp.mode != .gguf or up_qp.mode != .gguf or self.config.hidden_act != .silu) return null;
+    if (mw.gate_expert_scale.ctx != null or mw.up_expert_scale.ctx != null) return null;
+    const gi = gguf_kernels.infoOf(mw.switch_gate_w, mw.switch_gate_s) orelse return null;
+    const ui = gguf_kernels.infoOf(mw.switch_up_w, mw.switch_up_s) orelse return null;
+    const dt = mlx.mlx_array_dtype(x);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    const sigtab = try swigluSigTable(self.s, dt, std.heap.c_allocator);
+    const y = (try gguf_kernels.gatherSwiGLU(gi, ui, x, mw.switch_gate_w, mw.switch_up_w, ids, sigtab, self.s)) orelse return null;
+    defer _ = mlx.mlx_array_free(y);
+    var act = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(act);
+    try mlx.check(mlx.mlx_squeeze(&act, y, self.s));
+    return act;
 }
 
 pub fn useGatherQmvDecode(self: *const Trunk, gate_qp: QuantParams, up_qp: QuantParams) bool {

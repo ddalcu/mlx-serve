@@ -12,7 +12,6 @@ const formats = @import("../../sdk/quant/formats.zig");
 const native = @import("../../sdk/quant/native.zig");
 const gguf_format = @import("../../sdk/quant/gguf/format.zig");
 const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
-const transposeBf16Weight = @import("../../mlx/array.zig").transposeBf16Weight;
 const fuseRowGroup = @import("../../sdk/blocks/linear/fused_rows.zig").fuseRowGroup;
 
 const gpa = std.heap.c_allocator;
@@ -100,17 +99,6 @@ pub const Reader = struct {
 
     fn weight(r: *Reader, base: []const u8, in_dim: u32) !quant_abi.Weight {
         var w: quant_abi.Weight = .{};
-        // A GGUF's float tensors load as bf16 beside its block-quantized ones: one without a sentinel is dense.
-        if (r.isGguf()) {
-            var nb: [256]u8 = undefined;
-            if (!r.has(try std.fmt.bufPrint(&nb, "{s}.scales", .{base}))) {
-                const raw = r.src.tensor(try std.fmt.bufPrint(&nb, "{s}.weight", .{base}));
-                if (raw.ctx == null) return error.MissingWeight;
-                w.w = .{ .ctx = (try transposeBf16Weight(.{ .ctx = raw.ctx }, r.s)).ctx };
-                w.layout = @backingInt(native.Layout.dense);
-                return w;
-            }
-        }
         const v = r.fmt.load_tensor(&r.qctx, abi.Str.of(base), in_dim, &w);
         if (!v.isOk()) return if (std.mem.eql(u8, v.why.slice(), "MissingWeight")) error.MissingWeight else error.QuantFormatRefused;
         if (w.layout == @backingInt(native.Layout.fp8_rows)) {
@@ -126,9 +114,10 @@ pub const Reader = struct {
         return .{ .w = arr(w.w), .s = arr(w.scales), .b = arr(w.biases), .bits = w.bits, .group_size = w.group_size, .mode = r.modeOf(&w) };
     }
 
-    /// A GGUF weight's layout is its block type, read by the kernels off the sentinel; never an MLX mode.
+    /// A GGUF weight's layout is its block type, read by the kernels off the sentinel; never an MLX mode. Its
+    /// affine-coded types arrive as MLX affine (bf16 scales), its floats dense.
     fn modeOf(r: *const Reader, w: *const quant_abi.Weight) QuantMode {
-        return if (r.isGguf() and w.scales.ctx != null) .gguf else native.modeOf(w);
+        return if (r.isGguf() and w.scales.ctx != null and mlx.mlx_array_dtype(arr(w.scales)) == .bool_) .gguf else native.modeOf(w);
     }
 
     /// Routed experts stacked under `base` (`[E, out, in]`; dense ones `[E, in, out]`), unowned. A dense bank in a
@@ -216,4 +205,49 @@ pub fn bf16Scalar(o: *Owned, v: f32, s: mlx.mlx_stream) !Array {
     try mlx.check(mlx.mlx_astype(&out, f, .bfloat16, s));
     try o.own(out);
     return out;
+}
+
+// Bar: a GGUF set's projections and banks reach the blocks as the format hands them over: ggml blocks beside their
+// sentinel (`QuantMode.gguf`), an affine-coded type's triple as MLX affine at its own widths.
+test "a GGUF's ggml blocks read as the gguf mode, its affine-coded triples as MLX affine" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const testing = std.testing;
+    const resident = @import("../../sdk/weights/resident.zig");
+    const kernels = @import("../../sdk/quant/gguf/kernels.zig");
+    const s = mlx.gpuStream();
+    var w = resident.Weights.init(testing.allocator);
+    const rb = kernels.rowBytes(.q8_0, 64);
+    const raw = try testing.allocator.alloc(u8, 4 * rb);
+    defer testing.allocator.free(raw);
+    @memset(raw, 0);
+    try w.put("m.g.weight", mlx.mlx_array_new_data(raw.ptr, &[_]c_int{ 4, @intCast(rb) }, 2, .uint8));
+    try w.put("m.g.scales", try kernels.sentinel(.{ .ty = .q8_0 }, s));
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_random_normal(&dense, &[_]c_int{ 2, 4, 64 }, 3, .bfloat16, 0, 1, .{ .ctx = null }, s));
+    var q = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(q);
+    try mlx.check(mlx.mlx_quantize(&q, dense, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    for ([_][]const u8{ "m.e.weight", "m.e.scales", "m.e.biases" }, 0..) |n, i| {
+        var t = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&t, q, i));
+        try w.put(n, t);
+    }
+    var res = resident.Resident.adopt(w);
+    defer res.deinit();
+    const src = res.source();
+    const ctx: abi.LoadCtx = .{ .model_dir = .of(""), .dir = undefined, .parsed = undefined, .stream = .{ .ctx = s.ctx }, .weights = &src };
+    var r = try Reader.open(&ctx, "{\"group_size\":32,\"bits\":4,\"mode\":\"gguf\"}", &.{"m"}, "g.weight");
+    defer r.close();
+    const g = try r.proj("m.g", 64);
+    defer for ([_]Array{ g.w, g.s }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    try testing.expectEqual(QuantMode.gguf, g.mode);
+    const e = try r.bank("m.e", 64);
+    defer for ([_]Array{ e.w, e.s, e.b }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    try testing.expectEqual(QuantMode.affine, e.qp.mode);
+    try testing.expect(e.qp.bits == 4 and e.qp.group_size == 32);
 }

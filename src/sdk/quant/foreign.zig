@@ -14,7 +14,7 @@ pub const Format = struct {
     /// `x @ w^T` for a pair `claims` accepted.
     linear: *const fn (x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream) anyerror!mlx.mlx_array,
     /// Gathered rows of a pair `claims` accepted (MoE experts), or null when the format has none.
-    gather: ?*const fn (x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, lhs: mlx.mlx_array, rhs: mlx.mlx_array, s: mlx.mlx_stream) anyerror!mlx.mlx_array = null,
+    gather: ?*const fn (x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, lhs: mlx.mlx_array, rhs: mlx.mlx_array, sorted: bool, s: mlx.mlx_stream) anyerror!mlx.mlx_array = null,
 };
 
 const max_registered = 8;
@@ -40,10 +40,10 @@ pub fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_
 }
 
 /// Gathered rows through the format that stores (w, sc) and gathers, or null when none does.
-pub fn gather(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, lhs: mlx.mlx_array, rhs: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
-    inline for (builtin_formats) |f| if (f.gather) |g| if (f.claims(w, sc)) return try g(x, w, sc, lhs, rhs, s);
+pub fn gather(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, lhs: mlx.mlx_array, rhs: mlx.mlx_array, sorted: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
+    inline for (builtin_formats) |f| if (f.gather) |g| if (f.claims(w, sc)) return try g(x, w, sc, lhs, rhs, sorted, s);
     const r = &registry;
-    for (r.items[0..r.n]) |f| if (f.gather) |g| if (f.claims(w, sc)) return try g(x, w, sc, lhs, rhs, s);
+    for (r.items[0..r.n]) |f| if (f.gather) |g| if (f.claims(w, sc)) return try g(x, w, sc, lhs, rhs, sorted, s);
     return null;
 }
 
@@ -64,6 +64,6 @@ test "foreign: a registered format claims its pair, and a pair no format stores 
     const s: mlx.mlx_stream = .{ .ctx = null };
     try std.testing.expect((try linear(none, mine, none, s)).?.ctx == mine.ctx);
     try std.testing.expectEqual(@as(usize, 1), T.calls);
-    try std.testing.expect(try gather(none, mine, none, none, none, s) == null);
+    try std.testing.expect(try gather(none, mine, none, none, none, false, s) == null);
     try std.testing.expect(try linear(none, .{ .ctx = @ptrFromInt(0x20) }, none, s) == null);
 }

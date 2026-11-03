@@ -154,6 +154,8 @@ pub fn computeQuantParams(model: QuantParams, w: mlx.mlx_array, sc: mlx.mlx_arra
     const w_cols: u32 = if (w_shape.len >= 2) @intCast(w_shape[w_shape.len - 1]) else 0;
     const s_cols: u32 = if (s_shape.len >= 2) @intCast(s_shape[s_shape.len - 1]) else 0;
 
+    // A GGUF weight's scales are its ggml type sentinel (`sdk/quant/gguf` kernels.infoOf): no geometry to solve.
+    if (mlx.mlx_array_dtype(sc) == .bool_) return .{ .bits = model.bits, .group_size = model.group_size, .mode = .gguf };
     if (mlx.mlx_array_dtype(sc) == .uint8) {
         if (model.mode != .affine) {
             // A per-tensor override can live INSIDE the fp family: LFM2.5-2.6B-MLX's
@@ -312,6 +314,20 @@ test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar qu
     const qp_via = computeQuantParams(cfg, wq, sq, H);
     try testing.expectEqual(@as(u32, 5), qp_via.bits);
     try testing.expectEqual(@as(u32, 128), qp_via.group_size);
+}
+
+test "computeQuantParams: a GGUF weight's type sentinel resolves to the gguf mode, whatever its geometry" {
+    const s = mlx.gpuStream();
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 320, 10880 }, 2, .uint8, s));
+    const cfg: QuantParams = .{ .bits = 4, .group_size = 32, .mode = .gguf };
+    for ([_][]const c_int{ &.{9}, &.{ 9, 16, 3 } }) |shape| {
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_zeros(&sc, shape.ptr, @intCast(shape.len), .bool_, s));
+        for ([_]?u32{ null, 10240 }) |hint| try testing.expectEqual(QuantMode.gguf, computeQuantParams(cfg, w, sc, hint).mode);
+    }
 }
 
 test "computeQuantParams resolves an fp override INSIDE the fp family (mxfp8 embed under mxfp4)" {

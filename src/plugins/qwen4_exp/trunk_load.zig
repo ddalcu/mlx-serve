@@ -22,6 +22,7 @@ const weights_util = @import("../../engines/mlx/load/weights.zig");
 const quantizeHeadMxfp8 = @import("../../sdk/quant/mxfp8.zig").quantizeHeadMxfp8;
 const computeYarnFreqs = @import("../../sdk/blocks/rope/yarn.zig").computeYarnFreqs;
 const yarnSpec = @import("../../engines/mlx/methods/yarn.zig").yarnSpec;
+const gguf_kernels = @import("../../sdk/quant/gguf/root.zig").kernels;
 const mtp_nax_profile = @import("../../engines/mlx/spec/mtp_nax_profile.zig");
 const MoeLayerWeights = @import("../../engines/mlx/layer_weights.zig").MoeLayerWeights;
 const ternaryKernelCandidate = @import("../../sdk/quant/ternary.zig").ternaryKernelCandidate;
@@ -80,7 +81,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         return error.MissingWeight;
     };
     const emb_b = if (emb_dense) mlx.mlx_array_new() else weights_util.getNamedWeight(weights, &name_buf, prefix, "embed_tokens", "biases") orelse blk: {
-        if (bias_mandatory) {
+        if (biasesRequired(bias_mandatory, emb_w, emb_s)) {
             log.err("MISSING WEIGHT: {s}.embed_tokens.biases\n", .{prefix});
             return error.MissingWeight;
         }
@@ -101,7 +102,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
             lm_head_s = if (head_dense) mlx.mlx_array_new() else try weights_util.getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
             lm_head_b = if (head_dense)
                 mlx.mlx_array_new()
-            else if (bias_mandatory)
+            else if (biasesRequired(bias_mandatory, w, lm_head_s))
                 try weights_util.getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix)
             else
                 weights_util.getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix) orelse mlx.mlx_array_new();
@@ -299,6 +300,11 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
     };
 }
 
+/// A raw ggml table (its scales the GGUF type sentinel) carries no biases whatever the config's mode says.
+fn biasesRequired(mandatory: bool, w: mlx.mlx_array, sc: mlx.mlx_array) bool {
+    return mandatory and gguf_kernels.infoOf(w, sc) == null;
+}
+
 test "qwen4_exp trunk: a layout the trunk does not run is refused by name, the plugin's own config is not" {
     const testing = std.testing;
     const toModelConfig = @import("model_config.zig").toModelConfig;
@@ -316,4 +322,21 @@ test "qwen4_exp trunk: a layout the trunk does not run is refused by name, the p
         @field(bad, m[0]) = m[1];
         try testing.expect(unservedLayout(&bad, &.{}) != null);
     }
+}
+
+test "qwen4_exp trunk: a raw ggml table needs no biases, an affine one under an affine config does" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ 8, 110 }, 2, .uint8, s));
+    var sentinel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sentinel);
+    try mlx.check(mlx.mlx_zeros(&sentinel, &[_]c_int{12}, 1, .bool_, s)); // Q3_K + 1
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_zeros(&sc, &[_]c_int{ 8, 4 }, 2, .bfloat16, s));
+    try std.testing.expect(!biasesRequired(true, w, sentinel));
+    try std.testing.expect(biasesRequired(true, w, sc));
+    try std.testing.expect(!biasesRequired(false, w, sc));
 }

@@ -3,6 +3,7 @@ const core = @import("core.zig");
 pub const gguf = core.gguf;
 pub const quants = core.quants;
 pub const meta = core.meta;
+pub const gguf_arch = core.arch;
 pub const kernels = @import("kernels.zig");
 pub const weights = @import("weights.zig");
 

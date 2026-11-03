@@ -239,6 +239,8 @@ pub fn readShell(cfg: std.json.ObjectMap, root: std.json.ObjectMap, s: *abi.Shel
 /// not serve, affine widths without kernels, and 2-bit group 128 (possibly a ternary pack the engine's own kernels
 /// serve).
 pub fn readQuant(root: std.json.ObjectMap) error{Unsupported}!abi.Quant {
+    // A `--mlx-gguf` file's rebuilt block: each tensor's block type rides its sentinel (`sdk/quant/gguf`).
+    if (json_read.ggufQuant(root) catch return error.Unsupported) |g| return g;
     const q = field(root, "quantization") orelse return .{};
     if (q != .object) return error.Unsupported;
     var out: abi.Quant = .{ .bits = std.math.cast(u8, int(field(q.object, "bits")) orelse 0) orelse return error.Unsupported, .group_size = 64, .mode = .affine };
@@ -350,4 +352,13 @@ test "llama config: the rope scalings mlx-lm builds are served; any other block 
         try testing.expectEqualStrings(case[1], p.cache.layout_namespace.slice());
         try testing.expectEqual(case[2], p.caps.batches_decode);
     }
+}
+
+test "llama config: a --mlx-gguf rebuilt block reads as gguf, the format the shared parsers hand on" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"quantization\":{\"group_size\":32,\"bits\":4,\"mode\":\"gguf\"}}", .{});
+    defer parsed.deinit();
+    const q = try readQuant(parsed.value.object);
+    try testing.expectEqual(abi.QuantMode.gguf, q.mode);
+    try testing.expectEqual(@as(u8, 4), q.bits);
+    try testing.expectEqual(@as(u32, 32), q.group_size);
 }

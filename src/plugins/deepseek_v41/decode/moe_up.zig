@@ -298,28 +298,28 @@ pub fn register(set: *kc.Set) !void {
 // ── tests ──
 
 /// `res` of an op that wrote `o`.
-fn own(sc: *dsv41.Scope, rc: c_int, o: A) !A {
+pub fn own(sc: *dsv41.Scope, rc: c_int, o: A) !A {
     var x = o;
     return sc.res(rc, &x);
 }
 
-fn astype(sc: *dsv41.Scope, a: A, dt: mlx.mlx_dtype) !A {
+pub fn astype(sc: *dsv41.Scope, a: A, dt: mlx.mlx_dtype) !A {
     var o = mlx.mlx_array_new();
     return own(sc, mlx.mlx_astype(&o, a, dt, sc.s), o);
 }
 
-fn reshape(sc: *dsv41.Scope, a: A, shape: []const c_int) !A {
+pub fn reshape(sc: *dsv41.Scope, a: A, shape: []const c_int) !A {
     var o = mlx.mlx_array_new();
     return own(sc, mlx.mlx_reshape(&o, a, shape.ptr, shape.len, sc.s), o);
 }
 
-fn mul(sc: *dsv41.Scope, a: A, b: A) !A {
+pub fn mul(sc: *dsv41.Scope, a: A, b: A) !A {
     var o = mlx.mlx_array_new();
     return own(sc, mlx.mlx_multiply(&o, a, b, sc.s), o);
 }
 
 /// `a[..., lo:hi]`.
-fn sliceLast(sc: *dsv41.Scope, a: A, lo: usize, hi: usize) !A {
+pub fn sliceLast(sc: *dsv41.Scope, a: A, lo: usize, hi: usize) !A {
     const sh = mlx.getShape(a);
     var start: [4]c_int = @splat(0);
     var stop: [4]c_int = undefined;
@@ -332,7 +332,7 @@ fn sliceLast(sc: *dsv41.Scope, a: A, lo: usize, hi: usize) !A {
 }
 
 /// Row `row` of a 2-D array as `[1, W]`.
-fn sliceRow(sc: *dsv41.Scope, a: A, row: usize) !A {
+pub fn sliceRow(sc: *dsv41.Scope, a: A, row: usize) !A {
     const start: [2]c_int = .{ ci(row), 0 };
     const stop: [2]c_int = .{ ci(row + 1), mlx.getShape(a)[1] };
     const step: [2]c_int = .{ 1, 1 };
@@ -340,7 +340,7 @@ fn sliceRow(sc: *dsv41.Scope, a: A, row: usize) !A {
     return own(sc, mlx.mlx_slice(&o, a, &start, 2, &stop, 2, &step, 2, sc.s), o);
 }
 
-fn concat(sc: *dsv41.Scope, xs: []const A, axis: c_int) !A {
+pub fn concat(sc: *dsv41.Scope, xs: []const A, axis: c_int) !A {
     const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
     defer _ = mlx.mlx_vector_array_free(v);
     var o = mlx.mlx_array_new();
@@ -407,10 +407,10 @@ fn truth(gpa: std.mem.Allocator, sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, l
     return out;
 }
 
-const Routing = enum { random, shared_all, disjoint };
+pub const Routing = enum { random, shared_all, disjoint };
 
 /// k distinct experts of `experts` a row, per `how`; weights in (0.05, 0.5).
-fn route(rng: std.Random, how: Routing, rows: usize, topk: usize, experts: u32, ids: []u32, wts: []f32) void {
+pub fn route(rng: std.Random, how: Routing, rows: usize, topk: usize, experts: u32, ids: []u32, wts: []f32) void {
     for (0..rows) |row| for (0..topk) |j| {
         ids[row * topk + j] = switch (how) {
             .shared_all => @intCast(j * 2),
@@ -424,7 +424,7 @@ fn route(rng: std.Random, how: Routing, rows: usize, topk: usize, experts: u32, 
     };
 }
 
-fn bitsOf(a: A) ![]const u16 {
+pub fn bitsOf(a: A) ![]const u16 {
     var c = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(c);
     try mlx.check(mlx.mlx_contiguous(&c, a, false, mlx.gpuStream()));

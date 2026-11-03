@@ -765,3 +765,36 @@ required that head even for embedding inference; its error cleanup then released
 now accepts the missing head only for recognized embedding packs, refuses generation and drafter access without a head,
 and releases owned arrays once. Guard: a headless pack's embedding rows match identical tied weights, while an untied
 chat pack without a head returns `MissingWeight` without crashing.
+
+### A GGUF weight resolved as affine 8-bit
+Defect: on the MLX GGUF path every ggml weight reported `.affine` 8-bit g64 to `computeQuantParams`, so an affine-keyed
+fast path (the qwen4 hc read, `msvQmvRows`, MoE gathers) could take raw ggml blocks for MLX codes. Cause: the scales are
+a 1-D bool type sentinel; no 2-D geometry to solve, so the solver fell through to its last default. Fix: a bool scale
+answers `.gguf`. Guard: `computeQuantParams: a GGUF weight's type sentinel resolves to the gguf mode`.
+
+### Nemotron-3-Nano's GGUF prefilled far slower than its MLX pack
+Defect: Nemotron-3-Nano on `--mlx-gguf` prefilled at a small fraction of an MLX pack of the same plugin, flat in prompt
+length. Cause: the loader kept the GGUF's `A_log` f32 (`ssm_a`, `.neg_log`), the fused Mamba2 step kernels take every
+parameter in the activation dtype and declined, and the op-chain scan ran one row at a time (a graph dump shows
+Broadcast/Slice/Exp ops where the pack runs custom kernels). Fix: `narrowALog` stores it bf16, as mlx-lm's packs ship it. Guard: `Nemotron-H's and Flash Next's A_log narrow to bf16 for their fused kernels`.
+
+### A GGUF set larger than half of RAM swapped while it loaded
+Defect: loading DeepSeek-V4.1's IST-DAS set on a Mac with not quite twice its size in RAM compressed the copies and grew
+swap. Cause: the loader copied each tensor out of the file's mapping, and macOS kept the file's read pages active and
+compressed the anonymous copies instead; `madvise(DONTNEED)` and `msync(MS_KILLPAGES/INVALIDATE)` drop nothing
+from the cache, and an unaligned `F_NOCACHE` read still caches. Fix: `File.readUncached` reads each tensor with
+`F_NOCACHE` over its page-aligned range. Check: `mincore` residency of the file after a load stays ~0% (no automated guard).
+
+### A GGUF set's affine triples reached the plugins as `gguf`
+Defect: once every arch loaded affine-coded types (Q4_K, Q5_K, ...) as MLX affine, the LFM2.5, Nemotron-3-Nano, flint and
+Muse-Glimmer GGUFs failed every request (`Invalid quantization mode 'gguf'`). Cause: the sdk reader's `ggufProj` and the
+llama loader's `modeOf` stamped `.gguf` on any GGUF weight with scales, and dropped the triple's biases and widths. Fix:
+`.gguf` only for a bool sentinel. Guards: `reader: a GGUF projection is ggml blocks, an affine triple or dense, ...` and
+`a GGUF's ggml blocks read as the gguf mode, its affine-coded triples as MLX affine`.
+
+### A raw ggml out_proj with tiled heads read garbage
+Defect: ISTA-DASLab's Q2_0 Flash Next pack answered `!!` on the MLX GGUF path while llama.cpp answered right. Cause:
+`loadQuantized`'s `tiled_input` branch handed MLX the file's interleaved bytes, where every other branch repacks
+split-layout types (`packedRows`), so two Q6_K `ssm_out` layers fed the kernels a wrong layout; any qwen35 GGUF with a
+split-type out_proj and r > 1 had it too. Found by loading one tensor class raw at a time, the rest as 8-bit affine.
+Fix: the branch packs too. Guard: `a tiled-input weight of a split-layout type loads in the kernels' layout`.

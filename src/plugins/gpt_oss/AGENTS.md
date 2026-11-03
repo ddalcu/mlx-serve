@@ -8,8 +8,9 @@ Served (see "Served").
   the quantizer's `.biases`: never read one for the other), no q/k norm, learned sinks (`self_attn.sinks`, or
   `attention_sink_bias`), YaRN on every layer with the mscale over the whole head, sliding(128) layers banded at
   prefill and window-masked at decode. `moe.zig`: router `.bias`, softmax top-k, per-expert `.bias` on gate/up/down
-  added in SORTED order, the clamped SwiGLU `clip(g, max=l)·sigmoid(1.702·g)·(clip(u, ±l)+1)`; the biases force the
-  sorted path at every width, as the legacy (no fused decode arm has a bias slot). Serial, as the legacy.
+  added in SORTED order, the clamped SwiGLU `clip(g, max=l)·sigmoid(1.702·g)·(clip(u, ±l)+1)`; the biases keep it
+  off the fused decode arms (no bias slot): sorted past one token, one token unsorted in routing order (the sort's
+  index chain costs a dispatch per op; same bits). Serial, as the legacy.
 - Parse: `num_local_experts`/`experts_per_token` spellings; the expert width IS `intermediate_size`; ONE theta for
   both layer types; YaRN mscale COMPUTED (0.1·ln(factor)+1, the config ships none); context = the YaRN window;
   terminators 200002 and 200012 joined (never 200007, which closes the analysis channel). Chat facts: thinking on

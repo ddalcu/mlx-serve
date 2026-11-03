@@ -14,8 +14,8 @@ const Gguf = struct {
     fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream) anyerror!mlx.mlx_array {
         return gguf.kernels.linear(gguf.kernels.infoOf(w, sc).?, x, w, s);
     }
-    fn gather(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, lhs: mlx.mlx_array, rhs: mlx.mlx_array, s: mlx.mlx_stream) anyerror!mlx.mlx_array {
-        return gguf.kernels.gatherLinear(gguf.kernels.infoOf(w, sc).?, x, w, lhs, rhs, s);
+    fn gather(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, lhs: mlx.mlx_array, rhs: mlx.mlx_array, sorted: bool, s: mlx.mlx_stream) anyerror!mlx.mlx_array {
+        return gguf.kernels.gatherLinear(gguf.kernels.infoOf(w, sc).?, x, w, lhs, rhs, sorted, s);
     }
 };
 

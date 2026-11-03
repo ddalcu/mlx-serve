@@ -359,41 +359,9 @@ pub fn findDs4MtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_pa
     return firstMtpGgufIn(io, allocator, dir_path, std.fs.path.basename(model_file_path));
 }
 
-/// Full path to an MTP draft-head GGUF for the llama.cpp engine, or null: the
-/// model's own folder first, then an `MTP/` folder inside it or beside it
-/// (unsloth keeps each quant in its own folder and the heads in `MTP/`).
-/// Caller owns the returned slice.
-pub fn findLlamaMtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
-    const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
-    const skip = std.fs.path.basename(model_file_path);
-    if (firstMtpGgufIn(io, allocator, dir_path, skip)) |p| return p;
-    for ([_]?[]const u8{ dir_path, std.fs.path.dirname(dir_path) }) |base| {
-        const mtp_dir = std.fs.path.join(allocator, &.{ base orelse continue, "MTP" }) catch return null;
-        defer allocator.free(mtp_dir);
-        if (firstMtpGgufIn(io, allocator, mtp_dir, skip)) |p| return p;
-    }
-    return null;
-}
-
-/// The first MTP draft-head GGUF in `dir_path` by name, other than `skip`.
-fn firstMtpGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, skip: []const u8) ?[]u8 {
-    // openDir asserts (→ ReleaseFast UB) on a non-absolute path.
-    if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return null;
-    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
-    defer dir.close(io);
-    var name_buf: [std.fs.max_name_bytes]u8 = undefined;
-    var best: ?[]const u8 = null;
-    var it = dir.iterate();
-    while (it.next(io) catch null) |entry| {
-        if (!isMtpGgufBasename(entry.name) or std.mem.eql(u8, entry.name, skip)) continue;
-        if (best != null and !std.mem.lessThan(u8, entry.name, best.?)) continue;
-        const st = dir.statFile(io, entry.name, .{}) catch continue;
-        if (st.kind != .file or entry.name.len > name_buf.len) continue;
-        @memcpy(name_buf[0..entry.name.len], entry.name);
-        best = name_buf[0..entry.name.len];
-    }
-    return std.fs.path.join(allocator, &.{ dir_path, best orelse return null }) catch null;
-}
+/// The MLX GGUF engine and the llama.cpp engine find a head the same way.
+pub const findLlamaMtpSidecar = gguf_files.findMtpSidecar;
+const firstMtpGgufIn = gguf_files.firstMtpGgufIn;
 
 const asciiContainsIgnoreCase = gguf_files.asciiContainsIgnoreCase;
 

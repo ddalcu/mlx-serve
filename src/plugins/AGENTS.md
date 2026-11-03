@@ -20,6 +20,11 @@ Configs, templates, tokenizers:
 Weights, quant, loading:
 - **Tree, prefix and axis order are CONVERTER choices — probe** (`resolveWeightPrefix`, `lagunaRouterBase`, `hy3ExpertContainer`, `resolveVisionPrefix` + `patchProjLayout`). A family's geometry comes from the CHECKPOINT once a second size exists (FLUX klein 4B/9B).
 - **Quant resolves PER WEIGHT** (`computeQuantParams`; scales dtype decides fp8 vs affine; overrides can hide inside the fp family, `fpParamsFromGeometry`); affine bits outside {2,3,4,5,6,8} rejected at PARSE; no engine hardcodes a width (`affineParamsFromGeometry`, scan-pinned). A table or projection loaded WITHOUT its input width (hint 0, config gs) reads another group size: Gemma 4 E4B mixed 4/6-bit declares gs 32, stores gs 64 (`tests/test_gemma4_mixed_quant.sh`).
+- **A loader that COPIES a large file reads it uncached** (`gguf.File.readUncached`: `F_NOCACHE`, page-aligned): macOS
+  keeps every read page (no madvise/msync drops it) and compresses the copies first; DeepSeek-V4.1's 138 GB set swapped.
+- **A GGUF weight is `.gguf` ONLY when its scales are the bool TYPE SENTINEL**: affine-coded types load as MLX affine
+  triples and floats dense, so a reader keying on "GGUF set + scales" sent affine codes to `gather_qmm` as `gguf`
+  (`ggufProj`, llama `modeOf`). Raw ggml bytes only through `kernels.infoOf`; such a weight has no biases.
 - **Dense checkpoints**: scales absence PER-TENSOR (`getLayerScaleOpt`); dense contracted weights owe `maybeTransposeForBf16` — never depthwise conv or SSM state.
 - **ModelOpt's NVFP4 `weight_scale_2` is amax / (448 x 6); MLX's nvfp4 `global_scale` is the amax** (`modelopt_pack.dequantDense`): passed through raw, every weight shrank 2688x and the vision tower saw a blank image.
 - **A pack runs in its reference's numerics** (`actDtype`, `LoadOpts.keep_f16`; Bonsai 2 f16 + f32 GDN state; qwen4 f32 GDN state + gate, `MLX_SERVE_GDN_STATE_F32=0` = bf16); constants take the activation dtype. Guard: `test_hadamard_fidelity.sh`.

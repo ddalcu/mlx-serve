@@ -91,7 +91,7 @@ pub const Hparams = struct {
 };
 
 /// Metadata lookups under "<arch_name>.".
-const Keys = struct {
+pub const Keys = struct {
     f: *const gguf.File,
     arch_name: []const u8,
 
@@ -99,17 +99,17 @@ const Keys = struct {
         return std.fmt.bufPrint(buf, "{s}.{s}", .{ self.arch_name, suffix }) catch unreachable;
     }
 
-    fn int(self: Keys, suffix: []const u8) !u32 {
+    pub fn int(self: Keys, suffix: []const u8) !u32 {
         var buf: [96]u8 = undefined;
         return arch.u32Key(self.f, self.key(&buf, suffix));
     }
 
-    fn float(self: Keys, suffix: []const u8) !f64 {
+    pub fn float(self: Keys, suffix: []const u8) !f64 {
         var buf: [96]u8 = undefined;
         return self.f.getFloat(self.key(&buf, suffix)) orelse error.MissingMetadata;
     }
 
-    fn array(self: Keys, suffix: []const u8) ?gguf.Array {
+    pub fn array(self: Keys, suffix: []const u8) ?gguf.Array {
         var buf: [96]u8 = undefined;
         return self.f.getArray(self.key(&buf, suffix));
     }
@@ -229,6 +229,49 @@ pub fn mapTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
         return .{ .name = full, .transform = t };
     };
     return null;
+}
+
+/// HF name (the generic MTP loader's `mtp.*`) + transform for a tensor of the file's own MTP block, the block
+/// after the trunk (`nextn_predict_layers` = 1); null for every other tensor. The head shares the trunk's
+/// embedding and lm_head; its decoder layer is a full-attention trunk layer.
+pub fn mapMtpTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
+    const blk = arch.splitLayer(name, hp.n_layers + 1) orelse return null;
+    if (blk.layer != hp.n_layers) return null;
+    const nextn = [_]struct { []const u8, []const u8 }{
+        .{ "nextn.eh_proj.weight", "mtp.fc.weight" },
+        .{ "nextn.enorm.weight", "mtp.pre_fc_norm_embedding.weight" },
+        .{ "nextn.hnorm.weight", "mtp.pre_fc_norm_hidden.weight" },
+        .{ "nextn.shared_head_norm.weight", "mtp.norm.weight" },
+    };
+    for (nextn) |n| if (std.mem.eql(u8, blk.leaf, n[0])) return .{ .name = n[1], .transform = .none };
+    if (std.mem.startsWith(u8, blk.leaf, "nextn.")) return arch.skip;
+    var tmp: [160]u8 = undefined;
+    var trunk_name: [96]u8 = undefined;
+    const as_layer0 = std.fmt.bufPrint(&trunk_name, "blk.0.{s}", .{blk.leaf}) catch return null;
+    var one = hp;
+    one.n_layers = 1;
+    one.nv = one.nk; // a full-attention layer: nothing to un-tile
+    const m = mapTensor(&tmp, as_layer0, one) orelse return null;
+    const layer0 = prefix ++ "layers.0.";
+    return .{ .name = std.fmt.bufPrint(buf, "mtp.layers.0.{s}", .{m.name[layer0.len..]}) catch return null, .transform = m.transform };
+}
+
+test "mapMtpTensor: the block after the trunk is the head, under the generic loader's mtp names" {
+    var hp = std.mem.zeroes(Hparams);
+    hp.n_layers = 24;
+    hp.nk = 16;
+    hp.nv = 32;
+    var buf: [128]u8 = undefined;
+    try std.testing.expectEqualStrings("mtp.fc.weight", mapMtpTensor(&buf, "blk.24.nextn.eh_proj.weight", hp).?.name);
+    try std.testing.expectEqualStrings("mtp.norm.weight", mapMtpTensor(&buf, "blk.24.nextn.shared_head_norm.weight", hp).?.name);
+    try std.testing.expectEqualStrings("mtp.layers.0.self_attn.q_norm.weight", mapMtpTensor(&buf, "blk.24.attn_q_norm.weight", hp).?.name);
+    try std.testing.expectEqualStrings("mtp.layers.0.post_attention_layernorm.weight", mapMtpTensor(&buf, "blk.24.post_attention_norm.weight", hp).?.name);
+    try std.testing.expectEqualStrings("mtp.layers.0.mlp.switch_mlp.up_proj.weight", mapMtpTensor(&buf, "blk.24.ffn_up_exps.weight", hp).?.name);
+    try std.testing.expect(mapMtpTensor(&buf, "blk.24.ffn_gate_inp_shexp.weight", hp).?.transform == .shared_gate);
+    try std.testing.expect(mapMtpTensor(&buf, "blk.24.attn_q.weight", hp).?.transform == .none);
+    try std.testing.expectEqual(@as(usize, 0), mapMtpTensor(&buf, "blk.24.nextn.embed_tokens.weight", hp).?.name.len);
+    try std.testing.expect(mapMtpTensor(&buf, "blk.23.attn_q.weight", hp) == null);
+    try std.testing.expect(mapMtpTensor(&buf, "token_embd.weight", hp) == null);
 }
 
 /// Grouped position of tiled value head `t`: tiled index j*nk+g holds head g*r+j.

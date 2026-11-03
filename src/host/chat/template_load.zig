@@ -18,13 +18,16 @@ const templateRendersToolTurn = @import("render.zig").templateRendersToolTurn;
 /// read/parse failure is false — this only ARMS a family fallback, never
 /// blocks a load.
 fn dirModelTypeIs(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, want: []const u8) bool {
-    const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
-    defer allocator.free(cfg_path);
-    const file = std.Io.Dir.openFileAbsolute(io, cfg_path, .{}) catch return false;
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var rs = file.reader(io, &buf);
-    const content = rs.interface.allocRemaining(allocator, .limited(1 << 22)) catch return false;
+    // A `--mlx-gguf` file's config is rebuilt from its metadata, never on disk.
+    const content = (mlx_gguf.sidecar(io, allocator, model_dir, .config) catch return false) orelse blk: {
+        const cfg_path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+        defer allocator.free(cfg_path);
+        const file = std.Io.Dir.openFileAbsolute(io, cfg_path, .{}) catch return false;
+        defer file.close(io);
+        var buf: [4096]u8 = undefined;
+        var rs = file.reader(io, &buf);
+        break :blk rs.interface.allocRemaining(allocator, .limited(1 << 22)) catch return false;
+    };
     defer allocator.free(content);
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
     defer parsed.deinit();

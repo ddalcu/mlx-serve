@@ -44,7 +44,51 @@ pub fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) !
             scan.pick_bytes = @intCast(st.size);
         }
     }
+    // A split set's first shard is its metadata: the set is billed whole.
+    if (scan.pick) |p| if (splitSet(p)) |set| {
+        scan.pick_bytes = 0;
+        var again = dir.iterate();
+        while (again.next(io) catch null) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, set.stem) or !std.mem.endsWith(u8, entry.name, set.tail)) continue;
+            if (entry.name.len != p.len) continue;
+            const st = dir.statFile(io, entry.name, .{}) catch continue;
+            scan.pick_bytes += @intCast(st.size);
+        }
+    };
     return scan;
+}
+
+/// `<stem>-00001-of-NNNNN.gguf` as (`<stem>-`, `-of-NNNNN.gguf`), null for any other name.
+pub fn splitSet(basename: []const u8) ?struct { stem: []const u8, tail: []const u8 } {
+    const tail_len = "-of-00000.gguf".len;
+    const first = "-00001";
+    if (basename.len < first.len + tail_len) return null;
+    const tail = basename[basename.len - tail_len ..];
+    if (!std.mem.startsWith(u8, tail, "-of-") or !std.mem.endsWith(u8, tail, ".gguf")) return null;
+    for (tail[4..9]) |c| if (!std.ascii.isDigit(c)) return null;
+    const head = basename[0 .. basename.len - tail_len];
+    if (!std.mem.endsWith(u8, head, first) or std.mem.eql(u8, tail[4..9], "00001")) return null;
+    return .{ .stem = head[0 .. head.len - first.len + 1], .tail = tail };
+}
+
+test "a split set is picked by its first shard and billed whole" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "M-00001-of-00003.gguf", "M-00002-of-00003.gguf", "M-00003-of-00003.gguf" }, [_]usize{ 10, 200, 3000 }) |name, n| {
+        const bytes = try std.testing.allocator.alloc(u8, n);
+        defer std.testing.allocator.free(bytes);
+        @memset(bytes, 0);
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+    }
+    try tmp.dir.writeFile(io, .{ .sub_path = "M-other.gguf.txt", .data = "x" });
+    const scan = try scanLlmGguf(io, std.testing.allocator, &tmp.dir);
+    defer std.testing.allocator.free(scan.pick.?);
+    try std.testing.expectEqualStrings("M-00001-of-00003.gguf", scan.pick.?);
+    try std.testing.expectEqual(@as(u64, 3210), scan.pick_bytes);
+    try std.testing.expect(splitSet("M-00002-of-00003.gguf") == null);
+    try std.testing.expect(splitSet("M-00001-of-00001.gguf") == null);
+    try std.testing.expect(splitSet("Q4_K_M.gguf") == null);
 }
 
 /// True if `path` points at a .gguf file or a directory containing an LLM
@@ -157,6 +201,42 @@ pub fn isMtpGgufBasename(basename: []const u8) bool {
     return std.ascii.startsWithIgnoreCase(basename, "mtp-") or // llama.cpp convert --mtp
         asciiContainsIgnoreCase(basename, "-mtp-") or asciiContainsIgnoreCase(basename, "-mtp.") or
         asciiContainsIgnoreCase(basename, "-dspark-") or asciiContainsIgnoreCase(basename, "-dspark.");
+}
+
+/// Full path to an MTP draft-head GGUF for a model file, or null: the
+/// model's own folder first, then an `MTP/` folder inside it or beside it
+/// (unsloth keeps each quant in its own folder and the heads in `MTP/`).
+/// Caller owns the returned slice.
+pub fn findMtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
+    const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
+    const skip = std.fs.path.basename(model_file_path);
+    if (firstMtpGgufIn(io, allocator, dir_path, skip)) |p| return p;
+    for ([_]?[]const u8{ dir_path, std.fs.path.dirname(dir_path) }) |base| {
+        const mtp_dir = std.fs.path.join(allocator, &.{ base orelse continue, "MTP" }) catch return null;
+        defer allocator.free(mtp_dir);
+        if (firstMtpGgufIn(io, allocator, mtp_dir, skip)) |p| return p;
+    }
+    return null;
+}
+
+/// The first MTP draft-head GGUF in `dir_path` by name, other than `skip`.
+pub fn firstMtpGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, skip: []const u8) ?[]u8 {
+    // openDir asserts (→ ReleaseFast UB) on a non-absolute path.
+    if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return null;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+    var best: ?[]const u8 = null;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!isMtpGgufBasename(entry.name) or std.mem.eql(u8, entry.name, skip)) continue;
+        if (best != null and !std.mem.lessThan(u8, entry.name, best.?)) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file or entry.name.len > name_buf.len) continue;
+        @memcpy(name_buf[0..entry.name.len], entry.name);
+        best = name_buf[0..entry.name.len];
+    }
+    return std.fs.path.join(allocator, &.{ dir_path, best orelse return null }) catch null;
 }
 
 pub fn isGgufSidecarBasename(basename: []const u8) bool {
