@@ -1,8 +1,9 @@
 //! A layer whose EXL3 rate the stream lane's texts do not decode (a K outside `xk.bank_ks`: the 3.5 bpw packs' K = 4,
 //! for the whole layer or its down projection) runs the stock tier's math (`experts.EagerChain`: per projection
-//! `t128(inner(t128(x * rin[slot]))) * rout[slot]`, the clamped SwiGLU between) with sushi's rate-generic trellis inner
-//! product for all three of its projections: the indexed GEMV for decode rows, the expert-sorted GEMM for prompt rows.
-//! Every other layer runs the quant (`QuantMath`) unchanged. Sushi's inner products read f16 rows (exllamav3's).
+//! `t128(inner(t128(x * rin[slot]))) * rout[slot]`, the clamped SwiGLU between) over `SushiGemv`, sushi's rate-generic
+//! trellis inner product for all three of its projections: the indexed GEMV for decode rows, the expert-sorted GEMM for
+//! prompt rows. Every other layer runs the quant (`QuantMath`) unchanged. Sushi's inner products read f16 rows
+//! (exllamav3's).
 const std = @import("std");
 const sdk = @import("sdk");
 const env = @import("mlx_host").env;
@@ -11,6 +12,7 @@ const sushi = @import("sushi_exl3");
 const ops = @import("ops.zig");
 const xp = @import("experts.zig");
 const xk = @import("../../quant/exl3/stream/kernels.zig");
+const xq = @import("../../quant/exl3/stream/quant.zig");
 const quant = @import("sdk_ext.zig").quant;
 const G = ops.MlxOps;
 const T = mlx.mlx_array;
@@ -29,20 +31,6 @@ fn laneLayer(g: *G, b: Bank) bool {
     return laneDecodes(g, b.gate.code) and laneDecodes(g, b.up.code) and laneDecodes(g, b.down.code);
 }
 
-/// `128 ** -0.5` as the Python float rounds to the f32 MLX takes (`experts.t128_scale`).
-const t128_scale: f32 = @bitCast(@as(u32, 0x3db504f3));
-
-/// `tcq_runtime._t128`: the normalised 128-block Walsh-Hadamard over the last axis, in f32.
-fn t128(g: *G, v: T) !T {
-    const sh = g.shapeOf(v);
-    var blocks = sh;
-    blocks.d[sh.n - 1] = @divExact(sh.d[sh.n - 1], 128);
-    blocks.d[sh.n] = 128;
-    blocks.n += 1;
-    const h = try g.hadamard(try g.reshape(try g.astype(v, .float32), blocks.slice()), t128_scale);
-    return g.reshape(h, sh.slice());
-}
-
 /// The arm reads sushi's mul1 kernels: another codebook installed process-wide is refused by name.
 fn requireMul1() !void {
     const d = sushi.kernels.activeDecode();
@@ -55,46 +43,39 @@ const Inner = enum { indexed, sorted };
 /// Test seam: the inner products (GEMV / GEMM dispatches) this arm has built.
 var inner_dispatches: usize = 0;
 
-/// One projection: rows `x` [rows, in] at slot rows `ids` [rows] (u32, ascending for `.sorted`) -> f32 [rows, out].
-fn project(g: *G, x: T, ids: T, p: Proj, inner: Inner) !T {
-    try requireMul1();
-    if (@import("builtin").is_test) inner_dispatches += 1;
-    const xh = try rotateIn(g, x, try g.take(p.rin, ids, 0));
-    const z = try g.adopt(switch (inner) {
-        .indexed => try sushi.kernels.indexedGemvCoopF16(g.s, xh, p.code, ids),
-        .sorted => try sushi.kernels.innerGemmSorted(g.s, xh, p.code, ids),
-    });
-    return rotateOut(g, z, try g.take(p.rout, ids, 0));
+/// `experts.EagerChain`'s inner product on sushi's kernels: `xh` rounded to the f16 rows they read, then the
+/// indexed GEMV, or the slot-sorted GEMM (`ids` ascending) -> f16 [rows, out].
+pub const SushiGemv = struct {
+    inner: Inner,
+
+    pub fn project(self: SushiGemv, g: *G, _: xq.Proj, xh: T, ids: T, code: T) !T {
+        try requireMul1();
+        if (@import("builtin").is_test) inner_dispatches += 1;
+        const x16 = try g.astype(xh, .float16);
+        return g.adopt(switch (self.inner) {
+            .indexed => try sushi.kernels.indexedGemvCoopF16(g.s, x16, code, ids),
+            .sorted => try sushi.kernels.innerGemmSorted(g.s, x16, code, ids),
+        });
+    }
+};
+
+const Chain = xp.EagerChain(G, SushiGemv);
+
+fn chain(inner: Inner, limit: f64) Chain {
+    return Chain.init(.{ .inner = inner }, .{ .swiglu_limit = limit });
 }
 
 /// The banked route's projection: every row through its own bank's arrays (`ids` packed bank << 24 | slot row), one
-/// inner product over all the banks.
+/// inner product over all the banks. `EagerChain.project`'s math with each row's `rin` / `rout` picked from its bank.
 fn projectBanked(g: *G, x: T, ids: T, at: *const BankedRows, ps: [n_banks]Proj) !T {
     try requireMul1();
     if (@import("builtin").is_test) inner_dispatches += 1;
     var codes: [n_banks]T = undefined;
     for (&codes, ps) |*c, p| c.* = p.code;
-    const xh = try rotateIn(g, x, try at.pick(g, ps, "rin"));
+    const rin = try g.astype(try at.pick(g, ps, "rin"), .float32);
+    const xh = try g.astype(try xp.t128(G, g, try g.mul(try g.astype(x, .float32), rin)), .float16);
     const z = try g.adopt(try sushi.kernels.indexedGemvCoopBankedF16(g.s, xh, codes, ids));
-    return rotateOut(g, z, try at.pick(g, ps, "rout"));
-}
-
-/// `t128(x * rin)` in f32, rounded to the f16 rows sushi's inner products read.
-fn rotateIn(g: *G, x: T, rin_rows: T) !T {
-    const rin = try g.astype(rin_rows, .float32);
-    return g.astype(try t128(g, try g.mul(try g.astype(x, .float32), rin)), .float16);
-}
-
-/// `t128(z) * rout` in f32.
-fn rotateOut(g: *G, z: T, rout_rows: T) !T {
-    return g.mul(try t128(g, z), try g.astype(rout_rows, .float32));
-}
-
-/// `_clamped_swiglu` of gate and up (f32 [rows, inter]).
-fn swiglu(g: *G, gg: T, uu: T, limit: f64) !T {
-    const uc = try g.clip(uu, try g.scalar(-limit, .float32), try g.scalar(limit, .float32));
-    const gc = try g.minimum(gg, try g.scalar(limit, .float32));
-    return g.mul(try g.silu(gc), uc);
+    return g.mul(try xp.t128(G, g, z), try g.astype(try at.pick(g, ps, "rout"), .float32));
 }
 
 /// `QuantMath(G, Q)` with the arm for layers the lane's texts do not decode.
@@ -114,12 +95,12 @@ pub fn MixedKMath(comptime Q: type) type {
 
         pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: Proj, up: Proj) !T {
             if (laneDecodes(g, gate.code) and laneDecodes(g, up.code)) return self.lane.gateUp(g, x, ids, gate, up);
-            return swiglu(g, try project(g, x, ids, gate, .indexed), try project(g, x, ids, up, .indexed), self.swiglu_limit);
+            return chain(.indexed, self.swiglu_limit).gateUp(g, x, ids, gate, up);
         }
 
         pub fn down(self: *const Self, g: *G, h: T, ids: T, d: Proj) !T {
             if (laneDecodes(g, d.code)) return self.lane.down(g, h, ids, d);
-            return project(g, h, ids, d, .indexed);
+            return chain(.indexed, self.swiglu_limit).down(g, h, ids, d);
         }
 
         /// ids packed (bank << 24 | slot row): each row through its own bank's arrays, one inner product a projection.
@@ -222,8 +203,8 @@ fn sliceCall(g: *G, x: T, rows: quant.PrefillRows, order: []const u32, bank: Ban
     }
     const ids = try g.hostArray(std.mem.sliceAsBytes(slots), &.{@intCast(n)}, .uint32);
     const xs = try g.take(x, try g.hostArray(std.mem.sliceAsBytes(acts), &.{@intCast(n)}, .uint32), 0);
-    const h = try swiglu(g, try project(g, xs, ids, bank.gate, .sorted), try project(g, xs, ids, bank.up, .sorted), limit);
-    const y = g.keep(try project(g, h, ids, bank.down, .sorted));
+    const c = chain(.sorted, limit);
+    const y = g.keep(try c.down(g, try c.gateUp(g, xs, ids, bank.gate, bank.up), ids, bank.down));
     errdefer g.release(y);
     try g.evalAll(&.{y});
     return y;
@@ -247,7 +228,7 @@ fn sortedJoined(g: *G, x: T, rows: quant.PrefillRows, bank: Bank, limit: f64, sl
 /// The banked route's gate/up and down: each row through its own bank's arrays.
 fn bankedGateUp(g: *G, x: T, ids: T, banks: *const [n_banks]Bank, limit: f64) !T {
     const at = try BankedRows.of(g, ids);
-    return swiglu(g, try projectBanked(g, x, ids, &at, projOf(banks, "gate")), try projectBanked(g, x, ids, &at, projOf(banks, "up")), limit);
+    return xp.clampedSwiglu(G, g, try projectBanked(g, x, ids, &at, projOf(banks, "gate")), try projectBanked(g, x, ids, &at, projOf(banks, "up")), limit);
 }
 
 fn bankedDown(g: *G, h: T, ids: T, banks: *const [n_banks]Bank) !T {
@@ -363,7 +344,7 @@ test "exl3 k4 arm: a K4 projection, decode and prompt rows, equals the float64 r
         const x = try a.alloc(f32, rows * in_dim);
         defer a.free(x);
         for (x) |*v| v.* = rnd.float(f32) * 2 - 1;
-        const y = try project(&g, try g.hostArray(std.mem.sliceAsBytes(x), &.{ @intCast(rows), in_dim }, .float32), try g.hostArray(std.mem.sliceAsBytes(ids), &.{@intCast(rows)}, .uint32), p, inner);
+        const y = try chain(inner, 0).project(&g, try g.hostArray(std.mem.sliceAsBytes(x), &.{ @intCast(rows), in_dim }, .float32), try g.hostArray(std.mem.sliceAsBytes(ids), &.{@intCast(rows)}, .uint32), p, .gate);
         const got = try a.alloc(f32, rows * out_dim);
         defer a.free(got);
         _ = try g.hostF32(y, got);
@@ -435,8 +416,8 @@ fn testBankDims(g: *G, a: std.mem.Allocator, rnd: std.Random, e: c_int, kp: [3]c
 /// One routed row through its own bank alone, decode rows: the per-row reference the batched routes must keep.
 fn rowAlone(g: *G, x_row: T, slot: u32, b: Bank, limit: f64) !T {
     const one = try g.hostArray(std.mem.asBytes(&slot), &.{1}, .uint32);
-    const h = try swiglu(g, try project(g, x_row, one, b.gate, .indexed), try project(g, x_row, one, b.up, .indexed), limit);
-    return project(g, h, one, b.down, .indexed);
+    const c = chain(.indexed, limit);
+    return c.down(g, try c.gateUp(g, x_row, one, b.gate, b.up), one, b.down);
 }
 
 fn expectRowsNear(g: *G, a: std.mem.Allocator, got: T, want: T, rel: f64) !void {
