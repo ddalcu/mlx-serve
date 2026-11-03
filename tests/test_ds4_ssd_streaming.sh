@@ -76,6 +76,33 @@ if [ "$ok" = "1" ]; then
         "$(echo "$RESP" | grep -qi "paris" && echo 1 || echo 0)"
 fi
 
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
+
+echo ""
+echo "── ds4 --ssd-streaming: headless on-demand load (the app's path) ──"
+ROOTDIR=$(mktemp -d); PACK=$(basename "$(dirname "$MODEL")")
+ln -s "$(dirname "$MODEL")" "$ROOTDIR/$PACK"
+trap 'kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true; rm -rf "$ROOTDIR"' EXIT
+# The default resident cap (the Metal working set) applies: a bill of the whole file would refuse this load.
+"$BINARY" --serve --port "$PORT" --model-dir "$ROOTDIR" --ssd-streaming --log-level info > "$LOG" 2>&1 &
+SERVER_PID=$!
+ok=0
+for _ in $(seq 1 60); do
+    curl -sf "$BASE/health" >/dev/null 2>&1 && { ok=1; break; }
+    sleep 1
+done
+check "headless server became healthy" "$ok"
+if [ "$ok" = "1" ]; then
+    RESP=$(curl -s -m 900 -X POST "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$PACK\",\"messages\":[{\"role\":\"user\",\"content\":\"In one short sentence, what is the capital of France?\"}],\"max_tokens\":40,\"temperature\":0}")
+    check "on-demand load reaches ds4 with SSD streaming" \
+        "$(grep -qiE "SSD streaming mode enabled" "$LOG" && echo 1 || echo 0)"
+    check "on-demand load returned choices" \
+        "$(echo "$RESP" | grep -q '"choices"' && echo 1 || echo 0)"
+    check "the streaming bill fits the resident cap" \
+        "$(grep -q "Refusing to load" "$LOG" && echo 0 || echo 1)"
+fi
+
 echo ""
 TOTAL=$((PASS + FAIL))
 if [ "$FAIL" -eq 0 ]; then

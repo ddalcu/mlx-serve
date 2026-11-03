@@ -20,6 +20,8 @@ const drafterFor = @import("cold_load.zig").drafterFor;
 const availForLoad = @import("preflight.zig").availForLoad;
 const memInsufficientForLoad = @import("preflight.zig").memInsufficientForLoad;
 const loadRequirementBytes = @import("preflight.zig").loadRequirementBytes;
+const preflight = @import("preflight.zig");
+const mlx = @import("../../../mlx/ffi.zig");
 const ds4_load = @import("../../ds4/load.zig");
 const AneSettings = @import("../../ane/engine.zig").Settings;
 
@@ -164,7 +166,9 @@ fn install(sch: *Scheduler, params: anytype, s: *Served, drafter_path: []const u
     if (params.tokenize_cache_entries > 0) {
         entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(sch.allocator, params.tokenize_cache_entries);
     }
+    const ds4_streamed = if (params.gguf) |g| g.engine == .ds4 and params.ds4_ssd_streaming else false;
+    const bill = preflight.ds4StreamingBill(s.residentBytes(), if (ds4_streamed) mlx.maxRecommendedWorkingSet() else 0);
     sch.registry.mutex.lockUncancelable(sch.io);
-    sch.registry.markReadyLocked(entry, s.residentBytes());
+    sch.registry.markReadyLocked(entry, bill);
     sch.registry.mutex.unlock(sch.io);
 }

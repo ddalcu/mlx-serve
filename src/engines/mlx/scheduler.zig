@@ -136,6 +136,7 @@ const freeCpuState = @import("../../host/registry/cpu_state.zig").freeCpuState;
 pub const applyModelSettings = @import("../../host/registry/model_settings_apply.zig").applyModelSettings;
 const loadExceedsMemCap = @import("runtime/preflight.zig").loadExceedsMemCap;
 pub const gateEstimateBytes = @import("runtime/preflight.zig").gateEstimateBytes;
+const preflight = @import("runtime/preflight.zig");
 const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const pleTableBill = @import("runtime/preflight.zig").pleTableBill;
 const residentModelDiskBytes = @import("runtime/preflight.zig").residentModelDiskBytes;
@@ -827,7 +828,8 @@ pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
 
         // Estimate post-load bytes (see `gateEstimateBytes` for why a media
         // entry cannot be billed by its directory's size).
-        const estimated: u64 = gateEstimateBytes(media_peak, gate_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size) +
+        const ds4_streamed = if (owned.gguf) |g| g.engine == .ds4 and self.ds4_ssd_streaming else false;
+        const estimated: u64 = preflight.gateEstimateBytesFor(media_peak, gate_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size, if (ds4_streamed) mlx.maxRecommendedWorkingSet() else 0) +
             pleTableBill(self.io, owned.config);
 
         // Reserve this load's estimate BEFORE planning eviction, so a

@@ -83,7 +83,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             startup_buf: [96]u8 = undefined,
         };
 
-        fn state(e: *anyopaque) *State {
+        pub fn state(e: *anyopaque) *State {
             return @ptrCast(@alignCast(e));
         }
 
@@ -115,9 +115,9 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         fn openOrError(o: *const abi.Open, info: *abi.Info) !*State {
             const path = abi.items(u8, o.model_dir);
             const flags = parseFlags(abi.items(u8, o.settings_json)) catch return error.InvalidSettings;
-            const engine = try load.open(B, io, gpa, path, flags);
-            errdefer engine.close();
             const ctx = B.clampSessionCtx(o.context);
+            const engine = try load.open(B, io, gpa, path, flags, ctx);
+            errdefer engine.close();
             const session = try engine.createSession(@intCast(ctx));
             errdefer session.free();
             const vocab: usize = engine.vocabSize();
@@ -260,7 +260,11 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             defer gpa.free(prompt);
             for (r.prompt, prompt) |t, *p| p.* = @intCast(t);
             const cached = st.session.commonPrefix(prompt) catch 0;
-            try st.session.sync(prompt);
+            st.session.sync(prompt, &r.cancelled) catch |err| switch (err) {
+                // ds4 rebuilds a half-done pass on the next sync; the complete prefix stays cached.
+                error.SyncInterrupted => return .cancelled,
+                else => return err,
+            };
             if (r.prefilled(@intCast(@max(cached, 0)))) |why| return why;
 
             var rng = r.seed();
@@ -349,9 +353,10 @@ const FakeBridge = struct {
         pub const ChatTurn = struct { role: []const u8, content: []const u8 };
         embedded_mtp: bool,
         drafts: c_int,
+        ctx: u32,
         pub fn open(a: std.mem.Allocator, _: []const u8, opts: anytype) !*Ds4Engine {
             const e = try a.create(Ds4Engine);
-            e.* = .{ .embedded_mtp = opts.embedded_mtp, .drafts = if (opts.prefill_chunk == 1) 0 else 4 };
+            e.* = .{ .embedded_mtp = opts.embedded_mtp, .drafts = if (opts.prefill_chunk == 1) 0 else 4, .ctx = opts.context_size };
             return e;
         }
         pub fn close(e: *Ds4Engine) void {
@@ -415,7 +420,9 @@ const FakeBridge = struct {
             while (n < @min(p.len, s.toks.items.len) and p[n] == s.toks.items[n]) n += 1;
             return @intCast(n);
         }
-        pub fn sync(s: *Ds4Session, p: []const i32) !void {
+        pub fn sync(s: *Ds4Session, p: []const i32, cancel: ?*std.atomic.Value(bool)) !void {
+            if (std.mem.indexOfScalar(i32, p, 999) != null) if (cancel) |c| c.store(true, .release);
+            if (cancel) |c| if (c.load(.acquire)) return error.SyncInterrupted;
             s.toks.clearRetainingCapacity();
             try s.toks.appendSlice(testing.allocator, p);
             s.refresh();
@@ -595,6 +602,39 @@ test "ds4 adapter: requests past the one session wait their turn, in submit orde
     }
 }
 
+test "ds4 adapter: the engine opens sized for the session's context, not ds4's 4096 default" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try ds4Gguf(&tmp, &buf);
+    var host: abi.Host = .{ .ctx = undefined, .log = undefined, .wake = undefined };
+    const o: abi.Open = .{ .model_dir = abi.span(u8, path), .model_type = .{}, .config_json = .{}, .context = 65536, .max_concurrent = 1, .memory_budget = 0, .settings_json = .{}, .options_json = .{}, .host = &host };
+    var info: abi.Info = undefined;
+    var v: abi.Verdict = .{};
+    const e = Fake.table.open(&o, &info, &v).?;
+    defer Fake.table.close(e);
+    try testing.expectEqual(@as(u32, 65536), Fake.state(e).engine.ctx);
+    try testing.expectEqual(@as(u32, 65536), info.context_window);
+}
+
+test "ds4 adapter: a cancel during prefill finishes the request cancelled; the next one serves" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try ds4Gguf(&tmp, &buf);
+    var cancelled: Collect = .{};
+    defer cancelled.deinit();
+    // The fake's sync raises the request's cancel flag on token 999, as a client hanging up mid-prefill would.
+    _ = try runOne(Fake, path, "", .{ .prompt = abi.span(u32, &[_]u32{ 5, 999, 7 }), .max_tokens = 3 }, &cancelled);
+    try testing.expectEqual(Reason.cancelled, cancelled.reason);
+    try testing.expectEqual(@as(usize, 0), cancelled.toks.items.len);
+    var next: Collect = .{};
+    defer next.deinit();
+    _ = try runOne(Fake, path, "", .{ .prompt = abi.span(u32, &[_]u32{ 5, 6, 7 }), .max_tokens = 2, .sampling = .{ .temperature = 0 } }, &next);
+    try testing.expectEqual(Reason.length, next.reason);
+    try testing.expectEqual(@as(usize, 2), next.toks.items.len);
+}
+
 test "ds4 adapter: render maps the transcript onto ds4's template; tokenize and token bytes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -656,13 +696,13 @@ test "ds4 adapter: greedy tokens equal the plain bridge sequence on a real GGUF"
     }
     // The plain bridge sequence: sync, then argmax and eval, or one
     // speculative round, per tick.
-    const engine = try load.open(bridge, io, testing.allocator, path, .{});
+    const engine = try load.open(bridge, io, testing.allocator, path, .{}, bridge.clampSessionCtx(4096));
     defer engine.close();
     const session = try engine.createSession(@intCast(bridge.clampSessionCtx(4096)));
     defer session.free();
     var p: [64]i32 = undefined;
     for (ids[0..prompt_len], p[0..prompt_len]) |t, *q| q.* = @intCast(t);
-    try session.sync(p[0..prompt_len]);
+    try session.sync(p[0..prompt_len], null);
     var want: std.ArrayList(u32) = .empty;
     defer want.deinit(testing.allocator);
     var rng: u64 = 0;
