@@ -34,7 +34,7 @@ pub fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []con
     }
 
     var hdr_buf: [768]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: " ++ ALLOW_HEADERS_DEFAULT ++ "\r\nAccess-Control-Expose-Headers: X-Ablation\r\n{s}\r\n", .{
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: " ++ SSE_ALLOW_HEADERS_DEFAULT ++ "\r\nAccess-Control-Expose-Headers: X-Ablation\r\n{s}\r\n", .{
         status,
         content_type,
         body.len,
@@ -74,12 +74,9 @@ fn responseBodyLogged(content_type: []const u8) bool {
     return !std.mem.startsWith(u8, content_type, "text/html");
 }
 
-/// The `Access-Control-Allow-Headers` value a framed response (the OPTIONS preflight included) advertises.
-/// `X-Ablation-Key` is listed so a browser can send the ablation bearer key cross-origin.
-pub const ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization, X-Ablation-Key";
-
-/// The `Access-Control-Allow-Headers` value each SSE surface advertises.
-pub const SSE_ALLOW_HEADERS_DEFAULT = ALLOW_HEADERS_DEFAULT;
+/// The `Access-Control-Allow-Headers` value each SSE surface and every framed response (the OPTIONS preflight
+/// included) advertises.
+pub const SSE_ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization, X-Ablation-Key";
 
 pub const SSE_ALLOW_HEADERS_ANTHROPIC = "Content-Type, Authorization, x-api-key, anthropic-version, X-Ablation-Key";
 

@@ -10,10 +10,8 @@ const Conn = @import("../http/conn.zig").Conn;
 const http_server = @import("../http/server.zig");
 const LoadedModel = @import("../registry/registry.zig").LoadedModel;
 
-pub const manifest_format = "mlx-serve-ablation";
-pub const manifest_version = 1;
-/// The request header that carries the ablation key.
-pub const key_header = "x-ablation-key";
+const manifest_format = "mlx-serve-ablation";
+const manifest_version = 1;
 const min_key_len = 32;
 const max_hidden = 1 << 16;
 
@@ -21,7 +19,6 @@ pub const Profile = struct {
     name: []const u8,
     /// Unit direction `[hidden]`; empty when the profile was refused.
     direction: []const f32 = &.{},
-    hidden: u32 = 0,
     /// Lowercase hex sha256 of the exact `config.json` bytes of the pack the profile was computed on (the field name LoRA
     /// overlays use for the same binding).
     config_sha256: [64]u8 = @splat('0'),
@@ -48,7 +45,7 @@ pub const Set = struct {
 
     /// Whether `presented` is the key: sha256 digests compared in constant time, so neither length nor content leaks.
     /// Both sides are trimmed on purpose: a header value excludes surrounding whitespace (RFC 9110 section 5.5) and the
-    /// key file's trailing newline is dropped at load, so `key` and `key\n` are one key (docs/api.md says so).
+    /// key file's trailing newline is dropped at load, so `key` and `key\n` are one key.
     pub fn keyMatches(self: *const Set, presented: []const u8) bool {
         var d: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(trim(presented), &d, .{});
@@ -68,7 +65,14 @@ pub fn launch(gpa: std.mem.Allocator, io: std.Io, profiles_dir: ?[]const u8, key
     var set: Set = .{ .arena = .init(gpa), .profiles = &.{}, .key_digest = undefined };
     errdefer set.deinit();
     set.key_digest = readKey(set.arena.allocator(), key_file.?) catch |e| {
-        log.err("[ablation] key file {s} refused: {s}\n", .{ key_file.?, keyRule(e) });
+        log.err("[ablation] key file {s} refused: {s}\n", .{ key_file.?, switch (e) {
+            error.NotRegular => "not a regular file",
+            error.NotOwner => "not owned by the server's user",
+            error.GroupOrOtherAccess => "mode must be 0600 (no group or other access)",
+            error.TooShort => "the key must be at least 32 bytes",
+            error.Unreadable, error.OutOfMemory => "unreadable",
+            error.Unsupported => "directional ablation needs a POSIX host",
+        } });
         return error.AblationKeyFileRefused;
     };
     set.profiles = loadProfiles(set.arena.allocator(), io, profiles_dir.?) catch {
@@ -86,19 +90,8 @@ pub fn launch(gpa: std.mem.Allocator, io: std.Io, profiles_dir: ?[]const u8, key
 
 const KeyError = error{ NotRegular, NotOwner, GroupOrOtherAccess, TooShort, Unreadable, Unsupported, OutOfMemory };
 
-fn keyRule(e: KeyError) []const u8 {
-    return switch (e) {
-        error.NotRegular => "not a regular file",
-        error.NotOwner => "not owned by the server's user",
-        error.GroupOrOtherAccess => "mode must be 0600 (no group or other access)",
-        error.TooShort => "the key must be at least 32 bytes",
-        error.Unreadable, error.OutOfMemory => "unreadable",
-        error.Unsupported => "directional ablation needs a POSIX host",
-    };
-}
-
 /// The key file's sha256: a regular file the server's user owns, no group or other bits, at least 32 bytes trimmed.
-/// The key file's digest; POSIX hosts only (the owner and mode rules have no Windows form).
+/// POSIX hosts only (the owner and mode rules have no Windows form).
 fn readKey(a: std.mem.Allocator, path: []const u8) KeyError![32]u8 {
     return if (builtin.os.tag == .windows) error.Unsupported else readKeyPosix(a, path);
 }
@@ -183,54 +176,31 @@ fn loadProfiles(a: std.mem.Allocator, io: std.Io, dir_path: []const u8) ![]Profi
 
 /// A profile from its manifest and tensor bytes; refused (with the reason) rather than failed.
 pub fn parseProfile(a: std.mem.Allocator, name: []const u8, manifest: []const u8, tensor: ?[]const u8) !Profile {
+    const parsed = std.json.parseFromSlice(std.json.Value, a, manifest, .{}) catch
+        return .{ .name = name, .refused = "manifest.json is not JSON" };
+    if (parsed.value != .object) return .{ .name = name, .refused = "manifest.json is not an object" };
+    const root = parsed.value.object;
+    const format = root.get("format") orelse .null;
+    if (format != .string or !std.mem.eql(u8, format.string, manifest_format))
+        return .{ .name = name, .refused = "manifest format is not " ++ manifest_format };
+    const version = root.get("version") orelse .null;
+    if (version != .integer or version.integer != manifest_version) return .{ .name = name, .refused = "unknown manifest version" };
+    const hidden = root.get("hidden_size") orelse .null;
+    if (hidden != .integer or hidden.integer <= 0 or hidden.integer > max_hidden)
+        return .{ .name = name, .refused = "hidden_size is missing or out of range" };
+    const sha = root.get("base_config_sha256") orelse .null;
+    if (sha != .string or sha.string.len != 64 or !isHex(sha.string))
+        return .{ .name = name, .refused = "base_config_sha256 is missing or not 64 hex digits" };
+    const bytes = tensor orelse return .{ .name = name, .refused = "direction.safetensors is missing" };
     var p: Profile = .{ .name = name };
-    const parsed = std.json.parseFromSlice(std.json.Value, a, manifest, .{}) catch {
-        p.refused = "manifest.json is not JSON";
-        return p;
-    };
-    const root = if (parsed.value == .object) parsed.value.object else {
-        p.refused = "manifest.json is not an object";
-        return p;
-    };
-    const format = root.get("format") orelse std.json.Value{ .null = {} };
-    if (format != .string or !std.mem.eql(u8, format.string, manifest_format)) {
-        p.refused = "manifest format is not " ++ manifest_format;
-        return p;
-    }
-    const version = root.get("version") orelse std.json.Value{ .null = {} };
-    if (version != .integer or version.integer != manifest_version) {
-        p.refused = "unknown manifest version";
-        return p;
-    }
-    const hidden_v = root.get("hidden_size") orelse std.json.Value{ .null = {} };
-    if (hidden_v != .integer or hidden_v.integer <= 0 or hidden_v.integer > max_hidden) {
-        p.refused = "hidden_size is missing or out of range";
-        return p;
-    }
-    p.hidden = @intCast(hidden_v.integer);
-    const sha = blk: {
-        const v = root.get("base_config_sha256") orelse break :blk null;
-        break :blk if (v == .string and v.string.len == 64 and isHex(v.string)) v.string else null;
-    } orelse {
-        p.refused = "base_config_sha256 is missing or not 64 hex digits";
-        return p;
-    };
-    for (&p.config_sha256, sha) |*o, c| o.* = std.ascii.toLower(c);
-    const bytes = tensor orelse {
-        p.refused = "direction.safetensors is missing";
-        return p;
-    };
-    const dir = readDirection(a, bytes, p.hidden) catch |e| {
-        p.refused = switch (e) {
-            error.ZeroDirection => "the direction is zero",
-            error.ShapeMismatch => "the direction's shape is not [hidden_size]",
-            error.UnsupportedDtype => "the direction's dtype is not F32, F16 or BF16",
-            error.OutOfMemory => return error.OutOfMemory,
-            else => "direction.safetensors is malformed",
-        };
-        return p;
-    };
-    p.direction = dir;
+    for (&p.config_sha256, sha.string) |*o, c| o.* = std.ascii.toLower(c);
+    p.direction = readDirection(a, bytes, @intCast(hidden.integer)) catch |e| return .{ .name = name, .refused = switch (e) {
+        error.ZeroDirection => "the direction is zero",
+        error.ShapeMismatch => "the direction's shape is not [hidden_size]",
+        error.UnsupportedDtype => "the direction's dtype is not F32, F16 or BF16",
+        error.OutOfMemory => return error.OutOfMemory,
+        else => "direction.safetensors is malformed",
+    } };
     var h = std.hash.Wyhash.init(0);
     h.update(manifest);
     h.update(bytes);
@@ -306,11 +276,8 @@ pub const Served = struct {
 pub const Refusal = struct { status: []const u8, code: u16, msg: []const u8 };
 
 pub const Outcome = union(enum) {
-    /// No `ablation` field.
-    none,
-    /// Strength 0: runs as a standard request; the header still reports the profile.
-    standard: Selected,
-    run: Selected,
+    /// Strength 0 runs as a standard request; the header still reports the profile.
+    selected: Selected,
     refused: Refusal,
 };
 
@@ -333,10 +300,9 @@ fn unauthorized(msg: []const u8) Outcome {
     return .{ .refused = .{ .status = "401 Unauthorized", .code = 401, .msg = msg } };
 }
 
-/// Resolves a request body's `ablation` field. Checked in order: present, enabled, key, shape, profile, model.
+/// Resolves a request body's `ablation` field. Checked in order: enabled, key, shape, profile, model.
 /// `msg_buf` holds a refusal message naming the profile; it outlives the returned outcome.
-pub fn resolve(set: ?*const Set, field: ?std.json.Value, presented_key: ?[]const u8, served: Served, msg_buf: []u8) Outcome {
-    const v = field orelse return .none;
+pub fn resolve(set: ?*const Set, v: std.json.Value, presented_key: ?[]const u8, served: Served, msg_buf: []u8) Outcome {
     const s = set orelse return bad("ablation is not enabled on this server");
     const key = presented_key orelse return unauthorized("ablation key missing (X-Ablation-Key header)");
     if (!s.keyMatches(key)) return unauthorized("ablation key rejected");
@@ -358,34 +324,28 @@ pub fn resolve(set: ?*const Set, field: ?std.json.Value, presented_key: ?[]const
     const p = s.find(name) orelse return bad(std.fmt.bufPrint(msg_buf, "unknown ablation profile '{s}'", .{clip(name)}) catch "unknown ablation profile");
     if (p.refused) |why| return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' was refused at load: {s}", .{ p.name, why }) catch "ablation profile was refused at load");
     if (!served.serves) return bad("this model does not serve ablation");
-    if (p.hidden != served.hidden) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (hidden size {d}, the model's is {d})", .{ p.name, p.hidden, served.hidden }) catch "ablation profile is for another model");
+    if (p.direction.len != served.hidden) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (hidden size {d}, the model's is {d})", .{ p.name, p.direction.len, served.hidden }) catch "ablation profile is for another model");
     const sha = served.config_sha256 orelse return bad("ablation: the model's config.json could not be read to check the profile");
     if (!std.mem.eql(u8, &sha, &p.config_sha256)) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (config.json digest differs)", .{p.name}) catch "ablation profile is for another model");
-    const sel: Selected = .{ .profile = p, .strength = strength };
-    return if (strength == 0) .{ .standard = sel } else .{ .run = sel };
+    return .{ .selected = .{ .profile = p, .strength = strength } };
 }
 
 fn clip(s: []const u8) []const u8 {
     return s[0..@min(s.len, 64)];
 }
 
-/// Lowercase hex sha256 of `<model_dir>/config.json`.
-pub fn configDigest(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) ?[64]u8 {
-    const path = std.fs.path.join(a, &.{ model_dir, "config.json" }) catch return null;
-    defer a.free(path);
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return null;
-    defer a.free(bytes);
-    var d: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(bytes, &d, .{});
-    return std.fmt.bytesToHex(d, .lower);
-}
-
-/// `configDigest` of `lm`'s pack, read and hashed once per load; a request racing the first one hashes its own copy.
+/// Lowercase hex sha256 of `lm`'s `config.json`, read and hashed once per load; a request racing the first one hashes
+/// its own copy.
 pub fn modelDigest(io: std.Io, lm: *LoadedModel) ?[64]u8 {
     if (lm.config_digest_state.load(.acquire) == 2) return lm.config_digest;
-    var a = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer a.deinit();
-    const d = configDigest(io, a.allocator(), lm.path) orelse return null;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = std.fs.path.join(a, &.{ lm.path, "config.json" }) catch return null;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return null;
+    var h: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &h, .{});
+    const d = std.fmt.bytesToHex(h, .lower);
     if (lm.config_digest_state.cmpxchgStrong(0, 1, .acquire, .monotonic) == null) {
         lm.config_digest = d;
         lm.config_digest_state.store(2, .release);
@@ -406,7 +366,7 @@ pub fn headerLine(buf: []u8, sel: Selected) []const u8 {
 /// conn's response header (and, for a run, `conn.ablation`); a refusal is returned for the caller to send.
 pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *LoadedModel) ?Refusal {
     const field = root.get("ablation") orelse return null;
-    const set = http_server.g_ablation;
+    const set = if (http_server.g_ablation) |*s| s else null;
     const config = lm.config orelse return bad("this model does not serve ablation").refused;
     const serves = if (config.plugin) |pb| pb.parsed.caps.ablation else false;
     // The pack's config is read only for a request that holds the key (`resolve` checks it first).
@@ -416,19 +376,17 @@ pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *LoadedModel) ?Refu
         .serves = serves,
         .config_sha256 = if (authorized and serves) modelDigest(conn.io, lm) else null,
     };
-    const out = resolve(set, field, conn.ablation_key, served, &conn.ablation_header);
-    const sel = switch (out) {
-        .none => return null,
+    const sel = switch (resolve(set, field, conn.ablation_key, served, &conn.ablation_header)) {
         .refused => |r| {
             // The message may sit in the header buffer: keep it, but never send it as a header.
             conn.ablation_header_len = 0;
             return r;
         },
-        .standard, .run => |sel| sel,
+        .selected => |sel| sel,
     };
-    if (out == .run) conn.ablation = sel.request();
+    if (sel.strength > 0) conn.ablation = sel.request();
     conn.ablation_header_len = headerLine(&conn.ablation_header, sel).len;
-    log.info("[ablation] profile={s} strength={d:.3}{s}\n", .{ sel.profile.name, sel.strength, if (out == .standard) " (standard run)" else "" });
+    log.info("[ablation] profile={s} strength={d:.3}{s}\n", .{ sel.profile.name, sel.strength, if (sel.strength == 0) " (standard run)" else "" });
     return null;
 }
 
@@ -438,10 +396,6 @@ pub fn bodyNamesAblation(a: std.mem.Allocator, body: []const u8) bool {
     defer parsed.deinit();
     return parsed.value == .object and parsed.value.object.get("ablation") != null;
 }
-
-/// The refusal for a request a proxy would forward (a provider or a LAN peer): the field would reach a third party and
-/// run unablated.
-pub const proxied_refusal = "ablation is not forwarded to a provider or a LAN peer; send it to a local model";
 
 /// The surfaces that do not serve the field refuse it rather than ignore it.
 pub fn refuseOnSurface(root: std.json.ObjectMap) ?Refusal {
@@ -568,13 +522,12 @@ test "ablation request: every refusal row of the failure matrix, and the key nev
         try testing.expect(std.mem.indexOf(u8, r.msg, test_key) == null);
         if (c.key) |k| try testing.expect(std.mem.indexOf(u8, r.msg, k) == null);
     }
-    try testing.expect(resolve(&set, null, test_key, served, &buf) == .none);
     const run = resolve(&set, field, test_key ++ "\n", served, &buf);
-    try testing.expect(run == .run and run.run.strength == 0.5);
+    try testing.expect(run == .selected and run.selected.strength == 0.5);
     const zero = resolve(&set, try json(a, "{\"profile\":\"good\",\"strength\":0}"), test_key, served, &buf);
-    try testing.expect(zero == .standard);
+    try testing.expect(zero == .selected and zero.selected.strength == 0);
     const dflt = resolve(&set, try json(a, "{\"profile\":\"good\"}"), test_key, served, &buf);
-    try testing.expect(dflt == .run and dflt.run.strength == 1.0);
+    try testing.expect(dflt == .selected and dflt.selected.strength == 1.0);
 }
 
 test "ablation request: the key folds the strength in, never 0" {
@@ -585,7 +538,6 @@ test "ablation request: the key folds the strength in, never 0" {
     const b: Selected = .{ .profile = p, .strength = 0.5 };
     try testing.expect(a.request().key != b.request().key);
     try testing.expect(a.request().key != 0);
-    try testing.expectEqual(a.request().key, a.request().key);
 }
 
 test "ablation launch: one flag alone is refused, neither is off" {
@@ -634,11 +586,9 @@ test "ablation model digest: hashed once per load, the cached value served after
     lm.path = root;
     lm.config_digest_state = .init(0);
     const first = modelDigest(testing.io, &lm).?;
-    try testing.expectEqual(@as(u8, 2), lm.config_digest_state.load(.acquire));
     // The file changes on disk; the load's digest does not.
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{\"a\":2}" });
     try testing.expectEqualSlices(u8, &first, &modelDigest(testing.io, &lm).?);
-    try testing.expect(!std.mem.eql(u8, &first, &configDigest(testing.io, testing.allocator, root).?));
 }
 
 test "ablation header: names the profile and strength, header-safe" {

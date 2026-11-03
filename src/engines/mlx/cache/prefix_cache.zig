@@ -180,7 +180,6 @@ pub const ModuleBinding = struct {
         return .{ .xfm = xfm, .aux = aux };
     }
 
-    /// `init` for a request of `variant`.
     pub fn forVariant(xfm: *const transformer_mod.Transformer, variant: u64) ?ModuleBinding {
         var b = init(xfm) orelse return null;
         b.variant = variant;
@@ -188,7 +187,7 @@ pub const ModuleBinding = struct {
     }
 
     fn same(a: ModuleBinding, b: ModuleBinding) bool {
-        return a.xfm == b.xfm and a.aux.model == b.aux.model and a.aux.hooks == b.aux.hooks;
+        return a.xfm == b.xfm and a.aux.model == b.aux.model and a.aux.hooks == b.aux.hooks and a.variant == b.variant;
     }
 };
 
@@ -1308,7 +1307,7 @@ pub const HotPrefixCache = struct {
 
             if (e.module) |m| {
                 const request = module_request orelse continue;
-                if (!ModuleBinding.same(m.binding, request.binding) or m.binding.variant != request.binding.variant) continue;
+                if (!ModuleBinding.same(m.binding, request.binding)) continue;
                 if (m.n == 0 or m.n >= prompt_ids.len or shared != m.n or m.n <= best_effective) continue;
                 var key: u64 = 0;
                 const had_error = mlx.errorPending();
@@ -1385,7 +1384,7 @@ pub const HotPrefixCache = struct {
         for (self.entries.items, 0..) |*e, i| {
             if (e.id != entry_id) continue;
             const payload = e.module orelse return 0;
-            if (!ModuleBinding.same(payload.binding, binding) or payload.binding.variant != binding.variant) return 0;
+            if (!ModuleBinding.same(payload.binding, binding)) return 0;
             const had_error = mlx.errorPending();
             if (!plugin_driver.auxRestoreAt(binding.xfm, slot, payload.snapshot, payload.n).isOk()) {
                 mlx.dropLatchedErrorUnless(had_error);
@@ -1952,7 +1951,7 @@ pub const HotPrefixCache = struct {
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         for (self.entries.items, 0..) |*e, i| {
             const m = e.module orelse continue;
-            if (!ModuleBinding.same(m.binding, binding) or m.binding.variant != binding.variant or e.has_tools != has_tools) continue;
+            if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len > ids.len) continue;
             if (mediaSharedBound(e.media, eff_media) < e.tokens.len) continue;
             if (!std.mem.eql(u32, e.tokens, ids[0..e.tokens.len])) continue;

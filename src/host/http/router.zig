@@ -776,14 +776,14 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
     return buf[0..n];
 }
 
-// ── tests ──
-
 /// A body that asks for directional ablation never leaves the server: a provider or a LAN peer would run it unablated.
 fn refuseProxiedAblation(allocator: std.mem.Allocator, stream: *Conn, body: []const u8) !bool {
     if (!ablation.bodyNamesAblation(allocator, body)) return false;
-    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", ablation.proxied_refusal, 400);
+    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "ablation is not forwarded to a provider or a LAN peer; send it to a local model", 400);
     return true;
 }
+
+// ── tests ──
 
 test "routeExists answers endpoint existence without consulting the model" {
     // Whether a path EXISTS has nothing to do with which models are loaded, but

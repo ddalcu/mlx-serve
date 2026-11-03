@@ -358,15 +358,9 @@ fn printUsage(io: std.Io) void {
         \\                        off (default), 4, 8     — affine group quant.
         \\                          Per-request override via the `kv_quant`
         \\                          body field.
-        \\  --ablation-profiles <dir>
-        \\                      Directional ablation profiles, one subdirectory
-        \\                        each (manifest.json + direction.safetensors).
-        \\                        A request opts in with `ablation` and the key
-        \\                        in its X-Ablation-Key header. Needs
-        \\                        --ablation-key-file.
-        \\  --ablation-key-file <path>
-        \\                      The ablation key: a 0600 file the server's user
-        \\                        owns, at least 32 bytes.
+        \\  --ablation-profiles <dir> --ablation-key-file <path>
+        \\                      Per-request directional ablation (docs/api.md);
+        \\                        the key file is 0600, at least 32 bytes.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -1457,14 +1451,7 @@ pub fn main(init: std.process.Init) !void {
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
     log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
-    // Directional ablation: both flags or neither; a bad key file or profiles dir stops the launch.
-    if (ablation_api.launch(allocator, io, ablation_profiles, ablation_key_file)) |set| {
-        if (set) |s| {
-            const held = try allocator.create(ablation_api.Set);
-            held.* = s;
-            server_mod.g_ablation = held;
-        }
-    } else |_| std.process.exit(1);
+    server_mod.g_ablation = ablation_api.launch(allocator, io, ablation_profiles, ablation_key_file) catch std.process.exit(1);
 
     // Set GPU as default
     var metal_avail: bool = false;
