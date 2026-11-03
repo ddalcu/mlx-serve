@@ -2416,14 +2416,12 @@
 "Since server startup: " = "自服务器启动以来：";
 "History records observations while this app is running. Up to 24 hours are saved locally." = "历史记录仅在此应用运行时采集，最多在本地保留 24 小时。";
 "Phase" = "阶段";
-"Cached" = "已缓存";
 "Generated" = "已生成";
 "KV + state" = "KV + 状态";
 "Prefilling" = "预填充中";
 "Decoding" = "解码中";
 "In cache" = "缓存中";
 "By model" = "按模型";
-"Requests" = "请求";
 "Unattributed" = "未归属模型";
 "Request history" = "请求历史";
 "Started" = "开始时间";
