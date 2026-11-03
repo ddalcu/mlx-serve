@@ -1,15 +1,15 @@
 #!/bin/bash
-# Integration test for the embedded llama.cpp GGUF engine.
+# test_llama_gguf.sh — the embedded llama.cpp engine end to end on a generic .gguf: auto-routing, /health, /v1/models,
+# chat (stream and not), Anthropic messages, prefix reuse; then a GGUF dir discovered by --model-dir (no config.json)
+# cold-loads on first request, unloads and reloads.
 #
-# Boots `mlx-serve` against a generic (non-DeepSeek-V4-Flash) .gguf and verifies
-# the whole llama path end-to-end: auto-routing to the llama engine, /health,
-# /v1/models, chat completions (non-streaming + streaming), and the Anthropic
-# Messages API — all served through libllama via mlx-serve's own HTTP layer.
+#   LLAMA_GGUF_MODEL=/path/to/model.gguf ./tests/test_llama_gguf.sh [port]   # unset = SKIP
 #
-# Gated on a fixture so CI without a GGUF stays green:
-#   LLAMA_GGUF_MODEL=/path/to/model.gguf ./tests/test_llama_gguf.sh [port]
-# A small instruct model works well, e.g. Qwen2.5-0.5B-Instruct Q4_K_M.
+# Use a pure-attention GGUF (e.g. Qwen2.5-0.5B-Instruct Q4_K_M): llama.cpp cannot trim a recurrent Qwen3.5 session,
+# so that fixture reports cached_n=0 by design.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${LLAMA_GGUF_MODEL:-}"
 PORT="${1:-8123}"
@@ -40,11 +40,7 @@ cleanup() { kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG" "${LOG2:-}"; rm -rf "${
 trap cleanup EXIT
 
 # Wait for health (model load + Metal warmup can take a few seconds).
-for i in $(seq 1 30); do
-    if curl -fs --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then break; fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo -e "${RED}server died${NC}"; tail -20 "$LOG"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo -e "${RED}server died${NC}"; tail -20 "$LOG"; exit 1; }
 
 # 1. Routed to the llama engine (not ds4, not MLX).
 assert_contains "routes to embedded llama engine" "\[llama\] engine ready" "$(cat "$LOG")"
@@ -108,11 +104,7 @@ LOG2="$(mktemp)"
 echo "→ restarting headless on :$PORT with --model-dir $SCRATCH"
 "$BIN" --serve --port "$PORT" --model-dir "$SCRATCH" --log-level info > "$LOG2" 2>&1 &
 SERVER_PID=$!
-for i in $(seq 1 30); do
-    if curl -fs --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then break; fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo -e "${RED}headless server died${NC}"; tail -20 "$LOG2"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo -e "${RED}headless server died${NC}"; tail -20 "$LOG2"; exit 1; }
 
 assert_contains "headless boot discovers the GGUF dir"      "Discovered 1 model" "$(cat "$LOG2")"
 STUBS="$(curl -fs --max-time 5 "$BASE/v1/models")"

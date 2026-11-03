@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump a MageFlow EDIT-loop parity fixture for src/mage_flow.zig (E7.5).
+"""Dump a MageFlow EDIT-loop parity fixture for src/plugins/mage_flow/mage_flow.zig (E7.5).
 
 Runs the pure-MLX REFERENCE (ivanfioravanti/mflux@mage-flow-mlx) edit denoise
 loop — concat([target, refs]) → transformer with multi-image RoPE → slice to the

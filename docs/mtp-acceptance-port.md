@@ -66,29 +66,3 @@ Vontra Flash-Next 4-bit pack, T=1.0, code and prose at 1K/4K/16K, two seeds,
 A B B A on one binary: typical 0.2 decoded 86.7 tok/s, typical 0.2 plus the tail
 99.4 tok/s (2.96 to 3.36 tokens per round). Greedy output is byte-identical with
 the tail on.
-
-## Paired routed gate/up kernel
-
-`MLX_SERVE_MOE_VERIFY_PAIRED_GU=1` installs an opt-in physical-S=4 routed
-gate/up kernel at model load. It is limited to the Qwen3.8 Flash-Next pack with
-48 MoE layers, hidden width 2560, expert width 640, 512 experts, top-10 routing,
-separate contiguous affine q4/group-64 gate and up banks, and an M5-class GPU
-(`verifySharedHardware`). A pack or chip outside that contract declines with a
-`[mtp-verify] paired routed gate/up declined:` line and loads on the stock
-route. A matching pack is bit-compared per layer against the stock sorted gather
-plus fused SwiGLU path before generation; a self-check failure stops the load.
-
-The kernel adapts MTPLX's paired routed producer to this checkpoint's split
-banks and group size. In a two-order, six-pair 16K serving A/B on the same
-binary, with exact MTP acceptance, sampled depth-3 drafts, KV8, creative
-sampling, thinking xhigh, and identical request seeds, mean decode speed rose
-from 70.377 to 70.914 tok/s (+0.76%). Total wall time fell from 109.077 to
-108.675 seconds (0.37% shorter). All paired completion lengths, answer
-digests, and reasoning digests matched. This is a measured 16K-cell result;
-long-context and full state/cache parity remain separate gates.
-
-The complete unchanged-control comparison, quality sanity screen, and 1K-1M
-timing and memory charts are in the
-[benchmark record](benchmarks/qwen38-mtp-port/README.md). The high-context cells are
-explicitly statistics-only and should not be read as long-context quality or
-recurrent-state parity evidence.

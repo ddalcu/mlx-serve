@@ -14,6 +14,7 @@
 # Usage: ./tests/test_model_rescan.sh [port]
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11267}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -55,11 +56,7 @@ sleep 0.5
 HOME="$HOME_DIR" "$BINARY" --serve --model-dir "$ROOT_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
 SERVER_PID=$!
 UP=0
-for _ in $(seq 1 60); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { UP=1; break; }
-    sleep 0.5
-    kill -0 "$SERVER_PID" 2>/dev/null || break
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 0.5 "$SERVER_PID" && UP=1
 if [ "$UP" != "1" ]; then
     echo "[fail] server did not come up; log follows"; cat "$LOG"; exit 1
 fi

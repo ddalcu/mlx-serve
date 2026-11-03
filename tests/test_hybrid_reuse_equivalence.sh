@@ -1,29 +1,13 @@
 #!/bin/bash
-# test_hybrid_reuse_equivalence.sh — Phase 1 of performance-plan.md.
+# test_hybrid_reuse_equivalence.sh — prefix reuse on hybrid SSM models (qwen3_5, qwen3_5_moe, qwen3_next, lfm2,
+# nemotron_h) through per-position SSM/conv checkpoints: [1] warm output is byte-identical to cold (temp 0, and seeded
+# temp 1, whose draws key on absolute positions); [2] cached_n > 0 on the second identical request (the cache
+# engaged); [3] warm prompt_ms <= 0.7x cold.
 #
-# Hybrid SSM models (qwen3_5, qwen3_5_moe, qwen3_next, lfm2, nemotron_h)
-# went from "ZERO multi-turn prefix reuse" to "stride-aligned warm reuse via
-# per-position SSM/conv state checkpoints". This test pins three invariants
-# against future regressions:
-#
-#  1. Warm output is byte-identical to cold (temperature=0, same prompt; and
-#     seeded temperature=1, whose draws key on absolute positions).
-#  2. `cached_n` on the second identical request is > 0 (proof the cache
-#     actually engaged — the bug we're guarding against silently disabled
-#     itself if anything goes wrong in lookupAndRestore).
-#  3. Warm `prompt_ms` is at most 0.7× cold `prompt_ms` (Phase 1 acceptance:
-#     "turn 2..5 prefill compute < 20% of turn-1's" for the all-shared case;
-#     0.7× is a loose, hardware-agnostic threshold).
-#
-# Env:
-#   MLX_HYBRID_MODEL  Path to a hybrid MLX model dir. Default: Qwen3.5-4B-MLX-4bit
-#                     under Sandisk; pass another to exercise lfm2/qwen3_next/etc.
-#   PORT              Server port. Default 19077.
-#
-# Reverting Phase 1 (in src/prefix_cache.zig or src/generate.zig) must
-# turn this test red.
+#   MLX_HYBRID_MODEL=<dir> ./tests/test_hybrid_reuse_equivalence.sh   # default Qwen3.5-4B-MLX-4bit; PORT (19077)
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 source "$(dirname "$0")/_lib_models.sh"
 MODEL="${MLX_HYBRID_MODEL:-$(find_model mlx-community/Qwen3.5-4B-MLX-4bit)}"
@@ -48,11 +32,7 @@ trap 'kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG"; true' EXIT
     --log-level warn > "$LOG" 2>&1 &
 SERVER_PID=$!
 
-for _ in $(seq 1 120); do
-    curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && break
-    kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$LOG"; exit 1; }
-    sleep 0.5
-done
+srv_wait_health "$BASE" 120 0.5 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -20 "$LOG"; exit 1; }
 
 # Build a long-ish prompt so the cache actually hits stride boundaries.
 PROMPT="$(python3 - <<'PY'

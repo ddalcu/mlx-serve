@@ -1,7 +1,8 @@
 #!/bin/bash
-# Integration test: reproduces "The model couldn't generate a response" with Gemma 4 tool calling.
-# This sends the exact message sequence the agent loop produces after a webSearch tool call.
-# Expected: model generates >2 completion tokens. Fails if completion_tokens <= 2.
+# test_tool_response.sh — Gemma 4 tool round trip: the exact message sequence the agent loop sends after a webSearch
+# call must get a real answer (completion_tokens > 2), not "The model couldn't generate a response".
+#
+#   ./tests/test_tool_response.sh [port]
 
 PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"

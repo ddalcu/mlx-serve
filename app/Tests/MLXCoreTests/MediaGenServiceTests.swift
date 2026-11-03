@@ -1158,7 +1158,7 @@ final class MediaGenServiceTests: XCTestCase {
             XCTAssertTrue(q8.repo.hasPrefix("ddalcu/"), "\(q8.id): our mirror, not microsoft's")
         }
         // The engine gates EDIT capability on the directory name containing
-        // "mage-flow-edit" (dirIsEdit in src/mage_flow.zig), and the download
+        // "mage-flow-edit" (dirIsEdit in src/plugins/mage_flow/mage_flow.zig), and the download
         // dir is the repo id — so the edit mirror's name is load-bearing.
         let editDir = ImageModelPreset.mageFlowEditTurbo8bit.repo
             .split(separator: "/").last.map(String.init) ?? ""

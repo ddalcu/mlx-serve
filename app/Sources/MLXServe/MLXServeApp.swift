@@ -393,7 +393,7 @@ struct MLXCoreApp: App {
                     Button {
                         launchClaudeCodeWithPicker(
                             baseURL: appState.server.baseURL,
-                            serverContextLength: appState.server.chatModelInfo?.contextLength)
+                            serverBudget: appState.server.chatModelInfo?.agentBudget)
                     } label: { Text("Launch Claude Code…")
                         .font(.app(.body)) }
                 }

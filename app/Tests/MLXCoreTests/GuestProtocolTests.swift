@@ -6,13 +6,13 @@ import XCTest
 /// sync is a set of golden bytes asserted on both sides.
 ///
 /// The Zig test `"frame header is exactly the bytes Swift expects"` in
-/// `src/vz_agent.zig` asserts the SAME three headers this file does. If you
+/// `src/host/sandbox/vz_agent.zig` asserts the SAME three headers this file does. If you
 /// change the encoding, both must move together, and both tests must be updated
 /// in the same commit — otherwise the guest and the host desync at runtime with
 /// no compile error anywhere.
 final class GuestProtocolTests: XCTestCase {
 
-    // MARK: - Golden bytes (mirrored in src/vz_agent.zig)
+    // MARK: - Golden bytes (mirrored in src/host/sandbox/vz_agent.zig)
 
     func testHeaderGoldenBytesMatchTheZigAgent() {
         XCTAssertEqual(GuestProtocol.encodeHeader(.stdout, payloadLength: 12345),

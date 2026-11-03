@@ -25,9 +25,29 @@ enum ModelSettingsApply {
         return (show, show && mtp != false && !dflash)
     }
 
-    /// The server's `ane_lm.archOf` takes dense qwen3_5 and Qwen3 packs.
-    static func offersNeuralEngine(modelType: String?) -> Bool {
-        modelType == "qwen3_5" || modelType == "qwen3_5_text" || modelType == "qwen3"
+    /// The running server's row for the model at `path` (its id is the path's org/repo tail).
+    static func row(for path: String, in models: [ModelInfo]) -> ModelInfo? {
+        models.first { path.hasSuffix("/" + $0.name) || $0.name == path }
+    }
+
+    /// The engine picker's choices: Automatic ("") and what the server says can
+    /// serve the pack, plus a stored choice it no longer lists (so it can be reset).
+    /// Empty when there is nothing to pick.
+    static func engineChoices(engines: [String], stored: String?) -> [String] {
+        var out = engines
+        if let stored, !out.contains(stored) { out.append(stored) }
+        return out.count > 1 || stored != nil ? [""] + out : []
+    }
+
+    static func engineLabel(_ engine: String) -> String {
+        switch engine {
+        case "": return "Automatic"
+        case "mlx": return "MLX (GPU)"
+        case "ane": return "Neural Engine"
+        case "ds4": return "ds4"
+        case "llama": return "llama.cpp"
+        default: return engine
+        }
     }
 
     /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
@@ -61,7 +81,7 @@ struct ModelSettingsSheet: View {
     @State private var packDrafter: String?
 
     private var live: ModelInfo? {
-        server.allModels.first { request.path.hasSuffix("/" + $0.name) || $0.name == request.path }
+        ModelSettingsApply.row(for: request.path, in: server.allModels)
     }
 
     private var plan: ModelSettingsApply.Plan {
@@ -95,8 +115,8 @@ struct ModelSettingsSheet: View {
         request.path.hasSuffix(".gguf") || appState.localModels.first { $0.path == request.path }?.quantFile != nil
     }
 
-    private var offersNeuralEngine: Bool {
-        ModelSettingsApply.offersNeuralEngine(modelType: appState.localModels.first { $0.path == request.path }?.modelType)
+    private var engineChoices: [String] {
+        ModelSettingsApply.engineChoices(engines: live?.engines ?? [], stored: override.engineChoice)
     }
 
     private var hasInt8PrefillRoute: Bool {
@@ -129,7 +149,7 @@ struct ModelSettingsSheet: View {
     private var formHeight: CGFloat {
         var n = isGguf ? 2 : 3
         if hasInt8PrefillRoute { n += 1 }
-        if offersNeuralEngine { n += 1 }
+        if !engineChoices.isEmpty { n += 1 }
         if !isGguf { n += 2 + (specLine == nil ? 0 : 1) }
         if rows.acceptance { n += 2 }
         if live?.loaded == true { n += 1 }
@@ -253,15 +273,15 @@ struct ModelSettingsSheet: View {
                 }
                 .help("Faster prompt processing by quantizing activations to int8. Changes numerics; needs an M5-class GPU.")
                 }
-                if offersNeuralEngine {
-                Picker("Neural Engine", selection: Binding(
-                    get: { override.ane.map { $0 ? 1 : 0 } ?? -1 },
-                    set: { override.ane = $0 < 0 ? nil : $0 == 1 })) {
-                    Text("Default").font(.app(.body)).tag(-1)
-                    Text("On").font(.app(.body)).tag(1)
-                    Text("Off").font(.app(.body)).tag(0)
+                if !engineChoices.isEmpty {
+                Picker("Engine", selection: Binding(
+                    get: { override.engineChoice ?? "" },
+                    set: { override.engineChoice = $0.isEmpty ? nil : $0 })) {
+                    ForEach(engineChoices, id: \.self) { e in
+                        Text(ModelSettingsApply.engineLabel(e)).font(.app(.body)).tag(e)
+                    }
                 }
-                .help("Runs the model on the Neural Engine, leaving the GPU free. Text only; the first load on this Mac compiles it for minutes.")
+                .help("What serves this model; Automatic leaves it to the server. The Neural Engine leaves the GPU free (text only; the first load on this Mac compiles it for minutes).")
                 }
                 Section("Generation defaults") {
                     if override.extra["generation_defaults"] != nil {

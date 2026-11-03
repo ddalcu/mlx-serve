@@ -1,25 +1,16 @@
 #!/bin/bash
-# test_smoke_matrix.sh — quick hot smoke: every text arch on the box × server
-# configs × every API surface. Not a bench and not a correctness oracle: the
-# bar per cell is "answers, no leak, no crash", so a checkpoint's choices
-# (to think, to call the tool) are branched on, never asserted.
+# test_smoke_matrix.sh — quick hot smoke: one small checkpoint per text arch on the box x server configs x ~28 API
+# checks per boot. The bar per cell is "answers, no leak, no crash"; a checkpoint's choices are branched on.
 #
-#   ./tests/test_smoke_matrix.sh                 # every arch found, all configs
-#   SMOKE_ARCHES=gemma4,qwen3_5 ./tests/test_smoke_matrix.sh
-#   SMOKE_CONFIGS=default,kv4 ./tests/test_smoke_matrix.sh
-#   SMOKE_MAX_GB=20 ./tests/test_smoke_matrix.sh  # skip bigger packs
-#   SMOKE_EXTRA_FLAGS="--ctx-size 2048" ./tests/test_smoke_matrix.sh  # appended to every boot
+#   ./tests/test_smoke_matrix.sh      # SMOKE_ARCHES / SMOKE_CONFIGS (csv), SMOKE_MAX_GB, SMOKE_EXTRA_FLAGS, SMOKE_OUT
 #
-# Checkpoints are found on any model root and packs past this box's GPU budget
-# skip (tests/_lib_models.sh); ./tests/fetch_test_models.sh downloads the rest.
-#
-# Configs: default | kv4 (--kv-quant 4) | kv8 (--kv-quant 8) | mtp (--mtp, only
-# where the pack ships a head) | nospec (--no-pld --no-mtp --no-drafter) |
-# drafter / drafter_kv8 (a DFlash drafter, dense and 8-bit KV, where one is on disk).
-# Per boot: chat non-stream/stream, thinking on/off, tools, json_schema,
-# logprobs, max_tokens cap, prefix-cache hit, 2-way concurrency, /v1/completions,
-# /v1/messages (both modes), /v1/responses (both modes), Ollama /api/chat +
-# /api/generate, /v1/models, /metrics.json.
+# Configs: default | kv4 | kv8 | mtp (a head ships) | nospec | drafter / drafter_kv8 (a DFlash drafter on disk).
+# Checks: chat stream/non-stream, thinking on (stream and non-stream agree on the split) / off, a ~3k-token prompt
+# that must still read its first line, tools, json_schema, logprobs, max_tokens, prefix-cache hit, 2-way concurrency,
+# completions, messages, responses, Ollama, /v1/models, /metrics.json, alive + no `[mlx]` error.
+# Each boot has a scratch HOME (a saved model-settings profile outranks launch flags). Packs come from
+# tests/_lib_models.sh (fetch_test_models.sh downloads the rest); ~1 h for the full box.
+
 set -uo pipefail
 cd "$(dirname "$0")/.."
 source tests/_lib_models.sh
@@ -338,7 +329,7 @@ for entry in "${ARCHES[@]}"; do
         if [[ "$cfg" == drafter* ]]; then
             check "drafter: engaged in the log" "$(grep -q 'spec-stats\] mode=dflash' "$OUT/$CELL.server.log" && echo 0 || echo 1)"
             # Past 2k KV tokens, with packed-KV reads forced: drafted bytes == serial bytes on one load.
-            long=$(python3 -c "print(open('src/rowqmv.zig').read()[:12000])" | python3 -c 'import sys,json; print(json.dumps("Here is a file:\n"+sys.stdin.read()+"\nList its public functions."))')
+            long=$(python3 -c "print(open('src/sdk/blocks/qmm/rowqmv.zig').read()[:12000])" | python3 -c 'import sys,json; print(json.dumps("Here is a file:\n"+sys.stdin.read()+"\nList its public functions."))')
             a=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":false,\"enable_mtp\":false,\"enable_pld\":false}" | J '(d["choices"][0]["message"].get("reasoning_content") or "") + (d["choices"][0]["message"]["content"] or "")')
             b=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":true}" | J '(d["choices"][0]["message"].get("reasoning_content") or "") + (d["choices"][0]["message"]["content"] or "")')
             # The whole reply (a model can think with thinking off). Bytes match only on the row-exact

@@ -15,6 +15,7 @@
 #
 # Usage: ./tests/test_load_model_default.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11381}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -56,11 +57,7 @@ sleep 0.5
 "$BIN" --serve --model "$BOOT_MODEL" --model-dir "$MODELS_ROOT" --port "$PORT" --log-file off >"$LOG" 2>&1 &
 SRV=$!
 UP=0
-for _ in $(seq 1 240); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { UP=1; break; }
-    kill -0 "$SRV" 2>/dev/null || break
-    sleep 0.5
-done
+srv_wait_health "http://127.0.0.1:$PORT" 240 0.5 "$SRV" && UP=1
 [ "$UP" = "1" ] || { echo "FAIL: server never became healthy"; tail -5 "$LOG"; exit 1; }
 
 default_id() {

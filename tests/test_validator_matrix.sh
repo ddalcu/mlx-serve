@@ -1,31 +1,15 @@
 #!/bin/bash
-# test_validator_matrix.sh — API-compliance + agentic matrix across every
-# locally-available Zig MLX architecture plus one llama-engine GGUF and one
-# ds4-engine GGUF.
+# test_validator_matrix.sh — API-compliance + agentic matrix per architecture (gemma4, gemma3, qwen3_5 dense and MoE,
+# qwen3_moe, a llama.cpp GGUF, a ds4 GGUF): llmprobe's /v1/responses + chat + messages suites, then pi's 2-turn html
+# agent case through tests/pi_integration_run.sh.
 #
-# Per model, two layers:
-#   1. llmprobe (~/projects/agents/llmprobe) in auto
-#      mode — compliance suites for /v1/responses, /v1/chat/completions and
-#      /v1/messages against a server this script boots and tears down.
-#   2. The pi 2-turn agentic html case (multi-turn tool calls: create
-#      mlx.html, then add JS) via tests/pi_integration_run.sh, which manages
-#      its own server lifecycle and appends audit_format leak markers.
+#   VALIDATOR_MODELS=gemma4,ds4 ./tests/test_validator_matrix.sh   # SKIP_PI=1 / SKIP_PROBE=1, BINARY, PORT, LLMPROBE_DIR
 #
-# One model loaded at a time; missing weights skip cleanly. The 81GB ds4
-# model cannot coexist with another large resident model — this script
-# pkills ALL serving mlx-serve instances up front (including the app's).
-#
-# Usage:
-#   ./tests/test_validator_matrix.sh                      # full matrix
-#   VALIDATOR_MODELS=gemma4,ds4 ./tests/...               # csv filter
-#   SKIP_PI=1 ./tests/test_validator_matrix.sh            # llmprobe only
-#   SKIP_PROBE=1 ./tests/test_validator_matrix.sh         # pi only
-#   BINARY=...  PORT=...  LLMPROBE_DIR=...                # overrides
-#
-# Output: per-model logs in tests/validator-results/, summary table on
-# stdout + tests/validator-results/summary.tsv. Exit 1 if anything failed.
+# One model at a time; missing weights skip. It pkills EVERY serving mlx-serve up front (the app's too: the 81 GB
+# ds4 pack cannot sit beside another). Logs and summary.tsv in tests/validator-results/; exit 1 on any failure.
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
 REPO="$(pwd)"
@@ -85,11 +69,7 @@ start_server() { # path logfile -> 0 on healthy
     "$BINARY" --model "$1" --serve --port "$PORT" --log-level info \
         --ctx-size 32768 > "$2" 2>&1 &
     SERVER_PID=$!
-    for _ in $(seq 1 300); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || break
-        sleep 1
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 300 1 "$SERVER_PID" && return 0
     return 1
 }
 

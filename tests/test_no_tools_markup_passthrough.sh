@@ -7,10 +7,12 @@
 # `<|tool_call_start|>[...]<|tool_call_end|>` with no `tools` field.
 #
 # Usage: ./tests/test_no_tools_markup_passthrough.sh [model_dir] [port]
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/LiquidAI/LFM2.5-2.6B-MLX-4bit}"
+MODEL="${1:-$(find_model LiquidAI/LFM2.5-2.6B-MLX-4bit || echo "$HOME/.mlx-serve/models/LiquidAI/LFM2.5-2.6B-MLX-4bit")}"
 PORT="${2:-11262}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -32,13 +34,9 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 1
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 --ctx-size 8192 > "$LOG" 2>&1 &
 SERVER_PID=$!
-trap 'kill $SERVER_PID 2>/dev/null' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
-for _ in $(seq 1 60); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    sleep 1
-done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not come up"; exit 1; }
+srv_wait_health "$BASE" 60 1 || { echo "FAIL: server did not come up"; exit 1; }
 
 SYS='List of tools: [{"name": "get_weather", "description": "Get current weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}]'
 USER="What's the weather in Paris right now? Use the tool."

@@ -200,6 +200,75 @@ print("ok")
 run_test "top-level context_length/max_model_len mirror meta" \
     "$( [ "$TOPCTX" = ok ] && echo PASS || echo FAIL )" "$TOPCTX"
 
+# ── Test 4c: chat rows carry the agent budget the CLIs declare ──
+# The app, the pi extension and `mlx-serve launch` read `agent_budget` instead of
+# deriving it (src/host/launch/budget.zig): the context verbatim, output = half,
+# reserve = a quarter capped at 20000, `too_small_for` = the agent floors missed.
+BUDGET=$(echo "$RESULT" | python3 -c '
+import sys, json
+r = json.loads(sys.stdin.read())
+floors = {"claude": 65536, "opencode": 32768, "opencode2": 32768, "default": 16384}
+for m in r["data"]:
+    if m.get("lan_peer") or m.get("provider"):
+        continue
+    caps = m.get("capabilities") or []
+    b = m.get("agent_budget")
+    if "chat" not in caps:
+        if b is not None:
+            print("fail:budget_on_non_chat_row:%s" % m.get("id")); sys.exit()
+        continue
+    if not isinstance(b, dict):
+        print("fail:no_agent_budget:%s" % m.get("id")); sys.exit()
+    ctx = (m.get("meta") or {}).get("context_length") or 32768
+    want = {"context": ctx, "output": min(65536, max(1024, ctx // 2)),
+            "compaction_reserve": min(20000, max(1024, ctx // 4)),
+            "too_small_for": {k: v for k, v in floors.items() if ctx < v}}
+    if b != want:
+        print("fail:%s:%r!=%r" % (m.get("id"), b, want)); sys.exit()
+print("ok")
+' 2>&1)
+run_test "chat rows carry agent_budget from their advertised context" \
+    "$( [ "$BUDGET" = ok ] && echo PASS || echo FAIL )" "$BUDGET"
+
+# ── Test 4d: media rows name their modality, language models none ──
+MODALITY=$(echo "$RESULT" | python3 -c '
+import sys, json
+r = json.loads(sys.stdin.read())
+media = {"image", "speech", "music", "sound", "video", "3d", "decisions", "diarization"}
+for m in r["data"]:
+    if m.get("lan_peer") or m.get("provider"):
+        continue
+    caps = set(m.get("capabilities") or [])
+    mod = m.get("modality")
+    if "chat" in caps or "embeddings" in caps:
+        if mod is not None:
+            print("fail:modality_on_lm_row:%s:%r" % (m.get("id"), mod)); sys.exit()
+    elif mod is not None and mod not in media:
+        print("fail:unknown_modality:%s:%r" % (m.get("id"), mod)); sys.exit()
+print("ok")
+' 2>&1)
+run_test "modality only on media rows, in the capability vocabulary" \
+    "$( [ "$MODALITY" = ok ] && echo PASS || echo FAIL )" "$MODALITY"
+
+# ── Test 4e: every local row lists the engines that can serve it ──
+# The Model Settings engine picker offers exactly these; a ready MLX row lists mlx.
+ENGINES=$(echo "$RESULT" | python3 -c '
+import sys, json
+r = json.loads(sys.stdin.read())
+known = {"mlx", "ane", "ds4", "llama"}
+for m in r["data"]:
+    if m.get("lan_peer") or m.get("provider"):
+        continue
+    e = m.get("engines")
+    if not isinstance(e, list) or not set(e) <= known or len(set(e)) != len(e):
+        print("fail:engines:%s:%r" % (m.get("id"), e)); sys.exit()
+    if m.get("state") == "ready" and (m.get("meta") or {}).get("engine") == "mlx" and "mlx" not in e:
+        print("fail:ready_mlx_row_without_mlx:%s:%r" % (m.get("id"), e)); sys.exit()
+print("ok")
+' 2>&1)
+run_test "engines list what can serve each row" \
+    "$( [ "$ENGINES" = ok ] && echo PASS || echo FAIL )" "$ENGINES"
+
 # ── Test 5: existing meta block still present (no regression) ──
 META=$(echo "$RESULT" | python3 -c '
 import sys, json

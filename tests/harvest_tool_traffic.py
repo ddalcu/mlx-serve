@@ -3,7 +3,7 @@
 into a replay fixture.
 
 Every pair is a REAL thing a model emitted with a REAL client's tools attached,
-so `src/tool_traffic_replay_test.zig` can replay it through the actual
+so `src/host/chat/tool_traffic_replay_test.zig` can replay it through the actual
 parse+coerce path and assert the universal invariants forever. This turns an
 hour of agentic soak into permanent regression coverage.
 

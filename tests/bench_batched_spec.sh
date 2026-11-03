@@ -4,13 +4,14 @@
 # Usage: BENCH_MODEL=<dir> [SPEC_FLAGS="--mtp"] ./tests/bench_batched_spec.sh [port] [max_tokens]
 # The "mtp" arms enable whatever spec the server loaded (MTP head or DFlash drafter).
 set -u
+source "$(dirname "$0")/lib/server.sh"
 MODEL="${BENCH_MODEL:?set BENCH_MODEL}"
 PORT=${1:-18820}; MAXTOK=${2:-256}; BASE="http://127.0.0.1:$PORT"
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
 LOG=$(mktemp)
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld ${SPEC_FLAGS:---mtp} --max-concurrent 4 --prefix-cache-entries 0 > "$LOG" 2>&1 &
 PID=$!; trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -f "$LOG"' EXIT
-for i in $(seq 1 120); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "$BASE" 120 1 || true
 grep -E "Concurrency:|MTP|mtp" "$LOG" | head -3
 
 PROMPTS=("Write a detailed essay about the history of quantum computing." "Explain how a compiler turns source code into machine code, in depth." "Describe the water cycle for a graduate seminar, with mechanisms.")

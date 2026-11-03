@@ -112,8 +112,8 @@ final class ClusterWorker: ObservableObject {
         p.standardError = err
         err.fileHandleForReading.readabilityHandler = { [weak self] h in
             let data = h.availableData
+            if data.isEmpty { h.readabilityHandler = nil; return }  // EOF: see ProcessRegistry.capture
             let text = String(decoding: data, as: UTF8.self)
-            guard !text.isEmpty else { return }
             Self.appendToLog(data)
             Task { @MainActor in
                 guard let self else { return }

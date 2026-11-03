@@ -6,6 +6,7 @@
 # Gated on a fixture so CI without the model stays green:
 #   QWEN4EXP_GGUF_MODEL=/path/to/model-00001-of-00002.gguf ./tests/test_qwen4exp_gguf_route.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${QWEN4EXP_GGUF_MODEL:-}"
 PORT="${1:-8124}"
@@ -36,11 +37,7 @@ cleanup() { kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG"; }
 trap cleanup EXIT
 
 # A 75 GB checkpoint takes a while to map and warm.
-for i in $(seq 1 300); do
-    if curl -fs --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then break; fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo -e "${RED}server died${NC}"; tail -20 "$LOG"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 300 1 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo -e "${RED}server died${NC}"; tail -20 "$LOG"; exit 1; }
 
 assert_contains "routed to llama.cpp, not ds4" "\[gguf\] engine: llama (arch=qwen4exp" "$(cat "$LOG")"
 assert_contains "llama engine loaded the model" "\[llama\] engine ready" "$(cat "$LOG")"

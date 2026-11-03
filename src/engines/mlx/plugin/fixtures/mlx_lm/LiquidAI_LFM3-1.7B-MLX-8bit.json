@@ -1,0 +1,100 @@
+{
+    "architectures": [
+        "Lfm3ForCausalLM"
+    ],
+    "auto_map": {
+        "AutoConfig": "configuration_lfm3.Lfm3Config",
+        "AutoModel": "modeling_lfm3.Lfm3Model",
+        "AutoModelForCausalLM": "modeling_lfm3.Lfm3ForCausalLM"
+    },
+    "bos_token_id": 124894,
+    "conv_L_cache": 7,
+    "conv_bias": false,
+    "do_sample": true,
+    "dtype": "bfloat16",
+    "eos_token_id": [
+        124900
+    ],
+    "generation_config": {
+        "_from_model_config": true,
+        "bos_token_id": 124894,
+        "do_sample": true,
+        "eos_token_id": [
+            124900
+        ],
+        "output_attentions": false,
+        "output_hidden_states": false,
+        "pad_token_id": 124893,
+        "repetition_penalty": 1.1,
+        "temperature": 0.1,
+        "top_k": 50,
+        "transformers_version": "5.12.1",
+        "use_cache": true
+    },
+    "head_dim": 128,
+    "hidden_size": 2048,
+    "intermediate_size": 7680,
+    "layer_types": [
+        "conv",
+        "conv",
+        "full_attention",
+        "conv",
+        "sliding_attention",
+        "conv",
+        "full_attention",
+        "conv",
+        "sliding_attention",
+        "conv",
+        "full_attention",
+        "conv",
+        "sliding_attention",
+        "conv",
+        "full_attention",
+        "conv",
+        "sliding_attention",
+        "conv",
+        "full_attention",
+        "conv",
+        "sliding_attention",
+        "conv",
+        "full_attention",
+        "conv"
+    ],
+    "max_position_embeddings": 262144,
+    "model_type": "lfm3",
+    "norm_eps": 1e-05,
+    "num_attention_heads": 16,
+    "num_hidden_layers": 24,
+    "num_key_value_heads": 4,
+    "pad_token_id": 124893,
+    "quantization": {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine"
+    },
+    "quantization_config": {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine"
+    },
+    "rope_parameters": {
+        "full_attention": {
+            "partial_rotary_factor": 0.5,
+            "rope_theta": 1000000.0,
+            "rope_type": "default"
+        },
+        "sliding_attention": {
+            "rope_theta": 10000,
+            "rope_type": "default"
+        }
+    },
+    "sliding_window": 256,
+    "temperature": 0.1,
+    "tie_word_embeddings": true,
+    "top_k": 50,
+    "transformers_version": "5.12.1",
+    "use_cache": true,
+    "use_sandwich_norm": true,
+    "vision_config": {},
+    "vocab_size": 128000
+}

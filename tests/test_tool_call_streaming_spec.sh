@@ -13,8 +13,10 @@
 #
 # Usage:
 #   TOOL_STREAM_TEST_MODEL=/path/to/model ./tests/test_tool_call_streaming_spec.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8090}
 BASE="http://127.0.0.1:$PORT"
@@ -23,8 +25,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${TOOL_STREAM_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
-DRAFTER="${TOOL_STREAM_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
+MODEL="${TOOL_STREAM_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
+DRAFTER="${TOOL_STREAM_TEST_DRAFTER:-$(find_model mlx-community/gemma-4-E4B-it-assistant-bf16 || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16")}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_tool_call_streaming_spec: model directory not found ($MODEL)."
@@ -71,10 +73,7 @@ cleanup() {
 trap cleanup EXIT
 
 UP=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then UP=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 && UP=1
 if [ "$UP" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
     tail -30 "$LOGFILE"

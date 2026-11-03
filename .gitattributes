@@ -1,2 +1,7 @@
 # Built by app-web/ (`npm run build`): collapsed in review, and a merge conflict is resolved by rebuilding.
 src/html/index.html linguist-generated=true -diff -merge
+
+# Embedded kernel text must keep the bytes recorded in its digest manifest.
+*.metal text eol=lf
+*.cu text eol=lf
+src/kernels/digests.txt text eol=lf

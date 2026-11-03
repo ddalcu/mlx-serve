@@ -19,6 +19,7 @@
 # Greedy throughout. Usage: ./tests/test_output_config.sh [model_dir] [port]
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
 PORT=${2:-8135}
@@ -41,11 +42,7 @@ SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 120); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    if [ "$i" -eq 120 ]; then echo "FAIL: server did not start within 120s"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 120 1 || { echo "FAIL: server did not start within 120s"; exit 1; }
 
 run_test() {
     TOTAL=$((TOTAL + 1))

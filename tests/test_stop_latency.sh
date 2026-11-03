@@ -17,6 +17,7 @@
 #   STOP_TEST_MODEL=/path/to/model ./tests/test_stop_latency.sh [port]
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8095}
 BASE="http://127.0.0.1:$PORT"
@@ -52,10 +53,7 @@ echo "  model: $MODEL"
 echo "  log:   $LOGFILE"
 
 up=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 && up=1
 if [ "$up" != "1" ]; then
     echo -e "${RED}FAIL${NC} server didn't come up in 60s"
     tail -30 "$LOGFILE"

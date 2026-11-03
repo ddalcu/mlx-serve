@@ -2,7 +2,7 @@ import XCTest
 @testable import MLXCore
 
 /// A D1 pack's root config.json says `lfm2_vl`, the same as a chat LFM2.5-VL; its `auto_map` names the card's own
-/// decision class, which is what makes it a decision model. Server twin: `model_discovery.isD1Root`.
+/// decision class, which is what makes it a decision model. Server twin: the d1 plugin's `claims`.
 final class D1ModelTests: XCTestCase {
 
     private func makeDir(config: String) throws -> (root: String, dir: String) {

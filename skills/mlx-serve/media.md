@@ -193,9 +193,20 @@ minutes and hold a lot of memory: one at a time, unload the model after.
 
 ## 3D: `POST /v1/3d/generations`
 
+The default model is Idol (the `3d` row whose id contains `Idol`, `ddalcu/Idol-MLX-Serve-8bit`: about 3 GB on disk,
+about 6 GB of free memory): one picture of one object in, a 3D Gaussian splat out. Use it unless the user names
+another 3D model. If no listed `3d` model is Idol, stop and tell the user to download it (MLX Core: Models > Media > 3D,
+or `mlx-serve pull ddalcu/Idol-MLX-Serve-8bit` and then `POST /v1/models/rescan`) instead of substituting another model;
+`gen.mjs` stops the same way. The other models below are for what Idol does not make: a PBR-textured mesh with a triangle
+budget (a game prop, a car), or Pixal3D's several posed views.
+
 | field | notes |
 |---|---|
-| `image` | base64 PNG/JPEG of ONE object; a cutout with real transparency works best (TRELLIS.2 and Pixal3D have no background remover: an opaque photo's whole frame becomes the subject) |
+| `image` | base64 PNG/JPEG of ONE object. Idol cuts the subject out itself (a picture with real transparency is used as is); a cutout with real transparency also works best for the rest (TRELLIS.2 and Pixal3D have no background remover: an opaque photo's whole frame becomes the subject) |
+| `mode` | Idol: `synthetic` (default; renders and generated images, the object fills the frame) or `real` (photographs: more margin round the object) |
+| `num_gaussians` | Idol: 32768-1048576, default 262144. The GLB holds one disc per Gaussian, so about twice that many triangles, and `max_tris` cannot thin it (every disc is its own UV island: 506136 triangles stayed 506136) |
+| `geometry` | Idol: `discs` (default) is a triangle mesh with a baked colour atlas and no roughness or normal maps, drawn solid by three.js, Godot, Unity and Blender (glass and haze show one layer); `splat` is the `KHR_gaussian_splatting` extension on one POINTS primitive, about 60 bytes a Gaussian, for splat viewers |
+| `crop_margin`, `rescale_t` | Idol: `crop_margin` (1-4) sets the margin round the object directly (`mode` picks 1.2 or 1.7); `rescale_t` (1-10, default 3) shifts the step schedule toward noise |
 | `images` | Pixal3D only, instead of `image`: 2-8 views of the same object, the first its front. Each is used as framed (never cropped), so the framing must match the cameras. 400 beside `image`, with one view, or on another model |
 | `cameras` | Pixal3D with `images`: one 4x4 camera-to-world matrix per view (Blender axes: Z up, the camera looks down its own -Z). Omitted = the reference's rig: 0/90/180/270 degrees around the object, level, so at most 4 views |
 | `fov` | Pixal3D: horizontal field of view of the picture(s) in degrees (1-120). For `image` that is the cutout as cropped to its subject; the reference estimates it with MoGe-2, which is not shipped, so the default is 49.1. With `images` the default is the rig's 20 |
@@ -204,9 +215,10 @@ minutes and hold a lot of memory: one at a time, unload the model after.
 | `resolution` | TRELLIS.2 and Pixal3D: 1024 (default, about 23 GB of free GPU memory) or 1536 (about 36 GB; a 400 names the shortfall); 512 only on packs that ship the 512 texture model (about 6 GB; `gen.mjs 3d --resolution 512`) |
 | `decimation_target`, `texture_size` | TRELLIS.2 and Pixal3D: faces kept (10000-2000000, default 300000) and texture side (512/1024/2048/4096, default 2048) |
 | `roughness_scale`, `clearcoat` | TRELLIS.2 and Pixal3D, the GLB's finish: `roughness_scale` (0.05-2) multiplies the model's roughness map, below 1 is glossier; `clearcoat` (0-1) adds a clear layer. Omitted = what the model predicted. Hunyuan3D refuses both by name |
-| `steps`, `guidance_scale`, `seed`, `texture_steps` | Hunyuan3D defaults 30 / 5.0 / 42 / 30; TRELLIS.2 and Pixal3D `steps` omitted = the published 12 |
+| `steps`, `guidance_scale`, `seed`, `texture_steps` | Idol defaults 50 / 3.0 / 42 (`guidance_scale` 0-20; 0 skips the unconditional pass, so each step takes half the time); Hunyuan3D 30 / 5.0 / 42 / 30; TRELLIS.2 and Pixal3D `steps` omitted = the published 12 |
 
-What each model needs: Hunyuan3D-2.1 one photo of the object; TRELLIS.2
+What each model needs: Idol (`speridlabs/idol`) one picture of one object on any background, and returns a GLB in glTF's Y up;
+Hunyuan3D-2.1 one photo of the object; TRELLIS.2
 (`microsoft/TRELLIS.2-4B`) one cutout, its alpha the subject; Pixal3D
 (`TencentARC/Pixal3D`) one cutout the same way, or several posed views (the
 pack's `pipeline_mv.json` models). TRELLIS.2 and Pixal3D return a textured PBR
@@ -231,11 +243,12 @@ wheel spokes) with a mottled body texture and lumpy wheels; TRELLIS.2 gave a smo
 cleaner body and wheels but turned glass into black patches with white speckles and
 the rear window into a black blob. That red coupe was at 1024.
 
-Which to use: for a car or other hard-surface object from a MOSS photo, use TRELLIS.2 at `"resolution": 1536`
+Which to use: Idol, unless the job needs what only a mesh model gives (PBR maps, a triangle budget, a car), and then name
+the model in `"model"`. For a car or other hard-surface object from a MOSS photo, use TRELLIS.2 at `"resolution": 1536`
 (about 36 GB of free GPU memory; 1024 where less is free) and `"texture_size": 2048`. On a blue rally hatchback at those settings (same photo, same seed, M5 Ultra)
 TRELLIS.2 kept the spoked rims, round headlights, bumper vents, rear lights, mudflaps and roof scoop and took
 250-270 s; Pixal3D came out soft and mottled with flat wheels and took 360-420 s. Two cars is a small sample
-(the red coupe above went Pixal3D's way on glass and rear detail at 1024), so treat TRELLIS.2 as the default.
+(the red coupe above went Pixal3D's way on glass and rear detail at 1024), so treat TRELLIS.2 as the mesh model to name.
 Pixal3D is the choice for several posed views (`images`), the only mode TRELLIS.2 does not have.
 
 A model's roughness map is nearly flat (a car's paint, trim and wheels all come out near 0.58), so the finish is

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump the Qwen-Image-2.1 parity fixtures for src/qwen_image.zig.
+"""Dump the Qwen-Image-2.1 parity fixtures for src/plugins/qwen_image/qwen_image.zig.
 
 Builds a TINY random-weight DiT + VAE with the pure-MLX reference classes
 (mflux PR #736, ivanfioravanti/mflux@qwen-image-2.1), writes them as a pack in

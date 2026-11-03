@@ -1,58 +1,27 @@
 import XCTest
 @testable import MLXCore
 
+/// Voice needs two things: the microphone and our own speech-to-text model (Qwen3-ASR). Apple's dictation is gone.
 final class VoicePreflightTests: XCTestCase {
 
-    private func snap(mic: Bool = true, speech: Bool = true, onDevice: Bool = true,
-                      locale: String = "en_US") -> VoicePreflight.Snapshot {
-        .init(micAuthorized: mic, speechAuthorized: speech, onDeviceAvailable: onDevice, locale: locale)
+    func testTheMicComesFirstThenTheSpeechModel() {
+        XCTAssertNil(VoicePreflight.firstIssue(.init(micAuthorized: true, asrReady: true)))
+        XCTAssertEqual(VoicePreflight.firstIssue(.init(micAuthorized: false, asrReady: false)), .microphoneDenied)
+        XCTAssertEqual(VoicePreflight.firstIssue(.init(micAuthorized: true, asrReady: false)), .asrMissing)
     }
 
-    func testNoIssueWhenEverythingIsReady() {
-        XCTAssertNil(VoicePreflight.firstIssue(snap()))
+    /// The chat window with a model that hears the recording asks for no words, so it needs no Qwen3-ASR.
+    func testNoSpeechModelIsNeededWhereNoWordsAreAsked() {
+        XCTAssertTrue(VoicePreflight.asrReady(wantsWords: false, onDisk: false))
+        XCTAssertFalse(VoicePreflight.asrReady(wantsWords: true, onDisk: false))
+        XCTAssertTrue(VoicePreflight.asrReady(wantsWords: true, onDisk: true))
     }
 
-    func testIssueOrderingMicThenSpeechThenModel() {
-        // Mic wins even if everything else is also missing.
-        XCTAssertEqual(VoicePreflight.firstIssue(snap(mic: false, speech: false, onDevice: false)),
-                       .microphoneDenied)
-        // Mic ok → speech is next.
-        XCTAssertEqual(VoicePreflight.firstIssue(snap(mic: true, speech: false, onDevice: false)),
-                       .speechDenied)
-        // Mic + speech ok → the on-device model (the user's actual case).
-        XCTAssertEqual(VoicePreflight.firstIssue(snap(mic: true, speech: true, onDevice: false, locale: "fr_FR")),
-                       .dictationUnavailable(locale: "fr_FR"))
-    }
-
-    func testEveryIssueHasNonEmptyCopy() {
-        let issues: [VoicePreflight.Issue] = [
-            .microphoneDenied, .speechDenied, .dictationUnavailable(locale: "en_US"),
-        ]
-        for issue in issues {
-            XCTAssertFalse(VoicePreflight.shortMessage(for: issue).isEmpty)
-            XCTAssertFalse(VoicePreflight.detail(for: issue).isEmpty)
-            XCTAssertFalse(VoicePreflight.actionLabel(for: issue).isEmpty)
-        }
-    }
-
-    func testDictationDetailNamesTheLocaleAndDictation() {
-        let detail = VoicePreflight.detail(for: .dictationUnavailable(locale: "fr_FR"))
-        XCTAssertTrue(detail.contains("fr_FR"))
-        XCTAssertTrue(detail.contains("Dictation"))
-    }
-
-    func testSettingsURLsAreValidAndPaneSpecific() throws {
-        let mic = VoicePreflight.settingsURLString(for: .microphoneDenied)
-        let speech = VoicePreflight.settingsURLString(for: .speechDenied)
-        let dict = VoicePreflight.settingsURLString(for: .dictationUnavailable(locale: "en_US"))
-        // Each must parse as a URL (NSWorkspace.open needs a valid URL).
-        XCTAssertNotNil(URL(string: mic))
-        XCTAssertNotNil(URL(string: speech))
-        XCTAssertNotNil(URL(string: dict))
-        // …and point at the right pane.
-        XCTAssertTrue(mic.contains("Privacy_Microphone"))
-        XCTAssertTrue(speech.contains("Privacy_SpeechRecognition"))
-        XCTAssertTrue(dict.contains("keyboard"))
-        XCTAssertTrue(mic.hasPrefix("x-apple.systempreferences:"))
+    func testTheMissingSpeechModelOffersItsDownloadNotASettingsPane() {
+        XCTAssertNil(VoicePreflight.settingsURLString(for: .asrMissing))
+        XCTAssertTrue(VoicePreflight.actionLabel(for: .asrMissing).contains("Download"))
+        XCTAssertTrue(VoicePreflight.detail(for: .asrMissing).contains("Qwen3-ASR"))
+        let mic = try? XCTUnwrap(VoicePreflight.settingsURLString(for: .microphoneDenied))
+        XCTAssertTrue(mic?.contains("Privacy_Microphone") == true)
     }
 }

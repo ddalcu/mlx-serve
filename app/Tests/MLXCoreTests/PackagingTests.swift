@@ -114,11 +114,13 @@ final class PackagingTests: XCTestCase {
                      "the store build has no AppleScript automation")
     }
 
-    /// The mic + speech usage strings must survive — Voice mode still ships.
-    func testMASInfoPlistKeepsMicAndSpeechUsageStrings() throws {
-        let info = try plist("Info-MAS.plist")
-        XCTAssertNotNil(info["NSMicrophoneUsageDescription"])
-        XCTAssertNotNil(info["NSSpeechRecognitionUsageDescription"])
+    /// Voice needs the microphone only: speech is transcribed by our own server, never Apple's dictation.
+    func testInfoPlistsAskForTheMicAndNeverForSpeechRecognition() throws {
+        for name in ["Info.plist", "Info-MAS.plist"] {
+            let info = try plist(name)
+            XCTAssertNotNil(info["NSMicrophoneUsageDescription"], name)
+            XCTAssertNil(info["NSSpeechRecognitionUsageDescription"], name)
+        }
     }
 
     // MARK: privacy manifest

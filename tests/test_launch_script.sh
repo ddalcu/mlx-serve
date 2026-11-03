@@ -1,15 +1,18 @@
 #!/bin/bash
-# GET /launch: the web console's Code Launcher. The page shows
-# `curl -fsSL <server>/launch?agent=<a>&model=<id> | sh`; the script must write
-# the agent's configs on the machine that runs it and start the agent against
-# the host the request reached.
+# test_launch_script.sh — GET /launch, the web console's Code Launcher (`curl -fsSL <server>/launch?agent=<a>&model=<id>
+# | sh`): unknown or unoffered agent 400, unknown model 404, a quote-breaking Host or `base` 400; the script's base URL
+# is the console's `base` (scheme + path prefix kept) else the Host reached, and it parses (`sh -n`). Piped to `sh`
+# with fake agents it writes pi's models.json + settings + skill link and starts pi; a rerun keeps an edited skill and
+# settings; opencode2 resolves a 2.x `opencode`. On a terminal (`expect`) the agent's stdin is the terminal device,
+# never a reopened /dev/tty.
 #
-# FULLY HERMETIC: the models are stub dirs holding a config.json (nothing
-# loads), the agents and the login shell are fakes on PATH, HOME is scratch.
+#   ./tests/test_launch_script.sh [port]   # MLX_SERVE_BIN picks the binary
 #
-# Usage: ./tests/test_launch_script.sh [port]
+# FULLY HERMETIC: stub models, fake agents + login shell on PATH, scratch HOME. Hermetic twins: `served launch script`,
+# pickEntry, webLaunchable, launchBaseUrl.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8133}
 BASE="http://127.0.0.1:$PORT"
@@ -48,11 +51,7 @@ HOME="$T/server-home" "$BIN" serve --host 127.0.0.1 --port "$PORT" --model-dir "
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
-for i in $(seq 1 30); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    [ "$i" -eq 30 ] && { echo "FAIL: server did not start"; cat "$T/server.log"; exit 1; }
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || { echo "FAIL: server did not start"; cat "$T/server.log"; exit 1; }
 
 run_test() {
     TOTAL=$((TOTAL+1))

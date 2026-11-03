@@ -92,5 +92,9 @@ extension MusicModelPreset {
 }
 
 extension Model3DModelPreset {
-    var capabilityLabel: String { "Best for turning a photo into a 3D model" }
+    /// A splat is a different job from a mesh (a point cloud of Gaussians, not a surface to texture), so Idol
+    /// is featured on its own beside the best mesh model.
+    var capabilityLabel: String {
+        family == .idol ? "Best for turning a photo into a Gaussian splat" : "Best for turning a photo into a 3D model"
+    }
 }

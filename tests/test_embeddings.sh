@@ -1,38 +1,21 @@
 #!/bin/bash
-# /v1/embeddings end-to-end test (encoder-only BERT models; check 4c: a decoder-arch embedder).
+# test_embeddings.sh — /v1/embeddings end to end. [1-4] encoder BERT (EMBED_TEST_MODEL, default bge-small-en-v1.5-8bit):
+# OpenAI shape, batched == single cosine across mixed lengths (padding mask + masked mean-pool), > EMBED_MAX_BATCH,
+# `dimensions` (truncate + L2 renorm; out of range 400), 400 on generation, hot-load + stub capability beside a chat
+# default, load-by-absolute-path (incl. the `\/` JSON form), the CLS name-fallback boot log, `embedding_max_length`
+# and the over-limit 400. [4c] a decoder embedder (QWEN3_EMBED_TEST_MODEL, Qwen3-Embedding-0.6B): sub-batches equal
+# the same inputs alone, then the server still answers. [4d] EmbeddingGemma 2 (EG2_TEST_MODEL): unit vectors, the
+# card's ranking, the 512 band, `dimensions=256`, the 8192 400, and `messages` with images and video frames (sizes,
+# token counts, order, the named refusals). [5] hot-load from a chat server (CHAT_TEST_MODEL). Missing models SKIP.
 #
-# Embeddings are served by a batched GPU forward: every request's inputs are
-# tokenized up front, padded per EMBED_MAX_BATCH chunk, and run through ONE
-# masked encoder forward instead of one forward per text. The padding mask +
-# masked mean-pool are exactly what a per-text loop computes, so batched
-# results must match singles — this script pins that equivalence from the
-# HTTP surface, where a mask bug would silently skew every padded row.
+#   ./tests/test_embeddings.sh [port]
 #
-# This test asserts:
-#   1. single input: OpenAI list shape, non-empty unit-norm vector, usage
-#   2. mixed-length batch: each row cosine-matches its single-input result
-#      (>= 0.999), distinct texts stay distinct, order preserved
-#   3. a batch larger than EMBED_MAX_BATCH (80 inputs) round-trips intact
-#   4. generation endpoints reject encoder-only models with a 400
-#   4c. a decoder-arch embedder (Qwen3-Embedding) matches singles across
-#      sub-batches and survives them (skipped when the model is missing)
-#   4d. EmbeddingGemma 2: a batch whose long row crosses the sliding band
-#      matches its singles with finite vectors, the card's retrieval example
-#      ranks Mars first, `dimensions` truncates; `messages` carries images and
-#      video (sizes, token counts, order, refusals) (skipped when the model is missing)
-#   5. hot-load: a chat-model server embeds via "model": "<encoder-id>"
-#      (skipped when the chat model is missing)
-#
-# Requires:
-#   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
-#   - EMBED_TEST_MODEL or ~/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit
-#   - (check 4c only) QWEN3_EMBED_TEST_MODEL or ~/.mlx-serve/models/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ
-#   - (check 4d only) EG2_TEST_MODEL or ~/.mlx-serve/models/google/embeddinggemma-2
-#   - (check 5 only) CHAT_TEST_MODEL or ~/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4
-#
-# Usage: ./tests/test_embeddings.sh [port]
+# Hermetic twins: buildPaddedBatch / maskedMeanPoolNormalize / embedSubBatchEnd, the EmbeddingGemma 2 tiny-fixture
+# tests (tests/dump_embeddinggemma2_fixtures.py). Real-checkpoint parity: tests/dump_embeddinggemma{,2_media}*.py.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-11329}
 BASE="http://127.0.0.1:$PORT"
@@ -41,8 +24,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-EMBED_MODEL="${EMBED_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit}"
-CHAT_MODEL="${CHAT_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4}"
+EMBED_MODEL="${EMBED_TEST_MODEL:-$(find_model mlx-community/bge-small-en-v1.5-8bit || echo "$HOME/.mlx-serve/models/mlx-community/bge-small-en-v1.5-8bit")}"
+CHAT_MODEL="${CHAT_TEST_MODEL:-$(find_model mlx-community/Qwen3-0.6B-nvfp4 || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3-0.6B-nvfp4")}"
 if [ ! -d "$EMBED_MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_embeddings: encoder model not found at $EMBED_MODEL"
     exit 0
@@ -69,14 +52,11 @@ start_server() {
     local logfile="$1"; shift
     "$BINARY" --serve --port "$PORT" "$@" > "$logfile" 2>&1 &
     SERVER_PID=$!
-    for i in $(seq 1 60); do
-        curl -s -f "$BASE/health" > /dev/null 2>&1 && return 0
-        sleep 1
-    done
+    srv_wait_health "$BASE" 60 1 && return 0
     echo -e "${RED}FAIL${NC} server did not become healthy"; tail -5 "$logfile"; return 1
 }
 stop_server() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; }
-trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
 embed() { # embed <json-input> [model]
     local input="$1" model="${2:-mlx-serve}"
@@ -244,7 +224,7 @@ stop_server
 # --- 4c. decoder-arch embedder across sub-batches ---
 # Qwen3-Embedding forwards through the KV cache, and a request past EMBED_TOKEN_BUDGET
 # (64 x 512 padded tokens) splits into sub-batches that must each start from an empty one.
-QWEN3_EMBED_MODEL="${QWEN3_EMBED_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ}"
+QWEN3_EMBED_MODEL="${QWEN3_EMBED_TEST_MODEL:-$(find_model mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3-Embedding-0.6B-4bit-DWQ")}"
 echo "=== /v1/embeddings: decoder-arch embedder across sub-batches ==="
 if [ ! -d "$QWEN3_EMBED_MODEL" ]; then
     echo -e "  ${YELLOW}SKIP${NC} Qwen3-Embedding model not found at $QWEN3_EMBED_MODEL"
@@ -322,7 +302,7 @@ fi
 # A batch pads its short rows out to the long one. Past the band radius (512) a padded query sees
 # only padding in the sliding layers, and a NaN row there reaches the real rows through V in every
 # later layer: the long row below crosses the band, and every vector must come back finite.
-EG2_MODEL="${EG2_TEST_MODEL:-$HOME/.mlx-serve/models/google/embeddinggemma-2}"
+EG2_MODEL="${EG2_TEST_MODEL:-$(find_model google/embeddinggemma-2 || echo "$HOME/.mlx-serve/models/google/embeddinggemma-2")}"
 echo "=== /v1/embeddings: EmbeddingGemma 2 ==="
 if [ ! -d "$EG2_MODEL" ]; then
     echo -e "  ${YELLOW}SKIP${NC} EmbeddingGemma 2 not found at $EG2_MODEL"

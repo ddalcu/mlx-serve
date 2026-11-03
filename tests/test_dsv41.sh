@@ -1,24 +1,17 @@
 #!/bin/bash
-# DeepSeek-V4.1-Flash (deepseek_v41: src/deepseek_v41.zig, the EXL3 repack on
-# mlx-stream) live end-to-end, env-gated on a pack (loading takes minutes and
-# wants the machine otherwise idle; DSV41_TEST_FLAGS adds server flags, e.g.
-# --no-mtp to disable drafting, without unloading mlx-stream's stages):
+# test_dsv41.sh — DeepSeek-V4.1-Flash live end to end on any pack (MLX packs, the EXL3 repack with streamed experts):
+# template A/B vs the release encoder (when encoding/ is staged), greedy raw answer, both thinking arms, stream ==
+# non-stream, spaced-DSML tool call + round trip, single-flight (a concurrent request queues, byte-equal to solo, no
+# leak), prefix resume (a repeat resumes one token short and keeps the bytes; a fresh prompt starts over),
+# the repack's experts streamed from its bank. DSV41_TEST_DSPARK=1: rounds engaged, a --no-mtp boot keeps the greedy bytes,
+# a sampled seeded request engages the lane and repeats byte-equal from cold, two requests at once run group rounds. [9] with a tower: house.jpeg on the
+# release's 35x53 grid as 230 span tokens, the street signs read, a /v1/messages image block, a warm repeat.
 #
-#   DSV41_TEST_MODEL=~/.mlx-serve/models/OpensourceWTF/DeepSeek-V4.1-Flash-streaming-repack-exl3-3.0bpw \
-#       ./tests/test_dsv41.sh
+#   DSV41_TEST_MODEL=<pack> ./tests/test_dsv41.sh   # DSV41_TEST_PORT (11353), DSV41_TEST_FLAGS (e.g. --no-mtp)
 #
-# Pins: the embedded template against the release encoder (when staged), the
-# default thinking arm and the off arm, stream == non-stream bytes, V4.1's
-# spaced DSML tool calls (call -> result -> answer), and single-flight
-# admission (module-owned decode state). DSV41_TEST_DSPARK=1 checks DSpark (on
-# by default): its rounds engaged, and a second, serial boot (--no-mtp) keeps
-# the same greedy bytes (the EXL3 repack on mlx-stream drafts with typical
-# acceptance, so there the serial boot must answer without arming DSpark).
-# [9] on a pack with the tower: house.jpeg on the release's 35x53 grid as 230
-# span tokens, the street signs read, a /v1/messages image block, the image
-# turn resumed on a repeat.
-# Hermetic counterparts: the DSV41_TINY fixture tests, `chat: the embedded V4.1
-# template ...`, and the format-corpus "dsv41-dsml" family.
+# SKIPs without the env var. Hermetic twins: DSV41_TINY fixture tests (MLX_ENABLE_TF32=0), corpus "dsv41-dsml",
+# dsv41 vision plan/letterbox/patch tests. Parity: tests/dump_dsv41_vision_fixtures.py then DSV41_VISION_MODEL /
+# DSV41_VISION_FIXTURE with `zig build test-build -Doptimize=ReleaseFast -Dtest-filter="dsv41 vision"`.
 
 set -euo pipefail
 
@@ -87,17 +80,14 @@ post() { # path, body
 text_of() { python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['text'])"; }
 
 speculation_contract() { # enabled: default boot (1) or --no-mtp boot (0)
-    local native=()
-    [ -f "$MODEL/experts.bin" ] && native=(--native)
     python3 "$(dirname "$0")/test_dsv41_speculation.py" \
-        --url "http://127.0.0.1:$PORT" --log "$LOG" --expect-enabled "$1" \
-        --model mlx-serve ${native[@]+"${native[@]}"}
+        --url "http://127.0.0.1:$PORT" --log "$LOG" --expect-enabled "$1" --model mlx-serve
 }
 
 boot
 
 # [1] Raw completion, greedy.
-RAW=$(post /v1/completions '{"model":"mlx-serve","prompt":"The capital of France is","max_tokens":8,"temperature":0}' | text_of)
+RAW=$(post /v1/completions '{"model":"mlx-serve","prompt":"The capital of France is","max_tokens":16,"temperature":0}' | text_of)
 check "raw greedy answer" "$RAW" "Paris"
 
 # [2] Thinking off: content, no think markup.
@@ -165,13 +155,18 @@ else
 fi
 check "single-flight marker answered" "$MARKER" 'Kangaroo'
 refuse "single-flight no cross-request leak" "$CONC" 'Kangaroo'
+# [7a] Embeddings: refused by name before any forward, and the conversation state is untouched (a repeat is solo).
+EMB=$(post /v1/embeddings '{"model":"mlx-serve","input":"hello"}')
+check "embeddings refused by name" "$EMB" 'does not serve embeddings'
+AFTER_EMB=$(post /v1/completions "$SF_BODY" | text_of)
+if [ "$AFTER_EMB" = "$SOLO" ]; then echo "PASS: greedy bytes unchanged after an embeddings request"; pass=$((pass+1)); else echo "FAIL: greedy bytes changed after an embeddings request"; fail=$((fail+1)); fi
 refuse "no MLX error" "$(cat "$LOG")" '[mlx]'
 
 # [7b] Prefix resume (one conversation): a repeat resumes one token short of its prompt and keeps the
 # greedy bytes; a different prompt after it starts fresh, and the first prompt again matches.
 R1=$(post /v1/completions "$SF_BODY" | text_of)
 R2=$(post /v1/completions "$SF_BODY" | text_of)
-check "repeat resumed" "$(grep '\[dsv41\] resumed' "$LOG" | tail -1)" 'resumed'
+check "repeat resumed" "$(grep -qE '\[dsv41\] resumed|module restored' "$LOG" && echo resumed)" 'resumed'
 OTHER=$(post /v1/completions '{"model":"mlx-serve","prompt":"<｜begin▁of▁sentence｜><｜User｜>Name the three primary colors.<｜Assistant｜></think>","max_tokens":32,"temperature":0}')
 check "fresh prompt after a resume" "$OTHER" '"finish_reason"'
 R3=$(post /v1/completions "$SF_BODY" | text_of)
@@ -181,9 +176,9 @@ else
     echo "FAIL: resumed or fresh greedy bytes differ"
     for r in "$R1" "$R2" "$R3"; do echo "  $(echo "$r" | head -c 200)"; done; fail=$((fail+1))
 fi
-# The EXL3 repack runs on mlx-stream.
+# The EXL3 repack's routed experts stream from its bank.
 if [ -f "$MODEL/experts.bin" ]; then
-    check "mlx-stream serves the repack" "$(grep '\[mlx-stream\] loaded' "$LOG" || true)" 'tensors from'
+    check "the repack streams its experts" "$(grep 'deepseek_v41: streamed experts' "$LOG" || true)" 'slot rows per layer'
 fi
 
 # [9] Images, on a pack that ships the tower. The grid and token accounting come from the log (a run of
@@ -258,14 +253,27 @@ if [ "${DSV41_TEST_DSPARK:-0}" = "1" ]; then
     else
         echo "FAIL: seeded sampled repeat differs"; echo "  1: $(echo "$S1" | head -c 200)"; echo "  2: $(echo "$S2" | head -c 200)"; fail=$((fail+1))
     fi
+    # [8b] Two requests at once keep drafting, as one DSpark group round, instead of decoding plain side by side.
+    GROUP='{"model":"mlx-serve","prompt":"<｜begin▁of▁sentence｜><｜User｜>Write a Python function that merges two sorted lists, with a docstring and three asserts.<｜Assistant｜></think>","max_tokens":160,"temperature":0}'
+    G_FILE=$(mktemp /tmp/dsv41_group.XXXXXX)
+    post /v1/completions "$GROUP" > "$G_FILE" &
+    G_PID=$!
+    G2=$(post /v1/completions "$GROUP" | text_of)
+    wait "$G_PID" || true
+    G1=$(text_of < "$G_FILE" 2>/dev/null || echo "")
+    rm -f "$G_FILE"
+    check "dspark group rounds engaged" "$(grep -o 'group_rounds=[1-9][0-9]*' "$LOG" || true)" 'group_rounds='
+    if [ -n "$G1" ] && [ -n "$G2" ]; then
+        echo "PASS: both grouped requests answered"; pass=$((pass+1))
+    else
+        echo "FAIL: a grouped request came back empty"; fail=$((fail+1))
+    fi
+    refuse "grouped rounds no MLX error" "$(cat "$LOG")" '[mlx]'
     cleanup; SERVER_PID=""
     boot --no-mtp
     speculation_contract 0
     SERIAL=$(post /v1/completions "$SF_BODY" | text_of)
-    if [ -f "$MODEL/experts.bin" ]; then
-        # mlx-stream's lane accepts drafts by typical acceptance: greedy text may differ from serial.
-        if [ -n "$SERIAL" ]; then echo "PASS: serial boot answers"; pass=$((pass+1)); else echo "FAIL: serial boot answered nothing"; fail=$((fail+1)); fi
-    elif [ "$SERIAL" = "$SOLO" ]; then
+    if [ "$SERIAL" = "$SOLO" ]; then
         echo "PASS: dspark greedy == serial"; pass=$((pass+1))
     else
         echo "FAIL: dspark greedy != serial"; echo "  dspark: $(echo "$SOLO" | head -c 300)"; echo "  serial: $(echo "$SERIAL" | head -c 300)"; fail=$((fail+1))
