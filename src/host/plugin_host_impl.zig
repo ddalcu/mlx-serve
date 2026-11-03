@@ -256,6 +256,7 @@ const shims: ?type = if (@import("build_options").mlx_stream) struct {
     pub extern "c" fn dsv41_alloc_uninit(out: *mlx.mlx_array, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int;
     pub extern "c" fn dsv41_alloc_last_error() [*:0]const u8;
     pub extern "c" fn dsv41_alloc_alias(out: *mlx.mlx_array, base: mlx.mlx_array, offset: u64, shape: [*]const c_int, ndim: usize, dtype: mlx.mlx_dtype) c_int;
+    pub extern "c" fn dsv41_command_buffer_limits(ops: c_int, mb: c_int, prev_ops: *c_int, prev_mb: *c_int) c_int;
     pub extern "c" fn mlxlc_kernel_new(name: [*:0]const u8, input_names: mlx.mlx_vector_string, output_names: mlx.mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx.mlx_fast_metal_kernel;
     pub extern "c" fn mlxlc_kernel_free(k: mlx.mlx_fast_metal_kernel) void;
     pub extern "c" fn mlxlc_apply(outputs: *mlx.mlx_vector_array, k: mlx.mlx_fast_metal_kernel, inputs: mlx.mlx_vector_array, config: mlx.mlx_fast_metal_kernel_config, stream: mlx.mlx_stream) c_int;
@@ -275,6 +276,7 @@ pub const gpu_table: abi.HostGpu = .{
     .launch = launch,
     .buffer_addresses = bufferAddresses,
     .alias = allocAlias,
+    .command_buffer_limits = commandBufferLimits,
 };
 
 const unsupported = abi.Verdict.refuse(.unsupported, "HostGpu is not built on this graph");
@@ -359,6 +361,11 @@ fn allocAlias(_: ?*anyopaque, base: abi.Array, offset: u64, shape: [*]const i32,
     const s = shims orelse return unsupported;
     const dt = std.enums.fromInt(mlx.mlx_dtype, dtype) orelse return abi.Verdict.refuse(.failed, "alias: unknown dtype");
     if (s.dsv41_alloc_alias(@ptrCast(out), .{ .ctx = base.ctx }, offset, shape, ndim, dt) != 0) return refused("alias", s.dsv41_alloc_last_error());
+    return .ok;
+}
+fn commandBufferLimits(_: ?*anyopaque, ops: i32, mb: i32, prev_ops: *i32, prev_mb: *i32) callconv(.c) abi.Verdict {
+    const s = shims orelse return unsupported;
+    if (s.dsv41_command_buffer_limits(ops, mb, prev_ops, prev_mb) != 0) return refused("command_buffer_limits", s.dsv41_alloc_last_error());
     return .ok;
 }
 

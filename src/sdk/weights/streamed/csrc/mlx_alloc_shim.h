@@ -23,6 +23,11 @@ const char *dsv41_alloc_last_error(void);
  * within base's buffer. 0, or -1 (dsv41_alloc_last_error). */
 int dsv41_alloc_alias(mlx_array *out, mlx_array base, uint64_t offset, const int *shape, size_t ndim, mlx_dtype dtype);
 
+/* MLX's command-buffer split on the Metal device: ops operations and mb MB of bound arrays a buffer takes before it is
+ * committed (below 1 keeps the current one); the previous pair in *prev_ops / *prev_mb. 0, or -1
+ * (dsv41_alloc_last_error). */
+int dsv41_command_buffer_limits(int ops, int mb, int *prev_ops, int *prev_mb);
+
 #ifdef __cplusplus
 }
 #endif

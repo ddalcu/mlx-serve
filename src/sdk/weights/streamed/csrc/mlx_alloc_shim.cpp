@@ -5,6 +5,7 @@
 // Built against MLX 0.32.2's headers: re-verify on every MLX bump.
 #include <mach/vm_page_size.h>
 
+#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <string>
@@ -132,6 +133,25 @@ int dsv41_alloc_alias(mlx_array* out, mlx_array base, uint64_t offset, const int
     return -1;
   } catch (...) {
     g_error = "dsv41_alloc_alias failed";
+    return -1;
+  }
+}
+
+// MLX's command-buffer split (patches/mlx-metal-command-buffer-limits.patch: Device::set_max_ops_mb_per_buffer, its
+// pair atomic). The members stay an int's size and alignment, so the Device's layout is the unpatched one's.
+static_assert(sizeof(std::atomic<int>) == sizeof(int) && alignof(std::atomic<int>) == alignof(int));
+
+int dsv41_command_buffer_limits(int ops, int mb, int* prev_ops, int* prev_mb) {
+  try {
+    auto [o, m] = mx::metal::device(mx::Device::gpu).set_max_ops_mb_per_buffer(ops, mb);
+    *prev_ops = o;
+    *prev_mb = m;
+    return 0;
+  } catch (const std::exception& e) {
+    g_error = e.what();
+    return -1;
+  } catch (...) {
+    g_error = "dsv41_command_buffer_limits failed";
     return -1;
   }
 }

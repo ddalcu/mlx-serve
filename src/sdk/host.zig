@@ -8,15 +8,22 @@ pub const abi = @import("../abi/host.zig");
 pub const Host = struct {
     t: *const abi.Host,
 
-    /// The table a plugin was handed, refused by name when absent or older than this sdk's (a newer one is a superset).
+    /// The table a plugin was handed, refused by name when absent or older than this sdk's required members (a newer
+    /// one is a superset; `HostGpu`'s members past `gpu_min_size` are optional, see `commandBufferLimits`).
     pub fn of(raw: ?*const anyopaque) error{ NoHost, HostTooOld }!Host {
         const t: *const abi.Host = @ptrCast(@alignCast(raw orelse return error.NoHost));
-        if (t.size < @sizeOf(abi.Host) or t.gpu.size < @sizeOf(abi.HostGpu)) return error.HostTooOld;
+        if (t.size < @sizeOf(abi.Host) or t.gpu.size < abi.gpu_min_size) return error.HostTooOld;
         return .{ .t = t };
     }
 
     pub fn gpu(self: Host) *const abi.HostGpu {
         return self.t.gpu;
+    }
+
+    /// `HostGpu.command_buffer_limits`, or null on a host without it (a table that stops before it).
+    pub fn commandBufferLimits(self: Host) ?@FieldType(abi.HostGpu, "command_buffer_limits") {
+        const g = self.t.gpu;
+        return if (abi.gpuHas(g, "command_buffer_limits")) g.command_buffer_limits else null;
     }
 
     // ── Allocator ──
@@ -142,6 +149,13 @@ test "sdk host: a missing or older table is refused by name" {
     t.gpu = &old_gpu;
     try testing.expectError(error.HostTooOld, Host.of(&t));
     _ = try Host.of(fake.host());
+    // A HostGpu that stops before the optional members (a host older than them) is taken, and they read as null.
+    var pre_cbl = fake.gpu_table;
+    pre_cbl.size = abi.gpu_min_size;
+    var t2 = fake.table;
+    t2.gpu = &pre_cbl;
+    try testing.expect((try Host.of(&t2)).commandBufferLimits() == null);
+    try testing.expect((try Host.of(fake.host())).commandBufferLimits() != null);
 }
 
 test "sdk host: a lever is on only when set and not 0; a digest names source and header" {
