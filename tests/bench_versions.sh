@@ -1,42 +1,17 @@
 #!/bin/bash
-# bench_versions.sh — the SAME engine, two builds. Shipped app binary vs the
-# working-tree build, same models, same flags, llmprobe measuring both.
+# bench_versions.sh — the SAME engine, two builds: the shipped app binary (`shipped`) vs the working-tree build (`dev`),
+# same models and flags, llmprobe --bench-only measuring both (tests/bench.sh owns the release record). Arms are named
+# by BUILD (both report one --version); the CSV header records the binaries' mtimes. A model's two arms run back to
+# back and the first arm alternates by row (a ratio is honest only within a session). Short-context cells are expected
+# to tie: read the rung columns.
 #
-# This is not a cross-engine bench: `tests/bench.sh` owns that, and its CSVs
-# are the release record. This one answers a narrower question — "did the tree
-# get faster than what shipped, and where" — so it takes the same measurement
-# layer (llmprobe --bench-only) and varies ONLY the binary.
+#   ./tests/bench_versions.sh [--only <row>] [--skip <row>] [--list] [--resume <tag>]
 #
-#   ./tests/bench_versions.sh                    # every model, both arms
-#   ./tests/bench_versions.sh --only muse-30b    # one row
-#   ./tests/bench_versions.sh --resume <tag>     # pick up where a run stopped
-#   ./tests/bench_versions.sh --skip inkling-small-2bit   # leave a row for later
-#   ./tests/bench_versions.sh --list             # matrix + what each row proves
-#
-# PAUSE / RESUME. Every (model, arm) is a UNIT recorded in state.tsv the moment
-# it finishes. `touch <rundir>/PAUSE` and the runner stops at the next unit
-# boundary and waits for the file to disappear — so a model swap, a meeting, or
-# a reboot never costs more than the unit in flight. Ctrl-C is safe: rerun with
-# `--resume <tag>` and completed units are skipped, not re-measured.
-#
-# WHY THE LADDER IS THE CHART. Both binaries are byte-identical at short
-# context; the sliding-window block trim only pays once the cache is past the
-# window. The headline decode/prefill/TTFT cells will show ~nothing and that is
-# CORRECT — read the rung columns.
-#
-# ARM LABELLING. Both builds report the same --version string, so the arms are
-# named for their BUILD (`shipped` = the .app, `dev` = zig-out), and the CSV
-# header records the binary mtimes. Never label these by version number.
-#
-# THERMAL. The two arms of a model run back-to-back in one session, because a
-# ratio is only honest within a session (a cold box and a soaked box are
-# different machines). Which arm goes FIRST alternates by row, so the warm-up
-# advantage lands on `shipped` half the time and `dev` the other half instead
-# of systematically favouring one.
-#
-# Requirements: node (npx), python3 + matplotlib, curl, and a ReleaseFast build
-# (`zig build -Doptimize=ReleaseFast` — Debug is 2-4x slower = a fake win).
+# Every (model, arm) is a unit recorded in state.tsv: `touch <rundir>/PAUSE` stops at the next unit boundary,
+# Ctrl-C is safe, `--resume <tag>` skips finished units. Needs node (npx), python3 + matplotlib, a ReleaseFast build.
+
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -177,11 +152,7 @@ run_unit() {
     local pid=$!
 
     local up=0
-    for _ in $(seq 1 900); do
-        curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { up=1; break; }
-        kill -0 $pid 2>/dev/null || break
-        sleep 1
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 900 1 "$pid" && up=1
     if [[ "$up" != "1" ]]; then
         echo -e "  ${RED}FAIL${NC} $name/$arm: server never came up"
         tail -15 "$slog" | sed 's/^/      /'

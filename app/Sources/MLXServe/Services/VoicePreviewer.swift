@@ -1,7 +1,6 @@
 import Foundation
 
-/// Plays a short sample of a Kokoro voice so the picker is auditionable rather
-/// than a list of names.
+/// Plays a short sample of a Kokoro or LFM3 voice so the picker is auditionable rather than a list of names.
 ///
 /// Previews are SUPERSEDED, not queued: clicking through five voices must play
 /// the fifth, not all five in a row. Each request takes a generation number and
@@ -19,7 +18,7 @@ final class VoicePreviewer: ObservableObject {
     /// Set when a preview could not be produced (model missing, server down).
     @Published private(set) var error: String?
 
-    typealias Synthesize = (_ text: String, _ voice: String) async -> Data?
+    typealias Synthesize = (_ text: String, _ voice: NeuralVoice) async -> Data?
     typealias Play = (Data) async -> Void
 
     private var synthesize: Synthesize
@@ -51,15 +50,13 @@ final class VoicePreviewer: ObservableObject {
         attached = true
         let tts = VoiceCloneTTS(server: server)
         let player = VoiceClonePlayer()
-        synthesize = { text, voice in
-            await tts.synthesize(text: text, voice: .kokoro(voice: voice))
-        }
+        synthesize = { text, voice in await tts.synthesize(text: text, voice: voice) }
         play = { data in await player.play(data) }
         stopPlayback = { player.stop() }
     }
 
-    /// Audition `spec` (a voice id, or a comma-separated blend).
-    func preview(_ spec: String) {
+    /// Audition `spec`: a Kokoro voice id (or a comma-separated blend), or with `engine: .lfm3` an LFM3 voice id.
+    func preview(_ spec: String, engine: VoiceEngine = .kokoro) {
         let voice = spec.trimmingCharacters(in: .whitespaces)
         guard !voice.isEmpty else { return }
 
@@ -72,12 +69,12 @@ final class VoicePreviewer: ObservableObject {
         inFlight = Task { [weak self] in
             guard let self else { return }
             let text = KokoroVoiceCatalog.previewSentence(for: voice)
-            let data = await self.synthesize(text, voice)
+            let data = await self.synthesize(text, engine == .lfm3 ? .lfm3(voice: voice) : .kokoro(voice: voice))
             // A newer preview started while this one was synthesizing — drop it
             // rather than talking over the voice the user actually wants.
             guard self.generation == gen else { return }
             guard let data else {
-                self.error = "Couldn't play a preview. The Kokoro model may not be downloaded yet."
+                self.error = "Couldn't play a preview. The voice model may not be downloaded yet."
                 self.active = nil
                 return
             }

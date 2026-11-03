@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump the MOSS-Image parity fixtures for src/moss_image.zig.
+"""Dump the MOSS-Image parity fixtures for src/plugins/moss_image/moss_image.zig.
 
 Builds a TINY random-weight pack with the reference classes themselves: the
 upstream `pipeline_moss_image.py` (MOSSImageTransformer + MOSSImageScheduler),

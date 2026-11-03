@@ -38,7 +38,7 @@ Yes, on 128 GB+ Apple Silicon Macs. Open the MLX-Serve Model Browser, pick DeepS
 
 ## What models are supported?
 
-Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next, Meta's Muse-Glimmer-30B, inclusionAI Ling 3.0, Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna S 2.1, Llama 3.x, Mistral, Nemotron-H, LFM2.5 (including the VL vision builds), and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace. Full table: [models.md](models.md).
+Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3.8 / 3-Next, Meta's Muse-Glimmer-30B, inclusionAI Ling 3.0, Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna S 2.1, Llama 3.x, Mistral, Nemotron-H, LFM2.5 (including the VL vision builds), and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace. Full table: [models.md](models.md).
 
 ## Can mlx-serve run Tencent's Hunyuan 3 (295B) locally?
 

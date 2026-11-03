@@ -72,15 +72,15 @@ Thousands more run too: any MLX model with a supported architecture, and any GGU
 
 ## Speed
 
-Decode speed in v26.10.3 on an M5 Ultra with 256 GB, on a code prompt, with speculative decoding on:
+Decode speed in v26.11.1 on an M5 Ultra with 256 GB, on a code prompt, with speculative decoding on:
 
 | Model | Tokens per second |
 |---|---:|
-| Qwen3.6 35B-A3B, 4-bit | 424 |
-| Qwen3.8 27B, 4-bit | 242 |
-| Gemma 4 E4B, 4-bit | 199 |
-| Gemma 4 26B-A4B, 4-bit | 186 |
-| Qwen3.8-Flash-Next, 4.7 bits | 175 |
+| Qwen3.6 35B-A3B, 4-bit | 421 |
+| Qwen3.8 27B, 4-bit | 243 |
+| Gemma 4 E4B, 4-bit | 200 |
+| Gemma 4 26B-A4B, 4-bit | 184 |
+| Qwen3.8-Flash-Next, 4.7 bits | 180 |
 
 On an M4 Max, the same models decode 10% to 51% faster than they did in v26.8. Every release is measured the same way in [benchmarks.md](benchmarks.md); speculative decoding and tuning are in [docs/performance.md](docs/performance.md).
 
@@ -91,6 +91,7 @@ On an M4 Max, the same models decode 10% to 51% faster than they did in v26.8. E
 - [CLI and server flags](docs/cli.md)
 - [The Mac app](docs/app.md), with the media tour
 - [Supported models](docs/models.md)
+- Write a plugin without rebuilding the server: [model](docs/plugin-model.md), [media](docs/plugin-media.md), [quant](docs/plugin-quant.md)
 - [Performance and tuning](docs/performance.md)
 - [Building from source](docs/building.md) and [NVIDIA GPUs](docs/CUDA.md)
 - [FAQ](docs/faq.md) and the [changelog](CHANGELOG.md)

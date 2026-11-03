@@ -478,6 +478,11 @@ struct ModelInfo {
     /// only BERT entries, loaded or stub). DocumentIndex uses this to pick a
     /// GPU embedder for folder indexing.
     var supportsEmbeddings: Bool = false
+    /// True when the model answers in speech itself (`output_modalities` holds `audio`: LFM3-Audio, Omni). Voice
+    /// mode then sends what the user said and plays what the model says, instead of dictation + a system voice.
+    var speaks: Bool = false
+    /// The voices a model that speaks answers in (`<language>-<female|male>`), as its row lists them.
+    var voices: [String] = []
     /// Raw `capabilities` array as the server sent it ("chat", "vision",
     /// "image", "video", "audio", "embeddings", …). `slotKind` classifies a
     /// registry entry into a tray slot from these.
@@ -529,10 +534,19 @@ struct ModelInfo {
     /// `<model>@<peer>` and requests are proxied to that host). nil = local.
     var lanPeer: String? = nil
     /// Set when this entry is a configured upstream provider (`provider`
-    /// badge, `src/providers.zig`). Routing is identical to a LAN peer — the
+    /// badge, `src/host/api/providers.zig`). Routing is identical to a LAN peer — the
     /// id is `<model>@<name>` and the server proxies — so `lanPeer` is set
     /// too; this field only decides the picker heading and the label.
     var provider: String? = nil
+    /// `agent_budget`: what an agent CLI declares for this model, as the server
+    /// computes it (`src/host/launch/budget.zig`). nil on a non-chat row or an older server.
+    var agentBudget: AgentBudget.Budget? = nil
+    /// `modality`: a media row's create pane ("image", "speech", "music", "sound",
+    /// "video", "3d", "decisions", "diarization"); nil for a language model.
+    var modality: String? = nil
+    /// `engines`: what can serve this pack ("mlx", "ane", "ds4", "llama") — the
+    /// Model Settings engine picker's choices. Empty on older servers.
+    var engines: [String] = []
 
     /// Whether this LAN-mirrored entry serves `capability` — the tray
     /// empty-state and the "On Your Network" pickers count through this, not
@@ -546,7 +560,7 @@ struct ModelInfo {
         guard lanPeer != nil else { return false }
         // "audio" is the MODALITY, and the server advertises a music backend
         // ADDITIVELY as ["audio","music"] on both the ready and stub paths
-        // (src/server.zig) — so a peer running ACE-Step or MiniMax Music 3
+        // (src/host/http/server.zig) — so a peer running ACE-Step or MiniMax Music 3
         // matched the Voice pane's "audio" ask and offered itself as a TTS
         // voice. Speech is audio-and-not-music; the Music pane's own "music"
         // ask was already exact, because no TTS backend advertises it.
@@ -1069,6 +1083,7 @@ struct LocalModel: Identifiable, Hashable {
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
+            || OutsidePlugins.served.chat.contains(modelType) || OutsidePlugins.served.media.contains(modelType)
     }
 
     /// True only for models physically in `~/.mlx-serve/models` (source
@@ -1113,6 +1128,7 @@ struct LocalModel: Identifiable, Hashable {
     var isChatPickable: Bool {
         guard defect == nil, !isDownloading else { return false }
         return kind == .base && isSupportedArchitecture && modelType != "bert" && modelType != "embedding_gemma2" && modelType != "qwen3_asr" && modelType != "qwen3_forced_aligner" && !isMediaModelType(modelType)
+            && !OutsidePlugins.served.media.contains(modelType)
     }
 
     /// Likely tool/function-calling support (name heuristic, shared with the

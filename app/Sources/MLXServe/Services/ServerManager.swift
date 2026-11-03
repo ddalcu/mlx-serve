@@ -74,12 +74,6 @@ class ServerManager: ObservableObject {
     @Published var batching: BatchingInfo?
     /// The Thunderbolt cluster this server hosts, from `/props`; nil when it hosts none.
     @Published var cluster: ClusterInfo?
-    /// Live throughput, nil when the server runs without `--metrics`.
-    @Published var throughput: ThroughputSnapshot?
-    /// Live decode / prefill tok/s, derived from the gauge delta between the
-    /// last two polls.
-    @Published var decodeTPSNow: Double?
-    @Published var prefillTPSNow: Double?
     @Published var port: UInt16 = 11234
     @Published var currentModelPath: String = ""
     @Published var lastError: String = ""
@@ -89,6 +83,12 @@ class ServerManager: ObservableObject {
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
     let api = APIClient()
+    /// What this server serves, counted day by day for the dashboard: polled for as long as the process runs. The one
+    /// reader of `/metrics.json`: the tray and the chat window's strip both show its rates.
+    private(set) lazy var usage = UsageTracker { [weak self] in
+        guard let self else { return nil }
+        return try? await self.api.fetchThroughput(port: self.port)
+    }
     /// True while the tray popover is on screen. Drives the live /props
     /// ticker — when the popover is closed there's nothing to render, so we
     /// stop polling entirely instead of burning 3 s ticks in the background.
@@ -262,7 +262,8 @@ class ServerManager: ObservableObject {
 
         errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
-            guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
+            if data.isEmpty { handle.readabilityHandler = nil; return }  // EOF: see ProcessRegistry.capture
+            guard let str = String(data: data, encoding: .utf8) else { return }
             // Pure off-main append. No `Task @MainActor`, no `DispatchQueue.main`,
             // no `@Published` publish — none of which the inference path can
             // afford. The log views poll `currentServerLogSnapshot()` on their
@@ -281,6 +282,7 @@ class ServerManager: ObservableObject {
             process = proc
             startHealthPolling()
             startLoadProgressPolling()
+            usage.start()
         } catch {
             status = .error(error.localizedDescription)
             lastError = error.localizedDescription
@@ -308,6 +310,7 @@ class ServerManager: ObservableObject {
         pollSource?.cancel()
         pollSource = nil
         stopLoadProgressPolling()
+        usage.stop()
         healthTask?.cancel()
         healthTask = nil
         healthTimer?.invalidate()
@@ -341,9 +344,6 @@ class ServerManager: ObservableObject {
         memoryInfo = nil
         specCost = nil
         batching = nil
-        throughput = nil
-        decodeTPSNow = nil
-        prefillTPSNow = nil
     }
 
     /// Distill a crashed server's stderr tail into one human-meaningful line for
@@ -405,6 +405,7 @@ class ServerManager: ObservableObject {
         pollSource?.cancel()
         pollSource = nil
         stopLoadProgressPolling()
+        usage.stop()
         healthTask?.cancel()
         healthTask = nil
         healthTimer?.invalidate()
@@ -652,13 +653,6 @@ class ServerManager: ObservableObject {
             batching = props.batching
             cluster = props.cluster
             await noteRegistryGeneration(props.registryGeneration)
-        }
-        if let snap = try? await api.fetchThroughput(port: port) {
-            if let prev = throughput {
-                decodeTPSNow = snap.decodeTPS(since: prev)
-                prefillTPSNow = snap.prefillTPS(since: prev)
-            }
-            throughput = snap
         }
         // `/v1/models` reads every model's config, so it is re-read only when
         // `registry_generation` says a load, unload or eviction (from any

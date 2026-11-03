@@ -1,15 +1,19 @@
 #!/bin/zsh
-# Same-boot qwen4_exp A/B harness (M4 Max numbers in docs/gotchas/engine-mlx.md;
-# the M5 box re-measures with the same script).
-#   tests/qwen4_ab.sh mtp <tag> [server flags...]     MTP vs serial per prompt, 3 reps interleaved, then MTP + plain concurrent
-#   tests/qwen4_ab.sh batched <tag> [server flags...] serial 3 reps per prompt, then 2-/4-stream prose + 2-stream 8.5k aggregate
-# Env: QWEN4_MODEL (pack), MLX_SERVE_BIN, QWEN4_AB_OUT (default ~/claude-tmp/qwen4-ab), QWEN4_AB_PORT.
-# Engine env (MLX_SERVE_MTP_TRACE, MLX_SERVE_HC_FUSED, ...) passes through to the server; --mtp-min-depth/--mtp-max-depth ride the server flags.
+# qwen4_ab.sh — same-boot qwen4_exp A/B harness (a measurement, not a pass/fail test). Prompt fixtures in
+# tests/fixtures/qwen4_ab/ (400-token code + prose, one 8.4k prompt); the nonce varies by rep, never by arm.
+#
+#   tests/qwen4_ab.sh mtp <tag> [server flags...]       MTP vs serial interleaved x3 per prompt, then MTP beside plain
+#   tests/qwen4_ab.sh batched <tag> [server flags...]   serial x3 per prompt, then 2-/4-stream prose + 2-stream 8.5k
+#
+# Env: QWEN4_MODEL (pack), MLX_SERVE_BIN (a control binary must sit in zig-out/bin/ for its rpath), QWEN4_AB_OUT
+# (~/claude-tmp/qwen4-ab), QWEN4_AB_PORT. Engine env (MLX_SERVE_DIAG=mtp-trace, ...) passes to the server.
+source "$(dirname "$0")/_lib_models.sh"
+
 setopt nonomatch
 mode=$1; tag=$2; shift 2
 D=${0:A:h}/fixtures/qwen4_ab
 O=${QWEN4_AB_OUT:-$HOME/claude-tmp/qwen4-ab}; mkdir -p $O
-PACK=${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}
+PACK=${QWEN4_MODEL:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit")}
 BIN=${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}
 PORT=${QWEN4_AB_PORT:-11414}
 LOG=$O/${mode}_$tag.log

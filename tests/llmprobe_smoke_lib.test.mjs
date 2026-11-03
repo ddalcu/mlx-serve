@@ -184,14 +184,6 @@ test("planCells: drafter cell only for a Gemma 4 target with a matching assistan
   assert.deepEqual(d.flags, ["--no-pld", "--no-mtp", "--drafter", "/d/assistant"]);
 });
 
-test("planCells: block-diffusion models never speculate — baseline cell only", () => {
-  const cells = planCells(
-    { id: "m", family: "diffusion_gemma", hasMtp: true, drafterPath: "/d" },
-    { kvCheck: true },
-  );
-  assert.deepEqual(cells.map((c) => c.id), ["none"]);
-});
-
 test("planCells: the KV-quant cells are a crash check on one model, at its real config", () => {
   const plain = planCells({ id: "m", family: "gemma4" }, { kvCheck: false });
   assert.ok(!plain.some((c) => c.id.startsWith("kv")));

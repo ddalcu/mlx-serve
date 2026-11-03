@@ -1,0 +1,276 @@
+{
+    "architectures": [
+        "Lfm3OmniForConditionalGeneration"
+    ],
+    "audio_encoder_config": {
+        "conv_channels": 256,
+        "hidden_size": 768,
+        "initializer_range": 0.02,
+        "model_type": "lfm3_omni_encoder",
+        "num_mel_bins": 128,
+        "sliding_window": 32,
+        "text_config": {
+            "_name_or_path": "",
+            "architectures": null,
+            "block_auto_adjust_ff_dim": true,
+            "block_ffn_dim_multiplier": 1.0,
+            "block_multiple_of": 256,
+            "bos_token_id": 1,
+            "chunk_size_feed_forward": 0,
+            "conv_L_cache": 3,
+            "conv_bias": false,
+            "dtype": null,
+            "eos_token_id": null,
+            "full_attn_idxs": null,
+            "hidden_size": 768,
+            "id2label": {
+                "0": "LABEL_0",
+                "1": "LABEL_1"
+            },
+            "initializer_range": 0.02,
+            "intermediate_size": 2560,
+            "is_encoder_decoder": false,
+            "label2id": {
+                "LABEL_0": 0,
+                "LABEL_1": 1
+            },
+            "layer_types": [
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+                "conv",
+                "full_attention",
+                "conv",
+                "conv",
+                "full_attention",
+                "full_attention",
+                "full_attention"
+            ],
+            "max_position_embeddings": 128000,
+            "model_type": "lfm2",
+            "norm_eps": 1e-05,
+            "num_attention_heads": 8,
+            "num_hidden_layers": 17,
+            "num_key_value_heads": 4,
+            "output_attentions": false,
+            "output_hidden_states": false,
+            "pad_token_id": 0,
+            "problem_type": null,
+            "return_dict": true,
+            "rope_parameters": {
+                "rope_theta": 1000000.0,
+                "rope_type": "default"
+            },
+            "tie_word_embeddings": true,
+            "use_cache": true,
+            "vocab_size": 2
+        }
+    },
+    "audio_eos_code": 2016,
+    "audio_loss_weight": 1.0,
+    "audio_out_token_id": 125032,
+    "audio_start_token_id": 125012,
+    "audio_token_id": 125031,
+    "auto_map": {
+        "AutoConfig": "configuration_lfm3_omni.Lfm3OmniConfig",
+        "AutoModel": "modeling_lfm3_omni.Lfm3OmniModel",
+        "AutoModelForImageTextToText": "modeling_lfm3_omni.Lfm3OmniForConditionalGeneration",
+        "AutoModelForMultimodalLM": "modeling_lfm3_omni.Lfm3OmniForConditionalGeneration",
+        "AutoModelForSeq2SeqLM": "modeling_lfm3_omni.Lfm3OmniForConditionalGeneration"
+    },
+    "codebook_size": 2017,
+    "depth_config": {
+        "bos_token_id": null,
+        "conv_L_cache": 7,
+        "conv_bias": false,
+        "eos_token_id": null,
+        "head_dim": 32,
+        "hidden_size": 1024,
+        "initializer_range": 0.02,
+        "intermediate_size": 2816,
+        "layer_types": [
+            "full_attention",
+            "full_attention",
+            "full_attention"
+        ],
+        "max_position_embeddings": 12,
+        "model_type": "lfm3",
+        "norm_eps": 1e-05,
+        "num_attention_heads": 32,
+        "num_hidden_layers": 3,
+        "num_key_value_heads": 8,
+        "pad_token_id": null,
+        "rope_parameters": {
+            "full_attention": {
+                "partial_rotary_factor": 1.0,
+                "rope_theta": 1000000.0,
+                "rope_type": "default"
+            }
+        },
+        "sliding_window": 256,
+        "tie_word_embeddings": true,
+        "use_cache": false,
+        "use_sandwich_norm": false,
+        "vocab_size": 1
+    },
+    "do_sample": false,
+    "downsample_factor": 2,
+    "eos_token_id": [
+        124900,
+        125014
+    ],
+    "generation_config": {
+        "bos_token_id": 124894,
+        "eos_token_id": [
+            124900,
+            125014
+        ],
+        "pad_token_id": 124893,
+        "use_cache": true,
+        "output_attentions": false,
+        "output_hidden_states": false,
+        "do_sample": false,
+        "temperature": 0,
+        "top_k": 1,
+        "repetition_penalty": 1.0,
+        "audio_temperature": 0.4,
+        "audio_top_k": null,
+        "audio_repetition_penalty": 1.2,
+        "audio_repetition_window": 64
+    },
+    "image_token_id": 125030,
+    "initializer_range": 0.02,
+    "interleaved_n_audio": 12,
+    "interleaved_n_text": 6,
+    "maskgit_schedule": [
+        4,
+        4,
+        4
+    ],
+    "mixed_start_token_id": 125015,
+    "model_type": "lfm3_omni",
+    "num_codebooks": 12,
+    "projector_bias": true,
+    "projector_hidden_act": "gelu",
+    "projector_hidden_size": 4096,
+    "projector_layer_norm_eps": 1e-06,
+    "quantization": {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine"
+    },
+    "quantization_config": {
+        "group_size": 64,
+        "bits": 8,
+        "mode": "affine"
+    },
+    "temperature": 0,
+    "text_config": {
+        "bos_token_id": 124894,
+        "conv_L_cache": 7,
+        "conv_bias": false,
+        "eos_token_id": 124900,
+        "head_dim": 128,
+        "hidden_size": 2048,
+        "initializer_range": 0.02,
+        "intermediate_size": 7680,
+        "layer_types": [
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv"
+        ],
+        "max_position_embeddings": 128000,
+        "model_type": "lfm3",
+        "norm_eps": 1e-05,
+        "num_attention_heads": 16,
+        "num_hidden_layers": 24,
+        "num_key_value_heads": 4,
+        "pad_token_id": 124893,
+        "rope_parameters": {
+            "full_attention": {
+                "partial_rotary_factor": 0.5,
+                "rope_theta": 1000000.0,
+                "rope_type": "default"
+            },
+            "sliding_attention": {
+                "rope_theta": 10000,
+                "rope_type": "default"
+            }
+        },
+        "sliding_window": 256,
+        "tie_word_embeddings": true,
+        "use_cache": true,
+        "use_sandwich_norm": true,
+        "vocab_size": 128000
+    },
+    "text_end_token_id": 125014,
+    "text_loss_weight": 1.0,
+    "tie_word_embeddings": true,
+    "top_k": 1,
+    "transformers_version": "5.19.0.dev0",
+    "video_token_id": 125029,
+    "vision_config": {
+        "conv_kernel_size": 3,
+        "dtype": "bfloat16",
+        "hidden_size": 1024,
+        "in_channels": 3,
+        "initializer_range": 0.02,
+        "intermediate_size": 2560,
+        "layer_types": [
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "full_attention",
+            "conv"
+        ],
+        "model_type": "lfm3_vl_vision",
+        "norm_eps": 1e-05,
+        "num_attention_heads": 16,
+        "num_hidden_layers": 14,
+        "num_key_value_heads": 8,
+        "patch_size": 16,
+        "rope_parameters": {
+            "rope_theta": 1000000.0,
+            "rope_type": "axial"
+        },
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 2
+    }
+}

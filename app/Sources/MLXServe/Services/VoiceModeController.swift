@@ -15,33 +15,15 @@ import Combine
 @MainActor
 final class VoiceModeController: ObservableObject {
     @Published private(set) var state: VoiceTurnState = .idle
-    @Published private(set) var partialTranscript = ""
     @Published private(set) var level: Float = 0
     @Published private(set) var isMuted = false
     /// True from a successful `begin()` until `end()`. The tray toggle binds to
     /// this; it stays true through a recoverable error so the panel can show it.
     @Published private(set) var isActive = false
 
-    /// Set when enabling Voice hit a missing prerequisite (mic / speech
-    /// permission, or the on-device dictation model). Drives a non-invasive
-    /// notice + "Open Settings" button in the voice panel; cleared on a clean
-    /// start or on `end()`. nil = nothing to nag about.
+    /// Set when enabling Voice hit a missing prerequisite (the mic, or the speech model). Drives a non-invasive
+    /// notice + its fix in the voice panel; cleared on a clean start or on `end()`. nil = nothing to nag about.
     @Published private(set) var setupIssue: VoicePreflight.Issue?
-
-    /// Consecutive turns where the mic heard speech but recognition returned
-    /// nothing — the runtime signature of on-device dictation being off (the
-    /// pre-flight can't see this; `supportsOnDeviceRecognition` stays true).
-    private var unrecognizedSpeechStreak = 0
-    /// True once recognition has produced ANY text this session (partial or
-    /// final). That's positive proof on-device dictation is installed + on, so
-    /// the "dictation unavailable" notice is then categorically wrong — later
-    /// empty endpoints are just noise (a cough, the assistant's own TTS bleeding
-    /// into the mic) and must never surface it. The empty-speech streak only
-    /// diagnoses a genuinely-dead recognizer, i.e. before any text appears.
-    private var hasRecognizedSpeech = false
-    /// Surface the notice after this many empty-speech turns in a row — one stray
-    /// noise shouldn't nag; two in a row means recognition really isn't working.
-    private static let unrecognizedSpeechLimit = 2
 
     /// Hands-free agent runs: defaults ON for the tray voice assistant (it's
     /// hands-free by design). When OFF, each tool call surfaces a `pendingApproval`
@@ -145,6 +127,16 @@ final class VoiceModeController: ObservableObject {
     private let synthesizer: any SpeechSynthesizing
     private let loadingCue: any LoadingCue
     private let chime: WakeChime
+    /// Whether the chat model hears the recording itself (`ModelInfo.speaks`): it gets the utterance's audio, and
+    /// the chosen voice reads its answer like any other model's. Asked per turn.
+    var modelSpeaks: (() -> Bool)?
+    /// The chat window's tab folder index (mini RAG), as a typed turn there gets it.
+    var turnDocumentIndex: ((UUID) -> DocumentIndex?)?
+    /// The chat window's voice: every utterance is a turn (no wake word, no spoken agent switch), always in the
+    /// session it was turned on in. The tray's voice is the other instance.
+    let chatMode: Bool
+    /// The chat window's voice has the microphone: the tray stays on but does not listen.
+    private var micYielded = false
     private var chunker = SentenceChunker()
     private var streamComplete = false
     private var previewing = false
@@ -152,8 +144,6 @@ final class VoiceModeController: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var isBound = false
     private let voiceOptions: [VoiceOption]
-    private var recognitionLocaleIdentifier = SpeechLocale.reportingLocale(
-        preferredLanguages: Locale.preferredLanguages, fallback: .current).identifier
 
     private static let voiceDefaultsKey = "voiceModeVoiceId"
     /// Which assistant message we're currently voicing — when it changes (e.g. a
@@ -172,7 +162,9 @@ final class VoiceModeController: ObservableObject {
          voices: [VoiceOption] = VoiceCatalog.systemVoices(),
          loadingCue: any LoadingCue = SystemLoadingCue(),
          followUpTimer: FollowUpTimer = RealFollowUpTimer(),
-         chime: WakeChime = SystemWakeChime()) {
+         chime: WakeChime = SystemWakeChime(),
+         chatMode: Bool = false) {
+        self.chatMode = chatMode
         self.recognizer = recognizer
         self.synthesizer = synthesizer
         self.loadingCue = loadingCue
@@ -194,9 +186,9 @@ final class VoiceModeController: ObservableObject {
     /// router — when a clone clip is set in Settings, answers are spoken in the
     /// cloned voice via the server's TTS; otherwise (or on a failed synthesis)
     /// the wrapped system voice speaks. The controller only sees the protocol.
-    convenience init(server: ServerManager) {
+    convenience init(server: ServerManager, chatMode: Bool = false) {
         self.init(recognizer: makeSpeechRecognizer(),
-                  synthesizer: ClonedVoiceSynthesizer(server: server))
+                  synthesizer: ClonedVoiceSynthesizer(server: server), chatMode: chatMode)
     }
 
     /// Wire the controller to the app: use its `ChatTurnEngine` as the runner and
@@ -206,6 +198,7 @@ final class VoiceModeController: ObservableObject {
         guard !isBound else { return }
         isBound = true
         runner = appState.chatEngine
+        modelSpeaks = { [weak appState] in appState?.server.chatModelInfo?.speaks == true }
         turnContext = { [weak appState, weak self] in
             guard let appState else { return (UUID(), nil) }
             // Route by AGENT, not by whatever tab is open: each agent keeps its
@@ -215,7 +208,9 @@ final class VoiceModeController: ObservableObject {
             // session (where voice was enabled) — never the active tab: peeking
             // at another chat mid-voice must not move the conversation there.
             let sid: UUID
-            if appState.defaultAgentId == nil,
+            if let self, self.chatMode, let bound = self.boundSessionId {
+                sid = bound
+            } else if appState.defaultAgentId == nil,
                let bound = self?.boundSessionId,
                appState.chatSessions.contains(where: { $0.id == bound }) {
                 sid = bound
@@ -236,15 +231,20 @@ final class VoiceModeController: ObservableObject {
             let session = appState.chatSessions.first { $0.id == sid }
             // A chat tab's own pick wins for that conversation; otherwise the
             // tray's agent answers.
-            let agentId = session?.agentId ?? appState.defaultAgentId
+            let agentId = session?.agentId ?? (self.chatMode ? nil : appState.defaultAgentId)
+            // The chat window's voice runs under the tab's own toggles, read now: switching Tools on mid-voice counts.
+            let tab = self.chatMode ? session.map(Self.chatToggles) : nil
             return appState.resolvedAgentSettings(
                 agentId: agentId,
-                toolsEnabled: self.agentMode,
-                mcpEnabled: self.mcpMode,
-                thinkingEnabled: self.enableThinking,
+                toolsEnabled: tab?.tools ?? self.agentMode,
+                mcpEnabled: tab?.mcp ?? self.mcpMode,
+                thinkingEnabled: tab?.thinking ?? self.enableThinking,
                 autoApprove: self.autoApproveTools,
-                workingDirectory: session?.workingDirectory)
+                workingDirectory: session?.workingDirectory,
+                disabledTools: tab?.disabled ?? [],
+                reasoningEffort: tab?.effort ?? .low)
         }
+        turnDocumentIndex = chatMode ? { [weak appState] sid in appState?.documentIndexes[sid] } : nil
         agentPhrases = { [weak appState] in
             guard let appState else { return [] }
             return appState.agents.wakePhrases
@@ -362,17 +362,13 @@ final class VoiceModeController: ObservableObject {
     }
 
     private func wire() {
-        recognizer.onSpeechStarted = { [weak self] in self?.handleSpeechStarted() }
-        recognizer.onPartialTranscript = { [weak self] t in
-            guard let self else { return }
-            self.partialTranscript = t
-            // Any partial text is proof on-device dictation is working — clear
-            // the empty-speech streak and latch it so noise can't false-trigger.
-            if !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                self.hasRecognizedSpeech = true
-                self.unrecognizedSpeechStreak = 0
-            }
+        // The chat window's turn is the recording itself when the model hears it: no transcript needed. The tray's
+        // wake word always needs words.
+        recognizer.wantsWords = { [weak self] in
+            guard let self, self.chatMode else { return true }
+            return self.modelSpeaks?() != true
         }
+        recognizer.onSpeechStarted = { [weak self] in self?.handleSpeechStarted() }
         recognizer.onFinalTranscript = { [weak self] t in self?.handleFinalTranscript(t) }
         recognizer.onUnrecognizedSpeech = { [weak self] in self?.handleUnrecognizedSpeech() }
         recognizer.onError = { [weak self] m in self?.send(.failed(m)) }
@@ -383,27 +379,23 @@ final class VoiceModeController: ObservableObject {
 
     /// Authorize, open the mic and enter the listening state. Returns false if
     /// permission was denied or the mic couldn't start.
-    func begin() async -> Bool {
-        // Non-invasive pre-flight: check the three prerequisites (mic + speech
-        // permission, on-device dictation model) and, if one is missing, surface
-        // a precise notice in the panel instead of opening a dead mic. No modal.
+    /// `session`: the conversation to talk into (the chat window's tab); nil routes like the tray.
+    func begin(session: UUID? = nil) async -> Bool {
+        // Non-invasive pre-flight: the mic and the speech model; if one is missing, surface a precise notice in the
+        // panel instead of opening a dead mic. No modal.
         let snapshot = await recognizer.preflight()
-        recognitionLocaleIdentifier = snapshot.locale
-        setUpVoices(locale: Locale(identifier: snapshot.locale))
         if let issue = VoicePreflight.firstIssue(snapshot) {
             setupIssue = issue
             send(.failed(VoicePreflight.shortMessage(for: issue)))
             return false
         }
         setupIssue = nil
-        unrecognizedSpeechStreak = 0
-        hasRecognizedSpeech = false
         send(.start)
         isActive = true
         // Bind to the conversation voice will talk into — the launching chat
         // tab, or the tray agent's own thread. The orb/toggle render only in
         // this session's tab from here on.
-        boundSessionId = turnContext?().sessionId
+        boundSessionId = session ?? turnContext?().sessionId
         // Fire-and-forget: pre-embed a clone reference clip NOW so the first
         // spoken sentence starts from a warm speaker-embedding cache
         // (docs/qwentts-cache.md — the only lever for the first sentence).
@@ -413,20 +405,10 @@ final class VoiceModeController: ObservableObject {
         return state == .listening
     }
 
-    /// The mic heard speech but recognition produced nothing. A one-off is just
-    /// noise; a couple in a row means on-device dictation is off/unavailable — so
-    /// we stop the dead session and show the actionable notice (with the same
-    /// "Open Keyboard Settings" affordance as the pre-flight).
+    /// The mic heard sound but the speech model found no words (a cough, a door): keep listening.
     private func handleUnrecognizedSpeech() {
-        guard isActive else { return }
-        // Recognition already produced text this session → dictation is provably
-        // installed + on. This empty endpoint is just noise; never claim
-        // "dictation unavailable" and never stop a working session over it.
-        if hasRecognizedSpeech { return }
-        unrecognizedSpeechStreak += 1
-        guard unrecognizedSpeechStreak >= Self.unrecognizedSpeechLimit else { return }
-        end()
-        setupIssue = .dictationUnavailable(locale: recognitionLocaleIdentifier)
+        guard isActive, state == .recognizing else { return }
+        send(.utteranceDismissed)
     }
 
     /// Close voice mode and release all audio resources.
@@ -438,7 +420,6 @@ final class VoiceModeController: ObservableObject {
         recognizer.stop()
         synthesizer.shutdown()   // stop + release the clone TTS model, if loaded
         resetTurn()
-        partialTranscript = ""
         level = 0
         isMuted = false
         isActive = false
@@ -501,6 +482,19 @@ final class VoiceModeController: ObservableObject {
     }
 
     /// Stop/resume capturing without leaving voice mode.
+    /// The chat window's voice took (true) or released (false) the microphone. The tray stays on and keeps its
+    /// state; it only stops listening meanwhile, so it neither hears nor answers what is said to the chat.
+    func yieldMicrophone(_ yielded: Bool) {
+        guard yielded != micYielded else { return }
+        micYielded = yielded
+        if yielded {
+            recognizer.stop()
+            if state == .recognizing { send(.utteranceDismissed) }
+        } else if isActive, state == .listening {
+            startListening()
+        }
+    }
+
     func toggleMute() {
         isMuted.toggle()
         if isMuted { recognizer.stop() }
@@ -509,10 +503,16 @@ final class VoiceModeController: ObservableObject {
 
     // MARK: Turn submission + approval
 
+    /// A chat tab's Think / Tools / MCP / reasoning effort and per-chat tool switches, as its composer keeps them.
+    nonisolated static func chatToggles(_ s: ChatSession)
+        -> (tools: Bool, mcp: Bool, thinking: Bool, disabled: Set<AgentToolKind>, effort: ReasoningEffort) {
+        (s.mode == .agent, s.useMCP, s.enableThinking, ChatSession.disabledToolKinds(s.disabledTools), s.reasoningEffort)
+    }
+
     /// Submit the finalized user transcript to the shared engine. Always uses a
     /// `voiceStyle` config so spoken answers stay short and Markdown-free; agent
     /// Agent, thinking, and MCP all come from the voice-scoped toggles.
-    private func submitTurn(_ text: String) {
+    private func submitTurn(_ text: String, pcm: [Float] = []) {
         guard let runner, let ctx = turnContext?() else { return }
         boundSessionId = ctx.sessionId
         // Mark the transcript's current trailing answer as heard BEFORE the
@@ -529,8 +529,17 @@ final class VoiceModeController: ObservableObject {
             mcpEnabled: mcpMode,
             thinkingEnabled: enableThinking,
             workingDirectory: ctx.workingDirectory)
-        let config = ChatTurnEngine.TurnConfig.from(resolved, voiceStyle: true)
-        runner.runTurn(sessionId: ctx.sessionId, userText: text, images: nil, videos: nil, audio: nil,
+        let config = ChatTurnEngine.TurnConfig.from(resolved, voiceStyle: true, documentIndex: turnDocumentIndex?(ctx.sessionId))
+        // A model that hears gets the utterance itself (tone and all), tools or not; its text answer is read below.
+        var audio: [ChatAudio]? = nil
+        var userText = text
+        if modelSpeaks?() == true, !pcm.isEmpty {
+            audio = [ChatAudio(name: "voice.wav", pcm: pcm.withUnsafeBufferPointer { Data(buffer: $0) })]
+            userText = ""
+        }
+        // Words were skipped for a model that heard, and it no longer does: nothing to send.
+        guard audio != nil || !userText.isEmpty else { send(.turnFinished); startListening(); return }
+        runner.runTurn(sessionId: ctx.sessionId, userText: userText, images: nil, videos: nil, audio: audio,
                        config: config, approval: { [weak self] tc in
             await self?.approvalDecision(for: tc) ?? false
         })
@@ -607,25 +616,22 @@ final class VoiceModeController: ObservableObject {
     private func handleFinalTranscript(_ text: String) {
         guard state == .listening || state == .recognizing else { return }
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        unrecognizedSpeechStreak = 0   // recognition is working — clear the streak
-        hasRecognizedSpeech = true     // …and latch it: never nag "unavailable" again
+        // No words is a turn only where none were asked for (the chat window, a model that hears the recording).
+        guard !trimmed.isEmpty || (chatMode && !recognizer.utterancePCM.isEmpty) else { return }
 
         guard let query = wakeWordGate(trimmed) else {
             // Ambient speech we weren't addressed in, or a bare wake phrase that
             // only arms the next utterance → drop it and keep listening. The
             // recognizer already recycled itself for the next utterance.
-            partialTranscript = ""
             send(.utteranceDismissed)
             return
         }
 
         disarmFollowUp()                  // entering a turn closes any open follow-up window
         recognizer.stop()                 // mic off while the model thinks/speaks
-        partialTranscript = ""
         resetTurn()
         send(.transcriptFinalized)
-        submitTurn(query)
+        submitTurn(query, pcm: recognizer.utterancePCM)
     }
 
     /// Decide what (if anything) to submit for a finalized utterance under the
@@ -633,6 +639,7 @@ final class VoiceModeController: ObservableObject {
     /// should be ignored — either no wake word was present, or it was a bare wake
     /// phrase that only arms the next utterance. Mutates `awaitingWakeQuery`.
     func wakeWordGate(_ utterance: String) -> String? {
+        if chatMode { return utterance }
         // An agent's own name always addresses THAT agent — checked first, and
         // even in always-on mode, because "hey chef" is a request to hand the
         // conversation over, not a question for whoever is active.
@@ -736,7 +743,7 @@ final class VoiceModeController: ObservableObject {
         resetTurn()
         send(.turnFinished)
         startListening()
-        armFollowUp()                 // continued conversation: next utterance needs no wake word
+        if !chatMode { armFollowUp() }   // continued conversation: next utterance needs no wake word
     }
 
     // MARK: Presentation
@@ -747,6 +754,7 @@ final class VoiceModeController: ObservableObject {
     /// "Say "Hey Loki"…" while waiting for the wake word, plain "Listening…" when
     /// the wake word is off.
     var listeningPrompt: String {
+        if chatMode { return "Listening…" }
         if awaitingWakeQuery { return "Go ahead…" }
         if requireWakeWord { return "Say “\(wakePhraseDisplay)”…" }
         return "Listening…"
@@ -757,6 +765,7 @@ final class VoiceModeController: ObservableObject {
 
     // MARK: Helpers
 
+
     private func resetTurn() {
         streamComplete = false
         speakingMessageId = nil
@@ -764,7 +773,7 @@ final class VoiceModeController: ObservableObject {
     }
 
     private func startListening() {
-        guard !isMuted else { return }
+        guard !isMuted, !micYielded else { return }
         do { try recognizer.start() }
         catch { send(.failed(error.localizedDescription)) }
     }

@@ -152,12 +152,16 @@ class Client {
       listeners.forEach((fn) => fn());
       throw new StudioError("protocol", t("Timeout must be positive."));
     }
-    const timer = setTimeout(
-      () =>
-        controller.abort(new StudioError("timeout", t("Request timed out."))),
-      timeout,
-    );
+    const expire = () =>
+      controller.abort(new StudioError("timeout", t("Request timed out.")));
+    let timer = setTimeout(expire, timeout);
     let closed = false;
+    // Past the headers the timeout is a stall timeout: each body chunk (SSE keepalives too) restarts it.
+    const rearm = () => {
+      if (closed) return;
+      clearTimeout(timer);
+      timer = setTimeout(expire, timeout);
+    };
     const close = () => {
       if (closed) return;
       closed = true;
@@ -209,7 +213,26 @@ class Client {
           response.status,
         );
       }
-      return { response, signal: controller.signal, close };
+      rearm();
+      const body = response.body?.pipeThrough(
+        new TransformStream<Uint8Array, Uint8Array>({
+          transform(chunk, out) {
+            rearm();
+            out.enqueue(chunk);
+          },
+        }),
+      );
+      return {
+        response: body
+          ? new Response(body, {
+              status: response.status,
+              statusText: response.statusText,
+              headers: response.headers,
+            })
+          : response,
+        signal: controller.signal,
+        close,
+      };
     } catch (error) {
       const result = this.error(error, controller.signal);
       close();

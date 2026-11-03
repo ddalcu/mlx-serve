@@ -2,7 +2,7 @@
 """Dump DeepSeek-V4.1-Flash VISION parity fixtures — the reference EXECUTES.
 
 Runs the release's own `inference/image_processor.py` and `inference/vision.py` (ViT + Aligner,
-fp32, CPU) on OUR pack's dense bf16 tower weights and saves every stage `src/dsv41_vision.zig`
+fp32, CPU) on OUR pack's dense bf16 tower weights and saves every stage `src/plugins/deepseek_v41/vision.zig`
 has to reproduce, plus the span the trunk reads (delimiter embeddings in place).
 
 Preprocessing cases start from RGB bytes decoded here (our server decodes with stb, the

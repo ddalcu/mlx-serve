@@ -386,8 +386,10 @@ test("gen.mjs video reports the server's error and leaves no partial frames on d
 // ---------- gen.mjs 3d ----------
 
 const MOSS_AND_TRELLIS = [{ id: "org/moss", capabilities: ["image"], state: "ready" }, { id: "org/trellis", capabilities: ["3d"], state: "ready" }];
+const IDOL = "ddalcu/Idol-MLX-Serve-8bit";
+const MOSS_TRELLIS_AND_IDOL = [...MOSS_AND_TRELLIS, { id: IDOL, capabilities: ["3d"], state: "unloaded" }];
 
-async function threeDRun({ ref, input = "a red car", args = [], glb = Buffer.from("glb"), models = MOSS_AND_TRELLIS }) {
+async function threeDRun({ ref, input = "a red car", args = [], glb = Buffer.from("glb"), models = MOSS_TRELLIS_AND_IDOL }) {
   const srv = await mockServer(
     models,
     {
@@ -425,10 +427,36 @@ test("gen.mjs 3d sends --resolution, so a GPU short of the 1024 peak can ask for
   assert.equal((await threeDRun({ ref: png, args: ["--resolution", "512"] })).body.resolution, 512);
 });
 
+test("gen.mjs 3d without Idol stops before it generates anything and tells the user how to download it", async () => {
+  for (const models of [MOSS_AND_TRELLIS, [MOSS_AND_TRELLIS[0]]]) {
+    const srv = await mockServer(models, {});
+    try {
+      await assert.rejects(run("node", [join(SKILL, "gen.mjs"), "3d", "a red car", "-o", join(tmp(), "car.glb")], { env: { ...process.env, MLX_SERVE_URL: srv.url } }),
+        (e) => /Idol/.test(e.stderr) && /Models > Media > 3D/.test(e.stderr) && /mlx-serve pull ddalcu\/Idol-MLX-Serve-8bit/.test(e.stderr) && /--model/.test(e.stderr)
+          && /org\/trellis/.test(e.stderr) === models.includes(MOSS_AND_TRELLIS[1]));
+      assert.deepEqual(srv.calls.map((c) => c.url).filter((u) => u !== "/v1/models"), [], "no reference image was made and no model was loaded");
+    } finally {
+      await srv.close();
+    }
+  }
+});
+
+test("gen.mjs batch settles every job's model first, so a missing Idol stops it before the earlier jobs spend minutes", async () => {
+  const srv = await mockServer(MOSS_AND_TRELLIS, {});
+  try {
+    const spec = join(tmp(), "assets.json");
+    writeFileSync(spec, JSON.stringify({ out: "assets", jobs: [{ type: "image", id: "roof", prompt: "tiles" }, { type: "3d", id: "lantern", prompt: "a lantern" }] }));
+    await assert.rejects(run("node", [join(SKILL, "gen.mjs"), "batch", spec], { env: { ...process.env, MLX_SERVE_URL: srv.url } }), (e) => /Idol/.test(e.stderr));
+    assert.deepEqual(srv.calls.map((c) => c.url).filter((u) => u !== "/v1/models"), [], "the image job did not run");
+  } finally {
+    await srv.close();
+  }
+});
+
 test("gen.mjs 3d cuts the plain background off the reference image, because TRELLIS.2 and Pixal3D read the alpha as the subject", async () => {
   const w = 32, h = 32, data = new Uint8Array(w * h * 4).fill(255);
   for (let y = 12; y < 20; y++) for (let x = 12; x < 20; x++) data.set([200, 30, 30, 255], (y * w + x) * 4);
-  const r = await threeDRun({ ref: encodePng({ w, h, data }) });
+  const r = await threeDRun({ ref: encodePng({ w, h, data }), args: ["--model", "org/trellis"] });
   assert.equal(pixelAt(r.sent, 1, 1)[3], 0, "the white background is transparent");
   assert.deepEqual(pixelAt(r.sent, 16, 16), [200, 30, 30, 255], "the object keeps its colour and is opaque");
   assert.equal(r.body.model, "org/trellis");
@@ -629,16 +657,17 @@ test("gen.mjs 3d applies --max-texture and --quantize to the model it gets back,
   assert.equal(r.body.quantize, undefined);
 });
 
-test("gen.mjs 3d prefers TRELLIS.2 over another 3D model, even when the other one is the loaded one", async () => {
+test("gen.mjs 3d makes Idol the model, even when another 3D model is the loaded one, and --model names a different one", async () => {
   const ref = encodePng({ w: 8, h: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+  const TRELLIS = "org/TRELLIS.2-4B-MLX-Serve-8bit";
   const models = [
     { id: "org/moss", capabilities: ["image"], state: "ready" },
     { id: "local/Pixal3D-local", capabilities: ["3d"], state: "ready" },
-    { id: "org/TRELLIS.2-4B-MLX-Serve-8bit", capabilities: ["3d"], state: "unloaded" },
+    { id: TRELLIS, capabilities: ["3d"], state: "unloaded" },
+    { id: IDOL, capabilities: ["3d"], state: "unloaded" },
   ];
-  assert.equal((await threeDRun({ ref, models })).body.model, "org/TRELLIS.2-4B-MLX-Serve-8bit");
-  const only = models.filter((m) => !/TRELLIS/.test(m.id));
-  assert.equal((await threeDRun({ ref, models: only })).body.model, "local/Pixal3D-local", "without TRELLIS.2 the other model serves");
+  assert.equal((await threeDRun({ ref, models })).body.model, IDOL);
+  assert.equal((await threeDRun({ ref, models, args: ["--model", TRELLIS] })).body.model, TRELLIS);
 });
 
 test("gen.mjs 3d asks the server for about three times max_tris faces, so the UV unwrap is not run on 300k faces", async () => {

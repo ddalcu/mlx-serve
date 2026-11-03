@@ -27,6 +27,7 @@ open "app/MLX-Serve.app"
 ## Server only
 
 ```bash
+git submodule update --init                          # mlx, mlx-c, ds4, opencode2 and the absorbed libraries
 ./scripts/fetch-zig.sh                               # stages the pinned Zig at .zig-toolchain/
 export PATH="$PWD/.zig-toolchain:$PATH"
 ./scripts/fetch-llama.sh && ./scripts/build-mlx.sh   # once, and again on a pin bump
@@ -41,7 +42,7 @@ To build on Linux, run `./scripts/build-linux.sh` from a fresh checkout. On Wind
 
 ## Hermetic tests (Linux too)
 
-The per-step preview encoder (`src/preview.zig` + `src/jpeg.zig` + `src/latent_rgb.zig`) links no MLX and no Homebrew webp, so any machine, a Linux Cloud Agent included, can build and run it with no GPU:
+The per-step preview encoder (`src/sdk/media/preview.zig` + `src/sdk/media/jpeg.zig` + `src/sdk/media/latent_rgb.zig`) links no MLX and no Homebrew webp, so any machine, a Linux Cloud Agent included, can build and run it with no GPU:
 
 ```bash
 ./scripts/fetch-zig.sh

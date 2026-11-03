@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Boot one model, fire the decode forward micro-bench at load, print the lines,
-# shut down. Diagnostic helper for decode-perf work — NOT a test.
+# fwd_ubench.sh — diagnostic, NOT a test: boot one model, fire diag decode-fwd-ubench at load, print ms/forward,
+# the CPU graph-build vs GPU eval split, ops/forward and a terminal lm_head ablation, shut down.
 #
 #   tests/fwd_ubench.sh <model-dir> [iters] [extra mlx-serve flags...]
 #
-# Env passthrough: any MLX_SERVE_* already exported reaches the server.
+# The unit of every decode-perf A/B here: one run per boot per arm, ALTERNATING arms per boot (a block-of-N schedule
+# reads drift as an effect). An exported MLX_SERVE_DIAG joins the server's: layer-cap=N (slope vs fixed cost),
+# dispatch-probe=N (prices one dispatch with N exact-1.0 multiplies per MoE layer).
+
 set -uo pipefail
 
 MODEL="${1:?usage: fwd_ubench.sh <model-dir> [iters] [flags...]}"
@@ -13,11 +16,12 @@ shift 2 2>/dev/null || shift 1
 PORT="${PORT:-8099}"
 BIN="${BIN:-./zig-out/bin/mlx-serve}"
 LOG="${LOG:-/tmp/fwd-ubench-$PORT.log}"
+[[ "$("$BIN" --version 2>/dev/null | head -1)" != *"(Debug)"* ]] || { echo "$BIN is a Debug build (2-4x slower) — build ReleaseFast first" >&2; exit 1; }
 
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 1
 
-MLX_SERVE_DECODE_FWD_UBENCH="$ITERS" "$BIN" --model "$MODEL" --serve --port "$PORT" \
+MLX_SERVE_DIAG="decode-fwd-ubench=$ITERS${MLX_SERVE_DIAG:+,$MLX_SERVE_DIAG}" "$BIN" --model "$MODEL" --serve --port "$PORT" \
   --log-level info "$@" >"$LOG" 2>&1 &
 SRV=$!
 

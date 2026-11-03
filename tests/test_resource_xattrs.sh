@@ -1,24 +1,12 @@
 #!/usr/bin/env bash
-# Checked-in app resources must not carry the extended attributes that break
-# code signing.
+# test_resource_xattrs.sh — checked-in app/Sources/MLXServe/Resources/* carry none of the extended attributes that break
+# code signing (com.apple.FinderInfo, resource forks, quarantine): an asset dragged out of Finder brings them, and
+# codesign then refuses the WHOLE bundle three minutes into a build, naming the binary instead of the file.
+# com.apple.macl / com.apple.provenance are ignored on purpose: macOS adds them to any file a sandboxed app touches,
+# every resource has them, and they sign fine. Hermetic (one `xattr` per file); a failure names the file and the fix.
 #
-# An asset dragged out of Finder (a screen recording off the Desktop, an
-# exported image) arrives with com.apple.FinderInfo attached. codesign then
-# refuses the ENTIRE bundle:
-#
-#   MLX-Serve.app: resource fork, Finder information, or similar detritus not allowed
-#
-# — three minutes into a build, and naming the BINARY rather than the file that
-# actually brought the metadata in, which sends you looking in the wrong place.
-# build.sh strips them from the staged bundle so a build can't fail this way;
-# this keeps the repo copies clean so the problem is caught in a second, with
-# the offending file named and the fix printed.
-#
-# ONLY the attributes that actually break signing are checked. com.apple.macl
-# and com.apple.provenance are added by macOS itself whenever a sandboxed app
-# touches a file — every existing resource carries them and always has, and
-# they sign fine. Failing on those would make this script fail forever through
-# no fault of anyone's, and a guard that cries wolf gets deleted.
+#   ./tests/test_resource_xattrs.sh
+
 set -uo pipefail
 
 cd "$(dirname "$0")/.."

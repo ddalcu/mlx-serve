@@ -1,24 +1,14 @@
 #!/bin/bash
-# Drafter + tools equivalence test (mirror of test_pld_tools.sh).
+# test_drafter_tools.sh — the Gemma 4 assistant drafter with tools present, test_pld_tools.sh's contract: chat
+# non-stream, /v1/messages stream + non-stream and /v1/responses non-stream each count a `[spec-stats] mode=drafter`
+# engagement (the regular-decode fallback is output-identical, so equality alone misses a dispatch hole) and match a
+# no-drafter baseline byte for byte.
 #
-# The Gemma 4 assistant drafter was blanket-disabled whenever a request
-# defined tools — the same conservative day-one gate that blocked PLD.
-# Tool-pattern detection operates on emitted text and is agnostic to how
-# many tokens a decode step yields, and agent traffic (tool results echoed
-# into edits) is prime speculative-decode territory. This test asserts:
-#   1. a tools request with enable_drafter:true actually runs the drafter
-#      (log shows "[spec-stats] mode=drafter", not "drafter=disabled (tools present)")
-#   2. the tool call (name + args) is identical to a no-drafter baseline
-#   3. an echo-heavy text answer with tools defined is byte-identical
-#   4. a streaming /v1/messages tools request still parses the tool call
-#
-# Requires a dense Gemma 4 target + matching assistant drafter:
-#   DRAFTER_TEST_TARGET (default ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit)
-#   DRAFTER_TEST_DRAFTER (default ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16)
-#
-# Usage: ./tests/test_drafter_tools.sh [port]
+#   DRAFTER_TEST_TARGET=<gemma-4 dense dir> DRAFTER_TEST_DRAFTER=<assistant dir> ./tests/test_drafter_tools.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8097}
 BASE="http://127.0.0.1:$PORT"
@@ -27,8 +17,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
-DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
+MODEL="${DRAFTER_TEST_TARGET:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
+DRAFTER="${DRAFTER_TEST_DRAFTER:-$(find_model mlx-community/gemma-4-E4B-it-assistant-bf16 || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16")}"
 if [ ! -d "$MODEL" ] || [ ! -d "$DRAFTER" ]; then
     echo -e "${YELLOW}SKIP${NC} test_drafter_tools: target or drafter checkpoint not found."
     exit 0
@@ -69,14 +59,11 @@ start_server() {
     local logfile="$1"; shift
     "$BINARY" --model "$MODEL" --serve --port "$PORT" "$@" > "$logfile" 2>&1 &
     SERVER_PID=$!
-    for i in $(seq 1 90); do
-        curl -s -f "$BASE/health" > /dev/null 2>&1 && return 0
-        sleep 1
-    done
+    srv_wait_health "$BASE" 90 1 && return 0
     echo -e "${RED}FAIL${NC} server did not become healthy"; tail -5 "$logfile"; return 1
 }
 stop_server() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; }
-trap 'kill $SERVER_PID 2>/dev/null || true' EXIT
+trap 'srv_stop $SERVER_PID' EXIT
 
 tool_request() {
     local extra="$1"

@@ -3,7 +3,7 @@
 
 USER-RUN (needs mlx + the ~33 GB bf16 repo). Streams one tensor at a time, so it
 runs on a 32 GB Mac. The pack keeps the checkpoint's own layout and key names
-(what src/qwen_image.zig loads) with three changes:
+(what src/plugins/qwen_image/qwen_image.zig loads) with three changes:
 
   (a) the DiT block linears and the text-encoder layer linears are
       affine-quantized (group 64). `MfLinear` decides dense-vs-quantized PER

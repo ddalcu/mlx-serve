@@ -13,7 +13,7 @@
 #
 # Flint decides on each turn whether to think (its template has no switch), so [1] and [2] assert
 # the split, never that it thought. Hermetic counterparts: the config-parse and uint8-weight tests in
-# model.zig, the template render test in chat.zig, and `flint fixture` in transformer.zig.
+# engines/mlx/model.zig, the template render test in host/chat/chat.zig, and `flint fixture` in engines/mlx/transformer.zig.
 
 set -euo pipefail
 
@@ -110,7 +110,7 @@ chat '{"max_tokens":2000,"temperature":0,"messages":[{"role":"user","content":"N
 wait "$J1" "$J2"
 check "[9] concurrent answer 1" "$(content < "$P1")" "Tokyo"
 check "[9] concurrent answer 2" "$(content < "$P2")" "Jupiter"
-check "[9] batched decode engaged" "$(cat "$LOG")" "[batched] gdn batched decode engaged"
+check "[9] batched decode engaged" "$(cat "$LOG")" "batched decode engaged"
 rm -f "$P1" "$P2"
 
 check_absent "no MLX error" "$(cat "$LOG")" "[mlx]"

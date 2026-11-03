@@ -445,6 +445,27 @@ extension MediaBundle {
         ])
     }
 
+    /// Idol: the three transformers, BiRefNet, and the two image encoders (DINOv3 and the FLUX.2 VAE) it reads, all
+    /// under the paths the server loads them from (`tests/convert_idol_weights.py` writes this layout).
+    static func idol(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        let files = [
+            "denoiser.safetensors", "decoder.safetensors", "decoder_gs.safetensors", "birefnet.safetensors",
+            "dinov3/model.safetensors", "vae/model.safetensors",
+        ]
+        return MediaBundle(
+            id: "idol:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: Set(files.map { ($0 as NSString).lastPathComponent })),
+                    readyMarkers: ["config.json", "dinov3/config.json"] + files
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     private static func cascade3D(kind: String, repo: String, displayName: String, sizeGB: Double, files: [String]) -> MediaBundle {
         MediaBundle(
             id: "\(kind):\(repo)",
@@ -583,8 +604,9 @@ extension MediaBundle {
         )
     }
 
-    /// Qwen-Image-2.1 (mlx-serve pack): the diffusers layout plus the root
-    /// `config.json` our converter writes LAST, which is what names the backend.
+    /// Qwen-Image-2.1: the diffusers layout. Our packs add a root `config.json`;
+    /// the official and mlx-community trees have only `model_index.json`, which
+    /// every pack carries and the server classifies them by.
     static func qwenImage(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
         MediaBundle(
             id: "qwenimage:\(repo)",
@@ -593,7 +615,7 @@ extension MediaBundle {
                 MediaComponent(
                     repo: repo,
                     selection: FileSelection(recursive: true),
-                    readyMarkers: ["config.json", "transformer", "vae", "text_encoder", "processor"]
+                    readyMarkers: ["model_index.json", "transformer", "vae", "text_encoder", "processor"]
                 ),
             ],
             sizeEstimateGB: sizeGB
@@ -687,6 +709,7 @@ extension Model3DModelPreset {
         case .hunyuan3d: return .model3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         case .trellis2: return .trellis2(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         case .pixal3d: return .pixal3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+        case .idol: return .idol(repo: repo, displayName: name, sizeGB: approxDownloadGB)
         }
     }
 }
@@ -707,15 +730,8 @@ extension SoundModelPreset {
 
 // MARK: - Media pane generic surface
 
-/// Common surface every media-gen preset (image/audio/video/music) exposes to
-/// the Model Browser's Media tab, so ONE generic row renders all four
-/// modalities instead of four near-duplicate views. `Model3DModelPreset`
-/// deliberately does NOT conform — the Media tab covers exactly the four
-/// modalities the user asked for; 3D stays its own thing for now.
-/// What every media preset — INCLUDING 3D — can say about its cost. Split out
-/// of `MediaModelPreset` so a Create pane's picker can rank all five catalogues
-/// (`MediaModelPicks`) without dragging 3D into the Model Browser's Media tab,
-/// which is what conforming it to the fuller protocol below would do.
+/// What every media preset can say about its cost: all a Create pane's picker
+/// (`MediaModelPicks`) needs to rank a catalogue.
 protocol MediaModelSizing: Identifiable where ID == String {
     var name: String { get }
     /// Peak unified-memory footprint, GB — already the full RAM-needed
@@ -734,6 +750,10 @@ extension MediaModelSizing {
     }
 }
 
+/// Common surface every media-gen preset exposes to the Model Browser's Media
+/// tab, so ONE generic row renders every modality instead of near-duplicate
+/// views. The tab lists each modality's whole catalogue except 3D's, where it
+/// lists `Model3DModelPreset.modelBrowserCatalog` alone.
 protocol MediaModelPreset: MediaModelSizing, Hashable {
     var bundle: MediaBundle { get }
     /// Plain-English explanation shown under the model in the Media pane —
@@ -746,5 +766,4 @@ extension AudioModelPreset: MediaModelPreset {}
 extension VideoModelPreset: MediaModelPreset {}
 extension MusicModelPreset: MediaModelPreset {}
 extension SoundModelPreset: MediaModelPreset {}
-// Sizing only — see `MediaModelSizing`: 3D stays out of the Media tab.
-extension Model3DModelPreset: MediaModelSizing {}
+extension Model3DModelPreset: MediaModelPreset {}

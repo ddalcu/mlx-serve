@@ -10,13 +10,15 @@
 # NEEDS A REAL MODEL: skips when MODEL is absent.
 #
 # Usage: MODEL=<org/name dir> ./tests/test_model_alias.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11385}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
-MODEL="${MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+MODEL="${MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 MODEL="${MODEL%/}"
 [ -f "$MODEL/config.json" ] || { echo "SKIP: needs a local chat model (MODEL=$MODEL)"; exit 0; }
 ALIAS="shorty"
@@ -54,11 +56,7 @@ HOME="$FAKE_HOME" "$BIN" --serve --model "$MODELS_ROOT/t/twin" --model-dir "$MOD
     --log-level debug --log-file off >"$LOG" 2>&1 &
 SRV=$!
 UP=0
-for _ in $(seq 1 120); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { UP=1; break; }
-    kill -0 "$SRV" 2>/dev/null || break
-    sleep 0.5
-done
+srv_wait_health "http://127.0.0.1:$PORT" 120 0.5 "$SRV" && UP=1
 [ "$UP" = "1" ] || { echo "FAIL: server never became healthy"; tail -5 "$LOG"; exit 1; }
 URL="http://127.0.0.1:$PORT"
 

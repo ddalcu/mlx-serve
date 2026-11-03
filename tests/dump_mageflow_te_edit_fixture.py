@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump a MageFlow edit text-encoder parity fixture for src/mage_flow.zig (E7.4).
+"""Dump a MageFlow edit text-encoder parity fixture for src/plugins/mage_flow/mage_flow.zig (E7.4).
 
 Runs the pure-MLX REFERENCE (ivanfioravanti/mflux@mage-flow-mlx) full Qwen3-VL
 text encoder edit path (vision-embed replace + DeepStack scatter-add at LM layers

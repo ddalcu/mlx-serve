@@ -20,6 +20,12 @@ Cells:
              sub-4-bit weights fall out of `verifyQmmLane` (4/5/6-bit only), so
              the pack may give back in lost lanes what it gains in bandwidth.
 
+The agent cell's tool results must depend on the ARGUMENTS (one canned answer per
+tool makes re-reading rational), and rounds-to-answer rides beside it (a build that
+makes no calls scores a perfect 1). mlx-lm is not a valid oracle for our packs
+unmodified: it folds the `+1` into the delta-encoded norms whenever it sees an MTP
+head, double-folding ours; `_install_sanitize_fix` undoes that.
+
   python3 tests/qwen38_iq_battery.py reference --out ~/claude-tmp/qwen38-iq/ref.npz
   python3 tests/qwen38_iq_battery.py tokens --ref ...ref.npz --pack <dir>
   python3 tests/qwen38_iq_battery.py agent  --pack <dir>

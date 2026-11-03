@@ -17,11 +17,11 @@ Two subcommands, deliberately split so the expensive half runs once:
             phase-4 loop is "battery fails -> raise the floor -> allocate again",
             and it must not mean re-measuring.
 
-The objective summed across weights is ABSOLUTE weighted error, sum_j om_j (dW_j)^2
-over the tensor, which is proportional to the expected output-error energy that
-weight contributes per token. It is not corrected for depth: a perturbation early in
-the residual stream and one late in it are treated alike (the standard
-llama.cpp/AWQ approximation).
+The objective (`--objective`, default rel) divides each tensor's weighted error
+sum_j om_j (dW_j)^2 by its own weighted signal energy before weighting by size:
+activation scale spans ~6e4 across depth on this checkpoint, and the ABSOLUTE
+objective (`abs`, the llama.cpp/AWQ approximation) is dominated by the late layers
+and starves the early ones.
 
   python3 tests/qwen38_iq_allocate.py measure  --imatrix im.safetensors --out err.json
   python3 tests/qwen38_iq_allocate.py allocate --errors err.json --budget-gb 9.0 --out alloc.json

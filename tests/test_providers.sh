@@ -1,15 +1,15 @@
 #!/bin/bash
-# Guard: upstream chat providers (~/.mlx-serve/providers.json, src/providers.zig).
+# test_providers.sh — upstream chat providers (~/.mlx-serve/providers.json) end to end, no model: two Python stubs,
+# one listing /v1/models and one without a list (declared `models` used); scratch HOME.
 #
-# Two Python stubs stand in for providers: one lists models on /v1/models,
-# one has no model list at all (404) and relies on the declared `models`.
-# The server boots headless with NO model; everything it answers about
-# `<id>@<provider>` is proxied. HOME is redirected so the real config is
-# never touched.
+#   ./tests/test_providers.sh [port]
 #
-# Usage: ./tests/test_providers.sh [port]
+# Checks: listed rows with twinned context_length, disabled rows absent, chat proxied with `api_key_env` winning and
+# the bare model id, de-chunked SSE relay under our head, `/v1/messages` a named 400, GET /v1/providers, rows that
+# drop when a stub dies and return on reload, the `[providers]` log lines. Hermetic twins: host/api/providers.zig tests.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8177}
 BASE="http://127.0.0.1:$PORT"
@@ -84,11 +84,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for i in $(seq 1 60); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    [ "$i" -eq 60 ] && { echo "FAIL: server did not start"; cat "$WORK/server.log"; exit 1; }
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 || { echo "FAIL: server did not start"; cat "$WORK/server.log"; exit 1; }
 
 check() { TOTAL=$((TOTAL + 1)); if [ "$2" = PASS ]; then PASS=$((PASS + 1)); echo "  PASS: $1"; else FAIL=$((FAIL + 1)); echo "  FAIL: $1 — ${3:-}"; fi; }
 wait_rows() { # wait_rows <jq filter> <expected>

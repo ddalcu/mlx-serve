@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump the MageFlow VAE-DECODE parity fixture for src/mage_flow.zig.
+"""Dump the MageFlow VAE-DECODE parity fixture for src/plugins/mage_flow/mage_flow.zig.
 
 Runs the pure-MLX REFERENCE (ivanfioravanti/mflux@mage-flow-mlx) `MageVAE.decode`
 in FP32 over a deterministic latent and writes one safetensors the Zig oracle

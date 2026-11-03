@@ -9,6 +9,7 @@
 # Usage: ./tests/test_load_model_api.sh [model_dir_root] [port]
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 ROOT="${1:-$HOME/.mlx-serve/models}"
 PORT="${2:-8101}"
@@ -42,10 +43,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in $(seq 1 30); do
-    curl -fs "$BASE/health" >/dev/null 2>&1 && break
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || true
 
 FAIL=0
 echo "== POST /v1/load-model id=$M2 =="
