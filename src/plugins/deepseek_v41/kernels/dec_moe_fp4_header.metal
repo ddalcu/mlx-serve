@@ -53,25 +53,25 @@ inline void dec_fp4_up_routed(const device uint32_t* w, const device uint8_t* sc
   acc[1] = simd_sum(acc[1]);
 }
 
-// A simdgroup's sum of the expert row `row` of the fused-down bank (mxfp4, K inputs) against `x`.
+// A lane's part of the expert row `row` of the fused-down bank (mxfp4, K inputs) against `x`: units first, first + step...
 template <int K, typename T>
-inline float dec_fp4_down_routed(const device uint32_t* w, const device uint8_t* sc, size_t row, const device T* x, uint lane) {
+inline float dec_fp4_down_routed(const device uint32_t* w, const device uint8_t* sc, size_t row, const device T* x, uint first, uint step) {
   constexpr uint NU = K / 32;
   const device uint4* wp = (const device uint4*)(w + row * (K / 8));
   const device uint8_t* sp = sc + row * (K / 32);
   float acc = 0.0f;
-  for (uint u = lane; u < NU; u += 32) acc = fma(dec_fp4_scale(uint(sp[u])), dec_fp4_dot(wp[u], (const device uint4*)x + u * 4), acc);
+  for (uint u = first; u < NU; u += step) acc = fma(dec_fp4_scale(uint(sp[u])), dec_fp4_dot(wp[u], (const device uint4*)x + u * 4), acc);
   return acc;
 }
 
-// A simdgroup's sum of the shared expert's down row `row` (mxfp8, K inputs: a unit is 32 bytes) against `x`.
+// A lane's part of the shared expert's down row `row` (mxfp8, K inputs: a unit is 32 bytes) against `x`, as above.
 template <int K, typename T>
-inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t* ss, size_t row, const device T* x, uint lane) {
+inline float dec_fp4_down_shared(const device uint32_t* sw, const device uint8_t* ss, size_t row, const device T* x, uint first, uint step) {
   constexpr uint NU = K / 32;
   const device uint4* wp = (const device uint4*)(sw + row * (K / 4));
   const device uint8_t* sp = ss + row * (K / 32);
   float acc = 0.0f;
-  for (uint u = lane; u < NU; u += 32) {
+  for (uint u = first; u < NU; u += step) {
     const uint4 q0 = wp[2 * u], q1 = wp[2 * u + 1];
     const uint qs[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
     float d = 0.0f;

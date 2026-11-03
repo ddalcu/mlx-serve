@@ -949,10 +949,11 @@ pub const HotPrefixCache = struct {
     /// Load-time gate after the plugin has loaded. Auxiliary-only caches use the module
     /// commit/restore functions; their disk tier, if any, is a module tier (`DiskTier.initWithModule`).
     pub fn shouldUseInstance(config: *const model_mod.ModelConfig, enable_ssm_checkpoints: bool, xfm: *const transformer_mod.Transformer) bool {
-        // A module snapshot holds this rank's state only: a pipeline or tensor-parallel worker holds the rest.
+        // A module snapshot holds this rank's state only: a pipeline worker holds the rest at the live position, and a
+        // tensor split's plugin says through its enabled hook whether its workers keep their halves of each snapshot.
         // Other models keep `shouldUse` exactly (a tensor-parallel rank 0 keeps its KV cache: the worker is stateless).
         if (plugin_driver.auxBinding(xfm) != null) {
-            if (config.glm_stream or config.dist_span != null or config.dist_shard != null or config.expert_bank) return false;
+            if (config.glm_stream or config.dist_span != null or config.expert_bank) return false;
             // The plugin's eligibility hook also excludes paired and streamed loaded instances.
             return ModuleBinding.init(xfm) != null;
         }
@@ -11222,7 +11223,7 @@ test "HotPrefixCache module: model bindings cannot select or consume each other'
     try testing.expectEqual(@as(?*ModuleFake.Snap, &b), models[1].restored);
 }
 
-test "HotPrefixCache module: loaded instance gate keeps distributed and streamed packs cold" {
+test "HotPrefixCache module: loaded instance gate keeps pipeline and streamed packs cold, a tensor split's plugin decides" {
     var fake: ModuleFake = .{};
     var bound: plugin_driver.Bound = undefined;
     var xfm: transformer_mod.Transformer = undefined;
@@ -11246,10 +11247,12 @@ test "HotPrefixCache module: loaded instance gate keeps distributed and streamed
     cfg.dist_span = .{ .start = 0, .end = 1, .total = 2 };
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.dist_span = null;
+    // Its workers may keep their halves of each snapshot: the plugin's enabled hook says.
     cfg.dist_shard = .{ .rank = 0, .size = 2 };
+    try testing.expect(HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    fake.enabled = false;
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
-    cfg.legacy.caps.prefix_cache = true;
-    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
+    fake.enabled = true;
     cfg.dist_shard = null;
     cfg.legacy.caps.prefix_cache = false;
     xfm.plugin = null;

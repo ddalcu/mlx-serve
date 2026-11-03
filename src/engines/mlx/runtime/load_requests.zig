@@ -141,11 +141,7 @@ fn readyLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
 fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror) void {
     log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, loadErrorName(err) });
     sch.registry.mutex.lockUncancelable(sch.io);
-    if (err == error.InsufficientMemory) {
-        // A memory-preflight refusal is transient, not a property of the
-        // checkpoint: the 503 tells the user to free memory and retry, so
-        // the entry must go back to .unloaded — stuck in .error_state the
-        // retry would fail fast until a server restart (#144).
+    if (failureRetries(loadErrorName(err))) {
         sch.registry.markUnloadedLocked(req.entry);
     } else {
         // markErrorLocked dupes the error name onto the entry; the
@@ -154,6 +150,12 @@ fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror) void {
     }
     sch.registry.mutex.unlock(sch.io);
     finishLoadRequest(sch, req, loadErrorName(err));
+}
+
+/// A refusal the user fixes outside the pack (free memory, start the worker Mac) leaves the entry
+/// `.unloaded`: in `.error_state` every retry would fail fast until a server restart.
+fn failureRetries(name: []const u8) bool {
+    return std.mem.eql(u8, name, "InsufficientMemory") or std.mem.eql(u8, name, "DistWorkerNotJoined");
 }
 
 fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
@@ -211,4 +213,11 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     req.done = true;
     req.done_cond.broadcast(sch.io);
     req.done_mu.unlock(sch.io);
+}
+
+test "a load refused for memory or an absent worker Mac is retried by the next request; a broken pack stays failed" {
+    try std.testing.expect(failureRetries("InsufficientMemory"));
+    try std.testing.expect(failureRetries("DistWorkerNotJoined"));
+    try std.testing.expect(!failureRetries("MissingWeight"));
+    try std.testing.expect(!failureRetries("DistWorkerMissingModel"));
 }

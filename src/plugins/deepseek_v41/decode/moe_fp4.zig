@@ -97,6 +97,17 @@ pub fn runUp(sc: *dsv41.Scope, kern: Kernels, rows: usize, k: usize, n: usize, t
     return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
+/// Output columns a down threadgroup takes: the fewest whose lanes split a row's K / 32 units evenly (32 / NC lanes a
+/// column), else 8; null where N or the combine's lanes (NC x hc) do not fit.
+pub fn downCols(k: usize, n: usize, hc: usize) ?usize {
+    const units = k / 32;
+    const nc: usize = for ([_]usize{ 1, 2, 4, 8 }) |c| {
+        if (units % (32 / c) == 0) break c;
+    } else 8;
+    if (n % nc != 0 or nc * hc > 32) return null;
+    return nc;
+}
+
 /// x' `[R, hc, N]` = `hcExpand(x1, y, sp)` for y = the `idx` `[R, k]` experts' down rows plus the shared expert's over
 /// `act` `[R, k + 1, K]` (what `moeUp` makes). Null where the kernel does not serve the call: the down bank is not
 /// mxfp4 group 32, the shared is not mxfp8, the stream is not bf16, or K is not a multiple of 32.
@@ -123,10 +134,11 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const shape = [_]c_int{ ci(R), ci(hc), ci(N) };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
+    const nc = downCols(K, N, hc) orelse return null;
     const tg = 32 * (topk + 1);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N * tg), ci(R), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), ci(R), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
-    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
     const ins = [_]A{ act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -422,13 +434,15 @@ const DownK = struct {
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows < 1 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 32 != 0 or p.experts < TOPK or p.experts > 64) return null;
+        const nc = downCols(s.k, s.n, HC) orelse return null;
         const tg = 32 * (TOPK + 1);
-        var g = metal.Geometry{ .grid = .{ ci(s.n * tg), ci(s.rows), 1 }, .tg = .{ tg, 1, 1 } };
+        var g = metal.Geometry{ .grid = .{ ci(s.n / nc * tg), ci(s.rows), 1 }, .tg = .{ tg, 1, 1 } };
         g.out(&.{ ci(s.rows), HC, ci(s.n) }, adt);
         g.int("K", s.k);
         g.int("N", s.n);
         g.int("TOPK", TOPK);
         g.int("HC", HC);
+        g.int("NC", nc);
         g.dtype("T", adt);
         return g;
     }

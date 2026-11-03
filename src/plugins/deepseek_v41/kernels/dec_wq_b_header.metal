@@ -38,10 +38,19 @@ METAL_FUNC void dsv41_wqb_load(thread dsv41_wqb_w<NP>& w, const device uint4* wp
   }
 }
 
-// Those rows against R rows of x, held as float4 chunks: chunk (r, s, t, j) at ((r * 5 + s) * 4 + t) * 16 + j for
-// k = 256 s + 16 j + 4 t, so the 16 lanes of a half read consecutive float4s.
+// The bits of `v`, a value bf16 holds exactly.
+inline ushort dsv41_wqb_bf(float v) {
+  return ushort(as_type<uint>(v) >> 16);
+}
+
+inline float4 dsv41_wqb_unbf(ushort4 v) {
+  return float4(as_type<float>(uint(v.x) << 16), as_type<float>(uint(v.y) << 16), as_type<float>(uint(v.z) << 16), as_type<float>(uint(v.w) << 16));
+}
+
+// Those rows against R rows of x, held as chunks of four bf16: chunk (r, s, t, j) at ((r * 5 + s) * 4 + t) * 16 + j for
+// k = 256 s + 16 j + 4 t, so the 16 lanes of a half read consecutive chunks.
 template <int R, int NP>
-METAL_FUNC void dsv41_wqb_dots(const thread dsv41_wqb_w<NP>& w, const threadgroup float4* xs, uint lane, thread float (&acc)[NP][R]) {
+METAL_FUNC void dsv41_wqb_dots(const thread dsv41_wqb_w<NP>& w, const threadgroup ushort4* xs, uint lane, thread float (&acc)[NP][R]) {
   const uint j = lane & 15;
   for (int p = 0; p < NP; ++p) {
     for (int r = 0; r < R; ++r) acc[p][r] = 0.0f;
@@ -51,8 +60,8 @@ METAL_FUNC void dsv41_wqb_dots(const thread dsv41_wqb_w<NP>& w, const threadgrou
       for (int i = 0; i < 4; ++i) wv[i] = dsv41_wqb_e4m3x4(u[i]);
       const float sf = dsv41_wqb_scale(w.e[p][s]);
       for (int r = 0; r < R; ++r) {
-        const threadgroup float4* xr = xs + (r * 5 + s) * 64 + j;
-        const float4 x0 = xr[0], x1 = xr[16], x2 = xr[32], x3 = xr[48];
+        const threadgroup ushort4* xr = xs + (r * 5 + s) * 64 + j;
+        const float4 x0 = dsv41_wqb_unbf(xr[0]), x1 = dsv41_wqb_unbf(xr[16]), x2 = dsv41_wqb_unbf(xr[32]), x3 = dsv41_wqb_unbf(xr[48]);
         float d = x0.x * wv[0].x;
         d = metal::fma(x0.y, wv[0].y, d);
         d = metal::fma(x0.z, wv[0].z, d);
