@@ -190,6 +190,22 @@ pub fn argmax(logits: []const f16) u32 {
     return @intCast(best);
 }
 
+/// First vocabulary row of each logit part. The compiled program lists its outputs by NAME
+/// ("logits10" before "logits2"), so the parts arrive out of vocabulary order past ten of them.
+fn partStarts(names: []const []const u8, sizes: []const u32, base: u32, out: []u32) void {
+    for (names, 0..) |name, i| {
+        const k = partIndex(name);
+        out[i] = base;
+        for (names, sizes) |other, n| {
+            if (partIndex(other) < k) out[i] += n;
+        }
+    }
+}
+
+fn partIndex(name: []const u8) u32 {
+    return std.fmt.parseInt(u32, name["logits".len..], 10) catch unreachable;
+}
+
 pub const Cand = struct { logit: f32, id: u32 };
 
 /// Rule out `ids` and every row from `defined_vocab` on (0 = none) before anything samples `row`.
@@ -895,6 +911,8 @@ pub const Engine = struct {
     /// The head over a decode call's last round, each lane's logits parts (lane 0's first).
     head_round: Rounds = .{},
     logit_parts: []*Buf = &.{},
+    /// `logit_parts[i]`'s first vocabulary row.
+    part_start: []u32 = &.{},
     /// Decode rounds per (context, parity); prefill rounds per (parity, history slice), at the
     /// current context.
     plans: []?Rounds,
@@ -1043,6 +1061,7 @@ pub const Engine = struct {
         var total: usize = 0;
         for (m.head_parts[0..m.lanes]) |n| total += n;
         self.logit_parts = try a.alloc(*Buf, total);
+        self.part_start = try a.alloc(u32, total);
         const site: Site = .{ .unit = 0, .lane = 0, .kind = .decode, .round = m.headRound(), .layer = m.arch.layers, .j = 0, .par = 0, .fused = m.fused() };
         var o: usize = 0;
         for (0..m.lanes) |l| {
@@ -1061,7 +1080,15 @@ pub const Engine = struct {
                 self.logit_parts[o + i] = try self.newBuf(io, io.nameSlice());
                 outs[i] = self.logit_parts[o + i].surf.ref;
             }
-            o += m.head_parts[l];
+            var names: [32][]const u8 = undefined;
+            var sizes: [32]u32 = undefined;
+            for (0..m.head_parts[l]) |i| {
+                names[i] = self.logit_parts[o + i].name;
+                sizes[i] = self.logit_parts[o + i].t.dims[1];
+            }
+            const n = m.head_parts[l];
+            partStarts(names[0..n], sizes[0..n], q35.headHalf(m.arch.vocab, @intCast(l), m.lanes).lo, self.part_start[o..][0..n]);
+            o += n;
             var err: rt.ErrBuf = .{};
             try self.own(&self.head_round, l, try h.request(self.instance, m.head_proc[l], ins[0..ni], outs[0..m.head_parts[l]], &err));
         }
@@ -1658,15 +1685,13 @@ pub const Engine = struct {
     pub fn logitsRow(self: *Engine, r: usize) []const f16 {
         const V = self.model.arch.vocab;
         if (!self.rows_ready) {
-            var o: usize = 0;
-            for (self.logit_parts) |b| {
+            for (self.logit_parts, self.part_start) |b, o| {
                 const n = b.t.dims[1];
                 const pitch = b.t.strides[1];
                 for (0..n) |v| {
                     const line: [*]align(1) const f16 = @ptrCast(b.t.base + v * pitch);
                     for (0..P) |row| self.rows[row * V + o + v] = line[row];
                 }
-                o += n;
             }
             for (0..P) |row| suppress(self.rows[row * V ..][0..V], self.model.suppress_ids, self.model.defined_vocab);
             self.rows_ready = true;
@@ -2259,6 +2284,22 @@ test "gauges: a sync counts what it will feed and what it fed, and takes both ba
     try testing.expectEqual(@as(i64, 64), heard.n[@intFromEnum(abi.Progress.prefill_done)]);
     e.ungauge();
     try testing.expectEqual(@as(i64, 0), heard.n[@intFromEnum(abi.Progress.prefill_todo)] + heard.n[@intFromEnum(abi.Progress.prefill_done)]);
+}
+
+test "partStarts: parts listed by name still land at their own vocabulary rows" {
+    const names = [_][]const u8{ "logits0", "logits1", "logits10", "logits11", "logits2", "logits3", "logits4", "logits5", "logits6", "logits7", "logits8", "logits9" };
+    var sizes: [12]u32 = undefined;
+    for (&sizes, names) |*z, nm| z.* = 100 + (std.fmt.parseInt(u32, nm["logits".len..], 10) catch unreachable);
+    var got: [12]u32 = undefined;
+    partStarts(&names, &sizes, 1000, &got);
+    var want: u32 = 1000;
+    for (0..12) |k| {
+        const at = for (names, 0..) |nm, i| {
+            if ((std.fmt.parseInt(u32, nm["logits".len..], 10) catch unreachable) == k) break i;
+        } else unreachable;
+        try testing.expectEqual(want, got[at]);
+        want += 100 + @as(u32, @intCast(k));
+    }
 }
 
 test "suppress: reserved ids and padding rows are never drawn" {
