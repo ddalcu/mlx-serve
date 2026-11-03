@@ -320,7 +320,7 @@
 "From an attached first frame" = "첨부한 첫 프레임에서";
 "Recommended" = "권장";
 "Common tempos" = "일반적인 템포";
-"Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens." = "브라우저 로그인을 사용하려면 비워 두세요(권장). 헤드리스 또는 CI에서만 입력하세요. dev.azure.com/<org>/_usersSettings/tokens에서 생성합니다.";
+"Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens. A saved token is kept when this is blank; remove it in mcp.json." = "브라우저 로그인을 사용하려면 비워 두세요(권장). 헤드리스 또는 CI에서만 입력하세요. dev.azure.com/<org>/_usersSettings/tokens에서 생성합니다. 비워 두면 저장된 토큰이 유지됩니다. 삭제하려면 mcp.json에서 제거하세요.";
 "simmering" = "차근차근 생각 중";
 "Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off." = "탭한 각 텍스트 인코더 레이어의 기여도를 조절합니다(1 = 중립). 비워 두면 끔.";
 "Loading…" = "로드 중…";
