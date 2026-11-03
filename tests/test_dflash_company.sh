@@ -7,6 +7,7 @@
 # Three simultaneous greedy requests: the slot admitted first arms DFlash, the others arm MTP. It must
 # not yield (`dflash=disabled (company`) until the others are a crowd. Engagement counts from the log,
 # never output shape. `MLX_SERVE_BINARY` points the test at another build, e.g. main for the red run.
+# SKIPs without the env vars. Hermetic twin: the `yieldsToCompany` arms in engines/mlx/scheduler.zig.
 
 set -euo pipefail
 

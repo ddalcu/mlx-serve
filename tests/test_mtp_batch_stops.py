@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
-"""Live EOS/cancellation parity against a running server.
+"""GROUPED MTP over HTTP (`enable_batch_mtp`): EOS inside an accepted draft block, and one row of a group cancelled
+mid-round, against a server the CALLER boots with native MTP, --mtp-min-depth 4
+--mtp-max-depth 4 and --log-level debug.
 
-Start it with native MTP, MLX_SERVE_MTP_GROUP_PLANNER=1, and
---mtp-min-depth 4 --mtp-max-depth 4 so both arms use the same verify width.
-The caller owns model loading and GPU/thermal controls.
+  python3 tests/test_mtp_batch_stops.py <port> --server-log <that log> [--out <dir>]
+
+Solo references are each prompt's SECOND run (a first run computes its prefix, later ones restore it, not bit-exact).
+[1] the survivor beside an accepted-draft EOS keeps speculating (plain <= 2) and both streams equal solo; [2] a row
+RST mid-round is a prefix of its solo run and the survivor still equals solo. Both need `[mtp-planner-stats]`, and
+the run needs `[batched] row-axis mtp verify engaged (slots=2`. Mismatches land as <label>.expected/.actual.json.
 """
 import argparse
 import concurrent.futures

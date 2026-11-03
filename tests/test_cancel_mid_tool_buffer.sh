@@ -1,22 +1,14 @@
 #!/bin/bash
-# Guard: disconnecting WHILE the stream is buffering for tool detection leaves
-# no leak and no wedge.
+# test_cancel_mid_tool_buffer.sh — a client that disconnects WHILE the stream buffers for tool detection (server holds
+# an unflushed buffer AND a live slot, nothing sent yet). test_disconnect_cancel.sh covers prose streams only.
 #
-# With tools present the server emits nothing until the pattern resolves — it
-# holds tokens, sometimes for a long one-shot write_file. That buffering window
-# is the one place a client can vanish while the server owns an unflushed
-# buffer AND a live slot, and it is not covered by test_disconnect_cancel.sh
-# (which cancels a plain prose stream, where every token has already gone out).
+#   CANCEL_TEST_MODEL=<dir> ./tests/test_cancel_mid_tool_buffer.sh [port]   # CANCEL_ROUNDS=5
 #
-# The test drops the connection mid-buffer, several times, then asserts:
-#   • the server cancels the slot rather than generating to max_tokens
-#   • memory does not climb across the cycles (the buffer is freed)
-#   • the server still answers, with tools and without, afterwards
-#
-# Usage: CANCEL_TEST_MODEL=<dir> ./tests/test_cancel_mid_tool_buffer.sh [port]
-#   CANCEL_ROUNDS=5
+# Per round one `[cancel]` line (the slot is cancelled, not run to max_tokens); `active_bytes` does not climb across
+# rounds (the buffer is freed); the server still answers with tools and without afterwards.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${CANCEL_TEST_MODEL:-}"
 PORT="${1:-8137}"
@@ -37,8 +29,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -f "$LOG"; }
 trap cleanup EXIT
-for i in $(seq 1 300); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf "$BASE/health" >/dev/null 2>&1 || { echo "FAIL: server did not start"; exit 1; }
+srv_wait_health "$BASE" 300 1 || { echo "FAIL: server did not start"; exit 1; }
 
 mem_bytes() { curl -sf -m 10 "$BASE/props" 2>/dev/null \
     | python3 -c "import json,sys; d=json.load(sys.stdin); print((d.get('memory') or {}).get('active_bytes') or 0)" 2>/dev/null || echo 0; }

@@ -19,6 +19,7 @@ extension AppState {
         case .system: return .system(voice.selectedVoiceId ?? "")
         case .kokoro: return .kokoro(serverOptions.kokoroVoice)
         case .clone:  return .clone(serverOptions.voiceClonePath)
+        case .lfm3:   return .lfm3(serverOptions.lfm3Voice)
         }
     }
 

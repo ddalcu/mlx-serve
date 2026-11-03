@@ -34,7 +34,7 @@ mlx-serve launch codex -- resume     # -- 之后的参数全部传给 agent
 
 如果没有服务器在运行，`launch` 会启动 MLX-Serve 应用并等待；没装该应用时它会提示你先运行 `mlx-serve serve`。可用参数：`--model`、`--url`、`--port`、`--print`（只写出配置并打印启动脚本，而不真正运行）、`--no-start`。
 
-两个启动器都会把配置写进专用的 `~/.mlx-serve/<agent>/` 目录，绝不碰你真正的 Agent 配置（`~/.claude`、`~/.pi`、`~/.omp`、`~/.codex`、`~/.hermes` 还是你的）。Codex 例外：它直接使用你真正的 Codex home，让 MCP 服务器、插件和登录照常工作 —— 见 [Codex](#codex)。
+两个启动器都会把配置写进专用的 `~/.mlx-serve/<agent>/` 目录，绝不碰你真正的 Agent 配置（`~/.claude`、`~/.pi`、`~/.omp`、`~/.codex`、`~/.hermes` 还是你的）。Codex 例外：它直接使用你真正的 Codex home，让 MCP 服务器、插件和登录照常工作；启动器为它只写一个文件 `~/.mlx-serve/codex/model-instructions.md`，绝不写进你的 Codex home —— 见 [Codex](#codex)。
 
 ## 编码 Agent（手动配置）
 
@@ -156,7 +156,7 @@ opencode --standalone
 
 ### Codex
 
-当前的 Codex 只支持 OpenAI Responses 协议，mlx-serve 在 `/v1/responses` 提供它。mlx-serve 不往你的 Codex home（`${CODEX_HOME:-$HOME/.codex}`）写任何东西：它的设置以 `-c key=value` 覆盖参数传入，由 codex 合并到你自己的 `config.toml` 之上，所以你的 MCP 服务器、插件、登录和项目信任照常工作。无需配置 key：没有设置 `env_key` 时，codex 会跳过登录界面。codex 启动不携带 mlx-serve skill，因为 codex 没有额外 skill 目录的设置项。
+当前的 Codex 只支持 OpenAI Responses 协议，mlx-serve 在 `/v1/responses` 提供它。mlx-serve 不往你的 Codex home（`${CODEX_HOME:-$HOME/.codex}`）写任何东西：它的设置以 `-c key=value` 覆盖参数传入，由 codex 合并到你自己的 `config.toml` 之上，所以你的 MCP 服务器、插件、登录和项目信任照常工作。无需配置 key：没有设置 `env_key` 时，codex 会跳过登录界面。codex 启动不携带 mlx-serve skill，因为 codex 没有额外 skill 目录的设置项。启动器还会写入 `~/.mlx-serve/codex/model-instructions.md` —— 本仓库自撰的简短 base instructions，向本地模型教授当前 codex 的工具契约（codex 内置的回退提示词提到当前二进制已不再声明的工具，并且模型只叙述下一步时回合就会结束）—— 并以 `-c model_instructions_file=…` 传入；`MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off`（或 `0`）、或该文件不存在时，codex 保持自己的回退提示词。
 
 PATH 里没有 `codex`，但你有 ChatGPT 桌面应用？它把 CLI 打包在 `/Applications/ChatGPT.app/Contents/Resources/codex`（启动器会自动在那里找到它；`mlx-serve launch chatgpt` 同样可用）。
 
@@ -171,6 +171,8 @@ codex \
   -c 'model_providers.mlx.base_url="http://127.0.0.1:11234/v1"' \
   -c 'model_providers.mlx.wire_api="responses"'
 ```
+
+除以上各行之外，`mlx-serve launch codex` 还会传入 `-c model_instructions_file="$HOME/.mlx-serve/codex/model-instructions.md"`，指向它写下的文件；该路径不存在时 codex 会拒绝启动，所以手动运行 codex 而没有这个文件时请省略这一行。
 
 ### Hermes
 

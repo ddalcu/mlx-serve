@@ -1,45 +1,19 @@
 #!/bin/bash
-# llmprobe_smoke_test.sh — birds-eye conformance + speed across every MLX model
-# family this machine has, under each speculative-decoding config.
+# llmprobe_smoke_test.sh — birds-eye conformance + speed for every MLX model family on the box, under each
+# speculative-decoding config. One headless server groups /v1/models into families (`familyKey` = base arch +
+# MoE-ness) and picks one representative each; then one server per CELL runs `npx llmprobe --quick --bench`:
+# none (--no-pld --no-mtp), pld, mtp (a head ships), drafter (Gemma 4 dense + an assistant), plus --kv-quant 4 on the
+# fastest model. Zig MLX only; boots --prefix-cache-entries 0 (llmprobe resends one prompt).
 #
-# What it does
-#   1. Boots ONE headless server over --model-dir, reads /v1/models, and groups
-#      what it finds into families (gemma4, gemma4-moe, qwen3_5, qwen3_5-moe,
-#      gemma3, ...). Picks one representative per family. GGUF (llama.cpp /
-#      ds4), encoders and media models are out of scope — Zig MLX only.
-#   2. For each representative, boots a server per CELL and runs `npx llmprobe`:
-#        none      --no-pld --no-mtp       (PLD is default-ON: a real baseline
-#                                           needs BOTH flags)
-#        pld       --pld --no-mtp
-#        mtp       --no-pld --mtp          (only when the dir ships an MTP head;
-#                                           --mtp is what makes the cell real on
-#                                           a MoE target, whose per-request
-#                                           default is OFF)
-#        drafter   --drafter <assistant>   (Gemma 4 dense only)
-#      Plus, on the ONE fastest model, a KV-quant crash check at its default
-#      spec config: --kv-quant 4.
-#   3. Scrapes each server log for `[spec-stats] mode=` — throughput alone cannot
-#      prove a spec path engaged (the regular-decode fallback is output-identical;
-#      that is how a hardcoded use_drafter=false survived a month).
-#   4. Prints a birds-eye table + flags any cell whose conformance dropped
-#      against its own family's baseline.
+#   ./tests/llmprobe_smoke_test.sh   # SMOKE_MODELS, SMOKE_CELLS, SMOKE_DEPTH quick|default|full, SMOKE_MAX_GB (60),
+#                                    # SMOKE_PLAN_ONLY=1, BINARY, PORT, MODEL_DIR, LLMPROBE
 #
-# Usage
-#   ./tests/llmprobe_smoke_test.sh
-#   SMOKE_MODELS=mlx-community/gemma-4-e4b-it-4bit ./tests/llmprobe_smoke_test.sh
-#   SMOKE_DEPTH=default ./tests/llmprobe_smoke_test.sh   # + capability evals (slower)
-#   SMOKE_MAX_GB=200 ./tests/llmprobe_smoke_test.sh      # let the giants in
-#   SMOKE_PLAN_ONLY=1 ./tests/llmprobe_smoke_test.sh     # print the plan, run nothing
-#   SMOKE_CELLS=mtp ./tests/llmprobe_smoke_test.sh       # re-run one cell everywhere
-#
-# Env: BINARY PORT MODEL_DIR SMOKE_DEPTH SMOKE_MODELS SMOKE_CELLS SMOKE_MAX_GB
-#      SMOKE_TIMEOUT SMOKE_CTX SMOKE_PREFIX_CACHE
-#      LLMPROBE (default: `npx --yes llmprobe`)
-#
-# Output: tests/llmprobe-smoke-results/ (per-cell .json + .server.log, rows.json,
-# summary.tsv). Exit 1 if any cell failed.
+# The engagement column is the point: an mtp cell with no `[spec-stats] mode=` line FAILS, and so does a cell that
+# disabled speculation yet engaged (its flags never landed). Output tests/llmprobe-smoke-results/, exit 1 on a failed
+# cell. The decision layer is tests/llmprobe_smoke_lib.mjs (`node --test tests/llmprobe_smoke_lib.test.mjs`).
 
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 
@@ -79,11 +53,8 @@ boot() {
     local logf="$1"; shift
     "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --log-level info "$@" >"$logf" 2>&1 &
     SERVER_PID=$!
-    for _ in $(seq 1 600); do
-        if curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then return 0; fi
-        kill -0 "$SERVER_PID" 2>/dev/null || return 1
-        sleep 1
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 600 1 "$SERVER_PID" && return 0
+    kill -0 "$SERVER_PID" 2>/dev/null || return 1
     return 1
 }
 

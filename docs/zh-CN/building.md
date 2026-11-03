@@ -41,7 +41,7 @@ zig build -Doptimize=ReleaseFast                     # 始终用 ReleaseFast；D
 
 ## 封闭式测试（Linux 上也可以）
 
-逐步预览编码器（`src/preview.zig` + `src/jpeg.zig` + `src/latent_rgb.zig`）不链接 MLX，也不链接 Homebrew webp，因此任何机器（包括 Linux Cloud Agent）都能在没有 GPU 的情况下构建并运行它：
+逐步预览编码器（`src/sdk/media/preview.zig` + `src/sdk/media/jpeg.zig` + `src/sdk/media/latent_rgb.zig`）不链接 MLX，也不链接 Homebrew webp，因此任何机器（包括 Linux Cloud Agent）都能在没有 GPU 的情况下构建并运行它：
 
 ```bash
 ./scripts/fetch-zig.sh

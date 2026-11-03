@@ -34,6 +34,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Verify kernel checkout bytes
+        run: python tests/test_kernel_checkout.py
+
       - name: Compute pins
         id: pins
         shell: bash

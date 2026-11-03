@@ -10,9 +10,9 @@
 #   [8] the checkpoint's MTP heads draft (spec-stats mode=mtp)
 #   [9] a whole-file edit: prompt-lookup drafts commit long runs beside the heads
 #
-# Hermetic counterparts: the config-parse tests in model.zig, the generic-role-header
-# render test in chat.zig, the `mimo_v2 fixture` parity test in transformer.zig and the
-# `mimo mtp heads` oracle in mimo_mtp.zig.
+# Hermetic counterparts: the config-parse tests in engines/mlx/model.zig, the generic-role-header
+# render test in host/chat/chat.zig, the `mimo_v2 fixture` parity test in engines/mlx/transformer.zig and the
+# `mimo mtp heads` oracle in src/plugins/mimo_v2/mtp.zig.
 
 set -euo pipefail
 

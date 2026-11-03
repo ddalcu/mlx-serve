@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# MOSS-Image on the ONE main server: headless boot -> load the diffusers pack by
-# absolute path -> /v1/models ready with the image capability -> txt2img PNG of
-# the requested size at the default CFG 3 (two forwards per step, by the log)
-# -> guidance 1.0 runs one forward and renders differently -> a layout JSON
-# prompt with the recommended negative is accepted -> img2img and edit are
-# named 400s -> unload.
+# test_moss_image_gen.sh — MOSS-Image on the diffusers pack: load by path (`image` capability + `MOSS-Image ready`), a
+# 512x512 PNG at the default CFG 3 by ENGAGEMENT (`guidance=3.0 (two forwards per step`), guidance_scale 1.0 running
+# one forward and rendering differently, a layout JSON prompt with the recommended negative tags accepted, img2img and
+# edit as named 400s, unload, alive + no MLX error. 8 steps: the wire contract, never picture quality.
 #
-# SKIPs without a pack (mlx-community/MOSS-Image-SFT-bf16). Few steps: only the
-# wire contract is asserted, never picture quality.
+#   MOSS_IMAGE_MODEL=<dir> ./tests/test_moss_image_gen.sh [port]   # default mlx-community/MOSS-Image-SFT-*
 #
-# Usage: MOSS_IMAGE_MODEL=<dir> ./tests/test_moss_image_gen.sh [port]
+# SKIPs without a pack. Parity: tests/dump_moss_image_fixtures.py + MOSS_IMAGE_TEST_MODEL / MOSS_IMAGE_FIXTURE.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11399}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -23,11 +22,7 @@ LOG="$OUT/server.log"
 "$BIN" --serve --model-dir "$OUT" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
-for _ in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 FAILS=0
 pass() { echo "PASS: $1"; }
 fail() { echo "FAIL: $1"; FAILS=$((FAILS + 1)); }

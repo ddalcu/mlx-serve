@@ -349,7 +349,7 @@ final class LocalizationTests: XCTestCase {
     /// the same evidence as adding a key: a branch that resolves in the table.
     private static let labelProducers = [
         "actionLabel", "actionTitle", "buttonLabel", "caption",
-        "controller.partialTranscript", "defect?.explanation", "detail", "displayName",
+        "defect?.explanation", "detail", "displayName",
         "engineExplainer", "label", "lead", "modeLabel", "modelPickerLabel", "placeholder", "pretty",
         "run.summary ?? run.status.label", "shortMessage", "startupModelLabel", "statusLine", "title",
     ]
@@ -644,11 +644,9 @@ final class LocalizationTests: XCTestCase {
     func testVoiceAndChatProducerValuesResolveInTheCatalog() throws {
         let keys = Set(try catalog().map(\.key))
 
-        for issue: VoicePreflight.Issue in [.microphoneDenied, .speechDenied,
-                                            .dictationUnavailable(locale: "en-US")] {
+        for issue: VoicePreflight.Issue in [.microphoneDenied, .asrMissing] {
             assertResolves(VoicePreflight.shortMessage(for: issue), "voice short message", keys: keys)
-            assertResolves(VoicePreflight.detail(for: issue), "voice detail",
-                           values: [("en-US", "%@")], keys: keys)
+            assertResolves(VoicePreflight.detail(for: issue), "voice detail", keys: keys)
             assertResolves(VoicePreflight.actionLabel(for: issue), "voice action", keys: keys)
         }
 

@@ -46,6 +46,11 @@ Read the linked file (next to this one) before writing client code for that
 endpoint. If no model has the capability the user needs, say so and tell them to
 download one in the MLX Core app (Models). Do not invent an id.
 
+3D has a default: Idol, the `3d` row whose id contains `Idol` (about 3 GB). Use it unless the user
+names another 3D model. If no listed `3d` model is Idol, stop and tell the user to download it (MLX Core:
+Models > Media > 3D, or `mlx-serve pull ddalcu/Idol-MLX-Serve-8bit` and then `POST /v1/models/rescan`);
+do not substitute another 3D model.
+
 ## Loading and memory
 
 - Any request names its model with `"model": "<id>"`. An unloaded model loads on

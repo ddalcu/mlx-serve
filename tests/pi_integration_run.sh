@@ -244,7 +244,7 @@ score_workspace_html() {
 }
 
 # Format-correctness audit (Layer 3 of the cross-model format suite; the other
-# layers are src/format_corpus_test.zig and tests/test_format_matrix.sh).
+# layers are src/host/chat/format_corpus_test.zig and tests/test_format_matrix.sh).
 # Appends markers to the TSV notes column — score is untouched, but any `-`
 # marker here is a hard-fail signal:
 #   -junk-filename(<name>)  a created file whose basename carries tag/quote/

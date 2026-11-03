@@ -1,0 +1,92 @@
+uint block = uint(threadgroup_position_in_grid.x);
+uint slot = uint(threadgroup_position_in_grid.y);
+ushort lane = thread_index_in_simdgroup;
+const uint eid = uint(slots[slot]);
+const uint base = block * 128u;
+const size_t xb = (size_t)slot * (size_t)(ODIM) + base;
+const size_t sb = (size_t)eid * (size_t)(ODIM) + base;
+const float sc = 0.08838834764831845f;
+float4 v = float4(float(ig[xb + lane]), float(ig[xb + lane + 32u]), float(ig[xb + lane + 64u]), float(ig[xb + lane + 96u]));
+for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+  const float p0 = simd_shuffle_xor(v.x, bit);
+  const float p1 = simd_shuffle_xor(v.y, bit);
+  const float p2 = simd_shuffle_xor(v.z, bit);
+  const float p3 = simd_shuffle_xor(v.w, bit);
+  const bool lower = (lane & bit) == 0u;
+  v.x = lower ? v.x + p0 : p0 - v.x;
+  v.y = lower ? v.y + p1 : p1 - v.y;
+  v.z = lower ? v.z + p2 : p2 - v.z;
+  v.w = lower ? v.w + p3 : p3 - v.w;
+}
+float s0 = v.x + v.y;
+float s1 = v.x - v.y;
+float s2 = v.z + v.w;
+float s3 = v.z - v.w;
+float g0 = (s0 + s2) * sc * float(svhg[sb + lane]);
+float g1 = (s1 + s3) * sc * float(svhg[sb + lane + 32u]);
+float g2 = (s0 - s2) * sc * float(svhg[sb + lane + 64u]);
+float g3 = (s1 - s3) * sc * float(svhg[sb + lane + 96u]);
+v = float4(float(iu[xb + lane]), float(iu[xb + lane + 32u]), float(iu[xb + lane + 64u]), float(iu[xb + lane + 96u]));
+for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+  const float p0 = simd_shuffle_xor(v.x, bit);
+  const float p1 = simd_shuffle_xor(v.y, bit);
+  const float p2 = simd_shuffle_xor(v.z, bit);
+  const float p3 = simd_shuffle_xor(v.w, bit);
+  const bool lower = (lane & bit) == 0u;
+  v.x = lower ? v.x + p0 : p0 - v.x;
+  v.y = lower ? v.y + p1 : p1 - v.y;
+  v.z = lower ? v.z + p2 : p2 - v.z;
+  v.w = lower ? v.w + p3 : p3 - v.w;
+}
+s0 = v.x + v.y;
+s1 = v.x - v.y;
+s2 = v.z + v.w;
+s3 = v.z - v.w;
+float u0 = (s0 + s2) * sc * float(svhu[sb + lane]);
+float u1 = (s1 + s3) * sc * float(svhu[sb + lane + 32u]);
+float u2 = (s0 - s2) * sc * float(svhu[sb + lane + 64u]);
+float u3 = (s1 - s3) * sc * float(svhu[sb + lane + 96u]);
+if constexpr (CLAMP_LIMIT > 0) {
+  g0 = min(g0, float(CLAMP_LIMIT)); g1 = min(g1, float(CLAMP_LIMIT));
+  g2 = min(g2, float(CLAMP_LIMIT)); g3 = min(g3, float(CLAMP_LIMIT));
+  u0 = clamp(u0, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+  u1 = clamp(u1, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+  u2 = clamp(u2, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+  u3 = clamp(u3, -float(CLAMP_LIMIT), float(CLAMP_LIMIT));
+}
+const float ysig0 = 1 / (1 + exp(abs(g0)));
+const float ysig1 = 1 / (1 + exp(abs(g1)));
+const float ysig2 = 1 / (1 + exp(abs(g2)));
+const float ysig3 = 1 / (1 + exp(abs(g3)));
+const float sig0 = (g0 < 0) ? ysig0 : 1 - ysig0;
+const float sig1 = (g1 < 0) ? ysig1 : 1 - ysig1;
+const float sig2 = (g2 < 0) ? ysig2 : 1 - ysig2;
+const float sig3 = (g3 < 0) ? ysig3 : 1 - ysig3;
+const float silu0 = g0 * sig0;
+const float silu1 = g1 * sig1;
+const float silu2 = g2 * sig2;
+const float silu3 = g3 * sig3;
+const float h0 = silu0 * u0;
+const float h1 = silu1 * u1;
+const float h2 = silu2 * u2;
+const float h3 = silu3 * u3;
+v = float4(h0 * float(suhd[sb + lane]), h1 * float(suhd[sb + lane + 32u]), h2 * float(suhd[sb + lane + 64u]), h3 * float(suhd[sb + lane + 96u]));
+for (ushort bit = 1u; bit <= 16u; bit <<= 1u) {
+  const float p0 = simd_shuffle_xor(v.x, bit);
+  const float p1 = simd_shuffle_xor(v.y, bit);
+  const float p2 = simd_shuffle_xor(v.z, bit);
+  const float p3 = simd_shuffle_xor(v.w, bit);
+  const bool lower = (lane & bit) == 0u;
+  v.x = lower ? v.x + p0 : p0 - v.x;
+  v.y = lower ? v.y + p1 : p1 - v.y;
+  v.z = lower ? v.z + p2 : p2 - v.z;
+  v.w = lower ? v.w + p3 : p3 - v.w;
+}
+s0 = v.x + v.y;
+s1 = v.x - v.y;
+s2 = v.z + v.w;
+s3 = v.z - v.w;
+yd[xb + lane] = half((s0 + s2) * sc);
+yd[xb + lane + 32u] = half((s1 + s3) * sc);
+yd[xb + lane + 64u] = half((s0 - s2) * sc);
+yd[xb + lane + 96u] = half((s1 - s3) * sc);

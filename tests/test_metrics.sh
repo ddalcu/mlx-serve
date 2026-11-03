@@ -4,7 +4,7 @@
 #   * GET /metrics.json  — open JSON feed (drives the console's Monitoring pane)
 #
 # There is NO admin dashboard, NO auth, and NO admin mutations — the panel is
-# open and read-only. (The old tests/test_admin_api.sh is retired.)
+# open and read-only.
 #
 # Tests:
 #  1. Without --metrics: /metrics + /metrics.json → 503.
@@ -14,10 +14,12 @@
 #
 # Usage: ./tests/test_metrics.sh [model_dir] [port]
 #   Starts its own servers. Default model: Gemma 4 E4B 8-bit.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
+MODEL="${1:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
 PORT="${2:-11291}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -47,10 +49,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
 sleep 1
 
 wait_health() {
-    for _ in $(seq 1 90); do
-        curl -sf "$BASE/health" >/dev/null 2>&1 && return 0
-        sleep 1
-    done
+    srv_wait_health "$BASE" 90 1 && return 0
     echo "FAIL: server never became healthy on port $PORT"
     return 1
 }

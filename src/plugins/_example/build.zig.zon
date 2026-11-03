@@ -1,0 +1,9 @@
+.{
+    .name = ._example,
+    .version = "0.0.0",
+    .fingerprint = 0x1aa47ae2399bc932,
+    .minimum_zig_version = "0.17.0",
+    // The kit's root: this folder ships as <kit>/examples/_example (`mlx-serve plugin new` writes the kit's path).
+    .dependencies = .{ .mlx_serve_kit = .{ .path = "../.." } },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig" },
+}

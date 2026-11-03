@@ -111,6 +111,10 @@ int32_t mlx_llama_seq_pos(mlx_llama_ctx *c, int32_t seq);
 int32_t mlx_llama_seq_sample(mlx_llama_ctx *c, int32_t seq, float temperature, int32_t top_k,
                              float top_p, float min_p, uint64_t *rng);
 
+// The logits row `seq`'s last decode left (n_vocab floats), or NULL when it has none. Writable: a row reshaped
+// here (penalties, logit bias) is the one mlx_llama_seq_sample draws from. Valid until the next decode.
+float  *mlx_llama_seq_logits(mlx_llama_ctx *c, int32_t seq);
+
 // One MTP round for `seq`: draft up to `max_drafts` tokens from the MTP head,
 // verify them after `id_last` (sampled, not yet in the KV) in one target pass,
 // and keep the run the target agrees with. Writes the accepted drafts followed

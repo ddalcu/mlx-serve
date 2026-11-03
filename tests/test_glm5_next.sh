@@ -1,25 +1,16 @@
 #!/bin/bash
-# GLM-5.3-Flash (glm5_next) live end-to-end on an MLX pack (TensorFold's GLM-5.3-Flash-MLX-*):
+# test_glm5_next.sh — GLM-5.3-Flash (glm5_next) live end to end on an MLX pack, scratch HOME: [0] advertised arch,
+# [1] short answer thinking off, [2] thinking on by default and low effort thinking less, [3] parallel tool calls,
+# [4] a tool round trip through the template (no fallback markup), [5] a needle past the indexer's 2048-token budget,
+# [6] prefix reuse, [7] clean streaming, [8] the MTP head drafting (`mode=mtp`), [9] concurrent requests in one batched
+# forward, [11] images (tower boot line, house.jpeg on the 36x54 grid with all 486 soft tokens, the street signs read,
+# a /v1/messages image block, image prefix reuse), no MLX error. [10] with GLM5_DRAFTER (a second boot): the DFlash2
+# policy engages on predictable text, stays armed on novel text, and leaves answers, streams, tool calls unchanged.
 #
-#   GLM5_PACK=~/.mlx-serve/models/TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP ./tests/test_glm5_next.sh
-#   (add GLM5_DRAFTER=~/.mlx-serve/models/incoai/GLM-5.3-Flash-DFlash2 for [10])
+#   GLM5_PACK=<pack> [GLM5_DRAFTER=<incoai/GLM-5.3-Flash-DFlash2>] ./tests/test_glm5_next.sh   # GLM5_TEST_PORT
 #
-#   [0] advertised as glm5_next      [4] tool round-trip renders the template, not the fallback
-#   [1] short answer, thinking off   [5] needle past the indexer's 2048-token budget (sparse path)
-#   [2] thinking on by default, and  [6] prefix reuse: cached tokens, same answer
-#       low effort thinks less       [7] streaming carries no think/tool markup
-#   [3] parallel tool calls             [8] the pack's MTP head loads and drafts
-#                                       [9] concurrent requests share one batched forward
-#   [11] images: the tower loads, house.jpeg lands on the reference's 36x54 grid (486 tokens) and all of
-#        them reach the prompt, the street signs' names are read (pixel-only content), /v1/messages takes an
-#        image block, and a repeated image turn reuses the prefix
-#   [10] with GLM5_DRAFTER=<incoai/GLM-5.3-Flash-DFlash2> (second boot): the DFlash2 round policy engages on
-#        predictable text, stays armed on novel text (plain rounds, never the sticky serial fallback), and
-#        leaves the answer, the stream, a tool call and concurrent requests unchanged
-#
-# Hermetic counterparts: the config-parse tests in model.zig, the effort and tool-history
-# render tests in chat.zig, and the `glm5_next fixture` + `glm5_next MTP fixture` parity
-# tests in transformer.zig.
+# Hermetic twins: the config-parse, effort and tool-history render tests, `glm5_next fixture` / `MTP fixture`.
+# Vision parity: tests/dump_glm5_next_vision_fixtures.py then GLM5_VISION_MODEL / GLM5_VISION_FIXTURE `glm vision`.
 
 set -euo pipefail
 
@@ -115,7 +106,7 @@ check "[7] streamed answer carries 12" "$S" "12"
 check_absent "[7] no think tags streamed" "$S" "<think"
 check_absent "[7] no tool markup streamed" "$S" "<tool_call"
 
-check "[8] MTP head loaded" "$(cat "$LOG")" "GLM MTP head ready"
+check "[8] MTP head loaded" "$(cat "$LOG")" "MTP head ready"
 check "[8] MTP drafted" "$(cat "$LOG")" "[spec-stats] mode=mtp"
 
 # [9] Concurrent requests decode in ONE batched forward (rows of a window; each slot's KDA state and
@@ -150,7 +141,7 @@ check "[9] 30-count stream correct under batching" "$CONC" "count30=True"
 check "[9] 45-count stream correct under batching" "$CONC" "count45=True"
 check "[9] 60-count stream correct under batching" "$CONC" "count60=True"
 check "[9] needle recovered under batching" "$CONC" "needle=741952"
-check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] glm batched decode engaged"
+check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] gdn batched decode engaged"
 
 # [11] Images. The grid and token accounting come from the log: a run of pads that missed the
 # splice still answers plausibly, so the signs' names (only the pixels carry them) are the bar.

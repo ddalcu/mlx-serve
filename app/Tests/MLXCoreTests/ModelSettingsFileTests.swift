@@ -1,7 +1,7 @@
 import XCTest
 @testable import MLXCore
 
-/// `~/.mlx-serve/model-settings.json` is the SERVER's file (`src/model_settings.zig`);
+/// `~/.mlx-serve/model-settings.json` is the SERVER's file (`src/host/registry/model_settings.zig`);
 /// the app only edits it, so it must write exactly the server's keys and never
 /// drop a key it does not know.
 final class ModelSettingsFileTests: XCTestCase {
@@ -74,6 +74,19 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertEqual(ModelSettingsFile.load(path: path).override(for: "/m/a")?.ane, true)
         XCTAssertNil(ModelOverride(json: ["ane": "yes"]).ane)
         XCTAssertTrue(o.changesLoad(from: ModelOverride()), "the engine is chosen at load")
+    }
+
+    func testTheEnginePickerWritesEngineAndRetiresTheAneSwitch() throws {
+        var o = ModelOverride(json: ["ane": true])
+        XCTAssertEqual(o.engineChoice, "ane", "an older file's switch reads as the engine")
+        XCTAssertEqual(ModelOverride(json: ["ane": false]).engineChoice, "mlx")
+        o.engineChoice = "mlx"
+        XCTAssertEqual(o.json["engine"] as? String, "mlx")
+        XCTAssertNil(o.json["ane"], "one key decides")
+        o.engineChoice = nil
+        XCTAssertTrue(o.isEmpty)
+        XCTAssertEqual(ModelOverride(json: ["engine": "llama"]).engineChoice, "llama")
+        XCTAssertTrue(ModelOverride(json: ["engine": "ds4"]).changesLoad(from: ModelOverride()))
     }
 
     /// `chat_template_kwargs` round-trips as one object: the rows the sheet

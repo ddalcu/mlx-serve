@@ -21,7 +21,9 @@ Not covered: embed_tokens (gather-read), lm_head and the final mixer (8-bit,
 bytes-heavy, no calibration payoff), the MTP head (4-bit, pinned).
 
 Corpus = the 27B collector's (agent traffic, code, prose, math), rendered with
-this model's own template; same held-out split.
+this model's own template; same held-out split. The HF QSA indexer loops over
+query positions in Python; `qsa_indexer_forward_vectorized` replaces it, mask-exact
+except on exact-zero score ties at the budget edge (`--verify-indexer N` checks).
 
 `--reference OUT` runs the HELD-OUT half instead and writes bf16 next-token logits at
 sampled positions (`ids`, `pos`, `logits` f16, `slice`) for tests/qwen38_flash_next_score.py,

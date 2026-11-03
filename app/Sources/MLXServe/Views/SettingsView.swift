@@ -123,6 +123,10 @@ struct SettingsView: View {
         ) {
             ModelFoldersSectionContent()
             ServerSectionContent()
+            // The Mac App Store build loads no plugins (its sandbox forbids it).
+            if !BuildFeatures.current.isMAS {
+                PluginsSectionContent()
+            }
         }
         SettingsSection(
             category: .memory,
@@ -1964,6 +1968,18 @@ private struct ProviderModelPickerSheet: View {
     }
 }
 
+/// Outside plugins live in Models > Plugins; Settings keeps a door to them.
+private struct PluginsSectionContent: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        SettingsRow(title: "Outside plugins",
+                    explainer: "Install, update, remove and switch on community plugins in Models > Plugins. The server reads the switches once at startup.") {
+            Button("Open Plugins") { appState.showModels(.plugins) }
+        }
+    }
+}
+
 private struct ServerSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -2374,7 +2390,7 @@ private struct SpecDecodeSectionContent: View {
     var body: some View {
         let opts = $appState.serverOptions
         // Drafter and PLD are mutually exclusive at the request level
-        // (`drafter > PLD > regular` in src/server.zig). When drafter is on
+        // (`drafter > PLD > regular` in src/host/http/server.zig). When drafter is on
         // we lock the PLD toggles down so users can't accidentally enable a
         // setting that would never apply.
         let drafterActive = server.chatModelInfo?.drafterLoaded ?? false
@@ -3154,9 +3170,21 @@ private struct TranscribeSectionContent: View {
         }, set: { appState.serverOptions.transcriptNotesModel = $0 })
     }
 
+    private var nemotron: Bool { appState.serverOptions.transcribeEngine == .nemotron }
+
     var body: some View {
-        SettingsRow(title: "Meeting notes", explainer: "The model that writes a title, summary, decisions and action items above each transcript.") {
-            Picker("", selection: notesModel) {
+        SettingsRow(title: "Transcription model", explainer: "What turns speech into words for dictation, voice mode, Telegram voice notes and tray transcripts. Nemotron 3.5 Transcribe is one model that also times words, tells speakers apart and writes the notes; it has to be on this Mac (convert NVIDIA's checkpoint with scripts/convert_nemotron_transcribe.py).") {
+            Picker("", selection: $appState.serverOptions.transcribeEngine) {
+                ForEach(ServerOptions.TranscribeEngine.allCases) { engine in
+                    Text(verbatim: engine.label).font(.app(.body)).tag(engine)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 260).font(.app(.body))
+        }
+        SettingsRow(title: "Meeting notes", explainer: nemotron ? "Nemotron 3.5 Transcribe writes the notes itself." : "The model that writes a title, summary, decisions and action items above each transcript.") {
+            Picker("", selection: nemotron ? Binding<String>.constant("nemotron") : notesModel) {
+                if nemotron { Text(verbatim: "Nemotron").font(.app(.body)).tag("nemotron") }
                 Text(L10n.text("Chat model in use")).font(.app(.body)).tag("")
                 Text(L10n.text("Off")).font(.app(.body)).tag(ServerOptions.notesOff)
                 ForEach(pickable) { model in
@@ -3164,6 +3192,7 @@ private struct TranscribeSectionContent: View {
                 }
             }
             .labelsHidden()
+            .disabled(nemotron)
             .frame(width: 220).font(.app(.body))
         }
         SettingsRow(title: "Stop after silence", explainer: "Ends a recording when nothing has been heard for this long, then transcribes it.") {
@@ -3215,11 +3244,13 @@ private struct VoiceCloneSectionContent: View {
             return "Copies the voice from the clip below using Qwen3-TTS. Slower and much heavier than Kokoro, and it needs the model downloaded from the Audio tile."
         case .kokoro:
             return "A small, very fast model (about 17x realtime, a tenth of the memory of the cloning model) with 54 built-in voices you can blend. It can't copy your voice."
+        case .lfm3:
+            return "LiquidAI's speech model: 19 languages, a female and a male voice each. When your chat model is LFM3 Audio or Omni, that same model reads the answers, with no second model."
         }
     }
 
     var body: some View {
-        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"]) {
+        SearchableRow(searchText: ["Voice engine", "Kokoro", "LFM3", "cloned"]) {
             engineBody
         }
         // The clip control only makes sense for the backend that can USE it —
@@ -3236,28 +3267,9 @@ private struct VoiceCloneSectionContent: View {
                 kokoroBody
             }
         }
-        if appState.serverOptions.voiceEngine == .system {
-            SearchableRow(searchText: ["System voice", "Apple voice"]) {
-                systemVoiceBody
-            }
-        }
-    }
-
-    /// The app-wide Apple voice; an agent with its own voice still overrides it.
-    @ViewBuilder
-    private var systemVoiceBody: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("System voice")).font(.app(.headline).weight(.semibold))
-            HStack(spacing: 8) {
-                Picker("", selection: Binding(get: { appState.voice.selectedVoiceId },
-                                              set: { appState.voice.selectVoice($0) })) {
-                    ForEach(appState.voice.availableVoices) { v in
-                        Text(v.displayName).font(.app(.body)).tag(Optional(v.id))
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 260)
-                Spacer(minLength: 0)
+        if appState.serverOptions.voiceEngine == .lfm3 {
+            SearchableRow(searchText: ["LFM3 voice", "language", "preview"]) {
+                lfm3Body
             }
         }
     }
@@ -3267,7 +3279,7 @@ private struct VoiceCloneSectionContent: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(L10n.text("Voice engine")).font(.app(.rowTitle).weight(.semibold))
             Picker("", selection: $appState.serverOptions.voiceEngine) {
-                ForEach(VoiceEngine.allCases, id: \.self) { e in
+                ForEach(VoiceEngine.selectable, id: \.self) { e in
                     Text(L10n.text(e.label)).tag(e)
                 }
             }
@@ -3344,6 +3356,58 @@ private struct VoiceCloneSectionContent: View {
         // pick would fire a request that can only fail.
         .onChange(of: appState.serverOptions.kokoroVoice) { _, newValue in
             if kokoroReady { previewer.preview(newValue) }
+        }
+        .onDisappear { previewer.stop() }
+    }
+
+    private var lfm3Ready: Bool { LFM3Voice.modelPath(app: appState) != nil }
+
+    @ViewBuilder
+    private var lfm3Body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L10n.text("LFM3 voice")).font(.app(.headline).weight(.semibold))
+            if !lfm3Ready {
+                HStack(spacing: 8) {
+                    Text(L10n.text("Speaking needs LFM3 Audio 2B (about 2.5 GB)."))
+                        .font(.app(.caption)).foregroundStyle(.secondary)
+                    Button {
+                        downloads.start(repoId: LFM3Voice.repo) {
+                            appState.refreshModels()
+                            appState.server.rescanModels()
+                        }
+                    } label: { Text(L10n.text("Download")).font(.app(.body)) }
+                    .disabled(downloads.downloads[LFM3Voice.repo]?.status == .downloading)
+                }
+            }
+            HStack(spacing: 8) {
+                Picker("", selection: $appState.serverOptions.lfm3Voice) {
+                    ForEach(LFM3Voice.voices(appState.server.allModels, current: appState.serverOptions.lfm3Voice), id: \.self) { v in
+                        Text(LFM3Voice.displayName(v)).font(.app(.body)).tag(v)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 260)
+                Button {
+                    previewer.preview(appState.serverOptions.lfm3Voice, engine: .lfm3)
+                } label: {
+                    if previewer.isPreviewing(appState.serverOptions.lfm3Voice) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Play", systemImage: "play.circle").font(.app(.body))
+                    }
+                }
+                .help(lfm3Ready ? "Hear a short sample of this voice" : "Download the model first")
+                .disabled(previewer.active != nil || !lfm3Ready)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let e = previewer.error {
+                Text(L10n.text(e)).font(.app(.caption)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onChange(of: appState.serverOptions.lfm3Voice) { _, newValue in
+            if lfm3Ready { previewer.preview(newValue, engine: .lfm3) }
         }
         .onDisappear { previewer.stop() }
     }

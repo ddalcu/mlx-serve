@@ -10,6 +10,7 @@
 #
 # Usage: TRELLIS2_MODEL=<pack dir> [TRELLIS2_RES=1024] ./tests/test_trellis2_3d.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11433}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -27,11 +28,7 @@ mkdir -p "$WORK/home" "$WORK/empty"
 HOME="$WORK/home" "$BIN" --serve --model-dir "$WORK/empty" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -rf "$WORK"' EXIT
-for i in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: headless server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: headless server did not start"; tail -5 "$LOG"; exit 1; }
 
 api() { curl -s -m 3600 "http://127.0.0.1:$PORT$1" "${@:2}"; }
 ID="$(basename "$PACK")"

@@ -11,14 +11,15 @@ MTP layer (head k's row p = eh_proj(cat[enorm(embed(x_{p+k+1})), hnorm(h_p)]),
 h_p the trunk's final-normed hidden, a sliding layer with sinks, a dense
 SwiGLU, its own final norm, the shared lm_head) into `mtp_fixture.safetensors`.
 `tests/convert_mimo_v2.py` then packs the tiny release and the Zig tests
-`mimo_v2 fixture` and `mimo mtp heads` compare our forward against these.
+`mimo_v2 fixture`, `mimo_v2 batched decode` and `mimo mtp heads track`
+compare our forward against these.
 
   venv/bin/python tests/dump_mimo_v2_fixtures.py --ref <dir holding modeling_mimo_v2.py> --out ~/claude-tmp/mimo-tiny
   venv/bin/python tests/convert_mimo_v2.py --src ~/claude-tmp/mimo-tiny/src --dst ~/claude-tmp/mimo-tiny/pack --bits 16
   MIMO_V2_MODEL=~/claude-tmp/mimo-tiny/pack MIMO_V2_FIXTURE=~/claude-tmp/mimo-tiny/fixture.safetensors \\
-      zig build test -Dtest-filter="mimo_v2 fixture"
+      zig build test -Dtest-filter="MIMO_V2_FIXTURE)"
   MIMO_V2_MODEL=~/claude-tmp/mimo-tiny/pack MIMO_V2_MTP_FIXTURE=~/claude-tmp/mimo-tiny/mtp_fixture.safetensors \\
-      zig build test -Dtest-filter="mimo mtp"
+      zig build test -Dtest-filter="mimo mtp heads track"
 
 Every expert runs (top-k = all), so a near-tie in expert selection cannot fail
 the comparison; selection itself is exercised by the live model.

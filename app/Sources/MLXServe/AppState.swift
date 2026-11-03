@@ -383,6 +383,15 @@ class AppState: ObservableObject {
     /// the thing that opens it is a menu command with no view to talk to.
     @Published var modelPalettePresented = false
 
+    /// Is the usage dashboard up? A sheet on the chat window like the palette, opened from the status strip's speed line.
+    @Published var usageDashboardPresented = false
+
+    /// Refused while the welcome sheet is up, for the one-sheet rule.
+    func showUsageDashboard() {
+        guard !showWelcome else { return }
+        usageDashboardPresented = true
+    }
+
     /// Open the model switcher — the ONE way in, same shape as `showModels()`:
     /// it must both raise the picker AND bring the chat window forward, or ⌘L
     /// from the tray opens a sheet on a window nobody is looking at.
@@ -417,6 +426,19 @@ class AppState: ObservableObject {
     }
 
     /// Show the model browser — the ONE way in.
+    /// The fix a voice setup notice offers: the microphone's privacy pane, or Qwen3-ASR's download.
+    func fixVoiceSetup(_ issue: VoicePreflight.Issue) {
+        if let s = VoicePreflight.settingsURLString(for: issue), let url = URL(string: s) {
+            NSWorkspace.shared.open(url)
+            return
+        }
+        downloads.start(repoId: VoiceASR.repo) { [weak self] in
+            self?.refreshModels()
+            self?.server.rescanModels()
+        }
+        showModels(.downloads)
+    }
+
     func showModels(_ section: ModelBrowserSection = .recommended) {
         chatWorkspace = .models(section)
         pendingChatOpenTick += 1
@@ -577,6 +599,16 @@ class AppState: ObservableObject {
         return controller
     }()
 
+    /// The chat window's voice (the composer button and orb): its own instance, so turning it on or off never
+    /// touches the tray's. While it is on, the tray keeps its toggle but leaves the microphone to it.
+    lazy var chatVoice: VoiceModeController = {
+        let controller = VoiceModeController(server: server, chatMode: true)
+        controller.bind(appState: self)
+        controller.$isActive.removeDuplicates().sink { [weak self] on in self?.voice.yieldMicrophone(on) }
+            .store(in: &cancellables)
+        return controller
+    }()
+
     /// The chats on disk (`~/.mlx-serve/mlx-serve.db`). Nil when the file could
     /// not be opened: nothing is then written over it.
     private var chatStore: ChatStore?
@@ -671,6 +703,7 @@ class AppState: ObservableObject {
         // The tray transcript starts with the camera, stops after a silence and
         // picks up a recording left behind, without the tray open.
         TrayTranscript.shared.attach(self)
+        VoiceASR.app = self
 
         // The app-level agent's voice, applied once at launch (didSet doesn't
         // fire for the init assignment above). Everything else it owns is

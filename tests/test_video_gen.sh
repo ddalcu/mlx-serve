@@ -2,6 +2,7 @@
 # Native LTX-Video 2.3 text-to-video endpoint smoke test (incl. audio track).
 # Usage: LTX_MODEL=<dir> [LTX_GEMMA_DIR=<dir>] [LTX_AUDIO_VAE=<file>] ./tests/test_video_gen.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11331}"
 MODEL="${LTX_MODEL:-$(ls -d ~/.cache/huggingface/hub/models--dgrauet--ltx-2.3-mlx-q4/snapshots/* 2>/dev/null | head -1)}"
 [ -n "$MODEL" ] || { echo "SKIP: no LTX model (set LTX_MODEL)"; exit 0; }
@@ -25,11 +26,7 @@ fi
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 # wait for /health (model load is heavy: transformer + connector + vae + gemma)
-for i in $(seq 1 180); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -8 /tmp/test_video_server.log; exit 1; }
-  sleep 2
-done
+srv_wait_health "http://127.0.0.1:$PORT" 180 2 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -8 /tmp/test_video_server.log; exit 1; }
 
 # capabilities advertise "video"
 curl -s "http://127.0.0.1:$PORT/v1/models" | grep -q '"video"' || { echo "FAIL: /v1/models missing video capability"; exit 1; }
@@ -427,8 +424,7 @@ gc = gradient(a, conv["width"], conv["height"], conv["frames"])
 gd = gradient(b, diff["width"], diff["height"], diff["frames"])
 print(f"adjacent-pixel gradient: conv {gc:.2f}  diffusion {gd:.2f}  ratio {gd / max(gc, 1e-6):.2f}")
 if gd > gc * 2.0 + 2.0:
-    print("FAIL: decoder=diffusion decoded to STATIC — check the sampler contract "
-          "(MLX_SERVE_DIFFVAE_OUTPUT/STEPS/TSCALE)"); sys.exit(1)
+    print("FAIL: decoder=diffusion decoded to STATIC — check the sampler contract (diffvae Sampler.default)"); sys.exit(1)
 print(f"PASS: decoder=diffusion decoded {diff['frames']}f, real picture, differs from conv")
 PYEOF
   fi

@@ -1,4 +1,4 @@
-/* FFI layout cross-check for src/ds4_ffi.zig, compiled against the REAL
+/* FFI layout cross-check for src/engines/ds4/ffi.zig, compiled against the REAL
  * lib/ds4/ds4.h. Upstream inserts fields mid-struct on upgrades; a stale Zig
  * mirror silently corrupts ds4_engine_options at open time (generation hangs
  * with no error). The "EngineOptions layout" test in ds4_ffi.zig compares

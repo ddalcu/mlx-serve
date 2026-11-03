@@ -1,86 +1,62 @@
 import Foundation
 
-/// Pure voice prerequisite checks and actionable notices; each concrete
-/// recognizer supplies its live status through `preflight()`.
+/// Pure voice prerequisite checks and actionable notices; the recognizer supplies its live status through
+/// `preflight()`.
 enum VoicePreflight {
-    /// A point-in-time read of the three things voice mode needs.
+    /// A point-in-time read of the two things voice mode needs.
     struct Snapshot: Equatable {
         var micAuthorized: Bool
-        var speechAuthorized: Bool
-        /// On-device dictation model installed for the locale (voice forces
-        /// on-device recognition, so this is required — not just nice-to-have).
-        var onDeviceAvailable: Bool
-        var locale: String
+        /// Qwen3-ASR is on disk, whole (`VoiceASR.modelPath`): what turns speech into words.
+        var asrReady: Bool
     }
 
-    /// The single missing prerequisite to tell the user about. Ordered by the
-    /// pipeline: you need the mic, then permission to transcribe, then the model.
+    /// The single missing prerequisite to tell the user about: the mic first, then the speech model.
     enum Issue: Equatable {
         case microphoneDenied
-        case speechDenied
-        /// On-device dictation can't transcribe: the Dictation switch is OFF, or
-        /// the language model isn't installed. Both are fixed the same way
-        /// (Keyboard → Dictation), and they're indistinguishable to us —
-        /// `supportsOnDeviceRecognition` stays true with the switch off — so we
-        /// treat them as one issue.
-        case dictationUnavailable(locale: String)
+        case asrMissing
     }
 
-    /// First blocking prerequisite from a pre-flight snapshot, or nil when voice
-    /// looks good to go. (The Dictation-switch-off case can't be seen here — the
-    /// snapshot's `onDeviceAvailable` only reflects the installed model — so it's
-    /// caught at runtime instead; see `VoiceModeController`.)
+    /// Qwen3-ASR counts as ready where no words are asked for (the chat window, a model that hears the recording).
+    static func asrReady(wantsWords: Bool, onDisk: Bool) -> Bool { !wantsWords || onDisk }
+
     static func firstIssue(_ s: Snapshot) -> Issue? {
         if !s.micAuthorized { return .microphoneDenied }
-        if !s.speechAuthorized { return .speechDenied }
-        if !s.onDeviceAvailable { return .dictationUnavailable(locale: s.locale) }
+        if !s.asrReady { return .asrMissing }
         return nil
     }
 
     /// One-line status for the voice panel's status row.
     static func shortMessage(for issue: Issue) -> String {
         switch issue {
-        case .microphoneDenied:     return "Microphone access is off"
-        case .speechDenied:         return "Speech Recognition is off"
-        case .dictationUnavailable: return "On-device dictation isn't available"
+        case .microphoneDenied: return "Microphone access is off"
+        case .asrMissing:       return "Voice needs its speech model"
         }
     }
 
-    /// Full, actionable explanation for the notice card. The locale one is a
-    /// sentence the app assembles, so it formats here — the panel renders the
-    /// resolved text rather than looking the finished sentence up.
+    /// Full, actionable explanation for the notice card.
     static func detail(for issue: Issue) -> String {
         switch issue {
         case .microphoneDenied:
             return L10n.text("Voice mode can't hear you — Microphone access is off for MLX-Serve. " +
                 "Turn it on in System Settings → Privacy & Security → Microphone, then enable Voice again.")
-        case .speechDenied:
-            return L10n.text("Voice mode needs Speech Recognition access (a separate permission from Microphone). " +
-                "Turn it on in System Settings → Privacy & Security → Speech Recognition, then enable Voice again.")
-        case .dictationUnavailable(let locale):
-            return L10n.format("Voice mode transcribes on-device — your audio never leaves this Mac — but on-device " +
-                "dictation isn't available for %@: it's either turned off or the language isn't " +
-                "installed. Turn on System Settings → Keyboard → Dictation (and add your language), then " +
-                "enable Voice again.", locale)
+        case .asrMissing:
+            return L10n.text("Voice mode turns what you say into words on this Mac with Qwen3-ASR (about 1 GB). " +
+                "Download it, then enable Voice again.")
         }
     }
 
-    /// `x-apple.systempreferences:` deep link to the pane that fixes the issue.
-    static func settingsURLString(for issue: Issue) -> String {
+    /// `x-apple.systempreferences:` deep link to the pane that fixes the issue; nil when the fix is a download.
+    static func settingsURLString(for issue: Issue) -> String? {
         switch issue {
-        case .microphoneDenied:
-            return "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
-        case .speechDenied:
-            return "x-apple.systempreferences:com.apple.preference.security?Privacy_SpeechRecognition"
-        case .dictationUnavailable:
-            return "x-apple.systempreferences:com.apple.preference.keyboard?Dictation"
+        case .microphoneDenied: return "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone"
+        case .asrMissing:       return nil
         }
     }
 
     static func actionLabel(for issue: Issue) -> String {
         switch issue {
-        case .dictationUnavailable: return "Open Keyboard Settings"
-        default:                    return "Open Privacy Settings"
+        case .microphoneDenied: return "Open Privacy Settings"
+        case .asrMissing:       return "Download Qwen3-ASR"
         }
     }
 }

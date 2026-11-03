@@ -202,9 +202,8 @@ struct Agent: Identifiable, Codable, Equatable {
     }
 }
 
-/// Which voice an agent speaks with. Mirrors the three engines the app's voice
-/// picker already offers (`VoiceEngine`), so an agent voice is exactly one of
-/// the choices a user can make globally — no fourth code path.
+/// Which voice an agent speaks with. Mirrors the engines the app's voice picker offers (`VoiceEngine`), so an agent
+/// voice is exactly one of the choices a user can make globally — no code path of its own.
 enum AgentVoice: Codable, Equatable, Hashable, Sendable {
     /// macOS `AVSpeechSynthesizer`; the identifier ("" = the system default).
     case system(String)
@@ -212,18 +211,21 @@ enum AgentVoice: Codable, Equatable, Hashable, Sendable {
     case kokoro(String)
     /// Qwen3-TTS voice clone; the reference clip's path.
     case clone(String)
+    /// An LFM3 voice id (`<language>-<female|male>`).
+    case lfm3(String)
 
     var engine: VoiceEngine {
         switch self {
         case .system: return .system
         case .kokoro: return .kokoro
         case .clone: return .clone
+        case .lfm3: return .lfm3
         }
     }
 
     var value: String {
         switch self {
-        case .system(let v), .kokoro(let v), .clone(let v): return v
+        case .system(let v), .kokoro(let v), .clone(let v), .lfm3(let v): return v
         }
     }
 
@@ -232,6 +234,7 @@ enum AgentVoice: Codable, Equatable, Hashable, Sendable {
         case .system: self = .system(value)
         case .kokoro: self = .kokoro(value)
         case .clone: self = .clone(value)
+        case .lfm3: self = .lfm3(value)
         }
     }
 

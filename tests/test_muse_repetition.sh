@@ -1,33 +1,15 @@
 #!/bin/bash
-# Muse-Glimmer repetition-loop trigger / regression guard — env-gated on a
-# local mirror:
+# test_muse_repetition.sh — Muse repetition-loop regression gate: replays the real captured pi first-turn request
+# (tests/fixtures/muse_pi_doom_request.json: pi's system prompt, 4 tools, a doom-clone task) N times and FAILS on any
+# `finish_details.type == "repetition_loop"`, cross-checked against `[loop-stop]` in its own log. Looping bodies dump
+# to MUSE_REP_DUMP_DIR (~/claude-tmp/muse-loop). The root cause it pinned: sliding layers rotated at a Gemma 10000
+# default instead of muse's single 500000 theta.
 #
-#   MUSE_TEST_MODEL=~/.mlx-serve/models/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit \
-#       ./tests/test_muse_repetition.sh
+#   MUSE_TEST_MODEL=<mirror dir> ./tests/test_muse_repetition.sh   # MUSE_TEST_PORT (11357)
 #
-# Replays the REAL pi first-turn request captured live 2026-08-11
-# (tests/fixtures/muse_pi_doom_request.json — pi 0.84.1, system prompt +
-# 4 tools + the doom-clone task; the model restated the request in the
-# thinking channel until [loop-stop] cut it). A rep "loops" when the response
-# carries finish_details.type == "repetition_loop"; the server log's
-# [loop-stop] lines are the cross-check. Any looping rep FAILS — today this
-# is the trigger (red); after a fix it is the regression guard (green).
-#
-# Knobs (rewrite ONLY sampling/effort fields on the fixture at send time):
-#   MUSE_REP_REPS        reps to send (default 4)
-#   MUSE_REP_TEMP        unset = 0.7 (the incident's effective sampling, from
-#                        the app server's launch flags); 0 = greedy
-#   MUSE_REP_TOP_P       default 0.95 (incident value)
-#   MUSE_REP_TOP_K       unset = not sent (incident had top_k 0; upstream
-#                        generation_config recommends 64)
-#   MUSE_REP_NO_DAQ=1    boot with --no-decode-attn-quant (bf16 cells — the
-#                        lossy side copy only exists on DENSE attention)
-#   MUSE_REP_EFFORT      minimal|low|high -> reasoning_effort; off ->
-#                        enable_thinking:false (committed to=user channel)
-#   MUSE_REP_NO_TOOLS=1  drop the tools array
-#   MUSE_REP_NO_DRAFTER=1  boot with --no-drafter (default: the mirror's own
-#                        drafter/ is auto-probed -> dflash engaged)
-#   MUSE_REP_DUMP_DIR    where looping rep bodies land (default ~/claude-tmp/muse-loop)
+# Knobs rewrite ONLY sampling/effort/tool fields: MUSE_REP_REPS (4), MUSE_REP_TEMP (0.7; 0 = greedy), MUSE_REP_TOP_P
+# (0.95), MUSE_REP_TOP_K, MUSE_REP_EFFORT (minimal|low|high|off), MUSE_REP_NO_TOOLS=1, MUSE_REP_NO_DRAFTER=1 (default:
+# the mirror's drafter/ engages dflash), MUSE_REP_NO_DAQ=1 (--no-decode-attn-quant). SKIPs without the env var.
 
 set -euo pipefail
 

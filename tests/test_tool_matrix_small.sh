@@ -1,41 +1,17 @@
 #!/bin/bash
-# test_tool_matrix_small.sh — cross-model tool-call matrix for the sub-4B fleet.
+# test_tool_matrix_small.sh — tool calls on the sub-4B fleet, one model at a time, where small models fail: a one-shot
+# file write whose content carries raw newlines and unescaped inner quotes. Per model, stream and non-stream: a trivial
+# bash call fires; the quotes+newlines write FIRES (not dropped), arguments are valid JSON, the path byte-exact,
+# `class="hero"` survives, no tool tag leaks into content; a full HTML page write is not dropped or emptied. Reports per
+# model whether `[tool-parse] loose-repair recovered` engaged (informational). Outcome-based: a model that escapes
+# right or one the server repairs both pass.
 #
-# Companion to test_format_matrix.sh (which keys on format-family reps and only
-# byte-checks a TRIVIAL write). This one boots the SMALL models one at a time and
-# stresses the thing small models actually fail at: writing a file in one shot
-# whose content carries the escaping hazards that strict JSON rejects — raw
-# newlines and unescaped inner quotes. The bug those triggered (pre-fix) was the
-# WHOLE tool call getting dropped and the file leaking into visible content; the
-# server-side looseRepairToolCallJson recovery is what these assertions pin live.
+#   ./tests/test_tool_matrix_small.sh   # TOOL_MODELS=qwen35-2b,gemma4-e4b, PORT (11298); missing models skip
 #
-# Per model, per request the battery asserts:
-#   • bash baseline  — a trivial tool call fires at all (name + valid JSON args)
-#   • quotes+newlines write — call FIRES (not dropped), args valid JSON, path
-#     byte-exact, content carries the attribute-quote token `class="hero"`, and
-#     NO <tool_call>/<|tool_call> tag leaks into visible content
-#   • big-file write — a full HTML page: call fires, valid JSON, content length
-#     over a floor (the call neither dropped nor silently emptied)
-# each in BOTH non-stream and stream mode. It also greps the server log for the
-# `[tool-parse] loose-repair recovered …` line and REPORTS per model whether the
-# recovery actually engaged — i.e. which of these small models mis-escape in the
-# wild (informational, never a failure).
-#
-# Outcome-based on purpose: a model that escapes correctly OR whose mangled
-# output the server recovers both PASS — that is the cross-model "tool calls work"
-# signal. A capability miss (a 0.8B that won't follow "exactly") shows as a FAIL
-# for that one check on that one model, which is itself the signal you want.
-# The deterministic proof of the recovery logic lives in the hermetic corpus
-# test: `zig build test -Dtest-filter="format corpus"`.
-#
-# Usage: ./tests/test_tool_matrix_small.sh
-#   TOOL_MODELS=qwen35-2b,gemma4-e4b   — csv filter of logical names
-#   PORT=11298                          — override port
-#   Missing model paths skip cleanly (exit 0 if nothing ran, nothing failed).
-#
-# Runtime: ~1–2 min/model (these are small), ~5–10 min for all five.
+# The deterministic proof of the repair is the format corpus (`zig build test -Dtest-filter="format corpus"`).
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 source tests/_lib_models.sh
 
@@ -177,11 +153,7 @@ run_model() {
     "$BINARY" --model "$path" --serve --port "$PORT" --ctx-size 8192 --log-level debug > "$log" 2>&1 &
     local sp=$!
     local up=0
-    for _ in $(seq 1 90); do
-        curl -sf "$BASE/health" >/dev/null 2>&1 && { up=1; break; }
-        kill -0 "$sp" 2>/dev/null || break
-        sleep 2
-    done
+    srv_wait_health "$BASE" 90 2 "$sp" && up=1
     if [ "$up" != "1" ]; then
         check "[$logical] server boots" 0
         tail -10 "$log" | sed 's/^/    /'; kill "$sp" 2>/dev/null; return 1

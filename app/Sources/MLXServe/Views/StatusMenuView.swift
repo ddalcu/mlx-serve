@@ -526,32 +526,9 @@ struct StatusMenuView: View {
                         breakdown: mem.gpuBreakdown
                     )
                 }
-                if let t = server.throughput {
-                    TrayRowSeparator()
-                    throughputRows(t)
-                }
+                TrayThroughputRows(usage: server.usage)
             }
         }
-    }
-
-    /// Serving throughput, from `/metrics.json` (present only when the server
-    /// was launched with --metrics). "now" is the gauge delta between the last
-    /// two polls; the averages are whole-session.
-    @ViewBuilder private func throughputRows(_ t: ThroughputSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
-            statRow("Decode", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.decodeTPSNow), ThroughputSnapshot.formatTPS(t.avgDecodeTPS)))
-            statRow("Prefill", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.prefillTPSNow), ThroughputSnapshot.formatTPS(t.avgPrefillTPS)))
-        }
-    }
-
-    @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(L10n.text(label)).foregroundStyle(.secondary)
-            Spacer()
-            Text(value).monospacedDigit()
-        }
-        .font(.app(.caption2))
     }
 
     // MARK: - Media generation
@@ -660,7 +637,7 @@ struct StatusMenuView: View {
                     CLISetupInstructionsButton(
                         baseURL: server.baseURL,
                         servedModelId: server.chatModelId ?? "mlx-serve",
-                        serverContextLength: server.chatModelInfo?.contextLength,
+                        serverBudget: server.chatModelInfo?.agentBudget,
                         isEnabled: server.status == .running
                     )
                 }
@@ -1128,7 +1105,7 @@ struct EndpointsSection: View {
 /// already relying on that implicitly; presenting it through `AppActivation`
 /// (which touches `NSApp`) just makes the requirement explicit.
 @MainActor
-func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil) {
+func launchClaudeCodeWithPicker(baseURL: String, serverBudget: AgentBudget.Budget? = nil) {
     let panel = OpenPanel.make()
     panel.canChooseDirectories = true
     panel.canChooseFiles = false
@@ -1141,18 +1118,18 @@ func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil
     panel.directoryURL = URL(fileURLWithPath: defaultWS)
     guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
     launchClaudeCode(baseURL: baseURL, workingDirectory: url.path,
-                     serverContextLength: serverContextLength)
+                     serverBudget: serverBudget)
 }
 
 /// Launch Claude Code CLI configured to use the local mlx-serve server.
 /// Shares `AgentConfigs.claudeCodeExports` with the CLI-launcher dropdown — the
 /// env block must not drift between the two entry points.
 func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
-                      serverContextLength: Int? = nil) {
+                      serverBudget: AgentBudget.Budget? = nil) {
     let model = "mlx-serve"
     let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
-    let budget = AgentBudget.forServerContext(serverContextLength)
-    warnIfSmallContext(agentId: "claude", context: budget.context)
+    let budget = serverBudget ?? AgentBudget.fallback
+    warnIfSmallContext(agentId: "claude", budget: budget)
     let scriptContent = """
     #!/bin/zsh -l
     \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
@@ -1449,5 +1426,31 @@ private struct WorkerPartRow: View {
                     .padding(.leading, 22)
             }
         }
+    }
+}
+
+/// Serving throughput, from the usage tracker the chat window's strip reads, so the two show the same figures. "now" is
+/// the gauge delta between its last two looks; the averages are whole-session.
+private struct TrayThroughputRows: View {
+    @ObservedObject var usage: UsageTracker
+
+    var body: some View {
+        if let t = usage.live {
+            TrayRowSeparator()
+            VStack(alignment: .leading, spacing: 2) {
+                statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
+                statRow("Decode", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(usage.decodeTPS), ThroughputSnapshot.formatTPS(t.avgDecodeTPS)))
+                statRow("Prefill", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(usage.prefillTPS), ThroughputSnapshot.formatTPS(t.avgPrefillTPS)))
+            }
+        }
+    }
+
+    @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(L10n.text(label)).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).monospacedDigit()
+        }
+        .font(.app(.caption2))
     }
 }

@@ -1,0 +1,1744 @@
+// Manual FFI bindings for mlx-c.
+// We declare only the functions we need rather than @cImport to avoid
+// potential issues with C++ headers and keep the dependency surface explicit.
+
+const std = @import("std");
+const env = @import("../env.zig");
+const crt = @import("../sdk/util/crt.zig");
+const os_mutex = @import("../sdk/util/os_mutex.zig");
+const builtin = @import("builtin");
+const log = @import("../sdk/util/log.zig");
+const kernels = @import("kernels.zig");
+
+// ── Opaque handle types ──
+pub const mlx_array = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_stream = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_device = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_string = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_map_string_to_array = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_map_string_to_string = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_map_string_to_array_iterator = extern struct { ctx: ?*anyopaque = null, map_ctx: ?*anyopaque = null };
+pub const mlx_vector_array = extern struct { ctx: ?*anyopaque = null };
+pub const mlx_closure = extern struct { ctx: ?*anyopaque = null };
+
+// ── Enums ──
+pub const mlx_dtype = enum(c_int) {
+    bool_ = 0,
+    uint8 = 1,
+    uint16 = 2,
+    uint32 = 3,
+    uint64 = 4,
+    int8 = 5,
+    int16 = 6,
+    int32 = 7,
+    int64 = 8,
+    float16 = 9,
+    float32 = 10,
+    float64 = 11,
+    bfloat16 = 12,
+    complex64 = 13,
+};
+
+pub const mlx_device_type = enum(c_int) { cpu = 0, gpu = 1 };
+
+// ── Optional types ──
+pub const mlx_optional_int = extern struct {
+    value: c_int = 0,
+    has_value: bool = false,
+
+    pub fn none() mlx_optional_int {
+        return .{ .value = 0, .has_value = false };
+    }
+    pub fn some(v: c_int) mlx_optional_int {
+        return .{ .value = v, .has_value = true };
+    }
+};
+
+pub const mlx_optional_float = extern struct {
+    value: f32 = 0,
+    has_value: bool = false,
+
+    pub fn none() mlx_optional_float {
+        return .{ .value = 0, .has_value = false };
+    }
+    pub fn some(v: f32) mlx_optional_float {
+        return .{ .value = v, .has_value = true };
+    }
+};
+
+// ── Extern declarations ──
+pub extern "c" fn mlx_version(str: *mlx_string) c_int;
+
+// String
+pub extern "c" fn mlx_string_new() mlx_string;
+pub extern "c" fn mlx_string_data(str: mlx_string) [*:0]const u8;
+pub extern "c" fn mlx_string_free(str: mlx_string) c_int;
+
+// Device
+pub extern "c" fn mlx_device_new() mlx_device;
+pub extern "c" fn mlx_device_new_type(dtype: mlx_device_type, index: c_int) mlx_device;
+pub extern "c" fn mlx_device_is_available(avail: *bool, dev: mlx_device) c_int;
+pub extern "c" fn mlx_device_free(dev: mlx_device) c_int;
+pub extern "c" fn mlx_get_default_device(dev: *mlx_device) c_int;
+pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
+
+// Stream
+pub extern "c" fn mlx_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_set(stream: *mlx_stream, src: mlx_stream) c_int;
+pub extern "c" fn mlx_stream_equal(lhs: mlx_stream, rhs: mlx_stream) bool;
+pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
+pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
+pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
+pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_get_device(dev: *mlx_device, stream: mlx_stream) c_int;
+pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) c_int;
+
+/// True when the stream targets a GPU that runs custom Metal kernels: every
+/// `metal_kernel` helper gates on this, so on CUDA they all take the MLX-op path.
+pub fn streamIsGpu(s: mlx_stream) bool {
+    return streamOnGpuDevice(s) and metalKernelsAvailable();
+}
+
+/// True when the stream targets a GPU device of either backend: the `cuda_kernel` helpers gate on this
+/// (`streamIsGpu` is the Metal-kernel gate and is false on CUDA).
+pub fn streamOnGpuDevice(s: mlx_stream) bool {
+    var dev = mlx_device{ .ctx = null };
+    if (mlx_stream_get_device(&dev, s) != 0) return false;
+    defer _ = mlx_device_free(dev);
+    var dt: mlx_device_type = .cpu;
+    if (mlx_device_get_type(&dt, dev) != 0) return false;
+    return dt == .gpu;
+}
+
+/// MLX's CUDA JIT looks for the toolkit headers under CUDA_HOME/CUDA_PATH, else only
+/// /usr/local/cuda; Arch installs to /opt/cuda. The root to export as CUDA_HOME, if any.
+pub fn cudaHomeDefault(env_set: bool, usr_local_has_headers: bool, opt_has_headers: bool) ?[:0]const u8 {
+    if (env_set or usr_local_has_headers or !opt_has_headers) return null;
+    return "/opt/cuda";
+}
+
+/// `PATH` with the toolkit's DLL folders (CUDA 13 keeps them in bin\x64) first; null when it
+/// would not fit `buf`.
+pub fn cudaDllSearchPath(buf: []u8, cuda_path: []const u8, path: []const u8) ?[:0]const u8 {
+    return std.fmt.bufPrintSentinel(buf, "{s}\\bin\\x64;{s}\\bin;{s}", .{ cuda_path, cuda_path, path }, 0) catch null;
+}
+
+/// Windows: the installed toolkit's DLLs (CUDA_PATH) go first on PATH before any CUDA DLL loads, so
+/// llama.cpp's ggml-cuda binds the cuBLAS MLX uses: two copies in one process leave one engine on CPU.
+fn exportCudaDllPath() void {
+    const cuda = env.get(.CUDA_PATH) orelse return;
+    if (cuda[0] == 0) return; // an empty value would put the drive root's \bin first on PATH
+    const path = env.get(.PATH) orelse "";
+    const buf = std.heap.page_allocator.alloc(u8, 64 * 1024) catch return;
+    defer std.heap.page_allocator.free(buf);
+    if (cudaDllSearchPath(buf, std.mem.span(cuda), std.mem.span(path))) |p| env.set(.PATH, p.ptr);
+}
+
+/// Export CUDA_HOME before MLX compiles its first kernel (see cudaHomeDefault); on Windows the
+/// toolkit's DLL search path instead.
+pub fn exportCudaHome() void {
+    if (comptime builtin.os.tag == .windows) return exportCudaDllPath();
+    if (comptime builtin.os.tag != .linux) return;
+    const env_set = env.get(.CUDA_HOME) != null or env.get(.CUDA_PATH) != null;
+    const has = struct {
+        fn headers(comptime root: []const u8) bool {
+            return std.c.access(root ++ "/include/cuda.h", 0) == 0;
+        }
+    };
+    if (cudaHomeDefault(env_set, has.headers("/usr/local/cuda"), has.headers("/opt/cuda"))) |home| env.set(.CUDA_HOME, home);
+}
+
+/// The CUDA kernel cache for one staged MLX build. MLX keys its PTX cache by module name under
+/// its version alone, so a patched kernel kept running the build cached before the patch.
+pub fn ptxCacheDir(buf: []u8, tmp: []const u8, stamp_id: []const u8) ?[:0]const u8 {
+    if (stamp_id.len == 0) return null;
+    const sep = std.fs.path.sep_str;
+    return std.fmt.bufPrintSentinel(buf, "{s}" ++ sep ++ "mlx-serve-ptx" ++ sep ++ "{s}", .{ tmp, stamp_id }, 0) catch null;
+}
+
+/// A short id of a staged MLX build's stamp (`lib/mlx/.version`); "" for an unstamped build.
+pub fn stampId(buf: *[16]u8, stamp: []const u8) []const u8 {
+    const s = std.mem.trim(u8, stamp, " \t\r\n");
+    if (s.len == 0) return "";
+    return std.fmt.bufPrint(buf, "{x:0>16}", .{std.hash.Wyhash.hash(0, s)}) catch "";
+}
+
+/// Export MLX_PTX_CACHE_DIR (see ptxCacheDir) for the staged MLX build's stamp before MLX
+/// compiles its first kernel, unless set.
+pub fn exportPtxCacheDir(stamp: []const u8) void {
+    if (comptime builtin.os.tag != .linux and builtin.os.tag != .windows) return;
+    if (env.get(.MLX_PTX_CACHE_DIR) != null) return;
+    const tmp_env = if (comptime builtin.os.tag == .windows) env.get(.TEMP) else env.get(.TMPDIR);
+    const tmp = if (tmp_env) |t| std.mem.span(t) else "/tmp";
+    var id_buf: [16]u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    if (ptxCacheDir(&buf, tmp, stampId(&id_buf, stamp))) |dir| env.set(.MLX_PTX_CACHE_DIR, dir.ptr);
+}
+
+var cuda_cache: ?bool = null;
+
+/// The stream weight files load on. A CPU-stream load allocates host memory: on a discrete
+/// Linux GPU that is CUDA managed memory and migrates to VRAM. Where NVIDIA's unified memory is
+/// "limited" (Windows, WSL) it is pinned host memory that every kernel reads over PCIe, and on an
+/// integrated GPU (DGX Spark) the GPU reads managed pages at two thirds of its own pool's
+/// bandwidth, so there CUDA loads on the GPU stream. Metal has no GPU `Load`.
+pub fn weightLoadStream() mlx_stream {
+    return if (weightsInGpuPool()) mlx_default_gpu_stream_new() else mlx_default_cpu_stream_new();
+}
+
+/// Whether loaded weights live in a discrete GPU's VRAM (memory accounting reads this).
+pub fn weightsInDeviceMemory() bool {
+    if (limited_unified_memory == null) limited_unified_memory = limitedUnifiedMemory();
+    return weightLoadOnGpu(cudaAvailable(), limited_unified_memory.?, false);
+}
+
+/// Whether loaded weights go to the GPU's own allocation pool (see `weightLoadStream`).
+pub fn weightsInGpuPool() bool {
+    if (limited_unified_memory == null) limited_unified_memory = limitedUnifiedMemory();
+    return weightLoadOnGpu(cudaAvailable(), limited_unified_memory.?, cudaIntegrated());
+}
+
+pub fn weightLoadOnGpu(cuda: bool, limited_um: bool, integrated: bool) bool {
+    return cuda and (limited_um or integrated);
+}
+
+var cuda_integrated_cache: ?bool = null;
+
+/// The default CUDA device shares the host's memory (DGX Spark, Jetson).
+pub fn cudaIntegrated() bool {
+    if (cuda_integrated_cache == null) cuda_integrated_cache = cudaAvailable() and defaultDeviceInfoSize("integrated") == 1;
+    return cuda_integrated_cache.?;
+}
+
+/// `arr` copied into the GPU's pool where weights live there (`weightsInGpuPool`), else `arr`
+/// itself. Takes `arr`'s reference either way: an array built from host data
+/// (`mlx_array_new_data`) is CUDA managed memory.
+pub fn toGpuPool(arr: mlx_array) !mlx_array {
+    if (!weightsInGpuPool()) return arr;
+    defer _ = mlx_array_free(arr);
+    const s = mlx_default_gpu_stream_new();
+    defer _ = mlx_stream_free(s);
+    // A kernel's output is allocated in the pool; `arr` stays referenced, so it is not donated.
+    const one_i = mlx_array_new_int(1);
+    defer _ = mlx_array_free(one_i);
+    var one = mlx_array_new();
+    defer _ = mlx_array_free(one);
+    try check(mlx_astype(&one, one_i, mlx_array_dtype(arr), s));
+    var out = mlx_array_new();
+    errdefer _ = mlx_array_free(out);
+    try check(mlx_multiply(&out, arr, one, s));
+    try check(mlx_array_eval(out));
+    return out;
+}
+
+var limited_unified_memory: ?bool = null;
+
+fn limitedUnifiedMemory() bool {
+    if (comptime builtin.os.tag == .windows) return true;
+    if (comptime builtin.os.tag != .linux) return false;
+    var buf: [256]u8 = undefined;
+    const fd = crt.openRead("/proc/sys/kernel/osrelease");
+    if (fd < 0) return false;
+    defer crt.close(fd);
+    const n = crt.read(fd, &buf);
+    return n > 0 and kernelReleaseIsWsl(buf[0..@intCast(n)]);
+}
+
+/// WSL kernels name themselves in their release string ("…-microsoft-standard-WSL2").
+pub fn kernelReleaseIsWsl(release: []const u8) bool {
+    return std.ascii.findIgnoreCase(release, "microsoft") != null;
+}
+
+/// MLX runs on its CUDA backend (NVIDIA): `mlx_fast_cuda_kernel` instead of Metal.
+/// Whether prefill keeps MLX's CUDA graphs. On an integrated GPU (GB10) prefill kernels ran up to
+/// 2.3x slower inside them at every prompt length measured; decode keeps them either way.
+pub fn prefillKeepsCudaGraphs() bool {
+    return !cudaIntegrated();
+}
+
+var cuda_graphs_on = true;
+var cuda_graphs_fn: ?*const fn (bool) callconv(.c) void = null;
+var cuda_graphs_looked = false;
+
+/// Turns MLX's CUDA graphs on or off (`mlx_cuda_set_graphs` in the patched libmlx; a libmlx
+/// without it keeps them on) and returns the previous state. Inference thread only.
+pub fn setCudaGraphs(on: bool) bool {
+    const was = cuda_graphs_on;
+    if (comptime builtin.os.tag != .linux) return was;
+    if (on == was) return was;
+    if (!cuda_graphs_looked) {
+        cuda_graphs_looked = true;
+        if (std.c.dlopen(null, .{ .LAZY = true })) |self| {
+            if (std.c.dlsym(self, "mlx_cuda_set_graphs")) |f| cuda_graphs_fn = @ptrCast(@alignCast(f));
+        }
+    }
+    const f = cuda_graphs_fn orelse return was;
+    f(on);
+    cuda_graphs_on = on;
+    return was;
+}
+
+pub fn cudaAvailable() bool {
+    if (cuda_cache == null) {
+        var cuda = false;
+        if (comptime !builtin.os.tag.isDarwin()) _ = mlx_cuda_is_available(&cuda);
+        cuda_cache = cuda;
+    }
+    return cuda_cache.?;
+}
+
+/// Only Metal runs `mlx_fast_metal_kernel`; CUDA and Vulkan run MLX ops only.
+/// mlx-omarchy's Vulkan backend translates a subset of MSL and refuses the
+/// rest at EVAL, which fails the request instead of declining the kernel.
+pub fn metalKernelsAvailable() bool {
+    return comptime builtin.os.tag.isDarwin();
+}
+pub extern "c" fn mlx_cuda_is_available(res: *bool) c_int;
+
+pub const mlx_fast_cuda_kernel_config = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_fast_cuda_kernel_config_new() mlx_fast_cuda_kernel_config;
+pub extern "c" fn mlx_fast_cuda_kernel_config_free(cls: mlx_fast_cuda_kernel_config) void;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_output_arg(cls: mlx_fast_cuda_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_set_grid(cls: mlx_fast_cuda_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_set_thread_group(cls: mlx_fast_cuda_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_template_arg_dtype(cls: mlx_fast_cuda_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_template_arg_int(cls: mlx_fast_cuda_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+pub const mlx_fast_cuda_kernel = extern struct { ctx: ?*anyopaque = null };
+/// Every CUDA kernel's source and header pass through `kernels.resolve` (the `MLX_SERVE_KERNEL_DIR` override).
+pub fn mlx_fast_cuda_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, shared_memory: c_int) mlx_fast_cuda_kernel {
+    return c_cuda_kernel_new(name, input_names, output_names, kernels.resolve(source), kernels.resolve(header), ensure_row_contiguous, shared_memory);
+}
+const c_cuda_kernel_new = @extern(*const fn ([*:0]const u8, mlx_vector_string, mlx_vector_string, [*:0]const u8, [*:0]const u8, bool, c_int) callconv(.c) mlx_fast_cuda_kernel, .{ .name = "mlx_fast_cuda_kernel_new" });
+pub extern "c" fn mlx_fast_cuda_kernel_free(cls: mlx_fast_cuda_kernel) void;
+pub extern "c" fn mlx_fast_cuda_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_cuda_kernel, inputs: mlx_vector_array, config: mlx_fast_cuda_kernel_config, s: mlx_stream) c_int;
+pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
+
+// Metal
+pub extern "c" fn mlx_metal_is_available(res: *bool) c_int;
+pub extern "c" fn _mlx_array_is_available(res: *bool, arr: mlx_array) c_int;
+
+// Array creation
+pub extern "c" fn mlx_array_new() mlx_array;
+pub extern "c" fn mlx_array_new_int(val: c_int) mlx_array;
+pub extern "c" fn mlx_array_new_float(val: f32) mlx_array;
+pub extern "c" fn mlx_array_new_bool(val: bool) mlx_array;
+pub extern "c" fn mlx_array_new_data(data: ?*const anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype) mlx_array;
+/// Wraps `data` in place when the backend can (Metal no-copy `newBuffer(ptr, len)`), else
+/// COPIES it and calls `dtor(payload)` at once. `dtor` also runs when the last reference drops.
+pub extern "c" fn mlx_array_new_data_managed_payload(data: *anyopaque, shape: [*]const c_int, dim: c_int, dtype: mlx_dtype, payload: ?*anyopaque, dtor: *const fn (?*anyopaque) callconv(.c) void) mlx_array;
+pub extern "c" fn mlx_array_free(arr: mlx_array) c_int;
+pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
+
+// Array info
+pub extern "c" fn mlx_array_tostring(str: *mlx_string, arr: mlx_array) c_int;
+pub extern "c" fn mlx_array_ndim(arr: mlx_array) usize;
+pub extern "c" fn mlx_array_shape(arr: mlx_array) [*]const c_int;
+pub extern "c" fn mlx_array_strides(arr: mlx_array) [*]const usize;
+pub extern "c" fn mlx_array_size(arr: mlx_array) usize;
+pub extern "c" fn mlx_array_dtype(arr: mlx_array) mlx_dtype;
+pub extern "c" fn mlx_array_eval(arr: mlx_array) c_int;
+pub extern "c" fn mlx_array_itemsize(arr: mlx_array) usize;
+
+// Scalar access
+pub extern "c" fn mlx_array_item_float32(res: *f32, arr: mlx_array) c_int;
+pub extern "c" fn mlx_array_item_int32(res: *i32, arr: mlx_array) c_int;
+
+// Data access
+pub extern "c" fn mlx_array_data_bool(arr: mlx_array) ?[*]const bool;
+pub extern "c" fn mlx_array_data_float32(arr: mlx_array) ?[*]const f32;
+pub extern "c" fn mlx_array_data_float16(arr: mlx_array) ?[*]const f16;
+pub extern "c" fn mlx_array_data_bfloat16(arr: mlx_array) ?[*]const u16;
+pub extern "c" fn mlx_array_data_int32(arr: mlx_array) ?[*]const i32;
+pub extern "c" fn mlx_array_data_uint32(arr: mlx_array) ?[*]const u32;
+pub extern "c" fn mlx_array_data_uint8(arr: mlx_array) ?[*]const u8;
+
+// Distributed (mlx-c distributed.h / distributed_group.h); JACCL = RDMA over Thunderbolt 5
+pub const mlx_distributed_group = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_distributed_group_new() mlx_distributed_group;
+pub extern "c" fn mlx_distributed_is_available(bk: ?[*:0]const u8) bool;
+pub extern "c" fn mlx_distributed_init(res: *mlx_distributed_group, strict: bool, bk: ?[*:0]const u8) c_int;
+pub extern "c" fn mlx_distributed_group_free(group: mlx_distributed_group) c_int;
+pub extern "c" fn mlx_distributed_group_rank(group: mlx_distributed_group) c_int;
+pub extern "c" fn mlx_distributed_group_size(group: mlx_distributed_group) c_int;
+pub extern "c" fn mlx_distributed_all_sum(res: *mlx_array, x: mlx_array, group: mlx_distributed_group, s: mlx_stream) c_int;
+pub extern "c" fn mlx_distributed_all_gather(res: *mlx_array, x: mlx_array, group: mlx_distributed_group, s: mlx_stream) c_int;
+pub extern "c" fn mlx_distributed_send(res: *mlx_array, x: mlx_array, dst: c_int, group: mlx_distributed_group, s: mlx_stream) c_int;
+pub extern "c" fn mlx_distributed_recv(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, src: c_int, group: mlx_distributed_group, s: mlx_stream) c_int;
+pub extern "c" fn mlx_distributed_recv_like(res: *mlx_array, x: mlx_array, src: c_int, group: mlx_distributed_group, s: mlx_stream) c_int;
+
+// Vector array
+pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
+pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usize) mlx_vector_array;
+pub extern "c" fn mlx_vector_array_free(vec: mlx_vector_array) c_int;
+// Graph printing, for the decode-graph dump diagnostic (diag decode-graph-dump).
+pub const mlx_node_namer = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_node_namer_new() mlx_node_namer;
+pub extern "c" fn mlx_node_namer_free(namer: mlx_node_namer) c_int;
+pub extern "c" fn mlx_print_graph(os: *std.c.FILE, namer: mlx_node_namer, outputs: mlx_vector_array) c_int;
+pub extern "c" fn mlx_vector_array_size(vec: mlx_vector_array) usize;
+pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
+pub extern "c" fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array;
+pub extern "c" fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int;
+
+// Closure + compile
+pub extern "c" fn mlx_closure_new_func_payload(
+    fun: *const fn (*mlx_vector_array, mlx_vector_array, ?*anyopaque) callconv(.c) c_int,
+    payload: ?*anyopaque,
+    dtor: ?*const fn (?*anyopaque) callconv(.c) void,
+) mlx_closure;
+pub extern "c" fn mlx_closure_free(cls: mlx_closure) c_int;
+pub extern "c" fn mlx_closure_apply(res: *mlx_vector_array, cls: mlx_closure, input: mlx_vector_array) c_int;
+pub extern "c" fn mlx_compile(res: *mlx_closure, fun: mlx_closure, shapeless: bool) c_int;
+pub extern "c" fn mlx_detail_compile_clear_cache() c_int;
+
+// Map string -> array
+pub extern "c" fn mlx_map_string_to_array_new() mlx_map_string_to_array;
+pub extern "c" fn mlx_map_string_to_array_free(map: mlx_map_string_to_array) c_int;
+pub extern "c" fn mlx_map_string_to_array_get(value: *mlx_array, map: mlx_map_string_to_array, key: [*:0]const u8) c_int;
+pub extern "c" fn mlx_map_string_to_array_insert(map: mlx_map_string_to_array, key: [*:0]const u8, value: mlx_array) c_int;
+
+// Map iterator
+pub extern "c" fn mlx_map_string_to_array_iterator_new(map: mlx_map_string_to_array) mlx_map_string_to_array_iterator;
+pub extern "c" fn mlx_map_string_to_array_iterator_free(it: mlx_map_string_to_array_iterator) c_int;
+pub extern "c" fn mlx_map_string_to_array_iterator_next(key: *?[*:0]const u8, value: *mlx_array, it: mlx_map_string_to_array_iterator) c_int;
+
+// Map string -> string
+pub extern "c" fn mlx_map_string_to_string_new() mlx_map_string_to_string;
+pub extern "c" fn mlx_map_string_to_string_free(map: mlx_map_string_to_string) c_int;
+pub extern "c" fn mlx_map_string_to_string_insert(map: mlx_map_string_to_string, key: [*:0]const u8, value: [*:0]const u8) c_int;
+pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_map_string_to_string, key: [*:0]const u8) c_int;
+
+// IO
+pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
+pub const mlx_io_reader = extern struct { ctx: ?*anyopaque = null };
+/// A custom reader's callbacks over its own descriptor (mlx/c/io_types.h `mlx_io_vtable`).
+pub const mlx_io_vtable = extern struct {
+    is_open: *const fn (?*anyopaque) callconv(.c) bool,
+    good: *const fn (?*anyopaque) callconv(.c) bool,
+    tell: *const fn (?*anyopaque) callconv(.c) usize,
+    seek: *const fn (?*anyopaque, i64, c_int) callconv(.c) void,
+    read: *const fn (?*anyopaque, [*]u8, usize) callconv(.c) void,
+    read_at_offset: *const fn (?*anyopaque, [*]u8, usize, usize) callconv(.c) void,
+    write: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+    label: *const fn (?*anyopaque) callconv(.c) [*:0]const u8,
+    free: *const fn (?*anyopaque) callconv(.c) void,
+};
+pub extern "c" fn mlx_io_reader_new(desc: ?*anyopaque, vtable: mlx_io_vtable) mlx_io_reader;
+pub extern "c" fn mlx_io_reader_free(io: mlx_io_reader) c_int;
+pub extern "c" fn mlx_load_safetensors_reader(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, in_stream: mlx_io_reader, s: mlx_stream) c_int;
+pub extern "c" fn mlx_einsum(res: *mlx_array, subscripts: [*:0]const u8, operands: mlx_vector_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_slice_update_dynamic(res: *mlx_array, src: mlx_array, update: mlx_array, start: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_save_safetensors(file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) c_int;
+
+// ── Ops ──
+pub extern "c" fn mlx_add(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_subtract(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_multiply(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_floor_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_negative(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_maximum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+// Kokoro's SineGen takes the fractional part of a phase ramp (`x - floor(x)`).
+pub extern "c" fn mlx_floor(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_ceil(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log2(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_round(res: *mlx_array, a: mlx_array, decimals: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sign(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+// Complex plumbing for Kokoro's iSTFTNet head. mlx-c has NO "build a complex
+// array from two real ones" op, so the spectrum is assembled as `re + im·i`
+// using a complex SCALAR from `mlx_array_new_complex` (float ⊕ complex
+// promotes to complex).
+pub extern "c" fn mlx_real(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_imag(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_arctan2(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_new_complex(real_val: f32, imag_val: f32) mlx_array;
+pub extern "c" fn mlx_minimum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_addmm(res: *mlx_array, c: mlx_array, a: mlx_array, b: mlx_array, alpha: f32, beta: f32, s: mlx_stream) c_int;
+pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_rsqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_exp(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_abs(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_tanh(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_cos(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sin(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_erf(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_reshape(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_hadamard_transform(res: *mlx_array, a: mlx_array, scale: mlx_optional_float, s: mlx_stream) c_int;
+pub extern "c" fn mlx_transpose(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_swapaxes(res: *mlx_array, a: mlx_array, axis1: c_int, axis2: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_transpose_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_expand_dims(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_squeeze(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_broadcast_to(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_take(res: *mlx_array, a: mlx_array, indices: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_depends(res: *mlx_vector_array, inputs: mlx_vector_array, dependencies: mlx_vector_array) c_int;
+pub extern "c" fn mlx_take_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_concatenate_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_pad(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, low_pad: [*]const c_int, low_pad_num: usize, high_pad: [*]const c_int, high_pad_num: usize, pad_value: mlx_array, mode: [*:0]const u8, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_softmax_axis(res: *mlx_array, a: mlx_array, axis: c_int, precise: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_argmax_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_copy(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_argsort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_topk(res: *mlx_array, a: mlx_array, k: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_topk_axis(res: *mlx_array, a: mlx_array, k: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_cumsum(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_mean_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+// Variance along one axis — the InstanceNorm1d half of Kokoro's AdaIN1d
+// (`src/plugins/kokoro/kokoro.zig`). `ddof` 0 = biased/population variance, which is what
+// torch's normalization layers use.
+pub extern "c" fn mlx_var_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_view(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_to_fp8(res: *mlx_array, x: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_from_fp8(res: *mlx_array, x: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_bitwise_and(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_left_shift(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_right_shift(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_equal(res: *mlx_array, a: mlx_array, b: mlx_array, equal_nan: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_remainder(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_where(res: *mlx_array, condition: mlx_array, x: mlx_array, y: mlx_array, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_arange(res: *mlx_array, start: f64, stop: f64, step: f64, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_full(res: *mlx_array, shape: [*]const c_int, shape_num: usize, val: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_zeros(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_ones(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_slice(res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_slice_update(res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_triu(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_tril(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
+
+pub extern "c" fn mlx_power(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_less(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_greater(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_greater_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_less_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+
+// Quantized matmul
+pub extern "c" fn mlx_quantized_matmul(res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, s: mlx_stream) c_int;
+
+// Gathered quantized matmul (for MoE expert dispatch)
+pub extern "c" fn mlx_gather_qmm(res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, sorted_indices: bool, s: mlx_stream) c_int;
+// Dense gathered matmul — the unquantized analog of gather_qmm, used for bf16
+// MoE expert dispatch. No transpose flag: `b` must already be [..., in, out].
+pub extern "c" fn mlx_gather_mm(res: *mlx_array, a: mlx_array, b: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, sorted_indices: bool, s: mlx_stream) c_int;
+
+// Dequantize (fallback)
+pub extern "c" fn mlx_dequantize(res: *mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, dtype: mlx_optional_dtype, s: mlx_stream) c_int;
+
+// Quantize (affine group-wise). Returns a vector_array of [q, scales, biases].
+// Used by the KV cache quantization path; see src/engines/mlx/cache/kv_quant.zig.
+pub extern "c" fn mlx_quantize(res: *mlx_vector_array, w: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, global_scale: mlx_array, s: mlx_stream) c_int;
+
+// Additional ops for MoE / GatedDeltaNet
+pub extern "c" fn mlx_sigmoid(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sum_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_max_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sum(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, s: mlx_stream) c_int;
+// FFT — real-input forward transform for the TTS speaker-encoder mel/STFT.
+// `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
+pub const mlx_fft_norm = c_int;
+pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
+pub extern "c" fn mlx_as_strided(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, strides: [*]const i64, strides_num: usize, offset: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
+// Real-output inverse transform — the iSTFT head of Kokoro's iSTFTNet generator
+// (`src/plugins/kokoro/kokoro.zig`). `n` is the OUTPUT length in samples, so the caller states
+// the frame size (20) rather than inferring it from the 11-bin input.
+pub extern "c" fn mlx_fft_irfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
+// 2D/3D conv + transposed conv for the media-generation decoders (VAE/vocoder).
+// MLX layout: input NHWC / NDHWC, weight OHWI / ODHWI (out-channels first, in-channels last).
+pub extern "c" fn mlx_conv2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, output_padding: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, output_padding_0: c_int, output_padding_1: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, output_padding_0: c_int, output_padding_1: c_int, output_padding_2: c_int, groups: c_int, s: mlx_stream) c_int;
+// Seed-exact noise for diffusion latents (FLUX): pair with mlx_random_key(seed).
+pub extern "c" fn mlx_random_normal(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, loc: f32, scale: f32, key: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_argpartition_axis(res: *mlx_array, a: mlx_array, kth: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_take_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_put_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, values: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logical_and(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logical_or(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logical_not(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_repeat_axis(res: *mlx_array, arr: mlx_array, repeats: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_tile(res: *mlx_array, arr: mlx_array, reps: [*]const c_int, reps_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log1p(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logaddexp(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_stack_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_split(res: *mlx_vector_array, a: mlx_array, num_splits: c_int, axis: c_int, s: mlx_stream) c_int;
+
+pub const mlx_optional_dtype = extern struct {
+    value: mlx_dtype = .float32,
+    has_value: bool = false,
+};
+
+// ── Fast ops ──
+pub extern "c" fn mlx_fast_rms_norm(res: *mlx_array, x: mlx_array, weight: mlx_array, eps: f32, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_layer_norm(res: *mlx_array, x: mlx_array, weight: mlx_array, bias: mlx_array, eps: f32, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_rope(res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: c_int, freqs: mlx_array, s: mlx_stream) c_int;
+// `mlx_fast_rope_dynamic` accepts a per-row offset array (shape [B], int32) so a single
+// kernel launch handles N requests at different KV positions during batched decode.
+pub extern "c" fn mlx_fast_rope_dynamic(res: *mlx_array, x: mlx_array, dims: c_int, traditional: bool, base: mlx_optional_float, scale: f32, offset: mlx_array, freqs: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_scaled_dot_product_attention(res: *mlx_array, queries: mlx_array, keys: mlx_array, values: mlx_array, scale: f32, mask_mode: [*:0]const u8, mask_arr: mlx_array, sinks: mlx_array, force_fused: bool, s: mlx_stream) c_int;
+
+// ── Vector of strings (for custom metal kernels) ──
+pub const mlx_vector_string = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_vector_string_new() mlx_vector_string;
+pub extern "c" fn mlx_vector_string_new_data(data: [*]const [*:0]const u8, size: usize) mlx_vector_string;
+pub extern "c" fn mlx_vector_string_free(vec: mlx_vector_string) c_int;
+
+// ── Custom Metal kernels ──
+pub const mlx_fast_metal_kernel_config = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_fast_metal_kernel_config_new() mlx_fast_metal_kernel_config;
+pub extern "c" fn mlx_fast_metal_kernel_config_free(cls: mlx_fast_metal_kernel_config) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_add_output_arg(cls: mlx_fast_metal_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_set_grid(cls: mlx_fast_metal_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_set_thread_group(cls: mlx_fast_metal_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_dtype(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_any_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_int(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx_fast_metal_kernel_config, name: [*:0]const u8, value: bool) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
+
+pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
+/// Every Metal kernel's source and header pass through `kernels.resolve` (the `MLX_SERVE_KERNEL_DIR` override).
+pub fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel {
+    return c_metal_kernel_new(name, input_names, output_names, kernels.resolve(source), kernels.resolve(header), ensure_row_contiguous, atomic_outputs);
+}
+const c_metal_kernel_new = @extern(*const fn ([*:0]const u8, mlx_vector_string, mlx_vector_string, [*:0]const u8, [*:0]const u8, bool, bool) callconv(.c) mlx_fast_metal_kernel, .{ .name = "mlx_fast_metal_kernel_new" });
+pub extern "c" fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int;
+pub extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int;
+
+// ── Random ──
+pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
+pub extern "c" fn mlx_random_split(res_0: *mlx_array, res_1: *mlx_array, key: mlx_array, s: mlx_stream) c_int;
+// Uniform noise — Kokoro's SineGen draws a random initial phase per harmonic.
+// Bounds are ARRAYS, unlike mlx_random_normal's scalar loc/scale.
+pub extern "c" fn mlx_random_uniform(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_random_seed(seed: u64) c_int;
+pub extern "c" fn mlx_random_bits(res: *mlx_array, shape: [*]const c_int, shape_num: usize, width: c_int, key: mlx_array, s: mlx_stream) c_int;
+// Uniform random integers in [low, high).
+pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
+
+// ── Sampler ops ──
+pub extern "c" fn mlx_cummax(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_all(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_isfinite(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_clip(res: *mlx_array, a: mlx_array, a_min: mlx_array, a_max: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_contiguous(res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_mean(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_mean_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_std(res: *mlx_array, a: mlx_array, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_std_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, ddof: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_max(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int;
+
+// ── Batch eval ──
+pub extern "c" fn mlx_eval(outputs: mlx_vector_array) c_int;
+pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
+
+// ── Memory management ──
+pub extern "c" fn mlx_clear_cache() c_int;
+pub extern "c" fn mlx_set_memory_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_set_cache_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_set_wired_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;
+pub extern "c" fn mlx_get_cache_memory(res: *usize) c_int;
+pub extern "c" fn mlx_get_peak_memory(res: *usize) c_int;
+pub extern "c" fn mlx_reset_peak_memory() c_int;
+
+// ── Device info ──
+pub const mlx_device_info = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_device_info_new() mlx_device_info;
+pub extern "c" fn mlx_device_info_get(info: *mlx_device_info, dev: mlx_device) c_int;
+pub extern "c" fn mlx_device_info_free(info: mlx_device_info) c_int;
+pub extern "c" fn mlx_device_info_get_size(res: *usize, info: mlx_device_info, key: [*:0]const u8) c_int;
+pub extern "c" fn mlx_device_info_get_string(res: *[*:0]const u8, info: mlx_device_info, key: [*:0]const u8) c_int;
+
+// ── Error handler ──
+pub const mlx_error_handler_func = ?*const fn ([*:0]const u8, ?*anyopaque) callconv(.c) void;
+pub extern "c" fn mlx_set_error_handler(handler: mlx_error_handler_func, data: ?*anyopaque, dtor: ?*const fn (?*anyopaque) callconv(.c) void) void;
+
+// ── Zig helper wrappers ──
+
+/// Get the default compute stream. Normally the GPU (Metal) stream. When MLX
+/// was built without a Metal backend (e.g. the iOS Simulator slice, where MLX's
+/// Metal device can't be constructed), there is no GPU stream — fall back to the
+/// CPU stream so the engine runs on the Accelerate backend. The check is cached;
+/// on real hardware Metal is always available, so this is the GPU stream as
+/// before with no measurable overhead.
+var no_gpu_backend_cache: ?bool = null;
+
+var virtual_gpu_cache: ?bool = null;
+/// A virtual Metal GPU (a macOS VM, GitHub's macOS runners) names no Apple GPU family (`architecture` "air64_v27",
+/// not "applegpu_gNN"). It caps threadgroups below 1024, has no MPP tensor ops and classes NaN its own way, so Metal
+/// proofs and kernel contracts prove nothing there.
+pub fn virtualGpu() bool {
+    if (virtual_gpu_cache == null) virtual_gpu_cache = (comptime builtin.os.tag.isDarwin()) and !noGpuBackend() and gpuArchVirtual();
+    return virtual_gpu_cache.?;
+}
+
+fn virtualArch(arch: []const u8) bool {
+    return !std.mem.startsWith(u8, arch, "applegpu");
+}
+
+/// Whether GPU 0's `architecture` names a virtual GPU (GPU 0, not the default device: a CPU default names no GPU);
+/// false when MLX does not say. The string belongs to the device info, so it is read before the info is freed.
+fn gpuArchVirtual() bool {
+    const dev = mlx_device_new_type(.gpu, 0);
+    defer _ = mlx_device_free(dev);
+    var info = mlx_device_info_new();
+    defer _ = mlx_device_info_free(info);
+    if (mlx_device_info_get(&info, dev) != 0) return false;
+    var cstr: [*:0]const u8 = undefined;
+    if (mlx_device_info_get_string(&cstr, info, "architecture") != 0) return false;
+    return virtualArch(std.mem.span(cstr));
+}
+
+/// True when MLX has no Metal/GPU backend (e.g. the iOS Simulator slice built
+/// with MLX_BUILD_METAL=OFF). Callers use this to take CPU-only paths and skip
+/// GPU-only work (kernel-fusion JIT compilation). Always false on real hardware.
+pub fn noGpuBackend() bool {
+    if (no_gpu_backend_cache == null) {
+        var avail: bool = false;
+        if (comptime builtin.os.tag.isDarwin()) {
+            _ = mlx_metal_is_available(&avail);
+        } else {
+            // Non-Darwin backends (mlx-omarchy Vulkan) are invisible to
+            // mlx_metal_is_available. Ask the device API directly: the GPU
+            // device reports availability whether the backend is Metal,
+            // Vulkan or CUDA, and mlx_default_gpu_stream_new() resolves to
+            // that device's stream.
+            const dev = mlx_device_new_type(.gpu, 0);
+            defer _ = mlx_device_free(dev);
+            _ = mlx_device_is_available(&avail, dev);
+        }
+        no_gpu_backend_cache = !avail;
+    }
+    return no_gpu_backend_cache.?;
+}
+
+pub fn gpuStream() mlx_stream {
+    return if (noGpuBackend()) mlx_default_cpu_stream_new() else mlx_default_gpu_stream_new();
+}
+
+/// Get array shape as a Zig slice
+pub fn getShape(arr: mlx_array) []const c_int {
+    const ndim = mlx_array_ndim(arr);
+    if (ndim == 0) return &.{};
+    return mlx_array_shape(arr)[0..ndim];
+}
+
+/// How a residual's dtype moved between two observation points.
+pub const DtypeStep = enum { quiet, widened, narrowed, changed };
+
+/// Bytes per element, for deciding whether a dtype change WIDENED the stream.
+/// Only the dtypes a residual can actually hold are named; anything else is
+/// reported as a plain change rather than guessed at.
+pub fn dtypeBytes(d: mlx_dtype) ?u8 {
+    return switch (d) {
+        .float16, .bfloat16 => 2,
+        .float32 => 4,
+        .float64 => 8,
+        else => null,
+    };
+}
+
+pub fn dtypeStep(prev: mlx_dtype, cur: mlx_dtype) DtypeStep {
+    if (prev == cur) return .quiet;
+    const pb = dtypeBytes(prev) orelse return .changed;
+    const cb = dtypeBytes(cur) orelse return .changed;
+    if (cb > pb) return .widened;
+    if (cb < pb) return .narrowed;
+    return .changed; // same width, different kernel selection (bf16 vs f16)
+}
+
+/// One-shot latches for `[dtype-trace]`, keyed by forward-path name. A vision
+/// tower and its text trunk are different paths and latch independently.
+var dtype_trace_seen: [12]?[]const u8 = @splat(null);
+
+/// True the FIRST time `path` is seen, false forever after. After the first
+/// forward the trace costs nothing — a per-layer FFI dtype read on every token
+/// would be a real (if small) tax, and identical repeated lines would bury the
+/// one line that matters.
+pub fn dtypeTraceArm(path: []const u8) bool {
+    for (&dtype_trace_seen) |*slot| {
+        if (slot.*) |seen| {
+            if (std.mem.eql(u8, seen, path)) return false;
+            continue;
+        }
+        slot.* = path;
+        return true;
+    }
+    return false; // table full — stop tracing rather than spam
+}
+
+pub fn resetDtypeTraceForTest() void {
+    dtype_trace_seen = @splat(null);
+}
+
+/// DIAGNOSTIC (`[dtype-trace]`): watch the residual stream's dtype across one
+/// forward pass.
+///
+/// A residual wider than the weights promotes EVERY projection's weight on
+/// read, so the cost lands as a UNIFORM multiple across attention, MLP and
+/// lm_head — which reads like a platform problem, not a bug. The Laguna YaRN
+/// mscale table (f32 constant multiplied into bf16 q/k) cost 3x and was
+/// invisible to op count, kernel choice, KV ablation and the CPU/GPU split.
+/// Endpoints alone say THAT it widened; per-layer lines on every layer are
+/// unreadable. So: log both endpoints, and in between log only where the dtype
+/// actually moves — one line that names the layer responsible.
+pub const DtypeTrace = struct {
+    path: []const u8,
+    on: bool,
+    last: mlx_dtype,
+
+    pub fn begin(path: []const u8, h: mlx_array, weight: ?mlx_array) DtypeTrace {
+        const on = dtypeTraceArm(path);
+        const d = mlx_array_dtype(h);
+        if (on) {
+            log.info("[dtype-trace] {s}: residual in = {s}, first weight = {s}\n", .{
+                path,
+                @tagName(d),
+                if (weight) |w| (if (w.ctx == null) "null" else @tagName(mlx_array_dtype(w))) else "n/a",
+            });
+        }
+        return .{ .path = path, .on = on, .last = d };
+    }
+
+    pub fn layer(self: *DtypeTrace, h: mlx_array, layer_idx: usize) void {
+        if (!self.on) return;
+        const d = mlx_array_dtype(h);
+        const step = dtypeStep(self.last, d);
+        if (step == .quiet) return;
+        log.info("[dtype-trace] {s}: residual {s} at layer {d}: {s} -> {s}\n", .{
+            self.path,
+            @tagName(step),
+            layer_idx,
+            @tagName(self.last),
+            @tagName(d),
+        });
+        self.last = d;
+    }
+
+    pub fn end(self: *DtypeTrace, h: mlx_array) void {
+        if (!self.on) return;
+        log.info("[dtype-trace] {s}: residual out = {s}\n", .{ self.path, @tagName(mlx_array_dtype(h)) });
+    }
+};
+
+/// Check if an mlx-c call succeeded (returns 0 on success)
+/// DIAGNOSTIC op counter. Every graph-building op funnels through `check`, so
+/// this counts ops ISSUED (not kernels dispatched — MLX fuses some). Only read
+/// by the decode forward probe; the increment is a single relaxed add on a
+/// path that already does an FFI call, so it does not move any benchmark.
+pub var op_count: std.atomic.Value(u64) = .init(0);
+
+/// TEST-ONLY fault injection at the ONE chokepoint every checked mlx-c call
+/// goes through: `fault.arm(k)` makes the k-th SUBSEQUENT call that would have
+/// SUCCEEDED report `error.MlxError` instead, so an ownership audit can walk
+/// every error path of a function without patching the function. Failing calls
+/// are not counted (they already take the error path on their own). The op
+/// itself has already executed when `check` sees its return code — the
+/// argument is evaluated first — so what is injected is a succeeding op
+/// REPORTING failure; the caller's `&out` handle is a valid, freeable array,
+/// which is exactly the state its cleanup must survive. Compiled only under
+/// `builtin.is_test`, so a release build carries neither the branch nor the
+/// symbols.
+pub const fault = struct {
+    var remaining: u64 = 0; // 0 = disarmed
+    var fired: bool = false;
+
+    /// Fail the k-th checked call from here (k >= 1). `arm(0)` is a no-op arm.
+    pub fn arm(k: u64) void {
+        remaining = k;
+        fired = false;
+    }
+    pub fn disarm() void {
+        remaining = 0;
+    }
+    /// Did the armed fault actually fire? False means the call under test
+    /// returned before reaching its k-th checked op — an assertion the test
+    /// needs, or the sweep silently stops covering anything.
+    pub fn didFire() bool {
+        return fired;
+    }
+    fn hit() bool {
+        if (remaining == 0) return false;
+        remaining -= 1;
+        if (remaining != 0) return false;
+        fired = true;
+        return true;
+    }
+};
+
+/// Test-only: like `fault`, but the injected failure also LATCHES the process-wide
+/// error — the state a real mlx-c raise leaves behind, which a best-effort caller
+/// must drop before returning.
+const LATCH_FAULT_MSG = "injected latching mlx-c raise (test only)";
+var latch_remaining: u64 = 0;
+var latch_fired = false;
+var latch_msg: [:0]const u8 = LATCH_FAULT_MSG;
+
+fn latchFaultHit() bool {
+    if (latch_remaining == 0) return false;
+    latch_remaining -= 1;
+    if (latch_remaining != 0) return false;
+    latch_fired = true;
+    return true;
+}
+
+pub fn armLatchingFaultForTest(k: u64) void {
+    armLatchingFaultWithForTest(k, LATCH_FAULT_MSG);
+}
+/// The same, latching `msg` (a Metal OOM's text, to exercise the memory class).
+pub fn armLatchingFaultWithForTest(k: u64, msg: [:0]const u8) void {
+    latch_remaining = k;
+    latch_fired = false;
+    latch_msg = msg;
+}
+pub fn latchingFaultFiredForTest() bool {
+    return latch_fired;
+}
+
+pub fn check(ret: c_int) !void {
+    _ = op_count.fetchAdd(1, .monotonic);
+    if (ret != 0) return error.MlxError;
+    if (comptime builtin.is_test) {
+        if (fault.hit()) return error.MlxError;
+        if (latchFaultHit()) {
+            latchMlxError(latch_msg.ptr, null);
+            return error.MlxError;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Wired-residency policy (mlxfast notes/47 class).
+//
+// MLX's Metal residency set has a capacity set by `mlx_set_wired_limit`. Two
+// failure shapes bracket the useful setting:
+//  * capacity 0 (MLX default): nothing is wired, and the driver re-establishes
+//    residency for the whole RAM-resident model on every command buffer —
+//    measured upstream as 9-15 ms kernelStart gaps across a prefill.
+//  * capacity >> live bytes (our historical `max_recommended_working_set_size`):
+//    every transient allocation fits the residency set, so each alloc/evict
+//    issues a Metal commit() — per-allocation overhead on the decode path.
+// The `fit` policy wires the CURRENT live set with a small slack and no
+// headroom: weights migrate into the set in one resize commit, and every later
+// transient FAILS the fit test and stays on the commit-free unwired path.
+// Re-applied after every load/unload so the capacity tracks the live set.
+
+pub const WiredMode = enum {
+    off, // wire nothing (MLX default behavior)
+    max, // capacity = max_recommended_working_set_size (historical behavior)
+    fit, // capacity = live bytes + slack (zero headroom)
+
+    pub fn fromEnv(value: ?[]const u8) WiredMode {
+        const v = value orelse return .max;
+        if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "0")) return .off;
+        if (std.mem.eql(u8, v, "max")) return .max;
+        if (std.mem.eql(u8, v, "fit")) return .fit;
+        return .max;
+    }
+};
+
+/// Zero-headroom capacity for `fit` mode. `set_wired_limit` above the
+/// recommended working set is an uncatchable MLX error, so the target is
+/// clamped a margin under it; a dead device query or an empty live set
+/// declines (null) rather than wiring garbage.
+pub fn wiredFitTarget(active_bytes: usize, slack_bytes: usize, max_rec: usize) ?usize {
+    if (active_bytes == 0 or max_rec == 0) return null;
+    const margin = 256 << 20;
+    if (max_rec <= margin) return null;
+    const cap = max_rec - margin;
+    const target = active_bytes +| slack_bytes;
+    return @min(target, cap);
+}
+
+pub const WiredPolicyResult = struct { mode: WiredMode, target: ?usize };
+
+pub fn maxRecommendedWorkingSet() usize {
+    const v = defaultDeviceInfoSize("max_recommended_working_set_size");
+    // CUDA has no working-set key; a discrete GPU's ceiling is its VRAM.
+    return if (v != 0) v else defaultDeviceInfoSize("total_memory");
+}
+
+/// Free VRAM across all processes (NVML, else this process's view); 0 when unknown (Metal).
+pub fn freeDeviceMemory() usize {
+    return defaultDeviceInfoSize("free_memory");
+}
+
+/// `MTLDevice.maxBufferLength`; 0 when the query fails.
+pub fn maxBufferLength() usize {
+    return defaultDeviceInfoSize("max_buffer_length");
+}
+
+/// The default CUDA device's compute capability (`.major` 12, `.minor` 0 on sm_120); 0 when unknown.
+pub fn cudaComputeCapability(part: enum { major, minor }) usize {
+    return defaultDeviceInfoSize(if (part == .major) "compute_capability_major" else "compute_capability_minor");
+}
+
+fn defaultDeviceInfoSize(key: [*:0]const u8) usize {
+    var dev = mlx_device{ .ctx = null };
+    _ = mlx_get_default_device(&dev);
+    defer _ = mlx_device_free(dev);
+    var info = mlx_device_info_new();
+    defer _ = mlx_device_info_free(info);
+    if (mlx_device_info_get(&info, dev) != 0) return 0;
+    var v: usize = 0;
+    if (mlx_device_info_get_size(&v, info, key) != 0) return 0;
+    return v;
+}
+
+/// Headroom the wired fit leaves above active memory for scratch.
+const WIRED_SLACK_BYTES: usize = 64 << 20;
+
+/// Apply the wired-residency policy. Call on the inference thread AFTER a
+/// model load or unload completes (and from the offline run path after load)
+/// so `fit` capacity tracks the live set. The caller logs the result.
+pub fn applyWiredPolicy() WiredPolicyResult {
+    const mode = WiredMode.fromEnv(env.span(.MLX_SERVE_WIRED));
+    if (noGpuBackend()) return .{ .mode = mode, .target = null };
+    var prev: usize = 0;
+    switch (mode) {
+        .off => {
+            _ = mlx_set_wired_limit(&prev, 0);
+            return .{ .mode = mode, .target = 0 };
+        },
+        .max => {
+            const max_rec = maxRecommendedWorkingSet();
+            if (max_rec == 0) return .{ .mode = mode, .target = null };
+            _ = mlx_set_wired_limit(&prev, max_rec);
+            return .{ .mode = mode, .target = max_rec };
+        },
+        .fit => {
+            // Drop cached (free) buffers first so the resize walk wires only
+            // live weights and the capacity leaves no headroom for scratch.
+            _ = mlx_clear_cache();
+            const max_rec = maxRecommendedWorkingSet();
+            var active: usize = 0;
+            _ = mlx_get_active_memory(&active);
+            const target = wiredFitTarget(active, WIRED_SLACK_BYTES, max_rec) orelse
+                return .{ .mode = mode, .target = null };
+            // Shrink-then-grow forces ResidencySet::resize to re-walk, pulling
+            // buffers allocated since the last apply out of the unwired set.
+            _ = mlx_set_wired_limit(&prev, 0);
+            _ = mlx_set_wired_limit(&prev, target);
+            return .{ .mode = mode, .target = target };
+        },
+    }
+}
+
+test "custom Metal kernels run on the Metal backend only" {
+    try std.testing.expectEqual(builtin.os.tag.isDarwin(), metalKernelsAvailable());
+}
+
+/// Evaluates every array reachable through `value`'s fields (structs, optionals, arrays, slices),
+/// so weights a loader bound lazily are resident, and billed, before the first request.
+pub fn evalFields(value: anytype) !void {
+    const vec = mlx_vector_array_new();
+    defer _ = mlx_vector_array_free(vec);
+    appendFields(vec, value);
+    try check(mlx_eval(vec));
+}
+
+/// `parts` stacked on a new leading axis (a per-expert bank), the result evaluated; caller frees.
+/// The parts evaluate first: a GPU stack waiting on hundreds of queued disk reads times out.
+pub fn stackEvaluated(parts: []const mlx_array, s: mlx_stream) !mlx_array {
+    const vec = mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx_vector_array_free(vec);
+    try check(mlx_eval(vec));
+    var out = mlx_array_new();
+    errdefer _ = mlx_array_free(out);
+    try check(mlx_stack_axis(&out, vec, 0, s));
+    try check(mlx_array_eval(out));
+    return out;
+}
+
+fn appendFields(vec: mlx_vector_array, value: anytype) void {
+    const T = @TypeOf(value);
+    if (T == mlx_array) {
+        if (value.ctx != null) _ = mlx_vector_array_append_value(vec, value);
+        return;
+    }
+    switch (@typeInfo(T)) {
+        .@"struct" => |st| inline for (st.field_names) |name| appendFields(vec, @field(value, name)),
+        .optional => if (value) |v| appendFields(vec, v),
+        .array => for (value) |v| appendFields(vec, v),
+        .pointer => |p| if (p.size == .slice) for (value) |v| appendFields(vec, v),
+        else => {},
+    }
+}
+
+test "streamOnGpuDevice reads the device type alone; streamIsGpu adds the Metal-kernel gate" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const cpu = mlx_default_cpu_stream_new();
+    defer _ = mlx_stream_free(cpu);
+    try std.testing.expect(streamOnGpuDevice(gpuStream()) and !streamOnGpuDevice(cpu));
+    try std.testing.expectEqual(metalKernelsAvailable(), streamIsGpu(gpuStream()));
+}
+
+test "evalFields evaluates the arrays nested in structs, optionals, arrays and slices" {
+    if (noGpuBackend()) return error.SkipZigTest;
+    const s = gpuStream();
+    const one = mlx_array_new_float(1.0);
+    defer _ = mlx_array_free(one);
+    var lazy: [5]mlx_array = undefined;
+    for (&lazy) |*a| {
+        a.* = mlx_array_new();
+        try check(mlx_add(a, one, one, s));
+    }
+    defer for (lazy) |a| {
+        _ = mlx_array_free(a);
+    };
+    const Inner = struct { w: mlx_array, none: mlx_array = .{ .ctx = null } };
+    const Outer = struct { inner: Inner, opt: ?mlx_array, rows: [2]mlx_array, blocks: []const Inner, name: []const u8 = "x", n: u32 = 7 };
+    const v = Outer{ .inner = .{ .w = lazy[0] }, .opt = lazy[1], .rows = .{ lazy[2], lazy[3] }, .blocks = &.{.{ .w = lazy[4] }} };
+    try evalFields(v);
+    for (lazy) |a| {
+        var ready = false;
+        _ = _mlx_array_is_available(&ready, a);
+        try std.testing.expect(ready);
+    }
+}
+
+test "cudaHomeDefault: export /opt/cuda only when nothing else names a toolkit" {
+    try std.testing.expectEqualStrings("/opt/cuda", cudaHomeDefault(false, false, true).?);
+    try std.testing.expect(cudaHomeDefault(true, false, true) == null);
+    try std.testing.expect(cudaHomeDefault(false, true, true) == null);
+    try std.testing.expect(cudaHomeDefault(false, false, false) == null);
+}
+
+test "ptxCacheDir: each staged MLX build compiles into its own kernel cache" {
+    var a: [256]u8 = undefined;
+    var b: [256]u8 = undefined;
+    const one = ptxCacheDir(&a, "/tmp", "1f2e3d4c5b6a7980").?;
+    try std.testing.expectEqualStrings("/tmp" ++ std.fs.path.sep_str ++ "mlx-serve-ptx" ++ std.fs.path.sep_str ++ "1f2e3d4c5b6a7980", one);
+    try std.testing.expect(!std.mem.eql(u8, one, ptxCacheDir(&b, "/tmp", "0000000000000001").?));
+    try std.testing.expect(ptxCacheDir(&a, "/tmp", "") == null); // unstamped build: MLX's own default
+    try std.testing.expect(ptxCacheDir(a[0..8], "/tmp", "1f2e3d4c5b6a7980") == null);
+}
+
+test "stampId: a rebuilt MLX gets a cache of its own, an unstamped build none" {
+    var a: [16]u8 = undefined;
+    var b: [16]u8 = undefined;
+    const one = stampId(&a, "mlx=64ea011cb65f backend=cuda cuda_arch=121 inputs=a83be3e5e701\n");
+    try std.testing.expectEqual(@as(usize, 16), one.len);
+    try std.testing.expectEqualStrings(one, stampId(&b, "mlx=64ea011cb65f backend=cuda cuda_arch=121 inputs=a83be3e5e701"));
+    try std.testing.expect(!std.mem.eql(u8, one, stampId(&b, "mlx=64ea011cb65f backend=cuda cuda_arch=121 inputs=f6a0d900c02d")));
+    try std.testing.expectEqualStrings("", stampId(&a, " \n"));
+}
+
+test "a custom CUDA kernel is written to MLX's kernel cache, so the next process loads it instead of compiling it" {
+    if (!cudaAvailable()) return error.SkipZigTest;
+    const io = std.testing.io;
+    var name_buf: [64]u8 = undefined;
+    const name = try std.fmt.bufPrintSentinel(&name_buf, "msv_test_ptx_cache_{x}", .{crt.monotonicMs()}, 0);
+    const ins = [_][*:0]const u8{"x"};
+    const in_vec = mlx_vector_string_new_data(&ins, 1);
+    defer _ = mlx_vector_string_free(in_vec);
+    const outs = [_][*:0]const u8{"y"};
+    const out_vec = mlx_vector_string_new_data(&outs, 1);
+    defer _ = mlx_vector_string_free(out_vec);
+    const k = mlx_fast_cuda_kernel_new(name, in_vec, out_vec, "y[0] = x[0] + 1.0f;", "", false, 0);
+    defer mlx_fast_cuda_kernel_free(k);
+    const c = mlx_fast_cuda_kernel_config_new();
+    defer mlx_fast_cuda_kernel_config_free(c);
+    try check(mlx_fast_cuda_kernel_config_add_output_arg(c, &[_]c_int{1}, 1, .float32));
+    try check(mlx_fast_cuda_kernel_config_set_grid(c, 1, 1, 1));
+    try check(mlx_fast_cuda_kernel_config_set_thread_group(c, 1, 1, 1));
+    const x = mlx_array_new_float(1.0);
+    defer _ = mlx_array_free(x);
+    const v = mlx_vector_array_new_data(&[_]mlx_array{x}, 1);
+    defer _ = mlx_vector_array_free(v);
+    var o = mlx_vector_array_new();
+    defer _ = mlx_vector_array_free(o);
+    try check(mlx_fast_cuda_kernel_apply(&o, k, v, c, gpuStream()));
+    var y = mlx_array_new();
+    defer _ = mlx_array_free(y);
+    try check(mlx_vector_array_get(&y, o, 0));
+    try check(mlx_array_eval(y));
+
+    // MLX's cache: MLX_PTX_CACHE_DIR, else <tmp>/mlx/<version>/ptx.
+    var ver = mlx_string_new();
+    defer _ = mlx_string_free(ver);
+    try check(mlx_version(&ver));
+    var dir_buf: [1024]u8 = undefined;
+    const dir_path = if (env.get(.MLX_PTX_CACHE_DIR)) |d| std.mem.span(d) else try std.fmt.bufPrint(&dir_buf, "{s}/mlx/{s}/ptx", .{
+        if (env.get(.TMPDIR)) |t| std.mem.span(t) else "/tmp", std.mem.span(mlx_string_data(ver)),
+    });
+    var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
+    defer dir.close(io);
+    var prefix_buf: [96]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "custom_kernel_{s}_", .{name});
+    var written: usize = 0;
+    var it = dir.iterate();
+    while (try it.next(io)) |e| if (std.mem.startsWith(u8, e.name, prefix)) {
+        written += 1;
+        dir.deleteFile(io, e.name) catch {};
+    };
+    try std.testing.expect(written > 0);
+}
+
+test "setCudaGraphs: work evaluated with the graphs off, on and off again is bit-identical" {
+    if (!cudaAvailable()) return error.SkipZigTest;
+    const s = gpuStream();
+    var key = mlx_array_new();
+    defer _ = mlx_array_free(key);
+    try check(mlx_random_key(&key, 3));
+    var a = mlx_array_new();
+    defer _ = mlx_array_free(a);
+    try check(mlx_random_normal(&a, &[_]c_int{ 256, 512 }, 2, .bfloat16, 0, 1, key, s));
+    var outs: [3]mlx_array = .{ mlx_array_new(), mlx_array_new(), mlx_array_new() };
+    defer for (outs) |o| {
+        _ = mlx_array_free(o);
+    };
+    const states = [_]bool{ false, true, false };
+    for (states, &outs) |on, *o| {
+        _ = setCudaGraphs(on);
+        var t = mlx_array_new();
+        defer _ = mlx_array_free(t);
+        try check(mlx_transpose(&t, a, s));
+        var m = mlx_array_new();
+        defer _ = mlx_array_free(m);
+        try check(mlx_matmul(&m, a, t, s));
+        try check(mlx_add(o, m, m, s));
+        try check(mlx_array_eval(o.*));
+    }
+    try std.testing.expect(!setCudaGraphs(true)); // returns the state it replaced
+    try std.testing.expect(setCudaGraphs(true));
+    for (outs[1..]) |o| {
+        var eq = mlx_array_new();
+        defer _ = mlx_array_free(eq);
+        try check(mlx_array_equal(&eq, outs[0], o, false, s));
+        try check(mlx_array_eval(eq));
+        var same = false;
+        try check(mlx_array_item_bool(&same, eq));
+        try std.testing.expect(same);
+    }
+}
+
+test "weight loads go to the GPU's pool on CUDA where managed memory reads slow or never migrates" {
+    try std.testing.expect(weightLoadOnGpu(true, true, false));
+    try std.testing.expect(weightLoadOnGpu(true, false, true)); // DGX Spark: managed pages read at 2/3 speed
+    try std.testing.expect(!weightLoadOnGpu(true, false, false)); // discrete Linux: managed memory migrates
+    try std.testing.expect(!weightLoadOnGpu(false, true, true)); // Metal/CPU: no GPU `Load`
+    try std.testing.expect(kernelReleaseIsWsl("6.18.54.1-microsoft-standard-WSL2"));
+    try std.testing.expect(!kernelReleaseIsWsl("7.2.9-2-cachyos"));
+}
+
+test "cudaDllSearchPath: the toolkit's DLL folders go first, the old PATH keeps its order" {
+    var buf: [256]u8 = undefined;
+    try std.testing.expectEqualStrings("C:\\cuda\\bin\\x64;C:\\cuda\\bin;C:\\Windows;C:\\tools", cudaDllSearchPath(&buf, "C:\\cuda", "C:\\Windows;C:\\tools").?);
+    try std.testing.expect(cudaDllSearchPath(buf[0..8], "C:\\cuda", "x") == null); // too long: leave PATH alone
+}
+
+test "wired mode from env" {
+    const t = std.testing;
+    // Default (unset) is the historical behavior until the fit-policy A/B
+    // picks a winner; unknown values also take the default rather than
+    // silently wiring nothing.
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv(null));
+    try t.expectEqual(WiredMode.off, WiredMode.fromEnv("off"));
+    try t.expectEqual(WiredMode.off, WiredMode.fromEnv("0"));
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv("max"));
+    try t.expectEqual(WiredMode.fit, WiredMode.fromEnv("fit"));
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv("banana"));
+}
+
+test "wired fit target: zero headroom, clamped, declines empty" {
+    const t = std.testing;
+    const gb = 1 << 30;
+    // Normal: live + slack.
+    try t.expectEqual(@as(?usize, 10 * gb + (64 << 20)), wiredFitTarget(10 * gb, 64 << 20, 115 * gb));
+    // Live set near the ceiling clamps a margin under max_rec.
+    try t.expectEqual(@as(?usize, 115 * gb - (256 << 20)), wiredFitTarget(115 * gb, 64 << 20, 115 * gb));
+    // Nothing live / dead query: decline.
+    try t.expectEqual(@as(?usize, null), wiredFitTarget(0, 64 << 20, 115 * gb));
+    try t.expectEqual(@as(?usize, null), wiredFitTarget(10 * gb, 64 << 20, 0));
+}
+
+// mlx-c error latch. mlx-c's default error handler calls exit(-1) after the C boundary
+// already caught the exception, so a Metal working-set OOM killed the server (#353).
+// Our handler latches the message and returns; the engine raises a named error at its
+// next checkpoint and the process stays serviceable.
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
+const LatchState = struct {
+    mlx_error_latched: std.atomic.Value(bool) = .init(false),
+    mlx_error_buf: [512]u8 = undefined,
+    mlx_error_len: usize = 0,
+    /// pthread mutex: mlx-c calls the handler from whatever thread raised, none carry an `Io`.
+    mlx_error_mtx: os_mutex.Mutex = .{},
+    gpu_context_lost: std.atomic.Value(bool) = .init(false),
+};
+pub const latch_shared = @import("../sdk/util/shared.zig").Shared(LatchState, "mlx_error_latch", .{});
+inline fn latch() *LatchState {
+    return latch_shared.get();
+}
+fn lockErrBuf() void {
+    latch().mlx_error_mtx.lock();
+}
+fn unlockErrBuf() void {
+    latch().mlx_error_mtx.unlock();
+}
+
+/// Memory-class latched messages become a memory 503 (`[METAL] ... Insufficient Memory`,
+/// `[malloc]`/`[metal::malloc]` failures, `Resource limit exceeded`).
+pub fn mlxErrorIsMemory(msg: []const u8) bool {
+    const needles = [_][]const u8{
+        "Insufficient Memory",
+        "insufficient memory",
+        "Unable to allocate",
+        "Resource limit",
+        "out of memory",
+        "Out of memory",
+        "maximum allowed buffer size",
+    };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, msg, n) != null) return true;
+    }
+    return false;
+}
+
+/// CUDA's sticky errors: once one is raised, every later call in the context fails the same
+/// way, so the process can serve nothing until it restarts.
+pub fn mlxErrorIsContextLost(msg: []const u8) bool {
+    const needles = [_][]const u8{
+        "an illegal memory access was encountered",
+        "an illegal instruction was encountered",
+        "misaligned address",
+        "unspecified launch failure",
+        "the launch timed out and was terminated",
+        "uncorrectable ECC error encountered",
+        "context is destroyed",
+    };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, msg, n) != null) return true;
+    }
+    return false;
+}
+
+/// True once the latch has seen a sticky CUDA error: requests are refused, /health says so.
+pub fn gpuContextLost() bool {
+    return latch().gpu_context_lost.load(.acquire);
+}
+
+pub fn resetGpuContextLostForTest() void {
+    latch().gpu_context_lost.store(false, .release);
+}
+
+fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
+    _ = data;
+    const span = std.mem.span(msg);
+    lockErrBuf();
+    defer unlockErrBuf();
+    if (!latch().gpu_context_lost.load(.acquire) and mlxErrorIsContextLost(span)) {
+        latch().gpu_context_lost.store(true, .release);
+        log.err("[mlx] GPU context lost: every request is refused until the server restarts\n", .{});
+    }
+    // First error wins: follow-on noise from a poisoned stream must not hide the cause.
+    if (!latch().mlx_error_latched.load(.acquire)) {
+        const n = @min(span.len, latch().mlx_error_buf.len);
+        @memcpy(latch().mlx_error_buf[0..n], span[0..n]);
+        latch().mlx_error_len = n;
+        latch().mlx_error_latched.store(true, .release);
+    }
+    log.err("[mlx] {s}\n", .{span});
+    // Test builds keep the log off stderr; a failed op must still name its cause beside the test.
+    if (comptime builtin.is_test) std.debug.print("[mlx] {s}\n", .{span});
+}
+
+/// Install the latching handler. Called once from `main()`.
+pub fn installErrorHandler() void {
+    mlx_set_error_handler(latchMlxError, null, null);
+}
+
+/// True when an MLX call has failed since the last `takeError`.
+pub fn errorPending() bool {
+    return latch().mlx_error_latched.load(.acquire);
+}
+
+/// Peek the latch without consuming it: the name of the error `checkError` would raise, or
+/// null. A slot finish must not answer 200 over a failed forward, yet must leave the latch
+/// for the decode-tick wrapper that fails the rest of a batched group.
+pub fn peekErrorName() ?[]const u8 {
+    if (!latch().mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    return if (mlxErrorIsMemory(latch().mlx_error_buf[0..latch().mlx_error_len])) "OutOfMemory" else "MlxFailure";
+}
+
+/// Consume the latched message into `buf` (copied), clearing the latch.
+pub fn takeError(buf: []u8) ?[]const u8 {
+    if (!latch().mlx_error_latched.load(.acquire)) return null;
+    lockErrBuf();
+    defer unlockErrBuf();
+    const n = @min(latch().mlx_error_len, buf.len);
+    @memcpy(buf[0..n], latch().mlx_error_buf[0..n]);
+    latch().mlx_error_len = 0;
+    latch().mlx_error_latched.store(false, .release);
+    return buf[0..n];
+}
+
+/// Consume the latch only when its message contains `needle`; any other error stays latched.
+pub fn takeErrorIf(needle: []const u8) bool {
+    if (!latch().mlx_error_latched.load(.acquire)) return false;
+    lockErrBuf();
+    defer unlockErrBuf();
+    if (std.mem.indexOf(u8, latch().mlx_error_buf[0..latch().mlx_error_len], needle) == null) return false;
+    latch().mlx_error_len = 0;
+    latch().mlx_error_latched.store(false, .release);
+    return true;
+}
+
+/// Drop a latch a best-effort op raised and its caller already reported, so an
+/// optional write or a diagnostic can never become an unrelated request's
+/// `MlxFailure`. `had_error` is the caller's `errorPending()` from BEFORE the op:
+/// an error that was already latched belongs to someone else and stays.
+pub fn dropLatchedErrorUnless(had_error: bool) void {
+    if (!had_error and errorPending()) {
+        var buf: [512]u8 = undefined;
+        _ = takeError(&buf);
+    }
+}
+
+/// Release-build fault injection: diag `mlx-fault-chunk=<n>` latches a synthetic Metal
+/// OOM at the n-th `checkError` of the process, then disarms (`tests/test_mlx_error_recovery.sh`).
+const FAULT_CHUNK_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by mlx-fault-chunk). at transforms.cpp:15";
+const FAULT_STEP_MSG = "[METAL] Command buffer execution failed: Insufficient Memory (injected by mlx-fault-step). at transforms.cpp:15";
+/// `mlx-fault-kind=cuda_lost` injects a sticky CUDA error instead of the OOM.
+const FAULT_CUDA_LOST_MSG = "cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered (injected by mlx-fault-kind). at array.cpp:352";
+
+/// One armed, self-disarming injector; prefill and decode checkpoints count separately.
+fn FaultSite(comptime name: @EnumLiteral()) type {
+    return struct {
+        msg: [:0]const u8,
+        at: ?u64 = null,
+        seen: u64 = 0,
+
+        fn target(self: *@This()) u64 {
+            if (self.at) |v| return v;
+            const v = env.int(name, u64, 0);
+            self.at = v;
+            if (v > 0) log.warn("[mlx] FAULT INJECTION armed: {s}=#{d}\n", .{ @tagName(name), v });
+            return v;
+        }
+
+        fn maybeFire(self: *@This()) void {
+            const t = self.target();
+            if (t == 0) return;
+            self.seen += 1;
+            if (self.seen != t) return;
+            self.at = 0;
+            const kind: []const u8 = if (env.get(.MLX_FAULT_KIND)) |p| std.mem.span(p) else "";
+            latchErrorForTest(if (std.mem.eql(u8, kind, "cuda_lost")) FAULT_CUDA_LOST_MSG else self.msg);
+        }
+
+        fn reset(self: *@This()) void {
+            self.at = null;
+            self.seen = 0;
+        }
+    };
+}
+
+/// Process-wide under `-Dunits` (sdk/util/shared.zig): the host's plugin table and the engine count one checkpoint
+/// sequence.
+pub const fault_chunk = @import("../sdk/util/shared.zig").Shared(FaultSite(.MLX_FAULT_CHUNK), "mlx_fault_chunk", .{ .msg = FAULT_CHUNK_MSG });
+pub const fault_step = @import("../sdk/util/shared.zig").Shared(FaultSite(.MLX_FAULT_STEP), "mlx_fault_step", .{ .msg = FAULT_STEP_MSG });
+
+/// Consume a latched failure: `error.OutOfMemory` for the memory class, else `error.MlxFailure`.
+fn consumeLatch() !void {
+    if (!latch().mlx_error_latched.load(.acquire)) return;
+    var buf: [512]u8 = undefined;
+    const msg = takeError(&buf) orelse return;
+    if (mlxErrorIsMemory(msg)) return error.OutOfMemory;
+    return error.MlxFailure;
+}
+
+/// Prefill checkpoint: once per chunk plus once after the last.
+pub fn checkError() !void {
+    fault_chunk.get().maybeFire();
+    return consumeLatch();
+}
+
+/// Decode checkpoint: once per decode tick, after the forward. Without it a failed decode
+/// forward finished 200 with garbage and handed the latch to the NEXT request's prefill.
+pub fn checkErrorDecode() !void {
+    fault_step.get().maybeFire();
+    return consumeLatch();
+}
+
+pub fn latchErrorForTest(msg: [:0]const u8) void {
+    latchMlxError(msg.ptr, null);
+}
+
+pub fn resetFaultChunkForTest() void {
+    fault_chunk.get().reset();
+    fault_step.get().reset();
+    var buf: [512]u8 = undefined;
+    _ = takeError(&buf);
+}
+
+test "an MLX memory failure is classified as a memory error, an argument error is not" {
+    const t = std.testing;
+    try t.expect(mlxErrorIsMemory("[METAL] Command buffer execution failed: Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory). at transforms.cpp:15"));
+    try t.expect(mlxErrorIsMemory("[malloc] Unable to allocate 8589934592 bytes."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Resource limit (128000) exceeded."));
+    try t.expect(mlxErrorIsMemory("[metal::malloc] Attempting to allocate 99 bytes which is greater than the maximum allowed buffer size of 5 bytes."));
+    try t.expect(!mlxErrorIsMemory("[slice_update] Invalid slice sizes."));
+    try t.expect(!mlxErrorIsMemory("[matmul] Last dimension of first input must match."));
+}
+
+test "the latch turns an mlx-c error into a Zig error instead of exiting, once" {
+    const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = takeError(&stale); // an earlier test's latch would shadow this one's
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expect(errorPending());
+    latchErrorForTest("[slice_update] Invalid slice sizes.");
+    try t.expectError(error.OutOfMemory, checkError());
+    try t.expect(!errorPending());
+    try checkError();
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(!errorPending());
+}
+
+test "the injected MLX error costs ONE checkError and the engine keeps working after it" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try checkError();
+    try checkError();
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkError());
+
+    try t.expect(!errorPending());
+    try checkError();
+    const s = gpuStream();
+    const shape = [_]c_int{2};
+    const data = [_]f32{ 1.5, 2.5 };
+    const a = mlx_array_new_data(@ptrCast(&data), &shape, 1, .float32);
+    defer _ = mlx_array_free(a);
+    var sum = mlx_array_new();
+    defer _ = mlx_array_free(sum);
+    try t.expectEqual(@as(c_int, 0), mlx_sum(&sum, a, false, s));
+    _ = mlx_array_eval(sum);
+    var out: f32 = 0;
+    _ = mlx_array_item_float32(&out, sum);
+    try t.expectApproxEqAbs(@as(f32, 4.0), out, 1e-6);
+    try checkError();
+}
+
+test "peekErrorName names the class WITHOUT consuming the latch" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try t.expect(peekErrorName() == null);
+
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    try t.expectEqualStrings("OutOfMemory", peekErrorName().?);
+    try t.expect(errorPending());
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectEqualStrings("MlxFailure", peekErrorName().?);
+    try t.expectError(error.MlxFailure, checkErrorDecode());
+    try t.expect(peekErrorName() == null);
+}
+
+test "a DECODE-time MLX failure is attributed to the decoding request, not the next one" {
+    const t = std.testing;
+    resetFaultChunkForTest();
+    defer resetFaultChunkForTest();
+
+    try checkError();
+    try checkErrorDecode();
+    latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try t.expectError(error.OutOfMemory, checkErrorDecode());
+    try t.expect(!errorPending());
+    try checkError();
+
+    try checkError();
+    try checkError();
+    try checkErrorDecode();
+    try t.expect(!errorPending());
+}
+
+test "a sticky CUDA error marks the GPU context lost; any other error does not" {
+    const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = takeError(&stale);
+    defer resetGpuContextLostForTest();
+
+    try t.expect(mlxErrorIsContextLost("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered at array.cpp:352"));
+    try t.expect(mlxErrorIsContextLost("cuLaunchKernelEx(&config, func, params, nullptr) failed: unspecified launch failure"));
+    try t.expect(!mlxErrorIsContextLost("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15"));
+    try t.expect(!mlxErrorIsContextLost("cudaMallocAsync(&data, size, stream) failed: out of memory"));
+
+    latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(!gpuContextLost());
+
+    latchErrorForTest("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered at array.cpp:352");
+    try t.expect(gpuContextLost());
+    try t.expectError(error.MlxFailure, checkError());
+    try t.expect(gpuContextLost()); // consuming the latch does not bring the context back
+}
+
+test "fp quantized matmul on GB10: 8 rows equal each row alone, bit for bit, and no worse than the tiled kernel against f64 truth" {
+    if (!cudaAvailable() or env.get(.MLX_CUDA_QMV_MAX_ROWS) != null) return error.SkipZigTest;
+    if (cudaComputeCapability(.major) != 12 or cudaComputeCapability(.minor) != 1) return error.SkipZigTest;
+    const s = gpuStream();
+    const a = std.testing.allocator;
+    var sse_rows: f64 = 0;
+    var sse_tiled: f64 = 0;
+    for ([_][:0]const u8{ "mxfp8", "nvfp4" }) |mode| for ([_][2]c_int{ .{ 2560, 2560 }, .{ 640, 6144 }, .{ 12288, 2560 } }, 0..) |nk, case| {
+        const bits: c_int = if (std.mem.eql(u8, mode, "mxfp8")) 8 else 4;
+        const gs: c_int = if (bits == 8) 32 else 16;
+        var key = mlx_array_new();
+        defer _ = mlx_array_free(key);
+        try check(mlx_random_key(&key, 40 + case));
+        var wf = mlx_array_new();
+        defer _ = mlx_array_free(wf);
+        try check(mlx_random_normal(&wf, &[_]c_int{ nk[0], nk[1] }, 2, .bfloat16, 0, 0.05, key, s));
+        var qv = mlx_vector_array_new();
+        defer _ = mlx_vector_array_free(qv);
+        try check(mlx_quantize(&qv, wf, mlx_optional_int.some(gs), mlx_optional_int.some(bits), mode, .{ .ctx = null }, s));
+        var w = mlx_array_new();
+        defer _ = mlx_array_free(w);
+        var sc = mlx_array_new();
+        defer _ = mlx_array_free(sc);
+        try check(mlx_vector_array_get(&w, qv, 0));
+        try check(mlx_vector_array_get(&sc, qv, 1));
+        // Nine rows take the tiled kernel; their first eight are the eight-row call's input.
+        var x9 = mlx_array_new();
+        defer _ = mlx_array_free(x9);
+        try check(mlx_random_normal(&x9, &[_]c_int{ 9, nk[1] }, 2, .bfloat16, 0, 1, key, s));
+        var x8 = mlx_array_new();
+        defer _ = mlx_array_free(x8);
+        try check(mlx_slice(&x8, x9, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 8, nk[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        const Q = struct {
+            fn mm(st: mlx_stream, x: mlx_array, ww: mlx_array, scl: mlx_array, g: c_int, b: c_int, m: [*:0]const u8) !mlx_array {
+                var o = mlx_array_new();
+                try check(mlx_quantized_matmul(&o, x, ww, scl, .{ .ctx = null }, true, mlx_optional_int.some(g), mlx_optional_int.some(b), m, st));
+                var f = mlx_array_new();
+                try check(mlx_astype(&f, o, .float32, st));
+                _ = mlx_array_free(o);
+                try check(mlx_array_eval(f));
+                return f;
+            }
+        };
+        const y8 = try Q.mm(s, x8, w, sc, gs, bits, mode);
+        defer _ = mlx_array_free(y8);
+        const y9 = try Q.mm(s, x9, w, sc, gs, bits, mode);
+        defer _ = mlx_array_free(y9);
+        const n: usize = @intCast(nk[0]);
+        const r8 = mlx_array_data_float32(y8).?[0 .. 8 * n];
+        const r9 = mlx_array_data_float32(y9).?[0 .. 8 * n];
+        for (0..8) |r| {
+            var xr = mlx_array_new();
+            defer _ = mlx_array_free(xr);
+            try check(mlx_slice(&xr, x8, &[_]c_int{ @intCast(r), 0 }, 2, &[_]c_int{ @intCast(r + 1), nk[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            const y1 = try Q.mm(s, xr, w, sc, gs, bits, mode);
+            defer _ = mlx_array_free(y1);
+            try std.testing.expectEqualSlices(f32, mlx_array_data_float32(y1).?[0..n], r8[r * n ..][0..n]);
+        }
+        // f64 truth over the dequantized weights.
+        var wd = mlx_array_new();
+        defer _ = mlx_array_free(wd);
+        try check(mlx_dequantize(&wd, w, sc, .{ .ctx = null }, mlx_optional_int.some(gs), mlx_optional_int.some(bits), mode, .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+        try check(mlx_array_eval(wd));
+        var xf = mlx_array_new();
+        defer _ = mlx_array_free(xf);
+        try check(mlx_astype(&xf, x8, .float32, s));
+        try check(mlx_array_eval(xf));
+        const wdat = mlx_array_data_float32(wd).?;
+        const xdat = mlx_array_data_float32(xf).?;
+        const k: usize = @intCast(nk[1]);
+        const truth = try a.alloc(f64, 8 * n);
+        defer a.free(truth);
+        for (0..8) |r| for (0..n) |j| {
+            var acc: f64 = 0;
+            for (0..k) |i| acc += @as(f64, xdat[r * k + i]) * @as(f64, wdat[j * k + i]);
+            truth[r * n + j] = acc;
+        };
+        for (truth, r8, r9) |t, p8, p9| {
+            sse_rows += (@as(f64, p8) - t) * (@as(f64, p8) - t);
+            sse_tiled += (@as(f64, p9) - t) * (@as(f64, p9) - t);
+        }
+    };
+    std.debug.print("[fp qmv 8 rows] rms err rows/tiled = {d:.4}\n", .{@sqrt(sse_rows / sse_tiled)});
+    try std.testing.expect(sse_rows <= sse_tiled);
+}
+
+test "device info queries free the device handle they take" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const MStats = extern struct { bytes_total: usize, chunks_used: usize, bytes_used: usize, chunks_free: usize, bytes_free: usize };
+    const mstats = @extern(*const fn () callconv(.c) MStats, .{ .name = "mstats" });
+    _ = maxRecommendedWorkingSet();
+    const before = mstats().bytes_used;
+    for (0..4096) |_| _ = maxRecommendedWorkingSet();
+    // Every admission bill reads it; a 16-byte handle per call is 64 KB here.
+    try std.testing.expect(mstats().bytes_used -| before < 16 << 10);
+}
+
+test "virtualGpu: an architecture that names no Apple GPU family is a virtual GPU" {
+    try std.testing.expect(virtualArch("air64_v27"));
+    try std.testing.expect(!virtualArch("applegpu_g17d"));
+    try std.testing.expect(!virtualArch("applegpu_g13s"));
+}
+
+test "virtualGpu: GPU 0's architecture decides, read while MLX's info holds it, whatever the default device" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    if (noGpuBackend()) return error.SkipZigTest;
+    const dev = mlx_device_new_type(.gpu, 0);
+    defer _ = mlx_device_free(dev);
+    var prev = mlx_device{ .ctx = null };
+    try std.testing.expectEqual(@as(c_int, 0), mlx_get_default_device(&prev));
+    defer {
+        _ = mlx_set_default_device(prev);
+        _ = mlx_device_free(prev);
+    }
+    const cpu = mlx_device_new_type(.cpu, 0);
+    defer _ = mlx_device_free(cpu);
+    try std.testing.expectEqual(@as(c_int, 0), mlx_set_default_device(cpu));
+    var info = mlx_device_info_new();
+    defer _ = mlx_device_info_free(info);
+    try std.testing.expectEqual(@as(c_int, 0), mlx_device_info_get(&info, dev));
+    var cstr: [*:0]const u8 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), mlx_device_info_get_string(&cstr, info, "architecture"));
+    defer virtual_gpu_cache = null;
+    for (0..64) |_| {
+        virtual_gpu_cache = null;
+        try std.testing.expectEqual(virtualArch(std.mem.span(cstr)), virtualGpu());
+    }
+}

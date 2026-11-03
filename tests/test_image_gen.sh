@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# Native FLUX.2 image endpoint smoke test: text-to-image (JSON + SSE),
-# image-to-image (structure retention at low strength + engagement log),
-# instruction edit incl. multi-reference (ref_images engagement + 400s),
-# conditioning rebalance (cond_gain/cond_weights + count validation), and
-# runtime LoRA (synthetic zero-B adapter attaches; non-matching adapter 400s).
-# Usage: FLUX_MODEL=<dir> ./tests/test_image_gen.sh [port]
+# test_image_gen.sh — FLUX.2-klein image endpoints: txt2img (JSON + SSE), img2img structure retention at strength 0.2,
+# instruction edit and multi-reference edit (engagement line + 400s), conditioning rebalance (count validation, the
+# output differs), runtime LoRA (a zero-B adapter is byte-transparent, a non-matching one 400s), and OpenAI
+# POST /v1/images/edits multipart (PNG in the vendor shape, repeated `image[]`, named 400s for mask / n>1 /
+# response_format=url / output_format=jpeg / stream / missing image / JSON posted to multipart). The sizeless-edit case
+# SKIPs here by design (FLUX takes edit geometry from the request).
+#
+#   FLUX_MODEL=<dir> ./tests/test_image_gen.sh [port]
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11399}"
 MODEL="${FLUX_MODEL:-$(ls -d ~/.cache/huggingface/hub/models--Runpod--FLUX.2-klein-4B-mflux-4bit/snapshots/* 2>/dev/null | head -1)}"
 [ -n "$MODEL" ] || { echo "SKIP: no FLUX model (set FLUX_MODEL)"; exit 0; }
@@ -17,11 +21,7 @@ BIN="$ROOT/zig-out/bin/mlx-serve"
 SRV=$!
 trap 'kill $SRV 2>/dev/null' EXIT
 # wait for /health (model load is heavy)
-for i in $(seq 1 120); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 /tmp/test_image_server.log; exit 1; }
-  sleep 2
-done
+srv_wait_health "http://127.0.0.1:$PORT" 120 2 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 /tmp/test_image_server.log; exit 1; }
 
 OUT=/tmp/test_image_gen.json
 code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \

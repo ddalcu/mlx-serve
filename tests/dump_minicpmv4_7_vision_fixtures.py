@@ -4,7 +4,7 @@
 Runs transformers' own `MiniCPMV4_6ImageProcessorPil` (the processor the checkpoint maps to),
 `MiniCPMV4_7Processor`, `MiniCPMV4_7VisionModel` + `MiniCPMV4_7Merger` (fp32, CPU) on the
 checkpoint's dense tower weights, and `get_rope_index` (canvas M-RoPE), saving every stage
-`src/minicpm_vision.zig` has to reproduce. Both sides read the same bf16 numbers, so a diff is a
+`src/plugins/qwen3_5/minicpm_vision.zig` has to reproduce. Both sides read the same bf16 numbers, so a diff is a
 layout/math bug. Preprocessing cases start from RGB bytes decoded here (our server decodes with
 stb, the reference with libjpeg; the decoders are not under test):
   house  the repo's house.jpeg: sliced into a thumbnail plus a grid of detail crops

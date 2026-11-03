@@ -25,12 +25,8 @@ function parseModels(value: unknown): Model[] {
         : [];
     const architecture =
       typeof meta.architecture === "string" ? meta.architecture : undefined;
-    if (
-      capabilities.includes("audio") &&
-      ["kokoro", "qwen3_tts"].includes(architecture ?? "") &&
-      !capabilities.includes("speech")
-    )
-      capabilities.push("speech");
+    // The server names the route a media row serves (`modality`); speech is the one with no capability of its own.
+    if (r.modality === "speech") capabilities.push("speech");
     const length = ([r.context_length, r.max_model_len, meta.context_length].find(
         (v) => typeof v === "number" && Number.isSafeInteger(v) && v > 0,
       ) as number | undefined);

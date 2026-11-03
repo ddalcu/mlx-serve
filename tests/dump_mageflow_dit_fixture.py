@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump the two MageFlow DiT forward-parity fixtures for src/mage_flow.zig.
+"""Dump the two MageFlow DiT forward-parity fixtures for src/plugins/mage_flow/mage_flow.zig.
 
 Runs the pure-MLX REFERENCE (ivanfioravanti/mflux@mage-flow-mlx) transformer in
 FP32 over deterministic inputs and writes BOTH single-forward fixtures in one

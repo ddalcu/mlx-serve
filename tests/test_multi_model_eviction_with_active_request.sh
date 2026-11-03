@@ -10,6 +10,7 @@
 # Usage: ./tests/test_multi_model_eviction_with_active_request.sh [root] [port]
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 ROOT="${1:-$HOME/.mlx-serve/models}"
 PORT="${2:-8099}"
@@ -44,10 +45,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in $(seq 1 30); do
-    curl -fs "$BASE/health" >/dev/null 2>&1 && break
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || true
 
 # Warm M2 so it counts as the LRU victim.
 echo "  warming M2..."

@@ -5,7 +5,7 @@ Reference = sentence-transformers (Transformer -> LAST-TOKEN pool -> normalize;
 issue #116). The Qwen3-Embedding tokenizer's TemplateProcessing post-processor
 appends <|endoftext|> to every encode and the pooling reads THAT position —
 mlx-serve mirrors it by appending config.json's eos_token_id for last-token
-pooling models (`wrapEncoderIds` eos-only arm in server.zig).
+pooling models (`wrapEncoderIds` eos-only arm in host/http/server.zig).
 
 No prompt/instruction prefix on either side: /v1/embeddings serves raw text,
 and the reference is encoded with prompt="" for the same reason as the

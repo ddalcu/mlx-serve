@@ -8,7 +8,7 @@ the default and draws the same non-greedy token as before.
 
   tests/test_sampling_defaults.py [model_dir] [port]
 
-model_dir also reads SAMPLING_MODEL; defaults to Qwen3.5-0.8B-MLX-4bit.
+model_dir also reads SAMPLING_MODEL; defaults to Qwen3.5-0.8B-MLX-4bit. Fails (never skips) without it.
 """
 import json
 import os
@@ -19,6 +19,8 @@ import sys
 import tempfile
 import time
 from urllib.request import Request, urlopen
+
+from lib.server import wait_health
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = Path.home() / ".mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
@@ -115,17 +117,7 @@ def main():
                 cwd=ROOT, stdout=log, stderr=subprocess.STDOUT, env={**os.environ, "HOME": str(home)},
             )
             try:
-                while time.monotonic() < deadline:
-                    if process.poll() is not None:
-                        raise RuntimeError(f"server exited {process.returncode}")
-                    try:
-                        with urlopen(f"http://127.0.0.1:{PORT}/health", timeout=2) as health:
-                            if health.status == 200:
-                                break
-                    except OSError:
-                        time.sleep(0.5)
-                else:
-                    raise TimeoutError("server did not become healthy")
+                wait_health(f"http://127.0.0.1:{PORT}", deadline - time.monotonic(), process, interval=0.5)
                 run(deadline)
             except Exception:
                 print(log_path.read_text(errors="replace")[-4000:], file=sys.stderr)

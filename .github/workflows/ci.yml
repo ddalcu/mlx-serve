@@ -92,7 +92,7 @@ jobs:
           key: zig-cache-${{ hashFiles('scripts/fetch-zig.sh', 'build.zig', 'build.zig.zon') }}-${{ steps.mlxpin.outputs.submodules }}-${{ steps.mlxpin.outputs.xcode }}
 
       - name: Build mlx-serve (Zig, ReleaseFast)
-        run: zig build -Doptimize=ReleaseFast
+        run: zig build -Doptimize=ReleaseFast -Dstrip
 
       - name: Build vz-agent guest binary
         run: zig build vz-agent
@@ -117,7 +117,7 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ]; then
             echo "needed=1" >> "$GITHUB_OUTPUT"
           elif git diff --name-only "origin/${{ github.base_ref }}..." \
-              | grep -qE '^src/(chat|server)\.zig$|^src/fixtures/tool_traffic\.jsonl$'; then
+              | grep -qE '^src/host/chat/|^src/fixtures/tool_traffic\.jsonl$'; then
             echo "needed=1" >> "$GITHUB_OUTPUT"
           else
             echo "needed=0" >> "$GITHUB_OUTPUT"
@@ -125,6 +125,11 @@ jobs:
 
       - name: Run Zig tests
         run: zig build test --summary all ${{ steps.slowtests.outputs.needed == '1' && '-Dslow-tests' || '' }}
+
+      # The kit builds its example from itself, `plugin new|check|fixture|install` work, and the binary above serves a
+      # kit-built dylib's pack (CPU-light: the fixture pack is 2 layers at width 16).
+      - name: Plugin kit end to end
+        run: bash tests/test_plugin_kit.sh
 
   swift-app:
     runs-on: macos-26

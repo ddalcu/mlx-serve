@@ -6,10 +6,12 @@
 # absent so CI stays green.
 #
 # Usage: tests/test_qwen_vision.sh [model_dir] [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-${QWEN_VISION_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}}"
+MODEL="${1:-${QWEN_VISION_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}}"
 PORT="${2:-11385}"
 IMAGE="tests/fixtures/house.jpeg"
 
@@ -23,7 +25,7 @@ SRV=$!
 cleanup() { kill "$SRV" 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 90); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "localhost:$PORT" 90 1 || true
 if ! curl -sf "localhost:$PORT/health" >/dev/null 2>&1; then echo "FAIL: server never came up"; cat "$LOG"; exit 1; fi
 
 B64=$(base64 -i "$IMAGE")

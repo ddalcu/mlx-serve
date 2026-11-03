@@ -32,7 +32,7 @@ final class VoicePreviewerTests: XCTestCase {
         var synthCalls: [(String, String)] = []
         var played: [Data] = []
         let p = VoicePreviewer(
-            synthesize: { text, voice in synthCalls.append((text, voice)); return Data("audio".utf8) },
+            synthesize: { text, voice in synthCalls.append((text, voice.id)); return Data("audio".utf8) },
             play: { played.append($0) })
 
         p.preview("af_bella")
@@ -69,7 +69,7 @@ final class VoicePreviewerTests: XCTestCase {
         let gate = Gate()
         var played: [String] = []
         let p = VoicePreviewer(
-            synthesize: { _, voice in await gate.wait(); return Data(voice.utf8) },
+            synthesize: { _, voice in await gate.wait(); return Data(voice.id.utf8) },
             play: { played.append(String(decoding: $0, as: UTF8.self)) })
 
         p.preview("af_bella")
@@ -157,7 +157,7 @@ final class VoicePreviewerTests: XCTestCase {
     func testBlendSpecIsPassedThroughVerbatim() async {
         var seen: String?
         let p = VoicePreviewer(
-            synthesize: { _, voice in seen = voice; return Data() },
+            synthesize: { _, voice in seen = voice.id; return Data() },
             play: { _ in })
         p.preview("af_bella,af_sky")
         await settle(p)

@@ -1,23 +1,10 @@
 #!/bin/bash
-# test_model_card_frontmatter.sh — static checks for the HF model cards our
-# converter scripts generate.
+# test_model_card_frontmatter.sh — static checks for the HF model cards our converters generate (the `README`
+# constant read with `ast`, never imported: the converters import mlx): the frontmatter parses, declares `base_model`,
+# `base_model_relation: quantized` (HF DEFAULTS a missing relation to `finetune`, silently) and an explicit
+# `library_name` (else a diffusers-shaped repo advertises a from_pretrained snippet that cannot load it).
 #
-# Why this exists: Hugging Face DEFAULTS a missing `base_model_relation` to
-# `finetune`. A quantized mirror that omits the field is therefore published as
-# a finetune of its base model — nothing warns, the card renders fine, and the
-# repo lands in the wrong list on the base model's page. Both Mage-Flow mirrors
-# shipped that way (live, 2026-07-25).
-#
-# Verifies, without running the converter (it needs mlx + a ~16 GB checkpoint):
-#   1. every generated card's frontmatter is parseable YAML-ish key/value
-#   2. it declares `base_model`
-#   3. it declares `base_model_relation: quantized` — these scripts quantize,
-#      they never train
-#   4. it declares an explicit `library_name`, so a diffusers-shaped repo does
-#      not auto-advertise a `DiffusionPipeline.from_pretrained` snippet that
-#      cannot work against pruned, quantized weights
-#
-# Usage: ./tests/test_model_card_frontmatter.sh
+#   ./tests/test_model_card_frontmatter.sh   # hermetic: no weights, no network
 
 set -u
 cd "$(dirname "$0")/.." || exit 1

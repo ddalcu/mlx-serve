@@ -219,6 +219,27 @@ enum SystemMetrics {
         return min(rpOv || rbOv ? UInt64.max : reclaimBytes, outside)
     }
 
+    /// Activity Monitor's "Memory Used": app memory (less what can be purged) plus wired plus compressed.
+    static func computeMemoryUsed(internalPages: UInt64, purgeablePages: UInt64, wirePages: UInt64,
+                                  compressorPages: UInt64, pageSize: UInt64) -> UInt64 {
+        let app = internalPages >= purgeablePages ? internalPages - purgeablePages : 0
+        return (app + wirePages + compressorPages) * pageSize
+    }
+
+    static func memoryUsedBytes() -> UInt64 {
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<Int32>.size)
+        let result = withUnsafeMutablePointer(to: &stats) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return computeMemoryUsed(internalPages: UInt64(stats.internal_page_count), purgeablePages: UInt64(stats.purgeable_count),
+                                 wirePages: UInt64(stats.wire_count), compressorPages: UInt64(stats.compressor_page_count),
+                                 pageSize: UInt64(vm_kernel_page_size))
+    }
+
     // MARK: - Process identity (was: /bin/ps -o comm=)
 
     /// Absolute executable path, or nil if the process is gone or unreadable

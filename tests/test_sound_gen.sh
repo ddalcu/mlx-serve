@@ -13,13 +13,15 @@
 #   hf download ddalcu/Stable-Audio-3-Small-SFX-MLX-Serve --local-dir ~/.mlx-serve/models/stabilityai/stable-audio-3-small-sfx
 #
 # Usage: SA3_MODEL=<dir> ./tests/test_sound_gen.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11441}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
-SA3="${SA3_MODEL:-$HOME/.mlx-serve/models/stabilityai/stable-audio-3-small-sfx}"
+SA3="${SA3_MODEL:-$(find_model stabilityai/stable-audio-3-small-sfx || echo "$HOME/.mlx-serve/models/stabilityai/stable-audio-3-small-sfx")}"
 [ -f "$SA3/model_config.json" ] || { echo "SKIP: no Stable Audio 3 repo at $SA3 (set SA3_MODEL)"; exit 0; }
 [ -f "$SA3/t5gemma-b-b-ul2/model.safetensors" ] || { echo "SKIP: $SA3 is incomplete (no t5gemma-b-b-ul2/model.safetensors)"; exit 0; }
 
@@ -32,11 +34,7 @@ LOG="$TMP/server.log"
 "$BIN" --serve --model-dir "$TMP/models" --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -rf "$TMP"' EXIT
-for _ in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 
 api() { curl -s -m 600 "http://127.0.0.1:$PORT$1" "${@:2}"; }
 post() { api "$1" -X POST -H 'Content-Type: application/json' -d "$2" "${@:3}"; }
