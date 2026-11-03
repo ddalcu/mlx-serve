@@ -529,7 +529,7 @@ fn printUsage(io: std.Io) void {
         \\  --dist <pipeline|tensor>  Serve --dist-model across this Mac and a
         \\                        worker over Thunderbolt RDMA: pipeline splits the
         \\                        layers, tensor splits every MoE expert (Qwen3.8-
-        \\                        Flash-Next; DeepSeek-V4.1 pipeline only). An H3
+        \\                        Flash-Next, DeepSeek-V4.1). An H3
         \\                        pack splits each video step's rows instead. The
         \\                        worker runs `mlx-serve worker`.
         \\  --dist-model <dir>  The model the two Macs serve (default: --model)

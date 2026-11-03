@@ -89,6 +89,8 @@ pub const Model = struct {
     owner: u32 = 0,
     parked: std.AutoHashMapUnmanaged(u32, Kept) = .empty,
     idle: ?Kept = null,
+    /// The last id a snapshot was given for the other tensor ranks (`Snap.tp_id`).
+    tp_snaps: u64 = 0,
 };
 
 /// A state off the module, with its identity (`Dsv41Model.state_gen`).
@@ -108,13 +110,17 @@ fn park(m: *Model) !void {
     if (m.owner != 0) try m.parked.put(gpa, m.owner, k) else if (!auxEnabled(m)) keepIdle(m, k) else {
         var orphan = k;
         orphan.deinit();
+        dsv41.tpFree(m.mdl, k.gen);
     }
     m.mdl.dec_state = null;
     m.owner = 0;
 }
 
 fn keepIdle(m: *Model, k: Kept) void {
-    if (m.idle) |*old| old.deinit();
+    if (m.idle) |*old| {
+        old.deinit();
+        dsv41.tpFree(m.mdl, old.gen);
+    }
     m.idle = k;
 }
 
@@ -153,11 +159,15 @@ fn releaseSlot(mp: *anyopaque, slot: u32) callconv(.c) void {
     }
     if (slot == m.owner) {
         m.owner = 0;
-        if (m.mdl.dec_state) |*st| st.deinit();
+        if (m.mdl.dec_state) |*st| {
+            st.deinit();
+            dsv41.tpFree(m.mdl, m.mdl.state_gen);
+        }
         m.mdl.dec_state = null;
     } else if (m.parked.fetchRemove(slot)) |kv| {
         var k = kv.value;
         k.deinit();
+        dsv41.tpFree(m.mdl, k.gen);
     }
 }
 
@@ -210,6 +220,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             error.MissingWeight => Verdict.refuse(.failed, "deepseek_v41: a weight is missing"),
             error.StreamedRowsDoNotFit => Verdict.refuse(.too_large, "deepseek_v41: the streamed bank's rows do not fit the free memory"),
             error.StreamedWeightsUnsupported => Verdict.refuse(.unsupported, "deepseek_v41: a streamed (experts.bin) pack needs the macOS build's expert streamer"),
+            error.Dsv41TpStreamedExperts => Verdict.refuse(.unsupported, "deepseek_v41: streamed experts do not run split across two Macs; turn stream_experts off (each Mac holds half the experts)"),
             else => Verdict.refuse(.failed, "deepseek_v41: the pack does not load"),
         };
         return null;
@@ -247,7 +258,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const pair: ?dsv41.Pair = if (ctx.pair_remote.count > 0) .{ .lo = ctx.pair_remote.first, .hi = ctx.pair_remote.first + ctx.pair_remote.count, .worker = false } else null;
     m.s = s;
     m.caps = ctx.parsed.caps;
-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
+    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
     errdefer m.mdl.deinit();
     m.bank = null;
     m.owner = 0;
@@ -431,7 +442,7 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
 fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array) !mlx.mlx_array {
     const mdl = m.mdl;
     var one: [1]u32 = undefined;
-    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null;
+    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and mdl.tp == null;
     const ids = if (dev.ctx != null and !gpu_decode) blk: {
         one[0] = try v4plugin.hostToken(dev);
         if (one[0] >= m.cfg.vocab_size) return error.TokenPastVocabulary;
@@ -590,12 +601,17 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     out.* = null;
     if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
     const m: *Model = @ptrCast(@alignCast(mp));
-    const st = liveState(m, slot) orelse return .ok;
-    const sn = st.snap orelse return .ok;
+    const live = stateOf(m, slot) orelse return .ok;
+    const sn = live.st.snap orelse return .ok;
     if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
     const owned = gpa.create(dsv41.Snap) catch |e| return Verdict.named(.failed, @errorName(e));
     owned.* = sn;
-    st.snap = null;
+    live.st.snap = null;
+    if (m.mdl.tp != null) {
+        m.tp_snaps += 1;
+        owned.tp_id = m.tp_snaps;
+        dsv41.tpSnap(m.mdl, .take, live.gen, owned.tp_id);
+    }
     out.* = owned;
     return .ok;
 }
@@ -610,14 +626,19 @@ fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callcon
         fresh.deinit();
         return Verdict.named(.failed, @errorName(e));
     };
-    if (m.mdl.dec_state) |*old| old.deinit();
+    if (m.mdl.dec_state) |*old| {
+        old.deinit();
+        dsv41.tpFree(m.mdl, m.mdl.state_gen);
+    }
     m.mdl.dec_state = fresh;
     m.mdl.gens += 1;
     m.mdl.state_gen = m.mdl.gens;
+    dsv41.tpSnap(m.mdl, .restore, sn.tp_id, m.mdl.state_gen);
     return .ok;
 }
 
-fn auxSlice(_: *anyopaque, handle: abi.Handle, len: u64, out: *abi.Handle) callconv(.c) Verdict {
+fn auxSlice(mp: *anyopaque, handle: abi.Handle, len: u64, out: *abi.Handle) callconv(.c) Verdict {
+    const m: *Model = @ptrCast(@alignCast(mp));
     out.* = null;
     const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to slice");
     if (len != sn.n) return Verdict.refuse(.unsupported, "deepseek_v41: a snapshot cannot be shortened through its rings");
@@ -626,6 +647,11 @@ fn auxSlice(_: *anyopaque, handle: abi.Handle, len: u64, out: *abi.Handle) callc
         gpa.destroy(owned);
         return Verdict.named(.failed, @errorName(e));
     };
+    if (sn.tp_id != 0) {
+        m.tp_snaps += 1;
+        owned.tp_id = m.tp_snaps;
+        dsv41.tpSnap(m.mdl, .clone, sn.tp_id, owned.tp_id);
+    }
     out.* = owned;
     return .ok;
 }
@@ -644,8 +670,10 @@ fn auxHandoff(mp: *anyopaque, from: u32, to: u32) callconv(.c) Verdict {
     return .ok;
 }
 
-fn auxFree(_: *anyopaque, handle: abi.Handle) callconv(.c) void {
+fn auxFree(mp: *anyopaque, handle: abi.Handle) callconv(.c) void {
+    const m: *Model = @ptrCast(@alignCast(mp));
     const sn = snapOf(handle) orelse return;
+    if (sn.tp_id != 0) dsv41.tpSnap(m.mdl, .free, sn.tp_id, 0);
     sn.deinit(gpa);
     gpa.destroy(sn);
 }
@@ -679,7 +707,17 @@ fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: 
     out.* = null;
     if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
     const m: *Model = @ptrCast(@alignCast(mp));
-    out.* = dsv41.importSnapshot(m.mdl, gpa, ids.slice(), header.slice(), arrays.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    const sn = dsv41.importSnapshot(m.mdl, gpa, ids.slice(), header.slice(), arrays.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
+    if (m.mdl.tp != null) {
+        // Rank 0's snapshot holds the worker's cache too (`dsv41.tpLoadPlan`): it goes over under a new id.
+        m.tp_snaps += 1;
+        sn.tp_id = m.tp_snaps;
+        dsv41.tpLoad(m.mdl, gpa, sn) catch |e| {
+            auxFree(mp, sn);
+            return Verdict.named(.failed, @errorName(e));
+        };
+    }
+    out.* = sn;
     return .ok;
 }
 

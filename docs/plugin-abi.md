@@ -478,6 +478,8 @@ Valid during `load` only: the model keeps none of its pointers.
 | `stream_room` | `u64` | `0` | GPU bytes a streamed expert bank may fill (with what is resident): the GPU ceiling less one prompt's bill at 16K + 1K and the wired margin; 0 = none. |
 | `pair_remote` | `LayerSpan` | `.{}` | A two-Mac pair's layers on the other Mac (DeepSeek-V4.1's worker run); `count` 0 = no pair. |
 | `wired_margin_bytes` | `u64` | `8 << 30` | The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned. |
+| `tp_rank` | `u32` | `0` | Tensor parallel (DeepSeek-V4.1): this rank's slice of every expert and attention head, the weights already sliced. |
+| `tp_size` | `u32` | `0` | The ranks sharing every expert; 0 = whole. |
 
 ### `Mode` (enum(u8))
 

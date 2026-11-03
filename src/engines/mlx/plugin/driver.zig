@@ -239,6 +239,8 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .stream_room = streamRoom(config),
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},
+        .tp_rank = if (config.dist_shard) |sh| sh.rank else 0,
+        .tp_size = if (config.dist_shard) |sh| sh.size else 0,
     }, &why) orelse {
         if (why.code == .too_large) {
             log.warn("[plugin] {s}: load refused: {s}\n", .{ b.table.name.slice(), why.why.slice() });

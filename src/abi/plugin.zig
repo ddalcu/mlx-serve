@@ -383,6 +383,10 @@ pub const LoadCtx = extern struct {
     pair_remote: LayerSpan = .{},
     /// The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned.
     wired_margin_bytes: u64 = 8 << 30,
+    /// Tensor parallel (DeepSeek-V4.1): this rank's slice of every expert and attention head, the weights already sliced;
+    /// `tp_size` 0 = whole.
+    tp_rank: u32 = 0,
+    tp_size: u32 = 0,
 };
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };
