@@ -62,6 +62,7 @@ pub const transient_release_default = S.transient_release_default;
 pub const decode_staging_rows = S.decode_staging_rows;
 const wait_timeout_ns = S.wait_timeout_ns;
 pub const Stream = S.Stream;
+pub const stagingBytes = S.stagingBytes;
 /// The EXL3 bank's slot arrays by projection.
 pub const ProjArrays = expert_bank.ProjArrays;
 pub const BankArrays = expert_bank.BankArrays;
@@ -1472,6 +1473,50 @@ test "dsv41 stream: the transient release frees the whole scratch with nothing l
     try expectServed(s, &sb, r, &ids);
     s.release(r);
     try s.flush();
+}
+
+test "dsv41 stream: a bank of three geometries keeps a scratch per geometry; each layer is served from its own, and release, grow, shrink and regrow cover all three" {
+    // The 3.5 bpw bank's layer kinds: K 3, K 4, and gate/up K 3 with down K 4.
+    var sb = try SynthBank.openWith(.{ .n_experts = 32, .k_proj = &.{ .{ 3, 3, 3 }, .{ 4, 4, 4 }, .{ 3, 3, 4 } } }, &.{ 3, 4 });
+    defer sb.close();
+    const s = try Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool, .transient_release = true });
+    defer s.deinit();
+    try testing.expectEqual(@as(u32, 1), s.transient_layer);
+    try testing.expectEqual(@as(u8, 2), s.n_alts);
+    try testing.expectEqualSlices(u2, &.{ 1, 0, 2 }, s.geom_of);
+    var want: u64 = 0;
+    for ([_]u32{ 1, 0, 2 }) |l| for (sb.bank.layers[l].segments) |seg| {
+        want += 12 * seg.length;
+    };
+    try testing.expectEqual(want, s.promptTransientBytes());
+    const ids = [_]u16{ 5, 6, 7, 8, 9, 10 };
+    for (0..3) |l| {
+        const r = try serve(s, @intCast(l), &ids);
+        try expectServed(s, &sb, r, &ids);
+        s.release(r);
+    }
+    try s.flush();
+    try testing.expectEqual(want, try s.releaseTransient());
+    try s.grow(&.{ 6, 6, 6 });
+    const more = [_]u16{ 11, 12, 13, 14, 15, 16, 17, 18, 19, 20 };
+    for ([_]u32{ 2, 0 }) |l| {
+        const r = try serve(s, l, &more);
+        try expectServed(s, &sb, r, &more);
+        s.release(r);
+    }
+    try s.settleRoutes();
+    _ = try s.shrink(&.{ 4, 4, 4 }, .forget);
+    try testing.expectEqual(want, try s.regrowTransient());
+    const r = try serve(s, 2, &ids);
+    try expectServed(s, &sb, r, &ids);
+    s.release(r);
+    try s.flush();
+}
+
+test "dsv41 stream: a bank of more geometries than the scratch tracks is refused by name" {
+    var sb = try SynthBank.openWith(.{ .n_experts = 32, .k_proj = &.{ .{ 2, 2, 2 }, .{ 3, 3, 3 }, .{ 4, 4, 4 }, .{ 3, 3, 4 }, .{ 2, 2, 3 } } }, &.{ 2, 3, 4 });
+    defer sb.close();
+    try testing.expectError(error.MixedGeometry, Stream.init(testing.allocator, &sb.bank, .{ .rows = &.{ 4, 4, 4, 4, 4 }, .max_route_ids = 12, .transient_rows = 12, .pool = test_pool }));
 }
 
 test "dsv41 stream: after the transient release, decode with the served lookahead, pre-reads and gates loads only window 0" {

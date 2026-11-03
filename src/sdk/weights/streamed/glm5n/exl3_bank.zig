@@ -479,7 +479,7 @@ test "glm5_next exl3 bank: direct rows: the served phase cycle (prompt, release,
                 want += S.arrayBytes(&st.bank.layers[st.transient_layer], c, st.transient.rows);
                 unfloored += S.rowBytes(&st.bank.layers[st.transient_layer], c) * st.transient.rows;
             }
-            try testing.expect(st.alt == null and want > unfloored);
+            try testing.expect(st.n_alts == 0 and want > unfloored);
             try testing.expectEqual(want, try st.shrink(&prompt_rows, .forget));
             try testing.expectEqual(st.promptTransientBytes(), try st.regrowTransient());
             try testing.expect(!st.failed);

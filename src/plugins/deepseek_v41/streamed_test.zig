@@ -298,6 +298,19 @@ fn skipOnThreadCap(e: anyerror) anyerror {
 }
 
 test "deepseek_v41 streamed exl3: a served EXL3 pack (its prompt in wide calls, a phase change to decode) gives the trunk's logits over the same bank at fewer slot rows" {
+    try servedExl3MatchesTrunk(null);
+}
+
+/// The 3.5 bpw packs' layer kinds and a K = 2 layer: four record geometries, two of them through the K = 4 arm.
+const mixed_k_proj = [_][3]u32{ .{ 3, 3, 3 }, .{ 4, 4, 4 }, .{ 3, 3, 4 }, .{ 2, 2, 2 } };
+
+test "deepseek_v41 streamed exl3: a mixed-K pack (K 4 layers and a K 4 down) served gives the trunk's logits over the same bank at fewer slot rows" {
+    try servedExl3MatchesTrunk(&mixed_k_proj);
+}
+
+/// A synthetic EXL3 pack (each layer's K, or per projection `k_proj`) served by the plugin, against the trunk over
+/// the same bank at 2 prompt and 3 decode rows a layer.
+fn servedExl3MatchesTrunk(k_proj: ?[]const [3]u32) !void {
     // The repack's prompt GEMMs need NAX: below the M5 the load refuses it by name.
     if (!build_options.mlx_stream or mlx.noGpuBackend() or !@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     mlx.installErrorHandler();
@@ -307,7 +320,7 @@ test "deepseek_v41 streamed exl3: a served EXL3 pack (its prompt in wide calls, 
     const io = testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    _ = try streamed_w.Exl3.writeSynth(a, &tmp, .{ .hidden = 5120, .inter = 2304, .n_experts = 8, .k = &.{ 3, 2, 3, 3 }, .finite_scales = true });
+    _ = try streamed_w.Exl3.writeSynth(a, &tmp, .{ .hidden = 5120, .inter = 2304, .n_experts = 8, .k = &.{ 3, 2, 3, 3 }, .k_proj = k_proj, .finite_scales = true });
     try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = exl3_config_json });
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = try repackWeights(a, 43, exl3_geo, .streamed) });
     var buf: [512]u8 = undefined;
@@ -346,10 +359,11 @@ test "deepseek_v41 streamed exl3: a served EXL3 pack (its prompt in wide calls, 
     const Exl3 = streamed_w.Exl3;
     const c = &r.cfg;
     const geo: Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(r.m.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
-    const z = try Exl3.billOf(testing.allocator, io, dir, geo, .{ .prompt = std.math.maxInt(u64) / 2, .decode = std.math.maxInt(u64) / 2 });
+    const call_rows = @import("bill.zig").stream_call_rows;
+    const z = try Exl3.billOf(testing.allocator, io, dir, geo, .{ .prompt = std.math.maxInt(u64) / 2, .decode = std.math.maxInt(u64) / 2, .call_rows = call_rows });
     var gates: [4]Exl3.Gate = undefined;
     for (&gates, r.m.layers[0..4]) |*g, *ly| g.* = .{ .w = ly.gate_w, .bias = ly.gate_bias };
-    const src = try Exl3.Source.open(testing.allocator, io, dir, r.s, geo, &gates, .{ .prompt = z.prompt_windows + z.staging + 2 * z.row_bytes, .decode = z.decode_windows + z.staging + 3 * z.row_bytes });
+    const src = try Exl3.Source.open(testing.allocator, io, dir, r.s, geo, &gates, .{ .prompt = z.prompt_windows + z.staging + z.prompt_work + 2 * z.row_bytes, .decode = z.decode_windows + z.staging + 3 * z.row_bytes, .call_rows = call_rows });
     defer src.deinit();
     try testing.expectEqual(@as(u32, 2), src.bill.rows.prompt);
     try testing.expectEqual(@as(u32, 3), src.bill.rows.decode);

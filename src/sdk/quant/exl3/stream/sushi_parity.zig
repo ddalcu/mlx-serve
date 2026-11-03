@@ -29,9 +29,17 @@ fn tensorOf(header: std.json.Value, name: []const u8) !Tensor {
 }
 
 test "exl3 sushi parity: sushi's K3 mul1 fixture trellis reconstructs to its inner weights bit for bit through this plugin's decode" {
-    const a = std.testing.allocator;
     const env = host_env.get(.SUSHI_EXL3_K3_FIXTURE);
-    const path = if (env) |p| std.mem.span(p) else fixture_default;
+    try expectReconstructs(if (env) |p| std.mem.span(p) else fixture_default, 3);
+}
+
+test "exl3 sushi parity: sushi's K4 mul1 fixture trellis reconstructs to its inner weights bit for bit through this plugin's decode" {
+    try expectReconstructs("src/sdk/quant/exl3/sushi/fixtures/exl3_k4_linear.safetensors", 4);
+}
+
+/// The fixture at `path` (sushi's exllamav3 reference) decodes through `kernels.reconstruct` at `want_k` to its `inner`.
+fn expectReconstructs(path: []const u8, want_k: usize) !void {
+    const a = std.testing.allocator;
     const bytes = nocache_io.readAllNoCache(a, path, 1 << 20) catch |e| switch (e) {
         error.FileNotFound => return error.SkipZigTest,
         else => return e,
@@ -51,7 +59,7 @@ test "exl3 sushi parity: sushi's K3 mul1 fixture trellis reconstructs to its inn
     const n_i: usize = @intCast(trellis.shape[0]);
     const n_j: usize = @intCast(trellis.shape[1]);
     const K: usize = @intCast(trellis.shape[2] / 16);
-    try std.testing.expectEqual(@as(usize, 3), K);
+    try std.testing.expectEqual(want_k, K);
     try std.testing.expectEqual(@as(u64, 16 * n_i), inner.shape[0]);
     try std.testing.expectEqual(@as(u64, 16 * n_j), inner.shape[1]);
 

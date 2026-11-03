@@ -54,7 +54,10 @@ pub const Segment = struct {
 };
 
 pub const Layer = struct {
+    /// The widest projection's K (the manifest's `K`).
     k: u32,
+    /// K per projection: gate, up, down (`K_proj`; a manifest without it means `k` for all three).
+    k_proj: [3]u32 = .{ 0, 0, 0 },
     record_bytes: u64,
     logical_bytes: u64,
     base_offset: u64,
@@ -119,11 +122,18 @@ const max_records = 1 << 20;
 /// map hidden -> inter, down inter -> hidden; records pad to `record_alignment`.
 /// A manifest whose layer table differs from this is refused.
 pub fn layerSegments(k: u32, hidden: u64, inter: u64) ?Layer {
-    if (k == 0 or k > 8 or hidden == 0 or inter == 0) return null;
+    return layerSegmentsMixed(.{ k, k, k }, hidden, inter);
+}
+
+/// `layerSegments` with each projection at its own K (gate, up, down).
+pub fn layerSegmentsMixed(kp: [3]u32, hidden: u64, inter: u64) ?Layer {
+    for (kp) |k| if (k == 0 or k > 8) return null;
+    if (hidden == 0 or inter == 0) return null;
     if (hidden % 16 != 0 or inter % 16 != 0 or hidden > 1 << 24 or inter > 1 << 24) return null;
-    var l: Layer = .{ .k = k, .record_bytes = 0, .logical_bytes = 0, .base_offset = 0, .segments = undefined };
+    var l: Layer = .{ .k = @max(kp[0], kp[1], kp[2]), .k_proj = kp, .record_bytes = 0, .logical_bytes = 0, .base_offset = 0, .segments = undefined };
     var off: u64 = 0;
     for (0..3) |p| {
+        const k: u64 = kp[p];
         const in: u64 = if (p == 2) inter else hidden;
         const out: u64 = if (p == 2) hidden else inter;
         const parts = [3]Segment{
@@ -146,13 +156,23 @@ pub fn layerSegments(k: u32, hidden: u64, inter: u64) ?Layer {
 /// expert-minor. Returns the bank's total bytes, or null (bad dims / overflow).
 pub fn layerTable(ks: []const u32, hidden: u64, inter: u64, n_experts: u64, out: []Layer) ?u64 {
     var base: u64 = 0;
-    for (ks, out) |k, *l| {
-        l.* = layerSegments(k, hidden, inter) orelse return null;
-        l.base_offset = base;
-        const layer_bytes = std.math.mul(u64, n_experts, l.record_bytes) catch return null;
-        base = std.math.add(u64, base, layer_bytes) catch return null;
-    }
+    for (ks, out) |k, *l| base = place(layerSegments(k, hidden, inter) orelse return null, base, n_experts, l) orelse return null;
     return base;
+}
+
+/// `layerTable` with each layer's K per projection.
+pub fn layerTableMixed(kps: []const [3]u32, hidden: u64, inter: u64, n_experts: u64, out: []Layer) ?u64 {
+    var base: u64 = 0;
+    for (kps, out) |kp, *l| base = place(layerSegmentsMixed(kp, hidden, inter) orelse return null, base, n_experts, l) orelse return null;
+    return base;
+}
+
+/// `l` = `geometry` at `base`; returns the next layer's base, or null on overflow.
+fn place(geometry: Layer, base: u64, n_experts: u64, l: *Layer) ?u64 {
+    l.* = geometry;
+    l.base_offset = base;
+    const layer_bytes = std.math.mul(u64, n_experts, l.record_bytes) catch return null;
+    return std.math.add(u64, base, layer_bytes) catch null;
 }
 
 /// A record's two read ranges; their parts are the layer's segment lengths.
@@ -284,18 +304,25 @@ pub const Bank = struct {
 
         const table = v2.layers orelse return refuse(diag, error.ManifestSyntax, "v2: no layer table", .{});
         if (table.len != d.n_layers) return refuse(diag, error.LayerGeometry, "v2: {d} layer entries != dims.n_layers {d}", .{ table.len, d.n_layers });
-        const ks = try a.alloc(u32, table.len);
-        defer a.free(ks);
-        for (table, ks, 0..) |t, *k, li| {
+        const kps = try a.alloc([3]u32, table.len);
+        defer a.free(kps);
+        for (table, kps, 0..) |t, *kp, li| {
             if (t.layer != li) return refuse(diag, error.LayerGeometry, "v2: layer entry {d} names layer {d}", .{ li, t.layer });
-            if (t.K > std.math.maxInt(u32) or !containsInt(implemented.k, @intCast(t.K))) return refuse(diag, error.KNotImplemented, "v2: layer {d} K={d} not implemented by the installed lanes", .{ li, t.K });
-            k.* = @intCast(t.K);
+            const given: []const u64 = t.K_proj orelse &.{ t.K, t.K, t.K };
+            if (given.len != 3) return refuse(diag, error.LayerGeometry, "v2: layer {d} K_proj has {d} entries, not gate/up/down", .{ li, given.len });
+            for (given, kp) |k, *out| {
+                if (k > std.math.maxInt(u32) or !containsInt(implemented.k, @intCast(k))) return refuse(diag, error.KNotImplemented, "v2: layer {d} K={d} not implemented by the installed lanes", .{ li, k });
+                out.* = @intCast(k);
+            }
+            // The gate/up span decodes as one form, so its two projections share a K.
+            if (kp[0] != kp[1] or t.K != @max(kp[0], kp[1], kp[2]))
+                return refuse(diag, error.LayerGeometry, "v2: layer {d} K={d} K_proj={any}: gate and up differ, or K is not the widest", .{ li, t.K, kp.* });
         }
         self.layers = try a.alloc(Layer, table.len);
-        const total = layerTable(ks, d.hidden, d.inter, d.n_experts, self.layers) orelse return refuse(diag, error.DimsInvalid, "v2: bank size overflows", .{});
+        const total = layerTableMixed(kps, d.hidden, d.inter, d.n_experts, self.layers) orelse return refuse(diag, error.DimsInvalid, "v2: bank size overflows", .{});
         for (table, self.layers, 0..) |t, *want, li| {
             if (!segmentsMatch(t.segments, want, 0) or t.record_bytes != want.record_bytes or t.logical_bytes != want.logical_bytes)
-                return refuse(diag, error.LayerGeometry, "v2: layer {d} segment table / record size differs from the v2 geometry for K={d}", .{ li, t.K });
+                return refuse(diag, error.LayerGeometry, "v2: layer {d} segment table / record size differs from the v2 geometry for K={any}", .{ li, want.k_proj });
             if (t.base_offset != want.base_offset) return refuse(diag, error.LayerGeometry, "v2: layer {d} base_offset {d} != {d}", .{ li, t.base_offset, want.base_offset });
         }
         const sc = v2.sidecar orelse return refuse(diag, error.ManifestSyntax, "v2: no sidecar", .{});
@@ -475,7 +502,7 @@ const V2 = struct {
     quant: ?struct { codebook: []const u8, codebook_multiplier: u64 } = null,
     dims: ?struct { hidden: u64, inter: u64, n_experts: u64, n_layers: u64 } = null,
     sidecar: ?SidecarJson = null,
-    layers: ?[]const struct { layer: u64, K: u64, record_bytes: u64, logical_bytes: u64, base_offset: u64, segments: []const SegJson } = null,
+    layers: ?[]const struct { layer: u64, K: u64, K_proj: ?[]const u64 = null, record_bytes: u64, logical_bytes: u64, base_offset: u64, segments: []const SegJson } = null,
     records: std.ArrayList(Rec) = .empty,
     all_pass: ?bool = null,
     meta: std.heap.ArenaAllocator,
@@ -790,6 +817,10 @@ pub const Synth = struct {
     n_experts: u32 = 4,
     /// K per layer (at most `max_synth_layers` layers).
     k: []const u32 = &.{ 3, 3 },
+    /// K per projection per layer (gate, up, down), written as `K_proj`; replaces `k` when set.
+    k_proj: ?[]const [3]u32 = null,
+    /// Added to layer 1's `K` field.
+    k_field_delta: u32 = 0,
     v2_format: []const u8 = "mtplx-expert-manifest-v2",
     codebook: []const u8 = "mul1",
     multiplier: u64 = 0x83DCD12D,
@@ -825,7 +856,7 @@ pub const Synth = struct {
 
 const SynthSeg = struct { name: []const u8, dtype: []const u8, shape: [3]u64, rank: usize, offset: u64, length: u64 };
 
-fn synthSegments(k: u64, hidden: u64, inter: u64, out: *[9]SynthSeg) u64 {
+fn synthSegments(kp: [3]u32, hidden: u64, inter: u64, out: *[9]SynthSeg) u64 {
     const names = [_][]const u8{
         "gate_proj.code", "gate_proj.rout", "gate_proj.rin",
         "up_proj.code",   "up_proj.rout",   "up_proj.rin",
@@ -833,6 +864,7 @@ fn synthSegments(k: u64, hidden: u64, inter: u64, out: *[9]SynthSeg) u64 {
     };
     var off: u64 = 0;
     for (0..3) |p| {
+        const k: u64 = kp[p];
         const i: u64 = if (p == 2) inter else hidden;
         const o: u64 = if (p == 2) hidden else inter;
         const segs = [3]SynthSeg{
@@ -861,15 +893,17 @@ const max_synth_layers = 8;
 /// returns the experts.bin image (caller frees).
 pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u8 {
     const io = std.testing.io;
-    const nl = s.k.len;
+    const nl = if (s.k_proj) |kps| kps.len else s.k.len;
     std.debug.assert(nl >= 2 and nl <= max_synth_layers);
+    var kps: [max_synth_layers][3]u32 = undefined;
+    for (kps[0..nl], 0..) |*kp, l| kp.* = if (s.k_proj) |given| given[l] else .{ s.k[l], s.k[l], s.k[l] };
     var segs: [max_synth_layers][9]SynthSeg = undefined;
     var logical: [max_synth_layers]u64 = undefined;
     var rb: [max_synth_layers]u64 = undefined;
     var base: [max_synth_layers]u64 = undefined;
     var total: u64 = 0;
     for (0..nl) |l| {
-        logical[l] = synthSegments(s.k[l], s.hidden, s.inter, &segs[l]);
+        logical[l] = synthSegments(kps[l], s.hidden, s.inter, &segs[l]);
         rb[l] = (logical[l] + 4095) / 4096 * 4096;
         base[l] = total;
         total += s.n_experts * rb[l];
@@ -901,7 +935,10 @@ pub fn writeSynth(a: std.mem.Allocator, tmp: *std.testing.TmpDir, s: Synth) ![]u
     for (0..nl) |l| {
         if (s.drop_layer_entry and l == 1) continue;
         const index = l + (if (l == 1) s.layer_index_delta else 0);
-        try j.print(a, "{s}{{\"layer\":{d},\"K\":{d},\"record_bytes\":{d},\"logical_bytes\":{d},\"base_offset\":{d},\"segments\":[", .{ if (l == 0) "" else ",", index, s.k[l], rb[l], logical[l], base[l] + (if (l == 1) s.base_delta else 0) });
+        const k_field = @max(kps[l][0], kps[l][1], kps[l][2]) + (if (l == 1) s.k_field_delta else 0);
+        try j.print(a, "{s}{{\"layer\":{d},\"K\":{d},", .{ if (l == 0) "" else ",", index, k_field });
+        if (s.k_proj != null) try j.print(a, "\"K_proj\":[{d},{d},{d}],", .{ kps[l][0], kps[l][1], kps[l][2] });
+        try j.print(a, "\"record_bytes\":{d},\"logical_bytes\":{d},\"base_offset\":{d},\"segments\":[", .{ rb[l], logical[l], base[l] + (if (l == 1) s.base_delta else 0) });
         for (segs[l], 0..) |sg, n| {
             const len = sg.length + (if (l == 1 and n == 5) s.seg_len_delta else 0);
             try j.print(a, "{s}{{\"component\":\"{s}\",\"dtype\":\"{s}\",\"shape\":", .{ if (n == 0) "" else ",", sg.name, sg.dtype });
@@ -986,6 +1023,19 @@ pub const SynthBank = struct {
         return .{ .tmp = tmp, .image = image, .bank = bank };
     }
 
+    /// A synthetic bank of `synth`'s layers, opened with the K set `ks`.
+    pub fn openWith(synth: Synth, ks: []const u32) !SynthBank {
+        var tmp = std.testing.tmpDir(.{});
+        errdefer tmp.cleanup();
+        const image = try writeSynth(testing.allocator, &tmp, synth);
+        errdefer testing.allocator.free(image);
+        var rbuf: [512]u8 = undefined;
+        const n_layers = if (synth.k_proj) |kps| kps.len else synth.k.len;
+        const implemented: Implemented = .{ .codebooks = &.{"mul1"}, .k = ks, .hidden = synth.hidden, .inter = synth.inter, .n_experts = synth.n_experts, .n_layers = n_layers };
+        const bank = try Bank.open(testing.allocator, std.testing.io, try tmpRoot(&tmp, &rbuf), implemented, null);
+        return .{ .tmp = tmp, .image = image, .bank = bank };
+    }
+
     pub fn close(self: *SynthBank) void {
         self.bank.deinit();
         testing.allocator.free(self.image);
@@ -1039,6 +1089,58 @@ test "dsv41 bank: a K=2 layer opens only when K=2 is implemented" {
     try testing.expectEqual(@as(u32, 2), bank.layers[1].k);
     try testing.expectEqual(@as(u64, 2112), bank.layers[1].logical_bytes);
     try testing.expectEqual(Spans{ .gu_offset = 4 * 4096, .down_offset = 4 * 4096 + 1408 }, bank.spans(1, 0));
+}
+
+test "dsv41 bank: a mixed-K layer's segments follow each projection's K" {
+    // The 3.5 bpw source's layer kinds: gate and up K=3, down K=4, then all K=4 (offsets printed from the schema).
+    const m = layerSegmentsMixed(.{ 3, 3, 4 }, 5120, 2304).?;
+    try testing.expectEqual(@as(u32, 4), m.k);
+    try testing.expectEqual([3]u32{ 3, 3, 4 }, m.k_proj);
+    try testing.expectEqual(@as(u64, 14_790_144), m.logical_bytes);
+    try testing.expectEqual(@as(u64, 14_790_656), m.record_bytes);
+    try expectSegments(m, &.{
+        .{ 0, 4423680, 320, 144, 48 },      .{ 4423680, 4608, 2304, 0, 0 },  .{ 4428288, 10240, 5120, 0, 0 },
+        .{ 4438528, 4423680, 320, 144, 48 }, .{ 8862208, 4608, 2304, 0, 0 },  .{ 8866816, 10240, 5120, 0, 0 },
+        .{ 8877056, 5898240, 144, 320, 64 }, .{ 14775296, 10240, 5120, 0, 0 }, .{ 14785536, 4608, 2304, 0, 0 },
+    });
+    try testing.expectEqual(@as(u64, 17_739_776), layerSegmentsMixed(.{ 4, 4, 4 }, 5120, 2304).?.record_bytes);
+    try testing.expectEqual(layerSegments(3, 5120, 2304).?.segments, layerSegmentsMixed(.{ 3, 3, 3 }, 5120, 2304).?.segments);
+    var kps: [40][3]u32 = undefined;
+    for (&kps, 0..) |*kp, l| kp.* = if (l < 19) .{ 4, 4, 4 } else if (l < 37) .{ 3, 3, 3 } else .{ 3, 3, 4 };
+    var table: [40]Layer = undefined;
+    try testing.expectEqual(@as(?u64, 238_509_096_960), layerTableMixed(&kps, 5120, 2304, 384, &table));
+    try testing.expect(layerSegmentsMixed(.{ 3, 0, 3 }, 5120, 2304) == null);
+}
+
+test "dsv41 bank: a mixed-K bank opens with each projection's K, and refuses a layer it cannot decode by name" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const kps = [_][3]u32{ .{ 3, 3, 3 }, .{ 3, 3, 4 } };
+    const bin = try writeSynth(testing.allocator, &tmp, .{ .k_proj = &kps });
+    defer testing.allocator.free(bin);
+    var rbuf: [512]u8 = undefined;
+    const root = try tmpRoot(&tmp, &rbuf);
+    try testing.expectError(error.KNotImplemented, Bank.open(testing.allocator, std.testing.io, root, implemented_synth, null));
+    var k34 = implemented_synth;
+    k34.k = &.{ 3, 4 };
+    var bank = try Bank.open(testing.allocator, std.testing.io, root, k34, null);
+    defer bank.deinit();
+    try testing.expectEqual([3]u32{ 3, 3, 3 }, bank.layers[0].k_proj);
+    try testing.expectEqual([3]u32{ 3, 3, 4 }, bank.layers[1].k_proj);
+    try testing.expectEqual(@as(u32, 4), bank.layers[1].k);
+    try testing.expectEqual(@as(u64, 1920 + 1024 + 192), bank.layers[1].logical_bytes);
+    try testing.expectEqual(Spans{ .gu_offset = 4 * 4096, .down_offset = 4 * 4096 + 1920 }, bank.spans(1, 0));
+    for ([_]Synth{
+        .{ .k_proj = &.{ .{ 3, 3, 3 }, .{ 3, 4, 4 } } },
+        .{ .k_proj = &kps, .k_field_delta = 1 },
+    }) |bad| {
+        var t = std.testing.tmpDir(.{});
+        defer t.cleanup();
+        const b = try writeSynth(testing.allocator, &t, bad);
+        defer testing.allocator.free(b);
+        var buf: [512]u8 = undefined;
+        try testing.expectError(error.LayerGeometry, Bank.open(testing.allocator, std.testing.io, try tmpRoot(&t, &buf), k34, null));
+    }
 }
 
 test "dsv41 bank: a relative or empty bank dir is refused, never opened" {

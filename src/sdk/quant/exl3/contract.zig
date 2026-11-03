@@ -1,7 +1,8 @@
 //! The EXL3 format's kernel contract: the one-row decode GEMV (`sushi_glm_down_one`) under every codebook, the STQ
 //! tables included, against the host trellis decode; and the routed decode's finish reduce (`sushi_exl3_down_reduce`,
 //! which every codebook shares): each slot's down output through the 128-point Hadamard, scaled by its expert's
-//! `svh`, summed over the row's top-k by the router weights. Listed in `kernel_contract/registry.zig`.
+//! `svh`, summed over the row's top-k by the router weights; and the bank-aware indexed GEMV (`exl3_k4.zig`'s banked
+//! decode route). Listed in `kernel_contract/registry.zig`.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -343,6 +344,195 @@ const OneRow = struct {
     }
 };
 
+/// Experts in each of the banked GEMV's three banks.
+const BANK_EXPERTS = [3]usize{ 3, 2, 2 };
+
+/// The bank-aware cooperative GEMV (`indexedGemvCoopBankedF16`, MUL1): x [rows, IDIM] half, row r through slot
+/// `ids[r] & 0xffffff` of bank `ids[r] >> 24`'s trellis [E_b, IDIM/16, ODIM/16, N] into y [rows, ODIM] half.
+/// Shapes are (rows, ODIM, IDIM).
+const Banked = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch,
+    rate: u32,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    x: []f64 = &.{},
+    /// Each bank's decoded weights, [E_b, IDIM, ODIM].
+    w: [3][]f64 = .{ &.{}, &.{}, &.{} },
+    ids: []f64 = &.{},
+    args: [5]mlx.mlx_array = undefined,
+
+    fn init(a: std.mem.Allocator, rate: u32) !Banked {
+        kernels.setDecodeParams(.mul1);
+        const l = try a.create(metal.Launch);
+        l.* = .{
+            .name = "sushi_exl3_mul1_gemv_indexed_banked",
+            .inputs = &.{ "x", "t0", "t1", "t2", "ids" },
+            .outputs = &.{"y"},
+            .source = kernels.INDEXED_BANKED_COOP_SOURCE,
+            .header = try kernels.withTableRows(.mul1, comptime kernels.codebookHelpers(.mul1, .w16)),
+            .tg_bytes = 4 * 256 * 4,
+            .m1 = 1024,
+            .m2 = 1024,
+        };
+        return .{ .rig = metal.Rig.init(a), .launch = l, .rate = rate, .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Banked) void {
+        self.rig.deinit();
+        self.arena.deinit();
+        self.rig.a.destroy(self.launch);
+    }
+
+    /// `indexedGemvCoopBankedF16`'s config (`indexedCoopConfig`); whole 16-tiles only.
+    pub fn geometry(self: *const Banked, shape: Shape) ?metal.Geometry {
+        if (shape.rows == 0 or shape.k == 0 or shape.n == 0 or shape.k % 16 != 0 or shape.n % 16 != 0) return null;
+        const id: c_int = @intCast(shape.k);
+        const od: c_int = @intCast(shape.n);
+        const rows: c_int = @intCast(shape.rows);
+        var g = metal.Geometry{ .grid = .{ @divExact(od, 16) * 128, rows, 1 }, .tg = .{ 128, 1, 1 } };
+        g.out(&.{ rows, od }, .float16);
+        g.int("IDIM", id);
+        g.int("ODIM", od);
+        g.int("NHW", self.rate);
+        return g;
+    }
+
+    pub fn prepare(self: *Banked, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const it = shape.k / 16;
+        const ot = shape.n / 16;
+        const tile_hw = self.rate;
+        const rate: sushi.format.Rate = .{ .n = self.rate };
+        var tile: [sushi.format.TILE_VALUES]u16 = undefined;
+        var wv: [3][]f64 = undefined;
+        for (&self.w, &wv, BANK_EXPERTS) |*w, *v, experts| {
+            const words = try a.alloc(u16, experts * it * ot * tile_hw);
+            for (words) |*x| x.* = rng.int(u16);
+            // Gate 4: a bank's second half of input tiles repeats its first, against mirrored inputs, so sums cancel.
+            if (fill == .stress) for (0..experts) |e| for (it / 2..it) |tk| {
+                const at = (e * it + tk) * ot * tile_hw;
+                @memcpy(words[at..][0 .. ot * tile_hw], words[at - it / 2 * ot * tile_hw ..][0 .. ot * tile_hw]);
+            };
+            w.* = try a.alloc(f64, experts * shape.k * shape.n);
+            for (0..experts) |e| for (0..it) |tk| for (0..ot) |o| {
+                sushi.format.decodeTile(words[((e * it + tk) * ot + o) * tile_hw ..][0..tile_hw], rate, .mul1, &tile);
+                for (tile, 0..) |h, pos| w.*[(e * shape.k + tk * 16 + pos / 16) * shape.n + o * 16 + pos % 16] = @as(f16, @bitCast(h));
+            };
+            v.* = try a.alloc(f64, words.len);
+            for (v.*, words) |*o, x| o.* = @floatFromInt(x);
+        }
+        // Every bank and slot, in a mixed order: row r names bank (r + seed) % 3.
+        self.ids = try a.alloc(f64, shape.rows);
+        for (self.ids, 0..) |*v, r| {
+            const b = (r + seed) % 3;
+            v.* = @floatFromInt(@as(u32, @intCast(b)) << 24 | rng.uintLessThan(u32, @intCast(BANK_EXPERTS[b])));
+        }
+        self.x = try a.alloc(f64, shape.rows * shape.k);
+        for (self.x) |*v| v.* = spec.roundTo(.f16, rng.float(f64) * 2 - 1);
+        if (fill == .stress) for (0..shape.rows) |r| {
+            const row = self.x[r * shape.k ..][0..shape.k];
+            const half = shape.k / 2;
+            for (row[0..half], row[half..], 0..) |*lo, *hi, i| {
+                lo.* = @floatFromInt(1 + rng.uintLessThan(u32, 1024));
+                hi.* = -lo.* + @as(f64, if (i < 8) 1 else 0);
+            }
+        };
+        if (fill == .nonfinite) {
+            const at = [_][2]usize{ .{ 0, shape.k / 3 }, .{ 1, shape.k / 2 }, .{ 2, shape.k - 1 } };
+            const put = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64) };
+            for (at, put) |p, v| if (p[0] < shape.rows) {
+                self.x[p[0] * shape.k + p[1]] = v;
+            };
+            if (shape.rows > 3) {
+                self.x[3 * shape.k] = std.math.inf(f64);
+                self.x[3 * shape.k + 1] = -std.math.inf(f64);
+            }
+        }
+        const rig = &self.rig;
+        rig.reset();
+        self.args[0] = try rig.input(.float16, &.{ @intCast(shape.rows), @intCast(shape.k) }, self.x);
+        for (wv, BANK_EXPERTS, 1..) |v, experts, i| self.args[i] = try rig.input(.uint16, &.{ @intCast(experts), @intCast(it), @intCast(ot), @intCast(tile_hw) }, v);
+        self.args[4] = try rig.input(.uint32, &.{@intCast(shape.rows)}, self.ids);
+        return true;
+    }
+
+    pub fn run(self: *Banked) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Banked) usize {
+        return self.shape.rows * self.shape.n;
+    }
+
+    fn outputsIn(self: *const Banked, want: []f64, mags: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
+        const n = self.shape.n;
+        const k = self.shape.k;
+        const al = self.arena.child_allocator;
+        const terms = try al.alloc(f64, k);
+        defer al.free(terms);
+        for (0..self.shape.rows) |r| {
+            const id: u32 = @intFromFloat(self.ids[r]);
+            const w = self.w[id >> 24];
+            const e: usize = id & 0xffffff;
+            for (0..n) |o| {
+                var mag: f64 = 0;
+                for (terms, self.x[r * k ..][0..k], 0..) |*t, xv, i| {
+                    t.* = xv * w[(e * k + i) * n + o];
+                    mag += @abs(t.*);
+                }
+                want[r * n + o] = if (acc) |ac| spec.sumIn(ac, order, terms) else sumF64(terms);
+                if (mags) |m| m[r * n + o] = mag;
+            }
+        }
+    }
+
+    pub fn reference(self: *const Banked, want: []f64, mag: []f64) !void {
+        try self.outputsIn(want, mag, null, .sequential);
+    }
+
+    pub fn simulate(self: *const Banked, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.outputsIn(out, null, acc, order);
+    }
+
+    /// The shipped wrapper on the same inputs: its output's bytes.
+    fn wrapper(self: *Banked) ![]const u8 {
+        kernels.setDecodeParams(.mul1);
+        const y = try kernels.indexedGemvCoopBankedF16(self.rig.stream(), self.args[0], self.args[1..4].*, self.args[4]);
+        defer _ = mlx.mlx_array_free(y);
+        return self.rig.bytesOf(&.{y});
+    }
+};
+
+/// Each thread's chain over a quarter of the input tiles, then the threadgroup's sum of 16 rows by 4 simdgroups.
+fn bankedDepth(shape: Shape) usize {
+    return shape.k / 64 + 64;
+}
+
+/// The K 4 and K 3 rates the arm serves (3.5 bpw packs), at reduced widths of the (route ids, 2304, 5120) and
+/// (route ids, 5120, 2304) calls.
+fn bankedSpec(comptime n: u32) spec.Spec {
+    return .{
+        .name = std.fmt.comptimePrint("exl3 banked indexed mul1 n{d}", .{n}),
+        .accum = .f32,
+        .depth = bankedDepth,
+        .out = .f16,
+        .tiles = .{ .{}, .{ .size = 16, .step = 16, .min = 16 }, .{ .size = 16, .step = 16, .min = 16 } },
+        .served = &.{
+            .{ .rows = 12, .n = 768, .k = 512 },
+            .{ .rows = 3, .n = 512, .k = 2304 },
+            .{ .rows = 1, .n = 2304, .k = 5120 },
+            .{ .rows = 1, .n = 5120, .k = 2304 },
+        },
+        .sums = .{ .f16 = 10, .bf16 = 10, .exact = false, .why = "trellis weights are pseudo-random signed halves the stress cannot choose; half-precision sums miss by 10x+, not 100x" },
+    };
+}
+
 /// The weight row input `i` multiplies: the kernel reads x in its prepared order, lane quad q's four inputs being
 /// tile rows 2q, 2q + 1, 2q + 8 and 2q + 9 (the tensor-core fragment rows of the lane's weights).
 fn weightRow(i: usize) usize {
@@ -413,11 +603,32 @@ fn reduceSpec(comptime out: spec.Elem) spec.Spec {
 pub fn register(set: *kc.Set) !void {
     const a = set.a;
     inline for (one_row_cases) |c| try set.add(OneRow, try .init(a, c.cb, c.win, c.n, c.m), oneRowSpec(c), null);
+    inline for (.{ 64, 48 }) |n| try set.add(Banked, try .init(a, n), bankedSpec(n), null);
     try set.add(Reduce, .init(a, &Launch(928).launch, .float32), reduceSpec(.f32), null);
     try set.add(Reduce, .init(a, &Launch(928).launch, .bfloat16), reduceSpec(.bf16), null);
 }
 
 // ── tests ──
+
+test "kernel contract exl3 banked focused gates" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var set = kc.Set.init(a);
+    defer set.deinit();
+    inline for (.{ 64, 48 }) |n| try set.add(Banked, try .init(a, n), bankedSpec(n), null);
+    var findings: std.ArrayList(u8) = .empty;
+    defer findings.deinit(a);
+    for (set.kernels.items) |k| {
+        try std.testing.expectEqual(kc.gates.Verdict.pass, try kc.gates.one(a, .nonfinite, k, 0xc0de));
+        try std.testing.expectEqual(@as(usize, 0), try @import("../../testing/kernel_contract/registry.zig").gate5(a, k, &findings));
+    }
+    try @import("../../testing/kernel_contract/controls.zig").register(&set);
+    var tally: kc.gates.Tally = .{};
+    try kc.gates.runAll(a, set.kernels.items, 0xc0de, &tally);
+    try std.testing.expectEqual(@as(usize, 2), tally.passed);
+    try std.testing.expectEqual(@as(usize, 0), tally.problems());
+    try std.testing.expect(tally.caught >= 6);
+}
 
 /// The declared launch at `shape` on random inputs: its output's bytes, owned by the caller.
 fn driftRun(comptime T: type, a: std.mem.Allocator, k: kc.gates.Kernel, shape: Shape) ![]u8 {
@@ -436,10 +647,11 @@ test "kernel contract exl3: each declared launch is the shipped wrapper's, byte 
     try register(&set);
     for (set.kernels.items) |k| {
         const one_row = std.mem.startsWith(u8, k.spec.name, "exl3 down_one");
+        const banked = std.mem.startsWith(u8, k.spec.name, "exl3 banked");
         for (k.spec.served) |shape| {
-            const ours = if (one_row) try driftRun(OneRow, a, k, shape) else try driftRun(Reduce, a, k, shape);
+            const ours = if (one_row) try driftRun(OneRow, a, k, shape) else if (banked) try driftRun(Banked, a, k, shape) else try driftRun(Reduce, a, k, shape);
             defer a.free(ours);
-            const theirs = if (one_row) try @as(*OneRow, @ptrCast(@alignCast(k.ctx))).wrapper() else try @as(*Reduce, @ptrCast(@alignCast(k.ctx))).wrapper();
+            const theirs = if (one_row) try @as(*OneRow, @ptrCast(@alignCast(k.ctx))).wrapper() else if (banked) try @as(*Banked, @ptrCast(@alignCast(k.ctx))).wrapper() else try @as(*Reduce, @ptrCast(@alignCast(k.ctx))).wrapper();
             if (!std.mem.eql(u8, ours, theirs)) std.debug.print("{s}: the declared launch differs from the wrapper's\n", .{k.spec.name});
             try std.testing.expectEqualSlices(u8, theirs, ours);
         }

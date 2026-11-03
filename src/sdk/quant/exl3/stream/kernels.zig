@@ -984,9 +984,13 @@ pub const tile_perm: [256]u8 = blk: {
 
 /// The trellis states of one tile's 256 code positions (exl3_dq.cuh L15-31): the 16 stream
 /// bits ending at bit (p + 1) K, circularly, of the little-endian u32 view of the tile.
+/// The widest K a host decode reads (exllamav3's mul1 rates the packs ship: 2, 3, 4).
+pub const max_host_k = 4;
+
 fn tileStates(words: []const i16, K: usize, out: *[256]u16) void {
+    std.debug.assert(K >= 1 and K <= max_host_k);
     const nw = 8 * K;
-    var u: [24]u64 = undefined;
+    var u: [8 * max_host_k]u64 = undefined;
     for (0..nw) |m| u[m] = @as(u64, @as(u16, @bitCast(words[2 * m]))) | (@as(u64, @as(u16, @bitCast(words[2 * m + 1]))) << 16);
     for (out, 0..) |*o, p| {
         const b1 = (p + 1) * K + 256 * K;
@@ -1570,7 +1574,7 @@ test "dsv41 kernels: the registry implements exactly the bank's codebook and K" 
     try testing.expectEqual(expert_bank.mul1_multiplier, reg.multiplier);
 }
 
-test "dsv41 kernels: the host decode reads each weight's 16-bit state bit by bit from its tile's circular stream, K 1 to 3" {
+test "dsv41 kernels: the host decode reads each weight's 16-bit state bit by bit from its tile's circular stream, K 1 to 4" {
     const a = testing.allocator;
     const table = try a.create([65536]u16);
     defer a.destroy(table);
@@ -1585,8 +1589,7 @@ test "dsv41 kernels: the host decode reads each weight's 16-bit state bit by bit
     const rnd = prng.random();
     const n_i = 2;
     const n_j = 3;
-    // tileStates holds 8 K u32 words in a [24]: K <= 3 (the claim admits only bank_ks).
-    for (1..bank_ks[bank_ks.len - 1] + 1) |K| {
+    for (1..max_host_k + 1) |K| {
         const tw = 16 * K;
         const code = try a.alloc(i16, n_i * n_j * tw);
         defer a.free(code);

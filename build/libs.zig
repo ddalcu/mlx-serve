@@ -255,6 +255,8 @@ pub fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, root: []const u8, ta
         .link_libc = true,
         .imports = &.{ .{ .name = "mlx_host", .module = host }, .{ .name = "sdk", .module = sdk } },
     });
+    // The EXL3 lane's arm for rates its texts do not decode reads sushi's kernels (`exl3_k4.zig`).
+    if (host.import_table.get("sushi_exl3")) |exl3| m.addImport("sushi_exl3", exl3);
     // The read pool (pthreads, pread into slot rows), its MTLSharedEvent signal (non-ARC objc), and the MLX
     // event / alloc shims, which include the staged MLX's private headers and link libmlx.
     const csrc = "src/sdk/weights/streamed/csrc";

@@ -5,6 +5,7 @@
 //! route. Slot rows per phase: the prompt rows during a prompt pass, the decode rows after `phase(.decode)`.
 
 const std = @import("std");
+const env = @import("mlx_host").env;
 const sdk = @import("sdk");
 const mlx = sdk.mlx;
 const ops = @import("ops.zig");
@@ -20,7 +21,8 @@ const kernel_set = sdk_ext.kernels.KernelSet(xk);
 const G = ops.MlxOps;
 const T = mlx.mlx_array;
 
-const Math = xp.QuantMath(G, xq.Accepted(G));
+const k4 = @import("exl3_k4.zig");
+const Math = k4.MixedKMath(xq.Accepted(G));
 const Hook = xp.ExpertsWith(G, xp.StreamSource, Math, .{ .prefill = true, .lookahead = true, .gated = true });
 pub const Gate = Hook.Gate;
 pub const Phase = enum { prompt, decode };
@@ -28,8 +30,8 @@ pub const Phase = enum { prompt, decode };
 /// The trunk's MoE geometry the bank must match.
 pub const Geometry = struct { hidden_size: u32, moe_intermediate_size: u32, n_experts_per_tok: u32, n_routed_experts: u32, n_layers: u32, swiglu_limit: f64 };
 
-/// Bytes the slot rows and the source's own buffers may hold in each phase.
-pub const Budget = struct { prompt: u64, decode: u64 };
+/// Bytes the slot rows and the source's own buffers may hold in each phase, for prompt calls of `call_rows` rows.
+pub const Budget = struct { prompt: u64, decode: u64, call_rows: u64 };
 
 /// What the source holds, by term, at its rows.
 pub const Bill = struct {
@@ -41,10 +43,12 @@ pub const Bill = struct {
     decode_windows: u64,
     /// The lookahead's staging rows.
     staging: u64,
+    /// A prompt call's K 4 arm (`exl3_k4.promptWorkBytes`); 0 when the lane decodes every layer.
+    prompt_work: u64,
     rows: struct { prompt: u32, decode: u32 },
 
     pub fn prompt(b: Bill) u64 {
-        return b.row_bytes * b.rows.prompt + b.prompt_windows + b.staging;
+        return b.row_bytes * b.rows.prompt + b.prompt_windows + b.staging + b.prompt_work;
     }
 
     pub fn decode(b: Bill) u64 {
@@ -58,40 +62,45 @@ const event_watchdog_ms = 2000;
 const wide: xp.Wide = .{ .seed = true, .hot_first = true, .depth = wide_depth, .defer_base = true, .read_ahead = true, .base_at_seed = true, .seed_aligned = true };
 const forms: xq.Forms = .{ .down_pair = true, .gu_one = true };
 
-/// The bank geometry the EXL3 lane decodes for `geo`: mul1, K = 3 or 2 per layer.
+/// The bank geometry the EXL3 lane decodes for `geo`: mul1, K = 3 or 2 per layer in the lane's texts, K = 4 (a whole
+/// layer or one projection) through the sushi arm (`exl3_k4.zig`).
 fn implementedOf(geo: Geometry) expert_bank.Implemented {
-    return .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3 }, .hidden = geo.hidden_size, .inter = geo.moe_intermediate_size, .n_experts = geo.n_routed_experts, .n_layers = geo.n_layers };
+    return .{ .codebooks = &.{"mul1"}, .k = &.{ 2, 3, 4 }, .hidden = geo.hidden_size, .inter = geo.moe_intermediate_size, .n_experts = geo.n_routed_experts, .n_layers = geo.n_layers };
 }
 
 /// The rows `budget` holds over the bank in `dir`, by term (no slot memory allocated).
 pub fn billOf(a: std.mem.Allocator, io: std.Io, dir: []const u8, geo: Geometry, budget: Budget) !Bill {
     var bank = try expert_bank.Bank.open(a, io, dir, implementedOf(geo), null);
     defer bank.deinit();
-    return billBank(&bank, budget);
+    return billBank(&bank, budget, geo.n_experts_per_tok);
 }
 
-fn billBank(bank: *const expert_bank.Bank, budget: Budget) !Bill {
+fn billBank(bank: *const expert_bank.Bank, budget: Budget, top_k: u32) !Bill {
     var row: u64 = 0;
     var record: u64 = 0;
-    var alt: u64 = 0;
-    for (bank.layers) |l| {
+    // The stream keeps a transient scratch per record geometry: a window bills one record of each.
+    var geometries: u64 = 0;
+    var arm = false;
+    for (bank.layers, 0..) |*l, i| {
+        arm = arm or !k4.laneDecodesK(l.k);
         row += l.logical_bytes;
         record = @max(record, l.logical_bytes);
+        for (bank.layers[0..i]) |*e| {
+            if (std.meta.eql(e.segments, l.segments)) break;
+        } else geometries += l.logical_bytes;
     }
-    for (bank.layers) |l| if (l.logical_bytes != record) {
-        alt = @max(alt, l.logical_bytes);
-    };
-    const window = sdk_ext.expert.policy.max_route_ids * (record + alt);
+    const window = sdk_ext.expert.policy.max_route_ids * geometries;
     const release = expert_stream.phase_change_releases_wide_windows and expert_stream.transient_release_default;
     var b: Bill = .{
         .row_bytes = row,
         .prompt_windows = wide_depth * window,
         .decode_windows = if (release) window else wide_depth * window,
         .staging = expert_admission.lookaheadCharge(record, 2 * lookahead.budget, std.heap.pageSize()),
+        .prompt_work = if (arm) k4.promptWorkBytes(bank.hidden, bank.inter, budget.call_rows * top_k) else 0,
         .rows = undefined,
     };
     const n: u64 = bank.n_experts;
-    const p = (budget.prompt -| (b.prompt_windows + b.staging)) / row;
+    const p = (budget.prompt -| (b.prompt_windows + b.staging + b.prompt_work)) / row;
     const d = (budget.decode -| (b.decode_windows + b.staging)) / row;
     if (p == 0) return error.StreamedRowsDoNotFit;
     b.rows = .{ .prompt = @intCast(@min(p, n)), .decode = @intCast(@min(@max(d, p), n)) };
@@ -132,7 +141,7 @@ pub const Source = struct {
         self.released = false;
         self.bank = try expert_bank.Bank.open(a, io, dir, implementedOf(geo), null);
         errdefer self.bank.deinit();
-        self.bill = try billBank(&self.bank, budget);
+        self.bill = try billBank(&self.bank, budget, geo.n_experts_per_tok);
         self.gates = try a.dupe(Gate, gates);
         errdefer a.free(self.gates);
         self.prompt_rows = try a.alloc(u32, geo.n_layers);
@@ -162,15 +171,7 @@ pub const Source = struct {
         try self.q.compileTexts(self.set, &xq.banked_texts, &diag);
         try self.q.routeBanked(&self.g);
         const event = try expert_event.createMetal();
-        self.stream = try expert_stream.Stream.init(a, &self.bank, .{
-            .rows = self.prompt_rows,
-            .slot_memory = .{ .mlx = s },
-            .lookahead = lookahead,
-            .event = .{ .backend = .{ .metal = event.object }, .watchdog_ms = event_watchdog_ms },
-            .wide_depth = wide_depth,
-            .transient_rows = @as(u32, wide_depth) * sdk_ext.expert.policy.max_route_ids,
-            .transient_release = expert_stream.phase_change_releases_wide_windows and expert_stream.transient_release_default,
-        });
+        self.stream = try expert_stream.Stream.init(a, &self.bank, streamOptions(self.prompt_rows, s, event.object));
         errdefer self.stream.deinit();
         self.source = xp.StreamSource.init(self.stream);
         self.hook = try Hook.initWith(a, &self.g, &self.source, Math.init(self.q, geo), geo, .{ .gates = self.gates, .event = event, .wide = wide, .banked = true, .hoist_first = true, .devroute = true });
@@ -250,6 +251,22 @@ pub const Source = struct {
     }
 };
 
+/// The source's stream at `rows`, its slots on `s`, its reads gated on the Metal event `event`.
+fn streamOptions(rows: []const u32, s: mlx.mlx_stream, event: u64) expert_stream.Options {
+    return .{
+        .rows = rows,
+        // A pre-read lands a record's gate/up span or its down span in one staging buffer: a K 4 span is wider than
+        // the pool's default. The pool is otherwise the Stream's: its ticket ring holds a wide prompt's reads.
+        .staging_from_bank = true,
+        .slot_memory = .{ .mlx = s },
+        .lookahead = lookahead,
+        .event = .{ .backend = .{ .metal = event }, .watchdog_ms = event_watchdog_ms },
+        .wide_depth = wide_depth,
+        .transient_rows = @as(u32, wide_depth) * sdk_ext.expert.policy.max_route_ids,
+        .transient_release = expert_stream.phase_change_releases_wide_windows and expert_stream.transient_release_default,
+    };
+}
+
 /// A synthetic EXL3 bank for fixtures (`expert/bank.zig` `writeSynth`).
 pub const writeSynth = expert_bank.writeSynth;
 
@@ -264,19 +281,70 @@ test "exl3 source: the rows a budget holds, by term, floor-capped at the bank's 
     var rbuf: [512]u8 = undefined;
     const dir = try expert_bank.tmpRoot(&tmp, &rbuf);
     const geo: Geometry = .{ .hidden_size = 5120, .moe_intermediate_size = 2304, .n_experts_per_tok = 2, .n_routed_experts = 8, .n_layers = 3, .swiglu_limit = 10 };
-    const z = try billOf(a, testing.io, dir, geo, .{ .prompt = std.math.maxInt(u64) / 2, .decode = std.math.maxInt(u64) / 2 });
+    const z = try billOf(a, testing.io, dir, geo, .{ .prompt = std.math.maxInt(u64) / 2, .decode = std.math.maxInt(u64) / 2, .call_rows = 4096 });
     try testing.expectEqual(@as(u32, 8), z.rows.prompt);
     try testing.expectEqual(@as(u32, 8), z.rows.decode);
     const k3 = expert_bank.layerSegments(3, 5120, 2304).?.logical_bytes;
     const k2 = expert_bank.layerSegments(2, 5120, 2304).?.logical_bytes;
     try testing.expectEqual(2 * k3 + k2, z.row_bytes);
     try testing.expectEqual(@as(u64, wide_depth) * 48 * (k3 + k2), z.prompt_windows);
+    try testing.expectEqual(@as(u64, 0), z.prompt_work);
     const two = z.prompt_windows + z.staging + 2 * z.row_bytes;
-    const b = try billOf(a, testing.io, dir, geo, .{ .prompt = two + z.row_bytes - 1, .decode = z.decode_windows + z.staging + 5 * z.row_bytes });
+    const b = try billOf(a, testing.io, dir, geo, .{ .prompt = two + z.row_bytes - 1, .decode = z.decode_windows + z.staging + 5 * z.row_bytes, .call_rows = 4096 });
     try testing.expectEqual(@as(u32, 2), b.rows.prompt);
     try testing.expectEqual(@as(u32, 5), b.rows.decode);
     try testing.expect(b.prompt() <= two + z.row_bytes - 1);
-    const lean = try billOf(a, testing.io, dir, geo, .{ .prompt = two, .decode = 0 });
+    const lean = try billOf(a, testing.io, dir, geo, .{ .prompt = two, .decode = 0, .call_rows = 4096 });
     try testing.expectEqual(@as(u32, 2), lean.rows.decode);
-    try testing.expectError(error.StreamedRowsDoNotFit, billOf(a, testing.io, dir, geo, .{ .prompt = two - z.row_bytes - 1, .decode = two }));
+    try testing.expectError(error.StreamedRowsDoNotFit, billOf(a, testing.io, dir, geo, .{ .prompt = two - z.row_bytes - 1, .decode = two, .call_rows = 4096 }));
+}
+
+test "exl3 source: a bank of three geometries bills a transient window for each, and its K 4 arm's prompt work" {
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const kps = [_][3]u32{ .{ 4, 4, 4 }, .{ 3, 3, 3 }, .{ 3, 3, 4 } };
+    const image = try expert_bank.writeSynth(a, &tmp, .{ .hidden = 5120, .inter = 2304, .n_experts = 8, .k_proj = &kps, .finite_scales = true });
+    defer a.free(image);
+    var rbuf: [512]u8 = undefined;
+    const implemented: expert_bank.Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{ 3, 4 }, .hidden = 5120, .inter = 2304, .n_experts = 8, .n_layers = 3 };
+    var bank = try expert_bank.Bank.open(a, testing.io, try expert_bank.tmpRoot(&tmp, &rbuf), implemented, null);
+    defer bank.deinit();
+    const b = try billBank(&bank, .{ .prompt = std.math.maxInt(u64) / 2, .decode = std.math.maxInt(u64) / 2, .call_rows = 4096 }, 2);
+    var records: u64 = 0;
+    for (kps) |kp| records += expert_bank.layerSegmentsMixed(kp, 5120, 2304).?.logical_bytes;
+    try testing.expectEqual(records, b.row_bytes);
+    try testing.expectEqual(@as(u64, wide_depth) * 48 * records, b.prompt_windows);
+    // The K 4 layers run the sushi arm: a prompt call of 4096 rows at top-k 2 bills its workspace, and the rows shrink.
+    const work = k4.promptWorkBytes(5120, 2304, 4096 * 2);
+    try testing.expectEqual(work, b.prompt_work);
+    const fit = try billBank(&bank, .{ .prompt = b.prompt_windows + b.staging + work + 3 * b.row_bytes, .decode = 0, .call_rows = 4096 }, 2);
+    try testing.expectEqual(@as(u32, 3), fit.rows.prompt);
+    const short = try billBank(&bank, .{ .prompt = b.prompt_windows + b.staging + work + 3 * b.row_bytes - 1, .decode = 0, .call_rows = 4096 }, 2);
+    try testing.expectEqual(@as(u32, 2), short.rows.prompt);
+}
+
+test "exl3 source: the stream's pool keeps the Stream's ticket ring, enough for a wide prompt's reads, and stages a K 4 span" {
+    _ = env.get(.DSV41_PHASE0B_MLX) orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const kps = [_][3]u32{ .{ 4, 4, 4 }, .{ 3, 3, 3 }, .{ 3, 3, 4 } };
+    const image = try expert_bank.writeSynth(a, &tmp, .{ .hidden = 5120, .inter = 2304, .n_experts = 8, .k_proj = &kps, .finite_scales = true });
+    defer a.free(image);
+    var rbuf: [512]u8 = undefined;
+    const implemented: expert_bank.Implemented = .{ .codebooks = &.{"mul1"}, .k = &.{ 3, 4 }, .hidden = 5120, .inter = 2304, .n_experts = 8, .n_layers = 3 };
+    var bank = try expert_bank.Bank.open(a, testing.io, try expert_bank.tmpRoot(&tmp, &rbuf), implemented, null);
+    defer bank.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const event = try expert_event.createMetal();
+    const rows = [_]u32{ 2, 2, 2 };
+    const st = try expert_stream.Stream.init(a, &bank, streamOptions(&rows, s, event.object));
+    defer st.deinit();
+    const declared: expert_stream.Options = .{ .rows = &rows };
+    try testing.expectEqual(@as(usize, declared.pool.tickets), st.pool.published.len);
+    // A wide prompt holds `wide_depth` windows of a route's misses in flight, two tickets a record.
+    try testing.expect(st.pool.published.len >= 2 * @as(usize, wide_depth) * sdk_ext.expert.policy.max_route_ids);
 }

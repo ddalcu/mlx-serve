@@ -68,6 +68,12 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - The routed experts come from `sdk/weights/streamed.zig` `Exl3` (`exl3_source.zig`: the EXL3 lane, event-gated
   waves, the next layer's reads predicted, the wide prompt feed, the decode forms / banked waves / hoist / device
   route); the trunk's own MoE never runs for them (`moe`'s `source` arm; the DSpark stages stay resident).
+- A layer whose EXL3 rate the lane's texts do not decode (K 4: the 3.5 bpw packs' layers and K 4 downs, `K_proj` in the
+  manifest) runs all three projections through sushi's rate-generic GEMV / sorted GEMM (`exl3_k4.zig`); K 2 / 3 layers
+  keep the lane. Up to four record geometries, each its own transient scratch, each billed.
+- The K 4 arm's prompt path runs `exl3_k4.prompt_slice_rows` sorted rows at a time, each slice evaluated and freed;
+  the bank bills one slice plus the call's outputs (`promptWorkBytes`). Held to the layer call's reset, its arrays
+  outgrew the bill.
 - The prompt runs in calls of up to `bill.stream_call_rows`, each one MoE call a layer over all its rows
   (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
 - Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
