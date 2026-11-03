@@ -80,9 +80,9 @@ pub const GQMV_BODY_NVFP4 = kernelSource("kernels/moe/gqmv_body_nvfp4.metal");
 // (4-bit exp, 3-bit mantissa) yields it scaled by 2^-8. Callers fold both back
 // in with one multiply. Matches MLX's own `fp4.h` / `fp8.h` conversions, whose
 // sign handling is a branch instead of a shift.
-// One packed unit of quantized values as a uint32: a word for 2/4/8-bit; at
-// 3-bit, mx.quantize packs 8 values into 3 bytes (value i at bit 3i), so the
-// unit is a byte triple and the body's `>> (i * BITS)` walk is unchanged.
+// One packed unit of quantized values: a word for 2/4/8-bit; mx.quantize packs
+// 8 values into 3 bytes at 3-bit, 5 bytes at 5-bit (a 64-bit unit) and 4 into
+// 3 at 6-bit (value i at bit i * bits), so the body's `>> (i * BITS)` walk is unchanged.
 pub const GQMV_AFFINE_HEADER = kernelSource("kernels/moe/gqmv_affine_header.metal");
 
 pub const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_fp4.E2M1X2_HEADER ++ kernelSource("kernels/moe/gqmv_nvfp4_header.metal");
@@ -147,20 +147,24 @@ fn getGatherQmvGateUpKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
 pub fn affineQmvUnitOk(bits: u32, group_size: u32) bool {
     return switch (bits) {
         2, 4, 8 => group_size % (32 / bits) == 0,
-        3 => group_size % 8 == 0,
+        3, 5 => group_size % 8 == 0,
+        6 => group_size % 4 == 0,
         else => false,
     };
 }
 
 pub fn affineQmvPackUnits(K: c_int, bits: u32) c_int {
-    return if (bits == 3) @divExact(K, 8) else @divExact(K * @as(c_int, @intCast(bits)), 32);
+    return switch (bits) {
+        3, 5 => @divExact(K, 8),
+        6 => @divExact(K, 4),
+        else => @divExact(K * @as(c_int, @intCast(bits)), 32),
+    };
 }
 
 const GateUpCfgKey = struct { topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, limit: u32 };
 var gateup_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_cfg_key: GateUpCfgKey = std.mem.zeroes(GateUpCfgKey);
 var gqmv_gateup_engaged: bool = false;
-
 
 pub fn gatherQmvGateUpEnabled() bool {
     return gqmv_gateup_override orelse true;

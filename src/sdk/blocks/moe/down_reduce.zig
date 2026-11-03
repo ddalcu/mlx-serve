@@ -96,7 +96,6 @@ var downred_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_cfg_key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey);
 pub var downred_engaged: bool = false;
 
-
 fn downReduceFusedEnabled() bool {
     return downred_override orelse true;
 }
@@ -249,10 +248,8 @@ pub fn gatherQmvDownReduceRowsEligible(hidden_act: anytype, gate_qp: anytype, up
     if (hidden_act != .silu) return false;
     if (gate_qp.bits != up_qp.bits or gate_qp.group_size != up_qp.group_size or gate_qp.mode != up_qp.mode) return false;
     switch (down_qp.mode) {
-        .affine => {
-            if (down_qp.bits != 2 and down_qp.bits != 4 and down_qp.bits != 8) return false;
-            if (down_qp.group_size % (32 / down_qp.bits) != 0) return false;
-        },
+        // 3-bit down rows are unregistered in the kernel contract; those banks keep the sorted arm.
+        .affine => if (down_qp.bits == 3 or !affineQmvUnitOk(down_qp.bits, down_qp.group_size)) return false,
         .nvfp4 => {
             if (down_qp.bits != 4 or down_qp.group_size != 16) return false;
         },
@@ -562,6 +559,16 @@ fn moeDownReduceParityCase(s: mlx.mlx_stream, rnd: std.Random, t: anytype, E: us
             return e;
         };
     }
+}
+
+test "moe rows down+reduce takes every registered width but 3-bit" {
+    downred_override = true;
+    defer downred_override = null;
+    const Qp = struct { bits: u32, group_size: u32, mode: QuantMode = .affine };
+    const gu: Qp = .{ .bits = 4, .group_size = 32 };
+    const Act = enum { silu, gelu };
+    for ([_]u32{ 2, 4, 5, 6, 8 }) |bits| try std.testing.expect(gatherQmvDownReduceRowsEligible(Act.silu, gu, gu, Qp{ .bits = bits, .group_size = 32 }, 2560));
+    for ([_]u32{ 3, 7 }) |bits| try std.testing.expect(!gatherQmvDownReduceRowsEligible(Act.silu, gu, gu, Qp{ .bits = bits, .group_size = 32 }, 2560));
 }
 
 test "moe down+reduce fused: declines outside its envelope" {

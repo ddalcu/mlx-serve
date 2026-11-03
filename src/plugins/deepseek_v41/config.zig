@@ -231,3 +231,34 @@ test "deepseek_v41 config: a layer that would read another ratio's cache is refu
     const v = parseFiles(&.{.{ .name = "config.json", .bytes = bad }}, true, &p);
     try testing.expect(!v.isOk() and v.code == .unsupported and p.private == null);
 }
+
+test "deepseek_v41 config: a --mlx-gguf set's rebuilt configJson parses the deepseek_v41 plugin's own parser into the release's geometry" {
+    const ds41 = @import("../../sdk/quant/gguf/arch/deepseek41.zig");
+    const v41 = @This();
+    var f = try ds41.testFile();
+    defer f.deinit();
+    const json = try ds41.configJson(std.testing.allocator, try ds41.Hparams.read(&f));
+    defer std.testing.allocator.free(json);
+    (try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{})).deinit();
+
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+    const dir = mem.packDir();
+    var out: abi.Parsed = .{};
+    try std.testing.expect(v41.parse(&dir, abi.Str.of(json), .{}, null, true, &out).isOk());
+    defer v41.freeParsed(&out);
+    const c = v41.of(&out);
+    try std.testing.expectEqual(@as(u32, 40), c.num_hidden_layers);
+    try std.testing.expectEqual(@as(u32, 384), c.num_experts);
+    try std.testing.expectEqual(@as(u64, (1 << 2) | (1 << 8) | (1 << 14) | (1 << 20)), c.dsv41_kv_sources);
+    try std.testing.expectEqual(@as(i32, 20), c.dsv41_candidate_source);
+    try std.testing.expectEqual(@as(u32, 2), c.dsv41_n_engram_layers);
+    try std.testing.expectEqual(@as(u64, 384006168), c.dsv41_engram_rows[0]);
+    try std.testing.expectEqual(@as(u32, 99092), c.dsv41_engram_compressed_vocab);
+    try std.testing.expectEqual(@as(f32, 10), c.dsv4_swiglu_limit);
+    try std.testing.expectEqual(@as(f32, 1e-20), c.rms_norm_eps);
+    try std.testing.expect(c.rope_yarn and c.moe_route_norm and c.quant_mode == .gguf);
+    try std.testing.expectEqual(@as(u64, 1 << 20), out.shell.context_cap);
+    // No stages ship: no DSpark, and the image token stays text.
+    try std.testing.expectEqual(@as(u32, 0), out.spec.native_stages);
+    try std.testing.expect(!c.dsv41_vision);
+}

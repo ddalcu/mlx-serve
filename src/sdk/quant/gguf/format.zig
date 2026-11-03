@@ -7,6 +7,9 @@ const abi = @import("../../../abi/quant.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const block = @import("../block.zig");
 const kernels = @import("kernels.zig");
+const native = @import("../native.zig");
+const params = @import("../params.zig");
+const transposeBf16Weight = @import("../../../mlx/array.zig").transposeBf16Weight;
 
 const Str = abi.Str;
 const Verdict = abi.Verdict;
@@ -34,10 +37,40 @@ fn loadTensor(ctx: *const abi.LoadCtx, name: Str, in_dim: u32, out: *abi.Weight)
 }
 
 /// `<base>.weight` (uint8 [rows, row bytes], or [experts, rows, row bytes] for a bank) and its `<base>.scales`
-/// sentinel; `in_dim` must match the weight's own input width.
+/// sentinel; `in_dim` must match the weight's own input width. A float tensor of the file (no sentinel: loaded bf16,
+/// a router or ISTA's GDN a/b) is a dense weight, transposed as the native formats hand one over; an affine-coded one
+/// (bf16 scales and biases) is MLX affine, an MXFP4 one (E8M0 scales) MLX mxfp4.
 fn loadInto(ctx: *const abi.LoadCtx, base: []const u8, in_dim: u32, out: *abi.Weight) !void {
     const w = tensor(ctx, base, "weight");
+    if (w.ctx == null) return error.MissingWeight;
     const sc = tensor(ctx, base, "scales");
+    if (sc.ctx == null) {
+        if (mlx.getShape(w).len < 2) return error.NotAProjection;
+        out.* = .{ .w = wrap(try transposeBf16Weight(w, .{ .ctx = ctx.stream.ctx })), .layout = @intFromEnum(native.Layout.dense) };
+        return;
+    }
+    // MXFP4 the loader moved into MLX's layout (E8M0 scales): MLX's mxfp4 kernels read it.
+    if (mlx.mlx_array_dtype(sc) == .uint8) {
+        const ws = mlx.getShape(w);
+        if (in_dim != @as(u32, @intCast(ws[ws.len - 1])) * 8) return error.BadShape;
+        out.* = .{ .bits = 4, .group_size = 32, .layout = @intFromEnum(native.Layout.mxfp4) };
+        errdefer release(out);
+        out.w = wrap(try share(w));
+        out.scales = wrap(try share(sc));
+        return;
+    }
+    // An affine-coded block type the loader moved into MLX's layout (`affine.zig`): the native affine kernels read it.
+    if (mlx.mlx_array_dtype(sc) != .bool_) {
+        const bi = tensor(ctx, base, "biases");
+        // The input width decides the layout: 4-bit g32 and 2-bit g64 (Q2_0) share their shapes.
+        const qp = params.affineParamsFromGeometry(w, sc, in_dim) orelse return error.BadShape;
+        out.* = .{ .bits = @intCast(qp.bits), .group_size = qp.group_size, .layout = @intFromEnum(native.Layout.affine) };
+        errdefer release(out);
+        out.w = wrap(try share(w));
+        out.scales = wrap(try share(sc));
+        out.biases = wrap(try share(bi));
+        return;
+    }
     const info = kernels.infoOf(w, sc) orelse return error.NotAGgufWeight;
     const ws = mlx.getShape(w);
     const in = @as(usize, @intCast(ws[ws.len - 1])) / info.ty.blockBytes() * info.ty.blockElems();
@@ -75,10 +108,10 @@ fn matmul(w: *const abi.Weight, x: abi.Array, s: abi.Stream, out: *abi.Array) ca
     return .ok;
 }
 
-/// `sorted` is a hint the kernels do not need: each picks its arm by the row count.
-fn moe(bank: *const abi.Weight, x: abi.Array, lhs: abi.Array, rhs: abi.Array, _: bool, s: abi.Stream, out: *abi.Array) callconv(.c) Verdict {
+/// Each kernel arm is picked by the row count; `sorted` reaches the materialized bank's gather_mm.
+fn moe(bank: *const abi.Weight, x: abi.Array, lhs: abi.Array, rhs: abi.Array, sorted: bool, s: abi.Stream, out: *abi.Array) callconv(.c) Verdict {
     const info = kernels.infoOf(arr(bank.w), arr(bank.scales)) orelse return Verdict.refuse(.failed, "gguf: not a GGUF bank");
-    out.* = wrap(kernels.gatherLinear(info, arr(x), arr(bank.w), arr(lhs), arr(rhs), .{ .ctx = s.ctx }) catch |e| return failed(e));
+    out.* = wrap(kernels.gatherLinear(info, arr(x), arr(bank.w), arr(lhs), arr(rhs), sorted, .{ .ctx = s.ctx }) catch |e| return failed(e));
     return .ok;
 }
 
@@ -137,6 +170,8 @@ test "quant gguf: every block type multiplies through the table bit-equal to the
     const s = mlx.gpuStream();
     var w = resident.Weights.init(testing.allocator);
     inline for (kernels.all_types) |ty| try putFixture(&w, ty, s);
+    const ones: [32]u16 = @splat(0x3f80);
+    try w.put("f.weight", mlx.mlx_array_new_data(&ones, &[_]c_int{ 4, 8 }, 2, .bfloat16));
     var r = resident.Resident.adopt(w);
     defer r.deinit();
     const src = r.source();
@@ -174,11 +209,15 @@ test "quant gguf: every block type multiplies through the table bit-equal to the
             var got: abi.Array = .{};
             try testing.expect(table.moe(&bank, wrap(x), .{}, wrap(experts), true, .{ .ctx = s.ctx }, &got).isOk());
             defer _ = mlx.mlx_array_free(arr(got));
-            const want = try kernels.gatherLinear(.{ .ty = ty }, x, arr(wb), .{ .ctx = null }, experts, s);
+            const want = try kernels.gatherLinear(.{ .ty = ty }, x, arr(wb), .{ .ctx = null }, experts, true, s);
             defer _ = mlx.mlx_array_free(want);
             try ops.expectBitEqual(arr(got), want);
         }
     }
     var dense: abi.Weight = .{};
-    try testing.expectEqualStrings("NotAGgufWeight", table.load_tensor(&ctx, .of("missing"), 0, &dense).why.slice());
+    try testing.expectEqualStrings("MissingWeight", table.load_tensor(&ctx, .of("missing"), 0, &dense).why.slice());
+    try testing.expect(table.load_tensor(&ctx, .of("f"), 0, &dense).isOk());
+    defer table.release(&dense);
+    try testing.expect(dense.scales.ctx == null and dense.layout == @intFromEnum(native.Layout.dense));
+    try testing.expectEqualSlices(c_int, &.{ 8, 4 }, mlx.getShape(arr(dense.w)));
 }

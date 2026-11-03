@@ -29,6 +29,8 @@ pub const GgmlType = enum(u32) {
     iq1_m = 29,
     bf16 = 30,
     mxfp4 = 39,
+    /// GSQ's 2-bit type (ISTA-DASLab's GSQ-RCO packs): 64 codes and one fp16 scale, `(q - 1) * d`.
+    q2_0 = 42,
     _,
 
     pub fn supported(self: GgmlType) bool {
@@ -40,6 +42,7 @@ pub const GgmlType = enum(u32) {
         return switch (self) {
             .f32, .f16, .bf16 => 1,
             .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .iq4_nl, .mxfp4 => 32,
+            .q2_0 => 64,
             .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .iq2_xxs, .iq2_xs, .iq3_xxs, .iq3_s, .iq2_s, .iq4_xs, .iq1_s, .iq1_m => 256,
             _ => 0,
         };
@@ -68,6 +71,7 @@ pub const GgmlType = enum(u32) {
             .iq2_xs => 74,
             .iq4_xs => 136,
             .mxfp4 => 17,
+            .q2_0 => 18,
             .iq1_s => 50,
             .iq1_m => 56,
             _ => 0,
@@ -121,9 +125,15 @@ pub fn dequantize(ty: GgmlType, src: []const u8, dst: []f32) Error!void {
             .iq1_s => iq1S(blk, y),
             .iq1_m => iq1M(blk, y),
             .mxfp4 => mxfp4(blk, y),
+            .q2_0 => q2_0(blk, y),
             else => unreachable,
         }
     }
+}
+
+fn q2_0(b: []const u8, y: []f32) void {
+    const d = half(b, 0);
+    for (y, 0..) |*o, j| o.* = @as(f32, @floatFromInt(@as(i32, (b[2 + j / 4] >> @intCast(j % 4 * 2)) & 3) - 1)) * d;
 }
 
 fn half(b: []const u8, off: usize) f32 {
@@ -470,6 +480,7 @@ test "dequant matches ggml for every supported type" {
     try expectMatchesGgml(.iq1_s, "iq1_s.bin");
     try expectMatchesGgml(.iq1_m, "iq1_m.bin");
     try expectMatchesGgml(.mxfp4, "mxfp4.bin");
+    try expectMatchesGgml(.q2_0, "q2_0.bin");
 }
 
 test "dequantize rejects a short buffer and unknown types" {

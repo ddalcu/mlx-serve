@@ -9,6 +9,9 @@ const Config = @import("config.zig").Config;
 const weights_load = @import("../../sdk/weights/load.zig");
 const QuantMode = @import("../../sdk/quant/params.zig").QuantMode;
 const qwen4_ple = @import("../qwen4_exp/ple_table.zig");
+const gguf_claim = @import("../../sdk/quant/gguf/claim.zig");
+const gguf_root = @import("../../sdk/quant/gguf/root.zig");
+const ds41_gguf = @import("../../sdk/quant/gguf/arch/deepseek41.zig");
 
 pub const MAX_LAYERS = 4;
 pub const MAX_NGRAM = 8;
@@ -183,7 +186,9 @@ pub const Hash = struct {
 /// from V4.1's tokenizer.
 pub fn loadTokenMap(gpa: std.mem.Allocator, dir_path: []const u8, vocab: u32, compressed: u32) ![]u32 {
     const io = std.Io.Threaded.global_single_threaded.io();
-    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    // A GGUF picked by its file (`--mlx-gguf`) is the pack of its folder.
+    const root = if (std.mem.endsWith(u8, dir_path, ".gguf")) std.fs.path.dirname(dir_path) orelse dir_path else dir_path;
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{});
     defer dir.close(io);
     const map = try gpa.alloc(u32, vocab);
     errdefer gpa.free(map);
@@ -265,11 +270,11 @@ pub const Table = struct {
     /// config's Engram layers.
     pub fn open(gpa: std.mem.Allocator, dir_path: []const u8, index: usize, layer: usize, rows: u64, head_dim: u32) !Table {
         if (comptime @import("builtin").os.tag == .windows) return error.EngramUnsupportedOnWindows; // its tables open through std.c.open
-        _ = index;
         var arena = std.heap.ArenaAllocator.init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const io = std.Io.Threaded.global_single_threaded.io();
+        if (try openGgufTable(a, io, dir_path, index, layer, rows, head_dim)) |t| return t;
         var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
         defer dir.close(io);
         if (dir.readFileAlloc(io, "engram/engram-manifest.json", a, .limited(16 << 20))) |raw| {
@@ -341,6 +346,36 @@ pub const Table = struct {
             .slen = @intCast(scols * 2),
             .b_off = base + regions[2].start,
         };
+    }
+
+    /// A `--mlx-gguf` set's Engram, IQ4_NL rows read in place with the block scales inside each row (`slen` 0): its
+    /// own file beside the first shard (`deepseek41.engram_file_key`), or the re-split's shard 6, table `index` a run
+    /// of the one `ple_table`. Null when `dir_path` is not a GGUF we serve.
+    fn openGgufTable(a: std.mem.Allocator, io: std.Io, dir_path: []const u8, index: usize, layer: usize, rows: u64, head_dim: u32) !?Table {
+        const shard = gguf_claim.servablePath(io, a, dir_path) orelse return null;
+        var set = try gguf_root.gguf.File.open(a, shard);
+        defer set.deinit();
+        const name = set.getString(ds41_gguf.engram_file_key) orelse {
+            const loc = set.locate(ds41_gguf.ple_table) orelse return error.EngramTableMissing;
+            const t = loc.tensor;
+            const start = try ds41_gguf.pleRowStart(&set, index);
+            if (t.ty != .iq4_nl or t.n_dims != 2 or t.dims[0] != head_dim or t.dims[1] < start + rows) return error.EngramTableGeometry;
+            const row = t.data.len / t.dims[1];
+            const fd = try openAt(a, std.fs.path.dirname(loc.path) orelse ".", std.fs.path.basename(loc.path));
+            return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .gguf, .bits = 4, .group_size = 32, .w_off = loc.offset + start * row, .w_stride = row, .wlen = row, .s_off = 0, .s_stride = 0, .slen = 0 };
+        };
+        if (std.mem.indexOfAny(u8, name, "/\\") != null) return error.EngramTableMissing;
+        const dir = std.fs.path.dirname(shard) orelse return error.EngramTableMissing;
+        const path = try std.fs.path.join(a, &.{ dir, name });
+        var f = gguf_root.gguf.File.open(a, path) catch return error.EngramTableMissing;
+        defer f.deinit();
+        var nb: [64]u8 = undefined;
+        const loc = f.locate(try std.fmt.bufPrint(&nb, "blk.{d}." ++ ds41_gguf.engram_leaf, .{layer})) orelse return error.EngramTableMissing;
+        const t = loc.tensor;
+        if (t.ty != .iq4_nl or t.n_dims != 2 or t.dims[0] != head_dim or t.dims[1] != rows) return error.EngramTableGeometry;
+        const row = t.data.len / rows;
+        const fd = try openAt(a, dir, name);
+        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .gguf, .bits = 4, .group_size = 32, .w_off = loc.offset, .w_stride = row, .wlen = row, .s_off = 0, .s_stride = 0, .slen = 0 };
     }
 
     /// oMLX's lossless layout: `omlx_deepseek_v41.engram_tables` names the
@@ -466,6 +501,17 @@ pub const Table = struct {
 
     /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (caller frees).
     pub fn dequant(self: *const Table, raw: Raw, n: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+        if (self.mode == .gguf) {
+            // IQ4_NL blocks in the kernels' split row layout.
+            const kernels = gguf_root.kernels;
+            const rb = kernels.rowBytes(.iq4_nl, self.head_dim);
+            const tmp = try std.heap.page_allocator.alloc(u8, n * rb);
+            defer std.heap.page_allocator.free(tmp);
+            kernels.packRows(.iq4_nl, self.head_dim, tmp, raw.w[0 .. n * self.wlen]);
+            const wa = mlx.mlx_array_new_data(tmp.ptr, &[_]c_int{ @intCast(n), @intCast(rb) }, 2, .uint8);
+            defer _ = mlx.mlx_array_free(wa);
+            return kernels.dequantize(.iq4_nl, wa, .float32, s);
+        }
         const wcols: c_int = @intCast(self.wlen / 4);
         const scols: c_int = @intCast(if (self.mode == .affine) self.slen / 2 else self.slen);
         const rows: c_int = @intCast(n);
@@ -502,7 +548,7 @@ pub const Table = struct {
             const r: u64 = ids[i];
             if (r >= self.rows) continue;
             rdadvise(self.fd, self.w_off + r * self.w_stride, self.wlen);
-            rdadvise(self.fd, self.s_off + r * self.s_stride, self.slen);
+            if (self.slen > 0) rdadvise(self.fd, self.s_off + r * self.s_stride, self.slen);
             if (self.mode == .affine) rdadvise(self.fd, self.b_off + r * self.s_stride, self.slen);
         }
     }

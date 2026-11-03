@@ -84,6 +84,28 @@ const test_table: abi.ModelTable = blk: {
     break :blk t;
 };
 
+/// A head whose files are not there: an MLX read fails (latching its error) before the load refuses.
+fn hLoadFails(_: *anyopaque, _: *const abi.LoadCtx) callconv(.c) abi.Verdict {
+    const v = [_]f32{ 1, 2, 3 };
+    const a = mlx.mlx_array_new_data(&v, &[_]c_int{3}, 1, .float32);
+    defer _ = mlx.mlx_array_free(a);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    _ = mlx.mlx_reshape(&x, a, &[_]c_int{2}, 1, fixture.stream());
+    return abi.Verdict.refuse(.failed, "no head");
+}
+const failing_head_hooks: abi.HeadHooks = blk: {
+    var h = head_hooks;
+    h.load = &hLoadFails;
+    break :blk h;
+};
+const failing_spec_hooks: abi.SpecHooks = .{ .head = &failing_head_hooks, .trunk_weight = llama.table.spec.?.trunk_weight };
+const failing_table: abi.ModelTable = blk: {
+    var t = llama.table;
+    t.spec = &failing_spec_hooks;
+    break :blk t;
+};
+
 /// A qwen-layout dense head (`mtp.*`, the q projection carrying the output gate) for the proof trunk's geometry.
 fn writeHead(path: []const u8, g: proof.Geo) !void {
     const s = fixture.stream();
@@ -149,6 +171,18 @@ pub fn mtpRun(xfm: *Transformer, head: MtpHeadRef, tokens: []u32, accepted: *std
 }
 
 // ── tests ──
+
+test "plugin MTP head: a head that fails to load leaves no MLX error for the first request" {
+    mlx.installErrorHandler();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var b: proof.Served = undefined;
+    try b.open(.{ .quantized = true }, 0x3e7b);
+    defer b.close();
+    b.xfm.plugin.?.table = &failing_table;
+    try testing.expect(!mlx.errorPending());
+    try testing.expect(plugin_head.load(io, testing.allocator, &b.xfm, b.dir) == null);
+    try testing.expect(!mlx.errorPending());
+}
 
 test "plugin MTP head: head steps, draft picks and a pinned-depth round loop equal the legacy sidecar arm" {
     const a = testing.allocator;

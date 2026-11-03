@@ -52,6 +52,8 @@ const QuantMode = @import("../../quant/params.zig").QuantMode;
 const KVCache = cache_mod.KVCache;
 const Weights = @import("../../weights/resident.zig").Weights;
 const mtp_source = @import("source.zig");
+const gguf_claim = @import("../../quant/gguf/claim.zig");
+const gguf_root = @import("../../quant/gguf/root.zig");
 
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
 /// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
@@ -576,7 +578,9 @@ pub const MtpModel = struct {
         // (hy_v3: 8-bit head over a 2-bit trunk) diverge, and requantizing
         // with the wrong source bits reads garbage.
         const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
-        if (bits >= head_qp.bits) return; // no byte saving over the trunk head
+        // A GGUF head's width is its ggml type's, not the config's.
+        const from_bits = if (gguf_root.kernels.infoOf(target.lm_head_w, target.lm_head_s)) |info| info.ty.blockBytes() * 8 / info.ty.blockElems() else head_qp.bits;
+        if (bits >= from_bits) return; // no byte saving over the trunk head
         const group: u32 = 64;
 
         var dh = try requantizeRows(
@@ -746,8 +750,11 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: anytype, bits: u32) ?RerankC
     // A dense bf16 head ([V, H], 16 bits) always reads more than the coarse copy.
     const dense = target.lm_head_s.ctx == null;
     const head_qp: params_mod.QuantParams = if (dense) .{ .bits = 16, .group_size = 0, .mode = .affine } else headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    if (head_qp.mode == .gguf) return null; // raw ggml blocks: no affine rows to requantize
     if (bits >= head_qp.bits) return null; // no byte saving over the head we already read
 
+    // A refusal below is reported here, so its MLX error must not fail the next request.
+    const had_error = mlx.errorPending();
     var rc = requantizeRows(
         s,
         target.lm_head_w,
@@ -760,6 +767,7 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: anytype, bits: u32) ?RerankC
         bits,
         32768,
     ) catch |err| {
+        mlx.dropLatchedErrorUnless(had_error);
         log.warn("[mtp] draft rerank coarse build failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
         return null;
     };
@@ -770,6 +778,7 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: anytype, bits: u32) ?RerankC
     _ = mlx.mlx_vector_array_append_value(eval_vec, rc.b);
     mlx.check(mlx.mlx_eval(eval_vec)) catch {
         rc.deinit();
+        mlx.dropLatchedErrorUnless(had_error);
         log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
         return null;
     };
@@ -1486,6 +1495,13 @@ pub fn requantizeRows(
             defer _ = mlx.mlx_array_free(raw);
             try sliceRows(&raw, w, r0, r1, s);
             try mlx.check(mlx.mlx_astype(&dense, raw, .bfloat16, s));
+        } else if (gguf_root.kernels.infoOf(w, scales)) |info| {
+            // Raw ggml rows (`--mlx-gguf`): the type rides on the sentinel, every row decodes on its own.
+            var raw = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(raw);
+            try sliceRows(&raw, w, r0, r1, s);
+            _ = mlx.mlx_array_free(dense);
+            dense = try gguf_root.kernels.dequantize(info.ty, raw, .bfloat16, s);
         } else {
             var wq = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(wq);
@@ -1723,12 +1739,32 @@ pub fn loadMtp(
     s: mlx.mlx_stream,
     model_dir: []const u8,
 ) !MtpModel {
+    var weights = if (try ggufMtpWeights(io, allocator, s, model_dir)) |w| w else try mtpWeightsInDir(io, allocator, model_dir);
+    defer weights.deinit();
+    return loadMtpFrom(allocator, s, &weights);
+}
+
+/// A `--mlx-gguf` model's own head (a qwen35 file's `nextn` block); null when `model_dir` is not a GGUF we serve.
+fn ggufMtpWeights(io: std.Io, allocator: std.mem.Allocator, s: mlx.mlx_stream, model_dir: []const u8) !?Weights {
+    const path = gguf_claim.servablePath(io, allocator, model_dir) orelse return null;
+    defer allocator.free(path);
+    var f = try gguf_root.gguf.File.open(allocator, path);
+    defer f.deinit();
+    var weights = Weights.init(allocator);
+    errdefer weights.deinit();
+    try gguf_root.weights.loadQwen35Mtp(allocator, &f, &weights.map, s);
+    if (weights.count() == 0) return error.MissingMtpWeight;
+    log.info("[mtp] loading the GGUF's own head ({d} tensors)\n", .{weights.count()});
+    return weights;
+}
+
+fn mtpWeightsInDir(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
     const source = blk: {
         var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
         defer dir.close(io);
         break :blk resolveMtpSource(io, allocator, dir) orelse return error.MissingMtpWeight;
     };
-    var weights = switch (source) {
+    return switch (source) {
         .sidecar_file => |rel| blk: {
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const sidecar_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, rel });
@@ -1739,9 +1775,10 @@ pub fn loadMtp(
             break :blk try loadMtpWeightsFromCheckpoint(io, allocator, model_dir);
         },
     };
-    defer weights.deinit();
+}
 
-    const p = mtpKeyPrefix(&weights);
+fn loadMtpFrom(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *Weights) !MtpModel {
+    const p = mtpKeyPrefix(weights);
     var kb: [256]u8 = undefined;
     const K = struct {
         fn k(buf: []u8, pref: []const u8, rest: []const u8) []const u8 {
@@ -1754,10 +1791,10 @@ pub fn loadMtp(
     // Hy3 (hy_v3) layout: `mtp.eh_proj` + `mtp.layer.*` (full decoder layer,
     // sigmoid-router MoE). Detected by its distinctive projection name.
     if (weights.get(K.k(&kb, p, "eh_proj.weight")) != null) {
-        return loadHy3Mtp(allocator, s, &weights, p);
+        return loadHy3Mtp(allocator, s, weights, p);
     }
 
-    return loadQwenMtp(allocator, s, &weights, p);
+    return loadQwenMtp(allocator, s, weights, p);
 }
 
 /// Qwen 3.5/3.6/3.8 native head (sidecar or in-checkpoint `mtp.*`): fc over
@@ -3444,6 +3481,44 @@ test "mtp: requantizeRows round-trips through a finer re-encode (chunked)" {
     try testing.expectEqual(@as(c_int, @intCast(cols / 4)), w8_shape[1]);
 }
 
+test "mtp: requantizeRows reads a GGUF head's raw Q8_0 rows" {
+    const s = mlx.gpuStream();
+    const rows: usize = 48;
+    const cols: usize = 64;
+    const kernels = gguf_root.kernels;
+    // Q8_0 blocks: an f16 scale then 32 int8 codes; row r's codes are (r + j) % 17 - 8, the scale 1/8.
+    const rb = cols / 32 * 34;
+    var raw: [rows * rb]u8 = undefined;
+    var want: [rows * cols]f32 = undefined;
+    for (0..rows) |r| for (0..cols / 32) |b| {
+        const blk = raw[r * rb + b * 34 ..][0..34];
+        std.mem.writeInt(u16, blk[0..2], @bitCast(@as(f16, 0.125)), .little);
+        for (0..32) |j| {
+            const q: i8 = @intCast(@as(i32, @intCast((r + b * 32 + j) % 17)) - 8);
+            blk[2 + j] = @bitCast(q);
+            want[r * cols + b * 32 + j] = @as(f32, @floatFromInt(q)) * 0.125;
+        }
+    };
+    // As the loader hands it over: scales apart from the codes.
+    const lb = kernels.rowBytes(.q8_0, cols);
+    const split = try testing.allocator.alloc(u8, rows * lb);
+    defer testing.allocator.free(split);
+    if (kernels.isSplit(.q8_0, cols)) kernels.packRows(.q8_0, cols, split, &raw) else @memcpy(split, &raw);
+    const w = mlx.mlx_array_new_data(split.ptr, &[_]c_int{ @intCast(rows), @intCast(lb) }, 2, .uint8);
+    defer _ = mlx.mlx_array_free(w);
+    const sc = try kernels.sentinel(.{ .ty = .q8_0 }, s);
+    defer _ = mlx.mlx_array_free(sc);
+    // 8-bit/gs32 re-encode over three chunks, within a bf16 step of the ggml values (levels are 0.125 apart).
+    var q = try requantizeRows(s, w, sc, .{ .ctx = null }, 0, 0, "gguf", 32, 8, 16);
+    defer q.deinit();
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, q.w, q.s, q.b, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(deq));
+    const got = mlx.mlx_array_data_float32(deq).?;
+    for (want, 0..) |v, i| try testing.expectApproxEqAbs(v, got[i], 1e-2);
+}
+
 test "mtp: requantizeRows accepts a non-affine (mxfp8) source — the issue-#81 draft-head path" {
     // With headQuantParams fixed, buildDraftHead on an mxfp8 trunk passes
     // mode="mxfp8" and the load path's null-ctx biases into requantizeRows.
@@ -4571,6 +4646,27 @@ test "mtp: an mxfp4 sidecar loads bias-less and forwards in its own mode" {
 
 test "mtp: an mxfp8 sidecar loads bias-less and forwards in its own mode" {
     try fpSidecarCase("mxfp8", 8, 32, .mxfp8);
+}
+
+test "mtp: a raw ggml lm_head gets no coarse rerank copy, and leaves no MLX error for the next request" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_zeros(&w, &[_]c_int{ TOP32_MIN_ROWS, 136 }, 2, .uint8, s));
+    var sentinel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sentinel);
+    try mlx.check(mlx.mlx_zeros(&sentinel, &[_]c_int{24}, 1, .bool_, s)); // IQ4_XS + 1: the GGUF type sentinel
+    const Target = struct {
+        config: struct { hidden_size: u32 = 256, quant_bits: u32 = 4, quant_group_size: u32 = 32, quant_mode: params_mod.QuantMode = .affine } = .{},
+        lm_head_w: mlx.mlx_array,
+        lm_head_s: mlx.mlx_array,
+        lm_head_b: mlx.mlx_array = .{ .ctx = null },
+    };
+    const target: Target = .{ .lm_head_w = w, .lm_head_s = sentinel };
+    const had = mlx.errorPending();
+    try testing.expect(buildRerankCoarse(s, &target, 3) == null);
+    try testing.expectEqual(had, mlx.errorPending());
 }
 
 test "mtp: rerankCoarseBytes prices the packed weights AND both bf16 group tables" {

@@ -191,6 +191,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
   stable_audio, tokenizer_parity, trellis2, yue2
 - `build_qwen_preprocess_fixture.py`, `build_qwen_vision_fixture.py` Qwen3-VL fixtures · `dsv4_mlx_ref.py` MLX reference
 - `dsv4_template_ab.py`, `dsv41_template_ab.py` byte-exact template A/B · `dsv4_task_compare.py` **R** native vs GGUF tasks
+- `dsv41_api_kld.py` **R** teacher-forced top-20 vs the hosted V4.1 API's continuations (ds4 fixtures): top-1 + KLD, paired runs
 
 **Other files**: `fixtures/` (prompts, images, captured requests) · `hy3d_paint_unet_dossier.md`,
 `hy3d_paint_weights_contract.md` Hunyuan3D paint port notes · `agent_eval/README.md`.

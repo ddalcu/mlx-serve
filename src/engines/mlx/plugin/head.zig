@@ -277,6 +277,9 @@ pub fn load(io: std.Io, a: std.mem.Allocator, xfm: *Transformer, model_dir: []co
     defer fs.close();
     const dir = fs.packDir();
     const parsed = &xfm.config.plugin.?.parsed;
+    // A refused head turns MTP off, never the next request: a failed read inside the load latched its error.
+    const had_err = mlx.errorPending();
+    defer mlx.dropLatchedErrorUnless(had_err);
     const v = hooks.load(b.model, &.{ .model_dir = abi.Str.of(model_dir), .dir = &dir, .parsed = parsed, .stream = .{ .ctx = xfm.s.ctx } });
     if (!v.isOk()) {
         // A pack that ships no head is not a failed load.
@@ -291,7 +294,6 @@ pub fn load(io: std.Io, a: std.mem.Allocator, xfm: *Transformer, model_dir: []co
         const key = f(b.model);
         if (key != 0) h.fingerprint = .{ .bits = key >> 16, .group_size = key & 0xffff };
     }
-    const had_err = mlx.errorPending();
     if (h.heads > 1) {
         // Per-depth heads read out as MiMo's legacy arm does: the trunk head, shortlisted on a coarse copy.
         if (xfm.lm_head_s.ctx != null) h.rerank_coarse = mtp_mod.buildRerankCoarse(h.s, xfm, mtp_mod.DRAFT_HEAD_BITS);
@@ -301,7 +303,6 @@ pub fn load(io: std.Io, a: std.mem.Allocator, xfm: *Transformer, model_dir: []co
         };
         MtpModel.maybeBuildDraftRerank(h, xfm);
     }
-    mlx.dropLatchedErrorUnless(had_err);
     return h;
 }
 

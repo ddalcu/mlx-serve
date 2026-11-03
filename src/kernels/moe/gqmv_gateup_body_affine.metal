@@ -4,8 +4,8 @@
   float bju = float(u_biases[gbase + (size_t)gi]);
   for (int ki = 0; ki < VPW; ki += 4) {
     size_t xi = xrow + (size_t)(k_base + ki);
-    uint32_t qg = packed_g >> (ki * BITS);
-    uint32_t qu = packed_u >> (ki * BITS);
+    uint32_t qg = uint32_t(packed_g >> (ki * BITS));
+    uint32_t qu = uint32_t(packed_u >> (ki * BITS));
     float x0 = float(x[xi + 0]);
     float x1 = float(x[xi + 1]);
     float x2 = float(x[xi + 2]);

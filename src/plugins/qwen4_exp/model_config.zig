@@ -6,6 +6,7 @@ const model = @import("../../sdk/config/model.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const Config = @import("config.zig").Config;
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
 
 fn convert(comptime Dst: type, src: anytype) Dst {
     const Src = @TypeOf(src);
@@ -39,6 +40,12 @@ pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !
     m.rope_scaling_factor = 1.0;
     m.rope_local_base_freq = m.rope_theta;
     if (dir) |d| {
+        // A GGUF carries its table inside: the set's first shard names it.
+        const io = std.Io.Threaded.global_single_threaded.io();
+        if (gguf_files.isGgufModelPath(io, d)) {
+            m.ngram_table_path = try gguf_files.resolveGgufFile(io, a, d);
+            return m;
+        }
         m.ngram_table_path = try std.fmt.allocPrint(a, "{s}/ngram_table.bin", .{d});
         errdefer m.deinit(a);
         if (try qwen4_exp.inspectEmbedded(d, try model.qwen4EmbeddedSpec(&m))) |info| m.embedded_ple_payload_bytes = info.payload_bytes;
@@ -46,7 +53,6 @@ pub fn toModelConfig(a: std.mem.Allocator, c: *const Config, dir: ?[]const u8) !
     }
     return m;
 }
-
 
 /// A Sushi pack's `expert_quant` (config.json in `dir`): its EXL3 banks' codebook, window and rate.
 fn sushiSpec(a: std.mem.Allocator, dir: []const u8, top_k: u32) !exl3.Spec {

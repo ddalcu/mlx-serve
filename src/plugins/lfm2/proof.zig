@@ -246,6 +246,9 @@ pub fn openGguf(table: *const abi.ModelTable, g: *const Gguf, by_file: bool, ora
     const prev = mlx_gguf.claimState().enabled;
     mlx_gguf.claimState().enabled = true;
     defer mlx_gguf.claimState().enabled = prev;
+    const layouts = mlx_gguf.claimState().mlx_layouts;
+    mlx_gguf.claimState().mlx_layouts = false;
+    defer mlx_gguf.claimState().mlx_layouts = layouts;
     var tmp = testing.tmpDir(.{});
     errdefer tmp.cleanup();
     try g.write(io, tmp.dir, "model.gguf");

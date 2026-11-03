@@ -2,12 +2,13 @@
 //! attention requant, the dense MLP, the token embedding and the vision splice.
 //! copied_from: sdk/blocks/linear/qmatmul.zig, sdk/blocks/linear/verify_projection.zig, sdk/blocks/attention/proj.zig,
 //! sdk/blocks/norms/rms.zig, sdk/blocks/mlp/{activations,dense}.zig, sdk/blocks/embedding.zig, sdk/vision/splice.zig
-//! (the qwen4_exp arms: no Hadamard, ternary, row-exact, GGUF, grouped-norm or Gemma activation paths).
+//! (the qwen4_exp arms: no Hadamard, ternary, row-exact, grouped-norm or Gemma activation paths).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../sdk/util/log.zig");
 const sushi_pack = @import("../../../sdk/quant/exl3/sushi_pack.zig");
+const mlx_gguf = @import("../../../sdk/quant/gguf/root.zig");
 const decode_attn_quant = @import("../../../sdk/blocks/attention/decode_attn_quant.zig");
 const verify_projection = @import("../../../sdk/blocks/linear/verify_projection.zig");
 const Trunk = @import("../trunk.zig").Trunk;
@@ -239,6 +240,8 @@ pub fn embedding(self: *const Trunk, token_ids: mlx.mlx_array) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(emb);
     if (self.emb_s.ctx == null) {
         try mlx.check(mlx.mlx_astype(&emb, taken_w, .bfloat16, self.s));
+    } else if (mlx_gguf.kernels.infoOf(self.emb_w, self.emb_s)) |info| {
+        emb = try mlx_gguf.kernels.dequantize(info.ty, taken_w, self.actDtype(), self.s);
     } else {
         var taken_s = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(taken_s);

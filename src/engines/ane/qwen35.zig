@@ -1064,8 +1064,12 @@ pub fn headParts(vocab: u32, hidden: u32) u32 {
     return (vocab + rows - 1) / rows;
 }
 
+/// A head part starts on a multiple of this many vocabulary rows: the compiler lays out a
+/// part whose row count is not a multiple of it differently from the host's read.
+pub const HEAD_ALIGN: u32 = 64;
+
 pub fn partRange(vocab: u32, parts: u32, i: u32) struct { lo: u32, hi: u32 } {
-    const step = (vocab + parts - 1) / parts;
+    const step = std.mem.alignForward(u32, (vocab + parts - 1) / parts, HEAD_ALIGN);
     return .{ .lo = i * step, .hi = @min(vocab, (i + 1) * step) };
 }
 
@@ -1130,7 +1134,7 @@ fn headBase(pack: *const Pack, prefix: []const u8, b: []u8) ![]const u8 {
 
 const testing = std.testing;
 
-test "head parts: every vocabulary row in exactly one part, at most 32768 rows and 96 MiB of weights" {
+test "head parts: every vocabulary row in exactly one part, aligned, at most 32768 rows and 96 MiB of weights" {
     const v: u32 = 248320;
     for ([_]u32{ 1024, 5120 }) |hidden| {
         const n = headParts(v, hidden);
@@ -1139,6 +1143,7 @@ test "head parts: every vocabulary row in exactly one part, at most 32768 rows a
             const r = partRange(v, n, @intCast(i));
             try testing.expectEqual(covered, r.lo);
             try testing.expect(r.hi - r.lo <= 32768);
+            try testing.expectEqual(@as(u32, 0), r.lo % HEAD_ALIGN);
             try testing.expect(@as(u64, r.hi - r.lo) * hidden <= 96 << 20);
             covered = r.hi;
         }

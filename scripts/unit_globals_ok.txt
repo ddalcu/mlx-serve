@@ -37,6 +37,7 @@ mlx.ffi.cuda_integrated_cache
 mlx.ffi.limited_unified_memory
 mlx.ffi.no_gpu_backend_cache
 mlx.ffi.op_count
+mlx.ffi.virtual_gpu_cache
 plugins.deepseek_v4.deepseek_v4.dec_chain_cfg_cache
 plugins.deepseek_v4.deepseek_v4.emit_cfg_cache
 plugins.glm5_next.glm5_next.hc_pre_probed

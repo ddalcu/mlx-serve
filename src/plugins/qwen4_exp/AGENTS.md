@@ -55,6 +55,9 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
 - MTP head state is a `Qwen4MtpState` swapped onto the module (`qwen4MtpActivate` before EVERY head touch); the head
   projects only the consumed row; its rounds stay solo (`mtpRoundsStaySolo`).
 - A fast path keyed on one pack's quant layout is silent on another's: new pack layout => `tests/qwen4_engagement.sh`.
+- A GGUF (`--mlx-gguf`, arch `qwen4exp`) loads affine-coded blocks as affine g32 (`sdk/quant/gguf/affine.zig`), so these
+  kernels serve it (the grouped-verify arms keyed on 4-bit g64 still decline it); the table reads in place; its
+  `mtp-*.gguf` head loads in our packs' head layout (experts 4-bit g64, the rest 8-bit g64: `requantHead`).
 - Decode is kernel-time and dispatch bound: a kernel that replaces ONE dispatch loses to MLX's qmv; rows per simdgroup
   is an occupancy decision (sweep in situ). Meters: `tests/fwd_ubench.sh`, `MLX_SERVE_DIAG=step-trace`.
 

@@ -4,6 +4,7 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
+const device = @import("../../../mlx/device.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 
 pub const fixture = @import("fixture.zig");
@@ -15,6 +16,7 @@ pub const attn = @import("attn.zig");
 pub const wo_a = @import("wo_a.zig");
 pub const ffn_in = @import("ffn_in.zig");
 pub const moe_up = @import("moe_up.zig");
+pub const moe_fp4 = @import("moe_fp4.zig");
 pub const moe_down = @import("moe_down.zig");
 
 const dsv41 = @import("../deepseek_v41.zig");
@@ -28,7 +30,7 @@ pub const max_rows = 6;
 pub const stream_bytes_per_us: f64 = 1.065e6;
 
 pub fn register(set: *kc.Set) !void {
-    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| try k.register(set);
+    inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_fp4, moe_down }) |k| try k.register(set);
 }
 
 /// Root-mean-square of `got - want` over that of `want`.
@@ -85,16 +87,24 @@ test "dsv41 dec layers: the fused kernels decode no further from an f32 model th
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     // Ratio 1 (KV source, owner, candidate source, an index non-owner), ratio 2 (KV source pooling pairs), ratio 0.
-    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 }, .{ 0, 1 } }) |range| try layersAgree(gpa, range[0], range[1]);
+    for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 }, .{ 0, 1 } }) |range| try layersAgree(gpa, range[0], range[1], false);
 }
 
-fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize) !void {
+test "dsv41 dec layers: the fused kernels over mxfp4 experts decode no further from an f32 model than today's chain" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    // The mxfp4 kernels build only without NAX (`Dec.moe_fp4`): with NAX this compares the NAX attention against the
+    // chain at a bf16 near-tie instead. The kernel contract checks the mxfp4 kernels on every GPU.
+    if (device.naxAvailable()) return error.SkipZigTest;
+    try layersAgree(std.testing.allocator, 20, 23, true);
+}
+
+fn layersAgree(gpa: std.mem.Allocator, lo: usize, hi: usize, fp4: bool) !void {
     // Same seed, so the same weights, prefill and step inputs: the fused kernels, today's chain, and the f32 reference.
     var fxs: [3]*fixture.Fixture = undefined;
     var made: usize = 0;
     defer for (fxs[0..made]) |fx| fx.deinit();
     for (&fxs, [_]mlx.mlx_dtype{ .bfloat16, .bfloat16, .float32 }, [_]bool{ true, false, false }) |*fx, act, fused| {
-        fx.* = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .ctx = 601, .seed = 9, .act = act, .fused = fused });
+        fx.* = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .ctx = 601, .seed = 9, .act = act, .fused = fused, .experts_fp4 = fp4 });
         made += 1;
     }
     var p0: usize = 601;

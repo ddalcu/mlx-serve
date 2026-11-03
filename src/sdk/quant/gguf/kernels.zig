@@ -82,10 +82,10 @@ pub fn headerFor(comptime ty: GgmlType) [:0]const u8 {
         .mxfp4 => &.{"blocks/mxfp4"},
         .q2_k, .q3_k, .q4_k, .q5_k, .q6_k => &.{"blocks/k_quants"},
         .iq4_nl, .iq4_xs => &.{ "tables/kvalues_iq4nl", "blocks/iq4" },
-        .iq2_xxs => &.{ "tables/ksigns_iq2xs", "tables/iq2xxs_grid", "blocks/iq2_xxs" },
-        .iq2_xs => &.{ "tables/ksigns_iq2xs", "tables/iq2xs_grid", "blocks/iq2_xs" },
+        .iq2_xxs => &.{ "tables/iq2xxs_grid", "blocks/iq2_xxs" },
+        .iq2_xs => &.{ "tables/iq2xs_grid", "blocks/iq2_xs" },
         .iq2_s => &.{ "tables/iq2s_grid", "blocks/iq2_s" },
-        .iq3_xxs => &.{ "tables/ksigns_iq2xs", "tables/iq3xxs_grid", "blocks/iq3_xxs" },
+        .iq3_xxs => &.{ "tables/iq3xxs_grid", "blocks/iq3_xxs" },
         .iq3_s => &.{ "tables/iq3s_grid", "blocks/iq3_s" },
         .iq1_s, .iq1_m => &.{ "tables/iq1s_grid_gpu", "blocks/iq1" },
         else => unreachable,
@@ -95,7 +95,7 @@ pub fn headerFor(comptime ty: GgmlType) [:0]const u8 {
     return h;
 }
 
-pub const Kind = enum { dequant, matvec, gather, matmat, gather_tile };
+pub const Kind = enum { dequant, matvec, matvec_cols, gather, gather_swiglu, matmat, gather_tile };
 
 /// Runs the tile for this threadgroup's token tile: the last tile of a prompt
 /// may hold fewer 8-token groups.
@@ -104,22 +104,21 @@ const tile_dispatch =
 
 /// Weight rows per simdgroup of the matvec, for `per` activation rows per
 /// kernel instance. Many short threads pull more memory bandwidth than one
-/// long thread per row (MLX's own qmv does 4 rows). 8 keeps the lockstep
-/// stripes of the matvec even for every unit count that is a multiple of 4:
-/// Q6_K at K = 2560 is 20 units, 8% faster than with 4 rows, nothing got slower
-/// (measured). A thread keeps rows x per running sums, held to ~16 floats so
-/// they stay in registers (Q6_K, 3 activation rows: 0.46 ms with 4 rows, 0.69 with 8).
+/// long thread per row (MLX's own qmv does 4 rows); 8 keeps the lockstep
+/// stripes of the matvec even for every unit count that is a multiple of 4.
+/// A thread keeps rows x per running sums, held to ~16 floats so they stay in
+/// registers.
 pub fn matvecRows(per: c_int) c_int {
-    return if (per <= 2) 8 else if (per <= 4) 4 else 2;
+    return if (per <= 2) 8 else if (per <= 4) 4 else if (per <= 5) 2 else 1;
 }
 
 /// Activation rows one kernel instance takes (the rest of `m` runs as more
-/// instances on the grid's z axis): the largest divisor of m up to 5. An
-/// instance decodes each weight once for its rows, ~0.65x the cost per row of
-/// separate reads, but past 5 rows its accumulators spill (7 in one instance
-/// is as slow as 7 separate reads, measured).
+/// instances on the grid's z axis): the largest divisor of m up to 8. An
+/// instance decodes each weight once for all its rows; past 5 rows it keeps
+/// one weight row a simdgroup (`matvecRows`) so its accumulators stay in
+/// registers.
 pub fn rowsPerInstance(m: c_int) c_int {
-    var per: c_int = @min(m, 5);
+    var per: c_int = @min(m, 8);
     while (@mod(m, per) != 0) per -= 1;
     return per;
 }
@@ -128,9 +127,10 @@ pub const SIMD_WIDTH = 32;
 /// Simdgroups a decode matvec should put in flight before it starts packing rows.
 pub const MIN_SIMDGROUPS = 512;
 /// MoE prefill: (token, expert) pairs per expert from which the bank is
-/// materialized for gather_mm, and the largest bf16 bank that gets.
+/// materialized for gather_mm, and the largest bf16 bank that gets that
+/// transient copy (one bank at a time); a larger bank stays on the tile kernel.
 const DEQUANT_MOE_PAIRS_PER_EXPERT = 24;
-const DEQUANT_MOE_MAX_BYTES: u64 = 1 << 30;
+const DEQUANT_MOE_MAX_BYTES: u64 = 2 << 30;
 
 /// Tokens per tile of the matmat kernel.
 const TILE_TOKENS = 32;
@@ -174,6 +174,43 @@ fn tileRows(ty: GgmlType) c_int {
 const matvec_body =
     @embedFile("metal/kernels/matvec_body.metal");
 
+/// The matvec for 32-weight units, lane-major over a row's units instead: a lane loads its unit's activations into
+/// registers once and decodes RPT weight rows against them (ggml's layout), where the striped body reads them again
+/// per row. Needs a row of at least 32 units and few activation rows (32 x M floats of registers).
+const matvec_cols_body =
+    @embedFile("metal/kernels/matvec_cols.metal");
+
+fn colsServes(ty: GgmlType, in: c_int, per: c_int) bool {
+    return ty.unitElems() == 32 and per <= 2 and @divExact(in, 32) >= SIMD_WIDTH;
+}
+
+/// An IQ type's codebook, read at data-dependent indices: from `constant` memory those reads serialize, so the
+/// matvec and tile kinds stage it in threadgroup memory first (as ggml's own Metal kernels do).
+fn gridOf(ty: GgmlType) ?struct { table: []const u8, elem: []const u8, len: u32 } {
+    // IQ1's 8 KB grid stays in `constant`: staged, it costs the tile kernels more occupancy than its reads cost.
+    return switch (ty) {
+        .iq2_xxs => .{ .table = "iq2xxs_grid", .elem = "uint64_t", .len = 256 },
+        .iq2_xs => .{ .table = "iq2xs_grid", .elem = "uint64_t", .len = 512 },
+        .iq2_s => .{ .table = "iq2s_grid", .elem = "uint64_t", .len = 1024 },
+        .iq3_xxs => .{ .table = "iq3xxs_grid", .elem = "uint32_t", .len = 256 },
+        .iq3_s => .{ .table = "iq3s_grid", .elem = "uint32_t", .len = 512 },
+        else => null,
+    };
+}
+
+/// The matvec kinds' codebook in threadgroup memory, `DEQ_AT` reading it there.
+fn stagedGrid(comptime ty: GgmlType) []const u8 {
+    const g = comptime gridOf(ty) orelse return "";
+    return std.fmt.comptimePrint(
+        \\threadgroup {s} gg_grid[{d}];
+        \\for (uint i = simdgroup_index_in_threadgroup * threads_per_simdgroup + thread_index_in_simdgroup; i < {d}; i += simdgroups_per_threadgroup * threads_per_simdgroup) gg_grid[i] = {s}[i];
+        \\threadgroup_barrier(mem_flags::mem_threadgroup);
+        \\#undef DEQ_AT
+        \\#define DEQ_AT(w, row, blk, u, o) deq_{s}((w) + (size_t(row) * NB + (blk)) * BB, u, o, gg_grid)
+        \\
+    , .{ g.elem, g.len, g.len, g.table, @tagName(ty) });
+}
+
 pub fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
     // DEQ_AT(w, row, blk, u, o): decode unit u of block blk of row `row` of
     // weight w. SPLIT (template const, see isSplit) picks the row layout.
@@ -187,11 +224,14 @@ pub fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
         // One thread per unit.
         .dequant => @embedFile("metal/kernels/dequant.metal"),
         // Instance z takes activation rows [z * M, z * M + M).
-        .matvec => "#define GG_W w\n#define GG_X (x + size_t(z) * M * K)\n" ++ matvec_body,
+        .matvec => "#define GG_W w\n#define GG_X (x + size_t(z) * M * K)\n" ++ stagedGrid(ty) ++ matvec_body,
+        .matvec_cols => "#define GG_W w\n#define GG_X (x + size_t(z) * M * K)\n" ++ stagedGrid(ty) ++ matvec_cols_body,
         // MoE: instance z is one (token, expert) pair, `ids[z]` its expert in
         // the bank w [experts, N, row bytes] and z / XDIV its activation row
         // (XDIV = experts per token, 1 when the rows come already repeated).
-        .gather => "#define GG_W (w + size_t(ids[z]) * N * ROWB)\n#define GG_X (x + size_t(z / XDIV) * K)\n" ++ matvec_body,
+        .gather => "#define GG_W (w + size_t(ids[z]) * N * ROWB)\n#define GG_X (x + size_t(z / XDIV) * K)\n" ++ stagedGrid(ty) ++ matvec_body,
+        // The gather's matvec over a gate and an up bank at once, then SwiGLU on the pair (`gatherSwiGLU`).
+        .gather_swiglu => stagedGrid(ty) ++ @embedFile("metal/kernels/gather_swiglu.metal"),
         // x [M, K] f32 times w^T, M a multiple of 8 and N of TILE_ROWS. One
         // threadgroup (= one simdgroup, whose threads run simdgroup_matrix ops
         // TOGETHER) per output tile of TILE_TOKENS tokens x TILE_ROWS rows.
@@ -199,7 +239,7 @@ pub fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
         // threadgroup memory (thread-local arrays spill, this doesn't), then the
         // group multiplies 8x8 blocks against x. The last tile of a prompt may
         // hold fewer 8-token groups.
-        .matmat => "threadgroup float tile[TILE_ROWS * UNIT];\n" ++ tile_macro ++
+        .matmat => "threadgroup float tile[TILE_ROWS * UNIT];\n" ++ stagedGrid(ty) ++ tile_macro ++
             @embedFile("metal/kernels/matmat.metal") ++ tile_dispatch,
         // MoE prefill: x [M, K] f32 holds the rows already gathered per
         // (token, expert) pair, `ids` [rows of x, unpadded] their experts, as
@@ -208,7 +248,7 @@ pub fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
         // its rows, into a staging buffer, and the rows of that expert are
         // copied out. Every real row belongs to exactly one pass, the zero
         // pad rows to none.
-        .gather_tile => "threadgroup float tile[TILE_ROWS * UNIT];\nthreadgroup float stage[TILE_TOKENS * TILE_ROWS];\n" ++ tile_macro ++
+        .gather_tile => "threadgroup float tile[TILE_ROWS * UNIT];\nthreadgroup float stage[TILE_TOKENS * TILE_ROWS];\n" ++ stagedGrid(ty) ++ tile_macro ++
             @embedFile("metal/kernels/gather_tile_head.metal") ++ tile_dispatch ++
             @embedFile("metal/kernels/gather_tile_tail.metal"),
     };
@@ -226,8 +266,9 @@ fn kernelFor(comptime kind: Kind, comptime ty: GgmlType) Error!mlx.mlx_fast_meta
     if (Cache.kernel) |k| return k;
     const input_names: []const [*:0]const u8 = switch (kind) {
         .dequant => &.{"w"},
-        .matvec, .matmat => &.{ "x", "w" },
+        .matvec, .matvec_cols, .matmat => &.{ "x", "w" },
         .gather, .gather_tile => &.{ "x", "w", "ids" },
+        .gather_swiglu => &.{ "x", "wg", "wu", "ids", "sigtab" },
     };
     const output_names = [_][*:0]const u8{"out"};
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
@@ -326,24 +367,17 @@ fn layoutConsts(ty: GgmlType, in: c_int, row_bytes: c_int) [3]Const {
 /// Decode runs a matvec per (token, expert) pair; past MATVEC_MAX_ROWS pairs
 /// with x's rows already gathered (prefill), the tile kernel decodes each
 /// expert's weights once per token tile instead of once per pair.
-pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, sorted: bool, s: mlx.mlx_stream) !mlx.mlx_array {
     const ty = info.ty;
     const ws = mlx.getShape(w);
     if (!ty.isQuantized() or info.tiled != null) return error.UnsupportedType;
-    if (ws.len != 3 or mlx.mlx_array_dtype(w) != .uint8) return error.BadShape;
-    const rows = ws[1];
-    const in = try inFeatures(ty, ws[2]);
-
-    const xs = mlx.getShape(x);
-    if (xs.len < 2 or xs[xs.len - 1] != in or xs[xs.len - 2] != 1) return error.BadShape;
-    const x_rows: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(in))));
+    const p = try pairsOf(ty, x, w, rhs_idx);
+    const rows = p.rows;
+    const in = p.in;
+    const x_rows = p.x_rows;
     const os = mlx.getShape(rhs_idx);
-    const n_out: c_int = @intCast(mlx.mlx_array_size(rhs_idx));
-    var out_shape: [8]c_int = undefined;
-    if (os.len + 2 > out_shape.len or n_out == 0) return error.BadShape;
-    @memcpy(out_shape[0..os.len], os);
-    out_shape[os.len] = 1;
-    out_shape[os.len + 1] = rows;
+    const n_out = p.n_out;
+    const out_shape = p.out_shape;
 
     var x_in = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x_in);
@@ -394,7 +428,7 @@ pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx
         try mlx.check(mlx.mlx_reshape(&ids_flat, ids, &[_]c_int{n_out}, 1, s));
         var y3 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y3);
-        try mlx.check(mlx.mlx_gather_mm(&y3, x3, bank_t, .{ .ctx = null }, ids_flat, true, s));
+        try mlx.check(mlx.mlx_gather_mm(&y3, x3, bank_t, .{ .ctx = null }, ids_flat, sorted, s));
         var y = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(y);
         try mlx.check(mlx.mlx_reshape(&y, y3, &out_shape, os.len + 2, s));
@@ -419,9 +453,53 @@ pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx
         return y;
     }
 
-    const rpt = matvecRows(1);
-    const groups = @divFloor(rows + rpt * SIMDGROUPS - 1, rpt * SIMDGROUPS);
-    return apply(try kernel(.gather, ty), &.{ x_in, w, ids }, out_shape[0 .. os.len + 2], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, n_out }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, in, ws[2]) ++ [_]Const{ .{ "N", rows }, .{ "M", 1 }, .{ "RPT", rpt }, .{ "XDIV", xdiv } }), s);
+    const groups = @divFloor(rows + GATHER_RPT * SIMDGROUPS - 1, GATHER_RPT * SIMDGROUPS);
+    return apply(try kernel(.gather, ty), &.{ x_in, w, ids }, out_shape[0 .. os.len + 2], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, n_out }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, in, ws[2]) ++ [_]Const{ .{ "N", rows }, .{ "M", 1 }, .{ "RPT", GATHER_RPT }, .{ "XDIV", xdiv } }), s);
+}
+
+/// An expert bank's rows are scattered reads: four a simdgroup beat eight (swept in situ on IQ banks).
+const GATHER_RPT = 4;
+
+/// A gather's (token, expert) pairs over the bank w [experts, rows, row_bytes]: x [..., 1, in] and rhs_idx's shape
+/// + [1, rows] out.
+const Pairs = struct { rows: c_int, in: c_int, x_rows: c_int, n_out: c_int, out_shape: [8]c_int };
+
+fn pairsOf(ty: GgmlType, x: mlx.mlx_array, w: mlx.mlx_array, rhs_idx: mlx.mlx_array) !Pairs {
+    const ws = mlx.getShape(w);
+    if (ws.len != 3 or mlx.mlx_array_dtype(w) != .uint8) return error.BadShape;
+    const in = try inFeatures(ty, ws[2]);
+    const xs = mlx.getShape(x);
+    if (xs.len < 2 or xs[xs.len - 1] != in or xs[xs.len - 2] != 1) return error.BadShape;
+    const os = mlx.getShape(rhs_idx);
+    var p: Pairs = .{ .rows = ws[1], .in = in, .x_rows = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(in)))), .n_out = @intCast(mlx.mlx_array_size(rhs_idx)), .out_shape = undefined };
+    if (os.len + 2 > p.out_shape.len or p.n_out == 0) return error.BadShape;
+    @memcpy(p.out_shape[0..os.len], os);
+    p.out_shape[os.len] = 1;
+    p.out_shape[os.len + 1] = p.rows;
+    return p;
+}
+
+/// silu(x w_gate[ids]^T) * (x w_up[ids]^T) in one pass over both banks: `gatherLinear`'s matvec per (token, expert)
+/// pair for each projection, rounded to x's dtype as it writes them, then MLX's SwiGLU chain, bit for bit (`sigtab`:
+/// MLX's sigmoid of every 16-bit pattern of x's dtype). x's rows lead rhs_idx's dims, as in `gatherLinear` without
+/// lhs indices. Null where `gatherLinear` would not run its matvec (prefill-sized pair counts), or the banks differ.
+pub fn gatherSwiGLU(gate: Info, up: Info, x: mlx.mlx_array, wg: mlx.mlx_array, wu: mlx.mlx_array, rhs_idx: mlx.mlx_array, sigtab: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
+    const ty = gate.ty;
+    if (up.ty != ty or !ty.isQuantized() or gate.tiled != null or up.tiled != null) return null;
+    const dt = mlx.mlx_array_dtype(x);
+    if (dt != .bfloat16 and dt != .float16) return null;
+    const ws = mlx.getShape(wg);
+    if (!std.mem.eql(c_int, ws, mlx.getShape(wu))) return null;
+    const p = try pairsOf(ty, x, wg, rhs_idx);
+    if (@mod(p.n_out, p.x_rows) != 0) return error.BadShape;
+    const xdiv = @divExact(p.n_out, p.x_rows);
+    if (xdiv == 1 and p.n_out >= 8 * ws[0]) return null;
+    var ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids);
+    try mlx.check(mlx.mlx_astype(&ids, rhs_idx, .uint32, s));
+    const groups = @divFloor(p.rows + GATHER_RPT * SIMDGROUPS - 1, GATHER_RPT * SIMDGROUPS);
+    const nd = mlx.getShape(rhs_idx).len + 2;
+    return try apply(try kernel(.gather_swiglu, ty), &.{ x, wg, wu, ids, sigtab }, p.out_shape[0..nd], dt, .{ SIMD_WIDTH, SIMDGROUPS * groups, p.n_out }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, p.in, ws[2]) ++ [_]Const{ .{ "N", p.rows }, .{ "RPT", GATHER_RPT }, .{ "XDIV", xdiv } }), s);
 }
 
 /// w [rows, row_bytes] -> [rows, in_features] in `dtype`.
@@ -441,13 +519,20 @@ pub fn matvec(ty: GgmlType, x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_strea
     out_shape[xs.len - 1] = g.rows;
     const m: c_int = @intCast(@divExact(mlx.mlx_array_size(x), @as(usize, @intCast(g.in))));
     const per = rowsPerInstance(m);
-    // Small weights are latency bound, not bandwidth bound: fewer rows per
-    // simdgroup puts more of them in flight (E2B's 1536->256 projection goes
-    // from 9 to 4 us on an M4 Max, the big matrices keep RPT = 8, measured).
-    var rpt = matvecRows(per);
-    while (rpt > 1 and @divFloor(g.rows, rpt) < MIN_SIMDGROUPS) rpt = @divExact(rpt, 2);
+    const cols = colsServes(ty, g.in, per);
+    const rpt = matvecRpt(cols, per, g.rows);
     const groups = @divFloor(g.rows + rpt * SIMDGROUPS - 1, rpt * SIMDGROUPS);
-    return apply(try kernel(.matvec, ty), &.{ x, w }, out_shape[0..xs.len], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, @divExact(m, per) }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, g.in, g.row_bytes) ++ [_]Const{ .{ "N", g.rows }, .{ "M", per }, .{ "RPT", rpt } }), s);
+    const k = try kernel(if (cols) .matvec_cols else .matvec, ty);
+    return apply(k, &.{ x, w }, out_shape[0..xs.len], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, @divExact(m, per) }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, g.in, g.row_bytes) ++ [_]Const{ .{ "N", g.rows }, .{ "M", per }, .{ "RPT", rpt } }), s);
+}
+
+/// Weight rows per simdgroup of the matvec (`cols`: the column kernel) for `per` activation rows into `n` outputs;
+/// the wrapper and the kernel contract both read it. Small weights are latency bound, so fewer rows a simdgroup put
+/// more of them in flight; the column kernel holds a unit's activations in registers and keeps the most at two rows.
+pub fn matvecRpt(cols: bool, per: c_int, n: c_int) c_int {
+    var rpt = if (cols) 2 else matvecRows(per);
+    while (rpt > 1 and @divFloor(n, rpt) < MIN_SIMDGROUPS) rpt = @divExact(rpt, 2);
+    return rpt;
 }
 
 /// x [M, in_features] times w^T -> [M, rows], rows a multiple of tileRows.
@@ -638,7 +723,7 @@ fn readF32(arr: mlx.mlx_array, n: usize) ![]const f32 {
 }
 
 test "GPU dequant equals the CPU reference for every type" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     inline for (all_types) |ty| {
@@ -656,14 +741,14 @@ test "GPU dequant equals the CPU reference for every type" {
 }
 
 test "linear equals a CPU dot product on the matvec (1 and several rows) and the 2-row fallback path" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(7);
     inline for (all_types) |ty| {
         const w = try TestWeight.init(ty);
         defer w.deinit();
-        for ([_]usize{ 1, 2, 3, 5, MATVEC_MAX_ROWS, MATVEC_MAX_ROWS + 3, 16 }) |m| {
+        for ([_]usize{ 1, 2, 3, 5, 6, 7, MATVEC_MAX_ROWS, MATVEC_MAX_ROWS + 3, 16 }) |m| {
             const xv = try std.testing.allocator.alloc(f32, m * w.in);
             defer std.testing.allocator.free(xv);
             for (xv) |*v| v.* = prng.random().float(f32) - 0.5;
@@ -702,8 +787,54 @@ test "linear equals a CPU dot product on the matvec (1 and several rows) and the
     }
 }
 
+test "the column-major matvec (32-weight units, rows of 1024 weights and a ragged 1280, 1-2 rows) equals a CPU dot product" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var prng = std.Random.DefaultPrng.init(11);
+    const rows = 3;
+    // 1280 weights: 40 units, so the first 8 lanes take a second one.
+    for ([_]usize{ 1024, 1280 }) |in| inline for (all_types) |ty| if (comptime ty.unitElems() == 32) {
+        // The fixture's 4 blocks, cycled over 3 rows of 1024 weights.
+        const fixture = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin")[0 .. 4 * ty.blockBytes()];
+        const nb = rows * in / ty.blockElems();
+        const raw = try a.alloc(u8, nb * ty.blockBytes());
+        defer a.free(raw);
+        for (0..nb) |b| @memcpy(raw[b * ty.blockBytes() ..][0..ty.blockBytes()], fixture[(b % 4) * ty.blockBytes() ..][0..ty.blockBytes()]);
+        const ref = try a.alloc(f32, rows * in);
+        defer a.free(ref);
+        try quants.dequantize(ty, raw, ref);
+        const stored = try a.alloc(u8, rows * rowBytes(ty, in));
+        defer a.free(stored);
+        if (isSplit(ty, in)) packRows(ty, in, stored, raw) else @memcpy(stored, raw);
+        const w = mlx.mlx_array_new_data(stored.ptr, &[_]c_int{ rows, @intCast(rowBytes(ty, in)) }, 2, .uint8);
+        defer _ = mlx.mlx_array_free(w);
+        for ([_]usize{ 1, 2 }) |m| {
+            try std.testing.expect(colsServes(ty, @intCast(in), @intCast(m)));
+            const xv = try a.alloc(f32, m * in);
+            defer a.free(xv);
+            for (xv) |*v| v.* = prng.random().float(f32) - 0.5;
+            const x = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ 1, @intCast(m), @intCast(in) }, 3, .float32);
+            defer _ = mlx.mlx_array_free(x);
+            const y = try linear(.{ .ty = ty }, x, w, s);
+            defer _ = mlx.mlx_array_free(y);
+            const got = try readF32(y, m * rows);
+            for (0..m) |mi| for (0..rows) |r| {
+                var want: f32 = 0;
+                var scale: f32 = 0;
+                for (xv[mi * in ..][0..in], ref[r * in ..][0..in]) |xa, wb| {
+                    want += xa * wb;
+                    scale += @abs(xa * wb);
+                }
+                try std.testing.expectApproxEqAbs(want, got[mi * rows + r], 1e-5 * scale);
+            };
+        }
+    };
+}
+
 test "tile mat-mat kernel (32 rows, whole and padded token tiles) equals a CPU dot product" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(23);
@@ -749,7 +880,7 @@ test "tile mat-mat kernel (32 rows, whole and padded token tiles) equals a CPU d
 }
 
 test "gatherLinear routes every output to its expert, with and without lhs indices" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(5);
@@ -783,7 +914,7 @@ test "gatherLinear routes every output to its expert, with and without lhs indic
             defer if (c.lhs != null) {
                 _ = mlx.mlx_array_free(lhs);
             };
-            const y = try gatherLinear(.{ .ty = ty }, x, bank, lhs, rhs, s);
+            const y = try gatherLinear(.{ .ty = ty }, x, bank, lhs, rhs, c.lhs != null, s);
             defer _ = mlx.mlx_array_free(y);
             const ys = mlx.getShape(y);
             try std.testing.expectEqualSlices(c_int, c.rhs_shape, ys[0..c.rhs_shape.len]);
@@ -803,7 +934,7 @@ test "gatherLinear routes every output to its expert, with and without lhs indic
 }
 
 test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals a CPU dot product" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(29);
@@ -838,7 +969,7 @@ test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals 
             for ([_][]const u32{ &ids, &shuffled }) |order| {
                 const rhs = mlx.mlx_array_new_data(order.ptr, &[_]c_int{m}, 1, .uint32);
                 defer _ = mlx.mlx_array_free(rhs);
-                const y = try gatherLinear(.{ .ty = ty }, x, bank, .{ .ctx = null }, rhs, s);
+                const y = try gatherLinear(.{ .ty = ty }, x, bank, .{ .ctx = null }, rhs, order.ptr == &ids, s);
                 defer _ = mlx.mlx_array_free(y);
                 try std.testing.expectEqualSlices(c_int, &.{ m, 1, n_rows }, mlx.getShape(y));
                 const got = try readF32(y, m * n_rows);
@@ -859,8 +990,95 @@ test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals 
     }
 }
 
+/// The test banks: 4 experts of `test_bank_rows` one-block rows cut from the type's 4 fixture blocks, `shift` picking
+/// another order.
+const test_bank_rows = 36;
+
+fn testBank(comptime ty: GgmlType, shift: usize) mlx.mlx_array {
+    const be = ty.blockElems();
+    const bb = ty.blockBytes();
+    const data = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin");
+    const n = 4 * test_bank_rows;
+    var bytes: [n * 256]u8 = undefined;
+    for (0..4) |e| for (0..test_bank_rows) |r| @memcpy(bytes[(e * test_bank_rows + r) * bb ..][0..bb], data[((r + e + shift) % 4) * bb ..][0..bb]);
+    var rows: [n * 256]u8 = undefined;
+    if (isSplit(ty, be)) packRows(ty, be, rows[0 .. n * rowBytes(ty, be)], bytes[0 .. n * bb]) else @memcpy(rows[0 .. n * bb], bytes[0 .. n * bb]);
+    return mlx.mlx_array_new_data(&rows, &[_]c_int{ 4, test_bank_rows, @intCast(rowBytes(ty, be)) }, 3, .uint8);
+}
+
+/// `y`'s values as f32 (exact for a 16-bit float), owned by the caller.
+fn testValues(y: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
+    var y32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y32);
+    try mlx.check(mlx.mlx_astype(&y32, y, .float32, s));
+    return std.testing.allocator.dupe(f32, try readF32(y32, mlx.mlx_array_size(y)));
+}
+
+// Bar: one pass over both banks writes exactly what the two gathers and MLX's SwiGLU chain write.
+test "gatherSwiGLU equals two gathers and MLX's SwiGLU bit for bit, at the decode and the sorted verify layouts" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const fused_activations = @import("../../blocks/mlp/fused_activations.zig");
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var prng = std.Random.DefaultPrng.init(17);
+    inline for ([_]GgmlType{ .iq2_xxs, .iq2_xs, .iq2_s, .iq3_xxs, .iq3_s, .iq4_nl, .q4_k, .q6_k }) |ty| {
+        const k: c_int = @intCast(ty.blockElems());
+        const n_rows = test_bank_rows;
+        const banks = [2]mlx.mlx_array{ testBank(ty, 0), testBank(ty, 3) };
+        defer for (banks) |b| {
+            _ = mlx.mlx_array_free(b);
+        };
+        const Case = struct { x_shape: []const c_int, ids: []const u32, ids_shape: []const c_int };
+        const cases = [_]Case{
+            // decode: one token's top-3 experts
+            .{ .x_shape = &.{ 1, 1, 1, 1, k }, .ids = &.{ 2, 0, 3 }, .ids_shape = &.{ 1, 1, 3 } },
+            // sorted verify: x already repeated per pair, pairs sorted by expert
+            .{ .x_shape = &.{ 5, 1, k }, .ids = &.{ 0, 0, 1, 3, 3 }, .ids_shape = &.{5} },
+        };
+        for (cases) |c| for ([_]mlx.mlx_dtype{ .bfloat16, .float16 }) |dt| {
+            var n_x: usize = 1;
+            for (c.x_shape) |d| n_x *= @intCast(d);
+            const xv = try std.testing.allocator.alloc(f32, n_x);
+            defer std.testing.allocator.free(xv);
+            for (xv) |*v| v.* = prng.random().float(f32) - 0.5;
+            const x32 = mlx.mlx_array_new_data(xv.ptr, c.x_shape.ptr, @intCast(c.x_shape.len), .float32);
+            defer _ = mlx.mlx_array_free(x32);
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, x32, dt, s));
+            const ids = mlx.mlx_array_new_data(c.ids.ptr, c.ids_shape.ptr, @intCast(c.ids_shape.len), .uint32);
+            defer _ = mlx.mlx_array_free(ids);
+
+            const g = try gatherLinear(.{ .ty = ty }, x, banks[0], .{ .ctx = null }, ids, false, s);
+            defer _ = mlx.mlx_array_free(g);
+            const u = try gatherLinear(.{ .ty = ty }, x, banks[1], .{ .ctx = null }, ids, false, s);
+            defer _ = mlx.mlx_array_free(u);
+            var sig = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sig);
+            try mlx.check(mlx.mlx_sigmoid(&sig, g, s));
+            var act = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(act);
+            try mlx.check(mlx.mlx_multiply(&act, g, sig, s));
+            var want = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(want);
+            try mlx.check(mlx.mlx_multiply(&want, act, u, s));
+
+            const got = (try gatherSwiGLU(.{ .ty = ty }, .{ .ty = ty }, x, banks[0], banks[1], ids, try fused_activations.sigmoidTableFor(s, dt), s)).?;
+            defer _ = mlx.mlx_array_free(got);
+            try std.testing.expectEqual(dt, mlx.mlx_array_dtype(got));
+            try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+            const want_v = try testValues(want, s);
+            defer std.testing.allocator.free(want_v);
+            const got_v = try testValues(got, s);
+            defer std.testing.allocator.free(got_v);
+            try std.testing.expectEqual(c.ids.len * n_rows, got_v.len);
+            try std.testing.expectEqualSlices(f32, want_v, got_v);
+        };
+    }
+}
+
 test "split rows (16 blocks per row, packed at load) match the CPU reference for every split type" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var prng = std.Random.DefaultPrng.init(31);
@@ -913,7 +1131,7 @@ test "split rows (16 blocks per row, packed at load) match the CPU reference for
 }
 
 test "half precision activations keep their dtype and stay close to f32" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const w = try TestWeight.init(.iq4_nl);
@@ -960,7 +1178,7 @@ test "shape and type mistakes are errors, not GPU faults" {
 }
 
 test "sentinel round-trips the type and a tiled input matches a manual head swap" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const w = try TestWeight.init(.q8_0); // in = 64
