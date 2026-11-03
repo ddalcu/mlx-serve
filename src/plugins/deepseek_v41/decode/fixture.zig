@@ -313,7 +313,7 @@ test "dsv41 dec fixture: layers 20..25 at the release's shapes build, prefill, a
 }
 
 test "dsv41 tensor parallel: the two ranks' experts add up to the whole layer's MoE, decode and prompt rows" {
-    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const base: Opts = .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .act = .float32, .experts_fp4 = true };
     const whole = try Fixture.init(gpa, base);
@@ -351,7 +351,7 @@ test "dsv41 tensor parallel: the two ranks' experts add up to the whole layer's 
 }
 
 test "dsv41 tensor parallel: two ranks on half the heads and experts, summing each attention and MoE, give the whole model's stream" {
-    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const base: Opts = .{ .lo = 20, .hi = 22, .experts = 8, .ctx = 0, .act = .float32, .experts_fp4 = true };
     const whole = try Fixture.init(gpa, base);
@@ -419,7 +419,7 @@ test "dsv41 tensor parallel: the ranks on the fused decode kernels decode no fur
 }
 
 test "dsv41 tensor parallel: rank 0 holds a DSpark stage at the whole model's widths, and its MoE sums nothing" {
-    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const base: Opts = .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .act = .float32, .experts_fp4 = true };
     var tp = base;
@@ -481,7 +481,7 @@ test "dsv41 tensor parallel: rank 0 holds a DSpark stage at the whole model's wi
 }
 
 test "dsv41 tensor parallel and pair workers: a verify chunk rolled back to where the next step starts leaves the state its kept rows build" {
-    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const o: Opts = .{ .lo = 20, .hi = 22, .experts = 8, .ctx = 66, .act = .float32, .experts_fp4 = true };
     const a = try Fixture.init(gpa, o);
@@ -514,7 +514,7 @@ test "dsv41 tensor parallel and pair workers: a verify chunk rolled back to wher
 }
 
 test "dsv41 tensor parallel: a worker keeps rank 0's states by gen, the one it steps the module's, a free drops either" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const fx = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .tp = .{ .rank = 1, .size = 2 } });
     defer fx.deinit();
@@ -543,7 +543,7 @@ test "dsv41 tensor parallel: a worker keeps rank 0's states by gen, the one it s
 }
 
 test "dsv41 tensor parallel: a worker keeps its copy of rank 0's snapshots by id: take, clone, restore, capture at the boundary and free" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const fx = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0, .tp = .{ .rank = 1, .size = 2 } });
     defer fx.deinit();
@@ -578,7 +578,7 @@ test "dsv41 tensor parallel: a worker keeps its copy of rank 0's snapshots by id
 }
 
 test "dsv41 tensor parallel: a chunk's image rows, sent alone, splice as the request's rows at their offset" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const fx = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
     defer fx.deinit();
@@ -612,7 +612,7 @@ test "dsv41 tensor parallel: a chunk's image rows, sent alone, splice as the req
 }
 
 test "dsv41 tensor parallel: a snapshot read from disk reaches the worker as its cache tensors, which rebuild it bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
     const fx = try Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 8, .ctx = 0 });
     defer fx.deinit();

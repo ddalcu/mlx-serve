@@ -6570,6 +6570,7 @@ test "dsv41 bench: one-token FFN as a dependent chain, composed vs kernels (DSV4
 }
 
 test "dsv41 topk: the kernel picks the k largest of each row in index order, ties to the lower index" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();

@@ -486,6 +486,7 @@ test "dsv41 dec moe_up: 2-bit routed experts, rows 1 2 4 6, against today's path
 }
 
 test "dsv41 dec moe_up: 3-bit routed experts, rows 1 2 4 6, against today's path and f32 truth" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try equivalence(2, 4, 2, 3);
 }
 

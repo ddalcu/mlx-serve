@@ -242,7 +242,7 @@ fn expectSteps(comptime P: type, t: *Twin(P)) !void {
 }
 
 test "glm5_next plugin: prefill, decode, verify and later chunks equal the legacy forward bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/steps.tape");

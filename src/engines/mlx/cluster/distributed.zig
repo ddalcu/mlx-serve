@@ -238,8 +238,10 @@ const Bell = struct {
         if (!b.open()) return;
         // Steps come a decode tick apart: poll that long before sleeping, so a step does not wait for the kernel to
         // wake this thread.
-        var fds = [_]std.posix.pollfd{.{ .fd = b.fd, .events = std.posix.POLL.IN, .revents = 0 }};
-        for (0..spin_polls) |_| if ((std.posix.poll(&fds, 0) catch break) > 0) break;
+        if (comptime builtin.os.tag == .macos) {
+            var fds = [_]std.posix.pollfd{.{ .fd = b.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            for (0..spin_polls) |_| if ((std.posix.poll(&fds, 0) catch break) > 0) break;
+        }
         var x: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(b.fd, &x, 1);
