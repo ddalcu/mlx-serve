@@ -153,14 +153,13 @@ fn halfNovelty(window: []const u32, n: usize) f32 {
 pub const recurring_span_len: usize = 96;
 pub const recurring_span_reps: usize = 12;
 pub const recurring_span_min_distinct: usize = 24;
-/// The guard runs once per tick, so every tail end one tick can commit is checked. At least the
-/// engine's most tokens per tick (`loop_stop.zig` asserts it).
-pub const recurring_span_reach: usize = 16;
 
-/// Where a recurring tail span begins its SECOND copy (one copy is kept), or null.
-fn recurringSpanStart(tokens: []const u32) ?usize {
+/// Where a recurring tail span begins its SECOND copy (one copy is kept), or null. Every tail end
+/// among the `fresh` newest tokens is checked, at most one window of them per call.
+fn recurringSpanStart(tokens: []const u32, fresh: usize) ?usize {
+    const reach = @min(@max(fresh, 1), near_repeat_window);
     var end = tokens.len;
-    while (end + recurring_span_reach > tokens.len and end >= near_repeat_min_span) : (end -= 1) {
+    while (end + reach > tokens.len and end >= near_repeat_min_span) : (end -= 1) {
         if (recurringSpanEndingAt(tokens[0..end])) |s| return s;
     }
     return null;
@@ -272,7 +271,8 @@ fn trailingCycleStart(tokens: []const u32, p: usize) usize {
 /// Convict a degenerate tail and say where it starts. Tier order matches
 /// `scheduler.loopStopReason`: the exact tiers speak first, and the fuzzy
 /// near-repeat tier only ever judges spans they have already declined.
-pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
+/// `fresh` is how many tokens were committed since the last call: a tick can commit several.
+pub fn degenerateTail(tokens: []const u32, fresh: usize) ?DegenerateTail {
     if (exactCyclePeriod(tokens, 1, degenerate_loop_max_period, degenerate_loop_reps, degenerate_loop_min_span)) |p| {
         return .{ .tier = .exact_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
@@ -286,7 +286,7 @@ pub fn degenerateTail(tokens: []const u32) ?DegenerateTail {
         return .{ .tier = .long_cycle, .start = trailingCycleStart(tokens, p) + p };
     }
     if (nearRepeatStart(tokens)) |s| return .{ .tier = .near_repeat, .start = s };
-    if (recurringSpanStart(tokens)) |s| return .{ .tier = .recurring_span, .start = s };
+    if (recurringSpanStart(tokens, fresh)) |s| return .{ .tier = .recurring_span, .start = s };
     return null;
 }
 
@@ -380,18 +380,18 @@ test "degenerateTail: a short exact cycle convicts only past the minimum span" {
     defer ids.deinit(al);
     try ids.appendSlice(al, &[_]u32{ 7, 8, 9, 1 });
     for (0..24) |_| try ids.append(al, 16);
-    try testing.expect(degenerateTail(ids.items) == null);
+    try testing.expect(degenerateTail(ids.items, 1) == null);
 
     // A 32-element zeroed row: `0, 0, 0, ...` is a period-2 cycle of 64 tokens.
     var zeros = std.ArrayList(u32).empty;
     defer zeros.deinit(al);
     try zeros.appendSlice(al, &[_]u32{ 7, 8, 9, 1 });
     for (0..32) |_| try zeros.appendSlice(al, &[_]u32{ 15, 11 });
-    try testing.expect(degenerateTail(zeros.items) == null);
+    try testing.expect(degenerateTail(zeros.items, 1) == null);
 
     // Stuck for real: one token past the span is a loop and trims to one copy.
     for (24..degenerate_loop_min_span) |_| try ids.append(al, 16);
-    const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
+    const d = degenerateTail(ids.items, 1) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
     try testing.expectEqual(@as(usize, 5), d.start);
 }
@@ -505,7 +505,7 @@ test "degenerateTail acquits a low-entropy STRUCTURED file that ends inside the 
             }
             try ids.appendSlice(al, &[_]u32{ 200, 201, 202 }); // '"', ',', '\n'
         }
-        try testing.expect(degenerateTail(ids.items) == null);
+        try testing.expect(degenerateTail(ids.items, 1) == null);
     }
 }
 
@@ -582,7 +582,7 @@ test "isNearRepeatTailLoop leaves PROCEDURAL code alone — it recycles a vocabu
         }
     }
     try testing.expect(!isNearRepeatTailLoop(ids.items));
-    try testing.expect(degenerateTail(ids.items) == null);
+    try testing.expect(degenerateTail(ids.items, 1) == null);
 }
 
 test "degenerateTail: the exact tier reports its tier and keeps ONE cycle" {
@@ -596,7 +596,7 @@ test "degenerateTail: the exact tier reports its tier and keeps ONE cycle" {
     var k: usize = 0;
     while (k < degenerate_loop_min_span / 3 + 1) : (k += 1) try ids.appendSlice(al, &[_]u32{ 101, 102, 103 });
 
-    const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
+    const d = degenerateTail(ids.items, 1) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.exact_cycle, d.tier);
     // 4 prefix + 1 kept cycle = 7 tokens survive.
     try testing.expectEqual(@as(usize, 7), d.start);
@@ -636,7 +636,7 @@ test "degenerateTail: the trim start walks back PAST the near-repeat window" {
     try ids.appendSlice(al, honest.items);
     try ids.appendSlice(al, loop.items);
 
-    const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
+    const d = degenerateTail(ids.items, 1) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.near_repeat, d.tier);
     // Well past the single window, and never into the healthy prefix.
     try testing.expect(d.start < ids.items.len - near_repeat_window);
@@ -646,7 +646,7 @@ test "degenerateTail: the trim start walks back PAST the near-repeat window" {
 test "degenerateTail: healthy output is never convicted, so nothing is trimmed" {
     var ids: [4000]u32 = undefined;
     for (&ids, 0..) |*v, i| v.* = @intCast(i);
-    try testing.expect(degenerateTail(&ids) == null);
+    try testing.expect(degenerateTail(&ids, 1) == null);
 }
 
 test "degenerateTail: the long-period tier keeps one copy of its sentence cycle" {
@@ -659,7 +659,7 @@ test "degenerateTail: the long-period tier keeps one copy of its sentence cycle"
     var k: usize = 0;
     while (k < degenerate_loop_long_min_span / cycle.len + 1) : (k += 1) try ids.appendSlice(al, &cycle);
 
-    const d = degenerateTail(ids.items) orelse return error.TestExpectedLoop;
+    const d = degenerateTail(ids.items, 1) orelse return error.TestExpectedLoop;
     try testing.expectEqual(DegenerateTail.Tier.long_cycle, d.tier);
     try testing.expectEqual(@as(usize, 2 + cycle.len), d.start);
 }
@@ -694,10 +694,10 @@ test "degenerateTail: a fixed head with a reworded tail convicts once its copies
     // Inside the span bar the copies are still a passage a file could hold.
     var n: usize = 0;
     while (n < 300 + near_repeat_min_span - recurring_span_len) : (n += 1) {
-        try testing.expect(degenerateTail(ids.items[0..n]) == null);
+        try testing.expect(degenerateTail(ids.items[0..n], 1) == null);
     }
     // Past it, convicted at the first tick the tail is the head; one head and its tail survive.
-    while (n <= ids.items.len) : (n += 1) if (degenerateTail(ids.items[0..n])) |d| {
+    while (n <= ids.items.len) : (n += 1) if (degenerateTail(ids.items[0..n], 1)) |d| {
         try testing.expectEqual(DegenerateTail.Tier.recurring_span, d.tier);
         try testing.expectEqual(300 + 130 + first_tail, d.start);
         return;
@@ -706,7 +706,7 @@ test "degenerateTail: a fixed head with a reworded tail convicts once its copies
 }
 
 test "degenerateTail: a fixed head convicts when each tick commits several tokens" {
-    // An MTP or DFlash tick commits several tokens; the guard sees only the tick's last.
+    // An MTP or DFlash tick commits several tokens; the guard runs once per tick.
     const al = testing.allocator;
     var ids = std.ArrayList(u32).empty;
     defer ids.deinit(al);
@@ -715,7 +715,7 @@ test "degenerateTail: a fixed head convicts when each tick commits several token
     for (0..8) |phase| {
         var n: usize = phase + 1;
         const convicted = while (n <= ids.items.len) : (n += 8) {
-            if (degenerateTail(ids.items[0..n])) |d| break d.tier == .recurring_span;
+            if (degenerateTail(ids.items[0..n], 8)) |d| break d.tier == .recurring_span;
         } else false;
         try testing.expect(convicted);
     }
@@ -759,6 +759,6 @@ test "degenerateTail: a recurring block acquits below the rep bar, under the spa
             }
         }
         var n: usize = near_repeat_min_span;
-        while (n <= ids.items.len) : (n += 1) try testing.expect(recurringSpanStart(ids.items[0..n]) == null);
+        while (n <= ids.items.len) : (n += 1) try testing.expect(recurringSpanStart(ids.items[0..n], 1) == null);
     }
 }

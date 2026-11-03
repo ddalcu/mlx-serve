@@ -166,6 +166,8 @@ pub const Slot = struct {
     loop_trim_start: ?usize,
     /// The output has opened a tool call (`loop_stop.toolCallHoldsCut`); sticky.
     tool_call_opened: bool = false,
+    /// Generated tokens the loop guard has already seen.
+    loop_guard_seen: usize = 0,
     cancelled: std.atomic.Value(bool),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
