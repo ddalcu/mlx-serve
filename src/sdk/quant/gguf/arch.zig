@@ -11,6 +11,10 @@ pub const gpt_oss = @import("arch/gpt_oss.zig");
 pub const nemotron_h = @import("arch/nemotron_h.zig");
 pub const qwen3next = @import("arch/qwen3next.zig");
 pub const qwen4exp = @import("arch/qwen4exp.zig");
+pub const qwen3 = @import("arch/qwen3.zig");
+pub const flint = @import("arch/flint.zig");
+pub const muse_glimmer = @import("arch/muse_glimmer.zig");
+pub const deepseek41 = @import("arch/deepseek41.zig");
 
 /// What loading has to do to a tensor's bytes. Most of them undo llama.cpp's
 /// value-head tiling of the GatedDeltaNet, see arch/qwen35.zig.
@@ -41,6 +45,15 @@ pub const Transform = union(enum) {
     /// Quantized [2 * nk * r, in] with rows [b heads of key head 0, a heads of key head 0, b of 1, ...]:
     /// split into `in_proj_b` and `in_proj_a` of [nk * r, in] (Qwen3-Next's fused b / a projection).
     split_ba: struct { nk: u32, r: u32 },
+    /// Q or K rows llama.cpp interleaved per head for its NORM rope (`_unpermute_for_rope`: row `h*hd + 2j + p` holds
+    /// HF's `h*hd + p*hd/2 + j`), back to HF's rotate-half order; whole rows move, nothing is requantized.
+    rope_rows: u32,
+    /// An expert bank `[experts, 2M, in]` holding gate rows then up rows: two banks, the mapped name (`gate_proj`)
+    /// and its `up_proj` sibling, whole rows moved.
+    split_gate_up,
+    /// An F32 tensor kept f32 (every other float lands bf16): DeepSeek-V4.1's hyper-connection mixes, sinks and
+    /// router bias, f32 in its MLX packs too (the bias picks experts at near-ties).
+    keep_f32,
 };
 
 pub const Mapped = struct { name: []const u8, transform: Transform };
@@ -54,6 +67,10 @@ pub const Arch = union(enum) {
     nemotron_h: nemotron_h.Hparams,
     qwen3next: qwen3next.Hparams,
     qwen4exp: qwen4exp.Hparams,
+    qwen3: qwen3.Hparams,
+    flint: flint.Hparams,
+    muse_glimmer: muse_glimmer.Hparams,
+    deepseek41: deepseek41.Hparams,
 
     /// error.UnsupportedArch for anything not in the table.
     pub fn read(f: *const gguf.File) !Arch {
@@ -66,6 +83,10 @@ pub const Arch = union(enum) {
         if (nemotron_h.handles(name)) return .{ .nemotron_h = try nemotron_h.Hparams.read(f, name) };
         if (std.mem.eql(u8, name, qwen3next.arch_name)) return .{ .qwen3next = try qwen3next.Hparams.read(f) };
         if (std.mem.eql(u8, name, qwen4exp.arch_name)) return .{ .qwen4exp = try qwen4exp.Hparams.read(f) };
+        if (qwen3.handles(name)) return .{ .qwen3 = try qwen3.Hparams.read(f, name) };
+        if (std.mem.eql(u8, name, flint.arch_name)) return .{ .flint = try flint.Hparams.read(f) };
+        if (std.mem.eql(u8, name, muse_glimmer.arch_name)) return .{ .muse_glimmer = try muse_glimmer.Hparams.read(f) };
+        if (std.mem.eql(u8, name, deepseek41.arch_name)) return .{ .deepseek41 = try deepseek41.Hparams.read(f) };
         return error.UnsupportedArch;
     }
 
@@ -80,6 +101,10 @@ pub const Arch = union(enum) {
             .nemotron_h => |hp| nemotron_h.configJson(allocator, hp),
             .qwen3next => |hp| qwen3next.configJson(allocator, hp),
             .qwen4exp => |hp| qwen4exp.configJson(allocator, hp),
+            .qwen3 => |hp| qwen3.configJson(allocator, hp),
+            .flint => |hp| flint.configJson(allocator, hp),
+            .muse_glimmer => |hp| muse_glimmer.configJson(allocator, hp),
+            .deepseek41 => |hp| deepseek41.configJson(allocator, hp),
         };
     }
 
@@ -95,17 +120,29 @@ pub const Arch = union(enum) {
             .nemotron_h => |hp| nemotron_h.mapTensor(buf, name, hp),
             .qwen3next => |hp| qwen3next.mapTensor(buf, name, hp),
             .qwen4exp => |hp| qwen4exp.mapTensor(buf, name, hp),
+            .qwen3 => |hp| qwen3.mapTensor(buf, name, hp),
+            .flint => |hp| flint.mapTensor(buf, name, hp),
+            .muse_glimmer => |hp| muse_glimmer.mapTensor(buf, name, hp),
+            .deepseek41 => |hp| deepseek41.mapTensor(buf, name, hp),
         };
     }
 
-    /// Affine-coded tensors load in MLX's affine layout (`affine.zig`): the model's own kernels are affine-keyed.
-    pub fn affineKernels(self: Arch) bool {
-        return self == .qwen4exp;
+    /// Whether the loader serves the mapped tensor `name` at `ty`; the affine-coded types load in MLX's affine layout
+    /// (`transcodes`). DeepSeek-V4.1's forward reads raw ggml blocks only in its routed-expert gathers, so another
+    /// tensor of a type that stays raw is refused here, by name, instead of failing the first request.
+    pub fn serves(self: Arch, name: []const u8, ty: @import("quants.zig").GgmlType) bool {
+        if (!ty.supported()) return false;
+        if (self != .deepseek41 or !ty.isQuantized() or self.transcodes(ty)) return true;
+        return std.mem.indexOf(u8, name, ".ffn.experts.") != null;
     }
 
-    /// Whether this arch's loader serves `ty`: Q2_0 has no ggml kernel here, only its affine layout reads it.
-    pub fn serves(self: Arch, ty: @import("quants.zig").GgmlType) bool {
-        return ty.supported() and (ty != .q2_0 or self.affineKernels());
+    /// Whether `ty` loads in an MLX layout and runs on MLX's own kernels: MXFP4 as mxfp4, the affine-coded types as
+    /// affine (`affine.zig`). Q8_0's copy grows by its bias (a dense Q8_0 decode is bandwidth-bound), so it keeps its
+    /// blocks except where the model's fused kernels are affine-keyed.
+    pub fn transcodes(self: Arch, ty: @import("quants.zig").GgmlType) bool {
+        if (ty == .mxfp4) return true;
+        if (@import("affine.zig").bitsOf(ty) == null) return false;
+        return ty != .q8_0 or self == .qwen4exp or self == .deepseek41;
     }
 
     /// The GatedDeltaNet geometry the un-tiling transforms read (zeroes for an arch that has none).
@@ -135,12 +172,20 @@ pub fn splitLayer(name: []const u8, n_layers: u32) ?struct { layer: u32, leaf: [
     return .{ .layer = layer, .leaf = rest[dot + 1 ..] };
 }
 
-test "Q2_0 is served only where it loads as affine" {
-    const qwen4: Arch = .{ .qwen4exp = std.mem.zeroes(qwen4exp.Hparams) };
+test "MXFP4 and the affine-coded types transcode for every arch, Q8_0 only where the fused kernels are affine-keyed" {
     const qwen: Arch = .{ .qwen35 = std.mem.zeroes(qwen35.Hparams) };
-    try std.testing.expect(qwen4.serves(.q2_0) and qwen4.serves(.iq4_xs));
-    try std.testing.expect(!qwen.serves(.q2_0) and qwen.serves(.q4_k));
-    try std.testing.expect(!qwen4.serves(@fromBackingInt(@intCast(144))));
+    const qwen4: Arch = .{ .qwen4exp = std.mem.zeroes(qwen4exp.Hparams) };
+    try std.testing.expect(qwen.serves("head.weight", .q2_0) and qwen.serves("head.weight", .iq4_xs) and qwen.serves("head.weight", .q4_k));
+    try std.testing.expect(!qwen.serves("head.weight", @fromBackingInt(@intCast(144))));
+    try std.testing.expect(qwen.transcodes(.q4_k) and qwen.transcodes(.q2_0) and !qwen.transcodes(.q8_0) and !qwen.transcodes(.iq4_nl));
+    try std.testing.expect(qwen4.transcodes(.q8_0) and !qwen4.transcodes(.q6_k) and qwen.transcodes(.mxfp4));
+}
+
+test "DeepSeek-V4.1 reads raw ggml blocks only in its routed experts: another tensor of a type that stays raw is refused" {
+    const ds: Arch = .{ .deepseek41 = std.mem.zeroes(deepseek41.Hparams) };
+    try std.testing.expect(ds.serves("layers.0.ffn.experts.w1.weight", .iq2_xxs) and ds.serves("layers.0.ffn.experts.w2.weight", .q6_k));
+    try std.testing.expect(ds.serves("layers.0.attn.wq_a.weight", .q5_k) and ds.serves("layers.0.attn.wq_b.weight", .bf16));
+    try std.testing.expect(!ds.serves("head.weight", .q6_k) and !ds.serves("layers.0.ffn.shared_experts.w1.weight", .iq2_xxs));
 }
 
 test {
@@ -152,4 +197,8 @@ test {
     _ = nemotron_h;
     _ = qwen3next;
     _ = qwen4exp;
+    _ = qwen3;
+    _ = flint;
+    _ = muse_glimmer;
+    _ = deepseek41;
 }

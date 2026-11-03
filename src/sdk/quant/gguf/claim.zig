@@ -16,6 +16,9 @@ pub const kernels = gguf.kernels;
 const ClaimState = struct {
     /// Opt-in (`--mlx-gguf`); `--engine ds4|llama` keeps it off.
     enabled: bool = false,
+    /// Test hook: off, every tensor keeps its ggml blocks and every A_log the file's dtype, the weights the GGUF-file
+    /// proofs' tapes were recorded over (`plugins/lfm2/proof.zig` `openGguf`).
+    mlx_layouts: bool = true,
 };
 pub const claimState_shared = @import("../../util/shared.zig").Shared(ClaimState, "gguf_claim", .{});
 pub inline fn claimState() *ClaimState {
@@ -68,7 +71,7 @@ pub fn weightBytes(io: std.Io, model_dir: []const u8) ?u64 {
     defer allocator.free(path);
     var f = gguf.gguf.File.open(allocator, path) catch return null;
     defer f.deinit();
-    var bytes = gguf.weights.residentBytes(&f) catch return null;
+    var bytes = (gguf.weights.residentBytes(&f) catch return null) + gguf.weights.qwen35MtpBytes(&f);
     if (mtpHead(io, allocator, &f, path)) |head| {
         defer allocator.free(head);
         var h = gguf.gguf.File.open(allocator, head) catch return bytes;

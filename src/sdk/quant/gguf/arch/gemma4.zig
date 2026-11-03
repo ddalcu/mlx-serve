@@ -1,5 +1,6 @@
 //! Gemma 4 (GGUF arch "gemma4"): E2B / E4B with per-layer embeddings (PLE) and
-//! shared-KV layers, and the dense 12B+ whose full-attention layers reuse K as V.
+//! shared-KV layers, the dense 12B+ whose full-attention layers reuse K as V, and
+//! the 26B-A4B whose layers add routed experts beside the dense MLP.
 //! The GGUF stores every tensor exactly like the HF checkpoint (no norm offset,
 //! no head reorder), so loading is a rename.
 const std = @import("std");
@@ -39,6 +40,10 @@ pub const Hparams = struct {
     eos: Eos,
     /// Full-attention layers have no v_proj, V = K.
     k_eq_v: bool,
+    /// Routed experts (0 = dense), experts per token and the expert MLP width.
+    n_experts: u32,
+    n_experts_used: u32,
+    expert_ffn: u32,
 
     pub fn read(f: *const gguf.File) !Hparams {
         const n_layers = try arch.u32Key(f, "gemma4.block_count");
@@ -74,6 +79,9 @@ pub const Hparams = struct {
             .vocab = @intCast((f.getArray("tokenizer.ggml.tokens") orelse return error.MissingMetadata).len),
             .eos = try Eos.read(f),
             .k_eq_v = f.tensors.get(full_v) == null,
+            .n_experts = if (f.getInt("gemma4.expert_count") != null) try arch.u32Key(f, "gemma4.expert_count") else 0,
+            .n_experts_used = if (f.getInt("gemma4.expert_used_count") != null) try arch.u32Key(f, "gemma4.expert_used_count") else 0,
+            .expert_ffn = if (f.getInt("gemma4.expert_feed_forward_length") != null) try arch.u32Key(f, "gemma4.expert_feed_forward_length") else 0,
         };
     }
 
@@ -112,7 +120,7 @@ const Eos = struct {
     }
 };
 
-/// The 12B+ dense models are HF's `gemma4_unified`, the PLE ones plain `gemma4`.
+/// The 12B+ dense models are HF's `gemma4_unified`, the PLE ones and the 26B-A4B plain `gemma4`.
 pub fn configJson(allocator: std.mem.Allocator, hp: Hparams) ![]u8 {
     var layer_types: std.ArrayList(u8) = .empty;
     defer layer_types.deinit(allocator);
@@ -124,12 +132,16 @@ pub fn configJson(allocator: std.mem.Allocator, hp: Hparams) ![]u8 {
     defer eos.deinit(allocator);
     for (hp.eos.ids[0..hp.eos.len], 0..) |id, i| try eos.print(allocator, "{s}{d}", .{ if (i > 0) "," else "", id });
 
-    const unified = hp.ple_dim == 0;
+    const unified = hp.ple_dim == 0 and hp.n_experts == 0;
+    var moe_buf: [160]u8 = undefined;
+    const moe = if (hp.n_experts > 0) std.fmt.bufPrint(&moe_buf,
+        \\"enable_moe_block":true,"num_experts":{d},"top_k_experts":{d},"moe_intermediate_size":{d},
+    , .{ hp.n_experts, hp.n_experts_used, hp.expert_ffn }) catch unreachable else "\"enable_moe_block\":false,";
     return std.fmt.allocPrint(allocator,
         \\{{"architectures":["{[architecture]s}"],"model_type":"{[model_type]s}","tie_word_embeddings":true,
         \\"eos_token_id":[{[eos]s}],"quantization":{{"group_size":32,"bits":4,"mode":"gguf"}},
         \\"text_config":{{"model_type":"{[model_type]s}_text","attention_bias":false,"attention_k_eq_v":{[k_eq_v]},"dtype":"bfloat16",
-        \\"enable_moe_block":false,"final_logit_softcapping":{[softcap]d},"global_head_dim":{[global_head_dim]d},"head_dim":{[head_dim]d},
+        \\{[moe]s}"final_logit_softcapping":{[softcap]d},"global_head_dim":{[global_head_dim]d},"head_dim":{[head_dim]d},
         \\"hidden_activation":"gelu_pytorch_tanh","hidden_size":{[hidden]d},"hidden_size_per_layer_input":{[ple_dim]d},
         \\"intermediate_size":{[ffn]d},"layer_types":[{[layer_types]s}],"max_position_embeddings":{[ctx_len]d},
         \\"num_attention_heads":{[n_heads]d},"num_global_key_value_heads":{[n_global_kv_heads]d},"num_hidden_layers":{[n_layers]d},
@@ -143,6 +155,7 @@ pub fn configJson(allocator: std.mem.Allocator, hp: Hparams) ![]u8 {
         .model_type = if (unified) "gemma4_unified" else "gemma4",
         .eos = eos.items,
         .k_eq_v = hp.k_eq_v,
+        .moe = moe,
         .softcap = hp.softcap,
         .global_head_dim = hp.global_head_dim,
         .head_dim = hp.head_dim,
@@ -179,6 +192,11 @@ pub fn mapTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
     if (std.mem.eql(u8, name, "rope_freqs.weight")) return arch.skip;
 
     const blk = arch.splitLayer(name, hp.n_layers) orelse return null;
+    // The experts' gate and up rows as one bank, gate rows first (HF's `gate_up_proj`).
+    if (std.mem.eql(u8, blk.leaf, "ffn_gate_up_exps.weight")) return .{
+        .name = std.fmt.bufPrint(buf, prefix ++ "layers.{d}.experts.switch_glu.gate_proj.weight", .{blk.layer}) catch return null,
+        .transform = .split_gate_up,
+    };
     const table = [_]struct { []const u8, []const u8 }{
         .{ "attn_norm.weight", "input_layernorm.weight" },
         .{ "attn_q.weight", "self_attn.q_proj.weight" },
@@ -197,6 +215,15 @@ pub fn mapTensor(buf: []u8, name: []const u8, hp: Hparams) ?arch.Mapped {
         .{ "inp_gate.weight", "per_layer_input_gate.weight" },
         .{ "proj.weight", "per_layer_projection.weight" },
         .{ "post_norm.weight", "post_per_layer_input_norm.weight" },
+        .{ "ffn_gate_inp.weight", "router.proj.weight" },
+        .{ "ffn_gate_inp.scale", "router.scale" },
+        .{ "ffn_down_exps.scale", "router.per_expert_scale" },
+        .{ "ffn_gate_exps.weight", "experts.switch_glu.gate_proj.weight" },
+        .{ "ffn_up_exps.weight", "experts.switch_glu.up_proj.weight" },
+        .{ "ffn_down_exps.weight", "experts.switch_glu.down_proj.weight" },
+        .{ "pre_ffw_norm_2.weight", "pre_feedforward_layernorm_2.weight" },
+        .{ "post_ffw_norm_1.weight", "post_feedforward_layernorm_1.weight" },
+        .{ "post_ffw_norm_2.weight", "post_feedforward_layernorm_2.weight" },
     };
     for (table) |row| if (std.mem.eql(u8, blk.leaf, row[0])) {
         const full = std.fmt.bufPrint(buf, prefix ++ "layers.{d}.{s}", .{ blk.layer, row[1] }) catch return null;
@@ -215,7 +242,21 @@ test "mapTensor renames layers, PLE tensors and skips the rope table" {
     try std.testing.expectEqualStrings("language_model.model.embed_tokens_per_layer.weight", mapTensor(&buf, "per_layer_token_embd.weight", hp).?.name);
     try std.testing.expectEqualStrings("", mapTensor(&buf, "rope_freqs.weight", hp).?.name);
     try std.testing.expect(mapTensor(&buf, "blk.4.attn_q.weight", hp) == null);
-    try std.testing.expect(mapTensor(&buf, "blk.0.ffn_gate_inp.weight", hp) == null);
+    try std.testing.expect(mapTensor(&buf, "blk.0.ffn_gate_up.weight", hp) == null);
+}
+
+test "mapTensor: the 26B-A4B's router, per-expert scale, banks and second-MLP norms" {
+    var hp = std.mem.zeroes(Hparams);
+    hp.n_layers = 30;
+    var buf: [128]u8 = undefined;
+    const gu = mapTensor(&buf, "blk.2.ffn_gate_up_exps.weight", hp).?;
+    try std.testing.expectEqualStrings("language_model.model.layers.2.experts.switch_glu.gate_proj.weight", gu.name);
+    try std.testing.expect(gu.transform == .split_gate_up);
+    try std.testing.expectEqualStrings("language_model.model.layers.0.router.per_expert_scale", mapTensor(&buf, "blk.0.ffn_down_exps.scale", hp).?.name);
+    try std.testing.expectEqualStrings("language_model.model.layers.0.router.scale", mapTensor(&buf, "blk.0.ffn_gate_inp.scale", hp).?.name);
+    try std.testing.expectEqualStrings("language_model.model.layers.0.router.proj.weight", mapTensor(&buf, "blk.0.ffn_gate_inp.weight", hp).?.name);
+    try std.testing.expectEqualStrings("language_model.model.layers.29.experts.switch_glu.down_proj.weight", mapTensor(&buf, "blk.29.ffn_down_exps.weight", hp).?.name);
+    try std.testing.expectEqualStrings("language_model.model.layers.1.post_feedforward_layernorm_2.weight", mapTensor(&buf, "blk.1.post_ffw_norm_2.weight", hp).?.name);
 }
 
 test "configJson is valid JSON for the PLE and the unified flavour" {
@@ -252,4 +293,17 @@ test "configJson is valid JSON for the PLE and the unified flavour" {
     defer up.deinit();
     try std.testing.expectEqualStrings("gemma4_unified_text", up.value.object.get("text_config").?.object.get("model_type").?.string);
     try std.testing.expect(up.value.object.get("text_config").?.object.get("attention_k_eq_v").?.bool);
+
+    hp.n_experts = 128;
+    hp.n_experts_used = 8;
+    hp.expert_ffn = 704;
+    const moe = try configJson(a, hp);
+    defer a.free(moe);
+    const mp = try std.json.parseFromSlice(std.json.Value, a, moe, .{});
+    defer mp.deinit();
+    const mtc = mp.value.object.get("text_config").?.object;
+    try std.testing.expectEqualStrings("gemma4_text", mtc.get("model_type").?.string);
+    try std.testing.expect(mtc.get("enable_moe_block").?.bool);
+    try std.testing.expectEqual(@as(i64, 8), mtc.get("top_k_experts").?.integer);
+    try std.testing.expectEqual(@as(i64, 704), mtc.get("moe_intermediate_size").?.integer);
 }

@@ -289,6 +289,7 @@ pub const Trunk = struct {
     pub const moeFp4Decode = @import("trunk/moe.zig").moeFp4Decode;
     pub const moeMLP2 = @import("trunk/moe.zig").moeMLP2;
     pub const useGatherQmvDecode = @import("trunk/moe.zig").useGatherQmvDecode;
+    pub const ggufSwiGLU = @import("trunk/moe.zig").ggufSwiGLU;
     pub const scaleExperts = @import("trunk/moe.zig").scaleExperts;
     pub const computeMoeRouting = @import("trunk/moe.zig").computeMoeRouting;
     pub const moeRoutingUncompiled = @import("trunk/moe.zig").moeRoutingUncompiled;

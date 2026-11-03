@@ -19,6 +19,7 @@ const embedding = @import("../../sdk/blocks/embedding.zig");
 const verify_qmm_nax = @import("../../sdk/blocks/linear/verify_qmm_nax.zig");
 const gather_qmv = @import("../../sdk/blocks/moe/gather_qmv.zig");
 const params = @import("../../sdk/quant/params.zig");
+const gguf_kernels = @import("../../sdk/quant/gguf/kernels.zig");
 const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../sdk/util/log.zig");
 const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
@@ -685,6 +686,8 @@ fn getOpt(w: *const Weights, comptime fmt: []const u8, args: anytype) ?A {
 fn getLin(w: *const Weights, in_dim: usize, comptime base: []const u8, args: anytype) !Lin {
     const wt = try getW(w, base ++ ".weight", args);
     const sc = getOpt(w, base ++ ".scales", args) orelse return .{ .w = wt };
+    // A `--mlx-gguf` set's routed experts stay raw ggml blocks beside their type sentinel (`sdk/quant/gguf`).
+    if (gguf_kernels.infoOf(wt, sc) != null) return .{ .w = wt, .s = sc, .qp = .{ .bits = 0, .group_size = 0, .mode = .gguf } };
     const bi = getOpt(w, base ++ ".biases", args) orelse none;
     const qp = params.quantParamsFromGeometry(wt, sc, bi.ctx != null, @intCast(in_dim)) orelse {
         var buf: NameBuf = undefined;
@@ -788,7 +791,7 @@ fn loadHc(m: *Dsv41Model, w: *const Weights, comptime pfx: []const u8, li: usize
 /// `a` and `b` (same quantized format) as one array of their rows stacked
 /// along `axis`; the originals released (owned, or the weights map's).
 fn fuseRows(m: *Dsv41Model, w: *Weights, a: Lin, b: Lin, axis: c_int) !?Lin {
-    if (a.s.ctx == null or b.s.ctx == null or a.qp.bits != b.qp.bits or a.qp.group_size != b.qp.group_size or a.qp.mode != b.qp.mode or (a.b.ctx == null) != (b.b.ctx == null)) return null;
+    if (a.s.ctx == null or b.s.ctx == null or a.qp.mode == .gguf or a.qp.bits != b.qp.bits or a.qp.group_size != b.qp.group_size or a.qp.mode != b.qp.mode or (a.b.ctx == null) != (b.b.ctx == null)) return null;
     var out: Lin = .{ .w = none, .qp = a.qp };
     inline for (.{ "w", "s", "b" }) |f| {
         const x = @field(a, f);
@@ -1604,7 +1607,8 @@ fn droppedBytes(gpa: std.mem.Allocator, dir_path: []const u8, dspark: bool, visi
     defer arena.deinit();
     const a = arena.allocator();
     const io = std.Io.Threaded.global_single_threaded.io();
-    var dir = try std.Io.Dir.cwd().openDir(io, dir_path, .{});
+    // A `--mlx-gguf` set is its file: its loader keeps only what it serves.
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{}) catch |e| return if (e == error.NotDir) 0 else e;
     defer dir.close(io);
     const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20)) catch return 0;
     const idx = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return 0;
@@ -1658,10 +1662,11 @@ fn initEngram(m: *Dsv41Model, w: *const Weights, dir: []const u8) !void {
     const cols = m.hash.?.cols();
     for (0..n) |k| {
         const l: usize = c.dsv41_engram_layers[k];
-        const qw = try getW(w, "layers.{d}.engram.q_weight", .{l});
-        const kw = try getW(w, "layers.{d}.engram.k_weight", .{l});
+        // The re-split GGUF ships the product folded (`qk`, f32); the others the two vectors.
         var prod = mlx.mlx_array_new();
-        {
+        if (getOpt(w, "layers.{d}.engram.qk", .{l})) |qk| try mlx.check(mlx.mlx_astype(&prod, qk, .float32, m.s)) else {
+            const qw = try getW(w, "layers.{d}.engram.q_weight", .{l});
+            const kw = try getW(w, "layers.{d}.engram.k_weight", .{l});
             var q32 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q32);
             var k32 = mlx.mlx_array_new();
@@ -2858,6 +2863,7 @@ fn indexerFused(sc: *Scope, m: *Dsv41Model, li: usize, w: A, q: A, keys: A, p0: 
 // ── MoE ──────────────────────────────────────────────────────────────────
 
 pub fn gatherMm(sc: *Scope, x: A, b: *const Bank, lhs: A, idx: A, sorted: bool) !A {
+    if (b.qp.mode == .gguf) return sc.keep(try gguf_kernels.gatherLinear(gguf_kernels.infoOf(b.w, b.s).?, x, b.w, lhs, idx, sorted, sc.s));
     var o = mlx.mlx_array_new();
     if (b.s.ctx == null) return sc.res(mlx.mlx_gather_mm(&o, x, try sc.transpose(b.w, &.{ 0, 2, 1 }), lhs, idx, sorted, sc.s), &o);
     return sc.res(mlx.mlx_gather_qmm(&o, x, b.w, b.s, b.b, lhs, idx, true, mlx.mlx_optional_int.some(@intCast(b.qp.group_size)), mlx.mlx_optional_int.some(@intCast(b.qp.bits)), b.qp.mode.cstr(), sorted, sc.s), &o);

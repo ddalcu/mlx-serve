@@ -211,3 +211,22 @@ pub fn trunkWeight(l: *const Linear, out: *quant_abi.Weight) abi.Verdict {
 pub fn failed(e: anyerror) abi.Verdict {
     return .{ .code = .failed, .why = abi.Str.of(@errorName(e)) };
 }
+
+test "a GGUF's float projection (ISTA's GDN a/b in BF16) loads dense beside its block-quantized ones" {
+    const testing = std.testing;
+    const resident = @import("../../sdk/weights/resident.zig");
+    const s = mlx.gpuStream();
+    var w = resident.Weights.init(testing.allocator);
+    const ones: [32]u16 = @splat(0x3f80);
+    try w.put("m.a.weight", mlx.mlx_array_new_data(&ones, &[_]c_int{ 4, 8 }, 2, .bfloat16));
+    var res = resident.Resident.adopt(w);
+    defer res.deinit();
+    const src = res.source();
+    var r: Reader = undefined;
+    try r.open(&src, "{\"group_size\":32,\"bits\":4,\"mode\":\"gguf\"}", "m", s);
+    defer r.close();
+    const l = try r.proj("m.a", 8);
+    defer _ = mlx.mlx_array_free(l.w);
+    try testing.expect(l.s.ctx == null);
+    try testing.expectEqualSlices(c_int, &.{ 8, 4 }, mlx.getShape(l.w));
+}

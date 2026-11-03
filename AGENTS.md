@@ -111,8 +111,9 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 Dispatch on `config.json` `model_type`: the first plugin whose `config.zig` claims it serves it (`build/plugins.zig`
 registry). Each plugin's `AGENTS.md` holds its rules, quirks, packs and oracles (`src/plugins/<name>/AGENTS.md`; the
 name column below is the folder). With `--mlx-gguf` (opt-in, experimental) a GGUF that `sdk/quant/gguf/claim.zig`
-`servablePath` accepts (arch `qwen35`/`qwen35moe`/`gemma4`/`qwen4exp`, every tensor type known; a split set opens
-from its first shard) runs on the MLX path as the matching arch; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header
+`servablePath` accepts (arch `qwen3(moe)`/`qwen35(moe)`/`qwen3next`/`qwen4exp`/`gemma3`/`gemma4`/`gpt-oss`/`lfm2(moe)`/
+`nemotron_h(_moe)`/`flint`/`muse-glimmer`/`deepseek41`, every tensor type known; a split set opens from its first
+shard) runs on the MLX path as the matching plugin; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header
 (`engine_pick.preferredEngine`: antirez DSV4-Flash + the ds4-only archs `deepseek41`/`qwen4exp`/`glm-dsa`/`glm5-next`
 → ds4, else llama.cpp); a SPLIT GGUF (`split.count` > 1) always → llama.cpp (ds4 `exit()`s on a missing shard). ds4
 DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDraftTokens() > 1`, not `hasMtp()`).

@@ -145,7 +145,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         s.context_cap = if (s.max_position_embeddings == 0) window else @min(window, s.max_position_embeddings);
     }
     for (terminators) |t| if (std.mem.indexOfScalar(u32, s.eos[0..s.eos_count], t) == null) generation.addEos(s, t);
-    c.quant = readQuant(root) catch return unsupported("the quantization block");
+    c.quant = llama.readQuant(root) catch return unsupported("the quantization block");
     s.quant = c.quant;
     if (!stub) generation.apply(dir, s);
 
@@ -158,15 +158,6 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     p.private = cfg_out;
     out.* = p;
     return .ok;
-}
-
-/// The quantization block; a `--mlx-gguf` file's rebuilt config says `mode: gguf` (each tensor's block type rides its
-/// sentinel, `sdk/quant/gguf`).
-fn readQuant(cfg: std.json.ObjectMap) error{Unsupported}!abi.Quant {
-    if (field(cfg, "quantization")) |q| if (q == .object) if (field(q.object, "mode")) |m| if (m == .string and std.mem.eql(u8, m.string, "gguf")) {
-        return .{ .bits = 4, .group_size = 32, .mode = .gguf };
-    };
-    return llama.readQuant(cfg);
 }
 
 pub fn freeParsed(p: *abi.Parsed) callconv(.c) void {

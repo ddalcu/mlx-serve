@@ -1,6 +1,7 @@
 //! Zero-copy GGUF reader: the file is mmapped, metadata strings, arrays and
 //! tensor data are all slices into the map.
 const std = @import("std");
+const builtin = @import("builtin");
 const env = @import("../../../env.zig");
 const quants = @import("quants.zig");
 const GgmlType = quants.GgmlType;
@@ -196,6 +197,39 @@ pub const File = struct {
             if (at >= base and at + t.data.len <= base + m.len) return .{ .path = path, .offset = at - base, .tensor = t };
         }
         return null;
+    }
+
+    /// Tensor `name`'s bytes read past the page cache (`F_NOCACHE`); null off macOS or for an unmapped file. macOS
+    /// keeps a read file's pages (no madvise or msync drops them) and compresses the loader's copies first: a set
+    /// that fills most of RAM swapped at load when the loader read the mapping. The read is page-aligned (an
+    /// unaligned one went through the cache); `data` lies inside `buf`, which the caller frees.
+    pub const Uncached = struct { buf: []align(std.heap.page_size_max) u8, data: []const u8 };
+
+    pub fn readUncached(self: *const File, allocator: std.mem.Allocator, name: []const u8) !?Uncached {
+        if (comptime !builtin.os.tag.isDarwin()) return null;
+        const at = self.locate(name) orelse return null;
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        if (at.path.len >= pbuf.len) return error.NameTooLong;
+        @memcpy(pbuf[0..at.path.len], at.path);
+        pbuf[at.path.len] = 0;
+        const fd = std.c.open(pbuf[0..at.path.len :0], .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return error.FileNotFound;
+        defer _ = std.c.close(fd);
+        _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
+        const page = std.heap.page_size_max;
+        const lo = std.mem.alignBackward(usize, at.offset, page);
+        const hi = std.mem.alignForward(usize, at.offset + at.tensor.data.len, page);
+        const buf = try allocator.alignedAlloc(u8, .fromByteUnits(page), hi - lo);
+        errdefer allocator.free(buf);
+        var done: usize = 0;
+        while (done < buf.len) {
+            const n = std.c.pread(fd, buf.ptr + done, @min(buf.len - done, 64 << 20), @intCast(lo + done));
+            if (n < 0) return error.ReadFailed;
+            if (n == 0) break; // the file's last page
+            done += @intCast(n);
+        }
+        if (done < at.offset - lo + at.tensor.data.len) return error.ReadFailed;
+        return .{ .buf = buf, .data = buf[at.offset - lo ..][0..at.tensor.data.len] };
     }
 
     fn mapFile(path: []const u8) ![]align(std.heap.page_size_min) const u8 {
@@ -450,6 +484,10 @@ test "open follows a split set from its first shard, and refuses a missing sibli
     try std.testing.expect(std.mem.endsWith(u8, at.path, "m-00003-of-00003.gguf"));
     try std.testing.expectEqual(@as(usize, 2), at.tensor.data[0]);
     try std.testing.expectEqual(@as(usize, 0), at.offset % 32);
+    if (try f.readUncached(std.testing.allocator, "t2")) |r| {
+        defer std.testing.allocator.free(r.buf);
+        try std.testing.expectEqualSlices(u8, f.tensors.get("t2").?.data, r.data);
+    }
 
     try tmp.dir.deleteFile(io, "m-00003-of-00003.gguf");
     try std.testing.expectError(error.FileNotFound, File.open(std.testing.allocator, first));

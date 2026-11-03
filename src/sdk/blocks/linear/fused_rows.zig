@@ -49,6 +49,7 @@ pub fn fuseRowGroup(parts: []const [3]*mlx.mlx_array, s: mlx.mlx_stream) !?Fused
     const w0 = parts[0][0].*;
     const s0 = parts[0][1].*;
     if (w0.ctx == null or s0.ctx == null) return null;
+    if (mlx.mlx_array_dtype(s0) == .bool_) return fuseGgufRows(parts, s);
     const have_b = parts[0][2].ctx != null;
     const wsh0 = mlx.getShape(w0);
     const ssh0 = mlx.getShape(s0);
@@ -112,6 +113,57 @@ pub fn fuseRowGroup(parts: []const [3]*mlx.mlx_array, s: mlx.mlx_stream) !?Fused
             try mlx.check(mlx.mlx_slice(&view, src, &lo, 2, &hi, 2, &st, 2, s));
             p[which].* = view;
         }
+        start = stop;
+    }
+    return fused;
+}
+
+/// A GGUF group (`sdk/quant/gguf`: raw ggml rows beside a bool sentinel naming their block type): parts of ONE type
+/// join their rows into one weight beside one sentinel; each part keeps a row view and its own sentinel handle, so
+/// the caller's release of the originals stays right.
+fn fuseGgufRows(parts: []const [3]*mlx.mlx_array, s: mlx.mlx_stream) !?FusedRows {
+    const sh0 = mlx.getShape(parts[0][1].*);
+    const cols0 = mlx.getShape(parts[0][0].*)[mlx.getShape(parts[0][0].*).len - 1];
+    // A tiled input (a 3-axis sentinel) never shares a row group.
+    if (sh0.len != 1) return null;
+    var widths: [4]c_int = @splat(0);
+    var arrs: [4]mlx.mlx_array = undefined;
+    for (parts, 0..) |p, i| {
+        const w = p[0].*;
+        const sc = p[1].*;
+        if (w.ctx == null or sc.ctx == null or p[2].ctx != null) return null;
+        if (mlx.mlx_array_dtype(sc) != .bool_ or mlx.mlx_array_dtype(w) != .uint8) return null;
+        const sh = mlx.getShape(sc);
+        const wsh = mlx.getShape(w);
+        if (sh.len != 1 or sh[0] != sh0[0] or wsh.len != 2 or wsh[1] != cols0) return null;
+        widths[i] = wsh[0];
+        arrs[i] = w;
+    }
+    var fused = FusedRows{ .widths = widths, .count = @intCast(parts.len) };
+    {
+        const vec = mlx.mlx_vector_array_new_data(&arrs, parts.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var joined = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(joined);
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 0, s));
+        fused.w = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(fused.w);
+        try mlx.check(mlx.mlx_contiguous(&fused.w, joined, false, s));
+        try mlx.check(mlx.mlx_array_eval(fused.w));
+    }
+    errdefer _ = mlx.mlx_array_free(fused.w);
+    fused.s = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(fused.s);
+    try mlx.check(mlx.mlx_array_set(&fused.s, parts[0][1].*));
+    var start: c_int = 0;
+    for (parts, 0..) |p, i| {
+        const stop = start + widths[i];
+        var view = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&view, fused.w, &[_]c_int{ start, 0 }, 2, &[_]c_int{ stop, cols0 }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        p[0].* = view;
+        var own = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&own, p[1].*));
+        p[1].* = own;
         start = stop;
     }
     return fused;
@@ -345,4 +397,41 @@ test "joinableCols: a KDA q/k/v trio joins only when all three are quantized ali
     try t.expect(!joinableCols(&[_]c_int{ 384, 192, 192 }));
     try t.expect(!joinableCols(&[_]c_int{ 192, 192, 96 }));
     try t.expect(!joinableCols(&[_]c_int{}));
+}
+
+test "a GGUF group joins raw rows of one block type, each part a view beside its own sentinel; mixed types decline" {
+    const s = mlx.gpuStream();
+    const Sentinel = struct {
+        fn of(ty_id: c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&out, &[_]c_int{ty_id}, 1, .bool_, st));
+            return out;
+        }
+    };
+    var bytes: [6 * 34]u8 = undefined;
+    for (&bytes, 0..) |*b, i| b.* = @intCast(i % 251);
+    var w = [_]mlx.mlx_array{ mlx.mlx_array_new_data(&bytes, &[_]c_int{ 2, 34 }, 2, .uint8), mlx.mlx_array_new_data(bytes[68..].ptr, &[_]c_int{ 4, 34 }, 2, .uint8) };
+    var sc = [_]mlx.mlx_array{ try Sentinel.of(9, s), try Sentinel.of(9, s) };
+    var bi = [_]mlx.mlx_array{ .{ .ctx = null }, .{ .ctx = null } };
+    const parts = [_][3]*mlx.mlx_array{ .{ &w[0], &sc[0], &bi[0] }, .{ &w[1], &sc[1], &bi[1] } };
+    const originals = [_]mlx.mlx_array{ w[0], w[1], sc[0], sc[1] };
+    const fused = (try fuseRowGroup(&parts, s)).?;
+    // The caller releases the originals (`ld.join`): every part still holds its own handles.
+    for (originals) |a| _ = mlx.mlx_array_free(a);
+    defer for ([_]mlx.mlx_array{ fused.w, fused.s, w[0], w[1], sc[0], sc[1] }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    try testing.expectEqualSlices(c_int, &.{ 6, 34 }, mlx.getShape(fused.w));
+    try testing.expectEqualSlices(c_int, &.{ 2, 4 }, fused.widths[0..2]);
+    try testing.expectEqualSlices(c_int, &.{9}, mlx.getShape(sc[1]));
+    try mlx.check(mlx.mlx_array_eval(w[1]));
+    try testing.expectEqualSlices(u8, bytes[68..][0 .. 4 * 34], (mlx.mlx_array_data_uint8(w[1]) orelse return error.NoData)[0 .. 4 * 34]);
+
+    var w2 = [_]mlx.mlx_array{ mlx.mlx_array_new_data(&bytes, &[_]c_int{ 2, 34 }, 2, .uint8), mlx.mlx_array_new_data(&bytes, &[_]c_int{ 2, 34 }, 2, .uint8) };
+    var sc2 = [_]mlx.mlx_array{ try Sentinel.of(9, s), try Sentinel.of(3, s) };
+    defer for ([_]mlx.mlx_array{ w2[0], w2[1], sc2[0], sc2[1] }) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const mixed = [_][3]*mlx.mlx_array{ .{ &w2[0], &sc2[0], &bi[0] }, .{ &w2[1], &sc2[1], &bi[1] } };
+    try testing.expect(try fuseRowGroup(&mixed, s) == null);
 }

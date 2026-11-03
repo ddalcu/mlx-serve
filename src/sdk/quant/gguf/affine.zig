@@ -1,7 +1,8 @@
 //! GGUF block types that ARE an affine code: every group of weights (32; 64 for Q2_0) shares one (scale, bias) and
 //! w = scale * q + bias for an unsigned q. Such a tensor moves into MLX's affine layout (`mx.quantize` packing) without
-//! requantizing: the codes stay, only the scales round to bf16. The loader does it where the model's own kernels
-//! are affine-keyed (arch/qwen4exp.zig); every other type keeps its ggml blocks.
+//! requantizing: the codes stay, only the scales round to bf16. The loader does it where `Arch.transcodes` says (Q8_0
+//! only where the fused kernels are affine-keyed), so those tensors run on MLX's own affine kernels; every other type
+//! keeps its ggml blocks.
 const std = @import("std");
 const quants = @import("quants.zig");
 const GgmlType = quants.GgmlType;

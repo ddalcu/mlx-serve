@@ -19,8 +19,9 @@ pub fn unsupportedReason(f: *const gguf.File, buf: []u8) ?[]const u8 {
     var name_buf: [160]u8 = undefined;
     var it = f.tensors.iterator();
     while (it.next()) |e| {
-        if (!arch.serves(e.value_ptr.ty)) return std.fmt.bufPrint(buf, "tensor type of {s}", .{e.key_ptr.*}) catch "tensor type";
-        if (arch.mapTensor(&name_buf, e.key_ptr.*) == null) return std.fmt.bufPrint(buf, "tensor {s}", .{e.key_ptr.*}) catch "tensor";
+        const mapped = arch.mapTensor(&name_buf, e.key_ptr.*) orelse return std.fmt.bufPrint(buf, "tensor {s}", .{e.key_ptr.*}) catch "tensor";
+        // A tensor the arch skips is never loaded, whatever its type (DeepSeek-V4.1's I32/I64 hash tables).
+        if (mapped.name.len > 0 and !arch.serves(mapped.name, e.value_ptr.ty)) return std.fmt.bufPrint(buf, "tensor type of {s}", .{e.key_ptr.*}) catch "tensor type";
     }
     return null;
 }
@@ -55,11 +56,16 @@ const TokenizerKind = struct {
 
     fn of(f: *const gguf.File) ?TokenizerKind {
         const model = f.getString("tokenizer.ggml.model") orelse return null;
+        return ofNames(model, f.getString("general.architecture"), f.getString("tokenizer.ggml.pre"));
+    }
+
+    fn ofNames(model: []const u8, arch_or_null: ?[]const u8, pre_or_null: ?[]const u8) ?TokenizerKind {
         if (std.mem.eql(u8, model, "gemma4")) return .{ .head = gemma_head, .model_fields = gemma_model_fields, .also_special = "<eos>" };
-        const arch_name = f.getString("general.architecture") orelse return null;
+        const arch_name = arch_or_null orelse return null;
         if (std.mem.eql(u8, model, "llama") and std.mem.eql(u8, arch_name, "gemma3")) return .{ .head = gemma_head, .model_fields = gemma_model_fields, .also_special = "<eos>", .spm = true };
-        const pre = f.getString("tokenizer.ggml.pre") orelse return null;
-        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "gpt-4o")) return .{
+        const pre = pre_or_null orelse return null;
+        // Llama 4's split (Muse-Glimmer) is the same regex as GPT-4o's.
+        if (std.mem.eql(u8, model, "gpt2") and (std.mem.eql(u8, pre, "gpt-4o") or std.mem.eql(u8, pre, "llama4"))) return .{
             .head =
             \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n/]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
             \\"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
@@ -83,6 +89,15 @@ const TokenizerKind = struct {
         if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "lfm2")) return .{ .head =
         \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
         \\"decoder":{"type":"Sequence","decoders":[{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true}]},
+        };
+        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "flint")) return .{ .head =
+        \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]*[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\\r\\n\\p{L}\\p{N}]?[\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}]+[\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?| ?[\\p{P}\\p{S}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
+        \\"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
+        };
+        // DeepSeek-V4.1 (llama.cpp's name for its pre-tokenizer).
+        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "joyai-llm")) return .{ .head =
+        \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
+        \\"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
         };
         if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "qwen35")) return .{ .head =
         \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false}]},
@@ -266,6 +281,25 @@ fn appendDerivedMerges(allocator: std.mem.Allocator, out: *std.ArrayList(u8), to
         try pair.appendSlice(a, texts[m.tok][m.split..]);
         try appendJsonString(allocator, out, pair.items);
     }
+}
+
+test "Llama 4's pre-tokenizer reads as GPT-4o's, Flint's keeps its own digit and CJK splits" {
+    const a = std.testing.allocator;
+    const muse = TokenizerKind.ofNames("gpt2", "muse-glimmer", "llama4").?;
+    try std.testing.expectEqualStrings(TokenizerKind.ofNames("gpt2", "qwen3", "gpt-4o").?.head, muse.head);
+    try std.testing.expectEqualStrings("\"ignore_merges\":true,", muse.model_fields);
+
+    const flint = TokenizerKind.ofNames("gpt2", "flint", "flint").?;
+    try std.testing.expectEqualStrings("", flint.model_fields);
+    const json = try std.fmt.allocPrint(a, "{{{s}\"x\":0}}", .{flint.head});
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const splits = parsed.value.object.get("pre_tokenizer").?.object.get("pretokenizers").?.array.items;
+    try std.testing.expectEqual(@as(usize, 4), splits.len);
+    try std.testing.expectEqualStrings("\\p{N}{1,3}", splits[0].object.get("pattern").?.object.get("Regex").?.string);
+    try std.testing.expectEqualStrings("[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+", splits[1].object.get("pattern").?.object.get("Regex").?.string);
+    try std.testing.expect(TokenizerKind.ofNames("gpt2", "flint", "llama-bpe") == null);
 }
 
 test "derived merges follow HF's order: score, then longer pieces, user-defined tokens as score 0" {

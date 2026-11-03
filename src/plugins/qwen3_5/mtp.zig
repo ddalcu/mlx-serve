@@ -19,6 +19,7 @@ const ops = @import("../../mlx/ops.zig");
 const moe_block = @import("../../sdk/bases/blocks/moe.zig");
 const QuantParams = @import("../../sdk/quant/params.zig").QuantParams;
 const rht = @import("../../sdk/quant/hadamard/rht.zig");
+const gguf_kernels = @import("../../sdk/quant/gguf/kernels.zig");
 const axisView = @import("../../mlx/array.zig").axisView;
 const gated_attention = @import("../../sdk/bases/blocks/gated_attention.zig");
 
@@ -216,6 +217,10 @@ fn embedRows(h: *const Head, ids: Array, n: c_int) !Array {
     defer _ = mlx.mlx_array_free(rows);
     if (e.s.ctx == null) {
         try mlx.check(mlx.mlx_astype(&rows, tw, .bfloat16, s));
+    } else if (gguf_kernels.infoOf(e.w, e.s)) |info| {
+        // A `--mlx-gguf` trunk's table: raw ggml rows beside their type sentinel.
+        _ = mlx.mlx_array_free(rows);
+        rows = try gguf_kernels.dequantize(info.ty, tw, .bfloat16, s);
     } else {
         var ts = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ts);

@@ -34,7 +34,7 @@ fn Launch(comptime kind: kernels.Kind, comptime ty: GgmlType, comptime dt: mlx.m
 /// Recorded where M1 and M2 build an instantiation for fewer than 1024 threads; each launch is at most 64.
 fn limit(comptime kind: kernels.Kind, comptime ty: GgmlType, comptime dt: mlx.mlx_dtype) u32 {
     const f32_out = dt == .float32;
-    if (kind == .matvec) return switch (ty) {
+    if (kind == .matvec or kind == .matvec_cols) return switch (ty) {
         .q4_0 => if (f32_out) 512 else 1024,
         else => if (f32_out) 768 else 1024,
     };
@@ -110,8 +110,7 @@ const Gguf = struct {
         const m: c_int = @intCast(shape.rows);
         const n: c_int = @intCast(shape.n);
         const per = kernels.rowsPerInstance(m);
-        var rpt = kernels.matvecRows(per);
-        while (rpt > 1 and @divFloor(n, rpt) < kernels.MIN_SIMDGROUPS) rpt = @divExact(rpt, 2);
+        const rpt = kernels.matvecRpt(self.kind == .matvec_cols, per, n);
         const groups = @divFloor(n + rpt * kernels.SIMDGROUPS - 1, rpt * kernels.SIMDGROUPS);
         var g = metal.Geometry{ .grid = .{ kernels.SIMD_WIDTH, kernels.SIMDGROUPS * groups, @divExact(m, per) }, .tg = .{ kernels.SIMD_WIDTH, kernels.SIMDGROUPS, 1 } };
         g.out(&.{ m, n }, self.dt);
@@ -270,7 +269,9 @@ fn none(_: Shape) usize {
 }
 
 const dequant_shapes: []const Shape = &.{ .{ .rows = 3, .n = 1, .k = 2048 }, .{ .rows = 16, .n = 1, .k = 4096 } };
-const matvec_shapes: []const Shape = &.{ .{ .rows = 1, .n = 2048, .k = 2048 }, .{ .rows = 3, .n = 512, .k = 4096 }, .{ .rows = 8, .n = 1024, .k = 1024 } };
+/// The striped matvec serves what the column-major one declines (rows under 1024 weights, or 3+ activation rows).
+const matvec_shapes: []const Shape = &.{ .{ .rows = 1, .n = 2048, .k = 512 }, .{ .rows = 3, .n = 512, .k = 4096 }, .{ .rows = 8, .n = 1024, .k = 1024 } };
+const matvec_cols_shapes: []const Shape = &.{ .{ .rows = 1, .n = 2048, .k = 2048 }, .{ .rows = 1, .n = 2048, .k = 2560 }, .{ .rows = 2, .n = 512, .k = 4096 } };
 
 const mxfp4_tiny_scale: spec.Known = .{ .gate = .shapes, .finding = "an E8M0 scale byte of 0 or 1 is a subnormal fp32 scale, which the GPU flushes to zero where ggml's reference keeps it: such blocks dequantize to 0 instead of values below 1e-37" };
 const q3k_inconclusive: spec.Known = .{ .gate = .limits, .finding = "every offline M1/M2 build of the f32 Q3_K dequant changes with the thread request (INCONCLUSIVE), so no limit is recorded; it launches 64 threads" };
@@ -289,14 +290,14 @@ fn dequantSpec(comptime ty: GgmlType, comptime out: spec.Elem) spec.Spec {
     };
 }
 
-fn matvecSpec(comptime ty: GgmlType, comptime out: spec.Elem) spec.Spec {
+fn matvecSpec(comptime kind: kernels.Kind, comptime ty: GgmlType, comptime out: spec.Elem) spec.Spec {
     return .{
-        .name = "gguf matvec " ++ @tagName(ty) ++ (if (out == .f32) " f32" else " bf16"),
+        .name = "gguf " ++ @tagName(kind) ++ " " ++ @tagName(ty) ++ (if (out == .f32) " f32" else " bf16"),
         .accum = .f32,
         .depth = depthK,
         .out = out,
-        .tiles = .{ .{ .size = 5 }, .{ .size = 16 }, .{ .size = 256, .step = 32, .min = 32 } },
-        .served = matvec_shapes,
+        .tiles = .{ .{ .size = 8 }, .{ .size = 16 }, .{ .size = 256, .step = 32, .min = 32 } },
+        .served = if (kind == .matvec_cols) matvec_cols_shapes else matvec_shapes,
     };
 }
 
@@ -306,10 +307,10 @@ pub fn register(set: *kc.Set) !void {
         try set.add(Gguf, .init(a, &Launch(.dequant, ty, .float32).launch, .dequant, ty, .float32), dequantSpec(ty, .f32), null);
         try set.add(Gguf, .init(a, &Launch(.dequant, ty, .bfloat16).launch, .dequant, ty, .bfloat16), dequantSpec(ty, .bf16), null);
     }
-    inline for (.{ GgmlType.q8_0, GgmlType.q4_0 }) |ty| {
-        try set.add(Gguf, .init(a, &Launch(.matvec, ty, .float32).launch, .matvec, ty, .float32), matvecSpec(ty, .f32), null);
-        try set.add(Gguf, .init(a, &Launch(.matvec, ty, .bfloat16).launch, .matvec, ty, .bfloat16), matvecSpec(ty, .bf16), null);
-    }
+    inline for (.{ GgmlType.q8_0, GgmlType.q4_0 }) |ty| inline for (.{ kernels.Kind.matvec, kernels.Kind.matvec_cols }) |kind| {
+        try set.add(Gguf, .init(a, &Launch(kind, ty, .float32).launch, kind, ty, .float32), matvecSpec(kind, ty, .f32), null);
+        try set.add(Gguf, .init(a, &Launch(kind, ty, .bfloat16).launch, kind, ty, .bfloat16), matvecSpec(kind, ty, .bf16), null);
+    };
 }
 
 // ── tests ──

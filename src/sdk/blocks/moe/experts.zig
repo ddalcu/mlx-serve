@@ -26,7 +26,7 @@ const maxAbsDiffF32 = @import("../../testing/parity.zig").maxAbsDiffF32;
 /// (maybeTransposeForBf16 + generalized transposeBf16Weight), so x @ w is correct with no
 /// transpose flag — mirrors mlx-lm's `gather_mm(x, weight.swapaxes(-1,-2))`.
 pub fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, sorted: bool, s: mlx.mlx_stream) !void {
-    if (try foreign.gather(x, w, sc, lhs_idx, rhs_idx, s)) |y| {
+    if (try foreign.gather(x, w, sc, lhs_idx, rhs_idx, sorted, s)) |y| {
         _ = mlx.mlx_array_free(res.*);
         res.* = y;
         return;

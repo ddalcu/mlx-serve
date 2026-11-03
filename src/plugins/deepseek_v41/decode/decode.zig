@@ -4,6 +4,7 @@
 const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
+const device = @import("../../../mlx/device.zig");
 const kc = @import("../../../sdk/testing/kernel_contract/root.zig");
 
 pub const fixture = @import("fixture.zig");
@@ -91,6 +92,9 @@ test "dsv41 dec layers: the fused kernels decode no further from an f32 model th
 
 test "dsv41 dec layers: the fused kernels over mxfp4 experts decode no further from an f32 model than today's chain" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    // The mxfp4 kernels build only without NAX (`Dec.moe_fp4`): with NAX this compares the NAX attention against the
+    // chain at a bf16 near-tie instead. The kernel contract checks the mxfp4 kernels on every GPU.
+    if (device.naxAvailable()) return error.SkipZigTest;
     try layersAgree(std.testing.allocator, 20, 23, true);
 }
 

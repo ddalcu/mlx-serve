@@ -754,6 +754,12 @@ sparse target takes an absolute floor of 1.8 accepted per round (a verify reads 
 conv-only trunk takes T explicitly. `lfm2_moe` dense layers come in two spellings (probed). Equivalence runs on
 `/v1/completions`, where nothing amplifies a flipped tie. Guard: `tests/test_dspark_lfm2.sh`.
 
+### A refused MTP head failed the first request
+Defect: Nemotron-3-Nano's GGUF answered its first request with `MlxFailure`, every later one fine. Cause: the plugin's
+head load read `model.safetensors` beside the `.gguf`, MLX latched the failed read, and the refusal returned before
+dropping it, so the first prefill's check raised it. Fix: `plugin/head.load` drops a latch its own load raised on every
+path. Guard: `plugin MTP head: a head that fails to load leaves no MLX error for the first request`.
+
 ## The measured spec cost model
 
 ### A boot-time verify ladder could not decide widths (retired)
