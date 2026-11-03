@@ -399,7 +399,10 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
             r.arms.add(ctxs[i].qsa_arms);
         }
     }
-    out.logits = .{ .ctx = (try shapeLogits(m, try concatRows(m, rows[0..n]), false)).ctx };
+    // `shapeLogits` takes its own reference; the stacked `[N, 1, V]` handle is ours to free.
+    const cat = try concatRows(m, rows[0..n]);
+    defer _ = mlx.mlx_array_free(cat);
+    out.logits = .{ .ctx = (try shapeLogits(m, cat, false)).ctx };
     if (made_hidden == n and f.want_hidden) out.hidden = .{ .ctx = (try concatRows(m, hidden[0..n])).ctx };
 }
 
