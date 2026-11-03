@@ -3,6 +3,9 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const generate_mod = @import("generate.zig");
+const chat_mod = @import("../../host/chat/chat.zig");
+const loop_guard = @import("../../sdk/request/loop_guard.zig");
+const MAX_ROUND_DRAFTS = @import("spec/mtp_head_ref.zig").MAX_ROUND_DRAFTS;
 const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
 const testing = std.testing;
@@ -38,7 +41,7 @@ pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
 /// of the answer should end.
 pub const LoopStop = struct {
     finish_reason: []const u8 = "stop",
-    /// The `finish_details.type` value. One string for all three tiers: a
+    /// The `finish_details.type` value. One string for every tier: a
     /// client's decision ("this turn is unusable, don't feed it back") is the
     /// same whichever tier convicted, and the tier is in the log.
     finish_details: []const u8 = "repetition_loop",
@@ -46,7 +49,7 @@ pub const LoopStop = struct {
     trim_start: usize,
 };
 
-/// Pure decision + trim point. The three tiers live in generate.zig
+/// Pure decision + trim point. The tiers live in `sdk/request/loop_guard.zig`
 /// (`degenerateTail`); this is where their verdict becomes server behaviour.
 pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
     const d = generate_mod.degenerateTail(generated_ids) orelse return null;
@@ -58,6 +61,28 @@ pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
 fn slotLoopStop(eos_token_ids: []const u32, generated_ids: []const u32) ?LoopStop {
     if (eos_token_ids.len == 0) return null;
     return loopStopDecision(generated_ids);
+}
+
+comptime {
+    std.debug.assert(loop_guard.recurring_span_reach >= MAX_ROUND_DRAFTS + 1);
+}
+
+/// A file written through a tool can repeat one long block, and a cut drops the whole
+/// call: the recurring-span tier abstains once the answer has opened one.
+pub fn spanCutYieldsToToolCall(tier: generate_mod.DegenerateTail.Tier, has_tools: bool, text: []const u8) bool {
+    if (tier != .recurring_span or !has_tools) return false;
+    return chat_mod.trimLeakedToolMarkup(text).len < text.len;
+}
+
+/// `spanCutYieldsToToolCall` over the slot's output; an opened call stays opened.
+fn toolCallHoldsCut(slot: *Slot, gen: *Generator, tier: generate_mod.DegenerateTail.Tier) bool {
+    if (tier != .recurring_span or !slot.has_tools) return false;
+    if (slot.tool_call_opened) return true;
+    const tok = slot.model.tokenizer orelse return false;
+    const text = tok.decode(slot.allocator, gen.generated_ids.items, false) catch return false;
+    defer slot.allocator.free(text);
+    slot.tool_call_opened = spanCutYieldsToToolCall(tier, true, text);
+    return slot.tool_call_opened;
 }
 
 const LoopAction = enum { cut, close_thought };
@@ -85,7 +110,8 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
     const loop_guard_start = gen.loopGuardStart();
-    if (slotLoopStop(slot.eos_token_ids, gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+    if (slotLoopStop(slot.eos_token_ids, gen.generated_ids.items[loop_guard_start..])) |relative_stop| cut: {
+        if (toolCallHoldsCut(slot, gen, relative_stop.tier)) break :cut;
         if (gen.hasPrePayloadConstraint()) {
             switch (try gen.forceConstraintTransition(slot.allocator)) {
                 .committed => |boundary| {
@@ -267,6 +293,29 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
         try healthy.appendSlice(testing.allocator, &[_]u32{ 13, 14 });
     }
     try testing.expect(loopStopReason(healthy.items) == null);
+}
+
+test "a recurring-span cut yields to an open tool call, and only that tier does" {
+    // A tool call writing records that share one long block, past the span bar.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    var value: u32 = 9000;
+    while (ids.items.len < loop_guard.near_repeat_min_span + 400) {
+        for (0..120) |i| try ids.append(testing.allocator, 500 + @as(u32, @intCast(i)));
+        for (0..10) |_| {
+            value += 1;
+            try ids.append(testing.allocator, value);
+        }
+    }
+    const stop = loopStopDecision(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqual(generate_mod.DegenerateTail.Tier.recurring_span, stop.tier);
+
+    const call = "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"content\": \"{\\\"id\\\": 1,";
+    try testing.expect(spanCutYieldsToToolCall(stop.tier, true, call));
+    try testing.expect(!spanCutYieldsToToolCall(stop.tier, true, "The same paragraph again."));
+    try testing.expect(!spanCutYieldsToToolCall(stop.tier, false, call));
+    try testing.expect(!spanCutYieldsToToolCall(.exact_cycle, true, call));
+    try testing.expect(!spanCutYieldsToToolCall(.near_repeat, true, call));
 }
 
 test "loop recovery: a loop inside an open think block closes the thought once" {
