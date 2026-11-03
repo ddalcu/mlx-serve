@@ -174,6 +174,7 @@ pub const File = struct {
 
     /// A split set's first shard (`<stem>-00001-of-0000N.gguf`) opens the whole set.
     pub fn open(allocator: std.mem.Allocator, path: []const u8) !File {
+        if (comptime builtin.os.tag == .windows) return error.Unsupported; // mmap-based; the GGUF engine is Metal-only
         const map = try mapFile(path);
         var f = parse(allocator, map) catch |e| {
             std.posix.munmap(map);
