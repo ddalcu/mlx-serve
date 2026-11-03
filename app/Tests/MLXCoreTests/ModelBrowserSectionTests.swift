@@ -13,7 +13,7 @@ final class ModelBrowserSectionTests: XCTestCase {
     // MARK: - Sections
 
     func testMyModelsIsFirstAndDefaultDependsOnLibrary() {
-        XCTAssertEqual(ModelBrowserSection.allCases, [.myModels, .recommended, .discover, .downloads, .media])
+        XCTAssertEqual(ModelBrowserSection.allCases, [.myModels, .recommended, .discover, .downloads, .media, .plugins])
         XCTAssertEqual(ModelBrowserSection.defaultSection(hasChatModels: true), .myModels)
         XCTAssertEqual(ModelBrowserSection.defaultSection(hasChatModels: false), .recommended)
         for section in ModelBrowserSection.allCases {

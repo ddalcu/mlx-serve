@@ -43,16 +43,21 @@ final class ModelSettingsMtpRowsTests: XCTestCase {
     }
 }
 
-/// Mirrors the server's `ane_lm.archOf`: dense qwen3_5 and Qwen3 packs (MoE and Prism packs stay on the GPU).
-final class ModelSettingsNeuralEngineRowTests: XCTestCase {
-    func testOnlyDenseQwenPacksOfferTheNeuralEngine() {
-        XCTAssertTrue(ModelSettingsApply.offersNeuralEngine(modelType: "qwen3_5"))
-        XCTAssertTrue(ModelSettingsApply.offersNeuralEngine(modelType: "qwen3_5_text"))
-        XCTAssertTrue(ModelSettingsApply.offersNeuralEngine(modelType: "qwen3"))
-        for t in ["qwen3_5_moe", "qwen3_5_moe_text", "qwen3_moe", "prism_hadamard_qwen35", "qwen4_exp", "llama", ""] {
-            XCTAssertFalse(ModelSettingsApply.offersNeuralEngine(modelType: t), t)
-        }
-        XCTAssertFalse(ModelSettingsApply.offersNeuralEngine(modelType: nil))
+/// The engine picker offers what the server's row lists (`engines`), never a list of its own.
+final class ModelSettingsEngineRowTests: XCTestCase {
+    func testThePickerOffersAutomaticAndTheRowsEngines() {
+        XCTAssertEqual(ModelSettingsApply.engineChoices(engines: ["mlx", "ane"], stored: nil), ["", "mlx", "ane"])
+        XCTAssertEqual(ModelSettingsApply.engineChoices(engines: ["mlx"], stored: nil), [], "one engine is no choice")
+        XCTAssertEqual(ModelSettingsApply.engineChoices(engines: [], stored: nil), [], "an older server lists none")
+        XCTAssertEqual(ModelSettingsApply.engineChoices(engines: ["mlx"], stored: "ane"), ["", "mlx", "ane"],
+                       "a stored choice the server no longer lists stays visible, so it can be reset")
+    }
+
+    func testTheRowOfAModelIsTheOneItsPathEndsIn() {
+        let rows = [ModelInfo(name: "org/a", quantBits: 4, layers: 1, hiddenSize: 1, vocabSize: 1,
+                              contextLength: 1, modelMaxTokens: 1, engines: ["mlx", "ane"])]
+        XCTAssertEqual(ModelSettingsApply.row(for: "/models/org/a", in: rows)?.engines, ["mlx", "ane"])
+        XCTAssertNil(ModelSettingsApply.row(for: "/models/org/b", in: rows))
     }
 }
 
@@ -77,7 +82,7 @@ final class LocalMtpHeadProbeTests: XCTestCase {
         XCTAssertTrue(DownloadManager.dirHasMtpHead(atDir: d))
     }
     func testIndexMarkers() throws {
-        for key in ["language_model.mtp.fc.weight", "mtp.eh_proj.weight", "language_model.mtp.fc_hidden.weight"] {
+        for key in ["language_model.mtp.fc.weight", "mtp.eh_proj.weight", "language_model.mtp.fc_hidden.weight", "mtp.fc_hidden.weight"] {
             let d = try dir("idx")
             try #"{"weight_map":{"\#(key)":"a.safetensors"}}"#
                 .write(toFile: d + "/model.safetensors.index.json", atomically: true, encoding: .utf8)

@@ -1,0 +1,1471 @@
+//! CLI subcommands — `mlx-serve run|pull|list <model>` — Ollama-grade
+//! ergonomics for the terminal.
+//!
+//!   mlx-serve run gemma4        # download if missing, serve, drop into a REPL
+//!   mlx-serve pull qwen3.6      # download only
+//!   mlx-serve list              # what's on disk
+//!
+//! Short names resolve through a curated alias table (mirroring the MLX
+//! Core app catalog in ChatModels.swift); anything containing '/' is
+//! treated as a HuggingFace repo id directly ("org/repo", with optional
+//! "hf.co/" prefix and ":tag" suffix). Downloads land in
+//! `~/.mlx-serve/models/<org>/<repo>` — the single source of truth shared
+//! with the app's DownloadManager and the server's media-dep resolution.
+//!
+//! Transport is the system `curl` (always present on macOS): rock-solid
+//! TLS/redirect/HTTP2 handling, `-C -` resume, `--create-dirs`, and a free
+//! progress bar on the CLI path. Pure helpers (alias resolution, tree-JSON
+//! parsing, file filtering, REPL body/line codecs) are hermetically tested
+//! here; only the thin curl/spawn wrappers need a live network.
+
+const std = @import("std");
+const env = @import("../../env.zig");
+const build_options = @import("build_options");
+const ollama = @import("../api/ollama/translate.zig");
+const model_discovery = @import("../registry/discovery.zig");
+const served_media = @import("../media_jobs/plugin/served.zig");
+const log = @import("../../sdk/util/log.zig");
+
+// ── Unparsed-argument reporting ─────────────────────────────────────────
+
+/// Why main.zig's flag loop could not consume an argument.
+///
+/// The loop matches every flag by EXACT name and reads its value from the
+/// NEXT argv slot; without an else branch a
+/// misspelled flag, or the `--flag=value` shape it never accepted, is
+/// dropped in silence. That is the worst possible outcome for a launcher: the
+/// flag parses as far as the user can tell, `--help` documents it, and the
+/// server boots clean while ignoring what was asked for. Rejecting loudly is
+/// the whole point; the variants exist only to make the message actionable.
+pub const ArgReject = enum {
+    /// `--model=/path` — value welded to the flag name.
+    equals_form,
+    /// A flag in the LAST argv slot, so its value never arrived.
+    missing_value,
+    /// Not a flag we know.
+    unknown,
+
+    /// Trailing advice for the error message. Never empty.
+    pub fn hint(self: ArgReject) []const u8 {
+        return switch (self) {
+            .equals_form => "flags take their value as a separate argument (--model <path>, not --model=<path>)",
+            .missing_value => "this flag expects a value after it, or it is misspelled",
+            .unknown => "see --help for the flag list",
+        };
+    }
+};
+
+/// Classify an argument the flag loop fell through on. `is_last` is true when
+/// it occupied the final argv slot — the only way a known value-taking flag
+/// can reach the else branch (every such arm is guarded on `i + 1 < args.len`).
+pub fn classifyUnparsedArg(arg: []const u8, is_last: bool) ArgReject {
+    const is_flag = std.mem.startsWith(u8, arg, "-");
+    if (is_flag and std.mem.indexOfScalar(u8, arg, '=') != null) return .equals_form;
+    if (is_flag and is_last) return .missing_value;
+    return .unknown;
+}
+
+// ── Alias table ─────────────────────────────────────────────────────────
+
+pub const Alias = struct {
+    /// Short name before the ':', e.g. "gemma4".
+    name: []const u8,
+    /// Tag after the ':'; empty = selectable only by full name:tag.
+    tag: []const u8,
+    repo: []const u8,
+    /// Picked when the user gives the bare name with no tag.
+    is_default: bool = false,
+    /// Non-empty: restrict the download to this single .gguf artifact.
+    gguf_file: []const u8 = "",
+};
+
+/// Mirrors the app catalog (`gemmaModelOptions` in ChatModels.swift).
+/// Bare-name defaults pick the 4-bit build that fits the widest range of
+/// Macs for that family.
+pub const aliases = [_]Alias{
+    .{ .name = "gemma4", .tag = "e2b", .repo = "mlx-community/gemma-4-e2b-it-4bit" },
+    .{ .name = "gemma4", .tag = "e2b-8bit", .repo = "mlx-community/gemma-4-e2b-it-8bit" },
+    .{ .name = "gemma4", .tag = "e4b", .repo = "mlx-community/gemma-4-e4b-it-4bit", .is_default = true },
+    .{ .name = "gemma4", .tag = "e4b-8bit", .repo = "mlx-community/gemma-4-e4b-it-8bit" },
+    .{ .name = "gemma4", .tag = "12b", .repo = "mlx-community/gemma-4-12b-it-4bit" },
+    .{ .name = "gemma4", .tag = "12b-8bit", .repo = "mlx-community/gemma-4-12b-it-8bit" },
+    .{ .name = "gemma4", .tag = "26b", .repo = "mlx-community/gemma-4-26b-a4b-it-4bit" },
+    .{ .name = "gemma4", .tag = "26b-8bit", .repo = "mlx-community/gemma-4-26b-a4b-it-8bit" },
+    .{ .name = "gemma4", .tag = "31b", .repo = "mlx-community/gemma-4-31b-it-4bit" },
+    .{ .name = "gemma4", .tag = "31b-8bit", .repo = "mlx-community/gemma-4-31b-it-8bit" },
+    .{ .name = "gemma3", .tag = "12b", .repo = "mlx-community/gemma-3-12b-it-4bit", .is_default = true },
+    // Qwen 3.6 27B ships an MTP sidecar the server auto-loads for
+    // multi-token speculative decode — the best default experience.
+    .{ .name = "qwen3.6", .tag = "27b", .repo = "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", .is_default = true },
+    .{ .name = "qwen3.5", .tag = "0.8b", .repo = "mlx-community/Qwen3.5-0.8B-MLX-4bit", .is_default = true },
+    .{ .name = "deepseek-v4", .tag = "flash", .repo = "antirez/deepseek-v4-gguf", .is_default = true, .gguf_file = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf" },
+    // Tencent Hunyuan 3 (hy_v3, 295B-A21B MoE) — mixed 2/3-bit experts +
+    // 8-bit attention/router/shared, MTP layer included. ~110 GB on disk;
+    // needs a 128 GB Mac.
+    .{ .name = "hy3", .tag = "295b", .repo = "mlx-community/Hy3-oQ2e", .is_default = true },
+    // OpenAI gpt-oss. The MXFP4-Q8 conversions keep the native mxfp4 expert
+    // banks (what the model was released in) and put attention/embeddings at
+    // affine 8-bit: ~12 GB for the 20B, ~63 GB for the 120B.
+    .{ .name = "gpt-oss", .tag = "20b", .repo = "mlx-community/gpt-oss-20b-MXFP4-Q8", .is_default = true },
+    .{ .name = "gpt-oss", .tag = "120b", .repo = "mlx-community/gpt-oss-120b-MXFP4-Q8" },
+    .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
+    .{ .name = "spark", .tag = "4b", .repo = "abenzerps/Spark-X2.5-4B-MLX-4bit", .is_default = true },
+    .{ .name = "spark", .tag = "4b-8bit", .repo = "abenzerps/Spark-X2.5-4B-MLX-8bit" },
+    // IFM K2-Horizon dense. oMLX's 6-bit pack with 8-bit edge layers.
+    .{ .name = "k2", .tag = "7b", .repo = "mlx-community/K2-Horizon-7B-oQ6e", .is_default = true },
+};
+
+pub const Resolved = struct {
+    repo: []const u8,
+    gguf_file: []const u8 = "",
+    /// `org/repo:Q4_K_M`: the GGUF quant to pull from a repo that ships several.
+    quant: []const u8 = "",
+    /// Set by `pullRepo`: the chosen GGUF group (`ggufGroup`); its files are pulled, no other .gguf.
+    gguf_group: []const u8 = "",
+    /// Set by `pullRepo` with `gguf_group`: the one MTP draft head pulled beside it (`pickMtpSidecar`).
+    gguf_mtp: []const u8 = "",
+    /// Set by `pullRepo`: the root index's `weight_map`. A shard it names is part of the pack at any depth.
+    indexed: ?std.json.Value = null,
+};
+
+/// Short name / repo ref → HF repo id. Accepts:
+///   "gemma4" / "gemma4:12b"           (alias table)
+///   "org/repo" / "org/repo:tag"       (direct, tag stripped)
+///   "hf.co/org/repo", "huggingface.co/org/repo"
+/// Returns null for unknown alias-shaped names (no '/').
+pub fn resolveShortName(name: []const u8) ?Resolved {
+    var n = name;
+    for ([_][]const u8{ "hf.co/", "huggingface.co/", "https://huggingface.co/" }) |prefix| {
+        if (std.ascii.startsWithIgnoreCase(n, prefix)) {
+            n = n[prefix.len..];
+            break;
+        }
+    }
+    const tagged = n;
+    n = ollama.stripTag(n);
+    if (n.len == 0) return null;
+    if (std.mem.indexOfScalar(u8, n, '/') != null) {
+        // Direct org/repo reference; a tag picks a GGUF quant.
+        const tag = if (tagged.len > n.len) tagged[n.len + 1 ..] else "";
+        return .{ .repo = n, .quant = if (std.mem.eql(u8, tag, "latest")) "" else tag };
+    }
+    // Alias lookup: "name" or "name:tag" (tag was stripped above — redo the
+    // split on the ORIGINAL string so alias tags still work).
+    var base = name;
+    var tag: []const u8 = "";
+    if (std.mem.lastIndexOfScalar(u8, name, ':')) |ci| {
+        base = name[0..ci];
+        tag = name[ci + 1 ..];
+    }
+    if (std.mem.eql(u8, tag, "latest")) tag = "";
+    for (aliases) |a| {
+        if (!std.ascii.eqlIgnoreCase(a.name, base)) continue;
+        if (tag.len == 0) {
+            if (a.is_default) return .{ .repo = a.repo, .gguf_file = a.gguf_file };
+        } else if (std.ascii.eqlIgnoreCase(a.tag, tag)) {
+            return .{ .repo = a.repo, .gguf_file = a.gguf_file };
+        }
+    }
+    return null;
+}
+
+/// `~/.mlx-serve/models/<org>/<repo>` — the single models root shared with
+/// the app's DownloadManager.
+pub fn modelDestPath(allocator: std.mem.Allocator, home: []const u8, repo: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ home, repo });
+}
+
+pub fn modelsRootPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models", .{home});
+}
+
+/// Inputs to "which models should this boot discover?" — see
+/// `shouldDefaultModelsRoot`.
+pub const RootDefaulting = struct {
+    /// Invoked as `mlx-serve serve` / `mlx-serve run <model>` rather than flags.
+    subcommand: bool,
+    /// The process will serve HTTP (subcommand, or the `--serve` flag).
+    serve_mode: bool,
+    /// `--model <path>` (or `run <model>`) named a specific checkpoint.
+    has_explicit_model: bool,
+};
+
+/// Should an unspecified `--model-dir` fall back to `~/.mlx-serve/models`?
+///
+/// That path is already the single source of truth everywhere else — `pull`
+/// writes there, `list` reads there, the app's DownloadManager and both
+/// resolvers agree on it — so a server told to serve, but given neither a model
+/// nor a directory, has exactly one sensible place to look. Without this a bare
+/// `mlx-serve --serve` discovered nothing and answered 503 to everything.
+///
+/// The one case that must NOT default: `--model <path> --serve`, which asked
+/// for one specific model. Registering everything else on disk beside it is a
+/// different server than the one requested.
+pub fn shouldDefaultModelsRoot(in: RootDefaulting) bool {
+    if (!in.serve_mode) return false;
+    if (in.subcommand) return true; // `serve` / `run` always populate the picker
+    return !in.has_explicit_model;
+}
+
+fn homeDir() []const u8 {
+    return std.mem.span(env.get(.HOME) orelse return "/tmp");
+}
+
+// ── HF tree listing ─────────────────────────────────────────────────────
+
+pub const RepoFile = struct {
+    path: []u8,
+    size: u64,
+};
+
+pub fn freeRepoFiles(allocator: std.mem.Allocator, files: []RepoFile) void {
+    for (files) |f| allocator.free(f.path);
+    allocator.free(files);
+}
+
+/// Parse the HF `/api/models/<repo>/tree/main?recursive=true` JSON array.
+/// LFS entries report the real artifact size under `lfs.size`.
+pub fn parseTreeJson(allocator: std.mem.Allocator, json: []const u8) ![]RepoFile {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.InvalidTree;
+    defer parsed.deinit();
+    if (parsed.value != .array) return error.InvalidTree;
+
+    var files = std.ArrayList(RepoFile).empty;
+    errdefer {
+        for (files.items) |f| allocator.free(f.path);
+        files.deinit(allocator);
+    }
+    for (parsed.value.array.items) |item| {
+        if (item != .object) continue;
+        const obj = item.object;
+        const t = obj.get("type") orelse continue;
+        if (t != .string or !std.mem.eql(u8, t.string, "file")) continue;
+        const p = obj.get("path") orelse continue;
+        if (p != .string) continue;
+        var size: u64 = 0;
+        if (obj.get("lfs")) |lfs| {
+            if (lfs == .object) {
+                if (lfs.object.get("size")) |s| {
+                    if (s == .integer and s.integer > 0) size = @intCast(s.integer);
+                }
+            }
+        }
+        if (size == 0) {
+            if (obj.get("size")) |s| {
+                if (s == .integer and s.integer > 0) size = @intCast(s.integer);
+            }
+        }
+        try files.append(allocator, .{ .path = try allocator.dupe(u8, p.string), .size = size });
+    }
+    return files.toOwnedSlice(allocator);
+}
+
+/// Chat-default file selection (mirrors the app's `FileSelection.chatDefault`):
+/// the whole pack — top-level files + the `mtp/` and `drafter/` spec-decode
+/// sidecars; repo housekeeping and demo assets are skipped.
+/// `pytorch_model.bin` / `pytorch_model-0000N-of-0000M.bin` — the HF torch
+/// weights that sit beside the safetensors copy. Shared rule with the app's
+/// `DownloadManager.selectNeededFiles`; keep them in sync.
+pub fn isTorchShadowBin(path: []const u8) bool {
+    if (!std.ascii.endsWithIgnoreCase(path, ".bin")) return false;
+    const base = if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| path[i + 1 ..] else path;
+    return std.ascii.startsWithIgnoreCase(base, "pytorch_model") or
+        std.ascii.startsWithIgnoreCase(base, "rust_model") or
+        std.ascii.startsWithIgnoreCase(base, "tf_model");
+}
+
+pub fn shouldDownload(path: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, path, '/')) |_| {
+        const sidecar_dirs = [_][]const u8{ "mtp/", "drafter/", "g2p/", "speech_tokenizer/", "engram/", "tensors/", "audio_tokenizer/" };
+        for (sidecar_dirs) |d| {
+            if (std.mem.startsWith(u8, path, d)) break;
+        } else return false;
+    }
+    return shouldDownloadFile(path);
+}
+
+/// The name filter alone: a media pack keeps what passes it at any depth.
+fn shouldDownloadFile(path: []const u8) bool {
+    if (path.len == 0 or path[0] == '.') return false;
+    const skip_exact = [_][]const u8{ "README.md", "LICENSE", "LICENSE.txt", "USE_POLICY.md" };
+    for (skip_exact) |s| {
+        if (std.ascii.eqlIgnoreCase(path, s)) return false;
+    }
+    // Torch/flax shadow weights are a second copy of the same model in a format
+    // the server never reads — a doubled download. `.bin` itself stays allowed:
+    // qwen4_exp's `ngram_table.bin` is an engine-read sidecar (mmapped at serve
+    // time), and dropping it is what made app-downloaded packs fail to load.
+    const skip_ext = [_][]const u8{ ".png", ".jpg", ".jpeg", ".gif", ".webp", ".pdf", ".md", ".pth", ".h5", ".msgpack", ".ckpt" };
+    for (skip_ext) |ext| {
+        if (path.len > ext.len and std.ascii.eqlIgnoreCase(path[path.len - ext.len ..], ext)) return false;
+    }
+    if (isTorchShadowBin(path)) return false;
+    return true;
+}
+
+// ── Pull ────────────────────────────────────────────────────────────────
+
+pub const Reporter = struct {
+    impl: *anyopaque,
+    /// One human-readable status line per call (no trailing newline).
+    reportFn: *const fn (impl: *anyopaque, line: []const u8) void,
+
+    pub fn say(self: Reporter, comptime fmt: []const u8, args: anytype) void {
+        var buf: [512]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, fmt, args) catch return;
+        self.reportFn(self.impl, line);
+    }
+};
+
+/// Appends the shared curl argv prefix; returns the owned Authorization
+/// header string when HF_TOKEN is set (caller frees).
+fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !?[]u8 {
+    try list.appendSlice(allocator, &.{ "curl", "-fL", "--retry", "3", "--retry-delay", "2" });
+    if (env.get(.HF_TOKEN)) |tok| {
+        const header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{std.mem.span(tok)});
+        try list.appendSlice(allocator, &.{ "-H", header });
+        return header;
+    }
+    return null;
+}
+
+/// GET a small HTTPS document (the tree listing) via curl; returns stdout.
+fn curlFetch(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    const header_storage = try curlBaseArgs(&argv, allocator);
+    defer if (header_storage) |h| allocator.free(h);
+    try argv.appendSlice(allocator, &.{ "-s", url });
+    const result = std.process.run(allocator, io, .{
+        .argv = argv.items,
+        .stdout_limit = .limited(64 * 1024 * 1024),
+    }) catch return error.FetchFailed;
+    defer allocator.free(result.stderr);
+    errdefer allocator.free(result.stdout);
+    switch (result.term) {
+        // Quiet on failure — callers report (the REPL health poll EXPECTS
+        // failures while the server boots).
+        .exited => |code| if (code != 0) return error.FetchFailed,
+        else => return error.FetchFailed,
+    }
+    return result.stdout;
+}
+
+/// Download one file to `<dest_dir>/<file>` via curl (`-C -` resume onto a
+/// .partial, atomic rename on success). `show_progress` inherits stderr so
+/// the terminal gets curl's progress bar; the server-side pull passes false.
+fn curlDownload(allocator: std.mem.Allocator, io: std.Io, url: []const u8, dest_path: []const u8, show_progress: bool) !void {
+    const partial = try std.fmt.allocPrint(allocator, "{s}.partial", .{dest_path});
+    defer allocator.free(partial);
+
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(allocator);
+    const header_storage = try curlBaseArgs(&argv, allocator);
+    defer if (header_storage) |h| allocator.free(h);
+    try argv.appendSlice(allocator, &.{ "--create-dirs", "-C", "-", "-o", partial });
+    if (show_progress) {
+        try argv.append(allocator, "--progress-bar");
+    } else {
+        try argv.append(allocator, "-sS");
+    }
+    try argv.append(allocator, url);
+
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .stdin = .ignore,
+        .stdout = .ignore,
+        .stderr = if (show_progress) .inherit else .ignore,
+    }) catch return error.DownloadFailed;
+    const term = child.wait(io) catch return error.DownloadFailed;
+    switch (term) {
+        .exited => |code| if (code != 0) return error.DownloadFailed,
+        else => return error.DownloadFailed,
+    }
+    std.Io.Dir.renameAbsolute(partial, dest_path, io) catch return error.DownloadFailed;
+}
+
+fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
+    if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return null;
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return null;
+    defer dir.close(io);
+    const st = dir.statFile(io, rel, .{}) catch return null;
+    if (st.kind != .file) return null;
+    return st.size;
+}
+
+/// True when the model directory already holds a COMPLETE, loadable
+/// checkpoint. "config.json exists" is NOT enough: an interrupted `pull`
+/// (Ctrl-C mid-weights) leaves config.json + *.partial, and treating that
+/// as present skipped the resume and fed a weightless dir to the loader
+/// (live SIGSEGV — see tests/test_partial_download.sh). Complete means: no
+/// .partial leftovers anywhere (top level or one subdir deep, e.g.
+/// mtp/weights.safetensors.partial), plus config.json AND at least one
+/// .safetensors for MLX dirs — or any .gguf, which is self-contained.
+pub fn modelPresent(io: std.Io, dir_path: []const u8) bool {
+    if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return false;
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    return modelPresentInDir(io, dir);
+}
+
+fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
+    var has_config = false;
+    var has_safetensors = false;
+    var has_gguf = false;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .file => {
+                if (std.mem.endsWith(u8, entry.name, ".partial")) return false;
+                if (std.mem.eql(u8, entry.name, "config.json")) has_config = true;
+                if (std.mem.endsWith(u8, entry.name, ".safetensors")) has_safetensors = true;
+                if (std.mem.endsWith(u8, entry.name, ".gguf")) has_gguf = true;
+            },
+            .directory => {
+                // One level deep is enough for the pull layouts (mtp/ is the
+                // only subdir the chat-default selection downloads into).
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                var sit = sub.iterate();
+                while (sit.next(io) catch null) |se| {
+                    if (se.kind == .file and std.mem.endsWith(u8, se.name, ".partial")) return false;
+                }
+            },
+            else => {},
+        }
+    }
+    if (has_gguf) return true;
+    return has_config and has_safetensors;
+}
+
+/// Download `resolved.repo` into `dest_dir`. Skips files already complete
+/// on disk (size match), resumes partials, reports per-file progress.
+pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, dest_dir: []const u8, reporter: Reporter, show_progress: bool) !void {
+    // The Mac App Store build has no `curl` (the sandboxed helper can't reach
+    // it) and must not download to arbitrary paths — the Swift app owns model
+    // downloads via URLSession into the container.
+    if (build_options.mas) {
+        reporter.say("model pull is unavailable in this build", .{});
+        return error.PullUnavailable;
+    }
+    reporter.say("pulling manifest for {s}", .{resolved.repo});
+    const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
+    defer allocator.free(tree_url);
+    const tree_json = curlFetch(allocator, io, tree_url) catch {
+        reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
+        return error.PullFailed;
+    };
+    defer allocator.free(tree_json);
+    const files = parseTreeJson(allocator, tree_json) catch {
+        reporter.say("error: unexpected listing for {s}", .{resolved.repo});
+        return error.PullFailed;
+    };
+    defer freeRepoFiles(allocator, files);
+
+    const config_json = try fetchListed(allocator, io, resolved.repo, files, "config.json");
+    defer if (config_json) |c| allocator.free(c);
+    const media = isMediaListing(allocator, files, config_json);
+    const index_json = try fetchListed(allocator, io, resolved.repo, files, "model.safetensors.index.json");
+    defer if (index_json) |j| allocator.free(j);
+    const index = if (index_json) |j| std.json.parseFromSlice(std.json.Value, allocator, j, .{}) catch null else null;
+    defer if (index) |p| p.deinit();
+    var r = resolved;
+    if (index) |p| if (p.value == .object) {
+        r.indexed = p.value.object.get("weight_map");
+    };
+    if (r.gguf_file.len == 0) r.gguf_group = try chooseGgufGroup(allocator, io, files, r.quant, reporter) orelse "";
+    if (r.gguf_group.len > 0) r.gguf_mtp = pickMtpSidecar(files, r.gguf_group);
+
+    var wanted: usize = 0;
+    var total_bytes: u64 = 0;
+    var has_weights = false;
+    for (files) |f| {
+        if (!wantedFile(r, f.path, media)) continue;
+        wanted += 1;
+        total_bytes += f.size;
+        if (std.mem.endsWith(u8, f.path, ".safetensors") or std.mem.endsWith(u8, f.path, ".gguf")) has_weights = true;
+    }
+    if (!has_weights) {
+        reporter.say("error: {s} has no weights this pull can fetch", .{resolved.repo});
+        return error.PullFailed;
+    }
+    reporter.say("{d} files, {d} MB total", .{ wanted, total_bytes / (1024 * 1024) });
+
+    var idx: usize = 0;
+    for (files) |f| {
+        if (!wantedFile(r, f.path, media)) continue;
+        idx += 1;
+        const dest_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dest_dir, f.path });
+        defer allocator.free(dest_path);
+        if (f.size > 0) {
+            if (fileSizeAt(io, dest_dir, f.path)) |have| {
+                if (have == f.size) {
+                    reporter.say("[{d}/{d}] {s} — already complete", .{ idx, wanted, f.path });
+                    continue;
+                }
+            }
+        }
+        reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
+        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
+        defer allocator.free(url);
+        curlDownload(allocator, io, url, dest_path, show_progress) catch {
+            reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
+            return error.PullFailed;
+        };
+    }
+    reporter.say("success: {s} ready", .{resolved.repo});
+}
+
+fn wantedFile(resolved: Resolved, path: []const u8, media: bool) bool {
+    if (resolved.gguf_file.len > 0) {
+        // Single-artifact GGUF repos: just that file (plus nothing else).
+        return std.mem.eql(u8, path, resolved.gguf_file);
+    }
+    if (resolved.gguf_group.len > 0 and std.mem.endsWith(u8, path, ".gguf"))
+        return std.mem.eql(u8, path, resolved.gguf_mtp) or std.mem.eql(u8, ggufGroup(path) orelse return false, resolved.gguf_group);
+    if (media) return shouldDownloadFile(path);
+    return shouldDownload(path) or indexNames(resolved.indexed, path);
+}
+
+/// Whether an index's `weight_map` names `path` as a shard: the checkpoint's own parts list.
+fn indexNames(weight_map: ?std.json.Value, path: []const u8) bool {
+    const wm = weight_map orelse return false;
+    if (wm != .object) return false;
+    for (wm.object.values()) |v| if (v == .string and std.mem.eql(u8, v.string, path)) return true;
+    return false;
+}
+
+/// The body of `name` from the repo's `main`, when the listing has it and it can be fetched.
+fn fetchListed(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, files: []const RepoFile, name: []const u8) !?[]u8 {
+    for (files) |f| {
+        if (!std.mem.eql(u8, f.path, name)) continue;
+        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ repo, name });
+        defer allocator.free(url);
+        return curlFetch(allocator, io, url) catch null;
+    }
+    return null;
+}
+
+/// The quant group a GGUF file belongs to: its path without the split suffix
+/// (`-00001-of-00003`) and extension, so the parts of one split model group together.
+/// Null for what is not a model to pick: a sidecar discovery skips (MTP head, mmproj,
+/// tokenizer: `model_discovery.isGgufSidecarBasename`) or an importance matrix (imatrix).
+pub fn ggufGroup(path: []const u8) ?[]const u8 {
+    const base = std.fs.path.basename(path);
+    if (!std.mem.endsWith(u8, path, ".gguf") or model_discovery.isGgufSidecarBasename(base) or std.ascii.startsWithIgnoreCase(base, "imatrix")) return null;
+    const stem = path[0 .. path.len - ".gguf".len];
+    const of = std.mem.lastIndexOf(u8, stem, "-of-") orelse return stem;
+    const dash = std.mem.lastIndexOfScalar(u8, stem[0..of], '-') orelse return stem;
+    for (stem[dash + 1 .. of]) |c| if (!std.ascii.isDigit(c)) return stem;
+    return stem[0..dash];
+}
+
+/// The one MTP draft head to pull beside the chosen group: the one quantized like it
+/// (same last `-` token: `...-Q4_K_M`), else the smallest. Repos ship several (BF16 to Q4).
+fn pickMtpSidecar(files: []const RepoFile, group: []const u8) []const u8 {
+    const quant = group[(std.mem.lastIndexOfScalar(u8, group, '-') orelse 0)..];
+    var best: ?RepoFile = null;
+    for (files) |f| {
+        if (!model_discovery.isMtpGgufBasename(std.fs.path.basename(f.path))) continue;
+        if (std.ascii.endsWithIgnoreCase(f.path[0 .. f.path.len - ".gguf".len], quant)) return f.path;
+        if (best == null or f.size < best.?.size) best = f;
+    }
+    return if (best) |b| b.path else "";
+}
+
+/// Picks the GGUF quant to pull when the repo ships more than one: the tag's
+/// unique match, else the user's answer at a terminal, else a listed error.
+/// Null when there is nothing to choose (no GGUF, or one).
+fn chooseGgufGroup(allocator: std.mem.Allocator, io: std.Io, files: []const RepoFile, quant: []const u8, reporter: Reporter) !?[]const u8 {
+    var groups = std.ArrayList(struct { key: []const u8, bytes: u64 }).empty;
+    defer groups.deinit(allocator);
+    for (files) |f| {
+        const key = ggufGroup(f.path) orelse continue;
+        const i = for (groups.items, 0..) |g, i| {
+            if (std.mem.eql(u8, g.key, key)) break i;
+        } else blk: {
+            try groups.append(allocator, .{ .key = key, .bytes = 0 });
+            break :blk groups.items.len - 1;
+        };
+        groups.items[i].bytes += f.size;
+    }
+    // No GGUF: a tag names no quant here (an MLX repo's `:8bit`), so it is ignored as before.
+    if (groups.items.len == 0 or (groups.items.len == 1 and quant.len == 0)) return null;
+
+    // An exact quant token (`-Q6_K`) wins, so `:Q6_K` is not ambiguous beside `Q6_K_L`;
+    // a substring of the name is the fallback.
+    var matches = std.ArrayList(usize).empty;
+    defer matches.deinit(allocator);
+    for (groups.items, 0..) |g, i| if (quant.len == 0 or endsWithQuant(g.key, quant)) try matches.append(allocator, i);
+    if (matches.items.len == 0) for (groups.items, 0..) |g, i| if (std.ascii.findIgnoreCase(g.key, quant) != null) try matches.append(allocator, i);
+    if (matches.items.len == 1) return groups.items[matches.items[0]].key;
+
+    if (quant.len > 0) reporter.say("{s} matches {d} of the repo's GGUF quants:", .{ quant, matches.items.len }) else reporter.say("this repo ships {d} GGUF quants:", .{groups.items.len});
+    if (matches.items.len == 0) for (0..groups.items.len) |i| try matches.append(allocator, i);
+    for (matches.items, 1..) |gi, n| reporter.say("  {d}) {s}  ({d:.1} GB)", .{ n, std.fs.path.basename(groups.items[gi].key), @as(f64, @floatFromInt(groups.items[gi].bytes)) / 1e9 });
+
+    if (!(std.Io.File.stdin().isTty(io) catch false)) {
+        reporter.say("pick one: mlx-serve pull <org/repo>:<QUANT>  (e.g. :Q4_K_M)", .{});
+        return error.PullFailed;
+    }
+    var buf: [64]u8 = undefined;
+    var stdin_r = std.Io.File.stdin().reader(io, &buf);
+    while (true) {
+        reporter.say("quant number:", .{});
+        const line = (stdin_r.interface.takeDelimiter('\n') catch return error.PullFailed) orelse return error.PullFailed;
+        const n = std.fmt.parseInt(usize, std.mem.trim(u8, line, " \t\r"), 10) catch continue;
+        if (n >= 1 and n <= matches.items.len) return groups.items[matches.items[n - 1]].key;
+    }
+}
+
+/// `key` (a `ggufGroup`) ends with `quant` as its own `-`/`.`-delimited token.
+fn endsWithQuant(key: []const u8, quant: []const u8) bool {
+    if (key.len <= quant.len or !std.ascii.endsWithIgnoreCase(key, quant)) return false;
+    const sep = key[key.len - quant.len - 1];
+    return sep == '-' or sep == '.';
+}
+
+/// A media pack keeps its components in folders (FLUX's transformer/ and vae/,
+/// LTX's text encoder, Music3's tokenizers), so its pull takes every folder.
+/// Markers are the ones discovery classifies by: a configless pack's own
+/// config file, else `config.json`'s `model_type`.
+fn isMediaListing(allocator: std.mem.Allocator, files: []const RepoFile, config_json: ?[]const u8) bool {
+    const markers = [_][]const u8{ "model_index.json", "model_config.json", "rl_agent_config.json", "kev_config.json", "joint_head_config.json" };
+    for (files) |f| for (markers) |m| if (std.mem.eql(u8, f.path, m)) return true;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json orelse return false, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const mt = parsed.value.object.get("model_type") orelse return false;
+    return mt == .string and model_discovery.isMediaModelType(mt.string);
+}
+
+// ── Commands ────────────────────────────────────────────────────────────
+
+fn stderrReport(impl: *anyopaque, line: []const u8) void {
+    _ = impl;
+    log.info("{s}\n", .{line});
+}
+
+var stderr_reporter_dummy: u8 = 0;
+const stderr_reporter = Reporter{ .impl = &stderr_reporter_dummy, .reportFn = &stderrReport };
+
+/// Resolve + download-if-missing; returns the local model dir (owned).
+/// Exits the process with a friendly message on unknown names.
+pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []const u8) ![]u8 {
+    // A path that exists locally is used as-is.
+    if (std.fs.path.isAbsolute(name)) return allocator.dupe(u8, name);
+    const resolved = resolveShortName(name) orelse {
+        log.err("unknown model '{s}'\n", .{name});
+        printKnownAliases(io);
+        std.process.exit(1);
+    };
+    const dest = try modelDestPath(allocator, homeDir(), resolved.repo);
+    errdefer allocator.free(dest);
+    if (modelPresent(io, dest)) return dest;
+    try pullRepo(allocator, io, resolved, dest, stderr_reporter, true);
+    return dest;
+}
+
+pub fn cmdPull(allocator: std.mem.Allocator, io: std.Io, name: []const u8) !void {
+    const dir = try ensureModelAvailable(allocator, io, name);
+    defer allocator.free(dir);
+    log.info("model at {s}\n", .{dir});
+    log.info("run it: mlx-serve run {s}\n", .{name});
+}
+
+fn printKnownAliases(io: std.Io) void {
+    _ = io;
+    log.err("known short names (or use any HuggingFace 'org/repo'):\n", .{});
+    for (aliases) |a| {
+        if (a.is_default) {
+            log.err("  {s} (= {s}:{s}) -> {s}\n", .{ a.name, a.name, a.tag, a.repo });
+        } else {
+            log.err("  {s}:{s} -> {s}\n", .{ a.name, a.tag, a.repo });
+        }
+    }
+}
+
+/// `mlx-serve list` — models on disk under ~/.mlx-serve/models.
+pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
+    const root = try modelsRootPath(allocator, homeDir());
+    defer allocator.free(root);
+
+    var out_buf: [4096]u8 = undefined;
+    var stdout_w = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &stdout_w.interface;
+    defer w.flush() catch {};
+
+    var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch {
+        try w.print("no models yet (looked in {s})\ntry: mlx-serve pull gemma4\n", .{root});
+        return;
+    };
+    defer dir.close(io);
+
+    try w.print("{s: <56} {s: <12} {s: >10}\n", .{ "NAME", "TYPE", "SIZE" });
+    if (try listTree(io, allocator, w, &dir, root) == 0) {
+        try w.print("(none) — try: mlx-serve pull gemma4\n", .{});
+    }
+}
+
+/// One row per model dir under `dir`, at the top level or one org level down; returns the row count.
+fn listTree(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, root: []const u8) !usize {
+    var count: usize = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!treeEntryDescends(entry.kind)) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer sub.close(io);
+        if (isModelDir(io, &sub)) {
+            try printModelRow(io, allocator, w, &sub, entry.name, root);
+            count += 1;
+            continue;
+        }
+        // org/ level: one more hop down.
+        var sub_it = sub.iterate();
+        while (sub_it.next(io) catch null) |sub_entry| {
+            if (!treeEntryDescends(sub_entry.kind)) continue;
+            var leaf = sub.openDir(io, sub_entry.name, .{ .iterate = true }) catch continue;
+            defer leaf.close(io);
+            if (!isModelDir(io, &leaf)) continue;
+            var name_buf: [512]u8 = undefined;
+            const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
+            try printModelRow(io, allocator, w, &leaf, full, root);
+            count += 1;
+        }
+    }
+    return count;
+}
+
+/// A tree-walk entry worth descending into: a real directory OR a symlink
+/// (a checkpoint moved to an external drive and linked back — the H3 mirrors
+/// live that way; openDir resolves the link, and model_discovery's own walk
+/// already accepts both kinds).
+fn treeEntryDescends(kind: std.Io.File.Kind) bool {
+    return kind == .directory or kind == .sym_link;
+}
+
+fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
+    if (dir.statFile(io, "config.json", .{})) |st| {
+        if (st.kind == .file) return true;
+    } else |_| {}
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind == .file) return true;
+    }
+    // A configless media pack (MageFlow, an mflux FLUX.2 conversion, Laya, ...) is its plugin's claim, the one
+    // discovery reads, so `list` and `/v1/models` cannot disagree about what counts as a model.
+    return served_media.claimIn(io, dir.*) != null;
+}
+
+fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
+    const bytes = dirBytesOneLevel(io, dir);
+    // TYPE from the same classification serving uses (gguf → chat via the
+    // embedded engines, media modalities, embed, drafter, unsupported) so
+    // the list is honest about which rows `run` can actually chat with.
+    const abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, name }) catch null;
+    defer if (abs) |a| allocator.free(a);
+    const kind_label: []const u8 = blk: {
+        const a = abs orelse break :blk "?";
+        const kind = model_discovery.classifyModelPath(io, allocator, a) orelse break :blk "?";
+        break :blk kind.label();
+    };
+    var size_buf: [32]u8 = undefined;
+    try w.print("{s: <56} {s: <12} {s: >10}\n", .{ name, kind_label, formatSize(&size_buf, bytes) });
+}
+
+/// Sum file bytes in a model dir INCLUDING one level of subdirectories —
+/// media bundles keep their weights in transformer/ vae/ text_encoder/ etc.
+/// (the same one-level layout assumption `modelPresent` makes). Top-level-
+/// only summing showed a 7 GB FLUX bundle as "6 KB".
+fn dirBytesOneLevel(io: std.Io, dir: *std.Io.Dir) u64 {
+    var bytes: u64 = 0;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        switch (entry.kind) {
+            .file, .sym_link => {
+                const st = dir.statFile(io, entry.name, .{}) catch continue;
+                if (st.kind == .file) bytes += @intCast(st.size);
+            },
+            .directory => {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                var sit = sub.iterate();
+                while (sit.next(io) catch null) |se| {
+                    if (se.kind != .file and se.kind != .sym_link) continue;
+                    const st = sub.statFile(io, se.name, .{}) catch continue;
+                    if (st.kind != .file) continue;
+                    bytes += @intCast(st.size);
+                }
+            },
+            else => {},
+        }
+    }
+    return bytes;
+}
+
+pub fn formatSize(buf: []u8, bytes: u64) []const u8 {
+    const gb = 1024 * 1024 * 1024;
+    const mb = 1024 * 1024;
+    if (bytes >= gb) {
+        const whole = bytes / gb;
+        const tenth = (bytes % gb) * 10 / gb;
+        return std.fmt.bufPrint(buf, "{d}.{d} GB", .{ whole, tenth }) catch "?";
+    }
+    if (bytes >= mb) return std.fmt.bufPrint(buf, "{d} MB", .{bytes / mb}) catch "?";
+    return std.fmt.bufPrint(buf, "{d} KB", .{bytes / 1024}) catch "?";
+}
+
+// ── REPL (mlx-serve run) ────────────────────────────────────────────────
+//
+// The REPL is deliberately a real HTTP client against the server's own
+// /api/chat endpoint (via curl, streaming NDJSON) — it dogfoods the Ollama
+// surface on every keystroke instead of poking internal functions.
+
+pub const Turn = struct {
+    role: []const u8,
+    content: []const u8,
+};
+
+/// /api/chat request body for the REPL conversation so far.
+pub fn buildReplChatBody(allocator: std.mem.Allocator, history: []const Turn) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll("{\"model\":\"mlx-serve\",\"stream\":true,\"messages\":[");
+    for (history, 0..) |turn, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.writeAll("{\"role\":");
+        try ollama.writeJsonString(w, turn.role);
+        try w.writeAll(",\"content\":");
+        try ollama.writeJsonString(w, turn.content);
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+    return allocator.dupe(u8, out.written());
+}
+
+pub const ReplDelta = struct {
+    /// Owned by caller.
+    content: []u8,
+    done: bool,
+    eval_count: u64 = 0,
+    eval_duration_ns: u64 = 0,
+    err: ?[]u8 = null,
+};
+
+/// One NDJSON line from /api/chat → the piece the REPL prints.
+pub fn parseReplLine(allocator: std.mem.Allocator, line: []const u8) ?ReplDelta {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, line, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    const root = parsed.value.object;
+    if (root.get("error")) |e| {
+        if (e == .string) {
+            return .{
+                .content = allocator.dupe(u8, "") catch return null,
+                .done = true,
+                .err = allocator.dupe(u8, e.string) catch return null,
+            };
+        }
+    }
+    var content: []const u8 = "";
+    if (root.get("message")) |m| {
+        if (m == .object) {
+            if (m.object.get("content")) |c| {
+                if (c == .string) content = c.string;
+            }
+        }
+    }
+    const done = if (root.get("done")) |d| (d == .bool and d.bool) else false;
+    var eval_count: u64 = 0;
+    var eval_ns: u64 = 0;
+    if (done) {
+        if (root.get("eval_count")) |v| {
+            if (v == .integer and v.integer > 0) eval_count = @intCast(v.integer);
+        }
+        if (root.get("eval_duration")) |v| {
+            if (v == .integer and v.integer > 0) eval_ns = @intCast(v.integer);
+        }
+    }
+    return .{
+        .content = allocator.dupe(u8, content) catch return null,
+        .done = done,
+        .eval_count = eval_count,
+        .eval_duration_ns = eval_ns,
+    };
+}
+
+/// Interactive loop on the calling thread. Waits for the server to answer
+/// /health, then reads prompts from stdin and streams /api/chat responses.
+/// Returns when the user exits (/bye or EOF); caller shuts the server down.
+pub fn runRepl(allocator: std.mem.Allocator, io: std.Io, port: u16) !void {
+    const health_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/health", .{port});
+    defer allocator.free(health_url);
+    // Big checkpoints take a while to fault in; poll patiently.
+    var waited_ms: u64 = 0;
+    while (waited_ms < 15 * 60 * 1000) {
+        if (curlFetch(allocator, io, health_url)) |body| {
+            allocator.free(body);
+            break;
+        } else |_| {}
+        std.Io.sleep(io, .fromMilliseconds(500), .real) catch {};
+        waited_ms += 500;
+    }
+
+    const chat_url = try std.fmt.allocPrint(allocator, "http://127.0.0.1:{d}/api/chat", .{port});
+    defer allocator.free(chat_url);
+
+    var out_buf: [4096]u8 = undefined;
+    var stdout_w = std.Io.File.stdout().writer(io, &out_buf);
+    const w = &stdout_w.interface;
+    try w.writeAll("\n>>> chat is live — /bye to exit\n");
+    try w.flush();
+
+    var history = std.ArrayList(Turn).empty;
+    defer {
+        for (history.items) |t| allocator.free(t.content);
+        history.deinit(allocator);
+    }
+
+    var stdin_buf: [16 * 1024]u8 = undefined;
+    var stdin_r = std.Io.File.stdin().reader(io, &stdin_buf);
+    const r = &stdin_r.interface;
+
+    while (true) {
+        try w.writeAll(">>> ");
+        try w.flush();
+        const line = r.takeDelimiter('\n') catch break orelse break;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        if (std.mem.eql(u8, trimmed, "/bye") or std.mem.eql(u8, trimmed, "/exit") or std.mem.eql(u8, trimmed, "/quit")) break;
+
+        try history.append(allocator, .{ .role = "user", .content = try allocator.dupe(u8, trimmed) });
+        const body = try buildReplChatBody(allocator, history.items);
+        defer allocator.free(body);
+
+        const reply = streamOneTurn(allocator, io, chat_url, body, w) catch |err| {
+            try w.print("\n[error: {s}]\n", .{@errorName(err)});
+            try w.flush();
+            continue;
+        };
+        try history.append(allocator, .{ .role = "assistant", .content = reply });
+        try w.writeAll("\n");
+        try w.flush();
+    }
+}
+
+/// POST the body, stream NDJSON, print content deltas as they arrive.
+/// Returns the full assistant reply (owned).
+fn streamOneTurn(allocator: std.mem.Allocator, io: std.Io, url: []const u8, body: []const u8, w: *std.Io.Writer) ![]u8 {
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "curl", "-sN", "-X", "POST", "-H", "Content-Type: application/json", "--data-binary", "@-", url },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch return error.CurlSpawnFailed;
+    defer child.kill(io);
+
+    {
+        var in_buf: [4096]u8 = undefined;
+        var stdin_w = child.stdin.?.writer(io, &in_buf);
+        try stdin_w.interface.writeAll(body);
+        try stdin_w.interface.flush();
+        child.stdin.?.close(io);
+        child.stdin = null;
+    }
+
+    var full = std.ArrayList(u8).empty;
+    errdefer full.deinit(allocator);
+
+    var out_buf: [64 * 1024]u8 = undefined;
+    var stdout_r = child.stdout.?.reader(io, &out_buf);
+    const r = &stdout_r.interface;
+    while (true) {
+        const line = r.takeDelimiter('\n') catch break orelse break;
+        if (line.len == 0) continue;
+        const delta = parseReplLine(allocator, line) orelse continue;
+        defer allocator.free(delta.content);
+        if (delta.err) |e| {
+            defer allocator.free(e);
+            try w.print("[server error: {s}]", .{e});
+            try w.flush();
+            break;
+        }
+        if (delta.content.len > 0) {
+            try w.writeAll(delta.content);
+            try w.flush();
+            try full.appendSlice(allocator, delta.content);
+        }
+        if (delta.done) {
+            if (delta.eval_count > 0 and delta.eval_duration_ns > 0) {
+                const tok_s = @as(f64, @floatFromInt(delta.eval_count)) * 1e9 / @as(f64, @floatFromInt(delta.eval_duration_ns));
+                try w.print("\n[{d} tokens, {d:.1} tok/s]", .{ delta.eval_count, tok_s });
+            }
+            break;
+        }
+    }
+    _ = child.wait(io) catch {};
+    return full.toOwnedSlice(allocator);
+}
+
+// ── Tests ───────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
+    // Bare alias picks the family default.
+    try testing.expectEqualStrings("mlx-community/gemma-4-e4b-it-4bit", resolveShortName("gemma4").?.repo);
+    try testing.expectEqualStrings("ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", resolveShortName("qwen3.6").?.repo);
+    // Tagged alias.
+    try testing.expectEqualStrings("mlx-community/gemma-4-12b-it-4bit", resolveShortName("gemma4:12b").?.repo);
+    try testing.expectEqualStrings("mlx-community/gemma-4-26b-a4b-it-8bit", resolveShortName("GEMMA4:26B-8BIT").?.repo);
+    // :latest behaves like bare.
+    try testing.expectEqualStrings("mlx-community/gemma-4-e4b-it-4bit", resolveShortName("gemma4:latest").?.repo);
+    // Direct org/repo passthrough, tag stripped, hf.co prefixes stripped.
+    try testing.expectEqualStrings("org/repo", resolveShortName("org/repo").?.repo);
+    try testing.expectEqualStrings("org/repo", resolveShortName("org/repo:latest").?.repo);
+    try testing.expectEqualStrings("", resolveShortName("org/repo:latest").?.quant);
+    try testing.expectEqualStrings("IQ3_XXS", resolveShortName("hf.co/org/repo:IQ3_XXS").?.quant);
+    try testing.expectEqualStrings("org/repo", resolveShortName("hf.co/org/repo").?.repo);
+    try testing.expectEqualStrings("org/repo", resolveShortName("https://huggingface.co/org/repo").?.repo);
+    // GGUF single-artifact alias carries its file restriction.
+    const ds = resolveShortName("deepseek-v4").?;
+    try testing.expect(ds.gguf_file.len > 0);
+    // Unknown alias-shaped name → null.
+    try testing.expect(resolveShortName("doesnotexist") == null);
+    try testing.expect(resolveShortName("gemma4:nosuchtag") == null);
+}
+
+test "cli: modelDestPath layout" {
+    const allocator = testing.allocator;
+    const p = try modelDestPath(allocator, "/Users/x", "org/repo");
+    defer allocator.free(p);
+    try testing.expectEqualStrings("/Users/x/.mlx-serve/models/org/repo", p);
+}
+
+test "cli: shouldDownload chat-default selection" {
+    try testing.expect(shouldDownload("config.json"));
+    try testing.expect(shouldDownload("model.safetensors"));
+    try testing.expect(shouldDownload("model-00001-of-00002.safetensors"));
+    try testing.expect(shouldDownload("tokenizer.json"));
+    try testing.expect(shouldDownload("chat_template.jinja"));
+    try testing.expect(shouldDownload("mtp/weights.safetensors"));
+    try testing.expect(shouldDownload("drafter/model.safetensors"));
+    // A model that speaks (LFM3-Audio, Omni): its speech codec.
+    try testing.expect(shouldDownload("audio_tokenizer/model.safetensors"));
+    try testing.expect(!shouldDownload(".gitattributes"));
+    try testing.expect(!shouldDownload("README.md"));
+    try testing.expect(!shouldDownload("assets/demo.png"));
+    try testing.expect(!shouldDownload("banner.png"));
+    try testing.expect(!shouldDownload("vae/weights.safetensors")); // media subdirs are app-bundle territory
+    try testing.expect(shouldDownload("g2p/us_gold.json"));
+    try testing.expect(shouldDownload("speech_tokenizer/model.safetensors"));
+    try testing.expect(shouldDownload("speech_tokenizer/config.json"));
+    try testing.expect(!shouldDownload("g2p/README.md"));
+    // A `.bin` the engine READS (qwen4_exp ngram_table) is needed; torch-format
+    // shadow weights are a second copy of the same model. Same rule as the app's
+    // `DownloadManager.selectNeededFiles` — keep them in sync.
+    try testing.expect(shouldDownload("ngram_table.bin"));
+    try testing.expect(!shouldDownload("pytorch_model-00001-of-00002.bin"));
+    try testing.expect(!shouldDownload("consolidated.pth"));
+    try testing.expect(!shouldDownload("flax_model.msgpack"));
+    // DeepSeek-V4.1 repack: Engram tables in `engram/`, the token map a `.u32`.
+    try testing.expect(shouldDownload("engram/engram-L1.bin"));
+    try testing.expect(shouldDownload("engram-token-map.u32"));
+    try testing.expect(shouldDownload("experts.bin"));
+    // NVIDIA ModelOpt packs keep their shards in `tensors/`.
+    try testing.expect(shouldDownload("tensors/model-00001-of-00021.safetensors"));
+    try testing.expect(!shouldDownload("receipts/convert.json"));
+    try testing.expect(!shouldDownload("encoding/encoding.py"));
+}
+
+test "cli: a nested shard the index names is part of the pack" {
+    const index =
+        \\{"weight_map": {"embed.weight": "model-00001-of-00002.safetensors",
+        \\                "vision_embedder.pos_embedding": "optiq/optiq_vision.safetensors"}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, index, .{});
+    defer parsed.deinit();
+    const without = Resolved{ .repo = "mlx-community/humanizer-12b-OptiQ-4bit" };
+    const with = Resolved{ .repo = without.repo, .indexed = parsed.value.object.get("weight_map") };
+
+    try testing.expect(!wantedFile(without, "optiq/optiq_vision.safetensors", false));
+    try testing.expect(wantedFile(with, "optiq/optiq_vision.safetensors", false));
+    try testing.expect(wantedFile(with, "model-00001-of-00002.safetensors", false));
+    try testing.expect(!wantedFile(with, "optiq/metadata.json", false)); // not named by the index
+    try testing.expect(!wantedFile(with, "original/model.safetensors", false));
+}
+
+test "cli: a media pack's pull keeps its component folders (#362)" {
+    // FLUX.2-klein as Runpod and mlx-community ship it: every weight sits in a folder.
+    const tree =
+        \\[{"type":"file","path":"config.json","size":1},
+        \\ {"type":"file","path":"README.md","size":1},
+        \\ {"type":"file","path":"assets/demo.png","size":1},
+        \\ {"type":"file","path":"transformer/0.safetensors","size":1},
+        \\ {"type":"file","path":"transformer/model.safetensors.index.json","size":1},
+        \\ {"type":"file","path":"text_encoder/0.safetensors","size":1},
+        \\ {"type":"file","path":"text_encoder/pytorch_model.bin","size":1},
+        \\ {"type":"file","path":"vae/0.safetensors","size":1},
+        \\ {"type":"file","path":"tokenizer/tokenizer.json","size":1}]
+    ;
+    const files = try parseTreeJson(testing.allocator, tree);
+    defer freeRepoFiles(testing.allocator, files);
+    const resolved = Resolved{ .repo = "Runpod/FLUX.2-klein-4B-mflux-4bit" };
+
+    const media = isMediaListing(testing.allocator, files, "{\"model_type\": \"flux2-klein-4b\"}");
+    try testing.expect(media);
+    var kept = std.ArrayList([]const u8).empty;
+    defer kept.deinit(testing.allocator);
+    for (files) |f| if (wantedFile(resolved, f.path, media)) try kept.append(testing.allocator, f.path);
+    const want = [_][]const u8{ "config.json", "transformer/0.safetensors", "transformer/model.safetensors.index.json", "text_encoder/0.safetensors", "vae/0.safetensors", "tokenizer/tokenizer.json" };
+    try testing.expectEqual(want.len, kept.items.len);
+    for (want, kept.items) |w, k| try testing.expectEqualStrings(w, k);
+
+    // The same folders on a chat pack stay out, and configless media packs carry a marker.
+    try testing.expect(!isMediaListing(testing.allocator, files, "{\"model_type\": \"qwen3\"}"));
+    try testing.expect(!wantedFile(resolved, "vae/0.safetensors", false));
+    const mage = try parseTreeJson(testing.allocator, "[{\"type\":\"file\",\"path\":\"model_index.json\",\"size\":1}]");
+    defer freeRepoFiles(testing.allocator, mage);
+    try testing.expect(isMediaListing(testing.allocator, mage, null));
+}
+
+test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
+    // Regression: an interrupted `pull` (Ctrl-C mid-weights) leaves
+    // config.json + model.safetensors.partial. modelPresent used to return
+    // true on config.json alone, so the rerun skipped the resume and fed a
+    // weightless dir to the loader (SIGSEGV). Present now means: no .partial
+    // leftovers anywhere (top level or one subdir deep), and config.json +
+    // >=1 .safetensors (MLX) or any .gguf.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // config.json alone (weights never started): not present.
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/config.json", .data = "{}" });
+    {
+        var d = try tmp.dir.openDir(io, "a", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // config.json + interrupted weights: not present (the user's live repro).
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/model.safetensors.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "a", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // Complete single-file checkpoint: present.
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/model.safetensors", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "b", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(modelPresentInDir(io, d));
+    }
+
+    // Complete weights but another file still partial (e.g. tokenizer.json):
+    // not present — resume must finish the pull.
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/tokenizer.json.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "b", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // Interrupted sidecar one subdir deep (mtp/weights.safetensors.partial):
+    // not present.
+    try tmp.dir.createDirPath(io, "c/mtp");
+    try tmp.dir.writeFile(io, .{ .sub_path = "c/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c/model.safetensors", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c/mtp/weights.safetensors.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "c", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // GGUF: the file itself is the checkpoint (no config.json needed)…
+    try tmp.dir.createDirPath(io, "g");
+    try tmp.dir.writeFile(io, .{ .sub_path = "g/model-Q4_K_M.gguf", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "g", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(modelPresentInDir(io, d));
+    }
+
+    // …but a partial GGUF is not.
+    try tmp.dir.createDirPath(io, "h");
+    try tmp.dir.writeFile(io, .{ .sub_path = "h/model-Q4_K_M.gguf.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "h", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+}
+
+test "cli: parseTreeJson uses lfs size and skips directories" {
+    const allocator = testing.allocator;
+    const files = try parseTreeJson(allocator,
+        \\[{"type":"directory","path":"mtp","size":0},
+        \\ {"type":"file","path":"config.json","size":1234},
+        \\ {"type":"file","path":"model.safetensors","size":135,"lfs":{"size":5300000000,"sha256":"x"}}]
+    );
+    defer freeRepoFiles(allocator, files);
+    try testing.expectEqual(@as(usize, 2), files.len);
+    try testing.expectEqualStrings("config.json", files[0].path);
+    try testing.expectEqual(@as(u64, 1234), files[0].size);
+    try testing.expectEqual(@as(u64, 5_300_000_000), files[1].size);
+}
+
+test "cli: buildReplChatBody and parseReplLine round-trip" {
+    const allocator = testing.allocator;
+    const history = [_]Turn{
+        .{ .role = "user", .content = "hi \"there\"\n" },
+        .{ .role = "assistant", .content = "hello" },
+    };
+    const body = try buildReplChatBody(allocator, &history);
+    defer allocator.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
+    defer parsed.deinit();
+    const msgs = parsed.value.object.get("messages").?.array.items;
+    try testing.expectEqual(@as(usize, 2), msgs.len);
+    try testing.expectEqualStrings("hi \"there\"\n", msgs[0].object.get("content").?.string);
+    try testing.expect(parsed.value.object.get("stream").?.bool);
+
+    const d1 = parseReplLine(allocator, "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"Hey\"},\"done\":false}").?;
+    defer allocator.free(d1.content);
+    try testing.expectEqualStrings("Hey", d1.content);
+    try testing.expect(!d1.done);
+
+    const d2 = parseReplLine(allocator, "{\"model\":\"m\",\"message\":{\"role\":\"assistant\",\"content\":\"\"},\"done\":true,\"done_reason\":\"stop\",\"eval_count\":50,\"eval_duration\":2000000000}").?;
+    defer allocator.free(d2.content);
+    try testing.expect(d2.done);
+    try testing.expectEqual(@as(u64, 50), d2.eval_count);
+
+    const d3 = parseReplLine(allocator, "{\"error\":\"boom\"}").?;
+    defer allocator.free(d3.content);
+    defer if (d3.err) |e| allocator.free(e);
+    try testing.expect(d3.done);
+    try testing.expectEqualStrings("boom", d3.err.?);
+}
+
+test "cli: formatSize" {
+    var buf: [32]u8 = undefined;
+    try testing.expectEqualStrings("5.2 GB", formatSize(&buf, 5_600_000_000));
+    try testing.expectEqualStrings("35 MB", formatSize(&buf, 36_700_160));
+    try testing.expectEqualStrings("2 KB", formatSize(&buf, 2048));
+}
+
+test "cli: dirBytesOneLevel counts weight subdirs (FLUX bundle showed 6 KB)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Media-bundle shape: small top-level config + the actual weights one
+    // level down in transformer/ and vae/ (the modelPresent layout).
+    try tmp.dir.createDirPath(io, "m/transformer");
+    try tmp.dir.createDirPath(io, "m/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" }); // 2 bytes
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/transformer/w.safetensors", .data = "0123456789" }); // 10
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/vae/w.safetensors", .data = "0123" }); // 4
+
+    var m = try tmp.dir.openDir(io, "m", .{ .iterate = true });
+    defer m.close(io);
+    try testing.expectEqual(@as(u64, 16), dirBytesOneLevel(io, &m));
+}
+
+test "cli: a serving boot with no model named falls back to the shared models root" {
+    // `mlx-serve serve` and `mlx-serve run <m>` already default the discovery
+    // root; the `--serve` FLAG form did not, so a bare `mlx-serve --serve`
+    // booted a server that had discovered nothing and could only answer 503 —
+    // never what anyone meant by "serve".
+    try testing.expect(shouldDefaultModelsRoot(.{ .subcommand = true, .serve_mode = true, .has_explicit_model = false }));
+    try testing.expect(shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = true, .has_explicit_model = false }));
+
+    // `--model <path> --serve` asked for ONE model. Quietly registering the
+    // other 28 on disk is a different server than the one requested.
+    try testing.expect(!shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = true, .has_explicit_model = true }));
+    // `mlx-serve run <model>` names a model AND wants the picker populated —
+    // the subcommand's existing behavior, which this must not change.
+    try testing.expect(shouldDefaultModelsRoot(.{ .subcommand = true, .serve_mode = true, .has_explicit_model = true }));
+
+    // Not serving at all (one-shot `--prompt`) never scans a root.
+    try testing.expect(!shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = false, .has_explicit_model = true }));
+    try testing.expect(!shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = false, .has_explicit_model = false }));
+}
+
+test "cli: isModelDir accepts a configless media pack (MageFlow, Laya), not a stranger's" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // `list` must agree with `/v1/models` about what a model is. A MageFlow
+    // repo carries only model_index.json, so a config-or-gguf test hides it
+    // from `list` while discovery serves it — the exact divergence the
+    // "one path must never classify two ways" rule exists to prevent.
+    try tmp.dir.createDirPath(io, "mage/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mage/model_index.json",
+        .data =
+        \\{"_class_name":"MageFlowPipeline"}
+        ,
+    });
+    var mage = try tmp.dir.openDir(io, "mage", .{ .iterate = true });
+    defer mage.close(io);
+    try testing.expect(isModelDir(io, &mage));
+
+    // An unrelated diffusers pipeline is NOT ours — it must stay hidden.
+    try tmp.dir.createDirPath(io, "other");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "other/model_index.json",
+        .data =
+        \\{"_class_name":"StableDiffusionPipeline"}
+        ,
+    });
+    var other = try tmp.dir.openDir(io, "other", .{ .iterate = true });
+    defer other.close(io);
+    try testing.expect(!isModelDir(io, &other));
+
+    // Every configless pack a media plugin claims counts, a Laya checkpoint too.
+    try tmp.dir.createDirPath(io, "laya/encoder");
+    try tmp.dir.writeFile(io, .{ .sub_path = "laya/rl_agent_config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "laya/encoder/config.json", .data = "{}" });
+    var laya = try tmp.dir.openDir(io, "laya", .{ .iterate = true });
+    defer laya.close(io);
+    try testing.expect(isModelDir(io, &laya));
+
+    // An org dir (no config, no index, no gguf) stays a directory to descend.
+    try tmp.dir.createDirPath(io, "org/repo");
+    var org = try tmp.dir.openDir(io, "org", .{ .iterate = true });
+    defer org.close(io);
+    try testing.expect(!isModelDir(io, &org));
+}
+
+test "cli: isModelDir accepts an mflux FLUX.2 repo (no config.json at all)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The klein 9B MLX build carries neither config.json nor model_index.json,
+    // so this is the third place that has to know the shape. Same rule as
+    // MageFlow above: `list` and `/v1/models` answer from one predicate.
+    try tmp.dir.createDirPath(io, "klein9/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "klein9/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"double_stream_modulation_img.linear.weight\":\"0.safetensors\"}}",
+    });
+    var klein = try tmp.dir.openDir(io, "klein9", .{ .iterate = true });
+    defer klein.close(io);
+    try testing.expect(isModelDir(io, &klein));
+
+    // A different DiT with the same directory shape is not ours.
+    try tmp.dir.createDirPath(io, "notflux/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "notflux/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"blocks.0.attn.qkv.weight\":\"0.safetensors\"}}",
+    });
+    var notflux = try tmp.dir.openDir(io, "notflux", .{ .iterate = true });
+    defer notflux.close(io);
+    try testing.expect(!isModelDir(io, &notflux));
+}
+
+test "cli: an unparsed argument is classified, never silently ignored" {
+    // `--flag=value`: main.zig's flag loop matches names EXACTLY and takes the
+    // value as the NEXT argument, so the '='-joined form is not a near-miss,
+    // it is a shape we have never accepted. Without one it falls out of the loop in
+    // silence — `--model=<path>` booted a healthy-looking headless server that
+    // then auto-picked a different model and crashed on it.
+    try testing.expectEqual(ArgReject.equals_form, classifyUnparsedArg("--model=/tmp/m", false));
+    try testing.expectEqual(ArgReject.equals_form, classifyUnparsedArg("--port=1234", false));
+    // Even in last position the '=' hint is the useful one.
+    try testing.expectEqual(ArgReject.equals_form, classifyUnparsedArg("--model=/tmp/m", true));
+
+    // A flag in the LAST position fell out because its value is missing —
+    // the loop's `i + 1 < args.len` guard is the only way to reach here.
+    try testing.expectEqual(ArgReject.missing_value, classifyUnparsedArg("--model", true));
+    try testing.expectEqual(ArgReject.missing_value, classifyUnparsedArg("-h", true));
+
+    // Anything else is simply not a flag we know.
+    try testing.expectEqual(ArgReject.unknown, classifyUnparsedArg("--frobnicate", false));
+    try testing.expectEqual(ArgReject.unknown, classifyUnparsedArg("stray", false));
+    // An '=' outside a flag is not the equals form.
+    try testing.expectEqual(ArgReject.unknown, classifyUnparsedArg("a=b", false));
+    try testing.expectEqual(ArgReject.unknown, classifyUnparsedArg("a=b", true));
+
+    // Every reason carries actionable advice, and the equals-form one names
+    // the shape that actually works.
+    for ([_]ArgReject{ .equals_form, .missing_value, .unknown }) |r| {
+        try testing.expect(r.hint().len > 0);
+    }
+    try testing.expect(std.mem.indexOf(u8, ArgReject.equals_form.hint(), "separate argument") != null);
+}
+
+test "cli: list walks symlinked model dirs at the top, org and leaf level" {
+    // A checkpoint moved to an external drive and linked back must stay listed, like discovery serves it.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "ext/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ext/org/m/config.json", .data = "{}" });
+    try tmp.dir.createDirPath(io, "root/org");
+    try tmp.dir.symLink(io, "../ext/org/m", "root/top", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "../../ext/org/m", "root/org/leaf", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "../ext/org", "root/linked_org", .{ .is_directory = true });
+    var root = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    defer root.close(io);
+
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try testing.expectEqual(@as(usize, 3), try listTree(io, testing.allocator, &w, &root, "/nonexistent"));
+    for ([_][]const u8{ "top ", "org/leaf ", "linked_org/m " }) |name| {
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), name) != null);
+    }
+}
+
+test "ggufGroup: split parts group together, quants apart, mmproj never" {
+    try testing.expectEqualStrings("M-Q4_K_M", ggufGroup("M-Q4_K_M.gguf").?);
+    try testing.expectEqualStrings("Q8_0/M-Q8_0", ggufGroup("Q8_0/M-Q8_0-00001-of-00003.gguf").?);
+    try testing.expectEqualStrings("Q8_0/M-Q8_0", ggufGroup("Q8_0/M-Q8_0-00003-of-00003.gguf").?);
+    try testing.expect(ggufGroup("mmproj-F16.gguf") == null);
+    try testing.expect(ggufGroup("imatrix_unsloth.gguf") == null);
+    try testing.expect(ggufGroup("mtp-M-Q4_0.gguf") == null);
+    try testing.expect(ggufGroup("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf") == null);
+    // One MTP head rides along with the picked quant; other quants and heads do not.
+    const r: Resolved = .{ .repo = "o/r", .gguf_group = "M-Q4_K_M", .gguf_mtp = "MTP/mtp-M-Q4_0.gguf" };
+    try testing.expect(wantedFile(r, "M-Q4_K_M.gguf", false));
+    try testing.expect(wantedFile(r, "MTP/mtp-M-Q4_0.gguf", false));
+    try testing.expect(!wantedFile(r, "MTP/mtp-M-BF16.gguf", false));
+    try testing.expect(!wantedFile(r, "M-Q8_0.gguf", false));
+    try testing.expect(ggufGroup("config.json") == null);
+}
+
+test "chooseGgufGroup: an exact quant tag wins over a longer one; no GGUF ignores the tag" {
+    const io = std.testing.io;
+    var p1 = "M-Q6_K.gguf".*;
+    var p2 = "M-Q6_K_L.gguf".*;
+    const files = [_]RepoFile{ .{ .path = &p1, .size = 1 }, .{ .path = &p2, .size = 1 } };
+    try testing.expectEqualStrings("M-Q6_K", (try chooseGgufGroup(testing.allocator, io, &files, "q6_k", stderr_reporter)).?);
+    try testing.expectEqualStrings("M-Q6_K_L", (try chooseGgufGroup(testing.allocator, io, &files, "Q6_K_L", stderr_reporter)).?);
+    var p3 = "model.safetensors".*;
+    const mlx = [_]RepoFile{.{ .path = &p3, .size = 1 }};
+    try testing.expect((try chooseGgufGroup(testing.allocator, io, &mlx, "8bit", stderr_reporter)) == null);
+}
+
+test "pickMtpSidecar: the head quantized like the trunk, else the smallest" {
+    var p1 = "MTP/mtp-M-BF16.gguf".*;
+    var p2 = "MTP/mtp-M-Q4_K_M.gguf".*;
+    var p3 = "MTP/mtp-M-Q8_0.gguf".*;
+    const files = [_]RepoFile{ .{ .path = &p1, .size = 7000 }, .{ .path = &p2, .size = 2600 }, .{ .path = &p3, .size = 4000 } };
+    try testing.expectEqualStrings("MTP/mtp-M-Q8_0.gguf", pickMtpSidecar(&files, "Q8_0/M-Q8_0"));
+    try testing.expectEqualStrings("MTP/mtp-M-Q4_K_M.gguf", pickMtpSidecar(&files, "M-UD-IQ1_M"));
+    try testing.expectEqualStrings("", pickMtpSidecar(files[0..0], "M-Q4_K_M"));
+}

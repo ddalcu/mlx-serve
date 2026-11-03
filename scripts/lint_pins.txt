@@ -1,0 +1,132 @@
+# Class-guard pins for `zig build lint` (scripts/lint.py, rule pin-unmatched): a source-scan test becomes one line here.
+# Format, one pin per line, TAB-separated: <file glob from the repo root> <TAB> <needle> <TAB> <rule it guards>
+# A pin passes when at least one file matching the glob contains the needle (a plain substring); a needle that starts
+# with `!` passes when NO matching file contains the rest. `#` lines are comments.
+src/host/api/chat_stream.zig	in_think_block = prompt_opened_think	a stream seeds its think state from the rendered prompt, never the request flag
+src/host/api/anthropic_stream.zig	in_think_block = prompt_opened_think	a stream seeds its think state from the rendered prompt, never the request flag
+src/host/api/chat_stream.zig	.content = vis_token_text }, null, null, null, .{ .logprobs_json = try lps.take() });	every streaming content emitter drains the logprobs collector
+src/host/api/chat_completions.zig	if (continue_final) if (continuationRejectReason(	every continuation surface consults continuationRejectReason before rendering
+src/host/api/anthropic.zig	continuationRejectReason(lm.engineOwnsTemplate()) == null	every continuation surface consults continuationRejectReason before rendering
+src/host/api/chat_completions.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy
+src/host/api/anthropic.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy
+src/host/api/responses/handler.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy
+src/host/api/chat_stream.zig	prompt_opened_think, &think_scan)	the streaming think gate scans with a persistent ThinkScan cursor
+src/host/api/anthropic_stream.zig	prompt_opened_think, &think_scan)	the streaming think gate scans with a persistent ThinkScan cursor
+src/host/api/chat_completions.zig	"finish_reason":"{s}"{s}	finish_reason carries finish_details beside it (chat non-stream)
+src/host/api/completions.zig	"finish_reason":"{s}"{s}	finish_reason carries finish_details beside it (completions)
+src/host/http/sse.zig	"finish_reason":{s}{s}	finish_reason carries finish_details beside it (chat SSE chunk)
+src/host/http/router.zig	if (!routeExists(path)) {	the route-existence 404 is answered before the model is resolved
+src/host/http/server.zig	conn_thread.detach();	every connection thread is detached after spawn
+src/host/api/chat_completions.zig	RequestMedia.init(allocator)	request media is owned by RequestMedia, never a handler-local list
+src/host/api/anthropic.zig	RequestMedia.init(allocator)	request media is owned by RequestMedia, never a handler-local list
+src/engines/mlx/*.zig	sleep_inhibit.setActive(holdsSleepWhileParked(sch));	the inference loop drops the sleep assertion before it parks
+src/engines/mlx/scheduler.zig	coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path)	the cold-load LoadRequest re-applies the retained launch settings
+src/engines/mlx/load.zig	clamped_prefix_mem,	HotPrefixCache.initWithMem takes the clamped budget, never the raw launch flag
+src/engines/mlx/load.zig	loadRequirementBytes(weights_bytes))) / gb	a preflight refusal quotes the requirement it compared
+src/engines/mlx/runtime/media_load.zig	loadRequirementBytes(bill.ram))) / gb	a preflight refusal quotes the requirement it compared
+src/sdk/bases/hybrid.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/sdk/bases/encoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/sdk/bases/decoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/plugins/qwen4_exp/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/engines/mlx/prefill.zig	.interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }	the one Generator construction site wires the prefill interleave hook
+src/engines/mlx/step.zig	slot.prefill_ns = prefill_sw.read() -| slot.prefill_interleaved_ns;	interleaved decode time is billed to the decoding slots, never the prefilling slot
+src/engines/mlx/generate/init.zig	if (options.interleave_hook) |hk| hk.call(hk.ctx);	the prefill chunk loop yields to the interleave hook between chunks (inside `if (pos < loop_end)`, never after the last)
+src/engines/mlx/generate/init.zig	ctx.vision_splice_offset = vision_rows_consumed;	every prefill forward (chunk loop and final span) splices vision rows from the consumed-row offset
+src/engines/mlx/generate/init.zig	vision_rows_consumed += countSpliceRows(	the chunk loop advances the consumed vision-row count
+# Admission bills (were source-scan tests in admission/admit.zig and admission/prefill_chunk.zig).
+src/engines/mlx/admission/prefill_chunk.zig	dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq))	the admission guard bills deepseek_v4 through its own estimator at the real sub-chunk
+src/engines/mlx/admission/admit.zig	_ = mlx.mlx_get_active_memory(&active_mem);	the admission bill reads live MLX memory, which already holds a restored hot-cache entry
+src/engines/mlx/admission/admit.zig	resident_hot_cache_bytes.load(.monotonic)	the hot cache enters the bill once, as the published evictable bytes
+src/engines/mlx/admission/admit.zig	!largestEntryBytes	a restored hot-cache entry is never billed twice
+src/engines/mlx/admission/admit.zig	!.hot_prefix_cache.?	the bill reads the published hot-cache number, never the inference-thread pointer
+src/engines/mlx/admission/*.zig	prefillMemoryNeeded(seq, heads, kv_heads, config.kvBytesPerToken(), hdim, config.prefillScoreHeadDim(), hidden, ffn, kv_bits, chunk, config.prefillAttnKeys(seq)	the prefill bill takes the config's KV width, score width and key bound at the site
+src/engines/mlx/admission/*.zig	config.prefillAttnKeys(seq), prefillStreamBytesPerToken(config), prefillDequantWeightBytes(config), prefillRequestTerms(config, seq, max_tokens, kv_bits, chunk, warm))	the per-request bill terms are derived from the config at the site
+src/engines/mlx/admission/*.zig	    const seq: u64 = @max(kv_len, chunk);	the transient reserve bills at an explicit KV length
+src/sdk/bill/prefill.zig	const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);	the guard and auto-context bill KV through kvBytesPerTokenAtBits
+src/engines/mlx/admission/*.zig	(kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) *| ctx)	the guard and auto-context bill KV through kvBytesPerTokenAtBits
+src/engines/mlx/admission/*.zig	ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient	auto-context reserves the prefill transient once, never per token
+src/engines/mlx/prefill.zig	.pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk,	the prefill loop's width comes from the request's chosen chunk, never xfm.config
+src/engines/mlx/prefill.zig	const pin = cfg.pinned_prefill_chunk;	the prefill width falls back to the model config's pin the guard billed
+src/engines/mlx/generate.zig	!xfm.config.pinned_prefill_chunk	the Transformer's config copy predates the pin; never read it there
+src/engines/mlx/admission/context.zig	pinPrefillChunk(config)	the prefill width is frozen at the top of pinAutoContext, before anything reads it
+# Batching, KV and prefix cache.
+src/engines/mlx/batching/verdict.zig	t.ownsModuleDecodeState()	exclusive decode asks the transformer, never one hardcoded arch
+src/engines/mlx/batching/verdict.zig	!return t.dsv4 != null;	exclusive decode asks the transformer, never one hardcoded arch
+src/sdk/blocks/attention/kv_quant.zig	!mlx_repeat_axis	quantized attention reshapes Q for GQA, never repeats the K/V triples
+src/engines/mlx/cache/prefix_cache.zig	[hot-cache] hybrid miss	the no-match lookup arm reports why (missKind), never returns silently
+# Commit ownership (were source-scan tests in commit.zig).
+src/engines/mlx/commit.zig	dflashContextCoversPrefix(dc.absLen(), total_len)	a DFlash payload is committed only when it spans the trunk prefix
+src/engines/mlx/commit.zig	commitCancelledPrefillSlot(	a Generator-less slot commits what its cancelled prefill forwarded
+src/engines/mlx/commit.zig	slot.ssm_entries != null and salvage.checkpoints.len == 0	a cancelled hybrid prefill commits only with salvaged checkpoints
+src/engines/mlx/commit.zig	salvage.forwarded	a cancelled prefill commits the sink's forwarded count, never cache.step
+src/engines/mlx/commit.zig	slot.cancelled_prefill = .{};	the cancelled-prefill commit detaches the salvage before the cache owns it
+src/engines/mlx/generate/init.zig	cancelled_checkpoint_sink	a cancelled prefill hands its stride checkpoints to the sink
+src/engines/mlx/slot.zig	cancelled_prefill.deinit()	Slot.deinit frees unconsumed cancelled-prefill salvage
+# Decode, generator clock, grammar.
+src/engines/mlx/decode.zig	publishSpeculativeBlock(sch, slot, gen, result.?.tokens);	every speculative block publishes through the one per-token accounting loop
+src/engines/mlx/decode.zig	groupKeepCount(	the batched group is capped by padding waste before dispatch
+src/engines/mlx/decode.zig	noteSerial(sch, s, .pad_waste)	a slot the padding cap drops still ticks, serially
+src/engines/mlx/generate/generator.zig	self.step += n;	advanceStep is the one step mover (the cache-clear cadence's clock)
+src/engines/mlx/generate/*.zig	!.step += 1	no decode path advances `step` by hand; route through advanceStep
+src/engines/mlx/scheduler.zig	!.step += 1	no decode path advances `step` by hand; route through advanceStep
+src/engines/mlx/grammar/constraint.zig	xfm.forwardWith(&self.ctx, tok_input)	a forced grammar recovery commits its token through the live forward, once
+src/engines/mlx/grammar/constraint.zig	advanceStep(1)	a forced grammar recovery advances the step once
+# Attention + KV.
+src/sdk/blocks/attention/attn256.zig	if (qs[2] < FUSED256_MIN_Q_LEN) return null;	the hd-256 decline and the sliding trim read one constant
+src/engines/mlx/kv/sliding.zig	cfg.head_dim == 256 and seq_len >= FUSED256_MIN_Q_LEN	the hd-256 decline and the sliding trim read one constant
+src/sdk/blocks/attention/attn256.zig	!if (qs[2] < 16)	the hd-256 floor is never respelled as a literal
+src/engines/mlx/kv/cache.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
+src/engines/mlx/prompt_cache.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
+src/engines/mlx/scheduler.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
+src/main.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
+src/plugins/qwen4_exp/mtp.zig	!.cache = try 	a live KV cache re-inits through KVCache.reinit, which builds before it frees
+src/sdk/blocks/attention/kv_quant_attn_test.zig	fn composedStridedCase(	composed quantized-KV attention is a parity reference only; serving arms are kernel or dense
+# Load.
+src/engines/mlx/load.zig	effectivePrefillChunk(	the ANE build resolves its tile through effectivePrefillChunk, never the bare pin
+src/engines/mlx/load.zig	modules.call("qwen4_build_draft_rerank"	the qwen4 coarse rerank head is built at load, gated on mtp_enabled
+src/engines/mlx/runtime/*.zig	doLoadOnInferenceThread(sch, params)	the boot load goes through the one Transformer construction site
+src/engines/mlx/runtime/*.zig	doLoadOnInferenceThread(sch, req)	the cold load goes through the one Transformer construction site
+# Prefill, scheduler, spec wiring.
+src/engines/mlx/prefill.zig	dflash_restored = null	runPrefill clears restored spec-cache ownership before Generator.initWithOptions adopts it
+src/engines/mlx/prefill.zig	mtp_restored = null	runPrefill clears restored spec-cache ownership before Generator.initWithOptions adopts it
+src/engines/mlx/prefill.zig	const use_mtp = wiring.use_mtp;	runPrefill gates spec through specInitWiring
+src/engines/mlx/prefill.zig	const use_drafter = wiring.use_drafter;	runPrefill gates spec through specInitWiring
+src/engines/mlx/prefill.zig	const use_dflash = wiring.use_dflash;	runPrefill gates spec through specInitWiring
+src/engines/mlx/prefill.zig	const use_pld = wiring.use_pld;	runPrefill gates spec through specInitWiring
+src/engines/mlx/prefill.zig	const dsv4_spec_intent = wiring.native_intent;	runPrefill gates spec through specInitWiring
+src/engines/mlx/prefill.zig	transformer.?.moduleSpecWiring()	module-owned spec exclusions come from the shared predicate
+src/engines/mlx/prefill.zig	!and !is_dsv4 and slot.enable_pld	no per-arch spec conjuncts
+src/engines/mlx/scheduler.zig	gen.spec_disabled_runtime or	a slot whose speculation turned itself off batches (its re-enable check waits)
+src/engines/mlx/scheduler.zig	slotTicksRegular(slot)	the batched gate reads dispatch, never the armed spec flags
+src/engines/mlx/scheduler.zig	slotSpecMode(	the batched gate reads dispatch, never the armed spec flags
+src/host/api/chat_completions.zig	lm.drafter != null, lm.dflash != null	every drafter-loaded gate also reads the DFlash handle
+src/host/api/completions.zig	lm.drafter != null, lm.dflash != null	every drafter-loaded gate also reads the DFlash handle
+src/host/api/chat_stream.zig	lm.drafter != null, lm.dflash != null	every drafter-loaded gate also reads the DFlash handle
+src/host/api/anthropic_stream.zig	lm.drafter != null, lm.dflash != null	every drafter-loaded gate also reads the DFlash handle
+src/host/api/submit.zig	(lm.drafter != null or lm.dflash != null)	every drafter-loaded gate also reads the DFlash handle
+src/host/api/submit.zig	.enable_thinking =	every scheduler submission forwards resolved thinking to the DFlash gate
+src/host/api/chat_stream.zig	.enable_thinking =	every scheduler submission forwards resolved thinking to the DFlash gate
+src/host/api/anthropic_stream.zig	.enable_thinking =	every scheduler submission forwards resolved thinking to the DFlash gate
+src/engines/mlx/spec/mtp/ev_plan.zig	row.label	the MTP depth-cap resolver names the silicon row it applied
+src/engines/mlx/spec/mtp/ev_plan.zig	mtp_depth_cap_logged	the MTP depth-cap resolver names its row once
+src/engines/mlx/finish.zig	logQsaArms();	every request-finalize seam that logs [spec-stats] also logs [qsa-arms]
+src/engines/mlx/step.zig	admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)	the pending drain admits through admitPendingTick
+src/engines/mlx/step.zig	.exclusive = slotExclusiveDecode(s)	a candidate's exclusive bit comes from the per-slot predicate
+src/engines/mlx/step.zig	!to_prefill[n_prefill] = sch.pending.orderedRemove(0)	no path admits without the gate
+# Plugins.
+src/plugins/ltx/video.zig	!some(4)	LTX quant reads solve (bits, gs) from geometry, never a hardcoded width
+src/plugins/ltx/video.zig	!some(8)	LTX quant reads solve (bits, gs) from geometry, never a hardcoded width
+src/plugins/qwen4_exp/*.zig	!MTP_EV_SEED_DEPTH	the qwen4 EV seed width is mtp.MAX_DEPTH itself
+src/plugins/qwen4_exp/mtp.zig	ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32	the qwen4 EV seed width is mtp.MAX_DEPTH itself
+src/plugins/qwen4_exp/trunk/attn.zig	&ctx.qsa_arms, seq_len	the QSA arm tally lives on the request's ForwardCtx
+src/plugins/qwen4_exp/qsa/*.zig	!self.qsa_arms	the QSA arm tally never lives on the shared Transformer
+src/plugins/qwen4_exp/plugin.zig	r.arms.add(ctx.qsa_arms)	the QSA arm log reads the request's own ctx
+src/plugins/qwen4_exp/qsa/*.zig	const want_blocks = qsaWantsBlocks(	the QSA selection arm takes the block branch at verify widths
+src/plugins/qwen4_exp/qsa/*.zig	qsaVerifyGatherAttn(	the QSA dispatch reaches the verify gather before the prefill kernel
+src/plugins/qwen4_exp/qsa/*.zig	seq_len >= FUSED256_MIN_Q_LEN	the QSA prefill gather is guarded by the hd-256 width floor
+src/plugins/qwen4_exp/qsa/indexer.zig	yarnScaleRotated	the QSA indexer's scalar rope arm applies the YaRN mscale
+src/plugins/qwen4_exp/qsa/indexer.zig	!deliberately NOT applied	the QSA indexer never skips the YaRN mscale
+src/engines/mlx/methods/yarn.zig	constTableAs(self.yarn_mscale.?,	the YaRN mscale table reaches a multiply only through constTableAs
+src/plugins/glm5_next/table_forward.zig	spliceVisionRows(	the GLM-5.3 table forward splices vision rows on prompt chunks
+src/plugins/qwen4_exp/forward.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
+src/sdk/bases/run.zig	spliceRows(	the plugin bases splice vision rows on prompt chunks

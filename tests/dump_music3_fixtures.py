@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Dump MiniMax-Music3 parity fixtures (.raw f32/i32) for the Zig oracle tests
-in `src/music3.zig`.
+in `src/plugins/music3/music3.zig`.
 
 USER-RUN (needs torch + transformers + tokenizers + mlx + numpy). Run on the
 128 GB Mac: the global LLM is 8B fp32 (~32 GB resident).

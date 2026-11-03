@@ -1,28 +1,8 @@
 #!/bin/bash
-# PLD (Prompt Lookup Decoding) byte-equivalence test.
+# test_pld_equivalence.sh — PLD byte-equivalence: the same temp-0 chat with --pld and without must be identical text.
+# The echo-heavy prompt (repeat a snippet with one change) gives PLD long matches; zero matches still must agree.
 #
-# Verifies that running the same temp=0 chat completion request against the
-# server with --pld produces *identical* output text to running it without
-# --pld. PLD is model-agnostic, so any MLX checkpoint will do — no special
-# weights required.
-#
-# The chosen prompt is echo-heavy on purpose: the model is asked to repeat a
-# code snippet with one small change. That maximizes n-gram match opportunities
-# so the PLD path actually gets exercised (high acceptance rate). The test still
-# passes if PLD finds zero matches — both runs use the same greedy sampler so
-# they must agree regardless. We just want a real workout for PLD when a model
-# is available.
-#
-# Requires:
-#   - A built mlx-serve binary (run `zig build -Doptimize=ReleaseFast` first)
-#   - Either:
-#       PLD_TEST_MODEL set to a model directory, OR
-#       a default MLX checkpoint at ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#
-# Usage:
-#   PLD_TEST_MODEL=/path/to/model ./tests/test_pld_equivalence.sh [port]
-#
-# Exits 0 with a SKIP message if no model is available.
+#   PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh [port]   # default gemma-4-e4b-it-8bit; SKIP without one
 
 set -e
 

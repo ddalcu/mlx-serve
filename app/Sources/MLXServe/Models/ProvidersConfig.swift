@@ -1,7 +1,7 @@
 import Foundation
 
 /// One upstream OpenAI-compatible chat provider, as stored in
-/// `~/.mlx-serve/providers.json` — the file the SERVER reads (`src/providers.zig`),
+/// `~/.mlx-serve/providers.json` — the file the SERVER reads (`src/host/api/providers.zig`),
 /// so the keys are its keys. The app edits the file and asks the server to
 /// reload; the server owns probing and routing.
 struct ProviderEntry: Codable, Identifiable, Equatable {

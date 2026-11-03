@@ -22,6 +22,7 @@
 //! loop), so call it from a dedicated thread and treat a return as shutdown.
 
 const std = @import("std");
+pub const env = @import("env.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
@@ -32,21 +33,27 @@ const build_options = @import("build_options");
 // engine panics (ds4/llama unavailable on iOS) are never reached at runtime
 // anyway; this only governs how an unexpected panic terminates.
 pub const panic = std.debug.simple_panic;
-// pub: lib/mlx-serve-gguf and lib/sushi reach mlx, log and io_util through their host root (`mlx_host`). iOS builds
-// no mlx-stream plugin (src/arch/mlx_stream_stub.zig refuses its packs), so this root does not carry the plugin's names
-// of plugin_host.zig (sushi_exl3, dsa_nax), and plugin_host_check.zig does not check it; mtp_acceptance is the plugin
+// pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) reaches mlx, log and io_util through its host root (`mlx_host`). iOS builds
+// no mlx-stream plugin (src/engines/mlx/modules/stream_stub.zig refuses its packs), so this root does not carry the plugin's names
+// of plugin_host.zig (exl3, dsa_nax), and plugin_host_check.zig does not check it; mtp_acceptance is the plugin
 // SDK's too (`sdk.acceptance`), kept as main.zig has it, and nothing on iOS reads it.
-pub const mlx = @import("mlx.zig");
-pub const io_util = @import("io_util.zig");
-pub const mtp_acceptance = @import("mtp_acceptance.zig");
-const model_mod = @import("model.zig");
-const transformer_mod = @import("transformer.zig");
-const model_discovery = @import("model_discovery.zig");
-const model_registry_mod = @import("model_registry.zig");
-const scheduler_mod = @import("scheduler.zig");
-const server_mod = @import("server.zig");
-const gen_mod = @import("gen.zig");
-pub const log = @import("log.zig");
+pub const mlx = @import("mlx/ffi.zig");
+pub const io_util = @import("sdk/util/io_util.zig");
+pub const shared = @import("sdk/util/shared.zig");
+pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
+const model_mod = @import("sdk/config/model.zig");
+const transformer_mod = @import("engines/mlx/transformer.zig");
+const model_discovery = @import("host/registry/discovery.zig");
+const model_registry_mod = @import("host/registry/registry.zig");
+const scheduler_mod = @import("engines/mlx/scheduler.zig");
+const server_mod = @import("host/http/server.zig");
+const gen_mod = @import("host/media_jobs/gen.zig");
+pub const log = @import("sdk/util/log.zig");
+
+comptime {
+    // One compile unit: the MLX engine's table is exported from here.
+    _ = @import("engines/mlx/api.zig");
+}
 
 /// Returns the engine version string (NUL-terminated, static lifetime).
 export fn mlxserve_version() [*:0]const u8 {
@@ -100,7 +107,7 @@ fn run(models_dir: []const u8, host: []const u8, port: u16, ctx_size: u32, max_r
     // can't run MLX's kernels. CPU needs no metallib.
     var metal_avail: bool = false;
     try mlx.check(mlx.mlx_metal_is_available(&metal_avail));
-    const force_cpu = if (std.c.getenv("MLXSERVE_DEVICE")) |d| std.mem.eql(u8, std.mem.sliceTo(d, 0), "cpu") else false;
+    const force_cpu = if (env.get(.MLXSERVE_DEVICE)) |d| std.mem.eql(u8, std.mem.sliceTo(d, 0), "cpu") else false;
     log.info("[ios] Metal GPU available: {}, force_cpu: {}\n", .{ metal_avail, force_cpu });
     if (force_cpu) {
         const cpu_dev = mlx.mlx_device_new_type(.cpu, 0);

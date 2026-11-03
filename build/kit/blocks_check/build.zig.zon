@@ -1,0 +1,9 @@
+.{
+    .name = .blocks_check,
+    .version = "0.0.0",
+    .fingerprint = 0xf70545ecd4bb350c,
+    .minimum_zig_version = "0.17.0",
+    // The kit's root: this folder ships as <kit>/checks/blocks.
+    .dependencies = .{ .mlx_serve_kit = .{ .path = "../.." } },
+    .paths = .{ "build.zig", "build.zig.zon", "check.zig" },
+}

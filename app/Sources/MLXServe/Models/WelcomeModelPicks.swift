@@ -50,7 +50,7 @@ enum WelcomeModelPicks {
         }
         let starter = RecommendedModelPick.starterPick(physicalMemoryBytes: memory.totalBytes)
         switch starter.family {
-        case .gemma: break
+        case .gemma, .liquid: break
         case .qwen:
             return [WelcomeModelPick(category: codingCategory.label, pick: starter, strength: codingCategory.strength)]
         case .largest:

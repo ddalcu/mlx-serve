@@ -30,6 +30,13 @@ prompt: pixel_values + grid, the tower's pooler_output, the 3-D position ids
 + rope delta, full-prefill logits, prefill + stepwise decode, per-layer
 streams and the layer-3 QSA mask (the prompt crosses the tiny budget so the
 mask depends on the M-RoPE angles of the pooled block keys).
+
+`build --yarn` writes YaRN rope_parameters into the tiny config (the converter copies
+them through, `dump` reads them back), so the same test measures the context extension
+past the window. `build --topk 2` makes a k < E pack: a random tiny MoE ties almost
+everywhere, so its SELECTION coverage is the MTP head's one MoE layer; run it by hand,
+not in CI. `zig build test` caches a passing env-gated run (env is not in the cache key):
+rerun the test binary from .zig-cache/o/<hash>/test to re-execute.
 """
 
 import argparse

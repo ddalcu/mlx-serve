@@ -2,7 +2,7 @@
 """Dump reference Kokoro-82M activations for the `KOKORO_*` parity oracles.
 
 USER-RUN (torch + transformers + the upstream hexgrad/kokoro source). Writes raw
-little-endian f32/i32 blobs that `src/kokoro.zig`'s env-gated tests read back.
+little-endian f32/i32 blobs that `src/plugins/kokoro/kokoro.zig`'s env-gated tests read back.
 
     python3 tests/dump_kokoro_fixtures.py --kokoro-src <path to hexgrad/kokoro> \\
         --out /tmp/kokoro-fixtures

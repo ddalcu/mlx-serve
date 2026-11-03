@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Dump Hunyuan3D-2.1 PAINT parity fixtures (.raw f32) for the Zig oracle tests
-in `src/hunyuan3d_paint.zig`.
+in `src/plugins/hunyuan3d/paint.zig`.
 
 USER-RUN (needs torch + diffusers + transformers + the paint checkpoints).
 Runs the REFERENCE PyTorch components on deterministic inputs and writes

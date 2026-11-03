@@ -1,0 +1,101 @@
+== speech 0 38562 2ee3a1b095a388d1313552b794eab6bad16872f89ba2ad0ce6ddc27ac906483d
+== speech 1 51657 c656ae3b272687dba214f1e1814acf7a000a4e5890939084ff09bc036a33c13c
+== speech 2 164 cb1283f27b9ddb6910c5fca371c655188fdfc2b240e463b0ea6d01f4bcc84a81
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 39
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"missing 'input'"}}
+== speech 3 162 f40854cd45daab55bb73d944ec1e1cbaea024d0c81cb4a7010ffa0a5cae1a351
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 37
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"empty 'input'"}}
+== speech 4 38562 39f7237853ebeea024132a5ac1bb42b11744ee4d4598b34691ccfdbed3776a94
+== music 0 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== music 1 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== music 2 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== music 3 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== music 4 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== sound 0 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== sound 1 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== sound 2 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== sound 3 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== sound 4 205 8dc14f914150378dfb96973410c28a30de4ac0ac20d23c750bfcc9f8423dec3c
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 80
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"loaded audio model is a TTS voice; POST /v1/audio/speech"}}
+== row 685 23354f0db5154563b82fdd01a2ff45113d6e69a42a5317aaaa499ca255e84ddd
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["audio"],"input_modalities":["text"],"modality":"speech","engines":["mlx"],"meta":{"architecture":"qwen3_tts","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

@@ -79,6 +79,14 @@ final class CustomMediaModelsTests: XCTestCase {
         XCTAssertFalse(b?.components[0].readyMarkers.contains("dit.safetensors") ?? true)
     }
 
+    func testAnIdolPackOnDiskJoinsThe3DPaneAsItsOwnFamily() {
+        let models = [info("me/idol-local", arch: "idol", caps: ["3d"])]
+        XCTAssertEqual(CustomMediaModels.meshPresets(from: models).first?.family, .idol)
+        let markers = CustomMediaModels.bundle(arch: "idol", repoId: "me/idol-local")?.components[0].readyMarkers
+        XCTAssertEqual(markers?.contains("vae/model.safetensors"), true)
+        XCTAssertEqual(markers?.contains("birefnet.safetensors"), true)
+    }
+
     func testAPixal3DPackOnDiskJoinsThe3DPaneAsItsOwnFamily() {
         let models = [info("me/pixal3d-local", arch: "pixal3d", caps: ["3d"])]
         XCTAssertEqual(CustomMediaModels.meshPresets(from: models).first?.family, .pixal3d)
@@ -120,6 +128,18 @@ final class CustomMediaModelsTests: XCTestCase {
         XCTAssertEqual(presets.first { $0.id == "me/My-Mage-Flow-Edit-4bit" }?.variant, .mageFlowEditTurbo)
         XCTAssertEqual(presets.first { $0.id == "me/mageflow-edit-tuned" }?.variant, .mageFlowEditTurbo)
         XCTAssertEqual(presets.first { $0.id == "me/mage-flow-plain" }?.variant, .mageFlowTurbo)
+    }
+
+    /// `/v1/models` cannot tell Qwen-Image-2.1 from its Turbo (the server reads the
+    /// pack's `sample_sigmas`), so the dir name picks the family, as for Mage-Flow Edit.
+    func testQwenImageTurboIsKeyedOnTheDirName() {
+        let models = [
+            info("Qwen-Image-2.1-Turbo", arch: "qwen_image21", caps: ["image"]),
+            info("Qwen-Image-2.1", arch: "qwen_image21", caps: ["image"]),
+        ]
+        let presets = CustomMediaModels.imagePresets(from: models)
+        XCTAssertEqual(presets.first { $0.id == "Qwen-Image-2.1-Turbo" }?.variant, .qwenImage21Turbo)
+        XCTAssertEqual(presets.first { $0.id == "Qwen-Image-2.1" }?.variant, .qwenImage21)
     }
 
     // MARK: - What gets a row

@@ -1,25 +1,17 @@
 #!/bin/bash
-# Guard: continuing a partial assistant reply extends it — it does not restart.
+# test_continuation.sh — continuing a partial assistant reply EXTENDS it instead of restarting it: explicit
+# `continue_final_message` on /v1/chat/completions, an implicit trailing assistant message on /v1/messages, and
+# without the flag chat-completions is unchanged (a fresh turn). The "restarted?" check is the prefix not repeated
+# back; the without-flag arm is judged on `prompt_tokens` (the flag moves where the prompt ENDS: a close tag plus a
+# turn header on every checkpoint), not the reply. Greedy throughout.
 #
-# A conversation ending in an assistant message used to render that message as
-# HISTORY and then let add_generation_prompt open a SECOND assistant turn, so
-# the model answered the doubled turn by starting over. Continuation ends the
-# prompt mid-turn instead, on the partial text.
+#   ./tests/test_continuation.sh [model_dir] [port]   # any small chat model; SKIPs without one
 #
-# The observable contract, which is what this pins:
-#   - the reply CONTINUES rather than repeating the prefix back
-#   - the two surfaces ask for it their own documented way: an explicit
-#     `continue_final_message` on /v1/chat/completions, an implicit trailing
-#     assistant message on /v1/messages (Anthropic's own behaviour)
-#   - without the flag, /v1/chat/completions is unchanged — a trailing
-#     assistant message is history and a fresh turn is answered
-#
-# Greedy (temperature 0) throughout: the assertions are about WHERE the prompt
-# ends, and a sampled reply makes a "did it restart?" check a coin flip.
-#
-# Usage: ./tests/test_continuation.sh [model_dir] [port]
+# Hermetic twins: the `renderChatTemplate: continuation…` tests, `keyFor: a continuation does not share a key`,
+# continuationRejectReason.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL=${1:-~/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}
 PORT=${2:-8133}
@@ -42,11 +34,7 @@ SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; }
 trap cleanup EXIT
 
-for i in $(seq 1 120); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    if [ "$i" -eq 120 ]; then echo "FAIL: server did not start within 120s"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 120 1 || { echo "FAIL: server did not start within 120s"; exit 1; }
 
 run_test() {
     TOTAL=$((TOTAL + 1))

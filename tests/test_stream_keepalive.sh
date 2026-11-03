@@ -1,40 +1,15 @@
 #!/bin/bash
-# Streaming-silence regression test (class guard).
+# test_stream_keepalive.sh — a streaming surface that BUFFERS (a long tool call) never leaves the socket silent past
+# the keepalive interval, on chat, messages and responses: max inter-chunk gap < MAX_GAP_S, at least one
+# `: keepalive` / `event: ping`, and the tool call still parses with valid-JSON arguments (keepalive bytes must not
+# corrupt the SSE). A surface that finished faster than MIN_BUFFER_S SKIPs rather than passing vacuously.
 #
-# CLASS: a streaming surface that BUFFERS tokens must never let the socket go
-# silent for longer than the keepalive interval.
+#   KEEPALIVE_TEST_MODEL=<dir> ./tests/test_stream_keepalive.sh [port]   # default gemma-4-e4b-it-4bit
 #
-# The server buffers generated tokens whenever it might be looking at a tool
-# call (`chat.streamShouldBufferForTools`) or an unclosed thinking block
-# (`chat.streamThinkGate` -> .hold_thinking). For a large tool call — an agent
-# one-shotting a whole file into `write_file` — that buffer holds for the
-# ENTIRE generation, and pre-fix the server wrote zero bytes for its whole
-# duration. Clients with an idle-body timeout tear such a connection down
-# mid-generation: Node's `fetch` (undici) defaults to `bodyTimeout: 300_000`,
-# so any tool call that takes >5 min to generate dies as `TypeError: terminated`.
-# Live failure 2026-07-08: a pi agent session building a JS game lost two
-# ~5-minute `write` calls exactly this way (~10 min of GPU discarded).
-#
-# The keepalive used to fire only on `.idle` — i.e. only while WAITING for the
-# first token (long prefill). Once tokens flowed into a buffer, it never fired.
-#
-# This test asserts, for EVERY streaming surface (chat / messages / responses):
-#   1. the max inter-chunk gap stays under MAX_GAP_S even though the model
-#      spends far longer than that inside one buffered tool call
-#   2. at least one keepalive (`: keepalive` comment / `event: ping`) arrives
-#   3. the tool call still parses — name intact, arguments are valid JSON
-#      (the injected keepalive bytes must not corrupt the SSE stream)
-#
-# A surface whose generation finishes faster than MIN_BUFFER_S never exercised
-# the buffer, so it SKIPs rather than passing vacuously.
-#
-# Requires:
-#   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
-#   - KEEPALIVE_TEST_MODEL or ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit
-#
-# Usage: ./tests/test_stream_keepalive.sh [port]
+# Hermetic twin: StreamHeartbeat tests. Story: "A buffered streaming surface must beat on SOCKET SILENCE" (server-http).
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-11296}
 RED='\033[0;31m'
@@ -69,10 +44,7 @@ SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; rm -f "$LOG"; }
 trap cleanup EXIT
 
-for _ in $(seq 1 90); do
-    sleep 1
-    curl -sf -m 1 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-done
+srv_wait_health "http://127.0.0.1:$PORT" 90 1 || true
 if ! curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; then
     echo -e "${RED}FAIL${NC} server did not come up"; tail -20 "$LOG"; exit 1
 fi

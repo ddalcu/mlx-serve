@@ -5,8 +5,8 @@
 # downloaded or wrong-arch checkpoints (e.g. a `deepseek_v4` directory that
 # would crash mlx-serve on tokenizer load).
 #
-# Must stay in sync with `supported_model_types` in src/model_discovery.zig
-# and the `model_type` branches in src/model.zig:parseConfigFromJson.
+# Must stay in sync with `supported_model_types` in src/host/registry/discovery.zig
+# and the `model_type` branches in src/engines/mlx/model.zig:parseConfigFromJson.
 #
 # Usage:
 #   source "$(dirname "$0")/_lib_supported_models.sh"
@@ -63,6 +63,11 @@ for name in candidates(root):
     except Exception:
         continue
     if mt not in supported and not mt.startswith("lfm2"):
+        continue
+    # A DFlash sidecar (discovery's dflash_contract: block_size + mask_token_id + target_layer_ids, at the root or under
+    # dflash_config) is a drafter whatever its model_type says, never a chat row.
+    dc = data.get("dflash_config") if isinstance(data.get("dflash_config"), dict) else {}
+    if all(k in data or k in dc for k in ("block_size", "mask_token_id", "target_layer_ids")):
         continue
     # Decision packs answer /v1/decisions only: a D1 root names its own class, a Kev pack ships kev_config.json.
     if (data.get("auto_map") or {}).get("AutoModel") == "modeling_d1.D1Model" or os.path.isfile(os.path.join(root, name, "kev_config.json")):

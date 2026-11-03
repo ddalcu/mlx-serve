@@ -396,36 +396,23 @@ final class ComposerModeControlTests: XCTestCase {
             """)
     }
 
-    /// The sidebar's pinned destinations rely on the PLATFORM to frost what
-    /// scrolls beneath them — `scrollEdgeEffectStyle`, which needs the
-    /// toolbar's bar to attach to.
-    ///
-    /// They carried a hand-drawn `.regularMaterial` backdrop for exactly as
-    /// long as the bar was hidden outright. With the bar back the backdrop
-    /// goes: a band drawn by hand over a sidebar is the same class as the strip
-    /// that once looked native and swallowed every click in it.
-    func testThePinnedDestinationsRelyOnTheScrollEdgeEffect() throws {
+    /// The sidebar's destinations sit ABOVE the session list, never in a
+    /// `safeAreaInset` over it: the platform frosts only what scrolls under the
+    /// toolbar's bar, so rows scrolled under the inset drew straight over
+    /// Agents and Tasks (live 2026-11-01).
+    func testThePinnedDestinationsSitAboveTheSessionList() throws {
         let source = try chatViewSource()
-        guard let start = source.range(of: "safeAreaInset(edge: .top)"),
-              let end = source.range(of: "private func sectionHeader",
-                                     range: start.upperBound..<source.endIndex) else {
-            return XCTFail("the sidebar's destination inset moved — update this audit")
-        }
-        let inset = String(source[start.upperBound..<end.lowerBound])
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
-            .joined(separator: "\n")
-        XCTAssertFalse(inset.contains(".background(.regularMaterial)"), """
-            The destinations block draws its own band again. The toolbar's bar \
-            is back, so the platform's scroll-edge effect has something to \
-            attach to — a hand-drawn strip over a sidebar is the class that \
-            once looked native and ate every click in it.
-            """)
-        XCTAssertFalse(inset.contains(".background(.bar)"),
-                       "`.bar` also draws a separator — the rule removed from the Tasks header")
-        // The effect itself must still be asked for.
-        XCTAssertTrue(source.contains(".scrollEdgeEffectStyle("),
-                      "the sidebar list still needs the native edge effect")
+        let sidebar = try XCTUnwrap(source.range(of: "struct ChatSidebar: View {"))
+        let sidebarBody = String(source[sidebar.upperBound...])
+            .components(separatedBy: "\n// MARK:").first ?? ""
+        XCTAssertFalse(sidebarBody.contains("safeAreaInset(edge: .top)"),
+                       "rows scroll under a top inset unfrosted and draw over the destinations")
+        let stack = try XCTUnwrap(sidebarBody.range(of: "private var conversationsSidebar: some View {"))
+        let tail = sidebarBody[stack.upperBound...]
+        let destinations = try XCTUnwrap(tail.range(of: "destinations"))
+        let list = try XCTUnwrap(tail.range(of: "sessionList"))
+        XCTAssertLessThan(destinations.lowerBound, list.lowerBound,
+                          "the destinations stack above the list")
     }
 
     // MARK: - Hover card dismissal

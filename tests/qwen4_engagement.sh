@@ -1,10 +1,14 @@
 #!/usr/bin/env bash
-# Boot one Flash Next (qwen4_exp) pack, run a fixed workload (short MTP decode,
-# a ~6k-token prefill, two then four concurrent streams), then print which tuned paths
-# engaged. Diagnostic helper for per-pack kernel coverage — NOT a test.
+# qwen4_engagement.sh — diagnostic, NOT a test: boot one Flash Next (qwen4_exp) pack, run a fixed workload (short MTP
+# decode, a ~6k-token prefill, two then four concurrent streams) and print yes/NO per tuned path (hc-prefill, fused
+# and two-launch HC reads, joined verify projections, MTP head row-axis projections per width, softmax_gate fold,
+# affine-4 MoE, verify lanes, n-gram warm). Run it first on a new pack layout: a fast path keyed on one pack's quant
+# layout is silent on another's.
 #
 #   tests/qwen4_engagement.sh <model-dir> [extra mlx-serve flags...]
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${1:?usage: qwen4_engagement.sh <model-dir> [flags...]}"
 shift
@@ -19,11 +23,7 @@ sleep 1
 SRV=$!
 trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null' EXIT
 
-for _ in $(seq 1 900); do
-  curl -sf "$URL/health" >/dev/null && break
-  kill -0 "$SRV" 2>/dev/null || { echo "server died; see $LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "$URL" 900 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "server died; see $LOG"; exit 1; }
 
 chat() { # <max_tokens> <content> [enable_thinking]
   python3 -c 'import json,sys; d={"model":"x","max_tokens":int(sys.argv[1]),"temperature":0,"messages":[{"role":"user","content":sys.argv[2]}]}

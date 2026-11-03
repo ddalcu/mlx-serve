@@ -401,11 +401,18 @@ final class ProcessRegistry: ObservableObject {
     // MARK: - Private
 
     private func attachCapture(process: Process, buffer: ProcessOutputBuffer) {
-        (process.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = { h in
-            buffer.append(h.availableData)
-        }
-        (process.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = { h in
-            buffer.append(h.availableData)
+        (process.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = Self.capture(into: buffer)
+        (process.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = Self.capture(into: buffer)
+    }
+
+    /// Appends each chunk and detaches at EOF. Foundation re-fires the handler
+    /// without pause on a closed pipe, which pins a core per pipe for as long as
+    /// the retained `Process` lives.
+    nonisolated static func capture(into buffer: ProcessOutputBuffer) -> @Sendable (FileHandle) -> Void {
+        return { h in
+            let data = h.availableData
+            if data.isEmpty { h.readabilityHandler = nil; return }
+            buffer.append(data)
         }
     }
 

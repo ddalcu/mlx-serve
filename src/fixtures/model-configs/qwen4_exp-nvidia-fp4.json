@@ -1,0 +1,2402 @@
+{
+  "architectures": [
+    "Qwen4ExpForConditionalGeneration"
+  ],
+  "image_token_id": 248056,
+  "language_model_only": false,
+  "model_type": "qwen4_exp",
+  "text_config": {
+    "attention_bias": false,
+    "attention_dropout": 0.0,
+    "bos_token_id": 248044,
+    "dtype": "bfloat16",
+    "eos_token_id": 248044,
+    "full_attention_interval": 4,
+    "hc_count": 4,
+    "hc_lowrank": 320,
+    "head_dim": 256,
+    "heads_per_ngram": 8,
+    "hidden_act": "silu",
+    "hidden_size": 2560,
+    "indexer_budget": 2048,
+    "indexer_compress_ratio": 4,
+    "indexer_head_dim": 128,
+    "indexer_kv_heads": 1,
+    "indexer_n_heads": 4,
+    "initializer_range": 0.02,
+    "layer_types": [
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention",
+      "linear_attention",
+      "linear_attention",
+      "linear_attention",
+      "full_attention"
+    ],
+    "linear_conv_kernel_dim": 4,
+    "linear_key_head_dim": 128,
+    "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48,
+    "linear_value_head_dim": 128,
+    "make_ngram_vocab_size_divisible_by": 128,
+    "mamba_ssm_dtype": "float32",
+    "max_position_embeddings": 262144,
+    "model_type": "qwen4_exp_text",
+    "moe_intermediate_size": 640,
+    "mtp": {
+      "hybrid": true,
+      "layer_types": [
+        "full_attention"
+      ],
+      "mtp_use_hidden_state_from_layer": null,
+      "num_hidden_layers": 1,
+      "rope_theta": 10000000
+    },
+    "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": false,
+    "ngram_size": 3,
+    "ngram_vocab_size_base": 20000000,
+    "num_attention_heads": 24,
+    "num_experts": 512,
+    "num_experts_per_tok": 10,
+    "num_hidden_layers": 48,
+    "num_key_value_heads": 2,
+    "output_gate_type": "sigmoid",
+    "output_router_logits": false,
+    "pad_token_id": null,
+    "partial_rotary_factor": 0.25,
+    "ple_conv_kernel_size": 4,
+    "ple_embed_dim": 2560,
+    "ple_layer_ids": [
+      2
+    ],
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "mrope_interleaved": true,
+      "mrope_section": [
+        11,
+        11,
+        10
+      ],
+      "partial_rotary_factor": 0.25,
+      "rope_theta": 10000000,
+      "rope_type": "default"
+    },
+    "router_aux_loss_coef": 0.001,
+    "shared_expert_intermediate_size": 640,
+    "split_ngram_parts": 128,
+    "tie_word_embeddings": false,
+    "use_cache": true,
+    "vocab_size": 248320,
+    "ple_embedding_dtype": "nvfp4"
+  },
+  "tie_word_embeddings": false,
+  "transformers_version": "5.8.0.dev0",
+  "video_token_id": 248057,
+  "vision_config": {
+    "deepstack_visual_indexes": [],
+    "depth": 27,
+    "hidden_act": "gelu_pytorch_tanh",
+    "hidden_size": 1152,
+    "in_channels": 3,
+    "initializer_range": 0.02,
+    "intermediate_size": 4304,
+    "model_type": "qwen4_exp",
+    "num_heads": 16,
+    "num_position_embeddings": 2304,
+    "out_hidden_size": 2560,
+    "patch_size": 16,
+    "spatial_merge_size": 2,
+    "temporal_patch_size": 2
+  },
+  "vision_end_token_id": 248054,
+  "vision_start_token_id": 248053,
+  "quantization_config": {
+    "quant_method": "modelopt",
+    "quant_algo": "MIXED_PRECISION",
+    "kv_cache_quant_algo": null,
+    "ignore": [
+      "lm_head",
+      "mtp.fc_embedding",
+      "mtp.fc_hidden",
+      "mtp.pre_fc_norm_*",
+      "mtp.hyper_connection_mixer*",
+      "mtp.layers.0.self_attn*",
+      "mtp.layers.0.attn_hyper_connection*",
+      "mtp.layers.0.mlp_hyper_connection*",
+      "mtp.layers.0.mlp.gate",
+      "mtp.layers.0.mlp.shared_expert*"
+    ],
+    "quantized_layers": {
+      "model.language_model.layers.0.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.1.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.2.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.3.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.4.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.5.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.6.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.7.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.8.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.9.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.10.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.11.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.12.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.13.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.14.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.15.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.16.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.17.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.18.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.19.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.20.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.21.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.22.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.23.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.24.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.25.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.26.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.27.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.28.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.29.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.30.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.31.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.32.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.33.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.34.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.35.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.36.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.37.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.38.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.39.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.40.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.41.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.42.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.43.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.44.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.45.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.46.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.47.mlp.experts": {
+        "quant_algo": "NVFP4",
+        "group_size": 16,
+        "weight_scale_encoding": "csf"
+      },
+      "model.language_model.layers.0.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.0.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.0.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.2.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.2.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.2.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.3.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.3.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.3.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.4.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.4.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.4.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.5.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.5.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.5.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.6.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.6.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.6.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.7.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.7.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.7.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.8.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.8.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.8.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.9.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.9.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.9.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.10.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.10.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.10.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.11.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.11.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.11.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.12.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.12.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.12.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.13.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.13.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.13.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.14.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.14.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.14.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.15.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.15.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.15.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.16.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.16.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.16.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.17.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.17.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.17.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.18.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.18.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.18.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.19.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.19.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.19.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.20.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.20.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.20.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.21.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.21.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.21.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.22.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.22.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.22.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.23.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.23.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.23.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.24.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.24.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.24.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.25.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.25.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.25.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.26.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.26.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.26.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.27.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.27.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.27.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.28.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.28.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.28.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.29.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.29.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.29.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.30.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.30.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.30.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.31.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.31.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.31.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.32.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.32.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.32.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.33.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.33.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.33.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.34.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.34.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.34.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.35.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.35.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.35.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.36.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.36.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.36.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.37.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.37.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.37.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.38.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.38.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.38.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.39.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.39.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.39.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.40.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.40.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.40.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.41.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.41.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.41.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.42.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.42.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.42.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.43.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.43.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.43.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.44.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.44.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.44.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.45.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.45.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.45.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.46.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.46.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.46.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.47.mlp.shared_expert.gate_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.47.mlp.shared_expert.up_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.47.mlp.shared_expert.down_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.ple.ple_embedding.ngram_embedding": {
+        "quant_algo": "NVFP4",
+        "group_size": 16
+      },
+      "mtp.layers.0.mlp.experts": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.language_model.layers.0.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.0.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.0.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.0.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.0.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.1.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.10.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.10.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.10.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.10.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.10.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.11.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.11.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.11.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.11.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.11.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.12.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.12.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.12.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.12.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.12.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.13.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.13.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.13.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.13.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.13.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.14.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.14.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.14.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.14.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.14.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.15.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.15.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.15.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.15.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.15.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.16.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.16.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.16.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.16.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.16.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.17.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.17.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.17.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.17.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.17.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.18.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.18.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.18.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.18.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.18.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.19.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.19.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.19.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.19.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.19.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.2.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.2.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.2.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.2.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.2.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.20.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.20.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.20.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.20.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.20.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.21.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.21.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.21.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.21.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.21.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.22.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.22.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.22.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.22.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.22.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.23.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.23.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.23.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.23.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.23.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.24.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.24.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.24.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.24.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.24.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.25.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.25.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.25.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.25.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.25.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.26.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.26.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.26.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.26.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.26.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.27.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.27.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.27.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.27.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.27.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.28.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.28.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.28.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.28.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.28.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.29.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.29.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.29.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.29.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.29.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.3.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.3.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.3.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.3.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.3.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.30.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.30.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.30.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.30.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.30.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.31.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.31.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.31.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.31.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.31.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.32.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.32.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.32.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.32.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.32.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.33.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.33.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.33.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.33.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.33.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.34.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.34.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.34.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.34.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.34.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.35.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.35.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.35.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.35.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.35.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.36.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.36.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.36.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.36.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.36.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.37.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.37.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.37.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.37.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.37.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.38.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.38.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.38.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.38.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.38.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.39.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.39.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.39.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.39.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.39.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.4.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.4.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.4.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.4.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.4.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.40.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.40.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.40.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.40.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.40.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.41.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.41.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.41.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.41.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.41.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.42.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.42.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.42.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.42.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.42.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.43.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.43.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.43.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.43.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.43.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.44.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.44.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.44.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.44.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.44.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.45.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.45.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.45.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.45.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.45.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.46.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.46.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.46.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.46.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.46.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.47.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.47.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.47.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.47.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.47.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.5.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.5.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.5.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.5.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.5.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.6.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.6.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.6.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.6.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.6.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.7.self_attn.indexer.index_qk_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.7.self_attn.k_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.7.self_attn.o_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.7.self_attn.q_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.7.self_attn.v_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.8.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.8.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.8.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.8.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.8.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.9.linear_attn.in_proj_a": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.9.linear_attn.in_proj_b": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.9.linear_attn.in_proj_qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.9.linear_attn.in_proj_z": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.language_model.layers.9.linear_attn.out_proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "mtp.layers.48.mlp.experts": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.0.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.0.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.1.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.1.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.10.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.10.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.11.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.11.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.12.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.12.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.13.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.13.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.14.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.14.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.15.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.15.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.16.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.16.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.17.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.17.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.18.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.18.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.19.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.19.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.2.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.2.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.20.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.20.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.21.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.21.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.22.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.22.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.23.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.23.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.24.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.24.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.25.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.25.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.26.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.26.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.3.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.3.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.4.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.4.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.5.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.5.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.6.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.6.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.7.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.7.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.8.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.8.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.9.attn.proj": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.9.attn.qkv": {
+        "quant_algo": "MXFP8",
+        "group_size": 32
+      },
+      "model.visual.blocks.0.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.0.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.1.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.1.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.10.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.10.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.11.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.11.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.12.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.12.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.13.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.13.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.14.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.14.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.15.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.15.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.16.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.16.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.17.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.17.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.18.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.18.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.19.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.19.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.2.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.2.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.20.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.20.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.21.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.21.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.22.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.22.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.23.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.23.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.24.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.24.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.25.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.25.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.26.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.26.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.3.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.3.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.4.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.4.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.5.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.5.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.6.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.6.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.7.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.7.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.8.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.8.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.9.mlp.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.blocks.9.mlp.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.merger.linear_fc1": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      },
+      "model.visual.merger.linear_fc2": {
+        "quant_algo": "W4A16_NVFP4",
+        "group_size": 16
+      }
+    }
+  }
+}

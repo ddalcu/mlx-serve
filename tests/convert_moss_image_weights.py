@@ -3,7 +3,7 @@
 quantized mlx-serve pack.
 
 USER-RUN (needs mlx + the ~27 GB bf16 repo). Streams one shard at a time. The pack
-keeps the release's diffusers layout and key names (what src/moss_image.zig loads)
+keeps the release's diffusers layout and key names (what src/plugins/moss_image/moss_image.zig loads)
 with three changes:
 
   (a) the DiT block linears (`layers.N.proj.*`) and every text-encoder linear,

@@ -8,7 +8,7 @@
 //
 // Names match the ds4 loader's lookup table 1:1. Adding a new kernel: drop the
 // `.metal` file in lib/ds4/metal/, add a `pub const` here, and add an entry in
-// `src/arch/ds4.zig` `kernel_entries`.
+// `src/engines/ds4/bridge.zig` `kernel_entries`.
 
 pub const argsort: []const u8 = @embedFile("ds4/metal/argsort.metal");
 pub const bin: []const u8 = @embedFile("ds4/metal/bin.metal");

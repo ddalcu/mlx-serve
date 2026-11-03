@@ -365,12 +365,41 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(old.finish, .model)
     }
 
+    func testModel3DIdolSettingsRoundTripSnapTheCountAndOldBlobsKeepTheDefaults() throws {
+        var s = Model3DGenSettings()
+        s.splatSteps = 30
+        s.splatGuidance = 2.0
+        s.splatGaussians = 524_288
+        s.splatPhoto = .photo
+        let decoded = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONEncoder().encode(s))
+        XCTAssertEqual(decoded, s)
+
+        var obj = try JSONSerialization.jsonObject(with: try JSONEncoder().encode(s)) as! [String: Any]
+        obj["splatGaussians"] = 300_000
+        let snapped = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(snapped.splatGaussians, 262_144, "a stored count that is none of the pane's options snaps to the nearest")
+
+        for key in ["splatSteps", "splatGuidance", "splatGaussians", "splatPhoto"] { obj.removeValue(forKey: key) }
+        let old = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(old.splatSteps, 50)
+        XCTAssertEqual(old.splatGuidance, 3.0)
+        XCTAssertEqual(old.splatGaussians, 262_144)
+        XCTAssertEqual(old.splatPhoto, .render)
+    }
+
     func testModel3DResolvesModelByIdAndFallsBack() {
         var s = Model3DGenSettings()
         s.modelId = Model3DModelPreset.hunyuan3d21_8bit.id
         XCTAssertEqual(s.resolvedModel.id, Model3DModelPreset.hunyuan3d21_8bit.id)
         s.modelId = "nope/nope"
-        XCTAssertEqual(s.resolvedModel.id, Model3DModelPreset.hunyuan3d21_8bit.id)
+        XCTAssertEqual(s.resolvedModel.id, Model3DModelPreset.idol_8bit.id)
+    }
+
+    /// Idol is the recommended 3D model: a pane nobody has used starts on it and leads its picker. A pick already
+    /// saved (the test above) is the user's and is kept.
+    func testModel3DStartsOnIdol() {
+        XCTAssertEqual(Model3DGenSettings().resolvedModel, .idol_8bit)
+        XCTAssertEqual(Model3DModelPreset.all.first, .idol_8bit)
     }
 
     func testModel3DDefaultsMatchThePreset() {

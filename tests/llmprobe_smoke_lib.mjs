@@ -17,7 +17,7 @@ import { join } from "node:path";
  *  minus the engine-served and non-chat ones). GGUF routes to llama.cpp/ds4 and
  *  is deliberately out of scope. */
 const MLX_CHAT_ARCHS = new Set([
-  "gemma3", "gemma4", "gemma4_unified", "diffusion_gemma",
+  "gemma3", "gemma4", "gemma4_unified",
   "qwen2", "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_moe", "qwen3_next",
   "llama", "mistral", "lfm2", "nemotron_h", "hy_v3",
   // Ling-3.0-flash. Its MoE-ness comes from `is_moe` (the arch name carries no
@@ -27,11 +27,6 @@ const MLX_CHAT_ARCHS = new Set([
   "bailing_hybrid",
   "lfm2_moe", "lfm2_vl", "laguna", "inkling_mm_model", "muse_glimmer", "spark2_5", "qwen4_exp",
 ]);
-
-/** Block-diffusion models denoise a canvas instead of decoding token-by-token,
- *  so no speculative path can ever apply to them (`modelBatchable` gates on
- *  `isDiffusion` for the same reason). */
-const NON_SPECULATIVE_FAMILIES = new Set(["diffusion_gemma"]);
 
 /** Speculative drafters exist for Gemma 4 only (`drafter.zig` cross-attends
  *  into the target's K/V; `error.UnsupportedDrafterArch` otherwise). */
@@ -50,10 +45,6 @@ export function familyKey(m) {
   const base = namedMoe ? raw.slice(0, -"_moe".length) : raw;
   return namedMoe || m?.meta?.is_moe ? `${base}-moe` : base;
 }
-
-/** The family without its MoE suffix — for rules that key on the architecture
- *  itself (block diffusion is `diffusion_gemma`, and it is also an MoE). */
-const familyBase = (f = "") => f.replace(/-moe$/, "");
 
 export function isProbeable(m) {
   const caps = m?.capabilities ?? [];
@@ -139,16 +130,6 @@ export function planCells(rep, opts = {}) {
   // zero `[spec-stats]` lines. It is the tripwire for "the flags never landed"
   // — a cell running the wrong config still passes conformance and still posts
   // a plausible tok/s, so nothing else in this harness would notice.
-  if (NON_SPECULATIVE_FAMILIES.has(familyBase(rep.family))) {
-    return [{
-      id: "none",
-      label: "canvas (no spec path exists)",
-      flags: ["--no-pld", "--no-mtp"],
-      expectSpec: null,
-      expectNoSpec: true,
-    }];
-  }
-
   const cells = [
     // PLD is default-ON at the CLI, so a "no speculation" baseline needs BOTH
     // flags — otherwise it isn't a baseline at all.

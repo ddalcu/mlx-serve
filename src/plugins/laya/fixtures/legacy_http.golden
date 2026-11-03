@@ -1,0 +1,42 @@
+== decision 0 329 6a46616de4b20a702579e0c63594db5f154c05079f4dfdfd00c67b6356cf3d4a
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 206
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"model":"m","answers":{"q":{"type":"choice","confidence":0.0055,"action":{"act_probability":0.0001},"choice":"no","probabilities":{"yes":0.4565,"no":0.5435}}},"usage":{"input_tokens":61,"output_tokens":0}}
+== decision 1 179 94ca910d610bd97049e9e19576ed029d5efcb97599afbb32272ded83d52e1bc5
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 54
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"request body is not valid JSON"}}
+== decision 2 183 cc9c9987aef7199c0ed2c87f3089ba3ff6127435cde8d03d68be4492014a6c45
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 58
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"request body must be a JSON object"}}
+== decision 3 164 e6c37f0e16fbd5ab2f0246890c1fcdf47201502d597ed29a81f4186e48f3a0a0
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 39
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"missing 'state'"}}
+== decision 4 199 0f30b2751e2e042755a42cdfb5ab3b30594efb029a3a8a3c44d3f1827b2462bd
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 74
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"question 'type' must be one of choice, score, noul"}}
+== row 687 bc09b60b3f70c3380efe24bc974262dfd2af65b2143319b7a6470fb6cc1ac90e
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["decisions"],"input_modalities":["text"],"modality":"decisions","engines":["mlx"],"meta":{"architecture":"laya","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

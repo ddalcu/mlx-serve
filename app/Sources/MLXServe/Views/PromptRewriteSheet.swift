@@ -74,8 +74,7 @@ struct PromptRewriteSheet: View {
                 if isWriting {
                     ProgressView().controlSize(.small)
                     TimelineView(.periodic(from: startedAt, by: 1)) { context in
-                        Text(verbatim: progress.label + " " + Duration.seconds(context.date.timeIntervalSince(startedAt))
-                                .formatted(.time(pattern: .minuteSecond)))
+                        Text(verbatim: progress.label + " " + AudioClipPlayer.clock(context.date.timeIntervalSince(startedAt)))
                             .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
                     }
                 }
@@ -188,7 +187,8 @@ struct PromptRewriteSheet: View {
             do {
                 for try await event in AgentComposer.events(userText: req.user(seeingImage: sees), systemPrompt: req.system,
                                                             images: sees ? req.images : [],
-                                                            appState: appState, maxTokens: req.maxTokens) {
+                                                            appState: appState, maxTokens: req.maxTokens,
+                                                            reasoningEffort: req.reasoningEffort) {
                     if Task.isCancelled { return }
                     progress.apply(event)
                     if case .content = event { text = progress.text }

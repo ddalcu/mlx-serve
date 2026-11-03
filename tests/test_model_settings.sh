@@ -8,6 +8,7 @@
 #
 # Usage: ./tests/test_model_settings.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11384}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -52,11 +53,7 @@ write_settings 4096 8
 HOME="$FAKE_HOME" "$BIN" --serve --model "$MODEL_A" --model-dir "$MODELS_ROOT" --ctx-size 16384 --mtp-greedy-tail --port "$PORT" --log-file off >"$LOG" 2>&1 &
 SRV=$!
 UP=0
-for _ in $(seq 1 240); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { UP=1; break; }
-    kill -0 "$SRV" 2>/dev/null || break
-    sleep 0.5
-done
+srv_wait_health "http://127.0.0.1:$PORT" 240 0.5 "$SRV" && UP=1
 [ "$UP" = "1" ] || { echo "FAIL: server never became healthy"; tail -5 "$LOG"; exit 1; }
 
 row() { # row <model path> <field> — top-level context_length or meta.kv_quant of the READY row

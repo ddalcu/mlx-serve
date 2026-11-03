@@ -5,7 +5,7 @@ import XCTest
 /// are `rl_agent_config.json` + `encoder/config.json`), so every gate keyed on
 /// that file dropped it: invisible in the Downloaded tab, never "on disk" for
 /// the resolver, and no bundle to verify a search row against. Server twin:
-/// `model_discovery.peekLayaCheckpoint`.
+/// the laya plugin's `claims`.
 final class LayaModelTests: XCTestCase {
 
     private func makeLayaDir() throws -> (root: String, dir: String) {

@@ -1,0 +1,2311 @@
+//! Plan 05 — model discovery (Phase 1 minimal).
+//!
+//! Walks a directory looking for subdirectories that contain `config.json`,
+//! treats each as a discoverable model. Used by `--model-dir` to enumerate
+//! candidate models for `/v1/models` listing without loading them.
+//!
+//! v1 scope: discovery + listing only. Request routing still goes to the
+//! single `--model` loaded at startup; if the user passes `--model-dir`
+//! WITHOUT `--model`, we pick the first discovered model as the loaded one
+//! and surface the rest as `loaded:false` siblings.
+//!
+//! On-demand load + LRU eviction live in plan 05 phases 2-5 and depend on
+//! plan 01 Phase 0 (detangling Transformer state).
+
+const std = @import("std");
+const log = @import("../../sdk/util/log.zig");
+const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
+// Only the pure JSON contract predicate is referenced — lazy analysis keeps
+// dflash.zig's mlx FFI out of this filesystem-only module.
+const dflash = @import("../../sdk/spec/dflash_contract.zig");
+const mtp = @import("../../sdk/spec/mtp/mtp.zig");
+const served_media = @import("../media_jobs/plugin/served.zig");
+const modality = @import("modality.zig");
+const mlx_engine = @import("../engines/mlx.zig");
+const outside_plugins = @import("../plugins/loader.zig");
+const pack_dir = @import("pack_dir.zig");
+const FsPackDir = pack_dir.FsPackDir;
+const registry = @import("../../plugins/registry.zig");
+
+/// The file whose presence makes a media pack of `model_type` COMPLETE (its plugin's `required_file`), or null. Every
+/// H3/LTX download holds a valid config.json for the tens of minutes its big weights are still `.partial`: registering
+/// such a dir shadows complete copies in later roots, and loading it falls through to the text loader, which dies on
+/// the first missing weight. Discovery, register-by-path and the load guard all read this one.
+/// App twin: `DownloadManager.requiredMediaMarker`.
+pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
+    if (served_media.byName(model_type)) |t| return if (t.required_file.len == 0) null else t.required_file.slice();
+    return null;
+}
+
+/// Models a transcription leans on that serve no request of their own: the
+/// forced aligner and the speaker diarizer.
+pub fn isTranscriptionCompanion(model_type: []const u8) bool {
+    return std.mem.eql(u8, model_type, "qwen3_forced_aligner") or modality.fromType(model_type) == .diarization;
+}
+
+pub fn isMediaModelType(model_type: []const u8) bool {
+    return modality.fromType(model_type) != null;
+}
+
+/// A registered plugin claims `model_type` by its type alone.
+fn isSupportedModelType(model_type: []const u8) bool {
+    if (isMediaModelType(model_type)) return true;
+    for (registry.entries) |e| if (e.model) |t| if (t.claims(.of(model_type), .{}, &pack_dir.none) != .no) return true;
+    return false;
+}
+
+/// Quantization modes the MLX loader supports. Must stay in sync with
+/// `model.zig:QuantMode` (discovery deliberately avoids importing model.zig,
+/// which would drag the mlx FFI into this filesystem-only module).
+const supported_quant_modes = [_][]const u8{ "affine", "nvfp4", "mxfp4", "mxfp8" };
+
+fn isSupportedQuantMode(mode: []const u8) bool {
+    for (supported_quant_modes) |m| {
+        if (std.mem.eql(u8, mode, m)) return true;
+    }
+    return false;
+}
+
+/// Outcome of reading a candidate's config.json. Discovery treats any
+/// non-`.supported` result as "skip this directory."
+const ConfigPeek = union(enum) {
+    supported: []const u8, // owned dupe of model_type
+    unsupported_arch: []const u8, // owned dupe of model_type
+    unsupported_quant: []const u8, // owned dupe of quantization.mode
+    /// Declares the DFlash config contract — a spec-decode sidecar whatever
+    /// its `model_type` says (DFlash2 ships a bare "qwen3" with no embed
+    /// weights; registering it as chat dies at cold load).
+    drafter,
+    missing_or_unparseable,
+};
+
+/// Peek at a candidate's `config.json`: classify by `model_type` and
+/// `quantization.mode`. Discovery uses this to filter out:
+///   - unsupported archs (e.g. deepseek_v4, which crashes the tokenizer)
+///   - unsupported quantization modes (anything outside
+///     `supported_quant_modes` — affine, nvfp4, mxfp4, mxfp8).
+///
+/// Returned strings are owned by `allocator`; the caller frees them via
+/// the helpers in `freeConfigPeek`.
+fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_name: []const u8) ConfigPeek {
+    var sub = dir.openDir(io, entry_name, .{}) catch return .missing_or_unparseable;
+    defer sub.close(io);
+    // A media pack is its plugin's, whatever its config.json says (a Kev pack carries its base model's) or when it
+    // ships none.
+    if (served_media.claimTypeIn(io, sub, allocator)) |mt| return .{ .supported = mt };
+    var file = sub.openFile(io, "config.json", .{}) catch return .missing_or_unparseable;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .missing_or_unparseable;
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .missing_or_unparseable;
+    defer parsed.deinit();
+    if (parsed.value != .object) return .missing_or_unparseable;
+    const root = parsed.value.object;
+    // The DFlash contract outranks model_type: v1 assistants at least carry a
+    // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
+    // from its trunk family without this probe (one predicate, shared with
+    // the loader's own detection).
+    if (dflash.isDflashConfigJson(root)) return .drafter;
+    const mt_val = root.get("model_type") orelse return .missing_or_unparseable;
+    if (mt_val != .string) return .missing_or_unparseable;
+    const fs: FsPackDir = .{ .io = io, .root = sub };
+    if (!isSupportedModelType(mt_val.string) and outside_plugins.winner(mt_val.string, bytes, &fs.packDir()) == null) {
+        const dup = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable;
+        return .{ .unsupported_arch = dup };
+    }
+    // Media models manage their own per-component quantization (the top-level
+    // config may declare a mode the MLX loader doesn't, e.g. a DiT scheme), so
+    // they bypass the LM quant gate below.
+    if (isMediaModelType(mt_val.string)) {
+        return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
+    }
+    // Quantization gate: if a model declares a `quantization.mode`, accept
+    // only the schemes the loader supports. Models without a quantization
+    // block (bf16 / unquantized) pass through.
+    if (root.get("quantization")) |q_val| {
+        if (q_val == .object) {
+            if (q_val.object.get("mode")) |mode_val| {
+                if (mode_val == .string and !isSupportedQuantMode(mode_val.string)) {
+                    const dup = allocator.dupe(u8, mode_val.string) catch return .missing_or_unparseable;
+                    return .{ .unsupported_quant = dup };
+                }
+            }
+        }
+    }
+    const mt = if (isForcedAligner(root)) "qwen3_forced_aligner" else mt_val.string;
+    return .{ .supported = allocator.dupe(u8, mt) catch return .missing_or_unparseable };
+}
+
+/// A Qwen3-ForcedAligner pack: its root says `qwen3_asr`, only the thinker tells.
+pub fn isForcedAligner(root: std.json.ObjectMap) bool {
+    const t = root.get("thinker_config") orelse return false;
+    if (t != .object) return false;
+    const mt = t.object.get("model_type") orelse return false;
+    return mt == .string and std.mem.eql(u8, mt.string, "qwen3_forced_aligner");
+}
+
+pub const indexShardSet = @import("../../sdk/weights/resident.zig").indexShardSet;
+
+pub const freeShardSet = @import("../../sdk/weights/resident.zig").freeShardSet;
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
+
+const GgufScan = gguf_files.GgufScan;
+
+const scanLlmGguf = gguf_files.scanLlmGguf;
+
+pub const isGgufModelPath = gguf_files.isGgufModelPath;
+
+pub const resolveGgufFile = gguf_files.resolveGgufFile;
+
+/// Emit a user-facing, actionable error message for the failures
+/// `resolveGgufFile` can return. Call from the fatal load path; probes
+/// should NOT log and let the eventual resolveGgufFile re-attempt surface
+/// the error once.
+pub fn logResolveGgufError(path: []const u8, err: anyerror) void {
+    switch (err) {
+        error.OnlyMmprojGgufFile => {
+            // Discriminate between "user pointed at the mmproj file
+            // directly" and "directory had only mmproj sidecars".
+            if (std.mem.endsWith(u8, path, ".gguf")) {
+                log.err("'{s}' is an mmproj sidecar (CLIP vision/audio encoder), not an LLM. Point at the language-model .gguf (typically the same directory, e.g. `*-Q4_K_M.gguf`).\n", .{path});
+            } else {
+                log.err("'{s}' contains only mmproj sidecars (multimodal projection / CLIP encoders). Download or move the matching language-model .gguf (e.g. `*-Q4_K_M.gguf`) into this directory.\n", .{path});
+            }
+        },
+        error.EmbeddingGgufFile => log.err("'{s}' is an embedding GGUF (it declares a pooling type): the GGUF engines here generate text and do not serve embeddings. Use an MLX embedding model for /v1/embeddings.\n", .{path}),
+        error.NoGgufFile => log.err("'{s}' contains no .gguf files.\n", .{path}),
+        else => log.err("resolveGgufFile('{s}'): {s}\n", .{ path, @errorName(err) }),
+    }
+}
+
+/// Coarse classification of a model for UX surfaces — the `mlx-serve list`
+/// TYPE column and the `run` chat-REPL preflight. Mirrors how serving
+/// actually routes the directory (media engines, embedded GGUF engines,
+/// encoder-only, drafter sidecars).
+pub const ModelKind = enum {
+    chat,
+    image,
+    audio,
+    video,
+    mesh,
+    decision,
+    diarization,
+    embed,
+    drafter,
+    unsupported,
+
+    /// Short label for the `list` TYPE column.
+    pub fn label(self: ModelKind) []const u8 {
+        return switch (self) {
+            .chat => "chat",
+            .image => "image",
+            .audio => "audio",
+            .video => "video",
+            .mesh => "3d",
+            .decision => "decision",
+            .diarization => "diarizer",
+            .embed => "embed",
+            .drafter => "drafter",
+            .unsupported => "unsupported",
+        };
+    }
+
+    /// Human phrase for refusal messages ("'X' is <describe>").
+    pub fn describe(self: ModelKind) []const u8 {
+        return switch (self) {
+            .chat => "a chat model",
+            .image => "an image generation model",
+            .audio => "an audio generation model",
+            .video => "a video generation model",
+            .mesh => "a 3D generation model",
+            .decision => "a typed-decision model (use /v1/decisions)",
+            .diarization => "a speaker diarizer (it labels the speakers of /v1/audio/transcriptions with response_format=diarized_json)",
+            .embed => "an embedding encoder (use /v1/embeddings)",
+            .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside a Gemma 4 target)",
+            .unsupported => "an architecture mlx-serve does not support",
+        };
+    }
+
+    /// The generation endpoint that DOES serve this kind, when one exists.
+    pub fn genEndpoint(self: ModelKind) ?[]const u8 {
+        return switch (self) {
+            .image => "/v1/images/generations",
+            .audio => "/v1/audio/speech (TTS), /v1/audio/music-generations (music) or /v1/audio/sound-generations (sound effects)",
+            .video => "/v1/video/generations",
+            .mesh => "/v1/3d/generations",
+            .decision => "/v1/decisions",
+            else => null,
+        };
+    }
+};
+
+/// The ModelKind a config.json `model_type` alone tells: a media type by its plugin's modality. An encoder is told by
+/// its pack (`classifyModelPath`). "gguf" is the synthetic type discovery assigns to GGUF dirs — chat via the embedded
+/// engines.
+fn modelKindFromType(model_type: []const u8) ModelKind {
+    if (modality.fromType(model_type)) |m| return switch (m) {
+        .image => .image,
+        .audio => .audio,
+        .video => .video,
+        .mesh => .mesh,
+        .decision => .decision,
+        .diarization => .diarization,
+    };
+    if (std.mem.endsWith(u8, model_type, "_assistant")) return .drafter;
+    if (std.mem.eql(u8, model_type, "gguf")) return .chat;
+    if (isSupportedModelType(model_type)) return .chat;
+    return .unsupported;
+}
+
+/// Classify an ABSOLUTE model dir. An LLM `.gguf` wins (embedded chat
+/// engine — same precedence as routing); else config.json's model_type;
+/// null when the dir is not model-shaped at all.
+pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) ?ModelKind {
+    if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return null;
+    if (isGgufModelPath(io, abs_path)) return .chat;
+    const trimmed = trimTrailingSlash(abs_path);
+    const base = std.fs.path.basename(trimmed);
+    const parent = std.fs.path.dirname(trimmed) orelse return null;
+    if (base.len == 0 or parent.len == 0) return null;
+    var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return null;
+    defer dir.close(io);
+    return switch (peekConfig(io, allocator, dir, base)) {
+        .missing_or_unparseable => null,
+        // Raw model_type still classifies the KIND even when serving would
+        // skip it (drafters, vit, ...) — that's exactly what the label is for.
+        .unsupported_arch => |mt| blk: {
+            defer allocator.free(mt);
+            break :blk modelKindFromType(mt);
+        },
+        .unsupported_quant => |mode| blk: {
+            allocator.free(mode);
+            break :blk .unsupported;
+        },
+        .drafter => .drafter,
+        .supported => |mt| blk: {
+            defer allocator.free(mt);
+            const kind = modelKindFromType(mt);
+            // An encoder (BERT, EmbeddingGemma 1 and 2) serves embeddings, never chat.
+            break :blk if (kind == .chat and readStubMeta(io, allocator, abs_path).is_encoder) .embed else kind;
+        },
+    };
+}
+
+pub const DiscoveredModel = struct {
+    /// Model id (subdirectory basename, e.g. "gemma-4-e4b-it-4bit").
+    id: []const u8,
+    /// Absolute path to the model directory.
+    path: []const u8,
+    /// Approximate weight size on disk in bytes (sum of *.safetensors). Used
+    /// later by eviction; null if scan failed.
+    bytes_on_disk: ?u64,
+    /// `model_type` peeked from config.json (e.g. "bert"), so registry stubs
+    /// can advertise arch-derived capabilities before a cold load. Empty
+    /// when unknown.
+    model_type: []const u8 = "",
+};
+
+pub const DiscoveryResult = struct {
+    models: []DiscoveredModel,
+    allocator: std.mem.Allocator,
+    /// The roots this result was scanned from (owned dupes; set by
+    /// `discoverModelsMany`). Kept so `ModelRegistry.rescan` can re-walk
+    /// them at runtime — models downloaded after boot are invisible to a
+    /// boot-only scan.
+    roots: []const []const u8 = &.{},
+
+    pub fn deinit(self: *DiscoveryResult) void {
+        for (self.models) |*m| {
+            self.allocator.free(m.id);
+            self.allocator.free(m.path);
+            if (m.model_type.len > 0) self.allocator.free(m.model_type);
+        }
+        self.allocator.free(self.models);
+        if (self.roots.len > 0) {
+            for (self.roots) |r| self.allocator.free(r);
+            self.allocator.free(self.roots);
+        }
+    }
+};
+
+/// True if a `.gguf` basename is the DeepSeek-V4-Flash model served by the ds4
+/// engine (case-insensitive `deepseek-v4-flash` prefix). Every other GGUF routes
+/// to the generic llama.cpp engine — libllama can't load the DSV4-Flash
+/// architecture, which is why ds4 exists. Mirrors the Swift app's
+/// `isSupportedDsv4Gguf` so client and server agree on which GGUFs are ds4.
+pub fn isDs4GgufBasename(name: []const u8) bool {
+    const prefix = "deepseek-v4-flash";
+    if (name.len < prefix.len) return false;
+    for (prefix, 0..) |c, i| {
+        if (std.ascii.toLower(name[i]) != c) return false;
+    }
+    return true;
+}
+
+pub const isMmprojGgufBasename = gguf_files.isMmprojGgufBasename;
+
+pub const isMtpGgufBasename = gguf_files.isMtpGgufBasename;
+
+pub const isGgufSidecarBasename = gguf_files.isGgufSidecarBasename;
+
+/// Full path to the ds4 MTP draft-head GGUF sitting beside `model_file_path`
+/// (the primary quant), or null when there is none. Caller owns the returned
+/// slice. Used to auto-enable ds4 speculative decode: the app downloads the MTP
+/// file into the same folder as the chosen quant, and the engine finds it here.
+pub fn findDs4MtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
+    const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
+    return firstMtpGgufIn(io, allocator, dir_path, std.fs.path.basename(model_file_path));
+}
+
+/// Full path to an MTP draft-head GGUF for the llama.cpp engine, or null: the
+/// model's own folder first, then an `MTP/` folder inside it or beside it
+/// (unsloth keeps each quant in its own folder and the heads in `MTP/`).
+/// Caller owns the returned slice.
+pub fn findLlamaMtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
+    const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
+    const skip = std.fs.path.basename(model_file_path);
+    if (firstMtpGgufIn(io, allocator, dir_path, skip)) |p| return p;
+    for ([_]?[]const u8{ dir_path, std.fs.path.dirname(dir_path) }) |base| {
+        const mtp_dir = std.fs.path.join(allocator, &.{ base orelse continue, "MTP" }) catch return null;
+        defer allocator.free(mtp_dir);
+        if (firstMtpGgufIn(io, allocator, mtp_dir, skip)) |p| return p;
+    }
+    return null;
+}
+
+/// The first MTP draft-head GGUF in `dir_path` by name, other than `skip`.
+fn firstMtpGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, skip: []const u8) ?[]u8 {
+    // openDir asserts (→ ReleaseFast UB) on a non-absolute path.
+    if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return null;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+    var best: ?[]const u8 = null;
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!isMtpGgufBasename(entry.name) or std.mem.eql(u8, entry.name, skip)) continue;
+        if (best != null and !std.mem.lessThan(u8, entry.name, best.?)) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file or entry.name.len > name_buf.len) continue;
+        @memcpy(name_buf[0..entry.name.len], entry.name);
+        best = name_buf[0..entry.name.len];
+    }
+    return std.fs.path.join(allocator, &.{ dir_path, best orelse return null }) catch null;
+}
+
+const asciiContainsIgnoreCase = gguf_files.asciiContainsIgnoreCase;
+
+/// Scan `model_dir` for subdirectories containing `config.json`.
+/// Returns DiscoveryResult; caller owns memory via deinit().
+/// Symlinks followed; permission errors on individual subdirs skipped silently.
+pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !DiscoveryResult {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch |err| {
+        return err;
+    };
+    defer dir.close(io);
+    return discoverModelsInDir(io, allocator, dir, model_dir);
+}
+
+/// Scan several roots and merge them into ONE result, first-root-wins on a
+/// repeated id.
+///
+/// De-dup is load-bearing, not tidiness: `registerStubWithArch` answers
+/// `error.DuplicateId` and `ModelRegistry.registerDiscovered` does `try`, so
+/// two roots holding the same `org/name` would fail the whole registry init —
+/// the server would not start. First wins because the caller orders the roots
+/// and the first is where downloads land, so a stale copy on a second disk must
+/// never shadow the live one.
+///
+/// A root that cannot be opened is SKIPPED with a warning rather than failing:
+/// the second folder can live on an external drive, and unplugging it must not
+/// stop the server serving everything else.
+pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []const []const u8) !DiscoveryResult {
+    // Dupe the roots first so the result can carry them (see
+    // `DiscoveryResult.roots`).
+    var roots_owned: []const []const u8 = &.{};
+    if (roots.len > 0) {
+        const dupes = try allocator.alloc([]const u8, roots.len);
+        var done: usize = 0;
+        errdefer {
+            for (dupes[0..done]) |r| allocator.free(r);
+            allocator.free(dupes);
+        }
+        for (roots) |r| {
+            dupes[done] = try allocator.dupe(u8, r);
+            done += 1;
+        }
+        roots_owned = dupes;
+    }
+    errdefer if (roots_owned.len > 0) {
+        for (roots_owned) |r| allocator.free(r);
+        allocator.free(roots_owned);
+    };
+
+    var merged = std.ArrayList(DiscoveredModel).empty;
+    errdefer {
+        for (merged.items) |*m| {
+            allocator.free(m.id);
+            allocator.free(m.path);
+            if (m.model_type.len > 0) allocator.free(m.model_type);
+        }
+        merged.deinit(allocator);
+    }
+
+    for (roots) |root| {
+        const one = discoverModels(io, allocator, root) catch |err| {
+            log.warn("--model-dir scan failed ({s}): {s}\n", .{ root, @errorName(err) });
+            continue;
+        };
+        // Transfer ownership per model, freeing only the ones we drop — the
+        // whole result's `deinit` would free the strings we just handed over.
+        defer allocator.free(one.models);
+        for (one.models) |m| {
+            var dup = false;
+            for (merged.items) |seen| {
+                if (std.mem.eql(u8, seen.id, m.id)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                log.warn("[discovery] {s}: already found in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
+                allocator.free(m.id);
+                allocator.free(m.path);
+                if (m.model_type.len > 0) allocator.free(m.model_type);
+                continue;
+            }
+            try merged.append(allocator, m);
+        }
+    }
+
+    return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator, .roots = roots_owned };
+}
+
+/// Core scan over an already-open root. Two layouts are recognized:
+///   <root>/<model>/config.json               → id "<model>"
+///   <root>/<org>/<model>/config.json         → id "<org>/<model>"
+/// The second is the HF-style layout `~/.mlx-serve/models` uses (the app's
+/// DownloadManager and `mlx-serve pull` both write there).
+pub fn discoverModelsInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8) !DiscoveryResult {
+    var found = std.ArrayList(DiscoveredModel).empty;
+    errdefer {
+        for (found.items) |*m| {
+            allocator.free(m.id);
+            allocator.free(m.path);
+            if (m.model_type.len > 0) allocator.free(m.model_type);
+        }
+        found.deinit(allocator);
+    }
+
+    var iter = dir.iterate();
+    while (try iter.next(io)) |entry| {
+        if (entry.kind != .directory and entry.kind != .sym_link) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+
+        const is_model_dir = try tryAddModel(io, allocator, dir, entry.name, "", model_dir, &found);
+        if (is_model_dir) continue;
+
+        // No config.json at this level — maybe an org dir (org/repo layout).
+        var org = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer org.close(io);
+        var org_iter = org.iterate();
+        while (org_iter.next(io) catch null) |org_entry| {
+            if (org_entry.kind != .directory and org_entry.kind != .sym_link) continue;
+            if (org_entry.name.len == 0 or org_entry.name[0] == '.') continue;
+            _ = try tryAddModel(io, allocator, org, org_entry.name, entry.name, model_dir, &found);
+        }
+    }
+
+    // Stable order: by id ascending, so listing is deterministic.
+    std.sort.pdq(DiscoveredModel, found.items, {}, lessThanById);
+
+    return .{
+        .models = try found.toOwnedSlice(allocator),
+        .allocator = allocator,
+    };
+}
+
+/// Inspect `parent/<name>` as a model-dir candidate; append to `found` if
+/// it holds an LLM `.gguf` or a supported config.json. Returns true when
+/// the dir was model-shaped (gguf present, or config.json present — even
+/// if unsupported), so callers know not to descend into it looking for an
+/// org layout.
+fn tryAddModel(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parent: std.Io.Dir,
+    name: []const u8,
+    id_prefix: []const u8,
+    model_dir: []const u8,
+    found: *std.ArrayList(DiscoveredModel),
+) !bool {
+    var sub = parent.openDir(io, name, .{ .iterate = true }) catch return false;
+    defer sub.close(io);
+
+    var bytes: u64 = 0;
+    var bytes_ok = false;
+
+    // GGUF first (issue #59) — mirrors `--model` routing, where isGgufPath
+    // is checked BEFORE any config.json parse ("GGUF files bypass the MLX
+    // dispatch entirely"). Pulled GGUF repos usually ship no config.json at
+    // all, and the ones that do (unsloth) ship the ORIGINAL model's — an
+    // MLX classification would cold-load into a missing-safetensors failure.
+    const model_type: []const u8 = blk: {
+        const scan = scanLlmGguf(io, allocator, &sub) catch GgufScan{};
+        if (scan.pick) |p| {
+            allocator.free(p);
+            bytes = scan.pick_bytes;
+            bytes_ok = true;
+            break :blk try allocator.dupe(u8, "gguf");
+        }
+
+        // No root config.json is not automatically "not a model": a MageFlow
+        // diffusers repo keeps every config in a component subdir and carries
+        // only `model_index.json`. `peekConfig` knows that, so hand the dir to
+        // it instead of bailing here — bailing made its fallback unreachable
+        // and left every downloaded MageFlow checkpoint invisible to `list`,
+        // `/v1/models` and the app picker. Anything with neither file still
+        // returns false below, via `.missing_or_unparseable`.
+        const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
+        if (!has_config and served_media.claimIn(io, sub) == null) return false;
+
+        // Filter by supported model_type AND quantization scheme. Catches:
+        //   - partially-downloaded checkpoints (missing/garbage config)
+        //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
+        //   - unsupported quants (modes outside supported_quant_modes)
+        // before they reach the tokenizer/weight loaders.
+        break :blk switch (peekConfig(io, allocator, parent, name)) {
+            .missing_or_unparseable => {
+                log.info("[discovery] skip {s}: config.json missing or unparseable", .{name});
+                return true;
+            },
+            .unsupported_arch => |mt| {
+                defer allocator.free(mt);
+                log.info("[discovery] skip {s}: unsupported model_type '{s}'", .{ name, mt });
+                return true;
+            },
+            .unsupported_quant => |mode| {
+                defer allocator.free(mode);
+                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ name, mode });
+                return true;
+            },
+            .drafter => {
+                log.info("[discovery] skip {s}: DFlash drafter sidecar, not a standalone model", .{name});
+                return true;
+            },
+            .supported => |mt| mt, // ownership moves to the DiscoveredModel
+        };
+    };
+    errdefer if (model_type.len > 0) allocator.free(model_type);
+
+    // An incomplete media pack stays invisible, like any half-pulled
+    // download (see `requiredMediaMarker`).
+    if (requiredMediaMarker(model_type)) |marker| {
+        const present = if (sub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
+        if (!present) {
+            log.info("[discovery] skip {s}: {s} without {s} (incomplete media pack)", .{ name, model_type, marker });
+            allocator.free(model_type);
+            return true;
+        }
+    }
+
+    // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
+    // GGUF entries already carry the picked file's size instead.
+    if (!bytes_ok) {
+        var sub_iter_dir = parent.openDir(io, name, .{ .iterate = true }) catch null;
+        if (sub_iter_dir) |*sd| {
+            defer sd.close(io);
+            var referenced = indexShardSet(io, sd.*);
+            defer if (referenced) |*r| freeShardSet(r);
+            var sd_iter = sd.iterate();
+            while (sd_iter.next(io) catch null) |sub_entry| {
+                if (sub_entry.kind != .file and sub_entry.kind != .sym_link) continue;
+                if (!std.mem.endsWith(u8, sub_entry.name, ".safetensors")) continue;
+                if (referenced) |r| if (!r.contains(sub_entry.name)) continue;
+                const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
+                if (st.kind != .file) continue;
+                bytes += @intCast(st.size);
+                bytes_ok = true;
+            }
+        }
+        // A diffusers-shaped repo (MageFlow) holds NO weights at its root —
+        // they live one level down in transformer/, text_encoder/, vae/. Only
+        // descend when the flat scan came up empty, so the common MLX layout
+        // pays nothing.
+        if (!bytes_ok) bytes_ok = sumComponentWeights(io, parent, name, &bytes);
+    }
+
+    const id = if (id_prefix.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ id_prefix, name })
+    else
+        try allocator.dupe(u8, name);
+    errdefer allocator.free(id);
+    const path = if (id_prefix.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ trimTrailingSlash(model_dir), id_prefix, name })
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(model_dir), name });
+    try found.append(allocator, .{
+        .id = id,
+        .path = path,
+        .bytes_on_disk = if (bytes_ok) bytes else null,
+        .model_type = model_type,
+    });
+    return true;
+}
+
+/// Sum `*.safetensors` one level below `parent/name` (the component subdirs of
+/// a diffusers repo). Returns true when anything was found. Best-effort: any
+/// unreadable dir is skipped, exactly like the flat scan above.
+fn sumComponentWeights(io: std.Io, parent: std.Io.Dir, name: []const u8, bytes: *u64) bool {
+    var top = parent.openDir(io, name, .{ .iterate = true }) catch return false;
+    defer top.close(io);
+    var found_any = false;
+    var it = top.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        var comp = top.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer comp.close(io);
+        var cit = comp.iterate();
+        while (cit.next(io) catch null) |f| {
+            if (f.kind != .file and f.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, f.name, ".safetensors")) continue;
+            const st = comp.statFile(io, f.name, .{}) catch continue;
+            if (st.kind != .file) continue;
+            bytes.* += @intCast(st.size);
+            found_any = true;
+        }
+    }
+    return found_any;
+}
+
+const trimTrailingSlash = gguf_files.trimTrailingSlash;
+
+pub const ProbeResult = struct {
+    /// Owned dupe of the supported model_type.
+    model_type: []const u8,
+    /// Sum of *.safetensors bytes; null if the scan failed.
+    bytes_on_disk: ?u64,
+};
+
+/// Validate an arbitrary absolute model directory the way discovery would
+/// (config.json present, supported model_type and quant mode) and report its
+/// weight bytes. Used by /v1/load-model's register-by-path branch for models
+/// OUTSIDE the --model-dir scan — e.g. the app's auto-downloaded embedding
+/// encoder, which lands wherever the download root is regardless of which
+/// org dir the chat model came from.
+pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) !ProbeResult {
+    const trimmed = trimTrailingSlash(abs_path);
+    const base = std.fs.path.basename(trimmed);
+    const parent = std.fs.path.dirname(trimmed) orelse return error.InvalidModelPath;
+    if (base.len == 0 or parent.len == 0) return error.InvalidModelPath;
+
+    var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return error.ModelDirNotFound;
+    defer dir.close(io);
+
+    // A `.gguf` FILE is a model of its own: the app picks GGUF quants one file
+    // at a time (a per-quant folder, a split's first shard), as `--model` does.
+    if (std.mem.endsWith(u8, base, ".gguf")) {
+        if (isGgufSidecarBasename(base) or gguf_meta.fileDeclaresPooling(io, dir, base)) return error.UnsupportedArch;
+        const st = dir.statFile(io, base, .{}) catch return error.ModelDirNotFound;
+        if (st.kind != .file) return error.ModelDirNotFound;
+        return .{ .model_type = try allocator.dupe(u8, "gguf"), .bytes_on_disk = @intCast(st.size) };
+    }
+
+    // GGUF first — same precedence as tryAddModel and `--model` routing.
+    gguf: {
+        var sub = dir.openDir(io, base, .{ .iterate = true }) catch break :gguf;
+        defer sub.close(io);
+        const scan = scanLlmGguf(io, allocator, &sub) catch break :gguf;
+        if (scan.pick) |p| {
+            allocator.free(p);
+            return .{
+                .model_type = try allocator.dupe(u8, "gguf"),
+                .bytes_on_disk = scan.pick_bytes,
+            };
+        }
+    }
+
+    const model_type: []const u8 = switch (peekConfig(io, allocator, dir, base)) {
+        .missing_or_unparseable => return error.ModelDirNotFound,
+        .unsupported_arch => |mt| {
+            allocator.free(mt);
+            return error.UnsupportedArch;
+        },
+        .unsupported_quant => |mode| {
+            allocator.free(mode);
+            return error.UnsupportedQuantMode;
+        },
+        .drafter => return error.UnsupportedArch,
+        .supported => |mt| mt,
+    };
+    errdefer allocator.free(model_type);
+
+    // Same completeness rule as tryAddModel: registering an incomplete media
+    // pack by path would hand it straight to the text loader.
+    if (requiredMediaMarker(model_type)) |marker| {
+        var msub = dir.openDir(io, base, .{}) catch return error.ModelDirNotFound;
+        defer msub.close(io);
+        const present = if (msub.statFile(io, marker, .{})) |st| st.kind == .file else |_| false;
+        if (!present) return error.IncompleteMediaPack;
+    }
+
+    var bytes: u64 = 0;
+    var bytes_ok = false;
+    var sub = dir.openDir(io, base, .{ .iterate = true }) catch null;
+    if (sub) |*sd| {
+        defer sd.close(io);
+        var it = sd.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+            const st = sd.statFile(io, entry.name, .{}) catch continue;
+            if (st.kind != .file) continue;
+            bytes += @intCast(st.size);
+            bytes_ok = true;
+        }
+    }
+    return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null };
+}
+
+/// Metadata an `unloaded` stub can advertise via `/v1/models` without faulting
+/// in weights — all sourced from `config.json` (+ chat-template presence). Lets
+/// clients see context window, dims, MoE-ness, and capabilities (tools/vision)
+/// before a cold load. `found=false` means config.json couldn't be read/parsed.
+pub const StubMeta = struct {
+    found: bool = false,
+    vocab_size: u32 = 0,
+    hidden_size: u32 = 0,
+    num_hidden_layers: u32 = 0,
+    max_position_embeddings: u32 = 0,
+    quant_bits: u32 = 0,
+    is_moe: bool = false,
+    /// The dir ships an MTP head (sidecar or in-checkpoint) the server can load.
+    has_mtp: bool = false,
+    has_vision: bool = false,
+    /// Qwen3-VL-family video input: a `video_token_id` alongside `has_vision`
+    /// (video piggybacks the vision tower — see src/sdk/vision/qwen_vision.zig).
+    has_video: bool = false,
+    /// A served pack's audio input and speech output (`Parsed.speech`).
+    has_audio: bool = false,
+    has_speech: bool = false,
+    has_chat: bool = false,
+    /// Speech to text on `/v1/audio/transcriptions` (Qwen3-ASR).
+    has_transcription: bool = false,
+    /// Qwen3-ForcedAligner: times the words of a transcript, serves no route of its own.
+    is_aligner: bool = false,
+    /// The chat template can open a reasoning block (`templateSupportsThinking`).
+    has_thinking: bool = false,
+    /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
+    /// advertises "embeddings" and no chat capabilities.
+    is_encoder: bool = false,
+    /// Embedding capability (issue #116): every encoder, PLUS a decoder with a
+    /// declared pooling contract (config.json `pooling_mode`, or — added by
+    /// `readStubMeta` — a `1_Pooling/config.json` sidecar). The name-based
+    /// fallback for metadata-less checkpoints lives at the server's stub-cap
+    /// site via `model.poolingFromDirName` (one shared rule, no copy here).
+    has_embedding: bool = false,
+};
+
+fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
+    if (obj.get(key)) |v| {
+        if (v == .integer and v.integer > 0) return std.math.cast(u32, v.integer) orelse 0;
+    }
+    return 0;
+}
+
+/// RADIO's native checkpoint discriminator, shared by discovery and the model loader.
+pub fn hasRadioVision(root: std.json.ObjectMap) bool {
+    const vc = root.get("vision_config") orelse return false;
+    if (vc != .object) return false;
+    const mt = vc.object.get("model_type") orelse return false;
+    return mt == .string and std.mem.eql(u8, mt.string, "radio");
+}
+
+/// Pure: extract `StubMeta` from raw config.json bytes. `has_chat_template` is
+/// supplied by the caller (the template lives outside config.json), and
+/// determines chat/tool capabilities — gated off for encoder-only (`bert`)
+/// archs. Mirrors the loaded-path capability rules in `server.renderModelEntry`
+/// (chat-template presence ⇒ chat/tool_use/streaming/json_schema). Returns
+/// `.found=false` on any parse failure.
+pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_chat_template: bool) StubMeta {
+    var meta: StubMeta = .{};
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return meta;
+    defer parsed.deinit();
+    if (parsed.value != .object) return meta;
+    const root = parsed.value.object;
+    meta.found = true;
+
+    // A multimodal checkpoint puts EVERY text dim under `text_config` and
+    // leaves only model_type / vision_config / quantization at the root. Read
+    // the nested block first and fall back to the root per field (a minimal
+    // `text_config` may omit fields the root still carries) — the same merge
+    // `model.zig parseConfigFromJson` does. Reading the root alone made
+    // /v1/models report hidden=0 / layers=0 / ctx=0 / is_moe=false for every
+    // unloaded Gemma 3/4 and Qwen-VL model.
+    // Qwen3-ASR nests under `thinker_config`; Nemotron omni uses `llm_config`.
+    const thinker: ?std.json.ObjectMap = if (root.get("thinker_config")) |t| (if (t == .object) t.object else null) else null;
+    const text_cfg: ?std.json.ObjectMap = if (root.get("text_config") orelse root.get("llm_config") orelse if (thinker) |t| t.get("text_config") else null) |tc|
+        (if (tc == .object) tc.object else null)
+    else
+        null;
+    const cfgU32 = struct {
+        fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) u32 {
+            if (tc) |t| {
+                const v = jsonU32(t, key);
+                if (v > 0) return v;
+            }
+            return jsonU32(r, key);
+        }
+    }.get;
+
+    meta.vocab_size = cfgU32(root, text_cfg, "vocab_size");
+    meta.hidden_size = cfgU32(root, text_cfg, "hidden_size");
+    meta.num_hidden_layers = cfgU32(root, text_cfg, "num_hidden_layers");
+    if (meta.num_hidden_layers == 0) {
+        const tc = text_cfg orelse root;
+        if (tc.get("layers_block_type") orelse tc.get("block_configs") orelse tc.get("hybrid_override_pattern")) |layers| {
+            const count = switch (layers) {
+                .array => |arr| arr.items.len,
+                .string => |str| str.len,
+                else => 0,
+            };
+            meta.num_hidden_layers = std.math.cast(u32, count) orelse 0;
+        }
+    }
+    meta.max_position_embeddings = cfgU32(root, text_cfg, "max_position_embeddings");
+    if (root.get("quantization")) |q| {
+        if (q == .object) meta.quant_bits = jsonU32(q.object, "bits");
+    }
+    meta.is_moe = cfgU32(root, text_cfg, "num_experts") > 0 or
+        cfgU32(root, text_cfg, "num_local_experts") > 0 or
+        cfgU32(root, text_cfg, "n_routed_experts") > 0;
+    const mt: []const u8 = if (root.get("model_type")) |v|
+        (if (v == .string) v.string else "")
+    else
+        "";
+    // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
+    // skips text-only quantized checkpoints with a vestigial block).
+    meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
+    const nemotron = std.mem.eql(u8, mt, "nemotron_h") or std.mem.eql(u8, mt, "nemotron_h_puzzle") or std.mem.eql(u8, mt, "nemotron_h_omni");
+    const radio = nemotron and hasRadioVision(root);
+    if (nemotron) meta.has_vision = radio;
+    meta.has_video = (meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0) or radio;
+    meta.is_aligner = isForcedAligner(root);
+    meta.has_transcription = std.mem.eql(u8, mt, "qwen3_asr") and !meta.is_aligner;
+    const bidirectional = blk: {
+        const cfgBool = struct {
+            fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) bool {
+                if (tc) |t| {
+                    if (t.get(key)) |v| {
+                        if (v == .bool) return v.bool;
+                    }
+                }
+                if (r.get(key)) |v| {
+                    if (v == .bool) return v.bool;
+                }
+                return false;
+            }
+        }.get;
+        break :blk cfgBool(root, text_cfg, "use_bidirectional_attention");
+    };
+    const embedding_gemma2 = std.mem.eql(u8, mt, "embedding_gemma2");
+    meta.is_encoder = std.mem.eql(u8, mt, "bert") or bidirectional or embedding_gemma2;
+    // The model card's window, not the trunk's 262144 (model.zig EMBEDDING_GEMMA2_WINDOW).
+    const embedding_gemma2_window: u32 = 8192;
+    if (embedding_gemma2) meta.max_position_embeddings = if (meta.max_position_embeddings == 0) embedding_gemma2_window else @min(meta.max_position_embeddings, embedding_gemma2_window);
+    // Their packs ship no template; the loader embeds ours (chat.loadChatConfig).
+    const embeds_template = std.mem.eql(u8, mt, "deepseek_v4") or std.mem.eql(u8, mt, "deepseek_v41");
+    meta.has_chat = (has_chat_template or embeds_template) and !meta.is_encoder;
+    meta.has_embedding = meta.is_encoder;
+    if (root.get("pooling_mode")) |v| {
+        if (v == .string) meta.has_embedding = true;
+    }
+    return meta;
+}
+
+/// A served pack's facts come from its plugin's stub parse, not this file's reading of config.json.
+fn applyServedStub(meta: *StubMeta, st: mlx_engine.PluginStub) void {
+    meta.vocab_size = st.shell.vocab_size;
+    meta.hidden_size = st.shell.hidden_size;
+    meta.num_hidden_layers = st.shell.num_hidden_layers;
+    meta.max_position_embeddings = std.math.cast(u32, st.shell.max_position_embeddings) orelse std.math.maxInt(u32);
+    meta.quant_bits = st.shell.quant.bits;
+    meta.is_moe = st.caps.moe;
+    meta.has_vision = st.caps.images;
+    meta.has_video = st.caps.video;
+    meta.has_audio = st.caps.audio;
+    meta.has_speech = st.speaks;
+}
+
+/// Read `StubMeta` for the model directory at `abs_path` (config.json + a
+/// chat-template-presence check). Best-effort: any I/O / parse failure yields
+/// `.found=false`. Called per unloaded entry from `/v1/models` — cheap (small
+/// JSON files) and that endpoint isn't hot.
+pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) StubMeta {
+    const trimmed = trimTrailingSlash(abs_path);
+    const base = std.fs.path.basename(trimmed);
+    const parent = std.fs.path.dirname(trimmed) orelse return .{};
+    if (base.len == 0 or parent.len == 0) return .{};
+    var parent_dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return .{};
+    defer parent_dir.close(io);
+    var dir = parent_dir.openDir(io, base, .{}) catch return .{};
+    defer dir.close(io);
+
+    var file = dir.openFile(io, "config.json", .{}) catch return .{};
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .{};
+    defer allocator.free(bytes);
+
+    const sniff = sniffChatTemplate(io, allocator, dir);
+    var meta = parseStubMeta(allocator, bytes, sniff.present);
+    if (mlx_engine.api().plugin_stub(io, allocator, trimmed, bytes)) |st| applyServedStub(&meta, st);
+    meta.has_thinking = meta.has_chat and sniff.thinking;
+    meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
+    // A sentence-transformers pooling sidecar marks embedding capability even
+    // when config.json says nothing (the load path parses its mode; the stub
+    // only needs existence). Issue #116.
+    if (meta.found and !meta.has_embedding) {
+        if (dir.statFile(io, "1_Pooling/config.json", .{})) |st| {
+            if (st.kind == .file) meta.has_embedding = true;
+        } else |_| {}
+    }
+    return meta;
+}
+
+/// Whether a chat template can open a reasoning block; one rule for the stub
+/// and loaded capability paths.
+pub fn templateSupportsThinking(tmpl: []const u8) bool {
+    return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
+        std.mem.indexOf(u8, tmpl, "<think>") != null or
+        std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
+        std.mem.indexOf(u8, tmpl, "thought") != null or
+        std.mem.indexOf(u8, tmpl, "<|channel>") != null;
+}
+
+const TemplateSniff = struct { present: bool = false, thinking: bool = false };
+
+/// Whether the model dir ships a chat template — a `chat_template.jinja` file,
+/// or a `tokenizer_config.json` that carries a `chat_template` key — and whether
+/// it can think. Cheap proxy used to gate capabilities on unloaded stubs.
+fn sniffChatTemplate(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) TemplateSniff {
+    if (dir.readFileAlloc(io, "chat_template.jinja", allocator, .limited(8 * 1024 * 1024))) |bytes| {
+        defer allocator.free(bytes);
+        return .{ .present = true, .thinking = templateSupportsThinking(bytes) };
+    } else |_| {}
+    const bytes = dir.readFileAlloc(io, "tokenizer_config.json", allocator, .limited(8 * 1024 * 1024)) catch return .{};
+    defer allocator.free(bytes);
+    if (std.mem.indexOf(u8, bytes, "\"chat_template\"") == null) return .{};
+    // Only the template value: `added_tokens` name `<think>` on non-thinking packs too.
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .{ .present = true };
+    defer parsed.deinit();
+    const tmpl = if (parsed.value == .object) parsed.value.object.get("chat_template") else null;
+    const v = tmpl orelse return .{ .present = true };
+    var sniff: TemplateSniff = .{ .present = true };
+    switch (v) {
+        .string => |t| sniff.thinking = templateSupportsThinking(t),
+        .array => |arr| for (arr.items) |item| {
+            if (item != .object) continue;
+            const t = item.object.get("template") orelse continue;
+            if (t == .string and templateSupportsThinking(t.string)) sniff.thinking = true;
+        },
+        else => {},
+    }
+    return sniff;
+}
+
+fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
+    return std.mem.lessThan(u8, a.id, b.id);
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "mage_flow classifies as image media (modelKind + isMediaModelType)" {
+    try testing.expect(isMediaModelType("mage_flow"));
+    try testing.expect(isMediaModelType("mageflow"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("mage_flow"));
+    try testing.expect(isMediaModelType("qwen_image21"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("qwen_image21"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("mageflow"));
+    // Guardrail: a regular LM must not be swept up by the prefix match.
+    try testing.expect(!isMediaModelType("gemma4"));
+}
+
+test "the audio kind names every audio generation endpoint" {
+    const ep = ModelKind.audio.genEndpoint().?;
+    for ([_][]const u8{ "/v1/audio/speech", "/v1/audio/music-generations", "/v1/audio/sound-generations" }) |p|
+        try testing.expect(std.mem.indexOf(u8, ep, p) != null);
+}
+
+test "yue2 classifies as audio media; a pack without the folded-in VAE is incomplete" {
+    try testing.expect(isMediaModelType("yue2"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("yue2"));
+    try testing.expectEqualStrings("vae.safetensors", requiredMediaMarker("yue2").?);
+}
+
+test "minimax_music3 classifies as audio media with the vocoder marker" {
+    try testing.expect(isMediaModelType("minimax_music3"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("minimax_music3"));
+    try testing.expectEqualStrings("vocoder.safetensors", requiredMediaMarker("minimax_music3").?);
+}
+
+test "an ACE-Step pack without its text encoder does not shadow a complete copy in a later root" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var a_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer a_dir.cleanup();
+    var b_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer b_dir.cleanup();
+
+    const cfg = "{\"model_type\":\"acestep\"}";
+    try a_dir.dir.createDirPath(io, "org/ace");
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/ace/config.json", .data = cfg });
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/ace/model.safetensors", .data = "0123" });
+    try b_dir.dir.createDirPath(io, "org/ace/text_encoder");
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/config.json", .data = cfg });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/model.safetensors", .data = "0123" });
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/ace/text_encoder/model.safetensors", .data = "0123" });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const a_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, a_dir.sub_path });
+    defer allocator.free(a_path);
+    const b_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, b_dir.sub_path });
+    defer allocator.free(b_path);
+
+    var result = try discoverModelsMany(io, allocator, &.{ a_path, b_path });
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expect(std.mem.startsWith(u8, result.models[0].path, b_path));
+}
+
+test "discoverModels finds flat and org/repo model dirs" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "flat-model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat-model/config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    // HF-style org/repo layout — the DownloadManager / `mlx-serve pull`
+    // convention. Must be discovered with id "org/name".
+    try tmp.dir.createDirPath(io, "mlx-community/nested-model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/nested-model/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    // Junk that must not surface: an org dir with a non-model child, and a
+    // dot-dir.
+    try tmp.dir.createDirPath(io, "empty-org/not-a-model");
+    try tmp.dir.createDirPath(io, ".hidden/whatever");
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/models-root");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.models.len);
+    try std.testing.expectEqualStrings("flat-model", result.models[0].id);
+    try std.testing.expectEqualStrings("/models-root/flat-model", result.models[0].path);
+    try std.testing.expectEqualStrings("gemma3", result.models[0].model_type);
+    try std.testing.expectEqualStrings("mlx-community/nested-model", result.models[1].id);
+    try std.testing.expectEqualStrings("/models-root/mlx-community/nested-model", result.models[1].path);
+    try std.testing.expectEqualStrings("qwen3", result.models[1].model_type);
+}
+
+test "discoverModelsMany merges roots in order and de-dups by id" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var a_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer a_dir.cleanup();
+    var b_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer b_dir.cleanup();
+
+    // Same id in BOTH roots. The registry answers `error.DuplicateId` and
+    // `registerDiscovered` does `try`, so an un-deduped merge does not produce
+    // a duplicate entry — it fails the whole registry init, i.e. the server
+    // does not start. De-dup is not tidiness here.
+    try a_dir.dir.createDirPath(io, "org/shared");
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try a_dir.dir.createDirPath(io, "org/only-in-a");
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-a/config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    try b_dir.dir.createDirPath(io, "org/shared");
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try b_dir.dir.createDirPath(io, "org/only-in-b");
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-b/config.json", .data = "{\"model_type\":\"mistral\"}" });
+
+    // `discoverModels` opens by ABSOLUTE path (the openDirAbsolute UB class),
+    // and a testing tmpDir is `<cwd>/.zig-cache/tmp/<sub_path>`.
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const a_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, a_dir.sub_path });
+    defer allocator.free(a_path);
+    const b_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, b_dir.sub_path });
+    defer allocator.free(b_path);
+
+    var result = try discoverModelsMany(io, allocator, &.{ a_path, b_path });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.models.len);
+    // FIRST root wins the shared id: roots are ordered by the caller and the
+    // first is the one downloads land in, so a stale copy elsewhere must not
+    // shadow the live one.
+    var shared_type: []const u8 = "";
+    var saw_a = false;
+    var saw_b = false;
+    for (result.models) |m| {
+        if (std.mem.eql(u8, m.id, "org/shared")) shared_type = m.model_type;
+        if (std.mem.eql(u8, m.id, "org/only-in-a")) saw_a = true;
+        if (std.mem.eql(u8, m.id, "org/only-in-b")) saw_b = true;
+        // Every path must be absolute and under the root it came from, or the
+        // registry stores a path nothing can open.
+        try std.testing.expect(m.path.len > 0 and m.path[0] == '/');
+    }
+    try std.testing.expectEqualStrings("qwen3", shared_type);
+    try std.testing.expect(saw_a and saw_b);
+
+    // One root behaves exactly like `discoverModels` — the multi path is the
+    // only path, so the single-root case cannot be left behind.
+    var one = try discoverModelsMany(io, allocator, &.{a_path});
+    defer one.deinit();
+    try std.testing.expectEqual(@as(usize, 2), one.models.len);
+
+    // A root that does not exist is SKIPPED, not fatal: a user can unplug the
+    // external drive their second folder lives on, and that must not stop the
+    // server from serving everything else.
+    var with_missing = try discoverModelsMany(io, allocator, &.{ a_path, "/nope/not/here", b_path });
+    defer with_missing.deinit();
+    try std.testing.expectEqual(@as(usize, 3), with_missing.models.len);
+
+    // No roots at all is an empty result, never an error.
+    var none = try discoverModelsMany(io, allocator, &.{});
+    defer none.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none.models.len);
+}
+
+test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // HF hub-cache snapshot shape: every file is a symlink into ../../blobs.
+    // bytes_on_disk feeds /v1/models, the app's RAM column AND
+    // scheduler.gateEstimateBytes — all of which saw ~0 for a 121 GB model.
+    try tmp.dir.createDirPath(io, "blobs");
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/cfg", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "blobs/w1", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "org/snap-model");
+    try tmp.dir.symLink(io, "../../blobs/cfg", "org/snap-model/config.json", .{});
+    try tmp.dir.symLink(io, "../../blobs/w1", "org/snap-model/model.safetensors", .{});
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("org/snap-model", result.models[0].id);
+    try testing.expectEqual(@as(?u64, 10), result.models[0].bytes_on_disk);
+}
+
+test "discoverModels finds GGUF dirs without config.json (issue #59)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Pulled GGUF repo layout: `<org>/<repo>/<quant>.gguf`, NO config.json
+    // (bartowski / unsloth-style multi-quant repos ship only .gguf files).
+    // `mlx-serve list` already counts these as models; discovery must agree.
+    try tmp.dir.createDirPath(io, "bartowski/some-model-GGUF");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bartowski/some-model-GGUF/model-IQ2_M.gguf", .data = "0123" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "bartowski/some-model-GGUF/model-Q4_K_M.gguf", .data = "01234567" });
+    // Flat single-file layout.
+    try tmp.dir.createDirPath(io, "flat-gguf");
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat-gguf/tiny.gguf", .data = "x" });
+    // mmproj sidecar ONLY → not an LLM dir, must not be discovered.
+    try tmp.dir.createDirPath(io, "sidecar-only");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sidecar-only/mmproj-foo.gguf", .data = "x" });
+    // Interrupted pull → .partial is not a .gguf, must not be discovered.
+    try tmp.dir.createDirPath(io, "partial");
+    try tmp.dir.writeFile(io, .{ .sub_path = "partial/model.gguf.partial", .data = "x" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    try testing.expectEqualStrings("bartowski/some-model-GGUF", result.models[0].id);
+    try testing.expectEqualStrings("gguf", result.models[0].model_type);
+    // bytes = the file the loader will pick (alphabetically-smallest LLM
+    // .gguf — resolveGgufFile's rule), NOT the sum of every quant in the dir.
+    try testing.expectEqual(@as(?u64, 4), result.models[0].bytes_on_disk);
+    try testing.expectEqualStrings("flat-gguf", result.models[1].id);
+    try testing.expectEqualStrings("gguf", result.models[1].model_type);
+}
+
+test "discoverModels finds a MageFlow repo (model_index.json, no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // A MageFlow repo carries NO root config.json — every config lives in a
+    // component subdir, and `model_index.json` is the only classification
+    // signal (both released repos AND our 8-bit mirrors). `peekConfig` has the
+    // fallback, but `tryAddModel` used to bail on the missing config.json
+    // before ever reaching it, so a downloaded MageFlow model was invisible to
+    // `list`, `/v1/models` and the app's model picker.
+    try tmp.dir.createDirPath(io, "microsoft/Mage-Flow-Turbo/transformer");
+    try tmp.dir.createDirPath(io, "microsoft/Mage-Flow-Turbo/vae");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "microsoft/Mage-Flow-Turbo/model_index.json",
+        .data =
+        \\{"_class_name":"MageFlowPipeline","_mage_flow_version":"0.1.0"}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "microsoft/Mage-Flow-Turbo/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "microsoft/Mage-Flow-Turbo/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    // A configless, index-less dir stays invisible (an interrupted download).
+    try tmp.dir.createDirPath(io, "microsoft/half-pulled");
+    try tmp.dir.writeFile(io, .{ .sub_path = "microsoft/half-pulled/README.md", .data = "x" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("microsoft/Mage-Flow-Turbo", result.models[0].id);
+    try testing.expectEqualStrings("mage_flow", result.models[0].model_type);
+    // Size is the whole tree — the weights live in component subdirs.
+    try testing.expectEqual(@as(?u64, 14), result.models[0].bytes_on_disk);
+}
+
+test "discoverModels finds a Qwen-Image-2.1 repo (model_index.json, no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // An mlx-community-style 2.1 repo ships no root config.json — its only
+    // marker is model_index.json's `_class_name`. The 2.0 family spells
+    // "QwenImagePipeline": a different architecture (20B, 2x2-packed) we do
+    // not serve, so it stays invisible with the same directory shape.
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.1-MLX-4bit/transformer");
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.1-MLX-4bit/vae");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/model_index.json",
+        .data = "{\"_class_name\":\"QwenImage21Pipeline\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.1-MLX-4bit/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "mlx-community/Qwen-Image-2.0-MLX/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/Qwen-Image-2.0-MLX/model_index.json",
+        .data = "{\"_class_name\":\"QwenImagePipeline\"}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/Qwen-Image-2.0-MLX/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("mlx-community/Qwen-Image-2.1-MLX-4bit", result.models[0].id);
+    try testing.expectEqualStrings("qwen_image21", result.models[0].model_type);
+}
+
+test "discoverModels finds a MOSS-Image repo by its model_index.json alone" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "mlx-community/MOSS-Image-SFT-bf16/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/MOSS-Image-SFT-bf16/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    // A pull still in progress stays invisible until its VAE weights land.
+    try tmp.dir.createDirPath(io, "me/MOSS-Image-half/transformer");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/model_index.json", .data = "{\"_class_name\":\"MOSSImagePipeline\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/MOSS-Image-half/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("moss_image", result.models[0].model_type);
+    try testing.expect(isMediaModelType("moss_image"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("moss_image"));
+}
+
+test "discoverModels finds a TRELLIS.2 pack by its pipeline.json alone, once its last weights landed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const pipeline = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{}}";
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-4B/ckpts");
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-4B/microsoft/TRELLIS-image-large/ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/pipeline.json", .data = pipeline });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-4B/microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors", .data = "0123" });
+    // A pull still in progress stays invisible until the SS decoder lands.
+    try tmp.dir.createDirPath(io, "me/TRELLIS.2-half/ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-half/pipeline.json", .data = pipeline });
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/TRELLIS.2-half/ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors", .data = "0123456789" });
+    // Another pipeline.json (a different class) is no model.
+    try tmp.dir.createDirPath(io, "me/other");
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/other/pipeline.json", .data = "{\"name\":\"SomethingElse\"}" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("trellis2", result.models[0].model_type);
+    try testing.expect(isMediaModelType("trellis2"));
+    try testing.expectEqual(ModelKind.mesh, modelKindFromType("trellis2"));
+}
+
+test "discoverModels tells a Pixal3D pack (TRELLIS.2's pipeline.json, proj flows) from TRELLIS.2, once its last weights landed" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const pipeline = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{\"models\":{\"sparse_structure_flow_model\":\"ckpts/ss_flow\"}}}";
+    const proj_dit = "{\"name\":\"SparseStructureFlowModel\",\"args\":{\"image_attn_mode\":\"proj\"}}";
+    for ([_][]const u8{ "me/Pixal3D", "me/Pixal3D-half" }) |d| {
+        var buf: [64]u8 = undefined;
+        try tmp.dir.createDirPath(io, try std.fmt.bufPrint(&buf, "{s}/ckpts", .{d}));
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/pipeline.json", .{d}), .data = pipeline });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/ckpts/ss_flow.json", .{d}), .data = proj_dit });
+        try tmp.dir.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&buf, "{s}/ckpts/ss_flow.safetensors", .{d}), .data = "0123456789" });
+    }
+    // Only the complete pack has its texture decoder, the last of its weights.
+    try tmp.dir.writeFile(io, .{ .sub_path = "me/Pixal3D/ckpts/tex_dec_next_dc_f16c32_fp16.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("pixal3d", result.models[0].model_type);
+    try testing.expect(isMediaModelType("pixal3d"));
+    try testing.expectEqual(ModelKind.mesh, modelKindFromType("pixal3d"));
+}
+
+test "discoverModels finds a Stable Audio 3 repo (model_config.json, no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The official stabilityai repo as published: stable-audio-tools'
+    // model_config.json is the only marker; the T5Gemma subdir is the pack's
+    // completion marker. A stable-audio-tools model on another conditioner
+    // (T5-base: Stable Audio Open) is a different pipeline and stays invisible.
+    const sa3_config = "{\"model_type\":\"diffusion_cond_inpaint\",\"model\":{\"conditioning\":{\"configs\":[{\"id\":\"prompt\",\"type\":\"t5gemma\"}]}}}";
+    try tmp.dir.createDirPath(io, "stabilityai/stable-audio-3-small-sfx/t5gemma-b-b-ul2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-3-small-sfx/model_config.json", .data = sa3_config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-3-small-sfx/model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-3-small-sfx/t5gemma-b-b-ul2/model.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "stabilityai/half-pulled-sfx");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/half-pulled-sfx/model_config.json", .data = sa3_config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/half-pulled-sfx/model.safetensors", .data = "0123456789" });
+    try tmp.dir.createDirPath(io, "stabilityai/stable-audio-open-1.0");
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-open-1.0/model_config.json", .data = "{\"model_type\":\"diffusion_cond\",\"model\":{\"conditioning\":{\"configs\":[{\"id\":\"prompt\",\"type\":\"t5\"}]}}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stabilityai/stable-audio-open-1.0/model.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("stabilityai/stable-audio-3-small-sfx", result.models[0].id);
+    try testing.expectEqualStrings("stable_audio3", result.models[0].model_type);
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("stable_audio3"));
+}
+
+test "discoverModels finds an mflux FLUX.2 repo (no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The 4B mflux mirror ships a root config.json; `mlx-community/flux2-klein-9b-4bit`
+    // — the only MLX build of the 9B — ships NONE. Same class as MageFlow: the
+    // repo is a real, loadable model, so `list` / `/v1/models` / the app picker
+    // must see it. The signal is the DiT's own weight names, not a directory
+    // shape (transformer+vae+text_encoder describes half of HuggingFace).
+    try tmp.dir.createDirPath(io, "mlx-community/flux2-klein-9b-4bit/transformer");
+    try tmp.dir.createDirPath(io, "mlx-community/flux2-klein-9b-4bit/text_encoder");
+    try tmp.dir.createDirPath(io, "mlx-community/flux2-klein-9b-4bit/vae");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/flux2-klein-9b-4bit/transformer/model.safetensors.index.json",
+        .data =
+        \\{"weight_map":{"double_stream_modulation_img.linear.weight":"0.safetensors",
+        \\"single_stream_modulation.linear.weight":"0.safetensors"}}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/flux2-klein-9b-4bit/transformer/0.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/flux2-klein-9b-4bit/text_encoder/0.safetensors", .data = "0123" });
+    // A diffusers repo of some OTHER architecture must stay invisible — the
+    // fingerprint is what separates them, and a shape test would take both.
+    try tmp.dir.createDirPath(io, "mlx-community/some-other-dit/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/some-other-dit/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"blocks.0.attn.qkv.weight\":\"0.safetensors\"}}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/some-other-dit/transformer/0.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("mlx-community/flux2-klein-9b-4bit", result.models[0].id);
+    try testing.expectEqualStrings("flux2-klein", result.models[0].model_type);
+    try testing.expectEqual(ModelKind.image, modelKindFromType(result.models[0].model_type));
+    // Weights live one level down, like every other diffusers-shaped repo.
+    try testing.expectEqual(@as(?u64, 14), result.models[0].bytes_on_disk);
+}
+
+test "discoverModels: a .gguf beside config.json wins (mirrors --model routing)" {
+    // `--model <dir>` checks isGgufPath BEFORE parsing config.json, so a dir
+    // holding both routes to the embedded engine. Discovery must classify it
+    // identically — some GGUF repos (unsloth) ship the original config.json
+    // next to the quants, and an MLX classification would cold-load into a
+    // missing-safetensors failure.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "both");
+    try tmp.dir.writeFile(io, .{ .sub_path = "both/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "both/model-Q4_K_M.gguf", .data = "01234567" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("gguf", result.models[0].model_type);
+}
+
+test "probeModelDir accepts a GGUF dir (register-by-path / /api/pull)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "some-model-GGUF");
+    try tmp.dir.writeFile(io, .{ .sub_path = "some-model-GGUF/model-Q4_K_M.gguf", .data = "01234567" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const abs = try std.fmt.allocPrint(allocator, "{s}/some-model-GGUF", .{path_buf[0..root_len]});
+    defer allocator.free(abs);
+
+    const probe = try probeModelDir(io, allocator, abs);
+    defer allocator.free(probe.model_type);
+    try testing.expectEqualStrings("gguf", probe.model_type);
+    try testing.expectEqual(@as(?u64, 8), probe.bytes_on_disk);
+}
+
+test "findDs4MtpSidecar never returns the model file itself" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Flash-Next-IQ2-MTP.gguf", .data = "x" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model = try std.fmt.allocPrint(allocator, "{s}/Flash-Next-IQ2-MTP.gguf", .{path_buf[0..root_len]});
+    defer allocator.free(model);
+
+    try testing.expectEqual(@as(?[]u8, null), findDs4MtpSidecar(io, allocator, model));
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "Flash-Next-MTP-Q8.gguf", .data = "x" });
+    const found = findDs4MtpSidecar(io, allocator, model) orelse return error.TestExpectedSidecar;
+    defer allocator.free(found);
+    try testing.expectEqualStrings("Flash-Next-MTP-Q8.gguf", std.fs.path.basename(found));
+}
+
+test "findLlamaMtpSidecar: an mtp- head beside the model, in MTP/ inside, or in MTP/ next to its quant folder" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+
+    // unsloth's layout: quants in per-quant folders, heads in a sibling MTP/.
+    try tmp.dir.createDirPath(io, "repo/UD-Q4_K_XL");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/UD-Q4_K_XL/Next-UD-Q4_K_XL-00001-of-00002.gguf", .data = "x" });
+    const model = try std.fmt.allocPrint(allocator, "{s}/repo/UD-Q4_K_XL/Next-UD-Q4_K_XL-00001-of-00002.gguf", .{root});
+    defer allocator.free(model);
+    try testing.expectEqual(@as(?[]u8, null), findLlamaMtpSidecar(io, allocator, model));
+
+    try tmp.dir.createDirPath(io, "repo/MTP");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/MTP/mtp-Next-shared-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/MTP/README.md", .data = "x" });
+    {
+        const found = findLlamaMtpSidecar(io, allocator, model) orelse return error.TestExpectedSidecar;
+        defer allocator.free(found);
+        try testing.expectEqualStrings("mtp-Next-shared-Q8_0.gguf", std.fs.path.basename(found));
+    }
+
+    // A flat repo: the head beside the quant wins over any MTP/ folder.
+    try tmp.dir.createDirPath(io, "flat/MTP");
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat/Qwen-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat/mtp-Qwen-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat/MTP/mtp-Qwen-BF16.gguf", .data = "x" });
+    const flat = try std.fmt.allocPrint(allocator, "{s}/flat/Qwen-Q8_0.gguf", .{root});
+    defer allocator.free(flat);
+    const found = findLlamaMtpSidecar(io, allocator, flat) orelse return error.TestExpectedSidecar;
+    defer allocator.free(found);
+    try testing.expectEqualStrings("mtp-Qwen-Q8_0.gguf", std.fs.path.basename(found));
+}
+
+test "resolveGgufFile: deterministic pick, mmproj filtering, precise errors" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "multi");
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/model-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/model-Q4_K_M.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/mmproj-model.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "sidecar-only");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sidecar-only/mmproj-foo.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "empty");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..root_len];
+
+    // Directory: alphabetically-smallest non-mmproj .gguf wins.
+    const multi = try std.fmt.allocPrint(allocator, "{s}/multi", .{root});
+    defer allocator.free(multi);
+    const picked = try resolveGgufFile(io, allocator, multi);
+    defer allocator.free(picked);
+    try testing.expect(std.mem.endsWith(u8, picked, "/multi/model-Q4_K_M.gguf"));
+    try testing.expect(isGgufModelPath(io, multi));
+
+    // Direct file path: dup'd through; mmproj file rejected precisely.
+    const direct = try std.fmt.allocPrint(allocator, "{s}/multi/model-Q8_0.gguf", .{root});
+    defer allocator.free(direct);
+    const direct_res = try resolveGgufFile(io, allocator, direct);
+    defer allocator.free(direct_res);
+    try testing.expectEqualStrings(direct, direct_res);
+    const mmproj_file = try std.fmt.allocPrint(allocator, "{s}/multi/mmproj-model.gguf", .{root});
+    defer allocator.free(mmproj_file);
+    try testing.expectError(error.OnlyMmprojGgufFile, resolveGgufFile(io, allocator, mmproj_file));
+
+    // Sidecar-only dir vs genuinely empty dir: distinct errors, and neither
+    // counts as a GGUF model path.
+    const sidecar = try std.fmt.allocPrint(allocator, "{s}/sidecar-only", .{root});
+    defer allocator.free(sidecar);
+    try testing.expectError(error.OnlyMmprojGgufFile, resolveGgufFile(io, allocator, sidecar));
+    try testing.expect(!isGgufModelPath(io, sidecar));
+    const empty = try std.fmt.allocPrint(allocator, "{s}/empty", .{root});
+    defer allocator.free(empty);
+    try testing.expectError(error.NoGgufFile, resolveGgufFile(io, allocator, empty));
+    try testing.expect(!isGgufModelPath(io, empty));
+
+    // Empty / relative paths: never a GGUF path (the openDirAbsolute
+    // ReleaseFast-UB guard).
+    try testing.expect(!isGgufModelPath(io, ""));
+    try testing.expect(!isGgufModelPath(io, "relative/dir"));
+}
+
+test "modelKindFromType labels every family (list TYPE column + run preflight)" {
+    // Chat: MLX archs and the synthetic gguf type.
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("gemma4"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen3_5_moe"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("gguf"));
+    // Media modalities.
+    try testing.expectEqual(ModelKind.image, modelKindFromType("flux2-klein-4b"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("krea2_turbo"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("qwen3_tts"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("acestep"));
+    try testing.expectEqual(ModelKind.video, modelKindFromType("AudioVideo"));
+    try testing.expectEqual(ModelKind.mesh, modelKindFromType("hunyuan3d_2_1"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("kokoro"));
+    try testing.expectEqual(ModelKind.video, modelKindFromType("minimax_h3"));
+    // Drafter sidecars, and genuinely unsupported archs.
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_assistant"));
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_unified_assistant"));
+    // DFlash sidecars ride the same `*_assistant` suffix rule — never listed
+    // as primary models.
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("muse_glimmer_assistant"));
+    try testing.expectEqual(ModelKind.unsupported, modelKindFromType("vit"));
+    // Labels stay column-friendly.
+    try testing.expectEqualStrings("3d", ModelKind.mesh.label());
+    try testing.expectEqualStrings("chat", ModelKind.chat.label());
+}
+
+test "classifyModelPath: gguf/media/drafter/encoder dirs classify; junk is null" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "g");
+    try tmp.dir.writeFile(io, .{ .sub_path = "g/model-Q4_K_M.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "img");
+    try tmp.dir.writeFile(io, .{ .sub_path = "img/config.json", .data = "{\"model_type\":\"flux2-klein-4b\"}" });
+    try tmp.dir.createDirPath(io, "drafter");
+    try tmp.dir.writeFile(io, .{ .sub_path = "drafter/config.json", .data = "{\"model_type\":\"gemma4_assistant\"}" });
+    // MageFlow diffusers repo: NO root config.json, only model_index.json.
+    try tmp.dir.createDirPath(io, "mage");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mage/model_index.json", .data = "{\"_class_name\":\"MageFlowPipeline\"}" });
+    // Encoders embed: BERT, and EmbeddingGemma 2 (a chat-shaped trunk).
+    try tmp.dir.createDirPath(io, "bert");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bert/config.json", .data = "{\"model_type\":\"bert\"}" });
+    try tmp.dir.createDirPath(io, "eg2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "eg2/config.json", .data = "{\"model_type\":\"embedding_gemma2\"}" });
+    try tmp.dir.createDirPath(io, "junk");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..root_len];
+
+    const cases = .{
+        .{ "g", ModelKind.chat },
+        .{ "img", ModelKind.image },
+        .{ "drafter", ModelKind.drafter },
+        .{ "mage", ModelKind.image },
+        .{ "bert", ModelKind.embed },
+        .{ "eg2", ModelKind.embed },
+    };
+    inline for (cases) |c| {
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, c[0] });
+        defer allocator.free(p);
+        try testing.expectEqual(c[1], classifyModelPath(io, allocator, p).?);
+    }
+    const junk = try std.fmt.allocPrint(allocator, "{s}/junk", .{root});
+    defer allocator.free(junk);
+    try testing.expect(classifyModelPath(io, allocator, junk) == null);
+    try testing.expect(classifyModelPath(io, allocator, "") == null);
+    try testing.expect(classifyModelPath(io, allocator, "rel/path") == null);
+}
+
+test "a DFlash2 sidecar (bare chat model_type + dflash_config) classifies as drafter, never listed" {
+    // incoai/Qwen3.8-27B-DFlash2 ships `model_type: "qwen3"` — the
+    // `*_assistant` suffix rule alone would register it as a standalone chat
+    // model and die at cold load (no embed weights). Classification consults
+    // the DFlash config contract too (dflash.isDflashConfigJson — the ONE
+    // predicate the loader itself keys on).
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const d2_config =
+        \\{"model_type":"qwen3",
+        \\ "dflash_config":{"block_size":8,"mask_token_id":248070,"target_layer_ids":[5,19],
+        \\   "conv_kernel_size":2,"conv_group_size":16,"selector_rank":256,"selector_top_k":16},
+        \\ "hidden_size":5120,"num_hidden_layers":5,"num_attention_heads":32,"head_dim":128,
+        \\ "intermediate_size":17408,"rms_norm_eps":1e-6,"sliding_window":2048,
+        \\ "layer_types":["sliding_attention","sliding_attention","sliding_attention","sliding_attention","sliding_attention"]}
+    ;
+    try tmp.dir.createDirPath(io, "d2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "d2/config.json", .data = d2_config });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..root_len];
+    const p = try std.fmt.allocPrint(allocator, "{s}/d2", .{root});
+    defer allocator.free(p);
+    try testing.expectEqual(ModelKind.drafter, classifyModelPath(io, allocator, p).?);
+
+    // The discovery scan skips it entirely.
+    var result = try discoverModels(io, allocator, root);
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 0), result.models.len);
+}
+
+test "trimTrailingSlash" {
+    try testing.expectEqualStrings("foo", trimTrailingSlash("foo/"));
+    try testing.expectEqualStrings("foo", trimTrailingSlash("foo//"));
+    try testing.expectEqualStrings("foo", trimTrailingSlash("foo"));
+    try testing.expectEqualStrings("", trimTrailingSlash("//"));
+}
+
+test "lessThanById sorts ascending" {
+    const a: DiscoveredModel = .{ .id = "a", .path = "x", .bytes_on_disk = null };
+    const b: DiscoveredModel = .{ .id = "b", .path = "x", .bytes_on_disk = null };
+    try testing.expect(lessThanById({}, a, b));
+    try testing.expect(!lessThanById({}, b, a));
+    try testing.expect(!lessThanById({}, a, a));
+}
+
+test "isDs4GgufBasename routes DSV4 to ds4 and everything else to llama" {
+    // DeepSeek-V4-Flash → ds4 (case-insensitive).
+    try testing.expect(isDs4GgufBasename("DeepSeek-V4-Flash-Q4_K_M.gguf"));
+    try testing.expect(isDs4GgufBasename("deepseek-v4-flash-bf16.gguf"));
+    // Any other GGUF → llama.cpp engine.
+    try testing.expect(!isDs4GgufBasename("qwen2.5-0.5b-instruct-q4_k_m.gguf"));
+    try testing.expect(!isDs4GgufBasename("Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf"));
+    try testing.expect(!isDs4GgufBasename("deepseek-v3-chat.gguf")); // V3, not V4-Flash
+    try testing.expect(!isDs4GgufBasename("short.gguf"));
+}
+
+test "isMmprojGgufBasename catches the multimodal-projection sidecars" {
+    // Real mmproj files seen in the wild (Gemma 4 VL, Qwen 3.6 VL, ...).
+    try testing.expect(isMmprojGgufBasename("mmproj-gemma-4-E4B-it-BF16.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-gemma-4-E2B-it-BF16.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-F32.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-Qwen3.6-27B-VL-BF16.gguf"));
+    // Case-insensitive on the prefix only.
+    try testing.expect(isMmprojGgufBasename("MMPROJ-foo.gguf"));
+    try testing.expect(isMmprojGgufBasename("MmProj-bar.gguf"));
+    // Bare prefix.gguf — also a sidecar.
+    try testing.expect(isMmprojGgufBasename("mmproj.gguf"));
+
+    // Real LLM .gguf — must NOT match (this is the regression class:
+    // pre-fix, the directory-picker grabbed the alphabetically-first
+    // file and that file was the mmproj sidecar).
+    try testing.expect(!isMmprojGgufBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
+    try testing.expect(!isMmprojGgufBasename("Qwen3.5-4B-IQ4_NL.gguf"));
+    try testing.expect(!isMmprojGgufBasename("DeepSeek-V4-Flash-Q4_K_M.gguf"));
+    // Not a .gguf → not a sidecar.
+    try testing.expect(!isMmprojGgufBasename("mmproj-readme.md"));
+    try testing.expect(!isMmprojGgufBasename("mmproj"));
+    // Suffix-only — model-mmproj.gguf is NOT the convention.
+    try testing.expect(!isMmprojGgufBasename("model-mmproj.gguf"));
+}
+
+test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
+    // A GGUF folder ships non-LLM `.gguf` companions beside the quants. mmproj
+    // (CLIP) was the known one; a SPEECH TOKENIZER is the other — live, on a
+    // real Mac: `qwen3-tts-tokenizer-f16.gguf` (341 MB) sits next to
+    // `qwen3-tts-0.6b-f16.gguf`. Neither is a language model, and the
+    // alphabetical directory pick only avoids the tokenizer by luck of the
+    // name — a repo whose tokenizer sorts first would load it as the LLM.
+    try testing.expect(isGgufSidecarBasename("mmproj-gemma-4-E4B-it-BF16.gguf"));
+    try testing.expect(isGgufSidecarBasename("qwen3-tts-tokenizer-f16.gguf"));
+    try testing.expect(isGgufSidecarBasename("TOKENIZER-f16.gguf"));
+
+    // MTP draft-head sidecar (llama.cpp / ds4 speculative decode) — live in
+    // antirez/deepseek-v4-gguf, sitting beside the chat quants. Not a chat
+    // model; it must never appear as a selectable quant.
+    try testing.expect(isGgufSidecarBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
+    try testing.expect(isGgufSidecarBasename("some-model-mtp.gguf"));
+    // isMtpGgufBasename is the specific predicate the engine uses to FIND the
+    // draft head (a subset of the sidecar filter).
+    try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
+    // llama.cpp's convert `--mtp` names a head-only file with an `mtp-` prefix.
+    try testing.expect(isMtpGgufBasename("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"));
+    try testing.expect(isGgufSidecarBasename("MTP-Qwen3.8-Flash-Next-Q4_K_M.gguf"));
+    try testing.expect(!isMtpGgufBasename("mtpfoo-Q8_0.gguf"));
+    try testing.expect(!isMtpGgufBasename("mmproj-F16.gguf"));
+    try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
+
+    // DSpark support GGUF (upstream lib/ds4 `download_model.sh dspark-support`
+    // → `DeepSeek-V4-Flash-DSpark-support.gguf`): the 0731 replacement for the
+    // legacy MTP sidecar. It must be FOUND by the draft matcher (ds4 loads it
+    // via --mtp and `--dspark` selects the runtime) AND filtered as a sidecar
+    // — its name starts with "deepseek-v4-flash", so without the filter it
+    // classifies as a servable chat quant and becomes a pickable tray entry
+    // that can only fail.
+    try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
+    try testing.expect(isGgufSidecarBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
+    try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-dsparkle-chat.gguf"));
+
+    try testing.expect(!isGgufSidecarBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
+    try testing.expect(!isGgufSidecarBasename("Qwen3.5-4B-IQ4_NL.gguf"));
+    try testing.expect(!isGgufSidecarBasename("qwen3-tts-0.6b-f16.gguf"));
+    // A real chat quant whose scheme name merely contains the letters "mtp"
+    // (no delimited `-MTP-` token) is NOT a sidecar.
+    try testing.expect(!isGgufSidecarBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
+    try testing.expect(!isGgufSidecarBasename("tokenizer.json"));
+}
+
+test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
+    // Regression for the "[discovery] skip ...: unsupported model_type
+    // 'qwen3_moe'" warning: Qwen3-30B-A3B / Qwen3-Coder-30B-A3B must be
+    // discoverable by the model manager, not silently skipped.
+    try testing.expect(isSupportedModelType("qwen3_moe"));
+    try testing.expect(isSupportedModelType("qwen3_moe_text"));
+    // Sibling arches still recognized.
+    try testing.expect(isSupportedModelType("qwen3_5_moe"));
+    try testing.expect(isSupportedModelType("qwen3"));
+    try testing.expect(isSupportedModelType("minicpmv4_7"));
+    try testing.expect(isSupportedModelType("qwen3_asr"));
+    try testing.expect(isSupportedModelType("kolibri1"));
+    try testing.expect(isSupportedModelType("flint"));
+    try testing.expect(isSupportedModelType("lfm2_moe"));
+    // A genuinely unknown arch is still rejected.
+    try testing.expect(!isSupportedModelType("totally_made_up_arch"));
+}
+
+test "isSupportedModelType accepts native media archs (image/audio/video)" {
+    // Unified media-gen: FLUX (flux2*), Qwen3-TTS, LTX-Video (AudioVideo) load
+    // through the registry now, so discovery + by-path must accept them.
+    try testing.expect(isSupportedModelType("flux2-klein-4b"));
+    try testing.expect(isSupportedModelType("flux2"));
+    try testing.expect(isSupportedModelType("qwen3_tts"));
+    try testing.expect(isSupportedModelType("AudioVideo"));
+    try testing.expect(isMediaModelType("flux2-klein-9b"));
+    try testing.expect(isMediaModelType("krea2_turbo"));
+    try testing.expect(isSupportedModelType("krea2_turbo"));
+    try testing.expect(isMediaModelType("hunyuan3d_2_1"));
+    try testing.expect(isSupportedModelType("hunyuan3d_2_1"));
+    try testing.expect(isMediaModelType("acestep"));
+    try testing.expect(isSupportedModelType("acestep"));
+    try testing.expect(!isMediaModelType("gemma4"));
+}
+
+test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
+    // A served arch missing here is invisible to the picker, and a chat naming
+    // its path is answered 404 instead of cold-loading it.
+    try testing.expect(isSupportedModelType("glm5_next"));
+    try testing.expect(isSupportedModelType("glm5_next_text"));
+    try testing.expect(isSupportedModelType("deepseek_v41"));
+    try testing.expect(isSupportedModelType("glm_moe_dsa"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("glm_moe_dsa"));
+}
+
+test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
+    // Regression for "[discovery] skip ...: unsupported model_type
+    // 'gemma3_text'": text-only Gemma 3 abliterated checkpoints
+    // (mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit) ship a flat
+    // top-level model_type "gemma3_text" and must be discoverable, not skipped.
+    try testing.expect(isSupportedModelType("gemma3_text"));
+    try testing.expect(isSupportedModelType("gemma3"));
+}
+
+test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {
+    // Regression for "[discovery] skip ...: unsupported quantization mode
+    // 'nvfp4'": nvfp4 / mxfp4 / mxfp8 checkpoints are loadable and must be
+    // discoverable.
+    try testing.expect(isSupportedQuantMode("affine"));
+    try testing.expect(isSupportedQuantMode("nvfp4"));
+    try testing.expect(isSupportedQuantMode("mxfp4"));
+    try testing.expect(isSupportedQuantMode("mxfp8"));
+    try testing.expect(!isSupportedQuantMode("fp99"));
+}
+
+test "parseStubMeta: Qwen3-ASR transcribes, with no vision and no chat" {
+    const json =
+        \\{"model_type":"qwen3_asr","quantization":{"bits":8,"group_size":64},
+        \\"thinker_config":{"model_type":"qwen3_asr","audio_config":{"d_model":896},
+        \\"text_config":{"hidden_size":1024,"num_hidden_layers":28,"max_position_embeddings":65536}}}
+    ;
+    const m = parseStubMeta(testing.allocator, json, false);
+    try testing.expect(m.found and m.has_transcription);
+    try testing.expect(!m.has_vision and !m.has_chat);
+    try testing.expectEqual(@as(u32, 28), m.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 65536), m.max_position_embeddings);
+}
+
+const aligner_config_json =
+    \\{"model_type":"qwen3_asr","timestamp_token_id":151705,"timestamp_segment_time":80,
+    \\"thinker_config":{"model_type":"qwen3_forced_aligner","classify_num":5000,"audio_config":{"d_model":1024},
+    \\"text_config":{"hidden_size":1024,"num_hidden_layers":28,"max_position_embeddings":8192}}}
+;
+
+test "a Qwen3-ForcedAligner pack is discovered as the aligner, never as an ASR" {
+    const io = testing.io;
+    const a = testing.allocator;
+    const m = parseStubMeta(a, aligner_config_json, false);
+    try testing.expect(m.found and m.is_aligner and !m.has_transcription and !m.has_chat);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "aligner");
+    try tmp.dir.writeFile(io, .{ .sub_path = "aligner/config.json", .data = aligner_config_json });
+    const peek = peekConfig(io, a, tmp.dir, "aligner");
+    defer if (peek == .supported) a.free(peek.supported);
+    try testing.expect(peek == .supported);
+    try testing.expectEqualStrings("qwen3_forced_aligner", peek.supported);
+}
+
+test "parseStubMeta reads the native Nemotron omni language config" {
+    const m = parseStubMeta(testing.allocator,
+        \\{"model_type":"nemotron_h_omni","vision_config":{"model_type":"radio"},
+        \\"llm_config":{"model_type":"nemotron_h_puzzle","hidden_size":4096,
+        \\"vocab_size":131072,"max_position_embeddings":262144,"num_experts":496,
+        \\"layers_block_type":["mamba","moe","attention"]}}
+    , true);
+    try testing.expect(m.found and m.has_vision and m.has_video and m.is_moe);
+    try testing.expectEqual(@as(u32, 4096), m.hidden_size);
+    try testing.expectEqual(@as(u32, 131072), m.vocab_size);
+    try testing.expectEqual(@as(u32, 262144), m.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 3), m.num_hidden_layers);
+}
+
+test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
+    const a = testing.allocator;
+    // MoE chat model (Qwen3-Coder-30B-A3B shape), chat template present.
+    {
+        const json =
+            \\{"model_type":"qwen3_moe","vocab_size":151936,"hidden_size":2048,
+            \\"num_hidden_layers":48,"max_position_embeddings":262144,
+            \\"num_experts":128,"num_experts_per_tok":8,"quantization":{"bits":8,"group_size":64}}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.found);
+        try testing.expectEqual(@as(u32, 151936), m.vocab_size);
+        try testing.expectEqual(@as(u32, 2048), m.hidden_size);
+        try testing.expectEqual(@as(u32, 48), m.num_hidden_layers);
+        try testing.expectEqual(@as(u32, 262144), m.max_position_embeddings);
+        try testing.expectEqual(@as(u32, 8), m.quant_bits);
+        try testing.expect(m.is_moe);
+        try testing.expect(m.has_chat); // template present, not encoder
+        try testing.expect(!m.has_vision);
+    }
+    // Dense model, no template → no chat caps; no quant block → 0 bits.
+    {
+        const json =
+            \\{"model_type":"qwen2","hidden_size":5120,"num_attention_heads":40,
+            \\"max_position_embeddings":32768}
+        ;
+        const m = parseStubMeta(a, json, false);
+        try testing.expect(m.found);
+        try testing.expect(!m.is_moe);
+        try testing.expect(!m.has_chat);
+        try testing.expectEqual(@as(u32, 0), m.quant_bits);
+        try testing.expectEqual(@as(u32, 32768), m.max_position_embeddings);
+    }
+    // Vision: vision_config on a non-_text arch → has_vision.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"gemma4\",\"vision_config\":{\"hidden_size\":1152}}", true);
+        try testing.expect(m.has_vision);
+    }
+    // …but a `_text` arch with a vestigial vision_config must NOT report vision.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe_text\",\"vision_config\":{}}", true);
+        try testing.expect(!m.has_vision);
+    }
+    // Encoder (bert): chat/tool caps suppressed even with a template present.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"bert\",\"hidden_size\":384}", true);
+        try testing.expect(!m.has_chat);
+        try testing.expect(m.is_encoder);
+        try testing.expect(m.has_embedding);
+    }
+    // Decoder embedding checkpoint (issue #116): an explicit `pooling_mode`
+    // marks embeddings capability WITHOUT turning the stub into an encoder —
+    // Qwen3-Embedding keeps its causal arch (and its chat template).
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3\",\"hidden_size\":2560,\"pooling_mode\":\"last_token\"}", true);
+        try testing.expect(m.has_embedding);
+        try testing.expect(!m.is_encoder);
+        try testing.expect(m.has_chat);
+    }
+    // A plain chat qwen3 advertises no embeddings capability.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3\",\"hidden_size\":2560}", true);
+        try testing.expect(!m.has_embedding);
+    }
+    // Bidirectional embedding model (EmbeddingGemma): a gemma3_text config
+    // with use_bidirectional_attention — the stub must advertise embeddings,
+    // never chat, WITHOUT cold-loading (issue #79).
+    {
+        const json =
+            \\{"model_type":"gemma3_text","use_bidirectional_attention":true,
+            \\"hidden_size":768,"num_hidden_layers":24,"max_position_embeddings":2048}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.is_encoder);
+        try testing.expect(!m.has_chat);
+        try testing.expectEqual(@as(u32, 768), m.hidden_size);
+    }
+    // DeepSeek V4/V4.1 packs ship no chat template: the loader embeds ours, so the stub is still chat.
+    for ([_][]const u8{ "deepseek_v4", "deepseek_v41" }) |mt| {
+        var buf: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buf, "{{\"model_type\":\"{s}\",\"hidden_size\":5120}}", .{mt});
+        try testing.expect(parseStubMeta(a, json, false).has_chat);
+    }
+    // A chat gemma3_text WITHOUT the flag stays a chat model.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"gemma3_text\",\"hidden_size\":768}", true);
+        try testing.expect(!m.is_encoder);
+        try testing.expect(m.has_chat);
+    }
+    // EmbeddingGemma 2 declares no bidirectional flag: its model_type IS the encoder. It ships a
+    // chat_template.jinja (media placeholder joiner), which does not make it a chat model, and a vision_config
+    // whose tower embeds images and video.
+    {
+        const json =
+            \\{"model_type":"embedding_gemma2","vision_config":{"hidden_size":768},"video_token_id":258884,
+            \\"text_config":{"model_type":"embedding_gemma2_text","vocab_size":262144,"hidden_size":512,
+            \\"num_hidden_layers":24,"max_position_embeddings":262144}}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.is_encoder);
+        try testing.expect(m.has_embedding);
+        try testing.expect(!m.has_chat);
+        try testing.expect(m.has_vision);
+        try testing.expect(m.has_video);
+        try testing.expectEqual(@as(u32, 512), m.hidden_size);
+        try testing.expectEqual(@as(u32, 24), m.num_hidden_layers);
+        // The trained window the loaded row reports (model.zig), not the trunk's 262144.
+        try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
+        try testing.expect(isSupportedModelType("embedding_gemma2"));
+    }
+    // RADIO video has no video_token_id; its native tower discriminator supplies the capability.
+    {
+        const on = parseStubMeta(a, "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\"}}", true);
+        try testing.expect(on.has_vision);
+        try testing.expect(on.has_video);
+        const off = parseStubMeta(a, "{\"model_type\":\"nemotron_h\",\"vision_config\":{}}", true);
+        try testing.expect(!off.has_vision and !off.has_video);
+        const flag = parseStubMeta(a, "{\"model_type\":\"nemotron_h\",\"radio_vision\":true}", true);
+        try testing.expect(!flag.has_vision and !flag.has_video);
+    }
+    // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
+    // root carries only model_type / vision_config / quantization. Reading the
+    // root alone reported hidden=0, layers=0, ctx=0, is_moe=false on /v1/models
+    // for EVERY unloaded Gemma 3/4 and Qwen-VL model (which is most of them),
+    // so a client couldn't tell a 128-expert MoE from a dense model without
+    // cold-loading 16 GB of weights. Same class as the "Config fields omitted
+    // by nested text_config" gotcha, different parser.
+    {
+        // gemma-4-26B-A4B-it-qat-4bit's real shape.
+        const json =
+            \\{"model_type":"gemma4","vision_config":{"hidden_size":1152},
+            \\"quantization":{"bits":4,"group_size":32},
+            \\"text_config":{"vocab_size":262144,"hidden_size":2560,"num_hidden_layers":62,
+            \\"max_position_embeddings":131072,"num_experts":128,"top_k_experts":8}}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.found);
+        try testing.expectEqual(@as(u32, 262144), m.vocab_size);
+        try testing.expectEqual(@as(u32, 2560), m.hidden_size);
+        try testing.expectEqual(@as(u32, 62), m.num_hidden_layers);
+        try testing.expectEqual(@as(u32, 131072), m.max_position_embeddings);
+        try testing.expectEqual(@as(u32, 4), m.quant_bits); // still root-level
+        try testing.expect(m.is_moe);
+        try testing.expect(m.has_vision);
+    }
+    // A flat checkpoint whose text_config is absent keeps reading the root, and
+    // a nested block that OMITS a field falls back to the root rather than
+    // reporting 0 (mirrors the model.zig text_config merge).
+    {
+        const json =
+            \\{"model_type":"gemma3","max_position_embeddings":8192,
+            \\"text_config":{"hidden_size":3840}}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expectEqual(@as(u32, 3840), m.hidden_size);
+        try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
+    }
+    // Qwen3.5/3.6 MoE nests its expert count too (Ornith-1.0-35B: 256 experts).
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe\",\"text_config\":{\"num_experts\":256}}", true);
+        try testing.expect(m.is_moe);
+    }
+    // Malformed → found=false.
+    {
+        const m = parseStubMeta(a, "not json", true);
+        try testing.expect(!m.found);
+    }
+}
+
+test "discovery skips an incomplete media pack (media model_type without its marker)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The live shape: a turbo-lora fragment (and equally, any
+    // in-flight H3 pack) holds a valid minimax_h3 config.json and SOME
+    // safetensors, but not transformer.safetensors. Registering it shadows
+    // complete copies in later roots and the text loader dies on it.
+    try tmp.dir.createDirPath(io, "ddalcu/h3-fragment");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ddalcu/h3-fragment/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ddalcu/h3-fragment/turbo_lora.safetensors", .data = "0123" });
+    // A COMPLETE pack (marker present) stays discovered.
+    try tmp.dir.createDirPath(io, "ddalcu/h3-complete");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ddalcu/h3-complete/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ddalcu/h3-complete/transformer.safetensors", .data = "0123" });
+    // LTX has its own marker (connector.safetensors).
+    try tmp.dir.createDirPath(io, "x/ltx-partial");
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-partial/config.json", .data = "{\"model_type\":\"AudioVideo\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "x/ltx-partial/vae_decoder.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("ddalcu/h3-complete", result.models[0].id);
+}
+
+test "probeModelDir refuses an incomplete media pack by name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    try tmp.dir.createDirPath(io, "h3-fragment");
+    try tmp.dir.writeFile(io, .{ .sub_path = "h3-fragment/config.json", .data = "{\"model_type\":\"minimax_h3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "h3-fragment/turbo_lora.safetensors", .data = "0123" });
+    const dir = try std.fs.path.join(allocator, &.{ root, "h3-fragment" });
+    defer allocator.free(dir);
+
+    try testing.expectError(error.IncompleteMediaPack, probeModelDir(io, allocator, dir));
+}
+
+test "readStubMeta: has_mtp follows the checkpoint's MTP head" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen3_5\",\"hidden_size\":8}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});
+    defer allocator.free(model_dir);
+
+    try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_mtp);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
+        \\{"weight_map":{"mtp.fc.weight":"model-00002-of-00002.safetensors"}}
+    });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+    // qwen4_exp's head is the checkpoint's own layer.
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors.index.json", .data =
+        \\{"weight_map":{"language_model.mtp.fc_hidden.weight":"model-00002.safetensors"}}
+    });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_mtp);
+}
+
+test "readStubMeta: has_thinking reads the template on disk" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{\"model_type\":\"qwen3_5\",\"hidden_size\":8}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const model_dir = try std.fmt.allocPrint(allocator, "{s}/m", .{path_buf[0..root_len]});
+    defer allocator.free(model_dir);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/tokenizer_config.json", .data = "{\"chat_template\":\"{% if enable_thinking %}x{% endif %}\"}" });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_thinking);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/chat_template.jinja", .data = "{{ messages[0].content }}" });
+    try std.testing.expect(!readStubMeta(io, allocator, model_dir).has_thinking);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/chat_template.jinja", .data = "<|im_start|>assistant\n<think>\n" });
+    try std.testing.expect(readStubMeta(io, allocator, model_dir).has_thinking);
+}
+
+test "config discovery tolerates invalid roots and oversized metadata" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    const meta = parseStubMeta(allocator, "{\"hidden_size\":4294967297}", false);
+    try testing.expectEqual(@as(u32, 0), meta.hidden_size);
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "[]", "null", "false", "17", "\"bad\"", "[{}]" }) |content| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = content });
+        try testing.expect(peekConfig(io, allocator, tmp.dir, ".") == .missing_or_unparseable);
+    }
+}
+
+test "clef: the joint head identifies a decision pack before its Qwen config" {
+    const io = testing.io;
+    const a = testing.allocator;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "clef-4bit", "clef-8bit", "clef-flash-4bit", "clef-flash-8bit" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        var dir = try tmp.dir.openDir(io, name, .{});
+        defer dir.close(io);
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"qwen3_5\"}" });
+        try dir.writeFile(io, .{ .sub_path = "joint_head_config.json", .data = "{\"hidden_size\":4096,\"width\":1024,\"routing_layers\":2,\"layers\":4,\"heads\":16,\"feedforward\":4096}" });
+        try dir.writeFile(io, .{ .sub_path = "joint_head.safetensors", .data = "head" });
+        const peek = peekConfig(io, a, tmp.dir, name);
+        defer if (peek == .supported) a.free(peek.supported);
+        try testing.expect(peek == .supported);
+        try testing.expectEqualStrings("clef", peek.supported);
+        try testing.expectEqual(ModelKind.decision, modelKindFromType(peek.supported));
+        try testing.expect(isMediaModelType(peek.supported));
+    }
+}
+
+test "a Kev pack is a decision model even though its root config.json is its qwen3_5 base" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "org/kev-pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/kev-pack/config.json", .data = "{\"model_type\":\"qwen3_5\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/kev-pack/kev_config.json", .data = "{\"format\":\"kev\"}" });
+    try tmp.dir.createDirPath(io, "org/plain-qwen");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/plain-qwen/config.json", .data = "{\"model_type\":\"qwen3_5\"}" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    try testing.expectEqualStrings("org/kev-pack", result.models[0].id);
+    try testing.expectEqualStrings("kev", result.models[0].model_type);
+    try testing.expectEqual(ModelKind.decision, modelKindFromType(result.models[0].model_type));
+    try testing.expectEqualStrings("qwen3_5", result.models[1].model_type);
+    try testing.expectEqual(ModelKind.chat, modelKindFromType(result.models[1].model_type));
+}
+
+test "a D1 pack is a decision model: its config is LFM2-VL, its auto_map names the card's class" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "org/d1-pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/d1-pack/config.json", .data = "{\"model_type\":\"lfm2_vl\",\"auto_map\":{\"AutoModel\":\"modeling_d1.D1Model\"}}" });
+    try tmp.dir.createDirPath(io, "org/plain-lfm2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/plain-lfm2/config.json", .data = "{\"model_type\":\"lfm2_vl\"}" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    try testing.expectEqualStrings("org/d1-pack", result.models[0].id);
+    try testing.expectEqualStrings("d1", result.models[0].model_type);
+    try testing.expectEqual(ModelKind.decision, modelKindFromType(result.models[0].model_type));
+    try testing.expectEqualStrings("lfm2_vl", result.models[1].model_type);
+    try testing.expectEqual(ModelKind.chat, modelKindFromType(result.models[1].model_type));
+}
+
+test "resolveGgufFile: an embedding GGUF is never the chat model, and says so by name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const emb = try gguf_meta.buildHeader(allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "gemma-embedding" } },
+        .{ .key = "gemma-embedding.pooling_type", .value = .{ .u32_v = 1 } },
+    });
+    defer allocator.free(emb);
+    try tmp.dir.createDirPath(io, "emb-only");
+    try tmp.dir.writeFile(io, .{ .sub_path = "emb-only/embeddinggemma-Q4_0.gguf", .data = emb });
+    try tmp.dir.createDirPath(io, "mixed");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mixed/a-embed.gguf", .data = emb });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mixed/b-chat.gguf", .data = "x" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const only = try std.fmt.allocPrint(allocator, "{s}/emb-only", .{root});
+    defer allocator.free(only);
+    try testing.expectError(error.EmbeddingGgufFile, resolveGgufFile(io, allocator, only));
+    const direct = try std.fmt.allocPrint(allocator, "{s}/emb-only/embeddinggemma-Q4_0.gguf", .{root});
+    defer allocator.free(direct);
+    try testing.expectError(error.EmbeddingGgufFile, resolveGgufFile(io, allocator, direct));
+    const mixed = try std.fmt.allocPrint(allocator, "{s}/mixed", .{root});
+    defer allocator.free(mixed);
+    const picked = try resolveGgufFile(io, allocator, mixed);
+    defer allocator.free(picked);
+    try testing.expect(std.mem.endsWith(u8, picked, "/mixed/b-chat.gguf"));
+
+    var res = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer res.deinit();
+    try testing.expectEqual(@as(usize, 1), res.models.len);
+    try testing.expectEqualStrings("mixed", res.models[0].id);
+}

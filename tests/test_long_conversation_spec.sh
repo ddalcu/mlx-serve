@@ -1,33 +1,14 @@
 #!/bin/bash
-# Long-conversation sliding-window regression for spec-decode.
+# test_long_conversation_spec.sh — one conversation grown past the sliding window (Gemma 4 E4B: 512) over 12 turns on
+# one server with spec decode on, each reply appended back: every turn answers 200 with parseable JSON, finish_reason
+# stop|length, non-empty content, no NaN or pad-only output. Catches K/V view bugs in verify forwards past the window,
+# drafter cross-attention past it, and SSM/conv state drift on hybrids.
 #
-# Build a single conversation that grows past the model's sliding window
-# threshold (Gemma 4 E4B = 512 tokens). Send N user messages in sequence
-# against ONE long-running server, each with spec-decode enabled. After each
-# turn, assert the response decoded correctly:
-#   - HTTP 200
-#   - parseable JSON
-#   - finish_reason in {stop, length}
-#   - non-empty content
-#   - no NaN tokens, no <pad>-only output
-#
-# The point of the test is to catch:
-#   - KV cache view bugs during multi-token verify forwards at offsets past
-#     the sliding window
-#   - Drafter cross-attn into target's K/V at offsets > sliding_window
-#   - SSM/conv state corruption across long-context decodes (hybrid models)
-#
-# Multi-turn growth is built by appending each assistant response back into
-# the next request — the conversation gets monotonically longer as we go.
-#
-# Defaults:
-#   model = ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#   N = 12 turns of ~50-token unique content (more than enough to cross 512)
-#
-# Usage:
-#   LONG_CONV_TEST_MODEL=/path/to/model ./tests/test_long_conversation_spec.sh [port]
+#   LONG_CONV_TEST_MODEL=<dir> ./tests/test_long_conversation_spec.sh [port]   # default gemma-4-e4b-it-8bit
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8090}
 BASE="http://127.0.0.1:$PORT"
@@ -37,8 +18,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${LONG_CONV_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
-DRAFTER="${LONG_CONV_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
+MODEL="${LONG_CONV_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
+DRAFTER="${LONG_CONV_TEST_DRAFTER:-$(find_model mlx-community/gemma-4-E4B-it-assistant-bf16 || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16")}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_long_conversation_spec: model directory not found ($MODEL)."
@@ -87,10 +68,7 @@ cleanup() {
 trap cleanup EXIT
 
 UP=0
-for i in $(seq 1 60); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then UP=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 && UP=1
 if [ "$UP" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy in 60s"
     tail -30 "$LOGFILE"

@@ -3,7 +3,7 @@ import XCTest
 
 /// A Kev pack's root config.json says `qwen3_5`; `kev_config.json` is what makes it a
 /// decision model, or it is offered as a chat model it can't serve. Server twin:
-/// `model_discovery.peekKevPack`.
+/// the kev plugin's `claims`.
 final class KevModelTests: XCTestCase {
 
     private func makeKevDir() throws -> (root: String, dir: String) {

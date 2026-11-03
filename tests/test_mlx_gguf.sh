@@ -1,5 +1,5 @@
 #!/bin/bash
-# Integration test for the MLX GGUF engine (lib/mlx-serve-gguf).
+# Integration test for the MLX GGUF engine (src/sdk/quant/gguf/).
 #
 # Boots `mlx-serve` against every GGUF given (archs qwen35, qwen35moe, gemma4,
 # IQ/K quants) and checks the whole path: routing to the MLX engine instead of

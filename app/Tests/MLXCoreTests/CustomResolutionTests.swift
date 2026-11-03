@@ -2,7 +2,7 @@ import XCTest
 @testable import MLXCore
 
 /// The custom-resolution grid is a MIRROR of the server's `clampFluxDim` /
-/// `clampKreaDim` in `src/gen.zig`. Neither side can call the other, so this is
+/// `clampKreaDim` in `src/host/media_jobs/gen.zig`. Neither side can call the other, so this is
 /// documented duplication in the `isMediaModelType` / `modalityFromType` mould,
 /// and these tests are what keep the two from drifting: a hint that disagrees
 /// with what the server actually samples is worse than no hint, because the

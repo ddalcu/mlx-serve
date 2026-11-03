@@ -1,10 +1,12 @@
 #!/bin/bash
-# Regression: one completed HTTP request must not retain one pthread stack.
+# test_connection_thread_reaping.sh — one finished HTTP request does not retain one pthread stack: headless boot, 300
+# fresh connections, and the stack-region count (macOS `vmmap`; Linux mapped MiB from /proc/<pid>/status) must not
+# grow with the request count while the server stays healthy. A failure is the footprint climb of a long session
+# while MLX cache_bytes stays tiny (a joinable thread handle never detached).
 #
-# The accept loop used to discard each joinable std.Thread handle. The handler
-# returned, but macOS kept its stack mapping and page-table bookkeeping until a
-# join/detach that never came. A long Claude Code session therefore grew from
-# the model's 4-5 GB working set toward 10 GB while MLX cache_bytes stayed tiny.
+#   ./tests/test_connection_thread_reaping.sh [port]
+#
+# Hermetic twin: `each connection thread handle is detached after spawn`.
 
 set -u
 

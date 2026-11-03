@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump a MageFlow end-to-end DiT-loop parity fixture for src/mage_flow.zig.
+"""Dump a MageFlow end-to-end DiT-loop parity fixture for src/plugins/mage_flow/mage_flow.zig.
 
 Runs the pure-MLX REFERENCE (ivanfioravanti/mflux@mage-flow-mlx) transformer in
 its native bf16 over the reference scheduler + Euler loop at a small resolution,

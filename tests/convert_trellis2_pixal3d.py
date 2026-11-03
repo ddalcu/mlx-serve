@@ -1,25 +1,18 @@
 #!/usr/bin/env python3
-"""Repackage `microsoft/TRELLIS.2-4B` or `TencentARC/Pixal3D` as an 8-bit mlx-serve pack.
+"""Repackage `microsoft/TRELLIS.2-4B` or `TencentARC/Pixal3D` as the 8-bit mlx-serve packs we publish (needs mlx, the
+official weights and DINOv3). The release's layout and key names are kept, except: the DiT block projections are
+affine 8-bit group 64 and each DiT json gains mlx-lm's `quantization` block (the loader reads a packed weight's input
+width from its scales); the shape/texture encoders are dropped; decoders, DiT input/output layers, embedders, AdaLN,
+norms and RoPE phases stay as released. DINOv3 rides as float16 (`--dino-bits 8` quantizes it), NAF (Pixal3D) and the
+licences too; a source without a LICENSE is refused. Sizes: TRELLIS.2 9.6 GB (official 15), Pixal3D 14.8 GB (43).
 
-USER-RUN (needs mlx + the official weights + the DINOv3 checkpoint). One file at a time. The pack keeps
-the release's layout and key names (what src/trellis2.zig and src/pixal3d.zig load) with these changes:
-
-  (a) the DiT block projections (`blocks.N.*.weight`, 2-D, input width a multiple of the group) are
-      affine-quantized (group 64). The loaders decide dense-vs-quantized PER TENSOR from a `.scales`
-      sibling, and read the group size from the DiT json's mlx-lm style `quantization` block;
-  (b) the DiT json gains that block;
-  (c) the shape/texture ENCODERS are dropped (image-to-3D never runs them).
-
-NOT quantized: the decoders and the sparse-structure decoder (convolutions, under 1 GB together), the
-DiTs' input/output layers, time embedder and AdaLN modulation, every norm gamma and the RoPE phases.
-DINOv3 (the image encoder, Meta-gated upstream) rides in the pack as float16, or 8-bit with --dino-bits 8,
-with its licence; the NAF upsampler (Pixal3D) rides with its Apache licence. A source without a LICENSE is refused.
-
-    python3 tests/convert_trellis2_pixal3d.py --model trellis2 --src <TRELLIS.2-4B> --ss-dec <dir with ss_dec_conv3d_16l8_fp16.*> \\
+    python3 tests/convert_trellis2_pixal3d.py --model trellis2 --src <TRELLIS.2-4B> --ss-dec <dir with ss_dec_conv3d_16l8_fp16.*>
         --dinov3 <dinov3 dir> --license <LICENSE> --out <dir>
-    python3 tests/convert_trellis2_pixal3d.py --model pixal3d --src <Pixal3D> --naf <dir with model.safetensors> \\
-        --dinov3 <dinov3 dir> --out <dir>
-    python3 tests/convert_trellis2_pixal3d.py --self-test
+    python3 tests/convert_trellis2_pixal3d.py --model pixal3d --src <Pixal3D> --naf <dir> --dinov3 <dinov3 dir> --out <dir>
+    python3 tests/convert_trellis2_pixal3d.py --self-test        # hermetic
+
+The bar is the bf16 oracle run ON the pack: `zig build test-build -Doptimize=ReleaseFast -Dtest-filter="the blocks in
+bf16"` (TRELLIS2_WEIGHTS=<pack>) or `"the DiTs in bf16"` (PIXAL3D_WEIGHTS=<pack>), then the test binary directly.
 """
 
 import argparse

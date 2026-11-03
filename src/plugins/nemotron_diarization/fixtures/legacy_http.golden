@@ -1,0 +1,20 @@
+== probs 800 64fb9153bdee0532be4b0616de6b1ea6d25ba9ddf3a476a9c0d67b1e10d1c97b
+:ˆ?pä>Ðo	?‹àÙ>ªa?òÅ>¨¢?Ê?Ø>¼x?´âÚ>rü?=Í>g??îÂ>“í	?T˜Û>%‘?®"Ô>‚é?½UÍ>¤?gª½>ˆ:	?Å’Û>bú?qÚ>O½?WìÍ>¨à
+?É¾À>P»?±rÛ>ö§?5Õ>„á?°ÚÐ>Î¥	?tmÀ>L<	?7“Û>V?¡Ï>’?UŸÓ>¨y?öÄÃ>&,	?ýCÛ>²?biÞ>ºó?ªÖ¹>Mç?mÚ>å?[P¾>¦e?"ýÛ>7?0u¼>°,?ŒÓß>üä?\¯³>Õ|	?zSÖ>"?óDÆ>2ˆ?š¤Ý>ã?V²>b¯	?'ÓØ>>>?_÷Ä>L^?“à>0¥?Í,®>j‹
+?
+ÄÓ>R
+?/«Ï>Ü‚?á>ª>?ê0±>l®	?>×Ø>’L?ò¼É>Øœ?\lá>¸N?ë*°>`»
+?ù1Ò>|î?MËÍ>†?›1Þ>èÙ?b™µ>;	?JØ>È9?Bº>œ	?¦Ö>Æ¾?wA·>®ì?àêÏ>w?{Á>Ã
+?°Ô>0K?9û¶>b
+?!A×>í~
+?ø‚½>j7	?¢ÃÚ>(¹?§ñ»>¶?„¾Õ>¸?ÿÁ>¸$	?6»Ô>‚	?	¤Â>ð?š.Ø>à^
+?¦_·>ö*?¶KÓ>òM?•Ç¾>ƒ3
+?€àÒ>¯c?ß-¸>ò°?×€Ñ>BL	?¨1½>OÎ	?8PØ>r<	?Oµ>²	?æÇØ>*?õO»>ž?N¥Ö>(Ø?R«¿>º`?+õÕ>c"
+?´u¿>ŠM	?íÖÕ>Z?-½>Ë‡	?¼×>2ü?¯:¸>ö´
+?ðÉÐ>à¬?Ò¾>Ç…?”Ò>Ø
+?÷¹>Ì
+?¢×>>_	?¼Ï¶>Ü	?¹XÙ>$¿?JÓ¹>¿?«yÙ>:	?ª»>ÎÆ?MDÔ>œì?ñÝß>
+== speakers 1 d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35
+2
+== row 707 27af742860ad5bdd72d7e9832f051690d3cd71c9601c8935aa08335a8f116d4a
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["diarization"],"input_modalities":["text"],"modality":"diarization","engines":["mlx"],"meta":{"architecture":"nemotron_diarization","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

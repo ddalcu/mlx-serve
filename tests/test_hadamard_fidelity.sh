@@ -7,6 +7,7 @@
 # Usage: HADAMARD_TEST_MODEL=<pack dir> ./tests/test_hadamard_fidelity.sh [port]
 # Needs python3 with mlx, mlx_lm and tokenizers.
 set -u
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 MODEL="${HADAMARD_TEST_MODEL:-$(find_model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)}"
 PORT="${1:-11281}"
@@ -17,7 +18,7 @@ LOG=$(mktemp)
 "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --no-mtp --log-level info >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT
-for _ in $(seq 1 120); do curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "http://127.0.0.1:$PORT" 120 1 || true
 
 OUT=$(python3 "$(dirname "$0")/hadamard_fidelity.py" "$MODEL" "$PORT") || { echo "FAIL: fidelity run"; exit 1; }
 echo "[hadamard-fidelity] $OUT"

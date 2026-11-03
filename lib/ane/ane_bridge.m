@@ -79,11 +79,6 @@ static NSString *bridge_cache_root(void) {
     return root;
 }
 
-bool msv_ane_cache_enabled(void) {
-    const char *env = getenv("MLX_SERVE_ANE_CACHE");
-    return !env || atoi(env) != 0;
-}
-
 static void bridge_write_sources(NSString *directory, NSData *program,
                                  NSData *weights) {
     NSFileManager *files = [NSFileManager defaultManager];
@@ -304,12 +299,6 @@ static void bridge_cache_store(NSString *identifier, NSString *directory) {
         [entry stringByAppendingPathComponent:@"compiled.ok"] atomically:YES];
 }
 
-static void bridge_cache_evict(const char *identifier) {
-    if (!identifier) return;
-    [[NSFileManager defaultManager]
-        removeItemAtPath:bridge_cache_entry(@(identifier)) error:nil];
-}
-
 /* Symbol indices for one procedure: oMLX query the model rather than
  * assuming 0..count-1 (qwen35_ane.mm:724-731), because a bank's procedures
  * do NOT share one symbol numbering — the identity mapping serves procedure
@@ -430,8 +419,7 @@ static bool bridge_compile_load(const char *name, id model, NSData *program,
     });
     NSString *directory = [NSTemporaryDirectory() stringByAppendingPathComponent:identifier];
     NSFileManager *files = [NSFileManager defaultManager];
-    bool cache = msv_ane_cache_enabled();
-    bool cached = cache && bridge_cache_restore(identifier, directory);
+    bool cached = bridge_cache_restore(identifier, directory);
     if (cached) bridge_cache_tag(bridge_cache_entry(identifier));
     if (!cached) bridge_write_sources(directory, program, weights);
     [[NSString stringWithFormat:@"%d", getpid()]
@@ -467,10 +455,8 @@ static bool bridge_compile_load(const char *name, id model, NSData *program,
             [files removeItemAtPath:directory error:nil];
             return false;
         }
-        if (cache) {
-            bridge_cache_prune();
-            bridge_cache_store(identifier, directory);
-        }
+        bridge_cache_prune();
+        bridge_cache_store(identifier, directory);
     }
     /* The staging weights blob and MIL text are COMPILE inputs only —
      * the warm-restore path loads AND SERVES from a mirror that never
@@ -691,10 +677,6 @@ void msv_ane_model_free(msv_ane_model *handle) {
         if (handle->staging_directory) {
             [[NSFileManager defaultManager]
                 removeItemAtPath:@(handle->staging_directory) error:nil];
-            if (!msv_ane_cache_enabled())
-                bridge_cache_evict(strrchr(handle->staging_directory, '/') ?
-                    strrchr(handle->staging_directory, '/') + 1 :
-                    handle->staging_directory);
             free(handle->staging_directory);
         }
     }
@@ -894,8 +876,6 @@ void msv_ane_program_free(msv_ane_program *p) {
         if (p->staging_directory) {
             if (bridge_staging_release(p->staging_directory)) {
                 [[NSFileManager defaultManager] removeItemAtPath:@(p->staging_directory) error:nil];
-                if (!msv_ane_cache_enabled())
-                    bridge_cache_evict(strrchr(p->staging_directory, '/') + 1);
             }
             free(p->staging_directory);
         }

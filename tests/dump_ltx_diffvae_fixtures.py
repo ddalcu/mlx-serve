@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump LTX-2.5 DiffVAE-decoder parity fixtures (.raw) for the Zig oracle in src/ltx_diffvae_forward.zig.
+"""Dump LTX-2.5 DiffVAE-decoder parity fixtures (.raw) for the Zig oracle in src/plugins/ltx/diffvae_forward.zig.
 
 The reference decoder is `Lightricks/LTX-2`
 `ltx_core/model/video_vae/diffusion_video_decoder.py` + its `transformer/`
