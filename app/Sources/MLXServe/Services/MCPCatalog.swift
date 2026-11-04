@@ -224,7 +224,7 @@ enum MCPCatalog {
                       // uses default interactive auth (browser login on first tool call).
                       kind: .envEncoded(key: "PERSONAL_ACCESS_TOKEN", encoding: .base64Pair(leftSide: "x")),
                       label: "Personal Access Token (PAT) — optional",
-                      helpText: "Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens.",
+                      helpText: "Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens. A saved token is kept when this is blank; remove it in mcp.json.",
                       isSecret: true,
                       required: false,
                       placeholder: "Paste raw PAT for headless auth — we base64-encode it",

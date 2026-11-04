@@ -287,16 +287,39 @@ struct MCPMarketplaceView: View {
         Task { await mcpManager.startEnabled() }
     }
 
-    /// Materialize a catalog row over whatever entry is already stored. The
-    /// memberwise init drops the keys this build does not model, and this screen
-    /// is a second writer of the same file: hand-added `alwaysAllow`/`timeout`
-    /// survive a re-install only if they are carried across explicitly.
+    /// Materialize a catalog row over the stored entry. The file has a second
+    /// writer (the user's editor), so an input writes only when its value
+    /// changed from what the stored entry shows; `args` are rebuilt from the
+    /// catalog only when an input that feeds them changed. A blank encoded
+    /// secret (never shown) keeps the stored key and the args it adds.
     static func materialized(_ entry: MCPCatalogEntry,
                              over existing: MCPServerEntry?,
                              values: [String: String]) -> MCPServerEntry {
-        var materialized = entry.materialize(values: values)
-        if let existing, !existing.extra.isEmpty { materialized.extra = existing.extra }
-        return materialized
+        let fresh = entry.materialize(values: values)
+        guard var kept = existing else { return fresh }
+        kept.command = kept.command ?? fresh.command
+        let shown = entry.extractValues(from: kept)
+        var env = kept.env ?? [:]
+        var rebuildArgs = false
+        var secretArgs: [String] = []
+        for input in entry.inputs {
+            let value = values[input.id]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let changed = value != (shown[input.id] ?? "")
+            switch input.kind {
+            case .envEncoded(let key, _) where value.isEmpty:
+                if env[key] != nil { secretArgs += input.argsWhenPresent }
+            case .env(let key), .envEncoded(let key, _):
+                guard changed else { continue }
+                env[key] = fresh.env?[key]
+                rebuildArgs = rebuildArgs || !input.argsWhenPresent.isEmpty
+            case .arg:
+                rebuildArgs = rebuildArgs || changed
+            }
+        }
+        if rebuildArgs { kept.args = (fresh.args ?? []) + secretArgs }
+        kept.env = env.isEmpty ? nil : env
+        kept.disabled = false
+        return kept
     }
 
     // MARK: - State helpers

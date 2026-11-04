@@ -550,6 +550,19 @@ final class LocalizationTests: XCTestCase {
         }
     }
 
+    /// The marketplace renders an input's `helpText` through `L10n.text`, so a
+    /// wording change must re-key every catalog that translates it.
+    func testMCPInputHelpTextResolvesInEveryCatalog() throws {
+        let ado = try XCTUnwrap(MCPCatalog.entry(for: "azure-devops"))
+        let help = try XCTUnwrap(ado.inputs.first { $0.id == "ado_pat" }?.helpText)
+        let resources = Self.catalogURL.deletingLastPathComponent().deletingLastPathComponent()
+        for lang in ["zh-Hans", "ko"] {
+            let data = try Data(contentsOf: resources.appendingPathComponent("\(lang).lproj/Localizable.strings"))
+            let entries = try XCTUnwrap(PropertyListSerialization.propertyList(from: data, format: nil) as? [String: String])
+            XCTAssertNotNil(entries[help], "\(lang): the Azure DevOps PAT help text has no entry")
+        }
+    }
+
     /// The image pane's resolution menu is a producer table too.
     func testImageResolutionLabelsResolveInTheCatalog() throws {
         let keys = Set(try catalog().map(\.key))
