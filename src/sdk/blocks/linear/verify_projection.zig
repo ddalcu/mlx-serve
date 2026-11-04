@@ -11,7 +11,8 @@ const concatAxis0 = @import("../../../mlx/array.zig").concatAxis0;
 const gpuArchitecture = @import("../../../mlx/device.zig").gpuArchitecture;
 const QsaCfgCache = @import("../../../mlx/kernel_cache.zig").QsaCfgCache;
 const affineParamsFromGeometry = @import("../../quant/params.zig").affineParamsFromGeometry;
-const qmvBatchLimit = @import("qmatmul.zig").qmvBatchLimit;
+const qmvRows = @import("qmatmul.zig").qmvRows;
+const qmvNax = @import("qmatmul.zig").qmvNax;
 const cachedScalarInt = @import("verify_qmm.zig").cachedScalarInt;
 const mixedNaxShapeEnabled = @import("verify_qmm.zig").mixedNaxShapeEnabled;
 const mixedPlainEnabled = @import("verify_qmm.zig").mixedPlainEnabled;
@@ -259,6 +260,8 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
     var total: c_int = 0;
     for (widths) |width| {
         if (width < 2 or width > (if (wide) @as(c_int, 6) else 7)) return null;
+        // A slot whose solo verify takes MLX's qmv_nax gets other bits than any joined row.
+        if (qmvNax(width, k, n, @intCast(qp.bits))) return null;
         if (wide and verifyQmmEnabled() and
             mixedNaxShapeEnabled(qp.bits, qp.group_size, n, width) and width >= naxMinMForBits(qp.bits) and @mod(k, 256) == 0) return null;
         total += width;
@@ -278,7 +281,7 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
         }
     }
     const arch = verifyArch() orelse return null;
-    if (total >= qmvBatchLimit(dualDieArch(arch), k, n)) return null;
+    if (!qmvRows(dualDieArch(arch), total, k, n, @intCast(qp.group_size), @intCast(qp.bits))) return null;
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
     try mlx.check(mlx.mlx_quantized_matmul(&result, x, w, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));

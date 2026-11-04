@@ -227,7 +227,7 @@ test "laguna plugin: a pack with a DFlash sidecar serves through the plugin and 
     try writePackAt(&p, true, 64, 128);
     var b = try both.Both.openAs(&plugin.table, &p, json, true, .none);
     defer b.close();
-    try both.expectDflashRecorded(&b.xfm, "applegpu_g17d", &.{ 61, 76, 58, 71, 89, 126, 10, 72, 50, 35, 4, 120, 28, 28, 53, 126 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0 });
+    try both.expectDflashRecorded(&b.xfm, "applegpu_g17d", &.{ 61, 54, 102, 112, 22, 112, 126, 2, 121, 8, 43, 46, 13, 120, 114, 38 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
 }
 
 test "laguna plugin: a served pack reports its dense attention projections to /props as the legacy load does" {

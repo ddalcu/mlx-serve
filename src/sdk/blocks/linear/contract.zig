@@ -383,13 +383,15 @@ const Qmm = struct {
                 return self.rig.bytesOf(&.{y});
             },
             .wide => {
-                // Each stream's rows alone (M 6: MLX's qmv_wide on every M5), as the joined verify must match them.
+                // Each stream's rows alone, as the joined verify must match them: four-row streams take MLX's qmv_wide
+                // (six rows take qmv_nax, where the joined verify declines: `qmatmul.qmvNax`).
+                const sv = 4;
                 var g = ops.Graph.init(self.rig.a, s);
                 defer g.deinit();
-                var parts: [4]mlx.mlx_array = undefined;
+                var parts: [8]mlx.mlx_array = undefined;
                 var r: usize = 0;
-                while (r < d.m) : (r += self.nv) parts[r / self.nv] = try g.qmm(try g.sliceAxis(x[0], 1, @intCast(r), @intCast(@min(d.m, r + self.nv))), x[1], x[2], x[3], gs, bits);
-                return self.rig.bytesOf(&.{try g.concat(parts[0 .. (d.m + self.nv - 1) / self.nv], 1)});
+                while (r < d.m) : (r += sv) parts[r / sv] = try g.qmm(try g.sliceAxis(x[0], 1, @intCast(r), @intCast(@min(d.m, r + sv))), x[1], x[2], x[3], gs, bits);
+                return self.rig.bytesOf(&.{try g.concat(parts[0 .. (d.m + sv - 1) / sv], 1)});
             },
             else => unreachable,
         }
@@ -482,7 +484,7 @@ pub fn register(set: *kc.Set) !void {
     {
         // The joined verify group of 12 rows (two six-row streams): 8-bit g64 at the gdn, lm head and attention widths.
         const q = Qmm.init(a, &wide_launch, .wide, 8, 64, 12);
-        var sp = qmmSpec("verify_wide bf16 (8-bit g64, M 12, NV 6)", q, &.{ .{ .rows = 768, .n = 12, .k = 2560 }, .{ .rows = 320, .n = 12, .k = 6144 }, .{ .rows = 1280, .n = 12, .k = 2560 } }, "quantized_matmul per six-row stream (MLX qmv_wide)");
+        var sp = qmmSpec("verify_wide bf16 (8-bit g64, M 12, NV 6)", q, &.{ .{ .rows = 768, .n = 12, .k = 2560 }, .{ .rows = 320, .n = 12, .k = 6144 }, .{ .rows = 1280, .n = 12, .k = 2560 } }, "quantized_matmul per four-row stream (MLX qmv_wide)");
         sp.nax = true; // the engine runs it only where verifySharedHardware(), which needs NAX
         try set.add(Qmm, q, sp, null);
     }

@@ -20,8 +20,8 @@ for (uint k = 0; k < K; k += VPT * 32) {
     T a0 = x[p], a1 = x[p+1], a2 = x[p+2], a3 = x[p+3];
     T b0 = T(0), b1 = T(0), b2 = T(0), b3 = T(0);
     if (pair) { b0 = x[p+K]; b1 = x[p+K+1]; b2 = x[p+K+2]; b3 = x[p+K+3]; }
-    sum.x += a0 + a1 + a2 + a3;
-    sum.y += b0 + b1 + b2 + b3;
+    sum.x += float(a0) + float(a1) + float(a2) + float(a3);
+    sum.y += float(b0) + float(b1) + float(b2) + float(b3);
     xt[i] = float2(float(a0), float(b0));
     xt[i+1] = float2(float(a1), float(b1)) / 16.0f;
     xt[i+2] = float2(float(a2), float(b2)) / 256.0f;

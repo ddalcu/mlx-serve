@@ -63,6 +63,7 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
   test split across the shards. Lint: `python3 scripts/lint.py --strict` (`zig build lint`) stays 0.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx/ffi.zig` externs. Brew: webp ≥ 1.6.0.
+- **An MLX bump must not turn every proof tape red**: stamp the MLX build in the tape header, and on a different MLX drop a tape to a tolerance check against an f32 reference (as dsv41 `expectNoWorse` does) that asks for a re-record (`MLX_SERVE_TAPE_RECORD`).
 - **Linux/Windows CUDA**: build with `./scripts/build-linux.sh` / `scripts\build-windows.ps1`; MLX's JIT needs `CUDA_HOME`; custom MSL runs on Metal only. Kernels, per-device defaults, memory, measuring, and its rules (GPU-pool loads, graphs, kernel cache, matching MLX's bits): `docs/CUDA.md`.
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
 

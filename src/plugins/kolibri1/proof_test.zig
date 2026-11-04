@@ -203,5 +203,5 @@ test "kolibri1 plugin: a pack with a DFlash sidecar serves through the plugin an
     try writePackAt(&p, true, 64, 128);
     var b = try both.Both.openAs(&plugin.table, &p, json, true, .none);
     defer b.close();
-    try both.expectDflashRecorded(&b.xfm, "applegpu_g17d", &.{ 11, 12, 71, 58, 83, 97, 18, 68, 101, 41, 49, 30, 111, 65, 121, 122 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 });
+    try both.expectDflashRecorded(&b.xfm, "applegpu_g17d", &.{ 11, 12, 71, 58, 83, 127, 101, 123, 102, 13, 13, 30, 25, 3, 58, 4 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
 }

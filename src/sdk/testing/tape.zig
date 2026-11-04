@@ -4,6 +4,7 @@
 //! tiny random packs: 2% to 38% relative RMS on an M4) only their dtype, shape and finiteness are checked. Test-only.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const device = @import("../../mlx/device.zig");
 
@@ -82,6 +83,9 @@ pub const Tape = struct {
     /// Arrays over this many bytes are kept as a digest of their dtype, shape and bytes (compared on the recording's
     /// device only) and an even sample of `sample_len` elements; 0 = every array whole. As it was recorded.
     compact_over: usize = 0,
+    /// With `MLX_SERVE_TAPE_RECORD` set, on the recording's device: what this run produced, in the tape's format,
+    /// written at `expectDone` as `<dir>/<sha256 of the played tape>.tape` instead of compared (an MLX bump's re-baseline).
+    rec: ?*std.ArrayList(u8) = null,
 
     pub fn player(bytes: []const u8) !Tape {
         if (bytes.len < magic.len + 1 or !std.mem.eql(u8, bytes[0..magic.len], magic)) return error.NotAProofTape;
@@ -93,7 +97,14 @@ pub const Tape = struct {
         var dbuf: [64]u8 = undefined;
         const same = std.mem.eql(u8, recorded, deviceName(&dbuf));
         if (!same) std.debug.print("proof tape recorded on {s}: values not compared here, only dtype, shape and finiteness\n", .{recorded});
-        return .{ .data = bytes, .at = magic.len + 1 + n, .same_device = same };
+        var t: Tape = .{ .data = bytes, .at = magic.len + 1 + n, .same_device = same };
+        if (same and env.get(.MLX_SERVE_TAPE_RECORD) != null) {
+            const r = try std.heap.page_allocator.create(std.ArrayList(u8));
+            r.* = .empty;
+            try r.appendSlice(std.heap.page_allocator, bytes[0 .. magic.len + 1 + n]);
+            t.rec = r;
+        }
+        return t;
     }
 
     pub fn playing(t: *const Tape) bool {
@@ -129,6 +140,7 @@ pub const Tape = struct {
         for (sh[0..nd]) |*d| d.* = std.mem.readInt(i32, (try t.take(4))[0..4], .little);
         const len = std.mem.readInt(u64, (try t.take(8))[0..8], .little);
         const want = try t.take(@intCast(len));
+        if (t.rec) |r| return record(r, got);
         try testing.expectEqual(dt, mlx.mlx_array_dtype(got));
         // Off its device a speculative run accepts other drafts, so its token array may differ in length too.
         if (!t.same_device and tokens) return;
@@ -145,6 +157,33 @@ pub const Tape = struct {
 
     /// The playback read every recorded value.
     pub fn expectDone(t: *const Tape) !void {
+        if (t.rec) |r| return t.writeRecording(r);
         if (t.playing()) try testing.expectEqual(t.data.len, t.at);
+    }
+
+    fn record(r: *std.ArrayList(u8), got: Array) !void {
+        const pa = std.heap.page_allocator;
+        const shape = mlx.getShape(got);
+        try r.append(pa, @intCast(@backingInt(mlx.mlx_array_dtype(got))));
+        try r.append(pa, @intCast(shape.len));
+        for (shape) |d| try r.appendSlice(pa, std.mem.asBytes(&std.mem.nativeToLittle(i32, d)));
+        const bytes = try bytesOf(testing.allocator, got);
+        defer testing.allocator.free(bytes);
+        try r.appendSlice(pa, std.mem.asBytes(&std.mem.nativeToLittle(u64, bytes.len)));
+        try r.appendSlice(pa, bytes);
+    }
+
+    fn writeRecording(t: *const Tape, r: *std.ArrayList(u8)) !void {
+        defer {
+            r.deinit(std.heap.page_allocator);
+            std.heap.page_allocator.destroy(r);
+        }
+        var h: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(t.data, &h, .{});
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = try std.fmt.bufPrintSentinel(&buf, "{s}/{x}.tape", .{ std.mem.span(env.get(.MLX_SERVE_TAPE_RECORD).?), h }, 0);
+        const f = std.c.fopen(path, "wb") orelse return error.TapeRecordOpen;
+        defer _ = std.c.fclose(f);
+        if (std.c.fwrite(r.items.ptr, 1, r.items.len, f) != r.items.len) return error.TapeRecordWrite;
     }
 };

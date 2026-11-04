@@ -4,6 +4,7 @@
 //! of the plugin's parse and the legacy parse.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const abi = @import("../../../abi/plugin.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
@@ -496,6 +497,8 @@ pub fn expectDflashRecorded(xfm: *Transformer, device: []const u8, want_tokens: 
     try dflashRun(xfm, tokens, &accepted);
     var dbuf: [64]u8 = undefined;
     if (!std.mem.eql(u8, tape_mod.deviceName(&dbuf), device)) return;
+    // A re-baseline (`MLX_SERVE_TAPE_RECORD`) prints this run's values for the test's literals.
+    if (env.get(.MLX_SERVE_TAPE_RECORD) != null) return std.debug.print("dflash recorded: {any} {any}\n", .{ tokens, accepted.items });
     try testing.expectEqualSlices(u32, want_tokens, tokens);
     try testing.expectEqualSlices(u32, want_accepted, accepted.items);
 }

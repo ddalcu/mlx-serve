@@ -13,11 +13,11 @@ for (int k = 0; k < K; k += 512) {
   for (uint i = 0; i < 16; i += 8) {
     size_t at = size_t(row) * K + k + lane * 16 + i;
     const device T* a = x + at;
-    sum.x += a[0] + a[1] + a[2] + a[3] + a[4] + a[5] + a[6] + a[7];
+    sum.x += float(a[0]) + float(a[1]) + float(a[2]) + float(a[3]) + float(a[4]) + float(a[5]) + float(a[6]) + float(a[7]);
     float b[8] = {0,0,0,0,0,0,0,0};
     if (pair) {
       const device T* v = a + K;
-      sum.y += v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7];
+      sum.y += float(v[0]) + float(v[1]) + float(v[2]) + float(v[3]) + float(v[4]) + float(v[5]) + float(v[6]) + float(v[7]);
       for (uint j = 0; j < 8; ++j) b[j] = float(v[j]);
     }
     xt[i] = float2(float(a[0]), b[0]);
