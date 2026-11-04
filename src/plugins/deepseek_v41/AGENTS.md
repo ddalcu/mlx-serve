@@ -59,6 +59,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - A fused decode stage is judged against an f32 model (`decode.expectNoWorse`), not against the chain's bits: greedy
   texts diverge from the chain's at bf16 near-ties. Two dependent stages merged into one ticket-ordered dispatch
   measured slower than the pair (their threadgroup shapes differ): keep one dispatch a stage.
+- Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
+  interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
 ## Streamed packs (`experts.bin`)
 - M5 and newer only (`naxAvailable`), refused by name below, as are GLM-5.3's EXL3 repacks: the prompt GEMMs are built
