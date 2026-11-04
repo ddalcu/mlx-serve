@@ -22,7 +22,7 @@ INT_MAX = np.iinfo(np.int32).max
 BF16_STORE_FLOOR = 2.0e-3
 
 def zig_metal(name: str, path: str | None = None) -> str:
-    text = open(path or os.path.join(ROOT, "src/transformer.zig")).read()
+    text = open(path or os.path.join(ROOT, "src/engines/mlx/transformer.zig")).read()
     start = text.find("const " + name + " =")
     if start < 0:
         raise RuntimeError("missing kernel " + name)
@@ -36,7 +36,7 @@ def zig_metal(name: str, path: str | None = None) -> str:
 
 
 def nax_source() -> str:
-    return open(os.path.join(ROOT, "src/kernels/qsa_nax.metal")).read()
+    return open(os.path.join(ROOT, "src/plugins/qwen4_exp/kernels/qsa_nax.metal")).read()
 
 
 def f32_out(src: str) -> str:
@@ -57,7 +57,7 @@ def kernel(kind: str, terms: int = 3, out_f32: bool = True):
         return _KERNELS[key]
     if kind == "nax":
         src = nax_source()
-        header = open(os.path.join(ROOT, "src/kernels/qsa_nax_header.metal")).read()
+        header = open(os.path.join(ROOT, "src/plugins/qwen4_exp/kernels/qsa_nax_header.metal")).read()
         header = header.replace("PV_TERMS = 2", f"PV_TERMS = {terms}")
         if terms == 3:
             header = header.replace("using PT = half;", "using PT = bfloat;")

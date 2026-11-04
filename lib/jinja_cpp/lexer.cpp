@@ -75,6 +75,19 @@ lexer_result lexer::tokenize(const std::string & source) {
                 }
                 // add escaped char
                 char escaped_char = src[pos++];
+                // `\xHH` is Python's code point U+00HH, emitted as UTF-8 (Flint's template strips "\x00").
+                if (escaped_char == 'x' && pos + 1 < src.size() && std::isxdigit((unsigned char) src[pos]) &&
+                    std::isxdigit((unsigned char) src[pos + 1])) {
+                    const int cp = std::stoi(src.substr(pos, 2), nullptr, 16);
+                    if (cp < 0x80) {
+                        str += (char) cp;
+                    } else {
+                        str += (char) (0xC0 | (cp >> 6));
+                        str += (char) (0x80 | (cp & 0x3F));
+                    }
+                    pos += 2;
+                    continue;
+                }
                 if (escape_chars.find(escaped_char) == escape_chars.end()) {
                     throw lexer_exception(std::string("unknown escape character \\") + escaped_char, source, pos);
                 }

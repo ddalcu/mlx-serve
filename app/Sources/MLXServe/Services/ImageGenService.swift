@@ -226,10 +226,9 @@ final class ImageGenService: ObservableObject {
            weights.count == request.condWeightCount {
             json["cond_weights"] = weights
         }
-        // Classifier-free guidance (base klein only — `model.supportsGuidance`
-        // gates the control, so a distilled preset's 1.0 default never reaches
-        // here as anything but the omitted-field no-op).
-        if request.guidanceScale != 1.0 { json["guidance_scale"] = request.guidanceScale }
+        // Classifier-free guidance: omitted = the backend's own default, so an
+        // explicit value (even 1.0, which turns MOSS-Image's CFG 3 off) is sent.
+        if let g = request.guidanceScale { json["guidance_scale"] = g }
         let negativePrompt = request.negativePrompt.trimmingCharacters(in: .whitespacesAndNewlines)
         if !negativePrompt.isEmpty { json["negative_prompt"] = negativePrompt }
         // Stacked style LoRAs: several `.safetensors` adapters attach at once

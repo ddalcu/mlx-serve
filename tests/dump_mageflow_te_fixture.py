@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump a MageFlow Qwen3-VL text-encoder parity fixture for src/mage_flow.zig.
+"""Dump a MageFlow Qwen3-VL text-encoder parity fixture for src/plugins/mage_flow/mage_flow.zig.
 
 Runs the pure-MLX REFERENCE (ivanfioravanti/mflux@mage-flow-mlx) text encoder in
 FP32 over a fixed prompt and writes a single safetensors the Zig oracle test

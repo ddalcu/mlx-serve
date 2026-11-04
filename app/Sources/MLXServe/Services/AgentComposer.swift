@@ -55,8 +55,8 @@ enum AgentComposer {
     }
 
     /// Same request, every stage as it arrives. `image` rides the user turn.
-    static func events(userText: String, systemPrompt: String, image: Data? = nil, appState: AppState,
-                       maxTokens: Int = 512) -> AsyncThrowingStream<Event, Error> {
+    static func events(userText: String, systemPrompt: String, images: [Data] = [], appState: AppState,
+                       maxTokens: Int = 512, reasoningEffort: String? = nil) -> AsyncThrowingStream<Event, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -68,11 +68,10 @@ enum AgentComposer {
                     }
                     await server.ensureDefaultChatModel(selectedModelPath: path)
                     continuation.yield(.sent)
-                    let user: Any = image.map {
-                        MultimodalContent.build(text: userText, images: [ChatImage(data: $0)],
-                                                serverPreprocess: MultimodalContent.wantsServerPreprocess(
-                                                    architecture: server.chatModelInfo?.architecture ?? ""))
-                    } ?? userText
+                    let user: Any = images.isEmpty ? userText
+                        : MultimodalContent.build(text: userText, images: images.map { ChatImage(data: $0) },
+                                                  serverPreprocess: MultimodalContent.wantsServerPreprocess(
+                                                      architecture: server.chatModelInfo?.architecture ?? ""))
                     let messages: [[String: Any]] = [
                         ["role": "system", "content": systemPrompt],
                         ["role": "user", "content": user],
@@ -82,6 +81,8 @@ enum AgentComposer {
                         messages: messages,
                         maxTokens: maxTokens,
                         temperature: 0.7,
+                        enableThinking: reasoningEffort != nil,
+                        reasoningEffort: reasoningEffort,
                         defaults: APIClient.RequestDefaults.from(appState.serverOptions),
                         modelId: server.chatRequestModelId(selectedPath: path))
                     for try await event in stream {

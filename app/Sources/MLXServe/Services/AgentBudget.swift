@@ -10,70 +10,38 @@ import Foundation
 /// ONE output token while the server was offering 92k of context — because the
 /// launcher had written a hardcoded `contextWindow: 32768`.
 ///
-/// So these numbers are derived from what the running server advertises
-/// (`ModelInfo.contextLength`, i.e. the server's *effective* context).
+/// So the numbers come from the running server: each chat row of `/v1/models`
+/// carries its `agent_budget` (`src/host/launch/budget.zig`, the one source).
 enum AgentBudget {
 
     struct Budget: Equatable {
         let context: Int
+        /// The response cap (thinking shares it).
         let output: Int
+        /// Room the agent keeps free before compacting, and what it keeps after.
+        let compactionReserve: Int
+        /// The agents whose context floor this window misses, with that floor;
+        /// "default" stands for every agent without a floor of its own.
+        var tooSmallFor: [String: Int] = [:]
     }
 
-    /// Used when the server isn't running yet, or is an older build that does
-    /// not report `meta.context_length`. Deliberately conservative — a CLI that
-    /// under-declares merely compacts early; one that over-declares gets a hard
-    /// 400 on an oversized prompt.
-    static let fallback = Budget(context: 32768, output: 8192)
+    /// A row from a server that pre-dates `agent_budget`. Deliberately
+    /// conservative — a CLI that under-declares merely compacts early; one
+    /// that over-declares gets a hard 400 on an oversized prompt.
+    static let fallback = Budget(context: 32768, output: 8192, compactionReserve: 8192)
 
-    /// Cap on a single response. Thinking tokens share the response budget, so
-    /// "enough for a one-shot whole-file write (8–11k measured)" was NOT enough:
-    /// a flat 16384 truncated every large `write` at 262K context and looped a
-    /// pi session for hours (2026-07-20). The budget scales with context
-    /// (context/2: thinking shares it, and one xhigh design turn on Qwen3.8
-    /// spent all of a 24k window's quarter); this cap only bounds a
-    /// degenerate runaway generation.
-    private static let maxOutput = 65536
-
-    /// The advertised context is declared to the CLI VERBATIM — no second margin.
-    ///
-    /// The server already reserved headroom before advertising: with `--ctx-size`
-    /// absent it pins at 85% of the memory ceiling once, at load time, and that
-    /// pinned number is what `clampMaxTokens` and the prompt-length guard enforce.
-    /// Discounting it again here would double-count that reserve, and would make
-    /// the CLI report a different context than the app's Settings pane shows
-    /// (opencode said 75K where the server said 77K — the report that prompted
-    /// this). The CLIs keep their prompt inside the window themselves; if one
-    /// overshoots, the server's `400 Prompt exceeds maximum context length` is
-    /// the correct, loud answer.
-    static func forServerContext(_ advertised: Int?) -> Budget {
-        guard let advertised, advertised > 0 else { return fallback }
-        let output = min(maxOutput, max(1024, advertised / 2))
-        return Budget(context: advertised, output: output)
-    }
-
-    /// Room an agent keeps free before compacting, and what it keeps after: a
-    /// quarter of the window, capped where pi's and opencode2's own 20000-token
-    /// defaults (sized for 200k windows) take over. Twin of Zig `compactionReserve`.
-    static func compactionReserve(_ context: Int) -> Int {
-        min(20000, max(1024, context / 4))
-    }
-
-    /// Below this the agent's own fixed prompt leaves every turn compacting or
-    /// truncated: Claude Code sends 40-70k before the first word (tool + MCP
-    /// schemas, skills catalogue), opencode ~8k, pi ~2k. Twin of Zig `contextFloor`.
-    static func contextFloor(agentId: String) -> Int {
-        switch agentId {
-        case "claude": return 65536
-        case "opencode", "opencode2": return 32768
-        default: return 16384
-        }
+    /// A row's `agent_budget`, or nil when the row carries none.
+    static func parse(_ json: Any?) -> Budget? {
+        guard let o = json as? [String: Any], let context = o["context"] as? Int, context > 0,
+              let output = o["output"] as? Int, let reserve = o["compaction_reserve"] as? Int else { return nil }
+        return Budget(context: context, output: output, compactionReserve: reserve,
+                      tooSmallFor: o["too_small_for"] as? [String: Int] ?? [:])
     }
 
     /// Alert text, or nil when the window is enough.
-    static func contextWarning(agentId: String, context: Int) -> String? {
-        let floor = contextFloor(agentId: agentId)
-        guard context > 0, context < floor else { return nil }
-        return L10n.formatUngrouped("The model advertises a %lld-token context; %@ needs %lld+ to work well. Raise Context size in Settings ▸ Server, or expect compaction and truncated turns.", context, agentId, floor)
+    static func contextWarning(agentId: String, budget: Budget) -> String? {
+        guard let floor = budget.tooSmallFor[agentId] ?? budget.tooSmallFor["default"] else { return nil }
+        return L10n.formatUngrouped("The model advertises a %lld-token context; %@ needs %lld+ to work well. Raise Context size in Settings ▸ Server, or expect compaction and truncated turns.", budget.context, agentId, floor)
     }
 }
 
@@ -102,7 +70,7 @@ struct AgentModelEntry: Equatable {
             guard chat, !m.name.isEmpty, seen.insert(m.name).inserted else { continue }
             out.append(AgentModelEntry(
                 id: m.name,
-                budget: AgentBudget.forServerContext(m.contextLength),
+                budget: m.agentBudget ?? AgentBudget.fallback,
                 vision: m.supportsVision || m.capabilities.contains("vision")))
         }
         return out
@@ -206,7 +174,7 @@ enum AgentConfigs {
         // written by mlx-serve — live model list for the `mlx` provider.
         // Regenerated at each launch; edits here are overwritten.
         const API_KEY = "\(apiKey)";
-        const FALLBACK_CONTEXT = 32768;
+        const FALLBACK_BUDGET = { context: \(AgentBudget.fallback.context), output: \(AgentBudget.fallback.output) };
         const COMPAT = {
           supportsDeveloperRole: false,
           supportsReasoningEffort: true,
@@ -231,10 +199,8 @@ enum AgentConfigs {
                 return caps.length === 0 || caps.includes("chat");
               })
               .map((row) => {
-                const meta = row.meta || {};
-                const ctx = meta.context_length > 0 ? meta.context_length : FALLBACK_CONTEXT;
-                // Mirrors AgentBudget.forServerContext — keep the two in sync.
-                const maxTokens = Math.min(65536, Math.max(1024, Math.floor(ctx / 2)));
+                // The server's numbers (`agent_budget`); an older server's row gets the fallback.
+                const budget = row.agent_budget || FALLBACK_BUDGET;
                 const image = Array.isArray(row.input_modalities) && row.input_modalities.includes("image");
                 return {
                   id: row.id,
@@ -242,8 +208,8 @@ enum AgentConfigs {
                   reasoning: true,
                   input: image ? ["text", "image"] : ["text"],
                   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-                  contextWindow: ctx,
-                  maxTokens: maxTokens,
+                  contextWindow: budget.context,
+                  maxTokens: budget.output,
                   compat: COMPAT,
                   thinkingLevelMap: \(piThinkingLevelMap),
                 };
@@ -303,14 +269,13 @@ enum AgentConfigs {
         let models = list.map { e -> String in
             let attachment = e.vision ? " \"attachment\": true," : ""
             return "\"\(e.id)\": { \"name\": \"\(e.id) (mlx-serve)\",\(attachment) "
-                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(AgentBudget.compactionReserve(e.budget.context)) }, "
+                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(e.budget.compactionReserve) }, "
                 + opencodeReasoning + " }"
         }.joined(separator: ",\n        ")
         let pinned = pinModel ? "\n  \"model\": \"mlx/\(defaultModel)\"," : ""
         var compactionBlock = ""
         if compaction {
-            let ctx = list.first { $0.id == defaultModel }?.budget.context ?? AgentBudget.fallback.context
-            let reserve = AgentBudget.compactionReserve(ctx)
+            let reserve = (list.first { $0.id == defaultModel }?.budget ?? AgentBudget.fallback).compactionReserve
             compactionBlock = "\n  \"compaction\": { \"buffer\": \(reserve), \"keep\": { \"tokens\": \(min(15000, reserve)) } },"
         }
         return """
@@ -349,10 +314,10 @@ enum AgentConfigs {
     /// context exceeds window - reserveTokens and keeps keepRecentTokens; its
     /// defaults (16384 / 20000) never compact a 24k window while max_tokens
     /// shrinks to 1. Twin of Zig `mergePiSettingsJson`.
-    static func piSettingsJSON(existing: String, context: Int) -> String {
+    static func piSettingsJSON(existing: String, budget: AgentBudget.Budget) -> String {
         var obj = (try? JSONSerialization.jsonObject(with: Data(existing.utf8))) as? [String: Any] ?? [:]
         var compaction = obj["compaction"] as? [String: Any] ?? [:]
-        let reserve = AgentBudget.compactionReserve(context)
+        let reserve = budget.compactionReserve
         compaction["reserveTokens"] = min(16384, reserve + 4096)
         compaction["keepRecentTokens"] = reserve
         obj["compaction"] = compaction
@@ -527,6 +492,44 @@ enum AgentConfigs {
         fi
         if [ -z "$CODEX_BIN" ]; then echo "codex is not installed: npm install -g @openai/codex, or install the ChatGPT app"; exit 127; fi
         """
+
+    /// Local models lack registry instructions: ship the current base_instructions
+    /// instead of codex's stale fallback; MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off|0
+    /// drops the override. A function, not a split variable: zsh never word-splits.
+    static func codexLaunchGate(args: String) -> String {
+        let off = "[ \"${MLX_SERVE_CODEX_MODEL_INSTRUCTIONS:-}\" = off ] || [ \"${MLX_SERVE_CODEX_MODEL_INSTRUCTIONS:-}\" = 0 ]"
+        let file = "$HOME/.mlx-serve/codex/model-instructions.md"
+        return """
+            if \(off); then
+            codex_launch() { "$CODEX_BIN" \(args) "$@"; }
+            else
+            codex_launch() { if [ -f "\(file)" ]; then "$CODEX_BIN" \(args) -c "model_instructions_file=\"\(file)\"" "$@"; else "$CODEX_BIN" \(args) "$@"; fi; }
+            fi
+            """
+    }
+
+    /// The app bundle's copy (app/build.sh), else the repo's `src/assets/` in
+    /// dev and tests (the AgentSkills.sourceDir resolution trick).
+    static func codexInstructionsText() -> String? {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("src/assets/codex_model_instructions.md")
+        return [Bundle.main.resourceURL?.appendingPathComponent("codex/model-instructions.md"), repo]
+            .compactMap { $0 }
+            .first { FileManager.default.fileExists(atPath: $0.path) }
+            .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+    }
+
+    /// A shell block that lands the instructions file for a pasted script that
+    /// has no bundle to read; nil when the resource is missing.
+    static func codexInstructionsSetup() -> String? {
+        guard let text = codexInstructionsText() else { return nil }
+        return "mkdir -p ~/.mlx-serve/codex\ncat > ~/.mlx-serve/codex/model-instructions.md <<'MLX_CODEX_PROMPT_EOF'\n\(text)\nMLX_CODEX_PROMPT_EOF\n"
+    }
 
     /// aider model metadata (litellm's registry format) — tells aider the
     /// real context window of every `openai/<id>` model so its budgeting and

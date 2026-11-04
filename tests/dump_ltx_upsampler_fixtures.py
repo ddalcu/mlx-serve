@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump LTX-2 LATENT-UPSAMPLER parity fixtures (.raw) for the Zig oracle test in src/ltx_video.zig.
+"""Dump LTX-2 LATENT-UPSAMPLER parity fixtures (.raw) for the Zig oracle test in src/plugins/ltx/video.zig.
 
 Runs the ltx_core_mlx REFERENCE ``LatentUpsampler`` (spatial x2) on a fixed
 random latent and writes byte-exact golden tensors that `zig build test`
@@ -7,7 +7,7 @@ compares the Zig ``upsampleLatentX2`` port against (cosine parity > 0.999).
 
 USER-RUN: install the reference package (`ltx_core_mlx`, MLX) from a
 ltx-2-mlx checkout. NOT run in CI; the hermetic groupNorm/pixelShuffle unit
-tests in src/ltx_video.zig cover the port's math without it.
+tests in src/plugins/ltx/video.zig cover the port's math without it.
 
 Usage:
     python3 tests/dump_ltx_upsampler_fixtures.py <spatial_upscaler_x2_v1_1.safetensors> [OUT_DIR]

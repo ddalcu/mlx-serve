@@ -1,0 +1,18 @@
+MLX #4723 added `sdpa_split`, a Metal kernel for 2 to 8 query tokens whose stacked rows (tokens times query heads
+per KV head) fall between 33 and 128. At kL >= 128 it returns results about 300x less accurate than the vector
+kernels it replaced (max error against a float64 reference 3e-2 to 4e-2, against 1e-4), at head_dim 64, 96, 128,
+192 and 256, causal or unmasked: ml-explore/mlx#4808. This keeps the vector kernels and the full-attention kernel
+on those calls, which is what v0.32.3 ran. Drop the patch when upstream fixes the kernel.
+
+--- a/mlx/backend/metal/scaled_dot_product_attention.cpp
++++ b/mlx/backend/metal/scaled_dot_product_attention.cpp
+@@ -50,7 +50,8 @@ bool use_split(
+     int window_size,
+     bool output_logsumexp,
+     Stream s) {
+-  if (s.device != Device::gpu) {
++  // Off: sdpa_split (#4723) is ~300x less accurate than the vector kernels it replaces (ml-explore/mlx#4808).
++  if (s.device != Device::gpu || true) {
+     return false;
+   }
+   const int D = q.shape(-1);

@@ -58,11 +58,12 @@ private let bytesPerGiB: Double = 1_073_741_824
 
 /// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
 /// `largest` is a RAM tier — the biggest models this app runs (Qwen 3.8
-/// Flash-Next, DeepSeek-V4-Flash on the native MLX arch), grouped by "needs a
-/// very large Mac" rather than vendor.
+/// Flash-Next, DeepSeek-V4-Flash and V4.1-Flash on the native MLX arch),
+/// grouped by "needs a very large Mac" rather than vendor.
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
+    case liquid = "Liquid"
     case largest = "Largest models"
 }
 
@@ -180,6 +181,22 @@ struct RecommendedModelPick: Identifiable, Hashable {
 /// The fixed pool of picks the Recommended pane draws from, as static
 /// members on the type itself so the catalogs below can use plain
 /// dot-shorthand (`.gemmaE4B`).
+extension RecommendedModelPick {
+    static let lfm3_1_7b = lfm3(id: "lfm3-1.7b", name: "LFM3 1.7B", tagline: "Tiny and quick",
+        blurb: "Liquid's small text model: answers in a blink, thinks before it answers, and calls tools. A good fit for quick questions on any Mac.",
+        repo: "LiquidAI/LFM3-1.7B-MLX-8bit", sizeGB: 1.9, context: 262_144)
+    static let lfm3Omni2b = lfm3(id: "lfm3-omni-2b", name: "LFM3 Omni 2B", tagline: "Sees, hears and speaks",
+        blurb: "Everything at once: pictures, video and your voice in, text or its own voice out. Native voice mode in a model under 3 GB.",
+        repo: "LiquidAI/LFM3-Omni-2B-MLX-8bit", sizeGB: 2.9, context: 128_000)
+
+    private static func lfm3(id: String, name: String, tagline: String, blurb: String, repo: String,
+                             sizeGB: Double, context: Int) -> RecommendedModelPick {
+        RecommendedModelPick(id: id, name: name, tagline: tagline, blurb: blurb, repoId: repo, sizeGB: sizeGB,
+                             family: .liquid, intelligence: 15, intelligenceIsEstimated: true, speed: 85,
+                             contextTokens: context, activeParamsB: 1.7)
+    }
+}
+
 extension RecommendedModelPick {
     static let gemmaE4B = RecommendedModelPick(
         id: "gemma-4-e4b",
@@ -386,6 +403,33 @@ extension RecommendedModelPick {
         ramOverrideGB: 104.0
     )
 
+    /// DeepSeek-V4.1-Flash in our iQ-MLX 3.0 bpw pack on the native
+    /// `deepseek_v41` arch: 224 GB of weights resident plus the 203 GB Engram
+    /// table, read from disk as it runs (427 GB download). The RAM gate is the
+    /// load's measured ~213 GB wired peak: a 256 GB Mac, not a 192 GB one.
+    ///
+    /// `intelligence` is ESTIMATED (no index entry): the top of the scale, on
+    /// the maintainer's call. `activeParamsB` is read off config.json (6 of
+    /// 384 experts + 1 shared, ~16B). `speed` is scored with its draft stages:
+    /// DSpark ships in the pack and runs by default, and the maintainer puts it
+    /// level with Flash-Next; no M4 Max holds it to measure.
+    static let deepseekV41Flash = RecommendedModelPick(
+        id: "deepseek-v41-flash",
+        name: "DeepSeek-V4.1-Flash",
+        tagline: "Our smartest model, for 256 GB",
+        blurb: "DeepSeek's newest frontier model, running natively on Apple Silicon through MLX, for top-tier reasoning, coding and agent work. It wakes only a fraction of itself per word (mixture of experts), holds around a million words of context, and reads images. This is our own iQ-MLX conversion at 3 bits per weight: about 224 GB that stays in memory plus a 203 GB lookup table read from disk as it runs, so it wants a Mac with 256 GB of memory and the 427 GB download on a fast SSD (raise the GPU wired limit and close other apps to fit a useful context).",
+        repoId: "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw",
+        sizeGB: 427.3,
+        family: .largest,
+        intelligence: 100,
+        intelligenceIsEstimated: true,
+        speed: qwen38FlashNext.speed,
+        speedIsWithMtp: true,
+        contextTokens: 1_048_576,
+        activeParamsB: 16.0,
+        ramOverrideGB: 215.0
+    )
+
     /// Our own MLX-Serve pack of the 3.6 35B-A3B with the MTP head in the
     /// checkpoint. `speed` is the bench's MTP cell (259 tok/s on an M4 Max,
     /// 26.9.2) — the fastest model in this list by a wide margin.
@@ -433,37 +477,34 @@ extension RecommendedModelPick {
         ramOverrideGB: 78.0
     )
 
-    /// Qwen 3.8 Flash-Next in the Sushi project's packs (beamster): routed experts
+    /// Qwen 3.8 Flash-Next in the Sushi project's 2bpw pack (beamster): routed experts
     /// in EXL3, served through lib/sushi. Scores are Flash-Next's own (the bars
     /// describe the original weights), context is the checkpoint's YaRN 1M, and
-    /// the RAM gate is Sushi's README figure for a full 128k context (GiB).
-    static let sushi2bpw = sushi("2", sizeGB: 69.6, ramGB: 41.7, macGB: 48)
-    static let sushi3bpw = sushi("3", sizeGB: 85.0, ramGB: 56.1, macGB: 64)
-
-    private static func sushi(_ bpw: String, sizeGB: Double, ramGB: Double, macGB: Int) -> RecommendedModelPick {
-        RecommendedModelPick(
-            id: "sushi-\(bpw)bpw",
-            name: "Qwen Flash-Next Sushi \(bpw)bpw",
-            tagline: "EXL3 Variant for \(macGB) GB Macs",
-            blurb: "The same 125 billion parameter Qwen 3.8 Flash-Next, packed by the Sushi project to about \(bpw) bits per weight so it fits a Mac with \(macGB) GB of memory. Fewer bits means a smaller download and less memory, at a small cost in answer quality. Part of the download is a lookup table that stays on disk while it runs.",
-            repoId: "beamster/Qwen3.8-Flash-Next-Sushi-\(bpw)bpw",
-            sizeGB: sizeGB,
-            family: .largest,
-            intelligence: qwen38FlashNext.intelligence,
-            intelligenceIsEstimated: true,
-            speed: qwen38FlashNext.speed,
-            speedIsWithMtp: true,
-            contextTokens: 1_048_576,
-            activeParamsB: 6.0,
-            ramOverrideGB: ramGB
-        )
-    }
+    /// the RAM gate is Sushi's README figure for a full 128k context (GiB). Its
+    /// tier is a stock 64 GB Mac: on 48 GB it needs a raised `iogpu.wired_limit_mb`,
+    /// which the app cannot set, and the 3bpw pack does not fit a stock 64 GB Mac.
+    static let sushi2bpw = RecommendedModelPick(
+        id: "sushi-2bpw",
+        name: "Qwen Flash-Next Sushi 2bpw",
+        tagline: "EXL3 Variant for 64 GB Macs",
+        blurb: "The same 125 billion parameter Qwen 3.8 Flash-Next, packed by the Sushi project to about 2 bits per weight so it fits a Mac with 64 GB of memory. Fewer bits means a smaller download and less memory, at a small cost in answer quality. Part of the download is a lookup table that stays on disk while it runs.",
+        repoId: "beamster/Qwen3.8-Flash-Next-Sushi-2bpw",
+        sizeGB: 69.6,
+        family: .largest,
+        intelligence: qwen38FlashNext.intelligence,
+        intelligenceIsEstimated: true,
+        speed: qwen38FlashNext.speed,
+        speedIsWithMtp: true,
+        contextTokens: 1_048_576,
+        activeParamsB: 6.0,
+        ramOverrideGB: 41.7
+    )
 
 }
 
 extension RecommendedModelPick {
-    /// Gemma 4 picks, ascending by size — one of the Recommended pane's two
-    /// family sections.
+    /// Gemma 4 picks, ascending by size: the welcome screen's General picks
+    /// and the small-Mac starter tiers. Not a section of the Recommended pane.
     static let gemmaCatalog: [RecommendedModelPick] = [
         .gemmaE4B, .gemma12B, .gemma26bA4b, .gemma31B, .gemma26bA4b8bit,
     ]
@@ -477,17 +518,22 @@ extension RecommendedModelPick {
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's
-    /// smallest-first convention) — Qwen 3.8 Flash-Next (~100 GB) then
-    /// DeepSeek-V4-Flash (~130 GB). Grouped by "needs a very large Mac"
-    /// rather than by vendor.
+    /// smallest-first convention) — Qwen 3.8 Flash-Next (~100 GB),
+    /// DeepSeek-V4-Flash (~130 GB) then V4.1-Flash (~430 GB). Grouped by
+    /// "needs a very large Mac" rather than by vendor.
     static let largestCatalog: [RecommendedModelPick] = [
-        .sushi2bpw, .sushi3bpw, .qwen38FlashNext, .deepseekV4Flash,
+        .sushi2bpw, .qwen38FlashNext, .deepseekV4Flash, .deepseekV41Flash,
     ]
 
-    /// Every curated pick, across all three sections — the union the score
-    /// invariants sweep and the one list a new section can't slip past.
+    /// Liquid LFM3, the Recommended pane's first section: the small text model and the Omni that sees, hears and
+    /// speaks (native voice, the composer's purple toggle). One trunk (1.7B active) under both; speed is estimated
+    /// from its weight bytes (no M4 Max cell yet), intelligence is ours (no Artificial Analysis entry).
+    static let liquidCatalog: [RecommendedModelPick] = [lfm3_1_7b, lfm3Omni2b]
+
+    /// Every curated pick: the pane's sections plus the Gemma picks the welcome screen and the starter offer —
+    /// the union the score invariants sweep and the one list a new section can't slip past.
     static let allCatalogs: [RecommendedModelPick] =
-        gemmaCatalog + qwenCatalog + largestCatalog
+        gemmaCatalog + qwenCatalog + liquidCatalog + largestCatalog
 
     // MARK: - The starter recommendation
 

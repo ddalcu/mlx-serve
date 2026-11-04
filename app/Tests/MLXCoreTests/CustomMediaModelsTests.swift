@@ -64,6 +64,55 @@ final class CustomMediaModelsTests: XCTestCase {
                        ["me/mesh-custom"])
     }
 
+    func testATrellis2PackOnDiskJoinsThe3DPaneAsItsOwnFamily() {
+        let models = [
+            info("me/trellis2-local", arch: "trellis2", caps: ["3d"]),
+            info("me/mesh-custom", arch: "hunyuan3d_2_1", caps: ["3d"]),
+        ]
+        let presets = CustomMediaModels.meshPresets(from: models)
+        XCTAssertEqual(presets.map(\.id), ["me/mesh-custom", "me/trellis2-local"])
+        XCTAssertEqual(presets.first { $0.id == "me/trellis2-local" }?.family, .trellis2)
+        XCTAssertEqual(presets.first { $0.id == "me/mesh-custom" }?.family, .hunyuan3d)
+        // The download bundle follows the family: its markers are the pack's own files.
+        let b = CustomMediaModels.bundle(arch: "trellis2", repoId: "me/trellis2-local")
+        XCTAssertTrue(b?.components[0].readyMarkers.contains("pipeline.json") ?? false)
+        XCTAssertFalse(b?.components[0].readyMarkers.contains("dit.safetensors") ?? true)
+    }
+
+    func testAnIdolPackOnDiskJoinsThe3DPaneAsItsOwnFamily() {
+        let models = [info("me/idol-local", arch: "idol", caps: ["3d"])]
+        XCTAssertEqual(CustomMediaModels.meshPresets(from: models).first?.family, .idol)
+        let markers = CustomMediaModels.bundle(arch: "idol", repoId: "me/idol-local")?.components[0].readyMarkers
+        XCTAssertEqual(markers?.contains("vae/model.safetensors"), true)
+        XCTAssertEqual(markers?.contains("birefnet.safetensors"), true)
+    }
+
+    func testAPixal3DPackOnDiskJoinsThe3DPaneAsItsOwnFamily() {
+        let models = [info("me/pixal3d-local", arch: "pixal3d", caps: ["3d"])]
+        XCTAssertEqual(CustomMediaModels.meshPresets(from: models).first?.family, .pixal3d)
+        let markers = CustomMediaModels.bundle(arch: "pixal3d", repoId: "me/pixal3d-local")?.components[0].readyMarkers
+        XCTAssertTrue(markers?.contains("naf/model.safetensors") ?? false)
+    }
+
+    func testTrellis2BundleReadsReadyOnlyWithTheFilesTheServerNeeds() {
+        let b = Model3DModelPreset.trellis2Family.asCustom(id: "me/t2").bundle
+        XCTAssertEqual(b.components.count, 1)
+        let comp = b.components[0]
+        XCTAssertTrue(comp.selection.recursive)
+        // The server's own completeness marker, the gated encoder and the 1024 cascade.
+        for marker in ["pipeline.json",
+                       "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
+                       "dinov3/model.safetensors",
+                       "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+                       "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+                       "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+                       "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+                       "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors",
+                       "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"] {
+            XCTAssertTrue(comp.readyMarkers.contains(marker), "missing readyMarker \(marker)")
+        }
+    }
+
     /// The server gates Mage-Flow edit capability on the DIRECTORY NAME
     /// (`dirIsEdit`: "mage-flow-edit"/"mageflow-edit", case-insensitive) — the
     /// checkpoints are byte-identical, so the id is the only signal. The
@@ -79,6 +128,18 @@ final class CustomMediaModelsTests: XCTestCase {
         XCTAssertEqual(presets.first { $0.id == "me/My-Mage-Flow-Edit-4bit" }?.variant, .mageFlowEditTurbo)
         XCTAssertEqual(presets.first { $0.id == "me/mageflow-edit-tuned" }?.variant, .mageFlowEditTurbo)
         XCTAssertEqual(presets.first { $0.id == "me/mage-flow-plain" }?.variant, .mageFlowTurbo)
+    }
+
+    /// `/v1/models` cannot tell Qwen-Image-2.1 from its Turbo (the server reads the
+    /// pack's `sample_sigmas`), so the dir name picks the family, as for Mage-Flow Edit.
+    func testQwenImageTurboIsKeyedOnTheDirName() {
+        let models = [
+            info("Qwen-Image-2.1-Turbo", arch: "qwen_image21", caps: ["image"]),
+            info("Qwen-Image-2.1", arch: "qwen_image21", caps: ["image"]),
+        ]
+        let presets = CustomMediaModels.imagePresets(from: models)
+        XCTAssertEqual(presets.first { $0.id == "Qwen-Image-2.1-Turbo" }?.variant, .qwenImage21Turbo)
+        XCTAssertEqual(presets.first { $0.id == "Qwen-Image-2.1" }?.variant, .qwenImage21)
     }
 
     // MARK: - What gets a row

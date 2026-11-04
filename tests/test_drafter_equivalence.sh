@@ -1,23 +1,11 @@
 #!/bin/bash
-# Gemma 4 assistant drafter byte-equivalence test.
+# test_drafter_equivalence.sh — the Gemma 4 assistant drafter is byte-equivalent at temp 0 to no drafter, and a
+# seeded sampled request replays byte-identical x3 under the drafter.
 #
-# Verifies that running the same temp=0 chat completion request against the
-# server with --drafter <dir> produces *identical* output text to running it
-# without --drafter. The drafter is Gemma 4-specific, so the target must be
-# a Gemma 4 checkpoint paired with the matching assistant drafter.
+#   DRAFTER_TEST_TARGET=<gemma-4 dir> DRAFTER_TEST_DRAFTER=<assistant dir> ./tests/test_drafter_equivalence.sh [port]
 #
-# Default pair (Apple Silicon, ~3.3 GB peak RSS):
-#   target  = ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit
-#   drafter = ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16
-#
-# Override with env vars:
-#   DRAFTER_TEST_TARGET=/path/to/gemma-4-target
-#   DRAFTER_TEST_DRAFTER=/path/to/gemma-4-{E2B,E4B,...}-it-assistant-bf16
-#
-# Usage:
-#   ./tests/test_drafter_equivalence.sh [port]
-#
-# Exits 0 with a SKIP message if either checkpoint is missing.
+# Defaults gemma-4-e4b-it-8bit + gemma-4-E4B-it-assistant-bf16; SKIPs when either is missing.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -e
 
@@ -28,8 +16,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-TARGET="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
-DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
+TARGET="${DRAFTER_TEST_TARGET:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
+DRAFTER="${DRAFTER_TEST_DRAFTER:-$(find_model mlx-community/gemma-4-E4B-it-assistant-bf16 || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16")}"
 
 if [ ! -d "$TARGET" ]; then
     echo -e "${YELLOW}SKIP${NC} test_drafter_equivalence: target directory not found ($TARGET)."
@@ -116,15 +104,19 @@ run_request() {
         rm -f "$logfile"
         return 1
     fi
+    # REPEATS > 1 sends the payload again on the same server; outputs are joined by a `---` line.
     local body
-    body=$(echo "$JSON_PAYLOAD" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions")
+    body=$(for _ in $(seq 1 "${REPEATS:-1}"); do
+        echo "$JSON_PAYLOAD" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
+        echo ---
+    done)
     # Surface drafter acceptance stats from the server log so the test
     # operator can see whether the verify path actually ran.
     grep -E "drafter accept=|Drafter ready" "$logfile" 2>/dev/null | sed 's/^/    /' >&2 || true
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
     rm -f "$logfile"
-    echo "$body" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])"
+    echo "$body"
 }
 
 echo "== Drafter byte-equivalence test =="
@@ -146,7 +138,6 @@ echo "  with-drafter output captured ($(echo "$OUT_DRAFTER" | wc -c) bytes)"
 
 if [ "$OUT_NODRAFTER" = "$OUT_DRAFTER" ]; then
     echo -e "${GREEN}PASS${NC} byte-identical output with vs without --drafter"
-    exit 0
 else
     echo -e "${RED}FAIL${NC} outputs differ:"
     echo "  --no-drafter:"
@@ -154,5 +145,20 @@ else
     echo "  --drafter:"
     echo "$OUT_DRAFTER" | sed 's/^/    /'
     diff <(echo "$OUT_NODRAFTER") <(echo "$OUT_DRAFTER") | sed 's/^/    /'
+    exit 1
+fi
+
+# A seeded SAMPLED request replays byte-for-byte under the drafter: the verify round's
+# bonus/residual draw is keyed like every other draw.
+sleep 2
+JSON_PAYLOAD=$(echo "$JSON_PAYLOAD" | python3 -c "import sys, json; d = json.load(sys.stdin); d.update(temperature=0.8, seed=1001); print(json.dumps(d))")
+OUT_SEEDED=$(REPEATS=3 run_request "with --drafter, seeded x3" --drafter "$DRAFTER") || exit 1
+DISTINCT=$(echo "$OUT_SEEDED" | python3 -c "import sys; print(len(set(p.strip() for p in sys.stdin.read().split('\n---\n') if p.strip())))")
+if [ "$DISTINCT" = "1" ]; then
+    echo -e "${GREEN}PASS${NC} a seeded sampled request replays byte-identical under --drafter (3 runs)"
+    exit 0
+else
+    echo -e "${RED}FAIL${NC} seeded sampled request gave $DISTINCT distinct outputs under --drafter:"
+    echo "$OUT_SEEDED" | sed 's/^/    /'
     exit 1
 fi

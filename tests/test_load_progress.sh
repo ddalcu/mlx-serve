@@ -1,16 +1,17 @@
 #!/usr/bin/env bash
-# `GET /v1/load-progress` (`src/load_progress.zig`): a headless server answers an empty list; a
-# GPU load shows `reading_weights` (bytes) and a Neural Engine load `ane_programs` (programs), each
-# with a total and progress that moves, and the list is empty once the model is ready. `/props`
-# `registry_generation` moves with the load, so a client knows to re-read `/v1/models`. A POST
-# naming a model loads nothing; a `--model` boot answers `/health` (503 `loading`) and the progress
-# while its startup load runs.
+# test_load_progress.sh — GET /v1/load-progress: a headless server lists nothing; a GPU load is seen mid
+# `reading_weights` (bytes) and a Neural Engine load mid `ane_programs` (programs), each with a total and a count that
+# climbs, and the list empties once ready; `/props` registry_generation moves with the load; a POST naming a model
+# loads nothing; a `--model` boot answers /health 503 `loading` and the progress while it loads.
 #
-# Scratch HOME (the Neural Engine opt-in goes in its model-settings.json); the ANE compile cache
-# stays the real one. SKIPs without the packs; the ANE half without the private framework.
+#   ./tests/test_load_progress.sh [port]   # LOAD_PROGRESS_MODEL (Qwen3.8-27B, else Qwen3.5-4B),
+#                                          # LOAD_PROGRESS_ANE_MODEL (Qwen3.5-0.8B)
 #
-# Usage: ./tests/test_load_progress.sh [port]
+# Scratch HOME (the ANE opt-in goes in its model-settings.json); the ANE compile cache stays the real one. SKIPs
+# without the packs; the ANE half without the private framework. Hermetic twin: host/registry/load_progress.zig tests.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11387}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -44,11 +45,7 @@ boot() { # boot <model dir root>: headless, the root discovered
     : >"$LOG"
     HOME="$FAKE_HOME" "$BIN" --serve --model-dir "$1" --host 127.0.0.1 --port "$PORT" --log-level info --log-file off >"$LOG" 2>&1 &
     SRV=$!
-    for _ in $(seq 1 240); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-        kill -0 "$SRV" 2>/dev/null || break
-        sleep 0.5
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 240 0.5 "$SRV" && return 0
     echo "FAIL: server never became healthy"; tail -5 "$LOG"; exit 1
 }
 # watch <model path> <out>: load it in the background, recording /v1/load-progress every 50 ms.

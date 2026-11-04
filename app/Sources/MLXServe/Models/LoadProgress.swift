@@ -1,6 +1,6 @@
 import Foundation
 
-/// One model's load as `GET /v1/load-progress` reports it (`src/load_progress.zig`): a GPU load
+/// One model's load as `GET /v1/load-progress` reports it (`src/host/registry/load_progress.zig`): a GPU load
 /// reads weights (bytes), a Neural Engine load builds programs (compiled, or restored from its
 /// compile cache), and both end warming up.
 struct LoadProgress: Equatable {

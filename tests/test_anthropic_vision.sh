@@ -7,10 +7,11 @@
 # Cause: handleAnthropicMessages only handled `tool_result` and `text` blocks
 # in user content arrays — `image` blocks were silently dropped, so the encoder
 # never saw the picture and the model guessed.
+source "$(dirname "$0")/_lib_models.sh"
 
 set -u
 
-MODEL_DIR=${1:-~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}
+MODEL_DIR="${1:-$(find_model mlx-community/gemma-4-e4b-it-8bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit")}"
 PORT=${2:-8099}
 BASE="http://127.0.0.1:$PORT"
 PASS=0

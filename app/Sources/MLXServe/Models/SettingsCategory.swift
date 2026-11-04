@@ -46,7 +46,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     var title: String {
         switch self {
         case .server:            return "Server"
-        case .lanSharing:        return "LAN Sharing"
+        case .lanSharing:        return "Cluster"
         case .providers:         return "Providers"
         case .memory:            return "Memory"
         case .performance:       return "Performance"
@@ -77,7 +77,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     var icon: String {
         switch self {
         case .server:            return "server.rack"
-        case .lanSharing:        return "antenna.radiowaves.left.and.right"
+        case .lanSharing:        return "point.3.connected.trianglepath.dotted"
         case .providers:         return "cloud"
         case .memory:            return "memorychip"
         case .performance:       return "speedometer"

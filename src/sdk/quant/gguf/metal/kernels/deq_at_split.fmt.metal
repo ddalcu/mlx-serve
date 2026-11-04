@@ -1,0 +1,1 @@
+#define DEQ_AT(w, row, blk, u, o) {{ if constexpr (SPLIT) deq_{s}_split((w) + size_t(row) * ROWB + NB * {d} + (blk) * {d}, (w) + size_t(row) * ROWB + (blk) * {d}, u, o); else deq_{s}((w) + (size_t(row) * NB + (blk)) * BB, u, o); }}

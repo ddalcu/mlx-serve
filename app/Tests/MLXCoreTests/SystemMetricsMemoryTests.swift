@@ -13,7 +13,7 @@ final class SystemMetricsMemoryTests: XCTestCase {
         // free_count already contains speculative, and it is file-backed inside external.
         XCTAssertEqual(
             SystemMetrics.computeAvailableForModel(totalBytes: 128 * gib, freePages: 8 * ppg,
-                speculativePages: 2 * ppg, externalPages: 26 * ppg, wirePages: 83 * ppg,
+                speculativePages: 2 * ppg, externalPages: 26 * ppg, purgeablePages: 0, wirePages: 83 * ppg,
                 compressorPages: 1 * ppg, pageSize: page),
             32 * gib)
     }
@@ -24,7 +24,7 @@ final class SystemMetricsMemoryTests: XCTestCase {
         // wired pages (GPU, shared cache) hide inside the file-backed class: the cap binds.
         XCTAssertEqual(
             SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 6 * ppg,
-                speculativePages: 0, externalPages: 6 * ppg, wirePages: 9 * ppg,
+                speculativePages: 0, externalPages: 6 * ppg, purgeablePages: 0, wirePages: 9 * ppg,
                 compressorPages: 1 * ppg, pageSize: page),
             6 * gib)
     }
@@ -35,7 +35,7 @@ final class SystemMetricsMemoryTests: XCTestCase {
         // #45: a resident 7 GB anon model consumed the free/external pages — only 3 GB of the reclaimable classes remain.
         XCTAssertEqual(
             SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 2 * ppg,
-                speculativePages: 0, externalPages: 1 * ppg, wirePages: 3 * ppg,
+                speculativePages: 0, externalPages: 1 * ppg, purgeablePages: 0, wirePages: 3 * ppg,
                 compressorPages: 1 * ppg, pageSize: page),
             3 * gib)
     }
@@ -45,10 +45,10 @@ final class SystemMetricsMemoryTests: XCTestCase {
         let ppg = gib / page
         // failed query (total 0) → 0; the meter's never-blocks contract.
         XCTAssertEqual(SystemMetrics.computeAvailableForModel(totalBytes: 0, freePages: 1,
-            speculativePages: 1, externalPages: 1, wirePages: 1, compressorPages: 1, pageSize: page), 0)
+            speculativePages: 1, externalPages: 1, purgeablePages: 0, wirePages: 1, compressorPages: 1, pageSize: page), 0)
         // no headroom: wired + compressor filling the box → 0.
         XCTAssertEqual(SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 6 * ppg,
-            speculativePages: 0, externalPages: 6 * ppg, wirePages: 16 * ppg, compressorPages: 0, pageSize: page), 0)
+            speculativePages: 0, externalPages: 6 * ppg, purgeablePages: 0, wirePages: 16 * ppg, compressorPages: 0, pageSize: page), 0)
     }
 
     func testSpeculativeNeverUnderflows() {
@@ -57,8 +57,19 @@ final class SystemMetricsMemoryTests: XCTestCase {
         // speculative > free must not wrap; the external side carries the sum.
         XCTAssertEqual(
             SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 1 * ppg,
-                speculativePages: 5 * ppg, externalPages: 4 * ppg, wirePages: 0,
+                speculativePages: 5 * ppg, externalPages: 4 * ppg, purgeablePages: 0, wirePages: 0,
                 compressorPages: 0, pageSize: page),
             4 * gib)
+    }
+
+    func testPurgeablePagesCountAsGrantable() {
+        let page: UInt64 = 16384
+        let ppg = gib / page
+        // #932: anonymous caches the OS discards before compressing anything count like file cache.
+        XCTAssertEqual(
+            SystemMetrics.computeAvailableForModel(totalBytes: 16 * gib, freePages: 2 * ppg,
+                speculativePages: 0, externalPages: 1 * ppg, purgeablePages: 4 * ppg, wirePages: 3 * ppg,
+                compressorPages: 1 * ppg, pageSize: page),
+            7 * gib)
     }
 }

@@ -32,7 +32,7 @@ enum MtpAcceptanceChoice: String, CaseIterable {
 }
 
 /// One model's entry in `~/.mlx-serve/model-settings.json` — the file the
-/// SERVER reads (`src/model_settings.zig`) at every load of that model, so the
+/// SERVER reads (`src/host/registry/model_settings.zig`) at every load of that model, so the
 /// keys are its keys. nil = the process default. Unknown keys are kept in
 /// `extra` so a future server field survives an app-side edit.
 struct ModelOverride: Equatable {
@@ -49,8 +49,12 @@ struct ModelOverride: Equatable {
     var drafter: String?
     /// `int8_prefill`: LOSSY int8-activation prefill (2-bit Prism packs only).
     var int8Prefill: Bool?
-    /// `ane`: serve the model on the Neural Engine instead of the GPU.
+    /// `ane`: serve the model on the Neural Engine instead of the GPU. Read for
+    /// files written before `engine`; the engine picker clears it.
     var ane: Bool?
+    /// `engine`: what serves the model ("mlx", "ane", "ds4", "llama"; the row's
+    /// `engines` lists the choices). nil leaves it to the server.
+    var engine: String?
     /// `chat_template_kwargs`: variables handed to the model's Jinja template
     /// verbatim (`TemplateKwargs` types and names them).
     var templateKwargs: [String: Any] = [:]
@@ -94,6 +98,7 @@ struct ModelOverride: Equatable {
         if let a = rest.removeValue(forKey: "ane") {
             if let b = a as? Bool { ane = b }
         }
+        if let e = rest.removeValue(forKey: "engine") { engine = e as? String }
         if let kw = rest.removeValue(forKey: "chat_template_kwargs") as? [String: Any] { templateKwargs = kw }
         if let profile = rest["generation_defaults"] as? [String: Any],
            let data = try? JSONSerialization.data(withJSONObject: profile),
@@ -107,7 +112,7 @@ struct ModelOverride: Equatable {
     var isEmpty: Bool { !hasSettings && extra.isEmpty }
     /// True when any field the sheet edits is set.
     var hasSettings: Bool {
-        alias != nil || ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || mtpGreedyTail != nil || drafter != nil || int8Prefill != nil || ane != nil
+        alias != nil || ctxSize != nil || kvQuant != nil || mtp != nil || mtpAcceptance != nil || mtpGreedyTail != nil || drafter != nil || int8Prefill != nil || ane != nil || engine != nil
             || !templateKwargs.isEmpty || !generationDefaults.rules.isEmpty
     }
     var sortedKwargKeys: [String] { templateKwargs.keys.sorted() }
@@ -123,9 +128,19 @@ struct ModelOverride: Equatable {
         if let drafter { out["drafter"] = drafter }
         if let int8Prefill { out["int8_prefill"] = int8Prefill }
         if let ane { out["ane"] = ane }
+        if let engine { out["engine"] = engine }
         if !templateKwargs.isEmpty { out["chat_template_kwargs"] = templateKwargs }
         if !generationDefaults.rules.isEmpty { out["generation_defaults"] = generationDefaults.json }
         return out
+    }
+
+    /// The engine this entry asks for: `engine`, else the older `ane` switch.
+    var engineChoice: String? {
+        get { engine ?? ane.map { $0 ? "ane" : "mlx" } }
+        set {
+            engine = newValue
+            ane = nil
+        }
     }
 
     /// Mirrors the server's `validAlias`: `@` routes to a peer or provider, `/`
@@ -147,7 +162,7 @@ struct ModelOverride: Equatable {
 
     static func == (a: ModelOverride, b: ModelOverride) -> Bool {
         a.alias == b.alias && a.ctxSize == b.ctxSize && a.kvQuant == b.kvQuant && a.mtp == b.mtp && a.mtpAcceptance == b.mtpAcceptance && a.mtpGreedyTail == b.mtpGreedyTail && a.drafter == b.drafter
-            && a.int8Prefill == b.int8Prefill && a.ane == b.ane && a.generationDefaults == b.generationDefaults
+            && a.int8Prefill == b.int8Prefill && a.ane == b.ane && a.engine == b.engine && a.generationDefaults == b.generationDefaults
             && NSDictionary(dictionary: a.templateKwargs).isEqual(to: b.templateKwargs)
             && NSDictionary(dictionary: a.extra).isEqual(to: b.extra)
     }

@@ -5,10 +5,12 @@
 #
 #   ./tests/test_first_token_early.sh [port]
 #   FIRST_TOKEN_TEST_MODEL=<dir with a thinking chat model>   (default: the Qwen3.8-27B pack)
+source "$(dirname "$0")/_lib_models.sh"
 set -u
+source "$(dirname "$0")/lib/server.sh"
 PORT=${1:-8093}
 BASE="http://127.0.0.1:$PORT"
-MODEL="${FIRST_TOKEN_TEST_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit}"
+MODEL="${FIRST_TOKEN_TEST_MODEL:-$(find_model ddalcu/Qwen3.8-27B-MLX-Serve-4bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit")}"
 BINARY="${MLX_SERVE_BINARY:-./zig-out/bin/mlx-serve}"
 if [ ! -d "$MODEL" ]; then echo "SKIP test_first_token_early: $MODEL not found"; exit 0; fi
 
@@ -16,8 +18,7 @@ LOG=$(mktemp)
 "$BINARY" --model "$MODEL" --serve --port "$PORT" > "$LOG" 2>&1 &
 PID=$!
 trap 'kill $PID 2>/dev/null; wait $PID 2>/dev/null; rm -f "$LOG"' EXIT
-for _ in $(seq 1 600); do curl -sf "$BASE/health" >/dev/null && break; kill -0 $PID 2>/dev/null || break; sleep 1; done
-curl -sf "$BASE/health" >/dev/null || { echo "FAIL server did not start"; tail -20 "$LOG"; exit 1; }
+srv_wait_health "$BASE" 600 1 "$PID" || { echo "FAIL server did not start"; tail -20 "$LOG"; exit 1; }
 
 python3 - "$BASE" <<'EOF'
 import json, sys, urllib.request

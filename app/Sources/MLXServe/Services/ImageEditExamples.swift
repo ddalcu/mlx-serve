@@ -135,6 +135,25 @@ enum ImagePromptExamples {
                 """),
     ])
 
+    /// MOSS-Image's own published prompts (OpenMOSS `USERGUIDE.md` and
+    /// `README.md`), verbatim: long prose with quoted text in either language,
+    /// and a layout whose boxes are `abs_centralized` yxyx pixels of a
+    /// 1024 x 1024 canvas, last so Enhance (two per group) is never shown the
+    /// compiled form it should not write.
+    static let mossImage = ImagePromptExampleGroup(name: "MOSS-Image", examples: [
+        .init(title: "Handwritten note (Chinese text)",
+              body: """
+                A wide view of a refrigerator beside a kitchen counter with a fruit bowl. A small sticky note on the refrigerator door is handwritten in Chinese:
+                “记得买牛奶和鸡蛋！
+                牛奶两盒，鸡蛋一打。
+                顺便带一袋面包。”
+                """),
+        .init(title: "Whiteboard (Chinese text)",
+              body: "一个穿着\"MOSI\"标志的T恤的中国美女正拿着黑色的马克笔面向镜头微笑。她身后的玻璃板上手写体写着 \"一、MOSS-Image的技术路线：5B 的单流 DiT 模型，基于 Muon 训练。二、MOSS-Image的模型特色：1、复杂文字渲染。支持中英渲染、自动布局； 2、使用 Layout 进行精准图像控制，支持文字编辑和物体增减等自由编辑。三、MOSS-Image的后续发展：探索 R2I 参考生图、助力生成式AI发展。\""),
+        .init(title: "Layout poster (1024 × 1024)",
+              body: #"{"summary":{"meta":["poster"],"canvas":"single","caption":"A minimalist travel poster with a cream background, a blue mountain illustration, and the title EXPLORE at the top."},"items":[{"label":"text","caption":"Large dark-blue uppercase title centered at the top.","text":"EXPLORE","bbox":[-416,-384,-288,384]},{"label":"object","caption":"A flat blue mountain illustration in the lower center.","bbox":[-192,-288,384,288]}],"bbox_coord_space":"abs_centralized","bbox_format":"yxyx"}"#),
+    ])
+
     // MARK: Editing — the generic instructions any in-context editor handles
 
     private static let contentGroup = ImagePromptExampleGroup(name: "Content", examples: [

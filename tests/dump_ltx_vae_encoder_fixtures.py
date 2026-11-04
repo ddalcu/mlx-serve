@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dump LTX-2 VAE ENCODER parity fixtures (.raw) for the Zig oracle test in src/ltx_video.zig.
+"""Dump LTX-2 VAE ENCODER parity fixtures (.raw) for the Zig oracle test in src/plugins/ltx/video.zig.
 
 Runs the ltx_core_mlx REFERENCE ``VideoEncoder.encode`` on a fixed single-image
 (F=1) pixel tensor and writes byte-exact golden tensors that `zig build test`
@@ -14,14 +14,14 @@ the q4 bundle ships only ``vae_decoder.safetensors``; ``vae_encoder.safetensors`
 
 USER-RUN: you accept LTX-2's license, download the model, and install the
 reference package (`ltx_core_mlx`, MLX). NOT run in CI; the weights-gated
-structural test in src/ltx_video.zig covers the port without it.
+structural test in src/plugins/ltx/video.zig covers the port without it.
 
 Usage:
     python3 tests/dump_ltx_vae_encoder_fixtures.py <VAE_ENCODER.safetensors> [OUT_DIR] [H] [W]
 
 Writes (flat little-endian f32):
     pixels.raw   [1, 3, 1, H, W]   the input image tensor in [-1, 1] (BCFHW), the
-                                   EXACT input src/ltx_video.zig vaeEncode expects
+                                   EXACT input src/plugins/ltx/video.zig vaeEncode expects
     latent.raw   [1, 128, 1, H/32, W/32]  reference VideoEncoder.encode(pixels)
 
 Then it prints the `export LTX_ENC_*` block to paste before:

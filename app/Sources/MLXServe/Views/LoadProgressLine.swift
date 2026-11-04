@@ -35,8 +35,17 @@ struct LoadProgressBar: View {
 struct ModelLoadProgressRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    /// Above the composer: only while this Mac answers the chat, never a provider's or a peer's.
+    var chatTargetOnly = false
 
     var body: some View {
+        if ChatModelSelection.showsLocalLoadProgress(lanChatModelId: server.lanChatModelId, apple: appState.useAppleModel,
+                                                     chatTargetOnly: chatTargetOnly) {
+            loads
+        }
+    }
+
+    @ViewBuilder private var loads: some View {
         if let path = appState.loadingModelPath {
             LoadProgressLine(name: ModelDisplayName.pretty(URL(fileURLWithPath: path).lastPathComponent),
                              progress: LoadProgress.lookup(server.loadProgress, path: path))

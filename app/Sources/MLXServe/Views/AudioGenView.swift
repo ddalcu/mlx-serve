@@ -140,7 +140,6 @@ struct VoiceGenView: View {
     /// Created lazily on first use — never at launch (audio-graph TCC rule).
     @State private var dictation: (any SpeechRecognizing)? = nil
     @State private var dictating: Bool = false
-    @State private var dictationPartial: String = ""
     @State private var dictationError: String? = nil
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
@@ -298,15 +297,12 @@ struct VoiceGenView: View {
         Task {
             let rec = dictation ?? makeSpeechRecognizer()
             dictation = rec
-            guard await rec.requestAuthorization() else {
-                dictationError = "Microphone or speech-recognition access is off. Enable both in System Settings ▸ Privacy & Security."
+            let ready = await rec.preflight()
+            if let issue = VoicePreflight.firstIssue(ready) {
+                dictationError = VoicePreflight.detail(for: issue)
                 return
             }
-            rec.onPartialTranscript = { dictationPartial = $0 }
-            rec.onFinalTranscript = {
-                text = Dictation.appending($0, to: text)
-                dictationPartial = ""
-            }
+            rec.onFinalTranscript = { text = Dictation.appending($0, to: text) }
             rec.onError = { msg in
                 dictationError = msg
                 stopDictation()
@@ -321,10 +317,6 @@ struct VoiceGenView: View {
     }
 
     private func stopDictation() {
-        // Words spoken but not yet finalized by the silence gap land too —
-        // stopping mid-sentence must not eat them.
-        if !dictationPartial.isEmpty { text = Dictation.appending(dictationPartial, to: text) }
-        dictationPartial = ""
         dictation?.stop()
         dictating = false
     }

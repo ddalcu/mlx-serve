@@ -1,28 +1,14 @@
 #!/bin/bash
-# Plan 01 — A8 24h concurrent soak test.
+# test_soak_24h.sh — 4-way concurrent soak (`--max-concurrent 4 --kv-quant 4`): plain chat, an agent loop with
+# thinking, /v1/messages and a tool round trip run in parallel for SOAK_DURATION_HOURS (default 24). RSS/VSZ every
+# 5 min (every minute under 2 h) to tests/soak_log.csv, /health within 5 s every 30 min; FAIL when RSS drifts > 5%
+# from the first sample 3 minutes in, past warm-up (> 10% under 4 h).
 #
-# Spins up the server with `--max-concurrent 4 --kv-quant 4` and pounds it
-# with four parallel workloads for `SOAK_DURATION_HOURS` hours (default 24,
-# override via env). The workloads exercise distinct code paths so a leak
-# or crash in any of them surfaces:
-#
-#   1. Plain chat completions  — varied prompts, 50-500 max_tokens.
-#   2. Agent-loop style        — multi-turn fact recall (think tag enabled).
-#   3. Anthropic /v1/messages  — exercises the parallel API.
-#   4. Tool-calling round-trip — invokes a tool, feeds the result back.
-#
-# Every 5 minutes: record RSS / VSZ via `ps -o rss,vsz` to `tests/soak_log.csv`.
-# Every 30 minutes: assert /health returns 200 within 5s.
-# On exit: compute RSS drift = (rss_last_sample - rss_first_5min_sample) /
-#          rss_first_5min_sample. FAIL if drift > 5% (or > 10% in the 1-hour
-#          CI smoke variant, where transient allocator warm-up dominates).
-#
-# Usage:
-#   SOAK_DURATION_HOURS=1 ./tests/test_soak_24h.sh                 # CI smoke
-#   SOAK_DURATION_HOURS=24 ./tests/test_soak_24h.sh                # full
-#   SOAK_DURATION_HOURS=2 SOAK_MODEL=/path/to/model ./tests/test_soak_24h.sh
+#   SOAK_DURATION_HOURS=1 [SOAK_MODEL=<dir>] ./tests/test_soak_24h.sh
+#   SOAK_DURATION_MINUTES=30 ./tests/test_soak_24h.sh   (a release check; wins over the hours)
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 SOAK_DURATION_HOURS="${SOAK_DURATION_HOURS:-24}"
 PORT="${PORT:-8095}"
@@ -33,7 +19,7 @@ LOG_DIR="${SOAK_LOG_DIR:-./tests}"
 SAMPLE_LOG="$LOG_DIR/soak_log.csv"
 
 # Drift threshold: 5% for ≥4h runs, 10% for shorter runs (warm-up dominates).
-if [ "$SOAK_DURATION_HOURS" -ge 4 ]; then
+if [ -z "${SOAK_DURATION_MINUTES:-}" ] && [ "$SOAK_DURATION_HOURS" -ge 4 ]; then
     DRIFT_THRESHOLD_PCT="${DRIFT_THRESHOLD_PCT:-5}"
 else
     DRIFT_THRESHOLD_PCT="${DRIFT_THRESHOLD_PCT:-10}"
@@ -58,17 +44,17 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-DURATION_SEC=$(( SOAK_DURATION_HOURS * 3600 ))
+DURATION_SEC=$(( ${SOAK_DURATION_MINUTES:-$(( SOAK_DURATION_HOURS * 60 ))} * 60 ))
 SAMPLE_INTERVAL_SEC=300            # 5 minutes
 HEALTH_INTERVAL_SEC=1800           # 30 minutes
 # Shorter test → shorter sample interval so we get >= 4 samples even at 1h.
-if [ "$SOAK_DURATION_HOURS" -lt 2 ]; then
+if [ "$SOAK_DURATION_HOURS" -lt 2 ] || [ -n "${SOAK_DURATION_MINUTES:-}" ]; then
     SAMPLE_INTERVAL_SEC=60
     HEALTH_INTERVAL_SEC=300
 fi
 
 echo "== Plan 01 A8 — 24h concurrent soak =="
-echo "  duration:           ${SOAK_DURATION_HOURS}h (${DURATION_SEC}s)"
+echo "  duration:           ${DURATION_SEC}s"
 echo "  model:              $MODEL"
 echo "  drift threshold:    ${DRIFT_THRESHOLD_PCT}%"
 echo "  sample interval:    ${SAMPLE_INTERVAL_SEC}s"
@@ -103,10 +89,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 up=0
-for i in $(seq 1 120); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 120 1 && up=1
 if [ "$up" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy within 120s"
     tail -50 "$SERVER_LOG"
@@ -215,30 +198,27 @@ done
 echo
 echo "  duration elapsed; analyzing samples..."
 
-# Need at least 2 samples to compute drift.
 N_SAMPLES=$(tail -n +2 "$SAMPLE_LOG" | wc -l | tr -d ' ')
-if [ "$N_SAMPLES" -lt 2 ]; then
-    echo -e "${YELLOW}WARN${NC} only $N_SAMPLES sample(s) collected; skipping drift check."
-    exit 0
-fi
 
 DRIFT=$(python3 - <<PY
 import csv
 rows = list(csv.DictReader(open("$SAMPLE_LOG")))
-if len(rows) < 2:
-    print("0.0")
+# Baseline: the first sample 3 minutes in, so warm-up (page faults, kernel compiles, the
+# workers' caches and the allocator pool filling) doesn't count as drift. A run with no sample
+# past it (the server died early) has no drift to measure: "short".
+t0 = int(rows[0]['ts']) if rows else 0
+base_idx = next((i for i, r in enumerate(rows) if int(r['ts']) - t0 >= 180), None)
+if base_idx is None or base_idx == len(rows) - 1 or int(rows[base_idx]['rss_kb']) == 0:
+    print("short")
 else:
-    # Use the SECOND sample as baseline so warm-up (page faults, JIT
-    # compile, weight read-in) doesn't poison the denominator.
-    base_idx = min(1, len(rows) - 1)
     base = int(rows[base_idx]['rss_kb'])
-    last = int(rows[-1]['rss_kb'])
-    if base == 0:
-        print("0.0")
-    else:
-        print(f"{100.0 * (last - base) / base:.2f}")
+    print(f"{100.0 * (int(rows[-1]['rss_kb']) - base) / base:.2f}")
 PY
 )
+if [ "$DRIFT" = "short" ]; then
+    echo -e "${RED}FAIL${NC} $N_SAMPLES sample(s), none past minute 3 with one after it: the run ended too early to measure drift"
+    exit 1
+fi
 echo "  samples:   $N_SAMPLES"
 echo "  RSS drift: ${DRIFT}% (threshold ${DRIFT_THRESHOLD_PCT}%)"
 

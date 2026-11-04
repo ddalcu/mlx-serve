@@ -1,17 +1,19 @@
 #!/bin/bash
-# test_repeat_penalty.sh — a penalty shapes the reply on every path that serves it.
+# test_repeat_penalty.sh — a penalty shapes the reply on every path that serves it. At temp 0 repeat / frequency /
+# presence penalties change a looping reply without logprobs, the same bytes as with them, streamed or not, and under
+# a json_schema; frequency_penalty (OpenAI's additive one) is read on chat and /v1/completions. Engagement from the
+# log: the plain request runs `[spec-stats] mode=pld`, the penalized one none, and a penalized request beside a plain
+# one keeps its solo bytes (`[batched] slot serial: penalty`).
 #
-# Bar: at temp 0, repeat/frequency/presence penalties change a looping reply
-# without logprobs, the same bytes as with them, streamed or not, and under a
-# json_schema; frequency_penalty x is repeat_penalty 1+x on chat and /v1/completions; a
-# penalized request never runs a PLD round (verify reads raw logits).
+#   PENALTY_TEST_MODEL=<dir> ./tests/test_repeat_penalty.sh [port]   # default Qwen3.5-0.8B-MLX-4bit; SKIP without
 #
-#   PENALTY_TEST_MODEL=<dir> ./tests/test_repeat_penalty.sh [port]
-#
-# Any chat model works; defaults to Qwen3.5-0.8B-MLX-4bit. SKIPs without one.
-set -uo pipefail
+# Zig twin: `repeat penalty shapes every sampling path` (engines/mlx/generate.zig, LOGPROBS_TEST_MODEL).
+source "$(dirname "$0")/_lib_models.sh"
 
-MODEL="${PENALTY_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}"
+set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
+
+MODEL="${PENALTY_TEST_MODEL:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}"
 PORT="${1:-11294}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 BASE="http://127.0.0.1:$PORT"
@@ -26,8 +28,7 @@ for _ in $(seq 1 30); do lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || brea
 SRV=$!
 trap 'kill $SRV 2>/dev/null; rm -f "$LOG"' EXIT
 
-for _ in $(seq 1 180); do curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -sf -m 2 "$BASE/health" >/dev/null 2>&1 || { echo "fail: server never came up"; tail -20 "$LOG"; exit 1; }
+srv_wait_health "$BASE" 180 1 || { echo "fail: server never came up"; tail -20 "$LOG"; exit 1; }
 
 python3 - "$BASE" "$LOG" <<'PY'
 import json, sys, urllib.request
@@ -96,11 +97,10 @@ def completion(**extra):
     with urllib.request.urlopen(req, timeout=300) as r:
         return json.load(r)["choices"][0]["text"]
 
-# frequency_penalty x is read as repeat_penalty 1 + x on every surface.
+# frequency_penalty is read on every surface; its arithmetic is pinned by the unit tests (#912).
 for name, call in (("chat", chat), ("completions", completion)):
-    freq, rep = call(frequency_penalty=1.5), call(repeat_penalty=2.5)
-    ck(f"{name}: frequency_penalty 1.5 == repeat_penalty 2.5, and penalized", freq == rep and rep != call(),
-       f"freq={freq[:60]!r} rep={rep[:60]!r}")
+    freq = call(frequency_penalty=1.5)
+    ck(f"{name}: frequency_penalty changes the reply", freq != call(), f"freq={freq[:60]!r}")
 
 pj = "Write the word apple 40 times. Return JSON with a words array."
 j1 = chat(pj, response_format=SCHEMA, repeat_penalty=1.0)

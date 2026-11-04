@@ -45,11 +45,15 @@ function videoProfile(model: Model | undefined) {
   const h3 = model.architecture === "minimax_h3",
     ltx = model.architecture === "AudioVideo";
   if (!h3 && !ltx) return;
-  const references =
-    h3 && model.id === "ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit";
+  const omni = h3 && model.id === "ddalcu/FastH3-Omni-MLX-Serve-8bit",
+    references = omni || (h3 && model.id === "ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit");
   return {
     h3,
     references,
+    /** A distilled student's trained step count, the only one the server takes; 0 = a range. */
+    steps: omni ? 8 : 0,
+    /** The server's fast recipe, which a distilled student never runs. */
+    fast: h3 && !omni,
     last: !references,
     audio: ltx,
     turbo: h3 && !references,
@@ -65,13 +69,14 @@ function videoProfile(model: Model | undefined) {
 }
 function videoQuality(model: Model | undefined, quality: string) {
   const index = Math.max(0, qualities.indexOf(quality)),
-    h3 = videoProfile(model)?.h3;
+    p = videoProfile(model),
+    h3 = p?.h3;
   return {
     quality,
     mode: h3
       ? "one_stage"
       : ["one_stage", "one_stage", "two_stage", "two_stage_hq"][index],
-    steps: (h3 ? [16, 30, 30, 50] : [8, 8, 30, 15])[index],
+    steps: p?.steps || (h3 ? [16, 30, 30, 50] : [8, 8, 30, 15])[index],
     cfg: index > 1 && !h3 ? 3 : 1,
     stg: index === 2 && !h3 ? 1 : 0,
     frames: h3 ? (index > 1 ? 209 : 124) : index ? 97 : 49,
@@ -132,7 +137,8 @@ function maxSteps(m: Model | undefined, d: VideoDraft) {
 }
 /** Advice under Steps: H3 below 16 steps needs a few-step adapter, which Turbo is. */
 function stepsAdvice(m: Model | undefined, d: VideoDraft) {
-  return videoProfile(m)?.h3 && d.steps < 16 && !d.turbo
+  const p = videoProfile(m);
+  return p?.h3 && !p.steps && d.steps < 16 && !d.turbo
     ? t("Under 16 steps this model needs a distilled few-step adapter, like the Turbo LoRA. Without one the picture is rough and the soundtrack usually comes out garbled.")
     : "";
 }
@@ -183,7 +189,7 @@ function buildVideoRequest(m: Model | undefined, d: VideoDraft, inputs: VideoInp
       ),
     );
   const seed = range(d.seed, 0, Number.MAX_SAFE_INTEGER, t("Seed")),
-    steps = range(d.steps, 4, maxSteps(m, d), t("Steps"));
+    steps = p.steps || range(d.steps, 4, maxSteps(m, d), t("Steps"));
   if (!Number.isSafeInteger(seed) || !Number.isInteger(steps))
     throw Error(t("Seed and steps must be whole numbers."));
   const body = {
@@ -215,7 +221,7 @@ function buildVideoRequest(m: Model | undefined, d: VideoDraft, inputs: VideoInp
   }
   if (inputs.first) b.first_frame_image = inputs.first.base64;
   if (p.last && inputs.last) b.last_frame_image = inputs.last.base64;
-  if (p.h3 && d.best) b.fast = false;
+  if (p.fast && d.best) b.fast = false;
   if (p.decoder && d.decoder) b.decoder = "diffusion";
   if (p.turbo && d.turbo) b.turbo = true;
   if (windows > 1) b.chain_windows = windows;

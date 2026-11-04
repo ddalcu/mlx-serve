@@ -572,14 +572,6 @@ final class HFModelQuantGateTests: XCTestCase {
                       "local encoder checkpoints (config.json model_type=bert) must not be flagged unsupported")
     }
 
-    func testDiffusionGemmaIsSupportedModelType() {
-        // DiffusionGemma (block diffusion, config.json model_type=diffusion_gemma)
-        // is served by the canvas-denoising loop since v26.6.10 — the browser
-        // must not flag mlx-community/diffusiongemma-* as unsupported.
-        XCTAssertTrue(supportedModelTypes.contains("diffusion_gemma"),
-                      "diffusion_gemma checkpoints are served (src/diffusion.zig) and must not be flagged unsupported")
-    }
-
     func testNvfp4_servedSinceV26_6_10_notFlagged() {
         let m = mlx(id: "mlx-community/Qwen3-30B-A3B-nvfp4", tags: ["mlx", "qwen3"])
         XCTAssertNil(m.unsupportedQuantization)
@@ -732,6 +724,15 @@ final class HFModelQuantGateTests: XCTestCase {
         XCTAssertNil(m.incompatibleReason)
     }
 
+    func testNemotronVariantTagsAreSupportedArchitectures() {
+        for type in ["nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni"] {
+            let model = mlx(id: "org/Nemotron-MLX-4bit",
+                            tags: ["mlx", "safetensors", type, "image-text-to-text"])
+            XCTAssertTrue(model.isSupportedArchitecture, "\(type) must be recognized in search")
+            XCTAssertNil(model.incompatibleReason)
+        }
+    }
+
     func testGlm5NextIsSupportedButOtherGlmIsNot() {
         // GLM-5.3-Flash packs carry model_type glm5_next (text config glm5_next_text).
         for type in ["glm5_next", "glm5_next_text"] {
@@ -739,7 +740,7 @@ final class HFModelQuantGateTests: XCTestCase {
             XCTAssertTrue(mlx(id: "TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP",
                               tags: ["mlx", "safetensors", type, "glm", "text-generation"]).isSupportedArchitecture)
         }
-        // GLM-5 (glm_moe_dsa) and GLM-4 MoE are other architectures we do not serve.
+        // GLM-5 (glm_moe_dsa) loads only from an mlx-stream pack, so the search does not offer it; GLM-4 MoE is not served.
         XCTAssertFalse(mlx(id: "mlx-community/GLM-5-4bit", tags: ["mlx", "safetensors", "glm_moe_dsa", "glm"]).isSupportedArchitecture)
         XCTAssertFalse(mlx(id: "mlx-community/GLM-4.6-4bit", tags: ["mlx", "safetensors", "glm4_moe", "glm"]).isSupportedArchitecture)
     }
@@ -764,7 +765,7 @@ final class HFModelQuantGateTests: XCTestCase {
                            "bonsai", "text-generation", "conversational"])
         XCTAssertTrue(m.isSupportedArchitecture)
         XCTAssertNil(m.incompatibleReason)
-        for type in supportedModelTypes {
+        for type in supportedModelTypes.subtracting(streamOnlyModelTypes) {
             XCTAssertTrue(mlx(id: "org/x", tags: ["mlx", type]).isSupportedArchitecture,
                           "a repo tagged with served model_type \"\(type)\" reads as unsupported")
         }
@@ -1023,32 +1024,36 @@ final class HFModelIsDrafterTests: XCTestCase {
 
 // MARK: - Zig <-> Swift supported model_type sync
 
-/// The server's `supported_model_types` (src/model_discovery.zig) and the
-/// app's `supportedModelTypes` are the same list spelled twice. Every new
-/// arch has been added to one and forgotten on the other at least once, so
-/// this reads the Zig list and asserts the app knows every entry.
+/// The model types the server's language-model plugins claim (each `src/plugins/<name>/config.zig`'s
+/// `model_types`; media plugins are not chat models) and the app's `supportedModelTypes` are the
+/// same list spelled twice.
+/// Every new arch has been added to one and forgotten on the other at least once, so
+/// this reads the plugins' lists and asserts the app knows every entry.
 final class SupportedModelTypeSyncTests: XCTestCase {
     func testEveryZigSupportedModelTypeIsInTheAppSet() throws {
-        let zig = URL(fileURLWithPath: #filePath)
+        let plugins = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("src/model_discovery.zig")
-        let src = try String(contentsOf: zig, encoding: .utf8)
-        guard let start = src.range(of: "const supported_model_types = [_][]const u8{"),
-              let end = src.range(of: "};", range: start.upperBound..<src.endIndex) else {
-            return XCTFail("supported_model_types list not found in model_discovery.zig")
-        }
+            .appendingPathComponent("src/plugins")
         var types: [String] = []
-        for line in src[start.upperBound..<end.lowerBound].split(separator: "\n") {
-            let code = line.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
-            for m in code.split(separator: ",") {
-                let t = m.trimmingCharacters(in: .whitespaces)
-                if t.hasPrefix("\"") && t.hasSuffix("\"") && t.count > 2 {
-                    types.append(String(t.dropFirst().dropLast()))
+        for dir in try FileManager.default.contentsOfDirectory(atPath: plugins.path) where !dir.hasPrefix("_") {
+            let folder = plugins.appendingPathComponent(dir)
+            let table = (try? String(contentsOf: folder.appendingPathComponent("plugin.zig"), encoding: .utf8)) ?? ""
+            guard let src = try? String(contentsOf: folder.appendingPathComponent("config.zig"), encoding: .utf8),
+                  !(src + table).contains(".kind = .media"),
+                  let start = src.range(of: "model_types = [_][]const u8{"),
+                  let end = src.range(of: "};", range: start.upperBound..<src.endIndex) else { continue }
+            for line in src[start.upperBound..<end.lowerBound].split(separator: "\n") {
+                let code = line.split(separator: "/", maxSplits: 1).first.map(String.init) ?? ""
+                for m in code.split(separator: ",") {
+                    let t = m.trimmingCharacters(in: .whitespaces)
+                    if t.hasPrefix("\"") && t.hasSuffix("\"") && t.count > 2 {
+                        types.append(String(t.dropFirst().dropLast()))
+                    }
                 }
             }
         }
-        XCTAssertGreaterThan(types.count, 20, "parsed too few entries; the Zig list's shape changed")
+        XCTAssertGreaterThan(types.count, 20, "parsed too few entries; the plugins' model_types shape changed")
         let missing = types.filter { !supportedModelTypes.contains($0) }
         XCTAssertTrue(missing.isEmpty,
                       "served by Zig but missing from HFModels.swift supportedModelTypes: \(missing)")

@@ -123,6 +123,10 @@ struct SettingsView: View {
         ) {
             ModelFoldersSectionContent()
             ServerSectionContent()
+            // The Mac App Store build loads no plugins (its sandbox forbids it).
+            if !BuildFeatures.current.isMAS {
+                PluginsSectionContent()
+            }
         }
         SettingsSection(
             category: .memory,
@@ -132,9 +136,11 @@ struct SettingsView: View {
         }
         SettingsSection(
             category: .lanSharing,
-            subtitle: "Share models with other Macs on your network and use theirs; restart the server to apply changes."
+            subtitle: "Use your other machines. Over your network, each one takes whole jobs; a Mac joined to this one by a Thunderbolt cable works on the same job with it."
         ) {
+            ClusterMapView(worker: appState.clusterWorker)
             LanSharingSectionContent()
+            ThunderboltClusterSectionContent()
         }
         SettingsSection(
             category: .providers,
@@ -944,6 +950,13 @@ private struct LanSharingSectionContent: View {
     }
 
     var body: some View {
+        SearchableRow(searchText: ["Network", "LAN sharing"], separatorGap: nil) {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Over your network", systemImage: "network").font(.app(.headline)).padding(.top, 8)
+                Text("Any machine on your network, Mac or Linux, can take whole jobs: a chat, a picture, a storyboard shot. It works over Wi-Fi or Ethernet, and each machine works on its own.")
+                    .font(.app(.caption)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
         if let m = meta["lanShareEnabled"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareEnabled)) {
                 Toggle("", isOn: $appState.serverOptions.lanShareEnabled)
@@ -1030,6 +1043,607 @@ private struct LanSharingSectionContent: View {
         }
         .padding(.leading, 8)
         .padding(.vertical, 2)
+    }
+}
+
+/// Settings ▸ Cluster, Thunderbolt half: two Macs on one cable working on the same job.
+/// One button pairs them; the controls behind it sit under Advanced.
+private struct ThunderboltClusterSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+    @Environment(\.settingsSearchQuery) private var query
+    @State private var ports: [RdmaPort] = []
+    @State private var setupError: String?
+    /// A Pair, Join or Reconnect is waiting for the cable's address.
+    @State private var settingUp = false
+
+    private func pairing(_ action: @escaping @MainActor () async -> String?) {
+        settingUp = true
+        setupError = nil
+        Task {
+            setupError = await action()
+            settingUp = false
+        }
+    }
+    /// A Mac on the network that leads a pair and waits for one to join.
+    @State private var leader: String?
+    @State private var leadInstead = false
+    @State private var pairModel = ""
+    @State private var showAdvanced = false
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
+    }
+    private var options: ServerOptions { appState.serverOptions }
+    private var port: RdmaPort? {
+        let dev = ClusterSetup.device(options, ports: { ports })
+        return ports.first { $0.device == dev }
+    }
+
+    var body: some View {
+        SearchableRow(searchText: ["Thunderbolt", "RDMA", "pair", "cluster"], separatorGap: nil) {
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Thunderbolt pair", systemImage: "bolt.horizontal.fill").font(.app(.headline)).padding(.top, 12)
+                Text("Two Macs joined by a Thunderbolt 5 cable work on the same job together: one video made faster, or a chat model too big for one Mac. Only the two Macs on the cable take part.")
+                    .font(.app(.caption)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        SearchableRow(searchText: ["Pair", "Join", "Thunderbolt"], separatorGap: nil) {
+            pairCard
+        }
+        .task { await watch() }
+        SearchableRow(searchText: ["Advanced", "Thunderbolt"], separatorGap: nil) {
+            Button { showAdvanced.toggle() } label: {
+                Label(showAdvanced ? L10n.text("Hide advanced Thunderbolt settings") : L10n.text("Advanced Thunderbolt settings"),
+                      systemImage: showAdvanced ? "chevron.down" : "chevron.right")
+                    .font(.app(.caption))
+            }
+            .buttonStyle(.link)
+        }
+        if showAdvanced || !query.isEmpty { advancedRows }
+    }
+
+    private var pair: ThunderboltPair {
+        let up = ports.first(where: \.active)
+        let addressed = up.map { ClusterSetup.ipv4(on: $0.interface) == ClusterSetup.linkAddress(options.clusterRole) } ?? false
+        return .of(ports: ports, role: options.clusterRole, hasAddress: addressed, cluster: server.cluster, leader: leader)
+    }
+
+    /// The models a pair can run, video first.
+    /// Chat models too big for this Mac alone first (what a pair is for), then the rest.
+    private var pairable: [LocalModel] {
+        let models = appState.localModels.filter { ClusterSetup.servableTypes.contains($0.modelType) }
+        let here = Int64(SystemMetrics.availableBytes())
+        func needsPair(_ m: LocalModel) -> Bool {
+            m.modelType != "minimax_h3" && PairPlan.fit(bytes: ResidentSize.bytes(of: m), freeHere: here, freeThere: nil) != .alone
+        }
+        return models.sorted { a, b in
+            needsPair(a) != needsPair(b) ? needsPair(a) : a.name < b.name
+        }
+    }
+
+    /// The cable comes and goes, and a Mac on the network may start leading: look again every few seconds.
+    private func watch() async {
+        while !Task.isCancelled {
+            ports = await Task.detached { ClusterSetup.ports() }.value
+            await server.refreshPairState()
+            if case .ready = pair {
+                leader = server.lanPeers.filter(\.value.waitsForPartner).keys.sorted().first
+            } else {
+                leader = nil
+            }
+            try? await Task.sleep(for: .seconds(5))
+        }
+    }
+
+    @ViewBuilder private var pairCard: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            switch pair {
+            case .off:
+                status(L10n.text("Thunderbolt pairing is turned off on this Mac."), "bolt.slash", .secondary)
+                Text("To turn it on, on both Macs: shut down, then hold the power button until Options appears and open it. Choose Utilities ▸ Terminal, type rdma_ctl enable, press Return, and restart.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            case .noCable:
+                status(L10n.text("Connect the other Mac to this one with a Thunderbolt 5 cable."), "cable.connector", .secondary)
+            case .ready(let leader):
+                if let leader, !leadInstead {
+                    let model = server.lanPeers[leader]?.leads ?? ""
+                    let haveIt = PairLookup.has(model, in: appState.localModels)
+                    status(L10n.format("%@ is waiting to pair with this Mac.", leader), "bolt.horizontal.circle", .accentColor)
+                    if !haveIt {
+                        Text(L10n.format("It runs %@, which this Mac doesn't have. Download the same model here to join.", model))
+                            .font(.app(.caption)).foregroundStyle(.orange).fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 12) {
+                        Button { pairing { await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
+                            Text(L10n.format("Join %@", leader)).font(.app(.body))
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!haveIt)
+                        Button { leadInstead = true } label: { Text("Lead from this Mac instead").font(.app(.caption)) }
+                            .buttonStyle(.link)
+                    }
+                } else {
+                    status(L10n.text("A Mac is connected to this one by Thunderbolt."), "bolt.horizontal.circle", .accentColor)
+                    leadControls
+                }
+                Text("The first time, macOS asks for your password to set up the cable. It stays set up after restarts.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            case .reconnect(let role):
+                status(L10n.text("Paired, but the cable needs setting up again after a restart."), "arrow.triangle.2.circlepath", .orange)
+                Button { pairing { await ThunderboltPairing.reconnect(role, appState: appState, ports: ports) } } label: {
+                    Text("Reconnect").font(.app(.body))
+                }
+                .buttonStyle(.borderedProminent)
+            case .leading(let partner):
+                if let partner, let c = server.cluster, c.workerModel == "missing" || c.workerModel == "different" {
+                    status(c.workerModel == "missing"
+                           ? L10n.format("%@ doesn't have %@. Download the same model there, then join again.", partner, c.model)
+                           : L10n.format("%@ has another copy of %@ (a different quantization or revision). Download this one there, then join again.", partner, c.model),
+                           "exclamationmark.triangle", .orange)
+                } else if let partner {
+                    status(L10n.format("Paired with %@ for %@.", partner, server.cluster?.model ?? ""), "bolt.horizontal.fill", .green)
+                    if let c = server.cluster, c.mode == "rows" {
+                        VideoClusterAdviceRow(cluster: c)
+                    } else if let c = server.cluster, c.planned, c.layers > 0 {
+                        ClusterSplitBar(cluster: c)
+                    }
+                } else if let other = server.lanPeers.filter(\.value.waitsForPartner).keys.sorted().first {
+                    // Both Macs clicked Pair: one of them has to join the other.
+                    status(L10n.format("%@ is also waiting for a Mac to join it.", other), "exclamationmark.triangle", .orange)
+                    Button { pairing { await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
+                        Text(L10n.format("Join %@", other)).font(.app(.body))
+                    }
+                    .buttonStyle(.borderedProminent)
+                } else {
+                    status(L10n.text("Waiting for the other Mac. On it, open Settings ▸ Cluster and click Join."), "hourglass", .secondary)
+                }
+                unpairButton
+            case .helping:
+                HelperStatus(worker: appState.clusterWorker)
+                unpairButton
+            }
+            if settingUp {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Setting up the cable…").font(.app(.caption)).foregroundStyle(.secondary)
+                }
+            } else if let setupError {
+                Text(verbatim: setupError).font(.app(.caption)).foregroundStyle(.red)
+            }
+        }
+        .disabled(settingUp)
+        .padding(10)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// Which model the pair runs, and the button that makes this Mac lead it.
+    @ViewBuilder private var leadControls: some View {
+        let models = pairable
+        if models.isEmpty {
+            Text("A pair runs MiniMax-H3 (video), or Qwen3.8-Flash-Next or DeepSeek-V4.1 (chat). Download one on both Macs to use it.")
+                .font(.app(.caption)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        } else {
+            HStack(spacing: 8) {
+                Text("Use the pair for").font(.app(.caption))
+                Picker("", selection: $pairModel) {
+                    ForEach(models, id: \.path) { m in
+                        Text(verbatim: pairLabel(m)).tag(m.path)
+                    }
+                }
+                .labelsHidden().frame(maxWidth: 320)
+            }
+            .onAppear { if !models.contains(where: { $0.path == pairModel }) { pairModel = models[0].path } }
+            if let m = models.first(where: { $0.path == pairModel }) { pairEstimate(m) }
+            HStack(spacing: 12) {
+                Button { pairing { await ThunderboltPairing.lead(model: pairModel, appState: appState, ports: ports) } } label: {
+                    Text("Pair").font(.app(.body))
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(pairModel.isEmpty)
+                Button { pairing { await ThunderboltPairing.join(appState: appState, ports: ports) } } label: {
+                    Text("Join the Mac that leads instead").font(.app(.caption))
+                }
+                .buttonStyle(.link)
+            }
+            Text("This Mac leads and restarts its server; then click Join on the other Mac. Both need the same model.")
+                .font(.app(.caption2)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func pairLabel(_ m: LocalModel) -> String {
+        let use: String = m.modelType == "minimax_h3" ? L10n.text("video") : L10n.text("chat")
+        return "\(m.name) · \(use) · \(m.sizeFormatted)"
+    }
+
+    /// Whether the model needs the pair at all, and about how much memory each Mac gives it.
+    @ViewBuilder private func pairEstimate(_ m: LocalModel) -> some View {
+        let video = m.modelType == "minimax_h3"
+        let here = Int64(SystemMetrics.availableBytes())
+        let other = PairLookup.otherMac(server.lanPeers, workerName: server.cluster?.workerName ?? "")
+        let there = other.map { $0.peer.freeBytes }
+        let bytes = ResidentSize.bytes(of: m)
+        let share = PairPlan.share(bytes: bytes, video: video, mode: options.clusterMode, freeHere: here, freeThere: there ?? here)
+        let otherName = other?.name ?? L10n.text("the other Mac")
+        VStack(alignment: .leading, spacing: 2) {
+            if !video {
+                switch PairPlan.fit(bytes: bytes, freeHere: here, freeThere: there) {
+                case .alone:
+                    Text("Fits on this Mac alone. A pair runs it a little slower; pair it only to free memory here.")
+                case .needsBoth:
+                    Text("Too big for this Mac alone: the pair runs it across both Macs.")
+                case .tooBig:
+                    Text("Too big even for both Macs together.").foregroundStyle(.orange)
+                }
+            }
+            Text(L10n.format("About %@ on this Mac and %@ on %@.",
+                             MemoryInfo.format(share.here), MemoryInfo.format(share.there), otherName))
+        }
+        .font(.app(.caption2)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+    }
+
+    private var unpairButton: some View {
+        Button { ThunderboltPairing.unpair(appState: appState); leadInstead = false } label: { Text("Unpair").font(.app(.body)) }
+    }
+
+    private func status(_ text: String, _ symbol: String, _ color: Color) -> some View {
+        Label { Text(verbatim: text).font(.app(.body)).fixedSize(horizontal: false, vertical: true) } icon: {
+            Image(systemName: symbol).foregroundStyle(color)
+        }
+    }
+
+    @ViewBuilder private var advancedRows: some View {
+        if let m = meta["clusterRole"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterRole)) {
+                Picker("", selection: $appState.serverOptions.clusterRole) {
+                    Text("Off").tag(ClusterRole.off)
+                    Text("Host").tag(ClusterRole.host)
+                    Text("Worker").tag(ClusterRole.worker)
+                }
+                .labelsHidden().pickerStyle(.segmented).frame(width: 220)
+            }
+            .task { ports = await Task.detached { ClusterSetup.ports() }.value }
+        }
+        if options.clusterRole != .off {
+            linkRow
+            if let m = meta["clusterDevice"], ports.count > 1 {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterDevice)) {
+                    Picker("", selection: $appState.serverOptions.clusterDevice) {
+                        Text("Automatic").tag("")
+                        ForEach(ports, id: \.device) { p in
+                            Text(verbatim: "\(p.interface)\(p.active ? "" : " (no cable)")").tag(p.device)
+                        }
+                    }
+                    .labelsHidden().frame(width: 200)
+                }
+            }
+        }
+        if options.clusterRole == .host { hostRows }
+        if options.clusterRole == .worker { workerRows }
+    }
+
+    /// The cable and its address: RDMA carries nothing until the port has one.
+    @ViewBuilder private var linkRow: some View {
+        SettingsRow(title: L10n.text("Link"), explainer: L10n.text("A Thunderbolt 5 cable straight between the two Macs, with RDMA turned on.")) {
+            if let p = port, p.active {
+                if let ip = ClusterSetup.ipv4(on: p.interface) {
+                    Label(L10n.format("%@ connected · %@", p.interface, ip), systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green).font(.app(.caption))
+                } else {
+                    Button(L10n.format("Set up %@…", p.interface)) {
+                        setupError = ThunderboltAddressJob.apply(options.clusterRole)
+                        ports = ClusterSetup.ports()
+                    }
+                    .help(L10n.text("Gives the port its cluster address; the first time macOS asks for your password, and it stays set up after restarts."))
+                }
+            } else if ports.isEmpty {
+                Text("RDMA is off: run `rdma_ctl enable` in Recovery").font(.app(.caption)).foregroundStyle(.orange)
+            } else {
+                Text("No cable on a Thunderbolt 5 port").font(.app(.caption)).foregroundStyle(.orange)
+            }
+        }
+        if let setupError {
+            Text(verbatim: setupError).font(.app(.caption)).foregroundStyle(.red)
+        }
+    }
+
+    @ViewBuilder private var hostRows: some View {
+        if let m = meta["clusterModelPath"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterModelPath)) {
+                Picker("", selection: $appState.serverOptions.clusterModelPath) {
+                    Text("Choose…").tag("")
+                    ForEach(appState.localModels.filter { ClusterSetup.servableTypes.contains($0.modelType) }, id: \.path) { m in
+                        Text(verbatim: m.name).tag(m.path)
+                    }
+                }
+                .labelsHidden().frame(width: 260)
+            }
+        }
+        if videoModel {
+            SettingsRow(title: L10n.text("How it splits"),
+                        explainer: L10n.text("Both Macs keep the whole video pack loaded, so the worker needs the same pack and the room for it. Every step's frames are split between the two over the cable, by each Mac's measured speed.")) {
+                Text("Video steps").font(.app(.caption)).foregroundStyle(.secondary)
+            }
+        } else if let m = meta["clusterMode"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterMode)) {
+                Picker("", selection: $appState.serverOptions.clusterMode) {
+                    Text("By layers").tag(ClusterMode.pipeline)
+                    Text("By experts").tag(ClusterMode.tensor)
+                }
+                .labelsHidden().pickerStyle(.segmented).frame(width: 220)
+            }
+        }
+        SettingsRow(title: L10n.text("Status"), explainer: L10n.format("The worker joins at %@.", ClusterSetup.coordinator(options, ports: { ports }))) {
+            Text(verbatim: clusterStatus).font(.app(.caption)).foregroundStyle(.secondary)
+        }
+    }
+
+    private var videoModel: Bool {
+        appState.localModels.first { $0.path == options.clusterModelPath }?.modelType == "minimax_h3"
+    }
+
+    private var clusterStatus: String {
+        guard let c = server.cluster else {
+            return options.clusterModelPath.isEmpty ? L10n.text("Choose a model") : L10n.text("Starts with the server")
+        }
+        if !c.joined { return L10n.text("Waiting for the worker") }
+        let worker = c.workerName.isEmpty ? L10n.text("The worker") : ClusterVideoAdvice.shortName(c.workerName)
+        if videoModel {
+            if !c.planned { return L10n.format("%@ joined; it loads %@ with the first video", worker, c.model) }
+            return c.workerReady ? L10n.format("%@ holds %@ for video steps", worker, c.model) : L10n.format("%@ is loading %@", worker, c.model)
+        }
+        if !c.planned { return L10n.format("Worker joined; it loads its part with %@", c.model) }
+        return c.workerReady ? L10n.format("Serving %@ on both Macs", c.model) : L10n.text("The worker is loading its part")
+    }
+
+    @ViewBuilder private var workerRows: some View {
+        if let m = meta["clusterCoordinator"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.clusterCoordinator)) {
+                TextField("", text: $appState.serverOptions.clusterCoordinator,
+                          prompt: Text(verbatim: ClusterSetup.coordinator(options, ports: { ports })))
+                    .textFieldStyle(.roundedBorder).multilineTextAlignment(.trailing)
+                    .frame(width: 200).font(.app(.body))
+            }
+        }
+        WorkerStatusRow(worker: appState.clusterWorker)
+    }
+}
+
+private struct WorkerStatusRow: View {
+    @ObservedObject var worker: ClusterWorker
+
+    var body: some View {
+        SettingsRow(title: L10n.text("Status"), explainer: L10n.text("This Mac runs its part of the host's model; it needs the same model in its library.")) {
+            switch worker.state {
+            case .stopped: Text("Stopped").font(.app(.caption)).foregroundStyle(.secondary)
+            case .waiting: Text("Waiting for the host").font(.app(.caption)).foregroundStyle(.secondary)
+            case .loading(let what): Text(verbatim: L10n.format("Loading %@", what)).font(.app(.caption))
+            case .ready(let what): Label(L10n.format("Serving %@", what), systemImage: "checkmark.circle.fill")
+                .font(.app(.caption)).foregroundStyle(.green)
+            case .failed(let why): Text(verbatim: why).font(.app(.caption)).foregroundStyle(.red)
+            }
+        }
+    }
+}
+
+/// The Thunderbolt pair card's line while this Mac helps the one that leads.
+private struct HelperStatus: View {
+    @ObservedObject var worker: ClusterWorker
+
+    var body: some View {
+        switch worker.state {
+        case .stopped, .waiting:
+            Label(L10n.text("Joined. Waiting for the Mac that leads to start its job."), systemImage: "hourglass")
+                .font(.app(.body))
+        case .loading(let what):
+            Label(L10n.format("Loading %@ to help the Mac that leads", what), systemImage: "arrow.down.circle")
+                .font(.app(.body))
+        case .ready(let what):
+            Label(L10n.format("Helping the Mac that leads with %@", what), systemImage: "bolt.horizontal.fill")
+                .font(.app(.body)).foregroundStyle(.green)
+        case .failed(let why):
+            Label(why, systemImage: "exclamationmark.triangle").font(.app(.body)).foregroundStyle(.red)
+        }
+    }
+}
+
+/// The top of Settings ▸ Cluster: this Mac, the Mac paired with it by Thunderbolt, and the
+/// machines on the network, each drawn with the icon macOS uses for it.
+private struct ClusterMapView: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+    @ObservedObject var worker: ClusterWorker
+
+    var body: some View {
+        SearchableRow(searchText: ["Cluster", "machines", "Thunderbolt", "network"], separatorGap: nil) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(alignment: .iconMiddle, spacing: 20) {
+                    MachineTile(icon: MachineKind.thisMac.icon, name: thisMac, caption: L10n.text("This Mac"))
+                    if let pair {
+                        ThunderboltLink(model: pair.model)
+                        MachineTile(icon: pair.kind.icon, name: pair.name, caption: L10n.text("Paired"))
+                    }
+                }
+                if let together {
+                    Text(verbatim: together)
+                        .font(.app(.caption)).foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Divider()
+                Text("On your network").font(.app(.caption).weight(.semibold)).foregroundStyle(.secondary)
+                let peers = networkMachines
+                if peers.isEmpty {
+                    Text(appState.serverOptions.lanDiscoverEnabled
+                         ? L10n.text("No other machines found yet. They show up here when they share models.")
+                         : L10n.text("Turn on finding network models below to see your other machines."))
+                        .font(.app(.caption)).foregroundStyle(.secondary)
+                } else {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(alignment: .top, spacing: 20) {
+                            ForEach(peers, id: \.self) { name in
+                                let kind = server.lanPeers[name]?.kind ?? .unknown
+                                MachineTile(icon: kind.icon, name: name, caption: kind.label)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(.vertical, 6)
+        }
+    }
+
+    private var thisMac: String {
+        let n = appState.serverOptions.lanName
+        return n.isEmpty ? (Host.current().localizedName ?? L10n.text("This Mac")) : n
+    }
+
+    /// The Mac on the other end of the cable once paired, and the model the two run.
+    private var pair: (name: String, kind: MachineKind, model: String)? {
+        switch appState.serverOptions.clusterRole {
+        case .host:
+            guard let c = server.cluster, c.joined else { return nil }
+            let model = (c.model as NSString).lastPathComponent
+            // The worker names itself when the pair's model first loads; until then, the Mac
+            // the network reaches over the cable.
+            if let other = PairLookup.otherMac(server.lanPeers, workerName: c.workerName) {
+                return (other.name, other.peer.kind, model)
+            }
+            let name = c.workerName.isEmpty ? L10n.text("The other Mac") : ClusterVideoAdvice.shortName(c.workerName)
+            return (name, .mac, model)
+        case .worker:
+            guard case .ready = worker.state else { return nil }
+            // The leader reports its pair's model and that a Mac joined it.
+            guard let (name, peer) = server.lanPeers.first(where: { !$0.value.leads.isEmpty && $0.value.joined })
+                .map({ ($0.key, $0.value) }) else { return (L10n.text("The Mac that leads"), .mac, "") }
+            return (name, peer.kind, peer.leads)
+        case .off:
+            return nil
+        }
+    }
+
+    /// What the pair does for one video.
+    private var together: String? {
+        guard let c = server.cluster, c.joined, c.mode == "rows" else { return nil }
+        return ClusterVideoAdvice.of(c).text(worker: c.workerName)
+    }
+
+    /// Every machine on the network but the paired one.
+    private var networkMachines: [String] {
+        var names = Set(server.lanPeers.keys)
+        names.formUnion(server.allModels.compactMap(\.lanPeer))
+        if let pair { names = names.filter { !StoryboardCluster.sameMachine($0, pair.name) } }
+        return names.sorted()
+    }
+}
+
+/// One machine on the Cluster map: its macOS icon, name and kind.
+private struct MachineTile: View {
+    let icon: NSImage
+    let name: String
+    let caption: String
+
+    var body: some View {
+        VStack(spacing: 2) {
+            Image(nsImage: icon).resizable().interpolation(.high).frame(width: 64, height: 64)
+                .alignmentGuide(.iconMiddle) { $0[VerticalAlignment.center] }
+            Text(verbatim: name).font(.app(.body)).lineLimit(1)
+            Text(verbatim: caption).font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+        .frame(width: 112)
+    }
+}
+
+/// The cable between the two paired Macs, with the model they run together.
+private struct ThunderboltLink: View {
+    let model: String
+
+    var body: some View {
+        VStack(spacing: 4) {
+            HStack(spacing: 6) {
+                Rectangle().fill(Color.accentColor.opacity(0.6)).frame(width: 36, height: 2)
+                Image(systemName: "bolt.fill").font(.system(size: 18, weight: .semibold)).foregroundStyle(Color.accentColor)
+                Rectangle().fill(Color.accentColor.opacity(0.6)).frame(width: 36, height: 2)
+            }
+            .alignmentGuide(.iconMiddle) { $0[VerticalAlignment.center] }
+            Text("Thunderbolt").font(.app(.caption2)).foregroundStyle(.secondary)
+            if !model.isEmpty {
+                Text(verbatim: model).font(.app(.caption)).lineLimit(1).truncationMode(.middle).frame(maxWidth: 180)
+            }
+        }
+    }
+}
+
+extension VerticalAlignment {
+    /// The middle of the machine icons on the Cluster map, where the Thunderbolt line runs.
+    private enum IconMiddle: AlignmentID {
+        static func defaultValue(in d: ViewDimensions) -> CGFloat { d[VerticalAlignment.center] }
+    }
+    fileprivate static let iconMiddle = VerticalAlignment(IconMiddle.self)
+}
+
+/// Video steps: how fast the worker is against this Mac, what that means, and what the last
+/// video did, with its row split as two bars.
+private struct VideoClusterAdviceRow: View {
+    let cluster: ClusterInfo
+
+    var body: some View {
+        let advice = ClusterVideoAdvice.of(cluster)
+        VStack(alignment: .leading, spacing: 4) {
+            Label {
+                Text(verbatim: advice.text(worker: cluster.workerName)).font(.app(.caption))
+            } icon: {
+                Image(systemName: { if case .tooSlow = advice { return "tortoise" } else { return "bolt.horizontal" } }())
+                    .foregroundStyle({ if case .tooSlow = advice { return Color.orange } else { return Color.accentColor } }())
+            }
+            if cluster.linkGbps > 0 {
+                Text(verbatim: L10n.format("Link: %@ GB/s each way · %@ free on the worker",
+                                           String(format: "%.1f", cluster.linkGbps),
+                                           ByteCountFormatter.string(fromByteCount: Int64(cluster.workerFreeMib) << 20, countStyle: .memory)))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+            if cluster.lastSplit {
+                let here = Double(cluster.splitRows[0]) / Double(max(1, cluster.splitRows[0] + cluster.splitRows[1]))
+                GeometryReader { g in
+                    HStack(spacing: 2) {
+                        RoundedRectangle(cornerRadius: 3).fill(Color.accentColor).frame(width: max(4, g.size.width * here - 1))
+                        RoundedRectangle(cornerRadius: 3).fill(Color.purple).frame(width: max(4, g.size.width * (1 - here) - 1))
+                    }
+                }
+                .frame(height: 10)
+                Text(verbatim: L10n.format("Last video: %lld%% of every step here, %lld%% on the worker",
+                                           Int64((here * 100).rounded()), Int64(((1 - here) * 100).rounded())))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            } else if cluster.lastJob.hasPrefix("alone: ") {
+                Text(verbatim: L10n.format("Last video ran here alone: %@", String(cluster.lastJob.dropFirst(7))))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+}
+
+/// Which layers each Mac holds, as two bars in proportion.
+private struct ClusterSplitBar: View {
+    let cluster: ClusterInfo
+
+    var body: some View {
+        let here = cluster.mode == "tensor" ? 1.0 : Double(cluster.here) / Double(max(1, cluster.layers))
+        VStack(alignment: .leading, spacing: 4) {
+            GeometryReader { g in
+                HStack(spacing: 2) {
+                    RoundedRectangle(cornerRadius: 3).fill(Color.accentColor).frame(width: max(4, g.size.width * here - 1))
+                    RoundedRectangle(cornerRadius: 3).fill(Color.purple).frame(width: max(4, g.size.width * (1 - here) - 1))
+                }
+            }
+            .frame(height: 10)
+            Text(verbatim: cluster.mode == "tensor"
+                 ? L10n.text("Every layer on both Macs, each with half of every expert")
+                 : L10n.format("Layers 1–%lld here, %lld–%lld on the worker", Int64(cluster.here), Int64(cluster.here + 1), Int64(cluster.layers)))
+                .font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+        .padding(.vertical, 4)
     }
 }
 
@@ -1351,6 +1965,18 @@ private struct ProviderModelPickerSheet: View {
         }
         self.error = lastError
         loading = false
+    }
+}
+
+/// Outside plugins live in Models > Plugins; Settings keeps a door to them.
+private struct PluginsSectionContent: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        SettingsRow(title: "Outside plugins",
+                    explainer: "Install, update, remove and switch on community plugins in Models > Plugins. The server reads the switches once at startup.") {
+            Button("Open Plugins") { appState.showModels(.plugins) }
+        }
     }
 }
 
@@ -1764,7 +2390,7 @@ private struct SpecDecodeSectionContent: View {
     var body: some View {
         let opts = $appState.serverOptions
         // Drafter and PLD are mutually exclusive at the request level
-        // (`drafter > PLD > regular` in src/server.zig). When drafter is on
+        // (`drafter > PLD > regular` in src/host/http/server.zig). When drafter is on
         // we lock the PLD toggles down so users can't accidentally enable a
         // setting that would never apply.
         let drafterActive = server.chatModelInfo?.drafterLoaded ?? false
@@ -2188,6 +2814,11 @@ private struct NeuralEngineSectionContent: View {
                 }
             }
         }
+        if let m = meta["w8a8"], AnePrefillAdvice.liveIsM5Family { // inert without NAX: hidden off the M5 family
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.w8a8)) {
+                Toggle("", isOn: opts.w8a8).labelsHidden().toggleStyle(.switch).font(.app(.body))
+            }
+        }
         if let m = meta["aneImage"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneImage),
                         cost: m.cost, costActive: appState.serverOptions.aneImage) {
@@ -2539,9 +3170,21 @@ private struct TranscribeSectionContent: View {
         }, set: { appState.serverOptions.transcriptNotesModel = $0 })
     }
 
+    private var nemotron: Bool { appState.serverOptions.transcribeEngine == .nemotron }
+
     var body: some View {
-        SettingsRow(title: "Meeting notes", explainer: "The model that writes a title, summary, decisions and action items above each transcript.") {
-            Picker("", selection: notesModel) {
+        SettingsRow(title: "Transcription model", explainer: "What turns speech into words for dictation, voice mode, Telegram voice notes and tray transcripts. Nemotron 3.5 Transcribe is one model that also times words, tells speakers apart and writes the notes; it has to be on this Mac (convert NVIDIA's checkpoint with scripts/convert_nemotron_transcribe.py).") {
+            Picker("", selection: $appState.serverOptions.transcribeEngine) {
+                ForEach(ServerOptions.TranscribeEngine.allCases) { engine in
+                    Text(verbatim: engine.label).font(.app(.body)).tag(engine)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 260).font(.app(.body))
+        }
+        SettingsRow(title: "Meeting notes", explainer: nemotron ? "Nemotron 3.5 Transcribe writes the notes itself." : "The model that writes a title, summary, decisions and action items above each transcript.") {
+            Picker("", selection: nemotron ? Binding<String>.constant("nemotron") : notesModel) {
+                if nemotron { Text(verbatim: "Nemotron").font(.app(.body)).tag("nemotron") }
                 Text(L10n.text("Chat model in use")).font(.app(.body)).tag("")
                 Text(L10n.text("Off")).font(.app(.body)).tag(ServerOptions.notesOff)
                 ForEach(pickable) { model in
@@ -2549,6 +3192,7 @@ private struct TranscribeSectionContent: View {
                 }
             }
             .labelsHidden()
+            .disabled(nemotron)
             .frame(width: 220).font(.app(.body))
         }
         SettingsRow(title: "Stop after silence", explainer: "Ends a recording when nothing has been heard for this long, then transcribes it.") {
@@ -2600,11 +3244,13 @@ private struct VoiceCloneSectionContent: View {
             return "Copies the voice from the clip below using Qwen3-TTS. Slower and much heavier than Kokoro, and it needs the model downloaded from the Audio tile."
         case .kokoro:
             return "A small, very fast model (about 17x realtime, a tenth of the memory of the cloning model) with 54 built-in voices you can blend. It can't copy your voice."
+        case .lfm3:
+            return "LiquidAI's speech model: 19 languages, a female and a male voice each. When your chat model is LFM3 Audio or Omni, that same model reads the answers, with no second model."
         }
     }
 
     var body: some View {
-        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"]) {
+        SearchableRow(searchText: ["Voice engine", "Kokoro", "LFM3", "cloned"]) {
             engineBody
         }
         // The clip control only makes sense for the backend that can USE it —
@@ -2621,28 +3267,9 @@ private struct VoiceCloneSectionContent: View {
                 kokoroBody
             }
         }
-        if appState.serverOptions.voiceEngine == .system {
-            SearchableRow(searchText: ["System voice", "Apple voice"]) {
-                systemVoiceBody
-            }
-        }
-    }
-
-    /// The app-wide Apple voice; an agent with its own voice still overrides it.
-    @ViewBuilder
-    private var systemVoiceBody: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("System voice")).font(.app(.headline).weight(.semibold))
-            HStack(spacing: 8) {
-                Picker("", selection: Binding(get: { appState.voice.selectedVoiceId },
-                                              set: { appState.voice.selectVoice($0) })) {
-                    ForEach(appState.voice.availableVoices) { v in
-                        Text(v.displayName).font(.app(.body)).tag(Optional(v.id))
-                    }
-                }
-                .labelsHidden()
-                .frame(width: 260)
-                Spacer(minLength: 0)
+        if appState.serverOptions.voiceEngine == .lfm3 {
+            SearchableRow(searchText: ["LFM3 voice", "language", "preview"]) {
+                lfm3Body
             }
         }
     }
@@ -2652,7 +3279,7 @@ private struct VoiceCloneSectionContent: View {
         VStack(alignment: .leading, spacing: 6) {
             Text(L10n.text("Voice engine")).font(.app(.rowTitle).weight(.semibold))
             Picker("", selection: $appState.serverOptions.voiceEngine) {
-                ForEach(VoiceEngine.allCases, id: \.self) { e in
+                ForEach(VoiceEngine.selectable, id: \.self) { e in
                     Text(L10n.text(e.label)).tag(e)
                 }
             }
@@ -2729,6 +3356,58 @@ private struct VoiceCloneSectionContent: View {
         // pick would fire a request that can only fail.
         .onChange(of: appState.serverOptions.kokoroVoice) { _, newValue in
             if kokoroReady { previewer.preview(newValue) }
+        }
+        .onDisappear { previewer.stop() }
+    }
+
+    private var lfm3Ready: Bool { LFM3Voice.modelPath(app: appState) != nil }
+
+    @ViewBuilder
+    private var lfm3Body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L10n.text("LFM3 voice")).font(.app(.headline).weight(.semibold))
+            if !lfm3Ready {
+                HStack(spacing: 8) {
+                    Text(L10n.text("Speaking needs LFM3 Audio 2B (about 2.5 GB)."))
+                        .font(.app(.caption)).foregroundStyle(.secondary)
+                    Button {
+                        downloads.start(repoId: LFM3Voice.repo) {
+                            appState.refreshModels()
+                            appState.server.rescanModels()
+                        }
+                    } label: { Text(L10n.text("Download")).font(.app(.body)) }
+                    .disabled(downloads.downloads[LFM3Voice.repo]?.status == .downloading)
+                }
+            }
+            HStack(spacing: 8) {
+                Picker("", selection: $appState.serverOptions.lfm3Voice) {
+                    ForEach(LFM3Voice.voices(appState.server.allModels, current: appState.serverOptions.lfm3Voice), id: \.self) { v in
+                        Text(LFM3Voice.displayName(v)).font(.app(.body)).tag(v)
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 260)
+                Button {
+                    previewer.preview(appState.serverOptions.lfm3Voice, engine: .lfm3)
+                } label: {
+                    if previewer.isPreviewing(appState.serverOptions.lfm3Voice) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Play", systemImage: "play.circle").font(.app(.body))
+                    }
+                }
+                .help(lfm3Ready ? "Hear a short sample of this voice" : "Download the model first")
+                .disabled(previewer.active != nil || !lfm3Ready)
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if let e = previewer.error {
+                Text(L10n.text(e)).font(.app(.caption)).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .onChange(of: appState.serverOptions.lfm3Voice) { _, newValue in
+            if lfm3Ready { previewer.preview(newValue, engine: .lfm3) }
         }
         .onDisappear { previewer.stop() }
     }

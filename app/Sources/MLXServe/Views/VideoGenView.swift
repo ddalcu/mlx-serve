@@ -37,9 +37,11 @@ struct VideoGenView: View {
     @State private var lanModel: String? = nil
     @State private var quality: QualityPreset = .good
     /// Pixel size of the picked first frame, read from the file's metadata
-    /// when it arrives. The shape it gives is what the "Set by starting frame"
-    /// menu offers canvases for.
+    /// when it arrives. The server crops the frame to the canvas, so its
+    /// shape sets the clip's (`frameLadder`) and nothing is cut off.
     @State private var firstFrameSize: (width: Int, height: Int)? = nil
+    /// The size fields shown over the first frame's slider, at the user's ask.
+    @State private var customClipSize = false
     // Held as text so a half-typed size is allowed while editing.
     @State private var customWidthText: String = "704"
     @State private var customHeightText: String = "448"
@@ -57,6 +59,11 @@ struct VideoGenView: View {
     /// Storyboard mode: `prompt` is the story, and `shots` are what generates.
     @State private var storyboardMode: Bool = false
     @State private var shots: [StoryboardSegment] = []
+    /// Network machines the user switched off for this pane's storyboards.
+    @State private var clusterOff: Set<String> = []
+    /// "Draw last frames" in flight, and what it last had to say.
+    @State private var drawingFrames = false
+    @State private var drawNote: String? = nil
     @State private var seed: Int = 42
     /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
     /// Several can attach at once — their effects sum, so order doesn't matter.
@@ -171,10 +178,18 @@ struct VideoGenView: View {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
-        // The menu offers canvases for the picture's shape, so the shape has
-        // to be read when the picture changes, and forgotten when it goes.
+        // A new picture sets the clip's shape, at about the size the clip had.
         .onChange(of: firstFrameImageURL) { _, url in
-            firstFrameSize = url.flatMap { AspectCanvases.pixelSize(of: $0) }
+            let size = url.flatMap { AspectCanvases.pixelSize(of: $0) }
+            firstFrameSize = size
+            guard !hydrating, let size else { return }
+            customClipSize = false
+            snapToFirstFrame(ladder(for: size))
+        }
+        // A tier that changes the grid moves a matching clip to its new step.
+        .onChange(of: frameLadder) { old, new in
+            guard !hydrating, !customClipSize, old.contains(currentCanvas), !new.contains(currentCanvas) else { return }
+            snapToFirstFrame(new)
         }
         // TTS finished → attach the spoken line as the a2vid clip.
         .onChange(of: tts.phase) { _, phase in
@@ -232,13 +247,15 @@ struct VideoGenView: View {
         .sheet(isPresented: $showEnhance) {
             PromptRewriteSheet(
                 title: storyboardOn ? "Write storyboard" : "Rewrite video prompt", clip: enhanceLength,
+                source: prompt,
                 request: { seconds in
                     let firstFrame = firstFrameImageURL.flatMap { try? Data(contentsOf: $0) }
                     return plansStoryboard(seconds)
                         ? PromptRewriter.storyboard(idea: prompt, format: model.promptFormat, totalSeconds: seconds,
                                                     shotSeconds: Storyboard.plannedRange(shotSeconds), firstFrame: firstFrame)
                         : PromptRewriter.video(text: prompt, format: model.promptFormat, seconds: seconds,
-                                               firstFrame: firstFrame)
+                                               firstFrame: firstFrame,
+                                               references: model.supportsReferences ? refImageURLs.compactMap { try? Data(contentsOf: $0) } : [])
                 },
                 onApplyClip: { seconds in
                     guard !plansStoryboard(seconds) else { return }
@@ -606,12 +623,17 @@ struct VideoGenView: View {
     private var clipSizeSection: some View {
         let verdict = customResolutionVerdict
         return VStack(alignment: .leading, spacing: 6) {
-            // Bottom, not centre: the fields carry a heading above them, and
-            // centring the row puts the button halfway up that heading.
-            HStack(alignment: .bottom, spacing: 8) {
-                clipSizeFields
-                Spacer(minLength: 8)
-                presetsMenu
+            if matchesFirstFrame {
+                firstFrameSizeSlider
+            } else {
+                // Bottom, not centre: the fields carry a heading above them, and
+                // centring the row puts the button halfway up that heading.
+                HStack(alignment: .bottom, spacing: 8) {
+                    clipSizeFields
+                    Spacer(minLength: 8)
+                    presetsMenu
+                }
+                if !frameLadder.isEmpty { firstFrameMismatch }
             }
             if let hint = clipSizeHint(verdict) {
                 Label(hint, systemImage: verdict.isValid ? "wand.and.stars" : "exclamationmark.triangle")
@@ -653,50 +675,49 @@ struct VideoGenView: View {
         }
     }
 
-    /// Canvases matching the starting frame's shape. A submenu of Presets
-    /// rather than a button of its own: it answers the same question, and one
-    /// control leaves the row room it does not have to fight for.
-    @ViewBuilder
-    private var startingFrameMenu: some View {
-        let canvases = startingFrameCanvases
-        if firstFrameImageURL == nil {
-            // Disabled as a plain ITEM, not as a disabled submenu: a submenu
-            // still opens on hover, and an empty one that opens reads as a
-            // bug rather than as "pick a picture first".
-            Button {} label: { Text("Set by starting frame…")
-                .font(.app(.body)) }
-                .disabled(true)
-        } else {
-            Menu {
-                if canvases.isEmpty {
-                    // Two rows, because `NSMenu` renders a title on one line
-                    // and drops the newline.
-                    Button {} label: { Text("Selected first frame's picture does not fit this model.")
-                        .font(.app(.body)) }
-                        .disabled(true)
-                    Button {} label: { Text("Consider its cropping or adding a letterbox.")
-                        .font(.app(.body)) }
-                        .disabled(true)
-                } else {
-                    Section("Matching \(startingFrameRatio ?? "the starting frame")") {
-                        // The source's own size is a different kind of answer
-                        // from the spread below it: it does not rescale.
-                        ForEach(canvases.filter(\.isSourceSize)) { choice in
-                            Button(choiceLabel(choice)) {
-                                setClipSize(width: choice.canvas.width, height: choice.canvas.height)
-                            }
-                        }
-                        if canvases.contains(where: \.isSourceSize) { Divider() }
-                        ForEach(canvases.filter { !$0.isSourceSize }) { choice in
-                            Button(choiceLabel(choice)) {
-                                setClipSize(width: choice.canvas.width, height: choice.canvas.height)
-                            }
-                        }
-                    }
-                }
-            } label: {
-                Text("Set by starting frame…").font(.app(.body))
+    /// The clip size while it follows the first frame: one slider over the
+    /// picture's shape, from the smallest canvas up to the picture's own size.
+    private var firstFrameSizeSlider: some View {
+        let steps = frameLadder
+        let index = steps.firstIndex(of: currentCanvas) ?? steps.count - 1
+        return VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text(L10n.text("Clip size"))
+                    .font(.app(.subheadline).weight(.semibold))
+                Spacer()
+                Button { customClipSize = true } label: { Text("Custom size…").font(.app(.caption)) }
+                    .buttonStyle(.link)
             }
+            HStack(spacing: 10) {
+                if steps.count > 1 {
+                    Slider(value: Binding(get: { Double(index) }, set: { v in
+                        let c = steps[min(steps.count - 1, max(0, Int(v.rounded())))]
+                        if c != currentCanvas { setClipSize(width: c.width, height: c.height) }
+                    }), in: 0...Double(steps.count - 1), step: 1)
+                }
+                Text(verbatim: "\(currentCanvas.width) × \(currentCanvas.height)")
+                    .font(.app(.body).monospacedDigit())
+                    .fixedSize()
+            }
+            Text(L10n.format("Matches your first frame (%@). Smaller renders faster.", startingFrameRatio ?? ""))
+                .font(.app(.caption2)).foregroundStyle(.secondary)
+        }
+    }
+
+    /// Under the size fields when a first frame is set: whether the frame will
+    /// be cropped, and the way back to its shape.
+    private var firstFrameMismatch: some View {
+        HStack(spacing: 8) {
+            if let size = firstFrameSize, AspectCanvases.deviation(of: currentCanvas, from: size) > AspectCanvases.maxDeviation {
+                Label(L10n.format("Your first frame (%@) will be cropped to fit this size.",
+                                  AspectCanvases.ratioLabel(width: size.width, height: size.height)),
+                      systemImage: "exclamationmark.triangle")
+                    .font(.app(.caption2)).foregroundStyle(.orange)
+            }
+            Button { customClipSize = false; snapToFirstFrame(frameLadder) } label: {
+                Text("Match first frame").font(.app(.caption))
+            }
+            .buttonStyle(.link)
         }
     }
 
@@ -715,13 +736,11 @@ struct VideoGenView: View {
                     }
                 }
             }
-            Divider()
-            startingFrameMenu
         } label: {
             clipMenuLabel("Presets")
         }
         .modifier(PaneChipMenu())
-        .help("Sizes this model ships with, and sizes that match the starting frame.")
+        .help("Sizes this model ships with.")
     }
 
     private func clipMenuLabel(_ title: String) -> some View {
@@ -751,26 +770,31 @@ struct VideoGenView: View {
         return out
     }
 
-    /// No ratio per row: every row has the same one, and the section heading
-    /// above them already says which.
-    private func choiceLabel(_ choice: SourceCanvasChoice) -> String {
-        var out = "\(choice.canvas.width) × \(choice.canvas.height)"
-        if let name = choice.name { out += " - \(name)" }
-        return out
-    }
-
     private var startingFrameRatio: String? {
         guard let size = firstFrameSize else { return nil }
         return AspectCanvases.ratioLabel(width: size.width, height: size.height)
     }
 
-    /// Recomputed with the tier, because the grid tightens to /64 on the
-    /// two-stage pipelines, and with the picture, because it is the picture's
-    /// shape being matched.
-    private var startingFrameCanvases: [SourceCanvasChoice] {
-        guard let size = firstFrameSize else { return [] }
-        let grid = model.resolutionGrid(twoStage: effectiveMode != .oneStage)
-        return AspectCanvases.choices(sourceWidth: size.width, sourceHeight: size.height, grid: grid)
+    /// The first frame's shape at every size this tier samples, smallest first;
+    /// empty without one. The grid tightens to /64 on two-stage pipelines.
+    private var frameLadder: [AspectCanvas] {
+        firstFrameSize.map(ladder(for:)) ?? []
+    }
+
+    private func ladder(for size: (width: Int, height: Int)) -> [AspectCanvas] {
+        AspectCanvases.ladder(sourceWidth: size.width, sourceHeight: size.height,
+                              grid: model.resolutionGrid(twoStage: effectiveMode != .oneStage))
+    }
+
+    private var currentCanvas: AspectCanvas { AspectCanvas(width: effectiveSize.width, height: effectiveSize.height) }
+
+    /// The clip follows the first frame: the slider stands in for the size fields.
+    private var matchesFirstFrame: Bool { !customClipSize && frameLadder.contains(currentCanvas) }
+
+    /// The step nearest the clip's current size, so a new picture keeps the size class.
+    private func snapToFirstFrame(_ steps: [AspectCanvas]) {
+        guard let c = AspectCanvases.nearest(steps, area: currentCanvas.area) else { return }
+        setClipSize(width: c.width, height: c.height)
     }
 
     /// Written into the fields, over a focused one too: the user picked a size
@@ -838,7 +862,7 @@ struct VideoGenView: View {
         }
         let range = 1...Storyboard.longestPlannedStory
         let initial = storyboardOn
-            ? (shots.isEmpty ? 60 : storyboardSeconds)
+            ? (shots.isEmpty ? 16 : storyboardSeconds)
             : Int((Double(numFrames) / Double(fps)).rounded())
         let longest = Storyboard.plannedRange(shotSeconds).upperBound
         return .init(initial: min(range.upperBound, max(1, initial)), range: range, note: { seconds in
@@ -893,6 +917,9 @@ struct VideoGenView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            if appState.serverOptions.lanDiscoverEnabled, model.backend == .minimaxH3, lanModel == nil {
+                clusterStrip
+            }
             ForEach($shots) { $shot in
                 shotCard($shot, index: shots.firstIndex { $0.id == shot.id } ?? 0)
             }
@@ -907,12 +934,258 @@ struct VideoGenView: View {
         }
     }
 
+    /// Network machines serving this exact pack: they render shots beside this Mac. A Mac
+    /// already sharing every step over Thunderbolt is busy with this Mac's shots, so it is left out.
+    private var clusterPeers: [RenderDevice] {
+        guard storyboardOn, lanModel == nil, model.backend == .minimaxH3 else { return [] }
+        let peers = StoryboardCluster.peers(of: model.repo, lanModels: server.lanModels(capability: "video"))
+        guard let tb = thunderbolt else { return peers }
+        return peers.filter { !StoryboardCluster.sameMachine($0.peer, tb.workerName) }
+    }
+
+    /// The Thunderbolt cluster when it serves this pack: its worker shares the video's steps.
+    private var thunderbolt: ClusterInfo? {
+        guard model.backend == .minimaxH3, lanModel == nil, let c = server.cluster,
+              c.joined, c.serves(model.repo) else { return nil }
+        return c
+    }
+
+    /// The Mac paired by Thunderbolt, by name.
+    private func partnerName(_ c: ClusterInfo) -> String {
+        c.workerName.isEmpty ? L10n.text("the other Mac") : ClusterVideoAdvice.shortName(c.workerName)
+    }
+
+    /// The paired Mac when it makes each video on this Mac faster.
+    private var pairPartner: String? {
+        guard let tb = thunderbolt else { return nil }
+        switch ClusterVideoAdvice.of(tb) {
+        case .shares, .largeOnly: return partnerName(tb)
+        case .unmeasured, .tooSlow: return nil
+        }
+    }
+
+    /// This Mac, then every network machine taking part.
+    private var shotDevices: [RenderDevice] {
+        [RenderDevice(modelId: "", peer: nil)] + clusterPeers.filter { !clusterOff.contains($0.id) }
+    }
+
+    /// Seconds per anchor second on each device; this Mac counts its Thunderbolt partner.
+    private func speedFactors(_ devices: [RenderDevice]) -> [Double] {
+        devices.map { d in
+            guard d.peer == nil, let tb = thunderbolt, pairPartner != nil else { return H3TimeEstimate.speedFactor(peer: d.peer).factor }
+            let split = H3TimeEstimate.speedFactor(peer: ClusterInfo.thunderboltPeer)
+            return split.measured ? split.factor : H3TimeEstimate.speedFactor(peer: nil).factor / ClusterVideoAdvice.stepSpeedup(tb)
+        }
+    }
+
+    private var shotCosts: [Double] {
+        shotFrames.map {
+            H3TimeEstimate.seconds(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                   frames: $0, steps: steps, fast: effectiveFast, hardware: .anchor)
+        }
+    }
+
+    /// Which device each shot is planned on, and when the storyboard ends: at once across
+    /// the machines when every join has a picture, else one shot after another.
+    private var shotPlan: (seconds: Double, machine: [Int]) {
+        let devices = shotDevices
+        let costs = shotCosts
+        let factors = speedFactors(devices)
+        let pins = shots.map { StoryboardCluster.pin($0.machine, in: devices) }
+        if devices.count > 1, clusterReady {
+            return StoryboardCluster.simulate(costs: costs, factors: factors, pins: pins)
+        }
+        let machine = pins.map { $0 ?? 0 }
+        return (zip(costs, machine).reduce(0) { $0 + $1.0 * factors[$1.1] }, machine)
+    }
+
+    /// What the pane calls a device, with this Mac's Thunderbolt partner.
+    private func deviceName(_ d: RenderDevice) -> String {
+        guard let peer = d.peer else {
+            return pairPartner.map { L10n.format("This Mac + %@", $0) } ?? L10n.text("This Mac")
+        }
+        return peer
+    }
+
+    /// One line on where this video renders: this Mac, this Mac with its Thunderbolt
+    /// partner, or a machine on the network.
+    @ViewBuilder private var renderPlan: some View {
+        if model.backend == .minimaxH3 || lanModel != nil {
+            VStack(alignment: .leading, spacing: 3) {
+                if storyboardOn, !shots.isEmpty, lanModel == nil {
+                    let plan = shotPlan
+                    let devices = shotDevices
+                    ForEach(devices.indices.filter { plan.machine.contains($0) }, id: \.self) { d in
+                        let numbers = plan.machine.indices.filter { plan.machine[$0] == d }.map { String($0 + 1) }
+                        planLine(d == 0 ? (pairPartner != nil ? .pair : .here) : .network,
+                                 L10n.format("%@: shots %@", deviceName(devices[d]), numbers.joined(separator: ", ")))
+                    }
+                } else if let lanModel {
+                    planLine(.network, L10n.format("Renders on %@, over your network.", String(lanModel.split(separator: "@").last ?? "")))
+                } else if let partner = pairPartner {
+                    planLine(.pair, L10n.format("This Mac and %@ make this video together, over Thunderbolt.", partner))
+                } else if let tb = thunderbolt, case .tooSlow = ClusterVideoAdvice.of(tb) {
+                    planLine(.here, L10n.format("Renders on this Mac. %@, paired by Thunderbolt, is too slow to make one video faster.", partnerName(tb)))
+                } else if let tb = thunderbolt {
+                    planLine(.pair, L10n.format("Renders on this Mac, with %@ over Thunderbolt when that is faster. The first video measures it.", partnerName(tb)))
+                } else {
+                    planLine(.here, L10n.text("Renders on this Mac."))
+                }
+            }
+            .help(L10n.text("Network machines each take whole shots and work on their own. A Mac paired by a Thunderbolt cable works on the same video as this one. Set both up in Settings ▸ Cluster."))
+        }
+    }
+
+    private enum PlanRoute { case here, pair, network }
+
+    private func planLine(_ route: PlanRoute, _ text: String) -> some View {
+        let (symbol, color): (String, Color) = switch route {
+        case .here: ("desktopcomputer", .secondary)
+        case .pair: ("bolt.horizontal.fill", .purple)
+        case .network: ("network", .teal)
+        }
+        return Label { Text(verbatim: text).foregroundStyle(.secondary) } icon: { Image(systemName: symbol).foregroundStyle(color) }
+            .font(.app(.caption))
+    }
+
+    /// Where one shot renders: any machine (the plan picks), this Mac, or a network machine.
+    private func shotMachineMenu(_ shot: Binding<StoryboardSegment>, index: Int) -> some View {
+        let devices = shotDevices
+        let pinned = StoryboardCluster.pin(shot.wrappedValue.machine, in: devices)
+        let plan = shotPlan.machine
+        let on = pinned ?? (index < plan.count ? plan[index] : 0)
+        let route: PlanRoute = on == 0 ? (pairPartner != nil ? .pair : .here) : .network
+        let label = pinned == nil
+            ? L10n.format("Any machine · %@", deviceName(devices[on]))
+            : deviceName(devices[on])
+        return Menu {
+            Button { shot.wrappedValue.machine = nil } label: { Text("Any machine (fastest)") }
+            Divider()
+            Button { shot.wrappedValue.machine = "" } label: {
+                Label(deviceName(devices[0]) + (pairPartner != nil ? " · Thunderbolt" : ""),
+                      systemImage: pairPartner != nil ? "bolt.horizontal.fill" : "desktopcomputer")
+            }
+            ForEach(devices.dropFirst()) { d in
+                Button { shot.wrappedValue.machine = d.peer } label: {
+                    Label(L10n.format("%@ · network", d.peer ?? ""), systemImage: "network")
+                }
+            }
+        } label: {
+            planLine(route, label)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .help(route == .pair
+              ? L10n.format("Rendered by this Mac and %@ together, over Thunderbolt.", pairPartner ?? "")
+              : route == .network ? L10n.text("Rendered whole by this machine, over your network.") : L10n.text("Rendered by this Mac."))
+    }
+
+    private var clusterReady: Bool {
+        StoryboardCluster.joinsAnchored(shots.map(\.endFramePath))
+    }
+
+    private var clusterStrip: some View {
+        let peers = clusterPeers
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "point.3.connected.trianglepath.dotted")
+                Text("Machines for this storyboard").font(.app(.caption).weight(.semibold))
+                Label(deviceName(shotDevices[0]), systemImage: pairPartner != nil ? "bolt.horizontal.fill" : "desktopcomputer")
+                    .font(.app(.caption)).padding(.horizontal, 6).padding(.vertical, 2)
+                    .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+                ForEach(peers) { p in
+                    let on = !clusterOff.contains(p.id)
+                    Button {
+                        if on { clusterOff.insert(p.id) } else { clusterOff.remove(p.id) }
+                    } label: {
+                        Label(L10n.format("%@ · network", StoryboardCluster.name(p)), systemImage: on ? "checkmark.circle.fill" : "circle")
+                            .font(.app(.caption))
+                    }
+                    .buttonStyle(.borderless)
+                    .help(H3TimeEstimate.speedFactor(peer: p.peer).measured
+                          ? L10n.text("Renders shots for this storyboard. Click to leave it out.")
+                          : L10n.text("Renders shots for this storyboard; its speed is learned from its first shot. Click to leave it out."))
+                }
+            }
+            if peers.isEmpty {
+                Text(L10n.format("Other machines sharing %@ on your network render shots here too.",
+                                 (model.repo as NSString).lastPathComponent))
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            } else if !clusterReady {
+                Text("Give every shot a last frame and the shots render on all these machines at once; without them each shot waits for the one before.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    Button(drawingFrames ? L10n.text("Drawing last frames…") : L10n.text("Draw last frames")) {
+                        drawLastFrames()
+                    }
+                    .disabled(drawingFrames || service.isRunning || shots.count < 2)
+                    .help("The Image model draws a picture for every shot that has none, each from the one before so the characters carry over. Replace any you don't like.")
+                    if drawingFrames { ProgressView().controlSize(.small) }
+                }
+            }
+            if let drawNote {
+                Text(drawNote).font(.app(.caption2)).foregroundStyle(.orange)
+            }
+        }
+        .padding(8)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// Pictures for the joins that have none, from the Image pane's model at the
+    /// video's shape. A model that edits from a picture draws each from the one
+    /// before (the pane's first frame for the first), so the cast stays the same.
+    private func drawLastFrames() {
+        let settings = ImageGenSettings.load()
+        let imageModel = settings.resolvedModel(models: server.allModels)
+        let lanId = LanPick.lanId(settings.modelId)
+        guard lanId != nil || ServerManager.resolveModelDir(repo: imageModel.repo) != nil else {
+            drawNote = L10n.format("%@ isn't downloaded. Open the Image window to get it, or add the pictures yourself.", imageModel.name)
+            return
+        }
+        let size = MediaToolArgs.nearest(effectiveSize.width, effectiveSize.height, in: imageModel.resolutions)
+            ?? imageModel.defaultResolution
+        let steps = imageModel.stepsAreFixed ? imageModel.fixedSteps : imageModel.settings(settings.quality).steps
+        drawingFrames = true
+        drawNote = nil
+        Task {
+            defer { drawingFrames = false }
+            var previous = firstFrameImageURL?.path
+            for id in shots.dropLast().map(\.id) {
+                guard let i = shots.firstIndex(where: { $0.id == id }) else { continue }
+                if let picture = shots[i].endFramePath { previous = picture; continue }
+                var req = ImageGenRequest(model: imageModel, prompt: shots[i].prompt, seed: seed &+ i,
+                                          width: size.width, height: size.height, steps: steps,
+                                          keepResident: true, lanModelId: lanId)
+                if imageModel.supportsReferenceEdit, let previous {
+                    req.initImagePath = previous
+                    req.editMode = true
+                    req.prompt = "The same characters, look and place as this picture, now: " + shots[i].prompt
+                }
+                do {
+                    let path = try await appState.imageGen.generateForAgent(req, server: server)
+                    if let j = shots.firstIndex(where: { $0.id == id }) { shots[j].endFramePath = path }
+                    previous = path
+                } catch {
+                    drawNote = error.localizedDescription
+                    break
+                }
+            }
+            if lanId == nil, !settings.keepResident,
+               let dir = ServerManager.resolveModelDir(repo: imageModel.repo) {
+                try? await server.unloadModel(id: dir)
+            }
+        }
+    }
+
     private func shotCard(_ shot: Binding<StoryboardSegment>, index: Int) -> some View {
         let range = shotSeconds
         let id = shot.wrappedValue.id
         return VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text(L10n.format("Shot %lld", Int64(index + 1))).font(.app(.caption).weight(.semibold))
+                if shotDevices.count > 1 || pairPartner != nil {
+                    shotMachineMenu(shot, index: index)
+                }
                 Spacer()
                 Text(verbatim: Storyboard.lengthLabel(clampedSeconds(shot.wrappedValue.seconds)))
                     .font(.app(.caption).monospacedDigit())
@@ -1062,9 +1335,26 @@ struct VideoGenView: View {
     private var timeEstimate: String? {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         if storyboardOn, shots.isEmpty { return nil }
+        if storyboardOn, shotDevices.count > 1 || pairPartner != nil {
+            let plan = shotPlan
+            let alone = shotCosts.reduce(0, +) * H3TimeEstimate.speedFactor(peer: nil).factor
+            let machines = Set(plan.machine).count + (pairPartner != nil && plan.machine.contains(0) ? 1 : 0)
+            return StoryboardCluster.describe(alone: alone, cluster: plan.seconds, machines: machines)
+        }
+        let frames = storyboardOn ? shotFrames : [numFrames]
+        if let tb = thunderbolt, ClusterVideoAdvice.stepSpeedup(tb) > 1 {
+            let anchor = frames.reduce(0.0) {
+                $0 + H3TimeEstimate.seconds(model: model, width: effectiveSize.width, height: effectiveSize.height,
+                                            frames: $1, steps: steps, fast: effectiveFast, hardware: .anchor)
+            }
+            let alone = anchor * H3TimeEstimate.speedFactor(peer: nil).factor
+            let split = H3TimeEstimate.speedFactor(peer: ClusterInfo.thunderboltPeer)
+            let both = split.measured ? anchor * split.factor : alone / ClusterVideoAdvice.stepSpeedup(tb)
+            return StoryboardCluster.describe(alone: alone, cluster: min(both, alone), machines: 2)
+        }
         return H3TimeEstimate.describeBest(
             model: model, width: effectiveSize.width, height: effectiveSize.height,
-            shotFrames: storyboardOn ? shotFrames : [numFrames], steps: steps, fast: effectiveFast
+            shotFrames: frames, steps: steps, fast: effectiveFast
         )
     }
 
@@ -1729,9 +2019,12 @@ struct VideoGenView: View {
 
     private var advancedBody: some View {
         VStack(alignment: .leading, spacing: 10) {
-            // Steps — more steps = more detail/smoother motion, but slower.
-            intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
-                         help: "Denoising steps. More = more detail and smoother motion, but slower.")
+            // Steps — more steps = more detail/smoother motion, but slower. A distilled student
+            // takes one count, which a slider pinned at it would only pretend to offer.
+            if model.fixedSteps == nil {
+                intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
+                             help: "Denoising steps. More = more detail and smoother motion, but slower.")
+            }
             Text(L10n.text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp))
                 .font(.app(.caption2)).foregroundStyle(.secondary)
             // The low end is REACHABLE and only advised against, so the pane
@@ -2125,6 +2418,7 @@ struct VideoGenView: View {
                 Text("\(VideoModelPreset.deliveredFrames(perWindow: numFrames, chainWindows: chainWindows)) frames at \(effectiveSize.width) × \(effectiveSize.height) is more than one response can carry. Shorten the clip, drop a window, or use a smaller canvas.")
                     .font(.app(.caption2)).foregroundStyle(.orange)
             }
+            renderPlan
             if !service.isRunning, let est = timeEstimate {
                 Text(L10n.text(est))
                     .font(.app(.caption))
@@ -2506,8 +2800,8 @@ struct VideoGenView: View {
     /// A storyboard runs its shots; anything else is one request.
     private func run(_ req: VideoGenRequest) {
         guard storyboardOn else { return service.generate(req, server: server) }
-        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1, $0.endFramePath) },
-                                   server: server)
+        service.generateStoryboard(req, shots: zip(shots, shotFrames).map { ($0.prompt, $1, $0.endFramePath, $0.machine) },
+                                   peers: clusterPeers.filter { !clusterOff.contains($0.id) }, server: server)
     }
 
     /// Whether this pane's current selection needs the Turbo adapter fetched.

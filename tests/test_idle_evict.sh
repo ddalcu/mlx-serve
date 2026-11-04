@@ -1,29 +1,30 @@
 #!/bin/bash
-# --idle-evict-secs: a model nobody is using leaves residency, and the next
-# request cold-loads it back.
+# test_idle_evict.sh — --idle-evict-secs: a model nobody uses leaves residency (read from /api/ps, never the `state`
+# field: "unloaded" with the memory still held is the failure) and the next request cold-loads it back. Each cycle
+# fires /api/tags, /api/show and a chat (the three readers of retained CPU state that hold no refcount) concurrently
+# with the reload; a status poll (GET /props) must not reload; RSS stays flat across cycles that end with nothing
+# resident (64 MB bar on settled readings, cycles 6..12: the allocator grows for ~5 cycles, then holds); a boot
+# without the flag keeps the model resident. 2 s window.
 #
-# The reload this makes routine is also what the test is for. Three endpoints
-# read an entry's RETAINED CPU state (config, chat template) without holding a
-# refcount — /api/tags, /api/show, and the pre-load text-gen gate on a chat
-# request — and a reload frees that state. So each cycle fires all three
-# concurrently with the reload. Residency is read back from /api/ps rather than
-# trusting the `state` field: "unloaded" with the memory still held is the
-# failure this flag exists to prevent.
+#   ./tests/test_idle_evict.sh [root] [port]   # IDLE_EVICT_CYCLES, IDLE_EVICT_RSS_LIMIT_MB
 #
-# Usage: ./tests/test_idle_evict.sh [root] [port]
+# Hermetic twins: idleEvictable, pickIdleEvictable, idleEvictTickMs, the `.loading` reader predicates.
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 ROOT="${1:-$HOME/.mlx-serve/models}"
 PORT="${2:-8098}"
 BASE="http://127.0.0.1:$PORT"
-CYCLES="${IDLE_EVICT_CYCLES:-9}"
+CYCLES="${IDLE_EVICT_CYCLES:-12}"
 # Resident bytes may not grow across cycles that all end with NOTHING loaded:
 # each reload replaces the previous generation of CPU state and must free it.
 # Measured from cycle 4 — the first concurrent cycles pay a one-time warm-up
 # (prefix cache, MLX buffer pool, the OS returning freed pages lazily) worth
 # hundreds of MB, and on LFM2.5 it takes three to settle. Cycles 4..9 are flat.
-RSS_GROWTH_LIMIT_MB="${IDLE_EVICT_RSS_LIMIT_MB:-40}"
+# Bar: above one ~40 MB step of freed large blocks malloc keeps resident (live heap flat), far
+# below the ~196 MB/cycle orphan.
+RSS_GROWTH_LIMIT_MB="${IDLE_EVICT_RSS_LIMIT_MB:-64}"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
 if [ ! -d "$ROOT" ]; then
@@ -56,10 +57,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in $(seq 1 30); do
-    curl -fs "$BASE/health" >/dev/null 2>&1 && break
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || true
 FAIL=0
 
 chat() {  # prints the HTTP status
@@ -69,7 +67,18 @@ chat() {  # prints the HTTP status
 }
 # Resident entries only — /api/ps lists `.ready` models with their bytes.
 resident_count() { curl -fs "$BASE/api/ps" | grep -o '"name"' | wc -l | tr -d ' '; }
-server_rss_mb() { ps -o rss= -p $SERVER_PID | awk '{printf "%d", $1/1024}'; }
+raw_rss_mb() { ps -o rss= -p $SERVER_PID | awk '{printf "%d", $1/1024}'; }
+# Settled: the OS hands an unloaded model's pages back lazily (a read right after
+# eviction can still carry GBs of them), so read until it stops dropping.
+server_rss_mb() {
+    local prev cur; prev=$(raw_rss_mb)
+    for _ in $(seq 1 20); do
+        sleep 0.5; cur=$(raw_rss_mb)
+        [ $((prev - cur)) -le 4 ] && break
+        prev=$cur
+    done
+    echo "$cur"
+}
 
 wait_unloaded() {  # 0 = nothing resident within the timeout
     for _ in $(seq 1 40); do
@@ -139,14 +148,14 @@ for i in $(seq 2 "$CYCLES"); do
     curl -fs "$BASE/health" >/dev/null || { echo -e "${RED}FAIL${NC} cycle $i: server died"; FAIL=1; break; }
     wait_unloaded || { echo -e "${RED}FAIL${NC} cycle $i: never went idle"; FAIL=1; break; }
     CYCLE_RSS=$(server_rss_mb)
-    [ "$i" -lt 4 ] || [ -n "$BASE_RSS" ] || BASE_RSS="$CYCLE_RSS"   # cycle 4 = the warm baseline
+    [ "$i" -lt 6 ] || [ -n "$BASE_RSS" ] || BASE_RSS="$CYCLE_RSS"   # cycle 6 = the warm baseline
     echo "    cycle $i ok — RSS ${CYCLE_RSS} MB"
 done
 
 if [ "$FAIL" = "0" ] && [ -n "$BASE_RSS" ]; then
     END_RSS=$(server_rss_mb)
     GROWTH=$((END_RSS - BASE_RSS))
-    echo "  RSS across cycles 4..$CYCLES, nothing resident at either end: ${BASE_RSS} → ${END_RSS} MB (+${GROWTH})"
+    echo "  RSS across cycles 6..$CYCLES, nothing resident at either end: ${BASE_RSS} → ${END_RSS} MB (+${GROWTH})"
     if [ "$GROWTH" -gt "$RSS_GROWTH_LIMIT_MB" ]; then
         echo -e "${RED}FAIL${NC} +${GROWTH} MB with nothing resident — a reload is orphaning its CPU state"
         FAIL=1
@@ -158,7 +167,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
 wait $SERVER_PID 2>/dev/null || true
 "$BINARY" --model-dir "$ROOT" --serve --port "$PORT" ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 30); do curl -fs "$BASE/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "$BASE" 30 1 || true
 [ "$(chat)" = "200" ] || { echo -e "${RED}FAIL${NC} control server did not serve"; FAIL=1; }
 sleep 8
 if [ "$(resident_count)" = "1" ]; then

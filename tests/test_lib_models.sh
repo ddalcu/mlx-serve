@@ -4,6 +4,7 @@
 #
 # Run: bash tests/test_lib_models.sh
 set -u
+unset MAX_MODEL_GB  # the budget cases derive it; a caller's cap would mask them
 source "$(dirname "$0")/_lib_models.sh"
 
 PASS=0; FAIL=0

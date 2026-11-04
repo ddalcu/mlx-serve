@@ -28,7 +28,7 @@ BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 if [[ ${#PACKS[@]} -eq 0 ]]; then
     for rel in TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP mlx-community/Llama-3.2-3B-Instruct-4bit \
                LiquidAI/LFM2.5-2.6B-MLX-mxfp4 ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit \
-               mlx-community/Qwen3.5-0.8B-MLX-4bit mlx-community/gemma-4-e4b-it-8bit; do
+               mlx-community/Qwen3.5-0.8B-MLX-4bit mlx-community/gemma-4-e4b-it-8bit RecursiveSI/flint-int4; do
         p=$(find_model "$rel") && PACKS+=("$p") || echo "SKIP: $rel not on this box"
     done
 fi
@@ -40,7 +40,7 @@ for pack in "${PACKS[@]}"; do
     HOME="$WORK" "$BIN" --model "$pack" --serve --host 127.0.0.1 --port "$PORT" > "$WORK/server.log" 2>&1 &
     SRV=$!
     for _ in $(seq 1 600); do curl -sf "http://127.0.0.1:$PORT/v1/models" 2>/dev/null | grep -q '"id"' && break; sleep 1; done
-    "$PY" - "$pack" "$PORT" src/server.zig src/chat.zig app/Sources/MLXServe/AppState.swift src/html/index.html \
+    "$PY" - "$pack" "$PORT" src/host/api/chat_stream.zig src/host/chat/render.zig app/Sources/MLXServe/AppState.swift src/html/index.html \
         tests/fixtures/tokenizer_parity/qwen3_8.json <<'PY' || fail=1
 import difflib, json, sys, urllib.request
 from tokenizers import Tokenizer

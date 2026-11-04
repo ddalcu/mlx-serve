@@ -8,12 +8,19 @@ enum VoiceEngine: String, Codable, CaseIterable, Sendable {
     case clone
     /// Kokoro-82M with a built-in or blended voice.
     case kokoro
+    /// LFM3-Audio / Omni's own voices (19 languages, female and male).
+    case lfm3
+
+    /// What Settings and an agent's voice menu offer. `.system` stays for saved agents and as the fallback that keeps
+    /// a failed synthesis from going silent; a saved global `.system` reads as Kokoro.
+    static let selectable: [VoiceEngine] = [.clone, .kokoro, .lfm3]
 
     var label: String {
         switch self {
         case .system: return "System voice"
         case .clone: return "My cloned voice"
         case .kokoro: return "Kokoro (fast, built-in voices)"
+        case .lfm3: return "LFM3 (19 languages)"
         }
     }
 }
@@ -75,6 +82,18 @@ struct ServerOptions: Codable, Equatable {
     /// Name other Macs see for this one (`--lan-name`). Empty = hostname.
     var lanName: String = ""
 
+    // MARK: Thunderbolt cluster (RDMA)
+    /// Host: this server runs `clusterModelPath` across this Mac and a worker
+    /// (`--dist`). Worker: the app runs `mlx-serve worker` for another Mac's host.
+    var clusterRole: ClusterRole = .off
+    var clusterMode: ClusterMode = .pipeline
+    /// The model the two Macs serve together; the worker finds its own copy by folder name.
+    var clusterModelPath: String = ""
+    /// The RDMA port facing the other Mac (`rdma_enX`). Empty = the one that is up.
+    var clusterDevice: String = ""
+    /// The host's address the worker dials. Empty = the host's Thunderbolt address.
+    var clusterCoordinator: String = ""
+
     // Speculative decoding (server-launch flags)
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
     var pldDraftLen: Int = 5
@@ -124,6 +143,14 @@ struct ServerOptions: Codable, Equatable {
     var aneImage: Bool = false
     var aneVideo: Bool = false
     var aneAudio: Bool = false
+    /// `--w8a8` / `--no-w8a8`: image, video, music and 3D transformers run as rotated int8 x int8 on
+    /// M5-class GPUs (lossy, faster). The server turns it on by itself only with NAX (M5 family) and
+    /// 64 GiB of RAM, so this default is the same function and BOTH choices are emitted.
+    var w8a8: Bool = ServerOptions.defaultW8a8(
+        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, isM5Family: AnePrefillAdvice.liveIsM5Family)
+    static func defaultW8a8(physicalMemoryBytes: UInt64, isM5Family: Bool) -> Bool {
+        isM5Family && physicalMemoryBytes >= 64 * 1_073_741_824
+    }
     /// `--ane-slots`: requests each Neural Engine model runs at once. Slots share the weights and
     /// the engines, so they split one stream's speed; each adds its own KV and state.
     var aneSlots: Int = 1
@@ -309,11 +336,13 @@ struct ServerOptions: Codable, Equatable {
     /// has no voice list, Kokoro sends `voice` and cannot clone. Sending the
     /// wrong one is a named 400 server-side, so the engine choice decides which
     /// field is sent rather than both being attempted.
-    var voiceEngine: VoiceEngine = .system
+    var voiceEngine: VoiceEngine = .kokoro
     /// Which Kokoro voice to speak with. A comma-separated list BLENDS voices
     /// (`"af_bella,af_sky"`) — the reference's own convention, passed through
     /// verbatim.
     var kokoroVoice: String = "af_heart"
+    /// Which LFM3 voice to speak with (`<language>-<female|male>`, listed on its `/v1/models` row).
+    var lfm3Voice: String = "american-english-female"
     /// Wake phrase for hands-free voice mode ("hey loki" by default). Stored
     /// as the user typed it in Settings ▸ Voice; consumers normalize through
     /// `WakeWord.normalizePhrase` (blank → default). App-side like the other
@@ -325,6 +354,26 @@ struct ServerOptions: Codable, Equatable {
     /// for the chat model in use, or `notesOff`.
     var transcriptNotesModel: String = ""
     static let notesOff = "off"
+    /// What turns speech into words: the Qwen3-ASR pack with its aligner and diarizer, or Nemotron 3.5 Transcribe
+    /// alone (it times and tells speakers apart itself, and writes the notes).
+    var transcribeEngine: TranscribeEngine = .combo
+    enum TranscribeEngine: String, Codable, CaseIterable, Identifiable {
+        case combo, nemotron
+        var id: String { rawValue }
+        var label: String {
+            switch self {
+            case .combo:    return "Qwen3-ASR + aligner + diarizer"
+            case .nemotron: return "Nemotron 3.5 Transcribe"
+            }
+        }
+        /// The `config.json` model_types of the packs that transcribe (NVIDIA's name and mlx-audio's).
+        var asrModelTypes: [String] {
+            switch self {
+            case .combo:    return ["qwen3_asr"]
+            case .nemotron: return ["nemo_speechlm", "nemotron_transcribe"]
+            }
+        }
+    }
     /// Minutes of silence after which a tray recording stops itself; 0 never.
     var transcriptAutoStopMinutes: Int = 10
     /// Start a tray recording when an app turns the camera on.
@@ -484,6 +533,12 @@ struct ServerOptions: Codable, Equatable {
 
     /// Compares only fields that affect the launched mlx-serve process, ignoring
     /// per-request defaults.
+    /// The cluster fields the server's flags read: a host's only (a worker is its own process).
+    private var hostCluster: [String]? {
+        guard clusterRole == .host else { return nil }
+        return [clusterMode.rawValue, clusterModelPath, clusterDevice, clusterCoordinator]
+    }
+
     func serverLaunchEquals(_ other: ServerOptions) -> Bool {
         host == other.host &&
         port == other.port &&
@@ -500,6 +555,7 @@ struct ServerOptions: Codable, Equatable {
         lanSharedModels == other.lanSharedModels &&
         lanDiscoverEnabled == other.lanDiscoverEnabled &&
         lanName == other.lanName &&
+        hostCluster == other.hostCluster &&
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
@@ -510,6 +566,7 @@ struct ServerOptions: Codable, Equatable {
         aneImage == other.aneImage &&
         aneVideo == other.aneVideo &&
         aneAudio == other.aneAudio &&
+        w8a8 == other.w8a8 &&
         aneSlots == other.aneSlots &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
@@ -552,10 +609,11 @@ struct ServerOptions: Codable, Equatable {
     ///   ≤18 GB (16 GB Macs): 1   ≤36 GB (24/32 GB): 8   else: uncapped.
     /// Snap points for the model memory cap slider, in GiB. 0 is Auto and is
     /// always first. The ladder stops at the machine's RAM — a cap above it
-    /// can never be reached, so offering it is theatre.
+    /// can never be reached, so offering it is theatre. 224 lets a 256 GB Mac
+    /// hold one 200 GB model and refuse a second one beside it.
     static func residentMemPresets(physicalMemoryBytes: UInt64) -> [Int] {
         let ram = Int(physicalMemoryBytes / 1_073_741_824)
-        return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
+        return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 224, 256, 384, 512]
             .filter { $0 <= max(ram, 8) }
     }
 
@@ -585,6 +643,11 @@ struct ServerOptions: Codable, Equatable {
         return min(requested, ceiling)
     }
 
+    /// `--model-dir` per folder, in order: the one place the flag is spelled.
+    static func modelDirArgs(_ dirs: [String]) -> [String] {
+        dirs.filter { !$0.isEmpty }.flatMap { ["--model-dir", $0] }
+    }
+
     func toCLIArgs(modelDirOverride: String? = nil,
                    physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
         toCLIArgs(modelDirs: modelDirOverride.map { [$0] } ?? [],
@@ -612,9 +675,7 @@ struct ServerOptions: Codable, Equatable {
         if !logToFile {
             args += ["--log-file", "off"]
         }
-        for dir in modelDirs where !dir.isEmpty {
-            args += ["--model-dir", dir]
-        }
+        args += Self.modelDirArgs(modelDirs)
         if ctxSize > 0 {
             args += ["--ctx-size", "\(ctxSize)"]
         }
@@ -649,6 +710,7 @@ struct ServerOptions: Codable, Equatable {
         if lanDiscoverEnabled {
             args += ["--lan-discover"]
         }
+        args += ClusterSetup.hostArgs(self)
         let trimmedLanName = lanName.trimmingCharacters(in: .whitespacesAndNewlines)
         if (lanShareEnabled || lanDiscoverEnabled) && !trimmedLanName.isEmpty {
             args += ["--lan-name", trimmedLanName]
@@ -680,6 +742,7 @@ struct ServerOptions: Codable, Equatable {
         if aneImage { args += ["--ane-image"] }
         if aneVideo { args += ["--ane-video"] }
         if aneAudio { args += ["--ane-audio"] }
+        args += [w8a8 ? "--w8a8" : "--no-w8a8"]
         if aneSlots > 1 { args += ["--ane-slots", "\(aneSlots)"] }
         // Decode attention requant: tri-state — undecided emits NOTHING (the
         // server default keeps laguna on and dsv4's comp_in dense); an
@@ -876,6 +939,11 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent([String].self, forKey: .lanSharedModels) { lanSharedModels = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanDiscoverEnabled) { lanDiscoverEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lanName) { lanName = v }
+        if let v = try c.decodeIfPresent(ClusterRole.self, forKey: .clusterRole) { clusterRole = v }
+        if let v = try c.decodeIfPresent(ClusterMode.self, forKey: .clusterMode) { clusterMode = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterModelPath) { clusterModelPath = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterDevice) { clusterDevice = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .clusterCoordinator) { clusterCoordinator = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .decodeAttnQuantChoice) {
             decodeAttnQuantChoice = v
@@ -897,6 +965,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneImage) { aneImage = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneVideo) { aneVideo = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .aneAudio) { aneAudio = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .w8a8) { w8a8 = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .aneSlots) { aneSlots = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
@@ -946,16 +1015,18 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }
-        if let v = try c.decodeIfPresent(VoiceEngine.self, forKey: .voiceEngine) { voiceEngine = v }
+        if let v = try c.decodeIfPresent(VoiceEngine.self, forKey: .voiceEngine) { voiceEngine = v == .system ? .kokoro : v }
         else if let legacy = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) {
             // Configs written before the engine picker existed only carried the
             // clone toggle. Changing a persisted DEFAULT does nothing for
             // existing users, so migrate the old field explicitly rather than
             // stranding them on `.system` with a clip they already recorded.
-            voiceEngine = (legacy && !voiceClonePath.isEmpty) ? .clone : .system
+            voiceEngine = (legacy && !voiceClonePath.isEmpty) ? .clone : .kokoro
         }
         if let v = try c.decodeIfPresent(String.self, forKey: .kokoroVoice) { kokoroVoice = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .lfm3Voice) { lfm3Voice = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
+        if let v = try c.decodeIfPresent(TranscribeEngine.self, forKey: .transcribeEngine) { transcribeEngine = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .transcriptNotesModel) { transcriptNotesModel = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .transcriptAutoStopMinutes) { transcriptAutoStopMinutes = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .transcriptAutoStartCamera) { transcriptAutoStartCamera = v }
@@ -1079,6 +1150,26 @@ extension ServerOptions {
             title: "Shown to others as",
             explainer: "The name other Macs see; leave blank to use this Mac's name.",
             needsRestart: true),
+        "clusterRole": .init(
+            title: "This Mac in a Thunderbolt cluster",
+            explainer: "Host runs one model across this Mac and another over Thunderbolt; worker lends this Mac to another Mac's host.",
+            needsRestart: true),
+        "clusterMode": .init(
+            title: "Split",
+            explainer: "By layers: each Mac runs its own layers in turn, fast with little traffic. By experts: both Macs work on every layer at once.",
+            needsRestart: true),
+        "clusterModelPath": .init(
+            title: "Model",
+            explainer: "The model both Macs serve together; the other Mac needs the same model in its library.",
+            needsRestart: true),
+        "clusterDevice": .init(
+            title: "Thunderbolt port",
+            explainer: "The port the cable to the other Mac is in.",
+            needsRestart: true),
+        "clusterCoordinator": .init(
+            title: "Host address",
+            explainer: "Where the worker finds the host; leave blank to use the Thunderbolt link.",
+            needsRestart: true),
         "lanDiscoverEnabled": .init(
             title: "Use models shared by other Macs",
             explainer: "Show models other Macs share, which run on their Mac.",
@@ -1119,6 +1210,10 @@ extension ServerOptions {
             explainer: "Generate music faster with the Neural Engine; off by default, and the server declines if this Mac can't fit it.",
             needsRestart: true,
             cost: "Memory: 1.5–2 GB more while ACE-Step is loaded, plus up to 2.5 GB during the one-time build. Disk: 1–2 GB once; every song length shares it."),
+        "w8a8": .init(
+            title: "Neural Accelerator int8 (M5)",
+            explainer: "Faster images and video on M5 Macs, slightly lossy; off uses less memory with 4-bit models.",
+            needsRestart: true),
         "aneSlots": .init(
             title: "Neural Engine requests at once",
             explainer: "How many requests a model on the Neural Engine answers together; they share its speed, and each adds its own memory.",
@@ -1214,7 +1309,7 @@ extension ServerOptions {
             needsRestart: true),
         "ssdStreaming": .init(
             title: "SSD weight streaming",
-            explainer: "Read DeepSeek-V4-Flash from disk so it runs, a bit slower, on Macs with less memory.",
+            explainer: "Read a DeepSeek-V4 GGUF from disk so it runs, a bit slower, on Macs with less memory. MLX packs always load fully into memory.",
             needsRestart: true),
         "tokenizeCacheEntries": .init(
             title: "Tokenize cache entries",

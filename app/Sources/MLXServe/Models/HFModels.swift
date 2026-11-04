@@ -39,22 +39,30 @@ private let supportedArchitectureTagPrefixes: [String] = [
 /// model_type values from config.json that the Zig server can load.
 /// MLX-format DeepSeek-V4 is intentionally NOT in this set — DSV4 is served
 /// by the embedded ds4 engine, which loads the GGUF checkpoint directly.
+/// Served model types the Hugging Face search does not offer: the server loads them only
+/// from an mlx-stream pack (the trunk beside an `experts.bin` bank), and an ordinary
+/// checkpoint with the same model_type does not load. A local pack still lists and picks.
+let streamOnlyModelTypes: Set<String> = ["glm_moe_dsa"]
+
 let supportedModelTypes: Set<String> = [
     "gemma3", "gemma3_text", "gemma4", "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
-    "diffusion_gemma", // DiffusionGemma block diffusion (text-only; vision tower not wired)
     "qwen3", "qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
     "qwen3_moe", "qwen3_moe_text",
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "qwen2",
     "llama", "mistral",
-    "lfm2", "lfm2_vl", "lfm2_moe", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
-    "nemotron_h",
+    "lfm2", "lfm2_vl", "lfm2-vl", "lfm2_moe", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
+    "lfm3", "lfm3_vl", "lfm3_audio", "lfm3_omni", // Liquid LFM3: text, VL, speech in + out, all of it
+    "nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni",
+    "nemo_speechlm", "nemotron_transcribe", // NVIDIA Nemotron 3.5 Transcribe (speech in, Nemotron-H trunk); mlx-audio names it the second
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
+    "flint", // Recursive Flint (39.8B-A2.5B MoE coder)
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
+    "glm_moe_dsa", // Z.ai GLM-5.3 (744B MoE): an mlx-stream pack (the trunk beside an experts.bin bank)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", "muse_glimmer_text", // meta-models Muse-Glimmer-30B (text + vision)
     "bailing_hybrid", // inclusionAI Ling 3.0 (KDA + MLA hybrid MoE)
@@ -70,7 +78,7 @@ let supportedModelTypes: Set<String> = [
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
-    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/deepseek_v41.zig), the EXL3 repack on mlx-stream
+    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/plugins/deepseek_v41/deepseek_v41.zig), the EXL3 repack on mlx-stream
     "gpt_oss",
 ]
 
@@ -80,9 +88,10 @@ let supportedModelTypes: Set<String> = [
 /// so they must pass the architecture gate (not show "Unsupported
 /// architecture" in the Downloaded tab) while still being excluded from
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
-/// Mirrors `model_discovery.isMediaModelType` (Zig).
-private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "qwen_image", "hunyuan3d"]
-// Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
+/// Mirrors the server's media plugins (their `model_types`) for rows no server
+/// has classified: a Discover search hit, a download on disk.
+private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "qwen_image", "moss_image", "hunyuan3d"]
+// Mirrors the media plugins' `model_types` on the server. Drift here is not cosmetic:
 // a media model missing from this list fails the ARCHITECTURE gate outright,
 // so the browser draws it a red "Unsupported" — which is what happened to
 // `minimax_music3` on the same screen that offers to download it, and to bare
@@ -93,12 +102,11 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // architecture" are different decisions, and it was getting both. Exclusion
 // from pickers is `isChatPickable`'s job, which reads this same list. #228.
 //
-// `MediaModalityParityTests` reads `media_model_types` out of src/gen.zig and
-// asserts this agrees. Zig already pinned its own two copies against each
-// other; nothing pinned Swift, which is why this drifted unnoticed.
+// `MediaModalityParityTests` reads every media plugin's `model_types` out of src/plugins/*/config.zig and
+// asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization",
+    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d", "idol",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -134,15 +142,35 @@ func discoverableMediaModelType(_ modelType: String) -> Bool {
 /// Use button that only knew "audio" would drop a music model on the Voice
 /// tab. `CustomMediaModels.musicFamily` is the existing discriminator; this is
 /// the same split, minus the running-server requirement (a browser row is a
-/// filesystem `LocalModel` with no capabilities).
+/// filesystem `LocalModel` with no capabilities; a server row names it as `modality`).
 enum MediaModality: CaseIterable {
     case image, voice, music, sound, video, mesh
+
+    /// A `/v1/models` row's `modality` (src/host/api/model_row_facts.zig); nil for one with no create pane.
+    init?(served: String) {
+        switch served {
+        case "image": self = .image
+        case "speech": self = .voice
+        case "music": self = .music
+        case "sound": self = .sound
+        case "video": self = .video
+        case "3d": self = .mesh
+        default: return nil
+        }
+    }
+
+    /// The pane of the local pack at `path`: what the server says of it when it lists the pack (an outside
+    /// plugin's packs included), else the app's own map of `modelType` (no server, or an older one).
+    static func of(modelType: String, path: String, rows: [ModelInfo]) -> MediaModality? {
+        if let served = ModelSettingsApply.row(for: path, in: rows)?.modality { return MediaModality(served: served) }
+        return MediaModality(modelType: modelType)
+    }
 
     init?(modelType: String) {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
-            || modelType.hasPrefix("qwen_image") { self = .image; return }
-        if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
+            || modelType.hasPrefix("qwen_image") || modelType == "moss_image" { self = .image; return }
+        if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" || modelType == "idol" { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
         case "acestep", "minimax_music3", "yue2": self = .music
@@ -210,7 +238,8 @@ struct HFConfigMeta: Codable {
 /// (they come through the main door); their raw upstream layouts are not
 /// served, so their classes deliberately map nowhere.
 private let servedDiffusersClasses: [String: String] = [
-    "MageFlowPipeline": "mage_flow", // mirrors model_discovery.peekMageFlowIndex
+    "MageFlowPipeline": "mage_flow", // mirrors the mage_flow plugin's `claims`
+    "MOSSImagePipeline": "moss_image", // mirrors model_discovery.peekMossImageIndex
 ]
 
 struct HFModel: Identifiable, Codable {
@@ -303,7 +332,7 @@ struct HFModel: Identifiable, Codable {
         // HF tags every repo with its config.json model_type, so a served
         // model_type counts verbatim, no family prefix needed.
         return tags.contains { tag in
-            supportedModelTypes.contains(tag)
+            (supportedModelTypes.contains(tag) && !streamOnlyModelTypes.contains(tag))
                 || supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
         }
     }
@@ -342,6 +371,19 @@ struct HFModel: Identifiable, Codable {
 
     private static let unsupportedQuantizationTokens: [String] = ["mxfp6"]
 
+    /// An NVIDIA ModelOpt checkpoint (`modelopt_pack.zig` serves it as published).
+    var isModelOptRepo: Bool {
+        (tags ?? []).contains { $0.lowercased() == "modelopt" }
+    }
+
+    /// ModelOpt packs verified to load. ModelOpt is a toolkit, not a layout: two packs of one
+    /// model differ (csf vs dense scales, an NVFP4 vs FP8 n-gram table, MXFP8 vs NVFP4
+    /// linears), so the model_type cannot tell a servable pack from one refused at load.
+    static let verifiedModelOptRepos: Set<String> = [
+        "nvidia/Qwen3.8-Flash-Next-FP4-Local",
+        "nvidia/GLM-5.3-Flash-FP4-Local",
+    ]
+
     /// Human-readable reason why this model isn't compatible. The row renders
     /// it verbatim, so the lookup runs here. `mlx-serve` is the repo's own name.
     var incompatibleReason: String? {
@@ -357,6 +399,9 @@ struct HFModel: Identifiable, Codable {
         }
         if let quant = unsupportedQuantization {
             return L10n.format("Unsupported quantization (%@)", quant)
+        }
+        if isModelOptRepo, !Self.verifiedModelOptRepos.contains(id) {
+            return L10n.text("Unsupported ModelOpt layout")
         }
         return nil
     }
@@ -485,7 +530,7 @@ struct HFModel: Identifiable, Codable {
                 guard let bits = packedBitWidth(forId: id) else { return nil }
                 bytesPerParam = (bits + 0.5) / 8
             case "F16", "BF16", "U16", "I16": bytesPerParam = 2
-            case "I8", "U8": bytesPerParam = 1
+            case "I8", "U8", "F8_E4M3", "F8_E5M2", "F8_E8M0": bytesPerParam = 1
             case let d where d.contains("4"): bytesPerParam = 0.5
             default: bytesPerParam = 2
             }

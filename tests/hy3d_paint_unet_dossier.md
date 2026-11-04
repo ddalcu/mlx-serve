@@ -2,7 +2,7 @@
 
 Companion to `hy3d_paint_weights_contract.md`; every fact below read directly from
 `reference/hy3dpaint/hunyuanpaintpbr/{unet/modules.py, unet/attn_processor.py, pipeline.py}`.
-This is the P2-7/P2-8 spec for `src/hunyuan3d_paint.zig`.
+This is the P2-7/P2-8 spec for `src/plugins/hunyuan3d/paint.zig`.
 
 ## Base UNet (SD2.1, use_linear_projection=true)
 

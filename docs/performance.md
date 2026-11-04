@@ -31,6 +31,27 @@ Since v26.8.6, sliding-window models trim every attention read to their window: 
 
 The gain grows with the conversation; below roughly 8k there is nothing to trim yet.
 
+## Int8 Q/K prefill attention (NAX GPUs)
+
+Pass `--int8-qk` to run the causal prefill attention of dense Qwen 3.5/3.6/3.8 models with int8 Q and K. The option is **off by default** and **lossy**. It needs a GPU with neural accelerators (M5-class and later).
+
+The route quantizes Q per 64 rows and K per 32 keys, after it removes each head's mean key, and multiplies them in int8. P and V stay in half precision. Decode and prompt widths under 64 rows keep the stock kernels. A model whose prefill does not use the head-dim-256 causal path does not take the route: Flash-Next (`qwen4_exp`) switches to its own sparse attention past 2,048 tokens. Gemma and Spark take it when the variable is set, but quality was measured on the Qwen3.8 27B only.
+
+Qwen3.8-27B 4-bit on an M5 Ultra (256 GB), one request per cell, `--no-mtp --max-concurrent 1`, prefill tok/s, two boots per arm (A B B A):
+
+| Keys | Off | On | Gain |
+|---|---|---|---|
+| 8k | 1,544.1 / 1,540.2 | 1,543.3 / 1,546.9 | +0.2% |
+| 32k | 1,387.5 / 1,387.1 | 1,419.0 / 1,439.7 | +3.0% |
+| 64k | 1,215.5 / 1,214.4 | 1,301.6 / 1,300.2 | +7.1% |
+| 128k | 947.8 / 949.8 | 1,080.4 / 1,084.6 | +14.1% |
+
+Attention is a larger share of a longer prefill, so the gain grows with context and is nil at 8k.
+
+Against the route off, a 23,311-token echo NLL (measured on an M5 Max, 128 GB) moves by +0.001 nats and teacher-forced top-1 agreement is 98.3%. On a 113,784-token text the NLL moves by +0.0003 nats with no drift from 0 to 114k tokens. Greedy 64-token continuations after three prompts of 10k to 17k tokens match the stock path on two and diverge at token 48 on the third.
+
+When the route runs, the server logs `[attn] int8 QK hd-256 prefill attention engaged (--int8-qk; lossy)` once.
+
 ## Tuning
 
 The defaults are already the fast path. **If you have plenty of RAM, the fastest configuration is the one you get out of the box.** Every speed-relevant knob is a memory-for-speed trade in one direction or the other.

@@ -375,7 +375,7 @@ echo ""
 # ── Test G: a reader that lags the end of the stream gets EOF, not a reset ──
 # The SSE body ends when the server closes. A socket closed under a reader that
 # has not caught up is dropped by the kernel with an RST once its FIN_WAIT_2
-# timer runs out (net.inet.tcp.fin_timeout, 60 s), so the client read the whole
+# timer runs out (macOS net.inet.tcp.fin_timeout, Linux net.ipv4.tcp_fin_timeout; 60 s), so the client read the whole
 # body and then ECONNRESET instead of EOF. The reader here waits out that timer
 # after the server has finished (this test takes over a minute).
 echo "--- Test G: tools + reasoning budget — a lagging reader ends with EOF, not a reset ---"
@@ -383,7 +383,10 @@ G_OUT=$(python3 - "$PORT" <<'PY'
 import json, socket, subprocess, sys, time
 
 port = int(sys.argv[1])
-fin_timeout = int(subprocess.check_output(["sysctl", "-n", "net.inet.tcp.fin_timeout"]).strip()) / 1000
+if sys.platform == "darwin":
+    fin_timeout = int(subprocess.check_output(["sysctl", "-n", "net.inet.tcp.fin_timeout"]).strip()) / 1000
+else:
+    fin_timeout = int(open("/proc/sys/net/ipv4/tcp_fin_timeout").read())
 body = json.dumps({
     "model": "mlx-serve",
     "input": "What is the weather in Paris? Think about which unit to use first.",
@@ -398,6 +401,10 @@ sock.sendall((f"POST /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n"
 client_port = sock.getsockname()[1]
 
 def server_closed():
+    if sys.platform != "darwin":  # /proc/net/tcp: hex ports, state 05 is FIN_WAIT2
+        rows = [r.split() for r in open("/proc/net/tcp").readlines()[1:]]
+        return any(int(c[1].split(":")[1], 16) == port and int(c[2].split(":")[1], 16) == client_port and c[3] == "05"
+                   for c in rows)
     rows = subprocess.run(["netstat", "-an", "-p", "tcp"], capture_output=True, text=True).stdout.splitlines()
     return any(len(c) >= 6 and c[3].endswith(f".{port}") and c[4].endswith(f".{client_port}") and c[5] == "FIN_WAIT_2"
                for c in (r.split() for r in rows))

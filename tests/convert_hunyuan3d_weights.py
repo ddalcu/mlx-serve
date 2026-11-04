@@ -2,7 +2,7 @@
 """Convert Tencent Hunyuan3D-2.1 SHAPE checkpoints into mlx-serve's layout.
 
 USER-RUN (needs torch + mlx + the ~8 GB HF checkpoints). Not run in CI. Produces
-the three-file model dir the native Zig engine (`src/hunyuan3d.zig`) loads:
+the three-file model dir the native Zig engine (`src/plugins/hunyuan3d/hunyuan3d.zig`) loads:
 
     <out>/config.json            {"model_type":"hunyuan3d_2_1", ...}
     <out>/dit.safetensors        the HunYuanDiTPlain denoiser

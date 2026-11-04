@@ -1,47 +1,26 @@
 #!/bin/bash
-# Multi-client stress test — the "several pi's + several chats + voice + image gen" mix.
+# test_multiclient_stress.sh — several pi agents + chats + TTS + image gen on ONE server across models: tool-calling
+# agent streams (chat A) + plain streams (chat B, a different model: per-model batch groups) + Kokoro + FLUX klein.
+# Correctness under load, not latency: no lost request, [DONE] termination, real media bytes, server alive and
+# functional after, no crash signature, a log ENGAGEMENT line per leg. Workers retry honest backpressure 503s.
 #
-# Simulates the load pattern of multiple concurrent agent CLIs (pi) plus app chat
-# tabs plus voice (TTS) plus image generation, all against ONE server, across
-# MULTIPLE models (two chat models = per-model batch groups + multi-model
-# registry; Kokoro TTS + FLUX klein ride the gen_queue on the same inference
-# thread). Video is deliberately excluded (heavy, minutes-long).
-#
-# What it asserts is CORRECTNESS UNDER LOAD, not latency: every stream
-# terminates cleanly ([DONE], finish_reason), every media request returns real
-# bytes, no request is lost, and the server is alive and functional afterwards.
-# Chat runs between media steps (one GPU, shared time) and cold model loads
-# still block — client timeouts here are generous on purpose.
-#
-# Usage:
 #   ./tests/test_multiclient_stress.sh [port]
-# Env:
-#   STRESS_CHAT_A   agent-workload chat model dir (default gemma-4-e4b-it-4bit)
-#   STRESS_CHAT_B   plain-chat model dir, should differ from A (default gemma-4-e2b-it-4bit)
-#   STRESS_TTS      TTS model dir (default Kokoro-82M-MLX-Serve; empty to skip leg)
-#   STRESS_IMAGE    image model dir (default FLUX.2-klein-4B-mflux-4bit; empty to skip leg)
-#   N_AGENTS=3 N_PLAIN=2 N_TTS=3 N_IMG=2 MAX_TOKENS=200 ROUNDS=1
-#   STRESS_THINK=1   send enable_thinking on chat A (reasoning models)
-#   STRESS_MTP=1     send enable_mtp on chat A (MoE default is off)
-#   N_ABORT=0        clients that DISCONNECT mid-stream (the pi-stop pattern)
-#   N_CHURN=0        load/unload cycles on chat B (the app's media load→gen→unload pattern)
-#   SOAK_WAVES=1     repeat the whole concurrent mix N times against ONE server,
-#                    sampling /props memory after each wave; with >= 3 waves the
-#                    final active_bytes must stay within 1.5x of wave 2's
-#                    (steady state after warm-up — catches the leak class)
-#   STRESS_CHAT_A2   alternate agent-workload model on even waves (soak realism)
+#   STRESS_CHAT_A / STRESS_CHAT_B / STRESS_TTS / STRESS_IMAGE (dirs; empty skips a leg), N_AGENTS=3 N_PLAIN=2 N_TTS=3
+#   N_IMG=2 MAX_TOKENS=200 ROUNDS=1, STRESS_THINK=1, STRESS_MTP=1, N_ABORT (mid-stream vanish), N_CHURN (load/unload),
+#   SOAK_WAVES=N (>= 3 asserts final active <= 1.5x wave 2: the leak class), STRESS_CHAT_A2 (alternate agent model)
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8135}
 BASE="http://127.0.0.1:$PORT"
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; NC='\033[0m'
 
-MODELS_ROOT="$HOME/.mlx-serve/models"
-CHAT_A="${STRESS_CHAT_A:-$MODELS_ROOT/mlx-community/gemma-4-e4b-it-4bit}"
-CHAT_B="${STRESS_CHAT_B:-$MODELS_ROOT/mlx-community/gemma-4-e2b-it-4bit}"
-TTS="${STRESS_TTS-$MODELS_ROOT/ddalcu/Kokoro-82M-MLX-Serve}"
-IMAGE="${STRESS_IMAGE-$MODELS_ROOT/Runpod/FLUX.2-klein-4B-mflux-4bit}"
+source "$(dirname "$0")/_lib_models.sh"
+CHAT_A="${STRESS_CHAT_A:-$(find_model mlx-community/gemma-4-e4b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit")}"
+CHAT_B="${STRESS_CHAT_B:-$(find_model mlx-community/gemma-4-e2b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-e2b-it-4bit")}"
+TTS="${STRESS_TTS-$(find_model ddalcu/Kokoro-82M-MLX-Serve || echo "$HOME/.mlx-serve/models/ddalcu/Kokoro-82M-MLX-Serve")}"
+IMAGE="${STRESS_IMAGE-$(find_model Runpod/FLUX.2-klein-4B-mflux-4bit || echo "$HOME/.mlx-serve/models/Runpod/FLUX.2-klein-4B-mflux-4bit")}"
 N_AGENTS=${N_AGENTS:-3}
 N_PLAIN=${N_PLAIN:-2}
 N_TTS=${N_TTS:-3}
@@ -239,11 +218,12 @@ PY
 
 # ---------------------------------------------------------------- server ----
 echo "== booting headless server on :$PORT (log: $LOG) =="
-"$BINARY" --serve --port "$PORT" --model-dir "$MODELS_ROOT" \
+# Every model root, so a pack find_model located on any of them is served.
+ROOTS=(); while IFS= read -r r; do ROOTS+=(--model-dir "$r"); done < <(model_roots)
+"$BINARY" --serve --port "$PORT" "${ROOTS[@]}" \
     --max-concurrent 8 --metrics --log-level info --log-file "$LOG" > "$TMP/stdout.log" 2>&1 &
 SRV=$!
-for _ in $(seq 1 60); do curl -sf "$BASE/health" >/dev/null 2>&1 && break; sleep 0.5; done
-curl -sf "$BASE/health" >/dev/null || { echo -e "${RED}FAIL${NC} server did not come up"; tail -20 "$TMP/stdout.log"; exit 1; }
+srv_wait_health "$BASE" 60 0.5 || { echo -e "${RED}FAIL${NC} server did not come up"; tail -20 "$TMP/stdout.log"; exit 1; }
 
 resolve_id() {  # dir -> served model id (matched on basename)
     curl -s "$BASE/v1/models" | python3 -c "
@@ -361,8 +341,8 @@ engaged() {  # pattern expected_count leg
 }
 engaged "model id=$ID_A ready" 1 "chat A load"
 engaged "model id=$ID_B ready" 1 "chat B load"
-[ -n "$ID_IMG" ] && engaged '\[image\] -> [0-9]+ PNG bytes' $((N_IMG * SOAK_WAVES)) "image generations"
-[ -n "$ID_TTS" ] && engaged ' -> [0-9]+ WAV bytes' $((N_TTS * SOAK_WAVES)) "TTS generations"
+[ -n "$ID_IMG" ] && engaged '\[gen\] [a-z0-9_]+ -> [0-9]+ bytes|\[image\] -> [0-9]+ PNG bytes' $((N_IMG * SOAK_WAVES)) "image generations"
+[ -n "$ID_TTS" ] && engaged '\[gen\] (qwen3_tts|kokoro) -> [0-9]+ bytes| -> [0-9]+ WAV bytes' $((N_TTS * SOAK_WAVES)) "TTS generations"
 
 if [ "$FAILED" -gt 0 ]; then
     echo -e "${RED}FAIL${NC} $FAILED worker(s) failed (server survived)"

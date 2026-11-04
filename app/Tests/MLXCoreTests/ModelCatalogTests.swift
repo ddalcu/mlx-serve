@@ -23,24 +23,6 @@ final class ModelCatalogTests: XCTestCase {
         )
     }
 
-    /// The tray's DeepSeek-V4-Flash entry is the NATIVE MLX mirror, not the ds4
-    /// GGUF it replaced: a whole safetensors repo (no `ggufFilename`, so it
-    /// rides the plain repo-download path rather than `startGguf`), gated at the
-    /// 128 GB Mac the conversion targets, and still carrying the `"dsv4"` token
-    /// the tray filter keys on.
-    func testDeepseekV4FlashTrayEntryIsTheNativeMlxMirror() {
-        guard let ds4 = gemmaModelOptions.first(where: { $0.id.contains("dsv4") }) else {
-            return XCTFail("DeepSeek-V4-Flash must be in the curated catalog")
-        }
-        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw")
-        XCTAssertNil(ds4.ggufFilename, "the native MLX mirror fetches the whole safetensors repo")
-        XCTAssertEqual(ds4.minHostRamBytes, 128 * (UInt64(1) << 30))
-        XCTAssertTrue(gemmaModelOptionsTrayMenu.contains { $0.id == ds4.id },
-                      "DS4 must surface in the menu-bar tray (id carries the \"dsv4\" token)")
-        XCTAssertFalse(gemmaModelOptions.contains { $0.repoId == "antirez/deepseek-v4-gguf" },
-                       "the ds4 GGUF entry is superseded by the native mirror")
-    }
-
     /// Class guard: ids are the dictionary key into download state, so collisions
     /// silently merge two models' progress.
     func testCatalogIdsAreUnique() {
@@ -53,8 +35,8 @@ final class ModelCatalogTests: XCTestCase {
     func testTrayMenuMembersMatchFilterPredicate() {
         for opt in gemmaModelOptionsTrayMenu {
             XCTAssertTrue(
-                opt.id.contains("4bit") || opt.id.contains("dsv4"),
-                "tray entry \(opt.id) does not match the 4bit/dsv4 filter predicate"
+                opt.id.contains("4bit"),
+                "tray entry \(opt.id) does not match the 4bit filter predicate"
             )
         }
     }

@@ -7,17 +7,44 @@ agents shipped. Generate assets with `gen.mjs` next to this file (`node gen.mjs 
 
 Write every asset as a job in one `assets.json`, run `node <skill dir>/gen.mjs batch assets.json`,
 and load files through the `manifest.json` it writes. Jobs run one at a time (the server has one
-GPU), unchanged jobs are skipped, and the media models are unloaded at the end so your chat model
-keeps its memory. Never write your own SSE client for this.
+GPU, shared with the chat model you run on), unchanged jobs are skipped, a media model is unloaded
+before the next kind loads, and the last one at the end so your chat model keeps its memory. Run
+the batch in the FOREGROUND and wait for it (no `&` or `nohup`): while it runs your own model cannot be
+loaded, so any request you make to the server in the meantime is refused and ends your session. Never write your
+own SSE client for this.
 
 - Textures that repeat: `"tile": true` (seamless) and `"maps": true` (normal, roughness and AO maps
   beside the colour map). Prompt "seamless tileable texture of ..., top-down, flat even lighting".
 - Leaves, blossoms, sprites: prompt "... on a plain white background, no shadow", then
   `"cutout": true, "trim": true` (add `"holes": true` when background shows through gaps).
-- 3D props: `{"type": "3d", "prompt": "<one object>", "height_m": 1.6, "max_tris": 8000}`
-  generates a reference image, the textured GLB, then scales it to metres with the pivot at the
-  base centre and cuts it to a triangle budget. Load with `GLTFLoader` and add it as is.
-- Post-process files you already have: `gen.mjs maps|tile|cutout|glb` (PNG and GLB, no server).
+- 3D props: `{"type": "3d", "prompt": "<one object>", "height_m": 1.6}`
+  generates a reference image (its plain background is cut to transparency before it is sent), the 3D
+  model from it, then scales the GLB to metres with the pivot at the base centre. Load with `GLTFLoader` and
+  add it as is. The model is Idol, the default (`"model"` in a job overrides): a GLB of one coloured disc per Gaussian,
+  with no roughness or normal maps, whose detail and cost `"num_gaussians"` sets (default 262144, about 524k triangles).
+  If Idol is not installed `gen.mjs` stops before it generates anything: tell the user to download it (MLX Core: Models >
+  Media > 3D, or `mlx-serve pull ddalcu/Idol-MLX-Serve-8bit`) and do not switch to another 3D model. A project whose
+  props came from another model pins it with `"model": "<id>"`: a job without one runs on Idol, and the batch cache keys on the model.
+  A prop with a triangle budget (`"max_tris": 8000`) or a car needs a mesh model, so name one: `"model": "<TRELLIS.2 id from
+  /v1/models>"` (Idol's discs cannot be thinned). TRELLIS.2 reads the cutout's alpha as the subject, returns a textured PBR GLB,
+  and `max_tris` cuts it to the budget. Add `"vehicle": true` to a car: it is turned so its length runs along Z, with the nose at
+  +Z for most cars (a low-tailed one can come out 180 degrees off: check the first one in the scene;
+  without the flag a car keeps the angle of its photo). A car comes out as ONE fused mesh, wheels included,
+  so its wheels do not spin. Cars are the hero asset: `"resolution": 1536, "texture_size": 2048` needs about
+  36 GB of FREE GPU memory (1024 needs about 23 GB, so use 1024 on a Mac whose own chat model shares the GPU).
+  A 400 that names GPU memory means lower the resolution; never unload your own model to make room.
+  Ship the texture at 2048 and 100k or more triangles; shrinking a car's texture to 1024 and simplifying it
+  to 40% (what agents did to keep the file small) was visibly worse. Ask for the size when the car is made
+  (`"decimation_target": 150000, "texture_size": 2048`), then `gen.mjs glb car.glb -o car.glb --quantize` halves the file
+  and changes nothing you can see.
+  A car wants car paint: `"roughness_scale": 0.4, "clearcoat": 1.0` on the job (see media.md; try a second seed if the hood is lumpy), and a three.js
+  `RoomEnvironment` as `scene.environment` to show it.
+  With TRELLIS.2 or Pixal3D, `max_tris` also tells the server to keep about three times that many faces
+  before it unwraps and bakes the texture (`decimation_target`; set it yourself to override).
+- Never make vegetation (trees, palms, bushes, hedges, grass) a 3D job: its thin leaf geometry can pin
+  the server's UV unwrap for tens of minutes, and a stuck 3D job blocks every other media job and your
+  own model's reload. Use cutout cards (see Foliage below). Keep 3D jobs to solid objects.
+- Post-process files you already have: `gen.mjs maps|tile|cutout|glb` (PNG and GLB, no server). `glb` also takes `--max-texture 2048` and `--quantize`.
 
 ## Movement and camera
 

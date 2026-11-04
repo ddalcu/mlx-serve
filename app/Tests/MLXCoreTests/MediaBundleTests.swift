@@ -154,6 +154,26 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
+    /// Qwen-Image-2.1 as Qwen publishes it (and as mlx-community mirrors it): no root
+    /// `config.json`, which the server classifies by `model_index.json` alone.
+    func testQwenImageOfficialLayoutReadyWithoutRootConfig() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "qwenimagetest-\(UUID().uuidString)"
+        let comp = ImageModelPreset.qwenImage21_8bit.asCustom(id: "Qwen-Image-2.1-Turbo").bundle.components[0]
+        let modelDir = (root as NSString).appendingPathComponent(comp.repo)
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("model_index.json"),
+                      contents: Data(#"{"_class_name":"QwenImage21Pipeline"}"#.utf8))
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        for sub in ["transformer", "vae", "text_encoder", "processor", "scheduler"] {
+            try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("transformer/diffusion_pytorch_model.safetensors"), contents: Data([0, 1, 2]))
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
     // MARK: - Bundle mappings
 
     func testLtxBundleBundlesGemmaDependency() {
@@ -444,9 +464,9 @@ final class MediaBundleTests: XCTestCase {
         let root = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-        let src = try String(contentsOf: root.appendingPathComponent("src/ltx_video.zig"), encoding: .utf8)
+        let src = try String(contentsOf: root.appendingPathComponent("src/plugins/ltx/video.zig"), encoding: .utf8)
         XCTAssertTrue(src.contains("\"\(MediaBundle.ltx25TextEncoderDir)\""),
-                      "src/ltx_video.zig does not name \(MediaBundle.ltx25TextEncoderDir) — the app would fetch an encoder the server never looks for")
+                      "src/plugins/ltx/video.zig does not name \(MediaBundle.ltx25TextEncoderDir) — the app would fetch an encoder the server never looks for")
     }
 
     func testFluxAndTtsBundlesAreRecursiveSingleComponent() {
@@ -669,6 +689,53 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
+    func testIdolIsAPublishedPackWhoseBundleNamesEveryFileTheServerLoads() {
+        let p = Model3DModelPreset.idol_8bit
+        XCTAssertEqual(p.repo, "ddalcu/Idol-MLX-Serve-8bit")
+        XCTAssertFalse(p.isLocalOnly)
+        XCTAssertEqual(p.family, .idol)
+        let comp = p.bundle.components[0]
+        for f in ["config.json", "denoiser.safetensors", "decoder.safetensors", "decoder_gs.safetensors",
+                  "birefnet.safetensors", "dinov3/config.json", "dinov3/model.safetensors", "vae/model.safetensors"] {
+            XCTAssertTrue(comp.readyMarkers.contains(f), f)
+        }
+        // Twin of the idol plugin's `required_file`: the FLUX.2 VAE lands last.
+        XCTAssertEqual(DownloadManager.requiredMediaMarker(modelType: "idol"), "vae/model.safetensors")
+    }
+
+    func testThePublishedTrellisPacksAreCatalogEntriesThatFetchOnlyWhatTheyServe() {
+        XCTAssertEqual(Model3DModelPreset.trellis2_8bit.repo, "ddalcu/TRELLIS.2-4B-MLX-Serve-8bit")
+        XCTAssertEqual(Model3DModelPreset.pixal3d_8bit.repo, "ddalcu/Pixal3D-MLX-Serve-8bit")
+        for p in [Model3DModelPreset.trellis2_8bit, .pixal3d_8bit] {
+            XCTAssertTrue(Model3DModelPreset.all.contains(p), p.id)
+            XCTAssertFalse(p.isLocalOnly, p.id)
+            XCTAssertEqual(p.bundle.primaryRepo, p.repo)
+            XCTAssertEqual(Set(Model3DModelPreset.all.map(\.id)).count, Model3DModelPreset.all.count)
+        }
+        XCTAssertEqual(Model3DModelPreset.trellis2_8bit.family, .trellis2)
+        XCTAssertEqual(Model3DModelPreset.pixal3d_8bit.family, .pixal3d)
+
+        // Pixal3D: its sparse-structure decoder rides in ckpts/, NAF beside DINOv3. The multi-view models
+        // are not fetched: the pane sends one photo.
+        let comp = Model3DModelPreset.pixal3d_8bit.bundle.components[0]
+        for marker in ["pipeline.json", "dinov3/model.safetensors", "naf/model.safetensors",
+                       "ckpts/ss_dec_conv3d_16l8_fp16.safetensors",
+                       "ckpts/ss_flow_img_dit_1_3B_64_bf16.safetensors",
+                       "ckpts/slat_flow_img2shape_dit_1_3B_512_bf16.safetensors",
+                       "ckpts/slat_flow_img2shape_dit_1_3B_1024_bf16.safetensors",
+                       "ckpts/slat_flow_imgshape2tex_dit_1_3B_1024_bf16.safetensors",
+                       "ckpts/shape_dec_next_dc_f16c32_fp16.safetensors",
+                       "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors"] {
+            XCTAssertTrue(comp.readyMarkers.contains(marker), "missing readyMarker \(marker)")
+        }
+        XCTAssertFalse(comp.readyMarkers.contains { $0.hasSuffix("_mv.safetensors") })
+        XCTAssertFalse(comp.selection.keepSafetensors?.contains { $0.hasSuffix("_mv.safetensors") } ?? true)
+        // TRELLIS.2 keeps its sparse-structure decoder in the older TRELLIS repo's path, not ckpts/.
+        let t = Model3DModelPreset.trellis2_8bit.bundle.components[0]
+        XCTAssertTrue(t.readyMarkers.contains("microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors"))
+        XCTAssertFalse(t.readyMarkers.contains("naf/model.safetensors"))
+    }
+
     func testHunyuanPresetDownloadsFromHF() {
         // Published combined repo — the pane shows the standard download bar,
         // not the "convert locally" hint.
@@ -825,6 +892,7 @@ final class MediaBundleTests: XCTestCase {
         assertUnique(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertUnique(VideoModelPreset.all, "video")
         assertUnique(MusicModelPreset.all, "music")
+        assertUnique(Model3DModelPreset.modelBrowserCatalog, "3d")
     }
 
     /// Every preset resolves to a real bundle with a primary repo and a
@@ -840,6 +908,7 @@ final class MediaBundleTests: XCTestCase {
         assertDisplayable(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDisplayable(VideoModelPreset.all, "video")
         assertDisplayable(MusicModelPreset.all, "music")
+        assertDisplayable(Model3DModelPreset.modelBrowserCatalog, "3d")
     }
 
     /// Every preset needs a real, non-stub plain-English description — the
@@ -855,6 +924,12 @@ final class MediaBundleTests: XCTestCase {
         assertDescribed(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDescribed(VideoModelPreset.all, "video")
         assertDescribed(MusicModelPreset.all, "music")
+        assertDescribed(Model3DModelPreset.modelBrowserCatalog, "3d")
+    }
+
+    /// 3D has a catalogue of four for its Create pane, but the Media tab lists the recommended model alone.
+    func testTheMediaTabListsOnlyIdolFor3D() {
+        XCTAssertEqual(Model3DModelPreset.modelBrowserCatalog, [.idol_8bit])
     }
 
     // MARK: - MediaModelPreset.meetsSystemRequirements

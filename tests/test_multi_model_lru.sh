@@ -8,6 +8,7 @@
 # Usage: ./tests/test_multi_model_lru.sh [model_dir_root] [port]
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 ROOT="${1:-$HOME/.mlx-serve/models}"
 PORT="${2:-8096}"
@@ -44,10 +45,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for _ in $(seq 1 30); do
-    if curl -fs "$BASE/health" >/dev/null 2>&1; then break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || true
 
 fire() {
     curl -fs -X POST "$BASE/v1/chat/completions" \

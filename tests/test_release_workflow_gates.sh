@@ -1,18 +1,22 @@
 #!/bin/bash
-# Static guard for .github/workflows/release.yml event gating.
+# test_release_workflow_gates.sh — static guard for release packaging. release.yml event gating: the PR trigger and
+# fork-PR guard, Create Release + Homebrew push OFF for pull_request, tag creation dispatch-only, notarize steps never
+# excluded on PRs, artifact upload covers PRs (the class "a PR build releases" / "PR DMGs stop being notarized"), and
+# the shipped mlx-serve signed with the entitlement that lets it load a plugin compiled on the user's Mac.
+# app/build.sh: the CalVer timezone, license packaging, every Contents/Resources entry staged outside the App
+# Store-only block is staged by release.yml too, and FAST_DEV (default 0, Debug Swift only under its gate, one
+# ReleaseFast default, `-Doptimize=Debug` only under the ZIG_DEBUG gate, which is FAST_DEV-only and refused by name,
+# signing skipped only with the staging that invalidates it, the FAST_DEV exit after signing and before notarizing).
 #
-# The release workflow triples as (1) the tag/dispatch RELEASE pipeline,
-# (2) the dry-run packaging check, and (3) the PR packaging build that
-# signs + notarizes a DMG artifact WITHOUT releasing. The class of bug this
-# pins: someone edits a step's `if:` and a PR suddenly creates a tag, a
-# GitHub release, or a Homebrew formula push — or the opposite, PR builds
-# silently stop notarizing and the artifact regresses to unsigned.
-#
-# Hermetic — parses the YAML, no network, no runners.
+#   ./tests/test_release_workflow_gates.sh   # hermetic: PyYAML parse, no runners
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# PyYAML: the repo venv has it, a stock macOS python3 does not.
+PY=python3
+[ -x venv/bin/python3 ] && PY=venv/bin/python3
 
-python3 - <<'EOF'
+"$PY" - <<'EOF'
 import re, sys, yaml
 
 FAIL = 0
@@ -94,6 +98,23 @@ check("pull_request" in str(linux.get("if", "")) and "dry_run" in str(linux.get(
 check("gh run download" in linux_text and "gh release upload" in linux_text,
       "linux-assets downloads linux.yml's artifacts and uploads them")
 check("build-linux.sh" not in linux_text, "linux-assets never rebuilds")
+
+# MLX JIT-compiles its CUDA kernels against the headers beside libmlx (lib/mlx/include,
+# CCCL included): a tarball without them fails every custom kernel on a user's machine.
+lwf = yaml.safe_load(open(".github/workflows/linux.yml"))
+pkg = [st.get("run", "") for j in lwf["jobs"].values() for st in j.get("steps", []) if st.get("name") == "Package"]
+check(len(pkg) == 1 and "lib/mlx/include" in pkg[0], "the Linux tarball carries lib/mlx/include")
+
+# The Windows zip is windows.yml's build of the same commit, attached the same way.
+win = wf["jobs"].get("windows-assets", {})
+win_text = str(win)
+check(win.get("needs") == "build", "windows-assets runs after the draft exists")
+check("pull_request" in str(win.get("if", "")) and "dry_run" in str(win.get("if", "")),
+      "windows-assets gated off for pull_request and dry_run")
+check("gh run download" in win_text and "gh release upload" in win_text,
+      "windows-assets downloads windows.yml's artifact and uploads it")
+check("windows.yml" in win_text and "build-windows" not in win_text,
+      "windows-assets reads windows.yml's run and never rebuilds")
 check("steps.version.outputs.tag" in str(job.get("outputs", {}).get("tag", "")),
       "build job exports the release tag")
 
@@ -363,6 +384,14 @@ check(cp_plist is not None and first_stamp is not None and cp_plist < first_stam
 check(first_stamp is not None and sign_app is not None and first_stamp < sign_app,
       "the stamp runs BEFORE the bundle is sealed (a later write breaks the signature)")
 
+# ── Outside plugins are compiled on the user's Mac, so they are ad-hoc signed: a hardened-runtime server without
+# disable-library-validation refuses to load them. Every codesign of the shipped mlx-serve carries the entitlement.
+signs = re.findall(r'codesign [^\n]*--sign [^\n]*"\$(?:STAGING|CONTENTS/MacOS)/mlx-serve"', wf_text)
+check(len(signs) == 2 and all("--entitlements app/mlx-serve.entitlements" in c for c in signs),
+      "both shipped mlx-serve binaries are signed with app/mlx-serve.entitlements")
+check("com.apple.security.cs.disable-library-validation" in open("app/mlx-serve.entitlements").read(),
+      "app/mlx-serve.entitlements lets the server load a locally built plugin")
+
 # ── release.yml assembles its own .app: every resource app/build.sh stages
 # (its App Store-only block aside) must be staged there too, or the DMG ships
 # without it and the app's reader silently falls back to nothing.
@@ -401,6 +430,12 @@ check(checkout.get("with", {}).get("ref") == "main",
 bruns = " ".join(str(s.get("run", "")) for s in bsteps)
 for f in ("Formula/mlx-serve.rb", "Casks/mlx-serve.rb"):
     check(f in bruns, f"homebrew.yml updates {f}")
+
+# ── The formula moves lib/* into libexec/, so every library the binary links
+# through its rpaths must be repointed there; the server links libmlx directly.
+formula = open("Formula/mlx-serve.rb").read()
+check(re.search(r'"@rpath/libmlx\.dylib",\s*"#\{libexec\}/libmlx\.dylib",\s*"#\{bin\}/mlx-serve"', formula),
+      "formula repoints the binary's @rpath/libmlx.dylib into libexec")
 
 sys.exit(FAIL)
 EOF

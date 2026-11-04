@@ -96,6 +96,9 @@ class APIClient {
         config.waitsForConnectivity = true
         return URLSession(configuration: config)
     }()
+    /// For a poll that has to fail at once on a server that is not listening yet: a request on `session`, which waits
+    /// for connectivity, stays pending on a closed port and does not recover when the server comes up.
+    private let pollSession = URLSession(configuration: .ephemeral)
     private let decoder = JSONDecoder()
 
     /// Build a URL pointing at the server, honouring `host`. The settings
@@ -142,16 +145,25 @@ class APIClient {
         try await fetchModelList(port: port).models
     }
 
-    /// `/v1/models` whole: the rows plus the LAN peers that refused us for want of a key.
-    func fetchModelList(port: UInt16) async throws -> (models: [ModelInfo], lanNeedsKey: [String]) {
+    /// `/v1/models` whole: the rows, the LAN peers that refused us for want of a key, and
+    /// every peer's address.
+    func fetchModelList(port: UInt16) async throws -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: LanPeer]) {
         let (data, _) = try await session.data(from: serverURL(port: port, path: "/v1/models"))
         return Self.parseModelsBody(data)
     }
 
-    static func parseModelsBody(_ data: Data) -> (models: [ModelInfo], lanNeedsKey: [String]) {
+    static func parseModelsBody(_ data: Data) -> (models: [ModelInfo], lanNeedsKey: [String], lanPeers: [String: LanPeer]) {
         guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let dataArr = json["data"] as? [[String: Any]] else { return ([], []) }
-        return (dataArr.map { parseModelInfo($0) }, json["lan_needs_key"] as? [String] ?? [])
+              let dataArr = json["data"] as? [[String: Any]] else { return ([], [], [:]) }
+        var peers: [String: LanPeer] = [:]
+        for p in json["lan_peers"] as? [[String: Any]] ?? [] {
+            guard let name = p["name"] as? String else { continue }
+            peers[name] = LanPeer(kind: MachineKind(os: p["os"] as? String ?? "", model: p["model"] as? String ?? ""),
+                                  leads: p["leads"] as? String ?? "", joined: p["joined"] as? Bool ?? false,
+                                  url: (p["url"] as? String).flatMap(URL.init(string:)),
+                                  freeBytes: Int64(p["free_mib"] as? Int ?? 0) << 20)
+        }
+        return (dataArr.map { parseModelInfo($0) }, json["lan_needs_key"] as? [String] ?? [], peers)
     }
 
     // Internal (not private) so unit tests can exercise the capability/meta
@@ -184,6 +196,8 @@ class APIClient {
         // never be true without supportsVision, since video piggybacks the
         // same vision tower server-side.
         let supportsVideo = supportsVision && mods.contains("video")
+        // A model that answers in speech itself (LFM3-Audio / Omni): its own voice replaces dictation + TTS.
+        let speaks = (first["output_modalities"] as? [String] ?? []).contains("audio")
         // Encoder-only entries advertise "embeddings" even as unloaded stubs
         // (the server peeks model_type at discovery); architecture is the
         // belt-and-suspenders signal for loaded entries.
@@ -204,6 +218,8 @@ class APIClient {
             supportsVision: supportsVision,
             supportsVideo: supportsVideo,
             supportsEmbeddings: supportsEmbeddings,
+            speaks: speaks,
+            voices: first["voices"] as? [String] ?? [],
             capabilities: caps,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
@@ -223,7 +239,10 @@ class APIClient {
             recTopP: meta["gen_top_p"] as? Double,
             recTopK: meta["gen_top_k"] as? Int,
             lanPeer: (first["lan_peer"] as? String) ?? (first["provider"] as? String),
-            provider: first["provider"] as? String
+            provider: first["provider"] as? String,
+            agentBudget: AgentBudget.parse(first["agent_budget"]),
+            modality: first["modality"] as? String,
+            engines: first["engines"] as? [String] ?? []
         )
     }
 
@@ -416,6 +435,7 @@ class APIClient {
         /// tables applied), which the UI reads as "nothing to show".
         let specCost: SpecCostInfo?
         let batching: BatchingInfo?
+        let cluster: ClusterInfo?
         /// Moves whenever `/v1/models` would read differently; nil from older servers.
         let registryGeneration: UInt64?
     }
@@ -426,6 +446,7 @@ class APIClient {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
         return PropsSnapshot(memory: MemoryInfo.parse(mem), specCost: SpecCostInfo.parse(json), batching: BatchingInfo.parse(json),
+                             cluster: ClusterInfo.parse(json),
                              registryGeneration: (json["registry_generation"] as? NSNumber)?.uint64Value)
     }
 
@@ -447,7 +468,7 @@ class APIClient {
     /// `--metrics`, which reads as nil (the tray hides the rows).
     func fetchThroughput(port: UInt16) async throws -> ThroughputSnapshot? {
         let url = serverURL(port: port, path: "/metrics.json")
-        let (data, response) = try await session.data(from: url)
+        let (data, response) = try await pollSession.data(from: url)
         guard (response as? HTTPURLResponse)?.statusCode == 200,
               let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return ThroughputSnapshot.parse(json, at: Date().timeIntervalSinceReferenceDate)

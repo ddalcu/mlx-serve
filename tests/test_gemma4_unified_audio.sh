@@ -10,9 +10,11 @@
 #
 # Gated on the model fixture + macOS tooling (say + ffmpeg/afconvert):
 #   G4_UNIFIED_MODEL=/path/to/gemma-4-12b-it-4bit ./tests/test_gemma4_unified_audio.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
-MODEL="${G4_UNIFIED_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-12b-it-4bit}"
+MODEL="${G4_UNIFIED_MODEL:-$(find_model mlx-community/gemma-4-12b-it-4bit || echo "$HOME/.mlx-serve/models/mlx-community/gemma-4-12b-it-4bit")}"
 PORT="${1:-8231}"
 BASE="http://127.0.0.1:$PORT"
 BIN="./zig-out/bin/mlx-serve"
@@ -65,11 +67,7 @@ echo "→ starting mlx-serve on :$PORT with $MODEL"
 SERVER_PID=$!
 cleanup() { kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG" "$AIFF" "$PCM"; }
 trap cleanup EXIT
-for i in $(seq 1 60); do
-    if curl -fs --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then break; fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo -e "${RED}server died${NC}"; tail -20 "$LOG"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 60 1 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo -e "${RED}server died${NC}"; tail -20 "$LOG"; exit 1; }
 
 # The model must advertise the `audio` capability so the app can gate the mic.
 MODELS="$(curl -fs --max-time 5 "$BASE/v1/models")"
@@ -93,7 +91,7 @@ else
     bad "recognizes a spoken word from the audio" "no expected word in: $(echo "$CONTENT" | head -c 200)"
 fi
 assert_contains "audio encode produced soft tokens" "audio soft tokens" "$(cat "$LOG")"
-assert_contains "audio routed through the unified embedder" "0 vision +" "$(cat "$LOG")"
+assert_contains "audio routed through the unified embedder" "0 image + 0 video + " "$(cat "$LOG")"
 
 echo ""
 echo -e "Gemma 4 12B unified audio: ${GREEN}$PASS passed${NC}, ${RED}$FAIL failed${NC}"

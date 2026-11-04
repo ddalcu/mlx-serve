@@ -1,16 +1,18 @@
 #!/bin/bash
-# Image conversations reuse the prefix cache. Vision slots were excluded from
-# commit AND lookup, so every image turn re-prefilled the whole conversation.
-# Two things a byte check cannot see come from the log + usage: the second
-# identical request must report cached_tokens > 0 with a `[hot-cache] reused`
-# line. A DIFFERENT image must never reuse state at or after its placeholder
-# rows (the KV there is keyed on the pixels), but a long text prefix before
-# those rows should still restore. Every answer must still name what only the
-# pixels supply (the reused prefix is only correct if the restored rows are
-# the image's). A Harness-style turn may append user-role context after the
-# human's image message; history images stay in every later prompt.
+# test_vision_prefix_cache.sh — image conversations reuse the prefix cache: the same image twice -> cached_tokens > 0
+# and `[hot-cache] reused`, and the answer still names pixel-only content (the street signs); a DIFFERENT image under
+# the same placeholder tokens -> no reuse at or after its rows (per-item MediaSpan key) while a long text prefix before
+# them still restores. History images stay in every later prompt (twenty of them, an image-only turn, Anthropic
+# history). No byte equality across warm/cold (the hybrid restore class).
+#
+#   ./tests/test_vision_prefix_cache.sh [model] [port]   # default Qwen3.5-0.8B; SKIPs without a vision model
+#
+# Hermetic twins: `HotPrefixCache: media spans bound the reusable prefix at the first differing item`,
+# `vision prefill checkpoints SSM state only when it chunks like text`.
+source "$(dirname "$0")/_lib_models.sh"
+
 set -u
-MODEL="${VISION_CACHE_MODEL:-${1:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}}"
+MODEL="${VISION_CACHE_MODEL:-${1:-$(find_model mlx-community/Qwen3.5-0.8B-MLX-4bit || echo "$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit")}}"
 PORT="${2:-11419}"
 BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 LOG="$HOME/claude-tmp/vision-cache/server-$PORT.log"
@@ -27,7 +29,7 @@ check() { if [ "$2" = "$3" ]; then echo "  ok   $1"; pass=$((pass+1)); else echo
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT
 U="http://127.0.0.1:$PORT"
-for _ in $(seq 1 600); do curl -s "$U/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
+for _ in $(seq 1 600); do curl -sf "$U/health" >/dev/null 2>&1 && grep -q "ready" "$LOG" && break; kill -0 $SPID 2>/dev/null || { echo "server died"; tail -20 "$LOG"; exit 1; }; sleep 2; done
 
 mime_for() { case "$1" in *.jpeg|*.jpg) echo image/jpeg;; *.png) echo image/png;; *.webp) echo image/webp;; esac; }
 body() { # $1 image, $2 question

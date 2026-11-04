@@ -1,0 +1,295 @@
+Below 4 rows per expert, the sorted fp expert gather's mat-vec (row_dot_sorted_kernel) loads each
+expert's weight row once per run of sorted rows on that expert instead of once per row. Each
+output keeps row_dot's per-row arithmetic at the threads per row the per-row launch picks, so it
+is bit-identical to the per-row mat-vec.
+
+Retires with mlx-cuda-row-dot-matvec.patch, or when upstream's gather mat-vec shares weight loads
+across sorted rows. Not reported upstream yet.
+
+diff --git a/mlx/backend/cuda/gemms/row_dot.cuh b/mlx/backend/cuda/gemms/row_dot.cuh
+index d7dbfd6..acd9eb7 100644
+--- a/mlx/backend/cuda/gemms/row_dot.cuh
++++ b/mlx/backend/cuda/gemms/row_dot.cuh
+@@ -22,6 +22,64 @@ namespace mlx::core::cu {
+ 
+ constexpr int row_dot_threads = 256;
+ 
++// row_dot_chunk over rows of x at their own addresses, the same arithmetic per row.
++template <int FMT, int ROWS, typename T>
++__device__ __forceinline__ void row_dot_chunk_rows(
++    uint4 wv,
++    const uint8_t* s_row,
++    int c,
++    const T* const (&xr)[ROWS],
++    int rows,
++    float* acc) {
++  constexpr int E = row_dot_chunk_elems<FMT, T>();
++  uint32_t wu[4] = {wv.x, wv.y, wv.z, wv.w};
++  if constexpr (FMT == kRowDotMxfp8) {
++    float scale = ue8m0_scale(s_row[c >> 1]);
++    float w[16];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      float2 lo = e4m3x2(wu[i]);
++      float2 hi = e4m3x2(wu[i] >> 16);
++      w[4 * i] = lo.x;
++      w[4 * i + 1] = lo.y;
++      w[4 * i + 2] = hi.x;
++      w[4 * i + 3] = hi.y;
++    }
++#pragma unroll
++    for (int r = 0; r < ROWS; ++r) {
++      if (r < rows) {
++        acc[r] += scale * dot_x(xr[r] + static_cast<int64_t>(c) * E, w, 2);
++      }
++    }
++  } else {
++    float w[32];
++#pragma unroll
++    for (int i = 0; i < 4; ++i) {
++      e2m1x8(wu[i], w + 8 * i);
++    }
++    if constexpr (FMT == kRowDotMxfp4) {
++      float scale = ue8m0_scale(s_row[c]);
++#pragma unroll
++      for (int r = 0; r < ROWS; ++r) {
++        if (r < rows) {
++          acc[r] += scale * dot_x(xr[r] + static_cast<int64_t>(c) * E, w, 4);
++        }
++      }
++    } else {
++      uint32_t s2 = *reinterpret_cast<const uint16_t*>(s_row + 2 * c);
++      float s0 = e4m3_scale(s2);
++      float s1 = e4m3_scale(s2 >> 8);
++#pragma unroll
++      for (int r = 0; r < ROWS; ++r) {
++        if (r < rows) {
++          const T* x = xr[r] + static_cast<int64_t>(c) * E;
++          acc[r] += s0 * dot_x(x, w, 2) + s1 * dot_x(x + 16, w + 16, 2);
++        }
++      }
++    }
++  }
++}
++
+ // out[l, m, n] = x[lhs[l], m, :] . W[rhs[l], n, :]; lhs/rhs null = batch 0.
+ // Grid: x = row groups, y = groups of ROWS x rows, z = batch.
+ template <int FMT, int ROWS, typename T>
+@@ -117,6 +175,119 @@ __global__ void __launch_bounds__(row_dot_threads) row_dot_kernel(
+   }
+ }
+ 
++// A sorted fp gather of one x row per batch (rhs ascending): a block takes ROWS
++// consecutive batches and loads a weight row once per run on the same expert.
++// Each output is row_dot_kernel's at the same tpr.
++template <int FMT, int ROWS, typename T>
++__global__ void __launch_bounds__(row_dot_threads) row_dot_sorted_kernel(
++    const uint8_t* w,
++    const uint8_t* scales,
++    const T* x,
++    T* out,
++    int n,
++    int k,
++    int batch,
++    int tpr,
++    const uint32_t* lhs_indices,
++    const uint32_t* rhs_indices,
++    int64_t w_batch_bytes,
++    int64_t s_batch_bytes) {
++  constexpr int bits = FMT == kRowDotMxfp8 ? 8 : 4;
++  constexpr int group = FMT == kRowDotNvfp4 ? 16 : 32;
++  const int64_t row_bytes = static_cast<int64_t>(k) * bits / 8;
++  const int chunks = static_cast<int>(row_bytes / 16);
++
++  const int rows_per_block = row_dot_threads / tpr;
++  const int r_local = threadIdx.x / tpr;
++  const int lane = threadIdx.x % tpr;
++  const int row = blockIdx.x * rows_per_block + r_local;
++  const bool active = row < n;
++  const int l0 = blockIdx.z * ROWS;
++  const int rows = min(ROWS, batch - l0);
++  const int width = min(tpr, WARP_SIZE);
++  __shared__ float partial[ROWS][row_dot_threads / WARP_SIZE];
++
++  for (int r0 = 0; r0 < rows;) {
++    const uint32_t e = rhs_indices[l0 + r0];
++    int r1 = r0 + 1;
++    while (r1 < rows && rhs_indices[l0 + r1] == e) {
++      ++r1;
++    }
++    const int len = r1 - r0;
++    float acc[ROWS];
++#pragma unroll
++    for (int r = 0; r < ROWS; ++r) {
++      acc[r] = 0.f;
++    }
++    if (active) {
++      const T* xr[ROWS];
++#pragma unroll
++      for (int r = 0; r < ROWS; ++r) {
++        xr[r] = x +
++            static_cast<int64_t>(lhs_indices[l0 + r0 + min(r, len - 1)]) * k;
++      }
++      const uint8_t* s_row = scales + e * s_batch_bytes +
++          static_cast<int64_t>(row) * (k / group);
++      const uint4* wp = reinterpret_cast<const uint4*>(
++          w + e * w_batch_bytes + row * row_bytes);
++      // Up to four loads in flight, consumed in row_dot_kernel's chunk order.
++      for (int c = lane; c < chunks; c += 4 * tpr) {
++        uint4 v[4];
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++          if (c + j * tpr < chunks) {
++            v[j] = wp[c + j * tpr];
++          }
++        }
++#pragma unroll
++        for (int j = 0; j < 4; ++j) {
++          if (c + j * tpr < chunks) {
++            row_dot_chunk_rows<FMT, ROWS>(v[j], s_row, c + j * tpr, xr, len, acc);
++          }
++        }
++      }
++    }
++#pragma unroll
++    for (int r = 0; r < ROWS; ++r) {
++      for (int off = width / 2; off > 0; off /= 2) {
++        acc[r] += __shfl_xor_sync(0xffffffff, acc[r], off);
++      }
++    }
++    if (tpr > WARP_SIZE) {
++      const int warp = threadIdx.x / WARP_SIZE;
++      if (threadIdx.x % WARP_SIZE == 0) {
++#pragma unroll
++        for (int r = 0; r < ROWS; ++r) {
++          partial[r][warp] = acc[r];
++        }
++      }
++      __syncthreads();
++      if (lane == 0 && active) {
++        const int warps = tpr / WARP_SIZE;
++#pragma unroll
++        for (int r = 0; r < ROWS; ++r) {
++          float s = 0.f;
++          for (int i = 0; i < warps; ++i) {
++            s += partial[r][warp + i];
++          }
++          if (r < len) {
++            out[static_cast<int64_t>(l0 + r0 + r) * n + row] = static_cast<T>(s);
++          }
++        }
++      }
++      __syncthreads();
++    } else if (lane == 0 && active) {
++#pragma unroll
++      for (int r = 0; r < ROWS; ++r) {
++        if (r < len) {
++          out[static_cast<int64_t>(l0 + r0 + r) * n + row] = static_cast<T>(acc[r]);
++        }
++      }
++    }
++    r0 = r1;
++  }
++}
++
+ // Threads per row: fit short rows, then widen until the grid fills the GPU.
+ // `rows` counts every output row of the launch, batches included.
+ inline int row_dot_tpr(int chunks, int64_t rows, int num_sms) {
+@@ -170,7 +341,8 @@ void launch_row_dot(
+     const uint32_t* lhs_indices,
+     const uint32_t* rhs_indices,
+     int64_t w_batch_bytes,
+-    int64_t s_batch_bytes) {
++    int64_t s_batch_bytes,
++    bool sorted = false) {
+   int bits = fmt == kRowDotDense ? 8 * sizeof(T) : fmt == kRowDotMxfp8 ? 8 : 4;
+   int chunks = static_cast<int>(static_cast<int64_t>(k) * bits / 128);
+   int rows_cap = m <= 1 ? 1 : m <= 2 ? 2 : m <= 4 ? 4 : 8;
+@@ -184,6 +356,36 @@ void launch_row_dot(
+       (n + rows_per_block - 1) / rows_per_block, row_groups, batch);
+   auto wp = static_cast<const uint8_t*>(w);
+   auto sp = static_cast<const uint8_t*>(scales);
++  if (sorted && m == 1 && fmt != kRowDotDense && lhs_indices && rhs_indices) {
++    constexpr int G = 8;
++    dim3 sgrid(grid.x, 1, (batch + G - 1) / G);
++    auto go = [&]<int FMT>() {
++      encoder.add_kernel_node(
++          row_dot_sorted_kernel<FMT, G, T>,
++          sgrid,
++          dim3(row_dot_threads),
++          wp,
++          sp,
++          x,
++          out,
++          n,
++          k,
++          batch,
++          tpr,
++          lhs_indices,
++          rhs_indices,
++          w_batch_bytes,
++          s_batch_bytes);
++    };
++    if (fmt == kRowDotMxfp8) {
++      go.template operator()<kRowDotMxfp8>();
++    } else if (fmt == kRowDotMxfp4) {
++      go.template operator()<kRowDotMxfp4>();
++    } else {
++      go.template operator()<kRowDotNvfp4>();
++    }
++    return;
++  }
+   auto launch = [&]<int FMT>() {
+     auto go = [&]<int ROWS>() {
+       encoder.add_kernel_node(
+diff --git a/mlx/backend/cuda/quantized/qmm/qmm.h b/mlx/backend/cuda/quantized/qmm/qmm.h
+index ca873fc..8ce5d09 100644
+--- a/mlx/backend/cuda/quantized/qmm/qmm.h
++++ b/mlx/backend/cuda/quantized/qmm/qmm.h
+@@ -183,6 +183,7 @@ void gather_qmv(
+     int bits,
+     int group_size,
+     QuantizationMode mode,
+-    cu::CommandEncoder& encoder);
++    cu::CommandEncoder& encoder,
++    bool rhs_sorted = false);
+ 
+ } // namespace mlx::core
+diff --git a/mlx/backend/cuda/quantized/qmm/qmv.cu b/mlx/backend/cuda/quantized/qmm/qmv.cu
+index fa2bdb0..503684a 100644
+--- a/mlx/backend/cuda/quantized/qmm/qmv.cu
++++ b/mlx/backend/cuda/quantized/qmm/qmv.cu
+@@ -644,7 +644,8 @@ void gather_qmv(
+     int bits,
+     int group_size,
+     QuantizationMode mode,
+-    cu::CommandEncoder& encoder) {
++    cu::CommandEncoder& encoder,
++    bool rhs_sorted) {
+   const char* tag = "[gather_qmm]";
+   int m = out.shape(-2);
+   int n = out.shape(-1);
+@@ -683,7 +684,8 @@ void gather_qmv(
+           gpu_ptr<uint32_t>(lhs_indices),
+           gpu_ptr<uint32_t>(rhs_indices),
+           w_batch_bytes,
+-          s_batch_bytes);
++          s_batch_bytes,
++          rhs_sorted);
+     };
+     if (out.dtype() == bfloat16) {
+       launch.template operator()<__nv_bfloat16>();
+diff --git a/mlx/backend/cuda/quantized/quantized.cpp b/mlx/backend/cuda/quantized/quantized.cpp
+index d998e9197..e4b0a5f8d 100644
+--- a/mlx/backend/cuda/quantized/quantized.cpp
++++ b/mlx/backend/cuda/quantized/quantized.cpp
+@@ -269,7 +269,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+         bits_,
+         group_size_,
+         mode_,
+-        encoder);
++        encoder,
++        right_sorted_);
+   };
+ 
+   if (can_use_gather_qmm_rhs_sm80) {

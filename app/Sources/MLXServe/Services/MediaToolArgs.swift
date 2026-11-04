@@ -264,7 +264,8 @@ enum MediaToolArgs {
         return ImageGenRequest(
             model: model, prompt: prompt, seed: seed,
             width: resolution.width, height: resolution.height, steps: steps,
-            keepResident: keepResident, lanModelId: lanId)
+            keepResident: keepResident, lanModelId: lanId,
+            negativePrompt: model.defaultNegativePrompt)
     }
 
     // MARK: - Speech

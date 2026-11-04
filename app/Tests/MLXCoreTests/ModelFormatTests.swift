@@ -1,7 +1,7 @@
 import XCTest
 @testable import MLXCore
 
-/// Tests for the Model Browser's weight-format filter (MLX / GGUF / Both) and the
+/// Tests for the Model Browser's weight-format filter (MLX / GGUF / Other) and the
 /// GGUF download helpers it drives.
 final class ModelFormatTests: XCTestCase {
 
@@ -11,15 +11,39 @@ final class ModelFormatTests: XCTestCase {
         // Sushi's EXL3 packs are MLX-served but tagged `sushi`, not `mlx`.
         XCTAssertEqual(ModelFormat.mlx.filterTags, ["mlx", "sushi"])
         XCTAssertEqual(ModelFormat.gguf.filterTags, ["gguf"])
-        // Both queries each tag and merges client-side.
-        XCTAssertEqual(ModelFormat.both.filterTags, ["mlx", "sushi", "gguf"])
+        // Other: packs served as published that are neither, NVIDIA ModelOpt today.
+        XCTAssertEqual(ModelFormat.other.filterTags, ["modelopt"])
     }
 
     func testAllCasesAndLabels() {
-        XCTAssertEqual(ModelFormat.allCases, [.mlx, .gguf, .both])
+        XCTAssertEqual(ModelFormat.allCases, [.mlx, .gguf, .other])
         XCTAssertEqual(ModelFormat.mlx.label, "MLX")
         XCTAssertEqual(ModelFormat.gguf.label, "GGUF")
-        XCTAssertEqual(ModelFormat.both.label, "Both")
+        XCTAssertEqual(ModelFormat.other.label, "Other")
+    }
+
+    // MARK: - ModelOpt packs
+
+    private func modelOpt(_ id: String, modelType: String) -> HFModel {
+        HFModel(id: id, downloads: 0, likes: 0, lastModified: nil, tags: ["modelopt", "safetensors", modelType], safetensors: nil, pipelineTag: "image-text-to-text")
+    }
+
+    /// Same model_type, different ModelOpt layout (FP8 n-gram table, FP8 MTP experts): only a
+    /// verified pack gets a Download, any other one would fail at load.
+    func testOnlyAVerifiedModelOptPackIsDownloadable() {
+        XCTAssertNil(modelOpt("nvidia/Qwen3.8-Flash-Next-FP4-Local", modelType: "qwen4_exp").incompatibleReason)
+        XCTAssertNil(modelOpt("nvidia/GLM-5.3-Flash-FP4-Local", modelType: "glm5_next").incompatibleReason)
+        XCTAssertNotNil(modelOpt("nvidia/Qwen3.8-Flash-Next-NVFP4", modelType: "qwen4_exp").incompatibleReason)
+    }
+
+    func testTheOtherTabListsOnlyPacksWeServe() {
+        let shown = HFSearchService.shown([modelOpt("nvidia/Qwen3.8-Flash-Next-FP4-Local", modelType: "qwen4_exp"), modelOpt("nvidia/GLM-5.3-Flash-FP4-Local", modelType: "glm5_next"), modelOpt("nvidia/Qwen3.8-Flash-Next-NVFP4", modelType: "qwen4_exp")], format: .other)
+        XCTAssertEqual(shown.map(\.id), ["nvidia/Qwen3.8-Flash-Next-FP4-Local", "nvidia/GLM-5.3-Flash-FP4-Local"])
+    }
+
+    /// FP8 is one byte per element; a catch-all on "4" priced F8_E4M3 at half that.
+    func testFp8ParametersArePricedAtOneByte() {
+        XCTAssertEqual(HFModel.estimateWeightBytes(parameters: ["F8_E4M3": 1000, "F8_E5M2": 1000], id: "x/y-MXFP8"), 2000)
     }
 
     // MARK: - Search URL carries the chosen filter

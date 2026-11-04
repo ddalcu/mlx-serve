@@ -1,0 +1,28 @@
+== video 0 82127 ca93dde2ea2177d86eb353d126386351e338e407c6add580c7cff29351fc6e40
+== video 1 82421 857ce3be9ba5b5722cf0cad71817edbec2350d63e2ec870e450d0b3f42359f9c
+== video 2 165 2d1c9bed6f376354526f6ec31082ef8b72efc2832cd9bdc6ce7a7da3cf17fbd5
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 40
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"missing 'prompt'"}}
+== video 3 189 cd4e16229a31fd12b30cdfcbe60fc890fa2122ecd6f3f5ae9e02629070265131
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 64
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"width and height must be multiples of 32"}}
+== video 4 258 d95f51f9b1de2a21306f479607e46b1776fa2e739315941c2da875c55881d920
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 132
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint"}}
+== row 685 491aee60f7236dae3e5770f359057d3e65c71734c0041288c66a0c4cb0aa844d
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["video"],"input_modalities":["text"],"modality":"video","engines":["mlx"],"meta":{"architecture":"minimax_h3","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

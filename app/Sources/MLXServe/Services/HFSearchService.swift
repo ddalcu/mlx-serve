@@ -1,11 +1,12 @@
 import Foundation
 
-/// Weight format filter for the Model Browser's HuggingFace search. MLX and GGUF
-/// are queried via distinct HF `filter` tags; `both` runs each and merges.
+/// Weight format filter for the Model Browser's HuggingFace search, one HF `filter`
+/// tag set per format. `other` is packs served as published that are neither MLX nor
+/// GGUF: NVIDIA ModelOpt today.
 enum ModelFormat: String, CaseIterable, Identifiable, Sendable {
     case mlx
     case gguf
-    case both
+    case other
 
     var id: String { rawValue }
 
@@ -13,17 +14,17 @@ enum ModelFormat: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .mlx: return "MLX"
         case .gguf: return "GGUF"
-        case .both: return "Both"
+        case .other: return "Other"
         }
     }
 
-    /// HF API `filter` tags to query. `both` queries each tag and merges results.
+    /// HF API `filter` tags to query, each its own request, merged.
     /// Sushi's EXL3 packs are served on the MLX path but tagged `sushi`, not `mlx`.
     var filterTags: [String] {
         switch self {
         case .mlx: return ["mlx", "sushi"]
         case .gguf: return ["gguf"]
-        case .both: return ["mlx", "sushi", "gguf"]
+        case .other: return ["modelopt"]
         }
     }
 }
@@ -130,7 +131,7 @@ class HFSearchService: ObservableObject {
         // loadable as a chat target on their own, and already have a
         // dedicated home (the Drafters tab), so showing them in Discover
         // (e.g. searching "assistant") was just confusing clutter.
-        let filtered = rawAll.filter { !$0.id.lowercased().contains("deepseek-v4-flash") && !$0.isDrafter }
+        let filtered = Self.shown(rawAll, format: format).filter { !$0.id.lowercased().contains("deepseek-v4-flash") && !$0.isDrafter }
 
         var seen = Set(fetchedModels.map { $0.id })
         for m in filtered where !seen.contains(m.id) {
@@ -180,6 +181,12 @@ class HFSearchService: ObservableObject {
             self.error = error.localizedDescription
             return nil
         }
+    }
+
+    /// The `modelopt` tag spans every architecture NVIDIA quantizes, and the loader serves a few
+    /// layouts, so Other lists only those; the other formats list everything and say why.
+    nonisolated static func shown(_ models: [HFModel], format: ModelFormat) -> [HFModel] {
+        format == .other ? models.filter { $0.incompatibleReason == nil } : models
     }
 
     /// Build the HF API query URL for the given page parameters. Exposed for tests.

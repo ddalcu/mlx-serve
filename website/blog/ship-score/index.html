@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ship Score: an eval that can't saturate</title>
+<meta name="author" content="David Dalcu">
+<meta name="description" content="Ship Score Eval: one pinned agentic prompt, scored by the memory, time and tokens it took to finish, on a named machine.">
+<link rel="icon" href="../../appiconb.png">
+<link rel="canonical" href="https://mlxserve.com/blog/ship-score/">
+<meta property="og:type" content="article">
+<meta property="og:site_name" content="mlx-serve">
+<meta property="og:title" content="Ship Score: an eval that can't saturate">
+<meta property="og:description" content="One pinned prompt, scored by the memory, time and tokens it took to finish, on a named machine.">
+<meta property="og:url" content="https://mlxserve.com/blog/ship-score/">
+<meta property="og:image" content="https://mlxserve.com/blog/ship-score/card.jpg">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://mlxserve.com/blog/ship-score/card.jpg">
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@type": "BlogPosting",
+  "headline": "Ship Score: an eval that can't saturate",
+  "datePublished": "2026-11-02",
+  "author": { "@type": "Person", "name": "David Dalcu" },
+  "publisher": { "@type": "Organization", "name": "mlx-serve", "url": "https://mlxserve.com/" },
+  "mainEntityOfPage": "https://mlxserve.com/blog/ship-score/"
+}
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="../post.css">
+<style>
+  .formula{font-family:var(--mono);font-size:18px;font-weight:600;color:var(--text-primary)}
+  .runs th{white-space:normal;vertical-align:bottom}
+  td.fail{font-family:var(--mono);font-weight:700;color:#d70015}
+  details summary{cursor:pointer;color:var(--blue);margin:8px 0}
+  details .code{position:relative;padding-right:84px}
+  .copy{position:absolute;top:10px;right:10px;font:600 12px var(--mono);color:#f5f5f7;background:rgba(255,255,255,.12);border:0;border-radius:8px;padding:5px 10px;cursor:pointer}
+  .copy:hover{background:rgba(255,255,255,.22)}
+  .runs table{font-size:14px}
+  .runs td:first-child{white-space:normal}
+  .runs tr.grp td{padding-top:18px;font-weight:600;color:var(--text-primary)}
+  .checklist{margin:4px 0 12px}
+  @media (max-width:640px){.runs th:nth-child(5),.runs td:nth-child(5){display:none}.tbl.runs{padding:6px 8px}.runs table{font-size:12px}.runs th,.runs td{padding-right:6px}.runs th{letter-spacing:0}}
+  .result img{width:100%;height:auto;display:block;border-radius:var(--radius);box-shadow:var(--shadow-elevated)}
+</style>
+</head>
+<body>
+<div class="top"><div class="top-inner">
+  <a class="brand" href="../../"><img src="../../appiconb.png" alt="" width="28" height="28">mlx-serve <span class="by">blog</span></a>
+  <nav><a href="#score">The score</a><a href="#runs">First runs</a><a href="#results">Results</a><a href="../">All posts</a><a class="cta" href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLX-Serve.dmg">Download</a></nav>
+</div></div>
+<div class="wrap">
+
+<p class="eyebrow">Evaluation · Proposal</p>
+<h1>Ship Score: an eval that <span class="grad">can't saturate</span></h1>
+<p class="sub">Give a model one real job. Measure what it cost to finish: memory, time and tokens.</p>
+<div class="byline"><span><b>David Dalcu</b></span><span>2 Nov 2026</span><span>M5 Ultra 80c · 256 GB</span></div>
+
+<h2>The idea</h2>
+<p>Benchmarks die. Every model eventually aces them, and then they stop telling you anything. Tool-call suites, KLD and top-1 are all heading the same way.</p>
+<p>Memory and speed never max out. No one will ever say a model uses too little RAM or finishes too fast. So score those.</p>
+
+<h2>The rules</h2>
+<ul>
+  <li><strong>Pinned prompts.</strong> Each one is the same text every run, and scores only compare runs of the same prompt. Seven so far, each rated 1 to 5 for difficulty: a Minecraft-style voxel game, King's Landing with an origami intro, a subway zombie shooter, a Need for Speed-style racer, and three built to stretch even frontier models: flying from a planet's surface to orbit, a real-time strategy skirmish, and a puzzle game of linked doorways.</li>
+  <li><strong>Everything else is your choice.</strong> Engine, model, quant, settings and agent. All of it is part of what gets scored.</li>
+  <li><strong>Ship or fail.</strong> A run ships when, within 90 minutes of the prompt, <code>npm run build</code> passes, <code>DONE.md</code> exists, and the build passes the play check: it loads without errors, draws something, and responds when you play it. Anything else scores zero. What it got right is the checklist: each prompt ends with a Must have list, and each item earns points.</li>
+  <li><strong>No help.</strong> Once a run starts, nobody steps in: no nudges, no answers, no killed tools. The only stop is the 90-minute cap. A run anyone helped doesn't count.</li>
+  <li><strong>Name the inputs.</strong> Text only, or text and images. Give the agent what the model supports and say which it was: a model that can look at its own screenshots finishes differently from one that can't.</li>
+  <li><strong>Scored per machine.</strong> GPU plus memory, for example <b>M5 Ultra 80c · 256 GB</b> or <b>RTX 5090 · 32 GB</b>.</li>
+  <li><strong>Three runs to publish.</strong> One agent run swings too much to stand alone. All three count, so a failed run still pays for what it used.</li>
+</ul>
+
+<h2 id="score">The score</h2>
+<div class="callout"><p class="formula">1,000 × checklist ÷ (√avg GiB × minutes × M tokens)</p></div>
+<ul>
+  <li><strong>Checklist:</strong> the points the game earned on its prompt's checklist, out of 10, as a fraction (8 points is 0.8). Each item is something you can see or do in the game, yes or no.</li>
+  <li><strong>Avg GiB:</strong> the engine's memory footprint, averaged over the samples taken between the prompt and the agent's last message. It includes the engine's caches (KV and prompt cache), so their settings count too; on a small model they can outweigh the weights. It counts by its square root: memory matters, but less than getting the game right.</li>
+  <li><strong>Minutes:</strong> time from the prompt to the agent's last message.</li>
+  <li><strong>M tokens:</strong> millions of tokens the model wrote plus the prompt tokens it had to prefill, from the agent's session log. Prompt-cache hits don't count.</li>
+</ul>
+<p>For example, a full checklist in 25 GiB, 40 minutes and 100k tokens scores <b>50</b>. Miss 2 points and it scores 40. Use four times the memory and it scores 25. Halve the minutes or the tokens and the score doubles.</p>
+<p>Minutes charge a slow engine; tokens charge a wordy model. A fast engine can hide a model that writes three times the code it needs, and tokens catch it. Cached prompt tokens are left out because re-reading the context costs a good prompt cache almost nothing, and the minutes already show what it did cost.</p>
+<p>Tool calls and errors are reported but not scored. A wasted call already costs its tokens and minutes, a build-and-fix loop is how games ship, and how many calls the same work takes depends on the agent.</p>
+<p><strong>Three runs.</strong> Add the three runs' checklist fractions (a failed run adds 0) and their costs (√avg GiB × minutes × M tokens, failed runs included). The score is 1,000 × the checklist total ÷ the cost total. One lucky run can't carry a model that fails twice.</p>
+<p>Beyond the checklist, the screenshots are the quality signal: every result sheet shows each game, and no taste score goes into the number.</p>
+
+<h2 id="runs">First runs</h2>
+<p>These runs used a pre-release draft of voxel-sandbox v1, without its Must have list, plus a banner line and a 60 fps rule. Every item on the v1 checklist was already in that draft, so they're scored on it, but they don't compare with v1 runs. Qwen3.8 Flash Next and DeepSeek-V4.1 Flash packs on mlx-serve, pi agent, M5 Ultra 80c · 256 GB. One run each, so these are previews, not published scores. The sheets below list what each game missed. More packs are queued.</p>
+<div class="tbl runs"><table>
+<thead><tr><th>Pack</th><th class="n">Avg<br>GiB</th><th class="n">Time</th><th class="n">Tokens out /<br>uncached in</th><th class="n">Calls<br>(errors)</th><th class="n">Score<br>(checklist)</th></tr></thead>
+<tbody>
+<tr class="grp"><td colspan="6">Qwen3.8 Flash Next</td></tr>
+<tr><td>8-bit (MLX)</td><td class="n">134.1</td><td class="n">7:09</td><td class="n">48k / 15k</td><td class="n">44 (1)</td><td class="n"><b>171</b> (9/10)</td></tr>
+<tr><td>iQ-MLX 4.7bpw (MLX)</td><td class="n">77.4</td><td class="n">9:09</td><td class="n">71k / 29k</td><td class="n">53 (3)</td><td class="n"><b>124</b> (10/10)</td></tr>
+<tr><td>UD-Q4_K_XL (Unsloth)</td><td class="n">92.1</td><td class="n">13:09</td><td class="n">79k / 38k</td><td class="n">77 (2)</td><td class="n"><b>68</b> (10/10)</td></tr>
+<tr><td>IQ3_XXS (GSQ-RCO)</td><td class="n">55.6</td><td class="n">17:40</td><td class="n">88k / 60k</td><td class="n">60 (4)</td><td class="n"><b>46</b> (9/10)</td></tr>
+<tr><td>IQ3_S (GSQ-RCO)</td><td class="n">64.5*</td><td class="n">24:53</td><td class="n">102k / 89k</td><td class="n">129 (9)</td><td class="n"><b>26*</b> (10/10)</td></tr>
+<tr><td>Q2_0 (GSQ-RCO)</td><td class="n">45.5 est.</td><td class="n">39:51</td><td class="n">225k / 315k</td><td class="n">270 (20)</td><td class="n"><b>6.9 est.</b> (10/10)</td></tr>
+<tr><td>IQ2_XS (GSQ-RCO)</td><td class="n">–</td><td class="n">&gt; 90:00</td><td class="n">95k / 96k</td><td class="n">94 (4)</td><td class="n fail">FAIL</td></tr>
+<tr class="grp"><td colspan="6">DeepSeek-V4.1 Flash</td></tr>
+<tr><td>Coder IQ2_XXS (GSQ-RCO)</td><td class="n">73.4 est.</td><td class="n">23:34</td><td class="n">71k / 95k</td><td class="n">66 (8)</td><td class="n"><b>27 est.</b> (9/10)</td></tr>
+<tr><td>IQ2_XXS (GSQ-RCO)</td><td class="n">135.4 est.</td><td class="n">27:22</td><td class="n">83k / 110k</td><td class="n">63 (3)</td><td class="n"><b>15 est.</b> (9/10)</td></tr>
+<tr><td>STQ 1.75bpw (Sushi)†</td><td class="n">121.5</td><td class="n">31:06</td><td class="n">124k / 196k</td><td class="n">79 (6)</td><td class="n"><b>9.1</b> (10/10)</td></tr>
+<tr><td>iQ-MLX 3.0bpw (MLX)</td><td class="n">208.9</td><td class="n">23:35</td><td class="n">103k / 192k</td><td class="n">89 (9)</td><td class="n"><b>8.0</b> (8/10)</td></tr>
+</tbody></table></div>
+<p class="note">*Memory sampled for the second half of the run only. est.: memory wasn't sampled during the run, so it's the pack's loaded footprint times the median ratio of that model's sampled runs (1.05 for Flash Next, 0.98 for DeepSeek). †Text and image input; every other run had text only. Every run that shipped also passed the play check. The checklist was ticked from the same scripted play-through (start, key 3, walk, look, break, place) and each game's own screenshots, with jump checked by hand. IQ2_XS failed because a tool it wrote never returned, so it hit the cap with no <code>DONE.md</code>. Prompt-cache hits ran 1.4M to 18M tokens per run and aren't scored; the sheets below have the speeds.</p>
+
+<h2 id="results">Our results</h2>
+<p>Every set of runs we make lands here, newest first: one sheet per model family and prompt, with each game's screenshot, its Ship Score and the numbers behind them. Tap a sheet for full size.</p>
+<figure class="result"><a href="results/2026-11-02-voxel-qwen38-flash-next.webp"><img src="results/2026-11-02-voxel-qwen38-flash-next.webp" width="1600" height="3076" loading="lazy" alt="Ship Score sheet for seven Qwen3.8 Flash Next packs on the voxel prompt: each game's screenshot with its Ship Score, charts of Ship Score, KLD, Top-1, memory, decode, prefill and wall time, and a table of the score's inputs."></a>
+<figcaption><span class="fig">2 NOV 2026</span>Qwen3.8 Flash Next, 7 packs (MLX, GSQ-RCO and Unsloth GGUF). Voxel prompt with a banner line, mlx-serve, pi with text input, one run each, M5 Ultra 80c · 256 GB.</figcaption></figure>
+<figure class="result"><a href="results/2026-11-02-voxel-deepseek-v41-flash.webp"><img src="results/2026-11-02-voxel-deepseek-v41-flash.webp" width="1600" height="2159" loading="lazy" alt="Ship Score sheet for four DeepSeek-V4.1 Flash packs on the voxel prompt: each game's screenshot with its Ship Score, charts of Ship Score, KLD, Top-1, memory, decode, prefill and wall time, and a table of the score's inputs."></a>
+<figcaption><span class="fig">2 NOV 2026</span>DeepSeek-V4.1 Flash, 4 packs (iQ-MLX, Sushi STQ and GSQ-RCO GGUF). Voxel prompt with a banner line, mlx-serve, pi, one run each, M5 Ultra 80c · 256 GB. Sushi STQ ran with image input; the others with text.</figcaption></figure>
+
+<h2>Run it</h2>
+<p>The eval lives in <a href="https://github.com/CommunityServe/ship-score">CommunityServe/ship-score</a>: the prompts, the harness that runs, plays and scores a game, the judging rules and the <a href="https://communityserve.github.io/ship-score/">leaderboard</a>, where every submitted game is playable. Point your coding agent at it:</p>
+<div class="callout"><p>Run the Ship Score eval on my machine against my local model: follow https://github.com/CommunityServe/ship-score/blob/main/AGENTS.md</p></div>
+<p>The agent referees and judges: it asks for your engine and model, starts each run hands-off with the 90-minute cap, judges the checklist from screenshots of the game, and opens a PR with the result. CI recomputes every number from the raw files and merges the PR, and the leaderboard updates. Three runs make an official result; one or two land in previews.</p>
+
+<h2>How it's measured</h2>
+<p>Memory is the engine's physical footprint, sampled every 30 seconds and averaged from the prompt to the agent's last message. Time, tokens and tool calls come from the agent's session log; uncached tokens in are each turn's prompt tokens minus its prompt-cache hits. The play check loads the build in headless Chromium, starts it, presses keys, moves the mouse and clicks, and looks for errors, a blank screen or a screen that never changes. Each run starts with a fresh server and an empty folder.</p>
+<p>The checklist is the prompt's own Must have list, so the model knows exactly what earns points. Each item is something you can see or do, worth 1 to 3 points, 10 in all; the points are published here, not in the prompt, so the model builds the whole list. The things that make the game work at all weigh most. Whoever ticks it plays the game and answers yes or no, never "mostly".</p>
+<p>Difficulty is how much has to work at once and how hard the hardest part is: 1 is one system built from well-known techniques, 5 is several hard systems that all have to work together (rendering tricks, simulation, AI, precision), hard even for a frontier model. Scores only compare runs of the same prompt, so difficulty tells you what a score was earned on, not how to scale it.</p>
+<details>
+<summary>The prompt (voxel-sandbox v1) · difficulty 2/5</summary>
+<p class="note">sha256 <code>9e36e83443bada572260f423974e0c0fdd16e7bc8d4d3a98fb4a28e1279ac42d</code></p>
+<div class="code">Build a first-person voxel sandbox game for the browser with three.js, in the current directory.
+
+The world: a procedurally generated block terrain (grass, dirt, stone, sand, water, wood logs, leaves, with hills and trees), chunked and meshed with only the visible faces, a sky, fog and simple directional lighting. The player walks, jumps and collides with the blocks, breaks blocks (left click) and places the selected block (right click), and picks a block type from a hotbar (keys 1-9, shown at the bottom of the screen). Draw the block textures yourself in code (canvas-generated pixel textures, one texture atlas); no downloaded art.
+
+Must have (checked by playing the game):
+- Walk with WASD and look around with the mouse
+- Left click removes a block
+- Right click adds a block
+- Keys 1-9 change the highlighted hotbar slot
+- Space jumps
+- Water is visible
+- Trees are visible
+- The ground has hills
+
+Setup and rules:
+- Use Vite and the latest three.js from npm, plain JavaScript modules.
+- Controls: WASD to move, mouse to look (pointer lock on click), space to jump, left click break, right click place, 1-9 hotbar, with an on-screen controls hint and a crosshair.
+- Write tools/shot.mjs with Playwright (Chromium) that loads the built game, waits for the world to render and saves screenshots to shots/ (the spawn view and two other views). Look at the screenshots yourself and fix whatever looks wrong.
+- `npm run build` must pass. Write README.md (what it is, controls) and DONE.md (what you built, what you checked, what you would improve next).
+- Work autonomously to the end; do not stop to ask questions. If something fails, fix it and keep going.</div>
+<p class="note">Checklist points</p>
+<ul class="checklist">
+  <li><b>3</b> Walk with WASD and look around with the mouse</li>
+  <li><b>1</b> Left click removes a block</li>
+  <li><b>1</b> Right click adds a block</li>
+  <li><b>1</b> Keys 1-9 change the highlighted hotbar slot</li>
+  <li><b>1</b> Space jumps</li>
+  <li><b>1</b> Water is visible</li>
+  <li><b>1</b> Trees are visible</li>
+  <li><b>1</b> The ground has hills</li>
+</ul>
+</details>
+<details>
+<summary>The prompt (kings-landing v1) · difficulty 3/5</summary>
+<p class="note">sha256 <code>ab1695363468142cb9ec986ea13e3b0da294fe8cb17a07581c8bcd981d56ecad</code></p>
+<div class="code">Build me Kings landing from game of thrones in threejs, it starts like the tv show movie intro where kings landing gets built like origami for the first 30 seconds. And it ends with a first person walkable character so you can explore it.
+
+Must have (checked by playing the game):
+- An intro where the city builds itself from folding pieces
+- The intro lasts 20 to 40 seconds
+- After the intro, walk with WASD and look around with the mouse
+- A wall around the city
+- A castle on a hill
+- Water beside the city
+
+Setup and rules:
+- Use Vite and the latest three.js from npm, plain JavaScript modules.
+- Write tools/shot.mjs with Playwright (Chromium) that loads the built game, waits for it to render and saves three screenshots to shots/. Look at the screenshots yourself and fix whatever looks wrong.
+- `npm run build` must pass. Write README.md (what it is, controls) and DONE.md (what you built, what you checked, what you would improve next).
+- Work autonomously to the end; do not stop to ask questions. If something fails, fix it and keep going.</div>
+<p class="note">Checklist points</p>
+<ul class="checklist">
+  <li><b>3</b> An intro where the city builds itself from folding pieces</li>
+  <li><b>1</b> The intro lasts 20 to 40 seconds</li>
+  <li><b>3</b> After the intro, walk with WASD and look around with the mouse</li>
+  <li><b>1</b> A wall around the city</li>
+  <li><b>1</b> A castle on a hill</li>
+  <li><b>1</b> Water beside the city</li>
+</ul>
+</details>
+<details>
+<summary>The prompt (subway-fps v1) · difficulty 4/5</summary>
+<p class="note">sha256 <code>21e55f7228837b61a4f1df2569ebb204ba579a255c8b9554f136074d51eafbe6</code></p>
+<div class="code">Make a beautifully detailed web scene using js, of a subway station with focus on detail. It should be 3D and something that would be impressive to you.
+The scene must be the setting for an FPS with humanoid/zombieoid enemies, visible ammo tracers, weapon recoil, at least two different weapons, muzzle flash, sfx and high detail.
+The first wave should be simple. When the first wave is cleared, a train should pull into the station that the player enters. The train then closes its open doors to bring you to the next station for wave 2, with difficulty increasing until the player loses. use threejs and create the result as something playable in the browser.
+
+Must have (checked by playing the game):
+- Walk and look around in first person on a platform with tracks
+- Enemies come at you and fall when shot
+- Two or more weapons to switch between
+- Tracers and a muzzle flash when you fire
+- A sound when you fire
+- After wave 1 a train arrives, and riding it takes you to another station
+- Wave 2 has more enemies than wave 1
+
+Setup and rules:
+- Use Vite and the latest three.js from npm, plain JavaScript modules.
+- Write tools/shot.mjs with Playwright (Chromium) that loads the built game, waits for it to render and saves three screenshots to shots/. Look at the screenshots yourself and fix whatever looks wrong.
+- `npm run build` must pass. Write README.md (what it is, controls) and DONE.md (what you built, what you checked, what you would improve next).
+- Work autonomously to the end; do not stop to ask questions. If something fails, fix it and keep going.</div>
+<p class="note">Checklist points</p>
+<ul class="checklist">
+  <li><b>2</b> Walk and look around in first person on a platform with tracks</li>
+  <li><b>2</b> Enemies come at you and fall when shot</li>
+  <li><b>1</b> Two or more weapons to switch between</li>
+  <li><b>1</b> Tracers and a muzzle flash when you fire</li>
+  <li><b>1</b> A sound when you fire</li>
+  <li><b>2</b> After wave 1 a train arrives, and riding it takes you to another station</li>
+  <li><b>1</b> Wave 2 has more enemies than wave 1</li>
+</ul>
+</details>
+<details>
+<summary>The prompt (racing v1) · difficulty 3/5</summary>
+<p class="note">sha256 <code>5c15eee4d815ea8f32ed9ff9cfd848a9c23b2cf0c4161d901b3c8735be18234d</code></p>
+<div class="code">build me a need for speed style sim car racing game, with procedual generated textures and audio
+
+Must have (checked by playing the game):
+- Drive a car with the keyboard: accelerate, brake, steer
+- A track or road to race on
+- Opponent cars or a lap timer
+- Speed shown on screen
+- An engine sound that changes with speed
+- No image or audio files in the project
+
+Setup and rules:
+- Use Vite and the latest three.js from npm, plain JavaScript modules.
+- Write tools/shot.mjs with Playwright (Chromium) that loads the built game, waits for it to render and saves three screenshots to shots/. Look at the screenshots yourself and fix whatever looks wrong.
+- `npm run build` must pass. Write README.md (what it is, controls) and DONE.md (what you built, what you checked, what you would improve next).
+- Work autonomously to the end; do not stop to ask questions. If something fails, fix it and keep going.</div>
+<p class="note">Checklist points</p>
+<ul class="checklist">
+  <li><b>3</b> Drive a car with the keyboard: accelerate, brake, steer</li>
+  <li><b>2</b> A track or road to race on</li>
+  <li><b>2</b> Opponent cars or a lap timer</li>
+  <li><b>1</b> Speed shown on screen</li>
+  <li><b>1</b> An engine sound that changes with speed</li>
+  <li><b>1</b> No image or audio files in the project</li>
+</ul>
+</details>
+
+<details>
+<summary>The prompt (planet-to-orbit v1) · difficulty 5/5</summary>
+<p class="note">sha256 <code>5976854022a35b8dbe729e0e17420ab225ddb69efbda6074c107ac54a18473e1</code></p>
+<div class="code">Build a space flight game for the browser with three.js: one procedurally generated planet that you fly from its surface to orbit and back, with no loading screen.
+
+The planet: a whole sphere of terrain (mountains, plains, oceans, polar ice) generated from noise, with level of detail that adds triangles near the camera and stays crack-free where detail levels meet, from standing height to a view of the whole globe. An atmosphere shader that scatters light (blue sky by day, red sunsets, a thin glowing rim from space), a sun on a day and night cycle, clouds, and lights on the night side.
+
+The ship: Newtonian flight with thrust, rotation and gravity, atmospheric drag, a glow when re-entering too fast, landing gear and a check for a safe landing. A HUD with altitude, speed, vertical speed and fuel, and a predicted orbit line once you are above the atmosphere.
+
+Keep it smooth: 60 fps on an Apple Silicon Mac, and no jitter far from the origin (handle floating-point precision).
+
+Must have (checked by playing the game):
+- Take off from the ground and fly with the keyboard
+- Fly up until the whole planet is in view, with no loading screen
+- Oceans and mountains are visible
+- Blue sky near the ground, black sky in space
+- Day turns to night
+- A HUD with altitude, speed and fuel
+- An orbit line above the atmosphere
+- Land back on the ground
+
+Setup and rules:
+- Use Vite and the latest three.js from npm, plain JavaScript modules.
+- Write tools/shot.mjs with Playwright (Chromium) that loads the built game, waits for it to render and saves three screenshots to shots/. Look at the screenshots yourself and fix whatever looks wrong.
+- `npm run build` must pass. Write README.md (what it is, controls) and DONE.md (what you built, what you checked, what you would improve next).
+- Work autonomously to the end; do not stop to ask questions. If something fails, fix it and keep going.</div>
+<p class="note">Checklist points</p>
+<ul class="checklist">
+  <li><b>2</b> Take off from the ground and fly with the keyboard</li>
+  <li><b>2</b> Fly up until the whole planet is in view, with no loading screen</li>
+  <li><b>1</b> Oceans and mountains are visible</li>
+  <li><b>1</b> Blue sky near the ground, black sky in space</li>
+  <li><b>1</b> Day turns to night</li>
+  <li><b>1</b> A HUD with altitude, speed and fuel</li>
+  <li><b>1</b> An orbit line above the atmosphere</li>
+  <li><b>1</b> Land back on the ground</li>
+</ul>
+</details>
+<details>
+<summary>The prompt (rts-skirmish v1) · difficulty 5/5</summary>
+<p class="note">sha256 <code>82150aebef6de92ddd876aadb63c5381befc4ef6966cb5f9386673850898c919</code></p>
+<div class="code">Build a real-time strategy game for the browser with three.js: one skirmish, the player against a computer opponent, on a procedurally generated map.
+
+The map: terrain with hills, cliffs, forests and two resource types, under fog of war that hides what your units can't see and greys out what they have seen. A minimap showing terrain, units and fog that moves the camera when clicked.
+
+The game: workers gather resources and construct buildings; a base, a barracks and a workshop train at least three unit types with different roles (melee, ranged, siege). Box select, right click to move or attack, attack-move, and control groups on 1-9. Units path around terrain and buildings and move as groups without piling up, and 300 units on screen must hold 60 fps on an Apple Silicon Mac. The computer opponent gathers, builds, expands and attacks in waves. The game ends with a victory or defeat screen when a side loses its base.
+
+Must have (checked by playing the game):
+- Drag a box to select units, right click to move them
+- Workers gather resources and the counter goes up
+- Build a barracks and train units from it
+- Three or more unit types
+- Fog of war hides the unexplored map
+- A minimap, and clicking it moves the camera
+- Computer units attack you
+- A victory or defeat screen
+
+Setup and rules:
+- Use Vite and the latest three.js from npm, plain JavaScript modules.
+- Write tools/shot.mjs with Playwright (Chromium) that loads the built game, waits for it to render and saves three screenshots to shots/. Look at the screenshots yourself and fix whatever looks wrong.
+- `npm run build` must pass. Write README.md (what it is, controls) and DONE.md (what you built, what you checked, what you would improve next).
+- Work autonomously to the end; do not stop to ask questions. If something fails, fix it and keep going.</div>
+<p class="note">Checklist points</p>
+<ul class="checklist">
+  <li><b>2</b> Drag a box to select units, right click to move them</li>
+  <li><b>2</b> Workers gather resources and the counter goes up</li>
+  <li><b>1</b> Build a barracks and train units from it</li>
+  <li><b>1</b> Three or more unit types</li>
+  <li><b>1</b> Fog of war hides the unexplored map</li>
+  <li><b>1</b> A minimap, and clicking it moves the camera</li>
+  <li><b>1</b> Computer units attack you</li>
+  <li><b>1</b> A victory or defeat screen</li>
+</ul>
+</details>
+<details>
+<summary>The prompt (linked-doorways v1) · difficulty 5/5</summary>
+<p class="note">sha256 <code>2d27440b9d8b5e692c540167884b3cb97f5ff02d1649eb9a0e21a0c7db6bda50</code></p>
+<div class="code">Build a first-person puzzle game for the browser with three.js, built around linked doorways.
+
+The doorways: each one shows a live view of the place it leads to, rendered from the matching viewpoint and clipped to its frame, including doorways seen through other doorways at least two levels deep. Walking through one is seamless: no flash and no jump in the view. The player and objects keep their momentum through a doorway, and a cube halfway through is drawn on both sides.
+
+The game: five puzzle rooms with a level select, solved by placing doorways on walls, carrying cubes onto pressure plates and launching yourself through doorways at speed. Physics for the player and the cubes (gravity, collision, friction, stacking) written for this game, no physics library. Progress is saved between sessions, and each room ends with a level-complete screen.
+
+Must have (checked by playing the game):
+- Walk and look around in first person
+- A doorway shows the room it leads to
+- Walking through a doorway puts you in that room with no fade or loading
+- A doorway seen through a doorway also shows its room
+- A cube on a pressure plate opens something
+- A level select with five rooms
+- After a reload, a solved room stays solved
+
+Setup and rules:
+- Use Vite and the latest three.js from npm, plain JavaScript modules.
+- Write tools/shot.mjs with Playwright (Chromium) that loads the built game, waits for it to render and saves three screenshots to shots/. Look at the screenshots yourself and fix whatever looks wrong.
+- `npm run build` must pass. Write README.md (what it is, controls) and DONE.md (what you built, what you checked, what you would improve next).
+- Work autonomously to the end; do not stop to ask questions. If something fails, fix it and keep going.</div>
+<p class="note">Checklist points</p>
+<ul class="checklist">
+  <li><b>2</b> Walk and look around in first person</li>
+  <li><b>2</b> A doorway shows the room it leads to</li>
+  <li><b>2</b> Walking through a doorway puts you in that room with no fade or loading</li>
+  <li><b>1</b> A doorway seen through a doorway also shows its room</li>
+  <li><b>1</b> A cube on a pressure plate opens something</li>
+  <li><b>1</b> A level select with five rooms</li>
+  <li><b>1</b> After a reload, a solved room stays solved</li>
+</ul>
+</details>
+
+<footer>
+  <a href="../../">mlxserve.com</a>
+  <a href="../">Blog</a>
+  <a href="https://github.com/ddalcu/mlx-serve">GitHub</a>
+  <a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md">Changelog</a>
+  <span>MIT License · built for Apple silicon</span>
+</footer>
+</div>
+<script>
+document.querySelectorAll('details .code').forEach(function(el){
+  var text = el.textContent + '\n', b = document.createElement('button');
+  b.className = 'copy'; b.type = 'button'; b.textContent = 'Copy';
+  b.onclick = function(){
+    navigator.clipboard.writeText(text).then(function(){
+      b.textContent = 'Copied';
+      setTimeout(function(){b.textContent = 'Copy';}, 1500);
+    });
+  };
+  el.appendChild(b);
+});
+</script>
+</body>
+</html>

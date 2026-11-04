@@ -6,7 +6,6 @@
 |---|---|---|---|---|
 | **Gemma 4** | `gemma4`, `gemma4_unified` | `gemma-4-e2b-it-4bit`、`gemma-4-e4b-it-8bit`、`gemma-4-26b-a4b-it-4bit`、`gemma-4-12b-unified` | Gemma 轮次 | SigLIP（unified 增加音频） |
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma 轮次 | -- |
-| **DiffusionGemma** | `diffusion_gemma` | `diffusiongemma-26B-A4B-it-4bit` | Gemma 轮次（块扩散） | -- |
 | **Qwen 2 / 3 / 3.5 / 3.6 / 3.8** | `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`、`Qwen3.5-4B`、`Qwen3.6-27B`、`Qwen3.6-35B-A3B`、[`Qwen3.8-27B`](https://huggingface.co/ddalcu/Qwen3.8-27B-MLX-Serve-4bit)（18.2 GB，内置草稿头，effort 档位 `xhigh`/`medium`/`low`） | ChatML | Qwen3-VL |
 | **Muse-Glimmer** | `muse_glimmer` | Meta 的 Muse-Glimmer-30B（[4-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit) / [8-bit](https://huggingface.co/ddalcu/Muse-Glimmer-30B-MLX-Serve-8bit)，内置 DFlash 配套草稿模型，M4 Max 上最高 75 tok/s） | Harmony 频道 + ATEM 工具 | Muse ViT（图像） |
 | **Ling 3.0** | `bailing_hybrid` | inclusionAI Ling 3.0，例如 `rapid-mlx/Ling-3.0-tiny-MLX-4bit`（4.2 GB，KDA + MLA 混合 MoE） | GLM 标签，思考默认开启 | -- |

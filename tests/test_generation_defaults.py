@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Generation policies apply across APIs, reload without model reload, and enforce client locks."""
+"""Global and per-model generation defaults and `ignore_client` across Chat, Messages, Responses, raw Completions and
+Ollama, streamed and not.
+
+  python3 tests/test_generation_defaults.py <model_dir>      # MLX_SERVE_BINARY picks the binary
+
+Checks: an edited defaults file applies on the next request (no model reload), a forced budget closes an adaptive
+`xhigh` thought, a malformed file never refuses a request. Own server on a free port with a private HOME.
+"""
 import json
 import os
 import pathlib
@@ -8,8 +15,9 @@ import subprocess
 import sys
 import tempfile
 import time
-import urllib.error
 import urllib.request
+
+from lib.server import wait_health
 
 binary = pathlib.Path(os.environ.get('MLX_SERVE_BINARY', './zig-out/bin/mlx-serve')).resolve()
 model = pathlib.Path(sys.argv[1]).resolve()
@@ -73,16 +81,10 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
             '--no-prevent-sleep', '--log-file', str(log_path),
         ], env={**os.environ, 'HOME': home}, stdout=subprocess.DEVNULL, stderr=log)
         try:
-            for _ in range(180):
-                if process.poll() is not None:
-                    raise RuntimeError(log_path.read_text()[-2000:])
-                try:
-                    with urllib.request.urlopen(base + '/health', timeout=1):
-                        break
-                except (urllib.error.URLError, TimeoutError):
-                    time.sleep(1)
-            else:
-                raise RuntimeError('server did not start')
+            try:
+                wait_health(base, 180, process)
+            except RuntimeError:
+                raise RuntimeError(log_path.read_text()[-2000:])
             message = [{'role': 'user', 'content': 'Count from 1 to 100, one number per line.'}]
             cases = [
                 ('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message, 'max_completion_tokens': 64, 'enable_thinking': True, 'reasoning_effort': 'xhigh', 'stream_options': {'include_usage': True}}, 'completion_tokens'),

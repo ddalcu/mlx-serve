@@ -62,6 +62,31 @@ final class AnePrefillSettingsTests: XCTestCase {
         }
     }
 
+    /// The int8 route is on by default only on an M5-family Mac with 64 GiB of RAM, like the server; the app always says which.
+    func testW8a8DefaultsFromChipAndRamAndEmitsItsChoice() throws {
+        XCTAssertTrue(ServerOptions.defaultW8a8(physicalMemoryBytes: 64 << 30, isM5Family: true))
+        XCTAssertTrue(ServerOptions.defaultW8a8(physicalMemoryBytes: 512 << 30, isM5Family: true))
+        XCTAssertFalse(ServerOptions.defaultW8a8(physicalMemoryBytes: (64 << 30) - 1, isM5Family: true))
+        XCTAssertFalse(ServerOptions.defaultW8a8(physicalMemoryBytes: 64 << 30, isM5Family: false)) // an M4 Max with 64 GB
+        XCTAssertFalse(ServerOptions.defaultW8a8(physicalMemoryBytes: 512 << 30, isM5Family: false))
+        let here = ServerOptions.defaultW8a8(
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory, isM5Family: AnePrefillAdvice.liveIsM5Family)
+        XCTAssertEqual(ServerOptions().w8a8, here)
+        XCTAssertTrue(args { $0.w8a8 = true }.contains("--w8a8"))
+        XCTAssertFalse(args { $0.w8a8 = true }.contains("--no-w8a8"))
+        XCTAssertTrue(args { $0.w8a8 = false }.contains("--no-w8a8"))
+        XCTAssertFalse(args { $0.w8a8 = false }.contains("--w8a8"))
+        let legacy = #"{"host":"0.0.0.0","port":11234}"#.data(using: .utf8)!
+        XCTAssertEqual(try JSONDecoder().decode(ServerOptions.self, from: legacy).w8a8, here)
+        let off = #"{"host":"0.0.0.0","port":11234,"w8a8":false}"#.data(using: .utf8)!
+        XCTAssertFalse(try JSONDecoder().decode(ServerOptions.self, from: off).w8a8)
+        let on = #"{"host":"0.0.0.0","port":11234,"w8a8":true}"#.data(using: .utf8)!
+        XCTAssertTrue(try JSONDecoder().decode(ServerOptions.self, from: on).w8a8)
+        let field = ServerOptions.serverFlagFields["w8a8"]
+        XCTAssertTrue(field?.needsRestart ?? false)
+        XCTAssertTrue((field?.explainer ?? "").contains("4-bit"))
+    }
+
     // ── Per-Mac advice (pure: chip brand string + RAM in) ──
 
     func testM4MaxWithEnoughRamGetsNoCaution() {

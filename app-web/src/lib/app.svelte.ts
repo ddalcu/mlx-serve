@@ -1,6 +1,6 @@
 import { getContext } from "svelte";
 import { N } from "./i18n/i18n";
-import { pageApiKey, pageServer } from "./core/console";
+import { pageServer } from "./core/console";
 import { Library } from "./core/library";
 import { AudioWorkspace } from "./state/audio-workspace.svelte";
 import { ChatWorkspace } from "./state/chat-workspace.svelte";
@@ -30,7 +30,7 @@ export type SettingsCategory = "all" | "interface" | "providers" | "about";
 export class App {
   readonly storage = new SafeStorage();
   readonly prefs = new InterfacePreferences(this.storage);
-  readonly connection = new Connection(pageServer(location), this.storage, {}, pageApiKey(location.search));
+  readonly connection = new Connection(pageServer(location), this.storage);
   readonly router = new Router();
   readonly library: Library;
   readonly chat: ChatWorkspace;

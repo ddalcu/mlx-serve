@@ -2,10 +2,12 @@
 # Four long prompts at once under a LOW guard ceiling: each is served or refused by name,
 # a request that does not fit beside live ones WAITS, and the server is alive at the end.
 #   MEMPRESS_TEST_MODEL=/path ./tests/test_memory_pressure_4way.sh [port]
+source "$(dirname "$0")/_lib_models.sh"
 set -u
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11493}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${MEMPRESS_TEST_MODEL:-$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-2B-MLX-4bit}"
+MODEL="${MEMPRESS_TEST_MODEL:-$(find_model lmstudio-community/Qwen3.5-2B-MLX-4bit || echo "$HOME/.mlx-serve/models/lmstudio-community/Qwen3.5-2B-MLX-4bit")}"
 CEILING_MB="${MEMPRESS_CEILING_MB:-2600}"
 WORK="$(mktemp -d)"; SERVER_PID=""
 cleanup() { [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null; rm -rf "$WORK"; }
@@ -15,7 +17,7 @@ trap cleanup EXIT
 
 MLX_SERVE_GPU_CEILING_MB=$CEILING_MB "$BINARY" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --ctx-size 65536 > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!
-for _ in $(seq 1 90); do curl -s -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
+srv_wait_health "http://127.0.0.1:$PORT" 90 1 || true
 
 python3 - "$PORT" > "$WORK/out.txt" <<'PY'
 import json, sys, threading, urllib.request, urllib.error, uuid

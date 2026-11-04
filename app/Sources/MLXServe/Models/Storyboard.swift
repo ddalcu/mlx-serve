@@ -10,6 +10,9 @@ struct StoryboardSegment: Codable, Equatable, Identifiable {
     /// A picture this shot lands on and the next one opens on, in place of the
     /// shot's own rendered last frame. Never the final shot's: that is the pane's.
     var endFramePath: String? = nil
+    /// Where this shot renders: nil = whichever machine plans best, "" = this Mac, else
+    /// the LAN machine of that name.
+    var machine: String? = nil
 }
 
 /// A long clip as a list of shots the APP chains: each shot is an ordinary

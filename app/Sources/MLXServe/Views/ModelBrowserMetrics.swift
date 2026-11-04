@@ -22,6 +22,22 @@ enum ModelBrowserMetrics {
     static let updatedWidth: CGFloat = 64
     static let actionWidth: CGFloat = 120
 
+    // My Models: the size cell and the trailing action cell (Use, update, settings,
+    // trash/lock, reveal), read by the column header AND every row.
+    static let localSizeWidth: CGFloat = 90
+    static let localActionsWidth: CGFloat = 172
+    /// Two override chips and a "+N" (`ModelOverrideBadges.maxVisible`).
+    static let localSettingsWidth: CGFloat = 176
+
+    /// The Settings column gives way to the model name in a narrow pane.
+    /// Width 0 = not measured yet → assume roomy.
+    static func showsLocalSettings(forDetailWidth width: CGFloat) -> Bool {
+        guard width > 0 else { return true }
+        // Four cells in the row: name, settings, size, actions.
+        let fixed = rowPaddingH * 2 + localSizeWidth + localActionsWidth + localSettingsWidth + columnSpacing * 3
+        return width >= fixed + modelColumnMinWidth
+    }
+
     static let columnSpacing: CGFloat = 8
     static let rowPaddingH: CGFloat = 12
 

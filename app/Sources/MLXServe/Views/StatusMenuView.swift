@@ -499,7 +499,8 @@ struct StatusMenuView: View {
             TraySectionHeader(title: "In Memory",
                               detail: loadedModels.count > 1 ? L10n.format("%lld models", loadedModels.count) : nil)
             TrayCard {
-                if loadedModels.isEmpty {
+                let helping = ClusterWorker.part(of: appState.clusterWorker.state) != nil
+                if loadedModels.isEmpty && !helping {
                     Text("None loaded — models load on demand")
                         .font(.app(.caption))
                         .foregroundStyle(.secondary)
@@ -507,6 +508,7 @@ struct StatusMenuView: View {
                 ForEach(loadedModels, id: \.name) { info in
                     modelSlotRow(info)
                 }
+                WorkerPartRow(worker: appState.clusterWorker)
 
                 if let mem = server.memoryInfo {
                     if !loadedModels.isEmpty {
@@ -514,8 +516,9 @@ struct StatusMenuView: View {
                     }
                     // Shared meter — the same bar the Recommended pane and
                     // welcome screen show.
+                    // A Thunderbolt worker's part lives in its own process, beside the server's.
                     MemoryMeter(
-                        gpuBytes: mem.activeBytes,
+                        gpuBytes: mem.activeBytes + appState.clusterWorker.residentBytes,
                         gpuLabel: mem.gpuMemoryLabel,
                         availableBytes: mem.availableBytes,
                         totalBytes: Int64(ProcessInfo.processInfo.physicalMemory),
@@ -523,32 +526,9 @@ struct StatusMenuView: View {
                         breakdown: mem.gpuBreakdown
                     )
                 }
-                if let t = server.throughput {
-                    TrayRowSeparator()
-                    throughputRows(t)
-                }
+                TrayThroughputRows(usage: server.usage)
             }
         }
-    }
-
-    /// Serving throughput, from `/metrics.json` (present only when the server
-    /// was launched with --metrics). "now" is the gauge delta between the last
-    /// two polls; the averages are whole-session.
-    @ViewBuilder private func throughputRows(_ t: ThroughputSnapshot) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
-            statRow("Decode", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.decodeTPSNow), ThroughputSnapshot.formatTPS(t.avgDecodeTPS)))
-            statRow("Prefill", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(server.prefillTPSNow), ThroughputSnapshot.formatTPS(t.avgPrefillTPS)))
-        }
-    }
-
-    @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
-        HStack {
-            Text(L10n.text(label)).foregroundStyle(.secondary)
-            Spacer()
-            Text(value).monospacedDigit()
-        }
-        .font(.app(.caption2))
     }
 
     // MARK: - Media generation
@@ -657,7 +637,7 @@ struct StatusMenuView: View {
                     CLISetupInstructionsButton(
                         baseURL: server.baseURL,
                         servedModelId: server.chatModelId ?? "mlx-serve",
-                        serverContextLength: server.chatModelInfo?.contextLength,
+                        serverBudget: server.chatModelInfo?.agentBudget,
                         isEnabled: server.status == .running
                     )
                 }
@@ -736,6 +716,11 @@ struct StatusMenuView: View {
                     .help(info.slotKind == .chat
                           ? "\(info.slotKind.label) — \(info.layers) layers, \(info.hiddenSize)-dim"
                           : info.slotKind.label)
+                let paired = server.cluster.map { $0.joined && $0.serves(info.name) } ?? false
+                if paired {
+                    ThunderboltBadge()
+                        .help(L10n.text("Runs across the two Macs of a Thunderbolt pair; unloading it frees it on both."))
+                }
                 Spacer(minLength: 4)
                 // Copy the model's full name/id to the clipboard (paste into a curl,
                 // a config file, etc.).
@@ -1120,7 +1105,7 @@ struct EndpointsSection: View {
 /// already relying on that implicitly; presenting it through `AppActivation`
 /// (which touches `NSApp`) just makes the requirement explicit.
 @MainActor
-func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil) {
+func launchClaudeCodeWithPicker(baseURL: String, serverBudget: AgentBudget.Budget? = nil) {
     let panel = OpenPanel.make()
     panel.canChooseDirectories = true
     panel.canChooseFiles = false
@@ -1133,18 +1118,18 @@ func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil
     panel.directoryURL = URL(fileURLWithPath: defaultWS)
     guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
     launchClaudeCode(baseURL: baseURL, workingDirectory: url.path,
-                     serverContextLength: serverContextLength)
+                     serverBudget: serverBudget)
 }
 
 /// Launch Claude Code CLI configured to use the local mlx-serve server.
 /// Shares `AgentConfigs.claudeCodeExports` with the CLI-launcher dropdown — the
 /// env block must not drift between the two entry points.
 func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
-                      serverContextLength: Int? = nil) {
+                      serverBudget: AgentBudget.Budget? = nil) {
     let model = "mlx-serve"
     let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
-    let budget = AgentBudget.forServerContext(serverContextLength)
-    warnIfSmallContext(agentId: "claude", context: budget.context)
+    let budget = serverBudget ?? AgentBudget.fallback
+    warnIfSmallContext(agentId: "claude", budget: budget)
     let scriptContent = """
     #!/bin/zsh -l
     \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
@@ -1395,3 +1380,77 @@ struct TerminalLogTextView: NSViewRepresentable {
     }
 }
 
+/// "Thunderbolt" on a model the two Macs of a pair run together.
+struct ThunderboltBadge: View {
+    var body: some View {
+        Label("Thunderbolt", systemImage: "bolt.fill")
+            .font(.app(.caption2))
+            .labelStyle(.titleAndIcon)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .foregroundStyle(Color.accentColor)
+            .background(Capsule().fill(Color.accentColor.opacity(0.15)))
+            .fixedSize()
+            .help(L10n.text("Runs across the two Macs of a Thunderbolt pair."))
+    }
+}
+
+/// The part of a pair's model this Mac holds for the Mac that leads, while it helps one.
+private struct WorkerPartRow: View {
+    @ObservedObject var worker: ClusterWorker
+
+    var body: some View {
+        if let part = ClusterWorker.part(of: worker.state) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "bolt.horizontal")
+                        .font(.app(.caption))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 16)
+                    Text(verbatim: part.model)
+                        .font(.app(.caption).monospaced())
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                    ThunderboltBadge()
+                    Spacer(minLength: 4)
+                    if worker.residentBytes > 0 {
+                        Text(verbatim: MemoryInfo.format(worker.residentBytes)).font(.app(.caption2)).foregroundStyle(.secondary)
+                    }
+                    if !part.ready { ProgressView().controlSize(.mini) }
+                }
+                Text(part.detail.isEmpty
+                     ? L10n.text("This Mac's part, for the Mac that leads")
+                     : L10n.format("This Mac's part (%@), for the Mac that leads", part.detail))
+                    .font(.app(.caption2))
+                    .foregroundStyle(.secondary)
+                    .padding(.leading, 22)
+            }
+        }
+    }
+}
+
+/// Serving throughput, from the usage tracker the chat window's strip reads, so the two show the same figures. "now" is
+/// the gauge delta between its last two looks; the averages are whole-session.
+private struct TrayThroughputRows: View {
+    @ObservedObject var usage: UsageTracker
+
+    var body: some View {
+        if let t = usage.live {
+            TrayRowSeparator()
+            VStack(alignment: .leading, spacing: 2) {
+                statRow("Tokens generated", ThroughputSnapshot.formatTokens(t.displayedTokens))
+                statRow("Decode", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(usage.decodeTPS), ThroughputSnapshot.formatTPS(t.avgDecodeTPS)))
+                statRow("Prefill", L10n.format("%@ now · %@ avg tok/s", ThroughputSnapshot.formatTPS(usage.prefillTPS), ThroughputSnapshot.formatTPS(t.avgPrefillTPS)))
+            }
+        }
+    }
+
+    @ViewBuilder private func statRow(_ label: String, _ value: String) -> some View {
+        HStack {
+            Text(L10n.text(label)).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).monospacedDigit()
+        }
+        .font(.app(.caption2))
+    }
+}

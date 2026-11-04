@@ -1,0 +1,28 @@
+== video 0 147664 34c59af57649a361f40956a672e0fde622187937616955879df7b4e36205605b
+== video 1 147957 5de89fc048f201a557b785d4c8c57934712e7e180a663dfc4ccb8a1248ddfe0b
+== video 2 165 2d1c9bed6f376354526f6ec31082ef8b72efc2832cd9bdc6ce7a7da3cf17fbd5
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 40
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"missing 'prompt'"}}
+== video 3 256 7de5169f80c718ba0210251eeaeb84dccbbfbdf5fdd74271ee6517901897c3c6
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 130
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"two-stage pipelines require vae_encoder.safetensors (latent statistics) — download it into the model dir"}}
+== video 4 277 d7276bce78684ad5e3d538950dbb0be48ee7a4f85bd99b7ca2ad202af1b228ff
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 151
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"'decoder':\"diffusion\" requires vae_diffusion_decoder.safetensors — the 8-bit LTX-2.5 pack ships it, the 4-bit pack does not"}}
+== row 685 ab485a0e5e3580b8777b168d721bf51845c4d59b5bf683d540100f6662a906a4
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["video"],"input_modalities":["text"],"modality":"video","engines":["mlx"],"meta":{"architecture":"AudioVideo","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

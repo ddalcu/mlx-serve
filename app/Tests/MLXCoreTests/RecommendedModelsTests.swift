@@ -18,21 +18,21 @@ final class RecommendedModelsTests: XCTestCase {
     }
 
     /// `allCatalogs` is what the invariant sweeps run over, so it has to BE the
-    /// three sections — a section left out of it is a section with no guards.
-    func testAllCatalogsIsTheUnionOfTheThreeSections() {
+    /// sections — a section left out of it is a section with no guards.
+    func testAllCatalogsIsTheUnionOfTheSections() {
         let union = RecommendedModelPick.gemmaCatalog
             + RecommendedModelPick.qwenCatalog
+            + RecommendedModelPick.liquidCatalog
             + RecommendedModelPick.largestCatalog
         XCTAssertEqual(RecommendedModelPick.allCatalogs, union)
     }
 
     // MARK: - Catalog shape
 
-    /// The pane's whole layout assumes exactly three sections
-    /// (Gemma 4, Qwen, Largest).
-    func testExactlyThreeFamiliesArePresent() {
+    /// The pane draws one section per family (Gemma 4, Qwen, Liquid LFM3, Largest).
+    func testEveryFamilyIsPresent() {
         let families = Set(allRecommended.map(\.family))
-        XCTAssertEqual(families, [.gemma, .qwen, .largest])
+        XCTAssertEqual(families, [.gemma, .qwen, .liquid, .largest])
     }
 
     /// A family catalog can't be empty — a section with zero rows would be a
@@ -136,7 +136,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testMtpScoredPicksAreTheOnesShippingADraftHead() {
         let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
         XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next",
-                             "sushi-2bpw", "sushi-3bpw"])
+                             "sushi-2bpw", "deepseek-v41-flash"])
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
         XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
         XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
@@ -176,7 +176,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
         XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b",
-                                   "sushi-2bpw", "sushi-3bpw"])
+                                   "sushi-2bpw", "lfm3-1.7b", "lfm3-omni-2b", "deepseek-v41-flash"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -307,22 +307,21 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertTrue(pick.meetsSystemRequirements(physicalMemoryBytes: 32 * GiB))
     }
 
+    /// The Sushi pack fits a stock 64 GB Mac's GPU working set (3/4 of RAM) and not a stock 48 GB one.
+    func testSushiPackFitsAStock64GBMacButNot48() {
+        let pick = RecommendedModelPick.sushi2bpw
+        let mac64 = SystemMemoryInfo(totalBytes: 64 * GiB, usableBytes: 48 * GiB)
+        let mac48 = SystemMemoryInfo(totalBytes: 48 * GiB, usableBytes: 36 * GiB)
+        XCTAssertNotEqual(mac64.fit(neededGB: pick.approxRAMNeededGB), .exceeds)
+        XCTAssertEqual(mac48.fit(neededGB: pick.approxRAMNeededGB), .exceeds)
+        XCTAssertTrue(pick.tagline.contains("64 GB") && pick.blurb.contains("64 GB"))
+        XCTAssertEqual(pick.intelligence, RecommendedModelPick.qwen38FlashNext.intelligence)
+    }
+
     /// Flash-Next is ~100 GB on disk but the 32 GB n-gram table is mmapped,
     /// never resident, so the honest RAM gate is the ~70 GB of weights plus
     /// headroom: inline on a 96 GB Mac (tight against Metal's default working
     /// set there), behind "Requires more RAM" on 64 GB.
-    /// Each Sushi pack lands the Mac its own README sizes it for, and not the tier below.
-    func testSushiPacksFitTheirMacTier() {
-        let tiers: [(RecommendedModelPick, UInt64, UInt64)] = [
-            (.sushi2bpw, 48, 32), (.sushi3bpw, 64, 48),
-        ]
-        for (pick, fits, below) in tiers {
-            XCTAssertTrue(pick.meetsSystemRequirements(physicalMemoryBytes: fits * GiB), pick.id)
-            XCTAssertFalse(pick.meetsSystemRequirements(physicalMemoryBytes: below * GiB), pick.id)
-            XCTAssertEqual(pick.intelligence, RecommendedModelPick.qwen38FlashNext.intelligence, pick.id)
-        }
-    }
-
     func testFlashNextFitsOn96GBButNotBelow() {
         let fn = RecommendedModelPick.qwen38FlashNext
         XCTAssertTrue(fn.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
@@ -434,7 +433,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// then the ~130 GB native-MLX DeepSeek-V4-Flash mirror.
     func testLargestSectionHoldsFlashNextThenDeepseek() {
         XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id),
-                       ["sushi-2bpw", "sushi-3bpw", "qwen38-flash-next", "deepseek-v4-flash"])
+                       ["sushi-2bpw", "qwen38-flash-next", "deepseek-v4-flash", "deepseek-v41-flash"])
         let fn = RecommendedModelPick.qwen38FlashNext
         XCTAssertEqual(fn.repoId, "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw")
         XCTAssertEqual(fn.quantLabel, "iQ-MLX 4.7 bpw")
@@ -463,6 +462,22 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertNil(RecommendedModelPick.gemmaE4B.ggufFilename, "safetensors picks fetch the whole repo")
         XCTAssertFalse(RecommendedModelPick.allCatalogs.contains { $0.repoId == "antirez/deepseek-v4-gguf" },
                        "the ds4 GGUF pick is superseded by the native mirror")
+    }
+
+    /// DeepSeek-V4.1-Flash is our iQ-MLX 3.0 pack, gated on its ~213 GB wired
+    /// peak: a 256 GB Mac's pick, never a 192 GB one's.
+    func testDeepseekV41FlashIsOurPackForA256GBMac() {
+        let ds = RecommendedModelPick.deepseekV41Flash
+        XCTAssertEqual(ds.repoId, "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw")
+        XCTAssertEqual(ds.quantLabel, "iQ-MLX 3.0 bpw")
+        XCTAssertEqual(ds.contextTokens, 1_048_576)
+        XCTAssertTrue(ds.meetsSystemRequirements(physicalMemoryBytes: 256 * GiB))
+        XCTAssertFalse(ds.meetsSystemRequirements(physicalMemoryBytes: 192 * GiB))
+    }
+
+    /// The Liquid section is the small text model and the Omni, nothing else.
+    func testLiquidSectionIsTheTextModelAndTheOmni() {
+        XCTAssertEqual(RecommendedModelPick.liquidCatalog.map(\.id), ["lfm3-1.7b", "lfm3-omni-2b"])
     }
 
     /// The entry-level Qwen row is the MiMo 9B (7.1 GB) — and the ancient

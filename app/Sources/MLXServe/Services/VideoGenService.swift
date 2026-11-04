@@ -206,8 +206,12 @@ final class VideoGenService: ObservableObject {
     /// One window: stream `/v1/video/generations`, drive the phase off its
     /// `progress` events (`label` prefixes the stage, e.g. the shot number) and
     /// return the decoded frames. A server `error` event throws its message.
+    /// `onStep` replaces the pane's own progress line (a shot rendering beside
+    /// others reports to its lane); `peer` is the LAN machine rendering it.
     private func streamWindow(_ request: VideoGenRequest, body: [String: Any], port: UInt16, gen: Int,
-                              label: String = "") async throws -> DecodedFrames {
+                              label: String = "", peer: String? = nil,
+                              onStep: ((Int, Int) -> Void)? = nil) async throws -> DecodedFrames {
+        let peer = peer ?? request.lanModelId.map(LanPick.peer(of:))
         let steps = request.steps
         var decoded: DecodedFrames? = nil
         // Live ETA from the run's own cadence — the only estimate that
@@ -243,7 +247,9 @@ final class VideoGenService: ObservableObject {
                 if let data = MediaSSE.previewJPEG(ev), let img = NSImage(data: data) {
                     setLivePreview(img, for: gen)
                 }
-                setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
+                if let onStep { onStep(step, max(total, 1)) } else {
+                    setPhase(.running(step: step, total: max(total, 1), message: message), for: gen)
+                }
             case "complete":
                 decoded = await offMain { Self.decodeFrames(ev) }
             case "error":
@@ -260,10 +266,50 @@ final class VideoGenService: ObservableObject {
         // estimate is measured rather than extrapolated. Recorded from
         // the SAMPLING span only — the encode after this is ours, not the
         // model's, and the estimate does not include it.
+        let measured = ProcessInfo.processInfo.systemUptime - startedAt
+        // A local video whose steps the Thunderbolt worker shared learns its own speed.
+        var key = peer
+        if key == nil, request.model.backend == .minimaxH3,
+           let c = try? await api.fetchProps(port: port)?.cluster, c.lastSplit, c.serves(request.model.repo) {
+            key = ClusterInfo.thunderboltPeer
+        }
         H3RunHistory.remember(model: request.model, width: request.width, height: request.height,
-                              frames: request.numFrames, steps: steps, fast: !request.bestQuality,
-                              measuredSeconds: ProcessInfo.processInfo.systemUptime - startedAt)
+                              frames: request.numFrames, steps: steps, fast: !request.bestQuality && !request.turbo,
+                              measuredSeconds: measured, peer: key)
         return frames
+    }
+
+    /// One storyboard shot: stream it, then write its mp4 and a PNG of its last frame.
+    private func renderShot(_ req: VideoGenRequest, model: String, index i: Int, in dir: URL, port: UInt16,
+                            gen: Int, label: String, peer: String? = nil,
+                            onStep: ((Int, Int) -> Void)? = nil) async throws -> (mp4: URL, last: URL) {
+        let (first, last) = await Task.detached(priority: .userInitiated) {
+            (req.firstFrameImagePath.flatMap(Self.imageFileToBase64),
+             req.lastFrameImagePath.flatMap(Self.imageFileToBase64))
+        }.value
+        let body = Self.requestBody(model: model, prompt: req.prompt, request: req,
+                                    firstFrameB64: first, lastFrameB64: last)
+        let frames = try await streamWindow(req, body: body, port: port, gen: gen, label: label,
+                                            peer: peer, onStep: onStep)
+        if onStep == nil {
+            setPhase(.running(step: req.steps, total: req.steps, message: label + L10n.text("Encoding mp4…")), for: gen)
+        }
+        let url = dir.appendingPathComponent(String(format: "shot-%02d.mp4", i + 1))
+        let png = dir.appendingPathComponent(String(format: "shot-%02d-last.png", i + 1))
+        let outFps = frames.fps > 0 ? frames.fps : req.fps
+        try await Task.detached(priority: .userInitiated) {
+            try VideoGenService.writeMP4(
+                rgb: frames.rgb, frames: frames.frames,
+                width: frames.width, height: frames.height,
+                fps: outFps, to: url,
+                audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
+                audioChannels: frames.audioChannels)
+            guard let data = VideoGenService.lastFramePNG(frames) else {
+                throw MediaGenError.server(L10n.text("Couldn't save the shot's last frame."))
+            }
+            try data.write(to: png)
+        }.value
+        return (url, png)
     }
 
     /// A storyboard: one window per shot, each opening on the previous shot's
@@ -271,8 +317,10 @@ final class VideoGenService: ObservableObject {
     /// (`Storyboard.shotRequest`), written to its own mp4 beside a PNG of its
     /// last frame, then joined into one clip. The model loads once for every
     /// shot; shots already written stay on disk if a later one fails.
-    func generateStoryboard(_ base: VideoGenRequest, shots: [(prompt: String, frames: Int, endFrame: String?)],
-                            server: ServerManager) {
+    /// `peers` = LAN machines serving the same pack: with a picture at every
+    /// join, shots render on them and this Mac at once (`renderAcross`).
+    func generateStoryboard(_ base: VideoGenRequest, shots: [(prompt: String, frames: Int, endFrame: String?, machine: String?)],
+                            peers: [RenderDevice] = [], server: ServerManager) {
         guard !shots.isEmpty, shots.allSatisfy({ !$0.prompt.isBlank }) else {
             phase = .failed(L10n.text("Every shot needs a prompt."))
             return
@@ -304,9 +352,9 @@ final class VideoGenService: ObservableObject {
             do {
                 try FileManager.default.createDirectory(at: shotsDir, withIntermediateDirectories: true)
                 // Each join's picture, cropped to the canvas once, before any shot: the
-                // two shots meeting there read the same pixels (H3 crops a last frame
-                // and stretches a first), and one the server cannot read (HEIC, a file
-                // gone offline) stops the run now rather than shots later.
+                // two shots meeting there read the same pixels whatever machine renders
+                // them, and one the server cannot read (HEIC, a file gone offline) stops
+                // the run now rather than shots later.
                 var endFrames = [String?](repeating: nil, count: shots.count)
                 let (canvasW, canvasH) = (base.width, base.height)
                 for i in shots.indices.dropLast() {
@@ -327,41 +375,37 @@ final class VideoGenService: ObservableObject {
                     lanModelId: base.lanModelId, repo: base.model.repo)
                 loadedId = unloadId
                 var shotURLs: [URL] = []
-                var lastFrame: String? = nil
                 var settings: [String] = []
-                for (i, shot) in shots.enumerated() {
-                    shotIndex = i
-                    let endFrame = endFrames[i]
-                    let req = Storyboard.shotRequest(base: base, prompt: shot.prompt, frames: shot.frames,
-                                                     index: i, count: shots.count, previousLastFrame: lastFrame,
-                                                     endFrame: endFrame)
-                    let (first, last) = await Task.detached(priority: .userInitiated) {
-                        (req.firstFrameImagePath.flatMap(Self.imageFileToBase64),
-                         req.lastFrameImagePath.flatMap(Self.imageFileToBase64))
-                    }.value
-                    let body = Self.requestBody(model: modelId, prompt: req.prompt, request: req,
-                                                firstFrameB64: first, lastFrameB64: last)
-                    let label = L10n.format("Shot %lld of %lld · ", Int64(i + 1), Int64(shots.count))
-                    let frames = try await streamWindow(req, body: body, port: port, gen: gen, label: label)
-                    setPhase(.running(step: req.steps, total: req.steps, message: label + L10n.text("Encoding mp4…")), for: gen)
-                    let url = shotsDir.appendingPathComponent(String(format: "shot-%02d.mp4", i + 1))
-                    let png = shotsDir.appendingPathComponent(String(format: "shot-%02d-last.png", i + 1))
-                    let outFps = frames.fps > 0 ? frames.fps : base.fps
-                    try await Task.detached(priority: .userInitiated) {
-                        try VideoGenService.writeMP4(
-                            rgb: frames.rgb, frames: frames.frames,
-                            width: frames.width, height: frames.height,
-                            fps: outFps, to: url,
-                            audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
-                            audioChannels: frames.audioChannels)
-                        guard let data = VideoGenService.lastFramePNG(frames) else {
-                            throw MediaGenError.server(L10n.text("Couldn't save the shot's last frame."))
-                        }
-                        try data.write(to: png)
-                    }.value
-                    shotURLs.append(url)
-                    lastFrame = Storyboard.nextOpening(keyframe: endFrame, renderedLastFrame: png.path)
-                    settings.append("--- shot \(i + 1) ---\n" + Self.settingsText(req, modelId: modelId))
+                let devices = [RenderDevice(modelId: modelId, peer: nil)] + peers
+                if !peers.isEmpty, StoryboardCluster.joinsAnchored(endFrames) {
+                    shotIndex = nil
+                    let requests = shots.indices.map { i in
+                        Storyboard.shotRequest(base: base, prompt: shots[i].prompt, frames: shots[i].frames,
+                                               index: i, count: shots.count,
+                                               previousLastFrame: i > 0 ? endFrames[i - 1] : nil, endFrame: endFrames[i])
+                    }
+                    shotURLs = try await renderAcross(devices, requests: requests,
+                                                      pins: shots.map { StoryboardCluster.pin($0.machine, in: devices) },
+                                                      in: shotsDir, port: port, gen: gen)
+                    settings = requests.indices.map { "--- shot \($0 + 1) ---\n" + Self.settingsText(requests[$0], modelId: modelId) }
+                } else {
+                    var lastFrame: String? = nil
+                    for (i, shot) in shots.enumerated() {
+                        shotIndex = i
+                        let endFrame = endFrames[i]
+                        let req = Storyboard.shotRequest(base: base, prompt: shot.prompt, frames: shot.frames,
+                                                         index: i, count: shots.count, previousLastFrame: lastFrame,
+                                                         endFrame: endFrame)
+                        // One after another, each on the machine chosen for it (this Mac by default).
+                        let device = devices[StoryboardCluster.pin(shot.machine, in: devices) ?? 0]
+                        let label = L10n.format("Shot %lld of %lld · ", Int64(i + 1), Int64(shots.count))
+                            + (device.peer.map { L10n.format("on %@ · ", $0) } ?? "")
+                        let out = try await renderShot(req, model: device.modelId, index: i, in: shotsDir, port: port,
+                                                       gen: gen, label: label, peer: device.peer)
+                        shotURLs.append(out.mp4)
+                        lastFrame = Storyboard.nextOpening(keyframe: endFrame, renderedLastFrame: out.last.path)
+                        settings.append("--- shot \(i + 1) ---\n" + Self.settingsText(req, modelId: modelId))
+                    }
                 }
                 shotIndex = nil
                 await releaseIfNeeded()
@@ -382,6 +426,109 @@ final class VideoGenService: ObservableObject {
                 setPhase(.failed(message), for: gen)
             }
         }
+    }
+
+    /// Every shot at once across `devices` (this Mac first), one shot per machine
+    /// at a time, as `ShotDispatcher` plans them; a machine that fails leaves the
+    /// run and its shot goes to another. Returns the shots' mp4s in film order.
+    private func renderAcross(_ devices: [RenderDevice], requests: [VideoGenRequest], pins: [Int?], in dir: URL,
+                              port: UInt16, gen: Int) async throws -> [URL] {
+        let costs = requests.map {
+            H3TimeEstimate.seconds(model: $0.model, width: $0.width, height: $0.height, frames: $0.numFrames,
+                                   steps: $0.steps, fast: !$0.bestQuality && !$0.turbo, hardware: .anchor)
+        }
+        var dispatcher = ShotDispatcher(costs: costs, factors: devices.map { H3TimeEstimate.speedFactor(peer: $0.peer).factor },
+                                        pins: pins)
+        var urls = [URL?](repeating: nil, count: requests.count)
+        var lanes: [Int: (shot: Int, step: Int, total: Int)] = [:]
+        var rendering: [Int: Task<(mp4: URL, last: URL), Error>] = [:]
+        var lastError: Error?
+        let t0 = ProcessInfo.processInfo.systemUptime
+        func report() {
+            let done = urls.compactMap { $0 }.count
+            let busy = lanes.keys.sorted().map { d -> String in
+                let l = lanes[d]!
+                return L10n.format("%@ shot %lld (%lld/%lld)", StoryboardCluster.name(devices[d]),
+                                   Int64(l.shot + 1), Int64(l.step), Int64(l.total))
+            }
+            setPhase(.running(step: done, total: requests.count,
+                              message: L10n.format("%lld of %lld shots · ", Int64(done), Int64(requests.count))
+                                  + busy.joined(separator: " · ")), for: gen)
+        }
+        func lane(_ d: Int) async throws {
+            while !dispatcher.done, dispatcher.usable(d) {
+                try Task.checkCancellation()
+                let now = ProcessInfo.processInfo.systemUptime - t0
+                guard let s = dispatcher.next(for: d, now: now) else {
+                    try await Task.sleep(for: .seconds(2))
+                    continue
+                }
+                if let other = lanes.first(where: { $0.value.shot == s })?.key {
+                    log.append(L10n.format("%@ renders shot %lld again: %@ would take longer to finish it",
+                                           StoryboardCluster.name(devices[d]), Int64(s + 1),
+                                           StoryboardCluster.name(devices[other])))
+                }
+                lanes[d] = (s, 0, requests[s].steps)
+                report()
+                // Speed from the steps after the first, which also carries the load.
+                var firstStep: (step: Int, at: Double)?
+                var liveFactor: Double?
+                let job = Task { @MainActor in
+                    try await renderShot(requests[s], model: devices[d].modelId, index: s, in: dir, port: port,
+                                         gen: gen, label: "", peer: devices[d].peer) { step, total in
+                        lanes[d] = (s, step, total)
+                        report()
+                        let at = ProcessInfo.processInfo.systemUptime
+                        guard let f = firstStep else { firstStep = (step, at); return }
+                        if step - f.step >= 3, total > 0 {
+                            liveFactor = (at - f.at) / (costs[s] * Double(step - f.step) / Double(total))
+                            dispatcher.measured(d, factor: liveFactor!)
+                        }
+                    }
+                }
+                rendering[d] = job
+                do {
+                    let out = try await withTaskCancellationHandler { try await job.value } onCancel: { job.cancel() }
+                    rendering[d] = nil
+                    guard urls[s] == nil else { continue }
+                    urls[s] = out.mp4
+                    dispatcher.measured(d, factor: (ProcessInfo.processInfo.systemUptime - t0 - now) / costs[s])
+                    for j in dispatcher.finished(d) { rendering[j]?.cancel() }
+                    lanes[d] = nil
+                    report()
+                } catch {
+                    rendering[d] = nil
+                    if Task.isCancelled { throw error }
+                    if urls[s] != nil {
+                        // Another Mac finished this shot first: keep what this one showed of its speed.
+                        lanes[d] = nil
+                        report()
+                        if let peer = devices[d].peer, let f = liveFactor {
+                            let r = requests[s]
+                            H3RunHistory.remember(model: r.model, width: r.width, height: r.height, frames: r.numFrames,
+                                                  steps: r.steps, fast: !r.bestQuality && !r.turbo,
+                                                  measuredSeconds: f * costs[s], peer: peer)
+                        }
+                        continue
+                    }
+                    if Self.isCancellation(error) { throw error }
+                    lastError = error
+                    dispatcher.failed(d, shot: s)
+                    lanes[d] = nil
+                    log.append(L10n.format("%@ left the run: %@", StoryboardCluster.name(devices[d]),
+                                           error.localizedDescription))
+                    report()
+                }
+            }
+        }
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for d in devices.indices { group.addTask { @MainActor in try await lane(d) } }
+            try await group.waitForAll()
+        }
+        guard urls.allSatisfy({ $0 != nil }) else {
+            throw lastError ?? MediaGenError.server(L10n.text("Some shots did not render."))
+        }
+        return urls.compactMap { $0 }
     }
 
     /// Awaitable generation for the agent's `generate_video` tool. Same load →
@@ -815,7 +962,7 @@ final class VideoGenService: ObservableObject {
     /// Longest edge a reference frame is shipped at. The server normalizes a
     /// reference video to a 768 short edge anyway, so sending phone-native
     /// frames is pure payload — a 124-frame clip at 4K is hundreds of MB of
-    /// base64 against a 64 MB request cap.
+    /// base64 against the server's 512 MB request cap.
     nonisolated static let refFrameMaxEdge: CGFloat = 1024
 
     /// How many frames of a reference clip to actually ship. H3's ladder is

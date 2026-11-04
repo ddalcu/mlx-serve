@@ -193,6 +193,7 @@ enum SystemMetrics {
             freePages: UInt64(stats.free_count),
             speculativePages: UInt64(stats.speculative_count),
             externalPages: UInt64(stats.external_page_count),
+            purgeablePages: UInt64(stats.purgeable_count),
             wirePages: UInt64(stats.wire_count),
             compressorPages: UInt64(stats.compressor_page_count),
             pageSize: UInt64(pageSize)
@@ -204,16 +205,39 @@ enum SystemMetrics {
     /// outside wired + compressed). Returns 0 on a failed query.
     static func computeAvailableForModel(totalBytes: UInt64, freePages: UInt64,
                                          speculativePages: UInt64, externalPages: UInt64,
-                                         wirePages: UInt64, compressorPages: UInt64,
+                                         purgeablePages: UInt64, wirePages: UInt64, compressorPages: UInt64,
                                          pageSize: UInt64) -> UInt64 {
         if totalBytes == 0 { return 0 }
         let freeClean = freePages >= speculativePages ? freePages - speculativePages : 0
-        let (reclaimPages, rpOv) = freeClean.addingReportingOverflow(externalPages)
+        let (filePages, fpOv) = freeClean.addingReportingOverflow(externalPages)
+        let (reclaimPages, ppOv) = filePages.addingReportingOverflow(purgeablePages)
+        let rpOv = fpOv || ppOv
         let (reclaimBytes, rbOv) = reclaimPages.multipliedReportingOverflow(by: pageSize)
         let (nonGrantPages, npOv) = wirePages.addingReportingOverflow(compressorPages)
         let (nonGrantBytes, nbOv) = nonGrantPages.multipliedReportingOverflow(by: pageSize)
         let outside = (npOv || nbOv || nonGrantBytes >= totalBytes) ? 0 : totalBytes - nonGrantBytes
         return min(rpOv || rbOv ? UInt64.max : reclaimBytes, outside)
+    }
+
+    /// Activity Monitor's "Memory Used": app memory (less what can be purged) plus wired plus compressed.
+    static func computeMemoryUsed(internalPages: UInt64, purgeablePages: UInt64, wirePages: UInt64,
+                                  compressorPages: UInt64, pageSize: UInt64) -> UInt64 {
+        let app = internalPages >= purgeablePages ? internalPages - purgeablePages : 0
+        return (app + wirePages + compressorPages) * pageSize
+    }
+
+    static func memoryUsedBytes() -> UInt64 {
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<Int32>.size)
+        let result = withUnsafeMutablePointer(to: &stats) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return computeMemoryUsed(internalPages: UInt64(stats.internal_page_count), purgeablePages: UInt64(stats.purgeable_count),
+                                 wirePages: UInt64(stats.wire_count), compressorPages: UInt64(stats.compressor_page_count),
+                                 pageSize: UInt64(vm_kernel_page_size))
     }
 
     // MARK: - Process identity (was: /bin/ps -o comm=)

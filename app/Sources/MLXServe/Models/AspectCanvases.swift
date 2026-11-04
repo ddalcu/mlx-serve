@@ -25,9 +25,8 @@ struct SourceCanvasChoice: Identifiable, Equatable {
 /// what it samples: anything on the grid inside the range generates. So the
 /// candidates are enumerated FROM THE GRID, and the starting frame's aspect
 /// ratio is what picks among them. Without this, a 16:9 photo could only be
-/// generated at one of the shipped 16:9 rows, and everything else stretched
-/// the picture (the server resizes a first frame to the canvas without
-/// letterboxing or cropping).
+/// generated at one of the shipped 16:9 rows, and everything else lost the
+/// picture's edges (the server center-crops a first frame to the canvas).
 enum AspectCanvases {
     /// How far a canvas may be off the source's aspect. At 3% the distortion
     /// is not noticeable; past it the shape visibly changes, which is the one
@@ -44,7 +43,41 @@ enum AspectCanvases {
     /// 480 x 256, off by 5.5%, while 512 x 288 is off by 0.03%.
     static func options(sourceWidth: Int, sourceHeight: Int,
                         grid: ResolutionGrid, count: Int = 5) -> [AspectCanvas] {
-        guard sourceWidth > 0, sourceHeight > 0, grid.alignment > 0, count > 0 else { return [] }
+        guard count > 0 else { return [] }
+        return spread(faithful(sourceWidth: sourceWidth, sourceHeight: sourceHeight, grid: grid, fallback: count),
+                      count: count)
+    }
+
+    /// The clip-size slider's steps under a first frame: every canvas faithful to
+    /// its shape, smallest first, none larger than the picture (that only upscales it).
+    static func ladder(sourceWidth: Int, sourceHeight: Int, grid: ResolutionGrid) -> [AspectCanvas] {
+        let all = faithful(sourceWidth: sourceWidth, sourceHeight: sourceHeight, grid: grid, fallback: 5)
+            .sorted { $0.area < $1.area }
+        guard let smallest = all.first else { return [] }
+        var steps = all.filter { $0.area <= sourceWidth * sourceHeight }
+        if let own = sourceSize(sourceWidth: sourceWidth, sourceHeight: sourceHeight, grid: grid), !steps.contains(own) {
+            steps.append(own)
+            steps.sort { $0.area < $1.area }
+        }
+        return steps.isEmpty ? [smallest] : steps
+    }
+
+    /// How far `canvas` is off the source's shape, as a fraction of its aspect ratio.
+    static func deviation(of canvas: AspectCanvas, from source: (width: Int, height: Int)) -> Double {
+        let ratio = Double(source.width) / Double(max(source.height, 1))
+        return abs(Double(canvas.width) / Double(max(canvas.height, 1)) - ratio) / ratio
+    }
+
+    /// The step closest in area to `area`: a new picture keeps the size the user had.
+    static func nearest(_ ladder: [AspectCanvas], area: Int) -> AspectCanvas? {
+        ladder.min { abs($0.area - area) < abs($1.area - area) }
+    }
+
+    /// Canvases within `maxDeviation` of the source's shape, or the `fallback`
+    /// closest when none is.
+    private static func faithful(sourceWidth: Int, sourceHeight: Int, grid: ResolutionGrid,
+                                 fallback: Int) -> [AspectCanvas] {
+        guard sourceWidth > 0, sourceHeight > 0, grid.alignment > 0 else { return [] }
         let ratio = Double(sourceWidth) / Double(sourceHeight)
 
         var scored: [(canvas: AspectCanvas, deviation: Double)] = []
@@ -57,18 +90,14 @@ enum AspectCanvases {
             guard h >= grid.minDim, h <= grid.maxDim else { continue }
             let canvas = AspectCanvas(width: w, height: h)
             guard seen.insert(canvas.id).inserted else { continue }
-            let deviation = abs(Double(w) / Double(h) - ratio) / ratio
-            scored.append((canvas, deviation))
+            scored.append((canvas, deviation(of: canvas, from: (sourceWidth, sourceHeight))))
         }
         guard !scored.isEmpty else { return [] }
 
-        var faithful = scored.filter { $0.deviation <= maxDeviation }.map(\.canvas)
-        if faithful.isEmpty {
-            // Nothing is faithful (a very unusual aspect): offer the closest
-            // there is rather than an empty menu.
-            faithful = scored.sorted { $0.deviation < $1.deviation }.prefix(count).map(\.canvas)
-        }
-        return spread(faithful, count: count)
+        let faithful = scored.filter { $0.deviation <= maxDeviation }.map(\.canvas)
+        // Nothing is faithful (a very unusual aspect): offer the closest there
+        // is rather than nothing.
+        return faithful.isEmpty ? scored.sorted { $0.deviation < $1.deviation }.prefix(fallback).map(\.canvas) : faithful
     }
 
     /// The source's own size on the grid, when it fits. This is the one option

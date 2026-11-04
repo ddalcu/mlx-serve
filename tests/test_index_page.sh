@@ -15,6 +15,7 @@
 # Usage: ./tests/test_index_page.sh [port]
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11266}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -56,12 +57,7 @@ boot() {
     : > "$LOG"
     HOME="$WORK_DIR/home" "$BINARY" --serve --host 127.0.0.1 --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off "$@" > "$LOG" 2>&1 &
     SERVER_PID=$!
-    for _ in $(seq 1 60); do
-        kill -0 "$SERVER_PID" 2>/dev/null || break
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-        sleep 0.5
-        kill -0 "$SERVER_PID" 2>/dev/null || break
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 60 0.5 "$SERVER_PID" && return 0
     echo "  (server did not come up; log follows)"; cat "$LOG"
     return 1
 }

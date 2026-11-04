@@ -1,0 +1,22 @@
+const int L = y_shape[0];
+const int NT = y_shape[1];
+const uint lane = thread_index_in_simdgroup;
+const int slot = int(threadgroup_position_in_grid.x) * 8 + int(simdgroup_index_in_threadgroup);
+const int l = int(threadgroup_position_in_grid.y);
+if (slot >= H + 2 * KV) return;
+const bool is_q = slot < H;
+const bool is_k = !is_q && slot < H + KV;
+const int head = is_q ? slot : (is_k ? slot - H : slot - H - KV);
+const int col = (is_q ? QO : (is_k ? KO : VO)) + head * 128 + int(lane) * 4;
+const float4 v = float4(*(const device vec<T, 4>*)(y + (size_t)l * NT + col));
+device T* dst = (is_q ? q : (is_k ? k : vo)) + ((size_t)head * L + l) * 128 + lane * 4;
+if (!is_q && !is_k) { *(device vec<T, 4>*)dst = vec<T, 4>(v); return; }
+const float inv = rsqrt(simd_sum(dot(v, v)) / 128.0f + eps);
+const device W* nw = (is_q ? qn : kn) + lane * 4;
+float4 n = v * inv;
+if (ROUND) n = float4(vec<T, 4>(n));
+n *= float4(float(nw[0]), float(nw[1]), float(nw[2]), float(nw[3]));
+if (ROUND) n = float4(vec<T, 4>(n));
+const int t = l * 64 + int(lane) * 2;
+const float c0 = cs[t], s0 = sn[t], c1 = cs[t + 1], s1 = sn[t + 1];
+*(device vec<T, 4>*)dst = vec<T, 4>(T(n.x * c0 - n.y * s0), T(n.y * c0 + n.x * s0), T(n.z * c1 - n.w * s1), T(n.w * c1 + n.z * s1));

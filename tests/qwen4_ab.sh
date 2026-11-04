@@ -1,15 +1,19 @@
 #!/bin/zsh
-# Same-boot qwen4_exp A/B harness (M4 Max numbers in docs/gotchas/engine-mlx.md;
-# the M5 box re-measures with the same script).
-#   tests/qwen4_ab.sh mtp <tag> [server flags...]     MTP vs serial per prompt, 3 reps interleaved, then MTP + plain concurrent
-#   tests/qwen4_ab.sh batched <tag> [server flags...] serial 3 reps per prompt, then 2-/4-stream prose + 2-stream 8.5k aggregate
-# Env: QWEN4_MODEL (pack), MLX_SERVE_BIN, QWEN4_AB_OUT (default ~/claude-tmp/qwen4-ab), QWEN4_AB_PORT.
-# Engine env (MLX_SERVE_MTP_TRACE, MLX_SERVE_HC_FUSED, ...) passes through to the server; --mtp-min-depth/--mtp-max-depth ride the server flags.
+# qwen4_ab.sh — same-boot qwen4_exp A/B harness (a measurement, not a pass/fail test). Prompt fixtures in
+# tests/fixtures/qwen4_ab/ (400-token code + prose, one 8.4k prompt); the nonce varies by rep, never by arm.
+#
+#   tests/qwen4_ab.sh mtp <tag> [server flags...]       MTP vs serial interleaved x3 per prompt, then MTP beside plain
+#   tests/qwen4_ab.sh batched <tag> [server flags...]   serial x3 per prompt, then 2-/4-stream prose + 2-stream 8.5k
+#
+# Env: QWEN4_MODEL (pack), MLX_SERVE_BIN (a control binary must sit in zig-out/bin/ for its rpath), QWEN4_AB_OUT
+# (~/claude-tmp/qwen4-ab), QWEN4_AB_PORT. Engine env (MLX_SERVE_DIAG=mtp-trace, ...) passes to the server.
+source "$(dirname "$0")/_lib_models.sh"
+
 setopt nonomatch
 mode=$1; tag=$2; shift 2
 D=${0:A:h}/fixtures/qwen4_ab
 O=${QWEN4_AB_OUT:-$HOME/claude-tmp/qwen4-ab}; mkdir -p $O
-PACK=${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}
+PACK=${QWEN4_MODEL:-$(find_model ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit || echo "$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit")}
 BIN=${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}
 PORT=${QWEN4_AB_PORT:-11414}
 LOG=$O/${mode}_$tag.log
@@ -18,7 +22,7 @@ for i in $(seq 1 60); do lsof -nP -iTCP:$PORT -sTCP:LISTEN >/dev/null 2>&1 || br
 flags=(--max-concurrent 4 --prefix-cache-entries 0 --log-level info)
 [[ $mode == mtp ]] && flags+=(--mtp)
 nohup $BIN --model $PACK --serve --host 127.0.0.1 --port $PORT $flags "$@" > $LOG 2>&1 &
-for i in $(seq 1 200); do curl -s -m 2 localhost:$PORT/health >/dev/null && grep -q "Model ready" $LOG && break; sleep 3; done
+for i in $(seq 1 200); do curl -sf -m 2 localhost:$PORT/health >/dev/null && grep -q "Model ready" $LOG && break; sleep 3; done
 one() { echo "$1" | curl -s -m 1800 localhost:$PORT/v1/chat/completions -H 'content-type: application/json' -d @- | python3 -c "import sys,json; d=json.load(sys.stdin); t=d['timings']; print(f\"{t['predicted_per_second']:.1f}/{d['usage']['completion_tokens']}\")"; }
 agg() { python3 -c "
 import sys,time; t0=float(sys.argv[1]); toks=sum(int(x.split('/')[1]) for x in sys.stdin.read().split()); print(f'wall_agg={toks/(time.time()-t0):.1f} tok/s')" "$1"; }

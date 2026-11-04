@@ -42,6 +42,11 @@ enum ChatModelSelection {
         return .selectLan(String(tag.dropFirst(lanPrefix.count)))
     }
 
+    /// Whether a local load is shown: always in the tray, beside the composer only while the chat is local.
+    static func showsLocalLoadProgress(lanChatModelId: String?, apple: Bool, chatTargetOnly: Bool) -> Bool {
+        !chatTargetOnly || (lanChatModelId == nil && !apple)
+    }
+
     /// Shown when this Mac has nothing picked and nothing is answering.
     static let noModelPlaceholder = "Select a model"
 

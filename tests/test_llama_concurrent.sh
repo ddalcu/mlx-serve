@@ -1,20 +1,15 @@
 #!/bin/bash
-# llama.cpp engine: concurrent requests decode together (#547), and a request
-# decoding alone drafts with the model's MTP head (#548).
+# test_llama_concurrent.sh — llama.cpp sequences + MTP on one server (--llama-cache-entries 4): four concurrent chats
+# answer with `[batched] llama.cpp decode engaged (seqs=N)`; `/props` settings.mtp.loaded on a GGUF with a head; a
+# solo greedy chat accepts drafts (`[spec-stats] mode=llama-mtp`); --llama-mtp-drafts 0 answers the same text.
 #
-# Asserts, on one server with --llama-cache-entries 4:
-#   1. Four concurrent chats all answer, and the log shows the batched step
-#      engaged with more than one sequence.
-#   2. The context armed MTP (`/props` settings.mtp.loaded) and a solo chat
-#      ran MTP rounds that accepted drafts (`[spec-stats] mode=llama-mtp`).
-#   3. With --llama-mtp-drafts 0 the same greedy chat answers the same text.
+#   LLAMA_GGUF_MODEL=<Qwen3.5-0.8B-MTP-GGUF Q8_0 file> ./tests/test_llama_concurrent.sh   # PORT (19108), BINARY
 #
-# Env:
-#   LLAMA_GGUF_MODEL  A .gguf with an MTP head, e.g. unsloth/Qwen3.5-0.8B-MTP-GGUF
-#                     Qwen3.5-0.8B-Q8_0.gguf. Unset = skip.
-#   PORT              Default 19108.
-#   BINARY            Default ./zig-out/bin/mlx-serve.
+# Unset = SKIP. Hermetic twins: `pickLlamaSeq`, `llamaDraftsThisTick`, `findLlamaMtpSidecar`; model-gated: the
+# LLAMA_TEST_MODEL tests in src/engines/llama/bridge.zig.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${LLAMA_GGUF_MODEL:-}"
 PORT="${PORT:-19108}"
@@ -42,11 +37,8 @@ trap 'stop; rm -rf "$LOG" "$OUT"' EXIT INT TERM
 start() {
     "$BIN" --model "$MODEL" --serve --port "$PORT" --ctx-size 4096 --log-level info "$@" > "$LOG" 2>&1 &
     SERVER_PID=$!
-    for _ in $(seq 1 240); do
-        curl -sf --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"' && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -30 "$LOG"; exit 1; }
-        sleep 0.5
-    done
+    srv_wait_health "$BASE" 240 0.5 "$SERVER_PID" && return 0
+    kill -0 "$SERVER_PID" 2>/dev/null || { echo "fail: server died:"; tail -30 "$LOG"; exit 1; }
     echo "fail: server never became healthy"; exit 1
 }
 

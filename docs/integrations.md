@@ -23,7 +23,7 @@ One thing to get right in any manual config: the context window. The server pins
 
 Two ways to skip everything below:
 
-- **MLX Core app**: the tray's **Code** button detects the CLIs installed on your Mac and launches them preconfigured against the running server (the App Store build shows copy-paste commands instead, since it isn't allowed to launch other apps).
+- **MLX-Serve app**: the tray's **Code** button detects the CLIs installed on your Mac and launches them preconfigured against the running server (the App Store build shows copy-paste commands instead, since it isn't allowed to launch other apps).
 - **`mlx-serve launch <agent>`**: same thing from the terminal, ollama-style:
 
 ```bash
@@ -32,9 +32,9 @@ mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # everything after -- goes to the agent
 ```
 
-If no server is running, `launch` starts the MLX Core app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
+If no server is running, `launch` starts the MLX-Serve app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
 
-Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.grok`, `~/.zcode` stay yours). fx is the exception: it reads providers only from `~/.fx/settings.json`, so the launch sets the `providers.mlx-serve` entry there and selects it with `FX_PROVIDER`/`FX_MODEL`, leaving the rest of the file, your default provider included, as it was. Codex is the exception: it launches against your real Codex home so MCP servers, plugins, and auth work — see [Codex](#codex).
+Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.grok`, `~/.zcode` stay yours). fx is the exception: it reads providers only from `~/.fx/settings.json`, so the launch sets the `providers.mlx-serve` entry there and selects it with `FX_PROVIDER`/`FX_MODEL`, leaving the rest of the file, your default provider included, as it was. Codex is the exception: it launches against your real Codex home so MCP servers, plugins, and auth work; the only file the launch writes for it is `~/.mlx-serve/codex/model-instructions.md`, never into your Codex home — see [Codex](#codex).
 
 ### ZCode
 
@@ -138,7 +138,7 @@ opencode --model mlx/MODEL_ID
 
 OpenCode 2 reuses the same `OPENCODE_CONFIG_CONTENT` provider JSON, and the launcher also writes a dedicated config dir and registers the mlx-serve monitor plugin (sidebar stats + footer turn meter, reading `GET /metrics.json`). `mlx-serve launch opencode` routes a detected major >= 2 here (the profile is v2 for any newer major too); `mlx-serve launch opencode2` remains as a compatibility alias that forces v2 — it resolves `opencode` when that is the v2 binary, else a legacy `opencode2` still on PATH.
 
-**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX Core app enables metrics by default. A v2 launch probes the endpoint and prints a warning when it is off.
+**Start the server with `--metrics`** (`mlx-serve serve --metrics`). The CLI server has metrics off by default and answers `/metrics.json` with 503; the plugin then shows `feed --metrics off` and an otherwise empty panel, while the footer turn meter still works from the streamed response. The MLX-Serve app enables metrics by default. A v2 launch probes the endpoint and prints a warning when it is off.
 
 ```bash
 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
@@ -160,7 +160,7 @@ opencode --standalone
 
 ### Codex
 
-Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. mlx-serve writes nothing into your Codex home (`${CODEX_HOME:-$HOME/.codex}`): its settings ride `-c key=value` overrides that codex merges over your own `config.toml`, so your MCP servers, plugins, login and project trusts keep working. No key setup: with no `env_key` configured, codex skips the login screen. Codex launches carry no mlx-serve skill, since codex has no setting for an extra skills folder.
+Current Codex speaks only the OpenAI Responses wire API, which mlx-serve serves at `/v1/responses`. mlx-serve writes nothing into your Codex home (`${CODEX_HOME:-$HOME/.codex}`): its settings ride `-c key=value` overrides that codex merges over your own `config.toml`, so your MCP servers, plugins, login and project trusts keep working. No key setup: with no `env_key` configured, codex skips the login screen. Codex launches carry no mlx-serve skill, since codex has no setting for an extra skills folder. The launchers additionally write `~/.mlx-serve/codex/model-instructions.md` — a short base-instructions file written in this repo, teaching local models the tool contract of the current codex (its built-in fallback prompt names tools the binary no longer declares and ends the turn when the model only narrates its next step) — and pass it as `-c model_instructions_file=…`; `MLX_SERVE_CODEX_MODEL_INSTRUCTIONS=off` (or `0`), or the file being missing, keeps codex's own fallback prompt.
 
 No `codex` on PATH but you have the ChatGPT desktop app? It bundles the CLI at `/Applications/ChatGPT.app/Contents/Resources/codex` (the launchers find it there automatically; `mlx-serve launch chatgpt` works too).
 
@@ -175,6 +175,8 @@ codex \
   -c 'model_providers.mlx.base_url="http://127.0.0.1:11234/v1"' \
   -c 'model_providers.mlx.wire_api="responses"'
 ```
+
+Beyond these lines `mlx-serve launch codex` also passes `-c model_instructions_file="$HOME/.mlx-serve/codex/model-instructions.md"` for the file it writes there; codex refuses to start when that path is missing, so a hand-run codex without the file should leave the line out.
 
 ### Hermes
 
@@ -343,4 +345,4 @@ Continue, Cline, Goose and most other tools have an "OpenAI-compatible" provider
 
 ## Sandboxed agents
 
-The MLX Core app can also run pi and hermes inside a Linux VM (Agent Sandbox) with the config injected for you. See [docs/app.md](app.md).
+The MLX-Serve app can also run pi and hermes inside a Linux VM (Agent Sandbox) with the config injected for you. See [docs/app.md](app.md).

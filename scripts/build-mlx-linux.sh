@@ -101,12 +101,6 @@ if [[ "$MLX_COMMIT" != unknown && -f "$STAGE/lib/libmlx.so" && -f "$STAGE/lib/li
 fi
 
 if [[ "$MLX_BACKEND" == cuda ]]; then
-  echo "== patch mlx: CUDA LRU thrashing check counts consecutive misses"
-  if grep -q 'any hit resets it' "$MLX_SOURCE/mlx/backend/cuda/lru_cache.h"; then
-    echo "   lru cache: already applied"
-  else
-    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-lru-consecutive-misses.patch"
-  fi
   echo "== patch mlx: CUDA fused attention at head dims 256 and 512"
   if grep -q 'load_lane_row' "$MLX_SOURCE/mlx/backend/cuda/scaled_dot_product_attention.cu"; then
     echo "   sdpa: already applied"
@@ -114,10 +108,46 @@ if [[ "$MLX_BACKEND" == cuda ]]; then
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-sdpa-head-dim-256-512.patch"
   fi
   echo "== patch mlx: CUDA quantized matmul reads the weights once for all rows and batches"
-  if grep -q 'can_use_qmv && (M \* B == 1)' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
+  if grep -q 'fold the batches into rows' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
     echo "   qmm: already applied"
   else
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmm-read-weights-once.patch"
+  fi
+  echo "== patch mlx: CUDA mat-vec rows kernel (GB10 default, MLX_CUDA_QMV_MAX_ROWS)"
+  if grep -q 'qmv_rows_kernel' "$MLX_SOURCE/mlx/backend/cuda/quantized/qmm/qmv.cu"; then
+    echo "   qmv rows: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmv-rows.patch"
+  fi
+  echo "== patch mlx: CUDA decode mat-vecs read 16 bytes per load, top-k gathers take them"
+  if [[ -f "$MLX_SOURCE/mlx/backend/cuda/gemms/row_dot.cuh" ]]; then
+    echo "   decode mat-vec: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-row-dot-matvec.patch"
+  fi
+  echo "== patch mlx: CUDA sorted expert gather schedules CTAs per expert"
+  if grep -q 'qmm_sm80_expert_kernel' "$MLX_SOURCE/mlx/backend/cuda/device/qmm_sm80.cuh"; then
+    echo "   per-expert gather: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-sorted-gather-experts.patch"
+  fi
+  echo "== patch mlx: CUDA graphs switch at runtime (mlx_cuda_set_graphs)"
+  if grep -q 'mlx_cuda_set_graphs' "$MLX_SOURCE/mlx/backend/cuda/device.cpp"; then
+    echo "   graphs switch: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-graphs-switch.patch"
+  fi
+  echo "== patch mlx: CUDA sorted expert mat-vec loads each expert once per run of rows"
+  if grep -q 'row_dot_sorted_kernel' "$MLX_SOURCE/mlx/backend/cuda/gemms/row_dot.cuh"; then
+    echo "   sorted mat-vec: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-sorted-gather-matvec.patch"
+  fi
+  echo "== patch mlx: CUDA custom kernels go to the disk kernel cache too"
+  if grep -q 'hashes the generated source' "$MLX_SOURCE/mlx/backend/cuda/custom_kernel.cpp"; then
+    echo "   custom-kernel disk cache: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-custom-kernel-disk-cache.patch"
   fi
 fi
 
@@ -147,16 +177,11 @@ fi
 
 # ── 2. Build mlx-c against the fork's installed MLX ─────────────────────
 echo "== patch mlx-c for the fork's gather_qmm signature"
-if grep -q 'global_scale: no C ABI surface yet' "$MLXC_SRC/mlx/c/ops.cpp"; then
-  echo "   gather_qmm: already applied"
-else
-  git -C "$MLXC_SRC" apply -p1 "$ROOT/patches/mlxc-gather-qmm-global-scale.patch"
-fi
-if grep -q 'no baseline _Float16' "$MLXC_SRC/mlx/c/half.h"; then
-  echo "   f16 alias: already applied"
-else
-  git -C "$MLXC_SRC" apply -p1 "$ROOT/patches/mlxc-x86-f16-data-alias.patch"
-fi
+# The files a patch touches are reset first, so an edited patch replaces the old one in a tree that built before.
+for patch in mlxc-gather-qmm-global-scale mlxc-x86-f16-data-alias; do
+  git -C "$MLXC_SRC" checkout -- $(git -C "$MLXC_SRC" apply --numstat -p1 "$ROOT/patches/$patch.patch" | cut -f3)
+  git -C "$MLXC_SRC" apply -p1 "$ROOT/patches/$patch.patch"
+done
 
 echo "== configure mlx-c: $MLXC_SRC"
 # $ORIGIN so libmlxc.so finds the staged libmlx.so sitting next to it; a

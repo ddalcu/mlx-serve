@@ -1,30 +1,13 @@
 #!/bin/bash
-# Regression test for the persistent llama.cpp KV session across multiple turns.
+# test_llama_persistent_session.sh — a llama.cpp session reused across turns survives a second turn that shares a prefix
+# with turn 1 and adds a much larger suffix: both requests stream a normal SSE response with a terminator. The failure
+# is a 500 with `failed to find a memory slot for batch` -> `SessionSyncFailed` in the log (Qwen3-family GGUFs with
+# sliding-window layers, when the session was made without a full-size SWA cache).
 #
-# Reproduces the failure mode where the second turn of a chat — sharing some
-# prefix with turn 1 but with a substantially larger new suffix — fails with:
-#
-#   init_batch: failed to prepare attention ubatches
-#   decode: failed to find a memory slot for batch of size 512
-#   [llama] session_sync rc=-1 err=llama_decode failed during prefill
-#   [scheduler] prefill failed for slot: SessionSyncFailed
-#
-# That cascade is libllama refusing to allocate KV slots for the prefill batch
-# on the second turn — it surfaces on Qwen3-family GGUFs (hybrid / sliding-window
-# attention layers) when one `llama_context` is reused across requests via
-# `seq_rm` + decode. The two-pronged fix:
-#   1. `cp.swa_full = true` at session creation (full-size SWA cache, so
-#      `seq_rm` actually exposes the trimmed slots to subsequent decodes).
-#   2. `LlamaSession.syncWithFallback` in the scheduler — on a failed sync,
-#      reset and retry once cold instead of surfacing a 500 to the client.
-#
-# This test exercises (1) directly: without `swa_full`, the second request
-# returns a 500 with the SessionSyncFailed cascade in the server log. With
-# the fix, both requests stream a normal SSE response with a terminator.
-#
-# Gated on the same `LLAMA_GGUF_MODEL` fixture as test_llama_gguf.sh:
-#   LLAMA_GGUF_MODEL=/path/to/model.gguf ./tests/test_llama_persistent_session.sh [port]
+#   LLAMA_GGUF_MODEL=<file.gguf> ./tests/test_llama_persistent_session.sh [port]
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 MODEL="${LLAMA_GGUF_MODEL:-}"
 PORT="${1:-8124}"
@@ -59,11 +42,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Wait for /health.
-for i in $(seq 1 30); do
-    if curl -fs --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then break; fi
-    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo -e "${RED}server died${NC}"; tail -40 "$LOG"; exit 1; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 "$SERVER_PID" || kill -0 "$SERVER_PID" 2>/dev/null || { echo -e "${RED}server died${NC}"; tail -40 "$LOG"; exit 1; }
 
 # Reproduce the user-reported failure pattern: an agentic chat where turn 2's
 # history contains the previous assistant's multiple PARALLEL tool_calls plus

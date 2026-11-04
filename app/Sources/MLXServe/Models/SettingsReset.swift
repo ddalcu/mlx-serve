@@ -63,6 +63,11 @@ enum SettingsReset {
                 f("lanSharedModels") { $0.lanSharedModels = $1.lanSharedModels },
                 f("lanDiscoverEnabled") { $0.lanDiscoverEnabled = $1.lanDiscoverEnabled },
                 f("lanName") { $0.lanName = $1.lanName },
+                f("clusterRole") { $0.clusterRole = $1.clusterRole },
+                f("clusterMode") { $0.clusterMode = $1.clusterMode },
+                f("clusterModelPath") { $0.clusterModelPath = $1.clusterModelPath },
+                f("clusterDevice") { $0.clusterDevice = $1.clusterDevice },
+                f("clusterCoordinator") { $0.clusterCoordinator = $1.clusterCoordinator },
             ]
 
         case .specDecode:
@@ -105,6 +110,7 @@ enum SettingsReset {
                 f("aneImage") { $0.aneImage = $1.aneImage },
                 f("aneVideo") { $0.aneVideo = $1.aneVideo },
                 f("aneAudio") { $0.aneAudio = $1.aneAudio },
+                f("w8a8") { $0.w8a8 = $1.w8a8 },
                 f("aneSlots") { $0.aneSlots = $1.aneSlots },
             ]
 
@@ -143,7 +149,9 @@ enum SettingsReset {
                 f("voiceCloneLabel") { $0.voiceCloneLabel = $1.voiceCloneLabel },
                 f("voiceEngine") { $0.voiceEngine = $1.voiceEngine },
                 f("kokoroVoice") { $0.kokoroVoice = $1.kokoroVoice },
+                f("lfm3Voice") { $0.lfm3Voice = $1.lfm3Voice },
                 f("wakePhrase") { $0.wakePhrase = $1.wakePhrase },
+                f("transcribeEngine") { $0.transcribeEngine = $1.transcribeEngine },
                 f("transcriptNotesModel") { $0.transcriptNotesModel = $1.transcriptNotesModel },
                 f("transcriptAutoStopMinutes") { $0.transcriptAutoStopMinutes = $1.transcriptAutoStopMinutes },
                 f("transcriptAutoStartCamera") { $0.transcriptAutoStartCamera = $1.transcriptAutoStartCamera },

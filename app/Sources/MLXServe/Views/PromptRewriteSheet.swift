@@ -40,6 +40,8 @@ struct PromptRewriteSheet: View {
 
     let title: String
     var clip: ClipLength? = nil
+    /// The text the rewrite starts from. With a clip it is shown until Write is pressed.
+    var source: String? = nil
     let request: (Int) -> PromptRewriter.Request
     /// Called on Apply with the slider's seconds, only when it was moved.
     var onApplyClip: ((Int) -> Void)? = nil
@@ -51,12 +53,15 @@ struct PromptRewriteSheet: View {
 
     @State private var text: String = ""
     @State private var clipSeconds = 0
+    /// A clip sheet waits on Write, so the input and the length can be checked first.
+    @State private var started = false
     /// The length the text in the box was written for.
     @State private var writtenSeconds = 0
     @State private var isWriting = false
     @State private var progress = RewriteProgress()
     /// Set when there is a first frame the chat model cannot see.
     @State private var blindToFirstFrame = false
+    @State private var blindToReferences = false
     @State private var startedAt = Date()
     @State private var error: String? = nil
     @State private var job: Task<Void, Never>? = nil
@@ -69,32 +74,49 @@ struct PromptRewriteSheet: View {
                 if isWriting {
                     ProgressView().controlSize(.small)
                     TimelineView(.periodic(from: startedAt, by: 1)) { context in
-                        Text(verbatim: progress.label + " " + Duration.seconds(context.date.timeIntervalSince(startedAt))
-                                .formatted(.time(pattern: .minuteSecond)))
+                        Text(verbatim: progress.label + " " + AudioClipPlayer.clock(context.date.timeIntervalSince(startedAt)))
                             .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
                     }
                 }
             }
-            TextEditor(text: $text)
-                .font(.app(.body))
-                .frame(minHeight: 220)
-                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
-                .overlay(alignment: .topLeading) {
-                    // The think, until the answer starts: proof the model is working.
-                    if isWriting, text.isEmpty, !progress.thought.isEmpty {
-                        Text(verbatim: String(progress.thought.suffix(1200)))
-                            .font(.app(.caption)).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
-                            .padding(8)
-                            .clearOfEditorScroller()
-                            .clipped()
-                            .allowsHitTesting(false)
-                    }
+            if awaitingWrite {
+                ScrollView {
+                    Text(verbatim: source ?? "")
+                        .font(.app(.body))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(8)
                 }
-            if let error = error ?? (isWriting ? nil : applyError?(text, writtenSeconds)) {
+                .frame(minHeight: 220, alignment: .top)
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+            } else {
+                TextEditor(text: $text)
+                    .font(.app(.body))
+                    .frame(minHeight: 220)
+                    .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5))
+                    .overlay(alignment: .topLeading) {
+                        // The think, until the answer starts: proof the model is working.
+                        if isWriting, text.isEmpty, !progress.thought.isEmpty {
+                            Text(verbatim: String(progress.thought.suffix(1200)))
+                                .font(.app(.caption)).foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+                                .padding(8)
+                                .clearOfEditorScroller()
+                                .clipped()
+                                .allowsHitTesting(false)
+                        }
+                    }
+            }
+            if awaitingWrite {
+                Text("Check the prompt and clip length, then Write.")
+                    .font(.app(.caption2)).foregroundStyle(.secondary)
+            } else if let error = error ?? (isWriting ? nil : applyError?(text, writtenSeconds)) {
                 Text(error).font(.app(.caption)).foregroundStyle(.red)
             } else if blindToFirstFrame {
                 Text("Your chat model can't see images, so this was written without your first frame and the video may cut away from it. A vision chat model fixes that.")
+                    .font(.app(.caption)).foregroundStyle(.orange)
+            } else if blindToReferences {
+                Text("Your chat model can't see images, so this was written without your reference pictures and may describe them differently. A vision chat model fixes that.")
                     .font(.app(.caption)).foregroundStyle(.orange)
             } else {
                 Text("Edit the result, then Apply to replace your text.")
@@ -115,30 +137,41 @@ struct PromptRewriteSheet: View {
                 }
             }
             HStack {
-                Button { start() } label: { Text("Try again")
-                    .font(.app(.body)) }.disabled(isWriting)
+                if !awaitingWrite {
+                    Button { start() } label: { Text("Try again")
+                        .font(.app(.body)) }.disabled(isWriting)
+                }
                 Spacer()
                 Button { dismiss() } label: { Text("Cancel")
                     .font(.app(.body)) }.keyboardShortcut(.cancelAction)
-                Button {
-                    onApply(text)
-                    if let clip, clipSeconds != clip.initial { onApplyClip?(clipSeconds) }
-                    dismiss()
-                } label: { Text("Apply")
-                    .font(.app(.body)) }
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(isWriting || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                              || applyError?(text, writtenSeconds) != nil)
+                if awaitingWrite {
+                    Button { start() } label: { Text("Write")
+                        .font(.app(.body)) }
+                        .keyboardShortcut(.defaultAction)
+                } else {
+                    Button {
+                        onApply(text)
+                        if let clip, clipSeconds != clip.initial { onApplyClip?(clipSeconds) }
+                        dismiss()
+                    } label: { Text("Apply")
+                        .font(.app(.body)) }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(isWriting || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  || applyError?(text, writtenSeconds) != nil)
+                }
             }
         }
         .padding(16)
         .frame(width: 520)
-        .onAppear { clipSeconds = clip?.initial ?? 0; start() }
+        .onAppear { clipSeconds = clip?.initial ?? 0; if clip == nil { start() } }
         .onDisappear { job?.cancel() }
     }
 
+    private var awaitingWrite: Bool { clip != nil && !started }
+
     private func start() {
         job?.cancel()
+        started = true
         text = ""
         error = nil
         progress = RewriteProgress()
@@ -148,18 +181,20 @@ struct PromptRewriteSheet: View {
             defer { isWriting = false }
             writtenSeconds = clipSeconds
             let req = request(clipSeconds)
-            let sees = req.firstFrame != nil && AgentComposer.seesImages(appState: appState)
+            let sees = !req.images.isEmpty && AgentComposer.seesImages(appState: appState)
             blindToFirstFrame = req.firstFrame != nil && !sees
+            blindToReferences = !req.references.isEmpty && !sees
             do {
                 for try await event in AgentComposer.events(userText: req.user(seeingImage: sees), systemPrompt: req.system,
-                                                            image: sees ? req.firstFrame : nil,
-                                                            appState: appState, maxTokens: req.maxTokens) {
+                                                            images: sees ? req.images : [],
+                                                            appState: appState, maxTokens: req.maxTokens,
+                                                            reasoningEffort: req.reasoningEffort) {
                     if Task.isCancelled { return }
                     progress.apply(event)
                     if case .content = event { text = progress.text }
                 }
                 if Task.isCancelled { return }
-                text = PromptRewriter.clean(text)
+                text = PromptRewriter.finish(text, request: req)
                 error = progress.emptyReason
             } catch is CancellationError {
             } catch {

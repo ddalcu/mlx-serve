@@ -10,6 +10,7 @@
 # Usage: ./tests/test_website_agent_install.sh [port]
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8134}
 EMPTY_PORT=$((PORT + 1))
@@ -70,11 +71,7 @@ EMPTY_PID=$!
 cleanup() { kill $SERVER_PID $EMPTY_PID 2>/dev/null; wait $SERVER_PID $EMPTY_PID 2>/dev/null; rm -rf "$T"; }
 trap cleanup EXIT
 for p in "$PORT" "$EMPTY_PORT"; do
-    for i in $(seq 1 30); do
-        curl -sf "http://127.0.0.1:$p/health" >/dev/null 2>&1 && break
-        [ "$i" -eq 30 ] && { echo "FAIL: server on $p did not start"; cat "$T/server.log" "$T/empty.log"; exit 1; }
-        sleep 1
-    done
+    srv_wait_health "http://127.0.0.1:$p" 30 1 || { echo "FAIL: server on $p did not start"; cat "$T/server.log" "$T/empty.log"; exit 1; }
 done
 
 run_test() {

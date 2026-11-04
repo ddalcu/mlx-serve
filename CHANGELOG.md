@@ -1,17 +1,96 @@
 # Changelog
 
-## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
+## v26.11.1 — Outside Plugins, Full Rewrite, Faster Deepseek
 
-- **Speech to text.** `POST /v1/audio/transcriptions` turns WAV recordings into text in 30 languages with Qwen3-ASR, through the OpenAI SDK's own transcription call, with word and sentence times and SRT/WebVTT subtitles in 11 of them from Qwen3-ForcedAligner, and who said what (`diarized_json`, up to eight speakers) from NVIDIA's Nemotron 3 Diarization; the app downloads both alongside.
-- **Transcripts from the tray.** Switch on Transcript in the menu bar to record your microphone, and optionally what your Mac plays; switch it off and the transcript opens as Markdown with notes your chat model writes on top (summary, decisions, action items), each speaker named and your own voice marked You on a call; it can start when a call turns on your camera, stops by itself after a silence, and survives a quit.
-- **MiniCPM-V 4.7 sees.** OpenBMB's MiniCPM-V 4.7 reads images, from screenshots to pages of small print: large pictures are cut into crops so fine text stays legible, and a pack without the vision tower still answers text.
-- **Agents make films.** The mlx-serve skill walks a coding agent from a brief to a finished music video, trailer or release film: it writes and sings the song, times every word and beat, renders the shots on your Mac and cuts them to the music. Storyboards in the app join more smoothly too: a shot can end on a picture you choose, and every join fades.
-- **Sushi packs draft.** MiMo-V2.6-Flash Sushi packs draft with their own MTP heads and read their FP8 attention weights in place, about 105 tokens per second instead of 32 on an M5 Ultra, and GLM-5.3-Flash Sushi packs use the DFlash2 drafter they ship with, 94 instead of 66 on code.
-- **LoRAs for Qwen-Image 2.1.** Character and style LoRAs now work with Qwen-Image 2.1, Turbo or not, for generating and for instruction edits, and several can be stacked; the app's LoRA picker is enabled for it, and an adapter set to scale 0 now leaves the image unchanged, as it should for MiniMax-H3 too.
-- **Slider LoRAs with negative and large strengths.** A LoRA scale may be negative to reverse its effect or far past 1 (some published sliders run -20 to 20) on every image and video model; the app's strength slider now spans -2 to 2, widens when you type a larger value, and takes any number up to ±100.
-- **Coding agents in one line.** `curl -fsSL https://mlxserve.com/agent.sh | sh` sets up pi, Claude Code, oh-my-pi, OpenCode or Grok against your server, and agents started from the web console's Code Launcher no longer quit on launch.
-- **Use a Mac that shares with a key.** When another Mac shares its models behind an API key, it shows up in Settings > LAN Sharing as needing a key; enter it there and its models appear in your pickers. Headless: `~/.mlx-serve/lan-keys.json`.
-- **Fixes.** Bonsai 2 2B, 4B and 9B now supported, DeepSeek-V4-Flash GGUFs open again with default settings, a picture sent as a plain image URL string reaches the model instead of being silently dropped, a damaged LAN key file can no longer stall peer discovery, LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 downloads are no longer marked unsupported in the app, the downloaded app ships the mlx-serve agent skill and the OpenCode 2 plugin again, and Agent > Update System Prompt and Skills to Latest… no longer stays grayed out.
+- **Plugins you can build and install.** `mlx-serve plugin new` starts a plugin for a new model, `plugin check` tests it, and `plugin install` adds it after showing who signed it. Models ▸ Plugins lists every plugin beside a page that shows what it needs, the packs it serves (one click to download) and its on/off switch. Plugins can draft ahead, look at images and reuse the server's own building blocks. Thanks @davidtai and @STRML for helping here. Point your agent here: https://github.com/CommunityServe/plugins 
+- **DeepSeek-V4.1-Flash is faster and remembers more.** It reads long prompts faster (most of all on M5 Macs), writes faster, stays fast when several people use it at once, and keeps your conversation cached even after you stop a reply, so the next message starts right away. Asking a DeepSeek model for embeddings now gives a clear error instead of stopping the server. Thanks @STRML.
+- **Idol: one photo to a 3D model.** Drop a photo into the 3D pane and Idol turns it into a 3D model you can open in Preview or any 3D viewer. It cuts out the background by itself, runs faster than the original, and is now the recommended 3D model.
+- **LFM3 chats, sees, listens and talks.** Liquid's LFM3 models can read pictures, understand speech and answer out loud, and the app can use them for voice input without Apple's dictation.
+- **NVIDIA Nemotron 3.5 Transcribe.** Speech to text in 40 languages, with translation, who said what, word timings and subtitles, and you can ask questions about a recording. Settings ▸ Voice can use it for dictation and meeting notes. Thanks @beamivalice.
+- **A usage dashboard in the chat window.** The corner of the chat sidebar shows how busy your Mac is and how fast the model is going. Click the speeds for daily activity, the last 30 days, average and top speeds, and a breakdown per model. The history survives restarts.
+- **Recommended models.** Liquid LFM3 leads the list, and DeepSeek-V4.1-Flash is there for Macs with 256 GB of memory.
+- **Enhance works with thinking models.** The Enhance buttons on the Image, Video and Music panes and the storyboard planner no longer come back empty when the model thinks first.
+- **Text to speech in the language you pick.** Qwen3-TTS can be told which language to speak. Thanks @lborloz.
+- **Clearer text-to-speech errors.** A reference voice Qwen3-TTS cannot use is refused with a clear message. Thanks @ianalitis.
+- **Faster prompts on M1 and M2.** `MLX_SERVE_F16_PREFILL=1` reads prompts faster for bf16 models on Macs without fast bf16 math. Thanks @hyeoktae.
+- **Other's Flash-Next packs load.** Thanks @jasontitus.
+- **Gemma 4 packs that mix quantization settings load.** Thanks @lborloz.
+- **Draft heads stored one expert at a time load.** Thanks @brandondyal.
+- **Build draft heads for MoE models.** `tests/build_mtp_sidecar.py` now builds them for mixture-of-experts models too. Thanks @Dankpaws.
+- **Codex works better with local models.** `mlx-serve launch codex` and the app's Codex tab give Codex up-to-date instructions for the tools it really has. Thanks @kmahara.
+- **Answers come out right.** A thinking budget no longer switches off speculative decoding for the answer, text that looks like a special token is read as plain text, and stray tool-call markers no longer show up as the answer. Mistral 7B follows a system prompt and calls tools instead of rambling in the wrong format, Gemma 3 prompts start with one start token instead of two, and EmbeddingGemma gives proper vectors when a batch mixes very short and very long texts.
+- **Drafting stays within the rules.** Drafting ahead from your prompt can no longer slip in a word the model must never write. Thanks @dmumber.
+- **The Responses API keeps reasoning.** Replayed replies keep their reasoning text. Thanks @shikyo13.
+- **The Responses API sees tool images.** An image returned by a tool now reaches the model. Thanks @yerbolgmailcom.
+- **A steadier server.** A schema the server cannot enforce is refused up front instead of being ignored, the prompt cache holds up better on long-running servers, and the server shuts down promptly. Ollama clients get non-streamed replies without a wait at the end, `ignore_eos` requests run to their token limit, GLM-5.3-Flash no longer offers video input it cannot read, and a plugin built for an older release is refused with a note to rebuild it. Style LoRAs no longer turn FLUX.2 klein pictures into noise on Macs that run media models in int8.
+- **The SSD cache keeps what it just saved.** Thanks @lborloz.
+- **Models are found where they are.** Models in symlinked folders are found, and Qwen-Image downloads and MTP badges show correctly in the app. Thanks @elkaix.
+- **A finished agent stops using CPU.** Thanks @jondestoppeleire.
+- **No more web console timeouts on long replies.** Thanks @lborloz.
+- **Streams report their speed.** The last chunk of a streamed reply carries its timings, on the OpenAI and Anthropic APIs alike. Thanks @hyeoktae.
+- **Retired settings.** DiffusionGemma is no longer supported, and many old `MLX_SERVE_*` tuning variables are gone: what they switched on is now the default.
+
+### Thank you
+
+Everyone below sent a pull request for this release. Thank you!
+
+@beamivalice, @brandondyal, @Dankpaws, @davidtai, @dmumber, @elkaix, @hyeoktae, @ianalitis, @jasontitus, @jondestoppeleire, @kmahara, @lborloz, @shikyo13, @STRML, @yerbolgmailcom
+
+---
+
+## v26.10.3 — New Models, Transcripts, RDMA, Faster
+
+### Highlights
+
+- **Chat on the Neural Engine.** Dense Qwen models, from Qwen 3 to Qwen3.8, can run on the Neural Engine instead of the GPU, which leaves the GPU free for images, video or another model. Turn on Neural Engine in the model's settings; it is text only, and the first load compiles the model for a few minutes.
+
+- **Meeting notes from the menu bar.** Switch on Transcript to record your microphone, and your Mac's sound too if you like. Switch it off and the transcript opens with every speaker named (your own voice marked You on a call) and notes from your chat model on top: a summary, the decisions and the action items. It can start by itself when a call turns your camera on, stops after a silence, and survives a quit.
+
+- **Speech to text.** Turn WAV recordings into text in 30 languages, with word timings and subtitles in 11 of them and who said what for up to eight speakers. Any app that already uses OpenAI's transcription API works with it, and the Mac app downloads the models it needs for you.
+
+- **Two Macs as one.** Connect two Macs with a Thunderbolt 5 cable, turn on RDMA, click Pair in Settings > Cluster and Join on the other Mac. Qwen3.8-Flash-Next and DeepSeek-V4.1-Flash then run across both, so a model too big for one Mac runs on two, and MiniMax-H3 videos render on both at once. Other computers on your network with the same video model can render storyboard shots at the same time, and the app shows where each video renders.
+
+- **Frontier models on a 128 GB Mac.** GLM-5.3-Flash and MiMo-V2.6-Flash now read their experts from the SSD as they need them, so they run on a 128 GB Mac: GLM-5.3-Flash keeps its full million-token context, writes about 35 tokens a second, and starts answering a short question in about 2.5 seconds instead of 7. Z.ai's 744B GLM-5.3 runs the same way on a 256 GB Mac (thanks @davidtai).
+
+- **Images, video, music and 3D up to twice as fast on M5 Macs.** On an M5 Mac with 64 GB or more, the image, video, music and 3D models run on the Neural Accelerators, 1.2x to 2x faster from start to finish on an M5 Ultra: a 1024x1024 Krea picture takes 5.4 seconds instead of 10.7, a Qwen-Image one 3.9 instead of 7.3. You get the same picture, sound or mesh, give or take small details; 4-bit models hold 2 to 8 GB more memory while loaded, and Settings > Neural Accelerator int8 turns it on or off. On every Mac, Krea and Qwen-Image also finish each picture a little sooner.
+
+- **New models.** MOSS-Image draws from long prompts, tag lists or a scene layout, with English and Chinese text inside the picture, and Enhance writes the layout for you. MiniCPM-V 4.7 reads images down to the small print (thanks @beamivalice). NVIDIA's Nemotron 3.5 Bolt and Super understand text, images and video and draft ahead with their own drafter (thanks @thelogicalgate). NVIDIA's own FP4 builds of Qwen3.8-Flash-Next and GLM-5.3-Flash load straight from Hugging Face, the GLM one on a 256 GB Mac. DeepSeek-V4.1-Flash now reads images too. Recursive's Flint coding model runs from its MLX pack, tool calls and thinking included, and serves several users at once. FastH3 Omni makes a MiniMax-H3 video and its soundtrack from your reference pictures in 8 steps instead of 30, several times faster, and Enhance now looks at those pictures when it writes the prompt.
+
+- **A photo becomes a detailed 3D model.** TRELLIS.2 and Pixal3D turn one picture of an object into a textured 3D model for a game or Blender, with the mesh detail (up to 2 million faces), the texture size (up to 4096 pixels) and the finish, from as generated to glossy car paint, your choice. Mapping the texture onto the mesh now uses every core of your Mac: a 1-million-face car took 7 minutes and takes seconds. TRELLIS.2 is the better pick for cars and other hard objects; Pixal3D also takes two to eight views of the same object through the API.
+
+- **Agents make films.** The mlx-serve skill takes a coding agent from a brief to a finished music video, trailer or release film: it writes and sings the song, times every word and beat, renders the shots on your Mac and cuts them to the music. Storyboard shots can now end on a picture you choose, and every join fades (thanks @lojza3d).
+
+- **DeepSeek-V4.1-Flash is much faster.** On an M5 Ultra it now writes up to ~150 tokens a second, and reads long prompts at up to about 1,800 tokens a second.
+
+- **Windows.** mlx-serve now builds natively on Windows PCs with an NVIDIA graphics card, for chat with MLX and GGUF models, vision, images and music. `scripts\build-windows.ps1` builds it, requires CUDA Toolkit installed (thanks @alexborhani).
+
+### Fixes
+
+- **Saved conversations stay saved.** Conversations with images pick up from the SSD cache even after they leave memory (thanks @GGGBB). Every long session is saved to the SSD, not just the newest, and quitting the server stops a long prompt right away and takes up to 45 seconds to finish saving (thanks @STRML, @Dankpaws). A failed save no longer throws away what was already saved (thanks @kmahara).
+- **Models load.** Homebrew's command-line server starts again (thanks @yGuy), DeepSeek-V4-Flash GGUFs open with default settings (thanks @nothinglimited), a model you download shows up in the server right away (thanks @Salingo), downloads fetch every file a model lists so OptiQ packs no longer show "Missing shards", Bonsai 2 2B, 4B and 9B load, LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 are no longer marked unsupported, and switching models unloads an idle one even when its prompt cache fills the memory.
+- **Answers come out right.** Loading an embedding model no longer makes the next chat turn fail (thanks @alexborhani), GLM-5.3 answers as it should when several chats share it or it drafts ahead, Nemotron-H packs that write their step limit as infinity answer properly, a picture sent as a plain image URL reaches the model instead of being dropped, Claude Code gets the same drafting speed-up as other clients, DeepSeek-V4.1-Flash keeps answering while an image model is loaded beside it, a 3D job that fails on the GPU says so instead of returning a broken mesh, Qwen3-Embedding 4B and 8B return the same vectors as the reference, a tool call the model writes in Claude's `<invoke>` format runs instead of ending the agent's turn as text (and `<invoke>` markup quoted inside another call's arguments stays part of that call), GLM-5.3-Flash answers correctly on M1 and M2 Macs, Flint's tool calls keep their argument names, stacked LoRAs on MiniMax-H3 and MOSS-Image add up exactly, agents that send `frequency_penalty` (Crush) make their tool calls again (thanks @jackgene), and a long agent chat on a 48 GB Mac is no longer refused for memory macOS would hand back (thanks @peckinpah).
+- **NVIDIA, Linux and Windows.** Models paired with a drafter no longer stop after the first word on NVIDIA GPUs (thanks @Weschera), long prompts to NVIDIA's Flash Next pack no longer fail past 6,500 tokens at a time, image and video jobs on Windows respect the memory limit (thanks @alexborhani), Linux machines on MLX's Vulkan backend answer instead of failing every request, and on NVIDIA GPUs the same request no longer gets a different answer from run to run after an update, which came from an old cached copy of a fixed kernel. DGXSpark speedups (thanks @ivanfioravanti).
+- **A smoother app.** Agents started from the web console's Code Launcher no longer quit on launch, the downloaded app ships the mlx-serve agent skill and the OpenCode 2 plugin again, Agent > Update System Prompt and Skills to Latest… works again, the "/" menu opens above the text field, pickers no longer flicker and placeholder text no longer runs under the scroll bar while a pane scrolls (thanks @lborloz), a damaged LAN key file no longer stops your Mac from finding the others, the model memory cap gains a 224 GB step, the agent skill loads one media model at a time and waits for its assets instead of generating beside your chat, chatting with a provider or LAN model no longer loads your last local model, and the web console's API key page no longer leaves the key in the address bar and browser history, nor does a debug log record it.
+
+### Also new
+
+- **See a model load.** The app shows how far a model has loaded and how long is left, and loading one now unloads idle models when memory is short instead of failing.
+- **Faster when it's busy.** When two to five people share Qwen3.8-27B with its drafter, they get 1.3x to 1.9x more done together, and a quick question no longer waits until someone else's long prompt has been read (thanks @STRML).
+- **Long prompts read faster on M5 Macs.** Qwen3.8-27B reads prompts of a few thousand tokens up to 8.5% faster on an M5 Ultra, and the opt-in `--int8-qk` reads very long prompts on dense Qwen models 7% faster at 64K tokens and 14% at 128K, trading a little precision (thanks @STRML).
+- **A lighter output layer on a DGX Spark.** A quantized Flash Next pack whose output layer ships in bf16 now keeps it in MXFP8 on a DGX Spark, as vLLM's DGX Spark recipe for Flash Next does, which writes about 8% faster there at a small cost in exactness (`--no-lm-head-mxfp8` turns it off; `--lm-head-mxfp8` opts in elsewhere).
+- **Qwen-Image 2.1 LoRAs and reference edits.** Character and style LoRAs work with Qwen-Image 2.1, Turbo or not, for new pictures and for instruction edits, several at once, and the Image pane can edit with reference pictures. A LoRA's strength can now be negative to reverse its effect or far past 1 for slider LoRAs, on every image and video model, and a strength of 0 really turns it off (thanks @davguij).
+- **Sushi packs draft ahead and run faster.** MiMo-V2.6-Flash Sushi packs write about 105 tokens a second instead of 32 on an M5 Ultra, GLM-5.3-Flash Sushi packs 94 instead of 66 on code, and Sushi's newer kernels speed up its GLM-5.3-Flash and Qwen3.8-Flash-Next packs further (thanks @beamivalice).
+- **Coding agents in one line.** `curl -fsSL https://mlxserve.com/agent.sh | sh` sets up pi, Claude Code, oh-my-pi, OpenCode or Grok against your server.
+- **Agents build better 3D games.** The mlx-serve skill now cuts each subject out of its reference picture, turns a car to face forward, prefers TRELLIS.2 for cars, and tells an agent what each setting needs in memory so it never unloads its own model to make room. Leafy plants stay out of 3D jobs, where they can tie the server up for tens of minutes.
+- **Use a Mac that shares with a key.** A Mac that shares its models behind an API key shows up in Settings > LAN Sharing as needing one; enter it there and its models appear in your pickers.
+- **Faster on NVIDIA.** Mixture-of-experts models in FP4 and FP8 read prompts much faster (their expert layers about ten times faster), and models with a built-in draft head draft ahead by default, as they do on Macs; on a DGX Spark that makes them 1.5x to 1.9x faster (thanks @drowzeys). NVIDIA's Flash Next FP4 pack is faster again on a DGX Spark: it reads long prompts 2.5x as fast, writes 1.8x as fast with or without its draft head, and answers eight people at once 1.6x as fast, with answers identical to before or at least as close to the exact result.
+- **A tidier app.** My Models shows what you changed for each model in a Settings column, Discover adds a Use button for decision models and for repos you already have a build of, long code blocks fold behind Show more (thanks @lojza3d), and Settings can set the app's language (English, 简体中文 or 한국어) whatever your Mac uses (thanks @LXD-8).
+
+### Thank you
+
+Everyone below helped make this release with code, fixes or bug reports. Thank you!
+
+@alexborhani, @beamivalice, @Dankpaws, @davguij, @davidtai, @drowzeys, @GGGBB, @kmahara, @lborloz, @lojza3d, @LXD-8, @nothinglimited, @Salingo, @STRML, @thelogicalgate, @Weschera, @yGuy, @ivanfioravanti, @elkaix
 
 ---
 

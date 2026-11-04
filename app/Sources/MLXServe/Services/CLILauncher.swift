@@ -315,8 +315,8 @@ final class CLILauncher: ObservableObject {
 
 /// Small-window alert before an agent launches: the agent takes the whole
 /// screen, so a line in its terminal is never seen.
-func warnIfSmallContext(agentId: String, context: Int) {
-    guard let text = AgentBudget.contextWarning(agentId: agentId, context: context) else { return }
+func warnIfSmallContext(agentId: String, budget: AgentBudget.Budget) {
+    guard let text = AgentBudget.contextWarning(agentId: agentId, budget: budget) else { return }
     MainActor.assumeIsolated {
         let alert = NSAlert()
         alert.messageText = L10n.text("Small context window")
@@ -404,7 +404,7 @@ extension LauncherCLI {
             try? config.write(toFile: path, atomically: true, encoding: .utf8)
             let settingsPath = (dir as NSString).appendingPathComponent("settings.json")
             let existing = (try? String(contentsOfFile: settingsPath, encoding: .utf8)) ?? "{}"
-            try? AgentConfigs.piSettingsJSON(existing: existing, context: budget.context)
+            try? AgentConfigs.piSettingsJSON(existing: existing, budget: budget)
                 .write(toFile: settingsPath, atomically: true, encoding: .utf8)
             // Global context file — pi injects it into every session's system
             // prompt (same builder the sandbox registry materializes in-guest).
@@ -471,7 +471,14 @@ extension LauncherCLI {
         binaryName: "codex",
         iconSystemName: "chevron.left.forwardslash.chevron.right",
         useClaudeIcon: false,
-        prepareConfig: nil,
+        prepareConfig: { _, _, _, _ in
+            let dir = NSString(string: "~/.mlx-serve/codex").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            if let text = AgentConfigs.codexInstructionsText() {
+                try? text.write(toFile: (dir as NSString).appendingPathComponent("model-instructions.md"),
+                                atomically: true, encoding: .utf8)
+            }
+        },
         fallbackPaths: [
             "/Applications/ChatGPT.app/Contents/Resources/codex",
             "/Applications/Codex.app/Contents/Resources/codex",
@@ -480,10 +487,12 @@ extension LauncherCLI {
         ],
         resumeArgs: "resume --last",
         scriptBody: { baseURL, model, cdLine, budget, _ in
-            """
+            let args = AgentConfigs.codexConfigArgs(baseURL: baseURL, model: model, budget: budget)
+            return """
             \(AgentConfigs.codexBinResolver)
             \(cdLine)
-            "$CODEX_BIN" \(AgentConfigs.codexConfigArgs(baseURL: baseURL, model: model, budget: budget)) "$@"
+            \(AgentConfigs.codexLaunchGate(args: args))
+            codex_launch "$@"
             """
         }
     )

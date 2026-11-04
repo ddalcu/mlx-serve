@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Model Browser: five sections (`ModelBrowserSection`), switched by the bar
+/// Model Browser: six sections (`ModelBrowserSection`), switched by the bar
 /// across the top of the content area.
 struct ModelBrowserPane: View {
     /// Which section is showing. The pane's own bar drives it: the sidebar is
@@ -33,6 +33,7 @@ struct ModelBrowserPane: View {
             + readyCount(VideoModelPreset.all)
             + readyCount(MusicModelPreset.all)
             + readyCount(SoundModelPreset.all)
+            + readyCount(Model3DModelPreset.modelBrowserCatalog)
         return .live(localModelCount: appState.localModels.count,
                      activeDownloadCount: activeDownloads.count,
                      mediaReadyCount: media)
@@ -84,13 +85,14 @@ struct ModelBrowserPane: View {
         case .myModels:     MyModelsPane(filter: $localFilter)
         case .downloads:    DownloadsPane(items: activeDownloads)
         case .media:        MediaPane()
+        case .plugins:      PluginsPane()
         }
     }
 }
 
 // MARK: - Section bar
 
-/// The browser's five sections, across the top of the content area.
+/// The browser's six sections, across the top of the content area.
 private struct ModelBrowserSectionBar: View {
     @Binding var section: ModelBrowserSection
     let badges: ModelBrowserBadgeCounts
@@ -248,8 +250,8 @@ private struct RecommendedModelTable: View {
 
     private var families: [Family] {
         [
-            Family(id: "gemma", title: "Gemma 4", systemImage: "g.circle", tint: .blue,
-                   picks: RecommendedModelPick.gemmaCatalog),
+            Family(id: "liquid", title: "Liquid LFM3", systemImage: "waveform.and.person.filled", tint: .purple,
+                   picks: RecommendedModelPick.liquidCatalog),
             Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
                    picks: RecommendedModelPick.qwenCatalog),
             Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
@@ -413,7 +415,7 @@ private struct RecommendedModelTableRow: View {
     /// The other half of the catalogue — see `ModelBrowserUse.mediaModel`.
     private var usableMedia: (model: LocalModel, modality: MediaModality)? {
         let path = pick.ggufFilename != nil ? ggufFilePath : downloads.existingModelDir(for: pick.repoId)
-        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels)
+        return ModelBrowserUse.mediaModel(atPath: path, in: appState.localModels, rows: appState.server.allModels)
     }
 
     var body: some View {
@@ -635,7 +637,7 @@ private struct DiscoverPane: View {
                 .cornerRadius(8)
 
                 // Weight-format filter: MLX (safetensors), GGUF (llama.cpp /
-                // ds4), or Both. Re-runs the search on change.
+                // ds4), or Other (ModelOpt packs served as published). Re-runs the search on change.
                 Picker("Format", selection: $searchService.format) {
                     ForEach(ModelFormat.allCases) { f in
                         Text(L10n.text(f.label)).tag(f)
@@ -747,6 +749,8 @@ private struct MyModelsPane: View {
     @EnvironmentObject var downloads: DownloadManager
 
     @State private var freeDiskSpace: String = ""
+    /// Measured pane width, as in Discover: decides whether the Settings column fits.
+    @State private var paneWidth: CGFloat = 0
     @State private var sweepItems: [(model: LocalModel, check: UpdateCheck)] = []
     @State private var showSweepAlert = false
 
@@ -755,6 +759,8 @@ private struct MyModelsPane: View {
     }
 
     private var total: Int { groups.reduce(0) { $0 + $1.models.count } }
+
+    private var showsSettings: Bool { ModelBrowserMetrics.showsLocalSettings(forDetailWidth: paneWidth) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -779,10 +785,14 @@ private struct MyModelsPane: View {
             HStack(spacing: 8) {
                 Text("Model")
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if showsSettings {
+                    Text("Settings")
+                        .frame(width: ModelBrowserMetrics.localSettingsWidth, alignment: .leading)
+                }
                 Text("Size on Disk")
-                    .frame(width: 90, alignment: .trailing)
+                    .frame(width: ModelBrowserMetrics.localSizeWidth, alignment: .trailing)
                 Text("")
-                    .frame(width: 120)
+                    .frame(width: ModelBrowserMetrics.localActionsWidth)
             }
             .font(.app(.callout).weight(.semibold))
             .foregroundStyle(.secondary)
@@ -797,7 +807,7 @@ private struct MyModelsPane: View {
                     ForEach(groups) { group in
                         Section {
                             ForEach(group.models) { model in
-                                LocalModelRow(model: model)
+                                LocalModelRow(model: model, showsSettings: showsSettings)
                                 Divider().padding(.horizontal, 12)
                             }
                         } header: {
@@ -874,6 +884,13 @@ private struct MyModelsPane: View {
                      : PackUpdateCheck.sweepMessage(sweepItems))
             }
         }
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { paneWidth = geo.size.width }
+                    .onChange(of: geo.size.width) { _, w in paneWidth = w }
+            }
+        )
         .navigationTitle("My Models")
         .onAppear {
             updateDiskSpace()
@@ -932,10 +949,11 @@ private struct DownloadsPane: View {
 
 // MARK: - Media pane
 
-/// Every media-generation model (image/audio/video/music), grouped by
-/// modality. Its own sidebar destination — there's one catalog per modality
-/// and none of them are large enough to need Discover-style search, so one
-/// scrollable page beats splitting each modality into its own sidebar row.
+/// Every media-generation model (image/audio/video/music/sound), plus the
+/// recommended 3D one, grouped by modality. Its own sidebar destination —
+/// there's one catalog per modality and none of them are large enough to need
+/// Discover-style search, so one scrollable page beats splitting each
+/// modality into its own sidebar row.
 private struct MediaPane: View {
     private var physicalMemory: UInt64 { ProcessInfo.processInfo.physicalMemory }
 
@@ -985,6 +1003,14 @@ private struct MediaPane: View {
                 ) {
                     ForEach(SoundModelPreset.all) { MediaModelRow(preset: $0, modality: .sound, physicalMemoryBytes: physicalMemory) }
                 }
+                ModelGroupSection(
+                    title: "3D",
+                    subtitle: "Photo to 3D: one picture in, a 3D Gaussian splat out.",
+                    systemImage: "cube.transparent",
+                    tint: .purple
+                ) {
+                    ForEach(Model3DModelPreset.modelBrowserCatalog) { MediaModelRow(preset: $0, modality: .mesh, physicalMemoryBytes: physicalMemory) }
+                }
             }
             .padding(16)
         }
@@ -1023,7 +1049,7 @@ private struct ModelGroupSection<Content: View>: View {
     }
 }
 
-/// One row for any media preset (image/audio/video/music) — generic over
+/// One row for any media preset — generic over
 /// `MediaModelPreset` so the four modalities share this instead of four
 /// near-duplicate views. Download/progress/retry mirrors `BundleDownloadBar`.
 ///
@@ -1182,15 +1208,19 @@ private struct UseModelButton: View {
     @Environment(\.openWindow) private var openWindow
     @State private var isLoading = false
 
+    /// Load `path` as the server's model and, once it answers, open chat.
+    static func useAndOpenChat(path: String, appState: AppState, openWindow: OpenWindowAction) async {
+        if await appState.useModelAndAwaitReady(atPath: path) {
+            AppActivation.openWindow(id: "chat", using: openWindow)
+        }
+    }
+
     var body: some View {
         Button {
             Task {
                 isLoading = true
-                let ready = await appState.useModelAndAwaitReady(atPath: path)
+                await Self.useAndOpenChat(path: path, appState: appState, openWindow: openWindow)
                 isLoading = false
-                if ready {
-                    AppActivation.openWindow(id: "chat", using: openWindow)
-                }
             }
         } label: {
             if isLoading {
@@ -1538,18 +1568,18 @@ private struct ModelBrowserRow: View {
         return CustomMediaModels.bundle(arch: arch, repoId: model.id)
     }
 
-    /// Start (or resume) this row's download. The media arm also asks the
-    /// running server to rescan afterward — boot-time discovery can't see a
-    /// model downloaded mid-session, and the media panes' "On This Mac" rows
-    /// read `/v1/models`.
+    /// Start (or resume) this row's download, then ask the running server to
+    /// rescan: boot-time discovery can't see a model downloaded mid-session,
+    /// and `/v1/models` is what the media panes and API clients read.
     private func startDownload() {
+        let finished: @MainActor () -> Void = {
+            appState.refreshModels()
+            server.rescanModels()
+        }
         if let b = mediaBundle {
-            downloads.startBundle(b) {
-                appState.refreshModels()
-                server.rescanModels()
-            }
+            downloads.startBundle(b, onFinish: finished)
         } else {
-            downloads.start(repoId: model.id) { appState.refreshModels() }
+            downloads.start(repoId: model.id, onFinish: finished)
         }
     }
 
@@ -1596,6 +1626,8 @@ private struct ModelBrowserRow: View {
                         } else {
                             ModelUseBadge(state: use)
                         }
+                    } else if let decision = ModelBrowserUse.decisionModel(atPath: downloads.existingModelDir(for: model.id), in: appState.localModels) {
+                        UseDecisionModelButton(path: decision.path, name: decision.name)
                     } else if let media = usableMedia {
                         UseMediaModelButton(modality: media.modality, name: media.model.name)
                     } else {
@@ -1676,6 +1708,41 @@ private struct ModelBrowserRow: View {
     }
 }
 
+/// A shelf repo's action cell: the menu of builds, as a split button whose
+/// primary click is Use when only one build is on disk (`usePath`).
+private struct ShelfMenu<Content: View>: View {
+    let label: String
+    let usePath: String?
+    let useName: String
+    @ViewBuilder let content: Content
+    @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+        Group {
+            if let usePath {
+                Menu {
+                    content
+                } label: {
+                    Text("Use").font(.app(.body))
+                } primaryAction: {
+                    Task { await UseModelButton.useAndOpenChat(path: usePath, appState: appState, openWindow: openWindow) }
+                }
+                .help("Load \(useName) as the server's model, then open chat")
+            } else {
+                Menu {
+                    content
+                } label: {
+                    Text(verbatim: label).font(.app(.body))
+                }
+            }
+        }
+        .menuStyle(.button)
+        .controlSize(.small)
+        .fixedSize()
+    }
+}
+
 /// The action cell for a GGUF repo: one menu covering every quant, in every
 /// state.
 private struct GgufQuantMenu: View {
@@ -1707,7 +1774,13 @@ private struct GgufQuantMenu: View {
 
     var body: some View {
         let m = menu
-        Menu {
+        let label = GgufQuantMenuModel.buttonLabel(
+            onDisk: m.onDisk,
+            failed: state?.status == .failed,
+            hasPartial: downloads.hasPartialDownload(repoId)
+        )
+        let only = ModelBrowserUse.shelfPrimaryUse(onDisk: m.onDisk.compactMap(path(of:)), selected: appState.selectedModelPath)
+        ShelfMenu(label: label, usePath: only, useName: m.onDisk.first?.label ?? repoId) {
             if !m.onDisk.isEmpty {
                 Section("On this Mac") {
                     ForEach(m.onDisk) { quant in
@@ -1755,18 +1828,7 @@ private struct GgufQuantMenu: View {
                     }
                 }
             }
-        } label: {
-            Text(L10n.text(
-                GgufQuantMenuModel.buttonLabel(
-                onDisk: m.onDisk,
-                failed: state?.status == .failed,
-                hasPartial: downloads.hasPartialDownload(repoId)
-            )
-)).font(.app(.body))
         }
-        .menuStyle(.button)
-        .controlSize(.small)
-        .fixedSize()
         .task {
             guard !loaded else { return }
             remote = await downloads.listGgufFiles(repoId: repoId)
@@ -1820,7 +1882,13 @@ private struct MlxVariantMenu: View {
 
     var body: some View {
         let m = menu
-        Menu {
+        let label = MlxVariantMenuModel.buttonLabel(
+            onDisk: m.onDisk,
+            failed: state?.status == .failed,
+            hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
+        )
+        let only = ModelBrowserUse.shelfPrimaryUse(onDisk: m.onDisk.compactMap(path(of:)), selected: appState.selectedModelPath)
+        ShelfMenu(label: label, usePath: only, useName: m.onDisk.first?.label ?? repoId) {
             if !m.onDisk.isEmpty {
                 Section("On this Mac") {
                     ForEach(m.onDisk) { v in
@@ -1864,18 +1932,7 @@ private struct MlxVariantMenu: View {
                     }
                 }
             }
-        } label: {
-            Text(L10n.text(
-                MlxVariantMenuModel.buttonLabel(
-                onDisk: m.onDisk,
-                failed: state?.status == .failed,
-                hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
-            )
-)).font(.app(.body))
         }
-        .menuStyle(.button)
-        .controlSize(.small)
-        .fixedSize()
         .alert("Delete Quantization", isPresented: .init(
             get: { pendingDelete != nil },
             set: { if !$0 { pendingDelete = nil } }
@@ -1895,10 +1952,59 @@ private struct MlxVariantMenu: View {
     }
 }
 
+// MARK: - Settings column
+
+/// One setting chip. Green is the speculation stone (the gem the name line used
+/// to carry), orange is anything that changes the output distribution.
+private struct OverrideBadgeChip: View {
+    let badge: OverrideBadge
+
+    private var tint: Color {
+        badge.lossy ? .orange : (badge.gem == nil ? .secondary : .green)
+    }
+
+    var body: some View {
+        HStack(spacing: 3) {
+            if let stone = badge.gem { GemIcon(name: "gem-\(stone.rawValue).png") }
+            Text(verbatim: badge.text)
+                .font(.app(.caption2).weight(.semibold))
+                .foregroundStyle(tint)
+                .lineLimit(1)
+            if badge.gem != nil, badge.lossy { GemIcon(name: "gem-skull.png") }
+        }
+        .padding(.leading, badge.gem == nil ? 5 : 2).padding(.trailing, 5).padding(.vertical, 1)
+        .background(tint.opacity(0.15), in: Capsule())
+        .fixedSize()
+        .help(badge.help)
+    }
+}
+
+private struct OverrideBadgeStrip: View {
+    let badges: [OverrideBadge]
+
+    var body: some View {
+        let split = ModelOverrideBadges.overflow(badges)
+        HStack(spacing: 4) {
+            ForEach(split.shown) { OverrideBadgeChip(badge: $0) }
+            if !split.hidden.isEmpty {
+                Text(verbatim: "+\(split.hidden.count)")
+                    .font(.app(.caption2).weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 5).padding(.vertical, 1)
+                    .background(Color.secondary.opacity(0.12), in: Capsule())
+                    .fixedSize()
+                    .help(split.hidden.map(\.help).joined(separator: "\n"))
+            }
+        }
+        .frame(width: ModelBrowserMetrics.localSettingsWidth, alignment: .leading)
+    }
+}
+
 // MARK: - Local Model Row
 
 private struct LocalModelRow: View {
     let model: LocalModel
+    let showsSettings: Bool
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -1910,7 +2016,7 @@ private struct LocalModelRow: View {
     @State private var card: ModelCardRequest?
     @State private var settings: ModelSettingsRequest?
     @State private var hasOverrides = false
-    @State private var badge = SocketBadge(stone: nil, skull: false)
+    @State private var settingBadges: [OverrideBadge] = []
     @State private var confirmReplace: UpdateCheck?
 
     private var settingsRequest: ModelSettingsRequest {
@@ -1938,9 +2044,14 @@ private struct LocalModelRow: View {
     private func refreshOverrides() {
         let o = ModelSettingsFile.load().override(for: model.path)
         hasOverrides = o?.hasSettings ?? false
-        guard model.isChatPickable, model.quantFile == nil else { return }
-        badge = DrafterGems.badge(o ?? ModelOverride(), modelDir: model.path, hasMtpHead: model.hasMtpHead,
-                                  options: appState.serverOptions)
+        guard model.isChatPickable else { return settingBadges = [] }
+        let override = o ?? ModelOverride()
+        let socket = model.quantFile == nil
+            ? DrafterGems.badge(override, modelDir: model.path, hasMtpHead: model.hasMtpHead, options: appState.serverOptions)
+            : SocketBadge(stone: nil, skull: false)
+        settingBadges = ModelOverrideBadges.badges(override, modelType: model.modelType,
+                                                   engines: ModelSettingsApply.row(for: model.path, in: appState.server.allModels)?.engines,
+                                                   socket: socket)
     }
 
     private func revealInFinder() {
@@ -1998,18 +2109,6 @@ private struct LocalModelRow: View {
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(Color.purple.opacity(0.15), in: Capsule())
                             .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
-                    }
-                    if let stone = badge.stone {
-                        HStack(spacing: 3) {
-                            GemIcon(name: "gem-\(stone.rawValue).png")
-                            Text(stone.badge)
-                                .font(.app(.caption2).weight(.semibold))
-                                .foregroundStyle(.green)
-                            if badge.skull { GemIcon(name: "gem-skull.png") }
-                        }
-                        .padding(.leading, 2).padding(.trailing, 5).padding(.vertical, 1)
-                        .background(Color.green.opacity(0.15), in: Capsule())
-                        .help(badge.skull ? "\(stone.label), lossy acceptance (Typical / TokenV3)" : stone.label)
                     }
                 }
                 // The id itself, under the readable name.
@@ -2069,10 +2168,14 @@ private struct LocalModelRow: View {
             .disabled(cardRequest == nil)
             .frame(maxWidth: .infinity, alignment: .leading)
 
+            if showsSettings {
+                OverrideBadgeStrip(badges: settingBadges)
+            }
+
             Text(L10n.text(model.sizeFormatted))
                 .font(.app(.callout).monospacedDigit())
                 .foregroundStyle(.secondary)
-                .frame(width: 90, alignment: .trailing)
+                .frame(width: ModelBrowserMetrics.localSizeWidth, alignment: .trailing)
 
             // Use + Delete. "Use" is the missing terminal action the browser
             // never had — before this, the only thing you could do with a model
@@ -2088,7 +2191,7 @@ private struct LocalModelRow: View {
                     }
                 } else if isDecisionModelType(model.modelType) {
                     UseDecisionModelButton(path: model.path, name: model.name)
-                } else if let modality = MediaModality(modelType: model.modelType) {
+                } else if let modality = MediaModality.of(modelType: model.modelType, path: model.path, rows: appState.server.allModels) {
                     // A media checkpoint is a real, loadable, servable model —
                     // it just is not a CHAT model, and until now that meant the
                     // only verb the browser offered for it was Delete. This
@@ -2181,7 +2284,7 @@ private struct LocalModelRow: View {
                 .font(.app(.callout))
                 .help(ModelRowActions.revealHelp(model))
             }
-            .frame(width: 172, alignment: .trailing)
+            .frame(width: ModelBrowserMetrics.localActionsWidth, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)

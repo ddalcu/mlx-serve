@@ -22,6 +22,17 @@ final class PromptRewriterTests: XCTestCase {
         XCTAssertFalse(r.system.contains("integrated_multimodal_description:"))
     }
 
+    func testEveryVideoRewriteWritesTheSpokenWordsInItsModelsNotation() {
+        for format in [VideoPromptFormat.ltx, .h3Base, .h3Reference] {
+            for r in [PromptRewriter.video(text: "a man raps to camera", format: format, seconds: 15),
+                      PromptRewriter.storyboard(idea: "a man raps to camera", format: format, totalSeconds: 30, shotSeconds: 5...15)] {
+                XCTAssertTrue(r.system.contains("rapped line word for word"), "\(format)")
+                XCTAssertTrue(r.system.contains("else English"), "\(format)")
+                XCTAssertEqual(r.system.contains("<d>[Language]"), format != .ltx, "\(format)")
+            }
+        }
+    }
+
     func testVideoRewriteCapsTheActionAtTheClipLength() {
         for seconds in [2, 8] {
             let r = PromptRewriter.video(text: "a dog runs", format: .ltx, seconds: seconds)
@@ -104,6 +115,36 @@ final class PromptRewriterTests: XCTestCase {
         let r = PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10, firstFrame: png)
         XCTAssertFalse(r.user(seeingImage: false).contains("attached picture"))
         XCTAssertEqual(r.user(seeingImage: false), PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10).user)
+    }
+
+    /// Reference pictures ride along in order, with the rule that ties each to its `<Picture N>`.
+    func testReferencePicturesRideTheRequestInOrderWithTheirRule() {
+        let jpg = Data([0xFF, 0xD8, 0xFF, 9])
+        let r = PromptRewriter.video(text: "<Picture 1> meets <Picture 2>", format: .h3Reference, seconds: 10,
+                                     references: [png, jpg])
+        XCTAssertEqual(r.images, [png, jpg])
+        XCTAssertTrue(r.user(seeingImage: true).contains("<Picture 2>"))
+        XCTAssertFalse(r.user(seeingImage: true).contains("first frame"))
+        XCTAssertEqual(r.user(seeingImage: false), r.user)
+        // A first frame goes ahead of the references, each with its own rule.
+        let both = PromptRewriter.video(text: "x", format: .h3Reference, seconds: 10, firstFrame: png, references: [jpg])
+        XCTAssertEqual(both.images, [png, jpg])
+        XCTAssertTrue(both.user(seeingImage: true).contains("attached picture"))
+        XCTAssertTrue(both.user(seeingImage: true).contains("<Picture 1>"))
+    }
+
+    func testEveryEnhanceRequestThinksAtMediumWithNoOutputCap() {
+        let requests = [
+            PromptRewriter.image(text: "a fox", editing: false, groups: ImagePromptExamples.textToImage, denseText: false),
+            PromptRewriter.video(text: "they dance", format: .h3Base, seconds: 10),
+            PromptRewriter.storyboard(idea: "they dance", format: .h3Base, totalSeconds: 120, shotSeconds: 5...10),
+            MusicPromptRewriter.request(.lyrics, text: "la la", family: .acestep, other: "", instrumental: false, language: "en"),
+            MusicPromptRewriter.request(.style, text: "jazz", family: .acestep, other: "", instrumental: false, language: "en"),
+        ]
+        for r in requests {
+            XCTAssertEqual(r.maxTokens, 0, "0 = no cap: the server allows the rest of the context")
+            XCTAssertEqual(r.reasoningEffort, "medium")
+        }
     }
 
     func testNoFirstFrameMeansNoPicture() {

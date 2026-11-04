@@ -1,0 +1,50 @@
+== decision 0 343 1ec3003b7872168ea8f2ead8005b4f372133aa7790fa5853cb90e4023eff4bf0
+HTTP/1.1 200 OK
+Content-Type: application/json
+Content-Length: 220
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"model":"m","answers":{"refund":{"type":"noul","noul":0.5088},"tone":{"type":"choice","choice":"angry","confidence":0.5448,"probabilities":{"calm":0.4552,"angry":0.5448}}},"usage":{"input_tokens":674,"output_tokens":0}}
+== decision 1 175 4cd22d6c912f17fd442ac95f9650751fbb9db9c77ea737e8301eeaf09be7dba8
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 50
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"truncate must be a boolean"}}
+== decision 2 179 94ca910d610bd97049e9e19576ed029d5efcb97599afbb32272ded83d52e1bc5
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 54
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"request body is not valid JSON"}}
+== decision 3 183 cc9c9987aef7199c0ed2c87f3089ba3ff6127435cde8d03d68be4492014a6c45
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 58
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"request body must be a JSON object"}}
+== decision 4 164 e6c37f0e16fbd5ab2f0246890c1fcdf47201502d597ed29a81f4186e48f3a0a0
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 39
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"missing 'state'"}}
+== decision 5 193 fc7841e0174c5ad05e0ad116f5116328f3632fd033dac35a7a967905ccb95cf2
+HTTP/1.1 400 Error
+Content-Type: application/json
+Content-Length: 68
+Connection: close
+Access-Control-Allow-Origin: *
+
+{"error":{"message":"question type must be noul, choice, or score"}}
+== row 687 937e8c58ad1555061757b36b6206d1e2798988757129680fb8d45d46af626bcd
+{"id":"m","object":"model","created":0000000000,"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":0,"bytes_on_disk":null,"context_length":4096,"max_model_len":4096,"batched_decode":true,"capabilities":["decisions"],"input_modalities":["text"],"modality":"decisions","engines":["mlx"],"meta":{"architecture":"clef","engine":"mlx","vocab_size":262208,"hidden_size":1,"num_layers":1,"quantization":null,"context_length":4096,"model_max_tokens":4096,"embedding_max_length":null,"is_moe":false,"drafter_loaded":false,"drafter_path":null,"mtp_loaded":false,"mtp_available":false,"spec_exact":false,"kv_quant":"off","gen_temperature":null,"gen_top_p":null,"gen_top_k":null}}

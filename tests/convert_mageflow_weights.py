@@ -2,7 +2,7 @@
 """Repackage a released MageFlow repo as an 8-bit mlx-serve mirror.
 
 USER-RUN (needs mlx + the ~16 GB HF checkpoint). Not run in CI. Produces the
-diffusers-shaped dir `src/mage_flow.zig` loads, with two changes:
+diffusers-shaped dir `src/plugins/mage_flow/mage_flow.zig` loads, with two changes:
 
   (a) DiT + text-encoder linears affine-quantized (default 8-bit, group 64), so
       the DiT/TE roughly halve. `MfLinear` in the engine picks dense-vs-quantized
@@ -40,7 +40,7 @@ PRUNING (a wrong prune fails LOUDLY at load — `ownWeight` errors on a missing
 key — so this is safe to be aggressive about):
 
   - `pipeline.y_embedder.encoder.*` (~69 MB): the VAE's training-time encoder
-    half. Nothing in src/mage_flow.zig loads it, in either mode.
+    half. Nothing in src/plugins/mage_flow/mage_flow.zig loads it, in either mode.
   - `model.visual.*` (~830 MB) and `student.dconv_encoder.*` (~132 MB): loaded
     only when the engine is in EDIT mode (`VisionTower`/`VaeEncoder`), so they
     are dropped unless --edit.
@@ -85,8 +85,8 @@ DROP_ALWAYS = ("pipeline.y_embedder.encoder.",)
 # Loaded only by VisionTower / VaeEncoder, i.e. only in edit mode.
 DROP_UNLESS_EDIT = ("model.visual.", "student.dconv_encoder.")
 
-# Everything the engine opens, per component dir (see src/mage_flow.zig:145-227,
-# src/model_discovery.zig:153, tokenizer.zig loadTokenizerAny).
+# Everything the engine opens, per component dir (see src/plugins/mage_flow/mage_flow.zig:145-227,
+# src/host/registry/discovery.zig:153, sdk/tokenizer/tokenizer.zig loadTokenizerAny).
 KEEP_FILES = {
     "": ["model_index.json"],
     "scheduler": ["scheduler_config.json"],

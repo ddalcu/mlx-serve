@@ -1,6 +1,6 @@
 cask "mlx-serve" do
-  version "26.10.2"
-  sha256 "2f49992cb5aca1cd91b59093d1c9f7ecf6166e842312600e1d0cd1c2574ed60a"
+  version "26.11.1"
+  sha256 "1f99937fbc5f64bd48738644063b8f36962c903495927b5aaf5e31e27e3869c0"
 
   url "https://github.com/ddalcu/mlx-serve/releases/download/v#{version}/MLX-Serve.dmg"
   name "MLX-Serve"
