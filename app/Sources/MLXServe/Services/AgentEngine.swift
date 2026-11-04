@@ -212,21 +212,8 @@ enum AgentEngine {
             if content.count > 500 {
                 content = String(content.prefix(500)) + "..."
             }
-            var dict: [String: Any] = ["role": "assistant"]
-            if !content.isEmpty { dict["content"] = content }
-            if let tcs = msg.toolCalls, !tcs.isEmpty {
-                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
-                    [
-                        "id": tc.id,
-                        "type": "function",
-                        "function": [
-                            "name": tc.name,
-                            "arguments": tc.arguments
-                        ] as [String: Any]
-                    ]
-                }
-            }
-            history.append(dict)
+            // Text only: its tool results fell outside the window, and a strict API 400s on unanswered calls.
+            history.append(["role": "assistant", "content": content])
         }
 
         // Without history images only the last user message carries its images.
@@ -235,10 +222,13 @@ enum AgentEngine {
             : nil
 
         // Emit messages from the backward-walk window.
+        var openCalls = Set<String>()
         for (i, msg) in window.enumerated() {
             if msg.failedRetry { continue }
             // Tool responses — progressive truncation once the model has answered them
             if let callId = msg.toolCallId {
+                // A result whose call fell outside the window is an orphan a strict API refuses.
+                guard openCalls.remove(callId) != nil else { continue }
                 let isRecent = toolResultsSeen >= totalToolResults - 2
                 let unanswered = lastReplyIdx.map { i > $0 } ?? true
                 let limit = unanswered ? msg.content.count : (isRecent ? recentLimit : olderLimit)
@@ -278,6 +268,7 @@ enum AgentEngine {
                         ] as [String: Any]
                     ]
                 }
+                openCalls.formUnion(tcs.map(\.id))
                 history.append(dict)
                 continue
             }

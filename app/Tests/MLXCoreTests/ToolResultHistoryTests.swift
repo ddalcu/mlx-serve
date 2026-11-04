@@ -28,6 +28,25 @@ final class ToolResultHistoryTests: XCTestCase {
         XCTAssertEqual(toolResultLengths(msgs), [7000])
     }
 
+    /// A strict API (DeepSeek, #950) 400s on a tool call without its result or a result without its call.
+    func testATruncatedHistoryPairsEveryToolCallWithItsResult() {
+        var plan = call("p")
+        plan.content = "Plan: read the files one by one."
+        var msgs = [ChatMessage(role: .user, content: "read them"), plan, result("p", 4000)]
+        for i in 0..<12 { msgs += [call("c\(i)"), result("c\(i)", 4000)] }
+        let history = AgentEngine.buildAgentHistory(messages: msgs, contextLength: 16384, maxTokens: 4096)
+        var open = Set<String>()
+        for m in history {
+            if let id = m["tool_call_id"] as? String {
+                XCTAssertNotNil(open.remove(id), "result \(id) has no call before it")
+                continue
+            }
+            XCTAssertTrue(open.isEmpty, "calls \(open) have no result")
+            for tc in (m["tool_calls"] as? [[String: Any]]) ?? [] { open.insert(tc["id"] as! String) }
+        }
+        XCTAssertTrue(open.isEmpty, "calls \(open) have no result")
+    }
+
     func testAnAnsweredResultIsStillCompacted() {
         let msgs = [ChatMessage(role: .user, content: "read it"), call("a"), result("a", 7000), call("b"), result("b", 300)]
         XCTAssertEqual(toolResultLengths(msgs), [2000, 300])
