@@ -329,6 +329,7 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
         error.InsufficientMemory => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503),
         error.LoadFailed => try sendLoadFailedResponse(allocator, stream, sched, id),
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
+        error.DistWorkerNotJoined => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "worker_not_joined", "This model is served with a second Mac that has not joined: start `mlx-serve worker` there, then retry", 503),
         error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
         error.ForeignBytesReaderBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another DeepSeek-V4.1 or GLM-5.3 stream pack is in use; retry when its request finishes", 503),
         // Other errors (CPU-side preload failures like FileNotFound on a

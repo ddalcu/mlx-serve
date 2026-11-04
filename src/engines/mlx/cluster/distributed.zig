@@ -236,6 +236,12 @@ const Bell = struct {
 
     fn wait(b: Bell) !void {
         if (!b.open()) return;
+        // Steps come a decode tick apart: poll that long before sleeping, so a step does not wait for the kernel to
+        // wake this thread.
+        if (comptime builtin.os.tag == .macos) {
+            var fds = [_]std.posix.pollfd{.{ .fd = b.fd, .events = std.posix.POLL.IN, .revents = 0 }};
+            for (0..spin_polls) |_| if ((std.posix.poll(&fds, 0) catch break) > 0) break;
+        }
         var x: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(b.fd, &x, 1);
@@ -245,6 +251,9 @@ const Bell = struct {
         }
     }
 };
+
+/// Zero-timeout polls `Bell.wait` makes before it blocks: some 50 ms.
+const spin_polls = 50_000;
 
 const Coordinator = struct { ip4: [4]u8, port: u16 };
 
@@ -269,6 +278,15 @@ pub const OP_H3_JOB = wire.OP_H3_JOB;
 pub const OP_H3_STEP = wire.OP_H3_STEP;
 pub const OP_H3_END = wire.OP_H3_END;
 const OP_DSV41: i32 = 7;
+const OP_DSV41_TP: i32 = 9;
+/// Tensor parallel: one batched step over several states, then the states' positions and ids.
+const OP_DSV41_TP_BATCH: i32 = 10;
+/// Tensor parallel: rank 0 dropped a state; the others drop theirs.
+const OP_DSV41_TP_FREE: i32 = 11;
+/// Tensor parallel: what rank 0 did with a prefix-cache snapshot (`dsv41.SnapOp`), for the others' copies.
+const OP_DSV41_TP_SNAP: i32 = 12;
+/// Tensor parallel: a snapshot rank 0 read from disk (`dsv41.tpLoadPlan`'s tensors), the worker's copy of its cache.
+const OP_DSV41_TP_LOAD: i32 = 13;
 pub const OP_RELEASE = wire.OP_RELEASE;
 
 /// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
@@ -594,6 +612,13 @@ const ClusterState = struct {
     /// Round trips since the last timing line, and their totals (µs): the whole exchange and the
     /// worker's share of it.
     timing: struct { n: u32 = 0, round_us: u64 = 0, worker_us: u64 = 0 } = .{},
+    /// DeepSeek-V4.1 tensor: the link the forward's sums run over (either rank), and the sums built since the last step
+    /// began, which every rank must match step by step.
+    tp_link: ?*const Link = null,
+    tp_sums: u32 = 0,
+    /// Values summed this step: the ranks agree on it as on the count, or their sums pair up wrong.
+    tp_values: usize = 0,
+    tp_last: struct { p0: usize = 0, rows: usize = 0 } = .{},
     /// What the worker said about the group's model when it joined: 0 has it, else NOT_FOUND or
     /// MISMATCH (-1 = not asked: no bell connection).
     worker_copy: std.atomic.Value(i32) = .init(-1),
@@ -734,6 +759,7 @@ fn shareFor(g: Group, config: *const model_mod.ModelConfig, whole: u64, mine: u6
     const n: u64 = config.num_hidden_layers;
     if (theirs == 0) return whole;
     if (config.isDsv41()) {
+        if (g.mode == .tensor) return whole / 2 + whole / 10;
         const r = dsv41_mod.pairRange(config, mine, theirs) orelse return whole;
         return whole * (n - (r[1] - r[0])) / n;
     }
@@ -861,11 +887,29 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8
 /// DeepSeek-V4.1: the worker takes a run of layers its share of the memory holds, cut where
 /// no layer reads another Mac's state (`deepseek_v41.pairRange`); the stream and mix cross twice.
 fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8) !void {
-    if (self.mode != .pipeline) {
-        log.err("[dist] {s}: DeepSeek-V4.1 splits by layers only (--dist pipeline)\n", .{self.model});
-        return error.DistArchUnsupported;
-    }
     const n = config.num_hidden_layers;
+    switch (self.mode) {
+        .pipeline => {},
+        .tensor => {
+            self.shard = .{ .rank = 0, .size = 2 };
+            log.info("[dist] tensor: every expert and attention head of {s} split across this Mac and the worker\n", .{std.fs.path.basename(self.model)});
+            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts) };
+            self.plan_id = try pl.send(&self.link, model_dir);
+            self.planned = true;
+            cluster().tp_link = &self.link;
+            dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
+            dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
+            dsv41_mod.clusterHooks().tp_batch = &dsv41TpBatch;
+            dsv41_mod.clusterHooks().tp_free = &dsv41TpFree;
+            dsv41_mod.clusterHooks().tp_snap = &dsv41TpSnap;
+            dsv41_mod.clusterHooks().tp_load = &dsv41TpLoad;
+            return;
+        },
+        .rows => {
+            log.err("[dist] {s}: DeepSeek-V4.1 splits by layers or experts (--dist pipeline|tensor)\n", .{self.model});
+            return error.DistArchUnsupported;
+        },
+    }
     const mine: u64 = status.getAvailableMemBytes() >> 20;
     const r = dsv41_mod.pairRange(config, mine, @intCast(self.worker.avail_mib)) orelse return error.DistSplitOffInterval;
     self.remote = .{ .start = @intCast(r[0]), .end = @intCast(r[1]), .total = n };
@@ -875,6 +919,137 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
     self.plan_id = try pl.send(&self.link, model_dir);
     self.planned = true;
     dsv41_mod.clusterHooks().pair_exchange = &dsv41Exchange;
+}
+
+/// DeepSeek-V4.1 tensor, every rank: `x` summed over the group, lazily on this thread's CPU stream.
+fn dsv41TpSum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const link = cluster().tp_link orelse return error.DistWorkerNotJoined;
+    cluster().tp_sums += 1;
+    cluster().tp_values += mlx.mlx_array_size(x);
+    return link.allSum(x);
+}
+
+/// The sums the step before this one built, logged where a prompt step ends or the count is not a decode step's.
+fn noteTpStep(p0: usize, rows: usize) void {
+    const c = cluster();
+    if (c.tp_last.rows > 0 and (c.tp_last.rows > 1 or c.tp_sums != 80)) log.info("[dist] tensor step at {d}: {d} rows, {d} sums of {d} values\n", .{ c.tp_last.p0, c.tp_last.rows, c.tp_sums, c.tp_values });
+    c.tp_sums = 0;
+    c.tp_values = 0;
+    c.tp_last = .{ .p0 = p0, .rows = rows };
+}
+
+/// Host, DeepSeek-V4.1 tensor: one step's ids to the worker, which runs the same forward on its halves.
+fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?mlx.mlx_array) anyerror!void {
+    const self = peer() orelse return error.DistWorkerNotJoined;
+    if (!self.ready) try self.awaitReady();
+    noteTpStep(p0, ids.len);
+    // Ids fit an int32 (the vocabulary is checked before any forward).
+    const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(a);
+    self.exchanges += 1;
+    const flags = @as(i32, @intFromBool(snap)) | @as(i32, @intFromBool(all)) << 1 | @as(i32, @intFromBool(verify)) << 2 | @as(i32, @intFromBool(images != null)) << 3;
+    // Sent now, on the CPU stream alone: `sendOrdered` chains its sends through the GPU stream, and a GPU wait on a send
+    // that blocks until the worker's receive deadlocked MLX's fast fences.
+    try sendMsg(&self.link, tpHeader(ids, p0, flags, gen), 1);
+    if (ids.len > 1) try sendNow(&self.link, a, 1);
+    if (images) |r| try sendNow(&self.link, r, 1);
+}
+
+/// Host: one batched step over the states `gens`, each at its position `p0s[k]` with its ids `chunks[k]`.
+fn dsv41TpBatch(gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void {
+    const self = peer() orelse return error.DistWorkerNotJoined;
+    if (!self.ready) try self.awaitReady();
+    var rows: usize = 0;
+    for (chunks) |ch| rows += ch.len;
+    noteTpStep(p0s[0], rows);
+    const body = try std.heap.page_allocator.alloc(i32, tpBatchLen(gens.len, rows));
+    defer std.heap.page_allocator.free(body);
+    tpBatchPack(body, gens, p0s, chunks);
+    const a = mlx.mlx_array_new_data(body.ptr, &[_]c_int{@intCast(body.len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(a);
+    self.exchanges += 1;
+    try sendMsg(&self.link, .{ OP_DSV41_TP_BATCH, @intCast(gens.len), @intCast(rows), @intFromBool(verify), 0, 0, 0, 0 }, 1);
+    try sendNow(&self.link, a, 1);
+}
+
+/// Host: the state `gen` is gone; the worker drops its copy.
+fn dsv41TpFree(gen: u64) void {
+    const self = peer() orelse return;
+    if (!self.ready) return;
+    sendMsg(&self.link, .{ OP_DSV41_TP_FREE, @intCast(gen & 0x7fffffff), @intCast(gen >> 31), 0, 0, 0, 0, 0 }, 1) catch {};
+}
+
+/// Host: the snapshot `id` it read from disk, as its ids and then `dsv41.tpLoadPlan`'s tensors in order.
+fn dsv41TpLoad(id: u64, ids: []const u32, tensors: []const mlx.mlx_array) anyerror!void {
+    const self = peer() orelse return error.DistWorkerNotJoined;
+    if (!self.ready) try self.awaitReady();
+    try sendMsg(&self.link, .{ OP_DSV41_TP_LOAD, @intCast(id & 0x7fffffff), @intCast(id >> 31), @intCast(ids.len & 0x7fffffff), @intCast(ids.len >> 31), @intCast(tensors.len), 0, 0 }, 1);
+    const a = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(a);
+    try sendNow(&self.link, a, 1);
+    for (tensors) |t| try sendNow(&self.link, t, 1);
+}
+
+/// Host: what it did with a snapshot (`dsv41.SnapOp`); the worker does the same with its copy.
+fn dsv41TpSnap(op: dsv41_mod.SnapOp, a: u64, b: u64) void {
+    const self = peer() orelse return;
+    if (!self.ready) return;
+    sendMsg(&self.link, .{ OP_DSV41_TP_SNAP, @intFromEnum(op), @intCast(a & 0x7fffffff), @intCast(a >> 31), @intCast(b & 0x7fffffff), @intCast(b >> 31), 0, 0 }, 1) catch {};
+}
+
+/// A tensor step's header: its rows, position, flags, the state it advances and, for one row, the id itself.
+fn tpHeader(ids: []const u32, p0: usize, flags: i32, gen: u64) Msg {
+    return .{ OP_DSV41_TP, @intCast(ids.len), @intCast(p0 & 0x7fffffff), @intCast(p0 >> 31), flags, if (ids.len == 1) @intCast(ids[0]) else 0, @intCast(gen & 0x7fffffff), @intCast(gen >> 31) };
+}
+
+fn joined(lo: i32, hi: i32) u64 {
+    return @as(u64, @intCast(lo)) | (@as(u64, @intCast(hi)) << 31);
+}
+
+/// A batched step's body: per state its gen and position (two halves each) and its row count, then every row's id.
+fn tpBatchLen(states: usize, rows: usize) usize {
+    return 5 * states + rows;
+}
+
+fn tpBatchPack(out: []i32, gens: []const u64, p0s: []const usize, chunks: []const []const u32) void {
+    var at = 5 * gens.len;
+    for (gens, p0s, chunks, 0..) |g, p, ch, k| {
+        out[5 * k ..][0..5].* = .{ @intCast(g & 0x7fffffff), @intCast(g >> 31), @intCast(p & 0x7fffffff), @intCast(p >> 31), @intCast(ch.len) };
+        for (ch, out[at..][0..ch.len]) |t, *o| o.* = @intCast(t);
+        at += ch.len;
+    }
+}
+
+/// State `k` of a batched step's body: its gen, position and ids (pointing into `body`).
+fn tpBatchState(body: []const i32, states: usize, k: usize) struct { gen: u64, p0: usize, ids: []const u32 } {
+    var at = 5 * states;
+    for (0..k) |j| at += @intCast(body[5 * j + 4]);
+    const e = body[5 * k ..][0..5];
+    const ids: [*]const u32 = @ptrCast(body.ptr + at);
+    return .{ .gen = joined(e[0], e[1]), .p0 = @intCast(joined(e[2], e[3])), .ids = ids[0..@intCast(e[4])] };
+}
+
+test "tensor step header: one id and the state's gen ride in it" {
+    const m = tpHeader(&.{129279}, (1 << 33) + 5, 4, (1 << 40) + 3);
+    try std.testing.expectEqual(@as(i32, 129279), m[5]);
+    try std.testing.expectEqual(@as(i32, 4), m[4]);
+    try std.testing.expectEqual(@as(u64, (1 << 33) + 5), joined(m[2], m[3]));
+    try std.testing.expectEqual(@as(u64, (1 << 40) + 3), joined(m[6], m[7]));
+    try std.testing.expectEqual(@as(i32, 0), tpHeader(&.{ 1, 2 }, 0, 0, 1)[5]);
+}
+
+test "tensor batched step body: every state's gen, position and ids come back in order" {
+    const gens = [_]u64{ 7, (1 << 35) + 1 };
+    const p0s = [_]usize{ 40, (1 << 32) + 9 };
+    const chunks = [_][]const u32{ &.{ 5, 6, 7 }, &.{129279} };
+    var body: [tpBatchLen(2, 4)]i32 = undefined;
+    tpBatchPack(&body, &gens, &p0s, &chunks);
+    for (0..2) |k| {
+        const e = tpBatchState(&body, 2, k);
+        try std.testing.expectEqual(gens[k], e.gen);
+        try std.testing.expectEqual(p0s[k], e.p0);
+        try std.testing.expectEqualSlices(u32, chunks[k], e.ids);
+    }
 }
 
 /// Host, DeepSeek-V4.1: one step's stream and mix through the worker's layers and back.
@@ -905,10 +1080,17 @@ fn noteRoundTrip(us: i64) void {
     cluster().timing = .{};
 }
 
-/// Worker, DeepSeek-V4.1: its run of layers (`pl.span`), then one step per OP_DSV41 until
-/// rank 0 stops it.
+/// Worker, DeepSeek-V4.1: its run of layers (`pl.span`) and one step per OP_DSV41, or the whole model on its half of
+/// every expert and attention head and one step per OP_DSV41_TP, until rank 0 stops it.
 fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: []const u8, config: *model_mod.ModelConfig, pl: Plan) !bool {
-    config.dist_dsv41 = .{ .lo = pl.span.start, .hi = pl.span.end, .worker = true };
+    switch (pl.mode) {
+        .tensor => config.applyShard(.{ .rank = 1, .size = 2 }) catch |err| {
+            log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
+            sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
+            return err;
+        },
+        else => config.dist_dsv41 = .{ .lo = pl.span.start, .hi = pl.span.end, .worker = true },
+    }
     var w = model_mod.loadModelWeights(io, allocator, dir, config, false) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
@@ -916,12 +1098,23 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     };
     defer w.deinit();
     const binding = config.plugin orelse return error.NotPluginServed;
-    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41 }) catch |err| {
+    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;
     };
     defer m.deinit();
+    cluster().tp_link = link;
+    dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
+    defer {
+        dsv41_mod.clusterHooks().tp_sum = null;
+        cluster().tp_link = null;
+    }
+    // Rank 0's other live states (its parked slots and idle state), by gen; the module holds the one it advances.
+    var parked: dsv41_mod.Parked = .init(allocator);
+    defer dsv41_mod.dropParked(&parked);
+    var snaps: dsv41_mod.Snaps = .init(allocator);
+    defer dsv41_mod.dropSnaps(&snaps, allocator);
     var active: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     try sendMsg(link, .{ MAGIC, 0, mib(active), 0, 0, 0, 0, 0 }, 0);
@@ -952,6 +1145,74 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 steps += 1;
                 if (msg[1] > 1 or steps % 256 == 0) log.info("[dist] worker: step {d}: {d} rows at {d}\n", .{ steps, msg[1], p0 });
             },
+            OP_DSV41_TP => {
+                const p0: usize = @as(usize, @intCast(msg[2])) | (@as(usize, @intCast(msg[3])) << 31);
+                const L: usize = @intCast(msg[1]);
+                var one = [_]u32{@intCast(msg[5])};
+                var sent: mlx.mlx_array = .{ .ctx = null };
+                defer if (sent.ctx != null) {
+                    _ = mlx.mlx_array_free(sent);
+                };
+                const ids = if (L == 1) one[0..] else blk: {
+                    sent = try queuedRecv(link, &.{msg[1]}, .int32, 0);
+                    const data = mlx.mlx_array_data_int32(sent) orelse return error.NoData;
+                    break :blk @as([*]const u32, @ptrCast(data))[0..L];
+                };
+                // Bit 3: the rows of the chunk's image positions follow, one per position.
+                var images: mlx.mlx_array = .{ .ctx = null };
+                defer if (images.ctx != null) {
+                    _ = mlx.mlx_array_free(images);
+                };
+                if (msg[4] & 8 != 0) images = try queuedRecv(link, &.{ @intCast(m.imageRows(ids)), @intCast(m.cfg.hidden_size) }, m.act, 0);
+                noteTpStep(p0, L);
+                try dsv41_mod.tpWorkerStep(m, allocator, &parked, joined(msg[6], msg[7]), ids, p0, msg[4] & 1 != 0, if (msg[4] & 2 != 0) .all else .last, msg[4] & 4 != 0, if (images.ctx != null) images else null);
+                steps += 1;
+            },
+            OP_DSV41_TP_BATCH => {
+                const n: usize = @intCast(msg[1]);
+                const rows: usize = @intCast(msg[2]);
+                const sent = try queuedRecv(link, &.{@intCast(tpBatchLen(n, rows))}, .int32, 0);
+                defer _ = mlx.mlx_array_free(sent);
+                const body = (mlx.mlx_array_data_int32(sent) orelse return error.NoData)[0..tpBatchLen(n, rows)];
+                var gens: [dsv41_mod.region_rows]u64 = undefined;
+                var p0s: [dsv41_mod.region_rows]usize = undefined;
+                var chunks: [dsv41_mod.region_rows][]const u32 = undefined;
+                if (n == 0 or n > gens.len) return error.DistBadMessage;
+                for (0..n) |k| {
+                    const e = tpBatchState(body, n, k);
+                    gens[k] = e.gen;
+                    p0s[k] = e.p0;
+                    chunks[k] = e.ids;
+                }
+                noteTpStep(p0s[0], rows);
+                try dsv41_mod.tpWorkerBatch(m, allocator, &parked, gens[0..n], p0s[0..n], chunks[0..n], msg[3] != 0);
+                steps += 1;
+            },
+            OP_DSV41_TP_FREE => dsv41_mod.tpWorkerFree(m, &parked, joined(msg[1], msg[2])),
+            OP_DSV41_TP_SNAP => {
+                const op = std.enums.fromInt(dsv41_mod.SnapOp, msg[1]) orelse return error.DistBadMessage;
+                try dsv41_mod.tpWorkerSnap(m, allocator, &parked, &snaps, op, joined(msg[2], msg[3]), joined(msg[4], msg[5]));
+            },
+            OP_DSV41_TP_LOAD => {
+                const n: usize = @intCast(joined(msg[3], msg[4]));
+                const sent = try queuedRecv(link, &.{@intCast(n)}, .int32, 0);
+                defer _ = mlx.mlx_array_free(sent);
+                const ids = @as([*]const u32, @ptrCast(mlx.mlx_array_data_int32(sent) orelse return error.NoData))[0..n];
+                const p = try dsv41_mod.tpLoadPlan(m, n);
+                if (p.len != @as(usize, @intCast(msg[5]))) return error.DistPeerDiverged;
+                const xs = try allocator.alloc(mlx.mlx_array, p.len);
+                var got: usize = 0;
+                defer {
+                    for (xs[0..got]) |x| _ = mlx.mlx_array_free(x);
+                    allocator.free(xs);
+                }
+                for (p.specs(), xs) |spec, *x| {
+                    const shape = [_]c_int{ @intCast(spec.rows), @intCast(spec.width) };
+                    x.* = try queuedRecv(link, shape[0..spec.rank()], spec.dtype, 0);
+                    got += 1;
+                }
+                try dsv41_mod.tpWorkerLoad(m, allocator, &snaps, joined(msg[1], msg[2]), ids, xs);
+            },
             else => return error.DistBadMessage,
         }
     }
@@ -979,10 +1240,18 @@ fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
 /// inference thread, when `model` loads (`planFor`).
 pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32) !void {
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable; // a cluster exists only on macOS
+    preferFastSynch();
     cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
     h3_split.hooks().* = .{ .serves = &serves, .plan_rows = &rowsPair, .note_job = &noteJob };
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
     t.detach();
+}
+
+/// The collectives run on the CPU stream between GPU work, and MLX's default fence waits on a command buffer at each
+/// hand-off (~0.3 ms, two a tensor layer); its shared-memory fences take microseconds. MLX reads the switch once, at its
+/// first fence, so it is set before anything runs; an explicit value wins.
+fn preferFastSynch() void {
+    if (env.get(.MLX_METAL_FAST_SYNCH) == null) env.set(.MLX_METAL_FAST_SYNCH, "1");
 }
 
 fn waitForWorker(io: std.Io, cfg: Config) void {
@@ -1112,6 +1381,7 @@ fn sameModel(io: std.Io, allocator: std.mem.Allocator, parts: []const []const u8
 pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const u8) !void {
     // JACCL (RDMA over Thunderbolt) exists only on macOS.
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable;
+    preferFastSynch();
     var roots: std.ArrayList([]const u8) = .empty;
     defer roots.deinit(allocator);
     var rest: std.ArrayList([]const u8) = .empty;
@@ -1209,7 +1479,10 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
         fail.send(link, MISMATCH);
         return error.DistModelMismatch;
     }
-    if (config.isDsv41()) return serveDsv41(io, allocator, link, dir, &config, pl);
+    if (config.isDsv41()) return serveDsv41(io, allocator, link, dir, &config, pl) catch |err| {
+        log.err("[dist] worker: {s}\n", .{@errorName(err)});
+        return err;
+    };
     var xfm = load(io, allocator, dir, &config, pl.mode, pl.span) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         fail.send(link, LOAD_FAILED);
@@ -1345,12 +1618,65 @@ fn evalOne(a: mlx.mlx_array) !void {
     try mlx.check(mlx.mlx_array_eval(a));
 }
 
+/// `--chain`: a decode-shaped tensor-parallel token, `layers` x (a one-row matmul on the GPU, then an all_sum),
+/// built as one graph and evaluated once, against the same token evaluated layer by layer, and without the all_sums.
+fn chainProbe(io: std.Io, link: *const Link, s: mlx.mlx_stream) !void {
+    const d: c_int = 5120;
+    const layers = 40;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ d, d }, 2, .bfloat16, 0, 1.0 / @sqrt(@as(f32, @floatFromInt(d))), key, s));
+    var x0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x0);
+    try mlx.check(mlx.mlx_ones(&x0, &[_]c_int{ 1, d }, 2, .bfloat16, s));
+    try evalOne(w);
+    try evalOne(x0);
+    const half = mlx.mlx_array_new_float(0.5);
+    defer _ = mlx.mlx_array_free(half);
+    const Chain = enum { one_graph, per_layer, no_all_sum, all_sum_only, cpu_only };
+    for (std.enums.values(Chain)) |mode| {
+        var total: u64 = 0;
+        const iters = 30;
+        for (0..iters + 3) |it| {
+            var sw = io_util.Stopwatch.init(io);
+            var x = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&x, x0);
+            const cs = mlx.mlx_default_cpu_stream_new();
+            defer _ = mlx.mlx_stream_free(cs);
+            for (0..layers) |_| {
+                var y = mlx.mlx_array_new();
+                if (mode == .all_sum_only or mode == .cpu_only) _ = mlx.mlx_array_set(&y, x) else try mlx.check(mlx.mlx_matmul(&y, x, w, s));
+                if (mode != .no_all_sum) {
+                    const r = try link.allSum(y);
+                    _ = mlx.mlx_array_free(y);
+                    y = r;
+                }
+                var z = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&z, y, half, if (mode == .cpu_only) cs else s));
+                _ = mlx.mlx_array_free(y);
+                _ = mlx.mlx_array_free(x);
+                x = z;
+                if (mode == .per_layer) try evalOne(x);
+            }
+            try evalOne(x);
+            _ = mlx.mlx_array_free(x);
+            if (it >= 3) total += sw.read();
+        }
+        const per_token_us = @as(f64, @floatFromInt(total)) / iters / 1000.0;
+        log.info("[dist-probe] chain {s}: {d} layers a token, {d:.1} us a token, {d:.1} us a layer\n", .{ @tagName(mode), layers, per_token_us, per_token_us / layers });
+    }
+}
+
 /// `mlx-serve dist-probe --rank R --coordinator IP:PORT --device rdma_enX`:
 /// joins the group and measures round trips at the sizes inference moves
 /// (one decode row of a hyper-connection stream, a prefill chunk) and all_sum.
 pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     // `--soak N`: N header + one-row-stream round trips, the shape of a pipeline decode hop.
     var soak: u64 = 0;
+    var chain = false;
     var rest: [16][]const u8 = undefined;
     var n_rest: usize = 0;
     var ai: usize = 0;
@@ -1358,6 +1684,8 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         if (std.mem.eql(u8, args[ai], "--soak") and ai + 1 < args.len) {
             soak = std.fmt.parseInt(u64, args[ai + 1], 10) catch return error.InvalidArgs;
             ai += 1;
+        } else if (std.mem.eql(u8, args[ai], "--chain")) {
+            chain = true;
         } else if (n_rest < rest.len) {
             rest[n_rest] = args[ai];
             n_rest += 1;
@@ -1370,6 +1698,7 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     defer _ = mlx.mlx_stream_free(s);
     const other: u32 = if (link.rank == 0) 1 else 0;
     if (soak > 0) return soakLink(io, &link, other, soak, s);
+    if (chain) return chainProbe(io, &link, s);
 
     const sizes = [_]c_int{ 1, 5120, 10240, 262144, 6553600 }; // f32 elements: 4 B .. 25 MB
     for (sizes) |n| {
@@ -1539,16 +1868,36 @@ test "chooseSplit: a 2:1 memory split puts two thirds of the layers on rank 0, o
 }
 
 test "Shard: gate/up keep a band of rows per expert, down a band of columns" {
-    try std.testing.expect(Shard.expertAxis("language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight").? == .rows);
-    try std.testing.expect(Shard.expertAxis("language_model.model.layers.3.mlp.shared_expert.down_proj.scales").? == .cols);
-    try std.testing.expect(Shard.expertAxis("language_model.model.layers.3.mlp.switch_mlp.gate_proj.expert_scale") == null);
-    try std.testing.expect(Shard.expertAxis("language_model.model.layers.3.mlp.shared_expert_gate.weight") == null);
-    try std.testing.expect(Shard.expertAxis("mtp.layers.0.mlp.switch_mlp.up_proj.weight") == null);
+    try std.testing.expect(Shard.axis("language_model.model.layers.3.mlp.switch_mlp.gate_proj.weight").? == .rows);
+    try std.testing.expect(Shard.axis("language_model.model.layers.3.mlp.shared_expert.down_proj.scales").? == .cols);
+    try std.testing.expect(Shard.axis("language_model.model.layers.3.mlp.switch_mlp.gate_proj.expert_scale") == null);
+    try std.testing.expect(Shard.axis("language_model.model.layers.3.mlp.shared_expert_gate.weight") == null);
+    try std.testing.expect(Shard.axis("mtp.layers.0.mlp.switch_mlp.up_proj.weight") == null);
     // [2 experts, 4 rows, 2 bytes]: rank 1 of 2 keeps rows 2..3 of each expert.
     const buf = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 13, 14, 15, 16, 17 };
     var out: [8]u8 = undefined;
     (Shard{ .rank = 1, .size = 2 }).slice(&out, &buf, 2, 4, 2);
     try std.testing.expectEqualSlices(u8, &.{ 4, 5, 6, 7, 14, 15, 16, 17 }, &out);
+}
+
+test "Shard: DeepSeek-V4.1 splits its experts and its attention by heads, not its indexer, compressor, routers or DSpark stages" {
+    try std.testing.expect(Shard.axis("layers.3.ffn.experts.w1.weight").? == .rows);
+    try std.testing.expect(Shard.axis("layers.3.ffn.experts.w3.scales").? == .rows);
+    try std.testing.expect(Shard.axis("layers.3.ffn.experts.w2.weight").? == .cols);
+    try std.testing.expect(Shard.axis("layers.3.ffn.shared_experts.w1.weight").? == .rows);
+    try std.testing.expect(Shard.axis("layers.3.ffn.shared_experts.w2.scales").? == .cols);
+    try std.testing.expect(Shard.axis("language_model.layers.3.attn.wq_b.scales").? == .rows);
+    try std.testing.expect(Shard.axis("language_model.layers.3.attn.wo_a.weight").? == .rows);
+    try std.testing.expect(Shard.axis("language_model.layers.3.attn.wo_b.weight").? == .cols);
+    try std.testing.expect(Shard.axis("language_model.layers.3.attn.attn_sink").? == .vec);
+    try std.testing.expect(Shard.axis("layers.3.attn.indexer.wq_b.weight") == null);
+    try std.testing.expect(Shard.axis("layers.3.attn.wq_a.weight") == null);
+    try std.testing.expect(Shard.axis("layers.3.attn.wkv.weight") == null);
+    try std.testing.expect(Shard.axis("layers.3.attn.compressor.wkv.weight") == null);
+    try std.testing.expect(Shard.axis("layers.3.ffn.gate.weight") == null);
+    try std.testing.expect(Shard.axis("layers.3.ffn.gate.bias") == null);
+    try std.testing.expect(Shard.axis("mtp.0.ffn.experts.w1.weight") == null);
+    try std.testing.expect(Shard.axis("mtp.0.attn.wq_b.weight") == null);
 }
 
 test "clusterJson: valid JSON naming both ranks' layers and the worker" {

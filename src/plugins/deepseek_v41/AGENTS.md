@@ -31,6 +31,17 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   and restore only at their exact position; the engine owns finished history. Streamed/paired keep legacy resume.
 - No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
+- A tensor pair (`InitOpts.tp`, `--dist tensor`) halves the experts and attention heads at load (the sliced `cfg` says so);
+  both ranks run every layer and `tpSum` each attention and MoE output. Every rank must build the same sums in the same
+  order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`). DSpark drafts on rank 0 alone: its stages
+  load whole and sum nothing, and the worker follows each verify's rollback.
+- Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
+  worker keeps it; a step on another state (`st != &dec_state`) is refused.
+- Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken
+  outside a step (`armPrompt` at a restored boundary) goes as `.capture`. The ranks' caches are equal (`tpStream`
+  asserts it), so the SSD tier writes rank 0's and a disk import sends the worker its tensors (`tpLoad`).
+- Under `tp` rank 0 alone holds the vision tower: a chunk's image rows ride with its step (`tp_step` `images`), the
+  worker splices them at offset 0, so a rank's splice must depend only on the chunk's own rows (`chunkImageRows`).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
 - Metal only: a CPU host stream loads on this thread's GPU stream; no GPU = refused by name.
 
@@ -79,6 +90,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - A plain MLX pack streams with the per-model `stream_experts` (`openPackBank`, the `trunk` arm): one fetch serves
   `Routed.decode_ids` experts, so a wider prompt call runs its experts in groups (`slotWide`). Decode is read-bound
   (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
+- A tensor pair refuses streamed experts by name (`Dsv41TpStreamedExperts`): a bank reads whole experts, only rank 0
+  would open one, and each rank holds half of every expert.
 
 ## Known issues
 - Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization

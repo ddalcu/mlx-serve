@@ -1370,3 +1370,10 @@ landed 86-100% a position. Cause: each slot's drafting backoff weighed its token
 which holds the other slot's verify rows. Fix: a slot is charged its share of the stage pass and its own rows, against
 its accepted drafts at the group's plain cost a token (`moduleGroupRound`). Guard: `tests/test_dsv41.sh` [8b]
 (`group_rounds=` engaged); read `plain_ticks=` on a two-stream code run when the backoff changes.
+
+### A request sent before the worker Mac joined left the model failed for good
+Defect: under `--dist tensor`, a request that arrived before `mlx-serve worker` joined 500'd with
+`DistWorkerNotJoined`, and every request after the worker joined got the same 500 until a host restart. Cause: a
+failed load parks the entry in `.error_state`, which fails fast; only the memory refusal went back to `.unloaded`.
+Fix: refusals the user fixes outside the pack retry (`failureRetries`), and the absent worker is a named 503
+(`worker_not_joined`). Guard: `a load refused for memory or an absent worker Mac is retried by the next request`.

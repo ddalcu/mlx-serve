@@ -14,6 +14,7 @@ pub const Known = error{
     GenerationOutOfMemory,
     GpuContextLost,
     InsufficientMemory,
+    DistWorkerNotJoined,
     LoadFailed,
     NoDefaultModel,
     NotEnoughMemory,
