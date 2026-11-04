@@ -47,12 +47,19 @@ test "splitMaskedSdpa256: verify-width array-mask rows split through the vector 
 /// Like attn256MaxDiff but errors on any non-finite element on either side —
 /// NaN > max_err is false, so an all-NaN pair would otherwise diff to 0.
 fn attn256FiniteMaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    var af = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(af);
+    var bf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bf);
     var a32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(a32);
     var b32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(b32);
-    try mlx.check(mlx.mlx_astype(&a32, a, .float32, s));
-    try mlx.check(mlx.mlx_astype(&b32, b, .float32, s));
+    // Row-contiguous before the raw read: an sdpa output can come back strided, and astype keeps the strides.
+    try mlx.check(mlx.mlx_astype(&af, a, .float32, s));
+    try mlx.check(mlx.mlx_astype(&bf, b, .float32, s));
+    try mlx.check(mlx.mlx_contiguous(&a32, af, false, s));
+    try mlx.check(mlx.mlx_contiguous(&b32, bf, false, s));
     try mlx.check(mlx.mlx_array_eval(a32));
     try mlx.check(mlx.mlx_array_eval(b32));
     const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
