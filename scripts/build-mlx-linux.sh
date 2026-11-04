@@ -101,12 +101,6 @@ if [[ "$MLX_COMMIT" != unknown && -f "$STAGE/lib/libmlx.so" && -f "$STAGE/lib/li
 fi
 
 if [[ "$MLX_BACKEND" == cuda ]]; then
-  echo "== patch mlx: CUDA LRU thrashing check counts consecutive misses"
-  if grep -q 'any hit resets it' "$MLX_SOURCE/mlx/backend/cuda/lru_cache.h"; then
-    echo "   lru cache: already applied"
-  else
-    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-lru-consecutive-misses.patch"
-  fi
   echo "== patch mlx: CUDA fused attention at head dims 256 and 512"
   if grep -q 'load_lane_row' "$MLX_SOURCE/mlx/backend/cuda/scaled_dot_product_attention.cu"; then
     echo "   sdpa: already applied"

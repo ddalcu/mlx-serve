@@ -280,15 +280,14 @@ diff --git a/tests/cuda_tests.cpp b/tests/cuda_tests.cpp
 index fee796e..ef63fc1 100644
 --- a/tests/cuda_tests.cpp
 +++ b/tests/cuda_tests.cpp
-@@ -2,6 +2,7 @@
+@@ -2,5 +2,6 @@
  
  #include "doctest/doctest.h"
- #include "mlx/backend/cuda/lru_cache.h"
 +#include "mlx/backend/cuda/quantized/qmm/qmm.h"
  #include "mlx/mlx.h"
  
  #ifdef _WIN32
-@@ -195,3 +196,36 @@ TEST_CASE("test quantized matmul over a few rows") {
+@@ -195,3 +195,36 @@ TEST_CASE("test quantized matmul over a few rows") {
      }
    }
  }

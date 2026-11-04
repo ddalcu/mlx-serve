@@ -148,5 +148,4 @@ Guard: `ModelOpt: an FP8 linear loaded into the GPU's pool stays there` (reads t
 | `mlx-cuda-graphs-switch.patch` | `mlx_cuda_set_graphs`: CUDA graphs on or off at runtime | No: the encoder's mode |
 | `mlx-cuda-sorted-gather-matvec.patch` | below 4 rows per expert, the sorted fp gather's mat-vec loads each expert once per run of rows | Yes: a `cuda_kernel` could take it, if it reproduced `row_dot`'s arithmetic |
 | `mlx-cuda-custom-kernel-disk-cache.patch` | `cuda_kernel` modules go to the disk kernel cache like MLX's own | No: MLX's JIT cache |
-| `mlx-cuda-lru-consecutive-misses.patch` | MLX's internal LRU cache | No: not a kernel |
 | `mlx-cuda-windows-toolkit-dirs.patch` | DLL search folders on Windows | No: not a kernel |

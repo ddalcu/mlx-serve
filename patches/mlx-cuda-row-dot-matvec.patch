@@ -564,10 +564,10 @@ index 41de03e..f19c049 100644
  #include "mlx/backend/cuda/kernel_utils.cuh"
  #include "mlx/backend/cuda/quantized/qmm/qmm.h"
  #include "mlx/backend/cuda/quantized/quantized_utils.h"
-@@ -270,6 +271,33 @@ void fp_qmv(
-            cu::is_aligned<2>(vec_ptr))) {
-         n = 2;
-       }
+@@ -310,6 +311,33 @@ void fp_qmv(
+       const uint32_t* mat_ptr = gpu_ptr<uint32_t>(mat);
+       const T* vec_ptr = gpu_ptr<T>(vec);
+       int n = fp_qmv_n_per_thread(mat_ptr, vec_ptr, K, bits);
 +      if constexpr (sizeof(T) == 2) {
 +        // row_dot pays here on an integrated GPU (GB10); on a discrete card
 +        // the stock kernel below is faster, most at small N.
@@ -706,25 +706,13 @@ index 8ed9b72bd..d998e9197 100644
        call_qmv();
      } else {
        call_qmm_naive();
-@@ -272,8 +288,11 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-     return;
-   }
- 
+@@ -201,6 +216,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+   bool can_use_fp_gather_qmv = supports(supports_fp_gather_qmv);
+   bool can_use_qmv = supports(supports_qmv) || can_use_fp_gather_qmv;
+-  bool prefer_qmv = can_use_fp_gather_qmv || (can_use_qmv && M * B < 8);
 +  // Gathered rows on different experts share no weights, so a tile buys nothing
 +  // there: the mat-vec takes any batch of few-row gathers (top-k decode).
-+  bool gather_rows_few = M < 8;
-   if (can_use_qmm_sm80) {
--    if (can_use_qmv && (M * B < 8)) {
-+    if (can_use_qmv && gather_rows_few) {
-       call_qmv();
-     } else {
-       call_qmm_sm80();
-@@ -282,7 +301,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
-   }
++  bool prefer_qmv = can_use_fp_gather_qmv || (can_use_qmv && M < 8);
  
-   if (can_use_qmm_naive) {
--    if (can_use_qmv && (M * B < 8)) {
-+    if (can_use_qmv && gather_rows_few) {
-       call_qmv();
-     } else {
-       call_qmm_naive();
+   auto call_qmm_sm80 = [&]() {
+     out.set_data(cu::malloc_async(out.nbytes(), encoder));
