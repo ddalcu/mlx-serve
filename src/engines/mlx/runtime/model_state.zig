@@ -82,6 +82,7 @@ pub fn unloadResident(self: *LoadedModel) void {
     self.drafter_block_size = 0;
     if (self.bytes_resident > 0) registry.generations().last_unload.record(registry.monotonicMs(), self.bytes_resident);
     self.bytes_resident = 0;
+    self.bytes_live = 0;
     // The prefill-chunk pin was resolved from LIVE memory at load, so it
     // can be stale-narrow (pinned while a since-evicted model was
     // resident). Widening a RESIDENT model's pin would let a prefill run

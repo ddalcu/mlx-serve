@@ -117,11 +117,14 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // generated this turn that the cache holds — Generator forwarded each
     // emitted token into slot.cache as it was sampled, except an
     // `unforwarded_tail` the key must not claim.
-    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len - gen_ptr.unforwarded_tail;
+    const gen_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len - gen_ptr.unforwarded_tail;
+    const stop_tail = gen_ptr.forwarded_stop[0..if (slot.moe_seq_offset == gen_len + gen_ptr.forwarded_stop_len) gen_ptr.forwarded_stop_len else 0];
+    const total_len = gen_len + stop_tail.len;
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
-    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items[0 .. total_len - slot.full_prompt.len]);
+    @memcpy(total_tokens[slot.full_prompt.len..gen_len], gen_ptr.generated_ids.items[0 .. gen_len - slot.full_prompt.len]);
+    @memcpy(total_tokens[gen_len..], stop_tail);
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-

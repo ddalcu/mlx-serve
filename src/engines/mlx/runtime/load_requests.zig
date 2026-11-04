@@ -155,7 +155,7 @@ fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror) void {
 /// A refusal the user fixes outside the pack (free memory, start the worker Mac) leaves the entry
 /// `.unloaded`: in `.error_state` every retry would fail fast until a server restart.
 fn failureRetries(name: []const u8) bool {
-    return std.mem.eql(u8, name, "InsufficientMemory") or std.mem.eql(u8, name, "DistWorkerNotJoined");
+    return model_registry_mod.ModelRegistry.loadErrorFromName(name) == error.InsufficientMemory or std.mem.eql(u8, name, "DistWorkerNotJoined");
 }
 
 fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
@@ -217,6 +217,7 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
 
 test "a load refused for memory or an absent worker Mac is retried by the next request; a broken pack stays failed" {
     try std.testing.expect(failureRetries("InsufficientMemory"));
+    try std.testing.expect(failureRetries("OutOfMemory"));
     try std.testing.expect(failureRetries("DistWorkerNotJoined"));
     try std.testing.expect(!failureRetries("MissingWeight"));
     try std.testing.expect(!failureRetries("DistWorkerMissingModel"));

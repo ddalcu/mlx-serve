@@ -283,6 +283,9 @@ pub const LoadedModel = struct {
     /// Resident GPU bytes for this entry (weights + vision + drafter),
     /// summed at load time. Zero for non-`.ready` entries.
     bytes_resident: u64,
+    /// MLX bytes the load added, measured at ready: above `bytes_resident` when the model fills its own cache
+    /// at load (a plugin's streamed-expert cache), so eviction credits what unloading frees.
+    bytes_live: u64 = 0,
     /// Estimated bytes reserved against `ModelRegistry.reserved_bytes` while
     /// this entry is mid-load (`.loading`). Lets concurrent loaders see this
     /// pending allocation in the budget gate so two loads can't both pass and
@@ -942,6 +945,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry);
         entry.state = .unloaded;
         entry.bytes_resident = 0;
+        entry.bytes_live = 0;
         if (entry.error_name) |old| self.allocator.free(old);
         entry.error_name = null;
         self.stateChanged();
@@ -1291,7 +1295,7 @@ pub const ModelRegistry = struct {
     }
 
     fn liveBytesFreed(v: *const LoadedModel) u64 {
-        return v.bytes_resident +| mlx_engine.api().hot_cache_bytes(v);
+        return @max(v.bytes_resident, v.bytes_live) +| mlx_engine.api().hot_cache_bytes(v);
     }
 
     /// Idle models a load needing `need` bytes of RAM unloads with `room` free, oldest first: as few
@@ -2157,6 +2161,22 @@ test "planEvictions: an idle victim's prefix cache counts as freed live memory (
     var buf: [16]*LoadedModel = undefined;
     // 95 live = a's 40 weights + its 50-byte cache + 5: evicting a leaves 5 + 50 <= 100.
     try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 95));
+    try testing.expectEqualStrings("a", buf[0].id);
+}
+
+test "planEvictions: a victim frees the live bytes its load measured, not just its bill (#1064)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 100, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 10);
+    a.bytes_live = 80;
+    const b = try beginLoad(reg, "b", 50);
+
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    // 85 live, 80 of them a's: evicting a leaves 5 + 50 <= 100.
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 85));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 

@@ -89,7 +89,15 @@ pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
             if (sw != null) StepTrace.steps += 1;
 
             // Check stop conditions on the resolved token
-            if (try self.checkStop()) return null;
+            if (try self.checkStop()) {
+                if (self.ssmWrittenInPlace()) {
+                    var look: i32 = 0;
+                    try mlx.check(mlx.mlx_array_item_int32(&look, lazy_token));
+                    self.forwarded_stop = .{ self.next_token_id, @intCast(look) };
+                    self.forwarded_stop_len = 2;
+                }
+                return null;
+            }
 
             const token = self.next_token_id;
             self.advanceStep(1);

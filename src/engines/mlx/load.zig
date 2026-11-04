@@ -51,6 +51,7 @@ const availForLoad = @import("runtime/preflight.zig").availForLoad;
 const mtpSidecarDiskBytes = @import("runtime/preflight.zig").mtpSidecarDiskBytes;
 const drafterResidentBytes = @import("runtime/preflight.zig").drafterResidentBytes;
 const preflightVerdict = @import("runtime/preflight.zig").preflightVerdict;
+const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
 const scheduler_mod = @import("scheduler.zig");
 
@@ -111,6 +112,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         null;
     defer if (in_dir_drafter) |p| sch.allocator.free(p);
     makeRoomInRam(sch, params.entry.id, model_bytes);
+    const live_before = mlxActiveBytes();
     if (!scheduler_mod.skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
@@ -910,6 +912,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config);
 
     sch.registry.mutex.lockUncancelable(sch.io);
+    entry.bytes_live = mlxActiveBytes() -| live_before;
     sch.registry.markReadyLocked(entry, bytes_resident);
     sch.registry.mutex.unlock(sch.io);
 
