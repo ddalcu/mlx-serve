@@ -882,7 +882,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
                     @as(f64, @floatFromInt(estimated)) / gb,
                     @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
                 });
-            } else if (self.registry.countLoadedLocked() == 0) {
+            } else if (self.registry.countLoadedLocked() == 0 and self.registry.reserved_bytes == entry.load_estimate) {
                 log.err("Refusing to load {s}: needs ~{d:.2} GB, and {d:.2} GB of live memory belongs to no model, so no unload can free it. Restart the server.\n", .{
                     entry.id,
                     @as(f64, @floatFromInt(estimated)) / gb,

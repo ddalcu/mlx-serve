@@ -141,7 +141,7 @@ fn readyLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
 fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror) void {
     log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, loadErrorName(err) });
     sch.registry.mutex.lockUncancelable(sch.io);
-    if (err == error.InsufficientMemory) {
+    if (model_registry_mod.ModelRegistry.loadErrorFromName(loadErrorName(err)) == error.InsufficientMemory) {
         // A memory-preflight refusal is transient, not a property of the
         // checkpoint: the 503 tells the user to free memory and retry, so
         // the entry must go back to .unloaded — stuck in .error_state the
