@@ -325,6 +325,9 @@ const Entry = struct {
     last_used: u64,
     /// `crt.monotonicMs()` of the last touch; the default never reads as idle.
     touched_ms: i64 = std.math.maxInt(i64),
+    /// A module rung that a longer resident entry of the same conversation extends. Kept so a
+    /// fork below the tip (a recap, a regenerate) still restores; evicted before any tip.
+    superseded: bool = false,
     /// Wave 1.A: full KV-quant config active when this entry was committed.
     /// A new request whose `KVQuantConfig` differs in any field cannot
     /// restore from this entry — the underlying buffer layout (dense bf16 vs
@@ -1935,15 +1938,7 @@ pub const HotPrefixCache = struct {
         };
         // Allocate before removing any donor; OOM leaves the resident history intact.
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
-        for (self.entries.items, 0..) |*e, i| {
-            const m = e.module orelse continue;
-            if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) continue;
-            if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len > ids.len) continue;
-            if (mediaSharedBound(e.media, eff_media) < e.tokens.len) continue;
-            if (!std.mem.eql(u32, e.tokens, ids[0..e.tokens.len])) continue;
-            self.evictAt(i, "module checkpoint replaced");
-            break;
-        }
+        self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config);
         if (!self.makeModuleRoom(aux_bytes, cache_key)) return .declined;
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
@@ -1964,6 +1959,80 @@ pub const HotPrefixCache = struct {
         self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
         self.logResident();
         return .{ .ok = ids.len };
+    }
+
+    /// Superseded rungs a conversation keeps below its tip. A plugin snapshot restores only at its
+    /// exact length, so each rung is one more fork point that still hits.
+    pub const MODULE_RUNGS_KEPT: usize = 3;
+
+    /// Whether resident module entry `e` lies on the conversation `ids` extends.
+    fn moduleRungOf(e: *const Entry, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig) bool {
+        const m = e.module orelse return false;
+        if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) return false;
+        if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len > ids.len) return false;
+        if (mediaSharedBound(e.media, media) < e.tokens.len) return false;
+        return std.mem.eql(u32, e.tokens, ids[0..e.tokens.len]);
+    }
+
+    /// The commit of `ids` makes every shorter entry of its conversation a rung. An entry of the
+    /// same length is the same checkpoint and is replaced. Past `MODULE_RUNGS_KEPT` rungs the
+    /// ladder is thinned by `ladderVictim`.
+    fn supersedeModuleRungs(self: *HotPrefixCache, binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig) void {
+        var i: usize = self.entries.items.len;
+        while (i > 0) {
+            i -= 1;
+            const e = &self.entries.items[i];
+            if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config)) continue;
+            if (e.tokens.len == ids.len) {
+                self.evictAt(i, "module checkpoint replaced");
+                continue;
+            }
+            e.superseded = true;
+        }
+        while (true) {
+            var lens: [MODULE_RUNGS_KEPT + 2]usize = undefined;
+            var idxs: [MODULE_RUNGS_KEPT + 2]usize = undefined;
+            var n: usize = 0;
+            for (self.entries.items, 0..) |*e, j| {
+                if (!e.superseded or e.checked_out_by != null) continue;
+                if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config)) continue;
+                if (n == lens.len) break;
+                lens[n] = e.tokens.len;
+                idxs[n] = j;
+                n += 1;
+            }
+            if (n <= MODULE_RUNGS_KEPT) return;
+            const victim = ladderVictim(lens[0..n]) orelse return;
+            self.evictAt(idxs[victim], "module ladder thinned");
+        }
+    }
+
+    /// Which rung to drop from a ladder over capacity, by index into `lens` (any order). The
+    /// lowest rung (the shared system prompt) and the newest (the previous tip, where recaps and
+    /// regenerates fork) stay; of the rest, the one closest to the rung below it goes, so the
+    /// survivors spread out.
+    pub fn ladderVictim(lens: []const usize) ?usize {
+        if (lens.len < 3) return null;
+        var lo: usize = 0;
+        var hi: usize = 0;
+        for (lens, 0..) |l, k| {
+            if (l < lens[lo]) lo = k;
+            if (l > lens[hi]) hi = k;
+        }
+        var best: ?usize = null;
+        var best_gap: usize = std.math.maxInt(usize);
+        for (lens, 0..) |l, k| {
+            if (k == lo or k == hi) continue;
+            var below: usize = 0;
+            for (lens) |o| if (o < l and o > below) {
+                below = o;
+            };
+            if (l - below < best_gap) {
+                best_gap = l - below;
+                best = k;
+            }
+        }
+        return best;
     }
 
     fn makeModuleRoom(self: *HotPrefixCache, bytes: u64, cache_key: u64) bool {
@@ -3760,6 +3829,17 @@ pub const HotPrefixCache = struct {
             }
             if (best != null) return best;
         }
+        // A superseded rung goes before any conversation's tip, so every live conversation
+        // keeps its newest checkpoint while rungs remain.
+        for (self.entries.items, 0..) |*e, i| {
+            if (!e.superseded or e.checked_out_by != null) continue;
+            if (protect) |p| if (e.last_used == p) continue;
+            if (e.last_used < best_used) {
+                best_used = e.last_used;
+                best = i;
+            }
+        }
+        if (best != null) return best;
         for (self.entries.items, 0..) |*e, i| {
             // Held by a live slot that owns its buffers: evicting it frees nothing.
             if (e.checked_out_by != null) continue;
@@ -11123,7 +11203,16 @@ test "HotPrefixCache module: replacement count byte invalidation and deinit free
         var next: ModuleFake.Snap = .{ .owner = &fake, .ids = if (case == .replace) &.{ 1, 2, 3 } else &.{ 8, 9 }, .key = if (case == .replace) 6 else 17 };
         _ = try old.put(&cache, binding, &.{});
         const selected = cache.findModuleMatch(binding, &.{ 1, 2, 3, 4 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
-        if (case == .replace or case == .count or case == .bytes) {
+        if (case == .replace) {
+            // An extension keeps the shorter checkpoint as a rung: a fork below the tip still restores.
+            _ = try next.put(&cache, binding, &.{});
+            try testing.expectEqual(@as(usize, 0), old.frees);
+            try testing.expectEqual(@as(usize, 2), cache.entryCount());
+            try testing.expectEqual(@as(u64, 80), cache.current_kv_bytes);
+            try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 1, 2, 9 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?.n);
+            try testing.expectEqual(@as(usize, 3), cache.findModuleMatch(binding, &.{ 1, 2, 3, 4 }, false, &.{}, null, kv_quant.KVQuantConfig.dense).?.n);
+        }
+        if (case == .count or case == .bytes) {
             _ = try next.put(&cache, binding, &.{});
             try testing.expectEqual(@as(usize, 1), old.frees);
             try testing.expectEqual(@as(usize, 1), cache.entryCount());
@@ -11140,6 +11229,52 @@ test "HotPrefixCache module: replacement count byte invalidation and deinit free
         try testing.expectEqual(@as(usize, 1), old.frees);
         try testing.expectEqual(@as(usize, @intFromBool(case == .replace or case == .count or case == .bytes)), next.frees);
     }
+}
+
+test "HotPrefixCache module: ladderVictim keeps the lowest and newest rungs and drops the most crowded" {
+    try testing.expect(HotPrefixCache.ladderVictim(&.{ 100, 900 }) == null);
+    // 500 sits 100 above 400; 400 sits 300 above 100: 500 is the most crowded.
+    try testing.expectEqual(@as(?usize, 2), HotPrefixCache.ladderVictim(&.{ 100, 400, 500, 900 }));
+    // Order-free: the same ladder shuffled picks the same length.
+    try testing.expectEqual(@as(?usize, 0), HotPrefixCache.ladderVictim(&.{ 500, 900, 100, 400 }));
+}
+
+test "HotPrefixCache module: a long conversation keeps a thinned ladder and every tip survives rung eviction" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 0);
+    defer cache.deinit();
+    const turns = [_][]const u32{
+        &.{1},
+        &.{ 1, 2 },
+        &.{ 1, 2, 3 },
+        &.{ 1, 2, 3, 4 },
+        &.{ 1, 2, 3, 4, 5 },
+        &.{ 1, 2, 3, 4, 5, 6 },
+    };
+    var snaps: [turns.len + 1]ModuleFake.Snap = undefined;
+    for (turns, 0..) |ids, i| {
+        // ModuleFake's prefix key is the sum of the ids.
+        snaps[i] = .{ .owner = &fake, .ids = ids, .key = @intCast((i + 1) * (i + 2) / 2) };
+        _ = try snaps[i].put(&cache, binding, &.{});
+    }
+    // Tip plus MODULE_RUNGS_KEPT rungs.
+    try testing.expectEqual(HotPrefixCache.MODULE_RUNGS_KEPT + 1, cache.entryCount());
+    const q = kv_quant.KVQuantConfig.dense;
+    // The lowest rung and the previous tip both survive the thinning.
+    try testing.expectEqual(@as(usize, 1), cache.findModuleMatch(binding, &.{ 1, 9 }, false, &.{}, null, q).?.n);
+    try testing.expectEqual(@as(usize, 5), cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5, 9 }, false, &.{}, null, q).?.n);
+    try testing.expectEqual(@as(usize, 6), cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5, 6, 7 }, false, &.{}, null, q).?.n);
+    // Count pressure from another conversation takes rungs, never this conversation's tip.
+    cache.max_entries = @intCast(cache.entryCount());
+    snaps[turns.len] = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 };
+    _ = try snaps[turns.len].put(&cache, binding, &.{});
+    try testing.expectEqual(@as(usize, 6), cache.findModuleMatch(binding, &.{ 1, 2, 3, 4, 5, 6, 7 }, false, &.{}, null, q).?.n);
+    try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, q).?.n);
+    cache.invalidateAll("test end");
+    for (snaps) |s| try testing.expectEqual(@as(usize, 1), s.frees);
 }
 
 test "HotPrefixCache module: oversized disabled and malformed commits free the whole candidate" {
