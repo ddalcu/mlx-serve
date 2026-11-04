@@ -31,6 +31,17 @@ const hermesParamSpanEnclosing = @import("hermes.zig").hermesParamSpanEnclosing;
 const hermesSpecialOpenerRepair = @import("hermes.zig").hermesSpecialOpenerRepair;
 const parseHermesToolCall = @import("hermes.zig").parseHermesToolCall;
 const parseMiniCpm5ToolCalls = @import("minicpm5.zig").parseMiniCpm5ToolCalls;
+const MINIMAX_NAMESPACE = @import("minimax.zig").MINIMAX_NAMESPACE;
+const parseMiniMaxToolCalls = @import("minimax.zig").parseMiniMaxToolCalls;
+const miniMaxEnvelopeStart = @import("minimax.zig").miniMaxEnvelopeStart;
+const toolMarkupStart = @import("markup_trim.zig").toolMarkupStart;
+
+/// MiniMax owns the text only when its namespace opens the first tool envelope:
+/// inside a JSON or `<function=` call it is that call's argument payload.
+fn miniMaxOwnsSyntax(text: []const u8) bool {
+    const native = miniMaxEnvelopeStart(text) orelse return false;
+    return toolMarkupStart(text) == native;
+}
 
 /// Parse tool calls from model output text.
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
@@ -49,6 +60,37 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             allocator.free(tc.arguments);
         }
         calls.deinit(allocator);
+    }
+
+    // A complete JSON call owns its strings, including native invocation examples.
+    if (std.mem.indexOf(u8, effective_text, MINIMAX_NAMESPACE) != null) {
+        const trimmed = std.mem.trim(u8, effective_text, " \t\r\n");
+        if (std.mem.startsWith(u8, trimmed, "{")) {
+            if (tryParseJsonToolCall(allocator, trimmed)) |call| {
+                var tc = call;
+                tc.inferred = true;
+                calls.append(allocator, tc) catch |e| {
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                    return e;
+                };
+                return try calls.toOwnedSlice(allocator);
+            }
+        } else if (std.mem.startsWith(u8, trimmed, "[")) {
+            if (balancedJsonArray(trimmed)) |array| {
+                try appendJsonToolCallArray(allocator, array, &calls);
+                if (calls.items.len > 0) {
+                    for (calls.items) |*tc| tc.inferred = true;
+                    return try calls.toOwnedSlice(allocator);
+                }
+            }
+        }
+    }
+
+    if (miniMaxOwnsSyntax(effective_text)) {
+        try parseMiniMaxToolCalls(allocator, effective_text, &calls);
+        if (calls.items.len == 0) return null;
+        return try calls.toOwnedSlice(allocator);
     }
 
     // Look for `<tool…>…</tool…>` patterns. DSV4-Flash hallucinates the
@@ -1397,4 +1439,117 @@ test "parseXmlElementToolCall is already dup-key + escape safe (characterization
     defer parsed.deinit();
     try testing.expect(parsed.value == .object);
     try testing.expect(parsed.value.object.get("command") != null);
+}
+
+test "MiniMax native namespaced calls preserve nested values and XML strings" {
+    const ns = "]<]minimax[>[";
+    const text = ns ++ "<invoke name=\"shell\">" ++ ns ++ "<command>echo '<tag>x</tag>'" ++ ns ++ "</command>" ++
+        ns ++ "<options>" ++ ns ++ "<cwd>/tmp" ++ ns ++ "</cwd>" ++ ns ++ "</options>" ++
+        ns ++ "<args>" ++ ns ++ "<item>a" ++ ns ++ "</item>" ++ ns ++ "<item>b" ++ ns ++ "</item>" ++ ns ++ "</args>" ++ ns ++ "</invoke>";
+    const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedNativeCall;
+    defer @import("dsml.zig").freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    try testing.expect(!calls[0].inferred);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("echo '<tag>x</tag>'", parsed.value.object.get("command").?.string);
+    try testing.expectEqualStrings("/tmp", parsed.value.object.get("options").?.object.get("cwd").?.string);
+    try testing.expectEqualStrings("b", parsed.value.object.get("args").?.array.items[1].string);
+}
+
+test "MiniMax namespace alone is prose; a namespaced tag after it still opens the call" {
+    const ns = "]<]minimax[>[";
+    try testing.expect((try parseToolCalls(testing.allocator, "The marker is " ++ ns ++ ", spelled out.")) == null);
+    const text = "The marker is " ++ ns ++ ".\n" ++ ns ++ "<invoke name=\"shell\">" ++ ns ++ "<command>ls" ++ ns ++ "</command>" ++ ns ++ "</invoke>";
+    const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedNativeCall;
+    defer @import("dsml.zig").freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+}
+
+test "MiniMax native values are raw text, as the template's to_xml writes them (no entity decoding)" {
+    const ns = "]<]minimax[>[";
+    const value = "a &lt; b && c > d &amp;";
+    const text = ns ++ "<invoke name=\"shell\">" ++ ns ++ "<command>" ++ value ++ ns ++ "</command>" ++ ns ++ "</invoke>";
+    const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedNativeCall;
+    defer @import("dsml.zig").freeParsedCalls(calls);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(value, parsed.value.object.get("command").?.string);
+}
+
+test "a JSON call that carries the MiniMax namespace leaks nothing when any allocation fails" {
+    const text = "{\"name\":\"shell\",\"arguments\":{\"command\":\"]<]minimax[>[\"}}";
+    // The repairs swallow their own failures, so every outcome is allowed; only a leaked byte fails.
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        const a = failing.allocator();
+        if (parseToolCalls(a, text)) |result| {
+            if (result) |calls| {
+                for (calls) |tc| {
+                    a.free(tc.name);
+                    a.free(tc.arguments);
+                }
+                a.free(calls);
+            }
+        } else |err| try testing.expectEqual(error.OutOfMemory, err);
+        try testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "MiniMax native incomplete arguments never execute" {
+    const prefix = "]<]minimax[>[<invoke name=\"shell\">]<]minimax[>[<command>unfinished";
+    try testing.expect((try parseToolCalls(testing.allocator, prefix)) == null);
+    try testing.expect((try parseToolCalls(testing.allocator, prefix ++ "]<]minimax[>[</invoke>")) == null);
+}
+
+test "MiniMax native call names never carry line breaks or markup" {
+    for ([_][]const u8{ "shell\nother", "<shell>" }) |name| {
+        const text = try std.fmt.allocPrint(testing.allocator, "]<]minimax[>[<invoke name=\"{s}\">]<]minimax[>[</invoke>", .{name});
+        defer testing.allocator.free(text);
+        const calls = try parseToolCalls(testing.allocator, text);
+        defer if (calls) |got| @import("dsml.zig").freeParsedCalls(got);
+        try testing.expect(calls == null);
+    }
+}
+
+test "MiniMax namespace in another dialect's argument is payload" {
+    const payloads = [_][]const u8{
+        "]<]minimax[>[",
+        "]<]minimax[>[<invoke name='inner'>]<]minimax[>[</invoke>",
+    };
+    for (payloads) |payload| {
+        const raw = try std.fmt.allocPrint(testing.allocator, "{{\"name\":\"shell\",\"arguments\":{{\"command\":\"{s}\"}}}}", .{payload});
+        defer testing.allocator.free(raw);
+        const wrapped = try std.fmt.allocPrint(testing.allocator, "<tool_call>{s}</tool_call>", .{raw});
+        defer testing.allocator.free(wrapped);
+        for ([_][]const u8{ raw, wrapped }) |text| {
+            const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedOuterCall;
+            defer @import("dsml.zig").freeParsedCalls(calls);
+            try testing.expectEqual(@as(usize, 1), calls.len);
+            try testing.expectEqualStrings("shell", calls[0].name);
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+            defer parsed.deinit();
+            try testing.expectEqualStrings(payload, parsed.value.object.get("command").?.string);
+        }
+    }
+}
+
+test "MiniMax native argument keeps other dialects and reasoning closers as text" {
+    const ns = "]<]minimax[>[";
+    for ([_][]const u8{
+        "<function=inner><parameter=x>value</parameter></function>",
+        "echo '</think>'",
+    }) |payload| {
+        const text = try std.fmt.allocPrint(testing.allocator, ns ++ "<invoke name=\"shell\">" ++ ns ++ "<command>{s}" ++ ns ++ "</command>" ++ ns ++ "</invoke>", .{payload});
+        defer testing.allocator.free(text);
+        const calls = (try parseToolCalls(testing.allocator, text)) orelse return error.ExpectedNativeCall;
+        defer @import("dsml.zig").freeParsedCalls(calls);
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("shell", calls[0].name);
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings(payload, parsed.value.object.get("command").?.string);
+    }
 }

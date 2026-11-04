@@ -1512,3 +1512,19 @@ test "encodeMarked: a marked token is text, the template's own stay special, a l
     defer a.free(want);
     try testing.expectEqualSlices(u32, want, plain);
 }
+
+test "MiniMax native reasoning aliases decode but retain atomic closers" {
+    const a = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    for ([_][]const u8{ "<mm:think>", "</mm:think>" }, 0..) |marker, i| {
+        try tok.id_to_token.put(@intCast(i), marker);
+        try tok.special_tokens.put(try a.dupe(u8, marker), @intCast(i));
+    }
+    try testing.expect(tok.installMarkerAliases());
+    try testing.expectEqual(@as(?u32, 1), tok.markerCloserFor(0));
+    try testing.expectEqual(@as(?u32, 0), tok.specialTokenId("<mm:think>"));
+    const decoded = try tok.decode(a, &.{ 0, 1 }, false);
+    defer a.free(decoded);
+    try testing.expectEqualStrings("<think></think>", decoded);
+}

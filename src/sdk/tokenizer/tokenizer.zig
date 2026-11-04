@@ -461,23 +461,21 @@ pub const Tokenizer = struct {
         return self.special_tokens.get(name);
     }
 
-    /// K2-Horizon spells the think block and the GLM tool tags with an `ifm|`
-    /// prefix, one special token each; three think variants (one per effort)
-    /// all read as `<think>`. Installed when the vocabulary carries the family
-    /// marker; false otherwise.
+    /// Native markers decode to the shared parser's spelling; encoding retains
+    /// the checkpoint's bytes and its matching atomic reasoning closer.
     pub fn installMarkerAliases(self: *Tokenizer) bool {
-        const family_marker = "<ifm|think>";
-        if (self.special_tokens.get(family_marker) == null) return false;
+        if (self.special_tokens.get("<ifm|think>") == null and self.special_tokens.get("<mm:think>") == null) return false;
         var map = std.AutoHashMap(u32, []const u8).init(self.allocator);
         errdefer map.deinit();
         const pairs = [_][2][]const u8{
-            .{ "<ifm|think>", "<think>" },              .{ "</ifm|think>", "</think>" },
-            .{ "<ifm|think_fast>", "<think>" },         .{ "</ifm|think_fast>", "</think>" },
-            .{ "<ifm|think_faster>", "<think>" },       .{ "</ifm|think_faster>", "</think>" },
-            .{ "<ifm|tool_calls>", "<tool_calls>" },    .{ "</ifm|tool_calls>", "</tool_calls>" },
-            .{ "<ifm|tool_call>", "<tool_call>" },      .{ "</ifm|tool_call>", "</tool_call>" },
-            .{ "<ifm|arg_key>", "<arg_key>" },          .{ "</ifm|arg_key>", "</arg_key>" },
-            .{ "<ifm|arg_value>", "<arg_value>" },      .{ "</ifm|arg_value>", "</arg_value>" },
+            .{ "<mm:think>", "<think>" },            .{ "</mm:think>", "</think>" },
+            .{ "<ifm|think>", "<think>" },           .{ "</ifm|think>", "</think>" },
+            .{ "<ifm|think_fast>", "<think>" },      .{ "</ifm|think_fast>", "</think>" },
+            .{ "<ifm|think_faster>", "<think>" },    .{ "</ifm|think_faster>", "</think>" },
+            .{ "<ifm|tool_calls>", "<tool_calls>" }, .{ "</ifm|tool_calls>", "</tool_calls>" },
+            .{ "<ifm|tool_call>", "<tool_call>" },   .{ "</ifm|tool_call>", "</tool_call>" },
+            .{ "<ifm|arg_key>", "<arg_key>" },       .{ "</ifm|arg_key>", "</arg_key>" },
+            .{ "<ifm|arg_value>", "<arg_value>" },   .{ "</ifm|arg_value>", "</arg_value>" },
         };
         for (pairs) |pair| {
             if (self.special_tokens.get(pair[0])) |id| map.put(id, pair[1]) catch return false;
@@ -485,6 +483,7 @@ pub const Tokenizer = struct {
         var closers = std.AutoHashMap(u32, u32).init(self.allocator);
         errdefer closers.deinit();
         for ([_][2][]const u8{
+            .{ "<mm:think>", "</mm:think>" },
             .{ "<ifm|think>", "</ifm|think>" },
             .{ "<ifm|think_fast>", "</ifm|think_fast>" },
             .{ "<ifm|think_faster>", "</ifm|think_faster>" },
@@ -498,7 +497,7 @@ pub const Tokenizer = struct {
         return true;
     }
 
-    /// The atomic closer paired with a K2 think opener id; null for every other id.
+    /// The atomic closer paired with a native think opener id; null for every other id.
     pub fn markerCloserFor(self: *const Tokenizer, opener_id: u32) ?u32 {
         const m = self.marker_closers orelse return null;
         return m.get(opener_id);

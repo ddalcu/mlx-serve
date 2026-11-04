@@ -81,12 +81,13 @@ fn thinkBoundBudget(budget: i32) u32 {
 /// allocated; the caller frees it after generation.
 pub fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, enable_thinking: bool, budget: i32) ?request_mod.ThinkBound {
     if (!enable_thinking or lm.transformer == null) return null;
+    const opener = tok.specialTokenId("<mm:think>") orelse atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
     const closer = promptOpenerMarkerCloser(allocator, lm, tok, prompt_ids) orelse
+        (if (opener) |id| tok.markerCloserFor(id) else null) orelse
         atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) orelse {
         if (budget >= 0) log.info("  reasoning budget {d}: think markers are not atomic tokens, delivery cap only\n", .{budget});
         return null;
     };
-    const opener = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_OPENER);
     const opened = promptOpensThink(allocator, lm, tok, prompt_ids);
     if (opener == null and !opened) return null;
 
@@ -148,6 +149,10 @@ pub fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok
 /// A generated tag needs one unambiguous literal spelling in the template.
 /// Dynamic or conflicting spellings retain the unsupported-format fallback.
 fn templateThinkOpener(template: []const u8) ?[]const u8 {
+    if (std.mem.indexOf(u8, template, "<mm:think>") != null) {
+        if (std.mem.indexOf(u8, template, "<think>") != null or std.mem.indexOf(u8, template, "<think:") != null) return null;
+        return "<mm:think>";
+    }
     var found: ?[]const u8 = null;
     var offset: usize = 0;
     while (std.mem.indexOfPos(u8, template, offset, "<think")) |start| {
@@ -234,7 +239,7 @@ pub fn resolveReasoningProtocol(
             },
             .none => {
                 const opener = templateThinkOpener(template) orelse return false;
-                proto.kind = if (std.mem.eql(u8, opener, rp_mod.BARE_THINK_OPENER)) .bare_think else .suffixed_think;
+                proto.kind = if (std.mem.eql(u8, opener, rp_mod.BARE_THINK_OPENER) or std.mem.eql(u8, opener, "<mm:think>")) .bare_think else .suffixed_think;
                 var closer_buf: [rp_mod.MAX_MARKER_BYTES]u8 = undefined;
                 const close = std.fmt.bufPrint(&closer_buf, "</{s}", .{opener[1..]}) catch return false;
                 if (!proto.setOpener(opener) or !proto.setCloser(close)) return false;
@@ -261,6 +266,10 @@ pub fn resolveReasoningProtocol(
         proto.opener_suffix_buf = opener.tokens;
         proto.opener_candidates = opener.open_candidates;
         if (opener.atomic == null and opener.open_candidates.len == 0) return false;
+    }
+    if (tok.marker_aliases) |aliases| {
+        if (proto.opener_atomic) |id| proto.delivery_opener = aliases.get(id);
+        if (proto.closer_atomic) |id| proto.delivery_closer = aliases.get(id);
     }
     for (proto.headers[0..proto.header_len]) |*rule| {
         const marker = lm.reasoningMarker(allocator, io, rule.text) catch return false;
@@ -781,4 +790,77 @@ test "an absent reasoning budget arms an unreachable bound, a set one keeps its 
     try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), thinkBoundBudget(-1));
     try std.testing.expectEqual(@as(u32, 0), thinkBoundBudget(0));
     try std.testing.expectEqual(@as(u32, 2048), thinkBoundBudget(2048));
+}
+
+test "MiniMax native reasoning template has one unambiguous opener" {
+    const opener = templateThinkOpener("{%- set begin = '<mm:think>' -%}<thinking_instructions>adaptive</thinking_instructions>") orelse return error.ExpectedNativeThinkOpener;
+    try std.testing.expectEqualStrings("<mm:think>", opener);
+    try std.testing.expect(templateThinkOpener("<mm:think><think>") == null);
+}
+
+test "MiniMax native request protocol routes aliased reasoning and final content" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    defer tok.deinit();
+    for ([_][]const u8{ "x", "r", "<mm:think>", "</mm:think>" }, 0..) |text, i| {
+        const id: u32 = @intCast(i);
+        try tok.vocab.put(try a.dupe(u8, text), id);
+        try tok.id_to_token.put(id, text);
+        if (i >= 2) try tok.special_tokens.put(try a.dupe(u8, text), id);
+    }
+    try std.testing.expect(tok.installMarkerAliases());
+    const registry = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer registry.deinit();
+    const lm = try registry.registerStub("native-reasoning-test", "/model", null);
+    const transformer = try a.create(@import("../../../abi/mlx_handles.zig").Transformer);
+    defer a.destroy(transformer);
+    lm.transformer = transformer;
+    lm.tokenizer = &tok;
+    defer {
+        lm.transformer = null;
+        lm.tokenizer = null;
+    }
+    const cc = chat_mod.ChatConfig{
+        .allocator = a,
+        .chat_template = "{{ '<mm:think>' }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+    };
+    const bound = armThinkBound(a, lm, &tok, &.{2}, true, 7) orelse return error.ExpectedNativeThinkBound;
+    defer a.free(bound.forced);
+    try std.testing.expectEqual(@as(?u32, 2), bound.opener_id);
+    try std.testing.expectEqual(@as(u32, 3), bound.closer_id);
+    try std.testing.expectEqual(@as(u32, 7), bound.budget);
+    try std.testing.expect(bound.in_think);
+
+    var proto: rp_mod.Protocol = undefined;
+    try std.testing.expect(resolveReasoningProtocol(a, io, lm, &tok, &cc, &.{0}, &proto, true));
+    try std.testing.expectEqual(@as(?u32, 2), proto.opener_atomic);
+    try std.testing.expectEqual(@as(?u32, 3), proto.closer_atomic);
+    var state = proto.startState();
+    try std.testing.expectEqual(rp_mod.ChoiceOutcome.opened, rp_mod.observeChoice(&proto, &state, 2, null));
+    try std.testing.expect(rp_mod.observeReasoningToken(&proto, &state, 1, "r") == null);
+    try std.testing.expect(rp_mod.observeReasoningToken(&proto, &state, 3, null) != null);
+
+    var delivery = rp_mod.Delivery.init(&proto);
+    defer delivery.deinit(a);
+    var reasoning: std.ArrayList(u8) = .empty;
+    defer reasoning.deinit(a);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(a);
+    for ([_]u32{ 2, 1, 3, 0 }, 0..) |id, i| {
+        const decoded = try tok.decode(a, &.{id}, false);
+        defer a.free(decoded);
+        delivery.noteToken(decoded.len, if (i == 3) .{ .token_index = 3, .byte_offset = 0 } else null);
+        try delivery.feed(a, decoded);
+        try reasoning.appendSlice(a, delivery.reasoning.items);
+        try content.appendSlice(a, delivery.content.items);
+    }
+    delivery.clearOutput();
+    try delivery.finish(a);
+    try reasoning.appendSlice(a, delivery.reasoning.items);
+    try std.testing.expectEqualStrings("r", reasoning.items);
+    try std.testing.expectEqualStrings("x", content.items);
 }

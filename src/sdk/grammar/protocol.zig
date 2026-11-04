@@ -110,6 +110,9 @@ pub const Protocol = struct {
     opener_atomic: ?u32 = null,
     /// Atomic id for the close delimiter, when one exists.
     closer_atomic: ?u32 = null,
+    /// Delivery sees decoded aliases; grammar matching keeps the native spelling.
+    delivery_opener: ?[]const u8 = null,
+    delivery_closer: ?[]const u8 = null,
     /// Model-level candidate index (borrowed from `LoadedModel`): ordinary
     /// tokens whose bytes are a prefix of the opener or complete it. Only
     /// consulted in the choice phase.
@@ -291,6 +294,15 @@ pub const Protocol = struct {
     pub fn openerText(self: *const Protocol) ?[]const u8 {
         if (self.opener_len == 0) return null;
         return self.opener_buf[0..self.opener_len];
+    }
+
+    pub fn deliveryOpenerText(self: *const Protocol) ?[]const u8 {
+        if (self.delivery_opener) |text| return text;
+        return self.openerText();
+    }
+
+    pub fn deliveryCloserText(self: *const Protocol) []const u8 {
+        return self.delivery_closer orelse self.closerText();
     }
 
     pub fn closerText(self: *const Protocol) []const u8 {
@@ -798,6 +810,7 @@ pub const Delivery = struct {
     consumed_bytes: usize = 0,
     payload_byte: ?usize = null,
     opener_cursor: usize = 0,
+    decoded_opener_cursor: usize = 0,
     opened: bool,
     pending: [MAX_MARKER_BYTES]u8 = undefined,
     pending_len: usize = 0,
@@ -829,8 +842,20 @@ pub const Delivery = struct {
         try self.reasoning.append(allocator, b);
     }
 
+    fn completeCloser(self: *const Delivery) bool {
+        const pending = self.pending[0..self.pending_len];
+        return std.mem.eql(u8, pending, self.proto.closerText()) or
+            std.mem.eql(u8, pending, self.proto.deliveryCloserText());
+    }
+
+    fn partialCloser(self: *const Delivery) bool {
+        const pending = self.pending[0..self.pending_len];
+        return std.mem.startsWith(u8, self.proto.closerText(), pending) or
+            std.mem.startsWith(u8, self.proto.deliveryCloserText(), pending);
+    }
+
     fn flushPending(self: *Delivery, allocator: std.mem.Allocator) !void {
-        if (!std.mem.eql(u8, self.pending[0..self.pending_len], self.proto.closerText())) {
+        if (!self.completeCloser()) {
             for (self.pending[0..self.pending_len]) |b| try self.emitReasoning(allocator, b);
         }
         self.pending_len = 0;
@@ -855,24 +880,24 @@ pub const Delivery = struct {
                 continue;
             }
             if (!self.opened) {
-                const opener = self.proto.openerText().?;
-                if (self.opener_cursor == 0 and (b == ' ' or b == '\n' or b == '\r' or b == '\t')) continue;
-                // A direct answer's whitespace and a truncated header never
-                // become reasoning. The generator admits only exact openers.
-                if (b != opener[self.opener_cursor]) continue;
-                self.opener_cursor += 1;
-                self.opened = self.opener_cursor == opener.len;
+                const native = self.proto.openerText().?;
+                const decoded = self.proto.deliveryOpenerText().?;
+                if (self.opener_cursor == 0 and self.decoded_opener_cursor == 0 and
+                    (b == ' ' or b == '\n' or b == '\r' or b == '\t')) continue;
+                if (b == native[self.opener_cursor]) self.opener_cursor += 1;
+                if (b == decoded[self.decoded_opener_cursor]) self.decoded_opener_cursor += 1;
+                self.opened = self.opener_cursor == native.len or self.decoded_opener_cursor == decoded.len;
                 continue;
             }
             if (self.pending_len == self.pending.len) try self.flushPending(allocator);
             self.pending[self.pending_len] = b;
             self.pending_len += 1;
-            while (self.pending_len > 0 and !std.mem.startsWith(u8, self.proto.closerText(), self.pending[0..self.pending_len])) {
+            while (self.pending_len > 0 and !self.partialCloser()) {
                 try self.emitReasoning(allocator, self.pending[0]);
                 std.mem.copyForwards(u8, self.pending[0 .. self.pending_len - 1], self.pending[1..self.pending_len]);
                 self.pending_len -= 1;
             }
-            if (self.proto.header_len > 0 and std.mem.eql(u8, self.pending[0..self.pending_len], self.proto.closerText())) {
+            if (self.proto.header_len > 0 and self.completeCloser()) {
                 self.pending_len = 0;
                 _ = afterClose(self.proto, &self.header_state, "");
             }
@@ -1859,4 +1884,57 @@ test "Gemma prompt can end immediately after the thought channel name" {
     p.configureChannels();
     try testing.expect(p.startFromPrompt("<|turn>model\n<|channel>thought"));
     try testing.expectEqual(Phase.reasoning, p.startState().phase);
+}
+
+test "reasoning delivery: native and decoded markers preserve both token spellings" {
+    const a = testing.allocator;
+    var proto = Protocol{ .kind = .bare_think, .opener_atomic = 7, .closer_atomic = 8, .delivery_opener = "<think>", .delivery_closer = "</think>" };
+    try testing.expect(proto.setOpener("<native>"));
+    try testing.expect(proto.setCloser("</native>"));
+    for ([_][]const u8{ "<native>", "<think>" }, 0..) |open, oi| {
+        for ([_][]const u8{ "</native>", "</think>" }, 0..) |close, ci| {
+            var state = proto.startState();
+            if (oi == 0) {
+                for (open, 0..) |byte, i| {
+                    const outcome = observeChoice(&proto, &state, 100 + @as(u32, byte), open[i..][0..1]);
+                    const expected: ChoiceOutcome = if (i + 1 == open.len) .opened else .progress;
+                    try testing.expectEqual(expected, outcome);
+                }
+            } else try testing.expectEqual(ChoiceOutcome.opened, observeChoice(&proto, &state, 7, null));
+            if (ci == 0) {
+                for (close, 0..) |byte, i| {
+                    const payload = observeReasoningToken(&proto, &state, 100 + @as(u32, byte), close[i..][0..1]);
+                    try testing.expectEqual(i + 1 == close.len, payload != null);
+                }
+            } else try testing.expect(observeReasoningToken(&proto, &state, 8, null) != null);
+
+            var delivery = Delivery.init(&proto);
+            defer delivery.deinit(a);
+            if (oi == 0) {
+                for (open) |_| delivery.noteToken(1, null);
+            } else delivery.noteToken(open.len, null);
+            delivery.noteToken(1, null);
+            if (ci == 0) {
+                for (close) |_| delivery.noteToken(1, null);
+            } else delivery.noteToken(close.len, null);
+            const content_index = (if (oi == 0) open.len else 1) + 1 + (if (ci == 0) close.len else 1);
+            delivery.noteToken(1, .{ .token_index = @intCast(content_index), .byte_offset = 0 });
+            const text = try std.fmt.allocPrint(a, "{s}r{s}x", .{ open, close });
+            defer a.free(text);
+            var reasoning: std.ArrayList(u8) = .empty;
+            defer reasoning.deinit(a);
+            var content: std.ArrayList(u8) = .empty;
+            defer content.deinit(a);
+            for (0..text.len) |i| {
+                try delivery.feed(a, text[i..][0..1]);
+                try reasoning.appendSlice(a, delivery.reasoning.items);
+                try content.appendSlice(a, delivery.content.items);
+            }
+            delivery.clearOutput();
+            try delivery.finish(a);
+            try reasoning.appendSlice(a, delivery.reasoning.items);
+            try testing.expectEqualStrings("r", reasoning.items);
+            try testing.expectEqualStrings("x", content.items);
+        }
+    }
 }
