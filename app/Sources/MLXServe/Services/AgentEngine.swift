@@ -73,8 +73,7 @@ enum AgentEngine {
     ///
     /// Pins all user messages (they carry critical facts — name, preferences, task
     /// instructions) and the first assistant response (the plan). Walks backward from
-    /// newest messages to fill the remaining budget. Progressively truncates older
-    /// tool results when context is tight.
+    /// newest messages to fill the remaining budget, keeping admitted tool results whole.
     ///
     /// - Parameters:
     ///   - messages: All chat messages in the session.
@@ -172,22 +171,7 @@ enum AgentEngine {
         let pinnedUserOutside = pinnedUserIndices.filter { $0 < includeStartIdx }
         let needsPinAssistant = firstAssistantIdx != nil && firstAssistantIdx! < includeStartIdx
 
-        // --- Auto-compact ---
-
-        // When context is squeezed, truncate tool results more aggressively.
-        let freeRatio = Double(remainingBudget + pinnedCost) / Double(budget + pinnedCost)
-        let squeezed = freeRatio < 0.25
-        let recentLimit = squeezed ? 500 : 2000
-        let olderLimit = squeezed ? 100 : 500
-
         let window = Array(allMessages[includeStartIdx..<allMessages.count])
-        let totalToolResults = window.filter { $0.toolCallId != nil }.count
-        var toolResultsSeen = 0
-        // Results after the model's last reply are ones it has not seen yet: they go in
-        // full, or it re-reads the file it just asked for in ever smaller pieces (#605).
-        let lastReplyIdx = window.lastIndex {
-            $0.role == .assistant && !$0.isAgentSummary && (!$0.content.isEmpty || !($0.toolCalls ?? []).isEmpty)
-        }
 
         // --- Assemble history ---
 
@@ -223,20 +207,16 @@ enum AgentEngine {
 
         // Emit messages from the backward-walk window.
         var openCalls = Set<String>()
-        for (i, msg) in window.enumerated() {
+        for msg in window {
             if msg.failedRetry { continue }
-            // Tool responses — progressive truncation once the model has answered them
+            // The backward walk already charged the full result against the budget.
             if let callId = msg.toolCallId {
                 // A result whose call fell outside the window is an orphan a strict API refuses.
                 guard openCalls.remove(callId) != nil else { continue }
-                let isRecent = toolResultsSeen >= totalToolResults - 2
-                let unanswered = lastReplyIdx.map { i > $0 } ?? true
-                let limit = unanswered ? msg.content.count : (isRecent ? recentLimit : olderLimit)
-                toolResultsSeen += 1
                 history.append([
                     "role": "tool",
                     "tool_call_id": callId,
-                    "content": String(msg.content.prefix(limit)),
+                    "content": msg.content,
                 ])
                 continue
             }
@@ -989,7 +969,9 @@ enum AgentEngine {
 
     /// Truncate tool output, saving full result to disk if oversized.
     static func truncateWithOverflow(_ output: String, toolCallId: String, toolName: String) -> String {
-        let maxChars = toolResultCaps[toolName] ?? 4000
+        // MCP responses include envelopes and need not offer ranged reads of their payload.
+        let defaultCap = MCPManager.parseNamespacedName(toolName) == nil ? 4000 : 32000
+        let maxChars = toolResultCaps[toolName] ?? defaultCap
         guard output.count > maxChars else { return output }
 
         // Save full output to disk for debugging
