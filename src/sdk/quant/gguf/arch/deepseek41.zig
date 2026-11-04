@@ -148,8 +148,9 @@ pub const Vision = struct {
         if (try arch.u32Key(f, vp ++ "projection_length") != hp.hidden or
             try arch.u32Key(f, vp ++ "language.block_count") != hp.n_layers or
             try arch.u32Key(f, vp ++ "language.expert_count") != hp.n_experts) return error.BadMetadata;
-        for (f.tensors.values()) |t| switch (t.ty) {
-            .f32, .f16, .bf16 => {},
+        // Every tensor one the tower loads: anything else would fail the whole load after vision was advertised.
+        for (f.tensors.keys(), f.tensors.values()) |name, t| switch (t.ty) {
+            .f32, .f16, .bf16 => if (mapVisionTensor(name) == null) return error.UnsupportedTensor,
             else => return error.UnsupportedTensor,
         };
         return .{
@@ -1264,6 +1265,11 @@ test "Vision.read: the DS4 converter's tower gives our packs' vision_config; ano
     defer g.deinit();
     try g.kv.put(g.arena.allocator(), "general.architecture", .{ .string = "clip" });
     try std.testing.expectError(error.UnsupportedArch, Vision.read(&g, hp, rev));
+    // A tensor the tower does not name: declined here, so the set serves text instead of failing its load.
+    var x = try testVisionFileDs4();
+    defer x.deinit();
+    try x.tensors.put(x.arena.allocator(), "mm_projector.weight", .{ .dims = .{ 1024, 1024, 1, 1 }, .n_dims = 2, .ty = .bf16, .data = &.{} });
+    try std.testing.expectError(error.UnsupportedTensor, Vision.read(&x, hp, rev));
 }
 
 test "mapVisionTensor: the tower keeps the release's names, which the plugin's tower reads; anything else is unknown" {
