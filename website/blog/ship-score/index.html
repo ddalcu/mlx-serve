@@ -88,7 +88,7 @@
 <p>Beyond the checklist, the screenshots are the quality signal: every result sheet shows each game, and no taste score goes into the number.</p>
 
 <h2 id="runs">First runs</h2>
-<p>Prompt voxel-sandbox v1 plus a banner line and a 60 fps rule. v2 since added the Must have list; every item on it was already in the v1 text, so these runs are scored on the v2 checklist, but they don't compare with v2 runs. Qwen3.8 Flash Next and DeepSeek-V4.1 Flash packs on mlx-serve, pi agent, M5 Ultra 80c · 256 GB. One run each, so these are previews, not published scores. The sheets below list what each game missed. More packs are queued.</p>
+<p>These runs used a pre-release draft of voxel-sandbox v1, without its Must have list, plus a banner line and a 60 fps rule. Every item on the v1 checklist was already in that draft, so they're scored on it, but they don't compare with v1 runs. Qwen3.8 Flash Next and DeepSeek-V4.1 Flash packs on mlx-serve, pi agent, M5 Ultra 80c · 256 GB. One run each, so these are previews, not published scores. The sheets below list what each game missed. More packs are queued.</p>
 <div class="tbl runs"><table>
 <thead><tr><th>Pack</th><th class="n">Avg<br>GiB</th><th class="n">Time</th><th class="n">Tokens out /<br>uncached in</th><th class="n">Calls<br>(errors)</th><th class="n">Score<br>(checklist)</th></tr></thead>
 <tbody>
@@ -115,44 +115,17 @@
 <figure class="result"><a href="results/2026-11-02-voxel-deepseek-v41-flash.webp"><img src="results/2026-11-02-voxel-deepseek-v41-flash.webp" width="1600" height="2159" loading="lazy" alt="Ship Score sheet for four DeepSeek-V4.1 Flash packs on the voxel prompt: each game's screenshot with its Ship Score, charts of Ship Score, KLD, Top-1, memory, decode, prefill and wall time, and a table of the score's inputs."></a>
 <figcaption><span class="fig">2 NOV 2026</span>DeepSeek-V4.1 Flash, 4 packs (iQ-MLX, Sushi STQ and GSQ-RCO GGUF). Voxel prompt with a banner line, mlx-serve, pi, one run each, M5 Ultra 80c · 256 GB. Sushi STQ ran with image input; the others with text.</figcaption></figure>
 
-<h2>Run it with Claude Code</h2>
-<p>Paste this into Claude Code, then paste one of the prompts below where it says to. Claude only referees: it sets up the run, measures it and scores it. Your local model does all the building.</p>
-<details>
-<summary>The referee prompt</summary>
-<div class="code">Run the Ship Score eval (https://mlxserve.com/blog/ship-score/) on this machine against my local model. You are the referee, not a player: never write, fix or hint at the game's code. Only my local model works on the game. Once a run starts, don't touch it: no nudges, no answers, no killed tools. The only stop is the 90-minute cap, and a run anyone helped is void.
-
-Ask me for anything below I haven't given you:
-- My local engine: its OpenAI-compatible base URL, the model id, and the engine's process (name or PID).
-- The agent harness to run it with (for example pi or opencode), pointed at that model.
-
-Steps:
-1. Record the rig: chip or GPU, GPU cores, total memory, engine and version, model and quant, harness and version, and the inputs the harness gives the model (text only, or text and images). Give it images if the model supports them.
-2. Make a new empty folder. Save the game prompt below to prompt.txt exactly as given, ending with one newline. Check its sha256 against the one published on the page, and stop if it differs.
-3. Start a memory sampler: every 30 seconds, append a timestamp and the engine process's memory footprint (macOS: phys_footprint from `footprint -p PID`; NVIDIA: the process's VRAM from nvidia-smi plus its host RSS) to mem.txt.
-4. Start the harness in that folder, non-interactively, with prompt.txt as the only message. Note the start time. Stop it if it runs past 90 minutes.
-5. When it ends, stop the sampler and work out:
-   - minutes: from the prompt to the agent's last message
-   - avg GiB: the average of the samples taken between the prompt and the agent's last message
-   - tokens out, and uncached tokens in (prompt tokens minus prompt-cache hits), summed over the harness's session log
-   - tool calls and tool errors (calls whose result was an error), from the same log, reported but not scored
-   - decode and prefill speeds if the engine logs them
-6. The play check: serve the build (`npx vite preview`) and load it in headless Chromium with Playwright, recording page errors. Screenshot it after it loads. Click to start (a visible Play, Start or Enter button if there is one, else the centre of the page), press a number key, hold W for a second, move the mouse, left click and right click, with a screenshot after each. It passes when there are no page errors, the first screenshot isn't blank and at least one input changed the screen.
-7. The ship gate: within 90 minutes, `npm run build` passes in the folder, DONE.md exists and the play check passes. Otherwise the run fails and its checklist is 0.
-8. The checklist: for a run that shipped, open the game for me with the prompt's checklist from the page. I play it and say yes or no to each item; you don't judge them. Checklist = the points of the yes items ÷ 10.
-9. Cost = √avg GiB × minutes × M tokens (tokens out plus uncached tokens in, in millions). Score = 1,000 × checklist ÷ cost.
-10. Report one row: rig, inputs, engine, model, harness, prompt name, avg GiB, time (m:ss), tokens out / uncached in, calls (errors), play check, checklist points, cost, score, and the folder path.
-11. Do three runs: repeat from step 2 in a new folder each time, and ask me to restart the engine between runs. Report each row, then the final score: 1,000 × (the three checklists added) ÷ (the three costs added, failed runs included).
-
-The game prompt:
-&lt;paste one of the prompts here&gt;</div>
-</details>
+<h2>Run it</h2>
+<p>The eval lives in <a href="https://github.com/CommunityServe/ship-score">CommunityServe/ship-score</a>: the prompts, the harness that runs, plays and scores a game, the judging rules and the <a href="https://communityserve.github.io/ship-score/">leaderboard</a>, where every submitted game is playable. Point your coding agent at it:</p>
+<div class="callout"><p>Run the Ship Score eval on my machine against my local model: follow https://github.com/CommunityServe/ship-score/blob/main/AGENTS.md</p></div>
+<p>The agent referees and judges: it asks for your engine and model, starts each run hands-off with the 90-minute cap, judges the checklist from screenshots of the game, and opens a PR with the result. CI recomputes every number from the raw files and merges the PR, and the leaderboard updates. Three runs make an official result; one or two land in previews.</p>
 
 <h2>How it's measured</h2>
 <p>Memory is the engine's physical footprint, sampled every 30 seconds and averaged from the prompt to the agent's last message. Time, tokens and tool calls come from the agent's session log; uncached tokens in are each turn's prompt tokens minus its prompt-cache hits. The play check loads the build in headless Chromium, starts it, presses keys, moves the mouse and clicks, and looks for errors, a blank screen or a screen that never changes. Each run starts with a fresh server and an empty folder.</p>
 <p>The checklist is the prompt's own Must have list, so the model knows exactly what earns points. Each item is something you can see or do, worth 1 to 3 points, 10 in all; the points are published here, not in the prompt, so the model builds the whole list. The things that make the game work at all weigh most. Whoever ticks it plays the game and answers yes or no, never "mostly".</p>
 <p>Difficulty is how much has to work at once and how hard the hardest part is: 1 is one system built from well-known techniques, 5 is several hard systems that all have to work together (rendering tricks, simulation, AI, precision), hard even for a frontier model. Scores only compare runs of the same prompt, so difficulty tells you what a score was earned on, not how to scale it.</p>
 <details>
-<summary>The prompt (voxel-sandbox v2) · difficulty 2/5</summary>
+<summary>The prompt (voxel-sandbox v1) · difficulty 2/5</summary>
 <p class="note">sha256 <code>9e36e83443bada572260f423974e0c0fdd16e7bc8d4d3a98fb4a28e1279ac42d</code></p>
 <div class="code">Build a first-person voxel sandbox game for the browser with three.js, in the current directory.
 
@@ -187,7 +160,7 @@ Setup and rules:
 </ul>
 </details>
 <details>
-<summary>The prompt (kings-landing v2) · difficulty 3/5</summary>
+<summary>The prompt (kings-landing v1) · difficulty 3/5</summary>
 <p class="note">sha256 <code>ab1695363468142cb9ec986ea13e3b0da294fe8cb17a07581c8bcd981d56ecad</code></p>
 <div class="code">Build me Kings landing from game of thrones in threejs, it starts like the tv show movie intro where kings landing gets built like origami for the first 30 seconds. And it ends with a first person walkable character so you can explore it.
 
@@ -215,7 +188,7 @@ Setup and rules:
 </ul>
 </details>
 <details>
-<summary>The prompt (subway-fps v2) · difficulty 4/5</summary>
+<summary>The prompt (subway-fps v1) · difficulty 4/5</summary>
 <p class="note">sha256 <code>21e55f7228837b61a4f1df2569ebb204ba579a255c8b9554f136074d51eafbe6</code></p>
 <div class="code">Make a beautifully detailed web scene using js, of a subway station with focus on detail. It should be 3D and something that would be impressive to you.
 The scene must be the setting for an FPS with humanoid/zombieoid enemies, visible ammo tracers, weapon recoil, at least two different weapons, muzzle flash, sfx and high detail.
@@ -247,7 +220,7 @@ Setup and rules:
 </ul>
 </details>
 <details>
-<summary>The prompt (racing v2) · difficulty 3/5</summary>
+<summary>The prompt (racing v1) · difficulty 3/5</summary>
 <p class="note">sha256 <code>5c15eee4d815ea8f32ed9ff9cfd848a9c23b2cf0c4161d901b3c8735be18234d</code></p>
 <div class="code">build me a need for speed style sim car racing game, with procedual generated textures and audio
 
@@ -276,7 +249,7 @@ Setup and rules:
 </details>
 
 <details>
-<summary>The prompt (planet-to-orbit v2) · difficulty 5/5</summary>
+<summary>The prompt (planet-to-orbit v1) · difficulty 5/5</summary>
 <p class="note">sha256 <code>5976854022a35b8dbe729e0e17420ab225ddb69efbda6074c107ac54a18473e1</code></p>
 <div class="code">Build a space flight game for the browser with three.js: one procedurally generated planet that you fly from its surface to orbit and back, with no loading screen.
 
@@ -314,7 +287,7 @@ Setup and rules:
 </ul>
 </details>
 <details>
-<summary>The prompt (rts-skirmish v2) · difficulty 5/5</summary>
+<summary>The prompt (rts-skirmish v1) · difficulty 5/5</summary>
 <p class="note">sha256 <code>82150aebef6de92ddd876aadb63c5381befc4ef6966cb5f9386673850898c919</code></p>
 <div class="code">Build a real-time strategy game for the browser with three.js: one skirmish, the player against a computer opponent, on a procedurally generated map.
 
@@ -350,7 +323,7 @@ Setup and rules:
 </ul>
 </details>
 <details>
-<summary>The prompt (linked-doorways v2) · difficulty 5/5</summary>
+<summary>The prompt (linked-doorways v1) · difficulty 5/5</summary>
 <p class="note">sha256 <code>2d27440b9d8b5e692c540167884b3cb97f5ff02d1649eb9a0e21a0c7db6bda50</code></p>
 <div class="code">Build a first-person puzzle game for the browser with three.js, built around linked doorways.
 
