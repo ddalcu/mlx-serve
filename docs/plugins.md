@@ -68,6 +68,21 @@ the two vendored modules (`sushi_exl3`, `mlx_stream`). They read only the declar
   fill) keeps its own C++ shim, compiled by our build against the staged MLX headers (mlx-stream's `csrc/`). An MLX
   bump can break such a shim; the plugin's repository fixes it and the pin moves.
 
+## The Neural Engine: `Host.ane`
+
+A plugin reaches the ANE through the host's one runtime (`lib/ane`), never a copy of it:
+`kit.host.Host.of(ctx.host).ane()` is the `HostAne` table, or null (no ANE, Linux, or a host from before the field),
+and then the plugin serves on the GPU. The host owns the mechanism; the plugin owns the policy.
+
+| The host (`HostAne`) | The plugin |
+|---|---|
+| compiling any MIL program (`program_create`; `kit.ane.mil` builds the text and weight blob) with the compile cache, surfaces, requests, evaluation | which ops and layers go to the ANE, the rows each die takes, when it starts and joins an evaluation, its GPU fallback |
+| typed banks: SwiGLU (with DeepSeek V4's `swiglu_limit`) and GatedDeltaNet input projections over int8 per-row weights | quantizing its weights to int8 rows, the layout of its activations |
+| the process's count of resident compiled models (`resident`; about 121 allowed) and its dies, shared with the host's own offloads | staying under that limit |
+
+An evaluation runs on the calling thread. Different programs, banks and requests evaluate concurrently, one caller at
+a time each.
+
 ## Pick the shallowest seam
 
 The deeper the seam, the less of our stack the model gets for free. Use the shallowest one that expresses the work.

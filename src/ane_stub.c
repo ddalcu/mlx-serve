@@ -34,6 +34,7 @@ void msv_ane_cache_sweep(void) {}
 typedef struct msv_ane_program msv_ane_program;
 typedef struct msv_ane_request msv_ane_request;
 int msv_ane_bridge_available(void) { return 0; }
+uint32_t msv_ane_resident(void) { return 0; }
 void *msv_ane_bridge_surface(size_t bytes) {
     (void)bytes;
     return NULL;
@@ -110,9 +111,10 @@ int msv_ane_bank_add_mlp(MsvAneBank *b, uint32_t hidden, uint32_t ffn,
                          uint32_t rows, const int8_t *gate_q,
                          const float *gate_s, const int8_t *up_q,
                          const float *up_s, const int8_t *down_q,
-                         const float *down_s, char *err, size_t err_size) {
+                         const float *down_s, float limit, char *err,
+                         size_t err_size) {
     (void)b; (void)hidden; (void)ffn; (void)rows; (void)gate_q; (void)gate_s;
-    (void)up_q; (void)up_s; (void)down_q; (void)down_s;
+    (void)up_q; (void)up_s; (void)down_q; (void)down_s; (void)limit;
     if (err != NULL && err_size > 0)
         snprintf(err, err_size, "ANE unavailable on Linux");
     return -1;
