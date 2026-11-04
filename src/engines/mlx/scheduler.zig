@@ -853,6 +853,12 @@ pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
                     @as(f64, @floatFromInt(estimated)) / gb,
                     @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
                 });
+            } else if (self.registry.countLoadedLocked() == 0) {
+                log.err("Refusing to load {s}: needs ~{d:.2} GB, and {d:.2} GB of live memory belongs to no model, so no unload can free it. Restart the server.\n", .{
+                    entry.id,
+                    @as(f64, @floatFromInt(estimated)) / gb,
+                    @as(f64, @floatFromInt(mlxActiveBytes())) / gb,
+                });
             } else log.err("Refusing to load {s}: needs ~{d:.2} GB with {d:.2} GB resident ({d:.2} GB live, {d:.2} GB reserved by loads in flight, this one included) across {d} model(s), and unloading the idle ones does not fit it under --max-resident-models {d} and --max-resident-mem {d:.2} GB (0 = off). Unload a model or raise a cap.\n", .{
                 entry.id,
                 @as(f64, @floatFromInt(estimated)) / gb,
