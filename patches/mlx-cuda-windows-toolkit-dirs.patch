@@ -10,7 +10,7 @@ index 44f6d16..349f8e2 100644
 +#include <vector>
  // clang-format on
  
- namespace mlx::core::cu {
+ #include <cuda_runtime.h>
 @@ -57,6 +59,14 @@ fs::path load_cudnn() {
    // Internally cuDNN loads some libs dynamically, add to search dirs.
    load_nvrtc();

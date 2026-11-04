@@ -57,7 +57,14 @@ function Apply-Patch($repo, $patch) {
 }
 Write-Host "== patch mlx + mlx-c"
 foreach ($p in $patches) {
-    Apply-Patch $(if ($p.Name -like "mlxc-*") { $Mlxc } else { $Mlx }) $p.FullName
+    if ($p.Name -like "mlxc-*") {
+        # Reset what the patch touches first, so an edited patch replaces the old one in a tree that built before.
+        $files = git -C $Mlxc apply --numstat $p.FullName | ForEach-Object { ($_ -split "`t")[2] }
+        git -C $Mlxc checkout -- $files
+        Apply-Patch $Mlxc $p.FullName
+    } else {
+        Apply-Patch $Mlx $p.FullName
+    }
 }
 
 $prefix = Join-Path $Work "prefix"
