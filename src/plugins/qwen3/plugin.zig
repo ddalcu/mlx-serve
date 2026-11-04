@@ -84,7 +84,6 @@ fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 /// A loaded model: one of the two bases, and every handle it holds.
 pub const Loaded = struct {
     caps: abi.Caps,
-    embedding_pack: bool = false,
     headless: bool = false,
     body: union(enum) {
         dense: struct { base: bases.Model(Dense), layers: []Dense.Layer },
@@ -134,10 +133,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
 
     const m = try gpa.create(Loaded);
     errdefer gpa.destroy(m);
-    const name = std.fs.path.basename(ctx.model_dir.slice());
-    var lower_buf: [256]u8 = undefined;
-    const named_embedding = name.len <= lower_buf.len and std.mem.indexOf(u8, std.ascii.lowerString(&lower_buf, name), "embedding") != null;
-    m.* = .{ .caps = ctx.parsed.caps, .embedding_pack = !c.moe and (c.embedding_pack or named_embedding), .body = undefined };
+    m.* = .{ .caps = ctx.parsed.caps, .body = undefined };
     // Once the body is initialized below, release() owns cleanup of these handles.
     // A second errdefer here would free them twice when loading a layer fails.
     const shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps);
@@ -216,7 +212,7 @@ fn trunk(comptime D: type, m: *Loaded, r: *ld.Reader, c: *const config.Config, l
     try m.owned.linear(embed);
     const final_norm = try r.need(try r.name(&nb, "norm.weight", .{}));
     try m.owned.own(final_norm);
-    m.headless = m.embedding_pack and !c.tie_word_embeddings and !r.hasHead();
+    m.headless = c.embedding_pack and !c.tie_word_embeddings and !r.hasHead();
     return .{
         .embed = .{ .table = embed, .hidden = @intCast(c.hidden_size), .act = .bfloat16 },
         .layers = layers,

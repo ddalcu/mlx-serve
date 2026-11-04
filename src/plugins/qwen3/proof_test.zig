@@ -39,6 +39,8 @@ pub const Geo = struct {
     omit_head: bool = false,
     /// Qwen3-Embedding's explicit `pooling_mode`.
     last_token_pooling: bool = false,
+    pooling_sidecar: bool = false,
+    named_embedding_dir: bool = false,
 };
 
 const MOE_INTER = 64;
@@ -112,9 +114,22 @@ const Both = struct {
         defer a.free(json);
         b.* = .{ .tmp = testing.tmpDir(.{}), .dir = &.{}, .cfg = undefined, .xfm = undefined, .layers = g.layers, .oracle = try served_test.oracle("qwen3", std.fmt.comptimePrint("both-{x}", .{seed})) };
         errdefer b.tmp.cleanup();
-        try b.tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+        const prefix = if (g.named_embedding_dir) "my-embedding-tests/" else "";
+        if (g.named_embedding_dir) try b.tmp.dir.createDirPath(io, "my-embedding-tests");
+        const config_path = try std.fmt.allocPrint(a, "{s}config.json", .{prefix});
+        defer a.free(config_path);
+        try b.tmp.dir.writeFile(io, .{ .sub_path = config_path, .data = json });
+        if (g.pooling_sidecar) {
+            const sidecar_dir = try std.fmt.allocPrint(a, "{s}1_Pooling", .{prefix});
+            defer a.free(sidecar_dir);
+            try b.tmp.dir.createDirPath(io, sidecar_dir);
+            const sidecar_path = try std.fmt.allocPrint(a, "{s}/config.json", .{sidecar_dir});
+            defer a.free(sidecar_path);
+            try b.tmp.dir.writeFile(io, .{ .sub_path = sidecar_path, .data = "{\"pooling_mode_lasttoken\":true}" });
+        }
         var path_buf: [512]u8 = undefined;
-        b.dir = try a.dupe(u8, path_buf[0..try b.tmp.dir.realPath(io, &path_buf)]);
+        const root = path_buf[0..try b.tmp.dir.realPath(io, &path_buf)];
+        b.dir = if (g.named_embedding_dir) try std.fs.path.join(a, &.{ root, "my-embedding-tests" }) else try a.dupe(u8, root);
         errdefer a.free(b.dir);
         try p.save(b.dir);
         b.cfg = try model.parseConfig(io, a, b.dir);
@@ -393,6 +408,19 @@ test "qwen3 plugin: a Qwen3-Embedding pack's pooled rows equal the legacy dense 
 test "qwen3 plugin: missing untied chat head fails without double cleanup" {
     var b: Both = undefined;
     try testing.expectError(error.MissingWeight, b.open(.{ .head_dim = 256, .omit_head = true }, 0x3e02));
+}
+
+test "qwen3 plugin: a misleading embedding folder does not permit a missing chat head" {
+    var b: Both = undefined;
+    try testing.expectError(error.MissingWeight, b.open(.{ .head_dim = 256, .omit_head = true, .named_embedding_dir = true }, 0x3e02));
+}
+
+test "qwen3 plugin: a pooling sidecar permits a headless embedding pack" {
+    var b: Both = undefined;
+    try b.open(.{ .head_dim = 256, .omit_head = true, .pooling_sidecar = true }, 0x3e02);
+    defer b.close();
+    try testing.expectEqual(model.PoolingMode.last_token, b.cfg.pooling_mode.?);
+    for (embed_batches) |seqs| try expectEmbeddings(&b, seqs);
 }
 
 test "qwen3 plugin: headless embeddings match identical tied weights" {

@@ -185,7 +185,6 @@ const WoA = struct {
     };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
-        if (p.nax and !device.naxAvailable()) return null;
         if (s.k != HPG * HD) return null;
         const pl = plan(ci(s.rows), ci(p.groups * HPG), ci(p.s), HD, ci(p.groups), ci(s.n), RD, p.nax) orelse return null;
         var g = metal.Geometry{ .grid = pl.grid, .tg = pl.tg, .unread = 0b10 };
@@ -409,7 +408,6 @@ pub fn register(set: *kc.Set) !void {
         .in_place = true,
         .tiles = .{ .{}, .{ .size = NAX_NR * NAX_NSG, .step = NAX_NR * NAX_NSG, .min = NAX_NR * NAX_NSG }, .{} },
         .served = &served_nax,
-        .nax = true,
     });
 }
 
