@@ -30,6 +30,9 @@ pub const Opts = struct {
     experts_fp4: bool = false,
     /// This rank's slice of every expert and attention head, cut as the loader cuts it (`Shard.axis`).
     tp: ?Shard = null,
+    /// Every routed projection affine at this width over groups of 128 (the expert-pruned packs) instead of the iQ
+    /// pack's plan (gate/up 2 or 3 bits, down 3, groups of 64).
+    experts_affine: ?u32 = null,
 };
 
 pub const Fixture = struct {
@@ -38,15 +41,17 @@ pub const Fixture = struct {
     w: resident.Weights,
     seed: u64,
     draws: u64 = 0,
+    /// The routed experts' affine group.
+    group: c_int = 64,
 
     pub fn init(gpa: std.mem.Allocator, opts: Opts) !*Fixture {
         const fx = try gpa.create(Fixture);
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
         cfg.num_experts = opts.experts;
-        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed };
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed, .group = if (opts.experts_affine != null) 128 else 64 };
         errdefer fx.w.deinit();
-        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4);
+        for (opts.lo..opts.hi) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, opts.experts_fp4, opts.experts_affine);
         if (opts.tp) |t| try fx.sliceShard(t);
         fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = .{ .lo = opts.lo, .hi = opts.hi, .worker = true }, .act = opts.act, .tp = opts.tp });
         errdefer fx.m.deinit();
@@ -185,7 +190,7 @@ pub const Fixture = struct {
             },
             .mxfp8, .mxfp4, .affine => {
                 defer _ = mlx.mlx_array_free(w);
-                const q = if (fmt == .mxfp8) try quantize(w, 32, 8, "mxfp8") else if (fmt == .mxfp4) try quantize(w, 32, 4, "mxfp4") else try quantize(w, 64, @intCast(fmt.affine), "affine");
+                const q = if (fmt == .mxfp8) try quantize(w, 32, 8, "mxfp8") else if (fmt == .mxfp4) try quantize(w, 32, 4, "mxfp4") else try quantize(w, fx.group, @intCast(fmt.affine), "affine");
                 try fx.putNamed(base ++ ".weight", args, q[0]);
                 try fx.putNamed(base ++ ".scales", args, q[1]);
                 if (q[2].ctx != null) try fx.putNamed(base ++ ".biases", args, q[2]);
@@ -199,7 +204,7 @@ pub const Fixture = struct {
 
     /// One trunk layer's tensors under the names `loadLayer` reads, in the release's formats.
     /// Layer `li`'s tensors under `pfx` (a trunk layer's, or a DSpark stage's under "mtp.{d}.").
-    pub fn putLayer(fx: *Fixture, c: *const config.Config, comptime pfx: []const u8, li: usize, E: u32, fp4: bool) !void {
+    pub fn putLayer(fx: *Fixture, c: *const config.Config, comptime pfx: []const u8, li: usize, E: u32, fp4: bool, affine: ?u32) !void {
         const d: c_int = @intCast(c.hidden_size);
         const hc: c_int = @intCast(c.dsv4_hc_mult);
         const mix = (2 + hc) * hc;
@@ -216,7 +221,7 @@ pub const Fixture = struct {
         const ix_src = (c.dsv41_index_sources >> @intCast(li)) & 1 != 0;
         const ratio = c.dsv4_compress_ratios[li];
         // The release's expert plan: gate/up 3-bit at layers 1-9 and 14, 2-bit elsewhere; down 3-bit.
-        const gu_bits: u32 = if ((li >= 1 and li <= 9) or li == 14) 3 else 2;
+        const gu_bits: u32 = affine orelse if ((li >= 1 and li <= 9) or li == 14) 3 else 2;
         try fx.putVec(pfx ++ "attn_norm.weight", .{li}, &.{d}, .bfloat16, 1, 0.1);
         try fx.putVec(pfx ++ "ffn_norm.weight", .{li}, &.{d}, .bfloat16, 1, 0.1);
         try fx.putVec(pfx ++ "attn.q_norm.weight", .{li}, &.{ql}, .bfloat16, 1, 0.1);
@@ -255,7 +260,7 @@ pub const Fixture = struct {
         for (0..E) |x| {
             try fx.putLin(pfx ++ "ffn.experts.{d}.w1", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
             try fx.putLin(pfx ++ "ffn.experts.{d}.w3", .{ li, x }, &.{ inter, d }, if (fp4) .mxfp4 else .{ .affine = gu_bits });
-            try fx.putLin(pfx ++ "ffn.experts.{d}.w2", .{ li, x }, &.{ d, inter }, if (fp4) .mxfp4 else .{ .affine = 3 });
+            try fx.putLin(pfx ++ "ffn.experts.{d}.w2", .{ li, x }, &.{ d, inter }, if (fp4) .mxfp4 else .{ .affine = affine orelse 3 });
         }
     }
 };
@@ -434,7 +439,7 @@ test "dsv41 tensor parallel: rank 0 holds a DSpark stage at the whole model's wi
         var whole = try releaseConfig();
         whole.dsv41_dspark_experts = 8;
         f.*.m.cfg.dsv41_dspark_experts = 8;
-        try f.*.putLayer(&whole, "mtp.{d}.", 0, 8, true);
+        try f.*.putLayer(&whole, "mtp.{d}.", 0, 8, true, null);
         const m = f.*.m;
         const ly = try dsv41.loadLayer(m, &f.*.w, "mtp", 0, null);
         m.layers = try gpa.realloc(m.layers, m.n_layers + 1);

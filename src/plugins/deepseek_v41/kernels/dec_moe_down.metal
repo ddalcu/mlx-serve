@@ -1,11 +1,11 @@
-// dec_moe_down: the routed and shared down projections of ROWS decode rows, the combine and the hc expand into the next
+// dec_moe_down: the routed (affine BITS 2 or 3, group GS 64 or 128) and shared down projections of ROWS decode rows, the combine and the hc expand into the next
 // stream. A thread owns one output row and one 128-value unit of the reduction axis; a threadgroup RB rows, every
 // expert the rows pick (each distinct one read once) and the shared expert.
 constexpr int UNITS = K / 128;
 constexpr int NT = RB * UNITS;
 constexpr int NV = K / 8;
-constexpr int KW = K * 3 / 32;
-constexpr int KG = K / 64;
+constexpr int KW = K * BITS / 32;
+constexpr int KG = K / GS;
 constexpr int PS = 148;
 constexpr int PAIRS = ROWS * TOPK;
 const uint t = thread_position_in_threadgroup.x;
@@ -48,9 +48,10 @@ if (ROWS > 1) {
   threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
-// Stage the activation row XR (K bf16) for the 3-bit dots: 34 terms a 32 values, each its value times 2^-shift of its
-// field in its word (the two halves of a field across words 0|1 and 1|2 as two terms), and each 64-value group's sum.
-#define STAGE3(XR, BUF) { \
+// Stage the activation row XR (K bf16) for the BITS-bit dots, each term its value times 2^-shift of its field in its word,
+// and each 64 values' sum. 3-bit: 34 terms a 32 values (the two halves of a field across words 0|1 and 1|2 as two terms);
+// 2-bit: 32, value i at shift 2 * (i % 16).
+#define STAGEQ(XR, BUF) { \
   for (uint c = t; c - t < uint(NV); c += NT) { \
     const bool on = c < uint(NV); \
     uint4 v = uint4(0); \
@@ -66,7 +67,9 @@ if (ROWS > 1) {
       part += xf[k]; \
       const uint i = i0 + k; \
       const uint sh = (3u * i) & 31u; \
-      if (on) { \
+      if (on && BITS == 2) { \
+        pb[i] = xf[k] * as_type<float>((127u - 2u * (i % 16u)) << 23); \
+      } else if (on) { \
         if (sh >= 30u) { \
           const uint term = i == 10u ? 10u : 22u; \
           pb[term] = xf[k] * as_type<float>((127u - sh) << 23); \
@@ -100,20 +103,25 @@ if (ROWS > 1) {
 float accr[ROWS];
 for (int a = 0; a < ROWS; ++a) accr[a] = 0.0f;
 
-STAGE3(ROWS > 1 ? jx[0] : 0u, 0)
+STAGEQ(ROWS > 1 ? jx[0] : 0u, 0)
 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-uint4 wr[3];
-uint sc_ = 0u, bi_ = 0u;
+uint4 wr[BITS];
+float2 s_ = float2(0.0f), b_ = float2(0.0f);
 for (int f = 0; f < PAIRS; ++f) {
   const int cur = f & 1;
-  if (f + 1 < PAIRS) STAGE3(ROWS > 1 ? jx[f + 1] : uint(f + 1), cur ^ 1) else STAGE8(uint(TOPK), cur ^ 1)
+  if (f + 1 < PAIRS) STAGEQ(ROWS > 1 ? jx[f + 1] : uint(f + 1), cur ^ 1) else STAGE8(uint(TOPK), cur ^ 1)
   if (ROWS == 1 || jn[f] != 0u) {
     const size_t row = size_t(ROWS > 1 ? je[f] : uint(inds[f])) * N + d0 + rb;
-    const device uint4* wp = (const device uint4*)(w + row * KW + 12 * u);
-    wr[0] = wp[0]; wr[1] = wp[1]; wr[2] = wp[2];
-    sc_ = ((const device uint*)(scales + row * KG))[u];
-    bi_ = ((const device uint*)(biases + row * KG))[u];
+    const device uint4* wp = (const device uint4*)(w + row * KW + 4 * BITS * u);
+    for (int i = 0; i < BITS; ++i) wr[i] = wp[i];
+    if constexpr (GS == 64) {  // the unit's two groups
+      s_ = dsv41_bf2(((const device uint*)(scales + row * KG))[u]);
+      b_ = dsv41_bf2(((const device uint*)(biases + row * KG))[u]);
+    } else {
+      s_.x = float(scales[row * KG + u]);
+      b_.x = float(biases[row * KG + u]);
+    }
   }
   const threadgroup float* pu = pbuf + cur * UNITS * PS + u * PS;
   float dq = 0.0f, c = 0.0f;
@@ -123,12 +131,15 @@ for (int f = 0; f < PAIRS; ++f) {
       const float4 v = ((const threadgroup float4*)(pu + q * 36))[h];
       p[4 * h] = v.x; p[4 * h + 1] = v.y; p[4 * h + 2] = v.z; p[4 * h + 3] = v.w;
     }
-    dq = dsv41_dot96(p, wr[(3 * q) / 4][(3 * q) % 4], wr[(3 * q + 1) / 4][(3 * q + 1) % 4], wr[(3 * q + 2) / 4][(3 * q + 2) % 4], dq);
-    if (q & 1) {
+    if constexpr (BITS == 2) dq = dsv41_dot64(p, wr[q / 2][(2 * q) % 4], wr[q / 2][(2 * q + 1) % 4], dq);
+    else dq = dsv41_dot96(p, wr[(3 * q) / 4][(3 * q) % 4], wr[(3 * q + 1) / 4][(3 * q + 1) % 4], wr[(3 * q + 2) / 4][(3 * q + 2) % 4], dq);
+    if (GS == 64 && (q & 1)) {
       const float xs = xsb[cur * UNITS * 2 + u * 2 + (q >> 1)];
-      const float2 s = dsv41_bf2(sc_), b = dsv41_bf2(bi_);
-      c = metal::fma(q == 1 ? s.x : s.y, dq, metal::fma(q == 1 ? b.x : b.y, xs, c));
+      c = metal::fma(q == 1 ? s_.x : s_.y, dq, metal::fma(q == 1 ? b_.x : b_.y, xs, c));
       dq = 0.0f;
+    } else if (GS == 128 && q == 3) {
+      const float xs = xsb[cur * UNITS * 2 + u * 2] + xsb[cur * UNITS * 2 + u * 2 + 1];
+      c = metal::fma(s_.x, dq, metal::fma(b_.x, xs, c));
     }
   }
   const uint r = ROWS > 1 ? jr[f] : 0u;

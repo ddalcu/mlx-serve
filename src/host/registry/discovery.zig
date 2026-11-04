@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const log = @import("../../sdk/util/log.zig");
+const json_text = @import("../../sdk/util/json_text.zig");
 const gguf_meta = @import("../../sdk/quant/gguf/engine_pick.zig");
 // Only the pure JSON contract predicate is referenced — lazy analysis keeps
 // dflash.zig's mlx FFI out of this filesystem-only module.
@@ -97,7 +98,9 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
     var rs = file.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .missing_or_unparseable;
+    const raw = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .missing_or_unparseable;
+    defer allocator.free(raw);
+    const bytes = json_text.quoteInfinity(allocator, raw) catch return .missing_or_unparseable;
     defer allocator.free(bytes);
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return .missing_or_unparseable;
     defer parsed.deinit();
@@ -926,7 +929,9 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
     var rs = file.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .{};
+    const raw = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .{};
+    defer allocator.free(raw);
+    const bytes = json_text.quoteInfinity(allocator, raw) catch return .{};
     defer allocator.free(bytes);
 
     const sniff = sniffChatTemplate(io, allocator, dir);
@@ -1780,6 +1785,10 @@ test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
     try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
     try testing.expect(isGgufSidecarBasename("DeepSeek-V4-Flash-DSpark-support.gguf"));
     try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-dsparkle-chat.gguf"));
+    // Unsloth names its V4.1 stage bundle with a `dspark-` prefix.
+    try testing.expect(isMtpGgufBasename("dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"));
+    try testing.expect(isGgufSidecarBasename("dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"));
+    try testing.expect(!isMtpGgufBasename("dsparkle-Q8_0.gguf"));
 
     try testing.expect(!isGgufSidecarBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
     try testing.expect(!isGgufSidecarBasename("Qwen3.5-4B-IQ4_NL.gguf"));

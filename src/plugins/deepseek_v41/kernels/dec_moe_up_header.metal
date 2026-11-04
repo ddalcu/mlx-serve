@@ -35,12 +35,13 @@ inline void dec_up_table(threadgroup vec<float, BITS == 2 ? 4 : 2>* lut, uint ti
 
 // The gate (acc[rr][0]) and up (acc[rr][1]) sums of one expert's output row against RG x rows, over the simdgroup; the
 // weights are decoded once whatever RG is. `xrow[rr]` is the row of `x` rr reads; `lut` decodes EPL fields at a time.
-template <int BITS, int K, int N, int RG, typename T>
+template <int BITS, int GS, int K, int N, int RG, typename T>
 inline void dec_up_routed(const device uint32_t* w, const device T* sc, const device T* bi, uint row, const device T* x, thread const uint* xrow, uint lane, thread float (*acc)[2], threadgroup const vec<float, BITS == 2 ? 4 : 2>* lut) {
-  constexpr uint KW = K * BITS / 32, KG = K / 64, UPL = K / 1024;
+  // A lane's 32 inputs lie in one quant group of GS (64 or 128): GS / 32 lanes share a scale.
+  constexpr uint KW = K * BITS / 32, KG = K / GS, UPL = K / 1024, UPG = GS / 32;
   constexpr int EPL = BITS == 2 ? 4 : 2, NIDX = 8 / EPL;
   const uint wo[2] = {row * KW + lane * BITS, (row + N) * KW + lane * BITS};
-  const uint so[2] = {row * KG + lane / 2, (row + N) * KG + lane / 2};
+  const uint so[2] = {row * KG + lane / UPG, (row + N) * KG + lane / UPG};
 #pragma unroll
   for (int rr = 0; rr < RG; ++rr) acc[rr][0] = acc[rr][1] = 0.0f;
 #pragma unroll
@@ -58,8 +59,8 @@ inline void dec_up_routed(const device uint32_t* w, const device T* sc, const de
 #pragma unroll
         for (int j = 0; j < BITS; ++j) q[wr][j] = w[wo[wr] + k * 32 * BITS + j];
       }
-      s[wr] = float(sc[so[wr] + 16 * k]);
-      b[wr] = float(bi[so[wr] + 16 * k]);
+      s[wr] = float(sc[so[wr] + (32 / UPG) * k]);
+      b[wr] = float(bi[so[wr] + (32 / UPG) * k]);
     }
     float xs[RG], dq[RG][2];
 #pragma unroll

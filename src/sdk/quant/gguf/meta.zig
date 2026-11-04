@@ -40,6 +40,8 @@ const TokenizerKind = struct {
     model_fields: []const u8 = "",
     /// A token HF lists as special that the GGUF types as a normal one.
     also_special: []const u8 = "",
+    /// A token HF lists as added (atomic, not special) that the GGUF types as a normal one.
+    also_added: []const u8 = "",
     /// A SentencePiece vocab without merges: user-defined tokens keep their
     /// spaces as "\u2581" and the merges are derived from the scores the way
     /// HF's converter does it.
@@ -95,7 +97,7 @@ const TokenizerKind = struct {
         \\"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
         };
         // DeepSeek-V4.1 (llama.cpp's name for its pre-tokenizer).
-        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "joyai-llm")) return .{ .head =
+        if (std.mem.eql(u8, model, "gpt2") and std.mem.eql(u8, pre, "joyai-llm")) return .{ .also_added = "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>", .head =
         \\"pre_tokenizer":{"type":"Sequence","pretokenizers":[{"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+"},"behavior":"Isolated","invert":false},{"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},{"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
         \\"decoder":{"type":"ByteLevel","add_prefix_space":true,"trim_offsets":true,"use_regex":true},
         };
@@ -135,9 +137,8 @@ pub fn tokenizerJson(allocator: std.mem.Allocator, f: *const gguf.File) ![]u8 {
     var first = true;
     while (it.next()) |tok| : (id += 1) {
         const ty = types.int(id);
-        const special = ty == TOKEN_CONTROL or (kind.also_special.len > 0 and std.mem.eql(u8, tok, kind.also_special));
         const spaces = kind.spm and ty == TOKEN_USER_DEFINED;
-        if (special or ty == TOKEN_USER_DEFINED) {
+        if (addedSpecial(kind, tok, ty)) |special| {
             if (added.items.len > 0) try added.append(allocator, ',');
             try added.print(allocator, "{{\"id\":{d},\"special\":{},\"content\":", .{ id, special });
             try appendJsonToken(allocator, &added, tok, spaces);
@@ -163,6 +164,13 @@ pub fn tokenizerJson(allocator: std.mem.Allocator, f: *const gguf.File) ![]u8 {
     try out.appendSlice(allocator, added.items);
     try out.appendSlice(allocator, "]}");
     return out.toOwnedSlice(allocator);
+}
+
+/// Whether `tok` (llama.cpp type `ty`) is an added token, and then whether it is special; null = a plain vocab entry.
+fn addedSpecial(kind: TokenizerKind, tok: []const u8, ty: i64) ?bool {
+    if (ty == TOKEN_CONTROL or (kind.also_special.len > 0 and std.mem.eql(u8, tok, kind.also_special))) return true;
+    if (ty == TOKEN_USER_DEFINED or (kind.also_added.len > 0 and std.mem.eql(u8, tok, kind.also_added))) return false;
+    return null;
 }
 
 /// The tokenizer_config.json fields mlx-serve reads: template + named special tokens.
@@ -302,6 +310,14 @@ test "Llama 4's pre-tokenizer reads as GPT-4o's, Flint's keeps its own digit and
     try std.testing.expect(TokenizerKind.ofNames("gpt2", "flint", "llama-bpe") == null);
 }
 
+test "DeepSeek-V4.1's image placeholder stays one token when the DS4 converter types it as a normal one" {
+    const ds = TokenizerKind.ofNames("gpt2", "deepseek41", "joyai-llm").?;
+    try std.testing.expectEqual(@as(?bool, false), addedSpecial(ds, "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>", 1));
+    try std.testing.expectEqual(@as(?bool, null), addedSpecial(ds, "image", 1));
+    try std.testing.expectEqual(@as(?bool, true), addedSpecial(ds, "<\xef\xbd\x9cend\xe2\x96\x81of\xe2\x96\x81sentence\xef\xbd\x9c>", TOKEN_CONTROL));
+    try std.testing.expectEqual(@as(?bool, false), addedSpecial(ds, "x", TOKEN_USER_DEFINED));
+}
+
 test "derived merges follow HF's order: score, then longer pieces, user-defined tokens as score 0" {
     // vocab: a b ab abb bb "  " (user-defined, spaces) with scores
     const w = TestArrays{ .tokens = &.{ "a", "b", "\xe2\x96\x81", "ab", "abb", "bb", "  " }, .types = &.{ 1, 1, 1, 1, 1, 1, TOKEN_USER_DEFINED }, .scores = &.{ -1, -1, -1, -3, -2, -3, -1000 } };
@@ -366,6 +382,32 @@ test "appendJsonString round-trips through the JSON parser" {
     try std.testing.expectEqualStrings(raw, parsed.value);
 }
 
+test "unsupportedReason serves DeepSeek-V4.1's DS4 layout: IQ2_XXS / Q2_K expert banks, its I8 Engram rows left in the file" {
+    const ds41 = @import("arch.zig").deepseek41;
+    var f = try ds41.testFileDs4(ds41.release_config);
+    defer f.deinit();
+    const a = f.arena.allocator();
+    try f.kv.put(a, "general.architecture", .{ .string = ds41.arch_name });
+    try f.kv.put(a, "tokenizer.ggml.model", .{ .string = "gpt2" });
+    try f.kv.put(a, "tokenizer.ggml.pre", .{ .string = "joyai-llm" });
+    const tensors = [_]struct { []const u8, [3]u64, @import("quants.zig").GgmlType }{
+        .{ "token_embd.weight", .{ 5120, 129280, 1 }, .f16 },
+        .{ "output.weight", .{ 5120, 129280, 1 }, .q8_0 },
+        .{ "blk.0.attn_output_a.weight", .{ 4096, 8192, 1 }, .q8_0 },
+        .{ "blk.0.ffn_gate_exps.weight", .{ 5120, 2304, 384 }, .iq2_xxs },
+        .{ "blk.0.ffn_down_exps.weight", .{ 2304, 5120, 384 }, .q2_k },
+        .{ "blk.1.engram_q_norm.weight", .{ 5120, 4, 1 }, .f32 },
+        .{ "blk.1.engram_kv.weight", .{ 6144, 25600, 1 }, .f16 },
+        .{ "blk.1.engram_embd.weight", .{ 264, 384006168, 1 }, ds41.engram_row_type },
+    };
+    for (tensors) |t| try f.tensors.put(a, t[0], .{ .dims = .{ t[1][0], t[1][1], t[1][2], 1 }, .n_dims = if (t[1][2] > 1) 3 else 2, .ty = t[2], .data = &.{} });
+    var buf: [200]u8 = undefined;
+    try std.testing.expectEqual(@as(?[]const u8, null), unsupportedReason(&f, &buf));
+    // A raw Q2_K bank outside the routed experts has no kernel in the forward.
+    try f.tensors.put(a, "blk.0.ffn_down_shexp.weight", .{ .dims = .{ 2304, 5120, 1, 1 }, .n_dims = 2, .ty = .q2_k, .data = &.{} });
+    try std.testing.expectEqualStrings("tensor type of blk.0.ffn_down_shexp.weight", unsupportedReason(&f, &buf).?);
+}
+
 test "real model: synthesized JSON parses and matches the GGUF (a real GGUF, env-gated)" {
     const path = std.mem.span(env.get(.MLX_SERVE_GGUF_TEST_MODEL) orelse return error.SkipZigTest);
     const a = std.testing.allocator;
@@ -392,7 +434,8 @@ test "real model: synthesized JSON parses and matches the GGUF (a real GGUF, env
     const tc_parsed = try std.json.parseFromSlice(std.json.Value, a, tc, .{});
     defer tc_parsed.deinit();
     try std.testing.expect(tc_parsed.value.object.get("eos_token").?.string.len > 0);
-    try std.testing.expect(tc_parsed.value.object.get("chat_template").?.string.len > 100);
+    // DS4 GGUFs ship no template (the plugin renders its own): the rebuilt one is whatever the file holds.
+    try std.testing.expectEqualStrings(f.getString("tokenizer.chat_template") orelse "", tc_parsed.value.object.get("chat_template").?.string);
 
     if (try generationConfigJson(a, &f)) |gc| {
         defer a.free(gc);

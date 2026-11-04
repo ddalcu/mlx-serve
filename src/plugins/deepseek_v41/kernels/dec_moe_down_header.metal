@@ -15,3 +15,10 @@ inline float dsv41_dot96(const thread float* p, uint w0, uint w1, uint w2, float
   for (int i = 0; i < 10; ++i) d = metal::fma(p[24 + i], float(w2 & (7u << (2 + 3 * i))), d);
   return d;
 }
+
+// A 2-bit group's dot over 32 values (2 words, value i at bit 2 (i % 16) of word i / 16) against their 32 prescaled terms.
+inline float dsv41_dot64(const thread float* p, uint w0, uint w1, float d) {
+  for (int i = 0; i < 16; ++i) d = metal::fma(p[i], float(w0 & (3u << (2 * i))), d);
+  for (int i = 0; i < 16; ++i) d = metal::fma(p[16 + i], float(w1 & (3u << (2 * i))), d);
+  return d;
+}

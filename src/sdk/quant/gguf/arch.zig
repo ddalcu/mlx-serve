@@ -104,7 +104,7 @@ pub const Arch = union(enum) {
             .qwen3 => |hp| qwen3.configJson(allocator, hp),
             .flint => |hp| flint.configJson(allocator, hp),
             .muse_glimmer => |hp| muse_glimmer.configJson(allocator, hp),
-            .deepseek41 => |hp| deepseek41.configJson(allocator, hp),
+            .deepseek41 => |hp| deepseek41.configJson(allocator, hp, null),
         };
     }
 

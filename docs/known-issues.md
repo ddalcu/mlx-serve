@@ -79,6 +79,8 @@ classes the composed chain treats differently):
 - `deepseek_v41` `engram` launches 1024 threads at 5120-wide rows where M1/M2 compile it for 928, unprobed: decode
   Engram writes fail on M1/M2.
 - `ltx` `ltx_na3d_*`: a +Inf score returns that key's value where a float64 softmax gives NaN.
+- `deepseek_v41` `moe_dn_gguf` at Q3_K: a planted infinite block scale gives +Inf on 4 of 1280 outputs where float64
+  gives NaN (the gathers' Q3_K slice passes); Q3_K expert banks decode on `routed` until it is explained.
 - No registered contract (`src/sdk/testing/kernel_contract/REGISTERING.md`) for the 20 `glm5_next` kernels, the
   absorbed EXL3 kernels (`src/sdk/quant/exl3/`), MiMo's streamer and GLM-5.3-Flash's EXL3 lane
   (`src/sdk/weights/streamed/`) and GLM-5.3's (`src/plugins/glm_moe_dsa/`): about half the kernel files.

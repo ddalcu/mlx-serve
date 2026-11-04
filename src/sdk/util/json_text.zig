@@ -48,6 +48,42 @@ pub fn isJsonNumber(s: []const u8) bool {
     return i == s.len;
 }
 
+/// Python's `json.dump` writes an infinite float as a bare `Infinity` or `-Infinity`, which JSON rejects (mlx-lm's
+/// Nemotron-H configs carry `"time_step_limit": [0.0, Infinity]`): a copy of `text` with each one outside a string
+/// quoted, the spelling the config parsers read as infinity. Caller frees.
+pub fn quoteInfinity(a: std.mem.Allocator, text: []const u8) ![]u8 {
+    const word = "Infinity";
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var in_string = false;
+    var i: usize = 0;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (in_string) {
+            if (c == '\\' and i + 1 < text.len) {
+                try out.appendSlice(a, text[i..][0..2]);
+                i += 1;
+                continue;
+            }
+            if (c == '"') in_string = false;
+        } else if (c == '"') {
+            in_string = true;
+        } else {
+            const neg = c == '-' and std.mem.startsWith(u8, text[i + 1 ..], word);
+            if (neg or std.mem.startsWith(u8, text[i..], word)) {
+                const n = word.len + @intFromBool(neg);
+                try out.append(a, '"');
+                try out.appendSlice(a, text[i..][0..n]);
+                try out.append(a, '"');
+                i += n - 1;
+                continue;
+            }
+        }
+        try out.append(a, c);
+    }
+    return out.toOwnedSlice(a);
+}
+
 /// One UTF-8 sequence starting at `i`: `valid` = well-formed, else `end` is the maximal
 /// subpart to replace with U+FFFD (a character split across two tokens costs ONE replacement).
 pub const Utf8Seq = struct { end: usize, valid: bool };
@@ -113,6 +149,14 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
 }
 
 // ── tests ──
+
+test "quoteInfinity: Python's bare Infinity and -Infinity become quoted words; strings, escapes and keys keep theirs" {
+    const fixed = try quoteInfinity(testing.allocator, "{\"limit\": [0.0, Infinity, -Infinity], \"s\": \"Infinity \\\" Infinity\", \"Infinity\": 1}");
+    defer testing.allocator.free(fixed);
+    try testing.expectEqualStrings("{\"limit\": [0.0, \"Infinity\", \"-Infinity\"], \"s\": \"Infinity \\\" Infinity\", \"Infinity\": 1}", fixed);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, fixed, .{});
+    parsed.deinit();
+}
 
 test "isJsonLiteral" {
     try testing.expect(isJsonLiteral("true"));

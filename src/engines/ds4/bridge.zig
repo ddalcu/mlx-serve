@@ -244,16 +244,12 @@ pub const OpenOptions = struct {
     prefill_chunk: u32 = 0,
 };
 
-/// Whether to actually pass `--dspark` to the engine: only when a support
-/// GGUF is going in too — ds4 hard-errors open() on `--dspark` with no
-/// `--mtp FILE`, and a missing OPTIONAL accelerator must degrade to a serial
-/// boot, never a boot failure. Pure; unit-tested.
-/// Whether the GGUF header declares an in-checkpoint MTP head; the callers
-/// AND it with the `--mtp` request before `OpenOptions.embedded_mtp`.
-pub fn ggufDeclaresEmbeddedMtp(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
-    var info = gguf_meta.readFromFile(io, allocator, path) catch return false;
+/// What the GGUF header lets ds4 draft from (`gguf_meta.ds4Spec`); the callers
+/// ask only when `--mtp` is on.
+pub fn ggufSpec(io: std.Io, allocator: std.mem.Allocator, path: []const u8) gguf_meta.Spec {
+    var info = gguf_meta.readFromFile(io, allocator, path) catch return .{};
     defer info.deinit(allocator);
-    return info.embedded_mtp;
+    return gguf_meta.ds4Spec(info);
 }
 
 /// ds4 reads ONE file and exit()s the process on a missing tensor, so a split
@@ -274,6 +270,10 @@ pub fn contextBytes(ctx: u32) u64 {
     return ffi.ds4_context_memory_estimate(OpenOptions.default_backend, @intCast(ctx)).total_bytes;
 }
 
+/// Whether to actually pass `--dspark` to the engine: only when a support
+/// GGUF is going in too — ds4 hard-errors open() on `--dspark` with no
+/// `--mtp FILE`, and a missing OPTIONAL accelerator must degrade to a serial
+/// boot, never a boot failure. Pure; unit-tested.
 pub fn dsparkEffective(requested: bool, has_support_gguf: bool) bool {
     return requested and has_support_gguf;
 }

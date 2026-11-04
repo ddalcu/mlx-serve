@@ -63,6 +63,23 @@ struct GgTile {
     }
 };
 
+// One 32-weight unit against activations already in registers (`gather_body`).
+struct GgDotR {
+    float4 x[8];
+    float4 acc;
+    void emit(uint i, float4 v) { acc += v * x[i]; }
+};
+
+// Weights of one row into its row of a threadgroup tile, four at a store: the right operand `gather_nax`'s matrix
+// units read transposed.
+template <typename T>
+struct GgRow {
+    threadgroup T *row;
+    void emit(uint i, float4 v) {
+        *(threadgroup vec<T, 4> *)(row + 4 * i) = vec<T, 4>(v);
+    }
+};
+
 #define GG_U4(p) uint4(uchar4(*(const device packed_uchar4 *)(p)))
 // The 4 bytes of a word as lanes: a split row's payload comes in as aligned 16-byte loads.
 inline uint4 gg_bytes(uint w) {

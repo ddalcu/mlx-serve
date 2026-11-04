@@ -8,6 +8,9 @@ const mlx = @import("../../mlx/ffi.zig");
 const kit = @import("../deepseek_v4/contract_kit.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const v41 = @import("deepseek_v41.zig");
+const gguf = @import("../../sdk/quant/gguf/kernels.zig");
+const gguf_contract = @import("../../sdk/quant/gguf/contract.zig");
+const gguf_quants = @import("../../sdk/quant/gguf/quants.zig");
 
 const spec = kit.spec;
 const metal = kit.metal;
@@ -2801,6 +2804,317 @@ const MoeDn = struct {
     }
 };
 
+// ── the GGUF decode MoE (`ffnDecodeGguf`): shapes (decode rows, outputs, K), TOPK slots over 8 experts ──
+
+/// A GGUF expert bank's stored bytes (one value a byte, as the rig binds uint8; split types packed as the loader packs
+/// them), `rows` rows of `k` weights.
+const GgufBank = struct {
+    bytes: []f64,
+    ty: gguf_quants.GgmlType,
+    k: usize,
+
+    fn add(c: anytype, ty: gguf_quants.GgmlType, rows: []const usize, k: usize) !GgufBank {
+        var d: [3]usize = undefined;
+        @memcpy(d[0..rows.len], rows);
+        d[rows.len] = gguf.rowBytes(ty, k);
+        return .{ .bytes = try c.add(.uint8, d[0 .. rows.len + 1]), .ty = ty, .k = k };
+    }
+
+    /// Random finite blocks, or (`stress`) integer blocks whose second half repeats the first negated (the scale's
+    /// sign flipped), against x rows from `mirroredRows`: weight 1 on a row's first 8 entries, so the 8 terms the
+    /// mirror leaves sum exactly in bf16 too (Q8_0 and Q4_0, the integer types).
+    fn fill(self: GgufBank, rng: std.Random, stress: bool, scratch: std.mem.Allocator) !void {
+        const bb = self.ty.blockBytes();
+        const nb = self.k / self.ty.blockElems();
+        const rb = gguf.rowBytes(self.ty, self.k);
+        const rows = self.bytes.len / rb;
+        const raw = try scratch.alloc(u8, rows * nb * bb);
+        defer scratch.free(raw);
+        var dec: [256]f32 = undefined;
+        for (0..rows * nb) |b| {
+            const blk = raw[b * bb ..][0..bb];
+            if (stress and b % nb >= nb / 2) {
+                @memcpy(blk, raw[(b - nb / 2) * bb ..][0..bb]);
+                gguf_contract.negate(self.ty, blk);
+            } else if (stress) {
+                gguf_contract.integerBlock(self.ty, blk, rng);
+                if (b % nb == 0) gguf_contract.onesFirst8(self.ty, blk);
+            } else try gguf_contract.randomBlock(self.ty, blk, dec[0..self.ty.blockElems()], rng, false);
+        }
+        const stored = try scratch.alloc(u8, rows * rb);
+        defer scratch.free(stored);
+        if (gguf.isSplit(self.ty, self.k)) gguf.packRows(self.ty, self.k, stored, raw) else @memcpy(stored, raw);
+        for (self.bytes, stored) |*o, v| o.* = @floatFromInt(v);
+    }
+
+    /// Block `j` of row `r` in ggml's own layout (a split row's payload and head put back together).
+    fn block(self: GgufBank, r: usize, j: usize, out: []u8) void {
+        const bb = self.ty.blockBytes();
+        const row = self.bytes[r * gguf.rowBytes(self.ty, self.k) ..];
+        const l = gguf.splitLayout(self.ty) orelse {
+            for (out[0..bb], row[j * bb ..][0..bb]) |*o, v| o.* = @intFromFloat(v);
+            return;
+        };
+        const nb = self.k / self.ty.blockElems();
+        const head_at: usize = if (l.payload_at == 0) l.payload else 0;
+        for (out[l.payload_at..][0..l.payload], row[j * l.payload ..][0..l.payload]) |*o, v| o.* = @intFromFloat(v);
+        for (out[head_at..][0..l.head], row[nb * l.payload + j * l.head ..][0..l.head]) |*o, v| o.* = @intFromFloat(v);
+    }
+
+    /// Row `r`'s first block scale (its fp16 `d`) set to `v`.
+    fn plant(self: GgufBank, r: usize, v: f64) void {
+        const nb = self.k / self.ty.blockElems();
+        const d = gguf_contract.scaleAt(self.ty);
+        const at = r * gguf.rowBytes(self.ty, self.k) + if (gguf.isSplit(self.ty, self.k)) blk: {
+            const l = gguf.splitLayout(self.ty).?;
+            break :blk nb * l.payload + d - (if (l.payload_at == 0) l.payload else 0);
+        } else d;
+        const bits: u16 = @bitCast(@as(f16, @floatCast(v)));
+        self.bytes[at] = @floatFromInt(bits & 0xFF);
+        self.bytes[at + 1] = @floatFromInt(bits >> 8);
+    }
+
+    /// Row `r` against `x` [K]: the sum and its terms' magnitude.
+    fn dot(self: GgufBank, r: usize, x: []const f64, sum: Sum, t: []f64) ![2]f64 {
+        const be = self.ty.blockElems();
+        var blk: [256]u8 = undefined;
+        var dec: [256]f32 = undefined;
+        var mag: f64 = 0;
+        for (0..self.k / be) |j| {
+            self.block(r, j, &blk);
+            try gguf_quants.dequantize(self.ty, blk[0..self.ty.blockBytes()], dec[0..be]);
+            for (0..be) |i| {
+                t[j * be + i] = x[j * be + i] * dec[i];
+                mag += @abs(x[j * be + i] * dec[i]);
+            }
+        }
+        return .{ sum.of(t[0..self.k]), mag };
+    }
+};
+
+/// Integer x rows 1..16 whose second half is the first plus 1 on its first 8 entries: against a bank whose second
+/// half negates its first (`GgufBank`, `Bank.mirrored` over the identity), eight terms of each sum remain.
+fn mirroredRows(rng: std.Random, x: []f64, k: usize, perm: []usize) void {
+    for (perm, 0..) |*q, i| q.* = i;
+    const h = k / 2;
+    for (0..x.len / k) |r| for (0..h) |i| {
+        x[r * k + i] = @floatFromInt(rng.intRangeAtMost(i32, 1, 16));
+        x[r * k + h + i] = x[r * k + i] + @as(f64, if (i < 8) 1 else 0);
+    };
+}
+
+/// `TOPK` distinct experts of 8 a row.
+fn routeRows(rng: std.Random, inds: []f64) void {
+    for (0..inds.len / TOPK) |row| {
+        var pool: [8]usize = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+        rng.shuffle(usize, &pool);
+        for (0..TOPK) |j| inds[row * TOPK + j] = @floatFromInt(pool[j]);
+    }
+}
+
+const MoeGuGguf = struct {
+    pub const Params = struct { ty: gguf_quants.GgmlType, sbits: u32, sgs: usize, experts: usize = 8, lim: f64 = 10 };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.rows > v41.region_rows or s.n == 0 or s.k % 32 != 0 or s.k % p.sgs != 0) return null;
+        const sg = v41.gguf_gu_sg;
+        var g = metal.Geometry{ .grid = .{ 32, ci((s.n + sg - 1) / sg * sg), ci(s.rows * (TOPK + 1)) }, .tg = .{ 32, ci(sg), 1 } };
+        g.out(&.{ ci(s.rows * (TOPK + 1)), ci(s.n) }, act);
+        for (gguf.layoutConsts(p.ty, ci(s.k), ci(gguf.rowBytes(p.ty, s.k)))) |c| g.int(std.mem.span(c[0]), c[1]);
+        g.int("RB", v41.gguf_dn_rb);
+        g.int("N", s.n);
+        g.int("TOPK", TOPK);
+        g.int("SBITS", p.sbits);
+        g.int("SGS", p.sgs);
+        g.flag("SMX", false);
+        g.dtype("T", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const p = k.p;
+        const L = k.shape.rows;
+        const N = k.shape.n;
+        const K = k.shape.k;
+        const x = try k.add(act, &.{ L, K });
+        const wg = try GgufBank.add(k, p.ty, &.{ p.experts, N }, K);
+        const wu = try GgufBank.add(k, p.ty, &.{ p.experts, N }, K);
+        const sh = try Bank.add(k, &.{2 * N}, p.sbits, p.sgs, K);
+        const inds = try k.add(.uint32, &.{L * TOPK});
+        const wts = try k.add(.float32, &.{L * TOPK});
+        const lim = try k.add(.float32, &.{1});
+        // Gate sums of an RMS-normed input's size against GGUF weights up to 64: f32's exp overflows past |g| 88.
+        kit.uniform(rng, x, -1.0 / 32.0, 1.0 / 32.0);
+        kit.uniform(rng, wts, 0.05, 0.5);
+        lim[0] = p.lim;
+        routeRows(rng, inds);
+        try wg.fill(rng, f == .stress, k.scratch());
+        try wu.fill(rng, f == .stress, k.scratch());
+        if (f == .stress) {
+            const perm = try k.scratch().alloc(usize, K / 2);
+            defer k.scratch().free(perm);
+            mirroredRows(rng, x, K, perm);
+            try sh.mirrored(rng, perm, k.scratch());
+        } else try sh.random(rng, k.scratch());
+        if (f == .nonfinite) {
+            // A NaN or infinite first-block scale in one gate or up row of row 0's slots 0-3 (gate, gate, up, both),
+            // that block's x positive.
+            kit.uniform(rng, x[0..32], 0.1, 2);
+            const put = [_][3]f64{ .{ 0, nan, 0 }, .{ 1, inf, 0 }, .{ 2, 0, -inf }, .{ 3, inf, -inf } };
+            for (put) |q| {
+                const e: usize = @intFromFloat(q[0]);
+                const row = @as(usize, @intFromFloat(inds[e])) * N + e % N;
+                if (q[1] != 0) wg.plant(row, q[1]);
+                if (q[2] != 0) wu.plant(row, q[2]);
+            }
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * (TOPK + 1) * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const p = k.p;
+        const L = k.shape.rows;
+        const N = k.shape.n;
+        const K = k.shape.k;
+        const wg = GgufBank{ .bytes = k.in(1), .ty = p.ty, .k = K };
+        const wu = GgufBank{ .bytes = k.in(2), .ty = p.ty, .k = K };
+        const sh = Bank{ .w = k.in(3), .s = k.in(4), .b = k.in(5), .bits = p.sbits, .gs = p.sgs, .k = K };
+        const t = try k.scratch().alloc(f64, K);
+        defer k.scratch().free(t);
+        const lim = k.in(8)[0];
+        const flip = 0x1p-8 / spec.gamma(@floatFromInt(K), u);
+        for (0..L) |l| for (0..TOPK + 1) |j| for (0..N) |c| {
+            const x = k.in(0)[l * K ..][0..K];
+            var g: [2]f64 = undefined;
+            var up: [2]f64 = undefined;
+            var wt: f64 = 1;
+            var z = L * TOPK + l;
+            if (j < TOPK) {
+                z = l * TOPK + j;
+                const e: usize = @intFromFloat(k.in(6)[z]);
+                g = try wg.dot(e * N + c, x, sum, t);
+                up = try wu.dot(e * N + c, x, sum, t);
+                wt = k.in(7)[z];
+            } else {
+                g = sh.dot(c, x, sum, t);
+                up = sh.dot(N + c, x, sum, t);
+            }
+            const gc = kit.minN(bf(g[0]), lim);
+            const ut = bf(up[0]);
+            const uc = if (std.math.isNan(ut)) nan else std.math.clamp(ut, -lim, lim);
+            const sig = 1 / (1 + @exp(-gc));
+            out[z * N + c] = gc * sig * uc * wt;
+            // Each sum's error (and its bf16 rounding) reaches y scaled by y's slope in it.
+            const slope_g = @abs(sig * (1 + gc * (1 - sig)) * uc * wt);
+            mag[z * N + c] = (g[1] + @abs(g[0]) * flip) * slope_g * 2 + (up[1] + @abs(up[0]) * flip) * @abs(gc * sig * wt) * 2;
+        };
+    }
+};
+
+const MoeDnGguf = struct {
+    pub const Params = struct { ty: gguf_quants.GgmlType, sbits: u32, sgs: usize, experts: usize = 8 };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        const rb = v41.gguf_dn_rb;
+        if (s.rows == 0 or s.rows > v41.region_rows or s.n == 0 or s.n % rb != 0 or s.k % 32 != 0 or s.k % p.sgs != 0) return null;
+        var g = metal.Geometry{ .grid = .{ 32, ci(s.n / rb * (TOPK + 1)), ci(s.rows) }, .tg = .{ 32, TOPK + 1, 1 } };
+        g.out(&.{ ci(s.rows), HC, ci(s.n) }, act);
+        for (gguf.layoutConsts(p.ty, ci(s.k), ci(gguf.rowBytes(p.ty, s.k)))) |c| g.int(std.mem.span(c[0]), c[1]);
+        g.int("RB", rb);
+        g.int("N", s.n);
+        g.int("TOPK", TOPK);
+        g.int("SBITS", p.sbits);
+        g.int("SGS", p.sgs);
+        g.flag("SMX", false);
+        g.int("HC", HC);
+        g.dtype("T", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const p = k.p;
+        const L = k.shape.rows;
+        const N = k.shape.n;
+        const K = k.shape.k;
+        const x = try k.add(act, &.{ L * (TOPK + 1), K });
+        const w = try GgufBank.add(k, p.ty, &.{ p.experts, N }, K);
+        const sh = try Bank.add(k, &.{N}, p.sbits, p.sgs, K);
+        const inds = try k.add(.uint32, &.{L * TOPK});
+        const res = try k.add(act, &.{ L, HC, N });
+        const post = try k.add(.float32, &.{ L, HC });
+        const comb = try k.add(.float32, &.{ L, HC, HC });
+        kit.uniform(rng, x, -2, 2);
+        kit.uniform(rng, res, -3, 3);
+        kit.uniform(rng, post, 0.1, 2);
+        kit.uniform(rng, comb, 0, 0.5);
+        routeRows(rng, inds);
+        try w.fill(rng, f == .stress, k.scratch());
+        if (f == .stress) {
+            // Post 1, comb 0: the output is the summed dots, exact.
+            const perm = try k.scratch().alloc(usize, K / 2);
+            defer k.scratch().free(perm);
+            mirroredRows(rng, x, K, perm);
+            try sh.mirrored(rng, perm, k.scratch());
+            @memset(post, 1);
+            @memset(comb, 0);
+        } else try sh.random(rng, k.scratch());
+        // A NaN or infinite first-block scale in output d's row of row 0's slots 0-3 (d = slot): NaN, +inf, -inf,
+        // then +inf in slot 3 and -inf in the shared row of the same output; each block's x positive.
+        if (f == .nonfinite) {
+            for ([_]f64{ nan, inf, -inf, inf }, 0..) |v, e| {
+                kit.uniform(rng, x[e * K ..][0..32], 0.1, 2);
+                w.plant(@as(usize, @intFromFloat(inds[e])) * N + e, v);
+            }
+            kit.uniform(rng, x[L * TOPK * K ..][0..p.sgs], 0.1, 2);
+            try sh.plant(3, -inf, k.scratch());
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * HC * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const p = k.p;
+        const L = k.shape.rows;
+        const N = k.shape.n;
+        const K = k.shape.k;
+        const w = GgufBank{ .bytes = k.in(1), .ty = p.ty, .k = K };
+        const sh = Bank{ .w = k.in(2), .s = k.in(3), .b = k.in(4), .bits = p.sbits, .gs = p.sgs, .k = K };
+        const t = try k.scratch().alloc(f64, K);
+        defer k.scratch().free(t);
+        const flip = 0x1p-8 / spec.gamma(@floatFromInt(K), u);
+        var parts: [TOPK]f64 = undefined;
+        for (0..L) |l| for (0..N) |d| {
+            var m: f64 = 0;
+            for (0..TOPK) |e| {
+                const z = l * TOPK + e;
+                const r = try w.dot(@as(usize, @intFromFloat(k.in(5)[z])) * N + d, k.in(0)[z * K ..][0..K], sum, t);
+                parts[e] = bf(r[0]);
+                m += r[1] + @abs(r[0]) * flip;
+            }
+            const s = sh.dot(d, k.in(0)[(L * TOPK + l) * K ..][0..K], sum, t);
+            var tot: f64 = 0;
+            for (parts) |v| tot += v;
+            const y = bf(tot + bf(s[0]));
+            m += s[1] + @abs(s[0]) * flip + (@abs(tot) + @abs(y)) * flip;
+            for (0..HC) |i| {
+                var acc = k.in(7)[l * HC + i] * y;
+                var cm: f64 = 0;
+                for (0..HC) |j| {
+                    acc += k.in(8)[(l * HC + j) * HC + i] * k.in(6)[(l * HC + j) * N + d];
+                    cm += @abs(k.in(8)[(l * HC + j) * HC + i] * k.in(6)[(l * HC + j) * N + d]);
+                }
+                out[(l * HC + i) * N + d] = acc;
+                mag[(l * HC + i) * N + d] = @abs(k.in(7)[l * HC + i]) * m + cm;
+            }
+        };
+    }
+};
+
 // ── registrations ──
 
 fn depthHc(_: Shape) usize {
@@ -2857,6 +3171,14 @@ const sm_l = metal.Launch{ .name = "dsv41_attn_sm", .inputs = &.{ "s", "picks", 
 const pv_l = metal.Launch{ .name = "dsv41_attn_pv", .inputs = &.{ "p", "kw", "comp", "picks", "meta", "periods" }, .outputs = &.{"o"}, .source = v41.ATTN_PV_SOURCE, .header = v41.MPP_HEADER, .tg_bytes = 2 * 32 * 128 * 2, .offline = false, .min_gen = 17 };
 const wt_l = launch("dsv41_moe_wt", &.{ "a", "wts" }, &.{"out"}, v41.MOE_WT_SOURCE, "", 0, 1024, false);
 const gu_l = launch("dsv41_moe_gu", moe_gu_ins, &.{"out"}, v41.MOE_GU_SOURCE, v41.MOE_HEADER, 0, 1024, false);
+
+/// The GGUF decode MoE kernels at a routed type, as `gguf.pluginKernel` builds them.
+fn GgufMoe(comptime ty: gguf_quants.GgmlType) type {
+    return struct {
+        const gu = launch("dsv41_moe_gu_gguf_" ++ @tagName(ty), &v41.MOE_GU_GGUF_INS, &.{"out"}, gguf.pluginSource(ty, v41.MOE_GU_GGUF_SOURCE), gguf.pluginHeader(ty, v41.MOE_HEADER), 0, 1024, false);
+        const dn = launch("dsv41_moe_dn_gguf_" ++ @tagName(ty), &v41.MOE_DN_GGUF_INS, &.{"out"}, gguf.pluginSource(ty, v41.MOE_DN_GGUF_SOURCE), gguf.pluginHeader(ty, v41.MOE_HEADER), 4 * (TOPK + 1) * v41.gguf_dn_rb, 1024, false);
+    };
+}
 const dn_l = launch("dsv41_moe_dn", moe_dn_ins, &.{"out"}, v41.MOE_DN_SOURCE, v41.MOE_HEADER, 0, 928, false);
 const act_l = launch("dsv41_moe_act", &.{ "y", "wts", "lim" }, &.{"out"}, v41.MOE_ACT_SOURCE, "", 0, 1024, false);
 const combine_l = launch("dsv41_moe_combine", &.{ "dn", "inv", "sh" }, &.{"out"}, v41.MOE_COMBINE_SOURCE, "", 0, 1024, false);
@@ -3152,6 +3474,34 @@ pub fn register(set: *kc.Set) !void {
             .served = &.{ .{ .rows = TOPK, .n = 64, .k = INTER }, .{ .rows = 2, .n = 64, .k = 128 } },
         });
     }
+    // The GGUF decode MoE at the routed types whose blocks carry integer weights (the K-quants a 32-weight slice at a
+    // time), beside 5- and 8-bit shared experts.
+    inline for (.{ .{ gguf_quants.GgmlType.q8_0, 5, 32 }, .{ gguf_quants.GgmlType.q4_0, 8, 64 }, .{ gguf_quants.GgmlType.q2_k, 8, 64 }, .{ gguf_quants.GgmlType.q4_k, 8, 64 }, .{ gguf_quants.GgmlType.q5_k, 5, 32 }, .{ gguf_quants.GgmlType.q6_k, 8, 64 } }) |r| {
+        const L = GgufMoe(r[0]);
+        try kit.add(set, MoeGuGguf, &L.gu, .{ .ty = r[0], .sbits = r[1], .sgs = r[2] }, .{
+            .name = std.fmt.comptimePrint("dsv41 moe_gu_gguf {s} + {d}-bit g{d} shared", .{ @tagName(r[0]), r[1], r[2] }),
+            .accum = .f32,
+            .depth = depthK,
+            .ops = 8,
+            .mids = 1,
+            .out = .bf16,
+            .tiles = .{ .{}, .{ .size = v41.gguf_gu_sg }, .{ .size = 1024, .step = @max(64, r[0].blockElems()), .min = @max(64, r[0].blockElems()) } },
+            .served = &.{ .{ .rows = 1, .n = 64, .k = 2048 }, .{ .rows = 3, .n = 37, .k = 1024 }, .{ .rows = v41.region_rows, .n = 16, .k = 512 } },
+            .sums = .{ .f16 = 30, .bf16 = 30, .why = "a wrong sum's activation tends to 0, so a miss tops out near 1 / the bound" },
+            .known = swiglu_nan,
+        });
+        try kit.add(set, MoeDnGguf, &L.dn, .{ .ty = r[0], .sbits = r[1], .sgs = r[2] }, .{
+            .name = std.fmt.comptimePrint("dsv41 moe_dn_gguf {s} + {d}-bit g{d} shared, hc expand", .{ @tagName(r[0]), r[1], r[2] }),
+            .accum = .f32,
+            .depth = depthK,
+            .ops = 4,
+            .mids = 1,
+            .out = .bf16,
+            .tiles = .{ .{}, .{ .size = v41.gguf_dn_rb, .step = v41.gguf_dn_rb, .min = v41.gguf_dn_rb }, .{ .size = 1024, .step = @max(64, r[0].blockElems()), .min = @max(64, r[0].blockElems()) } },
+            .served = &.{ .{ .rows = 1, .n = 64, .k = 2304 }, .{ .rows = 3, .n = 36, .k = 1024 }, .{ .rows = v41.region_rows, .n = 16, .k = 512 } },
+            .sums = if (r[0].blockElems() == 256) .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "K 2304 is an odd count of 256-weight blocks, which the mirrored stress rows cannot cancel; the Q8_0 and Q4_0 arms prove these sums, the gathers the K-quant slices" } else .{},
+        });
+    }
     try kit.add(set, MoeAct, &act_l, .{}, .{
         .name = "dsv41 moe_act (prefill clipped SwiGLU x weight)",
         .accum = .none,
@@ -3428,6 +3778,21 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         {
             const r = try ours(MoeDn, a, &dn_l, .{ .bits = bits }, .{ .rows = TOPK, .n = 64, .k = 256 });
             try Expect.same(r.c, r.bytes, &.{try v41.moeKernel(&sc, m.moe_dn_kernel, r.c.args[0..11], &.{ 1, HC, 64 }, act, qp, sqp, 256, 64, TOPK)});
+        }
+    }
+    inline for (.{ .{ gguf_quants.GgmlType.q8_0, 5, 32 }, .{ gguf_quants.GgmlType.q4_0, 8, 64 } }) |q| {
+        const L = GgufMoe(q[0]);
+        const sqp: v41.QuantParams = .{ .bits = q[1], .group_size = q[2] };
+        const R = 3;
+        {
+            const r = try ours(MoeGuGguf, a, &L.gu, .{ .ty = q[0], .sbits = q[1], .sgs = q[2] }, .{ .rows = R, .n = 40, .k = 1024 });
+            const kern = try gguf.pluginKernel("dsv41_moe_gu_gguf", &v41.MOE_GU_GGUF_INS, v41.MOE_GU_GGUF_SOURCE, v41.MOE_HEADER, q[0]);
+            try Expect.same(r.c, r.bytes, &.{try v41.ggufMoeKernel(&sc, kern, r.c.args[0..9], &.{ R * (TOPK + 1), 40 }, act, q[0], sqp, 1024, 40, TOPK, R, gguf.rowBytes(q[0], 1024), null)});
+        }
+        {
+            const r = try ours(MoeDnGguf, a, &L.dn, .{ .ty = q[0], .sbits = q[1], .sgs = q[2] }, .{ .rows = R, .n = 40, .k = 1024 });
+            const kern = try gguf.pluginKernel("dsv41_moe_dn_gguf", &v41.MOE_DN_GGUF_INS, v41.MOE_DN_GGUF_SOURCE, v41.MOE_HEADER, q[0]);
+            try Expect.same(r.c, r.bytes, &.{try v41.ggufMoeKernel(&sc, kern, r.c.args[0..9], &.{ R, HC, 40 }, act, q[0], sqp, 1024, 40, TOPK, R, gguf.rowBytes(q[0], 1024), HC)});
         }
     }
     {

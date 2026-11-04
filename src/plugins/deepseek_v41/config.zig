@@ -237,7 +237,7 @@ test "deepseek_v41 config: a --mlx-gguf set's rebuilt configJson parses the deep
     const v41 = @This();
     var f = try ds41.testFile();
     defer f.deinit();
-    const json = try ds41.configJson(std.testing.allocator, try ds41.Hparams.read(&f));
+    const json = try ds41.configJson(std.testing.allocator, try ds41.Hparams.read(&f), null);
     defer std.testing.allocator.free(json);
     (try std.json.parseFromSlice(std.json.Value, std.testing.allocator, json, .{})).deinit();
 
@@ -261,4 +261,59 @@ test "deepseek_v41 config: a --mlx-gguf set's rebuilt configJson parses the deep
     // No stages ship: no DSpark, and the image token stays text.
     try std.testing.expectEqual(@as(u32, 0), out.spec.native_stages);
     try std.testing.expect(!c.dsv41_vision);
+}
+
+test "deepseek_v41 config: a --mlx-gguf set with a DSpark stage bundle beside it parses into the stages our packs declare" {
+    const ds41 = @import("../../sdk/quant/gguf/arch/deepseek41.zig");
+    const v41 = @This();
+    var f = try ds41.testFile();
+    defer f.deinit();
+    var b = try ds41.testDsparkFile();
+    defer b.deinit();
+    const hp = try ds41.Hparams.read(&f);
+    const json = try ds41.configJson(std.testing.allocator, hp, try ds41.Dspark.read(&b, hp));
+    defer std.testing.allocator.free(json);
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+    const dir = mem.packDir();
+    var out: abi.Parsed = .{};
+    try std.testing.expect(v41.parse(&dir, abi.Str.of(json), .{}, null, true, &out).isOk());
+    defer v41.freeParsed(&out);
+    const c = v41.of(&out);
+    try std.testing.expectEqual(@as(u32, 3), c.dsparkStages());
+    try std.testing.expectEqual(@as(u32, 5), c.dsv4_dspark_block_size);
+    try std.testing.expectEqualSlices(u8, &.{ 37, 38, 39 }, c.dsv4_dspark_target_layers[0..c.dsv4_n_dspark_target_layers]);
+    try std.testing.expectEqual(@as(u32, 128799), c.dsv4_dspark_noise_token_id);
+    try std.testing.expectEqual(@as(u32, 256), c.dsv4_dspark_markov_rank);
+    try std.testing.expectEqual(@as(u32, 128), c.dsv41_dspark_experts);
+    try std.testing.expectEqual(@as(u32, 3), c.dsv41_dspark_top_k);
+}
+
+test "deepseek_v41 config: a --mlx-gguf set with its vision GGUF beside it parses into our packs' tower" {
+    const ds41 = @import("../../sdk/quant/gguf/arch/deepseek41.zig");
+    const v41 = @This();
+    var f = try ds41.testFileDs4(ds41.release_config);
+    defer f.deinit();
+    var v = try ds41.testVisionFileDs4();
+    defer v.deinit();
+    const hp = try ds41.Hparams.read(&f);
+    const json = try ds41.configJsonWith(std.testing.allocator, hp, null, try ds41.Vision.read(&v, hp, null));
+    defer std.testing.allocator.free(json);
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+    const dir = mem.packDir();
+    var out: abi.Parsed = .{};
+    try std.testing.expect(v41.parse(&dir, abi.Str.of(json), .{}, null, true, &out).isOk());
+    defer v41.freeParsed(&out);
+    const c = v41.of(&out);
+    try std.testing.expect(c.dsv41_vision and out.caps.images);
+    try std.testing.expectEqual(@as(u32, 129264), out.placeholder_ids.image);
+    try std.testing.expectEqual(@as(u32, 32), c.vision_num_layers);
+    try std.testing.expectEqual(@as(u32, 1024), c.vision_hidden_size);
+    try std.testing.expectEqual(@as(u32, 2816), c.vision_intermediate_size);
+    try std.testing.expectEqual(@as(u32, 16), c.vision_num_heads);
+    try std.testing.expectEqual(@as(u32, 14), c.vision_patch_size);
+    try std.testing.expectEqual(@as(f32, 10000), c.vision_rope_theta);
+    try std.testing.expectEqual(@as(u32, 3), c.dv_downsample);
+    try std.testing.expectEqual(@as(u32, 1024), c.dv_max_image_tokens);
+    try std.testing.expectEqual(@as(u32, 295936), c.dv_min_pixels);
+    try std.testing.expectEqual(@as(u32, 0), c.dv_max_wh_ratio);
 }

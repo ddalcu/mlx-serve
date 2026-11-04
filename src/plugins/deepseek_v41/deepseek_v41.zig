@@ -1020,6 +1020,10 @@ pub fn loadLayer(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usiz
         },
         .experts = if (trunk_li != null and m.streamed_experts) .{ .gate = .{ .w = none }, .up = .{ .w = none }, .down = .{ .w = none } } else try fuseExperts(m, w, try loadExperts(m, w, pfx, li, n_experts, inter)),
     };
+    if (trunk_li == 0) for ([_]Bank{ ly.experts.gate, ly.experts.down }) |bank| if (gguf_kernels.infoOf(bank.w, bank.s)) |gi| if (gi.ty == .q3_k) {
+        log.warn("[dsv41] Q3_K expert banks decode on the composed path, not the fused GGUF FFN (docs/known-issues.md)\n", .{});
+        break;
+    };
     if (trunk_li != null) if (getOpt(w, pfx ++ ".{d}.ffn.gate.bias_vl", .{li})) |b| {
         ly.gate_bias_vl = try ownReshape(m, try ownCast(m, b, .float32), &.{ 1, ci(n_experts) });
     };
@@ -1231,6 +1235,11 @@ pub const MOE_GU_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_gu.meta
 /// new stream; RPS rows a simdgroup. Every rounding where the composed path
 /// takes it.
 pub const MOE_DN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_dn.metal");
+
+/// `MOE_GU_SOURCE` and `MOE_DN_SOURCE` with the routed rows in GGUF expert banks, decoded by the GGUF blocks' own
+/// decoders (`gguf_kernels.pluginKernel`, one build per type); every rounding where theirs takes it.
+pub const MOE_GU_GGUF_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_gu_gguf.metal");
+pub const MOE_DN_GGUF_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_dn_gguf.metal");
 
 /// A prefill MoE call's SwiGLU, one element a thread: row `r` of the fused
 /// gate+up gather `y` (`[n, 2N]`, gate then up) times its routing weight, the
@@ -2939,6 +2948,7 @@ pub const MOE_DN_INS = [_][*:0]const u8{ "x", "w", "scales", "biases", "sw", "ss
 /// with `sp`, the new stream `hcExpand` returns; null where they do not apply
 /// (rows, formats, an f32 stream).
 pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A, x1: A, sp: *const Split) !?A {
+    if (ly.experts.gate.qp.mode == .gguf) return ffnDecodeGguf(sc, m, ly, h, idx, wts, x1, sp);
     const gu = ly.experts.gu orelse return null;
     const sgu = ly.shared_gu orelse return null;
     const dn = &ly.experts.down;
@@ -2971,6 +2981,81 @@ pub fn ffnDecode(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: 
 
 /// Rows a simdgroup in the MoE kernels: swept on M5 Ultra over 1..8 rows and 1..4 simdgroups a threadgroup.
 pub const moe_rps = 2;
+
+pub const MOE_GU_GGUF_INS = [_][*:0]const u8{ "x", "wg", "wu", "sw", "sscales", "sbiases", "inds", "wts", "lim" };
+pub const MOE_DN_GGUF_INS = [_][*:0]const u8{ "x", "w", "sw", "sscales", "sbiases", "inds", "res", "post", "comb" };
+
+/// The GGUF MoE kernels' work split (swept on the DeepSeek-V4.1 Coder's decode): the gate+up's simdgroups a
+/// threadgroup, an output row each (a threadgroup stages its type's grid once for all of them), the down's rows a
+/// threadgroup (one simdgroup a slot).
+pub const gguf_gu_sg = 8;
+pub const gguf_dn_rb = 4;
+
+/// Whether `dsv41_dots` reads a shared linear: mxfp8 at group 32, or affine with biases at a width it unpacks.
+fn sharedDots(l: Lin) bool {
+    const qp = l.qp;
+    if (qp.mode == .mxfp8) return qp.bits == 8 and qp.group_size == 32;
+    const vpw: u32 = switch (qp.bits) {
+        2, 4, 8 => 32 / qp.bits,
+        3, 5 => 8,
+        6 => 4,
+        else => return false,
+    };
+    return qp.mode == .affine and l.b.ctx != null and qp.group_size % vpw == 0;
+}
+
+/// `ffnDecode` with GGUF routed banks over up to `region_rows` decode rows: gate and up of one ggml type, the
+/// down of another, the shared expert as `sharedDots` reads it.
+fn ffnDecodeGguf(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A, x1: A, sp: *const Split) !?A {
+    const e = &ly.experts;
+    const sgu = ly.shared_gu orelse return null;
+    const sdn = ly.shared[2];
+    const gi = gguf_kernels.infoOf(e.gate.w, e.gate.s) orelse return null;
+    const ui = gguf_kernels.infoOf(e.up.w, e.up.s) orelse return null;
+    const di = gguf_kernels.infoOf(e.down.w, e.down.s) orelse return null;
+    // Q3_K's planted-scale nonfinite case is unexplained (docs/known-issues.md): routed until it is.
+    if (gi.ty != ui.ty or gi.tiled != null or ui.tiled != null or di.tiled != null or gi.ty == .q3_k or di.ty == .q3_k) return null;
+    const L = dim(h, 0);
+    if (L > region_rows or mlx.mlx_array_dtype(h) == .float32 or !mlx.streamIsGpu(sc.s) or !sharedDots(sgu) or !sharedDots(sdn)) return null;
+    const k = dim(idx, 1);
+    const d = dim(h, 1);
+    const inter = dim(e.gate.w, 1);
+    if (d % gguf_dn_rb != 0 or d % 32 != 0 or inter % 32 != 0 or k + 1 > 32) return null;
+    const gk = try gguf_kernels.pluginKernel("dsv41_moe_gu_gguf", &MOE_GU_GGUF_INS, MOE_GU_GGUF_SOURCE, MOE_HEADER, gi.ty);
+    const dk = try gguf_kernels.pluginKernel("dsv41_moe_dn_gguf", &MOE_DN_GGUF_INS, MOE_DN_GGUF_SOURCE, MOE_HEADER, di.ty);
+    const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
+    const flat = try sc.reshape(idx, &.{ci(L * k)});
+    const dt = mlx.mlx_array_dtype(h);
+    // mxfp8 has no biases: its scales fill the input the MX dot never reads.
+    const sgb = if (sgu.b.ctx == null) sgu.s else sgu.b;
+    const sdb = if (sdn.b.ctx == null) sdn.s else sdn.b;
+    const act = try ggufMoeKernel(sc, gk, &.{ h, e.gate.w, e.up.w, sgu.w, sgu.s, sgb, flat, try sc.reshape(wts, &.{ci(L * k)}), lim }, &.{ ci(L * (k + 1)), ci(inter) }, dt, gi.ty, sgu.qp, d, inter, k, L, dim(e.gate.w, 2), null);
+    return try ggufMoeKernel(sc, dk, &.{ act, e.down.w, sdn.w, sdn.s, sdb, flat, x1, sp.post, sp.comb }, mlx.getShape(x1), dt, di.ty, sdn.qp, inter, d, k, L, dim(e.down.w, 2), mlx.getShape(x1)[1]);
+}
+
+/// One GGUF MoE launch over `rows` decode rows: `hc` null for the gate+up (a z per pair, then each row's shared
+/// expert), the stream count for the down (a z per row, a simdgroup per slot).
+pub fn ggufMoeKernel(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, shape: []const c_int, dt: mlx.mlx_dtype, ty: gguf_kernels.GgmlType, sqp: QuantParams, K: usize, N: usize, topk: usize, rows: usize, row_bytes: usize, hc: ?c_int) !A {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, shape.ptr, shape.len, dt));
+    const sg: usize = if (hc == null) gguf_gu_sg else topk + 1;
+    const per: usize = if (hc == null) gguf_gu_sg else gguf_dn_rb;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, ci((N + per - 1) / per * sg), ci(if (hc == null) rows * (topk + 1) else rows)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, ci(sg), 1));
+    for (gguf_kernels.layoutConsts(ty, ci(K), ci(row_bytes))) |c| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, c[0], c[1]));
+    inline for (.{ .{ "RB", gguf_dn_rb }, .{ "N", N }, .{ "TOPK", topk }, .{ "SBITS", sqp.bits }, .{ "SGS", sqp.group_size } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, "SMX", sqp.mode == .mxfp8));
+    if (hc) |n| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "HC", n));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+    const iv = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern, iv, cfg, sc.s));
+    var o = mlx.mlx_array_new();
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+}
 
 pub fn moeKernel(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, ins: []const A, shape: []const c_int, dt: mlx.mlx_dtype, qp: QuantParams, sqp: QuantParams, K: usize, N: usize, topk: usize) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -3281,6 +3366,17 @@ fn gateUpPaired(sc: *Scope, m: *const Dsv41Model, e: *const Experts, x3: A, rows
 
 /// A sorted gather of `b` for rows `idx` (one run per expert) on the NAX port where it serves the bank
 /// (affine 2..8-bit, bf16 rows), else MLX's; `row_map` reads `x`'s rows in place instead of a `take`.
+/// GGUF gate and up banks through one matrix-unit gather with the clipped SwiGLU and the routing weight fused:
+/// `[n, 1, inter]`, null where it does not serve them.
+fn ggufGateUp(sc: *Scope, m: *const Dsv41Model, e: *const Experts, x3: A, rows: A, sidx: A, w_sorted: A) !?A {
+    if (e.gate.qp.mode != .gguf or e.up.qp.mode != .gguf) return null;
+    const gi = gguf_kernels.infoOf(e.gate.w, e.gate.s) orelse return null;
+    const ui = gguf_kernels.infoOf(e.up.w, e.up.s) orelse return null;
+    const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
+    const a = (try gguf_kernels.gatherNaxSwiGLU(gi, ui, try sc.take(x3, rows, 0), e.gate.w, e.up.w, sidx, w_sorted, lim, sc.s)) orelse return null;
+    return try sc.reshape(try sc.keep(a), &.{ ci(dim(sidx, 0)), 1, ci(dim(e.gate.w, 1)) });
+}
+
 fn sortedBank(sc: *Scope, x: A, row_map: ?A, b: *const Bank, idx: A) !A {
     if (verify_qmm_nax.verifyQmmNaxAvailable() and b.s.ctx != null and (b.qp.mode == .affine or b.qp.mode.isFp4())) {
         const nax = if (row_map) |map|
@@ -3338,6 +3434,7 @@ fn moePrefill(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, x: A, idx: A, 
         if (m.moe_wt_kernel) |kw| break :blk try flatKernel(sc, kw, &.{ a, w_sorted }, &.{ ci(n), 1, ci(inter) }, dt, n * inter, &.{.{ .name = "N", .v = ci(inter) }});
         break :blk try sc.astype(try sc.mul(a, try sc.reshape(w_sorted, &.{ ci(n), 1, 1 })), dt);
     } else blk: {
+        if (try ggufGateUp(sc, m, e, x3, rows, sidx, w_sorted)) |a| break :blk a;
         const y = if (e.gu) |*gu| try sortedBank(sc, x3, rows, gu, sidx) else try sc.concat(&.{ try sortedBank(sc, x3, rows, &e.gate, sidx), try sortedBank(sc, x3, rows, &e.up, sidx) }, -1); // [n, 1, 2 inter]
         const inter = dim(y, -1) / 2;
         const lim = try sc.keep(mlx.mlx_array_new_data(&[_]f32{m.cfg.dsv4_swiglu_limit}, &[_]c_int{1}, 1, .float32));
@@ -6444,6 +6541,143 @@ test "dsv41 ffn decode: the two kernels are no further from f32 truth than the c
     };
 }
 
+/// A GGUF expert bank [E, N, row bytes] of `ty` from its fixture blocks (row r of expert e, block j: fixture block
+/// (r + 2 e + j + salt) % 4) and its f32 weights.
+fn ggufTestBank(comptime ty: gguf_kernels.GgmlType, sc: *Scope, E: usize, N: usize, K: usize, salt: usize) !struct { b: Bank, dq: A } {
+    const gpa = testing.allocator;
+    const quants = @import("../../sdk/quant/gguf/quants.zig");
+    const data = @embedFile("../../sdk/quant/gguf/fixtures/" ++ @tagName(ty) ++ ".bin");
+    const be = ty.blockElems();
+    const bb = ty.blockBytes();
+    const nb = K / be;
+    const raw = try gpa.alloc(u8, E * N * nb * bb);
+    defer gpa.free(raw);
+    const want = try gpa.alloc(f32, E * N * K);
+    defer gpa.free(want);
+    var blk: [4][256]f32 = undefined;
+    for (0..4) |i| try quants.dequantize(ty, data[i * bb ..][0..bb], blk[i][0..be]);
+    for (0..E) |e| for (0..N) |r| for (0..nb) |j| {
+        const f = (r + 2 * e + j + salt) % 4;
+        @memcpy(raw[((e * N + r) * nb + j) * bb ..][0..bb], data[f * bb ..][0..bb]);
+        @memcpy(want[(e * N + r) * K + j * be ..][0..be], blk[f][0..be]);
+    };
+    const rb = gguf_kernels.rowBytes(ty, K);
+    const stored = try gpa.alloc(u8, E * N * rb);
+    defer gpa.free(stored);
+    if (gguf_kernels.isSplit(ty, K)) gguf_kernels.packRows(ty, K, stored, raw) else @memcpy(stored, raw);
+    const w = try sc.keep(mlx.mlx_array_new_data(stored.ptr, &[_]c_int{ ci(E), ci(N), ci(rb) }, 3, .uint8));
+    const sent = try sc.keep(try gguf_kernels.sentinel(.{ .ty = ty }, sc.s));
+    const dq = try sc.keep(mlx.mlx_array_new_data(want.ptr, &[_]c_int{ ci(E), ci(N), ci(K) }, 3, .float32));
+    try evalAll(&.{ w, dq });
+    return .{ .b = .{ .w = w, .s = sent, .qp = .{ .bits = 0, .group_size = 0, .mode = .gguf } }, .dq = dq };
+}
+
+test "dsv41 ffn decode, GGUF experts: the two kernels are no further from f32 truth than the composed path, one row and a verify block, IQ and legacy banks, 5- and 8-bit shared" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const k = 6;
+    const d = 1024;
+    const inter = 256;
+    const E = 16;
+    // Rows 0 and 1 share experts 3 and 12.
+    const all_idx = [_]u32{ 3, 0, 15, 12, 5, 9, 3, 7, 1, 12, 2, 8, 14, 13, 11, 10, 6, 4 };
+    const all_wts = [_]f32{ 0.9, 0.4, 0.31, 0.2, 0.12, 0.05, 0.7, 0.5, 0.3, 0.25, 0.1, 0.02, 0.6, 0.6, 0.2, 0.15, 0.1, 0.08 };
+    // post[l][0] = 1 over a zero stream: stream 0 of row l is its FFN output rounded once.
+    const all_post = [_]f32{ 1, 0.5, 2, -1, 1, -0.25, 1.5, 0.75, 1, 2, -1, 0.5 };
+    var all_comb: [3 * 16]f32 = undefined;
+    for (&all_comb, 0..) |*c, i| c.* = 0.1 * @as(f32, @floatFromInt(i % 17)) - 0.3;
+    const Case = struct { gate: gguf_kernels.GgmlType, down: gguf_kernels.GgmlType, sbits: u32 };
+    inline for ([_]Case{ .{ .gate = .iq2_xxs, .down = .iq1_m, .sbits = 5 }, .{ .gate = .iq2_xs, .down = .iq1_m, .sbits = 8 }, .{ .gate = .q8_0, .down = .q4_0, .sbits = 5 } }) |cs| {
+        const f = try FfnFixture.init(gpa, E, d, inter, 4, .affine);
+        defer f.deinit(gpa);
+        const sc = &f.sc;
+        const g = try ggufTestBank(cs.gate, sc, E, inter, d, 0);
+        const u = try ggufTestBank(cs.gate, sc, E, inter, d, 1);
+        const dn = try ggufTestBank(cs.down, sc, E, d, inter, 2);
+        f.ly.experts = .{ .gate = g.b, .up = u.b, .down = dn.b };
+        // The shared expert requantized at `sbits` group 32, as the Coder's Q5_K transcode lands.
+        var sq: [2]Lin = undefined;
+        for ([_]A{ f.dq[2], f.dq[3] }, &sq, 2..) |w32, *l, j| {
+            var qv = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(qv);
+            try mlx.check(mlx.mlx_quantize(&qv, try sc.astype(w32, .bfloat16), mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(@intCast(cs.sbits)), "affine", none, sc.s));
+            var t: [3]A = undefined;
+            for (&t, 0..) |*a, i| {
+                a.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(a, qv, i));
+                _ = try sc.keep(a.*);
+            }
+            l.* = .{ .w = t[0], .s = t[1], .b = t[2], .qp = .{ .bits = cs.sbits, .group_size = 32, .mode = .affine } };
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_dequantize(&o, t[0], t[1], t[2], mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(@intCast(cs.sbits)), "affine", none, .{ .value = .float32, .has_value = true }, sc.s));
+            f.dq[j] = try sc.keep(o);
+        }
+        f.ly.shared_gu = sq[0];
+        f.ly.shared = .{ .{ .w = none }, .{ .w = none }, sq[1] };
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 5));
+        for ([_]c_int{ 1, 3 }) |L| {
+            const n: usize = @intCast(L);
+            var hx = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&hx, &[_]c_int{ L, d }, 2, .bfloat16, 0, 1, key, sc.s));
+            const h = try sc.keep(hx);
+            const idx = try sc.keep(mlx.mlx_array_new_data(&all_idx, &[_]c_int{ L, k }, 2, .uint32));
+            const wts = try sc.keep(mlx.mlx_array_new_data(&all_wts, &[_]c_int{ L, k }, 2, .float32));
+            const sp: Split = .{
+                .pre = none,
+                .post = try sc.keep(mlx.mlx_array_new_data(&all_post, &[_]c_int{ L, 4 }, 2, .float32)),
+                .comb = try sc.keep(mlx.mlx_array_new_data(&all_comb, &[_]c_int{ L, 4, 4 }, 3, .float32)),
+            };
+            const zero = try sc.zeros(&.{ L, 4, d }, .bfloat16);
+            const fused = (try ffnDecode(sc, &f.m, &f.ly, h, idx, wts, zero, &sp)).?;
+            const comp = try f.composed(h, idx, wts, zero, &sp);
+            var truth_rows: [3]A = undefined;
+            for (truth_rows[0..n], 0..) |*tr, l| {
+                const li = l;
+                const flat = try sc.reshape(try sc.slice(idx, 0, li, li + 1), &.{k});
+                const wl = try sc.reshape(try sc.slice(wts, 0, li, li + 1), &.{ k, 1 });
+                const hf = try sc.reshape(try sc.astype(try sc.slice(h, 0, li, li + 1), .float32), &.{ d, 1 });
+                const gt = try sc.reshape(try sc.matmul(try sc.take(g.dq, flat, 0), hf), &.{ k, inter });
+                const ut = try sc.reshape(try sc.matmul(try sc.take(u.dq, flat, 0), hf), &.{ k, inter });
+                const a32 = try sc.mul(try clampedSwiglu(sc, gt, ut, 10), wl);
+                const routed_t = try sc.sum(try sc.matmul(try sc.take(dn.dq, flat, 0), try sc.reshape(a32, &.{ k, inter, 1 })), 0, false);
+                const su = try sc.reshape(try sc.matmul(f.dq[2], hf), &.{ 1, 2 * inter });
+                const s32 = try clampedSwiglu(sc, try sc.slice(su, 1, 0, inter), try sc.slice(su, 1, inter, 2 * inter), 10);
+                tr.* = try sc.add(try sc.reshape(routed_t, &.{ 1, d }), try sc.matmul(s32, try sc.t2(f.dq[3])));
+            }
+            const truth = try sc.concat(truth_rows[0..n], 0);
+            const fo = try hostF32(try sc.slice(fused, 1, 0, 1));
+            defer gpa.free(fo);
+            const co = try hostF32(try sc.slice(comp, 1, 0, 1));
+            defer gpa.free(co);
+            const t = try hostF32(truth);
+            defer gpa.free(t);
+            var ef: f64 = 0;
+            var ec: f64 = 0;
+            var tt: f64 = 0;
+            for (fo, co, t) |a, b, r| {
+                ef += (a - r) * (a - r);
+                ec += (b - r) * (b - r);
+                tt += r * r;
+            }
+            std.debug.print("{s}/{s}, shared {d}-bit, {d} rows: fused-truth {e:.2}, composed-truth {e:.2} (rel rms)\n", .{ @tagName(cs.gate), @tagName(cs.down), cs.sbits, L, @sqrt(ef / tt), @sqrt(ec / tt) });
+            try testing.expect(@sqrt(ef / tt) < 1e-2);
+            try testing.expect(@sqrt(ef) <= 1.25 * @sqrt(ec) + 1e-4 * @sqrt(tt));
+            // The other streams: post and comb exactly as `hcExpand` applies them.
+            var sx = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_normal(&sx, &[_]c_int{ L, 4, d }, 3, .bfloat16, 0, 1, key, sc.s));
+            const x1 = try sc.keep(sx);
+            const y0 = try sc.astype(try sc.slice(fused, 1, 0, 1), .bfloat16);
+            const want = try hostF32(try hcExpand(sc, x1, try sc.reshape(y0, &.{ L, d }), &sp));
+            defer gpa.free(want);
+            const got = try hostF32((try ffnDecode(sc, &f.m, &f.ly, h, idx, wts, x1, &sp)).?);
+            defer gpa.free(got);
+            for (got, want) |a, b| try testing.expectEqual(@as(u32, @bitCast(b)), @as(u32, @bitCast(a)));
+        }
+    }
+}
+
 test "dsv41 ffn prefill: the sorted-gather MoE with its activation and combine kernels is no further from f32 truth than the composed path at 2048 rows, every routed width" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -6510,6 +6744,76 @@ test "dsv41 ffn prefill: the sorted-gather MoE with its activation and combine k
         try testing.expect(@sqrt(ef / tt) < 1e-2);
         try testing.expect(@sqrt(ef) <= 1.25 * @sqrt(ec) + 1e-4 * @sqrt(tt));
     }
+}
+
+test "dsv41 ffn prefill, GGUF experts: the matrix units' fused gate+up and down stay within twice the per-pair gathers' distance from f32 truth" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const L = 256;
+    const k = 6;
+    const d = 1024;
+    const inter = 256;
+    const E = 16;
+    const f = try FfnFixture.init(gpa, E, d, inter, 4, .affine);
+    defer f.deinit(gpa);
+    const sc = &f.sc;
+    const g = try ggufTestBank(.iq2_xxs, sc, E, inter, d, 0);
+    const u = try ggufTestBank(.iq2_xxs, sc, E, inter, d, 1);
+    const dn = try ggufTestBank(.iq2_xs, sc, E, d, inter, 2);
+    f.ly.experts = .{ .gate = g.b, .up = u.b, .down = dn.b };
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 9));
+    var hx = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_normal(&hx, &[_]c_int{ L, d }, 2, .bfloat16, 0, 1, key, sc.s));
+    const h = try sc.keep(hx);
+    var rng = std.Random.DefaultPrng.init(21);
+    var ids: [L * k]u32 = undefined;
+    var ws: [L * k]f32 = undefined;
+    for (0..L) |l| {
+        var used: [E]bool = @splat(false);
+        var j: usize = 0;
+        while (j < k) {
+            const e: usize = @min(E - 1, @as(usize, @intFromFloat(@sqrt(rng.random().float(f32)) * E)));
+            if (used[e]) continue;
+            used[e] = true;
+            ids[l * k + j] = @intCast(e);
+            ws[l * k + j] = 0.05 + rng.random().float(f32);
+            j += 1;
+        }
+    }
+    const idx = try sc.keep(mlx.mlx_array_new_data(&ids, &[_]c_int{ L, k }, 2, .uint32));
+    const wts = try sc.keep(mlx.mlx_array_new_data(&ws, &[_]c_int{ L, k }, 2, .float32));
+    const fused = try moePrefill(sc, &f.m, &f.ly, h, idx, wts, try shared(sc, &f.m, &f.ly, h));
+    const comp = try withShared(sc, &f.m, &f.ly, h, try routed(sc, &f.m, &f.ly, h, idx, wts));
+    const hf = try sc.astype(h, .float32);
+    const gt = try sc.matmul(hf, try sc.transpose(g.dq, &.{ 0, 2, 1 })); // [E, L, inter]
+    const ut = try sc.matmul(hf, try sc.transpose(u.dq, &.{ 0, 2, 1 }));
+    const a32 = try clampedSwiglu(sc, gt, ut, 10);
+    const dt = try sc.transpose(try sc.matmul(a32, try sc.transpose(dn.dq, &.{ 0, 2, 1 })), &.{ 1, 0, 2 }); // [L, E, d]
+    const picked = try sc.takeAlong(dt, try sc.reshape(idx, &.{ L, k, 1 }), 1);
+    const routed_t = try sc.sum(try sc.mul(picked, try sc.reshape(wts, &.{ L, k, 1 })), 1, false);
+    const su = try sc.matmul(hf, try sc.t2(f.dq[2]));
+    const s32 = try clampedSwiglu(sc, try sc.slice(su, -1, 0, inter), try sc.slice(su, -1, inter, 2 * inter), 10);
+    const truth = try sc.add(routed_t, try sc.matmul(s32, try sc.t2(f.dq[3])));
+    const fo = try hostF32(fused);
+    defer gpa.free(fo);
+    const co = try hostF32(comp);
+    defer gpa.free(co);
+    const t = try hostF32(truth);
+    defer gpa.free(t);
+    var ef: f64 = 0;
+    var ec: f64 = 0;
+    var tt: f64 = 0;
+    for (fo, co, t) |a, b, r| {
+        ef += (a - r) * (a - r);
+        ec += (b - r) * (b - r);
+        tt += r * r;
+    }
+    std.debug.print("gguf prefill: fused-truth {e:.2}, per-pair-truth {e:.2} (rel rms)\n", .{ @sqrt(ef / tt), @sqrt(ec / tt) });
+    try testing.expect(@sqrt(ef / tt) < 1e-2);
+    // The matrix units take the decoded weights in bf16; the per-pair gathers multiply them in f32.
+    try testing.expect(@sqrt(ef) <= 2 * @sqrt(ec) + 1e-4 * @sqrt(tt));
 }
 
 test "dsv41 bench: one-token FFN as a dependent chain, composed vs kernels (DSV41_BENCH_MOEK)" {

@@ -4,6 +4,7 @@ const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../util/log.zig");
+const json_text = @import("../util/json_text.zig");
 const plugin_config = @import("../../engines/mlx/plugin/config.zig");
 const abi = @import("../../abi/plugin.zig");
 const mlx_gguf = @import("../quant/gguf/claim.zig");
@@ -1700,7 +1701,7 @@ pub fn parseConfigLegacy(io: std.Io, allocator: std.mem.Allocator, model_dir: []
 }
 
 fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, served: bool) !ModelConfig {
-    const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
+    const raw = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
         const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
         defer allocator.free(path);
 
@@ -1711,6 +1712,8 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         var reader_state = file.reader(io, &read_buf);
         break :blk try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
     };
+    defer allocator.free(raw);
+    const content = try json_text.quoteInfinity(allocator, raw);
     defer allocator.free(content);
 
     // A served pack's engine config is the legacy parse with the plugin's binding attached, so every engine read
@@ -5008,7 +5011,10 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     try admitExl3Backend(config, mlx.metalKernelsAvailable());
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
-    if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
+    if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) {
+        if (load_vision) _ = try mlx_gguf.loadVision(io, allocator, model_dir, &gguf_weights.map);
+        return gguf_weights;
+    }
     if (config.embedded_ple_payload_bytes != null) {
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
@@ -9346,6 +9352,18 @@ test "nemotron_h: RADIO pruning preserves checkpoint decimal precision" {
         try testing.expectEqual(expected, @as(f64, root_rate.video_pruning_rate));
         try testing.expectEqual(expected, @as(f64, nested_rate.video_pruning_rate));
     }
+}
+
+test "parseConfig: a config.json with Python's bare Infinity (mlx-lm's Nemotron-H time_step_limit) loads" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"nemotron_h\",\"time_step_limit\":[\n 0.0,\n Infinity\n]}" });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var cfg = try parseConfigLegacy(io, testing.allocator, dir);
+    defer cfg.deinit(testing.allocator);
+    try testing.expectEqual(std.math.inf(f32), cfg.time_step_max);
 }
 
 test "nemotron_h: time_step_limit accepts only numeric bounds and positive infinity" {
