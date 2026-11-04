@@ -716,7 +716,36 @@ pub fn mediaPeakFor(self: *Scheduler, entry: *LoadedModel) u64 {
 ///                             RAM can't hold weights + headroom).
 ///   error.LoadFailed        — inference thread reported a load failure.
 ///   error.Shutdown          — scheduler is shutting down.
+/// A load refused for memory unloads one idle model, least recently used first, and tries again:
+/// a plugin sizes its own caches from what is free, so the registry gate cannot see it coming.
 pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
+    const Retry = struct {
+        sch: *Scheduler,
+        id: []const u8,
+        fn load(r: @This()) !*LoadedModel {
+            return ensureLoadedOnce(r.sch, r.id);
+        }
+        fn unloadOne(r: @This()) bool {
+            const keep = (r.sch.registry.resolveEntry(r.id) catch return false).id;
+            const victim = idleModelToUnload(r.sch, keep) orelse return false;
+            log.info("[registry] {s} does not fit — unloading idle model {s} first\n", .{ keep, victim });
+            r.sch.unloadModelIfIdle(victim, 0) catch return false;
+            return true;
+        }
+    };
+    return loadAfterUnloadingIdle(*LoadedModel, Retry{ .sch = self, .id = id_or_empty }, Retry.load, Retry.unloadOne);
+}
+
+fn loadAfterUnloadingIdle(comptime T: type, ctx: anytype, load: fn (@TypeOf(ctx)) anyerror!T, unloadOne: fn (@TypeOf(ctx)) bool) !T {
+    while (true) {
+        return load(ctx) catch |err| {
+            if (err != error.InsufficientMemory or !unloadOne(ctx)) return err;
+            continue;
+        };
+    }
+}
+
+fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
     // A lost GPU context fails every MLX call: nothing is loaded or served until a restart.
     if (mlx.gpuContextLost()) return error.GpuContextLost;
     // Fast path: ready entries. registry.ensureLoaded handles waiting
@@ -1225,6 +1254,34 @@ pub var gen_yield_enabled = true;
 pub var prefill_decode_share: f32 = 0;
 
 const testing = std.testing;
+
+test "a load refused for memory unloads idle models one at a time until it loads" {
+    const t = std.testing;
+    const Fake = struct {
+        fits_after: usize, // unloads needed before the load fits
+        idle: usize,
+        unloaded: usize = 0,
+        fn load(f: *@This()) anyerror!u32 {
+            return if (f.unloaded >= f.fits_after) 7 else error.InsufficientMemory;
+        }
+        fn unloadOne(f: *@This()) bool {
+            if (f.unloaded == f.idle) return false;
+            f.unloaded += 1;
+            return true;
+        }
+        fn failsOther(_: *@This()) anyerror!u32 {
+            return error.LoadFailed;
+        }
+    };
+    var a = Fake{ .fits_after = 2, .idle = 3 };
+    try t.expectEqual(@as(u32, 7), try loadAfterUnloadingIdle(u32, &a, Fake.load, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 2), a.unloaded);
+    var b = Fake{ .fits_after = 2, .idle = 1 };
+    try t.expectError(error.InsufficientMemory, loadAfterUnloadingIdle(u32, &b, Fake.load, Fake.unloadOne));
+    var c = Fake{ .fits_after = 0, .idle = 3 };
+    try t.expectError(error.LoadFailed, loadAfterUnloadingIdle(u32, &c, Fake.failsOther, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 0), c.unloaded);
+}
 
 test "a live MTP slot never ticks regular, an unarmed one always does" {
     try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, true, true, false));
