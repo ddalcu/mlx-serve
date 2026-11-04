@@ -325,9 +325,6 @@ const Entry = struct {
     last_used: u64,
     /// `crt.monotonicMs()` of the last touch; the default never reads as idle.
     touched_ms: i64 = std.math.maxInt(i64),
-    /// A module rung that a longer resident entry of the same conversation extends. Kept so a
-    /// fork below the tip (a recap, a regenerate) still restores; evicted before any tip.
-    superseded: bool = false,
     /// Wave 1.A: full KV-quant config active when this entry was committed.
     /// A new request whose `KVQuantConfig` differs in any field cannot
     /// restore from this entry — the underlying buffer layout (dense bf16 vs
@@ -1971,7 +1968,23 @@ pub const HotPrefixCache = struct {
         if (!ModuleBinding.same(m.binding, binding) or e.has_tools != has_tools) return false;
         if (!std.meta.eql(e.quant_config, quant_config) or e.tokens.len > ids.len) return false;
         if (mediaSharedBound(e.media, media) < e.tokens.len) return false;
+        // Conversations sharing a system prompt agree for thousands of tokens; the last one rejects them fast.
+        if (e.tokens.len > 0 and e.tokens[e.tokens.len - 1] != ids[e.tokens.len - 1]) return false;
         return std.mem.eql(u32, e.tokens, ids[0..e.tokens.len]);
+    }
+
+    /// Whether entry `i` is a rung: a longer resident module entry of its conversation extends it.
+    /// Computed from what is resident, never stored, so a tip that leaves by any path (thinning, a
+    /// failed restore, the stale or idle passes) turns its rungs back into ordinary entries.
+    fn isModuleRung(self: *const HotPrefixCache, i: usize) bool {
+        const e = &self.entries.items[i];
+        if (e.module == null) return false;
+        for (self.entries.items, 0..) |*o, j| {
+            if (j == i or o.tokens.len <= e.tokens.len) continue;
+            const m = o.module orelse continue;
+            if (moduleRungOf(e, m.binding, o.tokens, o.media, o.has_tools, o.quant_config)) return true;
+        }
+        return false;
     }
 
     /// The commit of `ids` makes every shorter entry of its conversation a rung. An entry of the
@@ -1982,19 +1995,15 @@ pub const HotPrefixCache = struct {
         while (i > 0) {
             i -= 1;
             const e = &self.entries.items[i];
-            if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config)) continue;
-            if (e.tokens.len == ids.len) {
-                self.evictAt(i, "module checkpoint replaced");
-                continue;
-            }
-            e.superseded = true;
+            if (e.tokens.len != ids.len) continue;
+            if (moduleRungOf(e, binding, ids, media, has_tools, quant_config)) self.evictAt(i, "module checkpoint replaced");
         }
         while (true) {
             var lens: [MODULE_RUNGS_KEPT + 2]usize = undefined;
             var idxs: [MODULE_RUNGS_KEPT + 2]usize = undefined;
             var n: usize = 0;
             for (self.entries.items, 0..) |*e, j| {
-                if (!e.superseded or e.checked_out_by != null) continue;
+                if (e.checked_out_by != null) continue;
                 if (!moduleRungOf(e, binding, ids, media, has_tools, quant_config)) continue;
                 if (n == lens.len) break;
                 lens[n] = e.tokens.len;
@@ -3829,11 +3838,12 @@ pub const HotPrefixCache = struct {
             }
             if (best != null) return best;
         }
-        // A superseded rung goes before any conversation's tip, so every live conversation
-        // keeps its newest checkpoint while rungs remain.
+        // A rung goes before any conversation's tip, so every live conversation keeps its newest
+        // checkpoint while rungs remain.
         for (self.entries.items, 0..) |*e, i| {
-            if (!e.superseded or e.checked_out_by != null) continue;
+            if (e.checked_out_by != null) continue;
             if (protect) |p| if (e.last_used == p) continue;
+            if (e.last_used >= best_used or !self.isModuleRung(i)) continue;
             if (e.last_used < best_used) {
                 best_used = e.last_used;
                 best = i;
@@ -11275,6 +11285,40 @@ test "HotPrefixCache module: a long conversation keeps a thinned ladder and ever
     try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, q).?.n);
     cache.invalidateAll("test end");
     for (snaps) |s| try testing.expectEqual(@as(usize, 1), s.frees);
+}
+
+test "HotPrefixCache module: a rung whose tip left by another path is a tip again" {
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 64, 0);
+    defer cache.deinit();
+    const q = kv_quant.KVQuantConfig.dense;
+    // B commits first, so B's tip is the least recently used entry.
+    var b: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17 };
+    _ = try b.put(&cache, binding, &.{});
+    var rung: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2 }, .key = 3 };
+    _ = try rung.put(&cache, binding, &.{});
+    var tip: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 1, 2, 3 }, .key = 6 };
+    _ = try tip.put(&cache, binding, &.{});
+    try testing.expectEqual(@as(usize, 3), cache.entryCount());
+    // A's tip leaves outside the ladder, the way a failed restore drops it.
+    for (cache.entries.items, 0..) |e, i| if (e.tokens.len == 3) {
+        cache.evictAt(i, "module restore failed");
+        break;
+    };
+    try testing.expectEqual(@as(usize, 1), tip.frees);
+    // {1,2} is A's best checkpoint now. Under count pressure it is not taken ahead of B's tip.
+    cache.max_entries = @intCast(cache.entryCount());
+    var c: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{20}, .key = 20 };
+    _ = try c.put(&cache, binding, &.{});
+    try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 1, 2, 7 }, false, &.{}, null, q).?.n);
+    try testing.expect(cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, q) == null);
+    try testing.expectEqual(@as(usize, 1), b.frees);
+    cache.invalidateAll("test end");
+    try testing.expectEqual(@as(usize, 1), rung.frees);
+    try testing.expectEqual(@as(usize, 1), c.frees);
 }
 
 test "HotPrefixCache module: oversized disabled and malformed commits free the whole candidate" {
