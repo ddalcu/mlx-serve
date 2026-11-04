@@ -13,6 +13,7 @@ enum InterfacePrefKey {
     static let accentColor = "accentColorName"
     static let textSize = "chatTextSize"
     static let compactMode = "compactMode"
+    static let showActivityPhrases = "showActivityPhrases"
     static let chatColumn = "chatColumnWidth"
     /// Default `TerminalTheme` id for new sandbox terminals; a session can
     /// override it from its row's context menu.

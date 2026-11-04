@@ -40,6 +40,7 @@ struct MLXCoreApp: App {
     /// The View ▸ Interface menu writes the same keys the Settings rows do.
     @AppStorage(InterfacePrefKey.chatColumn) private var chatColumnRaw = ChatColumnWidth.wide.rawValue
     @AppStorage(InterfacePrefKey.compactMode) private var compactMode = false
+    @AppStorage(InterfacePrefKey.showActivityPhrases) private var showActivityPhrases = true
     /// Held, NOT observed: `AppState` publishes every streamed chat delta, and
     /// an observing App body rebuilds every scene root per delta. What the
     /// scene graph reads from it lives in the small observing views below.
@@ -349,6 +350,7 @@ struct MLXCoreApp: App {
                     // terminal.
                     Toggle("Compact mode", isOn: $compactMode)
                         .keyboardShortcut("c", modifiers: [.command, .option])
+                    Toggle("Show Activity Phrases", isOn: $showActivityPhrases)
                 } label: {
                     Label("Interface", systemImage: "paintbrush")
                 }
