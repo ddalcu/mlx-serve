@@ -17,3 +17,15 @@ the C ABI has no surface for it yet.
 +            std::nullopt,
 +            sorted_indices,
              mlx_stream_get_(s)));
+diff --git a/mlx/c/fast.cpp b/mlx/c/fast.cpp
+index eb35d16..8d54803 100644
+--- a/mlx/c/fast.cpp
++++ b/mlx/c/fast.cpp
+@@ -620,6 +620,7 @@ extern "C" int mlx_fast_scaled_dot_product_attention(
+             mlx_array_get_(keys),
+             mlx_array_get_(values),
+             scale,
++            -1,
+             std::string(mask_mode),
+             (mask_arr.ctx ? std::make_optional(mlx_array_get_(mask_arr))
+                           : std::nullopt),
