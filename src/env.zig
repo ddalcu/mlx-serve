@@ -340,6 +340,7 @@ pub const vars = struct {
     pub const GLM53_WAVE_PROBE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/glm_moe_dsa/stream", .since = "26.10.3", .doc = "GLM-5.3: log each prompt layer's MLX peak by stage" };
     pub const GLM5_NEXT_PREFILL_TIMELINE: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "glm5_next profile builds: the prefill timeline" };
     pub const GLM5_NEXT_ROUTE_TRACE: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "sdk/weights/streamed/glm5n", .since = "26.10.3", .doc = "glm5_next profile builds: route trace file prefix" };
+    pub const GGUF_NAX_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/quant/gguf", .since = "26.11.2", .doc = "GGUF expert-bank ubenches at the DeepSeek-V4.1 Coder's shapes (prefill on the matrix units, decode gathers) against MLX's 2-bit affine" };
     pub const GQMM_UBENCH: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/blocks/moe", .since = "26.10.2", .doc = "gather-QMM NAX ubench (`sweep`: every tile config)" };
     pub const H3_SPLIT_SHARE: Var = .{ .kind = .diag, .type = .float, .default = "the calibrated cut", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 cluster: share of rows kept on this Mac (0..1)" };
     pub const KVQ_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "engines/mlx/cache", .since = "26.7.12", .doc = "kv-quant decode attention ubench" };

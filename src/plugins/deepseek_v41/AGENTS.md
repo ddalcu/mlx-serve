@@ -21,7 +21,11 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   rows runs through `blockFused`; `decode/fixture.zig` builds release-shape layers on random weights for their
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
-  without NAX (unmeasured on M5); `moe_up` / `moe_down` serve the affine 2/3-bit packs. Otherwise `routed` runs.
+  without NAX (unmeasured on M5); `moe_up` / `moe_down` serve the affine 2/3-bit packs at group 64 or 128 (the
+  expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
+- GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
+  (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
+  (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
 
 ## Facts the table declares
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other

@@ -82,6 +82,15 @@ pub fn preferredEngine(info: Info) Engine {
     return .llama;
 }
 
+/// What ds4 drafts from for a file: the checkpoint's own head and/or a support GGUF beside it.
+pub const Spec = struct { embedded_mtp: bool = false, support_gguf: bool = true };
+
+/// ds4 fails the open of a DeepSeek-V4.1 handed any support GGUF (MTP or DSpark), so one beside it is skipped.
+pub fn ds4Spec(info: Info) Spec {
+    const a = info.architecture orelse "";
+    return .{ .embedded_mtp = info.embedded_mtp, .support_gguf = !std.mem.eql(u8, a, "deepseek41") };
+}
+
 pub const Error = error{
     BadMagic,
     UnsupportedVersion,
@@ -439,6 +448,16 @@ test "embedded MTP is read from <arch>.nextn_predict_layers" {
     var c = try parseBytes(testing.allocator, dsv4);
     defer c.deinit(testing.allocator);
     try testing.expect(!c.embedded_mtp);
+}
+
+test "ds4Spec: DeepSeek-V4.1 takes no support GGUF in ds4; DeepSeek-V4 and the other archs do" {
+    for ([_][]const u8{ "deepseek41", "deepseek4", "qwen4exp" }) |arch| {
+        const bytes = try buildHeader(testing.allocator, &.{.{ .key = "general.architecture", .value = .{ .str = arch } }});
+        defer testing.allocator.free(bytes);
+        var info = try parseBytes(testing.allocator, bytes);
+        defer info.deinit(testing.allocator);
+        try testing.expectEqual(!std.mem.eql(u8, arch, "deepseek41"), ds4Spec(info).support_gguf);
+    }
 }
 
 test "preferredEngine: ds4-only archs → ds4 without the lora key" {

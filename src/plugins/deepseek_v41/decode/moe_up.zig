@@ -48,7 +48,7 @@ fn ci(v: usize) c_int {
 
 /// The gate/up half of `h2`'s MoE (`h2` `[R, K]`, `idx` `[R, k]` u32, `wts` `[R, k]` f32; R <= `decode.max_rows`) as
 /// `[R, k + 1, N]`: slot j < k the clamped SwiGLU of row r's j-th expert times its weight, slot k the shared expert's.
-/// Null where the layer's formats are not the served ones (routed affine 2 or 3 bits, group 64; shared mxfp8) or the shape is not.
+/// Null where the layer's formats are not the served ones (routed affine 2 or 3 bits, group 64 or 128; shared mxfp8) or the shape is not.
 pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, ly: *const dsv41.Layer, h2: A, idx: A, wts: A) !?A {
     const gu = ly.experts.gu orelse return null;
     const sgu = ly.shared_gu orelse return null;
@@ -62,7 +62,8 @@ pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, ly: *co
     const k: usize = @intCast(hs[1]);
     const bits = gu.qp.bits;
     if (rows < 1 or rows > decode.max_rows or topk < 1 or rows * topk > 64 or k % 1024 != 0) return null;
-    if (gu.qp.mode != .affine or gu.qp.group_size != 64 or (bits != 2 and bits != 3) or gw[2] != ci(k * bits / 32) or @rem(gw[1], 2) != 0) return null;
+    const gs = gu.qp.group_size;
+    if (gu.qp.mode != .affine or (gs != 64 and gs != 128) or (bits != 2 and bits != 3) or gw[2] != ci(k * bits / 32) or @rem(gw[1], 2) != 0) return null;
     if (sgu.qp.mode != .mxfp8 or sgu.qp.bits != 8 or sgu.qp.group_size != 32) return null;
     const n: usize = @intCast(@divExact(gw[1], 2));
     const dt = mlx.mlx_array_dtype(h2);
@@ -73,12 +74,12 @@ pub fn moeUp(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, ly: *co
     if (sw.len != 2 or ss.len != 2 or sw[0] != ci(2 * n) or sw[1] != ci(k / 4) or ss[0] != ci(2 * n) or ss[1] != ci(k / 32)) return null;
     if (mlx.mlx_array_dtype(sgu.w) != .uint32 or mlx.mlx_array_dtype(sgu.s) != .uint8) return null;
     const vgu = if (ly.experts.views) |v| v[0] else gu;
-    return try run(sc, kern, bits, h2, vgu.w, vgu.s, vgu.b, sgu.w, sgu.s, idx, wts);
+    return try run(sc, kern, bits, gs, h2, vgu.w, vgu.s, vgu.b, sgu.w, sgu.s, idx, wts);
 }
 
 /// The launch over arrays already checked: `w`, `scales` and `biases` the routed gate+up bank (or a view of its first
 /// expert: experts are addressed from the buffer pointer), `sw` and `sscales` the shared mxfp8 gate+up.
-pub fn run(sc: *dsv41.Scope, kern: Kernel, bits: usize, x: A, w: A, scales: A, biases: A, sw: A, sscales: A, idx: A, wts: A) !A {
+pub fn run(sc: *dsv41.Scope, kern: Kernel, bits: usize, gs: usize, x: A, w: A, scales: A, biases: A, sw: A, sscales: A, idx: A, wts: A) !A {
     const rows: usize = @intCast(mlx.getShape(x)[0]);
     const k: usize = @intCast(mlx.getShape(x)[1]);
     const topk: usize = @intCast(mlx.getShape(idx)[1]);
@@ -89,7 +90,7 @@ pub fn run(sc: *dsv41.Scope, kern: Kernel, bits: usize, x: A, w: A, scales: A, b
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ ci(rows), ci(topk + 1), ci(n) }, 3, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(32 * n * (topk * rows + 1)), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, tg_threads, 1, 1));
-    inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk }, .{ "BITS", bits } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
+    inline for (.{ .{ "R", rows }, .{ "K", k }, .{ "N", n }, .{ "TOPK", topk }, .{ "BITS", bits }, .{ "GS", gs } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     const ins = [_]A{ x, w, scales, biases, sw, sscales, idx, wts, kern.lim };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
@@ -136,7 +137,7 @@ fn sharedWeight(sw: []const f64, ss: []const f64, r: usize, i: usize, k: usize) 
 }
 
 const MoeUp = struct {
-    pub const Params = struct { bits: u32, experts: usize = 8, lim: f64 = 10 };
+    pub const Params = struct { bits: u32, gs: u32 = 64, experts: usize = 8, lim: f64 = 10 };
 
     pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
         if (s.rows == 0 or s.rows > decode.max_rows or s.n == 0 or s.k == 0 or s.k % 1024 != 0) return null;
@@ -147,6 +148,7 @@ const MoeUp = struct {
         g.int("N", s.n);
         g.int("TOPK", TOPK);
         g.int("BITS", p.bits);
+        g.int("GS", p.gs);
         g.dtype("T", act);
         return g;
     }
@@ -157,7 +159,7 @@ const MoeUp = struct {
         const N = k.shape.n;
         const K = k.shape.k;
         const x = try k.add(act, &.{ R, K });
-        const routed = try cv.Bank.add(k, &.{ p.experts, 2 * N }, p.bits, 64, K);
+        const routed = try cv.Bank.add(k, &.{ p.experts, 2 * N }, p.bits, p.gs, K);
         const sw = try k.add(.uint32, &.{ 2 * N, K / 4 });
         const ss = try k.add(.uint8, &.{ 2 * N, K / 32 });
         const inds = try k.add(.uint32, &.{ R, TOPK });
@@ -202,7 +204,7 @@ const MoeUp = struct {
         }
         if (f == .nonfinite) {
             // A NaN or infinite first-group scale in one gate or up row of row 0's slots 0-3 (gate, gate, up, both), the first group's x positive in every row (they share the experts).
-            for (0..R) |row| kit.uniform(rng, x[row * K ..][0..64], 0.1, 2);
+            for (0..R) |row| kit.uniform(rng, x[row * K ..][0..p.gs], 0.1, 2);
             const put = [_][3]f64{ .{ 0, kit.nan, 0 }, .{ 1, kit.inf, 0 }, .{ 2, 0, -kit.inf }, .{ 3, kit.inf, -kit.inf } };
             for (put) |q| {
                 const e: usize = @intFromFloat(q[0]);
@@ -230,7 +232,7 @@ const MoeUp = struct {
         const R = k.shape.rows;
         const N = k.shape.n;
         const K = k.shape.k;
-        const routed: cv.Bank = .{ .w = k.in(1), .s = k.in(2), .b = k.in(3), .bits = k.p.bits, .gs = 64, .k = K };
+        const routed: cv.Bank = .{ .w = k.in(1), .s = k.in(2), .b = k.in(3), .bits = k.p.bits, .gs = k.p.gs, .k = K };
         const t = try k.scratch().alloc(f64, K);
         defer k.scratch().free(t);
         const lim = k.in(8)[0];
@@ -280,9 +282,9 @@ const moe_up_l = cv.launch("dsv41_dec_moe_up", &INS, &.{"out"}, SOURCE, HEADER, 
 /// Served shapes cut the output width to 64: each column runs the same code at its own index; the reduction length and
 /// the rows (R = 1..6, over 8 experts so the rows share most of them) are the release's.
 pub fn register(set: *kc.Set) !void {
-    inline for (.{ 2, 3 }) |bits| {
-        try kit.add(set, MoeUp, &moe_up_l, .{ .bits = bits }, .{
-            .name = std.fmt.comptimePrint("dsv41 dec moe_up {d}-bit g64 + mxfp8 shared", .{bits}),
+    inline for (.{ 2, 3 }) |bits| inline for (.{ 64, 128 }) |gs| {
+        try kit.add(set, MoeUp, &moe_up_l, .{ .bits = bits, .gs = gs }, .{
+            .name = std.fmt.comptimePrint("dsv41 dec moe_up {d}-bit g{d} + mxfp8 shared", .{ bits, gs }),
             .accum = .f32,
             .depth = depth,
             .ops = 8,
@@ -292,7 +294,7 @@ pub fn register(set: *kc.Set) !void {
             .served = &.{ .{ .rows = 1, .n = 64, .k = 5120 }, .{ .rows = 3, .n = 17, .k = 5120 }, .{ .rows = decode.max_rows, .n = 64, .k = 5120 } },
             .sums = .{ .f16 = 30, .bf16 = 30, .why = "a wrong sum's activation tends to 0, so a miss tops out near 1 / the bound" },
         });
-    }
+    };
 }
 
 // ── tests ──
@@ -435,14 +437,16 @@ pub fn bitsOf(a: A) ![]const u16 {
 
 /// One layer of the fixture at R = 1, 2, 4, 6 and every routing: the kernel against today's path and f32 truth, and each
 /// row of a launch equal to its own one-row launch.
-fn equivalence(lo: usize, hi: usize, li: usize, bits: u32) !void {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+/// `affine`: every expert at that width over groups of 128 (`fixture.Opts.experts_affine`); null, the iQ plan's.
+fn equivalence(lo: usize, hi: usize, li: usize, bits: u32, affine: ?u32) !void {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const fx = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .experts = 16, .ctx = 0 });
+    const fx = try fixture.Fixture.init(gpa, .{ .lo = lo, .hi = hi, .experts = 16, .ctx = 0, .experts_affine = affine });
     defer fx.deinit();
     const m = fx.m;
     const ly = fx.layer(li);
     try testing.expectEqual(bits, ly.experts.gu.?.qp.bits);
+    try testing.expectEqual(@as(u32, if (affine != null) 128 else 64), ly.experts.gu.?.qp.group_size);
     const kern = try build(m.cfg.dsv4_swiglu_limit);
     defer kern.deinit();
     var prng = std.Random.DefaultPrng.init(0x4d0e + bits);
@@ -466,7 +470,7 @@ fn equivalence(lo: usize, hi: usize, li: usize, bits: u32) !void {
         const w = try dsv41.hostF32(want);
         defer gpa.free(w);
         var label: [64]u8 = undefined;
-        try decode.expectNoWorse(try std.fmt.bufPrint(&label, "moe_up {d}-bit R={d} {s}", .{ bits, rows, @tagName(how) }), g, w, tr);
+        try decode.expectNoWorse(try std.fmt.bufPrint(&label, "moe_up {d}-bit g{d} R={d} {s}", .{ bits, ly.experts.gu.?.qp.group_size, rows, @tagName(how) }), g, w, tr);
         const gb = try bitsOf(got);
         defer testing.allocator.free(gb);
         const per = (topk + 1) * @as(usize, @intCast(mlx.getShape(got)[2]));
@@ -482,19 +486,24 @@ fn equivalence(lo: usize, hi: usize, li: usize, bits: u32) !void {
 }
 
 test "dsv41 dec moe_up: 2-bit routed experts, rows 1 2 4 6, against today's path and f32 truth" {
-    try equivalence(20, 25, 20, 2);
+    try equivalence(20, 25, 20, 2, null);
 }
 
 test "dsv41 dec moe_up: 3-bit routed experts, rows 1 2 4 6, against today's path and f32 truth" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    try equivalence(2, 4, 2, 3);
+    try equivalence(2, 4, 2, 3, null);
+}
+
+test "dsv41 dec moe_up: 2-bit group-128 routed experts (the pruned packs), rows 1 2 4 6, against today's path and f32 truth" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try equivalence(20, 22, 20, 2, 2);
 }
 
 test "dsv41 dec moe_up: the declared launch is the wrapper's, byte for byte" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
-    inline for (.{ 2, 3 }) |bits| for ([_]Shape{ .{ .rows = 1, .n = 24, .k = 2048 }, .{ .rows = 4, .n = 9, .k = 1024 } }) |shape| {
-        var c = kit.Case(MoeUp).init(a, &moe_up_l, .{ .bits = bits });
+    inline for (.{ 2, 3 }) |bits| inline for (.{ 64, 128 }) |gs| for ([_]Shape{ .{ .rows = 1, .n = 24, .k = 2048 }, .{ .rows = 4, .n = 9, .k = 1024 } }) |shape| {
+        var c = kit.Case(MoeUp).init(a, &moe_up_l, .{ .bits = bits, .gs = gs });
         defer c.deinit();
         try testing.expect(try c.prepare(shape, .random, 7));
         try c.run();
@@ -505,7 +514,7 @@ test "dsv41 dec moe_up: the declared launch is the wrapper's, byte for byte" {
         const kern = try build(10);
         defer _ = mlx.mlx_fast_metal_kernel_free(kern.k);
         defer _ = mlx.mlx_array_free(kern.lim);
-        const theirs = try run(&sc, .{ .k = kern.k, .lim = c.args[8] }, bits, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6], c.args[7]);
+        const theirs = try run(&sc, .{ .k = kern.k, .lim = c.args[8] }, bits, gs, c.args[0], c.args[1], c.args[2], c.args[3], c.args[4], c.args[5], c.args[6], c.args[7]);
         try testing.expectEqualSlices(u8, try c.rig.bytesOf(&.{theirs}), mine);
     };
 }
@@ -757,7 +766,7 @@ const NewCtx = struct {
         const v = ly.experts.views.?[0];
         const sgu = ly.shared_gu.?;
         const x = try b.depX(c.sc, c.prev);
-        c.prev = try run(c.sc, b.kern, b.bits, x, v.w, v.s, v.b, sgu.w, sgu.s, b.ids[i % bench_steps], b.wts[i % bench_steps]);
+        c.prev = try run(c.sc, b.kern, b.bits, 64, x, v.w, v.s, v.b, sgu.w, sgu.s, b.ids[i % bench_steps], b.wts[i % bench_steps]);
         return c.prev;
     }
 };
@@ -852,4 +861,3 @@ test "dsv41 dec moe_up: ubench, R = 1 and 6 against today's chain (DSV41_DEC_UBE
         decode.report("moe_up", rows, new_us - dep_us, b.bytes(), old_us - dep_us);
     };
 }
-

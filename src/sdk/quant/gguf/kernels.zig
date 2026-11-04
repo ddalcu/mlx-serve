@@ -2,8 +2,9 @@
 //! [rows, row_bytes] holding the GGUF tensor bytes untouched.
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
+const device = @import("../../../mlx/device.zig");
 const quants = @import("quants.zig");
-const GgmlType = quants.GgmlType;
+pub const GgmlType = quants.GgmlType;
 
 pub const Error = error{ UnsupportedType, BadShape, MetalKernelCompileFailed, MetalKernelBadOutputCount };
 
@@ -95,7 +96,10 @@ pub fn headerFor(comptime ty: GgmlType) [:0]const u8 {
     return h;
 }
 
-pub const Kind = enum { dequant, matvec, matvec_cols, gather, gather_swiglu, matmat, gather_tile };
+/// The matrix units' tensor ops, for `gather_nax`.
+const nax_include = "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\n";
+
+pub const Kind = enum { dequant, matvec, matvec_cols, gather, gather_swiglu, matmat, gather_tile, gather_nax, gather_nax_gu };
 
 /// Runs the tile for this threadgroup's token tile: the last tile of a prompt
 /// may hold fewer 8-token groups.
@@ -186,11 +190,12 @@ fn colsServes(ty: GgmlType, in: c_int, per: c_int) bool {
 
 /// An IQ type's codebook, read at data-dependent indices: from `constant` memory those reads serialize, so the
 /// matvec and tile kinds stage it in threadgroup memory first (as ggml's own Metal kernels do).
-fn gridOf(ty: GgmlType) ?struct { table: []const u8, elem: []const u8, len: u32 } {
-    // IQ1's 8 KB grid stays in `constant`: staged, it costs the tile kernels more occupancy than its reads cost.
+fn gridOf(ty: GgmlType) ?struct { table: []const u8, elem: []const u8, len: u32, halves: bool = false } {
+    // IQ1's 8 KB grid stays in `constant`: staged, it costs the tile kernels more occupancy than its reads cost. The
+    // IQ2 grids of 8 magnitudes an entry stage as two half4 each (exact): a lookup skips the byte unpack.
     return switch (ty) {
-        .iq2_xxs => .{ .table = "iq2xxs_grid", .elem = "uint64_t", .len = 256 },
-        .iq2_xs => .{ .table = "iq2xs_grid", .elem = "uint64_t", .len = 512 },
+        .iq2_xxs => .{ .table = "iq2xxs_grid", .elem = "uint64_t", .len = 256, .halves = true },
+        .iq2_xs => .{ .table = "iq2xs_grid", .elem = "uint64_t", .len = 512, .halves = true },
         .iq2_s => .{ .table = "iq2s_grid", .elem = "uint64_t", .len = 1024 },
         .iq3_xxs => .{ .table = "iq3xxs_grid", .elem = "uint32_t", .len = 256 },
         .iq3_s => .{ .table = "iq3s_grid", .elem = "uint32_t", .len = 512 },
@@ -201,6 +206,7 @@ fn gridOf(ty: GgmlType) ?struct { table: []const u8, elem: []const u8, len: u32 
 /// The matvec kinds' codebook in threadgroup memory, `DEQ_AT` reading it there.
 fn stagedGrid(comptime ty: GgmlType) []const u8 {
     const g = comptime gridOf(ty) orelse return "";
+    if (g.halves) return std.fmt.comptimePrint(@embedFile("metal/kernels/staged_grid_half.fmt.metal"), .{ 2 * g.len, g.len, g.table, @tagName(ty) });
     return std.fmt.comptimePrint(
         \\threadgroup {s} gg_grid[{d}];
         \\for (uint i = simdgroup_index_in_threadgroup * threads_per_simdgroup + thread_index_in_simdgroup; i < {d}; i += simdgroups_per_threadgroup * threads_per_simdgroup) gg_grid[i] = {s}[i];
@@ -211,16 +217,27 @@ fn stagedGrid(comptime ty: GgmlType) []const u8 {
     , .{ g.elem, g.len, g.len, g.table, @tagName(ty) });
 }
 
-pub fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
-    // DEQ_AT(w, row, blk, u, o): decode unit u of block blk of row `row` of
-    // weight w. SPLIT (template const, see isSplit) picks the row layout.
+/// The block constants of `ty` (BE, BB, UNIT, UPB, NB of the template K) and DEQ_AT(w, row, blk, u, o): decode unit
+/// u of block blk of row `row` of weight w. SPLIT (template const, see isSplit) picks the row layout. `slice`: a
+/// kernel built on 32-weight units, where a wider K-quant unit decodes a 32-weight slice at a time (`deq_<type>_s`).
+fn prelude(comptime ty: GgmlType, comptime slice: bool) [:0]const u8 {
+    const sliced = slice and ty.unitElems() > 32;
+    const name = @tagName(ty) ++ if (sliced) "_s" else "";
     const layout = splitLayout(ty) orelse Split{ .head = 0, .payload = 0, .payload_at = 0 };
     const deq_at = if (layout.head > 0)
-        std.fmt.comptimePrint(@embedFile("metal/kernels/deq_at_split.fmt.metal"), .{ @tagName(ty), layout.payload, layout.head, layout.payload, @tagName(ty) })
+        std.fmt.comptimePrint(@embedFile("metal/kernels/deq_at_split.fmt.metal"), .{ name, layout.payload, layout.head, layout.payload, name })
     else
-        std.fmt.comptimePrint(@embedFile("metal/kernels/deq_at.fmt.metal"), .{@tagName(ty)});
-    const prelude = std.fmt.comptimePrint(@embedFile("metal/kernels/prelude.fmt.metal"), .{ ty.blockElems(), ty.blockBytes(), ty.unitElems(), tileRows(ty), TILE_TOKENS }) ++ deq_at;
-    return prelude ++ switch (kind) {
+        std.fmt.comptimePrint(@embedFile("metal/kernels/deq_at.fmt.metal"), .{name});
+    return std.fmt.comptimePrint(@embedFile("metal/kernels/prelude.fmt.metal"), .{ ty.blockElems(), ty.blockBytes(), if (sliced) 32 else ty.unitElems(), tileRows(ty), TILE_TOKENS }) ++ deq_at;
+}
+
+/// The kinds built on 32-weight units (the decode gather keeps a wide unit's own matvec, the proof tapes' order).
+fn unit32(comptime kind: Kind) bool {
+    return kind == .gather_nax or kind == .gather_nax_gu;
+}
+
+pub fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
+    return prelude(ty, unit32(kind)) ++ switch (kind) {
         // One thread per unit.
         .dequant => @embedFile("metal/kernels/dequant.metal"),
         // Instance z takes activation rows [z * M, z * M + M).
@@ -229,7 +246,7 @@ pub fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
         // MoE: instance z is one (token, expert) pair, `ids[z]` its expert in
         // the bank w [experts, N, row bytes] and z / XDIV its activation row
         // (XDIV = experts per token, 1 when the rows come already repeated).
-        .gather => "#define GG_W (w + size_t(ids[z]) * N * ROWB)\n#define GG_X (x + size_t(z / XDIV) * K)\n" ++ stagedGrid(ty) ++ matvec_body,
+        .gather => "#define GG_W (w + size_t(ids[z]) * N * ROWB)\n#define GG_X (x + size_t(z / XDIV) * K)\n" ++ stagedGrid(ty) ++ (if (ty.unitElems() == 32) "if ((K / UNIT) % 32 == 0) {\n" ++ @embedFile("metal/kernels/gather_body.metal") ++ "} else {\n" ++ matvec_body ++ "}\n" else matvec_body),
         // The gather's matvec over a gate and an up bank at once, then SwiGLU on the pair (`gatherSwiGLU`).
         .gather_swiglu => stagedGrid(ty) ++ @embedFile("metal/kernels/gather_swiglu.metal"),
         // x [M, K] f32 times w^T, M a multiple of 8 and N of TILE_ROWS. One
@@ -251,7 +268,30 @@ pub fn source(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
         .gather_tile => "threadgroup float tile[TILE_ROWS * UNIT];\nthreadgroup float stage[TILE_TOKENS * TILE_ROWS];\n" ++ stagedGrid(ty) ++ tile_macro ++
             @embedFile("metal/kernels/gather_tile_head.metal") ++ tile_dispatch ++
             @embedFile("metal/kernels/gather_tile_tail.metal"),
+        // MoE prefill on the matrix units (`gatherNax`).
+        .gather_nax => "threadgroup float buf[128 * (2 * UNIT + 8) / 2];\n" ++ stagedGrid(ty) ++
+            @embedFile("metal/kernels/gather_nax.metal"),
+        // The same over a gate and an up bank, the clipped SwiGLU on the pair (`gatherNaxSwiGLU`).
+        .gather_nax_gu => "threadgroup float buf[128 * (2 * UNIT + 8) / 2];\n" ++ stagedGrid(ty) ++
+            @embedFile("metal/kernels/gather_nax_gu.metal"),
     };
+}
+
+/// A kind's input names, in its wrapper's order.
+pub fn inputNames(comptime kind: Kind) []const [*:0]const u8 {
+    return switch (kind) {
+        .dequant => &.{"w"},
+        .matvec, .matvec_cols, .matmat => &.{ "x", "w" },
+        .gather, .gather_tile => &.{ "x", "w", "ids" },
+        .gather_nax => &.{ "x", "w", "offs", "tiles" },
+        .gather_nax_gu => &.{ "x", "wg", "wu", "offs", "tiles", "wts", "lim" },
+        .gather_swiglu => &.{ "x", "wg", "wu", "ids", "sigtab" },
+    };
+}
+
+/// A kind's header: the type's decoders, after the matrix units' tensor ops for the NAX gathers.
+pub fn kernelHeader(comptime kind: Kind, comptime ty: GgmlType) [:0]const u8 {
+    return comptime if (kind == .gather_nax or kind == .gather_nax_gu) nax_include ++ headerFor(ty) else headerFor(ty);
 }
 
 /// One compiled kernel per (kind, type), built on first use. Only the
@@ -264,12 +304,7 @@ fn kernelFor(comptime kind: Kind, comptime ty: GgmlType) Error!mlx.mlx_fast_meta
     };
     _ = Cache.key;
     if (Cache.kernel) |k| return k;
-    const input_names: []const [*:0]const u8 = switch (kind) {
-        .dequant => &.{"w"},
-        .matvec, .matvec_cols, .matmat => &.{ "x", "w" },
-        .gather, .gather_tile => &.{ "x", "w", "ids" },
-        .gather_swiglu => &.{ "x", "wg", "wu", "ids", "sigtab" },
-    };
+    const input_names = inputNames(kind);
     const output_names = [_][*:0]const u8{"out"};
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
@@ -280,10 +315,44 @@ fn kernelFor(comptime kind: Kind, comptime ty: GgmlType) Error!mlx.mlx_fast_meta
         in_vec,
         out_vec,
         comptime source(kind, ty),
-        comptime headerFor(ty),
+        comptime kernelHeader(kind, ty),
         true,
         false,
     );
+    if (k.ctx == null) return error.MetalKernelCompileFailed;
+    Cache.kernel = k;
+    return k;
+}
+
+/// A plugin's own kernel over weights of `ty`: `body` runs after the type's prelude, DEQ_AT and staged grid, `header`
+/// after its decoders; its template ints add the K, ROWB and SPLIT of `layout`. Built once per (name, ty).
+pub fn pluginKernel(comptime name: [:0]const u8, comptime ins: []const [*:0]const u8, comptime body: [:0]const u8, comptime header: [:0]const u8, ty: GgmlType) Error!mlx.mlx_fast_metal_kernel {
+    inline for (all_types) |t| if (t == ty) return pluginKernelFor(name, ins, body, header, t);
+    return error.UnsupportedType;
+}
+
+/// `pluginKernel`'s source and header for `ty`.
+pub fn pluginSource(comptime ty: GgmlType, comptime body: [:0]const u8) [:0]const u8 {
+    return comptime prelude(ty, true) ++ stagedGrid(ty) ++ body;
+}
+
+pub fn pluginHeader(comptime ty: GgmlType, comptime header: [:0]const u8) [:0]const u8 {
+    return comptime headerFor(ty) ++ header;
+}
+
+fn pluginKernelFor(comptime name: [:0]const u8, comptime ins: []const [*:0]const u8, comptime body: [:0]const u8, comptime header: [:0]const u8, comptime ty: GgmlType) Error!mlx.mlx_fast_metal_kernel {
+    const Cache = struct {
+        const key = .{ name, ty };
+        var kernel: ?mlx.mlx_fast_metal_kernel = null;
+    };
+    _ = Cache.key;
+    if (Cache.kernel) |k| return k;
+    const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const output_names = [_][*:0]const u8{"out"};
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const k = mlx.mlx_fast_metal_kernel_new(name ++ "_" ++ @tagName(ty), in_vec, out_vec, pluginSource(ty, body), pluginHeader(ty, header), true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     Cache.kernel = k;
     return k;
@@ -301,7 +370,7 @@ fn kernel(kind: Kind, ty: GgmlType) Error!mlx.mlx_fast_metal_kernel {
     return error.UnsupportedType;
 }
 
-const Const = struct { [*:0]const u8, c_int };
+pub const Const = struct { [*:0]const u8, c_int };
 
 fn apply(
     k: mlx.mlx_fast_metal_kernel,
@@ -355,7 +424,7 @@ fn inFeatures(ty: GgmlType, row_bytes: c_int) Error!c_int {
 }
 
 /// The layout constants every kernel takes.
-fn layoutConsts(ty: GgmlType, in: c_int, row_bytes: c_int) [3]Const {
+pub fn layoutConsts(ty: GgmlType, in: c_int, row_bytes: c_int) [3]Const {
     return .{ .{ "K", in }, .{ "ROWB", row_bytes }, .{ "SPLIT", @intFromBool(isSplit(ty, @intCast(in))) } };
 }
 
@@ -406,9 +475,10 @@ pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx
     // GEMMs. The decode costs one pass over the bank, the tile kernel one per
     // (expert, token tile); past ~16 pairs per expert the pass is cheaper
     // (bench: 3.6x at 1700 tokens x 8 experts of 256), as long as the bf16
-    // bank stays under a GB.
+    // bank stays under a GB. Past that cap the matrix units' gather.
     const bank_bytes = @as(u64, @intCast(ws[0])) * @as(u64, @intCast(rows)) * @as(u64, @intCast(in)) * 2;
-    if (xdiv == 1 and n_out >= DEQUANT_MOE_PAIRS_PER_EXPERT * ws[0] and bank_bytes <= DEQUANT_MOE_MAX_BYTES) {
+    const dequant_bank = n_out >= DEQUANT_MOE_PAIRS_PER_EXPERT * ws[0] and bank_bytes <= DEQUANT_MOE_MAX_BYTES;
+    if (xdiv == 1 and dequant_bank) {
         var flat_w = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat_w);
         try mlx.check(mlx.mlx_reshape(&flat_w, w, &[_]c_int{ ws[0] * rows, ws[2] }, 2, s));
@@ -435,6 +505,15 @@ pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx
         return y;
     }
 
+    if (sorted and xdiv == 1 and n_out >= @max(64, NAX_PAIRS_PER_EXPERT * ws[0]) and naxGathers(rows, in, mlx.mlx_array_dtype(x))) {
+        const y2 = try gatherNax(ty, x_in, w, ids, rows, in, ws[2], s);
+        defer _ = mlx.mlx_array_free(y2);
+        var y = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_reshape(&y, y2, &out_shape, os.len + 2, s));
+        return y;
+    }
+
     // The tile kernel pays one weight decode per (expert, token tile) but runs
     // few threadgroups; it wins once an expert averages a whole 8-token group
     // per tile (256 experts: ~256 prompt tokens, measured, see bench).
@@ -453,12 +532,96 @@ pub fn gatherLinear(info: Info, x: mlx.mlx_array, w: mlx.mlx_array, lhs_idx: mlx
         return y;
     }
 
-    const groups = @divFloor(rows + GATHER_RPT * SIMDGROUPS - 1, GATHER_RPT * SIMDGROUPS);
-    return apply(try kernel(.gather, ty), &.{ x_in, w, ids }, out_shape[0 .. os.len + 2], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, SIMDGROUPS * groups, n_out }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, in, ws[2]) ++ [_]Const{ .{ "N", rows }, .{ "M", 1 }, .{ "RPT", GATHER_RPT }, .{ "XDIV", xdiv } }), s);
+    const groups = @divFloor(rows + GATHER_RPT * GATHER_SIMDGROUPS - 1, GATHER_RPT * GATHER_SIMDGROUPS);
+    return apply(try kernel(.gather, ty), &.{ x_in, w, ids }, out_shape[0 .. os.len + 2], mlx.mlx_array_dtype(x), .{ SIMD_WIDTH, GATHER_SIMDGROUPS * groups, n_out }, .{ SIMD_WIDTH, GATHER_SIMDGROUPS, 1 }, &(layoutConsts(ty, in, ws[2]) ++ [_]Const{ .{ "N", rows }, .{ "M", 1 }, .{ "RPT", GATHER_RPT }, .{ "XDIV", xdiv } }), s);
 }
 
-/// An expert bank's rows are scattered reads: four a simdgroup beat eight (swept in situ on IQ banks).
-const GATHER_RPT = 4;
+/// Pairs per expert from which `gatherNax` beats the per-pair matvec: it reads each expert once per 64-row tile.
+const NAX_PAIRS_PER_EXPERT = 4;
+
+/// Whether `gatherNax` serves `ty` at `rows` outputs per expert and `in` inputs of `dt`: a GPU with the matrix
+/// units, whole 128-output tiles, 64-weight K steps, 16-bit activations.
+fn naxGathers(rows: c_int, in: c_int, dt: mlx.mlx_dtype) bool {
+    return device.naxAvailable() and @mod(rows, 128) == 0 and @mod(in, 64) == 0 and (dt == .bfloat16 or dt == .float16);
+}
+
+/// x_in [n >= 64, (1,) in] each (token, expert) pair's row and ids [n] its expert, sorted, through the bank w on the
+/// matrix units: each expert's run is cut into 64-row tiles (`offs`, `tiles`: the runs' and the tiles' starts).
+/// [n, rows] in x_in's dtype.
+fn gatherNax(ty: GgmlType, x_in: mlx.mlx_array, w: mlx.mlx_array, ids: mlx.mlx_array, rows: c_int, in: c_int, row_bytes: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const n: c_int = @intCast(mlx.mlx_array_size(ids));
+    const e = mlx.getShape(w)[0];
+    var runs: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (runs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    try runStarts(ids, e, 64, &runs, s);
+    const groups = @divFloor(n + 63, 64) + e;
+    const x2 = try pairRows(x_in, n, in, s);
+    defer _ = mlx.mlx_array_free(x2);
+    return apply(try kernel(.gather_nax, ty), &.{ x2, w, runs[0], runs[1] }, &.{ n, rows }, mlx.mlx_array_dtype(x_in), .{ rows, groups, 1 }, .{ 128, 1, 1 }, &(layoutConsts(ty, in, row_bytes) ++ [_]Const{ .{ "N", rows }, .{ "E", e } }), s);
+}
+
+/// x as [n, in]: the NAX gathers read x_shape[0] as the pair count, whatever batch dims the caller's x carries.
+fn pairRows(x: mlx.mlx_array, n: c_int, in: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var r = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(r);
+    try mlx.check(mlx.mlx_reshape(&r, x, &[_]c_int{ n, in }, 2, s));
+    return r;
+}
+
+/// Over sorted expert ids [n] of a bank of e experts: `out[0]` [e + 1] each expert's first row, `out[1]` [e + 1] its
+/// first `per`-row piece (int32).
+fn runStarts(ids: mlx.mlx_array, e: c_int, per: c_int, out: *[2]mlx.mlx_array, s: mlx.mlx_stream) !void {
+    const n: c_int = @intCast(mlx.mlx_array_size(ids));
+    var arrays: [11]mlx.mlx_array = @splat(.{ .ctx = null });
+    defer for (arrays) |a| {
+        if (a.ctx != null) _ = mlx.mlx_array_free(a);
+    };
+    const col = &arrays[0];
+    const experts = &arrays[1];
+    const hit = &arrays[2];
+    const hits = &arrays[3];
+    const counts = &arrays[4];
+    const runs = &arrays[5];
+    const zero = &arrays[6];
+    const offs = &arrays[7];
+    const up = &arrays[8];
+    const pieces = &arrays[9];
+    const tiles = &arrays[10];
+    try mlx.check(mlx.mlx_reshape(col, ids, &[_]c_int{ n, 1 }, 2, s));
+    try mlx.check(mlx.mlx_arange(experts, 0, @floatFromInt(e), 1, .uint32, s));
+    try mlx.check(mlx.mlx_equal(hit, col.*, experts.*, s));
+    try mlx.check(mlx.mlx_sum_axis(hits, hit.*, 0, false, s));
+    try mlx.check(mlx.mlx_astype(counts, hits.*, .int32, s));
+    try mlx.check(mlx.mlx_cumsum(runs, counts.*, 0, false, true, s));
+    try mlx.check(mlx.mlx_zeros(zero, &[_]c_int{1}, 1, .int32, s));
+    try concat(offs, &.{ zero.*, runs.* }, s);
+    // Pieces per run: (count + per - 1) / per.
+    const round_up = mlx.mlx_array_new_int(per - 1);
+    defer _ = mlx.mlx_array_free(round_up);
+    const per_a = mlx.mlx_array_new_int(per);
+    defer _ = mlx.mlx_array_free(per_a);
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, counts.*, round_up, s));
+    try mlx.check(mlx.mlx_floor_divide(up, sum, per_a, s));
+    try mlx.check(mlx.mlx_cumsum(pieces, up.*, 0, false, true, s));
+    try concat(tiles, &.{ zero.*, pieces.* }, s);
+    try mlx.check(mlx.mlx_array_set(&out[0], offs.*));
+    try mlx.check(mlx.mlx_array_set(&out[1], tiles.*));
+}
+
+fn concat(out: *mlx.mlx_array, parts: []const mlx.mlx_array, s: mlx.mlx_stream) !void {
+    const v = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    try mlx.check(mlx.mlx_concatenate_axis(out, v, 0, s));
+}
+
+/// An expert bank's rows are scattered reads: four a simdgroup beat eight (swept in situ on IQ banks), eight
+/// simdgroups a threadgroup so its staged IQ grid serves 32 rows (two left the grid copy larger than the rows' bytes).
+pub const GATHER_RPT = 4;
+pub const GATHER_SIMDGROUPS = 8;
 
 /// A gather's (token, expert) pairs over the bank w [experts, rows, row_bytes]: x [..., 1, in] and rhs_idx's shape
 /// + [1, rows] out.
@@ -500,6 +663,34 @@ pub fn gatherSwiGLU(gate: Info, up: Info, x: mlx.mlx_array, wg: mlx.mlx_array, w
     const groups = @divFloor(p.rows + GATHER_RPT * SIMDGROUPS - 1, GATHER_RPT * SIMDGROUPS);
     const nd = mlx.getShape(rhs_idx).len + 2;
     return try apply(try kernel(.gather_swiglu, ty), &.{ x, wg, wu, ids, sigtab }, p.out_shape[0..nd], dt, .{ SIMD_WIDTH, SIMDGROUPS * groups, p.n_out }, .{ SIMD_WIDTH, SIMDGROUPS, 1 }, &(layoutConsts(ty, p.in, ws[2]) ++ [_]Const{ .{ "N", p.rows }, .{ "RPT", GATHER_RPT }, .{ "XDIV", xdiv } }), s);
+}
+
+/// A sorted MoE call's gate and up on the matrix units with the clipped SwiGLU fused: x [n, (1,) in] each pair's row
+/// (sorted by expert, `ids` [n]), banks `wg`, `wu` of one type, `wts` [n] f32 each pair's weight, `lim` [1] f32 the clip
+/// (0: none). [n, rows] in x's dtype; null where `gatherLinear` would not take the matrix units.
+pub fn gatherNaxSwiGLU(gate: Info, up: Info, x: mlx.mlx_array, wg: mlx.mlx_array, wu: mlx.mlx_array, ids: mlx.mlx_array, wts: mlx.mlx_array, lim: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
+    const ty = gate.ty;
+    if (up.ty != ty or gate.tiled != null or up.tiled != null or !std.mem.eql(c_int, mlx.getShape(wg), mlx.getShape(wu))) return null;
+    const ws = mlx.getShape(wg);
+    if (ws.len != 3) return error.BadShape;
+    const rows = ws[1];
+    const n: c_int = @intCast(mlx.mlx_array_size(ids));
+    const in: c_int = @intCast(mlx.getShape(x)[mlx.getShape(x).len - 1]);
+    if (@as(c_int, @intCast(mlx.mlx_array_size(x))) != n * in or @mod(in, @as(c_int, @intCast(ty.blockElems()))) != 0 or rowBytes(ty, @intCast(in)) != ws[2]) return error.BadShape;
+    if (n < @max(64, NAX_PAIRS_PER_EXPERT * ws[0])) return null;
+    if (!naxGathers(rows, in, mlx.mlx_array_dtype(x))) return null;
+    var runs: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (runs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var ids32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids32);
+    try mlx.check(mlx.mlx_astype(&ids32, ids, .uint32, s));
+    try runStarts(ids32, ws[0], 64, &runs, s);
+    const groups = @divFloor(n + 63, 64) + ws[0];
+    const x2 = try pairRows(x, n, in, s);
+    defer _ = mlx.mlx_array_free(x2);
+    return try apply(try kernel(.gather_nax_gu, ty), &.{ x2, wg, wu, runs[0], runs[1], wts, lim }, &.{ n, rows }, mlx.mlx_array_dtype(x), .{ rows * 2, groups, 1 }, .{ 128, 1, 1 }, &(layoutConsts(ty, in, ws[2]) ++ [_]Const{ .{ "N", rows }, .{ "E", ws[0] } }), s);
 }
 
 /// w [rows, row_bytes] -> [rows, in_features] in `dtype`.
@@ -933,6 +1124,60 @@ test "gatherLinear routes every output to its expert, with and without lhs indic
     }
 }
 
+test "the decode gather (rows of whole 32-unit strides and not, a partial row tile) equals a CPU dot product for every type" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var prng = std.Random.DefaultPrng.init(17);
+    const a = std.testing.allocator;
+    const n_exp = 3;
+    const n_rows = 6;
+    // 2 tokens, top-2: the decode layout, each token's row shared by its experts.
+    const ids = [_]u32{ 2, 0, 1, 2 };
+    inline for (all_types) |ty| {
+        inline for (.{ 1024, 768 }) |k| {
+            const be = ty.blockElems();
+            const bb = ty.blockBytes();
+            const nb = k / be;
+            const data = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin");
+            var ref: [4 * 256]f32 = undefined;
+            try quants.dequantize(ty, data[0 .. 4 * bb], ref[0 .. 4 * be]);
+            const raw = try a.alloc(u8, n_exp * n_rows * nb * bb);
+            defer a.free(raw);
+            for (0..n_exp) |e| for (0..n_rows) |r| for (0..nb) |j| @memcpy(raw[((e * n_rows + r) * nb + j) * bb ..][0..bb], data[((r + e + j) % 4) * bb ..][0..bb]);
+            const rb = rowBytes(ty, k);
+            const packed_rows = try a.alloc(u8, n_exp * n_rows * rb);
+            defer a.free(packed_rows);
+            if (isSplit(ty, k)) packRows(ty, k, packed_rows, raw) else @memcpy(packed_rows, raw);
+            const bank = mlx.mlx_array_new_data(packed_rows.ptr, &[_]c_int{ n_exp, n_rows, @intCast(rb) }, 3, .uint8);
+            defer _ = mlx.mlx_array_free(bank);
+            var xv: [2 * k]f32 = undefined;
+            for (&xv) |*v| v.* = prng.random().float(f32) - 0.5;
+            const x = mlx.mlx_array_new_data(&xv, &[_]c_int{ 1, 2, 1, 1, k }, 5, .float32);
+            defer _ = mlx.mlx_array_free(x);
+            const idv = mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, 2, 2 }, 3, .uint32);
+            defer _ = mlx.mlx_array_free(idv);
+            const y = try gatherLinear(.{ .ty = ty }, x, bank, .{ .ctx = null }, idv, false, s);
+            defer _ = mlx.mlx_array_free(y);
+            try std.testing.expectEqualSlices(c_int, &.{ 1, 2, 2, 1, n_rows }, mlx.getShape(y));
+            const got = try readF32(y, ids.len * n_rows);
+            for (ids, 0..) |e, p| for (0..n_rows) |r| {
+                var want: f32 = 0;
+                var scale: f32 = 0;
+                for (0..nb) |j| for (0..be) |i| {
+                    const prod = xv[(p / 2) * k + j * be + i] * ref[((r + e + j) % 4) * be + i];
+                    want += prod;
+                    scale += @abs(prod);
+                };
+                if (@abs(want - got[p * n_rows + r]) > 2e-5 * scale) {
+                    std.debug.print("{s} k {d} pair {d} expert {d} row {d}: got {d} want {d}\n", .{ @tagName(ty), k, p, e, r, got[p * n_rows + r], want });
+                    return error.TestUnexpectedResult;
+                }
+            };
+        }
+    }
+}
+
 test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals a CPU dot product" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -987,6 +1232,318 @@ test "gathered tile path (sorted and unsorted prefill rows, padded tile) equals 
                 };
             }
         }
+    }
+}
+
+test "NAX gather (ragged sorted runs: one empty, one past a tile, gathered rows, short and long) equals a CPU dot product for every type" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var prng = std.Random.DefaultPrng.init(31);
+    const a = std.testing.allocator;
+    const n_exp = 4;
+    const n_rows = 128;
+    const k = 512;
+    // Expert 1's run is empty, expert 2's spans two tiles (then five), expert 3's ends a tile short (then a run of
+    // three tiles whose last window is clamped to the end of x).
+    for ([_][n_exp]usize{ .{ 5, 0, 45, 30 }, .{ 5, 0, 300, 150 } }) |runs| {
+    var m: usize = 0;
+    for (runs) |len| m += len;
+    const ids = try a.alloc(u32, m);
+    defer a.free(ids);
+    var at: usize = 0;
+    for (runs, 0..) |len, e| for (0..len) |_| {
+        ids[at] = @intCast(e);
+        at += 1;
+    };
+    inline for (all_types) |ty| {
+        const be = ty.blockElems();
+        const bb = ty.blockBytes();
+        const nb = k / be;
+        const data = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin");
+        var ref: [4 * 256]f32 = undefined;
+        try quants.dequantize(ty, data[0 .. 4 * bb], ref[0 .. 4 * be]);
+        // Expert e's row r, block j: fixture block (r + e + j) % 4.
+        const raw = try a.alloc(u8, n_exp * n_rows * nb * bb);
+        defer a.free(raw);
+        for (0..n_exp) |e| for (0..n_rows) |r| for (0..nb) |j| @memcpy(raw[((e * n_rows + r) * nb + j) * bb ..][0..bb], data[((r + e + j) % 4) * bb ..][0..bb]);
+        const rb = rowBytes(ty, k);
+        const packed_rows = try a.alloc(u8, n_exp * n_rows * rb);
+        defer a.free(packed_rows);
+        if (isSplit(ty, k)) packRows(ty, k, packed_rows, raw) else @memcpy(packed_rows, raw);
+        const bank = mlx.mlx_array_new_data(packed_rows.ptr, &[_]c_int{ n_exp, n_rows, @intCast(rb) }, 3, .uint8);
+        defer _ = mlx.mlx_array_free(bank);
+        // bf16 activations, the values the reference multiplies too.
+        const xv = try a.alloc(f32, m * k);
+        defer a.free(xv);
+        for (xv) |*v| v.* = @floatCast(@as(f32, @bitCast(@as(u32, @bitCast(prng.random().float(f32) - 0.5)) & 0xFFFF0000)));
+        const x32 = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ @intCast(m), 1, k }, 3, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+        const idv = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(m)}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(idv);
+        const y = try gatherLinear(.{ .ty = ty }, x, bank, .{ .ctx = null }, idv, true, s);
+        defer _ = mlx.mlx_array_free(y);
+        try std.testing.expectEqualSlices(c_int, &.{ @intCast(m), 1, n_rows }, mlx.getShape(y));
+        const got = try testValues(y, s);
+        defer a.free(got);
+        // The same pairs behind a leading batch dim: the gather reads them as pairs all the same.
+        var x4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x4);
+        try mlx.check(mlx.mlx_reshape(&x4, x, &[_]c_int{ 1, @intCast(m), 1, k }, 4, s));
+        const y4 = try gatherLinear(.{ .ty = ty }, x4, bank, .{ .ctx = null }, idv, true, s);
+        defer _ = mlx.mlx_array_free(y4);
+        const got4 = try testValues(y4, s);
+        defer a.free(got4);
+        try std.testing.expectEqualSlices(f32, got, got4);
+        for (ids, 0..) |e, t| for (0..n_rows) |r| {
+            var want: f32 = 0;
+            var scale: f32 = 0;
+            for (0..nb) |j| for (0..be) |i| {
+                const prod = xv[t * k + j * be + i] * ref[((r + e + j) % 4) * be + i];
+                want += prod;
+                scale += @abs(prod);
+            };
+            // The weights round to bf16 on the matrix units, and so does the output.
+            if (@abs(want - got[t * n_rows + r]) > 8e-3 * scale) {
+                std.debug.print("{s} {d} pairs, pair {d} expert {d} row {d}: got {d} want {d}\n", .{ @tagName(ty), m, t, e, r, got[t * n_rows + r], want });
+                return error.TestUnexpectedResult;
+            }
+        };
+    }
+    }
+}
+
+test "NAX gate+up (clipped SwiGLU times each pair's weight) equals the two gathers and the activation, for every type" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu() or !device.naxAvailable()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var prng = std.Random.DefaultPrng.init(37);
+    const a = std.testing.allocator;
+    const n_exp = 4;
+    const n_rows = 128;
+    const k = 512;
+    const runs = [n_exp]usize{ 5, 0, 45, 30 };
+    const m = 80;
+    var ids: [m]u32 = undefined;
+    var at: usize = 0;
+    for (runs, 0..) |len, e| for (0..len) |_| {
+        ids[at] = @intCast(e);
+        at += 1;
+    };
+    var wv: [m]f32 = undefined;
+    for (&wv) |*v| v.* = 0.05 + prng.random().float(f32);
+    inline for (all_types) |ty| {
+        const be = ty.blockElems();
+        const bb = ty.blockBytes();
+        const nb = k / be;
+        const data = @embedFile("fixtures/" ++ @tagName(ty) ++ ".bin");
+        var banks: [2]mlx.mlx_array = undefined;
+        for (&banks, 0..) |*bk, salt| {
+            const raw = try a.alloc(u8, n_exp * n_rows * nb * bb);
+            defer a.free(raw);
+            for (0..n_exp) |e| for (0..n_rows) |r| for (0..nb) |j| @memcpy(raw[((e * n_rows + r) * nb + j) * bb ..][0..bb], data[((r + 2 * e + j + salt) % 4) * bb ..][0..bb]);
+            const rb = rowBytes(ty, k);
+            const packed_rows = try a.alloc(u8, n_exp * n_rows * rb);
+            defer a.free(packed_rows);
+            if (isSplit(ty, k)) packRows(ty, k, packed_rows, raw) else @memcpy(packed_rows, raw);
+            bk.* = mlx.mlx_array_new_data(packed_rows.ptr, &[_]c_int{ n_exp, n_rows, @intCast(rb) }, 3, .uint8);
+        }
+        defer for (banks) |bk| {
+            _ = mlx.mlx_array_free(bk);
+        };
+        var xv: [m * k]f32 = undefined;
+        for (&xv) |*v| v.* = (prng.random().float(f32) - 0.5) * 4;
+        const x32 = mlx.mlx_array_new_data(&xv, &[_]c_int{ m, 1, k }, 3, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+        const idv = mlx.mlx_array_new_data(&ids, &[_]c_int{m}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(idv);
+        const wts = mlx.mlx_array_new_data(&wv, &[_]c_int{m}, 1, .float32);
+        defer _ = mlx.mlx_array_free(wts);
+        const g = try gatherLinear(.{ .ty = ty }, x, banks[0], .{ .ctx = null }, idv, true, s);
+        defer _ = mlx.mlx_array_free(g);
+        const u = try gatherLinear(.{ .ty = ty }, x, banks[1], .{ .ctx = null }, idv, true, s);
+        defer _ = mlx.mlx_array_free(u);
+        const gv = try testValues(g, s);
+        defer a.free(gv);
+        const uv = try testValues(u, s);
+        defer a.free(uv);
+        for ([_]f32{ 0, 0.5 }) |l| {
+            const lim = mlx.mlx_array_new_data(&l, &[_]c_int{1}, 1, .float32);
+            defer _ = mlx.mlx_array_free(lim);
+            const y = (try gatherNaxSwiGLU(.{ .ty = ty }, .{ .ty = ty }, x, banks[0], banks[1], idv, wts, lim, s)).?;
+            defer _ = mlx.mlx_array_free(y);
+            try std.testing.expectEqualSlices(c_int, &.{ m, n_rows }, mlx.getShape(y));
+            const got = try testValues(y, s);
+            defer a.free(got);
+            for (0..m) |t| for (0..n_rows) |r| {
+                var gg = gv[t * n_rows + r];
+                var uu = uv[t * n_rows + r];
+                if (l > 0) {
+                    gg = @min(gg, l);
+                    uu = std.math.clamp(uu, -l, l);
+                }
+                const want = gg / (1 + @exp(-gg)) * uu * wv[t];
+                // One bf16 rounding of the same f32 product.
+                if (@abs(want - got[t * n_rows + r]) > 0x1p-7 * @abs(want) + 1e-6) {
+                    std.debug.print("{s} lim {d} pair {d} row {d}: got {d} want {d}\n", .{ @tagName(ty), l, t, r, got[t * n_rows + r], want });
+                    return error.TestUnexpectedResult;
+                }
+            };
+        }
+    }
+}
+
+test "NAX gather ubench: the DeepSeek-V4.1 Coder's expert banks at 2048- and 8192-token chunks, against the tile kernel and MLX's 2-bit affine" {
+    const env = @import("../../../env.zig");
+    if (env.get(.GGUF_NAX_UBENCH) == null or !device.naxAvailable()) return error.SkipZigTest;
+    const iou = @import("../../util/io_util.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(5);
+    const cases = [_]struct { ty: GgmlType, rows: c_int, in: c_int, experts: u32, pairs: usize }{
+        .{ .ty = .iq2_xxs, .rows = 2304, .in = 5120, .experts = 192, .pairs = 2048 * 6 },
+        .{ .ty = .iq1_m, .rows = 5120, .in = 2304, .experts = 192, .pairs = 2048 * 6 },
+        // The Coder's 8k chunk: 192 experts, ~256 pairs each.
+        .{ .ty = .iq2_xxs, .rows = 2304, .in = 5120, .experts = 192, .pairs = 8192 * 6 },
+        .{ .ty = .iq1_m, .rows = 5120, .in = 2304, .experts = 192, .pairs = 8192 * 6 },
+    };
+    inline for (cases) |c| {
+        const experts = c.experts;
+        const pairs = c.pairs;
+        const ids = try a.alloc(u32, pairs);
+        defer a.free(ids);
+        for (ids) |*id| id.* = prng.random().uintLessThan(u32, experts);
+        std.mem.sort(u32, ids, {}, std.sort.asc(u32));
+        const data = @embedFile("fixtures/" ++ @tagName(c.ty) ++ ".bin");
+        const bb = c.ty.blockBytes();
+        const rb = rowBytes(c.ty, c.in);
+        const bank_bytes = try a.alloc(u8, experts * @as(usize, @intCast(c.rows)) * rb);
+        defer a.free(bank_bytes);
+        for (0..bank_bytes.len / bb) |i| @memcpy(bank_bytes[i * bb ..][0..bb], data[(i % 4) * bb ..][0..bb]);
+        const bank = mlx.mlx_array_new_data(bank_bytes.ptr, &[_]c_int{ experts, c.rows, @intCast(rb) }, 3, .uint8);
+        defer _ = mlx.mlx_array_free(bank);
+        const xv = try a.alloc(f32, pairs * @as(usize, @intCast(c.in)));
+        defer a.free(xv);
+        for (xv) |*v| v.* = prng.random().float(f32) - 0.5;
+        const x32 = mlx.mlx_array_new_data(xv.ptr, &[_]c_int{ pairs, 1, c.in }, 3, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+        const idv = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{pairs}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(idv);
+        var lhv = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lhv);
+        try mlx.check(mlx.mlx_arange(&lhv, 0, pairs, 1, .uint32, s));
+        try mlx.check(mlx.mlx_array_eval(x));
+        // What the MLX packs run: 2-bit group-128 affine experts through MLX's gather_qmm.
+        var qw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qw);
+        var qs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qs);
+        try mlx.check(mlx.mlx_zeros(&qw, &[_]c_int{ experts, c.rows, @divExact(c.in * 2, 32) }, 3, .uint32, s));
+        try mlx.check(mlx.mlx_zeros(&qs, &[_]c_int{ experts, c.rows, @divExact(c.in, 128) }, 3, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(qw));
+        try mlx.check(mlx.mlx_array_eval(qs));
+        var qb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qb);
+        try mlx.check(mlx.mlx_zeros(&qb, &[_]c_int{ experts, c.rows, @divExact(c.in, 128) }, 3, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(qb));
+        const sdk_nax = @import("../../blocks/moe/gather_qmm_nax.zig");
+        var ms: [4]f64 = undefined;
+        for (0..4) |arm| {
+            var times: [5]f64 = undefined;
+            for (0..2 + times.len) |rep| {
+                const t0 = iou.nowUsMonotonic(io);
+                var y = mlx.mlx_array_new();
+                switch (arm) {
+                    0 => y = try gatherLinear(.{ .ty = c.ty }, x, bank, .{ .ctx = null }, idv, true, s),
+                    1 => y = try gatherLinear(.{ .ty = c.ty }, x, bank, lhv, idv, false, s),
+                    2 => try mlx.check(mlx.mlx_gather_qmm(&y, x, qw, qs, qs, .{ .ctx = null }, idv, true, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(2), "affine", true, s)),
+                    else => y = (try sdk_nax.sortedGatherPrompt(x, qw, qs, qb, idv, 2, 128, false, true, s)).?,
+                }
+                defer _ = mlx.mlx_array_free(y);
+                try mlx.check(mlx.mlx_array_eval(y));
+                if (rep >= 2) times[rep - 2] = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / 1e3;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            ms[arm] = times[2];
+        }
+        const flops = 2.0 * @as(f64, @floatFromInt(pairs)) * @as(f64, @floatFromInt(c.rows)) * @as(f64, @floatFromInt(c.in));
+        std.debug.print("[gguf-nax-ubench] {s} {d}x{d}, {d} pairs over {d} experts: NAX {d:.2} ms ({d:.0} TFLOPS), unsorted (tile kernel) {d:.2} ms; 2-bit g128 affine: MLX gather_qmm {d:.2} ms, ours (sortedGatherPrompt) {d:.2} ms\n", .{ @tagName(c.ty), c.rows, c.in, pairs, experts, ms[0], flops / ms[0] / 1e9, ms[1], ms[2], ms[3] });
+    }
+}
+
+test "decode gather ubench: one token through 6 of 192 experts, 40 layers in one graph, against MLX's 2-bit g128" {
+    const env = @import("../../../env.zig");
+    if (env.get(.GGUF_NAX_UBENCH) == null or mlx.noGpuBackend()) return error.SkipZigTest;
+    const iou = @import("../../util/io_util.zig");
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const a = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(9);
+    const experts = 192;
+    const k = 6;
+    const layers = 40;
+    const cases = [_]struct { ty: GgmlType, rows: c_int, in: c_int, xk: c_int }{ .{ .ty = .iq2_xxs, .rows = 2304, .in = 5120, .xk = 1 }, .{ .ty = .iq1_m, .rows = 5120, .in = 2304, .xk = k } };
+    inline for (cases) |c| {
+        const data = @embedFile("fixtures/" ++ @tagName(c.ty) ++ ".bin");
+        const bb = c.ty.blockBytes();
+        const rb = rowBytes(c.ty, c.in);
+        const bank_bytes = try a.alloc(u8, experts * @as(usize, @intCast(c.rows)) * rb);
+        defer a.free(bank_bytes);
+        for (0..bank_bytes.len / bb) |i| @memcpy(bank_bytes[i * bb ..][0..bb], data[(i % 4) * bb ..][0..bb]);
+        const bank = mlx.mlx_array_new_data(bank_bytes.ptr, &[_]c_int{ experts, c.rows, @intCast(rb) }, 3, .uint8);
+        defer _ = mlx.mlx_array_free(bank);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_random_normal(&x, &[_]c_int{ 1, c.xk, 1, c.in }, 4, .bfloat16, 0, 1, .{ .ctx = null }, s));
+        var qw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qw);
+        var qs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qs);
+        try mlx.check(mlx.mlx_zeros(&qw, &[_]c_int{ experts, c.rows, @divExact(c.in * 2, 32) }, 3, .uint32, s));
+        try mlx.check(mlx.mlx_zeros(&qs, &[_]c_int{ experts, c.rows, @divExact(c.in, 128) }, 3, .bfloat16, s));
+        var idx: [layers]mlx.mlx_array = undefined;
+        for (&idx) |*v| {
+            var ids: [k]u32 = undefined;
+            for (&ids) |*id| id.* = prng.random().uintLessThan(u32, experts);
+            v.* = mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, k }, 2, .uint32);
+        }
+        defer for (idx) |v| {
+            _ = mlx.mlx_array_free(v);
+        };
+        for ([_]mlx.mlx_array{ x, qw, qs, bank }) |v| try mlx.check(mlx.mlx_array_eval(v));
+        var us: [2]f64 = undefined;
+        for (0..2) |arm| {
+            var times: [5]f64 = undefined;
+            for (0..4 + times.len) |rep| {
+                const outs = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(outs);
+                const t0 = iou.nowUsMonotonic(io);
+                for (idx) |iv| {
+                    var y = mlx.mlx_array_new();
+                    if (arm == 0) y = try gatherLinear(.{ .ty = c.ty }, x, bank, .{ .ctx = null }, iv, false, s) else try mlx.check(mlx.mlx_gather_qmm(&y, x, qw, qs, qs, .{ .ctx = null }, iv, true, mlx.mlx_optional_int.some(128), mlx.mlx_optional_int.some(2), "affine", false, s));
+                    defer _ = mlx.mlx_array_free(y);
+                    try mlx.check(mlx.mlx_vector_array_append_value(outs, y));
+                }
+                try mlx.check(mlx.mlx_eval(outs));
+                if (rep >= 4) times[rep - 4] = @as(f64, @floatFromInt(iou.nowUsMonotonic(io) - t0)) / layers;
+            }
+            std.mem.sort(f64, &times, {}, std.sort.asc(f64));
+            us[arm] = times[2];
+        }
+        const gbytes = @as(f64, @floatFromInt(k * @as(usize, @intCast(c.rows)) * rb)) / 1e3;
+        std.debug.print("[gguf-decode-ubench] {s} {d}x{d}: GGUF gather {d:.1} us ({d:.0} GB/s), MLX 2-bit g128 gather_qmm {d:.1} us\n", .{ @tagName(c.ty), c.rows, c.in, us[0], gbytes / us[0], us[1] });
     }
 }
 

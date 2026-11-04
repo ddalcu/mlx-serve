@@ -1377,3 +1377,10 @@ Defect: under `--dist tensor`, a request that arrived before `mlx-serve worker` 
 failed load parks the entry in `.error_state`, which fails fast; only the memory refusal went back to `.unloaded`.
 Fix: refusals the user fixes outside the pack retry (`failureRetries`), and the absent worker is a named 503
 (`worker_not_joined`). Guard: `a load refused for memory or an absent worker Mac is retried by the next request`.
+
+### A DeepSeek-V4.1 GGUF with its DSpark file beside it failed to load on ds4
+Defect: ivanfioravanti's DS4 IQ2 pack died at boot on the ds4 engine (`error: LoadFailed`) unless `--no-ds4-mtp`.
+Cause: the adapter hands ds4 any `-DSpark-`/`-MTP-` GGUF in the model's folder, and the pinned ds4 refuses every
+support GGUF (and `--dspark`) for the V4.1 family. Fix: `engine_pick.ds4Spec` says which archs take one; the adapter
+logs and skips the file for the rest (`--mlx-gguf` still drafts with it). Guard: `open: a support GGUF beside the
+model reaches ds4 only for an arch that takes one` + `ds4Spec: DeepSeek-V4.1 takes no support GGUF in ds4`.

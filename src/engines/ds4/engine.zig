@@ -342,8 +342,8 @@ const FakeBridge = struct {
     pub fn contextBytes(ctx: u32) u64 {
         return @as(u64, ctx) * 1024;
     }
-    pub fn ggufDeclaresEmbeddedMtp(_: std.Io, _: std.mem.Allocator, _: []const u8) bool {
-        return true;
+    pub fn ggufSpec(_: std.Io, _: std.mem.Allocator, _: []const u8) engine_pick.Spec {
+        return .{ .embedded_mtp = true };
     }
     pub const Ds4Engine = struct {
         pub const ChatTurn = struct { role: []const u8, content: []const u8 };

@@ -291,7 +291,7 @@ pub const Table = struct {
                 const fd = try openAt(a, dir_path, path);
                 errdefer crt.close(fd);
                 if (fileSize(fd) != rows * rec) return error.EngramTableSize;
-                return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = 0, .w_stride = rec, .wlen = head_dim, .s_off = head_dim, .s_stride = rec, .slen = head_dim / 32 };
+                return records(fd, rows, head_dim, 0);
             }
             return error.EngramManifest;
         } else |_| {}
@@ -348,34 +348,55 @@ pub const Table = struct {
         };
     }
 
-    /// A `--mlx-gguf` set's Engram, IQ4_NL rows read in place with the block scales inside each row (`slen` 0): its
-    /// own file beside the first shard (`deepseek41.engram_file_key`), or the re-split's shard 6, table `index` a run
-    /// of the one `ple_table`. Null when `dir_path` is not a GGUF we serve.
+    /// A `--mlx-gguf` set's Engram (`ggufTable`), null when `dir_path` is not a GGUF we serve.
     fn openGgufTable(a: std.mem.Allocator, io: std.Io, dir_path: []const u8, index: usize, layer: usize, rows: u64, head_dim: u32) !?Table {
         const shard = gguf_claim.servablePath(io, a, dir_path) orelse return null;
         var set = try gguf_root.gguf.File.open(a, shard);
         defer set.deinit();
-        const name = set.getString(ds41_gguf.engram_file_key) orelse {
-            const loc = set.locate(ds41_gguf.ple_table) orelse return error.EngramTableMissing;
-            const t = loc.tensor;
-            const start = try ds41_gguf.pleRowStart(&set, index);
-            if (t.ty != .iq4_nl or t.n_dims != 2 or t.dims[0] != head_dim or t.dims[1] < start + rows) return error.EngramTableGeometry;
-            const row = t.data.len / t.dims[1];
-            const fd = try openAt(a, std.fs.path.dirname(loc.path) orelse ".", std.fs.path.basename(loc.path));
-            return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .gguf, .bits = 4, .group_size = 32, .w_off = loc.offset + start * row, .w_stride = row, .wlen = row, .s_off = 0, .s_stride = 0, .slen = 0 };
-        };
-        if (std.mem.indexOfAny(u8, name, "/\\") != null) return error.EngramTableMissing;
-        const dir = std.fs.path.dirname(shard) orelse return error.EngramTableMissing;
-        const path = try std.fs.path.join(a, &.{ dir, name });
-        var f = gguf_root.gguf.File.open(a, path) catch return error.EngramTableMissing;
-        defer f.deinit();
+        return try ggufTable(a, &set, index, layer, rows, head_dim);
+    }
+
+    /// Engram table `index` (layer `layer`) of the GGUF `set`, read in place. IQ4_NL rows with the block scales inside
+    /// each row (`slen` 0): in their own file beside the first shard (`deepseek41.engram_file_key`), or the re-split's
+    /// shard 6, a run of the one `ple_table`. The DS4 layout keeps the release's fp8 records in the set as I8.
+    fn ggufTable(a: std.mem.Allocator, set: *const gguf_root.gguf.File, index: usize, layer: usize, rows: u64, head_dim: u32) !Table {
         var nb: [64]u8 = undefined;
-        const loc = f.locate(try std.fmt.bufPrint(&nb, "blk.{d}." ++ ds41_gguf.engram_leaf, .{layer})) orelse return error.EngramTableMissing;
+        const leaf = try std.fmt.bufPrint(&nb, "blk.{d}." ++ ds41_gguf.engram_leaf, .{layer});
+        if (set.getString(ds41_gguf.engram_file_key)) |name| {
+            if (std.mem.indexOfAny(u8, name, "/\\") != null) return error.EngramTableMissing;
+            const dir = std.fs.path.dirname(set.paths[0]) orelse return error.EngramTableMissing;
+            const path = try std.fs.path.join(a, &.{ dir, name });
+            var f = gguf_root.gguf.File.open(a, path) catch return error.EngramTableMissing;
+            defer f.deinit();
+            const loc = f.locate(leaf) orelse return error.EngramTableMissing;
+            const t = loc.tensor;
+            if (t.ty != .iq4_nl or t.n_dims != 2 or t.dims[0] != head_dim or t.dims[1] != rows) return error.EngramTableGeometry;
+            const row = t.data.len / rows;
+            const fd = try openAt(a, dir, name);
+            return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .gguf, .bits = 4, .group_size = 32, .w_off = loc.offset, .w_stride = row, .wlen = row, .s_off = 0, .s_stride = 0, .slen = 0 };
+        }
+        if (set.locate(leaf)) |loc| {
+            const t = loc.tensor;
+            const rec = head_dim + head_dim / 32;
+            if (t.ty != ds41_gguf.engram_row_type or t.n_dims != 2 or t.dims[0] != rec or t.dims[1] != rows) return error.EngramTableGeometry;
+            const fd = try openAt(a, std.fs.path.dirname(loc.path) orelse ".", std.fs.path.basename(loc.path));
+            errdefer crt.close(fd);
+            if (fileSize(fd) < loc.offset + rows * rec) return error.EngramTableSize;
+            return records(fd, rows, head_dim, loc.offset);
+        }
+        const loc = set.locate(ds41_gguf.ple_table) orelse return error.EngramTableMissing;
         const t = loc.tensor;
-        if (t.ty != .iq4_nl or t.n_dims != 2 or t.dims[0] != head_dim or t.dims[1] != rows) return error.EngramTableGeometry;
-        const row = t.data.len / rows;
-        const fd = try openAt(a, dir, name);
-        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .gguf, .bits = 4, .group_size = 32, .w_off = loc.offset, .w_stride = row, .wlen = row, .s_off = 0, .s_stride = 0, .slen = 0 };
+        const start = try ds41_gguf.pleRowStart(set, index);
+        if (t.ty != .iq4_nl or t.n_dims != 2 or t.dims[0] != head_dim or t.dims[1] < start + rows) return error.EngramTableGeometry;
+        const row = t.data.len / t.dims[1];
+        const fd = try openAt(a, std.fs.path.dirname(loc.path) orelse ".", std.fs.path.basename(loc.path));
+        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .gguf, .bits = 4, .group_size = 32, .w_off = loc.offset + start * row, .w_stride = row, .wlen = row, .s_off = 0, .s_stride = 0, .slen = 0 };
+    }
+
+    /// `rows` mxfp8 records from `base`: `head_dim` e4m3 codes, then one e8m0 scale per 32.
+    fn records(fd: c_int, rows: u64, head_dim: u32, base: u64) Table {
+        const rec: u64 = head_dim + head_dim / 32;
+        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base, .w_stride = rec, .wlen = head_dim, .s_off = base + head_dim, .s_stride = rec, .slen = head_dim / 32 };
     }
 
     /// oMLX's lossless layout: `omlx_deepseek_v41.engram_tables` names the
@@ -899,6 +920,111 @@ test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from 
     try testing.expectEqual(@as(f32, 0.5), v[63]);
     try testing.expectEqual(@as(f32, 1), v[64]);
     try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
+}
+
+/// The DS4 layout's GGUF: an F32 tensor, then layer 1's table as I8 [66, 4] records of head_dim 64 holding
+/// `writeRawFp8Fixture`'s rows (codes 1.0, row r's first scale 2^r, its second 0.5).
+fn writeDs4Fixture(io: std.Io, dir: std.Io.Dir) !void {
+    const a = testing.allocator;
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(a);
+    try b.appendSlice(a, "GGUF" ++ std.mem.toBytes(@as(u32, 3)) ++ std.mem.toBytes(@as(u64, 2)) ++ std.mem.toBytes(@as(u64, 0)));
+    const tensors = [_]struct { []const u8, []const u64, u32, u64 }{
+        .{ "x", &.{8}, 0, 0 },
+        .{ "blk.1." ++ ds41_gguf.engram_leaf, &.{ 66, 4 }, @intFromEnum(ds41_gguf.engram_row_type), 32 },
+    };
+    for (tensors) |t| {
+        try b.appendSlice(a, &std.mem.toBytes(@as(u64, t[0].len)));
+        try b.appendSlice(a, t[0]);
+        try b.appendSlice(a, &std.mem.toBytes(@as(u32, @intCast(t[1].len))));
+        for (t[1]) |d| try b.appendSlice(a, &std.mem.toBytes(d));
+        try b.appendSlice(a, &std.mem.toBytes(t[2]));
+        try b.appendSlice(a, &std.mem.toBytes(t[3]));
+    }
+    while (b.items.len % 32 != 0) try b.append(a, 0);
+    try b.appendNTimes(a, 0, 32);
+    for (0..4) |r| {
+        try b.appendNTimes(a, 0x38, 64);
+        try b.appendSlice(a, &.{ @intCast(127 + r), 126 });
+    }
+    try dir.writeFile(io, .{ .sub_path = "m.gguf", .data = b.items });
+}
+
+test "dsv41 engram: the DS4 layout's I8 table reads the release's fp8 records in place; another geometry is refused" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeDs4Fixture(io, td.dir);
+    var buf: [512]u8 = undefined;
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/m.gguf", .{buf[0..try td.dir.realPath(io, &buf)]});
+    defer testing.allocator.free(path);
+    var set = try gguf_root.gguf.File.open(testing.allocator, path);
+    defer set.deinit();
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var t = try Table.ggufTable(arena.allocator(), &set, 0, 1, 4, 64);
+    defer t.close();
+    try testing.expectEqual(@as(u64, 0), t.shardBytes());
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const rows = try t.gather(testing.allocator, &.{ 3, 0 }, s);
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_array_eval(rows));
+    const v = mlx.mlx_array_data_float32(rows).?;
+    try testing.expectEqual(@as(f32, 8), v[0]);
+    try testing.expectEqual(@as(f32, 0.5), v[63]);
+    try testing.expectEqual(@as(f32, 1), v[64]);
+    try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
+    try testing.expectError(error.EngramTableGeometry, Table.ggufTable(arena.allocator(), &set, 0, 1, 5, 64));
+    try testing.expectError(error.EngramTableGeometry, Table.ggufTable(arena.allocator(), &set, 0, 1, 4, 32));
+}
+
+test "dsv41 engram: a DS4 GGUF's hash constants are the ones the plugin derives, its rows read in place (a real GGUF, env-gated)" {
+    const path = std.mem.span(@import("../../env.zig").get(.MLX_SERVE_GGUF_TEST_MODEL) orelse return error.SkipZigTest);
+    var set = try gguf_root.gguf.File.open(testing.allocator, path);
+    defer set.deinit();
+    if (set.getString("deepseek41.engram.encoding") == null) return error.SkipZigTest;
+    const hp = try ds41_gguf.Hparams.read(&set);
+    var cfg = releaseConfig();
+    cfg.dsv41_n_engram_layers = hp.n_engram;
+    cfg.dsv41_engram_max_ngram = hp.engram_ngram;
+    cfg.dsv41_engram_n_heads = hp.engram_heads;
+    cfg.dsv41_engram_vocab_size = hp.engram_vocab;
+    cfg.dsv41_engram_compressed_vocab = hp.engram_compressed;
+    for (0..hp.n_engram) |k| {
+        cfg.dsv41_engram_layers[k] = @intCast(hp.engram_layers[k]);
+        cfg.dsv41_engram_rows[k] = hp.engram_rows[k];
+    }
+    const map = try loadTokenMap(testing.allocator, path, hp.vocab, hp.engram_compressed);
+    defer testing.allocator.free(map);
+    const file_map = set.getArray("deepseek41.engram.token_map").?;
+    try testing.expectEqual(map.len, file_map.len);
+    for (map, 0..) |v, i| try testing.expectEqual(@as(i64, v), file_map.int(i));
+    const h = try Hash.init(&cfg, map[hp.engram_pad]);
+    const primes = set.getArray("deepseek41.engram.primes").?;
+    const mults = set.getArray("deepseek41.engram.multipliers").?;
+    for (0..hp.n_engram) |l| {
+        for (0..h.cols()) |c| try testing.expectEqual(primes.int(l * h.cols() + c), @as(i64, @intCast(h.primes[l][c])));
+        for (0..h.max_ngram) |k| try testing.expectEqual(mults.int(l * h.max_ngram + k), @as(i64, @intCast(h.mult[l][k])));
+    }
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    for (0..hp.n_engram) |k| {
+        var t = try Table.ggufTable(arena.allocator(), &set, k, hp.engram_layers[k], hp.engram_rows[k], hp.engram_dim);
+        defer t.close();
+        const rows = try t.gather(testing.allocator, &.{ 0, @intCast(hp.engram_rows[k] / 2), @intCast(hp.engram_rows[k] - 1) }, s);
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_array_eval(rows));
+        var sq: f64 = 0;
+        for (mlx.mlx_array_data_float32(rows).?[0 .. 3 * hp.engram_dim]) |v| {
+            try testing.expect(std.math.isFinite(v));
+            sq += v * v;
+        }
+        try testing.expect(sq > 0);
+    }
 }
 
 test "dsv41 engram: rows asked of the kernel ahead read as a plain gather does; an out-of-range id is skipped there and refused by the read" {
