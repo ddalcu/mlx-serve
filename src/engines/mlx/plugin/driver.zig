@@ -809,7 +809,9 @@ pub fn forwardBatched(xfm: *Transformer, b: *Bound, next_tokens: []const u32, ct
         .cache_ops = &cache_ops.ops,
     };
     var out: abi.ForwardOut = .{};
+    intree.enterBatch(ctxs);
     const v = b.table.forward(b.model, &f, &out);
+    intree.leaveBatch();
     if (!v.isOk()) {
         freeOut(&out, &.{});
         log.err("[plugin] {s}: batched forward failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });
@@ -875,7 +877,9 @@ pub fn forwardBatchedVerify(xfm: *Transformer, b: *Bound, token_arr: Array, ctxs
         .cache_ops = &cache_ops.ops,
     };
     var out: abi.ForwardOut = .{};
+    intree.enterBatch(ctxs);
     const v = b.table.forward(b.model, &f, &out);
+    intree.leaveBatch();
     if (!v.isOk()) {
         freeOut(&out, &.{});
         log.err("[plugin] {s}: batched verify failed: {s}\n", .{ b.table.name.slice(), v.why.slice() });

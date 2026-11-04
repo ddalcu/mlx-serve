@@ -6,6 +6,7 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
+const log = @import("../../sdk/util/log.zig");
 const model = @import("../../sdk/config/model.zig");
 const engine_cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
@@ -50,6 +51,27 @@ pub fn engineCtx() *?*const ForwardCtx {
     return EngineCtx.get();
 }
 pub const EngineCtx = @import("../../sdk/util/shared.zig").SharedThreadLocal(?*const ForwardCtx, "qwen4_engine_ctx", null);
+
+/// Each slot's engine context of the batched forward in flight (`intree.enterBatch`), else empty.
+pub fn engineBatch() *[]const *const ForwardCtx {
+    return EngineBatch.get();
+}
+pub const EngineBatch = @import("../../sdk/util/shared.zig").SharedThreadLocal([]const *const ForwardCtx, "qwen4_engine_batch", &.{});
+
+/// Slot `i`'s cache position in a batched forward. An M-RoPE slot's `Forward.positions` entry carries its delta, so
+/// the slot's engine context gives the cache position back and lends its table to `ctx`; the trunk re-adds the delta
+/// where it ropes, as on the serial path.
+fn batchedCachePos(f: *const abi.Forward, i: usize, ctx: *ForwardCtx) u32 {
+    const pos = f.positions.slice()[i];
+    const eb = engineBatch().*;
+    if (eb.len != f.positions.len) return pos;
+    const ec = eb[i];
+    if (ec.mrope_pos == null) return pos;
+    ctx.mrope_pos = ec.mrope_pos;
+    ctx.mrope_total = ec.mrope_total;
+    ctx.mrope_delta = ec.mrope_delta;
+    return @intCast(@as(i64, pos) - ec.mrope_delta);
+}
 
 const Verdict = abi.Verdict;
 const Array = mlx.mlx_array;
@@ -242,10 +264,14 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (f.mode != .batched_rows and slots != 1) return Verdict.refuse(.unsupported, "qwen4_exp: one slot's rows at a time outside batched rows");
     if (f.ids.ctx == null) for (f.tokens.slice()) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "qwen4_exp: token id past the vocabulary");
     const r = if (f.mode == .batched_rows) runBatched(m, f, out) else runOne(m, f, out);
-    r catch |e| return switch (e) {
-        error.PositionDoesNotFollow => Verdict.refuse(.failed, "qwen4_exp: the position does not follow the slot's state"),
-        error.SlotWithoutSsmEntries => Verdict.refuse(.failed, "qwen4_exp: the engine slot carries no recurrent entries"),
-        else => Verdict.refuse(.failed, "qwen4_exp: the forward failed"),
+    r catch |e| {
+        // The verdict text is static; the cause is only named here.
+        log.err("[qwen4_exp] {s} forward failed: {s} (slots={d} rows={d}, mlx latch: {s})\n", .{ @tagName(f.mode), @errorName(e), slots, f.rows, mlx.peekErrorName() orelse "none" });
+        return switch (e) {
+            error.PositionDoesNotFollow => Verdict.refuse(.failed, "qwen4_exp: the position does not follow the slot's state"),
+            error.SlotWithoutSsmEntries => Verdict.refuse(.failed, "qwen4_exp: the engine slot carries no recurrent entries"),
+            else => Verdict.refuse(.failed, "qwen4_exp: the forward failed"),
+        };
     };
     return .ok;
 }
@@ -348,12 +374,14 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     if (f.ids.ctx != null or f.tokens.len != n) return error.BatchShape;
     var caches: [MAX_BATCH_ROWS]SlotCaches = undefined;
     var offsets: [MAX_BATCH_ROWS]usize = undefined;
+    var cpos: [MAX_BATCH_ROWS]u32 = undefined;
     var ctxs: [MAX_BATCH_ROWS]ForwardCtx = undefined;
     var ptrs: [MAX_BATCH_ROWS]*ForwardCtx = undefined;
     for (0..n) |i| {
         caches[i] = try slotCaches(m, f, i);
-        offsets[i] = f.positions.slice()[i];
         ctxs[i] = .{ .cache = caches[i].kv, .moe_seq_offset = &offsets[i], .ssm_entries = caches[i].ssm, .capture_hidden = null, .vision_embeddings = null, .kv_attn_fused = caches[i].packed_reads };
+        cpos[i] = batchedCachePos(f, i, &ctxs[i]);
+        offsets[i] = cpos[i];
         ptrs[i] = &ctxs[i];
     }
     var rows: [MAX_BATCH_ROWS]Array = undefined;
@@ -369,7 +397,7 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
     // The legacy tick's PLE gather defers inside it and settles once, before it returns: nothing is left owed.
     if (n > 1 and m.trunk.batchedGdnReady(ptrs[0..n])) {
         var hrows: ?[]Array = null;
-        const got = try m.trunk.forwardMoeBatchedDecode(f.tokens.slice(), ptrs[0..n], f.positions.slice(), if (f.want_hidden) &hrows else null);
+        const got = try m.trunk.forwardMoeBatchedDecode(f.tokens.slice(), ptrs[0..n], cpos[0..n], if (f.want_hidden) &hrows else null);
         defer gpa.free(got);
         @memcpy(rows[0..n], got);
         made = n;
@@ -392,7 +420,7 @@ fn runBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !void {
         made += 1;
     }
     for (0..n) |i| {
-        if (caches[i].own) |o| o.pos = f.positions.slice()[i] + 1;
+        if (caches[i].own) |o| o.pos = cpos[i] + 1;
         if (f.slots.len > i) {
             const r = try m.rec(f.slots.slice()[i]);
             r.ssm = caches[i].ssm;
@@ -410,22 +438,24 @@ fn runBatchedVerify(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) !voi
     if (f.ids.ctx == null) return error.BatchShape;
     var caches: [MAX_BATCH_ROWS]SlotCaches = undefined;
     var offsets: [MAX_BATCH_ROWS]usize = undefined;
+    var cpos: [MAX_BATCH_ROWS]u32 = undefined;
     var ctxs: [MAX_BATCH_ROWS]ForwardCtx = undefined;
     var ptrs: [MAX_BATCH_ROWS]*ForwardCtx = undefined;
     for (0..n) |i| {
         caches[i] = try slotCaches(m, f, i);
-        offsets[i] = f.positions.slice()[i];
         ctxs[i] = .{ .cache = caches[i].kv, .moe_seq_offset = &offsets[i], .ssm_entries = caches[i].ssm, .capture_hidden = null, .vision_embeddings = null, .kv_attn_fused = caches[i].packed_reads };
+        cpos[i] = batchedCachePos(f, i, &ctxs[i]);
+        offsets[i] = cpos[i];
         ptrs[i] = &ctxs[i];
     }
     var last = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(last);
     var all = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(all);
-    const logits = try m.trunk.forwardMoeBatchedVerify(.{ .ctx = f.ids.ctx }, ptrs[0..n], f.positions.slice(), &last, &all);
+    const logits = try m.trunk.forwardMoeBatchedVerify(.{ .ctx = f.ids.ctx }, ptrs[0..n], cpos[0..n], &last, &all);
     defer _ = mlx.mlx_array_free(logits);
     for (0..n) |i| {
-        if (caches[i].own) |o| o.pos = f.positions.slice()[i] + f.rows;
+        if (caches[i].own) |o| o.pos = cpos[i] + f.rows;
         if (f.slots.len > i) {
             const r = try m.rec(f.slots.slice()[i]);
             r.ssm = caches[i].ssm;
@@ -562,4 +592,30 @@ test {
     _ = @import("oracle_test.zig");
     _ = @import("cost_profile.zig");
     _ = @import("trunk.zig");
+}
+
+test "qwen4_exp batched forward: an M-RoPE slot runs at its cache position, its delta left to the rope" {
+    var cache_pos: [2]usize = .{ 5000, 900 };
+    const rope_table = [_]i32{ 0, 1, 2 };
+    var img: ForwardCtx = .{ .cache = undefined, .moe_seq_offset = &cache_pos[0], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null, .mrope_pos = &rope_table, .mrope_total = 4200, .mrope_delta = -1200 };
+    var txt: ForwardCtx = .{ .cache = undefined, .moe_seq_offset = &cache_pos[1], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    const engine = [_]*const ForwardCtx{ &img, &txt };
+    const positions = [_]u32{ 3800, 900 };
+    const f: abi.Forward = .{ .mode = .batched_rows, .rows = 1, .tokens = .{}, .positions = .of(&positions) };
+    var a: ForwardCtx = .{ .cache = undefined, .moe_seq_offset = undefined, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    var b = a;
+
+    engineBatch().* = &engine;
+    defer engineBatch().* = &.{};
+    try std.testing.expectEqual(@as(u32, 5000), batchedCachePos(&f, 0, &a));
+    try std.testing.expectEqual(@as(i32, -1200), a.mrope_delta);
+    try std.testing.expectEqual(@as(usize, 4200), a.mrope_total);
+    try std.testing.expect(a.mrope_pos != null);
+    try std.testing.expectEqual(@as(u32, 900), batchedCachePos(&f, 1, &b));
+    try std.testing.expect(b.mrope_pos == null);
+
+    // Outside the in-tree driver the positions stand as given.
+    engineBatch().* = &.{};
+    var c: ForwardCtx = .{ .cache = undefined, .moe_seq_offset = undefined, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+    try std.testing.expectEqual(@as(u32, 3800), batchedCachePos(&f, 0, &c));
 }
