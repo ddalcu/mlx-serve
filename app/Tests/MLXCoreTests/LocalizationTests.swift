@@ -677,6 +677,15 @@ final class LocalizationTests: XCTestCase {
         assertResolves("Pick a decision model in Models → Downloaded and press Use.", "empty state", keys: keys)
     }
 
+    /// The app menu's own Quit item replaces the system one, which macOS localized for us.
+    func testQuitCommandCopyResolvesInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+        for copy in ["Quit MLX-Serve", "Keep running when I press ⌘Q",
+                     "⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both."] {
+            assertResolves(copy, "quit command", keys: keys)
+        }
+    }
+
     private static func specs(_ text: String) -> [String] {
         let range = NSRange(text.startIndex..., in: text)
         return specifier.matches(in: text, range: range).compactMap {

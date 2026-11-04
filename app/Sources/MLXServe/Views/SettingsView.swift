@@ -2022,6 +2022,14 @@ private struct ServerSectionContent: View {
 
     var body: some View {
         SettingsRow(
+            title: "Keep running when I press ⌘Q",
+            explainer: "⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.quitKeepsRunning)
+                .labelsHidden()
+                .toggleStyle(.switch).font(.app(.body))
+        }
+        SettingsRow(
             title: "Preload the model when the server starts",
             explainer: "Load your model when the server starts instead of at your first message."
         ) {
