@@ -22,6 +22,7 @@ const memInsufficientForLoad = @import("preflight.zig").memInsufficientForLoad;
 const loadRequirementBytes = @import("preflight.zig").loadRequirementBytes;
 const ds4_load = @import("../../ds4/load.zig");
 const AneSettings = @import("../../ane/engine.zig").Settings;
+const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 
 /// A GGUF on ds4 or llama.cpp: open, install, ready. The stub config's context is the one asked for; the engine's
 /// answer replaces it.
@@ -44,7 +45,7 @@ pub fn loadGguf(sch: *Scheduler, params: anytype, route: GgufRoute) !void {
         .settings_json = settings,
     }, &params.entry.load_progress, &sch.engine_gauges, sch.metrics);
     errdefer s.close();
-    params.config.max_position_embeddings = s.info.context_window;
+    adoptEngineWindow(params.config, s.info.context_window);
     // The host renders a GGUF's embedded template through its own Jinja (tool synthesis included).
     if (s.chatTemplate()) |tmpl| {
         const cc = params.chat_config;
@@ -62,6 +63,12 @@ pub fn loadGguf(sch: *Scheduler, params: anytype, route: GgufRoute) !void {
     sch.dflash = null;
     publishHotCacheResidency(sch);
     if (scheduler_mod.hot_cache_budget_invalidate) |f| f();
+}
+
+/// A GGUF's context is the session its engine opened: the stub's geometry is a placeholder (`mlxMemoryGuardApplies`).
+fn adoptEngineWindow(config: *ModelConfig, window: u32) void {
+    config.max_position_embeddings = window;
+    config.pinned_context = window;
 }
 
 /// The Neural Engine's own preflight: its layout runs there, its RAM is made and its bill fits; false serves the
@@ -167,4 +174,26 @@ fn install(sch: *Scheduler, params: anytype, s: *Served, drafter_path: []const u
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, s.residentBytes());
     sch.registry.mutex.unlock(sch.io);
+}
+
+test "a GGUF's advertised context is the session its engine opened, not a memory estimate over the stub's placeholder geometry" {
+    const testing = std.testing;
+    const context = @import("../admission/context.zig");
+    const server = @import("../../../host/http/server.zig");
+    const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
+    const cpu_state = @import("../../../host/registry/cpu_state.zig");
+    const max_ctx = server.serverState().server_config.max_context_size;
+    defer server.serverState().server_config.max_context_size = max_ctx;
+    server.serverState().server_config.max_context_size = 0;
+    const ceiling = memory_ceiling.overrides().static_ceiling;
+    defer memory_ceiling.overrides().static_ceiling = ceiling;
+    memory_ceiling.overrides().static_ceiling = 2 << 30; // the placeholder geometry bills far under the window here
+
+    var stub = try cpu_state.buildGgufStubCpuState(testing.allocator, .ds4, 0);
+    defer cpu_state.freeCpuState(testing.allocator, &stub);
+    stub.config.max_position_embeddings = 262144;
+    try testing.expect(context.getEffectiveContextLength(stub.config) < 262144);
+    adoptEngineWindow(stub.config, 262144);
+    try testing.expectEqual(@as(u32, 262144), context.pinAutoContext(stub.config));
+    try testing.expectEqual(@as(u32, 262144), context.getEffectiveContextLength(stub.config));
 }
