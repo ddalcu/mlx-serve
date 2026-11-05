@@ -157,6 +157,15 @@ pub fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
     recordSlotEnd(m, slot, cleanupOutcome(slot));
 }
 
+/// `finishSlot`'s count. The slot leaves the in-flight aggregate before its tokens reach
+/// `generation_tokens_total`: a gauge sample taken before the tick-exit store would count them twice.
+/// Saturating, since `completion_tokens` can be ahead of the aggregate by this tick's tokens.
+fn recordSlotFinish(metrics: ?*metrics_mod.Metrics, inflight: *std.atomic.Value(u64), slot: anytype, outcome: metrics_mod.Outcome) void {
+    if (metrics == null or slot.metrics_recorded) return;
+    inflight.store(inflight.load(.monotonic) -| slot.completion_tokens, .monotonic);
+    recordSlotEnd(metrics, slot, outcome);
+}
+
 pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -197,7 +206,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // a single per-request branch. real_ttft = first_token_ns (queue+prefill,
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
-    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+    recordSlotFinish(sch.metrics, &sch.inflight_generated_tokens, slot, finishOutcome(reason, latched));
     // mlx-stream: the arch's request end (GLM-5.3's decode line), before the terminator.
     if (slot.model.transformer) |x| if (x.mlx_stream_ext) |m| mlx_stream.end(m);
     publishSlotTerminator(slot, reason, latched);
@@ -373,6 +382,24 @@ test "outcome row 9: metrics off does no work and leaves the slot untouched" {
     recordSlotCleanup(null, &s);
     s.finish(null, "stop");
     try testing.expect(!s.metrics_recorded);
+}
+
+test "a finish moves its tokens from the in-flight aggregate to the counter, so live counts them once" {
+    var m = metrics_mod.Metrics.init();
+    // The last tick exit published this slot's 10 tokens beside another slot's 5.
+    var inflight = std.atomic.Value(u64).init(15);
+    var s = OutcomeStub{};
+    recordSlotFinish(&m, &inflight, &s, .success);
+    try testing.expectEqual(@as(u64, 15), metrics_mod.liveGenerationTokens(&m, inflight.load(.monotonic)));
+
+    var ahead = OutcomeStub{};
+    ahead.completion_tokens = 7;
+    recordSlotFinish(&m, &inflight, &ahead, .success);
+    try testing.expectEqual(@as(u64, 0), inflight.load(.monotonic));
+
+    inflight.store(3, .monotonic);
+    recordSlotFinish(&m, &inflight, &s, .success);
+    try testing.expectEqual(@as(u64, 3), inflight.load(.monotonic));
 }
 
 test "[short-gen] carries both token counts, the ids and what they decode to" {
