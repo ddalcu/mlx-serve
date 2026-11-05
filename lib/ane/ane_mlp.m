@@ -230,6 +230,7 @@ int msv_ane_bank_add_mlp(msv_ane_bank *b, uint32_t hidden, uint32_t ffn,
                          const int8_t *gate_q, const float *gate_s,
                          const int8_t *up_q, const float *up_s,
                          const int8_t *down_q, const float *down_s,
+                         float limit,
                          char *error, size_t error_size) {
     if (!b || b->failed) {
         mlp_fail(error, error_size, "no ANE bank to add to");
@@ -290,18 +291,35 @@ int msv_ane_bank_add_mlp(msv_ane_bank *b, uint32_t hidden, uint32_t ffn,
     emit_int8_weight(text, wname, ffn, hidden, gq, gs);
     snprintf(wname, sizeof(wname), "Wu%u", p);
     emit_int8_weight(text, wname, ffn, hidden, uq, us);
+    /* limit > 0: the SwiGLU clamp (DeepSeek V4 `swiglu_limit`), gate <= limit and |up| <= limit. limit <= 0 emits
+     * the unclamped graph unchanged, so its programs keep their cache entries. */
+    const char *gname = limit > 0 ? "graw" : "g";
+    const char *uname = limit > 0 ? "uraw" : "u";
     [text appendFormat:
-        @"        tensor<fp16, [1, %u, 1, %u]> g%u = conv(dilations=dl%u, groups=gr%u, "
-        "pad=pd%u, pad_type=pt%u, strides=st%u, weight=Wg%u, x=x0)[name=string(\"g%u\")];\n"
-        "        tensor<fp16, [1, %u, 1, %u]> u%u = conv(dilations=dl%u, groups=gr%u, "
-        "pad=pd%u, pad_type=pt%u, strides=st%u, weight=Wu%u, x=x0)[name=string(\"u%u\")];\n"
-        "        tensor<fp16, [1, %u, 1, %u]> sg%u = sigmoid(x=g%u)[name=string(\"sg%u\")];\n"
+        @"        tensor<fp16, [1, %u, 1, %u]> %s%u = conv(dilations=dl%u, groups=gr%u, "
+        "pad=pd%u, pad_type=pt%u, strides=st%u, weight=Wg%u, x=x0)[name=string(\"%s%u\")];\n"
+        "        tensor<fp16, [1, %u, 1, %u]> %s%u = conv(dilations=dl%u, groups=gr%u, "
+        "pad=pd%u, pad_type=pt%u, strides=st%u, weight=Wu%u, x=x0)[name=string(\"%s%u\")];\n",
+        ffn, rows, gname, p, p, p, p, p, p, p, gname, p,
+        ffn, rows, uname, p, p, p, p, p, p, p, uname, p];
+    if (limit > 0) {
+        const double hi = (double)limit;
+        [text appendFormat:
+            @"        fp16 glo%u = const()[name=string(\"glo%u\"), val=fp16(%.1f)];\n"
+            "        fp16 ghi%u = const()[name=string(\"ghi%u\"), val=fp16(%.4f)];\n"
+            "        fp16 ulo%u = const()[name=string(\"ulo%u\"), val=fp16(%.4f)];\n"
+            "        tensor<fp16, [1, %u, 1, %u]> g%u = clip(x=graw%u, alpha=glo%u, beta=ghi%u)[name=string(\"g%u\")];\n"
+            "        tensor<fp16, [1, %u, 1, %u]> u%u = clip(x=uraw%u, alpha=ulo%u, beta=ghi%u)[name=string(\"u%u\")];\n",
+            p, p, -65000.0, p, p, hi, p, p, -hi,
+            ffn, rows, p, p, p, p, p,
+            ffn, rows, p, p, p, p, p];
+    }
+    [text appendFormat:
+        @"        tensor<fp16, [1, %u, 1, %u]> sg%u = sigmoid(x=g%u)[name=string(\"sg%u\")];\n"
         "        tensor<fp16, [1, %u, 1, %u]> gs%u = mul(x=g%u, y=sg%u)[name=string(\"gs%u\")];\n"
         "        tensor<fp16, [1, %u, 1, %u]> act%u = mul(x=gs%u, y=u%u)[name=string(\"act%u\")];\n"
         "        fp16 inv16_%u = const()[name=string(\"inv16_%u\"), val=fp16(0.0625)];\n"
         "        tensor<fp16, [1, %u, 1, %u]> act_p%u = mul(x=act%u, y=inv16_%u)[name=string(\"act_p%u\")];\n",
-        ffn, rows, p, p, p, p, p, p, p, p,
-        ffn, rows, p, p, p, p, p, p, p, p,
         ffn, rows, p, p, p,
         ffn, rows, p, p, p, p,
         ffn, rows, p, p, p, p,

@@ -60,6 +60,7 @@ extern fn msv_ane_bank_add_mlp(
     up_s: [*]const f32,
     down_q: [*]const i8,
     down_s: [*]const f32,
+    limit: f32,
     err: [*]u8,
     err_size: usize,
 ) c_int;
@@ -945,7 +946,7 @@ pub const Unit = struct {
             const rc = if (p.gdn)
                 msv_ane_bank_add_gdn(bank, self.parent.hidden, p.qkv_out, p.z_out, self.parent.rows, p.a.q.ptr, p.a.s.ptr, p.b.q.ptr, p.b.s.ptr, &err, err.len)
             else
-                msv_ane_bank_add_mlp(bank, self.parent.hidden, p.ffn, self.parent.rows, p.a.q.ptr, p.a.s.ptr, p.b.q.ptr, p.b.s.ptr, p.c.?.q.ptr, p.c.?.s.ptr, &err, err.len);
+                msv_ane_bank_add_mlp(bank, self.parent.hidden, p.ffn, self.parent.rows, p.a.q.ptr, p.a.s.ptr, p.b.q.ptr, p.b.s.ptr, p.c.?.q.ptr, p.c.?.s.ptr, 0, &err, err.len);
             if (rc < 0) {
                 ok = false;
                 break;

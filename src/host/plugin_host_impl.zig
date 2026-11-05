@@ -1,6 +1,6 @@
 //! The built-in `Host` table (`abi/host.zig`), filled from the process's real facilities: the allocator it is given,
 //! `log.zig`, the MLX error latch in `mlx/ffi.zig`, a kernel cache it owns, the environment (until `src/env.zig`),
-//! `--metrics`' counters and the memory ceiling the caller supplies. Built-ins and outside plugins get the same table.
+//! `--metrics`' counters, the memory ceiling the caller supplies, and the Neural Engine (`plugin_ane.zig`). Built-ins and outside plugins get the same table.
 //!
 //! `HostGpu` delegates to the shims compiled with mlx-stream (`sdk/weights/streamed/csrc/`: `mlx_event_shim.cpp`,
 //! `mlx_alloc_shim.cpp` with its `mlx_launch_cache.inc` and `mimo_gpu_address.inc`, `q3_event_shim.mm`): the one implementation over MLX's
@@ -46,6 +46,7 @@ pub const Builtin = struct {
             .counter = counter,
             .memory_ceiling = memoryCeiling,
             .gpu = &gpu_table,
+            .ane = @import("plugin_ane.zig").table(),
         } };
     }
 

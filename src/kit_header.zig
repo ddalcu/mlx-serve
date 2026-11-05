@@ -124,6 +124,7 @@ fn intName(comptime T: type) ?[]const u8 {
     if (T == bool) return "bool";
     if (T == f32) return "float";
     if (T == f64) return "double";
+    if (T == f16) return "_Float16";
     return switch (@typeInfo(T)) {
         .int => |i| std.fmt.comptimePrint("{s}int{d}_t", .{ if (i.signedness == .unsigned) "u" else "", i.bits }),
         else => null,

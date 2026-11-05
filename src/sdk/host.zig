@@ -8,15 +8,21 @@ pub const abi = @import("../abi/host.zig");
 pub const Host = struct {
     t: *const abi.Host,
 
-    /// The table a plugin was handed, refused by name when absent or older than this sdk's (a newer one is a superset).
+    /// The table a plugin was handed, refused by name when absent or missing a member every host has had since
+    /// `gpu`. Members added after it are optional and read through their accessors (`ane`).
     pub fn of(raw: ?*const anyopaque) error{ NoHost, HostTooOld }!Host {
         const t: *const abi.Host = @ptrCast(@alignCast(raw orelse return error.NoHost));
-        if (t.size < @sizeOf(abi.Host) or t.gpu.size < @sizeOf(abi.HostGpu)) return error.HostTooOld;
+        if (t.size < @offsetOf(abi.Host, "ane") or t.gpu.size < @sizeOf(abi.HostGpu)) return error.HostTooOld;
         return .{ .t = t };
     }
 
     pub fn gpu(self: Host) *const abi.HostGpu {
         return self.t.gpu;
+    }
+
+    /// The Neural Engine, or null: none on this machine or build, or a host older than `Host.ane`.
+    pub fn ane(self: Host) ?*const abi.HostAne {
+        return abi.aneOf(self.t);
     }
 
     // ── Allocator ──
@@ -134,8 +140,11 @@ test "sdk host: a missing or older table is refused by name" {
     var fake: FakeHost = undefined;
     fake.init(.{});
     var old = fake.table;
-    old.size -= 8;
+    old.size = @offsetOf(abi.Host, "gpu");
     try testing.expectError(error.HostTooOld, Host.of(&old));
+    // A host from before `ane` serves every plugin; it just has no Neural Engine to offer.
+    old.size = @offsetOf(abi.Host, "ane");
+    try testing.expect((try Host.of(&old)).ane() == null);
     var old_gpu = fake.gpu_table;
     old_gpu.size = 16;
     var t = fake.table;

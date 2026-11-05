@@ -42,6 +42,8 @@ msv_ane_model *msv_ane_model_create(const char *name, const char *mil,
                                   uint32_t procedure_count, int ane_instance,
                                   char *error, size_t error_size);
 void msv_ane_model_free(msv_ane_model *model);
+/* Models loaded in the process now, every caller's: the runtime refuses loads past about 121. */
+uint32_t msv_ane_resident(void);
 
 int msv_ane_model_eval(msv_ane_model *model, uint32_t procedure, char *error,
                        size_t error_size);

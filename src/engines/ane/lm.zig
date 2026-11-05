@@ -18,7 +18,7 @@ const q35 = @import("qwen35.zig");
 const pack_mod = @import("pack.zig");
 const prefix = @import("prefix.zig");
 const ane = @import("../../sdk/ane/offload.zig");
-const mil = @import("mil.zig");
+const mil = @import("../../sdk/ane/mil.zig");
 const dflash = @import("dflash.zig");
 const abi = @import("../../abi/engine.zig");
 

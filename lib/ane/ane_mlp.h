@@ -66,6 +66,7 @@ int msv_ane_bank_add_mlp(msv_ane_bank *b, uint32_t hidden, uint32_t ffn,
                          const int8_t *gate_q, const float *gate_s,
                          const int8_t *up_q, const float *up_s,
                          const int8_t *down_q, const float *down_s,
+                         float limit,
                          char *error, size_t error_size);
 
 /* Append one GDN input-projection procedure: in_proj_qkv + in_proj_z as ONE
