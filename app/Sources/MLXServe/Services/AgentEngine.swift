@@ -93,6 +93,8 @@ enum AgentEngine {
         historyImages: Bool = false
     ) -> [[String: Any]] {
 
+        let allMessages = ContextCompaction.activeMessages(allMessages)
+
         // --- Budget calculation ---
 
         let safetyBuffer = 1024
