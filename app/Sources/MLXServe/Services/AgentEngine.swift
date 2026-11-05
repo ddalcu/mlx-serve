@@ -260,6 +260,15 @@ enum AgentEngine {
                 if let rc = msg.reasoningContent, !rc.isEmpty {
                     dict["reasoning_content"] = rc
                 }
+                let following = window.dropFirst(i + 1).filter {
+                    !$0.isAgentSummary && !$0.failedRetry
+                        && ($0.toolCallId != nil || !$0.content.isEmpty || !($0.toolCalls ?? []).isEmpty)
+                }
+                let resultIDs = Set(following.prefix { $0.toolCallId != nil }.compactMap(\.toolCallId))
+                guard tcs.allSatisfy({ resultIDs.contains($0.id) }) else {
+                    if !content.isEmpty { history.append(dict) }
+                    continue
+                }
                 dict["tool_calls"] = tcs.map { tc -> [String: Any] in
                     [
                         "id": tc.id,

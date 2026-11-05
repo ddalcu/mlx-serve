@@ -53,7 +53,9 @@ enum ContextCompaction {
             guard let cp = marker.contextCheckpoint,
                   let i = raw.firstIndex(where: { $0.id == cp.boundaryID }),
                   fingerprint(Array(raw.prefix(i + 1))) == cp.digest else { continue }
-            let summary = ChatMessage(role: .user, content: "[Summary of earlier conversation; historical context, not a new request]\n" + marker.content)
+            var summary = ChatMessage(role: .system, content: "[Summary of earlier conversation; historical context, not a new request]\n" + marker.content)
+            summary.contextCheckpoint = cp
+            summary.isAgentSummary = true
             return [summary] + Array(raw.dropFirst(i + 1))
         }
         return raw
@@ -75,6 +77,9 @@ enum ContextCompaction {
                 cut = i; moved = true; break
             }
         }
+        // The summary lives in the system prompt, so the retained dialogue
+        // must start with a user turn for strict alternating templates.
+        while cut > 0, raw[cut].role != .user || raw[cut].toolCallId != nil { cut -= 1 }
         guard cut > 0 else { return nil }
         return Plan(boundary: cut - 1)
     }
@@ -88,46 +93,27 @@ enum ContextCompaction {
         return marker
     }
 
-    static func wireMessages(_ source: [ChatMessage], media: ((String, ChatMessage) -> Any)? = nil,
-                             historyImages: Bool = false) -> [[String: Any]] {
-        let active = activeMessages(source).filter { msg in
-            !msg.isAgentSummary && !msg.failedRetry && msg.errorNotice == nil
-                && (msg.toolCallId != nil || !msg.content.isEmpty || !(msg.toolCalls ?? []).isEmpty
-                    || !(msg.images ?? []).isEmpty || !(msg.videos ?? []).isEmpty || !(msg.audio ?? []).isEmpty)
+    static func appendingSummary(to messages: [[String: Any]], source: [ChatMessage]) -> [[String: Any]] {
+        guard let summary = activeMessages(source).first, summary.contextCheckpoint != nil else { return messages }
+        var messages = messages
+        if messages.first?["role"] as? String == "system" {
+            messages[0]["content"] = (messages[0]["content"] as? String ?? "") + "\n\n" + summary.content
+        } else {
+            messages.insert(["role": "system", "content": summary.content], at: 0)
         }
-        let lastUser = active.last(where: { $0.role == .user })?.id
-        var openCalls = Set<String>()
-        return active.enumerated().compactMap { index, msg in
-            if let id = msg.toolCallId {
-                guard openCalls.remove(id) != nil else { return nil }
-                return ["role": "tool", "tool_call_id": id, "content": msg.content]
-            }
-            openCalls.removeAll()
-            let content = msg.role == .assistant ? TruncationNotice.stripped(from: msg.content) : msg.content
-            var result: [String: Any] = ["role": msg.role.rawValue, "content": content]
-            if msg.role == .user, historyImages || msg.id == lastUser, let media {
-                result["content"] = media(msg.content, msg)
-            }
-            if let reasoning = msg.reasoningContent, !reasoning.isEmpty { result["reasoning_content"] = reasoning }
-            if let calls = msg.toolCalls, !calls.isEmpty {
-                let following = active.dropFirst(index + 1)
-                let results = Set(following.prefix { $0.toolCallId != nil }.compactMap(\.toolCallId))
-                if calls.allSatisfy({ results.contains($0.id) }) {
-                    result["tool_calls"] = calls.map { ["id": $0.id, "type": "function", "function": ["name": $0.name, "arguments": $0.arguments]] as [String: Any] }
-                    openCalls.formUnion(calls.map(\.id))
-                }
-            }
-            return result
-        }
+        return messages
     }
 
     static func summaryText(_ source: [ChatMessage]) -> String {
-        let messages = wireMessages(source, media: { text, msg in
+        let messages: [[String: Any]] = source.filter { !$0.isAgentSummary || $0.contextCheckpoint != nil }.map { msg in
             var paths: [String] = (msg.images ?? []).map { $0.path ?? "image \($0.id)" }
             paths += (msg.videos ?? []).map { $0.path ?? $0.name }
             paths += (msg.audio ?? []).map { $0.path ?? $0.name }
-            return paths.isEmpty ? text : text + "\n[Attachments, contents not included in summary: " + paths.joined(separator: ", ") + "]"
-        }, historyImages: true)
+            return ["role": msg.role.rawValue, "content": msg.content, "reasoning": msg.reasoningContent ?? "",
+                    "tool_call_id": msg.toolCallId ?? "",
+                    "tool_calls": (msg.toolCalls ?? []).map { ["id": $0.id, "name": $0.name, "arguments": $0.arguments] },
+                    "attachments": paths]
+        }
         let data = (try? JSONSerialization.data(withJSONObject: messages, options: [.sortedKeys, .withoutEscapingSlashes])) ?? Data()
         return String(data: data, encoding: .utf8) ?? ""
     }

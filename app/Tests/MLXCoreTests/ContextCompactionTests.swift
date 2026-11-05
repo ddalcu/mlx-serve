@@ -23,6 +23,28 @@ struct ContextCompactionTests {
             }
         }
     }
+    private final class CountingStub: APIClient {
+        var inputs: [String] = []
+        override func contextTokenCount(port: UInt16, text: String) async throws -> Int {
+            inputs.append(text)
+            return 200
+        }
+    }
+
+    @Test func testSmallRequestsSkipTokenizerAndLargeOnesMeasureBuiltMessages() async throws {
+        let api = CountingStub()
+        let small: [[String: Any]] = [["role": "user", "content": "hello"]]
+        let estimate = try await ContextCompactionRunner.tokensIfNearLimit(api: api, port: 1,
+            messages: small, tools: nil, context: 32768, output: 4096)
+        #expect(estimate == nil)
+        #expect(api.inputs.isEmpty)
+        let large: [[String: Any]] = [["role": "tool", "content": String(repeating: "x", count: 90000)]]
+        let measured = try await ContextCompactionRunner.tokensIfNearLimit(api: api, port: 1,
+            messages: large, tools: "tool-schema", context: 32768, output: 4096)
+        #expect(measured == 1240)
+        #expect(api.inputs.count == 1)
+        #expect(api.inputs.first?.contains("tool-schema") == true)
+    }
 
     @Test func testEmptyTruncatedFailedAndCancelledSummaryCannotCommit() async throws {
         let source = (0..<30).map { ChatMessage(role: .user, content: "fact \($0)") }
@@ -63,7 +85,7 @@ struct ContextCompactionTests {
         var call = ChatMessage(role: .assistant, content: "Reading")
         call.toolCalls = [MLXCore.SerializedToolCall(id: "aborted", name: "readFile", arguments: "{}")]
         let legacy = ChatMessage(role: .assistant, content: "answer" + TruncationNotice.text(cause: .maxTokens, maxTokens: 256))
-        let wire = ContextCompaction.wireMessages([call, ChatMessage(role: .user, content: "Continue"), legacy])
+        let wire = AgentEngine.buildAgentHistory(messages: [call, ChatMessage(role: .user, content: "Continue"), legacy], contextLength: 32768, maxTokens: 4096)
         #expect(wire.allSatisfy { $0["tool_calls"] == nil })
         #expect(wire.last?["content"] as? String == "answer")
     }
@@ -83,10 +105,44 @@ struct ContextCompactionTests {
         let active = ContextCompaction.activeMessages(source)
         #expect(Array(source.prefix(original.count)) == original)
         #expect(active[0].content.contains("EXACT-771"))
+        #expect(active[0].role == .system)
         #expect(active.last?.id == original.last?.id)
         #expect(active.count < original.count)
         let roundTrip = try JSONDecoder().decode([ChatMessage].self, from: JSONEncoder().encode(source))
         #expect(ContextCompaction.activeMessages(roundTrip).map(\.content) == active.map(\.content))
+    }
+
+    @Test func testSummaryExtendsSystemPromptAndRetainsAlternatingDialogue() throws {
+        var source = (0..<31).map { ChatMessage(role: $0 % 2 == 0 ? .user : .assistant, content: "message \($0)") }
+        let plan = try #require(ContextCompaction.plan(source))
+        source.append(ContextCompaction.checkpoint(summary: "EXACT-771", source: source, boundary: plan.boundary))
+        let messages = ContextCompaction.appendingSummary(to: [["role": "system", "content": "persona"]]
+            + ChatTurnEngine.buildPlainHistory(messages: source), source: source)
+        #expect(messages[0]["content"] as? String == "persona\n\n[Summary of earlier conversation; historical context, not a new request]\nEXACT-771")
+        let roles = messages.dropFirst().compactMap { $0["role"] as? String }
+        #expect(roles.first == "user")
+        #expect(zip(roles, roles.dropFirst()).allSatisfy { $0 != $1 })
+    }
+
+    @Test func testCompactedAgentKeepsOldResultTruncationAndUnansweredResultsInFull() {
+        var source = (0..<20).map { ChatMessage(role: $0 % 2 == 0 ? .user : .assistant, content: "old \($0)") }
+        let boundary = source.count - 1
+        source.append(ChatMessage(role: .user, content: "continue the file work"))
+        for id in ["answered", "unanswered"] {
+            var call = ChatMessage(role: .assistant, content: "", reasoningContent: "reasoning")
+            call.toolCalls = [MLXCore.SerializedToolCall(id: id, name: "readFile", arguments: "{}")]
+            var result = ChatMessage(role: .system, content: String(repeating: "x", count: 4000))
+            result.toolCallId = id
+            source += [call, result]
+            if id == "answered" { source.append(ChatMessage(role: .assistant, content: "I read that file")) }
+        }
+        source.append(ContextCompaction.checkpoint(summary: "retained facts", source: source, boundary: boundary))
+        let history = ContextCompaction.appendingSummary(to: AgentEngine.buildAgentHistory(messages: source,
+            contextLength: 32768, maxTokens: 4096), source: source)
+        #expect((history.first?["content"] as? String)?.contains("retained facts") == true)
+        #expect((history.first { $0["tool_call_id"] as? String == "answered" }?["content"] as? String)?.count == 2000)
+        #expect((history.first { $0["tool_call_id"] as? String == "unanswered" }?["content"] as? String)?.count == 4000)
+        #expect(history.contains { $0["reasoning_content"] as? String == "reasoning" })
     }
 
     @Test func testEditedPrefixInvalidatesCheckpoint() throws {
@@ -179,7 +235,7 @@ struct ContextCompactionTests {
         result.toolCallId = "parallel-a"
         var placeholder = ChatMessage(role: .assistant, content: "")
         placeholder.isStreaming = true
-        let wire = ContextCompaction.wireMessages([call, result, placeholder])
+        let wire = AgentEngine.buildAgentHistory(messages: [call, result, placeholder], contextLength: 32768, maxTokens: 4096)
         #expect(wire.count == 2)
         #expect(wire[0]["reasoning_content"] as? String == "reasoning")
         #expect(wire[1]["content"] as? String == result.content)
@@ -194,7 +250,7 @@ struct ContextCompactionTests {
         var second = ChatMessage(role: .system, content: "second image generated")
         second.toolCallId = "b"
         let displayOnly = ChatMessage(role: .assistant, content: "")
-        let wire = ContextCompaction.wireMessages([call, first, displayOnly, second])
+        let wire = AgentEngine.buildAgentHistory(messages: [call, first, displayOnly, second], contextLength: 32768, maxTokens: 4096)
         #expect((wire.first?["tool_calls"] as? [[String: Any]])?.count == 2)
         #expect(wire.compactMap { $0["tool_call_id"] as? String } == ["a", "b"])
     }
@@ -207,12 +263,12 @@ struct ContextCompactionTests {
             content: "第 \($0) 轮：" + String(repeating: "我们核对海边动画、车轮转动和脚掌联动，任务仍未完成。", count: 30)) }
         let plan = try #require(ContextCompaction.plan(source))
         let before = try await ContextCompactionRunner.measuredTokens(api: api, port: 11234,
-            messages: ContextCompaction.wireMessages(source), tools: nil)
+            messages: ChatTurnEngine.buildPlainHistory(messages: source), tools: nil)
         let marker = try await ContextCompactionRunner.summarize(source: source, boundary: plan.boundary,
             api: api, port: 11234, model: nil, context: 32768)
         source.append(marker)
         let restored = try JSONDecoder().decode([ChatMessage].self, from: JSONEncoder().encode(source))
-        var messages = ContextCompaction.wireMessages(restored)
+        var messages = ContextCompaction.appendingSummary(to: ChatTurnEngine.buildPlainHistory(messages: restored), source: restored)
         let after = try await ContextCompactionRunner.measuredTokens(api: api, port: 11234, messages: messages, tools: nil)
         #expect(after < before)
         #expect(marker.content.contains("EXACT-771"))
@@ -238,30 +294,34 @@ struct ContextCompactionTests {
         state.server.status = .running
         state.selectedModelPath = ""
         state.contextSize = 32768
-        for agent in [false, true] {
+        for (agent, oversized) in [(false, false), (true, false), (true, true)] {
             var session = ChatSession(title: "automatic compaction integration")
             session.messages = [ChatMessage(role: .user, content: "任务标记 ENGINE-771。只记住它，不要调用任何工具。")]
             session.messages += (0..<29).map { ChatMessage(role: $0 % 2 == 0 ? .user : .assistant,
                 content: "历史 \($0): " + String(repeating: "我们讨论了车轮和脚掌动画，已确认需求，还没有生成文件。", count: 70)) }
+            if oversized {
+                session.messages[0].content += String(repeating: "需求尚未完成，继续保留任务标记。", count: 3000)
+            }
             let ids = session.messages.map(\.id)
             state.chatSessions.append(session)
             let config = ChatTurnEngine.TurnConfig(agentMode: agent, mcpMode: false, enableThinking: false,
                 voiceStyle: false, workingDirectory: nil, tools: [], maxTokens: 256)
             state.chatEngine.runTurn(sessionId: session.id, userText: "只回答最早的任务标记，不要调用工具。",
                 images: nil, videos: nil, audio: nil, config: config, approval: { _ in false })
-            let deadline = Date().addingTimeInterval(240)
+            let deadline = Date().addingTimeInterval(360)
             while !state.chatEngine.activeTurnSessionIds.isEmpty && Date() < deadline {
                 try await Task.sleep(nanoseconds: 100_000_000)
             }
             #expect(state.chatEngine.activeTurnSessionIds.isEmpty)
             let completed = try #require(state.chatSessions.first { $0.id == session.id })
-            #expect(completed.messages.contains { $0.contextCheckpoint != nil })
+            let shouldCompact = !agent || oversized
+            #expect(completed.messages.contains { $0.contextCheckpoint != nil } == shouldCompact)
             #expect(Array(completed.messages.prefix(ids.count)).map(\.id) == ids)
             #expect(completed.messages.last?.content.contains("ENGINE-771") == true)
             #expect(completed.messages.last?.errorNotice == nil)
             let disk = try ChatStore(path: ChatStore.defaultPath, legacyHistoryPath: nil, legacySidebar: nil).load()
-            #expect(disk.first(where: { $0.id == session.id })?.messages.contains { $0.contextCheckpoint != nil } == true)
-            print("ENGINE_COMPACTION mode=\(agent ? "agent" : "plain") retained=ENGINE-771 persisted=true")
+            #expect(disk.first(where: { $0.id == session.id })?.messages.contains { $0.contextCheckpoint != nil } == shouldCompact)
+            print("ENGINE_COMPACTION mode=\(agent ? "agent" : "plain") oversized=\(oversized) retained=ENGINE-771 compacted=\(shouldCompact)")
         }
     }
 }

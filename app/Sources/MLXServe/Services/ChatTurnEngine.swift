@@ -671,17 +671,19 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     }
 
     private func prepareCompactedContext(api: APIClient, sessionId: UUID, config: TurnConfig,
-                                         context: Int, systems: [[String: Any]], tools: String?) async throws -> [[String: Any]] {
+                                         context: Int, tools: String?,
+                                         buildMessages: ([ChatMessage]) -> [[String: Any]]) async throws -> [[String: Any]] {
         for _ in 0..<8 {
             try Task.checkCancellation()
             guard let current = session(sessionId) else { throw CancellationError() }
             let source = current.messages
-            let messages = systems + ContextCompaction.wireMessages(source, media: { text, msg in
-                Self.buildMultimodalContent(text: text, images: msg.images ?? [], videos: msg.videos ?? [],
-                    audio: msg.audio ?? [], serverPreprocess: self.wantsServerImagePreprocess)
-            }, historyImages: wantsServerImagePreprocess)
-            let measured = try await ContextCompactionRunner.measuredTokens(api: api, port: server.port,
-                messages: messages, tools: tools)
+            let messages = ContextCompaction.appendingSummary(to: buildMessages(source), source: source)
+            guard let measured = try await ContextCompactionRunner.tokensIfNearLimit(api: api, port: server.port,
+                messages: messages, tools: tools, context: context, output: turnMaxTokens(config),
+                calibration: contextCalibration[sessionId] ?? 1) else {
+                contextMeasurements.removeValue(forKey: sessionId)
+                return messages
+            }
             let calibrated = Int(Double(measured) * (contextCalibration[sessionId] ?? 1))
             if !ContextCompaction.needsCompaction(tokens: calibrated, context: context, output: turnMaxTokens(config)) {
                 contextMeasurements[sessionId] = measured
@@ -736,20 +738,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // request — same pattern the agent loop uses. Attachments: every user
         // message's when the server preprocesses (it renders each where it was
         // sent); Gemma's raw-pixel format (~9 MB an image) keeps only the latest.
-        let sessionMsgs = ContextCompaction.activeMessages(session(sessionId)?.messages ?? [])
-        let lastUserIdx = sessionMsgs.lastIndex { $0.role == .user }
         let useServerPreprocess = wantsServerImagePreprocess
-        let history: [[String: Any]] = sessionMsgs.enumerated().map { i, msg in
-            if msg.role == .user, useServerPreprocess || i == lastUserIdx {
-                let imgs = msg.images ?? []
-                let vids = msg.videos ?? []
-                let clips = msg.audio ?? []
-                if !imgs.isEmpty || !vids.isEmpty || !clips.isEmpty {
-                    return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs, videos: vids, audio: clips, serverPreprocess: useServerPreprocess)]
-                }
-            }
-            return Self.plainHistoryDict(msg)
-        }
+        let history = Self.buildPlainHistory(messages: session(sessionId)?.messages ?? [],
+                                             serverPreprocess: useServerPreprocess)
         // Plain chat: no synthesized system message (see the long note in the
         // original ChatView implementation — a "formatNudge" system message was
         // routinely read by the model AS the user's input). Two exceptions, both
@@ -812,7 +803,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     modelContextLength: server.chatModelInfo?.contextLength)
                 let systems = messages.prefix { ($0["role"] as? String) == "system" }
                 messages = try await prepareCompactedContext(api: api, sessionId: sessionId,
-                    config: config, context: context, systems: Array(systems), tools: nil)
+                    config: config, context: context, tools: nil) { source in
+                        Array(systems) + Self.buildPlainHistory(messages: source, serverPreprocess: self.wantsServerImagePreprocess)
+                    }
+            } else {
+                messages = ContextCompaction.appendingSummary(to: messages, source: session(sessionId)?.messages ?? [])
             }
             let thinking = config.thinkingForRequest(appState.serverOptions,
                                                       inheritGeneration: server.chatIsLocal)
@@ -1030,16 +1025,19 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 apple: appState.useAppleModel
             )
             let useServerPreprocess = wantsServerImagePreprocess
-            var history = AgentEngine.buildAgentHistory(
-                messages: session(sessionId)?.messages ?? [],
-                contextLength: contextLength,
-                maxTokens: turnMax,
-                buildMultimodalContent: { text, msg in
-                    Self.buildMultimodalContent(text: text, images: msg.images ?? [], videos: msg.videos ?? [],
-                                                audio: msg.audio ?? [], serverPreprocess: useServerPreprocess)
-                },
-                historyImages: useServerPreprocess
-            )
+            let buildHistory: ([ChatMessage]) -> [[String: Any]] = { source in
+                AgentEngine.buildAgentHistory(
+                    messages: source,
+                    contextLength: contextLength,
+                    maxTokens: turnMax,
+                    buildMultimodalContent: { text, msg in
+                        Self.buildMultimodalContent(text: text, images: msg.images ?? [], videos: msg.videos ?? [],
+                                                    audio: msg.audio ?? [], serverPreprocess: useServerPreprocess)
+                    },
+                    historyImages: useServerPreprocess
+                )
+            }
+            var history = buildHistory(session(sessionId)?.messages ?? [])
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let mcpToolsJSON = config.mcpMode ? mcpManager.toolDefinitionsJSON() : nil
             let mcpListing = config.mcpMode ? mcpManager.toolListingForPrompt() : ""
@@ -1159,12 +1157,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             if server.chatIsLocal && !appState.useAppleModel {
                 await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
                 messages = try await prepareCompactedContext(api: api, sessionId: sessionId,
-                    config: config, context: contextLength,
-                    systems: [["role": "system", "content": systemPrompt]], tools: combinedToolsJSON)
-                if messages.last?["role"] as? String == "tool" {
-                    messages.append(["role": "user", "content": AgentEngine.toolRoundNudge])
+                    config: config, context: contextLength, tools: combinedToolsJSON) { source in
+                    var history = buildHistory(source)
+                    if history.last?["role"] as? String == "tool" {
+                        history.append(["role": "user", "content": AgentEngine.toolRoundNudge])
+                    }
+                    return [["role": "system", "content": systemPrompt]] + history
                 }
                 AgentEngine.dumpDebugRequest(messages: messages, maxTokens: turnMax)
+            } else {
+                messages = ContextCompaction.appendingSummary(to: messages, source: session(sessionId)?.messages ?? [])
             }
             let stream: AsyncThrowingStream<SSEEvent, Error>
             if appState.useAppleModel {
@@ -1889,6 +1891,23 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         case .ready(let files, _): return files
         case .indexing(_, let total): return total
         case .preparing, .failed, nil: return 0
+        }
+    }
+
+    static func buildPlainHistory(messages: [ChatMessage], serverPreprocess: Bool = false) -> [[String: Any]] {
+        let messages = ContextCompaction.activeMessages(messages).filter {
+            $0.contextCheckpoint == nil && !($0.isStreaming && $0.content.isEmpty)
+        }
+        let lastUser = messages.lastIndex { $0.role == .user }
+        return messages.enumerated().map { i, msg in
+            if msg.role == .user, serverPreprocess || i == lastUser {
+                let images = msg.images ?? [], videos = msg.videos ?? [], audio = msg.audio ?? []
+                if !images.isEmpty || !videos.isEmpty || !audio.isEmpty {
+                    return ["role": "user", "content": buildMultimodalContent(text: msg.content, images: images,
+                        videos: videos, audio: audio, serverPreprocess: serverPreprocess)]
+                }
+            }
+            return plainHistoryDict(msg)
         }
     }
 

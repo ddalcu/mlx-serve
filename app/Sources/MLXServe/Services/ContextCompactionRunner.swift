@@ -40,6 +40,18 @@ enum ContextCompactionRunner {
         return count + messages.count * 16 + 1024 + input.mediaTokens
     }
 
+    static func tokensIfNearLimit(api: APIClient, port: UInt16, messages: [[String: Any]], tools: String?,
+                                  context: Int, output: Int, calibration: Double = 1) async throws -> Int? {
+        let input = countingInput(messages)
+        let bytes = try JSONSerialization.data(withJSONObject: input.messages).count + (tools?.utf8.count ?? 0)
+        // Three bytes per token errs above the app's four-byte history estimate.
+        // Measure at three quarters of the trigger to leave room for model drift.
+        let estimate = bytes / 3 + messages.count * 16 + 1024 + input.mediaTokens
+        guard ContextCompaction.needsCompaction(tokens: Int(Double(estimate) * calibration * 4 / 3),
+                                                context: context, output: output) else { return nil }
+        return try await measuredTokens(api: api, port: port, messages: messages, tools: tools)
+    }
+
     static func summarize(source: [ChatMessage], boundary: Int, api: APIClient,
                           port: UInt16, model: String?, context: Int) async throws -> ChatMessage {
         let raw = ContextCompaction.transcript(source)
