@@ -51,8 +51,6 @@ const checkAttentionMemory = @import("admission.zig").checkAttentionMemory;
 const clampMaxTokens = @import("sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("media_gate.zig").mediaRejectReason;
 const dropMedia = @import("media_gate.zig").dropMedia;
-const effortWordOnly = @import("../chat/reasoning/request.zig").effortWordOnly;
-const implicitEffortBudgetFor = @import("../chat/reasoning/request.zig").implicitEffortBudgetFor;
 const defaultReasoningBudget = @import("../chat/reasoning/request.zig").defaultReasoningBudget;
 const forcedReasoningBudget = @import("../chat/reasoning/request.zig").forcedReasoningBudget;
 const reasoningEffortFromWord = @import("../chat/reasoning/request.zig").reasoningEffortFromWord;
@@ -554,7 +552,6 @@ pub fn handleAnthropicMessages(
     // (muse+tools delivers its always-on reasoning as thinking blocks rather
     // than paying for it and discarding it); a PRESENT object decides
     // explicitly, exactly as before.
-    const word_only = effortWordOnly(allocator, lm, tok);
     const default_budget = defaultReasoningBudget(gen);
     var thinking_on: ?bool = null;
     var budget_tokens: ?i32 = null;
@@ -584,12 +581,11 @@ pub fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         return;
     };
-    const request_effort = if (output_cfg.effort) |word| reasoningEffortFromWord(word, default_budget, word_only) else null;
-    const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(root.get("tools") != null), default_budget, word_only);
+    const request_effort = if (output_cfg.effort) |word| reasoningEffortFromWord(word, default_budget) else null;
+    const thinking = resolveThinking(gen, thinking_on, request_effort, config.defaultEnableThinking(root.get("tools") != null), default_budget);
     var enable_thinking = thinking.enable;
     const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
-    const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse
-        if (thinking.effort) |cfg| cfg.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget));
+    const reasoning_budget = forcedReasoningBudget(gen, budget_tokens orelse default_budget);
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
     const model_name = echoModelName(root, config.model_type);
 

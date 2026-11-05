@@ -60,8 +60,6 @@ const dropMedia = @import("media_gate.zig").dropMedia;
 const imageUrlOfPart = @import("media_gate.zig").imageUrlOfPart;
 const encodeText = @import("tokenize.zig").encodeText;
 const jsonEscapeOrEmpty = @import("tokenize.zig").jsonEscapeOrEmpty;
-const effortWordOnly = @import("../chat/reasoning/request.zig").effortWordOnly;
-const implicitEffortBudgetFor = @import("../chat/reasoning/request.zig").implicitEffortBudgetFor;
 const defaultReasoningBudget = @import("../chat/reasoning/request.zig").defaultReasoningBudget;
 const forcedReasoningBudget = @import("../chat/reasoning/request.zig").forcedReasoningBudget;
 const resolveChatThinking = @import("../chat/reasoning/request.zig").resolveChatThinking;
@@ -584,18 +582,17 @@ pub fn handleChatCompletions(
     // A request naming NEITHER takes the arch default (off for every arch but
     // the ones whose vendor documents thinking-on).
     const default_budget = defaultReasoningBudget(gen);
-    const thinking = resolveChatThinking(root, gen, config.defaultEnableThinking(tools_json != null), default_budget, effortWordOnly(allocator, lm, tok));
+    const thinking = resolveChatThinking(root, gen, config.defaultEnableThinking(tools_json != null), default_budget);
     const effort_cfg = thinking.effort;
     // The card's spoken recipes open no think block (`handleSpeech` likewise): the reply speaks from its first slot.
     var enable_thinking = thinking.enable and speech_ask == null;
 
     // Reasoning budget (max tokens in <think> block, -1 = unlimited):
-    // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
-    const effort_budget: i32 = if (effort_cfg) |e| e.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget);
+    // explicit reasoning_budget_tokens > --reasoning-budget (or the model rule); an effort word sets none.
     const reasoning_budget: i32 = forcedReasoningBudget(gen, if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
-        else => effort_budget,
-    } else effort_budget);
+        else => default_budget,
+    } else default_budget);
 
     // Wave 1.A: per-request KV-quant override. When unset, falls back to the
     // process-level --kv-quant default carried on the scheduler. Cross-scheme

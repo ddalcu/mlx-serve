@@ -17,7 +17,6 @@ pub const serializeMessagesJsonFor = @import("serialize.zig").serializeMessagesJ
 pub const messageHasMedia = @import("serialize.zig").messageHasMedia;
 pub const isImageItemStart = @import("serialize.zig").isImageItemStart;
 pub const isQwen38EffortTemplate = @import("effort.zig").isQwen38EffortTemplate;
-pub const templateConsumesEffort = @import("effort.zig").templateConsumesEffort;
 pub const dsv4EffortFor = @import("effort.zig").dsv4EffortFor;
 pub const mergeTemplateKwargs = @import("effort.zig").mergeTemplateKwargs;
 pub const thinkOpenTagLenAt = @import("reasoning/think_tags.zig").thinkOpenTagLenAt;

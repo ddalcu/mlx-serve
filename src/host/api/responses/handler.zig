@@ -50,8 +50,6 @@ const clampMaxTokens = @import("../sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("../media_gate.zig").mediaRejectReason;
 const dropMedia = @import("../media_gate.zig").dropMedia;
 const encodeText = @import("../tokenize.zig").encodeText;
-const effortWordOnly = @import("../../chat/reasoning/request.zig").effortWordOnly;
-const implicitEffortBudgetFor = @import("../../chat/reasoning/request.zig").implicitEffortBudgetFor;
 const defaultReasoningBudget = @import("../../chat/reasoning/request.zig").defaultReasoningBudget;
 const forcedReasoningBudget = @import("../../chat/reasoning/request.zig").forcedReasoningBudget;
 const reasoningEffortFromWord = @import("../../chat/reasoning/request.zig").reasoningEffortFromWord;
@@ -505,22 +503,19 @@ fn handleResponsesInner(
     };
 
     // ── reasoning ──
-    // Budget precedence as on chat: explicit reasoning_budget_tokens > the
-    // effort word's budget (`reasoningEffortFromWord`) > --reasoning-budget,
-    // with the Qwen3.8 implicit-low budget when thinking names no effort.
+    // Budget precedence as on chat: explicit reasoning_budget_tokens > --reasoning-budget (or the model rule); an
+    // effort word sets none.
     const default_budget = defaultReasoningBudget(gen);
-    const word_only = effortWordOnly(allocator, lm, tok);
     const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), default_budget);
     const reasoning_named = if (root.get("reasoning")) |v| v == .object else false;
-    const request_effort = if (reasoning_cfg.effort) |word| reasoningEffortFromWord(word, default_budget, word_only) else null;
-    const thinking = resolveThinking(gen, if (reasoning_named) reasoning_cfg.enable else null, request_effort, false, default_budget, word_only);
+    const request_effort = if (reasoning_cfg.effort) |word| reasoningEffortFromWord(word, default_budget) else null;
+    const thinking = resolveThinking(gen, if (reasoning_named) reasoning_cfg.enable else null, request_effort, false, default_budget);
     var enable_thinking = thinking.enable;
     const effort_word: ?[]const u8 = if (thinking.effort) |cfg| cfg.effort else null;
-    const effort_budget: i32 = if (thinking.effort) |cfg| cfg.budget else implicitEffortBudgetFor(allocator, lm, tok, default_budget);
     const reasoning_budget: i32 = forcedReasoningBudget(gen, if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| clampJsonI32(i),
-        else => effort_budget,
-    } else effort_budget);
+        else => default_budget,
+    } else default_budget);
 
     // ── tools ──
     var tools_json: ?[]const u8 = null;

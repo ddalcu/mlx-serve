@@ -113,7 +113,7 @@ pub const ReasoningConfig = struct {
     effort: ?[]const u8 = null,
 };
 
-/// Map `reasoning.effort` → (enable_thinking, reasoning_budget).
+/// Map `reasoning.effort` → enable_thinking; the word keeps the default budget (it never caps thinking).
 /// "none" is an explicit off, matching the chat and Anthropic surfaces;
 /// `null` / non-object → thinking disabled, budget unchanged.
 pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) ReasoningConfig {
@@ -123,17 +123,7 @@ pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) Reaso
     if (effort_val != .string) return .{ .enable = true, .budget = default_budget };
     const word = effort_val.string;
     if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
-    return .{ .enable = true, .budget = effortBudget(word, default_budget), .effort = word };
-}
-
-/// Effort → thinking-budget mapping shared by the Responses `reasoning.effort`
-/// object and the chat-completions `reasoning_effort` string. Unknown efforts
-/// (model-dependent spec values like "xhigh") fall back to the default budget.
-pub fn effortBudget(effort: []const u8, default_budget: i32) i32 {
-    if (std.mem.eql(u8, effort, "minimal")) return 1024;
-    if (std.mem.eql(u8, effort, "low")) return 2048;
-    if (std.mem.eql(u8, effort, "medium")) return 8192;
-    return default_budget;
+    return .{ .enable = true, .budget = default_budget, .effort = word };
 }
 
 // ─── text.format → schema constraint ──────────────────────────────────────
@@ -1187,9 +1177,11 @@ pub const ResponseStore = struct {
 const testing = std.testing;
 
 test "parseReasoning maps effort levels" {
+    // A word enables thinking at the default budget: it never caps thinking.
     const v_low = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"low\"}", .{});
     defer v_low.deinit();
-    try testing.expectEqual(@as(i32, 2048), parseReasoning(v_low.value, -1).budget);
+    try testing.expectEqual(@as(i32, -1), parseReasoning(v_low.value, -1).budget);
+    try testing.expectEqual(@as(i32, 300), parseReasoning(v_low.value, 300).budget);
 
     // high is uncapped: the default budget rides through.
     const v_high = try std.json.parseFromSlice(std.json.Value, testing.allocator, "{\"effort\":\"high\"}", .{});

@@ -260,7 +260,7 @@ A model whose table declares `SpeechHooks` (LFM3-Audio, LFM3-Omni) answers in sp
 
 `~/.mlx-serve/generation-settings.json` holds global rules, `{"temperature": {"value": 0.8}, "reasoning_budget": {"value": 1024, "ignore_client": true}}`; a model's entry in `model-settings.json` carries the same object under `generation_defaults`, and its `chat_template_kwargs` `enable_thinking`/`reasoning_effort` fill rules it leaves unset. Model rules replace global ones field by field. A rule fills a field the request omits; `ignore_client` makes it replace the request's value. Both files are read per request through `model_settings.Cache` (mtime-checked), so an edit applies to the next request. A malformed profile is logged and ignored, never a refused request.
 
-The `reasoning_budget` rule stands in for `--reasoning-budget`: effort words map against it (`xhigh` is capped by it, `medium` keeps 8192); forced, it replaces the final budget. Enforcement is the ordinary `think_bound`. A forced `enable_thinking`/`reasoning_effort` ignores the request's thinking switches; raw `/v1/completions` has no thinking and ignores those rules. The app migrates only its old server-wide values (`--temp`/`--top-p`/`--top-k`) into the global file, once.
+The `reasoning_budget` rule stands in for `--reasoning-budget`: every effort word takes it (a word never sets a budget of its own); forced, it replaces the final budget. Enforcement is the ordinary `think_bound`. A forced `enable_thinking`/`reasoning_effort` ignores the request's thinking switches; raw `/v1/completions` has no thinking and ignores those rules. The app migrates only its old server-wide values (`--temp`/`--top-p`/`--top-k`) into the global file, once.
 
 ## Anthropic Messages API (`/v1/messages`)
 

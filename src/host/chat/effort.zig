@@ -10,19 +10,6 @@ const templateRequiresReasoningField = @import("serialize.zig").templateRequires
 const serializeMessagesJsonFor = @import("serialize.zig").serializeMessagesJsonFor;
 const appendJsonString = @import("../../sdk/util/json_text.zig").appendJsonString;
 
-/// Whether the template READS `reasoning_effort` — i.e. the word is a
-/// BEHAVIORAL lever on this checkpoint (dsv4's preamble, Qwen3.8's and
-/// Inkling's effort arms) rather than a string we hand over and it ignores.
-/// Where it is, the server must NOT also derive a token budget from the same
-/// word: the budget only truncates what the client is shown, so the two
-/// levers fight — pi asking for `medium` on Qwen3.8 got the model's default
-/// (unguided, long) thinking AND a 2048-token display cut, then 25.9k tokens
-/// of invisible generation. An explicit
-/// `reasoning_budget_tokens` or `--reasoning-budget` is someone asking for a
-/// cap on purpose and still applies.
-///
-/// Substring on the KEY, so a family reading a different one is untouched:
-/// muse's `reasoning_strength` is a near-miss the corpus pins.
 /// Qwen3.8's effort vocabulary (xhigh|medium|low); `qwen38EffortFor` maps an
 /// absent effort to low on this family.
 pub fn isQwen38EffortTemplate(tpl: []const u8) bool {
@@ -33,10 +20,6 @@ pub fn isQwen38EffortTemplate(tpl: []const u8) bool {
 /// Kolibri-1's template: the one place that names its private effort variable.
 pub fn isKolibriEffortTemplate(tpl: []const u8) bool {
     return std.mem.indexOf(u8, tpl, "_sv_reasoning_effort") != null;
-}
-
-pub fn templateConsumesEffort(tpl: []const u8) bool {
-    return std.mem.indexOf(u8, tpl, "reasoning_effort") != null;
 }
 
 /// OpenAI's effort vocabulary → DeepSeek's low|high|max. `medium` maps to
@@ -285,24 +268,6 @@ pub fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const C
 }
 
 // ── tests ──
-
-test "templateConsumesEffort: the real templates that READ the effort word" {
-    // The three families whose templates act on `reasoning_effort`. For these
-    // the word is the lever and an effort-derived TOKEN budget on top is pure
-    // truncation (see the fn doc).
-    try testing.expect(templateConsumesEffort(@embedFile("../../fixtures/qwen38_chat_template.jinja")));
-    try testing.expect(templateConsumesEffort(@embedFile("../../fixtures/qwen38_27b_chat_template.jinja")));
-    try testing.expect(templateConsumesEffort(@embedFile("../../fixtures/dsv4_chat_template.jinja")));
-    try testing.expect(templateConsumesEffort(@embedFile("../../fixtures/inkling_chat_template.jinja")));
-
-    // Muse reads `reasoning_strength` — the near-miss. Matching it would strip
-    // the budget from a family the word never reaches, silently uncapping it.
-    try testing.expect(!templateConsumesEffort(@embedFile("../../fixtures/muse_chat_template.jinja")));
-    // Everything else on disk (gemma 4, LFM2.5, Qwen3.5/3.6, laguna, Ling,
-    // Nemotron, llama, mistral) reads neither: thinking is a bool there.
-    try testing.expect(!templateConsumesEffort("{%- if enable_thinking %}<think>\n{%- endif %}"));
-    try testing.expect(!templateConsumesEffort(""));
-}
 
 test "serializeExtraContext with thinking enabled" {
     const allocator = testing.allocator;

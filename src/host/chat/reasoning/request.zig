@@ -10,7 +10,6 @@ const rp_mod = @import("../../../sdk/grammar/protocol.zig");
 const abi = @import("../../../abi/plugin.zig");
 const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
 const log = @import("../../../sdk/util/log.zig");
-const responses_mod = @import("../../api/responses/model.zig");
 const model_registry_mod = @import("../../registry/registry.zig");
 const Tokenizer = tokenizer_mod.Tokenizer;
 const LoadedModel = model_registry_mod.LoadedModel;
@@ -57,13 +56,6 @@ fn atomicTokenId(allocator: std.mem.Allocator, tok: *const Tokenizer, text: []co
     const ids = tok.encode(allocator, text) catch return null;
     defer allocator.free(ids);
     return if (ids.len == 1) ids[0] else null;
-}
-
-/// The in-stream thinking bound needs atomic think markers (bare `<think>`
-/// family, or a pack that aliases its own markers onto it).
-fn thinkMarkersAtomic(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
-    if (lm.transformer == null) return false;
-    return tok.marker_closers != null or atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER) != null;
 }
 
 /// Qwen's own thinking-budget recipe: the model is told time is up, then the
@@ -294,35 +286,8 @@ pub fn resolveReasoningProtocol(
 /// enable/budget.
 const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null };
 
-/// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
-/// low | medium | high | xhigh — values are model-dependent, so unknown
-/// strings still enable). "none" is an explicit off (the gpt-5.1 default
-/// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
-/// stays in charge and existing clients see zero behavior change.
-/// The effort word is the ONLY lever when the template reads it and no
-/// decode-time bound can enforce a budget derived from it (a budget that is
-/// only a delivery cap fights the word: `chat.templateConsumesEffort`).
-pub fn effortWordOnly(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer) bool {
-    const cc = lm.chat_config orelse return false;
-    return chat_mod.templateConsumesEffort(cc.chat_template) and !thinkMarkersAtomic(allocator, lm, tok);
-}
-
-/// A request that thinks without naming an effort renders as "low" on the
-/// Qwen3.8 family (`chat.qwen38EffortFor`), so it gets low's budget too; the
-/// "keep it brief" preamble alone does not stop a model (a pi turn on a 2-bit
-/// Bonsai thought for 6k tokens). `--reasoning-budget` still wins.
-fn implicitEffortBudget(template: []const u8, markers_atomic: bool, default_budget: i32) i32 {
-    if (default_budget >= 0 or !markers_atomic or !chat_mod.isQwen38EffortTemplate(template)) return default_budget;
-    return responses_mod.effortBudget("low", default_budget);
-}
-
-pub fn implicitEffortBudgetFor(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, default_budget: i32) i32 {
-    const cc = lm.chat_config orelse return default_budget;
-    return implicitEffortBudget(cc.chat_template, thinkMarkersAtomic(allocator, lm, tok), default_budget);
-}
-
-/// The request's `--reasoning-budget`: the generation-defaults budget rule replaces the flag,
-/// and effort words map against it exactly as they map against the flag.
+/// The request's `--reasoning-budget`: the generation-defaults budget rule replaces the flag; every effort word
+/// takes it.
 pub fn defaultReasoningBudget(gen: generation_settings.Profile) i32 {
     return gen.value(i32, .reasoning_budget) orelse http_server.serverState().server_config.default_reasoning_budget;
 }
@@ -339,26 +304,23 @@ fn requestField(root: std.json.ObjectMap, name: []const u8) ?std.json.Value {
     return if (kw == .object) kw.object.get(name) else null;
 }
 
-fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32, template_consumes_effort: bool) ?ReasoningEffort {
+/// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
+/// low | medium | high | xhigh — values are model-dependent, so unknown
+/// strings still enable). "none" is an explicit off (the gpt-5.1 default
+/// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
+/// stays in charge and existing clients see zero behavior change.
+fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32) ?ReasoningEffort {
     const v = requestField(root, "reasoning_effort") orelse return null;
     if (v != .string) return null;
-    return reasoningEffortFromWord(v.string, default_budget, template_consumes_effort);
+    return reasoningEffortFromWord(v.string, default_budget);
 }
 
 /// One effort word → one thinking config, whatever field carried the word —
 /// OpenAI's flat `reasoning_effort` and Anthropic's `output_config.effort`
-/// must not drift on what "low" means.
-pub fn reasoningEffortFromWord(word: []const u8, default_budget: i32, template_consumes_effort: bool) ReasoningEffort {
-    if (std.mem.eql(u8, word, "none")) return .{ .enable = false, .budget = default_budget, .effort = word };
-    // Where the TEMPLATE reads the effort word, the word is the behavioral
-    // lever and a budget derived from the same string is pure display
-    // truncation on top of it (`chat.templateConsumesEffort`). An explicit
-    // `--reasoning-budget` still rides `default_budget`.
-    const budget = if (template_consumes_effort)
-        default_budget
-    else
-        responses_mod.effortBudget(word, default_budget);
-    return .{ .enable = true, .budget = budget, .effort = word };
+/// must not drift on what "low" means. A word reaches the template and never caps thinking (other engines cut no
+/// thought for it): only a number someone set, `default_budget`, does.
+pub fn reasoningEffortFromWord(word: []const u8, default_budget: i32) ReasoningEffort {
+    return .{ .enable = !std.mem.eql(u8, word, "none"), .budget = default_budget, .effort = word };
 }
 
 /// Anthropic `output_config` — the 2026 spelling Claude Code sends: `effort`
@@ -416,11 +378,11 @@ const ChatThinking = struct { enable: bool, effort: ?ReasoningEffort };
 /// `chat_template_kwargs` thinking keys among them) act as a default request, consulted only
 /// when the request names neither; then the arch. A forced thinking or effort rule replaces the
 /// request's switches.
-pub fn resolveThinking(gen: generation_settings.Profile, enable: ?bool, request: ?ReasoningEffort, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
+pub fn resolveThinking(gen: generation_settings.Profile, enable: ?bool, request: ?ReasoningEffort, arch_default: bool, default_budget: i32) ChatThinking {
     const ignore = gen.forced(.enable_thinking) or gen.forced(.reasoning_effort);
     const req_effort = if (ignore) null else request;
     const model: ?ReasoningEffort = if (gen.value(generation_settings.Effort, .reasoning_effort)) |e|
-        reasoningEffortFromWord(@tagName(e), default_budget, word_only)
+        reasoningEffortFromWord(@tagName(e), default_budget)
     else
         null;
     const on = if (gen.forced(.enable_thinking))
@@ -432,9 +394,9 @@ pub fn resolveThinking(gen: generation_settings.Profile, enable: ?bool, request:
     return .{ .enable = on, .effort = req_effort orelse modelEffortIfThinking(model, on) };
 }
 
-pub fn resolveChatThinking(root: std.json.ObjectMap, gen: generation_settings.Profile, arch_default: bool, default_budget: i32, word_only: bool) ChatThinking {
+pub fn resolveChatThinking(root: std.json.ObjectMap, gen: generation_settings.Profile, arch_default: bool, default_budget: i32) ChatThinking {
     const enable: ?bool = if (requestField(root, "enable_thinking")) |v| (if (v == .bool) v.bool else null) else null;
-    return resolveThinking(gen, enable, parseReasoningEffort(root, default_budget, word_only), arch_default, default_budget, word_only);
+    return resolveThinking(gen, enable, parseReasoningEffort(root, default_budget), arch_default, default_budget);
 }
 
 const SchemaThinkingPolicy = enum {
@@ -468,14 +430,6 @@ pub fn schemaMasksThinking(
 
 // ── tests ──
 
-test "implicitEffortBudget: silence on the Qwen3.8 family gets low's budget" {
-    const qwen38 = "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}";
-    try std.testing.expectEqual(@as(i32, 2048), implicitEffortBudget(qwen38, true, -1));
-    try std.testing.expectEqual(@as(i32, 512), implicitEffortBudget(qwen38, true, 512)); // --reasoning-budget wins
-    try std.testing.expectEqual(@as(i32, -1), implicitEffortBudget(qwen38, false, -1)); // no bound to arm
-    try std.testing.expectEqual(@as(i32, -1), implicitEffortBudget("{{ reasoning_effort }}", true, -1));
-}
-
 test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinking + budget" {
     const allocator = std.testing.allocator;
     const cases = [_]struct { body: []const u8, expect: ?ReasoningEffort }{
@@ -485,10 +439,10 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
         .{ .body = "{\"reasoning_effort\":42}", .expect = null },
         // "none" is an explicit OFF (gpt-5.1 default), never an enable.
         .{ .body = "{\"reasoning_effort\":\"none\"}", .expect = .{ .enable = false, .budget = -1 } },
-        // Known efforts enable thinking with the shared Responses budget map.
-        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .expect = .{ .enable = true, .budget = 1024 } },
-        .{ .body = "{\"reasoning_effort\":\"low\"}", .expect = .{ .enable = true, .budget = 2048 } },
-        .{ .body = "{\"reasoning_effort\":\"medium\"}", .expect = .{ .enable = true, .budget = 8192 } },
+        // Every effort enables thinking at the launch budget: a word never caps thinking.
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .expect = .{ .enable = true, .budget = -1 } },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .expect = .{ .enable = true, .budget = -1 } },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .expect = .{ .enable = true, .budget = -1 } },
         .{ .body = "{\"reasoning_effort\":\"high\"}", .expect = .{ .enable = true, .budget = -1 } },
         // Unknown efforts (xhigh, future values) enable with the default
         // budget — spec values are model-dependent, never reject them.
@@ -497,7 +451,7 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        const got = parseReasoningEffort(parsed.value.object, -1, false);
+        const got = parseReasoningEffort(parsed.value.object, -1);
         if (case.expect) |want| {
             try std.testing.expectEqual(want.enable, got.?.enable);
             try std.testing.expectEqual(want.budget, got.?.budget);
@@ -511,42 +465,21 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
     }
 }
 
-test "parseReasoningEffort: a template that READS the effort word gets no budget from it unless a decode-time bound can enforce it" {
-    // Two levers, one word. Where the template acts on `reasoning_effort` the
-    // word already shortens the THOUGHT; a budget that is only a delivery cap
-    // fights it: pi asking Qwen3.8 for `medium` got the model's unguided (long)
-    // thinking AND a 2048-token cut, followed by 25.9k tokens of invisible
-    // generation. The third argument is `effortWordOnly`:
-    // true when the template reads the word AND `armThinkBound` cannot close
-    // the thought at the budget (non-atomic markers). With atomic markers the
-    // budget is enforced in-stream and the word maps like everywhere else.
-    // An EXPLICIT cap is someone asking on purpose and still applies — that is
-    // `default_budget` here, which carries `--reasoning-budget`.
+test "parseReasoningEffort: no word caps thinking; --reasoning-budget binds whatever the word" {
     const allocator = std.testing.allocator;
-    const cases = [_]struct { body: []const u8, consumes: bool, default_budget: i32, want: i32 }{
-        // Consuming template (qwen3.8 / dsv4 / inkling): no effort-derived cap.
-        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = -1, .want = -1 },
-        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = true, .default_budget = -1, .want = -1 },
-        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = true, .default_budget = -1, .want = -1 },
-        // ...but `--reasoning-budget` still binds there.
-        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = true, .default_budget = 4096, .want = 4096 },
-        // Non-consuming template (gemma 4, LFM2.5, Qwen3.5/3.6, muse, laguna,
-        // Ling): the effort word reaches no template, so the budget is the ONLY
-        // thing it does and every mapping stays exactly as it shipped.
-        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .consumes = false, .default_budget = -1, .want = 1024 },
-        .{ .body = "{\"reasoning_effort\":\"low\"}", .consumes = false, .default_budget = -1, .want = 2048 },
-        .{ .body = "{\"reasoning_effort\":\"medium\"}", .consumes = false, .default_budget = -1, .want = 8192 },
-        // high and xhigh are uncapped: pi's own ladder is 2048 / 8192 / 16384.
-        .{ .body = "{\"reasoning_effort\":\"high\"}", .consumes = false, .default_budget = -1, .want = -1 },
-        .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .consumes = false, .default_budget = -1, .want = -1 },
+    const cases = [_]struct { body: []const u8, default_budget: i32 }{
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .default_budget = -1 },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .default_budget = -1 },
+        .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .default_budget = -1 },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .default_budget = 4096 },
     };
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        const got = parseReasoningEffort(parsed.value.object, case.default_budget, case.consumes).?;
+        const got = parseReasoningEffort(parsed.value.object, case.default_budget).?;
         try std.testing.expect(got.enable);
-        try std.testing.expectEqual(case.want, got.budget);
-        // The raw string rides along either way — the template still renders it.
+        try std.testing.expectEqual(case.default_budget, got.budget);
+        // The raw string rides along: a template that reads it still renders it.
         try std.testing.expectEqualStrings(parsed.value.object.get("reasoning_effort").?.string, got.effort.?);
     }
 }
@@ -607,18 +540,14 @@ test "parseAnthropicOutputConfig: absent, non-object, and non-schema shapes stay
 
 test "reasoningEffortFromWord: none disables, words budget exactly like the OpenAI surface" {
     // "none" is an explicit off with the word kept for the template.
-    const off = reasoningEffortFromWord("none", -1, false);
+    const off = reasoningEffortFromWord("none", -1);
     try std.testing.expect(!off.enable);
     try std.testing.expectEqualStrings("none", off.effort.?);
-    // A word maps through the ONE effortBudget table…
-    const low = reasoningEffortFromWord("low", -1, false);
+    // A word enables thinking and keeps the launch budget: it never caps thinking.
+    const low = reasoningEffortFromWord("low", -1);
     try std.testing.expect(low.enable);
-    try std.testing.expectEqual(@as(i32, 2048), low.budget);
-    // …unless the template consumes the word (qwen3.8 class): then the word is
-    // the lever and the budget stays the launch default.
-    const consumed = reasoningEffortFromWord("low", -1, true);
-    try std.testing.expect(consumed.enable);
-    try std.testing.expectEqual(@as(i32, -1), consumed.budget);
+    try std.testing.expectEqual(@as(i32, -1), low.budget);
+    try std.testing.expectEqual(@as(i32, 512), reasoningEffortFromWord("minimal", 512).budget);
 }
 
 test "resolveChatThinking: an explicit request value outranks the arch default, silence takes it" {
@@ -644,7 +573,7 @@ test "resolveChatThinking: an explicit request value outranks the arch default, 
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        try std.testing.expectEqual(case.want, resolveChatThinking(parsed.value.object, .{}, case.arch, -1, false).enable);
+        try std.testing.expectEqual(case.want, resolveChatThinking(parsed.value.object, .{}, case.arch, -1).enable);
     }
 }
 
@@ -675,7 +604,7 @@ test "resolveChatThinking: the request decides, the generation-defaults rules fi
         var gen = generation_settings.Profile{};
         if (case.model_on) |on| gen.set(.enable_thinking, .{ .boolean = on }, case.force);
         if (case.model_effort) |e| gen.set(.reasoning_effort, .{ .effort = e }, case.force);
-        const got = resolveChatThinking(parsed.value.object, gen, case.arch, -1, false);
+        const got = resolveChatThinking(parsed.value.object, gen, case.arch, -1);
         try std.testing.expectEqual(case.want, got.enable);
         if (case.effort) |w| try std.testing.expectEqualStrings(w, got.effort.?.effort.?) else try std.testing.expect(got.effort == null);
     }
@@ -683,26 +612,24 @@ test "resolveChatThinking: the request decides, the generation-defaults rules fi
 
 test "resolveThinking: forced effort outranks unforced thinking defaults" {
     inline for (.{ false, true }) |arch_default| {
-        inline for (.{ false, true }) |word_only| {
             var gen = generation_settings.Profile{};
             gen.set(.enable_thinking, .{ .boolean = true }, false);
             gen.set(.reasoning_effort, .{ .effort = .none }, true);
-            const off = resolveThinking(gen, false, reasoningEffortFromWord("high", -1, word_only), arch_default, -1, word_only);
+            const off = resolveThinking(gen, false, reasoningEffortFromWord("high", -1), arch_default, -1);
             try std.testing.expect(!off.enable);
             try std.testing.expect(off.effort == null);
 
             gen.set(.enable_thinking, .{ .boolean = false }, false);
             gen.set(.reasoning_effort, .{ .effort = .low }, true);
-            const on = resolveThinking(gen, false, reasoningEffortFromWord("none", -1, word_only), arch_default, -1, word_only);
+            const on = resolveThinking(gen, false, reasoningEffortFromWord("none", -1), arch_default, -1);
             try std.testing.expect(on.enable);
             try std.testing.expectEqualStrings("low", on.effort.?.effort.?);
 
             gen.set(.enable_thinking, .{ .boolean = false }, true);
-            try std.testing.expect(!resolveThinking(gen, true, null, arch_default, -1, word_only).enable);
+            try std.testing.expect(!resolveThinking(gen, true, null, arch_default, -1).enable);
             gen.set(.enable_thinking, .{ .boolean = true }, true);
             gen.set(.reasoning_effort, .{ .effort = .none }, true);
-            try std.testing.expect(resolveThinking(gen, false, null, arch_default, -1, word_only).enable);
-        }
+            try std.testing.expect(resolveThinking(gen, false, null, arch_default, -1).enable);
     }
 }
 
@@ -733,9 +660,9 @@ test "reasoning budget: the rule stands in for --reasoning-budget, forced it rep
     try std.testing.expectEqual(http_server.serverState().server_config.default_reasoning_budget, defaultReasoningBudget(gen));
     gen.set(.reasoning_budget, .{ .number = 1024 }, false);
     try std.testing.expectEqual(@as(i32, 1024), defaultReasoningBudget(gen));
-    // xhigh maps to the default budget, so an unforced rule caps it; medium keeps its own.
-    try std.testing.expectEqual(@as(i32, 1024), reasoningEffortFromWord("xhigh", defaultReasoningBudget(gen), false).budget);
-    try std.testing.expectEqual(@as(i32, 8192), forcedReasoningBudget(gen, reasoningEffortFromWord("medium", 1024, false).budget));
+    // Every word takes the default budget, so an unforced rule caps it.
+    try std.testing.expectEqual(@as(i32, 1024), reasoningEffortFromWord("xhigh", defaultReasoningBudget(gen)).budget);
+    try std.testing.expectEqual(@as(i32, 1024), forcedReasoningBudget(gen, reasoningEffortFromWord("medium", defaultReasoningBudget(gen)).budget));
     gen.set(.reasoning_budget, .{ .number = 16 }, true);
     try std.testing.expectEqual(@as(i32, 16), forcedReasoningBudget(gen, 32000));
 }
