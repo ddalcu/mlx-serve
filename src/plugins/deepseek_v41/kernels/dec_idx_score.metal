@@ -26,13 +26,13 @@ const ushort f4 = (qid & 2) | (lane & 1);
 // The row's right operands, one per step of 16 contracted channels.
 auto ct_a = op.get_left_input_cooperative_tensor<bfloat, bfloat, float>();
 auto ct_b0 = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
-auto ct_b1 = ct_b0;
-auto ct_b2 = ct_b0;
-auto ct_b3 = ct_b0;
-auto ct_b4 = ct_b0;
-auto ct_b5 = ct_b0;
-auto ct_b6 = ct_b0;
-auto ct_b7 = ct_b0;
+auto ct_b1 = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+auto ct_b2 = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+auto ct_b3 = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+auto ct_b4 = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+auto ct_b5 = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+auto ct_b6 = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
+auto ct_b7 = op.get_right_input_cooperative_tensor<bfloat, bfloat, float>();
 auto ct_c = op.get_destination_cooperative_tensor<metal::remove_addrspace_t<decltype(ct_a)>, metal::remove_addrspace_t<decltype(ct_b0)>, float>();
 #define LOAD_B(KS, CT) { \
   const int d0_ = ((KS) >> 1) * 32 + f4 * 8 + ((KS) & 1) * 4; \
