@@ -2418,3 +2418,4 @@
 "Rebuild" = "다시 빌드";
 "Not in the catalog: rebuild it from its source with this release's kit" = "카탈로그에 없음: 이 릴리스의 키트로 소스에서 다시 빌드하세요";
 "Needs rebuild" = "다시 빌드 필요";
+"Branch" = "브랜치";

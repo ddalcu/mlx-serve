@@ -32,6 +32,8 @@ final class PackUpdateTargetTests: XCTestCase {
                        .check(repo: "real/repo", selection: .chat(drafter: false)))
         XCTAssertEqual(PackUpdateCheck.target(for: model("org/m-4bit"), marker: PackSource(repo: "org/m", subfolder: "4bit"), drafterOff: false),
                        .check(repo: "org/m", selection: .variant("4bit")))
+        XCTAssertEqual(PackUpdateCheck.target(for: model("org/m-2bit"), marker: PackSource(repo: "org/m", revision: "2bit"), drafterOff: true),
+                       .check(repo: "org/m", revision: "2bit", selection: .chat(drafter: false)), "a branch download checks its branch")
     }
 
     func testAGgufQuantChecksOnlyItsOwnShards() {
@@ -45,7 +47,7 @@ final class PackUpdateTargetTests: XCTestCase {
     }
 
     func testAMediaModelChecksItsFamilySelection() {
-        guard case .check(let repo, .media(let sel)) = PackUpdateCheck.target(for: model(type: "flux2"), marker: nil, drafterOff: false) else {
+        guard case .check(let repo, _, .media(let sel)) = PackUpdateCheck.target(for: model(type: "flux2"), marker: nil, drafterOff: false) else {
             return XCTFail("a FLUX pack resolves to its bundle's selection")
         }
         XCTAssertEqual(repo, "org/m")
@@ -76,6 +78,11 @@ final class PackUpdateTargetTests: XCTestCase {
         XCTAssertNil(PackSource.read(dir: dir))
         PackSource(repo: "org/m", subfolder: "4bit").write(dir: dir)
         XCTAssertEqual(PackSource.read(dir: dir), PackSource(repo: "org/m", subfolder: "4bit"))
+        PackSource(repo: "org/m", revision: "2bit", commit: "abc").write(dir: dir)
+        XCTAssertEqual(PackSource.read(dir: dir)?.source, HFSource(repo: "org/m", revision: "2bit"))
+        XCTAssertEqual(PackSource.read(dir: dir)?.commit, "abc")
+        XCTAssertEqual(try JSONDecoder().decode(PackSource.self, from: Data(#"{"repo":"org/m"}"#.utf8)).source, HFSource(repo: "org/m"),
+                       "a marker written before branches reads as main")
     }
 
     func testTheSweepAlertListsOnlyModelsWithAnUpdate() {

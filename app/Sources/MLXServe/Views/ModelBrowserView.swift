@@ -613,6 +613,10 @@ private struct RecommendedModelTableRow: View {
 private struct DiscoverPane: View {
     @EnvironmentObject var searchService: HFSearchService
     @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+    /// A pasted `org/repo@<branch>` or `/tree/<branch>` URL opens its card on that branch.
+    @State private var opened: ModelCardRequest?
 
     /// Measured pane width → column tier. 0 until the first layout pass,
     /// which `ModelBrowserMetrics.tier` treats as roomy.
@@ -735,6 +739,12 @@ private struct DiscoverPane: View {
             }
         )
         .navigationTitle("Discover")
+        .onChange(of: searchService.openedSource) { _, source in
+            guard let source else { return }
+            let title = source.repo.split(separator: "/").last.map(String.init) ?? source.repo
+            opened = ModelCardRequest(repoId: source.repo, title: title, revision: source.revision, picksBranch: true)
+        }
+        .sheet(item: $opened) { ModelDetailSheet(request: $0).environmentObject(downloads).environmentObject(appState).environmentObject(server) }
     }
 }
 
@@ -1425,7 +1435,7 @@ private struct ModelBrowserRow: View {
     var body: some View {
         HStack(spacing: ModelBrowserMetrics.columnSpacing) {
             // Model name — takes all remaining space; click opens the card.
-            Button { card = ModelCardRequest(repoId: model.id, title: model.modelName) } label: {
+            Button { card = ModelCardRequest(repoId: model.id, title: model.modelName, picksBranch: true) } label: {
             VStack(alignment: .leading, spacing: 1) {
                 Text(L10n.text(model.modelName))
                     .font(.app(.callout).weight(.medium))
@@ -1511,7 +1521,7 @@ private struct ModelBrowserRow: View {
         .padding(.horizontal, ModelBrowserMetrics.rowPaddingH)
         .padding(.vertical, 6)
         .opacity(disabled ? 0.4 : 1.0)
-        .sheet(item: $card) { ModelDetailSheet(request: $0) }
+        .sheet(item: $card) { ModelDetailSheet(request: $0).environmentObject(downloads).environmentObject(appState).environmentObject(server) }
     }
 
     private var fitnessColor: Color {
@@ -2023,11 +2033,15 @@ private struct LocalModelRow: View {
         ModelSettingsRequest(path: model.path, title: ModelDisplayName.pretty(model.displayLabel))
     }
 
-    /// nil for a bare folder that maps to no Hugging Face repo.
+    /// nil for a bare folder that maps to no Hugging Face repo. A branch
+    /// download's marker names its repo and branch, which its folder name is not;
+    /// read on click, never per render.
     private var cardRequest: ModelCardRequest? {
-        ModelCard.repoId(localName: model.name).map {
-            ModelCardRequest(repoId: $0, title: ModelDisplayName.pretty(model.displayLabel))
+        let title = ModelDisplayName.pretty(model.displayLabel)
+        if model.quantFile == nil, let marker = PackSource.read(dir: model.path), marker.subfolder == nil {
+            return ModelCardRequest(repoId: marker.repo, title: title, revision: marker.revision)
         }
+        return ModelCard.repoId(localName: model.name).map { ModelCardRequest(repoId: $0, title: title) }
     }
 
     private var useState: ModelUseState {
@@ -2064,7 +2078,9 @@ private struct LocalModelRow: View {
         guard let update = downloads.packUpdates[model.name] else { return nil }
         let drafter = downloads.packListings[model.name]?.keys.contains { $0.hasPrefix(DrafterGems.packFolder + "/") } ?? false
         let off = ModelSettingsFile.load().override(for: model.path)?.drafter == "off"
-        return UpdateCheck(result: .update(update), repo: model.name, dir: model.path, selection: .chat(drafter: drafter && !off))
+        let source = PackUpdateCheck.listingSource(name: model.name, dir: model.path)
+        return UpdateCheck(result: .update(update), repo: source.repo, revision: source.revision, dir: model.path,
+                           selection: .chat(drafter: drafter && !off))
     }
 
     private func applyUpdate(_ check: UpdateCheck) {
@@ -2165,7 +2181,7 @@ private struct LocalModelRow: View {
             .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .disabled(cardRequest == nil)
+            .disabled(ModelCard.repoId(localName: model.name) == nil)
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if showsSettings {
@@ -2319,7 +2335,7 @@ private struct LocalModelRow: View {
                 } label: { Text("Use This Model")
                     .font(.app(.body)) }
             }
-            if cardRequest != nil {
+            if ModelCard.repoId(localName: model.name) != nil {
                 Button { card = cardRequest } label: { Text("Model Details\u{2026}")
                     .font(.app(.body)) }
             }
@@ -2422,7 +2438,8 @@ private struct ActiveDownloadRow: View {
                 .frame(width: 116, alignment: .trailing)
             } else if state.status == .failed {
                 Button {
-                    downloads.start(repoId: repoId) { appState.refreshModels() }
+                    let source = downloads.branchSources[repoId] ?? HFSource(repo: repoId)
+                    downloads.start(repoId: source.repo, revision: source.revision) { appState.refreshModels() }
                 } label: { Text(L10n.text(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry"))
                     .font(.app(.body)) }
                 .font(.app(.callout))

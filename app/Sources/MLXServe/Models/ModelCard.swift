@@ -4,12 +4,12 @@ import Foundation
 /// live, how a local folder name maps back to a repo id, and the README
 /// front-matter strip. Kept out of the view so each is testable.
 enum ModelCard {
-    static func pageURL(repoId: String) -> URL? {
-        URL(string: "https://huggingface.co/\(repoId)")
+    static func pageURL(repoId: String, revision: String = "main") -> URL? {
+        HFSource(repo: repoId, revision: revision).pageURL
     }
 
-    static func readmeURL(repoId: String) -> URL? {
-        URL(string: "https://huggingface.co/\(repoId)/resolve/main/README.md")
+    static func readmeURL(repoId: String, revision: String = "main") -> URL? {
+        HFSource(repo: repoId, revision: revision).fileURL("README.md")
     }
 
     /// `org/repo` as-is; MTPLX's flat `Org--Name` folded back; a bare folder
@@ -38,5 +38,9 @@ enum ModelCard {
 struct ModelCardRequest: Identifiable, Hashable {
     let repoId: String
     let title: String
+    /// The branch whose card opens first (a pasted `/tree/<branch>` URL, a branch download).
+    var revision: String? = nil
+    /// Offers the repo's branches with their sizes and a download for the one picked.
+    var picksBranch = false
     var id: String { repoId }
 }
