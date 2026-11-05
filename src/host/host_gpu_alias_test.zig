@@ -1,8 +1,8 @@
-//! `HostGpu.alias` on the GPU, behind the `ALIAS_TEST_GPU` fixture (skipped otherwise: the CPU suite makes no Metal
-//! device here). An alias's bytes are its base's at its offset; a GPU kernel reads and writes them through it and an
-//! overlapping alias sees the write; MLX's active bytes do not move for an alias; the base's buffer is held until the
-//! last alias over it is freed; a misaligned offset, a range past the base and an unevaluated base are refused.
-//! `command_buffer_limits`' round trip runs without the fixture: it makes the Metal device and dispatches nothing.
+//! `HostGpu.alias` on the GPU, a device test behind `_GPU_WINDOW_LOCKED`. An alias's bytes are its base's at its
+//! offset; a GPU kernel reads and writes them through it and an overlapping alias sees the write; MLX's active bytes do
+//! not move for an alias; the base's buffer is held until the last alias over it is freed; a misaligned offset, a range
+//! past the base and an unevaluated base are refused. `command_buffer_limits`' round trip runs without the gate: it
+//! makes the Metal device and dispatches nothing.
 
 const std = @import("std");
 const abi = @import("../abi/host.zig");
@@ -14,7 +14,7 @@ const testing = std.testing;
 const has_shims = @import("build_options").mlx_stream;
 
 fn gate() !void {
-    if (!has_shims or !env.on(.ALIAS_TEST_GPU)) return error.SkipZigTest;
+    if (!has_shims or env.get(._GPU_WINDOW_LOCKED) == null) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
 }
 
@@ -102,7 +102,7 @@ fn complementInPlace(dst: mlx.mlx_array, n: usize, s: mlx.mlx_stream) !void {
     try mlx.check(mlx.mlx_synchronize(s));
 }
 
-test "builtin host gpu: an alias reads and writes its base's pages, holds the base, adds no active bytes (ALIAS_TEST_GPU)" {
+test "builtin host gpu: an alias reads and writes its base's pages, holds the base, adds no active bytes" {
     try gate();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -176,7 +176,6 @@ test "builtin host gpu: an alias reads and writes its base's pages, holds the ba
     _ = mlx.mlx_array_free(a2);
     a2_live = false;
     try testing.expectEqual(held - words * 4, active());
-    std.debug.print("[alias-test] words ok: read, write and overlap through aliases; active held={d} MiB, freed={d} MiB with the last alias\n", .{ held >> 20, (words * 4) >> 20 });
 }
 
 test "builtin host gpu: command_buffer_limits sets MLX's split and hands back the previous pair; below 1 keeps a value" {

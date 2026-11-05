@@ -476,7 +476,6 @@ test "keyed DSpark (GPU): k-row verify draws equal k sequential 1-row draws over
     const Cfg = struct { t: f32, p: f32, k: u32, min_p: ?f32 = null };
     const cfgs = [_]Cfg{ .{ .t = 1.0, .p = 0.95, .k = 20 }, .{ .t = 0.6, .p = 0.95, .k = 0 }, .{ .t = 1.3, .p = 1.0, .k = 0 }, .{ .t = 0.8, .p = 0.9, .k = 40, .min_p = 0.05 } };
     const widths = [_]usize{ 1, 2, 6, 8 };
-    var rows_checked: usize = 0;
     var flips: usize = 0;
     var case_i: u64 = 0;
     for (seeds) |seed| for (bases) |pb| for (cfgs) |cf| for (widths) |k| for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dt| {
@@ -539,9 +538,8 @@ test "keyed DSpark (GPU): k-row verify draws equal k sequential 1-row draws over
             const x = (mlx.mlx_array_data_int32(t32) orelse return error.MlxArrayDataNull)[0];
             if (x != vd[r]) {
                 flips += 1;
-                std.debug.print("keyed DSpark gate (a): seed {d} base {d} T {d} top_p {d} top_k {d} width {d} {s} row {d}: verify {d} vs 1-row {d}\n", .{ seed, pb, cf.t, cf.p, cf.k, k, @tagName(dt), r, vd[r], x });
+                std.debug.print("keyed DSpark: seed {d} base {d} T {d} top_p {d} top_k {d} width {d} {s} row {d}: verify {d} vs 1-row {d}\n", .{ seed, pb, cf.t, cf.p, cf.k, k, @tagName(dt), r, vd[r], x });
             }
-            rows_checked += 1;
         }
         // the accept over drafts equal to the draws up to a mismatch at j
         var drafts: [8]u32 = undefined;
@@ -553,7 +551,6 @@ test "keyed DSpark (GPU): k-row verify draws equal k sequential 1-row draws over
             try testing.expectEqual(@as(u32, @intCast(vd[j])), v.next_token);
         }
     };
-    std.debug.print("keyed DSpark gate (a): {d} rows over {d} cases, {d} differ\n", .{ rows_checked, case_i, flips });
     try testing.expectEqual(@as(usize, 0), flips);
 }
 
