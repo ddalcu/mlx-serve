@@ -7,10 +7,11 @@ decided: the measured default stays, the losing opt-in was deleted. Engine code 
 (`spec/`, `cache/`, `kv/`, `sampling/`, `generate/`), shared blocks and kernels under `src/sdk/blocks/` and
 `src/kernels/`.
 
-### ds4's disk-only n-grams are not resident weights
-Qwen GGUFs can keep a large BF16 n-gram table on disk. Billing the full file can refuse a model whose mapped
-weights and session fit. Carry the table's tensor byte count from `engine_pick` into ds4 routes, the load gate
-and the adapter's load/memory estimates; llama routes retain the full bill.
+### ds4's disk-only tails are not resident weights
+Qwen's BF16 n-grams and V4.1's encoded Engram rows live outside ds4's weight mapping. Billing the full file can
+refuse a model whose mapped weights and session fit. Deduct their tensor bytes only after the header's encoding,
+types, shapes, offsets, page alignment and file bounds satisfy the pinned native unmapping rules. Carry that
+count through ds4 routes, the load gate and adapter estimates; llama routes retain the full bill.
 Guards: `GGUF accounting` tests in the reader, CPU route, preflight and ds4 adapter.
 
 ## Sampling

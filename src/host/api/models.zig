@@ -366,7 +366,8 @@ pub fn renderModelEntry(
     // template is adopted at load), so advertise the chat capability set the
     // ready path would.
     const is_gguf_stub = std.mem.eql(u8, entry.arch_hint, "gguf");
-    const stub_context: u32 = if (is_gguf_stub) ggufContextCap(io, entry) else if (sm.found) sm.max_position_embeddings else 0;
+    const gguf_context = if (is_gguf_stub) ggufContextCap(io, entry) else 0;
+    const stub_context = if (gguf_context > 0) gguf_context else if (sm.found) sm.max_position_embeddings else 0;
     // Native media-gen stub (image/audio/video) — advertise the modality from
     // the discovery-peeked arch_hint so the app can find it before loading.
     const media_modality = media_mod.modalityFromType(entry.arch_hint);
@@ -1079,6 +1080,34 @@ test "GGUF accounting: an unloaded catalog row exposes the trained context witho
         try testing.expectEqual(@as(i64, 131072), row.get("meta").?.object.get("context_length").?.integer);
         try testing.expectEqual(@as(i64, 131072), row.get("agent_budget").?.object.get("context").?.integer);
     }
+}
+
+test "GGUF accounting: a zero header context retains the config context" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = try engine_pick.buildHeader(a, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "glm-dsa" } },
+        .{ .key = "glm-dsa.context_length", .value = .{ .u32_v = 0 } },
+    });
+    defer a.free(header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = header });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"llama\",\"max_position_embeddings\":24576}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const reg = try ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStubWithArch("stub", path, 0, "gguf");
+    const json = try renderModelEntry(a, io, entry);
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const row = parsed.value.object;
+    try testing.expectEqual(@as(i64, 24576), row.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 24576), row.get("max_model_len").?.integer);
+    try testing.expectEqual(@as(i64, 24576), row.get("meta").?.object.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 24576), row.get("agent_budget").?.object.get("context").?.integer);
 }
 
 test "an unloaded pack that sees and hears lists both, as its loaded row does" {

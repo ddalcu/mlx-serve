@@ -707,7 +707,8 @@ file`, `tests/test_llama_gguf.sh` [8].
 
 ### Unloaded GGUFs need their own context metadata
 GGUF-only entries have no `config.json`, so a catalog built from config stubs omits their trained window.
-Read `engine_pick.Info.context_length` once per entry and use it for the top-level, meta and agent-budget fields.
+Read `engine_pick.Info.context_length` once per entry and use it for the top-level, meta and agent-budget fields;
+a zero or unavailable GGUF window retains the context from a readable `config.json`.
 Guards: `an unloaded catalog row exposes the trained context`, `tests/test_gguf_context_catalog.sh`.
 
 ### MiniMax-H3 admitted a canvas it could not hold (#764)

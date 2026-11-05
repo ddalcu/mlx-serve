@@ -558,19 +558,9 @@ test "ds4 adapter: an explicit context is the session, never the trained window 
     try testing.expectEqual(@as(?u32, null), try openedContext(262144, 2 * FakeBridge.session_cap));
 }
 
-test "GGUF accounting: ds4 load and memory reports exclude disk-only n-grams" {
+test "GGUF accounting: ds4 load and memory reports exclude validated disk-only tensors" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
-    const header = try engine_pick.buildHeaderWithTensors(testing.allocator, &.{
-        .{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } },
-        .{ .key = "qwen4exp.context_length", .value = .{ .u32_v = 8192 } },
-    }, &.{.{ .name = "per_layer_token_embd.weight", .ggml_type = 30, .dims = &.{ 160, 1024 } }});
-    defer testing.allocator.free(header);
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = header });
-    const file = try tmp.dir.createFile(io, "model.gguf", .{ .truncate = false });
-    defer file.close(io);
-    const file_bytes: u64 = 1 << 20;
-    try file.setLength(io, file_bytes);
     var buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = buf[0..try tmp.dir.realPath(io, &buf)];
     const path = try std.fs.path.join(testing.allocator, &.{ root, "model.gguf" });
@@ -580,22 +570,41 @@ test "GGUF accounting: ds4 load and memory reports exclude disk-only n-grams" {
     }.f, .wake = struct {
         fn f(_: *anyopaque) callconv(.c) void {}
     }.f };
-    for ([_]u32{ 0, 4096 }) |asked| {
-        const o: abi.Open = .{ .model_dir = .of(path), .model_type = .{}, .config_json = .{}, .context = asked, .max_concurrent = 1, .memory_budget = 0, .settings_json = .{}, .options_json = .{}, .host = &host };
-        const context = if (asked == 0) 8192 else asked;
-        const expected = file_bytes - 160 * 1024 * 2 + FakeBridge.contextBytes(context);
-        var bill: u64 = 0;
-        try testing.expect(Fake.table.load_bytes(&o, &bill).isOk());
-        try testing.expectEqual(expected, bill);
-        var info: abi.Info = undefined;
-        var verdict: abi.Verdict = .{};
-        const engine = Fake.table.open(&o, &info, &verdict) orelse return error.TestUnexpectedResult;
-        defer Fake.table.close(engine);
-        var memory: abi.Memory = .{};
-        Fake.table.memory(engine, &memory);
-        try testing.expectEqual(expected, memory.active);
-        try testing.expectEqual(expected, memory.peak);
-        try testing.expectEqual(context, info.context_window);
+    for ([_]bool{ false, true }) |engram| {
+        const tensors = [_]engine_pick.TensorInfo{
+            .{ .name = if (engram) "blk.1.engram_embd.weight" else "per_layer_token_embd.weight", .ggml_type = if (engram) 24 else 30, .dims = if (engram) &.{ 264, 1024 } else &.{ 160, 1024 } },
+            .{ .name = "blk.14.engram_embd.weight", .ggml_type = 24, .dims = &.{ 264, 1024 }, .offset = 1 << 19 },
+        };
+        const header = try engine_pick.buildHeaderWithTensors(testing.allocator, &.{
+            .{ .key = "general.architecture", .value = .{ .str = if (engram) "deepseek41" else "qwen4exp" } },
+            .{ .key = if (engram) "deepseek41.context_length" else "qwen4exp.context_length", .value = .{ .u32_v = 8192 } },
+            .{ .key = "general.alignment", .value = .{ .u32_v = @intCast(std.heap.pageSize()) } },
+            .{ .key = "deepseek41.engram.encoding", .value = .{ .str = "e4m3_e8m0_32_row264" } },
+        }, tensors[0..@as(usize, if (engram) 2 else 1)]);
+        defer testing.allocator.free(header);
+        try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = header });
+        const file = try tmp.dir.createFile(io, "model.gguf", .{ .truncate = false });
+        defer file.close(io);
+        const file_bytes: u64 = 1 << 20;
+        try file.setLength(io, file_bytes);
+        for ([_]u32{ 0, 4096 }) |asked| {
+            const o: abi.Open = .{ .model_dir = .of(path), .model_type = .{}, .config_json = .{}, .context = asked, .max_concurrent = 1, .memory_budget = 0, .settings_json = .{}, .options_json = .{}, .host = &host };
+            const context = if (asked == 0) 8192 else asked;
+            const disk_bytes: u64 = if (engram) 2 * 264 * 1024 else 160 * 1024 * 2;
+            const expected = file_bytes - disk_bytes + FakeBridge.contextBytes(context);
+            var bill: u64 = 0;
+            try testing.expect(Fake.table.load_bytes(&o, &bill).isOk());
+            try testing.expectEqual(expected, bill);
+            var info: abi.Info = undefined;
+            var verdict: abi.Verdict = .{};
+            const engine = Fake.table.open(&o, &info, &verdict) orelse return error.TestUnexpectedResult;
+            defer Fake.table.close(engine);
+            var memory: abi.Memory = .{};
+            Fake.table.memory(engine, &memory);
+            try testing.expectEqual(expected, memory.active);
+            try testing.expectEqual(expected, memory.peak);
+            try testing.expectEqual(context, info.context_window);
+        }
     }
 }
 
