@@ -54,6 +54,13 @@ big_content_check() { # mode verdict finish_reason
     if [ "$3" = "length" ]; then echo "  skip [$logical] big-file write ($1): content >=400 bytes — the model ran to max_tokens"; return; fi
     check "[$logical] big-file write ($1): content >=400 bytes" "$([ "$(echo "$2"|cut -d'|' -f4)" = 1 ] && echo 1 || echo 0)"
 }
+big_write_checks() { # mode verdict finish_reason finish_details.type
+    # A write the server cut as a repetition loop has no call by design (the loop's markup is never parsed).
+    if [ "$4" = "repetition_loop" ]; then echo "  skip [$logical] big-file write ($1): the model looped and the server cut it"; return; fi
+    check "[$logical] big-file write ($1): call FIRES (not dropped)" "$([ "$(echo "$2"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
+    check "[$logical] big-file write ($1): args valid JSON"         "$([ "$(echo "$2"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
+    big_content_check "$1" "$2" "$3"
+}
 check() {
     local desc="$1" ok="$2"
     if [ "$ok" = "1" ]; then PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $desc"
@@ -92,10 +99,10 @@ print(json.dumps(body))
 PY
 }
 
-# Accumulate an SSE stream into {"finish","content","calls":[{name,args}]}.
+# Accumulate an SSE stream into {"finish","details","content","calls":[{name,args}]} (details = finish_details.type).
 SSE_ACCUM='
 import json,sys
-calls={}; fr=None; c=""
+calls={}; fr=None; fd=None; c=""
 for line in sys.stdin:
     line=line.strip()
     if not line.startswith("data:"): continue
@@ -105,6 +112,7 @@ for line in sys.stdin:
     except: continue
     ch=(o.get("choices") or [{}])[0]
     if ch.get("finish_reason"): fr=ch["finish_reason"]
+    if ch.get("finish_details"): fd=ch["finish_details"].get("type")
     d=ch.get("delta",{})
     c+=d.get("content") or ""
     for tc in d.get("tool_calls") or []:
@@ -112,7 +120,7 @@ for line in sys.stdin:
         f=tc.get("function",{})
         if f.get("name"): e["name"]=f["name"]
         e["args"]+=f.get("arguments") or ""
-print(json.dumps({"finish":fr,"content":c,"calls":[calls[k] for k in sorted(calls)]}))
+print(json.dumps({"finish":fr,"details":fd,"content":c,"calls":[calls[k] for k in sorted(calls)]}))
 '
 
 # Verdict for a write call. argv: expected_path must_contain min_len
@@ -193,18 +201,14 @@ run_model() {
         -d "$(mkreq "$BIG_MSG" "[$WRITE_TOOL]" 0 3500)")
     V=$(jget "$R" "__import__('json').dumps({'name':(r['choices'][0]['message'].get('tool_calls') or [{}])[0].get('function',{}).get('name',''),'args':(r['choices'][0]['message'].get('tool_calls') or [{}])[0].get('function',{}).get('arguments',''),'content':r['choices'][0]['message'].get('content') or ''})" \
         | python3 -c "$WRITE_VERDICT" mars.html '-' 400)
-    check "[$logical] big-file write (non-stream): call FIRES (not dropped)" "$([ "$(echo "$V"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
-    check "[$logical] big-file write (non-stream): args valid JSON"         "$([ "$(echo "$V"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
-    big_content_check "non-stream" "$V" "$(jget "$R" "r['choices'][0]['finish_reason']")"
+    big_write_checks "non-stream" "$V" "$(jget "$R" "r['choices'][0]['finish_reason']")" "$(jget "$R" "(r['choices'][0].get('finish_details') or {}).get('type')")"
 
     # ── big-file write, STREAM ──
     ACC=$(curl -sN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
         -d "$(mkreq "$BIG_MSG" "[$WRITE_TOOL]" 1 3500)" | python3 -c "$SSE_ACCUM")
     V=$(jget "$ACC" "__import__('json').dumps({**((r['calls'] or [{'name':'','args':''}])[0]),'content':r['content']})" \
         | python3 -c "$WRITE_VERDICT" mars.html '-' 400)
-    check "[$logical] big-file write (stream): call FIRES (not dropped)" "$([ "$(echo "$V"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
-    check "[$logical] big-file write (stream): args valid JSON"         "$([ "$(echo "$V"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
-    big_content_check "stream" "$V" "$(jget "$ACC" "r['finish']")"
+    big_write_checks "stream" "$V" "$(jget "$ACC" "r['finish']")" "$(jget "$ACC" "r['details']")"
 
     # Informational: did the server-side recovery actually engage for this model?
     local recov

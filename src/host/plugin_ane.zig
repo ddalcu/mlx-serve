@@ -177,6 +177,11 @@ pub fn table() ?*const abi.HostAne {
 
 const testing = std.testing;
 const mil = @import("../sdk/ane/mil.zig");
+
+/// The table where a Neural Engine runs programs: a VM (GitHub's macOS runners) loads the bridge but has no ANE.
+fn testTable() ?*const abi.HostAne {
+    return if (@import("../mlx/ffi.zig").virtualGpu()) null else table();
+}
 const env = @import("../env.zig");
 
 /// The compile cache under a fresh directory, so a test neither reads nor fills the user's.
@@ -192,7 +197,7 @@ fn errText(err: []const u8) []const u8 {
 }
 
 test "plugin ane: a raw MIL program compiles, binds by name, evaluates on the ANE, and counts as resident until freed" {
-    const ane = table() orelse return error.SkipZigTest;
+    const ane = testTable() orelse return error.SkipZigTest;
     var cb: [128]u8 = undefined;
     const root = try testCache(&cb);
     defer {
@@ -260,7 +265,7 @@ test "plugin ane: a raw MIL program compiles, binds by name, evaluates on the AN
 }
 
 test "plugin ane: a bad program is refused with its reason, and nothing stays resident" {
-    const ane = table() orelse return error.SkipZigTest;
+    const ane = testTable() orelse return error.SkipZigTest;
     var cb: [128]u8 = undefined;
     const root = try testCache(&cb);
     defer {
@@ -299,7 +304,7 @@ fn refSwiglu(h: usize, f: usize, gq: []const i8, gs: []const f32, uq: []const i8
 }
 
 test "plugin ane: a SwiGLU bank gives the int8 reference, clamped by its limit and not without one" {
-    const ane = table() orelse return error.SkipZigTest;
+    const ane = testTable() orelse return error.SkipZigTest;
     var cb: [128]u8 = undefined;
     const root = try testCache(&cb);
     defer {

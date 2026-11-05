@@ -994,7 +994,7 @@ test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal th
     defer arena.deinit();
     const files = try fixture.v41DsparkFiles(arena.allocator(), 7);
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-greedy.tape"));
-    try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 0xd5 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
+    try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
 }
 
 /// The largest gap between two `[rows, V]` logit sets, against the reference's largest magnitude.

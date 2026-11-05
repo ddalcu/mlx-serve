@@ -285,9 +285,12 @@ pub fn addUnitTests(g: *const Graph) Tests {
 
     // The one test binary runs as `test-shards` processes in parallel, each every n-th test (build/test_runner.zig);
     // a filtered run is one process.
-    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default 8)") orelse 8;
+    const shards: u32 = if (test_filter != null) 1 else b.option(u32, "test-shards", "Unit-test processes run in parallel (default: one per 16 GiB of RAM past the first 16, 1 to 8)") orelse defaultShards();
     const test_runs = b.allocator.alloc(*std.Build.Step.Run, shards) catch @panic("OOM");
     const test_step = b.step("test", "Run unit tests");
+    // A Run step given an env var copies the WHOLE configure-time environment into the cached configuration, so the
+    // tests' own variables (MLX_SERVE_TAPE_RECORD, *_TEST_MODEL) would stay frozen at the last reconfigure.
+    b.graph.poisonCache();
     for (test_runs, 0..) |*run, k| {
         run.* = b.addRunArtifact(unit_tests);
         if (shards > 1) {
@@ -309,6 +312,13 @@ pub fn addUnitTests(g: *const Graph) Tests {
     test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
     test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
     return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
+}
+
+/// Every shard holds its own GPU tests' memory, and the heaviest (dsv41 moe_down) wants ~10 GB: a 16 GB Mac hung with
+/// two shards (a Metal command buffer that fails for memory never signals, so its test waits forever).
+fn defaultShards() u32 {
+    const gib = (std.process.totalSystemMemory() catch return 8) >> 30;
+    return @intCast(std.math.clamp((gib -| 16) / 16, 1, 8));
 }
 
 /// `exl3-test`, `mlx-stream-test`, `mlx-stream-conformance`: Zig collects tests from an artifact's root module only, so

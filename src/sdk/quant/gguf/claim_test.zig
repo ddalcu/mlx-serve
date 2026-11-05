@@ -100,8 +100,9 @@ test "real GGUF: a DeepSeek-V4.1 set's vision GGUF beside it maps every tensor a
     defer v.deinit();
     const vis = try ds41.Vision.read(&v, arch.deepseek41, f.getString("general.source.revision"));
     try std.testing.expectEqual(@as(u32, 32), vis.layers);
+    var mbuf: [96]u8 = undefined;
     for (v.tensors.keys(), v.tensors.values()) |name, t| {
-        const m = ds41.mapVisionTensor(name) orelse {
+        const m = ds41.mapVisionTensor(&mbuf, name) orelse {
             std.debug.print("unmapped {s}\n", .{name});
             return error.TestUnexpectedResult;
         };

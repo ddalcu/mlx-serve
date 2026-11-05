@@ -9,6 +9,7 @@ const sdk_fixture = @import("../../../sdk/testing/fixture.zig");
 const config = @import("../config.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 const decode = @import("decode.zig");
+const device = @import("../../../mlx/device.zig");
 const Shard = @import("../../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -366,6 +367,9 @@ test "dsv41 tensor parallel: two ranks on half the heads and experts, summing ea
     const rank1 = try Fixture.init(gpa, half);
     defer rank1.deinit();
     try std.testing.expectEqual(whole.m.cfg.num_attention_heads / 2, rank1.m.cfg.num_attention_heads);
+    // On a NAX GPU MLX runs these f32 GEMMs as TF32 (`MLX_ENABLE_TF32`, on by default): a 10-bit mantissa. A wrong
+    // shard sum is off by the summand, far above either bound.
+    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;
     // Two spans and a tail: a wide chunk, whose spans each sum their attention.
     for ([_]usize{ 1, 6, dsv41.region_rows + 9, 2 * dsv41.SPAN + 8 }) |rows| {
         const in = try Input.of(whole, rows);
@@ -377,7 +381,7 @@ test "dsv41 tensor parallel: two ranks on half the heads and experts, summing ea
         var peak: f32 = 0;
         for (want) |v| peak = @max(peak, @abs(v));
         try std.testing.expect(peak > 0);
-        for (want, got) |u, v| try std.testing.expect(@abs(u - v) <= 1e-3 * peak);
+        for (want, got) |u, v| try std.testing.expect(@abs(u - v) <= tol * peak);
     }
 }
 
