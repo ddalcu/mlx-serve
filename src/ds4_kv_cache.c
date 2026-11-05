@@ -1,13 +1,11 @@
 #include "ds4_kv_cache.h"
 #include "../lib/ds4/ds4_kvstore.h"
 
-#include <dirent.h>
-#include <errno.h>
-#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
+
+#define DS4_KV_CACHE_MIB (1024ull * 1024ull)
 
 struct mlxserve_ds4_kv_cache {
     ds4_engine *engine;
@@ -44,81 +42,24 @@ static bool exact_prefix(const ds4_tokens *live, const int *target, int n) {
          !memcmp(live->v, target, (size_t)live->len * sizeof(int))));
 }
 
-static bool native_temporary(const char *name) {
-    if (strlen(name) <= 48 || strncmp(name + 43, ".tmp.", 5)) return false;
-    char base[44], sha[41];
-    memcpy(base, name, 43);
-    base[43] = '\0';
-    return ds4_kvstore_sha_hex_name(base, sha) &&
-        strspn(name + 48, "0123456789") == strlen(name + 48);
-}
-
-/* Count every regular file, including failed native writes and corrupt entries.
- * Only native-format files are eligible for cleanup; never follow symlinks. */
-static uint64_t scan(mlxserve_ds4_kv_cache *c, bool clean) {
-    DIR *dir = opendir(c->store.dir);
-    if (!dir) return UINT64_MAX;
-    uint64_t bytes = 0;
-    struct dirent *de;
-    errno = 0;
-    while ((de = readdir(dir))) {
-        if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, "..")) continue;
-        char *path = ds4_kvstore_path_join(c->store.dir, de->d_name);
-        struct stat st;
-        if (lstat(path, &st) != 0) { free(path); bytes = UINT64_MAX; break; }
-        if (S_ISREG(st.st_mode)) {
-            char sha[41];
-            ds4_kvstore_entry entry = {0};
-            bool native = ds4_kvstore_sha_hex_name(de->d_name, sha);
-            bool valid = !native || ds4_kvstore_read_entry_file(path, sha, &entry);
-            ds4_kvstore_entry_free(&entry);
-            // All pool operations are serialized, so a native temp here is a crash leftover.
-            if (clean && ((native && !valid) || native_temporary(de->d_name)) && unlink(path) == 0) {
-                free(path);
-                errno = 0;
-                continue;
-            }
-            uint64_t size = st.st_size > 0 ? (uint64_t)st.st_size : 0;
-            bytes = UINT64_MAX - bytes < size ? UINT64_MAX : bytes + size;
-        }
-        free(path);
-        errno = 0;
-    }
-    if (errno) bytes = UINT64_MAX;
-    closedir(dir);
-    return bytes;
-}
-
-uint64_t mlxserve_ds4_kv_cache_physical_bytes(mlxserve_ds4_kv_cache *c) {
-    return scan(c, false);
-}
-
-int mlxserve_ds4_kv_cache_prune(mlxserve_ds4_kv_cache *c, char *err, size_t errlen) {
-    if (scan(c, true) == UINT64_MAX) return fail(err, errlen, "cannot scan ds4 cache pool");
-    uint64_t allowance = c->store.budget_bytes;
-    /* Native zero means unlimited. One byte evicts every native checkpoint. */
-    c->store.budget_bytes = allowance ? allowance : 1;
-    ds4_kvstore_evict(&c->store, NULL, 0, NULL);
-    c->store.budget_bytes = allowance;
-    if (scan(c, false) > allowance)
-        return fail(err, errlen, "ds4 cache pool exceeds allowance after pruning");
-    return 0;
-}
-
-int mlxserve_ds4_kv_cache_set_budget(mlxserve_ds4_kv_cache *c, uint64_t bytes,
-                                    char *err, size_t errlen) {
-    c->store.budget_bytes = bytes;
-    /* Exhausted write headroom must not destroy a useful checkpoint before
-     * lookup. Explicit prune still enforces zero by deleting all entries. */
-    if (!bytes) return 0;
-    return mlxserve_ds4_kv_cache_prune(c, err, errlen);
-}
-
 mlxserve_ds4_kv_cache *mlxserve_ds4_kv_cache_open(
     ds4_engine *engine, const char *dir, const char *namespace_key,
     uint64_t budget_bytes, int min_tokens, char *err, size_t errlen) {
     if (!engine || !dir || !namespace_key || !namespace_key[0] || min_tokens < 0) {
         fail(err, errlen, "invalid ds4 cache options");
+        return NULL;
+    }
+    /* The native pool budgets in whole MiB and reads zero as "use the
+     * default". A zero allowance would silently become that default, so the
+     * engine bypasses the cache instead of opening it. */
+    if (!budget_bytes) {
+        fail(err, errlen, "ds4 cache budget must be greater than zero");
+        return NULL;
+    }
+    uint64_t budget_mb = budget_bytes / DS4_KV_CACHE_MIB;
+    if (budget_bytes % DS4_KV_CACHE_MIB) budget_mb++;
+    if (budget_mb > UINT64_MAX / DS4_KV_CACHE_MIB) {
+        fail(err, errlen, "ds4 cache budget is too large");
         return NULL;
     }
     mlxserve_ds4_kv_cache *c = calloc(1, sizeof(*c));
@@ -127,19 +68,16 @@ mlxserve_ds4_kv_cache *mlxserve_ds4_kv_cache_open(
     c->namespace_key = strdup(namespace_key);
     ds4_kvstore_options opt = ds4_kvstore_default_options();
     if (min_tokens) opt.min_tokens = min_tokens;
-    /* Native open eagerly evicts. Scan first without eviction, then apply the
-     * exact allowance below, preserving read-only restores at zero headroom. */
-    uint64_t mb = UINT64_MAX / (1024 * 1024);
-    if (!c->namespace_key || !ds4_kvstore_open(&c->store, dir, mb,
+    if (!c->namespace_key || !ds4_kvstore_open(&c->store, dir, budget_mb,
                                               true, opt, "mlx-serve ds4", NULL, NULL)) {
         fail(err, errlen, "cannot open ds4 cache pool");
         mlxserve_ds4_kv_cache_close(c);
         return NULL;
     }
-    if (mlxserve_ds4_kv_cache_set_budget(c, budget_bytes, err, errlen) != 0) {
-        mlxserve_ds4_kv_cache_close(c);
-        return NULL;
-    }
+    /* The native budget is whole MiB; the exact allowance is applied here and
+     * the native eviction enforces it once. */
+    c->store.budget_bytes = budget_bytes;
+    ds4_kvstore_evict(&c->store, NULL, 0, NULL);
     return c;
 }
 
@@ -154,17 +92,18 @@ int mlxserve_ds4_kv_cache_store(mlxserve_ds4_kv_cache *c,
     ds4_session *session, const int *tokens, int count, const char *reason,
     char *err, size_t errlen) {
     if (err && errlen) err[0] = '\0';
-    if (!c->store.budget_bytes || count < c->store.opt.min_tokens ||
+    if (count < c->store.opt.min_tokens ||
         ds4_session_payload_bytes(session) == 0 || ds4_session_has_vision_state(session)) return 0;
     const ds4_tokens *live = ds4_session_tokens(session);
     if (!exact_prefix(live, tokens, count) || live->len != count) return 0;
     char *key = token_key(c, tokens, count);
     if (!key) return fail(err, errlen, "invalid ds4 cache token key");
+    /* The native pool pre-evicts to make room, renames its temporary file and
+     * removes a failed write, so the wrapper adds no second budget pass. */
     bool ok = ds4_kvstore_store_live_prefix_text(&c->store, c->engine, session,
         live, count, reason, key, 0, "namespaced-token-ids", NULL, err, errlen);
     free(key);
     if (!ok) return err && errlen && err[0] ? -1 : 0;
-    if (mlxserve_ds4_kv_cache_prune(c, err, errlen) != 0) return -1;
     return 1;
 }
 
@@ -200,6 +139,8 @@ int mlxserve_ds4_kv_cache_restore(mlxserve_ds4_kv_cache *c,
 /* Hermetic integration test: the real native kvstore, with only graph payload
  * I/O replaced. Build this TU + ds4_kvstore.c with the define and pass a temp dir. */
 #include <assert.h>
+#include <sys/stat.h>
+#include <time.h>
 
 struct ds4_engine { int unused; };
 struct ds4_session { ds4_tokens tokens; bool valid, vision; };
@@ -285,6 +226,18 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t bytes,
     return 0;
 }
 
+static ds4_session make_session(const int *tokens, int n) {
+    ds4_session s = {.valid = true};
+    for (int i = 0; i < n; i++) ds4_tokens_push(&s.tokens, tokens[i]);
+    return s;
+}
+
+static char *test_subdir(const char *name) {
+    char *path = ds4_kvstore_path_join(test_dir, name);
+    assert(mkdir(path, 0700) == 0);
+    return path;
+}
+
 static char *test_entry_path(mlxserve_ds4_kv_cache *c, const int *tokens, int n) {
     char *key = token_key(c, tokens, n);
     char sha[41];
@@ -293,19 +246,65 @@ static char *test_entry_path(mlxserve_ds4_kv_cache *c, const int *tokens, int n)
     return ds4_kvstore_path_for_sha(&c->store, sha);
 }
 
+/* Test-only view of the native index. The native eviction refreshes it. */
+static uint64_t indexed_bytes(mlxserve_ds4_kv_cache *c) {
+    ds4_kvstore_evict(&c->store, NULL, 0, NULL);
+    uint64_t total = 0;
+    for (int i = 0; i < c->store.len; i++) total += c->store.entry[i].file_size;
+    return total;
+}
+
+/* Test-only: a checkpoint whose stored text is shorter than its token list. */
+static char *write_mismatched_entry(mlxserve_ds4_kv_cache *c, const int *tokens,
+                                     int n, int text_tokens) {
+    char *text = token_key(c, tokens, text_tokens);
+    assert(text);
+    char sha[41];
+    ds4_kvstore_sha1_bytes_hex(text, strlen(text), sha);
+    char *path = ds4_kvstore_path_for_sha(&c->store, sha);
+    FILE *fp = fopen(path, "wb");
+    assert(fp);
+    uint64_t now = (uint64_t)time(NULL);
+    uint8_t h[DS4_KVSTORE_FIXED_HEADER];
+    ds4_kvstore_fill_header(h, 0, 4, DS4_KVSTORE_REASON_COLD, 0,
+                            (uint32_t)n, 0, 8192, now, now,
+                            sizeof(int) * (1ull + (uint64_t)n));
+    uint8_t tb[4];
+    ds4_kvstore_le_put32(tb, (uint32_t)strlen(text));
+    assert(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    assert(fwrite(tb, 1, sizeof(tb), fp) == sizeof(tb));
+    assert(fwrite(text, 1, strlen(text), fp) == strlen(text));
+    int count = n;
+    assert(fwrite(&count, sizeof(count), 1, fp) == 1);
+    assert(fwrite(tokens, sizeof(int), (size_t)n, fp) == (size_t)n);
+    assert(fclose(fp) == 0);
+    free(text);
+    return path;
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     test_dir = argv[1];
     ds4_engine engine = {0};
-    ds4_session source = {.valid = true}, dest = {0};
+    ds4_session dest = {0};
     int prompt[513];
-    for (int i = 0; i < 513; i++) { prompt[i] = i; ds4_tokens_push(&source.tokens, i); }
-    source.tokens.len = 512;
+    for (int i = 0; i < 513; i++) prompt[i] = i;
+    ds4_session source = make_session(prompt, 512);
     char err[256] = {0};
+
+    /* A zero allowance would become the native default budget, so the engine
+     * bypasses the cache instead of opening it. */
+    err[0] = '\0';
+    assert(mlxserve_ds4_kv_cache_open(&engine, test_dir, "checkpoint-A", 0, 0,
+                                      err, sizeof(err)) == NULL);
+    assert(err[0] != '\0');
+
     const uint64_t budget = 1024 * 1024;
     mlxserve_ds4_kv_cache *c = mlxserve_ds4_kv_cache_open(&engine, test_dir,
         "checkpoint-A", budget, 0, err, sizeof(err));
     assert(c && c->store.opt.min_tokens == 512);
+    assert(c->store.budget_bytes == budget);
+    /* Below the minimum, without a payload or with vision state: nothing is stored. */
     assert(mlxserve_ds4_kv_cache_store(c, &source, prompt, 511, "cold", err, sizeof(err)) == 0);
     source.valid = false;
     assert(mlxserve_ds4_kv_cache_store(c, &source, prompt, 512, "cold", err, sizeof(err)) == 0);
@@ -314,11 +313,11 @@ int main(int argc, char **argv) {
     source.vision = false;
     assert(staged_count == 0);
     assert(mlxserve_ds4_kv_cache_store(c, &source, prompt, 512, "cold", err, sizeof(err)) == 1);
-    uint64_t saved = mlxserve_ds4_kv_cache_physical_bytes(c);
-    assert(saved > 0 && saved < budget && staged_count == 1);
+    assert(staged_count == 1);
     /* Identical prompt checkpoint is idempotent and does not stage again. */
     assert(mlxserve_ds4_kv_cache_store(c, &source, prompt, 512, "shutdown", err, sizeof(err)) == 1);
     assert(staged_count == 1);
+    /* Another namespace cannot see this checkpoint. */
     mlxserve_ds4_kv_cache_close(c);
     c = mlxserve_ds4_kv_cache_open(&engine, test_dir, "checkpoint-B", budget, 0, err, sizeof(err));
     assert(c && mlxserve_ds4_kv_cache_restore(c, &dest, prompt, 513, err, sizeof(err)) == 0);
@@ -326,9 +325,11 @@ int main(int argc, char **argv) {
     c = mlxserve_ds4_kv_cache_open(&engine, test_dir, "checkpoint-A", budget, 0, err, sizeof(err));
     assert(c && mlxserve_ds4_kv_cache_restore(c, &dest, prompt, 513, err, sizeof(err)) == 512);
     assert(dest.valid && exact_prefix(&dest.tokens, prompt, 513));
+    /* A different token history is not a hit. */
     prompt[511]++;
     assert(mlxserve_ds4_kv_cache_restore(c, &dest, prompt, 513, err, sizeof(err)) == 0);
     prompt[511]--;
+    /* A corrupt payload is refused and the session stays invalid. */
     char *path = test_entry_path(c, prompt, 512);
     FILE *fp = fopen(path, "r+b");
     assert(fp);
@@ -341,6 +342,7 @@ int main(int argc, char **argv) {
     assert(mlxserve_ds4_kv_cache_restore(c, &dest, prompt, 513, err, sizeof(err)) == 0);
     assert(!dest.valid);
     assert(unlink(path) == 0);
+    /* A payload with other tokens is not a hit and its checkpoint is removed. */
     assert(mlxserve_ds4_kv_cache_store(c, &source, prompt, 512, "cold", err, sizeof(err)) == 1);
     fp = fopen(path, "r+b"); assert(fp);
     assert(fseek(fp, payload + sizeof(int), SEEK_SET) == 0);
@@ -348,34 +350,96 @@ int main(int argc, char **argv) {
     assert(fwrite(&wrong_token, sizeof(int), 1, fp) == 1 && fclose(fp) == 0);
     assert(mlxserve_ds4_kv_cache_restore(c, &dest, prompt, 513, err, sizeof(err)) == 0);
     assert(!dest.valid && access(path, F_OK) != 0);
-    /* Physical accounting includes invalid native files, which pruning removes. */
-    fp = fopen(path, "wb"); assert(fp);
-    assert(fwrite("broken", 1, 6, fp) == 6 && fclose(fp) == 0);
-    assert(mlxserve_ds4_kv_cache_physical_bytes(c) == 6);
-    assert(mlxserve_ds4_kv_cache_prune(c, err, sizeof(err)) == 0);
-    assert(mlxserve_ds4_kv_cache_physical_bytes(c) == 0);
-    char temporary[4096];
-    assert(snprintf(temporary, sizeof(temporary), "%s.tmp.1", path) < (int)sizeof(temporary));
-    fp = fopen(temporary, "wb"); assert(fp);
-    assert(fwrite("leftover", 1, 8, fp) == 8 && fclose(fp) == 0);
-    assert(mlxserve_ds4_kv_cache_physical_bytes(c) == 8);
-    assert(mlxserve_ds4_kv_cache_prune(c, err, sizeof(err)) == 0);
-    assert(mlxserve_ds4_kv_cache_physical_bytes(c) == 0);
-    assert(mlxserve_ds4_kv_cache_set_budget(c, saved / 2, err, sizeof(err)) == 0);
-    assert(mlxserve_ds4_kv_cache_store(c, &source, prompt, 512, "cold", err, sizeof(err)) == 0);
-    assert(mlxserve_ds4_kv_cache_set_budget(c, budget, err, sizeof(err)) == 0);
-    assert(mlxserve_ds4_kv_cache_store(c, &source, prompt, 512, "cold", err, sizeof(err)) == 1);
-    assert(mlxserve_ds4_kv_cache_set_budget(c, 0, err, sizeof(err)) == 0);
-    assert(mlxserve_ds4_kv_cache_physical_bytes(c) == saved);
-    assert(mlxserve_ds4_kv_cache_restore(c, &dest, prompt, 513, err, sizeof(err)) == 512);
-    int before = staged_count;
-    assert(mlxserve_ds4_kv_cache_store(c, &source, prompt, 512, "cold", err, sizeof(err)) == 0);
-    assert(staged_count == before);
-    assert(mlxserve_ds4_kv_cache_prune(c, err, sizeof(err)) == 0);
-    assert(mlxserve_ds4_kv_cache_physical_bytes(c) == 0);
     free(path);
+    /* A checkpoint whose stored text is shorter than its token list is not a
+     * hit, and it is removed. */
+    char *mismatched = write_mismatched_entry(c, prompt, 512, 511);
+    assert(mlxserve_ds4_kv_cache_restore(c, &dest, prompt, 513, err, sizeof(err)) == 0);
+    assert(!dest.valid && access(mismatched, F_OK) != 0);
+    free(mismatched);
+    /* The stored tokens must be the live token history. */
+    int wrong[512];
+    for (int i = 0; i < 512; i++) wrong[i] = prompt[i];
+    wrong[0] = 999;
+    assert(mlxserve_ds4_kv_cache_store(c, &source, wrong, 512, "cold", err, sizeof(err)) == 0);
+    char *wrong_path = test_entry_path(c, wrong, 512);
+    assert(access(wrong_path, F_OK) != 0);
+    free(wrong_path);
     mlxserve_ds4_kv_cache_close(c);
+
+    /* An allowance below one MiB is kept exactly, not turned into the native
+     * default, and a checkpoint larger than it is declined. */
+    char *small_dir = test_subdir("small");
+    const uint64_t small_budget = 4096;
+    mlxserve_ds4_kv_cache *small = mlxserve_ds4_kv_cache_open(&engine, small_dir,
+        "checkpoint-A", small_budget, 0, err, sizeof(err));
+    assert(small && small->store.budget_bytes == small_budget);
+    assert(small->store.budget_bytes !=
+           (uint64_t)DS4_KVSTORE_DEFAULT_MB * 1024ull * 1024ull);
+    assert(mlxserve_ds4_kv_cache_store(small, &source, prompt, 512, "cold", err, sizeof(err)) == 0);
+    char *small_path = test_entry_path(small, prompt, 512);
+    assert(access(small_path, F_OK) != 0);
+    assert(indexed_bytes(small) == 0);
+    free(small_path);
+    mlxserve_ds4_kv_cache_close(small);
+    free(small_dir);
+
+    /* A pool that holds more than its allowance drops the excess when it opens. */
+    char *reopen_dir = test_subdir("reopen");
+    mlxserve_ds4_kv_cache *roomy = mlxserve_ds4_kv_cache_open(&engine, reopen_dir,
+        "checkpoint-A", budget, 0, err, sizeof(err));
+    assert(roomy);
+    assert(mlxserve_ds4_kv_cache_store(roomy, &source, prompt, 512, "cold", err, sizeof(err)) == 1);
+    char *roomy_path = test_entry_path(roomy, prompt, 512);
+    assert(access(roomy_path, F_OK) == 0);
+    mlxserve_ds4_kv_cache_close(roomy);
+    mlxserve_ds4_kv_cache *tight = mlxserve_ds4_kv_cache_open(&engine, reopen_dir,
+        "checkpoint-A", small_budget, 0, err, sizeof(err));
+    assert(tight && tight->store.budget_bytes == small_budget);
+    assert(access(roomy_path, F_OK) != 0);
+    assert(indexed_bytes(tight) == 0);
+    free(roomy_path);
+    mlxserve_ds4_kv_cache_close(tight);
+    free(reopen_dir);
+
+    /* An allowance that is not a whole MiB is kept exactly. */
+    char *exact_dir = test_subdir("exact");
+    const uint64_t exact_budget = 1024 * 1024 + 1234;
+    mlxserve_ds4_kv_cache *exact = mlxserve_ds4_kv_cache_open(&engine, exact_dir,
+        "checkpoint-A", exact_budget, 0, err, sizeof(err));
+    assert(exact && exact->store.budget_bytes == exact_budget);
+    mlxserve_ds4_kv_cache_close(exact);
+    free(exact_dir);
+
+    /* The pool stays inside its allowance: the third checkpoint evicts the
+     * least useful one, the restored checkpoint survives. */
+    char *pool_dir = test_subdir("pool");
+    const uint64_t two_checkpoints = 14000;
+    mlxserve_ds4_kv_cache *pool = mlxserve_ds4_kv_cache_open(&engine, pool_dir,
+        "checkpoint-A", two_checkpoints, 0, err, sizeof(err));
+    assert(pool && pool->store.budget_bytes == two_checkpoints);
+    int second_prompt[513], third_prompt[513];
+    for (int i = 0; i < 513; i++) { second_prompt[i] = i + 1; third_prompt[i] = i + 2; }
+    ds4_session second = make_session(second_prompt, 512);
+    ds4_session third = make_session(third_prompt, 512);
+    assert(mlxserve_ds4_kv_cache_store(pool, &source, prompt, 512, "cold", err, sizeof(err)) == 1);
+    assert(mlxserve_ds4_kv_cache_store(pool, &second, second_prompt, 512, "cold", err, sizeof(err)) == 1);
+    assert(indexed_bytes(pool) <= two_checkpoints);
+    assert(mlxserve_ds4_kv_cache_restore(pool, &dest, prompt, 513, err, sizeof(err)) == 512);
+    assert(mlxserve_ds4_kv_cache_store(pool, &third, third_prompt, 512, "cold", err, sizeof(err)) == 1);
+    char *keep = test_entry_path(pool, prompt, 512);
+    char *drop = test_entry_path(pool, second_prompt, 512);
+    char *added = test_entry_path(pool, third_prompt, 512);
+    assert(access(keep, F_OK) == 0);
+    assert(access(drop, F_OK) != 0);
+    assert(access(added, F_OK) == 0);
+    assert(indexed_bytes(pool) <= two_checkpoints);
+    free(keep); free(drop); free(added);
+    mlxserve_ds4_kv_cache_close(pool);
+    free(pool_dir);
+
     ds4_tokens_free(&source.tokens); ds4_tokens_free(&dest.tokens);
+    ds4_tokens_free(&second.tokens); ds4_tokens_free(&third.tokens);
     puts("ds4 native kvstore integration: passed");
     return 0;
 }

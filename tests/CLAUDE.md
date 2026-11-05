@@ -124,7 +124,6 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_kv_cache_poison.sh` pad-only gens · `test_kv_cache_sliding_window.sh` sliding reuse
 - `test_kv_quant_equivalence.sh`, `test_kv_quant_per_request.sh`, `test_kv_quant_fused_equivalence.sh` quantized KV · `measure_fused_kv.sh`
 - `test_prefix_cache_{hot,mem,disk,disabled,workloads,budget_revisit}.sh` RAM + SSD tiers · `test_prefix_inherit_qsa.sh`
-- `test_shared_cache_io.py` **E** macOS: HTTP KV commits never traverse another cache namespace
 - `test_cache_reuses_generated_tokens.sh`, `test_hybrid_reuse_equivalence.sh`, `test_mid_system_cache.sh` reuse across turns · `test_late_system_fold_warning.sh` one fold warning per template
 - `test_tokenize_cache.sh`, `test_tokenize_ms_present.sh` tokenize cache · `diff_restore_dump.py` diff restore dumps
 

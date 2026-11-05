@@ -55,7 +55,6 @@ const transformer_mod = @import("../../transformer.zig");
 const model = @import("../../../../sdk/config/model.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const disk_writer = @import("writer.zig");
-const disk_budget = @import("../../../../sdk/kv/disk_budget.zig");
 pub const module_record = @import("module_record.zig");
 const log = @import("../../../../sdk/util/log.zig");
 
@@ -204,8 +203,6 @@ pub const IndexEntry = struct {
     quant: kv_quant.KVQuantConfig,
     /// KV file bill, or a module reservation/committed bill/deferred-cleanup liability.
     bytes: u64,
-    /// Unpublished module bytes also charged to other engines under the same root.
-    disk_reservation: ?*disk_budget.Reservation = null,
     /// Per-chunk file sizes recorded at commit (meta.json "chunk_bytes").
     /// The scan validates actual file sizes against these and clamps kv_len
     /// to the last contiguous valid chunk — a kill -9 mid-flush truncates a
@@ -416,7 +413,7 @@ pub const DiskTier = struct {
     io: std.Io,
     /// Absolute root for this model's entries (`<base>/<fingerprint>`). Owned.
     root: []u8,
-    /// This namespace's allowance after other cache roots are charged. 0 = intentionally unbounded.
+    /// Byte budget across all entries. 0 = unbounded.
     max_bytes: u64,
     chunk_tokens: u32,
     /// Max bytes written per appendCommit call (default 512 MB). The flush
@@ -446,11 +443,10 @@ pub const DiskTier = struct {
     operator_cap: u64 = 0,
     /// The free-space probe; tests arm a fixed answer with `armTestSpace`.
     space_probe: SpaceProbeFn = volumeSpace,
-    /// No disk headroom: new stores decline; existing entries remain restorable.
+    /// The volume is under `DISK_STORE_FLOOR`: no new entry persists, existing ones stay restorable.
     store_declined: bool = false,
-    /// `<base>` (the parent of `root`), for shared accounting and the root-wide sweep.
+    /// `<base>` (the parent of `root`), for the root-wide sweep. Null when the dupe failed.
     base_dir: ?[]u8 = null,
-    budget_pool: ?*disk_budget.Pool = null,
     entries: std.ArrayList(IndexEntry),
     next_id: u64,
     total_bytes: u64,
@@ -506,8 +502,6 @@ pub const DiskTier = struct {
         context: ?module_record.Context,
     ) !DiskTier {
         if (base_dir.len == 0 or !std.fs.path.isAbsolute(base_dir)) return error.BadDiskCacheDir;
-        const owned_base = try allocator.dupe(u8, base_dir);
-        errdefer allocator.free(owned_base);
         const root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fingerprint });
         errdefer allocator.free(root);
         try std.Io.Dir.cwd().createDirPath(io, root);
@@ -517,7 +511,6 @@ pub const DiskTier = struct {
             .root = root,
             .max_bytes = max_bytes,
             .operator_cap = max_bytes,
-            .base_dir = owned_base,
             .chunk_tokens = if (chunk_tokens == 0) DEFAULT_CHUNK_TOKENS else chunk_tokens,
             .entries = std.ArrayList(IndexEntry).empty,
             .next_id = 1,
@@ -525,17 +518,11 @@ pub const DiskTier = struct {
             .counter = 0,
             .module_context = context,
         };
-        self.budget_pool = try disk_budget.openPool(allocator, io, base_dir, root);
-        errdefer self.budget_pool.?.close(io);
         self.scan() catch |err| {
             log.warn("[disk-cache] scan failed: {s} — starting empty\n", .{@errorName(err)});
         };
-        errdefer {
-            for (self.entries.items) |*entry| self.freeIndexEntryOwned(entry);
-            self.entries.deinit(allocator);
-        }
-        self.refreshSharedBudget(max_bytes);
         self.gcToBudget();
+        self.base_dir = allocator.dupe(u8, base_dir) catch null;
         return self;
     }
 
@@ -565,21 +552,18 @@ pub const DiskTier = struct {
         const bytes = record.manifest.bytes;
         if (self.max_bytes != 0 and bytes > self.max_bytes) return null;
         if (!self.makeModuleRoom(bytes)) return null;
-        const id = self.next_id;
-        self.next_id = try std.math.add(u64, id, 1);
-        record.directory = try std.fmt.allocPrint(record.arena.allocator(), "{s}/e{d}/", .{ self.root, id });
-        const reservation = (try disk_budget.reserve(self.allocator, self.io, self.base_dir.?, record.directory, if (self.operator_cap == 0) std.math.maxInt(u64) else self.operator_cap, bytes)) orelse return null;
-        errdefer reservation.release(self.io);
         const tokens = try self.allocator.dupe(u32, input.tokens);
         errdefer self.allocator.free(tokens);
         const spans = try self.allocator.dupe(MediaSpan, media_in);
         errdefer self.allocator.free(spans);
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
+        const id = self.next_id;
+        self.next_id = try std.math.add(u64, id, 1);
+        record.directory = try std.fmt.allocPrint(record.arena.allocator(), "{s}/e{d}/", .{ self.root, id });
         try std.Io.Dir.cwd().createDirPath(self.io, record.directory);
         self.entries.appendAssumeCapacity(.{
             .kind = .module, .module = record, .id = id, .tokens = tokens, .kv_len = n,
             .has_tools = input.has_tools, .quant = input.quant, .bytes = bytes,
-            .disk_reservation = reservation,
             .chunk_bytes = &.{}, .ssm_positions = &.{}, .ssm_bytes = &.{}, .media = spans, .last_used = self.bump(),
         });
         owns_record = false;
@@ -767,10 +751,6 @@ pub const DiskTier = struct {
             self.total_bytes = self.total_bytes -| e.bytes;
             e.bytes = e.module.?.manifest.bytes;
             self.total_bytes += e.bytes;
-            if (e.disk_reservation) |r| {
-                r.release(self.io);
-                e.disk_reservation = null;
-            }
         }
     }
 
@@ -808,12 +788,6 @@ pub const DiskTier = struct {
         self.total_bytes -|= e.bytes;
         e.bytes = m.accepted_bytes;
         self.total_bytes += e.bytes;
-        if (e.disk_reservation) |r| {
-            if (e.bytes == 0) {
-                r.release(self.io);
-                e.disk_reservation = null;
-            } else r.shrink(self.io, e.bytes);
-        }
         log.warn("  [disk-cache] module e{d} {s} ({s})\n", .{ e.id, @tagName(state), why });
     }
 
@@ -835,7 +809,7 @@ pub const DiskTier = struct {
             w.discardPrefix(m.directory);
             if (w.pendingPrefix(m.directory)) return false;
         }
-        self.deleteBudgetedTree(m.directory) catch |err| {
+        std.Io.Dir.cwd().deleteTree(self.io, m.directory) catch |err| {
             log.warn("  [disk-cache] module e{d} cleanup deferred ({s})\n", .{ e.id, @errorName(err) });
             return false;
         };
@@ -847,7 +821,26 @@ pub const DiskTier = struct {
 
     /// Confirmed bytes occupying the volume, excluding unwritten module reservations.
     pub fn physicalDiskBytes(self: *DiskTier) u64 {
-        return if (self.budget_pool) |pool| pool.physical(self.io) else 0;
+        var bytes = self.total_bytes;
+        for (self.entries.items) |*e| {
+            if (e.kind != .module) continue;
+            bytes -|= e.bytes;
+            bytes +|= self.modulePhysicalBytes(e.module.?.directory);
+        }
+        return bytes;
+    }
+
+    fn modulePhysicalBytes(self: *DiskTier, directory: []const u8) u64 {
+        var dir = std.Io.Dir.openDirAbsolute(self.io, directory, .{ .iterate = true }) catch return 0;
+        defer dir.close(self.io);
+        var total: u64 = 0;
+        var it = dir.iterate();
+        while (it.next(self.io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            const st = dir.statFile(self.io, entry.name, .{}) catch continue;
+            total +|= st.size;
+        }
+        return total;
     }
 
     fn diskLruCandidate(self: *const DiskTier) ?usize {
@@ -1008,9 +1001,7 @@ pub const DiskTier = struct {
         if (self.writer != null) return;
         const w = self.allocator.create(disk_writer.Writer) catch return;
         w.* = disk_writer.Writer.init(self.allocator, self.io);
-        if (self.budget_pool) |pool| w.bindPool(pool);
         w.start() catch {
-            w.deinit();
             self.allocator.destroy(w);
             if (self.module_context != null) {
                 log.warn("[disk-cache] background writer unavailable — module persistence disabled\n", .{});
@@ -1261,8 +1252,6 @@ pub const DiskTier = struct {
             self.freeIndexEntryOwned(e);
         }
         self.entries.deinit(self.allocator);
-        if (self.budget_pool) |pool| pool.close(self.io);
-        self.budget_pool = null;
         self.allocator.free(self.root);
     }
 
@@ -1270,7 +1259,6 @@ pub const DiskTier = struct {
     /// eviction, invalidation, scan-append failure, extend-replace) must go
     /// through this so a new owned field can't leak on one of them.
     fn freeIndexEntryOwned(self: *DiskTier, e: *IndexEntry) void {
-        if (e.disk_reservation) |r| r.release(self.io);
         if (e.module) |*m| m.deinit();
         self.allocator.free(e.tokens);
         self.allocator.free(e.chunk_bytes);
@@ -1282,18 +1270,13 @@ pub const DiskTier = struct {
     /// Re-derive `max_bytes` from the volume. A failed probe keeps the operator cap; a budget
     /// under the store floor declines new stores without touching what is already persisted.
     fn refreshDiskBudget(self: *DiskTier) void {
-        const vs = self.space_probe(self.root) orelse {
-            self.refreshSharedBudget(self.operator_cap);
-            return;
-        };
+        const vs = self.space_probe(self.root) orelse return;
         // Our own entries are already counted in `used`; add what the tier holds back.
         const budget = diskBudgetFromFreeSpace(self.operator_cap, vs.free +| self.physicalDiskBytes(), vs.total);
         if (budget) |b| {
-            self.refreshSharedBudget(self.operator_cap);
-            if (self.store_declined) return;
-            const available = if (self.max_bytes == 0) b else @min(self.max_bytes, b);
-            if (available != self.max_bytes) {
-                self.max_bytes = available;
+            self.store_declined = false;
+            if (b != self.max_bytes) {
+                self.max_bytes = b;
                 self.gcToBudget();
             }
         } else if (!self.store_declined) {
@@ -1308,46 +1291,13 @@ pub const DiskTier = struct {
         }
     }
 
-    /// A finite cap belongs to the common root, not independently to each model or engine.
-    fn refreshSharedBudget(self: *DiskTier, cap: u64) void {
-        const budget: ?u64 = if (cap == 0) 0 else blk: {
-            const pool = self.budget_pool orelse {
-                self.store_declined = true;
-                return;
-            };
-            break :blk pool.available(self.io, cap, 0) catch |err| {
-                if (err != error.DiskBudgetBusy) log.warn("[disk-cache] shared budget unavailable: {s}; new stores declined\n", .{@errorName(err)});
-                self.store_declined = true;
-                return;
-            };
-        };
-        const available = budget orelse {
-            if (!self.store_declined) log.info("[disk-cache] {s}: other cache roots exhaust the shared disk budget; new stores declined\n", .{self.root});
-            self.store_declined = true;
-            return;
-        };
-        self.store_declined = false;
-        if (available != self.max_bytes) {
-            self.max_bytes = available;
-            self.gcToBudget();
-        }
-    }
-
     /// Sweep other models' fingerprints under the same base: strays always, LRU once they
     /// collectively exceed one budget's worth. SSD-first only.
     pub fn sweepSiblings(self: *DiskTier) void {
         if (!self.ssd_first) return;
         const base = self.base_dir orelse return;
         self.refreshDiskBudget();
-        const physical = disk_budget.physicalBytes(self.allocator, self.io, base, null) catch return;
-        const cap = if (self.space_probe(self.root)) |vs|
-            diskBudgetFromFreeSpace(self.operator_cap, vs.free +| physical, vs.total) orelse return
-        else if (self.operator_cap > 0)
-            self.operator_cap
-        else
-            return;
-        sweepBase(self.allocator, self.io, base, self.root, cap);
-        self.refreshDiskBudget();
+        sweepBase(self.allocator, self.io, base, self.root, self.max_bytes);
     }
 
     pub fn entryCount(self: *const DiskTier) usize {
@@ -2058,7 +2008,7 @@ pub const DiskTier = struct {
         // Its eviction swap-removes, so the target crosses it by id; an evicted target is a fresh store.
         const extend_id: ?u64 = if (extend_idx) |i| self.entries.items[i].id else null;
         const ssm_only_id: ?u64 = if (ssm_only_idx) |i| self.entries.items[i].id else null;
-        if (self.ssd_first) self.refreshDiskBudget() else self.refreshSharedBudget(self.operator_cap);
+        if (self.ssd_first) self.refreshDiskBudget();
         // The refresh gates THIS store, not merely the next one.
         if (self.store_declined) return .skipped;
         extend_idx = if (extend_id) |x| self.indexOfId(x) else null;
@@ -2075,7 +2025,6 @@ pub const DiskTier = struct {
         const dir_rel = try std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, id });
         defer self.allocator.free(dir_rel);
         try std.Io.Dir.cwd().createDirPath(self.io, dir_rel);
-        errdefer if (extend_idx == null) self.deleteEntryDir(id);
 
         // Chunks [0, keep) are full chunks already on disk from the entry we
         // extend; everything from `keep` on (the old partial tail + the new
@@ -2088,10 +2037,6 @@ pub const DiskTier = struct {
         // turn diverges inside the generated span and used to rewrite every chunk. Off on a synchronous RAM-first tier.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
         const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
-        const donor_prefix_rows: u32 = if (donor) |d|
-            @intCast(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), mediaSharedBound(self.entries.items[d.idx].media, media)))
-        else
-            kv_target;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -2186,7 +2131,11 @@ pub const DiskTier = struct {
             return if (chunk_complete) .persisted else .partial;
         }
 
-        const prefix_rows = @min(kv_len, donor_prefix_rows);
+        const prefix_rows: u32 = if (donor) |d|
+            @intCast(@min(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)),
+                mediaSharedBound(self.entries.items[d.idx].media, media)))
+        else
+            kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
         const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, inherited_qsa_bytes, prefix_rows, s);
         const complete = chunk_complete and ssm_res.complete;
@@ -2211,9 +2160,12 @@ pub const DiskTier = struct {
         if (extend_idx == null or record.ptr == tokens.ptr) {
             const tpath = try std.fmt.allocPrint(self.allocator, "{s}/tokens.bin", .{dir_rel});
             defer self.allocator.free(tpath);
-            const bytes = try self.allocator.alloc(u8, record.len * @sizeOf(u32));
-            for (record, 0..) |id_, i| std.mem.writeInt(u32, bytes[i * 4 ..][0..4], id_, .little);
-            try self.persistBytes(tpath, bytes);
+            const f = try std.Io.Dir.createFileAbsolute(self.io, tpath, .{});
+            defer f.close(self.io);
+            var wb: [8192]u8 = undefined;
+            var fw = f.writer(self.io, &wb);
+            try fw.interface.writeSliceEndian(u32, record, .little);
+            try fw.interface.flush();
         }
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
@@ -2447,35 +2399,21 @@ pub const DiskTier = struct {
         // drop what it set — or the next decode tick fails an unrelated request.
         const had_error = mlx.errorPending();
         errdefer mlx.dropLatchedErrorUnless(had_error);
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors", .{dir_abs});
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/spec.safetensors\x00", .{dir_abs});
         defer self.allocator.free(path);
         if (dflash == null and mtp == null) {
-            if (self.writer) |w| w.fence(path);
-            self.deleteBudgetedFile(path);
+            std.Io.Dir.deleteFileAbsolute(self.io, path[0 .. path.len - 1]) catch {};
             return .{};
         }
         const tensor_map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        const meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
         var res: SpecSidecarResult = .{};
         if (dflash) |dc| res.dflash = try self.insertSpecTensors(tensor_map, "d", dc, s);
         if (mtp) |mc| res.mtp = try self.insertSpecTensors(tensor_map, "m", mc, s);
-        var list = std.ArrayList(NamedTensor).empty;
-        defer self.freeNamed(&list);
-        const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
-        defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
-        while (true) {
-            var key: ?[*:0]const u8 = null;
-            var value = mlx.mlx_array_new();
-            if (mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter) != 0 or key == null) {
-                _ = mlx.mlx_array_free(value);
-                break;
-            }
-            errdefer _ = mlx.mlx_array_free(value);
-            const name = try self.allocator.dupe(u8, std.mem.span(key.?));
-            errdefer self.allocator.free(name);
-            try list.append(self.allocator, .{ .key = name, .arr = value });
-        }
-        res.bytes = try self.persistTensors(path, list.items, no_meta, s);
+        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
+        res.bytes = fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
         return res;
     }
 
@@ -2794,8 +2732,30 @@ pub const DiskTier = struct {
         }
 
         const path = try std.fmt.allocPrint(self.allocator, "{s}/c{d:0>6}.safetensors", .{ dir_abs, chunk_idx });
+        if (self.writer) |w| {
+            // The readback stays here (mlx arrays are inference-thread-owned); only bytes cross.
+            const bytes = self.serializeSafetensors(list.items, no_meta, s) catch |err| {
+                self.allocator.free(path);
+                return err;
+            };
+            const n = bytes.len;
+            w.submit(path, bytes); // takes both buffers
+            return n;
+        }
         defer self.allocator.free(path);
-        return self.persistTensors(path, list.items, no_meta, s);
+        const tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        const meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        for (list.items) |*t| {
+            const key_z = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{t.key});
+            defer self.allocator.free(key_z);
+            try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key_z.ptr), t.arr));
+        }
+        const path_z = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{path});
+        defer self.allocator.free(path_z);
+        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path_z.ptr), tensor_map, meta_map));
+        return fileSize(self.io, path) orelse 0;
     }
 
     fn appendSlice(
@@ -2846,96 +2806,6 @@ pub const DiskTier = struct {
     fn serializeSafetensors(self: *DiskTier, tensors: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) ![]u8 {
         try materializeContiguous(tensors, s);
         return self.encodeSafetensors(tensors, meta);
-    }
-
-    fn budgetStat(self: *DiskTier, path: []const u8) !?std.Io.File.Stat {
-        return std.Io.Dir.cwd().statFile(self.io, path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => err,
-        };
-    }
-
-    fn persistTensors(self: *DiskTier, path: []const u8, tensors: []NamedTensor, meta: []const MetaPair, s: mlx.mlx_stream) !u64 {
-        const bytes = try self.serializeSafetensors(tensors, meta, s);
-        const n = bytes.len;
-        try self.persistBytes(path, bytes);
-        return n;
-    }
-
-    /// Always consumes bytes; the queued writer owns its own path copy.
-    fn persistBytes(self: *DiskTier, path: []const u8, bytes: []u8) !void {
-        if (self.writer) |w| {
-            const owned = self.allocator.dupe(u8, path) catch |err| {
-                self.allocator.free(bytes);
-                return err;
-            };
-            const lease = self.reserveForFile(path, bytes.len) catch |err| {
-                self.allocator.free(owned);
-                self.allocator.free(bytes);
-                return err;
-            };
-            return w.submitReserved(owned, bytes, lease);
-        }
-        defer self.allocator.free(bytes);
-        const lease = try self.reserveForFile(path, bytes.len);
-        defer lease.release(self.io);
-        try disk_writer.writePublished(self.io, self.budget_pool.?, path, bytes, lease);
-    }
-
-    fn reserveForFile(self: *DiskTier, path: []const u8, bytes: u64) !*disk_budget.Reservation {
-        const pool = self.budget_pool orelse return error.DiskBudgetUnavailable;
-        const cap = if (self.operator_cap == 0) std.math.maxInt(u64) else self.operator_cap;
-        if (bytes > cap) return error.DiskBudgetFull;
-        // Indexed extensions retain array indices across writes; only fresh stores may evict.
-        const fresh = if (self.entryIdFromPath(path)) |id| self.indexOfId(id) == null else false;
-        while (true) {
-            switch (try pool.tryReserve(self.io, path, cap, bytes, .file)) {
-                .granted => |r| return r,
-                .busy => return error.DiskBudgetBusy,
-                .unavailable => return error.DiskBudgetUnavailable,
-                .full => {
-                    if (!fresh) return error.DiskBudgetFull;
-                    const count = self.entries.items.len;
-                    const victim = self.diskLruCandidate() orelse return error.DiskBudgetFull;
-                    self.removeAt(victim);
-                    if (self.entries.items.len >= count) return error.DiskBudgetFull;
-                },
-            }
-        }
-    }
-
-    fn deleteBudgetedFile(self: *DiskTier, path: []const u8) void {
-        const before = self.budgetStat(path) catch {
-            if (self.budget_pool) |pool| pool.unavailable(self.io);
-            return;
-        };
-        std.Io.Dir.deleteFileAbsolute(self.io, path) catch |err| switch (err) {
-            error.FileNotFound => {},
-            else => return,
-        };
-        if (self.budget_pool) |pool| pool.publish(self.io, path, before, null, null) catch pool.unavailable(self.io);
-    }
-
-    fn deleteBudgetedTree(self: *DiskTier, path: []const u8) !void {
-        const pool = self.budget_pool orelse return error.DiskBudgetUnavailable;
-        var observed = try disk_budget.inventory(self.allocator, self.io, path);
-        defer observed.deinit(self.allocator);
-        std.Io.Dir.cwd().deleteTree(self.io, path) catch |err| {
-            pool.unavailable(self.io);
-            return err;
-        };
-        for (observed.items) |file| try pool.publish(self.io, file.path, file.stat, null, null);
-    }
-
-    fn linkBudgeted(self: *DiskTier, dir: std.Io.Dir, source: []const u8, target: []const u8) !void {
-        const path = try std.fs.path.join(self.allocator, &.{ self.root, target });
-        defer self.allocator.free(path);
-        try std.Io.Dir.hardLink(dir, source, dir, target, self.io, .{});
-        if (self.budget_pool) |pool| {
-            errdefer pool.unavailable(self.io);
-            const after = (try self.budgetStat(path)) orelse return error.PublishedFileMissing;
-            try pool.publish(self.io, path, null, after, null);
-        }
     }
 
     /// One `__metadata__` entry. The encoder refuses anything needing JSON escaping.
@@ -3263,9 +3133,37 @@ pub const DiskTier = struct {
             }
         }
 
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
+        if (self.writer) |w| {
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors", .{ dir_rel, cp.pos });
+            const bytes = self.serializeSafetensors(list.items, meta.items, s) catch |err| {
+                self.allocator.free(path);
+                return err;
+            };
+            const n = bytes.len;
+            w.submit(path, bytes); // takes both buffers
+            return n;
+        }
+
+        const tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        const meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        for (meta.items) |m| {
+            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.key});
+            defer self.allocator.free(kz);
+            const vz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.value});
+            defer self.allocator.free(vz);
+            try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(kz.ptr), @ptrCast(vz.ptr)));
+        }
+        for (list.items) |*t| {
+            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{t.key});
+            defer self.allocator.free(kz);
+            try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(kz.ptr), t.arr));
+        }
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors\x00", .{ dir_rel, cp.pos });
         defer self.allocator.free(path);
-        return self.persistTensors(path, list.items, meta.items, s);
+        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
+        return fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
     }
 
     fn qsaHistoryRowsOf(cp: *const transformer_mod.SSMCheckpoint) c_int {
@@ -3330,9 +3228,36 @@ pub const DiskTier = struct {
             }
         }
         if (list.items.len == 0) return 0;
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
+        if (self.writer) |w| {
+            const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
+            const bytes = self.serializeSafetensors(list.items, meta.items, s) catch |err| {
+                self.allocator.free(path);
+                return err;
+            };
+            const n = bytes.len;
+            w.submit(path, bytes);
+            return n;
+        }
+        const tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        const meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        for (meta.items) |m| {
+            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.key});
+            defer self.allocator.free(kz);
+            const vz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{m.value});
+            defer self.allocator.free(vz);
+            try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, @ptrCast(kz.ptr), @ptrCast(vz.ptr)));
+        }
+        for (list.items) |*t| {
+            const kz = try std.fmt.allocPrint(self.allocator, "{s}\x00", .{t.key});
+            defer self.allocator.free(kz);
+            try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(kz.ptr), t.arr));
+        }
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors\x00", .{dir_rel});
         defer self.allocator.free(path);
-        return self.persistTensors(path, list.items, meta.items, s);
+        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
+        return fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
     }
 
     fn loadQsaHistoryFile(self: *DiskTier, id: u64, n_layers: usize) !transformer_mod.SSMCheckpoint {
@@ -3433,7 +3358,7 @@ pub const DiskTier = struct {
             const qpath = try std.fmt.allocPrint(self.allocator, "{s}/qsa.safetensors", .{dir_rel});
             defer self.allocator.free(qpath);
             if (self.writer) |w| w.fence(qpath);
-            self.deleteBudgetedFile(qpath);
+            std.Io.Dir.deleteFileAbsolute(self.io, qpath) catch {};
         }
         const bytes = try self.writeQsaHistoryFile(dir_rel, src, s);
         return .{ .bytes = bytes, .rows = rows, .inherited = false };
@@ -3445,7 +3370,7 @@ pub const DiskTier = struct {
         // A staged checkpoint may still be in the writer's queue; fence it before deleting, or
         // the write lands a file no index names.
         if (self.writer) |w| w.fence(path);
-        self.deleteBudgetedFile(path);
+        std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
     }
 
     // ── Invalidation (mirrors the RAM cache API) ──
@@ -3556,7 +3481,7 @@ pub const DiskTier = struct {
             defer self.allocator.free(old_sub);
             const new_sub = try std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ id, i });
             defer self.allocator.free(new_sub);
-            self.linkBudgeted(root_dir, old_sub, new_sub) catch |err| {
+            std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
                 log.warn("  [disk-cache] chunk share: link e{d}/c{d} -> e{d} failed: {s} — writing the chunks instead\n", .{ d.id, i, id, @errorName(err) });
                 return error.ChunkShareLinkFailed;
             };
@@ -3588,7 +3513,7 @@ pub const DiskTier = struct {
             if (!self.chunkLanded(old_abs, sz)) continue; // still staged in the writer: skip it
             const old_sub = std.fmt.bufPrint(&ob, "e{d}/s{d:0>7}.safetensors", .{ d.id, p }) catch continue;
             const new_sub = std.fmt.bufPrint(&nb, "e{d}/s{d:0>7}.safetensors", .{ id, p }) catch continue;
-            self.linkBudgeted(root_dir, old_sub, new_sub) catch |err| {
+            std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
                 log.warn("  [disk-cache] ssm share: link e{d}/s{d} -> e{d} failed: {s}\n", .{ d.id, p, id, @errorName(err) });
                 continue;
             };
@@ -3618,7 +3543,7 @@ pub const DiskTier = struct {
         defer self.allocator.free(old_sub);
         const new_sub = std.fmt.allocPrint(self.allocator, "e{d}/qsa.safetensors", .{id}) catch return false;
         defer self.allocator.free(new_sub);
-        self.linkBudgeted(root_dir, old_sub, new_sub) catch |err| {
+        std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
             log.warn("  [disk-cache] chunk share: link e{d}/qsa -> e{d} failed: {s} — writing the history instead\n", .{ d.id, id, @errorName(err) });
             return false;
         };
@@ -3636,14 +3561,12 @@ pub const DiskTier = struct {
         return true;
     }
 
-    fn unlinkChunkRange(self: *DiskTier, _: std.Io.Dir, id: u64, from: u32, to: u32) void {
+    fn unlinkChunkRange(self: *DiskTier, root_dir: std.Io.Dir, id: u64, from: u32, to: u32) void {
         var i: u32 = from;
         while (i < to) : (i += 1) {
             const sub = std.fmt.allocPrint(self.allocator, "e{d}/c{d:0>6}.safetensors", .{ id, i }) catch continue;
             defer self.allocator.free(sub);
-            const path = std.fs.path.join(self.allocator, &.{ self.root, sub }) catch continue;
-            defer self.allocator.free(path);
-            self.deleteBudgetedFile(path);
+            root_dir.deleteFile(self.io, sub) catch {};
         }
     }
 
@@ -3659,9 +3582,9 @@ pub const DiskTier = struct {
         if (self.writer) |w| w.fence(dir_abs);
         const rel = std.fmt.allocPrint(self.allocator, "e{d}", .{id}) catch return;
         defer self.allocator.free(rel);
-        const path = std.fs.path.join(self.allocator, &.{ self.root, rel }) catch return;
-        defer self.allocator.free(path);
-        self.deleteBudgetedTree(path) catch {};
+        var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{ .iterate = true }) catch return;
+        defer root_dir.close(self.io);
+        root_dir.deleteTree(self.io, rel) catch {};
     }
 
     fn gcToBudget(self: *DiskTier) void {
@@ -3681,9 +3604,28 @@ pub const DiskTier = struct {
         defer buf.deinit(self.allocator);
         try self.renderMeta(&buf, e);
 
-        const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json", .{ self.root, e.id });
-        defer self.allocator.free(path);
-        try self.persistBytes(path, try self.allocator.dupe(u8, buf.items));
+        const final_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json", .{ self.root, e.id });
+        // One owner per branch: the staged branch's cleanup is an `errdefer` scoped to it (a
+        // `defer` does not cancel an enclosing `errdefer`, and that was a double free on ENOSPC).
+        if (self.writer) |w| {
+            // The index rides the same FIFO queue as the chunks, so it is the last file to land.
+            errdefer self.allocator.free(final_path);
+            const bytes = try self.allocator.dupe(u8, buf.items);
+            w.submit(final_path, bytes);
+            return;
+        }
+        defer self.allocator.free(final_path);
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/meta.json.tmp", .{ self.root, e.id });
+        defer self.allocator.free(tmp_path);
+        {
+            const f = try std.Io.Dir.createFileAbsolute(self.io, tmp_path, .{});
+            defer f.close(self.io);
+            var wb: [1024]u8 = undefined;
+            var fw = f.writer(self.io, &wb);
+            try fw.interface.writeAll(buf.items);
+            try fw.interface.flush();
+        }
+        try std.Io.Dir.renameAbsolute(tmp_path, final_path, self.io);
     }
 
     /// The lowest manifest version that describes this entry. The version is a compatibility
@@ -4177,62 +4119,30 @@ pub const DiskTier = struct {
 /// the stale KV (GC'd by the disk budget eventually; different fingerprint
 /// dirs never mix). 16 hex chars of XxHash64.
 /// Root-wide LRU sweep across sibling model fingerprints (never `keep_root`, which the tier's
-/// own `scan` owns), oldest first until the whole root fits `global_budget`, plus index-less strays that
+/// own `scan` owns), oldest first until they fit `sibling_budget`, plus index-less strays that
 /// are old enough to be crash leftovers. Best effort.
 pub fn sweepBase(
     allocator: std.mem.Allocator,
     io: std.Io,
     base_dir: []const u8,
     keep_root: []const u8,
-    global_budget: u64,
+    sibling_budget: u64,
 ) void {
-    const pool = disk_budget.registeredPool(io, base_dir, keep_root) catch return;
-    defer pool.close(io);
-    const Sweep = struct {
-        allocator: std.mem.Allocator,
-        io: std.Io,
-        base: []const u8,
-        keep: []const u8,
-        budget: u64,
-        pool: *disk_budget.Pool,
-
-        fn run(ctx: *@This()) !void {
-            var before = try disk_budget.inventory(ctx.allocator, ctx.io, ctx.base);
-            defer before.deinit(ctx.allocator);
-            sweepBaseUnfenced(ctx.allocator, ctx.io, ctx.base, ctx.keep, ctx.budget);
-            for (before.items) |file| {
-                _ = std.Io.Dir.cwd().statFile(ctx.io, file.path, .{ .follow_symlinks = false }) catch |err| switch (err) {
-                    error.FileNotFound => {
-                        try ctx.pool.publish(ctx.io, file.path, file.stat, null, null);
-                        continue;
-                    },
-                    else => return err,
-                };
-            }
-        }
-    };
-    var ctx: Sweep = .{ .allocator = allocator, .io = io, .base = base_dir, .keep = keep_root, .budget = global_budget, .pool = pool };
-    _ = pool.sweep(io, &ctx, Sweep.run) catch {};
-}
-
-fn sweepBaseUnfenced(allocator: std.mem.Allocator, io: std.Io, base_dir: []const u8, keep_root: []const u8, global_budget: u64) void {
     var base = std.Io.Dir.openDirAbsolute(io, base_dir, .{ .iterate = true }) catch return;
     defer base.close(io);
 
-    const Victim = struct { path: []u8, mtime: i128 };
+    const Victim = struct { path: []u8, bytes: u64, mtime: i128 };
     var victims = std.ArrayList(Victim).empty;
     defer {
         for (victims.items) |v| allocator.free(v.path);
         victims.deinit(allocator);
     }
+    var total: u64 = 0;
     var strays: usize = 0;
 
     var fps = base.iterate();
     while (fps.next(io) catch null) |fp| {
         if (fp.kind != .directory) continue;
-        // Only modelFingerprintWithLayout's XxHash64 roots belong to this format's eviction.
-        if (fp.name.len != 2 * @sizeOf(u64)) continue;
-        _ = std.fmt.parseUnsigned(u64, fp.name, 16) catch continue;
         const fp_abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_dir, fp.name }) catch continue;
         defer allocator.free(fp_abs);
         if (std.mem.eql(u8, fp_abs, keep_root)) continue; // the live tier owns its own
@@ -4263,33 +4173,33 @@ fn sweepBaseUnfenced(allocator: std.mem.Allocator, io: std.Io, base_dir: []const
             };
             // A `.tmp` older than the same bar is a crash leftover of the writer's tmp+rename.
             reapStaleTmp(io, e_abs);
-            victims.append(allocator, .{ .path = e_abs, .mtime = st.mtime.nanoseconds }) catch {
+            const bytes = dirBytes(io, e_abs);
+            total += bytes;
+            victims.append(allocator, .{ .path = e_abs, .bytes = bytes, .mtime = st.mtime.nanoseconds }) catch {
                 allocator.free(e_abs);
             };
         }
     }
 
     if (strays > 0) log.info("  [disk-cache] swept {d} stray entry directories under {s}\n", .{ strays, base_dir });
-    const total = disk_budget.physicalBytes(allocator, io, base_dir, null) catch return;
-    if (total <= global_budget) return;
+    if (total <= sibling_budget) return;
 
     std.mem.sort(Victim, victims.items, {}, struct {
         fn lt(_: void, a: Victim, b: Victim) bool {
             return a.mtime < b.mtime;
         }
     }.lt);
-    var remaining = total;
+    var freed: u64 = 0;
     for (victims.items) |v| {
-        if (remaining <= global_budget) break;
+        if (total -| freed <= sibling_budget) break;
         deleteTreeAbsolute(io, v.path);
-        remaining = disk_budget.physicalBytes(allocator, io, base_dir, null) catch return;
+        freed += v.bytes;
     }
-    const freed = total -| remaining;
     if (freed > 0) {
         log.info("  [disk-cache] root-wide LRU freed {d} MB across other models ({d} MB held, {d} MB budget)\n", .{
             freed >> 20,
             total >> 20,
-            global_budget >> 20,
+            sibling_budget >> 20,
         });
     }
 }
@@ -4777,9 +4687,8 @@ test "DiskTier: byte budget evicts LRU entries, keeps newest" {
     var buf: [512]u8 = undefined;
     const base = try tmpRoot(&tmp, io, &buf);
 
-    // One complete record fits; keeping two requires evicting the oldest before writing.
-    const cap = 64 * 1024;
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-gc", cap, 128);
+    // Budget deliberately tiny: every new entry evicts the previous one.
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-gc", 4096, 128);
     defer tier.deinit();
 
     var cache = try KVCache.init(testing.allocator, 1);
@@ -4793,35 +4702,14 @@ test "DiskTier: byte budget evicts LRU entries, keeps newest" {
 
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_a, false, null, s);
     _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, null, s);
+    // Both entries exceed 4 KB each — only the newest survives.
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expect(std.mem.eql(u32, tier.entries.items[0].tokens, &tokens_b));
-    try testing.expect(tier.physicalDiskBytes() <= cap);
 
     // The evicted directory is gone from disk.
     const e1_meta = try std.fmt.allocPrint(testing.allocator, "{s}/fp-gc/e1/meta.json", .{base});
     defer testing.allocator.free(e1_meta);
     try testing.expect(statFile(io, e1_meta) == null);
-}
-
-test "DiskTier: byte budget refuses an oversized record and rolls back its partial files" {
-    const io = testing.io;
-    const s = mlx.gpuStream();
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try DiskTier.init(testing.allocator, io, base, "fp-oversized", 12 * 1024, 128);
-    defer tier.deinit();
-    var cache = try KVCache.init(testing.allocator, 1);
-    defer cache.deinit();
-    try fillCache(&cache, s, 1, 520, 8, 0.0, .float32);
-    const tokens = @as([520]u32, @splat(7));
-    try testing.expectError(error.DiskBudgetFull, tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s));
-    try testing.expectEqual(@as(usize, 0), tier.entryCount());
-    try testing.expectEqual(@as(u64, 0), tier.physicalDiskBytes());
-    const directory = try std.fs.path.join(testing.allocator, &.{ tier.root, "e1" });
-    defer testing.allocator.free(directory);
-    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(io, directory, .{}));
 }
 
 test "DiskTier: scan drops crash leftovers (no meta.json)" {
@@ -7345,16 +7233,15 @@ test "DiskTier: SSD-first stages the flush off-thread and indexes LAST" {
         paths.deinit(testing.allocator);
     }
     try tier.writer.?.stagedPaths(&paths, testing.allocator);
-    try testing.expectEqual(@as(usize, 7), paths.items.len); // 5 chunks, tokens and meta
-    for (paths.items[0..5]) |p| {
+    try testing.expectEqual(@as(usize, 6), paths.items.len); // 5 chunks + meta
+    for (paths.items[0 .. paths.items.len - 1]) |p| {
         try testing.expect(std.mem.indexOf(u8, p, "/c0000") != null);
     }
-    try testing.expect(std.mem.endsWith(u8, paths.items[5], "/tokens.bin"));
     try testing.expect(std.mem.endsWith(u8, paths.items[paths.items.len - 1], "/meta.json"));
 
     tier.writer.?.setPaused(false);
     tier.drainWriter();
-    try testing.expectEqual(@as(u64, 7), tier.writer.?.filesWritten());
+    try testing.expectEqual(@as(u64, 6), tier.writer.?.filesWritten());
 
     // The staged bytes are a real safetensors image: a fresh tier restores it.
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssd-writer", 0, 128);
@@ -7435,84 +7322,12 @@ test "DiskTier: SSD-first write-through extends without rewriting a persisted ch
         try testing.expect(std.mem.indexOf(u8, p, "/c000000.") == null);
         try testing.expect(std.mem.indexOf(u8, p, "/c000004.") == null);
     }
-    try testing.expect(staged.items.len <= 3); // the new chunk, tokens.bin and meta.json
+    try testing.expect(staged.items.len <= 2); // the new chunk + meta.json
     tier.writer.?.setPaused(false);
     tier.drainWriter();
-    try testing.expect(tier.writer.?.filesWritten() - written_after_first <= 3);
+    try testing.expect(tier.writer.?.filesWritten() - written_after_first <= 2);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 768), tier.entries.items[0].kv_len);
-}
-
-test "shared disk budget MLX init and refresh subtract native files and never interpret exhaustion as unlimited" {
-    const io = testing.io;
-    const GB: u64 = 1 << 30;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "ds4/model");
-    const native = try tmp.dir.createFile(io, "ds4/model/state.kv", .{});
-    defer native.close(io);
-    try native.setLength(io, 6 * GB);
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try DiskTier.init(testing.allocator, io, base, "0000000000000001", 8 * GB, 128);
-    defer tier.deinit();
-    try testing.expectEqual(@as(u64, 2 * GB), tier.max_bytes);
-    try testing.expect(!tier.store_declined);
-    tier.ssd_first = true;
-    tier.armTestSpace(1024 * GB, 2048 * GB);
-    tier.refreshDiskBudget();
-    try testing.expectEqual(@as(u64, 2 * GB), tier.max_bytes);
-    // Free space already excludes native files: the volume constraint must not charge them twice.
-    tier.armTestSpace(12 * GB, 100 * GB);
-    tier.refreshDiskBudget();
-    try testing.expect(!tier.store_declined);
-    try testing.expectEqual(@as(u64, 2 * GB), tier.max_bytes);
-    tier.armTestSpace(1024 * GB, 2048 * GB);
-    try native.setLength(io, 8 * GB);
-    try tier.budget_pool.?.refresh(io);
-    tier.refreshDiskBudget();
-    try testing.expect(tier.store_declined);
-    try testing.expect(tier.max_bytes != 0);
-    // Decline occurs before any persistence work, including on a RAM-first store.
-    tier.ssd_first = false;
-    const tokens: [MIN_PERSIST_TOKENS]u32 = @splat(7);
-    try testing.expectEqual(PersistOutcome.skipped, try tier.appendCommit(&.{}, tokens.len, kv_quant.KVQuantConfig.dense, &tokens, false, null, mlx.gpuStream()));
-    try testing.expectEqual(@as(usize, 0), tier.entryCount());
-    try testing.expectEqual(@as(u64, 8 * GB), (try tmp.dir.statFile(io, "ds4/model/state.kv", .{})).size);
-    try native.setLength(io, 7 * GB);
-    try tier.budget_pool.?.refresh(io);
-    tier.refreshDiskBudget();
-    try testing.expect(!tier.store_declined);
-    try testing.expectEqual(@as(u64, GB), tier.max_bytes);
-    tier.refreshDiskBudget();
-    try testing.expectEqual(@as(u64, GB), tier.max_bytes);
-}
-
-test "shared disk budget root LRU charges live MLX and native data but only removes MLX fingerprints" {
-    const a = testing.allocator;
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    try tmp.dir.createDirPath(io, "0000000000000002/e1");
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000002/e1/meta.json", .data = "" });
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000002/e1/chunk", .data = &@as([30]u8, @splat(1)) });
-    try tmp.dir.createDirPath(io, "ds4/e999");
-    try tmp.dir.writeFile(io, .{ .sub_path = "ds4/e999/save.tmp", .data = &@as([60]u8, @splat(2)) });
-    const aged: std.Io.Timestamp = .{ .nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds - 2 * @as(i96, @intCast(STRAY_MIN_AGE_NS)) };
-    try tmp.dir.setTimestamps(io, "ds4/e999/save.tmp", .{ .modify_timestamp = .{ .new = aged } });
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var live = try DiskTier.init(a, io, base, "0000000000000001", 0, 128);
-    defer live.deinit();
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000001/held", .data = &@as([20]u8, @splat(3)) });
-    // Nothing is evicted while all engines together fit the cap.
-    sweepBase(a, io, base, live.root, 110);
-    try testing.expect((try tmp.dir.statFile(io, "0000000000000002/e1/chunk", .{})).size == 30);
-    sweepBase(a, io, base, live.root, 100);
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "0000000000000002/e1/chunk", .{}));
-    try testing.expectEqual(@as(u64, 60), (try tmp.dir.statFile(io, "ds4/e999/save.tmp", .{})).size);
-    try testing.expectEqual(@as(u64, 20), (try tmp.dir.statFile(io, "0000000000000001/held", .{})).size);
-    try testing.expectEqual(@as(u64, 80), try disk_budget.physicalBytes(a, io, base, null));
 }
 
 test "diskBudgetFromFreeSpace: reserve is min(64 GiB, 10% of volume); below the floor stores nothing" {
@@ -7590,18 +7405,6 @@ fn commitPairThenShrink(tier: *DiskTier, cache_a: *KVCache, tokens_a: []const u3
     if (!a_first) _ = try tier.appendCommit(cache_a.entries, cache_a.step, cache_a.config, tokens_a, false, null, s);
     try testing.expectEqual(@as(usize, 2), tier.entryCount());
     const gib: u64 = 1024 * 1024 * 1024;
-    // Sparse padding belongs to the LRU entry and the physical ledger, so the
-    // volume refresh has headroom to evict rather than declining this store.
-    const e = &tier.entries.items[tier.diskLruCandidate().?];
-    const path = try std.fmt.allocPrint(tier.allocator, "{s}/e{d}/c000000.safetensors", .{ tier.root, e.id });
-    defer tier.allocator.free(path);
-    const file = try std.Io.Dir.openFileAbsolute(tier.io, path, .{ .mode = .read_write });
-    defer file.close(tier.io);
-    const before = try file.stat(tier.io);
-    try file.setLength(tier.io, before.size + 4 * gib);
-    try tier.budget_pool.?.publish(tier.io, path, before, try file.stat(tier.io), null);
-    e.chunk_bytes[0] += 4 * gib;
-    e.bytes += 4 * gib;
     tier.total_bytes += 4 * gib;
     tier.armTestSpace(63 * gib, 2048 * gib);
 }
@@ -7684,10 +7487,7 @@ test "DiskTier: a checkpoint-only append across an SSD-first refresh that evicts
         };
         defer for (&cps) |*cp| cp.deinit(testing.allocator);
         try commitPairThenShrink(&tier, &cache, &tokens_a, &cache, &tokens_b, a_first, s);
-        const evicted_id = tier.entries.items[tier.diskLruCandidate().?].id;
-        try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_a, false, &cps, s));
-        try testing.expect(!tier.store_declined);
-        try testing.expect(tier.indexOfId(evicted_id) == null);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_a, false, &cps, s);
 
         var found_a = false;
         for (tier.entries.items) |e| {
@@ -7815,7 +7615,7 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
     const base = try tmpRoot(&tmp, io, &buf);
 
     {
-        var sib = try DiskTier.init(testing.allocator, io, base, "0000000000000001", 0, 128);
+        var sib = try DiskTier.init(testing.allocator, io, base, "fp-sibling", 0, 128);
         defer sib.deinit();
         var cache = try KVCache.init(testing.allocator, 1);
         defer cache.deinit();
@@ -7824,36 +7624,36 @@ test "DiskTier: the root-wide sweep drops strays and never touches the live tier
         for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
         _ = try sib.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     }
-    try tmp.dir.createDirPath(io, "0000000000000002/e9");
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000002/e9/c000000.safetensors", .data = "orphan" });
+    try tmp.dir.createDirPath(io, "fp-stray/e9");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-stray/e9/c000000.safetensors", .data = "orphan" });
     const aged: std.Io.Timestamp = .{
         .nanoseconds = std.Io.Timestamp.now(io, .real).nanoseconds - 2 * @as(i96, @intCast(STRAY_MIN_AGE_NS)),
     };
-    try tmp.dir.setTimestamps(io, "0000000000000002/e9/c000000.safetensors", .{ .modify_timestamp = .{ .new = aged } });
+    try tmp.dir.setTimestamps(io, "fp-stray/e9/c000000.safetensors", .{ .modify_timestamp = .{ .new = aged } });
     // Its young twin: index-less but written just now, so it must survive.
-    try tmp.dir.createDirPath(io, "0000000000000003/e3");
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000003/e3/c000000.safetensors", .data = "another server" });
-    var live = try DiskTier.init(testing.allocator, io, base, "0000000000000004", 0, 128);
+    try tmp.dir.createDirPath(io, "fp-inflight/e3");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-inflight/e3/c000000.safetensors", .data = "another server" });
+    var live = try DiskTier.init(testing.allocator, io, base, "fp-live", 0, 128);
     defer live.deinit();
     live.ssd_first = true;
     live.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
     // The live tier's own root, mid-write-through: chunks, no index yet. Staged after init
     // (init's own `scan` rightly drops an index-less entry).
-    try tmp.dir.createDirPath(io, "0000000000000004/e1");
-    try tmp.dir.writeFile(io, .{ .sub_path = "0000000000000004/e1/c000000.safetensors", .data = "inflight" });
+    try tmp.dir.createDirPath(io, "fp-live/e1");
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-live/e1/c000000.safetensors", .data = "inflight" });
     live.max_bytes = 1 << 40;
     sweepBase(testing.allocator, io, base, live.root, live.max_bytes);
 
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "0000000000000002/e9/c000000.safetensors", .{}));
-    try testing.expect(tmp.dir.statFile(io, "0000000000000003/e3/c000000.safetensors", .{}) catch null != null);
-    try testing.expect(tmp.dir.statFile(io, "0000000000000001/e1/meta.json", .{}) catch null != null);
-    try testing.expect(tmp.dir.statFile(io, "0000000000000004/e1/c000000.safetensors", .{}) catch null != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-stray/e9/c000000.safetensors", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
 
     // With a budget of zero the siblings' real entries go too, and the live root is still untouched.
     sweepBase(testing.allocator, io, base, live.root, 0);
-    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "0000000000000001/e1/meta.json", .{}));
-    try testing.expect(tmp.dir.statFile(io, "0000000000000004/e1/c000000.safetensors", .{}) catch null != null);
-    try testing.expect(tmp.dir.statFile(io, "0000000000000003/e3/c000000.safetensors", .{}) catch null != null);
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "fp-sibling/e1/meta.json", .{}));
+    try testing.expect(tmp.dir.statFile(io, "fp-live/e1/c000000.safetensors", .{}) catch null != null);
+    try testing.expect(tmp.dir.statFile(io, "fp-inflight/e3/c000000.safetensors", .{}) catch null != null);
 }
 
 test "DiskTier: SSM retention spacing is priced against the tier, not just capped" {
@@ -9896,147 +9696,6 @@ test "a newer module checkpoint preserves the older unfinished identity" {
     tier.drainWriter();
     try testing.expect(tier.entryWholeOnDisk(old));
     try testing.expect(tier.entryWholeOnDisk(newer));
-}
-
-test "shared disk reservations bound a ds4 write while an 8 GiB module export is pending" {
-    const a = testing.allocator;
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try ModuleSource.init(base, "pending-module");
-    defer tier.deinit();
-    const GiB = 1024 * 1024 * 1024;
-    tier.operator_cap = 10 * GiB;
-    tier.writer.?.setPaused(true);
-    const ids = @as([512]u32, @splat(7));
-    const id = (try tier.registerModule(.{
-        .tokens = &ids,
-        .prefix_key = 18,
-        .has_tools = false,
-        .quant = kv_quant.KVQuantConfig.dense,
-        .header = ModuleSource.header,
-        .tensors = &.{.{ .name = "ring", .dtype = "F32", .shape = &.{ 2, GiB }, .bytes = 8 * GiB }},
-    })).?;
-    const reserved = tier.total_bytes;
-    try testing.expect(reserved >= 8 * GiB);
-    const native_root = try std.fs.path.join(a, &.{ base, "ds4" });
-    defer a.free(native_root);
-    try tmp.dir.createDirPath(io, "ds4");
-    const native_pool = try disk_budget.openPool(a, io, base, native_root);
-    defer native_pool.close(io);
-    try testing.expectEqual(@as(?u64, tier.operator_cap - reserved), try disk_budget.availableBudget(a, io, base, native_root, tier.operator_cap, 0));
-    try testing.expectError(error.DiskBudgetBusy, disk_budget.reserve(a, io, base, native_root, tier.operator_cap, 8 * GiB));
-    const native = (try disk_budget.reserve(a, io, base, native_root, tier.operator_cap, null)).?;
-    {
-        defer native.release(io);
-        // The same allowance passed to native ds4 bounds a real sparse checkpoint file.
-        const file = try tmp.dir.createFile(io, "ds4/state.kvc", .{});
-        defer file.close(io);
-        try file.setLength(io, native.bytes);
-        try native_pool.reconcile(io);
-        try testing.expectEqual(tier.operator_cap, reserved + try disk_budget.physicalBytes(a, io, base, null));
-    }
-    try testing.expect((try disk_budget.availableBudget(a, io, base, native_root, tier.operator_cap, try disk_budget.physicalBytes(a, io, native_root, null))) == null);
-    tier.cancelModule(id, .memory_pressure);
-    tier.cleanupModules();
-    try testing.expectEqual(@as(?u64, tier.operator_cap), try disk_budget.availableBudget(a, io, base, native_root, tier.operator_cap, 0));
-}
-
-test "shared disk reservations release after publication and injected writer failure" {
-    const a = testing.allocator;
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [512]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try ModuleSource.init(base, "pending-lifecycle");
-    defer tier.deinit();
-    const native = try std.fs.path.join(a, &.{ base, "ds4" });
-    defer a.free(native);
-    const native_pool = try disk_budget.openPool(a, io, base, native);
-    defer native_pool.close(io);
-    const id = try ModuleSource.register(&tier, 512);
-    try testing.expectEqual(@as(?u64, tier.operator_cap - tier.total_bytes), try disk_budget.availableBudget(a, io, base, native, tier.operator_cap, 0));
-    try ModuleSource.publish(&tier, id);
-    tier.drainWriter();
-    tier.pollModuleWrites();
-    const physical = try disk_budget.physicalBytes(a, io, base, null);
-    try testing.expectEqual(@as(?u64, tier.operator_cap - physical), try disk_budget.availableBudget(a, io, base, native, tier.operator_cap, 0));
-    try testing.expect(tier.entries.items[tier.indexOfId(id).?].disk_reservation == null);
-    const failed = try ModuleSource.register(&tier, 513);
-    tier.writer.?.setPaused(true);
-    tier.writer.?.injectFailure("m000.", .write);
-    try ModuleSource.publish(&tier, failed);
-    tier.writer.?.setPaused(false);
-    tier.drainWriter();
-    tier.cleanupModules();
-    try testing.expect(tier.moduleState(failed) == null);
-    try testing.expectEqual(@as(?u64, tier.operator_cap - physical), try disk_budget.availableBudget(a, io, base, native, tier.operator_cap, 0));
-}
-
-const BudgetAdmissionProbe = struct {
-    threadlocal var walks: usize = 0;
-    threadlocal var realpaths: usize = 0;
-
-    fn read(ud: ?*anyopaque, reader: *std.Io.Dir.Reader, entries: []std.Io.Dir.Entry) std.Io.Dir.Reader.Error!usize {
-        walks += 1;
-        return testing.io.vtable.dirRead(ud, reader, entries);
-    }
-
-    fn realPathFile(ud: ?*anyopaque, dir: std.Io.Dir, path: []const u8, out: []u8) std.Io.Dir.RealPathFileError!usize {
-        realpaths += 1;
-        return testing.io.vtable.dirRealPathFile(ud, dir, path, out);
-    }
-};
-
-test "discarding a speculative sidecar fences a pending writer and releases its budget" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    var tier = try ModuleSource.init(try tmpRoot(&tmp, testing.io, &buf), "spec-fence");
-    defer tier.deinit();
-    tier.writer.?.setPaused(true);
-    const path = try std.fs.path.join(testing.allocator, &.{ tier.root, "spec.safetensors" });
-    defer testing.allocator.free(path);
-    try tier.persistBytes(path, try testing.allocator.dupe(u8, "pending speculative snapshot"));
-    try testing.expect(tier.writer.?.pendingBytes() > 0);
-    _ = try tier.writeSpecSidecar(tier.root, null, null, mlx.gpuStream());
-    tier.writer.?.setPaused(false);
-    tier.drainWriter();
-    try testing.expectError(error.FileNotFound, std.Io.Dir.cwd().statFile(testing.io, path, .{}));
-    try testing.expectEqual(@as(u64, 0), tier.writer.?.pendingBytes());
-    try testing.expectEqual(@as(u64, 0), tier.physicalDiskBytes());
-}
-
-test "disk budget hot admission registerModule and submitBudgeted perform no traversal" {
-    const a = testing.allocator;
-    const io = testing.io;
-    var tmp = testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const base = try tmpRoot(&tmp, io, &buf);
-    var tier = try ModuleSource.init(base, "budget-hot");
-    defer tier.deinit();
-    tier.writer.?.setPaused(true);
-    var vtable = io.vtable.*;
-    vtable.dirRead = BudgetAdmissionProbe.read;
-    vtable.dirRealPathFile = BudgetAdmissionProbe.realPathFile;
-    const probed: std.Io = .{ .userdata = io.userdata, .vtable = &vtable };
-    tier.io = probed;
-    tier.writer.?.io = probed;
-    BudgetAdmissionProbe.walks = 0;
-    BudgetAdmissionProbe.realpaths = 0;
-    _ = try ModuleSource.register(&tier, 512);
-    try testing.expectEqual(@as(usize, 0), BudgetAdmissionProbe.walks);
-    try testing.expectEqual(@as(usize, 0), BudgetAdmissionProbe.realpaths);
-    const path = try std.fs.path.join(a, &.{ tier.root, "ordinary.safetensors" });
-    const bytes = try a.dupe(u8, "ordinary payload");
-    try tier.writer.?.submitBudgeted(path, bytes, tier.operator_cap);
-    try testing.expect(tier.writer.?.pendingBytes() > 0);
-    try testing.expectEqual(@as(usize, 0), BudgetAdmissionProbe.walks);
-    try testing.expectEqual(@as(usize, 0), BudgetAdmissionProbe.realpaths);
 }
 
 test "reservations never credit free space and active exports survive a lower cap" {

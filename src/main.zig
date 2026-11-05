@@ -396,6 +396,8 @@ fn printUsage(io: std.Io) void {
         \\                      Pass 0/off to disable the byte budget.
         \\  --prefix-cache-disk <n>{{KB,MB,GB}}
         \\                      SSD tier for the prefix cache (default: off).
+        \\                      Budget per MLX model tier and ds4 pool,
+        \\                        not a shared total.
         \\                      Seen prefixes persist under ~/.mlx-serve/kv-cache
         \\                        and are restored across restarts and RAM
         \\                        evictions instead of recomputed. Can use many
