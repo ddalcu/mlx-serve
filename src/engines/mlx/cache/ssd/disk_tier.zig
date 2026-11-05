@@ -3021,9 +3021,34 @@ pub const DiskTier = struct {
         return .{ .positions = positions, .bytes = bytes, .complete = complete, .still_linked = still_linked };
     }
 
+    /// `<root>/e<id>/s<pos>.safetensors`, owned by the caller; null when out of memory.
+    fn ssmPath(self: *DiskTier, id: u64, pos: u64) ?[]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch null;
+    }
+
+    /// What deleting the file at `path` (taken) returns to the volume: its size when no other entry
+    /// links it, else 0; `missing` when it cannot be named or stat'ed.
+    fn freedBytes(self: *DiskTier, path: ?[]u8, missing: u64) u64 {
+        const p = path orelse return missing;
+        defer self.allocator.free(p);
+        const st = statFile(self.io, p) orelse return missing;
+        return if (st.nlink <= 1) st.size else 0;
+    }
+
+    /// The scan's bill for the file at `path` (taken): a linked inode is paid by the first entry
+    /// that sees it; `missing` when it cannot be named or stat'ed.
+    fn billedOnce(self: *DiskTier, path: ?[]u8, missing: u64, seen: *std.AutoHashMap(u64, void)) u64 {
+        const p = path orelse return missing;
+        defer self.allocator.free(p);
+        const st = statFile(self.io, p) orelse return missing;
+        if (st.nlink <= 1) return st.size;
+        const gop = seen.getOrPut(@intCast(st.inode)) catch return st.size;
+        return if (gop.found_existing) 0 else st.size;
+    }
+
     /// Is `e<id>/s<pos>` a hard link another entry also holds?
     fn ssmFileShared(self: *DiskTier, id: u64, pos: u32) bool {
-        const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return false;
+        const path = self.ssmPath(id, pos) orelse return false;
         defer self.allocator.free(path);
         const st = statFile(self.io, path) orelse return false;
         return st.nlink > 1;
@@ -3340,7 +3365,7 @@ pub const DiskTier = struct {
     }
 
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
-        const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
+        const path = self.ssmPath(id, pos) orelse return;
         defer self.allocator.free(path);
         // A staged checkpoint may still be in the writer's queue; fence it before deleting, or
         // the write lands a file no index names.
@@ -3398,41 +3423,16 @@ pub const DiskTier = struct {
         defer self.allocator.free(dir_abs);
         if (self.writer) |w| w.fence(dir_abs);
         var freed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
-        // Checkpoint files may be hard links shared with a chunk-share heir or donor:
-        // only the last link returns its bytes.
-        for (e.ssm_positions, e.ssm_bytes) |pos, b| {
-            const sp = std.fmt.allocPrint(self.allocator, "{s}s{d:0>7}.safetensors", .{ dir_abs, pos }) catch {
-                freed += b;
-                continue;
-            };
-            defer self.allocator.free(sp);
-            if (statFile(self.io, sp)) |st| {
-                if (st.nlink <= 1) freed += st.size;
-            } else freed += b;
-        }
+        // Checkpoints, the QSA history and chunks may be hard links a chunk-share heir or donor
+        // also holds: only the last link returns its bytes.
+        for (e.ssm_positions, e.ssm_bytes) |pos, b| freed += self.freedBytes(self.ssmPath(e.id, pos), b);
         if (e.qsa_history_bytes > 0) {
-            if (std.fmt.allocPrint(self.allocator, "{s}qsa.safetensors", .{dir_abs})) |qp| {
-                defer self.allocator.free(qp);
-                if (statFile(self.io, qp)) |st| {
-                    if (st.nlink <= 1) freed += st.size;
-                } else if (!e.inherited_qsa) {
-                    freed += e.qsa_history_bytes;
-                }
-            } else |_| {
-                if (!e.inherited_qsa) freed += e.qsa_history_bytes;
-            }
+            const qp = std.fmt.allocPrint(self.allocator, "{s}qsa.safetensors", .{dir_abs}) catch null;
+            freed += self.freedBytes(qp, if (e.inherited_qsa) 0 else e.qsa_history_bytes);
         }
         for (e.chunk_bytes, 0..) |cb, i| {
-            const cp = std.fmt.allocPrint(self.allocator, "{s}c{d:0>6}.safetensors", .{ dir_abs, i }) catch {
-                freed += cb;
-                continue;
-            };
-            defer self.allocator.free(cp);
-            if (statFile(self.io, cp)) |st| {
-                if (st.nlink <= 1) freed += st.size;
-            } else if (i >= e.inherited_chunks) {
-                freed += cb;
-            }
+            const cp = std.fmt.allocPrint(self.allocator, "{s}c{d:0>6}.safetensors", .{ dir_abs, i }) catch null;
+            freed += self.freedBytes(cp, if (i >= e.inherited_chunks) cb else 0);
         }
         return freed;
     }
@@ -3508,7 +3508,7 @@ pub const DiskTier = struct {
         var nb: [64]u8 = undefined;
         for (de.ssm_positions, de.ssm_bytes) |p, sz| {
             if (p == 0 or p > bound) continue;
-            const old_abs = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, d.id, p }) catch continue;
+            const old_abs = self.ssmPath(d.id, p) orelse continue;
             defer self.allocator.free(old_abs);
             if (!self.chunkLanded(old_abs, sz)) continue; // still staged in the writer: skip it
             const old_sub = std.fmt.bufPrint(&ob, "e{d}/s{d:0>7}.safetensors", .{ d.id, p }) catch continue;
@@ -3771,68 +3771,14 @@ pub const DiskTier = struct {
             return;
         }
         var billed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
-        // Linked checkpoint files (chunk-share heirs) bill once per inode, like chunks.
-        for (e.ssm_positions, e.ssm_bytes) |pos, b| {
-            const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, e.id, pos }) catch {
-                billed += b;
-                continue;
-            };
-            defer self.allocator.free(sp);
-            const st = statFile(self.io, sp) orelse {
-                billed += b;
-                continue;
-            };
-            if (st.nlink <= 1) {
-                billed += st.size;
-                continue;
-            }
-            const gop = seen.getOrPut(@intCast(st.inode)) catch {
-                billed += st.size;
-                continue;
-            };
-            if (!gop.found_existing) billed += st.size;
-        }
+        for (e.ssm_positions, e.ssm_bytes) |pos, b| billed += self.billedOnce(self.ssmPath(e.id, pos), b, seen);
         if (e.qsa_history_bytes > 0) {
-            if (std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id })) |qp| {
-                defer self.allocator.free(qp);
-                if (statFile(self.io, qp)) |st| {
-                    if (st.nlink <= 1) {
-                        billed += st.size;
-                    } else {
-                        const ino: u64 = @intCast(st.inode);
-                        if (seen.getOrPut(ino)) |gop| {
-                            if (!gop.found_existing) billed += st.size;
-                        } else |_| {
-                            billed += st.size;
-                        }
-                    }
-                } else if (!e.inherited_qsa) {
-                    billed += e.qsa_history_bytes;
-                }
-            } else |_| {
-                if (!e.inherited_qsa) billed += e.qsa_history_bytes;
-            }
+            const qp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id }) catch null;
+            billed += self.billedOnce(qp, if (e.inherited_qsa) 0 else e.qsa_history_bytes, seen);
         }
         for (e.chunk_bytes, 0..) |cb, i| {
-            const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, e.id, i }) catch {
-                billed += cb;
-                continue;
-            };
-            defer self.allocator.free(cp);
-            const st = statFile(self.io, cp) orelse {
-                billed += cb;
-                continue;
-            };
-            if (st.nlink <= 1) {
-                billed += st.size;
-                continue;
-            }
-            const ino: u64 = @intCast(st.inode);
-            const gop = seen.getOrPut(ino) catch {
-                billed += st.size;
-                continue;
-            };
-            if (!gop.found_existing) billed += st.size;
+            const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, e.id, i }) catch null;
+            billed += self.billedOnce(cp, cb, seen);
         }
         e.bytes = billed;
     }
@@ -3999,7 +3945,7 @@ pub const DiskTier = struct {
                     const pos = jsonU64(o, "pos") orelse continue;
                     const szrec = jsonU64(o, "bytes") orelse continue;
                     if (pos == 0 or pos > kv_len) continue; // beyond the salvaged KV → unusable
-                    const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch continue;
+                    const sp = self.ssmPath(id, pos) orelse continue;
                     defer self.allocator.free(sp);
                     const have = fileSize(self.io, sp) orelse continue;
                     if (have != szrec) continue; // truncated mid-flush — drop this position
