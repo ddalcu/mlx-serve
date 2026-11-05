@@ -559,6 +559,7 @@ pub fn main(init: std.process.Init) !void {
     // `runHeadlessServe` (the mode the app always launches) silently ate the
     // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
     // (~121 GB on a 128 GB Mac) is no defense.
+    mlx.exportResidencyRefresh();
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
     mlx.exportCudaHome();

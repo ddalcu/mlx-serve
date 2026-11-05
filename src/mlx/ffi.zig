@@ -175,6 +175,14 @@ pub fn exportPtxCacheDir(stamp: []const u8) void {
     if (ptxCacheDir(&buf, tmp, stampId(&id_buf, stamp))) |dir| env.set(.MLX_PTX_CACHE_DIR, dir.ptr);
 }
 
+/// macOS drops Metal residency ~2 s after the GPU idles and MLX requests it once per set, so
+/// between requests a near-RAM model is compressed until the machine panics. Must run before
+/// MLX builds its device.
+pub fn exportResidencyRefresh() void {
+    if (comptime builtin.os.tag != .macos) return;
+    if (env.get(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS) == null) env.set(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS, "1000");
+}
+
 var cuda_cache: ?bool = null;
 
 /// The stream weight files load on. A CPU-stream load allocates host memory: on a discrete

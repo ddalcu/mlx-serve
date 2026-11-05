@@ -273,6 +273,17 @@ pub const Table = struct {
         return false;
     }
 
+    /// A plain token is less work than any speculative round, so a serial tick past
+    /// IMPLAUSIBLE_STEP of the bucket's narrowest trusted round carried foreign work. The only
+    /// check a cold serial cell gets: one contended probe otherwise seeds it for the process.
+    fn serialImplausible(self: *const Table, bucket: usize, ms: f32) bool {
+        for (self.cells[1..]) |row| {
+            if (row[bucket].n < MIN_SAMPLES) continue;
+            return ms > row[bucket].ms * IMPLAUSIBLE_STEP;
+        }
+        return false;
+    }
+
     /// Clear every width cell that fails the step bound against its narrower neighbour or
     /// the wider bound against its wider one (the persisted-table sweep); returns the count cleared.
     fn dropImplausibleCells(self: *Table) u32 {
@@ -307,7 +318,7 @@ pub const Table = struct {
             return .transition;
         }
         const bucket = self.bucketOf(kv_len);
-        if (selfSpike(self.serial[bucket], ms, self.serial_seq)) {
+        if (self.serialImplausible(bucket, ms) or selfSpike(self.serial[bucket], ms, self.serial_seq)) {
             self.dropped_implausible += 1;
             return .implausible;
         }
@@ -1488,6 +1499,14 @@ test "round_cost: a sample past SELF_SPIKE of the cell's own mature value is rej
     var u = Table{};
     _ = u.observe(1, 1000, 41.0, 1.8, true, false);
     try testing.expectEqual(Verdict.folded, u.observe(1, 1000, 150.0, 1.8, true, false));
+}
+
+test "round_cost: a serial tick costlier than the bucket's trusted rounds is refused, so a contended probe cannot seed (#1078)" {
+    var t = Table{ .layout = .long };
+    feed(&t, 2, 70_000, 28.0, 2.4);
+    try testing.expectEqual(Verdict.implausible, t.observeSerial(70_000, 155.0, true, false));
+    try testing.expectEqual(@as(u32, 0), t.serial[bucketFor(70_000)].n);
+    try testing.expectEqual(Verdict.reseeded, t.observeSerial(70_000, 12.0, true, false));
 }
 
 test "round_cost: the load sweep bounds against the nearest TRUSTED narrower cell, so a chain of bad cells all drop" {
