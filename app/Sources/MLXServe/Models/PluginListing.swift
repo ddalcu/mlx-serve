@@ -58,15 +58,17 @@ enum PluginListing {
         var id: String { source?.localRepoId ?? text }
     }
 
-    /// A catalog `models` line, `<what> (<org>/<name>)`: the trailing parentheses are a repo only in that shape.
+    /// A catalog `models` line, `<what> (<org>/<name>)` or `<what> (<org>/<name>@<branch>)`: the trailing
+    /// parentheses are a pack only in those shapes.
     static func packs(_ entry: PluginCatalog.Entry) -> [Pack] {
         entry.models.map { line in
             guard line.hasSuffix(")"), let open = line.range(of: " (", options: .backwards) else { return Pack(text: line, repo: nil) }
             let inside = String(line[open.upperBound..<line.index(before: line.endIndex)])
-            guard inside.range(of: #"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$"#, options: .regularExpression) != nil else {
+            guard inside.range(of: #"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(@[^\s()@:]+)?$"#, options: .regularExpression) != nil,
+                  let source = HFSource.parse(inside) else {
                 return Pack(text: line, repo: nil)
             }
-            return Pack(text: String(line[..<open.lowerBound]), repo: inside)
+            return Pack(text: String(line[..<open.lowerBound]), repo: source.repo, revision: source.revision)
         }
     }
 
