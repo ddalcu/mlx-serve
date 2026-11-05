@@ -135,6 +135,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 const testing = std.testing;
 
 test "clef plugin: a decision on the tiny pack is deterministic JSON; truncate and images are checked by name" {
+    if (@import("../../mlx/ffi.zig").virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var pack = try MediaPack.open(arena.allocator());
