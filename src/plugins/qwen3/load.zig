@@ -149,6 +149,13 @@ pub const Reader = struct {
         if (!tied) return error.MissingWeight;
         return embed;
     }
+
+    pub fn hasHead(r: *Reader) bool {
+        var nb: [160]u8 = undefined;
+        const nested = if (std.mem.eql(u8, r.prefix, "language_model.model")) "language_model" else r.prefix;
+        const key = std.fmt.bufPrint(&nb, "{s}.lm_head.weight", .{nested}) catch return false;
+        return r.src.tensor(key).ctx != null or r.src.tensor("lm_head.weight").ctx != null;
+    }
 };
 
 /// Joins quantized projections reading one input into one buffer (rows) when they share a packed geometry, rewriting

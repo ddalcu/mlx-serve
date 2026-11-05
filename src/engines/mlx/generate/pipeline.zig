@@ -256,7 +256,7 @@ pub fn rollbackSsmFromCapture(self: *Generator, entries: []transformer_mod.SSMCa
 /// only: a live batched group's states are copies, and a model that writes its state in place keeps none.
 pub fn pushSsmLag(self: *Generator) void {
     const entries = self.ctx.ssm_entries orelse return;
-    if (self.xfm.config.plugin) |b| if (b.parsed.cache.ssm_state.snapshot_policy == .in_place) return;
+    if (ssmWrittenInPlace(self)) return;
     for (entries) |*e| if (e.group) |g| if (g.live) return;
     var oldest = self.ssm_lag[0];
     self.ssm_lag[0] = self.ssm_lag[1];
@@ -269,6 +269,12 @@ pub fn pushSsmLag(self: *Generator) void {
     for (entries, oldest.snaps) |*e, *s| s.* = ssmSnapshot(e);
     oldest.pos = self.ctx.moe_seq_offset.*;
     self.ssm_lag[1] = oldest;
+}
+
+pub fn ssmWrittenInPlace(self: *const Generator) bool {
+    if (self.ctx.ssm_entries == null) return false;
+    const b = self.xfm.config.plugin orelse return false;
+    return b.parsed.cache.ssm_state.snapshot_policy == .in_place;
 }
 
 /// Restore the recurrent state a pipelined step started from at `pos` (the committed length), so

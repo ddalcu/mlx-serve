@@ -897,7 +897,7 @@
 "Laya Decisions" = "Laya 决策";
 "Laya is not a chat model. It reads a piece of text (the state) and answers typed questions about it in one forward pass, with calibrated probabilities. A few milliseconds per request, so it suits routing, triage, moderation and scoring." = "Laya 不是聊天模型。它读取一段文本（state），一次前向就对它回答带类型的问题，并给出校准过的概率。每个请求只需几毫秒，适合分流、分诊、审核与评分。";
 "Layer weights (%lld numbers, comma or space separated)" = "层权重（%lld 个数字，用逗号或空格分隔）";
-"Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens." = "留空则使用浏览器登录（推荐）。仅在无界面 / CI 场景下填写。可在 dev.azure.com/<org>/_usersSettings/tokens 创建。";
+"Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens. A saved token is kept when this is blank; remove it in mcp.json." = "留空则使用浏览器登录（推荐）。仅在无界面 / CI 场景下填写。可在 dev.azure.com/<org>/_usersSettings/tokens 创建。留空时保留已保存的令牌；如需删除，请编辑 mcp.json。";
 "Leave it empty to go back to the automatic name." = "留空即可恢复为自动命名。";
 "Length: same as the source clip." = "长度：与源音频片段相同。";
 "Let the model read files, run commands, search the web, and write code." = "让模型读取文件、运行命令、搜索网页并编写代码。";
@@ -2480,3 +2480,9 @@
 "%@ not measured yet" = "%@ 尚未测量";
 "%@ %@ tokens per second" = "%@ 每秒 %@ 个 Token";
 "Opens the usage dashboard" = "打开用量面板";
+"Rebuild all" = "全部重新构建";
+"Rebuild every plugin this mlx-serve refused as built for another version" = "重新构建所有被此 mlx-serve 拒绝的插件（它们是为其他版本构建的）";
+"This mlx-serve refused it: %@." = "此 mlx-serve 拒绝加载它：%@。";
+"Rebuild" = "重新构建";
+"Not in the catalog: rebuild it from its source with this release's kit" = "不在目录中：请用此版本的工具包从源码重新构建";
+"Needs rebuild" = "需要重新构建";

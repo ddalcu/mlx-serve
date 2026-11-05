@@ -7,6 +7,7 @@ import AppKit
 /// the switches at startup. Pure rules: `PluginListing`, `PluginCatalog`.
 struct PluginsPane: View {
     @StateObject private var manager = PluginManager()
+    @EnvironmentObject private var server: ServerManager
     @State private var switches = OutsidePlugins.loadSwitches()
     @State private var saveError: String?
     @State private var selection: PluginListing.Selection?
@@ -36,7 +37,7 @@ struct PluginsPane: View {
                              setSwitch: { name, on in switches.set(name, on: on); save() })
             }
         }
-        .task { await manager.loadCatalog() }
+        .task { await manager.loadCatalog(port: server.port) }
     }
 
     private var header: some View {
@@ -49,7 +50,15 @@ struct PluginsPane: View {
             }
             Spacer()
             if manager.loadingCatalog { ProgressView().controlSize(.small) }
-            Button { Task { await manager.loadCatalog() } } label: {
+            let stale = PluginListing.rebuildable(PluginListing.items(receipts: manager.receipts, catalog: manager.catalog).installed,
+                                                  server: manager.serverStatus)
+            if !stale.isEmpty {
+                Button { manager.prepare(stale) } label: { Text("Rebuild all").font(.app(.value, weight: .medium)) }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(manager.isBusy)
+                    .help(L10n.text("Rebuild every plugin this mlx-serve refused as built for another version"))
+            }
+            Button { Task { await manager.loadCatalog(port: server.port) } } label: {
                 Label { Text("Refresh").font(.app(.value)) } icon: { Image(systemName: "arrow.clockwise") }
             }
             .disabled(manager.loadingCatalog || manager.isBusy)
@@ -111,7 +120,7 @@ private struct PluginList: View {
     }
 
     private func row(_ item: PluginListing.Item) -> some View {
-        let state = PluginListing.state(item, switches: switches, running: manager.runningVersion)
+        let state = PluginListing.state(item, switches: switches, running: manager.runningVersion, server: manager.serverStatus)
         return PluginListRow(selected: selection == .plugin(item.name), action: { select(.plugin(item.name)) }) {
             PluginMonogram(name: item.name, kind: item.kind, size: 28)
             VStack(alignment: .leading, spacing: 1) {
@@ -119,7 +128,7 @@ private struct PluginList: View {
                 Text(PluginLabels.kind(item.kind)).font(.app(.annotation)).foregroundStyle(.secondary)
             }
             Spacer(minLength: 4)
-            if manager.phase.pluginName == item.name, manager.isBusy {
+            if manager.isBusy, manager.pending.contains(item.name) {
                 ProgressView().controlSize(.small)
             } else {
                 PluginStateBadge(state: state, compact: true)
@@ -187,7 +196,7 @@ private struct PluginPage: View {
     @State private var onDisk: Set<String> = []
     @State private var copied = false
 
-    private var state: PluginListing.State { PluginListing.state(item, switches: switches, running: manager.runningVersion) }
+    private var state: PluginListing.State { PluginListing.state(item, switches: switches, running: manager.runningVersion, server: manager.serverStatus) }
     private var packs: [PluginListing.Pack] { item.entry.map(PluginListing.packs) ?? [] }
 
     var body: some View {
@@ -196,7 +205,11 @@ private struct PluginPage: View {
             if let summary = item.entry?.summary, !summary.isEmpty {
                 Text(summary).font(.app(.explainer)).fixedSize(horizontal: false, vertical: true)
             }
-            if manager.phase.pluginName == item.name { PluginInstallPanel(manager: manager) }
+            if manager.phase != .idle, manager.pending.contains(item.name) { PluginInstallPanel(manager: manager) }
+            if state == .needsRebuild, let why = manager.serverStatus[item.name]?.why {
+                Text(L10n.format("This mlx-serve refused it: %@.", why))
+                    .font(.app(.annotation)).foregroundStyle(.orange).textSelection(.enabled)
+            }
             needs
             if !packs.isEmpty { packList }
             if let receipt = item.receipt { details(receipt) }
@@ -235,6 +248,12 @@ private struct PluginPage: View {
             }
             .buttonStyle(.borderedProminent)
             .disabled(manager.isBusy)
+            removeButton
+        case .needsRebuild:
+            Button { if let e = item.entry { manager.prepare(e) } } label: { Text("Rebuild").font(.app(.value, weight: .medium)) }
+                .buttonStyle(.borderedProminent)
+                .disabled(manager.isBusy || item.entry == nil)
+                .help(item.entry == nil ? L10n.text("Not in the catalog: rebuild it from its source with this release's kit") : "")
             removeButton
         case .on, .off:
             Toggle(isOn: Binding(get: { switches.isOn(item.name) }, set: { setSwitch(item.name, $0) })) {
@@ -275,7 +294,7 @@ private struct PluginPage: View {
 
     private var packList: some View {
         PluginSection(title: "Packs it serves") {
-            ForEach(packs, id: \.text) { pack in
+            ForEach(packs) { pack in
                 HStack(alignment: .center, spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(pack.text).font(.app(.rowTitle))
@@ -419,6 +438,7 @@ private struct PluginStateBadge: View {
         case .updateAvailable(let v): return (compact ? L10n.text("Update") : L10n.format("Update to %@", v), .orange)
         case .available: return (L10n.text("Not installed"), .blue)
         case .needsNewer(let r): return (compact ? L10n.text("Needs update") : L10n.format("Needs mlx-serve %@", r), .red)
+        case .needsRebuild: return (L10n.text("Needs rebuild"), .orange)
         }
     }
 
@@ -475,17 +495,6 @@ private struct PluginFactRow: View {
             Text(L10n.text(label)).font(.app(.annotation)).foregroundStyle(.secondary).frame(width: 70, alignment: .leading)
             Text(value).font(mono ? .app(.annotation, design: .monospaced) : .app(.value)).textSelection(.enabled)
             Spacer(minLength: 0)
-        }
-    }
-}
-
-private extension PluginManager.Phase {
-    /// The plugin an install step is about, if any.
-    var pluginName: String? {
-        switch self {
-        case .idle: return nil
-        case .fetching(let n), .building(let n), .done(let n): return n
-        case .awaitingConfirmation(let n, _, _), .failed(let n, _): return n
         }
     }
 }

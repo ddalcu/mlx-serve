@@ -408,6 +408,7 @@ pub fn register(set: *kc.Set) !void {
         .in_place = true,
         .tiles = .{ .{}, .{ .size = NAX_NR * NAX_NSG, .step = NAX_NR * NAX_NSG, .min = NAX_NR * NAX_NSG }, .{} },
         .served = &served_nax,
+        .nax = true,
     });
 }
 

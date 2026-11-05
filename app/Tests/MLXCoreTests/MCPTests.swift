@@ -343,6 +343,131 @@ final class MCPTests: XCTestCase {
         XCTAssertEqual(rematerialized.env?["GITHUB_PERSONAL_ACCESS_TOKEN"], "ghp_abc123")
     }
 
+    /// A catalog row used to re-materialize from the catalog's own `command: "npx"`,
+    /// so a stored absolute interpreter and a hand-added `env.PATH` (what a
+    /// Homebrew `npx` needs from a GUI process) came back as bare `npx` with no
+    /// env on every toggle. The form owns only its inputs' fields.
+    func testCatalogMaterializeKeepsTheStoredCommandEnvAndCwd() {
+        guard let shell = MCPCatalog.entry(for: "shell") else { return XCTFail("shell missing") }
+        var stored = MCPServerEntry(command: "/opt/homebrew/bin/npx",
+                                    args: ["-y", "@mkusaka/mcp-shell-server"],
+                                    env: ["PATH": "/opt/homebrew/bin:/usr/bin:/bin"],
+                                    disabled: true, cwd: "~/work")
+        stored.extra = ["timeout": .int(30)]
+
+        let on = MCPMarketplaceView.materialized(shell, over: stored, values: [:])
+
+        XCTAssertEqual(on.command, "/opt/homebrew/bin/npx")
+        XCTAssertEqual(on.env?["PATH"], "/opt/homebrew/bin:/usr/bin:/bin")
+        XCTAssertEqual(on.cwd, "~/work")
+        XCTAssertEqual(on.extra["timeout"], .int(30))
+        XCTAssertEqual(on.disabled, false)
+    }
+
+    /// A plain env input follows its field (blank clears it); a hand-added env
+    /// key beside it survives.
+    func testCatalogMaterializeFormInputsOverlayTheStoredEnv() {
+        guard let github = MCPCatalog.entry(for: "github") else { return XCTFail("github missing") }
+        var stored = github.materialize(values: ["github_token": "ghp_old"])
+        stored.env?["PATH"] = "/opt/homebrew/bin:/usr/bin:/bin"
+
+        let retyped = MCPMarketplaceView.materialized(github, over: stored, values: ["github_token": "ghp_new"])
+        XCTAssertEqual(retyped.env?["GITHUB_PERSONAL_ACCESS_TOKEN"], "ghp_new")
+        XCTAssertEqual(retyped.env?["PATH"], "/opt/homebrew/bin:/usr/bin:/bin")
+
+        let cleared = MCPMarketplaceView.materialized(github, over: stored, values: [:])
+        XCTAssertNil(cleared.env?["GITHUB_PERSONAL_ACCESS_TOKEN"])
+        XCTAssertEqual(cleared.env?["PATH"], "/opt/homebrew/bin:/usr/bin:/bin")
+    }
+
+    /// Toggling `shell` and `filesystem` through the marketplace's save path
+    /// writes `command`, `env`, `disabled` and an unknown key back unchanged.
+    func testMarketplaceSavePathRoundTripsAbsoluteCommandAndEnv() throws {
+        let tmp = NSTemporaryDirectory().appending("mcp-cmd-env-\(UUID().uuidString).json")
+        setenv("MCP_CONFIG_PATH", tmp, 1)
+        defer { unsetenv("MCP_CONFIG_PATH"); try? FileManager.default.removeItem(atPath: tmp) }
+        let source = #"""
+        {
+          "mcpServers": {
+            "shell": {
+              "command": "/opt/homebrew/bin/npx",
+              "args": ["-y", "@mkusaka/mcp-shell-server"],
+              "env": { "PATH": "/opt/homebrew/bin:/usr/bin:/bin" },
+              "disabled": true,
+              "alwaysAllow": ["run"]
+            },
+            "filesystem": {
+              "command": "/opt/homebrew/bin/npx",
+              "args": ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/ws"],
+              "env": { "PATH": "/opt/homebrew/bin:/usr/bin:/bin" },
+              "disabled": true
+            }
+          }
+        }
+        """#
+        try source.data(using: .utf8)!.write(to: URL(fileURLWithPath: tmp))
+
+        var config = MCPConfigStore.load()
+        for id in ["shell", "filesystem"] {
+            let entry = try XCTUnwrap(MCPCatalog.entry(for: id))
+            let stored = config.mcpServers[id]
+            let values = stored.map(entry.extractValues(from:)) ?? [:]
+            config.mcpServers[id] = MCPMarketplaceView.materialized(entry, over: stored, values: values)
+            config.mcpServers[id]?.disabled = true   // toggled back off
+        }
+        try MCPConfigStore.save(config)
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: tmp))
+        let raw = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let servers = try XCTUnwrap(raw["mcpServers"] as? [String: Any])
+        for id in ["shell", "filesystem"] {
+            let server = try XCTUnwrap(servers[id] as? [String: Any], id)
+            XCTAssertEqual(server["command"] as? String, "/opt/homebrew/bin/npx", id)
+            XCTAssertEqual(server["env"] as? [String: String], ["PATH": "/opt/homebrew/bin:/usr/bin:/bin"], id)
+            XCTAssertEqual(server["disabled"] as? Bool, true, id)
+        }
+        XCTAssertEqual((servers["shell"] as? [String: Any])?["alwaysAllow"] as? [String], ["run"])
+        XCTAssertEqual((servers["filesystem"] as? [String: Any])?["args"] as? [String],
+                       ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/ws"])
+    }
+
+    /// An encoded secret is never shown (`extractValues` skips it), so its blank
+    /// field keeps the stored key and the args its presence added.
+    func testCatalogMaterializeKeepsAnEncodedSecretItCannotShow() {
+        guard let ado = MCPCatalog.entry(for: "azure-devops") else { return XCTFail("azure-devops missing") }
+        let stored = ado.materialize(values: ["ado_org": "contoso", "ado_pat": "secret"])
+        let pat = stored.env?["PERSONAL_ACCESS_TOKEN"]
+        XCTAssertNotNil(pat)
+        XCTAssertEqual(stored.args, ["-y", "@azure-devops/mcp", "contoso", "--authentication", "pat"])
+
+        let toggled = MCPMarketplaceView.materialized(ado, over: stored, values: ado.extractValues(from: stored))
+        XCTAssertEqual(toggled.env?["PERSONAL_ACCESS_TOKEN"], pat)
+        XCTAssertEqual(toggled.args, stored.args)
+
+        let reOrg = MCPMarketplaceView.materialized(ado, over: stored, values: ["ado_org": "fabrikam"])
+        XCTAssertEqual(reOrg.env?["PERSONAL_ACCESS_TOKEN"], pat)
+        XCTAssertEqual(reOrg.args, ["-y", "@azure-devops/mcp", "fabrikam", "--authentication", "pat"])
+
+        let retyped = MCPMarketplaceView.materialized(ado, over: stored, values: ["ado_org": "contoso", "ado_pat": "other"])
+        XCTAssertEqual(retyped.env?["PERSONAL_ACCESS_TOKEN"],
+                       ado.materialize(values: ["ado_org": "contoso", "ado_pat": "other"]).env?["PERSONAL_ACCESS_TOKEN"])
+    }
+
+    /// `args` stay as stored, hand-added flags included, until a form value
+    /// that feeds them changes; then they are rebuilt from the catalog.
+    func testCatalogMaterializeRebuildsArgsOnlyWhenAFormArgChanges() {
+        guard let fs = MCPCatalog.entry(for: "filesystem") else { return XCTFail("filesystem missing") }
+        let stored = MCPServerEntry(command: "npx",
+                                    args: ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/ws", "--readonly"],
+                                    env: nil, disabled: true)
+
+        let toggled = MCPMarketplaceView.materialized(fs, over: stored, values: fs.extractValues(from: stored))
+        XCTAssertEqual(toggled.args, stored.args)
+
+        let moved = MCPMarketplaceView.materialized(fs, over: stored, values: ["root_path": "/Users/me/other"])
+        XCTAssertEqual(moved.args, ["-y", "@modelcontextprotocol/server-filesystem", "/Users/me/other"])
+    }
+
     func testCatalogMaterializeReplacesArgPlaceholder() {
         guard let dbhub = MCPCatalog.entry(for: "dbhub") else { return XCTFail("dbhub missing") }
         let dsn = "postgres://u:p@host:5432/db"

@@ -200,12 +200,11 @@ int mlx_apply(mlx_vector_array* outputs, mlx_fast_metal_kernel cls, mlx_vector_a
     for (auto& x : ins) nv->in_class.push_back(input_class(x));
     nv->out_dtypes = cfg.output_dtypes;
     nv->kernel_name = std::get<0>(st);
-    const std::string& source = std::get<1>(st);
     char hex[32];
-    std::snprintf(hex, sizeof hex, "%zx", std::hash<std::string>{}(source));
-    nv->lib_name = nv->kernel_name + "_" + hex + "_" + std::to_string(std::get<10>(st));
-    nv->shape_infos = std::get<4>(st);
-    nv->ensure_row_contiguous = std::get<5>(st);
+    std::snprintf(hex, sizeof hex, "%zx", std::get<2>(st));
+    nv->lib_name = nv->kernel_name + "_" + hex + "_" + std::to_string(std::get<11>(st));
+    nv->shape_infos = std::get<5>(st);
+    nv->ensure_row_contiguous = std::get<6>(st);
     c.variants.push_back(std::move(nv));
   }
   return 0;
@@ -255,7 +254,7 @@ int mlxlc_apply(mlx_vector_array* outputs, mlx_fast_metal_kernel cls, const mlx_
       auto& d = mx::metal::device(mx::Device::gpu);
       MTL::Library* lib = nullptr;
       try {
-        lib = d.get_library(v->lib_name, mx::CompileOptions{}, []() -> std::string { throw mlxlc::NotBuilt{}; });
+        lib = d.get_library(v->lib_name, mx::fast::CompileOptions{}, []() -> std::string { throw mlxlc::NotBuilt{}; });
       } catch (const mlxlc::NotBuilt&) {
       }
       if (lib != nullptr) v->pipeline = d.get_kernel(v->kernel_name, lib);
@@ -330,7 +329,7 @@ int mlxlc_test_bench(mlx_fast_metal_kernel k, mlx_fast_metal_kernel_config confi
       bytes = src.size();
       char hex[32];
       std::snprintf(hex, sizeof hex, "%zx", std::hash<std::string>{}(src));
-      std::string lib = std::get<0>(st) + "_" + hex + "_" + std::to_string(std::get<10>(st));
+      std::string lib = std::get<0>(st) + "_" + hex + "_" + std::to_string(std::get<11>(st));
       sink = sink + lib.size();
       mlx_vector_array_free(outs);
     }

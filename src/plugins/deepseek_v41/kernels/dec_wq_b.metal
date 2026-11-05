@@ -2,7 +2,7 @@ constexpr int K = 1280, D = 512, IHD = 128, NT = SGS * 32, PI = 16 / SGS, RQ = S
 const uint tg = threadgroup_position_in_grid.x;
 const uint tid = thread_index_in_threadgroup, sg = simdgroup_index_in_threadgroup, lane = thread_index_in_simdgroup;
 const uint h = lane >> 4, j = lane & 15;
-threadgroup float4 xs[R * 320];
+threadgroup ushort4 xs[R * 320]; // bf16 bits: half the bytes, so two threadgroups fit a core at R = 6
 threadgroup float ps[R * SGS];
 threadgroup float t_s[16];
 
@@ -57,7 +57,7 @@ if (int(tg) == G - 1) {
       const float o = metal::simd_shuffle_xor(r, 1);
       const bool even = (d & 1) == 0;
       const float x1 = even ? r : o, x2 = even ? o : r;
-      const float theta = float(kv_l + pos) * (1.0f / periods[(d - (D - RD)) / 2]);
+      const float theta = float(pos[kv_l]) * (1.0f / periods[(d - (D - RD)) / 2]);
       const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);
       r = float(T(even ? x1 * cs - x2 * sn : x1 * sn + x2 * cs));
     }
@@ -67,7 +67,7 @@ if (int(tg) == G - 1) {
   }
 }
 
-// qr = rms(qa, q_norm) of the R rows into xs: a thread takes 8 consecutive k of each row.
+// qr = rms(qa, q_norm) of the R rows into xs (each value a bf16 already): a thread takes 8 consecutive k of each row.
 float inv[R];
 for (int r = 0; r < R; ++r) {
   float ss = 0.0f;
@@ -101,9 +101,9 @@ for (int v = int(tid); v < K / 8; v += NT) {
       y[2 * i] = float(T(as_type<float>(nw[i] << 16) * float(T(as_type<float>(bw[i] << 16) * inv[r]))));
       y[2 * i + 1] = float(T(as_type<float>(nw[i] & 0xFFFF0000u) * float(T(as_type<float>(bw[i] & 0xFFFF0000u) * inv[r]))));
     }
-    threadgroup float4* xd = xs + ((r * 5 + s) * 4 + 2 * u) * 16 + jj;
-    xd[0] = float4(y[0], y[1], y[2], y[3]);
-    xd[16] = float4(y[4], y[5], y[6], y[7]);
+    threadgroup ushort4* xd = xs + ((r * 5 + s) * 4 + 2 * u) * 16 + jj;
+    xd[0] = ushort4(dsv41_wqb_bf(y[0]), dsv41_wqb_bf(y[1]), dsv41_wqb_bf(y[2]), dsv41_wqb_bf(y[3]));
+    xd[16] = ushort4(dsv41_wqb_bf(y[4]), dsv41_wqb_bf(y[5]), dsv41_wqb_bf(y[6]), dsv41_wqb_bf(y[7]));
   }
 }
 threadgroup_barrier(metal::mem_flags::mem_threadgroup);
@@ -128,7 +128,7 @@ if constexpr (UI > 0) {
       const int c = (n_base + 2 * p) % IHD;
       if (c >= IHD - RD) {
         const float o = metal::simd_shuffle_xor(vr, 16);
-        const float theta = float(int(j) + pos) * (1.0f / periods_i[(c - (IHD - RD)) / 2]);
+        const float theta = float(pos[metal::min(int(j), R - 1)]) * (1.0f / periods_i[(c - (IHD - RD)) / 2]);
         const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);
         const float x1 = h == 0 ? vr : o, x2 = h == 0 ? o : vr;
         vr = float(T(h == 0 ? x1 * cs - x2 * sn : x1 * sn + x2 * cs));
@@ -174,7 +174,7 @@ if (i_q < UI + UQ) {
     const int c = n_base % D;
     if (c >= D - RD) {
       const float o = metal::simd_shuffle_xor(vr, 16);
-      const float theta = float(int(j) + pos) * (1.0f / periods[(c - (D - RD)) / 2]);
+      const float theta = float(pos[metal::min(int(j), R - 1)]) * (1.0f / periods[(c - (D - RD)) / 2]);
       const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);
       const float x1 = h == 0 ? vr : o, x2 = h == 0 ? o : vr;
       vr = float(T(h == 0 ? x1 * cs - x2 * sn : x1 * sn + x2 * cs));

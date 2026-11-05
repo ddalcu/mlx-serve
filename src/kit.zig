@@ -21,6 +21,10 @@ pub const dylib = @import("sdk/dylib.zig");
 pub const generation = @import("sdk/config/generation.zig");
 /// WAV encoding for audio backends.
 pub const wav = @import("sdk/media/wav.zig");
+/// The Neural Engine's MIL builder: its text and weight blob are what `Host.ane().program_create` compiles.
+pub const ane = struct {
+    pub const mil = @import("sdk/ane/mil.zig");
+};
 
 /// The MLX bindings `blocks` are written on: their `mlx_array` and `mlx_stream` are `{ ctx }` like mlx-c's, so a
 /// plugin converts at the call (`.{ .ctx = x.ctx }`).

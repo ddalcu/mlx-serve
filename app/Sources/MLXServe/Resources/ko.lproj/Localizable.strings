@@ -320,7 +320,7 @@
 "From an attached first frame" = "첨부한 첫 프레임에서";
 "Recommended" = "권장";
 "Common tempos" = "일반적인 템포";
-"Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens." = "브라우저 로그인을 사용하려면 비워 두세요(권장). 헤드리스 또는 CI에서만 입력하세요. dev.azure.com/<org>/_usersSettings/tokens에서 생성합니다.";
+"Leave blank for browser login (recommended). Fill in only for headless / CI use. Create at dev.azure.com/<org>/_usersSettings/tokens. A saved token is kept when this is blank; remove it in mcp.json." = "브라우저 로그인을 사용하려면 비워 두세요(권장). 헤드리스 또는 CI에서만 입력하세요. dev.azure.com/<org>/_usersSettings/tokens에서 생성합니다. 비워 두면 저장된 토큰이 유지됩니다. 삭제하려면 mcp.json에서 제거하세요.";
 "simmering" = "차근차근 생각 중";
 "Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off." = "탭한 각 텍스트 인코더 레이어의 기여도를 조절합니다(1 = 중립). 비워 두면 끔.";
 "Loading…" = "로드 중…";
@@ -2412,3 +2412,9 @@
 "%@ not measured yet" = "%@ 아직 측정 안 됨";
 "%@ %@ tokens per second" = "%@ 초당 %@ 토큰";
 "Opens the usage dashboard" = "사용량 대시보드를 엽니다";
+"Rebuild all" = "모두 다시 빌드";
+"Rebuild every plugin this mlx-serve refused as built for another version" = "다른 버전용으로 빌드되어 이 mlx-serve가 거부한 플러그인을 모두 다시 빌드합니다";
+"This mlx-serve refused it: %@." = "이 mlx-serve가 거부했습니다: %@.";
+"Rebuild" = "다시 빌드";
+"Not in the catalog: rebuild it from its source with this release's kit" = "카탈로그에 없음: 이 릴리스의 키트로 소스에서 다시 빌드하세요";
+"Needs rebuild" = "다시 빌드 필요";

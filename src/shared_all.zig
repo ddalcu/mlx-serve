@@ -18,6 +18,7 @@ comptime {
     _ = @import("plugins/deepseek_v41/deepseek_v41.zig").clusterHooks_shared;
     _ = @import("plugins/qwen4_exp/ple_gpu.zig").pleGpu_shared;
     _ = @import("plugins/qwen4_exp/plugin.zig").EngineCtx;
+    _ = @import("plugins/qwen4_exp/plugin.zig").EngineBatch;
     _ = @import("plugins/qwen4_exp/qwen4_exp.zig").warm_shared;
     _ = @import("sdk/blocks/attention/nax_attention.zig").naxCli_shared;
     _ = @import("sdk/blocks/attention/decode_attn_quant.zig").cli_shared;

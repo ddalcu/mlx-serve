@@ -105,7 +105,7 @@ fn opened(io: std.Io, a: Allocator, comptime cmd: []const u8, path: []const u8) 
     const got = openForCheck(io, a, path) catch |e| return fail("plugin " ++ cmd ++ ": {s}: {t}", .{ path, e });
     return switch (got) {
         .ok => |p| p,
-        .refused => |why| fail("plugin " ++ cmd ++ ": {s}: {s}", .{ path, why }),
+        .refused, .stale => |why| fail("plugin " ++ cmd ++ ": {s}: {s}", .{ path, why }),
     };
 }
 
@@ -344,7 +344,7 @@ pub fn install(io: std.Io, a: Allocator, src: []const u8, dir: []const u8, confi
     try plugins.writeFile(io, .{ .sub_path = tmp_name, .data = bytes });
     const p = switch (try loader.open(a, try std.fs.path.join(a, &.{ dir, tmp_name }), hash, hostMlx())) {
         .ok => |p| p,
-        .refused => |why| {
+        .refused, .stale => |why| {
             plugins.deleteFile(io, tmp_name) catch {};
             return .{ .refused = why };
         },

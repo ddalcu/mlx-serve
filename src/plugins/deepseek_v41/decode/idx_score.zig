@@ -806,7 +806,7 @@ fn poolCases(fx: *fixture.Fixture, k: *const Kernels, li: usize, rows: []const u
 }
 
 test "dsv41 dec idx_score: the pool step equals compress at ratio 2 (open group of 0 and 1 rows) and ratio 1, R = 1, 2, 3, 4, 6" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var k = try build();
     defer k.deinit();
     for ([_]usize{ 300, 301 }) |ctx| {

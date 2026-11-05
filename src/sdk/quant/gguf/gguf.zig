@@ -313,15 +313,15 @@ pub const File = struct {
 
         for (pending) |p| {
             var t = p.t;
-            // Unknown types stay in the directory with empty data so callers can
-            // report exactly which type blocked the load.
+            const start = std.math.add(u64, data_start, p.offset) catch return error.BadTensor;
+            // Unknown types stay in the directory with empty data at their offset, so callers can report exactly which
+            // type blocked the load, and `locate` one an arch reads in place itself (DeepSeek-V4.1's I8 Engram rows).
             if (t.ty.supported()) {
                 if (t.dims[0] % t.ty.blockElems() != 0) return error.BadTensor;
                 const size = t.elems() / t.ty.blockElems() * t.ty.blockBytes();
-                const start = data_start + p.offset;
                 if (start > bytes.len or size > bytes.len - start) return error.Truncated;
                 t.data = bytes[@intCast(start)..][0..@intCast(size)];
-            }
+            } else if (start <= bytes.len) t.data = bytes[@intCast(start)..][0..0];
             try f.tensors.put(a, p.name, t);
         }
         return f;
@@ -422,6 +422,32 @@ test "parse reads metadata, string arrays and aligned tensor data" {
     try std.testing.expectEqual(@as(usize, 68), t.data.len);
     try std.testing.expectEqual(@as(u8, 7), t.data[0]);
     try std.testing.expect(f.firstUnsupportedTensor() == null);
+}
+
+test "parse keeps a tensor of a type we do not serve at its offset, with no data" {
+    var w = TestWriter{};
+    defer w.buf.deinit(w.a);
+    try w.buf.appendSlice(w.a, "GGUF");
+    try w.num(@as(u32, 3));
+    try w.num(@as(u64, 2));
+    try w.num(@as(u64, 0));
+    for ([_][]const u8{ "q", "raw" }, [_]u32{ 8, 24 }, [_]u64{ 0, 64 }) |name, ty, off| {
+        try w.str(name);
+        try w.num(@as(u32, 1));
+        try w.num(@as(u64, 32));
+        try w.num(ty);
+        try w.num(off);
+    }
+    while (w.buf.items.len % 32 != 0) try w.buf.append(w.a, 0);
+    const data_start = w.buf.items.len;
+    try w.buf.appendNTimes(w.a, 9, 64 + 32);
+
+    var f = try File.parse(std.testing.allocator, w.buf.items);
+    defer f.deinit();
+    const raw = f.tensors.get("raw").?;
+    try std.testing.expectEqual(@as(usize, 0), raw.data.len);
+    try std.testing.expectEqual(@intFromPtr(w.buf.items.ptr) + data_start + 64, @intFromPtr(raw.data.ptr));
+    try std.testing.expectEqualStrings("raw", f.firstUnsupportedTensor().?);
 }
 
 test "parse rejects a file cut short anywhere" {

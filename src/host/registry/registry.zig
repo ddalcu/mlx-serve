@@ -25,6 +25,7 @@ const tokenize_cache_mod = @import("../tokenizer/cache.zig");
 const token_mask_mod = @import("../../sdk/grammar/token_mask.zig");
 const rp_mod = @import("../../sdk/grammar/protocol.zig");
 const model_discovery = @import("discovery.zig");
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const load_progress = @import("load_progress.zig");
 const Served = @import("../engines/served.zig").Served;
@@ -166,6 +167,10 @@ pub const LoadedModel = struct {
     /// `path` with symlinks resolved, so a request naming the same directory
     /// another way finds this entry (`peekByPath`). Empty when it does not resolve.
     real_path: []const u8 = "",
+    /// Hex sha256 of this load's `config.json` for the ablation profile check (`api/ablation.zig` `modelDigest`): taken
+    /// once, by the first ablated request. `config_digest_state` 0 = not taken, 1 = being taken, 2 = ready.
+    config_digest: [64]u8 = undefined,
+    config_digest_state: std.atomic.Value(u8) = .init(0),
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,
@@ -283,6 +288,9 @@ pub const LoadedModel = struct {
     /// Resident GPU bytes for this entry (weights + vision + drafter),
     /// summed at load time. Zero for non-`.ready` entries.
     bytes_resident: u64,
+    /// MLX bytes the load added, measured at ready: above `bytes_resident` when the model fills its own cache
+    /// at load (a plugin's streamed-expert cache), so eviction credits what unloading frees.
+    bytes_live: u64 = 0,
     /// Estimated bytes reserved against `ModelRegistry.reserved_bytes` while
     /// this entry is mid-load (`.loading`). Lets concurrent loaders see this
     /// pending allocation in the budget gate so two loads can't both pass and
@@ -772,7 +780,27 @@ pub const ModelRegistry = struct {
             defer self.mutex.unlock(self.io);
             if (self.peekByPathLocked(path)) |e| return e;
         }
-        // The same directory under another spelling: a symlink, either way round.
+        if (self.peekByRealPath(path)) |e| return e;
+        // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it. Only the file the
+        // folder serves: another quant beside it is a model of its own.
+        if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| if (self.peekByPath(dir)) |e| {
+            if (self.folderServes(e.path, path)) return e;
+        };
+        return null;
+    }
+
+    fn folderServes(self: *ModelRegistry, folder: []const u8, file: []const u8) bool {
+        const pick = gguf_files.resolveGgufFile(self.io, self.allocator, folder) catch return false;
+        defer self.allocator.free(pick);
+        var a: [std.fs.max_path_bytes]u8 = undefined;
+        var b: [std.fs.max_path_bytes]u8 = undefined;
+        const ra = a[0 .. std.Io.Dir.realPathFileAbsolute(self.io, pick, &a) catch return false];
+        const rb = b[0 .. std.Io.Dir.realPathFileAbsolute(self.io, file, &b) catch return false];
+        return std.mem.eql(u8, ra, rb);
+    }
+
+    /// The same directory under another spelling: a symlink, either way round.
+    fn peekByRealPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         if (!std.fs.path.isAbsolute(path)) return null;
         var buf: [std.fs.max_path_bytes]u8 = undefined;
         const real = buf[0 .. std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return null];
@@ -942,6 +970,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry);
         entry.state = .unloaded;
         entry.bytes_resident = 0;
+        entry.bytes_live = 0;
         if (entry.error_name) |old| self.allocator.free(old);
         entry.error_name = null;
         self.stateChanged();
@@ -1291,7 +1320,7 @@ pub const ModelRegistry = struct {
     }
 
     fn liveBytesFreed(v: *const LoadedModel) u64 {
-        return v.bytes_resident +| mlx_engine.api().hot_cache_bytes(v);
+        return @max(v.bytes_resident, v.bytes_live) +| mlx_engine.api().hot_cache_bytes(v);
     }
 
     /// Idle models a load needing `need` bytes of RAM unloads with `room` free, oldest first: as few
@@ -1354,10 +1383,11 @@ pub const ModelRegistry = struct {
     /// Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, DistWorkerNotJoined } {
         if (name) |n| {
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
+            if (std.mem.eql(u8, n, "DistWorkerNotJoined")) return error.DistWorkerNotJoined;
         }
         return error.LoadFailed;
     }
@@ -1369,6 +1399,8 @@ pub const ModelRegistry = struct {
         // unactionable. Both spellings of "out of memory" have to survive.
         try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("InsufficientMemory"));
         try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("OutOfMemory"));
+        // So does a worker Mac that has not joined: the user starts it and retries.
+        try std.testing.expectEqual(error.DistWorkerNotJoined, loadErrorFromName("DistWorkerNotJoined"));
         // Everything else stays a load failure — guessing a diagnosis is worse
         // than reporting the honest generic one.
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
@@ -1587,6 +1619,40 @@ test "ModelRegistry: peekByPath finds an entry through a symlinked path in eithe
     defer reg2.deinit();
     const via_real = try reg2.registerStubWithArch("m", real, 64, "qwen3");
     try testing.expectEqual(via_real, reg2.peekByPath(link) orelse return error.TestUnexpectedResult);
+}
+
+test "ModelRegistry: peekByPath finds a GGUF pack by the .gguf file inside it, also through a symlink" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "real/pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pack/m.gguf", .data = "GGUF" });
+    try tmp.dir.createDirPath(io, "links");
+    try tmp.dir.symLink(io, "../real/pack", "links/pack", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    const link = try std.fs.path.join(testing.allocator, &.{ root, "links", "pack" });
+    defer testing.allocator.free(link);
+    const real_file = try std.fs.path.join(testing.allocator, &.{ root, "real", "pack", "m.gguf" });
+    defer testing.allocator.free(real_file);
+    const link_file = try std.fs.path.join(testing.allocator, &.{ root, "links", "pack", "m.gguf" });
+    defer testing.allocator.free(link_file);
+
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const e = try reg.registerStubWithArch("pack", link, 64, "gguf");
+    try testing.expectEqual(e, reg.peekByPath(link_file) orelse return error.TestUnexpectedResult);
+    try testing.expectEqual(e, reg.peekByPath(real_file) orelse return error.TestUnexpectedResult);
+    // Another quant beside the one the folder serves is not that entry.
+    try tmp.dir.writeFile(io, .{ .sub_path = "real/pack/z.gguf", .data = "GGUF" });
+    const other = try std.fs.path.join(testing.allocator, &.{ root, "real", "pack", "z.gguf" });
+    defer testing.allocator.free(other);
+    try testing.expect(reg.peekByPath(other) == null);
+    try testing.expectEqual(e, reg.peekByPath(real_file) orelse return error.TestUnexpectedResult);
+    // Only a .gguf falls back to its folder.
+    const readme = try std.fs.path.join(testing.allocator, &.{ link, "README.md" });
+    defer testing.allocator.free(readme);
+    try testing.expect(reg.peekByPath(readme) == null);
 }
 
 test "ModelRegistry: registerByPath rejects a nonexistent directory" {
@@ -2154,6 +2220,22 @@ test "planEvictions: an idle victim's prefix cache counts as freed live memory (
     var buf: [16]*LoadedModel = undefined;
     // 95 live = a's 40 weights + its 50-byte cache + 5: evicting a leaves 5 + 50 <= 100.
     try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 95));
+    try testing.expectEqualStrings("a", buf[0].id);
+}
+
+test "planEvictions: a victim frees the live bytes its load measured, not just its bill (#1064)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 100, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 10);
+    a.bytes_live = 80;
+    const b = try beginLoad(reg, "b", 50);
+
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    // 85 live, 80 of them a's: evicting a leaves 5 + 50 <= 100.
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(b.id, null, &buf, 85));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 

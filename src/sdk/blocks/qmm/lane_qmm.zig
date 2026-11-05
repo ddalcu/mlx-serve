@@ -596,9 +596,29 @@ fn quantizedBits(n: c_int, k: c_int, bits: u32, seed: u64, s: mlx.mlx_stream) ![
     return out;
 }
 
-/// MLX's own pick in `QuantizedMatmul::eval_gpu` / `qmm_splitk` (transposed,
-/// group 64): NAX qmm unless under 512 threadgroups of 32 x 32 leave a K split.
+/// MLX's `use_qmm_nax_splitk` (quantized.cpp) for a transposed affine weight with biases and a non-f32 input: the NAX
+/// split-K matmul `qmm_splitk` and a mid-size batch take since the pin moved to 4ca8d5d5.
+pub fn qmmNaxSplitK(m: c_int, n: c_int, k: c_int, group_size: c_int) bool {
+    if (@mod(n, 64) != 0 or @mod(k, 64) != 0 or @mod(k, group_size) != 0) return false;
+    const bm: c_int = if (m <= 32) 32 else 64;
+    const tiles = @divExact(n, 64) * @divTrunc(m + bm - 1, bm);
+    return tiles * 2 <= 256 and @mod(k, 2 * @max(64, group_size)) == 0;
+}
+
+/// MLX's `qmm_nax_k_partitions`: how many K partitions its NAX split-K launch uses (1 runs the plain NAX qmm).
+fn naxKPartitions(m: c_int, n: c_int, k: c_int, group_size: c_int) c_int {
+    const tiles = @divExact(n, 64) * @divTrunc(m + 63, 64);
+    const k_align = @max(64, group_size);
+    var split: c_int = 1;
+    while (split < 4 and tiles * split * 2 <= 256 and @mod(k, split * 2 * k_align) == 0 and @divTrunc(k, split * 2) >= 256) split *= 2;
+    return split;
+}
+
+/// MLX's own pick in `QuantizedMatmul::eval_gpu` / `qmm_splitk` (transposed, group 64): its NAX split-K route first,
+/// which runs the plain NAX qmm when one K partition is all it makes; else NAX qmm unless under 512 threadgroups of
+/// 32 x 32 leave a K split.
 fn mlxTakesNax(m: c_int, n: c_int, k: c_int) bool {
+    if (qmmNaxSplitK(m, n, k, 64)) return naxKPartitions(m, n, k, 64) == 1;
     var split: c_int = @max(1, @divTrunc(512, @divTrunc(n + 31, 32) * @divTrunc(m + 31, 32)));
     split = @min(split, @divTrunc(k, 64));
     while (split > 1 and @rem(k, split * 64) != 0) split -= 1;
@@ -697,7 +717,7 @@ test "lane_qmm: past 128 rows a weight tiled in place gives MLX's qmm bits at 4,
             if (mlxTakesNax(row_counts[ri], rows_of[i], k)) {
                 try testing.expect(try bitEqual(y, refs[ri][i], s));
             } else {
-                // MLX splits K there (bf16 partials): no worse than it against fp32 truth.
+                // MLX splits K there (fp32 partials on its NAX route): no worse than it against fp32 truth.
                 try testing.expect(try relErr(y, truths[ri][i], s) <= try relErr(refs[ri][i], truths[ri][i], s));
             }
         };

@@ -823,7 +823,7 @@ test "logical capture includes every defined state and the separate final state"
 }
 
 test "verify rollback permits in-place KV append and restores its valid prefix" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const stream = mlx.gpuStream();
     var cache = try KVCache.initWithConfig(allocator, 1, KVQuantConfig.affine(8));

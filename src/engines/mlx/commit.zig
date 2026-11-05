@@ -76,7 +76,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // `finishSlot` can be reached on an EOS the failing forward itself produced, before the
     // tick wrapper reads the latch: an unread latch means the KV under this commit may be garbage.
     if (mlx.errorPending()) return;
-    if (slot.model.transformer) |xfm| if (prefix_cache_mod.ModuleBinding.init(xfm)) |binding| {
+    if (slot.model.transformer) |xfm| if (prefix_cache_mod.ModuleBinding.forVariant(xfm, slot.cache_variant)) |binding| {
         if (slot.cancelled.load(.acquire)) return;
         const gen = if (slot.legacy_gen) |*g| g else return;
         if (commitDeclinesPadOnly(gen.generated_ids.items.len, slot.was_pad_only)) return;
@@ -97,6 +97,8 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         publishHotCacheResidency(sch);
         return;
     };
+    // The KV cache keys no variant: a slot that ran one leaves nothing there.
+    if (slot.cache_variant != 0) return;
     const gen_ptr = if (slot.legacy_gen) |*g| g else {
         // A Generator-less slot whose cache is non-empty is a prefill the
         // client disconnected from mid-chunk-loop: initWithOptions threw
@@ -117,11 +119,14 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // generated this turn that the cache holds — Generator forwarded each
     // emitted token into slot.cache as it was sampled, except an
     // `unforwarded_tail` the key must not claim.
-    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len - gen_ptr.unforwarded_tail;
+    const gen_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len - gen_ptr.unforwarded_tail;
+    const stop_tail = gen_ptr.forwarded_stop[0..if (slot.moe_seq_offset == gen_len + gen_ptr.forwarded_stop_len) gen_ptr.forwarded_stop_len else 0];
+    const total_len = gen_len + stop_tail.len;
     const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
     defer sch.allocator.free(total_tokens);
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
-    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items[0 .. total_len - slot.full_prompt.len]);
+    @memcpy(total_tokens[slot.full_prompt.len..gen_len], gen_ptr.generated_ids.items[0 .. gen_len - slot.full_prompt.len]);
+    @memcpy(total_tokens[gen_len..], stop_tail);
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-

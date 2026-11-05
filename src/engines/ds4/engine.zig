@@ -11,6 +11,7 @@ const env = @import("../../env.zig");
 const build_options = @import("build_options");
 const abi = @import("../../abi/engine.zig");
 const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
+const log = @import("../../sdk/util/log.zig");
 const book_mod = @import("../own_thread/book.zig");
 const logits = @import("../own_thread/logits.zig");
 const TokenTable = @import("../own_thread/token_table.zig").TokenTable;
@@ -94,8 +95,16 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
 
         /// The GGUF and ds4's own estimate of the session's KV and scratch.
         fn loadBytes(o: *const abi.Open, bytes: *u64) callconv(.c) abi.Verdict {
-            bytes.* = fileBytes(abi.items(u8, o.model_dir)) + B.contextBytes(B.clampSessionCtx(o.context));
+            bytes.* = fileBytes(abi.items(u8, o.model_dir)) + B.contextBytes(askedContext(o));
             return .{};
+        }
+
+        /// The session asked for: `o.context`, else the GGUF's trained window (`<arch>.context_length`), else ds4's default.
+        fn askedContext(o: *const abi.Open) u32 {
+            if (o.context != 0) return B.clampSessionCtx(o.context);
+            var info = engine_pick.readFromFile(io, gpa, abi.items(u8, o.model_dir)) catch return B.clampSessionCtx(0);
+            defer info.deinit(gpa);
+            return B.clampSessionCtx(info.context_length);
         }
 
         fn parseFlags(json: []const u8) !load.Flags {
@@ -117,8 +126,15 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             const flags = parseFlags(abi.items(u8, o.settings_json)) catch return error.InvalidSettings;
             const engine = try load.open(B, io, gpa, path, flags);
             errdefer engine.close();
-            const ctx = B.clampSessionCtx(o.context);
-            const session = try engine.createSession(@intCast(ctx));
+            var ctx = askedContext(o);
+            const session = engine.createSession(@intCast(ctx)) catch |err| retry: {
+                // Only the trained window an unset context asked for falls back; an explicit one fails by name.
+                const default_ctx = B.clampSessionCtx(0);
+                if (o.context != 0 or ctx <= default_ctx) return err;
+                log.warn("[ds4] the GGUF's trained {d}-token window was refused ({s}); opening ds4's default {d}\n", .{ ctx, @errorName(err), default_ctx });
+                ctx = default_ctx;
+                break :retry try engine.createSession(@intCast(ctx));
+            };
             errdefer session.free();
             const vocab: usize = engine.vocabSize();
             var eos: std.ArrayList(u32) = .empty;
@@ -335,6 +351,8 @@ test {
 /// session (1), so a shaped row changes what comes out; a speculative round commits three tokens.
 const FakeBridge = struct {
     pub const vocab = 1024;
+    /// The largest session the fake admits: a bigger one is refused, as ds4's memory guard refuses one that does not fit.
+    pub const session_cap: u32 = 1 << 20;
     pub const ThinkMode = enum(c_int) { none, high };
     pub fn clampSessionCtx(requested: u32) u32 {
         return if (requested == 0) 4096 else requested;
@@ -342,8 +360,8 @@ const FakeBridge = struct {
     pub fn contextBytes(ctx: u32) u64 {
         return @as(u64, ctx) * 1024;
     }
-    pub fn ggufDeclaresEmbeddedMtp(_: std.Io, _: std.mem.Allocator, _: []const u8) bool {
-        return true;
+    pub fn ggufSpec(_: std.Io, _: std.mem.Allocator, _: []const u8) engine_pick.Spec {
+        return .{ .embedded_mtp = true };
     }
     pub const Ds4Engine = struct {
         pub const ChatTurn = struct { role: []const u8, content: []const u8 };
@@ -388,7 +406,8 @@ const FakeBridge = struct {
             if (think == .high) try ids.append(a, 1);
             return ids.toOwnedSlice(a);
         }
-        pub fn createSession(_: *Ds4Engine, _: i32) !*Ds4Session {
+        pub fn createSession(_: *Ds4Engine, ctx: i32) !*Ds4Session {
+            if (ctx > session_cap) return error.SessionCreateFailed;
             const s = try testing.allocator.create(Ds4Session);
             s.* = .{};
             return s;
@@ -457,10 +476,17 @@ const Fake = Adapter(FakeBridge, testing.allocator);
 
 /// A file whose GGUF header routes to ds4, in `tmp`; returns its absolute path in `buf`.
 fn ds4Gguf(tmp: *std.testing.TmpDir, buf: []u8) ![]const u8 {
-    const header = try engine_pick.buildHeader(testing.allocator, &.{
+    return ds4GgufTrained(tmp, buf, null);
+}
+
+/// `ds4Gguf`, declaring `trained` as the checkpoint's `deepseek4.context_length` when set.
+fn ds4GgufTrained(tmp: *std.testing.TmpDir, buf: []u8, trained: ?u64) ![]const u8 {
+    const kvs = [_]engine_pick.KV{
         .{ .key = "general.architecture", .value = .{ .str = "deepseek4" } },
         .{ .key = "deepseek4.attention.output_lora_rank", .value = .{ .u32_v = 1024 } },
-    });
+        .{ .key = "deepseek4.context_length", .value = .{ .u64_v = trained orelse 0 } },
+    };
+    const header = try engine_pick.buildHeader(testing.allocator, if (trained != null) &kvs else kvs[0..2]);
     defer testing.allocator.free(header);
     try tmp.dir.writeFile(io, .{ .sub_path = "m.gguf", .data = header });
     var root: [std.fs.max_path_bytes]u8 = undefined;
@@ -491,6 +517,37 @@ test "ds4 adapter: probe reads the GGUF header" {
     try testing.expect(!probe(abi.span(u8, path), .{}, &v));
     try testing.expect(std.mem.indexOf(u8, abi.items(u8, v.why), "llama.cpp") != null);
     try testing.expect(!probe(abi.span(u8, "/nonexistent/m.gguf"), .{}, &v));
+}
+
+/// The session the fake adapter opens when asked for `asked` on a ds4 GGUF declaring `trained`; null when the open fails.
+fn openedContext(trained: ?u64, asked: u32) !?u32 {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try ds4GgufTrained(&tmp, &buf, trained);
+    var host: abi.Host = .{ .ctx = undefined, .log = struct {
+        fn f(_: *anyopaque, _: u8, _: abi.Str) callconv(.c) void {}
+    }.f, .wake = struct {
+        fn f(_: *anyopaque) callconv(.c) void {}
+    }.f };
+    const o: abi.Open = .{ .model_dir = abi.span(u8, path), .model_type = .{}, .config_json = .{}, .context = asked, .max_concurrent = 1, .memory_budget = 0, .settings_json = .{}, .options_json = .{}, .host = &host };
+    var info: abi.Info = undefined;
+    var v: abi.Verdict = .{};
+    const e = Fake.table.open(&o, &info, &v) orelse return null;
+    defer Fake.table.close(e);
+    return info.context_window;
+}
+
+test "ds4 adapter: an unset context opens the checkpoint's trained window, ds4's default when that session does not fit" {
+    const default = FakeBridge.clampSessionCtx(0);
+    try testing.expectEqual(@as(?u32, 262144), try openedContext(262144, 0));
+    try testing.expectEqual(@as(?u32, default), try openedContext(null, 0));
+    try testing.expectEqual(@as(?u32, default), try openedContext(2 * FakeBridge.session_cap, 0));
+}
+
+test "ds4 adapter: an explicit context is the session, never the trained window or a silent fallback" {
+    try testing.expectEqual(@as(?u32, 65536), try openedContext(262144, 65536));
+    try testing.expectEqual(@as(?u32, null), try openedContext(262144, 2 * FakeBridge.session_cap));
 }
 
 const Collect = struct {

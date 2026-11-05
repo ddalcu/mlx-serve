@@ -324,7 +324,7 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
 /// that skips the cache, or carries media (media rows are never matched by token), counts whole.
 pub fn slotUncachedTail(slot: *Slot) usize {
     const total = slot.full_prompt.len;
-    if (slot.skip_prefix_cache or slot.media.len > 0) return total;
+    if (slot.skip_prefix_cache or slot.cache_variant != 0 or slot.media.len > 0) return total;
     const hc = if (slot.model.prefix_cache) |p| p else return total;
     return total - @min(total, hc.peekMatchedTokens(slot.full_prompt, slot.has_tools, slot.cache.config, slot.ssm_entries != null));
 }
@@ -427,6 +427,7 @@ fn writeThroughEnabled() bool {
 /// worth at least one chunk.
 pub fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return false;
+    if (slot.cache_variant != 0) return false;
     if (hc.disk) |*d| if (d.module_context != null) return false;
     if (!writeThroughEnabled()) {
         if (hc.ssd_first and !write_through_off_logged.swap(true, .monotonic)) {

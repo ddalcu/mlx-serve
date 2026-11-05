@@ -33,22 +33,45 @@ pub const LayerSpan = struct {
 };
 
 /// Tensor-parallel rank: its slice of every MoE expert's intermediate width (gate/up
-/// rows, down columns), the routed experts and the shared one alike.
+/// rows, down columns), the routed experts and the shared one alike; V4.1's attention heads too.
 pub const Shard = struct {
     rank: u32,
     size: u32,
 
-    /// Which projection of an expert `key` names: gate/up split their rows, down its columns.
-    pub fn expertAxis(key: []const u8) ?enum { rows, cols } {
+    /// Which axis of `key` a rank cuts (null: every rank holds it whole): an expert's gate/up (V4.1: w1/w3) rows and
+    /// down (w2) columns; V4.1's attention by heads: `wq_b` and `wo_a` rows (whole output groups), `wo_b` columns, the
+    /// per-head `attn_sink`.
+    pub fn axis(key: []const u8) ?Axis {
         if (headOnly(key)) return null;
-        if (std.mem.indexOf(u8, key, ".switch_mlp.") == null and std.mem.indexOf(u8, key, ".shared_expert.") == null) return null;
+        if (std.mem.endsWith(u8, key, ".attn.attn_sink")) return .vec;
         const tail = for ([_][]const u8{ ".weight", ".scales", ".biases" }) |sfx| {
             if (std.mem.endsWith(u8, key, sfx)) break key[0 .. key.len - sfx.len];
         } else return null;
-        if (std.mem.endsWith(u8, tail, ".gate_proj") or std.mem.endsWith(u8, tail, ".up_proj")) return .rows;
-        if (std.mem.endsWith(u8, tail, ".down_proj")) return .cols;
+        if (std.mem.endsWith(u8, tail, ".attn.wq_b") or std.mem.endsWith(u8, tail, ".attn.wo_a")) return .rows;
+        if (std.mem.endsWith(u8, tail, ".attn.wo_b")) return .cols;
+        const holds = for ([_][]const u8{ ".switch_mlp.", ".shared_expert.", ".ffn.experts.", ".ffn.shared_experts." }) |part| {
+            if (std.mem.indexOf(u8, key, part) != null) break true;
+        } else false;
+        if (!holds) return null;
+        for ([_][]const u8{ ".gate_proj", ".up_proj", ".w1", ".w3" }) |sfx| if (std.mem.endsWith(u8, tail, sfx)) return .rows;
+        for ([_][]const u8{ ".down_proj", ".w2" }) |sfx| if (std.mem.endsWith(u8, tail, sfx)) return .cols;
         return null;
     }
+
+    pub const Axis = enum {
+        rows,
+        cols,
+        vec,
+
+        /// This axis's index in a tensor of `rank` dims.
+        pub fn of(a: Axis, rank: usize) usize {
+            return switch (a) {
+                .rows => rank - 2,
+                .cols => rank - 1,
+                .vec => 0,
+            };
+        }
+    };
 
     /// Copies this rank's part of axis `mid` of a row-major `[outer, mid, inner]` buffer.
     pub fn slice(self: Shard, out: []u8, buf: []const u8, outer: usize, mid: usize, inner: usize) void {

@@ -172,6 +172,7 @@ class DownloadManager: ObservableObject {
     ///   convention; live: `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf` in
     ///   antirez/deepseek-v4-gguf). Not loadable as a chat model — it's a
     ///   dependency of the main quant, downloaded alongside it.
+    /// - `*-Vision.gguf` — DeepSeek-V4.1's DS4 vision tower, loaded beside the set.
     ///
     /// This has to be exhaustive because discovery lists EVERY quant in a folder
     /// as a separately selectable model — anything not filtered here becomes a
@@ -187,8 +188,10 @@ class DownloadManager: ObservableObject {
         // server-side, never a servable chat quant.
         return lower.hasPrefix("mmproj") || lower.contains("tokenizer")
             || lower.hasPrefix("mtp-") // llama.cpp's head-only `convert --mtp` export
+            || lower.hasPrefix("dspark-") // Unsloth's DeepSeek-V4.1 stage bundle
             || lower.contains("-mtp-") || lower.contains("-mtp.")
             || lower.contains("-dspark-") || lower.contains("-dspark.")
+            || lower.hasSuffix("-vision.gguf") // DeepSeek-V4.1's DS4 vision tower beside the set
     }
 
     /// Retained for the mmproj-specific call sites (the Swift mirror of the

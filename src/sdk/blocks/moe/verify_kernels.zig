@@ -111,7 +111,7 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
     if (ds.len != 2 or ss.len != 3 or ix.len != 1) return null;
     const topk = ss[2];
     const hidden = ds[1];
-    if (!((topk == 10 and hidden == 2560) or (topk == 8 and hidden == 4096))) return null;
+    if (!((topk == 10 and hidden == 2560) or (topk == 8 and (hidden == 2048 or hidden == 4096)))) return null;
     const batch = ss[0];
     const tokens = ss[1];
     if (batch < 1 or tokens < 1 or batch * tokens < 2 or ds[0] != batch * tokens * topk or ix[0] != ds[0]) return null;

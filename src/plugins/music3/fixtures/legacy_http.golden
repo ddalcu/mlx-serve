@@ -30,8 +30,8 @@ Connection: close
 Access-Control-Allow-Origin: *
 
 {"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
-== music 0 20642 a7e5a8ded4eeb63a96f70b15970accbef9ae2c1875d2562fe78b369dc9644acf
-== music 1 28184 7afd31d293f95dea38598c3c7c9bb0380ae4662791b582166369b9cbb0316ed7
+== music 0 20642 bb697d87051f295d2dc2a847dc25efce55ac057825c653910d01cb3846c0fc7f
+== music 1 28184 31f980942efece89dd236d3276bf4af89cf6f02b392f4519146b68f76a518349
 == music 2 196 ad086416f060ead7d264aa75bccdfb19d0c4ea58b1e362d2619b10bc986f01c4
 HTTP/1.1 400 Error
 Content-Type: application/json

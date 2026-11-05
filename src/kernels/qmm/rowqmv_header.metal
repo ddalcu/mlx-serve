@@ -7,7 +7,7 @@ inline float rq_load(const device bfloat* x, thread float* xt) {
     constexpr float d1 = BITS == 4 ? 16.0f : 64.0f, d2 = BITS == 4 ? 256.0f : 16.0f, d3 = BITS == 4 ? 4096.0f : 4.0f;
     for (int i = 0; i < (BITS == 4 ? 16 : 8); i += 4) {
       const bfloat a = x[i], b = x[i + 1], c = x[i + 2], d = x[i + 3];
-      sum += float(bfloat(float(bfloat(float(bfloat(float(a) + float(b))) + float(c))) + float(d)));
+      sum += float(a) + float(b) + float(c) + float(d);
       xt[i] = float(a); xt[i + 1] = float(b) / d1; xt[i + 2] = float(c) / d2; xt[i + 3] = float(d) / d3;
     }
   }

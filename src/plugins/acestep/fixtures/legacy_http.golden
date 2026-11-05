@@ -38,8 +38,8 @@ Connection: close
 Access-Control-Allow-Origin: *
 
 {"error":{"message":"loaded audio model is a music generator; POST /v1/audio/music-generations"}}
-== music 0 1920164 1aa671fffa3baa6bc61df32589474b2402985d170b444e65f117ef9160a6a50d
-== music 1 2561068 5a70e85bdb048f7b85eb2e4d497ea69520a153fa3bbbda5d35124b88d0787036
+== music 0 1920164 bbb4468f42672aa771b0f65fbff010ad8b96205020ab44460f342c3476fe56cd
+== music 1 2561068 9a48df4c95185d0c7012d54f79d4d6922aaffc52394a5a4e1542281b2a3d8d25
 == music 2 196 ad086416f060ead7d264aa75bccdfb19d0c4ea58b1e362d2619b10bc986f01c4
 HTTP/1.1 400 Error
 Content-Type: application/json
@@ -56,7 +56,7 @@ Connection: close
 Access-Control-Allow-Origin: *
 
 {"error":{"message":"'instrumental' is true but 'lyrics' is non-empty — send one or the other"}}
-== music 4 11520165 831b0e6bf1e69f21795f33a888ac8ae4459a02dcb779d7c516754fa9c5a0e866
+== music 4 11520165 63ee53bf63ee48b025eaad1c6b67696686c432f8846ed48dce8490b9c4663bc1
 == sound 0 222 f4f4fd78dfbc8ae43fc66a58dd941794410cc1b5cce327f31da94a333322529e
 HTTP/1.1 400 Error
 Content-Type: application/json

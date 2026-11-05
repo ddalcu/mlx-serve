@@ -96,6 +96,33 @@ enum PluginCatalog {
         return version == running ? dir : nil
     }
 
+    /// The running release's kit asset, or nil for a version no release carries (a release is digits and dots).
+    static func kitURL(version: String) -> URL? {
+        guard !version.isEmpty, version.allSatisfy({ $0.isNumber || $0 == "." }) else { return nil }
+        return URL(string: "https://github.com/\(UpdateChecker.repo)/releases/download/v\(version)/mlx-serve-plugin-kit-\(version).tar.gz")
+    }
+
+    /// What the running server says of an installed plugin (`/props` `plugins`): loaded, or refused and why, and
+    /// whether a rebuild with this release's kit would load it (built for another MLX or plugin ABI).
+    struct ServerStatus: Equatable {
+        var loaded: Bool
+        var rebuild: Bool
+        var why: String
+    }
+
+    /// The `plugins` array of a `/props` body by name; empty from a server too old to report it.
+    static func serverStatus(fromProps data: Data) -> [String: ServerStatus] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = json["plugins"] as? [[String: Any]] else { return [:] }
+        var out: [String: ServerStatus] = [:]
+        for row in rows {
+            guard let name = row["name"] as? String else { continue }
+            out[name] = ServerStatus(loaded: row["loaded"] as? Bool ?? false, rebuild: row["rebuild"] as? Bool ?? false,
+                                     why: row["why"] as? String ?? "")
+        }
+        return out
+    }
+
     /// Why an install step exited non-zero: a kit no release carries yet is named, everything else is the log's.
     static func installFailure(status: Int32, log: String, running: String?) -> String {
         guard log.contains("[fetch-kit] cannot download") else { return "build or install failed (exit \(status)); see the log" }

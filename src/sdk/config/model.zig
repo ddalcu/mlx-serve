@@ -4,6 +4,7 @@ const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../util/log.zig");
+const json_text = @import("../util/json_text.zig");
 const plugin_config = @import("../../engines/mlx/plugin/config.zig");
 const abi = @import("../../abi/plugin.zig");
 const mlx_gguf = @import("../quant/gguf/claim.zig");
@@ -1700,7 +1701,7 @@ pub fn parseConfigLegacy(io: std.Io, allocator: std.mem.Allocator, model_dir: []
 }
 
 fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, served: bool) !ModelConfig {
-    const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
+    const raw = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
         const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
         defer allocator.free(path);
 
@@ -1711,6 +1712,8 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         var reader_state = file.reader(io, &read_buf);
         break :blk try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
     };
+    defer allocator.free(raw);
+    const content = try json_text.quoteInfinity(allocator, raw);
     defer allocator.free(content);
 
     // A served pack's engine config is the legacy parse with the plugin's binding attached, so every engine read
@@ -4957,7 +4960,7 @@ fn retainPart(weights: *Weights, keep: anytype) !void {
     weights.map = kept;
 }
 
-/// Keeps this tensor-parallel rank's slice of every expert projection (still lazy, so a
+/// Keeps this tensor-parallel rank's slice of every tensor `Shard.axis` cuts (still lazy, so a
 /// tensor is read once and only its part survives the batch eval). ModelOpt's routed
 /// banks arrive already sliced (`modelopt_pack.buildBanks`).
 fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !void {
@@ -4965,10 +4968,10 @@ fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !v
     defer _ = mlx.mlx_stream_free(s);
     var it = weights.map.iterator();
     while (it.next()) |kv| {
-        const axis = distributed.Shard.expertAxis(kv.key_ptr.*) orelse continue;
+        const axis = distributed.Shard.axis(kv.key_ptr.*) orelse continue;
         if (banks_sliced and std.mem.indexOf(u8, kv.key_ptr.*, ".switch_mlp.") != null) continue;
         const shape = mlx.getShape(kv.value_ptr.*);
-        const ax: usize = if (axis == .rows) shape.len - 2 else shape.len - 1;
+        const ax = axis.of(shape.len);
         const part: c_int = @divExact(shape[ax], @as(c_int, @intCast(sh.size)));
         var start: [4]c_int = @splat(0);
         var stop: [4]c_int = undefined;
@@ -4985,13 +4988,33 @@ fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !v
     }
 }
 
+test "shardExperts cuts DeepSeek-V4.1's experts (gate/up rows, down columns) and attention heads, not the router" {
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    const vals = [_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const names = [_][]const u8{ "layers.0.ffn.experts.w1.weight", "layers.0.ffn.experts.w2.weight", "layers.0.ffn.shared_experts.w1.weight", "layers.0.ffn.gate.weight", "layers.0.attn.wo_b.weight", "layers.0.attn.attn_sink", "layers.0.attn.indexer.wq_b.weight" };
+    const shapes = [_][]const c_int{ &.{ 2, 4, 2 }, &.{ 2, 2, 4 }, &.{ 4, 4 }, &.{ 4, 4 }, &.{ 4, 4 }, &.{16}, &.{ 4, 4 } };
+    for (names, shapes) |n, sh| try w.put(n, mlx.mlx_array_new_data(&vals, sh.ptr, @intCast(sh.len), .float32));
+    try shardExperts(&w, .{ .rank = 1, .size = 2 }, false);
+    const want = [_][]const f32{ &.{ 4, 5, 6, 7, 12, 13, 14, 15 }, &.{ 2, 3, 6, 7, 10, 11, 14, 15 }, &.{ 8, 9, 10, 11, 12, 13, 14, 15 }, &vals, &.{ 2, 3, 6, 7, 10, 11, 14, 15 }, &.{ 8, 9, 10, 11, 12, 13, 14, 15 }, &vals };
+    for (names, want) |n, expect| {
+        const a = w.get(n).?;
+        try mlx.check(mlx.mlx_array_eval(a));
+        const got = (mlx.mlx_array_data_float32(a) orelse return error.NoData)[0..expect.len];
+        try std.testing.expectEqualSlices(f32, expect, got);
+    }
+}
+
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
     if (config.mlxStream()) return Weights.init(allocator); // mlx-stream loads its own
     try admitExl3Backend(config, mlx.metalKernelsAvailable());
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
-    if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
+    if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) {
+        if (load_vision) _ = try mlx_gguf.loadVision(io, allocator, model_dir, &gguf_weights.map);
+        return gguf_weights;
+    }
     if (config.embedded_ple_payload_bytes != null) {
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
@@ -9329,6 +9352,18 @@ test "nemotron_h: RADIO pruning preserves checkpoint decimal precision" {
         try testing.expectEqual(expected, @as(f64, root_rate.video_pruning_rate));
         try testing.expectEqual(expected, @as(f64, nested_rate.video_pruning_rate));
     }
+}
+
+test "parseConfig: a config.json with Python's bare Infinity (mlx-lm's Nemotron-H time_step_limit) loads" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"nemotron_h\",\"time_step_limit\":[\n 0.0,\n Infinity\n]}" });
+    const dir = buf[0..try tmp.dir.realPath(io, &buf)];
+    var cfg = try parseConfigLegacy(io, testing.allocator, dir);
+    defer cfg.deinit(testing.allocator);
+    try testing.expectEqual(std.math.inf(f32), cfg.time_step_max);
 }
 
 test "nemotron_h: time_step_limit accepts only numeric bounds and positive infinity" {

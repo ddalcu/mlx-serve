@@ -87,6 +87,7 @@ test {
     _ = @import("host/plugins/loader.zig");
     _ = @import("sdk/util/log.zig");
     _ = @import("host/plugin_host_impl.zig");
+    _ = @import("host/plugin_ane.zig");
     _ = @import("sdk/util/os_mutex.zig");
     _ = @import("sdk/util/crt.zig");
     _ = @import("sdk/util/rtfmt.zig");
@@ -122,6 +123,7 @@ test {
     _ = @import("host/gpu_thread/scheduler.zig");
     _ = @import("host/gpu_thread/params.zig");
     _ = @import("host/gpu_thread/requests.zig");
+    _ = @import("host/api/ablation.zig");
     _ = @import("host/api/request_options.zig");
     _ = @import("host/api/schema_check.zig");
     _ = @import("sdk/util/err_name.zig");
@@ -290,7 +292,7 @@ test {
     _ = @import("sdk/ane/offload.zig");
     _ = @import("engines/ane/dflash.zig");
     _ = @import("engines/ane/lm.zig");
-    _ = @import("engines/ane/mil.zig");
+    _ = @import("sdk/ane/mil.zig");
     _ = @import("engines/ane/pack.zig");
     _ = @import("engines/ane/prefix.zig");
     _ = @import("engines/ane/qwen35.zig");

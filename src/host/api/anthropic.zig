@@ -1,6 +1,7 @@
 //! sendAnthropicError; sendAnthropicEvent; stop reasons, tools json, handleAnthropicMessages, non-streaming
 
 const std = @import("std");
+const ablation = @import("ablation.zig");
 const schema_check = @import("schema_check.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
@@ -236,6 +237,10 @@ pub fn handleAnthropicMessages(
         return;
     }
     const root = parsed.value.object;
+    if (ablation.refuseOnSurface(root)) |r| {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", r.msg, r.code);
+        return;
+    }
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.

@@ -1137,7 +1137,8 @@ test "kernel contract idol: the fused kernels pass gates 1-4" {
     var t: kc.gates.Tally = .{};
     try kc.gates.runAll(a, set.kernels.items, 0xc0de, &t);
     try std.testing.expectEqual(@as(usize, 0), t.problems());
-    try std.testing.expectEqual(@as(usize, 9), t.passed);
+    // Off NAX the matrix-unit attention skips.
+    try std.testing.expectEqual(@as(usize, 9), t.passed + t.skipped);
 }
 
 test "kernel contract idol: each declared launch is the shipped wrapper's, byte for byte" {

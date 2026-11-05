@@ -72,6 +72,7 @@ pen = chat(repeat_penalty=2.0)
 pen_pld = pld_rounds() - before
 
 ck("repeat_penalty changes the reply without logprobs", pen != plain, f"{pen.count('apple')} apples")
+ck("repetition_penalty alias produces the same reply", pen == chat(repetition_penalty=2.0))
 ck("same bytes as with logprobs", pen == chat(repeat_penalty=2.0, logprobs=True, top_logprobs=1))
 ck("same bytes streamed", pen == chat(repeat_penalty=2.0, stream=True))
 ck("frequency_penalty changes the reply", chat(frequency_penalty=1.5) != plain)
@@ -101,6 +102,8 @@ def completion(**extra):
 for name, call in (("chat", chat), ("completions", completion)):
     freq = call(frequency_penalty=1.5)
     ck(f"{name}: frequency_penalty changes the reply", freq != call(), f"freq={freq[:60]!r}")
+    rep = call(repetition_penalty=2.0)
+    ck(f"{name}: repetition_penalty alias matches repeat_penalty", rep == call(repeat_penalty=2.0) and rep != call())
 
 pj = "Write the word apple 40 times. Return JSON with a words array."
 j1 = chat(pj, response_format=SCHEMA, repeat_penalty=1.0)

@@ -42,6 +42,8 @@ and field: [plugin-abi.md](plugin-abi.md) (generated from `src/abi/`).
   match its receipt's hash, is negotiated (`src/abi/dylib.zig`: a plugin built against another MLX is refused) and
   joins the claims (a same-name plugin replaces a built-in; higher rank wins; a built-in wins a tie). A refusal names
   the file and the reason, and the server serves on without it. A dylib is never unloaded; `--no-plugins` loads none.
+  `/props` `plugins` lists each one loaded or refused (`rebuild: true` = built for another MLX or ABI, which a rebuild
+  with this release's kit fixes; the app offers Rebuild), and a failed model load names those plugins.
   `/v1/models` marks a pack an outside plugin serves with `"plugin": "<name>"`; the app's Settings ▸ Server lists the
   receipts with a switch each (writes `plugins.json`). macOS only, never in the Mac App Store build.
 
@@ -67,6 +69,21 @@ the two vendored modules (`sushi_exl3`, `mlx_stream`). They read only the declar
   are added to `src/mlx/ffi.zig`). A plugin that needs an MLX internal (a GPU wait on an event, an allocation without a
   fill) keeps its own C++ shim, compiled by our build against the staged MLX headers (mlx-stream's `csrc/`). An MLX
   bump can break such a shim; the plugin's repository fixes it and the pin moves.
+
+## The Neural Engine: `Host.ane`
+
+A plugin reaches the ANE through the host's one runtime (`lib/ane`), never a copy of it:
+`kit.host.Host.of(ctx.host).ane()` is the `HostAne` table, or null (no ANE, Linux, or a host from before the field),
+and then the plugin serves on the GPU. The host owns the mechanism; the plugin owns the policy.
+
+| The host (`HostAne`) | The plugin |
+|---|---|
+| compiling any MIL program (`program_create`; `kit.ane.mil` builds the text and weight blob) with the compile cache, surfaces, requests, evaluation | which ops and layers go to the ANE, the rows each die takes, when it starts and joins an evaluation, its GPU fallback |
+| typed banks: SwiGLU (with DeepSeek V4's `swiglu_limit`) and GatedDeltaNet input projections over int8 per-row weights | quantizing its weights to int8 rows, the layout of its activations |
+| the process's count of resident compiled models (`resident`; about 121 allowed) and its dies, shared with the host's own offloads | staying under that limit |
+
+An evaluation runs on the calling thread. Different programs, banks and requests evaluate concurrently, one caller at
+a time each.
 
 ## Pick the shallowest seam
 

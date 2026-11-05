@@ -152,7 +152,8 @@ Model facts the host keeps once at load. Defaults are the generic model's.
 | `verify_truncates` | `bool` | `false` | A rejected draft rolls back by truncating the KV cache (an attention trunk): no snapshot, no re-forward. |
 | `merged_state` | `bool` | `false` | A batch's recurrent state is read and written only through `CacheOps.state_rows` / `set_state_rows`, so the engine may keep it merged across batched ticks instead of re-stacking every layer each tick. |
 | `slot_state` | `bool` | `false` | Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`): requests interleave and batch instead of running single-flight. |
-| `_` | `u34` | `0` |  |
+| `ablation` | `bool` | `false` | The forward honours `Forward.ablation` on every pass that writes the residual stream (a native drafter's rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes only under the same `Ablation.keys` entry. |
+| `_` | `u33` | `0` |  |
 
 ### `ThinkingDefault` (enum(u8))
 
@@ -478,6 +479,8 @@ Valid during `load` only: the model keeps none of its pointers.
 | `stream_room` | `u64` | `0` | GPU bytes a streamed expert bank may fill (with what is resident): the GPU ceiling less one prompt's bill at 16K + 1K and the wired margin; 0 = none. |
 | `pair_remote` | `LayerSpan` | `.{}` | A two-Mac pair's layers on the other Mac (DeepSeek-V4.1's worker run); `count` 0 = no pair. |
 | `wired_margin_bytes` | `u64` | `8 << 30` | The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned. |
+| `tp_rank` | `u32` | `0` | Tensor parallel (DeepSeek-V4.1): this rank's slice of every expert and attention head, the weights already sliced; `tp_size` 0 = whole. |
+| `tp_size` | `u32` | `0` |  |
 
 ### `Mode` (enum(u8))
 
@@ -531,6 +534,18 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `suppress_mask` | `Array` | `.{}` | The sampler's suppress mask `[vocab]` (true = never drawn), which a round's greedy accept applies; empty = none. |
 | `embeds` | `Array` | `.{}` | Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`); empty = embed the ids. |
 | `progress` | `?*u64` | `null` | A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching. |
+| `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
+
+### `Ablation` (extern struct)
+
+Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its unit direction from everything it writes to the residual stream (the embedding and each sublayer's output), so `y <- y - s (y . r) r`. The arrays are the host's, valid for the call.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(Ablation)` |  |
+| `directions` | `Array` | `.{}` | Unit directions `[slots, hidden]` f32, one row per `Forward.slots` entry. |
+| `strengths` | `Span(f32)` | `.{}` | One per slot, in [0, 1]; 0 = that slot is not ablated. |
+| `keys` | `Span(u64)` | `.{}` | One per slot: the profile's identity with the strength folded in (equal keys ablate identically); 0 = none. |
 
 ### `Offload` (extern struct)
 
@@ -1226,7 +1241,7 @@ A quant plugin's table, exported as `exportName(name, version)`. `claims`, `vali
 
 ## `host.zig`
 
-The `Host` table: everything process-wide a plugin reaches (the allocator, the log, the MLX error latch, the kernel cache, levers, metrics, the memory ceiling) and `HostGpu`, the C API below MLX's kernel API. A plugin receives it at load (`LoadCtx.host`) and keeps the pointer in its own per-load state: sdk holds no copy. Extern layouts, the C calling convention, `size` first, grows at its end. Called only from the GPU thread, unless a member says otherwise.
+The `Host` table: everything process-wide a plugin reaches (the allocator, the log, the MLX error latch, the kernel cache, levers, metrics, the memory ceiling), `HostGpu`, the C API below MLX's kernel API, and `HostAne`, the Neural Engine. A plugin receives it at load (`LoadCtx.host`) and keeps the pointer in its own per-load state: sdk holds no copy. Extern layouts, the C calling convention, `size` first, grows at its end. Called only from the GPU thread, unless a member says otherwise.
 
 | Name | Value | |
 |---|---|---|
@@ -1238,6 +1253,13 @@ The `Host` table: everything process-wide a plugin reaches (the allocator, the l
 | `version` | `u32 = 1` |  |
 | `gpu_version` | `u32 = 1` |  |
 | `gpu_min_size` | `usize = @offsetOf(HostGpu, "command_buffer_limits")` | The `HostGpu` size every plugin may rely on (through `alias`): members past it are optional, read only when the table's `size` reaches them, so a plugin built with a newer kit still loads on a host without them, and a plugin built before them loads on a host with them. |
+| `ane_version` | `u32 = 1` |  |
+| `AneProgram` | `opaque {}` | A compiled MIL program (`HostAne.program_create`), a request binding one procedure's surfaces, and an IOSurface. |
+| `AneRequest` | `opaque {}` |  |
+| `AneSurface` | `opaque {}` |  |
+| `AneBank` | `opaque {}` | A bank under construction, the compiled bank (one program of typed procedures), and a shared I/O plane. |
+| `AneBankProgram` | `opaque {}` |  |
+| `AnePlane` | `opaque {}` |  |
 
 ### `LogLevel` (enum(u8))
 
@@ -1316,6 +1338,11 @@ One custom kernel as mlx-c's `mlx_fast_{metal,cuda}_kernel_new` takes it. The ca
 | `counter` | `*const fn (ctx: ?*anyopaque, name: Str) callconv(.c) ?*u64` |  | A named counter's word, added to with a relaxed atomic add; null when metrics are off or the name is unknown, so a plugin resolves it once and pays nothing per add when off. Any thread. |
 | `memory_ceiling` | `*const fn (ctx: ?*anyopaque) callconv(.c) u64` |  | Bytes the plugin may still allocate on the GPU right now: the host's ceiling less what is resident. |
 | `gpu` | `*const HostGpu` |  |  |
+| `ane` | `?*const HostAne` | `null` | The Neural Engine; read it through `aneOf`, which also answers null for a host older than this field. |
+
+### `aneOf(h: *const Host) ?*const HostAne`
+
+`h.ane`, or null where the host has none or predates it (its `size` ends before the field).
 
 ### `EventKind` (enum(u8))
 
@@ -1387,6 +1414,71 @@ The C API below MLX's kernel API: one implementation in the host against MLX's i
 ### `gpuHas(g: *const HostGpu, comptime name: []const u8) bool`
 
 Whether the table `g` (a host's, of any size) reaches its member `name`.
+
+### `AneIo` (extern struct)
+
+One input or output of a compiled procedure: a MIL tensor of rank r laid on the ANE's (batch, channel, depth, height, width) from the right, the last axis packed, with the strides the compiled model reports (rows padded to 64 bytes). `dtype`: 0 fp16, 1 fp32, 2 int8, 3 uint8.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `name` | `[128]u8` |  |  |
+| `dtype` | `u32` |  |  |
+| `batches` | `u32` |  |  |
+| `channels` | `u32` |  |  |
+| `depth` | `u32` |  |  |
+| `height` | `u32` |  |  |
+| `width` | `u32` |  |  |
+| `batch_stride` | `u64` |  |  |
+| `depth_stride` | `u64` |  |  |
+| `plane_stride` | `u64` |  |  |
+| `row_stride` | `u64` |  |  |
+
+### `AneSurfaceView` (extern struct)
+
+A surface and where it is mapped; zero-filled when made.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `surface` | `?*AneSurface` | `null` |  |
+| `base` | `?[*]u8` | `null` |  |
+| `bytes` | `usize` | `0` |  |
+
+### `HostAne` (extern struct)
+
+The Neural Engine (`lib/ane`), one runtime for the whole process: its compile cache, its limit on resident compiled models (about 121 on M5) and its dies are shared by every user, the host's own offloads included. Mechanism only: which layers or ops go there is the caller's choice. Any thread; one caller at a time per program instance, bank program or request, while different ones evaluate concurrently. Failures return null or a negative/zero result with `err` filled (`err_len` bytes, NUL-terminated); the caller runs its GPU path instead.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(HostAne)` |  |
+| `version` | `u32` | `ane_version` |  |
+| `ctx` | `?*anyopaque` |  |  |
+| `program_create` | `*const fn (ctx: ?*anyopaque, name: [*:0]const u8, mil: [*:0]const u8, weights: ?*anyopaque, weight_bytes: usize, instances: u32, dies: ?[*]const u32, err: [*]u8, err_len: usize) callconv(.c) ?*AneProgram` |  | One MIL program (`main`, or `procedureNNN` functions) over one weight blob, loaded `instances` times, load i pinned to die `dies[i]` (`dies` null, or 0 = no hint; two loads without hints can share a die). Takes `weights` (`malloc`'d, freed once compiled). The compile cache keys on the MIL text and the weights. |
+| `program_free` | `*const fn (ctx: ?*anyopaque, p: ?*AneProgram) callconv(.c) void` |  |  |
+| `program_procedure` | `*const fn (ctx: ?*anyopaque, p: *AneProgram, function: [*:0]const u8) callconv(.c) i32` |  | The procedure index of the MIL function `function`; -1 when absent. |
+| `program_io_count` | `*const fn (ctx: ?*anyopaque, p: *AneProgram, procedure: u32, output: bool) callconv(.c) u32` |  |  |
+| `program_io` | `*const fn (ctx: ?*anyopaque, p: *AneProgram, procedure: u32, output: bool, index: u32, out: *AneIo) callconv(.c) bool` |  | Inputs and outputs bind by name in the order this lists them; false for an index past the count. |
+| `program_compile_seconds` | `*const fn (ctx: ?*anyopaque, p: *const AneProgram) callconv(.c) f64` |  | Load cost of the create: a fresh compile, or a cache hit. |
+| `program_cache_hit` | `*const fn (ctx: ?*anyopaque, p: *const AneProgram) callconv(.c) bool` |  |  |
+| `surface_create` | `*const fn (ctx: ?*anyopaque, bytes: usize, out: *AneSurfaceView) callconv(.c) bool` |  | An IOSurface of at least `bytes` (16 KB-aligned, host-mapped, zeroed); false when the OS refuses it. |
+| `surface_release` | `*const fn (ctx: ?*anyopaque, s: ?*AneSurface) callconv(.c) void` |  |  |
+| `request_create` | `*const fn (ctx: ?*anyopaque, p: *AneProgram, instance: u32, procedure: u32, inputs: [*]const ?*AneSurface, n_in: u32, outputs: [*]const ?*AneSurface, n_out: u32, err: [*]u8, err_len: usize) callconv(.c) ?*AneRequest` |  | Procedure `procedure` of load `instance` over these surfaces, in `program_io`'s order. The surfaces must outlive the request. |
+| `request_eval` | `*const fn (ctx: ?*anyopaque, r: *AneRequest, err: [*]u8, err_len: usize) callconv(.c) bool` |  | Runs the request to completion on the calling thread. |
+| `request_free` | `*const fn (ctx: ?*anyopaque, r: ?*AneRequest) callconv(.c) void` |  |  |
+| `plane_create` | `*const fn (ctx: ?*anyopaque, bytes: usize) callconv(.c) ?*AnePlane` |  | A shared I/O plane of at least `bytes`: every program of one shape on one die can bind the same pair, since evaluations on a die run in turn. Concurrent dies need their own. |
+| `plane_free` | `*const fn (ctx: ?*anyopaque, p: ?*AnePlane) callconv(.c) void` |  |  |
+| `plane_base` | `*const fn (ctx: ?*anyopaque, p: *AnePlane) callconv(.c) ?[*]f16` |  |  |
+| `bank_create` | `*const fn (ctx: ?*anyopaque) callconv(.c) ?*AneBank` |  |  |
+| `bank_free` | `*const fn (ctx: ?*anyopaque, b: ?*AneBank) callconv(.c) void` |  | Frees a bank not yet finished. |
+| `bank_add_swiglu` | `*const fn (ctx: ?*anyopaque, b: *AneBank, hidden: u32, ffn: u32, rows: u32, gate_q: [*]const i8, gate_s: [*]const f32, up_q: [*]const i8, up_s: [*]const f32, down_q: [*]const i8, down_s: [*]const f32, limit: f32, err: [*]u8, err_len: usize) callconv(.c) i32` |  | Appends one SwiGLU (`down(silu(gate x) * up x)`, input `[hidden][rows]` channel-major) and returns its procedure index, or -1. `gate`/`up` are `[ffn, hidden]`, `down` `[hidden, ffn]`. `limit` > 0 clamps as DeepSeek V4's `swiglu_limit` does: gate <= limit, \|up\| <= limit; 0 clamps at fp16's range only. |
+| `bank_add_gdn` | `*const fn (ctx: ?*anyopaque, b: *AneBank, hidden: u32, qkv_out: u32, z_out: u32, rows: u32, qkv_q: [*]const i8, qkv_s: [*]const f32, z_q: [*]const i8, z_s: [*]const f32, err: [*]u8, err_len: usize) callconv(.c) i32` |  | Appends one GatedDeltaNet input projection: `qkv` `[qkv_out, hidden]` and `z` `[z_out, hidden]` as one fused conv whose output rows are qkv first. Returns the procedure index, or -1. |
+| `bank_finish` | `*const fn (ctx: ?*anyopaque, b: *AneBank, name: [*:0]const u8, die: i32, input: ?*AnePlane, output: ?*AnePlane, err: [*]u8, err_len: usize) callconv(.c) ?*AneBankProgram` |  | Compiles (or restores from the cache) and loads the bank as one program pinned to die `die` (0 = no hint). Consumes the bank either way. Null planes get a per-program allocation. |
+| `bank_program_free` | `*const fn (ctx: ?*anyopaque, m: ?*AneBankProgram) callconv(.c) void` |  |  |
+| `bank_program_input` | `*const fn (ctx: ?*anyopaque, m: *AneBankProgram) callconv(.c) ?[*]f16` |  |  |
+| `bank_program_output` | `*const fn (ctx: ?*anyopaque, m: *AneBankProgram) callconv(.c) ?[*]f16` |  |  |
+| `bank_program_eval` | `*const fn (ctx: ?*anyopaque, m: *AneBankProgram, procedure: u32, err: [*]u8, err_len: usize) callconv(.c) bool` |  | Runs procedure `procedure` over the input plane into the output plane, on the calling thread. |
+| `bank_program_compile_seconds` | `*const fn (ctx: ?*anyopaque, m: *const AneBankProgram) callconv(.c) f64` |  |  |
+| `bank_program_cache_hit` | `*const fn (ctx: ?*anyopaque, m: *const AneBankProgram) callconv(.c) bool` |  |  |
+| `resident` | `*const fn (ctx: ?*anyopaque) callconv(.c) u32` |  | Compiled models resident in the process now (every user's, the host's included). |
 
 ## `engine.zig`
 

@@ -18,7 +18,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx/ffi.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF), libllama (`lib/llama`, generic GGUF), the Neural Engine runtime (`lib/ane`). Absorbed in-tree: sushi's EXL3 + STQ (`src/sdk/quant/exl3/sushi/`, module `sushi_exl3`, `zig build exl3-test`) and davidtai's mlx-stream (`src/mlx_stream.zig`).
+Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` 0.32.5 pre-release, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx/ffi.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF), libllama (`lib/llama`, generic GGUF), the Neural Engine runtime (`lib/ane`). Absorbed in-tree: sushi's EXL3 + STQ (`src/sdk/quant/exl3/sushi/`, module `sushi_exl3`, `zig build exl3-test`) and davidtai's mlx-stream (`src/mlx_stream.zig`).
 
 ## Layout (`src/`)
 
@@ -63,6 +63,7 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
   test split across the shards. Lint: `python3 scripts/lint.py --strict` (`zig build lint`) stays 0.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx/ffi.zig` externs. Brew: webp ≥ 1.6.0.
+- **An MLX bump must not turn every proof tape red**: stamp the MLX build in the tape header, and on a different MLX drop a tape to a tolerance check against an f32 reference (as dsv41 `expectNoWorse` does) that asks for a re-record (`MLX_SERVE_TAPE_RECORD`).
 - **Linux/Windows CUDA**: build with `./scripts/build-linux.sh` / `scripts\build-windows.ps1`; MLX's JIT needs `CUDA_HOME`; custom MSL runs on Metal only. Kernels, per-device defaults, memory, measuring, and its rules (GPU-pool loads, graphs, kernel cache, matching MLX's bits): `docs/CUDA.md`.
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
 

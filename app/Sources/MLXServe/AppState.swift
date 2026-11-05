@@ -438,8 +438,8 @@ class AppState: ObservableObject {
         showModels(.downloads)
     }
 
-    func showModels(_ section: ModelBrowserSection = .recommended) {
-        chatWorkspace = .models(section)
+    func showModels(_ section: ModelBrowserSection? = nil) {
+        chatWorkspace = .modelBrowserEntry(section: section, localModels: localModels)
         pendingChatOpenTick += 1
     }
 

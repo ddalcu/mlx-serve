@@ -31,7 +31,7 @@ const naxSdpaPreferred = @import("sdpa.zig").naxSdpaPreferred;
 // K/V may be non-contiguous cache views (strides used; innermost dim must be
 // contiguous — guaranteed for slices along T). Guards and dispatch read one
 // shared predicate, so they cannot drift.
-pub const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header.metal");
+pub const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header.metal") ++ kernelSource("kernels/common/pack8.metal");
 
 // v2 tile geometry ( micro-bench sweep on the M4 Max, Qwen 24q/4kv
 // and Gemma geometries): BQ=64 with 8 simdgroups halves the K/V staging walks

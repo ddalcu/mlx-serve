@@ -65,6 +65,8 @@ def chat(messages, max_tokens=120):
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": False,
+        # Serial decode: an MTP round rolls its own state back, a pipelined stop is the case to cover.
+        "enable_mtp": False,
     }
     req = urllib.request.Request(
         f"{BASE}/v1/chat/completions",

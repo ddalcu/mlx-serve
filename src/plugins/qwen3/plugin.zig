@@ -67,6 +67,7 @@ const Linear = ld.Linear;
 /// The embedding table and head the drafters read, borrowed (a tied head is the table).
 fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weight) callconv(.c) Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
+    if (which == .head and m.headless) return Verdict.refuse(.unsupported, "embedding model has no language model head");
     return switch (m.body) {
         inline .dense, .moe => |*d| ld.trunkWeight(switch (which) {
             .embed => &d.base.weights.embed.table,
@@ -83,6 +84,7 @@ fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 /// A loaded model: one of the two bases, and every handle it holds.
 pub const Loaded = struct {
     caps: abi.Caps,
+    headless: bool = false,
     body: union(enum) {
         dense: struct { base: bases.Model(Dense), layers: []Dense.Layer },
         moe: struct { base: bases.Model(Moe), layers: []Moe.Layer, routes: []compiled.Closure, angles: b.qk_rope.AngleCache = .{} },
@@ -132,7 +134,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     const m = try gpa.create(Loaded);
     errdefer gpa.destroy(m);
     m.* = .{ .caps = ctx.parsed.caps, .body = undefined };
-    errdefer m.owned.deinit();
+    // Once the body is initialized below, release() owns cleanup of these handles.
+    // A second errdefer here would free them twice when loading a layer fails.
     const shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps);
     scaled.logScaling(plugin.name, c.rope);
     if (c.moe) {
@@ -209,11 +212,12 @@ fn trunk(comptime D: type, m: *Loaded, r: *ld.Reader, c: *const config.Config, l
     try m.owned.linear(embed);
     const final_norm = try r.need(try r.name(&nb, "norm.weight", .{}));
     try m.owned.own(final_norm);
+    m.headless = c.embedding_pack and !c.tie_word_embeddings and !r.hasHead();
     return .{
         .embed = .{ .table = embed, .hidden = @intCast(c.hidden_size), .act = .bfloat16 },
         .layers = layers,
         .final_norm = final_norm,
-        .head = try r.head(&m.owned, embed, c.hidden_size, c.tie_word_embeddings),
+        .head = try r.head(&m.owned, embed, c.hidden_size, c.tie_word_embeddings or m.headless),
     };
 }
 
@@ -322,6 +326,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
 
 fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) Verdict {
     const m: *Loaded = @ptrCast(@alignCast(mp));
+    if (m.headless and f.logits != .none) return Verdict.refuse(.unsupported, "embedding model has no language model head");
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "forward mode not declared");
     return switch (m.body) {
         .dense => |*d| run_mod.tableForward(Dense, &d.base, f, out),

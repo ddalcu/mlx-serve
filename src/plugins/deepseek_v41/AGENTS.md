@@ -21,7 +21,11 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   rows runs through `blockFused`; `decode/fixture.zig` builds release-shape layers on random weights for their
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
-  without NAX (unmeasured on M5); `moe_up` / `moe_down` serve the affine 2/3-bit packs. Otherwise `routed` runs.
+  without NAX (unmeasured on M5); `moe_up` / `moe_down` serve the affine 2/3-bit packs at group 64 or 128 (the
+  expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
+- GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
+  (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
+  (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
 
 ## Facts the table declares
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
@@ -31,6 +35,17 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   and restore only at their exact position; the engine owns finished history. Streamed/paired keep legacy resume.
 - No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
+- A tensor pair (`InitOpts.tp`, `--dist tensor`) halves the experts and attention heads at load (the sliced `cfg` says so);
+  both ranks run every layer and `tpSum` each attention and MoE output. Every rank must build the same sums in the same
+  order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`). DSpark drafts on rank 0 alone: its stages
+  load whole and sum nothing, and the worker follows each verify's rollback.
+- Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
+  worker keeps it; a step on another state (`st != &dec_state`) is refused.
+- Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken
+  outside a step (`armPrompt` at a restored boundary) goes as `.capture`. The ranks' caches are equal (`tpStream`
+  asserts it), so the SSD tier writes rank 0's and a disk import sends the worker its tensors (`tpLoad`).
+- Under `tp` rank 0 alone holds the vision tower: a chunk's image rows ride with its step (`tp_step` `images`), the
+  worker splices them at offset 0, so a rank's splice must depend only on the chunk's own rows (`chunkImageRows`).
 - Thinking default ON; effort vocabulary `dsv41`; DSML tools on OUR byte-pinned template.
 - Metal only: a CPU host stream loads on this thread's GPU stream; no GPU = refused by name.
 
@@ -61,6 +76,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - A fused decode stage is judged against an f32 model (`decode.expectNoWorse`), not against the chain's bits: greedy
   texts diverge from the chain's at bf16 near-ties. Two dependent stages merged into one ticket-ordered dispatch
   measured slower than the pair (their threadgroup shapes differ): keep one dispatch a stage.
+- Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
+  interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
 ## Streamed packs (`experts.bin`)
 - M5 and newer only (`naxAvailable`), refused by name below, as are GLM-5.3's EXL3 repacks: the prompt GEMMs are built
@@ -79,6 +96,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - A plain MLX pack streams with the per-model `stream_experts` (`openPackBank`, the `trunk` arm): one fetch serves
   `Routed.decode_ids` experts, so a wider prompt call runs its experts in groups (`slotWide`). Decode is read-bound
   (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
+- A tensor pair refuses streamed experts by name (`Dsv41TpStreamedExperts`): a bank reads whole experts, only rank 0
+  would open one, and each rank holds half of every expert.
 
 ## Known issues
 - Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization

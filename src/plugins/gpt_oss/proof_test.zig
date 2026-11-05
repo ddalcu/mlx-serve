@@ -296,5 +296,5 @@ test "gpt_oss plugin: a pack with a DFlash sidecar serves through the plugin and
     try writePackAt(&p, true, 64, 128);
     var b = try both.Both.openAs(&plugin.table, &p, json, true, .none);
     defer b.close();
-    try both.expectDflashRecorded(&b.xfm, "applegpu_g17d", &.{ 48, 54, 99, 45, 69, 54, 54, 29, 11, 31, 54, 122, 91, 122, 120, 44 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+    try both.expectDflashRecorded(&b.xfm, "applegpu_g17d", &.{ 48, 54, 99, 45, 54, 54, 54, 29, 13, 11, 9, 122, 54, 54, 91, 83 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
 }

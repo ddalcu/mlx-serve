@@ -240,6 +240,10 @@ pub const Generator = struct {
     /// and recurrent state cannot be rewound: the state at the last two such steps, shared by
     /// refcount, so a finishing slot rolls back to what it commits (`rollbackSsmTo`).
     ssm_lag: [2]SsmLag = .{ .{}, .{} },
+    /// A model whose recurrent state is written in place keeps no lag: its stop and lookahead stay
+    /// forwarded, and the commit keys them so the decode-end checkpoint lands where the state is.
+    forwarded_stop: [2]u32 = .{ 0, 0 },
+    forwarded_stop_len: u32 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
     /// Per-phase wall-time trace (diag dflash-trace; else untouched).
@@ -457,6 +461,8 @@ pub const Generator = struct {
     mtp_price: MtpPriceWindow = .{},
     /// Ticks left in a bounded serial block (the serial probe); the slot stays an MTP slot.
     mtp_serial_left: u32 = 0,
+    /// The running serial probe; null outside one.
+    mtp_probe: ?round_cost.SerialProbe = null,
     mtp_low_accept: u32 = 0,
     mtp_tok_ema: f32 = 0,
     /// Where a serial block sits in its ramp back to `nextMtp`'s entry invariant.
@@ -972,6 +978,7 @@ pub const Generator = struct {
     pub const mtpTraceRoundEnd = @import("../spec/mtp/planner.zig").mtpTraceRoundEnd;
     pub const pushSsmLag = @import("pipeline.zig").pushSsmLag;
     pub const rollbackSsmTo = @import("pipeline.zig").rollbackSsmTo;
+    pub const ssmWrittenInPlace = @import("pipeline.zig").ssmWrittenInPlace;
     pub const next = @import("step.zig").next;
     pub const nextReasoningStep = @import("step.zig").nextReasoningStep;
     pub const nextChoiceStep = @import("step.zig").nextChoiceStep;

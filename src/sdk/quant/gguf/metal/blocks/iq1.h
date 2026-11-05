@@ -19,14 +19,19 @@ inline void deq_iq1_s(const device uint8_t *b, uint ib, thread O &o) {
 
 template <typename O>
 inline void deq_iq1_m(const device uint8_t *b, uint ib, thread O &o) {
-    const device uint8_t *sc = b + 48;
+    // A block is 56 bytes, so it starts 8-aligned: the unit's grid bytes load as a word, its high bits as a half, the
+    // four scale halves as two words.
+    const uint qs = *(const device uint *)(b + 4 * ib);
+    const uint qh2 = *(const device ushort *)(b + 32 + 2 * ib);
+    const uint2 sw = *(const device uint2 *)(b + 48);
+    const uint sc[4] = {sw.x & 0xFFFF, sw.x >> 16, sw.y & 0xFFFF, sw.y >> 16};
     // The block's f16 scale is the top nibble of each of the 4 u16 scale words.
-    const uint16_t d_bits = uint16_t((sc[1] >> 4) | (sc[3] & 0xF0) | (uint(sc[5] >> 4) << 8) | (uint(sc[7] & 0xF0) << 8));
+    const uint16_t d_bits = uint16_t((sc[0] >> 12) | ((sc[1] >> 8) & 0x00F0) | ((sc[2] >> 4) & 0x0F00) | (sc[3] & 0xF000));
     const float d = float(as_type<half>(d_bits));
-    const uint s16 = (uint(sc[2 * (ib / 2)]) | (uint(sc[2 * (ib / 2) + 1]) << 8)) >> (6 * (ib % 2));
+    const uint s16 = sc[ib / 2] >> (6 * (ib % 2));
     for (uint l = 0; l < 4; l++) {
         const float dl = d * float(2 * ((s16 >> (3 * (l / 2))) & 7) + 1);
-        const uint qh = b[32 + 2 * ib + l / 2] >> (4 * (l % 2));
-        gg_iq1_group(uint(b[4 * ib + l]) | ((qh & 7) << 8), l, dl, dl * ((qh & 8) ? -1.125f : -0.875f), o);
+        const uint qh = (qh2 >> (8 * (l / 2))) >> (4 * (l % 2));
+        gg_iq1_group(((qs >> (8 * l)) & 0xFF) | ((qh & 7) << 8), l, dl, dl * ((qh & 8) ? -1.125f : -0.875f), o);
     }
 }

@@ -2,7 +2,7 @@
 // array that frees it through the allocator. No kernel writes it and nothing is wrapped no-copy; its bytes are whatever
 // the allocator hands out. And an alias (`dsv41_alloc_alias`): another evaluated array's pages under an MTLBuffer of
 // their own (newBufferWithBytesNoCopy), the base held by the alias's deleter; MLX allocates and counts nothing for it.
-// Built against MLX 0.32.2's headers: re-verify on every MLX bump.
+// Built against MLX 0.32.5's headers: re-verify on every MLX bump.
 #include <mach/vm_page_size.h>
 
 #include <atomic>
@@ -41,12 +41,12 @@ int dsv41_alloc_uninit(mlx_array* out, const int* shape, size_t ndim, mlx_dtype 
       }
       n *= static_cast<size_t>(d);
     }
-    mx::allocator::Buffer buf = mx::allocator::malloc(n);
-    if (buf.ptr() == nullptr) {
+    mx::allocator::Data data = mx::allocator::malloc(n);
+    if (data.buffer().ptr() == nullptr) {
       g_error = "allocator returned no buffer";
       return -1;
     }
-    mlx_array_set_(*out, mx::array(buf, std::move(s), dt));
+    mlx_array_set_(*out, mx::array(std::move(data), std::move(s), dt));
     return 0;
   } catch (const std::exception& e) {
     g_error = e.what();

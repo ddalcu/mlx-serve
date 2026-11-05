@@ -20,7 +20,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
-const mil = @import("mil.zig");
+const mil = @import("../../sdk/ane/mil.zig");
 const pack_mod = @import("pack.zig");
 
 const Builder = mil.Builder;

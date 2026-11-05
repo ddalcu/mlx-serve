@@ -23,17 +23,7 @@ pub fn load(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, 
     var it = f.tensors.iterator();
     while (it.next()) |e| {
         const mapped = arch.mapTensor(&name_buf, e.key_ptr.*) orelse return error.UnsupportedTensor;
-        if (mapped.name.len == 0) continue;
-        var t = e.value_ptr.*;
-        const uncached = try f.readUncached(allocator, e.key_ptr.*);
-        defer if (uncached) |r| allocator.free(r.buf);
-        if (uncached) |r| t.data = r.data;
-        if (t.ty.isQuantized()) {
-            if (mlx_layouts and arch.transcodes(t.ty) and try (if (t.ty == .mxfp4) loadMxfp4(allocator, t, mapped, out) else loadAffine(allocator, t, mapped, hp, out))) continue;
-            try loadQuantized(allocator, t, mapped, hp, out, s);
-        } else {
-            try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
-        }
+        try loadTensor(allocator, f, e.key_ptr.*, e.value_ptr.*, mapped, arch, hp, mlx_layouts, out, s);
     }
     if (arch == .qwen4exp) for (0..arch.qwen4exp.base.n_layers) |li| {
         var lb: [64]u8 = undefined;
@@ -46,6 +36,72 @@ pub fn load(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMap, 
         .nemotron_h => try narrowALog(out, ".mixer.A_log", s),
         else => {},
     };
+}
+
+/// One tensor of `f` under its mapped name, in the layout `arch` serves it in (nothing for a skipped one).
+fn loadTensor(allocator: std.mem.Allocator, f: *const gguf.File, key: []const u8, tensor: gguf.Tensor, mapped: arch_mod.Mapped, arch: Arch, hp: qwen35.Hparams, mlx_layouts: bool, out: *WeightMap, s: mlx.mlx_stream) !void {
+    if (mapped.name.len == 0) return;
+    var t = tensor;
+    const uncached = try f.readUncached(allocator, key);
+    defer if (uncached) |r| allocator.free(r.buf);
+    if (uncached) |r| t.data = r.data;
+    if (t.ty.isQuantized()) {
+        if (mlx_layouts and arch.transcodes(t.ty) and try (if (t.ty == .mxfp4) loadMxfp4(allocator, t, mapped, out) else loadAffine(allocator, t, mapped, hp, out))) return;
+        try loadQuantized(allocator, t, mapped, hp, out, s);
+    } else {
+        try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
+    }
+}
+
+/// A DeepSeek-V4.1 set's DSpark stage bundle (`dspark-*.gguf`, arch/deepseek41.zig `mapDsparkTensor`) into `out`
+/// beside the trunk `hp`, each tensor in the layout the trunk's own would take.
+pub fn loadDspark(allocator: std.mem.Allocator, f: *const gguf.File, hp: arch_mod.deepseek41.Hparams, out: *WeightMap, s: mlx.mlx_stream) !void {
+    const ds = try arch_mod.deepseek41.Dspark.read(f, hp);
+    const arch: Arch = .{ .deepseek41 = hp };
+    const mlx_layouts = @import("claim.zig").claimState().mlx_layouts;
+    var name_buf: [160]u8 = undefined;
+    var it = f.tensors.iterator();
+    while (it.next()) |e| {
+        const mapped = arch_mod.deepseek41.mapDsparkTensor(&name_buf, e.key_ptr.*, ds) orelse return error.UnsupportedTensor;
+        try loadTensor(allocator, f, e.key_ptr.*, e.value_ptr.*, mapped, arch, arch.gdn(), mlx_layouts, out, s);
+    }
+}
+
+/// `residentBytes` of a DSpark stage bundle (`loadDspark`).
+pub fn dsparkResidentBytes(f: *const gguf.File, hp: arch_mod.deepseek41.Hparams) !u64 {
+    const ds = try arch_mod.deepseek41.Dspark.read(f, hp);
+    const arch: Arch = .{ .deepseek41 = hp };
+    var name_buf: [160]u8 = undefined;
+    var total: u64 = 0;
+    var it = f.tensors.iterator();
+    while (it.next()) |e| {
+        const mapped = arch_mod.deepseek41.mapDsparkTensor(&name_buf, e.key_ptr.*, ds) orelse return error.UnsupportedTensor;
+        if (mapped.name.len != 0) total += loadedBytes(e.value_ptr.*, arch.transcodes(e.value_ptr.ty));
+    }
+    return total;
+}
+
+/// A DeepSeek-V4.1 set's vision tower GGUF (arch/deepseek41.zig `Vision`, `mapVisionTensor`) into `out` beside the
+/// trunk `hp`, its floats as stored.
+pub fn loadVision(allocator: std.mem.Allocator, f: *const gguf.File, hp: arch_mod.deepseek41.Hparams, out: *WeightMap, s: mlx.mlx_stream) !void {
+    _ = try arch_mod.deepseek41.Vision.read(f, hp, null);
+    const arch: Arch = .{ .deepseek41 = hp };
+    var it = f.tensors.iterator();
+    while (it.next()) |e| {
+        const mapped = arch_mod.deepseek41.mapVisionTensor(e.key_ptr.*) orelse return error.UnsupportedTensor;
+        try loadTensor(allocator, f, e.key_ptr.*, e.value_ptr.*, mapped, arch, arch.gdn(), true, out, s);
+    }
+}
+
+/// `residentBytes` of a vision tower GGUF (`loadVision`).
+pub fn visionResidentBytes(f: *const gguf.File, hp: arch_mod.deepseek41.Hparams) !u64 {
+    _ = try arch_mod.deepseek41.Vision.read(f, hp, null);
+    var total: u64 = 0;
+    for (f.tensors.keys(), f.tensors.values()) |name, t| {
+        if (arch_mod.deepseek41.mapVisionTensor(name) == null) return error.UnsupportedTensor;
+        total += loadedBytes(t, false);
+    }
+    return total;
 }
 
 /// Every `*<suffix>` A_log in bf16, as our qwen4_exp packs and mlx-lm's Nemotron-H packs ship it: the fused GDN decode
@@ -1066,6 +1122,37 @@ test "a tiled-input weight of a split-layout type loads in the kernels' layout: 
             try std.testing.expectApproxEqAbs(want, got[m * rows + r], mag / 64 + 1e-4);
         };
     }
+}
+
+test "a DeepSeek-V4.1 vision tower GGUF loads under the release's names, bf16 as stored, rows = output features" {
+    const a = std.testing.allocator;
+    const ds41 = arch_mod.deepseek41;
+    var t = try ds41.testFileDs4(ds41.release_config);
+    defer t.deinit();
+    var v = try ds41.testVisionFileDs4();
+    defer v.deinit();
+    const w = [_]u16{ 0x3f80, 0x4000, 0x4040, 0x4080, 0x40a0, 0x40c0 };
+    for ([_][]const u8{ "vision.patch_embed.proj.weight", "aligner.w1.weight" }) |n|
+        try v.tensors.put(v.arena.allocator(), n, .{ .dims = .{ 3, 2, 1, 1 }, .n_dims = 2, .ty = .bf16, .data = std.mem.sliceAsBytes(&w) });
+    var map = WeightMap.init(a);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            a.free(e.key_ptr.*);
+        }
+        map.deinit();
+    }
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    try loadVision(a, &v, try ds41.Hparams.read(&t), &map, s);
+    try std.testing.expectEqual(@as(u32, 2), map.count());
+    const got = map.get("aligner.w1.weight").?;
+    try std.testing.expectEqualSlices(c_int, &.{ 2, 3 }, mlx.getShape(got));
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(got));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try std.testing.expectEqualSlices(u16, &w, mlx.mlx_array_data_bfloat16(got).?[0..6]);
+    try std.testing.expectEqual(@as(u64, 24), try visionResidentBytes(&v, try ds41.Hparams.read(&t)));
 }
 
 test "real model loads into a weight map (a real GGUF, env-gated)" {

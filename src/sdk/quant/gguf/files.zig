@@ -176,7 +176,7 @@ pub fn isMmprojGgufBasename(basename: []const u8) bool {
 /// True if `basename` is a non-LLM `.gguf` COMPANION file rather than a
 /// language-model quant. Two kinds ship today:
 ///
-///   - `mmproj-*.gguf`  — multimodal-projection / CLIP encoder (see above).
+///   - `mmproj-*.gguf` / `*-Vision.gguf` — a vision tower (`isVisionGgufBasename`).
 ///   - `*tokenizer*.gguf` — audio/speech tokenizer shipped beside a TTS model
 ///     (real: `qwen3-tts-tokenizer-f16.gguf` next to `qwen3-tts-0.6b-f16.gguf`).
 ///
@@ -199,6 +199,7 @@ pub fn isMtpGgufBasename(basename: []const u8) bool {
     // same --mtp slot and classifies by tensors. Swift mirror:
     // DownloadManager.isGgufSidecar — keep in sync.
     return std.ascii.startsWithIgnoreCase(basename, "mtp-") or // llama.cpp convert --mtp
+        std.ascii.startsWithIgnoreCase(basename, "dspark-") or // Unsloth's DeepSeek-V4.1 stage bundle
         asciiContainsIgnoreCase(basename, "-mtp-") or asciiContainsIgnoreCase(basename, "-mtp.") or
         asciiContainsIgnoreCase(basename, "-dspark-") or asciiContainsIgnoreCase(basename, "-dspark.");
 }
@@ -221,6 +222,25 @@ pub fn findMtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path:
 
 /// The first MTP draft-head GGUF in `dir_path` by name, other than `skip`.
 pub fn firstMtpGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, skip: []const u8) ?[]u8 {
+    return firstGgufIn(io, allocator, dir_path, skip, isMtpGgufBasename);
+}
+
+/// True for a vision tower GGUF shipped beside a language model: an `mmproj-*` file, or ds4's `*-Vision.gguf`
+/// (a suffix only: `Llama-3.2-11B-Vision-Instruct-Q4_K_M.gguf` is a model).
+pub fn isVisionGgufBasename(basename: []const u8) bool {
+    const tail = "-vision.gguf";
+    return isMmprojGgufBasename(basename) or
+        (basename.len >= tail.len and std.ascii.eqlIgnoreCase(basename[basename.len - tail.len ..], tail));
+}
+
+/// Full path to the vision tower GGUF beside a model file, or null. Caller owns the returned slice.
+pub fn findVisionSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
+    const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
+    return firstGgufIn(io, allocator, dir_path, std.fs.path.basename(model_file_path), isVisionGgufBasename);
+}
+
+/// The first GGUF in `dir_path` by name that `kind` accepts, other than `skip`.
+fn firstGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []const u8, skip: []const u8, comptime kind: fn ([]const u8) bool) ?[]u8 {
     // openDir asserts (→ ReleaseFast UB) on a non-absolute path.
     if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return null;
     var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
@@ -229,7 +249,7 @@ pub fn firstMtpGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []cons
     var best: ?[]const u8 = null;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (!isMtpGgufBasename(entry.name) or std.mem.eql(u8, entry.name, skip)) continue;
+        if (!kind(entry.name) or std.mem.eql(u8, entry.name, skip)) continue;
         if (best != null and !std.mem.lessThan(u8, entry.name, best.?)) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind != .file or entry.name.len > name_buf.len) continue;
@@ -241,7 +261,7 @@ pub fn firstMtpGgufIn(io: std.Io, allocator: std.mem.Allocator, dir_path: []cons
 
 pub fn isGgufSidecarBasename(basename: []const u8) bool {
     if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
-    if (isMmprojGgufBasename(basename)) return true;
+    if (isVisionGgufBasename(basename)) return true;
     if (asciiContainsIgnoreCase(basename, "tokenizer")) return true;
     return isMtpGgufBasename(basename);
 }
@@ -262,4 +282,26 @@ pub fn trimTrailingSlash(s: []const u8) []const u8 {
     var p = s;
     while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
     return p;
+}
+
+test "a vision tower GGUF is a sidecar, never the model, and is found beside it" {
+    const io = std.testing.io;
+    const a = std.testing.allocator;
+    try std.testing.expect(isGgufSidecarBasename("DeepSeek-V4.1-Flash-1017-Vision.gguf") and isVisionGgufBasename("mmproj-gemma-4-E4B-it-BF16.gguf"));
+    try std.testing.expect(!isGgufSidecarBasename("Llama-3.2-11B-Vision-Instruct-Q4_K_M.gguf"));
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    for ([_][]const u8{ "A-1017-Vision.gguf", "B-IQ2.gguf", "B-DSpark-support.gguf" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = "x" });
+    const scan = try scanLlmGguf(io, a, &tmp.dir);
+    defer a.free(scan.pick.?);
+    try std.testing.expectEqualStrings("B-IQ2.gguf", scan.pick.?);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const model = try std.fs.path.join(a, &.{ root, "B-IQ2.gguf" });
+    defer a.free(model);
+    const tower = findVisionSidecar(io, a, model) orelse return error.TestUnexpectedResult;
+    defer a.free(tower);
+    try std.testing.expectEqualStrings("A-1017-Vision.gguf", std.fs.path.basename(tower));
+    try tmp.dir.deleteFile(io, "A-1017-Vision.gguf");
+    try std.testing.expect(findVisionSidecar(io, a, model) == null);
 }

@@ -53,6 +53,8 @@ pub const Info = struct {
     /// `split.count`: shards of a split GGUF (gguf-split / convert --split-max-size).
     /// Writers put it after every other key, so the whole KV section is walked.
     split_count: u32 = 1,
+    /// `<arch>.context_length`: the window the checkpoint was trained for; 0 when absent.
+    context_length: u32 = 0,
 
     pub fn deinit(self: *Info, allocator: std.mem.Allocator) void {
         if (self.architecture) |a| allocator.free(a);
@@ -80,6 +82,15 @@ pub fn preferredEngine(info: Info) Engine {
         for (ds4_only_archs) |d| if (std.mem.eql(u8, a, d)) return if (info.ds4_unloadable) .llama else .ds4;
     }
     return .llama;
+}
+
+/// What ds4 drafts from for a file: the checkpoint's own head and/or a support GGUF beside it.
+pub const Spec = struct { embedded_mtp: bool = false, support_gguf: bool = true };
+
+/// ds4 fails the open of a DeepSeek-V4.1 handed any support GGUF (MTP or DSpark), so one beside it is skipped.
+pub fn ds4Spec(info: Info) Spec {
+    const a = info.architecture orelse "";
+    return .{ .embedded_mtp = info.embedded_mtp, .support_gguf = !std.mem.eql(u8, a, "deepseek41") };
 }
 
 pub const Error = error{
@@ -140,6 +151,9 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
         const is_ds4_lora = std.mem.eql(u8, key_buf, "deepseek4.attention.output_lora_rank");
         const is_nextn = std.mem.endsWith(u8, key_buf, ".nextn_predict_layers");
         const is_split_count = std.mem.eql(u8, key_buf, "split.count");
+        // One dot: `<arch>.context_length`, never a sub-namespace's (`<arch>.vision.context_length`).
+        const is_ctx_len = std.mem.endsWith(u8, key_buf, ".context_length") and
+            std.mem.indexOfScalar(u8, key_buf, '.').? == key_buf.len - ".context_length".len;
 
         const value_type = takeIntT(r, u32) catch return error.Truncated;
 
@@ -157,6 +171,8 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
             info.embedded_mtp = (try takeNumeric(r, value_type)) > 0;
         } else if (is_split_count and isNumeric(value_type)) {
             info.split_count = @intFromFloat(std.math.clamp(try takeNumeric(r, value_type), 1, std.math.maxInt(u32)));
+        } else if (is_ctx_len and isNumeric(value_type)) {
+            info.context_length = @intFromFloat(std.math.clamp(try takeNumeric(r, value_type), 0, std.math.maxInt(u32)));
         } else {
             try skipValue(r, value_type);
         }
@@ -439,6 +455,34 @@ test "embedded MTP is read from <arch>.nextn_predict_layers" {
     var c = try parseBytes(testing.allocator, dsv4);
     defer c.deinit(testing.allocator);
     try testing.expect(!c.embedded_mtp);
+}
+
+test "the trained window is read from <arch>.context_length, not from a sub-namespace's key" {
+    const bytes = try buildHeader(testing.allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "glm-dsa" } },
+        .{ .key = "glm-dsa.vision.context_length", .value = .{ .u32_v = 4096 } },
+        .{ .key = "glm-dsa.context_length", .value = .{ .u64_v = 1048576 } },
+    });
+    defer testing.allocator.free(bytes);
+    var info = try parseBytes(testing.allocator, bytes);
+    defer info.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1048576), info.context_length);
+
+    const bare = try buildHeader(testing.allocator, &.{.{ .key = "general.architecture", .value = .{ .str = "glm-dsa" } }});
+    defer testing.allocator.free(bare);
+    var none = try parseBytes(testing.allocator, bare);
+    defer none.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), none.context_length);
+}
+
+test "ds4Spec: DeepSeek-V4.1 takes no support GGUF in ds4; DeepSeek-V4 and the other archs do" {
+    for ([_][]const u8{ "deepseek41", "deepseek4", "qwen4exp" }) |arch| {
+        const bytes = try buildHeader(testing.allocator, &.{.{ .key = "general.architecture", .value = .{ .str = arch } }});
+        defer testing.allocator.free(bytes);
+        var info = try parseBytes(testing.allocator, bytes);
+        defer info.deinit(testing.allocator);
+        try testing.expectEqual(!std.mem.eql(u8, arch, "deepseek41"), ds4Spec(info).support_gguf);
+    }
 }
 
 test "preferredEngine: ds4-only archs → ds4 without the lora key" {

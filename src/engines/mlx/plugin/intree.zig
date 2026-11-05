@@ -121,6 +121,15 @@ pub fn leave() void {
     qwen4.engineCtx().* = null;
 }
 
+/// The engine's slot contexts of the batched forward in flight (`leaveBatch` clears them).
+pub fn enterBatch(ctxs: []const *ForwardCtx) void {
+    qwen4.engineBatch().* = ctxs;
+}
+
+pub fn leaveBatch() void {
+    qwen4.engineBatch().* = &.{};
+}
+
 // ── tests ──
 
 const testing = std.testing;

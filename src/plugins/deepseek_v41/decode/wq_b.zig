@@ -52,11 +52,18 @@ fn mxfp8Rows(l: dsv41.Lin, n: usize) bool {
     return ws.len == 2 and ss.len == 2 and ws[0] == n and ss[0] == n and ws[1] * 4 == K and ss[1] * 32 == K;
 }
 
-/// The rows of one decode step at positions pos .. pos + rows: `qa` and `kv` `[rows, K]`, `[rows, 512]` bf16 (the
-/// `q_kv` GEMV's), `z` `[rows, 24]` f32 (this stage's hc mixes), `pos` an int32 scalar. Null where the shape or the
+/// Rows at positions `pos` (int32 `[rows]`, `rowsAt` for one state's run; a batch's states each at their own): `qa`
+/// and `kv` `[rows, K]`, `[rows, 512]` bf16 (the `q_kv` GEMV's), `z` `[rows, 24]` f32 (this stage's hc mixes). Null where the shape or the
 /// weights' format is not served.
 pub fn run(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_metal_kernel, ly: *const dsv41.Layer, li: usize, qa: A, kv: A, z: A, pos: A) !?Out {
     return launch(sc, m, kern, ly, li, qa, kv, z, pos, groups());
+}
+
+/// The positions p0 .. p0 + rows of one state's rows, from the host (no launch).
+pub fn rowsAt(sc: *dsv41.Scope, p0: usize, rows: usize) !A {
+    var v: [decode.max_rows]i32 = undefined;
+    for (v[0..rows], 0..) |*o, r| o.* = @intCast(p0 + r);
+    return sc.ints(v[0..rows], &.{ci(rows)});
 }
 
 /// `run` with `g` threadgroups walking the units.
@@ -68,6 +75,7 @@ pub fn launch(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_m
     const hd = c.head_dim;
     const hc = c.dsv4_hc_mult;
     if (rows < 1 or rows > decode.max_rows or dim(qa, 1) != K or hd != KV or c.dsv4_rope_head_dim != 64 or hc != 4) return null;
+    if (mlx.getShape(pos).len != 1 or dim(pos, 0) != rows or mlx.mlx_array_dtype(pos) != .int32) return null;
     if (c.dsv4_q_lora_rank != K or !mxfp8Rows(ly.wq_b, heads * hd)) return null;
     const idx_n = if (ly.idx != null) c.dsv4_index_n_heads * c.dsv4_index_head_dim else 0;
     if (ly.idx) |iw| if (c.dsv4_index_head_dim != 128 or idx_n % 32 != 0 or !mxfp8Rows(iw.wq_b, idx_n)) return null;
@@ -132,7 +140,7 @@ const wq_b_l = metal.Launch{
     .source = SOURCE,
     .header = HEADER,
     // xs (the latent of 6 rows as float4 chunks), ps and t_s.
-    .tg_bytes = 4 * (decode.max_rows * 4 * 320 + decode.max_rows * SGS + 16),
+    .tg_bytes = 8 * decode.max_rows * 320 + 4 * (decode.max_rows * SGS + 16),
     .m1 = 512,
     .m2 = 512,
 };
@@ -222,7 +230,7 @@ fn gemv(k: anytype, at: usize, n: usize, rows: usize, qr: []const Iv, sum: Sum, 
     }
 }
 
-/// The tail rope of the T-rounded `y` [rows, n] (heads of `hd`) at position row + pos with the periods at input `at`.
+/// The tail rope of the T-rounded `y` [rows, n] (heads of `hd`), row r at position pos[r], with the periods at input `at`.
 fn rope(k: anytype, y: []const Iv, rows: usize, n: usize, hd: usize, at: usize, point: bool, out: []Iv) void {
     const head = hd - cx.RD;
     for (0..rows) |r| for (0..n) |c| {
@@ -233,7 +241,7 @@ fn rope(k: anytype, y: []const Iv, rows: usize, n: usize, hd: usize, at: usize, 
             continue;
         }
         const b = i - (col - head) % 2;
-        const th = (@as(f64, @floatFromInt(r)) + k.in(I.pos)[0]) / spec.roundTo(.f32, k.in(at)[(col - head) / 2]);
+        const th = k.in(I.pos)[r] / spec.roundTo(.f32, k.in(at)[(col - head) / 2]);
         const even = (col - head) % 2 == 0;
         out[i] = if (point) blk: {
             const x1 = y[b].lo;
@@ -337,7 +345,7 @@ const Wqb = struct {
         const kvn = try k.add(cx.act, &.{KV});
         const periods = try k.add(.float32, &.{cx.RD / 2});
         const periods_i = try k.add(.float32, &.{cx.RD / 2});
-        const pos = try k.add(.int32, &.{});
+        const pos = try k.add(.int32, &.{R});
         const z = try k.add(.float32, &.{ R, cx.MIX });
         const eps = try k.add(.float32, &.{2});
         kit.uniform(rng, qa, -3, 3);
@@ -348,7 +356,8 @@ const Wqb = struct {
         cx.periodsFill(periods, 1);
         cx.periodsFill(periods_i, 1);
         for (periods_i) |*v| v.* *= 0.75;
-        pos[0] = 3001;
+        // Rows at positions apart, as a batch's states are.
+        for (pos, 0..) |*v, r| v.* = @floatFromInt(3001 + 37 * r);
         eps[0] = cx.EPS_RMS;
         eps[1] = cx.EPS_HC;
         randomWeights(rng, wq, sq);
@@ -652,6 +661,7 @@ const Steps = struct {
     kv0: A,
     z: A,
     pos: A,
+    rows_pos: A = none,
     kv: A = none,
 
     fn init(b: *Bench, kern: mlx.mlx_fast_metal_kernel, g: usize, rows: usize, with_idx: bool, replaced: bool) !Steps {
@@ -662,6 +672,7 @@ const Steps = struct {
         s.kv0 = try randn(&b.sc, 12, &.{ r, KV }, .bfloat16, 2);
         s.z = try randn(&b.sc, 13, &.{ r, 24 }, .float32, 1.5);
         s.pos = try b.sc.keep(mlx.mlx_array_new_int(3001));
+        s.rows_pos = try rowsAt(&b.sc, 3001, rows);
         return s;
     }
 
@@ -673,7 +684,7 @@ const Steps = struct {
         var ly = s.b.layers[i % s.b.layers.len];
         if (!s.with_idx) ly.idx = null;
         if (i == 0) s.kv = s.kv0;
-        const out: Out = if (s.replaced) try chain(&s.sc, s.b.fx.m, &ly, s.b.li, s.qa, s.kv, s.z, s.pos) else (try launch(&s.sc, s.b.fx.m, s.kern, &ly, s.b.li, s.qa, s.kv, s.z, s.pos, s.g)).?;
+        const out: Out = if (s.replaced) try chain(&s.sc, s.b.fx.m, &ly, s.b.li, s.qa, s.kv, s.z, s.pos) else (try launch(&s.sc, s.b.fx.m, s.kern, &ly, s.b.li, s.qa, s.kv, s.z, s.rows_pos, s.g)).?;
         var deps: [5]A = .{ out.q, out.sa.pre, out.sa.post, out.sa.comb, none };
         const n: usize = if (out.q_idx) |qi| blk: {
             deps[4] = qi;
@@ -759,7 +770,7 @@ test "dsv41 dec wq_b: bit-equal to the chain where every sum is exact (small int
             const pos = try scalar(&sc, @intCast(3001 + 17 * rows));
             const want = try chain(&sc, fx.m, &l, 20, qa, kv, z, pos);
             for (test_groups) |g| {
-                const got = (try launch(&sc, fx.m, kern, &l, 20, qa, kv, z, pos, if (g == 0) groups() else g)) orelse return error.Declined;
+                const got = (try launch(&sc, fx.m, kern, &l, 20, qa, kv, z, try rowsAt(&sc, 3001 + 17 * rows, rows), if (g == 0) groups() else g)) orelse return error.Declined;
                 try testing.expectEqual(@as(usize, 0), try differing(got.q, want.q));
                 if (with_idx) try testing.expectEqual(@as(usize, 0), try differing(got.q_idx.?, want.q_idx.?));
                 try testing.expectEqual(@as(usize, 0), try differing(got.kv_row, want.kv_row));
@@ -829,7 +840,7 @@ test "dsv41 dec wq_b: no further from f32 truth than the chain on the fixture's 
                 const pos = try scalar(&sc, @intCast(3001 + 13 * rows));
                 const want = try chain(&sc, fx.m, ly, li, qa, kv, z, pos);
                 const tr = try truth(&sc, fx.m, ly, li, qa, pos);
-                const got = (try run(&sc, fx.m, kern, ly, li, qa, kv, z, pos)) orelse return error.Declined;
+                const got = (try run(&sc, fx.m, kern, ly, li, qa, kv, z, try rowsAt(&sc, 3001 + 13 * rows, rows))) orelse return error.Declined;
                 var label_buf: [64]u8 = undefined;
                 const nq = try differing(got.q, want.q);
                 std.debug.print("[wq_b] layer {d}, rows {d}: q differs in {d} of {d}", .{ li, rows, nq, rows * 32768 });
@@ -869,7 +880,7 @@ test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and wi
         const qa = try randn(&sc, 71 + rows, &.{ ci(rows), K }, .bfloat16, 2);
         const kv = try randn(&sc, 81 + rows, &.{ ci(rows), KV }, .bfloat16, 2);
         const z = try randn(&sc, 91 + rows, &.{ ci(rows), 24 }, .float32, 1.5);
-        const pos = try scalar(&sc, 3001);
+        const pos = try rowsAt(&sc, 3001, rows);
         const got = (try launch(&sc, fx.m, kern, &ly, 20, qa, kv, z, pos, 9)) orelse return error.Declined;
         const iw = if (ly.idx) |i| i.wq_b else ly.wq_b;
         const args = [_]A{ qa, ly.q_norm, ly.wq_b.w, ly.wq_b.s, iw.w, iw.s, kv, ly.kv_norm, dsv41.ropeFor(fx.m, 20).fwd, fx.m.rope_yarn.fwd, pos, z, eps };

@@ -14,6 +14,7 @@ const LoadedModel = model_registry_mod.LoadedModel;
 const build_options = @import("build_options");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
+const plugin_loader = @import("../plugins/loader.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const KvAttnMode = @import("request_options.zig").KvAttnMode;
@@ -293,7 +294,9 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(settings_json);
     const cluster_json = mlx_engine.api().cluster_json(allocator) orelse return error.OutOfMemory;
     defer allocator.free(cluster_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, registryGeneration() });
+    const plugins_json = try plugin_loader.processStatusJson(allocator);
+    defer allocator.free(plugins_json);
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"plugins\":{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, plugins_json, registryGeneration() });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (http_server.launch().global_scheduler) |sch|
@@ -334,9 +337,11 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     const available_mem = metrics.getAvailableMemBytes();
     const cluster_json = mlx_engine.api().cluster_json(allocator) orelse return error.OutOfMemory;
     defer allocator.free(cluster_json);
+    const plugins_json = try plugin_loader.processStatusJson(allocator);
+    defer allocator.free(plugins_json);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"registry_generation":{d}}}
-    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, cluster_json, registryGeneration() });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"plugins":{s},"registry_generation":{d}}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP, cluster_json, plugins_json, registryGeneration() });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }

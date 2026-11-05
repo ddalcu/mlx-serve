@@ -348,7 +348,7 @@ test "group norm silu: the fused passes match silu(groupNormFlat) to the output'
         const x = try g.addScalar(try kit.randn(&g, &.{ 2, 37, 29, case.c }, 100 + i, case.dt, 2), 30);
         const w = try kit.randn(&g, &.{case.c}, 110 + i, case.dt, 1);
         const b = try kit.randn(&g, &.{case.c}, 120 + i, case.dt, 1);
-        const fused = (try groupNormSilu(&g, x, w, b, 32, 1e-6, case.out)).?;
+        const fused = (try groupNormSilu(&g, x, w, b, 32, 1e-6, case.out)) orelse return error.GroupNormSiluDeclined;
         try testing.expectEqual(case.out, ops.dtype(fused));
         const chain = try g.silu(try groupNormFlat(&g, x, w, b, 32, 1e-6, .float32));
         const d = try g.sub(try g.astype(fused, .float32), chain);
