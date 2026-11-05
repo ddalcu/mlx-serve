@@ -1395,8 +1395,13 @@
 "Resolution" = "分辨率";
 "Resolved each time the app starts, so it keeps up as you switch models." = "每次应用启动时重新解析，因此切换模型后也会跟着更新。";
 "Response" = "响应";
+"Restart" = "重启";
+"Restart + Notify" = "重启并通知";
+"Ask" = "询问";
 "Restart Now" = "立即重启";
 "Restart the server to apply this change" = "重启服务器以应用此更改";
+"If the server exits on its own" = "如果服务器自行退出";
+"For a crash or an out-of-memory kill while the server is running. Restart brings it back after 1, 2, 4, 8, 16, then 30 seconds, then stops trying so a model that cannot load still shows its error instead of restarting forever. Stop cancels a pending restart." = "用于服务器运行期间发生崩溃或被内存不足终止的情况。重启会依次在 1、2、4、8、16、30 秒后重试，然后停止尝试，这样无法加载的模型仍会显示错误，而不会无限重启。按下停止会取消待执行的重启。";
 "Restore" = "修复";
 "Result" = "结果";
 "Results already shared to the community stay on the board." = "已分享到社区的结果会保留在排行榜上。";
@@ -1933,6 +1938,9 @@
 "mlx-serve binary not found in the app bundle." = "在应用包中找不到 mlx-serve 可执行文件。";
 "mlx-serve binary not found in this build." = "在此构建中找不到 mlx-serve 可执行文件。";
 "mlx-serve exited unexpectedly" = "mlx-serve 意外退出";
+"mlx-serve exited" = "mlx-serve 已退出";
+"mlx-serve exited; restarting it" = "mlx-serve 已退出，正在重新启动";
+"Exit code %lld. Relaunch attempt %lld of %lld." = "退出代码 %lld。第 %lld 次重新启动，共 %lld 次。";
 "mlx-serve failed to start" = "mlx-serve 启动失败";
 "models" = "模型";
 "moody" = "忧郁";
