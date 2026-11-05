@@ -96,6 +96,134 @@ pub fn installSuppressMask(xfm: *Transformer, tok: *const Tokenizer, chat_templa
     );
 }
 
+/// Sorted, disjoint. U+2E80-U+DFFF is one span on purpose: every lead byte
+/// E3-ED is blocked whole, Yi and the rare Latin/Cyrillic extensions there
+/// included.
+const cjk_ranges = [_][2]u21{
+    .{ 0x1100, 0x11FF },   .{ 0x2E80, 0xDFFF },   .{ 0xF900, 0xFAFF },   .{ 0xFE10, 0xFE1F },
+    .{ 0xFE30, 0xFE6F },   .{ 0xFF00, 0xFFEF },   .{ 0x16FE0, 0x16FFF }, .{ 0x1AFF0, 0x1B16F },
+    .{ 0x1F200, 0x1F2FF }, .{ 0x20000, 0x3FFFF },
+};
+
+fn cjkSpan(lo: u21, hi: u21) bool {
+    for (cjk_ranges) |r| {
+        if (lo >= r[0] and hi <= r[1]) return true;
+    }
+    return false;
+}
+
+/// A masked model spells CJK from byte tokens: block any prefix whose every completion is CJK, plus a
+/// bare F0/EF (plane-2 Han, compatibility ideographs; emoji and VS16 never need it). E1/E2 alone stay
+/// open for quotes, dashes and ⚠, so Jamo and radicals spelled that way are not caught.
+pub fn cjkBytes(b: []const u8) bool {
+    var i: usize = 0;
+    while (i < b.len) : (i += 1) {
+        const len: usize = switch (b[i]) {
+            0xC2...0xDF => 2,
+            0xE0...0xEF => 3,
+            0xF0...0xF4 => 4,
+            else => continue,
+        };
+        var cp: u21 = b[i] & (@as(u8, 0x7F) >> @intCast(len));
+        var n: usize = 1;
+        while (n < len and i + n < b.len and (b[i + n] & 0xC0) == 0x80) : (n += 1) {
+            cp = (cp << 6) | (b[i + n] & 0x3F);
+        }
+        if (n == len) {
+            if (cjkSpan(cp, cp)) return true;
+        } else if (i + n == b.len) {
+            if (n == 1 and (b[i] == 0xF0 or b[i] == 0xEF)) return true;
+            const open: u5 = @intCast(6 * (len - n));
+            const lo = cp << open;
+            if (cjkSpan(lo, lo | ((@as(u21, 1) << open) - 1))) return true;
+        }
+        i += n - 1;
+    }
+    return false;
+}
+
+/// Marks every id whose decoded bytes `cjkBytes`. Specials stay open: EOS and
+/// the template markers must remain sampleable.
+pub fn fillCjkMask(buf: []bool, tok: *const Tokenizer) !usize {
+    const alloc = std.heap.page_allocator;
+    var specials = try std.DynamicBitSetUnmanaged.initEmpty(alloc, buf.len);
+    defer specials.deinit(alloc);
+    var sit = tok.special_tokens.valueIterator();
+    while (sit.next()) |id| {
+        if (id.* < buf.len) specials.set(id.*);
+    }
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    var n: usize = 0;
+    var one: [1]u8 = undefined;
+    var it = tok.id_to_token.iterator();
+    while (it.next()) |e| {
+        const id = e.key_ptr.*;
+        if (id >= buf.len or specials.isSet(id)) continue;
+        const bytes: []const u8 = if (byteFallbackPiece(tok, e.value_ptr.*)) |b| blk: {
+            one[0] = b;
+            break :blk &one;
+        } else blk: {
+            _ = arena.reset(.retain_capacity);
+            break :blk tok.decode(arena.allocator(), &[_]u32{id}, false) catch continue;
+        };
+        if (cjkBytes(bytes)) {
+            buf[id] = true;
+            n += 1;
+        }
+    }
+    return n;
+}
+
+/// A SentencePiece `<0xNN>` piece decodes alone to U+FFFD; the mask needs its raw byte.
+fn byteFallbackPiece(tok: *const Tokenizer, piece: []const u8) ?u8 {
+    if (!tok.byte_fallback_decode or piece.len != 6 or !std.mem.startsWith(u8, piece, "<0x") or piece[5] != '>') return null;
+    return std.fmt.parseInt(u8, piece[3..5], 16) catch null;
+}
+
+/// Never fails a load: without the mask a `suppress_cjk` request gets a 400.
+pub fn installCjkMask(xfm: *Transformer, tok: *const Tokenizer) void {
+    const logits_dim: usize = if (xfm.config.unpadded_vocab_size > 0)
+        xfm.config.unpadded_vocab_size
+    else
+        xfm.config.vocab_size;
+    const alloc = std.heap.page_allocator;
+    const buf = alloc.alloc(bool, logits_dim) catch {
+        log.warn("[suppress] CJK mask allocation failed; suppress_cjk off\n", .{});
+        return;
+    };
+    defer alloc.free(buf);
+    @memset(buf, false);
+    const n = fillCjkMask(buf, tok) catch |err| {
+        log.warn("[suppress] CJK mask derivation failed ({s}); suppress_cjk off\n", .{@errorName(err)});
+        return;
+    };
+    if (n == 0) {
+        log.warn("[suppress] no CJK token in this vocabulary; suppress_cjk off\n", .{});
+        return;
+    }
+    const shape = [_]c_int{@intCast(logits_dim)};
+    const cjk = mlx.mlx_array_new_data(buf.ptr, &shape, 1, .bool_);
+    if (xfm.suppress_mask) |reserved| {
+        defer _ = mlx.mlx_array_free(cjk);
+        var merged = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_logical_or(&merged, reserved, cjk, xfm.s)) catch |err| {
+            _ = mlx.mlx_array_free(merged);
+            log.warn("[suppress] CJK mask merge failed ({s}); suppress_cjk off\n", .{@errorName(err)});
+            return;
+        };
+        mlx.check(mlx.mlx_array_eval(merged)) catch |err| {
+            _ = mlx.mlx_array_free(merged);
+            log.warn("[suppress] CJK mask merge failed ({s}); suppress_cjk off\n", .{@errorName(err)});
+            return;
+        };
+        xfm.suppress_mask_cjk = merged;
+    } else {
+        xfm.suppress_mask_cjk = cjk;
+    }
+    log.info("[suppress] suppress_cjk ready: {d} CJK tokens of {d}\n", .{ n, logits_dim });
+}
+
 /// `out = where(mask, -inf, logits)` — the masked lanes get EXACTLY -inf
 /// (never an additive -inf, whose 0×-inf/NaN edge the parity rules exist
 /// for). `[V]` broadcasts over both `[1, V]` and `[1, 1, V]` logits.
@@ -177,6 +305,83 @@ test "fillSuppressMask: padding rows past the tokenizer's last defined id are su
         fillSuppressMask(&buf, &[_]u32{3}, defined);
         for (buf, 0..) |v, i| try testing.expectEqual(i == 3, v);
     }
+}
+
+test "cjkBytes: CJK code points, CJK-only prefixes and a bare F0/EF are caught, E1/E2 alone stay open" {
+    for ([_][]const u8{
+        "北京",
+        " 的",
+        "。",
+        "，",
+        "（",
+        "한국",
+        "カタカナ",
+        "ｶ",
+        "⼀",
+        "\u{20000}",
+        "🈚",
+        "\xe4",
+        "\xea",
+        "\xed",
+        "\xe2\xbc",
+        "\xef\xbc",
+        "\xf0\xa0",
+        "ab\xe5\x8c",
+        "\xf0\x9f\x88",
+        "\xf0",
+        "a\xef",
+    }) |t| try testing.expect(cjkBytes(t));
+    for ([_][]const u8{
+        "",
+        "„Grüße“ – ok…",
+        "Běijīng",
+        "€",
+        "\u{FE0F}",
+        "\u{FFFD}",
+        "😀",
+        "\xe2",
+        "\xe1",
+        "\xf0\x9f",
+        "\xef\xb8",
+        "\xbc\x8c",
+    }) |t| try testing.expect(!cjkBytes(t));
+}
+
+test "fillCjkMask: CJK tokens are marked, specials and everything else stay open" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    try tok.id_to_token.put(0, "a");
+    try tok.id_to_token.put(1, "北");
+    try tok.id_to_token.put(2, "„");
+    try tok.id_to_token.put(3, "<|北|>");
+    try tok.special_tokens.put(try allocator.dupe(u8, "<|北|>"), 3);
+    var buf: [5]bool = @splat(false);
+    try testing.expectEqual(@as(usize, 1), try fillCjkMask(&buf, &tok));
+    try testing.expectEqualSlices(bool, &.{ false, true, false, false, false }, &buf);
+}
+
+test "fillCjkMask: byte-level pieces are judged by their raw bytes" {
+    const allocator = testing.allocator;
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.deinit();
+    for (tok.byte_to_unicode, 0..) |cp, b| try tok.unicode_to_byte.put(cp, @intCast(b));
+    const raw = [_][]const u8{ "\xe4", "\xe2", "\xef\xbc\x8c", "\xe2\x80\x9e", "\xef\xb8\x8f" };
+    var pieces: [raw.len][]u8 = undefined;
+    for (raw, 0..) |bytes, id| {
+        var piece: std.ArrayList(u8) = .empty;
+        for (bytes) |b| {
+            var enc: [4]u8 = undefined;
+            const n = try std.unicode.utf8Encode(tok.byte_to_unicode[b], &enc);
+            try piece.appendSlice(allocator, enc[0..n]);
+        }
+        pieces[id] = try piece.toOwnedSlice(allocator);
+        try tok.id_to_token.put(@intCast(id), pieces[id]);
+    }
+    defer for (pieces) |piece| allocator.free(piece);
+    var buf: [raw.len]bool = @splat(false);
+    try testing.expectEqual(@as(usize, 2), try fillCjkMask(&buf, &tok));
+    try testing.expectEqualSlices(bool, &.{ true, false, true, false, false }, &buf);
 }
 
 test "Tokenizer.definedVocabSize: highest defined id + 1, 0 when nothing is defined" {
