@@ -380,7 +380,7 @@ test {
     _ = sdk;
     _ = @import("../sdk/testing/fake_host.zig");
     _ = @import("no_globals.zig");
-    // The alias's GPU checks: skipped unless the ALIAS_TEST_GPU fixture is set.
+    // HostGpu.alias's GPU checks (behind the ALIAS_TEST_GPU fixture) and command_buffer_limits' round trip.
     _ = @import("host_gpu_alias_test.zig");
 }
 

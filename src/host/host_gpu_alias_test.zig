@@ -2,6 +2,7 @@
 //! device here). An alias's bytes are its base's at its offset; a GPU kernel reads and writes them through it and an
 //! overlapping alias sees the write; MLX's active bytes do not move for an alias; the base's buffer is held until the
 //! last alias over it is freed; a misaligned offset, a range past the base and an unevaluated base are refused.
+//! `command_buffer_limits`' round trip runs without the fixture: it makes the Metal device and dispatches nothing.
 
 const std = @import("std");
 const abi = @import("../abi/host.zig");
@@ -176,4 +177,22 @@ test "builtin host gpu: an alias reads and writes its base's pages, holds the ba
     a2_live = false;
     try testing.expectEqual(held - words * 4, active());
     std.debug.print("[alias-test] words ok: read, write and overlap through aliases; active held={d} MiB, freed={d} MiB with the last alias\n", .{ held >> 20, (words * 4) >> 20 });
+}
+
+test "builtin host gpu: command_buffer_limits sets MLX's split and hands back the previous pair; below 1 keeps a value" {
+    if (!has_shims or mlx.noGpuBackend()) return error.SkipZigTest;
+    const set = impl.gpu_table.command_buffer_limits;
+    var ops0: i32 = 0;
+    var mb0: i32 = 0;
+    try testing.expect(set(null, 0, 0, &ops0, &mb0).isOk());
+    try testing.expect(ops0 > 0 and mb0 > 0);
+    var o: i32 = 0;
+    var m: i32 = 0;
+    defer _ = set(null, ops0, mb0, &o, &m);
+    try testing.expect(set(null, ops0 + 7, mb0 + 9, &o, &m).isOk());
+    try testing.expectEqual([2]i32{ ops0, mb0 }, [2]i32{ o, m });
+    try testing.expect(set(null, 0, 3, &o, &m).isOk());
+    try testing.expectEqual([2]i32{ ops0 + 7, mb0 + 9 }, [2]i32{ o, m });
+    try testing.expect(set(null, -1, 0, &o, &m).isOk());
+    try testing.expectEqual([2]i32{ ops0 + 7, 3 }, [2]i32{ o, m });
 }

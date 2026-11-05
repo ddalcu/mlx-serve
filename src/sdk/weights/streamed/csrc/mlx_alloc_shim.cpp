@@ -5,7 +5,6 @@
 // Built against MLX 0.32.5's headers: re-verify on every MLX bump.
 #include <mach/vm_page_size.h>
 
-#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <string>
@@ -15,6 +14,8 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/c/private/array.h"
 #include "mlx/c/private/enums.h"
+#include "mlx/config.h"
+#include "mlx/utils.h"
 #include "mlx_alloc_shim.h"
 
 namespace mx = mlx::core;
@@ -126,7 +127,8 @@ int dsv41_alloc_alias(mlx_array* out, mlx_array base, uint64_t offset, const int
       dsv41_alias::Pool p;
       static_cast<MTL::Buffer*>(x.ptr())->release();
     };
-    mlx_array_set_(*out, mx::array(mx::allocator::Buffer(static_cast<void*>(a)), std::move(s), dt, deleter));
+    mx::allocator::Data data(mx::allocator::Buffer(static_cast<void*>(a)), deleter);
+    mlx_array_set_(*out, mx::array(std::move(data), std::move(s), dt));
     return 0;
   } catch (const std::exception& e) {
     g_error = e.what();
@@ -137,15 +139,15 @@ int dsv41_alloc_alias(mlx_array* out, mlx_array base, uint64_t offset, const int
   }
 }
 
-// MLX's command-buffer split (patches/mlx-metal-command-buffer-limits.patch: Device::set_max_ops_mb_per_buffer, its
-// pair atomic). The members stay an int's size and alignment, so the Device's layout is the unpatched one's.
-static_assert(sizeof(std::atomic<int>) == sizeof(int) && alignof(std::atomic<int>) == alignof(int));
-
+// MLX's command-buffer split: every commit check (CommandEncoder::needs_commit) reads it through mlx::core::config,
+// over the device's default for its architecture.
 int dsv41_command_buffer_limits(int ops, int mb, int* prev_ops, int* prev_mb) {
   try {
-    auto [o, m] = mx::metal::device(mx::Device::gpu).set_max_ops_mb_per_buffer(ops, mb);
-    *prev_ops = o;
-    *prev_mb = m;
+    auto [default_ops, default_mb] = mx::metal::device(mx::Device::gpu).get_default_max_ops_mb_per_buffer();
+    *prev_ops = mx::env::max_ops_per_buffer(default_ops);
+    *prev_mb = mx::env::max_mb_per_buffer(default_mb);
+    if (ops > 0) mx::config::update("MLX_MAX_OPS_PER_BUFFER", ops);
+    if (mb > 0) mx::config::update("MLX_MAX_MB_PER_BUFFER", mb);
     return 0;
   } catch (const std::exception& e) {
     g_error = e.what();

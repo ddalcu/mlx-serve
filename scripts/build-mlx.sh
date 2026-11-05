@@ -43,16 +43,9 @@ MLXC_SHA="$(git -C "$MLXC_SRC" rev-parse --short=12 HEAD)"
 MLXC_PATCH="$REPO_ROOT/patches/mlxc-gather-qmm-global-scale.patch"
 PATCH_SHA="$(shasum "$MLXC_PATCH" | cut -c1-12)"
 WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
-# The MLX patch (the Metal device's command-buffer split settable at run time, HostGpu.command_buffer_limits) keys a
-# stamp of its own: it changes no layout a plugin sees (the Device's two members keep an int's size and alignment, which
-# the shim asserts), so .version, which plugins are negotiated against, keeps its form and older plugins still load.
-MLX_PATCH="$REPO_ROOT/patches/mlx-metal-command-buffer-limits.patch"
-MLX_PATCH_STAMP="$STAGE/.mlx-patch"
-MLX_PATCH_WANT="$(shasum "$MLX_PATCH" | cut -c1-12)"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
-if [ -f "$STAMP" ] && [ -f "$MLX_PATCH_STAMP" ] && [ "$(cat "$MLX_PATCH_STAMP")" = "$MLX_PATCH_WANT" ] \
-   && [ -f "$STAGE/lib/libmlx.dylib" ] \
+if [ -f "$STAMP" ] && [ -f "$STAGE/lib/libmlx.dylib" ] \
    && [ -f "$STAGE/lib/libmlxc.dylib" ] && [ -f "$STAGE/lib/mlx.metallib" ]; then
   if [ "$(cat "$STAMP")" = "$WANT" ]; then
     echo "[build-mlx] lib/mlx already at ($WANT) — nothing to do"
@@ -77,9 +70,6 @@ echo "[build-mlx] SDK $SDK_VERSION, deployment target $DEPLOYMENT_TARGET, $WANT"
 NCPU="$(sysctl -n hw.ncpu)"
 
 # ── mlx (C++ core + metallib) ────────────────────────────────────────────────
-# The MLX patch: its files reset first, so an edited patch replaces the old one; other local edits are kept.
-git -C "$MLX_SRC" checkout -- $(git -C "$MLX_SRC" apply --numstat -p1 "$MLX_PATCH" | cut -f3)
-git -C "$MLX_SRC" apply -p1 "$MLX_PATCH"
 cmake -S "$MLX_SRC" -B "$BUILD_ROOT/mlx" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOYMENT_TARGET" \
@@ -125,5 +115,4 @@ esac
 [ -f "$STAGE/lib/libmlxc.dylib" ] || die "libmlxc.dylib missing from stage"
 
 echo "$WANT" > "$STAMP"
-echo "$MLX_PATCH_WANT" > "$MLX_PATCH_STAMP"
 echo "[build-mlx] staged lib/mlx OK: $NAX_COUNT NAX symbol hits, minos $MINOS"
