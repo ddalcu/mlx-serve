@@ -1,7 +1,7 @@
 //! Native ds4 SSD checkpoints. The owning inference thread serializes every call.
 //! Main stores once after a successful cold prefill, then before destructive replacement/close;
 //! warm tool turns stay in the live session. Store requires the exact live token history.
-//! Budget is one root-wide cap; other engines' actual files reduce each write allowance.
+//! Budget is one root-wide cap; other engines' files and queued writes reduce each allowance.
 
 const std = @import("std");
 const log = @import("../../sdk/util/log.zig");
@@ -57,7 +57,6 @@ extern fn mlxserve_ds4_kv_cache_open(engine: *anyopaque, dir: [*:0]const u8, nam
 extern fn mlxserve_ds4_kv_cache_close(cache: *Native) void;
 extern fn mlxserve_ds4_kv_cache_store(cache: *Native, session: *anyopaque, tokens: [*]const i32, count: c_int, reason: [*:0]const u8, err: [*]u8, errlen: usize) c_int;
 extern fn mlxserve_ds4_kv_cache_restore(cache: *Native, session: *anyopaque, target: [*]const i32, count: c_int, err: [*]u8, errlen: usize) c_int;
-extern fn mlxserve_ds4_kv_cache_physical_bytes(cache: *Native) u64;
 extern fn mlxserve_ds4_kv_cache_set_budget(cache: *Native, bytes: u64, err: [*]u8, errlen: usize) c_int;
 extern fn mlxserve_ds4_kv_cache_prune(cache: *Native, err: [*]u8, errlen: usize) c_int;
 
@@ -70,6 +69,7 @@ pub fn Cache(comptime B: type) type {
         handle: *Native,
         base: []u8,
         root: [:0]u8,
+        pool: *disk_budget.Pool,
         total_cap: u64,
 
         pub fn open(io: std.Io, gpa: std.mem.Allocator, engine: *B.Ds4Engine, model_path: []const u8, options: Options) !Self {
@@ -79,18 +79,28 @@ pub fn Cache(comptime B: type) type {
             errdefer gpa.free(dir);
             const base = try std.fmt.allocPrint(gpa, "{s}/.mlx-serve/kv-cache", .{options.home});
             errdefer gpa.free(base);
-            const allowance = try disk_budget.availableBudget(gpa, io, base, dir, options.budget_bytes, 0);
+            const pool = try disk_budget.openPool(gpa, io, base, dir);
+            errdefer pool.close(io);
+            const reservation = try reservePool(io, pool, dir, options.budget_bytes);
+            defer reservation.release(io);
             var err: [256]u8 = @splat(0);
-            const handle = mlxserve_ds4_kv_cache_open(@ptrCast(engine.handle), dir, ns, allowance orelse 0, options.min_tokens, &err, err.len) orelse {
+            const opened = mlxserve_ds4_kv_cache_open(@ptrCast(engine.handle), dir, ns, reservation.bytes, options.min_tokens, &err, err.len);
+            errdefer if (opened) |handle| mlxserve_ds4_kv_cache_close(handle);
+            pool.reconcile(io) catch |failure| {
+                pool.unavailable(io);
+                return failure;
+            };
+            const handle = opened orelse {
                 report("open", &err);
                 return error.Ds4PrefixCacheOpen;
             };
-            return .{ .allocator = gpa, .io = io, .handle = handle, .base = base, .root = dir, .total_cap = options.budget_bytes };
+            return .{ .allocator = gpa, .io = io, .handle = handle, .base = base, .root = dir, .pool = pool, .total_cap = options.budget_bytes };
         }
 
         /// Flush the session with store(.close) before deinit; the cache never owns it.
         pub fn deinit(self: *Self) void {
             mlxserve_ds4_kv_cache_close(self.handle);
+            self.pool.close(self.io);
             self.allocator.free(self.base);
             self.allocator.free(self.root);
             self.* = undefined;
@@ -100,12 +110,18 @@ pub fn Cache(comptime B: type) type {
         /// boundary rejects invalid (including interrupted) and image-conditioned sessions.
         pub fn store(self: *Self, session: *B.Ds4Session, prompt: []const i32, reason: Reason) !bool {
             if (prompt.len > std.math.maxInt(c_int)) return error.Ds4PrefixCachePromptTooLong;
-            const reservation = (try disk_budget.reserve(self.allocator, self.io, self.base, self.root, self.total_cap, null)) orelse {
-                try self.applyAllowance(0);
-                return false;
+            const reservation = reservePool(self.io, self.pool, self.root, self.total_cap) catch |err| switch (err) {
+                error.DiskBudgetBusy, error.DiskBudgetFull => return false,
+                else => return err,
             };
             defer reservation.release(self.io);
-            try self.applyAllowance(reservation.bytes);
+            const result = self.storeNative(session, prompt, reason, reservation.bytes);
+            try self.reconcile();
+            return result;
+        }
+
+        fn storeNative(self: *Self, session: *B.Ds4Session, prompt: []const i32, reason: Reason, allowance: u64) !bool {
+            try self.applyAllowance(allowance);
             var err: [256]u8 = @splat(0);
             const rc = mlxserve_ds4_kv_cache_store(self.handle, @ptrCast(session.handle), prompt.ptr, @intCast(prompt.len), reason.native(), &err, err.len);
             if (rc < 0) {
@@ -136,10 +152,9 @@ pub fn Cache(comptime B: type) type {
             return .{ .tokens = tokens[0..n], .cached_tokens = n, .allocation = tokens };
         }
 
-        /// Actual file lengths, including unindexed/corrupt files. maxInt(u64) on scan
-        /// failure is conservative when main subtracts this from the total cache budget.
+        /// Physical bytes observed at open and after each native pool mutation.
         pub fn physicalDiskBytes(self: *Self) u64 {
-            return mlxserve_ds4_kv_cache_physical_bytes(self.handle);
+            return self.pool.physical(self.io);
         }
 
         /// Update the single root-wide cap. Zero stops writes while retaining
@@ -159,22 +174,46 @@ pub fn Cache(comptime B: type) type {
 
         /// Open and store refresh automatically; no other engine's files are deleted here.
         pub fn refreshBudget(self: *Self) !void {
-            const allowance = disk_budget.availableBudget(self.allocator, self.io, self.base, self.root, self.total_cap, 0) catch |err| {
-                self.applyAllowance(0) catch |budget_err| {
-                    log.warn("[ds4-cache] disabling after budget scan failure: {t}\n", .{budget_err});
-                };
-                return err;
-            };
-            try self.applyAllowance(allowance orelse 0);
+            const reservation = try reservePool(self.io, self.pool, self.root, self.total_cap);
+            defer reservation.release(self.io);
+            const result = self.applyAllowance(reservation.bytes);
+            try self.reconcile();
+            return result;
         }
 
         pub fn prune(self: *Self) !void {
+            const reservation = try reservePool(self.io, self.pool, self.root, 0);
+            defer reservation.release(self.io);
             var err: [256]u8 = @splat(0);
-            if (mlxserve_ds4_kv_cache_prune(self.handle, &err, err.len) != 0) {
+            const rc = mlxserve_ds4_kv_cache_prune(self.handle, &err, err.len);
+            try self.reconcile();
+            if (rc != 0) {
                 report("prune", &err);
                 return error.Ds4PrefixCacheBudget;
             }
         }
+
+        fn reconcile(self: *Self) !void {
+            self.pool.reconcile(self.io) catch |err| {
+                self.pool.unavailable(self.io);
+                return err;
+            };
+        }
+    };
+}
+
+fn reservePool(io: std.Io, pool: *disk_budget.Pool, root: []const u8, cap: u64) !*disk_budget.Reservation {
+    switch (try pool.tryReserve(io, root, cap, null, .pool)) {
+        .granted => |r| return r,
+        .unavailable => return error.DiskBudgetUnavailable,
+        .full, .busy => {},
+    }
+    // Zero write headroom still needs exclusive ownership during native open/pruning.
+    return switch (try pool.tryReserve(io, root, cap, 0, .pool)) {
+        .granted => |r| r,
+        .busy => error.DiskBudgetBusy,
+        .full => error.DiskBudgetFull,
+        .unavailable => error.DiskBudgetUnavailable,
     };
 }
 
@@ -222,6 +261,34 @@ pub fn namespace(io: std.Io, gpa: std.mem.Allocator, model_path: []const u8, ide
     for (identity.sidecars) |path| try fileIdentity(io, gpa, &hash, path);
     const digest = hash.finalResult();
     return gpa.dupeSentinel(u8, &std.fmt.bytesToHex(digest, .lower), 0);
+}
+
+test "ds4 native pool retains exclusive ownership with zero write headroom" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "ds4");
+    try tmp.dir.createDirPath(io, "mlx");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ds4/state", .data = &@as([80]u8, @splat(1)) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx/state", .data = &@as([20]u8, @splat(2)) });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const root = try std.fs.path.join(a, &.{ base, "ds4" });
+    defer a.free(root);
+    const peer_root = try std.fs.path.join(a, &.{ base, "mlx" });
+    defer a.free(peer_root);
+    const pool = try disk_budget.openPool(a, io, base, root);
+    defer pool.close(io);
+    const peer = try disk_budget.openPool(a, io, base, peer_root);
+    defer peer.close(io);
+    const reservation = try reservePool(io, pool, root, 0);
+    defer reservation.release(io);
+    try std.testing.expectEqual(@as(u64, 0), reservation.bytes);
+    try std.testing.expectEqual(.busy, std.meta.activeTag(try pool.tryReserve(io, root, 100, null, .pool)));
+    try tmp.dir.deleteFile(io, "ds4/state");
+    try pool.reconcile(io);
+    try std.testing.expectEqual(@as(?u64, 80), try peer.available(io, 100, 20));
 }
 
 test "ds4 namespace separates checkpoint settings template build and sidecars" {

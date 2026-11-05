@@ -398,14 +398,14 @@ test "engine abi: Caps bit positions are pinned" {
 }
 
 test "engine abi: enum tags and constants are pinned" {
-    try testing.expectEqual(@as(u8, 1), @backingInt(Threading.host_gpu_thread));
-    try testing.expectEqual(@as(u8, 4), @backingInt(@FieldType(Verdict, "code").failed));
-    try testing.expectEqual(@as(u8, 2), @backingInt(@FieldType(Event, "kind").finished));
-    try testing.expectEqual(@as(u8, 3), @backingInt(@FieldType(Event, "reason").failed));
-    try testing.expectEqual(@as(u8, 4), @backingInt(@FieldType(Grammar, "kind").ebnf));
-    try testing.expectEqual(@as(u8, 2), @backingInt(@FieldType(Media, "kind").audio));
-    try testing.expectEqual(@as(u8, 1), @backingInt(Action.stop));
-    try testing.expectEqual(@as(u8, 4), @backingInt(Progress.prefill_done));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(Threading.host_gpu_thread));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(@FieldType(Verdict, "code").failed));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(@FieldType(Event, "kind").finished));
+    try testing.expectEqual(@as(u8, 3), @intFromEnum(@FieldType(Event, "reason").failed));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(@FieldType(Grammar, "kind").ebnf));
+    try testing.expectEqual(@as(u8, 2), @intFromEnum(@FieldType(Media, "kind").audio));
+    try testing.expectEqual(@as(u8, 1), @intFromEnum(Action.stop));
+    try testing.expectEqual(@as(u8, 4), @intFromEnum(Progress.prefill_done));
     try testing.expectEqualStrings("mlx_serve_engine_v1", entry_symbol);
     try testing.expectEqual(@as(u32, 1), version);
 }

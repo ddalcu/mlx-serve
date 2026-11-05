@@ -83,7 +83,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             vocab: usize,
             eos: []u32,
             tokens: TokenTable,
-            mapped_bytes: u64,
+            file_bytes: u64,
             template: []const u8,
             /// The last prompt as the client sent it, and where its reply began in the session (the length of the
             /// prompt synced for it): `keptReply` continues a conversation whose copies of past replies differ.
@@ -209,7 +209,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .vocab = vocab,
                 .eos = try eos.toOwnedSlice(gpa),
                 .tokens = tokens,
-                .mapped_bytes = fileBytes(path),
+                .file_bytes = fileBytes(path),
                 .template = template,
                 .vision = vision,
                 .disk = openDisk(engine, path, ctx, template, flags),
@@ -338,7 +338,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         /// What props has always shown for ds4: the GGUF plus the session's estimate (ds4 allocates outside MLX).
         fn memory(e: *anyopaque, out: *abi.Memory) callconv(.c) void {
             const st = state(e);
-            const active = st.mapped_bytes + B.contextBytes(st.ctx);
+            const active = st.file_bytes + B.contextBytes(st.ctx);
             out.* = .{ .active = active, .cache = 0, .peak = active };
         }
 

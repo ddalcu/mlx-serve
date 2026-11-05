@@ -49,6 +49,7 @@ pub const Writer = struct {
     paused: bool = false,
     deinited: bool = false,
     thread: ?std.Thread = null,
+    pool: ?*disk_budget.Pool = null,
     /// Failed blobs since the last `takeFailures`.
     failures: std.ArrayList(Failure) = .empty,
     /// A failure that could not be recorded; read-and-clear via `takeUnattributed`.
@@ -64,6 +65,11 @@ pub const Writer = struct {
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io) Writer {
         return .{ .allocator = allocator, .io = io };
+    }
+
+    pub fn bindPool(self: *Writer, pool: *disk_budget.Pool) void {
+        std.debug.assert(!self.running and self.pool == null);
+        self.pool = pool.retain(self.io);
     }
 
     pub fn start(self: *Writer) !void {
@@ -113,6 +119,8 @@ pub const Writer = struct {
         if (self.fail_substr) |fs| self.allocator.free(fs);
         self.fail_substr = null;
         self.mutex.unlock(self.io);
+        if (self.pool) |pool| pool.close(self.io);
+        self.pool = null;
     }
 
     fn freeBlob(self: *Writer, b: *Blob) void {
@@ -162,30 +170,35 @@ pub const Writer = struct {
         self.work.signal(self.io);
     }
 
-    /// Ordinary KV files reserve their final target before queue acceptance. Module files
-    /// use trySubmit directly: their entire directory already has an export reservation.
-    /// Rejection retires the entry through the existing failure channel, without waiting.
-    pub fn submitBudgeted(self: *Writer, path: []u8, bytes: []u8, base: []const u8, cap: u64) void {
-        var blob: Blob = .{ .path = path, .bytes = bytes, .epoch = 0 };
+    /// Takes both buffers on every outcome. Busy/full admission leaves existing entries
+    /// usable; only an actual writer error enters the failure-attribution channel.
+    pub fn submitBudgeted(self: *Writer, path: []u8, bytes: []u8, cap: u64) !void {
+        const reservation = blk: {
+            errdefer self.allocator.free(path);
+            errdefer self.allocator.free(bytes);
+            const pool = self.pool orelse return error.DiskBudgetUninitialized;
+            break :blk switch (try pool.tryReserve(self.io, path, if (cap == 0) std.math.maxInt(u64) else cap, bytes.len, .file)) {
+                .granted => |r| r,
+                .busy => return error.DiskBudgetBusy,
+                .full => return error.DiskBudgetFull,
+                .unavailable => return error.DiskBudgetUnavailable,
+            };
+        };
+        return self.submitReserved(path, bytes, reservation);
+    }
+
+    /// Consumes both buffers and their file promise on every outcome.
+    pub fn submitReserved(self: *Writer, path: []u8, bytes: []u8, reservation: *disk_budget.Reservation) !void {
+        var blob: Blob = .{ .path = path, .bytes = bytes, .epoch = 0, .reservation = reservation };
         var owned = true;
-        var failure: []const u8 = "DiskBudgetExhausted";
-        defer if (owned) {
-            self.noteFailure(path, failure);
-            self.mutex.lockUncancelable(self.io);
-            self.files_dropped += 1;
-            self.mutex.unlock(self.io);
-            self.freeBlob(&blob);
-        };
-        blob.reservation = disk_budget.reserve(self.allocator, self.io, base, path, if (cap == 0) std.math.maxInt(u64) else cap, bytes.len) catch |err| {
-            failure = @errorName(err);
-            return;
-        };
-        if (blob.reservation == null) return;
+        defer if (owned) self.freeBlob(&blob);
+        if (reservation.pool != self.pool or reservation.kind != .file or bytes.len > reservation.bytes) return error.InvalidDiskLease;
         const result = self.trySubmitOwned(path, bytes, blob.reservation) catch |err| {
-            failure = @errorName(err);
-            return;
+            self.noteFailure(path, @errorName(err));
+            return err;
         };
-        if (result == .accepted) owned = false else failure = "WriterBusy";
+        if (result == .busy) return error.DiskBudgetBusy;
+        owned = false;
     }
 
     /// Stage without waiting for the byte permit. Only `accepted` transfers both buffers;
@@ -448,7 +461,7 @@ pub const Writer = struct {
                 log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ "InjectedWriteFailure", blob.path });
                 self.noteFailure(blob.path, "InjectedWriteFailure");
                 dropped = true;
-            } else if (writeAtomic(blob.path, blob.bytes)) |_| {} else |err| {
+            } else if (self.writeBlob(&blob)) |_| {} else |err| {
                 log.warn("  [disk-cache] background write failed: {s} ({s})\n", .{ @errorName(err), blob.path });
                 self.noteFailure(blob.path, @errorName(err));
                 dropped = true;
@@ -468,10 +481,37 @@ pub const Writer = struct {
             self.mutex.unlock(self.io);
         }
     }
+
+    fn writeBlob(self: *Writer, blob: *const Blob) !void {
+        const pool = self.pool orelse return writeAtomic(blob.path, blob.bytes);
+        return writePublished(self.io, pool, blob.path, blob.bytes, blob.reservation);
+    }
 };
 
-/// `<path>.tmp` then rename.
-fn writeAtomic(path: []const u8, bytes: []const u8) !void {
+/// Publishes filesystem facts before the caller releases its covering promise.
+pub fn writePublished(io: std.Io, pool: *disk_budget.Pool, path: []const u8, bytes: []const u8, reservation: ?*disk_budget.Reservation) !void {
+    const before = try publishedStat(io, path);
+    var tmp_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{path});
+    const before_tmp = try publishedStat(io, tmp);
+    var accounted = false;
+    errdefer if (!accounted) pool.unavailable(io);
+    const result = writeAtomic(path, bytes);
+    const after_tmp = try publishedStat(io, tmp);
+    if (result) |_| {
+        try pool.publish(io, tmp, before_tmp, after_tmp, null);
+        const after = (try publishedStat(io, path)) orelse return error.PublishedFileMissing;
+        try pool.publish(io, path, before, after, reservation);
+    } else |err| {
+        try pool.publish(io, tmp, before_tmp, after_tmp, null);
+        accounted = true;
+        return err;
+    }
+    accounted = true;
+}
+
+/// `<path>.tmp` then rename. The caller owns admission and ledger publication.
+pub fn writeAtomic(path: []const u8, bytes: []const u8) !void {
     var tmp_buf: [std.fs.max_path_bytes + 8]u8 = undefined;
     if (path.len + 6 >= tmp_buf.len) return error.NameTooLong;
     @memcpy(tmp_buf[0..path.len], path);
@@ -488,7 +528,7 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
         const n = crt.write(fd, bytes[off..]);
         if (n < 0) {
             const e = std.c._errno().*;
-            if (e == @backingInt(std.c.E.INTR) or e == @backingInt(std.c.E.AGAIN)) continue;
+            if (e == @intFromEnum(std.c.E.INTR) or e == @intFromEnum(std.c.E.AGAIN)) continue;
             return error.WriteFailed;
         }
         if (n == 0) return error.WriteFailed;
@@ -503,9 +543,72 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
     if (crt.rename(tmp.ptr, final.ptr) != 0) return error.RenameFailed;
 }
 
+fn publishedStat(io: std.Io, path: []const u8) !?std.Io.File.Stat {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(io);
+    const stat = try file.stat(io);
+    return if (stat.kind == .file) stat else null;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
+
+test "kv_disk_writer: paused replacements reserve temporary headroom and publish in FIFO order" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mlx");
+    try tmp.dir.createDirPath(io, "ds4");
+    const old = @as([80]u8, @splat(1));
+    const first = @as([80]u8, @splat(2));
+    const last = @as([80]u8, @splat(3));
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx/chunk", .data = &old });
+    try tmp.dir.writeFile(io, .{ .sub_path = "ds4/state", .data = &@as([20]u8, @splat(4)) });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const mlx_root = try std.fs.path.join(a, &.{ base, "mlx" });
+    defer a.free(mlx_root);
+    const native_root = try std.fs.path.join(a, &.{ base, "ds4" });
+    defer a.free(native_root);
+    const path = try std.fs.path.join(a, &.{ mlx_root, "chunk" });
+    defer a.free(path);
+    const pool = try disk_budget.openPool(a, io, base, mlx_root);
+    defer pool.close(io);
+    const peer = try disk_budget.openPool(a, io, base, native_root);
+    defer peer.close(io);
+    var w = Writer.init(a, io);
+    w.bindPool(pool);
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+
+    try testing.expectError(error.DiskBudgetFull, w.submitBudgeted(try a.dupe(u8, path), try a.dupe(u8, &first), 100));
+    const retained = try tmp.dir.readFileAlloc(io, "mlx/chunk", a, .limited(old.len + 1));
+    defer a.free(retained);
+    try testing.expectEqualSlices(u8, &old, retained);
+    try testing.expectEqual(@as(u64, 0), w.pendingBytes());
+    try w.submitBudgeted(try a.dupe(u8, path), try a.dupe(u8, &first), 260);
+    try w.submitBudgeted(try a.dupe(u8, path), try a.dupe(u8, &last), 260);
+    try testing.expectEqual(@as(u64, 160), w.pendingBytes());
+    try testing.expect((try peer.available(io, 260, 20)) == null);
+    try testing.expectError(error.DiskBudgetBusy, w.submitBudgeted(try a.dupe(u8, path), try a.dupe(u8, "x"), 260));
+    try testing.expectEqual(@as(u64, 0), w.writeErrorCount());
+
+    w.setPaused(false);
+    w.drain();
+    const result = try tmp.dir.readFileAlloc(io, "mlx/chunk", a, .limited(last.len + 1));
+    defer a.free(result);
+    try testing.expectEqualSlices(u8, &last, result);
+    try testing.expectEqual(@as(u64, 2), w.filesWritten());
+    try testing.expectEqual(@as(u64, 0), w.writeErrorCount());
+    try testing.expectEqual(@as(u64, 80), pool.physical(io));
+    try testing.expectEqual(@as(?u64, 160), try peer.available(io, 260, 20));
+}
 
 test "shared disk reservations cover paused chunks and release rejected or failed SSM jobs" {
     const a = testing.allocator;
@@ -520,15 +623,22 @@ test "shared disk reservations cover paused chunks and release rejected or faile
     defer a.free(native);
     const entry = try std.fs.path.join(a, &.{ base, "mlx/e1/" });
     defer a.free(entry);
+    const pool = try disk_budget.openPool(a, io, base, entry);
+    defer pool.close(io);
+    const native_pool = try disk_budget.openPool(a, io, base, native);
+    defer native_pool.close(io);
     const Send = struct {
         fn run(w: *Writer, root: []const u8, relative: []const u8, data: []const u8) !void {
             const path = try std.fs.path.join(testing.allocator, &.{ root, relative });
-            errdefer testing.allocator.free(path);
-            const bytes = try testing.allocator.dupe(u8, data);
-            w.submitBudgeted(path, bytes, root, 100);
+            const bytes = testing.allocator.dupe(u8, data) catch |err| {
+                testing.allocator.free(path);
+                return err;
+            };
+            try w.submitBudgeted(path, bytes, 100);
         }
     };
     var w = Writer.init(a, io);
+    w.bindPool(pool);
     try w.start();
     defer w.deinit();
     w.setPaused(true);
@@ -536,46 +646,50 @@ test "shared disk reservations cover paused chunks and release rejected or faile
     const payload = @as([80]u8, @splat(1));
     try Send.run(&w, base, chunk, &payload);
     try testing.expectEqual(@as(u64, 80), w.pendingBytes());
-    try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
-    try testing.expect((try disk_budget.reserve(a, io, base, native, 100, 80)) == null);
+    try testing.expectEqual(@as(?u64, 20), try native_pool.available(io, 100, 0));
+    try testing.expect(std.meta.activeTag(try native_pool.tryReserve(io, native, 100, 80, .pool)) != .granted);
     {
-        const native_write = (try disk_budget.reserve(a, io, base, native, 100, null)).?;
+        const native_write = switch (try native_pool.tryReserve(io, native, 100, null, .pool)) {
+            .granted => |r| r,
+            else => return error.TestUnexpectedResult,
+        };
         defer native_write.release(io);
         try testing.expectEqual(@as(u64, 20), native_write.bytes);
         try tmp.dir.writeFile(io, .{ .sub_path = "ds4/state.kvc", .data = &@as([20]u8, @splat(2)) });
+        try native_pool.reconcile(io);
     }
     w.setPaused(false);
     w.drain();
     try testing.expectEqual(@as(u64, 100), try disk_budget.physicalBytes(a, io, base, null));
-    try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
-    // Replacing a published target must not charge the old file twice.
+    try testing.expectEqual(@as(?u64, 20), try native_pool.available(io, 100, 0));
+    // A replacement also needs room for its temporary file.
     w.setPaused(true);
-    try Send.run(&w, base, chunk, &payload);
-    try testing.expectEqual(@as(u64, 80), w.pendingBytes());
-    w.setPaused(false);
-    w.drain();
-    try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expectError(error.DiskBudgetFull, Send.run(&w, base, chunk, &payload));
+    try testing.expectEqual(@as(u64, 0), w.pendingBytes());
+    try testing.expectEqual(@as(u64, 0), w.writeErrorCount());
+    try testing.expectEqual(@as(?u64, 20), try native_pool.available(io, 100, 0));
     try tmp.dir.deleteFile(io, chunk);
+    try pool.reconcile(io);
 
     // A permit rejection returns without waiting on this paused chunk.
     w.setPaused(true);
     w.permit_bytes = 4;
     try Send.run(&w, base, chunk, "held");
-    try Send.run(&w, base, "mlx/e1/s0000512.safetensors", "retry");
+    try testing.expectError(error.DiskBudgetBusy, Send.run(&w, base, "mlx/e1/s0000512.safetensors", "retry"));
     try testing.expectEqual(@as(u64, 4), w.pendingBytes());
-    try testing.expectEqual(@as(?u64, 96), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expectEqual(@as(?u64, 96), try native_pool.available(io, 100, 0));
     w.discardPrefix(entry);
-    try testing.expectEqual(@as(?u64, 100), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expectEqual(@as(?u64, 100), try native_pool.available(io, 100, 0));
     w.injectFailure("reject", .submit);
-    try Send.run(&w, base, "mlx/e1/s-reject.safetensors", "error");
+    try testing.expectError(error.InjectedSubmitFailure, Send.run(&w, base, "mlx/e1/s-reject.safetensors", "error"));
     try testing.expectEqual(@as(u64, 0), w.pendingBytes());
-    try testing.expectEqual(@as(?u64, 100), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expectEqual(@as(?u64, 100), try native_pool.available(io, 100, 0));
     w.injectFailure("fail", .write);
     try Send.run(&w, base, "mlx/e1/s-fail.safetensors", "error");
-    try testing.expectEqual(@as(?u64, 95), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expectEqual(@as(?u64, 95), try native_pool.available(io, 100, 0));
     w.setPaused(false);
     w.drain();
-    try testing.expectEqual(@as(?u64, 100), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expectEqual(@as(?u64, 100), try native_pool.available(io, 100, 0));
 
     // A real rename error cleans the temporary file before releasing its lease.
     w.injectFailure(null, .write);
@@ -583,7 +697,7 @@ test "shared disk reservations cover paused chunks and release rejected or faile
     try Send.run(&w, base, "mlx/e1/blocked.safetensors", "error");
     w.drain();
     try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "mlx/e1/blocked.safetensors.tmp", .{}));
-    try testing.expectEqual(@as(?u64, 100), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expectEqual(@as(?u64, 100), try native_pool.available(io, 100, 0));
     // Completing earlier writes must not invalidate later admissions in a busy producer.
     const written = w.filesWritten();
     const errors = w.writeErrorCount();
@@ -610,12 +724,20 @@ test "shared disk reservations do not charge module jobs twice" {
     defer a.free(entry);
     const native = try std.fs.path.join(a, &.{ base, "ds4" });
     defer a.free(native);
+    const pool = try disk_budget.openPool(a, io, base, entry);
+    defer pool.close(io);
+    const native_pool = try disk_budget.openPool(a, io, base, native);
+    defer native_pool.close(io);
     var w = Writer.init(a, io);
+    w.bindPool(pool);
     try w.start();
     defer w.deinit();
     w.setPaused(true);
     {
-        const directory = (try disk_budget.reserve(a, io, base, entry, 100, 80)).?;
+        const directory = switch (try pool.tryReserve(io, entry, 100, 80, .directory)) {
+            .granted => |r| r,
+            else => return error.TestUnexpectedResult,
+        };
         defer directory.release(io);
         const path = try std.fs.path.join(a, &.{ entry, "m000.safetensors" });
         const bytes = try a.dupe(u8, &@as([30]u8, @splat(1)));
@@ -627,12 +749,12 @@ test "shared disk reservations do not charge module jobs twice" {
         const result = try w.trySubmit(path, bytes);
         if (result == .accepted) owned = false;
         try testing.expectEqual(.accepted, result);
-        try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+        try testing.expectEqual(@as(?u64, 20), try native_pool.available(io, 100, 0));
         w.setPaused(false);
         w.drain();
-        try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+        try testing.expectEqual(@as(?u64, 20), try native_pool.available(io, 100, 0));
     }
-    try testing.expectEqual(@as(?u64, 70), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expectEqual(@as(?u64, 70), try native_pool.available(io, 100, 0));
 }
 
 test "a full paused queue returns busy and the caller can retry both buffers" {

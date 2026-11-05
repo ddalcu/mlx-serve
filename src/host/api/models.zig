@@ -560,9 +560,8 @@ fn machineJson(allocator: std.mem.Allocator) ![]u8 {
     var model_buf: [64]u8 = undefined;
     const status_mod = @import("../status.zig");
     return std.fmt.allocPrint(allocator, ",\"machine\":{{\"os\":\"{s}\",\"model\":{f},\"free_mib\":{d},\"total_mib\":{d}{s}}}", .{
-        @tagName(builtin.os.tag),                std.json.fmt(machineModel(&model_buf), .{}),
-        status_mod.getAvailableMemBytes() >> 20, status_mod.getTotalMemBytes() >> 20,
-        pair,
+        @tagName(builtin.os.tag), std.json.fmt(machineModel(&model_buf), .{}),
+        status_mod.getAvailableMemBytes() >> 20, status_mod.getTotalMemBytes() >> 20, pair,
     });
 }
 
@@ -1033,11 +1032,8 @@ test "input_modalities renders resident video weights and native unloaded capabi
     var radio_config = try model_mod.parseConfigFromJson(a, native);
     defer radio_config.deinit(a);
     var chat_config = chat_mod.ChatConfig{
-        .chat_template = "template",
-        .bos_token = null,
-        .eos_token = null,
-        .add_bos_token = false,
-        .allocator = a,
+        .chat_template = "template", .bos_token = null, .eos_token = null,
+        .add_bos_token = false, .allocator = a,
     };
     var encoder = std.mem.zeroInit(vision_mod.VisionEncoder, .{ .allocator = a, .config = qwen_config });
     var radio = std.mem.zeroInit(radio_vision.RadioVision, .{ .allocator = a });

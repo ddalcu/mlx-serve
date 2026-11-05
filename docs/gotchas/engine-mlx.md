@@ -1,5 +1,11 @@
 # Engine: KV cache, spec decode, kernels, MLX: gotchas
 
+### Shared disk admission must not walk storage on the inference thread
+Defect: every KV commit traversed unrelated model caches, and concurrent writes could appear to exhaust the disk.
+Fix: inventory at cold setup; publish successful file mutations to the shared inode ledger. Reserve full temporary
+bytes until atomic publication, distinguish busy from full, and fence root-wide sweeps against active writes.
+Guard: shared-budget and writer lifecycle tests; `tests/test_shared_cache_io.py` observes real HTTP commits.
+
 One story per gotcha: the defect, the cause, the fix, the guard. The rules live in the root `AGENTS.md` (`## Rules`)
 and each plugin's `AGENTS.md`; what is still open lives in `docs/known-issues.md`; spec-decode and cache designs live
 in `docs/reference.md`. An env lever a story names that `src/env.zig` no longer lists was retired once its arm was
