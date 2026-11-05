@@ -686,7 +686,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             } catch {
                 try Task.checkCancellation()
                 if error is CancellationError { throw error }
+                guard let current = session(sessionId),
+                      ContextCompaction.fingerprint(ContextCompaction.transcript(current.messages)) ==
+                        ContextCompaction.fingerprint(ContextCompaction.transcript(source)) else {
+                    throw ContextCompaction.Failure.changedHistory
+                }
                 return messages
+            }
+            try Task.checkCancellation()
+            guard let current = session(sessionId),
+                  ContextCompaction.fingerprint(ContextCompaction.transcript(current.messages)) ==
+                    ContextCompaction.fingerprint(ContextCompaction.transcript(source)) else {
+                throw ContextCompaction.Failure.changedHistory
             }
             guard let measured = measurement else {
                 contextMeasurements.removeValue(forKey: sessionId)
@@ -711,6 +722,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             } catch {
                 try Task.checkCancellation()
                 if error is CancellationError { throw error }
+                guard let current = session(sessionId),
+                      ContextCompaction.fingerprint(ContextCompaction.transcript(current.messages)) ==
+                        ContextCompaction.fingerprint(raw) else {
+                    throw ContextCompaction.Failure.changedHistory
+                }
                 return messages
             }
             try Task.checkCancellation()

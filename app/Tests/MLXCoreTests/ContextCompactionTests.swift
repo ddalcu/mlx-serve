@@ -26,8 +26,13 @@ struct ContextCompactionTests {
     private final class CountingStub: APIClient {
         var inputs: [String] = []
         var count = 200
+        var onCount: (() -> Void)?
+        var countFails = false
+        var onSummary: (() -> Void)?
         override func contextTokenCount(port: UInt16, text: String) async throws -> Int {
             inputs.append(text)
+            onCount?()
+            if countFails { throw URLError(.networkConnectionLost) }
             return count
         }
         override func streamChat(port: UInt16, messages: [[String: Any]], maxTokens: Int = 2048,
@@ -35,8 +40,63 @@ struct ContextCompactionTests {
             tools: [[String: Any]]? = nil, toolsJSON: String? = nil, defaults: RequestDefaults = .none,
             retryPolicy: RetryPolicy = .default, modelId: String? = nil,
             continueFinalMessage: Bool = false) -> AsyncThrowingStream<SSEEvent, Error> {
-            AsyncThrowingStream { $0.finish(throwing: URLError(.networkConnectionLost)) }
+            onSummary?()
+            return AsyncThrowingStream { $0.finish(throwing: URLError(.networkConnectionLost)) }
         }
+    }
+
+    @Test func testCompactionCannotSendEditedOrCancelledHistory() async throws {
+        guard NSHomeDirectory().contains("mlx-compaction-test-home") else { return }
+        _ = NSApplication.shared
+        let state = AppState(startServerAtLaunch: false)
+        var session = ChatSession(title: "measurement race")
+        session.messages = [ChatMessage(role: .user, content: "original")]
+        state.chatSessions.append(session)
+        let api = CountingStub()
+        for failure in [false, true] {
+            state.chatSessions[state.chatSessions.count - 1].messages[0].content = "original"
+            api.countFails = failure
+            api.onCount = {
+                let index = state.chatSessions.firstIndex { $0.id == session.id }!
+                state.chatSessions[index].messages[0].content = "edited"
+            }
+            do {
+                _ = try await state.chatEngine.prepareCompactedContext(api: api, sessionId: session.id,
+                    config: .init(agentMode: false, mcpMode: false, enableThinking: false, voiceStyle: false,
+                                  workingDirectory: nil, tools: [], maxTokens: 256),
+                    context: 32768, tools: String(repeating: "x", count: 90000)) { _ in
+                        [["role": "user", "content": "original"]]
+                    }
+                Issue.record("Edited history must not send the pre-measurement request")
+            } catch ContextCompaction.Failure.changedHistory { }
+        }
+        api.countFails = false
+        api.onCount = { withUnsafeCurrentTask { $0?.cancel() } }
+        let task = Task {
+            try await state.chatEngine.prepareCompactedContext(api: api, sessionId: session.id,
+                config: .init(agentMode: false, mcpMode: false, enableThinking: false, voiceStyle: false,
+                              workingDirectory: nil, tools: [], maxTokens: 256),
+                context: 32768, tools: String(repeating: "x", count: 90000)) { _ in
+                    [["role": "user", "content": "edited"]]
+                }
+        }
+        do { _ = try await task.value; Issue.record("Cancelled measurement must not send") }
+        catch is CancellationError { }
+        let index = state.chatSessions.firstIndex { $0.id == session.id }!
+        state.chatSessions[index].messages = (0..<30).map { ChatMessage(role: .user, content: "fact \($0)") }
+        api.count = 30000
+        api.onCount = nil
+        api.onSummary = { state.chatSessions[index].messages[0].content = "edited during summary" }
+        do {
+            _ = try await state.chatEngine.prepareCompactedContext(api: api, sessionId: session.id,
+                config: .init(agentMode: false, mcpMode: false, enableThinking: false, voiceStyle: false,
+                              workingDirectory: nil, tools: [], maxTokens: 256),
+                context: 32768, tools: String(repeating: "x", count: 90000)) { _ in
+                    [["role": "user", "content": "original"]]
+                }
+            Issue.record("Failed summary must not send history edited while it was running")
+        } catch ContextCompaction.Failure.changedHistory { }
+        #expect(!state.chatSessions[index].messages.contains { $0.contextCheckpoint != nil })
     }
 
     @Test func testUncompactableHistoryStillSendsExistingBuilderOutput() async throws {
