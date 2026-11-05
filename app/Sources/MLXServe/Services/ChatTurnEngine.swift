@@ -670,7 +670,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
     }
 
-    private func prepareCompactedContext(api: APIClient, sessionId: UUID, config: TurnConfig,
+    func prepareCompactedContext(api: APIClient, sessionId: UUID, config: TurnConfig,
                                          context: Int, tools: String?,
                                          buildMessages: ([ChatMessage]) -> [[String: Any]]) async throws -> [[String: Any]] {
         for _ in 0..<8 {
@@ -678,9 +678,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             guard let current = session(sessionId) else { throw CancellationError() }
             let source = current.messages
             let messages = ContextCompaction.appendingSummary(to: buildMessages(source), source: source)
-            guard let measured = try await ContextCompactionRunner.tokensIfNearLimit(api: api, port: server.port,
-                messages: messages, tools: tools, context: context, output: turnMaxTokens(config),
-                calibration: contextCalibration[sessionId] ?? 1) else {
+            let measurement: Int?
+            do {
+                measurement = try await ContextCompactionRunner.tokensIfNearLimit(api: api, port: server.port,
+                    messages: messages, tools: tools, context: context, output: turnMaxTokens(config),
+                    calibration: contextCalibration[sessionId] ?? 1)
+            } catch {
+                try Task.checkCancellation()
+                if error is CancellationError { throw error }
+                return messages
+            }
+            guard let measured = measurement else {
                 contextMeasurements.removeValue(forKey: sessionId)
                 return messages
             }
@@ -689,15 +697,22 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 contextMeasurements[sessionId] = measured
                 return messages
             }
-            guard let plan = ContextCompaction.plan(source) else { throw ContextCompaction.Failure.cannotReduce }
+            guard let plan = ContextCompaction.plan(source) else { return messages }
             let raw = ContextCompaction.transcript(source)
             let digest = ContextCompaction.fingerprint(Array(raw.prefix(plan.boundary + 1)))
             if source.contains(where: {
                 $0.contextCheckpoint?.boundaryID == raw[plan.boundary].id && $0.contextCheckpoint?.digest == digest
-            }) { throw ContextCompaction.Failure.cannotReduce }
+            }) { return messages }
             print("[ContextCompaction] start session=\(sessionId) tokens=\(calibrated) context=\(context)")
-            let marker = try await ContextCompactionRunner.summarize(source: source, boundary: plan.boundary,
-                api: api, port: server.port, model: requestModelId(config), context: context)
+            let marker: ChatMessage
+            do {
+                marker = try await ContextCompactionRunner.summarize(source: source, boundary: plan.boundary,
+                    api: api, port: server.port, model: requestModelId(config), context: context)
+            } catch {
+                try Task.checkCancellation()
+                if error is CancellationError { throw error }
+                return messages
+            }
             try Task.checkCancellation()
             guard let index = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
                   ContextCompaction.fingerprint(ContextCompaction.transcript(appState.chatSessions[index].messages)) ==
@@ -710,7 +725,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             appState.saveChatHistory()
             print("[ContextCompaction] committed session=\(sessionId) boundary=\(marker.contextCheckpoint!.boundaryID)")
         }
-        throw ContextCompaction.Failure.cannotReduce
+        try Task.checkCancellation()
+        guard let current = session(sessionId) else { throw CancellationError() }
+        return ContextCompaction.appendingSummary(to: buildMessages(current.messages), source: current.messages)
     }
 
     // MARK: - Plain chat

@@ -25,9 +25,41 @@ struct ContextCompactionTests {
     }
     private final class CountingStub: APIClient {
         var inputs: [String] = []
+        var count = 200
         override func contextTokenCount(port: UInt16, text: String) async throws -> Int {
             inputs.append(text)
-            return 200
+            return count
+        }
+        override func streamChat(port: UInt16, messages: [[String: Any]], maxTokens: Int = 2048,
+            temperature: Double = 0.8, enableThinking: Bool = false, reasoningEffort: String? = nil,
+            tools: [[String: Any]]? = nil, toolsJSON: String? = nil, defaults: RequestDefaults = .none,
+            retryPolicy: RetryPolicy = .default, modelId: String? = nil,
+            continueFinalMessage: Bool = false) -> AsyncThrowingStream<SSEEvent, Error> {
+            AsyncThrowingStream { $0.finish(throwing: URLError(.networkConnectionLost)) }
+        }
+    }
+
+    @Test func testUncompactableHistoryStillSendsExistingBuilderOutput() async throws {
+        guard NSHomeDirectory().contains("mlx-compaction-test-home") else { return }
+        _ = NSApplication.shared
+        let state = AppState(startServerAtLaunch: false)
+        let long = (0..<30).map { ChatMessage(role: $0 % 2 == 0 ? .user : .assistant, content: "message \($0)") }
+        let plan = try #require(ContextCompaction.plan(long))
+        let checkpoint = ContextCompaction.checkpoint(summary: "prior summary", source: long, boundary: plan.boundary)
+        for source in [[ChatMessage(role: .user, content: "one prompt")], long, long + [checkpoint]] {
+            var session = ChatSession(title: "compaction fallback")
+            session.messages = source
+            state.chatSessions.append(session)
+            let api = CountingStub()
+            api.count = 30000
+            let messages = try await state.chatEngine.prepareCompactedContext(api: api, sessionId: session.id,
+                config: .init(agentMode: true, mcpMode: false, enableThinking: false, voiceStyle: false,
+                              workingDirectory: nil, tools: [], maxTokens: 256),
+                context: 32768, tools: String(repeating: "x", count: 90000)) { _ in
+                    [["role": "user", "content": "one prompt"]]
+                }
+            #expect(messages.last?["content"] as? String == "one prompt")
+            #expect(state.chatSessions.last?.messages == source)
         }
     }
 
@@ -94,6 +126,56 @@ struct ContextCompactionTests {
         #expect(ContextCompaction.needsCompaction(tokens: 220_000, context: 262_144, output: 16_384))
         #expect(!ContextCompaction.needsCompaction(tokens: 20_000, context: 262_144, output: 16_384))
         #expect(ContextCompaction.needsCompaction(tokens: 260_555, context: 262_144, output: 0))
+    }
+
+    @Test func testSingleUserThirtyToolRoundsCanCompactWithinTheTurn() throws {
+        let user = ChatMessage(role: .user, content: "Keep working on TASK-771")
+        var source = [user]
+        for i in 0..<30 {
+            var call = ChatMessage(role: .assistant, content: "")
+            call.toolCalls = [MLXCore.SerializedToolCall(id: "call-\(i)", name: "readFile", arguments: "{}")]
+            var result = ChatMessage(role: .system, content: "result \(i)")
+            result.toolCallId = "call-\(i)"
+            source += [call, result]
+        }
+        let plan = try #require(ContextCompaction.plan(source))
+        #expect(plan.boundary > 0)
+        #expect(source[plan.boundary + 1].toolCalls?.isEmpty == false)
+        source.append(ContextCompaction.checkpoint(summary: "TASK-771 remains unfinished", source: source, boundary: plan.boundary))
+        let active = ContextCompaction.activeMessages(source)
+        #expect(active[1].id == user.id)
+        let wire = AgentEngine.buildAgentHistory(messages: source, contextLength: 32768, maxTokens: 4096)
+        #expect(wire.first?["role"] as? String == "user")
+        #expect(wire.first?["content"] as? String == user.content)
+        #expect(wire.compactMap { $0["tool_call_id"] as? String } == (24..<30).map { "call-\($0)" })
+        for i in 30..<40 {
+            var call = ChatMessage(role: .assistant, content: "")
+            call.toolCalls = [MLXCore.SerializedToolCall(id: "call-\(i)", name: "readFile", arguments: "{}")]
+            var result = ChatMessage(role: .system, content: "result \(i)")
+            result.toolCallId = "call-\(i)"
+            source += [call, result]
+        }
+        let next = try #require(ContextCompaction.plan(source))
+        #expect(next.boundary > plan.boundary)
+        source.append(ContextCompaction.checkpoint(summary: "TASK-771 still unfinished", source: source, boundary: next.boundary))
+        let continued = AgentEngine.buildAgentHistory(messages: source, contextLength: 32768, maxTokens: 4096)
+        #expect(continued.first?["content"] as? String == user.content)
+        #expect(continued.compactMap { $0["tool_call_id"] as? String } == (34..<40).map { "call-\($0)" })
+    }
+
+    @Test func testSummaryExcludesFailedAttemptsErrorsAndEmptyPlaceholders() throws {
+        var failed = ChatMessage(role: .assistant, content: "failed fiction")
+        failed.failedRetry = true
+        var error = ChatMessage(role: .assistant, content: "error fiction")
+        error.errorNotice = ChatErrorNotice(kind: .contextOverflow, message: "failure", neededTokens: 300, contextLength: 256)
+        var placeholder = ChatMessage(role: .assistant, content: "")
+        placeholder.isStreaming = true
+        let legacy = ChatMessage(role: .assistant, content: "couldn't generate a response")
+        let valid = ChatMessage(role: .user, content: "actual task")
+        let text = ContextCompaction.summaryText([valid, failed, error, placeholder, legacy])
+        let rows = try #require(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]])
+        #expect(rows.count == 1)
+        #expect(rows.first?["content"] as? String == "actual task")
     }
 
     @Test func testCheckpointReplacesOnlyCoveredPrefixAndKeepsTranscript() throws {

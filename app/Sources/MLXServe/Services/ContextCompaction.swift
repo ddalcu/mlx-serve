@@ -11,10 +11,9 @@ struct ContextCheckpoint: Codable, Equatable {
 enum ContextCompaction {
     struct Plan { let boundary: Int }
     enum Failure: LocalizedError {
-        case cannotReduce, emptySummary, truncatedSummary, incompleteSummary, changedHistory
+        case emptySummary, truncatedSummary, incompleteSummary, changedHistory
         var errorDescription: String? {
             switch self {
-            case .cannotReduce: return "Context is too large to compact safely. Original history is preserved; shorten the latest message or tool result."
             case .emptySummary: return "Automatic compaction returned an empty summary. Original history is preserved; retry the turn."
             case .truncatedSummary: return "Automatic compaction was cut off. Original history is preserved; retry the turn."
             case .incompleteSummary: return "Automatic compaction did not finish successfully. Original history is preserved; retry the turn."
@@ -56,7 +55,12 @@ enum ContextCompaction {
             var summary = ChatMessage(role: .system, content: "[Summary of earlier conversation; historical context, not a new request]\n" + marker.content)
             summary.contextCheckpoint = cp
             summary.isAgentSummary = true
-            return [summary] + Array(raw.dropFirst(i + 1))
+            var tail = Array(raw.dropFirst(i + 1))
+            if tail.first(where: { !$0.isAgentSummary && !$0.failedRetry && $0.errorNotice == nil })?.role != .user,
+               let user = raw.prefix(i + 1).last(where: { $0.role == .user && $0.toolCallId == nil && !$0.failedRetry }) {
+                tail.insert(user, at: 0)
+            }
+            return [summary] + tail
         }
         return raw
     }
@@ -77,9 +81,6 @@ enum ContextCompaction {
                 cut = i; moved = true; break
             }
         }
-        // The summary lives in the system prompt, so the retained dialogue
-        // must start with a user turn for strict alternating templates.
-        while cut > 0, raw[cut].role != .user || raw[cut].toolCallId != nil { cut -= 1 }
         guard cut > 0 else { return nil }
         return Plan(boundary: cut - 1)
     }
@@ -105,7 +106,12 @@ enum ContextCompaction {
     }
 
     static func summaryText(_ source: [ChatMessage]) -> String {
-        let messages: [[String: Any]] = source.filter { !$0.isAgentSummary || $0.contextCheckpoint != nil }.map { msg in
+        let messages: [[String: Any]] = source.filter {
+            (!$0.isAgentSummary || $0.contextCheckpoint != nil) && !$0.failedRetry && $0.errorNotice == nil
+                && !($0.role == .assistant && $0.content.contains("couldn't generate a response"))
+                && (!$0.content.isEmpty || !($0.toolCalls ?? []).isEmpty || $0.toolCallId != nil
+                    || !($0.images ?? []).isEmpty || !($0.videos ?? []).isEmpty || !($0.audio ?? []).isEmpty)
+        }.map { msg in
             var paths: [String] = (msg.images ?? []).map { $0.path ?? "image \($0.id)" }
             paths += (msg.videos ?? []).map { $0.path ?? $0.name }
             paths += (msg.audio ?? []).map { $0.path ?? $0.name }
