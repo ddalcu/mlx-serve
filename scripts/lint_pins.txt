@@ -130,3 +130,10 @@ src/engines/mlx/methods/yarn.zig	constTableAs(self.yarn_mscale.?,	the YaRN mscal
 src/plugins/glm5_next/table_forward.zig	spliceVisionRows(	the GLM-5.3 table forward splices vision rows on prompt chunks
 src/plugins/qwen4_exp/forward.zig	applyVisionEmbeddingsWith	every generative forward arm splices vision rows
 src/sdk/bases/run.zig	spliceRows(	the plugin bases splice vision rows on prompt chunks
+# Kernels.
+src/kernels/attention/attn256.metal	!(thread T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
+src/plugins/qwen4_exp/kernels/attn_qsa256.metal	!(thread T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
+src/plugins/qwen4_exp/kernels/qsa_attn_d_kload.metal	!(thread T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
+src/plugins/qwen4_exp/kernels/qsa_attn_d_vload.metal	!(thread T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
+src/kernels/quant/norm_rotate.metal	!(thread T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
+src/kernels/quant/norm_rotate.metal	!(thread const T*)&	a kernel reinterprets a uint4 through as_type (msv_unpack8, msv_pack8), never a thread-pointer pun
