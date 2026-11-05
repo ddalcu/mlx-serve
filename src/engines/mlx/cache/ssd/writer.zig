@@ -7,12 +7,14 @@
 const std = @import("std");
 const crt = @import("../../../../sdk/util/crt.zig");
 const log = @import("../../../../sdk/util/log.zig");
+const disk_budget = @import("../../../../sdk/kv/disk_budget.zig");
 
 /// One staged file; both buffers are owned by the queue once `submit` accepts them.
 pub const Blob = struct {
     path: []u8,
     bytes: []u8,
     epoch: u64,
+    reservation: ?*disk_budget.Reservation = null,
 };
 
 pub const DEFAULT_PERMIT_BYTES: u64 = 1024 * 1024 * 1024;
@@ -114,6 +116,7 @@ pub const Writer = struct {
     }
 
     fn freeBlob(self: *Writer, b: *Blob) void {
+        if (b.reservation) |r| r.release(self.io);
         self.allocator.free(b.path);
         self.allocator.free(b.bytes);
     }
@@ -159,9 +162,39 @@ pub const Writer = struct {
         self.work.signal(self.io);
     }
 
+    /// Ordinary KV files reserve their final target before queue acceptance. Module files
+    /// use trySubmit directly: their entire directory already has an export reservation.
+    /// Rejection retires the entry through the existing failure channel, without waiting.
+    pub fn submitBudgeted(self: *Writer, path: []u8, bytes: []u8, base: []const u8, cap: u64) void {
+        var blob: Blob = .{ .path = path, .bytes = bytes, .epoch = 0 };
+        var owned = true;
+        var failure: []const u8 = "DiskBudgetExhausted";
+        defer if (owned) {
+            self.noteFailure(path, failure);
+            self.mutex.lockUncancelable(self.io);
+            self.files_dropped += 1;
+            self.mutex.unlock(self.io);
+            self.freeBlob(&blob);
+        };
+        blob.reservation = disk_budget.reserve(self.allocator, self.io, base, path, if (cap == 0) std.math.maxInt(u64) else cap, bytes.len) catch |err| {
+            failure = @errorName(err);
+            return;
+        };
+        if (blob.reservation == null) return;
+        const result = self.trySubmitOwned(path, bytes, blob.reservation) catch |err| {
+            failure = @errorName(err);
+            return;
+        };
+        if (result == .accepted) owned = false else failure = "WriterBusy";
+    }
+
     /// Stage without waiting for the byte permit. Only `accepted` transfers both buffers;
     /// `busy` and errors leave them with the caller and the queue unchanged.
     pub fn trySubmit(self: *Writer, path: []u8, bytes: []u8) !SubmitResult {
+        return self.trySubmitOwned(path, bytes, null);
+    }
+
+    fn trySubmitOwned(self: *Writer, path: []u8, bytes: []u8, reservation: ?*disk_budget.Reservation) !SubmitResult {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         if (!self.running or self.deinited) return error.WriterStopped;
@@ -172,6 +205,7 @@ pub const Writer = struct {
             .path = path,
             .bytes = bytes,
             .epoch = self.epoch,
+            .reservation = reservation,
         });
         self.pending_bytes += bytes.len;
         self.work.signal(self.io);
@@ -447,13 +481,14 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
 
     const fd = crt.openWrite(tmp.ptr, true);
     if (fd < 0) return error.OpenFailed;
+    errdefer crt.unlink(tmp.ptr);
     defer crt.close(fd);
     var off: usize = 0;
     while (off < bytes.len) {
         const n = crt.write(fd, bytes[off..]);
         if (n < 0) {
             const e = std.c._errno().*;
-            if (e == @intFromEnum(std.c.E.INTR) or e == @intFromEnum(std.c.E.AGAIN)) continue;
+            if (e == @backingInt(std.c.E.INTR) or e == @backingInt(std.c.E.AGAIN)) continue;
             return error.WriteFailed;
         }
         if (n == 0) return error.WriteFailed;
@@ -471,6 +506,134 @@ fn writeAtomic(path: []const u8, bytes: []const u8) !void {
 // ── Tests ──
 
 const testing = std.testing;
+
+test "shared disk reservations cover paused chunks and release rejected or failed SSM jobs" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mlx/e1");
+    try tmp.dir.createDirPath(io, "ds4");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const native = try std.fs.path.join(a, &.{ base, "ds4" });
+    defer a.free(native);
+    const entry = try std.fs.path.join(a, &.{ base, "mlx/e1/" });
+    defer a.free(entry);
+    const Send = struct {
+        fn run(w: *Writer, root: []const u8, relative: []const u8, data: []const u8) !void {
+            const path = try std.fs.path.join(testing.allocator, &.{ root, relative });
+            errdefer testing.allocator.free(path);
+            const bytes = try testing.allocator.dupe(u8, data);
+            w.submitBudgeted(path, bytes, root, 100);
+        }
+    };
+    var w = Writer.init(a, io);
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    const chunk = "mlx/e1/c000000.safetensors";
+    const payload = @as([80]u8, @splat(1));
+    try Send.run(&w, base, chunk, &payload);
+    try testing.expectEqual(@as(u64, 80), w.pendingBytes());
+    try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try testing.expect((try disk_budget.reserve(a, io, base, native, 100, 80)) == null);
+    {
+        const native_write = (try disk_budget.reserve(a, io, base, native, 100, null)).?;
+        defer native_write.release(io);
+        try testing.expectEqual(@as(u64, 20), native_write.bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = "ds4/state.kvc", .data = &@as([20]u8, @splat(2)) });
+    }
+    w.setPaused(false);
+    w.drain();
+    try testing.expectEqual(@as(u64, 100), try disk_budget.physicalBytes(a, io, base, null));
+    try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    // Replacing a published target must not charge the old file twice.
+    w.setPaused(true);
+    try Send.run(&w, base, chunk, &payload);
+    try testing.expectEqual(@as(u64, 80), w.pendingBytes());
+    w.setPaused(false);
+    w.drain();
+    try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    try tmp.dir.deleteFile(io, chunk);
+
+    // A permit rejection returns without waiting on this paused chunk.
+    w.setPaused(true);
+    w.permit_bytes = 4;
+    try Send.run(&w, base, chunk, "held");
+    try Send.run(&w, base, "mlx/e1/s0000512.safetensors", "retry");
+    try testing.expectEqual(@as(u64, 4), w.pendingBytes());
+    try testing.expectEqual(@as(?u64, 96), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    w.discardPrefix(entry);
+    try testing.expectEqual(@as(?u64, 100), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    w.injectFailure("reject", .submit);
+    try Send.run(&w, base, "mlx/e1/s-reject.safetensors", "error");
+    try testing.expectEqual(@as(u64, 0), w.pendingBytes());
+    try testing.expectEqual(@as(?u64, 100), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    w.injectFailure("fail", .write);
+    try Send.run(&w, base, "mlx/e1/s-fail.safetensors", "error");
+    try testing.expectEqual(@as(?u64, 95), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    w.setPaused(false);
+    w.drain();
+    try testing.expectEqual(@as(?u64, 100), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+
+    // A real rename error cleans the temporary file before releasing its lease.
+    w.injectFailure(null, .write);
+    try tmp.dir.createDirPath(io, "mlx/e1/blocked.safetensors");
+    try Send.run(&w, base, "mlx/e1/blocked.safetensors", "error");
+    w.drain();
+    try testing.expectError(error.FileNotFound, tmp.dir.statFile(io, "mlx/e1/blocked.safetensors.tmp", .{}));
+    try testing.expectEqual(@as(?u64, 100), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    // Completing earlier writes must not invalidate later admissions in a busy producer.
+    const written = w.filesWritten();
+    const errors = w.writeErrorCount();
+    w.permit_bytes = 1000;
+    for (0..10) |i| {
+        var name: [64]u8 = undefined;
+        const path = try std.fmt.bufPrint(&name, "mlx/e1/c{d}.safetensors", .{i});
+        try Send.run(&w, base, path, "kv");
+    }
+    w.drain();
+    try testing.expectEqual(written + 10, w.filesWritten());
+    try testing.expectEqual(errors, w.writeErrorCount());
+}
+
+test "shared disk reservations do not charge module jobs twice" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "mlx/e1");
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const entry = try std.fs.path.join(a, &.{ base, "mlx/e1" });
+    defer a.free(entry);
+    const native = try std.fs.path.join(a, &.{ base, "ds4" });
+    defer a.free(native);
+    var w = Writer.init(a, io);
+    try w.start();
+    defer w.deinit();
+    w.setPaused(true);
+    {
+        const directory = (try disk_budget.reserve(a, io, base, entry, 100, 80)).?;
+        defer directory.release(io);
+        const path = try std.fs.path.join(a, &.{ entry, "m000.safetensors" });
+        const bytes = try a.dupe(u8, &@as([30]u8, @splat(1)));
+        var owned = true;
+        defer if (owned) {
+            a.free(path);
+            a.free(bytes);
+        };
+        const result = try w.trySubmit(path, bytes);
+        if (result == .accepted) owned = false;
+        try testing.expectEqual(.accepted, result);
+        try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+        w.setPaused(false);
+        w.drain();
+        try testing.expectEqual(@as(?u64, 20), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+    }
+    try testing.expectEqual(@as(?u64, 70), try disk_budget.availableBudget(a, io, base, native, 100, 0));
+}
 
 test "a full paused queue returns busy and the caller can retry both buffers" {
     var tmp = testing.tmpDir(.{ .iterate = true });

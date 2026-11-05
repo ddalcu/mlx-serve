@@ -3,6 +3,7 @@
 //! those exports (`sdk/util/shared.zig`). A new `Shared` goes on this list.
 
 comptime {
+    _ = @import("sdk/kv/disk_budget.zig").reservations_shared;
     _ = @import("sdk/util/err_name.zig").last_tls;
     if (@import("build_options").mlx_stream) _ = @import("mlx_stream").shared_state;
     _ = @import("host/plugins/loader.zig").process;

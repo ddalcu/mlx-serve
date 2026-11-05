@@ -100,7 +100,12 @@ pub fn Cache(comptime B: type) type {
         /// boundary rejects invalid (including interrupted) and image-conditioned sessions.
         pub fn store(self: *Self, session: *B.Ds4Session, prompt: []const i32, reason: Reason) !bool {
             if (prompt.len > std.math.maxInt(c_int)) return error.Ds4PrefixCachePromptTooLong;
-            try self.refreshBudget();
+            const reservation = (try disk_budget.reserve(self.allocator, self.io, self.base, self.root, self.total_cap, null)) orelse {
+                try self.applyAllowance(0);
+                return false;
+            };
+            defer reservation.release(self.io);
+            try self.applyAllowance(reservation.bytes);
             var err: [256]u8 = @splat(0);
             const rc = mlxserve_ds4_kv_cache_store(self.handle, @ptrCast(session.handle), prompt.ptr, @intCast(prompt.len), reason.native(), &err, err.len);
             if (rc < 0) {

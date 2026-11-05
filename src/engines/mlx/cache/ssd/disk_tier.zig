@@ -204,6 +204,8 @@ pub const IndexEntry = struct {
     quant: kv_quant.KVQuantConfig,
     /// KV file bill, or a module reservation/committed bill/deferred-cleanup liability.
     bytes: u64,
+    /// Unpublished module bytes also charged to other engines under the same root.
+    disk_reservation: ?*disk_budget.Reservation = null,
     /// Per-chunk file sizes recorded at commit (meta.json "chunk_bytes").
     /// The scan validates actual file sizes against these and clamps kv_len
     /// to the last contiguous valid chunk — a kill -9 mid-flush truncates a
@@ -298,7 +300,6 @@ pub const PersistOutcome = enum {
     partial,
     /// Nothing was written and nothing is promised.
     skipped,
-
 };
 
 /// The KV extent one commit would persist, in tokens: clamped to the token record (the cache
@@ -544,10 +545,17 @@ pub const DiskTier = struct {
         defer self.allocator.free(media);
         for (media_in, media) |sp, *out| out.* = .{ .start = sp.start, .key = @bitCast(sp.key) };
         var record = try module_record.Record.create(self.allocator, .{
-            .n = n, .prefix_key = @bitCast(input.prefix_key), .has_tools = input.has_tools,
-            .scheme = @tagName(input.quant.scheme), .bits = input.quant.bits, .group_size = input.quant.group_size,
-            .identity = context.identity, .header_bytes = input.header.len, .token_bytes = @as(u64, n) * 4,
-            .tensors = input.tensors, .media = media,
+            .n = n,
+            .prefix_key = @bitCast(input.prefix_key),
+            .has_tools = input.has_tools,
+            .scheme = @tagName(input.quant.scheme),
+            .bits = input.quant.bits,
+            .group_size = input.quant.group_size,
+            .identity = context.identity,
+            .header_bytes = input.header.len,
+            .token_bytes = @as(u64, n) * 4,
+            .tensors = input.tensors,
+            .media = media,
         }, input.header);
         var owns_record = true;
         defer if (owns_record) record.deinit();
@@ -556,19 +564,32 @@ pub const DiskTier = struct {
         const bytes = record.manifest.bytes;
         if (self.max_bytes != 0 and bytes > self.max_bytes) return null;
         if (!self.makeModuleRoom(bytes)) return null;
+        const id = self.next_id;
+        self.next_id = try std.math.add(u64, id, 1);
+        record.directory = try std.fmt.allocPrint(record.arena.allocator(), "{s}/e{d}/", .{ self.root, id });
+        const reservation = (try disk_budget.reserve(self.allocator, self.io, self.base_dir.?, record.directory, if (self.operator_cap == 0) std.math.maxInt(u64) else self.operator_cap, bytes)) orelse return null;
+        errdefer reservation.release(self.io);
         const tokens = try self.allocator.dupe(u32, input.tokens);
         errdefer self.allocator.free(tokens);
         const spans = try self.allocator.dupe(MediaSpan, media_in);
         errdefer self.allocator.free(spans);
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
-        const id = self.next_id;
-        self.next_id = try std.math.add(u64, id, 1);
-        record.directory = try std.fmt.allocPrint(record.arena.allocator(), "{s}/e{d}/", .{ self.root, id });
         try std.Io.Dir.cwd().createDirPath(self.io, record.directory);
         self.entries.appendAssumeCapacity(.{
-            .kind = .module, .module = record, .id = id, .tokens = tokens, .kv_len = n,
-            .has_tools = input.has_tools, .quant = input.quant, .bytes = bytes,
-            .chunk_bytes = &.{}, .ssm_positions = &.{}, .ssm_bytes = &.{}, .media = spans, .last_used = self.bump(),
+            .kind = .module,
+            .module = record,
+            .id = id,
+            .tokens = tokens,
+            .kv_len = n,
+            .has_tools = input.has_tools,
+            .quant = input.quant,
+            .bytes = bytes,
+            .disk_reservation = reservation,
+            .chunk_bytes = &.{},
+            .ssm_positions = &.{},
+            .ssm_bytes = &.{},
+            .media = spans,
+            .last_used = self.bump(),
         });
         owns_record = false;
         self.total_bytes += bytes;
@@ -755,6 +776,10 @@ pub const DiskTier = struct {
             self.total_bytes = self.total_bytes -| e.bytes;
             e.bytes = e.module.?.manifest.bytes;
             self.total_bytes += e.bytes;
+            if (e.disk_reservation) |r| {
+                r.release(self.io);
+                e.disk_reservation = null;
+            }
         }
     }
 
@@ -792,6 +817,12 @@ pub const DiskTier = struct {
         self.total_bytes -|= e.bytes;
         e.bytes = m.accepted_bytes;
         self.total_bytes += e.bytes;
+        if (e.disk_reservation) |r| {
+            if (e.bytes == 0) {
+                r.release(self.io);
+                e.disk_reservation = null;
+            } else r.shrink(self.io, e.bytes);
+        }
         log.warn("  [disk-cache] module e{d} {s} ({s})\n", .{ e.id, @tagName(state), why });
     }
 
@@ -1263,6 +1294,7 @@ pub const DiskTier = struct {
     /// eviction, invalidation, scan-append failure, extend-replace) must go
     /// through this so a new owned field can't leak on one of them.
     fn freeIndexEntryOwned(self: *DiskTier, e: *IndexEntry) void {
+        if (e.disk_reservation) |r| r.release(self.io);
         if (e.module) |*m| m.deinit();
         self.allocator.free(e.tokens);
         self.allocator.free(e.chunk_bytes);
@@ -2174,8 +2206,7 @@ pub const DiskTier = struct {
         }
 
         const prefix_rows: u32 = if (donor) |d|
-            @intCast(@min(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)),
-                mediaSharedBound(self.entries.items[d.idx].media, media)))
+            @intCast(@min(@min(commonPrefixLen(self.entries.items[d.idx].tokens, tokens), @as(usize, kv_len)), mediaSharedBound(self.entries.items[d.idx].media, media)))
         else
             kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
@@ -2781,7 +2812,7 @@ pub const DiskTier = struct {
                 return err;
             };
             const n = bytes.len;
-            w.submit(path, bytes); // takes both buffers
+            w.submitBudgeted(path, bytes, self.base_dir.?, self.operator_cap); // takes both buffers
             return n;
         }
         defer self.allocator.free(path);
@@ -3182,7 +3213,7 @@ pub const DiskTier = struct {
                 return err;
             };
             const n = bytes.len;
-            w.submit(path, bytes); // takes both buffers
+            w.submitBudgeted(path, bytes, self.base_dir.?, self.operator_cap); // takes both buffers
             return n;
         }
 
@@ -3277,7 +3308,7 @@ pub const DiskTier = struct {
                 return err;
             };
             const n = bytes.len;
-            w.submit(path, bytes);
+            w.submitBudgeted(path, bytes, self.base_dir.?, self.operator_cap);
             return n;
         }
         const tensor_map = mlx.mlx_map_string_to_array_new();
@@ -3493,8 +3524,7 @@ pub const DiskTier = struct {
             if (e.poisoned) continue; // never inherit from a dead entry
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
-            const shared: u64 = @min(@min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)),
-                @as(u64, e.kv_len)), @as(u64, mediaSharedBound(e.media, media)));
+            const shared: u64 = @min(@min(@min(@as(u64, commonPrefixLen(e.tokens, tokens)), @as(u64, kv_target)), @as(u64, e.kv_len)), @as(u64, mediaSharedBound(e.media, media)));
             const whole: u32 = @intCast(shared / self.chunk_tokens);
             const usable: u32 = @min(whole, @as(u32, @intCast(e.chunk_bytes.len)));
             if (usable == 0) continue;
@@ -3653,7 +3683,7 @@ pub const DiskTier = struct {
             // The index rides the same FIFO queue as the chunks, so it is the last file to land.
             errdefer self.allocator.free(final_path);
             const bytes = try self.allocator.dupe(u8, buf.items);
-            w.submit(final_path, bytes);
+            w.submitBudgeted(final_path, bytes, self.base_dir.?, self.operator_cap);
             return;
         }
         defer self.allocator.free(final_path);
@@ -3851,9 +3881,19 @@ pub const DiskTier = struct {
         errdefer self.allocator.free(media);
         for (m.media, media) |sp, *out| out.* = .{ .start = sp.start, .key = @bitCast(sp.key) };
         const e: IndexEntry = .{
-            .kind = .module, .module = record, .id = id, .tokens = tokens, .kv_len = m.n,
-            .has_tools = m.has_tools, .quant = quant, .bytes = m.bytes, .media = media,
-            .chunk_bytes = &.{}, .ssm_positions = &.{}, .ssm_bytes = &.{}, .last_used = 0,
+            .kind = .module,
+            .module = record,
+            .id = id,
+            .tokens = tokens,
+            .kv_len = m.n,
+            .has_tools = m.has_tools,
+            .quant = quant,
+            .bytes = m.bytes,
+            .media = media,
+            .chunk_bytes = &.{},
+            .ssm_positions = &.{},
+            .ssm_bytes = &.{},
+            .last_used = 0,
         };
         try self.validateModuleFiles(&e);
         return .{ .e = e, .mtime = mtime };
@@ -9566,8 +9606,12 @@ const ModuleSource = struct {
         defer testing.allocator.free(ids);
         for (ids, 0..) |*id, i| id.* = @intCast(i + 7);
         return (try tier.registerModule(.{
-            .tokens = ids, .prefix_key = 17, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
-            .header = header, .tensors = tensors,
+            .tokens = ids,
+            .prefix_key = 17,
+            .has_tools = false,
+            .quant = kv_quant.KVQuantConfig.dense,
+            .header = header,
+            .tensors = tensors,
         })) orelse error.ModuleRegistrationDeclined;
     }
 
@@ -9812,6 +9856,79 @@ test "a newer module checkpoint preserves the older unfinished identity" {
     try testing.expect(tier.entryWholeOnDisk(newer));
 }
 
+test "shared disk reservations bound a ds4 write while an 8 GiB module export is pending" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try ModuleSource.init(base, "pending-module");
+    defer tier.deinit();
+    const GiB = 1024 * 1024 * 1024;
+    tier.operator_cap = 10 * GiB;
+    tier.writer.?.setPaused(true);
+    const ids = @as([512]u32, @splat(7));
+    const id = (try tier.registerModule(.{
+        .tokens = &ids,
+        .prefix_key = 18,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .header = ModuleSource.header,
+        .tensors = &.{.{ .name = "ring", .dtype = "F32", .shape = &.{ 2, GiB }, .bytes = 8 * GiB }},
+    })).?;
+    const reserved = tier.total_bytes;
+    try testing.expect(reserved >= 8 * GiB);
+    const native_root = try std.fs.path.join(a, &.{ base, "ds4" });
+    defer a.free(native_root);
+    try tmp.dir.createDirPath(io, "ds4");
+    try testing.expectEqual(@as(?u64, tier.operator_cap - reserved), try disk_budget.availableBudget(a, io, base, native_root, tier.operator_cap, 0));
+    try testing.expect((try disk_budget.reserve(a, io, base, native_root, tier.operator_cap, 8 * GiB)) == null);
+    const native = (try disk_budget.reserve(a, io, base, native_root, tier.operator_cap, null)).?;
+    {
+        defer native.release(io);
+        // The same allowance passed to native ds4 bounds a real sparse checkpoint file.
+        const file = try tmp.dir.createFile(io, "ds4/state.kvc", .{});
+        defer file.close(io);
+        try file.setLength(io, native.bytes);
+        try testing.expectEqual(tier.operator_cap, reserved + try disk_budget.physicalBytes(a, io, base, null));
+    }
+    try testing.expect((try disk_budget.availableBudget(a, io, base, native_root, tier.operator_cap, try disk_budget.physicalBytes(a, io, native_root, null))) == null);
+    tier.cancelModule(id, .memory_pressure);
+    tier.cleanupModules();
+    try testing.expectEqual(@as(?u64, tier.operator_cap), try disk_budget.availableBudget(a, io, base, native_root, tier.operator_cap, 0));
+}
+
+test "shared disk reservations release after publication and injected writer failure" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try ModuleSource.init(base, "pending-lifecycle");
+    defer tier.deinit();
+    const native = try std.fs.path.join(a, &.{ base, "ds4" });
+    defer a.free(native);
+    const id = try ModuleSource.register(&tier, 512);
+    try testing.expectEqual(@as(?u64, tier.operator_cap - tier.total_bytes), try disk_budget.availableBudget(a, io, base, native, tier.operator_cap, 0));
+    try ModuleSource.publish(&tier, id);
+    tier.drainWriter();
+    tier.pollModuleWrites();
+    const physical = try disk_budget.physicalBytes(a, io, base, null);
+    try testing.expectEqual(@as(?u64, tier.operator_cap - physical), try disk_budget.availableBudget(a, io, base, native, tier.operator_cap, 0));
+    try testing.expect(tier.entries.items[tier.indexOfId(id).?].disk_reservation == null);
+    const failed = try ModuleSource.register(&tier, 513);
+    tier.writer.?.setPaused(true);
+    tier.writer.?.injectFailure("m000.", .write);
+    try ModuleSource.publish(&tier, failed);
+    tier.writer.?.setPaused(false);
+    tier.drainWriter();
+    tier.cleanupModules();
+    try testing.expect(tier.moduleState(failed) == null);
+    try testing.expectEqual(@as(?u64, tier.operator_cap - physical), try disk_budget.availableBudget(a, io, base, native, tier.operator_cap, 0));
+}
+
 test "reservations never credit free space and active exports survive a lower cap" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -9825,8 +9942,12 @@ test "reservations never credit free space and active exports survive a lower ca
     tier.armTestSpace(11 * DISK_STORE_FLOOR - 1, 100 * DISK_STORE_FLOOR);
     const ids = @as([512]u32, @splat(7));
     try testing.expect((try tier.registerModule(.{
-        .tokens = &ids, .prefix_key = 18, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
-        .header = ModuleSource.header, .tensors = ModuleSource.tensors,
+        .tokens = &ids,
+        .prefix_key = 18,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
+        .header = ModuleSource.header,
+        .tensors = ModuleSource.tensors,
     })) == null);
     try testing.expect(tier.store_declined);
     tier.max_bytes = reserved - 1;
@@ -9854,7 +9975,10 @@ test "a module larger than the entire budget declines before registration" {
     tier.operator_cap = DISK_STORE_FLOOR;
     const ids = @as([512]u32, @splat(7));
     try testing.expect((try tier.registerModule(.{
-        .tokens = &ids, .prefix_key = 18, .has_tools = false, .quant = kv_quant.KVQuantConfig.dense,
+        .tokens = &ids,
+        .prefix_key = 18,
+        .has_tools = false,
+        .quant = kv_quant.KVQuantConfig.dense,
         .header = ModuleSource.header,
         .tensors = &.{.{ .name = "ring", .dtype = "F32", .shape = &.{DISK_STORE_FLOOR / 4}, .bytes = DISK_STORE_FLOOR }},
     })) == null);
@@ -9952,9 +10076,7 @@ test "v2 through v9 KV scans retain contiguous chunk salvage" {
         try tmp.dir.writeFile(testing.io, .{ .sub_path = "kv/e1/tokens.bin", .data = &raw });
         try tmp.dir.writeFile(testing.io, .{ .sub_path = "kv/e1/c000000.safetensors", .data = "good" });
         try tmp.dir.writeFile(testing.io, .{ .sub_path = "kv/e1/c000001.safetensors", .data = "x" });
-        const meta = try std.fmt.allocPrint(testing.allocator,
-            "{{\"v\":{d},\"kv_len\":600,\"tokens\":600,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":64,\"chunk_tokens\":512,\"chunk_bytes\":[4,4]{s}}}",
-            .{ v, if (v == 9) ",\"media\":[[100,2]]" else "" });
+        const meta = try std.fmt.allocPrint(testing.allocator, "{{\"v\":{d},\"kv_len\":600,\"tokens\":600,\"has_tools\":false,\"scheme\":\"off\",\"bits\":0,\"group_size\":64,\"chunk_tokens\":512,\"chunk_bytes\":[4,4]{s}}}", .{ v, if (v == 9) ",\"media\":[[100,2]]" else "" });
         defer testing.allocator.free(meta);
         try tmp.dir.writeFile(testing.io, .{ .sub_path = "kv/e1/meta.json", .data = meta });
         var buf: [512]u8 = undefined;
