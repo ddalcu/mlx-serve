@@ -36,6 +36,23 @@ final class PluginListingTests: XCTestCase {
         XCTAssertEqual(PluginListing.state(lists.available[0], switches: on, running: "26.12.1"), .available)
     }
 
+    func testAPluginTheServerRefusedForAnotherBuildNeedsARebuild() {
+        let current = PluginListing.items(receipts: [receipt("sushi_ds41", "0.2.0")], catalog: [sushi]).installed[0]
+        let on = OutsidePlugins.Switches(enabled: true)
+        let stale = ["sushi_ds41": PluginCatalog.ServerStatus(loaded: false, rebuild: true, why: "rebuild it")]
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: stale), .needsRebuild)
+        let changed = ["sushi_ds41": PluginCatalog.ServerStatus(loaded: false, rebuild: false, why: "hash differs")]
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: changed), .on,
+                       "a refusal a rebuild does not fix is not offered one")
+        let older = PluginListing.items(receipts: [receipt("sushi_ds41", "0.1.0")], catalog: [sushi]).installed[0]
+        XCTAssertEqual(PluginListing.state(older, switches: on, running: "26.11.2", server: stale), .updateAvailable("0.2.0"),
+                       "an update rebuilds it too, and says more")
+        XCTAssertEqual(PluginListing.rebuildable(PluginListing.items(receipts: [receipt("sushi_ds41", "0.2.0"), receipt("local_only", "1.0")],
+                                                                     catalog: [sushi]).installed,
+                                                 server: stale.merging(["local_only": stale["sushi_ds41"]!]) { a, _ in a }).map(\.name),
+                       ["sushi_ds41"], "Rebuild all takes only what the catalog can build")
+    }
+
     func testPacksSplitTheDescriptionFromTheRepo() {
         XCTAssertEqual(PluginListing.packs(sushi), [.init(text: "deepseek_v41 with expert_quant.format stq",
                                                          repo: "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw")])

@@ -25,6 +25,10 @@ final class PluginManager: ObservableObject {
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var log = ""
     @Published private(set) var runningVersion: String?
+    /// What the running server said of each installed plugin at its start (`/props`); empty when it is not running.
+    @Published private(set) var serverStatus: [String: PluginCatalog.ServerStatus] = [:]
+    /// The plugins the install in progress builds, in order (one, or every stale one for Rebuild all).
+    @Published private(set) var pending: [String] = []
 
     static let sourceDir = NSString(string: "~/.mlx-serve/plugin-src").expandingTildeInPath
     private var process: Process?
@@ -40,10 +44,11 @@ final class PluginManager: ObservableObject {
 
     // MARK: Catalog
 
-    func loadCatalog() async {
+    func loadCatalog(port: UInt16? = nil) async {
         loadingCatalog = true
         defer { loadingCatalog = false }
         async let version = Self.probeRunningVersion()
+        if let port { serverStatus = await Self.fetchServerStatus(port: port) }
         do {
             var request = URLRequest(url: PluginCatalog.catalogURL)
             request.cachePolicy = .reloadIgnoringLocalCacheData
@@ -61,6 +66,14 @@ final class PluginManager: ObservableObject {
         refreshReceipts()
     }
 
+    nonisolated private static func fetchServerStatus(port: UInt16) async -> [String: PluginCatalog.ServerStatus] {
+        guard let url = URL(string: "http://127.0.0.1:\(port)/props") else { return [:] }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 3
+        guard let (data, _) = try? await URLSession.shared.data(for: request) else { return [:] }
+        return PluginCatalog.serverStatus(fromProps: data)
+    }
+
     nonisolated private static func probeRunningVersion() async -> String? {
         await Task.detached {
             let out = runCapture(Self.binaryPath(), ["--version"], env: ServerManager.launchEnvironment())
@@ -71,19 +84,23 @@ final class PluginManager: ObservableObject {
     // MARK: Install
 
     /// Step 1: fetch the source and name the commit. Nothing is compiled or run from it yet.
-    func prepare(_ entry: PluginCatalog.Entry) {
-        guard !isBusy, PluginCatalog.isSafeName(entry.name) else { return }
+    func prepare(_ entry: PluginCatalog.Entry) { prepare([entry]) }
+
+    /// Several at once (Rebuild all): one fetch, one confirmation, then each built and installed in turn.
+    func prepare(_ entries: [PluginCatalog.Entry]) {
+        guard !isBusy, !entries.isEmpty, entries.allSatisfy({ PluginCatalog.isSafeName($0.name) }) else { return }
         log = ""
-        phase = .fetching(name: entry.name)
-        let name = entry.name
+        pending = entries.map(\.name)
+        let name = pending.joined(separator: ", ")
+        phase = .fetching(name: name)
         Task {
             do {
                 try Self.requireDeveloperTools()
                 let commit = try await fetchSource()
-                guard FileManager.default.fileExists(atPath: Self.sourceDir + "/plugins/\(name)/plugin.json") else {
-                    throw Failure("\(name) is not in the repository at \(commit.prefix(10))")
+                for n in pending where !FileManager.default.fileExists(atPath: Self.sourceDir + "/plugins/\(n)/plugin.json") {
+                    throw Failure("\(n) is not in the repository at \(commit.prefix(10))")
                 }
-                phase = .awaitingConfirmation(name: name, commit: commit, version: entry.version)
+                phase = .awaitingConfirmation(name: name, commit: commit, version: entries.count == 1 ? entries[0].version : "")
             } catch {
                 phase = .failed(name: name, message: error.localizedDescription)
             }
@@ -109,10 +126,17 @@ final class PluginManager: ObservableObject {
                 var env = ServerManager.launchEnvironment()
                 let binDir = (Self.binaryPath() as NSString).deletingLastPathComponent
                 env["PATH"] = [binDir, "/usr/bin", "/bin", "/usr/sbin", "/sbin", env["PATH"] ?? ""].filter { !$0.isEmpty }.joined(separator: ":")
-                if let kit = PluginCatalog.kit(at: PluginCatalog.homeKitDir, matching: runningVersion) { env["MLX_SERVE_KIT"] = kit }
-                for step in Self.installSteps(name: name, sourceDir: Self.sourceDir, binary: Self.binaryPath()) {
-                    let status = try await stream(step.exe, step.args, cwd: Self.sourceDir, env: env)
-                    guard status == 0 else { throw Failure(PluginCatalog.installFailure(status: status, log: log, running: runningVersion)) }
+                if let kit = try await kitForRunningServer() {
+                    env["MLX_SERVE_KIT"] = kit
+                    // The repo's fetch-kit keeps a staged kit of its own KIT_VERSION over MLX_SERVE_KIT.
+                    try? FileManager.default.removeItem(atPath: Self.sourceDir + "/.kit")
+                }
+                for n in pending {
+                    for step in Self.installSteps(name: n, sourceDir: Self.sourceDir, binary: Self.binaryPath()) {
+                        let status = try await stream(step.exe, step.args, cwd: Self.sourceDir, env: env)
+                        guard status == 0 else { throw Failure(PluginCatalog.installFailure(status: status, log: log, running: runningVersion)) }
+                    }
+                    serverStatus[n] = nil
                 }
                 refreshReceipts()
                 phase = .done(name: name)
@@ -127,7 +151,11 @@ final class PluginManager: ObservableObject {
         if case let .awaitingConfirmation(name, _, _) = phase { phase = .failed(name: name, message: "Cancelled") }
     }
 
-    func dismiss() { if !isBusy { phase = .idle } }
+    func dismiss() {
+        guard !isBusy else { return }
+        phase = .idle
+        pending = []
+    }
 
     func uninstall(_ name: String) {
         do {
@@ -154,6 +182,28 @@ final class PluginManager: ObservableObject {
     nonisolated static func installSteps(name: String, sourceDir: String, binary: String) -> [(exe: String, args: [String])] {
         [("/bin/bash", [sourceDir + "/scripts/build.sh", name]),
          (binary, ["plugin", "install", "\(sourceDir)/plugins/\(name)/zig-out/lib/lib\(name).dylib", "--yes"])]
+    }
+
+    /// The kit of the running release in ~/.mlx-serve/kit, downloaded from that release's assets when the folder
+    /// holds another; nil when no release carries one (a dev build), and the build fetches the repo's own.
+    private func kitForRunningServer() async throws -> String? {
+        let home = PluginCatalog.homeKitDir
+        if let kit = PluginCatalog.kit(at: home, matching: runningVersion) { return kit }
+        guard let version = runningVersion, let url = PluginCatalog.kitURL(version: version) else { return nil }
+        appendLog("$ fetch \(url.absoluteString)\n")
+        guard let (file, response) = try? await URLSession.shared.download(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { appendLog("no kit released for \(version)\n"); return nil }
+        let fm = FileManager.default
+        let staging = (home as NSString).deletingLastPathComponent + "/.kit-staging"
+        try? fm.removeItem(atPath: staging)
+        try fm.createDirectory(atPath: staging, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: staging) }
+        guard try await stream("/usr/bin/tar", ["-xzf", file.path, "-C", staging], cwd: nil, env: ["PATH": "/usr/bin:/bin"]) == 0,
+              PluginCatalog.kit(at: staging + "/mlx-serve-plugin-kit-\(version)", matching: version) != nil
+        else { throw Failure("the kit for \(version) did not unpack; see the log") }
+        try? fm.removeItem(atPath: home)
+        try fm.moveItem(atPath: staging + "/mlx-serve-plugin-kit-\(version)", toPath: home)
+        return home
     }
 
     /// git and the Zig build both need the Command Line Tools; say so by name instead of letting the shim pop a dialog.

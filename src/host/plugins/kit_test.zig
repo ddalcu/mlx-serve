@@ -104,6 +104,8 @@ test "kit examples: a changed install is refused by its receipt; a disabled one 
     defer stale.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), stale.plugins.items.len);
     try testing.expectEqualStrings("plugin was built against another MLX: rebuild it with this release's kit", stale.refused.items[0].why);
+    // A rebuild fixes that one, not the changed hash.
+    try testing.expect(stale.refused.items[0].rebuild and !set.refused.items[0].rebuild);
 }
 
 /// The last row's logits of `tokens` fed as `chunks` forwards (prefill, then decode steps) on one fresh cache.

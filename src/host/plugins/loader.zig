@@ -98,7 +98,8 @@ pub const Plugin = struct {
     }
 };
 
-pub const Refusal = struct { path: []const u8, why: []const u8 };
+/// `rebuild`: refused by negotiation (another MLX, ABI or table version), which a rebuild against this kit fixes.
+pub const Refusal = struct { path: []const u8, why: []const u8, rebuild: bool = false };
 
 pub const Set = struct {
     plugins: std.ArrayList(Plugin) = .empty,
@@ -130,6 +131,8 @@ pub const Opened = union(enum) {
     ok: Plugin,
     /// Allocated in the caller's allocator.
     refused: []const u8,
+    /// Refused by negotiation as built for another host: a rebuild with this release's kit loads it.
+    stale: []const u8,
 };
 
 /// Opens the dylib at `path` (now: every mlx-c symbol it names must exist in this process) and negotiates its
@@ -145,7 +148,10 @@ pub fn open(a: Allocator, path: []const u8, sha256: [Sha256.digest_length * 2]u8
         return .{ .refused = try a.dupe(u8, "exports no `" ++ dylib_abi.symbol ++ "` (not built with the plugin kit)") };
     const m: *const dylib_abi.Manifest = @ptrCast(@alignCast(sym));
     const v = dylib_abi.negotiate(m, host_mlx);
-    if (!v.isOk()) return .{ .refused = try a.dupe(u8, v.why.slice()) };
+    if (!v.isOk()) {
+        const why = try a.dupe(u8, v.why.slice());
+        return if (v.code == .unsupported) .{ .stale = why } else .{ .refused = why };
+    }
     return .{ .ok = .{ .path = try a.dupe(u8, path), .manifest = m, .sha256 = sha256 } };
 }
 
@@ -179,6 +185,7 @@ pub fn loadDir(io: std.Io, a: Allocator, dir_path: []const u8, settings: Setting
                 try set.entries.append(a, p.entry());
             },
             .refused => |why| try set.refused.append(a, .{ .path = try a.dupe(u8, path), .why = why }),
+            .stale => |why| try set.refused.append(a, .{ .path = try a.dupe(u8, path), .why = why, .rebuild = true }),
         }
     }
     return set;
@@ -278,6 +285,43 @@ pub fn homePath(a: Allocator, rel: []const u8) ![]u8 {
     return std.fs.path.join(a, &.{ home, ".mlx-serve", rel });
 }
 
+fn fileStem(path: []const u8) []const u8 {
+    return std.fs.path.stem(std.fs.path.basename(path));
+}
+
+/// The `/props` `plugins` array: each installed plugin this process loaded or refused, and whether a rebuild against
+/// this release's kit would load it.
+pub fn statusJson(a: Allocator, loaded_names: []const []const u8, refused: []const Refusal) ![]u8 {
+    const Row = struct { name: []const u8, loaded: bool, rebuild: ?bool = null, why: ?[]const u8 = null };
+    var rows: std.ArrayList(Row) = .empty;
+    defer rows.deinit(a);
+    for (loaded_names) |n| try rows.append(a, .{ .name = n, .loaded = true });
+    for (refused) |r| try rows.append(a, .{ .name = fileStem(r.path), .loaded = false, .rebuild = r.rebuild, .why = r.why });
+    return std.json.Stringify.valueAlloc(a, rows.items, .{ .emit_null_optional_fields = false });
+}
+
+/// This process's `statusJson`.
+pub fn processStatusJson(a: Allocator) ![]u8 {
+    const set = &process.get().set;
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(a);
+    for (set.plugins.items) |p| try names.append(a, p.name());
+    return statusJson(a, names.items, set.refused.items);
+}
+
+/// What a failed model load adds when plugins were refused for another build: their names and the fix, or null.
+pub fn rebuildHint(a: Allocator, refused: []const Refusal) !?[]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for (refused) |r| if (r.rebuild) {
+        try out.appendSlice(a, if (out.items.len == 0) "Outside plugins refused at startup, built for another mlx-serve: " else ", ");
+        try out.appendSlice(a, fileStem(r.path));
+    };
+    if (out.items.len == 0) return null;
+    try out.appendSlice(a, ". If one of them serves this model, rebuild it in Models > Plugins");
+    return try out.toOwnedSlice(a);
+}
+
 /// At startup: publishes the process's `Host` table, which every model load hands its plugin, then loads the installed
 /// plugins when `plugins.json` switches them on and `--no-plugins` was not given, logging each plugin loaded or refused
 /// and each built-in an outside plugin replaces.
@@ -316,7 +360,7 @@ test "outside plugins: open refuses unsupported builds before loading a library"
     if (supported) return error.SkipZigTest;
     const result = try open(testing.allocator, "missing.dylib", @splat(0), "pin");
     switch (result) {
-        .refused => |why| {
+        .refused, .stale => |why| {
             defer testing.allocator.free(why);
             try testing.expectEqualStrings("does not load: outside plugins are unsupported on this build", why);
         },
@@ -409,4 +453,28 @@ test "plugin signature: codesign's report reads as its first authority, ad-hoc o
     try testing.expectEqualStrings("Developer ID Application: Jane Doe (ABCDE12345)", signatureFromReport("Executable=/x\nIdentifier=x\nAuthority=Developer ID Application: Jane Doe (ABCDE12345)\nAuthority=Developer ID Certification Authority\nTeamIdentifier=ABCDE12345\n"));
     try testing.expectEqualStrings("ad-hoc", signatureFromReport("Executable=/x\nSignature=adhoc\nTeamIdentifier=not set\n"));
     try testing.expectEqualStrings("unsigned", signatureFromReport("/x: code object is not signed at all\n"));
+}
+
+test "outside plugins: /props names each plugin loaded or refused, and which a rebuild fixes" {
+    const refused = [_]Refusal{
+        .{ .path = "/h/.mlx-serve/plugins/sushi_ds41.dylib", .why = "plugin was built against another MLX: rebuild it with this release's kit", .rebuild = true },
+        .{ .path = "/h/.mlx-serve/plugins/toy.dylib", .why = "changed since it was installed (hash differs from its receipt)" },
+    };
+    const got = try statusJson(testing.allocator, &.{"turbo"}, &refused);
+    defer testing.allocator.free(got);
+    try testing.expectEqualStrings(
+        \\[{"name":"turbo","loaded":true},{"name":"sushi_ds41","loaded":false,"rebuild":true,"why":"plugin was built against another MLX: rebuild it with this release's kit"},{"name":"toy","loaded":false,"rebuild":false,"why":"changed since it was installed (hash differs from its receipt)"}]
+    , got);
+}
+
+test "outside plugins: a failed load names the plugins a rebuild would bring back" {
+    const refused = [_]Refusal{
+        .{ .path = "/p/a.dylib", .why = "x", .rebuild = true },
+        .{ .path = "/p/b.dylib", .why = "y" },
+        .{ .path = "/p/c.dylib", .why = "z", .rebuild = true },
+    };
+    const hint = (try rebuildHint(testing.allocator, &refused)).?;
+    defer testing.allocator.free(hint);
+    try testing.expectEqualStrings("Outside plugins refused at startup, built for another mlx-serve: a, c. If one of them serves this model, rebuild it in Models > Plugins", hint);
+    try testing.expectEqual(@as(?[]u8, null), try rebuildHint(testing.allocator, refused[1..2]));
 }

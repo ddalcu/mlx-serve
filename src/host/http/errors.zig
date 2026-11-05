@@ -6,6 +6,7 @@ const log = @import("../../sdk/util/log.zig");
 const Scheduler = @import("../gpu_thread/scheduler.zig").Scheduler;
 const Stream = @import("../engines/stream.zig").Stream;
 const mlx_engine = @import("../engines/mlx.zig");
+const plugin_loader = @import("../plugins/loader.zig");
 const err_name = @import("../../sdk/util/err_name.zig");
 const instr = @import("../metrics/metrics.zig");
 const testing = std.testing;
@@ -357,7 +358,9 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
 fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *Scheduler, id: []const u8) !void {
     if (mlx_engine.api().load_error_name(sched, allocator, id)) |name| {
         defer allocator.free(name);
-        if (std.fmt.allocPrint(allocator, "Model load failed: {s}", .{name}) catch null) |msg| {
+        const hint = plugin_loader.rebuildHint(allocator, plugin_loader.process.get().set.refused.items) catch null;
+        defer if (hint) |h| allocator.free(h);
+        if (std.fmt.allocPrint(allocator, "Model load failed: {s}{s}{s}", .{ name, if (hint != null) ". " else "", hint orelse "" }) catch null) |msg| {
             defer allocator.free(msg);
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
             return;

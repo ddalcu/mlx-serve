@@ -42,6 +42,8 @@ and field: [plugin-abi.md](plugin-abi.md) (generated from `src/abi/`).
   match its receipt's hash, is negotiated (`src/abi/dylib.zig`: a plugin built against another MLX is refused) and
   joins the claims (a same-name plugin replaces a built-in; higher rank wins; a built-in wins a tie). A refusal names
   the file and the reason, and the server serves on without it. A dylib is never unloaded; `--no-plugins` loads none.
+  `/props` `plugins` lists each one loaded or refused (`rebuild: true` = built for another MLX or ABI, which a rebuild
+  with this release's kit fixes; the app offers Rebuild), and a failed model load names those plugins.
   `/v1/models` marks a pack an outside plugin serves with `"plugin": "<name>"`; the app's Settings ▸ Server lists the
   receipts with a switch each (writes `plugins.json`). macOS only, never in the Mac App Store build.
 

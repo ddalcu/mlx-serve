@@ -2480,3 +2480,9 @@
 "%@ not measured yet" = "%@ 尚未测量";
 "%@ %@ tokens per second" = "%@ 每秒 %@ 个 Token";
 "Opens the usage dashboard" = "打开用量面板";
+"Rebuild all" = "全部重新构建";
+"Rebuild every plugin this mlx-serve refused as built for another version" = "重新构建所有被此 mlx-serve 拒绝的插件（它们是为其他版本构建的）";
+"This mlx-serve refused it: %@." = "此 mlx-serve 拒绝加载它：%@。";
+"Rebuild" = "重新构建";
+"Not in the catalog: rebuild it from its source with this release's kit" = "不在目录中：请用此版本的工具包从源码重新构建";
+"Needs rebuild" = "需要重新构建";

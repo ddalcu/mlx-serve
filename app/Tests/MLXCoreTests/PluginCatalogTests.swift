@@ -52,6 +52,20 @@ final class PluginCatalogTests: XCTestCase {
     }
 
     /// A dev build prints `mlx-serve 26.11.1 (fast)`: the plugin rules (kit match, requirement, agent text) read the release.
+    func testServerStatusIsReadFromProps() {
+        let props = Data(#"{"memory":{},"plugins":[{"name":"turbo","loaded":true},{"name":"sushi_ds41","loaded":false,"rebuild":true,"why":"built against another MLX"}]}"#.utf8)
+        let got = PluginCatalog.serverStatus(fromProps: props)
+        XCTAssertEqual(got["turbo"], .init(loaded: true, rebuild: false, why: ""))
+        XCTAssertEqual(got["sushi_ds41"], .init(loaded: false, rebuild: true, why: "built against another MLX"))
+        XCTAssertTrue(PluginCatalog.serverStatus(fromProps: Data(#"{"memory":{}}"#.utf8)).isEmpty, "an older server says nothing")
+    }
+
+    func testTheKitComesFromTheRunningReleasesAssets() {
+        XCTAssertEqual(PluginCatalog.kitURL(version: "26.11.2")?.absoluteString,
+                       "https://github.com/ddalcu/mlx-serve/releases/download/v26.11.2/mlx-serve-plugin-kit-26.11.2.tar.gz")
+        XCTAssertNil(PluginCatalog.kitURL(version: "26.11.2-dev"), "a version no release can carry asks for nothing")
+    }
+
     func testRunningVersionIsTheReleaseWithoutTheBuildFlavor() {
         let out = "[mem] MLX buffer-pool cap 8192 MB (was 249036 MB)\nmlx-serve 26.11.1 (fast)\nmlx 0.32.3\n"
         XCTAssertEqual(PluginCatalog.runningVersion(fromVersionOutput: out), "26.11.1")

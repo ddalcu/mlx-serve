@@ -26,11 +26,14 @@ enum PluginListing {
         case updateAvailable(String)
         case available
         case needsNewer(String)
+        /// Installed, but the server refused it as built for another mlx-serve: a rebuild with this kit loads it.
+        case needsRebuild
     }
 
     /// An installed plugin runs only when loading is on and its own switch is; an update shows only when this server
     /// can run it.
-    static func state(_ item: Item, switches: OutsidePlugins.Switches, running: String?) -> State {
+    static func state(_ item: Item, switches: OutsidePlugins.Switches, running: String?,
+                      server: [String: PluginCatalog.ServerStatus] = [:]) -> State {
         let compatible = item.entry.map { PluginCatalog.runs(on: running, requirement: $0.requiresMlxServe) } ?? true
         guard let receipt = item.receipt else {
             return compatible ? .available : .needsNewer(item.entry?.requiresMlxServe ?? "")
@@ -38,7 +41,13 @@ enum PluginListing {
         if let entry = item.entry, compatible, PluginCatalog.compare(receipt.version, entry.version) == .orderedAscending {
             return .updateAvailable(entry.version)
         }
+        if server[item.name]?.rebuild == true { return .needsRebuild }
         return switches.enabled && switches.isOn(item.name) ? .on : .off
+    }
+
+    /// The installed plugins a rebuild would bring back that the catalog can build (Rebuild all).
+    static func rebuildable(_ installed: [Item], server: [String: PluginCatalog.ServerStatus]) -> [PluginCatalog.Entry] {
+        installed.compactMap { server[$0.name]?.rebuild == true ? $0.entry : nil }
     }
 
     struct Pack: Equatable, Identifiable {
