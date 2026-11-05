@@ -196,6 +196,12 @@ fn errText(err: []const u8) []const u8 {
     return std.mem.sliceTo(err, 0);
 }
 
+/// A Mac without a Neural Engine (CI's virtual one) loads the framework, so `table()` answers, then refuses every
+/// compile with this.
+fn noAneHardware(err: []const u8) bool {
+    return std.mem.indexOf(u8, errText(err), "ANE hardware not available") != null;
+}
+
 test "plugin ane: a raw MIL program compiles, binds by name, evaluates on the ANE, and counts as resident until freed" {
     const ane = testTable() orelse return error.SkipZigTest;
     var cb: [128]u8 = undefined;
@@ -220,6 +226,7 @@ test "plugin ane: a raw MIL program compiles, binds by name, evaluates on the AN
     var err: [512]u8 = @splat(0);
     const before = ane.resident(ane.ctx);
     const p = ane.program_create(ane.ctx, "plugin-ane-test-affine", text.ptr, weights, bytes.len, 1, null, &err, err.len) orelse {
+        if (noAneHardware(&err)) return error.SkipZigTest;
         std.debug.print("program_create: {s}\n", .{errText(&err)});
         return error.TestUnexpectedResult;
     };
@@ -341,6 +348,7 @@ test "plugin ane: a SwiGLU bank gives the int8 reference, clamped by its limit a
         return error.TestUnexpectedResult;
     }
     const m = ane.bank_finish(ane.ctx, b, "plugin-ane-test-swiglu", 0, null, null, &err, err.len) orelse {
+        if (noAneHardware(&err)) return error.SkipZigTest;
         std.debug.print("bank_finish: {s}\n", .{errText(&err)});
         return error.TestUnexpectedResult;
     };

@@ -25,6 +25,8 @@ const mtpBatchedAcceptGraph = @import("mtp/batched_graph.zig").mtpBatchedAcceptG
 const mtpSerialOneToken = @import("mtp/serial.zig").mtpSerialOneToken;
 const probsAllPositions = @import("../sampling/spec_sampling.zig").probsAllPositions;
 const seedKey = @import("../sampling/lazy.zig").seedKey;
+const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
+const CommittedArgmax = @import("verify.zig").CommittedArgmax;
 const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
 const intree = @import("../plugin/intree.zig");
 const abi = @import("../../../abi/plugin.zig");
@@ -295,10 +297,15 @@ pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, com
     return round;
 }
 
+/// A sampled round's outcome: the drafts kept and the token pending after them.
+pub const Verdict = struct { accepted: u32, next_token: u32 };
+
 /// The sampled accept of a verify chunk: `verify` is `[t1, drafts...]` and `vl_g` its logits `[rows, vocab]`. Keeps each
 /// draft (a point mass) with the probability the request's filtered density gives it; the token pending after the kept
-/// prefix is the residual sample at the first reject, or the bonus draw from the last row on a full accept.
-pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32) !struct { accepted: u32, next_token: u32 } {
+/// prefix is the residual sample at the first reject, or the bonus draw from the last row on a full accept. With
+/// MLX_SERVE_KEYED_SAMPLING a keyed request takes the serial verdict instead.
+pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32) !Verdict {
+    if (env.on(.MLX_SERVE_KEYED_SAMPLING) and keyedSerial(self.sampling)) return serialVerdict(self, vl_g, verify, vocab, accepted_cap);
     const s = self.xfm.s;
     const b: u32 = @intCast(verify.len - 1);
 
@@ -376,7 +383,176 @@ pub fn stochasticVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const 
     return .{ .accepted = accepted, .next_token = next_token };
 }
 
+/// Whether a sampled request's rounds accept serially: its draws are keyed (`sampling.keyed`, its seed set), as
+/// DFlash's and MTP's `serial` arms read it.
+pub fn keyedSerial(sampling: SamplingParams) bool {
+    return sampling.keyed and sampling.temperature > 0.01 and sampling.seed != null;
+}
+
+/// MLX_SERVE_KEYED_SAMPLING's verdict: verify row i draws the keyed token at generated index G + 1 + i (t1 sits at G),
+/// a draft stays while it equals the draw before it, and the draw after the kept prefix is the next token: what serial
+/// decoding draws from the same rows' logits. The draw counter then stands where serial decoding's would.
+fn serialVerdict(self: *Generator, vl_g: mlx.mlx_array, verify: []const u32, vocab: usize, accepted_cap: u32) !Verdict {
+    const s = self.xfm.s;
+    const rows = verify.len;
+    const vshape = [_]c_int{ 1, @intCast(rows), @intCast(vocab) };
+    var vl3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vl3);
+    try mlx.check(mlx.mlx_reshape(&vl3, vl_g, &vshape, 3, s));
+    var draws = try keyedDraws(self.sampling, self.generated_ids.items.len + 1, vl3, rows, s);
+    defer draws.deinit();
+    try mlx.check(mlx.mlx_array_eval(draws.lazy()));
+    const v = serialAccept(verify[1..], try draws.ids(rows), accepted_cap);
+    self.sampling.draw = self.generated_ids.items.len + v.accepted + 2;
+    return v;
+}
+
+/// Row i of `logits` `[1, rows, V]` drawn as serial decoding draws generated index `base + i` (`sampleTokenLazy` on the
+/// row alone): `verifySerialSamples` (spec/mtp/chain.zig) without a Generator; `[1, rows]` ids.
+pub fn keyedDraws(sampling: SamplingParams, base: usize, logits: mlx.mlx_array, rows: usize, s: mlx.mlx_stream) !CommittedArgmax {
+    const vocab = mlx.getShape(logits)[2];
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (0..rows) |i| {
+        const ri: c_int = @intCast(i);
+        var row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(row);
+        try mlx.check(mlx.mlx_slice(&row, logits, &[_]c_int{ 0, ri, 0 }, 3, &[_]c_int{ 1, ri + 1, vocab }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+        var sp = sampling;
+        sp.draw = base + i;
+        const tok = sampleTokenLazy(row, sp, s);
+        defer _ = mlx.mlx_array_free(tok);
+        if (tok.ctx == null) return error.KeyedDrawFailed;
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, tok, &[_]c_int{1}, 1, s));
+        _ = mlx.mlx_vector_array_append_value(vec, flat);
+    }
+    var cat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cat);
+    try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
+    var ids32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids32);
+    try mlx.check(mlx.mlx_astype(&ids32, cat, .int32, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, ids32, &[_]c_int{ 1, @intCast(rows) }, 2, s));
+    return .{ .arr = out };
+}
+
+/// The serial accept over realized draws: `drafts` d1..dk, `draws` x0..xk (row i's draw); d(i+1) stays while it equals
+/// x(i), up to `cap` kept; the next token is the draw after the kept prefix.
+pub fn serialAccept(drafts: []const u32, draws: []const i32, cap: u32) Verdict {
+    var a: u32 = 0;
+    while (a < drafts.len and a < cap and @as(i64, drafts[a]) == @as(i64, draws[a])) a += 1;
+    return .{ .accepted = a, .next_token = @intCast(draws[a]) };
+}
+
 // ── tests ──
+
+test "keyed DSpark: the serial accept keeps drafts while they equal the draws; the next token is the draw after them" {
+    try testing.expectEqual(Verdict{ .accepted = 3, .next_token = 9 }, serialAccept(&.{ 4, 5, 6 }, &.{ 4, 5, 6, 9 }, 16));
+    try testing.expectEqual(Verdict{ .accepted = 1, .next_token = 7 }, serialAccept(&.{ 4, 5, 6 }, &.{ 4, 7, 6, 9 }, 16));
+    try testing.expectEqual(Verdict{ .accepted = 0, .next_token = 8 }, serialAccept(&.{ 4, 5 }, &.{ 8, 5, 1 }, 16));
+    // the token budget: the draw at the cap is the target's own, a kept draft's equal
+    try testing.expectEqual(Verdict{ .accepted = 2, .next_token = 6 }, serialAccept(&.{ 4, 5, 6 }, &.{ 4, 5, 6, 9 }, 2));
+    try testing.expectEqual(Verdict{ .accepted = 0, .next_token = 4 }, serialAccept(&.{ 4, 5, 6 }, &.{ 4, 5, 6, 9 }, 0));
+    // no drafts (the confidence gate's single-row round): the bonus draw
+    try testing.expectEqual(Verdict{ .accepted = 0, .next_token = 3 }, serialAccept(&.{}, &.{3}, 16));
+    // a keyed request accepts serially only when sampled and seeded
+    try testing.expect(keyedSerial(.{ .temperature = 1.0, .seed = 7, .keyed = true }));
+    try testing.expect(!keyedSerial(.{ .temperature = 1.0, .seed = 7, .keyed = false }));
+    try testing.expect(!keyedSerial(.{ .temperature = 1.0, .seed = null, .keyed = true }));
+    try testing.expect(!keyedSerial(.{ .temperature = 0.0, .seed = 7, .keyed = true }));
+}
+
+// Bit for bit over seeds, prompt positions, widths, filters and f32/bf16 rows: a verify's keyed draws are 1-row decodes'.
+test "keyed DSpark (GPU): k-row verify draws equal k sequential 1-row draws over seeds and positions" {
+    if (env.get(._GPU_WINDOW_LOCKED) == null) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const V: c_int = 129280;
+    const seeds = [_]u64{ 0, 1, 20260829, 0x9E3779B97F4A7C15, 0xFFFF_FFFF_FFFF_FFFE, 31337 };
+    const bases = [_]u64{ 0, 1, 16384, 16399, 1 << 20, 4_000_000_000 };
+    const Cfg = struct { t: f32, p: f32, k: u32, min_p: ?f32 = null };
+    const cfgs = [_]Cfg{ .{ .t = 1.0, .p = 0.95, .k = 20 }, .{ .t = 0.6, .p = 0.95, .k = 0 }, .{ .t = 1.3, .p = 1.0, .k = 0 }, .{ .t = 0.8, .p = 0.9, .k = 40, .min_p = 0.05 } };
+    const widths = [_]usize{ 1, 2, 6, 8 };
+    var flips: usize = 0;
+    var case_i: u64 = 0;
+    for (seeds) |seed| for (bases) |pb| for (cfgs) |cf| for (widths) |k| for ([_]mlx.mlx_dtype{ .float32, .bfloat16 }) |dt| {
+        case_i += 1;
+        const R: usize = k + 1;
+        // the chunk's logits: normal rows, every other one peaked (one id raised by 8 / T), in dt
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, case_i));
+        var base_l = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(base_l);
+        try mlx.check(mlx.mlx_random_normal(&base_l, &[_]c_int{ 1, @intCast(R), V }, 3, .float32, 0.0, 2.5, key, s));
+        const bump = try std.testing.allocator.alloc(f32, R * @as(usize, @intCast(V)));
+        defer std.testing.allocator.free(bump);
+        @memset(bump, 0);
+        const Vu: usize = @intCast(V);
+        for (0..R) |r| if (r % 2 == 1) {
+            const at: usize = @intCast((case_i * 7919 + @as(u64, @intCast(r)) * 104729) % @as(u64, @intCast(V)));
+            bump[r * Vu + at] = 8.0;
+        };
+        const bump_a = mlx.mlx_array_new_data(bump.ptr, &[_]c_int{ 1, @intCast(R), V }, 3, .float32);
+        defer _ = mlx.mlx_array_free(bump_a);
+        var l32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(l32);
+        try mlx.check(mlx.mlx_add(&l32, base_l, bump_a, s));
+        var chunk = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(chunk);
+        try mlx.check(mlx.mlx_astype(&chunk, l32, dt, s));
+        try mlx.check(mlx.mlx_array_eval(chunk));
+        const G: usize = @intCast(case_i % 97);
+        const sp: SamplingParams = .{ .temperature = cf.t, .top_p = cf.p, .top_k = cf.k, .min_p = cf.min_p, .seed = seed, .keyed = true, .position_base = pb };
+        // the verify's draws, as `serialVerdict` takes them
+        var draws = try keyedDraws(sp, G + 1, chunk, R, s);
+        defer draws.deinit();
+        try mlx.check(mlx.mlx_array_eval(draws.lazy()));
+        const vd = try draws.ids(R);
+        // each row on its own, as a 1-row decode's logits
+        const host = try std.testing.allocator.alloc(u8, R * @as(usize, @intCast(V)) * mlx.mlx_array_itemsize(chunk));
+        defer std.testing.allocator.free(host);
+        {
+            const p: [*]const u8 = switch (dt) {
+                .float32 => @ptrCast(mlx.mlx_array_data_float32(chunk) orelse return error.MlxArrayDataNull),
+                else => @ptrCast(mlx.mlx_array_data_bfloat16(chunk) orelse return error.MlxArrayDataNull),
+            };
+            @memcpy(host, p[0..host.len]);
+        }
+        const rb = @as(usize, @intCast(V)) * mlx.mlx_array_itemsize(chunk);
+        for (0..R) |r| {
+            const one = mlx.mlx_array_new_data(host[r * rb ..].ptr, &[_]c_int{ 1, 1, V }, 3, dt);
+            defer _ = mlx.mlx_array_free(one);
+            var sp1 = sp;
+            sp1.draw = G + 1 + r;
+            const tok = sampleTokenLazy(one, sp1, s);
+            defer _ = mlx.mlx_array_free(tok);
+            try testing.expect(tok.ctx != null);
+            var t32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(t32);
+            try mlx.check(mlx.mlx_astype(&t32, tok, .int32, s));
+            try mlx.check(mlx.mlx_array_eval(t32));
+            const x = (mlx.mlx_array_data_int32(t32) orelse return error.MlxArrayDataNull)[0];
+            if (x != vd[r]) {
+                flips += 1;
+                std.debug.print("keyed DSpark: seed {d} base {d} T {d} top_p {d} top_k {d} width {d} {s} row {d}: verify {d} vs 1-row {d}\n", .{ seed, pb, cf.t, cf.p, cf.k, k, @tagName(dt), r, vd[r], x });
+            }
+        }
+        // the accept over drafts equal to the draws up to a mismatch at j
+        var drafts: [8]u32 = undefined;
+        for (0..k + 1) |j| {
+            for (0..k) |i| drafts[i] = @intCast(vd[i]);
+            if (j < k) drafts[j] = @intCast((@as(u64, @intCast(vd[j])) + 1) % @as(u64, @intCast(V)));
+            const v = serialAccept(drafts[0..k], vd, 16);
+            try testing.expectEqual(@as(u32, @intCast(j)), v.accepted);
+            try testing.expectEqual(@as(u32, @intCast(vd[j])), v.next_token);
+        }
+    };
+    try testing.expectEqual(@as(usize, 0), flips);
+}
 
 
 test "native speculation: shared DSpark environment policy" {

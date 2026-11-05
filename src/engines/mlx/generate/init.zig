@@ -74,7 +74,9 @@ pub fn initWithOptions(
     // inherits the model's mask without per-site wiring.
     var sampling = sampling_in;
     sampling.suppress_mask = xfm.suppress_mask;
-    sampling.keyed = xfm.config.rowExactDecode() and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
+    // MLX_SERVE_KEYED_SAMPLING: every clean sampled request keyed, not only a row-exact trunk's; DSpark's stochastic
+    // arm then takes the serial verdict (spec/dspark.zig `serialVerdict`).
+    sampling.keyed = (xfm.config.rowExactDecode() or (env.on(.MLX_SERVE_KEYED_SAMPLING) and !sampling.shapesLogits())) and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
     sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
     // Spec drafts and verify rows share the serial sampler's keys (and
     // mlx-stream's lane draws from the seed), so an unseeded sampled
