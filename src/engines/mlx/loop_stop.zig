@@ -3,6 +3,8 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const generate_mod = @import("generate.zig");
+const chat_mod = @import("../../host/chat/chat.zig");
+const loop_guard = @import("../../sdk/request/loop_guard.zig");
 const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
 const testing = std.testing;
@@ -28,7 +30,7 @@ const Slot = @import("slot.zig").Slot;
 /// and compact unnecessarily. The server separately suppresses tool-call parsing
 /// for this cause, so a cut fragment cannot be promoted to a completed call.
 pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
-    const d = loopStopDecision(generated_ids) orelse return null;
+    const d = loopStopDecision(generated_ids, 1) orelse return null;
     return d.finish_reason;
 }
 
@@ -38,7 +40,7 @@ pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
 /// of the answer should end.
 pub const LoopStop = struct {
     finish_reason: []const u8 = "stop",
-    /// The `finish_details.type` value. One string for all three tiers: a
+    /// The `finish_details.type` value. One string for every tier: a
     /// client's decision ("this turn is unusable, don't feed it back") is the
     /// same whichever tier convicted, and the tier is in the log.
     finish_details: []const u8 = "repetition_loop",
@@ -46,18 +48,36 @@ pub const LoopStop = struct {
     trim_start: usize,
 };
 
-/// Pure decision + trim point. The three tiers live in generate.zig
+/// Pure decision + trim point. The tiers live in `sdk/request/loop_guard.zig`
 /// (`degenerateTail`); this is where their verdict becomes server behaviour.
-pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
-    const d = generate_mod.degenerateTail(generated_ids) orelse return null;
+pub fn loopStopDecision(generated_ids: []const u32, fresh: usize) ?LoopStop {
+    const d = generate_mod.degenerateTail(generated_ids, fresh) orelse return null;
     return .{ .tier = d.tier, .trim_start = d.start };
 }
 
 /// `loopStopDecision` for a slot: none for a request that ignores EOS, which reaches the engine as an empty EOS set
 /// (`requestEosSlice`) and runs to `max_tokens` by contract; bench clients force equal decode lengths with it.
-fn slotLoopStop(eos_token_ids: []const u32, generated_ids: []const u32) ?LoopStop {
+fn slotLoopStop(eos_token_ids: []const u32, generated_ids: []const u32, fresh: usize) ?LoopStop {
     if (eos_token_ids.len == 0) return null;
-    return loopStopDecision(generated_ids);
+    return loopStopDecision(generated_ids, fresh);
+}
+
+/// A file written through a tool can repeat one long block, and a cut drops the whole
+/// call: the recurring-span tier abstains once the answer has opened one.
+pub fn spanCutYieldsToToolCall(tier: generate_mod.DegenerateTail.Tier, has_tools: bool, text: []const u8) bool {
+    if (tier != .recurring_span or !has_tools) return false;
+    return chat_mod.trimLeakedToolMarkup(text).len < text.len;
+}
+
+/// `spanCutYieldsToToolCall` over the slot's output; an opened call stays opened.
+fn toolCallHoldsCut(slot: *Slot, gen: *Generator, tier: generate_mod.DegenerateTail.Tier) bool {
+    if (tier != .recurring_span or !slot.has_tools) return false;
+    if (slot.tool_call_opened) return true;
+    const tok = slot.model.tokenizer orelse return false;
+    const text = tok.decode(slot.allocator, gen.generated_ids.items, false) catch return false;
+    defer slot.allocator.free(text);
+    slot.tool_call_opened = spanCutYieldsToToolCall(tier, true, text);
+    return slot.tool_call_opened;
 }
 
 const LoopAction = enum { cut, close_thought };
@@ -85,7 +105,11 @@ pub fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
     const loop_guard_start = gen.loopGuardStart();
-    if (slotLoopStop(slot.eos_token_ids, gen.generated_ids.items[loop_guard_start..])) |relative_stop| {
+    const generated = gen.generated_ids.items.len;
+    const fresh = generated -| slot.loop_guard_seen;
+    slot.loop_guard_seen = generated;
+    if (slotLoopStop(slot.eos_token_ids, gen.generated_ids.items[loop_guard_start..], fresh)) |relative_stop| cut: {
+        if (toolCallHoldsCut(slot, gen, relative_stop.tier)) break :cut;
         if (gen.hasPrePayloadConstraint()) {
             switch (try gen.forceConstraintTransition(slot.allocator)) {
                 .committed => |boundary| {
@@ -184,7 +208,7 @@ test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
         try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
     }
 
-    const stop = loopStopDecision(ids.items) orelse return error.TestExpectedLoopCut;
+    const stop = loopStopDecision(ids.items, 1) orelse return error.TestExpectedLoopCut;
     try testing.expectEqualStrings("stop", stop.finish_reason);
     try testing.expectEqualStrings("repetition_loop", stop.finish_details);
     try testing.expectEqual(generate_mod.DegenerateTail.Tier.exact_cycle, stop.tier);
@@ -195,21 +219,21 @@ test "loopStopDecision: the wire reason is stop and the CAUSE rides beside it" {
     // outside the guard window and cannot stop the very next answer tick.
     try ids.append(testing.allocator, 99);
     const answer_start = ids.items.len;
-    try testing.expect(loopStopDecision(ids.items[answer_start..]) == null);
+    try testing.expect(loopStopDecision(ids.items[answer_start..], 1) == null);
 
     // A new loop wholly inside the constrained answer retains the existing
     // stop/repetition result, with an absolute trim point for response code.
     for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 });
     }
-    const answer_loop = loopStopDecision(ids.items[answer_start..]) orelse return error.TestExpectedLoopCut;
+    const answer_loop = loopStopDecision(ids.items[answer_start..], 1) orelse return error.TestExpectedLoopCut;
     try testing.expectEqualStrings("stop", answer_loop.finish_reason);
     try testing.expect(answer_loop.trim_start + answer_start >= answer_start);
 
     // Healthy output decides nothing at all — no reason, and nothing to trim.
     var healthy: [512]u32 = undefined;
     for (&healthy, 0..) |*v, i| v.* = @intCast(i);
-    try testing.expect(loopStopDecision(&healthy) == null);
+    try testing.expect(loopStopDecision(&healthy, 1) == null);
     try testing.expect(loopStopReason(&healthy) == null);
 }
 
@@ -219,9 +243,9 @@ test "slotLoopStop: a request that ignores EOS runs to its cap, every other requ
     for (0..generate_mod.degenerate_loop_min_span / 3 + 1) |_| {
         try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
     }
-    try testing.expect(slotLoopStop(&[_]u32{1}, ids.items) != null);
+    try testing.expect(slotLoopStop(&[_]u32{1}, ids.items, 1) != null);
     // `ignore_eos` reaches the engine as an empty EOS set (`requestEosSlice`): only max_tokens ends that reply.
-    try testing.expect(slotLoopStop(&.{}, ids.items) == null);
+    try testing.expect(slotLoopStop(&.{}, ids.items, 1) == null);
 }
 
 test "loopStopReason: periods past the long tier stay uncut" {
@@ -267,6 +291,30 @@ test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repe
         try healthy.appendSlice(testing.allocator, &[_]u32{ 13, 14 });
     }
     try testing.expect(loopStopReason(healthy.items) == null);
+}
+
+test "a recurring-span cut yields to an open tool call, and only that tier does" {
+    // A tool call writing records that share one long block, past the span bar.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    var value: u32 = 9000;
+    while (ids.items.len < loop_guard.near_repeat_min_span + 400) {
+        for (0..120) |i| try ids.append(testing.allocator, 500 + @as(u32, @intCast(i)));
+        for (0..10) |_| {
+            value += 1;
+            try ids.append(testing.allocator, value);
+        }
+    }
+    for (0..120) |i| try ids.append(testing.allocator, 500 + @as(u32, @intCast(i)));
+    const stop = loopStopDecision(ids.items, 1) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqual(generate_mod.DegenerateTail.Tier.recurring_span, stop.tier);
+
+    const call = "<tool_call>\n{\"name\": \"write\", \"arguments\": {\"content\": \"{\\\"id\\\": 1,";
+    try testing.expect(spanCutYieldsToToolCall(stop.tier, true, call));
+    try testing.expect(!spanCutYieldsToToolCall(stop.tier, true, "The same paragraph again."));
+    try testing.expect(!spanCutYieldsToToolCall(stop.tier, false, call));
+    try testing.expect(!spanCutYieldsToToolCall(.exact_cycle, true, call));
+    try testing.expect(!spanCutYieldsToToolCall(.near_repeat, true, call));
 }
 
 test "loop recovery: a loop inside an open think block closes the thought once" {

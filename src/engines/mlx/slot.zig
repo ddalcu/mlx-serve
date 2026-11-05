@@ -164,6 +164,10 @@ pub const Slot = struct {
     /// everything from here on is the loop. Non-streaming responses are cut
     /// here so the client cannot round-trip the loop into the next prompt.
     loop_trim_start: ?usize,
+    /// The output has opened a tool call (`loop_stop.toolCallHoldsCut`); sticky.
+    tool_call_opened: bool = false,
+    /// Generated tokens the loop guard has already seen.
+    loop_guard_seen: usize = 0,
     cancelled: std.atomic.Value(bool),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
