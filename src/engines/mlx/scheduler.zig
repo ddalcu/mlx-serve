@@ -846,6 +846,10 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
 
         // One stream pack at a time reads the process's foreign-bytes value (DeepSeek-V4.1, GLM-5.3).
         const foreign_reader = try self.registry.foreignReaderVictimLocked(entry.id, owned.config);
+        // One ds4 engine per process: an idle resident ds4 model goes first, a busy one refuses this load.
+        const incoming_ds4 = if (owned.gguf) |g| g.engine == .ds4 else false;
+        entry.ds4_route = incoming_ds4;
+        const ds4_victim = try self.registry.ds4EngineVictimLocked(entry.id, incoming_ds4);
 
         // Claim the slot.
         std.debug.assert(self.registry.tryBeginLoadLocked(entry));
@@ -870,7 +874,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         // (multi-victim). On failure — every other resident model is pinned
         // by an in-flight request — roll back and surface a 503 instead of
         // loading anyway and crashing.
-        const n = self.registry.planEvictionsLocked(entry.id, foreign_reader, &victims_buf, mlxActiveBytes()) orelse {
+        const n = self.registry.planEvictionsLocked(entry.id, foreign_reader orelse ds4_victim, &victims_buf, mlxActiveBytes()) orelse {
             // Name the numbers. A refusal that logs NOTHING sends the user
             // hunting for a concurrent request that does not exist: on an
             // idle server the cause is always the static cap (#126), and

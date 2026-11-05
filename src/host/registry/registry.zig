@@ -247,6 +247,9 @@ pub const LoadedModel = struct {
     /// An engine beside MLX serving this model (ds4 or llama.cpp for a GGUF, the Neural Engine for an MLX pack;
     /// `host/engines/`): the MLX fields stay null. A GGUF's tokenizer and template are the engine's.
     engine: ?*Served = null,
+    /// This load claims the process's ds4 engine; retained through eviction. Loading claims set it before
+    /// native open; publication derives it from the opened engine, including eager startup loads.
+    ds4_route: bool = false,
     /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
@@ -488,7 +491,6 @@ pub const LoadedModel = struct {
             self.tokenize_cache = null;
         }
     }
-
 };
 
 /// Snapshot of a single entry, returned by `ModelRegistry.snapshot` for
@@ -1099,6 +1101,24 @@ pub const ModelRegistry = struct {
         return null;
     }
 
+    /// ds4 has process-wide model globals and exits on a second open. Evict an idle owner; refuse another load
+    /// while that owner is busy, loading or evicting.
+    pub fn ds4EngineVictimLocked(self: *ModelRegistry, exclude_id: []const u8, incoming_ds4: bool) error{Ds4EngineBusy}!?*LoadedModel {
+        if (!incoming_ds4) return null;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (std.mem.eql(u8, entry.id, exclude_id) or !entry.ds4_route) continue;
+            if (entry.state != .ready and entry.state != .loading and entry.state != .evicting) continue;
+            if (entry.state != .ready or entry.refcount.load(.acquire) != 0) {
+                log.err("{s}: refused: {s} holds the process ds4 engine and is busy\n", .{ exclude_id, entry.id });
+                return error.Ds4EngineBusy;
+            }
+            return entry;
+        }
+        return null;
+    }
+
     /// Release a borrowed pointer obtained from `ensureLoaded`. Decrements
     /// the refcount and bumps `last_used_ns` so LRU picks an older entry
     /// over this one next. Wakes anyone waiting on eviction.
@@ -1194,6 +1214,7 @@ pub const ModelRegistry = struct {
         self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         generations().last_unload.consume(bytes_resident);
+        entry.ds4_route = if (entry.engine) |engine| engine.kind == .ds4 else false;
         entry.state = .ready;
         entry.error_name = null;
         self.lru_clock += 1;
@@ -2554,6 +2575,80 @@ test "ModelRegistry: registerByPath registers under the caller's org/name id" {
     try testing.expect(reg.peek("org/name") != null);
     try testing.expectEqualStrings(id, try reg.registerByPath(io, path, "org/name"));
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
+}
+
+test "ModelRegistry: a second ds4 GGUF unloads an idle ds4 model and is refused by a busy one" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const first = try makeReadyStub(reg, "first-gguf", 180_000_000_000);
+    first.ds4_route = true;
+    const plain = try makeReadyStub(reg, "plain", 20_000_000_000);
+    const second = try beginLoad(reg, "second-gguf", 100);
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    // A load that does not open ds4 is unaffected; a reload of the same id is not a second engine.
+    try testing.expect(try reg.ds4EngineVictimLocked("plain", false) == null);
+    try testing.expect(try reg.ds4EngineVictimLocked("first-gguf", true) == null);
+    // Busy: refused, nothing marked.
+    _ = first.refcount.fetchAdd(1, .acq_rel);
+    try testing.expectError(error.Ds4EngineBusy, reg.ds4EngineVictimLocked("second-gguf", true));
+    try testing.expectEqual(LoadState.ready, first.state);
+    try testing.expectEqual(LoadState.ready, plain.state);
+    first.refcount.store(0, .release);
+    // Idle: the plan evicts it although both caps hold.
+    const victim = (try reg.ds4EngineVictimLocked("second-gguf", true)).?;
+    try testing.expectEqualStrings("first-gguf", victim.id);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(second.id, victim, &buf, 0));
+    try testing.expectEqual(LoadState.evicting, first.state);
+    try testing.expectEqual(LoadState.ready, plain.state);
+    reg.unmarkEvictingLocked(first);
+    reg.markUnloadedLocked(second);
+}
+
+test "ModelRegistry: a second ds4 GGUF is refused while the owner is loading or evicting" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const first = try makeReadyStub(reg, "first-gguf", 100);
+    first.ds4_route = true;
+    const second = try reg.registerStub("second-gguf", "/second-gguf", 100);
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    for ([_]LoadState{ .loading, .evicting }) |state| {
+        first.state = state;
+        try testing.expectError(error.Ds4EngineBusy, reg.ds4EngineVictimLocked(second.id, true));
+        try testing.expectEqual(state, first.state);
+        try testing.expectEqual(LoadState.unloaded, second.state);
+        try testing.expect(try reg.ds4EngineVictimLocked(second.id, false) == null);
+    }
+    first.state = .ready;
+    try testing.expectEqual(first, (try reg.ds4EngineVictimLocked(second.id, true)).?);
+    reg.markUnloadedLocked(first);
+    try testing.expect(try reg.ds4EngineVictimLocked(second.id, true) == null);
+}
+
+test "ModelRegistry: ds4 ownership follows the published native engine including eager loads" {
+    const reg = try ModelRegistry.init(testing.allocator, testing.io, null, 3, 0, null);
+    defer reg.deinit();
+    const first = try reg.registerStub("first-gguf", "/first-gguf", 100);
+    var engine: Served = undefined;
+    engine.kind = .ds4;
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try testing.expect(reg.tryBeginLoadLocked(first));
+    try testing.expect(!first.ds4_route);
+    first.engine = &engine;
+    defer first.engine = null;
+    reg.markReadyLocked(first, 100);
+    try testing.expect(first.ds4_route);
+    try testing.expectEqual(first, (try reg.ds4EngineVictimLocked("second-gguf", true)).?);
+    reg.markUnloadedLocked(first);
+    try testing.expect(reg.tryBeginLoadLocked(first));
+    engine.kind = .llama;
+    reg.markReadyLocked(first, 100);
+    try testing.expect(!first.ds4_route);
+    try testing.expect(try reg.ds4EngineVictimLocked("second-gguf", true) == null);
 }
 
 test "ModelRegistry: a second stream pack that reads the foreign bytes unloads an idle one and is refused by a busy one" {
