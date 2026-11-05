@@ -140,6 +140,7 @@ const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
 const pleTableBill = @import("runtime/preflight.zig").pleTableBill;
 const residentModelDiskBytes = @import("runtime/preflight.zig").residentModelDiskBytes;
 const residentGateBytes = @import("runtime/preflight.zig").residentGateBytes;
+const ggufGateBytes = @import("runtime/preflight.zig").ggufGateBytes;
 pub const loadRequirementBytes = @import("runtime/preflight.zig").loadRequirementBytes;
 
 test {
@@ -810,7 +811,8 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         }
     else
         null;
-    const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
+    const discovered_bytes = if (owned.gguf) |g| ggufGateBytes(entry.bytes_on_disk, g.disk_only_bytes) else entry.bytes_on_disk;
+    const resident_model_bytes = residentGateBytes(validated_model_bytes, discovered_bytes, mlx_text);
     // A Neural Engine load holds int8 copies of the pack's 4- to 8-bit weights, and its KV.
     const ane_bytes: ?u64 = if (mlx_text and engines_served.aneWanted(owned.config, self.ane))
         engines_load.aneBytes(self.allocator, entry.path, self.ane_slots)

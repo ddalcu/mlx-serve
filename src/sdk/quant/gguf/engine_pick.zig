@@ -37,7 +37,14 @@ pub const Engine = enum { ds4, llama };
 pub const Route = struct {
     path: []const u8,
     engine: Engine,
+    disk_only_bytes: u64 = 0,
 };
+
+pub fn ds4DiskOnlyBytes(io: std.Io, allocator: std.mem.Allocator, path: []const u8) u64 {
+    var info = readFromFile(io, allocator, path) catch return 0;
+    defer info.deinit(allocator);
+    return info.ds4_disk_only_bytes;
+}
 
 pub const Info = struct {
     /// Owned dupe of `general.architecture` value; null if the key was
@@ -55,6 +62,8 @@ pub const Info = struct {
     split_count: u32 = 1,
     /// `<arch>.context_length`: the window the checkpoint was trained for; 0 when absent.
     context_length: u32 = 0,
+    /// BF16 n-gram tensor bytes that ds4 reads from disk rather than mapping.
+    ds4_disk_only_bytes: u64 = 0,
 
     pub fn deinit(self: *Info, allocator: std.mem.Allocator) void {
         if (self.architecture) |a| allocator.free(a);
@@ -179,7 +188,11 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     }
 
     if (info.architecture) |a| {
-        if (std.mem.eql(u8, a, "qwen4exp")) info.ds4_unloadable = try scanDs4Unloadable(r, tensor_count);
+        if (std.mem.eql(u8, a, "qwen4exp")) {
+            const tensors = try scanDs4Tensors(r, tensor_count);
+            info.ds4_unloadable = tensors.unloadable;
+            info.ds4_disk_only_bytes = tensors.disk_only_bytes;
+        }
     }
     if (info.embedded_mtp) info.embedded_mtp = for (ds4_embedded_mtp_archs) |d| {
         if (info.architecture != null and std.mem.eql(u8, info.architecture.?, d)) break true;
@@ -187,9 +200,11 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     return info;
 }
 
-/// Walk the tensor infos that follow the KVs; true at the first tensor ds4
-/// would reject for a qwen4exp model.
-fn scanDs4Unloadable(r: *std.Io.Reader, tensor_count: u64) Error!bool {
+const Ds4Tensors = struct { unloadable: bool = false, disk_only_bytes: u64 = 0 };
+
+/// ds4 unmaps Qwen's trailing BF16 n-gram table and reads its rows from disk.
+fn scanDs4Tensors(r: *std.Io.Reader, tensor_count: u64) Error!Ds4Tensors {
+    var out: Ds4Tensors = .{};
     var i: u64 = 0;
     while (i < tensor_count) : (i += 1) {
         const name_len = takeIntT(r, u64) catch return error.Truncated;
@@ -197,13 +212,17 @@ fn scanDs4Unloadable(r: *std.Io.Reader, tensor_count: u64) Error!bool {
         const is_ngrams = std.mem.eql(u8, takeBytes(r, @intCast(name_len)) catch return error.Truncated, "per_layer_token_embd.weight");
         const n_dims = takeIntT(r, u32) catch return error.Truncated;
         if (n_dims > GGML_MAX_DIMS) return error.Truncated;
-        r.discardAll64(@as(u64, n_dims) * 8) catch return error.Truncated;
+        var elements: u64 = 1;
+        for (0..n_dims) |_| elements = std.math.mul(u64, elements, takeIntT(r, u64) catch return error.Truncated) catch return error.Truncated;
         const ty = takeIntT(r, u32) catch return error.Truncated;
         _ = takeIntT(r, u64) catch return error.Truncated; // offset
-        if (std.mem.indexOfScalar(u32, &ds4_qwen_tensor_types, ty) == null) return true;
-        if (is_ngrams and ty != GGML_TYPE_BF16) return true;
+        if (std.mem.indexOfScalar(u32, &ds4_qwen_tensor_types, ty) == null or (is_ngrams and ty != GGML_TYPE_BF16)) {
+            out.unloadable = true;
+            return out;
+        }
+        if (is_ngrams) out.disk_only_bytes = std.math.mul(u64, elements, @sizeOf(u16)) catch return error.Truncated;
     }
-    return false;
+    return out;
 }
 
 /// True when the header names a pooling type (`<arch>.pooling_type` > 0), llama.cpp's
@@ -361,15 +380,15 @@ fn appendStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u
     try buf.appendSlice(allocator, s);
 }
 
-const TensorInfo = struct { name: []const u8, ggml_type: u32 };
+pub const TensorInfo = struct { name: []const u8, ggml_type: u32, dims: []const u64 = &.{ 640, 2560 } };
 
 /// Build a minimal but valid GGUF v3 header from a KV list, with no tensors.
 pub fn buildHeader(allocator: std.mem.Allocator, kvs: []const KV) ![]u8 {
     return buildHeaderWithTensors(allocator, kvs, &.{});
 }
 
-/// GGUF v3 header followed by tensor infos (2-D, offset 0); no tensor data.
-fn buildHeaderWithTensors(allocator: std.mem.Allocator, kvs: []const KV, tensors: []const TensorInfo) ![]u8 {
+/// GGUF v3 header followed by tensor infos (offset 0); no tensor data.
+pub fn buildHeaderWithTensors(allocator: std.mem.Allocator, kvs: []const KV, tensors: []const TensorInfo) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "GGUF");
@@ -401,9 +420,8 @@ fn buildHeaderWithTensors(allocator: std.mem.Allocator, kvs: []const KV, tensors
     }
     for (tensors) |t| {
         try appendStr(&buf, allocator, t.name);
-        try appendU32(&buf, allocator, 2); // n_dims
-        try appendU64(&buf, allocator, 640);
-        try appendU64(&buf, allocator, 2560);
+        try appendU32(&buf, allocator, @intCast(t.dims.len));
+        for (t.dims) |dim| try appendU64(&buf, allocator, dim);
         try appendU32(&buf, allocator, t.ggml_type);
         try appendU64(&buf, allocator, 0); // offset
     }
@@ -527,6 +545,24 @@ test "preferredEngine: qwen4exp routes by tensor types ds4 can load" {
         var info = try parseBytes(testing.allocator, c.bytes);
         defer info.deinit(testing.allocator);
         try testing.expectEqual(c.want, preferredEngine(info));
+    }
+}
+
+test "GGUF accounting: only ds4 Qwen BF16 n-grams are excluded from resident weights" {
+    const cases = [_]struct { arch: []const u8, ty: u32, disk_bytes: u64 }{
+        .{ .arch = "qwen4exp", .ty = 30, .disk_bytes = 160 * 1024 * 2 },
+        .{ .arch = "glm5-next", .ty = 30, .disk_bytes = 0 },
+        .{ .arch = "qwen4exp", .ty = 1, .disk_bytes = 0 },
+    };
+    for (cases) |c| {
+        const header = try buildHeaderWithTensors(testing.allocator, &.{.{ .key = "general.architecture", .value = .{ .str = c.arch } }}, &.{
+            .{ .name = "blk.0.ffn_down_exps.weight", .ggml_type = 12 },
+            .{ .name = "per_layer_token_embd.weight", .ggml_type = c.ty, .dims = &.{ 160, 1024 } },
+        });
+        defer testing.allocator.free(header);
+        var info = try parseBytes(testing.allocator, header);
+        defer info.deinit(testing.allocator);
+        try testing.expectEqual(c.disk_bytes, info.ds4_disk_only_bytes);
     }
 }
 

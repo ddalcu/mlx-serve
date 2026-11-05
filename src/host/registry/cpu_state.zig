@@ -16,6 +16,27 @@ const ChatConfig = chat_mod.ChatConfig;
 const GgufRoute = @import("../../sdk/quant/gguf/engine_pick.zig").Route;
 const served = @import("../engines/served.zig");
 
+test "GGUF accounting: only ds4 routes discount their disk-only tensors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = try gguf_meta.buildHeaderWithTensors(a, &.{.{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } }}, &.{
+        .{ .name = "per_layer_token_embd.weight", .ggml_type = 30, .dims = &.{ 160, 1024 } },
+    });
+    defer a.free(header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = header });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    for ([_]gguf_meta.Engine{ .ds4, .llama }) |engine| {
+        var state = try preloadGgufCpuState(a, io, root, 0, engine);
+        defer freeCpuState(a, &state);
+        defer a.free(state.gguf.?.path);
+        try std.testing.expectEqual(engine, state.gguf.?.engine);
+        try std.testing.expectEqual(@as(u64, if (engine == .ds4) 160 * 1024 * 2 else 0), state.gguf.?.disk_only_bytes);
+    }
+}
+
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
 /// (CPU only — file I/O + parse, no mlx) ahead of posting a LoadRequest.
 /// Ownership transfers to the entry on successful load; on failure the
@@ -114,7 +135,7 @@ fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
 
     const engine = served.ggufEngine(io, allocator, gguf_path, forced);
     var state = try buildGgufStubCpuState(allocator, engine, ctx_size);
-    state.gguf = .{ .path = gguf_path, .engine = engine };
+    state.gguf = .{ .path = gguf_path, .engine = engine, .disk_only_bytes = if (engine == .ds4) gguf_meta.ds4DiskOnlyBytes(io, allocator, gguf_path) else 0 };
     return state;
 }
 
