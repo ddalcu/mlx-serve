@@ -60,6 +60,22 @@ final class PluginListingTests: XCTestCase {
         XCTAssertEqual(PluginListing.packs(turbo).last?.text, "bare text (not a repo)")
     }
 
+    func testAPackOnABranchIsThatRepoAtThatBranch() {
+        let exl3 = PluginCatalog.Entry(name: "turboexl3_qwen38", kind: "model", version: "0.1.0", models: [
+            "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3@2.05bpw)",
+            "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3)",
+            "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3, branch 2.05bpw)",
+            "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-exl3@)"])
+        let packs = PluginListing.packs(exl3)
+        XCTAssertEqual(packs[0], .init(text: "qwen4_exp with a trunk_quant block", repo: "OpensourceWTF/Qwen3.8-Flash-Next-exl3", revision: "2.05bpw"))
+        XCTAssertEqual(packs[0].source?.localRepoId, "OpensourceWTF/Qwen3.8-Flash-Next-exl3-2.05bpw", "it downloads into the branch's folder")
+        XCTAssertEqual(packs[1], .init(text: "qwen4_exp with a trunk_quant block", repo: "OpensourceWTF/Qwen3.8-Flash-Next-exl3"))
+        XCTAssertEqual(packs[1].source?.localRepoId, "OpensourceWTF/Qwen3.8-Flash-Next-exl3")
+        XCTAssertNil(packs[2].repo, "prose in the parentheses names no pack")
+        XCTAssertNil(packs[3].repo, "an empty revision names no pack")
+        XCTAssertEqual(Set(packs.map(\.id)).count, 4)
+    }
+
     func testPacksSharingADescriptionStillGetOneIdEach() {
         let exl3 = PluginCatalog.Entry(name: "turboexl3_qwen38", kind: "model", version: "0.1.0", models: [
             "qwen4_exp with a trunk_quant block (OpensourceWTF/Qwen3.8-Flash-Next-EXL3-2.05-mlx-serve)",

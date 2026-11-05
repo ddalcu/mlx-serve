@@ -53,7 +53,9 @@ enum PluginListing {
     struct Pack: Equatable, Identifiable {
         let text: String
         let repo: String?
-        var id: String { repo ?? text }
+        var revision = "main"
+        var source: HFSource? { repo.map { HFSource(repo: $0, revision: revision) } }
+        var id: String { source?.localRepoId ?? text }
     }
 
     /// A catalog `models` line, `<what> (<org>/<name>)`: the trailing parentheses are a repo only in that shape.
