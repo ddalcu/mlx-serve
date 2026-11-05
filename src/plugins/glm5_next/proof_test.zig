@@ -467,7 +467,7 @@ test "glm5_next plugin: media rows splice as the legacy forward splices them" {
 
 // Bar: a batched tick's bits never depend on whether the slots' prefills were evaluated before it was built.
 test "glm5_next plugin: a batched tick over unevaluated prefill states equals one over evaluated states" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), null);

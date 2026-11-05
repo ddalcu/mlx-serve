@@ -163,6 +163,18 @@ binary. Cause: `openDirAbsolute("")` asserts, the assert is `unreachable`, and t
 branch. Fix: guard every absolute-path open against empty or relative input. When ReleaseFast and Debug disagree on
 control flow, build Debug to locate the UB.
 
+### A shell variable never reached `zig build test` after the first run
+Defect: `MLX_SERVE_TAPE_RECORD=<dir> zig build test` recorded nothing, while the same test binary run directly did.
+Cause: Zig 0.17 caches the configuration, and a Run step given any env var (`MLX_SERVE_TEST_SHARD`) copies the whole
+configure-time environment into it, so every env-gated test (tapes, `*_TEST_MODEL`) saw the environment of the last
+reconfigure. Fix: the test graph poisons the configuration cache (~0.5 s a build). Guard:
+`tests/test_build_env_reaches_tests.sh`.
+
+### An f32 reference on M5 is a TF32 reference
+Defect: the dsv41 tensor-parallel test failed only on M5 (whole vs two ranks off by 5e-3 of peak at 520 rows). Cause:
+MLX runs f32 matmuls and quantized matmuls as TF32 on a NAX GPU (`MLX_ENABLE_TF32`, on by default): a 10-bit
+mantissa; `MLX_ENABLE_TF32=0` brought it to 9e-5. Fix: an f32 bound on a NAX GPU allows TF32 (`device.naxAvailable()`).
+
 ### `mlx_array_new_data` copies shape-worth of bytes
 Defect: a guard-page test read past a buffer. Cause: `mlx_array_new_data` copies as many bytes as the shape implies
 from the pointer it is given. Fix: size the source to the shape.

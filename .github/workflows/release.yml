@@ -242,7 +242,8 @@ jobs:
         # PR commits already run the identical suite in ci.yml — don't pay for
         # it twice.
         if: github.event_name != 'pull_request' && steps.ci_passed.outputs.passed != '1'
-        run: zig build test --summary all
+        # 8 shards: the default sizes them by RAM for GPU tests, which this virtual GPU skips.
+        run: zig build test --summary all -Dtest-shards=8
 
       - name: Plugin kit end to end
         run: bash tests/test_plugin_kit.sh

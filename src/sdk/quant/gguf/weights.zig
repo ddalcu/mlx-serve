@@ -84,21 +84,54 @@ pub fn dsparkResidentBytes(f: *const gguf.File, hp: arch_mod.deepseek41.Hparams)
 /// A DeepSeek-V4.1 set's vision tower GGUF (arch/deepseek41.zig `Vision`, `mapVisionTensor`) into `out` beside the
 /// trunk `hp`, its floats as stored.
 pub fn loadVision(allocator: std.mem.Allocator, f: *const gguf.File, hp: arch_mod.deepseek41.Hparams, out: *WeightMap, s: mlx.mlx_stream) !void {
-    _ = try arch_mod.deepseek41.Vision.read(f, hp, null);
+    const vis = try arch_mod.deepseek41.Vision.read(f, hp, null);
     const arch: Arch = .{ .deepseek41 = hp };
+    var buf: [96]u8 = undefined;
     var it = f.tensors.iterator();
     while (it.next()) |e| {
-        const mapped = arch_mod.deepseek41.mapVisionTensor(e.key_ptr.*) orelse return error.UnsupportedTensor;
+        const mapped = arch_mod.deepseek41.mapVisionTensor(&buf, e.key_ptr.*) orelse return error.UnsupportedTensor;
         try loadTensor(allocator, f, e.key_ptr.*, e.value_ptr.*, mapped, arch, arch.gdn(), true, out, s);
     }
+    try joinMmproj(allocator, out, vis.layers, s);
+}
+
+/// An mmproj's tower in the release's layout: each block's gate and up as one `mlp.w1` (gate rows, then up), and the
+/// patch conv `[out, 3, p, p]` as the `[out, 3*p*p]` linear the tower reads (channel, row, column: its pixel order).
+fn joinMmproj(allocator: std.mem.Allocator, out: *WeightMap, layers: u32, s: mlx.mlx_stream) !void {
+    var nb: [96]u8 = undefined;
+    for (0..layers) |i| {
+        const g = out.fetchRemove(std.fmt.bufPrint(&nb, "vision.blocks.{d}.mlp.w1_gate.weight", .{i}) catch unreachable) orelse continue;
+        defer allocator.free(g.key);
+        defer _ = mlx.mlx_array_free(g.value);
+        const u = out.fetchRemove(std.fmt.bufPrint(&nb, "vision.blocks.{d}.mlp.w1_up.weight", .{i}) catch unreachable) orelse return error.UnsupportedTensor;
+        defer allocator.free(u.key);
+        defer _ = mlx.mlx_array_free(u.value);
+        const parts = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(parts);
+        _ = mlx.mlx_vector_array_append_value(parts, g.value);
+        _ = mlx.mlx_vector_array_append_value(parts, u.value);
+        var joined = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&joined, parts, 0, s));
+        try mlx.check(mlx.mlx_array_eval(joined));
+        try put(allocator, out, std.fmt.bufPrint(&nb, "vision.blocks.{d}.mlp.w1.weight", .{i}) catch unreachable, joined);
+    }
+    const patch = out.getPtr("vision.patch_embed.proj.weight") orelse return;
+    if (mlx.mlx_array_ndim(patch.*) != 4) return;
+    const rows: c_int = mlx.mlx_array_shape(patch.*)[0];
+    var flat = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&flat, patch.*, &[_]c_int{ rows, -1 }, 2, s));
+    try mlx.check(mlx.mlx_array_eval(flat));
+    _ = mlx.mlx_array_free(patch.*);
+    patch.* = flat;
 }
 
 /// `residentBytes` of a vision tower GGUF (`loadVision`).
 pub fn visionResidentBytes(f: *const gguf.File, hp: arch_mod.deepseek41.Hparams) !u64 {
     _ = try arch_mod.deepseek41.Vision.read(f, hp, null);
     var total: u64 = 0;
+    var buf: [96]u8 = undefined;
     for (f.tensors.keys(), f.tensors.values()) |name, t| {
-        if (arch_mod.deepseek41.mapVisionTensor(name) == null) return error.UnsupportedTensor;
+        if (arch_mod.deepseek41.mapVisionTensor(&buf, name) == null) return error.UnsupportedTensor;
         total += loadedBytes(t, false);
     }
     return total;
@@ -782,6 +815,36 @@ fn loadFloat(allocator: std.mem.Allocator, t: gguf.Tensor, transform: arch_mod.T
     try mlx.check(mlx.mlx_astype(&out, raw, .bfloat16, s));
     try mlx.check(mlx.mlx_array_eval(out));
     return out;
+}
+
+test "an mmproj's gate and up join gate-first into mlp.w1, and its 4-D patch conv flattens to the tower's linear" {
+    const a = std.testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var map = WeightMap.init(a);
+    defer {
+        var it = map.iterator();
+        while (it.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            a.free(e.key_ptr.*);
+        }
+        map.deinit();
+    }
+    const gate = [_]f32{ 1, 2, 3, 4 };
+    const up = [_]f32{ 5, 6, 7, 8 };
+    try put(a, &map, "vision.blocks.0.mlp.w1_gate.weight", mlx.mlx_array_new_data(&gate, &[_]c_int{ 2, 2 }, 2, .float32));
+    try put(a, &map, "vision.blocks.0.mlp.w1_up.weight", mlx.mlx_array_new_data(&up, &[_]c_int{ 2, 2 }, 2, .float32));
+    var px: [2 * 3 * 2 * 2]f32 = undefined;
+    for (&px, 0..) |*v, i| v.* = @floatFromInt(i);
+    try put(a, &map, "vision.patch_embed.proj.weight", mlx.mlx_array_new_data(&px, &[_]c_int{ 2, 3, 2, 2 }, 4, .float32));
+    try joinMmproj(a, &map, 1, s);
+    try std.testing.expect(map.get("vision.blocks.0.mlp.w1_gate.weight") == null and map.get("vision.blocks.0.mlp.w1_up.weight") == null);
+    const w1 = map.get("vision.blocks.0.mlp.w1.weight").?;
+    try std.testing.expectEqualSlices(c_int, &.{ 4, 2 }, mlx.mlx_array_shape(w1)[0..2]);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, mlx.mlx_array_data_float32(w1).?[0..8]);
+    const p = map.get("vision.patch_embed.proj.weight").?;
+    try std.testing.expectEqualSlices(c_int, &.{ 2, 12 }, mlx.mlx_array_shape(p)[0..2]);
+    try std.testing.expectEqualSlices(f32, px[0..], mlx.mlx_array_data_float32(p).?[0..24]);
 }
 
 test "Nemotron-H's and Flash Next's A_log narrow to bf16 for their fused kernels, other A_log stay f32" {
