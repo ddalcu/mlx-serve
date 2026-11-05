@@ -66,7 +66,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             .decide = null,
             .tokenize = tokenize,
             .token_bytes = tokenBytes,
-            .chat_template = null,
+            .chat_template = chatTemplate,
             .render = render,
         };
 
@@ -80,6 +80,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             eos: []u32,
             tokens: TokenTable,
             file_bytes: u64,
+            template: []const u8,
             thread: std.Thread = undefined,
             startup_buf: [96]u8 = undefined,
         };
@@ -91,6 +92,27 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         fn fileBytes(path: []const u8) u64 {
             const st = std.Io.Dir.cwd().statFile(io, path, .{}) catch return 0;
             return st.size;
+        }
+
+        /// What the GGUF header says about the open: its trained window and whether
+        /// ds4's own encoder is the chat format (DeepSeek-V4's DSML) rather than the template the GGUF ships.
+        const Meta = struct { trained: u32 = 0, ds4_encodes: bool = true };
+
+        fn ggufMeta(path: []const u8) Meta {
+            var info = engine_pick.readFromFile(io, gpa, path) catch return .{};
+            defer info.deinit(gpa);
+            const arch = info.architecture orelse "";
+            return .{
+                .trained = info.context_length,
+                .ds4_encodes = std.mem.eql(u8, arch, "deepseek4") or std.mem.eql(u8, arch, "deepseek41"),
+            };
+        }
+
+        /// The GGUF's template for the host's Jinja: its native tool and reasoning format. Empty when ds4 encodes
+        /// the chat itself or the GGUF ships none.
+        fn hostTemplate(path: []const u8, meta: Meta) []const u8 {
+            if (meta.ds4_encodes) return &.{};
+            return (engine_pick.readChatTemplate(io, gpa, path) catch null) orelse &.{};
         }
 
         /// The GGUF and ds4's own estimate of the session's KV and scratch.
@@ -124,6 +146,9 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
         fn openOrError(o: *const abi.Open, info: *abi.Info) !*State {
             const path = abi.items(u8, o.model_dir);
             const flags = parseFlags(abi.items(u8, o.settings_json)) catch return error.InvalidSettings;
+            const meta = ggufMeta(path);
+            const template = hostTemplate(path, meta);
+            errdefer gpa.free(template);
             const engine = try load.open(B, io, gpa, path, flags);
             errdefer engine.close();
             var ctx = askedContext(o);
@@ -153,7 +178,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                     .logit_bias = true,
                     .logprobs = true,
                     .owns_tokenizer = true,
-                    .owns_template = true,
+                    .owns_template = template.len == 0,
                     .drafts = engine.mtpDraftTokens() > 1,
                     .prefix_cache = true,
                 },
@@ -162,6 +187,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
                 .eos = try eos.toOwnedSlice(gpa),
                 .tokens = tokens,
                 .file_bytes = fileBytes(path),
+                .template = template,
             };
             errdefer gpa.free(st.eos);
             st.thread = try std.Thread.spawn(.{}, work, .{st});
@@ -188,6 +214,7 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
             st.book.deinit();
             st.tokens.deinit(gpa);
             gpa.free(st.eos);
+            gpa.free(st.template);
             st.session.free();
             st.engine.close();
             gpa.destroy(st);
@@ -217,10 +244,19 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
 
         fn tokenize(e: *anyopaque, text: abi.Str, _: bool, out: [*]u32, cap: usize) callconv(.c) usize {
             const st = state(e);
-            const ids = st.engine.tokenizeText(gpa, abi.items(u8, text)) catch return 0;
+            // The host renders through the GGUF's template: its special tokens must map to their ids.
+            const ids = (if (st.template.len > 0)
+                st.engine.tokenizeRenderedChat(gpa, abi.items(u8, text))
+            else
+                st.engine.tokenizeText(gpa, abi.items(u8, text))) catch return 0;
             defer gpa.free(ids);
             for (ids[0..@min(ids.len, cap)], 0..) |t, i| out[i] = @intCast(t);
             return ids.len;
+        }
+
+        /// The GGUF's template when the host renders (`Caps.owns_template` false); empty when ds4 encodes the chat.
+        fn chatTemplate(e: *anyopaque) callconv(.c) abi.Str {
+            return abi.span(u8, state(e).template);
         }
 
         fn tokenBytes(e: *anyopaque, token: u32) callconv(.c) abi.Str {
@@ -395,6 +431,11 @@ const FakeBridge = struct {
             for (text, ids) |c, *id| id.* = c;
             return ids;
         }
+        pub fn tokenizeRenderedChat(_: *Ds4Engine, a: std.mem.Allocator, text: []const u8) ![]i32 {
+            const ids = try a.alloc(i32, text.len);
+            for (text, ids) |c, *id| id.* = @as(i32, c) + 1000;
+            return ids;
+        }
         pub fn detokenizeOne(_: *Ds4Engine, a: std.mem.Allocator, id: i32) ![]u8 {
             return std.fmt.allocPrint(a, "<{d}>", .{id});
         }
@@ -548,6 +589,64 @@ test "ds4 adapter: an unset context opens the checkpoint's trained window, ds4's
 test "ds4 adapter: an explicit context is the session, never the trained window or a silent fallback" {
     try testing.expectEqual(@as(?u32, 65536), try openedContext(262144, 65536));
     try testing.expectEqual(@as(?u32, null), try openedContext(262144, 2 * FakeBridge.session_cap));
+}
+
+/// A ds4-routed GGUF of `arch` in `tmp`, declaring `template` as its chat template when set.
+fn archGguf(tmp: *std.testing.TmpDir, buf: []u8, arch: []const u8, template: ?[]const u8) ![]const u8 {
+    const kvs = [_]engine_pick.KV{
+        .{ .key = "general.architecture", .value = .{ .str = arch } },
+        .{ .key = "deepseek4.attention.output_lora_rank", .value = .{ .u32_v = 1024 } },
+        .{ .key = "tokenizer.chat_template", .value = .{ .str = template orelse "" } },
+    };
+    const header = try engine_pick.buildHeader(testing.allocator, if (template != null) &kvs else kvs[0..2]);
+    defer testing.allocator.free(header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.gguf", .data = header });
+    var root: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = root[0..try tmp.dir.realPath(io, &root)];
+    return std.fmt.bufPrint(buf, "{s}/m.gguf", .{dir});
+}
+
+const Rendering = struct { host_renders: bool, template: []const u8, first_token: u32 };
+
+/// Who renders a chat for a GGUF of `arch` with `template`, and how the adapter tokenizes "a".
+fn rendering(arch: []const u8, template: ?[]const u8, tbuf: []u8) !Rendering {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try archGguf(&tmp, &buf, arch, template);
+    var host: abi.Host = .{ .ctx = undefined, .log = struct {
+        fn f(_: *anyopaque, _: u8, _: abi.Str) callconv(.c) void {}
+    }.f, .wake = struct {
+        fn f(_: *anyopaque) callconv(.c) void {}
+    }.f };
+    const o: abi.Open = .{ .model_dir = abi.span(u8, path), .model_type = .{}, .config_json = .{}, .context = 4096, .max_concurrent = 1, .memory_budget = 0, .settings_json = .{}, .options_json = .{}, .host = &host };
+    var info: abi.Info = undefined;
+    var v: abi.Verdict = .{};
+    const e = Fake.table.open(&o, &info, &v) orelse return error.Open;
+    defer Fake.table.close(e);
+    const chat_template = Fake.table.chat_template orelse return error.NoChatTemplate;
+    const t = abi.items(u8, chat_template(e));
+    @memcpy(tbuf[0..t.len], t);
+    var out: [4]u32 = undefined;
+    _ = Fake.table.tokenize.?(e, abi.span(u8, "a"), false, &out, out.len);
+    return .{ .host_renders = !info.caps.owns_template, .template = tbuf[0..t.len], .first_token = out[0] };
+}
+
+test "ds4 adapter: a GGUF's own chat template goes to the host's Jinja, except DeepSeek-V4's, which ds4 encodes" {
+    var tbuf: [64]u8 = undefined;
+    const qwen = try rendering("qwen4exp", "{{ qwen }}", &tbuf);
+    try testing.expect(qwen.host_renders);
+    try testing.expectEqualStrings("{{ qwen }}", qwen.template);
+    // The rendered chat carries special tokens: the fake's rendered-chat tokenizer offsets ids by 1000.
+    try testing.expectEqual(@as(u32, 'a' + 1000), qwen.first_token);
+
+    const dsv4 = try rendering("deepseek4", "{{ dsv4 }}", &tbuf);
+    try testing.expect(!dsv4.host_renders);
+    try testing.expectEqual(@as(usize, 0), dsv4.template.len);
+    try testing.expectEqual(@as(u32, 'a'), dsv4.first_token);
+
+    const bare = try rendering("qwen4exp", null, &tbuf);
+    try testing.expect(!bare.host_renders);
 }
 
 const Collect = struct {

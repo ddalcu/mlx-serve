@@ -403,6 +403,19 @@ pub const Ds4Engine = struct {
         return tokensToOwnedSlice(allocator, &tv);
     }
 
+    /// Tokenize a chat a template already rendered: its special tokens (`<|im_start|>`, `<think>`, `<tool_call>`)
+    /// map to their ids. Caller owns the returned slice.
+    pub fn tokenizeRenderedChat(self: *Ds4Engine, allocator: std.mem.Allocator, text: []const u8) Error![]i32 {
+        const text_z = allocator.dupeSentinel(u8, text, 0) catch return Error.OutOfMemory;
+        defer allocator.free(text_z);
+
+        var tv = ffi.Tokens{};
+        ffi.ds4_tokenize_rendered_chat(self.handle, text_z.ptr, &tv);
+        defer ffi.ds4_tokens_free(&tv);
+
+        return tokensToOwnedSlice(allocator, &tv);
+    }
+
     /// Render the engine's built-in chat template for a single (system, user)
     /// turn and return token IDs. Use `encodeChatTranscript` for multi-turn.
     pub fn encodeChatPrompt(

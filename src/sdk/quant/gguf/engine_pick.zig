@@ -39,6 +39,42 @@ pub const Route = struct {
     engine: Engine,
 };
 
+/// The GGUF's `tokenizer.chat_template` (caller frees); null when it ships none.
+pub fn readChatTemplate(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    return parseChatTemplate(allocator, &rs.interface);
+}
+
+fn parseChatTemplate(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!?[]u8 {
+    const magic = takeBytes(r, 4) catch return error.Truncated;
+    if (!std.mem.eql(u8, magic, "GGUF")) return error.BadMagic;
+    const version = takeIntT(r, u32) catch return error.Truncated;
+    if (version < 2 or version > 3) return error.UnsupportedVersion;
+    _ = takeIntT(r, u64) catch return error.Truncated; // tensor_count
+    const kv_count = takeIntT(r, u64) catch return error.Truncated;
+    var i: u64 = 0;
+    while (i < kv_count) : (i += 1) {
+        const key_len = takeIntT(r, u64) catch return error.Truncated;
+        if (key_len > MAX_KEY_LEN) return error.KeyTooLong;
+        const is_template = std.mem.eql(u8, takeBytes(r, @intCast(key_len)) catch return error.Truncated, "tokenizer.chat_template");
+        const value_type = takeIntT(r, u32) catch return error.Truncated;
+        if (is_template and value_type == TY_STRING) {
+            const len = takeIntT(r, u64) catch return error.Truncated;
+            if (len > MAX_STR_VALUE_LEN) return error.Truncated;
+            // A template can outgrow the reader's buffer: read it into its own allocation.
+            return r.readAlloc(allocator, @intCast(len)) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Truncated,
+            };
+        }
+        try skipValue(r, value_type);
+    }
+    return null;
+}
+
 pub const Info = struct {
     /// Owned dupe of `general.architecture` value; null if the key was
     /// absent or not a string.
@@ -473,6 +509,23 @@ test "the trained window is read from <arch>.context_length, not from a sub-name
     var none = try parseBytes(testing.allocator, bare);
     defer none.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 0), none.context_length);
+}
+
+test "the chat template is read from tokenizer.chat_template; a GGUF without one has none" {
+    const with = try buildHeader(testing.allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } },
+        .{ .key = "tokenizer.chat_template", .value = .{ .str = "{{ messages }}" } },
+    });
+    defer testing.allocator.free(with);
+    var r = std.Io.Reader.fixed(with);
+    const t = (try parseChatTemplate(testing.allocator, &r)) orelse return error.NoTemplate;
+    defer testing.allocator.free(t);
+    try testing.expectEqualStrings("{{ messages }}", t);
+
+    const without = try buildHeader(testing.allocator, &.{.{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } }});
+    defer testing.allocator.free(without);
+    var r2 = std.Io.Reader.fixed(without);
+    try testing.expect((try parseChatTemplate(testing.allocator, &r2)) == null);
 }
 
 test "ds4Spec: DeepSeek-V4.1 takes no support GGUF in ds4; DeepSeek-V4 and the other archs do" {
