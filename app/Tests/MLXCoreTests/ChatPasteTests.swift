@@ -55,4 +55,71 @@ final class ChatPasteTests: XCTestCase {
     func testDirectoryBeatsVideoSupportEvenWithAMovieExtension() {
         XCTAssertEqual(kind("mov", dir: true, video: true), "folder")
     }
+
+    // MARK: - Plain text
+
+    func testPlainTextExtensionsAreText() {
+        for ext in ["txt", "TXT", "text", "md", "markdown", "log",
+                    "json", "yaml", "yml", "toml", "csv", "tsv", "xml"] {
+            XCTAssertEqual(kind(ext, audio: true, video: true), "text", "\(ext) should classify as text")
+        }
+    }
+
+    func testTextRoutingIgnoresModelMediaSupport() {
+        // Text rides in the prompt, so it never depends on what the model can hear or see.
+        XCTAssertEqual(kind("log", audio: false, video: false), "text")
+        XCTAssertEqual(kind("log", audio: true, video: true), "text")
+    }
+
+    func testMarkupFormatsAreNotAttachedAsText() {
+        // Tagged text, but the raw bytes are markup rather than the prose someone
+        // means to attach; PDF keeps its own case because it is extracted, not read.
+        for ext in ["html", "htm", "rtf"] {
+            XCTAssertEqual(kind(ext), "unhandled", "\(ext) should not attach as plain text")
+        }
+        XCTAssertEqual(kind("pdf"), "pdf")
+    }
+
+    func testPendingDocPreambleTagFollowsKind() {
+        XCTAssertEqual(PendingTextDoc(name: "a.pdf", text: "t", kind: .pdf).preambleTag, "PDF")
+        XCTAssertEqual(PendingTextDoc(name: "a.log", text: "t", kind: .text).preambleTag, "Text")
+    }
+
+    // MARK: - Reading plain text off disk
+
+    /// A fresh temp directory that is removed when the test returns.
+    private func withTempDir(_ body: (URL) throws -> Void) throws {
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("chat-paste-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        try body(dir)
+    }
+
+    @MainActor
+    func testPlainTextReaderReturnsFileContentVerbatim() async throws {
+        try withTempDir { dir in
+            let url = dir.appendingPathComponent("session.log")
+            let content = "line one\nline two\n"
+            try content.write(to: url, atomically: true, encoding: .utf8)
+            XCTAssertEqual(ChatDetailView.extractPlainTextFile(from: url), content)
+        }
+    }
+
+    @MainActor
+    func testPlainTextReaderRejectsBinaryAndEmptyFiles() async throws {
+        try withTempDir { dir in
+            // A NUL byte means the bytes are not text, however the file is named.
+            let binary = dir.appendingPathComponent("blob.txt")
+            try Data([0x74, 0x00, 0x78]).write(to: binary)
+            XCTAssertNil(ChatDetailView.extractPlainTextFile(from: binary))
+
+            // Whitespace only is nothing to send.
+            let blank = dir.appendingPathComponent("blank.txt")
+            try "  \n\t\n".write(to: blank, atomically: true, encoding: .utf8)
+            XCTAssertNil(ChatDetailView.extractPlainTextFile(from: blank))
+
+            XCTAssertNil(ChatDetailView.extractPlainTextFile(from: dir.appendingPathComponent("missing.txt")))
+        }
+    }
 }
