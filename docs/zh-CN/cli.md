@@ -16,6 +16,14 @@ mlx-serve launch claude     # 配置并启动一个针对本地服务器的编�
 
 短名称、`org/repo` 形式的 HuggingFace id 以及 `name:tag` 都可用。模型会落进一个共享的 `~/.mlx-serve/models` 存储目录，MLX-Serve 应用用的也是它。
 
+发布在分支、标签或提交上的包写作 `org/repo@<revision>`（Hugging Face 自己的写法），或该分支的
+`https://huggingface.co/org/repo/tree/<branch>` 链接；GGUF 量化仍以 `:<quant>` 跟在后面。它会落在 main 副本旁边的
+`<repo>-<revision>` 目录里，除字母、数字、`.`、`_`、`-` 之外的字符都会变成 `-`。短提交哈希只要 Hugging Face 能解析就可用。
+
+```bash
+mlx-serve pull OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3@2.81bpw
+```
+
 ## 直接驱动服务器
 
 脚本、launchd 或无图形界面的 Mac 需要的方式：

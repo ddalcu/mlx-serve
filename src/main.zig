@@ -145,7 +145,9 @@ fn printUsage(io: std.Io) void {
         \\Commands:
         \\  run <model>         Download if needed, serve it, and chat right here
         \\                      (short name like "gemma4", "qwen3.6:27b", or any
-        \\                      HuggingFace "org/repo")
+        \\                      HuggingFace "org/repo"; "org/repo@<branch|tag|commit>"
+        \\                      or a ".../tree/<branch>" URL pulls that revision
+        \\                      into "<repo>-<revision>")
         \\  pull <model>        Download a model into ~/.mlx-serve/models
         \\  list                Show downloaded models
         \\  serve               Start the server over ~/.mlx-serve/models

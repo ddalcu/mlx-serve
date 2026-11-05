@@ -126,28 +126,48 @@ pub const Resolved = struct {
     gguf_mtp: []const u8 = "",
     /// Set by `pullRepo`: the root index's `weight_map`. A shard it names is part of the pack at any depth.
     indexed: ?std.json.Value = null,
+    /// The branch, tag or commit to pull (`org/repo@<rev>`, or a `/tree/<rev>` URL).
+    revision: []const u8 = "main",
 };
 
 /// Short name / repo ref → HF repo id. Accepts:
 ///   "gemma4" / "gemma4:12b"           (alias table)
-///   "org/repo" / "org/repo:tag"       (direct, tag stripped)
-///   "hf.co/org/repo", "huggingface.co/org/repo"
+///   "org/repo" / "org/repo:tag"       (direct; a tag picks a GGUF quant)
+///   "org/repo@<rev>[:tag]"            (a branch, tag or commit: Hugging Face's own spelling)
+///   "hf.co/org/repo", "https://huggingface.co/org/repo[/tree/<rev>]"
 /// Returns null for unknown alias-shaped names (no '/').
 pub fn resolveShortName(name: []const u8) ?Resolved {
     var n = name;
-    for ([_][]const u8{ "hf.co/", "huggingface.co/", "https://huggingface.co/" }) |prefix| {
+    for ([_][]const u8{ "https://huggingface.co/", "https://hf.co/", "hf.co/", "huggingface.co/" }) |prefix| {
         if (std.ascii.startsWithIgnoreCase(n, prefix)) {
             n = n[prefix.len..];
+            n = n[0 .. std.mem.indexOfAny(u8, n, "?#") orelse n.len];
             break;
         }
+    }
+    // Repo names cannot hold `@` and refnames cannot hold `:`, so the revision
+    // runs from the first `@` to the last `:`.
+    var revision: []const u8 = "main";
+    if (std.mem.indexOfScalar(u8, n, '@')) |at| if (std.mem.indexOfScalar(u8, n[0..at], '/') != null) {
+        const rev_end = std.mem.lastIndexOfScalar(u8, n, ':') orelse n.len;
+        if (rev_end <= at + 1) return null;
+        revision = n[at + 1 .. rev_end];
+        const quant = if (rev_end < n.len) n[rev_end + 1 ..] else "";
+        return .{ .repo = n[0..at], .revision = revision, .quant = if (std.mem.eql(u8, quant, "latest")) "" else quant };
+    };
+    if (std.mem.indexOf(u8, n, "/tree/")) |t| {
+        const rev = n[t + "/tree/".len ..];
+        revision = rev[0 .. std.mem.indexOfScalar(u8, rev, '/') orelse rev.len];
+        n = n[0..t];
     }
     const tagged = n;
     n = ollama.stripTag(n);
     if (n.len == 0) return null;
-    if (std.mem.indexOfScalar(u8, n, '/') != null) {
-        // Direct org/repo reference; a tag picks a GGUF quant.
+    if (std.mem.indexOfScalar(u8, n, '/')) |slash| {
+        // A page URL past the repo (`/blob/main/README.md`) still names the repo.
+        const end = std.mem.indexOfScalarPos(u8, n, slash + 1, '/') orelse n.len;
         const tag = if (tagged.len > n.len) tagged[n.len + 1 ..] else "";
-        return .{ .repo = n, .quant = if (std.mem.eql(u8, tag, "latest")) "" else tag };
+        return .{ .repo = n[0..end], .revision = revision, .quant = if (std.mem.eql(u8, tag, "latest")) "" else tag };
     }
     // Alias lookup: "name" or "name:tag" (tag was stripped above — redo the
     // split on the ORIGINAL string so alias tags still work).
@@ -170,10 +190,65 @@ pub fn resolveShortName(name: []const u8) ?Resolved {
 }
 
 /// `~/.mlx-serve/models/<org>/<repo>` — the single models root shared with
-/// the app's DownloadManager.
-pub fn modelDestPath(allocator: std.mem.Allocator, home: []const u8, repo: []const u8) ![]u8 {
-    return std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ home, repo });
+/// the app's DownloadManager; a revision off main lands in `<repo>-<rev>`.
+pub fn modelDestPath(allocator: std.mem.Allocator, home: []const u8, repo: []const u8, revision: []const u8) ![]u8 {
+    const id = try localRepoId(allocator, repo, revision);
+    defer allocator.free(id);
+    return std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ home, id });
 }
+
+/// The id a pull registers and its folder: `org/name` on main, `org/name-<rev>`
+/// off it (the app's `HFSource.localRepoId`).
+pub fn localRepoId(allocator: std.mem.Allocator, repo: []const u8, revision: []const u8) ![]u8 {
+    if (std.mem.eql(u8, revision, "main")) return allocator.dupe(u8, repo);
+    return std.fmt.allocPrint(allocator, "{s}-{f}", .{ repo, RevisionText{ .rev = revision, .mode = .folder } });
+}
+
+pub fn hfTreeUrl(allocator: std.mem.Allocator, repo: []const u8, revision: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/{f}?recursive=true", .{ repo, RevisionText{ .rev = revision, .mode = .url } });
+}
+
+pub fn hfFileUrl(allocator: std.mem.Allocator, repo: []const u8, revision: []const u8, path: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/{f}/{s}", .{ repo, RevisionText{ .rev = revision, .mode = .url }, path });
+}
+
+/// `.mlx-serve-source.json`, the app's `PackSource`: the repo and (off main)
+/// the revision, so the app's update check lists what this folder holds.
+pub fn sourceMarkerJson(allocator: std.mem.Allocator, repo: []const u8, revision: []const u8) ![]u8 {
+    if (std.mem.eql(u8, revision, "main")) return std.fmt.allocPrint(allocator, "{{\"repo\":{f}}}", .{std.json.fmt(repo, .{})});
+    return std.fmt.allocPrint(allocator, "{{\"repo\":{f},\"revision\":\"{f}\"}}", .{ std.json.fmt(repo, .{}), RevisionText{ .rev = revision, .mode = .json } });
+}
+
+/// A revision written into a URL path (unreserved bytes kept, the rest `%XX`,
+/// so `feature/x` is one segment), a folder name (`[A-Za-z0-9._-]` kept, the
+/// rest `-`: no `/`, `@` or `:` reaches a model id) or a JSON string. `%XX` in
+/// the input is decoded first: a pasted `/tree/feature%2Fx` names `feature/x`.
+const RevisionText = struct {
+    rev: []const u8,
+    mode: enum { url, folder, json },
+
+    pub fn format(self: RevisionText, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        var i: usize = 0;
+        while (i < self.rev.len) : (i += 1) {
+            var c = self.rev[i];
+            if (c == '%' and i + 2 < self.rev.len) {
+                if (std.fmt.parseInt(u8, self.rev[i + 1 .. i + 3], 16)) |b| {
+                    c = b;
+                    i += 2;
+                } else |_| {}
+            }
+            const plain = std.ascii.isAlphanumeric(c) or c == '-' or c == '.' or c == '_';
+            switch (self.mode) {
+                .url => if (plain or c == '~') try w.writeByte(c) else try w.print("%{X:0>2}", .{c}),
+                .folder => try w.writeByte(if (plain) c else '-'),
+                .json => {
+                    if (c == '"' or c == '\\') try w.writeByte('\\');
+                    if (c >= 0x20) try w.writeByte(c);
+                },
+            }
+        }
+    }
+};
 
 pub fn modelsRootPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models", .{home});
@@ -223,7 +298,7 @@ pub fn freeRepoFiles(allocator: std.mem.Allocator, files: []RepoFile) void {
     allocator.free(files);
 }
 
-/// Parse the HF `/api/models/<repo>/tree/main?recursive=true` JSON array.
+/// Parse the HF `/api/models/<repo>/tree/<rev>?recursive=true` JSON array.
 /// LFS entries report the real artifact size under `lfs.size`.
 pub fn parseTreeJson(allocator: std.mem.Allocator, json: []const u8) ![]RepoFile {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch return error.InvalidTree;
@@ -448,8 +523,8 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         reporter.say("model pull is unavailable in this build", .{});
         return error.PullUnavailable;
     }
-    reporter.say("pulling manifest for {s}", .{resolved.repo});
-    const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
+    reporter.say("pulling manifest for {s}@{s}", .{ resolved.repo, resolved.revision });
+    const tree_url = try hfTreeUrl(allocator, resolved.repo, resolved.revision);
     defer allocator.free(tree_url);
     const tree_json = curlFetch(allocator, io, tree_url) catch {
         reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
@@ -462,10 +537,10 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
-    const config_json = try fetchListed(allocator, io, resolved.repo, files, "config.json");
+    const config_json = try fetchListed(allocator, io, resolved, files, "config.json");
     defer if (config_json) |c| allocator.free(c);
     const media = isMediaListing(allocator, files, config_json);
-    const index_json = try fetchListed(allocator, io, resolved.repo, files, "model.safetensors.index.json");
+    const index_json = try fetchListed(allocator, io, resolved, files, "model.safetensors.index.json");
     defer if (index_json) |j| allocator.free(j);
     const index = if (index_json) |j| std.json.parseFromSlice(std.json.Value, allocator, j, .{}) catch null else null;
     defer if (index) |p| p.deinit();
@@ -506,14 +581,24 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
             }
         }
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
+        const url = try hfFileUrl(allocator, resolved.repo, resolved.revision, f.path);
         defer allocator.free(url);
         curlDownload(allocator, io, url, dest_path, show_progress) catch {
             reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
             return error.PullFailed;
         };
     }
+    writeSourceMarker(allocator, io, dest_dir, resolved);
     reporter.say("success: {s} ready", .{resolved.repo});
+}
+
+/// Best effort: without it the app's update check guesses the repo from the folder name.
+fn writeSourceMarker(allocator: std.mem.Allocator, io: std.Io, dest_dir: []const u8, resolved: Resolved) void {
+    const json = sourceMarkerJson(allocator, resolved.repo, resolved.revision) catch return;
+    defer allocator.free(json);
+    var dir = std.Io.Dir.openDirAbsolute(io, dest_dir, .{}) catch return;
+    defer dir.close(io);
+    dir.writeFile(io, .{ .sub_path = ".mlx-serve-source.json", .data = json }) catch {};
 }
 
 fn wantedFile(resolved: Resolved, path: []const u8, media: bool) bool {
@@ -535,11 +620,11 @@ fn indexNames(weight_map: ?std.json.Value, path: []const u8) bool {
     return false;
 }
 
-/// The body of `name` from the repo's `main`, when the listing has it and it can be fetched.
-fn fetchListed(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, files: []const RepoFile, name: []const u8) !?[]u8 {
+/// The body of `name` at the pulled revision, when the listing has it and it can be fetched.
+fn fetchListed(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, files: []const RepoFile, name: []const u8) !?[]u8 {
     for (files) |f| {
         if (!std.mem.eql(u8, f.path, name)) continue;
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ repo, name });
+        const url = try hfFileUrl(allocator, resolved.repo, resolved.revision, name);
         defer allocator.free(url);
         return curlFetch(allocator, io, url) catch null;
     }
@@ -659,7 +744,7 @@ pub fn ensureModelAvailable(allocator: std.mem.Allocator, io: std.Io, name: []co
         printKnownAliases(io);
         std.process.exit(1);
     };
-    const dest = try modelDestPath(allocator, homeDir(), resolved.repo);
+    const dest = try modelDestPath(allocator, homeDir(), resolved.repo, resolved.revision);
     errdefer allocator.free(dest);
     if (modelPresent(io, dest)) return dest;
     try pullRepo(allocator, io, resolved, dest, stderr_reporter, true);
@@ -1042,9 +1127,74 @@ test "cli: resolveShortName aliases, tags, org/repo, hf.co, unknown" {
 
 test "cli: modelDestPath layout" {
     const allocator = testing.allocator;
-    const p = try modelDestPath(allocator, "/Users/x", "org/repo");
+    const p = try modelDestPath(allocator, "/Users/x", "org/repo", "main");
     defer allocator.free(p);
     try testing.expectEqualStrings("/Users/x/.mlx-serve/models/org/repo", p);
+}
+
+test "cli: a branch lands in <name>-<branch>, main in <name>, with no / @ or : in the id" {
+    const a = testing.allocator;
+    const cases = [_][3][]const u8{
+        .{ "main", "/h/.mlx-serve/models/org/repo", "org/repo" },
+        .{ "2.81bpw", "/h/.mlx-serve/models/org/repo-2.81bpw", "org/repo-2.81bpw" },
+        .{ "feature%2Fx@y:z", "/h/.mlx-serve/models/org/repo-feature-x-y-z", "org/repo-feature-x-y-z" },
+    };
+    for (cases) |c| {
+        const dest = try modelDestPath(a, "/h", "org/repo", c[0]);
+        defer a.free(dest);
+        try testing.expectEqualStrings(c[1], dest);
+        const id = try localRepoId(a, "org/repo", c[0]);
+        defer a.free(id);
+        try testing.expectEqualStrings(c[2], id);
+    }
+}
+
+test "cli: org/repo@rev[:quant] and a /tree/<rev> URL name the revision; an id or a page is main" {
+    const Case = struct { in: []const u8, repo: []const u8, rev: []const u8, quant: []const u8 = "" };
+    const cases = [_]Case{
+        .{ .in = "org/repo", .repo = "org/repo", .rev = "main" },
+        .{ .in = "org/repo@2.81bpw", .repo = "org/repo", .rev = "2.81bpw" },
+        .{ .in = "org/repo@feature/x:Q4_K_M", .repo = "org/repo", .rev = "feature/x", .quant = "Q4_K_M" },
+        .{ .in = "org/repo@8acadd0", .repo = "org/repo", .rev = "8acadd0" },
+        .{ .in = "org/repo:Q4_K_M", .repo = "org/repo", .rev = "main", .quant = "Q4_K_M" },
+        .{ .in = "https://huggingface.co/org/repo", .repo = "org/repo", .rev = "main" },
+        .{ .in = "https://huggingface.co/org/repo/tree/2.81bpw", .repo = "org/repo", .rev = "2.81bpw" },
+        .{ .in = "hf.co/org/repo/tree/feature%2Fx/sub/dir?x=1", .repo = "org/repo", .rev = "feature%2Fx" },
+        .{ .in = "https://huggingface.co/org/repo/blob/main/README.md", .repo = "org/repo", .rev = "main" },
+    };
+    for (cases) |c| {
+        const r = resolveShortName(c.in) orelse return error.TestUnexpectedResult;
+        try testing.expectEqualStrings(c.repo, r.repo);
+        try testing.expectEqualStrings(c.rev, r.revision);
+        try testing.expectEqualStrings(c.quant, r.quant);
+    }
+}
+
+test "cli: Hugging Face URLs carry the percent-encoded revision" {
+    const a = testing.allocator;
+    const cases = [_][3][]const u8{
+        .{ "main", "https://huggingface.co/api/models/org/repo/tree/main?recursive=true", "https://huggingface.co/org/repo/resolve/main/sub/a.safetensors" },
+        .{ "feature/x", "https://huggingface.co/api/models/org/repo/tree/feature%2Fx?recursive=true", "https://huggingface.co/org/repo/resolve/feature%2Fx/sub/a.safetensors" },
+        .{ "feature%2Fx", "https://huggingface.co/api/models/org/repo/tree/feature%2Fx?recursive=true", "https://huggingface.co/org/repo/resolve/feature%2Fx/sub/a.safetensors" },
+    };
+    for (cases) |c| {
+        const tree = try hfTreeUrl(a, "org/repo", c[0]);
+        defer a.free(tree);
+        try testing.expectEqualStrings(c[1], tree);
+        const file = try hfFileUrl(a, "org/repo", c[0], "sub/a.safetensors");
+        defer a.free(file);
+        try testing.expectEqualStrings(c[2], file);
+    }
+}
+
+test "cli: the source marker names the branch the app's update check lists" {
+    const a = testing.allocator;
+    const main_json = try sourceMarkerJson(a, "org/repo", "main");
+    defer a.free(main_json);
+    try testing.expectEqualStrings("{\"repo\":\"org/repo\"}", main_json);
+    const branch_json = try sourceMarkerJson(a, "org/repo", "feature%2Fx");
+    defer a.free(branch_json);
+    try testing.expectEqualStrings("{\"repo\":\"org/repo\",\"revision\":\"feature/x\"}", branch_json);
 }
 
 test "cli: shouldDownload chat-default selection" {

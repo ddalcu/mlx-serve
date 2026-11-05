@@ -353,7 +353,7 @@ fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u
         return;
     };
     const home = std.mem.span(env.get(.HOME) orelse "/tmp");
-    const dest = try cli_mod.modelDestPath(allocator, home, resolved.repo);
+    const dest = try cli_mod.modelDestPath(allocator, home, resolved.repo, resolved.revision);
     defer allocator.free(dest);
 
     log.info("POST /api/pull {s} -> {s}\n", .{ requested, dest });
@@ -372,7 +372,9 @@ fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u
     // Make it loadable by name right away. GGUF-only dirs (no config.json)
     // aren't registerable this way — they still work via --model / the app.
     if (http_server.global_registry) |registry| {
-        _ = registry.registerByPath(stream.io, dest, resolved.repo) catch {};
+        const id = try cli_mod.localRepoId(allocator, resolved.repo, resolved.revision);
+        defer allocator.free(id);
+        _ = registry.registerByPath(stream.io, dest, id) catch {};
     }
     sink.quiet = false;
     sink.emit("status", "success") catch {};
