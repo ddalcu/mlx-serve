@@ -1,9 +1,11 @@
 import Foundation
 import Testing
 import AppKit
+import SwiftUI
 @testable import MLXCore
 
 @MainActor
+@Suite(.serialized)
 struct ContextCompactionTests {
     private final class SummaryStub: APIClient {
         let events: [SSEEvent]
@@ -59,7 +61,7 @@ struct ContextCompactionTests {
 
     @Test func testWireDropsIncompleteToolRoundsAndLegacyWarnings() {
         var call = ChatMessage(role: .assistant, content: "Reading")
-        call.toolCalls = [SerializedToolCall(id: "aborted", name: "readFile", arguments: "{}")]
+        call.toolCalls = [MLXCore.SerializedToolCall(id: "aborted", name: "readFile", arguments: "{}")]
         let legacy = ChatMessage(role: .assistant, content: "answer" + TruncationNotice.text(cause: .maxTokens, maxTokens: 256))
         let wire = ContextCompaction.wireMessages([call, ChatMessage(role: .user, content: "Continue"), legacy])
         #expect(wire.allSatisfy { $0["tool_calls"] == nil })
@@ -95,10 +97,42 @@ struct ContextCompactionTests {
         #expect(ContextCompaction.activeMessages(source).first?.content == "corrected fact")
     }
 
+    @Test func testCheckpointRendersAsAMessageAlongsideToolCards() throws {
+        let user = ChatMessage(role: .user, content: "Keep the project marker EXACT-771 and output path /tmp/pelican.html.")
+        let reply = ChatMessage(role: .assistant, content: "I’ll preserve those details while continuing the task.")
+        let marker = ContextCompaction.checkpoint(
+            summary: "Project marker: EXACT-771. Output: /tmp/pelican.html. The animation task remains unfinished.",
+            source: [user, reply], boundary: 0)
+        var toolCard = ChatMessage(role: .assistant, content: "**readFile**(path: /tmp/pelican.html)")
+        toolCard.isAgentSummary = true
+        let rows = ChatRowBuilder.rows(from: [toolCard, marker])
+        guard rows.count == 2, case .toolCall = rows[0], case .message(let rendered) = rows[1] else {
+            Issue.record("A context checkpoint must remain a message instead of joining a tool card")
+            return
+        }
+        #expect(rendered.id == marker.id)
+        guard let directory = ProcessInfo.processInfo.environment["MLX_COMPACTION_UI_SNAPSHOTS"] else { return }
+        for (name, messages) in [("before", [user, reply]), ("after", [user, marker, reply])] {
+            let view = VStack(alignment: .leading, spacing: 20) {
+                ForEach(messages) { MessageBubble(message: $0) }
+            }.padding(24).frame(width: 760).background(Color(nsColor: .windowBackgroundColor))
+            let host = NSHostingView(rootView: view.environment(\.colorScheme, .light))
+            host.appearance = NSAppearance(named: .aqua)
+            host.frame = NSRect(origin: .zero, size: host.fittingSize)
+            let window = NSWindow(contentRect: host.frame, styleMask: [.borderless], backing: .buffered, defer: false)
+            window.contentView = host
+            host.layoutSubtreeIfNeeded()
+            let bitmap = try #require(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            let png = try #require(bitmap.representation(using: .png, properties: [:]))
+            try png.write(to: URL(fileURLWithPath: directory).appendingPathComponent("context-summary-\(name).png"))
+        }
+    }
+
     @Test func testBoundaryNeverSplitsToolRound() throws {
         var source = (0..<20).map { ChatMessage(role: .user, content: "message \($0)") }
         var call = ChatMessage(role: .assistant, content: "")
-        call.toolCalls = [SerializedToolCall(id: "call-a", name: "readFile", arguments: "{}")]
+        call.toolCalls = [MLXCore.SerializedToolCall(id: "call-a", name: "readFile", arguments: "{}")]
         var result = ChatMessage(role: .system, content: "file result")
         result.toolCallId = "call-a"
         source.append(call)
@@ -140,7 +174,7 @@ struct ContextCompactionTests {
 
     @Test func testWirePreservesReasoningToolArgumentsAndFullResults() {
         var call = ChatMessage(role: .assistant, content: "read", reasoningContent: "reasoning")
-        call.toolCalls = [SerializedToolCall(id: "parallel-a", name: "readFile", arguments: "{\"path\":\"/tmp/a\"}")]
+        call.toolCalls = [MLXCore.SerializedToolCall(id: "parallel-a", name: "readFile", arguments: "{\"path\":\"/tmp/a\"}")]
         var result = ChatMessage(role: .system, content: String(repeating: "完整结果", count: 2000))
         result.toolCallId = "parallel-a"
         var placeholder = ChatMessage(role: .assistant, content: "")
@@ -150,6 +184,19 @@ struct ContextCompactionTests {
         #expect(wire[0]["reasoning_content"] as? String == "reasoning")
         #expect(wire[1]["content"] as? String == result.content)
         #expect(wire[1]["tool_call_id"] as? String == "parallel-a")
+    }
+
+    @Test func testDisplayOnlyRowsDoNotSplitParallelToolResults() {
+        var call = ChatMessage(role: .assistant, content: "")
+        call.toolCalls = ["a", "b"].map { MLXCore.SerializedToolCall(id: $0, name: "generate_image", arguments: "{}") }
+        var first = ChatMessage(role: .system, content: "first image generated")
+        first.toolCallId = "a"
+        var second = ChatMessage(role: .system, content: "second image generated")
+        second.toolCallId = "b"
+        let displayOnly = ChatMessage(role: .assistant, content: "")
+        let wire = ContextCompaction.wireMessages([call, first, displayOnly, second])
+        #expect((wire.first?["tool_calls"] as? [[String: Any]])?.count == 2)
+        #expect(wire.compactMap { $0["tool_call_id"] as? String } == ["a", "b"])
     }
 
     @Test func testLiveModelSummaryAndContinuation() async throws {

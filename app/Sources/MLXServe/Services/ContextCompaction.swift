@@ -90,18 +90,19 @@ enum ContextCompaction {
 
     static func wireMessages(_ source: [ChatMessage], media: ((String, ChatMessage) -> Any)? = nil,
                              historyImages: Bool = false) -> [[String: Any]] {
-        let active = activeMessages(source)
+        let active = activeMessages(source).filter { msg in
+            !msg.isAgentSummary && !msg.failedRetry && msg.errorNotice == nil
+                && (msg.toolCallId != nil || !msg.content.isEmpty || !(msg.toolCalls ?? []).isEmpty
+                    || !(msg.images ?? []).isEmpty || !(msg.videos ?? []).isEmpty || !(msg.audio ?? []).isEmpty)
+        }
         let lastUser = active.last(where: { $0.role == .user })?.id
         var openCalls = Set<String>()
         return active.enumerated().compactMap { index, msg in
-            guard !msg.isAgentSummary, !msg.failedRetry, msg.errorNotice == nil else { return nil }
             if let id = msg.toolCallId {
                 guard openCalls.remove(id) != nil else { return nil }
                 return ["role": "tool", "tool_call_id": id, "content": msg.content]
             }
             openCalls.removeAll()
-            guard !msg.content.isEmpty || !(msg.toolCalls ?? []).isEmpty || !(msg.images ?? []).isEmpty
-                    || !(msg.videos ?? []).isEmpty || !(msg.audio ?? []).isEmpty else { return nil }
             let content = msg.role == .assistant ? TruncationNotice.stripped(from: msg.content) : msg.content
             var result: [String: Any] = ["role": msg.role.rawValue, "content": content]
             if msg.role == .user, historyImages || msg.id == lastUser, let media {
@@ -109,7 +110,7 @@ enum ContextCompaction {
             }
             if let reasoning = msg.reasoningContent, !reasoning.isEmpty { result["reasoning_content"] = reasoning }
             if let calls = msg.toolCalls, !calls.isEmpty {
-                let following = active.dropFirst(index + 1).filter { !$0.isAgentSummary && !$0.failedRetry && $0.errorNotice == nil }
+                let following = active.dropFirst(index + 1)
                 let results = Set(following.prefix { $0.toolCallId != nil }.compactMap(\.toolCallId))
                 if calls.allSatisfy({ results.contains($0.id) }) {
                     result["tool_calls"] = calls.map { ["id": $0.id, "type": "function", "function": ["name": $0.name, "arguments": $0.arguments]] as [String: Any] }
