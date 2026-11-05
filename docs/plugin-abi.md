@@ -1252,6 +1252,7 @@ The `Host` table: everything process-wide a plugin reaches (the allocator, the l
 | `Stream` | `common.Stream` |  |
 | `version` | `u32 = 1` |  |
 | `gpu_version` | `u32 = 1` |  |
+| `gpu_min_size` | `usize = @offsetOf(HostGpu, "command_buffer_limits")` | The `HostGpu` size every plugin may rely on (through `alias`): members past it are optional, read only when the table's `size` reaches them, so a plugin built with a newer kit still loads on a host without them, and a plugin built before them loads on a host with them. |
 | `ane_version` | `u32 = 1` |  |
 | `AneProgram` | `opaque {}` | A compiled MIL program (`HostAne.program_create`), a request binding one procedure's surfaces, and an IOSurface. |
 | `AneRequest` | `opaque {}` |  |
@@ -1407,6 +1408,12 @@ The C API below MLX's kernel API: one implementation in the host against MLX's i
 | `alloc_uninit` | `*const fn (ctx: ?*anyopaque, shape: [*]const i32, ndim: usize, dtype: i32, out: *Array) callconv(.c) Verdict` |  | `out` (a fresh handle) becomes an evaluated [shape] array of `dtype` (mlx-c's `mlx_dtype` value) over one buffer from MLX's allocator, its bytes unspecified until written. |
 | `launch` | `*const fn (ctx: ?*anyopaque, outputs: *VectorArray, kernel: ?*anyopaque, inputs: VectorArray, config: KernelConfig, stream: Stream) callconv(.c) Verdict` |  | `mlx_fast_metal_kernel_apply`'s contract; a kernel from the host's cache launches MLX's built pipeline directly once MLX has built it (no per-launch source regeneration). Bit-identical to MLX's apply. |
 | `buffer_addresses` | `*const fn (ctx: ?*anyopaque, arrays: [*]const Array, n: usize, out: [*]u64) callconv(.c) Verdict` |  | Each evaluated, row-contiguous GPU array's buffer address + offset, for kernels reading sources from a table. |
+| `alias` | `*const fn (ctx: ?*anyopaque, base: Array, offset: u64, shape: [*]const i32, ndim: usize, dtype: i32, out: *Array) callconv(.c) Verdict` |  | `out` (a fresh handle) becomes an evaluated [shape] array of `dtype` (mlx-c's `mlx_dtype` value) over `base`'s bytes from `offset`, an MTLBuffer of its own over the same pages: MLX orders its work apart from `base`'s. Refused unless `base` is evaluated at its buffer's start, `offset` is page-aligned and the range fits. It holds `base` and adds no active memory; MLX cannot see aliases overlap, so tensors alive at once take disjoint ranges. |
+| `command_buffer_limits` | `*const fn (ctx: ?*anyopaque, ops: i32, mb: i32, prev_ops: *i32, prev_mb: *i32) callconv(.c) Verdict` |  | MLX's command-buffer split: the operations (`ops`) and MB of bound arrays (`mb`) a command buffer takes before it is committed, from each stream's next commit check (below 1 keeps the current value); the previous pair back. The words are the same at any split. Optional: read it only when `size` reaches it (`gpu_min_size`). |
+
+### `gpuHas(g: *const HostGpu, comptime name: []const u8) bool`
+
+Whether the table `g` (a host's, of any size) reaches its member `name`.
 
 ### `AneIo` (extern struct)
 
