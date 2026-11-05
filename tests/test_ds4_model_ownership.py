@@ -61,7 +61,7 @@ def main():
         except urllib.error.HTTPError as error:
             result = json.load(error)
             assert error.code == 503, result
-            assert result.get('error', {}).get('code') == 'model_busy', result
+            assert result.get('error', {}).get('type') == 'model_busy', result
             records.append({'busy_status': error.code, 'response': result})
     assert call('/health')['status'] == 'ok'
     args.output.parent.mkdir(parents=True, exist_ok=True)
