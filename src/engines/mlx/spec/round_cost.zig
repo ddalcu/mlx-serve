@@ -387,6 +387,14 @@ pub const Table = struct {
         return if (stale) .reseeded else .folded;
     }
 
+    /// A probe that ended with nothing folded (every tick refused) gives its retry back: the
+    /// cap bounds probes that measured something, not a busy box. True when refunded.
+    pub fn endSerialProbe(self: *Table, bucket: usize) bool {
+        if (bucket >= N_BUCKETS or self.serial[bucket].n != 0 or self.serial_probes[bucket] == 0) return false;
+        self.serial_probes[bucket] -= 1;
+        return true;
+    }
+
     /// Measured ms of one plain serial token in `bucket`, or null. Never interpolated across buckets.
     pub fn serialMsPerTok(self: *const Table, bucket: usize) ?f32 {
         if (bucket >= N_BUCKETS or self.serial[bucket].n < MIN_SAMPLES) return null;

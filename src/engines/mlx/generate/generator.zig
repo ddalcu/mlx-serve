@@ -461,6 +461,8 @@ pub const Generator = struct {
     mtp_price: MtpPriceWindow = .{},
     /// Ticks left in a bounded serial block (the serial probe); the slot stays an MTP slot.
     mtp_serial_left: u32 = 0,
+    /// The bucket the running serial probe measures; null outside a probe.
+    mtp_probe_bucket: ?usize = null,
     mtp_low_accept: u32 = 0,
     mtp_tok_ema: f32 = 0,
     /// Where a serial block sits in its ramp back to `nextMtp`'s entry invariant.

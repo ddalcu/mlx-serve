@@ -1136,6 +1136,17 @@ test "cudaHomeDefault: export /opt/cuda only when nothing else names a toolkit" 
     try std.testing.expect(cudaHomeDefault(false, false, false) == null);
 }
 
+test "exportResidencyRefresh: defaults to 1000 ms on macOS, keeps a value the user set (0 opts out)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    const saved = env.override(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS, null);
+    defer saved.restore();
+    exportResidencyRefresh();
+    try std.testing.expectEqualStrings("1000", env.span(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS).?);
+    env.set(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS, "0");
+    exportResidencyRefresh();
+    try std.testing.expectEqualStrings("0", env.span(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS).?);
+}
+
 test "ptxCacheDir: each staged MLX build compiles into its own kernel cache" {
     var a: [256]u8 = undefined;
     var b: [256]u8 = undefined;

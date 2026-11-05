@@ -342,6 +342,7 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
         const useful = mtpSerialProbeUseful(window_ms_tok) and mtpSerialProbeEarned(if (self.xfm.qwen4Trunk()) |trunk| trunk.qwen4_mtp != null else false, self.mtp_low_accept);
         if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), useful)) |own| {
             self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
+            self.mtp_probe_bucket = own;
             log.info(
                 "  [mtp] adaptive: bucket {s} has no serial cell -> probing {d} serial tokens\n",
                 .{ round_cost.bucketName(self.xfm.round_cost.layout, own), MTP_ADAPTIVE_PROBE_TOKENS },
@@ -616,6 +617,23 @@ test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in 
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4)); // crossing
     var i: u32 = 0;
     while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
+}
+
+test "mtpSerialProbeArm: a probe whose every tick was refused gives its retry back, so a clean one still seeds" {
+    const G = Generator;
+    var t = round_cost.Table{ .layout = .long };
+    const kv: u32 = 70_000;
+    const b = round_cost.bucketFor(kv);
+    for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(2, kv, 28.0, 2.4, true, false);
+    for (0..round_cost.MAX_SERIAL_PROBES) |_| {
+        try testing.expect(G.mtpSerialProbeArm(&t, b, true, true, true, true) != null);
+        for (0..MTP_ADAPTIVE_PROBE_TOKENS) |_| _ = t.observeSerial(kv, 155.0, true, false);
+        try testing.expect(t.endSerialProbe(b));
+    }
+    try testing.expect(G.mtpSerialProbeArm(&t, b, true, true, true, true) != null);
+    for (0..MTP_ADAPTIVE_PROBE_TOKENS) |_| _ = t.observeSerial(kv, 12.0, true, false);
+    try testing.expect(!t.endSerialProbe(b));
+    try testing.expect(t.serialMsPerTok(b) != null);
 }
 
 test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is trusted" {
