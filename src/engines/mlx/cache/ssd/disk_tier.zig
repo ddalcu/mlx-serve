@@ -2084,8 +2084,22 @@ pub const DiskTier = struct {
         // chunks this flush reaches is still written (position-keyed,
         // immutable) and becomes restorable when a later flush extends
         // kv_len past it.
-        const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
-        const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
+        //
+        // A fresh entry that hard-linked its leading chunks also links the donor's
+        // checkpoints at or below the shared prefix, so a fork into the inherited
+        // span keeps an anchor once the donor is evicted. Linked files bill 0.
+        var linked_ssm_pos = std.ArrayList(u32).empty;
+        defer linked_ssm_pos.deinit(self.allocator);
+        var linked_ssm_bytes = std.ArrayList(u64).empty;
+        defer linked_ssm_bytes.deinit(self.allocator);
+        if (donor) |d| if (inherited > 0) {
+            const de = &self.entries.items[d.idx];
+            const bound: u32 = @intCast(@min(@min(@min(commonPrefixLen(de.tokens, tokens), @as(usize, de.kv_len)), @as(usize, kv_target)), mediaSharedBound(de.media, media)));
+            self.linkInheritedSsm(d, id, bound, &linked_ssm_pos, &linked_ssm_bytes);
+        };
+        errdefer for (linked_ssm_pos.items) |p| self.deleteSsmFile(id, p);
+        const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else linked_ssm_pos.items;
+        const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else linked_ssm_bytes.items;
         var written_bytes: u64 = 0;
         var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_target, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes / 2) catch |err| {
             // errdefer already owns chunk_sizes + ssm_res; a manual deinit here
@@ -2156,7 +2170,11 @@ pub const DiskTier = struct {
 
         // `bytes` is what this entry created on disk: inherited (linked) chunks bill 0.
         var non_chunk: u64 = @as(u64, record.len) * 4 + spec_res.bytes;
-        for (ssm_res.bytes) |b| non_chunk += b;
+        for (ssm_res.positions, ssm_res.bytes) |p, b| {
+            // A checkpoint linked from the donor (fresh entry only) bills 0, like an inherited chunk.
+            if (extend_idx == null and std.mem.indexOfScalar(u32, linked_ssm_pos.items, p) != null) continue;
+            non_chunk += b;
+        }
         if (!qsa_res.inherited) non_chunk += qsa_res.bytes;
         var bytes: u64 = non_chunk;
         for (chunk_sizes.items[@min(inherited, chunk_sizes.items.len)..]) |b| bytes += b;
@@ -2194,6 +2212,7 @@ pub const DiskTier = struct {
             var delta: i64 = @as(i64, @intCast(non_chunk)) - @as(i64, @intCast(nonChunkBytes(e)));
             for (new_entry.chunk_bytes[@min(keep, new_entry.chunk_bytes.len)..]) |b| delta += @as(i64, @intCast(b));
             if (e.chunk_bytes.len > keep) delta -= @as(i64, @intCast(e.chunk_bytes[keep]));
+            delta += @as(i64, @intCast(ssm_res.still_linked));
             new_entry.bytes = clampAdd(e.bytes, delta);
             // meta.json is the commit point: written last, atomically.
             try self.writeMeta(new_entry);
@@ -2325,6 +2344,7 @@ pub const DiskTier = struct {
         self.allocator.free(e.ssm_bytes);
         e.ssm_positions = ssm_res.positions;
         e.ssm_bytes = ssm_res.bytes;
+        const still_linked = ssm_res.still_linked;
         // The arrays are the entry's from here: disarm the errdefer, or a failed
         // writeMeta frees what the entry owns and the next removal double-frees.
         ssm_res.positions = &.{};
@@ -2336,7 +2356,7 @@ pub const DiskTier = struct {
             e.qsa_history_rows = qsa_res.rows;
             e.inherited_qsa = false;
         }
-        const delta: i64 = @as(i64, @intCast(nonChunkBytes(e))) - @as(i64, @intCast(old_non_chunk));
+        const delta: i64 = @as(i64, @intCast(nonChunkBytes(e))) - @as(i64, @intCast(old_non_chunk)) + @as(i64, @intCast(still_linked));
         e.bytes = clampAdd(e.bytes, delta);
         self.total_bytes = clampAdd(self.total_bytes, delta);
         e.last_used = self.bump();
@@ -2856,6 +2876,10 @@ pub const DiskTier = struct {
         /// All target checkpoints made it to disk this flush (false → the
         /// per-flush byte cap deferred some; the caller keeps the entry dirty).
         complete: bool,
+        /// Bytes of retention-dropped files another entry still hard-links (a
+        /// chunk-share heir or donor): the volume did not get them back, so a
+        /// delta-billed caller must not drop them from `total_bytes`.
+        still_linked: u64 = 0,
 
         fn deinit(self: *SsmPersistResult, allocator: std.mem.Allocator) void {
             allocator.free(self.positions);
@@ -2946,8 +2970,11 @@ pub const DiskTier = struct {
         defer self.allocator.free(target);
 
         // Delete positions retention drops (present on disk, absent from target).
-        for (old_positions) |p| {
-            if (std.mem.indexOfScalar(u32, target, p) == null) self.deleteSsmFile(id, p);
+        var still_linked: u64 = 0;
+        for (old_positions, old_bytes) |p, b| {
+            if (std.mem.indexOfScalar(u32, target, p) != null) continue;
+            if (self.ssmFileShared(id, p)) still_linked += b;
+            self.deleteSsmFile(id, p);
         }
 
         const Pair = struct { pos: u32, bytes: u64 };
@@ -2991,7 +3018,40 @@ pub const DiskTier = struct {
             positions[i] = pr.pos;
             bytes[i] = pr.bytes;
         }
-        return .{ .positions = positions, .bytes = bytes, .complete = complete };
+        return .{ .positions = positions, .bytes = bytes, .complete = complete, .still_linked = still_linked };
+    }
+
+    /// `<root>/e<id>/s<pos>.safetensors`, owned by the caller; null when out of memory.
+    fn ssmPath(self: *DiskTier, id: u64, pos: u64) ?[]u8 {
+        return std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch null;
+    }
+
+    /// What deleting the file at `path` (taken) returns to the volume: its size when no other entry
+    /// links it, else 0; `missing` when it cannot be named or stat'ed.
+    fn freedBytes(self: *DiskTier, path: ?[]u8, missing: u64) u64 {
+        const p = path orelse return missing;
+        defer self.allocator.free(p);
+        const st = statFile(self.io, p) orelse return missing;
+        return if (st.nlink <= 1) st.size else 0;
+    }
+
+    /// The scan's bill for the file at `path` (taken): a linked inode is paid by the first entry
+    /// that sees it; `missing` when it cannot be named or stat'ed.
+    fn billedOnce(self: *DiskTier, path: ?[]u8, missing: u64, seen: *std.AutoHashMap(u64, void)) u64 {
+        const p = path orelse return missing;
+        defer self.allocator.free(p);
+        const st = statFile(self.io, p) orelse return missing;
+        if (st.nlink <= 1) return st.size;
+        const gop = seen.getOrPut(@intCast(st.inode)) catch return st.size;
+        return if (gop.found_existing) 0 else st.size;
+    }
+
+    /// Is `e<id>/s<pos>` a hard link another entry also holds?
+    fn ssmFileShared(self: *DiskTier, id: u64, pos: u32) bool {
+        const path = self.ssmPath(id, pos) orelse return false;
+        defer self.allocator.free(path);
+        const st = statFile(self.io, path) orelse return false;
+        return st.nlink > 1;
     }
 
     /// Write (or, under SSD-first, stage) one SSM checkpoint as `s{pos:0>7}.safetensors`.
@@ -3305,7 +3365,7 @@ pub const DiskTier = struct {
     }
 
     fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
-        const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
+        const path = self.ssmPath(id, pos) orelse return;
         defer self.allocator.free(path);
         // A staged checkpoint may still be in the writer's queue; fence it before deleting, or
         // the write lands a file no index names.
@@ -3363,30 +3423,16 @@ pub const DiskTier = struct {
         defer self.allocator.free(dir_abs);
         if (self.writer) |w| w.fence(dir_abs);
         var freed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
-        for (e.ssm_bytes) |b| freed += b;
+        // Checkpoints, the QSA history and chunks may be hard links a chunk-share heir or donor
+        // also holds: only the last link returns its bytes.
+        for (e.ssm_positions, e.ssm_bytes) |pos, b| freed += self.freedBytes(self.ssmPath(e.id, pos), b);
         if (e.qsa_history_bytes > 0) {
-            if (std.fmt.allocPrint(self.allocator, "{s}qsa.safetensors", .{dir_abs})) |qp| {
-                defer self.allocator.free(qp);
-                if (statFile(self.io, qp)) |st| {
-                    if (st.nlink <= 1) freed += st.size;
-                } else if (!e.inherited_qsa) {
-                    freed += e.qsa_history_bytes;
-                }
-            } else |_| {
-                if (!e.inherited_qsa) freed += e.qsa_history_bytes;
-            }
+            const qp = std.fmt.allocPrint(self.allocator, "{s}qsa.safetensors", .{dir_abs}) catch null;
+            freed += self.freedBytes(qp, if (e.inherited_qsa) 0 else e.qsa_history_bytes);
         }
         for (e.chunk_bytes, 0..) |cb, i| {
-            const cp = std.fmt.allocPrint(self.allocator, "{s}c{d:0>6}.safetensors", .{ dir_abs, i }) catch {
-                freed += cb;
-                continue;
-            };
-            defer self.allocator.free(cp);
-            if (statFile(self.io, cp)) |st| {
-                if (st.nlink <= 1) freed += st.size;
-            } else if (i >= e.inherited_chunks) {
-                freed += cb;
-            }
+            const cp = std.fmt.allocPrint(self.allocator, "{s}c{d:0>6}.safetensors", .{ dir_abs, i }) catch null;
+            freed += self.freedBytes(cp, if (i >= e.inherited_chunks) cb else 0);
         }
         return freed;
     }
@@ -3448,6 +3494,41 @@ pub const DiskTier = struct {
         mb /= 1024.0 * 1024.0;
         log.info("  [disk-cache] chunk share: e{d} inherits {d} chunks ({d:.1} MB) from e{d} by hard link\n", .{ id, linked, mb, d.id });
         return linked;
+    }
+
+    /// Best-effort hard link of the donor's landed SSM checkpoints at positions in (0, `bound`] into
+    /// `e<id>/`, appending each position and the donor's recorded size to the out lists. A checkpoint
+    /// at `p` depends only on `tokens[0..p)`, so any one at or below the common prefix is valid here.
+    fn linkInheritedSsm(self: *DiskTier, d: ChunkDonor, id: u64, bound: u32, pos_out: *std.ArrayList(u32), bytes_out: *std.ArrayList(u64)) void {
+        if (bound == 0) return;
+        var root_dir = std.Io.Dir.openDirAbsolute(self.io, self.root, .{}) catch return;
+        defer root_dir.close(self.io);
+        const de = &self.entries.items[d.idx];
+        var ob: [64]u8 = undefined;
+        var nb: [64]u8 = undefined;
+        for (de.ssm_positions, de.ssm_bytes) |p, sz| {
+            if (p == 0 or p > bound) continue;
+            const old_abs = self.ssmPath(d.id, p) orelse continue;
+            defer self.allocator.free(old_abs);
+            if (!self.chunkLanded(old_abs, sz)) continue; // still staged in the writer: skip it
+            const old_sub = std.fmt.bufPrint(&ob, "e{d}/s{d:0>7}.safetensors", .{ d.id, p }) catch continue;
+            const new_sub = std.fmt.bufPrint(&nb, "e{d}/s{d:0>7}.safetensors", .{ id, p }) catch continue;
+            std.Io.Dir.hardLink(root_dir, old_sub, root_dir, new_sub, self.io, .{}) catch |err| {
+                log.warn("  [disk-cache] ssm share: link e{d}/s{d} -> e{d} failed: {s}\n", .{ d.id, p, id, @errorName(err) });
+                continue;
+            };
+            pos_out.append(self.allocator, p) catch {
+                self.deleteSsmFile(id, p);
+                break;
+            };
+            bytes_out.append(self.allocator, sz) catch {
+                _ = pos_out.pop();
+                self.deleteSsmFile(id, p);
+                break;
+            };
+        }
+        if (pos_out.items.len > 0)
+            log.info("  [disk-cache] ssm share: e{d} inherits {d} checkpoints (<= {d}) from e{d} by hard link\n", .{ id, pos_out.items.len, bound, d.id });
     }
 
     fn linkInheritedQsa(self: *DiskTier, d: ChunkDonor, id: u64) bool {
@@ -3690,48 +3771,14 @@ pub const DiskTier = struct {
             return;
         }
         var billed: u64 = @as(u64, e.tokens.len) * 4 + e.spec_bytes;
-        for (e.ssm_bytes) |b| billed += b;
+        for (e.ssm_positions, e.ssm_bytes) |pos, b| billed += self.billedOnce(self.ssmPath(e.id, pos), b, seen);
         if (e.qsa_history_bytes > 0) {
-            if (std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id })) |qp| {
-                defer self.allocator.free(qp);
-                if (statFile(self.io, qp)) |st| {
-                    if (st.nlink <= 1) {
-                        billed += st.size;
-                    } else {
-                        const ino: u64 = @intCast(st.inode);
-                        if (seen.getOrPut(ino)) |gop| {
-                            if (!gop.found_existing) billed += st.size;
-                        } else |_| {
-                            billed += st.size;
-                        }
-                    }
-                } else if (!e.inherited_qsa) {
-                    billed += e.qsa_history_bytes;
-                }
-            } else |_| {
-                if (!e.inherited_qsa) billed += e.qsa_history_bytes;
-            }
+            const qp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/qsa.safetensors", .{ self.root, e.id }) catch null;
+            billed += self.billedOnce(qp, if (e.inherited_qsa) 0 else e.qsa_history_bytes, seen);
         }
         for (e.chunk_bytes, 0..) |cb, i| {
-            const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, e.id, i }) catch {
-                billed += cb;
-                continue;
-            };
-            defer self.allocator.free(cp);
-            const st = statFile(self.io, cp) orelse {
-                billed += cb;
-                continue;
-            };
-            if (st.nlink <= 1) {
-                billed += st.size;
-                continue;
-            }
-            const ino: u64 = @intCast(st.inode);
-            const gop = seen.getOrPut(ino) catch {
-                billed += st.size;
-                continue;
-            };
-            if (!gop.found_existing) billed += st.size;
+            const cp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors", .{ self.root, e.id, i }) catch null;
+            billed += self.billedOnce(cp, cb, seen);
         }
         e.bytes = billed;
     }
@@ -3898,7 +3945,7 @@ pub const DiskTier = struct {
                     const pos = jsonU64(o, "pos") orelse continue;
                     const szrec = jsonU64(o, "bytes") orelse continue;
                     if (pos == 0 or pos > kv_len) continue; // beyond the salvaged KV → unusable
-                    const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch continue;
+                    const sp = self.ssmPath(id, pos) orelse continue;
                     defer self.allocator.free(sp);
                     const have = fileSize(self.io, sp) orelse continue;
                     if (have != szrec) continue; // truncated mid-flush — drop this position
@@ -9825,4 +9872,121 @@ test "failure attribution overflow retires all unfinished module exports once" {
     try testing.expectEqual(@as(u64, 2), tier.module_export_losses_total);
     _ = tier.harvestWriteFailures();
     try testing.expectEqual(@as(u64, 2), tier.module_export_losses_total);
+}
+
+test "DiskTier chunk share: an heir hard-links the donor's checkpoints below the shared prefix and keeps them after the donor dies" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssm-share", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520); // 4 whole chunks shared; the fork is at 520
+
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 590, s), // above the fork: never linked
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, &cps, s);
+    const donor_id = tier.entries.items[0].id;
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 512, 590 }, tier.entries.items[0].ssm_positions);
+
+    // The heir's own prefill captured nothing (cps = null): every checkpoint it holds is linked.
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+    try testing.expectEqual(@as(usize, 2), tier.entryCount());
+    const heir = &tier.entries.items[1];
+    const heir_id = heir.id;
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 512 }, heir.ssm_positions);
+    // One inode, two links; the links bill 0, like inherited chunks.
+    var pbuf: [1024]u8 = undefined;
+    var hbuf: [1024]u8 = undefined;
+    const dp = try std.fmt.bufPrint(&pbuf, "{s}/fp-ssm-share/e{d}/s{d:0>7}.safetensors", .{ base, donor_id, 512 });
+    const hp = try std.fmt.bufPrint(&hbuf, "{s}/fp-ssm-share/e{d}/s{d:0>7}.safetensors", .{ base, heir_id, 512 });
+    try testing.expectEqual(statFile(io, dp).?.inode, statFile(io, hp).?.inode);
+    try testing.expectEqual(@as(u64, 2), @as(u64, @intCast(statFile(io, hp).?.nlink)));
+    try testing.expectEqual(heir.chunk_bytes[4] + 600 * 4, heir.bytes);
+
+    // A fresh scan re-validates the linked sizes and bills each inode once.
+    {
+        var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssm-share", 0, 128);
+        defer tier2.deinit();
+        try testing.expectEqual(tier.total_bytes, tier2.total_bytes);
+    }
+
+    // The donor dies (byte-budget LRU): the heir still restores at 512 for a fork at 520.
+    const before = tier.total_bytes;
+    tier.removeAt(0);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+    try testing.expectEqual(@as(?u32, 512), tier.highestSsmPosAtOrBelow(0, 520));
+    // The linked checkpoint files stayed on disk, so removing the donor did not return their bytes.
+    try testing.expect(statFile(io, hp) != null);
+    try testing.expect(tier.total_bytes < before);
+}
+
+test "DiskTier chunk share: thinning a checkpoint the donor still links keeps the bill (a fresh scan agrees)" {
+    // Retention drops a linked file from the heir while the donor still holds the inode: the volume gets nothing back.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    chunk_share_override = true;
+    defer chunk_share_override = null;
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssm-thin", 0, 128);
+    defer tier.deinit();
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    const toks = chunkShareTokens(520);
+
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 512, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.a, false, &cps, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, null, s);
+    try testing.expectEqualSlices(u32, &[_]u32{ 128, 512 }, tier.entries.items[1].ssm_positions);
+
+    // The heir's next checkpoint pushes both linked ones out (cap 1).
+    tier.ssm_max_per_entry = 1;
+    var top = [_]transformer_mod.SSMCheckpoint{try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 560, s)};
+    defer top[0].deinit(testing.allocator);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &toks.b, false, &top, s);
+    try testing.expectEqual(@as(usize, 1), tier.entries.items[1].ssm_positions.len);
+    {
+        var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssm-thin", 0, 128);
+        defer tier2.deinit();
+        try testing.expectEqual(tier2.total_bytes, tier.total_bytes);
+    }
+    // The donor dies: its checkpoints are now its own last links, and the bill still matches the files.
+    tier.removeAt(0);
+    {
+        var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-ssm-thin", 0, 128);
+        defer tier3.deinit();
+        try testing.expectEqual(tier3.total_bytes, tier.total_bytes);
+    }
 }
