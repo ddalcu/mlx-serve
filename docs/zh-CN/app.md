@@ -20,6 +20,7 @@
 - **可编辑的系统提示词 + 持久记忆** —— `~/.mlx-serve/system-prompt.md` 和 `~/.mlx-serve/memory.md`。
 - **基于提示词的技能** —— 把带 YAML frontmatter 的 `.md` 文件放进 `~/.mlx-serve/skills/`，即可教给 Agent 由关键词触发的自定义能力；或者在聊天框里输入 `/` 挑一个技能，在任何聊天中按名字运行它，无论是否处于 Agent 模式。
 - **引擎感知的设置窗口**（Cmd+,）—— 每一项服务器启动参数与每个请求的默认值，分区只显示与你已加载引擎相关的旋钮（MLX vs GGUF vs ds4）。
+- **模型浏览器导航** —— “我的模型”位于侧边栏首位。打开模型浏览器时，如有可用于聊天的本地模型则显示“我的模型”，否则显示“推荐”；明确选择的目标页面保持不变。
 - **服务器管理** —— 启动 / 停止、实时日志缓冲、参数变更后提示重启的横幅。
 - **图像 / 视频 / 音乐 / 语音 / 3D 生成** —— FLUX.2、Krea-2、Mage-Flow、LTX-Video 2.3 / 2.5、MiniMax-H3、ACE-Step、MiniMax Music 3、YuE2、Qwen3-TTS、Kokoro 和 Hunyuan3D，全部通过 mlx-serve zig 服务器原生运行。
 

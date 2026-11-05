@@ -20,6 +20,7 @@ Menu-bar app that wraps the server with a full UI. [Download the latest release]
 - **Editable system prompt + persistent memory** — `~/.mlx-serve/system-prompt.md` and `~/.mlx-serve/memory.md`.
 - **Prompt-based skills** — drop `.md` files into `~/.mlx-serve/skills/` with YAML frontmatter to teach the agent custom capabilities triggered by keywords, or type `/` in the chat box to pick one and run it by name in any chat, agent mode or not.
 - **Engine-aware Settings window** (Cmd+,) — every server-launch flag and per-request default, with sections that show only the knobs relevant to the engine you've loaded (MLX vs GGUF vs ds4).
+- **Model browser navigation** — My Models is first in the sidebar. Opening Models shows My Models when a local chat-capable model is available, or Recommended otherwise; explicit destinations remain unchanged.
 - **Server management** — start/stop, live log buffer, restart-on-flag-change banner.
 - **Image / Video / Music / Speech / 3D generation** — FLUX.2, Krea-2, Mage-Flow, LTX-Video 2.3 / 2.5, MiniMax-H3, ACE-Step, MiniMax Music 3, YuE2, Qwen3-TTS, Kokoro and Hunyuan3D, all native via the mlx-serve zig server.
 
