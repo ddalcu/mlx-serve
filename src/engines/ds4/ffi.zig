@@ -223,6 +223,10 @@ pub extern fn ds4_token_assistant(e: *Engine) c_int;
 pub extern fn ds4_session_create(out: *?*Session, e: *Engine, ctx_size: c_int) c_int;
 pub extern fn ds4_session_free(s: ?*Session) void;
 pub extern fn ds4_session_set_progress(s: *Session, f: SessionProgressFn, ud: ?*anyopaque) void;
+pub const SessionCancelFn = ?*const fn (ud: ?*anyopaque) callconv(.c) bool;
+pub extern fn ds4_session_set_cancel(s: *Session, f: SessionCancelFn, ud: ?*anyopaque) void;
+/// `ds4_session_sync`'s rc when the cancel callback stopped it (`DS4_SESSION_SYNC_INTERRUPTED`).
+pub const session_sync_interrupted: c_int = 2;
 
 pub extern fn ds4_session_sync(s: *Session, prompt: *const Tokens, err: ?[*]u8, errlen: usize) c_int;
 pub extern fn ds4_session_rewrite_requires_rebuild(live_len: c_int, canonical_len: c_int, common: c_int) bool;
@@ -274,9 +278,42 @@ pub extern fn ds4_session_eval_speculative_argmax(
     err: ?[*]u8,
     errlen: usize,
 ) c_int;
+pub extern fn ds4_session_eval_speculative_argmax_ignoring_eos(
+    s: *Session,
+    first_token: c_int,
+    max_tokens: c_int,
+    eos_token: c_int,
+    think_mode: ThinkMode,
+    accepted: ?[*]c_int,
+    accepted_cap: c_int,
+    err: ?[*]u8,
+    errlen: usize,
+) c_int;
 pub extern fn ds4_session_invalidate(s: *Session) void;
 pub extern fn ds4_session_rewind(s: *Session, pos: c_int) void;
 pub extern fn ds4_session_pos(s: *Session) c_int;
+
+/// Mirrors `ds4_vision_embedding`: one image's rows from the vision tower; ds4 owns `data`
+/// (`ds4_vision_embedding_free`).
+pub const VisionEmbedding = extern struct {
+    data: ?[*]f32 = null,
+    token_count: u32 = 0,
+    layout: u32 = 0,
+    grid_width: u32 = 0,
+    grid_height: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    content_width: u32 = 0,
+    content_height: u32 = 0,
+    fingerprint: [32]u8 = @splat(0),
+};
+/// Mirrors `ds4_vision_span`: the prompt position of an image's first placeholder token.
+pub const VisionSpan = extern struct { token_start: u32 = 0, embedding: VisionEmbedding = .{} };
+pub extern fn ds4_engine_has_vision(e: *Engine) bool;
+/// 0 on failure (an image ds4 cannot decode: PNG and JPEG only).
+pub extern fn ds4_engine_vision_encode_memory(e: *Engine, encoded: [*]const u8, encoded_len: usize, out: *VisionEmbedding, err: ?[*]u8, errlen: usize) c_int;
+pub extern fn ds4_vision_embedding_free(embedding: *VisionEmbedding) void;
+pub extern fn ds4_session_sync_multimodal(s: *Session, prompt: *const Tokens, images: ?[*]const VisionSpan, image_count: usize, err: ?[*]u8, errlen: usize) c_int;
 pub extern fn ds4_session_ctx(s: *Session) c_int;
 pub extern fn ds4_engine_routed_quant_bits(e: *Engine) c_int;
 pub extern fn ds4_engine_has_mtp(e: *Engine) bool;
@@ -298,6 +335,9 @@ extern fn mlxserve_ds4_sizeof_distributed_options() usize;
 extern fn mlxserve_ds4_sizeof_tokens() usize;
 extern fn mlxserve_ds4_sizeof_context_memory() usize;
 extern fn mlxserve_ds4_sizeof_session_snapshot() usize;
+extern fn mlxserve_ds4_sizeof_vision_embedding() usize;
+extern fn mlxserve_ds4_sizeof_vision_span() usize;
+extern fn mlxserve_ds4_offsetof_vision_span_embedding() usize;
 
 test "ds4 FFI mirror layout matches ds4.h (mid-struct-insert guard)" {
     // Upstream inserts fields mid-struct on upgrades; a stale mirror corrupts
@@ -312,4 +352,7 @@ test "ds4 FFI mirror layout matches ds4.h (mid-struct-insert guard)" {
     try std.testing.expectEqual(mlxserve_ds4_sizeof_tokens(), @sizeOf(Tokens));
     try std.testing.expectEqual(mlxserve_ds4_sizeof_context_memory(), @sizeOf(ContextMemory));
     try std.testing.expectEqual(mlxserve_ds4_sizeof_session_snapshot(), @sizeOf(SessionSnapshot));
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_vision_embedding(), @sizeOf(VisionEmbedding));
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_vision_span(), @sizeOf(VisionSpan));
+    try std.testing.expectEqual(mlxserve_ds4_offsetof_vision_span_embedding(), @offsetOf(VisionSpan, "embedding"));
 }

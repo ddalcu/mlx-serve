@@ -84,6 +84,8 @@ pub const Info = extern struct {
     eos: Span(u32), // the engine's stop set; the host merges generation_config's
     startup: Str, // one line the host logs at load (the memory plan, the cluster)
     vocab_size: u32 = 0, // Caps.owns_tokenizer: the ids a prompt may carry
+    /// The image atom for a host-rendered template; borrowed until close. Empty uses typed content parts.
+    image_placeholder: Str = .{},
 };
 
 pub const Sampling = extern struct {
@@ -360,7 +362,7 @@ test "engine abi: extern layouts are pinned (64-bit)" {
     try expectLayout(Verdict, 24, .{ .code = 0, .why = 8 });
     try expectLayout(Host, 40, .{ .size = 0, .ctx = 8, .log = 16, .wake = 24, .progress = 32 });
     try expectLayout(Open, 112, .{ .size = 0, .model_dir = 8, .model_type = 24, .config_json = 40, .context = 56, .max_concurrent = 60, .memory_budget = 64, .settings_json = 72, .options_json = 88, .host = 104 });
-    try expectLayout(Info, 104, .{ .size = 0, .name = 8, .version = 24, .caps = 40, .threading = 48, .context_window = 52, .max_concurrent = 56, .embedding_dims = 60, .eos = 64, .startup = 80, .vocab_size = 96 });
+    try expectLayout(Info, 120, .{ .size = 0, .name = 8, .version = 24, .caps = 40, .threading = 48, .context_window = 52, .max_concurrent = 56, .embedding_dims = 60, .eos = 64, .startup = 80, .vocab_size = 96, .image_placeholder = 104 });
     try expectLayout(Sampling, 56, .{ .temperature = 0, .top_p = 4, .top_k = 8, .min_p = 12, .seed = 16, .seeded = 24, .repeat_penalty = 28, .frequency_penalty = 32, .presence_penalty = 36, .logit_bias = 40 });
     try expectLayout(Bias, 8, .{ .token = 0, .bias = 4 });
     try expectLayout(Grammar, 32, .{ .size = 0, .kind = 4, .text = 8, .after = 24 });
@@ -396,14 +398,14 @@ test "engine abi: Caps bit positions are pinned" {
 }
 
 test "engine abi: enum tags and constants are pinned" {
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(Threading.host_gpu_thread));
-    try testing.expectEqual(@as(u8, 4), @intFromEnum(@FieldType(Verdict, "code").failed));
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(@FieldType(Event, "kind").finished));
-    try testing.expectEqual(@as(u8, 3), @intFromEnum(@FieldType(Event, "reason").failed));
-    try testing.expectEqual(@as(u8, 4), @intFromEnum(@FieldType(Grammar, "kind").ebnf));
-    try testing.expectEqual(@as(u8, 2), @intFromEnum(@FieldType(Media, "kind").audio));
-    try testing.expectEqual(@as(u8, 1), @intFromEnum(Action.stop));
-    try testing.expectEqual(@as(u8, 4), @intFromEnum(Progress.prefill_done));
+    try testing.expectEqual(@as(u8, 1), @backingInt(Threading.host_gpu_thread));
+    try testing.expectEqual(@as(u8, 4), @backingInt(@FieldType(Verdict, "code").failed));
+    try testing.expectEqual(@as(u8, 2), @backingInt(@FieldType(Event, "kind").finished));
+    try testing.expectEqual(@as(u8, 3), @backingInt(@FieldType(Event, "reason").failed));
+    try testing.expectEqual(@as(u8, 4), @backingInt(@FieldType(Grammar, "kind").ebnf));
+    try testing.expectEqual(@as(u8, 2), @backingInt(@FieldType(Media, "kind").audio));
+    try testing.expectEqual(@as(u8, 1), @backingInt(Action.stop));
+    try testing.expectEqual(@as(u8, 4), @backingInt(Progress.prefill_done));
     try testing.expectEqualStrings("mlx_serve_engine_v1", entry_symbol);
     try testing.expectEqual(@as(u32, 1), version);
 }

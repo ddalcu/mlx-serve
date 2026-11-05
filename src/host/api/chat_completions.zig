@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const ablation = @import("ablation.zig");
+const abi = @import("../../abi/engine.zig");
 const schema_check = @import("schema_check.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
@@ -56,6 +57,7 @@ const sendGenerationError = @import("../http/errors.zig").sendGenerationError;
 const checkAttentionMemory = @import("admission.zig").checkAttentionMemory;
 const clampMaxTokens = @import("sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("media_gate.zig").mediaRejectReason;
+const mediaSupportOf = @import("media_gate.zig").mediaSupportOf;
 const dropMedia = @import("media_gate.zig").dropMedia;
 const imageUrlOfPart = @import("media_gate.zig").imageUrlOfPart;
 const encodeText = @import("tokenize.zig").encodeText;
@@ -103,7 +105,7 @@ const prepareMultimodalPrompt = @import("../media/encode.zig").prepareMultimodal
 const multimodalFailure = @import("../media/encode.zig").multimodalFailure;
 const parseAudioInput = @import("../media/encode.zig").parseAudioInput;
 const AUDIO_DECODE_REJECT = @import("../media/request_media.zig").AUDIO_DECODE_REJECT;
-const visionPreprocFromConfig = @import("../media/prepare.zig").visionPreprocFromConfig;
+const visionPreprocForModel = @import("../media/prepare.zig").visionPreprocForModel;
 const RequestMedia = @import("../media/request_media.zig").RequestMedia;
 const appendImageUrlContent = @import("../media/request_media.zig").appendImageUrlContent;
 const IMAGE_DECODE_REJECT = @import("../media/request_media.zig").IMAGE_DECODE_REJECT;
@@ -228,7 +230,7 @@ pub fn handleChatCompletions(
                             image_decode_failed = true;
                             continue;
                         };
-                        if (!appendImageUrlContent(allocator, media.images(img_slot), url, visionPreprocFromConfig(config))) image_decode_failed = true;
+                        if (!appendImageUrlContent(allocator, media.images(img_slot), url, visionPreprocForModel(lm, config))) image_decode_failed = true;
                     } else if (std.mem.eql(u8, ptype.string, "video_url")) {
                         // A video is, on the wire, an ordered array of already-
                         // decoded frame images — no video codec exists anywhere
@@ -244,7 +246,7 @@ pub fn handleChatCompletions(
                             if (f == .string) frame_urls.append(allocator, f.string) catch continue;
                         }
                         const before = media.videos(vid_slot).items.len;
-                        appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocFromConfig(config));
+                        appendVideoUrlContent(allocator, media.videos(vid_slot), frame_urls.items, visionPreprocForModel(lm, config));
                         // The rate the client sampled the frames at (a plugin tower's timestamps read it).
                         if (vid_obj.object.get("fps")) |f| if (media.videos(vid_slot).items.len > before) {
                             const rate: f64 = switch (f) {
@@ -647,8 +649,8 @@ pub fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(mtpCapable(lm), dsv4DraftStages(lm));
+    if (enable_mtp and !mtpCapable(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
         enable_mtp = false;
@@ -711,13 +713,14 @@ pub fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
         return;
     };
-    if (lm.vision_encoder == null) {
-        if (mediaRejectReason(messages.items, continue_final)) |reason| {
+    {
+        const support = mediaSupportOf(lm);
+        if (mediaRejectReason(messages.items, continue_final, support)) |reason| {
             log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{reason});
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
-        try dropMedia(allocator, messages.items, &content_allocs);
+        try dropMedia(allocator, messages.items, &content_allocs, support);
     }
     // The request's `chat_template_kwargs` merge over the model's for this render only.
     var render_config = chat_config.*;
@@ -771,7 +774,7 @@ pub fn handleChatCompletions(
     const cache_key = requestCacheKey(root);
     var mm: MultimodalPrompt = .{};
     defer mm.deinit(allocator);
-    if (lm.vision_encoder != null) {
+    if (lm.vision_encoder != null or lm.engine != null) {
         mm = prepareMultimodalPrompt(allocator, lm, config, messages.items, &prompt_ids_raw) catch |err| {
             allocator.free(prompt_ids_raw);
             const f = multimodalFailure(err);
@@ -918,18 +921,18 @@ pub fn handleChatCompletions(
     const sub_mrope = mm.mrope;
     mm.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream and speech_ask != null) {
-        speech_stream.handle(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, model_name, include_usage, if (has_tools) tools_json else null, allow_parallel_tools, sub_ve, mm.media, cache_key, sub_mrope, tokenize_ns) catch |err| {
+        speech_stream.handle(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, model_name, include_usage, if (has_tools) tools_json else null, allow_parallel_tools, sub_ve, mm.media, mm.engine_media, cache_key, sub_mrope, tokenize_ns) catch |err| {
             logStreamError(err);
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, mm.engine_media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             logStreamError(err);
             // One mapping with the non-streaming arm: an HTTP status before the SSE head, an SSE `error` event after.
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns, speech_ask) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, surface_budget, enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, mm.engine_media, cache_key, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns, speech_ask) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .openai) catch {};
         };
@@ -1045,6 +1048,7 @@ fn handleNonStreamingGeneration(
     allow_batch_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     media: []const MediaSpan,
+    engine_media: []const abi.Media,
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
@@ -1084,7 +1088,7 @@ fn handleNonStreamingGeneration(
         break :blk v;
     };
     // Propagates to `handleChatCompletions`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, if (speech != null) .{} else null, stream);
+    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, engine_media, cache_key, mrope, logprobs_n, false, kv_quant_override, kv_attn_explicit, if (speech != null) .{} else null, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     defer if (result.logprobs) |lps| {

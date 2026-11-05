@@ -1407,7 +1407,7 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         // Offline mode only runs with --prompt.
-        try runGgufOffline(io, allocator, model_dir, chosen, prompt.?, max_tokens, temperature, ctx_size);
+        try runGgufOffline(io, allocator, model_dir, chosen, prompt.?, max_tokens, temperature, ctx_size, !no_vision);
         return;
     }
 
@@ -1482,7 +1482,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @intFromEnum(mode), group_model, dist_split));
+        try err_name.check(mlx_engine.api().cluster_connect(io, allocator, coordinator, device, @backingInt(mode), group_model, dist_split));
     }
 
     if (serve_mode) {
@@ -2104,6 +2104,7 @@ fn runGgufServe(
         .kv_quant_config = KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
+        .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .llama = server_mod.llama_settings,
         .gguf = .{ .path = gguf_path, .engine = engine },
@@ -2140,6 +2141,7 @@ fn runGgufOffline(
     max_tokens: u32,
     temp: f32,
     ctx_size: u32,
+    vision: bool,
 ) !void {
     const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
         logResolveGgufError(model_dir, err);
@@ -2150,7 +2152,7 @@ fn runGgufOffline(
     log.info("[{s}] model: {s}\n", .{ @tagName(kind), gguf_path });
 
     const settings = if (engine == .ds4)
-        try std.json.Stringify.valueAlloc(allocator, ds4_load.Flags{ .mtp = ds4_mtp, .dspark = ds4_dspark, .ssd_streaming = ds4_ssd_streaming, .prefill_chunk = mlx_engine.settings().explicit_prefill_chunk }, .{})
+        try std.json.Stringify.valueAlloc(allocator, ds4_load.Flags{ .mtp = ds4_mtp, .dspark = ds4_dspark, .ssd_streaming = ds4_ssd_streaming, .prefill_chunk = mlx_engine.settings().explicit_prefill_chunk, .vision = vision }, .{})
     else
         try std.json.Stringify.valueAlloc(allocator, llama_load.Settings{ .seqs = 1, .mtp_drafts = 0 }, .{});
     defer allocator.free(settings);

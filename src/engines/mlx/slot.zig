@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const abi = @import("../../abi/engine.zig");
+const media_owned = @import("../../sdk/media/engine_media.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
@@ -68,6 +69,8 @@ pub const Slot = struct {
     vision_embeddings: ?mlx.mlx_array,
     /// Media items in `full_prompt` (owned): the prefix-cache key of their rows.
     media: []prefix_cache_mod.MediaSpan,
+    /// The prompt's images for an engine beside MLX (`offload.submit`), pixels owned.
+    engine_media: []abi.Media = &.{},
     cache_key: u64 = 0,
     client: metrics_mod.Client = .other,
     request_id: u64 = 0,
@@ -292,8 +295,10 @@ pub const Slot = struct {
         const full_prompt_src = params.full_prompt orelse params.prompt_ids;
         const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
         errdefer allocator.free(full_prompt_owned);
-        const media_owned = try allocator.dupe(prefix_cache_mod.MediaSpan, params.media);
-        errdefer allocator.free(media_owned);
+        const media_spans = try allocator.dupe(prefix_cache_mod.MediaSpan, params.media);
+        errdefer allocator.free(media_spans);
+        const engine_media = try media_owned.dupe(allocator, params.engine_media);
+        errdefer media_owned.deinit(allocator, engine_media);
         const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
         errdefer allocator.free(eos_owned);
 
@@ -305,7 +310,8 @@ pub const Slot = struct {
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
-            .media = media_owned,
+            .media = media_spans,
+            .engine_media = engine_media,
             .cache_key = params.cache_key,
             .client = params.client,
             .request_id = metrics_mod.nextRequestId(),
@@ -427,6 +433,7 @@ pub const Slot = struct {
         self.allocator.free(self.prompt_ids);
         self.allocator.free(self.full_prompt);
         self.allocator.free(self.media);
+        media_owned.deinit(self.allocator, self.engine_media);
         self.allocator.free(self.eos_token_ids);
         if (self.error_code) |code| self.allocator.free(code);
         if (self.generated_ids) |g| self.allocator.free(g);

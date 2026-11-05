@@ -14,6 +14,7 @@ const model_registry_mod = @import("../registry/registry.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
+const abi = @import("../../abi/engine.zig");
 
 const loadedSupportsVideo = @import("../api/models.zig").loadedSupportsVideo;
 const MediaItem = @import("placeholders.zig").MediaItem;
@@ -28,76 +29,8 @@ const radioMediaTokens = @import("../../plugins/nemotron_h/media.zig").radioMedi
 const ByteTokenizer = @import("placeholders.zig").ByteTokenizer;
 const expandRuns = @import("placeholders.zig").expandRuns;
 
-/// The encoder inputs for a request's items: one piece per tower call (an
-/// LFM2-VL tile, else the whole item), keyed by its pixels/PCM; an item's key
-/// folds its pieces'.
-const MediaPieces = struct {
-    pieces: []scheduler_mod.VisionItem,
-    piece_keys: []u64,
-    item_keys: []u64,
-
-    fn init(allocator: std.mem.Allocator, items: []const MediaItem) !MediaPieces {
-        var pieces = std.ArrayList(scheduler_mod.VisionItem).empty;
-        defer pieces.deinit(allocator);
-        for (items) |item| switch (item) {
-            .image => |imgs| for (imgs) |img| try pieces.append(allocator, .{ .image = .{
-                .pixels = img.pixels,
-                .width = img.width,
-                .height = img.height,
-                .grid_h = img.grid_h,
-                .grid_w = img.grid_w,
-            } }),
-            .video => |vid| try pieces.append(allocator, .{ .video = .{
-                .pixels = vid.pixels,
-                .grid_t = vid.grid_t,
-                .grid_h = vid.grid_h,
-                .grid_w = vid.grid_w,
-                .fps = vid.fps,
-            } }),
-            .audio => |au| try pieces.append(allocator, .{ .audio = au.samples }),
-        };
-        const piece_keys = try allocator.alloc(u64, pieces.items.len);
-        errdefer allocator.free(piece_keys);
-        for (pieces.items, piece_keys) |piece, *k| k.* = pieceKey(piece);
-        const item_keys = try allocator.alloc(u64, items.len);
-        errdefer allocator.free(item_keys);
-        var p: usize = 0;
-        for (items, item_keys) |item, *k| {
-            const n = piecesOf(item);
-            var h = std.hash.Wyhash.init(0x5ec0de);
-            h.update(std.mem.sliceAsBytes(piece_keys[p .. p + n]));
-            k.* = h.final() | 1;
-            p += n;
-        }
-        return .{ .pieces = try pieces.toOwnedSlice(allocator), .piece_keys = piece_keys, .item_keys = item_keys };
-    }
-
-    fn deinit(self: *MediaPieces, allocator: std.mem.Allocator) void {
-        allocator.free(self.pieces);
-        allocator.free(self.piece_keys);
-        allocator.free(self.item_keys);
-    }
-};
-
-fn piecesOf(item: MediaItem) usize {
-    return if (item == .image) item.image.len else 1;
-}
-
-fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
-    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(piece)));
-    switch (piece) {
-        .image => |im| {
-            h.update(std.mem.asBytes(&[_]u32{ im.width, im.height, im.grid_h, im.grid_w }));
-            h.update(im.pixels);
-        },
-        .video => |vd| {
-            h.update(std.mem.asBytes(&[_]u32{ vd.grid_t, vd.grid_h, vd.grid_w, @bitCast(vd.fps) }));
-            h.update(vd.pixels);
-        },
-        .audio => |pcm| h.update(pcm),
-    }
-    return h.final();
-}
+const MediaPieces = @import("pieces.zig").MediaPieces;
+const piecesOf = @import("pieces.zig").piecesOf;
 
 const EncodedMedia = struct {
     rows: mlx.mlx_array,
@@ -168,6 +101,8 @@ pub const MropeData = struct {
 pub const MultimodalPrompt = struct {
     embeddings: ?mlx.mlx_array = null,
     media: []MediaSpan = &.{},
+    /// Descriptors owned here; RGB bytes borrowed from `RequestMedia` until submit copies them.
+    engine_media: []abi.Media = &.{},
     mrope: MropeData = .{},
     /// Soft-token rows in `embeddings`.
     rows: usize = 0,
@@ -180,6 +115,7 @@ pub const MultimodalPrompt = struct {
     pub fn deinit(self: *MultimodalPrompt, allocator: std.mem.Allocator) void {
         if (self.embeddings) |e| _ = mlx.mlx_array_free(e);
         allocator.free(self.media);
+        allocator.free(self.engine_media);
         if (self.mrope.pos) |p| allocator.free(p);
         self.* = .{};
     }
@@ -196,6 +132,13 @@ pub fn prepareMultimodalPrompt(allocator: std.mem.Allocator, lm: *LoadedModel, c
 /// `prepareMultimodalPrompt` for items a caller already put in placeholder order.
 pub fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
     if (items.len == 0) return .{};
+    if (lm.engine) |e| {
+        if (!e.caps().images) return error.ImagesUnsupported;
+        const atom = e.imagePlaceholder() orelse return error.MediaPlaceholderMismatch;
+        const tokens = try e.tokenize(allocator, atom, false);
+        defer allocator.free(tokens);
+        return @import("engine.zig").prepare(allocator, items, prompt_ids.*, tokens);
+    }
     var videos: usize = 0;
     for (items) |it| videos += @intFromBool(it == .video);
     if (videos > 0 and !loadedSupportsVideo(lm)) return error.VideoUnsupported;
@@ -261,6 +204,9 @@ pub fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, co
 
 /// The error response for a failed `prepareMultimodalPrompt`.
 pub fn multimodalFailure(err: anyerror) struct { status: []const u8, code: u16, kind: []const u8, message: []const u8 } {
+    if (err == error.ImagesUnsupported) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "image input is not supported by this model's loaded engine (no vision tower or projector)" };
+    if (err == error.AudioUnsupported) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "audio input is not supported by this model's loaded engine" };
+    if (err == error.InvalidImagePixels) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "image input must decode to non-empty RGB8 pixels matching its dimensions" };
     if (err == error.VideoUnsupported) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "video input is not supported by this model's loaded vision tower" };
     if (err == error.MediaPlaceholderMismatch) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = MEDIA_PLACEHOLDER_REJECT };
     return .{ .status = "500 Internal Server Error", .code = 500, .kind = "server_error", .message = "media encoding failed" };
@@ -377,6 +323,7 @@ test "RADIO video availability rejects a forced clip before encoding with a name
     encoder.plugin_media = null;
     var entry: LoadedModel = undefined;
     entry.vision_encoder = &encoder;
+    entry.engine = null;
     entry.tokenizer = null;
     const config = model_mod.ModelConfig{ .radio_vision = true, .image_token_id = 18 };
     const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 64, .grid_w = 64 };

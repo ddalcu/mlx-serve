@@ -149,6 +149,13 @@ pub const Served = struct {
         return s.info.caps;
     }
 
+    /// The engine's complete image atom, borrowed for the opened model's lifetime.
+    pub fn imagePlaceholder(s: *const Served) ?[]const u8 {
+        if (s.info.size < @offsetOf(abi.Info, "image_placeholder") + @sizeOf(abi.Str)) return null;
+        if (!s.caps().images or s.info.image_placeholder.len == 0) return null;
+        return s.info.image_placeholder.slice();
+    }
+
     /// What the engine holds now (its weights, KV and caches; outside MLX's counters).
     pub fn residentBytes(s: *const Served) u64 {
         var m: abi.Memory = .{};
@@ -235,6 +242,18 @@ fn hostProgress(ctx: *anyopaque, what: abi.Progress, n: i64) callconv(.c) void {
 // ── tests ──
 
 const testing = std.testing;
+
+test "engine image transport imagePlaceholder is borrowed only for an image-capable opened model" {
+    var engine: Served = undefined;
+    engine.info = std.mem.zeroInit(abi.Info, .{});
+    try testing.expect(engine.imagePlaceholder() == null);
+    engine.info.caps.images = true;
+    try testing.expect(engine.imagePlaceholder() == null);
+    engine.info.image_placeholder = abi.Str.of("<start><image><end>");
+    try testing.expectEqualStrings("<start><image><end>", engine.imagePlaceholder().?);
+    engine.info.size = @offsetOf(abi.Info, "image_placeholder");
+    try testing.expect(engine.imagePlaceholder() == null);
+}
 
 /// A GGUF header file `name` in `tmp` with `kvs`; returns its absolute path in `buf`.
 fn writeGguf(tmp: *std.testing.TmpDir, buf: []u8, name: []const u8, kvs: []const engine_pick.KV) ![]const u8 {

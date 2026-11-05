@@ -1,6 +1,7 @@
 //! StreamMode, StreamingTokenStream; handleStreamingGeneration
 
 const std = @import("std");
+const abi = @import("../../abi/engine.zig");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
@@ -172,6 +173,7 @@ pub fn handleStreamingGeneration(
     allow_batch_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     media: []const MediaSpan,
+    engine_media: []const abi.Media,
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
@@ -252,6 +254,7 @@ pub fn handleStreamingGeneration(
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
         .media = media,
+        .engine_media = engine_media,
         .cache_key = cache_key,
         .client = stream.client,
         .ablation = stream.ablation,

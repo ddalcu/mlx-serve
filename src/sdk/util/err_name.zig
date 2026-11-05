@@ -6,6 +6,8 @@ const std = @import("std");
 /// Every error the host tells apart from an engine call. Anything else arrives as `error.EngineFailed`, its name in
 /// `last` for the message.
 pub const Known = error{
+    ContextExceeded,
+    MediaPlaceholderMismatch,
     EmptyPrompt,
     EngineBusy,
     EngineUnsupported,

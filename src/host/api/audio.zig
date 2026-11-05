@@ -229,7 +229,7 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
     const spec = false;
     const mtp = config.isNemoSpeech();
     var timer = Stopwatch.init(stream.io);
-    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, mtp, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, null, stream) catch |err| {
+    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, mtp, spec, getTimeoutNs(), slot_ve, mm.media, mm.engine_media, 0, .{}, 0, false, null, null, null, stream) catch |err| {
         log.err("  -> {s}\n", .{@errorName(err)});
         sendGenerationError(allocator, stream, err, .openai) catch {};
         return null;
@@ -289,7 +289,7 @@ pub fn handleSpeech(allocator: std.mem.Allocator, stream: *Conn, body: []const u
     const max_tokens = clampMaxTokens(SPEECH_MAX_FRAMES, prompt_ids.len, effective_ctx);
     if (!try checkAttentionMemory(allocator, stream, prompt_ids, max_tokens, config, false, null, lm, false, 0)) return;
     var timer = Stopwatch.init(stream.io);
-    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = 0 }, config.eosTokenSlice(), 0, false, false, false, false, false, false, getTimeoutNs(), null, &.{}, 0, .{}, 0, false, null, null, .{}, stream) catch |err| {
+    const result = nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = 0 }, config.eosTokenSlice(), 0, false, false, false, false, false, false, getTimeoutNs(), null, &.{}, &.{}, 0, .{}, 0, false, null, null, .{}, stream) catch |err| {
         log.err("  -> {s}\n", .{@errorName(err)});
         sendGenerationError(allocator, stream, err, .openai) catch {};
         return;

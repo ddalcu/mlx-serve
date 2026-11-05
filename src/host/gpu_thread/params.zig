@@ -205,6 +205,9 @@ pub const SubmitParams = struct {
     vision_embeddings: ?mlx.mlx_array = null,
     /// Media items in the prompt, for the prefix-cache key. Borrowed; the slot copies it.
     media: []const MediaSpan = &.{},
+    /// The prompt's images as pixels, for an engine that sees them itself (`Caps.images`). Borrowed; the slot
+    /// copies them.
+    engine_media: []const abi.Media = &.{},
     /// Workload key for hot-cache eviction (`server.requestCacheKey`, 0 = anonymous).
     cache_key: u64 = 0,
     client: metrics_mod.Client = .other,

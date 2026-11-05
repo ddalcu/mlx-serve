@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const ablation = @import("ablation.zig");
+const abi = @import("../../abi/engine.zig");
 const schema_check = @import("schema_check.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
@@ -50,6 +51,7 @@ const sendGenerationError = @import("../http/errors.zig").sendGenerationError;
 const checkAttentionMemory = @import("admission.zig").checkAttentionMemory;
 const clampMaxTokens = @import("sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("media_gate.zig").mediaRejectReason;
+const mediaSupportOf = @import("media_gate.zig").mediaSupportOf;
 const dropMedia = @import("media_gate.zig").dropMedia;
 const effortWordOnly = @import("../chat/reasoning/request.zig").effortWordOnly;
 const implicitEffortBudgetFor = @import("../chat/reasoning/request.zig").implicitEffortBudgetFor;
@@ -85,7 +87,7 @@ const MropeData = @import("../media/encode.zig").MropeData;
 const MultimodalPrompt = @import("../media/encode.zig").MultimodalPrompt;
 const prepareMultimodalPrompt = @import("../media/encode.zig").prepareMultimodalPrompt;
 const multimodalFailure = @import("../media/encode.zig").multimodalFailure;
-const visionPreprocFromConfig = @import("../media/prepare.zig").visionPreprocFromConfig;
+const visionPreprocForModel = @import("../media/prepare.zig").visionPreprocForModel;
 const RequestMedia = @import("../media/request_media.zig").RequestMedia;
 const appendAnthropicImageBlock = @import("../media/request_media.zig").appendAnthropicImageBlock;
 const IMAGE_DECODE_REJECT = @import("../media/request_media.zig").IMAGE_DECODE_REJECT;
@@ -341,7 +343,7 @@ pub fn handleAnthropicMessages(
                                 result_text = joined.text;
                                 // Claude Code's Read tool returns an image as a block here.
                                 for (result_arr.items) |part| {
-                                    if (!try appendAnthropicImageBlock(allocator, media.images(result_imgs), part, visionPreprocFromConfig(config))) image_decode_failed = true;
+                                    if (!try appendAnthropicImageBlock(allocator, media.images(result_imgs), part, visionPreprocForModel(lm, config))) image_decode_failed = true;
                                 }
                             },
                             else => {},
@@ -363,7 +365,7 @@ pub fn handleAnthropicMessages(
                                 if (msg_text.items.len > 0) try msg_text.append(allocator, '\n');
                                 try msg_text.appendSlice(allocator, text);
                             }
-                        } else if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), block, visionPreprocFromConfig(config))) {
+                        } else if (!try appendAnthropicImageBlock(allocator, media.images(img_slot), block, visionPreprocForModel(lm, config))) {
                             image_decode_failed = true;
                         }
                     }
@@ -610,8 +612,8 @@ pub fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(mtpCapable(lm), dsv4DraftStages(lm));
+    if (enable_mtp and !mtpCapable(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
     // chat-completions' `response_format`: a schema instruction in the system
@@ -664,13 +666,14 @@ pub fn handleAnthropicMessages(
     // endpoint has always given.
     const continue_final = chat_mod.continuationRequested(messages.items) and
         continuationRejectReason(lm.engineOwnsTemplate()) == null;
-    if (lm.vision_encoder == null) {
-        if (mediaRejectReason(messages.items, continue_final)) |reason| {
+    {
+        const support = mediaSupportOf(lm);
+        if (mediaRejectReason(messages.items, continue_final, support)) |reason| {
             log.warn("POST /v1/messages -> 400 ({s})\n", .{reason});
             try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
             return;
         }
-        try dropMedia(allocator, messages.items, &content_allocs);
+        try dropMedia(allocator, messages.items, &content_allocs, support);
     }
     var tokenize_sw = Stopwatch.init(stream.io);
     // The `thinking` budget object carries no effort string, but
@@ -720,7 +723,7 @@ pub fn handleAnthropicMessages(
     const cache_key = requestCacheKey(root);
     var mm: MultimodalPrompt = .{};
     defer mm.deinit(allocator);
-    if (lm.vision_encoder != null) {
+    if (lm.vision_encoder != null or lm.engine != null) {
         mm = prepareMultimodalPrompt(allocator, lm, config, messages.items, &prompt_ids_raw) catch |err| {
             allocator.free(prompt_ids_raw);
             const f = multimodalFailure(err);
@@ -838,12 +841,12 @@ pub fn handleAnthropicMessages(
     const sub_mrope = mm.mrope;
     mm.mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, mm.engine_media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             logStreamError(err);
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, surface_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, allow_batch_mtp, sub_ve, mm.media, mm.engine_media, sub_mrope, cache_key, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> {s}\n", .{@errorName(err)});
             sendGenerationError(allocator, stream, err, .anthropic) catch {};
         };
@@ -877,6 +880,7 @@ fn handleAnthropicNonStreaming(
     allow_batch_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
     media: []const MediaSpan,
+    engine_media: []const abi.Media,
     mrope: MropeData,
     cache_key: u64,
     /// Wave 1.A: per-request KV-quant override.
@@ -915,7 +919,7 @@ fn handleAnthropicNonStreaming(
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
     // Propagates to `handleAnthropicMessages`' one error arm, shared with the streaming twin.
-    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, cache_key, mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream);
+    const result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve, media, engine_media, cache_key, mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 

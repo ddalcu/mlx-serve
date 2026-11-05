@@ -48,11 +48,7 @@ fn defaultMinP(kind: Kind) f32 {
 /// `offloaded` list. The slot's `in_pass` is held from here to its `finished` event.
 pub fn submit(slot: *Slot, s: *Served) !void {
     const sp = slot.sampling;
-    // An engine that owns its vocabulary owns its stop set; the request's own EOS joins it.
-    var eos: std.ArrayList(u32) = .empty;
-    defer eos.deinit(slot.allocator);
-    try eos.appendSlice(slot.allocator, slot.eos_token_ids);
-    if (s.caps().owns_tokenizer) try eos.appendSlice(slot.allocator, abi.items(u32, s.info.eos));
+    // Engine EOS is installed in the model config at load. An empty request set is ignore_eos.
     const grammar: abi.Grammar = .{ .kind = .json_schema, .text = .{} };
     const tool_gate: abi.ToolGate = .{ .opener = .{}, .names = .{} };
     const think: abi.Think = .{ .budget = 0, .open = .{}, .opened_in_prompt = false, .close = .{}, .end = abi.no_token };
@@ -60,6 +56,7 @@ pub fn submit(slot: *Slot, s: *Served) !void {
     if (sp.constraint != null and !ask_grammar) log.info("[{s}] response_format ignored: the engine has no grammar sampler\n", .{@tagName(s.kind)});
     const r: abi.Request = .{
         .prompt = abi.span(u32, slot.full_prompt),
+        .media = abi.span(abi.Media, slot.engine_media),
         .max_tokens = slot.max_tokens,
         .sampling = .{
             .temperature = sp.temperature,
@@ -72,12 +69,13 @@ pub fn submit(slot: *Slot, s: *Served) !void {
             .frequency_penalty = sp.frequency_penalty,
             .presence_penalty = sp.presence_penalty,
         },
-        .eos = abi.span(u32, eos.items),
+        .eos = abi.span(u32, slot.eos_token_ids),
         .logprobs = @intCast(@min(slot.logprobs_n, std.math.maxInt(u8))),
         .grammar = if (ask_grammar) &grammar else null,
         .think = if (sp.think_bound != null) &think else null,
         .tool_gate = if (sp.tool_force != null) &tool_gate else null,
         .prompt_logprobs = slot.prompt_logprobs,
+        .no_drafts = !slot.enable_mtp,
     };
     _ = slot.in_pass.fetchAdd(1, .acq_rel);
     _ = s.gauges.prefilling.fetchAdd(1, .monotonic);
@@ -106,7 +104,7 @@ fn onEvent(ctx: *anyopaque, _: u64, ev: *const abi.Event) callconv(.c) abi.Actio
     switch (ev.kind) {
         .prefilled => {
             _ = s.gauges.prefilling.fetchSub(1, .monotonic);
-            slot.prompt_tokens = @intCast(slot.full_prompt.len);
+            slot.prompt_tokens = if (ev.prompt_tokens != 0) ev.prompt_tokens else @intCast(slot.full_prompt.len);
             slot.cached_tokens = ev.cached;
             slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(slot.io, .boot).nanoseconds);
             slot.state = .decoding;
