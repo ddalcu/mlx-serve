@@ -175,6 +175,14 @@ pub fn exportPtxCacheDir(stamp: []const u8) void {
     if (ptxCacheDir(&buf, tmp, stampId(&id_buf, stamp))) |dir| env.set(.MLX_PTX_CACHE_DIR, dir.ptr);
 }
 
+/// macOS drops Metal residency ~2 s after the GPU idles and MLX requests it once per set, so
+/// between requests a near-RAM model is compressed until the machine panics. Must run before
+/// MLX builds its device.
+pub fn exportResidencyRefresh() void {
+    if (comptime builtin.os.tag != .macos) return;
+    if (env.get(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS) == null) env.set(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS, "1000");
+}
+
 var cuda_cache: ?bool = null;
 
 /// The stream weight files load on. A CPU-stream load allocates host memory: on a discrete
@@ -1126,6 +1134,17 @@ test "cudaHomeDefault: export /opt/cuda only when nothing else names a toolkit" 
     try std.testing.expect(cudaHomeDefault(true, false, true) == null);
     try std.testing.expect(cudaHomeDefault(false, true, true) == null);
     try std.testing.expect(cudaHomeDefault(false, false, false) == null);
+}
+
+test "exportResidencyRefresh: defaults to 1000 ms on macOS, keeps a value the user set (0 opts out)" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
+    const saved = env.override(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS, null);
+    defer saved.restore();
+    exportResidencyRefresh();
+    try std.testing.expectEqualStrings("1000", env.span(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS).?);
+    env.set(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS, "0");
+    exportResidencyRefresh();
+    try std.testing.expectEqualStrings("0", env.span(.MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS).?);
 }
 
 test "ptxCacheDir: each staged MLX build compiles into its own kernel cache" {
