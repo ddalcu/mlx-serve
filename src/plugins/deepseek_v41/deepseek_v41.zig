@@ -585,12 +585,14 @@ pub const Dec = struct {
     moe_down_rb: usize = 0,
 
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (device.naxAvailable()) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = try dkern.moe_up.build(cfg.dsv4_swiglu_limit), .moe_fp4 = if (device.naxAvailable()) null else try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = try dkern.moe_down.build() };
+        const nax = device.naxAvailable();
+        // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = if (nax) null else try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
-        d.moe_down_rb = dkern.moe_down.probe(gpa, d.moe_down.?, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
+        if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
             if (e != error.Declined) return e;
-            _ = mlx.mlx_fast_metal_kernel_free(d.moe_down.?);
+            _ = mlx.mlx_fast_metal_kernel_free(kd);
             d.moe_down = null;
             break :blk 0;
         };
@@ -6416,6 +6418,7 @@ const FfnFixture = struct {
         errdefer gpa.destroy(f);
         f.sc = Scope.init(gpa, mlx.gpuStream());
         f.m = undefined;
+        f.m.dec = .{};
         f.m.cfg = .{};
         f.m.cfg.dsv4_swiglu_limit = 10;
         f.m.lhs_gu = none;
