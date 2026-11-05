@@ -8,28 +8,29 @@
 
 ## Decode tok/s by release — Apple M4 Max 128 GB
 
-| Model | 26.8.6 | 26.8.11 | 26.9.1 | 26.9.2 | 26.9.3 | 26.9.5 | 26.9.6 | 26.10.1 | 26.10.2 | 26.10.3 | speedup |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Gemma 4 E4B 4b | 115 | 117 | 114 | 116 | 118 pld | 116 pld | 118 pld | 129 pld | 129 | 127 pld | +10% |
-| Gemma 4 26B-A4B 4b | 116 | 120 | 120 | 120 | 118 | 115 pld | 119 pld | 126 pld | · | 128 pld | +10% |
-| Qwen3.6 35B-A3B 4b (MTP) | 191 mtp | · | · | 259 mtp | 236 mtp | 239 mtp | 241 mtp | 238 mtp | · | 239 mtp | +25% |
-| Qwen3.8 27B 4b (ddalcu) | · | 70 mtp | 71 mtp | 68 mtp | 73 mtp | 70 mtp | 72 mtp | 92 dflash | 109 dflash | 106 dflash | +51% |
-| Qwen3.8 27B iQ-MLX 3.8bpw | · | · | · | · | · | · | · | · | · | 62 mtp | · |
-| Qwen3.8 Flash-Next mixed 4-8b | · | 70 mtp | 68 mtp | 80 mtp | 80 mtp | 83 mtp | 82 mtp | 88 mtp | 91 mtp | · | +30% |
+| Model | 26.8.6 | 26.8.11 | 26.9.1 | 26.9.2 | 26.9.3 | 26.9.5 | 26.9.6 | 26.10.1 | 26.10.2 | 26.10.3 | 26.11.2 | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| Gemma 4 E4B 4b | 115 | 117 | 114 | 116 | 118 pld | 116 pld | 118 pld | 129 pld | 129 | 127 pld | 130 pld | +13% |
+| Gemma 4 26B-A4B 4b | 116 | 120 | 120 | 120 | 118 | 115 pld | 119 pld | 126 pld | · | 128 pld | · | +10% |
+| Qwen3.6 35B-A3B 4b (MTP) | 191 mtp | · | · | 259 mtp | 236 mtp | 239 mtp | 241 mtp | 238 mtp | · | 239 mtp | · | +25% |
+| Qwen3.8 27B 4b (ddalcu) | · | 70 mtp | 71 mtp | 68 mtp | 73 mtp | 70 mtp | 72 mtp | 92 dflash | 109 dflash | 106 dflash | · | +51% |
+| Qwen3.8 27B iQ-MLX 3.8bpw | · | · | · | · | · | · | · | · | · | 62 mtp | 59 mtp | -5% |
+| Qwen3.8 Flash-Next mixed 4-8b | · | 70 mtp | 68 mtp | 80 mtp | 80 mtp | 83 mtp | 82 mtp | 88 mtp | 91 mtp | · | · | +30% |
+| Qwen3.8 Flash-Next iQ-MLX 4.7bpw | · | · | · | · | · | · | · | · | · | · | 83 mtp | · |
 
 ## Decode tok/s by release — Apple M5 Ultra 80c 256 GB
 
-| Model | 26.10.2 | 26.10.3 | 26.11.1 |
-|---|---|---|---|
-| Gemma 4 E4B 4b | 196 pld | 199 pld | 200 pld |
-| Gemma 4 26B-A4B 4b | 187 pld | 186 pld | 184 pld |
-| Qwen3.6 35B-A3B 4b (MTP) | 416 mtp | 424 mtp | 421 mtp |
-| Qwen3.8 27B 4b (ddalcu) | 242 dflash | 242 dflash | 243 dflash |
-| Qwen3.8 27B iQ-MLX 3.8bpw | 134 mtp | 136 mtp | · |
-| Qwen3.8 Flash-Next mixed 4-8b | · | 129 mtp | · |
-| Qwen3.8 Flash-Next iQ-MLX 4.7bpw | 169 mtp | 175 mtp | 180 mtp |
-| MiMo-V2.6-Flash MXFP4-Q8 | 94 mtp | · | · |
-| GLM-5.3-Flash oQ4-MTP | 82 mtp | · | · |
+| Model | 26.10.2 | 26.10.3 | 26.11.1 | 26.11.2 |
+|---|---|---|---|---|
+| Gemma 4 E4B 4b | 196 pld | 199 pld | 200 pld | 199 pld |
+| Gemma 4 26B-A4B 4b | 187 pld | 186 pld | 184 pld | 190 pld |
+| Qwen3.6 35B-A3B 4b (MTP) | 416 mtp | 424 mtp | 421 mtp | 433 mtp |
+| Qwen3.8 27B 4b (ddalcu) | 242 dflash | 242 dflash | 243 dflash | 241 dflash |
+| Qwen3.8 27B iQ-MLX 3.8bpw | 134 mtp | 136 mtp | · | · |
+| Qwen3.8 Flash-Next mixed 4-8b | · | 129 mtp | · | · |
+| Qwen3.8 Flash-Next iQ-MLX 4.7bpw | 169 mtp | 175 mtp | 180 mtp | 168 mtp |
+| MiMo-V2.6-Flash MXFP4-Q8 | 94 mtp | · | · | · |
+| GLM-5.3-Flash oQ4-MTP | 82 mtp | · | · | · |
 
 ## Decode tok/s by release — x86 Linux, RTX 5060 Ti 16 GB (CUDA 13), i5-12600K, 31 GB RAM
 

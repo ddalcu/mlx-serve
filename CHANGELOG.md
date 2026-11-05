@@ -1,5 +1,21 @@
 # Changelog
 
+## v26.11.2 — DeepSeek Across Two Macs, GGUF at MLX Speed
+
+- **DeepSeek-V4.1-Flash across two Macs.** `--dist tensor` splits the model over two Thunderbolt 5 Macs that work on every token together: on two M3 Ultras it writes 57% faster with DSpark (88 tokens a second instead of 56) and 31% faster without. Thanks @ivanfioravanti.
+- **DeepSeek-V4.1 GGUF files at MLX speed.** With `--mlx-gguf`, DeepSeek-V4.1 GGUF sets (ISTA's GSQ-RCO packs, the Coder pack and ivanfioravanti's DS4 packs) run on the MLX engine with DSpark drafting and image input: about 3,300 tokens a second reading prompts on an M5 Ultra, 2.5x what it managed before and close to our own MLX pack. More GGUF families take this path too (Qwen3, Flint, Muse Glimmer), with faster IQ kernels.
+- **Faster DeepSeek-V4.1 on M3 and older Macs.** The Lossless pack writes 7% faster on Macs without neural accelerators. Thanks @ivanfioravanti.
+- **Long chats stay cached when you go back.** On models that keep their own state (DeepSeek-V4.1 and others), a conversation keeps a few earlier checkpoints, so editing or forking an older message answers in a fraction of a second instead of re-reading the whole chat (8.7 s to 0.13 s at 60k tokens). Thanks @STRML.
+- **Newer MLX.** mlx-serve moves to MLX 0.32.5. Outside plugins built for 26.11.1 now show Needs rebuild in Models ▸ Plugins, and one Rebuild all compiles them again with this release's kit; a model a refused plugin served names it in its load error.
+- **Answers and switches come out right.** Switching away from a DeepSeek-V4.1 Sushi pack unloads it instead of refusing the new model, Qwen3.8-Flash-Next picks up its cached reply on the next agent turn instead of re-reading it, agents talking to DeepSeek's API no longer fail on tool-call history, GLM-5.3-Flash no longer carries one turn's reasoning into the next (thanks @lborloz), and a memory refusal with nothing left to unload says a restart is needed.
+- **App fixes.** Models ▸ Plugins downloads the pack you clicked instead of the first one on the list (thanks @hyspace), and turning an MCP server on or off in the marketplace keeps the command, environment and folder you set by hand in `mcp.json` (thanks @jondestoppeleire).
+
+### Thank you
+
+@hyspace, @ivanfioravanti, @jondestoppeleire, @lborloz, @STRML
+
+---
+
 ## v26.11.1 — Outside Plugins, Full Rewrite, Faster Deepseek
 
 - **Plugins you can build and install.** `mlx-serve plugin new` starts a plugin for a new model, `plugin check` tests it, and `plugin install` adds it after showing who signed it. Models ▸ Plugins lists every plugin beside a page that shows what it needs, the packs it serves (one click to download) and its on/off switch. Plugins can draft ahead, look at images and reuse the server's own building blocks. Thanks @davidtai and @STRML for helping here. Point your agent here: https://github.com/CommunityServe/plugins 
