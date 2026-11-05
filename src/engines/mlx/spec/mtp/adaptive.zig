@@ -342,7 +342,7 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
         const useful = mtpSerialProbeUseful(window_ms_tok) and mtpSerialProbeEarned(if (self.xfm.qwen4Trunk()) |trunk| trunk.qwen4_mtp != null else false, self.mtp_low_accept);
         if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), useful)) |own| {
             self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
-            self.mtp_probe_bucket = own;
+            self.mtp_probe = .{ .bucket = own, .n0 = t.serial[own].n };
             log.info(
                 "  [mtp] adaptive: bucket {s} has no serial cell -> probing {d} serial tokens\n",
                 .{ round_cost.bucketName(self.xfm.round_cost.layout, own), MTP_ADAPTIVE_PROBE_TOKENS },
@@ -625,14 +625,19 @@ test "mtpSerialProbeArm: a probe whose every tick was refused gives its retry ba
     const kv: u32 = 70_000;
     const b = round_cost.bucketFor(kv);
     for (0..round_cost.MIN_SAMPLES) |_| _ = t.observe(2, kv, 28.0, 2.4, true, false);
-    for (0..round_cost.MAX_SERIAL_PROBES) |_| {
+    // The first probe folds two clean ticks before the box gets busy: one short of trusted.
+    try testing.expect(G.mtpSerialProbeArm(&t, b, true, true, true, true) != null);
+    _ = t.observeSerial(kv, 12.0, true, false);
+    _ = t.observeSerial(kv, 12.0, true, false);
+    try testing.expect(!t.endSerialProbe(b, 0));
+    for (1..round_cost.MAX_SERIAL_PROBES + 1) |_| {
         try testing.expect(G.mtpSerialProbeArm(&t, b, true, true, true, true) != null);
+        const n0 = t.serial[b].n;
         for (0..MTP_ADAPTIVE_PROBE_TOKENS) |_| _ = t.observeSerial(kv, 155.0, true, false);
-        try testing.expect(t.endSerialProbe(b));
+        try testing.expect(t.endSerialProbe(b, n0));
     }
     try testing.expect(G.mtpSerialProbeArm(&t, b, true, true, true, true) != null);
-    for (0..MTP_ADAPTIVE_PROBE_TOKENS) |_| _ = t.observeSerial(kv, 12.0, true, false);
-    try testing.expect(!t.endSerialProbe(b));
+    _ = t.observeSerial(kv, 12.0, true, false);
     try testing.expect(t.serialMsPerTok(b) != null);
 }
 

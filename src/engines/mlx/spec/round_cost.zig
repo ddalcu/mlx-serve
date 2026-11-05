@@ -123,6 +123,9 @@ pub const Cell = struct {
     }
 };
 
+/// A running serial probe: its bucket and the samples the bucket held when it armed.
+pub const SerialProbe = struct { bucket: usize, n0: u32 };
+
 pub const Verdict = enum { folded, reseeded, contended, transition, bad_sample, out_of_range, implausible };
 
 /// A width-w round is one forward of w+1 rows; it cannot cost more than this
@@ -387,10 +390,11 @@ pub const Table = struct {
         return if (stale) .reseeded else .folded;
     }
 
-    /// A probe that ended with nothing folded (every tick refused) gives its retry back: the
-    /// cap bounds probes that measured something, not a busy box. True when refunded.
-    pub fn endSerialProbe(self: *Table, bucket: usize) bool {
-        if (bucket >= N_BUCKETS or self.serial[bucket].n != 0 or self.serial_probes[bucket] == 0) return false;
+    /// A probe that folded nothing past the `n0` samples its bucket held at arm (every tick
+    /// refused) gives its retry back: the cap bounds probes that measured something, not a
+    /// busy box. True when refunded.
+    pub fn endSerialProbe(self: *Table, bucket: usize, n0: u32) bool {
+        if (bucket >= N_BUCKETS or self.serial[bucket].n > n0 or self.serial_probes[bucket] == 0) return false;
         self.serial_probes[bucket] -= 1;
         return true;
     }

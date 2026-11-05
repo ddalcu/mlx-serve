@@ -266,8 +266,8 @@ pub fn mtpSerialTick(self: *Generator, allocator: std.mem.Allocator) !?DrafterSt
         if (self.mtp_serial_left == 0) {
             self.mtp_serial_exit = .drain;
             // A refunded retry waits for a fresh price window, so it does not fire next round.
-            if (self.mtp_probe_bucket) |b| if (self.xfm.round_cost.endSerialProbe(b)) self.mtp_price.reset();
-            self.mtp_probe_bucket = null;
+            if (self.mtp_probe) |p| if (self.xfm.round_cost.endSerialProbe(p.bucket, p.n0)) self.mtp_price.reset();
+            self.mtp_probe = null;
         }
     }
     return try mtpSerialOneToken(allocator, tok);
