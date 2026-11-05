@@ -29,6 +29,7 @@ struct ContextCompactionTests {
         var onCount: (() -> Void)?
         var countFails = false
         var onSummary: (() -> Void)?
+        var summaryEvents: [SSEEvent]?
         override func contextTokenCount(port: UInt16, text: String) async throws -> Int {
             inputs.append(text)
             onCount?()
@@ -41,7 +42,43 @@ struct ContextCompactionTests {
             retryPolicy: RetryPolicy = .default, modelId: String? = nil,
             continueFinalMessage: Bool = false) -> AsyncThrowingStream<SSEEvent, Error> {
             onSummary?()
+            if let summaryEvents {
+                return AsyncThrowingStream { continuation in
+                    for event in summaryEvents { continuation.yield(event) }
+                    continuation.finish()
+                }
+            }
             return AsyncThrowingStream { $0.finish(throwing: URLError(.networkConnectionLost)) }
+        }
+    }
+
+    @Test func testFailedSummaryIsNotRetriedUntilBoundaryOrDigestChanges() async throws {
+        guard NSHomeDirectory().contains("mlx-compaction-test-home") else { return }
+        _ = NSApplication.shared
+        let state = AppState(startServerAtLaunch: false)
+        for events in [[SSEEvent.content("partial"), .truncated(.maxTokens)], [.done], [.content("unfinished")]] {
+            var session = ChatSession(title: "failed summary")
+            session.messages = (0..<30).map { ChatMessage(role: $0 % 2 == 0 ? .user : .assistant, content: "fact \($0)") }
+            state.chatSessions.append(session)
+            let index = state.chatSessions.count - 1
+            let api = CountingStub()
+            api.count = 30000
+            api.summaryEvents = events
+            var calls = 0
+            api.onSummary = { calls += 1 }
+            for pass in 0..<4 {
+                if pass == 2 { state.chatSessions[index].messages += [ChatMessage(role: .user, content: "next"), ChatMessage(role: .assistant, content: "reply")] }
+                if pass == 3 { state.chatSessions[index].messages[0].content = "edited fact" }
+                let messages = try await state.chatEngine.prepareCompactedContext(api: api, sessionId: session.id,
+                    config: .init(agentMode: true, mcpMode: false, enableThinking: false, voiceStyle: false,
+                                  workingDirectory: nil, tools: [], maxTokens: 256),
+                    context: 32768, tools: String(repeating: "x", count: 90000)) { source in
+                        AgentEngine.buildAgentHistory(messages: source, contextLength: 32768, maxTokens: 256)
+                    }
+                #expect(!messages.isEmpty)
+                #expect(calls == (pass == 0 ? 1 : pass))
+                #expect(!state.chatSessions[index].messages.contains { $0.contextCheckpoint != nil })
+            }
         }
     }
 
@@ -232,10 +269,13 @@ struct ContextCompactionTests {
         placeholder.isStreaming = true
         let legacy = ChatMessage(role: .assistant, content: "couldn't generate a response")
         let valid = ChatMessage(role: .user, content: "actual task")
-        let text = ContextCompaction.summaryText([valid, failed, error, placeholder, legacy])
+        let quoted = ChatMessage(role: .user, content: "Why couldn't generate a response?")
+        let text = ContextCompaction.summaryText([valid, failed, error, placeholder, legacy, quoted])
         let rows = try #require(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [[String: Any]])
-        #expect(rows.count == 1)
+        #expect(rows.count == 2)
         #expect(rows.first?["content"] as? String == "actual task")
+        let wire = AgentEngine.buildAgentHistory(messages: [valid, legacy, quoted], contextLength: 32768, maxTokens: 256)
+        #expect(wire.compactMap { $0["content"] as? String } == [valid.content, quoted.content])
     }
 
     @Test func testCheckpointReplacesOnlyCoveredPrefixAndKeepsTranscript() throws {

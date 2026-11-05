@@ -108,7 +108,7 @@ enum ContextCompaction {
     static func summaryText(_ source: [ChatMessage]) -> String {
         let messages: [[String: Any]] = source.filter {
             (!$0.isAgentSummary || $0.contextCheckpoint != nil) && !$0.failedRetry && $0.errorNotice == nil
-                && !($0.role == .assistant && $0.content.contains("couldn't generate a response"))
+                && !$0.isLegacyFailure
                 && (!$0.content.isEmpty || !($0.toolCalls ?? []).isEmpty || $0.toolCallId != nil
                     || !($0.images ?? []).isEmpty || !($0.videos ?? []).isEmpty || !($0.audio ?? []).isEmpty)
         }.map { msg in

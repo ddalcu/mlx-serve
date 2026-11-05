@@ -162,7 +162,7 @@ enum AgentEngine {
             if msg.role == .system && msg.toolCallId == nil { continue }
             if msg.isAgentSummary { continue }
             if msg.failedRetry { continue }
-            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+            if msg.isLegacyFailure { continue }
 
             let cost = tokenCostForMessage(msg, withImages: sendsImages)
             if cost > remainingBudget { break }
@@ -244,7 +244,7 @@ enum AgentEngine {
             }
             if msg.role == .system { continue }
             if msg.isAgentSummary { continue }
-            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+            if msg.isLegacyFailure { continue }
 
             // Assistant messages with tool_calls
             if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {

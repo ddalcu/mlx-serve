@@ -662,6 +662,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     private var contextMeasurements: [UUID: Int] = [:]
     private var contextCalibration: [UUID: Double] = [:]
+    private var contextFailures: [UUID: ContextCheckpoint] = [:]
 
     private func calibrateContext(_ usage: TokenUsage, sessionId: UUID) {
         if let estimate = contextMeasurements[sessionId], estimate > 0 {
@@ -711,6 +712,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             guard let plan = ContextCompaction.plan(source) else { return messages }
             let raw = ContextCompaction.transcript(source)
             let digest = ContextCompaction.fingerprint(Array(raw.prefix(plan.boundary + 1)))
+            let boundary = ContextCheckpoint(boundaryID: raw[plan.boundary].id, digest: digest)
+            if contextFailures[sessionId] == boundary { return messages }
             if source.contains(where: {
                 $0.contextCheckpoint?.boundaryID == raw[plan.boundary].id && $0.contextCheckpoint?.digest == digest
             }) { return messages }
@@ -727,6 +730,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         ContextCompaction.fingerprint(raw) else {
                     throw ContextCompaction.Failure.changedHistory
                 }
+                contextFailures[sessionId] = boundary
+                print("[ContextCompaction] failed session=\(sessionId) boundary=\(boundary.boundaryID): \(error.localizedDescription) Using existing history; this boundary will not be retried.")
                 return messages
             }
             try Task.checkCancellation()
@@ -737,6 +742,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             let insertion = appState.chatSessions[index].messages.last?.isStreaming == true
                 ? appState.chatSessions[index].messages.count - 1 : appState.chatSessions[index].messages.count
             appState.chatSessions[index].messages.insert(marker, at: insertion)
+            contextFailures.removeValue(forKey: sessionId)
             appState.chatSessions[index].updatedAt = Date()
             appState.saveChatHistory()
             print("[ContextCompaction] committed session=\(sessionId) boundary=\(marker.contextCheckpoint!.boundaryID)")

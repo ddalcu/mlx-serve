@@ -375,6 +375,7 @@ struct ChatMessage: Identifiable, Codable, Equatable {
     /// reader keep reading `content` and never learn this field exists.
     var revisions: [MessageRevision] = []
     var activeRevision: Int = 0
+    var isLegacyFailure: Bool { role == .assistant && content.contains("couldn't generate a response") }
 
     enum Role: String, Codable {
         case system, user, assistant
