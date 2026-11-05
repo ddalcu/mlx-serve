@@ -16,6 +16,8 @@ pub const SamplingParams = struct {
     /// OpenAI's: subtracted once per earlier occurrence of a token (0.0 = disabled).
     frequency_penalty: f32 = 0.0,
     seed: ?u64 = null,
+    /// Ignore both configured and engine-reported EOS; stop strings remain active.
+    ignore_eos: bool = false,
     /// Draw index under `seed`: every sample takes a fresh key.
     draw: u64 = 0,
     /// When non-null, generation is constrained to outputs that satisfy the

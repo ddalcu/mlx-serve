@@ -359,6 +359,7 @@ pub fn handleCompletions(
         .presence_penalty = presence_penalty_c,
         .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
+        .ignore_eos = @import("sampling.zig").requestIgnoresEos(root),
     };
 
     if (is_stream) {

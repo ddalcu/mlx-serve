@@ -48,7 +48,15 @@ fn defaultMinP(kind: Kind) f32 {
 /// `offloaded` list. The slot's `in_pass` is held from here to its `finished` event.
 pub fn submit(slot: *Slot, s: *Served) !void {
     const sp = slot.sampling;
-    // Engine EOS is installed in the model config at load. An empty request set is ignore_eos.
+    // The engine's full stop set can exceed ModelConfig's fixed-size list. Submit copies this union.
+    var eos = std.ArrayList(u32).empty;
+    defer eos.deinit(slot.allocator);
+    if (!sp.ignore_eos) {
+        try eos.appendSlice(slot.allocator, slot.eos_token_ids);
+        for (abi.items(u32, s.info.eos)) |t| {
+            if (std.mem.indexOfScalar(u32, eos.items, t) == null) try eos.append(slot.allocator, t);
+        }
+    }
     const grammar: abi.Grammar = .{ .kind = .json_schema, .text = .{} };
     const tool_gate: abi.ToolGate = .{ .opener = .{}, .names = .{} };
     const think: abi.Think = .{ .budget = 0, .open = .{}, .opened_in_prompt = false, .close = .{}, .end = abi.no_token };
@@ -69,7 +77,7 @@ pub fn submit(slot: *Slot, s: *Served) !void {
             .frequency_penalty = sp.frequency_penalty,
             .presence_penalty = sp.presence_penalty,
         },
-        .eos = abi.span(u32, slot.eos_token_ids),
+        .eos = abi.span(u32, eos.items),
         .logprobs = @intCast(@min(slot.logprobs_n, std.math.maxInt(u8))),
         .grammar = if (ask_grammar) &grammar else null,
         .think = if (sp.think_bound != null) &think else null,
@@ -235,31 +243,51 @@ test "submit: the engine's events land in the slot from its thread — prefilled
     lm.transformer = null;
     lm.id = "org/gguf-model";
     var cfg: ModelConfig = .{};
-    const slot = try Slot.init(testing.allocator, testing.io, &cfg, .{ .model = &lm, .prompt_ids = &.{ 5, 6, 7 }, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 5 }, .dense);
-    defer slot.deinit();
-    try submit(slot, &s);
-    var got: [8]u32 = undefined;
-    var n: usize = 0;
-    while (true) switch (slot.waitNext()) {
-        .token => |t| {
-            got[n] = t;
-            n += 1;
-        },
-        .done => break,
-        .err => return error.SlotFailed,
+    const engine_eos = &.{ 100, 101, 102, 103, 104, 105, 106, 107, 108, 1000 };
+    const cases = [_]struct {
+        engine_eos: []const u32,
+        request_eos: []const u32,
+        ignore_eos: bool = false,
+        expected: []const u32,
+        reason: []const u8,
+    }{
+        .{ .engine_eos = &.{0}, .request_eos = &.{}, .expected = &.{ 5, 6, 7, 1000, 1001 }, .reason = "length" },
+        .{ .engine_eos = engine_eos, .request_eos = &.{}, .expected = &.{ 5, 6, 7 }, .reason = "stop" },
+        .{ .engine_eos = engine_eos, .request_eos = &.{ 20, 21, 22, 23, 24, 25, 26, 27 }, .expected = &.{ 5, 6, 7 }, .reason = "stop" },
+        .{ .engine_eos = engine_eos, .request_eos = &.{6}, .expected = &.{5}, .reason = "stop" },
+        .{ .engine_eos = engine_eos, .request_eos = &.{6}, .ignore_eos = true, .expected = &.{ 5, 6, 7, 1000, 1001 }, .reason = "length" },
+        .{ .engine_eos = engine_eos, .request_eos = &.{}, .ignore_eos = true, .expected = &.{ 5, 6, 7, 1000, 1001 }, .reason = "length" },
     };
-    // The fake echoes the prompt, then counts from 1000; `max_tokens` cuts it.
-    try testing.expectEqualSlices(u32, &.{ 5, 6, 7, 1000, 1001 }, got[0..n]);
-    try testing.expectEqualStrings("length", slot.finish_reason);
-    try testing.expectEqual(@as(u32, 3), slot.prompt_tokens);
-    try testing.expectEqual(@as(u32, 5), slot.completion_tokens);
-    while (slot.in_pass.load(.acquire) != 0) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
-    try testing.expectEqual(@as(u64, 0), gauges.prefilling.load(.monotonic) + gauges.generated.load(.monotonic));
-    // The usage dashboard counts an embedded engine's traffic like MLX's: one row, under the model's id.
-    try testing.expectEqual(@as(u32, 1), metrics.usage_count.load(.acquire));
-    const row = &metrics.usage[0];
-    try testing.expectEqualStrings("org/gguf-model", row.name[0..row.name_len]);
-    try testing.expectEqual(@as(u64, 1), row.requests.load());
-    try testing.expectEqual(@as(u64, 3), row.prompt_tokens.load());
-    try testing.expectEqual(@as(u64, 5), row.generation_tokens.load());
+    var generated: u64 = 0;
+    for (cases, 0..) |case, i| {
+        s.info.eos = abi.span(u32, case.engine_eos);
+        const slot = try Slot.init(testing.allocator, testing.io, &cfg, .{ .model = &lm, .prompt_ids = &.{ 5, 6, 7 }, .sampling = .{ .temperature = 0, .ignore_eos = case.ignore_eos }, .eos_token_ids = case.request_eos, .max_tokens = 5 }, .dense);
+        defer slot.deinit();
+        try submit(slot, &s);
+        var got: [8]u32 = undefined;
+        var n: usize = 0;
+        while (true) switch (slot.waitNext()) {
+            .token => |t| {
+                got[n] = t;
+                n += 1;
+            },
+            .done => break,
+            .err => return error.SlotFailed,
+        };
+        // The fake echoes the prompt, then counts from 1000; EOS or max_tokens cuts it.
+        try testing.expectEqualSlices(u32, case.expected, got[0..n]);
+        try testing.expectEqualStrings(case.reason, slot.finish_reason);
+        try testing.expectEqual(@as(u32, 3), slot.prompt_tokens);
+        try testing.expectEqual(@as(u32, @intCast(case.expected.len)), slot.completion_tokens);
+        while (slot.in_pass.load(.acquire) != 0) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+        try testing.expectEqual(@as(u64, 0), gauges.prefilling.load(.monotonic) + gauges.generated.load(.monotonic));
+        // The usage dashboard counts every embedded request in the same model row.
+        try testing.expectEqual(@as(u32, 1), metrics.usage_count.load(.acquire));
+        const row = &metrics.usage[0];
+        try testing.expectEqualStrings("org/gguf-model", row.name[0..row.name_len]);
+        generated += case.expected.len;
+        try testing.expectEqual(@as(u64, i + 1), row.requests.load());
+        try testing.expectEqual(@as(u64, 3 * (i + 1)), row.prompt_tokens.load());
+        try testing.expectEqual(generated, row.generation_tokens.load());
+    }
 }

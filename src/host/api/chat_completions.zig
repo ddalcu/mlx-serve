@@ -864,6 +864,7 @@ pub fn handleChatCompletions(
         .presence_penalty = presence_penalty,
         .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
+        .ignore_eos = @import("sampling.zig").requestIgnoresEos(root),
     };
 
     // Build grammar-constrained sampling state if a JSON schema was supplied.

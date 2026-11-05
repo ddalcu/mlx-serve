@@ -48,7 +48,6 @@ pub fn loadGguf(sch: *Scheduler, params: anytype, route: GgufRoute) !void {
     }, &params.entry.load_progress, &sch.engine_gauges, sch.metrics);
     errdefer s.close();
     adoptEngineWindow(params.config, s.info.context_window);
-    params.config.mergeEosTokens(abi.items(u32, s.info.eos));
     // The host renders a GGUF's embedded template through its own Jinja (tool synthesis included).
     if (s.chatTemplate()) |tmpl| {
         const cc = params.chat_config;
