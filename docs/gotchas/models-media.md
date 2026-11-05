@@ -759,6 +759,13 @@ baseline and `--no-w8a8` were clean. Cause: the attached delta keeps the f32 mod
 casts `v` to q's dtype. Guard: `int8 attention reads a v wider than q`, `tests/test_real_loras.sh` (open the renders:
 the 9B's broken one scored under the noise bar).
 
+### Headless Qwen3 embedding packs and failed-load cleanup
+Some Qwen3-Embedding packs declare untied embeddings but contain no language-model head. The Qwen3 loader previously
+required that head even for embedding inference; its error cleanup then released the same owned arrays twice. The loader
+now accepts the missing head only for recognized embedding packs, refuses generation and drafter access without a head,
+and releases owned arrays once. Guard: a headless pack's embedding rows match identical tied weights, while an untied
+chat pack without a head returns `MissingWeight` without crashing.
+
 ### A GGUF weight resolved as affine 8-bit
 Defect: on the MLX GGUF path every ggml weight reported `.affine` 8-bit g64 to `computeQuantParams`, so an affine-keyed
 fast path (the qwen4 hc read, `msvQmvRows`, MoE gathers) could take raw ggml blocks for MLX codes. Cause: the scales are
