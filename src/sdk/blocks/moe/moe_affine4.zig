@@ -115,9 +115,11 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
     const dsh = mlx.getShape(down.w);
     if (gsh.len != 3 or dsh.len != 3 or !std.mem.eql(c_int, gsh, mlx.getShape(up.w))) return null;
     const inter = gsh[1];
-    const hidden = gsh[2] * 8;
+    const hidden = dsh[1];
     const gs: c_int = @intCast(group_size);
-    if (dsh[1] != hidden or dsh[2] * 8 != inter) return null;
+    if (hidden <= 0 or inter <= 0 or @rem(gsh[2] * 32, hidden) != 0) return null;
+    const bits: c_int = @divExact(gsh[2] * 32, hidden);
+    if ((bits != 3 and bits != 4) or dsh[2] * 32 != inter * bits) return null;
     if (@rem(hidden, gs) != 0 or @rem(inter, gs) != 0 or @rem(inter, ROWS * SGS) != 0 or @rem(hidden, ROWS * SGS) != 0) return null;
     if (@rem(hidden, 16) != 0 or @rem(inter, 16) != 0) return null;
     const xsh = mlx.getShape(x);
@@ -139,7 +141,7 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
         const udsh = mlx.getShape(u.down.w);
         if (ush.len != 2 or udsh.len != 2 or !std.mem.eql(c_int, ush, mlx.getShape(u.up.w))) return null;
         si = ush[0];
-        if (ush[1] * 8 != hidden or udsh[0] != hidden or udsh[1] * 8 != si) return null;
+        if (ush[1] * 32 != hidden * bits or udsh[0] != hidden or udsh[1] * 32 != si * bits) return null;
         if (@rem(si, inter) != 0 or @rem(si, gs) != 0) return null;
         // One group size for the whole layer: the scales' width says it.
         if (mlx.getShape(u.gate.s)[1] * gs != hidden or mlx.getShape(u.down.s)[1] * gs != si) return null;
@@ -157,13 +159,13 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
     // Without a shared expert its operands are never read; any array of the right type binds.
     const ug = ungated orelse Ungated{ .gate = bound.gate, .up = bound.up, .down = bound.down };
     const se = @divExact(si, inter);
-    const act = try apply(gateup_kernel.?, &.{ x, bound.gate.w, bound.gate.s, bound.gate.b, bound.up.w, bound.up.s, bound.up.b, inds, sigtab, ug.gate.w, ug.gate.s, ug.gate.b, ug.up.w, ug.up.s, ug.up.b }, &.{ topk + se, inter }, dt, .{ 32, @divExact(inter, ROWS), topk + se }, &.{ .{ "K", hidden }, .{ "N", inter }, .{ "GS", gs }, .{ "TOPK", topk } }, s);
+    const act = try apply(gateup_kernel.?, &.{ x, bound.gate.w, bound.gate.s, bound.gate.b, bound.up.w, bound.up.s, bound.up.b, inds, sigtab, ug.gate.w, ug.gate.s, ug.gate.b, ug.up.w, ug.up.s, ug.up.b }, &.{ topk + se, inter }, dt, .{ 32, @divExact(inter, ROWS), topk + se }, &.{ .{ "K", hidden }, .{ "N", inter }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "BITS", bits } }, s);
     defer _ = mlx.mlx_array_free(act);
     const sh = shared orelse Shared{ .down = scores, .logit = scores };
-    const y = try apply(downred_kernel.?, &.{ act, bound.down.w, bound.down.s, bound.down.b, inds, scores, sh.down, sh.logit, ug.down.w, ug.down.s, ug.down.b }, &.{hidden}, dt, .{ 32, @divExact(hidden, ROWS), 1 }, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "SHARED", @intFromBool(shared != null) }, .{ "SI", si } }, s);
+    const y = try apply(downred_kernel.?, &.{ act, bound.down.w, bound.down.s, bound.down.b, inds, scores, sh.down, sh.logit, ug.down.w, ug.down.s, ug.down.b }, &.{hidden}, dt, .{ 32, @divExact(hidden, ROWS), 1 }, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "SHARED", @intFromBool(shared != null) }, .{ "SI", si }, .{ "BITS", bits } }, s);
     if (!engaged) {
         engaged = true;
-        log.info("[moe] affine-4 decode kernels engaged: topk={d} inter={d} hidden={d} gs={d} ungated_shared={d}\n", .{ topk, inter, hidden, gs, si });
+        log.info("[moe] affine-{d} decode kernels engaged: topk={d} inter={d} hidden={d} gs={d} ungated_shared={d}\n", .{ bits, topk, inter, hidden, gs, si });
     }
     return y;
 }
@@ -183,17 +185,23 @@ fn randBf16(rnd: std.Random, shape: []const c_int, scale: f32, s: mlx.mlx_stream
     return out;
 }
 
-fn quant(w: mlx.mlx_array, s: mlx.mlx_stream) !struct { b: Bank, deq: mlx.mlx_array } {
+const QuantResult = struct { b: Bank, deq: mlx.mlx_array };
+
+fn quantGs(w: mlx.mlx_array, bits: c_int, gs: c_int, s: mlx.mlx_stream) !QuantResult {
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
-    try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
     var b: Bank = .{ .w = mlx.mlx_array_new(), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() };
     try mlx.check(mlx.mlx_vector_array_get(&b.w, triple, 0));
     try mlx.check(mlx.mlx_vector_array_get(&b.s, triple, 1));
     try mlx.check(mlx.mlx_vector_array_get(&b.b, triple, 2));
     var deq = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_dequantize(&deq, b.w, b.s, b.b, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&deq, b.w, b.s, b.b, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
     return .{ .b = b, .deq = deq };
+}
+
+fn quant(w: mlx.mlx_array, bits: c_int, s: mlx.mlx_stream) !QuantResult {
+    return quantGs(w, bits, 64, s);
 }
 
 fn freeBank(b: Bank) void {
@@ -214,10 +222,16 @@ fn readF32(a: mlx.mlx_array, s: mlx.mlx_stream) ![]f32 {
 }
 
 test "moe affine-4 decode: no worse than the per-slot gather kernels against the f32 truth (Flash Next geometry, K not a whole block)" {
+    try routedDecodeCase(4, 64, 2560, 640, 10);
+    try routedDecodeCase(3, 64, 2048, 768, 8);
+    try routedDecodeCase(3, 32, 2048, 768, 8);
+}
+
+fn routedDecodeCase(comptime bits: u32, comptime group_size: u32, comptime H: c_int, comptime I: c_int, comptime TOPK: c_int) !void {
     const s = mlx.gpuStream();
     const gather_qmv_vars = @import("gather_qmv.zig");
     const down_reduce_vars = @import("down_reduce.zig");
-    var prng = std.Random.DefaultPrng.init(0xA4E0);
+    var prng = std.Random.DefaultPrng.init(0xA4E0 + bits + group_size);
     const rnd = prng.random();
     gather_qmv_vars.gqmv_gateup_override = true;
     defer gather_qmv_vars.gqmv_gateup_override = null;
@@ -225,36 +239,35 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
     defer down_reduce_vars.downred_override = null;
 
     const E: c_int = 16;
-    const H: c_int = 2560; // hidden: 5 whole blocks
-    const I: c_int = 640; // intermediate: 1.25 blocks, the predicated tail
-    const TOPK: c_int = 10;
     const gw = try randBf16(rnd, &.{ E, I, H }, 0.05, s);
     defer _ = mlx.mlx_array_free(gw);
     const uw = try randBf16(rnd, &.{ E, I, H }, 0.05, s);
     defer _ = mlx.mlx_array_free(uw);
     const dw = try randBf16(rnd, &.{ E, H, I }, 0.05, s);
     defer _ = mlx.mlx_array_free(dw);
-    const g = try quant(gw, s);
+    const g = try quantGs(gw, @intCast(bits), @intCast(group_size), s);
     defer {
         freeBank(g.b);
         _ = mlx.mlx_array_free(g.deq);
     }
-    const u = try quant(uw, s);
+    const u = try quantGs(uw, @intCast(bits), @intCast(group_size), s);
     defer {
         freeBank(u.b);
         _ = mlx.mlx_array_free(u.deq);
     }
-    const d = try quant(dw, s);
+    const d = try quantGs(dw, @intCast(bits), @intCast(group_size), s);
     defer {
         freeBank(d.b);
         _ = mlx.mlx_array_free(d.deq);
     }
     const x = try randBf16(rnd, &.{H}, 1.0, s);
     defer _ = mlx.mlx_array_free(x);
-    var idx: [10]u32 = .{ 3, 15, 0, 7, 9, 1, 12, 5, 14, 2 };
+    const all_idx = [10]u32{ 3, 15, 0, 7, 9, 1, 12, 5, 14, 2 };
+    const all_scf = [10]f32{ 0.3, 0.2, 0.1, 0.1, 0.08, 0.07, 0.05, 0.05, 0.03, 0.02 };
+    const idx = all_idx[0..@intCast(TOPK)].*;
+    const scf = all_scf[0..@intCast(TOPK)].*;
     const inds = mlx.mlx_array_new_data(&idx, &[_]c_int{TOPK}, 1, .uint32);
     defer _ = mlx.mlx_array_free(inds);
-    const scf = [_]f32{ 0.3, 0.2, 0.1, 0.1, 0.08, 0.07, 0.05, 0.05, 0.03, 0.02 };
     const sc32 = mlx.mlx_array_new_data(&scf, &[_]c_int{TOPK}, 1, .float32);
     defer _ = mlx.mlx_array_free(sc32);
     var scores = mlx.mlx_array_new();
@@ -262,12 +275,12 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
     try mlx.check(mlx.mlx_astype(&scores, sc32, .bfloat16, s));
     const sigtab = try @import("../mlp/fused_activations.zig").swigluSigTable(s, .bfloat16, std.heap.c_allocator);
 
-    const ours = (try decode(s, x, g.b, u.b, d.b, null, null, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    const ours = (try decode(s, x, g.b, u.b, d.b, null, null, null, inds, scores, sigtab, group_size)) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(ours);
     // The shipped per-slot kernels on the same inputs.
-    const act = (try gather_qmv_vars.gatherQmvGateUp(s, x, g.b.w, g.b.s, g.b.b, u.b.w, u.b.s, u.b.b, inds, 4, 64, .affine, 0)) orelse return error.GatherDeclined;
+    const act = (try gather_qmv_vars.gatherQmvGateUp(s, x, g.b.w, g.b.s, g.b.b, u.b.w, u.b.s, u.b.b, inds, bits, group_size, .affine, 0)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(act);
-    const stock = (try down_reduce_vars.gatherQmvDownReduce(s, act, d.b.w, d.b.s, d.b.b, inds, scores, 4, 64, .affine)) orelse return error.GatherDeclined;
+    const stock = (try down_reduce_vars.gatherQmvDownReduce(s, act, d.b.w, d.b.s, d.b.b, inds, scores, bits, group_size, .affine)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(stock);
 
     // f32 truth over the dequantized experts.
@@ -324,7 +337,7 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
     defer _ = mlx.mlx_array_free(sd);
     const logit = try randBf16(rnd, &.{1}, 4.0, s);
     defer _ = mlx.mlx_array_free(logit);
-    const joined = (try decode(s, x, g.b, u.b, d.b, null, .{ .down = sd, .logit = logit }, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    const joined = (try decode(s, x, g.b, u.b, d.b, null, .{ .down = sd, .logit = logit }, null, inds, scores, sigtab, group_size)) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(joined);
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
@@ -357,7 +370,7 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
             try testing.expectEqual(@intFromPtr(mlx.mlx_array_data_uint32(bank)), @intFromPtr(mlx.mlx_array_data_uint32(v)));
         }
     }
-    const viewed = (try decode(s, x, g.b, u.b, d.b, views, null, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    const viewed = (try decode(s, x, g.b, u.b, d.b, views, null, null, inds, scores, sigtab, group_size)) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(viewed);
     const hv = try readF32(viewed, s);
     defer testing.allocator.free(hv);
@@ -365,15 +378,16 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
 }
 
 test "moe affine-4 decode: an ungated shared expert folded into both kernels is no worse than the separate chain against the f32 truth (Flint, Kolibri-1, Hunyuan 3 geometries)" {
-    try ungatedFoldCase(2048, 512, 1024, 6);
-    try ungatedFoldCase(2560, 512, 512, 6);
-    try ungatedFoldCase(4096, 1536, 1536, 8);
+    try ungatedFoldCase(4, 2048, 512, 1024, 6);
+    try ungatedFoldCase(4, 2560, 512, 512, 6);
+    try ungatedFoldCase(4, 4096, 1536, 1536, 8);
+    try ungatedFoldCase(3, 2048, 512, 1024, 6);
 }
 
-fn ungatedFoldCase(comptime H: c_int, comptime I: c_int, comptime SI: c_int, comptime TOPK: c_int) !void {
+fn ungatedFoldCase(comptime bits: c_int, comptime H: c_int, comptime I: c_int, comptime SI: c_int, comptime TOPK: c_int) !void {
     const s = mlx.gpuStream();
     const xfm = @import("../mlp/fused_activations.zig");
-    var prng = std.Random.DefaultPrng.init(0xF117 + @as(u64, @intCast(H)));
+    var prng = std.Random.DefaultPrng.init(0xF117 + @as(u64, @intCast(H + bits)));
     const rnd = prng.random();
     const E: c_int = TOPK + 2;
     const Q = struct { b: Bank, deq: mlx.mlx_array };
@@ -382,13 +396,13 @@ fn ungatedFoldCase(comptime H: c_int, comptime I: c_int, comptime SI: c_int, com
     for (&banks, [_][3]c_int{ .{ E, I, H }, .{ E, I, H }, .{ E, H, I } }) |*bk, sh| {
         const w = try randBf16(rnd, &sh, 0.05, s);
         defer _ = mlx.mlx_array_free(w);
-        const q = try quant(w, s);
+        const q = try quant(w, bits, s);
         bk.* = .{ .b = q.b, .deq = q.deq };
     }
     for (&shared, [_][2]c_int{ .{ SI, H }, .{ SI, H }, .{ H, SI } }) |*bk, sh| {
         const w = try randBf16(rnd, &sh, 0.05, s);
         defer _ = mlx.mlx_array_free(w);
-        const q = try quant(w, s);
+        const q = try quant(w, bits, s);
         bk.* = .{ .b = q.b, .deq = q.deq };
     }
     defer for (banks ++ shared) |bk| {
@@ -421,7 +435,7 @@ fn ungatedFoldCase(comptime H: c_int, comptime I: c_int, comptime SI: c_int, com
     var gu: [2]mlx.mlx_array = undefined;
     for (&gu, shared[0..2]) |*o, bk| {
         o.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_quantized_matmul(o, x, bk.b.w, bk.b.s, bk.b.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+        try mlx.check(mlx.mlx_quantized_matmul(o, x, bk.b.w, bk.b.s, bk.b.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(bits), "affine", s));
     }
     defer for (gu) |a| {
         _ = mlx.mlx_array_free(a);
@@ -437,7 +451,7 @@ fn ungatedFoldCase(comptime H: c_int, comptime I: c_int, comptime SI: c_int, com
     try mlx.check(mlx.mlx_multiply(&act, silu, gu[1], s));
     var sdown = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sdown);
-    try mlx.check(mlx.mlx_quantized_matmul(&sdown, act, shared[2].b.w, shared[2].b.s, shared[2].b.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    try mlx.check(mlx.mlx_quantized_matmul(&sdown, act, shared[2].b.w, shared[2].b.s, shared[2].b.b, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(bits), "affine", s));
     var chain = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(chain);
     try mlx.check(mlx.mlx_add(&chain, routed, sdown, s));
@@ -490,4 +504,68 @@ fn ungatedFoldCase(comptime H: c_int, comptime I: c_int, comptime SI: c_int, com
     const rms_c = @sqrt(se_c / @as(f64, @floatFromInt(H)));
     std.debug.print("\n[moe-a4 ungated shared] H={d} I={d} SI={d}: folded_rms={e:.4} chain_rms={e:.4}\n", .{ H, I, SI, rms_f, rms_c });
     try testing.expect(rms_f <= rms_c * 1.15 + 1e-6);
+}
+
+test "moe affine-4 decode: declines unsupported or mismatched bit-widths" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xA4DC);
+    const rnd = prng.random();
+    const H: c_int = 128;
+    const I: c_int = 64;
+    const E: c_int = 4;
+    const gw = try randBf16(rnd, &.{ E, I, H }, 0.05, s);
+    defer _ = mlx.mlx_array_free(gw);
+    const dw = try randBf16(rnd, &.{ E, H, I }, 0.05, s);
+    defer _ = mlx.mlx_array_free(dw);
+    const swg = try randBf16(rnd, &.{ I, H }, 0.05, s);
+    defer _ = mlx.mlx_array_free(swg);
+    const swd = try randBf16(rnd, &.{ H, I }, 0.05, s);
+    defer _ = mlx.mlx_array_free(swd);
+
+    const specs = [9]struct { w: mlx.mlx_array, bits: c_int }{
+        .{ .w = gw, .bits = 2 },
+        .{ .w = dw, .bits = 2 },
+        .{ .w = gw, .bits = 8 },
+        .{ .w = dw, .bits = 8 },
+        .{ .w = gw, .bits = 3 },
+        .{ .w = dw, .bits = 3 },
+        .{ .w = dw, .bits = 4 },
+        .{ .w = swg, .bits = 4 },
+        .{ .w = swd, .bits = 4 },
+    };
+    const Q = struct { b: Bank, deq: mlx.mlx_array };
+    var qb: [9]Q = undefined;
+    for (&qb, specs) |*q, sp| {
+        const r = try quant(sp.w, sp.bits, s);
+        q.* = .{ .b = r.b, .deq = r.deq };
+    }
+    defer for (qb) |q| {
+        freeBank(q.b);
+        _ = mlx.mlx_array_free(q.deq);
+    };
+
+    const x = try randBf16(rnd, &.{H}, 1.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const idx = [2]u32{ 0, 2 };
+    const scf = [2]f32{ 0.6, 0.4 };
+    const inds = mlx.mlx_array_new_data(&idx, &[_]c_int{2}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(inds);
+    const sc32 = mlx.mlx_array_new_data(&scf, &[_]c_int{2}, 1, .float32);
+    defer _ = mlx.mlx_array_free(sc32);
+    var scores = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores);
+    try mlx.check(mlx.mlx_astype(&scores, sc32, .bfloat16, s));
+    const sigtab = try @import("../mlp/fused_activations.zig").swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+
+    // Positive control: 3/3/3 at the same geometry succeeds.
+    const ok3 = (try decode(s, x, qb[4].b, qb[4].b, qb[5].b, null, null, null, inds, scores, sigtab, 64)) orelse return error.DecodeDeclined;
+    defer _ = mlx.mlx_array_free(ok3);
+    // 2-bit and 8-bit routed banks decline.
+    try testing.expect((try decode(s, x, qb[0].b, qb[0].b, qb[1].b, null, null, null, inds, scores, sigtab, 64)) == null);
+    try testing.expect((try decode(s, x, qb[2].b, qb[2].b, qb[3].b, null, null, null, inds, scores, sigtab, 64)) == null);
+    // Mismatched gate/up (3-bit) vs down (4-bit) declines.
+    try testing.expect((try decode(s, x, qb[4].b, qb[4].b, qb[6].b, null, null, null, inds, scores, sigtab, 64)) == null);
+    // 3-bit routed with 4-bit ungated shared declines.
+    try testing.expect((try decode(s, x, qb[4].b, qb[4].b, qb[5].b, null, null, .{ .gate = qb[7].b, .up = qb[7].b, .down = qb[8].b }, inds, scores, sigtab, 64)) == null);
 }

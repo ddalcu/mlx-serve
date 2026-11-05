@@ -2126,8 +2126,9 @@ fn registerVerify(set: *kc.Set) !void {
     // guard runs the wrapper's 2560).
     try set.add(Reuse, .init(a), .{ .name = "verify_expert_reuse bf16 (4-bit g64, K 640)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather, .tiles = .{ .{}, .{ .size = 16, .step = 8, .min = 8 }, .{} }, .served = &.{ .{ .rows = 20, .n = 256, .k = 640 }, .{ .rows = 80, .n = 256, .k = 640 } } }, null);
     const reduce_chain = "take -> multiply -> sum (MLX col_reduce_small, bf16)";
-    // Verify (2..32 tokens) and prefill chunks, at the two (top-k, hidden) pairs whose partial-sum tree it copies.
+    // Verify (2..32 tokens) and prefill chunks, at the (top-k, hidden) pairs whose partial-sum tree it copies.
     try set.add(Reduce, .init(a), .{ .name = "verify_expert_reduce bf16 (top-10, hidden 2560)", .accum = .bf16, .depth = routeDepth, .out = .bf16, .replaces = reduce_chain, .served = &.{ .{ .rows = 4, .n = 2560, .k = 10 }, .{ .rows = 32, .n = 2560, .k = 10 }, .{ .rows = 1024, .n = 2560, .k = 10 } } }, null);
+    try set.add(Reduce, .init(a), .{ .name = "verify_expert_reduce bf16 (top-8, hidden 2048)", .accum = .bf16, .depth = routeDepth, .out = .bf16, .replaces = reduce_chain, .served = &.{ .{ .rows = 8, .n = 2048, .k = 8 }, .{ .rows = 16, .n = 2048, .k = 8 }, .{ .rows = 512, .n = 2048, .k = 8 } } }, null);
     try set.add(Reduce, .init(a), .{ .name = "verify_expert_reduce bf16 (top-8, hidden 4096)", .accum = .bf16, .depth = routeDepth, .out = .bf16, .replaces = reduce_chain, .served = &.{ .{ .rows = 4, .n = 4096, .k = 8 }, .{ .rows = 512, .n = 4096, .k = 8 } } }, null);
     const argsort = "argsort -> argsort (inverse), take, floor_divide (MLX, stable)";
     try set.add(Route, .init(a, .pack, 512), routeSpec("verify_route_pack (top-10, 2..32 tokens)", &.{ .{ .rows = 2, .n = 1, .k = 10 }, .{ .rows = 8, .n = 1, .k = 10 }, .{ .rows = 32, .n = 1, .k = 10 } }, argsort), null);
