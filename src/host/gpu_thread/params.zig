@@ -217,6 +217,8 @@ pub const SubmitParams = struct {
     logprobs_n: u32 = 0,
     /// `/v1/completions` echo: score every prompt token (cold prefill, no restore).
     prompt_logprobs: bool = false,
+    /// Directional ablation; the prefix cache keys a module-owned model's entries by it and is otherwise skipped.
+    ablation: ?@import("../../sdk/request/ablation.zig").Request = null,
     /// A spoken reply (the model's `SpeechFacts`); null = text only.
     speech: ?@import("../../sdk/request/speech.zig").Request = null,
     /// Wave 1.A: per-request override of the process-default KV-cache quant

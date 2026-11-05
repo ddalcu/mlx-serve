@@ -169,6 +169,9 @@ pub const LookupResult = struct {
 pub const ModuleBinding = struct {
     xfm: *const transformer_mod.Transformer,
     aux: plugin_driver.AuxBinding,
+    /// What the request changes about the model's state (a directional ablation's key; 0 = nothing): folded into every
+    /// prefix key it stores and looks up (`variantKey`), so an entry is restored only by a request of the same variant.
+    variant: u64 = 0,
 
     /// Null unless the auxiliary table is complete and this loaded instance permits caching.
     pub fn init(xfm: *const transformer_mod.Transformer) ?ModuleBinding {
@@ -177,10 +180,22 @@ pub const ModuleBinding = struct {
         return .{ .xfm = xfm, .aux = aux };
     }
 
+    pub fn forVariant(xfm: *const transformer_mod.Transformer, variant: u64) ?ModuleBinding {
+        var b = init(xfm) orelse return null;
+        b.variant = variant;
+        return b;
+    }
+
     fn same(a: ModuleBinding, b: ModuleBinding) bool {
-        return a.xfm == b.xfm and a.aux.model == b.aux.model and a.aux.hooks == b.aux.hooks;
+        return a.xfm == b.xfm and a.aux.model == b.aux.model and a.aux.hooks == b.aux.hooks and a.variant == b.variant;
     }
 };
+
+/// A plugin's prefix key under a request variant (`ModuleBinding.variant`); variant 0 is the key itself.
+pub fn variantKey(key: u64, variant: u64) u64 {
+    if (variant == 0) return key;
+    return key ^ std.hash.Wyhash.hash(0x7661_7269_616e_74, std.mem.asBytes(&variant));
+}
 
 /// A selection survives eviction by carrying identity, never an index into the entry array.
 pub const ModuleMatch = struct {
@@ -1301,7 +1316,7 @@ pub const HotPrefixCache = struct {
                     mlx.dropLatchedErrorUnless(had_error);
                     continue;
                 }
-                if (key != m.prefix_key) continue;
+                if (variantKey(key, request.binding.variant) != m.prefix_key) continue;
                 best_effective = m.n;
                 best_shared = m.n;
                 best_idx = i;
@@ -1353,7 +1368,7 @@ pub const HotPrefixCache = struct {
             const had_error = mlx.errorPending();
             const verdict = plugin_driver.auxPrefixKey(binding.xfm, prompt_ids[0..candidate.n], media_rows, &key);
             mlx.dropLatchedErrorUnless(had_error);
-            if (!verdict.isOk() or key != candidate.prefix_key) continue;
+            if (!verdict.isOk() or variantKey(key, binding.variant) != candidate.prefix_key) continue;
             return .{ .source = .disk, .disk_id = candidate.id, .n = candidate.n, .prefix_key = candidate.prefix_key };
         }
         return best;
@@ -1948,7 +1963,7 @@ pub const HotPrefixCache = struct {
             .last_used = self.bumpCounter(),
             .touched_ms = crt.monotonicMs(),
             .snapshot = .{ .entries = &.{}, .step = 0, .allocator = self.allocator, .config = quant_config },
-            .module = .{ .binding = binding, .snapshot = snapshot, .n = ids.len, .prefix_key = prefix_key, .aux_bytes = aux_bytes },
+            .module = .{ .binding = binding, .snapshot = snapshot, .n = ids.len, .prefix_key = variantKey(prefix_key, binding.variant), .aux_bytes = aux_bytes },
             .kv_bytes = aux_bytes,
         });
         retained = true;

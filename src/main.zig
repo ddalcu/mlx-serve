@@ -32,6 +32,7 @@ const drafter_mod = @import("plugins/gemma4/assistant_drafter.zig");
 const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
+const ablation_api = @import("host/api/ablation.zig");
 const effectiveSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
@@ -357,6 +358,9 @@ fn printUsage(io: std.Io) void {
         \\                        off (default), 4, 8     — affine group quant.
         \\                          Per-request override via the `kv_quant`
         \\                          body field.
+        \\  --ablation-profiles <dir> --ablation-key-file <path>
+        \\                      Per-request directional ablation (docs/api.md);
+        \\                        the key file is 0600, at least 32 bytes.
         \\  --kv-attn-mode {{auto|dense|fused}}
         \\                      Decode read path for quantized KV. `dense`
         \\                        dequantizes K/V before SDPA; `fused` reads
@@ -715,6 +719,8 @@ pub fn main(init: std.process.Init) !void {
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
     // Off by default — only the `.affine` cache scheme has a fused path.
     var kv_attn_mode: server_mod.KvAttnMode = .auto;
+    var ablation_profiles: ?[]const u8 = null;
+    var ablation_key_file: ?[]const u8 = null;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -1180,6 +1186,12 @@ pub fn main(init: std.process.Init) !void {
             ds4_ssd_streaming = true;
         } else if (std.mem.eql(u8, args[i], "--no-ds4-mtp")) {
             ds4_mtp = false;
+        } else if (std.mem.eql(u8, args[i], "--ablation-profiles") and i + 1 < args.len) {
+            i += 1;
+            ablation_profiles = args[i];
+        } else if (std.mem.eql(u8, args[i], "--ablation-key-file") and i + 1 < args.len) {
+            i += 1;
+            ablation_key_file = args[i];
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -1440,6 +1452,7 @@ pub fn main(init: std.process.Init) !void {
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
     log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
+    server_mod.g_ablation = ablation_api.launch(allocator, io, ablation_profiles, ablation_key_file) catch std.process.exit(1);
 
     // Set GPU as default
     var metal_avail: bool = false;
