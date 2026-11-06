@@ -5,6 +5,13 @@ lives in `docs/known-issues.md`.
 
 ## Agent tools and weak models
 
+### Tool history lost data that already fit its budget
+Defect: a later tool round forgot file contents and kept reading the same files. Cause: the history window charged
+full stored results, then cut them again to 100–2,000 characters. MCP envelopes also shared a 4,000-character cap
+with generic tools, which could remove an issue's body after its metadata. Fix: retain whole results in the admitted
+window and allow bounded 32,000-character MCP responses. Guards: `ToolResultHistoryTests` and
+`tests/test_agent_result_history.py`, which drives three real file reads against a scripted local response stream.
+
 ### writeFile: the body crammed into the `append` flag, and an error that claimed truncation
 Defect: gemma-4-12b wrote `{"append":"true,\n<whole body>","path":…}` five times, each rejected with "content was
 truncated"; later `"true,"` overwrote instead of appending and `"true\",content:"` welded the key into the flag (empty
