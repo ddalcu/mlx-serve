@@ -88,6 +88,7 @@ const RequestMedia = @import("../media/request_media.zig").RequestMedia;
 const appendAnthropicImageBlock = @import("../media/request_media.zig").appendAnthropicImageBlock;
 const IMAGE_DECODE_REJECT = @import("../media/request_media.zig").IMAGE_DECODE_REJECT;
 const handleAnthropicStreaming = @import("anthropic_stream.zig").handleAnthropicStreaming;
+const countTextTokens = @import("tokenize.zig").countTextTokens;
 
 pub fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []const u8, message: []const u8, status_code: u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
@@ -959,6 +960,7 @@ fn handleAnthropicNonStreaming(
     // the request's thinking flag shaped the prompt, never the delivery.
     var routed: ?rp_mod.Delivery = null;
     defer if (routed) |*d| d.deinit(allocator);
+    var thinking_tokens: u32 = 0;
     {
         const think_split = try splitConstrainedResponse(allocator, &routed, sampling, final_text, result.constraint_payload_byte, true, opens_think);
         // Reasoning is never fed back to the parser, so it is cut here.
@@ -967,6 +969,8 @@ fn handleAnthropicNonStreaming(
             break :blk if (t.len > 0) t else null;
         } else null;
         if (split_reasoning) |reasoning| {
+            // The whole thought: output_tokens bills it even when the budget cuts the block below.
+            thinking_tokens = countTextTokens(allocator, lm, tok, reasoning);
             // Apply budget truncation
             var truncated_reasoning = reasoning;
             var trunc_allocated = false;
@@ -1088,7 +1092,7 @@ fn handleAnthropicNonStreaming(
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
 
-    const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens);
+    const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens, thinking_tokens);
     defer allocator.free(usage);
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{s}{s}}}

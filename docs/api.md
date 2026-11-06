@@ -48,7 +48,7 @@ curl http://localhost:11234/v1/messages \
   }'
 ```
 
-Compatible with Claude Code (`ANTHROPIC_BASE_URL=http://localhost:11234 claude`) and Anthropic SDKs. Supports streaming, tool calling, and extended thinking.
+Compatible with Claude Code (`ANTHROPIC_BASE_URL=http://localhost:11234 claude`) and Anthropic SDKs. Supports streaming, tool calling, and extended thinking. Usage always carries `output_tokens_details.thinking_tokens` (0 without thinking; streamed on `message_delta`).
 
 ## POST /v1/responses (OpenAI Responses API)
 
