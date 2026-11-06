@@ -371,6 +371,9 @@ struct MLXCoreApp: App {
                     .font(.app(.body)) }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
 
+                Button { appState.showMonitoring() } label: { Text("Monitoring")
+                    .font(.app(.body)) }
+
                 Divider()
 
                 // The four generators are PAGES of the chat window now

@@ -15,6 +15,7 @@ enum ChatWorkspace: Equatable {
     /// argument as the browser applies — a task is something you set up and then
     /// go back to chatting, not a place you live.
     case tasks
+    case monitoring
     /// The agent list + editor. The sidebar row used to open a MENU of agents,
     /// which made "Agents" mean "start a chat as somebody" — a different verb
     /// from every other row in that column, none of which start anything. It is
@@ -34,6 +35,8 @@ enum ChatWorkspace: Equatable {
     }
 
     var isTasks: Bool { self == .tasks }
+
+    var isMonitoring: Bool { self == .monitoring }
 
     var isAgents: Bool { self == .agents }
 
