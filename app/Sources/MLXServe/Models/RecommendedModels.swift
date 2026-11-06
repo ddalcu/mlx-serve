@@ -58,7 +58,7 @@ private let bytesPerGiB: Double = 1_073_741_824
 
 /// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
 /// `largest` is a RAM tier — the biggest models this app runs (Qwen 3.8
-/// Flash-Next, DeepSeek-V4-Flash and V4.1-Flash on the native MLX arch),
+/// Flash-Next and DeepSeek-V4.1-Flash on the native MLX arch),
 /// grouped by "needs a very large Mac" rather than vendor.
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
@@ -128,10 +128,10 @@ struct RecommendedModelPick: Identifiable, Hashable {
             let bits = name[r].dropFirst("mixed-".count).dropLast("bit".count).split(separator: "-")
             return "mixed \(bits.joined(separator: "/"))-bit"
         }
-        if let r = name.range(of: "(iQ-MLX|Sushi)-[0-9.]+bpw", options: .regularExpression) {
+        if let r = name.range(of: "(iQ-MLX|Sushi)(-Pruned[0-9]+)?-[0-9.]+bpw", options: .regularExpression) {
             let tag = name[r].dropLast("bpw".count)
             let dash = tag.lastIndex(of: "-")!
-            return "\(tag[..<dash]) \(tag[tag.index(after: dash)...]) bpw"
+            return "\(tag[..<dash].replacingOccurrences(of: "-Pruned", with: " Pruned")) \(tag[tag.index(after: dash)...]) bpw"
         }
         if let r = name.range(of: "(?<![A-Za-z0-9])[0-9]+bit", options: .regularExpression) {
             return name[r].dropLast("bit".count) + "-bit"
@@ -371,36 +371,25 @@ extension RecommendedModelPick {
         activeParamsB: 27.0
     )
 
-    /// DeepSeek-V4-Flash via the embedded ds4 engine — a frontier-scale model
-    /// on a very large Mac — now on our OWN native `deepseek_v4` MLX arch
-    /// rather than the embedded ds4 GGUF engine, so the curated pick is our
-    /// mixed 2/3/8-bit mirror (whole safetensors repo, no quant file to name).
-    /// It supersedes the `antirez/deepseek-v4-gguf` IQ2XXS pick: same model,
-    /// engine-native instead of converted, at the cost of the 96 GB tier —
-    /// this build wants 128 GB.
-    static let deepseekV4Flash = RecommendedModelPick(
-        id: "deepseek-v4-flash",
-        name: "DeepSeek-V4-Flash",
-        tagline: "Frontier model, native MLX",
-        blurb: "A frontier-scale DeepSeek model that runs natively on Apple Silicon through MLX — no GGUF conversion, no llama.cpp — for top-tier reasoning, coding, and agent work. It wakes only a fraction of itself per word (mixture of experts) and holds around a million words of context. This is our own iQ-MLX conversion at 3.3 bits per weight, about 130 GB on disk, so it wants a Mac with 128 GB of memory (raise the GPU wired limit and close other apps to fit a useful context); it also ships DeepSeek's own DSpark draft stages, which Settings can switch on for a faster reply on Macs with more than 128 GB.",
-        repoId: "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw",
-        sizeGB: 129.6,
+    /// DeepSeek-V4.1-Flash for a 128 GB Mac: our pack keeps 192 of each layer's 384 experts at 2 bits (the
+    /// 256 GB pick's model, so its intelligence and context). The RAM gate is the 91 GB measured active on a
+    /// 128 GB M4 Max plus room for macOS: a 96 GB Mac has none. `speed` is that M4 Max's 31 tok/s with DSpark
+    /// (on by default), measured with the Engram table read from another Mac's disk.
+    static let deepseekV41Pruned = RecommendedModelPick(
+        id: "deepseek-v41-flash-pruned192",
+        name: "DeepSeek-V4.1-Flash Pruned",
+        tagline: "DeepSeek V4.1 for 128 GB",
+        blurb: "DeepSeek's newest frontier model, slimmed to fit a Mac with 128 GB of memory: each layer keeps the 192 of its 384 experts our agent and coding traffic uses most, at 2 bits per weight. Code, reasoning and tool calls hold up best; chat is weaker than the full model and other languages than English are much weaker. It holds around a million words of context and reads images. About 92 GB stays in memory plus a 203 GB lookup table read from disk as it runs, so plan for the 296 GB download on a fast internal SSD and close other apps first.",
+        repoId: "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-Pruned192-2.25bpw",
+        sizeGB: 296.2,
         family: .largest,
-        intelligence: 67,
-        intelligenceIsEstimated: false,
-        // Plain autoregressive decode measures ~23 tok/s on an M4 Max, level
-        // with the dense 31B (ties are what the activeParams invariant leaves
-        // free). DSpark takes it to ~35 but is opt-in, so it stays out of the
-        // score and is named in the blurb instead — see the file header.
-        speed: 14,
+        intelligence: deepseekV41Flash.intelligence,
+        intelligenceIsEstimated: true,
+        speed: 16,
+        speedIsWithMtp: true,
         contextTokens: 1_048_576,
-        activeParamsB: 13.0,
-        // Weights×1.2 would demand 141 GB and hide the model from the exact
-        // machine the conversion targets: it serves in ~110 GB resident on a
-        // 128 GB Mac, tight against Metal's default ~107 GB working set there
-        // (the blurb says to raise the wired limit), and still above a 96 GB
-        // Mac's gate.
-        ramOverrideGB: 104.0
+        activeParamsB: 16.0,
+        ramOverrideGB: 100.0
     )
 
     /// DeepSeek-V4.1-Flash in our iQ-MLX 3.0 bpw pack on the native
@@ -518,11 +507,11 @@ extension RecommendedModelPick {
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's
-    /// smallest-first convention) — Qwen 3.8 Flash-Next (~100 GB),
-    /// DeepSeek-V4-Flash (~130 GB) then V4.1-Flash (~430 GB). Grouped by
+    /// smallest-first convention) — Qwen 3.8 Flash-Next (~100 GB), DeepSeek-V4.1-Flash
+    /// pruned for 128 GB (~296 GB download) then V4.1-Flash (~430 GB). Grouped by
     /// "needs a very large Mac" rather than by vendor.
     static let largestCatalog: [RecommendedModelPick] = [
-        .sushi2bpw, .qwen38FlashNext, .deepseekV4Flash, .deepseekV41Flash,
+        .sushi2bpw, .qwen38FlashNext, .deepseekV41Pruned, .deepseekV41Flash,
     ]
 
     /// Liquid LFM3, the Recommended pane's first section: the small text model and the Omni that sees, hears and

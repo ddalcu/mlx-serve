@@ -136,7 +136,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testMtpScoredPicksAreTheOnesShippingADraftHead() {
         let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
         XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next",
-                             "sushi-2bpw", "deepseek-v41-flash"])
+                             "sushi-2bpw", "deepseek-v41-flash", "deepseek-v41-flash-pruned192"])
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
         XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
         XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
@@ -176,7 +176,8 @@ final class RecommendedModelsTests: XCTestCase {
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
         XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b",
-                                   "sushi-2bpw", "lfm3-1.7b", "lfm3-omni-2b", "deepseek-v41-flash"])
+                                   "sushi-2bpw", "lfm3-1.7b", "lfm3-omni-2b", "deepseek-v41-flash",
+                                   "deepseek-v41-flash-pruned192"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -191,8 +192,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertLessThan(RecommendedModelPick.gemmaE4B.contextBar,
                           RecommendedModelPick.gemma12B.contextBar)
         XCTAssertLessThan(RecommendedModelPick.gemma12B.contextBar,
-                          RecommendedModelPick.deepseekV4Flash.contextBar)
-        XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.contextBar, 1.0, accuracy: 0.001)
+                          RecommendedModelPick.deepseekV41Flash.contextBar)
+        XCTAssertEqual(RecommendedModelPick.deepseekV41Flash.contextBar, 1.0, accuracy: 0.001)
     }
 
     /// The context bar shows the MODEL's window, not the RAM-clamped effective
@@ -203,7 +204,7 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(RecommendedModelPick.mimo9b.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.qwen38_27b.contextTokens, 262_144)
         XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.contextTokens, 262_144)
-        XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.contextTokens, 1_048_576)
+        XCTAssertEqual(RecommendedModelPick.deepseekV41Pruned.contextTokens, 1_048_576)
     }
 
     /// `activeParamsB` is a fact per checkpoint, not a restatement of the
@@ -211,7 +212,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testActiveParamsAreTheWokenParametersNotTheTotal() {
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.activeParamsB, 3.0)  // 35B total
         XCTAssertEqual(RecommendedModelPick.qwen38FlashNext.activeParamsB, 6.0) // 125B total
-        XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.activeParamsB, 13.0) // 284B total
+        XCTAssertEqual(RecommendedModelPick.deepseekV41Pruned.activeParamsB, 16.0) // 6 of 192 kept experts + shared
         XCTAssertEqual(RecommendedModelPick.mimo9b.activeParamsB, 9.7) // dense
         XCTAssertEqual(RecommendedModelPick.gemma31B.activeParamsB, 31.0)      // dense
     }
@@ -331,11 +332,11 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(mac96.fit(neededGB: fn.approxRAMNeededGB), .tight)
     }
 
-    /// DeepSeek serves in ~110 GB on a 128 GB Mac: the row must read TIGHT
+    /// The pruned DeepSeek serves in ~91 GB on a 128 GB Mac: the row must read TIGHT
     /// against that Mac's default Metal working set (~107 GB), never
     /// "exceeds", while a 96 GB Mac still fails the gate.
     func testDeepseekReadsTightNotExceedsOn128GB() {
-        let ds = RecommendedModelPick.deepseekV4Flash
+        let ds = RecommendedModelPick.deepseekV41Pruned
         let mac128 = SystemMemoryInfo(totalBytes: 128 * GiB, usableBytes: UInt64(107.5 * Double(GiB)))
         XCTAssertEqual(mac128.fit(neededGB: ds.approxRAMNeededGB), .tight)
         XCTAssertFalse(ds.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
@@ -429,15 +430,14 @@ final class RecommendedModelsTests: XCTestCase {
     }
 
     /// The "Largest models" section holds the biggest picks, ordered smallest-
-    /// first like every other catalog: the ~100 GB Qwen 3.8 Flash-Next pack
-    /// then the ~130 GB native-MLX DeepSeek-V4-Flash mirror.
+    /// first like every other catalog: the ~100 GB Qwen 3.8 Flash-Next pack,
+    /// then DeepSeek-V4.1 pruned for 128 GB Macs, then its 256 GB pack.
     func testLargestSectionHoldsFlashNextThenDeepseek() {
         XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id),
-                       ["sushi-2bpw", "qwen38-flash-next", "deepseek-v4-flash", "deepseek-v41-flash"])
+                       ["sushi-2bpw", "qwen38-flash-next", "deepseek-v41-flash-pruned192", "deepseek-v41-flash"])
         let fn = RecommendedModelPick.qwen38FlashNext
         XCTAssertEqual(fn.repoId, "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-4.7bpw")
         XCTAssertEqual(fn.quantLabel, "iQ-MLX 4.7 bpw")
-        XCTAssertEqual(fn.intelligence, RecommendedModelPick.deepseekV4Flash.intelligence)
     }
 
     /// The 35B slot is our own MLX-Serve pack (in-checkpoint MTP head).
@@ -446,22 +446,17 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertFalse(RecommendedModelPick.qwenCatalog.contains { $0.repoId == "mlx-community/Qwen3.6-35B-A3B-4bit" })
     }
 
-    /// DeepSeek-V4-Flash is served by our OWN native `deepseek_v4` MLX arch, not
-    /// the embedded ds4 GGUF engine — so the pick is the mixed 2/3/8-bit mirror
-    /// and fetches a whole safetensors repo (no `ggufFilename`). Its RAM gate is
-    /// an explicit 128 GB: weights×1.2 would claim 141 GB and hide the model
-    /// from the exact machine the conversion was built for (~110 GB resident).
-    func testDeepseekV4FlashIsTheNativeMlxMirror() {
-        let ds4 = RecommendedModelPick.deepseekV4Flash
-        XCTAssertEqual(ds4.family, .largest)
-        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw")
-        XCTAssertNil(ds4.ggufFilename, "the native MLX mirror fetches the whole safetensors repo")
-        XCTAssertEqual(ds4.approxRAMNeededGB, 104.0)
-        XCTAssertTrue(ds4.meetsSystemRequirements(physicalMemoryBytes: 128 * GiB))
-        XCTAssertFalse(ds4.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
-        XCTAssertNil(RecommendedModelPick.gemmaE4B.ggufFilename, "safetensors picks fetch the whole repo")
-        XCTAssertFalse(RecommendedModelPick.allCatalogs.contains { $0.repoId == "antirez/deepseek-v4-gguf" },
-                       "the ds4 GGUF pick is superseded by the native mirror")
+    /// DeepSeek-V4.1 for a 128 GB Mac is our pruned pack (192 of 384 experts, 2-bit): the same model as the
+    /// 256 GB pick, so the same intelligence and context; its Engram table stays on disk.
+    func testDeepseekV41PrunedIsOurPackForA128GBMac() {
+        let ds = RecommendedModelPick.deepseekV41Pruned
+        XCTAssertEqual(ds.repoId, "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-Pruned192-2.25bpw")
+        XCTAssertEqual(ds.quantLabel, "iQ-MLX Pruned192 2.25 bpw")
+        XCTAssertEqual(ds.intelligence, RecommendedModelPick.deepseekV41Flash.intelligence)
+        XCTAssertTrue(ds.meetsSystemRequirements(physicalMemoryBytes: 128 * GiB))
+        XCTAssertFalse(ds.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
+        XCTAssertFalse(RecommendedModelPick.allCatalogs.contains { $0.repoId.hasPrefix("ddalcu/DeepSeek-V4-Flash") },
+                       "the V4.1 pruned pack replaces the V4-Flash pick")
     }
 
     /// DeepSeek-V4.1-Flash is our iQ-MLX 3.0 pack, gated on its ~213 GB wired
