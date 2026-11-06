@@ -199,7 +199,7 @@ fn waitForUnload(need: u64, avail: u64, mark: model_registry_mod.UnloadMark, now
 }
 
 fn loadAvail(_: std.Io) u64 {
-    return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+    return effectiveAvailableBytes(status.getLoadAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
 }
 
 /// RAM a load can still take beside everything resident: what the OS grants less the reserve it
@@ -628,6 +628,25 @@ test "a sidecar bills its loaded width, and only an in-dir one is dropped to fit
     try std.testing.expectEqual(PreflightVerdict.refuse, preflightVerdict(20 * GB, 3 * GB, 25 * GB, false));
     try std.testing.expectEqual(PreflightVerdict.refuse, preflightVerdict(20 * GB, 3 * GB, 20 * GB, true));
     try std.testing.expectEqual(PreflightVerdict.fits, preflightVerdict(20 * GB, 0, 25 * GB, true));
+}
+
+test "load preflight: a load that fits once idle apps are compressed is admitted; one that cannot fit is still refused" {
+    const system = @import("../../../sdk/util/system.zig");
+    const GB: u64 = 1024 * 1024 * 1024;
+    const page: u64 = 16384;
+    const total: u64 = 128 * GB;
+    // vm_stat on a 128 GB M5 Max with browsers, editors and agent sessions idle, nothing loaded:
+    // free 4104361, speculative 130855, file-backed 735834, purgeable 83758, inactive 1663021,
+    // wired 451005, compressor 193872 pages. The 70.13 GB pack needs ~77.1 GB.
+    const weights: u64 = @intFromFloat(70.13 * @as(f64, @floatFromInt(GB)));
+    const base = system.computeAvailableBytes(total, 4104361, 130855, 735834, 83758, 451005, 193872, page);
+    const load = system.computeLoadAvailableBytes(total, 4104361, 130855, 735834, 83758, 1663021, 451005, 193872, page);
+    try testing.expect(memInsufficientForLoad(weights, base)); // base figure ~73.1 GB: refused
+    try testing.expect(!memInsufficientForLoad(weights, load)); // load figure ~80.2 GB: admitted
+    // A pack the box cannot hold is still refused, idle apps or not.
+    try testing.expect(memInsufficientForLoad(100 * GB, load));
+    // The same box with those apps ACTIVE (nothing inactive) refuses the 70 GB pack.
+    try testing.expect(memInsufficientForLoad(weights, system.computeLoadAvailableBytes(total, 4104361, 130855, 735834, 83758, 0, 451005, 193872, page)));
 }
 
 test "memInsufficientForLoad: headroom + unknown-query guards" {

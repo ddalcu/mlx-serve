@@ -818,6 +818,12 @@ Defect: Qwen3.8-27B on a 48 GB laptop 400'd every turn after a while. Cause: pur
 drops first) read as taken. Fix: purgeable joins the grantable sum in `computeAvailableBytes` and the app's twin.
 Guard: `computeAvailableBytes sums the reclaimable classes…`, `testPurgeablePagesCountAsGrantable`.
 
+### A 70 GB pack was refused on a 128 GB Mac with ~98 GB to give
+Defect: with browsers and editors idle, every cold load of Qwen3.8-Flash-Next 503'd (needs 77.1, "available" 73.2);
+loaded past the preflight, ~28 GB stayed free. Cause: idle anonymous pages, which macOS compresses or swaps for a
+wiring, read as taken. Fix: the load preflight alone adds half of `inactive - external` (`computeLoadAvailableBytes`).
+Guard: `load preflight: a load that fits once idle apps are compressed is admitted…`.
+
 ### A client that hung up during a cold prefill left the GPU prefilling for a ghost
 Defect: Claude Code retrying a 40K-token prompt queued abandoned prefills while no client was connected. Cause: the
 handler checked the peer only after a token arrived. Fix: keepalives flow while waiting for the first token, each

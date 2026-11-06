@@ -7,6 +7,7 @@ Scheduler, admission, caches, spec decode, kernels. Stories: `docs/gotchas/engin
 Loading + residency:
 - **A missing tensor is a load ERROR, never `unreachable`** (#217, `error.MissingWeight` → named 503); load failures cross the inference thread by NAME (`req.error_name` → `loadErrorFromName`, #144). A refusal the user fixes outside the pack (memory, an absent worker Mac) leaves the entry `.unloaded` (`failureRetries`).
 - **The load preflight's "available" is capped by Metal's working-set limit** (`effectiveAvailableBytes(…, mlx.maxRecommendedWorkingSet())`): a lowered `iogpu.wired_limit_mb` binds below free RAM and weights past it OOM in warmup, leaving a server that refuses every request.
+- **The load preflight counts half the idle anonymous pages** (`computeLoadAvailableBytes`); per-request gates keep `computeAvailableBytes`, which a resident model's next prefill must not push apps out for.
 - **`modelDiskBytes` bills the shards the INDEX names** (#274); an index naming NO shard on disk is STALE, not a filter (`indexShardSet` → null).
 - **Tokenizer-derived config is set in ONE place for both load paths** (`ModelConfig.applyTokenizer`: EOS merges, LFM2 image tokens).
 - **A launch flag that shapes a LOAD is retained on the Scheduler** (`ensureLoaded`'s cold-load `LoadRequest` is a second site; `--drafter` via `coldLoadDrafterDir`). Guard: `tests/test_cold_load_launch_flags.sh`. An arg loop needs an else branch (`classifyUnparsedArg`); guard `tests/test_headless_spec_flags.sh`.
