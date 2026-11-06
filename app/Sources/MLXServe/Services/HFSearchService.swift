@@ -42,6 +42,8 @@ class HFSearchService: ObservableObject {
     @Published var sortField: HFSortField = .downloads
     @Published var sortDescending = true
     @Published var hasMore = true
+    /// A pasted `/tree/<branch>` URL: Discover opens that repo's card on the branch.
+    @Published var openedSource: HFSource?
 
     private let pageSize = 50
     private var currentSkip = 0
@@ -75,7 +77,24 @@ class HFSearchService: ObservableObject {
         models = []
         hasMore = true
         error = nil
+        openedSource = nil
+        // A pasted id or URL is that repo, whatever its tags; a miss is an ordinary search.
+        if let source = HFSource.parse(searchQuery), let model = await lookup(source.repo) {
+            fetchedModels = [model]
+            models = sortedModels
+            hasMore = false
+            if !source.isMain { openedSource = source }
+            if Self.needsFallbackFetch(model) { await fetchFallbackSizes(for: [model]) }
+            return
+        }
         await fetchPage()
+    }
+
+    private func lookup(_ repo: String) async -> HFModel? {
+        guard let url = Self.lookupURL(repo: repo),
+              let (data, response) = try? await DownloadSession.shared.data(for: DownloadManager.hfApiRequest(url)),
+              (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
+        return try? JSONDecoder().decode(HFModel.self, from: data)
     }
 
     func loadMore() async {
@@ -201,14 +220,22 @@ class HFSearchService: ObservableObject {
         ]
         let q = query.trimmingCharacters(in: .whitespaces)
         if !q.isEmpty { items.append(URLQueryItem(name: "search", value: q)) }
-        // `config` carries `model_type` — the field the server dispatches on,
-        // and how a media pack (H3, LTX, …) is recognized in search results.
-        for field in ["safetensors", "lastModified", "likes", "downloads", "tags", "pipeline_tag", "config"] {
-            items.append(URLQueryItem(name: "expand[]", value: field))
-        }
-        components.queryItems = items
+        components.queryItems = items + expandFields
         return components.url
     }
+
+    /// One repo by id, with the fields a search row reads.
+    nonisolated static func lookupURL(repo: String) -> URL? {
+        var components = URLComponents(string: "https://huggingface.co/api/models")!
+        components.path += "/" + repo
+        components.queryItems = expandFields
+        return components.url
+    }
+
+    /// `config` carries `model_type` — the field the server dispatches on,
+    /// and how a media pack (H3, LTX, …) is recognized in search results.
+    private nonisolated static let expandFields = ["safetensors", "lastModified", "likes", "downloads", "tags", "pipeline_tag", "config"]
+        .map { URLQueryItem(name: "expand[]", value: $0) }
 
     /// Fetch file sizes from the tree API for models missing metadata.
     /// Branches inside `parseFallbackSize` on what the repo actually ships:
@@ -222,7 +249,7 @@ class HFSearchService: ObservableObject {
                     // `?recursive=true` so a sharded GGUF's nested shards are
                     // listed — `parseFallbackSize` sums each quant's shards, so
                     // a subfoldered repo reports a real size instead of "—".
-                    guard let url = URL(string: "https://huggingface.co/api/models/\(model.id)/tree/main?recursive=true") else { return nil }
+                    let url = HFSource(repo: model.id).treeURL
                     guard let (data, response) = try? await DownloadSession.shared.data(for: DownloadManager.hfApiRequest(url)),
                           let http = response as? HTTPURLResponse, http.statusCode == 200,
                           let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }

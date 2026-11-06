@@ -2286,3 +2286,19 @@ test "resolveGgufFile: an embedding GGUF is never the chat model, and says so by
     try testing.expectEqual(@as(usize, 1), res.models.len);
     try testing.expectEqualStrings("mixed", res.models[0].id);
 }
+
+test "discoverModels finds a branch download (<org>/<name>-<branch>) under its folder name" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "org/Model-exl3-2.81bpw");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/Model-exl3-2.81bpw/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/models-root");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.models.len);
+    try std.testing.expectEqualStrings("org/Model-exl3-2.81bpw", result.models[0].id);
+    try std.testing.expectEqualStrings("/models-root/org/Model-exl3-2.81bpw", result.models[0].path);
+}

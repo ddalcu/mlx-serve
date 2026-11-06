@@ -30,7 +30,7 @@ enum DownloadChunking {
     /// don't quote it as one without naming the link it was measured on.
     static let defaultConnections = 16
     /// Never split below this. A chunk this small spends more on connection
-    /// setup and the `resolve/main` redirect than the parallelism saves.
+    /// setup and the `resolve` redirect than the parallelism saves.
     static let minChunkBytes: Int64 = 8 << 20
     static let maxConnections = 16
     private static let connectionsDefaultsKey = "downloadConnections"
@@ -239,7 +239,7 @@ final class PositionalFile: @unchecked Sendable {
 enum DownloadSession {
     /// ONE session for every model transfer. Keep-alive is the point: a repo's
     /// config/tokenizer/index files stop re-paying TCP + TLS + the
-    /// `resolve/main` 302 each, and a big file's chunks reuse warmed
+    /// `resolve` 302 each, and a big file's chunks reuse warmed
     /// connections. The per-host cap has to clear our connection count —
     /// URLSession's default is 6, which would silently queue chunks 7 and 8.
     /// A `var` only so tests can point the whole download loop at a stub

@@ -298,35 +298,37 @@ private struct PluginPage: View {
                 HStack(alignment: .center, spacing: 10) {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(pack.text).font(.app(.rowTitle))
-                        if let repo = pack.repo {
-                            Text(repo).font(.app(.annotation, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
+                        if let source = pack.source {
+                            Text(verbatim: source.isMain ? source.repo : "\(source.repo)@\(source.revision)")
+                                .font(.app(.annotation, design: .monospaced)).foregroundStyle(.secondary).textSelection(.enabled)
                         }
                     }
                     Spacer()
-                    if let repo = pack.repo { packStatus(repo) }
+                    if let source = pack.source { packStatus(source) }
                 }
                 .padding(.vertical, 4)
             }
         }
     }
 
-    @ViewBuilder private func packStatus(_ repo: String) -> some View {
-        if onDisk.contains(repo) {
+    /// A branch pack is on disk, and downloads, as `<name>-<branch>`.
+    @ViewBuilder private func packStatus(_ source: HFSource) -> some View {
+        if onDisk.contains(source.localRepoId) {
             Label { Text("On this Mac").font(.app(.value)) } icon: { Image(systemName: "checkmark.circle.fill").foregroundStyle(.green) }
-        } else if let d = downloads.downloads[repo], d.status == .downloading {
+        } else if let d = downloads.downloads[source.localRepoId], d.status == .downloading {
             HStack(spacing: 8) {
                 ProgressView(value: d.progress).frame(width: 90)
                 Text("\(Int(d.progress * 100))%").font(.app(.value).monospacedDigit()).foregroundStyle(.secondary)
             }
         } else {
-            Button { downloads.start(repoId: repo) { refreshOnDisk() } } label: {
+            Button { downloads.start(repoId: source.repo, revision: source.revision) { refreshOnDisk() } } label: {
                 Label { Text("Download").font(.app(.value)) } icon: { Image(systemName: "arrow.down.circle") }
             }
         }
     }
 
     private func refreshOnDisk() {
-        onDisk = Set(packs.compactMap(\.repo).filter { ServerManager.resolveModelDir(repo: $0) != nil })
+        onDisk = Set(packs.compactMap(\.source?.localRepoId).filter { ServerManager.resolveModelDir(repo: $0) != nil })
     }
 
     // MARK: Details

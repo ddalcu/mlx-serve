@@ -12,9 +12,14 @@ struct PackUpdate: Equatable {
 
 /// The Hugging Face repo a download came from, written beside the files
 /// (`.mlx-serve-source.json`) so a later update check need not guess it from the folder name.
+/// `revision` is nil for main (markers written before branches carry none); `commit` when known.
 struct PackSource: Codable, Equatable {
     var repo: String
     var subfolder: String? = nil
+    var revision: String? = nil
+    var commit: String? = nil
+
+    var source: HFSource { HFSource(repo: repo, revision: revision ?? "main") }
 
     static let fileName = ".mlx-serve-source.json"
 
@@ -40,7 +45,7 @@ enum UpdateSelection: Equatable {
 
 enum UpdateTarget: Equatable {
     case skipped(String)
-    case check(repo: String, selection: UpdateSelection)
+    case check(repo: String, revision: String = "main", selection: UpdateSelection)
 }
 
 enum UpdateResult: Equatable {
@@ -56,8 +61,11 @@ enum UpdateResult: Equatable {
 struct UpdateCheck: Equatable {
     var result: UpdateResult
     var repo: String = ""
+    var revision: String = "main"
     var dir: String = ""
     var selection: UpdateSelection = .chat(drafter: false)
+
+    var source: HFSource { HFSource(repo: repo, revision: revision) }
 }
 
 enum PackUpdateCheck {
@@ -102,14 +110,15 @@ enum PackUpdateCheck {
         case .mlxServe, .custom: break
         }
         guard let repo = marker?.repo ?? ModelCard.repoId(localName: m.name) else { return .skipped("no Hugging Face name") }
-        if let quant = m.quantFile { return .check(repo: repo, selection: .gguf(quant)) }
+        let revision = marker?.revision ?? "main"
+        if let quant = m.quantFile { return .check(repo: repo, revision: revision, selection: .gguf(quant)) }
         if let sub = marker?.subfolder { return .check(repo: repo, selection: .variant(sub)) }
         if isMediaModelType(m.modelType) || m.modelType == "laya",
            let bundle = CustomMediaModels.bundle(arch: m.modelType, repoId: repo) {
             let comp = bundle.components.first { $0.repo == repo } ?? bundle.components[0]
-            return .check(repo: repo, selection: .media(comp.selection))
+            return .check(repo: repo, revision: revision, selection: .media(comp.selection))
         }
-        return .check(repo: repo, selection: .chat(drafter: !drafterOff))
+        return .check(repo: repo, revision: revision, selection: .chat(drafter: !drafterOff))
     }
 
     /// The listing's files a selection covers, as local paths with their sizes.
@@ -181,6 +190,14 @@ enum PackUpdateCheck {
             || GemmaVariant.allCases.contains { $0.drafterRepoId == repoId }
     }
 
+    /// What the daily check lists for a pack: its marker's repo and branch
+    /// (a branch folder's name is neither), else the folder's own name on main.
+    /// A variant's marker names the parent repo, whose root is not this pack.
+    static func listingSource(name: String, dir: String) -> HFSource {
+        guard let marker = PackSource.read(dir: dir), marker.subfolder == nil else { return HFSource(repo: name) }
+        return marker.source
+    }
+
     static func isDue(lastChecked: Date?, now: Date = Date()) -> Bool {
         guard let lastChecked else { return true }
         return now.timeIntervalSince(lastChecked) >= interval
@@ -189,15 +206,14 @@ enum PackUpdateCheck {
 
 extension DownloadManager {
     /// The pack's HF listing as path → size (nil on any failure).
-    func fetchListing(repoId: String) async -> [[String: Any]]? {
-        let (status, entries) = await fetchListingStatus(repoId: repoId)
+    func fetchListing(_ source: HFSource) async -> [[String: Any]]? {
+        let (status, entries) = await fetchListingStatus(source)
         return status == 200 ? entries : nil
     }
 
     /// The listing with its HTTP status (0 when the request never answered).
-    func fetchListingStatus(repoId: String) async -> (Int, [[String: Any]]?) {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true"),
-              let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)) else { return (0, nil) }
+    func fetchListingStatus(_ source: HFSource) async -> (Int, [[String: Any]]?) {
+        guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(source.treeURL)) else { return (0, nil) }
         return ((response as? HTTPURLResponse)?.statusCode ?? 0, try? JSONSerialization.jsonObject(with: data) as? [[String: Any]])
     }
 
@@ -216,13 +232,13 @@ extension DownloadManager {
     private func checkForUpdate(_ m: LocalModel, drafterOff: Bool) async -> UpdateCheck {
         let base = m.quantFile == nil ? m.path : (m.path as NSString).deletingLastPathComponent
         let marker = PackSource.read(dir: base) ?? PackSource.read(dir: (base as NSString).deletingLastPathComponent)
-        let repo: String
+        let source: HFSource
         var selection: UpdateSelection
         switch PackUpdateCheck.target(for: m, marker: marker, drafterOff: drafterOff) {
         case .skipped(let why): return UpdateCheck(result: .skipped(why))
-        case .check(let r, let sel): (repo, selection) = (r, sel)
+        case .check(let r, let rev, let sel): (source, selection) = (HFSource(repo: r, revision: rev), sel)
         }
-        let (status, entries) = await fetchListingStatus(repoId: repo)
+        let (status, entries) = await fetchListingStatus(source)
         let wanted = PackUpdateCheck.wanted(entries ?? [], selection: selection)
         // Applying fetches `drafter/` as its own selection, which must not be empty.
         if case .chat(true) = selection, !wanted.contains(where: { $0.0.hasPrefix(DrafterGems.packFolder + "/") }) {
@@ -233,7 +249,7 @@ extension DownloadManager {
             dir = m.path.hasSuffix("/" + rel) ? String(m.path.dropLast(rel.count + 1)) : base
         }
         return UpdateCheck(result: PackUpdateCheck.classify(status: status, wanted: wanted, inDir: dir),
-                           repo: repo, dir: dir, selection: selection)
+                           repo: source.repo, revision: source.revision, dir: dir, selection: selection)
     }
 
     /// Refresh one pack's listing and pending update. `force` skips the daily gate.
@@ -242,7 +258,7 @@ extension DownloadManager {
         let key = "packUpdateChecked." + repoId
         let last = UserDefaults.standard.object(forKey: key) as? Date
         guard force || PackUpdateCheck.isDue(lastChecked: last) else { return }
-        guard let entries = await fetchListing(repoId: repoId) else { return }
+        guard let entries = await fetchListing(PackUpdateCheck.listingSource(name: repoId, dir: dir)) else { return }
         UserDefaults.standard.set(Date(), forKey: key)
         packListings[repoId] = PackUpdateCheck.sizes(entries)
         let drafterOff = ModelSettingsFile.load().override(for: dir)?.drafter == "off"

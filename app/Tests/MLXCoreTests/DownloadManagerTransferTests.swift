@@ -208,6 +208,106 @@ final class DownloadManagerTransferTests: XCTestCase {
                        "the quant subfolder — partials and all — goes with the cancel")
     }
 
+    // MARK: - Branches
+
+    /// A branch-only repo (main holds the card) lands in `<name>-<branch>`, from that branch's own URLs.
+    func testABranchLandsInItsOwnFolderFromItsOwnURLs() async throws {
+        HuggingFaceStubProtocol.serve(repo: repoId, branches: ["main": [("README.md", Data("card".utf8))],
+                                                               "feature/x": Self.fixtureFiles()])
+        let manager = DownloadManager(modelsRoot: tempRoot)
+        let local = "acme/fixture-model-feature-x"
+
+        await manager.download(repoId: repoId, alertOnFailure: false, revision: "feature/x", commit: "commit-feature/x")
+
+        XCTAssertEqual(manager.downloads[local]?.status, .completed, "error: \(manager.downloads[local]?.error ?? "-")")
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: local)
+        for (name, body) in Self.fixtureFiles() {
+            XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: (dir as NSString).appendingPathComponent(name))), body)
+        }
+        XCTAssertFalse(FileManager.default.fileExists(atPath: DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)))
+        XCTAssertEqual(PackSource.read(dir: dir), PackSource(repo: repoId, revision: "feature/x", commit: "commit-feature/x"))
+        let paths = HuggingFaceStubProtocol.requests.map(\.path)
+        XCTAssertTrue(paths.contains("/api/models/\(repoId)/tree/feature%2Fx"), "\(paths)")
+        XCTAssertTrue(paths.filter { $0.contains("/resolve/") }.allSatisfy { $0.contains("/resolve/feature%2Fx/") }, "\(paths)")
+        XCTAssertTrue(manager.isReady(local))
+        XCTAssertEqual(manager.branchSources[local], HFSource(repo: repoId, revision: "feature/x"), "a Retry fetches the branch")
+        XCTAssertEqual(DownloadManager.mlxServeModels(inRoots: [tempRoot]).map(\.name), [local],
+                       "discovery lists the branch folder like any other pack")
+    }
+
+    func testAMainDownloadKeepsItsFolderAndReadsMain() async throws {
+        HuggingFaceStubProtocol.serve(repo: repoId, branches: ["main": Self.fixtureFiles(),
+                                                               "2bit": [("config.json", Data("{}".utf8))]])
+        let manager = DownloadManager(modelsRoot: tempRoot)
+
+        await manager.download(repoId: repoId, alertOnFailure: false)
+
+        XCTAssertEqual(manager.downloads[repoId]?.status, .completed)
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
+        XCTAssertTrue(manager.isReady(repoId))
+        XCTAssertEqual(PackSource.read(dir: dir), PackSource(repo: repoId))
+        XCTAssertTrue(HuggingFaceStubProtocol.requests.filter { $0.path.contains("/resolve/") }.allSatisfy { $0.path.contains("/resolve/main/") })
+    }
+
+    func testBranchesArePricedAndAOneCardMainIsLeftOut() async throws {
+        HuggingFaceStubProtocol.serve(repo: repoId, branches: ["main": [("README.md", Data("card".utf8))],
+                                                               "2bit": Self.fixtureFiles(),
+                                                               "docs": [("README.md", Data("x".utf8))]])
+        let branches = await DownloadManager(modelsRoot: tempRoot).listBranches(repoId: repoId)
+        let bytes = Self.fixtureFiles().reduce(Int64(0)) { $0 + Int64($1.1.count) }
+        XCTAssertEqual(branches, [HFBranch(name: "2bit", commit: "commit-2bit", bytes: bytes)])
+    }
+
+    func testAMainOnlyRepoListsNoBranchesWithoutWalkingItsTree() async throws {
+        HuggingFaceStubProtocol.serve(repo: repoId, files: Self.fixtureFiles())
+        let branches = await DownloadManager(modelsRoot: tempRoot).listBranches(repoId: repoId)
+        XCTAssertTrue(branches.isEmpty)
+        XCTAssertFalse(HuggingFaceStubProtocol.requests.contains { $0.path.contains("/tree/") })
+    }
+
+    /// The check lists the RECORDED branch, and applying it lands in the branch folder.
+    func testTheUpdateCheckReadsTheRecordedRevision() async throws {
+        let manager = DownloadManager(modelsRoot: tempRoot)
+        HuggingFaceStubProtocol.serve(repo: repoId, branches: ["main": [("README.md", Data("card".utf8))],
+                                                               "2bit": Self.fixtureFiles()])
+        await manager.download(repoId: repoId, alertOnFailure: false, revision: "2bit")
+        let local = "acme/fixture-model-2bit"
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: local)
+        let added = ("generation_config.json", Data(#"{"temperature":1}"#.utf8))
+        HuggingFaceStubProtocol.serve(repo: repoId, branches: ["main": [("README.md", Data("card".utf8))],
+                                                               "2bit": Self.fixtureFiles() + [added]])
+        let model = LocalModel(id: "mlxServe:\(local)", name: local, path: dir, sizeFormatted: "1 GB",
+                               modelType: "llama", source: .mlxServe, kind: .base)
+
+        await manager.checkAllForUpdates(models: [model])
+
+        let check = try XCTUnwrap(manager.updateChecks[model.id])
+        XCTAssertEqual(check.result, .update(PackUpdate(files: 1, bytes: Int64(added.1.count))))
+        XCTAssertEqual(check.repo, repoId)
+        XCTAssertEqual(check.revision, "2bit")
+        XCTAssertTrue(HuggingFaceStubProtocol.requests.contains { $0.path == "/api/models/\(repoId)/tree/2bit" })
+
+        // Applying a failed check would raise the failure alert, which blocks a test run.
+        guard case .update = check.result else { return }
+        let applied = expectation(description: "update applied")
+        manager.applyUpdate(check, for: model) { applied.fulfill() }
+        await fulfillment(of: [applied], timeout: 30)
+        XCTAssertEqual(try Data(contentsOf: URL(fileURLWithPath: (dir as NSString).appendingPathComponent(added.0))), added.1)
+        XCTAssertNil(manager.updateChecks[model.id], "the badge clears once the files landed")
+    }
+
+    func testAPastedBranchURLFindsTheRepoAndOpensItsBranch() async throws {
+        HuggingFaceStubProtocol.serve(repo: repoId, branches: ["main": [("README.md", Data("card".utf8))],
+                                                               "2bit": Self.fixtureFiles()])
+        let search = HFSearchService()
+        search.searchQuery = "https://huggingface.co/\(repoId)/tree/2bit"
+
+        await search.search()
+
+        XCTAssertEqual(search.models.map(\.id), [repoId], "a pasted id is shown whatever its tags")
+        XCTAssertEqual(search.openedSource, HFSource(repo: repoId, revision: "2bit"))
+    }
+
     // MARK: - Every entry point uses the same transport
 
     /// The app has SIX download entry points (`start`, both `startGguf`
@@ -306,13 +406,14 @@ final class DownloadManagerTransferTests: XCTestCase {
 
 // MARK: - Stub Hugging Face origin
 
-/// Answers the two endpoints the download loop speaks: the recursive tree
-/// listing and `resolve/main/<path>` with real Range semantics.
+/// Answers the endpoints the download loop speaks: the model lookup, `refs`, the
+/// recursive tree listing and `resolve/<rev>/<path>` with real Range semantics.
 final class HuggingFaceStubProtocol: URLProtocol {
     struct Recorded { let path: String; let range: String? }
 
     private static let lock = NSLock()
-    private static var repos: [String: [(String, Data)]] = [:]
+    /// repo -> revision -> files.
+    private static var repos: [String: [String: [(String, Data)]]] = [:]
     private static var throttle = false
     private static var shardChunkFailuresLeft = 0
     private static var recorded: [Recorded] = []
@@ -320,7 +421,7 @@ final class HuggingFaceStubProtocol: URLProtocol {
     static func serve(repo: String, files: [(String, Data)], throttle: Bool = false,
                       failFirstNShardChunks: Int = 0) {
         lock.lock(); defer { lock.unlock() }
-        self.repos = repo.isEmpty ? [:] : [repo: files]
+        self.repos = repo.isEmpty ? [:] : [repo: ["main": files]]
         self.throttle = throttle
         self.shardChunkFailuresLeft = failFirstNShardChunks
         self.recorded = []
@@ -330,7 +431,16 @@ final class HuggingFaceStubProtocol: URLProtocol {
     /// model and its assistant drafter).
     static func serve(repos: [String: [(String, Data)]]) {
         lock.lock(); defer { lock.unlock() }
-        self.repos = repos
+        self.repos = repos.mapValues { ["main": $0] }
+        self.throttle = false
+        self.shardChunkFailuresLeft = 0
+        self.recorded = []
+    }
+
+    /// One repo with several branches, each answering refs, `tree/<rev>` and `resolve/<rev>`.
+    static func serve(repo: String, branches: [String: [(String, Data)]]) {
+        lock.lock(); defer { lock.unlock() }
+        self.repos = [repo: branches]
         self.throttle = false
         self.shardChunkFailuresLeft = 0
         self.recorded = []
@@ -356,7 +466,8 @@ final class HuggingFaceStubProtocol: URLProtocol {
 
     override func startLoading() {
         guard let url = request.url else { return }
-        let path = url.path
+        // Encoded, so a branch's `%2F` stays one path segment.
+        let path = URLComponents(url: url, resolvingAgainstBaseURL: false)?.percentEncodedPath ?? url.path
         let range = request.value(forHTTPHeaderField: "Range")
         Self.lock.lock()
         Self.recorded.append(Recorded(path: path, range: range))
@@ -365,9 +476,25 @@ final class HuggingFaceStubProtocol: URLProtocol {
         Self.lock.unlock()
 
         if path.hasPrefix("/api/models/") {
-            // /api/models/<org>/<name>/tree/main
-            let repo = path.dropFirst("/api/models/".count).split(separator: "/").prefix(2).joined(separator: "/")
-            guard let files = repos[repo] else {
+            // /api/models/<org>/<name>[/refs | /tree/<rev>]
+            let parts = path.dropFirst("/api/models/".count).split(separator: "/").map(String.init)
+            let repo = parts.prefix(2).joined(separator: "/")
+            guard let branches = repos[repo] else {
+                send(status: 404, body: Data(), headers: [:])
+                return
+            }
+            if parts.count == 2 {
+                let model: [String: Any] = ["id": repo, "tags": ["mlx-serve"], "pipeline_tag": "text-generation"]
+                send(status: 200, body: try! JSONSerialization.data(withJSONObject: model), headers: [:])
+                return
+            }
+            if parts.count == 3, parts[2] == "refs" {
+                let list = branches.keys.sorted().map { ["name": $0, "ref": "refs/heads/\($0)", "targetCommit": "commit-\($0)"] }
+                send(status: 200, body: try! JSONSerialization.data(withJSONObject: ["branches": list, "tags": []]), headers: [:])
+                return
+            }
+            let rev = parts.count >= 4 && parts[2] == "tree" ? (parts[3].removingPercentEncoding ?? parts[3]) : "main"
+            guard let files = branches[rev] else {
                 send(status: 404, body: Data(), headers: [:])
                 return
             }
@@ -376,8 +503,12 @@ final class HuggingFaceStubProtocol: URLProtocol {
             return
         }
 
-        guard let (repo, files) = repos.first(where: { path.hasPrefix("/\($0.key)/resolve/main/") }),
-              let body = files.first(where: { $0.0 == String(path.dropFirst("/\(repo)/resolve/main/".count)) })?.1 else {
+        // /<org>/<name>/resolve/<rev>/<path>
+        guard let (repo, branches) = repos.first(where: { path.hasPrefix("/\($0.key)/resolve/") }),
+              case let rest = path.dropFirst("/\(repo)/resolve/".count),
+              let slash = rest.firstIndex(of: "/"),
+              let files = branches[String(rest[..<slash]).removingPercentEncoding ?? ""],
+              let body = files.first(where: { $0.0 == String(rest[rest.index(after: slash)...]).removingPercentEncoding })?.1 else {
             send(status: 404, body: Data(), headers: [:])
             return
         }

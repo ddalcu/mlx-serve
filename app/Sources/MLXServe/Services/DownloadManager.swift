@@ -29,6 +29,9 @@ class DownloadManager: ObservableObject {
     /// to. Same reason as `activeGgufShards`: a cancel must take down the one
     /// variant being fetched, never the sibling quants already on disk.
     private var activeVariantDest: [String: String] = [:]
+    /// The repo and branch behind a branch download's row (keyed `<org>/<name>-<branch>`),
+    /// so a Retry fetches that branch rather than a repo named like the folder.
+    private(set) var branchSources: [String: HFSource] = [:]
 
     struct DownloadState {
         /// Fraction of the WHOLE transfer: bytes banked across every file
@@ -248,7 +251,7 @@ class DownloadManager: ObservableObject {
         return ["pytorch_model", "rust_model", "tf_model"].contains { base.hasPrefix($0) }
     }
 
-    /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
+    /// Filter a HuggingFace `/tree/<rev>?recursive=true` listing down to the
     /// files a model download actually needs: top-level config / tokenizer /
     /// weight files, PLUS the speculation sidecars the server auto-loads (the
     /// pack's `drafter/`, and the MTP head). Two nested sidecar layouts are pulled: `mtp/weights.safetensors`
@@ -806,17 +809,22 @@ class DownloadManager: ObservableObject {
     /// `LiquidAI/LFM2.5-2.6B-MLX` but the model must sit in its own 2-level dir
     /// (`LiquidAI/LFM2.5-2.6B-MLX-4bit`) for the server to discover it. Progress
     /// stays keyed on `repoId` — the row the user clicked is the repo's.
+    /// A non-main `revision` is its own model: progress and files both live
+    /// under `HFSource.localRepoId` (`<org>/<name>-<branch>`).
     func download(repoId: String, selection: FileSelection = .chatDefault,
                   alertOnFailure: Bool = true, destRepoId: String? = nil,
-                  destDirOverride: String? = nil) async {
+                  destDirOverride: String? = nil, revision: String = "main", commit: String? = nil) async {
+        let source = HFSource(repo: repoId, revision: revision)
+        let key = source.localRepoId
+        if !source.isMain { branchSources[key] = source }
         // `destDirOverride`: an absolute dir that already holds the model —
         // used when a fetch ADDS to an existing pack (the Turbo adapter),
         // which may live in a non-destination owned root. Writing it to the
         // destination instead creates a fragment dir that reads as a (broken)
         // model to every resolver (live 2026-08-08).
-        let destDir = destDirOverride ?? newLayoutDir(for: destRepoId ?? repoId)
+        let destDir = destDirOverride ?? newLayoutDir(for: destRepoId ?? key)
 
-        downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching file list...")
+        downloads[key] = DownloadState(status: .downloading, statusText: "Fetching file list...")
 
         do {
             // `?recursive=true` so the listing includes nested sidecars — most
@@ -824,8 +832,7 @@ class DownloadManager: ObservableObject {
             // returns `mtp` as a bare directory entry and the file filter skips
             // it, silently dropping the sidecar (and the model's spec-decode
             // speedup). `selectNeededFiles` keeps top-level files + mtp/ only.
-            let listURL = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true")!
-            let (listData, _) = try await DownloadSession.shared.data(for: Self.hfApiRequest(listURL))
+            let (listData, _) = try await DownloadSession.shared.data(for: Self.hfApiRequest(source.treeURL))
             guard let files = try JSONSerialization.jsonObject(with: listData) as? [[String: Any]] else {
                 throw URLError(.cannotParseResponse)
             }
@@ -835,8 +842,7 @@ class DownloadManager: ObservableObject {
             // Unreadable = the old allowlist alone.
             var indexed: Set<String> = []
             if files.contains(where: { ($0["path"] as? String) == "model.safetensors.index.json" }),
-               let indexURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/model.safetensors.index.json"),
-               let (indexData, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(indexURL)) {
+               let (indexData, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(source.fileURL("model.safetensors.index.json"))) {
                 indexed = Self.indexedShardNames(fromIndexData: indexData) ?? []
             }
             let neededFiles = Self.selectNeededFiles(from: files, selection: selection, indexedShards: indexed)
@@ -878,21 +884,21 @@ class DownloadManager: ObservableObject {
                    let existingSize = attrs[.size] as? Int64,
                    existingSize == fileSize && fileSize > 0 {
                     downloadedSize += fileSize
-                    downloads[repoId]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
-                    downloads[repoId]?.statusText = "Skipped \(filePath) (exists)"
-                    downloads[repoId]?.fileIndex = idx + 1
-                    downloads[repoId]?.fileCount = neededFiles.count
+                    downloads[key]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
+                    downloads[key]?.statusText = "Skipped \(filePath) (exists)"
+                    downloads[key]?.fileIndex = idx + 1
+                    downloads[key]?.fileCount = neededFiles.count
                     continue
                 }
 
                 let sizeStr = formatBytes(fileSize)
-                downloads[repoId]?.currentFile = (filePath as NSString).lastPathComponent
-                downloads[repoId]?.fileIndex = idx + 1
-                downloads[repoId]?.fileCount = neededFiles.count
-                downloads[repoId]?.bytesPerSecond = 0
-                downloads[repoId]?.statusText = "\(filePath) (\(sizeStr))"
+                downloads[key]?.currentFile = (filePath as NSString).lastPathComponent
+                downloads[key]?.fileIndex = idx + 1
+                downloads[key]?.fileCount = neededFiles.count
+                downloads[key]?.bytesPerSecond = 0
+                downloads[key]?.statusText = "\(filePath) (\(sizeStr))"
 
-                let fileURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(filePath)")!
+                let fileURL = source.fileURL(filePath)
                 let maxRetries = 20
 
                 for attempt in 0..<maxRetries {
@@ -903,11 +909,11 @@ class DownloadManager: ObservableObject {
                     // plain `.partial` size.
                     let existingBytes = ChunkedFileDownloader.resumableBytes(partialPath: partialPath, fileSize: fileSize)
                     if existingBytes > 0 {
-                        downloads[repoId]?.statusText = "Resuming \(filePath) from \(formatBytes(existingBytes))..."
+                        downloads[key]?.statusText = "Resuming \(filePath) from \(formatBytes(existingBytes))..."
                         // Bank the resumed bytes now: the first transfer
                         // callback would count them anyway, and until it lands
                         // the bar should already reflect what is on disk.
-                        downloads[repoId]?.progress = totalSize > 0
+                        downloads[key]?.progress = totalSize > 0
                             ? Double(downloadedSize + existingBytes) / Double(totalSize) : 0
                     }
 
@@ -915,7 +921,7 @@ class DownloadManager: ObservableObject {
                         try await transferFile(
                             url: fileURL,
                             partialPath: partialPath,
-                            repoId: repoId,
+                            repoId: key,
                             fileSize: fileSize,
                             baseDownloaded: downloadedSize,
                             totalSize: totalSize
@@ -934,7 +940,7 @@ class DownloadManager: ObservableObject {
                             let isStall = error is DownloadStallError
                             let delay = isStall ? 2.0 : Double(attempt + 1) * 2.0
                             let reason = isStall ? "Download stalled" : "Connection lost"
-                            downloads[repoId]?.statusText = "\(reason), retrying in \(Int(delay))s... (\(attempt + 2)/\(maxRetries))"
+                            downloads[key]?.statusText = "\(reason), retrying in \(Int(delay))s... (\(attempt + 2)/\(maxRetries))"
                             try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                         } else {
                             throw error
@@ -943,20 +949,23 @@ class DownloadManager: ObservableObject {
                 }
 
                 downloadedSize += fileSize
-                downloads[repoId]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
+                downloads[key]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
             }
 
-            if destDirOverride == nil { PackSource(repo: repoId, subfolder: selection.subfolder).write(dir: destDir) }
-            downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",
+            if destDirOverride == nil {
+                PackSource(repo: repoId, subfolder: selection.subfolder,
+                           revision: source.isMain ? nil : revision, commit: commit).write(dir: destDir)
+            }
+            downloads[key] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",
                                                fileIndex: neededFiles.count, fileCount: neededFiles.count)
         } catch {
             // User-cancelled? Skip the .failed row + alert — `start()`'s
             // wrapper will drop the entry and remove partials.
             if Task.isCancelled { return }
             let message = error.localizedDescription
-            downloads[repoId] = DownloadState(status: .failed, error: message)
+            downloads[key] = DownloadState(status: .failed, error: message)
             if alertOnFailure, !(error is CancellationError) {
-                presentFailureAlert(repoId: repoId, message: message)
+                presentFailureAlert(repoId: key, message: message)
             }
         }
     }
@@ -967,8 +976,8 @@ class DownloadManager: ObservableObject {
     /// `GgufQuant.groupQuants` can fold them into per-quant menu entries; the
     /// download path reassembles a sharded quant from its ordered shard list.
     /// Sidecars (mmproj/tokenizer) are dropped. Empty on error.
-    func listGgufFiles(repoId: String) async -> [String] {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true") else { return [] }
+    func listGgufFiles(repoId: String, revision: String = "main") async -> [String] {
+        let url = HFSource(repo: repoId, revision: revision).treeURL
         guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let files = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
@@ -981,17 +990,41 @@ class DownloadManager: ObservableObject {
     /// Kick off `download(repoId:)` as a tracked, cancellable task. `onFinish`
     /// runs after the inner work returns (whether completion, failure, or
     /// cancellation) so the caller can refresh model lists exactly once.
-    func start(repoId: String, onFinish: @escaping @MainActor () -> Void) {
-        activeTasks[repoId]?.cancel()
+    /// A branch is tracked, cancelled and found under `HFSource.localRepoId`.
+    func start(repoId: String, revision: String = "main", commit: String? = nil,
+               onFinish: @escaping @MainActor () -> Void) {
+        let source = HFSource(repo: repoId, revision: revision)
+        let key = source.localRepoId
+        activeTasks[key]?.cancel()
         let task = Task { @MainActor [weak self] in
-            await self?.download(repoId: repoId)
-            self?.finalizeIfCancelled(repoId: repoId)
-            await self?.autoFillSocket(for: repoId)
-            await self?.fetchCompanions(for: repoId)
-            self?.activeTasks.removeValue(forKey: repoId)
+            await self?.download(repoId: repoId, revision: revision, commit: commit)
+            self?.finalizeIfCancelled(repoId: key)
+            await self?.autoFillSocket(for: source)
+            await self?.fetchCompanions(for: key)
+            self?.activeTasks.removeValue(forKey: key)
             onFinish()
         }
-        activeTasks[repoId] = task
+        activeTasks[key] = task
+    }
+
+    /// The repo's branches that hold weights, each priced by what `download`
+    /// fetches from it, main first. Empty for a repo with only main.
+    func listBranches(repoId: String) async -> [HFBranch] {
+        guard let (data, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(HFSource.refsURL(repo: repoId))) else { return [] }
+        let refs = HFBranch.refs(from: data)
+        guard refs.contains(where: { $0.name != "main" }) else { return [] }
+        let priced = await withTaskGroup(of: HFBranch?.self) { group in
+            for ref in refs {
+                group.addTask {
+                    let url = HFSource(repo: repoId, revision: ref.name).treeURL
+                    guard let (data, _) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
+                          let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+                    return HFBranch.priced(name: ref.name, commit: ref.commit, entries: entries)
+                }
+            }
+            return await group.reduce(into: [HFBranch]()) { if let b = $1 { $0.append(b) } }
+        }
+        return HFBranch.ordered(priced)
     }
 
     // MARK: - Speculation gems (the Model Settings socket)
@@ -1097,14 +1130,15 @@ class DownloadManager: ObservableObject {
     /// RAM and the user has not chosen one. A pack's own `drafter/` stays
     /// "auto" (the server finds it); a separate repo is written as a path.
     /// Failures stay silent: the user asked for the model, not the drafter.
-    private func autoFillSocket(for repoId: String) async {
-        guard !Task.isCancelled, downloads[repoId]?.status == .completed,
-              let modelDir = existingModelDir(for: repoId),
+    private func autoFillSocket(for source: HFSource) async {
+        let key = source.localRepoId
+        guard !Task.isCancelled, downloads[key]?.status == .completed,
+              let modelDir = existingModelDir(for: key),
               [nil, "auto"].contains(ModelSettingsFile.load().override(for: modelDir)?.drafter),
-              let entries = await fetchListing(repoId: repoId) else { return }
+              let entries = await fetchListing(source) else { return }
         let files = PackUpdateCheck.sizes(entries)
-        packListings[repoId] = files
-        let gems = DrafterGems.gems(forRepoId: repoId, packFiles: files, localDrafter: false, mtpAvailable: false)
+        packListings[key] = files
+        let gems = DrafterGems.gems(forRepoId: source.repo, packFiles: files, localDrafter: false, mtpAvailable: false)
         let modelGB = Double(Self.packBytesWithoutDrafter(entries)) / 1e9
         guard let gem = DrafterGems.defaultGem(gems),
               DrafterGems.fits(gem, modelGB: modelGB, memory: .current()) else { return }
@@ -1206,35 +1240,35 @@ class DownloadManager: ObservableObject {
     /// Apply a checked update in place: fetch only the missing and changed
     /// files into the model's own dir. A cancel keeps the model and drops only partials.
     func startUpdate(_ check: UpdateCheck, onFinish: @escaping @MainActor () -> Void) {
-        let repo = check.repo, dir = check.dir
-        guard activeTasks[repo] == nil else { return }
+        let source = check.source, key = source.localRepoId, dir = check.dir
+        guard activeTasks[key] == nil else { return }
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
             switch check.selection {
             case .gguf:
-                let files = PackUpdateCheck.wanted(await self.fetchListing(repoId: repo) ?? [], selection: check.selection).map(\.0)
-                if !files.isEmpty { await self.downloadGguf(repoId: repo, files: files, destDirOverride: dir) }
+                let files = PackUpdateCheck.wanted(await self.fetchListing(source) ?? [], selection: check.selection).map(\.0)
+                if !files.isEmpty { await self.downloadGguf(repoId: source.repo, files: files, destDirOverride: dir, revision: source.revision) }
             default:
                 for sel in Self.fileSelections(check.selection) {
-                    await self.download(repoId: repo, selection: sel, destDirOverride: dir)
-                    if Task.isCancelled || self.downloads[repo]?.status != .completed { break }
+                    await self.download(repoId: source.repo, selection: sel, destDirOverride: dir, revision: source.revision)
+                    if Task.isCancelled || self.downloads[key]?.status != .completed { break }
                 }
             }
             if Task.isCancelled {
-                self.downloads.removeValue(forKey: repo)
+                self.downloads.removeValue(forKey: key)
                 Self.removePartials(under: dir)
             }
-            self.activeTasks.removeValue(forKey: repo)
+            self.activeTasks.removeValue(forKey: key)
             onFinish()
         }
-        activeTasks[repo] = task
+        activeTasks[key] = task
     }
 
     /// `startUpdate` for one listed model, clearing its update badge once the files landed.
     func applyUpdate(_ check: UpdateCheck, for model: LocalModel, onFinish: @escaping @MainActor () -> Void) {
         startUpdate(check) { [weak self] in
             onFinish()
-            guard let self, self.downloads[check.repo]?.status == .completed else { return }
+            guard let self, self.downloads[check.source.localRepoId]?.status == .completed else { return }
             self.updateChecks[model.id] = nil
             self.packUpdates[model.name] = nil
         }
@@ -1448,8 +1482,7 @@ class DownloadManager: ObservableObject {
     /// Fetch the repo's full tree (NO sidecar filter — the MTP head is filtered
     /// out of the selectable-quant lists) and return the MTP draft-head path.
     private func repoMtpSidecar(repoId: String) async -> String? {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true") else { return nil }
-        guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)),
+        guard let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(HFSource(repo: repoId).treeURL)),
               let http = response as? HTTPURLResponse, http.statusCode == 200,
               let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
         return Self.mtpSidecarPath(in: entries.compactMap { $0["path"] as? String })
@@ -1685,10 +1718,12 @@ class DownloadManager: ObservableObject {
     /// resume/retry/disk-space shape, looped over each file; progress is
     /// `fileIndex/fileCount` and byte progress spans them all. A nested subfolder
     /// (`<quant>/<quant>-00001-of-…`) is created as needed, mirroring HF's layout.
-    func downloadGguf(repoId: String, files shards: [String], destDirOverride: String? = nil) async {
-        let destDir = destDirOverride ?? newLayoutDir(for: repoId)
+    func downloadGguf(repoId: String, files shards: [String], destDirOverride: String? = nil, revision: String = "main") async {
+        let source = HFSource(repo: repoId, revision: revision)
+        let key = source.localRepoId
+        let destDir = destDirOverride ?? newLayoutDir(for: key)
         let primaryName = ((shards.first ?? "") as NSString).lastPathComponent
-        downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching \(primaryName)...")
+        downloads[key] = DownloadState(status: .downloading, statusText: "Fetching \(primaryName)...")
 
         do {
             try FileManager.default.createDirectory(atPath: destDir, withIntermediateDirectories: true)
@@ -1698,7 +1733,7 @@ class DownloadManager: ObservableObject {
             var sizes: [Int64] = []
             for rel in shards {
                 try Task.checkCancellation()
-                let fileURL = ggufShardURL(repoId: repoId, path: rel)
+                let fileURL = source.fileURL(rel)
                 var headReq = Self.hfApiRequest(fileURL)
                 headReq.httpMethod = "HEAD"
                 let (_, headResp) = try await DownloadSession.shared.data(for: headReq)
@@ -1725,15 +1760,15 @@ class DownloadManager: ObservableObject {
                 try Task.checkCancellation()
                 let fileSize = sizes[idx]
                 let shardName = (rel as NSString).lastPathComponent
-                let fileURL = ggufShardURL(repoId: repoId, path: rel)
+                let fileURL = source.fileURL(rel)
                 let destPath = (destDir as NSString).appendingPathComponent(rel)
                 let partialPath = destPath + ".partial"
                 // Nested shard subfolder (`<quant>/`) — created on demand.
                 try? fm.createDirectory(atPath: (destPath as NSString).deletingLastPathComponent, withIntermediateDirectories: true)
 
-                downloads[repoId]?.currentFile = shardName
-                downloads[repoId]?.fileIndex = idx + 1
-                downloads[repoId]?.fileCount = shards.count
+                downloads[key]?.currentFile = shardName
+                downloads[key]?.fileIndex = idx + 1
+                downloads[key]?.fileCount = shards.count
 
                 // Skip a shard already present at its expected size (resume across
                 // an interrupted multi-shard download).
@@ -1742,7 +1777,7 @@ class DownloadManager: ObservableObject {
                    let existingSize = attrs[.size] as? Int64,
                    existingSize == fileSize {
                     baseDownloaded += fileSize
-                    downloads[repoId]?.progress = Double(baseDownloaded) / Double(totalSize)
+                    downloads[key]?.progress = Double(baseDownloaded) / Double(totalSize)
                     continue
                 }
 
@@ -1752,8 +1787,8 @@ class DownloadManager: ObservableObject {
 
                     let existingBytes = ChunkedFileDownloader.resumableBytes(partialPath: partialPath, fileSize: fileSize)
                     if existingBytes > 0 {
-                        downloads[repoId]?.statusText = "Resuming \(shardName) from \(formatBytes(existingBytes))..."
-                        downloads[repoId]?.progress = totalSize > 0
+                        downloads[key]?.statusText = "Resuming \(shardName) from \(formatBytes(existingBytes))..."
+                        downloads[key]?.progress = totalSize > 0
                             ? Double(baseDownloaded + existingBytes) / Double(totalSize) : 0
                     }
 
@@ -1761,7 +1796,7 @@ class DownloadManager: ObservableObject {
                         try await transferFile(
                             url: fileURL,
                             partialPath: partialPath,
-                            repoId: repoId,
+                            repoId: key,
                             fileSize: fileSize,
                             baseDownloaded: baseDownloaded,
                             totalSize: totalSize
@@ -1774,7 +1809,7 @@ class DownloadManager: ObservableObject {
                             let isStall = error is DownloadStallError
                             let delay = isStall ? 2.0 : Double(attempt + 1) * 2.0
                             let reason = isStall ? "Download stalled" : "Connection lost"
-                            downloads[repoId]?.statusText = "\(reason), retrying in \(Int(delay))s... (\(attempt + 2)/\(maxRetries))"
+                            downloads[key]?.statusText = "\(reason), retrying in \(Int(delay))s... (\(attempt + 2)/\(maxRetries))"
                             try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                         } else {
                             throw error
@@ -1783,30 +1818,19 @@ class DownloadManager: ObservableObject {
                 }
 
                 baseDownloaded += fileSize
-                downloads[repoId]?.progress = Double(baseDownloaded) / Double(totalSize)
+                downloads[key]?.progress = Double(baseDownloaded) / Double(totalSize)
             }
 
-            if destDirOverride == nil { PackSource(repo: repoId).write(dir: destDir) }
-            downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete", fileIndex: shards.count, fileCount: shards.count)
+            if destDirOverride == nil { PackSource(repo: repoId, revision: source.isMain ? nil : revision).write(dir: destDir) }
+            downloads[key] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete", fileIndex: shards.count, fileCount: shards.count)
         } catch {
             if Task.isCancelled { return }
             let message = error.localizedDescription
-            downloads[repoId] = DownloadState(status: .failed, error: message)
+            downloads[key] = DownloadState(status: .failed, error: message)
             if !(error is CancellationError) {
-                presentFailureAlert(repoId: repoId, message: message)
+                presentFailureAlert(repoId: key, message: message)
             }
         }
-    }
-
-    /// The HF `resolve` URL for a repo-relative shard path. Percent-encodes each
-    /// path segment (leaving the `/` separators) so an unusual filename can't
-    /// produce a nil `URL`.
-    private func ggufShardURL(repoId: String, path: String) -> URL {
-        let encoded = path
-            .split(separator: "/", omittingEmptySubsequences: false)
-            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? String($0) }
-            .joined(separator: "/")
-        return URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(encoded)")!
     }
 
     private func presentFailureAlert(repoId: String, message: String) {

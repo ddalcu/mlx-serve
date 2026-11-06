@@ -2486,3 +2486,4 @@
 "Rebuild" = "重新构建";
 "Not in the catalog: rebuild it from its source with this release's kit" = "不在目录中：请用此版本的工具包从源码重新构建";
 "Needs rebuild" = "需要重新构建";
+"Branch" = "分支";

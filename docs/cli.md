@@ -20,6 +20,16 @@ Outside plugins (dylibs built with the plugin kit, [plugins.md](plugins.md)) loa
 
 Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Models land in a shared `~/.mlx-serve/models` store the MLX-Serve app uses too.
 
+A pack published on a branch, tag or commit is `org/repo@<revision>` (Hugging Face's own spelling), or the branch's
+`https://huggingface.co/org/repo/tree/<branch>` URL; a GGUF quant still follows as `:<quant>`. It lands beside main's
+copy in `<repo>-<revision>`, where any character but a letter, digit, `.`, `_` or `-` becomes `-`. A short commit
+hash works wherever Hugging Face resolves it, and gets its own folder. The app's model card offers the same branches.
+
+```bash
+mlx-serve pull OpensourceWTF/DeepSeek-V4.1-Flash-1017-streaming-repack-exl3@2.81bpw
+mlx-serve run org/repo@8acadd0:Q4_K_M
+```
+
 ## Driving the server directly
 
 What you want for scripts, launchd, or a headless Mac:
