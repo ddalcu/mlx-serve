@@ -20,6 +20,7 @@ const Conn = @import("../http/conn.zig").Conn;
 const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
 const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
 const resolveSampling = @import("sampling.zig").resolveSampling;
+const parseLogitBias = @import("sampling.zig").parseLogitBias;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
 const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
@@ -242,6 +243,8 @@ pub fn handleCompletions(
 
     const repeat_penalty = sampled.repeat_penalty;
     const presence_penalty_c = sampled.presence_penalty;
+    const logit_bias = try parseLogitBias(allocator, root);
+    defer allocator.free(logit_bias);
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -358,6 +361,7 @@ pub fn handleCompletions(
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
         .frequency_penalty = sampled.frequency_penalty,
+        .logit_bias = logit_bias,
         .seed = seed,
     };
 
