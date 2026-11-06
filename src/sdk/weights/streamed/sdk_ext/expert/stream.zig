@@ -679,9 +679,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             transient_meta: []SlotMeta,
             /// The widest layer: the transient rows' geometry (decode's window 0 is allocated in it at the grow).
             transient_layer: u32,
-            /// `per_geometry`: the other geometry's transient scratch (the layers `geom_of` marks 1), beside `transient`.
-            alt: ?AltTransient = null,
-            geom_of: []u1 = &.{},
+            /// `per_geometry`: each other geometry's transient scratch (`alts[g - 1]` for the layers `geom_of` marks g > 0),
+            /// beside `transient` (g = 0).
+            alts: [max_alt_geometries]AltTransient = undefined,
+            n_alts: u8 = 0,
+            geom_of: []u2 = &.{},
             /// `releaseTransient` ran: the scratch is freed until the grow allocates window 0.
             transient_released: bool = false,
             /// The release route, installed at construction (`Options.transient_release`).
@@ -795,8 +797,14 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 landed: []bool,
             };
 
-            /// The second geometry's transient scratch: its rows, their meta and the layer whose geometry it has.
+            /// Another geometry's transient scratch: its rows, their meta and the layer whose geometry it has.
             const AltTransient = struct { rows: Rows, meta: []SlotMeta, layer: u32 };
+            /// Geometries a bank may hold beside the widest (`geom_of` is a u2).
+            pub const max_alt_geometries = 3;
+
+            fn altSlice(self: *Stream) []AltTransient {
+                return self.alts[0..self.n_alts];
+            }
 
             /// P7 overlap: one prompt call's schedule, from `planCall` to its last group's `releaseP7`.
             pub const P7 = struct {
@@ -850,18 +858,23 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (opt.decode_route_ids > opt.max_route_ids) return error.InvalidOptions;
                 if (opt.max_route_ids == 0 or opt.max_route_ids > max_route_ids or opt.transient_rows < opt.max_route_ids or minis > max_minis or
                     opt.records_per_part == 0 or opt.records_per_part * minis > expert_io.max_items) return error.InvalidOptions;
-                // One transient row must hold any layer's record; per geometry, each of the two geometries has its scratch.
+                // One transient row must hold any layer's record; per geometry, each geometry has its scratch.
                 var widest: usize = 0;
                 for (bank.layers, 0..) |*l, i| if (spanOf(l) > spanOf(&bank.layers[widest])) {
                     widest = i;
                 };
-                var alt_layer: ?usize = null;
+                var alt_layers: [max_alt_geometries]usize = undefined;
+                var n_alts: usize = 0;
                 for (bank.layers, 0..) |*l, i| {
                     if (sameGeometry(l, &bank.layers[widest])) continue;
                     if (per_geometry) {
-                        if (alt_layer) |al| {
-                            if (!sameGeometry(l, &bank.layers[al])) return error.MixedGeometry;
-                        } else alt_layer = i;
+                        for (alt_layers[0..n_alts]) |al| {
+                            if (sameGeometry(l, &bank.layers[al])) break;
+                        } else {
+                            if (n_alts == max_alt_geometries) return error.MixedGeometry;
+                            alt_layers[n_alts] = i;
+                            n_alts += 1;
+                        }
                     } else {
                         if (minisOf(l) != minisOf(&bank.layers[widest])) return error.MixedGeometry;
                         for (l.segments, bank.layers[widest].segments) |sg, w| if (sg.length > w.length) return error.MixedGeometry;
@@ -939,14 +952,28 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const transient_meta = try a.alloc(SlotMeta, opt.transient_rows);
                 errdefer a.free(transient_meta);
                 @memset(transient_meta, .{});
-                var alt_rows: ?Rows = if (alt_layer) |al| try Rows.init(&bank.layers[al], opt.transient_rows, opt.slot_memory) else null;
-                errdefer if (alt_rows) |*x| x.deinit();
-                const alt_meta: []SlotMeta = if (alt_layer != null) try a.alloc(SlotMeta, opt.transient_rows) else &.{};
-                errdefer a.free(alt_meta);
-                @memset(alt_meta, .{});
-                const geom_of = try a.alloc(u1, n_layers);
+                var alts: [max_alt_geometries]AltTransient = undefined;
+                var n_alt_init: usize = 0;
+                errdefer for (alts[0..n_alt_init]) |*x| {
+                    x.rows.deinit();
+                    a.free(x.meta);
+                };
+                for (alt_layers[0..n_alts], alts[0..n_alts]) |al, *x| {
+                    var rows = try Rows.init(&bank.layers[al], opt.transient_rows, opt.slot_memory);
+                    errdefer rows.deinit();
+                    const meta = try a.alloc(SlotMeta, opt.transient_rows);
+                    @memset(meta, .{});
+                    x.* = .{ .rows = rows, .meta = meta, .layer = @intCast(al) };
+                    n_alt_init += 1;
+                }
+                const geom_of = try a.alloc(u2, n_layers);
                 errdefer a.free(geom_of);
-                for (bank.layers, geom_of) |*l, *gm| gm.* = @intFromBool(alt_layer != null and !sameGeometry(l, &bank.layers[widest]));
+                for (bank.layers, geom_of) |*l, *gm| {
+                    gm.* = 0;
+                    for (alt_layers[0..n_alts], 1..) |al, g| if (sameGeometry(l, &bank.layers[al])) {
+                        gm.* = @intCast(g);
+                    };
+                }
                 const ahead_loads = try a.alloc(LayerPolicy.ReadAhead, bank.n_experts);
                 errdefer a.free(ahead_loads);
                 const ahead_reads = try a.alloc(bool, bank.n_experts);
@@ -963,7 +990,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 if (opt.prompt_ahead != .head and opt.prompt_reads != .overlap) return error.InvalidOptions;
                 // Relocation copies a layer's persistent row into a transient row: one geometry, rows interchangeable.
                 if (opt.prompt_relocate) {
-                    if (opt.prompt_reads != .overlap or alt_layer != null) return error.InvalidOptions;
+                    if (opt.prompt_reads != .overlap or n_alts > 0) return error.InvalidOptions;
                     for (bank.layers) |*l| if (!sameGeometry(l, &bank.layers[widest])) return error.InvalidOptions;
                 }
                 const p7_rows: []P7Row = if (opt.prompt_reads == .overlap) try a.alloc(P7Row, bank.n_experts + opt.transient_rows) else &.{};
@@ -989,7 +1016,8 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     .transient = transient,
                     .transient_meta = transient_meta,
                     .transient_layer = @intCast(widest),
-                    .alt = if (alt_layer) |al| .{ .rows = alt_rows.?, .meta = alt_meta, .layer = @intCast(al) } else null,
+                    .alts = alts,
+                    .n_alts = @intCast(n_alts),
                     .geom_of = geom_of,
                     .release_installed = opt.transient_release,
                     .grow_fill = opt.grow_fill,
@@ -1038,7 +1066,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 self.promote_copies.deinit(a);
                 self.transient.deinit();
                 a.free(self.transient_meta);
-                if (self.alt) |*x| {
+                for (self.altSlice()) |*x| {
                     x.rows.deinit();
                     a.free(x.meta);
                 }
@@ -1068,10 +1096,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 return .{ .rows = &self.transient, .row = t, .meta = &self.transient_meta[t] };
             }
 
-            /// The second geometry's scratch when `layer` has that geometry (null: the layer reads `transient`).
+            /// The scratch of `layer`'s geometry when it is not the widest (null: the layer reads `transient`).
             fn altOf(self: *Stream, layer: u32) ?*AltTransient {
-                if (self.alt) |*x| if (self.geom_of[layer] == 1) return x;
-                return null;
+                const g = self.geom_of[layer];
+                return if (g == 0) null else &self.alts[g - 1];
             }
 
             /// One component row of a layer's slot (for the kernels' binding and tests).
@@ -1124,7 +1152,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 const rows: *const Rows = switch (kind) {
                     .base => &self.layers[layer].base,
                     .ext => if (self.layers[layer].ext) |*e| e else return null,
-                    .transient => if (self.alt != null and self.geom_of[layer] == 1) &self.alt.?.rows else &self.transient,
+                    .transient => if (self.geom_of[layer] != 0) &self.alts[self.geom_of[layer] - 1].rows else &self.transient,
                 };
                 const m = switch (rows.backing) {
                     .mlx => |*m| m,
@@ -2627,12 +2655,12 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 for (&self.routes) |*r| if (r.state != .free) return error.RoutesLive;
                 if (self.held_base.items.len > 0) return error.RoutesLive;
                 var bytes: u64 = self.transient.allocBytes(&self.bank.layers[self.transient_layer]);
-                if (self.alt) |*x| bytes += x.rows.allocBytes(&self.bank.layers[x.layer]);
+                for (self.altSlice()) |*x| bytes += x.rows.allocBytes(&self.bank.layers[x.layer]);
                 const before = if (self.memory == .mlx) mlxActive() else 0;
                 self.transient.deinit();
                 self.allocator.free(self.transient_meta);
                 self.transient_meta = self.transient_meta[0..0];
-                if (self.alt) |*x| {
+                for (self.altSlice()) |*x| {
                     x.rows.deinit();
                     self.allocator.free(x.meta);
                     x.meta = x.meta[0..0];
@@ -2671,18 +2699,28 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     w.deinit();
                     a.free(meta0);
                 };
-                var alt0: ?Rows = null;
-                var alt_meta0: []SlotMeta = &.{};
-                errdefer if (alt0) |*w| {
-                    w.deinit();
-                    a.free(alt_meta0);
+                var alt0: [max_alt_geometries]?Rows = @splat(null);
+                var alt_meta0: [max_alt_geometries][]SlotMeta = @splat(&.{});
+                errdefer for (&alt0, alt_meta0) |*w, m| if (w.*) |*rows| {
+                    rows.deinit();
+                    a.free(m);
                 };
                 if (self.transient_released) {
-                    // Decode's window 0 holds the widest decode route (`decode_route_ids`), per geometry (a bank of two
-                    // stream geometries keeps a window of each).
+                    // Decode's window 0 holds the widest decode route (`decode_route_ids`), per geometry (a bank of
+                    // several stream geometries keeps a window of each).
                     const n0 = self.decode_route_ids + decode_staging_rows;
-                    const geoms = [2]?u32{ self.transient_layer, if (self.alt) |x| x.layer else null };
-                    for (geoms, [2]*?Rows{ &window0, &alt0 }, [2]*[]SlotMeta{ &meta0, &alt_meta0 }) |gl, w, m| {
+                    var geoms: [1 + max_alt_geometries]?u32 = @splat(null);
+                    geoms[0] = self.transient_layer;
+                    for (self.altSlice(), geoms[1..][0..self.n_alts]) |x, *gl| gl.* = x.layer;
+                    var windows: [1 + max_alt_geometries]*?Rows = undefined;
+                    var metas: [1 + max_alt_geometries]*[]SlotMeta = undefined;
+                    windows[0] = &window0;
+                    metas[0] = &meta0;
+                    for (windows[1..], metas[1..], &alt0, &alt_meta0) |*w, *m, *aw, *am| {
+                        w.* = aw;
+                        m.* = am;
+                    }
+                    for (geoms, windows, metas) |gl, w, m| {
                         const geom = &self.bank.layers[gl orelse continue];
                         w.* = switch (self.grow_fill) {
                             .zeros => try Rows.init(geom, n0, self.memory),
@@ -2717,11 +2755,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     self.transient_released = false;
                     window0 = null;
                 }
-                if (alt0) |w| {
-                    self.alt.?.rows = w;
-                    self.alt.?.meta = alt_meta0;
-                    alt0 = null;
-                }
+                for (self.altSlice(), alt0[0..self.n_alts], alt_meta0[0..self.n_alts]) |*x, *w, m| if (w.*) |rows| {
+                    x.rows = rows;
+                    x.meta = m;
+                    w.* = null;
+                };
                 for (self.layers, decode_rows, exts) |*ls, rows, *e| {
                     ls.ext = e.*;
                     e.* = null;
@@ -2759,7 +2797,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     bytes += e.allocBytes(geom);
                 };
                 if (self.release_installed) bytes += self.transient.allocBytes(&self.bank.layers[self.transient_layer]);
-                if (self.release_installed) if (self.alt) |*x| {
+                if (self.release_installed) for (self.altSlice()) |*x| {
                     bytes += x.rows.allocBytes(&self.bank.layers[x.layer]);
                 };
                 const before = if (self.memory == .mlx) mlxActive() else 0;
@@ -2784,7 +2822,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     self.transient.deinit();
                     self.allocator.free(self.transient_meta);
                     self.transient_meta = self.transient_meta[0..0];
-                    if (self.alt) |*x| {
+                    for (self.altSlice()) |*x| {
                         x.rows.deinit();
                         self.allocator.free(x.meta);
                         x.meta = x.meta[0..0];
@@ -2825,7 +2863,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             pub fn promptTransientBytes(self: *const Stream) u64 {
                 var n: u64 = 0;
                 for (0..n_components) |c| n += arrayBytes(&self.bank.layers[self.transient_layer], c, self.prompt_transient_rows);
-                if (self.alt) |x| for (0..n_components) |c| {
+                for (self.alts[0..self.n_alts]) |x| for (0..n_components) |c| {
                     n += arrayBytes(&self.bank.layers[x.layer], c, self.prompt_transient_rows);
                 };
                 return n;
@@ -2847,15 +2885,26 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                 errdefer if (!installed) self.allocator.free(meta);
                 @memset(meta, .{});
                 var bytes: u64 = 0;
-                if (self.alt) |*x| {
+                // Each geometry's scratch, built before any is installed: a failure frees only what it made.
+                var made: [max_alt_geometries]AltTransient = undefined;
+                var n_made: usize = 0;
+                errdefer for (made[0..n_made]) |*x| {
+                    x.rows.deinit();
+                    self.allocator.free(x.meta);
+                };
+                for (self.altSlice(), made[0..self.n_alts]) |x, *m| {
                     var t2 = try Rows.init(&self.bank.layers[x.layer], self.prompt_transient_rows, self.memory);
                     errdefer t2.deinit();
                     const meta2 = try self.allocator.alloc(SlotMeta, t2.rows);
                     @memset(meta2, .{});
-                    bytes += t2.allocBytes(&self.bank.layers[x.layer]);
-                    x.rows = t2;
-                    x.meta = meta2;
+                    m.* = .{ .rows = t2, .meta = meta2, .layer = x.layer };
+                    n_made += 1;
                 }
+                for (self.altSlice(), made[0..self.n_alts]) |*x, m| {
+                    bytes += m.rows.allocBytes(&self.bank.layers[m.layer]);
+                    x.* = m;
+                }
+                n_made = 0;
                 self.transient = t;
                 self.transient_meta = meta;
                 installed = true;
@@ -2874,7 +2923,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                     if (ls.ext) |*e| try self.directRowsAt(site, e, "ext", l);
                 }
                 if (!self.transient_released) try self.directRowsAt(site, &self.transient, "transient", self.transient_layer);
-                if (self.alt) |*x| try self.directRowsAt(site, &x.rows, "alt", x.layer);
+                for (self.alts[0..self.n_alts]) |*x| try self.directRowsAt(site, &x.rows, "alt", x.layer);
             }
 
             /// Where `checkRowsDirect` runs: the refusal line names it.

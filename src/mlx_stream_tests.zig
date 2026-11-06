@@ -15,6 +15,7 @@ comptime {
     _ = @import("sdk/weights/streamed/glm5n/settings.zig");
     _ = @import("sdk/weights/streamed/ops.zig");
     _ = @import("sdk/weights/streamed/exl3_source.zig");
+    _ = @import("sdk/weights/streamed/exl3_k4.zig");
     _ = @import("sdk/weights/streamed/experts.zig");
     _ = @import("sdk/weights/streamed/expert/bank.zig");
     _ = @import("sdk/weights/streamed/expert/io_test.zig");

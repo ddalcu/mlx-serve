@@ -428,11 +428,30 @@ pub const FakeSource = struct {
 /// `128 ** -0.5` as the Python float rounds to the f32 MLX takes.
 const t128_scale: f32 = @bitCast(@as(u32, 0x3db504f3));
 
+/// `tcq_runtime._t128`: the normalised 128-block Walsh-Hadamard over the last axis, in f32.
+pub fn t128(comptime G: type, g: *G, v: G.T) !G.T {
+    const sh = g.shapeOf(v);
+    var blocks = sh;
+    blocks.d[sh.n - 1] = @divExact(sh.d[sh.n - 1], 128);
+    blocks.d[sh.n] = 128;
+    blocks.n += 1;
+    const h = try g.hadamard(try g.reshape(try g.astype(v, .float32), blocks.slice()), t128_scale);
+    return g.reshape(h, sh.slice());
+}
+
+/// `_clamped_swiglu` of gate `gg` and up `uu` (f32 [rows, inter]) at `limit`.
+pub fn clampedSwiglu(comptime G: type, g: *G, gg: G.T, uu: G.T, limit: f64) !G.T {
+    const uc = try g.clip(uu, try g.scalar(-limit, .float32), try g.scalar(limit, .float32));
+    const gc = try g.minimum(gg, try g.scalar(limit, .float32));
+    return g.mul(try g.silu(gc), uc);
+}
+
 /// The stock tier's routed-expert math, `exl3_lane.Exl3PackedOps` op for op:
 /// per projection `t128(gemv(t128(x * rin[slot])) ) * rout[slot]` (f32), the
 /// clamped SwiGLU between gate/up and down. `Gemv.project(g, proj, xh, ids,
 /// code)` is the EXL3 decode GEMV (`z = xh @ W_hat[slot]` in the trellis domain,
-/// f32 [rows, out]): the accepted EXL3 quant's (`*const exl3_quant.Gemv(G)`).
+/// [rows, out], read in f32): the accepted EXL3 quant's (`*const exl3_quant.Gemv(G)`), or the K 4 arm's sushi
+/// inner products (`exl3_k4.SushiGemv`).
 /// The parity harnesses' math (the stock path reads f32 routed rows).
 pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
     return struct {
@@ -446,24 +465,13 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
             return .{ .gemv = gemv, .swiglu_limit = c.swiglu_limit };
         }
 
-        /// `tcq_runtime._t128`: the normalised 128-block Walsh-Hadamard over the last axis.
-        fn t128(g: *G, v: T) !T {
-            const sh = g.shapeOf(v);
-            var blocks = sh;
-            blocks.d[sh.n - 1] = @divExact(sh.d[sh.n - 1], 128);
-            blocks.d[sh.n] = 128;
-            blocks.n += 1;
-            const h = try g.hadamard(try g.reshape(try g.astype(v, .float32), blocks.slice()), t128_scale);
-            return g.reshape(h, sh.slice());
-        }
-
         /// `Exl3PackedOps._project`.
-        fn project(self: *const Self, g: *G, x: T, ids: T, p: ProjOf(T), proj: xq.Proj) !T {
+        pub fn project(self: *const Self, g: *G, x: T, ids: T, p: ProjOf(T), proj: xq.Proj) !T {
             const rin = try g.astype(try g.take(p.rin, ids, 0), .float32);
-            const xh = try t128(g, try g.mul(try g.astype(x, .float32), rin));
+            const xh = try t128(G, g, try g.mul(try g.astype(x, .float32), rin));
             const z = try self.gemv.project(g, proj, xh, ids, p.code);
             const rout = try g.astype(try g.take(p.rout, ids, 0), .float32);
-            return g.mul(try t128(g, z), rout);
+            return g.mul(try t128(G, g, z), rout);
         }
 
         /// Gate and up of rows `x` [rows, hidden] at slot rows `ids` [rows]
@@ -471,10 +479,7 @@ pub fn EagerChain(comptime G: type, comptime Gemv: type) type {
         pub fn gateUp(self: *const Self, g: *G, x: T, ids: T, gate: ProjOf(T), up: ProjOf(T)) !T {
             const gg = try self.project(g, x, ids, gate, .gate);
             const uu = try self.project(g, x, ids, up, .up);
-            const lim = self.swiglu_limit;
-            const uc = try g.clip(uu, try g.scalar(-lim, .float32), try g.scalar(lim, .float32));
-            const gc = try g.minimum(gg, try g.scalar(lim, .float32));
-            return g.mul(try g.silu(gc), uc);
+            return clampedSwiglu(G, g, gg, uu, self.swiglu_limit);
         }
 
         /// Down of the SwiGLU rows `h` [rows, inter]: f32 [rows, hidden].

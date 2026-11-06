@@ -287,11 +287,11 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin
     const geo: streamed.Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(mdl.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
     const context = ctx_size orelse for (bill_mod.stream_context_rungs) |rung| {
         const at = bill_mod.streamBudget(c, rung, wired_margin);
-        const fit = streamed.Exl3.billOf(gpa, io, dir, geo, .{ .prompt = at.prompt, .decode = at.decode }) catch continue;
+        const fit = streamed.Exl3.billOf(gpa, io, dir, geo, .{ .prompt = at.prompt, .decode = at.decode, .call_rows = bill_mod.stream_call_rows }) catch continue;
         if (fit.rows.prompt >= bill_mod.stream_min_rows) break rung;
     } else bill_mod.stream_context;
     const budget = bill_mod.streamBudget(c, context, wired_margin);
-    const b = try streamed.Exl3.Source.open(gpa, io, dir, m.s, geo, gates, .{ .prompt = budget.prompt, .decode = budget.decode });
+    const b = try streamed.Exl3.Source.open(gpa, io, dir, m.s, geo, gates, .{ .prompt = budget.prompt, .decode = budget.decode, .call_rows = bill_mod.stream_call_rows });
     std.log.info("deepseek_v41: streamed experts, {d} prompt / {d} decode slot rows per layer for a {d}-token context ({d} B a row)", .{ b.bill.rows.prompt, b.bill.rows.decode, context, b.bill.row_bytes });
     m.bank = .{ .exl3 = b };
     m.bank_context = context;

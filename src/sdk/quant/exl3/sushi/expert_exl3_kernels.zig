@@ -1293,20 +1293,7 @@ pub fn indexedGemvCoopF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_
     const topk = ssh[0];
     const rate = try packedRate(tsh[3]);
     if (tsh[1] * 16 != in_dim) return error.BadExl3Shape;
-    const key = IndexedKey{ .in_dim = in_dim, .out_dim = out_dim, .topk = topk, .n = rate.n };
-    const cfg = indexed_coop_cfgs.get(key) orelse blk: {
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        const out_shape = [_]c_int{ topk, out_dim };
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, .float16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_tiles * 128, topk, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
-        indexed_coop_cfgs.put(key, c);
-        break :blk c;
-    };
+    const cfg = try indexedCoopConfig(in_dim, out_dim, out_tiles, topk, rate);
     const inputs_arr = [_]mlx.mlx_array{ x, trellis, slots };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -1318,6 +1305,58 @@ pub fn indexedGemvCoopF16(s: mlx.mlx_stream, x: mlx.mlx_array, trellis: mlx.mlx_
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    return out;
+}
+
+fn indexedCoopConfig(in_dim: c_int, out_dim: c_int, out_tiles: c_int, topk: c_int, rate: exl3.Rate) !mlx.mlx_fast_metal_kernel_config {
+    const key = IndexedKey{ .in_dim = in_dim, .out_dim = out_dim, .topk = topk, .n = rate.n };
+    if (indexed_coop_cfgs.get(key)) |c| return c;
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    const out_shape = [_]c_int{ topk, out_dim };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &out_shape, 2, .float16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, out_tiles * 128, topk, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 128, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "IDIM", in_dim));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "ODIM", out_dim));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "NHW", @intCast(rate.n)));
+    indexed_coop_cfgs.put(key, c);
+    return c;
+}
+
+/// `indexedGemvCoopF16`'s body behind a prelude that picks each row's trellis bank: ids [topk] = bank << 24 | slot.
+pub const INDEXED_BANKED_COOP_SOURCE: [:0]const u8 = blk: {
+    const eid = "const uint eid = uint(slots[slot]);";
+    const at = std.mem.indexOf(u8, INDEXED_COOP_SOURCE, eid).?;
+    break :blk @embedFile("kernels/indexed_banked_coop_pointers.metal") ++ INDEXED_COOP_SOURCE[0..at] ++
+        "const uint eid = banked_id & 0xffffffu;" ++ INDEXED_COOP_SOURCE[at + eid.len ..];
+};
+var indexed_banked_coop_kernel: KernelSlots = no_kernels;
+var indexed_banked_coop_engaged: bool = false;
+
+/// Rows x [topk, in] f16, each through slot `ids & 0xffffff` of bank `ids >> 24` (0, 1 or 2) -> y [topk, out] f16,
+/// one dispatch: a row's sums are `indexedGemvCoopF16`'s over its own bank, bit for bit. The banks share their
+/// [_, in/16, out/16, 16K] tail and dtype; their expert counts may differ.
+pub fn indexedGemvCoopBankedF16(s: mlx.mlx_stream, x: mlx.mlx_array, banks: [3]mlx.mlx_array, ids: mlx.mlx_array) !mlx.mlx_array {
+    const xsh = mlx.getShape(x);
+    const tsh = mlx.getShape(banks[0]);
+    const ssh = mlx.getShape(ids);
+    if (xsh.len != 2 or tsh.len != 4 or ssh.len != 1 or xsh[0] != ssh[0] or ssh[0] <= 0) return error.BadExl3Shape;
+    if (mlx.mlx_array_dtype(x) != .float16 or mlx.mlx_array_dtype(ids) != .uint32) return error.BadExl3Shape;
+    for (banks[1..]) |b| {
+        const bsh = mlx.getShape(b);
+        if (bsh.len != 4 or !std.mem.eql(c_int, bsh[1..], tsh[1..]) or mlx.mlx_array_dtype(b) != mlx.mlx_array_dtype(banks[0])) return error.BadExl3Shape;
+    }
+    const in_dim = xsh[1];
+    if (tsh[1] * 16 != in_dim) return error.BadExl3Shape;
+    const rate = try packedRate(tsh[3]);
+    const cfg = try indexedCoopConfig(in_dim, tsh[2] * 16, tsh[2], ssh[0], rate);
+    const kernel = try codebookKernel(&indexed_banked_coop_kernel, "sushi_exl3_mul1_gemv_indexed_banked", &.{ "x", "t0", "t1", "t2", "ids" }, &.{"y"}, INDEXED_BANKED_COOP_SOURCE);
+    const out = try applyUnary(s, kernel, &.{ x, banks[0], banks[1], banks[2], ids }, cfg);
+    if (!indexed_banked_coop_engaged) {
+        indexed_banked_coop_engaged = true;
+        if (!@import("builtin").is_test) log.info("[exl3-decode] banked cooperative GEMV engaged inner=f16 banks=3\n", .{});
+    }
     return out;
 }
 
@@ -2433,6 +2472,91 @@ test "exl3 K3 cooperative indexed GEMV matches host MUL1 on production shape" {
 
 test "exl3 K2 cooperative indexed GEMV matches host MUL1 on production shape" {
     try indexedParity(exl3.Rate.fromK(2), 2560, 640, 4, 10, 29, .mul1);
+}
+
+/// `a`'s f16 values as host bits (owned by `alloc`).
+fn hostF16Bits(alloc: std.mem.Allocator, s: mlx.mlx_stream, a: mlx.mlx_array) ![]u16 {
+    var contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(contig);
+    try mlx.check(mlx.mlx_contiguous(&contig, a, false, s));
+    try mlx.check(mlx.mlx_array_eval(contig));
+    const src = mlx.mlx_array_data_float16(contig) orelse return error.F16Unreadable;
+    const out = try alloc.alloc(u16, mlx.mlx_array_size(contig));
+    for (out, src[0..out.len]) |*o, v| o.* = @bitCast(v);
+    return out;
+}
+
+test "exl3 banked cooperative indexed GEMV: each row is the plain GEMV's over its own bank, bit for bit, K2/K3/K4" {
+    const t = std.testing;
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s) or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(t.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const in_dim = 256;
+    const out_dim = 512;
+    const experts = [3]c_int{ 5, 3, 4 };
+    // (bank, slot) per row: every bank, repeats, a slot past the smaller banks' rows.
+    const routed = [_][2]u32{ .{ 0, 4 }, .{ 2, 1 }, .{ 1, 2 }, .{ 0, 0 }, .{ 2, 3 }, .{ 0, 4 }, .{ 1, 0 } };
+    var ids_h: [routed.len]u32 = undefined;
+    for (routed, &ids_h) |r, *p| p.* = r[0] << 24 | r[1];
+    var prng = std.Random.DefaultPrng.init(0xba4e);
+    const rnd = prng.random();
+    for ([_]u32{ 2, 3, 4 }) |k| {
+        const packed_n: c_int = @intCast(exl3.Rate.fromK(k).halfwords());
+        var banks: [3]mlx.mlx_array = undefined;
+        for (&banks, experts) |*b, e| {
+            const words = try alloc.alloc(u16, @as(usize, @intCast(e * packed_n)) * (in_dim / 16) * (out_dim / 16));
+            for (words) |*v| v.* = rnd.int(u16);
+            b.* = mlx.mlx_array_new_data(words.ptr, &[_]c_int{ e, in_dim / 16, out_dim / 16, packed_n }, 4, .uint16);
+        }
+        defer for (banks) |b| {
+            _ = mlx.mlx_array_free(b);
+        };
+        const xh = try alloc.alloc(u16, routed.len * in_dim);
+        for (xh) |*v| v.* = exl3.f32ToF16Bits(rnd.float(f32) * 2 - 1);
+        const x = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ routed.len, in_dim }, 2, .float16);
+        defer _ = mlx.mlx_array_free(x);
+        const ids = mlx.mlx_array_new_data(&ids_h, &[_]c_int{routed.len}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(ids);
+        const got_a = try indexedGemvCoopBankedF16(s, x, banks, ids);
+        defer _ = mlx.mlx_array_free(got_a);
+        const got = try hostF16Bits(alloc, s, got_a);
+        var want: [3][]u16 = undefined;
+        for (&want, banks, 0..) |*w, b, bi| {
+            var slots_h: [routed.len]u32 = undefined;
+            for (routed, &slots_h) |r, *sl| sl.* = if (r[0] == bi) r[1] else 0;
+            const slots = mlx.mlx_array_new_data(&slots_h, &[_]c_int{routed.len}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(slots);
+            const plain = try indexedGemvCoopF16(s, x, b, slots);
+            defer _ = mlx.mlx_array_free(plain);
+            w.* = try hostF16Bits(alloc, s, plain);
+        }
+        for (routed, 0..) |r, i| {
+            try t.expectEqualSlices(u16, want[r[0]][i * out_dim ..][0..out_dim], got[i * out_dim ..][0..out_dim]);
+            // Control: another bank's row differs, so a kernel that ignored the bank would fail.
+            try t.expect(!std.mem.eql(u16, want[(r[0] + 1) % 3][i * out_dim ..][0..out_dim], got[i * out_dim ..][0..out_dim]));
+        }
+        // Refused by name: no rows, int32 ids, f32 rows, a bank of another geometry.
+        const none = mlx.mlx_array_new_data(&ids_h, &[_]c_int{0}, 1, .uint32);
+        defer _ = mlx.mlx_array_free(none);
+        const x0 = mlx.mlx_array_new_data(xh.ptr, &[_]c_int{ 0, in_dim }, 2, .float16);
+        defer _ = mlx.mlx_array_free(x0);
+        try t.expectError(error.BadExl3Shape, indexedGemvCoopBankedF16(s, x0, banks, none));
+        const ids32 = mlx.mlx_array_new_data(&ids_h, &[_]c_int{routed.len}, 1, .int32);
+        defer _ = mlx.mlx_array_free(ids32);
+        try t.expectError(error.BadExl3Shape, indexedGemvCoopBankedF16(s, x, banks, ids32));
+        const xf = try alloc.alloc(f32, routed.len * in_dim);
+        @memset(xf, 0);
+        const x32 = mlx.mlx_array_new_data(xf.ptr, &[_]c_int{ routed.len, in_dim }, 2, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        try t.expectError(error.BadExl3Shape, indexedGemvCoopBankedF16(s, x32, banks, ids));
+        const narrow_h = try alloc.alloc(u16, @as(usize, @intCast(packed_n)) * (in_dim / 16) * (out_dim / 32));
+        @memset(narrow_h, 0);
+        const narrow = mlx.mlx_array_new_data(narrow_h.ptr, &[_]c_int{ 1, in_dim / 16, out_dim / 32, packed_n }, 4, .uint16);
+        defer _ = mlx.mlx_array_free(narrow);
+        try t.expectError(error.BadExl3Shape, indexedGemvCoopBankedF16(s, x, .{ banks[0], narrow, banks[2] }, ids));
+    }
 }
 
 test "exl3 K4 Metal inner GEMV matches the host tile decode" {

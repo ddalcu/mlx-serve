@@ -775,7 +775,7 @@ test "glm exl3 bank: a uniform pack (one K3 bank layer per layer, the converter'
     for (0..4) |r| rows[2 * r] = 2;
     const s = try Stream.Stream.init(a, &b, .{ .rows = &rows, .max_route_ids = 8, .transient_rows = 16, .wide_depth = 2, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 } });
     defer s.deinit();
-    try testing.expect(s.alt == null);
+    try testing.expect(s.n_alts == 0);
     var rng = std.Random.DefaultPrng.init(7);
     var ids: [8]u16 = undefined;
     for (0..24) |step| {
@@ -830,7 +830,7 @@ test "glm exl3 bank: a uniform pack of 256 K3 experts a routed layer: its routes
     const s = try Stream.Stream.init(a, &b, .{ .rows = &prompt_rows, .max_route_ids = 8, .transient_rows = 16, .wide_depth = 2, .transient_release = true, .records_per_part = 2, .staging_from_bank = true, .pool = .{ .workers = 2, .tickets = 256 }, .lookahead = .{ .k = 8, .budget = 4, .preread = false }, .event = .{} });
     defer s.deinit();
     // One geometry: one transient scratch.
-    try testing.expect(s.alt == null);
+    try testing.expect(s.n_alts == 0);
     var rng = std.Random.DefaultPrng.init(11);
     var ids: [8]u16 = undefined;
     var scores: [256]f32 = undefined;
@@ -959,9 +959,10 @@ test "glm exl3 bank: the stream reads each routed expert's minis into adjacent r
     defer s.deinit();
     // The K4 bank layers are the widest (the first scratch), the K3 ones the second.
     try testing.expectEqual(@as(u32, 1), s.transient_layer);
-    try testing.expectEqual(@as(u32, 0), s.alt.?.layer);
-    try testing.expectEqual(@as(u1, 0), s.geom_of[3]);
-    try testing.expectEqual(@as(u1, 1), s.geom_of[2]);
+    try testing.expectEqual(@as(u8, 1), s.n_alts);
+    try testing.expectEqual(@as(u32, 0), s.alts[0].layer);
+    try testing.expectEqual(@as(u2, 0), s.geom_of[3]);
+    try testing.expectEqual(@as(u2, 1), s.geom_of[2]);
     var rng = std.Random.DefaultPrng.init(7);
     var ids: [8]u16 = undefined;
     for (0..40) |step| {
