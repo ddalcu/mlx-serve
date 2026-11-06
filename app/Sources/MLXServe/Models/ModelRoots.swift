@@ -26,6 +26,12 @@ struct ModelRoots {
 
     private static let downloadRootKey = "defaultModelDownloadPath"
     private static let customRootKey = "customModelPath"
+    static let automaticDiscoveryKey = "automaticallyDiscoverModels"
+
+    var automaticallyDiscoverModels: Bool {
+        get { defaults.object(forKey: Self.automaticDiscoveryKey) as? Bool ?? true }
+        nonmutating set { defaults.set(newValue, forKey: Self.automaticDiscoveryKey) }
+    }
 
     private let defaults: UserDefaults
     private let allowCustomFolders: Bool
@@ -113,11 +119,8 @@ struct ModelRoots {
     /// The built-in root stays in the list after the destination moves —
     /// everything downloaded before the change is there, and dropping it would
     /// make a library disappear from the picker.
-    /// Other tools' folders come after ours and before the custom slot: a repo
-    /// id we hold a copy of keeps resolving to OUR copy, and the custom folder
-    /// stays last because it is the one the person chose explicitly and the
-    /// server's root cap could otherwise spend every slot on tools they did
-    /// not ask about.
+    /// Explicitly configured folders precede automatic sources so their copy
+    /// wins, and automatic discovery cannot consume the custom folder's slot.
     func scanRoots(toolRoots: ToolModelRoots) -> [String] {
         var out: [String] = []
         var seen = Set<String>()
@@ -125,14 +128,16 @@ struct ModelRoots {
             guard out.count < Self.serverRootLimit,
                   let raw = path,
                   let resolved = Self.existingDirectory(raw),
-                  seen.insert(resolved).inserted
+                  seen.insert(URL(fileURLWithPath: resolved).resolvingSymlinksInPath().path).inserted
             else { return }
             out.append(resolved)
         }
         add(resolvedDownloadRoot)
         add(Self.builtInRoot)
-        for tool in toolRoots.ordered { add(tool) }
         if allowCustomFolders { add(customRoot) }
+        if automaticallyDiscoverModels {
+            for tool in toolRoots.ordered { add(tool) }
+        }
         return out
     }
 
@@ -161,5 +166,18 @@ struct ModelRoots {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: path, isDirectory: &isDir), isDir.boolValue else { return nil }
         return path
+    }
+}
+
+struct ModelDiscoveryConfiguration: Equatable {
+    let automaticallyDiscoverModels: Bool
+    let roots: [String]
+
+    static func current() -> ModelDiscoveryConfiguration {
+        let roots = ModelRoots()
+        let automatic = roots.automaticallyDiscoverModels
+        let tools = automatic ? ToolModelRoots.detected() : ToolModelRoots()
+        return ModelDiscoveryConfiguration(automaticallyDiscoverModels: automatic,
+                                           roots: roots.scanRoots(toolRoots: tools))
     }
 }

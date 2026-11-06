@@ -438,3 +438,12 @@ Defect: with a model loaded and no requests, `MLXCore` burned CPU while `mlx-ser
 
 ## A poll started at spawn never returned, because the app's session waits for connectivity (2026-10-31)
 Defect: the chat window's usage strip (decode, prefill, Total Tokens) stayed at dashes and zero for a whole run, and `~/.mlx-serve/usage.db` stayed empty, while `/metrics.json` held the counters. Cause: `UsageTracker` starts polling when the server process is spawned, before it listens, and `APIClient.session` sets `waitsForConnectivity`: a request to a closed port stays pending until the one-hour resource timeout and does not complete when the server comes up, so the loop sat on its first `await` for good (a session without the wait fails in 0.0 s on the same port). Every earlier test fed `ingest` directly, so none saw the poll. Fix: `fetchThroughput` reads through `pollSession`, a plain ephemeral session. Guard: `APIClientThroughputTests` (a closed port answers within seconds).
+
+## External model folders on UI hot paths
+
+Computed root detection parsed LM Studio settings during polling and Settings redraws.
+Forwarding refresh progress through AppState also invalidated unrelated views.
+Cache the complete discovery snapshot, including absent tools, and reload only on explicit events.
+Compare stored snapshots for restart decisions; observe refresh progress in My Models alone.
+Revision-check asynchronous root resolution so an older result cannot undo newer settings.
+Guard: `ModelDiscoverySnapshotTests` covers resolver counts, absent roots, moved folders and stale results.
