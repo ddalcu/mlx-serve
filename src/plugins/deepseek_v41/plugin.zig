@@ -544,7 +544,7 @@ const aux_hooks = abi.AuxHooks{
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
     const m: *Model = @ptrCast(@alignCast(mp));
-    return !m.cfg.dsv41_streamed and m.bank == null and m.mdl.streamed == null and m.mdl.pair == null;
+    return m.mdl.pair == null;
 }
 
 fn liveState(m: *Model, slot: u32) ?*dsv41.State {
@@ -572,7 +572,7 @@ fn auxPrefixKey(mp: *anyopaque, ids: abi.Span(u32), rows: abi.Array, out: *u64) 
 }
 
 fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), rows: abi.Array, restored_at: u64, capture: bool) callconv(.c) Verdict {
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     if (restored_at != 0) {
         const st = liveState(m, slot) orelse return Verdict.refuse(.failed, "deepseek_v41: restored slot has no state");
@@ -599,7 +599,7 @@ fn auxCommit(mp: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict {
 
 fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     const live = stateOf(m, slot) orelse return .ok;
     const sn = live.st.snap orelse return .ok;
@@ -617,7 +617,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
 }
 
 fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callconv(.c) Verdict {
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to restore");
     if (pos != sn.n or sn.n != sn.ids.len) return Verdict.refuse(.unsupported, "deepseek_v41: restore requires the snapshot's exact position");
     const m: *Model = @ptrCast(@alignCast(mp));
@@ -685,7 +685,7 @@ fn auxBytes(_: *anyopaque, handle: abi.Handle) callconv(.c) u64 {
 
 fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdict {
     out.* = 0;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     out.* = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
@@ -696,7 +696,7 @@ fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) call
     out.tensor_len = 0;
     out.names_len = 0;
     out.header_len = 0;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const sn = snapOf(handle) orelse return Verdict.refuse(.failed, "deepseek_v41: no snapshot to export");
     const m: *Model = @ptrCast(@alignCast(mp));
     dsv41.exportSnapshot(m.mdl, sn, out) catch |e| return Verdict.named(.failed, @errorName(e));
@@ -705,7 +705,7 @@ fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) call
 
 fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     const sn = dsv41.importSnapshot(m.mdl, gpa, ids.slice(), header.slice(), arrays.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
     if (m.mdl.tp != null) {

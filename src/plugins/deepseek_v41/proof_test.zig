@@ -23,26 +23,30 @@ test "deepseek_v41 plugin: prefill, GPU decode, a verify block and a later chunk
     try proof.expectSteps(v41, t);
 }
 
-test "deepseek_v41 plugin: excluded configuration keeps the legacy resume and continues bit-equal" {
+test "deepseek_v41 plugin: a paired instance keeps the legacy resume and continues bit-equal" {
     if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const first = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60 };
     const second = first ++ [_]u32{ 11, 2, 90 };
+    const paired: dsv41.Pair = .{ .lo = 2, .hi = 4, .worker = false };
     for ([_]bool{ false, true }) |release_parked| {
         const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), @embedFile("fixtures/proof-resume.tape"));
         defer t.close();
         const model: *v41.Model = @ptrCast(@alignCast(t.m));
-        model.cfg.dsv41_streamed = true;
         for ([_][]const u32{ &first, &second }, 0..) |prompt, turn| {
+            model.mdl.pair = paired;
             const n: u32 = @intCast(v41.resumePrompt(t.m, 7, .of(prompt), .{}));
+            model.mdl.pair = null;
             if (turn == 1) try testing.expect(n > 0);
             try t.check(mlx.mlx_array_new_data(&n, &[_]c_int{1}, 1, .uint32));
             try t.check(try t.plugin(.{ .mode = .prefill, .ids = prompt[n..] }, n));
             if (turn == 0 and release_parked)
                 testing.allocator.free(try slotForward(t, .prefill, &.{8}, &.{ 4, 12, 6 }, &.{0}));
+            model.mdl.pair = paired;
             v41.table.release_slot.?(t.m, 7);
+            model.mdl.pair = null;
             if (turn == 0 and !release_parked)
                 testing.allocator.free(try slotForward(t, .prefill, &.{8}, &.{ 4, 12, 6 }, &.{0}));
         }
@@ -275,12 +279,12 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
     try testing.expect(key[0] != key[1]);
     try testing.expect(aux.enabled(t.m));
     m.cfg.dsv41_streamed = true;
-    try testing.expect(!aux.enabled(t.m));
-    try testing.expectEqual(abi.Verdict.Code.unsupported, aux.begin_prompt(t.m, 1, .of(&.{ 3, 4 }), .{}, 0, true).code);
+    try testing.expect(aux.enabled(t.m));
     m.cfg.dsv41_streamed = false;
     m.mdl.pair = .{ .lo = 2, .hi = 4, .worker = false };
     defer m.mdl.pair = null;
     try testing.expect(!aux.enabled(t.m));
+    try testing.expectEqual(abi.Verdict.Code.unsupported, aux.begin_prompt(t.m, 1, .of(&.{ 3, 4 }), .{}, 0, true).code);
 }
 
 const codec = @import("cache_codec.zig");
