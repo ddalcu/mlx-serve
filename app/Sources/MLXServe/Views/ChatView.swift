@@ -4701,7 +4701,8 @@ struct MessageBubble: View {
                     // reads as machinery, not prose.
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
-                            Label("Tool Call", systemImage: "wrench.and.screwdriver")
+                            Label(message.contextCheckpoint == nil ? "Tool Call" : "Context summary",
+                                  systemImage: message.contextCheckpoint == nil ? "wrench.and.screwdriver" : "text.badge.checkmark")
                                 .font(.app(.caption2).weight(.medium))
                                 .foregroundStyle(.secondary)
                         }
@@ -5307,10 +5308,10 @@ enum ChatRowBuilder {
     /// `**name**(args)`. The `** → ` right after the bolded name discriminates
     /// them (and also matches the "→ denied by user" result form).
     static func isResultSummary(_ m: ChatMessage) -> Bool {
-        m.isAgentSummary && m.content.contains("** → ")
+        m.isAgentSummary && m.contextCheckpoint == nil && m.content.contains("** → ")
     }
     static func isCallSummary(_ m: ChatMessage) -> Bool {
-        m.isAgentSummary && !m.content.contains("** → ")
+        m.isAgentSummary && m.contextCheckpoint == nil && !m.content.contains("** → ")
     }
 
     static func rows(from messages: [ChatMessage]) -> [ChatRow] {
