@@ -142,6 +142,71 @@ fn verifyMlxStage(b: *std.Build) void {
         );
         std.process.exit(1);
     }
+    const stamp = buildRootHandle(b).readFileAlloc(b.graph.io, "lib/mlx/.version", b.allocator, .limited(256)) catch return;
+    b.dependOnFileContents(b.path("lib/mlx/.version"));
+    const patch = "patches/mlxc-gather-qmm-global-scale.patch";
+    const inputs = [_]StageInput{
+        .{ .key = "mlx=", .path = "lib/mlx-src", .have = submoduleCommit(b, "lib/mlx-src") },
+        .{ .key = "mlxc=", .path = "lib/mlxc-src", .have = submoduleCommit(b, "lib/mlxc-src") },
+        .{ .key = "patch=", .path = patch, .have = fileSha1(b, patch) },
+    };
+    if (staleStageInput(stamp, &inputs)) |s| {
+        std.debug.print(
+            "\n[mlx-serve] lib/mlx was staged for {s}{s} but {s} is at {s}. Run:\n  ./scripts/build-mlx.sh\n\n",
+            .{ s.input.key, s.staged, s.input.path, s.input.have.? },
+        );
+        std.process.exit(1);
+    }
+}
+
+/// A submodule's checked-out commit, short as scripts/build-mlx.sh stamps it, read without git: its `.git` file names
+/// the git dir, whose detached HEAD holds the commit. Null without a checkout or on a branch.
+fn submoduleCommit(b: *std.Build, dir: []const u8) ?[]const u8 {
+    const root = buildRootHandle(b);
+    const link = root.readFileAlloc(b.graph.io, b.pathJoin(&.{ dir, ".git" }), b.allocator, .limited(512)) catch return null;
+    const git_dir = std.mem.cutPrefix(u8, std.mem.trim(u8, link, " \t\r\n"), "gitdir: ") orelse return null;
+    const head_path = std.fs.path.resolveAlloc(b.allocator, &.{ dir, git_dir, "HEAD" }) catch return null;
+    const head = root.readFileAlloc(b.graph.io, head_path, b.allocator, .limited(256)) catch return null;
+    b.dependOnFileContents(if (std.fs.path.isAbsolute(head_path)) .{ .cwd_relative = head_path } else b.path(head_path));
+    const sha = std.mem.trim(u8, head, " \t\r\n");
+    if (sha.len < 12 or std.mem.startsWith(u8, sha, "ref:")) return null;
+    return sha[0..12];
+}
+
+/// A file's SHA-1, short as `shasum | cut -c1-12` prints it.
+fn fileSha1(b: *std.Build, path: []const u8) ?[]const u8 {
+    const bytes = buildRootHandle(b).readFileAlloc(b.graph.io, path, b.allocator, .limited(1 << 20)) catch return null;
+    b.dependOnFileContents(b.path(path));
+    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
+    std.crypto.hash.Sha1.hash(bytes, &digest, .{});
+    return b.dupe(std.fmt.bytesToHex(digest, .lower)[0..12]);
+}
+
+/// The build's own tests of this file, on the host.
+pub fn addTests(b: *std.Build, step: *std.Build.Step) void {
+    const t = b.addTest(.{ .name = "build-config-test", .root_module = b.createModule(.{
+        .root_source_file = b.path("build/config.zig"),
+        .target = b.graph.host,
+    }) });
+    step.dependOn(&b.addRunArtifact(t).step);
+}
+
+/// One input scripts/build-mlx.sh stamps into lib/mlx/.version: its key, where it lives, and its value now (12 hex),
+/// null when this tree cannot tell (no submodule checkout), which leaves it unchecked.
+const StageInput = struct { key: []const u8, path: []const u8, have: ?[]const u8 };
+
+/// The first input whose value differs from the one `stamp` records, with the recorded value ("none" when absent).
+fn staleStageInput(stamp: []const u8, inputs: []const StageInput) ?struct { input: StageInput, staged: []const u8 } {
+    for (inputs) |in| {
+        const have = in.have orelse continue;
+        var staged: []const u8 = "none";
+        var it = std.mem.tokenizeAny(u8, stamp, " \t\r\n");
+        while (it.next()) |tok| {
+            if (std.mem.cutPrefix(u8, tok, in.key)) |v| staged = v;
+        }
+        if (!std.mem.eql(u8, staged, have)) return .{ .input = in, .staged = staged };
+    }
+    return null;
 }
 
 /// A Homebrew formula the macOS graph links: its name, the pkg-config file and header a copied prefix must hold, and
@@ -221,4 +286,18 @@ fn verifyBrewDeps(b: *std.Build) void {
             std.process.exit(1);
         }
     }
+}
+
+test "build config: a stage stamped for other pins names the first stale input; an input it cannot read is skipped" {
+    const stamp = "mlx=64ea011cb65f mlxc=56b2d39fc831 patch=613a4be4d66a target=26.2\n";
+    const mlxc: StageInput = .{ .key = "mlxc=", .path = "lib/mlxc-src", .have = "56b2d39fc831" };
+    const patch: StageInput = .{ .key = "patch=", .path = "patches/mlxc.patch", .have = "613a4be4d66a" };
+    const mlx_staged: StageInput = .{ .key = "mlx=", .path = "lib/mlx-src", .have = "64ea011cb65f" };
+    const mlx_bumped: StageInput = .{ .key = "mlx=", .path = "lib/mlx-src", .have = "c69303b00f5f" };
+    try std.testing.expectEqual(null, staleStageInput(stamp, &.{ mlx_staged, mlxc, patch }));
+    const stale = staleStageInput(stamp, &.{ mlxc, mlx_bumped, patch }).?;
+    try std.testing.expectEqualStrings("lib/mlx-src", stale.input.path);
+    try std.testing.expectEqualStrings("64ea011cb65f", stale.staged);
+    try std.testing.expectEqualStrings("none", staleStageInput("mlx=64ea011cb65f target=26.2", &.{patch}).?.staged);
+    try std.testing.expectEqual(null, staleStageInput(stamp, &.{.{ .key = "mlx=", .path = "lib/mlx-src", .have = null }}));
 }
