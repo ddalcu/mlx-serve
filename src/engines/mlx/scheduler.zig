@@ -511,6 +511,10 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
         refusal.refused().* = .{ .kind = e.kind, .cap = cap };
         return error.EngineUnsupported;
     };
+    if (params.model.engine == null and params.sampling.logit_bias.len > 0) {
+        refusal.refused().* = .{ .kind = .mlx, .cap = "logit_bias" };
+        return error.EngineUnsupported;
+    }
     // Every decode path reads the prompt's last token; `""` on a BOS-less vocab encodes to none.
     if (params.prompt_ids.len == 0) return error.EmptyPrompt;
     const eff_kv_quant = params.kv_quant_config orelse slot_config.kv_quant_override orelse self.kv_quant_config;

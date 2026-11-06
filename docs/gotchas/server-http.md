@@ -21,6 +21,13 @@ was a 400. Fix: empty stops skipped at every parse site; a schema-less `json_sch
 decoded, so never refused); empty embedding entries 400; the handshake answers `done_reason: load` without a forward.
 Guard: `tests/test_api_edges.sh`.
 
+### `logit_bias` answered 200 and changed nothing
+Defect: a -100 `logit_bias` still produced the banned token, on every model. Cause: no handler parsed the field and
+`SamplingParams` had no slot for it, though the llama.cpp, ds4 and Neural Engine adapters serve `Caps.logit_bias`.
+Fix: chat and `/v1/completions` parse it (`parseLogitBias`, bias clamped to +-100) and an engine beside MLX gets it
+as `Sampling.logit_bias`; the MLX samplers do not read it, so `Scheduler.submit` refuses it by name (a 400 naming
+MLX). Guard: `parseLogitBias` and `missingCap` tests, `tests/test_logit_bias.sh`.
+
 ### A bare-string `image_url` vanished from the prompt
 Defect: `{"type":"image_url","image_url":"data:..."}` (the Responses shape) answered 200 about a picture the model
 never saw. Cause: the parser skipped any part whose `image_url` was not an object, and every other malformed shape
