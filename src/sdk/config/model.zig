@@ -4971,6 +4971,30 @@ test "dist N-rank: a tensor split refuses a size that does not divide the heads,
     try std.testing.expectEqual(@as(u32, 256), q.moe_intermediate_size);
 }
 
+test "dist N-rank: shardExperts gives rank 2 and rank 3 of four their quarter of each expert and head" {
+    const vals = [_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const names = [_][]const u8{ "layers.0.ffn.experts.w1.weight", "layers.0.ffn.experts.w2.weight", "layers.0.attn.wo_b.weight", "layers.0.attn.attn_sink", "layers.0.ffn.gate.weight" };
+    const shapes = [_][]const c_int{ &.{ 2, 8, 1 }, &.{ 2, 1, 8 }, &.{ 2, 8 }, &.{16}, &.{ 4, 4 } };
+    // [expert, rows, 1] keeps 2 rows of each expert; [expert, 1, cols] 2 columns; [2, 8] 2 columns of each row; the sink 4 heads.
+    const want = [2][5][]const f32{
+        .{ &.{ 4, 5, 12, 13 }, &.{ 4, 5, 12, 13 }, &.{ 4, 5, 12, 13 }, &.{ 8, 9, 10, 11 }, &vals },
+        .{ &.{ 6, 7, 14, 15 }, &.{ 6, 7, 14, 15 }, &.{ 6, 7, 14, 15 }, &.{ 12, 13, 14, 15 }, &vals },
+    };
+    for ([_]u32{ 2, 3 }, want) |rank, expect_rank| {
+        var w = Weights.init(std.testing.allocator);
+        defer w.deinit();
+        for (names, shapes) |n, sh| try w.put(n, mlx.mlx_array_new_data(&vals, sh.ptr, @intCast(sh.len), .float32));
+        try shardExperts(&w, .{ .rank = rank, .size = 4 }, false);
+        for (names, expect_rank) |n, expect| {
+            const a = w.get(n).?;
+            try mlx.check(mlx.mlx_array_eval(a));
+            try std.testing.expectEqual(expect.len, mlx.mlx_array_size(a));
+            const got = (mlx.mlx_array_data_float32(a) orelse return error.NoData)[0..expect.len];
+            try std.testing.expectEqualSlices(f32, expect, got);
+        }
+    }
+}
+
 test "shardExperts cuts DeepSeek-V4.1's experts (gate/up rows, down columns) and attention heads, not the router" {
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
