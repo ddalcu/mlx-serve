@@ -104,7 +104,7 @@ enum PackUpdateCheck {
         guard let repo = marker?.repo ?? ModelCard.repoId(localName: m.name) else { return .skipped("no Hugging Face name") }
         if let quant = m.quantFile { return .check(repo: repo, selection: .gguf(quant)) }
         if let sub = marker?.subfolder { return .check(repo: repo, selection: .variant(sub)) }
-        if isMediaModelType(m.modelType) || m.modelType == "laya",
+        if isMediaModelType(m.mediaModelType) || m.modelType == "laya",
            let bundle = CustomMediaModels.bundle(arch: m.modelType, repoId: repo) {
             let comp = bundle.components.first { $0.repo == repo } ?? bundle.components[0]
             return .check(repo: repo, selection: .media(comp.selection))

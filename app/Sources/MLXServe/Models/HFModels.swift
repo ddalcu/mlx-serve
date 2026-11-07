@@ -109,6 +109,19 @@ private let mediaModelTypeExactValues: Set<String> = [
     "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d", "idol",
 ]
 
+/// `dense` is a generic `model_type`: the server's ming_tts claims it only beside `ditar_config` and
+/// `aggregator_config` (`src/plugins/ming_tts/config.zig`). A local config is judged on the same keys.
+let mediaTypeMarkers: [String: [String]] = ["dense": ["ditar_config", "aggregator_config"]]
+
+/// A Hub search row's config carries only `model_type` and `architectures`, so there the class the
+/// marker-claimed packs declare stands in for the markers.
+let mediaTypeHubArchitectures: [String: String] = ["dense": "BailingMMNativeForConditionalGeneration"]
+
+/// False when `config` declares a marker-claimed media type without its markers.
+func mediaMarkersHold(modelType: String, config: [String: Any]) -> Bool {
+    mediaTypeMarkers[modelType].map { $0.allSatisfy { config[$0] != nil } } ?? true
+}
+
 func isMediaModelType(_ modelType: String) -> Bool {
     if mediaModelTypeExactValues.contains(modelType) { return true }
     return mediaModelTypePrefixes.contains { modelType.hasPrefix($0) }
@@ -222,13 +235,14 @@ enum MediaModality: CaseIterable {
 struct HFConfigMeta: Codable {
     let modelType: String?
     var diffusers: DiffusersMeta? = nil
+    var architectures: [String]? = nil
     var diffusersClassName: String? { diffusers?.className }
 
     struct DiffusersMeta: Codable {
         let className: String?
         enum CodingKeys: String, CodingKey { case className = "_class_name" }
     }
-    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers }
+    enum CodingKeys: String, CodingKey { case modelType = "model_type", diffusers, architectures }
 }
 
 /// Served media families recognizable from a diffusers repo's `_class_name`.
@@ -294,9 +308,12 @@ struct HFModel: Identifiable, Codable {
     /// nil = not a media repo we serve; Kokoro deliberately maps nowhere
     /// (voice-mode-only catalog rule — see `discoverableMediaModelType`).
     var mediaFamilyModelType: String? {
-        if let t = config?.modelType, discoverableMediaModelType(t) { return t }
+        if let t = config?.modelType, discoverableMediaModelType(t) {
+            guard let arch = mediaTypeHubArchitectures[t] else { return t }
+            return config?.architectures?.contains(arch) == true ? t : nil
+        }
         if let c = config?.diffusersClassName, let t = servedDiffusersClasses[c] { return t }
-        return (tags ?? []).first(where: discoverableMediaModelType)
+        return (tags ?? []).first { discoverableMediaModelType($0) && mediaTypeMarkers[$0] == nil }
     }
 
     var isServedMediaRepo: Bool { mediaFamilyModelType != nil }

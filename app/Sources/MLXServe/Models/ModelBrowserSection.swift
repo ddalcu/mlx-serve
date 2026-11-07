@@ -210,7 +210,7 @@ enum ModelBrowserUse {
         guard let path, !path.isEmpty else { return nil }
         let wanted = normalize(path)
         guard let m = models.first(where: { normalize($0.path) == wanted }),
-              let modality = MediaModality.of(modelType: m.modelType, path: m.path, rows: rows) else { return nil }
+              let modality = MediaModality.of(modelType: m.mediaModelType, path: m.path, rows: rows) else { return nil }
         return (m, modality)
     }
 
