@@ -176,6 +176,9 @@ pub const Link = struct {
         var link: Link = .{ .group = g, .rank = @intCast(mlx.mlx_distributed_group_rank(g)), .size = @intCast(mlx.mlx_distributed_group_size(g)) };
         if (link.rank != cfg.rank or link.size != cfg.size) return error.RdmaGroupMismatch;
         if (link.rank != 0) {
+            // A worker started while rank 0 was down failed its first dial, and JACCL's own retries then met rank 0:
+            // rank 0 still files bells for 10 s after the group forms.
+            if (!to_host.open()) to_host = Bell.connect(coord, cfg.rank);
             link.bells[0] = to_host;
             if (!to_host.open()) log.warn("[dist] no bell connection: this worker waits on the RDMA link, one core busy\n", .{});
         } else if (acceptor) |t| {
@@ -862,9 +865,20 @@ const Group = struct {
     split: ?u32,
     /// Macs in the group, rank 0 included.
     size: u32 = 2,
-    /// How long the group model's load waits for every worker to join (0: it fails at once, a pair's way).
+    /// How long after startup a load of the group model that finds a worker missing reads as the group still forming
+    /// (0: missing at once, a pair's way). Either way the load fails at once: the inference thread never waits.
     join_timeout_s: u32 = 0,
+    /// When the server started waiting for its workers (µs, monotonic).
+    started_us: i64 = 0,
 };
+
+pub const JoinState = enum { joined, forming, late };
+
+/// Whether the group has joined, is still forming `waited_ms` after startup, or is past its join timeout.
+fn joinState(joined_now: bool, waited_ms: u64, timeout_s: u32) JoinState {
+    if (joined_now) return .joined;
+    return if (waited_ms < @as(u64, timeout_s) * 1000) .forming else .late;
+}
 /// The worker's bell connection closed: it left, and JACCL forms a group once per process,
 /// so this server must restart to pair again (the app does it, `/props` cluster "worker_gone").
 var worker_gone = std.atomic.Value(bool).init(false);
@@ -1101,7 +1115,7 @@ fn planRows(model_dir: []const u8, hidden: i32, blocks: i32) !*Peer {
 fn join() !*Peer {
     if (cluster().peer_slot == null) {
         const g = cluster().group.?;
-        if (!cluster().joined.load(.acquire)) try awaitJoin(g);
+        try checkJoined(g);
         if (firstRefusal(&loadCopies(), g.size)) |r| {
             log.err("[dist] worker rank {d} {s} {s}: download the same model there, then join again\n", .{ r.rank, if (r.code == MISMATCH) "has another copy of" else "does not have", std.fs.path.basename(g.model) });
             return error.DistWorkerMissingModel;
@@ -1122,19 +1136,21 @@ fn join() !*Peer {
     return &cluster().peer_slot.?;
 }
 
-/// Waits up to the group's join timeout for every worker; past it the load fails naming the ranks missing.
-fn awaitJoin(g: Group) !void {
-    var waited: u64 = 0;
-    const limit = @as(u64, g.join_timeout_s) * 1000;
-    if (limit > 0) log.info("[dist] {s} waits up to {d} s for its {d} workers to join\n", .{ std.fs.path.basename(g.model), g.join_timeout_s, g.size - 1 });
-    while (!cluster().joined.load(.acquire) and waited < limit) : (waited += 200) crt.sleepMs(200);
-    if (cluster().joined.load(.acquire)) return;
+/// Fails the load at once while a worker is missing (`DistWorkerNotJoined`, a 503): as the group forming until the
+/// join timeout, then naming the ranks with no bell. The inference thread serves every other model meanwhile.
+fn checkJoined(g: Group) !void {
+    const waited: u64 = @intCast(@max(@divTrunc(io_util.nowUsMonotonic(g.io) - g.started_us, 1000), 0));
+    const state = joinState(cluster().joined.load(.acquire), waited, g.join_timeout_s);
+    if (state == .joined) return;
+    const seen = cluster().bells_seen.load(.acquire);
     if (g.size == 2) {
         log.err("[dist] {s} is served with a worker: start `mlx-serve worker` on the other Mac first\n", .{std.fs.path.basename(g.model)});
+    } else if (state == .forming) {
+        log.info("[dist] {s}: cluster forming ({d} of {d} Macs)\n", .{ std.fs.path.basename(g.model), @popCount(seen) + 1, g.size });
     } else {
         var mb: [64]u8 = undefined;
-        const missing = missingRanks(cluster().bells_seen.load(.acquire), g.size, &mb);
-        log.err("[dist] {s} is served by {d} Macs and rank {s} has not joined after {d} s: start `mlx-serve worker --rank k --size {d}` there\n", .{ std.fs.path.basename(g.model), g.size, if (missing.len > 0) missing else "(all dialed; the group is still forming)", g.join_timeout_s, g.size });
+        const missing = missingRanks(seen, g.size, &mb);
+        log.err("[dist] {s} is served by {d} Macs and rank {s} has not joined {d} s after startup: start `mlx-serve worker --rank k --size {d}` there\n", .{ std.fs.path.basename(g.model), g.size, if (missing.len > 0) missing else "(none; the group is still forming)", g.join_timeout_s, g.size });
     }
     return error.DistWorkerNotJoined;
 }
@@ -1561,14 +1577,14 @@ pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable; // a cluster exists only on macOS
     try checkHost(cfg, mode);
     preferFastSynch();
-    cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split, .size = cfg.size, .join_timeout_s = join_timeout_s orelse defaultJoinTimeout(cfg.size) };
+    cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split, .size = cfg.size, .join_timeout_s = join_timeout_s orelse defaultJoinTimeout(cfg.size), .started_us = io_util.nowUsMonotonic(io) };
     h3_split.hooks().* = .{ .serves = &serves, .plan_rows = &rowsPair, .note_job = &noteJob };
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
     t.detach();
 }
 
-/// A pair's load fails at once when the worker is absent (the app restarts it); a larger group waits ten minutes
-/// for its last Mac.
+/// A pair's worker is missing at once when absent (the app restarts it); a larger group reads as forming for ten
+/// minutes before the log names the missing ranks.
 fn defaultJoinTimeout(size: u32) u32 {
     return if (size > 2) 600 else 0;
 }
@@ -1803,9 +1819,16 @@ fn watchHost(b: Bell) void {
     var fds = [_]std.posix.pollfd{.{ .fd = b.fd, .events = std.posix.POLL.IN, .revents = 0 }};
     while (true) {
         _ = std.posix.poll(&fds, -1) catch return;
+        // The worker closed the bell itself (a clean stop): nothing to watch.
+        if (fds[0].revents & std.posix.POLL.NVAL != 0) return;
         var x: [1]u8 = undefined;
         const n = std.c.recv(b.fd, &x, 1, std.c.MSG.PEEK);
-        if (n == 0 or (n < 0 and std.c._errno().* != @backingInt(std.c.E.INTR))) break;
+        if (n < 0) switch (std.c._errno().*) {
+            @backingInt(std.c.E.INTR) => continue,
+            @backingInt(std.c.E.BADF), @backingInt(std.c.E.NOTSOCK) => return,
+            else => break,
+        };
+        if (n == 0) break;
         crt.sleepMs(20); // a ring the inference thread has yet to read
     }
     log.err("[dist] rank 0 left; this worker exits\n", .{});
@@ -2631,10 +2654,26 @@ test "dist N-rank: the watcher names the worker whose bell closed, after reading
     };
     var took: [4]u8 = undefined;
     std.mem.writeInt(u32, &took, 1234, .little);
-    try (Bell{ .fd = pairs[3][1] }).writeAll(&took);
-    _ = std.c.close(pairs[2][1]);
+    try (Bell{ .fd = pairs[1][1] }).writeAll(&took);
     var last: u32 = 0;
+    // Rank 1's time is read first; then rank 2 leaves.
+    const t = try std.Thread.spawn(.{}, struct {
+        fn leave(fd: std.c.fd_t) void {
+            crt.sleepMs(200);
+            _ = std.c.close(fd);
+        }
+    }.leave, .{pairs[2][1]});
+    defer t.join();
     try std.testing.expectEqual(@as(u32, 2), watchBells(&link, &last));
+    try std.testing.expectEqual(@as(u32, 1234), last);
+}
+
+test "dist N-rank: a load before every worker joined fails at once, as forming until the join timeout and late after it" {
+    try std.testing.expectEqual(JoinState.joined, joinState(true, 0, 600));
+    try std.testing.expectEqual(JoinState.forming, joinState(false, 599_999, 600));
+    try std.testing.expectEqual(JoinState.late, joinState(false, 600_000, 600));
+    // A pair's timeout is 0: late at once, today's refusal.
+    try std.testing.expectEqual(JoinState.late, joinState(false, 0, 0));
 }
 
 test "dist N-rank: the join names every rank that has not joined, and refuses a rank without the model by its number" {

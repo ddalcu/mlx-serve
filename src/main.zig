@@ -540,8 +540,10 @@ fn printUsage(io: std.Io) void {
         \\                        --dist-device lists the port facing each rank
         \\                        in rank order, this Mac's own `-` (rank 0), and
         \\                        each worker runs `worker --rank k --size n`
-        \\  --dist-join-timeout <s>  How long the group model's load waits for
-        \\                        every worker (default 0 for a pair, 600 past it)
+        \\  --dist-join-timeout <s>  How long after startup a missing worker reads as
+        \\                        the group forming before the log names its rank
+        \\                        (default 0 for a pair, 600 past it; the load
+        \\                        fails with 503 at once either way)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --log-file <path>   Persist the server log ("off" disables).
         \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
