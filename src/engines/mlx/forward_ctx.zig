@@ -100,6 +100,9 @@ pub const ForwardCtx = struct {
     tree: ?*const SpecTree = null,
     /// A speculative VERIFY forward (drafts behind one committed token), never a prompt chunk.
     spec_verify: bool = false,
+    /// A prompt forward read at most at its last row's logits (no prompt logprobs): a model declaring
+    /// `Caps.prompt_last_row` is asked for that row alone.
+    last_row_logits: bool = false,
     /// Hand the graph built so far to the GPU every this many layers (0 =
     /// build it whole): a spec round's verify waits on the host otherwise.
     pipeline_build: u32 = 0,
