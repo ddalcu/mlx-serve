@@ -59,6 +59,7 @@ const mediaRejectReason = @import("media_gate.zig").mediaRejectReason;
 const dropMedia = @import("media_gate.zig").dropMedia;
 const imageUrlOfPart = @import("media_gate.zig").imageUrlOfPart;
 const encodeText = @import("tokenize.zig").encodeText;
+const countTextTokens = @import("tokenize.zig").countTextTokens;
 const jsonEscapeOrEmpty = @import("tokenize.zig").jsonEscapeOrEmpty;
 const defaultReasoningBudget = @import("../chat/reasoning/request.zig").defaultReasoningBudget;
 const forcedReasoningBudget = @import("../chat/reasoning/request.zig").forcedReasoningBudget;
@@ -89,6 +90,7 @@ const cachedFormatChat = @import("format.zig").cachedFormatChat;
 const speech_stream = @import("speech_stream.zig");
 const speech_api = @import("speech.zig");
 const formatChatUsage = @import("format.zig").formatChatUsage;
+const formatChatUsageWithReasoning = @import("format.zig").formatChatUsageWithReasoning;
 const formatTimingsObject = @import("format.zig").formatTimingsObject;
 const formatPerfBracket = @import("format.zig").formatPerfBracket;
 const jsonEscape = @import("format.zig").jsonEscape;
@@ -1211,7 +1213,8 @@ fn handleNonStreamingGeneration(
                 try allocator.alloc(u8, 0);
             defer allocator.free(tc_timings_field);
 
-            const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
+            const tc_reasoning_tokens = if (tc_think_split.reasoning_content) |reasoning| countTextTokens(allocator, lm, tok, reasoning) else 0;
+            const tc_usage_obj = try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, tc_reasoning_tokens);
             defer allocator.free(tc_usage_obj);
 
             const response = try std.fmt.allocPrint(allocator,

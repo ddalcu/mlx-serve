@@ -26,6 +26,7 @@ const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
 const mtpCapable = @import("request_options.zig").mtpCapable;
 const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
+const countTextTokens = @import("tokenize.zig").countTextTokens;
 const promptOpensThink = @import("../chat/reasoning/request.zig").promptOpensThink;
 const promptOpensMuseHeader = @import("../chat/reasoning/request.zig").promptOpensMuseHeader;
 const reasoningDialect = @import("../chat/reasoning/request.zig").reasoningDialect;
@@ -47,6 +48,7 @@ const sendSseHeaders = @import("../http/respond.zig").sendSseHeaders;
 const logHttpSseData = @import("../http/respond.zig").logHttpSseData;
 const utf8TrailingIncomplete = @import("format.zig").utf8TrailingIncomplete;
 const formatChatUsage = @import("format.zig").formatChatUsage;
+const formatChatUsageWithReasoning = @import("format.zig").formatChatUsageWithReasoning;
 const formatTimingsObject = @import("format.zig").formatTimingsObject;
 const formatPerfBracket = @import("format.zig").formatPerfBracket;
 const MropeData = @import("../media/encode.zig").MropeData;
@@ -350,7 +352,9 @@ pub fn handleStreamingGeneration(
     // Bytes of THIS turn's reasoning already streamed. The tools path emits the
     // thought incrementally now, so every later emit site sends the remainder.
     var reasoning_streamed: usize = 0;
-    var reasoning_tokens_sent: usize = 0; // reasoning deltas actually emitted (the budget is counted in these)
+    // Reasoning tokens emitted: one per streamed delta, re-encoded for a piece sent at once. The budget counts them,
+    // and the usage chunk reports them with think_tokens.
+    var reasoning_tokens_sent: usize = 0;
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
 
@@ -445,6 +449,7 @@ pub fn handleStreamingGeneration(
         if (delivery) |*d| {
             defer allocator.free(token_text);
             try d.feed(allocator, token_text);
+            if (d.reasoning.items.len > 0) think_tokens += 1;
             try emitConstrainedChat(allocator, stream, chat_id, model_name, &lps, d);
             try beatStreamKeepalive(stream, .sse_comment);
             continue;
@@ -533,6 +538,7 @@ pub fn handleStreamingGeneration(
                             if (split.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
                                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
+                                    reasoning_tokens_sent += countTextTokens(allocator, lm, tok, fresh);
                                 }
                             }
                         }
@@ -934,6 +940,7 @@ pub fn handleStreamingGeneration(
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
+                    reasoning_tokens_sent += countTextTokens(allocator, lm, tok, reasoning);
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
                         const r_ids = try tok.encode(allocator, reasoning);
@@ -983,6 +990,7 @@ pub fn handleStreamingGeneration(
                 const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
                 // `budget_exhausted` means the cap was already streamed in full.
                 if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
+                    reasoning_tokens_sent += countTextTokens(allocator, lm, tok, reasoning);
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
                         const r_ids = try tok.encode(allocator, reasoning);
@@ -1023,7 +1031,8 @@ pub fn handleStreamingGeneration(
         defer allocator.free(timings_obj);
         // Usage chunk only if requested via stream_options.include_usage. Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
-        const usage_json: ?[]u8 = if (include_usage) try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "") else null;
+        const reasoning_tokens: u32 = @intCast(@as(usize, @intCast(think_tokens)) + reasoning_tokens_sent);
+        const usage_json: ?[]u8 = if (include_usage) try formatChatUsageWithReasoning(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, reasoning_tokens) else null;
         defer if (usage_json) |u| allocator.free(u);
         try sendStreamTail(allocator, stream, chat_id, model_name, .{ .reason = finish_reason, .details = ts.finish_details }, try lps.take(), usage_json, if (timings_obj.len > 0) timings_obj else null);
     }
@@ -1107,4 +1116,14 @@ test "a chat stream's timings ride the finish chunk without include_usage, and o
     try testing.expect(with_usage[0].object.get("timings") == null);
     try testing.expectEqual(@as(usize, 0), with_usage[1].object.get("choices").?.array.items.len);
     try testing.expectEqual(@as(f64, 50), with_usage[1].object.get("timings").?.object.get("predicted_per_second").?.float);
+}
+
+test "a chat stream's usage chunk reports its reasoning tokens" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const events = try testStreamTail(a, try formatChatUsageWithReasoning(a, 1000, 50, 0, 40), null);
+    try testing.expectEqual(@as(usize, 2), events.len);
+    const usage = events[1].object.get("usage").?.object;
+    try testing.expectEqual(@as(?i64, 40), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
 }
