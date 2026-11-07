@@ -38,12 +38,21 @@ pub fn billLoad(dir: *const abi.PackDir, m: *const abi.Machine) callconv(.c) u64
 
 /// MLX's working memory for one fragment (KV caches, VAE decode), above the resident weights.
 const fragment_peak: u64 = 3 << 30;
-/// f32 samples at 44.1 kHz, 12 spoken units a second at the slowest plausible rate of 1.2: an upper bound per input byte.
-const output_per_input_byte: u64 = 4 * 44100 / 1;
+/// The output buffer's bound: f32 at 44.1 kHz, one second per input byte (a CJK character is 3 bytes, about 0.3 s).
+const output_per_input_byte: u64 = 4 * 44100;
+
+/// The bytes of `input` (or `text`). `ref_audio` is a clip of at most 20 s and does not grow the output.
+fn inputBytes(body: []const u8) u64 {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), body, .{}) catch return 0;
+    const t = pack_claims.path(v, &.{"input"}) orelse pack_claims.path(v, &.{"text"}) orelse return 0;
+    return if (t == .string) t.string.len else 0;
+}
 
 pub fn billRequest(dir: *const abi.PackDir, m: *const abi.Machine, body: abi.Str) callconv(.c) u64 {
     _ = m;
-    return billLoad(dir, &.{}) + fragment_peak + @min(body.len, 512 * 1024) * output_per_input_byte;
+    return billLoad(dir, &.{}) + fragment_peak + inputBytes(body.slice()) * output_per_input_byte;
 }
 
 /// One Qwen2 stack (the LM, the VAE encoder, the VAE decoder).
@@ -147,6 +156,16 @@ test "ming_tts config: the release is claimed by marker; another `dense` or a st
     try testing.expectEqual(abi.Claim.no, claims(.of("dense"), &other.packDir()));
     const none: fixture.MemDir = .{ .files = &.{} };
     try testing.expectEqual(abi.Claim.no, claims(.of("dense"), &none.packDir()));
+}
+
+test "ming_tts config: a request's bill grows with its text, not with its reference clip" {
+    const none: fixture.MemDir = .{ .files = &.{} };
+    const dir = none.packDir();
+    const m: abi.Machine = .{};
+    const plain = billRequest(&dir, &m, .of("{\"input\":\"hi\"}"));
+    try testing.expectEqual(plain, billRequest(&dir, &m, .of("{\"input\":\"hi\",\"ref_audio\":\"UklGUklGUklGUklGUklG\"}")));
+    try testing.expect(billRequest(&dir, &m, .of("{\"input\":\"hello there\"}")) > plain);
+    try testing.expectEqual(fragment_peak, billRequest(&dir, &m, .of("not json")));
 }
 
 test "ming_tts config: the release's geometry" {

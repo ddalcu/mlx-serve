@@ -86,8 +86,8 @@ fn bad(comptime why: []const u8) Verdict {
 }
 
 const known_fields = [_][]const u8{
-    "model",    "input",    "text",      "stream",     "response_format", "speed",      "task",
-    "voice",    "language", "ref_audio", "ref_text",   "instruction",     "controls",   "seed",
+    "model",       "input",    "text",      "stream",   "response_format", "speed",    "task",
+    "voice",       "language", "ref_audio", "ref_text", "instruction",     "controls", "seed",
     "pause_scale",
 };
 
