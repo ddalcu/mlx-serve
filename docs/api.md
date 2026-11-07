@@ -107,7 +107,7 @@ On `POST /v1/audio/speech`, Qwen3-TTS uses `ref_audio` (a base64-encoded WAV) to
 - `ref_audio` (base64 WAV, at most 20 s) clones a voice; `ref_text` is its transcript and improves the clone. French, German, Spanish, Japanese and Korean `input` needs `ref_text` to clone in that language's path.
 - `language`: `fr`, `de`, `es`, `ja`, `ko`, `zh`, `en` or `auto`. Absent, these languages are detected from `input`. French numbers, dates and typography are spelled out first.
 - `task` with `controls` selects the reference's other tasks: `BASIC` (`speed`, `pitch`, `volume`), `EMOTION` (`emotion`), `DIALECT` (`dialect`), `IP`, `FREEFORM`, `VOICE_DESIGN` (`style`), `MULTILINGUAL`. A field a task does not take is a named 400.
-- `seed` (default 0) repeats a take. `pause_scale` (0 to 4) scales the pauses between fragments. Anything else is a named 400.
+- `seed` (default 0) repeats a take while no chat runs on the server: with chat alongside, the same seed gives a different take. `pause_scale` (0 to 4) scales the pauses between fragments. Anything else is a named 400.
 
 ### Qwen-Image transparent PNG output
 

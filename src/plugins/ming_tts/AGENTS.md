@@ -31,6 +31,7 @@ used is a named 400, never another voice.
   zero-points. `embed_tokens` and `word_embedder` are read through `gatherQuantizedRows`. Other modes are a named refusal.
 
 ## Known gaps
+- A seed repeats a take only while no chat runs on the server. With chat alongside, the same seed gave a different length. The cause is not traced.
 - No parity test against the reference in this tree; `tests/test_ming_tts.sh` proves the HTTP surface on a real pack.
 
 ## Levers
