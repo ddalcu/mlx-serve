@@ -893,10 +893,24 @@ pub const ModelConfig = struct {
         self.dist_span = span;
     }
 
+    /// The dimension a `size`-way tensor split cannot cut evenly, null when every one divides: the expert widths in
+    /// 64-wide parts (every shipped group size divides one), and DeepSeek-V4.1's heads and output groups, which it cuts too.
+    pub fn shardUneven(self: *const ModelConfig, size: u32) ?[]const u8 {
+        const quantum = size * 64;
+        if (self.moe_intermediate_size % quantum != 0) return "moe_intermediate_size";
+        if (self.shared_expert_intermediate_size % quantum != 0) return "shared_expert_intermediate_size";
+        if (!self.isDsv41()) return null;
+        if (self.num_attention_heads % size != 0) return "num_attention_heads";
+        if (self.dsv4_o_groups % size != 0) return "dsv4_o_groups";
+        return null;
+    }
+
     /// The expert widths one tensor-parallel rank holds.
     pub fn applyShard(self: *ModelConfig, sh: distributed.Shard) !void {
-        const quantum = sh.size * 64; // every shipped group size divides a 64-aligned part
-        if (self.moe_intermediate_size % quantum != 0 or self.shared_expert_intermediate_size % quantum != 0) return error.DistShardOffGroup;
+        if (self.shardUneven(sh.size)) |dim| {
+            log.err("[dist] {d} ranks cannot split {s} evenly\n", .{ sh.size, dim });
+            return error.DistShardUneven;
+        }
         self.moe_intermediate_size /= sh.size;
         self.shared_expert_intermediate_size /= sh.size;
         self.dist_shard = sh;
@@ -4934,6 +4948,27 @@ fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !v
         _ = mlx.mlx_array_free(kv.value_ptr.*);
         kv.value_ptr.* = owned;
     }
+}
+
+test "dist N-rank: a tensor split refuses a size that does not divide the heads, the output groups or the widths" {
+    var c: ModelConfig = .{ .model_type = "deepseek_v41", .num_attention_heads = 64, .dsv4_o_groups = 8, .moe_intermediate_size = 2304, .shared_expert_intermediate_size = 2304 };
+    try std.testing.expect(c.shardUneven(2) == null);
+    try std.testing.expect(c.shardUneven(4) == null);
+    // 2304 is 36 blocks of 64, so three ranks fit the widths; the heads and groups do not.
+    try std.testing.expectEqualStrings("num_attention_heads", c.shardUneven(3).?);
+    try std.testing.expectEqualStrings("moe_intermediate_size", c.shardUneven(8).?);
+    c.num_attention_heads = 66;
+    try std.testing.expectEqualStrings("num_attention_heads", c.shardUneven(4).?);
+    c.num_attention_heads = 64;
+    c.dsv4_o_groups = 6;
+    try std.testing.expectEqualStrings("dsv4_o_groups", c.shardUneven(4).?);
+    try std.testing.expectError(error.DistShardUneven, c.applyShard(.{ .rank = 0, .size = 3 }));
+    try std.testing.expectEqual(@as(u32, 2304), c.moe_intermediate_size); // a refused split changes nothing
+    // Qwen's tensor split cuts only the experts: its heads need not divide.
+    var q: ModelConfig = .{ .model_type = "qwen4_exp", .num_attention_heads = 3, .moe_intermediate_size = 512, .shared_expert_intermediate_size = 512 };
+    try std.testing.expect(q.shardUneven(2) == null);
+    try q.applyShard(.{ .rank = 1, .size = 2 });
+    try std.testing.expectEqual(@as(u32, 256), q.moe_intermediate_size);
 }
 
 test "shardExperts cuts DeepSeek-V4.1's experts (gate/up rows, down columns) and attention heads, not the router" {
