@@ -44,8 +44,10 @@ and field: [plugin-abi.md](plugin-abi.md) (generated from `src/abi/`).
   the file and the reason, and the server serves on without it. A dylib is never unloaded; `--no-plugins` loads none.
   `/props` `plugins` lists each one loaded or refused (`rebuild: true` = built for another MLX or ABI, which a rebuild
   with this release's kit fixes; the app offers Rebuild), and a failed model load names those plugins.
-  `/v1/models` marks a pack an outside plugin serves with `"plugin": "<name>"`; the app's Settings ▸ Server lists the
-  receipts with a switch each (writes `plugins.json`). macOS only, never in the Mac App Store build.
+  `/v1/models` marks a pack an outside plugin serves with `"plugin": "<name>"`. The app's Models ▸ Plugins installs a
+  catalog plugin after one approval of the fetched commit (build, install, switch on in `plugins.json`) and offers a
+  server restart to load it.
+  macOS only, never in the Mac App Store build.
 
 ## Vendored modules: `mlx_host`, the one import
 

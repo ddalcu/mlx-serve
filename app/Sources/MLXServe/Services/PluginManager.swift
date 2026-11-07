@@ -1,19 +1,19 @@
 import Foundation
 
-/// Drives Settings > Server > Plugins > Manage: loads the catalog, and installs a plugin in two steps so the user
-/// confirms what will be compiled. (1) `prepare` fetches the repo at `PluginCatalog.ref` into
-/// ~/.mlx-serve/plugin-src and reports the exact commit; (2) `confirmInstall` runs the repo's
-/// `scripts/build.sh <name>` (the pinned Zig, the plugin's tests) and then this app's own
-/// `mlx-serve plugin install <dylib> --yes` (hash + signature receipt): `installSteps`.
+/// Drives Models ▸ Plugins: loads the catalog, and installs a plugin in two clicks: `install` fetches the repo at
+/// `PluginCatalog.ref` into ~/.mlx-serve/plugin-src and names the commit; `confirm` runs the repo's
+/// `scripts/build.sh <name>` (the pinned Zig, the plugin's tests) on exactly that commit, then this app's own
+/// `mlx-serve plugin install <dylib> --yes` (hash + signature receipt): `installSteps`, and switches it on.
 /// Nothing prebuilt is ever downloaded or run.
 @MainActor
 final class PluginManager: ObservableObject {
     enum Phase: Equatable {
         case idle
         case fetching(name: String)
-        /// Source is on disk at `commit`; waiting for the user to accept it.
+        /// Source is on disk at `commit`; nothing is compiled until the user approves it.
         case awaitingConfirmation(name: String, commit: String, version: String)
         case building(name: String)
+        case installing(name: String)
         case done(name: String)
         case failed(name: String, message: String)
     }
@@ -29,13 +29,16 @@ final class PluginManager: ObservableObject {
     @Published private(set) var serverStatus: [String: PluginCatalog.ServerStatus] = [:]
     /// The plugins the install in progress builds, in order (one, or every stale one for Rebuild all).
     @Published private(set) var pending: [String] = []
+    /// Whether `xcode-select -p` names the Command Line Tools that git and the build need; nil until checked.
+    @Published private(set) var developerTools: Bool?
+    private var lastRequest: (entries: [PluginCatalog.Entry], onInstalled: ([String]) -> Void)?
 
     static let sourceDir = NSString(string: "~/.mlx-serve/plugin-src").expandingTildeInPath
     private var process: Process?
 
     var isBusy: Bool {
         switch phase {
-        case .fetching, .building: return true
+        case .fetching, .building, .installing: return true
         default: return false
         }
     }
@@ -48,6 +51,7 @@ final class PluginManager: ObservableObject {
         loadingCatalog = true
         defer { loadingCatalog = false }
         async let version = Self.probeRunningVersion()
+        developerTools = Self.hasDeveloperTools()
         if let port { serverStatus = await Self.fetchServerStatus(port: port) }
         do {
             var request = URLRequest(url: PluginCatalog.catalogURL)
@@ -64,6 +68,11 @@ final class PluginManager: ObservableObject {
         }
         runningVersion = await version
         refreshReceipts()
+    }
+
+    /// What a server that just (re)started loaded.
+    func refreshServerStatus(port: UInt16) async {
+        serverStatus = await Self.fetchServerStatus(port: port)
     }
 
     nonisolated private static func fetchServerStatus(port: UInt16) async -> [String: PluginCatalog.ServerStatus] {
@@ -83,12 +92,11 @@ final class PluginManager: ObservableObject {
 
     // MARK: Install
 
-    /// Step 1: fetch the source and name the commit. Nothing is compiled or run from it yet.
-    func prepare(_ entry: PluginCatalog.Entry) { prepare([entry]) }
-
-    /// Several at once (Rebuild all): one fetch, one confirmation, then each built and installed in turn.
-    func prepare(_ entries: [PluginCatalog.Entry]) {
+    /// Step 1 for `entries` (one, or every stale one for Rebuild all): fetch the source and wait for `confirm`.
+    /// `onInstalled` gets their names once every one is in, so the caller can switch them on.
+    func install(_ entries: [PluginCatalog.Entry], onInstalled: @escaping ([String]) -> Void) {
         guard !isBusy, !entries.isEmpty, entries.allSatisfy({ PluginCatalog.isSafeName($0.name) }) else { return }
+        lastRequest = (entries, onInstalled)
         log = ""
         pending = entries.map(\.name)
         let name = pending.joined(separator: ", ")
@@ -107,22 +115,14 @@ final class PluginManager: ObservableObject {
         }
     }
 
-    /// The plugin's own `plugin.json`, shown in the confirmation sheet beside the commit.
-    func manifestText(for name: String) -> String {
-        guard PluginCatalog.isSafeName(name),
-              let text = try? String(contentsOfFile: Self.sourceDir + "/plugins/\(name)/plugin.json", encoding: .utf8) else { return "" }
-        return text
-    }
-
-    /// Step 2: the user accepted `commit`. Build and install exactly the tree `prepare` fetched.
-    func confirmInstall() {
-        guard case let .awaitingConfirmation(name, commit, _) = phase else { return }
+    /// Step 2: the user approved `commit`. Build and install exactly the tree `install` fetched, then switch it on.
+    func confirm() {
+        guard case let .awaitingConfirmation(name, commit, _) = phase, let onInstalled = lastRequest?.onInstalled else { return }
         phase = .building(name: name)
         Task {
             do {
-                // The checkout must still be the commit the user accepted.
                 let head = try await Self.git(["rev-parse", "HEAD"], in: Self.sourceDir).trimmingCharacters(in: .whitespacesAndNewlines)
-                guard head == commit else { throw Failure("the source changed after you reviewed it; start again") }
+                guard head == commit else { throw Failure(L10n.text("The source changed after you approved it. Click Try again.")) }
                 var env = ServerManager.launchEnvironment()
                 let binDir = (Self.binaryPath() as NSString).deletingLastPathComponent
                 env["PATH"] = [binDir, "/usr/bin", "/bin", "/usr/sbin", "/sbin", env["PATH"] ?? ""].filter { !$0.isEmpty }.joined(separator: ":")
@@ -132,13 +132,15 @@ final class PluginManager: ObservableObject {
                     try? FileManager.default.removeItem(atPath: Self.sourceDir + "/.kit")
                 }
                 for n in pending {
-                    for step in Self.installSteps(name: n, sourceDir: Self.sourceDir, binary: Self.binaryPath()) {
+                    for (i, step) in Self.installSteps(name: n, sourceDir: Self.sourceDir, binary: Self.binaryPath()).enumerated() {
+                        phase = i == 0 ? .building(name: name) : .installing(name: name)
                         let status = try await stream(step.exe, step.args, cwd: Self.sourceDir, env: env)
                         guard status == 0 else { throw Failure(PluginCatalog.installFailure(status: status, log: log, running: runningVersion)) }
                     }
-                    serverStatus[n] = nil
                 }
+                for n in pending { serverStatus[n] = nil }
                 refreshReceipts()
+                onInstalled(pending)
                 phase = .done(name: name)
             } catch {
                 phase = .failed(name: name, message: error.localizedDescription)
@@ -146,9 +148,23 @@ final class PluginManager: ObservableObject {
         }
     }
 
+    /// The last install again, after a failure.
+    func retry() {
+        guard let request = lastRequest else { return }
+        phase = .idle
+        install(request.entries, onInstalled: request.onInstalled)
+    }
+
     func cancel() {
         process?.terminate()
-        if case let .awaitingConfirmation(name, _, _) = phase { phase = .failed(name: name, message: "Cancelled") }
+        if case .awaitingConfirmation = phase { phase = .idle; pending = [] }
+    }
+
+    /// The plugin's own `plugin.json` at the fetched commit, shown under the approval.
+    func manifestText(for name: String) -> String {
+        guard PluginCatalog.isSafeName(name),
+              let text = try? String(contentsOfFile: Self.sourceDir + "/plugins/\(name)/plugin.json", encoding: .utf8) else { return "" }
+        return text
     }
 
     func dismiss() {
@@ -177,7 +193,7 @@ final class PluginManager: ObservableObject {
     nonisolated static func binaryPath() -> String { ServerManager.resolveBinaryPath() }
 
     /// The two processes an install runs, in order: the repo's build (its pinned Zig and kit, the plugin's own tests,
-    /// a ReleaseFast dylib), then this app's mlx-serve copying that dylib in, confirmed because the user just accepted
+    /// a ReleaseFast dylib), then this app's mlx-serve copying that dylib in, confirmed because the user approved
     /// the commit. `name` is a `isSafeName` identifier.
     nonisolated static func installSteps(name: String, sourceDir: String, binary: String) -> [(exe: String, args: [String])] {
         [("/bin/bash", [sourceDir + "/scripts/build.sh", name]),
@@ -206,11 +222,15 @@ final class PluginManager: ObservableObject {
         return home
     }
 
-    /// git and the Zig build both need the Command Line Tools; say so by name instead of letting the shim pop a dialog.
+    nonisolated private static func hasDeveloperTools() -> Bool {
+        !runCapture("/usr/bin/xcode-select", ["-p"], env: nil).isEmpty
+    }
+
+    /// git and the Zig build both need the Command Line Tools: open Apple's installer for them rather than fail cold.
     private static func requireDeveloperTools() throws {
-        guard !runCapture("/usr/bin/xcode-select", ["-p"], env: nil).isEmpty else {
-            throw Failure("Install the Xcode Command Line Tools first: run `xcode-select --install` in Terminal.")
-        }
+        guard !hasDeveloperTools() else { return }
+        _ = runCapture("/usr/bin/xcode-select", ["--install"], env: nil)
+        throw Failure(L10n.text("This needs Apple's Command Line Tools. Their installer has opened: finish it, then click Try again."))
     }
 
     /// Shallow-fetches `PluginCatalog.ref` into `sourceDir` (a clone the first time) and returns the commit.

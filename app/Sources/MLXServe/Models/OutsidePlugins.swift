@@ -71,6 +71,18 @@ enum OutsidePlugins {
             disabled.removeAll { $0 == name }
             if !on { disabled.append(name) }
         }
+
+        /// Switching a plugin on means it runs: loading comes on with it. Loading coming on must not also start the
+        /// installed plugins the user never chose, so those are switched off first.
+        func turningOn(_ names: [String], installed: [String]) -> Switches {
+            var s = self
+            if !s.enabled {
+                for other in installed where !names.contains(other) && !s.disabled.contains(other) { s.disabled.append(other) }
+            }
+            s.enabled = true
+            s.disabled.removeAll { names.contains($0) }
+            return s
+        }
     }
 
     static let defaultDir = NSString(string: "~/.mlx-serve/plugins").expandingTildeInPath
