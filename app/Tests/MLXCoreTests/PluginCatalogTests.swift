@@ -122,4 +122,27 @@ final class PluginAgentInstructionsTests: XCTestCase {
         XCTAssertTrue(t.contains("scripts/build.sh <name>"))
         XCTAssertTrue(t.contains("unknown"))
     }
+
+    func testTheApprovedCommitLinksToItsTreeOnGitHub() {
+        let commit = "0123456789abcdef0123456789abcdef01234567"
+        XCTAssertEqual(PluginCatalog.commitURL(commit)?.absoluteString,
+                       "https://github.com/CommunityServe/plugins/tree/0123456789abcdef0123456789abcdef01234567")
+        XCTAssertNil(PluginCatalog.commitURL("main; rm"), "only a full hex commit becomes a link")
+    }
+
+    func testIconAndLinksComeFromTheCatalogAndStayInsideTheirRepos() throws {
+        let json = #"{"plugins":[{"name":"sushi_ds41","kind":"model","icon":"plugins/sushi_ds41/icon.png","homepage":"https://github.com/beamivalice/sushi"},{"name":"bare","kind":"model"},{"name":"evil","kind":"model","icon":"../../x.png","homepage":"http://example.com"}]}"#
+        let got = try PluginCatalog.decode(Data(json.utf8))
+        XCTAssertEqual(PluginCatalog.iconURL(got[0])?.absoluteString,
+                       "https://raw.githubusercontent.com/CommunityServe/plugins/main/plugins/sushi_ds41/icon.png")
+        XCTAssertEqual(PluginCatalog.homepageURL(got[0])?.absoluteString, "https://github.com/beamivalice/sushi")
+        XCTAssertEqual(PluginCatalog.folderURL("sushi_ds41").absoluteString,
+                       "https://github.com/CommunityServe/plugins/tree/main/plugins/sushi_ds41")
+        XCTAssertEqual(PluginCatalog.logoURL.absoluteString,
+                       "https://raw.githubusercontent.com/CommunityServe/plugins/main/docs/assets/logo.png")
+        XCTAssertNil(PluginCatalog.iconURL(got[1]), "no icon: the monogram stands in")
+        XCTAssertNil(PluginCatalog.homepageURL(got[1]))
+        XCTAssertNil(PluginCatalog.iconURL(got[2]), "an icon is a file under its own plugin folder")
+        XCTAssertNil(PluginCatalog.homepageURL(got[2]), "only an https homepage becomes a link")
+    }
 }

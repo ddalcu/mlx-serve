@@ -53,6 +53,24 @@ final class OutsidePluginsTests: XCTestCase {
         XCTAssertEqual(s.disabled, [])
     }
 
+    func testTurningAPluginOnAlsoTurnsOnLoading() {
+        let s = OutsidePlugins.Switches(enabled: false, disabled: ["toy", "snd"]).turningOn(["toy"], installed: ["toy", "snd"])
+        XCTAssertTrue(s.enabled, "a plugin switched on with loading off would still not run")
+        XCTAssertEqual(s.disabled, ["snd"], "only the named plugins change")
+    }
+
+    func testTurningLoadingOnLeavesEveryOtherInstalledPluginOff() {
+        let s = OutsidePlugins.Switches(enabled: false, disabled: []).turningOn(["b"], installed: ["a", "b"])
+        XCTAssertTrue(s.isOn("b"))
+        XCTAssertFalse(s.isOn("a"), "a plugin the user never chose must not load because loading came on for another")
+    }
+
+    func testTurningOnWithLoadingAlreadyOnChangesOnlyTheNamedPlugins() {
+        let s = OutsidePlugins.Switches(enabled: true, disabled: ["c"]).turningOn(["b"], installed: ["a", "b", "c"])
+        XCTAssertEqual(s.disabled, ["c"])
+        XCTAssertTrue(s.isOn("a"), "with loading on, a's own switch was already the user's choice")
+    }
+
     func testServedTypesFollowTheSwitchesAndTheKind() {
         let receipts = [
             OutsidePlugins.Receipt(name: "toy", kind: "model", sha256: "a", modelTypes: ["toy_lm"]),
