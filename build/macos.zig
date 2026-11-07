@@ -37,19 +37,18 @@ pub const Graph = struct {
         //   --mlx-c-version  pinned mlx-c submodule version; defaults from the
         //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
         //   --ds4-commit     pinned ds4 submodule short commit; defaults from its checked-out
-        //                    commit (readDs4Commit), so the release build reports it too
+        //                    commit (config.ds4PinModule), so the release build reports it too
         //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
         //                    (written by scripts/fetch-llama.sh) so a plain dev build
         //                    still reports it. app/build.sh passes all three.
         const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse config.readMlxcPin(b) orelse "unknown";
-        const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse config.readDs4Commit(b) orelse "unknown";
+        const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit");
         const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse config.readLlamaTag(b) orelse "unknown";
 
         const build_options = b.addOptions();
         build_options.addOption([]const u8, "version", version);
         build_options.addOption(bool, "mas", mas);
         build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
-        build_options.addOption([]const u8, "ds4_commit", ds4_commit);
         build_options.addOption([]const u8, "llama_tag", llama_tag);
         const git_sha = b.option([]const u8, "git-sha", "Engine build id for the round-cost table: a release sha stands for the executable bytes, which are then not hashed; the MLX dylib and metallib fingerprints are always mixed in") orelse "";
         build_options.addOption([]const u8, "git_sha", git_sha);
@@ -75,6 +74,7 @@ pub const Graph = struct {
         const shared: Shared = .{
             .build_options = build_options,
             .mlx_stamp = config.mlxStampModule(b, "lib/mlx/.version"),
+            .ds4_pin = config.ds4PinModule(b, ds4_commit),
             // ds4 Metal kernel sources embedded via @embedFile and exposed as a
             // named module so src/engines/ds4/bridge.zig can import them with `@import("ds4_metal_sources")`
             // without traversing the project root.
@@ -108,6 +108,7 @@ pub const Graph = struct {
 const Shared = struct {
     build_options: *std.Build.Step.Options,
     mlx_stamp: *std.Build.Module,
+    ds4_pin: *std.Build.Module,
     ds4_metal_sources: *std.Build.Module,
     embedded: libs.Embedded,
 
@@ -120,6 +121,7 @@ const Shared = struct {
             .imports = &.{
                 .{ .name = "build_options", .module = s.build_options.createModule() },
                 .{ .name = "mlx_stamp", .module = s.mlx_stamp },
+                .{ .name = "ds4_pin", .module = s.ds4_pin },
                 .{ .name = "ds4_metal_sources", .module = s.ds4_metal_sources },
                 .{ .name = "mlx_steel_sources", .module = s.embedded.mlx_steel_sources },
                 .{ .name = "opencode2_plugin", .module = s.embedded.opencode2_plugin },
@@ -138,7 +140,7 @@ const Shared = struct {
         libs.addVendoredSources(b, mod);
 
         // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
-        // `lib/ds4/` submodule pinned at 9139e2a and `src/engines/ds4/bridge.zig`. Kernel
+        // the `lib/ds4/` submodule and `src/engines/ds4/bridge.zig`. Kernel
         // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
         // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
         libs.addDs4Sources(b, mod);

@@ -30,7 +30,6 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "mas", false);
     build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
-    build_options.addOption([]const u8, "ds4_commit", b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse config.readDs4Commit(b) orelse "unknown");
     build_options.addOption([]const u8, "llama_tag", config.readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
@@ -47,6 +46,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
 
     // The server and its unit tests (`zig build test`, root src/tests.zig) share one module setup.
     const mlx_stamp = config.mlxStampModule(b, if (windows) "lib/mlx-win/.version" else "lib/mlx/.version");
+    const ds4_pin = config.ds4PinModule(b, b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit"));
     var mods: [2]*std.Build.Module = undefined;
     for (&mods, [_][]const u8{ "src/main.zig", "src/tests.zig" }) |*slot, root| {
         const mod = b.createModule(.{
@@ -57,6 +57,7 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .imports = &.{
                 .{ .name = "build_options", .module = build_options.createModule() },
                 .{ .name = "mlx_stamp", .module = mlx_stamp },
+                .{ .name = "ds4_pin", .module = ds4_pin },
                 .{ .name = "mlx_steel_sources", .module = embedded.mlx_steel_sources },
                 .{ .name = "opencode2_plugin", .module = embedded.opencode2_plugin },
                 .{ .name = "agent_skills", .module = embedded.agent_skills },

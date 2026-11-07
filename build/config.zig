@@ -78,20 +78,30 @@ pub fn readAppVersion(b: *std.Build) ?[]const u8 {
     return if (v.len > 0) b.dupe(v) else null;
 }
 
-/// The ds4 submodule's checked-out commit, short, read without git: its `.git` file names the
-/// git dir, whose detached HEAD holds the commit.
-pub fn readDs4Commit(b: *std.Build) ?[]const u8 {
-    const root = buildRootHandle(b);
-    const link = root.readFileAlloc(b.graph.io, "lib/ds4/.git", b.allocator, .limited(512)) catch return null;
+/// Module `ds4_pin`: the ds4 submodule's checked-out short commit as `commit` ("unknown" without a
+/// checkout), or `override`, flagged by `overridden`. HEAD is copied through the build graph so a
+/// moved pin rebuilds it: a configure-time read is cached.
+pub fn ds4PinModule(b: *std.Build, override: ?[]const u8) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    if (override) |c| _ = wf.add("HEAD", c) else if (ds4HeadPath(b)) |head| _ = wf.addCopyFile(head, "HEAD") else _ = wf.add("HEAD", "");
+    return b.createModule(.{ .root_source_file = wf.add("ds4_pin.zig", b.fmt(
+        \\const std = @import("std");
+        \\const head = std.mem.trim(u8, @embedFile("HEAD"), " \t\r\n");
+        \\pub const commit = if (head.len >= 7 and !std.mem.startsWith(u8, head, "ref:")) head[0..7] else "unknown";
+        \\pub const overridden = {s};
+        \\
+    , .{if (override != null) "true" else "false"})) });
+}
+
+/// The HEAD file of the ds4 submodule's git dir, which its `.git` file names.
+fn ds4HeadPath(b: *std.Build) ?std.Build.LazyPath {
+    const link = buildRootHandle(b).readFileAlloc(b.graph.io, "lib/ds4/.git", b.allocator, .limited(512)) catch return null;
     const line = std.mem.trim(u8, link, " \t\r\n");
     const prefix = "gitdir: ";
     if (!std.mem.startsWith(u8, line, prefix)) return null;
-    const git_dir = line[prefix.len..];
-    const head_path = b.pathJoin(&.{ if (std.fs.path.isAbsolute(git_dir)) git_dir else b.pathJoin(&.{ "lib/ds4", git_dir }), "HEAD" });
-    const head = root.readFileAlloc(b.graph.io, head_path, b.allocator, .limited(256)) catch return null;
-    const sha = std.mem.trim(u8, head, " \t\r\n");
-    if (sha.len < 7 or std.mem.startsWith(u8, sha, "ref:")) return null;
-    return b.dupe(sha[0..7]);
+    const head = std.fs.path.resolveAlloc(b.allocator, &.{ "lib/ds4", line[prefix.len..], "HEAD" }) catch return null;
+    buildRootHandle(b).access(b.graph.io, head, .{}) catch return null;
+    return if (std.fs.path.isAbsolute(head)) .{ .cwd_relative = head } else b.path(head);
 }
 
 /// The pinned mlx-c revision from lib/mlx/.version (written by
