@@ -1,0 +1,198 @@
+{
+  "aggregator_config": {
+    "attn_mask_enabled": false,
+    "depth": 8,
+    "dropout": 0.0,
+    "hidden_size": 1024,
+    "mlp_ratio": 4,
+    "num_heads": 16
+  },
+  "architectures": [
+    "BailingMMNativeForConditionalGeneration"
+  ],
+  "audio_tokenizer_config": {
+    "architectures": [
+      "AudioVAE"
+    ],
+    "dec_kwargs": {
+      "backbone": {
+        "_attn_implementation": "flash_attention_2",
+        "attention_dropout": 0.0,
+        "attn_implementation": null,
+        "bos_token_id": 151643,
+        "eos_token_id": 151645,
+        "hidden_act": "silu",
+        "hidden_size": 896,
+        "initializer_range": 0.02,
+        "intermediate_size": 4864,
+        "is_causal": true,
+        "max_position_embeddings": 32768,
+        "max_window_layers": 0,
+        "model_type": "qwen2",
+        "num_attention_heads": 14,
+        "num_hidden_layers": 24,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 1000000.0,
+        "sliding_window": 64,
+        "tie_word_embeddings": true,
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.43.1",
+        "use_cache": false,
+        "use_sliding_window": true,
+        "vocab_size": 1
+      },
+      "latent_dim": 64,
+      "output_dim": 882
+    },
+    "enc_kwargs": {
+      "backbone": {
+        "_attn_implementation": "flash_attention_2",
+        "attention_dropout": 0.0,
+        "attn_implementation": null,
+        "bos_token_id": 151643,
+        "eos_token_id": 151645,
+        "hidden_act": "silu",
+        "hidden_size": 896,
+        "initializer_range": 0.02,
+        "intermediate_size": 4864,
+        "is_causal": true,
+        "max_position_embeddings": 32768,
+        "max_window_layers": 0,
+        "model_type": "qwen2",
+        "num_attention_heads": 14,
+        "num_hidden_layers": 24,
+        "num_key_value_heads": 2,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 1000000.0,
+        "sliding_window": 64,
+        "tie_word_embeddings": true,
+        "torch_dtype": "bfloat16",
+        "transformers_version": "4.43.1",
+        "use_cache": false,
+        "use_sliding_window": true,
+        "vocab_size": 1
+      },
+      "hop_size": 882,
+      "input_dim": 882,
+      "latent_dim": 64
+    },
+    "hifi_gan_disc_kwargs": {
+      "channel_increasing_factor": 4,
+      "channels": 16,
+      "max_downsample_channels": 512,
+      "periods": [
+        2,
+        3,
+        5,
+        7,
+        11
+      ]
+    },
+    "init_method": "kaiming",
+    "lambda_adv": 1.0,
+    "lambda_disc": 1.0,
+    "lambda_feat_match_loss": 1.0,
+    "lambda_mel_loss": 1.0,
+    "lambda_semantic": 2.0,
+    "patch_size": 4,
+    "sample_rate": 44100,
+    "semantic_module_kwargs": null,
+    "spec_disc_kwargs": {
+      "channels": 32,
+      "downsample_scales": [
+        2,
+        2,
+        2
+      ],
+      "in_channels": 1,
+      "kernel_sizes": [
+        5,
+        3
+      ],
+      "max_downsample_channels": 512,
+      "out_channels": 1,
+      "stft_params": {
+        "fft_sizes": [
+          78,
+          126,
+          206,
+          334,
+          542,
+          876,
+          1418,
+          2296
+        ],
+        "hop_sizes": [
+          39,
+          63,
+          103,
+          167,
+          271,
+          438,
+          709,
+          1148
+        ],
+        "win_lengths": [
+          78,
+          126,
+          206,
+          334,
+          542,
+          876,
+          1418,
+          2296
+        ],
+        "window": "hann_window"
+      },
+      "use_weight_norm": true
+    },
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.46.3"
+  },
+  "auto_map": {
+    "AutoConfig": "configuration_bailingmm.BailingMMConfig"
+  },
+  "ditar_config": {
+    "attn_backend": "torch",
+    "attn_mask_enabled": false,
+    "depth": 8,
+    "dropout": 0.0,
+    "hidden_size": 1024,
+    "history_patch_size": 1,
+    "mlp_ratio": 4,
+    "num_heads": 16,
+    "patch_size": 1
+  },
+  "llm_config": {
+    "architectures": [
+      "Qwen2ForCausalLM"
+    ],
+    "attention_dropout": 0.0,
+    "bos_token_id": 151643,
+    "eos_token_id": 151645,
+    "hidden_act": "silu",
+    "hidden_size": 896,
+    "initializer_range": 0.02,
+    "intermediate_size": 4864,
+    "max_position_embeddings": 32768,
+    "max_window_layers": 21,
+    "model_type": "qwen2",
+    "num_attention_heads": 14,
+    "num_hidden_layers": 24,
+    "num_key_value_heads": 2,
+    "rms_norm_eps": 1e-06,
+    "rope_theta": 1000000.0,
+    "sliding_window": 32768,
+    "tie_word_embeddings": true,
+    "torch_dtype": "bfloat16",
+    "transformers_version": "4.43.1",
+    "use_cache": true,
+    "use_sliding_window": false,
+    "vocab_size": 151936
+  },
+  "mlp_depth": 2,
+  "model_type": "dense",
+  "torch_dtype": "bfloat16",
+  "transformers_version": "4.52.4"
+}

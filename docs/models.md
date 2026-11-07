@@ -29,6 +29,6 @@
 | **Embeddings** | `bert`, `gemma3_text`, `embedding_gemma2`, `qwen3` | bge, mxbai, EmbeddingGemma 1 and 2 (2: 768 dims, `dimensions` down to 128, 8192 tokens, text, image and video), Qwen3-Embedding (pooling read from the checkpoint) | n/a | EmbeddingGemma 2: SigLIP (images, video) |
 | **Anything else as GGUF** | via embedded llama.cpp | any `.gguf` on HuggingFace | per-template | -- |
 
-Media models live in the same registry and are classified the same way: FLUX.2, Krea-2, Mage-Flow and Qwen-Image-2.1 (image), Qwen3-TTS, Kokoro, ACE-Step and MiniMax Music 3 (speech + music), LTX-Video 2.3 / 2.5 and MiniMax-H3 (video), Hunyuan3D-2.1 (3D). A chat request naming one of them gets a 400 that names the endpoint to use instead.
+Media models live in the same registry and are classified the same way: FLUX.2, Krea-2, Mage-Flow and Qwen-Image-2.1 (image), Qwen3-TTS, Kokoro, Ming-3.0-tts, ACE-Step and MiniMax Music 3 (speech + music), LTX-Video 2.3 / 2.5 and MiniMax-H3 (video), Hunyuan3D-2.1 (3D). A chat request naming one of them gets a 400 that names the endpoint to use instead.
 
 Any quantized MLX model using one of the above architectures works natively. Anything else can be served as GGUF through the embedded llama.cpp engine — just pick the `.gguf` file in the Model Browser and the server auto-routes by format. Models with unsupported architectures are flagged in the Model Browser but can still be downloaded.

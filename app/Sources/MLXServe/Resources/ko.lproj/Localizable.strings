@@ -1660,6 +1660,10 @@
 "Arabic" = "아랍어";
 "Edit an existing image with an instruction, or generate a variation of it." = "기존 이미지를 지시문으로 편집하거나 변형 이미지를 생성합니다.";
 "Writing…" = "작성 중…";
+"Ming-3.0-tts 0.5B 8-bit (44.1 kHz, ~1.6 GB)" = "Ming-3.0-tts 0.5B 8-bit(44.1kHz, ~1.6GB)";
+"Ming-3.0-tts 0.5B bf16 (full precision, ~2.9 GB)" = "Ming-3.0-tts 0.5B bf16(전체 정밀도, ~2.9GB)";
+"Clear 44.1 kHz speech in English, Chinese, French and more, faster than real time, with voice cloning from a clip of up to 20 seconds." = "영어, 중국어, 프랑스어 등을 지원하는 선명한 44.1kHz 음성을 실시간보다 빠르게 생성하며, 최대 20초 클립으로 음성을 복제합니다.";
+"The same Ming voice model at full precision — the fastest Ming build on a Mac GPU, at more memory than the 8-bit build." = "같은 Ming 음성 모델의 전체 정밀도 버전입니다. Mac GPU에서 가장 빠른 Ming 빌드이지만 8-bit 빌드보다 메모리를 더 사용합니다.";
 "Qwen3-TTS 0.6B 8-bit (balanced, ~2 GB)" = "Qwen3-TTS 0.6B 8-bit(균형, ~2GB)";
 "%lld source%@" = "소스 %lld개";
 "Max tokens to generate per chat turn. \"Auto\" pegs it to the remaining context window — the safe choice on a small-RAM / small-context machine. Per-message overrides win when set." = "채팅 턴마다 생성할 최대 토큰 수입니다. \"자동\"은 남은 컨텍스트 윈도우에 맞춥니다 — RAM이나 컨텍스트가 작은 컴퓨터에서 안전한 선택입니다. 메시지별로 재정의하면 그 값이 우선합니다.";
