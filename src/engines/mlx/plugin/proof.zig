@@ -19,6 +19,8 @@ const quant_abi = @import("../../../abi/quant.zig");
 const llama = @import("../../../plugins/llama/plugin.zig");
 const HotPrefixCache = @import("../cache/prefix_cache.zig").HotPrefixCache;
 const cache_ops = @import("../kv/cache_ops.zig");
+const Generator = @import("../generate/generator.zig").Generator;
+const Tokenizer = @import("../../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const both = @import("both.zig");
 
 const testing = std.testing;
@@ -489,6 +491,95 @@ test "plugin forward: a prompt forward hands the plugin the host's prefill count
     try testing.expectEqual(@as(u64, 5), counter.load(.monotonic));
     _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{12})));
     try testing.expect(!T.saw_progress);
+}
+
+test "plugin forward: a whole-prompt prefill hands the plugin the engine's span ends and checkpoint positions, and its checkpoint reaches the engine's list" {
+    const T = struct {
+        var spans: [4]u64 = @splat(0);
+        var n_spans: usize = 0;
+        var cps: [4]u64 = @splat(0);
+        var n_cps: usize = 0;
+        var filed: ?abi.Verdict = null;
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            n_spans = @min(f.prompt_spans.len, spans.len);
+            @memcpy(spans[0..n_spans], f.prompt_spans.slice()[0..n_spans]);
+            n_cps = @min(f.ssm_checkpoints.len, cps.len);
+            @memcpy(cps[0..n_cps], f.ssm_checkpoints.slice()[0..n_cps]);
+            if (n_cps > 0) if (f.cache_ops.?.checkpointOp()) |cp| {
+                filed = cp(f.caches.slice()[0], cps[0], .{});
+            };
+            return llama.table.forward(m, f, out);
+        }
+        const table: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.forward = &forward;
+            break :blk t;
+        };
+    };
+    const Sink = struct {
+        var pos: u64 = 0;
+        fn file(_: *anyopaque, p: u64, _: []const abi.LayerState) anyerror!void {
+            pos = p;
+        }
+    };
+    var b: Served = undefined;
+    try b.open(.{}, 0x5a17);
+    defer b.close();
+    b.xfm.plugin.?.table = &T.table;
+    var s: Slot = undefined;
+    try s.init(b.layers);
+    defer s.deinit();
+    var anchor: u8 = 0;
+    const sink: cache_ops.CheckpointSink = .{ .ctx = &anchor, .file = &Sink.file };
+    s.ctx.prompt_spans = &.{ 3, 5 };
+    s.ctx.ssm_cp_positions = &.{3};
+    s.ctx.cp_sink = &sink;
+    var g = ops.Graph.init(testing.allocator, fixture.stream());
+    defer g.deinit();
+    _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{ 7, 8, 9, 10, 11 })));
+    try testing.expectEqualSlices(u64, &.{ 3, 5 }, T.spans[0..T.n_spans]);
+    try testing.expectEqualSlices(u64, &.{3}, T.cps[0..T.n_cps]);
+    try testing.expect(T.filed != null and T.filed.?.isOk());
+    try testing.expectEqual(@as(u64, 3), Sink.pos);
+    // A decode step carries neither list.
+    _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, &.{12})));
+    try testing.expectEqual(@as(usize, 0), T.n_spans);
+    try testing.expectEqual(@as(usize, 0), T.n_cps);
+}
+
+test "plugin forward: a whole-prompt prefill's spans reach the plugin, and its generator keeps neither the plan nor the sink" {
+    const T = struct {
+        var n_spans: usize = 0;
+        var last_span: u64 = 0;
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            if (f.rows > 1) {
+                n_spans = f.prompt_spans.len;
+                if (n_spans > 0) last_span = f.prompt_spans.slice()[n_spans - 1];
+            }
+            return llama.table.forward(m, f, out);
+        }
+        const table: abi.ModelTable = blk: {
+            var t = llama.table;
+            t.forward = &forward;
+            break :blk t;
+        };
+    };
+    var b: Served = undefined;
+    try b.open(.{}, 0x5a18);
+    defer b.close();
+    b.xfm.plugin.?.table = &T.table;
+    b.xfm.config.plugin.?.parsed.caps.whole_prompt_prefill = true;
+    try b.xfm.resetCache();
+    var tok: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5 };
+    var gen = try Generator.initWithOptions(std.Io.Threaded.global_single_threaded.io(), testing.allocator, &b.xfm, &tok, &prompt, 2, .{ .temperature = 0.0 }, &.{}, .{});
+    defer gen.deinit(testing.allocator);
+    try testing.expect(T.n_spans > 0);
+    try testing.expectEqual(@as(u64, prompt.len), T.last_span);
+    // The plan and the sink live for the prefill's forward only; the generator's copy of the context outlives them.
+    try testing.expectEqual(@as(usize, 0), gen.ctx.prompt_spans.len);
+    try testing.expectEqual(@as(usize, 0), gen.ctx.ssm_cp_positions.len);
+    try testing.expect(gen.ctx.cp_sink == null);
 }
 
 test "plugin forward: an ablated request hands every forward and draft round its direction, a plain one none, a plugin without the cap refuses" {
