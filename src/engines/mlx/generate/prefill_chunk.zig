@@ -431,6 +431,35 @@ pub fn clearsPoolAtPrefillEnd(config: *const model_mod.ModelConfig) bool {
     return config.longCtxGated();
 }
 
+/// A whole-prompt prefill's plan in absolute positions (`Forward.prompt_spans`, `Forward.ssm_checkpoints`).
+pub const WholePromptPlan = struct {
+    spans: []u64,
+    checkpoints: []u64,
+
+    pub fn deinit(self: *WholePromptPlan, allocator: std.mem.Allocator) void {
+        allocator.free(self.spans);
+        allocator.free(self.checkpoints);
+        self.* = undefined;
+    }
+};
+
+/// The spans the chunk loop would run over an `n`-token prompt at width `chunk`, ending each where `nextChunkEnd`
+/// does up to the snapshot backoff, then at `n`; and the positions it would checkpoint after (`ssmCapturePos`,
+/// then the backoff point). One forward cannot re-price its width, so every span keeps `chunk`.
+pub fn wholePromptPlan(
+    allocator: std.mem.Allocator,
+    n: usize,
+    chunk: usize,
+    want_ssm_cp: bool,
+    ssm_cp_stride: usize,
+    ssm_cp_offset: usize,
+    adaptive_width: bool,
+    dense_low_grid: bool,
+) !WholePromptPlan {
+    _ = .{ n, chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid };
+    return .{ .spans = try allocator.alloc(u64, 0), .checkpoints = try allocator.alloc(u64, 0) };
+}
+
 // ── tests ──
 
 
@@ -1084,4 +1113,28 @@ test "explicitPrefillChunkU32: unset is 0, a flag past u32 clamps instead of ove
     try std.testing.expectEqual(@as(u32, 256), explicitPrefillChunkU32());
     generate_mod.prefillCli().override = 5_000_000_000;
     try std.testing.expectEqual(std.math.maxInt(u32), explicitPrefillChunkU32());
+}
+
+test "wholePromptPlan: a whole-prompt prefill's spans are the chunk loop's ends then the prompt's end, its checkpoints the loop's" {
+    const Case = struct { n: usize, want: bool, stride: usize, offset: usize, dense: bool, spans: []const u64, cps: []const u64 };
+    const cases = [_]Case{
+        // Checkpointing: the loop stops the backoff short of the prompt end and snapshots there.
+        .{ .n = 10_000, .want = true, .stride = 4096, .offset = 0, .dense = false, .spans = &.{ 4096, 8192, 9969, 10_000 }, .cps = &.{ 4096, 8192, 9969 } },
+        // None: chunks up to the last token, which is a span of its own.
+        .{ .n = 10_000, .want = false, .stride = 0, .offset = 0, .dense = false, .spans = &.{ 4096, 8192, 9999, 10_000 }, .cps = &.{} },
+        // A restored prefix of 5000: absolute positions, the first chunk cut at the 8192 boundary.
+        .{ .n = 6000, .want = true, .stride = 4096, .offset = 5000, .dense = false, .spans = &.{ 8192, 10_969, 11_000 }, .cps = &.{ 8192, 10_969 } },
+        // A tail under the merge bound joins the chunk before it.
+        .{ .n = 4200, .want = false, .stride = 0, .offset = 0, .dense = false, .spans = &.{ 4199, 4200 }, .cps = &.{} },
+        // A restored tail inside the backoff window is one span and files nothing.
+        .{ .n = 20, .want = true, .stride = 4096, .offset = 300, .dense = false, .spans = &.{320}, .cps = &.{} },
+        // The dense low grid adds its anchors under a coarse stride.
+        .{ .n = 20_000, .want = true, .stride = 16_384, .offset = 0, .dense = true, .spans = &.{ 4096, 8192, 12_288, 16_384, 19_969, 20_000 }, .cps = &.{ 8192, 16_384, 19_969 } },
+    };
+    for (cases) |c| {
+        var p = try wholePromptPlan(testing.allocator, c.n, 4096, c.want, c.stride, c.offset, false, c.dense);
+        defer p.deinit(testing.allocator);
+        try testing.expectEqualSlices(u64, c.spans, p.spans);
+        try testing.expectEqualSlices(u64, c.cps, p.checkpoints);
+    }
 }

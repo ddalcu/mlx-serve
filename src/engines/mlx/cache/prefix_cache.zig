@@ -12137,3 +12137,50 @@ test "shutdown counts published module records" {
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
     try testing.expect(hc.disk.?.entryWholeOnDisk(id));
 }
+
+const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
+const engine_cache_ops = @import("../kv/cache_ops.zig");
+
+// Bar: a checkpoint that a whole-prompt plugin stores restores the slot state that the chunk loop's own checkpoint does.
+test "HotPrefixCache: a whole-prompt plugin's checkpoint, stored through CacheOps.checkpoint, restores the slot state the chunk loop's checkpoint does" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const next = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 70, 71, 72 };
+    // The slot after 6 tokens: a conv and scan layer, a conv-only layer and an attention layer.
+    var live = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&live);
+    const states = [_]plugin_abi.LayerState{
+        .{ .layer = 0, .conv = .{ .ctx = live[0].conv_state.ctx }, .ssm = .{ .ctx = live[0].ssm_state.ctx } },
+        .{ .layer = 1, .conv = .{ .ctx = live[1].conv_state.ctx } },
+    };
+    var restored: [2][3]SSMCacheEntry = .{ pcEmptySsm(), pcEmptySsm() };
+    defer for (&restored) |*r| pcFreeHybrid(r);
+    for (&restored, 0..) |*r, arm| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, prompt.len);
+        var list: std.ArrayList(SSMCheckpoint) = .empty;
+        defer list.deinit(testing.allocator);
+        if (arm == 0) {
+            // The chunk loop: its own capture of the slot at 6.
+            try list.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 6, s));
+        } else {
+            // A whole-prompt plugin: the same states at the planned position, through the slot's CacheOps.
+            var pc: PromptCheckpoints = .{ .allocator = testing.allocator, .list = &list, .positions = &.{6}, .layers = 3, .s = s };
+            const sink = pc.sink();
+            var slot: engine_cache_ops.Slot = .{ .kv = &cache, .checkpoints = &sink };
+            const op = engine_cache_ops.ops.checkpointOp() orelse return error.TestExpectedCheckpointOp;
+            try testing.expect(op(slot.handle(), 6, .of(&states)).isOk());
+        }
+        _ = try hc.commitWithState(&cache, &prompt, false, &.{}, try list.toOwnedSlice(testing.allocator), null, null);
+        var kv = try KVCache.init(testing.allocator, 3);
+        defer kv.deinit();
+        var off: usize = 0;
+        const hit = try hc.lookupAndRestore(&kv, &off, r, s, &next, false, &.{}, null, null);
+        try testing.expectEqual(@as(usize, 6), hit.matched);
+    }
+    try testing.expectEqualStrings("", try pcSsmDiffField(s, &restored[0], &restored[1]));
+}

@@ -21,6 +21,12 @@ pub const Entry = struct {
     spec_prework: Prework = .{},
 };
 
+/// Where a whole-prompt prefill's `CacheOps.checkpoint` calls go: the engine's list for that prefill, set on its slot.
+pub const CheckpointSink = struct {
+    ctx: *anyopaque,
+    file: *const fn (ctx: *anyopaque, pos: u64, states: []const abi.LayerState) anyerror!void,
+};
+
 pub fn For(comptime E: type) type {
     return struct {
         /// What a `Handle` points at: one slot's KV cache and its recurrent entries (one per layer, or none).
@@ -35,6 +41,8 @@ pub fn For(comptime E: type) type {
             /// Set on every slot of a batched tick whose engine keeps the batch's recurrent state merged across ticks
             /// (one entry per layer, rows in slot order): `state_rows` / `set_state_rows` read and write it whole.
             merged: []E = &.{},
+            /// Set on a whole-prompt prefill's slot when the engine wants its checkpoints; null = refused.
+            checkpoints: ?*const CheckpointSink = null,
 
             pub fn handle(self: *Slot) abi.Handle {
                 return @ptrCast(self);

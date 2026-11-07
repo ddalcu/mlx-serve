@@ -535,6 +535,8 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `embeds` | `Array` | `.{}` | Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`); empty = embed the ids. |
 | `progress` | `?*u64` | `null` | A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching. |
 | `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
+| `prompt_spans` | `Span(u64)` | `.{}` | A whole-prompt prefill (`Caps.whole_prompt_prefill`): the absolute positions where the engine's chunk loop would end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
+| `ssm_checkpoints` | `Span(u64)` | `.{}` | The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending, each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it. |
 
 ### `Ablation` (extern struct)
 
@@ -622,6 +624,17 @@ A recurrent layer's states: the convolution window and the scan state, and what 
 | `prework_v` | |  |
 | `prework_gb` | |  |
 
+### `LayerState` (extern struct)
+
+One recurrent layer's state after a checkpoint position (`CacheOps.checkpoint`): the convolution window `[B, K-1, C]` and the scan state `[B, Hv, Dv, Dk]`, borrowed for the call. As an array element, this layout is frozen for ABI version 1.
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `size` | `u32` | `@sizeOf(LayerState)` |  |
+| `layer` | `u32` | `0` |  |
+| `conv` | `Array` | `.{}` |  |
+| `ssm` | `Array` | `.{}` |  |
+
 ### `CacheOps` (extern struct)
 
 The engine's calls on a slot's cache (`Handle`), handed in `Forward.cache_ops`: blocks append and read KV and recurrent state through it and never see the engine's types. Every `Array` passed in stays the caller's.
@@ -640,6 +653,7 @@ The engine's calls on a slot's cache (`Handle`), handed in `Forward.cache_ops`: 
 | `state_rows` | `*const fn (caches: [*]const Handle, n: u32, layer: u32, slot: StateSlot, s: Stream) callconv(.c) Array` |  | Layer `layer`'s `slot` over `caches[0..n]`, stacked on the batch axis (axis 1 for `.state_seq`): a new reference the caller frees; a null array when any cache holds none yet. An engine that keeps a batch's states merged across ticks hands its group's array, with no concat. |
 | `set_state_rows` | `*const fn (caches: [*]const Handle, n: u32, layer: u32, slot: StateSlot, value: Array, s: Stream) callconv(.c) Verdict` |  | Replaces layer `layer`'s `slot` of `caches[0..n]` with the rows of `value` (the engine takes its own reference). A merged group keeps `value` whole and splits a row out only when that cache is read alone or leaves the group. |
 | `sdk_slots` | `bool` | `false` | Each handle is an SDK `cache_ops.Slot` (`sdk/kv/cache_ops.zig`), which an in-tree model may read directly. A flag, not the table's address: every compile unit holds its own copy of the table. |
+| `checkpoint` | `?*const fn (cache: Handle, pos: u64, states: Span(LayerState)) callconv(.c) Verdict` | `null` | A whole-prompt prefill's checkpoint: the named layers' states after `pos` tokens, `pos` the next position of `Forward.ssm_checkpoints`. The engine files its own copies; a layer not named keeps none. Null = not served. |
 
 ### `Round` (extern struct)
 
