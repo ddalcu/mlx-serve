@@ -9892,6 +9892,13 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
         try testing.expectEqual(dt, Seen.dt);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
     }
+    // dist N-rank: past two ranks a bf16 part sums in f32 too, so the group's sum still rounds once.
+    m.tp = .{ .rank = 0, .size = 4 };
+    for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
+        const y = try tpSum(&sc, &m, try sc.zeros(&.{ 2, 64 }, dt));
+        try testing.expectEqual(mlx.mlx_dtype.float32, Seen.dt);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
+    }
 }
 
 test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps the head as the pack ships it" {
