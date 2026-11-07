@@ -61,6 +61,7 @@ pub fn For(comptime E: type) type {
             .state_rows = stateRows,
             .set_state_rows = setStateRows,
             .sdk_slots = true,
+            .checkpoint = checkpoint,
         };
 
         const Rows = @import("../util/state_rows.zig").Rows(state, setState);
@@ -178,6 +179,12 @@ pub fn For(comptime E: type) type {
             const sl = slotOf(h);
             if (layer >= sl.ssm.len) return abi.Verdict.refuse(.unsupported, "layer has no recurrent state");
             put(&sl.ssm[layer], which, value);
+            return .ok;
+        }
+
+        fn checkpoint(h: abi.Handle, pos: u64, states: abi.Span(abi.LayerState)) callconv(.c) abi.Verdict {
+            const sink = slotOf(h).checkpoints orelse return abi.Verdict.refuse(.unsupported, "this forward files no checkpoints");
+            sink.file(sink.ctx, pos, states.slice()) catch |e| return failed(e);
             return .ok;
         }
 

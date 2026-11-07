@@ -456,8 +456,25 @@ pub fn wholePromptPlan(
     adaptive_width: bool,
     dense_low_grid: bool,
 ) !WholePromptPlan {
-    _ = .{ n, chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid };
-    return .{ .spans = try allocator.alloc(u64, 0), .checkpoints = try allocator.alloc(u64, 0) };
+    var spans: std.ArrayList(u64) = .empty;
+    errdefer spans.deinit(allocator);
+    var cps: std.ArrayList(u64) = .empty;
+    errdefer cps.deinit(allocator);
+    const prefix_len = n -| 1;
+    const loop_end = prefix_len - ssmSnapshotBackoff(want_ssm_cp, prefix_len, ssm_cp_offset > 0);
+    var pos: usize = 0;
+    while (pos < loop_end) {
+        const end = nextChunkEnd(pos, loop_end, chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, adaptive_width, dense_low_grid);
+        try spans.append(allocator, end + ssm_cp_offset);
+        if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, end + ssm_cp_offset, dense_low_grid)) try cps.append(allocator, end + ssm_cp_offset);
+        pos = end;
+    }
+    if (want_ssm_cp and loop_end > 0 and (cps.items.len == 0 or cps.items[cps.items.len - 1] != loop_end + ssm_cp_offset))
+        try cps.append(allocator, loop_end + ssm_cp_offset);
+    if (n > loop_end) try spans.append(allocator, n + ssm_cp_offset);
+    const span_slice = try spans.toOwnedSlice(allocator);
+    errdefer allocator.free(span_slice);
+    return .{ .spans = span_slice, .checkpoints = try cps.toOwnedSlice(allocator) };
 }
 
 // ── tests ──

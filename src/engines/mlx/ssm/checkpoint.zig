@@ -170,8 +170,36 @@ pub const PromptCheckpoints = struct {
     }
 
     pub fn file(self: *PromptCheckpoints, pos: u64, states: []const abi.LayerState) !void {
-        _ = .{ self, pos, states };
-        return error.CheckpointNotPlanned;
+        if (self.next >= self.positions.len or pos != self.positions[self.next]) return error.CheckpointNotPlanned;
+        for (states) |st| {
+            if (st.size != @sizeOf(abi.LayerState)) return error.CheckpointLayerState;
+            if (st.layer >= self.layers) return error.CheckpointLayer;
+        }
+        const layers = try self.allocator.alloc(SSMCacheEntrySnapshot, self.layers);
+        for (layers) |*l| l.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        var cp: SSMCheckpoint = .{ .pos = @intCast(pos), .layers = layers };
+        errdefer cp.deinit(self.allocator);
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (states) |st| {
+            const l = &layers[st.layer];
+            for ([_]struct { src: abi.Array, dst: *mlx.mlx_array }{ .{ .src = st.conv, .dst = &l.conv_state }, .{ .src = st.ssm, .dst = &l.ssm_state } }) |f| {
+                if (f.src.ctx == null) continue;
+                const copy = try materializedOwnedCopy(self.s, .{ .ctx = f.src.ctx });
+                _ = mlx.mlx_array_free(f.dst.*);
+                f.dst.* = copy;
+                _ = mlx.mlx_vector_array_append_value(vec, copy);
+            }
+            l.initialized = true;
+        }
+        // The copies evaluate in one batch, so no checkpoint keeps the forward's graph alive.
+        _ = mlx.mlx_eval(vec);
+        try self.list.append(self.allocator, cp);
+        self.next += 1;
+        if (self.max > 0 and self.list.items.len > self.max) {
+            var dropped = self.list.orderedRemove(ssmCheckpointDropIndexLowAnchored(self.list.items, self.thin, null, self.low_anchors));
+            dropped.deinit(self.allocator);
+        }
     }
 };
 

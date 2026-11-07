@@ -461,7 +461,7 @@ fn evalEvery(cfg: *const ModelConfig, positions: Positions, rows: u32, total_kv:
 }
 
 fn slotFor(xfm: *const Transformer, ctx: *const ForwardCtx) cache_ops.Slot {
-    return .{ .kv = ctx.cache, .ssm = ctx.ssm_entries orelse &.{}, .packed_reads = ctx.kv_attn_fused, .batched_append = xfm.batched_kv_append_override orelse true };
+    return .{ .kv = ctx.cache, .ssm = ctx.ssm_entries orelse &.{}, .packed_reads = ctx.kv_attn_fused, .batched_append = xfm.batched_kv_append_override orelse true, .checkpoints = ctx.cp_sink };
 }
 
 fn freeOut(out: *const abi.ForwardOut, captured: []const abi.Array) void {
@@ -593,6 +593,8 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .embeds = .{ .ctx = if (ctx.step_embeds) |e| e.ctx else null },
         .progress = if (mode != .prefill) null else if (ctx.prefill_progress) |p| &p.raw else null,
         .ablation = ablation,
+        .prompt_spans = if (mode == .prefill) .of(ctx.prompt_spans) else .{},
+        .ssm_checkpoints = if (mode == .prefill) .of(ctx.ssm_cp_positions) else .{},
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

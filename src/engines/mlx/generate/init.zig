@@ -52,6 +52,10 @@ const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
+const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
+const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
+const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
+const CheckpointSink = @import("../kv/cache_ops.zig").CheckpointSink;
 const intree = @import("../plugin/intree.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 
@@ -772,6 +776,31 @@ pub fn initWithOptions(
         ctx.prefill_progress = options.prefill_progress;
     }
     defer ctx.prefill_progress = null;
+    // It is handed the spans and checkpoint positions the chunk loop would have run, and files its checkpoints onto the
+    // loop's list through `CacheOps.checkpoint`.
+    var whole_plan: ?WholePromptPlan = null;
+    defer if (whole_plan) |*wp| wp.deinit(allocator);
+    var prompt_cps: PromptCheckpoints = undefined;
+    var prompt_cp_sink: CheckpointSink = undefined;
+    if (final_start == 0 and tail_len > 1) {
+        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid);
+        ctx.prompt_spans = whole_plan.?.spans;
+        if (whole_plan.?.checkpoints.len > 0) {
+            prompt_cps = .{
+                .allocator = allocator,
+                .list = &ssm_checkpoints,
+                .positions = whole_plan.?.checkpoints,
+                .layers = ctx.ssm_entries.?.len,
+                .s = xfm.s,
+                .max = options.ssm_checkpoint_max,
+                .thin = if (xfm.config.longCtxGated()) .min_span_recency else .oldest,
+                .low_anchors = options.ssm_low_anchors,
+            };
+            prompt_cp_sink = prompt_cps.sink();
+            ctx.ssm_cp_positions = whole_plan.?.checkpoints;
+            ctx.cp_sink = &prompt_cp_sink;
+        }
+    }
     const raw_logits = if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
@@ -779,6 +808,10 @@ pub fn initWithOptions(
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
     } else try xfm.forwardWith(&ctx, last_input);
+    // The plan and the sink are this forward's: the generator below keeps a copy of `ctx`.
+    ctx.prompt_spans = &.{};
+    ctx.ssm_cp_positions = &.{};
+    ctx.cp_sink = null;
     // History entries for the held-back span: (hidden[j], token[j+1]) for
     // j in [final_start, prefix_len) — same pairing as the chunk loop.
     // The last row's pair (hidden[last], t1) is appended by the first
