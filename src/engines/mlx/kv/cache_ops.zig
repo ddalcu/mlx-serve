@@ -6,10 +6,12 @@ const abi = @import("../../../abi/plugin.zig");
 const KVCache = @import("cache.zig").KVCache;
 const KVQuantConfig = @import("../cache/kv_quant.zig").KVQuantConfig;
 const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
-const adapter = @import("../../../sdk/kv/cache_ops.zig").For(SSMCacheEntry);
+const sdk_cache_ops = @import("../../../sdk/kv/cache_ops.zig");
+const adapter = sdk_cache_ops.For(SSMCacheEntry);
 
 pub const Slot = adapter.Slot;
 pub const ops = adapter.ops;
+pub const CheckpointSink = sdk_cache_ops.CheckpointSink;
 
 fn mx(a: abi.Array) mlx.mlx_array {
     return .{ .ctx = a.ctx };
@@ -69,4 +71,31 @@ test "bases cache ops: a quantized KVCache's view carries its triples" {
     try testing.expect(out.k_q.ctx != null and out.v_biases.ctx != null and out.capacity >= 3);
     try testing.expectEqualSlices(c_int, &.{ 1, 2, 3, 64 }, mlx.getShape(mx(out.k)));
     try testing.expectEqual(@as(u64, 3), ops.len(sl.handle(), 0));
+}
+
+// Bar: a whole-prompt checkpoint reaches the slot's sink with its position and states; without a sink it is refused.
+test "bases cache ops: a whole-prompt checkpoint goes to the slot's sink, and is refused without one" {
+    const Sink = struct {
+        var pos: u64 = 0;
+        var layers: [2]u32 = .{ 0, 0 };
+        var n: usize = 0;
+        fn file(_: *anyopaque, p: u64, states: []const abi.LayerState) anyerror!void {
+            pos = p;
+            n = states.len;
+            for (states, 0..) |st, i| layers[i] = st.layer;
+        }
+    };
+    var c = try KVCache.init(testing.allocator, 3);
+    defer c.deinit();
+    var anchor: u8 = 0;
+    const sink: CheckpointSink = .{ .ctx = &anchor, .file = &Sink.file };
+    var bare: Slot = .{ .kv = &c };
+    var wired: Slot = .{ .kv = &c, .checkpoints = &sink };
+    const op = ops.checkpointOp() orelse return error.TestExpectedCheckpointOp;
+    const states = [_]abi.LayerState{ .{ .layer = 0 }, .{ .layer = 2 } };
+    try testing.expect(!op(bare.handle(), 4096, .of(&states)).isOk());
+    try testing.expect(op(wired.handle(), 4096, .of(&states)).isOk());
+    try testing.expectEqual(@as(u64, 4096), Sink.pos);
+    try testing.expectEqual(@as(usize, 2), Sink.n);
+    try testing.expectEqualSlices(u32, &.{ 0, 2 }, &Sink.layers);
 }
