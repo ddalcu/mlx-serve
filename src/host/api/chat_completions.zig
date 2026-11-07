@@ -1214,23 +1214,7 @@ fn handleNonStreamingGeneration(
             defer allocator.free(tc_timings_field);
 
             const tc_reasoning_tokens = if (tc_think_split.reasoning_content) |reasoning| countTextTokens(allocator, lm, tok, reasoning) else 0;
-            const tc_usage_obj = try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, tc_reasoning_tokens);
-            defer allocator.free(tc_usage_obj);
-
-            const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
-            , .{
-                nowMs(stream.io),
-                nowSecs(stream.io),
-                model_name,
-                tc_content_json,
-                tc_reasoning_json,
-                tc_buf.items,
-                toolCallFinishReason(finish_reason),
-                finishDetailsField(toolCallFinishReason(finish_reason), result.finish_details),
-                tc_usage_obj,
-                tc_timings_field,
-            });
+            const response = try formatToolCallReply(allocator, stream.io, model_name, .{ .content = tc_content_json, .reasoning = tc_reasoning_json, .tool_calls = tc_buf.items }, finish_reason, result, tc_reasoning_tokens, tc_timings_field);
             defer allocator.free(response);
             try sendResponse(stream, "200 OK", "application/json", response);
             return;
@@ -1341,4 +1325,37 @@ fn handleNonStreamingGeneration(
     defer allocator.free(response);
 
     try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+/// The non-stream reply that called tools. `message` is encoded already: the content value, the `reasoning_content`
+/// field or "", the tool_calls array.
+fn formatToolCallReply(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    model_name: []const u8,
+    message: struct { content: []const u8, reasoning: []const u8, tool_calls: []const u8 },
+    finish_reason: []const u8,
+    result: request_mod.GenerationResult,
+    reasoning_tokens: u32,
+    timings_field: []const u8,
+) ![]u8 {
+    const usage = try formatChatUsageWithReasoning(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, reasoning_tokens);
+    defer allocator.free(usage);
+    const finish = toolCallFinishReason(finish_reason);
+    return std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s},"tool_calls":{s}}},"finish_reason":"{s}"{s}}}],"usage":{s}{s}}}
+    , .{ nowMs(io), nowSecs(io), model_name, message.content, message.reasoning, message.tool_calls, finish, finishDetailsField(finish, result.finish_details), usage, timings_field });
+}
+
+// ── tests ──
+
+test "a tool-call reply's usage reports its reasoning tokens" {
+    const testing = std.testing;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const result: request_mod.GenerationResult = .{ .text = &.{}, .token_ids = &.{}, .prompt_tokens = 1000, .completion_tokens = 50, .finish_reason = "stop", .prefill_tps = 0, .decode_tps = 0 };
+    const json = try formatToolCallReply(a, testing.io, "m", .{ .content = "null", .reasoning = "", .tool_calls = "[]" }, "stop", result, 40, "");
+    const usage = (try std.json.parseFromSliceLeaky(std.json.Value, a, json, .{})).object.get("usage").?.object;
+    try testing.expectEqual(@as(?i64, 40), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
 }

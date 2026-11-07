@@ -47,7 +47,6 @@ const SSE_ALLOW_HEADERS_DEFAULT = @import("../http/respond.zig").SSE_ALLOW_HEADE
 const sendSseHeaders = @import("../http/respond.zig").sendSseHeaders;
 const logHttpSseData = @import("../http/respond.zig").logHttpSseData;
 const utf8TrailingIncomplete = @import("format.zig").utf8TrailingIncomplete;
-const formatChatUsage = @import("format.zig").formatChatUsage;
 const formatChatUsageWithReasoning = @import("format.zig").formatChatUsageWithReasoning;
 const formatTimingsObject = @import("format.zig").formatTimingsObject;
 const formatPerfBracket = @import("format.zig").formatPerfBracket;
@@ -1031,10 +1030,8 @@ pub fn handleStreamingGeneration(
         defer allocator.free(timings_obj);
         // Usage chunk only if requested via stream_options.include_usage. Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
-        const reasoning_tokens: u32 = @intCast(@as(usize, @intCast(think_tokens)) + reasoning_tokens_sent);
-        const usage_json: ?[]u8 = if (include_usage) try formatChatUsageWithReasoning(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, reasoning_tokens) else null;
-        defer if (usage_json) |u| allocator.free(u);
-        try sendStreamTail(allocator, stream, chat_id, model_name, .{ .reason = finish_reason, .details = ts.finish_details }, try lps.take(), usage_json, if (timings_obj.len > 0) timings_obj else null);
+        const usage: ?StreamUsage = if (include_usage) .{ .prompt = total_prompt, .completion = ts.completion_tokens, .cached = ts.cached_tokens, .reasoning = @intCast(@as(usize, @intCast(think_tokens)) + reasoning_tokens_sent) } else null;
+        try sendStreamTail(allocator, stream, chat_id, model_name, .{ .reason = finish_reason, .details = ts.finish_details }, try lps.take(), usage, if (timings_obj.len > 0) timings_obj else null);
     }
 
     // Per-slot timings come from the scheduler (ts.prefill_ns / ts.decode_ns,
@@ -1046,7 +1043,9 @@ pub fn handleStreamingGeneration(
     });
 }
 
-/// The stream's end: the finish_reason chunk, the usage chunk when `usage_json` is set, then `[DONE]`.
+const StreamUsage = struct { prompt: u32, completion: u32, cached: u32, reasoning: u32 };
+
+/// The stream's end: the finish_reason chunk, the usage chunk when `usage` is set, then `[DONE]`.
 /// Timings ship once: on the usage chunk when one follows, else on the finish chunk (llama.cpp's
 /// shape), so proxies that meter rates (llama-swap) read them without the client opting into usage.
 fn sendStreamTail(
@@ -1056,15 +1055,19 @@ fn sendStreamTail(
     model_name: []const u8,
     finish: struct { reason: []const u8, details: ?[]const u8 },
     logprobs_json: ?[]const u8,
-    usage_json: ?[]const u8,
+    usage: ?StreamUsage,
     timings: ?[]const u8,
 ) !void {
-    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish.reason, .details = finish.details }, null, if (usage_json == null) timings else null, .{ .logprobs_json = logprobs_json });
+    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, .{ .reason = finish.reason, .details = finish.details }, null, if (usage == null) timings else null, .{ .logprobs_json = logprobs_json });
     // OpenAI ships the usage chunk with an EMPTY choices array — restating
     // finish_reason/finish_details here made every per-event client render
     // the ending twice ('s doubled truncation banner). Pending
     // logprobs all drained on the finish chunk above.
-    if (usage_json) |u| try sendSSEUsageChunk(allocator, stream, chat_id, model_name, u, timings);
+    if (usage) |u| {
+        const usage_json = try formatChatUsageWithReasoning(allocator, u.prompt, u.completion, u.cached, u.reasoning);
+        defer allocator.free(usage_json);
+        try sendSSEUsageChunk(allocator, stream, chat_id, model_name, usage_json, timings);
+    }
     logHttpSseData("[DONE]");
     try stream.writeAll("data: [DONE]\n\n");
 }
@@ -1083,12 +1086,12 @@ test "a streamed turn's result keeps the prompt-cache hit and timings the slot m
 }
 
 /// The SSE `data:` payloads `sendStreamTail` writes, as parsed JSON (`[DONE]` dropped).
-fn testStreamTail(a: std.mem.Allocator, usage_json: ?[]const u8, timings: ?[]const u8) ![]std.json.Value {
+fn testStreamTail(a: std.mem.Allocator, usage: ?StreamUsage, timings: ?[]const u8) ![]std.json.Value {
     const raw = try capture(a, struct {
-        fn run(conn: *Conn, al: std.mem.Allocator, u: ?[]const u8, t: ?[]const u8) !void {
+        fn run(conn: *Conn, al: std.mem.Allocator, u: ?StreamUsage, t: ?[]const u8) !void {
             try sendStreamTail(al, conn, 1, "m", .{ .reason = "stop", .details = null }, null, u, t);
         }
-    }.run, .{ a, usage_json, timings });
+    }.run, .{ a, usage, timings });
     var events = std.ArrayList(std.json.Value).empty;
     var it = std.mem.tokenizeSequence(u8, raw, "\n\n");
     while (it.next()) |ev| {
@@ -1110,8 +1113,7 @@ test "a chat stream's timings ride the finish chunk without include_usage, and o
     try testing.expectEqualStrings("stop", plain[0].object.get("choices").?.array.items[0].object.get("finish_reason").?.string);
     try testing.expectEqual(@as(f64, 50), plain[0].object.get("timings").?.object.get("predicted_per_second").?.float);
 
-    const usage = try formatChatUsage(a, 1000, 50, 0, "");
-    const with_usage = try testStreamTail(a, usage, timings);
+    const with_usage = try testStreamTail(a, .{ .prompt = 1000, .completion = 50, .cached = 0, .reasoning = 0 }, timings);
     try testing.expectEqual(@as(usize, 2), with_usage.len);
     try testing.expect(with_usage[0].object.get("timings") == null);
     try testing.expectEqual(@as(usize, 0), with_usage[1].object.get("choices").?.array.items.len);
@@ -1122,7 +1124,7 @@ test "a chat stream's usage chunk reports its reasoning tokens" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const events = try testStreamTail(a, try formatChatUsageWithReasoning(a, 1000, 50, 0, 40), null);
+    const events = try testStreamTail(a, .{ .prompt = 1000, .completion = 50, .cached = 0, .reasoning = 40 }, null);
     try testing.expectEqual(@as(usize, 2), events.len);
     const usage = events[1].object.get("usage").?.object;
     try testing.expectEqual(@as(?i64, 40), if (usage.get("completion_tokens_details")) |d| d.object.get("reasoning_tokens").?.integer else null);
