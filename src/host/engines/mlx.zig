@@ -68,10 +68,11 @@ pub const Api = struct {
     plugin_stub: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8) ?PluginStub,
     gauges: *const fn (*Gauges) void,
     /// The Thunderbolt cluster: `mlx-serve dist-worker`, `dist-probe`, and the host side's `--dist` connect
-    /// (`mode` is the cluster's `Mode` tag).
+    /// (`mode` is the cluster's `Mode` tag; `size` Macs in the group, rank 0 included; `join_timeout_s` how long the
+    /// group model's load waits for the workers, null = the size's default).
     cluster_worker: *const fn (std.Io, std.mem.Allocator, []const []const u8) Err,
     cluster_probe: *const fn (std.Io, []const []const u8) Err,
-    cluster_connect: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, u8, []const u8, ?u32) Err,
+    cluster_connect: *const fn (std.Io, std.mem.Allocator, []const u8, []const u8, u8, []const u8, ?u32, u32, ?u32) Err,
     /// `--prompt` without `--serve`: one generation on the calling thread.
     run_offline: *const fn (*const Offline) Err,
     // ── process-wide engine settings, set once from the launch flags

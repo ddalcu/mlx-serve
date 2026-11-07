@@ -682,7 +682,17 @@ inline fn cluster() *ClusterState {
 
 /// The group this server leads (`--dist`): set at startup, while a thread waits
 /// for the worker to join; the handshake runs when the group's model loads.
-const Group = struct { io: std.Io, allocator: std.mem.Allocator, mode: Mode, model: []const u8, split: ?u32 };
+const Group = struct {
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    mode: Mode,
+    model: []const u8,
+    split: ?u32,
+    /// Macs in the group, rank 0 included.
+    size: u32 = 2,
+    /// How long the group model's load waits for every worker to join (0: it fails at once, a pair's way).
+    join_timeout_s: u32 = 0,
+};
 /// The worker's bell connection closed: it left, and JACCL forms a group once per process,
 /// so this server must restart to pair again (the app does it, `/props` cluster "worker_gone").
 var worker_gone = std.atomic.Value(bool).init(false);
@@ -799,7 +809,7 @@ pub fn hostShare(model_dir: []const u8, config: *const model_mod.ModelConfig, wh
     const g = cluster().group.?;
     const n: u64 = config.num_hidden_layers;
     if (n == 0) return whole;
-    if (peer()) |p| if (p.planned) return if (p.mode == .tensor) whole / 2 + whole / 10 else whole * p.span.len() / n;
+    if (peer()) |p| if (p.planned) return if (p.mode == .tensor) whole / g.size + whole / 10 else whole * p.span.len() / n;
     return shareFor(g, config, whole, status.getAvailableMemBytes() >> 20, worker_free_mib.load(.acquire));
 }
 
@@ -807,13 +817,13 @@ fn shareFor(g: Group, config: *const model_mod.ModelConfig, whole: u64, mine: u6
     const n: u64 = config.num_hidden_layers;
     if (theirs == 0) return whole;
     if (config.isDsv41()) {
-        if (g.mode == .tensor) return whole / 2 + whole / 10;
+        if (g.mode == .tensor) return whole / g.size + whole / 10;
         const r = dsv41_mod.pairRange(config, mine, theirs) orelse return whole;
         return whole * (n - (r[1] - r[0])) / n;
     }
     if (!config.isQwen4()) return whole;
     return switch (g.mode) {
-        .tensor => whole / 2 + whole / 10,
+        .tensor => whole / g.size + whole / 10,
         .rows => whole,
         .pipeline => whole * (g.split orelse chooseSplit(@intCast(n), config.full_attention_interval, mine, theirs)) / n,
     };
@@ -866,6 +876,7 @@ fn rowsPair(model_dir: []const u8, hidden: i32, blocks: i32) anyerror!h3_split.P
 
 /// Rows mode: the worker told to load the group's video model whole, and ready.
 fn planRows(model_dir: []const u8, hidden: i32, blocks: i32) !*Peer {
+    if (cluster().group.?.size > 2) return error.DistNeedsPair; // the rows wire talks to rank 1 alone
     const p = try join();
     if (!p.planned) {
         p.mode = .rows;
@@ -904,7 +915,22 @@ fn join() !*Peer {
     return &cluster().peer_slot.?;
 }
 
+/// Whether `size` Macs can serve `config` in `mode`: past a pair only DeepSeek-V4.1's tensor split (every other wire
+/// talks to rank 1 alone), and a tensor split only of the dimensions `size` divides. Checked before the plan goes out.
+fn groupFits(mode: Mode, config: *const model_mod.ModelConfig, size: u32) !void {
+    if (size > 2 and !(mode == .tensor and config.isDsv41())) {
+        log.err("[dist] {d} Macs serve only DeepSeek-V4.1 with --dist tensor; {s} with --dist {s} pairs two\n", .{ size, config.model_type, @tagName(mode) });
+        return error.DistNeedsPair;
+    }
+    if (mode != .tensor) return;
+    if (config.shardUneven(size)) |dim| {
+        log.err("[dist] {d} Macs cannot split {s} of {s} evenly\n", .{ size, dim, config.model_type });
+        return error.DistShardUneven;
+    }
+}
+
 fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8) !void {
+    try groupFits(self.mode, config, cluster().group.?.size);
     if (config.isDsv41()) return planDsv41(self, config, model_dir);
     if (!config.isQwen4()) {
         log.err("[dist] {s}: this architecture ({s}) has no multi-Mac path yet\n", .{ self.model, config.model_type });
@@ -1286,13 +1312,37 @@ fn recvBytes(link: *const Link, out: []u8, src: u32) !void {
 /// Rank 0 at startup: waits for the worker on a thread of its own, so the server
 /// serves meanwhile. Only the RDMA link opens there; every message runs on the
 /// inference thread, when `model` loads (`planFor`).
-pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32) !void {
+pub fn connect(io: std.Io, allocator: std.mem.Allocator, cfg: Config, mode: Mode, model: []const u8, split: ?u32, join_timeout_s: ?u32) !void {
     if (comptime builtin.os.tag != .macos) return error.RdmaUnavailable; // a cluster exists only on macOS
+    try checkHost(cfg, mode);
     preferFastSynch();
-    cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split };
+    cluster().group = .{ .io = io, .allocator = allocator, .mode = mode, .model = try allocator.dupe(u8, model), .split = split, .size = cfg.size, .join_timeout_s = join_timeout_s orelse defaultJoinTimeout(cfg.size) };
     h3_split.hooks().* = .{ .serves = &serves, .plan_rows = &rowsPair, .note_job = &noteJob };
     const t = try std.Thread.spawn(.{ .stack_size = 1 << 20 }, waitForWorker, .{ io, cfg });
     t.detach();
+}
+
+/// A pair's load fails at once when the worker is absent (the app restarts it); a larger group waits ten minutes
+/// for its last Mac.
+fn defaultJoinTimeout(size: u32) u32 {
+    return if (size > 2) 600 else 0;
+}
+
+/// The host's flags, refused at startup rather than on the link's thread: the size, the mode past a pair, the device list.
+fn checkHost(cfg: Config, mode: Mode) !void {
+    if (cfg.size < 2 or cfg.size > max_ranks) {
+        log.err("[dist] --dist-size takes 2..{d} Macs, got {d}\n", .{ max_ranks, cfg.size });
+        return error.InvalidArgs;
+    }
+    if (cfg.size > 2 and mode != .tensor) {
+        log.err("[dist] --dist-size {d} needs --dist tensor (DeepSeek-V4.1): --dist {s} pairs two Macs\n", .{ cfg.size, @tagName(mode) });
+        return error.DistNeedsPair;
+    }
+    var buf: [1024]u8 = undefined;
+    _ = deviceMatrixJson(cfg, &buf) catch |err| {
+        log.err("[dist] --dist-device needs the port facing each of the {d} ranks in rank order, this Mac's own `-`: got \"{s}\"\n", .{ cfg.size, cfg.device });
+        return err;
+    };
 }
 
 /// The collectives run on the CPU stream between GPU work, and MLX's default fence waits on a command buffer at each
@@ -2239,6 +2289,30 @@ test "the leader bills only the layers it keeps of a model its pair splits" {
     try std.testing.expectEqual(@as(u64, 500), shareFor(g, &c, 800, 60, 40));
     // A worker that has not said how much it has: the whole model.
     try std.testing.expectEqual(@as(u64, 800), shareFor(g, &c, 800, 60, 0));
+}
+
+test "dist N-rank: each of four Macs bills a quarter of a tensor split, plus the same tenth" {
+    var c: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8 };
+    const g: Group = .{ .io = std.testing.io, .allocator = std.testing.allocator, .mode = .tensor, .model = "/m/V41", .split = null, .size = 4 };
+    try std.testing.expectEqual(@as(u64, 200 + 80), shareFor(g, &c, 800, 60, 40));
+    var pair = g;
+    pair.size = 2;
+    try std.testing.expectEqual(@as(u64, 400 + 80), shareFor(pair, &c, 800, 60, 40));
+    var q: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .num_hidden_layers = 8 };
+    try std.testing.expectEqual(@as(u64, 400 + 80), shareFor(pair, &q, 800, 60, 40));
+}
+
+test "dist N-rank: past a pair only DeepSeek-V4.1's tensor split forms a group, and only one its heads divide" {
+    var c: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8, .num_attention_heads = 64, .dsv4_o_groups = 8, .moe_intermediate_size = 2304 };
+    try groupFits(.tensor, &c, 2);
+    try groupFits(.tensor, &c, 4);
+    try groupFits(.pipeline, &c, 2);
+    try std.testing.expectError(error.DistShardUneven, groupFits(.tensor, &c, 3));
+    try std.testing.expectError(error.DistNeedsPair, groupFits(.pipeline, &c, 4));
+    try std.testing.expectError(error.DistNeedsPair, groupFits(.rows, &c, 4));
+    var q: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .num_hidden_layers = 8, .num_experts = 4, .moe_intermediate_size = 512 };
+    try groupFits(.tensor, &q, 2);
+    try std.testing.expectError(error.DistNeedsPair, groupFits(.tensor, &q, 4));
 }
 
 test "after the stop message rank 0 sends the worker nothing more" {
