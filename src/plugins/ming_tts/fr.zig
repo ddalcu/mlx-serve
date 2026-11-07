@@ -1,8 +1,8 @@
-//! French text normalization for MULTILINGUAL with language fr. Upstream
+//! French text normalization for MULTILINGUAL with language fr. The reference
 //! passes French text to the model untouched, so digits are left to the
 //! model, which reads "60" as "sixante" and "14h30" or "12,50 €" unreliably.
 //! This spells numbers out and flattens French typography before the text is
-//! cut into fragments. It is a deliberate departure from upstream.
+//! cut into fragments. It is a deliberate departure from the reference.
 //!
 //! Spelling: traditional (pre-1990) rules, because they are what most French
 //! text, and so most of the model's training text, uses: hyphens only between
@@ -392,7 +392,7 @@ fn romanDigit(c: u8) u64 {
     };
 }
 
-test "French cardinals, traditional spelling" {
+test "ming_tts fr: French cardinals, traditional spelling" {
     const a = std.testing.allocator;
     const cases = [_]struct { u64, []const u8 }{
         .{ 0, "zéro" },
@@ -439,7 +439,7 @@ test "French cardinals, traditional spelling" {
     }
 }
 
-test "French text normalization" {
+test "ming_tts fr: French text normalization" {
     const a = std.testing.allocator;
     const cases = [_][2][]const u8{
         .{ "Il a 60 ans.", "Il a soixante ans." },

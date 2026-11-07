@@ -20,7 +20,7 @@ pub const Cp = u21;
 pub const Cps = std.ArrayList(Cp);
 
 // ─────────────────────────────────────────────────────────────────────────
-// Errors with the upstream messages (HTTP 400 bodies)
+// Errors with the the reference messages (HTTP 400 bodies)
 // ─────────────────────────────────────────────────────────────────────────
 
 pub const Diag = struct {
@@ -1411,7 +1411,7 @@ pub fn isFrench(language_id: ?[]const u8) bool {
 }
 
 /// MULTILINGUAL fr/de/es: the cutter rewrites the punctuation it splits on
-/// to the Chinese full-width forms ("Bonjour à tous，voici …。"), as upstream
+/// to the Chinese full-width forms ("Bonjour à tous，voici …。"), as the reference
 /// does. Put the ASCII forms back (Latin-script languages only; Japanese
 /// keeps 、。).
 fn isLatinMultilingual(language_id: ?[]const u8) bool {
@@ -1490,7 +1490,7 @@ pub fn freeFragments(a: std.mem.Allocator, frags: *std.ArrayList(Fragment)) void
 /// follows it. A line break starts a new paragraph unless the line does not
 /// end a sentence and the next line starts with a lowercase letter (a hard
 /// wrap, joined with a space). Text without line breaks gives the same
-/// fragments as `prepareText`. Departs from upstream, which turns line breaks
+/// fragments as `prepareText`. Departs from the reference, which turns line breaks
 /// into spaces.
 pub fn prepareLongText(a: std.mem.Allocator, text_in: []const u8, language_id: ?[]const u8, max_len: usize) !std.ArrayList(Fragment) {
     var out: std.ArrayList(Fragment) = .empty;
@@ -1600,7 +1600,7 @@ pub const TaskInput = struct {
     language_id: ?[]const u8 = null,
     instruction: ?[]const u8 = null,
     controls: Controls = .{},
-    /// Control keys outside `Controls` (refused like upstream).
+    /// Control keys outside `Controls` (refused like the reference).
     unknown_controls: []const []const u8 = &.{},
     prompt_wav: ?[]const u8 = null,
     prompt_text: ?[]const u8 = null,
@@ -1741,7 +1741,7 @@ pub fn buildRequest(a: std.mem.Allocator, in: TaskInput, d: *Diag) !Request {
     };
     if (runtime == null) return d.set("Unsupported Ming TTS task '{s}'; expected one of ['BASIC', 'DIALECT', 'EMOTION', 'FREEFORM', 'IP', 'MULTILINGUAL', 'MULTILINGUAL_TTS', 'PLAIN', 'SEED', 'STYLE', 'TTS', 'VOICE_DESIGN']", .{task});
     var language_id = in.language_id;
-    if (std.mem.eql(u8, task, "DIALECT")) language_id = null; // upstream warns and drops it
+    if (std.mem.eql(u8, task, "DIALECT")) language_id = null; // the reference warns and drops it
     if ((std.mem.eql(u8, task, "MULTILINGUAL") or std.mem.eql(u8, task, "MULTILINGUAL_TTS")) and (language_id == null or isBlank(language_id.?)))
         return d.set("MULTILINGUAL requires language_id", .{});
     const text_s = strip(in.text);
@@ -1931,7 +1931,7 @@ fn isCombiningMark(cp: u21) bool {
         (cp >= 0x1161 and cp <= 0x11FF); // Hangul V/T jamo continue a syllable
 }
 
-test "nfc composes French, Vietnamese stacking, kana and Hangul" {
+test "ming_tts text: nfc composes French, Vietnamese stacking, kana and Hangul" {
     const a = std.testing.allocator;
     const cases = [_][2][]const u8{
         .{ "e\u{301}te\u{301} a\u{300} c\u{327}a o\u{302}", "été à ça ô" },
@@ -1954,7 +1954,7 @@ pub fn buildInputIds(a: std.mem.Allocator, tok: anytype, prompt: []const u8, tex
         fn add(al: std.mem.Allocator, t: anytype, list: *std.ArrayList(i32), s: []const u8) !void {
             // tokenizer.json declares an NFC normalizer that tokenizer.zig does
             // not apply; without it NFD input (e + U+0301, common from macOS
-            // paste) tokenizes differently from upstream.
+            // paste) tokenizes differently from the reference.
             const n = try nfc(al, s);
             defer al.free(n);
             const e = try t.encode(al, n);
@@ -1999,7 +1999,7 @@ pub fn buildInputIds(a: std.mem.Allocator, tok: anytype, prompt: []const u8, tex
     return .{ .ids = try ids.toOwnedSlice(a), .speaker_positions = try pos.toOwnedSlice(a), .latent_position = latent_pos };
 }
 
-test "numberToWords matches inflect" {
+test "ming_tts text: numberToWords matches inflect" {
     const a = std.testing.allocator;
     const cases = [_]struct { []const u8, bool, []const u8 }{
         .{ "1234", false, "one thousand, two hundred thirty-four" },
@@ -2085,7 +2085,7 @@ const stopwords = [_][]const []const u8{
     &.{ "el", "los", "las", "y", "es", "yo", "tu", "que", "no", "una", "con", "por", "para", "del", "se", "lo", "como", "pero", "hola", "buenos", "hoy", "muy", "est*", "vamos", "hace" },
 };
 
-test "detectLanguage" {
+test "ming_tts text: detectLanguage" {
     const cases = [_]struct { []const u8, ?[]const u8 }{
         .{ "Bonjour à tous, voici un essai de voix en français.", "fr" },
         .{ "Il a soixante ans et il est arrivé hier.", "fr" },
@@ -2103,7 +2103,7 @@ test "detectLanguage" {
     }
 }
 
-test "buildRequest routes detected fr/de/es/ja/ko text off the zh/en path" {
+test "ming_tts text: buildRequest routes detected fr/de/es/ja/ko text off the zh/en path" {
     const a = std.testing.allocator;
     const fr = "En 1895, 96 % des billets coûtaient 100 €. C'est l'été.";
     const Case = struct { in: TaskInput, lang: ?[]const u8, line: ?[]const u8 };
@@ -2144,7 +2144,7 @@ test "buildRequest routes detected fr/de/es/ja/ko text off the zh/en path" {
     try std.testing.expectEqualStrings("En mille huit cent quatre-vingt-quinze, quatre-vingt-seize pour cent des billets coûtaient cent euros. C'est l'été.", joined);
 }
 
-test "prepareLongText tags clause, sentence and paragraph boundaries" {
+test "ming_tts text: prepareLongText tags clause, sentence and paragraph boundaries" {
     const a = std.testing.allocator;
     const txt = "The garden will remain open until sunset, provided the weather stays clear, and visitors are asked to leave by the north gate. After that, the lights along the river path will switch on.\n\nChapter two\nIt was\nlate.";
     var frags = try prepareLongText(a, txt, null, 24);

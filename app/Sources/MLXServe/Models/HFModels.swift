@@ -105,7 +105,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // `MediaModalityParityTests` reads every media plugin's `model_types` out of src/plugins/*/config.zig and
 // asserts this agrees; the server's own discovery and dispatch read those plugins.
 private let mediaModelTypeExactValues: Set<String> = [
-    "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
+    "qwen3_tts", "dense", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
     "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d", "idol",
 ]
 
@@ -172,7 +172,7 @@ enum MediaModality: CaseIterable {
             || modelType.hasPrefix("qwen_image") || modelType == "moss_image" { self = .image; return }
         if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" || modelType == "idol" { self = .mesh; return }
         switch modelType {
-        case "qwen3_tts", "kokoro": self = .voice
+        case "qwen3_tts", "kokoro", "dense": self = .voice
         case "acestep", "minimax_music3", "yue2": self = .music
         case "stable_audio3": self = .sound
         case "AudioVideo", "minimax_h3": self = .video

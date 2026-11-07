@@ -166,7 +166,7 @@ fn fft(re: *[NFFT]f64, im: *[NFFT]f64) void {
     }
 }
 
-/// Target level for reference audio: the speech RMS of the upstream voice
+/// Target level for reference audio: the speech RMS of the the reference voice
 /// presets (db30.wav -21.5, lingguang.wav -23.8 dBFS).
 pub const PROMPT_SPEECH_RMS_DB: f32 = -22.0;
 const PROMPT_PEAK_MAX: f32 = 0.89; // -1 dBFS
@@ -175,7 +175,7 @@ const PROMPT_PEAK_MAX: f32 = 0.89; // -1 dBFS
 /// with the peak capped at -1 dBFS. The model reproduces the reference's
 /// level, so a quiet take (e.g. peak -23, RMS -42 dBFS) otherwise yields
 /// equally quiet output. Speech RMS: 20 ms frames within 30 dB of the
-/// loudest frame. Departs from upstream, which uses the reference as is.
+/// loudest frame. Departs from the reference, which uses the reference as is.
 /// Returns the gain applied.
 pub fn normalizePrompt(x: []f32, sample_rate: u32) f32 {
     const n: usize = @max(1, sample_rate / 50);
@@ -213,7 +213,7 @@ fn meanSquare(x: []const f32) f64 {
 /// so output stays under 0.98 (-0.2 dBFS) and peaks round off instead of
 /// clipping. Plain TTS (no reference) often peaks above 1.0, which the 16-bit
 /// WAV would otherwise hard-clip. Per sample, so streamed chunks match the
-/// full output. Departs from upstream, which writes the samples as is.
+/// full output. Departs from the reference, which writes the samples as is.
 pub fn softLimit(x: []f32) void {
     for (x) |*v| {
         const m = @abs(v.*);
@@ -297,7 +297,7 @@ pub fn fade(x: []f32, n_in: usize, dir: enum { in, out }) void {
     }
 }
 
-test "speechBounds finds the loud span" {
+test "ming_tts audio: speechBounds finds the loud span" {
     var x: [44100]f32 = @splat(0);
     for (4410..8820) |i| x[i] = 0.3 * @sin(@as(f32, @floatFromInt(i)) * 0.2);
     for (0..44100) |i| x[i] += if (i % 2 == 0) 1e-5 else -1e-5; // noise floor
@@ -310,7 +310,7 @@ test "speechBounds finds the loud span" {
     try std.testing.expect(y[0] < 0.05 and y[99] < 0.05 and y[50] == 1);
 }
 
-test "resample keeps a DC level and the torchaudio output length" {
+test "ming_tts audio: resample keeps a DC level and the torchaudio output length" {
     const a = std.testing.allocator;
     var x: [4800]f32 = undefined;
     @memset(&x, 0.5);
@@ -320,7 +320,7 @@ test "resample keeps a DC level and the torchaudio output length" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), y[800], 1e-3);
 }
 
-test "normalizePrompt lifts a quiet clip to the target speech level" {
+test "ming_tts audio: normalizePrompt lifts a quiet clip to the target speech level" {
     var x: [16000]f32 = undefined;
     for (&x, 0..) |*v, i| v.* = 0.01 * @sin(@as(f32, @floatFromInt(i)) * 0.1);
     const gain = normalizePrompt(&x, 16000);
@@ -331,7 +331,7 @@ test "normalizePrompt lifts a quiet clip to the target speech level" {
     try std.testing.expectApproxEqAbs(@as(f64, PROMPT_SPEECH_RMS_DB), db, 0.1);
 }
 
-test "trim keeps 300 ms after the last loud frame" {
+test "ming_tts audio: trim keeps 300 ms after the last loud frame" {
     var x: [44100]f32 = @splat(0);
     for (0..4410) |i| x[i] = 0.5;
     const t = trimTrailingSilence(&x, 44100);

@@ -752,6 +752,8 @@ and they are listed because they made that work possible.
   * The `inkling_mlx/` package bundled with Thinking Machines' Inkling Small
     checkpoints (Apache-2.0), the reference and parity oracle for
     `inkling_mm_model`.
+  * inclusionAI's Ming-3.0-tts modeling code and Blaizzy/mlx-audio (MIT), the
+    references for the `ming_tts` plugin's model, task and text frontend ports.
   * hexgrad/misaki (Apache-2.0), whose pronunciation dictionaries are fetched
     verbatim into the Kokoro conversion we publish at
     `ddalcu/Kokoro-82M-MLX-Serve`, where they are redistributed under their own

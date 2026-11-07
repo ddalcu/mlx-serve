@@ -336,6 +336,12 @@ fn ditStack(t: *sdk.tensors.Tensors, comptime prefix: []const u8) !void {
 const testing = std.testing;
 const media_pack = @import("../../sdk/testing/media_pack.zig");
 
+test {
+    _ = @import("audio.zig");
+    _ = @import("fr.zig");
+    _ = @import("text.zig");
+}
+
 test "ming_tts plugin: a job on the tiny pack is a 44.1 kHz mono WAV, repeatable by seed" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();

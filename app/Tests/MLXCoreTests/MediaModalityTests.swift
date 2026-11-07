@@ -90,7 +90,7 @@ final class MediaModalityRoutingTests: XCTestCase {
         let cases: [(String, MediaModality)] = [
             ("flux2-klein-4b", .image), ("krea2_turbo", .image),
             ("mage_flow", .image), ("mageflow", .image),
-            ("qwen3_tts", .voice), ("kokoro", .voice),
+            ("qwen3_tts", .voice), ("kokoro", .voice), ("dense", .voice),
             ("acestep", .music), ("minimax_music3", .music),
             ("AudioVideo", .video), ("minimax_h3", .video),
             ("hunyuan3d_2_1", .mesh), ("hunyuan3d_2_1_paint", .mesh),

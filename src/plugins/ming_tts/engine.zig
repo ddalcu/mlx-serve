@@ -60,17 +60,17 @@ pub const Engine = struct {
     /// The running job's progress and cancel probe.
     prog: ?progress.Progress = null,
     /// Bring reference audio to the presets' speech level before use
-    /// (`audio.normalizePrompt`). Off reproduces upstream exactly.
+    /// (`audio.normalizePrompt`). Off reproduces the reference exactly.
     normalize_prompt: bool = true,
     /// Soft-limit output above 0.9 instead of hard clipping at 1.0
-    /// (`audio.softLimit`). Off reproduces upstream exactly.
+    /// (`audio.softLimit`). Off reproduces the reference exactly.
     soft_limit: bool = true,
     /// Regenerate fragments with an implausible speaking rate
-    /// (`generateGuarded`). Off reproduces upstream exactly.
+    /// (`generateGuarded`). Off reproduces the reference exactly.
     guard: bool = true,
     /// Join fragments with a pause chosen by the boundary between them
     /// (clause, sentence, paragraph; see PAUSE_*_S), cutting the model's own
-    /// edge silence. Off concatenates fragments as upstream does.
+    /// edge silence. Off concatenates fragments as the reference does.
     join: bool = true,
     /// Multiplies the boundary pauses for the next `synthesize` calls (0 to
     /// MAX_PAUSE_SCALE). The gap never goes below LEAD_PAD_S + TAIL_PAD_S.
@@ -184,7 +184,7 @@ pub const Engine = struct {
     }
 
     fn synthesizeChecked(e: *Engine, in: text.TaskInput, seed: ?u64, d: *Diag) ![]f32 {
-        // Validate first so the 400 carries the upstream message.
+        // Validate first so the 400 carries the the reference message.
         const req = try text.buildRequest(e.a, in, d);
         req.deinit(e.a);
         return e.synthesize(in, seed);
@@ -344,7 +344,7 @@ pub const Engine = struct {
     /// Long, noisy references (e.g. a 17 s room recording) can make the model
     /// run to the step cap or stop after one word for most seeds, while the
     /// same reference used as speaker embedding only is fine. Departs from
-    /// upstream (`guard` off reproduces it).
+    /// the reference (`guard` off reproduces it).
     fn generateGuarded(e: *Engine, req: text.Request, frag: []const u8, spk: ?[]const f32, prompt_latent: ?Arr, prompt_text: ?[]const u8, zero: bool) ![]f32 {
         const a = e.a;
         var best = try e.generateFragment(req, frag, spk, prompt_latent, prompt_text, zero);
