@@ -37,6 +37,13 @@ pub fn encodeText(allocator: std.mem.Allocator, lm: *const LoadedModel, tok: *co
     return tok.encode(allocator, text);
 }
 
+/// `encodeText`'s length for a usage count, which never fails a reply: 0 when the text does not encode.
+pub fn countTextTokens(allocator: std.mem.Allocator, lm: *const LoadedModel, tok: *const Tokenizer, text: []const u8) u32 {
+    const ids = encodeText(allocator, lm, tok, text, false) catch return 0;
+    defer allocator.free(ids);
+    return @intCast(ids.len);
+}
+
 pub fn handleTokenize(
     allocator: std.mem.Allocator,
     stream: *Conn,

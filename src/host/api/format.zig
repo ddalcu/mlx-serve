@@ -117,6 +117,16 @@ pub fn cachedFormatChat(
     return ids;
 }
 
+/// `formatChatUsage` with `completion_tokens_details.reasoning_tokens` when the reply reasoned; a re-encoded count can
+/// overshoot the generated one, so it is capped at `completion_tokens`.
+pub fn formatChatUsageWithReasoning(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32, reasoning_tokens: u32) ![]u8 {
+    const n = @min(reasoning_tokens, completion_tokens);
+    if (n == 0) return formatChatUsage(allocator, prompt_tokens, completion_tokens, cached_tokens, "");
+    var buf: [64]u8 = undefined;
+    const details = try std.fmt.bufPrint(&buf, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{n});
+    return formatChatUsage(allocator, prompt_tokens, completion_tokens, cached_tokens, details);
+}
+
 /// The chat-completions `usage` object, shared by the non-stream, tool-call
 /// and streaming-final-chunk emitters so the shape never drifts per path.
 /// `prompt_tokens_details.cached_tokens` is ALWAYS present (0 when cold) —
@@ -383,6 +393,25 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
     try t.expectEqualStrings(
         \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
     , with_details);
+}
+
+test "Chat usage: completion_tokens_details.reasoning_tokens is part of completion_tokens" {
+    const a = testing.allocator;
+    for ([_]struct { reasoning: u32, want: ?i64 }{
+        .{ .reasoning = 0, .want = null },
+        .{ .reasoning = 40, .want = 40 },
+        .{ .reasoning = 126, .want = 126 },
+        .{ .reasoning = 127, .want = 126 },
+    }) |case| {
+        const json = try formatChatUsageWithReasoning(a, 100, 126, 30, case.reasoning);
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object;
+        const details = usage.get("completion_tokens_details");
+        try testing.expectEqual(case.want, if (details) |d| d.object.get("reasoning_tokens").?.integer else null);
+        try testing.expectEqual(@as(i64, 126), usage.get("completion_tokens").?.integer);
+    }
 }
 
 test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
