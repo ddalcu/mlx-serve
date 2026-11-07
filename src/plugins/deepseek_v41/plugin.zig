@@ -84,6 +84,9 @@ pub const Model = struct {
     /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for.
     bank: ?Bank = null,
     bank_context: u64 = 0,
+    /// The bank holds fewer slot rows than experts, so it reads from the SSD and plans its rows into the headroom the
+    /// prefix cache would also spend.
+    bank_streams: bool = false,
     /// The slot whose state is `mdl.dec_state` (0: none claimed it yet, a resumed state or the module's own); every
     /// other live slot's waits in `parked`. Excluded configurations keep the last finished state in `idle`.
     owner: u32 = 0,
@@ -261,6 +264,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
     errdefer m.mdl.deinit();
     m.bank = null;
+    m.bank_streams = false;
     m.owner = 0;
     m.parked = .empty;
     m.idle = null;
@@ -295,6 +299,7 @@ fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin
     std.log.info("deepseek_v41: streamed experts, {d} prompt / {d} decode slot rows per layer for a {d}-token context ({d} B a row)", .{ b.bill.rows.prompt, b.bill.rows.decode, context, b.bill.row_bytes });
     m.bank = .{ .exl3 = b };
     m.bank_context = context;
+    m.bank_streams = bankStreams(b.bill.rows.prompt, b.bill.rows.decode, m.cfg.num_experts);
     mdl.streamed = streamed.exl3Routed(b);
 }
 
@@ -307,6 +312,7 @@ fn openPackBank(m: *Model, dir: []const u8, ctx_size: ?u64, settings_json: []con
     errdefer st.close();
     m.bank = .{ .pack = st };
     m.bank_context = ctx_size orelse bill_mod.stream_context_rungs[0];
+    m.bank_streams = bankStreams(rows, rows, m.cfg.num_experts);
     m.mdl.streamed = m.bank.?.pack.routedSource();
     std.log.info("deepseek_v41: streamed MLX pack experts, {d} slot rows per layer", .{rows});
 }
@@ -320,6 +326,7 @@ fn closeBank(m: *Model) void {
         .pack => |*x| x.close(),
     }
     m.bank = null;
+    m.bank_streams = false;
 }
 
 /// The per-model `ctx_size` setting: the prompt positions a streamed bank bills.
@@ -544,7 +551,11 @@ const aux_hooks = abi.AuxHooks{
 
 fn auxEnabled(mp: *anyopaque) callconv(.c) bool {
     const m: *Model = @ptrCast(@alignCast(mp));
-    return !m.cfg.dsv41_streamed and m.bank == null and m.mdl.streamed == null and m.mdl.pair == null;
+    return m.mdl.pair == null and !m.bank_streams;
+}
+
+pub fn bankStreams(prompt_rows: u64, decode_rows: u64, experts: u64) bool {
+    return @min(prompt_rows, decode_rows) < experts;
 }
 
 fn liveState(m: *Model, slot: u32) ?*dsv41.State {
@@ -572,7 +583,7 @@ fn auxPrefixKey(mp: *anyopaque, ids: abi.Span(u32), rows: abi.Array, out: *u64) 
 }
 
 fn auxBeginPrompt(mp: *anyopaque, slot: u32, prompt: abi.Span(u32), rows: abi.Array, restored_at: u64, capture: bool) callconv(.c) Verdict {
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     if (restored_at != 0) {
         const st = liveState(m, slot) orelse return Verdict.refuse(.failed, "deepseek_v41: restored slot has no state");
@@ -599,7 +610,7 @@ fn auxCommit(mp: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict {
 
 fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     const live = stateOf(m, slot) orelse return .ok;
     const sn = live.st.snap orelse return .ok;
@@ -617,7 +628,7 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
 }
 
 fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callconv(.c) Verdict {
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to restore");
     if (pos != sn.n or sn.n != sn.ids.len) return Verdict.refuse(.unsupported, "deepseek_v41: restore requires the snapshot's exact position");
     const m: *Model = @ptrCast(@alignCast(mp));
@@ -685,7 +696,7 @@ fn auxBytes(_: *anyopaque, handle: abi.Handle) callconv(.c) u64 {
 
 fn auxImportPlan(mp: *anyopaque, header: abi.Str, out: *u64) callconv(.c) Verdict {
     out.* = 0;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     out.* = dsv41.snapshotImportPlan(m.mdl, header.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
     return .ok;
@@ -696,7 +707,7 @@ fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) call
     out.tensor_len = 0;
     out.names_len = 0;
     out.header_len = 0;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const sn = snapOf(handle) orelse return Verdict.refuse(.failed, "deepseek_v41: no snapshot to export");
     const m: *Model = @ptrCast(@alignCast(mp));
     dsv41.exportSnapshot(m.mdl, sn, out) catch |e| return Verdict.named(.failed, @errorName(e));
@@ -705,7 +716,7 @@ fn auxExportArrays(mp: *anyopaque, handle: abi.Handle, out: *abi.AuxExport) call
 
 fn auxImportArrays(mp: *anyopaque, ids: abi.Span(u32), header: abi.Str, arrays: abi.Span(abi.AuxTensor), out: *abi.Handle) callconv(.c) Verdict {
     out.* = null;
-    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires resident unpaired weights");
+    if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     const sn = dsv41.importSnapshot(m.mdl, gpa, ids.slice(), header.slice(), arrays.slice()) catch |e| return Verdict.named(.failed, @errorName(e));
     if (m.mdl.tp != null) {
