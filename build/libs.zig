@@ -86,7 +86,7 @@ pub fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4.c"), .flags = c_flags });
     // ds4.c #includes ds4_distributed.h; the engine/session path links its impl.
-    // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c and
+    // ds4_gpu.h is implemented in ds4_metal.m; ds4_web/help/agent.c and
     // ds4_gpu_args.c are CLI/server-only and not part of the library path
     // mlx-serve embeds (upstream Makefile CORE_OBJS is the authority).
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_distributed.c"), .flags = c_flags });
@@ -104,6 +104,7 @@ pub fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     // Our own shim: exports sizeof/offsetof of the real C structs so the
     // ds4_ffi.zig layout test catches mirror drift (mid-struct-insert class).
     module.addCSourceFile(.{ .file = b.path("src/ds4_layout_check.c"), .flags = c_flags });
+    addDs4CacheSources(b, module);
 
     const objc_flags = &[_][]const u8{
         "-O3",
@@ -125,6 +126,13 @@ pub fn addDs4LinuxLib(b: *std.Build, module: *std.Build.Module) void {
     module.addLibraryPath(b.path("lib/ds4-linux"));
     module.linkSystemLibrary("ds4", .{ .use_pkg_config = .no });
     module.addCSourceFile(.{ .file = b.path("src/ds4_layout_check.c"), .flags = &.{"-std=c99"} });
+    addDs4CacheSources(b, module);
+}
+
+fn addDs4CacheSources(b: *std.Build, module: *std.Build.Module) void {
+    const flags: []const []const u8 = &.{ "-O2", "-std=gnu99" };
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_kvstore.c"), .flags = flags });
+    module.addCSourceFile(.{ .file = b.path("src/ds4_kv_cache.c"), .flags = flags });
 }
 
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and

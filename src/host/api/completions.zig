@@ -284,8 +284,8 @@ pub fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(mtpCapable(lm), dsv4DraftStages(lm));
+    if (enable_mtp and !mtpCapable(lm)) enable_mtp = false;
 
     // Log the request
     var max_tokens_desc_buf: [MAX_TOKENS_DESC_LEN]u8 = undefined;
@@ -359,6 +359,7 @@ pub fn handleCompletions(
         .presence_penalty = presence_penalty_c,
         .frequency_penalty = sampled.frequency_penalty,
         .seed = seed,
+        .ignore_eos = @import("sampling.zig").requestIgnoresEos(root),
     };
 
     if (is_stream) {
@@ -413,7 +414,7 @@ fn handleNonStreamingCompletion(
     const use_pld = spec.use_pld;
 
     // Every failure class propagates to the surface's one error arm (`sendGenerationError`), shared with the streaming twin.
-    var result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, cache_key, .{}, logprobs_n, prompt_logprobs, null, null, null, stream);
+    var result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, false, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), null, &.{}, &.{}, cache_key, .{}, logprobs_n, prompt_logprobs, null, null, null, stream);
     _ = &result;
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);

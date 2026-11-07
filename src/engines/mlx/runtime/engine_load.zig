@@ -34,6 +34,8 @@ pub fn loadGguf(sch: *Scheduler, params: anytype, route: GgufRoute) !void {
             .dspark = params.ds4_dspark,
             .ssd_streaming = params.ds4_ssd_streaming,
             .prefill_chunk = generate_mod.explicitPrefillChunkU32(),
+            .vision = scheduler_mod.coldLoadVision(true),
+            .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
         }, .{}),
         else => try std.json.Stringify.valueAlloc(sch.allocator, params.llama, .{}),
     };
@@ -53,6 +55,7 @@ pub fn loadGguf(sch: *Scheduler, params: anytype, route: GgufRoute) !void {
         cc.allocator.free(cc.chat_template);
         cc.chat_template = dup;
     }
+    params.chat_config.image_placeholder = s.imagePlaceholder();
     install(sch, params, s, "");
     // A GGUF load takes the scheduler's current model, as the inference thread once decoded it.
     sch.current_model = params.entry;

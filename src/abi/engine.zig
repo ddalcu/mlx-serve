@@ -84,6 +84,8 @@ pub const Info = extern struct {
     eos: Span(u32), // the engine's stop set; the host merges generation_config's
     startup: Str, // one line the host logs at load (the memory plan, the cluster)
     vocab_size: u32 = 0, // Caps.owns_tokenizer: the ids a prompt may carry
+    /// The image atom for a host-rendered template; borrowed until close. Empty uses typed content parts.
+    image_placeholder: Str = .{},
 };
 
 pub const Sampling = extern struct {
@@ -360,7 +362,7 @@ test "engine abi: extern layouts are pinned (64-bit)" {
     try expectLayout(Verdict, 24, .{ .code = 0, .why = 8 });
     try expectLayout(Host, 40, .{ .size = 0, .ctx = 8, .log = 16, .wake = 24, .progress = 32 });
     try expectLayout(Open, 112, .{ .size = 0, .model_dir = 8, .model_type = 24, .config_json = 40, .context = 56, .max_concurrent = 60, .memory_budget = 64, .settings_json = 72, .options_json = 88, .host = 104 });
-    try expectLayout(Info, 104, .{ .size = 0, .name = 8, .version = 24, .caps = 40, .threading = 48, .context_window = 52, .max_concurrent = 56, .embedding_dims = 60, .eos = 64, .startup = 80, .vocab_size = 96 });
+    try expectLayout(Info, 120, .{ .size = 0, .name = 8, .version = 24, .caps = 40, .threading = 48, .context_window = 52, .max_concurrent = 56, .embedding_dims = 60, .eos = 64, .startup = 80, .vocab_size = 96, .image_placeholder = 104 });
     try expectLayout(Sampling, 56, .{ .temperature = 0, .top_p = 4, .top_k = 8, .min_p = 12, .seed = 16, .seeded = 24, .repeat_penalty = 28, .frequency_penalty = 32, .presence_penalty = 36, .logit_bias = 40 });
     try expectLayout(Bias, 8, .{ .token = 0, .bias = 4 });
     try expectLayout(Grammar, 32, .{ .size = 0, .kind = 4, .text = 8, .after = 24 });

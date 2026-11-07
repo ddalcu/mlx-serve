@@ -18,6 +18,7 @@ const plugin_loader = @import("../plugins/loader.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const KvAttnMode = @import("request_options.zig").KvAttnMode;
+const mtpCapable = @import("request_options.zig").mtpCapable;
 const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
 const dsv4DraftStages = @import("request_options.zig").dsv4DraftStages;
 const configuredKvQuantFor = @import("../http/server.zig").configuredKvQuantFor;
@@ -176,7 +177,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .decode_attn_quant = mp.decode_attn_quant,
         .prefill_chunk = es.prefill_chunk,
         .mtp_loaded = mp.mtp_loaded,
-        .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),
+        .mtp_default_on = defaultEnableMtp(mtpCapable(lm), dsv4DraftStages(lm)),
         .mtp_acceptance = mp.mtp_acceptance,
         .mtp_greedy_tail = mp.mtp_greedy_tail,
         .mtp_depth = lm.mtp_depth,

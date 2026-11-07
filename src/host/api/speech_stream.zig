@@ -2,6 +2,7 @@
 //! frame slots and mode markers are not text) and the speech as 16-bit PCM `data` deltas as the codec makes it final.
 
 const std = @import("std");
+const abi = @import("../../abi/engine.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
 const request_mod = @import("../../sdk/request/request.zig");
@@ -39,6 +40,7 @@ pub fn handle(
     allow_parallel_tools: bool,
     vision_embeddings: ?mlx.mlx_array,
     media: []const MediaSpan,
+    engine_media: []const abi.Media,
     cache_key: u64,
     mrope: MropeData,
     tokenize_ns: u64,
@@ -73,6 +75,7 @@ pub fn handle(
         .kv_attn_fused = false,
         .vision_embeddings = vision_embeddings,
         .media = media,
+        .engine_media = engine_media,
         .cache_key = cache_key,
         .client = stream.client,
         .ablation = stream.ablation,

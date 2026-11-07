@@ -39,6 +39,96 @@ pub const Route = struct {
     engine: Engine,
 };
 
+/// The GGUF's `tokenizer.chat_template` (caller frees); null when it ships none.
+pub fn readChatTemplate(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    return parseChatTemplate(allocator, &rs.interface);
+}
+
+fn parseChatTemplate(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!?[]u8 {
+    const magic = takeBytes(r, 4) catch return error.Truncated;
+    if (!std.mem.eql(u8, magic, "GGUF")) return error.BadMagic;
+    const version = takeIntT(r, u32) catch return error.Truncated;
+    if (version < 2 or version > 3) return error.UnsupportedVersion;
+    _ = takeIntT(r, u64) catch return error.Truncated; // tensor_count
+    const kv_count = takeIntT(r, u64) catch return error.Truncated;
+    var i: u64 = 0;
+    while (i < kv_count) : (i += 1) {
+        const key_len = takeIntT(r, u64) catch return error.Truncated;
+        if (key_len > MAX_KEY_LEN) return error.KeyTooLong;
+        const is_template = std.mem.eql(u8, takeBytes(r, @intCast(key_len)) catch return error.Truncated, "tokenizer.chat_template");
+        const value_type = takeIntT(r, u32) catch return error.Truncated;
+        if (is_template and value_type == TY_STRING) {
+            const len = takeIntT(r, u64) catch return error.Truncated;
+            if (len > MAX_STR_VALUE_LEN) return error.Truncated;
+            // A template can outgrow the reader's buffer: read it into its own allocation.
+            return r.readAlloc(allocator, @intCast(len)) catch |err| switch (err) {
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.Truncated,
+            };
+        }
+        try skipValue(r, value_type);
+    }
+    return null;
+}
+
+/// The ids of `names` in the GGUF's `tokenizer.ggml.tokens`; null where a name is not in the vocabulary.
+pub fn readTokenIds(io: std.Io, allocator: std.mem.Allocator, path: []const u8, comptime n: usize, names: [n][]const u8) ![n]?u32 {
+    _ = allocator;
+    var file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    return parseTokenIds(&rs.interface, n, names);
+}
+
+fn parseTokenIds(r: *std.Io.Reader, comptime n: usize, names: [n][]const u8) Error![n]?u32 {
+    var out: [n]?u32 = @splat(null);
+    const magic = takeBytes(r, 4) catch return error.Truncated;
+    if (!std.mem.eql(u8, magic, "GGUF")) return error.BadMagic;
+    const version = takeIntT(r, u32) catch return error.Truncated;
+    if (version < 2 or version > 3) return error.UnsupportedVersion;
+    _ = takeIntT(r, u64) catch return error.Truncated; // tensor_count
+    const kv_count = takeIntT(r, u64) catch return error.Truncated;
+    var i: u64 = 0;
+    while (i < kv_count) : (i += 1) {
+        const key_len = takeIntT(r, u64) catch return error.Truncated;
+        if (key_len > MAX_KEY_LEN) return error.KeyTooLong;
+        const is_tokens = std.mem.eql(u8, takeBytes(r, @intCast(key_len)) catch return error.Truncated, "tokenizer.ggml.tokens");
+        const value_type = takeIntT(r, u32) catch return error.Truncated;
+        if (!is_tokens or value_type != TY_ARRAY) {
+            try skipValue(r, value_type);
+            continue;
+        }
+        const elem = takeIntT(r, u32) catch return error.Truncated;
+        const count = takeIntT(r, u64) catch return error.Truncated;
+        if (elem != TY_STRING) return out;
+        var id: u64 = 0;
+        while (id < count) : (id += 1) {
+            const len = takeIntT(r, u64) catch return error.Truncated;
+            // Long ordinary vocabulary pieces cannot match these marker names.
+            const max_name = blk: {
+                var max: usize = 0;
+                for (names) |name| max = @max(max, name.len);
+                break :blk max;
+            };
+            if (len > max_name) {
+                r.discardAll64(len) catch return error.Truncated;
+                continue;
+            }
+            const piece = takeBytes(r, @intCast(len)) catch return error.Truncated;
+            for (names, &out) |name, *o| if (o.* == null and std.mem.eql(u8, piece, name)) {
+                o.* = @intCast(id);
+            };
+        }
+        return out;
+    }
+    return out;
+}
+
 pub const Info = struct {
     /// Owned dupe of `general.architecture` value; null if the key was
     /// absent or not a string.
@@ -65,6 +155,12 @@ pub const Info = struct {
 // Arch names the ds4 converters write. llama.cpp loads qwen4exp too, so a
 // qwen4exp file ds4 cannot load goes there instead.
 const ds4_only_archs = [_][]const u8{ "deepseek41", "qwen4exp", "glm-dsa", "glm5-next" };
+
+/// ds4 sizes prefill itself for the GLM-DSA family and rejects an explicit chunk.
+pub fn isDs4GlmFamily(info: Info) bool {
+    const arch = info.architecture orelse return false;
+    return std.mem.eql(u8, arch, "glm-dsa") or std.mem.eql(u8, arch, "glm5-next");
+}
 
 // Archs whose NextN layers ds4 drafts from inside the checkpoint; DeepSeek-V4 declares
 // `nextn_predict_layers` but takes its head from a separate GGUF, and ds4 refuses to open it with one armed.
@@ -473,6 +569,36 @@ test "the trained window is read from <arch>.context_length, not from a sub-name
     var none = try parseBytes(testing.allocator, bare);
     defer none.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 0), none.context_length);
+}
+
+test "the chat template is read from tokenizer.chat_template; a GGUF without one has none" {
+    const with = try buildHeader(testing.allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } },
+        .{ .key = "tokenizer.chat_template", .value = .{ .str = "{{ messages }}" } },
+    });
+    defer testing.allocator.free(with);
+    var r = std.Io.Reader.fixed(with);
+    const t = (try parseChatTemplate(testing.allocator, &r)) orelse return error.NoTemplate;
+    defer testing.allocator.free(t);
+    try testing.expectEqualStrings("{{ messages }}", t);
+
+    const without = try buildHeader(testing.allocator, &.{.{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } }});
+    defer testing.allocator.free(without);
+    var r2 = std.Io.Reader.fixed(without);
+    try testing.expect((try parseChatTemplate(testing.allocator, &r2)) == null);
+}
+
+test "token ids are looked up by name in tokenizer.ggml.tokens" {
+    const bytes = try buildHeader(testing.allocator, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "qwen4exp" } },
+        .{ .key = "tokenizer.ggml.tokens", .value = .{ .str_array = &.{ "a", "<|vision_start|>", "b", "<|image_pad|>", "<|vision_end|>" } } },
+    });
+    defer testing.allocator.free(bytes);
+    var r = std.Io.Reader.fixed(bytes);
+    const ids = try parseTokenIds(&r, 3, .{ "<|vision_start|>", "<|image_pad|>", "<|vision_missing|>" });
+    try testing.expectEqual(@as(?u32, 1), ids[0]);
+    try testing.expectEqual(@as(?u32, 3), ids[1]);
+    try testing.expectEqual(@as(?u32, null), ids[2]);
 }
 
 test "ds4Spec: DeepSeek-V4.1 takes no support GGUF in ds4; DeepSeek-V4 and the other archs do" {

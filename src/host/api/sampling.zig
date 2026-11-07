@@ -175,10 +175,14 @@ fn maxTokensBudgetSqueezed(max_tokens: u32, remaining: u32) bool {
 /// only `max_tokens` (or the request timeout) does. Stop sequences are a
 /// separate field and stay active.
 pub fn requestEosSlice(config: *const model_mod.ModelConfig, root: std.json.ObjectMap) []const u32 {
-    if (root.get("ignore_eos")) |v| {
-        if (v == .bool and v.bool) return &.{};
-    }
+    if (requestIgnoresEos(root)) return &.{};
     return config.eosTokenSlice();
+}
+
+/// Preserve the request's intent even when its model has no configured EOS tokens.
+pub fn requestIgnoresEos(root: std.json.ObjectMap) bool {
+    const v = root.get("ignore_eos") orelse return false;
+    return v == .bool and v.bool;
 }
 
 /// Clamp max_tokens so prompt + completion doesn't exceed context length.
@@ -259,12 +263,17 @@ test "requestEosSlice: ignore_eos swaps the EOS list for empty" {
     const parsed_off = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"ignore_eos\": true}", .{});
     defer parsed_off.deinit();
     try std.testing.expectEqual(@as(usize, 0), requestEosSlice(&config, parsed_off.value.object).len);
+    try std.testing.expect(requestIgnoresEos(parsed_off.value.object));
     const parsed_on = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"ignore_eos\": false}", .{});
     defer parsed_on.deinit();
     try std.testing.expectEqual(@as(usize, 2), requestEosSlice(&config, parsed_on.value.object).len);
+    try std.testing.expect(!requestIgnoresEos(parsed_on.value.object));
     const parsed_absent = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"max_tokens\": 64}", .{});
     defer parsed_absent.deinit();
     try std.testing.expectEqual(@as(usize, 2), requestEosSlice(&config, parsed_absent.value.object).len);
+    try std.testing.expect(!requestIgnoresEos(parsed_absent.value.object));
+    const empty_config: model_mod.ModelConfig = .{};
+    try std.testing.expectEqual(@as(usize, 0), requestEosSlice(&empty_config, parsed_absent.value.object).len);
 }
 
 test "parseJsonFloat returns value when present" {

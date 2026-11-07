@@ -1,6 +1,7 @@
 //! nonStreamingViaScheduler
 
 const std = @import("std");
+const abi = @import("../../abi/engine.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kv_quant = @import("../../sdk/blocks/attention/kv_quant.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
@@ -52,6 +53,7 @@ pub fn nonStreamingViaScheduler(
     timeout_ns: u64,
     vision_embeddings: ?mlx.mlx_array,
     media: []const MediaSpan,
+    engine_media: []const abi.Media,
     cache_key: u64,
     mrope: MropeData,
     logprobs_n: u32,
@@ -92,6 +94,7 @@ pub fn nonStreamingViaScheduler(
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .media = media,
+        .engine_media = engine_media,
         .cache_key = cache_key,
         .client = if (conn) |c| c.client else .other,
         .ablation = if (conn) |c| c.ablation else null,

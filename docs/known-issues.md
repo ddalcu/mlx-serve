@@ -43,8 +43,10 @@ Declared today:
 - **Concurrent**: archs that batch decode (B > 1) are not row-exact across batch widths; serial archs (`qwen3_next`,
   `laguna`, `kolibri1`, `bailing_hybrid`, `hy_v3`, `inkling`, `gpt_oss`, `nemotron_h`, `lfm2`) and the single-flight
   `deepseek_v4`/`deepseek_v41` are equal to solo by construction but no guard checks it.
-- **Embedded engines** (`ds4`, `llama`, `ane`): every contract unverified. The adapters ignore `Request.no_drafts` and
-  `CacheHint.cold`, and ds4 reports `Stats.drafted = 0`, so a drafted check could not see a draft.
+- **Embedded engines** (`ds4`, `llama`, `ane`): full model-backed exactness contracts remain unverified. ds4 honors
+  `Request.no_drafts` and `CacheHint.cold`; its `Stats.drafted = 0` still prevents measuring proposed draft counts.
+- **ds4 SSD prefixes** persist text-conditioned state only. Image-conditioned KV reuses the live session with
+  fingerprint checks; native payloads do not carry enough image identity to authenticate a disk restore.
 - Embedding, decision and media plugins have no token decode loop; their bar is seeded outputs identical.
 
 ## Correctness

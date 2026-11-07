@@ -31,6 +31,7 @@ pub fn slotFailure(slot: *Stream) anyerror {
         return error.PrefillDoesNotFit;
     }
     if (slot.errorNameIs("PromptLogprobsUnavailable")) return error.PromptLogprobsUnavailable;
+    if (slot.errorNameIs("ContextExceeded")) return error.ContextExceeded;
     if (slot.errorIsMemory()) return error.GenerationOutOfMemory;
     if (slot.errorNameIs("DistWorkerLeft")) return error.DistWorkerLeft;
     return error.GenerationFailed;
@@ -90,6 +91,20 @@ pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
         .message = gpu_context_lost_message,
     };
     return switch (err) {
+        error.MediaPlaceholderMismatch => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "the rendered image placeholders do not match the attached images",
+        },
+        error.ContextExceeded => .{
+            .status_line = "400 Bad Request",
+            .code = 400,
+            .openai_type = "invalid_request_error",
+            .anthropic_type = "invalid_request_error",
+            .message = "The expanded image prompt exceeds the model's maximum context length; reduce the images or prompt, or increase the configured context.",
+        },
         // The MLX working-set latch (#353): a memory 503.
         error.GenerationOutOfMemory, error.OutOfMemory => .{
             .status_line = "503 Service Unavailable",
@@ -333,6 +348,7 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
         error.DistWorkerNotJoined => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "worker_not_joined", "This model is served with a second Mac that has not joined: start `mlx-serve worker` there, then retry", 503),
         error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
         error.ForeignBytesReaderBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another DeepSeek-V4.1 or GLM-5.3 stream pack is in use; retry when its request finishes", 503),
+        error.Ds4EngineBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another GGUF model is using the ds4 engine; retry when it is idle", 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
         // config.json, etc.) bubble out of `preloadCpuState`. Surface a
@@ -462,6 +478,19 @@ test "PrefillDoesNotFit quotes the figures the inference thread refused on, once
     // Read once: the next refusal without figures on this thread gets the bare message.
     try t.expect(prefill_refusal == null);
     try t.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
+}
+
+test "engine image transport expanded context failure is a named 400" {
+    const slot = try Stream.create(testing.allocator, testing.io);
+    defer slot.release();
+    slot.markError("ContextExceeded");
+    try testing.expectEqual(error.ContextExceeded, slotFailure(slot));
+    var buf: [320]u8 = undefined;
+    const w = mapGenerationError(err_name.toError("ContextExceeded"), &buf);
+    try testing.expectEqual(@as(u32, 400), w.code);
+    try testing.expectEqualStrings("invalid_request_error", w.openai_type);
+    try testing.expectEqualStrings("invalid_request_error", w.anthropic_type);
+    try testing.expect(std.mem.indexOf(u8, w.message, "expanded image prompt") != null);
 }
 
 test "mapGenerationError: after a lost GPU context any failure is the named 503" {

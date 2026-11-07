@@ -30,3 +30,12 @@ size_t mlxserve_ds4_sizeof_context_memory(void) {
 size_t mlxserve_ds4_sizeof_session_snapshot(void) {
     return sizeof(ds4_session_snapshot);
 }
+size_t mlxserve_ds4_sizeof_vision_embedding(void) {
+    return sizeof(ds4_vision_embedding);
+}
+size_t mlxserve_ds4_sizeof_vision_span(void) {
+    return sizeof(ds4_vision_span);
+}
+size_t mlxserve_ds4_offsetof_vision_span_embedding(void) {
+    return offsetof(ds4_vision_span, embedding);
+}

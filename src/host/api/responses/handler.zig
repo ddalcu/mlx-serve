@@ -48,6 +48,7 @@ const sendGenerationError = @import("../../http/errors.zig").sendGenerationError
 const checkAttentionMemory = @import("../admission.zig").checkAttentionMemory;
 const clampMaxTokens = @import("../sampling.zig").clampMaxTokens;
 const mediaRejectReason = @import("../media_gate.zig").mediaRejectReason;
+const mediaSupportOf = @import("../media_gate.zig").mediaSupportOf;
 const dropMedia = @import("../media_gate.zig").dropMedia;
 const encodeText = @import("../tokenize.zig").encodeText;
 const defaultReasoningBudget = @import("../../chat/reasoning/request.zig").defaultReasoningBudget;
@@ -83,7 +84,7 @@ const parseKvQuantOverride = @import("../sampling.zig").parseKvQuantOverride;
 const MultimodalPrompt = @import("../../media/encode.zig").MultimodalPrompt;
 const prepareMultimodalPrompt = @import("../../media/encode.zig").prepareMultimodalPrompt;
 const multimodalFailure = @import("../../media/encode.zig").multimodalFailure;
-const visionPreprocFromConfig = @import("../../media/prepare.zig").visionPreprocFromConfig;
+const visionPreprocForModel = @import("../../media/prepare.zig").visionPreprocForModel;
 const appendImageUrlContent = @import("../../media/request_media.zig").appendImageUrlContent;
 const IMAGE_DECODE_REJECT = @import("../../media/request_media.zig").IMAGE_DECODE_REJECT;
 const sendStreamKeepalive = @import("../../http/sse.zig").sendStreamKeepalive;
@@ -579,7 +580,7 @@ fn handleResponsesInner(
     }
 
     // ── parse input → messages ──
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, &namespace_aliases, appendImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, &namespace_aliases, appendImageUrlContent, visionPreprocForModel(lm, config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
@@ -618,13 +619,14 @@ fn handleResponsesInner(
         }
     }
 
-    if (lm.vision_encoder == null) {
-        if (mediaRejectReason(pi.messages.items, false)) |reason| {
+    {
+        const support = mediaSupportOf(lm);
+        if (mediaRejectReason(pi.messages.items, false, support)) |reason| {
             log.warn("POST /v1/responses -> 400 ({s})\n", .{reason});
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
-        try dropMedia(allocator, pi.messages.items, &rf_allocs);
+        try dropMedia(allocator, pi.messages.items, &rf_allocs, support);
     }
 
     // ── format chat template ──
@@ -670,7 +672,7 @@ fn handleResponsesInner(
     const cache_key = requestCacheKey(root);
     var mm: MultimodalPrompt = .{};
     defer mm.deinit(allocator);
-    if (lm.vision_encoder != null) {
+    if (lm.vision_encoder != null or lm.engine != null) {
         mm = prepareMultimodalPrompt(allocator, lm, config, pi.messages.items, &prompt_ids_raw) catch |err| {
             allocator.free(prompt_ids_raw);
             const f = multimodalFailure(err);
@@ -700,8 +702,8 @@ fn handleResponsesInner(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
-    if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
+        defaultEnableMtp(mtpCapable(lm), dsv4DraftStages(lm));
+    if (enable_mtp_resp and !mtpCapable(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Check if attention computation would exceed GPU memory.
@@ -933,6 +935,7 @@ fn handleResponsesInner(
             .mtp_depth = lm.mtp_depth,
             .vision_embeddings = slot_ve_resp,
             .media = mm.media,
+            .engine_media = mm.engine_media,
             .cache_key = cache_key,
             .client = stream.client,
             .mrope_pos = slot_mrope.pos,
@@ -1267,7 +1270,7 @@ fn handleResponsesInner(
         const slot_mrope = mm.mrope;
         mm.mrope = .{};
         // Propagates to `handleResponses`' one error arm, shared with the streaming half.
-        result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream);
+        result = try nonStreamingViaScheduler(allocator, http_server.launch().global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, enable_thinking, use_pld, use_drafter, use_mtp, allow_batch_mtp, getTimeoutNs(), slot_ve_ns, mm.media, mm.engine_media, cache_key, slot_mrope, 0, false, kv_quant_override, kv_attn_explicit, null, stream);
     }
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
