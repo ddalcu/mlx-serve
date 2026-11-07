@@ -304,6 +304,7 @@ pub const vars = struct {
     // ── kill switches and opt-in arms ──
     pub const MINIMAX_H3_GLUE_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 fused glue kernels (=0: the op chain)" };
     pub const MINIMAX_H3_VSA: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 trained VSA sparse attention (=0: dense attention, no gate branch)" };
+    pub const MLX_SERVE_MING_FUSED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/ming_tts", .since = "26.11.3", .doc = "Ming-3.0-tts fused DiT and LM kernels (=0: the op chain)" };
     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };

@@ -1,0 +1,174 @@
+//! Ming-3.0-tts-0.5b's claims, caps and bills, and its geometry from `config.json`, MLX-free. The pack's `model_type` is
+//! `dense`, a generic word, so the claim also asks for the flow head and aggregator blocks only this model has.
+
+const std = @import("std");
+const abi = @import("../../abi/media.zig");
+const bill = @import("../../sdk/media/bill.zig");
+const pack_claims = @import("../../sdk/media/pack_claims.zig");
+
+pub const plugin = @import("../../sdk/plugin.zig").Plugin{
+    .name = "ming_tts",
+    .kind = .media,
+    .claims = &model_types,
+    .gate_models = &.{"inclusionAI/Ming-3.0-tts-0.5b"},
+};
+
+pub const model_types = [_][]const u8{"dense"};
+
+pub const required_file = "model.safetensors";
+
+pub fn claims(model_type: abi.Str, dir: *const abi.PackDir) callconv(.c) abi.Claim {
+    if (!std.mem.eql(u8, model_type.slice(), model_types[0])) return .no;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const v = pack_claims.readJson(arena.allocator(), dir, "config.json") orelse return .no;
+    if (pack_claims.path(v, &.{"ditar_config"}) == null or pack_claims.path(v, &.{"aggregator_config"}) == null) return .no;
+    return .by_marker;
+}
+
+pub fn caps(dir: *const abi.PackDir, out: *abi.MediaCaps) callconv(.c) void {
+    _ = dir;
+    out.* = .{ .routes = .{ .speech = true } };
+}
+
+pub fn billLoad(dir: *const abi.PackDir, m: *const abi.Machine) callconv(.c) u64 {
+    _ = m;
+    return bill.safetensorsIn(dir, "") + bill.files(dir, &.{"campplus.onnx"});
+}
+
+/// MLX's working memory for one fragment (KV caches, VAE decode), above the resident weights.
+const fragment_peak: u64 = 3 << 30;
+/// f32 samples at 44.1 kHz, 12 spoken units a second at the slowest plausible rate of 1.2: an upper bound per input byte.
+const output_per_input_byte: u64 = 4 * 44100 / 1;
+
+pub fn billRequest(dir: *const abi.PackDir, m: *const abi.Machine, body: abi.Str) callconv(.c) u64 {
+    _ = m;
+    return billLoad(dir, &.{}) + fragment_peak + @min(body.len, 512 * 1024) * output_per_input_byte;
+}
+
+/// One Qwen2 stack (the LM, the VAE encoder, the VAE decoder).
+pub const Qwen = struct {
+    layers: usize,
+    hidden: c_int,
+    heads: c_int,
+    kv_heads: c_int,
+    theta: f32,
+    window: ?c_int,
+
+    pub fn headDim(q: Qwen) c_int {
+        return @divExact(q.hidden, q.heads);
+    }
+};
+
+/// One DiT stack (the flow head, the aggregator).
+pub const Dit = struct {
+    layers: c_int,
+    hidden: c_int,
+    heads: c_int,
+};
+
+pub const Dims = struct {
+    lm: Qwen,
+    enc: Qwen,
+    dec: Qwen,
+    dit: Dit,
+    agg: Dit,
+};
+
+pub const ParseError = error{ InvalidConfig, QuantizedPack };
+
+/// A positive integer at `keys`, at most `max`.
+fn intAt(v: std.json.Value, keys: []const []const u8, max: i64) ParseError!c_int {
+    const x = pack_claims.path(v, keys) orelse return error.InvalidConfig;
+    if (x != .integer or x.integer < 1 or x.integer > max) return error.InvalidConfig;
+    return @intCast(x.integer);
+}
+
+fn qwenAt(v: std.json.Value, comptime keys: []const []const u8) ParseError!Qwen {
+    const q: Qwen = .{
+        .layers = @intCast(try intAt(v, keys ++ .{"num_hidden_layers"}, 64)),
+        .hidden = try intAt(v, keys ++ .{"hidden_size"}, 8192),
+        .heads = try intAt(v, keys ++ .{"num_attention_heads"}, 64),
+        .kv_heads = try intAt(v, keys ++ .{"num_key_value_heads"}, 64),
+        .theta = blk: {
+            const t = pack_claims.path(v, keys ++ .{"rope_theta"}) orelse return error.InvalidConfig;
+            break :blk switch (t) {
+                .integer => |i| @floatFromInt(i),
+                .float => |f| @floatCast(f),
+                else => return error.InvalidConfig,
+            };
+        },
+        .window = blk: {
+            const on = pack_claims.path(v, keys ++ .{"use_sliding_window"}) orelse break :blk null;
+            if (on != .bool or !on.bool) break :blk null;
+            break :blk try intAt(v, keys ++ .{"sliding_window"}, 1 << 20);
+        },
+    };
+    if (@mod(q.hidden, q.heads) != 0 or @mod(q.heads, q.kv_heads) != 0 or @mod(q.headDim(), 2) != 0 or !(q.theta > 0)) return error.InvalidConfig;
+    return q;
+}
+
+fn ditAt(v: std.json.Value, comptime keys: []const []const u8) ParseError!Dit {
+    const d: Dit = .{
+        .layers = try intAt(v, keys ++ .{"depth"}, 64),
+        .hidden = try intAt(v, keys ++ .{"hidden_size"}, 8192),
+        .heads = try intAt(v, keys ++ .{"num_heads"}, 64),
+    };
+    if (@mod(d.hidden, d.heads) != 0) return error.InvalidConfig;
+    return d;
+}
+
+/// The geometry a `config.json` declares. Config JSON is untrusted: every field is bounds-checked. A quantized pack is
+/// refused by name: the fused kernels and the op chain read dense bf16 weights.
+pub fn parseDims(a: std.mem.Allocator, config_json: []const u8) ParseError!Dims {
+    const v = std.json.parseFromSliceLeaky(std.json.Value, a, config_json, .{}) catch return error.InvalidConfig;
+    if (pack_claims.path(v, &.{"quantization"}) != null or pack_claims.path(v, &.{"quantization_config"}) != null) return error.QuantizedPack;
+    return .{
+        .lm = try qwenAt(v, &.{"llm_config"}),
+        .enc = try qwenAt(v, &.{ "audio_tokenizer_config", "enc_kwargs", "backbone" }),
+        .dec = try qwenAt(v, &.{ "audio_tokenizer_config", "dec_kwargs", "backbone" }),
+        .dit = try ditAt(v, &.{"ditar_config"}),
+        .agg = try ditAt(v, &.{"aggregator_config"}),
+    };
+}
+
+// ── tests ──
+
+const testing = std.testing;
+const fixture = @import("../../sdk/testing/fixture.zig");
+
+const released = @embedFile("../../fixtures/model-configs/ming_tts-0.5b.json");
+
+test "ming_tts config: the release is claimed by marker; another `dense` or a stranger is not" {
+    const rel: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = released }} };
+    try testing.expectEqual(abi.Claim.by_marker, claims(.of("dense"), &rel.packDir()));
+    try testing.expectEqual(abi.Claim.no, claims(.of("qwen3"), &rel.packDir()));
+    const other: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = "{\"model_type\":\"dense\"}" }} };
+    try testing.expectEqual(abi.Claim.no, claims(.of("dense"), &other.packDir()));
+    const none: fixture.MemDir = .{ .files = &.{} };
+    try testing.expectEqual(abi.Claim.no, claims(.of("dense"), &none.packDir()));
+}
+
+test "ming_tts config: the release's geometry" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const d = try parseDims(arena.allocator(), released);
+    try testing.expectEqual(@as(usize, 24), d.lm.layers);
+    try testing.expectEqual(@as(c_int, 64), d.lm.headDim());
+    try testing.expectEqual(@as(c_int, 2), d.lm.kv_heads);
+    try testing.expectEqual(@as(?c_int, null), d.lm.window);
+    try testing.expectEqual(@as(?c_int, 64), d.dec.window);
+    try testing.expectEqual(@as(?c_int, 64), d.enc.window);
+    try testing.expectEqual(@as(c_int, 1024), d.dit.hidden);
+    try testing.expectEqual(@as(c_int, 8), d.agg.layers);
+}
+
+test "ming_tts config: a quantized pack and malformed geometry are refused by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expectError(error.QuantizedPack, parseDims(a, "{\"quantization\":{\"bits\":8}}"));
+    try testing.expectError(error.InvalidConfig, parseDims(a, "not json"));
+    try testing.expectError(error.InvalidConfig, parseDims(a, "{\"llm_config\":{\"num_hidden_layers\":-1}}"));
+    try testing.expectError(error.InvalidConfig, parseDims(a, "{\"llm_config\":{\"num_hidden_layers\":1,\"hidden_size\":7,\"num_attention_heads\":2,\"num_key_value_heads\":1,\"rope_theta\":1e6}}"));
+}
