@@ -82,6 +82,8 @@ const Kernel = struct {
     name: [*:0]const u8,
     ins: []const [*:0]const u8,
     outs: []const [*:0]const u8 = &.{"OUT"},
+    /// The last output is a u32 counter of `counter` elements that MLX zeroes before the dispatch; it is not returned.
+    counter: ?c_int = null,
     src: [*:0]const u8,
     tile: Tile = .{ .no = 8, .sg = 4 },
     k: ?mlx.mlx_fast_metal_kernel = null,
@@ -99,7 +101,7 @@ const Kernel = struct {
     }
 };
 
-var k_qkv: Kernel = .{ .name = "ming_dit_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN", "CNT" }, .outs = &.{ "OUT", "ATT" }, .src = SRC_QKV, .tile = .{ .no = 2, .sg = 4 } };
+var k_qkv: Kernel = .{ .name = "ming_dit_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, .outs = &.{ "OUT", "ATT", "CNT" }, .counter = D / 64, .src = SRC_QKV, .tile = .{ .no = 2, .sg = 4 } };
 var k_attn: Kernel = .{ .name = "ming_dit_attn_out", .ins = &.{ "ATT", "X", "WO", "BO" }, .src = SRC_ATTN, .tile = .{ .no = 2, .sg = 4 } };
 var k_ff1: Kernel = .{ .name = "ming_dit_ff1", .ins = &.{ "X", "NW", "W1", "B1" }, .src = SRC_FF1, .tile = .{ .no = 2, .sg = 4 } };
 var k_ff2: Kernel = .{ .name = "ming_dit_ff2", .ins = &.{ "HH", "X", "W2", "B2" }, .src = SRC_FF2, .tile = .{ .no = 2, .sg = 4 } };
@@ -113,6 +115,8 @@ var k_final: Kernel = .{ .name = "ming_cfm_final", .ins = &.{ "X", "NW", "WF", "
 
 const Tmpl = struct { [*:0]const u8, c_int };
 
+extern "c" fn mlx_fast_metal_kernel_config_set_init_value(cls: mlx.mlx_fast_metal_kernel_config, value: f32) c_int;
+
 /// Run one kernel → its bf16 outputs (owned by the caller) in `outs`. With
 /// `n_cols`, a GEMV kernel: n_cols / tile.no threadgroups of tile.sg
 /// simdgroups; otherwise `tgs` threadgroups of `tg` threads.
@@ -121,6 +125,10 @@ fn runN(kr: *Kernel, inputs: []const Arr, shapes: []const []const c_int, n_cols:
     const c = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
     for (shapes) |sh| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, sh.len, .bfloat16));
+    if (kr.counter) |n| {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{n}, 1, .uint32));
+        try mlx.check(mlx_fast_metal_kernel_config_set_init_value(c, 0));
+    }
     var n_tg = tgs;
     var tg = tg_threads;
     if (n_cols) |n| {
@@ -166,9 +174,6 @@ pub const Block = struct {
     b1: Arr,
     w2: Arr,
     b2: Arr,
-    /// int32 [1024] (big enough to be bound as device memory) counter for A's last-threadgroup election, shared by
-    /// the blocks of one stack (zero at load; only ever incremented by A).
-    cnt: Arr,
 };
 
 /// Whether x [B, L, 1024] fits the fused DiT kernels.
@@ -186,7 +191,7 @@ fn qkvAtt(b: *const Block, x: Arr, cos: Arr, sin: Arr, t: []const Tmpl, s: S) ![
     const tl = k_qkv.tile;
     const ta: []const Tmpl = &.{ t[0], t[1], .{ "NTG", @divExact(3 * 64, tl.no) } };
     var o: [2]Arr = undefined;
-    try runN(&k_qkv, &.{ x, b.norm1, b.wq, b.wk, b.wv, b.bq, b.bk, b.bv, cos, sin, b.cnt }, &.{ &.{ 3, R, D }, &.{ R, D } }, 3 * D, 0, 128, ta, s, &o);
+    try runN(&k_qkv, &.{ x, b.norm1, b.wq, b.wk, b.wv, b.bq, b.bk, b.bv, cos, sin }, &.{ &.{ 3, R, D }, &.{ R, D } }, 3 * D, 0, 128, ta, s, &o);
     return o;
 }
 

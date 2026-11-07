@@ -789,17 +789,12 @@ const DitStack = struct {
         var rot: Rotary = .{ .inv_freq = try t.get(prefix ++ ".rotary_embed.inv_freq", .{}) };
         try rot.precompute(a, s, seq_len);
         try t.extra.appendSlice(t.a, &rot.tab);
-        var cnt = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_zeros(&cnt, &[_]c_int{1024}, 1, .int32, s));
-        try t.extra.append(t.a, cnt);
-        try evalAll(&.{cnt});
         // A quantized pack leaves `fb` empty and runs the op chain.
         const dense = for (blocks) |b| {
             if (!denseBiased(&.{ b.q, b.k, b.v, b.out, b.ff1, b.ff2 })) break false;
         } else true;
         const fb = try a.alloc(fused.Block, if (dense) n else 0);
         for (blocks[0..fb.len], fb) |b, *f| f.* = .{
-            .cnt = cnt,
             .norm1 = b.norm1,
             .norm2 = b.norm2,
             .wq = b.q.w,

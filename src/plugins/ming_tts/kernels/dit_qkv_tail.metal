@@ -14,14 +14,14 @@ for (int ei = int(t); ei < NO / 2 * R; ei += 32 * SG) {
     OUT[(which * R + r) * 1024 + col + 1] = bfloat16_t(od);
 }
 // Per head h, the last threadgroup to finish h's q/k/v columns computes
-// h's attention into ATT. Counters CNT[h] are never reset: every dispatch
-// adds exactly NTG = 3 * 64 / NO to each.
+// h's attention into ATT. CNT[h] is an output MLX zeroes before the dispatch
+// (`init_value` 0), and the NTG = 3 * 64 / NO threadgroups of h bump it.
 threadgroup_barrier(mem_flags::mem_device);
 threadgroup bool last;
 if (t == 0) {
     atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
     const uint old = atomic_fetch_add_explicit((device atomic_uint*)CNT + col0 / 64, 1u, memory_order_relaxed);
-    last = old % uint(NTG) == uint(NTG - 1);
+    last = old == uint(NTG - 1);
 }
 threadgroup_barrier(mem_flags::mem_threadgroup);
 if (!last) return;

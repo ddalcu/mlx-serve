@@ -21,6 +21,9 @@ const D = 1024;
 const FF = 4096;
 const WL = 896;
 const MLP = 4864;
+const HEADS = D / 64;
+/// Threadgroups per head of `ming_dit_qkv` (NTG): 3 * 64 columns, 2 per threadgroup.
+const QKV_TGS = 3 * 64 / 2;
 const CFG: f32 = 2;
 const STEP = 3;
 const LOG2_THETA: f32 = @log2(@as(f32, 10000));
@@ -38,7 +41,7 @@ fn launchOf(comptime name: [:0]const u8, comptime inputs: []const [*:0]const u8,
 }
 
 // A adds `hq[3 * R * 32]` uints and a bool at R 6; LB `q[64]`, `sc[512]`, `rd[256]` floats.
-const qkv_launch = launchOf("ming_dit_qkv", &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN", "CNT" }, &.{ "OUT", "ATT" }, fused.SRC_QKV, gemvBytes(2, 6) + 2304 + 4, 640);
+const qkv_launch = launchOf("ming_dit_qkv", &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, &.{ "OUT", "ATT", "CNT" }, fused.SRC_QKV, gemvBytes(2, 6) + 2304 + 4, 640);
 const attn_launch = launchOf("ming_dit_attn_out", &.{ "ATT", "X", "WO", "BO" }, &.{"OUT"}, fused.SRC_ATTN, gemvBytes(2, 6), 1024);
 const ff1_launch = launchOf("ming_dit_ff1", &.{ "X", "NW", "W1", "B1" }, &.{"OUT"}, fused.SRC_FF1, gemvBytes(2, 6), 640);
 const ff2_launch = launchOf("ming_dit_ff2", &.{ "HH", "X", "W2", "B2" }, &.{"OUT"}, fused.SRC_FF2, gemvBytes(2, 6), 1024);
@@ -53,7 +56,7 @@ const lm_down_launch = launchOf("ming_lm_down", &.{ "HH", "X", "WD" }, &.{"OUT"}
 /// What an input holds, which decides how `.random`, `.nonfinite` and `.stress` fill it. `act`: activations a
 /// non-finite row may hit (DiT); `fixed`: the same but kept finite (one row, or a row every output reads); `res`: the
 /// residual x.
-const Role = enum { act, fixed, res, norm, w, bias, cos, sin, count, y, dtt, sq, sde, qkv, kv_k, kv_v, pos };
+const Role = enum { act, fixed, res, norm, w, bias, cos, sin, y, dtt, sq, sde, qkv, kv_k, kv_v, pos };
 
 const In = struct {
     role: Role,
@@ -74,7 +77,7 @@ const In = struct {
     fn dtype(i: In) mlx.mlx_dtype {
         return switch (i.role) {
             .cos, .sin => .float32,
-            .count, .pos => .int32,
+            .pos => .int32,
             else => .bfloat16,
         };
     }
@@ -106,7 +109,6 @@ fn layout(kind: Kind, shape: Shape) Layout {
             for (0..3) |_| l.add(.bias, &.{D});
             l.add(.cos, &.{ 1, 1, seq, 32 });
             l.add(.sin, &.{ 1, 1, seq, 32 });
-            l.add(.count, &.{D});
         },
         .dit_out => {
             l.add(.act, &.{ r, D });
@@ -285,9 +287,10 @@ const Ming = struct {
                 gemv(&g, 3 * D, 2);
                 g.out(&.{ 3, r, D }, .bfloat16);
                 g.out(&.{ r, D }, .bfloat16);
+                g.out(&.{HEADS}, .uint32);
                 g.int("R", r);
                 g.int("L", seq);
-                g.int("NTG", 3 * 64 / 2);
+                g.int("NTG", QKV_TGS);
             },
             .dit_out, .dit_ff2 => {
                 gemv(&g, D, 2);
@@ -384,10 +387,6 @@ const Ming = struct {
                 };
                 return;
             },
-            .count => {
-                @memset(x, 0);
-                return;
-            },
             .pos => return,
         };
         host.uniformInto(rng, x, span.lo, span.hi, .bfloat16);
@@ -417,7 +416,6 @@ const Ming = struct {
             },
             .kv_k => keyRows(x, rng),
             .kv_v => host.intsInto(rng, x, -8, 8),
-            .count => @memset(x, 0),
             .sin, .pos => {},
         }
     }
@@ -496,7 +494,7 @@ const Ming = struct {
     pub fn count(self: *const Ming) usize {
         const r = self.shape.rows;
         return switch (self.kind) {
-            .dit_qkv => 4 * r * D,
+            .dit_qkv => 4 * r * D + HEADS,
             .dit_out, .dit_ff2 => r * D,
             .dit_ff1 => r * FF,
             .embed => 6 * D,
@@ -676,6 +674,8 @@ const Ming = struct {
             self.attend(&q, seq, &o, null);
             for (o, 0..) |y, d| put(want, mag, 3 * r * D + ri * D + h * 64 + d, y);
         };
+        // CNT: each head's threadgroups, counted from MLX's zero fill.
+        for (0..HEADS) |h| put(want, mag, 4 * r * D + h, .exact(QKV_TGS));
     }
 
     fn emitFinal(self: *const Ming, want: []f64, mag: ?[]f64, sim: Sim) void {
@@ -771,6 +771,14 @@ const Ming = struct {
     }
 };
 
+fn qkvRows(s: Shape) usize {
+    return 4 * s.rows * D;
+}
+
+fn qkvHeads(_: Shape) usize {
+    return HEADS;
+}
+
 fn mingSpec(comptime name: []const u8, served: []const Shape) spec.Spec {
     return .{ .name = name, .accum = .f32, .depth = host.depthOne, .out = .bf16, .served = served, .sums = .{ .exact = false } };
 }
@@ -780,8 +788,7 @@ const dit_served: []const Shape = &.{ .{ .rows = 6, .n = 2, .k = D }, .{ .rows =
 pub fn register(set: *kc.Set) !void {
     const a = set.a;
     var qkv = mingSpec("ming_dit_qkv", dit_served);
-    // CNT is the election counter every threadgroup bumps: the one input a run changes by design.
-    qkv.in_place = true;
+    qkv.outs = &.{ .{ .elem = .bf16, .count = qkvRows }, .{ .elem = .u32, .count = qkvHeads } };
     try set.add(Ming, .init(a, &qkv_launch, .dit_qkv, 0), qkv, null);
     try set.add(Ming, .init(a, &attn_launch, .dit_out, 0), mingSpec("ming_dit_attn_out", dit_served), null);
     try set.add(Ming, .init(a, &ff1_launch, .dit_ff1, 0), mingSpec("ming_dit_ff1", dit_served), null);
@@ -805,11 +812,13 @@ pub fn register(set: *kc.Set) !void {
 
 const testing = std.testing;
 
+/// The wrapper's outputs lead the launch's: `ming_dit_qkv`'s CNT comes last, and the wrapper drops it.
 fn expectLaunch(t: *Ming, theirs: []const mlx.mlx_array) !void {
     try t.run();
     const ours = try testing.allocator.dupe(u8, t.rig.outputBytes());
     defer testing.allocator.free(ours);
-    try testing.expectEqualSlices(u8, try t.rig.bytesOf(theirs), ours);
+    const want = try t.rig.bytesOf(theirs);
+    try testing.expectEqualSlices(u8, want, ours[0..want.len]);
 }
 
 test "kernel contract ming_tts: the DiT launches are the shipped block's, byte for byte" {
@@ -826,11 +835,8 @@ test "kernel contract ming_tts: the DiT launches are the shipped block's, byte f
     defer td.deinit();
     for ([_]*Ming{ &ta, &tb, &tc, &td }, 1..) |t, seed| try testing.expect(try t.prepare(shape, .random, seed));
     const s = ta.rig.stream();
-    var cnt = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(cnt);
-    try mlx.check(mlx.mlx_zeros(&cnt, &[_]c_int{D}, 1, .int32, s));
     const x = ta.args;
-    const b = fused.Block{ .norm1 = x[1], .wq = x[2], .wk = x[3], .wv = x[4], .bq = x[5], .bk = x[6], .bv = x[7], .norm2 = tc.args[1], .wo = tb.args[2], .bo = tb.args[3], .w1 = tc.args[2], .b1 = tc.args[3], .w2 = td.args[2], .b2 = td.args[3], .cnt = cnt };
+    const b = fused.Block{ .norm1 = x[1], .wq = x[2], .wk = x[3], .wv = x[4], .bq = x[5], .bk = x[6], .bv = x[7], .norm2 = tc.args[1], .wo = tb.args[2], .bo = tb.args[3], .w1 = tc.args[2], .b1 = tc.args[3], .w2 = td.args[2], .b2 = td.args[3] };
     const o = try fused.block(&b, x[0], x[8], x[9], s);
     defer for ([_]mlx.mlx_array{ o.qkv, o.att, o.x1, o.hh, o.x2 }) |y| {
         _ = mlx.mlx_array_free(y);
