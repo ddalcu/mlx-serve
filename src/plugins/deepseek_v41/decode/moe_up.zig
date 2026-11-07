@@ -572,7 +572,7 @@ test "dsv41 dec moe_up: the kernel contract's gates 1-4 over both widths" {
 const bench_copies = 12;
 const bench_steps = 60;
 
-fn randomBits(shape: []const c_int, width: c_int, seed: u64) !A {
+pub fn randomBits(shape: []const c_int, width: c_int, seed: u64) !A {
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_key(&key, seed));
@@ -601,7 +601,7 @@ fn firstExpert(a: A) !A {
     return v;
 }
 
-fn evalAll(xs: []const A) !void {
+pub fn evalAll(xs: []const A) !void {
     const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
     defer _ = mlx.mlx_vector_array_free(v);
     try mlx.check(mlx.mlx_eval(v));
@@ -814,7 +814,7 @@ fn nowUs() i64 {
 }
 
 /// Median microseconds a step of an `n`-step chain takes on the device, the graph built before the clock starts.
-fn deviceUs(ctx: anytype, n: usize) !f64 {
+pub fn deviceUs(ctx: anytype, n: usize) !f64 {
     var times: [7]f64 = undefined;
     for (0..2 + times.len) |rep| {
         var last: A = none;
@@ -829,7 +829,7 @@ fn deviceUs(ctx: anytype, n: usize) !f64 {
 }
 
 /// Milliseconds the first evaluation of a chain's step takes: MLX compiles the pipeline of its (R, bits) on it.
-fn firstCallMs(ctx: anytype) !f64 {
+pub fn firstCallMs(ctx: anytype) !f64 {
     const last = try ctx.step(0);
     const t0 = nowUs();
     try mlx.check(mlx.mlx_array_eval(last));
