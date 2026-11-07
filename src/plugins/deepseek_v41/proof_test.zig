@@ -255,7 +255,7 @@ test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint"
     }
 }
 
-test "deepseek_v41 aux: candidate image key ignores later rows and eligibility excludes streamed and paired instances" {
+test "deepseek_v41 aux: candidate image key ignores later rows and eligibility excludes streaming banks and paired instances" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -281,6 +281,12 @@ test "deepseek_v41 aux: candidate image key ignores later rows and eligibility e
     m.cfg.dsv41_streamed = true;
     try testing.expect(aux.enabled(t.m));
     m.cfg.dsv41_streamed = false;
+    m.bank_streams = true;
+    try testing.expect(!aux.enabled(t.m));
+    m.bank_streams = false;
+    try testing.expect(v41.bankStreams(146, 183, 384));
+    try testing.expect(v41.bankStreams(384, 200, 384));
+    try testing.expect(!v41.bankStreams(384, 384, 384));
     m.mdl.pair = .{ .lo = 2, .hi = 4, .worker = false };
     defer m.mdl.pair = null;
     try testing.expect(!aux.enabled(t.m));
