@@ -7,6 +7,7 @@
 //! (`applyMrope`), sdk/blocks/rope/yarn.zig (`yarnScaleQK`).
 
 const mlx = @import("../../../mlx/ffi.zig");
+const std = @import("std");
 const ops = @import("../../../mlx/ops.zig");
 const log = @import("../../util/log.zig");
 const abi = @import("../../../abi/plugin.zig");
@@ -194,11 +195,15 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
         q_rope = r[0];
         k_rope = r[1];
     }
-    if (q_rope == null and c.tree != null) return error.SpecTreeUnsupported;
     if (q_rope == null) {
-        const q_t = try g.transpose(try g.rmsNorm(queries, w.q_norm, c.shared.eps), &perm);
-        const k_t = try g.transpose(try g.rmsNorm(k_r, w.k_norm, c.shared.eps), &perm);
-        if (c.mrope) |m| {
+        const qn = try g.rmsNorm(queries, w.q_norm, c.shared.eps);
+        const kn = try g.rmsNorm(k_r, w.k_norm, c.shared.eps);
+        const q_t = try g.transpose(if (ops.dtype(w.q_norm) == .float32) try g.astype(qn, ops.dtype(queries)) else qn, &perm);
+        const k_t = try g.transpose(if (ops.dtype(w.k_norm) == .float32) try g.astype(kn, ops.dtype(k_r)) else kn, &perm);
+        if (c.tree) |t| {
+            q_rope = try treeRope(g, q_t, t.attn.depth, geo, rd, off);
+            k_rope = try treeRope(g, k_t, t.attn.depth, geo, rd, off);
+        } else if (c.mrope) |m| {
             q_rope = try applyMrope(g, q_t, m[0], m[1], rd);
             k_rope = try applyMrope(g, k_t, m[0], m[1], rd);
         } else if (is_batched) {
@@ -286,6 +291,42 @@ fn tail(w: *const GatedAttention.Weights, lane: row_exact.Lane, parent: *Graph, 
     }
     if (w.geo.output_gate) return parent.keep(try w.o.onLane(lane, g, try g.reshape(try g.mul(attn_t, try g.sigmoid(gate)), &flat), decode_shape));
     return parent.keep(try w.o.onLane(lane, g, try g.reshape(attn_t, &flat), decode_shape));
+}
+
+/// Scalar/per-row RoPE for a draft tree after the fused norm+RoPE kernel declines (for example, FP32 raw-delta gains).
+/// The transposed input is [1,H,S,D]; dynamic RoPE's offsets are one per batch row, so make each tree row a batch row.
+fn treeRope(g: *Graph, x: Array, depths: Array, geo: *const Geo, rd: c_int, off: c_int) !Array {
+    const sh = ops.shape(x);
+    const s = sh[2];
+    const base = try g.add(try g.fromSlice(i32, &.{off}, &.{1}), depths);
+    const h = sh[1];
+    const flat = try g.transpose(x, &.{ 2, 1, 0, 3 });
+    const roped = try g.call(mlx.mlx_fast_rope_dynamic, .{ flat, rd, false, geo.base(), geo.rope_scale, base, geo.yarn_freqs });
+    const shaped = try g.reshape(roped, &.{ 1, s, h, geo.head_dim });
+    const out = try g.transpose(shaped, &perm);
+    return if (geo.yarn_mscale.ctx != null) g.mul(out, geo.yarn_mscale) else out;
+}
+
+test "gated attention tree RoPE uses each row's depth when composed QK norm declines" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    var g = Graph.init(std.testing.allocator, s);
+    defer g.deinit();
+    const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24 };
+    const f = mlx.mlx_array_new_data(&values, &[_]c_int{ 1, 2, 3, 4 }, 4, .float32);
+    defer _ = mlx.mlx_array_free(f);
+    const x = try g.astype(f, .bfloat16);
+    const depths = try g.fromSlice(i32, &.{ 0, 2 }, &.{2});
+    const depth_values = [_]i32{ 0, 2 };
+    const geo = Geo{ .heads = 3, .kv_heads = 3, .head_dim = 4, .scale = 0.5, .rope_dims = 4, .rope_base = 10000, .output_gate = true };
+    const got = try treeRope(&g, try g.transpose(x, &perm), depths, &geo, 4, 7);
+    var want_parts: [2]Array = undefined;
+    for (&want_parts, 0..) |*part, i| {
+        const row = try g.slice(x, &.{ 0, @intCast(i), 0, 0 }, &.{ 1, @intCast(i + 1), 3, 4 });
+        part.* = try g.call(mlx.mlx_fast_rope, .{ try g.transpose(row, &perm), 4, false, geo.base(), geo.rope_scale, 7 + depth_values[i], geo.yarn_freqs });
+    }
+    const want = try g.concat(&want_parts, 2);
+    try ops.expectBitEqual(got, want);
 }
 
 /// Interleaved M-RoPE on `[B, H, S, D]` from per-token `cos`/`sin` rows over the first `rd` dims.

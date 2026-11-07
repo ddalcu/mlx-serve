@@ -110,6 +110,7 @@ pub fn fusedQkNormRope(
     // rd=0 is a NoPE layer: every element takes the pass-through branch, `angles` is never read.
     if (rd != 0 and rd != 32 and rd != 64 and rd != 128) return null;
     if (q_norm_w.ctx == null or k_norm_w.ctx == null) return null;
+    if (mlx.mlx_array_dtype(q_norm_w) != dt or mlx.mlx_array_dtype(k_norm_w) != dt) return null;
 
     const key = QkFusedCfgKey{ .hq = hq, .hk = hk, .rd = rd, .scaled = ms != null, .dtype = dt };
     const slot = for (&qk_fused_cfgs) |*c| {
@@ -398,6 +399,31 @@ fn qkComposedRef(
         return scaled;
     }
     return roped;
+}
+
+test "qk norm rope fused declines mismatched FP32 norm gains" {
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    qk_fused_override = true;
+    defer qk_fused_override = null;
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_ones(&q, &[_]c_int{ 1, 1, 128 }, 3, .bfloat16, s));
+    var wb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wb);
+    try mlx.check(mlx.mlx_ones(&wb, &[_]c_int{128}, 1, .bfloat16, s));
+    var wf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wf);
+    try mlx.check(mlx.mlx_astype(&wf, wb, .float32, s));
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+    for ([_][2]mlx.mlx_array{ .{ wf, wb }, .{ wb, wf }, .{ wf, wf } }) |weights| {
+        const result = try fusedQkNormRope(s, q, q, weights[0], weights[1], q, null, eps, 1, 1, 0);
+        defer if (result) |pair| {
+            for (pair) |v| _ = mlx.mlx_array_free(v);
+        };
+        try std.testing.expect(result == null);
+    }
 }
 
 test "qk norm rope fused: bit-identical at the qwen geometry (rd=32, strided post-split q)" {

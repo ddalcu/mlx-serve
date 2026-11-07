@@ -34,12 +34,47 @@ pub const plugin = config.plugin;
 
 const b = bases.blocks;
 const gdn = b.gdn;
+/// FP32 folded gains retain HF's small deltas; only the norm's output returns to the residual dtype.
+const RmsNorm = struct {
+    pub const kind = b.norm.RmsNorm.kind;
+    pub const supports_batched_rows = true;
+    pub const fusable = true;
+    pub const Weights = mlx.mlx_array;
+
+    pub fn forward(w: *const Weights, c: *@import("../../sdk/bases/block.zig").Ctx, x: Weights) !Weights {
+        const y = try c.g.rmsNorm(x, w.*, c.shared.eps);
+        return if (mlx.mlx_array_dtype(w.*) == .float32) c.g.astype(y, mlx.mlx_array_dtype(x)) else y;
+    }
+};
+
+test "qwen3_5 FP32 norm gains preserve BF16 activations and small deltas" {
+    const ops = @import("../../mlx/ops.zig");
+    const block = @import("../../sdk/bases/block.zig");
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = ops.Graph.init(std.testing.allocator, s);
+    defer g.deinit();
+    var shared = bases.Shared.init(1e-6, 1e-6);
+    defer shared.deinit();
+    var c: block.Ctx = .{ .g = &g, .mode = .prefill, .rows = 1, .positions = &.{0}, .shared = &shared };
+    const data = [_]f32{ 0.8, -1.2, 0.4, 2.0 };
+    const gains = [_]f32{ 1.0001220703125, 0.999755859375, 1.0003662109375, 0.99951171875 };
+    const x32 = mlx.mlx_array_new_data(&data, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    const w = mlx.mlx_array_new_data(&gains, &[_]c_int{4}, 1, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    const x = try g.astype(x32, .bfloat16);
+    const y = try RmsNorm.forward(&w, &c, x);
+    try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, ops.dtype(y));
+    const expected = try g.astype(try g.rmsNorm(x, w, shared.eps), .bfloat16);
+    try std.testing.expectEqual(@as(f32, 0), try @import("../../sdk/testing/parity.zig").maxAbsDiffF32(y, expected, s));
+}
 
 pub const Mixer = bases.Either(gdn.Gdn, b.gated_attention.GatedAttention);
 
 pub const Dense = bases.Decoder(.{
     .embed = b.embed.TableEmbed,
-    .norm = b.norm.RmsNorm,
+    .norm = RmsNorm,
     .mixer = Mixer,
     .mlp = b.mlp.GatedMlp,
     .seam = b.seam.AddNorm,
@@ -48,7 +83,7 @@ pub const Dense = bases.Decoder(.{
 
 pub const Moe = bases.Decoder(.{
     .embed = b.embed.TableEmbed,
-    .norm = b.norm.RmsNorm,
+    .norm = RmsNorm,
     .mixer = Mixer,
     .mlp = b.moe.Moe,
     .seam = b.seam.AddNorm,

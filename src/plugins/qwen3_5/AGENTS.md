@@ -55,6 +55,7 @@ run by the engine). `qwen3_next` reuses this plugin's load and forward (`plugins
   string, only a refusing template gets `noThinkTailSuffix`; `preserve_thinking` keeps the template's default.
 - A MiniCPM-V image is SEVERAL encoder calls (thumbnail + crops); the canvas M-RoPE table is built from the EXPANDED
   ids (`minicpm_canvas.canvasPositions`).
+- Raw HF RMS deltas are folded to FP32 gains before load; preserve BF16 residual dtype after norm, including fused-seam declines and direct GDN gains. If fused QK norm declines, tree verify must use composed per-depth RoPE rather than refuse the tree.
 
 ## Known issues
 - The shared-expert gate vector (`SharedExpert.gate_vec`): dropping it is not caught by the proof (the router
