@@ -132,8 +132,9 @@ pub fn qkvDecMmaFits(gqa: c_int, dk: c_int, dv: c_int, gs: c_int) bool {
 
 /// Whether a decode-width call goes to the simdgroup-matrix kernel ahead of the matmul2d page kernel: on the M4
 /// family's shader tile (measured there); a GPU with matrix units keeps the page kernel past its window.
+/// The one gate for both sites (the matmul2d skip and the dispatch); the test seam wins over the tile.
 fn qkvDecMmaTakes(q: mlx.mlx_array, view: *const DenseKVView) bool {
-    if (!qkvDecMmaEnabled() or verifyQmmTile() == .nax) return false;
+    if (!(qkv_dec_mma_override orelse (qkvDecMmaEnabled() and verifyQmmTile() != .nax))) return false;
     if ((view.bits != 4 and view.bits != 8) or view.group_size == 0) return false;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(view.k_triple_q);
@@ -154,9 +155,9 @@ pub fn qkvDecMmaTgBytes(gqa: c_int, dk: c_int, dv: c_int) c_int {
 }
 
 pub var qkv_dec_mma_override: ?bool = null; // test seam
+pub var qkv_dec_mma_calls: usize = 0; // test seam: dispatches of the kernel
 var qkv_dec_mma_env: ?bool = null;
 fn qkvDecMmaEnabled() bool {
-    if (qkv_dec_mma_override) |v| return v;
     if (qkv_dec_mma_env) |v| return v;
     const v = if (env.get(.MLX_SERVE_KV_ATTN_MMA)) |x| x[0] != '0' else true;
     qkv_dec_mma_env = v;
@@ -231,6 +232,7 @@ fn qkvAttnDecodeMma(s: mlx.mlx_stream, q: mlx.mlx_array, view: *const DenseKVVie
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, o_t, &[_]c_int{ 1, h_q, 1, dv }, 4, s));
+    qkv_dec_mma_calls += 1;
     if (!qkv_dec_mma_engaged) {
         qkv_dec_mma_engaged = true;
         log.info("[kv-attn] decode kernel (simdgroup matrix) engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} splits={d} mask={}\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, nsplit, mask != null });
@@ -322,7 +324,7 @@ pub fn qkvAttnDecodeKernel(
         return null;
     }
 
-    if (qkvDecMmaEnabled() and qkvDecMmaFits(gqa, dk, dv, @intCast(view.group_size))) {
+    if (qkvDecMmaTakes(q, view)) {
         return try qkvAttnDecodeMma(s, q, view, scale, if (has_mask) mask_arr else null, h_q, h_kv, dk, dv, t_k, qdt);
     }
 

@@ -210,6 +210,19 @@ test "qkv decode simdgroup-matrix kernel: two head tiles, 8-bit dims across word
     try qkvDecParityCase(6, 1, 256, 8, 700, false);
 }
 
+test "qkv decode simdgroup-matrix kernel: a NAX GPU keeps the block kernel at 4K keys" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const nax = @import("../linear/verify_qmm_nax.zig");
+    const before = kv_quant_attn.qkv_dec_mma_calls;
+    try qkvDecParityCase(8, 2, 128, 4, 4096, false);
+    try testing.expect(kv_quant_attn.qkv_dec_mma_calls > before);
+    nax.vqmm_nax_probe_override = true;
+    defer nax.vqmm_nax_probe_override = null;
+    const at = kv_quant_attn.qkv_dec_mma_calls;
+    try qkvDecParityCase(8, 2, 128, 4, 4096, false);
+    try testing.expectEqual(at, kv_quant_attn.qkv_dec_mma_calls);
+}
+
 fn qkvVerParityCase(h_q: c_int, h_kv: c_int, d: c_int, bits: u8, t_prefill: usize, t_q: c_int) !void {
     return qkvVerParityCaseWith(h_q, h_kv, d, bits, t_prefill, t_q, false);
 }
