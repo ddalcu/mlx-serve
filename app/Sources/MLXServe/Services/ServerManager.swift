@@ -977,19 +977,19 @@ class ServerManager: ObservableObject {
                 return bundled
             }
         }
-        // 2. Development: zig-out/bin/mlx-serve relative to this source file's repo root
-        //    The Swift package lives in app/, so the repo root is one level up.
-        let repoRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // Services/
-            .deletingLastPathComponent() // MLXServe/
-            .deletingLastPathComponent() // Sources/
-            .deletingLastPathComponent() // app/
-            .path
-        let zigOut = (repoRoot as NSString).appendingPathComponent("zig-out/bin/mlx-serve")
-        if FileManager.default.fileExists(atPath: zigOut) {
-            return zigOut
+        // 2. Development: the checkout's own build.
+        if FileManager.default.fileExists(atPath: sourceBuildBinaryPath) {
+            return sourceBuildBinaryPath
         }
         return "mlx-serve"
+    }
+
+    /// `zig-out/bin/mlx-serve` at the checkout root, which sits four folders above this file
+    /// (app/Sources/MLXServe/Services/).
+    nonisolated static var sourceBuildBinaryPath: String {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
+        return root.appendingPathComponent("zig-out/bin/mlx-serve").path
     }
 
     /// Note this never runs at app exit — a `@StateObject` is not deallocated
