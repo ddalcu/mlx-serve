@@ -11,6 +11,7 @@ const buildBytesToUnicode = @import("pretokenize.zig").buildBytesToUnicode;
 const MetaspacePrepend = @import("load.zig").MetaspacePrepend;
 const byteTokenValue = @import("load.zig").byteTokenValue;
 const flushByteRun = @import("load.zig").flushByteRun;
+const nfc = @import("nfc.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
 
@@ -136,6 +137,9 @@ pub const Tokenizer = struct {
     /// tokens decode as the bytes they spell (U+FFFD per byte when the run
     /// is not valid UTF-8).
     byte_fallback_decode: bool = false,
+    /// tokenizer.json `normalizer` is (or holds in a `Sequence`) `NFC`: text between specials is
+    /// NFC-normalized before encoding (Qwen2 class). Other normalizers are not applied.
+    nfc: bool = false,
     /// The special a `TemplateProcessing` post-processor appends after a single sequence
     /// (Qwen3-Embedding's `<|endoftext|>`); `encode` never adds it, a last-token pooler must.
     appended_special: ?u32 = null,
@@ -439,7 +443,10 @@ pub const Tokenizer = struct {
     }
 
     /// Encode a text segment (no special tokens) using the appropriate method.
-    fn encodeSegment(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, at_start: bool) ![]u32 {
+    fn encodeSegment(self: *const Tokenizer, allocator: std.mem.Allocator, text_in: []const u8, at_start: bool) ![]u32 {
+        const normalized = if (self.nfc) try nfc.normalize(allocator, text_in) else null;
+        defer if (normalized) |n| allocator.free(n);
+        const text = normalized orelse text_in;
         return switch (self.tok_type) {
             .sentencepiece_bpe => self.encodeSentencePiece(allocator, text, at_start),
             .byte_level_bpe => self.encodeByteLevel(allocator, text),
@@ -956,4 +963,5 @@ test {
     _ = @import("load.zig");
     _ = @import("pretokenize.zig");
     _ = @import("tokenizer_test.zig");
+    _ = @import("nfc.zig");
 }

@@ -12,7 +12,7 @@
 //!   numbers and dates are read as written in both.
 //! - Unicode classes (`isalpha`, `isalnum`, `\w`) cover Latin, Greek,
 //!   Cyrillic, CJK, kana and hangul; other scripts count as non-letters.
-//! - No NFC normalization of input text (inputs are expected in NFC).
+//! - Input arrives NFC: `plugin.zig` normalizes `input` and `ref_text` (`sdk/tokenizer/nfc.zig`).
 
 const std = @import("std");
 
@@ -1866,98 +1866,12 @@ pub const InputIds = struct {
 };
 
 /// `encode` is any tokenizer with `encode(allocator, text) ![]u32` (no BOS/EOS).
-// ── NFC (the tokenizer's normalizer) ──
-
-const nfc_table = @import("nfc_table.zig").pairs;
-
-fn composePair(base: u21, mark: u21) ?u21 {
-    // Hangul: L + V → LV, LV + T → LVT (Unicode §3.12).
-    const S_BASE = 0xAC00;
-    const L_BASE = 0x1100;
-    const V_BASE = 0x1161;
-    const T_BASE = 0x11A7;
-    if (base >= L_BASE and base < L_BASE + 19 and mark >= V_BASE and mark < V_BASE + 21)
-        return S_BASE + ((base - L_BASE) * 21 + (mark - V_BASE)) * 28;
-    if (base >= S_BASE and base < S_BASE + 11172 and (base - S_BASE) % 28 == 0 and mark > T_BASE and mark < T_BASE + 28)
-        return base + (mark - T_BASE);
-    var lo: usize = 0;
-    var hi: usize = nfc_table.len;
-    while (lo < hi) {
-        const mid = (lo + hi) / 2;
-        const p = nfc_table[mid];
-        if (p.base == base and p.mark == mark) return p.composed;
-        if (p.base < base or (p.base == base and p.mark < mark)) lo = mid + 1 else hi = mid;
-    }
-    return null;
-}
-
-/// Unicode NFC for text that is NFC already or canonically decomposed
-/// (NFD), which is what keyboards and macOS paste produce. Caller frees.
-/// Ceiling: no canonical reordering of several marks on one base and no
-/// decomposition of precomposed input, so a non-canonical mark order or
-/// mixed precomposed + combining text can differ from full NFC. Upgrade
-/// path: generate the decomposition and combining-class tables too.
-pub fn nfc(a: std.mem.Allocator, s: []const u8) ![]u8 {
-    var view = std.unicode.Utf8View.init(s) catch return a.dupe(u8, s);
-    var it = view.iterator();
-    var cps: std.ArrayList(u21) = .empty;
-    defer cps.deinit(a);
-    var starter: ?usize = null;
-    var changed = false;
-    while (it.nextCodepoint()) |cp| {
-        if (starter) |i| if (composePair(cps.items[i], cp)) |c| {
-            cps.items[i] = c;
-            changed = true;
-            continue;
-        };
-        try cps.append(a, cp);
-        if (!isCombiningMark(cp)) starter = cps.items.len - 1;
-    }
-    if (!changed) return a.dupe(u8, s);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(a);
-    for (cps.items) |cp| {
-        var buf: [4]u8 = undefined;
-        const n = try std.unicode.utf8Encode(cp, &buf);
-        try out.appendSlice(a, buf[0..n]);
-    }
-    return out.toOwnedSlice(a);
-}
-
-fn isCombiningMark(cp: u21) bool {
-    return (cp >= 0x0300 and cp <= 0x036F) or (cp >= 0x1AB0 and cp <= 0x1AFF) or (cp >= 0x1DC0 and cp <= 0x1DFF) or
-        (cp >= 0x20D0 and cp <= 0x20FF) or (cp >= 0xFE20 and cp <= 0xFE2F) or cp == 0x3099 or cp == 0x309A or
-        (cp >= 0x0591 and cp <= 0x05C7) or (cp >= 0x0610 and cp <= 0x061A) or (cp >= 0x064B and cp <= 0x065F) or
-        (cp >= 0x1161 and cp <= 0x11FF); // Hangul V/T jamo continue a syllable
-}
-
-test "ming_tts text: nfc composes French, Vietnamese stacking, kana and Hangul" {
-    const a = std.testing.allocator;
-    const cases = [_][2][]const u8{
-        .{ "e\u{301}te\u{301} a\u{300} c\u{327}a o\u{302}", "été à ça ô" },
-        .{ "e\u{323}\u{302}", "ệ" },
-        .{ "か\u{3099}", "が" },
-        .{ "\u{1112}\u{1161}\u{11AB}", "한" },
-        .{ "déjà", "déjà" },
-    };
-    for (cases) |c| {
-        const got = try nfc(a, c[0]);
-        defer a.free(got);
-        try std.testing.expectEqualStrings(c[1], got);
-    }
-}
-
 pub fn buildInputIds(a: std.mem.Allocator, tok: anytype, prompt: []const u8, text_: []const u8, num_speakers: usize, instruction: ?[]const u8, prompt_text: ?[]const u8, prompt_latent_steps: usize) !InputIds {
     var ids: std.ArrayList(i32) = .empty;
     errdefer ids.deinit(a);
     const Enc = struct {
         fn add(al: std.mem.Allocator, t: anytype, list: *std.ArrayList(i32), s: []const u8) !void {
-            // tokenizer.json declares an NFC normalizer that tokenizer.zig does
-            // not apply; without it NFD input (e + U+0301, common from macOS
-            // paste) tokenizes differently from the reference.
-            const n = try nfc(al, s);
-            defer al.free(n);
-            const e = try t.encode(al, n);
+            const e = try t.encode(al, s);
             defer al.free(e);
             for (e) |x| try list.append(al, @intCast(x));
         }

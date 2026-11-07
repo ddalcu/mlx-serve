@@ -362,6 +362,7 @@ pub fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: 
         .fuse_unk = if (model_obj.get("fuse_unk")) |v| v == .bool and v.bool else false,
         .unk_id = if (model_obj.get("unk_token")) |v| (if (v == .string) vocab.get(v.string) else null) else null,
         .byte_fallback_decode = if (root.get("decoder")) |d| decoderHasByteFallback(d) else false,
+        .nfc = if (root.get("normalizer")) |n| normalizerHasNfc(n) else false,
         .appended_special = if (root.get("post_processor")) |pp| appendedSpecialId(pp, &special_tokens) else null,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
@@ -530,6 +531,19 @@ pub fn decoderHasByteFallback(dec: std.json.Value) bool {
         if (subs != .array) return false;
         for (subs.array.items) |sub| if (decoderHasByteFallback(sub)) return true;
     }
+    return false;
+}
+
+/// The `normalizer` is `NFC` or a `Sequence` holding one.
+pub fn normalizerHasNfc(n: std.json.Value) bool {
+    if (n != .object) return false;
+    const t = n.object.get("type") orelse return false;
+    if (t != .string) return false;
+    if (std.mem.eql(u8, t.string, "NFC")) return true;
+    if (!std.mem.eql(u8, t.string, "Sequence")) return false;
+    const subs = n.object.get("normalizers") orelse return false;
+    if (subs != .array) return false;
+    for (subs.array.items) |sub| if (normalizerHasNfc(sub)) return true;
     return false;
 }
 

@@ -9,7 +9,7 @@ download), `jorgepb96/Ming-3.0-tts-0.5B-4bit`, and bf16, the quality reference (
 ## Files
 - `plugin.zig`: the media table, the request's fields, the tiny conformance pack.
 - `config.zig`: claims (`model_type: dense` plus `ditar_config` and `aggregator_config`), bills, the geometry parse.
-- `engine.zig`: tasks to samples: fragments, retries, joins, prompt audio. `text.zig`, `fr.zig`, `nfc_table.zig`: the
+- `engine.zig`: tasks to samples: fragments, retries, joins, prompt audio. `text.zig`, `fr.zig`: the
   frontend. `audio.zig`: resampler, fbank, trims. `campplus.zig`: CAM++ on the CPU stream.
 - `model.zig`: the op chain, the pipelined decode loop. `fused.zig`, `kernels/`, `contract.zig`: the fused kernels.
 

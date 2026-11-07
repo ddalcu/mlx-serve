@@ -10,6 +10,7 @@ const wav = @import("../../sdk/media/wav.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const engine = @import("engine.zig");
 const text = @import("text.zig");
+const nfc = @import("../../sdk/tokenizer/nfc.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -160,6 +161,11 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         r.language = null;
     };
     if (readControls(req, a, &body, &r)) |v| return v;
+    // The frontend reads composed letters (language scoring, French spelling); macOS paste is NFD.
+    if (nfc.normalize(a, r.text) catch return bad("out of memory")) |s| r.text = s;
+    if (r.prompt_text) |t| if (nfc.normalize(a, t) catch return bad("out of memory")) |s| {
+        r.prompt_text = s;
+    };
 
     var ref_b64: ?[]const u8 = null;
     if (optStr(req, &body, "ref_audio", &ref_b64)) |v| return v;
