@@ -166,6 +166,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 **Static and release guards** (all **H**)
 - `test_build_env_reaches_tests.sh` a shell variable reaches `zig build test` on a cached configuration
 - `test_release_workflow_gates.sh` release.yml + app/build.sh · `test_release.sh` release.sh · `test_resource_xattrs.sh`
+- `test_dev_version.sh` a source build stamps the newest release tag behind HEAD (`scripts/dev-version.sh`)
 - `test_model_card_frontmatter.sh` converter model cards · `test_website_pages.sh` · `website_benchmarks_logic.mjs`, `website_tier_list_logic.mjs`
 
 **Benchmarks and diagnostics** (measurements, not pass/fail; method in the `/bench` skill)
