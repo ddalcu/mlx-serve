@@ -24,6 +24,7 @@ const resolveKvAttnFused = @import("request_options.zig").resolveKvAttnFused;
 const mtpCapable = @import("request_options.zig").mtpCapable;
 const getTimeoutNs = @import("../http/server.zig").getTimeoutNs;
 const decodeTokens = @import("tokenize.zig").decodeTokens;
+const countTextTokens = @import("tokenize.zig").countTextTokens;
 const promptOpensThink = @import("../chat/reasoning/request.zig").promptOpensThink;
 const promptOpensMuseHeader = @import("../chat/reasoning/request.zig").promptOpensMuseHeader;
 const reasoningDialect = @import("../chat/reasoning/request.zig").reasoningDialect;
@@ -200,6 +201,7 @@ pub fn handleAnthropicStreaming(
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>";
     var skipped_think_open = false;
+    // Reasoning tokens so far: the budget counts them, and message_delta reports them as thinking_tokens.
     var think_tokens: i32 = 0;
     var budget_exhausted = false;
 
@@ -302,6 +304,7 @@ pub fn handleAnthropicStreaming(
         if (delivery) |*d| {
             defer allocator.free(token_text);
             try d.feed(allocator, token_text);
+            if (d.reasoning.items.len > 0) think_tokens += 1;
             try emitConstrainedAnthropic(allocator, stream, &block_index, &thinking_block_open, &text_block_open, d);
             try beatStreamKeepalive(stream, .anthropic_ping);
             continue;
@@ -354,6 +357,7 @@ pub fn handleAnthropicStreaming(
                         const split = chat_mod.splitThinkBlock(buf, true, opens_think);
                         if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else split.reasoning_content orelse "", reasoning_streamed)) |rest| {
                             try sendAnthropicThinking(allocator, stream, block_index, &thinking_block_open, rest);
+                            think_tokens += @intCast(countTextTokens(allocator, lm, tok, rest));
                         }
                         try endAnthropicThinking(allocator, stream, &block_index, &thinking_block_open);
                         reasoning_streamed = 0;
@@ -761,6 +765,7 @@ pub fn handleAnthropicStreaming(
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
                 if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     try sendAnthropicThinking(allocator, stream, block_index, &thinking_block_open, reasoning);
+                    think_tokens += @intCast(countTextTokens(allocator, lm, tok, reasoning));
                 }
                 try endAnthropicThinking(allocator, stream, &block_index, &thinking_block_open);
             }
@@ -810,6 +815,7 @@ pub fn handleAnthropicStreaming(
                 const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
                 if (chat_mod.unstreamedReasoning(if (budget_exhausted) "" else think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     try sendAnthropicThinking(allocator, stream, block_index, &thinking_block_open, reasoning);
+                    think_tokens += @intCast(countTextTokens(allocator, lm, tok, reasoning));
                 }
                 try endAnthropicThinking(allocator, stream, &block_index, &thinking_block_open);
                 if (think_split.content.len > 0) {
@@ -858,7 +864,7 @@ pub fn handleAnthropicStreaming(
         {
             const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
-            const md = try formatAnthropicMessageDelta(allocator, stop_reason, stop_seq_json, total_prompt, ts.completion_tokens, ts.cached_tokens, timings_obj);
+            const md = try formatAnthropicMessageDelta(allocator, stop_reason, stop_seq_json, total_prompt, ts.completion_tokens, ts.cached_tokens, @intCast(think_tokens), timings_obj);
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -880,8 +886,8 @@ fn formatAnthropicMessageStart(allocator: std.mem.Allocator, id: i64, model_name
 
 /// `timings_obj` (formatTimingsObject; empty = none) rides as a top-level extension, as on the
 /// non-streaming response, so rate-metering proxies (llama-swap) read the streamed surface too.
-fn formatAnthropicMessageDelta(allocator: std.mem.Allocator, stop_reason: []const u8, stop_seq_json: []const u8, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32, timings_obj: []const u8) ![]u8 {
-    const usage = try formatAnthropicUsage(allocator, prompt_tokens, completion_tokens, cached_tokens);
+fn formatAnthropicMessageDelta(allocator: std.mem.Allocator, stop_reason: []const u8, stop_seq_json: []const u8, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32, thinking_tokens: u32, timings_obj: []const u8) ![]u8 {
+    const usage = try formatAnthropicUsage(allocator, prompt_tokens, completion_tokens, cached_tokens, thinking_tokens);
     defer allocator.free(usage);
     const sep: []const u8 = if (timings_obj.len > 0) ",\"timings\":" else "";
     return try std.fmt.allocPrint(allocator,
@@ -960,7 +966,7 @@ test "Anthropic usage: message_delta overwrites provisional message_start counts
         defer arena.deinit();
         const a = arena.allocator();
         const start = try formatAnthropicMessageStart(a, 1, "mlx-serve", 92934);
-        const delta = try formatAnthropicMessageDelta(a, "end_turn", "null", 92934, 126, cached_tokens, "");
+        const delta = try formatAnthropicMessageDelta(a, "end_turn", "null", 92934, 126, cached_tokens, 40, "");
         const start_event = try std.json.parseFromSliceLeaky(std.json.Value, a, start, .{});
         const delta_event = try std.json.parseFromSliceLeaky(std.json.Value, a, delta, .{});
         try testing.expectEqualStrings("message_start", start_event.object.get("type").?.string);
@@ -977,6 +983,7 @@ test "Anthropic usage: message_delta overwrites provisional message_start counts
         try testing.expectEqual(@as(i64, 0), created);
         try testing.expectEqual(@as(i64, @min(cached_tokens, 92934)), cached);
         try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
+        try testing.expectEqual(@as(?i64, 40), if (usage.get("output_tokens_details")) |d| d.object.get("thinking_tokens").?.integer else null);
     }
 }
 
@@ -985,11 +992,11 @@ test "Anthropic streaming: message_delta carries the timings extension when ther
     defer arena.deinit();
     const a = arena.allocator();
     const timings = try formatTimingsObject(a, 1000, 200, 50, 2 * std.time.ns_per_s, std.time.ns_per_s, 0);
-    const with = try std.json.parseFromSliceLeaky(std.json.Value, a, try formatAnthropicMessageDelta(a, "end_turn", "null", 1000, 50, 200, timings), .{});
+    const with = try std.json.parseFromSliceLeaky(std.json.Value, a, try formatAnthropicMessageDelta(a, "end_turn", "null", 1000, 50, 200, 0, timings), .{});
     const t = with.object.get("timings").?.object;
     try testing.expectEqual(@as(f64, 400), t.get("prompt_per_second").?.float);
     try testing.expectEqual(@as(f64, 50), t.get("predicted_per_second").?.float);
     try testing.expect(with.object.get("usage") != null);
-    const without = try std.json.parseFromSliceLeaky(std.json.Value, a, try formatAnthropicMessageDelta(a, "end_turn", "null", 1000, 50, 200, ""), .{});
+    const without = try std.json.parseFromSliceLeaky(std.json.Value, a, try formatAnthropicMessageDelta(a, "end_turn", "null", 1000, 50, 200, 0, ""), .{});
     try testing.expect(without.object.get("timings") == null);
 }
