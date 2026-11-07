@@ -1382,6 +1382,8 @@ struct AudioModelPreset: Identifiable, Hashable {
     /// Built-in voice ids, empty when the backend has none. A comma-separated
     /// selection BLENDS them server-side.
     var builtInVoices: [String] = []
+    /// A Ming-3.0-tts pack: picks the download bundle, whose files differ from Qwen3-TTS.
+    var isMing: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -1443,7 +1445,8 @@ struct AudioModelPreset: Identifiable, Hashable {
         approxDownloadGB: 1.6,
         approxRAMGB: 4,
         recommendedRefSeconds: 10,
-        description: "Clear 44.1 kHz speech in English, Chinese, French and more, faster than real time, with voice cloning from a clip of up to 20 seconds."
+        description: "Clear 44.1 kHz speech in English, Chinese, French and more, faster than real time, with voice cloning from a clip of up to 20 seconds.",
+        isMing: true
     )
 
     /// Ming-3.0-tts 0.5B bf16 — the quality reference, on the fused kernels.
@@ -1454,7 +1457,8 @@ struct AudioModelPreset: Identifiable, Hashable {
         approxDownloadGB: 2.9,
         approxRAMGB: 6,
         recommendedRefSeconds: 10,
-        description: "The same Ming voice model at full precision — the fastest Ming build on a Mac GPU, at more memory than the 8-bit build."
+        description: "The same Ming voice model at full precision — the fastest Ming build on a Mac GPU, at more memory than the 8-bit build.",
+        isMing: true
     )
 
     /// Kokoro-82M — the fast path. Non-autoregressive, so it is ~17x realtime
