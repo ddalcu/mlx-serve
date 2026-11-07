@@ -986,6 +986,7 @@ pub const Model = struct {
         m.t = try Tensors.load(a, path, null, s);
         errdefer m.t.deinit();
         m.t.scheme = dims.quant;
+        if (dims.quant) |q| log.info("[ming_tts] {d}-bit pack: the fused DiT and LM decode kernels read bf16 weights only, so this pack runs on the op chain\n", .{q.bits});
         const t = &m.t;
         m.embed = try t.get("model.model.embed_tokens.weight", .{});
         m.embed_q = try t.quantOf("model.model.embed_tokens", .{});
