@@ -35,19 +35,50 @@ pub const Mode = enum {
     }
 };
 
-/// How this process joins the group. Each rank names only its OWN RDMA device
-/// (the `rdma_enX` whose port faces the peer); JACCL reads only its own row of
-/// the device matrix but validates the whole square, so the other rows repeat it.
+/// The most ranks a group holds (JACCL's mesh: a cable from every Mac to every other).
+pub const max_ranks = 8;
+
+/// How this process joins the group. Each rank names only its OWN RDMA devices: in a pair the
+/// one `rdma_enX` whose port faces the peer, past a pair a comma list with the port facing each
+/// rank in rank order (its own entry `-` or empty). JACCL reads only its own row of the device
+/// matrix but validates the whole square, so the other rows repeat names.
 pub const Config = struct {
     rank: u32,
     size: u32 = 2,
-    /// `ip:port` rank 0 listens on; workers connect out (no inbound firewall prompt there).
+    /// `ip:port` rank 0 listens on; workers connect out (no inbound firewall prompt there). Past a pair
+    /// each worker dials rank 0's address on its own cable, so rank 0 listens on every address (`jacclCoordinator`).
     coordinator: []const u8,
     device: []const u8,
 };
 
-/// Writes the JACCL device matrix for `cfg` into `out`.
+/// `cfg.device` as one entry per rank: a single device (a pair) faces the one peer.
+fn deviceList(cfg: Config, out: *[max_ranks][]const u8) ![]const []const u8 {
+    if (cfg.size < 2 or cfg.size > max_ranks or cfg.rank >= cfg.size) return error.DistDeviceList;
+    if (std.mem.indexOfScalar(u8, cfg.device, ',') == null) {
+        // One port faces one peer only.
+        if (cfg.size != 2 or cfg.device.len == 0) return error.DistDeviceList;
+        for (out[0..2]) |*d| d.* = cfg.device;
+        out[cfg.rank] = "-";
+        return out[0..2];
+    }
+    var it = std.mem.splitScalar(u8, cfg.device, ',');
+    var n: usize = 0;
+    while (it.next()) |raw| : (n += 1) {
+        if (n == cfg.size) return error.DistDeviceList;
+        const d = std.mem.trim(u8, raw, " ");
+        const own = d.len == 0 or std.mem.eql(u8, d, "-");
+        if (own != (n == cfg.rank)) return error.DistDeviceList;
+        out[n] = d;
+    }
+    if (n != cfg.size) return error.DistDeviceList;
+    return out[0..n];
+}
+
+/// Writes the JACCL device matrix for `cfg` into `out`: this rank's row names the port facing each peer; row
+/// `r` of another rank repeats those names, with the port facing `r` in this rank's column.
 pub fn deviceMatrixJson(cfg: Config, out: []u8) ![]const u8 {
+    var lb: [max_ranks][]const u8 = undefined;
+    const list = try deviceList(cfg, &lb);
     var w: std.Io.Writer = .fixed(out);
     try w.writeByte('[');
     for (0..cfg.size) |r| {
@@ -55,12 +86,26 @@ pub fn deviceMatrixJson(cfg: Config, out: []u8) ![]const u8 {
         try w.writeByte('[');
         for (0..cfg.size) |c| {
             if (c != 0) try w.writeByte(',');
-            if (r == c) try w.writeAll("null") else try w.print("\"{s}\"", .{cfg.device});
+            if (r == c) try w.writeAll("null") else try w.print("\"{s}\"", .{list[if (c == cfg.rank) r else c]});
         }
         try w.writeByte(']');
     }
     try w.writeByte(']');
     return w.buffered();
+}
+
+/// The coordinator address JACCL uses on this rank: past a pair rank 0 listens on every address, since each
+/// worker reaches it over its own cable and subnet; a worker, and a pair's rank 0, use the address given.
+pub fn jacclCoordinator(cfg: Config, out: []u8) ![:0]const u8 {
+    const c = try bellAddress(cfg);
+    return std.fmt.bufPrintSentinel(out, "{d}.{d}.{d}.{d}:{d}", .{ c.ip4[0], c.ip4[1], c.ip4[2], c.ip4[3], c.port }, 0);
+}
+
+/// Where the bell listens (rank 0) or dials (a worker), on the coordinator's port + 1: as `jacclCoordinator`.
+fn bellAddress(cfg: Config) !Coordinator {
+    var c = try parseCoordinator(cfg.coordinator);
+    if (cfg.rank == 0 and cfg.size > 2) c.ip4 = .{ 0, 0, 0, 0 };
+    return c;
 }
 
 pub const LayerSpan = @import("../../../sdk/weights/shard.zig").LayerSpan;
@@ -85,7 +130,10 @@ pub const Link = struct {
         var path_buf: [128]u8 = undefined;
         const path = try std.fmt.bufPrintSentinel(&path_buf, "/tmp/mlx-serve-jaccl-{d}.json", .{std.c.getpid()}, 0);
         var json_buf: [1024]u8 = undefined;
-        const json = try deviceMatrixJson(cfg, &json_buf);
+        const json = deviceMatrixJson(cfg, &json_buf) catch |err| {
+            log.err("[dist] the device needs one RDMA port per rank in rank order, this rank's own `-` ({d} ranks, rank {d}): got \"{s}\"\n", .{ cfg.size, cfg.rank, cfg.device });
+            return err;
+        };
         {
             const f = try std.Io.Dir.createFileAbsolute(io, path, .{});
             defer f.close(io);
@@ -97,11 +145,11 @@ pub const Link = struct {
         var rank_buf: [16]u8 = undefined;
         var coord_buf: [128]u8 = undefined;
         _ = env.setForeign("MLX_RANK", try std.fmt.bufPrintSentinel(&rank_buf, "{d}", .{cfg.rank}, 0));
-        _ = env.setForeign("MLX_JACCL_COORDINATOR", try std.fmt.bufPrintSentinel(&coord_buf, "{s}", .{cfg.coordinator}, 0));
+        _ = env.setForeign("MLX_JACCL_COORDINATOR", try jacclCoordinator(cfg, &coord_buf));
         _ = env.setForeign("MLX_IBV_DEVICES", path);
         log.info("[dist] joining as rank {d}/{d} via {s}, coordinator {s}\n", .{ cfg.rank, cfg.size, cfg.device, cfg.coordinator });
         // Rank 0 listens for the bell before the group forms, so rank 1 finds it once it does.
-        const coord = try parseCoordinator(cfg.coordinator);
+        const coord = try bellAddress(cfg);
         const listener: std.c.fd_t = if (cfg.rank == 0) Bell.listen(coord) else Bell.none;
         defer if (listener >= 0) {
             _ = std.c.close(listener);
@@ -1399,8 +1447,9 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
         home_root = try @import("../../../host/cli/cli.zig").modelsRootPath(allocator, std.mem.span(env.get(.HOME) orelse "/tmp"));
         try roots.append(allocator, home_root.?);
     }
-    try rest.appendSlice(allocator, &.{ "--rank", "1" });
-    const cfg = try parseArgs(rest.items);
+    const with_rank = try allocator.alloc([]const u8, rest.items.len + 2);
+    defer allocator.free(with_rank);
+    const cfg = try parseArgs(workerArgs(rest.items, with_rank));
 
     // A failed JACCL init leaks its socket, so a retry is a fresh process: the app restarts
     // the worker a few seconds later (headless: run it under launchd or in a loop).
@@ -1809,6 +1858,7 @@ fn soakLink(io: std.Io, link: *const Link, other: u32, n: u64, s: mlx.mlx_stream
 
 pub fn parseArgs(args: []const []const u8) !Config {
     var rank: ?u32 = null;
+    var size: u32 = 2;
     var coordinator: ?[]const u8 = null;
     var device: ?[]const u8 = null;
     var i: usize = 0;
@@ -1821,6 +1871,8 @@ pub fn parseArgs(args: []const []const u8) !Config {
         const v = args[i + 1];
         if (std.mem.eql(u8, a, "--rank")) {
             rank = std.fmt.parseInt(u32, v, 10) catch return error.InvalidArgs;
+        } else if (std.mem.eql(u8, a, "--size")) {
+            size = std.fmt.parseInt(u32, v, 10) catch return error.InvalidArgs;
         } else if (std.mem.eql(u8, a, "--coordinator")) {
             coordinator = v;
         } else if (std.mem.eql(u8, a, "--device")) {
@@ -1832,16 +1884,78 @@ pub fn parseArgs(args: []const []const u8) !Config {
         i += 1;
     }
     if (rank == null or coordinator == null or device == null) {
-        log.err("usage: mlx-serve dist-probe --rank N --coordinator IP:PORT --device rdma_enX\n", .{});
+        log.err("usage: mlx-serve dist-probe --rank N [--size N] --coordinator IP:PORT --device rdma_enX[,rdma_enY...]\n", .{});
         return error.InvalidArgs;
     }
-    return .{ .rank = rank.?, .coordinator = coordinator.?, .device = device.? };
+    if (size < 2 or size > max_ranks or rank.? >= size) {
+        log.err("[dist] --size takes 2..{d} ranks and --rank one below it: got rank {d} of {d}\n", .{ max_ranks, rank.?, size });
+        return error.InvalidArgs;
+    }
+    return .{ .rank = rank.?, .size = size, .coordinator = coordinator.?, .device = device.? };
+}
+
+/// A worker's arguments with `--rank 1` added unless it names its own (a pair's worker is rank 1).
+fn workerArgs(args: []const []const u8, out: [][]const u8) []const []const u8 {
+    @memcpy(out[0..args.len], args);
+    for (args) |a| if (std.mem.eql(u8, a, "--rank")) return out[0..args.len];
+    out[args.len] = "--rank";
+    out[args.len + 1] = "1";
+    return out[0 .. args.len + 2];
 }
 
 test "deviceMatrixJson: each row names the local device, the diagonal is null" {
     var buf: [256]u8 = undefined;
     const j = try deviceMatrixJson(.{ .rank = 1, .coordinator = "x:1", .device = "rdma_en1" }, &buf);
     try std.testing.expectEqualStrings("[[null,\"rdma_en1\"],[\"rdma_en1\",null]]", j);
+}
+
+test "dist N-rank: a device list names each peer's port in this rank's row, and every row is a valid mesh" {
+    var buf: [512]u8 = undefined;
+    // Rank 2 of 4: its own entry is `-`; the other rows repeat names so JACCL's whole-square check passes.
+    const j = try deviceMatrixJson(.{ .rank = 2, .size = 4, .coordinator = "x:1", .device = "rdma_en2,rdma_en3,-,rdma_en5" }, &buf);
+    try std.testing.expectEqualStrings("[[null,\"rdma_en3\",\"rdma_en2\",\"rdma_en5\"],[\"rdma_en2\",null,\"rdma_en3\",\"rdma_en5\"],[\"rdma_en2\",\"rdma_en3\",null,\"rdma_en5\"],[\"rdma_en2\",\"rdma_en3\",\"rdma_en5\",null]]", j);
+    // An empty own entry reads as `-`.
+    const e = try deviceMatrixJson(.{ .rank = 0, .size = 4, .coordinator = "x:1", .device = ",a,b,c" }, &buf);
+    try std.testing.expectEqualStrings("[[null,\"a\",\"b\",\"c\"],[\"a\",null,\"b\",\"c\"],[\"b\",\"a\",null,\"c\"],[\"c\",\"a\",\"b\",null]]", e);
+    // A pair's list writes the pair's matrix.
+    const p = try deviceMatrixJson(.{ .rank = 1, .size = 2, .coordinator = "x:1", .device = "rdma_en1,-" }, &buf);
+    try std.testing.expectEqualStrings("[[null,\"rdma_en1\"],[\"rdma_en1\",null]]", p);
+    // Past a pair one port cannot face every peer; a list must have one entry per rank, own entry empty.
+    try std.testing.expectError(error.DistDeviceList, deviceMatrixJson(.{ .rank = 0, .size = 4, .coordinator = "x:1", .device = "rdma_en1" }, &buf));
+    try std.testing.expectError(error.DistDeviceList, deviceMatrixJson(.{ .rank = 0, .size = 4, .coordinator = "x:1", .device = "-,a,b" }, &buf));
+    try std.testing.expectError(error.DistDeviceList, deviceMatrixJson(.{ .rank = 1, .size = 4, .coordinator = "x:1", .device = "-,a,b,c" }, &buf));
+    try std.testing.expectError(error.DistDeviceList, deviceMatrixJson(.{ .rank = 0, .size = 4, .coordinator = "x:1", .device = "-,a,,c" }, &buf));
+}
+
+test "dist N-rank: past a pair rank 0 listens on every address, each worker dials its own" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("10.254.77.1:32323", try jacclCoordinator(.{ .rank = 0, .size = 2, .coordinator = "10.254.77.1:32323", .device = "d" }, &buf));
+    try std.testing.expectEqualStrings("0.0.0.0:32323", try jacclCoordinator(.{ .rank = 0, .size = 4, .coordinator = "10.254.12.1:32323", .device = "d" }, &buf));
+    try std.testing.expectEqualStrings("10.254.13.1:32323", try jacclCoordinator(.{ .rank = 2, .size = 4, .coordinator = "10.254.13.1:32323", .device = "d" }, &buf));
+    const pair = try bellAddress(.{ .rank = 0, .size = 2, .coordinator = "10.254.77.1:32323", .device = "d" });
+    try std.testing.expectEqual([4]u8{ 10, 254, 77, 1 }, pair.ip4);
+    const four = try bellAddress(.{ .rank = 0, .size = 4, .coordinator = "10.254.12.1:32323", .device = "d" });
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 0 }, four.ip4);
+    try std.testing.expectEqual(@as(u16, 32323), four.port);
+    const worker = try bellAddress(.{ .rank = 3, .size = 4, .coordinator = "10.254.14.1:32323", .device = "d" });
+    try std.testing.expectEqual([4]u8{ 10, 254, 14, 1 }, worker.ip4);
+}
+
+test "dist N-rank: --rank and --size name the worker's place; a pair is the default" {
+    const pair = try parseArgs(&.{ "--rank", "1", "--coordinator", "10.0.0.1:5", "--device", "rdma_en1" });
+    try std.testing.expectEqual(@as(u32, 2), pair.size);
+    const four = try parseArgs(&.{ "--rank", "3", "--size", "4", "--coordinator", "10.0.0.1:5", "--device", "a,b,c,-" });
+    try std.testing.expectEqual(@as(u32, 3), four.rank);
+    try std.testing.expectEqual(@as(u32, 4), four.size);
+    try std.testing.expectError(error.InvalidArgs, parseArgs(&.{ "--rank", "4", "--size", "4", "--coordinator", "10.0.0.1:5", "--device", "d" }));
+    try std.testing.expectError(error.InvalidArgs, parseArgs(&.{ "--rank", "0", "--size", "1", "--coordinator", "10.0.0.1:5", "--device", "d" }));
+    try std.testing.expectError(error.InvalidArgs, parseArgs(&.{ "--rank", "0", "--size", "99", "--coordinator", "10.0.0.1:5", "--device", "d" }));
+    // The worker's own --rank wins over the default it adds.
+    var out: [12][]const u8 = undefined;
+    const w = workerArgs(&.{ "--rank", "2", "--size", "4", "--coordinator", "c:1", "--device", "d" }, &out);
+    try std.testing.expectEqual(@as(u32, 2), (try parseArgs(w)).rank);
+    const d = workerArgs(&.{ "--coordinator", "c:1", "--device", "d" }, &out);
+    try std.testing.expectEqual(@as(u32, 1), (try parseArgs(d)).rank);
 }
 
 test "LayerSpan.remap: a later rank renumbers its trunk layers and drops the head-only towers" {
