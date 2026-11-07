@@ -55,6 +55,7 @@ const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
 const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
 const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
 const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
+const fileCheckpoint = @import("../ssm/checkpoint.zig").fileCheckpoint;
 const CheckpointSink = @import("../kv/cache_ops.zig").CheckpointSink;
 const intree = @import("../plugin/intree.zig");
 const plugin_driver = @import("../plugin/driver.zig");
@@ -264,6 +265,8 @@ pub fn initWithOptions(
     // checkpoint-retention `ssm_low_anchors` wiring. A non-gated arch keeps the
     // coarsened stride's own boundary chunking — the grid adds it no chunks.
     const dense_low_grid: bool = xfm.config.longCtxGated();
+    // The prefill's checkpoint retention: one value for the chunk loop and a whole-prompt prefill.
+    const cp_thin: transformer_mod.ThinPolicy = if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
 
     // Qwen native MTP: build the head's committed-history KV cache during
     // prefill. Entry j pairs (trunk hidden at prompt position j, token at
@@ -380,10 +383,7 @@ pub fn initWithOptions(
         // is not in place, so a long prefill's peak carried a second copy of everything so
         // far (~7.75 GB at 458k on qwen4_exp, #353). Same number the admission guard billed
         // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
-        // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
-        const cp_thin: transformer_mod.ThinPolicy =
-            if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
-
+        // a prefix-cache hit.
         const reserved_tokens = reservedPrefillTokens(
             &xfm.config,
             total_ctx_for_chunk,
@@ -565,7 +565,7 @@ pub fn initWithOptions(
             const abs_end_for_cp2 = end + ssm_cp_offset;
             if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
                 const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
-                ssm_checkpoints.append(allocator, cp) catch |e| {
+                fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
                     doomed.deinit(allocator);
                     return e;
@@ -578,21 +578,6 @@ pub fn initWithOptions(
                 if (mtp_active) if (xfm.qwen4Trunk()) |t| t.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
-                // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
-                // the last `max * stride` tokens and left no affordable trim point.
-                if (options.ssm_checkpoint_max > 0 and
-                    ssm_checkpoints.items.len > options.ssm_checkpoint_max)
-                {
-                    var dropped = ssm_checkpoints.orderedRemove(
-                        transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                            ssm_checkpoints.items,
-                            cp_thin,
-                            null,
-                            options.ssm_low_anchors,
-                        ),
-                    );
-                    dropped.deinit(allocator);
-                }
             }
 
             if (has_vision) {
@@ -689,7 +674,7 @@ pub fn initWithOptions(
                 // or a partial tail (also evaluated). The snapshot is a
                 // cheap refcount-share.
                 const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs, xfm.s);
-                ssm_checkpoints.append(allocator, cp) catch |e| {
+                fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
                     doomed.deinit(allocator);
                     return e;
@@ -702,19 +687,6 @@ pub fn initWithOptions(
                 if (mtp_active) if (xfm.qwen4Trunk()) |t| t.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
-                if (options.ssm_checkpoint_max > 0 and
-                    ssm_checkpoints.items.len > options.ssm_checkpoint_max)
-                {
-                    var dropped = ssm_checkpoints.orderedRemove(
-                        transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                            ssm_checkpoints.items,
-                            cp_thin,
-                            null,
-                            options.ssm_low_anchors,
-                        ),
-                    );
-                    dropped.deinit(allocator);
-                }
             }
             // One copy of the QSA key history on the latest snap. Stride
             // captures skipped it so a 400k prefill is not 32× the
@@ -793,7 +765,7 @@ pub fn initWithOptions(
                 .layers = ctx.ssm_entries.?.len,
                 .s = xfm.s,
                 .max = options.ssm_checkpoint_max,
-                .thin = if (xfm.config.longCtxGated()) .min_span_recency else .oldest,
+                .thin = cp_thin,
                 .low_anchors = options.ssm_low_anchors,
             };
             prompt_cp_sink = prompt_cps.sink();
