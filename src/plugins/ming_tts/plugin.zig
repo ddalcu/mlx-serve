@@ -56,7 +56,7 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     };
     const dims = config.parseDims(a, cfg) catch |e| {
         out.* = switch (e) {
-            error.QuantizedPack => Verdict.refuse(.unsupported, "ming_tts: quantized packs are not supported; use the bf16 inclusionAI/Ming-3.0-tts-0.5b"),
+            error.UnservedQuantMode => Verdict.refuse(.unsupported, "ming_tts: only affine quantization is served; use an affine or bf16 pack"),
             error.InvalidConfig => Verdict.refuse(.unsupported, "ming_tts: the pack's config.json declares an unusable geometry"),
         };
         return null;
@@ -339,6 +339,7 @@ const media_pack = @import("../../sdk/testing/media_pack.zig");
 test {
     _ = @import("audio.zig");
     _ = @import("fr.zig");
+    _ = @import("model.zig");
     _ = @import("text.zig");
 }
 

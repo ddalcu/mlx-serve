@@ -10,7 +10,7 @@ pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "ming_tts",
     .kind = .media,
     .claims = &model_types,
-    .gate_models = &.{"inclusionAI/Ming-3.0-tts-0.5b"},
+    .gate_models = &.{"mlx-community/Ming-3.0-tts-0.5B-8bit"},
 };
 
 pub const model_types = [_][]const u8{"dense"};
@@ -76,15 +76,23 @@ pub const Dit = struct {
     heads: c_int,
 };
 
+/// The pack-wide affine scheme from `config.json`.
+pub const Quant = struct {
+    bits: u32,
+    group_size: u32,
+};
+
 pub const Dims = struct {
     lm: Qwen,
     enc: Qwen,
     dec: Qwen,
     dit: Dit,
     agg: Dit,
+    /// Null on a bf16 pack.
+    quant: ?Quant = null,
 };
 
-pub const ParseError = error{ InvalidConfig, QuantizedPack };
+pub const ParseError = error{ InvalidConfig, UnservedQuantMode };
 
 /// A positive integer at `keys`, at most `max`.
 fn intAt(v: std.json.Value, keys: []const []const u8, max: i64) ParseError!c_int {
@@ -127,17 +135,34 @@ fn ditAt(v: std.json.Value, comptime keys: []const []const u8) ParseError!Dit {
     return d;
 }
 
-/// The geometry a `config.json` declares. Config JSON is untrusted: every field is bounds-checked. A quantized pack is
-/// refused by name: the fused kernels and the op chain read dense bf16 weights.
+fn quantAt(v: std.json.Value) ParseError!?Quant {
+    const q = pack_claims.path(v, &.{"quantization"}) orelse pack_claims.path(v, &.{"quantization_config"}) orelse return null;
+    if (pack_claims.path(q, &.{"mode"})) |m| {
+        if (m != .string or !std.mem.eql(u8, m.string, "affine")) return error.UnservedQuantMode;
+    }
+    const bits = try intAt(q, &.{"bits"}, 8);
+    const group_size = try intAt(q, &.{"group_size"}, 128);
+    switch (bits) {
+        2, 3, 4, 5, 6, 8 => {},
+        else => return error.InvalidConfig,
+    }
+    switch (group_size) {
+        32, 64, 128 => {},
+        else => return error.InvalidConfig,
+    }
+    return .{ .bits = @intCast(bits), .group_size = @intCast(group_size) };
+}
+
+/// The geometry a `config.json` declares. Config JSON is untrusted: every field is bounds-checked.
 pub fn parseDims(a: std.mem.Allocator, config_json: []const u8) ParseError!Dims {
     const v = std.json.parseFromSliceLeaky(std.json.Value, a, config_json, .{}) catch return error.InvalidConfig;
-    if (pack_claims.path(v, &.{"quantization"}) != null or pack_claims.path(v, &.{"quantization_config"}) != null) return error.QuantizedPack;
     return .{
         .lm = try qwenAt(v, &.{"llm_config"}),
         .enc = try qwenAt(v, &.{ "audio_tokenizer_config", "enc_kwargs", "backbone" }),
         .dec = try qwenAt(v, &.{ "audio_tokenizer_config", "dec_kwargs", "backbone" }),
         .dit = try ditAt(v, &.{"ditar_config"}),
         .agg = try ditAt(v, &.{"aggregator_config"}),
+        .quant = try quantAt(v),
     };
 }
 
@@ -182,11 +207,23 @@ test "ming_tts config: the release's geometry" {
     try testing.expectEqual(@as(c_int, 8), d.agg.layers);
 }
 
-test "ming_tts config: a quantized pack and malformed geometry are refused by name" {
+test "ming_tts config: a quantized pack declares its scheme; another mode and bad widths are refused" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectError(error.QuantizedPack, parseDims(a, "{\"quantization\":{\"bits\":8}}"));
+    try testing.expectEqual(@as(?Quant, null), (try parseDims(a, released)).quant);
+    const head = "{\"quantization\":";
+    const q4 = try parseDims(a, head ++ "{\"bits\":4,\"group_size\":64,\"mode\":\"affine\"}," ++ released[1..]);
+    try testing.expectEqual(Quant{ .bits = 4, .group_size = 64 }, q4.quant.?);
+    try testing.expectError(error.UnservedQuantMode, parseDims(a, head ++ "{\"bits\":4,\"group_size\":32,\"mode\":\"mxfp4\"}," ++ released[1..]));
+    try testing.expectError(error.InvalidConfig, parseDims(a, head ++ "{\"bits\":7,\"group_size\":64}," ++ released[1..]));
+    try testing.expectError(error.InvalidConfig, parseDims(a, head ++ "{\"bits\":8,\"group_size\":48}," ++ released[1..]));
+}
+
+test "ming_tts config: malformed geometry is refused by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
     try testing.expectError(error.InvalidConfig, parseDims(a, "not json"));
     try testing.expectError(error.InvalidConfig, parseDims(a, "{\"llm_config\":{\"num_hidden_layers\":-1}}"));
     try testing.expectError(error.InvalidConfig, parseDims(a, "{\"llm_config\":{\"num_hidden_layers\":1,\"hidden_size\":7,\"num_attention_heads\":2,\"num_key_value_heads\":1,\"rope_theta\":1e6}}"));

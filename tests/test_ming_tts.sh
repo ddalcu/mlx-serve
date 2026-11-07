@@ -2,14 +2,14 @@
 # test_ming_tts.sh — Ming-3.0-tts on /v1/audio/speech: voices, a seed repeats a take, cloning, the French path, long text,
 # named 400s, and a client that leaves mid-job.
 #
-#   MING_MODEL=<Ming-3.0-tts-0.5b dir> ./tests/test_ming_tts.sh [port]   # SKIPs without one
+#   MING_MODEL=<Ming-3.0-tts-0.5B dir, bf16 or quantized> ./tests/test_ming_tts.sh [port]   # SKIPs without one
 set -euo pipefail
 cd "$(dirname "$0")/.."
 source tests/lib/server.sh
 source tests/_lib_models.sh
 PORT="${1:-11381}"
 BASE="http://127.0.0.1:$PORT"
-MODEL="${MING_MODEL:-$(find_model inclusionAI/Ming-3.0-tts-0.5b || true)}"
+MODEL="${MING_MODEL:-$(find_model mlx-community/Ming-3.0-tts-0.5B-8bit || find_model inclusionAI/Ming-3.0-tts-0.5b || true)}"
 [ -n "$MODEL" ] || { echo "SKIP: no Ming-3.0-tts-0.5b pack (set MING_MODEL)"; exit 0; }
 [ -d "$MODEL" ] || { echo "FAIL: MING_MODEL points at a missing dir: $MODEL" >&2; exit 1; }
 BIN="${BIN:-./zig-out/bin/mlx-serve}"

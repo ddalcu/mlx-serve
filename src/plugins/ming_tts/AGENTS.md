@@ -2,7 +2,9 @@
 
 Ming-3.0-tts-0.5b on `/v1/audio/speech`: a Qwen2.5 LM writes one hidden per step, a CFM flow head (10 Euler steps of an
 8-layer DiT with CFG) turns it into a 64-d latent, an aggregator feeds it back, and a VAE decoder (Qwen2 + ISTFT) makes
-44.1 kHz mono. CAM++ and the VAE encoder clone a reference. Pack: `inclusionAI/Ming-3.0-tts-0.5b` (bf16).
+44.1 kHz mono. CAM++ and the VAE encoder clone a reference. Packs: `mlx-community/Ming-3.0-tts-0.5B-8bit` (the default
+download), `jorgepb96/Ming-3.0-tts-0.5B-4bit`, and bf16, the quality reference (`inclusionAI/Ming-3.0-tts-0.5b`,
+`mlx-community/Ming-3.0-tts-0.5B-bf16`).
 
 ## Files
 - `plugin.zig`: the media table, the request's fields, the tiny conformance pack.
@@ -24,9 +26,11 @@ used is a named 400, never another voice.
   frontend, which spells numbers in English and turns accented letters into punctuation.
 - The `Target language` prompt line joins only TTS, BASIC and EMOTION: on captioned voices it moves the voice.
 - Fused kernels run only at the release's geometry on a bf16 GPU stream; anything else takes the op chain.
+- A quantized pack has the bf16 pack's tensor names plus `.scales` and `.biases`, and declares one affine scheme in
+  `config.json`. `quantOf` checks each tensor against that scheme. `.bias` is additive and `.biases` holds the
+  zero-points. `embed_tokens` and `word_embedder` are read through `gatherQuantizedRows`. Other modes are a named refusal.
 
 ## Known gaps
-- No quantized pack: the loader refuses one by name. Fused kernels and the op chain read dense bf16 weights.
 - No parity test against the reference in this tree; `tests/test_ming_tts.sh` proves the HTTP surface on a real pack.
 
 ## Levers

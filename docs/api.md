@@ -101,7 +101,7 @@ On `POST /v1/audio/speech`, Qwen3-TTS uses `ref_audio` (a base64-encoded WAV) to
 
 ### Ming-3.0-tts speech
 
-`POST /v1/audio/speech` on `inclusionAI/Ming-3.0-tts-0.5b` answers a 44.1 kHz mono WAV. `input` takes up to 50,000 characters: long text is split by paragraph, sentence and clause, and joined with pauses.
+`POST /v1/audio/speech` on a Ming-3.0-tts-0.5B pack answers a 44.1 kHz mono WAV. The server loads the bf16 pack (`inclusionAI/Ming-3.0-tts-0.5b`, `mlx-community/Ming-3.0-tts-0.5B-bf16`) and the affine quantized packs (`mlx-community/Ming-3.0-tts-0.5B-8bit`, `jorgepb96/Ming-3.0-tts-0.5B-4bit`). `input` takes up to 50,000 characters: long text is split by paragraph, sentence and clause, and joined with pauses.
 
 - `voice`: a built-in voice (`US_Emma`, `UK_George`, `UK_Charlotte`, or a Chinese name). `instruction`: a description of a designed voice.
 - `ref_audio` (base64 WAV, at most 20 s) clones a voice; `ref_text` is its transcript and improves the clone. French, German, Spanish, Japanese and Korean `input` needs `ref_text` to clone in that language's path.

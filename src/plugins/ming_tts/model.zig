@@ -12,13 +12,15 @@
 //! softplus(scale) + 1e-4) and CAM++ (`campplus.zig`). Text frontend and prompt layout: `text.zig`.
 //!
 //! Every op mirrors the reference graph (same op order, same weak-scalar dtypes, `addmm` for biased linears). On the
-//! GPU in bf16, the DiT stacks and the LM decode step run on fused kernels instead (`fused.zig`).
+//! GPU in bf16, the DiT stacks and the LM decode step run on fused kernels instead (`fused.zig`). An affine-quantized
+//! pack has the same tensor names plus `.scales` and `.biases`, and always runs the op chain.
 
 const std = @import("std");
 const log = @import("../../sdk/util/log.zig");
 const config = @import("config.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const fused = @import("fused.zig");
+const embedding = @import("../../sdk/blocks/embedding.zig");
 
 pub const Arr = mlx.mlx_array;
 pub const S = mlx.mlx_stream;
@@ -106,6 +108,14 @@ pub const G = struct {
     pub fn matmul(g: *G, x: Arr, y: Arr) !Arr {
         var o = mlx.mlx_array_new();
         return g.ret(mlx.mlx_matmul(&o, x, y, g.s), o);
+    }
+    pub fn qmm(g: *G, x: Arr, w: Arr, q: Quant) !Arr {
+        var o = mlx.mlx_array_new();
+        return g.ret(mlx.mlx_quantized_matmul(&o, x, w, q.scales, q.biases, true, mlx.mlx_optional_int.some(@intCast(q.group_size)), mlx.mlx_optional_int.some(@intCast(q.bits)), "affine", g.s), o);
+    }
+    /// Rows `ids` of a quantized table, dequantized to `dt`.
+    pub fn gatherRows(g: *G, w: Arr, q: Quant, ids: Arr, dt: Dtype) !Arr {
+        return g.keep(try embedding.gatherQuantizedRows(g.s, w, q.scales, q.biases, ids, q.group_size, q.bits, .affine, .{ .ctx = null }, .{ .value = dt, .has_value = true }));
     }
     pub fn addmm(g: *G, c: Arr, x: Arr, y: Arr) !Arr {
         var o = mlx.mlx_array_new();
@@ -306,6 +316,8 @@ pub const Tensors = struct {
     map: std.StringHashMap(Arr),
     a: std.mem.Allocator,
     extra: std.ArrayList(Arr) = .empty, // derived views (transposed linears)
+    /// The scheme `config.json` declares; null on a dense pack.
+    scheme: ?config.Quant = null,
 
     pub fn load(a: std.mem.Allocator, path: []const u8, cast_to: ?Dtype, s: S) !Tensors {
         var self: Tensors = .{ .map = std.StringHashMap(Arr).init(a), .a = a };
@@ -448,25 +460,52 @@ pub const Tensors = struct {
         return self.map.contains(k);
     }
 
-    /// Linear `<prefix>.weight` [out, in] (+ optional `.bias`). The weight is
+    /// The affine triple of `<prefix>`, or null for a dense weight (scales absence is per tensor). A tensor that
+    /// disagrees with the declared scheme is an error here, not a wrong output later.
+    pub fn quantOf(self: *const Tensors, comptime fmt: []const u8, args: anytype) !?Quant {
+        if (!self.has(fmt ++ ".scales", args)) return null;
+        const q = self.scheme orelse return error.UndeclaredQuantization;
+        const w = mlx.getShape(try self.get(fmt ++ ".weight", args));
+        const scales = try self.get(fmt ++ ".scales", args);
+        const sc = mlx.getShape(scales);
+        if (w.len != 2 or sc.len != 2 or w[0] != sc[0]) return error.QuantizedGeometry;
+        if (@as(i64, w[1]) * 32 != @as(i64, sc[1]) * q.group_size * q.bits) return error.QuantizedGeometry;
+        return .{ .scales = scales, .biases = try self.get(fmt ++ ".biases", args), .bits = q.bits, .group_size = q.group_size };
+    }
+
+    /// Linear `<prefix>.weight` [out, in] (+ optional `.bias`). A dense weight is
     /// kept as a transposed VIEW, like `x @ W.T` in mlx.nn.Linear.
     pub fn lin(self: *Tensors, s: S, comptime fmt: []const u8, args: anytype) !Lin {
         const w = try self.get(fmt ++ ".weight", args);
+        const b: ?Arr = if (self.has(fmt ++ ".bias", args)) try self.get(fmt ++ ".bias", args) else null;
+        if (try self.quantOf(fmt, args)) |q| return .{ .w = w, .wt = .{ .ctx = null }, .b = b, .q = q };
         var wt = mlx.mlx_array_new();
         const perm = [_]c_int{ 1, 0 };
         try mlx.check(mlx.mlx_transpose_axes(&wt, w, &perm, 2, s));
         try self.extra.append(self.a, wt);
-        const b: ?Arr = if (self.has(fmt ++ ".bias", args)) try self.get(fmt ++ ".bias", args) else null;
         return .{ .w = w, .wt = wt, .b = b };
     }
 };
 
+/// A quantized weight's affine extras. The weight itself holds the packed u32 codes.
+pub const Quant = struct {
+    scales: Arr,
+    biases: Arr,
+    bits: u32,
+    group_size: u32,
+};
+
 pub const Lin = struct {
-    w: Arr, // [out, in], for the fused kernels
-    wt: Arr,
+    w: Arr, // [out, in], for the fused kernels; packed codes when `q` is set
+    wt: Arr, // null when `q` is set
     b: ?Arr,
+    q: ?Quant = null,
 
     pub fn f(l: Lin, g: *G, x: Arr) !Arr {
+        if (l.q) |q| {
+            const y = try g.qmm(x, l.w, q);
+            return if (l.b) |b| g.add(y, b) else y;
+        }
         if (l.b) |b| return g.addmm(b, x, l.wt);
         return g.matmul(x, l.wt);
     }
@@ -475,6 +514,12 @@ pub const Lin = struct {
 // ─────────────────────────────────────────────────────────────────────────
 // Qwen2 stack (LM backbone, VAE encoder/aggregator/decoder)
 // ─────────────────────────────────────────────────────────────────────────
+
+/// The fused kernels read dense weights and an additive bias on these linears.
+fn denseBiased(ls: []const Lin) bool {
+    for (ls) |l| if (l.q != null or l.b == null) return false;
+    return true;
+}
 
 const QLayer = struct {
     ln1: Arr,
@@ -501,7 +546,12 @@ const QStack = struct {
     /// Fused decode kernels' view of the layers (the LM only).
     fl: ?[]fused.LmLayer = null,
 
+    /// A quantized pack keeps `fl` null and decodes on the op chain.
     fn fuse(st: *QStack, a: std.mem.Allocator) !void {
+        for (st.layers) |l| {
+            if (!denseBiased(&.{ l.q, l.k, l.v })) return;
+            for ([_]Lin{ l.o, l.gate, l.up, l.down }) |x| if (x.q != null) return;
+        }
         const fl = try a.alloc(fused.LmLayer, st.layers.len);
         for (st.layers, fl) |l, *f| f.* = .{
             .ln1 = l.ln1,
@@ -743,8 +793,12 @@ const DitStack = struct {
         try mlx.check(mlx.mlx_zeros(&cnt, &[_]c_int{1024}, 1, .int32, s));
         try t.extra.append(t.a, cnt);
         try evalAll(&.{cnt});
-        const fb = try a.alloc(fused.Block, n);
-        for (blocks, fb) |b, *f| f.* = .{
+        // A quantized pack leaves `fb` empty and runs the op chain.
+        const dense = for (blocks) |b| {
+            if (!denseBiased(&.{ b.q, b.k, b.v, b.out, b.ff1, b.ff2 })) break false;
+        } else true;
+        const fb = try a.alloc(fused.Block, if (dense) n else 0);
+        for (blocks[0..fb.len], fb) |b, *f| f.* = .{
             .cnt = cnt,
             .norm1 = b.norm1,
             .norm2 = b.norm2,
@@ -769,7 +823,7 @@ const DitStack = struct {
         const B = sh[0];
         const L = sh[1];
         var x = x_in;
-        if (L == st.rot.tab_len and fused.eligible(x, g.s) and mlx.mlx_array_dtype(st.fb[0].wq) == .bfloat16) {
+        if (st.fb.len > 0 and L == st.rot.tab_len and fused.eligible(x, g.s) and mlx.mlx_array_dtype(st.fb[0].wq) == .bfloat16) {
             for (st.fb) |*b| {
                 const o = try fused.block(b, x, st.rot.tab[0], st.rot.tab[1], g.s);
                 for ([_]Arr{ o.qkv, o.att, o.x1, o.hh, o.x2 }) |y| _ = try g.keep(y);
@@ -879,6 +933,7 @@ pub const Model = struct {
     dtype: Dtype,
 
     embed: Arr,
+    embed_q: ?Quant,
     lm: QStack,
     stop_head: Lin,
     spk_head: Lin,
@@ -934,8 +989,10 @@ pub const Model = struct {
         m.dtype = .bfloat16;
         m.t = try Tensors.load(a, path, null, s);
         errdefer m.t.deinit();
+        m.t.scheme = dims.quant;
         const t = &m.t;
         m.embed = try t.get("model.model.embed_tokens.weight", .{});
+        m.embed_q = try t.quantOf("model.model.embed_tokens", .{});
         m.lm = try QStack.load(t, a, s, "model.model", dims.lm, dims.lm.layers);
         try m.lm.fuse(a);
         m.stop_head = try t.lin(s, "stop_head", .{});
@@ -952,6 +1009,12 @@ pub const Model = struct {
         m.agg = try DitStack.load(t, a, s, A, dims.agg, 2); // [cls, x]
         m.agg_x_emb = try t.lin(s, A ++ ".x_embedder", .{});
         m.agg_cls = try t.get(A ++ ".word_embedder.weight", .{});
+        if (try t.quantOf(A ++ ".word_embedder", .{})) |q| {
+            var g = G.init(a, s);
+            defer g.deinit();
+            m.agg_cls = try own(try g.gatherRows(m.agg_cls, q, try g.fromI32(&.{0}, &.{1}), m.dtype));
+            try t.extra.append(a, m.agg_cls);
+        }
         m.agg_final_norm = try t.get(A ++ ".final_layer.norm_final.weight", .{});
         m.agg_final = try t.lin(s, A ++ ".final_layer.linear", .{});
         m.enc = try QStack.load(t, a, s, "audio.encoder.encoder", dims.enc, dims.enc.layers);
@@ -1022,7 +1085,7 @@ pub const Model = struct {
 
     pub fn embedIds(m: *Model, g: *G, ids: []const i32) !Arr {
         const idx = try g.fromI32(ids, &.{@intCast(ids.len)});
-        const e = try g.take(m.embed, idx, 0);
+        const e = if (m.embed_q) |q| try g.gatherRows(m.embed, q, idx, m.dtype) else try g.take(m.embed, idx, 0);
         return g.reshape(e, &.{ 1, @intCast(ids.len), -1 });
     }
 
@@ -1160,7 +1223,7 @@ pub const Model = struct {
     pub fn cfmSampleRaw(m: *Model, g: *G, z: Arr, hist: Arr, noise: Arr, sde: Arr, cfg: f32, sigma: f32, temperature: f32) !Arr {
         const dt = mlx.mlx_array_dtype(noise);
         const shift_k = sigma * std.math.sqrt(temperature);
-        if (fused.enabled() and m.dit.hidden == 1024 and mlx.streamIsGpu(g.s) and dt == .bfloat16 and dt == m.t_emb_dt and mlx.mlx_array_dtype(z) == .bfloat16)
+        if (m.dit.fb.len > 0 and denseBiased(&.{ m.x_emb, m.dit_final }) and fused.enabled() and m.dit.hidden == 1024 and mlx.streamIsGpu(g.s) and dt == .bfloat16 and dt == m.t_emb_dt and mlx.mlx_array_dtype(z) == .bfloat16)
             return m.cfmSampleFused(g, z, hist, noise, sde, cfg, shift_k);
         const t = try flowSchedule(g, dt);
         var y = noise;
@@ -1224,7 +1287,7 @@ pub const Model = struct {
         const need = nf * @as(c_int, HOP);
         if (need > N) x = try g.concat(&.{ x, try g.zeros(&.{ 1, need - N }, .float32) }, 1);
         x = try g.reshape(x, &.{ 1, nf, @as(c_int, HOP) });
-        x = try g.astype(x, mlx.mlx_array_dtype(m.enc_fc1.wt));
+        x = try g.astype(x, mlx.mlx_array_dtype(if (m.enc_fc1.q) |q| q.scales else m.enc_fc1.w));
         x = try m.enc_fc2.f(g, try m.enc_fc1.f(g, x));
         x = try m.enc.forward(g, x, null);
         // pad_patch_insert_cls
@@ -1472,3 +1535,52 @@ const Pb = struct {
         return f;
     }
 };
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "ming_tts model: a quantized linear tracks its dense weight, adds its bias, and is not fused" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var g = G.init(a, s);
+    defer g.deinit();
+    var data: [2 * 64]f32 = undefined;
+    for (&data, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.37);
+    const dense = try g.fromF32(&data, &.{ 2, 64 });
+    const bias = try g.fromF32(&.{ 0.25, -0.25 }, &.{2});
+    var qv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qv);
+    try mlx.check(mlx.mlx_quantize(&qv, dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
+
+    var t: Tensors = .{ .map = std.StringHashMap(Arr).init(a), .a = a, .scheme = .{ .bits = 8, .group_size = 64 } };
+    defer t.deinit();
+    for ([_][]const u8{ "l.weight", "l.scales", "l.biases" }, 0..) |k, i| {
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&o, qv, i));
+        try t.map.put(try a.dupe(u8, k), o);
+    }
+    try t.map.put(try a.dupe(u8, "l.bias"), try own(bias));
+    try t.map.put(try a.dupe(u8, "d.weight"), try own(dense));
+    try t.map.put(try a.dupe(u8, "d.bias"), try own(bias));
+
+    const ql = try t.lin(s, "l", .{});
+    const dl = try t.lin(s, "d", .{});
+    try testing.expect(denseBiased(&.{dl}));
+    try testing.expect(!denseBiased(&.{ql}));
+
+    var ones: [64]f32 = @splat(1.0 / 64.0);
+    const x = try g.fromF32(&ones, &.{ 1, 64 });
+    const yq = try toF32(a, try ql.f(&g, x), s);
+    defer a.free(yq);
+    const yd = try toF32(a, try dl.f(&g, x), s);
+    defer a.free(yd);
+    for (yq, yd) |p, r| try testing.expectApproxEqAbs(r, p, 0.01);
+
+    t.scheme = .{ .bits = 4, .group_size = 64 };
+    try testing.expectError(error.QuantizedGeometry, t.quantOf("l", .{}));
+    t.scheme = null;
+    try testing.expectError(error.UndeclaredQuantization, t.quantOf("l", .{}));
+    try testing.expectEqual(@as(?Quant, null), try t.quantOf("d", .{}));
+}
