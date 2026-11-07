@@ -144,11 +144,11 @@ fn verifyMlxStage(b: *std.Build) void {
     }
     const stamp = buildRootHandle(b).readFileAlloc(b.graph.io, "lib/mlx/.version", b.allocator, .limited(256)) catch return;
     b.dependOnFileContents(b.path("lib/mlx/.version"));
-    const patch = "patches/mlxc-gather-qmm-global-scale.patch";
+    const patch_list = "scripts/build-mlx-patches.txt";
     const inputs = [_]StageInput{
         .{ .key = "mlx=", .path = "lib/mlx-src", .have = submoduleCommit(b, "lib/mlx-src") },
         .{ .key = "mlxc=", .path = "lib/mlxc-src", .have = submoduleCommit(b, "lib/mlxc-src") },
-        .{ .key = "patch=", .path = patch, .have = fileSha1(b, patch) },
+        .{ .key = "patch=", .path = patch_list, .have = patchesSha1(b.allocator, RootReader{ .b = b }, patch_list) },
     };
     if (staleStageInput(stamp, &inputs)) |s| {
         std.debug.print(
@@ -173,14 +173,29 @@ fn submoduleCommit(b: *std.Build, dir: []const u8) ?[]const u8 {
     return sha[0..12];
 }
 
-/// A file's SHA-1, short as `shasum | cut -c1-12` prints it.
-fn fileSha1(b: *std.Build, path: []const u8) ?[]const u8 {
-    const bytes = buildRootHandle(b).readFileAlloc(b.graph.io, path, b.allocator, .limited(1 << 20)) catch return null;
-    b.dependOnFileContents(b.path(path));
-    var digest: [std.crypto.hash.Sha1.digest_length]u8 = undefined;
-    std.crypto.hash.Sha1.hash(bytes, &digest, .{});
-    return b.dupe(std.fmt.bytesToHex(digest, .lower)[0..12]);
+/// The patches `list` names (`<submodule> <patch>` lines; blank and `#` lines skipped), concatenated in order, as SHA-1
+/// short as `cat <patches> | shasum | cut -c1-12` prints it. Null when the list or a patch cannot be read.
+fn patchesSha1(a: std.mem.Allocator, reader: anytype, list: []const u8) ?[]const u8 {
+    const text = reader.read(list) catch return null;
+    var sha1 = std.crypto.hash.Sha1.init(.{});
+    var lines = std.mem.tokenizeScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        var fields = std.mem.tokenizeAny(u8, line, " \t\r");
+        const submodule = fields.next() orelse continue;
+        if (submodule[0] == '#') continue;
+        sha1.update(reader.read(fields.next() orelse return null) catch return null);
+    }
+    return a.dupe(u8, std.fmt.bytesToHex(sha1.finalResult(), .lower)[0..12]) catch @panic("OOM");
 }
+
+/// Reads a file under the build root and declares it a configure input.
+const RootReader = struct {
+    b: *std.Build,
+    fn read(self: RootReader, path: []const u8) ![]const u8 {
+        self.b.dependOnFileContents(self.b.path(path));
+        return buildRootHandle(self.b).readFileAlloc(self.b.graph.io, path, self.b.allocator, .limited(1 << 20));
+    }
+};
 
 /// The build's own tests of this file, on the host.
 pub fn addTests(b: *std.Build, step: *std.Build.Step) void {
@@ -300,4 +315,29 @@ test "build config: a stage stamped for other pins names the first stale input; 
     try std.testing.expectEqualStrings("64ea011cb65f", stale.staged);
     try std.testing.expectEqualStrings("none", staleStageInput("mlx=64ea011cb65f target=26.2", &.{patch}).?.staged);
     try std.testing.expectEqual(null, staleStageInput(stamp, &.{.{ .key = "mlx=", .path = "lib/mlx-src", .have = null }}));
+}
+
+const MapReader = struct {
+    files: []const [2][]const u8,
+    fn read(self: MapReader, path: []const u8) ![]const u8 {
+        for (self.files) |f| if (std.mem.eql(u8, f[0], path)) return f[1];
+        return error.FileNotFound;
+    }
+};
+
+test "build config: patch= covers each patch the list names, hashed as `cat <patches> | shasum` prints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const list = "# <submodule> <patch>\nlib/mlx-src patches/a.patch\n\nlib/mlxc-src patches/b.patch\n";
+    const staged: MapReader = .{ .files = &.{ .{ "list", list }, .{ "patches/a.patch", "a\n" }, .{ "patches/b.patch", "b\n" } } };
+    try std.testing.expectEqualStrings("05dec960e24d", patchesSha1(a, staged, "list").?);
+    const stamp = "mlx=c69303b00f5f mlxc=56b2d39fc831 patch=05dec960e24d target=26.2";
+    const edited_a: MapReader = .{ .files = &.{ .{ "list", list }, .{ "patches/a.patch", "a2\n" }, .{ "patches/b.patch", "b\n" } } };
+    const edited_b: MapReader = .{ .files = &.{ .{ "list", list }, .{ "patches/a.patch", "a\n" }, .{ "patches/b.patch", "b2\n" } } };
+    const dropped_b: MapReader = .{ .files = &.{ .{ "list", "lib/mlx-src patches/a.patch\n" }, .{ "patches/a.patch", "a\n" } } };
+    for ([_]MapReader{ staged, edited_a, edited_b, dropped_b }, [_]bool{ false, true, true, true }) |r, stale| {
+        const in: StageInput = .{ .key = "patch=", .path = "list", .have = patchesSha1(a, r, "list") };
+        try std.testing.expectEqual(stale, staleStageInput(stamp, &.{in}) != null);
+    }
 }
