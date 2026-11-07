@@ -21,6 +21,7 @@ const config = @import("config.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const fused = @import("fused.zig");
 const embedding = @import("../../sdk/blocks/embedding.zig");
+const istft_head = @import("../../sdk/media/istft.zig");
 
 pub const Arr = mlx.mlx_array;
 pub const S = mlx.mlx_stream;
@@ -1317,53 +1318,15 @@ pub const Model = struct {
         var x = try m.dec_fc1.f(g, latents);
         x = try linearUpsample(g, x, VAE_PATCH);
         x = try m.dec.forward(g, x, null);
-        // ISTFT head
-        var p = try m.dec_head.f(g, x); // [1, F, 3530]
-        p = try g.transpose(p, &.{ 0, 2, 1 });
-        const mp = try g.split2(p, 1);
-        var mag = try g.exp(mp[0]);
-        const big = try g.scalar(1e2, mlx.mlx_array_dtype(mag));
-        mag = try g.minimum(mag, big);
+        // ISTFT head: [1, F, 3530] → log-magnitude and phase halves; "same" padding.
+        const mp = try g.split2(try m.dec_head.f(g, x), 2);
+        const mag = try g.minimum(try g.exp(mp[0]), try g.scalar(1e2, mlx.mlx_array_dtype(mp[0])));
         const ph = mp[1];
         const i_unit = try g.keep(mlx.mlx_array_new_complex(0, 1));
         const spec = try g.mul(mag, try g.add(try g.cos(ph), try g.mul(i_unit, try g.sin(ph))));
-        var fr = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_fft_irfft(&fr, spec, @intCast(N_FFT), 1, mlx.MLX_FFT_NORM_BACKWARD, g.s));
-        var frames = try g.keep(fr); // [1, n_fft, F] f32
-        frames = try g.mul(frames, try g.reshape(m.window, &.{ 1, @intCast(N_FFT), 1 }));
-        const F: usize = @intCast(mlx.getShape(frames)[2]);
-        // Overlap-add with n_fft = 4 * hop: block b sums frame (b - j) part j,
-        // added in frame order like the Python loop.
-        const fT = try g.reshape(try g.transpose(frames, &.{ 0, 2, 1 }), &.{ @intCast(F), 4, @intCast(HOP) });
-        var acc: ?Arr = null;
-        var j: usize = 4;
-        while (j > 0) {
-            j -= 1;
-            const part = try g.reshape(try g.sliceAxis(fT, 1, @intCast(j), @intCast(j + 1), 1), &.{ @intCast(F), @intCast(HOP) });
-            const lo: c_int = @intCast(j);
-            const hi: c_int = @intCast(3 - j);
-            var padded = part;
-            if (lo > 0) padded = try g.concat(&.{ try g.zeros(&.{ lo, @intCast(HOP) }, .float32), padded }, 0);
-            if (hi > 0) padded = try g.concat(&.{ padded, try g.zeros(&.{ hi, @intCast(HOP) }, .float32) }, 0);
-            acc = if (acc) |s_| try g.add(s_, padded) else padded;
-        }
-        const total = (F + 3) * HOP;
-        const out = try toF32(g.a, try g.reshape(acc.?, &.{-1}), g.s);
-        defer g.a.free(out);
-        // Window envelope (host, same accumulation order) and the "same" trim.
         const win = try toF32(g.a, m.window, g.s);
         defer g.a.free(win);
-        const env = try g.a.alloc(f32, total);
-        defer g.a.free(env);
-        @memset(env, 0);
-        for (0..F) |t_| {
-            for (0..N_FFT) |k| env[t_ * HOP + k] += win[k] * win[k];
-        }
-        const pad = (N_FFT - HOP) / 2;
-        const n_out = total - 2 * pad;
-        const res = try g.a.alloc(f32, n_out);
-        for (0..n_out) |i| res[i] = out[pad + i] / @max(env[pad + i], 1e-11);
-        return res;
+        return istft_head.istft(g.a, spec, N_FFT, HOP, win, (N_FFT - HOP) / 2, g.s);
     }
 };
 
