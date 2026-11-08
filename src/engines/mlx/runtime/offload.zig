@@ -174,7 +174,7 @@ fn logSpec(kind: Kind, st: *const abi.Stats) void {
         .ane => log.info("[ane] spec: {d} cycles, {d}% of drafts accepted, {d:.2} tokens per call\n", .{
             st.rounds, 100 * st.accepted / @max(st.drafted, 1), @as(f64, @floatFromInt(st.accepted + st.rounds)) / @as(f64, @floatFromInt(st.rounds)),
         }),
-        .ds4, .mlx => {},
+        .ds4, .mlx, .plugin => {},
     }
 }
 

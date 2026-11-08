@@ -950,9 +950,9 @@ pub const HotPrefixCache = struct {
         config: *const model_mod.ModelConfig,
         enable_ssm_checkpoints: bool,
     ) bool {
-        // Module-owned request state (a served pack's caps; DeepSeek-V4.1 and GLM-5.3 on mlx-stream) is not in the
+        // Module-owned request state (a served pack's caps: DeepSeek-V4.1's) is not in the
         // KVCache: a snapshot restore would advance cache.step without rebuilding it.
-        if (!config.caps().prefix_cache or config.glm_stream) return false;
+        if (!config.caps().prefix_cache) return false;
         // A pipeline worker holds the later layers' state at the live position only: a restore
         // here would rewind this rank and not the worker.
         if (config.dist_span != null) return false;
@@ -968,7 +968,7 @@ pub const HotPrefixCache = struct {
         // tensor split's plugin says through its enabled hook whether its workers keep their halves of each snapshot.
         // Other models keep `shouldUse` exactly (a tensor-parallel rank 0 keeps its KV cache: the worker is stateless).
         if (plugin_driver.auxBinding(xfm) != null) {
-            if (config.glm_stream or config.dist_span != null or config.expert_bank) return false;
+            if (config.dist_span != null) return false;
             // The plugin's eligibility hook also excludes paired and streamed loaded instances.
             return ModuleBinding.init(xfm) != null;
         }
@@ -3946,11 +3946,6 @@ test "HotPrefixCache: shouldUse rejects a streamed pack's module-owned decode st
     // without rebuilding it. A served DeepSeek pack says so in its caps (`plugins/deepseek_v4/served_test.zig`).
     var cfg = try model_mod.parseConfigFromJson(testing.allocator, model_mod.dsv41_release_config);
     defer cfg.deinit(testing.allocator);
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
-    // A GLM-5.3 pack on mlx-stream keeps its decode state on the plugin's module.
-    cfg.legacy.caps.prefix_cache = true;
-    cfg.model_type = "glm_moe_dsa";
-    cfg.glm_stream = true;
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
 
@@ -11432,12 +11427,6 @@ test "HotPrefixCache module: loaded instance gate keeps pipeline and streamed pa
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.legacy.caps.prefix_cache = false;
     fake.enabled = true;
-    cfg.glm_stream = true;
-    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
-    cfg.glm_stream = false;
-    cfg.expert_bank = true;
-    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
-    cfg.expert_bank = false;
     cfg.dist_span = .{ .start = 0, .end = 1, .total = 2 };
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.dist_span = null;

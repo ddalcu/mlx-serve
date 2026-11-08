@@ -134,7 +134,10 @@ pub const Caps = packed struct(u64) {
     /// rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes
     /// only under the same `Ablation.keys` entry.
     ablation: bool = false,
-    _: u33 = 0,
+    /// The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`):
+    /// the preflight bills their slot rows, not the experts. Without it the setting is refused by name.
+    experts_stream: bool = false,
+    _: u32 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };

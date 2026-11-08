@@ -14,7 +14,6 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const plugin_driver = @import("plugin/driver.zig");
 const plugin_abi = @import("../../abi/plugin.zig");
 const plugin_settle = @import("plugin/settle.zig");
-const mlx_stream = @import("modules/stream.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
 const Generator = generate_mod.Generator;
@@ -212,7 +211,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        (intree.dsv4(slot.model.transformer.?) != null or intree.dsv41(slot.model.transformer.?) != null or plugin_driver.nativeDrafter(slot.model.transformer.?) != null or slot.model.transformer.?.mlx_stream_ext != null);
+        (intree.dsv4(slot.model.transformer.?) != null or intree.dsv41(slot.model.transformer.?) != null or plugin_driver.nativeDrafter(slot.model.transformer.?) != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -280,12 +279,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     } else {
         // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
         const resume_at = if (slot.ctx.ablation == null) plugin_driver.resumePrompt(xfm_ptr, &slot.ctx, slot.full_prompt, slot.vision_embeddings) else null;
-        const resumed: u64 = if (resume_at) |n|
-            n
-        else if (xfm_ptr.mlx_stream_ext) |m|
-            try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
-        else
-            0;
+        const resumed: u64 = resume_at orelse 0;
         if (resumed > 0) {
             hot_matched = @intCast(resumed);
             prefill_tokens = slot.full_prompt[resumed..];

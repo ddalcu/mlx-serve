@@ -1,13 +1,12 @@
 # glm5_next plugin
 
-Owns `glm5_next`, `glm5_next_text` (GLM-5.3-Flash: mlx-community, NVIDIA ModelOpt FP4, Sushi EXL3 and EXL3 streaming
-packs) and claims `glm_moe_dsa` to refuse it (GLM-5.3, `plugins/glm_moe_dsa`). Ling 3.0 (`plugins/bailing_hybrid`) shares this plugin's
+Owns `glm5_next`, `glm5_next_text` (GLM-5.3-Flash: mlx-community, NVIDIA ModelOpt FP4 and Sushi EXL3 packs). Ling 3.0 (`plugins/bailing_hybrid`) shares this plugin's
 config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.zig`) and fixture writer.
 
 - Parse: `config.zig` (MLX-free) reads every key the engine's GLM arm reads into `Config`; `model_config.zig` maps it
   to the engine's `ModelConfig` field for field (`expectEngineParse`: equal on the three GLM fixtures, a flat pack, the
-  refusals, and the file parse with processor + generation config). Refuses: an `expert_streaming` bank other than the EXL3 K=3 mul1 manifest-v2 one, `qk_rope_head_dim`,
-  any Gemma/BERT/sliding key (`foreign_keys`), `glm_moe_dsa`.
+  refusals, and the file parse with processor + generation config). Refuses: a streaming pack (`expert_streaming`: its bank streams through a plugin),
+  `qk_rope_head_dim`, any Gemma/BERT/sliding key (`foreign_keys`).
 - Load (`trunk.zig`): reads the driver's resident source (`LoadCtx.weights`: the engine's map with the Sushi and
   ModelOpt adapters applied) in the layout the deleted legacy load built: q|k|v and the convs joined, GLM's decode row
   group `[qkv | z | a | b]`, f32 KDA tables, DSA and MLA projections, the MoE block's weights, the `mtp.0` head.
@@ -40,7 +39,7 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
   row names 4 bits, as its loaded row always did (legacy discovery read only `quantization.bits`).
 
 Served, legacy forward deleted (`engines/mlx/plugin/served.zig` `legacy_removed`: a pack the plugin declines is
-refused by name). Streamed packs (`expert_streaming`, `glm_moe_dsa`) stay mlx-stream's.
+refused by name). GLM-5.3 (`glm_moe_dsa`) is not served in-tree.
 Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine keeps GLM's MTP rounds solo
 (`mtpRoundsStaySolo`), so nothing calls it.
 
@@ -70,7 +69,5 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 GLM-5.3-Flash: KDA (f32 state) + DSA (absorbed NoPE MLA, indexer past position 2051) inside mHC, 288-expert MoE.
 Thinking ON. Batches decode (`forwardGlmBatchedDecode`); MTP = its `mtp.0` layer. Vision = `vision.zig`, rows spliced
 at `<|image|>` on 1-D positions.
-- Streaming pack (`expert_streaming`, EXL3 K=3 mul1 bank `experts.bin`, `fp8_block128` residents): `config.streamed`;
-  `plugin.zig` `openBank` binds `sdk/weights/streamed/glm5n_source.zig` (MiMo's streamer, the GLM-shape EXL3 texts)
-  behind `Moe.Weights.streamed`; slot rows from free memory (`bill.streamRows`, all 288 on 256 GB); the `mtp.0` head's
-  NVFP4 experts load resident (`sdk/quant/nvfp4/stream_bank.zig`). Serial (no batched decode).
+- Streaming pack (`expert_streaming`, an EXL3 `experts.bin` bank): refused by name at parse (a quant plugin's
+  `open_bank` could serve it).

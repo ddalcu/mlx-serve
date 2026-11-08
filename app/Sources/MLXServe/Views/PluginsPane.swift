@@ -36,6 +36,10 @@ struct PluginsPane: View {
                           if on { switches = switches.turningOn([name], installed: manager.receipts.map(\.name)) } else { switches.set(name, on: false) }
                           save()
                       },
+                      setOption: { plugin, name, value in
+                          switches.setOption(plugin, name, value)
+                          save()
+                      },
                       restartServer: restartServer)
     }
 
@@ -116,6 +120,7 @@ private struct PluginContext {
     let serverUp: Bool
     let install: ([PluginCatalog.Entry]) -> Void
     let setSwitch: (String, Bool) -> Void
+    let setOption: (_ plugin: String, _ name: String, _ value: String?) -> Void
     let restartServer: () -> Void
 
     @MainActor func state(_ item: PluginListing.Item, _ manager: PluginManager) -> PluginListing.State {
@@ -259,6 +264,11 @@ private struct PluginPage: View {
                 PluginCallout(tint: .orange, icon: "exclamationmark.triangle.fill",
                               title: L10n.text("Built for another mlx-serve"),
                               detail: L10n.format("This mlx-serve refused it: %@.", why))
+            }
+            if let receipt = item.receipt, !receipt.options.isEmpty {
+                PluginOptions(options: receipt.options, values: context.switches.options[item.name] ?? [:]) {
+                    context.setOption(item.name, $0, $1)
+                }
             }
             if !packs.isEmpty { packList }
             requirements
@@ -520,6 +530,7 @@ private enum PluginLabels {
         case "model": return L10n.text("Model")
         case "media": return L10n.text("Media")
         case "quant": return L10n.text("Quant format")
+        case "engine": return L10n.text("Engine")
         default: return kind
         }
     }
@@ -559,6 +570,7 @@ private struct PluginMonogram: View {
         case "model": return .purple
         case "media": return .teal
         case "quant": return .orange
+        case "engine": return .indigo
         default: return .gray
         }
     }
@@ -623,6 +635,68 @@ private struct PluginSection<Content: View>: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(.background.secondary, in: RoundedRectangle(cornerRadius: 12))
                 .overlay(RoundedRectangle(cornerRadius: 12).strokeBorder(.separator.opacity(0.6)))
+        }
+    }
+}
+
+/// A plugin's own settings: the server sets them when it starts, so a change on a running server asks for a restart.
+private struct PluginOptions: View {
+    let options: [OutsidePlugins.Option]
+    let values: [String: String]
+    let set: (_ name: String, _ value: String?) -> Void
+
+    var body: some View {
+        PluginSection(title: "Settings") {
+            ForEach(Array(options.enumerated()), id: \.element.id) { index, option in
+                if index > 0 { Divider() }
+                PluginOptionRow(option: option, saved: values[option.name]) { set(option.name, $0) }
+            }
+            Text("The server reads these when it starts.").font(.app(.annotation)).foregroundStyle(.secondary)
+        }
+    }
+}
+
+/// One option: a switch, or a field whose empty value is the plugin's own default. A value its kind refuses is not
+/// saved.
+private struct PluginOptionRow: View {
+    let option: OutsidePlugins.Option
+    let saved: String?
+    let set: (String?) -> Void
+    @State private var text = ""
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 12) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(option.name).font(.app(.value, design: .monospaced)).textSelection(.enabled)
+                if !option.help.isEmpty {
+                    Text(option.help).font(.app(.annotation)).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 12)
+            control
+        }
+        .padding(.vertical, 4)
+        .onAppear { text = saved ?? "" }
+    }
+
+    @ViewBuilder private var control: some View {
+        if option.kind == .bool {
+            Toggle(isOn: Binding(get: { (saved ?? option.defaultValue) == "1" }, set: { set($0 ? "1" : "0") })) { EmptyView() }
+                .labelsHidden().toggleStyle(.switch)
+        } else {
+            VStack(alignment: .trailing, spacing: 2) {
+                TextField(option.defaultValue, text: $text)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.app(.value, design: option.kind == .number ? .monospaced : .default))
+                    .frame(width: option.kind == .number ? 120 : 240)
+                    .onChange(of: text) { _, value in
+                        if value.isEmpty { set(nil) } else if option.accepts(value) { set(value) }
+                    }
+                if !text.isEmpty && !option.accepts(text) {
+                    Group { if option.kind == .number { Text("Not a number") } else { Text("Too long") } }
+                        .font(.app(.annotation)).foregroundStyle(.red)
+                }
+            }
         }
     }
 }

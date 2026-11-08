@@ -4,7 +4,6 @@
 //! not the experts; a truncated or malformed shard is refused by name. Owns tests and the pack writer.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
 const fixture = @import("../../bases/proof/fixture.zig");
@@ -149,7 +148,7 @@ fn expectFetched(sw: *streamed.Streamed, l: *const Loaded, layer: u32, ids: []co
 // ── tests ──
 
 test "mlx pack: a fetch's slot rows hold each expert's nine parts as the pack's tensors do, stacked and per expert, two widths, two shards, with evictions" {
-    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!streamed.built or mlx.noGpuBackend()) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
@@ -163,29 +162,29 @@ test "mlx pack: a fetch's slot rows hold each expert's nine parts as the pack's 
     try testing.expectEqual(@as(?u32, null), sw.layerOf("mtp.layers.0.mlp"));
     const calls = [_][]const u16{ &.{ 0, 5, 3, 3, 1 }, &.{ 2, 4 }, &.{ 5, 0, 1, 2, 3, 4, 4 }, &.{1} };
     for (calls) |ids| for ([_]u32{ 0, 1 }) |layer| try expectFetched(&sw, &l, layer, ids);
-    const st = sw.src.pack.stats();
+    const st = sw.src.stats();
     try testing.expect(st.expert_cache_evictions > 0 and st.expert_cache_hits > 0);
 }
 
 test "mlx pack: streaming bills the slot rows and drops the routed experts' bytes" {
-    if (!build_options.mlx_stream) return error.SkipZigTest;
+    if (!streamed.built) return error.SkipZigTest;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
     var buf: [512]u8 = undefined;
     const dir = try tmpPack(&tmp, &buf);
     var l = try Loaded.init(dir);
     defer l.deinit();
-    const b = try streamed.Streamed.packBytes(testing.allocator, dir, 2);
+    const b = try streamed.Streamed.packBytes(testing.allocator, dir, .{ .rows = 2 });
     try testing.expectEqual(l.bytes(&.{ ".switch_mlp.", ".experts." }), b.experts);
     // A record is one expert's nine parts; each layer holds 2 rows, each geometry 48 transient rows.
     const rec0 = l.bytes(&.{"layers.0.mlp.switch_mlp."}) / E;
     const rec1 = l.bytes(&.{"layers.1.mlp.experts."}) / E;
     try testing.expectEqual(2 * (rec0 + rec1) + 48 * (rec0 + rec1), b.slots);
-    try testing.expectEqual(b.slots, (try streamed.Streamed.packBytes(testing.allocator, dir, 2)).slots);
+    try testing.expectEqual(b.slots, (try streamed.Streamed.packBytes(testing.allocator, dir, .{ .rows = 2 })).slots);
 }
 
 test "mlx pack: a truncated shard and a malformed header are refused by name" {
-    if (!build_options.mlx_stream) return error.SkipZigTest;
+    if (!streamed.built) return error.SkipZigTest;
     const io = std.testing.io;
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -194,10 +193,23 @@ test "mlx pack: a truncated shard and a malformed header are refused by name" {
     const whole = try tmp.dir.readFileAlloc(io, shard_names[1], testing.allocator, .unlimited);
     defer testing.allocator.free(whole);
     try tmp.dir.writeFile(io, .{ .sub_path = shard_names[1], .data = whole[0 .. whole.len - 100] });
-    try testing.expectError(error.StreamedPackTruncated, streamed.Streamed.packBytes(testing.allocator, dir, 2));
+    try testing.expectError(error.StreamedPackTruncated, streamed.Streamed.packBytes(testing.allocator, dir, .{ .rows = 2 }));
     var bad: [18]u8 = undefined;
     std.mem.writeInt(u64, bad[0..8], 10, .little);
     @memcpy(bad[8..], "not json!!");
     try tmp.dir.writeFile(io, .{ .sub_path = shard_names[1], .data = &bad });
-    try testing.expectError(error.StreamedPackHeader, streamed.Streamed.packBytes(testing.allocator, dir, 2));
+    try testing.expectError(error.StreamedPackHeader, streamed.Streamed.packBytes(testing.allocator, dir, .{ .rows = 2 }));
+}
+
+test "mlx pack: a pack opened on a CPU stream is refused by name (its reads land behind Metal events)" {
+    if (!streamed.built) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    try writePack(dir);
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    try std.testing.expectError(error.StreamedNeedsGpuStream, streamed.Streamed.openPack(std.testing.allocator, dir, s, 2));
 }

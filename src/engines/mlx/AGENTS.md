@@ -6,6 +6,8 @@ Scheduler, admission, caches, spec decode, kernels. Stories: `docs/gotchas/engin
 
 Loading + residency:
 - **A missing tensor is a load ERROR, never `unreachable`** (#217, `error.MissingWeight` → named 503); load failures cross the inference thread by NAME (`req.error_name` → `loadErrorFromName`, #144). A refusal the user fixes outside the pack (memory, an absent worker Mac) leaves the entry `.unloaded` (`failureRetries`).
+- **An error a caller tells apart after a cross-unit call (`modules.call`, the engine table) is in `err_name.Known`**,
+  else it arrives as `EngineFailed`: DSV4.1's benign `MissingVisionWeights` opt-out failed whole loads under `-Dunits`.
 - **The load preflight's "available" is capped by Metal's working-set limit** (`effectiveAvailableBytes(…, mlx.maxRecommendedWorkingSet())`): a lowered `iogpu.wired_limit_mb` binds below free RAM and weights past it OOM in warmup, leaving a server that refuses every request.
 - **`modelDiskBytes` bills the shards the INDEX names** (#274); an index naming NO shard on disk is STALE, not a filter (`indexShardSet` → null).
 - **Tokenizer-derived config is set in ONE place for both load paths** (`ModelConfig.applyTokenizer`: EOS merges, LFM2 image tokens).
@@ -15,7 +17,6 @@ Loading + residency:
 - **Only an unknown NAME falls back to the default model; a PATH names its own entry** (#585, `resolveRequestModelId`, shared with the LAN gate); unregistered path = 404. Guard: `tests/test_load_failure_no_fallback.sh`.
 - **A request's model NAME resolves in ONE place** (`resolveRequestModelId`: id, path, Model Settings `alias`, Ollama tag): dispatch, the keyless LAN gate, load, unload and `/api/show` all read it; a gate that resolves less than dispatch lets an alias reach an unshared model. Guard: `tests/test_model_alias.sh` [2].
 - **`--model-dir` is REPEATABLE**, merged FIRST-WINS; app reads via `readRoots`, writes via `ownedRoots`. Guard: `tests/test_multi_model_dir.sh`.
-- **A streaming pack that sets no `ctx_size` takes an AUTO context** (`mlx_stream.resolveContext`: the largest rung of 256k..32k whose load bill fits the ceiling, cached per pack for `contextLength`), not the plugin's 16k standard request; a manual `ctx_size` wins.
 - **A reload FREES retained CPU state off-mutex while `.loading`** (`releaseRetainedCpuState`): a refcount-less reader takes the mutex AND skips `.loading` entries.
 - **Embedded engines** (ds4, llama.cpp, the Neural Engine) are reached only through their `abi/engine.zig` tables (`src/host/engines/`), each on its own thread: one ds4 session per model (unset ctx → the GGUF's trained window, ds4's default if refused), one llama.cpp sequence per request (`session_claims` ≤ `Info.max_concurrent`); the context advertised is the one the engine opened (`adoptEngineWindow`: the stub's dims are a placeholder no MLX sizer may bill); ds4 in-checkpoint MTP only when the GGUF declares `nextn_predict_layers` on an arch ds4 embeds it for (`ds4_embedded_mtp_archs`; DSV4 ships its head apart); ds4 takes NO support GGUF for DSV4.1 (`engine_pick.ds4Spec`: one beside it failed the open); the `Tokenizer` is a STUB — count via `server.encodeText`, stop on the ENGINE's set (`Info.eos`, #667); embeddings refuse by NAME; a llama trim is FALLIBLE (cold-prefill on refusal). Guard: `tests/test_ds4_serve.sh`.
 - **An embedding SUB-BATCH is its own forward** (cache reset per sub-batch). Guard: `tests/test_embeddings.sh` [4c].
@@ -186,6 +187,9 @@ Kernels + numerics:
   Qwen3-TTS's CPU stream cached CPU bits that every later fused SwiGLU on the GPU read.
 - **MoE decode**: gate+up fused `gatherQmv` default by the kernel's OWN conditions (`useGatherQmvDecode`); down+reduce ONE dispatch over 8 lanes (`gatherQmvDownReduce`, `DOWNRED_LPR`; bar = fp32-truth RMS). MoE PREFILL uses `_gather_sort`.
 - **A streamed bank feeds the shared MoE block through `Moe.Weights.streamed`** (`sdk/bases/blocks/moe.zig`, contract `sdk/weights/routed.zig`): every arm reads slot banks in the in-memory arm's kernel class (fp4 decode over up to 3 banks; sorted calls at the row-block B/E); an arm whose kernel reads one bank is refused by name.
+- **`stream_experts` is billed as slot rows only where the plugin declares `Caps.experts_stream`**, else refused by name
+  (`preflight.streamRefused`): a plugin that ignored the setting held every expert beside a bill of slot rows. A stream
+  opens on a GPU stream only (`StreamedNeedsGpuStream`): on a CPU stream its reads land after the forward reads the rows.
 - **Affine-4 banks at ONE decode token take `moe_affine4`**; a one-expert bank VIEW is what the kernels bind, because MLX bills a command buffer per bound array's `data_size`.
 - **MLX's concurrent encoder puts a GLOBAL barrier before any kernel that reads an outstanding write**: parallel branches overlap one stage only, and ordering the q projection behind the indexer with `mlx_depends` made the layer slower; judge a chained kernel by its stage, not its alone-time.
 - **The indexer score stays on the NAX matrix kernel at every width** (`msv_qsa_score`): no scalar accumulation order reproduces it, and decode, verify and prefill must pick the same blocks.

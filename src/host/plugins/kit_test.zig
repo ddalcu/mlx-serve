@@ -11,7 +11,8 @@ const test_cache = @import("../../sdk/testing/cache_ops.zig");
 const sdk_dylib = @import("../../sdk/dylib.zig");
 const dylib_abi = @import("../../abi/dylib.zig");
 const model_abi = @import("../../abi/plugin.zig");
-const examples = [_][]const u8{ "_example", "_example_media", "_example_quant" };
+/// In the loader's order (file names sorted).
+const examples = [_][]const u8{ "_example", "_example_engine", "_example_media", "_example_quant" };
 
 const testing = std.testing;
 
@@ -70,15 +71,15 @@ test "kit examples: built from the kit, installed with receipts, loaded, negotia
         try testing.expectEqualStrings(ex, p.name());
         try cli.checkPlugin(testing.io, testing.allocator, p);
     }
-    try testing.expectEqual(dylib_abi.Kind.media, inst.set.plugins.items[1].manifest.kind);
+    try testing.expectEqual(dylib_abi.Kind.media, inst.set.plugins.items[2].manifest.kind);
     // The receipt Settings lists: the plugin's own version and the file's signer beside its hash.
     for (inst.receipts, inst.set.plugins.items) |r, p| {
         try testing.expectEqualStrings("0.1.0", r.version);
-        if (p.manifest.kind != .quant) try testing.expectEqualStrings(p.name(), r.model_types[0]);
+        if (p.manifest.kind == .model or p.manifest.kind == .media) try testing.expectEqualStrings(p.name(), r.model_types[0]);
         try testing.expectEqualStrings(&p.sha256, r.sha256);
         try testing.expect(r.signature.len > 0);
     }
-    try testing.expect(inst.set.entries.items[0].model != null and inst.set.entries.items[2].quant != null);
+    try testing.expect(inst.set.entries.items[0].model != null and inst.set.entries.items[3].quant != null);
 }
 
 test "kit examples: a changed install is refused by its receipt; a disabled one is not opened" {
@@ -93,7 +94,7 @@ test "kit examples: a changed install is refused by its receipt; a disabled one 
     // A new file renamed over it: this process has the old one mapped.
     try plugins.writeFile(testing.io, .{ .sub_path = "swap.tmp", .data = other });
     try plugins.rename("swap.tmp", plugins, "_example_media.dylib", testing.io);
-    var set = try loader.loadDir(testing.io, testing.allocator, dir, .{ .enabled = true, .disabled = &.{"_example"} }, @import("mlx_stamp").bytes);
+    var set = try loader.loadDir(testing.io, testing.allocator, dir, .{ .enabled = true, .disabled = &.{ "_example", "_example_engine" } }, @import("mlx_stamp").bytes);
     defer set.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 1), set.plugins.items.len);
     try testing.expectEqualStrings("_example_quant", set.plugins.items[0].name());
@@ -102,7 +103,9 @@ test "kit examples: a changed install is refused by its receipt; a disabled one 
     // Built against another MLX: refused by negotiation.
     var stale = try loader.loadDir(testing.io, testing.allocator, dir, .{ .enabled = true, .disabled = &.{"_example_media"} }, "mlx=another");
     defer stale.deinit(testing.allocator);
-    try testing.expectEqual(@as(usize, 0), stale.plugins.items.len);
+    // The engine never calls MLX: another MLX leaves it loading.
+    try testing.expectEqual(@as(usize, 1), stale.plugins.items.len);
+    try testing.expectEqualStrings("_example_engine", stale.plugins.items[0].name());
     try testing.expectEqualStrings("plugin was built against another MLX: rebuild it with this release's kit", stale.refused.items[0].why);
     // A rebuild fixes that one, not the changed hash.
     try testing.expect(stale.refused.items[0].rebuild and !set.refused.items[0].rebuild);
@@ -160,7 +163,7 @@ test "kit examples: the model plugin's fixture written as a pack is one it claim
         try inst.tmp.dir.access(testing.io, try std.fs.path.join(a, &.{ "pack", f }), .{});
     try testing.expectEqualStrings("_example, 2 layers, hidden 16, vocab 260 (by_type)", try cli.checkPack(testing.io, a, p, pack));
     // The media example claims nothing of a model pack.
-    try testing.expectError(error.NotClaimed, cli.checkPack(testing.io, a, inst.set.plugins.items[1], pack));
+    try testing.expectError(error.NotClaimed, cli.checkPack(testing.io, a, inst.set.plugins.items[2], pack));
 }
 
 test "kit examples: a plugin with no fixture is told apart from one failing the suite, and its pack still checks" {
@@ -219,3 +222,22 @@ fn expectAreaExposed(comptime area: []const u8) !void {
         try testing.expect(listed);
     }
 }
+
+test "kit examples: the engine example serves the model it names, passes the engine contract and claims no pack" {
+    var inst = try Installed.init();
+    defer inst.deinit();
+    const a = inst.arena.allocator();
+    const p = &inst.set.plugins.items[1];
+    try testing.expectEqual(dylib_abi.Kind.engine, p.manifest.kind);
+    try testing.expectEqualStrings("_example_engine", inst.receipts[1].models[0]);
+    try testing.expectEqual(@as(?*const loader.Plugin, p), loader.engineIn(inst.set.plugins.items, "_example_engine"));
+    try testing.expect(loader.engineIn(inst.set.plugins.items, "_example") == null);
+    const e = inst.set.entries.items[1];
+    try testing.expect(e.model == null and e.media == null and e.quant == null);
+    const pack = try inst.path("engine_pack");
+    try cli.writeFixture(testing.io, a, p.*, pack);
+    try testing.expectEqualStrings("it probes the pack (the engine serves the model folders it names)", try cli.checkPack(testing.io, a, p.*, pack));
+    const cfg = try inst.tmp.dir.readFileAlloc(testing.io, "engine_pack/config.json", a, .limited(1 << 16));
+    try @import("../../abi/contract_test.zig").run(@ptrCast(@alignCast(p.manifest.table)), .{ .model_dir = pack, .model_type = "", .config_json = cfg, .prompt = &.{ 258, 'h', 'i', 256, 259 } });
+}
+

@@ -15,11 +15,9 @@ const Verdict = common.Verdict;
 pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
     comptime sdk_plugin.check(M, M.plugin.name);
     return struct {
-        const claims: [M.plugin.claims.len]Str = blk: {
-            var out: [M.plugin.claims.len]Str = undefined;
-            for (M.plugin.claims, &out) |c, *o| o.* = Str.of(c);
-            break :blk out;
-        };
+        const claims = strs(M.plugin.claims);
+        const models = strs(M.plugin.models);
+        const options = optionsOf(M.plugin.options);
 
         pub const value: dylib_abi.Manifest = .{
             .name = Str.of(M.plugin.name),
@@ -27,6 +25,7 @@ pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
                 .model => .model,
                 .media => .media,
                 .quant => .quant,
+                .engine => .engine,
             },
             .mlx = Str.of(mlx_pin),
             .table = &M.table,
@@ -34,6 +33,8 @@ pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
             .fixture = &fixtureOf,
             .fixture_free = &fixtureFree,
             .plugin_version = Str.of(if (@hasDecl(M, "version")) M.version else ""),
+            .models = .of(&models),
+            .options = .of(&options),
         };
 
         const Owned = struct { arena: std.heap.ArenaAllocator };
@@ -64,6 +65,18 @@ pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
             f.* = .{};
         }
     };
+}
+
+fn strs(comptime list: []const []const u8) [list.len]Str {
+    var out: [list.len]Str = undefined;
+    for (list, &out) |c, *o| o.* = Str.of(c);
+    return out;
+}
+
+fn optionsOf(comptime list: []const sdk_plugin.Option) [list.len]dylib_abi.Option {
+    var out: [list.len]dylib_abi.Option = undefined;
+    for (list, &out) |o, *x| x.* = .{ .name = Str.of(o.name), .kind = o.kind, .default_value = Str.of(o.default), .help = Str.of(o.help) };
+    return out;
 }
 
 /// Exports `M`'s manifest as `abi.dylib.symbol`: the dylib's one entry point.

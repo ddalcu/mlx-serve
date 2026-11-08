@@ -287,8 +287,9 @@ def r_raw_mlx_c(f, ctx):
                 yield i, f"{n} raw mlx-c reference{'s' if n > 1 else ''}"
 
 
-# The guest agent is its own binary (its own module root, the VM's environment), so it cannot reach src/env.zig.
-ENV_EXEMPT = {"src/env.zig", "src/host/sandbox/vz_agent.zig"}
+# The guest agent is its own binary (its own module root, the VM's environment), and the example engine an outside
+# plugin built from the kit: neither can reach src/env.zig.
+ENV_EXEMPT = {"src/env.zig", "src/host/sandbox/vz_agent.zig", "src/plugins/_example_engine/plugin.zig"}
 
 
 def env_lines(f):

@@ -53,9 +53,9 @@ final class PluginCatalogTests: XCTestCase {
 
     /// A dev build prints `mlx-serve 26.11.1 (fast)`: the plugin rules (kit match, requirement, agent text) read the release.
     func testServerStatusIsReadFromProps() {
-        let props = Data(#"{"memory":{},"plugins":[{"name":"turbo","loaded":true},{"name":"sushi_ds41","loaded":false,"rebuild":true,"why":"built against another MLX"}]}"#.utf8)
+        let props = Data(#"{"memory":{},"plugins":[{"name":"turbo","loaded":true,"options":{"TURBO_FRAC":"0.4"}},{"name":"sushi_ds41","loaded":false,"rebuild":true,"why":"built against another MLX"}]}"#.utf8)
         let got = PluginCatalog.serverStatus(fromProps: props)
-        XCTAssertEqual(got["turbo"], .init(loaded: true, rebuild: false, why: ""))
+        XCTAssertEqual(got["turbo"], .init(loaded: true, rebuild: false, why: "", options: ["TURBO_FRAC": "0.4"]))
         XCTAssertEqual(got["sushi_ds41"], .init(loaded: false, rebuild: true, why: "built against another MLX"))
         XCTAssertTrue(PluginCatalog.serverStatus(fromProps: Data(#"{"memory":{}}"#.utf8)).isEmpty, "an older server says nothing")
     }

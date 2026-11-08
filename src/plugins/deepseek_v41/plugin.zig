@@ -1,10 +1,10 @@
 //! DeepSeek-V4.1-Flash: the module-owned native arch (`deepseek_v41.zig`) and its vision tower behind the model table.
 //! One state per slot: the module runs the active one (`dec_state`), the others wait here, and plain decode tokens of
 //! several slots run as one batch (`extendBatched`). Prompt captures transfer to the engine's prefix cache.
-//! A streamed pack's routed experts come from its EXL3 bank (`sdk/weights/streamed.zig` `Exl3`).
+//! A streamed pack's routed experts come from the bank its outside quant plugin streams (`sdk/quant/outside.zig`), or
+//! a plain MLX pack's own shards (`sdk/weights/streamed.zig`).
 
 const std = @import("std");
-const build_options = @import("build_options");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -19,6 +19,11 @@ const Resident = @import("../../sdk/weights/resident.zig").Resident;
 const Weights = @import("../../sdk/weights/resident.zig").Weights;
 const Layout = @import("../../sdk/quant/native.zig").Layout;
 const streamed = @import("../../sdk/weights/streamed.zig");
+const outside = @import("../../sdk/quant/outside.zig");
+const env = @import("../../env.zig");
+const engram_decode = @import("decode/engram_decode.zig");
+const flash_attn = @import("prompt/flash_attn.zig");
+const scratch_attn = @import("prompt/scratch_attn.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -79,6 +84,9 @@ pub const Model = struct {
     weights: Weights,
     mdl: *dsv41.Dsv41Model,
     tower: ?vision.Dsv41Vision,
+    /// the pack whose vision tower the media hook reads for each image (`tower`
+    /// then null).
+    vision_dir: ?[:0]u8,
     caps: abi.Caps,
     s: mlx.mlx_stream,
     /// A streamed pack's expert bank, and the prompt positions its slot rows were billed for.
@@ -177,7 +185,7 @@ fn activateSlot(mp: *anyopaque, slot: u32) callconv(.c) Verdict {
     return .ok;
 }
 
-const Bank = if (build_options.mlx_stream) union(enum) { exl3: *streamed.Exl3.Source, pack: streamed.Streamed } else void;
+const Bank = if (streamed.built) union(enum) { outside: *outside.Bank, pack: streamed.Streamed } else void;
 
 /// The trunk's embedding table or LM head as loaded (borrowed), for the DSpark drafter.
 fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weight) callconv(.c) Verdict {
@@ -207,11 +215,11 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
         return null;
     }
     const c = config.of(ctx.parsed);
-    // The EXL3 prompt GEMMs are built on MLX's NAX tiles: below the M5 they compute wrong (f64 self-check, M4).
-    if (c.dsv41_exl3_bank and !@import("../../mlx/device.zig").naxAvailable()) {
-        out.* = Verdict.refuse(.unsupported, "deepseek_v41: the streamed EXL3 repack needs an M5 or newer GPU (its prompt kernels run on the M5's matrix units); stream the MLX pack with the stream_experts setting instead");
+    configureLoad(c) catch |e| {
+        std.log.err("deepseek_v41: a DeepSeek-V4.1 setting is refused: {t}", .{e});
+        out.* = Verdict.named(.unsupported, @errorName(e));
         return null;
-    }
+    };
     return loadModel(ctx, s) catch |e| {
         // Too little free memory is a refusal the host answers by name, not a fault.
         if (e == error.StreamedRowsDoNotFit) std.log.warn("deepseek_v41: load refused: {t}", .{e}) else std.log.err("deepseek_v41: load failed: {t}", .{e});
@@ -221,10 +229,24 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
             error.StreamedRowsDoNotFit => Verdict.refuse(.too_large, "deepseek_v41: the streamed bank's rows do not fit the free memory"),
             error.StreamedWeightsUnsupported => Verdict.refuse(.unsupported, "deepseek_v41: a streamed (experts.bin) pack needs the macOS build's expert streamer"),
             error.Dsv41TpStreamedExperts => Verdict.refuse(.unsupported, "deepseek_v41: streamed experts do not run split across two Macs; turn stream_experts off (each Mac holds half the experts)"),
+            error.Dsv41TpOutsideQuant => Verdict.refuse(.unsupported, "deepseek_v41: a pack read by an outside quant plugin does not run split across two Macs"),
+            error.OutsideQuantRefused => Verdict.refuse(.unsupported, "deepseek_v41: the outside quant plugin refused the pack (the log names why)"),
+            error.StreamedBankUnclaimed => Verdict.refuse(.unsupported, "deepseek_v41: no installed quant plugin streams this pack's experts.bin (OpensourceWTF's EXL3 repacks: install turboexl3_ds41)"),
             else => Verdict.refuse(.failed, "deepseek_v41: the pack does not load"),
         };
         return null;
     };
+}
+
+/// The settings a load reads, each refused by name at a bad value. A plugin-streamed bank's own (flash attention by
+/// default) apply to it alone.
+fn configureLoad(c: *const config.Config) !void {
+    const exl3 = c.dsv41_exl3_bank;
+    engram_decode.ps().lru_mb = try engram_decode.parseMb(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
+    flash_attn.ps().mode = .off;
+    flash_attn.ps().explicit = false;
+    if (exl3 or env.span(.MLX_SERVE_DSV41_FLASH_ATTN) != null) try flash_attn.configure(env.span(.MLX_SERVE_DSV41_FLASH_ATTN));
+    scratch_attn.ps().ring_regions = flash_attn.ps().mode != .on;
 }
 
 /// The host's stream when it is a GPU one, else this thread's GPU stream; null off Metal: the module's kernels are
@@ -252,55 +274,69 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.cfg = c.*;
     // The driver's map never holds the vision tower (the engine's encoder reads it and hands its rows to `forward`).
     const taken = if (ctx.weights) |w| Resident.take(w) else null;
-    m.weights = taken orelse try dsv41.loadPack(io, gpa, ctx.model_dir.slice(), c.dsv41_vision);
+    // the tower left on disk, read for each image (`media.tower`).
+    const lazy_tower = c.dsv41_vision and taken == null;
+    m.weights = taken orelse try dsv41.loadPack(io, gpa, ctx.model_dir.slice(), c.dsv41_vision and !lazy_tower);
     errdefer m.weights.deinit();
     // The worker's layers when the driver's load planned a Thunderbolt pair.
     const pair: ?dsv41.Pair = if (ctx.pair_remote.count > 0) .{ .lo = ctx.pair_remote.first, .hi = ctx.pair_remote.first + ctx.pair_remote.count, .worker = false } else null;
     m.s = s;
     m.caps = ctx.parsed.caps;
-    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice() });
+    // The weights the pack stores in an outside quant plugin's format load and run through it.
+    const quant = try outside.Format.open(gpa, ctx.dir, ctx.model_dir.slice(), m.weights.source(), s, ctx.host);
+    defer if (quant) |q| q.close();
+    // A pack an outside plugin reads has no tower reader here: its weights leave before the bank sizes its rows.
+    if (quant != null) m.weights.dropPrefix("vision.");
+    m.mdl = try dsv41.init(gpa, &m.cfg, &m.weights, s, .{ .dspark = dsv41.dsparkWanted(&m.cfg, pair, mtpSetting(ctx.settings_json.slice())), .pair = pair, .tp = if (ctx.tp_size > 0) .{ .rank = ctx.tp_rank, .size = ctx.tp_size } else null, .head_8bit = dsv41.head8Wanted(), .streamed_experts = c.dsv41_streamed, .pack_dir = ctx.model_dir.slice(), .quant = quant });
     errdefer m.mdl.deinit();
+    // The fused Markov chain's kernels compiled now, not in the first draft.
+    if (m.mdl.dspark) |*w| try @import("spec/markov.zig").warm(m.mdl.s, w.markov_embed, w.markov_head, w.conf, m.mdl.act, m.mdl.ds_block, m.mdl.cfg.hidden_size, true);
     m.bank = null;
     m.owner = 0;
     m.parked = .empty;
     m.idle = null;
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
-        if (c.dsv41_exl3_bank) try openBank(m, io, dir, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
+        if (c.dsv41_exl3_bank) try openBank(m, quant, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
     }
     errdefer closeBank(m);
-    m.tower = if (c.dsv41_vision and taken == null) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
+    m.vision_dir = if (lazy_tower) try gpa.dupeSentinel(u8, ctx.model_dir.slice(), 0) else null;
+    errdefer if (m.vision_dir) |d| gpa.free(d);
+    m.tower = if (c.dsv41_vision and taken == null and !lazy_tower) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
+    if (lazy_tower) std.log.info("deepseek_v41: the vision tower is read from the pack for each image, not resident", .{});
     return m;
 }
 
-/// The pack's EXL3 bank at the slot rows the box holds beside the residents and a request of the model's `ctx_size`,
-/// else of the largest `bill.stream_context_rungs` rung that keeps `bill.stream_min_rows` rows, else of
-/// `bill.stream_context`.
-fn openBank(m: *Model, io: std.Io, dir: []const u8, ctx_size: ?u64, wired_margin: u64) !void {
-    if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
+/// The pack's bank, streamed by the outside quant plugin that claims it, at the slot rows the box holds beside the
+/// residents and a request of the model's `ctx_size`, else of the largest `bill.stream_context_rungs` rung that keeps
+/// `bill.stream_min_rows` rows, else of `bill.stream_context`.
+fn openBank(m: *Model, quant: ?*const outside.Format, ctx_size: ?u64, wired_margin: u64) !void {
+    const q = quant orelse return error.StreamedBankUnclaimed;
     const mdl = m.mdl;
-    const gates = try gpa.alloc(streamed.Exl3.Gate, mdl.n_layers);
+    const gates = try gpa.alloc(quant_abi.BankGate, mdl.n_layers);
     defer gpa.free(gates);
-    for (gates, mdl.layers[0..mdl.n_layers]) |*g, *ly| g.* = .{ .w = ly.gate_w, .bias = ly.gate_bias };
+    for (gates, mdl.layers[0..mdl.n_layers]) |*g, *ly| g.* = .{ .w = .{ .ctx = ly.gate_w.ctx }, .bias = .{ .ctx = ly.gate_bias.ctx } };
     _ = mlx.mlx_synchronize(m.s);
+    // The load's freed buffers back to the system: the budget reads the memory in use.
+    _ = mlx.mlx_clear_cache();
     const c = &m.cfg;
-    const geo: streamed.Exl3.Geometry = .{ .hidden_size = c.hidden_size, .moe_intermediate_size = c.moe_intermediate_size, .n_experts_per_tok = c.num_experts_per_tok, .n_routed_experts = c.num_experts, .n_layers = @intCast(mdl.n_layers), .swiglu_limit = c.dsv4_swiglu_limit };
+    const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(mdl.n_layers), .swiglu_limit = @floatCast(c.dsv4_swiglu_limit), .gates = gates.ptr };
     const context = ctx_size orelse for (bill_mod.stream_context_rungs) |rung| {
         const at = bill_mod.streamBudget(c, rung, wired_margin);
-        const fit = streamed.Exl3.billOf(gpa, io, dir, geo, .{ .prompt = at.prompt, .decode = at.decode }) catch continue;
-        if (fit.rows.prompt >= bill_mod.stream_min_rows) break rung;
+        const fit = (q.bankRows(geo, .{ .prompt = at.prompt, .decode = at.decode }) catch continue) orelse return error.StreamedBankUnclaimed;
+        if (fit.prompt >= bill_mod.stream_min_rows) break rung;
     } else bill_mod.stream_context;
     const budget = bill_mod.streamBudget(c, context, wired_margin);
-    const b = try streamed.Exl3.Source.open(gpa, io, dir, m.s, geo, gates, .{ .prompt = budget.prompt, .decode = budget.decode });
-    std.log.info("deepseek_v41: streamed experts, {d} prompt / {d} decode slot rows per layer for a {d}-token context ({d} B a row)", .{ b.bill.rows.prompt, b.bill.rows.decode, context, b.bill.row_bytes });
-    m.bank = .{ .exl3 = b };
+    const b = (try q.openBank(geo, .{ .prompt = budget.prompt, .decode = budget.decode })) orelse return error.StreamedBankUnclaimed;
+    std.log.info("deepseek_v41: streamed experts, {s} for a {d}-token context", .{ b.b.about.slice(), context });
+    m.bank = .{ .outside = b };
     m.bank_context = context;
-    mdl.streamed = streamed.exl3Routed(b);
+    mdl.streamed = b.routed();
 }
 
 /// A standard MLX pack's routed experts streamed as downloaded, at the slot rows the `stream_experts` setting names.
 fn openPackBank(m: *Model, dir: []const u8, ctx_size: ?u64, settings_json: []const u8) !void {
-    if (comptime !build_options.mlx_stream) return error.StreamedWeightsUnsupported;
+    if (comptime !streamed.built) return error.StreamedWeightsUnsupported;
     const rows = (streamed.Setting.parse(settings_json) orelse return error.StreamedWeightsUnsupported).slotRows(m.cfg.num_experts);
     _ = mlx.mlx_synchronize(m.s);
     var st = try streamed.Streamed.openPack(gpa, dir, m.s, rows);
@@ -312,16 +348,25 @@ fn openPackBank(m: *Model, dir: []const u8, ctx_size: ?u64, settings_json: []con
 }
 
 fn closeBank(m: *Model) void {
-    if (comptime !build_options.mlx_stream) return;
+    if (comptime !streamed.built) return;
     var b = m.bank orelse return;
     m.mdl.streamed = null;
     switch (b) {
-        .exl3 => |x| x.deinit(),
+        .outside => |x| x.close(),
         .pack => |*x| x.close(),
     }
     m.bank = null;
 }
 
+/// Whether a plugin-streamed bank holds its decode rows now.
+pub fn bankDecoding(m: *const Model) bool {
+    if (comptime !streamed.built) return false;
+    const b = m.bank orelse return false;
+    return switch (b) {
+        .outside => |x| !x.prompt,
+        .pack => false,
+    };
+}
 /// The per-model `ctx_size` setting: the prompt positions a streamed bank bills.
 fn ctxSetting(settings_json: []const u8) ?u64 {
     if (settings_json.len == 0) return null;
@@ -335,6 +380,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
     closeBank(m);
     if (m.tower) |*t| t.deinit();
+    if (m.vision_dir) |d| gpa.free(d);
     var it = m.parked.valueIterator();
     while (it.next()) |k| k.deinit();
     m.parked.deinit(gpa);
@@ -361,7 +407,10 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
-    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
+    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch |e| {
+        std.log.err("deepseek_v41: the forward failed: {s}", .{if (e == error.EngineFailed) @import("../../sdk/util/err_name.zig").last() else @errorName(e)});
+        return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
+    };
     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
     return .ok;
 }
@@ -466,13 +515,13 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
     return o;
 }
 
-/// The rows of one prompt call: a streamed EXL3 bank's up to `bill.stream_call_rows`; an MLX pack's the most whose pairs
+/// The rows of one prompt call: a plugin-streamed bank's up to `bill.stream_call_rows`; an MLX pack's the most whose pairs
 /// one group's fetch takes (`max_call_ids`).
 fn callRows(m: *const Model, n: usize) usize {
-    if (comptime !build_options.mlx_stream) return n;
+    if (comptime !streamed.built) return n;
     const b = m.bank orelse return n;
     return switch (b) {
-        .exl3 => bill_mod.stream_call_rows,
+        .outside => bill_mod.stream_call_rows,
         .pack => streamed.max_call_ids / m.cfg.num_experts_per_tok,
     };
 }
@@ -735,6 +784,11 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 // ── tests ──
 
+/// The Engram LRU every load of a pack with Engram layers bills.
+fn lru() u64 {
+    return @import("decode/engram_decode.zig").billBytes();
+}
+
 /// `residentBytes` over the Engram fixture (`engram.writeAffineFixture`) in `dir`, from `shards` bytes.
 fn engramResident(dir: []const u8, settings_json: []const u8, shards: u64) !u64 {
     var c: config.Config = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = 64 };
@@ -761,14 +815,14 @@ test "deepseek_v41 resident bill: a --mlx-gguf set (a file, not a pack dir) bill
     try std.testing.expectEqual(@as(u64, 10_000), out);
 }
 
-test "deepseek_v41 resident bill: the Engram tables it preads are not billed" {
+test "deepseek_v41 resident bill: the Engram tables it preads bill their LRU, not their shards" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
     try @import("engram.zig").writeAffineFixture(io, td.dir, "");
     var buf: [512]u8 = undefined;
     const dir = buf[0..try td.dir.realPath(io, &buf)];
-    try std.testing.expectEqual(@as(u64, 10_000 - 288), try engramResident(dir, "", 10_000));
+    try std.testing.expectEqual(10_000 - 288 + lru(), try engramResident(dir, "", 10_000));
 }
 
 test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages that will not load" {
@@ -792,8 +846,8 @@ test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages tha
     var buf: [512]u8 = undefined;
     const dir = buf[0..try td.dir.realPath(io, &buf)];
     // The stages load by default; the tower never does.
-    try std.testing.expectEqual(@as(u64, 10_000 - 288 - 32), try engramResident(dir, "", 10_000));
-    try std.testing.expectEqual(@as(u64, 10_000 - 288 - 32 - 64), try engramResident(dir, "{\"mtp\":false}", 10_000));
+    try std.testing.expectEqual(10_000 - 288 - 32 + lru(), try engramResident(dir, "", 10_000));
+    try std.testing.expectEqual(10_000 - 288 - 32 - 64 + lru(), try engramResident(dir, "{\"mtp\":false}", 10_000));
 }
 
 test {

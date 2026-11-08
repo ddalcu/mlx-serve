@@ -3,7 +3,7 @@
 DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its vision tower, as a native,
 module-owned arch. Resident unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
-OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank, streamed).
+OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin (its trunk and its `experts.bin` bank).
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;
@@ -13,13 +13,19 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
 - `media.zig`: decode, the release's processor (`vision.preprocess`), tower, placeholder run.
 - `deepseek_v41.zig` (model), `engram.zig`, `vision.zig`. The legacy seam is deleted: a pack the plugin declines is
   refused by name (`load/init.zig`).
-- `streamed_test.zig`: the trunk over an MXFP4 `experts.bin` bit-equal to the in-memory banks; a served EXL3 pack
-  equal to the trunk over the same bank at fewer slot rows (phase change, misses through the transient bank).
+- `streamed_test.zig`: the trunk with its experts streamed from the pack (`stream_experts`) bit-equal to the in-memory banks.
 - `fixtures/`: proof tapes recorded from the legacy forward (`fixtures/MANIFEST.md`).
 - `contract.zig`: kernel contract registrations of `kernels/*.metal`.
 - `decode/`: the fused decode kernels (`kernels/dec_*.metal`, one file a stage) a step or verify of up to `max_rows`
   rows runs through `blockFused`; `decode/fixture.zig` builds release-shape layers on random weights for their
   equivalence tests and the `DSV41_DEC_UBENCH` meters.
+- `prompt/`: the wide prompt layers' exact rewrites (each file's header names its change and gain): the gather's
+  kernels (`attn_core`, `q_tail`, `scratch_attn` regions and ring), the hc and router fusions (`hc_fuse`, `gate_gemm`),
+  span grouping (`idx_group`), buffers kept or reused (`transient_keep`, `scratch_x1` on `scratch`),
+  Engram's direct read (`engram_direct`), the embedding pread and a plugin bank's own pieces (`wide_early`, `woa_rows`,
+  `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
+- `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
+  `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
   without NAX (unmeasured on M5); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or
   128 (the expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
@@ -73,6 +79,17 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   the one-expert kernels: batched logits match a solo step to kernel numerics, not bits. Past one row they match bit
   for bit on the fixture, so a slot's greedy group rounds never depend on who shares them.
 - The V4.1 template, like V4's, is byte-pinned (`tests/dsv41_template_ab.py`).
+- A pack an outside quant plugin claims (`sdk/quant/outside.zig`, exllamav3's EXL3 trunk) loads its weights through it:
+  `Lin.ext` and `Experts.ext` hold no MLX arrays, so a path that reads a linear's `w`/`s` checks `ext` first; the
+  head counts through `hasHead`, not `head.w` (a head of `ext` alone was skipped as a tensor rank's).
+- The model runs in three `-Dunits` units (plugin, engine, modules): a setting or per-prompt region the load sets is
+  a `Shared` (`ps()`), never a plain `var`, or the rounds and the streamer run on another unit's defaults.
+- A plugin-streamed bank's greedy DSpark round verifies the whole block (`DflashPol.pin_rows`): its 6-row verify costs
+  about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s.
+- A streamed bank's phase follows its decode capacity (`promptPhase`): a call past the decode regions OR past
+  `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
+- Engram tables are read past the page cache only beside a streamed bank (`Table.readDirect`): on a resident MLX pack
+  the direct whole-grid read cost warm prompts 3% (the cache served their rows), and the bank needs that memory.
 - A fused decode stage is judged against an f32 model (`decode.expectNoWorse`), not against the chain's bits: greedy
   texts diverge from the chain's at bf16 near-ties. Stacked layers judge the median over seeds: one seed lands 1.6x
   either side of the chain (TF32 moves the f32 model itself 8% at the verify step on M5). Two dependent stages merged into one ticket-ordered dispatch
@@ -81,19 +98,18 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
 ## Streamed packs (`experts.bin`)
-- M5 and newer only (`naxAvailable`), refused by name below, as are GLM-5.3's EXL3 repacks: the prompt GEMMs are built
-  on MLX's NAX tiles and miss their f64 self-check on M4. The MLX pack streams anywhere.
-- The routed experts come from `sdk/weights/streamed.zig` `Exl3` (`exl3_source.zig`: the EXL3 lane, event-gated
-  waves, the next layer's reads predicted, the wide prompt feed, the decode forms / banked waves / hoist / device
-  route); the trunk's own MoE never runs for them (`moe`'s `source` arm; the DSpark stages stay resident).
+- An `experts.bin` bank is an outside quant plugin's (`openBank`: `outside.Format.openBank`, the `abi.Bank` as the
+  trunk's `Routed` `source` arm); no plugin claiming the pack refuses it by name (`StreamedBankUnclaimed`). The
+  trunk's own MoE never runs for its experts (the DSpark stages stay resident). The plugin owns the bank's rows,
+  reads, phases, kernels and its own bill terms; the trunk owns the forward and the budget (`streamBudget`).
 - The prompt runs in calls of up to `bill.stream_call_rows`, each one MoE call a layer over all its rows
   (`wideLayer`), its routes predicted before the attention (`readAhead`) so the reads overlap it.
 - Slot rows per phase (`Routed.phase`): a call wider than `region_rows` is a prompt, else decode; the phase change
   grows the rows into what the prompt's working set held.
 - The bank bills its rows at the load (`streamBudget`: the GPU working set less the host's wired margin and
   `stream_host_bytes`, the memory in use, the phase's working set at the context); the context is `ctx_size`, else
-  the largest `stream_context_rungs` rung keeping `stream_min_rows`. The engine's prefill guard leaves the pack to
-  it (`streamed_weights`); a prompt past the billed context is refused by name.
+  the largest `stream_context_rungs` rung keeping `stream_min_rows` (`bank_rows`). The engine's prefill guard leaves
+  the pack to it (`streamed_weights`); a prompt past the billed context is refused by name.
 - A plain MLX pack streams with the per-model `stream_experts` (`openPackBank`, the `trunk` arm): one fetch serves
   `Routed.decode_ids` experts, so a wider prompt call runs its experts in groups (`slotWide`). Decode is read-bound
   (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
@@ -117,6 +133,8 @@ OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank
   it, the fp8 encoder saturates it); `moe_gu` / `moe_act` turn a NaN gate sum into the clip limit (Metal's min);
   `engram` launches 1024 threads at 5120-wide rows where M1/M2 compile it for 928, unprobed: decode-width Engram
   writes fail on M1/M2.
+- No contract case yet for the 12 kernels the streamed forward brought (`attn_flash`, `attn_qk_t`, `gate_gemm_nt`,
+  `gate_gemm_loop`, `gemv_twin`, `hc_expand_into`, `hc_expand_norm`, `hc_mix_norm`, `markov_*`, `rope_tail_only`).
 
 ## Fixtures
 - `conformanceFixture`: `fixture.v41Files` (the `tests/dump_dsv41_fixtures.py` pipe layout, 8 layers, no Engram or

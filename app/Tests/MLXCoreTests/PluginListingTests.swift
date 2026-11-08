@@ -66,6 +66,20 @@ final class PluginListingTests: XCTestCase {
                        "a stopped server loads it at its next start: nothing to restart")
     }
 
+    func testAnOptionTheRunningServerHasNotAppliedNeedsARestart() {
+        var r = receipt("sushi_ds41", "0.2.0")
+        r.options = [.init(name: "SUSHI_DS41_FRAC", kind: .number)]
+        let current = PluginListing.items(receipts: [r], catalog: [sushi]).installed[0]
+        var on = OutsidePlugins.Switches(enabled: true)
+        on.setOption("sushi_ds41", "SUSHI_DS41_FRAC", "0.4")
+        let stale = ["sushi_ds41": PluginCatalog.ServerStatus(loaded: true, rebuild: false, why: "")]
+        let applied = ["sushi_ds41": PluginCatalog.ServerStatus(loaded: true, rebuild: false, why: "", options: ["SUSHI_DS41_FRAC": "0.4"])]
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: stale, serverUp: true), .restartNeeded)
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: applied, serverUp: true), .on)
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: stale, serverUp: false), .on,
+                       "a stopped server sets it at its next start")
+    }
+
     func testInstallProgressReadsAsThreeSteps() {
         typealias S = PluginListing.StepStatus
         func statuses(_ phase: PluginManager.Phase) -> [S] { PluginListing.installSteps(phase).map(\.status) }

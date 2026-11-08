@@ -2508,3 +2508,6 @@
 "Install downloads its source from CommunityServe/plugins and shows you what it will build. Once you approve, it is compiled and tested on this Mac and turned on." = "安装会从 CommunityServe/plugins 下载源代码，并显示将要构建的内容。你批准后，它会在这台 Mac 上编译、测试并启用。";
 "The original project" = "原始项目";
 "This plugin's source in the CommunityServe catalog" = "此插件在 CommunityServe 目录中的源代码";
+"Not a number" = "不是数字";
+"Too long" = "太长";
+"The server reads these when it starts." = "服务器在启动时读取这些设置。";

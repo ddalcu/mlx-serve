@@ -160,17 +160,9 @@ int dsv41_command_buffer_limits(int ops, int mb, int* prev_ops, int* prev_mb) {
 
 }  // extern "C"
 
-// MiMo P7 (`prefill_combine: "inplace"`): the wide call's sources' GPU addresses (csrc/mimo_gpu_address.inc).
+// The GPU addresses of arrays' buffers (`HostGpu.buffer_addresses`, csrc/mimo_gpu_address.inc).
 #include "mimo_gpu_address.inc"
 
-// MiMo X12 (`gpu_keep_warm`): the warm queue, kernel and tiny buffer (csrc/mimo_gpu_warm.inc). Kept in this translation
-// unit because the host compiles a fixed list of the plugin's csrc files; DeepSeek never calls it.
-#include "mimo_gpu_warm.inc"
-
-// MiMo X12 measurement: the GPU's energy, DVFS-state and thermal-state residency (IOReport) and DVFS table (csrc/mimo_gpu_power.inc).
-#include "mimo_gpu_power.inc"
-// glm5_next: MLX's gather_qmm in nvfp4 mode with the per-expert global scale (mlx-c has no argument for it).
-#include "glm5_gather_qmm.inc"
-// Every arch's MLX custom kernels: the launch cache (sdk_ext/metal_launch.zig; the pinned MLX rebuilds and rehashes a
-// kernel's source on every apply).
+// MLX custom kernels' launch cache (`HostGpu.launch`; the pinned MLX rebuilds and rehashes a kernel's source on every
+// apply).
 #include "mlx_launch_cache.inc"

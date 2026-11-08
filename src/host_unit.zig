@@ -9,13 +9,7 @@ const main_mod = @import("main.zig");
 pub const env = main_mod.env;
 pub const mlx = main_mod.mlx;
 pub const io_util = main_mod.io_util;
-pub const shared = main_mod.shared;
-pub const mtp_acceptance = main_mod.mtp_acceptance;
-pub const exl3 = main_mod.exl3;
-pub const dsa_nax = main_mod.dsa_nax;
-pub const fp8_block128_gemv = main_mod.fp8_block128_gemv;
 pub const log = main_mod.log;
-pub const plugin_profile = main_mod.plugin_profile;
 
 comptime {
     @export(&hostMain, .{ .name = "mlx_serve_host_main" });
