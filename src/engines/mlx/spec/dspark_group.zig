@@ -36,7 +36,17 @@ pub const MAX_SLOTS: usize = dflash_policy.MAX_GROUP_ROWS;
 /// unpaired). Its DSpark slots keep drafting beside company instead of yielding to the plain batch.
 pub fn groupable(xfm: *const Transformer) bool {
     const m = intree.dsv41(xfm) orelse return false;
-    return m.dspark != null and m.pair == null and m.streamed == null;
+    // An exact model's DSpark slots join no group round, whose verify and accept run the batched kernels. With company
+    // they yield to the plain batch after `COMPANY_YIELD_TICKS` (prefill_interleave), as any slot that does not group:
+    // exact covers one request at a time.
+    return m.dspark != null and m.pair == null and m.streamed == null and !dsv41_mod.exactServes(m);
+}
+
+/// Whether `xfm` keeps every request solo under exact (`MLX_SERVE_DSV41_EXACT_SOLO`, `dsv41.exactSolo`): the scheduler
+/// batches none of its decode and its DSpark slots keep drafting beside company.
+pub fn exactSolo(xfm: *const Transformer) bool {
+    const m = intree.dsv41(xfm) orelse return false;
+    return dsv41_mod.exactSolo(m);
 }
 
 /// Whether `slot` ticks DSpark rounds on a groupable model.

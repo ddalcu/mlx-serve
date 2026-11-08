@@ -268,7 +268,7 @@ pub const Fixture = struct {
 
 const Fmt = union(enum) { bf16, fp8_exact, mxfp8, mxfp4, affine: u32 };
 
-fn quantize(w: A, gs: c_int, bits: c_int, mode: [*:0]const u8) ![3]A {
+pub fn quantize(w: A, gs: c_int, bits: c_int, mode: [*:0]const u8) ![3]A {
     var qv = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(qv);
     try mlx.check(mlx.mlx_quantize(&qv, w, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), mode, none, mlx.gpuStream()));
