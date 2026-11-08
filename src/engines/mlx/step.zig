@@ -357,6 +357,15 @@ pub fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot, module_bytes:
         bytes += b;
         if (observe) recordLiveSession(sch, s, .decode, b);
     }
+    // A shed or queued slot keeps its KV beside the decode list: bill it or the
+    // published residency under-reads what the process holds. Queued slots are
+    // not sessions — bytes only.
+    for ([_][]*Slot{ sch.pending.items, sch.cleanup_queue.items, sch.offloaded.items }) |queued| {
+        for (queued) |s| {
+            if (s == prefilling) continue; // already priced above
+            bytes += slotStateBytes(s);
+        }
+    }
     sch.resident_live_kv_bytes.store(bytes, .monotonic);
 }
 
@@ -375,10 +384,79 @@ fn slotStateBytes(s: *const Slot) u64 {
     if (s.ssm_entries) |ents| for (ents) |*e| {
         bytes += transformer_mod.ssmEntryBytes(e);
     };
+    if (s.legacy_gen) |*g| bytes += g.mtpCacheBytes();
     return bytes;
 }
 
 // ── tests ──
+
+fn slotHoldingKvBytes(bytes: usize) !Slot {
+    // A slot whose cache owns exactly `bytes` of KV, nothing else counted.
+    const mlx = @import("../../mlx/ffi.zig");
+    var s: Slot = undefined;
+    s.cache = try transformer_mod.KVCache.init(testing.allocator, 1);
+    s.ssm_entries = null;
+    s.legacy_gen = null;
+    const buf = try testing.allocator.alloc(f32, bytes / 4);
+    defer testing.allocator.free(buf);
+    var shape = [_]c_int{@intCast(buf.len)};
+    s.cache.entries[0].keys = mlx.mlx_array_new_data(buf.ptr, &shape, 1, .float32);
+    s.cache.entries[0].initialized = true;
+    return s;
+}
+
+test "live residency bills the slots held off the decode list" {
+    // The under-read: a shed or queued slot keeps its KV while invisible to
+    // the decode walk. Listed once is billed once: the prefilling slot parked
+    // in `pending` too adds nothing a second time.
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.metrics = null;
+    sch.queue_mu = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.cleanup_queue = .empty;
+    sch.offloaded = .empty;
+    sch.live_session_count = 0;
+    sch.resident_live_kv_bytes = .init(0);
+
+    var held = try slotHoldingKvBytes(4096);
+    defer held.cache.deinit();
+    var retiring = try slotHoldingKvBytes(2048);
+    defer retiring.cache.deinit();
+    try sch.pending.append(testing.allocator, &held);
+    defer sch.pending.deinit(testing.allocator);
+    try sch.cleanup_queue.append(testing.allocator, &retiring);
+    defer sch.cleanup_queue.deinit(testing.allocator);
+
+    sch.queue_mu.lockUncancelable(sch.io);
+    defer sch.queue_mu.unlock(sch.io);
+    publishLiveKvResidency(&sch, null, 1024);
+    try testing.expectEqual(@as(u64, 1024 + 4096 + 2048), sch.resident_live_kv_bytes.load(.monotonic));
+    publishLiveKvResidency(&sch, &held, 1024);
+    try testing.expectEqual(@as(u64, 1024 + 4096 + 2048), sch.resident_live_kv_bytes.load(.monotonic));
+}
+
+test "a slot's state bytes carry the MTP head cache it owns" {
+    // Request-private head history: billed by neither a hot entry nor the
+    // module, so the live term must carry it.
+    const Generator = @import("generate/generator.zig").Generator;
+    const mlx = @import("../../mlx/ffi.zig");
+    var s: Slot = undefined;
+    s.cache = try transformer_mod.KVCache.init(testing.allocator, 0);
+    defer s.cache.deinit();
+    s.ssm_entries = null;
+    var gen: Generator = undefined;
+    var head_kv = try transformer_mod.KVCache.init(testing.allocator, 1);
+    defer head_kv.deinit();
+    var buf: [1024]f32 = @splat(1.0);
+    var shape = [_]c_int{1024};
+    head_kv.entries[0].keys = mlx.mlx_array_new_data(&buf, &shape, 1, .float32);
+    head_kv.entries[0].initialized = true;
+    gen.mtp_cache = .{ .qwen = head_kv };
+    s.legacy_gen = gen;
+    try testing.expectEqual(@as(u64, 4096), slotStateBytes(&s));
+}
 
 test "a busy disk retry parks until its bounded timeout or pending work" {
     var sch: Scheduler = undefined;

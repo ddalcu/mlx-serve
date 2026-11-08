@@ -564,6 +564,13 @@ pub const Generator = struct {
         return @min(self.loop_guard_start, self.generated_ids.items.len);
     }
 
+    /// GPU bytes of this request's private MTP head history; the live-residency
+    /// term must carry it or under-reads what the process holds.
+    pub fn mtpCacheBytes(self: *const Generator) u64 {
+        if (self.mtp_cache) |*cache| return cache.residentBytes();
+        return 0;
+    }
+
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
         self.xfm.discardDeferredPle(&self.ctx);

@@ -499,6 +499,9 @@ test "module live residency is counted once per model and cannot be credited as 
     sch.digest_mu = .init;
     sch.queue_mu = .init;
     sch.decoding = .empty;
+    sch.pending = .empty;
+    sch.cleanup_queue = .empty;
+    sch.offloaded = .empty;
     sch.resident_hot_cache_bytes = .init(0);
     sch.reclaimable_hot_cache_bytes = .init(0);
     sch.resident_live_kv_bytes = .init(0);

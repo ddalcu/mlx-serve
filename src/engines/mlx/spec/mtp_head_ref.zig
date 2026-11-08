@@ -12,6 +12,7 @@ const plugin_head = @import("../plugin/head.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
 const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
+const ssmEntryBytes = @import("../ssm/entry.zig").ssmEntryBytes;
 const ssmFreeSpecCapture = @import("../ssm/entry.zig").ssmFreeSpecCapture;
 const testing = std.testing;
 
@@ -379,6 +380,21 @@ pub const MtpCacheRef = union(enum) {
         };
     }
 
+    /// GPU bytes of the head history this request privately holds (KV rows +
+    /// recurrent entry): request-private, billed by neither hot cache nor module.
+    /// Never activates the qwen4 head — a residency read must not swap state.
+    pub fn residentBytes(self: *const MtpCacheRef) u64 {
+        return switch (self.*) {
+            .qwen => |*c| c.residentBytes(),
+            .plugin => |*r| blk: {
+                var bytes = r.kv.residentBytes();
+                for (r.ssm) |*e| bytes += ssmEntryBytes(e);
+                break :blk bytes;
+            },
+            .qwen4 => |r| r.st.residentBytes(),
+        };
+    }
+
     /// The underlying KVCache — what the prefix cache's spec-snap machinery
     /// snapshots and restores. The qwen4 head's state is not KV-only, so a caller taking this
     /// pointer must also carry `head()`. Null when head persistence is off.
@@ -467,4 +483,54 @@ test "MTP plugin head cache: each head's recurrent entry keeps what its handle s
     try testing.expectEqual(ref.ssm[2].conv_state.ctx, cache_ops.ops.state(slot.handle(), 2, .conv).ctx);
     try testing.expect(cache_ops.ops.state(slot.handle(), 0, .conv).ctx == null);
     try testing.expectEqual(abi.Verdict.Code.unsupported, cache_ops.ops.set_state(slot.handle(), 3, .conv, .{ .ctx = v.ctx }).code);
+}
+
+fn kvWithBytes(cache: *transformer_mod.KVCache, bytes: usize) void {
+    var buf: [2048]f32 = @splat(1.0);
+    var shape = [_]c_int{@intCast(bytes / 4)};
+    cache.entries[0].keys = mlx.mlx_array_new_data(&buf, &shape, 1, .float32);
+    cache.entries[0].initialized = true;
+}
+
+test "MtpCacheRef.residentBytes bills the request-private head history on every arm" {
+    // qwen sidecar arm: the head's own KV rows.
+    var qkv = try transformer_mod.KVCache.init(testing.allocator, 1);
+    defer qkv.deinit();
+    kvWithBytes(&qkv, 4096);
+    const qwen: MtpCacheRef = .{ .qwen = qkv };
+    try testing.expectEqual(@as(u64, 4096), qwen.residentBytes());
+
+    // plugin arm: head KV plus each head's recurrent entry.
+    var pkv = try transformer_mod.KVCache.init(testing.allocator, 1);
+    defer pkv.deinit();
+    kvWithBytes(&pkv, 4096);
+    var ssm = [_]SSMCacheEntry{.{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = false,
+    }};
+    defer _ = mlx.mlx_array_free(ssm[0].ssm_state);
+    const empty_conv = ssm[0].conv_state;
+    defer _ = mlx.mlx_array_free(empty_conv);
+    var buf: [512]f32 = @splat(1.0);
+    var shape = [_]c_int{512};
+    ssm[0].conv_state = mlx.mlx_array_new_data(&buf, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(ssm[0].conv_state);
+    const pref: MtpCacheRef = .{ .plugin = .{ .kv = pkv, .ssm = &ssm } };
+    try testing.expectEqual(@as(u64, 4096 + 2048), pref.residentBytes());
+
+    // qwen4 arm: the request's own half of the in-checkpoint head, read
+    // without activating it.
+    var skv = try transformer_mod.KVCache.init(testing.allocator, 1);
+    defer skv.deinit();
+    kvWithBytes(&skv, 4096);
+    var st: Qwen4Mtp.Qwen4MtpState = .{ .cache = skv, .entry = .{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = false,
+    } };
+    defer _ = mlx.mlx_array_free(st.entry.conv_state);
+    defer _ = mlx.mlx_array_free(st.entry.ssm_state);
+    const q4: MtpCacheRef = .{ .qwen4 = .{ .t = undefined, .st = &st, .allocator = testing.allocator } };
+    try testing.expectEqual(@as(u64, 4096), q4.residentBytes());
 }
