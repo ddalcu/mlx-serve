@@ -76,6 +76,7 @@ const acore = @import("prompt/attn_core.zig");
 /// kernel (an online softmax; the scores and probabilities never leave a threadgroup), not exact.
 const fa = @import("prompt/flash_attn.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
+const array_util = @import("../../mlx/array.zig");
 
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
@@ -337,6 +338,38 @@ pub const Lin = struct {
     }
 };
 
+/// One tensor rank's rows `[lo, hi)` of the LM head (`vocabRange`). Its logits cross to the other ranks `rows` wide,
+/// the last rank's zero-padded, so every rank's part has one shape.
+pub const HeadPart = struct {
+    lin: Lin,
+    lo: usize,
+    hi: usize,
+    rows: usize,
+    size: usize,
+};
+
+/// Rank `rank` of `size`'s rows of a `vocab`-row head: `ceil(vocab / size)` each, the last rank what remains.
+pub fn vocabRange(vocab: usize, rank: usize, size: usize) struct { lo: usize, hi: usize, rows: usize } {
+    const rows = (vocab + size - 1) / size;
+    return .{ .lo = @min(vocab, rank * rows), .hi = @min(vocab, (rank + 1) * rows), .rows = rows };
+}
+
+/// This rank's logits `[L, part.rows]` over the normed rows `xn`, in the head's output dtype, zero past `hi`.
+pub fn vocabPart(sc: *Scope, part: *const HeadPart, xn: A) !A {
+    const y = try part.lin.apply(sc, xn);
+    const n = part.hi - part.lo;
+    if (n == part.rows) return y;
+    return sc.concat(&.{ y, try sc.zeros(&.{ ci(dim(y, 0)), ci(part.rows - n) }, mlx.mlx_array_dtype(y)) }, -1);
+}
+
+/// The ranks' parts as an all-gather stacks them, `[size * L, rows]` in rank order, as the logits `[L, vocab]`.
+pub fn vocabJoin(sc: *Scope, g: A, size: usize, vocab: usize) !A {
+    const rows = dim(g, -1);
+    const L = dim(g, 0) / size;
+    const t = try sc.transpose(try sc.reshape(g, &.{ ci(size), ci(L), ci(rows) }), &.{ 1, 0, 2 });
+    return sc.slice(try sc.reshape(t, &.{ ci(L), ci(size * rows) }), -1, 0, vocab);
+}
+
 pub const Hc = struct {
     fn_w: A, // f32 [mix, hc * dim]
     scale: A, // f32 [mix]: scale[0] for pre, [1] post, [2] comb
@@ -509,6 +542,10 @@ pub const Dsv41Model = struct {
     pair: ?Pair = null,
     /// This process's slice of every expert (`cfg.moe_intermediate_size` is already its width).
     tp: ?Shard = null,
+    /// Tensor parallel with the vocabulary split (`vocabSplit`): this rank's rows of the LM head. Every rank projects
+    /// its part of each step's logits and the parts are gathered (`headLogits`); rank 0 still holds the whole head for
+    /// the DSpark drafts.
+    head_part: ?HeadPart = null,
     /// `moeFused`'s unit expand at rows 1..`dkern.max_rows` (`.pre` the zero stream), made once at load.
     tp_units: [dkern.max_rows]Split = undefined,
     /// `dec_state`'s identity: a snapshot names the state it was taken of. Set from `gens` whenever `dec_state` is
@@ -708,6 +745,68 @@ pub fn head8Wanted() bool {
 
 fn head8From(v: ?[*:0]const u8) bool {
     return v == null or v.?[0] != '0';
+}
+
+/// The split a tensor rank's LM head takes: every rank its rows of the vocabulary (`vocabRange`), unless
+/// `DSV41_VOCAB_HEAD=0` keeps the head whole on rank 0 (the A/B control). Every rank must read the same value.
+fn vocabSplit(tp: ?Shard) ?Shard {
+    return vocabSplitFrom(tp, std.c.getenv("DSV41_VOCAB_HEAD"));
+}
+
+fn vocabSplitFrom(tp: ?Shard, v: ?[*:0]const u8) ?Shard {
+    const t = tp orelse return null;
+    if (t.size < 2) return null;
+    return if (v != null and v.?[0] == '0') null else t;
+}
+
+/// Rank `t`'s rows of the head `l` (`vocabRange`): views of `l` when `keep_whole` (rank 0, whose DSpark drafts read the
+/// whole head), else owned copies with `l` released, requantized to 8-bit when `head_8bit` and `l` is dense, as rank
+/// 0's whole head is (affine groups run along a row, so a row's codes are the same either way).
+fn headPart(m: *Dsv41Model, w: *Weights, l: Lin, t: Shard, keep_whole: bool, head_8bit: bool) !HeadPart {
+    const r = vocabRange(m.vocab, t.rank, t.size);
+    if (r.lo >= r.hi) return error.Dsv41VocabSplit;
+    var p = l;
+    inline for (.{ "w", "s", "b" }) |f| if (@field(l, f).ctx != null) {
+        @field(p, f) = try ownRows(m, @field(l, f), r.lo, r.hi, !keep_whole);
+    };
+    if (!keep_whole) {
+        inline for (.{ "w", "s", "b" }) |f| release(m, w, @field(l, f));
+        if (p.s.ctx == null and head_8bit) p = try quantizeLin(m, w, p, 8, 64);
+    }
+    return .{ .lin = p, .lo = r.lo, .hi = r.hi, .rows = r.rows, .size = t.size };
+}
+
+/// Rows `[lo, hi)` of the 2-D `x`, evaluated and owned by `m`: a view of `x`, or with `copy` a buffer of its own.
+fn ownRows(m: *Dsv41Model, x: A, lo: usize, hi: usize, copy: bool) !A {
+    const sh = mlx.getShape(x);
+    const start = [_]c_int{ ci(lo), 0 };
+    const stop = [_]c_int{ ci(hi), sh[1] };
+    const strides = [_]c_int{ 1, 1 };
+    var v = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_slice(&v, x, &start, 2, &stop, 2, &strides, 2, m.s)) catch |e| {
+        _ = mlx.mlx_array_free(v);
+        return e;
+    };
+    const o = if (copy) blk: {
+        defer _ = mlx.mlx_array_free(v);
+        break :blk try array_util.materializedOwnedCopy(m.s, v);
+    } else v;
+    _ = try m.own(o);
+    try mlx.check(mlx.mlx_array_eval(o));
+    return o;
+}
+
+/// The logits `[L, vocab]` f32 of the collapsed rows `h`: the head over the final norm, or under a vocabulary split this
+/// rank's part gathered with every other rank's. A tensor rank past 0 without a split holds no head: `h` stands in.
+fn headLogits(sc: *Scope, m: *const Dsv41Model, h: A) !A {
+    const eps = m.cfg.rms_norm_eps;
+    if (m.head_part) |*p| {
+        const gather = clusterHooks().tp_gather orelse return error.DsvTpNotJoined;
+        const part = try vocabPart(sc, p, try sc.rms(h, m.norm, eps));
+        return sc.astype(try vocabJoin(sc, try sc.keep(try gather(part)), p.size, m.vocab), .float32);
+    }
+    if (!m.hasHead()) return sc.astype(h, .float32);
+    return sc.astype(try m.head.apply(sc, try sc.rms(h, m.norm, eps)), .float32);
 }
 
 var ced_env: ?bool = null;
@@ -1536,6 +1635,9 @@ const ClusterHooksState = struct {
     pair_exchange: ?*const fn (x: A, pre: A, p0: usize, snap: bool, verify: bool) anyerror![2]A = null,
     /// Tensor parallel: every rank's partial `x` summed, lazily (caller frees). Set by distributed.zig on every rank.
     tp_sum: ?*const fn (x: A) anyerror!A = null,
+    /// Tensor parallel: every rank's `x` stacked on axis 0 in rank order, lazily (caller frees); the shapes match. Set
+    /// by distributed.zig on every rank.
+    tp_gather: ?*const fn (x: A) anyerror!A = null,
     /// Tensor parallel, rank 0: one step's ids at `p0` to the other ranks before its forward is built; `snap`: the
     /// step ends at the armed snapshot; `all`: every row's logits; `images`: the rows its image positions take
     /// (`chunkImageRows`, evaluated). Set by distributed.zig.
@@ -1643,7 +1745,8 @@ pub const InitOpts = struct {
     pair: ?Pair = null,
     /// Tensor parallel: the weights hold this rank's slice of every expert and attention head (`Shard.axis`). Every
     /// rank runs the whole forward and sums its attention and MoE outputs with the others (`ClusterHooksState.tp_sum`);
-    /// rank 0 hands each step's ids to the others (`tp_step`, `tpWorkerStep`) and alone projects the logits.
+    /// rank 0 hands each step's ids to the others (`tp_step`, `tpWorkerStep`). Each rank projects its rows of the
+    /// logits and rank 0 gathers them (`head_part`); `DSV41_VOCAB_HEAD=0` has rank 0 alone project them.
     tp: ?Shard = null,
     /// A dense head served 8-bit (affine, g64): half the bytes every token reads. Lossy.
     head_8bit: bool = false,
@@ -1772,11 +1875,22 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             if (getOpt(w, "embed.weight", .{})) |x| release(m, w, x);
             log.info("deepseek_v41: embedding rows read from the pack at each lookup, not resident\n", .{});
         } else m.embed = try getLin(m, w, cfg.hidden_size, "embed", .{});
-        m.head = if (tp_worker) .{ .w = none } else try getLin(m, w, cfg.hidden_size, "head", .{});
-        if (m.head.ext != null) log.info("deepseek_v41: lm head on {s}, as shipped\n", .{opts.quant.?.name()}) else if (!tp_worker and m.head.s.ctx == null) {
-            if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
-            log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
+        const split = vocabSplit(opts.tp);
+        m.head = if (tp_worker and split == null) .{ .w = none } else try getLin(m, w, cfg.hidden_size, "head", .{});
+        if (tp_worker and split != null) {
+            m.head_part = try headPart(m, w, m.head, split.?, false, opts.head_8bit);
+            m.head = .{ .w = none };
+        } else if (m.head.ext != null) log.info("deepseek_v41: lm head on {s}, as shipped\n", .{opts.quant.?.name()}) else if (!tp_worker) {
+            if (m.head.s.ctx == null) {
+                if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
+                log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
+            }
+            if (split) |t| m.head_part = try headPart(m, w, m.head, t, true, opts.head_8bit);
         }
+        // Logged on every rank: ranks that disagree hang in rank 0's first gather.
+        if (opts.tp) |t| if (m.head_part) |p| {
+            log.info("deepseek_v41: tensor rank {d} of {d} projects lm head rows [{d}, {d}) of {d} (DSV41_VOCAB_HEAD=0 keeps it whole on rank 0)\n", .{ t.rank, t.size, p.lo, p.hi, m.vocab });
+        } else if (t.size > 1) log.info("deepseek_v41: tensor rank {d} of {d}: lm head whole on rank 0 (DSV41_VOCAB_HEAD=0)\n", .{ t.rank, t.size });
         m.norm = try ownCast(m, try getW(w, "norm.weight", .{}), m.act);
     }
     m.rope_plain = try buildRope(m, cfg.rope_theta, 0, 1, 0, 0);
@@ -1857,7 +1971,7 @@ fn evalWeights(m: *Dsv41Model) !void {
         try wireLoaded(m);
     }
     xs.clearRetainingCapacity();
-    try collectArrays(m.gpa, &xs, .{ m.embed, m.head, m.norm, m.dspark });
+    try collectArrays(m.gpa, &xs, .{ m.embed, m.head, m.head_part, m.norm, m.dspark });
     for (m.engrams) |e| try collectArrays(m.gpa, &xs, .{ e.wkv, e.qk });
     try evalAll(xs.items);
 }
@@ -5017,8 +5131,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         for (0..sp.xs.len) |k| try parts.append(gpa, try hcCollapse(&sc, sp.xs[k], sp.pres[k]));
         h = try sc.concat(parts.items, 0);
     }
-    // A tensor rank past 0 holds no head: its last stream stands in for the logits.
-    const logits = if (!m.hasHead()) try sc.astype(h, .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(h, m.norm, c.rms_norm_eps)), .float32);
+    const logits = try headLogits(&sc, m, h);
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, logits);
@@ -6499,8 +6612,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
     const rows = try gpa.alloc(A, N);
     defer gpa.free(rows);
     for (rows, 0..) |*h, k| h.* = try hcCollapse(&sc, sp.xs[k], sp.pres[k]);
-    // A tensor rank past 0 holds no head: its last streams stand in for the logits.
-    const logits = if (!m.hasHead()) try sc.astype(try sc.concat(rows, 0), .float32) else try sc.astype(try m.head.apply(&sc, try sc.rms(try sc.concat(rows, 0), m.norm, c.rms_norm_eps)), .float32);
+    const logits = try headLogits(&sc, m, try sc.concat(rows, 0));
     var ev: std.ArrayList(A) = .empty;
     defer ev.deinit(gpa);
     try ev.append(gpa, logits);
@@ -9912,6 +10024,130 @@ test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps t
     try testing.expect(head8From(null));
     try testing.expect(head8From("1"));
     try testing.expect(!head8From("0"));
+}
+
+test "dsv41 vocab head: tensor ranks split the head unless DSV41_VOCAB_HEAD=0; uneven vocabularies pad the last part" {
+    const t: Shard = .{ .rank = 1, .size = 4 };
+    try testing.expectEqual(t, vocabSplitFrom(t, null).?);
+    try testing.expectEqual(t, vocabSplitFrom(t, "1").?);
+    try testing.expect(vocabSplitFrom(t, "0") == null);
+    try testing.expect(vocabSplitFrom(.{ .rank = 0, .size = 1 }, null) == null);
+    try testing.expect(vocabSplitFrom(null, null) == null);
+    // The release's 129280 rows: a quarter each at four ranks; at three the last part is two rows short.
+    const q = vocabRange(129280, 3, 4);
+    try testing.expectEqual([3]usize{ 96960, 129280, 32320 }, [3]usize{ q.lo, q.hi, q.rows });
+    const t3 = vocabRange(129280, 2, 3);
+    try testing.expectEqual([3]usize{ 86188, 129280, 43094 }, [3]usize{ t3.lo, t3.hi, t3.rows });
+}
+
+test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole head's logits bit for bit, dense and 8-bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const s = mlx.gpuStream();
+    // Uneven at 2, 3 and 4 ranks, so the last rank's part is padded every time.
+    const V: usize = 1027;
+    const D: usize = 256;
+    var sc = Scope.init(gpa, s);
+    defer sc.deinit();
+    const rand = struct {
+        fn of(scope: *Scope, k: A, shape: []const c_int, mean: f32, sd: f32) !A {
+            var o = mlx.mlx_array_new();
+            const r = try scope.res(mlx.mlx_random_normal(&o, shape.ptr, shape.len, .bfloat16, mean, sd, k, scope.s), &o);
+            try mlx.check(mlx.mlx_array_eval(r));
+            return r;
+        }
+    }.of;
+    var kk: [3]A = undefined;
+    for (&kk, 0..) |*k, i| {
+        k.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_key(k, 7 + i));
+        _ = try sc.keep(k.*);
+    }
+    const dense = try rand(&sc, kk[0], &.{ ci(V), ci(D) }, 0, 0.05);
+    const norm = try rand(&sc, kk[1], &.{ci(D)}, 1, 0.1);
+    const hs = try rand(&sc, kk[2], &.{ 6, ci(D) }, 0, 1);
+    const eps: f32 = 1e-6;
+    // A model shell holding only what the head reads, its head loaded from its own weights map as `init` loads it.
+    const Shell = struct {
+        m: Dsv41Model,
+        w: Weights,
+        fn init(sh: *@This(), head: A, nw: A, q8: bool) !void {
+            sh.w = Weights.init(testing.allocator);
+            var o = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&o, head);
+            try sh.w.put("head.weight", o);
+            sh.m = undefined;
+            sh.m.gpa = testing.allocator;
+            sh.m.s = mlx.gpuStream();
+            sh.m.vocab = V;
+            sh.m.owned = .empty;
+            sh.m.cfg = .{};
+            sh.m.cfg.rms_norm_eps = eps;
+            sh.m.norm = nw;
+            sh.m.head_part = null;
+            sh.m.head = try getLin(&sh.w, D, "head", .{});
+            if (q8) sh.m.head = try quantizeLin(&sh.m, &sh.w, sh.m.head, 8, 64);
+        }
+        fn deinit(sh: *@This()) void {
+            for (sh.m.owned.items) |x| _ = mlx.mlx_array_free(x);
+            sh.m.owned.deinit(testing.allocator);
+            sh.w.deinit();
+        }
+    };
+    // The all-gather: every rank's part stacked on axis 0, the calling rank's own in its slot.
+    const Gather = struct {
+        var parts: [4]A = undefined;
+        var n: usize = 0;
+        var rank: usize = 0;
+        fn gather(x: A) anyerror!A {
+            var xs = parts;
+            xs[rank] = x;
+            const vec = mlx.mlx_vector_array_new_data(&xs, n);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 0, mlx.gpuStream()));
+            return o;
+        }
+    };
+    clusterHooks().tp_gather = &Gather.gather;
+    defer clusterHooks().tp_gather = null;
+    for ([_]bool{ false, true }) |q8| {
+        var whole: Shell = undefined;
+        try whole.init(dense, norm, q8);
+        defer whole.deinit();
+        for ([_]usize{ 2, 3, 4 }) |n| {
+            // Rank 0 cuts views of its whole head (quantized first, as `init` does); a worker cuts the dense rows and
+            // quantizes only those.
+            var ranks: [4]Shell = undefined;
+            var made: usize = 0;
+            defer for (ranks[0..made]) |*r| r.deinit();
+            for (ranks[0..n], 0..) |*r, i| {
+                try r.init(dense, norm, q8 and i == 0);
+                made += 1;
+                r.m.head_part = try headPart(&r.m, &r.w, r.m.head, .{ .rank = @intCast(i), .size = @intCast(n) }, i == 0, q8);
+                if (i != 0) r.m.head = .{ .w = none };
+                try testing.expectEqual(q8, r.m.head_part.?.lin.s.ctx != null);
+            }
+            Gather.n = n;
+            for ([_]usize{ 1, 6 }) |L| {
+                const h = try sc.slice(hs, 0, 0, L);
+                const want = try hostF32(try headLogits(&sc, &whole.m, h));
+                defer gpa.free(want);
+                try testing.expectEqual(L * V, want.len);
+                for (ranks[0..n], 0..) |*r, i| {
+                    Gather.parts[i] = try vocabPart(&sc, &r.m.head_part.?, try sc.rms(h, norm, eps));
+                    // The gather carries the head's bf16 output: the f32 logits are only its widening.
+                    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(Gather.parts[i]));
+                }
+                for (ranks[0..n], 0..) |*r, i| {
+                    Gather.rank = i;
+                    const got = try hostF32(try headLogits(&sc, &r.m, h));
+                    defer gpa.free(got);
+                    try testing.expectEqualSlices(f32, want, got);
+                }
+            }
+        }
+    }
 }
 
 test "dsv41 clampedSwiglu: the SDK clamped SwiGLU in f32 gives the bytes the plugin's own chain recorded" {
