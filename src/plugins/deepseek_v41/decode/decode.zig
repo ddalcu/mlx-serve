@@ -22,6 +22,7 @@ pub const moe_down = @import("moe_down.zig");
 const dsv41 = @import("../deepseek_v41.zig");
 
 const A = mlx.mlx_array;
+const none: A = .{ .ctx = null };
 
 /// The most rows a decode kernel serves in one launch: a plain step, or a DSpark verify block.
 pub const max_rows = 6;
@@ -52,6 +53,12 @@ pub fn expectNoWorse(label: []const u8, new: []const f32, chain: []const f32, tr
     std.debug.print("[dec] {s}: new-truth {e:.2}, chain-truth {e:.2} (rel rms)\n", .{ label, en, ec });
     for (new) |v| if (!std.math.isFinite(v)) return error.NonFinite;
     if (en > 1.25 * ec + 1e-4) return error.FurtherFromTruth;
+}
+
+/// `DSV41_ATTN_BW` (on; =0 keeps the first attention-side launches).
+pub fn attnBw() bool {
+    const v = env.get(.DSV41_ATTN_BW);
+    return v == null or v.?[0] != '0';
 }
 
 /// The ubenches run only with `DSV41_DEC_UBENCH` set (under `~/claude-tmp/dsdec/with.sh gpu`).
@@ -168,6 +175,354 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
             std.debug.print("[dec-ubench] layers 20..40 R={d} {s}: {d:.1} us a layer (median step {d:.0} us)\n", .{ rows, if (fused) "fused" else "chain", times[times.len / 2] / 20, times[times.len / 2] });
         }
     }
+}
+
+// ── the attention side at a tensor rank's shapes ──
+
+const Shard = @import("../../../sdk/weights/shard.zig").Shard;
+/// Rank 0 of four: a quarter of the heads, wq_b and wo_a rows and wo_b columns; q_kv, the hc mixes, the compressor
+/// and the indexer whole.
+const tp4: Shard = .{ .rank = 0, .size = 4 };
+/// Weight sets a chain cycles through, so a step's weights were last read hundreds of MB before it.
+const bw_sets = 80;
+/// The splits a compressed layer's attention hands wo_a (`attn.splitsFor` of the window and the 512 picks).
+const bw_splits = 8;
+const bench_rows = [_]usize{ 1, 2, 4, max_rows };
+
+/// `a` in new memory, evaluated.
+fn copyOf(sc: *dsv41.Scope, a: A) !A {
+    const o = try sc.add(a, try sc.zeros(&.{1}, mlx.mlx_array_dtype(a)));
+    try mlx.check(mlx.mlx_array_eval(o));
+    return o;
+}
+
+/// `ly` with every attention-side weight in new memory.
+fn layerCopy(sc: *dsv41.Scope, ly: *const dsv41.Layer) !dsv41.Layer {
+    var c = ly.*;
+    const q = &c.q_kv.?;
+    q.w = try copyOf(sc, q.w);
+    q.s = try copyOf(sc, q.s);
+    c.hc_attn.fn_w = try copyOf(sc, c.hc_attn.fn_w);
+    inline for (.{ "wq_b", "wo_a", "wo_b" }) |f| {
+        @field(c, f).w = try copyOf(sc, @field(c, f).w);
+        @field(c, f).s = try copyOf(sc, @field(c, f).s);
+    }
+    if (c.idx) |*iw| {
+        iw.weights_proj.w = try copyOf(sc, iw.weights_proj.w);
+        iw.wq_b.w = try copyOf(sc, iw.wq_b.w);
+        iw.wq_b.s = try copyOf(sc, iw.wq_b.s);
+    }
+    if (c.comp) |*cw| cw.wkv.w = try copyOf(sc, cw.wkv.w);
+    return c;
+}
+
+fn nbytes(a: A) usize {
+    return if (a.ctx == null) 0 else mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+}
+
+fn linBytes(l: dsv41.Lin) f64 {
+    return @floatFromInt(nbytes(l.w) + nbytes(l.s));
+}
+
+/// One arm's pipelines (today's, or `DSV41_ATTN_BW`'s); with `dep` wo_a's takes an unread input a chain hangs on.
+const Arm = struct {
+    in: in_proj.Kernels,
+    wq: wq_b.Kernel,
+    oa: wo_a.Kernel,
+
+    fn init(bw: bool, dep: bool) !Arm {
+        const in = try in_proj.Kernels.buildArm(bw);
+        errdefer in.deinit();
+        const wq = try wq_b.buildArm(bw);
+        errdefer wq.deinit();
+        if (!dep) return .{ .in = in, .wq = wq, .oa = try wo_a.buildArm(bw) };
+        const oa = try dsv41.buildKernel(if (bw) "dsv41_dec_wo_a_bw_dep" else "dsv41_dec_wo_a_dep", &(wo_a.INS ++ [_][*:0]const u8{"dep"}), &wo_a.OUTS, if (bw) wo_a.BW_SOURCE else wo_a.SOURCE, wo_a.HEADER);
+        return .{ .in = in, .wq = wq, .oa = .{ .k = oa, .bw = bw } };
+    }
+
+    fn deinit(a: Arm) void {
+        a.in.deinit();
+        a.wq.deinit();
+        a.oa.deinit();
+    }
+
+    /// Every output of the three launches on `ly`, in a fixed order.
+    fn outs(p: *const Arm, sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, li: usize, in: *const Ins, counter: A, buf: *[13]A) ![]A {
+        const a = (try in_proj.run(sc, &p.in, m, ly, in.x, in.cpre)) orelse return error.Declined;
+        const w = (try wq_b.run(sc, m, p.wq, ly, li, in.qa, in.kv, in.z, in.pos)) orelse return error.Declined;
+        const o = (try wo_a.apply(sc, m, ly, p.oa, counter, dsv41.ropeFor(m, li).inv, in.meta, in.pacc, in.pm, in.pl)) orelse return error.Declined;
+        var n: usize = 0;
+        for ([_]?A{ a.h, a.qa, a.kv, a.iw, a.comp, a.z, w.q, w.q_idx, w.kv_row, w.sa.pre, w.sa.post, w.sa.comb, o }) |x| if (x) |v| {
+            buf[n] = v;
+            n += 1;
+        };
+        return buf[0..n];
+    }
+};
+
+/// One row count's inputs for a layer's attention-side launches, and which stretch a chain runs.
+const Side = struct {
+    const Stretch = enum { in_proj, in_proj_wq_b, wo_a, wo_a_wo_b };
+
+    sc: *dsv41.Scope,
+    m: *const dsv41.Dsv41Model,
+    li: usize,
+    sets: []const dsv41.Layer,
+    arm: *const Arm,
+    counter: A,
+    x: A,
+    cpre: A,
+    pos: A,
+    parts: [3]A,
+    meta: A,
+    stretch: Stretch = .in_proj,
+    prev: A = none,
+
+    fn inProj(c: *Side, ly: *const dsv41.Layer, cpre: A) !in_proj.Out {
+        return (try in_proj.run(c.sc, &c.arm.in, c.m, ly, c.x, cpre)) orelse error.Declined;
+    }
+
+    fn wqB(c: *Side, ly: *const dsv41.Layer, a: in_proj.Out) !A {
+        const o = try wq_b.run(c.sc, c.m, c.arm.wq, ly, c.li, a.qa, a.kv, a.z, c.pos);
+        return (o orelse return error.Declined).sa.pre;
+    }
+
+    fn woA(c: *Side, ly: *const dsv41.Layer, dep: A) !A {
+        const ins = [8]A{ c.parts[0], c.parts[1], c.parts[2], ly.sink, c.meta, dsv41.ropeFor(c.m, c.li).inv, ly.wo_a.w, ly.wo_a.s };
+        const rd = c.m.cfg.dsv4_rope_head_dim;
+        return (try wo_a.launch(c.sc, c.arm.oa.k, rd, c.m.act, ins, c.counter, dep)) orelse error.Declined;
+    }
+
+    pub fn step(c: *Side, i: usize) !A {
+        if (i == 0) {
+            for (c.sc.items.items) |a| _ = mlx.mlx_array_free(a);
+            c.sc.items.clearRetainingCapacity();
+            c.prev = if (c.stretch == .in_proj or c.stretch == .in_proj_wq_b) c.cpre else c.meta;
+        }
+        const ly = &c.sets[i % c.sets.len];
+        c.prev = switch (c.stretch) {
+            .in_proj => (try c.inProj(ly, c.prev)).z,
+            .in_proj_wq_b => try c.wqB(ly, try c.inProj(ly, c.prev)),
+            .wo_a => try c.woA(ly, c.prev),
+            .wo_a_wo_b => try ly.wo_b.apply(c.sc, try c.woA(ly, c.prev)),
+        };
+        return c.prev;
+    }
+
+    fn us(c: *Side, stretch: Stretch) !f64 {
+        c.stretch = stretch;
+        return moe_up.deviceUs(c, c.sets.len);
+    }
+
+    fn all(c: *Side) ![4]f64 {
+        return .{ try c.us(.in_proj), try c.us(.in_proj_wq_b), try c.us(.wo_a), try c.us(.wo_a_wo_b) };
+    }
+};
+
+/// A layer's 80 weight copies and one row count's inputs, for either arm.
+const Bench = struct {
+    held: dsv41.Scope,
+    own: dsv41.Scope,
+    sets: []dsv41.Layer,
+    side: Side,
+
+    fn init(gpa: std.mem.Allocator, f: *fixture.Fixture, li: usize, rows: usize, arm: *const Arm) !*Bench {
+        const m = f.m;
+        const b = try gpa.create(Bench);
+        errdefer gpa.destroy(b);
+        b.held = dsv41.Scope.init(gpa, m.s);
+        errdefer b.held.deinit();
+        b.own = dsv41.Scope.init(gpa, m.s);
+        b.sets = try gpa.alloc(dsv41.Layer, bw_sets);
+        errdefer gpa.free(b.sets);
+        for (b.sets) |*st| st.* = try layerCopy(&b.held, f.layer(li));
+        const R: c_int = @intCast(rows);
+        const H: c_int = @intCast(m.cfg.num_attention_heads);
+        const parts = [3]A{
+            try b.held.keep(try f.normal(&.{ R, H, bw_splits, 512 }, .float32, 0, 1)),
+            try b.held.keep(try f.normal(&.{ R, H, bw_splits }, .float32, 0, 1)),
+            try b.held.keep(try f.uniform(&.{ R, H, bw_splits }, 0.5, 2)),
+        };
+        b.side = .{ .sc = &b.own, .m = m, .li = li, .sets = b.sets, .arm = arm, .counter = try b.held.keep(wo_a.newCounter()), .x = try b.held.keep(try f.stream(rows)), .cpre = try b.held.keep(try f.cpre(rows)), .pos = try wq_b.rowsAt(&b.held, 4096, rows), .parts = parts, .meta = try b.held.ints(&.{ 4096, R, 512, 128, 144, 0 }, &.{6}) };
+        return b;
+    }
+
+    fn deinit(b: *Bench, gpa: std.mem.Allocator) void {
+        b.own.deinit();
+        b.held.deinit();
+        gpa.free(b.sets);
+        gpa.destroy(b);
+    }
+};
+
+const Kind = struct { lo: usize, hi: usize, li: usize, name: []const u8, layers: usize, tp: ?Shard = tp4 };
+/// A layer of each attention-side shape and how many of the release's 40 have it, at a rank of four; then a plain
+/// layer of the whole model (`layers` 0: outside the rank's sums).
+const kinds = [_]Kind{
+    .{ .lo = 20, .hi = 25, .li = 21, .name = "plain", .layers = 32 },
+    .{ .lo = 20, .hi = 25, .li = 24, .name = "index", .layers = 4 },
+    .{ .lo = 20, .hi = 25, .li = 20, .name = "kv ratio 1", .layers = 1 },
+    .{ .lo = 2, .hi = 3, .li = 2, .name = "kv ratio 2", .layers = 3 },
+    .{ .lo = 20, .hi = 22, .li = 21, .name = "whole model", .layers = 0, .tp = null },
+};
+
+test "dsv41 dec attention side: ubench at a tensor-parallel rank of four, rows 1 2 4 6, both arms (DSV41_DEC_UBENCH)" {
+    if (!ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var arms: [2]Arm = .{ try Arm.init(false, true), try Arm.init(true, true) };
+    defer for (arms) |a| a.deinit();
+    var fx: ?*fixture.Fixture = null;
+    defer if (fx) |f| f.deinit();
+    var fx_kind: ?Kind = null;
+    for (kinds) |kind| {
+        if (fx_kind == null or fx_kind.?.lo != kind.lo or (fx_kind.?.tp == null) != (kind.tp == null)) {
+            if (fx) |f| f.deinit();
+            fx = null;
+            fx = try fixture.Fixture.init(gpa, .{ .lo = kind.lo, .hi = kind.hi, .experts = 2, .ctx = 0, .fused = true, .tp = kind.tp });
+            fx_kind = kind;
+        }
+        const f = fx.?;
+        const ly = f.layer(kind.li);
+        for (bench_rows) |rows| {
+            const b = try Bench.init(gpa, f, kind.li, rows, &arms[0]);
+            defer b.deinit(gpa);
+            var raw: [2][4]f64 = @splat(@splat(std.math.inf(f64)));
+            for (0..6) |_| for (&arms, &raw) |*arm, *ra| {
+                b.side.arm = arm;
+                for (ra, try b.side.all()) |*x, v| x.* = @min(x.*, v);
+            };
+            var t: [2][4]f64 = undefined;
+            for (&t, raw) |*ta, ra| ta.* = .{ ra[0], ra[1] - ra[0], ra[2], ra[3] - ra[2] };
+            const p = in_proj.plan(f.m, ly, b.side.x).?;
+            const idx_b: f64 = if (ly.idx) |iw| linBytes(iw.wq_b) else 0;
+            const bytes = [4]f64{ @floatFromInt(in_proj.layerBytes(p)), linBytes(ly.wq_b) + idx_b, linBytes(ly.wo_a), linBytes(ly.wo_b) };
+            for ([_][]const u8{ "in_proj", "wq_b", "wo_a", "wo_b" }, bytes, 0..) |name, by, j| {
+                if (j >= 2 and kind.layers != 32 and kind.layers != 0) continue;
+                std.debug.print("[attn-bw] {s} ({s}) R={d}, {d:.2} MB: today {d:.1} us {d:.0} GB/s, bw {d:.1} us {d:.0} GB/s\n", .{ name, kind.name, rows, by / 1e6, t[0][j], by / t[0][j] / 1e3, t[1][j], by / t[1][j] / 1e3 });
+            }
+        }
+    }
+}
+
+/// Elements of `a` and `b` whose bits differ (both widened to f32, exact from bf16).
+fn bitsDiffer(a: A, b: A) !usize {
+    const x = try dsv41.hostF32(a);
+    defer std.testing.allocator.free(x);
+    const y = try dsv41.hostF32(b);
+    defer std.testing.allocator.free(y);
+    try std.testing.expectEqual(x.len, y.len);
+    var n: usize = 0;
+    for (x, y) |u, v| n += @intFromBool(@as(u32, @bitCast(u)) != @as(u32, @bitCast(v)));
+    return n;
+}
+
+/// `a` with NaN, +Inf and -Inf at a few elements (an e4m3 NaN code in a word array), evaluated.
+fn planted(sc: *dsv41.Scope, a: A) !A {
+    const n = mlx.mlx_array_size(a);
+    const shape = mlx.getShape(a);
+    const at = [_]usize{ 3, n / 3 + 17, n / 2 + 5, n - 9 };
+    const dt = mlx.mlx_array_dtype(a);
+    if (dt == .uint32) {
+        const c = try sc.op1(mlx.mlx_copy, a);
+        try mlx.check(mlx.mlx_array_eval(c));
+        const words = try std.testing.allocator.dupe(u32, (mlx.mlx_array_data_uint32(c) orelse return error.NoData)[0..n]);
+        defer std.testing.allocator.free(words);
+        for (at) |i| words[i] = (words[i] & 0xFFFF00FF) | 0x7F00;
+        return sc.keep(mlx.mlx_array_new_data(words.ptr, shape.ptr, @intCast(shape.len), .uint32));
+    }
+    const v = try dsv41.hostF32(a);
+    defer std.testing.allocator.free(v);
+    for (at, [_]f32{ std.math.nan(f32), std.math.inf(f32), -std.math.inf(f32), std.math.nan(f32) }) |i, x| v[i] = x;
+    const f = try sc.keep(mlx.mlx_array_new_data(v.ptr, shape.ptr, @intCast(shape.len), .float32));
+    const o = try sc.astype(f, dt);
+    try mlx.check(mlx.mlx_array_eval(o));
+    return o;
+}
+
+/// `ly` with NaN and Inf planted in every attention-side weight the bw launches read.
+fn plantedLayer(sc: *dsv41.Scope, ly: *const dsv41.Layer) !dsv41.Layer {
+    var c = ly.*;
+    c.q_kv.?.w = try planted(sc, c.q_kv.?.w);
+    c.hc_attn.fn_w = try planted(sc, c.hc_attn.fn_w);
+    c.wq_b.w = try planted(sc, c.wq_b.w);
+    c.wo_a.w = try planted(sc, c.wo_a.w);
+    if (c.idx) |*iw| {
+        iw.weights_proj.w = try planted(sc, iw.weights_proj.w);
+        iw.wq_b.w = try planted(sc, iw.wq_b.w);
+    }
+    if (c.comp) |*cw| cw.wkv.w = try planted(sc, cw.wkv.w);
+    return c;
+}
+
+/// One row count's inputs to the three launches.
+const Ins = struct {
+    x: A,
+    cpre: A,
+    qa: A,
+    kv: A,
+    z: A,
+    pos: A,
+    pacc: A,
+    pm: A,
+    pl: A,
+    meta: A,
+
+    fn init(sc: *dsv41.Scope, f: *fixture.Fixture, rows: usize, plant: bool) !Ins {
+        const R: c_int = @intCast(rows);
+        const H: c_int = @intCast(f.m.cfg.num_attention_heads);
+        var in: Ins = .{
+            .x = try sc.keep(try f.stream(rows)),
+            .cpre = try sc.keep(try f.cpre(rows)),
+            .qa = try sc.keep(try f.normal(&.{ R, 1280 }, .bfloat16, 0, 2)),
+            .kv = try sc.keep(try f.normal(&.{ R, 512 }, .bfloat16, 0, 2)),
+            .z = try sc.keep(try f.normal(&.{ R, 24 }, .float32, 0, 1.5)),
+            .pos = try wq_b.rowsAt(sc, 3001, rows),
+            .pacc = try sc.keep(try f.normal(&.{ R, H, bw_splits, 512 }, .float32, 0, 1)),
+            .pm = try sc.keep(try f.normal(&.{ R, H, bw_splits }, .float32, 0, 1)),
+            .pl = try sc.keep(try f.uniform(&.{ R, H, bw_splits }, 0.5, 2)),
+            .meta = try sc.ints(&.{ 3001, R, 512, 128, 144, 0 }, &.{6}),
+        };
+        if (!plant) return in;
+        in.x = try planted(sc, in.x);
+        in.qa = try planted(sc, in.qa);
+        in.pacc = try planted(sc, in.pacc);
+        return in;
+    }
+};
+
+test "dsv41 dec attention side: the DSV41_ATTN_BW launches write today's bytes, a rank of four and the whole model, rows 1-6, NaN and Inf planted too" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    // in_proj's launch needs M3 or newer (`in_proj.plan`).
+    if (@import("../../../mlx/device.zig").deviceGeneration().gen < 15) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const arms: [2]Arm = .{ try Arm.init(false, false), try Arm.init(true, false) };
+    defer for (arms) |a| a.deinit();
+    var checked: usize = 0;
+    for ([_]?Shard{ tp4, null }) |tp| for ([_][2]usize{ .{ 20, 25 }, .{ 2, 3 } }) |span| {
+        const f = try fixture.Fixture.init(gpa, .{ .lo = span[0], .hi = span[1], .experts = 2, .ctx = 0, .tp = tp });
+        defer f.deinit();
+        for (span[0]..span[1]) |li| {
+            if (li == 22 or li == 23) continue;
+            var sc = dsv41.Scope.init(gpa, f.m.s);
+            defer sc.deinit();
+            const counter = try sc.keep(wo_a.newCounter());
+            const lys = [2]dsv41.Layer{ f.layer(li).*, try plantedLayer(&sc, f.layer(li)) };
+            for (bench_rows ++ [_]usize{ 3, 5 }) |rows| for (&lys, 0..) |*ly, plant| {
+                const in = try Ins.init(&sc, f, rows, plant == 1);
+                var bufs: [2][13]A = undefined;
+                const want = try arms[0].outs(&sc, f.m, ly, li, &in, counter, &bufs[0]);
+                const got = try arms[1].outs(&sc, f.m, ly, li, &in, counter, &bufs[1]);
+                try std.testing.expectEqual(want.len, got.len);
+                for (want, got, 0..) |u, v, k| {
+                    const d = try bitsDiffer(u, v);
+                    if (d != 0) std.debug.print("[attn-bw] {s} layer {d} R={d} planted {d}: output {d} differs in {d} elements\n", .{ if (tp != null) "tp4" else "whole", li, rows, plant, k, d });
+                    try std.testing.expectEqual(@as(usize, 0), d);
+                    checked += mlx.mlx_array_size(u);
+                }
+            };
+        }
+    };
+    std.debug.print("[attn-bw] bw arm equal to today's in all {d} output elements\n", .{checked});
 }
 
 test {

@@ -25,6 +25,20 @@ pub fn build() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_wq_b", &INS, &OUTS, SOURCE, HEADER);
 }
 
+/// The pipeline `run` takes: `bw` the `DSV41_ATTN_BW` grid (`groupsBw`), the same sums.
+pub const Kernel = struct {
+    k: mlx.mlx_fast_metal_kernel,
+    bw: bool = false,
+
+    pub fn deinit(self: Kernel) void {
+        _ = mlx.mlx_fast_metal_kernel_free(self.k);
+    }
+};
+
+pub fn buildArm(bw: bool) !Kernel {
+    return .{ .k = try build(), .bw = bw };
+}
+
 pub const Out = struct { q: A, q_idx: ?A, kv_row: A, sa: dsv41.Split };
 
 /// Simdgroups a threadgroup holds, and the threadgroups that walk the units: two a GPU core (one where the GPU's
@@ -34,6 +48,11 @@ const SGS = 8;
 pub fn groups() usize {
     const cores = system.gpuCoreCount();
     return if (cores > 0) 2 * cores else 160;
+}
+
+/// The bw grid: four threadgroups a core, so a core's units overlap more weight reads.
+pub fn groupsBw() usize {
+    return 2 * groups();
 }
 
 fn ci(v: usize) c_int {
@@ -55,8 +74,8 @@ fn mxfp8Rows(l: dsv41.Lin, n: usize) bool {
 /// Rows at positions `pos` (int32 `[rows]`, `rowsAt` for one state's run; a batch's states each at their own): `qa`
 /// and `kv` `[rows, K]`, `[rows, 512]` bf16 (the `q_kv` GEMV's), `z` `[rows, 24]` f32 (this stage's hc mixes). Null where the shape or the
 /// weights' format is not served.
-pub fn run(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_metal_kernel, ly: *const dsv41.Layer, li: usize, qa: A, kv: A, z: A, pos: A) !?Out {
-    return launch(sc, m, kern, ly, li, qa, kv, z, pos, groups());
+pub fn run(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: Kernel, ly: *const dsv41.Layer, li: usize, qa: A, kv: A, z: A, pos: A) !?Out {
+    return launch(sc, m, kern.k, ly, li, qa, kv, z, pos, if (kern.bw) groupsBw() else groups());
 }
 
 /// The positions p0 .. p0 + rows of one state's rows, from the host (no launch).
@@ -840,7 +859,7 @@ test "dsv41 dec wq_b: no further from f32 truth than the chain on the fixture's 
                 const pos = try scalar(&sc, @intCast(3001 + 13 * rows));
                 const want = try chain(&sc, fx.m, ly, li, qa, kv, z, pos);
                 const tr = try truth(&sc, fx.m, ly, li, qa, pos);
-                const got = (try run(&sc, fx.m, kern, ly, li, qa, kv, z, try rowsAt(&sc, 3001 + 13 * rows, rows))) orelse return error.Declined;
+                const got = (try run(&sc, fx.m, .{ .k = kern }, ly, li, qa, kv, z, try rowsAt(&sc, 3001 + 13 * rows, rows))) orelse return error.Declined;
                 var label_buf: [64]u8 = undefined;
                 const nq = try differing(got.q, want.q);
                 std.debug.print("[wq_b] layer {d}, rows {d}: q differs in {d} of {d}", .{ li, rows, nq, rows * 32768 });

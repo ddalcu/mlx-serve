@@ -648,9 +648,9 @@ pub const Dec = struct {
     in_proj: ?dkern.in_proj.Kernels = null,
     idx_score: ?dkern.idx_score.Kernels = null,
     topk: ?dkern.topk.Kernels = null,
-    wq_b: ?mlx.mlx_fast_metal_kernel = null,
+    wq_b: ?dkern.wq_b.Kernel = null,
     attn: ?mlx.mlx_fast_metal_kernel = null,
-    wo_a: ?mlx.mlx_fast_metal_kernel = null,
+    wo_a: ?dkern.wo_a.Kernel = null,
     /// `wo_a`'s arrival counter, zeroed once and shared by every layer's launch.
     wo_a_counter: A = none,
     ffn_in: ?dkern.ffn_in.Kernels = null,
@@ -663,7 +663,7 @@ pub const Dec = struct {
     fn init(gpa: std.mem.Allocator, cfg: *const Config) !Dec {
         const nax = device.naxAvailable();
         // Without NAX the affine moe_up / moe_down lose to today's MoE kernels at every row count.
-        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.build(), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.build(), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = if (nax) null else try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
+        var d: Dec = .{ .in_proj = try dkern.in_proj.Kernels.build(), .idx_score = try dkern.idx_score.build(), .topk = try dkern.topk.Kernels.build(), .wq_b = try dkern.wq_b.buildArm(dkern.attnBw()), .attn = if (nax) try dkern.attn.build() else null, .wo_a = try dkern.wo_a.buildArm(dkern.attnBw()), .wo_a_counter = dkern.wo_a.newCounter(), .ffn_in = try dkern.ffn_in.build(), .moe_up = if (nax) try dkern.moe_up.build(cfg.dsv4_swiglu_limit) else null, .moe_fp4 = if (nax) null else try dkern.moe_fp4.build(cfg.dsv4_swiglu_limit), .moe_down = if (nax) try dkern.moe_down.build() else null };
         errdefer d.deinit();
         try dkern.topk.probe(gpa, &d.topk.?, mlx.gpuStream());
         if (d.moe_down) |kd| d.moe_down_rb = dkern.moe_down.probe(gpa, kd, cfg.moe_intermediate_size, cfg.hidden_size) catch |e| blk: {
@@ -682,7 +682,9 @@ pub const Dec = struct {
         if (d.moe_up) |k| k.deinit();
         if (d.moe_fp4) |k| k.deinit();
         if (d.ffn_in) |k| dkern.ffn_in.free(k);
-        inline for (.{ d.wq_b, d.attn, d.wo_a, d.moe_down }) |k| if (k) |kern| {
+        if (d.wq_b) |k| k.deinit();
+        if (d.wo_a) |k| k.deinit();
+        inline for (.{ d.attn, d.moe_down }) |k| if (k) |kern| {
             _ = mlx.mlx_fast_metal_kernel_free(kern);
         };
         if (d.wo_a_counter.ctx != null) _ = mlx.mlx_array_free(d.wo_a_counter);

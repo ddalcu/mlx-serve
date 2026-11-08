@@ -26,22 +26,30 @@ const STAGE_OUTS = [_][*:0]const u8{"h"};
 /// The first Apple GPU family (M3) that runs its 640-thread groups at every row count: M1 and M2 cap a pipeline's
 /// threads by its registers, and R = 6 with bf16 rows compiles for fewer.
 const first_gen = 15;
-/// The most rows whose stream every threadgroup re-reads and collapses: past two the re-reads cost more than the stage launch.
+/// The most rows whose stream every threadgroup re-reads and collapses: past two the re-reads cost more than the stage launch;
+/// past one on the `DSV41_ATTN_BW` arm.
 const fuse_rows = 2;
+const fuse_rows_bw = 1;
 /// Output rows a threadgroup: q_kv's mxfp8 rows, and the bf16 rows of weights_proj and the compressor.
 const rt = 4;
 /// The stream's copies, and the hc mixes the layer makes (`(2 + hc) * hc`).
 const hc = 4;
 const n_mix = (2 + hc) * hc;
 
+/// `bw`: the `DSV41_ATTN_BW` plans (`planBw`), the same sums.
 pub const Kernels = struct {
     main: mlx.mlx_fast_metal_kernel,
     stage: mlx.mlx_fast_metal_kernel,
+    bw: bool = false,
 
     pub fn build() !Kernels {
+        return buildArm(decode.attnBw());
+    }
+
+    pub fn buildArm(bw: bool) !Kernels {
         const main = try v41.buildKernel("dsv41_dec_in_proj", &MAIN_INS, &MAIN_OUTS, MAIN_SOURCE, HEADER);
         errdefer _ = mlx.mlx_fast_metal_kernel_free(main);
-        return .{ .main = main, .stage = try v41.buildKernel("dsv41_dec_in_proj_stage", &STAGE_INS, &STAGE_OUTS, STAGE_SOURCE, HEADER) };
+        return .{ .main = main, .stage = try v41.buildKernel("dsv41_dec_in_proj_stage", &STAGE_INS, &STAGE_OUTS, STAGE_SOURCE, HEADER), .bw = bw };
     }
 
     pub fn deinit(k: Kernels) void {
@@ -159,7 +167,14 @@ pub fn argsOf(ly: *const v41.Layer, x: A, cpre: A, eps: A) Args {
 /// The attention input of `ly` for `x` `[R, hc, D]` and the previous mix `cpre`, or null (see `plan`).
 pub fn run(sc: *v41.Scope, k: *const Kernels, m: *const v41.Dsv41Model, ly: *const v41.Layer, x: A, cpre: A) !?Out {
     const p = plan(m, ly, x) orelse return null;
-    return try launch(sc, k, p, argsOf(ly, x, cpre, try v41.hcEps(sc, m)));
+    return try launch(sc, k, if (k.bw) planBw(p) else p, argsOf(ly, x, cpre, try v41.hcEps(sc, m)));
+}
+
+/// The bw arm's plan: the stage launch from two rows on.
+fn planBw(p: Plan) Plan {
+    var w = p;
+    w.fuse = p.rows <= fuse_rows_bw;
+    return w;
 }
 
 fn keep(sc: *v41.Scope, a: A) !A {
@@ -683,7 +698,7 @@ const Stage = struct {
 
 const nan_rule: spec.Nan = .{ .stated = "classes as float64 gives them; the normed rows within the intervals of their roundings, the dots and mixes within their sums' allowance" };
 const fused_shapes: []const Shape = &.{ .{ .rows = 1, .n = NQ, .k = DIM }, .{ .rows = fuse_rows, .n = NQ, .k = DIM } };
-const staged_shapes: []const Shape = &.{ .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
+const staged_shapes: []const Shape = &.{ .{ .rows = fuse_rows_bw + 1, .n = NQ, .k = DIM }, .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
 
 fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime name: []const u8) !void {
     const T = Main(fuse, nw, nc, cf32);
@@ -715,7 +730,7 @@ pub fn register(set: *kc.Set) !void {
         .mids = 2,
         .out = .bf16,
         .nan = nan_rule,
-        .served = &.{ .{ .rows = fuse_rows + 1, .n = DIM, .k = DIM }, .{ .rows = decode.max_rows, .n = DIM, .k = DIM } },
+        .served = &.{ .{ .rows = fuse_rows_bw + 1, .n = DIM, .k = DIM }, .{ .rows = fuse_rows + 1, .n = DIM, .k = DIM }, .{ .rows = decode.max_rows, .n = DIM, .k = DIM } },
         .sums = .{ .f16 = 0, .bf16 = 0, .why = "a sum of squares cannot cancel" },
     });
 }
@@ -1091,7 +1106,7 @@ const OldChain = struct {
 };
 
 /// The bytes one launch reads: q_kv with its scales, the mix weights, weights_proj and the compressor.
-fn layerBytes(p: Plan) usize {
+pub fn layerBytes(p: Plan) usize {
     return p.nq * p.dim * 33 / 32 + n_mix * hc * p.dim * 4 + (p.nw + p.nc) * p.dim * 2;
 }
 

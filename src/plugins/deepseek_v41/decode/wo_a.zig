@@ -22,6 +22,7 @@ const A = mlx.mlx_array;
 const Scope = dsv41.Scope;
 
 pub const SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wo_a.metal");
+pub const BW_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dec_wo_a_bw.metal");
 /// The e4m3 pair decode the SDK's mxfp8 GEMV uses, a word's four values, and the matrix units' tile op.
 pub const HEADER = mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/dec_wo_a_header.metal") ++ kernelSource("plugins/deepseek_v41/kernels/dec_nax_header.metal");
 pub const INS = [_][*:0]const u8{ "pacc", "pm", "pl", "sink", "meta", "periods", "w", "scales", "counter" };
@@ -29,6 +30,21 @@ pub const OUTS = [_][*:0]const u8{ "out", "parts" };
 
 pub fn build() !mlx.mlx_fast_metal_kernel {
     return dsv41.buildKernel("dsv41_dec_wo_a", &INS, &OUTS, SOURCE, HEADER);
+}
+
+/// The pipeline `apply` takes: `bw` the `DSV41_ATTN_BW` text (`dec_wo_a_bw.metal`), the same sums.
+pub const Kernel = struct {
+    k: mlx.mlx_fast_metal_kernel,
+    bw: bool = false,
+
+    pub fn deinit(self: Kernel) void {
+        _ = mlx.mlx_fast_metal_kernel_free(self.k);
+    }
+};
+
+pub fn buildArm(bw: bool) !Kernel {
+    if (!bw) return .{ .k = try build() };
+    return .{ .k = try dsv41.buildKernel("dsv41_dec_wo_a_bw", &INS, &OUTS, BW_SOURCE, HEADER), .bw = true };
 }
 
 /// The head's width: 32 lanes of 16 channels.
@@ -130,10 +146,10 @@ pub fn launch(sc: *Scope, kern: mlx.mlx_fast_metal_kernel, rd: usize, odt: mlx.m
 /// The layer's `attnOutRoped` input from the splits: `oa` [R, 8192] in the model's activation dtype, what wo_b reads.
 /// Null (the old path runs) off the GPU, where wo_a is not the release's 8-bit mxfp8 of group 32, or past the rows,
 /// splits or head width `plan` declines.
-pub fn apply(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: mlx.mlx_fast_metal_kernel, counter: A, inv: A, meta: A, pacc: A, pm: A, pl: A) !?A {
+pub fn apply(sc: *Scope, m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer, kern: Kernel, counter: A, inv: A, meta: A, pacc: A, pm: A, pl: A) !?A {
     const wo = &ly.wo_a;
     if (!mlx.streamIsGpu(sc.s) or wo.s.ctx == null or wo.qp.mode != .mxfp8 or wo.qp.bits != 8 or wo.qp.group_size != 32) return null;
-    return launch(sc, kern, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, meta, inv, wo.w, wo.s }, counter, null);
+    return launch(sc, kern.k, m.cfg.dsv4_rope_head_dim, m.act, .{ pacc, pm, pl, ly.sink, meta, inv, wo.w, wo.s }, counter, null);
 }
 
 // ── the kernel contract ──
@@ -388,6 +404,20 @@ const decl_nax: metal.Launch = .{
     .min_gen = 17,
 };
 
+const decl_bw: metal.Launch = blk: {
+    var l = decl;
+    l.name = "dsv41_dec_wo_a_bw";
+    l.source = BW_SOURCE;
+    break :blk l;
+};
+
+const decl_nax_bw: metal.Launch = blk: {
+    var l = decl_nax;
+    l.name = "dsv41_dec_wo_a_bw";
+    l.source = BW_SOURCE;
+    break :blk l;
+};
+
 pub fn register(set: *kc.Set) !void {
     try kit.add(set, WoA, &decl, .{}, .{
         .name = "dsv41 dec wo_a (split merge, inverse rope, grouped mxfp8)",
@@ -401,6 +431,27 @@ pub fn register(set: *kc.Set) !void {
     });
     try kit.add(set, WoA, &decl_nax, .{ .nax = true }, .{
         .name = "dsv41 dec wo_a (matrix units)",
+        .accum = .f32,
+        .depth = depthWoA,
+        .ops = 8,
+        .out = .bf16,
+        .in_place = true,
+        .tiles = .{ .{}, .{ .size = NAX_NR * NAX_NSG, .step = NAX_NR * NAX_NSG, .min = NAX_NR * NAX_NSG }, .{} },
+        .served = &served_nax,
+        .nax = true,
+    });
+    try kit.add(set, WoA, &decl_bw, .{}, .{
+        .name = "dsv41 dec wo_a, DSV41_ATTN_BW (each row's split weights once)",
+        .accum = .f32,
+        .depth = depthWoA,
+        .ops = 8,
+        .out = .bf16,
+        .in_place = true,
+        .tiles = .{ .{}, .{ .size = NR * NSG, .step = NR * NSG, .min = NR * NSG }, .{} },
+        .served = &served,
+    });
+    try kit.add(set, WoA, &decl_nax_bw, .{ .nax = true }, .{
+        .name = "dsv41 dec wo_a, DSV41_ATTN_BW (matrix units)",
         .accum = .f32,
         .depth = depthWoA,
         .ops = 8,
@@ -564,12 +615,12 @@ test "dsv41 dec wo_a: 1 to 6 rows are no further from the float64 truth than tod
         defer gpa.free(t);
         const w32 = try dsv41.hostF32(want);
         defer gpa.free(w32);
-        const got = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined;
+        const got = (try apply(&sc, fx.m, ly, .{ .k = kern }, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined;
         try testing.expectEqual(@as(c_int, ci(8 * OL)), mlx.getShape(got)[1]);
         const g32 = try dsv41.hostF32(got);
         defer gpa.free(g32);
         // The counter has moved on: the same inputs give the same bytes.
-        const again = (try apply(&sc, fx.m, ly, kern, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined;
+        const again = (try apply(&sc, fx.m, ly, .{ .k = kern }, counter, inv, meta, pacc, pm, pl)) orelse return error.Declined;
         const a32 = try dsv41.hostF32(again);
         defer gpa.free(a32);
         try testing.expectEqualSlices(f32, g32, a32);
@@ -594,25 +645,26 @@ test "dsv41 dec wo_a: shapes the kernel was not built for are declined" {
 test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
-    const kern = try build();
-    defer _ = mlx.mlx_fast_metal_kernel_free(kern);
     var sc = Scope.init(a, mlx.gpuStream());
     defer sc.deinit();
-    for ([_]bool{ false, true }) |nax| {
+    for ([_]bool{ false, true }) |bw| for ([_]bool{ false, true }) |nax| {
         if (nax and !device.naxAvailable()) continue;
+        const kern = try buildArm(bw);
+        defer kern.deinit();
         const c = try a.create(kit.Case(WoA));
         defer {
             c.deinit();
             a.destroy(c);
         }
-        c.* = .init(a, if (nax) &decl_nax else &decl, .{ .nax = nax });
+        const l: *const metal.Launch = if (bw) (if (nax) &decl_nax_bw else &decl_bw) else if (nax) &decl_nax else &decl;
+        c.* = .init(a, l, .{ .nax = nax });
         try testing.expect(try c.prepare(.{ .rows = if (nax) 6 else 3, .n = 128, .k = HPG * HD }, .random, 7));
         try c.run();
         const mine = try a.dupe(u8, c.rig.outputBytes());
         defer a.free(mine);
-        const got = (try launch(&sc, kern, RD, act, c.args[0..8].*, c.args[8], null)) orelse return error.Declined;
+        const got = (try launch(&sc, kern.k, RD, act, c.args[0..8].*, c.args[8], null)) orelse return error.Declined;
         try testing.expectEqualSlices(u8, mine, try c.rig.bytesOf(&.{got}));
-    }
+    };
 }
 
 // ── ubench ──
