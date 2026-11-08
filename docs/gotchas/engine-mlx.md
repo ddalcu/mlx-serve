@@ -1424,6 +1424,19 @@ failed load parks the entry in `.error_state`, which fails fast; only the memory
 Fix: refusals the user fixes outside the pack retry (`failureRetries`), and the absent worker is a named 503
 (`worker_not_joined`). Guard: `a load refused for memory or an absent worker Mac is retried by the next request`.
 
+### A GPU timeout during a reload left the model failed until a restart
+Defect: reloading the 70 GB Qwen3.8-Flash-Next pack while a busy app rewrote 32 GB failed with Metal's
+`kIOGPUCommandBufferCallbackErrorTimeout` on 12 of 28 reloads, and every request after it 500'd with
+`PluginLoadFailed` until the server restarted. Cause: the plugin reports any MLX failure as `PluginLoadFailed`, which
+parks the entry in `.error_state`; and the failed eval's other command buffers kept failing after the load returned,
+latching a second timeout onto the next load a second later. Fix: the load reads its own latched MLX error
+(`loadFailureCause`): a GPU timeout is `GpuTimeout` (503 `gpu_timeout`) and a GPU out-of-memory is
+`InsufficientMemory`, both retried; a timeout waits out the in-flight GPU work (`mlx.drainGpu`) before the latch is
+dropped. Under steady pressure the retry timed out again as often as not, so qwen4_exp evaluates its trunk a layer at
+a time instead of all ~70 GB at once: 0 of 23 of the same reloads timed out, and the eval took 6-24 s where one batch
+took up to 59 s. Guard: `a load the GPU timed out or ran out of memory on fails for that reason, not as a broken pack`;
+live, warm reloads beside a busy 32 GB app after the last model's memory is freed.
+
 ### A DeepSeek-V4.1 GGUF with its DSpark file beside it failed to load on ds4
 Defect: ivanfioravanti's DS4 IQ2 pack died at boot on the ds4 engine (`error: LoadFailed`) unless `--no-ds4-mtp`.
 Cause: the adapter hands ds4 any `-DSpark-`/`-MTP-` GGUF in the model's folder, and the pinned ds4 refuses every

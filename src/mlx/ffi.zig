@@ -1356,6 +1356,29 @@ pub fn mlxErrorIsContextLost(msg: []const u8) bool {
     return false;
 }
 
+/// Metal's watchdog cancelled a command buffer that ran too long, as it does while the OS makes room in
+/// RAM. The device stays usable, so the work can be retried.
+pub fn mlxErrorIsGpuTimeout(msg: []const u8) bool {
+    return std.mem.indexOf(u8, msg, "kIOGPUCommandBufferCallbackErrorTimeout") != null or
+        std.mem.indexOf(u8, msg, "GPU Timeout Error") != null;
+}
+
+/// Waits out the GPU work still in flight: after a timeout the rest of a failed eval's command buffers keep
+/// failing, and their errors must latch before the caller drops them, not during the next load.
+pub fn drainGpu() void {
+    const s = gpuStream();
+    defer _ = mlx_stream_free(s);
+    _ = mlx_synchronize(s);
+}
+
+/// True when an error is latched and `pred` holds for its message; the latch stays.
+pub fn latchedErrorIs(comptime pred: fn ([]const u8) bool) bool {
+    if (!latch().mlx_error_latched.load(.acquire)) return false;
+    lockErrBuf();
+    defer unlockErrBuf();
+    return pred(latch().mlx_error_buf[0..latch().mlx_error_len]);
+}
+
 /// True once the latch has seen a sticky CUDA error: requests are refused, /health says so.
 pub fn gpuContextLost() bool {
     return latch().gpu_context_lost.load(.acquire);

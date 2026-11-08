@@ -280,6 +280,9 @@ pub fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
 pub const gpu_context_lost_message =
     "The GPU context was lost (a CUDA kernel faulted) and every GPU call now fails. Restart the server; the server log names the first error.";
 
+pub const gpu_timeout_load_message =
+    "The GPU timed out while loading the model, as it can while macOS makes room in memory. Retry the request; the next one loads it again.";
+
 /// Body text for a context-overflow 400, in a caller-owned buffer.
 ///
 /// The COUNTS are the point. "Prompt exceeds maximum context length" tells a
@@ -332,6 +335,7 @@ pub fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched:
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
         error.DistWorkerNotJoined => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "worker_not_joined", "This model is served with a second Mac that has not joined: start `mlx-serve worker` there, then retry", 503),
         error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
+        error.GpuTimeout => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_timeout", gpu_timeout_load_message, 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
         // config.json, etc.) bubble out of `preloadCpuState`. Surface a

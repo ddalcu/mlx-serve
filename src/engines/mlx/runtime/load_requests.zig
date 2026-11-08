@@ -105,8 +105,10 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     const had_error = mlx.errorPending();
     doLoadOnInferenceThread(sch, req) catch |err| {
         // The load's own MLX error is reported here; latched, it would fail the next request.
+        const cause = loadFailureCause(err, had_error);
+        if (cause == error.GpuTimeout) mlx.drainGpu();
         mlx.dropLatchedErrorUnless(had_error);
-        return failLoadRequest(sch, req, err);
+        return failLoadRequest(sch, req, cause);
     };
     // Re-apply so `fit` capacity covers everything this load brought in
     // (MTP head / drafter / vision land after the mid-load apply).
@@ -152,10 +154,22 @@ fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror) void {
     finishLoadRequest(sch, req, loadErrorName(err));
 }
 
-/// A refusal the user fixes outside the pack (free memory, start the worker Mac) leaves the entry
-/// `.unloaded`: in `.error_state` every retry would fail fast until a server restart.
+/// A load whose own MLX error is a GPU out-of-memory or a GPU timeout fails for that reason, not as the
+/// bare `PluginLoadFailed` a plugin reports. A latch set before the load belongs to someone else.
+fn loadFailureCause(err: anyerror, had_error: bool) anyerror {
+    if (had_error) return err;
+    if (mlx.latchedErrorIs(mlx.mlxErrorIsMemory)) return error.InsufficientMemory;
+    if (mlx.latchedErrorIs(mlx.mlxErrorIsGpuTimeout)) return error.GpuTimeout;
+    return err;
+}
+
+/// A refusal the user fixes outside the pack (free memory, start the worker Mac) or a GPU timeout leaves
+/// the entry `.unloaded`: in `.error_state` every retry would fail fast until a server restart.
 fn failureRetries(name: []const u8) bool {
-    return model_registry_mod.ModelRegistry.loadErrorFromName(name) == error.InsufficientMemory or std.mem.eql(u8, name, "DistWorkerNotJoined");
+    return switch (model_registry_mod.ModelRegistry.loadErrorFromName(name)) {
+        error.InsufficientMemory, error.DistWorkerNotJoined, error.GpuTimeout => true,
+        error.LoadFailed => false,
+    };
 }
 
 fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
@@ -221,4 +235,27 @@ test "a load refused for memory or an absent worker Mac is retried by the next r
     try std.testing.expect(failureRetries("DistWorkerNotJoined"));
     try std.testing.expect(!failureRetries("MissingWeight"));
     try std.testing.expect(!failureRetries("DistWorkerMissingModel"));
+    try std.testing.expect(failureRetries("GpuTimeout"));
+    try std.testing.expect(!failureRetries("PluginLoadFailed"));
+}
+
+test "a load the GPU timed out or ran out of memory on fails for that reason, not as a broken pack" {
+    var buf: [512]u8 = undefined;
+    defer _ = mlx.takeError(&buf);
+    // The message a busy Mac's warm reload latched, verbatim.
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Caused GPU Timeout Error (00000002:kIOGPUCommandBufferCallbackErrorTimeout). at transforms.cpp:73");
+    try std.testing.expectEqual(error.GpuTimeout, loadFailureCause(error.PluginLoadFailed, false));
+    try std.testing.expect(failureRetries(loadErrorName(loadFailureCause(error.PluginLoadFailed, false))));
+    // The same latch raised before the load is another request's: the load keeps its own error.
+    try std.testing.expectEqual(error.PluginLoadFailed, loadFailureCause(error.PluginLoadFailed, true));
+    _ = mlx.takeError(&buf);
+    mlx.latchErrorForTest("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15");
+    try std.testing.expectEqual(error.InsufficientMemory, loadFailureCause(error.PluginLoadFailed, false));
+    _ = mlx.takeError(&buf);
+    // A shape error is a broken pack, and stays failed.
+    mlx.latchErrorForTest("[matmul] Last dimension of first input must match.");
+    try std.testing.expectEqual(error.PluginLoadFailed, loadFailureCause(error.PluginLoadFailed, false));
+    try std.testing.expect(!failureRetries(loadErrorName(loadFailureCause(error.PluginLoadFailed, false))));
+    _ = mlx.takeError(&buf);
+    try std.testing.expectEqual(error.PluginLoadFailed, loadFailureCause(error.PluginLoadFailed, false));
 }
