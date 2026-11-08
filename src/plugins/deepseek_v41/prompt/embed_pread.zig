@@ -24,6 +24,8 @@ pub const Table = struct {
 
     /// The pack in `dir`: its index names the shard holding `tensor`, whose header must give it as BF16 [rows, hidden].
     pub fn open(gpa: std.mem.Allocator, dir: []const u8, rows: u32, hidden: u32) OpenError!Table {
+        // Its reads are POSIX `pread`s: Windows keeps the embedding in memory.
+        if (comptime builtin.os.tag == .windows) return error.EmbedPreadOpen;
         const shard = try shardOf(gpa, dir);
         defer gpa.free(shard);
         const path = try std.fmt.allocPrintSentinel(gpa, "{s}/{s}", .{ dir, shard }, 0);
@@ -65,6 +67,7 @@ pub const Table = struct {
     }
 
     pub fn close(self: *Table) void {
+        if (comptime builtin.os.tag == .windows) return;
         _ = std.c.close(self.fd);
         self.fd = -1;
     }
@@ -146,6 +149,7 @@ fn intOf(v: std.json.Value) ?u64 {
 
 /// `dst` filled from `off` (pread until done; false on an error or the end of the file).
 fn preadAll(fd: c_int, dst: []u8, off: u64) bool {
+    if (comptime builtin.os.tag == .windows) return false;
     var got: usize = 0;
     while (got < dst.len) {
         const r = std.c.pread(fd, dst[got..].ptr, dst.len - got, @intCast(off + got));

@@ -58,13 +58,15 @@ pub fn billBytes() u64 {
 }
 
 /// A pthread mutex: the LRU's users are the prefetch threads, GCD workers and the model's thread, with no `Io` among them.
+/// None on Windows, which opens no Engram table (`engram.Table.open`).
 const Lock = struct {
-    m: std.c.pthread_mutex_t = .{},
+    m: if (windows) struct {} else std.c.pthread_mutex_t = .{},
+    const windows = builtin.os.tag == .windows;
     fn lock(l: *Lock) void {
-        _ = std.c.pthread_mutex_lock(&l.m);
+        if (comptime !windows) _ = std.c.pthread_mutex_lock(&l.m);
     }
     fn unlock(l: *Lock) void {
-        _ = std.c.pthread_mutex_unlock(&l.m);
+        if (comptime !windows) _ = std.c.pthread_mutex_unlock(&l.m);
     }
 };
 

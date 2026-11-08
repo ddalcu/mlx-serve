@@ -311,6 +311,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
 /// residents and a request of the model's `ctx_size`, else of the largest `bill.stream_context_rungs` rung that keeps
 /// `bill.stream_min_rows` rows, else of `bill.stream_context`.
 fn openBank(m: *Model, quant: ?*const outside.Format, ctx_size: ?u64, wired_margin: u64) !void {
+    if (comptime !streamed.built) return error.StreamedWeightsUnsupported;
     const q = quant orelse return error.StreamedBankUnclaimed;
     const mdl = m.mdl;
     const gates = try gpa.alloc(quant_abi.BankGate, mdl.n_layers);
@@ -323,7 +324,7 @@ fn openBank(m: *Model, quant: ?*const outside.Format, ctx_size: ?u64, wired_marg
     const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(mdl.n_layers), .swiglu_limit = @floatCast(c.dsv4_swiglu_limit), .gates = gates.ptr };
     const context = ctx_size orelse for (bill_mod.stream_context_rungs) |rung| {
         const at = bill_mod.streamBudget(c, rung, wired_margin);
-        const fit = (q.bankRows(geo, .{ .prompt = at.prompt, .decode = at.decode }) catch continue) orelse return error.StreamedBankUnclaimed;
+        const fit = (q.bankRows(geo, .{ .prompt = at.prompt, .decode = at.decode }) catch |e| if (e == error.StreamedRowsDoNotFit) continue else return e) orelse return error.StreamedBankUnclaimed;
         if (fit.prompt >= bill_mod.stream_min_rows) break rung;
     } else bill_mod.stream_context;
     const budget = bill_mod.streamBudget(c, context, wired_margin);

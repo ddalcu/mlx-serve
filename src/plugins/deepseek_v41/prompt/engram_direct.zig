@@ -74,6 +74,8 @@ fn blockOf(fd: c_int) u64 {
 /// `dst.len` bytes at `off` of `fd`: through the blocks that cover them when `fd` is registered (one F_NOCACHE pread of
 /// whole blocks into an aligned buffer, the bytes copied out), else one pread. False on a short read.
 pub fn readRow(fd: c_int, dst: []u8, off: u64) bool {
+    // Windows opens no Engram table (`engram.Table.open`).
+    if (comptime builtin.os.tag == .windows) return false;
     const block = blockOf(fd);
     const lo = if (block > 0) off / block * block else off;
     const hi = if (block > 0) std.mem.alignForward(u64, off + dst.len, block) else off + dst.len;
@@ -112,6 +114,7 @@ pub const Block = struct {
     /// `dst.len` bytes at `off` of `fd`: from the kept block when it covers them, else read through the blocks that
     /// cover them (kept for the next row); one pread when `fd` is not registered or the span is past `max_span`.
     pub fn read(b: *Block, fd: c_int, dst: []u8, off: u64) bool {
+        if (comptime builtin.os.tag == .windows) return false;
         const block = blockOf(fd);
         if (block == 0) return readRow(fd, dst, off);
         if (b.lo != std.math.maxInt(u64) and off >= b.lo and off + dst.len <= b.lo + b.len) {

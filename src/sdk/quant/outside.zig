@@ -183,6 +183,10 @@ pub const Format = struct {
         try check(f.t, v);
         if (b.b.size < @offsetOf(abi.Bank, "rows_shared")) {
             log.err("{s}: its streamed bank lacks the members every bank has: rebuild it with this release's kit\n", .{f.t.name.slice()});
+            // The plugin built it: closed when it gave its `close` (read as optional: the zeroed word may be null).
+            const Close = ?*const fn (?*anyopaque) callconv(.c) void;
+            const given = @as(*const Close, @ptrCast(&b.b.close)).*;
+            if (b.b.size >= @offsetOf(abi.Bank, "close") + @sizeOf(Close)) if (given) |c| c(b.b.ctx);
             return error.OutsideQuantRefused;
         }
         return b;
@@ -381,9 +385,10 @@ const ToyBank = struct {
         out.size = @offsetOf(abi.Bank, "rows_shared");
         return v;
     }
-    fn openShort(_: *const abi.LoadCtx, _: *const abi.BankGeometry, _: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
+    fn openShort(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
+        const v = open(ctx, geo, budget, out);
         out.size = @offsetOf(abi.Bank, "rows");
-        return .ok;
+        return v;
     }
     fn close(_: ?*anyopaque) callconv(.c) void {
         closed += 1;
@@ -444,4 +449,5 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     older.close();
     table.open_bank = &ToyBank.openShort;
     try testing.expectError(error.OutsideQuantRefused, f.openBank(geo, .{ .prompt = 1000, .decode = 1000 }));
+    try testing.expectEqual(@as(u32, 3), ToyBank.closed); // the refused bank is closed too
 }
