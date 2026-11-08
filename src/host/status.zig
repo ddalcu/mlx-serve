@@ -7,6 +7,7 @@ pub const getProcAvailableMemBytes = system.getProcAvailableMemBytes;
 pub const memoryPool = system.memoryPool;
 pub const getTotalMemBytes = system.getTotalMemBytes;
 pub const getAvailableMemBytes = system.getAvailableMemBytes;
+pub const getLoadAvailableMemBytes = system.getLoadAvailableMemBytes;
 pub const memoryPressureLevel = system.memoryPressureLevel;
 pub const underMemoryPressure = system.underMemoryPressure;
 pub const osReserveBytes = system.osReserveBytes;
