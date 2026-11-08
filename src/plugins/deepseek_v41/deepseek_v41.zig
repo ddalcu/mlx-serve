@@ -750,7 +750,7 @@ fn head8From(v: ?[*:0]const u8) bool {
 /// The split a tensor rank's LM head takes: every rank its rows of the vocabulary (`vocabRange`), unless
 /// `DSV41_VOCAB_HEAD=0` keeps the head whole on rank 0 (the A/B control). Every rank must read the same value.
 fn vocabSplit(tp: ?Shard) ?Shard {
-    return vocabSplitFrom(tp, std.c.getenv("DSV41_VOCAB_HEAD"));
+    return vocabSplitFrom(tp, env.get(.DSV41_VOCAB_HEAD));
 }
 
 fn vocabSplitFrom(tp: ?Shard, v: ?[*:0]const u8) ?Shard {
@@ -10151,7 +10151,7 @@ test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole 
 }
 
 test "dsv41 bench: the release's LM head whole, as rank 0's view of a quarter, and as a worker's own quarter (DSV41_BENCH_VOCAB)" {
-    if (std.c.getenv("DSV41_BENCH_VOCAB") == null) return error.SkipZigTest;
+    if (env.get(.DSV41_BENCH_VOCAB) == null) return error.SkipZigTest;
     const gpa = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const iou = @import("../../sdk/util/io_util.zig");
