@@ -115,8 +115,6 @@ var k_final: Kernel = .{ .name = "ming_cfm_final", .ins = &.{ "X", "NW", "WF", "
 
 const Tmpl = struct { [*:0]const u8, c_int };
 
-extern "c" fn mlx_fast_metal_kernel_config_set_init_value(cls: mlx.mlx_fast_metal_kernel_config, value: f32) c_int;
-
 /// Run one kernel → its bf16 outputs (owned by the caller) in `outs`. With
 /// `n_cols`, a GEMV kernel: n_cols / tile.no threadgroups of tile.sg
 /// simdgroups; otherwise `tgs` threadgroups of `tg` threads.
@@ -127,7 +125,7 @@ fn runN(kr: *Kernel, inputs: []const Arr, shapes: []const []const c_int, n_cols:
     for (shapes) |sh| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, sh.len, .bfloat16));
     if (kr.counter) |n| {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{n}, 1, .uint32));
-        try mlx.check(mlx_fast_metal_kernel_config_set_init_value(c, 0));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_init_value(c, 0));
     }
     var n_tg = tgs;
     var tg = tg_threads;

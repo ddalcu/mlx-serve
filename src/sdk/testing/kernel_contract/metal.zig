@@ -8,8 +8,6 @@ const limits = @import("limits.zig");
 const spec = @import("spec.zig");
 const crt = @import("../../util/crt.zig");
 
-extern "c" fn mlx_fast_metal_kernel_config_set_init_value(cls: mlx.mlx_fast_metal_kernel_config, value: f32) c_int;
-
 /// A template argument as `mlx_fast_metal_kernel_config_add_template_arg_*` takes it.
 pub const TArg = struct {
     name: [*:0]const u8,
@@ -270,7 +268,7 @@ pub const Rig = struct {
             .flag => |v| mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, t.name, v),
             .dtype => |v| mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t.name, v),
         });
-        try mlx.check(mlx_fast_metal_kernel_config_set_init_value(cfg, if (bools > 0) BOOL_POISON else g.poison));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_init_value(cfg, if (bools > 0) BOOL_POISON else g.poison));
         if (r.capture != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_set_verbose(cfg, true));
         const v = mlx.mlx_vector_array_new_data(args.ptr, args.len);
         defer _ = mlx.mlx_vector_array_free(v);
