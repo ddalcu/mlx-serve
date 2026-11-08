@@ -33,6 +33,9 @@
 //! fresh path.
 
 const std = @import("std");
+/// The regions ride the host's MLX shims (`sdk/weights/streamed/csrc/`), which only the macOS graphs compile: elsewhere
+/// every caller takes the fresh path.
+const shimmed = @import("builtin").os.tag == .macos;
 const mlx = @import("../../../mlx/ffi.zig");
 
 const A = mlx.mlx_array;
@@ -54,6 +57,7 @@ pub inline fn ps() *State {
     return shared_state.get();
 }
 fn readyEvent() !i32 {
+    if (comptime !shimmed) return error.ScratchEvent;
     if (ps().ready_event < 0) {
         var object: u64 = 0;
         const id = dsv41ev_create_metal(1, &object);
@@ -89,6 +93,7 @@ pub const Region = struct {
     /// The region's buffer at `shape` of `dtype`: the one it holds while they match, else a new one (the old freed);
     /// null when the regions together would pass `cap_bytes` (the caller takes the fresh path).
     pub fn ensure(r: *Region, shape: []const c_int, dtype: mlx.mlx_dtype) !?A {
+        if (comptime !shimmed) return null;
         if (shape.len == 0 or shape.len > max_ndim) return error.ScratchShape;
         if (r.arr.ctx != null and r.ndim == shape.len and std.mem.eql(c_int, r.shape[0..r.ndim], shape) and r.dtype == dtype) return r.arr;
         r.free();
@@ -145,6 +150,7 @@ pub const Region = struct {
     /// MLX holds as written in the compute pass after the latest writer's (the host's event wait over an event already
     /// at 1, the region and the carrier its tracked inputs).
     pub fn publish(r: *Region, s: mlx.mlx_stream) !A {
+        if (comptime !shimmed) return error.ScratchUnwritten;
         if (r.arr.ctx == null or r.carrier.ctx == null) return error.ScratchUnwritten;
         const gated = [2]A{ r.arr, r.carrier };
         var outs = [2]A{ mlx.mlx_array_new(), mlx.mlx_array_new() };

@@ -20,6 +20,8 @@
 //! p live changes.
 
 const std = @import("std");
+/// The regions' event wait is the host's MLX shim (`sdk/weights/streamed/csrc/`), on the macOS graphs only.
+const shimmed = @import("builtin").os.tag == .macos;
 const mlx = @import("../../../mlx/ffi.zig");
 const scratch = @import("scratch.zig");
 /// The twins' text derivation (std only).
@@ -77,7 +79,7 @@ pub inline fn ps() *State {
 pub fn layerBegin(eligible: bool, rows: usize, heads: usize, nk: usize) !bool {
     ps().live = false;
     ps().next = 0;
-    if (!eligible) return false;
+    if (!eligible or !shimmed) return false;
     if (!ps().ring_regions) {
         ps().s_region.free();
         ps().p_region.free();
@@ -269,6 +271,7 @@ pub fn headsWroteFree(carrier: A) !void {
 /// A run's end: its region published for its `wo_a` (a new handle the caller owns; the host's event wait over the
 /// region and the last pv carrier of each span parity), the next run on the other region; null: the run kept the join.
 pub fn headsRunEnd(s: mlx.mlx_stream) !?A {
+    if (comptime !shimmed) return null;
     if (!ps().run_live) {
         ps().run_next +%= 1;
         return null;
@@ -315,6 +318,7 @@ pub fn headsLayerEnd() void {
 extern fn dsv41ev_create_metal(start: u64, object: *u64) i32;
 extern fn dsv41ev_wait(xs: [*]const A, n: usize, event: i32, value: u64, deps: ?[*]const A, n_deps: usize, track_inputs: bool, s: mlx.mlx_stream, outs: [*]A) c_int;
 fn readyEvent() !i32 {
+    if (comptime !shimmed) return error.ScratchHeadsEvent;
     if (ps().ready_event < 0) {
         var object: u64 = 0;
         const id = dsv41ev_create_metal(1, &object);
