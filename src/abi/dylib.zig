@@ -19,7 +19,12 @@ pub const version: u32 = 2;
 pub const symbol = "mlx_serve_plugin";
 
 /// `engine`: a whole engine of its own (`abi/engine.zig`), its own runtime on its own thread, for the models it names.
-pub const Kind = enum(u8) { model, media, quant, engine };
+/// Open: a kind a later kit adds is refused by name (`negotiate`), never switched on.
+pub const Kind = enum(u8) { model, media, quant, engine, _ };
+
+/// An engine manifest's `mlx`: equal to no MLX build, so a host older than engine plugins (which checks every pin)
+/// refuses one by name instead of switching on a kind it has no arm for.
+pub const engine_pin = "engine plugin: links no MLX";
 
 pub const File = extern struct { name: Str, bytes: Str };
 
@@ -73,7 +78,7 @@ pub const OptionKind = enum(u8) { bool, number, text, _ };
 
 /// One setting (`Manifest.options`).
 pub const Option = extern struct {
-    /// The plugin's name upper-cased, `_`, then [A-Z0-9_] (`optionNameOk`), never `MLX_SERVE_` or `DYLD_`. Two
+    /// The plugin's name upper-cased, `_`, then [A-Z0-9_] (`optionNameOk`), never `MLX_`, `MTL_`, `METAL_` or `DYLD_`. Two
     /// plugins whose names nest (`foo`, `foo_bar`) can still declare one name: the loader sets it for the first.
     name: Str,
     kind: OptionKind,
@@ -86,8 +91,8 @@ pub const Option = extern struct {
 /// Whether plugin `plugin` may declare option `name` (`Option.name`); at most 128 bytes.
 pub fn optionNameOk(plugin: []const u8, name: []const u8) bool {
     if (name.len <= plugin.len + 1 or name.len > 128) return false;
-    // mlx-serve's own variables, and the loader's (inherited by every child process).
-    if (std.mem.startsWith(u8, name, "MLX_SERVE_") or std.mem.startsWith(u8, name, "DYLD_")) return false;
+    // mlx-serve's and MLX's own variables, Metal's, and the loader's (inherited by every child process).
+    for ([_][]const u8{ "MLX_", "MTL_", "METAL_", "DYLD_" }) |reserved| if (std.mem.startsWith(u8, name, reserved)) return false;
     for (plugin, name[0..plugin.len]) |p, n| if (std.ascii.toUpper(p) != n) return false;
     if (name[plugin.len] != '_') return false;
     for (name[plugin.len + 1 ..]) |c| if (!(std.ascii.isUpper(c) or std.ascii.isDigit(c) or c == '_')) return false;
@@ -139,6 +144,7 @@ fn sized(comptime T: type, p: ?*const anyopaque) bool {
 pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
     if (m.version != version) return Verdict.refuse(.unsupported, "plugin manifest version is not this host's: rebuild it with this release's kit");
     if (m.size < Manifest.min_size) return Verdict.refuse(.unsupported, "plugin manifest is older than this host's: rebuild it with this release's kit");
+    if (std.enums.tagName(Kind, m.kind) == null) return Verdict.refuse(.unsupported, "plugin kind is not one this host serves: a newer mlx-serve may");
     if (!validName(m.name.slice())) return Verdict.refuse(.failed, "plugin name is not [a-z0-9_], 1 to 64 bytes");
     for (m.declaredOptions()) |o| {
         if (!optionNameOk(m.name.slice(), o.name.slice()))
@@ -180,6 +186,7 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
             // An engine's table carries no name: the manifest's is its name.
             return .ok;
         },
+        _ => unreachable,
     }
     const t_name: *const Str = @ptrCast(@alignCast(@as([*]const u8, @ptrCast(m.table)) + @sizeOf(Head)));
     if (!std.mem.eql(u8, t_name.slice(), m.name.slice())) return Verdict.refuse(.failed, "plugin table is named otherwise than its manifest");
@@ -381,6 +388,9 @@ test "abi dylib: an engine plugin needs no MLX pin and names the models it serve
     old.version = engine_abi.version + 1;
     m.table = &old;
     try testing.expectEqualStrings("engine table version is not this host's", negotiate(&m, "mlx=any").why.slice());
+    m.table = &e;
+    m.kind = @enumFromInt(9);
+    try testing.expectEqualStrings("plugin kind is not one this host serves: a newer mlx-serve may", negotiate(&m, "mlx=any").why.slice());
 }
 
 test "abi dylib: an option is named after its plugin and its default is a value of its kind" {
@@ -408,6 +418,7 @@ test "abi dylib: option names carry the plugin's name upper-cased; values follow
     for ([_][]const u8{ "TURBOEXL3_DS41_", "TURBOEXL3_DS41", "TURBOEXL3_DS41_frac", "TURBOEXL3_DS4_FRAC", "OTHER_X", "TURBOEXL3_DS41_A-B" }) |n|
         try testing.expect(!optionNameOk("turboexl3_ds41", n));
     try testing.expect(!optionNameOk("mlx_serve", "MLX_SERVE_CTX") and !optionNameOk("dyld", "DYLD_INSERT_LIBRARIES"));
+    try testing.expect(!optionNameOk("mlx", "MLX_METAL_FAST_SYNCH") and !optionNameOk("mtl", "MTL_DEBUG_LAYER") and !optionNameOk("metal", "METAL_DEVICE_WRAPPER_TYPE"));
     for ([_][]const u8{ "1", "-2.5", "1e3", "0.25E-2" }) |v| try testing.expect(valueOk(.number, v));
     for ([_][]const u8{ "", "x", "1.", ".5", "nan", "inf", "1_000", "0x10", "0.5\n" }) |v| try testing.expect(!valueOk(.number, v));
     try testing.expect(valueOk(.bool, "0") and valueOk(.bool, "1") and !valueOk(.bool, "true"));

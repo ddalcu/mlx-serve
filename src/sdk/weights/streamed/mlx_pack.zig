@@ -172,8 +172,10 @@ const Found = struct {
                 if (!std.mem.eql(u8, t.dtype, want_dtype)) return error.StreamedPackDtype;
                 const sh = if (stacked) t.shape[1..] else t.shape;
                 if (sh.len != 2 or (stacked and (t.shape.len != 3 or t.shape[0] != n_experts))) return error.StreamedPackShape;
-                const one = sh[0] * sh[1] * elem;
-                if (t.len != one * @as(u64, if (stacked) n_experts else 1)) return error.StreamedPackShape;
+                // A downloaded header's dims: the slot arrays take them as `c_int`, and their product must not wrap.
+                if (sh[0] > std.math.maxInt(c_int) or sh[1] > std.math.maxInt(c_int)) return error.StreamedPackShape;
+                const one = std.math.mul(u64, sh[0] * sh[1], elem) catch return error.StreamedPackShape;
+                if (t.len != (std.math.mul(u64, one, if (stacked) n_experts else 1) catch return error.StreamedPackShape)) return error.StreamedPackShape;
                 if (e == 0) {
                     l.segments[c] = .{ .dtype = if (c % 3 == 0) .U32 else .BF16, .shape = .{ sh[0], sh[1] }, .offset = l.logical_bytes, .length = one };
                     l.logical_bytes += one;
@@ -376,6 +378,22 @@ pub const Source = struct {
 // ── tests ──
 
 const testing = std.testing;
+
+test "mlx pack: a header whose expert dims pass c_int or whose bytes wrap u64 is refused by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const fds = [_]io.UncachedFd{.{ .fd = -1, .size = 0 }};
+    const big: u64 = std.math.maxInt(c_int);
+    // The stacked bytes at [2, big, big] wrap u64; the claimed lengths are the wrapped products.
+    inline for (.{ [_]u64{ 2, big, big }, [_]u64{ 2, big + 1, 1 } }) |shape| {
+        var f: Found = .{};
+        for (&f.stacked, 0..) |*x, c| {
+            const elem: u64 = if (c % 3 == 0) 4 else 2;
+            x.* = .{ .file = 0, .start = 0, .len = shape[1] *% shape[2] *% elem *% 2, .dtype = if (c % 3 == 0) "U32" else "BF16", .shape = &shape };
+        }
+        try testing.expectError(error.StreamedPackShape, f.layer(arena.allocator(), "p", &fds));
+    }
+}
 
 test "mlx pack: routed expert names, stacked and per expert; the MTP head's and other tensors are not" {
     const st = routedOf("language_model.model.layers.3.mlp.switch_mlp.down_proj.biases").?;

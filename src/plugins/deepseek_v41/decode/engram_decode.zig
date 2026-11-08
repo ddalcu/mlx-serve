@@ -52,9 +52,11 @@ pub fn parseMb(value: ?[]const u8) Error!u32 {
     return n;
 }
 
-/// What the load bills for the LRU (`bill.engram_store_bytes`): its bytes.
-pub fn billBytes() u64 {
-    return @as(u64, ps().lru_mb) << 20;
+/// What the load bills for the LRU (`bill.engram_store_bytes`): the bytes `setting` (`MLX_SERVE_DSV41_ENGRAM_LRU_MB`)
+/// names, read here because the bill runs before the load sets `lru_mb`; a refused value bills the default (the load
+/// refuses it by name).
+pub fn billBytes(setting: ?[]const u8) u64 {
+    return @as(u64, parseMb(setting) catch default_mb) << 20;
 }
 
 /// A pthread mutex: the LRU's users are the prefetch threads, GCD workers and the model's thread, with no `Io` among them.
@@ -448,10 +450,9 @@ test "engram decode setting: the LRU's MiB (unset 256; 1 to 16384), anything els
     try testing.expectEqual(@as(u32, 1), try parseMb("1"));
     try testing.expectEqual(@as(u32, 16384), try parseMb("16384"));
     for ([_][]const u8{ "0", "16385", "-1", "256M", " 256", "1.5" }) |v| try testing.expectError(error.EngramLruSetting, parseMb(v));
-    const saved = ps().lru_mb;
-    defer ps().lru_mb = saved;
-    ps().lru_mb = 300;
-    try testing.expectEqual(@as(u64, 300 << 20), billBytes());
+    // Billed at the size its setting names, before a load sets `lru_mb`; a refused value bills the default.
+    try testing.expectEqual(@as(u64, 300 << 20), billBytes("300"));
+    try testing.expectEqual(@as(u64, default_mb) << 20, billBytes("lots"));
 }
 
 test "engram decode LRU: a grid's rows taken by id across tables, the least recently used giving way, a used row kept" {

@@ -115,6 +115,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   (nine scattered reads an expert vs one EXL3 record): the repack stays the fast way to stream.
 - A tensor pair refuses streamed experts by name (`Dsv41TpStreamedExperts`): a bank reads whole experts, only rank 0
   would open one, and each rank holds half of every expert.
+- A layer split refuses `stream_experts` by name (`Dsv41PairStreamedExperts`): each Mac is billed its share of the
+  layers, while the stream opens slot rows for every one.
+- A run takes a heads region only when every span's gather serves (`runGathers`, decided at its first span): a span
+  that wrote the region hands back no heads, so a run cannot fall back to the join halfway (unaligned second turns).
 
 ## Known issues
 - Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization

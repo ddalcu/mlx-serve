@@ -27,7 +27,7 @@ pub fn Manifest(comptime M: type, comptime mlx_pin: []const u8) type {
                 .quant => .quant,
                 .engine => .engine,
             },
-            .mlx = Str.of(mlx_pin),
+            .mlx = Str.of(if (M.plugin.kind == .engine) dylib_abi.engine_pin else mlx_pin),
             .table = &M.table,
             .claims = .of(&claims),
             .fixture = &fixtureOf,
@@ -95,6 +95,7 @@ pub fn filesOf(a: std.mem.Allocator, f: *const dylib_abi.Fixture) !fixture.Fixtu
 
 const testing = std.testing;
 const quant_abi = @import("../abi/quant.zig");
+const engine_abi = @import("../abi/engine.zig");
 
 const Toy = struct {
     pub const plugin = sdk_plugin.Plugin{ .name = "toy_fmt", .kind = .quant, .claims = &.{ "a", "b" } };
@@ -117,6 +118,20 @@ test "sdk dylib: the manifest carries the root's name, kind, table and claims, a
     try testing.expectEqualStrings("b", m.claims.slice()[1].slice());
     try testing.expect(dylib_abi.negotiate(m, "pin-1").isOk());
     try testing.expect(!dylib_abi.negotiate(m, "pin-2").isOk());
+}
+
+const ToyEngine = struct {
+    pub const plugin = sdk_plugin.Plugin{ .name = "toy_engine", .kind = .engine, .models = &.{"Toy-1B"} };
+    pub const table = engine_abi.Engine{ .probe = undefined, .load_bytes = undefined, .open = undefined, .close = undefined, .submit = undefined, .cancel = undefined, .step = null, .status = undefined, .memory = undefined, .report_json = null, .trim = null, .media_rows = null, .embed = null, .decide = null, .tokenize = null, .token_bytes = null, .chat_template = null, .render = null };
+    pub fn conformanceFixture(a: std.mem.Allocator) !fixture.Fixture {
+        return .{ .files = try a.dupe(fixture.File, &.{.{ .name = "config.json", .bytes = try a.dupe(u8, "{}") }}) };
+    }
+};
+
+test "sdk dylib: an engine's manifest carries a pin no MLX matches, so a host that reads every pin refuses it" {
+    const m = &Manifest(ToyEngine, "pin-1").value;
+    try testing.expectEqualStrings(dylib_abi.engine_pin, m.mlx.slice());
+    try testing.expect(dylib_abi.negotiate(m, "pin-1").isOk());
 }
 
 test "sdk dylib: the fixture crosses as plugin-owned files and is freed by the plugin" {

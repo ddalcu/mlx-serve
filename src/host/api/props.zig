@@ -15,6 +15,7 @@ const build_options = @import("build_options");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
 const plugin_loader = @import("../plugins/loader.zig");
+const auth = @import("../http/auth.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const KvAttnMode = @import("request_options.zig").KvAttnMode;
@@ -284,7 +285,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(settings_json);
     const cluster_json = mlx_engine.api().cluster_json(allocator) orelse return error.OutOfMemory;
     defer allocator.free(cluster_json);
-    const plugins_json = try plugin_loader.processStatusJson(allocator);
+    const plugins_json = try plugin_loader.processStatusJson(allocator, auth.peerIsLoopback(stream));
     defer allocator.free(plugins_json);
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"plugins\":{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, plugins_json, registryGeneration() });
     defer allocator.free(extra_json);
@@ -327,7 +328,7 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     const available_mem = metrics.getAvailableMemBytes();
     const cluster_json = mlx_engine.api().cluster_json(allocator) orelse return error.OutOfMemory;
     defer allocator.free(cluster_json);
-    const plugins_json = try plugin_loader.processStatusJson(allocator);
+    const plugins_json = try plugin_loader.processStatusJson(allocator, auth.peerIsLoopback(stream));
     defer allocator.free(plugins_json);
     const body = try std.fmt.allocPrint(allocator,
         \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"plugins":{s},"registry_generation":{d}}}

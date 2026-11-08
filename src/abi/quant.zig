@@ -104,7 +104,8 @@ pub const QuantTable = extern struct {
     open_bank: ?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *Bank) callconv(.c) Verdict = null,
 };
 
-/// A routed layer's router as the trunk loaded it, borrowed for the bank's life.
+/// A layer's router as the trunk loaded it. The `gates` list is valid for the call only; the arrays it names live
+/// with the trunk, which outlives the bank.
 pub const BankGate = extern struct { w: Array = .{}, bias: Array = .{} };
 
 /// The trunk's routed MoE a streamed bank serves.
@@ -114,10 +115,11 @@ pub const BankGeometry = extern struct {
     inter: u32,
     top_k: u32,
     n_experts: u32,
+    /// The trunk's layers: `gates` and a call's `layer` index them alike.
     n_layers: u32,
     /// > 0: the SwiGLU's clamp.
     swiglu_limit: f32 = 0,
-    /// Every routed layer's router (`n_layers`); null for `bank_rows`.
+    /// Every layer's router (`n_layers`); null for `bank_rows`.
     gates: ?[*]const BankGate = null,
 };
 
@@ -143,6 +145,7 @@ pub const Bank = extern struct {
     about: Str = .{},
     /// Routed ids a decode-phase call takes: a wider call is a prompt pass, which the bank refuses in decode.
     decode_ids: u32,
+    /// Every `layer` below is the trunk's layer index (`BankGeometry.n_layers`).
     rows: *const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, out: *Array) callconv(.c) Verdict,
     /// After the eval that consumed a forward's calls.
     settle: *const fn (ctx: ?*anyopaque) callconv(.c) Verdict,

@@ -92,7 +92,8 @@ fn open(_: *const abi.Open, info: *abi.Info, out: *abi.Verdict) callconv(.c) ?*a
         return null;
     };
     st.* = .{};
-    if (std.c.getenv(config.reply_option)) |v| st.reply = gpa.dupe(u8, std.mem.span(v)) catch config.reply;
+    const want = config.replyFor(if (std.c.getenv(config.reply_option)) |v| std.mem.span(v) else null);
+    if (want.ptr != config.reply.ptr) st.reply = gpa.dupe(u8, want) catch config.reply;
     st.worker = std.Thread.spawn(.{}, work, .{st}) catch {
         freeReply(st);
         gpa.destroy(st);

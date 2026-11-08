@@ -156,6 +156,17 @@ pub fn setForeign(name: [*:0]const u8, value: [*:0]const u8) bool {
     return (if (is_windows) c._putenv_s(name, value) else c.setenv(name, value, 1)) == 0;
 }
 
+/// Unsets a variable `setForeign` set.
+pub fn unsetForeign(name: [*:0]const u8) void {
+    _ = if (is_windows) c._putenv_s(name, "") else c.unsetenv(name);
+}
+
+/// Whether `name` is one of `vars` (a plugin option may not reuse it).
+pub fn registered(name: []const u8) bool {
+    inline for (comptime std.meta.declarations(vars)) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
 pub fn unset(comptime name: @EnumLiteral()) void {
     _ = comptime info(name);
     _ = if (is_windows) c._putenv_s(@tagName(name), "") else c.unsetenv(@tagName(name));

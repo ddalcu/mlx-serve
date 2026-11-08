@@ -357,7 +357,8 @@ fn openUncachedWith(path: [*:0]const u8, errno: ?*c_int, follow: bool) OpenError
     var st: std.c.Stat = undefined;
     if (std.c.fstat(fd, &st) != 0) return error.StatFailed;
     if (st.mode & std.c.S.IFMT != std.c.S.IFREG) return error.NotRegularFile;
-    if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0) return error.NoCacheRefused;
+    // Read-ahead off: the reads are scattered expert records, and the kernel's prefetch only spends the drive's bandwidth.
+    if (std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1)) != 0 or std.c.fcntl(fd, std.c.F.RDAHEAD, @as(c_int, 0)) != 0) return error.NoCacheRefused;
     return .{ .fd = fd, .size = @intCast(st.size) };
 }
 

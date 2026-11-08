@@ -246,6 +246,7 @@ pub fn checkPlugin(io: std.Io, gpa: Allocator, p: loader.Plugin) !void {
             .media => .{ .media = @ptrCast(@alignCast(m.table)) },
             .quant => .{ .quant = @ptrCast(@alignCast(m.table)) },
             .engine => .{ .engine = @ptrCast(@alignCast(m.table)) },
+            _ => unreachable, // `negotiate` refused it
         },
         .fixture = try sdk_dylib.filesOf(a, &f),
     });

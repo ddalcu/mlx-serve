@@ -411,13 +411,32 @@ fn expectModel(io: std.Io, a: Allocator, s: Subject, t: *const model_abi.ModelTa
 /// fixture with the routed experts affine 8-bit (what the stream reads). The streamed load's map holds them zeroed, so
 /// only a load that reads them from the pack matches.
 pub fn expectStreamedExperts(io: std.Io, a: Allocator, name: []const u8, t: *const model_abi.ModelTable, fx: fixture.Fixture) !void {
-    if (!streamed.built or mlx.noGpuBackend() or mlx.virtualGpu()) return;
+    // Said, not skipped: the registry runs every plugin in one test, and a skip would end it at the first.
+    if (!streamed.built or mlx.noGpuBackend() or mlx.virtualGpu()) {
+        std.debug.print("conformance: plugin {s}: streamed experts unchecked here (no expert streamer or no real GPU)\n", .{name});
+        return;
+    }
     var resident = try Loaded.openWith(io, a, name, t, fx, .{ .quantize_experts = true, .gpu = true });
     defer resident.close();
     var live = try Loaded.openWith(io, a, name, t, fx, .{ .quantize_experts = true, .zero_experts = true, .gpu = true, .settings = "{\"stream_experts\":true}" });
     defer live.close();
-    const want = try promptThenStep(a, &resident);
-    const got = try promptThenStep(a, &live);
+    try expectSameLogits(name, try promptThenStep(a, &resident), try promptThenStep(a, &live), "streamed experts serve other logits than the same experts in memory");
+    // A batched decode over two row groups of 8 (GLM's) serves streamed what it serves in memory; a streamed load may
+    // run single-flight (refused `unsupported`). A fixture's few experts all fit the transient rows, so this cannot
+    // see a fetch rewrite rows a pending group still reads (glm5_next evaluates each group first).
+    if (model_abi.declaresMode(resident.parsed.caps, .batched_rows)) {
+        const want = (try batchedStep(a, &resident, 16)) orelse return fail(name, "a declared batched decode is refused", .{});
+        if (try batchedStep(a, &live, 16)) |got| try expectSameLogits(name, want, got, "a batched decode over streamed experts serves other logits than in memory");
+    }
+    // Logits cannot see a load that keeps its experts too: the zeroed copies the map holds stay unread.
+    for (live.zeroed.items) |z| {
+        var read = false;
+        _ = mlx._mlx_array_is_available(&read, z);
+        if (read) return fail(name, "a streamed load made the experts it streams resident", .{});
+    }
+}
+
+fn expectSameLogits(name: []const u8, want: []const f32, got: []const f32, comptime why: []const u8) !void {
     var top: f32 = 0;
     var diff: f32 = 0;
     for (want, got) |w, g| {
@@ -426,14 +445,38 @@ pub fn expectStreamedExperts(io: std.Io, a: Allocator, name: []const u8, t: *con
     }
     if (!(diff <= 1e-3 * @max(1, top))) {
         std.debug.print("conformance: plugin {s}: streamed logits differ by {d} (largest {d})\n", .{ name, diff, top });
-        return fail(name, "streamed experts serve other logits than the same experts in memory", .{});
+        return fail(name, why, .{});
     }
-    // Logits cannot see a load that keeps its experts too: the zeroed copies the map holds stay unread.
-    for (live.zeroed.items) |z| {
-        var read = false;
-        _ = mlx._mlx_array_is_available(&read, z);
-        if (read) return fail(name, "a streamed load made the experts it streams resident", .{});
+}
+
+/// The logits of one batched decode step over `n` fresh slots, a token each; null when the load refuses the mode.
+fn batchedStep(a: Allocator, pack: *Loaded, n: u32) !?[]f32 {
+    const vocab = pack.parsed.shell.vocab_size;
+    const tokens = try a.alloc(u32, n);
+    const slot_ids = try a.alloc(u32, n);
+    const positions = try a.alloc(u32, n);
+    for (tokens, slot_ids, 0..) |*tok, *s, i| {
+        tok.* = @intCast((i * 7 + 1) % vocab);
+        s.* = @intCast(i);
     }
+    @memset(positions, 0);
+    const caches = try a.alloc(test_cache.TestCache, n);
+    const handles = try a.alloc(model_abi.Handle, n);
+    for (caches, handles) |*c, *h| {
+        c.* = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+        h.* = c.handle();
+    }
+    defer for (caches) |*c| c.deinit();
+    var fo: model_abi.ForwardOut = .{};
+    const v = pack.table.forward(pack.model, &.{ .mode = .batched_rows, .logits = .last_row, .rows = 1, .tokens = .of(tokens), .slots = .of(slot_ids), .positions = .of(positions), .caches = .of(handles), .cache_ops = &test_cache.ops }, &fo);
+    if (v.code == .unsupported and fo.logits.ctx == null) return null;
+    // A fixture's bank (a row or two) is too small for MLX's row-block class a wide batch takes; a pack's holds dozens.
+    if (std.mem.eql(u8, v.why.slice(), "StreamedBankTooFewRows")) return null;
+    try expectOk(pack.name, "batched decode over streamed experts", v);
+    if (fo.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = fo.hidden.ctx });
+    const l = try consumeF32(a, fo.logits);
+    if (l.len != n * vocab) return fail(pack.name, "batched logits are not [slots, vocab]", .{});
+    return l;
 }
 
 /// The logits of a four-token prompt (last row) then of one decode step on its cache, back to back.

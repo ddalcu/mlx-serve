@@ -1251,7 +1251,7 @@ A quant plugin's table, exported as `exportName(name, version)`. `claims`, `vali
 
 ### `BankGate` (extern struct)
 
-A routed layer's router as the trunk loaded it, borrowed for the bank's life.
+A layer's router as the trunk loaded it. The `gates` list is valid for the call only; the arrays it names live with the trunk, which outlives the bank.
 
 | Field | Type | Default | |
 |---|---|---|---|
@@ -1269,9 +1269,9 @@ The trunk's routed MoE a streamed bank serves.
 | `inter` | `u32` |  |  |
 | `top_k` | `u32` |  |  |
 | `n_experts` | `u32` |  |  |
-| `n_layers` | `u32` |  |  |
+| `n_layers` | `u32` |  | The trunk's layers: `gates` and a call's `layer` index them alike. |
 | `swiglu_limit` | `f32` | `0` | > 0: the SwiGLU's clamp. |
-| `gates` | `?[*]const BankGate` | `null` | Every routed layer's router (`n_layers`); null for `bank_rows`. |
+| `gates` | `?[*]const BankGate` | `null` | Every layer's router (`n_layers`); null for `bank_rows`. |
 
 ### `BankBudget` (extern struct)
 
@@ -1302,7 +1302,7 @@ A streamed bank of routed experts, as the trunk's MoE reads one whose math it do
 | `close` | `*const fn (ctx: ?*anyopaque) callconv(.c) void` |  |  |
 | `about` | `Str` | `.{}` | The load line's account of the bank, valid until `close`. |
 | `decode_ids` | `u32` |  | Routed ids a decode-phase call takes: a wider call is a prompt pass, which the bank refuses in decode. |
-| `rows` | `*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, out: *Array) callconv(.c) Verdict` |  |  |
+| `rows` | `*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, out: *Array) callconv(.c) Verdict` |  | Every `layer` below is the trunk's layer index (`BankGeometry.n_layers`). |
 | `settle` | `*const fn (ctx: ?*anyopaque) callconv(.c) Verdict` |  | After the eval that consumed a forward's calls. |
 | `phase` | `*const fn (ctx: ?*anyopaque, prompt: bool) callconv(.c) Verdict` |  | Before each forward: a prompt pass or decode (the slot rows follow it). |
 | `read_ahead` | `*const fn (ctx: ?*anyopaque, layer: u32, ids: [*]const u16, n: usize) callconv(.c) Verdict` |  | A prompt pass's predicted routes of `layer` (every row's ids), read while its attention runs. |
@@ -2037,10 +2037,11 @@ An outside plugin's dylib: the one symbol it exports (`Manifest`, under `symbol`
 | `Verdict` | `common.Verdict` |  |
 | `version` | `u32 = 2` |  |
 | `symbol` | `"mlx_serve_plugin"` | The manifest's export name. Unversioned: a dylib built for another manifest version is refused by name, never reported as "no plugin here". |
+| `engine_pin` | `"engine plugin: links no MLX"` | An engine manifest's `mlx`: equal to no MLX build, so a host older than engine plugins (which checks every pin) refuses one by name instead of switching on a kind it has no arm for. |
 
 ### `Kind` (enum(u8))
 
-`engine`: a whole engine of its own (`abi/engine.zig`), its own runtime on its own thread, for the models it names.
+`engine`: a whole engine of its own (`abi/engine.zig`), its own runtime on its own thread, for the models it names. Open: a kind a later kit adds is refused by name (`negotiate`), never switched on.
 
 | Member | Value | |
 |---|---|---|
@@ -2048,6 +2049,7 @@ An outside plugin's dylib: the one symbol it exports (`Manifest`, under `symbol`
 | `media` | |  |
 | `quant` | |  |
 | `engine` | |  |
+| `_` | |  |
 
 ### `File` (extern struct)
 
@@ -2100,7 +2102,7 @@ One setting (`Manifest.options`).
 
 | Field | Type | Default | |
 |---|---|---|---|
-| `name` | `Str` |  | The plugin's name upper-cased, `_`, then [A-Z0-9_] (`optionNameOk`), never `MLX_SERVE_` or `DYLD_`. Two plugins whose names nest (`foo`, `foo_bar`) can still declare one name: the loader sets it for the first. |
+| `name` | `Str` |  | The plugin's name upper-cased, `_`, then [A-Z0-9_] (`optionNameOk`), never `MLX_`, `MTL_`, `METAL_` or `DYLD_`. Two plugins whose names nest (`foo`, `foo_bar`) can still declare one name: the loader sets it for the first. |
 | `kind` | `OptionKind` |  |  |
 | `default_value` | `Str` | `.{}` | The plugin's own value when none is set ("" when it names none), else a value of `kind` (`valueOk`). |
 | `help` | `Str` | `.{}` | One line the app shows under the name. |

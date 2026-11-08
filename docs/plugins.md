@@ -54,12 +54,13 @@ and field: [plugin-abi.md](plugin-abi.md) (generated from `src/abi/`).
 - **Options** (`Manifest.options`, `sdk.Plugin.options`): the settings a plugin reads from its environment (`getenv`,
   or the Host table's `lever`), each a name, a kind (`bool` = `0`/`1`, `number`, `text`), a default and one line of
   help. A name is the plugin's name upper-cased, `_`, then [A-Z0-9_] (`turboexl3_ds41` → `TURBOEXL3_DS41_FRAC`),
-  never `MLX_SERVE_` or `DYLD_`; negotiation refuses any other. Two plugins whose names nest (`foo`, `foo_bar`) can
+  never `MLX_`, `MTL_`, `METAL_` or `DYLD_`; negotiation refuses any other, and the server sets no name `env.zig`
+  registers (`HF_TOKEN` for a plugin named `hf`). Two plugins whose names nest (`foo`, `foo_bar`) can
   declare one name: the first loaded sets it, the other is told by name. The app draws them on the
   plugin's page and saves values in `plugins.json` (`"options": {"<plugin>": {"<NAME>": "<value>"}}`); at startup the
-  server sets each declared one the file saves, over a value the shell set, before it opens the plugin, and `/props`
-  reports what it set. A change applies at the next start (the app offers the restart). One value per plugin, not per
-  model.
+  server sets each declared one the file saves, over a value the shell set, before it opens the plugin (a plugin it
+  then refuses gets the shell's values back), and `/props` reports what it set, the values to a loopback client only.
+  A change applies at the next start (the app offers the restart). One value per plugin, not per model.
 
 ## Vendored modules: `mlx_host`, the one import
 

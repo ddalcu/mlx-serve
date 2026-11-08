@@ -22,7 +22,8 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
 - Forward (`table_forward.zig`): the [B,S,4,D] stream through KDA / DSA sublayers inside mHC; KV and recurrent state
   only through `CacheOps` (`slots.kda` writes conv, ssm and a verify's per-row capture back); positions from
   `Forward.positions`; captures = the stream MEAN; batched rows in groups of 8 (`MOE_DECODE_BATCH_MAX`), each slot's
-  KDA and DSA by its own call.
+  KDA and DSA by its own call; with streamed experts each group is evaluated before the next fetches (its misses
+  rewrite the slot rows the group's last layer reads).
 - Spec: `trunk_weight` (embedding table and head, both KDA hybrids); `SpecHooks.head` = `head.zig`, the `mtp.0` layer
   read with the trunk and made resident by `load`, its block over the head's one-layer cache at the cache's OWN length (`CacheOps.len`),
   never the trunk position. DFlash: captures through `Forward.capture_layers`; the policy stays engine-side.

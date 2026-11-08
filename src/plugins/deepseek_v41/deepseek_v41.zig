@@ -1659,6 +1659,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     var sliced = whole.*;
     // A streamed bank reads whole experts and only rank 0 opens one; a split's ranks hold half of each.
     if (opts.tp != null and opts.streamed_experts) return error.Dsv41TpStreamedExperts;
+    // An MLX pack's stream opens slot rows for every routed layer, where a layer split bills each Mac its share.
+    if (opts.pair != null and opts.streamed_experts and opts.quant == null) return error.Dsv41PairStreamedExperts;
     // A split slices the weights as MLX arrays; an outside plugin's stay whole.
     if (opts.tp != null and opts.quant != null) return error.Dsv41TpOutsideQuant;
     if (opts.tp) |t| {
@@ -1955,7 +1957,7 @@ pub fn residentDiskBytes(gpa: std.mem.Allocator, dir: []const u8, cfg: *const Co
         total -|= t.shardBytes();
     }
     // Its rows' LRU (`MLX_SERVE_DSV41_ENGRAM_LRU_MB`) fills on every load.
-    if (cfg.dsv41_n_engram_layers > 0) total +|= edec.billBytes();
+    if (cfg.dsv41_n_engram_layers > 0) total +|= edec.billBytes(env.span(.MLX_SERVE_DSV41_ENGRAM_LRU_MB));
     return total;
 }
 
@@ -2891,6 +2893,27 @@ fn attentionHeads(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, p0: u
     return attnDecode(sc, m, &m.layers[li], pj.q, ls.win, comp_rows, topk, p0, scale, ropeFor(m, li).inv);
 }
 
+/// The shapes `attnGather`'s kernels take: `H` heads of `D`, a window of `W` and `K` compressed picks.
+fn gatherServes(W: usize, H: usize, D: usize, K: usize) bool {
+    return H == 64 and D % 128 == 0 and W % 64 == 0 and K % 64 == 0 and W + K <= 32 * 32;
+}
+
+/// The compressed picks a span ending at position `end` reads where its layer's index source compresses at `ratio`
+/// (0: no compressed rows): the indexer keeps `topk` of the groups that end by then (`indexerQ`'s `nb`).
+fn picksAt(ratio: usize, topk: usize, end: usize) usize {
+    return if (ratio == 0) 0 else @min(topk, end / ratio);
+}
+
+/// Whether every span of a run (`run` spans of `span` rows from position `start`) takes the gather, so each writes its
+/// heads into the run's region: a span the gather declines hands its heads back plain, and its rows of the region
+/// would hold an earlier run's. A run that does not keeps the join.
+fn runGathers(c: *const Config, ratio: usize, start: usize, span: usize, run: usize) bool {
+    const og = c.dsv4_o_groups;
+    if (og == 0 or c.num_attention_heads % og != 0) return false;
+    for (1..run + 1) |i| if (!gatherServes(c.sliding_window, c.num_attention_heads, c.head_dim, picksAt(ratio, c.dsv4_index_topk, start + i * span))) return false;
+    return true;
+}
+
 /// `attnGather`'s heads as `attnOut`'s grouped projection reads them: inverse-roped with `periods` at `p0` on, laid out
 /// [o_groups, L, H / o_groups * D].
 pub const Grouped = struct { periods: A, p0: usize };
@@ -2907,7 +2930,7 @@ fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w: A,
     const W = m.cfg.sliding_window;
     const K = if (comp_rows.ctx != null) dim(topk, 1) else 0;
     const NK = W + K;
-    if (H != 64 or D % 128 != 0 or W % 64 != 0 or K % 64 != 0 or NK > 32 * 32 or !mlx.streamIsGpu(sc.s)) return null;
+    if (!gatherServes(W, H, D, K) or !mlx.streamIsGpu(sc.s)) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(keys_w) != .bfloat16 or (K > 0 and mlx.mlx_array_dtype(comp_rows) != .bfloat16)) return null;
     const og = m.cfg.dsv4_o_groups;
     if (grouped != null and (og == 0 or H % og != 0)) return null;
@@ -5391,8 +5414,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
     };
     // scratch_attn.zig: a full run's grouped heads straight into a run region (`[rows, og, in]`), its `wo_a` reading
     // the region: no join, no transpose (with an EXL3 `wo_a`).
-    const heads_b = run > 1 and try sat.headsLayerBegin(ly.wo_a.ext != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
+    const heads_b = run > 1 and m.act == .bfloat16 and try sat.headsLayerBegin(ly.wo_a.ext != null, run * sp.span, m.cfg.dsv4_o_groups, @as(usize, m.cfg.num_attention_heads) / m.cfg.dsv4_o_groups * m.cfg.head_dim, m.act);
     defer sat.headsLayerEnd();
+    const src_ratio = if (m.ratio(li) == 0) 0 else m.ratio(m.latest(li, Dsv41Model.isIndexSource));
     for (0..n_spans) |k| {
         const lo, const hi = sp.bounds(k);
         // A span's core intermediates are dropped once built, as in the per-span path.
@@ -5404,7 +5428,9 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // Whether this span's run takes a region (its `run` spans all of `sp.span` rows).
         if (heads_b) {
             const r0 = k - in_run;
-            sat.headsSpan(r0 + run <= n_spans and sp.bounds(r0 + run - 1)[1] - sp.bounds(r0)[0] == run * sp.span, in_run == 0, in_run * sp.span);
+            const full = r0 + run <= n_spans and sp.bounds(r0 + run - 1)[1] - sp.bounds(r0)[0] == run * sp.span;
+            // Decided at the run's first span: a span that wrote the region hands back no heads to join.
+            sat.headsSpan(in_run == 0 and full and runGathers(&m.cfg, src_ratio, sp.p0 + sp.bounds(r0)[0], sp.span, run), in_run == 0, in_run * sp.span);
         }
         var o_k = try attention(&ssc, m, st, li, try ssc.slice(pa.h, 0, lo, hi), sp.p0 + lo, &sh, span_pj);
         // Each span (or each run of spans) takes its own `wo_a`: the rows the chunk's `wo_b` reads, not the heads, are
@@ -9995,4 +10021,24 @@ test "dsv41 tp: a tensor split refuses streamed experts by name before it reads 
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     try std.testing.expectError(error.Dsv41TpStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .tp = .{ .rank = 0, .size = 2 }, .streamed_experts = true }));
+}
+
+test "dsv41 heads region: a run takes it only where every span's gather serves, so no span leaves its rows stale" {
+    const c: Config = .{ .model_type = "deepseek_v41", .num_hidden_layers = 40, .sliding_window = 128, .num_attention_heads = 64, .head_dim = 512, .dsv4_o_groups = 8, .dsv4_index_topk = 512 };
+    // From p0 = 0 every span's picks (128, 256, ... at ratio 2) are a multiple of 64.
+    try std.testing.expect(runGathers(&c, 2, 0, 256, 4));
+    // A second turn from 300: spans 0 and 1 read 278 and 406 picks, which the gather declines.
+    try std.testing.expect(!runGathers(&c, 2, 300, 256, 4));
+    // A 512-token turn at 100: both spans decline (178 and 306 picks), so the region was never written.
+    try std.testing.expect(!runGathers(&c, 2, 100, 256, 2));
+    // Past the cap every span reads 512 picks, wherever the call starts; a layer with no compressed rows reads none.
+    try std.testing.expect(runGathers(&c, 2, 1100, 256, 4) and runGathers(&c, 0, 300, 256, 4));
+    try std.testing.expectEqual(@as(usize, 278), picksAt(2, 512, 556));
+}
+
+test "dsv41 pair: a layer split refuses an MLX pack's streamed experts by name before it reads a weight" {
+    const cfg: Config = .{ .model_type = "deepseek_v41", .num_hidden_layers = 8 };
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    try std.testing.expectError(error.Dsv41PairStreamedExperts, init(std.testing.allocator, &cfg, &w, mlx.gpuStream(), .{ .pair = .{ .lo = 4, .hi = 8, .worker = false }, .streamed_experts = true }));
 }

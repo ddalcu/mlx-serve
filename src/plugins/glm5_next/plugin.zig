@@ -170,9 +170,17 @@ fn batched(m: *host.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out:
         made += 1;
         try rows2d(m, logits, &parts[made - 1][0]);
         try rows2d(m, hidden, &parts[made - 1][1]);
+        // Streamed experts: the next group's fetches rewrite the slot rows this group's last MoE layer reads.
+        if (m.experts != null and end < n) try evalParts(&parts[made - 1]);
     }
     out.logits = .{ .ctx = (try joinRows(m, parts[0..made], 0)).ctx };
     if (f.want_hidden) out.hidden = .{ .ctx = (try joinRows(m, parts[0..made], 1)).ctx };
+}
+
+fn evalParts(p: *const [2]Array) !void {
+    const vec = mlx.mlx_vector_array_new_data(p, 2);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
 }
 
 /// `[1, R, W]` as `[R, W]`.

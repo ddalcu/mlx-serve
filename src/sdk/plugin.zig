@@ -99,11 +99,29 @@ pub fn check(comptime M: type, comptime folder: []const u8) void {
             if (fnPtr(M.config.claims) != M.table.claims) @compileError(w ++ ": table.claims is not config.zig's `claims`");
             if (p.kind == .model and fnPtr(M.config.parse) != M.table.parse) @compileError(w ++ ": table.parse is not config.zig's `parse`");
         }
+        checkOptions(w, p);
+        if (!@hasDecl(M, "conformanceFixture")) @compileError(w ++ ": no `conformanceFixture` for the conformance suite");
+    }
+}
+
+/// `p`'s options against the manifest's rules, at comptime; the branch quota grows with them (a name and a text
+/// default take hundreds of branches each).
+pub fn checkOptions(comptime w: []const u8, comptime p: Plugin) void {
+    comptime {
+        @setEvalBranchQuota(1000 + 4000 * p.options.len);
         for (p.options) |o| {
             if (!dylib_abi.optionNameOk(p.name, o.name)) @compileError(w ++ ": option " ++ o.name ++ " is not named `<PLUGIN NAME>_` then [A-Z0-9_]");
             if (o.default.len > 0 and !dylib_abi.valueOk(o.kind, o.default)) @compileError(w ++ ": option " ++ o.name ++ "'s default is not a value of its kind");
         }
-        if (!@hasDecl(M, "conformanceFixture")) @compileError(w ++ ": no `conformanceFixture` for the conformance suite");
+    }
+}
+
+test "sdk plugin: a plugin may declare 64 options" {
+    comptime {
+        var opts: [64]Option = undefined;
+        for (&opts, 0..) |*o, i| o.* = .{ .name = "TURBOEXL3_GLM53F_OPT_" ++ [_]u8{ 'A' + i / 26, 'A' + i % 26 }, .kind = .number, .default = "0.25" };
+        const all = opts;
+        checkOptions("plugin turboexl3_glm53f", .{ .name = "turboexl3_glm53f", .kind = .quant, .options = &all });
     }
 }
 

@@ -59,8 +59,9 @@ pub const Receipt = struct {
 
 pub const ReceiptOption = struct { name: []const u8, kind: dylib_abi.OptionKind, default: []const u8 = "", help: []const u8 = "" };
 
-/// A variable the host set for a plugin before it opened (`/props` reports them).
-pub const Applied = struct { name: [:0]const u8, value: [:0]const u8 };
+/// A variable the host set for a plugin before it opened (`/props` reports them), and the shell's value it replaced
+/// (null: unset), put back if the plugin is refused.
+pub const Applied = struct { name: [:0]const u8, value: [:0]const u8, prev: ?[:0]const u8 = null };
 
 /// Sets, over the shell's, each option `declared` that `settings` saves a string for under plugin `plugin`, when the
 /// name and value pass the manifest's rules (`abi.dylib.optionNameOk`, `valueOk`) and no plugin in `earlier` set the
@@ -77,7 +78,7 @@ pub fn applyOptions(a: Allocator, plugin: []const u8, declared: []const ReceiptO
     for (declared) |o| {
         const v = saved.object.get(o.name) orelse continue;
         if (v != .string) continue;
-        if (!dylib_abi.optionNameOk(plugin, o.name) or !dylib_abi.valueOk(o.kind, v.string)) {
+        if (!dylib_abi.optionNameOk(plugin, o.name) or env.registered(o.name) or !dylib_abi.valueOk(o.kind, v.string)) {
             log.warn("[plugins] {s}: option {s} is not set (its name or value breaks the option rules)\n", .{ plugin, o.name });
             continue;
         }
@@ -90,7 +91,12 @@ pub fn applyOptions(a: Allocator, plugin: []const u8, declared: []const ReceiptO
             a.free(name);
             return e;
         };
-        const one: Applied = .{ .name = name, .value = value };
+        const prev = if (env.byName(name)) |p| a.dupeSentinel(u8, std.mem.span(p), 0) catch |e| {
+            a.free(name);
+            a.free(value);
+            return e;
+        } else null;
+        const one: Applied = .{ .name = name, .value = value, .prev = prev };
         if (!env.setForeign(one.name, one.value)) {
             freeOne(a, one);
             log.warn("[plugins] {s}: option {s} could not be set\n", .{ plugin, o.name });
@@ -152,6 +158,7 @@ pub const Plugin = struct {
             .media => .media,
             .quant => .quant,
             .engine => .engine,
+            _ => unreachable, // `negotiate` refused it
         } } };
         switch (m.kind) {
             .model => e.model = @ptrCast(@alignCast(m.table)),
@@ -159,6 +166,7 @@ pub const Plugin = struct {
             .quant => e.quant = @ptrCast(@alignCast(m.table)),
             // It claims nothing by type: it serves the models it names (`engineFor`).
             .engine => {},
+            _ => unreachable,
         }
         return e;
     }
@@ -197,6 +205,15 @@ fn freeApplied(a: Allocator, list: []const Applied) void {
 fn freeOne(a: Allocator, o: Applied) void {
     a.free(o.name);
     a.free(o.value);
+    if (o.prev) |p| a.free(p);
+}
+
+/// A refused plugin's options undone: each name back to the shell's value, or unset.
+fn undoApplied(a: Allocator, list: []const Applied) void {
+    for (list) |o| if (o.prev) |p| {
+        _ = env.setForeign(o.name, p);
+    } else env.unsetForeign(o.name);
+    freeApplied(a, list);
 }
 
 /// The hex SHA-256 of `bytes`.
@@ -285,16 +302,16 @@ fn loadInstalled(io: std.Io, a: Allocator, dir: std.Io.Dir, stem: []const u8, pa
     if (!std.mem.eql(u8, &hash, receipt.sha256)) return .{ .refused = try a.dupe(u8, "changed since it was installed (hash differs from its receipt)") };
     const applied = try applyOptions(a, stem, receipt.options, settings, earlier);
     var got = open(a, path, hash, host_mlx) catch |e| {
-        freeApplied(a, applied);
+        undoApplied(a, applied);
         return e;
     };
     if (got != .ok) {
-        freeApplied(a, applied);
+        undoApplied(a, applied);
         return got;
     }
     if (!std.mem.eql(u8, got.ok.name(), stem)) {
         a.free(got.ok.path);
-        freeApplied(a, applied);
+        undoApplied(a, applied);
         return .{ .refused = try a.dupe(u8, "its manifest names another plugin than its file") };
     }
     got.ok.options = applied;
@@ -404,18 +421,19 @@ fn fileStem(path: []const u8) []const u8 {
 }
 
 /// The `/props` `plugins` array: each installed plugin this process loaded (with the options it set) or refused, and
-/// whether a rebuild against this release's kit would load it.
-pub fn statusJson(a: Allocator, loaded_now: []const Plugin, refused: []const Refusal) ![]u8 {
+/// whether a rebuild against this release's kit would load it. An option's value only with `values` (a loopback
+/// client: the app compares it with what it saved); elsewhere null, since a text option can hold a key.
+pub fn statusJson(a: Allocator, loaded_now: []const Plugin, refused: []const Refusal, values: bool) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const aa = arena.allocator();
-    const Row = struct { name: []const u8, loaded: bool, options: ?std.json.ArrayHashMap([]const u8) = null, rebuild: ?bool = null, why: ?[]const u8 = null };
+    const Row = struct { name: []const u8, loaded: bool, options: ?std.json.ArrayHashMap(?[]const u8) = null, rebuild: ?bool = null, why: ?[]const u8 = null };
     var rows: std.ArrayList(Row) = .empty;
     for (loaded_now) |p| {
         var row: Row = .{ .name = p.name(), .loaded = true };
         if (p.options.len > 0) {
             row.options = .{};
-            for (p.options) |o| try row.options.?.map.put(aa, o.name, o.value);
+            for (p.options) |o| try row.options.?.map.put(aa, o.name, if (values) o.value else null);
         }
         try rows.append(aa, row);
     }
@@ -424,9 +442,9 @@ pub fn statusJson(a: Allocator, loaded_now: []const Plugin, refused: []const Ref
 }
 
 /// This process's `statusJson`.
-pub fn processStatusJson(a: Allocator) ![]u8 {
+pub fn processStatusJson(a: Allocator, values: bool) ![]u8 {
     const set = &process.get().set;
-    return statusJson(a, set.plugins.items, set.refused.items);
+    return statusJson(a, set.plugins.items, set.refused.items, values);
 }
 
 /// What a failed model load adds when plugins were refused for another build: their names and the fix, or null.
@@ -571,6 +589,11 @@ test "outside plugins: each option a receipt declares is set from plugins.json, 
     try testing.expectEqualStrings("from the app", got[0].value);
     try testing.expectEqualStrings("from the app", std.mem.span(env.byName("TOYOPT_REPLY").?));
     try testing.expect(env.byName("TOYOPT_FAST") == null and env.byName("OTHEROPT_X") == null and env.byName("TOYOPT_LATER") == null);
+    // A plugin named `hf` cannot reach the token mlx-serve's `pull` sends.
+    const hf = try std.json.parseFromSliceLeaky(Settings, a,
+        \\{"enabled":true,"options":{"hf":{"HF_TOKEN":"stolen"}}}
+    , .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 0), (try applyOptions(testing.allocator, "hf", &.{.{ .name = "HF_TOKEN", .kind = .text }}, hf, &.{})).len);
     try testing.expectEqual(@as(usize, 0), (try applyOptions(testing.allocator, "toyopt", &declared, .{ .enabled = true }, &.{})).len);
     // A name an earlier plugin set (`toy` beside `toy_opt`, whose prefixes nest) stays the earlier one's.
     var none: u8 = 0;
@@ -590,15 +613,26 @@ test "outside plugins: a dylib without a receipt, with a changed hash, or not a 
     const h = sha256Hex("not a dylib");
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.dylib", .data = "not a dylib" });
     var receipt_buf: [256]u8 = undefined;
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.json", .data = try std.fmt.bufPrint(&receipt_buf, "{{\"name\":\"c\",\"kind\":\"model\",\"sha256\":\"{s}\"}}", .{h}) });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.json", .data = try std.fmt.bufPrint(&receipt_buf, "{{\"name\":\"c\",\"kind\":\"model\",\"sha256\":\"{s}\",\"options\":[{{\"name\":\"C_SET\",\"kind\":\"text\"}},{{\"name\":\"C_NEW\",\"kind\":\"text\"}}]}}", .{h}) });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "d.dylib", .data = "off" });
-    var set = try loadDir(testing.io, testing.allocator, root, .{ .enabled = true, .disabled = &.{"d"} }, "pin");
+    // A plugin refused after its options were set leaves the shell's values as they were.
+    try testing.expect(env.setForeign("C_SET", "from the shell"));
+    env.unsetForeign("C_NEW");
+    defer env.unsetForeign("C_SET");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const settings = try std.json.parseFromSliceLeaky(Settings, arena.allocator(),
+        \\{"enabled":true,"disabled":["d"],"options":{"c":{"C_SET":"from the app","C_NEW":"from the app"}}}
+    , .{ .ignore_unknown_fields = true });
+    var set = try loadDir(testing.io, testing.allocator, root, settings, "pin");
     defer set.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), set.plugins.items.len);
     try testing.expectEqual(@as(usize, 3), set.refused.items.len);
     try testing.expectEqualStrings("has no install receipt: install it with `mlx-serve plugin install`", set.refused.items[0].why);
     try testing.expectEqualStrings("changed since it was installed (hash differs from its receipt)", set.refused.items[1].why);
     try testing.expect(std.mem.startsWith(u8, set.refused.items[2].why, "does not load: "));
+    try testing.expectEqualStrings("from the shell", std.mem.span(env.byName("C_SET").?));
+    try testing.expect(env.byName("C_NEW") == null);
 }
 
 test "plugin signature: codesign's report reads as its first authority, ad-hoc or unsigned" {
@@ -617,11 +651,17 @@ test "outside plugins: /props names each plugin loaded or refused, and which a r
     const loaded_now = [_]Plugin{
         .{ .path = "turbo.dylib", .manifest = &m, .sha256 = @splat('0'), .options = &.{.{ .name = "TURBO_FRAC", .value = "0.4" }} },
     };
-    const got = try statusJson(testing.allocator, &loaded_now, &refused);
+    const got = try statusJson(testing.allocator, &loaded_now, &refused, true);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(
         \\[{"name":"turbo","loaded":true,"options":{"TURBO_FRAC":"0.4"}},{"name":"sushi_ds41","loaded":false,"rebuild":true,"why":"plugin was built against another MLX: rebuild it with this release's kit"},{"name":"toy","loaded":false,"rebuild":false,"why":"changed since it was installed (hash differs from its receipt)"}]
     , got);
+    // Off loopback the options are named, never valued.
+    const lan = try statusJson(testing.allocator, &loaded_now, &.{}, false);
+    defer testing.allocator.free(lan);
+    try testing.expectEqualStrings(
+        \\[{"name":"turbo","loaded":true,"options":{"TURBO_FRAC":null}}]
+    , lan);
 }
 
 test "outside plugins: a failed load names the plugins a rebuild would bring back" {
