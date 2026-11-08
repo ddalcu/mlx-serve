@@ -2364,7 +2364,7 @@ pub const HotPrefixCache = struct {
                     {
                         // The resident entry already covers the trim target;
                         // the candidate's EXTRA tokens still belong on disk.
-                        self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps);
+                        self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps, if (disk_spec) specCommits(&new_dflash, &new_mtp) else .{});
                         var discarded = new_snap;
                         discarded.deinit();
                         if (new_dflash) |*d| d.deinit();
@@ -2454,7 +2454,7 @@ pub const HotPrefixCache = struct {
             if (!trimmed_ok) {
                 // RAM decline is not a value verdict: offer the candidate to
                 // the SSD tier before discarding it.
-                self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps);
+                self.spillDeclinedToDisk(&new_snap, disk_tokens, has_tools, disk_media, eff_cps, if (disk_spec) specCommits(&new_dflash, &new_mtp) else .{});
                 var discarded_snap = new_snap;
                 discarded_snap.deinit();
                 if (new_dflash) |*d| d.deinit();
@@ -2736,6 +2736,7 @@ pub const HotPrefixCache = struct {
     /// from the next commit of the same conversation (chunks are
     /// content-deduped by token range). Since v9 a media candidate rides too:
     /// `media` carries the spans the record was keyed under (clamped to it).
+    /// `specs` are the candidate's spec payloads, text-only as on every commit.
     fn spillDeclinedToDisk(
         self: *HotPrefixCache,
         snap: *const KVCacheSnapshot,
@@ -2743,6 +2744,7 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         media: []const MediaSpan,
         cps: ?[]SSMCheckpoint,
+        specs: EntrySpecs,
     ) void {
         const d = if (self.disk) |*dd| dd else return;
         // SSD-first captured the live state as `pending_disk` before the trim; the
@@ -2764,7 +2766,7 @@ pub const HotPrefixCache = struct {
         const saved_cap = d.max_flush_bytes;
         d.max_flush_bytes = @max(saved_cap, kv_disk_cache.DECLINE_SPILL_FLUSH_FLOOR);
         defer d.max_flush_bytes = saved_cap;
-        const outcome = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, null, null, mlx.gpuStream()) catch |err| {
+        const outcome = d.appendCommitWithSpec(snap.entries, snap.step, snap.config, tokens, has_tools, rec_media, cps, specs.dflash, specs.mtp, mlx.gpuStream()) catch |err| {
             log.warn("  [disk-cache] declined-candidate spill failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -2857,16 +2859,17 @@ pub const HotPrefixCache = struct {
         mtp: ?kv_disk_cache.SpecCommit = null,
     };
 
-    /// The disk-tier spec payloads for one RAM entry; the flush and the idle spill must not drift.
-    fn entrySpecCommits(e: *Entry) EntrySpecs {
+    /// The disk-tier spec payloads of a RAM entry, a parked record or a declined candidate;
+    /// every tier write builds them here so none drifts.
+    fn specCommits(dflash: *?DflashSnap, mtp: *?DflashSnap) EntrySpecs {
         return .{
-            .dflash = if (e.dflash) |*df| .{
+            .dflash = if (dflash.*) |*df| .{
                 .entries = df.snapshot.entries,
                 .step = df.snapshot.step,
                 .config = df.snapshot.config,
                 .base_pos = df.base_pos,
             } else null,
-            .mtp = if (e.mtp) |*mm| .{
+            .mtp = if (mtp.*) |*mm| .{
                 .entries = mm.snapshot.entries,
                 .step = mm.snapshot.step,
                 .config = mm.snapshot.config,
@@ -2908,7 +2911,7 @@ pub const HotPrefixCache = struct {
             // so the media-keyed rows are no longer ambiguous on disk. The spec
             // payloads describe rows past the first item under NO media key
             // gate, so they stay text-only rides (same rule as the commit path).
-            const specs: EntrySpecs = if (e.media.len == 0) entrySpecCommits(e) else .{};
+            const specs: EntrySpecs = if (e.media.len == 0) specCommits(&e.dflash, &e.mtp) else .{};
             const outcome = d.appendCommitWithSpec(
                 e.snapshot.entries,
                 e.snapshot.step,
@@ -3063,24 +3066,7 @@ pub const HotPrefixCache = struct {
             slot.* = null;
             return r;
         }
-        const specs: EntrySpecs = .{
-            .dflash = if (p.dflash) |*df| .{
-                .entries = df.snapshot.entries,
-                .step = df.snapshot.step,
-                .config = df.snapshot.config,
-                .base_pos = df.base_pos,
-            } else null,
-            .mtp = if (p.mtp) |*mm| .{
-                .entries = mm.snapshot.entries,
-                .step = mm.snapshot.step,
-                .config = mm.snapshot.config,
-                .base_pos = mm.base_pos,
-                .head_aux = if (mm.head_aux) |*ha| ha else null,
-                .head_pos_base = mm.head_pos_base,
-                .head_marks = mm.head_marks.slice(),
-            } else null,
-        };
-        const r = appendSlice(d, &p.snapshot, p.tokens, p.has_tools, p.media, p.ssm_cps, specs, s);
+        const r = appendSlice(d, &p.snapshot, p.tokens, p.has_tools, p.media, p.ssm_cps, specCommits(&p.dflash, &p.mtp), s);
         if (r == .owed) return r;
         p.deinit(self.allocator);
         slot.* = null;
@@ -3090,7 +3076,7 @@ pub const HotPrefixCache = struct {
     /// One slice of a RAM entry; its flag stays set only while the tier owes it more.
     fn sliceEntry(self: *HotPrefixCache, d: *kv_disk_cache.DiskTier, e: *Entry, s: mlx.mlx_stream) SliceResult {
         // A media entry's spec payloads stay behind (they describe rows past the first item).
-        const r = if (e.module) |m| self.sliceModule(d, m, s) else appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, if (e.media.len == 0) entrySpecCommits(e) else .{}, s);
+        const r = if (e.module) |m| self.sliceModule(d, m, s) else appendSlice(d, &e.snapshot, e.tokens, e.has_tools, e.media, e.ssm_checkpoints, if (e.media.len == 0) specCommits(&e.dflash, &e.mtp) else .{}, s);
         e.disk_dirty = r == .owed or r == .busy;
         return r;
     }
