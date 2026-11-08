@@ -66,8 +66,11 @@ Declared today:
   its close waits for the peer.
 - **K2-Horizon** with a JSON schema keeps thinking off.
 - **A sliding ring drops rows past window + 2048** (`mimo_v2`, `laguna`, `flint`, `kolibri1`, `gpt_oss`, `gemma4`): a
-  prefix-cache hit restores only where the entry still holds the window behind the match (`ringFloor`), and a session
-  that has dropped a row no longer persists to the SSD tier (its chunk files start at position 0).
+  prefix-cache hit restores only where the entry still holds the window behind the match (`ringFloor`), and once a
+  ring has dropped a row the whole session stops persisting to the SSD tier, full layers too (chunk files start at
+  position 0, a restore needs every layer): past about 2.2k tokens on gpt-oss-20b and MiMo, 2.6k on Laguna XS and
+  Gemma 4 E4B, 3.1k on Gemma 4 26B-A4B a session lives in the RAM hot cache only, and an eviction or a restart
+  prefills it cold.
 - **`--kv-attn-mode fused` is a silent no-op on Gemma 4**: sliding layers keep a 512-key ring (under the packed reads'
   2048-key floor) and the hd-512 global layers at GQA 4 overflow the decode kernel's 10 KB threadgroup budget
   (`qkvDecBlockFor`), so every read stays dense (`tests/test_kv_quant_fused_equivalence.sh` defaults to Gemma 4 E4B).

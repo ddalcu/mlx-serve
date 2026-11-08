@@ -516,8 +516,14 @@ test "sliding layers keep a ring: released laguna, gpt_oss and gemma4 configs bi
         // At 128k with an 8192-row chunk the ring is a small fixed term beside the per-token bill.
         const ctx: u64 = 131072;
         try t.expect(slotFixedKvBytes(&cfg, 16, 8192) + c.global * ctx < c.full * ctx / 4 * 3);
-        // A short prompt's ring holds keep + its own rows, not a whole chunk.
-        try t.expectEqual(slotFixedKvBytes(&cfg, 16, 1000), prefillRequestTerms(&cfg, 1000, 256, 16, 8192, .{}).slot_fixed_kv_bytes);
+        // A request's ring holds at most its prompt plus the generation it may add, and keep + its chunk.
+        const keep: u64 = cfg.slidingKeepRows();
+        const omitted: u64 = std.math.maxInt(u32) / 4;
+        for ([_]u64{ 10, 1000 }) |seq| {
+            try t.expectEqual(c.ring_row * (seq + 256), prefillRequestTerms(&cfg, seq, 256, 16, 8192, .{}).slot_fixed_kv_bytes);
+            try t.expectEqual(c.ring_row * (keep + seq), prefillRequestTerms(&cfg, seq, omitted, 16, 8192, .{}).slot_fixed_kv_bytes);
+        }
+        try t.expectEqual(slotFixedKvBytes(&cfg, 16, 8192), prefillRequestTerms(&cfg, 100_000, 256, 16, 8192, .{}).slot_fixed_kv_bytes);
     }
 }
 

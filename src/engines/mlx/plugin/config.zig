@@ -149,6 +149,10 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
         a.destroy(b);
         return .{ .declined = v.why.slice() };
     }
+    if (!ringCoversWindows(table, &b.parsed)) {
+        b.destroy(a);
+        return .{ .declined = "sliding ring narrower than a sliding window" };
+    }
     // The engine reads an embedding pack's pooling from its folder name, which `parse` never sees: an encoder serves
     // under that config's pooling, a decoder only where its plugin serves the embedding batch.
     if (!b.parsed.caps.embed and !served.servesDecoderEmbedding(model_type) and model.poolingFromDirName(std.fs.path.basename(model_dir), model_type) != null) {
@@ -284,6 +288,17 @@ pub fn applyLayout(c: *ModelConfig, table: *const abi.ModelTable, p: *const abi.
     c.sliding_window = window;
 }
 
+/// A declared `CacheFacts.sliding_ring` keeps at least the widest sliding window: a narrower ring drops keys the
+/// layer still reads.
+fn ringCoversWindows(table: *const abi.ModelTable, p: *const abi.Parsed) bool {
+    if (p.cache.sliding_ring == 0) return true;
+    const layout = table.cache.layout orelse return true;
+    var buf: [128]abi.LayerCache = undefined;
+    const n = layout(p, null, &buf, buf.len);
+    for (buf[0..n]) |l| if (l.kind == .sliding and l.window > p.cache.sliding_ring) return false;
+    return true;
+}
+
 // ── tests ──
 
 const testing = std.testing;
@@ -327,6 +342,22 @@ test "plugin config: the cache layout sets the sliding window, the global layers
     var plain = modelConfig(&.{});
     applyLayout(&plain, &t, &.{ .shell = .{ .num_hidden_layers = 0 } });
     try testing.expect(!plain.scale_embeddings);
+}
+
+test "plugin config: a sliding ring must hold every sliding layer's window" {
+    const T = struct {
+        fn layout(_: *const abi.Parsed, _: ?*const abi.LayerSpan, out: [*]abi.LayerCache, cap: u32) callconv(.c) u32 {
+            const ls = [_]abi.LayerCache{ .{ .kind = .sliding, .window = 512 }, .{ .kind = .full }, .{ .kind = .sliding, .window = 1024 } };
+            const n = @min(cap, ls.len);
+            @memcpy(out[0..n], ls[0..n]);
+            return n;
+        }
+    };
+    const t: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{ .layout = &T.layout }, .weights = undefined };
+    for ([_]struct { ring: u32, ok: bool }{ .{ .ring = 0, .ok = true }, .{ .ring = 1024, .ok = true }, .{ .ring = 3072, .ok = true }, .{ .ring = 1023, .ok = false }, .{ .ring = 512, .ok = false } }) |c| {
+        const p: abi.Parsed = .{ .shell = .{ .num_hidden_layers = 3 }, .cache = .{ .sliding_ring = c.ring } };
+        try testing.expectEqual(c.ok, ringCoversWindows(&t, &p));
+    }
 }
 
 test "plugin config: a served model's facts layer on the legacy config; an unset fact keeps the legacy arm" {
