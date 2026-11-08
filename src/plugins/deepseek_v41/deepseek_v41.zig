@@ -1889,7 +1889,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         }
         // Logged on every rank: ranks that disagree hang in rank 0's first gather.
         if (opts.tp) |t| if (m.head_part) |p| {
-            log.info("deepseek_v41: tensor rank {d} of {d} projects lm head rows [{d}, {d}) of {d} (DSV41_VOCAB_HEAD=0 keeps it whole on rank 0)\n", .{ t.rank, t.size, p.lo, p.hi, m.vocab });
+            const bits: u32 = if (p.lin.s.ctx != null) p.lin.qp.bits else 16;
+            log.info("deepseek_v41: tensor rank {d} of {d} projects lm head rows [{d}, {d}) of {d}, {d}-bit (DSV41_VOCAB_HEAD=0 keeps it whole on rank 0)\n", .{ t.rank, t.size, p.lo, p.hi, m.vocab, bits });
         } else if (t.size > 1) log.info("deepseek_v41: tensor rank {d} of {d}: lm head whole on rank 0 (DSV41_VOCAB_HEAD=0)\n", .{ t.rank, t.size });
         m.norm = try ownCast(m, try getW(w, "norm.weight", .{}), m.act);
     }
@@ -10040,60 +10041,59 @@ test "dsv41 vocab head: tensor ranks split the head unless DSV41_VOCAB_HEAD=0; u
     try testing.expectEqual([3]usize{ 86188, 129280, 43094 }, [3]usize{ t3.lo, t3.hi, t3.rows });
 }
 
+/// A model shell holding only what the LM head reads, its head loaded from its own weights map as `init` loads it.
+const HeadShell = struct {
+    m: Dsv41Model,
+    w: Weights,
+
+    fn init(sh: *HeadShell, head: A, norm: A, q8: bool) !void {
+        sh.w = Weights.init(testing.allocator);
+        var o = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&o, head);
+        try sh.w.put("head.weight", o);
+        sh.m = undefined;
+        sh.m.gpa = testing.allocator;
+        sh.m.s = mlx.gpuStream();
+        sh.m.vocab = dim(head, 0);
+        sh.m.owned = .empty;
+        sh.m.cfg = .{};
+        sh.m.cfg.rms_norm_eps = 1e-6;
+        sh.m.norm = norm;
+        sh.m.head_part = null;
+        sh.m.quant = null;
+        sh.m.head = try getLin(&sh.m, &sh.w, dim(head, 1), "head", .{});
+        if (q8) sh.m.head = try quantizeLin(&sh.m, &sh.w, sh.m.head, 8, 64);
+    }
+
+    fn deinit(sh: *HeadShell) void {
+        for (sh.m.owned.items) |x| _ = mlx.mlx_array_free(x);
+        sh.m.owned.deinit(testing.allocator);
+        sh.w.deinit();
+    }
+};
+
+/// N(mean, sd) bf16 of `shape` from seed `seed`, evaluated (the scope frees it).
+fn bfRandom(sc: *Scope, seed: u64, shape: []const c_int, mean: f32, sd: f32) !A {
+    var k = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_random_key(&k, seed));
+    _ = try sc.keep(k);
+    var o = mlx.mlx_array_new();
+    const r = try sc.res(mlx.mlx_random_normal(&o, shape.ptr, shape.len, .bfloat16, mean, sd, k, sc.s), &o);
+    try mlx.check(mlx.mlx_array_eval(r));
+    return r;
+}
+
 test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole head's logits bit for bit, dense and 8-bit" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
-    const s = mlx.gpuStream();
     // Uneven at 2, 3 and 4 ranks, so the last rank's part is padded every time.
     const V: usize = 1027;
     const D: usize = 256;
-    var sc = Scope.init(gpa, s);
+    var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
-    const rand = struct {
-        fn of(scope: *Scope, k: A, shape: []const c_int, mean: f32, sd: f32) !A {
-            var o = mlx.mlx_array_new();
-            const r = try scope.res(mlx.mlx_random_normal(&o, shape.ptr, shape.len, .bfloat16, mean, sd, k, scope.s), &o);
-            try mlx.check(mlx.mlx_array_eval(r));
-            return r;
-        }
-    }.of;
-    var kk: [3]A = undefined;
-    for (&kk, 0..) |*k, i| {
-        k.* = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_random_key(k, 7 + i));
-        _ = try sc.keep(k.*);
-    }
-    const dense = try rand(&sc, kk[0], &.{ ci(V), ci(D) }, 0, 0.05);
-    const norm = try rand(&sc, kk[1], &.{ci(D)}, 1, 0.1);
-    const hs = try rand(&sc, kk[2], &.{ 6, ci(D) }, 0, 1);
-    const eps: f32 = 1e-6;
-    // A model shell holding only what the head reads, its head loaded from its own weights map as `init` loads it.
-    const Shell = struct {
-        m: Dsv41Model,
-        w: Weights,
-        fn init(sh: *@This(), head: A, nw: A, q8: bool) !void {
-            sh.w = Weights.init(testing.allocator);
-            var o = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&o, head);
-            try sh.w.put("head.weight", o);
-            sh.m = undefined;
-            sh.m.gpa = testing.allocator;
-            sh.m.s = mlx.gpuStream();
-            sh.m.vocab = V;
-            sh.m.owned = .empty;
-            sh.m.cfg = .{};
-            sh.m.cfg.rms_norm_eps = eps;
-            sh.m.norm = nw;
-            sh.m.head_part = null;
-            sh.m.head = try getLin(&sh.w, D, "head", .{});
-            if (q8) sh.m.head = try quantizeLin(&sh.m, &sh.w, sh.m.head, 8, 64);
-        }
-        fn deinit(sh: *@This()) void {
-            for (sh.m.owned.items) |x| _ = mlx.mlx_array_free(x);
-            sh.m.owned.deinit(testing.allocator);
-            sh.w.deinit();
-        }
-    };
+    const dense = try bfRandom(&sc, 7, &.{ ci(V), ci(D) }, 0, 0.05);
+    const norm = try bfRandom(&sc, 8, &.{ci(D)}, 1, 0.1);
+    const hs = try bfRandom(&sc, 9, &.{ 6, ci(D) }, 0, 1);
     // The all-gather: every rank's part stacked on axis 0, the calling rank's own in its slot.
     const Gather = struct {
         var parts: [4]A = undefined;
@@ -10112,13 +10112,13 @@ test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole 
     clusterHooks().tp_gather = &Gather.gather;
     defer clusterHooks().tp_gather = null;
     for ([_]bool{ false, true }) |q8| {
-        var whole: Shell = undefined;
+        var whole: HeadShell = undefined;
         try whole.init(dense, norm, q8);
         defer whole.deinit();
         for ([_]usize{ 2, 3, 4 }) |n| {
             // Rank 0 cuts views of its whole head (quantized first, as `init` does); a worker cuts the dense rows and
             // quantizes only those.
-            var ranks: [4]Shell = undefined;
+            var ranks: [4]HeadShell = undefined;
             var made: usize = 0;
             defer for (ranks[0..made]) |*r| r.deinit();
             for (ranks[0..n], 0..) |*r, i| {
@@ -10135,7 +10135,7 @@ test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole 
                 defer gpa.free(want);
                 try testing.expectEqual(L * V, want.len);
                 for (ranks[0..n], 0..) |*r, i| {
-                    Gather.parts[i] = try vocabPart(&sc, &r.m.head_part.?, try sc.rms(h, norm, eps));
+                    Gather.parts[i] = try vocabPart(&sc, &r.m.head_part.?, try sc.rms(h, norm, whole.m.cfg.rms_norm_eps));
                     // The gather carries the head's bf16 output: the f32 logits are only its widening.
                     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(Gather.parts[i]));
                 }
@@ -10145,6 +10145,49 @@ test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole 
                     defer gpa.free(got);
                     try testing.expectEqualSlices(f32, want, got);
                 }
+            }
+        }
+    }
+}
+
+test "dsv41 bench: the release's LM head whole, as rank 0's view of a quarter, and as a worker's own quarter (DSV41_BENCH_VOCAB)" {
+    if (std.c.getenv("DSV41_BENCH_VOCAB") == null) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const iou = @import("../../sdk/util/io_util.zig");
+    var sc = Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const dense = try bfRandom(&sc, 1, &.{ 129280, 5120 }, 0, 0.02);
+    const norm = try bfRandom(&sc, 2, &.{5120}, 1, 0.1);
+    const hs = try bfRandom(&sc, 3, &.{ 16, 5120 }, 0, 1);
+    const iters = 100;
+    for ([_]bool{ true, false }) |q8| {
+        var r0: HeadShell = undefined;
+        try r0.init(dense, norm, q8);
+        defer r0.deinit();
+        var r3: HeadShell = undefined;
+        try r3.init(dense, norm, false);
+        defer r3.deinit();
+        const view = try headPart(&r0.m, &r0.w, r0.m.head, .{ .rank = 0, .size = 4 }, true, q8);
+        const own = try headPart(&r3.m, &r3.w, r3.m.head, .{ .rank = 3, .size = 4 }, false, q8);
+        for ([_]usize{ 1, 16 }) |L| {
+            const h = try sc.rms(try sc.slice(hs, 0, 0, L), norm, 1e-6);
+            try evalAll(&.{h});
+            for ([_][]const u8{ "whole", "rank-0 view", "worker own" }, 0..) |name, arm| {
+                var us: f64 = 0;
+                for (0..iters + 10) |it| {
+                    var inner = Scope.init(gpa, mlx.gpuStream());
+                    defer inner.deinit();
+                    const t0 = iou.nowUsMonotonic(io);
+                    const y = switch (arm) {
+                        0 => try r0.m.head.apply(&inner, h),
+                        1 => try vocabPart(&inner, &view, h),
+                        else => try vocabPart(&inner, &own, h),
+                    };
+                    try evalAll(&.{y});
+                    if (it >= 10) us += @floatFromInt(iou.nowUsMonotonic(io) - t0);
+                }
+                std.debug.print("[vocab] {s} head, {d} rows, {s}: {d:.1} us\n", .{ if (q8) "8-bit" else "dense bf16", L, name, us / iters });
             }
         }
     }
