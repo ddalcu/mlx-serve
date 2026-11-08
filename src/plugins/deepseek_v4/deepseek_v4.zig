@@ -825,8 +825,17 @@ fn transposedF32(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var f = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f);
     try mlx.check(mlx.mlx_astype(&f, w, .float32, s));
+    // A DSpark head can arrive as a 1-D row (the confidence projection of a
+    // converted sidecar does): read it as one row so it transposes to the
+    // column the consumer multiplies against.
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    const src: mlx.mlx_array = if (mlx.mlx_array_ndim(f) == 1) blk: {
+        try mlx.check(mlx.mlx_expand_dims(&row, f, 0, s));
+        break :blk row;
+    } else f;
     var tr = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_transpose(&tr, f, s));
+    try mlx.check(mlx.mlx_transpose(&tr, src, s));
     try mlx.check(mlx.mlx_array_eval(tr));
     return tr;
 }
@@ -9165,6 +9174,19 @@ test "dsv4 clippedSwigluG: the SDK clamped SwiGLU in f32 gives the bytes the plu
     try mlx.check(mlx.mlx_array_eval(got));
     const gb = @as([*]const u8, @ptrCast(mlx.mlx_array_data_bfloat16(got).?))[0 .. 2 * 64 * 96];
     try std.testing.expectEqual(@as(u64, 0xdb0cdacd4c0f33e9), std.hash.Wyhash.hash(0, gb));
+}
+
+test "dsv4: a 1-D DSpark head transposes to a column" {
+    var vals = [_]f32{ 1, 2, 3, 4 };
+    const shape = [_]c_int{4};
+    const w = mlx.mlx_array_new_data(&vals, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    const s = if (!mlx.noGpuBackend()) mlx.gpuStream() else mlx.mlx_default_cpu_stream_new();
+    const t = try transposedF32(w, s);
+    defer _ = mlx.mlx_array_free(t);
+    try std.testing.expectEqual(@as(usize, 2), mlx.mlx_array_ndim(t));
+    try std.testing.expectEqual(@as(c_int, 4), mlx.mlx_array_shape(t)[0]);
+    try std.testing.expectEqual(@as(c_int, 1), mlx.mlx_array_shape(t)[1]);
 }
 
 /// A test config through the plugin's own parse (the engine's parse, field for field: `model_config.zig`).
