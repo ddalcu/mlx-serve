@@ -8,6 +8,11 @@
 // the GPU runs side by side. This primitive is that launch, bound as MLX's `qmv()` binds it (quantized.cpp), against
 // the pinned MLX's metallib: no MLX change, no source compiled at run time. Batched (`[B, M, K]` against `[B, N, K']`)
 // as MLX's `_batch_1` kernel (wo_a's groups). Included by mlx_alloc_shim.cpp (a fixed list of csrc files).
+//
+// A workaround for how the pinned MLX dispatches M > 1. It binds MLX internals: the `qmv_fast` kernel's name, its
+// buffer order and its tile (`results_per_simdgroup = 4`). decode/exact_test.zig's row-qmv bit test (the default suite,
+// on a real GPU) fails when an MLX bump changes them. It goes away once MLX's quantized_matmul is row-invariant (M rows
+// give each row its M = 1 bits) or MLX dispatches `qmv_fast` over M rows itself.
 #include <optional>
 #include <string>
 #include <vector>

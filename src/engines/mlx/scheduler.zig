@@ -1209,7 +1209,7 @@ pub fn batchVerdict(self: *const Scheduler, slot: *const Slot) BatchVerdict {
     if (slot.logprobs_n > 0) return .logprobs;
     if (slot.sampling.penalized()) return .penalty;
     const cfg = slot.model.config orelse return .arch;
-    // A DeepSeek-V4.1 model under MLX_SERVE_DSV41_EXACT_SOLO decodes every request alone: a batched row's bits depend
+    // A DeepSeek-V4.1 model under MLX_SERVE_DSV41_EXACT=solo decodes every request alone: a batched row's bits depend
     // on its company, and the mode promises each request its solo plain decode's tokens.
     if (slot.model.transformer) |t| if (@import("spec/dspark_group.zig").exactSolo(t)) return .arch;
     if (modelBatchable(cfg)) return .ok;

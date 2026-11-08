@@ -7,7 +7,10 @@
 //! NAX GPU (M5) takes other kernels than an M3 (`Dec.init`), and exact holds only on the non-NAX ones.
 //!
 //! `DSV41_EXACT_GATE=1` runs it; `DSV41_EXACT_GATE_OFF=1` (the same run with exact off) prints how far today's verify
-//! is from the plain steps instead of asserting.
+//! is from the plain steps instead of asserting, and `DSV41_EXACT_GATE_BATCHED` (a comma list of tail, engram, head,
+//! argmax) leaves those parts on the batched kernels. The row-qmv bit test below runs in the default suite on a real
+//! GPU: it pins the MLX internals `Dsv41RowQmv` binds (csrc/dsv41_row_qmv.inc), so an MLX bump that changes them
+//! fails it.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -189,7 +192,7 @@ fn runGate(exact_on: bool) !Tally {
     for (ranges) |rg| for (rg.p0s) |p0| {
         const fx = try fixture.Fixture.init(gpa, .{ .lo = rg.lo, .hi = rg.hi, .ctx = p0 - 1, .seed = 7 + p0, .act = .bfloat16, .fused = true });
         defer fx.deinit();
-        fx.m.exact = .{ .on = exact_on };
+        fx.m.exact = dsv41.exactBatched(.{ .on = exact_on }, env.get(.DSV41_EXACT_GATE_BATCHED));
         fx.m.exact_pair_ok = true;
         // One plain step to p0 with a snapshot there: every case rewinds to it.
         {
@@ -256,8 +259,9 @@ fn sliceAxis(x: A, axis: usize, lo: usize, hi: usize) !A {
     return o;
 }
 
-test "dsv41 exact: the one-row kernel over R rows gives each row's one-row quantized_matmul bits (DSV41_EXACT_GATE)" {
-    if (env.get(.DSV41_EXACT_GATE) == null) return error.SkipZigTest;
+test "dsv41 exact: the one-row kernel over R rows gives each row's one-row quantized_matmul bits" {
+    // Default suite, on a real GPU: `Dsv41RowQmv` binds the pinned MLX's `qmv_fast` pipeline by name, buffer order and
+    // tile, so this is what turns red when an MLX bump changes any of them.
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     // The release's quantized projections a verify row runs: the 8-bit head, wo_b, the Engram's wkv, the grouped wo_a;

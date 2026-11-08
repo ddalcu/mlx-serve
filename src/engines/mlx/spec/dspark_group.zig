@@ -42,7 +42,7 @@ pub fn groupable(xfm: *const Transformer) bool {
     return m.dspark != null and m.pair == null and m.streamed == null and !dsv41_mod.exactServes(m);
 }
 
-/// Whether `xfm` keeps every request solo under exact (`MLX_SERVE_DSV41_EXACT_SOLO`, `dsv41.exactSolo`): the scheduler
+/// Whether `xfm` keeps every request solo under exact (`MLX_SERVE_DSV41_EXACT=solo`, `dsv41.exactSolo`): the scheduler
 /// batches none of its decode and its DSpark slots keep drafting beside company.
 pub fn exactSolo(xfm: *const Transformer) bool {
     const m = intree.dsv41(xfm) orelse return false;

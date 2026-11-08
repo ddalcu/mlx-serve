@@ -723,8 +723,8 @@ fn head8From(v: ?[*:0]const u8) bool {
 
 /// `MLX_SERVE_DSV41_EXACT=1`: a DSpark verify row runs the kernels a plain step runs, so a greedy drafted request emits
 /// plain decode's tokens bit for bit, whatever the round schedule; plain decode itself is untouched. Copy verifies are
-/// cut to the decode-width rows (`maxVerifyDrafts`). `MLX_SERVE_DSV41_EXACT_OFF` (a comma list of the parts below)
-/// leaves parts on the batched kernels, to measure what each one contributes.
+/// cut to the decode-width rows (`maxVerifyDrafts`). The parts below are all on when exact is; only the gate
+/// (`decode/exact_test.zig`, `DSV41_EXACT_GATE_BATCHED`) leaves some on the batched kernels, to measure each one.
 pub const Exact = struct {
     on: bool = false,
     /// Each verify row's attention, attn_out and FFN as the plain step at its position runs them (`blockFusedRows`).
@@ -735,26 +735,42 @@ pub const Exact = struct {
     head: bool = true,
     /// The greedy accept masks the ids the serial sampler masks (`Dsv41Model.suppress`).
     argmax: bool = true,
-    /// `MLX_SERVE_DSV41_EXACT_SOLO=1`: every request on the model ticks alone, whatever company it has. Nothing batches
+    /// `MLX_SERVE_DSV41_EXACT=solo`: every request on the model ticks alone, whatever company it has. Nothing batches
     /// its decode, and its DSpark slots keep drafting instead of yielding to the plain batch, so each request's tokens
     /// are its solo plain decode's at any load (`exactSolo`). Off: exact covers one request at a time.
     solo: bool = false,
 };
 
 pub fn exactWanted() Exact {
-    var e = exactFrom(env.get(.MLX_SERVE_DSV41_EXACT), env.get(.MLX_SERVE_DSV41_EXACT_OFF));
-    const solo = env.get(.MLX_SERVE_DSV41_EXACT_SOLO);
-    e.solo = solo != null and solo.?[0] != 0 and solo.?[0] != '0';
-    return e;
+    return exactFrom(env.get(.MLX_SERVE_DSV41_EXACT));
 }
 
-fn exactFrom(on: ?[*:0]const u8, off: ?[*:0]const u8) Exact {
-    var e: Exact = .{ .on = on != null and on.?[0] != 0 and on.?[0] != '0' };
-    var it = std.mem.tokenizeScalar(u8, std.mem.span(off orelse return e), ',');
+/// `MLX_SERVE_DSV41_EXACT`: unset, empty or `0` off; `solo` on and solo; any other value on.
+fn exactFrom(v: ?[*:0]const u8) Exact {
+    const t = std.mem.trim(u8, std.mem.span(v orelse return .{}), " ");
+    if (t.len == 0 or std.mem.eql(u8, t, "0")) return .{};
+    return .{ .on = true, .solo = std.mem.eql(u8, t, "solo") };
+}
+
+/// `e` with the parts named in `parts` (a comma list of tail, engram, head, argmax) left on the batched kernels: the
+/// gate's `DSV41_EXACT_GATE_BATCHED`, to measure what each part contributes.
+pub fn exactBatched(e: Exact, parts: ?[*:0]const u8) Exact {
+    var out = e;
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(parts orelse return out), ',');
     while (it.next()) |part| inline for (.{ "tail", "engram", "head", "argmax" }) |name| {
-        if (std.mem.eql(u8, std.mem.trim(u8, part, " "), name)) @field(e, name) = false;
+        if (std.mem.eql(u8, std.mem.trim(u8, part, " "), name)) @field(out, name) = false;
     };
-    return e;
+    return out;
+}
+
+test "dsv41 exact: MLX_SERVE_DSV41_EXACT values" {
+    try std.testing.expect(!exactFrom(null).on);
+    try std.testing.expect(!exactFrom("").on);
+    try std.testing.expect(!exactFrom("0").on);
+    try std.testing.expect(exactFrom("1").on and !exactFrom("1").solo);
+    try std.testing.expect(exactFrom("solo").on and exactFrom("solo").solo);
+    const b = exactBatched(exactFrom("1"), "head, argmax");
+    try std.testing.expect(b.on and b.tail and b.engram and !b.head and !b.argmax);
 }
 
 /// The expert stream's shim's one-row-kernel launch (csrc/dsv41_row_qmv.inc), on the macOS graphs that compile the
@@ -1925,7 +1941,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     }
     if (m.exact.on) {
         var ab: [64]u8 = undefined;
-        log.info("deepseek_v41: exact DSpark verify (MLX_SERVE_DSV41_EXACT) on {s} (NAX {any}): tail={any} engram={any} head={any} argmax={any} solo={any}; copy verifies cut to {d} drafts\n", .{ device.gpuArchitecture(&ab) orelse "?", device.naxAvailable(), m.exact.tail, m.exact.engram, m.exact.head, m.exact.argmax, m.exact.solo, dkern.max_rows - 1 });
+        log.info("deepseek_v41: exact DSpark verify (MLX_SERVE_DSV41_EXACT) on {s} (NAX {any}): solo={any}; copy verifies cut to {d} drafts\n", .{ device.gpuArchitecture(&ab) orelse "?", device.naxAvailable(), m.exact.solo, dkern.max_rows - 1 });
     }
     if (n_stages > 0) {
         for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
@@ -2898,6 +2914,12 @@ fn hcExpandNormScratch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const 
 }
 
 /// Collapse the hc copies `[L, hc, D]` with `pre` `[L, hc]`, in f32.
+pub fn hcCollapse(sc: *Scope, x: A, pre: A) !A {
+    const w = try sc.expand(pre, 1); // [L, 1, hc]
+    const y = try sc.matmul(w, try sc.astype(x, .float32)); // [L, 1, D]
+    return sc.astype(try sc.reshape(y, &.{ ci(dim(x, 0)), ci(dim(x, 2)) }), mlx.mlx_array_dtype(x));
+}
+
 /// The f32 logits of each final hidden row `h` [L, dim] on its own, as a plain step's one row (`Exact.head`).
 fn headRows(sc: *Scope, m: *const Dsv41Model, h: A) !A {
     const L = dim(h, 0);
@@ -2908,12 +2930,6 @@ fn headRows(sc: *Scope, m: *const Dsv41Model, h: A) !A {
     if (try rowQmv(sc, &m.head, try sc.concat(ys[0..L], 0))) |lg| return sc.astype(lg, .float32);
     for (ys[0..L]) |*y| y.* = try sc.astype(try m.head.apply(sc, y.*), .float32);
     return sc.concat(ys[0..L], 0);
-}
-
-pub fn hcCollapse(sc: *Scope, x: A, pre: A) !A {
-    const w = try sc.expand(pre, 1); // [L, 1, hc]
-    const y = try sc.matmul(w, try sc.astype(x, .float32)); // [L, 1, D]
-    return sc.astype(try sc.reshape(y, &.{ ci(dim(x, 0)), ci(dim(x, 2)) }), mlx.mlx_array_dtype(x));
 }
 
 /// `out[k] = post[k] * y + sum_j comb[j, k] * x[j]` — the new stream.
@@ -4572,6 +4588,12 @@ fn routedOutside(sc: *Scope, m: *const Dsv41Model, e: *const [3]outside.Weight, 
 /// The gated write of the n-gram rows into the stream `[L, hc, dim]`: `wkv`
 /// turns the rows into one key per copy plus a shared value, and the gate is
 /// sigmoid of the signed sqrt of a per-copy normalized stream-key dot.
+pub fn engramApply(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A) !A {
+    const kv = try engramWkv(sc, e, try sc.astype(rows, m.act));
+    if (mlx.streamIsGpu(sc.s)) return engramGate(sc, m, e.qk, x, kv);
+    return engramGateOps(sc, m, e.qk, x, kv);
+}
+
 /// `engramApply` over each row on its own, as the plain step at the row's position projects it (`Exact.engram`).
 fn engramRows(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A) !A {
     const L = dim(x, 0);
@@ -4584,12 +4606,6 @@ fn engramRows(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, row
     else
         try engramApply(sc, m, e, try sc.slice(x, 0, l, l + 1), try sc.slice(rows, 0, l, l + 1));
     return sc.concat(ys[0..L], 0);
-}
-
-pub fn engramApply(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A) !A {
-    const kv = try engramWkv(sc, e, try sc.astype(rows, m.act));
-    if (mlx.streamIsGpu(sc.s)) return engramGate(sc, m, e.qk, x, kv);
-    return engramGateOps(sc, m, e.qk, x, kv);
 }
 
 /// the widest Engram wkv call the gemv twin takes (a decode lane's verify; the decode-width
