@@ -5466,6 +5466,66 @@ test "HotPrefixCache: a budget-declined candidate spills to the SSD tier" {
     }
 }
 
+test "HotPrefixCache: a budget-declined candidate spills to the SSD tier with its dflash and mtp sidecars" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // A RAM budget below the commit floor declines the candidate, so only the spill writes it.
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 16 * 1024);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spill-spec", 0, 128);
+        defer hc.deinit();
+
+        var trunk = try KVCache.init(testing.allocator, 2);
+        defer trunk.deinit();
+        try testFillCache(&trunk, s, 2, 600);
+        var assist = try KVCache.init(testing.allocator, 2);
+        defer assist.deinit();
+        try testFillCache(&assist, s, 2, 600);
+        var hist = try KVCache.init(testing.allocator, 1);
+        defer hist.deinit();
+        try testFillCache(&hist, s, 1, 600);
+
+        const st = try hc.commitWithSsm(&trunk, &tokens, false, null, .{ .cache = &assist, .base_pos = 0 }, .{ .cache = &hist, .base_pos = 0 });
+        try testing.expect(st == .declined);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+        try testing.expect(hc.disk.?.entries.items[0].spec_dflash != null);
+        try testing.expect(hc.disk.?.entries.items[0].spec_mtp != null);
+    }
+
+    // A fresh process restores the prefix and both spec caches from the SSD tier.
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-spill-spec", 0, 128);
+        defer hc2.deinit();
+
+        var trunk2 = try KVCache.init(testing.allocator, 2);
+        defer trunk2.deinit();
+        var dfl = try KVCache.init(testing.allocator, 2);
+        defer dfl.deinit();
+        var mtp_dst = try KVCache.init(testing.allocator, 1);
+        defer mtp_dst.deinit();
+        var moe_off: usize = 0;
+        var dbase: usize = 99;
+        var mbase: usize = 99;
+        const res = try hc2.lookupAndRestore(&trunk2, &moe_off, null, s, &tokens, false, &.{}, .{ .cache = &dfl, .base_pos = &dbase }, .{ .cache = &mtp_dst, .base_pos = &mbase });
+        try testing.expect(res.full_match);
+        try testing.expectEqual(@as(usize, 599), res.matched);
+        try testing.expectEqual(@as(?usize, 0), res.dflash_base);
+        try testing.expectEqual(@as(usize, 599), dfl.step);
+        try testing.expectEqual(@as(?usize, 0), res.mtp_base);
+        try testing.expectEqual(@as(usize, 599), mtp_dst.step);
+    }
+}
+
 test "HotPrefixCache: a decline-spill is not bounded by the per-flush byte cap" {
     // The per-flush cap bounds the stall a LIVE next request pays after a
     // response. A decline-spill runs on a request whose client is already
