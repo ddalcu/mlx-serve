@@ -461,9 +461,10 @@ pub const Forward = extern struct {
     progress: ?*u64 = null,
     /// Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged.
     ablation: ?*const Ablation = null,
-    /// A whole-prompt prefill (`Caps.whole_prompt_prefill`): the absolute positions where the engine's chunk loop would
-    /// end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only
-    /// when `size` reaches it: an older host's `Forward` ends before it.
+    /// A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's
+    /// restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its
+    /// spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size`
+    /// reaches it: an older host's `Forward` ends before it.
     prompt_spans: Span(u64) = .{},
     /// The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending,
     /// each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it.

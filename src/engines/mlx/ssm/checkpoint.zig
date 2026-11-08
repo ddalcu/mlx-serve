@@ -194,12 +194,8 @@ pub const PromptCheckpoints = struct {
         }
         // The copies evaluate in one batch, so no checkpoint keeps the forward's graph alive.
         _ = mlx.mlx_eval(vec);
-        try self.list.append(self.allocator, cp);
+        try fileCheckpoint(self.allocator, self.list, cp, self.max, self.thin, self.low_anchors);
         self.next += 1;
-        if (self.max > 0 and self.list.items.len > self.max) {
-            var dropped = self.list.orderedRemove(ssmCheckpointDropIndexLowAnchored(self.list.items, self.thin, null, self.low_anchors));
-            dropped.deinit(self.allocator);
-        }
     }
 };
 
@@ -373,6 +369,17 @@ pub fn ssmCheckpointDropIndexLowAnchored(
     low_anchors: usize,
 ) usize {
     return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, low_anchors);
+}
+
+/// Files `cp` on a prefill's checkpoint list and thins the list past `max` (0 = no cap): the one store-and-thin
+/// every prefill site runs (the chunk loop's captures, `PromptCheckpoints.file`). The list owns `cp` once this
+/// returns; on an error the caller still does.
+pub fn fileCheckpoint(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), cp: SSMCheckpoint, max: usize, thin: ThinPolicy, low_anchors: usize) !void {
+    try list.append(allocator, cp);
+    if (max > 0 and list.items.len > max) {
+        var dropped = list.orderedRemove(ssmCheckpointDropIndexLowAnchored(list.items, thin, null, low_anchors));
+        dropped.deinit(allocator);
+    }
 }
 
 /// `spanPreservingDropIndex` over a bare ascending position list.
@@ -799,4 +806,44 @@ test "prompt checkpoints: past the cap, a whole-prompt prefill's filing thins th
     try testing.expectEqual(@as(usize, 2), list.items.len);
     try testing.expectEqual(@as(usize, 8192), list.items[0].pos);
     try testing.expectEqual(@as(usize, 12_288), list.items[1].pos);
+
+    // The long-context archs' rule: span-preserving with a dense newest quarter, the low anchors kept.
+    var gated: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (gated.items) |*cp| cp.deinit(testing.allocator);
+        gated.deinit(testing.allocator);
+    }
+    var planned: [12]u64 = undefined;
+    for (&planned, 1..) |*p, i| p.* = 1000 * i;
+    var pg: PromptCheckpoints = .{ .allocator = testing.allocator, .list = &gated, .positions = &planned, .layers = 1, .s = s, .max = 8, .thin = .min_span_recency, .low_anchors = 2 };
+    for (planned) |p| try pg.file(p, &.{});
+    try testing.expectEqual(@as(usize, 8), gated.items.len);
+    var kept: [8]usize = undefined;
+    for (gated.items, &kept) |cp, *k| k.* = cp.pos;
+    try testing.expectEqualSlices(usize, &.{ 1000, 2000, 4000, 6000, 8000, 10_000, 11_000, 12_000 }, &kept);
+}
+
+// Bar: past the cap, the one store-and-thin keeps each policy's survivors and its low anchors.
+test "prompt checkpoints: fileCheckpoint thins past the cap by the policy, low anchors kept" {
+    const Case = struct { thin: ThinPolicy, low_anchors: usize, kept: [8]usize };
+    const cases = [_]Case{
+        .{ .thin = .oldest, .low_anchors = 2, .kept = .{ 1000, 2000, 7000, 8000, 9000, 10_000, 11_000, 12_000 } },
+        .{ .thin = .min_span, .low_anchors = 0, .kept = .{ 1000, 3000, 5000, 7000, 9000, 10_000, 11_000, 12_000 } },
+        .{ .thin = .min_span_recency, .low_anchors = 2, .kept = .{ 1000, 2000, 4000, 6000, 8000, 10_000, 11_000, 12_000 } },
+    };
+    for (cases) |c| {
+        var list: std.ArrayList(SSMCheckpoint) = .empty;
+        defer {
+            for (list.items) |*cp| cp.deinit(testing.allocator);
+            list.deinit(testing.allocator);
+        }
+        for (1..13) |i| {
+            const cp: SSMCheckpoint = .{ .pos = 1000 * i, .layers = try testing.allocator.alloc(SSMCacheEntrySnapshot, 0) };
+            try fileCheckpoint(testing.allocator, &list, cp, 8, c.thin, c.low_anchors);
+        }
+        try testing.expectEqual(@as(usize, 8), list.items.len);
+        var kept: [8]usize = undefined;
+        for (list.items, &kept) |cp, *k| k.* = cp.pos;
+        try testing.expectEqualSlices(usize, &c.kept, &kept);
+    }
 }
