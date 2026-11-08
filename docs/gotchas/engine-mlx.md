@@ -1160,7 +1160,8 @@ replay. Guard: `tests/test_mimo_v2.sh` [9].
 Defect: 87% of MiMo's 222 KB/token KV was sliding rows attention never reads; at the app's 1M context the bill left no
 hot cache and an 88k agent turn re-prefilled every turn (~38 s). Fix: `slidingRing` keeps window + slack rows per
 sliding layer (`KVCache.updateSliding`, absolute `offset` via `entry.base`), billed once per slot; a ring cannot
-rewind past dropped rows, so restores stay above `ringFloor` and a ring spills to SSD only before it drops a row.
+rewind past dropped rows, so restores stay above `ringFloor`; on SSD a ring's layers go only into the chunks it holds
+whole (meta v11 `ring.from`) and a restore reads their newest `keep` rows.
 MiMo, laguna's family, gpt_oss and gemma4 declare it (`CacheFacts.sliding_ring`). It drops whole 32-row blocks: the
 hd-256 band kernel tiles a whole-buffer view from its first row, and a ring starting off a block boundary summed its
 keys in other groups than the full buffer. Guard: `KVCache sliding ring`, the prefix-cache and DiskTier ring tests,

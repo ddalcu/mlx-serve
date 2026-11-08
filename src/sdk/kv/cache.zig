@@ -558,7 +558,7 @@ pub const KVCache = struct {
 
     /// A sliding ring drops rows in whole blocks of this many, so a whole-buffer view keeps the absolute key-block
     /// boundaries of the hd-256 band kernel (`attn256.metal` BK) and sums as a full buffer does, bit for bit.
-    const ring_drop_align = 32;
+    pub const ring_drop_align = 32;
 
     /// The grow a write of `new_len` rows needs, or null. A sliding ring carries only its newest
     /// `keep` rows (up to one drop block more) across and ignores the request's reservation, which sizes a full buffer.
