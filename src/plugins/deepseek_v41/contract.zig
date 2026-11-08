@@ -1182,7 +1182,7 @@ const HcMixNorm = struct {
     }
 
     pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
-        try HcMix.fill(k, if (f == .stress) .random else f, rng);
+        try HcMix.fill(k, f, rng);
         const cpre = try k.add(.float32, &.{ k.shape.rows, HC });
         const w = try k.add(act, &.{k.shape.n});
         const w2 = try k.add(act, &.{k.shape.n});
@@ -4681,7 +4681,7 @@ fn registerStreamed(set: *kc.Set) !void {
         .replaces = "hc_mix then hc_norm (the stock launches)",
         .tiles = .{ .{ .size = 4 }, .{}, .{} },
         .served = mix_norm_served,
-        .sums = fused_sums,
+        .sums = .{ .bf16 = 0, .exact = false, .why = "on hc_mix's stress rows the collapse's sums are not exact, so the float64 bound holds them, and a bf16 miss hides under it" },
     });
     try kit.add(set, RopeTailOnly, &rope_only_l, .{}, .{
         .name = "dsv41 rope_tail_only (the query tail)",
@@ -4695,11 +4695,19 @@ fn registerStreamed(set: *kc.Set) !void {
 }
 
 /// A prepared case run on our launch: its output bytes (owned) and the case for the wrapper's call.
-fn ours(comptime D: type, a: std.mem.Allocator, l: *const metal.Launch, p: D.Params, shape: Shape) !struct { c: *kit.Case(D), bytes: []u8 } {
+fn ours(comptime D: type, a: std.mem.Allocator, l: *const metal.Launch, p: D.Params, shape: Shape) !Ran(D) {
+    return oursAt(D, a, l, p, shape, .random);
+}
+
+fn Ran(comptime D: type) type {
+    return struct { c: *kit.Case(D), bytes: []u8 };
+}
+
+fn oursAt(comptime D: type, a: std.mem.Allocator, l: *const metal.Launch, p: D.Params, shape: Shape, f: Fill) !Ran(D) {
     const c = try a.create(kit.Case(D));
     errdefer a.destroy(c);
     c.* = .init(a, l, p);
-    try std.testing.expect(try c.prepare(shape, .random, 7));
+    try std.testing.expect(try c.prepare(shape, f, 7));
     try c.run();
     return .{ .c = c, .bytes = try a.dupe(u8, c.outBytes()) };
 }
@@ -4880,6 +4888,16 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
         defer _ = mlx.mlx_array_free(carrier);
         try mlx.check(mlx.mlx_array_eval(carrier));
         try Expect.same(r.c, r.bytes, &.{dst});
+    }
+    // Gate 3 runs random rows: hc_mix's stress rows (partial sums past fp16's range) give the stock launches' words too.
+    inline for (.{ true, false }) |h2| {
+        const r = try oursAt(HcMixNorm, a, &mix_norm_l, .{ .h2 = h2 }, .{ .rows = 17, .n = DIM, .k = HC * DIM }, .stress);
+        defer {
+            a.free(r.bytes);
+            r.c.deinit();
+            a.destroy(r.c);
+        }
+        try std.testing.expectEqualSlices(u8, try r.c.replaced(), r.bytes);
     }
     inline for (.{ true, false }) |h2| {
         const r = try ours(HcMixNorm, a, &mix_norm_l, .{ .h2 = h2 }, .{ .rows = 6, .n = 300, .k = HC * 300 });
