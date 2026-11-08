@@ -1067,7 +1067,7 @@ test "deepseek_v41 served: a batched verify gives each state its solo verify's r
     }
     // The next draft reads the main rows each finish committed: the batched draft drafts what each state drafts alone.
     var drafts: [2]dsv41.DsparkDraft = undefined;
-    try dsv41.dsparkDraftBatched(m, a, &ptrs, &.{ 60, 61 }, true, &drafts);
+    try dsv41.dsparkDraftBatched(m, a, &ptrs, &gens, &.{ 60, 61 }, true, &drafts);
     defer for (&drafts) |*d| d.deinit(a);
     for (0..2) |k| {
         var alone = try dsv41.dsparkDraft(m, a, &solo[k], drafts[k].ids[0]);

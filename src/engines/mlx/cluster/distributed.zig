@@ -464,8 +464,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 6: a worker names its rank on the bell, and the group may hold more than two Macs.
-const VERSION: i32 = 6;
+/// 7: a DeepSeek-V4.1 tensor plan says whether the DSpark stages split, and every rank then drafts (OP_DSV41_TP_DRAFT).
+const VERSION: i32 = 7;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
 pub const OP_STOP = wire.OP_STOP;
@@ -483,6 +483,8 @@ const OP_DSV41_TP_FREE: i32 = 11;
 const OP_DSV41_TP_SNAP: i32 = 12;
 /// Tensor parallel: a snapshot rank 0 read from disk (`dsv41.tpLoadPlan`'s tensors), the worker's copy of its cache.
 const OP_DSV41_TP_LOAD: i32 = 13;
+/// Tensor parallel, a sharded DSpark draft: its states' gens, positions and first tokens (`dsv41.tpWorkerDraft`).
+const OP_DSV41_TP_DRAFT: i32 = 14;
 pub const OP_RELEASE = wire.OP_RELEASE;
 
 /// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
@@ -584,6 +586,8 @@ const Plan = struct {
     span: LayerSpan,
     hidden: i32,
     experts: i32,
+    /// DeepSeek-V4.1 tensor: every rank holds its slice of the DSpark stages and drafts (`Shard.stages`).
+    stages: bool = false,
 
     fn msg(p: Plan, name_len: usize) Msg {
         return .{ MAGIC, @backingInt(p.mode), @intCast(p.span.start), @intCast(p.span.end), @intCast(p.span.total), @intCast(name_len), p.hidden, p.experts };
@@ -605,7 +609,7 @@ const Plan = struct {
             const dst: u32 = @intCast(k);
             try sendMsg(link, p.msg(name.len), dst);
             try sendBytes(link, name, dst);
-            try sendMsg(link, .{ MAGIC, @bitCast(@as(u32, @truncate(id))), @bitCast(@as(u32, @truncate(id >> 32))), 0, 0, 0, 0, 0 }, dst);
+            try sendMsg(link, .{ MAGIC, @bitCast(@as(u32, @truncate(id))), @bitCast(@as(u32, @truncate(id >> 32))), @intFromBool(p.stages), 0, 0, 0, 0 }, dst);
         }
         return id;
     }
@@ -1205,9 +1209,10 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
     switch (self.mode) {
         .pipeline => {},
         .tensor => {
-            self.shard = .{ .rank = 0, .size = self.link.size };
-            log.info("[dist] tensor: every expert and attention head of {s} split across {d} Macs\n", .{ std.fs.path.basename(self.model), self.link.size });
-            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts) };
+            const stages = dsv41DraftShard(config, self.link.size);
+            self.shard = .{ .rank = 0, .size = self.link.size, .stages = stages };
+            log.info("[dist] tensor: every expert and attention head of {s} split across {d} Macs; DSpark drafts on {s}\n", .{ std.fs.path.basename(self.model), self.link.size, if (stages) "every rank" else "rank 0 alone" });
+            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .stages = stages };
             self.plan_id = try pl.send(&self.link, model_dir);
             self.planned = true;
             cluster().tp_link = &self.link;
@@ -1215,6 +1220,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
             dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
             dsv41_mod.clusterHooks().tp_batch = &dsv41TpBatch;
+            dsv41_mod.clusterHooks().tp_draft = &dsv41TpDraft;
             dsv41_mod.clusterHooks().tp_free = &dsv41TpFree;
             dsv41_mod.clusterHooks().tp_snap = &dsv41TpSnap;
             dsv41_mod.clusterHooks().tp_load = &dsv41TpLoad;
@@ -1297,6 +1303,32 @@ fn dsv41TpBatch(gens: []const u64, p0s: []const usize, chunks: []const []const u
     self.exchanges += 1;
     for (1..self.link.size) |k| {
         try sendMsg(&self.link, .{ OP_DSV41_TP_BATCH, @intCast(gens.len), @intCast(rows), @intFromBool(verify), 0, 0, 0, 0 }, @intCast(k));
+        try sendNow(&self.link, a, @intCast(k));
+    }
+}
+
+/// Whether rank 0's DSpark stages load and split across the group (the plugin loads them as `dsparkWanted` says).
+fn dsv41DraftShard(config: *const model_mod.ModelConfig, size: u32) bool {
+    const binding = config.plugin orelse return false;
+    const cfg = @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed);
+    return dsv41_mod.draftShardWanted(size) and dsv41_mod.dsparkWanted(cfg, null, config.mtp_override);
+}
+
+/// Host: a sharded DSpark draft over the states `gens`, each at `p0s[k]` drafting from `t1s[k]` (a batch body with one
+/// id a state). Its sums are not a step's: the tally restarts with no rows, so the next step logs only its own.
+fn dsv41TpDraft(gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void {
+    const self = peer() orelse return error.DistWorkerNotJoined;
+    if (!self.ready) try self.awaitReady();
+    noteTpStep(p0s[0], 0);
+    var chunks: [dsv41_mod.region_rows][]const u32 = undefined;
+    for (chunks[0..t1s.len], t1s) |*ch, *t| ch.* = t[0..1];
+    var body: [tpBatchLen(dsv41_mod.region_rows, dsv41_mod.region_rows)]i32 = undefined;
+    const len = tpBatchLen(gens.len, gens.len);
+    tpBatchPack(body[0..len], gens, p0s, chunks[0..gens.len]);
+    const a = mlx.mlx_array_new_data(&body, &[_]c_int{@intCast(len)}, 1, .int32);
+    defer _ = mlx.mlx_array_free(a);
+    for (1..self.link.size) |k| {
+        try sendMsg(&self.link, .{ OP_DSV41_TP_DRAFT, @intCast(gens.len), 0, 0, 0, 0, 0, 0 }, @intCast(k));
         try sendNow(&self.link, a, @intCast(k));
     }
 }
@@ -1427,7 +1459,7 @@ fn noteRoundTrip(us: i64) void {
 /// every expert and attention head and one step per OP_DSV41_TP, until rank 0 stops it.
 fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: []const u8, config: *model_mod.ModelConfig, pl: Plan) !bool {
     switch (pl.mode) {
-        .tensor => config.applyShard(.{ .rank = link.rank, .size = link.size }) catch |err| {
+        .tensor => config.applyShard(.{ .rank = link.rank, .size = link.size, .stages = pl.stages }) catch |err| {
             log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
             sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
             return err;
@@ -1441,12 +1473,18 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     };
     defer w.deinit();
     const binding = config.plugin orelse return error.NotPluginServed;
-    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .head_8bit = dsv41_mod.head8Wanted(), .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
+    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .dspark = pl.stages, .draft_shard = pl.stages, .head_8bit = dsv41_mod.head8Wanted(), .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;
     };
     defer m.deinit();
+    // Rank 0 drafts with this rank's stages: without them its first draft would wait on this rank forever.
+    if (pl.stages and !m.draft_shard) {
+        log.err("[dist] worker load failed: rank 0 drafts on every rank but this copy loaded no DSpark stages\n", .{});
+        sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
+        return error.Dsv41DraftShardNoStages;
+    }
     cluster().tp_link = link;
     dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
     dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
@@ -1532,6 +1570,25 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 noteTpStep(p0s[0], rows);
                 try dsv41_mod.tpWorkerBatch(m, allocator, &parked, gens[0..n], p0s[0..n], chunks[0..n], msg[3] != 0);
                 steps += 1;
+            },
+            OP_DSV41_TP_DRAFT => {
+                const n: usize = @intCast(msg[1]);
+                if (n == 0 or n > dsv41_mod.region_rows) return error.DistBadMessage;
+                const sent = try queuedRecv(link, &.{@intCast(tpBatchLen(n, n))}, .int32, 0);
+                defer _ = mlx.mlx_array_free(sent);
+                const body = (mlx.mlx_array_data_int32(sent) orelse return error.NoData)[0..tpBatchLen(n, n)];
+                var gens: [dsv41_mod.region_rows]u64 = undefined;
+                var p0s: [dsv41_mod.region_rows]usize = undefined;
+                var t1s: [dsv41_mod.region_rows]u32 = undefined;
+                for (0..n) |k| {
+                    const e = tpBatchState(body, n, k);
+                    if (e.ids.len != 1) return error.DistBadMessage;
+                    gens[k] = e.gen;
+                    p0s[k] = e.p0;
+                    t1s[k] = e.ids[0];
+                }
+                noteTpStep(p0s[0], 0);
+                try dsv41_mod.tpWorkerDraft(m, allocator, &parked, gens[0..n], p0s[0..n], t1s[0..n]);
             },
             OP_DSV41_TP_FREE => dsv41_mod.tpWorkerFree(m, &parked, joined(msg[1], msg[2])),
             OP_DSV41_TP_SNAP => {
@@ -1848,7 +1905,7 @@ fn watchHost(b: Bell) void {
 /// One plan: finds and loads this Mac's part, then serves until rank 0 stops it (false) or
 /// releases it (true: the host unloaded the model and may plan again).
 fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots: []const []const u8, pmsg: Msg) !bool {
-    const pl = try Plan.parse(pmsg);
+    var pl = try Plan.parse(pmsg);
     var name_buf: [256]u8 = undefined;
     const name_len: usize = @intCast(pmsg[5]);
     if (name_len == 0 or name_len > name_buf.len) return error.DistBadMessage;
@@ -1857,6 +1914,7 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     const idm = try recvMsg(link, 0);
     if (idm[0] != MAGIC) return error.DistProtocolMismatch;
     const id = @as(u64, @as(u32, @bitCast(idm[1]))) | @as(u64, @as(u32, @bitCast(idm[2]))) << 32;
+    pl.stages = idm[3] != 0;
     switch (pl.mode) {
         .pipeline => log.info("[dist] worker: {s} layers {d}..{d} of {d} (pipeline)\n", .{ name, pl.span.start, pl.span.end, pl.span.total }),
         .tensor => log.info("[dist] worker rank {d}: {s}, 1/{d} of every expert (tensor)\n", .{ link.rank, name, link.size }),

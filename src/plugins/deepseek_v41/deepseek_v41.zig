@@ -543,9 +543,11 @@ pub const Dsv41Model = struct {
     /// This process's slice of every expert (`cfg.moe_intermediate_size` is already its width).
     tp: ?Shard = null,
     /// Tensor parallel with the vocabulary split (`vocabSplit`): this rank's rows of the LM head. Every rank projects
-    /// its part of each step's logits and the parts are gathered (`headLogits`); rank 0 still holds the whole head for
-    /// the DSpark drafts.
+    /// its part of each step's logits and the parts are gathered (`headLogits`); rank 0 still holds the whole head.
     head_part: ?HeadPart = null,
+    /// Tensor parallel: every rank holds its slice of the DSpark stages and its rows of the Markov head, and drafts with
+    /// rank 0 (`InitOpts.draft_shard`).
+    draft_shard: bool = false,
     /// `moeFused`'s unit expand at rows 1..`dkern.max_rows` (`.pre` the zero stream), made once at load.
     tp_units: [dkern.max_rows]Split = undefined,
     /// `dec_state`'s identity: a snapshot names the state it was taken of. Set from `gens` whenever `dec_state` is
@@ -757,6 +759,26 @@ fn vocabSplitFrom(tp: ?Shard, v: ?[*:0]const u8) ?Shard {
     const t = tp orelse return null;
     if (t.size < 2) return null;
     return if (v != null and v.?[0] == '0') null else t;
+}
+
+/// Whether a `size`-rank tensor split drafts on every rank (`InitOpts.draft_shard`): `DSV41_DRAFT_SHARD` (on by default)
+/// with the vocabulary split, whose rows of the head the draft's tail projects. Rank 0 decides and its plan tells the
+/// workers, so a worker's own environment never changes the draft's collectives.
+pub fn draftShardWanted(size: u32) bool {
+    if (vocabSplit(.{ .rank = 0, .size = size }) == null) return false;
+    const v = env.get(.DSV41_DRAFT_SHARD);
+    return v == null or v.?[0] != '0';
+}
+
+/// The Markov head `[vocab, rank]` in the activation dtype: whole, or under a sharded draft this rank's rows of it
+/// (`vocabRange`, as `head_part`).
+fn markovHead(m: *Dsv41Model, w: *Weights, x: A) !A {
+    const p = if (m.draft_shard) m.head_part.? else return ownCast(m, x, m.act);
+    const rows = try ownRows(m, x, p.lo, p.hi, true);
+    release(m, w, x);
+    const cast = try ownCast(m, rows, m.act);
+    release(m, w, rows);
+    return cast;
 }
 
 /// Rank `t`'s rows of the head `l` (`vocabRange`): views of `l` when `keep_whole` (rank 0, whose DSpark drafts read the
@@ -1189,8 +1211,8 @@ fn loadExperts(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize,
 pub fn loadLayer(m: *Dsv41Model, w: *Weights, comptime pfx: []const u8, li: usize, trunk_li: ?usize) !Layer {
     const c = &m.cfg;
     const d = c.hidden_size;
-    // A tensor split slices the trunk's heads and experts; the DSpark stages load whole.
-    const whole: usize = if (trunk_li == null) if (m.tp) |t| t.size else 1 else 1;
+    // A tensor split slices the trunk's heads and experts; the DSpark stages load whole unless they split too.
+    const whole: usize = if (trunk_li == null and !m.draft_shard) if (m.tp) |t| t.size else 1 else 1;
     const heads = c.num_attention_heads * whole;
     const hd = c.head_dim;
     const og = c.dsv4_o_groups * whole;
@@ -1642,6 +1664,8 @@ const ClusterHooksState = struct {
     /// step ends at the armed snapshot; `all`: every row's logits; `images`: the rows its image positions take
     /// (`chunkImageRows`, evaluated). Set by distributed.zig.
     tp_step: ?*const fn (ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A) anyerror!void = null,
+    /// Tensor parallel, rank 0, a sharded draft: the states `gens` at `p0s[k]` draft from `t1s[k]`.
+    tp_draft: ?*const fn (gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void = null,
     /// Tensor parallel, rank 0: one batched step over the states `gens`, each from `p0s[k]` with `chunks[k]`.
     tp_batch: ?*const fn (gens: []const u64, p0s: []const usize, chunks: []const []const u32, verify: bool) anyerror!void = null,
     /// Tensor parallel, rank 0: the state `gen` is gone.
@@ -1748,6 +1772,10 @@ pub const InitOpts = struct {
     /// rank 0 hands each step's ids to the others (`tp_step`, `tpWorkerStep`). Each rank projects its rows of the
     /// logits and rank 0 gathers them (`head_part`); `DSV41_VOCAB_HEAD=0` has rank 0 alone project them.
     tp: ?Shard = null,
+    /// Tensor parallel: the weights hold this rank's slice of the DSpark stages too (`Shard.stages`), so every rank
+    /// loads them and drafts with rank 0, summing each stage's attention and MoE; the Markov head splits by vocabulary
+    /// rows as the LM head does, and each Markov step gathers every rank's best row (`vocabArgmax`).
+    draft_shard: bool = false,
     /// A dense head served 8-bit (affine, g64): half the bytes every token reads. Lossy.
     head_8bit: bool = false,
     /// The routed experts stream from the pack's bank (`Dsv41Model.streamed`, bound after the load).
@@ -1775,8 +1803,8 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     const m = try gpa.create(Dsv41Model);
     errdefer gpa.destroy(m);
     const n_layers = cfg.num_hidden_layers;
-    // A tensor split's rank 0 holds the DSpark stages whole and drafts alone.
-    const n_stages: usize = if (opts.dspark and (opts.tp == null or opts.tp.?.rank == 0) and cfg.dsv4_dspark_block_size > 0 and (getOpt(w, "mtp.0.main_proj.weight", .{}) != null or (opts.quant != null and getOpt(w, "mtp.0.main_norm.weight", .{}) != null)))
+    // A tensor split's rank 0 holds the DSpark stages whole and drafts alone, unless every rank holds its slice of them.
+    const n_stages: usize = if (opts.dspark and (opts.tp == null or opts.tp.?.rank == 0 or opts.draft_shard) and cfg.dsv4_dspark_block_size > 0 and (getOpt(w, "mtp.0.main_proj.weight", .{}) != null or (opts.quant != null and getOpt(w, "mtp.0.main_norm.weight", .{}) != null)))
         cfg.dsv4_n_compress_ratios - n_layers
     else
         0;
@@ -1820,6 +1848,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     };
     m.pair = opts.pair;
     m.tp = opts.tp;
+    m.draft_shard = opts.draft_shard and opts.tp != null and n_stages > 0;
     m.streamed_experts = opts.streamed_experts;
     m.quant = opts.quant;
     defer m.quant = null;
@@ -1908,6 +1937,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     };
     try compileRegions(m);
     if (n_stages > 0) {
+        if (m.draft_shard and m.head_part == null) return error.Dsv41DraftShardNeedsVocabHead;
         for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
         const last = n_stages - 1;
         const targets = cfg.dsv4_n_dspark_target_layers;
@@ -1915,12 +1945,12 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .main_proj = try getLin(m, w, cfg.hidden_size * targets, "mtp.0.main_proj", .{}),
             .main_norm = try ownCast(m, try getW(w, "mtp.0.main_norm.weight", .{}), m.act),
             .norm = try ownCast(m, try getW(w, "mtp.{d}.norm.weight", .{last}), m.act),
-            // The release's names (`markov_w1`, the bigram embedding; `markov_w2`, its head) where the pack keeps them.
             .markov_embed = getOpt(w, "mtp.{d}.markov_head.markov_w1.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.embed.weight", .{last}),
-            .markov_head = try ownCast(m, getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.head.weight", .{last}), m.act),
+            .markov_head = try markovHead(m, w, getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.head.weight", .{last})),
             .conf = try ownCast(m, try getW(w, "mtp.{d}.confidence_head.proj.weight", .{last}), .float32),
         };
         m.n_mtp = n_stages;
+        if (opts.tp) |t| log.info("deepseek_v41: tensor rank {d} of {d}: DSpark {s}\n", .{ t.rank, t.size, if (m.draft_shard) "stages and Markov head split, every rank drafts (DSV41_DRAFT_SHARD=0: rank 0 alone)" else "drafts on rank 0 alone" });
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
     }
@@ -4411,7 +4441,7 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     };
     if (ly.experts.ext) |*e| return withShared(sc, m, ly, x, try routedOutside(sc, m, e, x, r.idx, r.wts));
     const y = try moePartial(sc, m, ly, x, r.idx, r.wts);
-    return if (li < m.n_layers) tpSum(sc, m, y) else sc.astype(y, m.act);
+    return if (li < m.n_layers or m.draft_shard) tpSum(sc, m, y) else sc.astype(y, m.act);
 }
 
 /// `x` summed over the tensor-parallel ranks (itself unsplit), in `m.act`: f32 at decode width, so the sum rounds once.
@@ -5280,8 +5310,8 @@ fn followVerify(m: *Dsv41Model, p0: usize) !void {
 
 fn followVerifyOf(m: *Dsv41Model, st: *State, p0: usize) !void {
     const v = st.verify orelse return;
-    if (p0 >= v.n0 and p0 < st.n) try rollbackVerify(m, st, p0 - v.n0);
-    st.dropVerify();
+    if (p0 < v.n0 or p0 > st.n) return st.dropVerify();
+    try finishVerify(m, st.gpa, st, p0 - v.n0);
 }
 
 /// Rank 0 tells the other ranks a state is gone (`ClusterHooksState.tp_free`).
@@ -5290,10 +5320,11 @@ pub fn tpFree(m: *const Dsv41Model, gen: u64) void {
 }
 
 /// What a snapshot read from disk sends the other ranks: its layers' caches and Engram history. The ranks build them
-/// off the same summed stream through whole KV weights, so rank 0's are theirs; the DSpark stages are rank 0's alone.
+/// off the same summed stream through whole KV weights, so rank 0's are theirs; the DSpark windows too when every rank
+/// drafts, else they are rank 0's alone.
 pub fn tpLoadPlan(m: *const Dsv41Model, n: usize) !cache_codec.Plan {
     var l = try cacheLayout(m);
-    l.stages = 0;
+    if (!m.draft_shard) l.stages = 0;
     return cache_codec.Plan.init(l, n, 0);
 }
 
@@ -6802,7 +6833,7 @@ pub const DraftAhead = struct {
 };
 /// whether a draft can be launched ahead: the stages loaded.
 pub fn draftAheadOk(m: *const Dsv41Model) bool {
-    return m.dspark != null and m.n_mtp > 0;
+    return m.dspark != null and m.n_mtp > 0 and !m.draft_shard;
 }
 /// whether `a` is the draft `dsparkDraft(m, _, st, t1)` would make now:
 /// the same token, the same position, the same state.
@@ -6837,8 +6868,15 @@ pub fn dsparkDraftCollect(m: *Dsv41Model, gpa: std.mem.Allocator, a: *DraftAhead
     try evalAll(&a.ev);
     return draftRead(&sc, m, gpa, a.t1, &a.ev, a.want_conf, false);
 }
-/// `keep_logits` also copies the Markov-biased rows to the host.
+/// `keep_logits` also copies the Markov-biased rows to the host. A sharded draft names its state to the other ranks
+/// by its gen: only the module's own state drafts alone.
 fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_logits: bool) !DsparkDraft {
+    if (m.draft_shard) {
+        if (m.dec_state == null or st != &m.dec_state.?) return error.Dsv41TpStateNotLive;
+        var out: [1]DsparkDraft = undefined;
+        try dsparkDraftBatched(m, gpa, &.{st}, &.{m.state_gen}, &.{t1}, keep_logits, &out);
+        return out[0];
+    }
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     const g = try draftGraph(&sc, m, st, t1, keep_logits);
@@ -6929,59 +6967,84 @@ fn draftRead(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, t1: u32, 
     return .{ .ids = out_ids, .len = len, .logits = host_logits, .confidence = conf };
 }
 
-/// `dsparkDraft` of each of `states` from its committed token `t1s[k]`, into `out[k]` (each owned by the caller): the
-/// stages run once over every state's block, attention per state against its own window of committed main rows, and
-/// the Markov chain steps every state's row at once. `keep_logits` also copies the Markov-biased rows to the host.
-pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
+/// `dsparkDraft` of each of `states` (known to the other tensor ranks as `gens`) from its committed token `t1s[k]`,
+/// into `out[k]` (each owned by the caller): the stages run once over every state's block, attention per state against
+/// its own window of committed main rows, and the Markov chain steps every state's row at once. `keep_logits` also
+/// copies the Markov-biased rows to the host (a sharded draft has no whole row to copy).
+pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
+    if (states.len == 0 or states.len > region_rows or gens.len != states.len or t1s.len != states.len) return error.Dsv41BatchUnsupported;
+    if (m.draft_shard and keep_logits) return error.Dsv41DraftShardLogits;
+    if (m.draft_shard) try tpDraft(m, states, gens, t1s);
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
+    const g = try batchGraph(&sc, m, gpa, states, t1s, keep_logits);
+    var ev = [_]A{ g.ids, g.conf, g.logits };
+    try evalAll(&ev);
+    try readDrafts(m, gpa, g, t1s, keep_logits, out);
+}
+
+/// Rank 0 of a sharded draft: the states it drafts and their first tokens to every other rank, before its first sum.
+fn tpDraft(m: *const Dsv41Model, states: []const *State, gens: []const u64, t1s: []const u32) !void {
+    if (m.tp.?.rank != 0) return;
+    const send = clusterHooks().tp_draft orelse return error.DsvTpNotJoined;
+    var p0s: [region_rows]usize = undefined;
+    for (states, p0s[0..states.len]) |st, *p| p.* = st.n;
+    try send(gens, p0s[0..states.len], t1s);
+}
+
+/// Tensor-parallel rank past 0: rank 0's sharded draft over its states `gens`, each first brought to `p0s[k]` as rank
+/// 0 kept its open verify; the draft's sums and gathers meet rank 0's and its drafts are dropped.
+pub fn tpWorkerDraft(m: *Dsv41Model, gpa: std.mem.Allocator, parked: *Parked, gens: []const u64, p0s: []const usize, t1s: []const u32) !void {
+    if (!m.draft_shard or gens.len == 0 or gens.len > region_rows) return error.DistPeerDiverged;
+    var states: [region_rows]*State = undefined;
+    for (gens, p0s, states[0..gens.len]) |g, p0, *o| {
+        const st = try tpStateOf(m, parked, g);
+        try followVerifyOf(m, st, p0);
+        if (st.n != p0) return error.DistPeerDiverged;
+        o.* = st;
+    }
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const g = try batchGraph(&sc, m, gpa, states[0..gens.len], t1s, false);
+    try evalAll(&.{g.ids});
+}
+
+/// The draft's lazy outputs: `ids` and `conf` `[N, B]`, `logits` `[N, B, vocab]`; each is `ids` where it was not asked for.
+pub const BatchGraph = struct { ids: A, conf: A, logits: A };
+
+fn wantsConfidence(m: *const Dsv41Model) bool {
+    return m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
+}
+
+pub fn batchGraph(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool) !BatchGraph {
     const c = &m.cfg;
     const B = m.ds_block;
     const N = states.len;
-    const hc = c.dsv4_hc_mult;
-    const d = c.hidden_size;
-    const ds = &m.dspark.?;
     const ids = try gpa.alloc(i32, N * B);
     defer gpa.free(ids);
     for (t1s, 0..) |t1, k| for (0..B) |j| {
         ids[k * B + j] = @intCast(if (j == 0) t1 else c.dsv4_dspark_noise_token_id);
     };
-    // the rows by their host ids.
     const uids = try gpa.alloc(u32, N * B);
     defer gpa.free(uids);
     for (uids, ids) |*u, v| u.* = @intCast(v);
-    const emb = try embedIds(m, &sc, uids, m.act);
-    var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(hc), ci(d) });
-    var pre = try onehotPre(&sc, m, N * B);
-    for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B);
-    const flat = try hcCollapse(&sc, x, pre);
-    const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
-    const logits = try sc.reshape(try sc.astype(try m.head.apply(&sc, try sc.rms(flat, ds.norm, c.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
+    const emb = try embedIds(m, sc, uids, m.act);
+    var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(c.dsv4_hc_mult), ci(c.hidden_size) });
+    var pre = try onehotPre(sc, m, N * B);
+    for (0..m.n_mtp) |si| x = try stageBlock(sc, m, states, m.n_layers + si, x, &pre, B);
     const firsts = try gpa.alloc(i32, N);
     defer gpa.free(firsts);
     for (firsts, t1s) |*f, t| f.* = @intCast(t);
-    var cur = try sc.ints(firsts, &.{ci(N)});
-    const want_conf = m.ds_want_conf or std.math.isFinite(m.ds_conf_thr);
-    var toks: [16]A = undefined;
-    var confs: [16]A = undefined;
-    var rows_k: [16]A = undefined;
-    for (0..B) |k| {
-        const e = try sc.take(ds.markov_embed, cur, 0); // [N, rank]
-        const me = try sc.astype(e, .float32);
-        const bias = try sc.astype(try sc.matmul(try sc.astype(e, m.act), try sc.t2(ds.markov_head)), .float32);
-        const row = try sc.add(try sc.reshape(try sc.slice(logits, 1, k, k + 1), &.{ ci(N), -1 }), bias);
-        rows_k[k] = row;
-        if (want_conf) confs[k] = try sc.matmul(try sc.concat(&.{ try sc.astype(try sc.reshape(try sc.slice(hout, 1, k, k + 1), &.{ ci(N), ci(d) }), .float32), me }, -1), try sc.t2(ds.conf));
-        cur = try sc.astype(try sc.argmax(row, -1), .int32);
-        toks[k] = cur;
-    }
-    const all = try sc.stack(toks[0..B], 1); // [N, B]
-    const rows_all = if (keep_logits) try sc.stack(rows_k[0..B], 1) else all;
-    var ev = [_]A{ all, if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all, rows_all };
-    try evalAll(&ev);
-    const data = mlx.mlx_array_data_int32(all) orelse return error.NoData;
-    const conf_data: []const f32 = if (want_conf) (mlx.mlx_array_data_float32(ev[1]) orelse return error.NoData)[0 .. N * B] else &.{};
-    const logit_data: []const f32 = if (keep_logits) (mlx.mlx_array_data_float32(rows_all) orelse return error.NoData)[0 .. N * B * m.vocab] else &.{};
+    return draftTail(sc, m, x, pre, try sc.ints(firsts, &.{ci(N)}), wantsConfidence(m), keep_logits);
+}
+
+fn readDrafts(m: *const Dsv41Model, gpa: std.mem.Allocator, g: BatchGraph, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
+    const B = m.ds_block;
+    const N = t1s.len;
+    const want_conf = wantsConfidence(m);
+    const data = mlx.mlx_array_data_int32(g.ids) orelse return error.NoData;
+    const conf_data: []const f32 = if (want_conf) (mlx.mlx_array_data_float32(g.conf) orelse return error.NoData)[0 .. N * B] else &.{};
+    const logit_data: []const f32 = if (keep_logits) (mlx.mlx_array_data_float32(g.logits) orelse return error.NoData)[0 .. N * B * m.vocab] else &.{};
     var made: usize = 0;
     errdefer for (out[0..made]) |*o| o.deinit(gpa);
     for (out[0..N], t1s, 0..) |*o, t1, k| {
@@ -7008,8 +7071,72 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     }
 }
 
+/// The last stage's collapse through the head over its norm, then the Markov bigram bias chained position by position
+/// (greedy), and the confidence head's logit per position when asked. A sharded draft projects this rank's rows of
+/// the head and the Markov head, and each step's token is the best of every rank's (`vocabArgmax`).
+pub fn draftTail(sc: *Scope, m: *const Dsv41Model, x: A, pre: A, firsts: A, want_conf: bool, keep_logits: bool) !BatchGraph {
+    const ds = &m.dspark.?;
+    const B = m.ds_block;
+    const N = dim(x, 0) / B;
+    const d = m.cfg.hidden_size;
+    const flat = try hcCollapse(sc, x, pre);
+    const hout = try sc.reshape(flat, &.{ ci(N), ci(B), ci(d) });
+    const head = if (m.draft_shard) &m.head_part.?.lin else &m.head;
+    const logits = try sc.reshape(try sc.astype(try head.apply(sc, try sc.rms(flat, ds.norm, m.cfg.rms_norm_eps)), .float32), &.{ ci(N), ci(B), -1 });
+    var toks: [16]A = undefined;
+    var confs: [16]A = undefined;
+    var rows_k: [16]A = undefined;
+    var cur = firsts;
+    for (0..B) |k| {
+        const step = try markovStep(sc, m, logits, hout, cur, k, want_conf);
+        rows_k[k] = step.row;
+        confs[k] = step.conf;
+        cur = step.tok;
+        toks[k] = cur;
+    }
+    const all = try sc.stack(toks[0..B], 1); // [N, B]
+    return .{
+        .ids = all,
+        .conf = if (want_conf) try sc.astype(try sc.concat(confs[0..B], -1), .float32) else all,
+        .logits = if (keep_logits) try sc.stack(rows_k[0..B], 1) else all,
+    };
+}
+
+const MarkovStep = struct { row: A, conf: A, tok: A };
+
+/// Position `k`'s logits `[N, rows]` biased by the Markov table row of the previous token `cur`, its greedy token and,
+/// when asked, the confidence head's logit over the position's hidden row beside that embedding.
+fn markovStep(sc: *Scope, m: *const Dsv41Model, logits: A, hout: A, cur: A, k: usize, want_conf: bool) !MarkovStep {
+    const ds = &m.dspark.?;
+    const N = dim(logits, 0);
+    const e = try sc.take(ds.markov_embed, cur, 0); // [N, rank]
+    const bias = try sc.astype(try sc.matmul(try sc.astype(e, m.act), try sc.t2(ds.markov_head)), .float32);
+    const row = try sc.add(try sc.reshape(try sc.slice(logits, 1, k, k + 1), &.{ ci(N), -1 }), bias);
+    const tok = try vocabArgmax(sc, m, row);
+    if (!want_conf) return .{ .row = row, .conf = row, .tok = tok };
+    const hidden = try sc.astype(try sc.reshape(try sc.slice(hout, 1, k, k + 1), &.{ ci(N), ci(dim(hout, 2)) }), .float32);
+    const conf = try sc.matmul(try sc.concat(&.{ hidden, try sc.astype(e, .float32) }, -1), try sc.t2(ds.conf));
+    return .{ .row = row, .conf = conf, .tok = tok };
+}
+
+/// The vocabulary id of each row's largest logit `[N]` int32, the first of equal ones. A sharded draft's row holds this
+/// rank's ids `[lo, hi)`: every rank's best value and id are gathered, and the first rank holding the largest wins,
+/// which is the whole row's first.
+pub fn vocabArgmax(sc: *Scope, m: *const Dsv41Model, row: A) !A {
+    if (!m.draft_shard) return sc.astype(try sc.argmax(row, -1), .int32);
+    const p = &m.head_part.?;
+    const gather = clusterHooks().tp_gather orelse return error.DsvTpNotJoined;
+    const N = dim(row, 0);
+    const id = try sc.add(try sc.astype(try sc.argmax(row, -1), .float32), try sc.f(@floatFromInt(p.lo)));
+    const mine = try sc.stack(&.{ try sc.max(row, -1, false), id }, 1); // [N, 2]: ids below 2^24 stay exact in f32
+    const all = try sc.reshape(try sc.keep(try gather(mine)), &.{ ci(p.size), ci(N), 2 });
+    const best = try sc.expand(try sc.argmax(try sc.reshape(try sc.slice(all, 2, 0, 1), &.{ ci(p.size), ci(N) }), 0), 0);
+    const ids = try sc.takeAlong(try sc.reshape(try sc.slice(all, 2, 1, 2), &.{ ci(p.size), ci(N) }), best, 0);
+    return sc.astype(try sc.reshape(ids, &.{ci(N)}), .int32);
+}
+
 /// A DSpark stage over `B` draft rows a state: the mixes, norms and FFN over every row, each state's attention
-/// against its own window of committed main rows.
+/// against its own window of committed main rows. A sharded draft sums the attention's and the MoE's output.
 fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: A, pre: *A, B: usize) !A {
     const ly = &m.layers[li];
     const si = li - m.n_layers;
@@ -7023,7 +7150,8 @@ fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: 
         const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
         o.* = try dsparkHeads(sc, m, ly, mine, keys, st.n);
     }
-    const h = try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
+    const ao = try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
+    const h = if (m.draft_shard) try tpSum(sc, m, ao) else ao;
     const pf = try hcExpandPreNorm(sc, m, x, h, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
     const y = try moe(sc, m, li, pf.h, none);
     pre.* = pf.sp.pre;
@@ -7101,7 +7229,7 @@ pub fn dsparkBeginWith(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u
 }
 
 /// The rollback anchors a verify chunk restores to.
-fn armVerify(st: *State, nl: usize) !void {
+pub fn armVerify(st: *State, nl: usize) !void {
     var v: Verify = .{
         .n0 = st.n,
         .comp_used = try st.gpa.alloc(usize, nl),
@@ -7171,7 +7299,7 @@ pub fn finishVerify(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, keep_n: 
     defer st.dropVerify();
     const v = &st.verify.?;
     if (v.n0 + keep_n < st.n) try rollbackVerify(m, st, keep_n);
-    if (v.mh.ctx != null) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
+    if (v.mh.ctx != null and keep_n > 0) try commitMain(&sc, m, st, try sc.slice(v.mh, 0, 0, keep_n), v.n0);
 }
 
 pub fn dsparkObserve(m: *Dsv41Model, ph: DsparkPhases) void {
@@ -9308,7 +9436,7 @@ test "dsv41 group: greedy DSpark group rounds against batched plain steps, by st
         for (0..rounds + warm) |r| {
             var drafts: [max_n]DsparkDraft = undefined;
             const t0 = iou.nowUsMonotonic(io);
-            try dsparkDraftBatched(m, gpa, ptrs[0..n], t1s[0..n], false, drafts[0..n]);
+            try dsparkDraftBatched(m, gpa, ptrs[0..n], gens[0..n], t1s[0..n], false, drafts[0..n]);
             defer for (drafts[0..n]) |*d| d.deinit(gpa);
             const t_d = iou.nowUsMonotonic(io);
             var chunks: [max_n][]const u32 = undefined;

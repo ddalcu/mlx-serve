@@ -66,6 +66,7 @@ test {
     _ = @import("plugins/deepseek_v4/proof_test.zig");
     _ = @import("plugins/deepseek_v4/served_test.zig");
     _ = @import("plugins/deepseek_v41/proof_test.zig");
+    _ = @import("plugins/deepseek_v41/draft_test.zig");
     _ = @import("plugins/muse_glimmer/proof_test.zig");
     _ = @import("plugins/qwen3_asr/proof_test.zig");
     _ = @import("plugins/qwen3_5/proof_test.zig");
