@@ -2440,3 +2440,6 @@
 "Install downloads its source from CommunityServe/plugins and shows you what it will build. Once you approve, it is compiled and tested on this Mac and turned on." = "설치는 CommunityServe/plugins에서 소스를 받아 무엇을 빌드할지 보여 줍니다. 승인하면 이 Mac에서 컴파일하고 테스트한 뒤 켭니다.";
 "The original project" = "원본 프로젝트";
 "This plugin's source in the CommunityServe catalog" = "CommunityServe 카탈로그에 있는 이 플러그인의 소스";
+"Not a number" = "숫자가 아닙니다";
+"Too long" = "너무 깁니다";
+"The server reads these when it starts." = "서버는 시작할 때 이 설정을 읽습니다.";

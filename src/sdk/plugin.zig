@@ -6,12 +6,15 @@ const common = @import("../abi/common.zig");
 const model_abi = @import("../abi/plugin.zig");
 const media_abi = @import("../abi/media.zig");
 const quant_abi = @import("../abi/quant.zig");
+const engine_abi = @import("../abi/engine.zig");
+const dylib_abi = @import("../abi/dylib.zig");
 
 const Str = common.Str;
 const Claim = common.Claim;
 const PackDir = common.PackDir;
 
-pub const Kind = enum { model, media, quant };
+/// `engine`: an outside plugin only (the kit's `_example_engine`), never in the registry.
+pub const Kind = enum { model, media, quant, engine };
 
 /// The declaration in a plugin's `plugin.zig` (`pub const plugin = sdk.Plugin{ ... }`). Beside it the root declares
 /// `table` (the kind's table), `config` (its MLX-free `config.zig`, whose `claims` and, for a model, `parse` the
@@ -24,13 +27,21 @@ pub const Plugin = struct {
     claims: []const []const u8 = &.{},
     /// The checkpoints the gates load for this plugin.
     gate_models: []const []const u8 = &.{},
+    /// An engine's models: the model folders it serves, by name, and no others.
+    models: []const []const u8 = &.{},
+    /// The settings it reads from its environment (`abi.dylib.Option`).
+    options: []const Option = &.{},
 };
+
+/// `abi.dylib.Option` for a Zig root: `name` is the plugin's name upper-cased, `_`, then [A-Z0-9_].
+pub const Option = struct { name: []const u8, kind: dylib_abi.OptionKind, default: []const u8 = "", help: []const u8 = "" };
 
 pub fn Table(comptime kind: Kind) type {
     return switch (kind) {
         .model => model_abi.ModelTable,
         .media => media_abi.MediaTable,
         .quant => quant_abi.QuantTable,
+        .engine => engine_abi.Engine,
     };
 }
 
@@ -39,6 +50,7 @@ fn tableVersion(comptime kind: Kind) u32 {
         .model => model_abi.version,
         .media => media_abi.version,
         .quant => quant_abi.version,
+        .engine => engine_abi.version,
     };
 }
 
@@ -77,12 +89,39 @@ pub fn check(comptime M: type, comptime folder: []const u8) void {
         const p = M.plugin;
         if (!std.mem.eql(u8, p.name, folder)) @compileError(w ++ ": declares the name " ++ p.name ++ ", not its folder's");
         if (!@hasDecl(M, "table") or @TypeOf(M.table) != Table(p.kind)) @compileError(w ++ ": no `pub const table: " ++ @typeName(Table(p.kind)) ++ "`");
-        if (!std.mem.eql(u8, M.table.name.slice(), p.name)) @compileError(w ++ ": its table is named " ++ M.table.name.slice());
         if (M.table.size != @sizeOf(Table(p.kind)) or M.table.version != tableVersion(p.kind)) @compileError(w ++ ": table size or version is not this ABI's");
-        if (!@hasDecl(M, "config")) @compileError(w ++ ": no `pub const config = @import(\"config.zig\")`");
-        if (fnPtr(M.config.claims) != M.table.claims) @compileError(w ++ ": table.claims is not config.zig's `claims`");
-        if (p.kind == .model and fnPtr(M.config.parse) != M.table.parse) @compileError(w ++ ": table.parse is not config.zig's `parse`");
+        if (p.kind == .engine) {
+            // An engine claims nothing by type: it serves the models it names.
+            if (p.models.len == 0) @compileError(w ++ ": an engine names the models it serves (`plugin.models`)");
+        } else {
+            if (!std.mem.eql(u8, M.table.name.slice(), p.name)) @compileError(w ++ ": its table is named " ++ M.table.name.slice());
+            if (!@hasDecl(M, "config")) @compileError(w ++ ": no `pub const config = @import(\"config.zig\")`");
+            if (fnPtr(M.config.claims) != M.table.claims) @compileError(w ++ ": table.claims is not config.zig's `claims`");
+            if (p.kind == .model and fnPtr(M.config.parse) != M.table.parse) @compileError(w ++ ": table.parse is not config.zig's `parse`");
+        }
+        checkOptions(w, p);
         if (!@hasDecl(M, "conformanceFixture")) @compileError(w ++ ": no `conformanceFixture` for the conformance suite");
+    }
+}
+
+/// `p`'s options against the manifest's rules, at comptime; the branch quota grows with them (a name and a text
+/// default take hundreds of branches each).
+pub fn checkOptions(comptime w: []const u8, comptime p: Plugin) void {
+    comptime {
+        @setEvalBranchQuota(1000 + 4000 * p.options.len);
+        for (p.options) |o| {
+            if (!dylib_abi.optionNameOk(p.name, o.name)) @compileError(w ++ ": option " ++ o.name ++ " is not named `<PLUGIN NAME>_` then [A-Z0-9_]");
+            if (o.default.len > 0 and !dylib_abi.valueOk(o.kind, o.default)) @compileError(w ++ ": option " ++ o.name ++ "'s default is not a value of its kind");
+        }
+    }
+}
+
+test "sdk plugin: a plugin may declare 64 options" {
+    comptime {
+        var opts: [64]Option = undefined;
+        for (&opts, 0..) |*o, i| o.* = .{ .name = "TURBOEXL3_GLM53F_OPT_" ++ [_]u8{ 'A' + i / 26, 'A' + i % 26 }, .kind = .number, .default = "0.25" };
+        const all = opts;
+        checkOptions("plugin turboexl3_glm53f", .{ .name = "turboexl3_glm53f", .kind = .quant, .options = &all });
     }
 }
 
@@ -104,6 +143,7 @@ pub fn entries(comptime mods: []const type, comptime names: []const []const u8) 
             .model => out[i].model = &M.table,
             .media => out[i].media = &M.table,
             .quant => out[i].quant = &M.table,
+            .engine => @compileError("plugin " ++ name ++ ": an engine is an outside plugin, never registered"),
         }
     }
     return out;
@@ -120,6 +160,7 @@ pub fn externEntries(comptime metas: []const Plugin) [metas.len]Entry {
             .model => out[i].model = @extern(*const model_abi.ModelTable, .{ .name = sym }),
             .media => out[i].media = @extern(*const media_abi.MediaTable, .{ .name = sym }),
             .quant => out[i].quant = @extern(*const quant_abi.QuantTable, .{ .name = sym }),
+            .engine => @compileError("plugin " ++ p.name ++ ": an engine is an outside plugin, never registered"),
         }
     }
     return out;

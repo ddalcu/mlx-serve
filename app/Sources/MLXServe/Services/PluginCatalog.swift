@@ -151,6 +151,8 @@ enum PluginCatalog {
         var loaded: Bool
         var rebuild: Bool
         var why: String
+        /// The option values it set for the plugin when it started.
+        var options: [String: String] = [:]
     }
 
     /// The `plugins` array of a `/props` body by name; empty from a server too old to report it.
@@ -161,7 +163,7 @@ enum PluginCatalog {
         for row in rows {
             guard let name = row["name"] as? String else { continue }
             out[name] = ServerStatus(loaded: row["loaded"] as? Bool ?? false, rebuild: row["rebuild"] as? Bool ?? false,
-                                     why: row["why"] as? String ?? "")
+                                     why: row["why"] as? String ?? "", options: row["options"] as? [String: String] ?? [:])
         }
         return out
     }

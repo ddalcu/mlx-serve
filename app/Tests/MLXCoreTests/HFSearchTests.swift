@@ -740,7 +740,7 @@ final class HFModelQuantGateTests: XCTestCase {
             XCTAssertTrue(mlx(id: "TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP",
                               tags: ["mlx", "safetensors", type, "glm", "text-generation"]).isSupportedArchitecture)
         }
-        // GLM-5 (glm_moe_dsa) loads only from an mlx-stream pack, so the search does not offer it; GLM-4 MoE is not served.
+        // GLM-5 (glm_moe_dsa) and GLM-4 MoE are not served.
         XCTAssertFalse(mlx(id: "mlx-community/GLM-5-4bit", tags: ["mlx", "safetensors", "glm_moe_dsa", "glm"]).isSupportedArchitecture)
         XCTAssertFalse(mlx(id: "mlx-community/GLM-4.6-4bit", tags: ["mlx", "safetensors", "glm4_moe", "glm"]).isSupportedArchitecture)
     }
@@ -765,7 +765,7 @@ final class HFModelQuantGateTests: XCTestCase {
                            "bonsai", "text-generation", "conversational"])
         XCTAssertTrue(m.isSupportedArchitecture)
         XCTAssertNil(m.incompatibleReason)
-        for type in supportedModelTypes.subtracting(streamOnlyModelTypes) {
+        for type in supportedModelTypes {
             XCTAssertTrue(mlx(id: "org/x", tags: ["mlx", type]).isSupportedArchitecture,
                           "a repo tagged with served model_type \"\(type)\" reads as unsupported")
         }

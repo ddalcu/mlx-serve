@@ -1,5 +1,6 @@
-//! The engines beside MLX (ds4, llama.cpp, the Neural Engine), each behind its `abi/engine.zig` table: which one
-//! serves a model, and one opened model on its registry entry. Requests reach it through `requests.zig`.
+//! The engines beside MLX (ds4, llama.cpp, the Neural Engine, an outside engine plugin), each behind its
+//! `abi/engine.zig` table: which one serves a model, and one opened model on its registry entry. Requests reach it
+//! through `requests.zig`.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -11,13 +12,14 @@ const io_util = @import("../../sdk/util/io_util.zig");
 const log = @import("../../sdk/util/log.zig");
 const metrics_mod = @import("../metrics/metrics.zig");
 
-/// The Model Settings `engine` spelling; `.mlx` has no table here.
-pub const Kind = @import("../registry/model_settings.zig").Engine;
+/// Which engine serves an opened model: the Model Settings `engine` spellings, and `plugin` (an outside engine plugin,
+/// for the models it names; never a setting). `.mlx` has no table here.
+pub const Kind = enum { mlx, ane, ds4, llama, plugin };
 
-/// The table serving `kind`; null for MLX and for an engine this build leaves out.
+/// The table serving `kind`; null for MLX, an outside plugin's (`loader.engineFor`) and an engine this build leaves out.
 pub fn table(kind: Kind) ?*const abi.Engine {
     return switch (kind) {
-        .mlx => null,
+        .mlx, .plugin => null,
         .ds4 => if (build_options.ds4_engine) &@import("../../engines/ds4/engine.zig").table else null,
         .llama => if (build_options.llama_engine) &@import("../../engines/llama/engine.zig").table else null,
         .ane => &@import("../../engines/ane/engine.zig").table,
@@ -31,6 +33,7 @@ pub fn displayName(kind: Kind) []const u8 {
         .ds4 => "the embedded ds4 engine (GGUF)",
         .llama => "the embedded llama.cpp engine (GGUF)",
         .ane => "the Neural Engine",
+        .plugin => "an outside engine plugin",
     };
 }
 
@@ -101,11 +104,16 @@ pub const Served = struct {
         context: u32 = 0,
         max_concurrent: u32 = 1,
         settings_json: []const u8 = "",
+        config_json: []const u8 = "",
     };
 
     /// Opens `kind` on `spec`; a refusal is the engine's own error by name (`OpenError`), logged.
     pub fn open(gpa: std.mem.Allocator, kind: Kind, spec: Spec, progress: *load_progress.Progress, gauges: *Gauges, metrics: ?*metrics_mod.Metrics) !*Served {
-        const t = table(kind) orelse return error.EngineUnavailable;
+        return openTable(gpa, kind, table(kind) orelse return error.EngineUnavailable, spec, progress, gauges, metrics);
+    }
+
+    /// `open` on table `t`; an outside plugin's (`.plugin`) runs its own runtime on its own thread, or is refused.
+    pub fn openTable(gpa: std.mem.Allocator, kind: Kind, t: *const abi.Engine, spec: Spec, progress: *load_progress.Progress, gauges: *Gauges, metrics: ?*metrics_mod.Metrics) !*Served {
         const s = try gpa.create(Served);
         errdefer gpa.destroy(s);
         s.* = .{
@@ -113,7 +121,8 @@ pub const Served = struct {
             .kind = kind,
             .table = t,
             .handle = undefined,
-            .info = undefined,
+            // An engine may fill `Info` member by member: nothing it leaves is garbage the host then logs.
+            .info = .{ .name = .{}, .version = .{}, .caps = .{}, .threading = .own_thread, .context_window = 0, .max_concurrent = 0, .embedding_dims = 0, .eos = .{}, .startup = .{} },
             .host = .{ .ctx = s, .log = hostLog, .wake = hostWake, .progress = hostProgress },
             .progress = progress,
             .gauges = gauges,
@@ -122,7 +131,7 @@ pub const Served = struct {
         const o: abi.Open = .{
             .model_dir = abi.span(u8, spec.model_dir),
             .model_type = abi.span(u8, spec.model_type),
-            .config_json = .{},
+            .config_json = abi.span(u8, spec.config_json),
             .context = spec.context,
             .max_concurrent = spec.max_concurrent,
             .memory_budget = 0,
@@ -135,6 +144,11 @@ pub const Served = struct {
             log.err("[{s}] engine open failed: {s}\n", .{ @tagName(kind), abi.items(u8, v.why) });
             return openError(abi.items(u8, v.why));
         };
+        if (kind == .plugin and (s.info.threading != .own_thread or t.step != null)) {
+            log.err("[plugin] {s}: an outside engine runs its own runtime on its own thread (`Threading.own_thread`)\n", .{abi.items(u8, s.info.name)});
+            t.close(s.handle);
+            return error.EngineNotOwnThread;
+        }
         log.info("[{s}] {s}\n", .{ @tagName(kind), abi.items(u8, s.info.startup) });
         return s;
     }
@@ -213,6 +227,12 @@ fn fill(gpa: std.mem.Allocator, guess: usize, f: anytype, args: anytype) ![]u32 
     }
 }
 
+/// The Host an engine sees before it is opened (`probe`'s and `load_bytes`'s `Open`): it logs, `wake` does nothing, and
+/// no progress is shown. `ctx` is never read.
+pub fn loadHost(ctx: *anyopaque) abi.Host {
+    return .{ .ctx = ctx, .log = hostLog, .wake = hostWake };
+}
+
 fn hostLog(_: *anyopaque, level: u8, msg: abi.Str) callconv(.c) void {
     const m = abi.items(u8, msg);
     if (level == 0) log.err("{s}\n", .{m}) else log.info("{s}\n", .{m});
@@ -280,6 +300,12 @@ test "aneWanted: the model's setting wins over --ane" {
     try testing.expect(!aneWanted(Cfg{ .ane_override = null }, false));
     try testing.expect(!aneWanted(Cfg{ .ane_override = false }, true));
     try testing.expect(aneWanted(Cfg{ .ane_override = true }, false));
+}
+
+test "openTable: an outside engine that wants the host's GPU thread is refused by name and closed" {
+    var progress: load_progress.Progress = .{};
+    var gauges: Gauges = .{};
+    try std.testing.expectError(error.EngineNotOwnThread, Served.openTable(std.testing.allocator, .plugin, &@import("../../testing/fake_engine.zig").host_gpu_thread, .{ .model_dir = "/m" }, &progress, &gauges, null));
 }
 
 test "table: each engine this build carries; MLX has none" {

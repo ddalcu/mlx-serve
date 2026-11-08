@@ -44,7 +44,6 @@ test "native speculation: resolved opt-out gates capability and API defaults" {
     var cfg = model_mod.ModelConfig{ .plugin = &binding };
     var xfm: Transformer = undefined;
     xfm.config = cfg;
-    xfm.mlx_stream_ext = null;
     xfm.plugin = &bound;
     xfm.dense_attn_proj = false;
     var lm: LoadedModel = undefined;

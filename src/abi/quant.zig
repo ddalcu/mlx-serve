@@ -97,6 +97,68 @@ pub const QuantTable = extern struct {
     /// Routed SwiGLU experts in one dispatch, for a format whose kernels fuse the three projections (EXL3): `x`
     /// [B, S, D] through the banks' experts `inds` [B, S, K], weighted by `scores`. Null: compose `moe` per projection.
     swiglu: ?*const fn (gate: *const Weight, up: *const Weight, down: *const Weight, x: Array, inds: Array, scores: Array, opts: *const Swiglu, s: Stream, out: *Array) callconv(.c) Verdict = null,
+    /// The slot rows per routed layer `budget` buys over the pack's streamed expert bank, no memory taken (`open_bank`'s
+    /// rows); refused by name when none fit. Null: the format streams no bank.
+    bank_rows: ?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *BankRows) callconv(.c) Verdict = null,
+    /// The pack's streamed expert bank at the rows `budget` buys; it outlives `close`.
+    open_bank: ?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *Bank) callconv(.c) Verdict = null,
+};
+
+/// A layer's router as the trunk loaded it. The `gates` list is valid for the call only; the arrays it names live
+/// with the trunk, which outlives the bank.
+pub const BankGate = extern struct { w: Array = .{}, bias: Array = .{} };
+
+/// The trunk's routed MoE a streamed bank serves.
+pub const BankGeometry = extern struct {
+    size: u32 = @sizeOf(BankGeometry),
+    hidden: u32,
+    inter: u32,
+    top_k: u32,
+    n_experts: u32,
+    /// The trunk's layers: `gates` and a call's `layer` index them alike.
+    n_layers: u32,
+    /// > 0: the SwiGLU's clamp.
+    swiglu_limit: f32 = 0,
+    /// Every layer's router (`n_layers`); null for `bank_rows`.
+    gates: ?[*]const BankGate = null,
+};
+
+/// Bytes the slot rows and the bank's own buffers may hold in each phase (a prompt pass, decode).
+pub const BankBudget = extern struct { prompt: u64, decode: u64 };
+
+pub const BankRows = extern struct {
+    size: u32 = @sizeOf(BankRows),
+    prompt: u32 = 0,
+    decode: u32 = 0,
+    /// One slot row in every layer.
+    row_bytes: u64 = 0,
+};
+
+/// A streamed bank of routed experts, as the trunk's MoE reads one whose math it does not have (`sdk/weights/routed.zig`
+/// `Routed`, its `source` arm): a call returns the routed sum (`[n, hidden]` f32, a new array) of the normed input `x`
+/// over the routes `idx` weighted by `wts`. Every entry takes `ctx`; a refusal names its error.
+pub const Bank = extern struct {
+    size: u32 = @sizeOf(Bank),
+    ctx: ?*anyopaque = null,
+    close: *const fn (ctx: ?*anyopaque) callconv(.c) void,
+    /// The load line's account of the bank, valid until `close`.
+    about: Str = .{},
+    /// Routed ids a decode-phase call takes: a wider call is a prompt pass, which the bank refuses in decode.
+    decode_ids: u32,
+    /// Every `layer` below is the trunk's layer index (`BankGeometry.n_layers`).
+    rows: *const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, out: *Array) callconv(.c) Verdict,
+    /// After the eval that consumed a forward's calls.
+    settle: *const fn (ctx: ?*anyopaque) callconv(.c) Verdict,
+    /// Before each forward: a prompt pass or decode (the slot rows follow it).
+    phase: *const fn (ctx: ?*anyopaque, prompt: bool) callconv(.c) Verdict,
+    /// A prompt pass's predicted routes of `layer` (every row's ids), read while its attention runs.
+    read_ahead: *const fn (ctx: ?*anyopaque, layer: u32, ids: [*]const u16, n: usize) callconv(.c) Verdict,
+    /// The fused forms the trunk takes where offered (`Routed`'s of the same names); null: not offered.
+    rows_shared: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, out: *Array) callconv(.c) Verdict = null,
+    rows_expand: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict = null,
+    rows_expand_into: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict = null,
+    rows_decode_expand: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict = null,
+    next_ahead: ?*const fn (ctx: ?*anyopaque, layer: u32, ids: Array) callconv(.c) Verdict = null,
 };
 
 pub const Swiglu = extern struct {
@@ -114,6 +176,6 @@ const testing = std.testing;
 test "abi quant: every struct opens with its size" {
     const w: Weight = .{};
     try testing.expectEqual(@as(u32, @sizeOf(Weight)), w.size);
-    inline for (.{ Source, Weight, LoadCtx, QuantTable, Swiglu }) |T|
+    inline for (.{ Source, Weight, LoadCtx, QuantTable, Swiglu, BankGeometry, BankRows, Bank }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
 }

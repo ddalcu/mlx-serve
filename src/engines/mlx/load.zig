@@ -76,6 +76,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const TyInfo = @typeInfo(Ty);
     const Inner = if (TyInfo == .pointer) TyInfo.pointer.child else Ty;
     params.entry.load_progress.start(io_util.nowMsMonotonic(sch.io));
+    // A model an outside engine plugin names is its, over every built-in.
+    if (@import("../../host/plugins/loader.zig").engineFor(std.fs.path.basename(params.model_dir))) |p| return engines_load.loadOutside(sch, params, p);
     const ane_declined = if (@hasField(Inner, "ane_declined")) params.ane_declined else false;
     if (params.gguf == null and engines_served.aneWanted(params.config, params.ane) and !ane_declined and engines_load.aneAdmit(sch, params) and try engines_load.aneOpen(sch, params)) return;
     if (params.gguf) |route| return engines_load.loadGguf(sch, params, route);
@@ -174,8 +176,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // A served plugin reads the pack's tensors itself (`plugin/driver.zig`): the entry's map holds only the vision
     // tower, for the encoder below.
     const served = params.config.plugin != null;
-    // Only a plugin or an mlx-stream module serves a pack: refuse the rest before reading any weights.
-    if (!served and !params.config.mlxStream()) return error.PluginDeclinedNoLegacy;
+    // Only a plugin serves a pack: refuse the rest before reading any weights.
+    if (!served) return error.PluginDeclinedNoLegacy;
     weights_ptr.* = if (served) Weights.init(sch.allocator) else try model_mod.loadModelWeights(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision);
     errdefer weights_ptr.deinit();
     if (!served) {

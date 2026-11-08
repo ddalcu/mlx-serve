@@ -1396,3 +1396,39 @@ Cause: the adapter hands ds4 any `-DSpark-`/`-MTP-` GGUF in the model's folder, 
 support GGUF (and `--dspark`) for the V4.1 family. Fix: `engine_pick.ds4Spec` says which archs take one; the adapter
 logs and skips the file for the rest (`--mlx-gguf` still drafts with it). Guard: `open: a support GGUF beside the
 model reaches ds4 only for an arch that takes one` + `ds4Spec: DeepSeek-V4.1 takes no support GGUF in ds4`.
+
+### A DeepSeek-V4.1 pack whose vision tower the build cannot read failed the whole load
+Defect: the EXL3 repack (its tower EXL3 too) died at boot with `EngineFailed` instead of serving text with vision off.
+Cause: under `-Dunits` (the macOS default) the tower init runs in the module archs' unit and its error crosses by name;
+`MissingVisionWeights` was not in `err_name.Known`, so `load.zig`'s benign opt-out never matched. Fix: the name joined
+`Known`. Guard: the `err_name` test; an error a caller compares after a cross-unit call must be in `Known`.
+
+### A short prompt on DeepSeek-V4.1's streamed EXL3 bank failed the request
+Defect: a 12-token prompt ("Name three primary colors") 500'd with `PluginForwardFailed`; 8 and 18 tokens served.
+Cause: `extendIds` picked the bank's prompt phase only past the 16 decode-region rows, but a decode-phase call holds
+48 routed ids (8 rows at top-6); 9-16 rows went wide in the decode phase and the stream refused `NotPrefill`. The
+module unit's error crossed as `EngineFailed`, and the forward logged no name. Fix: `promptPhase` (rows or routed
+ids), and the forward logs its error by name. Guard: `dsv41 streamed phase` + `tests/test_dsv41.sh` [4].
+
+### `WeightHooks.keep_key` is all-or-nothing: the engine loads every tensor or none
+Defect: a plugin's `keep_key` that left the embedding and the vision tower on disk freed nothing: the server still held
+2.4 GB more than the old plugin, and the streamed bank got fewer slot rows. Cause: the driver asks the hook only
+whether the table keeps ANY tensor (`keepsAny`); a keep means the whole pack loads. Fix: deepseek_v41 drops what it does
+not read after `init` (the embedding behind its pread, an outside plugin's tower, the stacked `wo_a` slices) and clears
+MLX's cache before the bank reads the memory in use. Guard: the `slot rows per layer` load line against the old plugin.
+
+### DeepSeek-V4.1's settings set at load reached only one of its three units
+Defect: under `-Dunits` the ported prompt-pass and streamer modules kept their settings and per-prompt regions in
+plain globals; the plugin unit's load set them, and the modules unit (DSpark rounds, the streamer) ran on its own
+defaults. Fix: every such global is one `Shared` per file (`ps()`), listed through `shared_all.zig`. Guard:
+`zig build units-check -Dunits=true` (it listed 55).
+
+### `stream_experts` under-billed every MoE whose plugin did not stream
+Defect: the setting on a qwen3_moe or Hy3 pack billed the residents plus slot rows, while the plugin, which never read
+it, loaded every expert. Cause: the preflight swapped expert bytes for slot rows on the setting alone; only qwen3_5 and
+deepseek_v41 opened a stream, each with its own copy of the open and bind code. Fix: `Caps.experts_stream` (the
+preflight refuses the setting without it) and two SDK calls every MoE on the shared block uses (`Streamed.forLoad`,
+`moe.bindStreamed`). The suite's check also caught a CPU stream serving rows before their reads landed (wrong logits,
+no error): `openPack` takes GPU streams only. Guard: `residentModelDiskBytes: with stream_experts ...`, the
+conformance suite's streamed check, `mlx pack: a pack opened on a CPU stream is refused by name`.
+

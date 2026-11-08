@@ -138,7 +138,7 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertEqual(badge("ds4"), "DS4")
         XCTAssertEqual(badge("mlx-gguf"), "MLX GGUF")
         XCTAssertEqual(badge("sushi"), "Sushi")
-        XCTAssertEqual(badge("mlx-stream"), "Stream")
+        XCTAssertEqual(badge("plugin"), "Plugin") // an outside engine plugin
         XCTAssertEqual(badge(nil), "MLX") // a server that predates the field
     }
 

@@ -147,7 +147,7 @@ fn poolPlan(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, li: usize, rows: A, pe
     const ratio: usize = ly.ratio;
     const r = dim(rows, 0);
     if (r == 0 or r > decode.max_rows or (ratio != 1 and ratio != 2) or m.cfg.head_dim != 512 or m.cfg.dsv4_index_head_dim != channels) return null;
-    if (mlx.mlx_array_dtype(wk.w) != .bfloat16 or wk.s.ctx != null or mlx.mlx_array_dtype(cw.norm) != .bfloat16 or mlx.mlx_array_dtype(iw.k_norm) != .bfloat16) return null;
+    if (wk.ext != null or mlx.mlx_array_dtype(wk.w) != .bfloat16 or wk.s.ctx != null or mlx.mlx_array_dtype(cw.norm) != .bfloat16 or mlx.mlx_array_dtype(iw.k_norm) != .bfloat16) return null;
     const pooling = ratio == 2;
     if (dim(rows, 1) != (if (pooling) @as(usize, 1024) else 512) or mlx.mlx_array_dtype(rows) != (if (pooling) mlx.mlx_dtype.float32 else .bfloat16)) return null;
     const np: usize = if (pooling) p0 % 2 else 0;

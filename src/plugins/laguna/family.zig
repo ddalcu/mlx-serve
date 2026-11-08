@@ -15,6 +15,7 @@ const run_mod = @import("../../sdk/bases/run.zig");
 const computeYarnFreqs = @import("../../sdk/blocks/rope/yarn.zig").computeYarnFreqs;
 const DecodeCopies = @import("../../sdk/bases/blocks/decode_copies.zig").DecodeCopies;
 const loader = @import("../llama/load.zig");
+const streamed = @import("../../sdk/weights/streamed.zig");
 const config = @import("config.zig");
 
 const b = bases.blocks;
@@ -46,8 +47,11 @@ pub fn Loaded(comptime D: type) type {
         layers: []D.Layer = &.{},
         owned: loader.Owned = .{},
         route_fns: []compiled.Closure = &.{},
+        /// The routed experts streamed from the pack (the `stream_experts` setting).
+        experts: ?streamed.Streamed = null,
 
         pub fn release(m: *Self) void {
+            if (m.experts) |*x| x.close();
             for (m.route_fns) |*f| compiled.free(f);
             gpa.free(m.route_fns);
             m.owned.release();
@@ -95,6 +99,7 @@ pub fn loadFamily(comptime D: type, ctx: *const abi.LoadCtx) !*Loaded(D) {
     m.route_fns = try gpa.alloc(compiled.Closure, c.num_hidden_layers);
     @memset(m.route_fns, .{ .ctx = null });
     const o = &m.owned;
+    if (c.num_experts > 0) m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.num_experts, s);
     const yarn = if (c.yarn != null) try yarnTables(o, c) else null;
 
     const hidden = c.hidden_size;
@@ -159,6 +164,7 @@ pub fn loadFamily(comptime D: type, ctx: *const abi.LoadCtx) !*Loaded(D) {
             continue;
         }
         var w = try moeOf(&r, o, c, i);
+        if (m.experts) |*x| try b.moe.bindStreamed(&w, x, try r.name(&nb, "layers.{d}.mlp", .{i}));
         m.route_fns[i] = b.moe.compileRouting(&w, s);
         w.route_fn = m.route_fns[i];
         L.mlp = try mlpOf(D, &r, o, i, .{ .moe = w });

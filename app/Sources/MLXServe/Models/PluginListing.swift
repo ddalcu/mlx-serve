@@ -29,7 +29,7 @@ enum PluginListing {
         case needsNewer(String)
         /// Installed, but the server refused it as built for another mlx-serve: a rebuild with this kit loads it.
         case needsRebuild
-        /// The running server has not applied the switch: it loads plugins only at its start.
+        /// The running server has not applied the switch or the options: it loads plugins only at its start.
         case restartNeeded
     }
 
@@ -47,6 +47,7 @@ enum PluginListing {
         if server[item.name]?.rebuild == true { return .needsRebuild }
         let wanted = switches.enabled && switches.isOn(item.name)
         if serverUp, wanted != (server[item.name]?.loaded == true) { return .restartNeeded }
+        if serverUp, wanted, OutsidePlugins.applied(receipt, switches) != (server[item.name]?.options ?? [:]) { return .restartNeeded }
         return wanted ? .on : .off
     }
 

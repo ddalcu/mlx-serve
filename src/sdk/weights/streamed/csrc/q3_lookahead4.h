@@ -20,8 +20,10 @@ extern "C" {
 #endif
 
 /* res[t * RES_W + k]: 0 status, 1 preadv calls, 2 bytes returned, 3 payload landed, 4 errno,
- * 5 t_start (monotonic ns), 6 t_end, 7 worker index. */
-#define Q3LD_RES_W 8
+ * 5 t_start (monotonic ns), 6 t_end, 7 worker index, 8 the lookahead flags (bit 0 an unclaimed speculative chunk in
+ * flight at the range's start, >> 1 those started while it read), 9 the wait ns (an adopted range's for its record's
+ * chunks, a pre-bound range's for its pre-read). */
+#define Q3LD_RES_W 10
 #define Q3LD_MAX_WORKERS 8
 #define Q3LD_MAX_COMP 6
 #define Q3LD_MAX_ITEMS 8
@@ -49,6 +51,7 @@ int64_t q3ld_monotonic_ns(void);
 int q3ld_spec_config(int32_t nthreads, const uint64_t *bufs, int32_t nslots, int64_t slot_bytes, int64_t rec_len,
                      int64_t chunk, int64_t *counters);
 int q3ld_spec_streams(int32_t idle_busy);   /* stopped pool, after spec_config: 0 or 1; 0 or -1 */
+int q3ld_gu_split(int32_t mode);           /* dq1b: any time: 0 off, 1 the gate/up ranges in two jobs; 0 or -1 */
 int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t psize,
                int64_t *res_arr, int64_t n_tickets, int64_t *log_arr, int64_t n_log, int64_t *gauge_arr);
 /* One job of n <= MAX_ITEMS records on tickets first .. first + 2n - 1: GU(0..n-1) then DOWN(0..n-1); claims the
@@ -92,7 +95,13 @@ int q3ld_ev_config(int32_t kind, uint64_t obj, int64_t timeout_ns, uint64_t star
 int32_t q3ld_ev_gates(int32_t n, const uint64_t *values, const int32_t *counts, const int64_t *tickets);
 int32_t q3ld_ev_release(uint64_t value);    /* force every live gate <= value; forced count, -1 off */
 int32_t q3ld_ev_state(int64_t *out);        /* 10 words; returns the live gate count */
-int32_t q3ld_abi(void);                     /* 2026102401 */
+/* PARTS (ABI 2026110101), on a stopped pool: block 0 (off) or a power of two >= 512, the file's block; each demand
+ * range part whose file offset, length and row address are multiples of it is read straight into its row, the others
+ * staged and copied.  0 or -1. */
+int q3ld_parts_config(int64_t block);
+/* PARTS' phase switch, at any time: 1 (the default) the route as configured, 0 every range staged.  0. */
+int q3ld_parts_live(int32_t on);
+int32_t q3ld_abi(void);                     /* 2026110202 */
 int32_t q3ld_max_gates(void);
 int32_t q3ld_max_gate_tickets(void);
 int32_t q3ld_max_pre(void);

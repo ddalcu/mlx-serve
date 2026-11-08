@@ -12,7 +12,6 @@ const Transformer = @import("transformer.zig").Transformer;
 /// then resets the cache so the first real request starts from clean state.
 /// Idempotent — calling twice is wasted work but not incorrect.
 pub fn warmup(self: *Transformer) !void {
-    if (self.mlx_stream_ext != null) return; // mlx-stream warms its own kernels at construction
     const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
     const decode_shape = [_]c_int{ 1, 1 };
     const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);

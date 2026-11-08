@@ -286,7 +286,7 @@ pub fn parseAs(comptime asr: bool, dir: *const abi.PackDir, config_json: abi.Str
     }
     c.quant = quantization(outer) catch return unsupported(P, "quantization");
 
-    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !moe and c.rope != .dynamic, .moe = moe, .dflash_capture = true } };
+    var p: abi.Parsed = .{ .caps = .{ .batches_decode = !moe and c.rope != .dynamic, .moe = moe, .dflash_capture = true, .experts_stream = moe } };
     const s = &p.shell;
     s.* = .{
         .vocab_size = c.vocab_size,

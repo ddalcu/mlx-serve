@@ -34,6 +34,7 @@ const fused_act = @import("../../blocks/mlp/fused_activations.zig");
 const clampedSwiGLU = @import("../../blocks/mlp/activations.zig").clampedSwiGLU;
 const sigmoidTable = @import("../../blocks/hc/hc_prefill.zig").sigmoidTable;
 const routed = @import("../../weights/routed.zig");
+const streamed = @import("../../weights/streamed.zig");
 const HiddenAct = @import("../../blocks/mlp/activations.zig").HiddenAct;
 
 const Array = ops.Array;
@@ -133,6 +134,20 @@ pub const Streamed = struct {
     /// `sigmoid(x @ router) + bias` starts that layer's likely reads (`Routed.trunk`'s scores); null = none.
     next: ?struct { router: Array, bias: Array } = null,
 };
+
+/// Routes `w`'s experts through the stream's layer `prefix` (the pack's `<prefix>.{switch_mlp,experts}.*`): the banks
+/// keep their quant params; their arrays stay the caller's, never read. What the streamed arm does not run (a format's
+/// or a model's own expert kernel, one-expert views, non-affine or per-expert-scaled banks) is refused by name.
+pub fn bindStreamed(w: *Moe.Weights, x: *streamed.Streamed, prefix: []const u8) !void {
+    if (w.format_banks != null or w.fused != null or w.bank_views != null or w.route_scale.ctx != null) return error.StreamedExpertsUnsupported;
+    inline for (.{ &w.gate, &w.up, &w.down }) |bk| {
+        if (bk.qp.mode != .affine) return error.StreamedPackNotAffine;
+        if (bk.expert_scale.ctx != null) return error.StreamedExpertScales;
+    }
+    const layer = x.layerOf(prefix) orelse return error.StreamedLayerMissing;
+    inline for (.{ &w.gate, &w.up, &w.down }) |bk| bk.* = .{ .w = .{ .ctx = null }, .qp = bk.qp };
+    w.streamed = .{ .routed = x.routedSource(), .layer = layer };
+}
 
 /// A model's one-kernel MoE at up to `rows` rows (GLM's `moeDecode`): the routed sum plus the shared expert in `x`'s
 /// shape, or null to take the block's arms. `limit` is the model's SwiGLU limit as its kernel reads it.

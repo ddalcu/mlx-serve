@@ -3,7 +3,6 @@
 const std = @import("std");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 const testing = std.testing;
 
@@ -135,23 +134,6 @@ pub fn inferenceLoop(ctx: ThreadCtx) void {
         if (chatPass(sch, .main) == .shutdown) break;
     }
     persistAtShutdown(sch);
-    closeGlmModels(sch);
-}
-
-/// At shutdown, on the inference thread: GLM-5.3's module synchronizes its stream as it frees, and MLX finds that
-/// stream only on this thread, not on the one that joins it (`Scheduler.deinit`, where every other model unloads as
-/// before; "There is no Stream(gpu, 0) in current thread", mlx-c stream.cpp).
-fn closeGlmModels(sch: *Scheduler) void {
-    sch.registry.mutex.lockUncancelable(sch.io);
-    defer sch.registry.mutex.unlock(sch.io);
-    var it = sch.registry.entries.valueIterator();
-    while (it.next()) |entry| {
-        const x = entry.*.transformer orelse continue;
-        if (!x.config.glm_stream) continue;
-        const m = x.mlx_stream_ext orelse continue;
-        mlx_stream.close(m);
-        x.mlx_stream_ext = null;
-    }
 }
 
 /// Cleanup, vision and embed work, drained on the inference thread. Returns

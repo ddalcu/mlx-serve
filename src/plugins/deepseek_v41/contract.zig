@@ -8,6 +8,15 @@ const mlx = @import("../../mlx/ffi.zig");
 const kit = @import("../deepseek_v4/contract_kit.zig");
 const kc = @import("../../sdk/testing/kernel_contract/root.zig");
 const v41 = @import("deepseek_v41.zig");
+const qtail = @import("prompt/q_tail.zig");
+const hcf = @import("prompt/hc_fuse.zig");
+const sx1 = @import("prompt/scratch_x1.zig");
+const gtwin = @import("decode/gemv_twin.zig");
+const ggemm = @import("prompt/gate_gemm.zig");
+const markov = @import("spec/markov.zig");
+const mplan = @import("spec/markov_plan.zig");
+const fa = @import("prompt/flash_attn.zig");
+const satt = @import("../../sdk/blocks/attention/contract.zig");
 const gguf = @import("../../sdk/quant/gguf/kernels.zig");
 const gguf_contract = @import("../../sdk/quant/gguf/contract.zig");
 const gguf_quants = @import("../../sdk/quant/gguf/quants.zig");
@@ -131,6 +140,9 @@ pub fn stressDot(rng: std.Random, x: []f64, w: []f64, rows: usize, k: usize, xma
 
 fn depthK(s: Shape) usize {
     return s.k;
+}
+fn depthN(s: Shape) usize {
+    return s.n;
 }
 fn depthK1(s: Shape) usize {
     return s.k + 1;
@@ -1122,6 +1134,900 @@ pub const RopeTail = struct {
             if (qatOk(k.p.qk, iv[0..blk], got[i..][0..blk], act, &k.msg, i)) |why| return why;
         }
         return null;
+    }
+};
+
+// ── hc_mix_norm: hc_mix's mixes and hc_norm's normed collapse of the same rows in one launch ──
+
+/// hc_fuse.zig's claims are bit-equality with the stock launches: gate 3 proves them against those (`replaced`), the
+/// float64 bound the rest.
+const fused_sums: spec.Sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "bit-equal to the stock hc launches (gate 3); random rows, not a stress" };
+
+/// The normed collapse of row `l`'s copies (`x` [L, HC, D], `cpre` [L, HC]) under each weight in `ws`, into
+/// `out[c][l * D ..]` (hc_norm's statements in float64); `mag` the error's scale.
+fn normedCollapse(x: []const f64, cpre: []const f64, ws: []const []const f64, eps: f64, l: usize, D: usize, sum: Sum, hb: []f64, sq: []f64, out: []const []f64, mag: []const []f64) void {
+    for (0..D) |d| {
+        var h: f64 = 0;
+        for (0..HC) |j| h += cpre[l * HC + j] * x[(l * HC + j) * D + d];
+        hb[d] = bf(h);
+        sq[d] = hb[d] * hb[d];
+    }
+    const inv = 1 / @sqrt(sum.of(sq[0..D]) / @as(f64, @floatFromInt(D)) + eps);
+    for (ws, out, mag) |w, o, m| for (0..D) |d| {
+        o[l * D + d] = w[d] * bf(hb[d] * inv);
+        m[l * D + d] = @abs(o[l * D + d]);
+    };
+}
+
+const HcMixNorm = struct {
+    pub const Params = struct { tg: usize = 1024, cols: usize = 6, h2: bool = true };
+    const R = 4;
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or MIX % p.cols != 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci((MIX / p.cols + 1) * p.tg), ci((s.rows + R - 1) / R), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
+        g.out(&.{ ci(s.rows), MIX }, .float32);
+        g.out(&.{ ci(s.rows), ci(s.n) }, act);
+        if (p.h2) g.out(&.{ ci(s.rows), ci(s.n) }, act) else {
+            g.out(&.{1}, act);
+            g.unread = 1 << 2;
+        }
+        g.int("TG", p.tg);
+        g.int("R", R);
+        g.int("M", p.cols);
+        g.int("HC", HC);
+        g.int("H2", @intFromBool(p.h2));
+        g.dtype("T", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try HcMix.fill(k, f, rng);
+        const cpre = try k.add(.float32, &.{ k.shape.rows, HC });
+        const w = try k.add(act, &.{k.shape.n});
+        const w2 = try k.add(act, &.{k.shape.n});
+        kit.uniform(rng, cpre, 0, 1);
+        kit.uniform(rng, w, 0.5, 1.5);
+        kit.uniform(rng, w2, 0.5, 1.5);
+    }
+
+    pub fn count(p: Params, s: Shape) usize {
+        return s.rows * MIX + s.rows * s.n * @as(usize, if (p.h2) 2 else 1);
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const zn = L * MIX;
+        try HcMix.compute(k, out[0..zn], mag[0..zn], sum);
+        const a = k.scratch();
+        const buf = try a.alloc(f64, 2 * D);
+        defer a.free(buf);
+        const ws = [_][]const f64{ k.in(6), k.in(7) };
+        const outs = [_][]f64{ out[zn..][0 .. L * D], if (k.p.h2) out[zn + L * D ..][0 .. L * D] else &.{} };
+        const mags = [_][]f64{ mag[zn..][0 .. L * D], if (k.p.h2) mag[zn + L * D ..][0 .. L * D] else &.{} };
+        const nh: usize = if (k.p.h2) 2 else 1;
+        for (0..L) |l| normedCollapse(k.in(0), k.in(5), ws[0..nh], spec.roundTo(.f32, k.in(4)[0]), l, D, sum, buf[0..D], buf[D..], outs[0..nh], mags[0..nh]);
+    }
+
+    /// The stock launches: hc_mix's mixes, then hc_norm's normed collapse (twice with `w2`).
+    pub fn replaced(k: anytype) ![]const u8 {
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        var m: v41.Dsv41Model = undefined;
+        m.s = k.rig.stream();
+        m.cfg = .{};
+        m.cfg.dsv4_hc_mult = HC;
+        m.cfg.dsv4_hc_sinkhorn_iters = ITERS;
+        m.hc_tg = k.p.tg;
+        m.hc_mix_kernel = try v41.buildKernel("dsv41_hc_mix", &.{ "x", "fn", "scale", "base", "eps" }, &.{"z"}, v41.HC_MIX_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_mix_kernel);
+        m.hc_norm_kernel = try v41.buildKernel("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "pre", "post", "comb", "h_out" }, v41.HC_NORM_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_norm_kernel);
+        const hc: v41.Hc = .{ .fn_w = k.args[1], .scale = k.args[2], .base = k.args[3] };
+        const z = try v41.hcMixWide(&sc, &m, k.args[0], &hc, k.args[4]);
+        const n = try v41.hcNorm(&sc, &m, z, k.args[0], k.args[5], k.args[6], k.args[4]);
+        if (!k.p.h2) return k.rig.bytesOf(&.{ z, n.h });
+        const n2 = try v41.hcNorm(&sc, &m, z, k.args[0], k.args[5], k.args[7], k.args[4]);
+        return k.rig.bytesOf(&.{ z, n.h, n2.h });
+    }
+};
+
+// ── the hc expand: the new stream `post * y + comb^T res`, into a bound region or with its normed collapse ──
+
+/// Row `l`'s new stream (`y` [L, D], `res` [L, HC, D], `post` [L, HC], `comb` [L, HC, HC]) into `out[l * HC * D ..]`,
+/// rounded to `act` when a later stage reads it (`round`); `mag` the sum of its terms' magnitudes.
+fn expandRow(y: []const f64, res: []const f64, post: []const f64, comb: []const f64, l: usize, D: usize, round: bool, out: []f64, mag: []f64) void {
+    for (0..HC) |i| for (0..D) |d| {
+        const o = (l * HC + i) * D + d;
+        var v = post[l * HC + i] * y[l * D + d];
+        var m = @abs(v);
+        for (0..HC) |j| {
+            const t = comb[(l * HC + j) * HC + i] * res[(l * HC + j) * D + d];
+            v += t;
+            m += @abs(t);
+        }
+        out[o] = if (round) bf(v) else v;
+        mag[o] = m;
+    };
+}
+
+/// The expand's inputs in the wrapper's order (`y`, `res`, `post`, `comb`), shaped as `expandInto` or the fused launch
+/// binds them (`lead`: `y` [1, L, D] and `res` [1, L, HC, D]).
+fn expandFill(k: anytype, f: Fill, rng: std.Random, lead: bool) !void {
+    const L = k.shape.rows;
+    const D = k.shape.n;
+    const y = try k.add(act, if (lead) &.{ 1, L, D } else &.{ L, D });
+    const res = try k.add(act, if (lead) &.{ 1, L, HC, D } else &.{ L, HC, D });
+    const post = try k.add(.float32, &.{ L, HC });
+    const comb = try k.add(.float32, &.{ L, HC, HC });
+    kit.uniform(rng, y, -3, 3);
+    kit.uniform(rng, res, -3, 3);
+    kit.uniform(rng, post, 0, 2);
+    kit.uniform(rng, comb, 0, 0.5);
+    if (f == .nonfinite) {
+        kit.plantRows(y, L, D);
+        kit.plantRows(res, L, HC * D);
+    }
+}
+
+/// The stock expand (glm5's) over the case's inputs, [L, HC, D].
+fn stockExpand(sc: *v41.Scope, k: anytype) !mlx.mlx_array {
+    const L = ci(k.shape.rows);
+    const D = ci(k.shape.n);
+    const y = try sc.reshape(k.args[0], &.{ L, D });
+    const res = try sc.reshape(k.args[1], &.{ L, HC, D });
+    return v41.hcExpand(sc, res, y, &.{ .pre = none, .post = k.args[2], .comb = k.args[3] });
+}
+
+/// kernels/hc_expand_into.metal: the new stream into `dst`, a bound region.
+const ExpandInto = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or s.n % 4 != 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci(s.n / 4), ci(s.rows), 1 }, .tg = .{ ci(@min(256, s.n / 4)), 1, 1 } };
+        g.out(&.{1}, .uint32);
+        g.unread = 1;
+        g.dtype("T", act);
+        g.int("HC", HC);
+        g.int("D", s.n);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try expandFill(k, f, rng, true);
+        const dst = try k.add(act, &.{ k.shape.rows, HC, k.shape.n });
+        @memset(dst, nan);
+        _ = try k.add(.uint32, &.{1});
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * HC * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        for (0..k.shape.rows) |l| expandRow(k.in(0), k.in(1), k.in(2), k.in(3), l, k.shape.n, false, out, mag);
+    }
+
+    /// The region the kernel wrote.
+    pub fn output(k: anytype, own: *std.ArrayList(u8)) !void {
+        try own.appendSlice(k.scratch(), try k.rig.bytesOf(&.{k.args[4]}));
+    }
+
+    pub fn replaced(k: anytype) ![]const u8 {
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        return k.rig.bytesOf(&.{try stockExpand(&sc, k)});
+    }
+};
+
+/// kernels/hc_expand_norm.metal: the expand and hc_norm's normed collapse of the new stream in one launch, the new
+/// stream a fresh `x1` or (`into`) written into `dst`.
+const ExpandNorm = struct {
+    pub const Params = struct { into: bool, tg: usize = 1024 };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci(p.tg), ci(s.rows), 1 }, .tg = .{ ci(p.tg), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, act);
+        if (p.into) {
+            g.out(&.{1}, .uint32);
+            g.unread = 1 << 1;
+        } else g.out(&.{ ci(s.rows), HC, ci(s.n) }, act);
+        g.int("TG", p.tg);
+        g.int("HC", HC);
+        g.dtype("T", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try expandFill(k, f, rng, false);
+        const cpre = try k.add(.float32, &.{ k.shape.rows, HC });
+        const w = try k.add(act, &.{k.shape.n});
+        const eps = try k.add(.float32, &.{2});
+        kit.uniform(rng, cpre, 0, 1);
+        kit.uniform(rng, w, 0.5, 1.5);
+        eps[0] = EPS_RMS;
+        eps[1] = EPS_HC;
+        if (k.p.into) {
+            const dst = try k.add(act, &.{ k.shape.rows, HC, k.shape.n });
+            @memset(dst, nan);
+            _ = try k.add(.uint32, &.{1});
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n + s.rows * HC * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const D = k.shape.n;
+        const x1 = out[L * D ..];
+        for (0..L) |l| expandRow(k.in(0), k.in(1), k.in(2), k.in(3), l, D, true, x1, mag[L * D ..]);
+        const a = k.scratch();
+        const buf = try a.alloc(f64, 2 * D);
+        defer a.free(buf);
+        for (0..L) |l| normedCollapse(x1, k.in(4), &.{k.in(5)}, spec.roundTo(.f32, k.in(6)[0]), l, D, sum, buf[0..D], buf[D..], &.{out[0 .. L * D]}, &.{mag[0 .. L * D]});
+    }
+
+    /// `h_out`, then the new stream (`dst` when written into it).
+    pub fn output(k: anytype, own: *std.ArrayList(u8)) !void {
+        const a = k.scratch();
+        try own.appendSlice(a, k.rig.outputBytes()[0 .. k.shape.rows * k.shape.n * 2]);
+        if (k.p.into) try own.appendSlice(a, try k.rig.bytesOf(&.{k.args[7]})) else try own.appendSlice(a, k.rig.outputBytes()[k.shape.rows * k.shape.n * 2 ..]);
+    }
+
+    /// The stock launches: glm5's expand, then hc_norm's normed collapse of the new stream.
+    pub fn replaced(k: anytype) ![]const u8 {
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        var m: v41.Dsv41Model = undefined;
+        m.s = k.rig.stream();
+        m.cfg = .{};
+        m.cfg.dsv4_hc_mult = HC;
+        m.cfg.dsv4_hc_sinkhorn_iters = ITERS;
+        m.hc_tg = k.p.tg;
+        m.hc_norm_kernel = try v41.buildKernel("dsv41_hc_norm", &.{ "z", "x", "cpre", "w", "eps" }, &.{ "pre", "post", "comb", "h_out" }, v41.HC_NORM_SOURCE, "");
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.hc_norm_kernel);
+        const x1 = try stockExpand(&sc, k);
+        const z = try sc.zeros(&.{ ci(k.shape.rows), MIX }, .float32);
+        const n = try v41.hcNorm(&sc, &m, z, x1, k.args[4], k.args[5], k.args[6]);
+        return k.rig.bytesOf(&.{ n.h, x1 });
+    }
+};
+
+// ── decode/gemv_twin.zig: MLX's one-row gemv over a verify's rows, each row its one-row words ──
+
+/// A launch shape of the twin: the header `gemv_twin.header` writes for the plan of an [n, k] weight tiled by `v`;
+/// `m12` its M1/M2 compiled thread limit.
+fn twinLaunch(comptime n: usize, comptime k: usize, comptime v: gtwin.Variant, comptime m12: u32) metal.Launch {
+    const p = comptime gtwin.tiled(gtwin.plan(n, k), n, v).?;
+    const h: [:0]const u8 = comptime blk: {
+        var buf: [512]u8 = undefined;
+        const s = gtwin.header(&buf, "bfloat16_t", p, v.nr, v.ilv) catch unreachable;
+        var out: [s.len:0]u8 = undefined;
+        @memcpy(out[0..s.len], s);
+        const final = out;
+        break :blk &final;
+    };
+    const block_m = p.bm * p.sm * p.tm;
+    return .{
+        .name = std.fmt.comptimePrint("dsv41_gemv_twin_bf16_bm{d}_bn{d}_sm{d}_sn{d}_tm{d}_tn{d}_r{d}{s}", .{ p.bm, p.bn, p.sm, p.sn, p.tm, p.tn, v.nr, if (v.ilv) "_i" else "" }),
+        .inputs = &.{ "x", "w" },
+        .outputs = &.{"y"},
+        .source = gtwin.source,
+        .header = h,
+        .tg_bytes = 4 * v.nr * (if (p.bn > 1) p.bn * (block_m + p.tm) else 1),
+        .m1 = m12,
+        .m2 = m12,
+    };
+}
+
+const GemvTwin = struct {
+    pub const Params = struct { v: gtwin.Variant };
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (s.rows < 2 or s.rows > gtwin.max_rows or s.n == 0 or s.k == 0) return null;
+        const t = gtwin.tiled(gtwin.plan(s.n, s.k), s.n, p.v) orelse return null;
+        const chunks = (s.rows + p.v.nr - 1) / p.v.nr;
+        var g = if (p.v.ilv)
+            metal.Geometry{ .grid = .{ ci(t.tgs * chunks * 32), ci(t.bn), ci(t.bm) }, .tg = .{ 32, ci(t.bn), ci(t.bm) } }
+        else
+            metal.Geometry{ .grid = .{ ci(t.tgs * 32), ci(t.bn), ci(chunks * t.bm) }, .tg = .{ 32, ci(t.bn), ci(t.bm) } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const K = k.shape.k;
+        const x = try k.add(act, &.{ L, K });
+        const w = try k.add(act, &.{ k.shape.n, K });
+        kit.uniform(rng, x, -2, 2);
+        kit.uniform(rng, w, -2, 2);
+        switch (f) {
+            .random => {},
+            .nonfinite => kit.plantRows(x, L, K),
+            // A short row takes larger terms (k/2 x 64 x 64 stays below 2^24) to push fp16's partial sums out of range.
+            .stress => {
+                try stressDot(rng, x[0..K], w, k.shape.n, K, 64, if (K <= 1024) 64 else 7, k.scratch());
+                for (1..L) |r| @memcpy(x[r * K ..][0..K], x[0..K]);
+            },
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const K = k.shape.k;
+        const N = k.shape.n;
+        const t = try k.scratch().alloc(f64, K);
+        defer k.scratch().free(t);
+        for (0..k.shape.rows) |r| for (0..N) |j| {
+            var m: f64 = 0;
+            for (t, k.in(0)[r * K ..][0..K], k.in(1)[j * K ..][0..K]) |*v, a, b| {
+                v.* = a * b;
+                m += @abs(v.*);
+            }
+            out[r * N + j] = sum.of(t);
+            mag[r * N + j] = m;
+        };
+    }
+
+    /// MLX's matmul of each row alone (its M = 1 gemv), the rows stacked.
+    pub fn replaced(k: anytype) ![]const u8 {
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        const wt = try sc.transpose(k.args[1], &.{ 1, 0 });
+        var rows: [gtwin.max_rows]A = undefined;
+        for (rows[0..k.shape.rows], 0..) |*y, r| y.* = try sc.matmul(try sc.slice(k.args[0], 0, r, r + 1), wt);
+        return k.rig.bytesOf(&.{try sc.concat(rows[0..k.shape.rows], 0)});
+    }
+};
+
+// ── prompt/gate_gemm.zig: the wide router's f32 logits as MLX's fused NAX GEMM over the stored types ──
+
+const GateGemm = struct {
+    pub const Params = struct {};
+    const t = ggemm.tile;
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.n == 0 or s.k == 0 or !ggemm.mlxRegular(@intCast(s.rows), @intCast(s.n), @intCast(s.k))) return null;
+        const swz: usize = @as(usize, 1) << @intCast(t.swz);
+        const tiles_m = (s.rows + t.bm - 1) / t.bm;
+        const tiles_n = (s.n + t.bn - 1) / t.bn;
+        var g = metal.Geometry{ .grid = .{ ci(tiles_n * swz * 32), ci((tiles_m + swz - 1) / swz * t.wn), ci(t.wm) }, .tg = .{ 32, ci(t.wn), ci(t.wm) } };
+        g.out(&.{ ci(s.rows), ci(s.n) }, .float32);
+        g.dtype("T", .float32);
+        g.dtype("TA", act);
+        g.dtype("TB", .float16);
+        g.dtype("OUT_R", .float32);
+        g.int("BM", t.bm);
+        g.int("BN", t.bn);
+        g.int("BK", t.bk);
+        g.int("WM", t.wm);
+        g.int("WN", t.wn);
+        g.int("SWZ", t.swz);
+        g.int("AM", @intFromBool(s.rows % t.bm == 0));
+        g.int("AN", @intFromBool(s.n % t.bn == 0));
+        g.int("AK", @intFromBool(s.k % t.bk == 0));
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const M = k.shape.rows;
+        const K = k.shape.k;
+        const x = try k.add(act, &.{ M, K });
+        const w = try k.add(.float16, &.{ k.shape.n, K });
+        kit.uniform(rng, x, -2, 2);
+        kit.uniform(rng, w, -2, 2);
+        switch (f) {
+            .random => {},
+            .nonfinite => kit.plantRows(x, M, K),
+            .stress => {
+                try stressDot(rng, x[0..K], w, k.shape.n, K, 64, 7, k.scratch());
+                for (1..M) |r| @memcpy(x[r * K ..][0..K], x[0..K]);
+            },
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        return GemvTwin.compute(k, out, mag, sum);
+    }
+
+    /// The chain the router ran: both operands cast to f32, MLX's matmul.
+    pub fn replaced(k: anytype) ![]const u8 {
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        const w = try sc.astype(k.args[1], .float32);
+        return k.rig.bytesOf(&.{try sc.matmul(try sc.astype(k.args[0], .float32), try sc.transpose(w, &.{ 1, 0 }))});
+    }
+};
+
+// ── prompt/flash_attn.zig: a wide span's attention as one kernel, an online softmax over blocks of 128 keys ──
+
+/// Lossy (P rounds to f16 against the running max), so within the float64 online softmax's bound (the SDK attention
+/// contract's `online`: the sink's start, each block's rescale, the fast exp, P's rounding), not the gather's words.
+const AttnFlash = struct {
+    /// `Gathered`'s geometry (its keys), grouped as attnOut reads the heads; `qt`: the roped tail read from `qt`.
+    pub const Params = struct { wp: usize = 100, nc: usize = 700, p0: usize = 40, grouped: bool = true, og: usize = 8, qt: bool };
+    const HGN: usize = @intCast(fa.hgn);
+    const BK = 128;
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        if (!Gathered.ok(s) or s.n % (16 * HGN) != 0 or s.n % p.og != 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci(32 * s.n / (16 * HGN)), ci(s.rows), ci(4 * HGN) }, .tg = .{ 32, 1, ci(4 * HGN) } };
+        g.out(&.{ ci(p.og), ci(s.rows), ci(s.n / p.og * HD) }, act);
+        g.int("HGN", HGN);
+        g.int("QT", @intFromBool(p.qt));
+        g.int("RD", RD);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+
+    /// q, the keys (`Gathered.addKeys`: window rows, compressed rows, picks, meta), qt, the sink, the scale, the
+    /// inverse rope's periods.
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const q = try k.add(act, &.{ L, H, HD });
+        kit.uniform(rng, q, -2, 2);
+        try Gathered.addKeys(k, rng);
+        const qt = try k.add(act, &.{ L, H, 64 });
+        kit.uniform(rng, qt, -2, 2);
+        kit.uniform(rng, try k.add(.float32, &.{ 1, H, 1 }), -3, 3);
+        const scal = try k.add(.float32, &.{1});
+        scal[0] = 0.05;
+        periodsFill(try k.add(.float32, &.{RD / 2}), -1);
+        switch (f) {
+            .random => {},
+            .nonfinite => kit.plantRows(q, L * H, HD),
+            // Every query one stress vector (its tail in qt too), every key row a stress row against it; scale 1, so a
+            // score's sum error moves the weights.
+            .stress => {
+                scal[0] = 1;
+                const kw = k.in(1);
+                const comp = k.in(2);
+                const rows = (kw.len + comp.len) / HD;
+                const w = try k.scratch().alloc(f64, rows * HD);
+                defer k.scratch().free(w);
+                try stressDot(rng, q[0..HD], w, rows, HD, 64, 64, k.scratch());
+                @memcpy(kw, w[0..kw.len]);
+                @memcpy(comp, w[kw.len..]);
+                for (1..L * H) |r| @memcpy(q[r * HD ..][0..HD], q[0..HD]);
+                for (0..L * H) |r| @memcpy(qt[r * 64 ..][0..64], q[HD - 64 .. HD]);
+            },
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n * HD;
+    }
+
+    /// Each head's online softmax from its sink over its keys (absent ones weigh 0), O / l, then the epilogue's
+    /// inverse rope on the f32 values (fast trig); `mag` carries the whole allowance (depth one).
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const L = k.shape.rows;
+        const H = k.shape.n;
+        const NK = WINDOW + k.shape.k;
+        const hg = H / k.p.og;
+        const a = k.scratch();
+        const keys = try a.alloc(satt.Key, NK);
+        defer a.free(keys);
+        const ends = try a.alloc(usize, (NK + BK - 1) / BK);
+        defer a.free(ends);
+        for (ends, 0..) |*e, b| e.* = @min(NK, (b + 1) * BK);
+        const buf = try a.alloc(f64, 5 * HD);
+        defer a.free(buf);
+        const qv = buf[0..HD];
+        const terms = buf[HD .. 2 * HD];
+        const o = buf[2 * HD .. 3 * HD];
+        const eo = buf[3 * HD .. 4 * HD];
+        const zero = buf[4 * HD ..];
+        @memset(zero, 0);
+        const sim: satt.Sim = if (sum.acc) |x| .{ .acc = x, .order = sum.order } else null;
+        const scale = k.in(7)[0];
+        for (0..L) |l| for (0..H) |h| {
+            @memcpy(qv, k.in(0)[(l * H + h) * HD ..][0..HD]);
+            if (k.p.qt) @memcpy(qv[HD - 64 ..], k.in(5)[(l * H + h) * 64 ..][0..64]);
+            for (keys, 0..) |*key, c| key.* = if (Gathered.key(k, 1, l, c)) |row| blk: {
+                const d = satt.dot(qv, row, scale, HD, 1, sim, terms);
+                break :blk .{ .s = d.v, .e = d.e, .v = row };
+            } else .{ .s = -inf, .on = false, .v = zero };
+            const st = satt.online(.{ .p_unit = 0x1p-11, .p_abs = 0x1p-25 }, .{ .m = k.in(6)[h], .l = 1 }, keys, ends, o, eo);
+            satt.normalize(st, o, eo);
+            const base = ((h / hg) * L + l) * hg * HD + (h % hg) * HD;
+            for (0..HD - RD) |d| {
+                out[base + d] = o[d];
+                mag[base + d] = kc.host.allowance(eo[d]);
+            }
+            const pos: f64 = @floatFromInt(k.p.p0 + l);
+            var d: usize = HD - RD;
+            while (d < HD) : (d += 2) {
+                const th = pos * spec.roundTo(.f32, 1 / spec.roundTo(.f32, k.in(8)[(d - (HD - RD)) / 2]));
+                const x0 = o[d];
+                const x1 = o[d + 1];
+                out[base + d] = x0 * @cos(th) - x1 * @sin(th);
+                out[base + d + 1] = x0 * @sin(th) + x1 * @cos(th);
+                const e = eo[d] + eo[d + 1] + (@abs(x0) + @abs(x1)) * (@abs(th) * 3 * u + TRIG + 2 * u);
+                mag[base + d] = kc.host.allowance(e);
+                mag[base + d + 1] = kc.host.allowance(e);
+            }
+        };
+    }
+};
+
+// ── spec/markov.zig: the DSpark draft's Markov chain, a step a launch and the last one ──
+
+const MK_NT: usize = mplan.step_groups;
+const MK_NONE: u32 = 0xFFFFFFFF;
+
+/// markov_header.metal's order on (value, index) pairs: NaN first (the lower index among NaNs), then the larger value,
+/// then the lower index.
+fn mkBetter(va: f32, ia: u32, vb: f32, ib: u32) bool {
+    const na = std.math.isNan(va);
+    const nb = std.math.isNan(vb);
+    if (na != nb) return na;
+    if (na) return ia < ib;
+    if (va != vb) return va > vb;
+    return ia < ib;
+}
+
+fn bitsOf(v: f64) f32 {
+    return @bitCast(@as(u32, @intFromFloat(v)));
+}
+
+/// The index of the best of `n` (value bits, index) pairs at `p`.
+fn mkBest(p: []const f64, n: usize) u32 {
+    var bv = -std.math.inf(f32);
+    var bi = MK_NONE;
+    for (0..n) |j| {
+        const v = bitsOf(p[2 * j]);
+        const i: u32 = @intFromFloat(p[2 * j + 1]);
+        if (mkBetter(v, i, bv, bi)) {
+            bv = v;
+            bi = i;
+        }
+    }
+    return bi;
+}
+
+/// Step `K`'s pairs from its row: threadgroup g's best over the quads its simdgroups read (with zig-zag), into `out`
+/// as (value bits, index) per threadgroup.
+fn mkPairs(row: []const f32, K: usize, out: []f64) void {
+    const Q: u32 = @intCast(row.len / 4);
+    const ns: u32 = @intCast(MK_NT * mplan.step_simdgroups);
+    for (0..MK_NT) |g| {
+        var bv = -std.math.inf(f32);
+        var bi = MK_NONE;
+        for (0..mplan.step_simdgroups) |sg| {
+            var q: u32 = @intCast(g * mplan.step_simdgroups + sg);
+            while (q < Q) : (q += ns) {
+                const r0 = 4 * mplan.quadAt(q, Q, @intCast(K), true);
+                for (r0..r0 + 4) |i| if (mkBetter(row[i], @intCast(i), bv, bi)) {
+                    bv = row[i];
+                    bi = @intCast(i);
+                };
+            }
+        }
+        out[2 * g] = @floatFromInt(@as(u32, @bitCast(bv)));
+        out[2 * g + 1] = @floatFromInt(bi);
+    }
+}
+
+fn mkPairsBytes(a: std.mem.Allocator, pairs: []const f64) ![]u8 {
+    const b = try a.alloc(u8, 4 * pairs.len);
+    for (pairs, 0..) |v, i| std.mem.writeInt(u32, b[4 * i ..][0..4], @intFromFloat(v), .little);
+    return b;
+}
+
+/// kernels/markov_step.metal at step K = rows - 1 (`shape.n` the vocabulary, `shape.k` the rank), KEEP: the earlier
+/// steps' pairs passed on, this step's pairs a threadgroup, then the biased row.
+const MarkovStep = struct {
+    pub const Params = struct {};
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.rows > mplan.max_block) return null;
+        if (mplan.refusal(.{ .act = .bf16, .embed = .bf16, .hout = .bf16, .vocab = s.n, .rank = s.k, .dim = 1, .block = s.rows }) != null) return null;
+        var g = metal.Geometry{ .grid = .{ ci(MK_NT * mplan.step_threads), 1, 1 }, .tg = .{ ci(mplan.step_threads), 1, 1 } };
+        g.out(&.{ci(s.rows * MK_NT * 2)}, .uint32);
+        g.out(&.{ci(s.n)}, .float32);
+        g.dtype("T", act);
+        g.dtype("E", act);
+        g.int("R", s.k);
+        g.int("V", s.n);
+        g.int("K", s.rows - 1);
+        g.int("NT", MK_NT);
+        g.int("KEEP", 1);
+        g.int("ZZ", 1);
+        return g;
+    }
+
+    /// The token before step K: t1, or the best of step K - 1's pairs.
+    fn prev(k: anytype) usize {
+        const K = k.shape.rows - 1;
+        if (K == 0) return @intFromFloat(k.in(3)[0]);
+        return mkBest(k.in(4)[2 * (K - 1) * MK_NT ..], MK_NT);
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const K = k.shape.rows - 1;
+        const V = k.shape.n;
+        const R = k.shape.k;
+        const lg = try k.add(.float32, &.{ k.shape.rows, V });
+        const emb = try k.add(act, &.{ V, R });
+        const mh = try k.add(act, &.{ V, R });
+        const t1 = try k.add(.int32, &.{1});
+        const pin = try k.add(.uint32, &.{@max(K * MK_NT * 2, 8)});
+        kit.uniform(rng, lg, -4, 4);
+        kit.uniform(rng, emb, -1, 1);
+        kit.uniform(rng, mh, -1, 1);
+        t1[0] = @floatFromInt(rng.uintLessThan(usize, V));
+        for (0..K * MK_NT) |j| {
+            pin[2 * j] = @floatFromInt(@as(u32, @bitCast(@as(f32, @floatCast(rng.float(f64) * 20 - 10)))));
+            pin[2 * j + 1] = @floatFromInt(rng.uintLessThan(usize, V));
+        }
+        switch (f) {
+            .random => {},
+            .nonfinite => {
+                kit.plantRows(lg[K * V ..][0..V], 4, V / 4);
+                kit.plantRows(mh, V, R);
+                if (K > 0) pin[2 * ((K - 1) * MK_NT + 7)] = @floatFromInt(@as(u32, 0x7FC00000));
+            },
+            // The token's row and every head row a stress pair: each bias a small integer, fp32-exact in any order.
+            .stress => {
+                for (lg) |*v| v.* = @floatFromInt(rng.intRangeAtMost(i32, -3, 3));
+                try stressDot(rng, emb[prev(k) * R ..][0..R], mh, V, R, 64, 64, k.scratch());
+            },
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * MK_NT * 2 + s.n;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const K = k.shape.rows - 1;
+        const V = k.shape.n;
+        const R = k.shape.k;
+        const np = k.shape.rows * MK_NT * 2;
+        @memset(mag, 0);
+        @memcpy(out[0 .. K * MK_NT * 2], k.in(4)[0 .. K * MK_NT * 2]);
+        const a = k.scratch();
+        const terms = try a.alloc(f64, R);
+        defer a.free(terms);
+        const row = try a.alloc(f32, V);
+        defer a.free(row);
+        const e = k.in(1)[prev(k) * R ..][0..R];
+        for (0..V) |v| {
+            var m: f64 = 0;
+            for (terms, k.in(2)[v * R ..][0..R], e) |*x, w, ev| {
+                x.* = w * ev;
+                m += @abs(x.*);
+            }
+            out[np + v] = k.in(0)[K * V + v] + bf(sum.of(terms));
+            mag[np + v] = m;
+            row[v] = @floatCast(out[np + v]);
+        }
+        mkPairs(row, K, out[K * MK_NT * 2 .. np]);
+    }
+
+    /// The op chain (markov_embed's row in the activation dtype by markov_head^T, cast to f32, plus the logits row), its
+    /// pairs a threadgroup from that row, the earlier pairs as given.
+    pub fn replaced(k: anytype) ![]const u8 {
+        const K = k.shape.rows - 1;
+        const V = k.shape.n;
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        const p = prev(k);
+        const e = try sc.astype(try sc.slice(k.args[1], 0, p, p + 1), act);
+        const bias = try sc.astype(try sc.matmul(e, try sc.t2(k.args[2])), .float32);
+        const rowa = try sc.add(try sc.slice(k.args[0], 0, K, K + 1), bias);
+        const ar = k.arena.allocator();
+        const rb = try ar.dupe(u8, try k.rig.bytesOf(&.{rowa}));
+        const row = try ar.alloc(f32, V);
+        for (row, 0..) |*x, i| x.* = @bitCast(std.mem.readInt(u32, rb[4 * i ..][0..4], .little));
+        const pairs = try ar.alloc(f64, k.shape.rows * MK_NT * 2);
+        @memcpy(pairs[0 .. K * MK_NT * 2], k.in(4)[0 .. K * MK_NT * 2]);
+        mkPairs(row, K, pairs[K * MK_NT * 2 ..]);
+        return std.mem.concat(ar, u8, &.{ try mkPairsBytes(ar, pairs), rb });
+    }
+};
+
+/// kernels/markov_final.metal, CONF: each position's token (the best of its step's pairs) and the confidence head's
+/// logit over [hout, markov_embed of the token before] (`shape.n` the hidden width, `shape.k` the rank).
+const MarkovFinal = struct {
+    pub const Params = struct {};
+    /// markov_embed's rows (the tokens' range).
+    const V = 2048;
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        if (s.rows == 0 or s.rows > mplan.max_block or s.n == 0 or s.k == 0 or s.n + s.k > mplan.max_conf_len) return null;
+        var g = metal.Geometry{ .grid = .{ ci(mplan.final_threads), ci(s.rows), 1 }, .tg = .{ ci(mplan.final_threads), 1, 1 } };
+        g.out(&.{ci(s.rows)}, .int32);
+        g.out(&.{ci(s.rows)}, .float32);
+        g.int("B", s.rows);
+        g.int("NT", MK_NT);
+        g.int("D", s.n);
+        g.int("R", s.k);
+        g.dtype("H", act);
+        g.dtype("E", act);
+        g.int("CONF", 1);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        const B = k.shape.rows;
+        const D = k.shape.n;
+        const R = k.shape.k;
+        const parts = try k.add(.uint32, &.{B * MK_NT * 2});
+        const t1 = try k.add(.int32, &.{1});
+        const hout = try k.add(act, &.{ B, D });
+        const emb = try k.add(act, &.{ V, R });
+        const cw = try k.add(.float32, &.{ 1, D + R });
+        for (0..B * MK_NT) |j| {
+            parts[2 * j] = @floatFromInt(@as(u32, @bitCast(@as(f32, @floatCast(rng.float(f64) * 20 - 10)))));
+            parts[2 * j + 1] = @floatFromInt(rng.uintLessThan(usize, V));
+        }
+        t1[0] = @floatFromInt(rng.uintLessThan(usize, V));
+        kit.uniform(rng, hout, -2, 2);
+        kit.uniform(rng, emb, -2, 2);
+        // The fused logit's claim holds for 16-bit floats' weights (`plan.exact16`).
+        kit.uniform(rng, cw, -0.5, 0.5);
+        for (cw) |*v| v.* = bf(v.*);
+        switch (f) {
+            .random => {},
+            .nonfinite => {
+                kit.plantRows(hout, B, D);
+                parts[2 * (2 * MK_NT + 5)] = @floatFromInt(@as(u32, 0x7FC00000));
+            },
+            // Every step's best the same token p (also t1): every logit one stress dot over [hout row, emb row p].
+            .stress => {
+                const p = rng.uintLessThan(usize, V);
+                t1[0] = @floatFromInt(p);
+                for (0..B) |s| {
+                    parts[2 * s * MK_NT] = @floatFromInt(@as(u32, @bitCast(@as(f32, 1e9))));
+                    parts[2 * s * MK_NT + 1] = @floatFromInt(p);
+                }
+                const xv = try k.scratch().alloc(f64, D + R);
+                defer k.scratch().free(xv);
+                try stressDot(rng, xv, cw, 1, D + R, 64, 7, k.scratch());
+                for (0..B) |s| @memcpy(hout[s * D ..][0..D], xv[0..D]);
+                @memcpy(emb[p * R ..][0..R], xv[D..]);
+            },
+        }
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return 2 * s.rows;
+    }
+
+    fn toks(k: anytype, out: []u32) void {
+        for (out, 0..) |*t, s| t.* = mkBest(k.in(0)[2 * s * MK_NT ..], MK_NT);
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const B = k.shape.rows;
+        const D = k.shape.n;
+        const R = k.shape.k;
+        var tk: [mplan.max_block]u32 = undefined;
+        toks(k, tk[0..B]);
+        const terms = try k.scratch().alloc(f64, D + R);
+        defer k.scratch().free(terms);
+        @memset(mag, 0);
+        for (0..B) |s| {
+            out[s] = @floatFromInt(tk[s]);
+            const p: usize = if (s == 0) @intFromFloat(k.in(1)[0]) else tk[s - 1];
+            var m: f64 = 0;
+            for (terms, 0..) |*x, i| {
+                x.* = (if (i < D) k.in(2)[s * D + i] else k.in(3)[p * R + i - D]) * k.in(4)[i];
+                m += @abs(x.*);
+            }
+            out[B + s] = sum.of(terms);
+            mag[B + s] = m;
+        }
+    }
+
+    /// The op chain: each token MLX's argmax of its row (the best of its pairs), each logit MLX's matmul of
+    /// [f32 hout row, f32 markov_embed row of the token before] by the head.
+    pub fn replaced(k: anytype) ![]const u8 {
+        const B = k.shape.rows;
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        var tk: [mplan.max_block]u32 = undefined;
+        toks(k, tk[0..B]);
+        var ti: [mplan.max_block]i32 = undefined;
+        for (ti[0..B], tk[0..B]) |*x, v| x.* = @intCast(v);
+        const ta = try sc.keep(mlx.mlx_array_new_data(&ti, &[_]c_int{ci(B)}, 1, .int32));
+        const cwt = try sc.t2(k.args[4]);
+        var confs: [mplan.max_block]A = undefined;
+        for (confs[0..B], 0..) |*c, s| {
+            const p: usize = if (s == 0) @intFromFloat(k.in(1)[0]) else tk[s - 1];
+            const h = try sc.astype(try sc.slice(k.args[2], 0, s, s + 1), .float32);
+            const e = try sc.astype(try sc.slice(k.args[3], 0, p, p + 1), .float32);
+            c.* = try sc.matmul(try sc.concat(&.{ h, e }, -1), cwt);
+        }
+        return k.rig.bytesOf(&.{ ta, try sc.concat(confs[0..B], 0) });
+    }
+};
+
+// ── the query tail: rope_tail's roped channels alone, [L, H, RD] ──
+
+const RopeTailOnly = struct {
+    /// `RopeTail`'s (its `fill` and `pre` read them).
+    pub const Params = struct { scal: f64 = 1, off: i32 = 3001, sign: f64 = 1 };
+
+    pub fn geometry(_: Params, s: Shape) ?metal.Geometry {
+        const n = s.rows * s.n * RD;
+        if (n == 0 or s.k < RD or s.k % 2 != 0) return null;
+        var g = metal.Geometry{ .grid = .{ ci(n), 1, 1 }, .tg = .{ ci(@min(n, 256)), 1, 1 } };
+        g.out(&.{ ci(s.rows), ci(s.n), RD }, act);
+        g.int("RD", RD);
+        g.int("HH", s.n);
+        g.dtype("T", act);
+        g.dtype("OT", act);
+        return g;
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        return RopeTail.fill(k, f, rng);
+    }
+
+    pub fn count(_: Params, s: Shape) usize {
+        return s.rows * s.n * RD;
+    }
+
+    /// Output `i`'s element of the whole heads `x`.
+    fn src(k: anytype, i: usize) usize {
+        const D = k.shape.k;
+        return i / RD * D + (D - RD) + i % RD;
+    }
+
+    pub fn compute(k: anytype, out: []f64, mag: []f64, _: Sum) !void {
+        for (out, 0..) |*o, i| o.* = rt(act, RopeTail.pre(k, src(k, i), true).lo);
+        @memset(mag, 0);
+    }
+
+    pub fn check(k: anytype, at: spec.Gate) !?[]const u8 {
+        const n = count(k.p, k.shape);
+        const a = k.scratch();
+        const buf = try a.alloc(f64, 3 * n);
+        defer a.free(buf);
+        const got = buf[0..n];
+        k.outputs(kc.host.elemOf(act), got);
+        if (at == .nonfinite) {
+            try compute(k, buf[n .. 2 * n], buf[2 * n ..], .{});
+            return classes(&k.msg, got, buf[n .. 2 * n]);
+        }
+        for (got, 0..) |g, i| if (qatOk(.none, &.{RopeTail.pre(k, src(k, i), false)}, &.{g}, act, &k.msg, i)) |why| return why;
+        return null;
+    }
+
+    /// rope_tail over the whole heads, its last `RD` channels: the words the tail must equal.
+    pub fn replaced(k: anytype) ![]const u8 {
+        var sc = v41.Scope.init(k.rig.a, k.rig.stream());
+        defer sc.deinit();
+        var m: v41.Dsv41Model = undefined;
+        m.cfg = .{};
+        m.cfg.dsv4_rope_head_dim = RD;
+        m.qat_off = false;
+        m.rope_kernel = try v41.buildKernel("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER);
+        defer _ = mlx.mlx_fast_metal_kernel_free(m.rope_kernel);
+        const whole = try v41.ropeQat(&sc, &m, k.args[0], k.args[1], k.args[2], @floatCast(k.p.scal), null, null);
+        const D: c_int = ci(k.shape.k);
+        var tail = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tail);
+        try mlx.check(mlx.mlx_slice(&tail, whole, &[_]c_int{ 0, 0, D - RD }, 3, &[_]c_int{ ci(k.shape.rows), ci(k.shape.n), D }, 3, &[_]c_int{ 1, 1, 1 }, 3, k.rig.stream()));
+        return k.rig.bytesOf(&.{tail});
     }
 };
 
@@ -2261,6 +3167,61 @@ const AttnQk = struct {
     }
 };
 
+/// kernels/attn_qk_t.metal: attn_qk with the heads in two parts, `q` [L, H, D] for every 64-deep step but the last
+/// and `qt` [L, H, 64] (the roped tail, rope_tail_only) for it.
+const AttnQkT = struct {
+    pub const Params = Gathered.Params;
+    const TAIL = 64;
+
+    pub fn geometry(p: Params, s: Shape) ?metal.Geometry {
+        return AttnQk.geometry(p, s);
+    }
+
+    pub fn fill(k: anytype, f: Fill, rng: std.Random) !void {
+        try AttnQk.fill(k, f, rng);
+        const qt = try k.add(act, &.{ k.shape.rows, k.shape.n, TAIL });
+        // The tail is the heads' own last channels (as rope_tail_only writes the roped ones), so the stress rows stay
+        // stress rows.
+        const q = k.in(0);
+        for (0..k.shape.rows * k.shape.n) |r| @memcpy(qt[r * TAIL ..][0..TAIL], q[r * HD + HD - TAIL ..][0..TAIL]);
+        if (f == .random) kit.uniform(rng, qt, -2, 2);
+    }
+
+    pub fn count(p: Params, s: Shape) usize {
+        return AttnQk.count(p, s);
+    }
+
+    /// The heads the scores read: `q`'s channels with `qt` written over the last 64.
+    fn tailInto(k: anytype, q: []f64) void {
+        for (0..k.shape.rows * k.shape.n) |r| @memcpy(q[r * HD + HD - TAIL ..][0..TAIL], k.in(5)[r * TAIL ..][0..TAIL]);
+    }
+
+    /// attn_qk's formula over those heads (`q` restored after).
+    pub fn compute(k: anytype, out: []f64, mag: []f64, sum: Sum) !void {
+        const q = k.in(0);
+        const saved = try k.scratch().dupe(f64, q);
+        defer k.scratch().free(saved);
+        defer @memcpy(q, saved);
+        tailInto(k, q);
+        try AttnQk.compute(k, out, mag, sum);
+    }
+
+    /// attn_qk over the whole roped heads on its own rig: the scores the split read must equal.
+    pub fn replaced(k: anytype) ![]const u8 {
+        const a = k.scratch();
+        const qr = try a.dupe(f64, k.in(0));
+        defer a.free(qr);
+        tailInto(k, qr);
+        var r2 = metal.Rig.init(a);
+        defer r2.deinit();
+        var args: [5]A = undefined;
+        args[0] = try r2.input(act, k.ins[0].dims[0..3], qr);
+        for (args[1..], k.ins[1..5]) |*x, in| x.* = try r2.input(in.dt, in.dims[0..in.nd], in.v);
+        try r2.launch(&qk_l, AttnQk.geometry(.{}, k.shape).?, &args);
+        return k.arena.allocator().dupe(u8, r2.outputBytes());
+    }
+};
+
 const AttnSm = struct {
     pub const Params = struct { wp: usize = 100, scal: f64 = 1.4 };
 
@@ -3160,6 +4121,17 @@ const stage_x_l = launch("dsv41_hc_stage_x", hc_stage_x_ins, &.{ "h_out", "z", "
 const idx_l = launch("dsv41_index_scores", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_SCORE_SOURCE, "", 4 * IH * IHD, 416, false);
 const tile_l = launch("dsv41_index_tile", &.{ "q", "keys", "w", "meta", "wsc" }, &.{"scores"}, v41.IDX_TILE_SOURCE, "", 2 * IdxTile.KT * IHD + 4 * IH + 4 * 4 * 64, 1024, false);
 pub const rope_l = launch("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER, 0, 1024, false);
+const expand_into_l = launch("dsv41_hc_expand_into", &.{ "x", "res", "post", "comb", "dst", "after" }, &.{"carrier"}, sx1.expand_into_source, "", 0, 704, false);
+const expand_norm_l = launch("dsv41_hc_expand_norm", &.{ "y", "res", "post", "comb", "cpre", "w", "eps" }, &.{ "h_out", "x1" }, hcf.expand_norm_source, hcf.expand_norm_fresh_header, 4 * 32, 1024, true);
+const expand_norm_into_l = launch("dsv41_hc_expand_norm_into", &.{ "y", "res", "post", "comb", "cpre", "w", "eps", "dst", "after" }, &.{ "h_out", "carrier" }, hcf.expand_norm_source, hcf.expand_norm_into_header, 4 * 32, 1024, true);
+const gate_gemm_l = metal.Launch{ .name = "dsv41_gate_gemm", .inputs = &.{ "a", "b" }, .outputs = &.{"y"}, .source = ggemm.body, .header = ggemm.header, .tg_bytes = 0, .offline = false, .min_gen = 17 };
+const markov_step_l = launch("dsv41_markov_step", &.{ "lg", "emb", "mh", "t1", "pin" }, &.{ "pout", "row" }, markov.step_source, markov.header, 4 * (2 * 8 + 1), 1024, false);
+const markov_final_l = launch("dsv41_markov_final", &.{ "parts", "t1", "hout", "emb", "cw" }, &.{ "toks", "conf" }, markov.final_source, markov.header, 4 * (3 * 16 + 1), 1024, false);
+const flash_l = metal.Launch{ .name = "dsv41_attn_flash", .inputs = &v41.GatherAttn.FLASH_INS, .outputs = &.{"o"}, .source = fa.source, .header = @import("decode/attn.zig").HEADER, .tg_bytes = 4 * 2 * 128 + 4 * 2 * 4 * 4 * 16 + 2 * 4 * 8 * 256, .offline = false, .min_gen = 17 };
+const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
+const qk_t_l = metal.Launch{ .name = "dsv41_attn_qk_t", .inputs = &.{ "q", "kw", "comp", "picks", "meta", "qt" }, .outputs = &.{"s"}, .source = qtail.attn_qk_t_source, .header = v41.MPP_HEADER, .tg_bytes = 2 * 64 * 64 * 2, .offline = false, .min_gen = 17 };
+const mix_norm_l = launch("dsv41_hc_mix_norm", &.{ "x", "fn", "scale", "base", "eps", "cpre", "w", "w2" }, &.{ "z", "h_out", "h2" }, hcf.mix_norm_source, "", 4 * (4 * 6 + 4) * 32, 1024, true);
+const rope_only_l = launch("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "", 0, 1024, false);
 const kv_l = launch("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER, 4 * (32 + 1024), 1024, false);
 const engram_l = launch("dsv41_engram", &.{ "x", "kv", "qk", "cst" }, &.{"out"}, v41.ENGRAM_SOURCE, "", 4 * (3 * 32 + 1), 928, false);
 const dec_l = launch("dsv41_attn_decode", attn_ins ++ &[_][*:0]const u8{"periods"}, &.{"out"}, v41.ATTN_DEC_SOURCE, v41.UNROPE_HEADER, 4 * (AttnDec.NSG * HD + 2 * AttnDec.NSG), 768, false);
@@ -3195,6 +4167,7 @@ const swiglu_nan: spec.Known = .{ .gate = .nonfinite, .finding = "a NaN gate sum
 /// seconds: each runs the same code at its own index; the reduction axis and the row widths stay the release's.
 pub fn register(set: *kc.Set) !void {
     try @import("decode/decode.zig").register(set);
+    try registerStreamed(set);
     try kit.add(set, Gate, &gate_l, .{}, .{
         .name = "dsv41 gate (router logits)",
         .accum = .f32,
@@ -3407,7 +4380,6 @@ pub fn register(set: *kc.Set) !void {
         .served = &.{ .{ .rows = 17, .n = 8, .k = 512 }, .{ .rows = 64, .n = 8, .k = 0 } },
         .sums = softmax_sums,
     });
-    const gather_served: []const Shape = &.{ .{ .rows = 3, .n = HEADS, .k = 512 }, .{ .rows = 2, .n = HEADS, .k = 0 }, .{ .rows = 5, .n = HEADS, .k = 128 } };
     try kit.add(set, AttnQk, &qk_l, .{}, .{
         .name = "dsv41 attn_qk (prompt width, matrix units)",
         .accum = .f32,
@@ -3570,6 +4542,7 @@ const Shell = struct {
         m.hc_stage_x_kernel = try b("dsv41_hc_stage_x", &v41.HC_STAGE_X_INS, &v41.HC_STAGE_X_OUTS, v41.HC_STAGE_X_SOURCE, "");
         m.hc_split_kernel = try b("dsv41_hc_split", &.{ "z", "eps" }, &.{ "pre", "post", "comb" }, v41.HC_SPLIT_SOURCE, "");
         m.rope_kernel = try b("dsv41_rope_tail", &.{ "x", "periods", "off", "scal" }, &.{"out"}, v41.ROPE_TAIL_SOURCE, v41.FP8_HEADER);
+        m.rope_tail_only_kernel = try b("dsv41_rope_tail_only", &.{ "x", "periods", "off", "scal" }, &.{"out"}, qtail.rope_tail_only_source, "");
         m.kv_row_kernel = try b("dsv41_kv_row", &.{ "x", "w", "periods", "off", "eps" }, &.{"out"}, v41.KV_ROW_SOURCE, v41.FP8_HEADER);
         m.engram_kernel = try b("dsv41_engram", &v41.ENGRAM_INS, &.{"out"}, v41.ENGRAM_SOURCE, "");
         m.moe_gu_kernel = try b("dsv41_moe_gu", &v41.MOE_GU_INS, &.{"out"}, v41.MOE_GU_SOURCE, v41.MOE_HEADER);
@@ -3581,18 +4554,170 @@ const Shell = struct {
 
     fn deinit(self: *Shell) void {
         const m = &self.m;
-        for ([_]mlx.mlx_fast_metal_kernel{ m.attn_dec_kernel, m.attn_split_kernel, m.attn_merge_kernel, m.idx_score_kernel, m.idx_tile_kernel, m.gate_kernel, m.topk_kernel, m.dense_f32x_kernel, m.route_kernel, m.hc_mix_kernel, m.hc_norm_kernel, m.hc_stage_kernel, m.hc_stage_x_kernel, m.hc_split_kernel, m.rope_kernel, m.kv_row_kernel, m.engram_kernel, m.moe_gu_kernel, m.moe_dn_kernel, m.moe_act_kernel, m.moe_combine_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
+        for ([_]mlx.mlx_fast_metal_kernel{ m.attn_dec_kernel, m.attn_split_kernel, m.attn_merge_kernel, m.idx_score_kernel, m.idx_tile_kernel, m.gate_kernel, m.topk_kernel, m.dense_f32x_kernel, m.route_kernel, m.hc_mix_kernel, m.hc_norm_kernel, m.hc_stage_kernel, m.hc_stage_x_kernel, m.hc_split_kernel, m.rope_kernel, m.rope_tail_only_kernel, m.kv_row_kernel, m.engram_kernel, m.moe_gu_kernel, m.moe_dn_kernel, m.moe_act_kernel, m.moe_combine_kernel }) |k| _ = mlx.mlx_fast_metal_kernel_free(k);
     }
 };
 
+/// The kernels the streamed forward brought (`prompt/`, `spec/markov.zig`, `decode/gemv_twin.zig`).
+fn mkPairCount(s: Shape) usize {
+    return s.rows * MK_NT * 2;
+}
+fn mkRow(s: Shape) usize {
+    return s.n;
+}
+fn rowsOnly(s: Shape) usize {
+    return s.rows;
+}
+fn depthNK(s: Shape) usize {
+    return s.n + s.k;
+}
+
+fn registerStreamed(set: *kc.Set) !void {
+    inline for (.{ true, false }) |qt| try kit.add(set, AttnFlash, &flash_l, .{ .qt = qt }, .{
+        .name = if (qt) "dsv41 attn_flash (one launch, f16 weights, the roped tail from qt)" else "dsv41 attn_flash (one launch, f16 weights)",
+        .accum = .f32,
+        .depth = kc.host.depthOne,
+        .out = .bf16,
+        .nax = true,
+        .served = gather_served,
+        .sums = .{ .exact = false },
+    });
+    // The vocabulary cut to 40,000 (129,280 served): the step is vocabulary-generic, and this still gives a simdgroup
+    // more quads than one turn.
+    try kit.add(set, MarkovStep, &markov_step_l, .{}, .{
+        .name = "dsv41 markov_step (biased row, its pairs a threadgroup)",
+        .accum = .f32,
+        .depth = depthK,
+        .ops = 1,
+        .mids = 1,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = mkPairCount }, .{ .elem = .f32, .count = mkRow } },
+        .replaces = "the draft's op chain (take, matmul, cast, add) and its row's argmax",
+        .served = &.{ .{ .rows = 1, .n = 40000, .k = 256 }, .{ .rows = 2, .n = 40000, .k = 256 }, .{ .rows = 6, .n = 40000, .k = 256 } },
+    });
+    try kit.add(set, MarkovFinal, &markov_final_l, .{}, .{
+        .name = "dsv41 markov_final (tokens, confidence logits)",
+        .accum = .f32,
+        .depth = depthNK,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .u32, .count = rowsOnly }, .{ .elem = .f32, .count = rowsOnly } },
+        .replaces = "the draft's argmax and confidence matmul",
+        .served = &.{ .{ .rows = 6, .n = DIM, .k = 256 }, .{ .rows = 16, .n = DIM, .k = 256 } },
+    });
+    // The twin's served launches (`gemv_twin.choices`) on the indexer's weights_proj (32 x 5120) and wk (128 x 512);
+    // Engram's wkv (25600 x 6144) by its plan's class at 4096 x 1024 (the same MLX tiling: bm 8, bn 1).
+    const twins = .{
+        .{ 32, 5120, gtwin.Variant{ .nr = 1, .tm = 4, .bm = 1 }, &[_]Shape{ .{ .rows = 2, .n = 32, .k = 5120 }, .{ .rows = 5, .n = 32, .k = 5120 } } , 1024 },
+        .{ 32, 5120, gtwin.Variant{ .nr = 1, .tm = 1, .bm = 1 }, &[_]Shape{.{ .rows = 6, .n = 32, .k = 5120 }} , 1024 },
+        .{ 128, 512, gtwin.Variant{ .nr = 1, .tm = 4, .bm = 4 }, &[_]Shape{ .{ .rows = 2, .n = 128, .k = 512 }, .{ .rows = 5, .n = 128, .k = 512 } }, 928 },
+        .{ 128, 512, gtwin.Variant{ .nr = 1, .tm = 1, .bm = 4 }, &[_]Shape{.{ .rows = 6, .n = 128, .k = 512 }} , 1024 },
+        .{ 4096, 1024, gtwin.Variant{ .nr = 2, .tm = 1, .bm = 8 }, &[_]Shape{.{ .rows = 2, .n = 4096, .k = 1024 }} , 1024 },
+        .{ 4096, 1024, gtwin.Variant{ .nr = 3, .tm = 1, .bm = 4 }, &[_]Shape{.{ .rows = 3, .n = 4096, .k = 1024 }} , 1024 },
+        .{ 4096, 1024, gtwin.Variant{ .nr = 4, .tm = 1, .bm = 8 }, &[_]Shape{.{ .rows = 4, .n = 4096, .k = 1024 }} , 1024 },
+        .{ 4096, 1024, gtwin.Variant{ .nr = 3, .tm = 2, .bm = 8, .ilv = true }, &[_]Shape{ .{ .rows = 5, .n = 4096, .k = 1024 }, .{ .rows = 6, .n = 4096, .k = 1024 } } , 1024 },
+    };
+    inline for (twins) |tw| {
+        const l = comptime twinLaunch(tw[0], tw[1], tw[2], tw[4]);
+        try kit.add(set, GemvTwin, &l, .{ .v = tw[2] }, .{
+            .name = "dsv41 gemv_twin (" ++ l.name["dsv41_gemv_twin_".len..] ++ std.fmt.comptimePrint(", {d} x {d})", .{ tw[0], tw[1] }),
+            .accum = .f32,
+            .depth = depthK,
+            .out = .bf16,
+            .replaces = "MLX's matmul of each row alone",
+            .served = tw[3],
+        });
+    }
+    try kit.add(set, GateGemm, &gate_gemm_l, .{}, .{
+        .name = "dsv41 gate_gemm (MLX's NAX GEMM over bf16 x and f16 gate_w)",
+        .accum = .f32,
+        .depth = depthK,
+        .out = .f32,
+        .nax = true,
+        .replaces = "astype f32, MLX's matmul (its regular NAX kernel)",
+        .served = &.{ .{ .rows = 256, .n = 384, .k = 512 }, .{ .rows = 100, .n = 384, .k = 768 }, .{ .rows = 77, .n = 200, .k = 300 } },
+    });
+    try kit.add(set, AttnQkT, &qk_t_l, .{}, .{
+        .name = "dsv41 attn_qk_t (prompt width, the heads and their roped tail)",
+        .accum = .f32,
+        .depth = depthHd,
+        .out = .f32,
+        .nax = true,
+        .replaces = "attn_qk over the whole roped heads",
+        .served = gather_served,
+    });
+    const expand_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC }, .{ .rows = 64, .n = DIM, .k = HC } };
+    try kit.add(set, ExpandInto, &expand_into_l, .{}, .{
+        .name = "dsv41 hc_expand_into (the new stream into a region)",
+        .accum = .f32,
+        .depth = depthHc,
+        .ops = 2,
+        .out = .bf16,
+        .in_place = true,
+        .replaces = "glm5's expand (the stock launch)",
+        .served = expand_served,
+        .sums = fused_sums,
+    });
+    inline for (.{ false, true }) |into| try kit.add(set, ExpandNorm, if (into) &expand_norm_into_l else &expand_norm_l, .{ .into = into }, .{
+        .name = if (into) "dsv41 hc_expand_norm (expand into a region + normed collapse)" else "dsv41 hc_expand_norm (expand + normed collapse)",
+        .accum = .f32,
+        .depth = depthN,
+        .ops = 4,
+        .mids = 3,
+        .out = .bf16,
+        .in_place = into,
+        .replaces = "glm5's expand then hc_norm (the stock launches)",
+        .served = expand_served,
+        .sums = fused_sums,
+    });
+    const mix_norm_served: []const Shape = &.{ .{ .rows = 17, .n = DIM, .k = HC * DIM }, .{ .rows = 64, .n = DIM, .k = HC * DIM } };
+    inline for (.{ true, false }) |h2| try kit.add(set, HcMixNorm, &mix_norm_l, .{ .h2 = h2 }, .{
+        .name = if (h2) "dsv41 hc_mix_norm (mixes + normed collapse, twice)" else "dsv41 hc_mix_norm (mixes + normed collapse)",
+        .accum = .f32,
+        .depth = depthK,
+        .ops = 4,
+        .mids = 2,
+        .out = .f32,
+        .outs = &.{ .{ .elem = .f32, .count = rowsMix }, .{ .elem = .bf16, .count = rowsN } },
+        .replaces = "hc_mix then hc_norm (the stock launches)",
+        .tiles = .{ .{ .size = 4 }, .{}, .{} },
+        .served = mix_norm_served,
+        .sums = .{ .bf16 = 0, .exact = false, .why = "on hc_mix's stress rows the collapse's sums are not exact, so the float64 bound holds them, and a bf16 miss hides under it" },
+    });
+    try kit.add(set, RopeTailOnly, &rope_only_l, .{}, .{
+        .name = "dsv41 rope_tail_only (the query tail)",
+        .accum = .none,
+        .depth = depthOne,
+        .out = .bf16,
+        .replaces = "rope_tail's roped channels",
+        .nan = quant_nan,
+        .served = &.{ .{ .rows = 1, .n = HEADS, .k = HD }, .{ .rows = REGION, .n = HEADS, .k = HD } },
+    });
+}
+
 /// A prepared case run on our launch: its output bytes (owned) and the case for the wrapper's call.
-fn ours(comptime D: type, a: std.mem.Allocator, l: *const metal.Launch, p: D.Params, shape: Shape) !struct { c: *kit.Case(D), bytes: []u8 } {
+fn ours(comptime D: type, a: std.mem.Allocator, l: *const metal.Launch, p: D.Params, shape: Shape) !Ran(D) {
+    return oursAt(D, a, l, p, shape, .random);
+}
+
+fn Ran(comptime D: type) type {
+    return struct { c: *kit.Case(D), bytes: []u8 };
+}
+
+fn oursAt(comptime D: type, a: std.mem.Allocator, l: *const metal.Launch, p: D.Params, shape: Shape, f: Fill) !Ran(D) {
     const c = try a.create(kit.Case(D));
     errdefer a.destroy(c);
     c.* = .init(a, l, p);
-    try std.testing.expect(try c.prepare(shape, .random, 7));
+    try std.testing.expect(try c.prepare(shape, f, 7));
     try c.run();
-    return .{ .c = c, .bytes = try a.dupe(u8, c.rig.outputBytes()) };
+    return .{ .c = c, .bytes = try a.dupe(u8, c.outBytes()) };
+}
+
+/// A NaN-filled [L, HC, D] region on `c`'s rig, for a wrapper to write.
+fn freshRegion(c: anytype, L: usize, D: usize) !A {
+    const v = try c.scratch().alloc(f64, L * HC * D);
+    defer c.scratch().free(v);
+    @memset(v, nan);
+    return c.rig.input(act, &.{ ci(L), HC, ci(D) }, v);
 }
 
 fn held(x: A) A {
@@ -3670,6 +4795,119 @@ test "kernel contract dsv41: each declared launch is the shipped wrapper's, byte
             .fp4_e4m3 => .fp4_e4m3,
         };
         try Expect.same(r.c, r.bytes, &.{try v41.ropeQat(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2], @floatCast(p.scal), qat, p.ot)});
+    }
+    inline for (.{ gtwin.Variant{ .nr = 1, .tm = 4, .bm = 4 }, gtwin.Variant{ .nr = 3, .tm = 2, .bm = 8, .ilv = true } }, .{ 128, 4096 }, .{ 512, 1024 }, .{ 928, 1024 }) |v, n, kk, m12| {
+        const l = comptime twinLaunch(n, kk, v, m12);
+        const r = try ours(GemvTwin, a, &l, .{ .v = v }, .{ .rows = 5, .n = n, .k = kk });
+        const y = (try gtwin.linearWith(m.s, r.c.args[0], r.c.args[1], v)).?;
+        defer _ = mlx.mlx_array_free(y);
+        try Expect.same(r.c, r.bytes, &.{y});
+    }
+    if (@import("../../mlx/device.zig").naxAvailable()) {
+        const r = try ours(GateGemm, a, &gate_gemm_l, .{}, .{ .rows = 100, .n = 384, .k = 768 });
+        const y = (try ggemm.router(m.s, r.c.args[0], r.c.args[1], true)).?;
+        defer _ = mlx.mlx_array_free(y);
+        try Expect.same(r.c, r.bytes, &.{y});
+    }
+    // The flash kernel as the model launches it (`flashLaunch`, grouped).
+    if (@import("../../mlx/device.zig").naxAvailable()) inline for (.{ true, false }) |qt| {
+        const r = try ours(AttnFlash, a, &flash_l, .{ .qt = qt }, .{ .rows = 3, .n = HEADS, .k = 128 });
+        const fk = try v41.buildKernel("dsv41_attn_flash", &v41.GatherAttn.FLASH_INS, &.{"o"}, fa.source, @import("decode/attn.zig").HEADER);
+        defer _ = mlx.mlx_fast_metal_kernel_free(fk);
+        var got: [1]A = .{none};
+        try v41.flashLaunch(&sc, fk, r.c.args[0..9], &.{.{ .shape = &.{ 8, 3, HEADS / 8 * HD }, .dt = act }}, 3, HEADS, qt, act, &got);
+        try Expect.same(r.c, r.bytes, &got);
+    };
+    // The Markov chain through our two launches, step by step, against markov.chain's.
+    {
+        var rig = metal.Rig.init(a);
+        defer rig.deinit();
+        var prng = std.Random.DefaultPrng.init(7);
+        const rng = prng.random();
+        const B = 3;
+        const V = 8192;
+        const R = 256;
+        const D = 512;
+        const vals = try a.alloc(f64, V * R);
+        defer a.free(vals);
+        kit.uniform(rng, vals[0 .. B * V], -4, 4);
+        const lg = try rig.input(.float32, &.{ B, V }, vals[0 .. B * V]);
+        kit.uniform(rng, vals, -1, 1);
+        const emb = try rig.input(act, &.{ V, R }, vals);
+        kit.uniform(rng, vals, -1, 1);
+        const mh = try rig.input(act, &.{ V, R }, vals);
+        kit.uniform(rng, vals[0 .. B * D], -2, 2);
+        const hout = try rig.input(act, &.{ B, D }, vals[0 .. B * D]);
+        kit.uniform(rng, vals[0 .. D + R], -0.5, 0.5);
+        for (vals[0 .. D + R]) |*v| v.* = bf(v.*);
+        const cw = try rig.input(.float32, &.{ 1, D + R }, vals[0 .. D + R]);
+        const t1 = try rig.input(.int32, &.{1}, &.{5});
+        var pin = try rig.input(.uint32, &.{8}, &@as([8]f64, @splat(0)));
+        var held_pin: ?A = null;
+        defer if (held_pin) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        var rows: std.ArrayList(u8) = .empty;
+        defer rows.deinit(a);
+        for (0..B) |K| {
+            try rig.launch(&markov_step_l, MarkovStep.geometry(.{}, .{ .rows = K + 1, .n = V, .k = R }).?, &.{ lg, emb, mh, t1, pin });
+            var next = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&next, rig.output(0)));
+            if (held_pin) |x| _ = mlx.mlx_array_free(x);
+            held_pin = next;
+            pin = next;
+            try rows.appendSlice(a, try rig.bytesOf(&.{rig.output(1)}));
+        }
+        try rig.launch(&markov_final_l, MarkovFinal.geometry(.{}, .{ .rows = B, .n = D, .k = R }).?, &.{ pin, t1, hout, emb, cw });
+        const fin = try a.dupe(u8, rig.outputBytes());
+        defer a.free(fin);
+        const o = (try markov.chain(rig.stream(), .{ .logits = lg, .hout = hout, .t1 = t1, .emb = emb, .mh = mh, .cw = cw, .want_conf = true, .keep = true })).?;
+        defer for ([_]A{ o.toks, o.conf.?, o.rows.? }) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        try std.testing.expectEqualSlices(u8, fin, try rig.bytesOf(&.{ o.toks, o.conf.? }));
+        try std.testing.expectEqualSlices(u8, rows.items, try rig.bytesOf(&.{o.rows.?}));
+    }
+    // The fused hc launches (hc_fuse.zig), built and probed as a load does.
+    try v41.hcFuseInit(a, m);
+    inline for (.{ false, true }) |into| {
+        const r = try ours(ExpandNorm, a, if (into) &expand_norm_into_l else &expand_norm_l, .{ .into = into }, .{ .rows = 6, .n = 300, .k = HC });
+        const sp: v41.Split = .{ .pre = none, .post = r.c.args[2], .comb = r.c.args[3] };
+        // The wrapper writes a fresh region: one that wrote nothing could not pass on ours.
+        const dst = if (into) try freshRegion(r.c, 6, 300) else none;
+        const f = try v41.hcExpandNormLaunch(&sc, m, r.c.args[1], r.c.args[0], &sp, r.c.args[4], r.c.args[5], r.c.args[6], if (into) dst else null, if (into) r.c.args[8] else none);
+        if (into) {
+            try mlx.check(mlx.mlx_array_eval(f.carrier));
+            try Expect.same(r.c, r.bytes, &.{ f.h, dst });
+        } else try Expect.same(r.c, r.bytes, &.{ f.h, f.x1 });
+    }
+    {
+        const r = try ours(ExpandInto, a, &expand_into_l, .{}, .{ .rows = 6, .n = 300, .k = HC });
+        const dst = try freshRegion(r.c, 6, 300);
+        const carrier = try sx1.expandInto(m.s, r.c.args[0], r.c.args[1], r.c.args[2], r.c.args[3], dst, r.c.args[5]);
+        defer _ = mlx.mlx_array_free(carrier);
+        try mlx.check(mlx.mlx_array_eval(carrier));
+        try Expect.same(r.c, r.bytes, &.{dst});
+    }
+    // Gate 3 runs random rows: hc_mix's stress rows (partial sums past fp16's range) give the stock launches' words too.
+    inline for (.{ true, false }) |h2| {
+        const r = try oursAt(HcMixNorm, a, &mix_norm_l, .{ .h2 = h2 }, .{ .rows = 17, .n = DIM, .k = HC * DIM }, .stress);
+        defer {
+            a.free(r.bytes);
+            r.c.deinit();
+            a.destroy(r.c);
+        }
+        try std.testing.expectEqualSlices(u8, try r.c.replaced(), r.bytes);
+    }
+    inline for (.{ true, false }) |h2| {
+        const r = try ours(HcMixNorm, a, &mix_norm_l, .{ .h2 = h2 }, .{ .rows = 6, .n = 300, .k = HC * 300 });
+        const hc: v41.Hc = .{ .fn_w = r.c.args[1], .scale = r.c.args[2], .base = r.c.args[3] };
+        const f = try v41.hcMixNormFused(&sc, m, r.c.args[0], r.c.args[5], &hc, r.c.args[6], if (h2) r.c.args[7] else null, r.c.args[4]);
+        try Expect.same(r.c, r.bytes, if (h2) &.{ f.z, f.n.h, f.h2 } else &.{ f.z, f.n.h });
+    }
+    {
+        const r = try ours(RopeTailOnly, a, &rope_only_l, .{}, .{ .rows = 3, .n = 4, .k = HD });
+        try Expect.same(r.c, r.bytes, &.{try v41.ropeTailOnly(&sc, m, r.c.args[0], r.c.args[1], r.c.args[2])});
     }
     {
         const r = try ours(KvRow, a, &kv_l, .{}, .{ .rows = 3, .n = 1, .k = HD });

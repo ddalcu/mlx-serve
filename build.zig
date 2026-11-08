@@ -66,7 +66,7 @@ pub fn build(b: *std.Build) void {
     const tests = macos.addUnitTests(&graph);
     // `kit`, and the kit's example plugins built from it as dylibs the unit tests load.
     kit.add(b, graph.version, tests.runs);
-    // `exl3-test`, `mlx-stream-test`, `mlx-stream-conformance`.
+    // `exl3-test`.
     macos.addPluginTests(&graph, tests);
     // `check`.
     macos.addCheck(&graph);

@@ -9,7 +9,7 @@ const std = @import("std");
 const plugins = @import("plugins.zig");
 
 /// The example plugins (`src/plugins/<name>/`, each with its own build.zig): `plugin new` copies them.
-pub const examples = [_][]const u8{ "_example", "_example_media", "_example_quant" };
+pub const examples = [_][]const u8{ "_example", "_example_media", "_example_quant", "_example_engine" };
 
 pub fn add(b: *std.Build, version: []const u8, test_runs: []const *std.Build.Step.Run) void {
     const name = b.fmt("mlx-serve-plugin-kit-{s}", .{version});
@@ -72,6 +72,9 @@ fn stage(b: *std.Build, wf: *std.Build.Step.WriteFile, name: []const u8, version
     }
     _ = wf.add(b.fmt("{s}/src/kernels/digests.txt", .{name}), staged.digests);
     _ = wf.addCopyFile(b.path("build/kit/build.zig"), b.fmt("{s}/build.zig", .{name}));
+    // `kit.streamed`'s read pool, which a streaming plugin compiles in (`build.zig` `streamSources`).
+    for ([_][]const u8{ "q3_lookahead4_exl3.c", "q3_lookahead4.h" }) |f|
+        _ = wf.addCopyFile(b.path(b.fmt("src/sdk/weights/streamed/csrc/{s}", .{f})), b.fmt("{s}/src/sdk/weights/streamed/csrc/{s}", .{ name, f }));
     _ = wf.add(b.fmt("{s}/build.zig.zon", .{name}), b.fmt(
         \\.{{
         \\    .name = .mlx_serve_kit,
@@ -174,10 +177,10 @@ fn stagedInstead(path: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Modules a staged source may import beyond `std`: `mlx_steel_sources` ships with the kit (`lib/`); `build_options` and
-/// `mlx_stream` are named by test blocks and by code a plugin only reaches if it asks for it (`moe_fp4`'s streamed
-/// weights), and a plugin that does fails to compile there by name.
+/// Modules a staged source may import beyond `std`: `mlx_steel_sources` ships with the kit (`lib/`); `build_options` is
+/// named by test blocks and by code a plugin only reaches if it asks for it, and a plugin that does fails to compile
+/// there by name.
 fn isKitModule(name: []const u8) bool {
-    for ([_][]const u8{ "mlx_steel_sources", "build_options", "mlx_stream" }) |m| if (std.mem.eql(u8, name, m)) return true;
+    for ([_][]const u8{ "mlx_steel_sources", "build_options" }) |m| if (std.mem.eql(u8, name, m)) return true;
     return false;
 }

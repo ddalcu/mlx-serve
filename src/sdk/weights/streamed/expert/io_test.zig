@@ -2,8 +2,7 @@
 //! fault injection compile into the test binary, never into the SDK's own tests.
 
 const std = @import("std");
-const expert_bank = @import("bank.zig");
-const io = @import("../sdk_ext.zig").expert.io;
+const io = @import("io.zig");
 const c = io.test_abi.abi;
 const Pool = io.Pool;
 const Status = io.Status;
@@ -21,8 +20,20 @@ const chunkBytes = io.chunkBytes;
 const injectFault = io.injectFault;
 const injectFaults = io.injectFaults;
 const clearFaults = io.clearFaults;
-const n_components = expert_bank.n_components;
-const gu_components = expert_bank.gu_components;
+const n_components = 9;
+const gu_components = 6;
+
+/// Deterministic, position-dependent bytes: every offset gets its own value.
+pub fn fillPattern(buf: []u8, seed: u64) void {
+    var x: u64 = seed;
+    for (buf) |*b| {
+        x +%= 0x9E3779B97F4A7C15;
+        var z = x;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        b.* = @truncate(z ^ (z >> 31));
+    }
+}
 /// EXL3's record topology (the bank of record's).
 const R96 = io.Records(n_components, gu_components);
 
@@ -43,7 +54,7 @@ const PatternFile = struct {
         errdefer tmp.cleanup();
         const image = try testing.allocator.alloc(u8, len);
         errdefer testing.allocator.free(image);
-        expert_bank.fillPattern(image, seed);
+        fillPattern(image, seed);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "pattern.bin", .data = image });
         var root: [512]u8 = undefined;
         var pbuf: [600]u8 = undefined;

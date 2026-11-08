@@ -12,7 +12,6 @@ parser.add_argument("--url", required=True)
 parser.add_argument("--log", required=True, type=Path)
 parser.add_argument("--expect-enabled", required=True, choices=("0", "1"))
 parser.add_argument("--model")
-parser.add_argument("--native", action="store_true", help="require mlx-stream native metadata")
 args = parser.parse_args()
 base = args.url.rstrip("/")
 enabled = args.expect_enabled == "1"
@@ -26,13 +25,6 @@ def get(path):
 model = args.model or get("/v1/models")["data"][0]["id"]
 mtp = get("/props?" + urlencode({"model": model}))["settings"]["mtp"]
 assert mtp["default_on"] is enabled, mtp
-if args.native or "native" in mtp:
-    native = mtp["native"]
-    assert mtp["loaded"] and native["block_size"] > 0, mtp
-    assert "typical" in native["lane"], native
-    assert native["sampled_acceptance"] == "stochastic", native
-    for key in ("acceptance", "acceptance_param", "greedy_tail", "depth", "adaptive"):
-        assert mtp[key] is None, mtp
 
 prompt = "List five rivers and a fact about each."
 bodies = {
@@ -81,7 +73,7 @@ for path, body in bodies.items():
                     assert payload["status"] in ("completed", "incomplete"), result
             after = args.log.read_text().count("spec=dspark (")
             if enabled and flag is not False:
-                assert after > before, (path, stream, flag, "native lane did not arm")
+                assert after > before, (path, stream, flag, "DSpark did not arm")
             else:
                 assert after == before, (path, stream, flag, "opt-out drafted")
             print(f"PASS: {path} stream={stream} enable_mtp={flag}")

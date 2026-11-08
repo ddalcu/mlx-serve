@@ -9,8 +9,7 @@ const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const fp8_grid = @import("../../sdk/quant/fp8_block128_gemv.zig");
 
-/// `glm_moe_dsa` (the streamed GLM-5.3 pack) is claimed here and declined: lib/mlx-stream serves it.
-pub const model_types = [_][]const u8{ "glm5_next", "glm5_next_text", "glm_moe_dsa" };
+pub const model_types = [_][]const u8{ "glm5_next", "glm5_next_text" };
 
 pub const claims = sdk.claimsByType(&model_types);
 
@@ -138,8 +137,6 @@ pub const Config = struct {
 
     /// A Sushi pack's `expert_quant` block as JSON (EXL3 routed experts); empty = none. Read by the engine side.
     expert_quant_json: []const u8 = "",
-    /// The routed experts stream from an EXL3 bank beside the shards (`experts.bin`, `expert_streaming`).
-    streamed: bool = false,
 
     /// Pack-owned sampling recommendations (`generation_config.json`).
     gen: abi.GenDefaults = .{},
@@ -528,14 +525,13 @@ pub fn parseWith(
     for (types) |t| {
         if (std.mem.eql(u8, t, mt.string)) break;
     } else return abi.Verdict.refuse(.unsupported, name ++ ": a model_type this plugin does not serve");
-    const streamed = field(root, "expert_streaming");
-    if (streamed) |es| if (!isExl3Bank(es)) return abi.Verdict.refuse(.unsupported, name ++ ": an expert_streaming block other than the EXL3 K=3 mul1 bank");
+    if (field(root, "expert_streaming") != null) return abi.Verdict.refuse(.unsupported, name ++ ": a streaming pack (expert_streaming): its experts.bin bank is not streamed in-tree");
     if (field(root, "residents_format")) |rf| if (rf != .string or !std.mem.eql(u8, rf.string, "fp8_block128"))
         return abi.Verdict.refuse(.unsupported, name ++ ": a residents_format other than fp8_block128");
     const tc = field(root, "text_config");
     if (tc != null and tc.? != .object) return abi.Verdict.refuse(.failed, name ++ ": text_config is not an object");
     const o: Objects = .{ .root = root, .cfg = if (tc) |t| t.object else root };
-    var c: Config = .{ .streamed = streamed != null };
+    var c: Config = .{};
     readCommon(&c, o) catch |e| return refusal(name, e);
     arm(&c, o) catch |e| return refusal(name, e);
     if (field(root, "expert_quant")) |eq| {
@@ -584,17 +580,6 @@ pub fn parseWith(
     return .ok;
 }
 
-/// mlx-stream's EXL3 K=3 mul1 bank (`experts.bin` + its v2 and runtime manifests), the one streamed format served.
-fn isExl3Bank(v: std.json.Value) bool {
-    if (v != .object) return false;
-    const want = [_][2][]const u8{ .{ "family", "mlx-stream" }, .{ "format", "mtplx-expert-manifest-v2" }, .{ "manifest", "expert-manifest-v2.json" }, .{ "runtime_manifest", "expert-manifest.json" }, .{ "quant", "exl3-k3-mul1" } };
-    for (want) |kv| {
-        const f = v.object.get(kv[0]) orelse return false;
-        if (f != .string or !std.mem.eql(u8, f.string, kv[1])) return false;
-    }
-    return true;
-}
-
 fn refusal(comptime name: []const u8, e: ParseError) abi.Verdict {
     return switch (e) {
         error.Unsupported => abi.Verdict.refuse(.unsupported, name ++ ": a shape this plugin does not serve (the engine's parse names it)"),
@@ -609,13 +594,11 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
         // Each slot's DSA cache is advanced by its own call: a batched tick never pads or stacks KV.
         .batch_pads_kv = false,
         .moe = c.num_experts > 0,
+        .experts_stream = c.num_experts > 0,
         .dflash_capture = true,
         .dflash_policy = true,
         .images = c.advertises_images,
-        .streamed_weights = c.streamed,
     };
-    // A streamed bank's decode lane takes a few rows a call: one request decodes at a time.
-    if (c.streamed) p.caps.batches_decode = false;
     p.shell.state_dtype = .f32;
     p.chat.thinking_default = .on;
     p.chat.effort_vocab = .glm5;
@@ -671,22 +654,11 @@ test "glm5_next config: the mlx-community pack parses into the shell, its facts 
     try testing.expectEqual(@as(f32, -5.0), c.kda_gate_lower_bound);
 }
 
-test "glm5_next config: an EXL3 streaming pack with fp8 residents parses streamed and decodes serially" {
-    const base = @embedFile("../../fixtures/model-configs/glm5_next-mlx-community-4bit.json");
-    const bank = "{\"residents_format\":\"fp8_block128\",\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mtplx-expert-manifest-v2\",\"manifest\":\"expert-manifest-v2.json\",\"runtime_manifest\":\"expert-manifest.json\",\"quant\":\"exl3-k3-mul1\"},";
-    const json = try std.mem.concat(testing.allocator, u8, &.{ bank, std.mem.trimStart(u8, base, " \n{") });
-    defer testing.allocator.free(json);
-    var p: abi.Parsed = .{};
-    try testing.expect(parseJson(json, true, &p).isOk());
-    defer freeParsed(&p);
-    try testing.expect(of(&p).streamed and p.caps.streamed_weights and !p.caps.batches_decode);
-}
-
 test "glm5_next config: a streamed pack, a RoPE'd sparse attention and broken JSON are refused by name" {
     inline for (.{
         "{\"model_type\":\"glm_moe_dsa\",\"num_hidden_layers\":2}",
         "{\"model_type\":\"glm5_next\",\"expert_streaming\":{},\"num_hidden_layers\":2}",
-        "{\"model_type\":\"glm5_next\",\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-nvfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"},\"num_hidden_layers\":2}",
+        "{\"model_type\":\"glm5_next\",\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mtplx-expert-manifest-v2\",\"manifest\":\"expert-manifest-v2.json\",\"runtime_manifest\":\"expert-manifest.json\",\"quant\":\"exl3-k3-mul1\"},\"num_hidden_layers\":2}",
         "{\"model_type\":\"glm5_next_text\",\"num_hidden_layers\":2,\"kv_lora_rank\":64,\"index_kpool\":4,\"index_topk\":8,\"qk_rope_head_dim\":64}",
         "{\"model_type\":\"glm5_next_text\",\"num_hidden_layers\":2,\"index_kpool\":4,\"index_topk\":8,\"top_k_experts\":4}",
     }) |json| {

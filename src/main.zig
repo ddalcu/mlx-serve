@@ -7,18 +7,13 @@ const err_name = @import("sdk/util/err_name.zig");
 pub const env = @import("env.zig");
 const crt = @import("sdk/util/crt.zig");
 const build_options = @import("build_options");
-// pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) and mlx-stream reach these through their host root.
+// pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) reaches these through its host root.
 pub const mlx = @import("mlx/ffi.zig");
+const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
-pub const shared = @import("sdk/util/shared.zig");
 const mlx_gguf = @import("sdk/quant/gguf/claim.zig");
 const model_mod = @import("sdk/config/model.zig");
 const tokenizer_mod = @import("sdk/tokenizer/tokenizer.zig");
-pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
-/// The EXL3 quant format, for the plugins that reach it through their host root (`mlx_host`).
-pub const exl3 = @import("sdk/quant/exl3/format.zig");
-pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
-pub const fp8_block128_gemv = @import("sdk/quant/fp8_block128_gemv.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());
@@ -67,8 +62,6 @@ const ane_mod = @import("sdk/ane/offload.zig");
 const ple_gpu = @import("plugins/qwen4_exp/ple_gpu.zig");
 
 pub const VERSION: []const u8 = build_options.version;
-/// `-Dplugin-profile`: the mlx-stream plugin's sdk reads this (`mlx_host.plugin_profile`) to compile its profile probes in.
-pub const plugin_profile: bool = build_options.plugin_profile;
 
 // ggml runtime version (llama.cpp), linked into the macOS exe. Referenced only
 // by the `--version` report, which runs before any engine init.
@@ -1533,7 +1526,7 @@ pub fn main(init: std.process.Init) !void {
         config_storage.deinit(allocator);
         allocator.destroy(config_storage);
     };
-    config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
+    config_storage.* = if (@import("host/plugins/loader.zig").engineServes(model_dir)) try model_mod.parseConfigLegacy(io, allocator, model_dir) else try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
         config.model_type,

@@ -1,6 +1,7 @@
 //! Outside plugins: the dylibs `mlx-serve plugin install` put in `~/.mlx-serve/plugins/`, loaded once at startup
 //! when `plugins.json` switches them on. Each must match its install receipt's hash before it is opened, then is
-//! negotiated (`abi.dylib.negotiate`) and joins the claims (`outsideWinner`). A refusal names the file and the
+//! negotiated (`abi.dylib.negotiate`) and joins the claims (`outsideWinner`). Before it opens, each option its
+//! receipt declares gets the value `plugins.json` saves for it (`applyOptions`). A refusal names the file and the
 //! reason; the server serves on without it. A dylib is never unloaded (it may hold MLX arrays and threads).
 
 const std = @import("std");
@@ -18,10 +19,13 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// Outside plugins load on the macOS CLI and app; the Mac App Store build and iOS stay static (sandbox).
 pub const supported = builtin.os.tag == .macos and !@import("build_options").mas;
 
-/// `~/.mlx-serve/plugins.json`: the Settings switch (off unless the user turned it on) and the plugins turned off.
+/// `~/.mlx-serve/plugins.json`: the Settings switch (off unless the user turned it on), the plugins turned off, and
+/// each plugin's option values (`{"<plugin>": {"<variable>": "<value>"}}`).
 pub const Settings = struct {
     enabled: bool = false,
     disabled: []const []const u8 = &.{},
+    /// Read leniently: a value that is not a string is skipped, not a broken file.
+    options: std.json.Value = .null,
 
     pub fn isDisabled(self: Settings, name: []const u8) bool {
         for (self.disabled) |d| if (std.mem.eql(u8, d, name)) return true;
@@ -31,7 +35,7 @@ pub const Settings = struct {
 
 /// `plugins.json` at `path`; a missing or broken file is the default (off).
 pub fn readSettings(io: std.Io, a: Allocator, path: []const u8) Settings {
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 16)) catch return .{};
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20)) catch return .{};
     return std.json.parseFromSliceLeaky(Settings, a, bytes, .{ .ignore_unknown_fields = true }) catch .{};
 }
 
@@ -47,7 +51,70 @@ pub const Receipt = struct {
     source: []const u8 = "",
     /// The `model_type`s it declares: the app lists their packs as the plugin's.
     model_types: []const []const u8 = &.{},
+    /// An engine's models: the model folders it serves, by name.
+    models: []const []const u8 = &.{},
+    /// Its manifest's options: the app draws them, `applyOptions` sets them.
+    options: []const ReceiptOption = &.{},
 };
+
+pub const ReceiptOption = struct { name: []const u8, kind: dylib_abi.OptionKind, default: []const u8 = "", help: []const u8 = "" };
+
+/// A variable the host set for a plugin before it opened (`/props` reports them), and the shell's value it replaced
+/// (null: unset), put back if the plugin is refused.
+pub const Applied = struct { name: [:0]const u8, value: [:0]const u8, prev: ?[:0]const u8 = null };
+
+/// Sets, over the shell's, each option `declared` that `settings` saves a string for under plugin `plugin`, when the
+/// name and value pass the manifest's rules (`abi.dylib.optionNameOk`, `valueOk`) and no plugin in `earlier` set the
+/// name; returns what it set, in `a`.
+pub fn applyOptions(a: Allocator, plugin: []const u8, declared: []const ReceiptOption, settings: Settings, earlier: []const Plugin) ![]const Applied {
+    if (settings.options != .object) return &.{};
+    const saved = settings.options.object.get(plugin) orelse return &.{};
+    if (saved != .object) return &.{};
+    var out: std.ArrayList(Applied) = .empty;
+    errdefer {
+        for (out.items) |o| freeOne(a, o);
+        out.deinit(a);
+    }
+    for (declared) |o| {
+        const v = saved.object.get(o.name) orelse continue;
+        if (v != .string) continue;
+        if (!dylib_abi.optionNameOk(plugin, o.name) or env.registered(o.name) or !dylib_abi.valueOk(o.kind, v.string)) {
+            log.warn("[plugins] {s}: option {s} is not set (its name or value breaks the option rules)\n", .{ plugin, o.name });
+            continue;
+        }
+        if (setBy(earlier, o.name)) |other| {
+            log.warn("[plugins] {s}: option {s} is not set: {s} set it\n", .{ plugin, o.name, other });
+            continue;
+        }
+        const name = try a.dupeSentinel(u8, o.name, 0);
+        const value = a.dupeSentinel(u8, v.string, 0) catch |e| {
+            a.free(name);
+            return e;
+        };
+        const prev = if (env.byName(name)) |p| a.dupeSentinel(u8, std.mem.span(p), 0) catch |e| {
+            a.free(name);
+            a.free(value);
+            return e;
+        } else null;
+        const one: Applied = .{ .name = name, .value = value, .prev = prev };
+        if (!env.setForeign(one.name, one.value)) {
+            freeOne(a, one);
+            log.warn("[plugins] {s}: option {s} could not be set\n", .{ plugin, o.name });
+            continue;
+        }
+        log.info("[plugins] {s}: set {s}\n", .{ plugin, o.name });
+        out.append(a, one) catch |e| {
+            freeOne(a, one);
+            return e;
+        };
+    }
+    return out.toOwnedSlice(a);
+}
+
+fn setBy(plugins: []const Plugin, name: []const u8) ?[]const u8 {
+    for (plugins) |p| for (p.options) |o| if (std.mem.eql(u8, o.name, name)) return p.name();
+    return null;
+}
 
 /// The signer of a code-signed file from `codesign -dvv`'s report: its first `Authority=` (with the team), "ad-hoc", or
 /// "unsigned".
@@ -75,6 +142,8 @@ pub const Plugin = struct {
     /// Lives in the dylib, which stays loaded for the process.
     manifest: *const dylib_abi.Manifest,
     sha256: [Sha256.digest_length * 2]u8,
+    /// The options set before it opened.
+    options: []const Applied = &.{},
 
     pub fn name(self: Plugin) []const u8 {
         return self.manifest.name.slice();
@@ -88,11 +157,16 @@ pub const Plugin = struct {
             .model => .model,
             .media => .media,
             .quant => .quant,
+            .engine => .engine,
+            _ => unreachable, // `negotiate` refused it
         } } };
         switch (m.kind) {
             .model => e.model = @ptrCast(@alignCast(m.table)),
             .media => e.media = @ptrCast(@alignCast(m.table)),
             .quant => e.quant = @ptrCast(@alignCast(m.table)),
+            // It claims nothing by type: it serves the models it names (`engineFor`).
+            .engine => {},
+            _ => unreachable,
         }
         return e;
     }
@@ -109,7 +183,10 @@ pub const Set = struct {
 
     /// Frees the lists and their text; the dylibs stay loaded.
     pub fn deinit(self: *Set, a: Allocator) void {
-        for (self.plugins.items) |p| a.free(p.path);
+        for (self.plugins.items) |p| {
+            a.free(p.path);
+            freeApplied(a, p.options);
+        }
         for (self.refused.items) |r| {
             a.free(r.path);
             a.free(r.why);
@@ -119,6 +196,25 @@ pub const Set = struct {
         self.entries.deinit(a);
     }
 };
+
+fn freeApplied(a: Allocator, list: []const Applied) void {
+    for (list) |o| freeOne(a, o);
+    a.free(list);
+}
+
+fn freeOne(a: Allocator, o: Applied) void {
+    a.free(o.name);
+    a.free(o.value);
+    if (o.prev) |p| a.free(p);
+}
+
+/// A refused plugin's options undone: each name back to the shell's value, or unset.
+fn undoApplied(a: Allocator, list: []const Applied) void {
+    for (list) |o| if (o.prev) |p| {
+        _ = env.setForeign(o.name, p);
+    } else env.unsetForeign(o.name);
+    freeApplied(a, list);
+}
 
 /// The hex SHA-256 of `bytes`.
 pub fn sha256Hex(bytes: []const u8) [Sha256.digest_length * 2]u8 {
@@ -178,7 +274,7 @@ pub fn loadDir(io: std.Io, a: Allocator, dir_path: []const u8, settings: Setting
         if (settings.isDisabled(stem)) continue;
         const path = try std.fs.path.join(a, &.{ dir_path, file });
         defer a.free(path);
-        const got = try loadInstalled(io, a, dir, stem, path, host_mlx);
+        const got = try loadInstalled(io, a, dir, stem, path, settings, set.plugins.items, host_mlx);
         switch (got) {
             .ok => |p| {
                 try set.plugins.append(a, p);
@@ -191,8 +287,8 @@ pub fn loadDir(io: std.Io, a: Allocator, dir_path: []const u8, settings: Setting
     return set;
 }
 
-/// One installed dylib: its receipt's hash first (nothing runs before it matches), then `open`.
-fn loadInstalled(io: std.Io, a: Allocator, dir: std.Io.Dir, stem: []const u8, path: []const u8, host_mlx: []const u8) !Opened {
+/// One installed dylib: its receipt's hash first (nothing runs before it matches), its options, then `open`.
+fn loadInstalled(io: std.Io, a: Allocator, dir: std.Io.Dir, stem: []const u8, path: []const u8, settings: Settings, earlier: []const Plugin, host_mlx: []const u8) !Opened {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const aa = arena.allocator();
@@ -204,11 +300,21 @@ fn loadInstalled(io: std.Io, a: Allocator, dir: std.Io.Dir, stem: []const u8, pa
         return .{ .refused = try a.dupe(u8, "cannot be read") };
     const hash = sha256Hex(bytes);
     if (!std.mem.eql(u8, &hash, receipt.sha256)) return .{ .refused = try a.dupe(u8, "changed since it was installed (hash differs from its receipt)") };
-    const got = try open(a, path, hash, host_mlx);
-    if (got == .ok and !std.mem.eql(u8, got.ok.name(), stem)) {
+    const applied = try applyOptions(a, stem, receipt.options, settings, earlier);
+    var got = open(a, path, hash, host_mlx) catch |e| {
+        undoApplied(a, applied);
+        return e;
+    };
+    if (got != .ok) {
+        undoApplied(a, applied);
+        return got;
+    }
+    if (!std.mem.eql(u8, got.ok.name(), stem)) {
         a.free(got.ok.path);
+        undoApplied(a, applied);
         return .{ .refused = try a.dupe(u8, "its manifest names another plugin than its file") };
     }
+    got.ok.options = applied;
     return got;
 }
 
@@ -258,9 +364,34 @@ pub fn winner(model_type: []const u8, config_json: []const u8, dir: *const commo
     return &st.set.plugins.items[i];
 }
 
+/// The engine plugin in `plugins` that names the model folder `folder` (its manifest's `models`, matched exactly), or
+/// null; two that name it are ambiguous: neither serves it.
+pub fn engineIn(plugins: []const Plugin, folder: []const u8) ?*const Plugin {
+    var found: ?*const Plugin = null;
+    for (plugins) |*p| if (p.manifest.kind == .engine) for (p.manifest.declaredModels()) |m| {
+        if (!std.mem.eql(u8, m.slice(), folder)) continue;
+        if (found != null) return null;
+        found = p;
+        break;
+    };
+    return found;
+}
+
+/// The loaded engine plugin that serves the model in folder `folder` (its name, not its path), or null: it serves it
+/// over every built-in.
+pub fn engineFor(folder: []const u8) ?*const Plugin {
+    return engineIn(loaded(), folder);
+}
+
+/// Whether a loaded engine plugin serves the model at `path`: no MLX parse, bill or route applies to it.
+pub fn engineServes(path: []const u8) bool {
+    return engineFor(std.fs.path.basename(path)) != null;
+}
+
 /// The name of the loaded outside plugin serving the pack at absolute `path` (its `/v1/models` badge), or null.
 pub fn servingName(io: std.Io, path: []const u8) ?[]const u8 {
     if (loaded().len == 0) return null;
+    if (engineFor(std.fs.path.basename(path))) |p| return p.name();
     var fs = FsPackDir.open(io, path) catch return null;
     defer fs.close();
     const dir = fs.packDir();
@@ -289,24 +420,31 @@ fn fileStem(path: []const u8) []const u8 {
     return std.fs.path.stem(std.fs.path.basename(path));
 }
 
-/// The `/props` `plugins` array: each installed plugin this process loaded or refused, and whether a rebuild against
-/// this release's kit would load it.
-pub fn statusJson(a: Allocator, loaded_names: []const []const u8, refused: []const Refusal) ![]u8 {
-    const Row = struct { name: []const u8, loaded: bool, rebuild: ?bool = null, why: ?[]const u8 = null };
+/// The `/props` `plugins` array: each installed plugin this process loaded (with the options it set) or refused, and
+/// whether a rebuild against this release's kit would load it. An option's value only with `values` (a loopback
+/// client: the app compares it with what it saved); elsewhere null, since a text option can hold a key.
+pub fn statusJson(a: Allocator, loaded_now: []const Plugin, refused: []const Refusal, values: bool) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const Row = struct { name: []const u8, loaded: bool, options: ?std.json.ArrayHashMap(?[]const u8) = null, rebuild: ?bool = null, why: ?[]const u8 = null };
     var rows: std.ArrayList(Row) = .empty;
-    defer rows.deinit(a);
-    for (loaded_names) |n| try rows.append(a, .{ .name = n, .loaded = true });
-    for (refused) |r| try rows.append(a, .{ .name = fileStem(r.path), .loaded = false, .rebuild = r.rebuild, .why = r.why });
+    for (loaded_now) |p| {
+        var row: Row = .{ .name = p.name(), .loaded = true };
+        if (p.options.len > 0) {
+            row.options = .{};
+            for (p.options) |o| try row.options.?.map.put(aa, o.name, if (values) o.value else null);
+        }
+        try rows.append(aa, row);
+    }
+    for (refused) |r| try rows.append(aa, .{ .name = fileStem(r.path), .loaded = false, .rebuild = r.rebuild, .why = r.why });
     return std.json.Stringify.valueAlloc(a, rows.items, .{ .emit_null_optional_fields = false });
 }
 
 /// This process's `statusJson`.
-pub fn processStatusJson(a: Allocator) ![]u8 {
+pub fn processStatusJson(a: Allocator, values: bool) ![]u8 {
     const set = &process.get().set;
-    var names: std.ArrayList([]const u8) = .empty;
-    defer names.deinit(a);
-    for (set.plugins.items) |p| try names.append(a, p.name());
-    return statusJson(a, names.items, set.refused.items);
+    return statusJson(a, set.plugins.items, set.refused.items, values);
 }
 
 /// What a failed model load adds when plugins were refused for another build: their names and the fix, or null.
@@ -344,8 +482,11 @@ pub fn loadAtStartup(io: std.Io, a: Allocator, builtins: []const sdk_plugin.Entr
         return;
     };
     for (st.set.refused.items) |r| log.warn("[plugins] refused {s}: {s}\n", .{ r.path, r.why });
+    for (st.set.entries.items) |e| if (e.quant) |q| @import("../../sdk/quant/outside.zig").register(q);
     for (st.set.plugins.items) |p| {
         log.info("[plugins] loaded {s} ({t}, sha256 {s}) from {s}\n", .{ p.name(), p.manifest.kind, p.sha256[0..12], p.path });
+        if (p.manifest.kind == .engine) for (p.manifest.declaredModels()) |m| if (engineFor(m.slice()) == null)
+            log.warn("[plugins] {s}: another engine plugin also names {s}: neither serves it\n", .{ p.name(), m.slice() });
         for (builtins) |e| if (std.mem.eql(u8, e.plugin.name, p.name())) log.info("[plugins] {s} replaces the built-in plugin of that name\n", .{p.name()});
     }
 }
@@ -427,6 +568,40 @@ test "outside plugins: settings default off; a broken file is off; disabled name
     try testing.expect(s.enabled and s.isDisabled("toy") and !s.isDisabled("toy2"));
 }
 
+test "outside plugins: each option a receipt declares is set from plugins.json, over the shell, when its rules take it" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try testing.expect(env.setForeign("TOYOPT_REPLY", "from the shell"));
+    const declared = [_]ReceiptOption{
+        .{ .name = "TOYOPT_REPLY", .kind = .text },
+        .{ .name = "TOYOPT_FAST", .kind = .bool },
+        .{ .name = "TOYOPT_FRAC", .kind = .number },
+        .{ .name = "OTHEROPT_X", .kind = .text },
+    };
+    const settings = try std.json.parseFromSliceLeaky(Settings, a,
+        \\{"enabled":true,"options":{"toyopt":{"TOYOPT_REPLY":"from the app","TOYOPT_FAST":"yes","TOYOPT_FRAC":0.4,"OTHEROPT_X":"1","TOYOPT_LATER":"1"}}}
+    , .{ .ignore_unknown_fields = true });
+    const got = try applyOptions(testing.allocator, "toyopt", &declared, settings, &.{});
+    defer freeApplied(testing.allocator, got);
+    try testing.expectEqual(@as(usize, 1), got.len);
+    try testing.expectEqualStrings("TOYOPT_REPLY", got[0].name);
+    try testing.expectEqualStrings("from the app", got[0].value);
+    try testing.expectEqualStrings("from the app", std.mem.span(env.byName("TOYOPT_REPLY").?));
+    try testing.expect(env.byName("TOYOPT_FAST") == null and env.byName("OTHEROPT_X") == null and env.byName("TOYOPT_LATER") == null);
+    // A plugin named `hf` cannot reach the token mlx-serve's `pull` sends.
+    const hf = try std.json.parseFromSliceLeaky(Settings, a,
+        \\{"enabled":true,"options":{"hf":{"HF_TOKEN":"stolen"}}}
+    , .{ .ignore_unknown_fields = true });
+    try testing.expectEqual(@as(usize, 0), (try applyOptions(testing.allocator, "hf", &.{.{ .name = "HF_TOKEN", .kind = .text }}, hf, &.{})).len);
+    try testing.expectEqual(@as(usize, 0), (try applyOptions(testing.allocator, "toyopt", &declared, .{ .enabled = true }, &.{})).len);
+    // A name an earlier plugin set (`toy` beside `toy_opt`, whose prefixes nest) stays the earlier one's.
+    var none: u8 = 0;
+    const m: dylib_abi.Manifest = .{ .name = .of("toy"), .kind = .model, .mlx = .{}, .table = &none, .fixture = undefined, .fixture_free = undefined };
+    const earlier = [_]Plugin{.{ .path = "toy.dylib", .manifest = &m, .sha256 = @splat('0'), .options = &.{.{ .name = "TOYOPT_REPLY", .value = "from the app" }} }};
+    try testing.expectEqual(@as(usize, 0), (try applyOptions(testing.allocator, "toyopt", &declared, settings, &earlier)).len);
+}
+
 test "outside plugins: a dylib without a receipt, with a changed hash, or not a plugin is refused by name" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -438,15 +613,26 @@ test "outside plugins: a dylib without a receipt, with a changed hash, or not a 
     const h = sha256Hex("not a dylib");
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.dylib", .data = "not a dylib" });
     var receipt_buf: [256]u8 = undefined;
-    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.json", .data = try std.fmt.bufPrint(&receipt_buf, "{{\"name\":\"c\",\"kind\":\"model\",\"sha256\":\"{s}\"}}", .{h}) });
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "c.json", .data = try std.fmt.bufPrint(&receipt_buf, "{{\"name\":\"c\",\"kind\":\"model\",\"sha256\":\"{s}\",\"options\":[{{\"name\":\"C_SET\",\"kind\":\"text\"}},{{\"name\":\"C_NEW\",\"kind\":\"text\"}}]}}", .{h}) });
     try tmp.dir.writeFile(testing.io, .{ .sub_path = "d.dylib", .data = "off" });
-    var set = try loadDir(testing.io, testing.allocator, root, .{ .enabled = true, .disabled = &.{"d"} }, "pin");
+    // A plugin refused after its options were set leaves the shell's values as they were.
+    try testing.expect(env.setForeign("C_SET", "from the shell"));
+    env.unsetForeign("C_NEW");
+    defer env.unsetForeign("C_SET");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const settings = try std.json.parseFromSliceLeaky(Settings, arena.allocator(),
+        \\{"enabled":true,"disabled":["d"],"options":{"c":{"C_SET":"from the app","C_NEW":"from the app"}}}
+    , .{ .ignore_unknown_fields = true });
+    var set = try loadDir(testing.io, testing.allocator, root, settings, "pin");
     defer set.deinit(testing.allocator);
     try testing.expectEqual(@as(usize, 0), set.plugins.items.len);
     try testing.expectEqual(@as(usize, 3), set.refused.items.len);
     try testing.expectEqualStrings("has no install receipt: install it with `mlx-serve plugin install`", set.refused.items[0].why);
     try testing.expectEqualStrings("changed since it was installed (hash differs from its receipt)", set.refused.items[1].why);
     try testing.expect(std.mem.startsWith(u8, set.refused.items[2].why, "does not load: "));
+    try testing.expectEqualStrings("from the shell", std.mem.span(env.byName("C_SET").?));
+    try testing.expect(env.byName("C_NEW") == null);
 }
 
 test "plugin signature: codesign's report reads as its first authority, ad-hoc or unsigned" {
@@ -460,11 +646,22 @@ test "outside plugins: /props names each plugin loaded or refused, and which a r
         .{ .path = "/h/.mlx-serve/plugins/sushi_ds41.dylib", .why = "plugin was built against another MLX: rebuild it with this release's kit", .rebuild = true },
         .{ .path = "/h/.mlx-serve/plugins/toy.dylib", .why = "changed since it was installed (hash differs from its receipt)" },
     };
-    const got = try statusJson(testing.allocator, &.{"turbo"}, &refused);
+    var none: u8 = 0;
+    const m: dylib_abi.Manifest = .{ .name = .of("turbo"), .kind = .model, .mlx = .{}, .table = &none, .fixture = undefined, .fixture_free = undefined };
+    const loaded_now = [_]Plugin{
+        .{ .path = "turbo.dylib", .manifest = &m, .sha256 = @splat('0'), .options = &.{.{ .name = "TURBO_FRAC", .value = "0.4" }} },
+    };
+    const got = try statusJson(testing.allocator, &loaded_now, &refused, true);
     defer testing.allocator.free(got);
     try testing.expectEqualStrings(
-        \\[{"name":"turbo","loaded":true},{"name":"sushi_ds41","loaded":false,"rebuild":true,"why":"plugin was built against another MLX: rebuild it with this release's kit"},{"name":"toy","loaded":false,"rebuild":false,"why":"changed since it was installed (hash differs from its receipt)"}]
+        \\[{"name":"turbo","loaded":true,"options":{"TURBO_FRAC":"0.4"}},{"name":"sushi_ds41","loaded":false,"rebuild":true,"why":"plugin was built against another MLX: rebuild it with this release's kit"},{"name":"toy","loaded":false,"rebuild":false,"why":"changed since it was installed (hash differs from its receipt)"}]
     , got);
+    // Off loopback the options are named, never valued.
+    const lan = try statusJson(testing.allocator, &loaded_now, &.{}, false);
+    defer testing.allocator.free(lan);
+    try testing.expectEqualStrings(
+        \\[{"name":"turbo","loaded":true,"options":{"TURBO_FRAC":null}}]
+    , lan);
 }
 
 test "outside plugins: a failed load names the plugins a rebuild would bring back" {
@@ -477,4 +674,19 @@ test "outside plugins: a failed load names the plugins a rebuild would bring bac
     defer testing.allocator.free(hint);
     try testing.expectEqualStrings("Outside plugins refused at startup, built for another mlx-serve: a, c. If one of them serves this model, rebuild it in Models > Plugins", hint);
     try testing.expectEqual(@as(?[]u8, null), try rebuildHint(testing.allocator, refused[1..2]));
+}
+
+test "outside plugins: an engine plugin serves exactly the model folders it names and claims no pack by type" {
+    var none: u8 = 0;
+    const named = [_]common.Str{ .of("Qwen3-0.6B-4bit"), .of("Raw-Metal-7B") };
+    const m: dylib_abi.Manifest = .{ .name = .of("raw_metal"), .kind = .engine, .mlx = .{}, .table = &none, .fixture = undefined, .fixture_free = undefined, .models = .of(&named) };
+    const engine: Plugin = .{ .path = "raw_metal.dylib", .manifest = &m, .sha256 = @splat('0') };
+    const plugins = [_]Plugin{engine};
+    try testing.expectEqual(@as(?*const Plugin, &plugins[0]), engineIn(&plugins, "Raw-Metal-7B"));
+    try testing.expectEqual(@as(?*const Plugin, null), engineIn(&plugins, "raw-metal-7b"));
+    try testing.expectEqual(@as(?*const Plugin, null), engineIn(&plugins, "Qwen3-0.6B"));
+    const twice = [_]Plugin{ engine, engine };
+    try testing.expectEqual(@as(?*const Plugin, null), engineIn(&twice, "Raw-Metal-7B"));
+    const e = engine.entry();
+    try testing.expect(e.model == null and e.media == null and e.quant == null);
 }

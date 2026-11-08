@@ -1,5 +1,6 @@
 //! What a graph compiles in and links: the vendored C/C++ sources, the embedded engines (ds4, llama.cpp, ANE), the
-//! staged mlx + mlx-c, the modules the engine imports by name (C headers, embedded sources, Sushi's EXL3, mlx-stream).
+//! staged mlx + mlx-c, the modules the engine imports by name (C headers, embedded sources, Sushi's EXL3), the expert
+//! stream's C sources.
 
 const std = @import("std");
 
@@ -232,54 +233,22 @@ pub fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.R
     return exl3;
 }
 
-/// mlx-stream (absorbed from davidtai/mlx-stream): the streamed packs' archs (`src/plugins/<model>/stream/`), their
-/// EXL3 lanes (`src/sdk/quant/exl3/stream/`) and the expert streamer (`src/sdk/weights/streamed/`), one module rooted at
-/// `src/mlx_stream.zig` (`src/engines/mlx/modules/stream_glue.zig` binds it). Its contract types are its own `sdk` module;
-/// both reach the host through `mlx_host`.
-pub fn addMlxStreamModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    host.addImport("mlx_stream", mlxStreamPkg(b, host, "src/mlx_stream.zig", target, optimize, false, true));
-}
-
-pub fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inject: bool, c_sources: bool) *std.Build.Module {
-    const sdk = b.createModule(.{
-        .root_source_file = b.path("src/sdk/weights/streamed/sdk/root.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{.{ .name = "mlx_host", .module = host }},
-    });
-    const m = b.createModule(.{
-        .root_source_file = b.path(root),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{ .{ .name = "mlx_host", .module = host }, .{ .name = "sdk", .module = sdk } },
-    });
-    // The read pool (pthreads, pread into slot rows), its MTLSharedEvent signal (non-ARC objc), and the MLX
-    // event / alloc shims, which include the staged MLX's private headers and link libmlx.
+/// The expert stream's C side (`src/sdk/weights/streamed/csrc/`, absorbed from davidtai/mlx-stream): the read pool
+/// (pthreads, pread into slot rows), its MTLSharedEvent signal (non-ARC objc), and the MLX event / alloc shims the
+/// `HostGpu` table serves, which include the staged MLX's private headers. `inject`: the read pool's scripted faults
+/// (the test binary's).
+pub fn addStreamSources(b: *std.Build, m: *std.Build.Module, inject: bool) void {
     const csrc = "src/sdk/weights/streamed/csrc";
-    // A profile server build (`-Dplugin-profile=true`, never the tests) also compiles the decode profile's command-buffer
-    // timeline shims and the read pool's event-signal log (`-DQ3LD_EVSIG`), which the plugin's profile probes link.
-    const profile = !inject and pluginProfile(b);
     const c: []const []const u8 = if (inject)
         &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" }
-    else if (profile)
-        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_EVSIG" }
     else
         &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
     const cxx: []const []const u8 = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" };
-    if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "q3_lookahead4_exl3.c" })), .flags = c });
-    if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "q3_event_shim.mm" })), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
-    if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "mlx_event_shim.cpp" })), .flags = cxx });
-    if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "mlx_alloc_shim.cpp" })), .flags = cxx });
-    if (profile) {
-        const objc: []const []const u8 = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" };
-        if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_cb_timeline.mm" })), .flags = objc });
-        if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_newbuffer_count.mm" })), .flags = objc });
-        if (c_sources) m.addCSourceFile(.{ .file = b.path(b.pathJoin(&.{ csrc, "dsv41_tl_mlx.cpp" })), .flags = cxx });
-    }
+    m.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = c });
+    m.addCSourceFile(.{ .file = b.path(csrc ++ "/q3_event_shim.mm"), .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
+    m.addCSourceFile(.{ .file = b.path(csrc ++ "/mlx_event_shim.cpp"), .flags = cxx });
+    m.addCSourceFile(.{ .file = b.path(csrc ++ "/mlx_alloc_shim.cpp"), .flags = cxx });
     m.addIncludePath(b.path(csrc));
-    m.addIncludePath(b.path("lib/mlx/include"));
     m.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
     m.addIncludePath(b.path("lib/mlxc-src"));
     m.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
@@ -287,13 +256,4 @@ pub fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, root: []const u8, ta
     // CLI zip in lib/ beside the binary.
     m.addRPath(.{ .cwd_relative = "@executable_path/../Frameworks" });
     m.addRPath(.{ .cwd_relative = "@executable_path/lib" });
-    return m;
-}
-
-/// `-Dplugin-profile`: compile the plugin's profile probes and their shims in; off in every served build. `b.option`
-/// may be declared once; the graphs share this answer.
-var plugin_profile_opt: ?bool = null;
-pub fn pluginProfile(b: *std.Build) bool {
-    if (plugin_profile_opt == null) plugin_profile_opt = b.option(bool, "plugin-profile", "Compile the mlx-stream plugin's profile probes in (profile builds only)") orelse false;
-    return plugin_profile_opt.?;
 }

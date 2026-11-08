@@ -2,9 +2,9 @@
 //! `log.zig`, the MLX error latch in `mlx/ffi.zig`, a kernel cache it owns, the environment (until `src/env.zig`),
 //! `--metrics`' counters, the memory ceiling the caller supplies, and the Neural Engine (`plugin_ane.zig`). Built-ins and outside plugins get the same table.
 //!
-//! `HostGpu` delegates to the shims compiled with mlx-stream (`sdk/weights/streamed/csrc/`: `mlx_event_shim.cpp`,
-//! `mlx_alloc_shim.cpp` with its `mlx_launch_cache.inc` and `mimo_gpu_address.inc`, `q3_event_shim.mm`): the one implementation over MLX's
-//! internals until P4 moves it here. A graph without them (Linux, Windows) refuses every call `unsupported`.
+//! `HostGpu` delegates to the expert stream's shims (`sdk/weights/streamed/csrc/`: `mlx_event_shim.cpp`,
+//! `mlx_alloc_shim.cpp` with its `mlx_launch_cache.inc` and `mimo_gpu_address.inc`, `q3_event_shim.mm`): the one
+//! implementation over MLX's internals. A graph without them (Linux, Windows) refuses every call `unsupported`.
 
 const std = @import("std");
 const env = @import("../env.zig");
@@ -244,8 +244,8 @@ fn workingSetHeadroom(_: ?*anyopaque) u64 {
 
 // ── HostGpu ──
 
-/// The mlx-stream shims, on the graphs that compile them.
-const shims: ?type = if (@import("build_options").mlx_stream) struct {
+/// The expert stream's MLX shims (`sdk/weights/streamed/csrc/`), on the macOS graphs that compile them.
+const shims: ?type = if (@import("builtin").os.tag == .macos) struct {
     pub extern "c" fn dsv41ev_create_metal(start: u64, object: *u64) i32;
     pub extern "c" fn dsv41ev_create_host(word: *i64, timeout_ns: i64) i32;
     pub extern "c" fn dsv41ev_wait(xs: [*]const mlx.mlx_array, n: usize, event: i32, value: u64, deps: ?[*]const mlx.mlx_array, n_deps: usize, track_inputs: bool, s: mlx.mlx_stream, outs: [*]mlx.mlx_array) c_int;

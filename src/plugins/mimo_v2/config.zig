@@ -1,7 +1,7 @@
 //! Xiaomi MiMo-V2 packs (`mimo_v2`, `mimo_v2_flash`; mlx-lm's layout, `tests/convert_mimo_v2.py`): the claim and the
 //! parse into `Parsed` plus this plugin's own fields. MLX-free. A Sushi pack (EXL3 experts under `expert_quant`,
-//! an e4m3 trunk) is served, and so is a streaming pack (its experts in an MXFP4 `experts.bin`, `expert_streaming`); the
-//! original release is refused by name.
+//! an e4m3 trunk) is served; a streaming pack (`expert_streaming`, an `experts.bin` bank) and the original release are
+//! refused by name.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -62,8 +62,6 @@ pub const Config = struct {
     block_json: []const u8 = "{}",
     /// A Sushi pack's `expert_quant` block (its routed experts are EXL3 banks); empty = none.
     expert_block_json: []const u8 = "",
-    /// The routed experts are read from the pack's MXFP4 bank (`experts.bin`), the MTP heads from its sidecar.
-    streamed: bool = false,
 
     pub fn moeAt(c: *const Config, layer: u32) bool {
         return c.experts > 0 and layer >= c.first_k_dense;
@@ -104,11 +102,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     const root = json.parseRoot(arena.allocator(), config_json.slice()) catch return invalid("config.json is not a JSON object");
     const type_name = json.string(json.field(root, "model_type")) orelse return unsupported("no model_type");
     if (!std.mem.eql(u8, type_name, "mimo_v2") and !std.mem.eql(u8, type_name, "mimo_v2_flash")) return unsupported("another model_type");
-    const streamed = json.field(root, "expert_streaming") != null;
-    if (streamed and !isBank(json.object(json.field(root, "expert_streaming"))))
-        return unsupported("an expert_streaming block other than mlx-stream's MXFP4 expert bank");
-    if (json.field(root, "residents_format")) |v| if (!std.mem.eql(u8, json.string(v) orelse "", "fp8_block128"))
-        return unsupported("a residents_format other than fp8_block128");
+    if (json.field(root, "expert_streaming") != null) return unsupported("a streaming pack (expert_streaming): its experts.bin bank is not streamed in-tree");
     for ([_][]const u8{ "text_config", "modules" }) |k| if (json.field(root, k) != null) return unsupported("a key this plugin does not model");
     // A Sushi pack's `quant_method: fp8` describes its trunk; its experts are EXL3.
     const sushi = json.object(json.field(root, "expert_quant"));
@@ -159,19 +153,10 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         gpa.destroy(cfg_out);
         return invalid("out of memory");
     };
-    c.streamed = streamed;
     cfg_out.* = c;
     p.private = cfg_out;
     out.* = p;
     return .ok;
-}
-
-/// mlx-stream's MXFP4 expert bank (`experts.bin` beside `expert-manifest.json`).
-fn isBank(es: ?json.Object) bool {
-    const o = es orelse return false;
-    const want = [_][2][]const u8{ .{ "family", "mlx-stream" }, .{ "format", "mlx-stream-mxfp4-expert-bank-v1" }, .{ "manifest", "expert-manifest.json" } };
-    for (want) |kv| if (!std.mem.eql(u8, json.string(json.field(o, kv[0])) orelse "", kv[1])) return false;
-    return true;
 }
 
 /// The engine's reading of a MiMo config (its common block, then the `mimo_v2` arm).
@@ -325,23 +310,12 @@ test "mimo_v2 config: the original release fails by name (a Sushi pack's fp8 tru
     try testing.expect(std.mem.indexOf(u8, sushi.why.slice(), "convert_mimo_v2.py") == null);
 }
 
-test "mimo_v2 config: a streaming pack with the MXFP4 bank and fp8 residents parses; another bank or residents format is unsupported" {
+test "mimo_v2 config: a streaming pack is unsupported by name" {
     const bank = "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-mxfp4-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"}";
-    const fp8 = "\"model.layers.0.self_attn.q_proj\":{\"mode\":\"fp8_e4m3\",\"bits\":8,\"block\":[64,128]},\"lm_head\":false,";
-    const stream_json = try std.mem.concat(testing.allocator, u8, &.{ pack_json[0 .. pack_json.len - 1], ",", bank, ",\"residents_format\":\"fp8_block128\"}" });
+    const stream_json = try std.mem.concat(testing.allocator, u8, &.{ pack_json[0 .. pack_json.len - 1], ",", bank, "}" });
     defer testing.allocator.free(stream_json);
-    const with_fp8 = try std.mem.replaceOwned(u8, testing.allocator, stream_json, "\"quantization\":{", "\"quantization\":{" ++ fp8);
-    defer testing.allocator.free(with_fp8);
     var p: abi.Parsed = .{};
-    try testing.expect(parseJson(with_fp8, &p).isOk());
-    try testing.expect(of(&p).streamed and of(&p).quant.mode == .mxfp4);
-    freeParsed(&p);
-    for ([_][]const u8{ "\"expert_streaming\":{}", "\"expert_streaming\":{\"family\":\"mlx-stream\",\"format\":\"mlx-stream-exl3-expert-bank-v1\",\"manifest\":\"expert-manifest.json\"}" }) |other| {
-        const js = try std.mem.replaceOwned(u8, testing.allocator, stream_json, bank, other);
-        defer testing.allocator.free(js);
-        try testing.expectEqual(abi.Verdict.Code.unsupported, parseJson(js, &p).code);
-    }
-    const res = try std.mem.replaceOwned(u8, testing.allocator, stream_json, "fp8_block128", "int8");
-    defer testing.allocator.free(res);
-    try testing.expectEqual(abi.Verdict.Code.unsupported, parseJson(res, &p).code);
+    const v = parseJson(stream_json, &p);
+    try testing.expectEqual(abi.Verdict.Code.unsupported, v.code);
+    try testing.expect(std.mem.indexOf(u8, v.why.slice(), "expert_streaming") != null);
 }

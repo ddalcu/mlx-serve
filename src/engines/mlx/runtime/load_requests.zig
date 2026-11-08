@@ -87,8 +87,8 @@ pub fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     evictResident(sch, req.evict_entries);
     req.evict_entries = &.{};
 
-    // A Neural Engine build runs on its own thread while the GPU keeps serving.
-    if (req.gguf == null and !req.ane_declined and aneWanted(req.config, req.ane)) {
+    // A Neural Engine build runs on its own thread while the GPU keeps serving; an engine plugin's model is its own.
+    if (req.gguf == null and !req.ane_declined and aneWanted(req.config, req.ane) and !@import("../../../host/plugins/loader.zig").engineServes(req.model_dir)) {
         req.entry.load_progress.start(io_util.nowMsMonotonic(sch.io));
         if (engines_load.aneAdmit(sch, req)) {
             _ = sch.ane_builds.fetchAdd(1, .acq_rel);
