@@ -90,7 +90,7 @@ final class MediaModalityRoutingTests: XCTestCase {
         let cases: [(String, MediaModality)] = [
             ("flux2-klein-4b", .image), ("krea2_turbo", .image),
             ("mage_flow", .image), ("mageflow", .image),
-            ("qwen3_tts", .voice), ("kokoro", .voice),
+            ("qwen3_tts", .voice), ("kokoro", .voice), ("dense", .voice),
             ("acestep", .music), ("minimax_music3", .music),
             ("AudioVideo", .video), ("minimax_h3", .video),
             ("hunyuan3d_2_1", .mesh), ("hunyuan3d_2_1_paint", .mesh),
@@ -260,5 +260,32 @@ final class MediaModelResolutionTests: XCTestCase {
         let uses = text.components(separatedBy: "UseMediaModelButton(").count - 1
         XCTAssertGreaterThanOrEqual(uses, 4,
             "expected the media Use button in Recommended, Discover, My Models and the Media pane")
+    }
+
+    /// `dense` is generic: the app keys Ming on the server's markers, and on the Hub on Ming's architecture.
+    func testADenseConfigIsAVoicePackOnlyWithTheServersMarkers() throws {
+        let dir = NSTemporaryDirectory() + "dense-\(UUID().uuidString)"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try #"{"model_type":"dense","ditar_config":{},"aggregator_config":{}}"#.write(toFile: cfg, atomically: true, encoding: .utf8)
+        XCTAssertFalse(DownloadManager.parseConfigMetadata(atPath: cfg).lacksMediaMarkers)
+        try #"{"model_type":"dense","hidden_size":896}"#.write(toFile: cfg, atomically: true, encoding: .utf8)
+        XCTAssertTrue(DownloadManager.parseConfigMetadata(atPath: cfg).lacksMediaMarkers)
+
+        let ming = local("dense", path: "/m/ming")
+        XCTAssertTrue(ming.isSupportedArchitecture)
+        XCTAssertEqual(MediaModality.of(modelType: ming.mediaModelType, path: ming.path, rows: []), .voice)
+        var other = local("dense", path: "/m/other")
+        other.lacksMediaMarkers = true
+        XCTAssertFalse(other.isSupportedArchitecture)
+        XCTAssertNil(MediaModality.of(modelType: other.mediaModelType, path: other.path, rows: []))
+
+        var row = HFModel(id: "me/dense", downloads: 1, likes: 0, lastModified: nil,
+                          tags: ["dense"], safetensors: nil, pipelineTag: nil)
+        row.config = HFConfigMeta(modelType: "dense", architectures: ["SomeForCausalLM"])
+        XCTAssertFalse(row.isServedMediaRepo)
+        row.config = HFConfigMeta(modelType: "dense", architectures: ["BailingMMNativeForConditionalGeneration"])
+        XCTAssertTrue(row.isServedMediaRepo)
     }
 }

@@ -38,6 +38,7 @@ const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../sdk/util/log.zig");
+const istft_head = @import("../../sdk/media/istft.zig");
 
 const S = mlx.mlx_stream;
 
@@ -522,37 +523,6 @@ pub fn frameSignal(allocator: std.mem.Allocator, samples: []const f32, n_fft: us
         @memcpy(data[f * n_fft ..][0..n_fft], padded[f * hop ..][0..n_fft]);
     }
     return .{ .data = data, .frames = frames };
-}
-
-/// Overlap-add reconstruction with window-squared normalisation — the inverse
-/// of `frameSignal` under the same window, i.e. `torch.istft(center=True)`.
-pub fn overlapAdd(allocator: std.mem.Allocator, frames_data: []const f32, frames: usize, n_fft: usize, hop: usize, window: []const f32) ![]f32 {
-    const padded_len = (frames - 1) * hop + n_fft;
-    const acc = try allocator.alloc(f32, padded_len);
-    defer allocator.free(acc);
-    const wsum = try allocator.alloc(f32, padded_len);
-    defer allocator.free(wsum);
-    @memset(acc, 0);
-    @memset(wsum, 0);
-
-    for (0..frames) |f| {
-        const off = f * hop;
-        for (0..n_fft) |k| {
-            acc[off + k] += frames_data[f * n_fft + k] * window[k];
-            wsum[off + k] += window[k] * window[k];
-        }
-    }
-
-    const pad = n_fft / 2;
-    const out_len = padded_len - 2 * pad;
-    const out = try allocator.alloc(f32, out_len);
-    errdefer allocator.free(out);
-    for (0..out_len) |i| {
-        const w = wsum[pad + i];
-        // torch guards the same way; below this the frame coverage is degenerate.
-        out[i] = if (w > 1e-11) acc[pad + i] / w else 0;
-    }
-    return out;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1624,16 +1594,8 @@ fn istft(allocator: std.mem.Allocator, mag: mlx.mlx_array, phase: mlx.mlx_array,
     const cplx = try add2(re, im_c, s);
     defer _ = mlx.mlx_array_free(cplx);
 
-    var frames_arr = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(frames_arr);
-    try mlx.check(mlx.mlx_fft_irfft(&frames_arr, cplx, @intCast(n_fft), 2, mlx.MLX_FFT_NORM_BACKWARD, s));
-
-    try mlx.check(mlx.mlx_array_eval(frames_arr));
-    const shape = mlx.getShape(frames_arr);
-    const n_frames: usize = @intCast(shape[1]);
-    const data = mlx.mlx_array_data_float32(frames_arr) orelse return error.KokoroIstftReadFailed;
-
-    return overlapAdd(allocator, data[0 .. n_frames * n_fft], n_frames, n_fft, hop, window);
+    // torch.istft(center=True): trimmed by n_fft / 2 at both ends.
+    return istft_head.istft(allocator, cplx, n_fft, hop, window, n_fft / 2, s);
 }
 
 /// The iSTFTNet generator: two upsample stages, each mixing in a harmonic
@@ -2359,7 +2321,7 @@ test "kokoro: predictedDurations sums sigmoids, clamps to >= 1, and scales by sp
     // Row 1: four very negative logits → ≈0 → must CLAMP to 1, never 0
     //        (a 0-frame phoneme would vanish from the alignment).
     const logits = [_]f32{
-        20, 20, 20, 20,
+        20,  20,  20,  20,
         -20, -20, -20, -20,
     };
     const dur = try predictedDurations(testing.allocator, &logits, 2, 4, 1.0);
@@ -2411,7 +2373,7 @@ test "kokoro: frame → window → overlap-add reconstructs the signal (COLA)" {
         for (0..n_fft) |k| framed.data[f * n_fft + k] *= w[k];
     }
 
-    const rec = try overlapAdd(a, framed.data, framed.frames, n_fft, hop, w);
+    const rec = try istft_head.overlapAdd(a, framed.data, framed.frames, n_fft, hop, w, n_fft / 2);
     defer a.free(rec);
 
     try testing.expectEqual(sig.len, rec.len);

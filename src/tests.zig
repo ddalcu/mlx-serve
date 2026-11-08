@@ -274,6 +274,7 @@ test {
     _ = @import("sdk/media/pack_bytes.zig");
     _ = @import("sdk/media/image_pixels.zig");
     _ = @import("sdk/media/lora_set.zig");
+    _ = @import("sdk/media/istft.zig");
     _ = @import("sdk/blocks/dit/w8a8_bill.zig");
     _ = @import("sdk/media/job.zig");
     _ = @import("sdk/media/image_request.zig");
