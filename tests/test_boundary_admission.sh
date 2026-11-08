@@ -4,7 +4,9 @@
 # ~4k-token prefill B and a 30-token request C sent 0.8 s into B. [1] with a share, C's first-token wait is under half
 # of B's remaining prefill; [2] at share 0 it is at least 80% (that schedule must not change); [3] every request ends
 # with text; [4] only the share arm logs `[boundary] admitted`; [5] C dropping while it waits, and B dropping after C
-# was admitted, leave every other request finishing and the server answering.
+# was admitted, leave every other request finishing and the server answering; [6] at the default share a C whose
+# tail is past the boundary limit waits under half of B's remaining prefill with `X-MLX-Priority: high` and at
+# least 80% without it.
 #
 #   BOUNDARY_TEST_MODEL=<dir> BINARY=./zig-out/bin/mlx-serve ./tests/test_boundary_admission.sh [port]
 #
@@ -44,15 +46,19 @@ PORT = int(sys.argv[1])
 B_WORDS = int(sys.argv[2])
 MODE = sys.argv[3] if len(sys.argv) > 3 else "normal"
 URL = f"http://127.0.0.1:{PORT}/v1/chat/completions"
+# Past the 1024-token boundary limit and under the 8192 priority limit at 2 to 10 tokens a word.
+C_WORDS = 600
 
 
-def stream(payload, out, abort_after=None):
+def stream(payload, out, abort_after=None, priority=False):
     """Records request start, the time of the first content chunk, the text and the finish reason.
     `abort_after` seconds after the start the client drops the connection."""
     out["start"] = time.monotonic()
     out["text"] = []
-    req = urllib.request.Request(URL, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"})
+    headers = {"Content-Type": "application/json"}
+    if priority:
+        headers["X-MLX-Priority"] = "high"
+    req = urllib.request.Request(URL, data=json.dumps(payload).encode(), headers=headers)
     with urllib.request.urlopen(req, timeout=600) as r:
         if abort_after is not None:
             threading.Timer(abort_after, r.close).start()
@@ -114,8 +120,36 @@ def cancel_case(drop):
     return all(survived(x) for x in expect_ok)
 
 
+def priority_case(priority):
+    """B prefills beside a decoding A; C, sent 0.8 s into B, has a tail past the boundary limit."""
+    a, b, c = {}, {}, {}
+    ta = threading.Thread(target=stream, args=(payload("Count from 1 to 400, one number per line.", 800), a))
+    ta.start()
+    while len(a.get("text", [])) < 20:
+        time.sleep(0.01)
+    salt = random.randint(0, 10**9)
+    words = " ".join(f"w{salt}x{i}" for i in range(B_WORDS))
+    tb = threading.Thread(target=stream, args=(payload(f"Summarize in one word. {words}", 4), b))
+    tb.start()
+    time.sleep(0.8)
+    tail = " ".join(f"p{salt}y{i}" for i in range(C_WORDS))
+    tc = threading.Thread(target=stream, args=(payload(f"Reply with the single word ok. {tail}", 4), c, None, priority))
+    tc.start()
+    tc.join()
+    tb.join()
+    ta.join()
+    ratio = (c.get("first", c["end"]) - c["start"]) / max(1e-3, b["end"] - c["start"])
+    return ratio, all(x.get("finish") for x in (a, b, c))
+
+
 if MODE == "cancel":
     print(json.dumps({"cancel_c": cancel_case("c"), "cancel_b": cancel_case("b")}))
+    sys.exit(0)
+
+if MODE == "priority":
+    with_r, with_ok = priority_case(True)
+    without_r, without_ok = priority_case(False)
+    print(json.dumps({"with": with_r, "without": without_r, "finished": with_ok and without_ok}))
     sys.exit(0)
 
 a, b, c = {}, {}, {}
@@ -177,6 +211,17 @@ python3 "$WORK/probe.py" "$PORT" "$B_WORDS" cancel > "$WORK/cancel.json" || { ec
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || { echo "[fail] server stopped answering after the cancel cases"; exit 1; }
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
 
+# Priority on a default-share server: C past the boundary limit, with and without the header.
+"$BINARY" --serve --model "$MODEL" --host 127.0.0.1 --port "$PORT" --prefix-cache-entries 0 \
+    --max-concurrent 8 --prefill-chunk 1024 \
+    --log-level debug --log-file "$WORK/priority.log" >"$WORK/priority.stdout" 2>&1 &
+SERVER_PID=$!
+srv_wait_health "http://127.0.0.1:$PORT" 480 0.5 || { echo "[fail] server did not start (priority arm)"; exit 1; }
+for rep in 1 2 3; do
+    python3 "$WORK/probe.py" "$PORT" "$B_WORDS" priority > "$WORK/priority.r$rep.json" || { echo "[fail] priority probe (rep $rep)"; exit 1; }
+done
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""
+
 # ratio = C's wait over B's remaining prefill at C's arrival, median over reps 2 and 3.
 ratio() {
     python3 - "$WORK/$1.r2.json" "$WORK/$1.r3.json" <<'PY'
@@ -219,4 +264,17 @@ import json, sys
 r = json.load(open(sys.argv[1]))
 sys.exit(0 if r["cancel_c"] and r["cancel_b"] else 1)
 PY
-echo "[pass] a small request arriving mid-prefill is admitted at a chunk boundary; share 0 is unchanged; cancels at either end leave the rest finishing"
+# Median over reps 2 and 3 of each priority arm.
+python3 - "$WORK/priority.r2.json" "$WORK/priority.r3.json" <<'PY' || { echo "[fail] priority arm: $(cat "$WORK"/priority.r?.json)"; exit 1; }
+import json, sys
+rs = [json.load(open(p)) for p in sys.argv[1:]]
+w = sorted(r["with"] for r in rs)[len(rs) // 2]
+wo = sorted(r["without"] for r in rs)[len(rs) // 2]
+print(f"priority: C wait / B remaining: with={w:.3f} without={wo:.3f}")
+sys.exit(0 if all(r["finished"] for r in rs) and w < 0.5 and wo >= 0.8 else 1)
+PY
+if ! grep -q '\[boundary\] admitted a [0-9]*-token priority request' "$WORK/priority.log"; then
+    echo "[fail] priority arm never logged a priority admission at a chunk boundary"
+    exit 1
+fi
+echo "[pass] a small request arriving mid-prefill is admitted at a chunk boundary; share 0 is unchanged; cancels at either end leave the rest finishing; a priority request past the boundary limit is admitted too"

@@ -215,6 +215,8 @@ pub const SubmitParams = struct {
     /// A prefix cache of the request's own, in place of the model's (a warm request leaves the model's untouched).
     prefix_cache: ?*handles.HotPrefixCache = null,
     client: metrics_mod.Client = .other,
+    /// The request's `X-MLX-Priority: high` (`Conn.priority`).
+    priority: bool = false,
     /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
     /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
     /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.

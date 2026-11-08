@@ -89,11 +89,15 @@ pub const Conn = struct {
     ablation: ?AblationRequest = null,
     ablation_header: [192]u8 = undefined,
     ablation_header_len: usize = 0,
+    /// The current request's `X-MLX-Priority: high`: it may be prefilled at a running prefill's chunk boundaries
+    /// with a longer uncached tail (`engines/mlx/prefill_interleave.zig` `PRIORITY_MAX_TAIL`).
+    priority: bool = false,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
         c.client = .other;
+        c.priority = false;
         c.clearAblation();
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
@@ -107,6 +111,7 @@ pub const Conn = struct {
     /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
     pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
         c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
+        c.priority = if (findHeaderValue(headers, "x-mlx-priority")) |v| std.ascii.eqlIgnoreCase(v, "high") else false;
         c.clearAblation();
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");
     }
@@ -420,6 +425,19 @@ test "Conn names the client from each request's User-Agent and keeps no header t
     try std.testing.expectEqual(instr.Client.opencode, conn.client);
     conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
     try std.testing.expectEqual(instr.Client.other, conn.client);
+}
+
+test "Conn: X-MLX-Priority: high marks its own request only" {
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = undefined } }, std.Io.Threaded.global_single_threaded.io());
+    try testing.expect(!conn.priority);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nx-mlx-priority: High\r\n\r\n");
+    try testing.expect(conn.priority);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nX-MLX-Priority: low\r\n\r\n");
+    try testing.expect(!conn.priority);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nX-MLX-Priority: high\r\n\r\n");
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(!conn.priority);
 }
 
 test "Conn: a request's X-Ablation line rides both response heads, and the next request starts without it or the key" {

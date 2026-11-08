@@ -944,6 +944,7 @@ fn handleResponsesInner(
             .media = mm.media,
             .cache_key = cache_key,
             .client = stream.client,
+            .priority = stream.priority,
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,

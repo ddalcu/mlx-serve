@@ -41,6 +41,7 @@ pub const InterleaveCtx = struct {
     ticks: u32 = 0,
     /// Wall clock since the previous boundary's ticks ended: the chunk just forwarded.
     chunk_sw: io_util.Stopwatch,
+    priority_share: PriorityShare = .{},
 };
 
 /// Ticks a speculating slot must see company before it gives up speculation for the batch.
@@ -163,6 +164,9 @@ pub const BOUNDARY_MAX_TAIL: usize = DECODE_SHARE_PREFILL_CHUNK;
 /// Requests admitted at one chunk boundary, across its admission scan and the gaps between its owed
 /// decode ticks. The wall-time cap in `BoundaryBudget` is the real bound.
 pub const BOUNDARY_MAX_COUNT: u32 = 4;
+/// The largest uncached tail a priority request (`X-MLX-Priority: high`) may prefill at a chunk boundary: the
+/// outer waits for the whole nested prefill, so one priority request costs it at most about eight chunks.
+pub const PRIORITY_MAX_TAIL: usize = 8 * BOUNDARY_MAX_TAIL;
 
 /// What the boundary gate reads about a pending request.
 pub const BoundaryCand = struct {
@@ -174,6 +178,7 @@ pub const BoundaryCand = struct {
     module_state: bool,
     /// Uncached tail, from `peekMatchedTokens`.
     tail: usize,
+    priority: bool = false,
 };
 
 pub const BoundaryCtx = struct {
@@ -184,6 +189,20 @@ pub const BoundaryCtx = struct {
     decoding: usize,
     max_concurrent: usize,
     max_tail: usize,
+    /// `PriorityShare.room` of the outer prefill.
+    priority_room: bool = false,
+};
+
+/// Wall time of a long prefill's own chunks and of the priority prefills it hosted at its boundaries. A priority
+/// request past `BOUNDARY_MAX_TAIL` starts only while the hosted time is at most the own time, so priority
+/// traffic never takes more than about half of a long prefill's wall clock.
+pub const PriorityShare = struct {
+    own_ns: u64 = 0,
+    hosted_ns: u64 = 0,
+
+    pub fn room(self: PriorityShare) bool {
+        return self.hosted_ns <= self.own_ns;
+    }
 };
 
 /// May this pending request be prefilled at the outer prefill's chunk boundary?
@@ -191,7 +210,8 @@ pub fn boundaryEligible(c: BoundaryCand, x: BoundaryCtx) bool {
     if (x.share <= 0 or x.nested or x.outer_exclusive) return false;
     if (c.exclusive or c.has_media or c.prompt_logprobs or !c.generator_path or c.module_state) return false;
     if (x.decoding >= x.max_concurrent) return false;
-    return c.tail <= x.max_tail;
+    if (c.tail <= x.max_tail) return true;
+    return c.priority and x.priority_room and c.tail <= PRIORITY_MAX_TAIL;
 }
 
 /// What one boundary may spend on nested prefills, so the outer always advances.
@@ -246,7 +266,7 @@ pub fn emptySlotCache(slot: *Slot) void {
 
 /// The first pending request that passes the boundary gate, removed from `pending` with its
 /// `in_pass` held. `outer` is the prefill whose chunk boundary this is.
-fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
+fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot, priority_room: bool) ?*Slot {
     sch.queue_mu.lockUncancelable(sch.io);
     defer sch.queue_mu.unlock(sch.io);
     var decoding: usize = 0;
@@ -261,6 +281,7 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
         .decoding = decoding,
         .max_concurrent = sch.max_concurrent,
         .max_tail = BOUNDARY_MAX_TAIL,
+        .priority_room = priority_room,
     };
     const n = @min(sch.pending.items.len, 32);
     for (sch.pending.items[0..n], 0..) |s, i| {
@@ -272,6 +293,7 @@ fn takeBoundaryCandidate(sch: *Scheduler, outer: *Slot) ?*Slot {
             .generator_path = s.model.transformer != null,
             .module_state = if (s.model.transformer) |xf| xf.config.caps().shared_readonly_state else false,
             .tail = slotUncachedTail(s),
+            .priority = s.priority,
         };
         if (!boundaryEligible(c, x)) continue;
         _ = s.in_pass.fetchAdd(1, .acq_rel);
@@ -291,9 +313,10 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
     if (share <= 0 or sch.boundary_depth > 0) return 0;
     var total = io_util.Stopwatch.init(sch.io);
     while (budget.mayStart()) {
-        const slot = takeBoundaryCandidate(sch, ic.slot) orelse break;
+        const slot = takeBoundaryCandidate(sch, ic.slot, ic.priority_share.room()) orelse break;
         var sw = io_util.Stopwatch.init(sch.io);
-        slot.boundary_max_tail = BOUNDARY_MAX_TAIL;
+        const priority = slot.priority;
+        slot.boundary_max_tail = if (priority) PRIORITY_MAX_TAIL else BOUNDARY_MAX_TAIL;
         sch.boundary_depth += 1;
         sch.boundary_outer = ic.slot;
         const saved_tokens = sch.inflight_prefill_tokens.load(.monotonic);
@@ -313,9 +336,11 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
         if (wait) sch.pending.insert(sch.allocator, 0, slot) catch slot.markError("OutOfMemory");
         sch.queue_mu.unlock(sch.io);
         _ = slot.in_pass.fetchSub(1, .acq_rel);
+        const spent = sw.read();
+        if (priority) ic.priority_share.hosted_ns +|= spent;
         if (wait) break;
-        if (outcome == .decoding) log.info("[boundary] admitted a {d}-token request beside a {d}-token prefill\n", .{ slot.prompt_tokens, ic.slot.full_prompt.len });
-        budget.charge(sw.read());
+        if (outcome == .decoding) log.info("[boundary] admitted a {d}-token {s}request beside a {d}-token prefill\n", .{ slot.prompt_tokens, if (priority) "priority " else "", ic.slot.full_prompt.len });
+        budget.charge(spent);
     }
     return total.read();
 }
@@ -502,6 +527,7 @@ pub fn interleaveDecodeTickCb(opaque_ctx: *anyopaque) void {
     const graphs_were = mlx.setCudaGraphs(true);
     defer _ = mlx.setCudaGraphs(graphs_were);
     const chunk_ns = ic.chunk_sw.read();
+    ic.priority_share.own_ns +|= chunk_ns;
     const share = prefillDecodeShare();
     // Small pending requests first, so the ticks below include them; their time is hosted time. A
     // request that arrives during the owed ticks is admitted between them, so no newcomer waits
@@ -640,6 +666,95 @@ test "boundaryEligible: a small plain request is admitted only under a share, ne
     try testing.expect(boundaryEligible(c, base_ctx));
     c.tail = base_ctx.max_tail + 1;
     try testing.expect(!boundaryEligible(c, base_ctx));
+}
+
+test "boundaryEligible: a priority request past the boundary tail needs room in the share and at most PRIORITY_MAX_TAIL" {
+    const cand: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .module_state = false, .tail = BOUNDARY_MAX_TAIL + 1, .priority = true };
+    const ctx: BoundaryCtx = .{ .share = 0.25, .nested = false, .outer_exclusive = false, .decoding = 1, .max_concurrent = 8, .max_tail = BOUNDARY_MAX_TAIL, .priority_room = true };
+    try testing.expect(boundaryEligible(cand, ctx));
+
+    var c = cand;
+    c.tail = PRIORITY_MAX_TAIL;
+    try testing.expect(boundaryEligible(c, ctx));
+    c.tail = PRIORITY_MAX_TAIL + 1;
+    try testing.expect(!boundaryEligible(c, ctx));
+    c = cand;
+    c.priority = false;
+    try testing.expect(!boundaryEligible(c, ctx));
+
+    var x = ctx;
+    x.priority_room = false;
+    try testing.expect(!boundaryEligible(cand, x));
+    // Within the boundary tail a priority request needs no room.
+    c = cand;
+    c.tail = BOUNDARY_MAX_TAIL;
+    try testing.expect(boundaryEligible(c, x));
+    // Every other gate still holds.
+    x = ctx;
+    x.share = 0;
+    try testing.expect(!boundaryEligible(cand, x));
+    x = ctx;
+    x.nested = true;
+    try testing.expect(!boundaryEligible(cand, x));
+    c = cand;
+    c.has_media = true;
+    try testing.expect(!boundaryEligible(c, ctx));
+}
+
+test "PriorityShare: room while the hosted priority time is at most the outer's own" {
+    var s: PriorityShare = .{};
+    try testing.expect(s.room());
+    s.own_ns = 100;
+    s.hosted_ns = 100;
+    try testing.expect(s.room());
+    s.hosted_ns = 101;
+    try testing.expect(!s.room());
+}
+
+const SimRequest = struct { tail: usize, priority: bool, arrives: u32 };
+
+/// A long prefill of `chunks` equal chunks; request i is pending from boundary `arrives` on and, admitted, prefills at
+/// the outer's speed. Writes the boundary that admitted each request, `chunks` for one that waited for the whole prefill.
+fn simulateLongPrefill(reqs: []const SimRequest, chunks: u32, admitted: []u32) void {
+    const chunk_ns: u64 = 100 * std.time.ns_per_ms;
+    const share: f32 = DEFAULT_DECODE_SHARE;
+    var ps: PriorityShare = .{};
+    @memset(admitted, chunks);
+    var b: u32 = 1;
+    while (b < chunks) : (b += 1) {
+        ps.own_ns += chunk_ns;
+        var budget: BoundaryBudget = .{ .max_count = BOUNDARY_MAX_COUNT, .ns_cap = decodeShareBudgetNs(chunk_ns, share) };
+        for (reqs, admitted) |r, *at| {
+            if (!budget.mayStart()) break;
+            if (at.* != chunks or r.arrives > b) continue;
+            const c: BoundaryCand = .{ .exclusive = false, .has_media = false, .prompt_logprobs = false, .generator_path = true, .module_state = false, .tail = r.tail, .priority = r.priority };
+            const x: BoundaryCtx = .{ .share = share, .nested = false, .outer_exclusive = false, .decoding = 1, .max_concurrent = 8, .max_tail = BOUNDARY_MAX_TAIL, .priority_room = ps.room() };
+            if (!boundaryEligible(c, x)) continue;
+            at.* = b;
+            const spent = chunk_ns * ((r.tail + BOUNDARY_MAX_TAIL - 1) / BOUNDARY_MAX_TAIL);
+            if (r.priority) ps.hosted_ns += spent;
+            budget.charge(spent);
+        }
+    }
+}
+
+test "boundary admission: beside an 80-chunk prefill a 4k priority request waits for the chunk in flight, without priority for all of it" {
+    var at: [1]u32 = undefined;
+    simulateLongPrefill(&.{.{ .tail = 4096, .priority = true, .arrives = 3 }}, 80, &at);
+    try testing.expectEqual(@as(u32, 3), at[0]);
+    simulateLongPrefill(&.{.{ .tail = 4096, .priority = false, .arrives = 3 }}, 80, &at);
+    try testing.expectEqual(@as(u32, 80), at[0]);
+    // Past PRIORITY_MAX_TAIL priority changes nothing.
+    simulateLongPrefill(&.{.{ .tail = PRIORITY_MAX_TAIL + 1, .priority = true, .arrives = 3 }}, 80, &at);
+    try testing.expectEqual(@as(u32, 80), at[0]);
+}
+
+test "boundary admission: a flood of priority requests keeps at least half of a long prefill's wall clock" {
+    const flood: [12]SimRequest = @splat(.{ .tail = PRIORITY_MAX_TAIL, .priority = true, .arrives = 1 });
+    var at: [flood.len]u32 = undefined;
+    simulateLongPrefill(&flood, 80, &at);
+    // Each costs eight chunks: the next starts once the outer has forwarded as much again.
+    try testing.expectEqualSlices(u32, &.{ 1, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 80 }, &at);
 }
 
 test "BoundaryBudget: stops at the count or the time cap, whichever comes first" {

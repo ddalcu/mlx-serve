@@ -558,6 +558,7 @@ fn handleStreamingCompletion(
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
         .client = stream.client,
+        .priority = stream.priority,
         .ablation = stream.ablation,
     });
     var ts = StreamingTokenStream.initFromStream(running.?.stream, stream_mode, eos_token_ids);
