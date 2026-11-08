@@ -159,6 +159,8 @@ pub fn initWithOptions(
     // `&ctx` to every forward call below; the cache/moe/ssm fields
     // mutate in-place through their pointers.
     var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
+    // Only an echo of prompt logprobs reads a prompt forward's logits before its last row.
+    ctx.last_row_logits = options.prompt_logprobs == null;
 
     const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
     defer allocator.free(ids_i32);
@@ -780,10 +782,11 @@ pub fn initWithOptions(
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
     } else try xfm.forwardWith(&ctx, last_input);
-    // The plan and the sink are this forward's: the generator below keeps a copy of `ctx`.
+    // The plan, the sink and the last-row read are the prompt's: the generator below keeps a copy of `ctx`.
     ctx.prompt_spans = &.{};
     ctx.ssm_cp_positions = &.{};
     ctx.cp_sink = null;
+    ctx.last_row_logits = false;
     // History entries for the held-back span: (hidden[j], token[j+1]) for
     // j in [final_start, prefix_len) — same pairing as the chunk loop.
     // The last row's pair (hidden[last], t1) is appended by the first

@@ -134,7 +134,11 @@ pub const Caps = packed struct(u64) {
     /// rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes
     /// only under the same `Ablation.keys` entry.
     ablation: bool = false,
-    _: u33 = 0,
+    /// A prompt forward asked for `Logits.last_row` returns its last row's logits alone, bit-identical to that row of
+    /// its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the
+    /// prefill's prompt forwards unless the request echoes prompt logprobs.
+    prompt_last_row: bool = false,
+    _: u32 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -976,6 +980,12 @@ test "abi plugin: caps fit one word with the generic defaults" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Caps));
     const c: Caps = .{};
     try testing.expect(c.prefix_cache and c.batch_per_slot_attn and c.batch_pads_kv and !c.batches_decode);
+}
+
+test "abi plugin: an older plugin's caps word ends before prompt_last_row, which it reads unset" {
+    try testing.expectEqual(@bitOffsetOf(Caps, "ablation") + 1, @bitOffsetOf(Caps, "prompt_last_row"));
+    const older: Caps = @bitCast((@as(u64, 1) << @bitOffsetOf(Caps, "prompt_last_row")) - 1);
+    try testing.expect(older.ablation and !older.prompt_last_row);
 }
 
 test "abi plugin: every struct opens with its size, set by default" {

@@ -153,7 +153,8 @@ Model facts the host keeps once at load. Defaults are the generic model's.
 | `merged_state` | `bool` | `false` | A batch's recurrent state is read and written only through `CacheOps.state_rows` / `set_state_rows`, so the engine may keep it merged across batched ticks instead of re-stacking every layer each tick. |
 | `slot_state` | `bool` | `false` | Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`): requests interleave and batch instead of running single-flight. |
 | `ablation` | `bool` | `false` | The forward honours `Forward.ablation` on every pass that writes the residual stream (a native drafter's rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes only under the same `Ablation.keys` entry. |
-| `_` | `u33` | `0` |  |
+| `prompt_last_row` | `bool` | `false` | A prompt forward asked for `Logits.last_row` returns its last row's logits alone, bit-identical to that row of its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the prefill's prompt forwards unless the request echoes prompt logprobs. |
+| `_` | `u32` | `0` |  |
 
 ### `ThinkingDefault` (enum(u8))
 
