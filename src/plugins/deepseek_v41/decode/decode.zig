@@ -170,6 +170,52 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
     }
 }
 
+/// One link of `HandOff`'s chain, shaped like a tensor split's decode `tpSum` past two ranks: a GPU producer of the
+/// bf16 part, its cast to f32, the collective's stand-in (an add) on the CPU stream, the cast back and a GPU consumer;
+/// without `sum`, the producer and consumer alone.
+const HandOff = struct {
+    sc: *dsv41.Scope,
+    cpu: mlx.mlx_stream,
+    x0: A,
+    zero: A,
+    prev: A,
+    sum: bool,
+
+    fn on(c: *HandOff, x: A, dt: ?mlx.mlx_dtype, s: mlx.mlx_stream) !A {
+        var o = mlx.mlx_array_new();
+        if (dt) |t| return c.sc.res(mlx.mlx_astype(&o, x, t, s), &o);
+        return c.sc.res(mlx.mlx_add(&o, x, c.zero, s), &o);
+    }
+
+    pub fn step(c: *HandOff, _: usize) !A {
+        const gpu = c.sc.s;
+        var a = try c.sc.astype(try c.sc.add(c.x0, try c.sc.mul(c.prev, c.zero)), .bfloat16);
+        if (c.sum) a = try c.on(try c.on(try c.on(a, .float32, gpu), null, c.cpu), .bfloat16, gpu);
+        c.prev = try c.sc.add(a, c.zero);
+        return c.prev;
+    }
+};
+
+test "dsv41 dec ubench: a tensor sum's GPU-CPU-GPU hand-off without the network (DSV41_DEC_UBENCH)" {
+    if (!ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+    defer sc.deinit();
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    var row: [4096]f32 = undefined;
+    for (&row, 0..) |*v, i| v.* = @floatFromInt(i % 7);
+    const x0 = try sc.keep(mlx.mlx_array_new_data(&row, &[_]c_int{ 1, row.len }, 2, .float32));
+    const zero = try sc.keep(mlx.mlx_array_new_data(&[_]f32{0}, &[_]c_int{1}, 1, .float32));
+    const n = 80; // a decode token's sums under a tensor split
+    var us = [2]f64{ std.math.inf(f64), std.math.inf(f64) };
+    for (0..3) |_| for (&us, [_]bool{ false, true }) |*u, sum| {
+        var h: HandOff = .{ .sc = &sc, .cpu = cpu, .x0 = x0, .zero = zero, .prev = x0, .sum = sum };
+        u.* = @min(u.*, try moe_up.deviceUs(&h, n));
+    };
+    std.debug.print("[dec-ubench] tensor-sum hand-off (MLX_METAL_FAST_SYNCH={s}): {d:.1} us a sum before any network ({d:.1} us a link for the GPU producer and consumer alone)\n", .{ env.get(.MLX_METAL_FAST_SYNCH) orelse "unset", us[1] - us[0], us[0] });
+}
+
 test {
     _ = fixture;
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;

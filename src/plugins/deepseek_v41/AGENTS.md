@@ -29,6 +29,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
   without NAX (unmeasured on M5); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or
   128 (the expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
+- Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX
+  hands off through its fences (`mlx/backend/metal/fence.cpp`): the GPU dispatches `input_coherent` and `fence_update`
+  before the sum and spins in the one-thread `fence_wait` kernel until the CPU finishes it, so the collective's wait
+  counts as GPU busy time. `DSV41_DEC_UBENCH` also times that hand-off without the network (decode.zig).
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.

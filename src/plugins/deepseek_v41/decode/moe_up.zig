@@ -814,7 +814,7 @@ fn nowUs() i64 {
 }
 
 /// Median microseconds a step of an `n`-step chain takes on the device, the graph built before the clock starts.
-fn deviceUs(ctx: anytype, n: usize) !f64 {
+pub fn deviceUs(ctx: anytype, n: usize) !f64 {
     var times: [7]f64 = undefined;
     for (0..2 + times.len) |rep| {
         var last: A = none;
