@@ -30,7 +30,7 @@ pub fn releaseAll() void {
 /// [1, L, D] (T: glm5's caller casts it first) with each row's `post` [L, HC] and `comb` [L, HC, HC] (f32), its words
 /// written into `dst` (a region at [L, HC, D] of T) instead of a fresh array, behind `after` (`Region.after`, bound
 /// and unread); returns the carrier (a new handle).
-const expand_into_source = kernelSource("plugins/deepseek_v41/kernels/hc_expand_into.metal");
+pub const expand_into_source = kernelSource("plugins/deepseek_v41/kernels/hc_expand_into.metal");
 var expand_into_kernel: ?mlx.mlx_fast_metal_kernel = null;
 pub fn expandInto(s: mlx.mlx_stream, x: A, res: A, post: A, comb: A, dst: A, after_: A) !A {
     const kern = expand_into_kernel orelse blk: {

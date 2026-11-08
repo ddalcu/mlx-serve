@@ -2586,7 +2586,7 @@ const HcFuse = struct { mix_norm: mlx.mlx_fast_metal_kernel, exp_norm: mlx.mlx_f
 var hcf_k: ?HcFuse = null;
 /// hc_fuse.zig: the fused launches built, and run once at `m.hc_tg` threads: a GPU that grants one fewer
 /// threads (the stock kernels' reduction order then out of reach) refuses them by name, the stock kernels serving.
-fn hcFuseInit(gpa: std.mem.Allocator, m: *Dsv41Model) !void {
+pub fn hcFuseInit(gpa: std.mem.Allocator, m: *Dsv41Model) !void {
     if (hcf_k != null) return;
     if (!mlx.streamIsGpu(m.s)) {
         log.info("[dsv41] the fused hc kernels need the GPU stream: the stock hc kernels serve\n", .{});
@@ -2658,7 +2658,7 @@ fn hcSplitWide(sc: *Scope, m: *const Dsv41Model, z: A, eps: A) !Split {
 const MixNorm = struct { n: Normed, h2: A, z: A };
 /// hc_fuse.zig: `hcMixWide` of `x` and `hcNorm` of its mixes (with `w2`, `hcNorm` again under `w2`: `.h2`)
 /// as one launch (`kernels/hc_mix_norm.metal`), then the split from the mixes: the same words.
-fn hcMixNormFused(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A, w2: ?A, eps: A) !MixNorm {
+pub fn hcMixNormFused(sc: *Scope, m: *const Dsv41Model, x: A, cpre: A, hc: *const Hc, norm_w: A, w2: ?A, eps: A) !MixNorm {
     const k = (hcf_k orelse return error.Dsv41HcFuseOff).mix_norm;
     const L = dim(x, 0);
     const D = dim(x, 2);
@@ -2701,7 +2701,7 @@ const ExpandNorm = struct { x1: A, h: A, carrier: A };
 /// one launch (`kernels/hc_expand_norm.metal`): the new stream into `dst` behind `after` (`.carrier`, the write's
 /// one-word output; `dst` may be `x`'s own buffer), else a fresh `.x1`; `.h` the normed rows. The same words as the
 /// expand and `hcNorm`.
-fn hcExpandNormLaunch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, norm_w: A, eps: A, dst: ?A, after: A) !ExpandNorm {
+pub fn hcExpandNormLaunch(sc: *Scope, m: *const Dsv41Model, x: A, y: A, sp: *const Split, cpre: A, norm_w: A, eps: A, dst: ?A, after: A) !ExpandNorm {
     const ks = hcf_k orelse return error.Dsv41HcFuseOff;
     const L = dim(x, 0);
     const nh = dim(x, 1);
@@ -3004,7 +3004,7 @@ fn attnGather(sc: *Scope, m: *const Dsv41Model, sink: A, q: A, qt: A, keys_w: A,
 }
 /// scratch_attn.zig: one launch of `k` with outputs `outs` (shape, dtype), each kept in the scope and written to
 /// `got` (as many as `outs`); `three`, attn_core.zig's (32, 1, 4) launch over the same threadgroups.
-const KOut = struct { shape: []const c_int, dt: mlx.mlx_dtype };
+pub const KOut = struct { shape: []const c_int, dt: mlx.mlx_dtype };
 const KType = struct { [*:0]const u8, mlx.mlx_dtype };
 fn runKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, outs: []const KOut, grid: [2]c_int, ints: []const Tmpl, types: []const KType, got: []A, three: bool) !void {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -3027,7 +3027,7 @@ fn runKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, outs: []c
 }
 /// MLX_SERVE_DSV41_FLASH_ATTN: one launch of the flash kernel `k` (or its heads twin) over `L` rows of `H` heads:
 /// threadgroups of (32, 1, 4 hgn), H / (16 hgn) of them a row; outputs `outs`, each kept in the scope and written to `got`.
-fn flashLaunch(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, outs: []const KOut, L: usize, H: usize, qt_on: bool, ot: mlx.mlx_dtype, got: []A) !void {
+pub fn flashLaunch(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, outs: []const KOut, L: usize, H: usize, qt_on: bool, ot: mlx.mlx_dtype, got: []A) !void {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, o.shape.ptr, o.shape.len, o.dt));

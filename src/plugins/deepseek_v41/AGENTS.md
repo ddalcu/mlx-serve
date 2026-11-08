@@ -133,8 +133,6 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   it, the fp8 encoder saturates it); `moe_gu` / `moe_act` turn a NaN gate sum into the clip limit (Metal's min);
   `engram` launches 1024 threads at 5120-wide rows where M1/M2 compile it for 928, unprobed: decode-width Engram
   writes fail on M1/M2.
-- No contract case yet for the 12 kernels the streamed forward brought (`attn_flash`, `attn_qk_t`, `gate_gemm_nt`,
-  `gate_gemm_loop`, `gemv_twin`, `hc_expand_into`, `hc_expand_norm`, `hc_mix_norm`, `markov_*`, `rope_tail_only`).
 
 ## Fixtures
 - `conformanceFixture`: `fixture.v41Files` (the `tests/dump_dsv41_fixtures.py` pipe layout, 8 layers, no Engram or

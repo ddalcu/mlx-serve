@@ -48,12 +48,15 @@ pub fn Case(comptime D: type) type {
         args: [16]mlx.mlx_array = undefined,
         /// A stated rule's finding, returned by `check`.
         msg: [256]u8 = undefined,
+        /// The outputs `D.output` gathers after each run, for a kernel whose result lands in a bound input.
+        own: std.ArrayList(u8) = .empty,
 
         pub fn init(a: std.mem.Allocator, launch: *const metal.Launch, p: D.Params) Self {
             return .{ .rig = metal.Rig.init(a), .launch = launch, .p = p, .arena = .init(a) };
         }
 
         pub fn deinit(self: *Self) void {
+            self.own.deinit(self.arena.child_allocator);
             self.rig.deinit();
             self.arena.deinit();
         }
@@ -103,6 +106,15 @@ pub fn Case(comptime D: type) type {
 
         pub fn run(self: *Self) !void {
             try self.rig.launch(self.launch, D.geometry(self.p, self.shape).?, self.args[0..self.n_in]);
+            if (comptime @hasDecl(D, "output")) {
+                self.own.clearRetainingCapacity();
+                try D.output(self, &self.own);
+            }
+        }
+
+        /// What the gates read as the last run's outputs.
+        pub fn outBytes(self: *Self) []const u8 {
+            return if (comptime @hasDecl(D, "output")) self.own.items else self.rig.outputBytes();
         }
 
         pub fn count(self: *const Self) usize {
@@ -130,7 +142,7 @@ pub fn Case(comptime D: type) type {
 
         /// The last run's outputs read as `e`, into `out`.
         pub fn outputs(self: *Self, e: spec.Elem, out: []f64) void {
-            for (out, 0..) |*o, i| o.* = spec.read(e, self.rig.outputBytes(), i);
+            for (out, 0..) |*o, i| o.* = spec.read(e, self.outBytes(), i);
         }
     };
 }
@@ -142,6 +154,11 @@ pub fn add(set: *kc.Set, comptime D: type, launch: *const metal.Launch, p: D.Par
         const full = blk: {
             var v = gates.hooks(T);
             if (!@hasDecl(D, "replaced")) v.replaced = null;
+            if (@hasDecl(D, "output")) v.output = struct {
+                fn f(ctx: *anyopaque) anyerror![]const u8 {
+                    return @as(*T, @ptrCast(@alignCast(ctx))).outBytes();
+                }
+            }.f;
             break :blk v;
         };
         const plain = blk: {

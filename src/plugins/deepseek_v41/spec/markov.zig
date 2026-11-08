@@ -25,9 +25,9 @@ const plan = @import("markov_plan.zig");
 
 const A = mlx.mlx_array;
 
-const header = kernelSource("plugins/deepseek_v41/kernels/markov_header.metal");
-const step_source = kernelSource("plugins/deepseek_v41/kernels/markov_step.metal");
-const final_source = kernelSource("plugins/deepseek_v41/kernels/markov_final.metal");
+pub const header = kernelSource("plugins/deepseek_v41/kernels/markov_header.metal");
+pub const step_source = kernelSource("plugins/deepseek_v41/kernels/markov_step.metal");
+pub const final_source = kernelSource("plugins/deepseek_v41/kernels/markov_final.metal");
 
 var step_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var final_kernel: ?mlx.mlx_fast_metal_kernel = null;

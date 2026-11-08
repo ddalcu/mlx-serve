@@ -90,8 +90,8 @@ fn sentinel(comptime s: []const u8) [:0]const u8 {
 /// pg2's arrangement: MLX's steel NAX headers (the kit's), the loop, then MLX's kernel attribute on the generated
 /// definition (`[[kernel]]` becomes `[[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]]`); the body's last line
 /// undefines the macro, so the explicit instantiation MLX appends keeps its plain `[[kernel]]`.
-const header: [:0]const u8 = sentinel(inlined(&.{ steel.defines, steel.type_traits, steel.integral_constant, steel.nax }) ++ "using namespace mlx::steel;\n" ++ kernelSource("plugins/deepseek_v41/kernels/gate_gemm_loop.metal") ++ "\n#define kernel kernel, max_total_threads_per_threadgroup(WM * WN * 32)\n");
-const body: [:0]const u8 = sentinel(kernelSource("plugins/deepseek_v41/kernels/gate_gemm_nt.metal") ++ "\n#undef kernel\n");
+pub const header: [:0]const u8 = sentinel(inlined(&.{ steel.defines, steel.type_traits, steel.integral_constant, steel.nax }) ++ "using namespace mlx::steel;\n" ++ kernelSource("plugins/deepseek_v41/kernels/gate_gemm_loop.metal") ++ "\n#define kernel kernel, max_total_threads_per_threadgroup(WM * WN * 32)\n");
+pub const body: [:0]const u8 = sentinel(kernelSource("plugins/deepseek_v41/kernels/gate_gemm_nt.metal") ++ "\n#undef kernel\n");
 
 var kern: ?mlx.mlx_fast_metal_kernel = null;
 
