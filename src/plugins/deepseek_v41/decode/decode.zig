@@ -467,9 +467,22 @@ const Ins = struct {
     pl: A,
     meta: A,
 
-    fn init(sc: *dsv41.Scope, f: *fixture.Fixture, rows: usize, plant: bool) !Ins {
+    /// `splits` partials a (row, head), every 13th split empty as the split kernel writes one (max -inf, sum 0).
+    fn init(sc: *dsv41.Scope, f: *fixture.Fixture, rows: usize, splits: usize, plant: bool) !Ins {
         const R: c_int = @intCast(rows);
         const H: c_int = @intCast(f.m.cfg.num_attention_heads);
+        const S: c_int = @intCast(splits);
+        const n = rows * @as(usize, @intCast(H)) * splits;
+        const host = try std.testing.allocator.alloc(f32, 3 * n);
+        defer std.testing.allocator.free(host);
+        var prng = std.Random.DefaultPrng.init(rows * 31 + splits);
+        for (0..n) |j| {
+            const empty = j % 13 == 5;
+            host[j] = if (empty) -std.math.inf(f32) else prng.random().floatNorm(f32);
+            host[n + j] = if (empty) 0 else 0.5 + 1.5 * prng.random().float(f32);
+            host[2 * n + j] = if (empty) 0 else 1;
+        }
+        const live = try sc.keep(mlx.mlx_array_new_data(host[2 * n ..].ptr, &[_]c_int{ R, H, S, 1 }, 4, .float32));
         var in: Ins = .{
             .x = try sc.keep(try f.stream(rows)),
             .cpre = try sc.keep(try f.cpre(rows)),
@@ -477,9 +490,9 @@ const Ins = struct {
             .kv = try sc.keep(try f.normal(&.{ R, 512 }, .bfloat16, 0, 2)),
             .z = try sc.keep(try f.normal(&.{ R, 24 }, .float32, 0, 1.5)),
             .pos = try wq_b.rowsAt(sc, 3001, rows),
-            .pacc = try sc.keep(try f.normal(&.{ R, H, bw_splits, 512 }, .float32, 0, 1)),
-            .pm = try sc.keep(try f.normal(&.{ R, H, bw_splits }, .float32, 0, 1)),
-            .pl = try sc.keep(try f.uniform(&.{ R, H, bw_splits }, 0.5, 2)),
+            .pacc = try sc.mul(try sc.keep(try f.normal(&.{ R, H, S, 512 }, .float32, 0, 1)), live),
+            .pm = try sc.keep(mlx.mlx_array_new_data(host.ptr, &[_]c_int{ R, H, S }, 3, .float32)),
+            .pl = try sc.keep(mlx.mlx_array_new_data(host[n..].ptr, &[_]c_int{ R, H, S }, 3, .float32)),
             .meta = try sc.ints(&.{ 3001, R, 512, 128, 144, 0 }, &.{6}),
         };
         if (!plant) return in;
@@ -507,15 +520,17 @@ test "dsv41 dec attention side: the DSV41_ATTN_BW launches write today's bytes, 
             defer sc.deinit();
             const counter = try sc.keep(wo_a.newCounter());
             const lys = [2]dsv41.Layer{ f.layer(li).*, try plantedLayer(&sc, f.layer(li)) };
-            for (bench_rows ++ [_]usize{ 3, 5 }) |rows| for (&lys, 0..) |*ly, plant| {
-                const in = try Ins.init(&sc, f, rows, plant == 1);
+            // The attention's splits: 8 on a compressed layer, 4 on a window-only one, 5 to 7 early in a context.
+            for (bench_rows ++ [_]usize{ 3, 5 }) |rows| for ([_]usize{ 8, 4, 5 }) |splits| for (&lys, 0..) |*ly, plant| {
+                if (splits != 8 and rows > 3) continue;
+                const in = try Ins.init(&sc, f, rows, splits, plant == 1);
                 var bufs: [2][13]A = undefined;
                 const want = try arms[0].outs(&sc, f.m, ly, li, &in, counter, &bufs[0]);
                 const got = try arms[1].outs(&sc, f.m, ly, li, &in, counter, &bufs[1]);
                 try std.testing.expectEqual(want.len, got.len);
                 for (want, got, 0..) |u, v, k| {
                     const d = try bitsDiffer(u, v);
-                    if (d != 0) std.debug.print("[attn-bw] {s} layer {d} R={d} planted {d}: output {d} differs in {d} elements\n", .{ if (tp != null) "tp4" else "whole", li, rows, plant, k, d });
+                    if (d != 0) std.debug.print("[attn-bw] {s} layer {d} R={d} S={d} planted {d}: output {d} differs in {d} elements\n", .{ if (tp != null) "tp4" else "whole", li, rows, splits, plant, k, d });
                     try std.testing.expectEqual(@as(usize, 0), d);
                     checked += mlx.mlx_array_size(u);
                 }
