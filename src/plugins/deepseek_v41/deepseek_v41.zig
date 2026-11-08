@@ -4300,13 +4300,15 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
 }
 
 /// `x` summed over the tensor-parallel ranks (itself unsplit), in `m.act`: f32 at decode width, so the sum rounds once.
-/// `DSV41_TP_SUM`: `off` skips the sums (wrong output, timing only), `bf16` sums the activation dtype at any rank count.
-const TpSumMode = enum { normal, off, bf16 };
+/// `DSV41_TP_SUM`: `auto` (default) keeps a pair's rule and sums past a pair in the activation dtype (JACCL
+/// accumulates in f32 and rounds once; +5-6% decode at TP4, KLD unchanged); `bf16` does so at any size, `f32` sums
+/// wider past a pair as before, `off` skips the sums (wrong output, timing only).
+const TpSumMode = enum { auto, bf16, off, f32 };
 var tp_sum_mode: ?TpSumMode = null;
 fn tpSumMode() TpSumMode {
     if (tp_sum_mode) |v| return v;
-    const raw = std.c.getenv("DSV41_TP_SUM");
-    const v: TpSumMode = if (raw) |r| std.meta.stringToEnum(TpSumMode, std.mem.span(r)) orelse .normal else .normal;
+    const raw = env.get(.DSV41_TP_SUM);
+    const v: TpSumMode = if (raw) |r| std.meta.stringToEnum(TpSumMode, std.mem.span(r)) orelse .auto else .auto;
     tp_sum_mode = v;
     return v;
 }
@@ -4318,7 +4320,12 @@ pub fn tpSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
     const sum = clusterHooks().tp_sum orelse return error.DsvTpNotJoined;
     // Two ranks' bf16 parts sum as they are: one rounding of their f32 sum, as the cast back makes (JACCL rounds on the
     // CPU, so a tie can land apart). A wider part sums wider at decode width.
-    const as_is = mode == .bf16 or (mlx.mlx_array_dtype(x) == m.act and m.tp.?.size == 2);
+    const pair_rule = mlx.mlx_array_dtype(x) == m.act and m.tp.?.size == 2;
+    const as_is = switch (mode) {
+        .bf16 => true,
+        .auto => pair_rule or m.tp.?.size > 2,
+        .f32, .off => pair_rule,
+    };
     const part = if (as_is or dim(x, 0) > region_rows) try sc.astype(x, m.act) else try sc.astype(x, .float32);
     return sc.astype(try sc.keep(try sum(part)), m.act);
 }
@@ -9892,11 +9899,11 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
         try testing.expectEqual(dt, Seen.dt);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
     }
-    // dist N-rank: past two ranks a bf16 part sums in f32 too, so the group's sum still rounds once.
+    // dist N-rank: past two ranks every part sums in the activation dtype (JACCL accumulates in f32, one rounding).
     m.tp = .{ .rank = 0, .size = 4 };
     for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
         const y = try tpSum(&sc, &m, try sc.zeros(&.{ 2, 64 }, dt));
-        try testing.expectEqual(mlx.mlx_dtype.float32, Seen.dt);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, Seen.dt);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
     }
 }
