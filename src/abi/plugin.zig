@@ -141,7 +141,9 @@ pub const Caps = packed struct(u64) {
     /// The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`):
     /// the preflight bills their slot rows, not the experts. Without it the setting is refused by name.
     experts_stream: bool = false,
-    _: u31 = 0,
+    /// The forward serves a split prompt forward (`Forward.split_rows`, `Forward.split_states`).
+    split_prefill: bool = false,
+    _: u30 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -523,6 +525,26 @@ pub const Forward = extern struct {
     /// The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending,
     /// each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it.
     ssm_checkpoints: Span(u64) = .{},
+    /// A split prompt forward (mode `.prefill`, one slot, a model declaring `Caps.split_prefill`): the first
+    /// `split_rows` of `rows` are span A, the rest span B, whose first position is `positions[0] + split_rows`. Every
+    /// layer runs span A, then span B, and each span's arithmetic is the forward it would be alone (its own row count
+    /// for every non-routed op). The results are span B's (`ForwardOut`). 0 = an ordinary forward. Read it through
+    /// `splitRows` (size-gated).
+    split_rows: u32 = 0,
+    /// With `split_rows`: a cache handle whose recurrent-state slots (`CacheOps.state` / `set_state`, every
+    /// `StateSlot` the model keeps) receive, at each layer, span A's state (the state a forward of span A alone
+    /// leaves) before span B updates `caches[0]`. Its KV is never appended to or read. Read it through `splitStates`.
+    split_states: Handle = null,
+
+    /// `split_rows`, or 0 from a host whose struct ends before it.
+    pub fn splitRows(self: *const Forward) u32 {
+        return if (self.size >= @offsetOf(Forward, "split_rows") + @sizeOf(u32)) self.split_rows else 0;
+    }
+
+    /// `split_states`, or null from a host whose struct ends before it.
+    pub fn splitStates(self: *const Forward) Handle {
+        return if (self.size >= @offsetOf(Forward, "split_states") + @sizeOf(Handle)) self.split_states else null;
+    }
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its
@@ -676,7 +698,10 @@ pub const Round = extern struct {
 };
 
 /// The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number
-/// of slots (`.last_row`) or of tokens (`.all_rows`).
+/// of slots (`.last_row`) or of tokens (`.all_rows`). A split forward's (`Forward.split_rows`) `logits` are the ones a
+/// forward of span B alone returns (B's rows for `.all_rows`, its last row for `.last_row`), and its `hidden` holds
+/// span A's rows, then span B's (`[1, rows, hidden]`), each span's as its own forward returns them; the host never asks
+/// a split forward for `capture_layers`.
 pub const ForwardOut = extern struct {
     size: u32 = @sizeOf(ForwardOut),
     logits: Array = .{},
@@ -1068,6 +1093,30 @@ test "abi plugin: auxiliary callbacks are required function pointers" {
 test "abi plugin: unset generation defaults read as unset" {
     const g: GenDefaults = .{};
     try testing.expect(std.math.isNan(g.temperature) and std.math.isNan(g.top_p) and g.top_k == -1);
+}
+
+test "abi plugin: a split forward's fields end Forward, and a shorter host struct reads as an ordinary forward" {
+    // Appended after every earlier field: an older host's struct ends before them, and Caps' bit follows the last one.
+    try testing.expect(@offsetOf(Forward, "split_rows") > @offsetOf(Forward, "ssm_checkpoints"));
+    try testing.expect(@offsetOf(Forward, "split_states") > @offsetOf(Forward, "split_rows"));
+    try testing.expectEqual(@as(usize, @sizeOf(Forward)), @offsetOf(Forward, "split_states") + @sizeOf(Handle));
+    // split_prefill takes the first padding bit after every flag upstream defines, which keep their places; an
+    // upstream caps word reads it unset.
+    try testing.expectEqual(@as(u16, @bitOffsetOf(Caps, "prompt_last_row") + 1), @bitOffsetOf(Caps, "experts_stream"));
+    try testing.expectEqual(@as(u16, @bitOffsetOf(Caps, "experts_stream") + 1), @bitOffsetOf(Caps, "split_prefill"));
+    try testing.expectEqual(@as(u16, 33), @bitOffsetOf(Caps, "split_prefill"));
+    const stock: Caps = @bitCast((@as(u64, 1) << @bitOffsetOf(Caps, "split_prefill")) - 1);
+    try testing.expect(stock.prompt_last_row and stock.experts_stream and !stock.split_prefill);
+    var marker: u8 = 0;
+    var f: Forward = .{ .mode = .prefill, .rows = 48, .tokens = .{}, .split_rows = 17, .split_states = &marker };
+    try testing.expectEqual(@as(u32, 17), f.splitRows());
+    try testing.expectEqual(@intFromPtr(&marker), @intFromPtr(f.splitStates()));
+    f.size = @offsetOf(Forward, "split_rows");
+    try testing.expectEqual(@as(u32, 0), f.splitRows());
+    try testing.expectEqual(@as(usize, 0), @intFromPtr(f.splitStates()));
+    const plain: Forward = .{ .mode = .prefill, .rows = 48, .tokens = .{} };
+    try testing.expectEqual(@as(u32, 0), plain.splitRows());
+    try testing.expect(!(Caps{}).split_prefill);
 }
 
 test "abi plugin: prefill, decode and verify are always declared; batched rows follow the caps" {
