@@ -4098,9 +4098,11 @@ fn slotWide(sc: *Scope, m: *const Dsv41Model, src: streamed.Routed, li: usize, x
 fn gateUpPaired(sc: *Scope, m: *const Dsv41Model, e: *const Experts, x3: A, rows: A, sidx: A) !?A {
     const gu = e.gu orelse return null;
     const lim = m.cfg.dsv4_swiglu_limit;
-    if (gu.qp.mode != .affine or gu.s.ctx == null or lim < 0 or lim != @floor(lim) or !verify_qmm_nax.verifyQmmNaxAvailable()) return null;
+    const mx = gu.qp.mode.isFp4();
+    if (mx and !env.one(.DSV41_FP4_PAIRED)) return null;
+    if ((gu.qp.mode != .affine and !mx) or gu.s.ctx == null or lim < 0 or lim != @floor(lim) or !verify_qmm_nax.verifyQmmNaxAvailable()) return null;
     const sigtab = try @import("../../sdk/blocks/hc/hc_prefill.zig").sigmoidTable(sc.s);
-    const y = (try gather_nax.sortedGateUpFused(x3, rows, gu.w, gu.s, gu.b, sidx, sigtab, @intFromFloat(lim), gu.qp.bits, gu.qp.group_size, false, true, sc.s)) orelse return null;
+    const y = (try gather_nax.sortedGateUpFused(x3, rows, gu.w, gu.s, gu.b, sidx, sigtab, @intFromFloat(lim), gu.qp.bits, gu.qp.group_size, mx, true, sc.s)) orelse return null;
     return try sc.keep(y);
 }
 

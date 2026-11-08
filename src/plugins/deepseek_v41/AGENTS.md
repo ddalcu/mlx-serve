@@ -26,9 +26,14 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `flash_attn`: the lossy flash kernel, default on beside a plugin bank only).
 - `spec/markov.zig`: DSpark's Markov chain in B + 1 launches; `decode/engram_decode.zig` the Engram LRU,
   `decode/gemv_twin.zig` the batched GEMV twin of MLX's M=1 words.
-- `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
-  without NAX (unmeasured on M5); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or
-  128 (the expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
+- `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built on
+  every GPU (NAX too); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or 128 (the
+  expert-pruned packs are 2-bit g128). Otherwise `routed` runs. Its ubench times both launches at the per-rank widths
+  2304 / 1152 / 576 against a streaming read.
+- A MoE ubench routes scattered experts and cycles 80+ weight sets: consecutive expert ids read far slower on M5 Max
+  than a router's picks, and one reused set reads from the cache.
+- An MXFP4 bank's prefill gate/up takes the paired NAX kernel with SwiGLU only under `DSV41_FP4_PAIRED=1`; the
+  kernel's canary declines a bank it does not reproduce.
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
@@ -126,7 +131,7 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the
-  compiled MoE there); `moe_fp4` is the non-NAX one.
+  compiled MoE there).
 - Prefill is chunked at 8192 (`prefillChunkMax`), one MoE call per chunk: each chunk still reads every expert bank
   once (the CED replay runs the decoder layers), so a narrower chunk pays that read twice as often.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
