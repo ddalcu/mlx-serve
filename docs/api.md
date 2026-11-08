@@ -39,8 +39,8 @@ A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"v
 
 ### Request priority
 
-`X-MLX-Priority: high` on a text request (any of the chat, completion, messages, responses or Ollama routes) lets it
-start between the chunks of a long prompt another request is reading with up to 8192 prompt tokens the cache does not
+`X-MLX-Priority: high` on a request to any of the chat, completion, messages, responses, speech or Ollama routes lets
+it start between the chunks of a long prompt another request is reading with up to 8192 prompt tokens the cache does not
 hold, instead of 1024, so a short call does not wait for the whole long prompt. Any client on this machine (loopback,
 as for LoRA paths) may claim it; from another machine the header is ignored. Such a request starts only once the long
 prompt has read for as long as the priority requests it already hosted plus this one cost (about one chunk per 1024
