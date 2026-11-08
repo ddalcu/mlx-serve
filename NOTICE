@@ -331,33 +331,19 @@ Copyright (c) 2026 David Tai
 Licensed under the MIT License (the permission and warranty terms in LICENSE).
 
 Absorbed from mlx-stream (commit fcb4011 of our fork ddalcu/mlx-stream), built into
-the macOS server: the streamed packs' archs (`src/plugins/{deepseek_v41,glm5_next,
-glm_moe_dsa,mimo_v2}/stream/`), the DeepSeek-V4.1 EXL3 decoder and its pinned Metal
-kernels (`src/sdk/quant/exl3/stream/`), the SSD expert streamer, its plugin SDK and C
-shims (`src/sdk/weights/streamed/`, `src/mlx_stream*.zig`) and its GLM-5.3 pack
-converters (now `scripts/glm53_pack.py`). The DeepSeek-V4.1 streaming
+the macOS server and shipped in the plugin kit: the SSD expert streamer and its C read
+pool and shims (`src/sdk/weights/streamed/`). Its archs (GLM-5.3, MiMo's and GLM-5.3-
+Flash's streaming packs), plugin SDK, DeepSeek-V4.1 EXL3 decoder and pinned Metal
+kernels left the tree; the EXL3 lane lives in the turboexl3_ds41 quant plugin. The DeepSeek-V4.1 streaming
 runtime it was ported from (the packed expert record and manifest formats, the
 streamed-bank layout and the routed-expert EXL3 Metal kernels) is David Tai's earlier
 Python work, its parity oracle, MIT. It incorporates:
 - MLX (https://github.com/ml-explore/mlx, Copyright (c) 2023-2025 Apple Inc., MIT):
-  the kernel texts under `src/sdk/quant/exl3/stream/kernels/exl3/` inline MLX's steel
-  headers, each section marked with its MLX source path and copyright line;
   `src/sdk/weights/streamed/csrc/mlx_{event,alloc}_shim.cpp` compile against the
   staged MLX and mlx-c private headers.
-- ExLlamaV3 (https://github.com/turboderp-org/exllamav3, Copyright (c) turboderp,
-  MIT): the EXL3 format it reads follows exllamav3 v1.4.2 (codebook.cuh,
-  exl3_dq.cuh, pack.cu, hadamard.cu, quantize.py); `src/sdk/quant/exl3/stream/
-  {quant,kernels}.zig` cite the lines they reproduce. No exllamav3 code is shipped.
 - DeepSeek-V4.1-Flash (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash,
   Copyright (c) 2023 DeepSeek, MIT): the release's `inference/model.py` is the
-  reference for the `deepseek_v41` arch. The fixtures
-  `src/sdk/weights/streamed/fixtures/dsv41_{official_engram,independent_dequant}.json`
-  and `scripts/mlx_stream/dump_dsv41_reference_fixtures.py` use its official Engram
-  CPU forward and FP8/FP4 decoding at revision 2cba9e42aa026125f3ed06c6d98c1db82f7ca027
-  (loaded externally, not vendored; the fixtures hold synthetic inputs, the official
-  hash tables and expected rows). They are adapted from Sushi's DeepSeek-V4.1 consumer
-  fixtures (MIT, Copyright (c) 2026 Theinruj Toranavikrai, Copyright (c) 2026 David
-  Dalcu). No model weights are included.
+  reference for the `deepseek_v41` arch. No model weights are included.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)
@@ -467,6 +453,12 @@ License).
 (`quantized_nax.h`) to a tiled weight layout and inlines `steel/gemm/nax.h`
 with the headers it includes, embedded from the pinned submodule (Copyright
 (c) 2023-2025 Apple Inc., MIT License).
+
+`src/plugins/deepseek_v41/kernels/gemv_twin.metal` ports MLX's `GEMVKernel`
+(`gemv.h`), and `src/plugins/deepseek_v41/kernels/gate_gemm_nt.metal` and
+`gate_gemm_loop.metal` port MLX's fused NAX GEMM
+(`steel/gemm/kernels/steel_gemm_fused_nax.h`) by way of turboexl3's copy
+(Copyright (c) 2023-2025 Apple Inc., MIT License).
 
 --------------------------------------------------------------------------------
 mlx-lm

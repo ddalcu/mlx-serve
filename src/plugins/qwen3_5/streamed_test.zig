@@ -6,7 +6,6 @@
 //! resident. Owns tests only.
 
 const std = @import("std");
-const build_options = @import("build_options");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
@@ -18,6 +17,7 @@ const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const Resident = @import("../../sdk/weights/resident.zig").Resident;
+const streamed = @import("../../sdk/weights/streamed.zig");
 const qwen3_5 = @import("plugin.zig");
 
 const testing = std.testing;
@@ -185,7 +185,7 @@ fn parity(comptime experts: c_int, comptime bits: c_int, rows: ?u32, seed: u64) 
     try run(t, &got);
     try testing.expectEqual(native.items.len, got.items.len);
     for (native.items, got.items) |want, have| try testing.expectEqualSlices(u32, want, have);
-    const st = t.loaded().experts.?.src.pack.stats();
+    const st = t.loaded().experts.?.src.stats();
     std.debug.print("qwen3_5 streamed ({d}-bit experts, {d} rows of {d} a layer): {d} routes, {d} hits, {d} misses, {d} evictions\n", .{ bits, rows orelse experts, experts, st.route_calls, st.expert_cache_hits, st.expert_cache_misses, st.expert_cache_evictions });
     if (rows != null) try testing.expect(st.expert_cache_evictions > 0);
 }
@@ -193,16 +193,16 @@ fn parity(comptime experts: c_int, comptime bits: c_int, rows: ?u32, seed: u64) 
 // ── tests ──
 
 test "qwen3_5 streamed: 4-bit experts streamed from the pack (3 of 64 slot rows a layer) give the resident's logits bit for bit" {
-    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!streamed.built or mlx.noGpuBackend()) return error.SkipZigTest;
     try parity(64, 4, 3, 0x57e1);
 }
 
 test "qwen3_5 streamed: 3-bit experts streamed from the pack (3 of 64 slot rows a layer) give the resident's logits bit for bit" {
-    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!streamed.built or mlx.noGpuBackend()) return error.SkipZigTest;
     try parity(64, 3, 3, 0x57e3);
 }
 
 test "qwen3_5 streamed: 8-bit experts streamed from the pack (every one of 256 in slot rows) give the resident's logits bit for bit" {
-    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!streamed.built or mlx.noGpuBackend()) return error.SkipZigTest;
     try parity(256, 8, null, 0x57e2);
 }

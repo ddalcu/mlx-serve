@@ -8,7 +8,6 @@ const keyed_sample = @import("../sampling/keyed_sample.zig");
 const transformer_mod = @import("../transformer.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
 const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const log = @import("../../../sdk/util/log.zig");

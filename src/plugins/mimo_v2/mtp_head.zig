@@ -68,9 +68,8 @@ pub const Heads = struct {
 /// The heads the pack ships, in the sliding layers' geometry; null when it ships none.
 pub fn load(ctx: *const abi.LoadCtx, c: *const config.Config) !?*Heads {
     if (c.sliding_window == 0) return error.MimoMtpNeedsSlidingGeometry;
-    // MiMo's heads ride the trunk's shards; a streaming pack's ride its sidecar.
-    const sidecars: []const []const u8 = if (c.streamed) &.{"mtp-heads.safetensors"} else &.{};
-    var res = Resident.adopt(try reader.headWeights(ctx, sidecars, "model.mtp.layers.0.eh_proj.weight", "model.mtp."));
+    // MiMo's heads ride the trunk's shards.
+    var res = Resident.adopt(try reader.headWeights(ctx, &.{}, "model.mtp.layers.0.eh_proj.weight", "model.mtp."));
     defer res.deinit();
     // A Sushi pack stores them as its trunk: a fused e4m3 QKV and an e4m3 MLP.
     if (c.expert_block_json.len > 0) {

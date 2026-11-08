@@ -138,7 +138,10 @@ pub const Caps = packed struct(u64) {
     /// its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the
     /// prefill's prompt forwards unless the request echoes prompt logprobs.
     prompt_last_row: bool = false,
-    _: u32 = 0,
+    /// The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`):
+    /// the preflight bills their slot rows, not the experts. Without it the setting is refused by name.
+    experts_stream: bool = false,
+    _: u31 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };

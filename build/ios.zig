@@ -42,8 +42,6 @@ fn addLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice: Sl
     ios_options.addOption(bool, "mas", true);
     ios_options.addOption(bool, "ds4_engine", false);
     ios_options.addOption(bool, "llama_engine", false);
-    ios_options.addOption(bool, "mlx_stream", false);
-    ios_options.addOption(bool, "plugin_profile", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");

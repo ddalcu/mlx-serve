@@ -11,7 +11,7 @@ const mlx = @import("../mlx/ffi.zig");
 const impl = @import("plugin_host_impl.zig");
 
 const testing = std.testing;
-const has_shims = @import("build_options").mlx_stream;
+const has_shims = @import("builtin").os.tag == .macos;
 
 fn gate() !void {
     if (!has_shims or env.get(._GPU_WINDOW_LOCKED) == null) return error.SkipZigTest;

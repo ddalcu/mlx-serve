@@ -2,7 +2,6 @@ const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 const builtin = @import("builtin");
 const plugin_driver = @import("plugin/driver.zig");
-const mlx_stream_mod = @import("modules/stream.zig");
 const distributed_mod = @import("cluster/distributed.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
 // (`mtp.rerankSelect` + `QLinear`), which reads only the TARGET's lm_head and
@@ -464,8 +463,6 @@ pub const Transformer = struct {
     // by directly.
     yarn_mscale_cast: DtypeCastCache = .{},
 
-    /// An mlx-stream pack (`arch/mlx_stream.zig`: DeepSeek-V4.1's EXL3 repack or MiMo-V2.6-Flash): the plugin's module.
-    mlx_stream_ext: ?*mlx_stream_mod.Model = null,
     /// A pack served through its plugin's table (`engines/mlx/plugin/driver.zig`): every forward goes there.
     plugin: ?*plugin_driver.Bound = null,
 
@@ -816,10 +813,6 @@ pub const Transformer = struct {
             self.allocator.free(rests);
             self.ane_chan = null;
         }
-        if (self.mlx_stream_ext) |m| {
-            mlx_stream_mod.close(m);
-            self.mlx_stream_ext = null;
-        }
         if (self.plugin) |b| {
             plugin_driver.unbind(b, self.allocator);
             self.plugin = null;
@@ -1043,7 +1036,6 @@ test {
     _ = @import("../../sdk/blocks/moe/verify_kernels.zig");
     _ = @import("load/exl3_bank.zig");
     _ = @import("../../plugins/hy_v3/load.zig");
-    _ = @import("modules/mlx_stream.zig");
     _ = @import("modules/shell.zig");
     _ = @import("../../plugins/mimo_v2/fixtures.zig");
     _ = @import("../../plugins/flint/fixtures.zig");

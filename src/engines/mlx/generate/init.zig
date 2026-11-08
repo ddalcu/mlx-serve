@@ -5,7 +5,6 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
@@ -83,10 +82,9 @@ pub fn initWithOptions(
     // arm then takes the serial verdict (spec/dspark.zig `serialVerdict`).
     sampling.keyed = (xfm.config.rowExactDecode() or (env.on(.MLX_SERVE_KEYED_SAMPLING) and !sampling.shapesLogits())) and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
     sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
-    // Spec drafts and verify rows share the serial sampler's keys (and
-    // mlx-stream's lane draws from the seed), so an unseeded sampled
-    // request gets its own random seed.
-    if ((sampling.keyed or xfm.mlx_stream_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
+    // Spec drafts and verify rows share the serial sampler's keys, so an
+    // unseeded sampled request gets its own random seed.
+    if (sampling.keyed and sampling.seed == null and sampling.temperature > 0.01) {
         var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
         sampling.seed = prng.random().int(u64);
     }
@@ -102,7 +100,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
-    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or xfm.mlx_stream_ext != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
         // checkpoint ships stages and the request is CLEAN (no
@@ -115,7 +113,7 @@ pub fn initWithOptions(
         // remain hard-off regardless: their verify forwards go through
         // machinery this arch cannot roll back.
         const native = plugin_driver.nativeDrafter(xfm) != null;
-        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else if (native) xfm.config.plugin.?.parsed.spec.native_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
+        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else xfm.config.plugin.?.parsed.spec.native_block;
         const dspark_env_off = !dsparkEnabled();
         // A plugin whose drafter cannot hand the verify back accepts greedily: a sampled request runs serial.
         const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
@@ -124,16 +122,7 @@ pub fn initWithOptions(
             DsparkArm.off
         else
             dsparkArmFor(sampling, options.logprobs_n);
-        // mlx-stream's lane samples a sampled request itself, from the request's own settings.
-        const lane_sampling: ?mlx_stream.SamplingParams = if (dspark_env_off or arm == .off) null else .{
-            .temperature = sampling.temperature,
-            .top_p = sampling.top_p,
-            .top_k = sampling.top_k,
-            .min_p = sampling.min_p,
-            .seed = sampling.seed orelse 0,
-        };
-        const lane_arms = if (xfm.mlx_stream_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
-        if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
+        if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off) {
             dspark_active = true;
             dspark_stochastic = arm == .stochastic;
             if (dspark_stochastic) {
@@ -981,7 +970,8 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
-            .dspark_pol = if (dspark_active and intree.dsv41(xfm) != null) .{ .calib = .{ .head = true } } else null,
+            // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
+            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

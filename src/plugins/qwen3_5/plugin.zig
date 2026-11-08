@@ -222,7 +222,7 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     if (gpu) m.geo.gate_fn = gdn.compileGate(m.geo.state, s);
     const shared = bases.Shared.init(c.rms_norm_eps, c.rms_norm_eps);
     if (c.moe()) {
-        if (streamed.Setting.parse(ctx.settings_json.slice())) |st| m.experts = try streamed.Streamed.openPack(gpa, ctx.model_dir.slice(), s, st.slotRows(c.num_experts));
+        m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.num_experts, s);
         m.body = .{ .moe = .{ .base = .{ .weights = undefined, .shared = shared, .a = gpa, .s = s, .placeholders = ctx.parsed.placeholder_ids }, .layers = try gpa.alloc(Moe.Layer, c.num_hidden_layers) } };
         m.routes = try gpa.alloc(compiled.Closure, c.num_hidden_layers);
         @memset(m.routes, .{ .ctx = null });
@@ -515,20 +515,10 @@ fn moeMlp(m: *Loaded, r: *ld.Reader, c: *const config.Config, i: usize, s: mlx.m
         .top_k = @intCast(c.num_experts_per_tok),
         .experts = @intCast(c.num_experts),
     };
+    for ([_]Linear{ gate, up, down }) |l| try m.owned.linear(l);
     if (m.experts) |*x| {
-        // The banks give the quant params only: their tensors are never read.
-        for ([_]Linear{ gate, up, down }) |l| for ([_]Array{ l.w, l.s, l.b }) |a| if (a.ctx != null) {
-            _ = mlx.mlx_array_free(a);
-        };
-        inline for (.{ &w.gate, &w.up, &w.down }) |bk| {
-            if (bk.qp.mode != .affine) return error.StreamedPackNotAffine;
-            bk.* = .{ .w = .{ .ctx = null }, .qp = bk.qp };
-        }
-        w.streamed = .{ .routed = x.routedSource(), .layer = x.layerOf(try r.name(&nb, "layers.{d}.mlp", .{i})) orelse return error.StreamedLayerMissing };
-    } else {
-        for ([_]Linear{ gate, up, down }) |l| try m.owned.linear(l);
-        w.bank_views = try qwen3.bankViews(&m.owned, gate, up, down, s);
-    }
+        try b.moe.bindStreamed(&w, x, try r.name(&nb, "layers.{d}.mlp", .{i}));
+    } else w.bank_views = try qwen3.bankViews(&m.owned, gate, up, down, s);
     if (r.has(try r.name(&nb, "layers.{d}.mlp.shared_expert_gate.weight", .{i}))) {
         const sg = try r.proj(try r.name(&nb, "layers.{d}.mlp.shared_expert.gate_proj", .{i}), hidden);
         const su = try r.proj(try r.name(&nb, "layers.{d}.mlp.shared_expert.up_proj", .{i}), hidden);

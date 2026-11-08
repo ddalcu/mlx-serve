@@ -15,7 +15,6 @@ const model_discovery = @import("../../../host/registry/discovery.zig");
 const mlx_gguf = @import("../../../sdk/quant/gguf/claim.zig");
 const status = @import("../../../host/status.zig");
 const streamed = @import("../../../sdk/weights/streamed.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const testing = std.testing;
 
 /// A load whose own bill exceeds the memory cap is refused whatever else is resident.
@@ -126,6 +125,11 @@ pub fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
+fn streamRefused() error{StreamExpertsUnsupported} {
+    log.err("[preflight] stream_experts: this model's load does not stream its experts; turn the setting off\n", .{});
+    return error.StreamExpertsUnsupported;
+}
+
 /// A ModelOpt pack also bills the banks' decoded scales, which are smaller on disk.
 pub fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     const shards = try shardResidentBytes(allocator, io, model_dir, config);
@@ -134,14 +138,14 @@ pub fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_di
 }
 
 fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
-    if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
     var shards = modelDiskBytes(io, model_dir);
-    // An expert bank's plugin bills its rows (`resident_bytes`).
-    if (config.stream_experts_override) |st| if (!config.expert_bank) {
+    if (config.stream_experts_override) |st| {
+        const b = config.plugin orelse return streamRefused();
+        if (!b.parsed.caps.experts_stream) return streamRefused();
         // The routed experts stay on disk; their slot rows are resident.
-        const s = try streamed.Streamed.packBytes(allocator, model_dir, st.slotRows(config.num_experts));
+        const s = try streamed.Streamed.packBytes(allocator, model_dir, st);
         shards = shards -| s.experts +| s.slots;
-    };
+    }
     const b = config.plugin orelse return shards;
     const f = b.table.weights.resident_bytes orelse return shards;
     var settings: [128]u8 = undefined;
@@ -686,17 +690,30 @@ test "a refusal right after a two-model eviction waits for the memory to come ba
     try std.testing.expect(waitForUnload(211 * GiB, 108 * GiB, mark, 1_200));
 }
 
-test "residentModelDiskBytes: with stream_experts a pack bills its residents and slot rows, not the experts" {
-    if (!@import("build_options").mlx_stream) return error.SkipZigTest;
+test "residentModelDiskBytes: with stream_experts a pack whose plugin streams them bills its residents and slot rows" {
+    if (!streamed.built) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
     var buf: [512]u8 = undefined;
     const dir = buf[0..try td.dir.realPath(io, &buf)];
     try @import("../../../sdk/weights/streamed/mlx_pack_test.zig").writePack(dir);
+    const table: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = &.{} };
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table };
     var config: model_mod.ModelConfig = .{ .num_experts = @import("../../../sdk/weights/streamed/mlx_pack_test.zig").E, .stream_experts_override = .{ .rows = 2 } };
-    const b = try streamed.Streamed.packBytes(std.testing.allocator, dir, 2);
+    // A model whose load does not stream its experts would hold them all beside a bill of slot rows.
+    try std.testing.expectError(error.StreamExpertsUnsupported, residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    config.plugin = &binding;
+    try std.testing.expectError(error.StreamExpertsUnsupported, residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    binding.parsed.caps.experts_stream = true;
+    const b = try streamed.Streamed.packBytes(std.testing.allocator, dir, .{ .rows = 2 });
     try std.testing.expectEqual(modelDiskBytes(io, dir) - b.experts + b.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    // A plugin's adapted config names no expert count: the bank's own sizes the rows.
+    config.num_experts = 0;
+    config.stream_experts_override = .on;
+    const on = try streamed.Streamed.packBytes(std.testing.allocator, dir, .on);
+    try std.testing.expect(on.slots > 0);
+    try std.testing.expectEqual(modelDiskBytes(io, dir) - on.experts + on.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
     config.stream_experts_override = null;
     try std.testing.expectEqual(modelDiskBytes(io, dir), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
 }

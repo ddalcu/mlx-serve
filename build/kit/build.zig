@@ -55,6 +55,18 @@ pub fn plugin(b: *std.Build, opts: Options) *std.Build.Step.Compile {
     return lib;
 }
 
+/// `kit.streamed`'s read pool (pthreads, pread into slot rows: `src/sdk/weights/streamed/csrc/`) compiled into `m`, the
+/// module of a plugin that streams its bank over the kit's stream. The stream's MLX internals (its events, aliases and
+/// launch cache) are C symbols the plugin serves over the server's `HostGpu` table. `inject`: the pool's scripted faults
+/// (a test build's).
+pub fn streamSources(b: *std.Build, m: *std.Build.Module, inject: bool) void {
+    const kit = b.dependency("mlx_serve_kit", .{});
+    const csrc = "src/sdk/weights/streamed/csrc";
+    const flags: []const []const u8 = &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    m.addCSourceFile(.{ .file = kit.path(csrc ++ "/q3_lookahead4_exl3.c"), .flags = if (inject) flags ++ &[_][]const u8{"-DQ3LD_INJECT"} else flags });
+    m.addIncludePath(kit.path(csrc));
+}
+
 /// The kit's one Zig module, `mlx_serve`, with the `mlx_steel_sources` module `kit.blocks.qmm` embeds.
 fn kitModule(b: *std.Build, kit: *std.Build.Dependency, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
     const steel = b.createModule(.{ .root_source_file = kit.path("lib/mlx_steel_sources.zig"), .target = target, .optimize = optimize });

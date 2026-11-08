@@ -81,9 +81,8 @@ classes the composed chain treats differently):
 - `ltx` `ltx_na3d_*`: a +Inf score returns that key's value where a float64 softmax gives NaN.
 - `deepseek_v41` `moe_dn_gguf` at Q3_K: a planted infinite block scale gives +Inf on 4 of 1280 outputs where float64
   gives NaN (the gathers' Q3_K slice passes); Q3_K expert banks decode on `routed` until it is explained.
-- No registered contract (`src/sdk/testing/kernel_contract/REGISTERING.md`) for the 20 `glm5_next` kernels, the
-  absorbed EXL3 kernels (`src/sdk/quant/exl3/`), MiMo's streamer and GLM-5.3-Flash's EXL3 lane
-  (`src/sdk/weights/streamed/`) and GLM-5.3's (`src/plugins/glm_moe_dsa/`): about half the kernel files.
+- No registered contract (`src/sdk/testing/kernel_contract/REGISTERING.md`) for the 20 `glm5_next` kernels and sushi's
+  EXL3 kernels (`src/sdk/quant/exl3/`).
 - `msv_simd_qmm` 3-row 4-bit launches 256 threads where M1/M2 build 224 at K 4096, unprobed.
 - `add_norm` / `gate_norm_mod` looped-width probe hole and the Gemma 4 MoE seam's unprobed 1024-thread launch: confirm
   on M1/M2, then probe per arm and width.
@@ -125,7 +124,6 @@ classes the composed chain treats differently):
   iOS root).
 - CUDA: the FLUX fault that made chat-beside-media unsafe has no root cause yet (chat does not interleave with media
   on CUDA).
-- `mlx-stream-test` crashed once under heavy shared-GPU load and passed on rerun: on a crash, rerun the step alone.
 - Build times miss their targets: a one-line plugin edit rebuilds in ~55 s Debug under `-Dunits` (three units of
   ~40 s in parallel plus an 8 s link; target 30 s), a clean ReleaseFast takes ~3:40 at full parallelism (target 1:30),
   and the host unit is still the largest compile (~10 GB peak). `-Dunits` stays opt-in.

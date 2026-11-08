@@ -70,7 +70,6 @@ const log = @import("../../sdk/util/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const status = @import("../../host/status.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
-const mlx_stream = @import("modules/stream.zig");
 const sleep_inhibit = @import("runtime/sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -800,7 +799,8 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
     // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
     // other load should block on our filesystem.
     const media_peak = mediaPeakFor(self, entry);
-    const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null;
+    const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null and
+        !@import("../../host/plugins/loader.zig").engineServes(entry.path);
     const validated_model_bytes: ?u64 = if (mlx_text)
         residentModelDiskBytes(self.allocator, self.io, entry.path, owned.config) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
@@ -844,9 +844,6 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
             }
         }
 
-        // One stream pack at a time reads the process's foreign-bytes value (DeepSeek-V4.1, GLM-5.3).
-        const foreign_reader = try self.registry.foreignReaderVictimLocked(entry.id, owned.config);
-
         // Claim the slot.
         std.debug.assert(self.registry.tryBeginLoadLocked(entry));
         // From the claim: while victims unload or the queue waits, not the last load's numbers.
@@ -870,7 +867,7 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         // (multi-victim). On failure — every other resident model is pinned
         // by an in-flight request — roll back and surface a 503 instead of
         // loading anyway and crashing.
-        const n = self.registry.planEvictionsLocked(entry.id, foreign_reader, &victims_buf, mlxActiveBytes()) orelse {
+        const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
             // Name the numbers. A refusal that logs NOTHING sends the user
             // hunting for a concurrent request that does not exist: on an
             // idle server the cause is always the static cap (#126), and

@@ -57,7 +57,6 @@ pub fn supportsBatchedGdnDecode(self: *const Transformer) bool {
     // Built-state question: this path reads `moe_layers` and the GDN
     // ssm entries, so the trunk must actually be that shape.
     if (self.moe_layers == null) return false;
-    if (self.mlx_stream_ext != null) return false;
     // Every layer must be one of the two shapes this path handles.
     for (self.moe_layers.?) |*lw| {
         switch (lw.mlp) {

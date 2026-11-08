@@ -5,7 +5,6 @@ const mlx = @import("../../mlx/ffi.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const metrics_mod = @import("../../host/metrics/metrics.zig");
 const log = @import("../../sdk/util/log.zig");
-const mlx_stream = @import("modules/stream.zig");
 const testing = std.testing;
 
 const publishHotCacheResidency = @import("cache/budget.zig").publishHotCacheResidency;
@@ -198,8 +197,6 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
     recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
-    // mlx-stream: the arch's request end (GLM-5.3's decode line), before the terminator.
-    if (slot.model.transformer) |x| if (x.mlx_stream_ext) |m| mlx_stream.end(m);
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {

@@ -617,7 +617,7 @@ struct ModelInfo {
         switch engineName {
         case "ane": return "ANE"
         case "sushi": return "Sushi"
-        case "mlx-stream": return "Stream"
+        case "plugin": return "Plugin"
         default: break
         }
         switch engine {

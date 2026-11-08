@@ -1,4 +1,4 @@
-//! Compiles every public function of `kit.blocks` and `kit.foreign` into an object, so a block that no longer builds from
+//! Compiles every public function of `kit.blocks`, `kit.foreign` and `kit.streamed` into an object, so a block that no longer builds from
 //! the staged kit (a file or module the kit lacks, a format a block still imports) fails here, not in a plugin author's
 //! build. Nothing links or runs it.
 
@@ -31,4 +31,5 @@ fn touch(comptime T: type, comptime depth: u8) void {
 comptime {
     touch(kit.blocks, 0);
     touch(kit.foreign, 2);
+    touch(kit.streamed, 1);
 }

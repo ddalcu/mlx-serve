@@ -104,7 +104,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
         error.Invalid => invalid("a config value out of range"),
     };
 
-    var p: abi.Parsed = .{ .caps = .{ .batches_decode = batches_decode, .moe = c.moe != null, .exact_resumed = true, .dflash_capture = true, .images = vision } };
+    var p: abi.Parsed = .{ .caps = .{ .batches_decode = batches_decode, .moe = c.moe != null, .exact_resumed = true, .dflash_capture = true, .images = vision, .experts_stream = c.moe != null } };
     p.placeholder_ids.image = image_id;
     const s = &p.shell;
     s.* = .{
