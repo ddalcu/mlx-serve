@@ -378,6 +378,26 @@ test "dsv41 draft shard: four ranks draft the unsharded draft's ids, one state a
     }
 }
 
+test "dsv41 draft shard: what a snapshot read from disk sends is the same on rank 0 and a worker, the DSpark windows included" {
+    if (gpuUnavailable()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var ms = try Models.init(gpa, .{ .experts = 4, .ctx = 8 });
+    defer ms.deinit();
+    for ([_]usize{ 1, 130, 4096 }) |n| {
+        const a = try dsv41.tpLoadPlan(ms.rank[0].m, n);
+        for (ms.rank[1..]) |fx| {
+            const b = try dsv41.tpLoadPlan(fx.m, n);
+            try testing.expectEqual(a.len, b.len);
+            var windows: usize = 0;
+            for (a.specs(), b.specs()) |x, y| {
+                try testing.expectEqualDeep(x, y);
+                windows += @intFromBool(x.kind == .ds);
+            }
+            try testing.expectEqual(ms.rank[0].m.n_mtp, windows);
+        }
+    }
+}
+
 test "dsv41 draft shard: a sharded draft refuses to copy logits and a state other ranks do not know by gen" {
     if (gpuUnavailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
