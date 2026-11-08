@@ -7,6 +7,7 @@ const plugin = @import("plugin.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const sliding_ring = @import("../../sdk/config/sliding_ring.zig");
 
 const H = 128;
 const HEADS = 4;
@@ -297,4 +298,28 @@ test "gpt_oss plugin: a pack with a DFlash sidecar serves through the plugin and
     var b = try both.Both.openAs(&plugin.table, &p, json, true, .none);
     defer b.close();
     try both.expectDflashRecorded(&b.xfm, "applegpu_g17d", &.{ 48, 54, 99, 45, 54, 54, 54, 29, 13, 11, 9, 122, 54, 54, 91, 83 }, &.{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 });
+}
+
+test "gpt_oss plugin: sliding layers keep a ring of window + slack rows, and a ring that drops rows reads as the full buffer" {
+    var p = fixture.Pack.init(0x95e1);
+    defer p.deinit();
+    try writePack(&p, true);
+    var b = try both.Both.openAs(&plugin.table, &p, configJson(true), false, .none);
+    defer b.close();
+    const m: *plugin.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
+    var full: [4]plugin.Model.Layer = undefined;
+    var ringed: [4]plugin.Model.Layer = undefined;
+    for (m.base.weights.layers, &full, &ringed) |l, *f, *r| {
+        const window = l.mixer.inner.window;
+        try std.testing.expectEqual(sliding_ring.rows(window), l.mixer.inner.ring);
+        f.* = l;
+        f.mixer.inner.ring = 0;
+        r.* = l;
+        r.mixer.inner.ring = if (window > 0) window + 2 else 0;
+    }
+    var fw = m.base.weights;
+    fw.layers = &full;
+    var rw = m.base.weights;
+    rw.layers = &ringed;
+    try both.expectRingSame(plugin.Model, &m.base.shared, b.xfm.s, &fw, &rw, 4, false);
 }

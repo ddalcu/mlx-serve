@@ -394,6 +394,83 @@ pub fn servedUnderOverrides(config_json: []const u8) !model.ModelConfig {
     return cfg;
 }
 
+/// `n` token ids below 250.
+fn ringIds(comptime n: usize, comptime seed: usize) [n]i32 {
+    var out: [n]i32 = undefined;
+    for (&out, 0..) |*x, i| x.* = @intCast((i * 37 + seed) % 250);
+    return out;
+}
+
+const ring_chunk_a = ringIds(260, 11);
+const ring_chunk_b = ringIds(300, 5);
+const ring_second_a = ringIds(200, 3);
+const ring_second_b = ringIds(54, 17);
+
+/// `long_steps`, then chunks past the cache's first capacity (a grow), decode and verify between them.
+const ring_steps = long_steps ++ [_]Step{
+    .{ .mode = .prefill, .ids = &ring_chunk_a },
+    .{ .mode = .decode, .ids = &.{40} },
+    .{ .mode = .verify, .ids = &.{ 8, 13, 21, 34, 55 } },
+    .{ .mode = .prefill, .ids = &ring_chunk_b },
+    .{ .mode = .decode, .ids = &.{77} },
+    .{ .mode = .decode, .ids = &.{78} },
+};
+
+/// A second slot that fills its first capacity to two rows short, so the batched rows grow it.
+const ring_second = [_]Step{ .{ .mode = .prefill, .ids = &ring_second_a }, .{ .mode = .prefill, .ids = &ring_second_b } };
+
+/// `ring_steps` through `M.forward` on `full` (every sliding layer's `ring` 0) and on `ringed` (the same weights with
+/// rings short enough to drop rows), each through its own cache, then with `batched` a second slot per arm and six
+/// batched decode rows: every step's logits bit-equal, and only the ringed caches dropped rows.
+pub fn expectRingSame(comptime M: type, shared: anytype, s: mlx.mlx_stream, full: *const M.Weights, ringed: *const M.Weights, layers: u32, batched: bool) !void {
+    const a = testing.allocator;
+    const cache_ops = @import("../kv/cache_ops.zig");
+    var kv: [4]KVCache = undefined;
+    var made: usize = 0;
+    defer for (kv[0..made]) |*c| c.deinit();
+    for (&kv) |*c| {
+        c.* = try KVCache.init(a, layers);
+        made += 1;
+    }
+    var slots: [4]cache_ops.Slot = undefined;
+    for (&slots, &kv) |*sl, *c| sl.* = .{ .kv = c };
+    const arms = [_]*const M.Weights{ full, ringed };
+    var pos = [2]u32{ 0, 0 };
+    for ([_][]const Step{ &ring_steps, if (batched) &ring_second else &.{} }, 0..) |run, slot| {
+        for (run) |st| {
+            var g = ops.Graph.init(a, s);
+            defer g.deinit();
+            const ids = try fixture.tokens(&g, st.ids);
+            var outs: [2]ops.Array = undefined;
+            for (arms, 0..) |w, arm| {
+                const handles = [_]abi.Handle{slots[2 * slot + arm].handle()};
+                outs[arm] = (try M.forward(w, shared, &g, ids, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .positions = &.{pos[slot]}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows })).logits;
+            }
+            try ops.expectBitEqual(outs[1], outs[0]);
+            pos[slot] += @intCast(st.ids.len);
+        }
+    }
+    if (batched) for (0..6) |i| {
+        var g = ops.Graph.init(a, s);
+        defer g.deinit();
+        const t: i32 = @intCast(i);
+        const ids = try g.fromSlice(i32, &.{ 3 + t, 90 + t }, &.{ 2, 1 });
+        var outs: [2]ops.Array = undefined;
+        for (arms, 0..) |w, arm| {
+            const handles = [_]abi.Handle{ slots[arm].handle(), slots[2 + arm].handle() };
+            outs[arm] = (try M.forward(w, shared, &g, ids, .{ .mode = .batched_rows, .rows = 1, .slots = 2, .positions = &pos, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows })).logits;
+        }
+        try ops.expectBitEqual(outs[1], outs[0]);
+        pos[0] += 1;
+        pos[1] += 1;
+    };
+    for (kv[0..if (batched) 4 else 2], 0..) |c, i| {
+        var dropped = false;
+        for (c.entries) |e| dropped = dropped or e.base > 0;
+        try testing.expectEqual(i % 2 == 1, dropped);
+    }
+}
+
 /// A released pack's config at a proof pack's geometry: `real` with every key of `fixture` but `keep` taken from the
 /// fixture (inside both `text_config`s too), `drop` removed, and its `quantization_config` (when present) mlx-lm's copy of the result's
 /// `quantization`. Caller frees.

@@ -34,7 +34,7 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
   `attention_sink_bias`); K 192 / V 128, RoPE on `int(192 * partial_rotary_factor)` = 64 channels, V scaled by
   `attention_value_scale` (in V's dtype) BEFORE caching; additive q/k/v/o biases, no q/k norm.
 - A full-buffer sliding layer caches every token it never reads: the sliding layers keep a RING of window + slack
-  rows (`CacheFacts.sliding_ring`), billed per slot, restored above the ring floor, never spilled.
+  rows (`CacheFacts.sliding_ring`), billed per slot, restored above the ring floor, spilled only before it drops a row.
 - Decode-attn-quant side copies are read at decode width AND on a speculative verify window up to `dec_attn.MAX_ROWS`
   (a verify scoring drafts on other weights than the serial steps would diverge); a prompt chunk prefills dense.
 - Global layers decode through the split-K kernel (`dec_attn`: a KV group's heads x positions are one MMA tile's

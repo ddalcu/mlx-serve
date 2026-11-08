@@ -556,13 +556,17 @@ pub const KVCache = struct {
     /// A grow: the capacity to allocate, and which of the current rows move into it.
     const Grow = struct { cap: c_int, drop: usize, kept: usize };
 
+    /// A sliding ring drops rows in whole blocks of this many, so a whole-buffer view keeps the absolute key-block
+    /// boundaries of the hd-256 band kernel (`attn256.metal` BK) and sums as a full buffer does, bit for bit.
+    const ring_drop_align = 32;
+
     /// The grow a write of `new_len` rows needs, or null. A sliding ring carries only its newest
-    /// `keep` rows across and ignores the request's reservation, which sizes a full buffer.
+    /// `keep` rows (up to one drop block more) across and ignores the request's reservation, which sizes a full buffer.
     fn planGrow(self: *const KVCache, entry: *const KVCacheEntry, new_len: usize) ?Grow {
         const rows = entry.offset - entry.base;
         const oversized = self.restoredOversized(entry, new_len);
         if (entry.initialized and !oversized and rows + new_len <= bufferCapacity(entry.keys)) return null;
-        const drop: usize = if (entry.initialized and entry.keep > 0 and rows > entry.keep) rows - entry.keep else 0;
+        const drop: usize = if (entry.initialized and entry.keep > 0 and rows > entry.keep) (rows - entry.keep) / ring_drop_align * ring_drop_align else 0;
         const kept: usize = if (entry.initialized) rows - drop else 0;
         const cur_cap = if (oversized) rows else if (entry.initialized) bufferCapacity(entry.keys) else 0;
         const cap = if (entry.keep > 0) nextCapacity(cur_cap, kept + new_len) else self.nextCapacityReserved(cur_cap, kept + new_len);

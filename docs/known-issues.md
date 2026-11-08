@@ -65,6 +65,9 @@ Declared today:
 - **Ollama sink**: SSE keepalive comments are dropped, and a LAN-tunnelled reply is not marked `length_framed`, so
   its close waits for the peer.
 - **K2-Horizon** with a JSON schema keeps thinking off.
+- **A sliding ring drops rows past window + 2048** (`mimo_v2`, `laguna`, `flint`, `kolibri1`, `gpt_oss`, `gemma4`): a
+  prefix-cache hit restores only where the entry still holds the window behind the match (`ringFloor`), and a session
+  that has dropped a row no longer persists to the SSD tier (its chunk files start at position 0).
 - **`--kv-attn-mode fused` is a silent no-op on Gemma 4**: sliding layers keep a 512-key ring (under the packed reads'
   2048-key floor) and the hd-512 global layers at GQA 4 overflow the decode kernel's 10 KB threadgroup budget
   (`qkvDecBlockFor`), so every read stays dense (`tests/test_kv_quant_fused_equivalence.sh` defaults to Gemma 4 E4B).

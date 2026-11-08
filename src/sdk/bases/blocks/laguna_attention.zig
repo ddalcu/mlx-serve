@@ -200,17 +200,8 @@ pub fn LagunaAttention(comptime opts: Options) type {
             return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandOnce(c, s, kv_len, w_c), sinks, false);
         }
 
-        /// Appends to `h` at the current layer: a sliding layer with a ring keeps only its ring.
         fn append(w: *const Weights, c: *Ctx, h: abi.Handle, k: Array, v: Array, keep: u32) !abi.KvView {
-            const o = try c.cacheOps();
-            const s: abi.Stream = .{ .ctx = c.stream().ctx };
-            var out: abi.KvView = .{};
-            const verdict = if (keep > 0 and w.ring > 0)
-                o.append_ring(h, c.layer, .{ .ctx = k.ctx }, .{ .ctx = v.ctx }, keep, w.window, w.ring, s, &out)
-            else
-                o.append(h, c.layer, .{ .ctx = k.ctx }, .{ .ctx = v.ctx }, keep, s, &out);
-            if (!verdict.isOk()) return error.CacheOpFailed;
-            return out;
+            return kv.appendSliding(c, h, k, v, keep, w.window, w.ring);
         }
 
         /// `flat * softplus(gate(x))` per head: the f32 softplus rounded to bf16 before the multiply.

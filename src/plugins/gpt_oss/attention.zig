@@ -2,7 +2,7 @@
 //! column, YaRN on every layer (its mscale on the rotated dims), sliding layers over a block-sized tail with a band
 //! mask at prefill and a window mask at decode. Serial only.
 //! copied_from: sdk/blocks/attention/sinks.zig (`sinkAttnWith`, `sinkAttnCore`, `sinkAttnOut` without MiMo's
-//! per-layer geometry, value scale, ring and decode copies, and without the batched slots).
+//! per-layer geometry, value scale and decode copies, and without the batched slots).
 
 const ops = @import("../../mlx/ops.zig");
 const block = @import("../../sdk/bases/block.zig");
@@ -35,6 +35,8 @@ pub const SinkAttention = struct {
         mscale: Array = .{},
         /// Keys a sliding layer attends; 0 = a full layer.
         window: u32 = 0,
+        /// Rows a sliding layer's cache keeps (>= the widest view); 0 = every row.
+        ring: u32 = 0,
     };
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
@@ -56,7 +58,7 @@ pub const SinkAttention = struct {
 
         const total = offset + s;
         const sv = sliding.view(w.window, geo.head_dim, total, s);
-        var view = try kv.append(c, k, v, if (w.window > 0) sv.span else 0);
+        var view = try kv.appendSliding(c, c.cache(), k, v, if (w.window > 0) sv.span else 0, w.window, w.ring);
         defer kv.release(c, &view);
         const dv = kv.dense(view);
         const out = try core(w, c, q, dv.k, dv.v, total, sv.kv_len);

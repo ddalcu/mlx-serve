@@ -144,7 +144,8 @@ pub fn aneGateHeadroom(config: *const model_mod.ModelConfig, chunk: u32) u64 {
 /// here. The sizer used to bill fp16 unconditionally, so a `--kv-quant 4`
 /// server reported — and served — under a third of the context it can hold.
 /// KV every live slot holds whatever its length: the QSA key ring and the sliding rings
-/// (`ModelConfig.slidingRing`), whose buffers hold keep + one prefill chunk of rows.
+/// (`ModelConfig.slidingRing`), whose buffers hold keep + one prefill chunk of rows (a request's chunk is never
+/// longer than its prompt).
 pub fn slotFixedKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
     const ring_rows: u64 = @as(u64, config.slidingKeepRows()) +| chunk;
     return config.qsaRingBytes() +| kvBytesPerTokenAtBits(config.slidingRowBytes(), kv_bits) *| ring_rows;
@@ -410,7 +411,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         return .{
             .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
             .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
-            .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk),
+            .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, @min(chunk, seq)),
             .dq_min_rows = dq_min_rows,
         };
     }
@@ -432,7 +433,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
-        .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk) +| head_qsa_ring,
+        .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, @min(chunk, seq)) +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dq_min_rows = dq_min_rows,
     };

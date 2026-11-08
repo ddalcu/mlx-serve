@@ -494,6 +494,33 @@ test "slotFixedKvBytes: a MiMo slot bills its sliding rings once, at keep + one 
     try t.expectEqual(llama.qsaRingBytes(), slotFixedKvBytes(&llama, 16, 8192));
 }
 
+test "sliding layers keep a ring: released laguna, gpt_oss and gemma4 configs bill their full layers per token, the rings per slot" {
+    const t = std.testing;
+    const both = @import("../plugin/both.zig");
+    const Case = struct { json: []const u8, full: u64, global: u64, ring_row: u64, window: u32 };
+    // `full` = every caching layer's K+V bf16 row (the full-buffer bill), `global` = the full layers' alone.
+    const cases = [_]Case{
+        .{ .json = @embedFile("../plugin/fixtures/mlx_lm/poolside_Laguna-XS-2.1-NVFP4-mlx.json"), .full = 163840, .global = 40960, .ring_row = 122880, .window = 512 },
+        .{ .json = @embedFile("../plugin/fixtures/mlx_lm/mlx-community_gpt-oss-20b-MXFP4-Q8.json"), .full = 49152, .global = 24576, .ring_row = 24576, .window = 128 },
+        .{ .json = @embedFile("../../../fixtures/model-configs/gemma-4-26b-a4b-it-4bit.json"), .full = 225280, .global = 20480, .ring_row = 204800, .window = 1024 },
+        .{ .json = @embedFile("../../../fixtures/model-configs/gemma-4-e4b-it-4bit.json"), .full = 57344, .global = 16384, .ring_row = 40960, .window = 512 },
+    };
+    for (cases) |c| {
+        var cfg = try both.servedUnderOverrides(c.json);
+        defer cfg.deinit(t.allocator);
+        try t.expect(cfg.slidingRing());
+        try t.expectEqual(c.window + model_mod.ModelConfig.SLIDING_RING_SLACK, cfg.slidingKeepRows());
+        try t.expectEqual(c.global, cfg.kvBytesPerToken());
+        try t.expectEqual(c.ring_row, cfg.slidingRowBytes());
+        try t.expectEqual(c.full, c.global + c.ring_row);
+        // At 128k with an 8192-row chunk the ring is a small fixed term beside the per-token bill.
+        const ctx: u64 = 131072;
+        try t.expect(slotFixedKvBytes(&cfg, 16, 8192) + c.global * ctx < c.full * ctx / 4 * 3);
+        // A short prompt's ring holds keep + its own rows, not a whole chunk.
+        try t.expectEqual(slotFixedKvBytes(&cfg, 16, 1000), prefillRequestTerms(&cfg, 1000, 256, 16, 8192, .{}).slot_fixed_kv_bytes);
+    }
+}
+
 test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V widths" {
     const t = std.testing;
     // Uniform arch: every layer caches, K and V are both head_dim wide.

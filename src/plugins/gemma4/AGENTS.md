@@ -21,6 +21,8 @@ keys) are declined `unsupported`. `bidirectional.zig` is the encoder base of bot
   `assistant_drafter.zig`; they go when the legacy Gemma 4 path does.
 
 ## Facts the table declares
+- `sliding_ring` (window + 2048): sliding layers keep a ring (`DecoderAttention.ring`), KV-shared layers read their
+  source's; gemma3 keeps the full buffer.
 - `dflash_capture` (the forward fills `capture_layers`): the driver adopts the trunk's table and head, so the
   assistant drafter (and a DFlash sidecar) serve on the plugin path; proven by `expectDrafter` (tokens, acceptance,
   each round's draft logits bit-equal on E-series and 26B-A4B trunks).

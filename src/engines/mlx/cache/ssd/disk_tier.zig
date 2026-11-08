@@ -1943,8 +1943,8 @@ pub const DiskTier = struct {
         // persistable snapshot.
         for (kv_entries) |*entry| {
             if (!entry.initialized) continue;
-            // The chunk files hold rows from position 0; a sliding ring dropped them.
-            if (entry.keep > 0) {
+            // The chunk files hold rows from position 0; a sliding ring that dropped them cannot write them.
+            if (entry.base > 0) {
                 log.debug("  [disk-cache] skip: sliding ring layer\n", .{});
                 return .skipped;
             }
@@ -4562,7 +4562,7 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
     try testing.expect(tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.affine(4), &.{}) == null);
 }
 
-test "DiskTier: a sliding ring is never persisted (its rows start past position 0)" {
+test "DiskTier: a sliding ring that dropped rows is never persisted (its rows start past position 0)" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -4586,6 +4586,33 @@ test "DiskTier: a sliding ring is never persisted (its rows start past position 
     const out = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expectEqual(PersistOutcome.skipped, out);
     try testing.expectEqual(@as(usize, 0), tier.entryCount());
+}
+
+test "DiskTier: a sliding ring that has dropped no row persists from position 0" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-test", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    for (0..4) |_| {
+        var k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k);
+        try mlx.check(mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, 150, 8 }, 4, .float32, s));
+        var view = try cache.updateSliding(0, k, k, s, 8 + 150 - 1, 8, 1024);
+        view.deinit();
+    }
+    try testing.expectEqual(@as(usize, 0), cache.entries[0].base);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const out = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
+    try testing.expectEqual(PersistOutcome.persisted, out);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
 }
 
 test "DiskTier: extend commit appends only new chunks (full chunks untouched)" {
