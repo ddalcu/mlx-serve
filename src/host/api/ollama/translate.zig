@@ -902,7 +902,7 @@ pub const Sink = struct {
             "Connection: close\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
             "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
+            "Access-Control-Allow-Headers: Content-Type, Authorization, X-MLX-Priority\r\n" ++
             "\r\n");
     }
 

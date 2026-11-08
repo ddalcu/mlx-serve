@@ -76,9 +76,9 @@ fn responseBodyLogged(content_type: []const u8) bool {
 
 /// The `Access-Control-Allow-Headers` value each SSE surface and every framed response (the OPTIONS preflight
 /// included) advertises.
-pub const SSE_ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization, X-Ablation-Key";
+pub const SSE_ALLOW_HEADERS_DEFAULT = "Content-Type, Authorization, X-Ablation-Key, X-MLX-Priority";
 
-pub const SSE_ALLOW_HEADERS_ANTHROPIC = "Content-Type, Authorization, x-api-key, anthropic-version, X-Ablation-Key";
+pub const SSE_ALLOW_HEADERS_ANTHROPIC = "Content-Type, Authorization, x-api-key, anthropic-version, X-Ablation-Key, X-MLX-Priority";
 
 /// The one place a `text/event-stream` response head is written. Past this call a generation
 /// failure is an SSE `error` event; before it the stream answers like its non-streaming twin.

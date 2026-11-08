@@ -629,7 +629,7 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
     const l = http_server.g_lan orelse return sendResponseFramed(stream, "200 OK", "application/json", body);
     if (stream.ws_mode != null) return sendResponseFramed(stream, "200 OK", "application/json", body);
     var hdr_buf: [512]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nX-MLX-LAN-Token: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nX-MLX-LAN-Token: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-MLX-Priority\r\n\r\n", .{
         body.len,
         &l.token_hex,
     }) catch return error.Overflow;
