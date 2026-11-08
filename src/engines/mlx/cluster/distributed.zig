@@ -1212,6 +1212,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             self.planned = true;
             cluster().tp_link = &self.link;
             dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
+            dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
             dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
             dsv41_mod.clusterHooks().tp_batch = &dsv41TpBatch;
             dsv41_mod.clusterHooks().tp_free = &dsv41TpFree;
@@ -1241,6 +1242,13 @@ fn dsv41TpSum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
     cluster().tp_sums += 1;
     cluster().tp_values += mlx.mlx_array_size(x);
     return link.allSum(x);
+}
+
+/// DeepSeek-V4.1 tensor, every rank: every rank's `x` stacked on axis 0 in rank order, lazily on this thread's CPU
+/// stream (each rank's slice of the logits, `deepseek_v41.headLogits`).
+fn dsv41TpGather(x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const link = cluster().tp_link orelse return error.DistWorkerNotJoined;
+    return link.allGather(x);
 }
 
 /// The sums the step before this one built, logged where a prompt step ends or the count is not a decode step's.
@@ -1433,7 +1441,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     };
     defer w.deinit();
     const binding = config.plugin orelse return error.NotPluginServed;
-    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
+    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .head_8bit = dsv41_mod.head8Wanted(), .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;
@@ -1441,8 +1449,10 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     defer m.deinit();
     cluster().tp_link = link;
     dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
+    dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
     defer {
         dsv41_mod.clusterHooks().tp_sum = null;
+        dsv41_mod.clusterHooks().tp_gather = null;
         cluster().tp_link = null;
     }
     // Rank 0's other live states (its parked slots and idle state), by gen; the module holds the one it advances.
