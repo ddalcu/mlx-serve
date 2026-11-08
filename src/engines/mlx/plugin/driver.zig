@@ -547,6 +547,8 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     // Module-owned state (`Caps.owns_decode_state`): the cache is never appended to, its step is the position, and
     // only a verify reads more than the last row's logits.
     const module = if (xfm.config.plugin) |pb| pb.parsed.caps.owns_decode_state else false;
+    // A prompt forward read at most at its last row asks a `Caps.prompt_last_row` model for that row alone.
+    const last_row = module or (ctx.last_row_logits and (if (xfm.config.plugin) |pb| pb.parsed.caps.prompt_last_row else false));
     const ids: []const u32 = if (ctx.capture_layers) |cl| cl.ids else &.{};
     var captured: [64]abi.Array = undefined;
     if (ids.len > captured.len) return error.PluginForwardUnsupported;
@@ -560,7 +562,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     const f: abi.Forward = .{
         .mode = mode,
         .row_exact = xfm.config.dflash_bound,
-        .logits = if (!head) .none else if (module and !capture and !ctx.spec_verify) .last_row else .all_rows,
+        .logits = if (!head) .none else if (last_row and !capture and !ctx.spec_verify) .last_row else .all_rows,
         .want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null,
         .rows = rows,
         .tokens = .{},

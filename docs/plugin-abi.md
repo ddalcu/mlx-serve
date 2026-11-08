@@ -153,8 +153,9 @@ Model facts the host keeps once at load. Defaults are the generic model's.
 | `merged_state` | `bool` | `false` | A batch's recurrent state is read and written only through `CacheOps.state_rows` / `set_state_rows`, so the engine may keep it merged across batched ticks instead of re-stacking every layer each tick. |
 | `slot_state` | `bool` | `false` | Module-owned state (`owns_decode_state`) kept per slot (`Forward.slots`, `release_slot`, `activate_slot`): requests interleave and batch instead of running single-flight. |
 | `ablation` | `bool` | `false` | The forward honours `Forward.ablation` on every pass that writes the residual stream (a native drafter's rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes only under the same `Ablation.keys` entry. |
+| `prompt_last_row` | `bool` | `false` | A prompt forward asked for `Logits.last_row` returns its last row's logits alone, bit-identical to that row of its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the prefill's prompt forwards unless the request echoes prompt logprobs. |
 | `experts_stream` | `bool` | `false` | The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`): the preflight bills their slot rows, not the experts. Without it the setting is refused by name. |
-| `_` | `u32` | `0` |  |
+| `_` | `u31` | `0` |  |
 
 ### `ThinkingDefault` (enum(u8))
 
@@ -536,7 +537,7 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `embeds` | `Array` | `.{}` | Input rows `[slots, rows, hidden]` in place of the ids' embedding (a spoken frame's `SpeechHooks.frame_rows`); empty = embed the ids. |
 | `progress` | `?*u64` | `null` | A prompt forward's live progress: a model that chunks the prompt itself (`Caps.whole_prompt_prefill`) stores the rows it has forwarded so far here (`@atomicStore`, monotonic) after each chunk; null = nobody is watching. |
 | `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
-| `prompt_spans` | `Span(u64)` | `.{}` | A whole-prompt prefill (`Caps.whole_prompt_prefill`): the absolute positions where the engine's chunk loop would end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
+| `prompt_spans` | `Span(u64)` | `.{}` | A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
 | `ssm_checkpoints` | `Span(u64)` | `.{}` | The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending, each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it. |
 
 ### `Ablation` (extern struct)

@@ -134,10 +134,14 @@ pub const Caps = packed struct(u64) {
     /// rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes
     /// only under the same `Ablation.keys` entry.
     ablation: bool = false,
+    /// A prompt forward asked for `Logits.last_row` returns its last row's logits alone, bit-identical to that row of
+    /// its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the
+    /// prefill's prompt forwards unless the request echoes prompt logprobs.
+    prompt_last_row: bool = false,
     /// The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`):
     /// the preflight bills their slot rows, not the experts. Without it the setting is refused by name.
     experts_stream: bool = false,
-    _: u32 = 0,
+    _: u31 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -464,9 +468,10 @@ pub const Forward = extern struct {
     progress: ?*u64 = null,
     /// Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged.
     ablation: ?*const Ablation = null,
-    /// A whole-prompt prefill (`Caps.whole_prompt_prefill`): the absolute positions where the engine's chunk loop would
-    /// end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only
-    /// when `size` reaches it: an older host's `Forward` ends before it.
+    /// A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's
+    /// restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its
+    /// spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size`
+    /// reaches it: an older host's `Forward` ends before it.
     prompt_spans: Span(u64) = .{},
     /// The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending,
     /// each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it.
@@ -978,6 +983,12 @@ test "abi plugin: caps fit one word with the generic defaults" {
     try testing.expectEqual(@as(usize, 8), @sizeOf(Caps));
     const c: Caps = .{};
     try testing.expect(c.prefix_cache and c.batch_per_slot_attn and c.batch_pads_kv and !c.batches_decode);
+}
+
+test "abi plugin: an older plugin's caps word ends before prompt_last_row, which it reads unset" {
+    try testing.expectEqual(@bitOffsetOf(Caps, "ablation") + 1, @bitOffsetOf(Caps, "prompt_last_row"));
+    const older: Caps = @bitCast((@as(u64, 1) << @bitOffsetOf(Caps, "prompt_last_row")) - 1);
+    try testing.expect(older.ablation and !older.prompt_last_row);
 }
 
 test "abi plugin: every struct opens with its size, set by default" {
