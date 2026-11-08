@@ -9,6 +9,7 @@ Loading + residency:
 - **An error a caller tells apart after a cross-unit call (`modules.call`, the engine table) is in `err_name.Known`**,
   else it arrives as `EngineFailed`: DSV4.1's benign `MissingVisionWeights` opt-out failed whole loads under `-Dunits`.
 - **The load preflight's "available" is capped by Metal's working-set limit** (`effectiveAvailableBytes(…, mlx.maxRecommendedWorkingSet())`): a lowered `iogpu.wired_limit_mb` binds below free RAM and weights past it OOM in warmup, leaving a server that refuses every request.
+- **The load preflight counts the RAM outside wired + compressor, less the OS reserve** (`computeLoadAvailableBytes`): macOS moves any app's pages for a wiring, so only another wired model binds; per-request gates keep `computeAvailableBytes`.
 - **`modelDiskBytes` bills the shards the INDEX names** (#274); an index naming NO shard on disk is STALE, not a filter (`indexShardSet` → null).
 - **Tokenizer-derived config is set in ONE place for both load paths** (`ModelConfig.applyTokenizer`: EOS merges, LFM2 image tokens).
 - **A launch flag that shapes a LOAD is retained on the Scheduler** (`ensureLoaded`'s cold-load `LoadRequest` is a second site; `--drafter` via `coldLoadDrafterDir`). Guard: `tests/test_cold_load_launch_flags.sh`. An arg loop needs an else branch (`classifyUnparsedArg`); guard `tests/test_headless_spec_flags.sh`.
