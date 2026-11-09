@@ -359,12 +359,16 @@ pub fn publishLiveKvResidency(sch: *Scheduler, prefilling: ?*Slot, module_bytes:
     }
     // A shed or queued slot keeps its KV beside the decode list: bill it or the
     // published residency under-reads what the process holds. Queued slots are
-    // not sessions — bytes only.
-    for ([_][]*Slot{ sch.pending.items, sch.cleanup_queue.items, sch.offloaded.items }) |queued| {
+    // bytes only, never sessions; a finished cleanup slot is billed as hot cache.
+    for ([_][]*Slot{ sch.pending.items, sch.offloaded.items }) |queued| {
         for (queued) |s| {
             if (s == prefilling) continue; // already priced above
             bytes += slotStateBytes(s);
         }
+    }
+    for (sch.cleanup_queue.items) |s| {
+        if (s.finished) continue; // committed: its buffers ride the hot-cache bill
+        bytes += slotStateBytes(s);
     }
     sch.resident_live_kv_bytes.store(bytes, .monotonic);
 }
@@ -397,6 +401,7 @@ fn slotHoldingKvBytes(bytes: usize) !Slot {
     s.cache = try transformer_mod.KVCache.init(testing.allocator, 1);
     s.ssm_entries = null;
     s.legacy_gen = null;
+    s.finished = false;
     const buf = try testing.allocator.alloc(f32, bytes / 4);
     defer testing.allocator.free(buf);
     var shape = [_]c_int{@intCast(buf.len)};
@@ -407,8 +412,8 @@ fn slotHoldingKvBytes(bytes: usize) !Slot {
 
 test "live residency bills the slots held off the decode list" {
     // The under-read: a shed or queued slot keeps its KV while invisible to
-    // the decode walk. Listed once is billed once: the prefilling slot parked
-    // in `pending` too adds nothing a second time.
+    // the decode walk. Listed once is billed once; a finished, committed
+    // cleanup slot is billed hot, not live.
     var sch: Scheduler = undefined;
     sch.io = testing.io;
     sch.metrics = null;
@@ -424,9 +429,13 @@ test "live residency bills the slots held off the decode list" {
     defer held.cache.deinit();
     var retiring = try slotHoldingKvBytes(2048);
     defer retiring.cache.deinit();
+    var donated = try slotHoldingKvBytes(8192);
+    defer donated.cache.deinit();
+    donated.finished = true; // finishSlot committed its cache: the hot entry bills it
     try sch.pending.append(testing.allocator, &held);
     defer sch.pending.deinit(testing.allocator);
     try sch.cleanup_queue.append(testing.allocator, &retiring);
+    try sch.cleanup_queue.append(testing.allocator, &donated);
     defer sch.cleanup_queue.deinit(testing.allocator);
 
     sch.queue_mu.lockUncancelable(sch.io);
