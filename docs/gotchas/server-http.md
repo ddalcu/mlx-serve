@@ -839,8 +839,9 @@ available, but macOS compresses or swaps ANY app's pages to make room for a wiri
 and still refused loads that fit. Fix: the load preflight takes the RAM outside wired + compressor, less the OS
 reserve (`computeLoadAvailableBytes`). The eviction planner and the GPU ceiling read the same room (`getLoadRoomBytes`),
 so a small load no longer unloads an idle model it fits beside, nor is its request then refused; another resident
-model is wired, so a load beside it is still refused.
-Guard: `load preflight: a load macOS can make room for is admitted…`.
+model is wired, so a load beside it is still refused. The hot cache stays while the server idles, so its clamp keeps
+the old figure (`idleCacheGpuMemoryCeiling`) and never sizes itself into memory other apps hold.
+Guard: `load preflight: a load macOS can make room for is admitted…`, `the hot cache is sized against memory nobody holds…`.
 
 ### A client that hung up during a cold prefill left the GPU prefilling for a ghost
 Defect: Claude Code retrying a 40K-token prompt queued abandoned prefills while no client was connected. Cause: the

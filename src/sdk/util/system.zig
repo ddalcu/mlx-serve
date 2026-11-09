@@ -143,8 +143,8 @@ pub fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages:
 
 /// What a model LOAD can count on: the RAM outside wired and compressor memory, less the OS reserve. macOS
 /// compresses or swaps any app's pages to make room for a wiring, so only wired memory (another loaded
-/// model, the kernel) and the compressor's own pages bind. Loads and the GPU ceiling read it on macOS
-/// (`getLoadRoomBytes`); the app's meter keeps `computeAvailableBytes`. 0 on a failed query.
+/// model, the kernel) and the compressor's own pages bind. Loads and request admission read it on macOS
+/// (`getLoadRoomBytes`); the hot cache and the app's meter keep `computeAvailableBytes`. 0 on a failed query.
 pub fn computeLoadAvailableBytes(total_mem: u64, wire_pages: u64, compressor_pages: u64, page: u64, reserve: u64) u64 {
     if (total_mem == 0) return 0;
     return (total_mem -| (wire_pages +| compressor_pages) *| page) -| reserve;
