@@ -1363,7 +1363,7 @@ pub fn mlxErrorIsGpuTimeout(msg: []const u8) bool {
         std.mem.indexOf(u8, msg, "GPU Timeout Error") != null;
 }
 
-/// Waits out the GPU work still in flight: after a timeout the rest of a failed eval's command buffers keep
+/// Waits out the GPU work still in flight: after a failure the rest of a failed eval's command buffers keep
 /// failing, and their errors must latch before the caller drops them, not during the next load.
 pub fn drainGpu() void {
     const s = gpuStream();

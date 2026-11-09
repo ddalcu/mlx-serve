@@ -1431,8 +1431,8 @@ Defect: reloading the 70 GB Qwen3.8-Flash-Next pack while a busy app rewrote 32 
 parks the entry in `.error_state`; and the failed eval's other command buffers kept failing after the load returned,
 latching a second timeout onto the next load a second later. Fix: the load reads its own latched MLX error
 (`loadFailureCause`): a GPU timeout is `GpuTimeout` (503 `gpu_timeout`) and a GPU out-of-memory is
-`InsufficientMemory`, both retried; a timeout waits out the in-flight GPU work (`mlx.drainGpu`) before the latch is
-dropped. Under steady pressure the retry timed out again as often as not, so qwen4_exp evaluates its trunk a layer at
+`InsufficientMemory`, both retried; a failed load waits out the in-flight GPU work (`mlx.drainGpu`) before the latch
+is dropped. Under steady pressure the retry timed out again as often as not, so qwen4_exp evaluates its trunk a layer at
 a time instead of all ~70 GB at once: 0 of 23 of the same reloads timed out, and the eval took 6-24 s where one batch
 took up to 59 s. Guard: `a load the GPU timed out or ran out of memory on fails for that reason, not as a broken pack`;
 live, warm reloads beside a busy 32 GB app after the last model's memory is freed.

@@ -1,6 +1,6 @@
 //! Builds the trunk from a pack's loaded map: the embedding and head, the layers (the engine's MoE layer binder),
-//! the final mixer, the n-gram state and table, the MTP head, the YaRN tables, then one batched eval of every
-//! weight. The map stays the caller's (the trunk borrows its arrays).
+//! the final mixer, the n-gram state and table, the MTP head, the YaRN tables, then an eval of every weight, a
+//! layer at a time. The map stays the caller's (the trunk borrows its arrays).
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
