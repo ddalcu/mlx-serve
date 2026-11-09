@@ -22,6 +22,9 @@ const ssmSnapshot = @import("entry.zig").ssmSnapshot;
 const ssmSnapshotDeinit = @import("entry.zig").ssmSnapshotDeinit;
 const ssmLiveAux = @import("group.zig").ssmLiveAux;
 const ssmMaterializeLive = @import("group.zig").ssmMaterializeLive;
+const abi = @import("../../../abi/plugin.zig");
+const CheckpointSink = @import("../kv/cache_ops.zig").CheckpointSink;
+const materializedOwnedCopy = @import("../../../mlx/array.zig").materializedOwnedCopy;
 
 /// Phase 1 (performance-plan): per-position SSM checkpoint covering ALL hybrid
 /// layers in the model. Captures the SSM/conv state after the model has been
@@ -141,6 +144,60 @@ pub fn captureSsmCheckpoint(
     }
     return .{ .pos = pos, .layers = layers };
 }
+
+/// A whole-prompt prefill's checkpoints (`CacheOps.checkpoint`), filed onto the prefill's list as the chunk loop files
+/// its own: owned copies at the planned positions in order, thinned past `max` by the same rule.
+pub const PromptCheckpoints = struct {
+    allocator: std.mem.Allocator,
+    list: *std.ArrayList(SSMCheckpoint),
+    /// `Forward.ssm_checkpoints`; `next` indexes the position the next call files.
+    positions: []const u64,
+    next: usize = 0,
+    /// The model's layer count (`ssm_entries.len`); a layer the call does not name keeps a null snapshot.
+    layers: usize,
+    s: mlx.mlx_stream,
+    max: usize = 0,
+    thin: ThinPolicy = .oldest,
+    low_anchors: usize = 0,
+
+    pub fn sink(self: *PromptCheckpoints) CheckpointSink {
+        return .{ .ctx = self, .file = &fileOpaque };
+    }
+
+    fn fileOpaque(ctx: *anyopaque, pos: u64, states: []const abi.LayerState) anyerror!void {
+        const self: *PromptCheckpoints = @ptrCast(@alignCast(ctx));
+        return self.file(pos, states);
+    }
+
+    pub fn file(self: *PromptCheckpoints, pos: u64, states: []const abi.LayerState) !void {
+        if (self.next >= self.positions.len or pos != self.positions[self.next]) return error.CheckpointNotPlanned;
+        for (states) |st| {
+            if (st.size != @sizeOf(abi.LayerState)) return error.CheckpointLayerState;
+            if (st.layer >= self.layers) return error.CheckpointLayer;
+        }
+        const layers = try self.allocator.alloc(SSMCacheEntrySnapshot, self.layers);
+        for (layers) |*l| l.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+        var cp: SSMCheckpoint = .{ .pos = @intCast(pos), .layers = layers };
+        errdefer cp.deinit(self.allocator);
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (states) |st| {
+            const l = &layers[st.layer];
+            for ([_]struct { src: abi.Array, dst: *mlx.mlx_array }{ .{ .src = st.conv, .dst = &l.conv_state }, .{ .src = st.ssm, .dst = &l.ssm_state } }) |f| {
+                if (f.src.ctx == null) continue;
+                const copy = try materializedOwnedCopy(self.s, .{ .ctx = f.src.ctx });
+                _ = mlx.mlx_array_free(f.dst.*);
+                f.dst.* = copy;
+                _ = mlx.mlx_vector_array_append_value(vec, copy);
+            }
+            l.initialized = true;
+        }
+        // The copies evaluate in one batch, so no checkpoint keeps the forward's graph alive.
+        _ = mlx.mlx_eval(vec);
+        try fileCheckpoint(self.allocator, self.list, cp, self.max, self.thin, self.low_anchors);
+        self.next += 1;
+    }
+};
 
 pub var cadence_conv_eval_count: u64 = 0;
 
@@ -312,6 +369,17 @@ pub fn ssmCheckpointDropIndexLowAnchored(
     low_anchors: usize,
 ) usize {
     return spanPreservingDropIndex(SSMCheckpoint, cps, checkpointPosOf, policy, protect, low_anchors);
+}
+
+/// Files `cp` on a prefill's checkpoint list and thins the list past `max` (0 = no cap): the one store-and-thin
+/// every prefill site runs (the chunk loop's captures, `PromptCheckpoints.file`). The list owns `cp` once this
+/// returns; on an error the caller still does.
+pub fn fileCheckpoint(allocator: std.mem.Allocator, list: *std.ArrayList(SSMCheckpoint), cp: SSMCheckpoint, max: usize, thin: ThinPolicy, low_anchors: usize) !void {
+    try list.append(allocator, cp);
+    if (max > 0 and list.items.len > max) {
+        var dropped = list.orderedRemove(ssmCheckpointDropIndexLowAnchored(list.items, thin, null, low_anchors));
+        dropped.deinit(allocator);
+    }
 }
 
 /// `spanPreservingDropIndex` over a bare ascending position list.
@@ -670,4 +738,112 @@ test "the warm-credit capacity gate survives a hybrid trunk's uninitialized laye
     var dense = Fold{};
     for (0..32) |_| dense.add(cap);
     try t.expectEqual(cap, dense.result());
+}
+
+fn arangeShaped(s: mlx.mlx_stream, shape: []const c_int, from: f64) !mlx.mlx_array {
+    var n: f64 = 1;
+    for (shape) |d| n *= @floatFromInt(d);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_arange(&flat, from, from + n, 1.0, .float32, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, flat, shape.ptr, shape.len, s));
+    _ = mlx.mlx_array_eval(out);
+    return out;
+}
+
+// Bar: each call files an owned copy of the states it names at the next planned position; anything else files nothing.
+test "prompt checkpoints: a whole-prompt forward's states file as owned copies at the planned positions, in order" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var list: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (list.items) |*cp| cp.deinit(testing.allocator);
+        list.deinit(testing.allocator);
+    }
+    const conv = try arangeShaped(s, &.{ 1, 3, 8 }, 0);
+    const ssm = try arangeShaped(s, &.{ 1, 2, 2, 2 }, 100);
+    var pc: PromptCheckpoints = .{ .allocator = testing.allocator, .list = &list, .positions = &.{ 4096, 8192 }, .layers = 3, .s = s };
+    try testing.expectError(error.CheckpointNotPlanned, pc.file(8192, &.{}));
+    try testing.expectError(error.CheckpointNotPlanned, pc.file(4000, &.{}));
+    try testing.expectError(error.CheckpointLayer, pc.file(4096, &.{.{ .layer = 3, .conv = .{ .ctx = conv.ctx } }}));
+    try testing.expectError(error.CheckpointLayerState, pc.file(4096, &.{.{ .size = 0, .layer = 0, .conv = .{ .ctx = conv.ctx } }}));
+    try testing.expectEqual(@as(usize, 0), list.items.len);
+    const states = [_]abi.LayerState{
+        .{ .layer = 0, .conv = .{ .ctx = conv.ctx }, .ssm = .{ .ctx = ssm.ctx } },
+        .{ .layer = 2, .conv = .{ .ctx = conv.ctx } },
+    };
+    try pc.file(4096, &states);
+    try pc.file(8192, &states);
+    try testing.expectError(error.CheckpointNotPlanned, pc.file(8192, &states));
+    const conv_in = @intFromPtr(mlx.mlx_array_data_float32(conv).?);
+    _ = mlx.mlx_array_free(conv);
+    _ = mlx.mlx_array_free(ssm);
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqual(@as(usize, 4096), list.items[0].pos);
+    try testing.expectEqual(@as(usize, 8192), list.items[1].pos);
+    const l = list.items[0].layers;
+    try testing.expectEqual(@as(usize, 3), l.len);
+    try testing.expect(l[0].initialized and !l[1].initialized and l[2].initialized);
+    try testing.expect(l[1].conv_state.ctx == null and l[1].ssm_state.ctx == null and l[2].ssm_state.ctx == null);
+    const c0 = mlx.mlx_array_data_float32(l[0].conv_state).?;
+    try testing.expect(@intFromPtr(c0) != conv_in);
+    try testing.expectEqual(@as(f32, 23), c0[23]);
+    try testing.expectEqual(@as(f32, 107), mlx.mlx_array_data_float32(l[0].ssm_state).?[7]);
+}
+
+// Bar: past `max`, filing drops a checkpoint by the chunk loop's own rule.
+test "prompt checkpoints: past the cap, a whole-prompt prefill's filing thins the list by the chunk loop's rule" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var list: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (list.items) |*cp| cp.deinit(testing.allocator);
+        list.deinit(testing.allocator);
+    }
+    var pc: PromptCheckpoints = .{ .allocator = testing.allocator, .list = &list, .positions = &.{ 4096, 8192, 12_288 }, .layers = 1, .s = s, .max = 2, .thin = .oldest };
+    for ([_]u64{ 4096, 8192, 12_288 }) |p| try pc.file(p, &.{});
+    try testing.expectEqual(@as(usize, 2), list.items.len);
+    try testing.expectEqual(@as(usize, 8192), list.items[0].pos);
+    try testing.expectEqual(@as(usize, 12_288), list.items[1].pos);
+
+    // The long-context archs' rule: span-preserving with a dense newest quarter, the low anchors kept.
+    var gated: std.ArrayList(SSMCheckpoint) = .empty;
+    defer {
+        for (gated.items) |*cp| cp.deinit(testing.allocator);
+        gated.deinit(testing.allocator);
+    }
+    var planned: [12]u64 = undefined;
+    for (&planned, 1..) |*p, i| p.* = 1000 * i;
+    var pg: PromptCheckpoints = .{ .allocator = testing.allocator, .list = &gated, .positions = &planned, .layers = 1, .s = s, .max = 8, .thin = .min_span_recency, .low_anchors = 2 };
+    for (planned) |p| try pg.file(p, &.{});
+    try testing.expectEqual(@as(usize, 8), gated.items.len);
+    var kept: [8]usize = undefined;
+    for (gated.items, &kept) |cp, *k| k.* = cp.pos;
+    try testing.expectEqualSlices(usize, &.{ 1000, 2000, 4000, 6000, 8000, 10_000, 11_000, 12_000 }, &kept);
+}
+
+// Bar: past the cap, the one store-and-thin keeps each policy's survivors and its low anchors.
+test "prompt checkpoints: fileCheckpoint thins past the cap by the policy, low anchors kept" {
+    const Case = struct { thin: ThinPolicy, low_anchors: usize, kept: [8]usize };
+    const cases = [_]Case{
+        .{ .thin = .oldest, .low_anchors = 2, .kept = .{ 1000, 2000, 7000, 8000, 9000, 10_000, 11_000, 12_000 } },
+        .{ .thin = .min_span, .low_anchors = 0, .kept = .{ 1000, 3000, 5000, 7000, 9000, 10_000, 11_000, 12_000 } },
+        .{ .thin = .min_span_recency, .low_anchors = 2, .kept = .{ 1000, 2000, 4000, 6000, 8000, 10_000, 11_000, 12_000 } },
+    };
+    for (cases) |c| {
+        var list: std.ArrayList(SSMCheckpoint) = .empty;
+        defer {
+            for (list.items) |*cp| cp.deinit(testing.allocator);
+            list.deinit(testing.allocator);
+        }
+        for (1..13) |i| {
+            const cp: SSMCheckpoint = .{ .pos = 1000 * i, .layers = try testing.allocator.alloc(SSMCacheEntrySnapshot, 0) };
+            try fileCheckpoint(testing.allocator, &list, cp, 8, c.thin, c.low_anchors);
+        }
+        try testing.expectEqual(@as(usize, 8), list.items.len);
+        var kept: [8]usize = undefined;
+        for (list.items, &kept) |cp, *k| k.* = cp.pos;
+        try testing.expectEqualSlices(usize, &c.kept, &kept);
+    }
 }

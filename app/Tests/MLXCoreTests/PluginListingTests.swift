@@ -53,6 +53,53 @@ final class PluginListingTests: XCTestCase {
                        ["sushi_ds41"], "Rebuild all takes only what the catalog can build")
     }
 
+    func testARunningServerThatHasNotAppliedTheSwitchNeedsARestart() {
+        let current = PluginListing.items(receipts: [receipt("sushi_ds41", "0.2.0")], catalog: [sushi]).installed[0]
+        let on = OutsidePlugins.Switches(enabled: true)
+        let loaded = ["sushi_ds41": PluginCatalog.ServerStatus(loaded: true, rebuild: false, why: "")]
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: [:], serverUp: true), .restartNeeded,
+                       "just installed: the running server loads plugins only at its start")
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: loaded, serverUp: true), .on)
+        XCTAssertEqual(PluginListing.state(current, switches: .init(enabled: true, disabled: ["sushi_ds41"]), running: "26.11.2",
+                                           server: loaded, serverUp: true), .restartNeeded, "switched off but still loaded")
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: [:], serverUp: false), .on,
+                       "a stopped server loads it at its next start: nothing to restart")
+    }
+
+    func testAnOptionTheRunningServerHasNotAppliedNeedsARestart() {
+        var r = receipt("sushi_ds41", "0.2.0")
+        r.options = [.init(name: "SUSHI_DS41_FRAC", kind: .number)]
+        let current = PluginListing.items(receipts: [r], catalog: [sushi]).installed[0]
+        var on = OutsidePlugins.Switches(enabled: true)
+        on.setOption("sushi_ds41", "SUSHI_DS41_FRAC", "0.4")
+        let stale = ["sushi_ds41": PluginCatalog.ServerStatus(loaded: true, rebuild: false, why: "")]
+        let applied = ["sushi_ds41": PluginCatalog.ServerStatus(loaded: true, rebuild: false, why: "", options: ["SUSHI_DS41_FRAC": "0.4"])]
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: stale, serverUp: true), .restartNeeded)
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: applied, serverUp: true), .on)
+        XCTAssertEqual(PluginListing.state(current, switches: on, running: "26.11.2", server: stale, serverUp: false), .on,
+                       "a stopped server sets it at its next start")
+    }
+
+    func testInstallProgressReadsAsThreeSteps() {
+        typealias S = PluginListing.StepStatus
+        func statuses(_ phase: PluginManager.Phase) -> [S] { PluginListing.installSteps(phase).map(\.status) }
+        XCTAssertEqual(PluginListing.installSteps(.fetching(name: "x")).count, 3)
+        XCTAssertEqual(statuses(.fetching(name: "x")), [.active, .waiting, .waiting])
+        XCTAssertEqual(statuses(.awaitingConfirmation(name: "x", commit: String(repeating: "a", count: 40), version: "0.2.0")),
+                       [.done, .waiting, .waiting], "nothing compiles until the user approves the fetched commit")
+        XCTAssertEqual(statuses(.building(name: "x")), [.done, .active, .waiting])
+        XCTAssertEqual(statuses(.installing(name: "x")), [.done, .done, .active])
+        XCTAssertEqual(statuses(.done(name: "x")), [.done, .done, .done])
+    }
+
+    func testARowReadsByItsCatalogTitleAndFallsBackToItsName() throws {
+        let json = #"{"plugins":[{"name":"sushi_ds41","title":"Sushi - DeepSeek 4.1 Flash","kind":"model"},{"name":"bare","kind":"model","title":"  "}]}"#
+        let catalog = try PluginCatalog.decode(Data(json.utf8))
+        let lists = PluginListing.items(receipts: [receipt("local_only", "1.0")], catalog: catalog)
+        XCTAssertEqual(lists.available.map(\.title), ["Sushi - DeepSeek 4.1 Flash", "bare"], "a blank title is no title")
+        XCTAssertEqual(lists.installed[0].title, "local_only", "a plugin the catalog does not list reads by its name")
+    }
+
     func testPacksSplitTheDescriptionFromTheRepo() {
         XCTAssertEqual(PluginListing.packs(sushi), [.init(text: "deepseek_v41 with expert_quant.format stq",
                                                          repo: "beamster/DeepSeek-V4.1-Flash-1017-Sushi-STQ-1.75bpw")])

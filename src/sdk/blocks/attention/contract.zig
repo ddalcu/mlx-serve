@@ -272,17 +272,17 @@ const Q23 = 0x1p-23;
 /// A key a kernel block takes for one query row: its score in the kernel's units (log2 units under exp2), the
 /// score's error, whether a mask hides it (the score is then the kernel's mask value), the weight its exp carries
 /// into the sum (a joined chunk's sum; 1 for a key), its value row and that row's errors (a dequantized row).
-const Key = struct { s: f64, e: f64 = 0, on: bool = true, w: f64 = 1, v: []const f64, ve: ?[]const f64 = null };
+pub const Key = struct { s: f64, e: f64 = 0, on: bool = true, w: f64 = 1, v: []const f64, ve: ?[]const f64 = null };
 
 /// exp2 on log2-unit scores or exp; P's rounding before P·V (half: 2^-11 of it, 2^-25 at least); a block whose
 /// keys are all masked to -Inf leaves the max and sum as they were (lane_attn's rule).
-const Soft = struct { base2: bool = false, p_unit: f64 = 0, p_abs: f64 = 0, keep_empty: bool = false };
+pub const Soft = struct { base2: bool = false, p_unit: f64 = 0, p_abs: f64 = 0, keep_empty: bool = false };
 
 /// The state a row starts from: the kernel's starting max, or a carried / sink state (`l` > 0) whose max is `e` off.
-const Init = struct { m: f64, e: f64 = 0, l: f64 = 0, o: ?[]const f64 = null };
+pub const Init = struct { m: f64, e: f64 = 0, l: f64 = 0, o: ?[]const f64 = null };
 
 /// A row's max and sum after its blocks, with their errors (the unnormalized output and its errors land in o, eo).
-const Row = struct { m: f64, em: f64, l: f64, el: f64 };
+pub const Row = struct { m: f64, em: f64, l: f64, el: f64 };
 
 const inf = std.math.inf(f64);
 
@@ -295,7 +295,7 @@ fn expIn(base2: bool, x: f64) f64 {
 /// as Metal's does; a -Inf score weighs 0; no rescale while the max is still -Inf). Each output's error is bounded against the final max: per visible term
 /// its score's and the max's error, its exp, the rescales it passed (a fast exp: 3 ulps each, plus 2 per unit the
 /// max moved), P's rounding and the f32 sums; the carried term the same without a score.
-fn online(soft: Soft, init: Init, keys: []const Key, ends: []const usize, o: []f64, eo: []f64) Row {
+pub fn online(soft: Soft, init: Init, keys: []const Key, ends: []const usize, o: []f64, eo: []f64) Row {
     var m = init.m;
     var l = init.l;
     if (init.o) |c| @memcpy(o, c) else @memset(o, 0);
@@ -372,7 +372,7 @@ fn joinMax(m: []const f64, l: []const f64, o: []const f64, d: usize, out: []f64,
 }
 
 /// o / l as a kernel stores it (a reciprocal and a product, or a divide): values in o, errors in eo.
-fn normalize(r: Row, o: []f64, eo: []f64) void {
+pub fn normalize(r: Row, o: []f64, eo: []f64) void {
     for (o, eo) |*y, *e| {
         y.* /= r.l;
         e.* = (e.* + @abs(y.*) * r.el) / r.l + 2 * host.U * @abs(y.*);
@@ -389,12 +389,12 @@ fn granule(t: f64) f64 {
 }
 
 /// How gate 4 runs a kernel's sums (null: exact).
-const Sim = ?struct { acc: spec.Accum, order: spec.Order };
+pub const Sim = ?struct { acc: spec.Accum, order: spec.Order };
 
 /// q·k times `scale` in float64, with its error: k's own errors (`kerr`, a dequantized row), f32 sums `depth` deep
 /// over the products' magnitude (none when every product is an integer and the magnitude stays under 2^24, where any
 /// f32 order is exact), then `roundings` of the scaled value. Gate 4 runs the sum in its accumulator.
-fn dot(q: []const f64, k: []const f64, scale: f64, depth: usize, roundings: f64, sim: Sim, terms: []f64) host.Val {
+pub fn dot(q: []const f64, k: []const f64, scale: f64, depth: usize, roundings: f64, sim: Sim, terms: []f64) host.Val {
     return dotErr(q, k, null, scale, depth, roundings, sim, terms);
 }
 

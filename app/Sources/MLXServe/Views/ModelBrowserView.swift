@@ -85,7 +85,7 @@ struct ModelBrowserPane: View {
         case .myModels:     MyModelsPane(filter: $localFilter)
         case .downloads:    DownloadsPane(items: activeDownloads)
         case .media:        MediaPane()
-        case .plugins:      PluginsPane()
+        case .plugins:      PluginsPane(restartServer: appState.restartServer)
         }
     }
 }

@@ -39,9 +39,19 @@ GPU. `bill` returns the resident bytes for the format given the stored size.
 | `release` | Free a weight you handed out |
 | `matmul` | `x @ W^T` for a weight you loaded |
 | `moe` | The routed-expert matmul over a bank (indices, scores) |
+| `swiglu` | Optional: routed SwiGLU experts over three banks in one dispatch (`limit` > 0 clamps); with no `inds`, a dense SwiGLU MLP you may decline (`unsupported`: the model runs its own chain) |
+| `bank_rows` / `open_bank` | Optional: a streamed bank of routed experts (`experts.bin`): the slot rows a budget buys, and the bank itself (`abi.Bank`), which runs each routed call and returns its sum; null: the format streams none |
 
-The dispatch is per load and per forward, never per layer, so a model plugin routes its quantized tensors through your
-table without knowing the encoding.
+An in-tree model that knows no other form of a weight asks the loaded quant plugin claiming the pack's
+`quantization_config` (or `quantization`) block (`src/sdk/quant/outside.zig`): it loads the weight through
+`load_tensor` / `load_bank` and runs it through `matmul` / `swiglu`, without knowing the encoding. A streamed pack's
+routed experts come from your `open_bank` (`outside.Format.openBank` wraps the `abi.Bank` as the trunk's
+`sdk/weights/routed.zig` `Routed`): the bank owns its slot rows, reads and math; the trunk hands it each layer's normed
+rows, routes and weights. The bank streams over the kit's expert stream (`kit.streamed.expert`: `stream.StreamOf` over
+your bank type, the residency policy, the read pool; the kit's `build.zig` `streamSources` compiles the read pool's C
+into your dylib, and its MLX internals are C symbols you serve over the `HostGpu` table). DeepSeek-V4.1 reads its EXL3
+repack this way (the `turboexl3_ds41` plugin: its trunk, its grouped `wo_a` as one weight your `matmul` takes as
+`[rows, groups, in]`, and its streamed bank). Such a pack loads its tensors as stored (no f16 narrowing).
 
 ## Rules
 
@@ -59,11 +69,11 @@ mlx-serve plugin check ./myquant
 mlx-serve plugin check ./myquant --model <pack dir>
 ```
 
-In-tree examples to copy from: affine, fp8, nvfp4 in `src/sdk/quant/`, EXL3 in `src/sdk/quant/exl3/`, GGUF in
+In-tree examples to copy from: affine, fp8, nvfp4 in `src/sdk/quant/`, sushi's EXL3 in `src/sdk/quant/exl3/`, GGUF in
 `src/sdk/quant/gguf/` (a format seam: see [plugins.md](plugins.md) "Pick the shallowest seam").
 
 ## Read these in the kit
 
 - `examples/_example_quant/plugin.zig` and its `config.zig`: the scaffold `plugin new` copies.
-- `src/abi/quant.zig`: `QuantTable`, `Weight`, `LoadCtx`. Field comments are the reference.
+- `src/abi/quant.zig`: `QuantTable`, `Weight`, `LoadCtx`, `Bank`. Field comments are the reference.
 - `src/sdk/root.zig`, `include/mlx_serve_plugin.h`: the SDK exports and the C ABI.

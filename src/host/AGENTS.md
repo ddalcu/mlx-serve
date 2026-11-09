@@ -28,6 +28,9 @@ The MLX engine boundary:
 - **A table or function is told apart by a value it carries, never its address** (`CacheOps.sdk_slots`, `Source.resident`, a table's `name`): each unit holds its own copy, so qwen4 wrote its MTP rollback captures into its own slot and every request failed.
 - **An `Io` handed into another unit is rebuilt there** (`io_util.local`, at the engine table, the module calls and the stream table): its vtable returns the numbers of the unit that built it, so the host's `FileNotFound` read as `HostUnreachable` and qwen3_asr failed to load.
 - **State two units touch is `Shared`** (`sdk/util/shared.zig`), the host owns it and lists it in `src/shared_all.zig`; a plain `pub var` the engine reads splits into two copies under `-Dunits` (`zig build units-check` names them). A plugin is told apart by its table's NAME, never its address: each unit holds its own copy of a table.
+- **An engine plugin serves the model FOLDERS it names** (`loader.engineFor`, by folder name, over every built-in):
+  discovery and the `/v1/models` badge see the folder, while a `--model-dir` id carries its org (`t/<folder>`), so a
+  match on the id loaded the folder on MLX. It runs its own thread or is refused (`Served.openTable`).
 
 Reasoning, budgets, agents:
 - **A reasoning budget is enforced at DECODE** (`armThinkBound` → `think_bound`, `thinkBoundTick`): early-stop line + atomic closer committed as ONE forward (`commitForcedTokens`); bare-`<think>` family only; all three surfaces (`reasoning_budget_tokens`). Guard: `tests/test_reasoning_budget_stream.sh`.

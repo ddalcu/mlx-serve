@@ -64,7 +64,7 @@ pub fn adapted(b: *Binding) ModelConfig {
 }
 
 /// The plugin's claim and parse of the pack at `model_dir` (caller owns the binding); null for a pack of a type no
-/// plugin serves (an mlx-stream pack is its stream module's), `error.PluginDeclinedNoLegacy` for a served type's pack
+/// plugin serves, `error.PluginDeclinedNoLegacy` for a served type's pack
 /// its plugin declines. The engine's config of a served pack is the legacy parse with this binding attached.
 pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?*Binding {
     const why = switch (try resolve(io, a, model_dir, config_json)) {
@@ -75,21 +75,8 @@ pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, confi
     defer arena.deinit();
     const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
     if (!served.serves(model_type)) return null;
-    if (streamPack(io, a, model_dir, config_json)) {
-        log.info("[plugin] {s}: {s}; its stream module serves it\n", .{ model_type, why });
-        return null;
-    }
     log.err("[plugin] {s}: {s}; no other path serves it\n", .{ model_type, why });
     return error.PluginDeclinedNoLegacy;
-}
-
-/// An mlx-stream pack: a declared expert bank, or an `experts.bin` beside the trunk.
-fn streamPack(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) bool {
-    if (model.declaresExpertStreaming(a, config_json)) return true;
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const bank = std.fmt.bufPrint(&buf, "{s}/experts.bin", .{model_dir}) catch return false;
-    std.Io.Dir.accessAbsolute(io, bank, .{}) catch return false;
-    return true;
 }
 
 /// `table`'s parse of the pack at `dir` (caller owns the binding), for an engine that serves a pack through one named

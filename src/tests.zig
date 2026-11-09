@@ -1,15 +1,10 @@
 // Test root — imports all modules to run their embedded tests.
 // Run with: zig build test
 
-// pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) and mlx-stream reach these through their host root.
+// pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) reaches these through its host root.
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
-pub const shared = @import("sdk/util/shared.zig");
-pub const mtp_acceptance = @import("sdk/spec/mtp_acceptance.zig");
 pub const log = @import("sdk/util/log.zig");
-pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
-pub const fp8_block128_gemv = @import("sdk/quant/fp8_block128_gemv.zig");
-pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const env = @import("env.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
@@ -67,7 +62,6 @@ test {
     _ = @import("plugins/mimo_v2/proof_test.zig");
     _ = @import("plugins/mimo_v2/mtp_head_test.zig");
     _ = @import("plugins/mimo_v2/sushi_test.zig");
-    _ = @import("plugins/mimo_v2/streamed_test.zig");
     _ = @import("plugins/bert/proof_test.zig");
     _ = @import("plugins/deepseek_v4/proof_test.zig");
     _ = @import("plugins/deepseek_v4/served_test.zig");
@@ -94,8 +88,26 @@ test {
     _ = @import("env.zig");
     _ = @import("sdk/util/win_io.zig");
     _ = @import("sdk/quant/gguf/claim.zig");
-    if (@import("build_options").mlx_stream) _ = @import("engines/mlx/modules/stream_glue.zig");
-    _ = @import("sdk/weights/streamed/dupes_test.zig");
+    _ = @import("sdk/weights/streamed/expert.zig");
+    _ = @import("sdk/weights/streamed/expert/io.zig");
+    _ = @import("sdk/weights/streamed/expert/policy.zig");
+    _ = @import("sdk/weights/streamed/expert/routes.zig");
+    _ = @import("sdk/weights/streamed/expert/usage.zig");
+    _ = @import("sdk/weights/streamed/expert/tally.zig");
+    _ = @import("sdk/weights/streamed/expert/stream.zig");
+    _ = @import("sdk/weights/streamed/expert/bank_pool.zig");
+    _ = @import("sdk/weights/streamed/expert/stage.zig");
+    _ = @import("sdk/weights/streamed/expert/stage_votes.zig");
+    _ = @import("sdk/weights/streamed/expert/stage_trim.zig");
+    _ = @import("sdk/weights/streamed/expert/la_wide.zig");
+    _ = @import("sdk/weights/streamed/expert/io_test.zig");
+    _ = @import("sdk/weights/streamed/expert/event_test.zig");
+    _ = @import("sdk/weights/streamed/expert/policy_test.zig");
+    _ = @import("sdk/weights/streamed/expert/stream_of_test.zig");
+    _ = @import("sdk/weights/streamed/expert/seed_free_test.zig");
+    _ = @import("sdk/weights/streamed/expert/stage_test.zig");
+    _ = @import("sdk/weights/streamed/expert/direct_parts_test.zig");
+    _ = @import("sdk/weights/streamed/expert/demand_first_test.zig");
     _ = @import("sdk/weights/streamed/mlx_pack_test.zig");
     _ = @import("plugins/deepseek_v41/streamed_test.zig");
     _ = @import("version.zig");
@@ -349,5 +361,6 @@ test {
     _ = @import("host/api/model_row_facts.zig");
     _ = @import("mlx/ffi.zig");
     _ = @import("testing/fake_engine.zig"); // the engine contract suite against the fake engines
+    _ = @import("kit_header.zig"); // the C names a released header had
     _ = @import("abi/exactness_test.zig"); // the exactness contracts (run on the fakes from fake_engine.zig)
 }

@@ -10,6 +10,7 @@ const PlePending = @import("../../plugins/qwen4_exp/ple.zig").PlePending;
 const QsaArmCounts = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArmCounts;
 const KVCache = @import("kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("ssm/entry.zig").SSMCacheEntry;
+const CheckpointSink = @import("kv/cache_ops.zig").CheckpointSink;
 const Transformer = @import("transformer.zig").Transformer;
 
 /// A draft tree's verify rows: row w sits at position offset + depth[w], and
@@ -99,6 +100,9 @@ pub const ForwardCtx = struct {
     tree: ?*const SpecTree = null,
     /// A speculative VERIFY forward (drafts behind one committed token), never a prompt chunk.
     spec_verify: bool = false,
+    /// A prompt forward read at most at its last row's logits (no prompt logprobs): a model declaring
+    /// `Caps.prompt_last_row` is asked for that row alone.
+    last_row_logits: bool = false,
     /// Hand the graph built so far to the GPU every this many layers (0 =
     /// build it whole): a spec round's verify waits on the host otherwise.
     pipeline_build: u32 = 0,
@@ -111,6 +115,11 @@ pub const ForwardCtx = struct {
     vision_splice_offset: usize = 0,
     /// The scheduler's prefill-progress gauge, handed to a plugin that chunks a whole-prompt prefill itself.
     prefill_progress: ?*std.atomic.Value(u64) = null,
+    /// A whole-prompt prefill's plan, absolute (`Forward.prompt_spans`, `Forward.ssm_checkpoints`), and the list its
+    /// `CacheOps.checkpoint` calls file onto.
+    prompt_spans: []const u64 = &.{},
+    ssm_cp_positions: []const u64 = &.{},
+    cp_sink: ?*const CheckpointSink = null,
     /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
     /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
     /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens

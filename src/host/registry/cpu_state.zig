@@ -71,7 +71,8 @@ pub fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
 fn preloadTextCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !CpuState {
     const config = try allocator.create(ModelConfig);
     errdefer allocator.destroy(config);
-    config.* = try model_mod.parseConfig(io, allocator, model_dir);
+    // An engine plugin's model is never a built-in plugin's to refuse.
+    config.* = if (@import("../plugins/loader.zig").engineServes(model_dir)) try model_mod.parseConfigLegacy(io, allocator, model_dir) else try model_mod.parseConfig(io, allocator, model_dir);
 
     const tok = try allocator.create(Tokenizer);
     errdefer allocator.destroy(tok);

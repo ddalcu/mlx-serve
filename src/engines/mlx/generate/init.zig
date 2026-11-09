@@ -5,7 +5,6 @@ const std = @import("std");
 const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
-const mlx_stream = @import("../modules/stream.zig");
 const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const log = @import("../../../sdk/util/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
@@ -52,6 +51,11 @@ const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
+const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
+const wholePromptPlan = @import("prefill_chunk.zig").wholePromptPlan;
+const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
+const fileCheckpoint = @import("../ssm/checkpoint.zig").fileCheckpoint;
+const CheckpointSink = @import("../kv/cache_ops.zig").CheckpointSink;
 const intree = @import("../plugin/intree.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 
@@ -78,10 +82,9 @@ pub fn initWithOptions(
     // arm then takes the serial verdict (spec/dspark.zig `serialVerdict`).
     sampling.keyed = (xfm.config.rowExactDecode() or (env.on(.MLX_SERVE_KEYED_SAMPLING) and !sampling.shapesLogits())) and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
     sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
-    // Spec drafts and verify rows share the serial sampler's keys (and
-    // mlx-stream's lane draws from the seed), so an unseeded sampled
-    // request gets its own random seed.
-    if ((sampling.keyed or xfm.mlx_stream_ext != null) and sampling.seed == null and sampling.temperature > 0.01) {
+    // Spec drafts and verify rows share the serial sampler's keys, so an
+    // unseeded sampled request gets its own random seed.
+    if (sampling.keyed and sampling.seed == null and sampling.temperature > 0.01) {
         var prng = std.Random.DefaultPrng.init(@truncate(@as(u96, @bitCast(std.Io.Timestamp.now(io, .real).toNanoseconds())) ^ @intFromPtr(xfm)));
         sampling.seed = prng.random().int(u64);
     }
@@ -97,7 +100,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
-    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or xfm.mlx_stream_ext != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or plugin_driver.nativeDrafter(xfm) != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
         // checkpoint ships stages and the request is CLEAN (no
@@ -110,7 +113,7 @@ pub fn initWithOptions(
         // remain hard-off regardless: their verify forwards go through
         // machinery this arch cannot roll back.
         const native = plugin_driver.nativeDrafter(xfm) != null;
-        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else if (native) xfm.config.plugin.?.parsed.spec.native_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
+        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else xfm.config.plugin.?.parsed.spec.native_block;
         const dspark_env_off = !dsparkEnabled();
         // A plugin whose drafter cannot hand the verify back accepts greedily: a sampled request runs serial.
         const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
@@ -119,16 +122,7 @@ pub fn initWithOptions(
             DsparkArm.off
         else
             dsparkArmFor(sampling, options.logprobs_n);
-        // mlx-stream's lane samples a sampled request itself, from the request's own settings.
-        const lane_sampling: ?mlx_stream.SamplingParams = if (dspark_env_off or arm == .off) null else .{
-            .temperature = sampling.temperature,
-            .top_p = sampling.top_p,
-            .top_k = sampling.top_k,
-            .min_p = sampling.min_p,
-            .seed = sampling.seed orelse 0,
-        };
-        const lane_arms = if (xfm.mlx_stream_ext) |m| mlx_stream.arm(m, lane_sampling) else true;
-        if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off and lane_arms) {
+        if (xfm.dsparkStages() > 0 and !dspark_env_off and arm != .off) {
             dspark_active = true;
             dspark_stochastic = arm == .stochastic;
             if (dspark_stochastic) {
@@ -154,6 +148,8 @@ pub fn initWithOptions(
     // `&ctx` to every forward call below; the cache/moe/ssm fields
     // mutate in-place through their pointers.
     var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
+    // Only an echo of prompt logprobs reads a prompt forward's logits before its last row.
+    ctx.last_row_logits = options.prompt_logprobs == null;
 
     const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
     defer allocator.free(ids_i32);
@@ -260,6 +256,8 @@ pub fn initWithOptions(
     // checkpoint-retention `ssm_low_anchors` wiring. A non-gated arch keeps the
     // coarsened stride's own boundary chunking — the grid adds it no chunks.
     const dense_low_grid: bool = xfm.config.longCtxGated();
+    // The prefill's checkpoint retention: one value for the chunk loop and a whole-prompt prefill.
+    const cp_thin: transformer_mod.ThinPolicy = if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
 
     // Qwen native MTP: build the head's committed-history KV cache during
     // prefill. Entry j pairs (trunk hidden at prompt position j, token at
@@ -376,10 +374,7 @@ pub fn initWithOptions(
         // is not in place, so a long prefill's peak carried a second copy of everything so
         // far (~7.75 GB at 458k on qwen4_exp, #353). Same number the admission guard billed
         // (`KVCache.reservedTokens`), in ABSOLUTE positions: `prompt_ids` is the tail after
-        // a prefix-cache hit. `cp_thin` names this site's previous retention policy.
-        const cp_thin: transformer_mod.ThinPolicy =
-            if (xfm.config.longCtxGated()) .min_span_recency else .oldest;
-
+        // a prefix-cache hit.
         const reserved_tokens = reservedPrefillTokens(
             &xfm.config,
             total_ctx_for_chunk,
@@ -561,7 +556,7 @@ pub fn initWithOptions(
             const abs_end_for_cp2 = end + ssm_cp_offset;
             if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
                 const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
-                ssm_checkpoints.append(allocator, cp) catch |e| {
+                fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
                     doomed.deinit(allocator);
                     return e;
@@ -574,21 +569,6 @@ pub fn initWithOptions(
                 if (mtp_active) if (xfm.qwen4Trunk()) |t| t.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
-                // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
-                // the last `max * stride` tokens and left no affordable trim point.
-                if (options.ssm_checkpoint_max > 0 and
-                    ssm_checkpoints.items.len > options.ssm_checkpoint_max)
-                {
-                    var dropped = ssm_checkpoints.orderedRemove(
-                        transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                            ssm_checkpoints.items,
-                            cp_thin,
-                            null,
-                            options.ssm_low_anchors,
-                        ),
-                    );
-                    dropped.deinit(allocator);
-                }
             }
 
             if (has_vision) {
@@ -685,7 +665,7 @@ pub fn initWithOptions(
                 // or a partial tail (also evaluated). The snapshot is a
                 // cheap refcount-share.
                 const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs, xfm.s);
-                ssm_checkpoints.append(allocator, cp) catch |e| {
+                fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
                     doomed.deinit(allocator);
                     return e;
@@ -698,19 +678,6 @@ pub fn initWithOptions(
                 if (mtp_active) if (xfm.qwen4Trunk()) |t| t.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
-                if (options.ssm_checkpoint_max > 0 and
-                    ssm_checkpoints.items.len > options.ssm_checkpoint_max)
-                {
-                    var dropped = ssm_checkpoints.orderedRemove(
-                        transformer_mod.ssmCheckpointDropIndexLowAnchored(
-                            ssm_checkpoints.items,
-                            cp_thin,
-                            null,
-                            options.ssm_low_anchors,
-                        ),
-                    );
-                    dropped.deinit(allocator);
-                }
             }
             // One copy of the QSA key history on the latest snap. Stride
             // captures skipped it so a 400k prefill is not 32× the
@@ -772,6 +739,31 @@ pub fn initWithOptions(
         ctx.prefill_progress = options.prefill_progress;
     }
     defer ctx.prefill_progress = null;
+    // It is handed the spans and checkpoint positions the chunk loop would have run, and files its checkpoints onto the
+    // loop's list through `CacheOps.checkpoint`.
+    var whole_plan: ?WholePromptPlan = null;
+    defer if (whole_plan) |*wp| wp.deinit(allocator);
+    var prompt_cps: PromptCheckpoints = undefined;
+    var prompt_cp_sink: CheckpointSink = undefined;
+    if (final_start == 0 and tail_len > 1) {
+        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid);
+        ctx.prompt_spans = whole_plan.?.spans;
+        if (whole_plan.?.checkpoints.len > 0) {
+            prompt_cps = .{
+                .allocator = allocator,
+                .list = &ssm_checkpoints,
+                .positions = whole_plan.?.checkpoints,
+                .layers = ctx.ssm_entries.?.len,
+                .s = xfm.s,
+                .max = options.ssm_checkpoint_max,
+                .thin = cp_thin,
+                .low_anchors = options.ssm_low_anchors,
+            };
+            prompt_cp_sink = prompt_cps.sink();
+            ctx.ssm_cp_positions = whole_plan.?.checkpoints;
+            ctx.cp_sink = &prompt_cp_sink;
+        }
+    }
     const raw_logits = if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
@@ -779,6 +771,11 @@ pub fn initWithOptions(
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
     } else try xfm.forwardWith(&ctx, last_input);
+    // The plan, the sink and the last-row read are the prompt's: the generator below keeps a copy of `ctx`.
+    ctx.prompt_spans = &.{};
+    ctx.ssm_cp_positions = &.{};
+    ctx.cp_sink = null;
+    ctx.last_row_logits = false;
     // History entries for the held-back span: (hidden[j], token[j+1]) for
     // j in [final_start, prefix_len) — same pairing as the chunk loop.
     // The last row's pair (hidden[last], t1) is appended by the first
@@ -973,7 +970,8 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
-            .dspark_pol = if (dspark_active and intree.dsv41(xfm) != null) .{ .calib = .{ .head = true } } else null,
+            // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
+            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

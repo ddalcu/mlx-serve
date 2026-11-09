@@ -9,6 +9,7 @@ enum PluginListing {
         var entry: PluginCatalog.Entry?
         var id: String { name }
         var kind: String { entry?.kind ?? receipt?.kind ?? "" }
+        var title: String { entry.flatMap { $0.title.isEmpty ? nil : $0.title } ?? name }
     }
 
     typealias Lists = (installed: [Item], available: [Item])
@@ -28,12 +29,14 @@ enum PluginListing {
         case needsNewer(String)
         /// Installed, but the server refused it as built for another mlx-serve: a rebuild with this kit loads it.
         case needsRebuild
+        /// The running server has not applied the switch or the options: it loads plugins only at its start.
+        case restartNeeded
     }
 
     /// An installed plugin runs only when loading is on and its own switch is; an update shows only when this server
-    /// can run it.
+    /// can run it. `serverUp`: `server` is what a running server reported, so a plugin missing from it is not loaded.
     static func state(_ item: Item, switches: OutsidePlugins.Switches, running: String?,
-                      server: [String: PluginCatalog.ServerStatus] = [:]) -> State {
+                      server: [String: PluginCatalog.ServerStatus] = [:], serverUp: Bool = false) -> State {
         let compatible = item.entry.map { PluginCatalog.runs(on: running, requirement: $0.requiresMlxServe) } ?? true
         guard let receipt = item.receipt else {
             return compatible ? .available : .needsNewer(item.entry?.requiresMlxServe ?? "")
@@ -42,7 +45,37 @@ enum PluginListing {
             return .updateAvailable(entry.version)
         }
         if server[item.name]?.rebuild == true { return .needsRebuild }
-        return switches.enabled && switches.isOn(item.name) ? .on : .off
+        let wanted = switches.enabled && switches.isOn(item.name)
+        if serverUp, wanted != (server[item.name]?.loaded == true) { return .restartNeeded }
+        if serverUp, wanted, OutsidePlugins.applied(receipt, switches) != (server[item.name]?.options ?? [:]) { return .restartNeeded }
+        return wanted ? .on : .off
+    }
+
+    enum StepStatus: Equatable { case waiting, active, done }
+
+    struct Step: Equatable {
+        let title: String
+        let status: StepStatus
+    }
+
+    /// An install as the three steps a person follows; the log stays behind Details.
+    static func installSteps(_ phase: PluginManager.Phase) -> [Step] {
+        let current: Int
+        var waitingOnUser = false
+        switch phase {
+        case .fetching: current = 0
+        case .awaitingConfirmation: current = 1; waitingOnUser = true
+        case .building: current = 1
+        case .installing: current = 2
+        case .done: current = 3
+        case .idle, .failed: return []
+        }
+        let titles = [L10n.text("Download the source"),
+                      L10n.text("Compile and test it on this Mac"),
+                      L10n.text("Install and turn it on")]
+        return titles.enumerated().map { i, title in
+            Step(title: title, status: i < current ? .done : (i == current && !waitingOnUser ? .active : .waiting))
+        }
     }
 
     /// The installed plugins a rebuild would bring back that the catalog can build (Rebuild all).

@@ -37,7 +37,7 @@ fn runOrErr(o: *const host.Offline) !void {
     log.info("Loading weights...\n", .{});
     // A served model loads through its plugin, as the serve path does (`engines/mlx/load.zig`).
     const served = config.plugin != null;
-    if (!served and !config.mlxStream()) return error.PluginDeclinedNoLegacy;
+    if (!served) return error.PluginDeclinedNoLegacy;
     var weights = if (served) model_mod.Weights.init(allocator) else try model_mod.loadModelWeights(io, allocator, model_dir, config, load_vision);
     defer weights.deinit();
     if (!served) {

@@ -820,6 +820,13 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Stop and start again, reloading the chat model only if one was loaded: what applies a launch-time change.
+    func restartServer() {
+        let reload = !server.currentModelPath.isEmpty
+        server.stop()
+        startServer(loadingSelection: reload)
+    }
+
     /// Freshen the network-model list for a picker that is about to show it.
     /// No-op when discovery is off; boots the server (headless) when needed.
     func refreshLanModels() async {

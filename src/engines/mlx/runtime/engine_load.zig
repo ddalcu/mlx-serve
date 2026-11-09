@@ -23,6 +23,7 @@ const loadRequirementBytes = @import("preflight.zig").loadRequirementBytes;
 const ds4_load = @import("../../ds4/load.zig");
 const AneSettings = @import("../../ane/engine.zig").Settings;
 const ModelConfig = @import("../../../sdk/config/model.zig").ModelConfig;
+const outside = @import("../../../host/plugins/loader.zig");
 
 /// A GGUF on ds4 or llama.cpp: open, install, ready. The stub config's context is the one asked for; the engine's
 /// answer replaces it.
@@ -63,6 +64,48 @@ pub fn loadGguf(sch: *Scheduler, params: anytype, route: GgufRoute) !void {
     sch.dflash = null;
     publishHotCacheResidency(sch);
     if (scheduler_mod.hot_cache_budget_invalidate) |f| f();
+}
+
+/// A model an outside engine plugin names (`loader.engineFor`): its probe, its bill against what fits, then open and
+/// install as the Neural Engine's models are. The engine runs its own runtime on its own thread and never calls MLX.
+pub fn loadOutside(sch: *Scheduler, params: anytype, p: *const outside.Plugin) !void {
+    const t: *const abi.Engine = @ptrCast(@alignCast(p.manifest.table));
+    const gpa = sch.allocator;
+    const cfg_path = try std.fs.path.join(gpa, &.{ params.model_dir, "config.json" });
+    defer gpa.free(cfg_path);
+    const cfg = std.Io.Dir.cwd().readFileAlloc(sch.io, cfg_path, gpa, .limited(4 << 20)) catch try gpa.dupe(u8, "");
+    defer gpa.free(cfg);
+    var v: abi.Verdict = .{};
+    if (!t.probe(.of(params.model_dir), .of(cfg), &v)) {
+        log.err("[plugin] {s} refuses {s}: {s}\n", .{ p.name(), params.model_dir, v.why.slice() });
+        return error.EngineProbeRefused;
+    }
+    const host = served_mod.loadHost(sch);
+    const o: abi.Open = .{ .model_dir = .of(params.model_dir), .model_type = .of(params.config.model_type), .config_json = .of(cfg), .context = 0, .max_concurrent = sch.queue_cap, .memory_budget = 0, .settings_json = .{}, .options_json = .{}, .host = &host };
+    var need: u64 = 0;
+    const bill = t.load_bytes(&o, &need);
+    if (bill.code != .ok) {
+        log.err("[plugin] {s} cannot bill {s}: {s}\n", .{ p.name(), params.model_dir, bill.why.slice() });
+        return error.EngineProbeRefused;
+    }
+    makeRoomInRam(sch, params.entry.id, need);
+    if (!scheduler_mod.skip_mem_preflight and memInsufficientForLoad(need, availForLoad(sch.io, need))) return error.NotEnoughMemory;
+    const s = try Served.openTable(gpa, .plugin, t, .{
+        .model_dir = params.model_dir,
+        .model_type = params.config.model_type,
+        .max_concurrent = sch.queue_cap,
+        .config_json = cfg,
+    }, &params.entry.load_progress, &sch.engine_gauges, sch.metrics);
+    errdefer s.close();
+    log.info("[plugin] {s} serves {s}\n", .{ p.name(), params.entry.id });
+    adoptEngineWindow(params.config, s.info.context_window);
+    if (s.chatTemplate()) |tmpl| {
+        const cc = params.chat_config;
+        const dup = try cc.allocator.dupe(u8, tmpl);
+        cc.allocator.free(cc.chat_template);
+        cc.chat_template = dup;
+    }
+    install(sch, params, s, "");
 }
 
 /// A GGUF's context is the session its engine opened: the stub's geometry is a placeholder (`mlxMemoryGuardApplies`).

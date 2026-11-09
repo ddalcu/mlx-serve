@@ -9,6 +9,7 @@ pub const abi = struct {
     pub const quant = @import("abi/quant.zig");
     pub const host = @import("abi/host.zig");
     pub const dylib = @import("abi/dylib.zig");
+    pub const engine = @import("abi/engine.zig");
 };
 
 /// `sdk.Plugin`, `claimsByType`, `fixture`, `tensors`, `byte_tokenizer`, as built-in plugins see them.
@@ -29,6 +30,11 @@ pub const ane = struct {
 /// The MLX bindings `blocks` are written on: their `mlx_array` and `mlx_stream` are `{ ctx }` like mlx-c's, so a
 /// plugin converts at the call (`.{ .ctx = x.ctx }`).
 pub const mlx = @import("mlx/ffi.zig");
+/// The expert stream (`sdk/weights/streamed.zig`): routed experts read from SSD into slot rows, its residency policy and
+/// read pool, for a plugin's own bank format (`expert.stream.StreamOf` over the plugin's bank) or an MLX pack's experts
+/// as downloaded (`Streamed.openPack`). macOS only. The read pool is C a plugin compiles in (`build.zig`
+/// `streamSources`); its MLX internals reach the server through the `HostGpu` table (the plugin's own C shims over it).
+pub const streamed = @import("sdk/weights/streamed.zig");
 
 /// Register a quant layout of your own (`foreign.register`) so the blocks' `qmatmul` and expert matmul read it.
 pub const foreign = @import("sdk/quant/foreign.zig");

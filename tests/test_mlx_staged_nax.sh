@@ -3,7 +3,7 @@
 # pinned submodules at deployment target 26.2; the Homebrew bottle ships NAX off): the staged dylibs + metallib +
 # .version stamp exist, the metallib contains `*_nax` kernels (MLX's CMake gate fails SILENTLY below 26.2),
 # libmlx.dylib minos >= 26.2, libmlxc.dylib links the staged mlx, a built zig-out/bin/mlx-serve links no Homebrew
-# mlx/mlx-c, and when it loads @rpath/libmlx.dylib itself (the mlx-stream shims) its rpaths reach libmlx in the
+# mlx/mlx-c, and when it loads @rpath/libmlx.dylib itself (the expert stream's shims) its rpaths reach libmlx in the
 # app's Frameworks/ and the CLI zip's lib/.
 #
 #   ./tests/test_mlx_staged_nax.sh   # hermetic: no GPU, no server

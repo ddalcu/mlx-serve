@@ -126,9 +126,7 @@ pub fn loadSettings(buf: []u8, config: *const ModelConfig) []const u8 {
     if (headMxfp8Setting(config)) |on| w.print("\"lm_head_mxfp8\":{s}", .{if (on) "true" else "false"}) catch unreachable;
     if (config.mtp_override) |on| w.print("{s}\"mtp\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
     if (config.int8_prefill_override) |on| w.print("{s}\"int8_prefill\":{s}", .{ if (w.end > 1) "," else "", if (on) "true" else "false" }) catch unreachable;
-    const stream_experts: ?@import("../../../sdk/weights/streamed.zig").Setting = config.stream_experts_override orelse
-        if (config.expert_bank) .{ .rows = @import("../admission/bills.zig").expertBankFillRows(config) } else null;
-    if (stream_experts) |st| {
+    if (config.stream_experts_override) |st| {
         if (w.end > 1) w.writeByte(',') catch unreachable;
         switch (st) {
             .on => w.writeAll("\"stream_experts\":true") catch unreachable,
@@ -179,16 +177,12 @@ fn streamRoom(config: *const ModelConfig) u64 {
 fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
     const seq = 16_384 + 1_024;
     const chunk = @import("../generate.zig").WIDE_PREFILL_CHUNK;
-    const need = if (config.isGlm5() and config.expert_bank)
-        @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, seq, 1, 16, chunk, .{})
-    else blk: {
-        const b = config.plugin orelse return 0;
-        if (!b.parsed.caps.streamed_weights) return 0;
-        var bill: abi.Bill = .{};
-        b.table.bill(&b.parsed, &.{ .context = seq }, &bill);
-        const prefill = bill.prefill_bytes orelse return 0;
-        break :blk prefill(&b.parsed, seq, chunk, 16, 0);
-    };
+    const b = config.plugin orelse return 0;
+    if (!b.parsed.caps.streamed_weights) return 0;
+    var bill: abi.Bill = .{};
+    b.table.bill(&b.parsed, &.{ .context = seq }, &bill);
+    const prefill = bill.prefill_bytes orelse return 0;
+    const need = prefill(&b.parsed, seq, chunk, 16, 0);
     return ceiling -| need -| margin;
 }
 
@@ -461,7 +455,7 @@ fn evalEvery(cfg: *const ModelConfig, positions: Positions, rows: u32, total_kv:
 }
 
 fn slotFor(xfm: *const Transformer, ctx: *const ForwardCtx) cache_ops.Slot {
-    return .{ .kv = ctx.cache, .ssm = ctx.ssm_entries orelse &.{}, .packed_reads = ctx.kv_attn_fused, .batched_append = xfm.batched_kv_append_override orelse true };
+    return .{ .kv = ctx.cache, .ssm = ctx.ssm_entries orelse &.{}, .packed_reads = ctx.kv_attn_fused, .batched_append = xfm.batched_kv_append_override orelse true, .checkpoints = ctx.cp_sink };
 }
 
 fn freeOut(out: *const abi.ForwardOut, captured: []const abi.Array) void {
@@ -553,6 +547,8 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     // Module-owned state (`Caps.owns_decode_state`): the cache is never appended to, its step is the position, and
     // only a verify reads more than the last row's logits.
     const module = if (xfm.config.plugin) |pb| pb.parsed.caps.owns_decode_state else false;
+    // A prompt forward read at most at its last row asks a `Caps.prompt_last_row` model for that row alone.
+    const last_row = module or (ctx.last_row_logits and (if (xfm.config.plugin) |pb| pb.parsed.caps.prompt_last_row else false));
     const ids: []const u32 = if (ctx.capture_layers) |cl| cl.ids else &.{};
     var captured: [64]abi.Array = undefined;
     if (ids.len > captured.len) return error.PluginForwardUnsupported;
@@ -566,7 +562,7 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     const f: abi.Forward = .{
         .mode = mode,
         .row_exact = xfm.config.dflash_bound,
-        .logits = if (!head) .none else if (module and !capture and !ctx.spec_verify) .last_row else .all_rows,
+        .logits = if (!head) .none else if (last_row and !capture and !ctx.spec_verify) .last_row else .all_rows,
         .want_hidden = !head or ctx.capture_hidden != null or ctx.capture_hidden_all != null,
         .rows = rows,
         .tokens = .{},
@@ -593,6 +589,8 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
         .embeds = .{ .ctx = if (ctx.step_embeds) |e| e.ctx else null },
         .progress = if (mode != .prefill) null else if (ctx.prefill_progress) |p| &p.raw else null,
         .ablation = ablation,
+        .prompt_spans = if (mode == .prefill) .of(ctx.prompt_spans) else .{},
+        .ssm_checkpoints = if (mode == .prefill) .of(ctx.ssm_cp_positions) else .{},
     };
     var out: abi.ForwardOut = .{ .captured = &captured };
     intree.enter(ctx);

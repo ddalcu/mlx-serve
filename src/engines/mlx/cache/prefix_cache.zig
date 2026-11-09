@@ -950,9 +950,9 @@ pub const HotPrefixCache = struct {
         config: *const model_mod.ModelConfig,
         enable_ssm_checkpoints: bool,
     ) bool {
-        // Module-owned request state (a served pack's caps; DeepSeek-V4.1 and GLM-5.3 on mlx-stream) is not in the
+        // Module-owned request state (a served pack's caps: DeepSeek-V4.1's) is not in the
         // KVCache: a snapshot restore would advance cache.step without rebuilding it.
-        if (!config.caps().prefix_cache or config.glm_stream) return false;
+        if (!config.caps().prefix_cache) return false;
         // A pipeline worker holds the later layers' state at the live position only: a restore
         // here would rewind this rank and not the worker.
         if (config.dist_span != null) return false;
@@ -968,7 +968,7 @@ pub const HotPrefixCache = struct {
         // tensor split's plugin says through its enabled hook whether its workers keep their halves of each snapshot.
         // Other models keep `shouldUse` exactly (a tensor-parallel rank 0 keeps its KV cache: the worker is stateless).
         if (plugin_driver.auxBinding(xfm) != null) {
-            if (config.glm_stream or config.dist_span != null or config.expert_bank) return false;
+            if (config.dist_span != null) return false;
             // The plugin's eligibility hook also excludes paired and streamed loaded instances.
             return ModuleBinding.init(xfm) != null;
         }
@@ -3946,11 +3946,6 @@ test "HotPrefixCache: shouldUse rejects a streamed pack's module-owned decode st
     // without rebuilding it. A served DeepSeek pack says so in its caps (`plugins/deepseek_v4/served_test.zig`).
     var cfg = try model_mod.parseConfigFromJson(testing.allocator, model_mod.dsv41_release_config);
     defer cfg.deinit(testing.allocator);
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
-    // A GLM-5.3 pack on mlx-stream keeps its decode state on the plugin's module.
-    cfg.legacy.caps.prefix_cache = true;
-    cfg.model_type = "glm_moe_dsa";
-    cfg.glm_stream = true;
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
 
@@ -11432,12 +11427,6 @@ test "HotPrefixCache module: loaded instance gate keeps pipeline and streamed pa
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.legacy.caps.prefix_cache = false;
     fake.enabled = true;
-    cfg.glm_stream = true;
-    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
-    cfg.glm_stream = false;
-    cfg.expert_bank = true;
-    try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
-    cfg.expert_bank = false;
     cfg.dist_span = .{ .start = 0, .end = 1, .total = 2 };
     try testing.expect(!HotPrefixCache.shouldUseInstance(&cfg, true, &xfm));
     cfg.dist_span = null;
@@ -12136,4 +12125,51 @@ test "shutdown counts published module records" {
     try testing.expectEqual(@as(u64, 0), t.failures);
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
     try testing.expect(hc.disk.?.entryWholeOnDisk(id));
+}
+
+const PromptCheckpoints = @import("../ssm/checkpoint.zig").PromptCheckpoints;
+const engine_cache_ops = @import("../kv/cache_ops.zig");
+
+// Bar: a checkpoint that a whole-prompt plugin stores restores the slot state that the chunk loop's own checkpoint does.
+test "HotPrefixCache: a whole-prompt plugin's checkpoint, stored through CacheOps.checkpoint, restores the slot state the chunk loop's checkpoint does" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const prompt = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const next = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 70, 71, 72 };
+    // The slot after 6 tokens: a conv and scan layer, a conv-only layer and an attention layer.
+    var live = pcBuildHybrid(s, 100.0, 500.0);
+    defer pcFreeHybrid(&live);
+    const states = [_]plugin_abi.LayerState{
+        .{ .layer = 0, .conv = .{ .ctx = live[0].conv_state.ctx }, .ssm = .{ .ctx = live[0].ssm_state.ctx } },
+        .{ .layer = 1, .conv = .{ .ctx = live[1].conv_state.ctx } },
+    };
+    var restored: [2][3]SSMCacheEntry = .{ pcEmptySsm(), pcEmptySsm() };
+    defer for (&restored) |*r| pcFreeHybrid(r);
+    for (&restored, 0..) |*r, arm| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        defer hc.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, prompt.len);
+        var list: std.ArrayList(SSMCheckpoint) = .empty;
+        defer list.deinit(testing.allocator);
+        if (arm == 0) {
+            // The chunk loop: its own capture of the slot at 6.
+            try list.append(testing.allocator, try transformer_mod.captureSsmCheckpoint(testing.allocator, &live, 6, s));
+        } else {
+            // A whole-prompt plugin: the same states at the planned position, through the slot's CacheOps.
+            var pc: PromptCheckpoints = .{ .allocator = testing.allocator, .list = &list, .positions = &.{6}, .layers = 3, .s = s };
+            const sink = pc.sink();
+            var slot: engine_cache_ops.Slot = .{ .kv = &cache, .checkpoints = &sink };
+            const op = engine_cache_ops.ops.checkpointOp() orelse return error.TestExpectedCheckpointOp;
+            try testing.expect(op(slot.handle(), 6, .of(&states)).isOk());
+        }
+        _ = try hc.commitWithState(&cache, &prompt, false, &.{}, try list.toOwnedSlice(testing.allocator), null, null);
+        var kv = try KVCache.init(testing.allocator, 3);
+        defer kv.deinit();
+        var off: usize = 0;
+        const hit = try hc.lookupAndRestore(&kv, &off, r, s, &next, false, &.{}, null, null);
+        try testing.expectEqual(@as(usize, 6), hit.matched);
+    }
+    try testing.expectEqualStrings("", try pcSsmDiffField(s, &restored[0], &restored[1]));
 }

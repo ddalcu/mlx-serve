@@ -15,6 +15,7 @@ const build_options = @import("build_options");
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
 const plugin_loader = @import("../plugins/loader.zig");
+const auth = @import("../http/auth.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const KvAttnMode = @import("request_options.zig").KvAttnMode;
@@ -118,7 +119,6 @@ const PropsSettings = struct {
     /// 0 = auto.
     mtp_depth: u32,
     mtp_adaptive: bool,
-    native_speculation: ?struct { lane: []const u8, block_size: u32, sampled: bool } = null,
     /// 0 = no ceiling.
     max_mtp_ctx: u32,
     drafter: []const u8,
@@ -181,11 +181,6 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_greedy_tail = mp.mtp_greedy_tail,
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = true,
-        .native_speculation = if (mp.native_lane.len > 0) .{
-            .lane = mp.native_lane,
-            .block_size = mp.native_block,
-            .sampled = true,
-        } else null,
         .max_mtp_ctx = es.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = http_server.serverState().server_config.default_enable_pld, .draft_len = http_server.serverState().server_config.default_pld_draft_len, .key_len = http_server.serverState().server_config.default_pld_key_len },
@@ -206,11 +201,7 @@ pub fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
     var mtp_buf: [512]u8 = undefined;
-    const mtp_json = if (st.native_speculation) |native|
-        try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":null,\"acceptance_param\":null,\"greedy_tail\":null,\"depth\":null,\"adaptive\":null,\"max_ctx\":{d},\"native\":{{\"lane\":\"{s}\",\"block_size\":{d},\"sampled_acceptance\":\"{s}\"}}}}", .{
-            st.mtp_loaded, st.mtp_default_on, st.max_mtp_ctx, native.lane, native.block_size, if (native.sampled and native.block_size > 0) "stochastic" else "off",
-        })
-    else
+    const mtp_json =
         try std.fmt.bufPrint(&mtp_buf, "{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}}", .{
             st.mtp_loaded, st.mtp_default_on, mtp_acceptance_mod.name(st.mtp_acceptance), param, st.mtp_greedy_tail, st.mtp_depth, st.mtp_adaptive, st.max_mtp_ctx,
         });
@@ -294,7 +285,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
     defer allocator.free(settings_json);
     const cluster_json = mlx_engine.api().cluster_json(allocator) orelse return error.OutOfMemory;
     defer allocator.free(cluster_json);
-    const plugins_json = try plugin_loader.processStatusJson(allocator);
+    const plugins_json = try plugin_loader.processStatusJson(allocator, auth.peerIsLoopback(stream));
     defer allocator.free(plugins_json);
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s},\"plugins\":{s},\"registry_generation\":{d}", .{ engine_json, batching_json, settings_json, cluster_json, plugins_json, registryGeneration() });
     defer allocator.free(extra_json);
@@ -337,7 +328,7 @@ pub fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     const available_mem = metrics.getAvailableMemBytes();
     const cluster_json = mlx_engine.api().cluster_json(allocator) orelse return error.OutOfMemory;
     defer allocator.free(cluster_json);
-    const plugins_json = try plugin_loader.processStatusJson(allocator);
+    const plugins_json = try plugin_loader.processStatusJson(allocator, auth.peerIsLoopback(stream));
     defer allocator.free(plugins_json);
     const body = try std.fmt.allocPrint(allocator,
         \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}{s},"plugins":{s},"registry_generation":{d}}}
@@ -482,48 +473,6 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     var ep = try std.json.parseFromSlice(std.json.Value, testing.allocator, exact[",\"settings\":".len..], .{});
     defer ep.deinit();
     try testing.expect(ep.value.object.get("mtp").?.object.get("acceptance_param").? == .null);
-}
-
-test "settingsPropsJson: native lane configuration is not generic MTP or request engagement" {
-    for ([_]struct { enabled: bool, sampled: bool, stages: u32 }{
-        .{ .enabled = false, .sampled = true, .stages = 5 },
-        .{ .enabled = true, .sampled = true, .stages = 5 },
-        .{ .enabled = true, .sampled = false, .stages = 5 },
-        .{ .enabled = false, .sampled = true, .stages = 0 },
-    }) |case| {
-        const frag = try settingsPropsJson(testing.allocator, .{
-            .engine = "mlx",
-            .kv_quant = "8",
-            .kv_attn_mode = .auto,
-            .decode_attn_quant = false,
-            .prefill_chunk = 8192,
-            .mtp_loaded = case.stages > 0,
-            .mtp_default_on = case.enabled,
-            .mtp_acceptance = .exact,
-            .mtp_greedy_tail = true,
-            .mtp_depth = 6,
-            .mtp_adaptive = true,
-            .max_mtp_ctx = 0,
-            .native_speculation = .{ .lane = "dspark typical 0.3", .block_size = case.stages, .sampled = case.sampled },
-            .drafter = "none",
-            .pld = PldDefaults.off,
-            .max_concurrent = 1,
-            .prefix_cache_mem_bytes = 0,
-            .prefix_cache_disk_bytes = 0,
-        });
-        defer testing.allocator.free(frag);
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, frag[",\"settings\":".len..], .{});
-        defer parsed.deinit();
-        const mtp = parsed.value.object.get("mtp").?.object;
-        try testing.expectEqual(case.stages > 0, mtp.get("loaded").?.bool);
-        try testing.expectEqual(case.enabled, mtp.get("default_on").?.bool);
-        for ([_][]const u8{ "acceptance", "acceptance_param", "greedy_tail", "depth", "adaptive" }) |key|
-            try testing.expect(mtp.get(key).? == .null);
-        const native = mtp.get("native").?.object;
-        try testing.expectEqualStrings("dspark typical 0.3", native.get("lane").?.string);
-        try testing.expectEqual(@as(i64, case.stages), native.get("block_size").?.integer);
-        try testing.expectEqualStrings(if (case.sampled and case.stages > 0) "stochastic" else "off", native.get("sampled_acceptance").?.string);
-    }
 }
 
 test "settingsPropsJson: /props names the greedy tail" {

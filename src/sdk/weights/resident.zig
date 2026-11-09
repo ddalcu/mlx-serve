@@ -70,6 +70,16 @@ pub const Weights = struct {
         return self.map.get(name);
     }
 
+    /// The formats' view of the map; borrows `self`, which must not move while it is in use.
+    pub fn source(self: *const Weights) abi.Source {
+        return .{ .ctx = @constCast(self), .get = getIn };
+    }
+
+    fn getIn(ctx: ?*anyopaque, name: abi.Str) callconv(.c) abi.Array {
+        const self: *const Weights = @ptrCast(@alignCast(ctx.?));
+        return .{ .ctx = (self.get(name.slice()) orelse return .{}).ctx };
+    }
+
     /// Hand the map a new array under `name`, freeing the one it held (load-time
     /// weight fusion parks its row views here so the originals go away).
     pub fn replace(self: *Weights, name: []const u8, arr: mlx.mlx_array) void {

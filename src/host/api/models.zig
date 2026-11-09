@@ -53,6 +53,7 @@ const jsonEscape = @import("format.zig").jsonEscape;
 /// pack's EXL3 experts.
 fn modelEngineName(engine: ?EngineKind, mlx_gguf_served: bool, config: ?*const model_mod.ModelConfig, path: []const u8, arch_hint: []const u8) []const u8 {
     if (engine) |k| return @tagName(k);
+    if (@import("../plugins/loader.zig").engineServes(path)) return "plugin";
     if (config) |c| {
         if (c.exl3 != null) return "sushi";
     }
@@ -414,8 +415,7 @@ pub fn renderModelEntry(
     defer allocator.free(stub_speech);
 
     const arch_part: []const u8 = if (entry.arch_hint.len > 0) blk: {
-        // arch_hint comes from config.json's model_type via discovery — the
-        // supported-type allowlist guarantees no JSON metacharacters.
+        // arch_hint comes from config.json's model_type via discovery, which admits [A-Za-z0-9_.-] only.
         break :blk try std.fmt.allocPrint(allocator, "\"architecture\":\"{s}\",", .{entry.arch_hint});
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);

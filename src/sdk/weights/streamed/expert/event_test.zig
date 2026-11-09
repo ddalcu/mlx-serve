@@ -2,11 +2,10 @@
 //! on a GPU machine only: DSV41_PHASE0B_MLX=1; creating any MLX array creates the Metal device).
 
 const std = @import("std");
-const env = @import("mlx_host").env;
-const mlx = @import("sdk").mlx;
-const expert_bank = @import("bank.zig");
-const expert_io = @import("../sdk_ext.zig").expert.io;
-const event = @import("../sdk_ext.zig").expert.event;
+const env = @import("../../../../env.zig");
+const mlx = @import("../../../../mlx/ffi.zig");
+const expert_io = @import("io.zig");
+const event = @import("event.zig");
 const c = event.test_abi.abi;
 const abi_version = event.abi_version;
 const Event = event.Event;
@@ -19,7 +18,8 @@ const allFresh = event.allFresh;
 const stats = event.stats;
 
 const testing = std.testing;
-const n_components = expert_bank.n_components;
+const n_components = 9;
+const gu_components = 6;
 
 test "dsv41 event: the shim's ABI" {
     try testing.expectEqual(@as(i32, abi_version), c.dsv41ev_abi());
@@ -58,7 +58,7 @@ const Rig = struct {
         errdefer tmp.cleanup();
         const image = try testing.allocator.alloc(u8, 8 * 16384);
         errdefer testing.allocator.free(image);
-        expert_bank.fillPattern(image, 5);
+        @import("io_test.zig").fillPattern(image, 5);
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "p.bin", .data = image });
         var root: [512]u8 = undefined;
         var pbuf: [600]u8 = undefined;
@@ -89,7 +89,7 @@ const Rig = struct {
     /// The record's read (its gate/up read held `hold_ns`), gated by values 1 (gate/up) and 2 (down).
     fn submitGated(self: *Rig, pool: *expert_io.Pool, hold_ns: i64) !u32 {
         expert_io.injectFault(base / 16384 * 16384, 5, hold_ns);
-        const first = try expert_io.Records(n_components, expert_bank.gu_components).submit(pool, self.ufd, &.{base}, &.{base + gu_len}, &self.rows, &lens);
+        const first = try expert_io.Records(n_components, gu_components).submit(pool, self.ufd, &.{base}, &.{base + gu_len}, &self.rows, &lens);
         try pool.registerGates(&.{ 1, 2 }, &.{ 1, 1 }, &.{ first, first + 1 });
         return first;
     }

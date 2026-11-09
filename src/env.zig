@@ -156,6 +156,17 @@ pub fn setForeign(name: [*:0]const u8, value: [*:0]const u8) bool {
     return (if (is_windows) c._putenv_s(name, value) else c.setenv(name, value, 1)) == 0;
 }
 
+/// Unsets a variable `setForeign` set.
+pub fn unsetForeign(name: [*:0]const u8) void {
+    _ = if (is_windows) c._putenv_s(name, "") else c.unsetenv(name);
+}
+
+/// Whether `name` is one of `vars` (a plugin option may not reuse it).
+pub fn registered(name: []const u8) bool {
+    inline for (comptime std.meta.declarations(vars)) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
 pub fn unset(comptime name: @EnumLiteral()) void {
     _ = comptime info(name);
     _ = if (is_windows) c._putenv_s(@tagName(name), "") else c.unsetenv(@tagName(name));
@@ -307,7 +318,9 @@ pub const vars = struct {
     pub const MLX_SERVE_CUDA_QMV_TC: Var = .{ .kind = .kill, .type = .flag, .default = "on where measured (sm_120)", .owner = "sdk/blocks/qmm", .since = "26.10.3", .doc = "CUDA tensor-core 4-bit GEMV for 2..8 rows" };
     pub const MLX_SERVE_DSV41_ATTN_F16: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 f16 attention (=0: f32)" };
     pub const MLX_SERVE_DSV41_CED: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 CED prefill chunks (=0: full forward)" };
+    pub const MLX_SERVE_DSV41_ENGRAM_LRU_MB: Var = .{ .kind = .kill, .type = .text, .default = "256", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 Engram LRU's size in MiB: the rows kept across a conversation's turns and their index, 1 to 16384, billed at load beside the host's bytes" };
     pub const MLX_SERVE_DSV41_HEAD8: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "DeepSeek-V4.1 dense LM head requantized to 8-bit (=0: as shipped)" };
+    pub const MLX_SERVE_DSV41_FLASH_ATTN: Var = .{ .kind = .kill, .type = .text, .default = "on", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "DeepSeek-V4.1 wide prompt layers' attention spans on a streamed EXL3 bank: unset, empty or 1, each span as one flash kernel (keys in blocks of 128, an online softmax, the scores and probabilities never in memory), its heads into the run region; NOT exact (the probabilities round to f16 before the division); =1 refuses a wide span the kernel cannot take; 0: the exact gather" };
     pub const MLX_SERVE_F16_PREFILL: Var = .{ .kind = .kill, .type = .flag, .default = "off", .owner = "sdk/blocks", .since = "26.10.4", .doc = "bf16 prefill dequant+GEMM and sorted affine gather_qmm in fp16 (GPUs without fast bf16 math, e.g. M1)" };
     pub const MLX_SERVE_GDN_STATE_F32: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "engines/mlx", .since = "26.10.2", .doc = "f32 GDN recurrent state (=0: bf16)" };
     pub const MLX_SERVE_H3_RESIDENT: Var = .{ .kind = .kill, .type = .flag, .default = "on", .owner = "plugins/minimax_h3", .since = "26.10.2", .doc = "H3 DiT resident between requests" };
@@ -326,22 +339,11 @@ pub const vars = struct {
     pub const DISPATCH_PROBE: Var = .{ .kind = .diag, .type = .int, .default = "0", .owner = "engines/mlx/diag", .since = "26.7.12", .doc = "count the dispatches of N decode steps" };
     pub const DSPARK_PROFILE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark per-round profile" };
     pub const DSPARK_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark draft trace" };
-    pub const DSV41_KERNELS_RECEIPT: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel self-check: receipt path" };
-    pub const DSV41_KERNEL_DECODE2_RECEIPT: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel decode2 gate: per-output receipt path" };
-    pub const DSV41_KERNEL_DRAFT_RECEIPT: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel draft gate: per-output receipt path" };
-    pub const DSV41_KERNEL_OPS_RECEIPT: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel ops gate: per-output receipt path" };
-    pub const DSV41_KERNEL_PREFILL2_RECEIPT: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel prefill2 gate: per-output receipt path" };
-    pub const DSV41_KERNEL_PREFILL_RECEIPT: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel prefill gate: per-output receipt path" };
-    pub const DSV41_SELFCHECK_REPORT: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel self-check: log every result" };
     pub const DSV4_SKIP_MOE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.8.1", .doc = "set: DeepSeek-V4 decode skips the MoE (timing only, garbage output)" };
     pub const DSV4_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.8.1", .doc = "DeepSeek-V4 decode trace (exactly 1)" };
     pub const DUMP_RESTORE: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "engines/mlx/cache", .since = "26.9.3", .doc = "dir: dump restored prefix-cache state" };
     pub const FORCE_GPU_FAMILY_FALLBACK: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "mlx", .since = "26.7.10", .doc = "=1: report no NAX (the pre-NAX GPU-family fallback)" };
     pub const GDN_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/blocks/gdn", .since = "26.7.7", .doc = "GDN µbench: sequential kernel vs bare qmm at 27B shapes (attribution)" };
-    pub const GLM53_ROUTES: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "plugins/glm_moe_dsa/stream", .since = "26.10.3", .doc = "GLM-5.3 profile builds: write each request's decode routes under this dir" };
-    pub const GLM53_WAVE_PROBE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/glm_moe_dsa/stream", .since = "26.10.3", .doc = "GLM-5.3: log each prompt layer's MLX peak by stage" };
-    pub const GLM5_NEXT_PREFILL_TIMELINE: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "glm5_next profile builds: the prefill timeline" };
-    pub const GLM5_NEXT_ROUTE_TRACE: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "sdk/weights/streamed/glm5n", .since = "26.10.3", .doc = "glm5_next profile builds: route trace file prefix" };
     pub const GGUF_NAX_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "sdk/quant/gguf", .since = "26.11.2", .doc = "GGUF expert-bank ubenches at the DeepSeek-V4.1 Coder's shapes (prefill on the matrix units, decode gathers) against MLX's 2-bit affine" };
     pub const GQMM_UBENCH: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "sdk/blocks/moe", .since = "26.10.2", .doc = "gather-QMM NAX ubench (`sweep`: every tile config)" };
     pub const H3_SPLIT_SHARE: Var = .{ .kind = .diag, .type = .float, .default = "the calibrated cut", .owner = "plugins/minimax_h3", .since = "26.10.3", .doc = "H3 cluster: share of rows kept on this Mac (0..1)" };
@@ -349,9 +351,6 @@ pub const vars = struct {
     pub const LAGUNA_UBENCH: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/laguna", .since = "26.7.12", .doc = "Laguna-XS decode µbench: bf16 attention projections" };
     pub const LAYER_CAP: Var = .{ .kind = .diag, .type = .int, .default = "0 (all layers)", .owner = "engines/mlx/diag", .since = "26.7.12", .doc = "run only the first N layers (timing only, garbage output; DeepSeek-V4 too)" };
     pub const LTX_AUDIO_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/ltx", .since = "26.7.1", .doc = "LTX audio decoder shape trace on stderr" };
-    pub const MIMO_DIAG: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "mimo profile builds: stream source diagnostics (off | missfree)" };
-    pub const MIMO_PREFILL_TIMELINE: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "mimo profile builds: the prefill timeline" };
-    pub const MIMO_ROUTE_TRACE: Var = .{ .kind = .diag, .type = .text, .default = "off", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "mimo profile builds: route trace file prefix" };
     pub const MINIMAX_H3_ABLATE: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "plugins/minimax_h3", .since = "26.8.2", .doc = "H3 ablation arms" };
     pub const MLX_FAULT_CHUNK: Var = .{ .kind = .diag, .type = .int, .default = "0", .owner = "mlx", .since = "26.9.2", .doc = "inject a Metal OOM at the n-th prefill checkpoint" };
     pub const MLX_FAULT_KIND: Var = .{ .kind = .diag, .type = .text, .default = "the OOM", .owner = "mlx", .since = "26.10.3", .doc = "injected fault kind (`cuda_lost`)" };
@@ -449,24 +448,12 @@ pub const vars = struct {
     pub const DFLASH2_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/mlx/spec/dflash", .since = "26.8.10", .doc = "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab model_mlx" };
     pub const DFLASH_ASSISTANT_DIR: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/mlx/spec/dflash", .since = "26.8.5", .doc = "dflash fixture parity: encoder + two draft rounds vs transformers reference" };
     pub const DFLASH_FIXTURES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/mlx/spec/dflash", .since = "26.8.5", .doc = "dflash fixture parity: encoder + two draft rounds vs transformers reference" };
-    pub const DSV41_BANK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "26.10.2", .doc = "DeepSeek-V4.1 EXL3 streamed bank dir for the bank-mode tests" };
     pub const DSV41_BENCH_ATTN: Var = .{ .kind = .fixture, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 bench: one-token decode attention as a dependent chain (DSV41_BENCH_ATTN)" };
     pub const DSV41_BENCH_HC: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 bench: one hyper-connection stage as a dependent chain (DSV41_BENCH_HC = rows)" };
     pub const DSV41_BENCH_MOEK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 bench: one-token FFN as a dependent chain, composed vs kernels (DSV41_BENCH_MOEK)" };
     pub const DSV41_DEC_UBENCH: Var = .{ .kind = .fixture, .type = .flag, .default = "unset: the ubenches skip", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "dsv41 decode kernels: each kernel's ubench vs its byte floor and the chain it replaces" };
-    pub const DSV41_KERNELS_GPU: Var = .{ .kind = .fixture, .type = .flag, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel ops gate on the GPU" };
-    pub const DSV41_KERNEL_DECODE2_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel decode2 gate: the reference runtime's fixture dir" };
-    pub const DSV41_KERNEL_DRAFT_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel draft gate: the reference runtime's fixture dir" };
-    pub const DSV41_KERNEL_OPS_FAMILIES: Var = .{ .kind = .fixture, .type = .text, .default = "every family", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel ops gate: the families to replay" };
-    pub const DSV41_KERNEL_OPS_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel ops gate: the reference runtime's fixture dir" };
-    pub const DSV41_KERNEL_PREFILL2_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel prefill2 gate: the reference runtime's fixture dir" };
-    pub const DSV41_KERNEL_PREFILL_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 kernel prefill gate: the reference runtime's fixture dir" };
     pub const DSV41_GROUP: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.11.1", .doc = "dsv41 group: batched plain steps, verifies and drafts timed by states and rows (DSV41_GROUP)" };
     pub const DSV41_PHASE0B_MLX: Var = .{ .kind = .fixture, .type = .flag, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "26.10.2", .doc = "streamed-bank MLX device tests (a GPU-lock-held run)" };
-    pub const DSV41_PHASE0_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed/expert", .since = "26.10.2", .doc = "dsv41 oracle fixture from the reference runtime" };
-    pub const DSV41_PHASE1_ROUTE_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "26.10.2", .doc = "dsv41 oracle fixture from the reference runtime" };
-    pub const DSV41_PHASE2_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "26.10.2", .doc = "dsv41 oracle fixture from the reference runtime" };
-    pub const DSV41_PHASE4A_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed/expert", .since = "26.10.2", .doc = "dsv41 oracle fixture from the reference runtime" };
     pub const DSV41_PPL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.2", .doc = "dsv41 perplexity: non-overlapping windows of a token corpus through extend (DSV41_PPL)" };
     pub const DSV41_PPL_HEAD8: Var = .{ .kind = .fixture, .type = .flag, .default = "off", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 perplexity: non-overlapping windows of a token corpus through extend (DSV41_PPL)" };
     pub const DSV41_PPL_TEXT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.2", .doc = "dsv41 perplexity: non-overlapping windows of a token corpus through extend (DSV41_PPL)" };
@@ -474,7 +461,6 @@ pub const vars = struct {
     pub const DSV41_ROUND: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_ROUND)" };
     pub const DSV41_ROUND_OFFSET: Var = .{ .kind = .fixture, .type = .int, .default = "the test's own", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_ROUND)" };
     pub const DSV41_ROUND_TEXT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 DSpark round: draft, verify and finish timed apart, greedy (DSV41_ROUND)" };
-    pub const DSV41_SELFCHECK_DEVICE: Var = .{ .kind = .fixture, .type = .flag, .default = "unset: the test skips", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "dsv41 pre-ship gate: the kernels' self-check plan on the device" };
     pub const DSV41_STEP: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 decode step: serial one-token steps as the server pipelines them (DSV41_STEP)" };
     pub const DSV41_STEP_CTX: Var = .{ .kind = .fixture, .type = .int, .default = "the test's own", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 decode step: serial one-token steps as the server pipelines them (DSV41_STEP)" };
     pub const DSV41_TINY: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.2", .doc = "dsv41 fixture: prefill, chunked prefill, spans and decode match DeepSeek's reference (DSV41_TINY)" };
@@ -483,11 +469,6 @@ pub const vars = struct {
     pub const DSV41_VISION_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v41", .since = "26.10.3", .doc = "dsv41 vision: tower, aligner and span match the reference" };
     pub const DSV4_MINI: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "engines/mlx/spec", .since = "26.7.12", .doc = "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" };
     pub const DSV4_REAL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "dsv4: forwardPrefill on the REAL mirror continues 'The capital of France is' (DSV4_REAL)" };
-    pub const DUPES_OUT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "unreleased", .doc = "dupes oracle: the receipt path a pack run writes" };
-    pub const DUPES_PACK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "unreleased", .doc = "dupes oracle: the pack a run loads through the engine (resident or streamed)" };
-    pub const DUPES_PROMPT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "unreleased", .doc = "dupes oracle: a file of prompt ids (whitespace or commas)" };
-    pub const DUPES_RECEIPTS: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed", .since = "unreleased", .doc = "dupes oracle: two receipt paths, comma-separated, to compare" };
-    pub const DUPES_STEPS: Var = .{ .kind = .fixture, .type = .int, .default = "32", .owner = "sdk/weights/streamed", .since = "unreleased", .doc = "dupes oracle: greedy steps a pack run takes after the prompt" };
     pub const FLINT_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/flint", .since = "26.10.3", .doc = "flint fixture: one-shot and chunked prefill + decode vs rec_mlx's model (FLINT_MODEL, FLINT_FIXTURE)" };
     pub const FLINT_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/flint", .since = "26.10.3", .doc = "flint fixture: one-shot and chunked prefill + decode vs rec_mlx's model (FLINT_MODEL, FLINT_FIXTURE)" };
     pub const FLUX_DECODED: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/flux2", .since = "26.6.13", .doc = "flux VAE reproduces decoded image" };
@@ -502,8 +483,6 @@ pub const vars = struct {
     pub const FLUX_TXTIDS: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/flux2", .since = "26.6.13", .doc = "flux DiT reproduces noise_step0" };
     pub const GLB_FIXTURE_OUT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/mesh", .since = "26.7.2", .doc = "glb: write swift fixture" };
     pub const GLB_TEXTURED_FIXTURE_OUT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/mesh", .since = "26.7.2", .doc = "glb: write textured swift fixture" };
-    pub const GLM53_EXL3_BENCH: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/glm_moe_dsa/glm53_exl3", .since = "26.10.3", .doc = "glm53 EXL3 bench: the pack dir" };
-    pub const GLM53_EXL3_TINY_PACK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/glm_moe_dsa/glm53_exl3", .since = "26.10.3", .doc = "glm53 EXL3: write the tiny fixture's pack to this dir" };
     pub const GLM5_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/glm5_next", .since = "26.10.2", .doc = "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_next (GLM5_MODEL…" };
     pub const GLM5_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/glm5_next", .since = "26.10.2", .doc = "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_next (GLM5_MODEL…" };
     pub const GLM5_MTP_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/glm5_next", .since = "26.10.2", .doc = "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter, one-shot and row by row…" };
@@ -685,10 +664,6 @@ pub const vars = struct {
     pub const MAGEFLOW_VAE_ENC_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/mage_flow", .since = "26.7.11", .doc = "MageFlow VAE encode parity (env-gated)" };
     pub const MAGEFLOW_VAE_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/mage_flow", .since = "26.7.11", .doc = "MageFlow VAE decode parity (env-gated)" };
     pub const MAGEFLOW_VIT_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/mage_flow", .since = "26.7.11", .doc = "MageFlow ViT parity (env-gated)" };
-    pub const MIMO_Q4_BANK_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "mimo q4 bank: fixture path" };
-    pub const MIMO_Q4_SDK_STREAM_GPU: Var = .{ .kind = .fixture, .type = .flag, .default = "unset: the test skips", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "mimo device test: q4 sdk stream gpu" };
-    pub const MIMO_ROUTE_TRACE_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "a temp dir", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "mimo route trace policy fixture: output prefix" };
-    pub const MIMO_ROUTE_TRACE_FIXTURE_SPLIT: Var = .{ .kind = .fixture, .type = .text, .default = "a temp dir", .owner = "sdk/weights/streamed/mimo", .since = "26.10.3", .doc = "mimo route trace policy fixture: output prefix" };
     pub const MIMO_V2_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/mimo_v2", .since = "26.10.2", .doc = "mimo_v2 batched decode: a slot in a two-slot tick tracks the fp32 reference as well as serial…" };
     pub const MIMO_V2_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/mimo_v2", .since = "26.10.2", .doc = "mimo_v2 sliding ring: a chunked prefill past the kept rows, then decode, matches the full-buffer…" };
     pub const MIMO_V2_MTP_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/mimo_v2", .since = "26.10.2", .doc = "mimo mtp heads track the torch rendering of the MiMo-V2 MTP layer across rounds, drafts and…" };
@@ -791,7 +766,6 @@ pub const vars = struct {
     pub const SA3_TOK: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/stable_audio3", .since = "26.10.2", .doc = "sa3 oracle: prompt tokens, T5Gemma rows and conditioning match the reference" };
     pub const SA3_X: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/stable_audio3", .since = "26.10.2", .doc = "sa3 oracle: one DiT velocity, the seeded 8-step sample and the SAME-S decode match the reference" };
     pub const SINGLE_MTP_TEST_CONTEXT: Var = .{ .kind = .fixture, .type = .int, .default = "the test's own", .owner = "plugins/qwen4_exp", .since = "26.9.3", .doc = "single-stream verify optimizations preserve native outputs and captures (QWEN4_TEST_MODEL)" };
-    pub const SUSHI_EXL3_K3_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "src/sdk/quant/exl3/sushi/fixtures/exl3_k3_linear.safetensors", .owner = "sdk/quant/exl3/stream", .since = "26.10.2", .doc = "sushi K3 mul1 fixture for mlx-stream's EXL3 parity" };
     pub const TOKENIZER_PARITY_CASES: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "host/tokenizer", .since = "26.10.2", .doc = "tokenizer parity: encode() matches HF `tokenizers` ids (TOKENIZER_PARITY_MODEL)" };
     pub const TOKENIZER_PARITY_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "host/tokenizer", .since = "26.10.2", .doc = "tokenizer parity: encode() matches HF `tokenizers` ids (TOKENIZER_PARITY_MODEL)" };
     pub const TRELLIS2_DUMP: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/trellis2", .since = "26.10.3", .doc = "trellis2 end to end: an RGBA cutout becomes a textured GLB (TRELLIS2_PACK, TRELLIS2_IMAGE…" };

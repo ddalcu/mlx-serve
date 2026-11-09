@@ -145,9 +145,9 @@ YM="$(TZ=America/New_York date +%y.%-m)"
 # Nothing in CI reaches this: release.yml mirrors this script step by step and
 # runs its own `gh release list`.
 if [ "$FAST_DEV" = "1" ] || [ "$IDENTITY" = "-" ]; then
-    # Reuse whatever version the plist already carries. It is only read back by
-    # UpdateChecker, which has nothing to compare against on a dev build.
-    CALVER="$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$INFO_PLIST_SRC" 2>/dev/null || echo "${YM}.0")"
+    # The newest release tag behind HEAD (the plist's version without one): `mlx-serve --version` names the plugin
+    # kit the app downloads, so a source build must report the release its code is (scripts/dev-version.sh).
+    CALVER="$(bash "$PROJECT_ROOT/scripts/dev-version.sh" "$PROJECT_ROOT" "$INFO_PLIST_SRC" 2>/dev/null || echo "${YM}.0")"
 else
     # `gh` is the only thing that knows what has already been published, so its
     # failure is not defaultable. It used to end in `|| echo "0"`, which turns a

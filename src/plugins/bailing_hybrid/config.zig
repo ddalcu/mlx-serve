@@ -96,7 +96,7 @@ fn readLing(c: *Config, o: Objects) ParseError!void {
 
 /// Ling 3.0's `Parsed` facts beside the shell.
 fn lingFacts(c: *const Config, p: *abi.Parsed) void {
-    p.caps = .{ .moe = c.num_experts > 0, .dflash_capture = true };
+    p.caps = .{ .moe = c.num_experts > 0, .dflash_capture = true, .experts_stream = c.num_experts > 0 };
     p.chat.thinking_default = .on;
     p.cache.ssm_state = .{ .entries = c.num_hidden_layers, .dtype = .bf16 };
     p.weights.prefix = abi.Str.of(c.weight_prefix);
