@@ -837,8 +837,9 @@ loaded past the preflight, ~28 GB stayed free. Cause: the load read only free, f
 available, but macOS compresses or swaps ANY app's pages to make room for a wiring: 21 of 21 live loads with 12 to
 36 GB of app memory held succeeded at a base figure as low as 31.9 GB. Crediting half the idle pages was tried first
 and still refused loads that fit. Fix: the load preflight takes the RAM outside wired + compressor, less the OS
-reserve (`computeLoadAvailableBytes`), and the eviction planner (`loadRamRoom`) reads the same figure, so it no longer
-unloads an idle model the load fits beside; another resident model is wired, so a load beside it is still refused.
+reserve (`computeLoadAvailableBytes`). The eviction planner and the GPU ceiling read the same room (`getLoadRoomBytes`),
+so a small load no longer unloads an idle model it fits beside, nor is its request then refused; another resident
+model is wired, so a load beside it is still refused.
 Guard: `load preflight: a load macOS can make room for is admitted…`.
 
 ### A client that hung up during a cold prefill left the GPU prefilling for a ghost

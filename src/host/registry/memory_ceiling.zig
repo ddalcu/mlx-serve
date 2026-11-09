@@ -186,7 +186,7 @@ pub fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem
     return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        (metrics.getAvailableMemBytes() -| metrics.osReserveBytes(metrics.getTotalMemBytes(), mlx.weightsInDeviceMemory())) +| ane_bytes,
+        metrics.getLoadRoomBytes() +| ane_bytes,
         wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }

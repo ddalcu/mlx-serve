@@ -143,8 +143,8 @@ pub fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages:
 
 /// What a model LOAD can count on: the RAM outside wired and compressor memory, less the OS reserve. macOS
 /// compresses or swaps any app's pages to make room for a wiring, so only wired memory (another loaded
-/// model, the kernel) and the compressor's own pages bind. Only the load preflight uses it: the
-/// per-request gates keep `computeAvailableBytes`. 0 on a failed query.
+/// model, the kernel) and the compressor's own pages bind. Loads and the GPU ceiling read it on macOS
+/// (`getLoadRoomBytes`); the app's meter keeps `computeAvailableBytes`. 0 on a failed query.
 pub fn computeLoadAvailableBytes(total_mem: u64, wire_pages: u64, compressor_pages: u64, page: u64, reserve: u64) u64 {
     if (total_mem == 0) return 0;
     return (total_mem -| (wire_pages +| compressor_pages) *| page) -| reserve;
@@ -228,6 +228,14 @@ pub fn getLoadAvailableMemBytes() u64 {
     return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostLoadAvailableMemBytes());
 }
 
+/// RAM a new wiring or allocation can take beside everything resident: `getLoadAvailableMemBytes` less the
+/// OS reserve, which macOS's figure already leaves out.
+pub fn getLoadRoomBytes() u64 {
+    const avail = getLoadAvailableMemBytes();
+    if (comptime builtin.os.tag == .macos) return avail;
+    return avail -| osReserveBytes(getTotalMemBytes(), mlx.weightsInDeviceMemory());
+}
+
 /// The kernel's memory-pressure level: 1 normal, 2 warning, 4 critical; 0 where the OS has no such reading.
 pub fn memoryPressureLevel() u32 {
     if (comptime !builtin.os.tag.isDarwin()) return 0;
@@ -280,7 +288,7 @@ fn hostAvailableMemBytes() u64 {
 }
 
 fn hostLoadAvailableMemBytes() u64 {
-    if (comptime !builtin.os.tag.isDarwin()) return hostAvailableMemBytes();
+    if (comptime builtin.os.tag != .macos) return hostAvailableMemBytes();
     const v = darwinVm() orelse return 0;
     return computeLoadAvailableBytes(v.total, v.vm.wire_count, v.vm.compressor_page_count, v.page, osReserveBytes(v.total, false));
 }
