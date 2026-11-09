@@ -275,34 +275,29 @@ pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
 fn hostAvailableMemBytes() u64 {
     if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
-    var total_mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
-
-    var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
-
-    var vm = std.mem.zeroes(VmStats64);
-    var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
-
-    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.purgeable_count, vm.wire_count, vm.compressor_page_count, page);
+    const v = darwinVm() orelse return 0;
+    return computeAvailableBytes(v.total, v.vm.free_count, v.vm.speculative_count, v.vm.external_page_count, v.vm.purgeable_count, v.vm.wire_count, v.vm.compressor_page_count, v.page);
 }
 
 fn hostLoadAvailableMemBytes() u64 {
     if (comptime !builtin.os.tag.isDarwin()) return hostAvailableMemBytes();
+    const v = darwinVm() orelse return 0;
+    return computeLoadAvailableBytes(v.total, v.vm.wire_count, v.vm.compressor_page_count, v.page, osReserveBytes(v.total, false));
+}
+
+/// Total RAM, page size and the kernel's page counts; null on a failed query.
+fn darwinVm() ?struct { total: u64, page: u64, vm: VmStats64 } {
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return null;
 
     var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
+    if (host_page_size(mach_host_self(), &page) != 0) return null;
 
     var vm = std.mem.zeroes(VmStats64);
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
-
-    return computeLoadAvailableBytes(total_mem, vm.wire_count, vm.compressor_page_count, page, osReserveBytes(total_mem, false));
+    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return null;
+    return .{ .total = total_mem, .page = page, .vm = vm };
 }
 
 const MemoryStatusEx = extern struct {

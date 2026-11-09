@@ -1,6 +1,7 @@
 //! Load preflight: resident and on-disk bills, the eviction gate estimate, available memory.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const mlx = @import("../../../mlx/ffi.zig");
 const ple_gpu = @import("../../../plugins/qwen4_exp/ple_gpu.zig");
 const gen_mod = @import("../../../host/media_jobs/gen.zig");
@@ -217,13 +218,15 @@ fn loadAvail(_: std.Io) u64 {
     return effectiveAvailableBytes(status.getLoadAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
 }
 
-/// RAM a load can still take beside everything resident: what the OS grants less the reserve it
-/// keeps (iOS's per-process headroom already is what the process may take). Null when unreadable.
+/// RAM a load can still take beside everything resident: the preflight's figure less the reserve the OS
+/// keeps, which macOS's figure already leaves out (iOS's per-process headroom already is what the process
+/// may take). Null when unreadable.
 pub fn loadRamRoom() ?u64 {
     const proc = status.getProcAvailableMemBytes();
     if (proc > 0) return proc;
-    const host = status.getAvailableMemBytes();
+    const host = status.getLoadAvailableMemBytes();
     if (host == 0) return null;
+    if (comptime builtin.os.tag.isDarwin()) return host;
     return host -| status.osReserveBytes(status.getTotalMemBytes(), mlx.weightsInDeviceMemory());
 }
 
