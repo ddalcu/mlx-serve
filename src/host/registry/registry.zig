@@ -732,7 +732,8 @@ pub const ModelRegistry = struct {
         const base = std.fs.path.basename(trimmed);
         if (base.len == 0) return error.InvalidModelPath;
         const stem = if (std.mem.endsWith(u8, base, ".gguf") and base.len > ".gguf".len) base[0 .. base.len - ".gguf".len] else base;
-        const reg_id = id orelse stem;
+        var hub_buf: [256]u8 = undefined;
+        const reg_id = id orelse hubCacheRepoId(&hub_buf, trimmed) orelse stem;
 
         // Fast path: already registered (discovered, --model, or a previous
         // register-by-path). No filesystem touch.
@@ -1460,6 +1461,26 @@ fn makeReadyStub(reg: *ModelRegistry, id: []const u8, bytes: u64) !*LoadedModel 
     return stub;
 }
 
+/// `<org>/<repo>` for a Hugging Face hub-cache snapshot (`…/models--<org>--<repo>/snapshots/<40-hex commit>`), else
+/// null: the folder's own name there is the commit, which `/v1/models` would list as the model's id.
+fn hubCacheRepoId(buf: []u8, path: []const u8) ?[]const u8 {
+    const commit = std.fs.path.basename(path);
+    if (commit.len != 40) return null;
+    for (commit) |c| if (!std.ascii.isHex(c)) return null;
+    const snapshots = std.fs.path.dirname(path) orelse return null;
+    if (!std.mem.eql(u8, std.fs.path.basename(snapshots), "snapshots")) return null;
+    const repo_dir = std.fs.path.basename(std.fs.path.dirname(snapshots) orelse return null);
+    const prefix = "models--";
+    if (!std.mem.startsWith(u8, repo_dir, prefix) or repo_dir.len == prefix.len) return null;
+    const name = repo_dir[prefix.len..];
+    if (name.len > buf.len) return null;
+    @memcpy(buf[0..name.len], name);
+    const sep = std.mem.indexOf(u8, name, "--") orelse return buf[0..name.len];
+    buf[sep] = '/';
+    @memmove(buf[sep + 1 .. name.len - 1], name[sep + 2 ..]);
+    return buf[0 .. name.len - 1];
+}
+
 test "ModelRegistry: init/deinit empty" {
     var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
     defer reg.deinit();
@@ -1633,6 +1654,30 @@ test "ModelRegistry: registerByPath takes a .gguf file, named by its stem as --m
     const sidecar = try std.fmt.allocPrint(testing.allocator, "{s}/repo/IQ3_S/mmproj-F16.gguf", .{root});
     defer testing.allocator.free(sidecar);
     try testing.expectError(error.UnsupportedArch, reg.registerByPath(io, sidecar, null));
+}
+
+test "ModelRegistry: a Hugging Face hub-cache snapshot registers under its repo id, not its commit" {
+    // Bar: `/v1/models` names the repo; the snapshot folder's name is a commit hash no client can read.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const snap = "hub/models--OpensourceWTF--Next-EXL3/snapshots/ed79daeb7c1adab095e5079c4552ae678398eb8f";
+    try tmp.dir.createDirPath(io, snap);
+    try tmp.dir.writeFile(io, .{ .sub_path = snap ++ "/config.json", .data = "{\"model_type\":\"llama\"}" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}/", .{ root, snap });
+    defer testing.allocator.free(path);
+    try testing.expectEqualStrings("OpensourceWTF/Next-EXL3", try reg.registerByPath(io, path, null));
+
+    var id_buf: [256]u8 = undefined;
+    // No org; a folder that is not a commit, or not under `snapshots`, keeps its own name.
+    try testing.expectEqualStrings("gpt2", hubCacheRepoId(&id_buf, "/c/hub/models--gpt2/snapshots/ed79daeb7c1adab095e5079c4552ae678398eb8f").?);
+    try testing.expect(hubCacheRepoId(&id_buf, "/c/hub/models--a--b/snapshots/main") == null);
+    try testing.expect(hubCacheRepoId(&id_buf, "/m/models--a--b/ed79daeb7c1adab095e5079c4552ae678398eb8f") == null);
+    try testing.expect(hubCacheRepoId(&id_buf, "/m/a/snapshots/ed79daeb7c1adab095e5079c4552ae678398eb8f") == null);
 }
 
 test "LoadedModel: a reload frees the CPU state the previous load left behind" {
