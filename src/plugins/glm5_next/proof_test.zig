@@ -252,7 +252,7 @@ test "glm5_next plugin: prefill, decode, verify and later chunks equal the legac
 }
 
 test "bailing_hybrid plugin: prefill, decode, verify and later chunks equal the legacy forward bit for bit" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin(ling).open(try fixture.lingFiles(arena.allocator(), 11), "bailing_hybrid/fixtures/steps.tape");
@@ -275,7 +275,7 @@ test "glm5_next plugin: batched rows equal the legacy batched decode bit for bit
 // Bar: a Sushi pack (EXL3 routed experts through `sdk/quant/exl3/format.zig`) runs as the legacy forward runs it,
 // per slot and batched.
 test "glm5_next plugin: a Sushi pack's EXL3 experts equal the legacy forward bit for bit" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -352,7 +352,7 @@ const HeadCache = struct {
 // Bar: the head behind `SpecHooks.head` gives the legacy `mtp.0` head's normed output and cache rows bit for bit over
 // history rows, chained drafts and a rollback.
 test "glm5_next plugin: the MTP head equals the legacy head" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/head.tape");
@@ -420,7 +420,7 @@ fn plainStep(t: *Twin(glm), s: *Slot, ids: []const u32, media: Array, offset: us
 // Bar: image rows the engine hands the plugin (`Forward.media`) splice at the placeholders as the legacy forward
 // splices `vision_embeddings`, across two prompt chunks (the second resuming at its row offset), then decode.
 test "glm5_next plugin: media rows splice as the legacy forward splices them" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const t = try Twin(glm).open(try fixture.glmFiles(arena.allocator(), 7), "glm5_next/fixtures/media.tape");

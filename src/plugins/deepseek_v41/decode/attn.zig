@@ -313,7 +313,7 @@ fn mergeToday(sc: *Scope, m: *const dsv41.Dsv41Model, p: Partials, sink: A, p0: 
 }
 
 test "dsv41 dec attn: matches today's split and merge" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
@@ -402,7 +402,7 @@ fn ringWith(sc: *Scope, buf: A, new_rows: A, p0: usize) !A {
 }
 
 test "dsv41 dec attn: rows 1, 2, 4, 6 on the fixture equal today's split and merge, no further from truth" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const Case = struct { lo: usize, hi: usize, ctx: usize };
     for ([_]Case{ .{ .lo = 20, .hi = 25, .ctx = 300 }, .{ .lo = 20, .hi = 25, .ctx = 4200 }, .{ .lo = 0, .hi = 1, .ctx = 300 }, .{ .lo = 0, .hi = 1, .ctx = 4200 } }) |c| {
@@ -459,7 +459,7 @@ test "dsv41 dec attn: rows 1, 2, 4, 6 on the fixture equal today's split and mer
 }
 
 test "dsv41 dec attn: the declared launch is the wrapper's, byte for byte" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !device.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     var m = try todayModel();
     defer freeTodayModel(&m);

@@ -739,7 +739,7 @@ fn integerLin(sc: *dsv41.Scope, rng: std.Random, n: usize) !dsv41.Lin {
 const test_groups = [_]usize{ 0, 7, 19 };
 
 test "dsv41 dec wq_b: bit-equal to the chain where every sum is exact (small integers), 1..6 rows, with and without the indexer" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const fx = try fixture.Fixture.init(testing.allocator, .{ .lo = 20, .hi = 21, .experts = 2, .ctx = 0 });
     defer fx.deinit();
     var sc = dsv41.Scope.init(testing.allocator, mlx.gpuStream());
@@ -822,7 +822,7 @@ fn noWorse(label: []const u8, got: A, ch: A, tr: A) !void {
 }
 
 test "dsv41 dec wq_b: no further from f32 truth than the chain on the fixture's layers, 1, 2, 4 and 6 rows; kv row and split equal" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const kern = try build();
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
     for ([_][2]usize{ .{ 20, 25 }, .{ 2, 4 } }) |range| {
@@ -860,7 +860,7 @@ test "dsv41 dec wq_b: no further from f32 truth than the chain on the fixture's 
 }
 
 test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and without the indexer; it registers" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     var set = kc.Set.init(testing.allocator);
     defer set.deinit();
     try register(&set);
@@ -899,7 +899,7 @@ test "dsv41 dec wq_b: the declared launch is the wrapper's dispatch, with and wi
 }
 
 test "dsv41 dec wq_b: gates 1-4 of the kernel contract hold for the registration" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     var set = kc.Set.init(testing.allocator);
     defer set.deinit();
     try register(&set);
@@ -939,7 +939,7 @@ fn splitTime(b: *Bench, kern: mlx.mlx_fast_metal_kernel, g: usize, rows: usize, 
 }
 
 test "dsv41 dec wq_b: ubench" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const b = try Bench.init(49);
     defer b.deinit();
     const kern = try build();

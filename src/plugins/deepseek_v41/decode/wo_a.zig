@@ -522,7 +522,7 @@ fn truth(a: std.mem.Allocator, parts: Parts, sink: []const f32, periods: []const
 }
 
 test "dsv41 dec wo_a: 1 to 6 rows are no further from the float64 truth than today's merge + wo_a chain" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const fx = try fixture.Fixture.init(gpa, .{ .ctx = 0 });
     defer fx.deinit();
@@ -592,7 +592,7 @@ test "dsv41 dec wo_a: shapes the kernel was not built for are declined" {
 }
 
 test "dsv41 dec wo_a: the declared launches are the wrapper's, byte for byte" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
     const kern = try build();
     defer _ = mlx.mlx_fast_metal_kernel_free(kern);
@@ -678,7 +678,7 @@ fn evalUs(ctx: anytype, n: usize) !f64 {
 }
 
 test "dsv41 dec wo_a: ubench" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const G = 8;
     const H = 64;

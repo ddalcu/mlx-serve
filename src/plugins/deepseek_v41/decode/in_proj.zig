@@ -1096,7 +1096,7 @@ fn layerBytes(p: Plan) usize {
 }
 
 test "dsv41 dec in_proj: ubench against its byte floor and the chain it replaces (DSV41_DEC_UBENCH)" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const k = try Kernels.build();
     defer k.deinit();

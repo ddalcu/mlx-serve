@@ -706,7 +706,7 @@ fn pickDiffs(gpa: std.mem.Allocator, x: []const f32, y: []const f32, mag: []cons
 }
 
 test "dsv41 dec idx_score: the scores equal today's within f32 reassociation, full and gathered, R = 1..6" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !nax.naxAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !nax.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const fx = try fixture.Fixture.init(testing.allocator, .{ .ctx = 1030 });
     defer fx.deinit();
     var k = try build();
@@ -848,7 +848,7 @@ test "dsv41 dec idx_score: the declared launches are the shipped wrappers', byte
 }
 
 test "dsv41 dec idx_score: the registered kernels pass the contract's gates 1-4" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var set = kc.Set.init(testing.allocator);
     defer set.deinit();
     try register(&set);
@@ -1150,7 +1150,7 @@ fn evalUsRewound(gpa: std.mem.Allocator, s: mlx.mlx_stream, b: PoolBench, ls: *d
 }
 
 test "dsv41 dec idx_score: ubench" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !nax.naxAvailable()) return error.SkipZigTest;
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or !nax.naxAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var twins = try Twins.init();
     defer twins.deinit();

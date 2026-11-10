@@ -486,6 +486,7 @@ fn equivalence(lo: usize, hi: usize, li: usize, bits: u32, affine: ?u32) !void {
 }
 
 test "dsv41 dec moe_up: 2-bit routed experts, rows 1 2 4 6, against today's path and f32 truth" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try equivalence(20, 25, 20, 2, null);
 }
 
@@ -520,7 +521,7 @@ test "dsv41 dec moe_up: the declared launch is the wrapper's, byte for byte" {
 }
 
 test "dsv41 dec moe_up: formats and shapes it does not serve are declined" {
-    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     const fx = try fixture.Fixture.init(gpa, .{ .lo = 20, .hi = 21, .experts = 16, .ctx = 0 });
     defer fx.deinit();
@@ -837,7 +838,7 @@ fn firstCallMs(ctx: anytype) !f64 {
 }
 
 test "dsv41 dec moe_up: ubench, R = 1 and 6 against today's chain (DSV41_DEC_UBENCH)" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = testing.allocator;
     for ([_]u32{ 2, 3 }) |bits| for ([_][2]usize{ .{ 1, 0 }, .{ 6, 0 }, .{ 6, 1 } }) |case| {
         const rows = case[0];

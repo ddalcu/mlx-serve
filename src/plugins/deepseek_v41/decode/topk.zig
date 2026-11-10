@@ -1044,7 +1044,7 @@ fn sceneOn(label: []const u8) bool {
 }
 
 test "dsv41 dec topk: ubench" {
-    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     mlx.installErrorHandler();
     const gpa = testing.allocator;
     var ks = try Kernels.build();
