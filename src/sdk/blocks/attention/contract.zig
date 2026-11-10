@@ -1756,7 +1756,7 @@ const lane_registrations = .{
 
 // ── packed-KV attention (kv-quant 4 / 8): decode, verify widths, the matmul2d page kernel ──
 
-const QkvKind = enum { dec, verify, mpp };
+const QkvKind = enum { dec, mma, verify, mpp };
 
 /// One instantiation: the cache's bits and group, q/k head width, query heads per kv head; `mask` binds the
 /// additive mask row (decode only).
@@ -1788,6 +1788,18 @@ fn qkvLaunch(comptime kind: QkvKind, comptime tg: u32, comptime m: u32, comptime
             .inputs = &.{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk", "msk" },
             .outputs = &.{ "m_out", "l_out", "o_out" },
             .source = kvq.QKV_DEC_KERNEL_SOURCE,
+            .contiguous = false,
+            .tg_bytes = tg,
+            .m1 = m,
+            .m2 = m,
+            .caps = caps,
+        },
+        .mma => .{
+            .name = "qkv_attn_dec_mma",
+            .inputs = &.{ "q", "kq", "ksc", "kbi", "vq", "vsc", "vbi", "scl", "tk", "msk" },
+            .outputs = &.{ "m_out", "l_out", "o_out" },
+            .source = kvq.QKV_DEC_MMA_KERNEL_SOURCE,
+            .header = "#include <metal_simdgroup_matrix>\n",
             .contiguous = false,
             .tg_bytes = tg,
             .m1 = m,
@@ -1872,6 +1884,10 @@ const Qkv = struct {
                 const b = qkvDecBlock(c.gqa, c.dk) orelse return null;
                 return .{ shape.rows * c.gqa, (tk + b - 1) / b };
             },
+            .mma => {
+                if (tq != 1 or !kvq.qkvDecMmaFits(cInt(c.gqa), cInt(c.dk), cInt(c.dk), cInt(c.gs))) return null;
+                return .{ shape.rows * c.gqa, @intCast(kvq.qkvDecMmaSplits(cInt(tk))) };
+            },
             .verify => {
                 if (tq < 2 or c.gqa * tq > QKV_NT) return null;
                 const b = qkvVerifyBlock(c.gqa * tq) orelse return null;
@@ -1887,6 +1903,11 @@ const Qkv = struct {
     fn block(self: *const Qkv, tq: usize) usize {
         return switch (self.cfg.kind) {
             .dec => qkvDecBlock(self.cfg.gqa, self.cfg.dk).?,
+            // A split is its 4 simdgroups' contiguous spans of whole 8-row tiles.
+            .mma => blk: {
+                const ns: usize = @intCast(kvq.qkvDecMmaSplits(cInt(self.shape.k)));
+                break :blk 4 * (((self.shape.k + ns * 4 - 1) / (ns * 4) + 7) / 8 * 8);
+            },
             .verify => qkvVerifyBlock(self.cfg.gqa * tq).?,
             .mpp => MPP_PAGE,
         };
@@ -1921,6 +1942,7 @@ const Qkv = struct {
                 g.int("BLOCK", self.block(1));
                 g.int("HAS_MASK", @intFromBool(c.mask));
             },
+            .mma => g.int("HAS_MASK", @intFromBool(c.mask)),
             .verify => {
                 g.int("TQ", shape.n);
                 g.int("BLOCK", self.block(shape.n));
@@ -2024,11 +2046,11 @@ const Qkv = struct {
         }
         self.args[7] = try rig.input(.float32, &.{1}, &.{self.scale});
         self.args[8] = try rig.input(.int32, &.{1}, &.{@floatFromInt(self.shape.k)});
-        if (c.kind == .dec) self.args[9] = if (c.mask) try rig.input(c.dt, &.{ 1, 1, 1, tk }, self.mask) else try rig.input(.float32, &.{1}, &.{0});
+        if (c.kind == .dec or c.kind == .mma) self.args[9] = if (c.mask) try rig.input(c.dt, &.{ 1, 1, 1, tk }, self.mask) else try rig.input(.float32, &.{1}, &.{0});
     }
 
     pub fn run(self: *Qkv) !void {
-        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..if (self.cfg.kind == .dec) 10 else 9]);
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..if (self.cfg.kind == .dec or self.cfg.kind == .mma) 10 else 9]);
     }
 
     pub fn count(self: *const Qkv) usize {
@@ -2103,15 +2125,15 @@ const Qkv = struct {
             for (qs, qrow) |*x, y| x.* = host.rt(.float32, y * self.scale);
             const t0 = b * blk;
             var n: usize = 0;
-            for (t0..@min(t0 + blk, tk)) |pos| {
+            for (@min(t0, tk)..@min(t0 + blk, tk)) |pos| {
                 const v = kr(self.kv[1], self.cap, d, hk, pos);
                 const ve = kr(self.ke[1], self.cap, d, hk, pos);
                 // Decode stages q * scale in f32 and sums against it; verify sums q, then scales.
-                const x = if (c.kind == .dec)
+                const x = if (c.kind == .dec or c.kind == .mma)
                     dotErr(qs, kr(self.kv[0], self.cap, d, hk, pos), kr(self.ke[0], self.cap, d, hk, pos), 1, d, 0, sim, terms)
                 else
                     dotErr(qrow, kr(self.kv[0], self.cap, d, hk, pos), kr(self.ke[0], self.cap, d, hk, pos), self.scale, d, 1, sim, terms);
-                const madd = if (c.kind == .dec and c.mask) self.mask[pos] else 0;
+                const madd = if ((c.kind == .dec or c.kind == .mma) and c.mask) self.mask[pos] else 0;
                 const vis = if (c.kind == .verify) pos < tk - tq + 1 + t else madd != -inf;
                 keys[n] = if (vis) .{ .s = x.v + madd, .e = x.e + host.U * @abs(x.v + madd), .v = v, .ve = ve } else .{ .s = -inf, .on = false, .v = v };
                 n += 1;
@@ -2157,7 +2179,7 @@ const Qkv = struct {
             l = try g.reshape(try g.slice(try g.transpose(l, &.{ 0, 2, 1 }), &.{ 0, 0, 0 }, &.{ hkv, mr, ns }), &.{ hkv * mr, ns });
             o = try g.reshape(try g.slice(try g.transpose(o, &.{ 0, 2, 1, 3 }), &.{ 0, 0, 0, 0 }, &.{ hkv, mr, ns, d }), &.{ hkv * mr, ns, d });
         }
-        const out = try g.adopt(try kvq.qkvMergeArrays(st, m, l, o, c.dt));
+        const out = try g.adopt(if (c.kind == .mma) try kvq.qkvMergeFused(st, m, l, o, c.dt) else try kvq.qkvMergeArrays(st, m, l, o, c.dt));
         return self.rig.bytesOf(&.{try g.reshape(out, &.{ 1, hq, tq, d })});
     }
 
@@ -2166,9 +2188,11 @@ const Qkv = struct {
         const vw = self.view();
         kvq.qkv_ver_override = true;
         defer kvq.qkv_ver_override = null;
+        kvq.qkv_dec_mma_override = c.kind == .mma;
+        defer kvq.qkv_dec_mma_override = null;
         const st = self.rig.stream();
         const got = switch (c.kind) {
-            .dec => try kvq.qkvAttnDecodeKernel(st, self.args[0], &vw, @floatCast(self.scale), if (c.mask) "array" else "", if (c.mask) self.args[9] else .{ .ctx = null }),
+            .dec, .mma => try kvq.qkvAttnDecodeKernel(st, self.args[0], &vw, @floatCast(self.scale), if (c.mask) "array" else "", if (c.mask) self.args[9] else .{ .ctx = null }),
             .verify => try kvq.qkvAttnVerifyKernel(st, self.args[0], &vw, @floatCast(self.scale), "causal"),
             .mpp => blk: {
                 // The wrapper pads q itself: hand it the [1, Hq, TQ, D] rows.
@@ -2196,6 +2220,7 @@ fn putQkv(want: []f64, mag: ?[]f64, rows: usize, d: usize, at: usize, st: Row, o
 fn qkvTg(comptime c: QkvCfg, comptime tq: usize) u32 {
     return switch (c.kind) {
         .dec => c.gqa * c.dk * 4 + c.gqa * qkvDecBlock(c.gqa, c.dk).? * 4 + QKV_NT * 4 + 8 * c.gqa,
+        .mma => @intCast(kvq.qkvDecMmaTgBytes(cInt(c.gqa), cInt(c.dk), cInt(c.dk))),
         .verify => c.gqa * tq * qkvVerifyBlock(c.gqa * tq).? * 4 + QKV_NT * 4 + 8 * c.gqa * tq,
         // tile [32 * D] T, scores and probs [MPAD * 32] f32, rmax / rsum / pscale [MPAD] f32.
         .mpp => MPP_PAGE * c.dk * 2 + 2 * ((c.gqa * tq + 7) / 8 * 8) * MPP_PAGE * 4 + 3 * ((c.gqa * tq + 7) / 8 * 8) * 4,
@@ -2211,13 +2236,17 @@ fn qkvSpec(comptime name: []const u8, cfg: QkvCfg, served: []const Shape) spec.S
         .tiles = .{ .{}, .{}, .{ .size = if (cfg.kind == .mpp) MPP_PAGE else 128, .min = 16 } },
         .served = served,
         // Decode stages q x 1/sqrt(DK) in f32 before its sums: off a power of two (DK 128) no input makes them exact.
-        .sums = if (cfg.kind == .dec and cfg.dk == 128) .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "q is staged as q / sqrt(128) in f32, so no input makes its sums exact in f32" } else .{ .exact = false },
+        .sums = if ((cfg.kind == .dec or cfg.kind == .mma) and cfg.dk == 128) .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "q is staged as q / sqrt(128) in f32, so no input makes its sums exact in f32" } else .{ .exact = false },
     };
 }
 
 const qkv_dec_4_256 = QkvCfg{ .kind = .dec, .bits = 4, .dk = 256, .gqa = 6 };
 const qkv_dec_8_256 = QkvCfg{ .kind = .dec, .bits = 8, .dk = 256, .gqa = 6 };
 const qkv_dec_8_128m = QkvCfg{ .kind = .dec, .bits = 8, .dk = 128, .gqa = 4, .mask = true };
+const qkv_mma_4_256 = QkvCfg{ .kind = .mma, .bits = 4, .dk = 256, .gqa = 6 };
+const qkv_mma_8_256 = QkvCfg{ .kind = .mma, .bits = 8, .dk = 256, .gqa = 12 };
+const qkv_mma_4_128 = QkvCfg{ .kind = .mma, .bits = 4, .dk = 128, .gqa = 10 };
+const qkv_mma_8_128m = QkvCfg{ .kind = .mma, .bits = 8, .dk = 128, .gqa = 4, .mask = true };
 const qkv_ver_4_256 = QkvCfg{ .kind = .verify, .bits = 4, .dk = 256, .gqa = 6 };
 const qkv_ver_8_256 = QkvCfg{ .kind = .verify, .bits = 8, .dk = 256, .gqa = 6 };
 const qkv_ver_8_128 = QkvCfg{ .kind = .verify, .bits = 8, .dk = 128, .gqa = 4 };
@@ -2227,6 +2256,10 @@ const qkv_mpp_4 = QkvCfg{ .kind = .mpp, .bits = 4, .dk = 256, .gqa = 6 };
 const qkv_dec_4_256_l = qkvLaunch(.dec, qkvTg(qkv_dec_4_256, 1), 1024, &.{});
 const qkv_dec_8_256_l = qkvLaunch(.dec, qkvTg(qkv_dec_8_256, 1), 1024, &.{});
 const qkv_dec_8_128m_l = qkvLaunch(.dec, qkvTg(qkv_dec_8_128m, 1), 1024, &.{});
+const qkv_mma_4_256_l = qkvLaunch(.mma, qkvTg(qkv_mma_4_256, 1), QKV_NT, &.{});
+const qkv_mma_8_256_l = qkvLaunch(.mma, qkvTg(qkv_mma_8_256, 1), QKV_NT, &.{});
+const qkv_mma_4_128_l = qkvLaunch(.mma, qkvTg(qkv_mma_4_128, 1), QKV_NT, &.{});
+const qkv_mma_8_128m_l = qkvLaunch(.mma, qkvTg(qkv_mma_8_128m, 1), QKV_NT, &.{});
 const qkv_ver_4_256_l = qkvLaunch(.verify, qkvTg(qkv_ver_4_256, 2), 576, &.{});
 const qkv_ver_8_256_l = qkvLaunch(.verify, qkvTg(qkv_ver_8_256, 2), 640, &.{});
 const qkv_ver_128_l = qkvLaunch(.verify, qkvTg(qkv_ver_8_128, 3), 640, &.{.{ .n = 2, .m1 = 832, .m2 = 832 }});
@@ -2240,6 +2273,10 @@ const qkv_registrations = .{
     .{ "qkv_attn_dec bf16 (4-bit, DK 256, GQA 6)", qkv_dec_4_256, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 1000 } }), &qkv_dec_4_256_l },
     .{ "qkv_attn_dec bf16 (8-bit, DK 256, GQA 6)", qkv_dec_8_256, qk(&.{ .{ 1, 1, 300 }, .{ 1, 1, 700 } }), &qkv_dec_8_256_l },
     .{ "qkv_attn_dec bf16 (8-bit, DK 128, GQA 4, mask row)", qkv_dec_8_128m, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 600 } }), &qkv_dec_8_128m_l },
+    .{ "qkv_attn_dec_mma bf16 (4-bit, DK 256, GQA 6)", qkv_mma_4_256, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 2100 } }), &qkv_mma_4_256_l },
+    .{ "qkv_attn_dec_mma bf16 (8-bit, DK 256, GQA 12)", qkv_mma_8_256, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 1000 } }), &qkv_mma_8_256_l },
+    .{ "qkv_attn_dec_mma bf16 (4-bit, DK 128, GQA 10)", qkv_mma_4_128, qk(&.{ .{ 1, 1, 37 }, .{ 2, 1, 3000 } }), &qkv_mma_4_128_l },
+    .{ "qkv_attn_dec_mma bf16 (8-bit, DK 128, GQA 4, mask row)", qkv_mma_8_128m, qk(&.{ .{ 1, 1, 300 }, .{ 2, 1, 600 } }), &qkv_mma_8_128m_l },
     .{ "qkv_attn_verify bf16 (4-bit, DK 256, GQA 6)", qkv_ver_4_256, qk(&.{ .{ 1, 2, 300 }, .{ 1, 2, 900 } }), &qkv_ver_4_256_l },
     .{ "qkv_attn_verify bf16 (8-bit, DK 256, GQA 6)", qkv_ver_8_256, qk(&.{ .{ 1, 2, 300 }, .{ 1, 2, 700 } }), &qkv_ver_8_256_l },
     .{ "qkv_attn_verify bf16 (8-bit, DK 128, GQA 4)", qkv_ver_8_128, qk(&.{ .{ 1, 3, 300 }, .{ 1, 2, 500 } }), &qkv_ver_128_l },
