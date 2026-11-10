@@ -166,7 +166,8 @@ pub fn flushOwedDiskSlices(sch: *Scheduler) prefix_cache_mod.FlushResult {
     for (owed[0..diskCaches(sch, &owed, true)]) |o| {
         const slice = if (admitModuleStaging(sch, o.hc)) o.hc.flushOwedSlice(o.s) else .busy;
         if (slice == .progress) result = .progress;
-        if (slice == .busy and result == .done) result = .busy;
+        if (slice == .busy and result != .progress) result = .busy;
+        if (slice == .quiet and result == .done) result = .quiet;
     }
     return result;
 }

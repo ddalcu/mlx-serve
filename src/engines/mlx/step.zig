@@ -35,9 +35,9 @@ const hasWorkPendingLocked = @import("runtime/loop.zig").hasWorkPendingLocked;
 const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
 
 /// Caller holds queue_mu. Recheck arrivals under the lock before the short, wakeable retry wait.
-fn waitForDiskRetryLocked(sch: *Scheduler) void {
+fn waitForDiskRetryLocked(sch: *Scheduler, ms: u32) void {
     if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) return;
-    sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .boot } }) catch {};
+    sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, .{ .duration = .{ .raw = .fromMilliseconds(ms), .clock = .boot } }) catch {};
 }
 
 const ChatPassMode = enum { main, yield };
@@ -139,7 +139,9 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                     const flushed = flushOwedDiskSlices(sch);
                     sch.queue_mu.lockUncancelable(sch.io);
                     disk_owed = flushed != .done;
-                    if (flushed == .busy) waitForDiskRetryLocked(sch);
+                    if (flushed == .busy) waitForDiskRetryLocked(sch, 10);
+                    // A tip inside its quiet period is written later: look again once a second, or at the next request.
+                    if (flushed == .quiet) waitForDiskRetryLocked(sch, 1000);
                     continue;
                 }
                 // No later tick runs while parked, so release here.
@@ -484,8 +486,8 @@ test "a busy disk retry parks until its bounded timeout or pending work" {
     sch.queue_mu.lockUncancelable(sch.io);
     defer sch.queue_mu.unlock(sch.io);
     const before = io_util.Stopwatch.init(sch.io);
-    waitForDiskRetryLocked(&sch);
+    waitForDiskRetryLocked(&sch, 10);
     try testing.expect(before.read() >= 5 * std.time.ns_per_ms);
     sch.shutdown.store(true, .release);
-    waitForDiskRetryLocked(&sch);
+    waitForDiskRetryLocked(&sch, 10);
 }

@@ -475,7 +475,7 @@ pub const DiskTier = struct {
 
     pub const ModuleSlice = enum { progress, busy, done };
     pub const ModuleCandidate = struct { id: u64, n: u32, prefix_key: u64 };
-    pub const ModuleCancellation = enum { memory_pressure, unload, invalidation, shutdown_expiry, holder_exhaustion };
+    pub const ModuleCancellation = enum { memory_pressure, unload, invalidation, shutdown_expiry, holder_exhaustion, superseded };
     const PendingModuleFile = struct { id: u64, path: []u8, bytes: []u8, meta: bool };
 
     /// Create the tier rooted at `<base>/<fingerprint>` and scan whatever
@@ -755,8 +755,9 @@ pub const DiskTier = struct {
     }
 
     pub fn cancelModule(self: *DiskTier, id: u64, reason: ModuleCancellation) void {
-        _ = reason;
         const idx = self.moduleIndex(id) orelse return;
+        // A newer state of the same conversation takes its place: nothing a restart could use is lost.
+        if (reason == .superseded) self.entries.items[idx].module.?.loss_counted = true;
         self.retireModuleEntry(&self.entries.items[idx], .cancelled, "module export cancelled");
     }
 

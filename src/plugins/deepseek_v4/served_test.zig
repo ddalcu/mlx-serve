@@ -352,6 +352,8 @@ const Requests = struct {
         hc.disk = try @import("../../engines/mlx/load.zig").initPrefixDisk(testing.allocator, h.sch.io, path, "module-requests", 0, 512, prefix_cache.ModuleBinding.init(&p.xfm).?, path);
         hc.disk.?.armTestSpace(1 << 40, 2 << 40);
         hc.armDiskTier(&p.cfg);
+        // These tests exercise the write path, not the wait before it.
+        hc.module_quiet_ms = 0;
         try testing.expect(!hc.ssd_first);
         try testing.expect(hc.disk.?.writer != null);
     }

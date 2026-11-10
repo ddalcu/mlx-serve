@@ -81,6 +81,16 @@ yet (`isModuleRung` looks for a longer RESIDENT entry) and, just restored, it wa
 pass took another conversation's tip. Fix: `incoming_tip` names the commit in progress and `isModuleRung` counts
 what it extends. Guard: `at the count cap a new turn takes its own conversation's previous tip, never another's`.
 
+### Every DeepSeek-V4.1 turn rewrote the conversation's whole state to the SSD (#1124)
+Defect: macOS flagged mlx-serve for 550 GB of disk writes in 18 hours of agent use; the 20 GB tier turned over 27
+times and 7,826 superseded records were written and deleted. Cause: a module record is immutable, each commit
+registered a new one, and the idle loop flushed it in the seconds before the next turn; the state that turn then
+superseded was parked and written as well. Fix: the idle flush leaves a module tip alone until it has gone
+`module_quiet_ms` (60 s) without a turn (`FlushResult.quiet`, a one-second re-check), eviction and shutdown still
+write it, and a commit cancels the unwritten export of what it extends or replaces (`superseded`, not a loss). A
+crash loses the cached state of a conversation that never paused: it prefills once. Guard: `a module tip is written
+once it has gone quiet`, `a turn's commit drops the unwritten export of the state it supersedes`.
+
 ### A warm turn that could not share its prefix was refused (PR #518)
 Defect: a 46k-of-47.7k-warm agent turn on a 64 GB Mac got `PrefillDoesNotFit`. Cause: off SSD-first a restore shares
 buffers and the first append copies the whole prefix; the bill was honest. Fix: a full-entry hit that cannot share
