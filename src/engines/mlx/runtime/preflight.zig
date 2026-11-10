@@ -158,10 +158,21 @@ fn shardResidentBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []con
     return out;
 }
 
+pub fn ggufGateBytes(discovered: ?u64, disk_only: u64) ?u64 {
+    return if (discovered) |bytes| bytes -| disk_only else null;
+}
+
 pub fn residentGateBytes(validated: ?u64, discovered: ?u64, mlx_text: bool) ?u64 {
     if (!mlx_text) return discovered;
     if (validated) |bytes| if (bytes > 0) return bytes;
     return discovered orelse 0;
+}
+
+test "GGUF accounting: disk-only tensors leave the resident gate but unknown sizes stay unknown" {
+    try std.testing.expectEqual(@as(?u64, 45), ggufGateBytes(147, 102));
+    try std.testing.expectEqual(@as(?u64, 147), ggufGateBytes(147, 0));
+    try std.testing.expectEqual(@as(?u64, 0), ggufGateBytes(100, 101));
+    try std.testing.expectEqual(@as(?u64, null), ggufGateBytes(null, 102));
 }
 
 pub fn committedTextBytes(model_bytes: u64, config: *const model_mod.ModelConfig) u64 {

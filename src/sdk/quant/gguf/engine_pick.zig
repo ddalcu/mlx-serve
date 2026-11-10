@@ -29,6 +29,7 @@
 //! decision cheap and side-effect free.
 
 const std = @import("std");
+const GgmlType = @import("quants.zig").GgmlType;
 
 pub const Engine = enum { ds4, llama };
 
@@ -37,7 +38,14 @@ pub const Engine = enum { ds4, llama };
 pub const Route = struct {
     path: []const u8,
     engine: Engine,
+    disk_only_bytes: u64 = 0,
 };
+
+pub fn ds4DiskOnlyBytes(io: std.Io, allocator: std.mem.Allocator, path: []const u8) u64 {
+    var info = readFromFile(io, allocator, path) catch return 0;
+    defer info.deinit(allocator);
+    return info.ds4_disk_only_bytes;
+}
 
 pub const Info = struct {
     /// Owned dupe of `general.architecture` value; null if the key was
@@ -55,6 +63,8 @@ pub const Info = struct {
     split_count: u32 = 1,
     /// `<arch>.context_length`: the window the checkpoint was trained for; 0 when absent.
     context_length: u32 = 0,
+    /// Validated tensor bytes in the disk-only tail that ds4 unmaps.
+    ds4_disk_only_bytes: u64 = 0,
 
     pub fn deinit(self: *Info, allocator: std.mem.Allocator) void {
         if (self.architecture) |a| allocator.free(a);
@@ -123,9 +133,20 @@ const TY_F64: u32 = 12;
 const MAX_KEY_LEN: u64 = 1024;
 const MAX_STR_VALUE_LEN: u64 = 16 * 1024 * 1024;
 
-/// Stream-parse Info from a *Reader. Both runtime (file) and test (fixed
-/// bytes) callers go through here.
-pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
+/// Stream-parse metadata; disk-only accounting also requires a known file size.
+pub fn parseInfo(allocator: std.mem.Allocator, reader: *std.Io.Reader) Error!Info {
+    return parseInfoSized(allocator, reader, null);
+}
+
+fn parseInfoSized(allocator: std.mem.Allocator, reader: *std.Io.Reader, file_size: ?u64) Error!Info {
+    var buffer: [16 * 1024]u8 = undefined;
+    const limit = @min(file_size orelse std.math.maxInt(usize) - 1, std.math.maxInt(usize) - 1);
+    var counted = reader.limited(.limited64(limit), &buffer);
+    const r = &counted.interface;
+    var alignment: u64 = 32;
+    var engram_encoding: ?bool = null;
+    var unique_arch = true;
+    var seen_arch = false;
     var info: Info = .{};
     errdefer info.deinit(allocator);
 
@@ -148,20 +169,34 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
         // to read, because the next take call invalidates the buffer slice.
         // Match first, then advance.
         const is_arch = std.mem.eql(u8, key_buf, "general.architecture");
+        if (is_arch) {
+            if (seen_arch) unique_arch = false;
+            seen_arch = true;
+        }
         const is_ds4_lora = std.mem.eql(u8, key_buf, "deepseek4.attention.output_lora_rank");
         const is_nextn = std.mem.endsWith(u8, key_buf, ".nextn_predict_layers");
         const is_split_count = std.mem.eql(u8, key_buf, "split.count");
+        const is_alignment = std.mem.eql(u8, key_buf, "general.alignment");
+        const is_encoding = std.mem.eql(u8, key_buf, "deepseek41.engram.encoding") and engram_encoding == null;
+        if (is_encoding) engram_encoding = false;
         // One dot: `<arch>.context_length`, never a sub-namespace's (`<arch>.vision.context_length`).
         const is_ctx_len = std.mem.endsWith(u8, key_buf, ".context_length") and
             std.mem.indexOfScalar(u8, key_buf, '.').? == key_buf.len - ".context_length".len;
 
         const value_type = takeIntT(r, u32) catch return error.Truncated;
 
-        if (is_arch and value_type == TY_STRING) {
+        if ((is_arch or is_encoding) and value_type == TY_STRING) {
             const v_len = takeIntT(r, u64) catch return error.Truncated;
             if (v_len > MAX_STR_VALUE_LEN) return error.Truncated;
             const v_buf = takeBytes(r, @intCast(v_len)) catch return error.Truncated;
-            info.architecture = try allocator.dupe(u8, v_buf);
+            if (is_arch) {
+                const owned = try allocator.dupe(u8, v_buf);
+                if (info.architecture) |old| allocator.free(old);
+                info.architecture = owned;
+            } else engram_encoding = std.mem.eql(u8, v_buf, "e4m3_e8m0_32_row264");
+        } else if (is_alignment and value_type == TY_U32) {
+            const n = takeIntT(r, u32) catch return error.Truncated;
+            if (n != 0) alignment = n;
         } else if (is_ds4_lora and isNumeric(value_type)) {
             // Presence is what matters; the actual value (rank) isn't used
             // for routing. Skip past the value cleanly.
@@ -179,7 +214,21 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     }
 
     if (info.architecture) |a| {
-        if (std.mem.eql(u8, a, "qwen4exp")) info.ds4_unloadable = try scanDs4Unloadable(r, tensor_count);
+        const engram = std.mem.eql(u8, a, "deepseek41");
+        if (engram or std.mem.eql(u8, a, "qwen4exp")) {
+            const tensors = try scanDs4Tensors(r, tensor_count, engram);
+            info.ds4_unloadable = tensors.unloadable;
+            info.ds4_disk_only_bytes = bill: {
+                if (version != 3 or !unique_arch or info.split_count != 1 or (engram and !(engram_encoding orelse false))) break :bill 0;
+                const size = file_size orelse break :bill 0;
+                const relative = tensors.start orelse break :bill 0;
+                const header_end = limit - counted.remaining.toInt64().? - (r.end - r.seek);
+                const data_start = std.math.add(u64, header_end, (alignment - header_end % alignment) % alignment) catch break :bill 0;
+                const start = std.math.add(u64, data_start, relative) catch break :bill 0;
+                if (start % std.heap.pageSize() != 0 or data_start > size or tensors.end > size - data_start) break :bill 0;
+                break :bill tensors.disk_only_bytes;
+            };
+        }
     }
     if (info.embedded_mtp) info.embedded_mtp = for (ds4_embedded_mtp_archs) |d| {
         if (info.architecture != null and std.mem.eql(u8, info.architecture.?, d)) break true;
@@ -187,23 +236,89 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     return info;
 }
 
-/// Walk the tensor infos that follow the KVs; true at the first tensor ds4
-/// would reject for a qwen4exp model.
-fn scanDs4Unloadable(r: *std.Io.Reader, tensor_count: u64) Error!bool {
+const Ds4Tensors = struct { unloadable: bool = false, disk_only_bytes: u64 = 0, start: ?u64 = null, end: u64 = 0 };
+
+// Match the pinned ds4 tensor_type table where its geometry differs from standard ggml.
+fn ds4TensorBytes(ty: u32, elements: u64) ?u64 {
+    const geometry: struct { u64, u64 } = switch (ty) {
+        9 => .{ 32, 40 },
+        15 => .{ 256, 292 },
+        19 => .{ 256, 110 },
+        20 => .{ 256, 50 },
+        24 => .{ 1, 1 },
+        25 => .{ 1, 2 },
+        26 => .{ 1, 4 },
+        27, 28 => .{ 1, 8 },
+        42 => return null,
+        else => blk: {
+            const quant: GgmlType = @fromBackingInt(@intCast(ty));
+            if (!quant.supported()) return null;
+            break :blk .{ quant.blockElems(), quant.blockBytes() };
+        },
+    };
+    const blocks = std.math.divCeil(u64, elements, geometry[0]) catch return null;
+    return std.math.mul(u64, blocks, geometry[1]) catch null;
+}
+
+/// The same shape and tail ordering required by ds4's model_unmap_engram/model_unmap_qwen_ngrams.
+fn scanDs4Tensors(r: *std.Io.Reader, tensor_count: u64, engram: bool) Error!Ds4Tensors {
+    const Table = struct { offset: u64, bytes: u64 };
+    var tables: [2]?Table = .{ null, null };
+    var resident_end: u64 = 0;
+    var valid = true;
+    var out: Ds4Tensors = .{};
     var i: u64 = 0;
     while (i < tensor_count) : (i += 1) {
         const name_len = takeIntT(r, u64) catch return error.Truncated;
         if (name_len > MAX_KEY_LEN) return error.KeyTooLong;
-        const is_ngrams = std.mem.eql(u8, takeBytes(r, @intCast(name_len)) catch return error.Truncated, "per_layer_token_embd.weight");
+        const name = takeBytes(r, @intCast(name_len)) catch return error.Truncated;
+        const index: ?usize = if (engram)
+            (if (std.mem.eql(u8, name, "blk.1.engram_embd.weight")) 0 else if (std.mem.eql(u8, name, "blk.14.engram_embd.weight")) 1 else null)
+        else if (std.mem.eql(u8, name, "per_layer_token_embd.weight")) 0 else null;
         const n_dims = takeIntT(r, u32) catch return error.Truncated;
         if (n_dims > GGML_MAX_DIMS) return error.Truncated;
-        r.discardAll64(@as(u64, n_dims) * 8) catch return error.Truncated;
+        if (n_dims == 0) valid = false;
+        var dims: [GGML_MAX_DIMS]u64 = @splat(0);
+        var elements: u64 = 1;
+        for (dims[0..n_dims]) |*dim| {
+            dim.* = takeIntT(r, u64) catch return error.Truncated;
+            elements = std.math.mul(u64, elements, dim.*) catch return error.Truncated;
+        }
         const ty = takeIntT(r, u32) catch return error.Truncated;
-        _ = takeIntT(r, u64) catch return error.Truncated; // offset
-        if (std.mem.indexOfScalar(u32, &ds4_qwen_tensor_types, ty) == null) return true;
-        if (is_ngrams and ty != GGML_TYPE_BF16) return true;
+        const offset = takeIntT(r, u64) catch return error.Truncated;
+        if (!engram and (std.mem.indexOfScalar(u32, &ds4_qwen_tensor_types, ty) == null or (index != null and ty != GGML_TYPE_BF16))) {
+            out.unloadable = true;
+            return out;
+        }
+        const bytes = ds4TensorBytes(ty, elements) orelse {
+            valid = false;
+            continue;
+        };
+        const end = std.math.add(u64, offset, bytes) catch {
+            valid = false;
+            continue;
+        };
+        out.end = @max(out.end, end);
+        if (index) |k| {
+            if (tables[k] != null or n_dims != 2 or ty != @as(u32, if (engram) 24 else GGML_TYPE_BF16) or
+                dims[0] == 0 or (if (engram) dims[0] != 264 else dims[0] > 160) or dims[1] == 0 or dims[1] > std.math.maxInt(u32)) valid = false;
+            tables[k] = .{ .offset = offset, .bytes = bytes };
+        } else {
+            if (bytes == 0) valid = false;
+            resident_end = @max(resident_end, end);
+        }
     }
-    return false;
+    const first = tables[0] orelse return out;
+    if (!valid or resident_end > first.offset) return out;
+    var bytes = first.bytes;
+    if (engram) {
+        const second = tables[1] orelse return out;
+        if (second.offset < first.offset + first.bytes) return out;
+        bytes = std.math.add(u64, bytes, second.bytes) catch return out;
+    }
+    out.start = first.offset;
+    out.disk_only_bytes = bytes;
+    return out;
 }
 
 /// True when the header names a pooling type (`<arch>.pooling_type` > 0), llama.cpp's
@@ -246,7 +361,7 @@ pub fn readFromFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) 
     defer file.close(io);
     var rbuf: [16 * 1024]u8 = undefined;
     var rs = file.reader(io, &rbuf);
-    return parseInfo(allocator, &rs.interface);
+    return parseInfoSized(allocator, &rs.interface, (try file.stat(io)).size);
 }
 
 // ── private ──
@@ -361,15 +476,15 @@ fn appendStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u
     try buf.appendSlice(allocator, s);
 }
 
-const TensorInfo = struct { name: []const u8, ggml_type: u32 };
+pub const TensorInfo = struct { name: []const u8, ggml_type: u32, dims: []const u64 = &.{ 640, 2560 }, offset: u64 = 0 };
 
 /// Build a minimal but valid GGUF v3 header from a KV list, with no tensors.
 pub fn buildHeader(allocator: std.mem.Allocator, kvs: []const KV) ![]u8 {
     return buildHeaderWithTensors(allocator, kvs, &.{});
 }
 
-/// GGUF v3 header followed by tensor infos (2-D, offset 0); no tensor data.
-fn buildHeaderWithTensors(allocator: std.mem.Allocator, kvs: []const KV, tensors: []const TensorInfo) ![]u8 {
+/// GGUF v3 header followed by tensor infos; no tensor data.
+pub fn buildHeaderWithTensors(allocator: std.mem.Allocator, kvs: []const KV, tensors: []const TensorInfo) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, "GGUF");
@@ -401,18 +516,17 @@ fn buildHeaderWithTensors(allocator: std.mem.Allocator, kvs: []const KV, tensors
     }
     for (tensors) |t| {
         try appendStr(&buf, allocator, t.name);
-        try appendU32(&buf, allocator, 2); // n_dims
-        try appendU64(&buf, allocator, 640);
-        try appendU64(&buf, allocator, 2560);
+        try appendU32(&buf, allocator, @intCast(t.dims.len));
+        for (t.dims) |dim| try appendU64(&buf, allocator, dim);
         try appendU32(&buf, allocator, t.ggml_type);
-        try appendU64(&buf, allocator, 0); // offset
+        try appendU64(&buf, allocator, t.offset);
     }
     return buf.toOwnedSlice(allocator);
 }
 
 fn parseBytes(allocator: std.mem.Allocator, bytes: []const u8) Error!Info {
     var r = std.Io.Reader.fixed(bytes);
-    return parseInfo(allocator, &r);
+    return parseInfoSized(allocator, &r, bytes.len);
 }
 
 test "preferredEngine: llama arch → llama" {
@@ -527,6 +641,66 @@ test "preferredEngine: qwen4exp routes by tensor types ds4 can load" {
         var info = try parseBytes(testing.allocator, c.bytes);
         defer info.deinit(testing.allocator);
         try testing.expectEqual(c.want, preferredEngine(info));
+    }
+}
+
+test "GGUF accounting: disk-only tails require the native layout guards" {
+    const Change = enum { valid, wrong_arch, wrong_encoding, missing_encoding, wrong_type, wrong_width, wrong_rank, zero_rows, row_limit, duplicate, missing, overlap, unaligned, header_alignment, resident_after, truncated, header_only, no_size, offset_overflow, unsupported_resident, native_iq4, native_iq1_crosses };
+    const page: u64 = std.heap.pageSize();
+    for ([_]bool{ true, false }) |engram| {
+        for (std.enums.values(Change)) |change| {
+            if (!engram and (change == .wrong_encoding or change == .missing_encoding or change == .missing or change == .overlap or change == .native_iq4 or change == .native_iq1_crosses)) continue;
+            errdefer std.debug.print("Engram={}: {s}\n", .{ engram, @tagName(change) });
+            var tensors = [_]TensorInfo{
+                .{ .name = "output.weight", .ggml_type = 1, .dims = &.{256} },
+                .{ .name = if (engram) "blk.1.engram_embd.weight" else "per_layer_token_embd.weight", .ggml_type = if (engram) 24 else 30, .dims = if (engram) &.{ 264, 16 } else &.{ 160, 64 }, .offset = page },
+                .{ .name = "blk.14.engram_embd.weight", .ggml_type = 24, .dims = &.{ 264, 16 }, .offset = 2 * page },
+            };
+            var count: usize = if (engram) 3 else 2;
+            switch (change) {
+                .wrong_type => tensors[1].ggml_type = 1,
+                .wrong_width => tensors[1].dims = &.{ 265, 16 },
+                .wrong_rank => tensors[1].dims = if (engram) &.{ 264, 16, 1 } else &.{ 160, 16, 1 },
+                .zero_rows => tensors[1].dims = if (engram) &.{ 264, 0 } else &.{ 160, 0 },
+                .row_limit => tensors[1].dims = if (engram) &.{ 264, @as(u64, std.math.maxInt(u32)) + 1 } else &.{ 160, @as(u64, std.math.maxInt(u32)) + 1 },
+                .duplicate => {
+                    tensors[2] = tensors[1];
+                    count = 3;
+                },
+                .missing => count = 2,
+                .overlap => tensors[2].offset = page,
+                .unaligned => tensors[1].offset += 1,
+                .offset_overflow => tensors[1].offset = std.math.maxInt(u64),
+                .resident_after => tensors[0].offset = 3 * page,
+                .unsupported_resident => tensors[0].ggml_type = 42,
+                .native_iq4 => {
+                    tensors[0].ggml_type = 20;
+                    tensors[0].offset = page - 50;
+                },
+                .native_iq1_crosses => {
+                    tensors[0].ggml_type = 19;
+                    tensors[0].offset = page - 50;
+                },
+                else => {},
+            }
+            const kvs = [_]KV{
+                .{ .key = "general.architecture", .value = .{ .str = if (change == .wrong_arch) "glm-dsa" else if (engram) "deepseek41" else "qwen4exp" } },
+                .{ .key = "general.alignment", .value = .{ .u32_v = @intCast(if (change == .header_alignment) 32 else page) } },
+                .{ .key = "deepseek41.engram.encoding", .value = .{ .str = if (change == .wrong_encoding) "other" else "e4m3_e8m0_32_row264" } },
+            };
+            const header = try buildHeaderWithTensors(testing.allocator, kvs[0..@as(usize, if (change == .missing_encoding) 2 else 3)], tensors[0..count]);
+            var bytes = std.ArrayList(u8).fromOwnedSlice(header);
+            defer bytes.deinit(testing.allocator);
+            if (change != .header_only) {
+                try bytes.resize(testing.allocator, @intCast(if (change == .truncated) 2 * page else 8 * page));
+                @memset(bytes.items[header.len..], 0);
+            }
+            var reader: std.Io.Reader = .fixed(bytes.items);
+            var info = if (change == .no_size) try parseInfo(testing.allocator, &reader) else try parseBytes(testing.allocator, bytes.items);
+            defer info.deinit(testing.allocator);
+            const want: u64 = if (change == .valid or change == .native_iq4) (if (engram) 2 * 264 * 16 else 160 * 64 * 2) else 0;
+            try testing.expectEqual(want, info.ds4_disk_only_bytes);
+        }
     }
 }
 

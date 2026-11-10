@@ -14,6 +14,8 @@ const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
+const gguf_files = @import("../../sdk/quant/gguf/files.zig");
+const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
 const EngineKind = @import("../engines/served.zig").Kind;
 const media_mod = @import("../media_jobs/gen.zig");
 const metrics = @import("../status.zig");
@@ -72,6 +74,20 @@ fn mlxGgufClaims(io: std.Io, entry: *LoadedModel) bool {
         entry.mlx_gguf_claim = p != null;
     }
     return entry.mlx_gguf_claim.?;
+}
+
+fn ggufContextCap(io: std.Io, entry: *LoadedModel) u32 {
+    if (entry.gguf_ctx_cap) |cap| return cap;
+    const a = entry.allocator;
+    const cap: u32 = blk: {
+        const path = gguf_files.resolveGgufFile(io, a, entry.path) catch break :blk 0;
+        defer a.free(path);
+        var info = engine_pick.readFromFile(io, a, path) catch break :blk 0;
+        defer info.deinit(a);
+        break :blk info.context_length;
+    };
+    entry.gguf_ctx_cap = cap;
+    return cap;
 }
 
 /// Render the JSON metadata fragment for one entry. For `.ready` entries
@@ -351,6 +367,8 @@ pub fn renderModelEntry(
     // template is adopted at load), so advertise the chat capability set the
     // ready path would.
     const is_gguf_stub = std.mem.eql(u8, entry.arch_hint, "gguf");
+    const gguf_context = if (is_gguf_stub) ggufContextCap(io, entry) else 0;
+    const stub_context = if (gguf_context > 0) gguf_context else if (sm.found) sm.max_position_embeddings else 0;
     // Native media-gen stub (image/audio/video) — advertise the modality from
     // the discovery-peeked arch_hint so the app can find it before loading.
     const media_modality = media_mod.modalityFromType(entry.arch_hint);
@@ -397,7 +415,7 @@ pub fn renderModelEntry(
 
     const stub_chat = media_modality == null and !is_encoder_stub and
         (is_gguf_stub or (sm.found and !sm.has_transcription and !sm.is_aligner and sm.has_chat));
-    const facts = try row_facts.forEntry(allocator, io, entry, entry.arch_hint, if (stub_chat) (if (sm.found) sm.max_position_embeddings else 0) else null, mlxGgufClaims(io, entry));
+    const facts = try row_facts.forEntry(allocator, io, entry, entry.arch_hint, if (stub_chat) stub_context else null, mlxGgufClaims(io, entry));
     defer allocator.free(facts);
 
     const mods_part: []const u8 = if (sm.found and (sm.has_vision or sm.has_audio or sm.has_chat) or is_gguf_stub) blk: {
@@ -431,10 +449,10 @@ pub fn renderModelEntry(
     // Top-level twins of meta.context_length (issue #188): openai-models-list
     // discovery clients read row-level max_model_len/context_length. Unloaded
     // stubs advertise the architectural max — the same number meta carries here.
-    const top_ctx_part: []const u8 = if (sm.found) blk: {
+    const top_ctx_part: []const u8 = if (sm.found or stub_context > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, ",\"context_length\":{d},\"max_model_len\":{d}", .{
-            sm.max_position_embeddings,
-            sm.max_position_embeddings,
+            stub_context,
+            stub_context,
         });
     } else &[_]u8{};
     defer if (top_ctx_part.len > 0) allocator.free(top_ctx_part);
@@ -446,12 +464,15 @@ pub fn renderModelEntry(
             sm.hidden_size,
             sm.num_hidden_layers,
             quantizationJson(&quant_buf, sm.quant_bits),
-            sm.max_position_embeddings,
-            sm.max_position_embeddings,
+            stub_context,
+            stub_context,
             if (sm.is_moe) "true" else "false",
             if (sm.has_mtp) "true" else "false",
         });
-    } else &[_]u8{};
+    } else if (stub_context > 0)
+        try std.fmt.allocPrint(allocator, "\"context_length\":{d},\"model_max_tokens\":{d},", .{ stub_context, stub_context })
+    else
+        &[_]u8{};
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     const id_json = try jsonEscape(allocator, entry.id);
@@ -1027,6 +1048,66 @@ fn inputModalities(a: std.mem.Allocator, vision: bool, video: bool, audio: bool)
     return std.fmt.allocPrint(a, "[\"text\"{s}{s}{s}]", .{
         if (vision) ",\"image\"" else "", if (video) ",\"video\"" else "", if (audio) ",\"audio\"" else "",
     });
+}
+
+test "GGUF accounting: an unloaded catalog row exposes the trained context without config.json" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const pick = @import("../../sdk/quant/gguf/engine_pick.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = try pick.buildHeader(a, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "glm-dsa" } },
+        .{ .key = "glm-dsa.context_length", .value = .{ .u64_v = 131072 } },
+    });
+    defer a.free(header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = header });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const directory = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const file = try std.fs.path.join(a, &.{ directory, "model.gguf" });
+    defer a.free(file);
+    for ([_][]const u8{ directory, file }) |path| {
+        const reg = try ModelRegistry.init(a, io, null, 1, 0, null);
+        defer reg.deinit();
+        const entry = try reg.registerStubWithArch("stub", path, 0, "gguf");
+        const json = try renderModelEntry(a, io, entry);
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const row = parsed.value.object;
+        try testing.expectEqual(@as(i64, 131072), (row.get("context_length") orelse return error.TestUnexpectedResult).integer);
+        try testing.expectEqual(@as(i64, 131072), row.get("max_model_len").?.integer);
+        try testing.expectEqual(@as(i64, 131072), row.get("meta").?.object.get("context_length").?.integer);
+        try testing.expectEqual(@as(i64, 131072), row.get("agent_budget").?.object.get("context").?.integer);
+    }
+}
+
+test "GGUF accounting: a zero header context retains the config context" {
+    const a = testing.allocator;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = try engine_pick.buildHeader(a, &.{
+        .{ .key = "general.architecture", .value = .{ .str = "glm-dsa" } },
+        .{ .key = "glm-dsa.context_length", .value = .{ .u32_v = 0 } },
+    });
+    defer a.free(header);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = header });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"llama\",\"max_position_embeddings\":24576}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const reg = try ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStubWithArch("stub", path, 0, "gguf");
+    const json = try renderModelEntry(a, io, entry);
+    defer a.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer parsed.deinit();
+    const row = parsed.value.object;
+    try testing.expectEqual(@as(i64, 24576), row.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 24576), row.get("max_model_len").?.integer);
+    try testing.expectEqual(@as(i64, 24576), row.get("meta").?.object.get("context_length").?.integer);
+    try testing.expectEqual(@as(i64, 24576), row.get("agent_budget").?.object.get("context").?.integer);
 }
 
 test "an unloaded pack that sees and hears lists both, as its loaded row does" {

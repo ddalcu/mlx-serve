@@ -705,6 +705,12 @@ Defect: the app loads a GGUF quant by its file path and `probeModelDir` took fol
 accepts a `.gguf` file (not sidecars or embedding GGUFs), named by its stem. Guard: `registerByPath takes a .gguf
 file`, `tests/test_llama_gguf.sh` [8].
 
+### Unloaded GGUFs need their own context metadata
+GGUF-only entries have no `config.json`, so a catalog built from config stubs omits their trained window.
+Read `engine_pick.Info.context_length` once per entry and use it for the top-level, meta and agent-budget fields;
+a zero or unavailable GGUF window retains the context from a readable `config.json`.
+Guards: `an unloaded catalog row exposes the trained context`, `tests/test_gguf_context_catalog.sh`.
+
 ### MiniMax-H3 admitted a canvas it could not hold (#764)
 Defect: a 1536x672 x 124f run died in an uncatchable Metal OOM on its first step; every request printed the same peak.
 Fix: `h3RequestRows` x per-row bytes (+ the fast recipe's per-block attention cache) bills each request before any

@@ -250,6 +250,8 @@ pub const LoadedModel = struct {
     /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
+    /// Trained GGUF context, independent of MLX architecture support; 0 when unavailable.
+    gguf_ctx_cap: ?u32 = null,
     /// The engines whose probe accepts this pack (`model_row_facts.Engines` bits); answered once, like the claim.
     engines: ?u8 = null,
 
