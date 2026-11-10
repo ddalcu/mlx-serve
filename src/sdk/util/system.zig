@@ -358,8 +358,9 @@ test "ReturnLag: bytes MLX returned between two close readings are credited unti
     try std.testing.expectEqual(@as(u64, 0), lag.credit(20_000, 19 * GB, 16 * GB));
 }
 
-test "getAvailableMemBytes counts memory MLX has just returned" {
-    // Bar: the figure rises by a freed buffer at once, where the OS alone shows it about a second later.
+test "ReturnLag sees a buffer MLX frees past its pool as returned" {
+    // Bar: with the pool full a freed buffer leaves MLX's footprint, which is what the credit reads. The OS figure is
+    // held fixed here: other processes move the real one.
     if (!is_macos or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var prev: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev, 0); // a free goes back to the OS, as with the pool at its cap
@@ -367,14 +368,27 @@ test "getAvailableMemBytes counts memory MLX has just returned" {
         var t: usize = 0;
         _ = mlx.mlx_set_cache_limit(&t, prev);
     }
+    const footprint = struct {
+        fn now() u64 {
+            var active: usize = 0;
+            var pool: usize = 0;
+            _ = mlx.mlx_get_active_memory(&active);
+            _ = mlx.mlx_get_cache_memory(&pool);
+            return @as(u64, active) +| pool;
+        }
+    }.now;
     const bytes: u64 = 1 << 30;
     var a = mlx.mlx_array_new();
     const shape = [_]c_int{1 << 28};
-    try mlx.check(mlx.mlx_ones(&a, &shape, 1, .float32, mlx.gpuStream()));
+    const s = mlx.gpuStream();
+    try mlx.check(mlx.mlx_ones(&a, &shape, 1, .float32, s));
     try mlx.check(mlx.mlx_array_eval(a));
-    const held = getAvailableMemBytes();
+    // The eval's command buffer holds the buffer until its completion ran.
+    _ = mlx.mlx_synchronize(s);
+    var lag: ReturnLag = .{};
+    _ = lag.credit(1000, footprint(), 8 << 30);
     _ = mlx.mlx_array_free(a);
-    try std.testing.expect(getAvailableMemBytes() >= held + bytes - bytes / 8);
+    try std.testing.expect(lag.credit(1001, footprint(), 8 << 30) >= bytes - bytes / 8);
 }
 
 test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {

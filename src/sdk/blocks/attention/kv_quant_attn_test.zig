@@ -198,6 +198,11 @@ test "qkv decode kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
 
 test "qkv decode simdgroup-matrix kernel: two head tiles, 8-bit dims across words, ragged spans; block kernel when off" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    // Dispatch leaves the kernel to the block kernel on NAX; forced off, it is checked on every GPU.
+    const nax = @import("../linear/verify_qmm_nax.zig");
+    const saved = nax.vqmm_nax_probe_override;
+    defer nax.vqmm_nax_probe_override = saved;
+    nax.vqmm_nax_probe_override = false;
     try qkvDecParityCase(20, 2, 128, 4, 3001, false);
     try qkvDecParityCase(32, 2, 128, 8, 2500, true);
     try qkvDecParityCase(24, 2, 256, 4, 3001, false);
