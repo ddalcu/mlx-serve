@@ -26,6 +26,7 @@ const init = @import("../../engines/mlx/load/init.zig").init;
 const initMoeLayers = @import("../../engines/mlx/load/layers_layered.zig").initMoeLayers;
 const weightTriple = @import("../../engines/mlx/load/weights.zig").weightTriple;
 const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
+const ssmEntryBytes = @import("../../engines/mlx/ssm/entry.zig").ssmEntryBytes;
 const SSMCacheEntrySnapshot = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntrySnapshot;
 const ssmFreeSpecCapture = @import("../../engines/mlx/ssm/entry.zig").ssmFreeSpecCapture;
 const ssmRestore = @import("../../engines/mlx/ssm/entry.zig").ssmRestore;
@@ -229,6 +230,12 @@ pub const Qwen4MtpState = struct {
         self.seq_offset = m.stash_len;
         self.pos_base = m.origin;
         self.cache.step = m.cache_step;
+    }
+
+    /// GPU bytes this request's head half holds (KV rows + recurrent entry):
+    /// request-private, billed by neither the hot cache nor the module.
+    pub fn residentBytes(self: *const Qwen4MtpState) u64 {
+        return self.cache.residentBytes() + ssmEntryBytes(&self.entry);
     }
 
     pub fn deinit(self: *Qwen4MtpState) void {
