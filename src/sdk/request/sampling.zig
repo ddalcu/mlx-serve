@@ -4,6 +4,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const Constraint = @import("../grammar/constraint.zig").Constraint;
 const ThinkBound = @import("forced.zig").ThinkBound;
 const ToolForce = @import("forced.zig").ToolForce;
+const Bias = @import("../../abi/engine.zig").Bias;
 
 /// Sampling parameters for token generation.
 pub const SamplingParams = struct {
@@ -15,6 +16,8 @@ pub const SamplingParams = struct {
     presence_penalty: f32 = 0.0, // 0.0 = disabled
     /// OpenAI's: subtracted once per earlier occurrence of a token (0.0 = disabled).
     frequency_penalty: f32 = 0.0,
+    /// OpenAI's `logit_bias`, owned by the request handler. Served by an engine that declares `Caps.logit_bias`.
+    logit_bias: []const Bias = &.{},
     seed: ?u64 = null,
     /// Draw index under `seed`: every sample takes a fresh key.
     draw: u64 = 0,
