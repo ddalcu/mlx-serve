@@ -146,10 +146,12 @@ pub fn formatChatUsage(
     , .{ prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens, extra_details });
 }
 
-pub fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
+/// `thinking_tokens` is Anthropic's share of `output_tokens` spent thinking; a re-encoded count can overshoot the
+/// generated one, so it is capped there.
+pub fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32, thinking_tokens: u32) ![]u8 {
     return try std.fmt.allocPrint(allocator,
-        \\{{"input_tokens":{d},"output_tokens":{d},"cache_creation_input_tokens":0,"cache_read_input_tokens":{d}}}
-    , .{ prompt_tokens -| cached_tokens, completion_tokens, @min(cached_tokens, prompt_tokens) });
+        \\{{"input_tokens":{d},"output_tokens":{d},"output_tokens_details":{{"thinking_tokens":{d}}},"cache_creation_input_tokens":0,"cache_read_input_tokens":{d}}}
+    , .{ prompt_tokens -| cached_tokens, completion_tokens, @min(thinking_tokens, completion_tokens), @min(cached_tokens, prompt_tokens) });
 }
 
 pub fn formatTimingsObject(
@@ -423,7 +425,7 @@ test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
         .{ .prompt = 100, .cached = 100, .input = 0 },
         .{ .prompt = 100, .cached = 101, .input = 0 },
     }) |case| {
-        const json = try formatAnthropicUsage(a, case.prompt, 126, case.cached);
+        const json = try formatAnthropicUsage(a, case.prompt, 126, case.cached, 0);
         defer a.free(json);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
         defer parsed.deinit();
@@ -445,5 +447,24 @@ test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
         try testing.expectEqual(@as(i64, case.prompt), obj.get("prompt_tokens").?.integer);
         try testing.expectEqual(@as(i64, case.prompt) + 126, obj.get("total_tokens").?.integer);
         try testing.expectEqual(@as(i64, case.cached), obj.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
+    }
+}
+
+test "Anthropic usage: output_tokens_details.thinking_tokens is part of output_tokens" {
+    const a = testing.allocator;
+    for ([_]struct { thinking: u32, want: i64 }{
+        .{ .thinking = 0, .want = 0 },
+        .{ .thinking = 40, .want = 40 },
+        .{ .thinking = 126, .want = 126 },
+        .{ .thinking = 127, .want = 126 },
+    }) |case| {
+        const json = try formatAnthropicUsage(a, 100, 126, 30, case.thinking);
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object;
+        const details = usage.get("output_tokens_details");
+        try testing.expectEqual(@as(?i64, case.want), if (details) |d| d.object.get("thinking_tokens").?.integer else null);
+        try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
     }
 }
