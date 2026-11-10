@@ -115,6 +115,16 @@ pub const Settings = struct {
         return aliasOf(self.entry(model_path) orelse return null);
     }
 
+    /// The `ctx_size` pinned for `model_path`; 0 when the file sets none or
+    /// names it badly — the same parse rule `lookup` applies, on the folder's
+    /// own key (a load's `.gguf`-file fallback lives in `lookupPack`).
+    pub fn ctxSize(self: *const Settings, model_path: []const u8) u32 {
+        const e = self.entry(model_path) orelse return 0;
+        if (e != .object) return 0;
+        const c = e.object.get("ctx_size") orelse return 0;
+        return ctxSizeValue(c);
+    }
+
     pub const Duplicate = struct { alias: []const u8, a: []const u8, b: []const u8 };
 
     /// The first alias that two model paths both claim, if any.
@@ -162,18 +172,25 @@ fn trimSlash(p: []const u8) []const u8 {
     return s;
 }
 
+/// The `ctx_size` a JSON value pins; 0 when it is absent, not an integer, or
+/// outside a positive u32 — the one parse rule every reader shares.
+fn ctxSizeValue(c: std.json.Value) u32 {
+    return switch (c) {
+        .integer => |i| if (i > 0 and i <= std.math.maxInt(u32)) @intCast(i) else 0,
+        else => 0,
+    };
+}
+
 fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     const obj = switch (v) {
         .object => |o| o,
         else => return .{},
     };
     var o: Override = .{};
-    if (obj.get("ctx_size")) |c| switch (c) {
-        .integer => |i| if (i > 0 and i <= std.math.maxInt(u32)) {
-            o.ctx_size = @intCast(i);
-        },
-        else => {},
-    };
+    if (obj.get("ctx_size")) |c| {
+        const pin = ctxSizeValue(c);
+        if (pin > 0) o.ctx_size = pin;
+    }
     if (obj.get("kv_quant")) |k| o.kv_quant = kv_quant.KVQuantConfig.fromJsonValue(k);
     if (obj.get("mtp")) |m| switch (m) {
         .bool => |b| o.mtp = b,
@@ -291,6 +308,16 @@ pub const Cache = struct {
         defer self.mutex.unlock(io);
         self.refresh(io);
         return copyInto(buf, self.settings.aliasForPath(model_path));
+    }
+
+    /// The `ctx_size` pinned for `model_path`, 0 when none: the window a load
+    /// will enforce (`http/server.zig manualContext`), for a row that must
+    /// advertise it before the model is resident.
+    pub fn ctxSizeFor(self: *Cache, io: std.Io, model_path: []const u8) u32 {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.refresh(io);
+        return self.settings.ctxSize(model_path);
     }
 
     /// The generation rules of `model_path`'s entry; null reads the whole file as one
@@ -422,6 +449,30 @@ test "model_settings: parse + lookup with and without trailing slash" {
     try std.testing.expectEqual(@as(u8, 4), b.kv_quant.?.bits);
     try std.testing.expectEqual(@as(?bool, null), b.mtp);
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "ctxSize: the pin; 0 for absent, zero, non-integer, over-u32, or a non-object entry" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"ctx_size": 65536}, "/m/b": {"ctx_size": 0}, "/m/c": {"ctx_size": "big"}, "/m/d": 3, "/m/e": {"ctx_size": -1}, "/m/f": {"ctx_size": 99999999999}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(u32, 65536), s.ctxSize("/m/a"));
+    try std.testing.expectEqual(@as(u32, 65536), s.ctxSize("/m/a/"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/b"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/c"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/d"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/e"));
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/f")); // past maxInt(u32)
+    try std.testing.expectEqual(@as(u32, 0), s.ctxSize("/m/none"));
+    // The request-path Cache with an empty path: answers from the held settings, never reads a file.
+    var cache: Cache = .{ .path = "", .settings = try parse(t,
+        \\{"/m/p": {"ctx_size": 262144}}
+    ) };
+    defer cache.deinit();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try std.testing.expectEqual(@as(u32, 262144), cache.ctxSizeFor(io, "/m/p"));
+    try std.testing.expectEqual(@as(u32, 0), cache.ctxSizeFor(io, "/m/gone"));
 }
 
 test "model_settings: a GGUF folder answers to the key of the .gguf it serves, by its spelling or real path" {

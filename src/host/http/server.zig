@@ -265,7 +265,12 @@ pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) kv_quant_mod.K
 /// The explicit context for THIS model: its `model-settings.json` `ctx_size`, else `--ctx-size`.
 /// 0 = auto. Every reader of the manual context goes through here, never `server_config.max_context_size`.
 pub fn manualContext(config: *const model_mod.ModelConfig) u32 {
-    return if (config.ctx_override > 0) config.ctx_override else serverState().server_config.max_context_size;
+    return manualContextFor(config.ctx_override);
+}
+
+/// `manualContext` from the pin alone, for a model that has no loaded config yet (an unloaded `/v1/models` row).
+pub fn manualContextFor(pin: u32) u32 {
+    return if (pin > 0) pin else serverState().server_config.max_context_size;
 }
 
 /// Plan 05 — model registry. Always non-null in serve mode (set by
