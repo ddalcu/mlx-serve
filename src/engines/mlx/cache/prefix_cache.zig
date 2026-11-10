@@ -637,6 +637,9 @@ pub const HotPrefixCache = struct {
     max_entries: u32,
     /// An entry untouched this long is evicted before the workload-fair rule applies.
     stale_after_ms: i64 = 30 * 60 * 1000,
+    /// The module commit that is making room: its tip is not resident yet, but the entries it extends are its
+    /// rungs already. Without it a count-cap eviction took another conversation's tip on the same cache key (#1125).
+    incoming_tip: ?struct { binding: ModuleBinding, ids: []const u32, media: []const MediaSpan, has_tools: bool, quant_config: kv_quant.KVQuantConfig } = null,
     /// Wave 1.B: total KV bytes the cache is allowed to keep resident across
     /// all entries. 0 disables the byte budget (count cap still applies).
     /// Enforced on `commit`: evict LRU entries (in addition to the count
@@ -1951,7 +1954,12 @@ pub const HotPrefixCache = struct {
         // Allocate before removing any donor; OOM leaves the resident history intact.
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         self.supersedeModuleRungs(binding, ids, eff_media, has_tools, quant_config);
-        if (!self.makeModuleRoom(aux_bytes, cache_key)) return .declined;
+        const room = blk: {
+            self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
+            defer self.incoming_tip = null;
+            break :blk self.makeModuleRoom(aux_bytes, cache_key);
+        };
+        if (!room) return .declined;
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -1988,12 +1996,16 @@ pub const HotPrefixCache = struct {
         return std.mem.eql(u32, e.tokens, ids[0..e.tokens.len]);
     }
 
-    /// Whether entry `i` is a rung: a longer resident module entry of its conversation extends it.
+    /// Whether entry `i` is a rung: a longer resident module entry of its conversation extends it, or the tip
+    /// a commit is making room for does (`incoming_tip`).
     /// Computed from what is resident, never stored, so a tip that leaves by any path (thinning, a
     /// failed restore, the stale or idle passes) turns its rungs back into ordinary entries.
     fn isModuleRung(self: *const HotPrefixCache, i: usize) bool {
         const e = &self.entries.items[i];
         if (e.module == null) return false;
+        if (self.incoming_tip) |t| {
+            if (t.ids.len > e.tokens.len and moduleRungOf(e, t.binding, t.ids, t.media, t.has_tools, t.quant_config)) return true;
+        }
         for (self.entries.items, 0..) |*o, j| {
             if (j == i or o.tokens.len <= e.tokens.len) continue;
             const m = o.module orelse continue;
@@ -11341,6 +11353,38 @@ test "HotPrefixCache module: a long conversation keeps a thinned ladder and ever
     try testing.expectEqual(@as(usize, 2), cache.findModuleMatch(binding, &.{ 8, 9, 10 }, false, &.{}, null, q).?.n);
     cache.invalidateAll("test end");
     for (snaps) |s| try testing.expectEqual(@as(usize, 1), s.frees);
+}
+
+test "HotPrefixCache module: at the count cap a new turn takes its own conversation's previous tip, never another's" {
+    // Bar: four conversations on one cache key keep all four latest states at four entries.
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer cache.deinit();
+    const q = kv_quant.KVQuantConfig.dense;
+    const first = [_][]const u32{ &.{ 1, 10 }, &.{ 2, 20 }, &.{ 3, 30 }, &.{ 4, 40 } };
+    const second = [_][]const u32{ &.{ 1, 10, 11 }, &.{ 2, 20, 21 }, &.{ 3, 30, 31 }, &.{ 4, 40, 41 } };
+    var snaps: [8]ModuleFake.Snap = undefined;
+    for (first, 0..) |ids, i| {
+        snaps[i] = .{ .owner = &fake, .ids = ids, .key = ids[0] + ids[1] };
+        _ = try snaps[i].put(&cache, binding, &.{});
+    }
+    for (second, 0..) |ids, i| {
+        // The turn restores its conversation's tip first, which makes that tip the most recently used entry.
+        const hit = cache.findModuleMatch(binding, ids, false, &.{}, null, q) orelse return error.TestUnexpectedResult;
+        try testing.expectEqual(@as(usize, 2), hit.n);
+        _ = cache.restoreModule(binding, hit.entry_id, 0);
+        snaps[4 + i] = .{ .owner = &fake, .ids = ids, .key = ids[0] + ids[1] + ids[2] };
+        _ = try snaps[4 + i].put(&cache, binding, &.{});
+    }
+    try testing.expectEqual(@as(usize, 4), cache.entryCount());
+    for (second) |ids| {
+        const next = [_]u32{ ids[0], ids[1], ids[2], 99 };
+        try testing.expectEqual(@as(usize, 3), cache.findModuleMatch(binding, &next, false, &.{}, null, q).?.n);
+    }
+    cache.invalidateAll("test end");
 }
 
 test "HotPrefixCache module: a rung whose tip left by another path is a tip again" {

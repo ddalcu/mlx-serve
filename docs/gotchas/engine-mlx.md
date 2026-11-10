@@ -73,6 +73,14 @@ allocation takes it at once. Fix: `system.ReturnLag` credits what MLX returned b
 figure shows it or MLX takes it again; `getAvailableMemBytes` adds it, so admission, the load preflight and `/props`
 read one figure. Guard: `ReturnLag` test, `getAvailableMemBytes counts memory MLX has just returned`.
 
+### Conversations sharing a cache key evicted each other's latest state (#1125)
+Defect: four DeepSeek-V4.1 conversations with one system prompt (an agent and its subagents, no `prompt_cache_key`)
+at `--prefix-cache-entries 4` re-prefilled most turns: 0 to 27% token reuse against 89 to 97% with a key each.
+Cause: `commitModule` makes room before it appends the new tip, so the conversation's previous tip was not a rung
+yet (`isModuleRung` looks for a longer RESIDENT entry) and, just restored, it was the most recently used; the LRU
+pass took another conversation's tip. Fix: `incoming_tip` names the commit in progress and `isModuleRung` counts
+what it extends. Guard: `at the count cap a new turn takes its own conversation's previous tip, never another's`.
+
 ### A warm turn that could not share its prefix was refused (PR #518)
 Defect: a 46k-of-47.7k-warm agent turn on a 64 GB Mac got `PrefillDoesNotFit`. Cause: off SSD-first a restore shares
 buffers and the first append copies the whole prefix; the bill was honest. Fix: a full-entry hit that cannot share
