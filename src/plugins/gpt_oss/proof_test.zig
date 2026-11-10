@@ -37,6 +37,10 @@ fn writePack(p: *fixture.Pack, q: bool) !void {
 
 /// The pack at hidden width `h` and vocabulary `vocab` (the DFlash proof's tiny assistant reads 64 and 128).
 fn writePackAt(p: *fixture.Pack, q: bool, comptime h: c_int, comptime vocab: c_int) !void {
+    return writePackHead(p, q, h, vocab, HD);
+}
+
+fn writePackHead(p: *fixture.Pack, q: bool, comptime h: c_int, comptime vocab: c_int, comptime hd: c_int) !void {
     var buf: [160]u8 = undefined;
     try p.weight("model.embed_tokens", vocab, h, q);
     try p.norm("model.norm.weight", h);
@@ -44,7 +48,7 @@ fn writePackAt(p: *fixture.Pack, q: bool, comptime h: c_int, comptime vocab: c_i
     for (0..4) |i| {
         try p.norm(try at(&buf, i, "input_layernorm.weight"), h);
         try p.norm(try at(&buf, i, "post_attention_layernorm.weight"), h);
-        inline for (.{ .{ "q_proj", HEADS * HD, h }, .{ "k_proj", KV * HD, h }, .{ "v_proj", KV * HD, h }, .{ "o_proj", h, HEADS * HD } }) |t| {
+        inline for (.{ .{ "q_proj", HEADS * hd, h }, .{ "k_proj", KV * hd, h }, .{ "v_proj", KV * hd, h }, .{ "o_proj", h, HEADS * hd } }) |t| {
             try p.weight(try at(&buf, i, "self_attn." ++ t[0]), t[1], t[2], q);
             try p.denseAs(try at(&buf, i, "self_attn." ++ t[0] ++ ".bias"), &.{t[1]}, 0.1, 0, .bfloat16);
         }
@@ -322,4 +326,30 @@ test "gpt_oss plugin: sliding layers keep a ring of window + slack rows, and a r
     var rw = m.base.weights;
     rw.layers = &ringed;
     try both.expectRingSame(plugin.Model, &m.base.shared, b.xfm.s, &fw, &rw, 4, false);
+}
+
+test "gpt_oss plugin: at head 256 a prompt prefilled in whole-buffer chunks keeps its sliding rings and reads as the full buffer, through the band kernel and without it" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const json = try std.mem.replaceOwned(u8, std.testing.allocator, configJson(true), "\"head_dim\":64", "\"head_dim\":256");
+    defer std.testing.allocator.free(json);
+    var p = fixture.Pack.init(0x95e2);
+    defer p.deinit();
+    try writePackHead(&p, true, H, VOCAB, 256);
+    var b = try both.Both.openAs(&plugin.table, &p, json, false, .none);
+    defer b.close();
+    const m: *plugin.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
+    var full: [4]plugin.Model.Layer = undefined;
+    var ringed: [4]plugin.Model.Layer = undefined;
+    for (m.base.weights.layers, &full, &ringed) |l, *f, *r| {
+        f.* = l;
+        f.mixer.inner.ring = 0;
+        r.* = l;
+        r.mixer.inner.ring = if (l.mixer.inner.window > 0) l.mixer.inner.window + 2 else 0;
+    }
+    var fw = m.base.weights;
+    fw.layers = &full;
+    var rw = m.base.weights;
+    rw.layers = &ringed;
+    // The CPU stream has no band kernel: the composed band mask reads the same views.
+    for ([_]mlx.mlx_stream{ b.xfm.s, mlx.mlx_default_cpu_stream_new() }) |s| try both.expectRingSameWide(plugin.Model, &m.base.shared, s, &fw, &rw, 4);
 }

@@ -4,6 +4,7 @@
 //! copied_from: sdk/blocks/attention/sinks.zig (`sinkAttnWith`, `sinkAttnCore`, `sinkAttnOut` without MiMo's
 //! per-layer geometry, value scale and decode copies, and without the batched slots).
 
+const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const block = @import("../../sdk/bases/block.zig");
 const kv = @import("../../sdk/bases/kv.zig");
@@ -61,13 +62,13 @@ pub const SinkAttention = struct {
         var view = try kv.appendSliding(c, c.cache(), k, v, if (w.window > 0) sv.span else 0, w.window, w.ring);
         defer kv.release(c, &view);
         const dv = kv.dense(view);
-        const out = try core(w, c, q, dv.k, dv.v, total, sv.kv_len);
+        const out = try core(w, c, q, dv.k, dv.v, total);
         return w.o.forward(g, try g.mergeHeads(out));
     }
 
     /// Fused kernels where they serve, else MLX's SDPA with the sinks: causal at more than one row, banded to the
     /// window on a sliding layer's prefill, the window mask on its decode past the window.
-    fn core(w: *const Weights, c: *Ctx, q: Array, k: Array, v: Array, total: c_int, kv_len: c_int) !Array {
+    fn core(w: *const Weights, c: *Ctx, q: Array, k: Array, v: Array, total: c_int) !Array {
         const g = c.g;
         const geo = &w.geo;
         const s = c.rows;
@@ -84,7 +85,8 @@ pub const SinkAttention = struct {
         if (full) return da.sdpaSinks(g, q, k, v, geo.scale, if (wide) "causal" else "", .{}, w.sinks, false);
         const sw: c_int = @intCast(w.window);
         if (wide and total <= sw) return da.sdpaSinks(g, q, k, v, geo.scale, "causal", .{}, w.sinks, false);
-        if (wide) return da.sdpaSinks(g, q, k, v, geo.scale, "array", try sliding.bandMask(g, s, kv_len, sw), w.sinks, false);
+        // The keys the view holds: a ring's whole-buffer view starts past position 0.
+        if (wide) return da.sdpaSinks(g, q, k, v, geo.scale, "array", try sliding.bandMask(g, s, mlx.getShape(k)[2], sw), w.sinks, false);
         if (total <= sw) return da.sdpaSinks(g, q, k, v, geo.scale, "", .{}, w.sinks, false);
         return da.sdpaSinks(g, q, k, v, geo.scale, "array", try sliding.decodeMask(g, @min(total, sw), sw), w.sinks, false);
     }

@@ -42,6 +42,10 @@ fn writePack(p: *fixture.Pack, q: bool) !void {
 
 /// The pack at hidden width `h` and vocabulary `vocab` (the DFlash proof's tiny assistant reads 64 and 128).
 fn writePackAt(p: *fixture.Pack, q: bool, comptime h: c_int, comptime vocab: c_int) !void {
+    return writePackHead(p, q, h, vocab, HD);
+}
+
+fn writePackHead(p: *fixture.Pack, q: bool, comptime h: c_int, comptime vocab: c_int, comptime hd: c_int) !void {
     var buf: [160]u8 = undefined;
     try p.weight("model.embed_tokens", vocab, h, q);
     try p.norm("model.norm.weight", h);
@@ -49,12 +53,12 @@ fn writePackAt(p: *fixture.Pack, q: bool, comptime h: c_int, comptime vocab: c_i
     for (heads, 0..) |nh, i| {
         try p.norm(try at(&buf, i, "input_layernorm.weight"), h);
         try p.norm(try at(&buf, i, "post_attention_layernorm.weight"), h);
-        try p.weight(try at(&buf, i, "self_attn.q_proj"), nh * HD, h, q);
-        try p.weight(try at(&buf, i, "self_attn.k_proj"), HD, h, q);
-        try p.weight(try at(&buf, i, "self_attn.v_proj"), HD, h, q);
-        try p.weight(try at(&buf, i, "self_attn.o_proj"), h, nh * HD, q);
-        try p.norm(try at(&buf, i, "self_attn.q_norm.weight"), HD);
-        try p.norm(try at(&buf, i, "self_attn.k_norm.weight"), HD);
+        try p.weight(try at(&buf, i, "self_attn.q_proj"), nh * hd, h, q);
+        try p.weight(try at(&buf, i, "self_attn.k_proj"), hd, h, q);
+        try p.weight(try at(&buf, i, "self_attn.v_proj"), hd, h, q);
+        try p.weight(try at(&buf, i, "self_attn.o_proj"), h, nh * hd, q);
+        try p.norm(try at(&buf, i, "self_attn.q_norm.weight"), hd);
+        try p.norm(try at(&buf, i, "self_attn.k_norm.weight"), hd);
         try p.weight(try at(&buf, i, "self_attn.g_proj"), nh, h, q);
         if (i == 0) {
             try p.weight(try at(&buf, i, "mlp.gate_proj"), INTER, h, q);
@@ -265,4 +269,30 @@ test "laguna plugin: sliding layers keep a ring of window + slack rows, and a ri
     var rw = m.base.weights;
     rw.layers = &ringed;
     try both.expectRingSame(plugin.Model, &m.base.shared, b.xfm.s, &fw, &rw, 4, false);
+}
+
+test "laguna plugin: at head 256 a prompt prefilled in whole-buffer chunks keeps its sliding rings and reads as the full buffer" {
+    const mlx = @import("../../mlx/ffi.zig");
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const json = try std.mem.replaceOwned(u8, std.testing.allocator, configJson(true), "\"head_dim\":128", "\"head_dim\":256");
+    defer std.testing.allocator.free(json);
+    var p = fixture.Pack.init(0x1a5f);
+    defer p.deinit();
+    try writePackHead(&p, true, H, VOCAB, 256);
+    var b = try both.Both.openAs(&plugin.table, &p, json, false, .none);
+    defer b.close();
+    const m: *family.Loaded(plugin.Model) = @ptrCast(@alignCast(b.xfm.plugin.?.model));
+    var full: [4]plugin.Model.Layer = undefined;
+    var ringed: [4]plugin.Model.Layer = undefined;
+    for (m.base.weights.layers, &full, &ringed) |l, *f, *r| {
+        f.* = l;
+        f.mixer.inner.ring = 0;
+        r.* = l;
+        r.mixer.inner.ring = if (l.mixer.inner.window > 0) l.mixer.inner.window + 2 else 0;
+    }
+    var fw = m.base.weights;
+    fw.layers = &full;
+    var rw = m.base.weights;
+    rw.layers = &ringed;
+    try both.expectRingSameWide(plugin.Model, &m.base.shared, b.xfm.s, &fw, &rw, 4);
 }

@@ -471,6 +471,40 @@ pub fn expectRingSame(comptime M: type, shared: anytype, s: mlx.mlx_stream, full
     }
 }
 
+/// A prompt prefilled in chunks wide enough for a whole-buffer view (16 rows or more at head 256) on `s`, through
+/// `full` and `ringed` as `expectRingSame` takes them: every chunk's logits bit-equal, only the ringed cache dropped rows.
+pub fn expectRingSameWide(comptime M: type, shared: anytype, s: mlx.mlx_stream, full: *const M.Weights, ringed: *const M.Weights, layers: u32) !void {
+    const a = testing.allocator;
+    const cache_ops = @import("../kv/cache_ops.zig");
+    var kv: [2]KVCache = undefined;
+    var made: usize = 0;
+    defer for (kv[0..made]) |*c| c.deinit();
+    for (&kv) |*c| {
+        c.* = try KVCache.init(a, layers);
+        made += 1;
+    }
+    var slots: [2]cache_ops.Slot = undefined;
+    for (&slots, &kv) |*sl, *c| sl.* = .{ .kv = c };
+    var pos: u32 = 0;
+    for ([_]usize{ 250, 40, 20 }) |n| {
+        var g = ops.Graph.init(a, s);
+        defer g.deinit();
+        const ids = try fixture.tokens(&g, ring_chunk_a[0..n]);
+        var outs: [2]ops.Array = undefined;
+        for ([_]*const M.Weights{ full, ringed }, &slots, &outs) |w, *sl, *o| {
+            const handles = [_]abi.Handle{sl.handle()};
+            o.* = (try M.forward(w, shared, &g, ids, .{ .mode = .prefill, .rows = @intCast(n), .positions = &.{pos}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows })).logits;
+        }
+        try ops.expectBitEqual(outs[1], outs[0]);
+        pos += @intCast(n);
+    }
+    for (kv, 0..) |c, i| {
+        var dropped = false;
+        for (c.entries) |e| dropped = dropped or e.base > 0;
+        try testing.expectEqual(i == 1, dropped);
+    }
+}
+
 /// A released pack's config at a proof pack's geometry: `real` with every key of `fixture` but `keep` taken from the
 /// fixture (inside both `text_config`s too), `drop` removed, and its `quantization_config` (when present) mlx-lm's copy of the result's
 /// `quantization`. Caller frees.
