@@ -125,8 +125,9 @@ jobs:
           fi
 
       - name: Run Zig tests
-        # 8 shards: the default sizes them by RAM for GPU tests, which this virtual GPU skips.
-        run: zig build test --summary all -Dtest-shards=8 ${{ steps.slowtests.outputs.needed == '1' && '-Dslow-tests' || '' }}
+        # 4 shards: the default sizes them by RAM. Not every GPU test skips on this virtual GPU, and at 8 they ran it
+        # out of memory (a different kernel test exited 255 on each run).
+        run: zig build test --summary all -Dtest-shards=4 ${{ steps.slowtests.outputs.needed == '1' && '-Dslow-tests' || '' }}
 
       # The kit builds its example from itself, `plugin new|check|fixture|install` work, and the binary above serves a
       # kit-built dylib's pack (CPU-light: the fixture pack is 2 layers at width 16).
