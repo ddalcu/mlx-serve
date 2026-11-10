@@ -872,7 +872,8 @@ test "deepseek_v41 served: an excluded instance keeps legacy resume through requ
     const p = try Served.open(&P.table, try fixture.v41Files(arena.allocator(), 7), "");
     defer p.close();
     const m: *P.Model = @ptrCast(@alignCast(p.xfm.plugin.?.model));
-    m.cfg.dsv41_streamed = true;
+    m.bank_streams = true;
+    defer m.bank_streams = false;
     try testing.expect(!prefix_cache.HotPrefixCache.shouldUseInstance(&p.cfg, true, &p.xfm));
     const h = try Requests.open(p);
     defer h.close();

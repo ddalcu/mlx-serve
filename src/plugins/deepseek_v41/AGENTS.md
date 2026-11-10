@@ -1,7 +1,7 @@
 # deepseek_v41
 
 DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its vision tower, as a native,
-module-owned arch. Resident unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
+module-owned arch. Unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin (its trunk and its `experts.bin` bank).
 
@@ -37,8 +37,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
   live slots in `parked`; decode and DSpark rounds batch through `extendBatched` (rows a state, projections shared,
   attention per state) and `dsparkDraftBatched`. Each State owns its pending capture.
-- `prefix_cache` for resident packs; `aux.enabled` also excludes Thunderbolt pairs. Snapshots retain every buffer
-  and restore only at their exact position; the engine owns finished history. Streamed/paired keep legacy resume.
+- `prefix_cache` for unpaired instances whose bank holds every expert; a streaming bank (fewer prompt or decode slot
+  rows than `num_experts`, `bankStreams`) and a Thunderbolt pair keep legacy resume.
+  Snapshots retain every buffer and restore only at their exact position; the engine owns finished history. Pairs
+  keep legacy resume.
 - No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
 - A tensor pair (`InitOpts.tp`, `--dist tensor`) halves the experts and attention heads at load (the sliced `cfg` says so);
@@ -145,7 +147,7 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 ## The row from the root architecture table
 
 DeepSeek-V4/V4.1 Flash, 1M ctx. Spec off but DSpark; V4 single-flight, V4.1 batches decode and DSpark rounds across slots; DSML tools, OUR byte-pinned templates. V4:
-prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, resident unpaired auxiliary snapshots keyed on
+prefix cache OFF, 0731+, our layout. V4.1: MLX packs, DSpark ON, unpaired auxiliary snapshots keyed on
 image rows; the EXL3 repack's experts streamed from its bank. V4.1 images: every span position carries `image_token_id` (without the
 request's rows that id is TEXT, as in the reference), the module splices the rows itself, image rows route by
 `gate.bias_vl` and get no Engram write (`Hash.DEAD`)
