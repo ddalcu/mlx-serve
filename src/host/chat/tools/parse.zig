@@ -28,6 +28,7 @@ const tryParseJsonToolCall = @import("json_repair.zig").tryParseJsonToolCall;
 const unwrapDoubleBraces = @import("json_repair.zig").unwrapDoubleBraces;
 const parseGemma4ToolCall = @import("gemma4.zig").parseGemma4ToolCall;
 const hermesParamSpanEnclosing = @import("hermes.zig").hermesParamSpanEnclosing;
+const hermesCollapsedOpenerRepair = @import("hermes.zig").hermesCollapsedOpenerRepair;
 const hermesSpecialOpenerRepair = @import("hermes.zig").hermesSpecialOpenerRepair;
 const parseHermesToolCall = @import("hermes.zig").parseHermesToolCall;
 const parseMiniCpm5ToolCalls = @import("minicpm5.zig").parseMiniCpm5ToolCalls;
@@ -362,10 +363,14 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         // reorders the case that was being read wrong.
         const repaired_opener = try hermesSpecialOpenerRepair(allocator, content);
         defer if (repaired_opener) |r| allocator.free(r);
-        const body = repaired_opener orelse content;
+        const collapsed_opener = if (repaired_opener == null) try hermesCollapsedOpenerRepair(allocator, content) else null;
+        defer if (collapsed_opener) |r| allocator.free(r);
+        const body = repaired_opener orelse collapsed_opener orelse content;
         if (std.mem.indexOf(u8, body, "<function=") != null) {
             if (parseHermesToolCall(allocator, body)) |tc| {
-                try calls.append(allocator, tc);
+                var call = tc;
+                call.inferred = collapsed_opener != null;
+                try calls.append(allocator, call);
                 parsed_ok = true;
             }
         }

@@ -51,6 +51,22 @@ pub fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, body: []const u8)
     return out;
 }
 
+/// A `<tool_call>` body whose tool name arrived as a first, valueless `<parameter=NAME>` where `<function=NAME>`
+/// belongs (`<parameter=bash>\n<parameter=command>…</function>`, live on Qwen3.8-Flash-Next). Returns the body with
+/// that opener spelled `<function=`, null when the body has a `<function=` or its first tag is not a parameter
+/// opener directly followed by another. The caller owns the copy and marks the call inferred: NAME must be a tool.
+pub fn hermesCollapsedOpenerRepair(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
+    const tag = "<parameter=";
+    if (std.mem.indexOf(u8, body, "<function=") != null) return null;
+    const lead = std.mem.trimStart(u8, body, " \t\r\n");
+    if (!std.mem.startsWith(u8, lead, tag)) return null;
+    const open = body.len - lead.len;
+    const gt = std.mem.indexOfAnyPos(u8, body, open + tag.len, ">\n\r<") orelse return null;
+    if (body[gt] != '>') return null;
+    if (!std.mem.startsWith(u8, std.mem.trimStart(u8, body[gt + 1 ..], " \t\r\n"), tag)) return null;
+    return try std.mem.concat(allocator, u8, &.{ body[0..open], "<function=", body[open + tag.len ..] });
+}
+
 pub fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
     const fn_start_tag = "<function=";
     const fn_start = std.mem.indexOf(u8, block, fn_start_tag) orelse return null;
@@ -663,4 +679,25 @@ test "a sampled special token where <function='s `<` belongs still names the cal
     // A body with its real opener is left alone; a special that is not glued to `function=` is not touched.
     try std.testing.expect((try hermesSpecialOpenerRepair(allocator, "<function=x>\n</function>")) == null);
     try std.testing.expect((try hermesSpecialOpenerRepair(allocator, "<|im_start|>\nfunction=x>")) == null);
+}
+
+test "a collapsed call whose tool name arrives as the first <parameter=> still names the call" {
+    const allocator = std.testing.allocator;
+    const raw = "<tool_call>\n<parameter=bash>\n<parameter=command>\ncd /tmp && ls\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("bash", calls[0].name);
+    try std.testing.expectEqualStrings("{\"command\":\"cd /tmp && ls\"}", calls[0].arguments);
+    // The name came from a parameter tag, so the request chokepoint keeps it only for a declared tool.
+    try std.testing.expect(calls[0].inferred);
+    // A first parameter that carries a value is a parameter; a body with its opener is left alone.
+    try std.testing.expect((try hermesCollapsedOpenerRepair(allocator, "<parameter=path>\nsrc\n</parameter>")) == null);
+    try std.testing.expect((try hermesCollapsedOpenerRepair(allocator, "<function=x>\n<parameter=a>\n<parameter=b>")) == null);
 }

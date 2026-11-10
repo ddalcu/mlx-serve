@@ -184,6 +184,13 @@ ended. Cause: the checkpoint samples Claude's dialect; no parser, gate or scrubb
 `<function_calls>` / `<invoke …` prefixes; `bareInvokeMarkupCut` cuts only beside `<parameter ` or `</invoke>`. Guard:
 corpus family `qwen4_exp`, the prose and in-value negative tests.
 
+### Qwen3.8 Flash Next collapsed its call: the tool name in a parameter tag (#1114)
+Defect: a pi turn streamed only reasoning, then `stop` with no content and no call. Cause: the model wrote
+`<tool_call><parameter=bash><parameter=command>…</function>`, the `<function=bash>` layer spelled as a parameter;
+no parser took it and the leak trim cut the held block. Fix: `hermesCollapsedOpenerRepair` reads a first, valueless
+`<parameter=NAME>` directly followed by another opener as `<function=NAME>`, `.inferred` (a declared tool only).
+Guard: corpus family `qwen4_exp` (the call, and an undeclared name that stays no call).
+
 ### LFM2.5's pythonic call grammar
 Defect: LFM2.5 tool requests came back empty. Cause: `<|tool_call_start|>[get_weather(city='Paris',
 metric=True)]<|tool_call_end|>` matched no parser, and the leak trim cut it. Fix: `pythonicLiteral` parses Python

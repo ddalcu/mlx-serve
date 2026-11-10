@@ -1838,6 +1838,27 @@ const corpus = [_]Expect{
         .no_tool_calls = true,
     },
     .{
+        // LIVE (qwen4_exp, pi, #1114): the tool name arrived as a first `<parameter=bash>` where `<function=bash>`
+        // belongs, nothing parsed, and the turn ended as an empty `stop`.
+        .family = "qwen4_exp",
+        .name = "collapsed function-tag call whose name arrives as the first parameter tag",
+        .raw = "Count them with a script.</think>\n\n<tool_call>\n<parameter=bash>\n<parameter=command>\ncd /x && cat > /tmp/count.py <<'EOF'\nprint(1)\nEOF\n</parameter>\n</function>\n</tool_call>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_key = "command",
+        .tool_arg_value = "cd /x && cat > /tmp/count.py <<'EOF'\nprint(1)\nEOF",
+        .reasoning_contains = "Count them",
+    },
+    .{
+        .family = "qwen4_exp",
+        .name = "collapsed function-tag shape naming an undeclared tool is not a call",
+        .raw = "<tool_call>\n<parameter=teleport>\n<parameter=to>\nmars\n</parameter>\n</function>\n</tool_call>",
+        .tools_json = bash_tool_schema,
+        .no_tool_calls = true,
+    },
+    .{
         .family = "qwen4_exp",
         .name = "prose naming the invoke tag is not a call",
         .raw = "Claude's format wraps each call in <invoke name=\"bash\"> tags.",
