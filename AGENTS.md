@@ -78,6 +78,8 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 
 **A test that dispatches a Metal kernel, or runs a Neural Engine program, skips on a virtual GPU** (a VM has no ANE either). CI's `macos-26` runner reports the device `air64_v27`, caps threadgroups at 384-896 and kills command buffers with `Insufficient Memory`, so an unguarded kernel test fails or exits 255 there and turns the `zig` job red. Start it with `if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;` (`mlx.virtualGpu()` alone when it has no other skip). A bulk patch must scan the whole test body for the guard, not the next few lines. PR runs omit `-Dslow-tests` unless the diff touches the replay's paths and pushes to main add it, so a green PR can still hide a slow-test failure on main.
 
+**Green CI does not run a kernel or the proofs of a plugin that owns one** (#1027: they skip on the runner). Before merging a change to a kernel, a quant path or a model plugin, run its tests on a real Mac (`zig build test -Dtest-filter=<plugin>`, or the full suite): a parity test merged green and failed on the first M5 run.
+
 ## Releases & benchmarking
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).
