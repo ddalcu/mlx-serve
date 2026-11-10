@@ -1177,6 +1177,35 @@ test "renderChatTemplate: a set inside a for loop does not carry into the next i
     try testing.expect(std.mem.indexOf(u8, glm, "<|assistant|><think></think>two") != null);
 }
 
+test "renderChatTemplate: Z.ai's current GLM-5.3-Flash template renders a tool round natively" {
+    // Bar: the tool-result turn keeps GLM's own markup. The template's id check (`unique`) once raised there, and the
+    // request fell back to the generic format.
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = @embedFile("../../fixtures/glm5_next_chat_template_1015.jinja"),
+        .bos_token = null,
+        .eos_token = "<|endoftext|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "add", .arguments = "{\"a\":17,\"b\":25}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Use the add tool to calculate 17 plus 25." },
+        .{ .role = "assistant", .content = "", .tool_calls = &calls },
+        .{ .role = "tool", .content = "{\"result\":42}", .tool_call_id = "call_1" },
+        .{ .role = "user", .content = "Reply with only the numeric result returned by the tool." },
+    };
+    const tools =
+        \\[{"type":"function","function":{"name":"add","description":"Add two integers.","parameters":{"type":"object","properties":{"a":{"type":"integer"},"b":{"type":"integer"}},"required":["a","b"]}}}]
+    ;
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools, null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|observation|>") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "{\"result\":42}") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<tool_call>add") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+}
+
 test "templateReferencesToolRole detects role branches" {
     try testing.expect(templateReferencesToolRole("{% if message['role'] == 'tool' %}"));
     try testing.expect(templateReferencesToolRole("{% if message.role == \"tool\" %}"));
