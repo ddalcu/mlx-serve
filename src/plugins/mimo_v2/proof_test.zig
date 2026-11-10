@@ -34,11 +34,16 @@ const LAYERS = 4;
 const pattern = [LAYERS]u8{ 0, 1, 1, 0 };
 
 pub fn configJson(comptime quantized: bool) []const u8 {
+    return configAt(quantized, HD, VD, "0.334");
+}
+
+fn configAt(comptime quantized: bool, comptime hd: c_int, comptime vd: c_int, comptime rotary: []const u8) []const u8 {
+    const dims = std.fmt.comptimePrint("\"head_dim\":{d},\"v_head_dim\":{d},\"swa_head_dim\":{d},\"swa_v_head_dim\":{d},", .{ hd, vd, hd, vd });
     return "{\"model_type\":\"mimo_v2\",\"vocab_size\":256,\"hidden_size\":256,\"intermediate_size\":512," ++
         "\"num_hidden_layers\":4,\"num_attention_heads\":8,\"num_key_value_heads\":1,\"swa_num_key_value_heads\":2," ++
-        "\"head_dim\":192,\"v_head_dim\":128,\"swa_head_dim\":192,\"swa_v_head_dim\":128,\"swa_num_attention_heads\":8," ++
+        dims ++ "\"swa_num_attention_heads\":8," ++
         "\"layernorm_epsilon\":1e-6,\"rope_theta\":10000000.0,\"swa_rope_theta\":10000.0," ++
-        "\"rope_parameters\":{\"partial_rotary_factor\":0.334,\"rope_theta\":10000000.0,\"rope_type\":\"default\"}," ++
+        "\"rope_parameters\":{\"partial_rotary_factor\":" ++ rotary ++ ",\"rope_theta\":10000000.0,\"rope_type\":\"default\"}," ++
         "\"sliding_window\":8,\"hybrid_layer_pattern\":[0,1,1,0],\"moe_layer_freq\":[0,1,1,1]," ++
         "\"max_position_embeddings\":4096,\"n_routed_experts\":8,\"num_experts_per_tok\":2,\"moe_intermediate_size\":128," ++
         "\"n_shared_experts\":null,\"norm_topk_prob\":true,\"routed_scaling_factor\":null,\"n_group\":1,\"topk_group\":1," ++
@@ -51,6 +56,10 @@ fn at(buf: []u8, layer: usize, name: []const u8) ![]const u8 {
 }
 
 pub fn writePack(p: *fixture.Pack, q: bool) !void {
+    return writePackAt(p, q, HD, VD);
+}
+
+fn writePackAt(p: *fixture.Pack, q: bool, hd: c_int, vd: c_int) !void {
     var buf: [160]u8 = undefined;
     try p.weight("model.embed_tokens", VOCAB, H, q);
     try p.norm("model.norm.weight", H);
@@ -59,13 +68,13 @@ pub fn writePack(p: *fixture.Pack, q: bool) !void {
         const kvh: c_int = if (pattern[i] == 0) KV_GLOBAL else KV_SWA;
         try p.norm(try at(&buf, i, "input_layernorm.weight"), H);
         try p.norm(try at(&buf, i, "post_attention_layernorm.weight"), H);
-        try p.weight(try at(&buf, i, "self_attn.q_proj"), HEADS * HD, H, q);
-        try p.weight(try at(&buf, i, "self_attn.k_proj"), kvh * HD, H, q);
-        try p.weight(try at(&buf, i, "self_attn.v_proj"), kvh * VD, H, q);
-        try p.weight(try at(&buf, i, "self_attn.o_proj"), H, HEADS * VD, q);
-        try p.dense(try at(&buf, i, "self_attn.q_proj.bias"), &.{HEADS * HD}, 0.1, 0);
-        try p.dense(try at(&buf, i, "self_attn.k_proj.bias"), &.{kvh * HD}, 0.1, 0);
-        try p.dense(try at(&buf, i, "self_attn.v_proj.bias"), &.{kvh * VD}, 0.1, 0);
+        try p.weight(try at(&buf, i, "self_attn.q_proj"), HEADS * hd, H, q);
+        try p.weight(try at(&buf, i, "self_attn.k_proj"), kvh * hd, H, q);
+        try p.weight(try at(&buf, i, "self_attn.v_proj"), kvh * vd, H, q);
+        try p.weight(try at(&buf, i, "self_attn.o_proj"), H, HEADS * vd, q);
+        try p.dense(try at(&buf, i, "self_attn.q_proj.bias"), &.{HEADS * hd}, 0.1, 0);
+        try p.dense(try at(&buf, i, "self_attn.k_proj.bias"), &.{kvh * hd}, 0.1, 0);
+        try p.dense(try at(&buf, i, "self_attn.v_proj.bias"), &.{kvh * vd}, 0.1, 0);
         // Sinks on the sliding layers (`add_swa_attention_sink_bias`), under both of their names.
         if (i == 1) try p.dense(try at(&buf, i, "self_attn.attention_sink_bias"), &.{HEADS}, 0.5, 0);
         if (i == 2) try p.dense(try at(&buf, i, "self_attn.sinks"), &.{HEADS}, 0.5, 0);
@@ -281,6 +290,48 @@ test "mimo_v2 plugin: bf16 batched rows are too" {
 
 test "mimo_v2 plugin: past the sliding ring (2200 rows in two chunks), then decode, is bit-equal" {
     try ringCase(0x3134);
+}
+
+test "mimo_v2 plugin: at head 256 a prompt prefilled in whole-buffer chunks keeps its sliding rings and reads as the full buffer, through the band kernel and without it" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var p = fixture.Pack.init(0x3135);
+    defer p.deinit();
+    try writePackAt(&p, true, 256, 256);
+    var b = try both.Both.openAs(&mimo.table, &p, configAt(true, 256, 256, "0.25"), false, .none);
+    defer b.close();
+    const m: *mimo.Loaded = @ptrCast(@alignCast(b.xfm.plugin.?.model));
+    var ringed: [LAYERS]mimo.Model.Layer = undefined;
+    for (m.base.weights.layers, &ringed) |l, *r| {
+        r.* = l;
+        r.mixer.ring = if (l.mixer.window > 0) l.mixer.window + 2 else 0;
+    }
+    var rw = m.base.weights;
+    rw.layers = &ringed;
+    var ids: [250]i32 = undefined;
+    for (&ids, 0..) |*id, i| id.* = @intCast((i * 37 + 11) % VOCAB);
+    // The CPU stream has no band kernel: the composed band mask reads the same views.
+    for ([_]mlx.mlx_stream{ b.xfm.s, mlx.mlx_default_cpu_stream_new() }) |s| {
+        var sides: [2]Side = undefined;
+        for (&sides) |*sd| try sd.init();
+        defer for (&sides) |*sd| sd.deinit();
+        var pos: u32 = 0;
+        for ([_]usize{ 250, 40, 20 }) |n| {
+            var g = ops.Graph.init(testing.allocator, s);
+            defer g.deinit();
+            const toks = try fixture.tokens(&g, ids[0..n]);
+            var outs: [2]ops.Array = undefined;
+            for ([_]*const mimo.Model.Weights{ &m.base.weights, &rw }, &sides, &outs) |w, *sd, *o| {
+                const handles = [_]abi.Handle{sd.slot.handle()};
+                o.* = (try mimo.Model.forward(w, &m.base.shared, &g, toks, .{ .mode = .prefill, .rows = @intCast(n), .positions = &.{pos}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows })).logits;
+            }
+            try ops.expectBitEqual(outs[1], outs[0]);
+            pos += @intCast(n);
+        }
+        for (pattern, sides[0].kv.entries, sides[1].kv.entries) |kind, full, ring| {
+            try testing.expectEqual(@as(usize, 0), full.base);
+            try testing.expectEqual(kind == 1, ring.base > 0);
+        }
+    }
 }
 
 test "mimo_v2 plugin: parse equals the engine's parse on the shell and the plugin's own fields" {

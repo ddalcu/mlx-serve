@@ -62,5 +62,5 @@ and `round.zig`/`round_finish.zig`'s `isMimo` rollback stay (the served shell's 
 
 ## Fixtures
 - `conformanceFixture`: a dense global and an MoE sliding layer with sinks, width 64, head 32 / V 16, f32. Proof
-  packs: 4-bit and bf16, four layers, both router and sink names, one MoE layer without a bias; a 2200-row ring case.
-  Oracles (model-gated): `tests/dump_mimo_v2_fixtures.py`, `MIMO_V2_MODEL` / `MIMO_V2_FIXTURE`.
+  packs: 4-bit and bf16, four layers, both router and sink names, one MoE layer without a bias; ring cases at 2200
+  rows and at head 256. Oracles (model-gated): `tests/dump_mimo_v2_fixtures.py`, `MIMO_V2_MODEL` / `MIMO_V2_FIXTURE`.
