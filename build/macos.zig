@@ -304,6 +304,7 @@ pub fn addUnitTests(g: *const Graph) Tests {
         test_step.dependOn(&run.*.step);
     }
     plugins.addTests(b, test_step);
+    config.addTests(b, test_step);
     test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
     test_step.dependOn(&b.top_level_steps.get("unit-closure").?.step);
     return .{ .step = test_step, .build = test_build, .runs = test_runs, .filter = test_filter };
