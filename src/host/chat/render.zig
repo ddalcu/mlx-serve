@@ -773,6 +773,25 @@ test "renderChatTemplate: |min picks the smaller element, |max the larger" {
     try testing.expect(std.mem.indexOf(u8, rendered, "1/3") != null);
 }
 
+test "renderChatTemplate: |unique keeps the first of each value, lowercased unless case_sensitive, or by attribute" {
+    // GLM-5.3-Flash's template counts its tool-call ids with `unique(case_sensitive=true) | list | length`.
+    const allocator = testing.allocator;
+    const tpl =
+        \\{{ ['b', 'a', 'B', 'a'] | unique | join(',') }}/{{ ['b', 'a', 'B', 'a'] | unique(case_sensitive=true) | list | length }}/{{ [3, 1, 3] | unique | join(',') }}/{{ [{'id': 'x'}, {'id': 'y'}, {'id': 'x'}] | unique(attribute='id') | list | length }}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const messages = [_]Message{.{ .role = "user", .content = "hi" }};
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null, false);
+    defer allocator.free(rendered);
+    try testing.expectEqualStrings("b,a/3/3,1/2", rendered);
+}
+
 test "renderChatTemplate: a namespace attribute named like a dict method is the attribute" {
     // `ns.items` resolved to dict.items(), `+` raised, and the render fell back to the generic format.
     const allocator = testing.allocator;
