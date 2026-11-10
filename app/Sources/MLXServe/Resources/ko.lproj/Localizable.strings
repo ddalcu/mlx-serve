@@ -2443,3 +2443,8 @@
 "Not a number" = "숫자가 아닙니다";
 "Too long" = "너무 깁니다";
 "The server reads these when it starts." = "서버는 시작할 때 이 설정을 읽습니다.";
+
+/* Quit command */
+"Quit MLX-Serve" = "MLX-Serve 종료";
+"Keep running when I press ⌘Q" = "⌘Q를 눌러도 계속 실행";
+"⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q는 창을 닫고 서버는 계속 실행됩니다. 메뉴 막대의 종료는 여전히 둘 다 중지합니다.";

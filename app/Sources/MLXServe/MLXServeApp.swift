@@ -246,6 +246,11 @@ struct MLXCoreApp: App {
         .defaultSize(width: 900, height: 640)
 
         .commands {
+            CommandGroup(replacing: .appTermination) {
+                Button { QuitCommand.perform() } label: { Text("Quit MLX-Serve")
+                    .font(.app(.body)) }
+                    .keyboardShortcut("q", modifiers: [.command])
+            }
             CommandGroup(replacing: .newItem) {
                     Button {
                         openAndFocus("chat")

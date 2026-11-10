@@ -2511,3 +2511,8 @@
 "Not a number" = "不是数字";
 "Too long" = "太长";
 "The server reads these when it starts." = "服务器在启动时读取这些设置。";
+
+/* Quit command */
+"Quit MLX-Serve" = "退出 MLX-Serve";
+"Keep running when I press ⌘Q" = "按 ⌘Q 时保持运行";
+"⌘Q closes the window and the server keeps running. Quit in the menu bar still stops both." = "⌘Q 关闭窗口，服务器继续运行。菜单栏中的“退出”仍会同时停止两者。";
