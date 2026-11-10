@@ -23,9 +23,11 @@ const std = @import("std");
 // Histogram bounds (comptime constants shared by Metrics.init)
 // ---------------------------------------------------------------------------
 
-/// 10 latency buckets spanning 10 ms → 10 s, stored in nanoseconds.
+/// 15 latency buckets spanning 10 ms → 10 min, stored in nanoseconds: a long-context prefill runs for minutes, and
+/// past the last finite bound a quantile is only "more than that".
 /// The Prometheus renderer divides by 1e9 before emitting `le="X.XXX"`.
-const LATENCY_BOUNDS_NS: [10]u64 = .{
+const LATENCY_BUCKETS = 15;
+const LATENCY_BOUNDS_NS: [LATENCY_BUCKETS]u64 = .{
     10_000_000, // 10 ms
     25_000_000, // 25 ms
     50_000_000, // 50 ms
@@ -36,6 +38,11 @@ const LATENCY_BOUNDS_NS: [10]u64 = .{
     2_500_000_000, // 2.5 s
     5_000_000_000, // 5 s
     10_000_000_000, // 10 s
+    30_000_000_000, // 30 s
+    60_000_000_000, // 1 min
+    120_000_000_000, // 2 min
+    300_000_000_000, // 5 min
+    600_000_000_000, // 10 min
 };
 
 /// 8 token-count buckets: 32 → 8 192 (raw integers, no scaling).
@@ -85,10 +92,10 @@ pub const ModelUsage = struct {
 /// Zero-allocation after init; every field is a lock-free primitive.
 pub const Metrics = struct {
     // Latency histograms (observe in nanoseconds; rendered as seconds)
-    ttft_ns: Histogram(10), // time to first token
-    e2e_latency_ns: Histogram(10), // end-to-end request latency
-    prefill_time_ns: Histogram(10), // prefill phase
-    decode_time_ns: Histogram(10), // decode phase
+    ttft_ns: Histogram(LATENCY_BUCKETS), // time to first token
+    e2e_latency_ns: Histogram(LATENCY_BUCKETS), // end-to-end request latency
+    prefill_time_ns: Histogram(LATENCY_BUCKETS), // prefill phase
+    decode_time_ns: Histogram(LATENCY_BUCKETS), // decode phase
 
     // Per-request token histograms (raw counts)
     prompt_tokens_hist: Histogram(8),
@@ -173,10 +180,10 @@ pub const Metrics = struct {
 
     pub fn init() Metrics {
         return .{
-            .ttft_ns = Histogram(10).init(LATENCY_BOUNDS_NS),
-            .e2e_latency_ns = Histogram(10).init(LATENCY_BOUNDS_NS),
-            .prefill_time_ns = Histogram(10).init(LATENCY_BOUNDS_NS),
-            .decode_time_ns = Histogram(10).init(LATENCY_BOUNDS_NS),
+            .ttft_ns = Histogram(LATENCY_BUCKETS).init(LATENCY_BOUNDS_NS),
+            .e2e_latency_ns = Histogram(LATENCY_BUCKETS).init(LATENCY_BOUNDS_NS),
+            .prefill_time_ns = Histogram(LATENCY_BUCKETS).init(LATENCY_BOUNDS_NS),
+            .decode_time_ns = Histogram(LATENCY_BUCKETS).init(LATENCY_BOUNDS_NS),
             .prompt_tokens_hist = Histogram(8).init(TOKEN_BOUNDS),
             .output_tokens_hist = Histogram(8).init(TOKEN_BOUNDS),
             .prompt_tokens_total = Counter.init(),
@@ -976,6 +983,22 @@ test "Histogram.observe places values in the correct bucket" {
     try testing.expectEqual(@as(u64, 1), h.buckets[3].load(.monotonic));
     try testing.expectEqual(@as(u64, 5), h.count.load(.monotonic));
     try testing.expectEqual(@as(u64, 5565), h.sum.load(.monotonic));
+}
+
+test "a request that takes minutes lands in a finite latency bucket" {
+    // Bar: a 90 s time to first token is counted under 2 min, not only under +Inf.
+    const testing = std.testing;
+    var m = Metrics.init();
+    m.ttft_ns.observe(90 * std.time.ns_per_s);
+    m.e2e_latency_ns.observe(400 * std.time.ns_per_s);
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.buckets[LATENCY_BUCKETS].load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.e2e_latency_ns.buckets[LATENCY_BUCKETS].load(.monotonic));
+    var buf: [64 * 1024]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&buf);
+    try renderPrometheus(&m, &w);
+    const text = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, text, "vllm:time_to_first_token_seconds_bucket{le=\"120") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "vllm:e2e_request_latency_seconds_bucket{le=\"600") != null);
 }
 
 test "renderJson emits valid JSON with correct structure" {
