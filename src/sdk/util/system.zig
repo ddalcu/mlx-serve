@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const crt = @import("crt.zig");
+const os_mutex = @import("os_mutex.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const is_macos = builtin.os.tag == .macos;
@@ -162,7 +163,54 @@ pub fn getTotalMemBytes() u64 {
 }
 
 pub fn getAvailableMemBytes() u64 {
-    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostAvailableMemBytes());
+    const host = hostAvailableMemBytes();
+    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), host +| returnedNotShown(host));
+}
+
+/// macOS shows memory MLX handed back about a second late, while a new allocation can take it at once: a reading
+/// taken right after an eviction or an unload refused work that fit. This carries what MLX returned between two
+/// close readings until the OS figure shows it, or MLX takes it again.
+pub const ReturnLag = struct {
+    /// The OS figure catches up well inside this; a credit older than it is dropped.
+    pub const WINDOW_MS: i64 = 2000;
+
+    at_ms: i64 = 0,
+    /// MLX's active memory and buffer pool at the last reading: it shrinks only by what went back to the OS.
+    footprint: u64 = 0,
+    os_free: u64 = 0,
+    pending: u64 = 0,
+    pending_at_ms: i64 = 0,
+
+    /// The bytes to add to `os_free` at this reading.
+    pub fn credit(self: *ReturnLag, now_ms: i64, footprint: u64, os_free: u64) u64 {
+        if (now_ms - self.pending_at_ms > WINDOW_MS) self.pending = 0;
+        if (self.at_ms != 0 and now_ms - self.at_ms <= WINDOW_MS and footprint < self.footprint) {
+            self.pending +|= self.footprint - footprint;
+            self.pending_at_ms = now_ms;
+        }
+        self.pending -|= os_free -| self.os_free;
+        self.pending -|= footprint -| self.footprint;
+        self.at_ms = now_ms;
+        self.footprint = footprint;
+        self.os_free = os_free;
+        return self.pending;
+    }
+};
+
+const ReturnLagState = struct { mtx: os_mutex.Mutex = .{}, lag: ReturnLag = .{} };
+pub const return_lag_shared = @import("shared.zig").Shared(ReturnLagState, "mem_return_lag", .{});
+
+fn returnedNotShown(os_free: u64) u64 {
+    if (comptime !is_macos) return 0;
+    if (os_free == 0) return 0;
+    var active: usize = 0;
+    var pool: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    _ = mlx.mlx_get_cache_memory(&pool);
+    const st = return_lag_shared.get();
+    st.mtx.lock();
+    defer st.mtx.unlock();
+    return st.lag.credit(crt.monotonicMs(), @as(u64, active) +| pool, os_free);
 }
 
 /// The kernel's memory-pressure level: 1 normal, 2 warning, 4 critical; 0 where the OS has no such reading.
@@ -287,6 +335,46 @@ fn readProcFile(path: []const u8, buf: []u8) ?usize {
     const n = crt.read(fd, buf);
     if (n <= 0) return null;
     return @intCast(n);
+}
+
+test "ReturnLag: bytes MLX returned between two close readings are credited until the OS figure shows them" {
+    const GB: u64 = 1 << 30;
+    var lag: ReturnLag = .{};
+    // The first reading has no baseline.
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(1000, 30 * GB, 10 * GB));
+    // An eviction returned 4 GB and the OS figure has not moved: all 4 are credited.
+    try std.testing.expectEqual(4 * GB, lag.credit(1001, 26 * GB, 10 * GB));
+    // The OS shows 1 GB of it 200 ms later, then the rest.
+    try std.testing.expectEqual(3 * GB, lag.credit(1200, 26 * GB, 11 * GB));
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(2200, 26 * GB, 14 * GB));
+    // A return the OS shows within the same pair of readings needs no credit.
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(2300, 24 * GB, 16 * GB));
+    // What MLX takes again is no longer room.
+    try std.testing.expectEqual(4 * GB, lag.credit(2400, 20 * GB, 16 * GB));
+    try std.testing.expectEqual(1 * GB, lag.credit(2401, 23 * GB, 16 * GB));
+    // A figure that never rises stops being credited after the window.
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(2401 + ReturnLag.WINDOW_MS + 1, 23 * GB, 16 * GB));
+    // A drop seen across readings further apart than the window had time to show: no credit.
+    try std.testing.expectEqual(@as(u64, 0), lag.credit(20_000, 19 * GB, 16 * GB));
+}
+
+test "getAvailableMemBytes counts memory MLX has just returned" {
+    // Bar: the figure rises by a freed buffer at once, where the OS alone shows it about a second later.
+    if (!is_macos or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, 0); // a free goes back to the OS, as with the pool at its cap
+    defer {
+        var t: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&t, prev);
+    }
+    const bytes: u64 = 1 << 30;
+    var a = mlx.mlx_array_new();
+    const shape = [_]c_int{1 << 28};
+    try mlx.check(mlx.mlx_ones(&a, &shape, 1, .float32, mlx.gpuStream()));
+    try mlx.check(mlx.mlx_array_eval(a));
+    const held = getAvailableMemBytes();
+    _ = mlx.mlx_array_free(a);
+    try std.testing.expect(getAvailableMemBytes() >= held + bytes - bytes / 8);
 }
 
 test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {

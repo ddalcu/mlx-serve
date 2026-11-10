@@ -64,6 +64,15 @@ then evicted the long session. Cause: a restored cache shares the donor's buffer
 it. Fix: `KVCache.restoredOversized` regrows from the prefix when the donor is much larger; evict-to-admit is no
 longer qwen4-only. Guard: `KVCache: an append after a short restore sizes its copy from the prefix`.
 
+### A prompt was refused right after the eviction that made room for it (#987)
+Defect: an agent turn got "does not fit in GPU memory even after freeing the prefix cache" although the pass had
+just evicted more than it needed (4204 MB freed, the re-check still read 4607 MB against a 5066 MB bill); a retry
+went through. Cause: with the buffer pool at its cap an evicted entry goes back to the OS, and macOS shows returned
+memory about a second late (a freed 4 GiB read unchanged at once, a third at 200 ms, all of it by 1.2 s) while a new
+allocation takes it at once. Fix: `system.ReturnLag` credits what MLX returned between two close readings until the OS
+figure shows it or MLX takes it again; `getAvailableMemBytes` adds it, so admission, the load preflight and `/props`
+read one figure. Guard: `ReturnLag` test, `getAvailableMemBytes counts memory MLX has just returned`.
+
 ### A warm turn that could not share its prefix was refused (PR #518)
 Defect: a 46k-of-47.7k-warm agent turn on a 64 GB Mac got `PrefillDoesNotFit`. Cause: off SSD-first a restore shares
 buffers and the first append copies the whole prefix; the bill was honest. Fix: a full-entry hit that cannot share
