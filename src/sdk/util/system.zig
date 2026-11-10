@@ -216,11 +216,20 @@ fn returnedNotShown(os_free: u64) u64 {
     var pool: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     _ = mlx.mlx_get_cache_memory(&pool);
+    var footprint: u64 = @as(u64, active) +| pool;
+    var now_ms = crt.monotonicMs();
+    if (test_reading) |r| {
+        footprint = r.footprint;
+        now_ms = r.now_ms;
+    }
     const st = return_lag_shared.get();
     st.mtx.lock();
     defer st.mtx.unlock();
-    return st.lag.credit(crt.monotonicMs(), @as(u64, active) +| pool, os_free);
+    return st.lag.credit(now_ms, footprint, os_free);
 }
+
+/// Test seam: the kernel's counts, MLX's footprint and the clock, read in place of the machine's.
+pub var test_reading: ?struct { vm: DarwinVm, footprint: u64, now_ms: i64 } = null;
 
 /// `getAvailableMemBytes` for a model load (`computeLoadAvailableBytes`). Other hosts' readings
 /// already count what their OS reclaims (Linux `MemAvailable`, Windows `ullAvailPhys`).
@@ -283,18 +292,27 @@ pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
 fn hostAvailableMemBytes() u64 {
     if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
-    const v = darwinVm() orelse return 0;
+    return darwinFree(darwinVm() orelse return 0);
+}
+
+fn darwinFree(v: DarwinVm) u64 {
     return computeAvailableBytes(v.total, v.vm.free_count, v.vm.speculative_count, v.vm.external_page_count, v.vm.purgeable_count, v.vm.wire_count, v.vm.compressor_page_count, v.page);
 }
 
 fn hostLoadAvailableMemBytes() u64 {
     if (comptime builtin.os.tag != .macos) return hostAvailableMemBytes();
     const v = darwinVm() orelse return 0;
-    return computeLoadAvailableBytes(v.total, v.vm.wire_count, v.vm.compressor_page_count, v.page, osReserveBytes(v.total, false));
+    const room = computeLoadAvailableBytes(v.total, v.vm.wire_count, v.vm.compressor_page_count, v.page, osReserveBytes(v.total, false));
+    // MLX's buffers are wired, so this figure shows a return as late as the free one. The credit follows the free
+    // figure from every reader: fed this one here and the free one elsewhere, each reading would wipe the other's.
+    return room +| returnedNotShown(darwinFree(v));
 }
 
+const DarwinVm = struct { total: u64, page: u64, vm: VmStats64 };
+
 /// Total RAM, page size and the kernel's page counts; null on a failed query.
-fn darwinVm() ?struct { total: u64, page: u64, vm: VmStats64 } {
+fn darwinVm() ?DarwinVm {
+    if (test_reading) |r| return r.vm;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return null;
@@ -423,6 +441,32 @@ test "ReturnLag sees a buffer MLX frees past its pool as returned" {
     _ = lag.credit(1000, footprint(), 8 << 30);
     _ = mlx.mlx_array_free(a);
     try std.testing.expect(lag.credit(1001, footprint(), 8 << 30) >= bytes - bytes / 8);
+}
+
+test "the load figure carries what MLX just returned, and a free-figure reading between does not wipe it" {
+    if (!is_macos) return error.SkipZigTest;
+    const GB: u64 = 1 << 30;
+    const page: u64 = 16384;
+    const st = return_lag_shared.get();
+    st.lag = .{};
+    defer {
+        st.lag = .{};
+        test_reading = null;
+    }
+    var vm = std.mem.zeroes(VmStats64);
+    vm.free_count = @intCast(20 * GB / page);
+    vm.wire_count = @intCast(80 * GB / page);
+    test_reading = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = vm }, .footprint = 70 * GB, .now_ms = 1000 };
+    const load_before = getLoadAvailableMemBytes();
+    const free_before = getAvailableMemBytes();
+    // An eviction returned 4 GB; the kernel's counts have not moved yet.
+    test_reading.?.footprint = 66 * GB;
+    test_reading.?.now_ms = 1001;
+    try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
+    test_reading.?.now_ms = 1002;
+    try std.testing.expectEqual(free_before + 4 * GB, getAvailableMemBytes());
+    test_reading.?.now_ms = 1003;
+    try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
 }
 
 test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {

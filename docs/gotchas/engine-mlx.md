@@ -70,8 +70,10 @@ just evicted more than it needed (4204 MB freed, the re-check still read 4607 MB
 went through. Cause: with the buffer pool at its cap an evicted entry goes back to the OS, and macOS shows returned
 memory about a second late (a freed 4 GiB read unchanged at once, a third at 200 ms, all of it by 1.2 s) while a new
 allocation takes it at once. Fix: `system.ReturnLag` credits what MLX returned between two close readings until the OS
-figure shows it or MLX takes it again; `getAvailableMemBytes` adds it, so admission, the load preflight and `/props`
-read one figure. Guard: `ReturnLag` test, `getAvailableMemBytes counts memory MLX has just returned`.
+figure shows it or MLX takes it again. `getAvailableMemBytes` and the load figure (`getLoadAvailableMemBytes`, which
+admission and the load preflight read on macOS) both add it, and both feed it the free figure: fed one figure by one
+reader and the other by the next, each reading wipes the other's credit. Guard: `ReturnLag` tests, `the load figure
+carries what MLX just returned, and a free-figure reading between does not wipe it`.
 
 ### Conversations sharing a cache key evicted each other's latest state (#1125)
 Defect: four DeepSeek-V4.1 conversations with one system prompt (an agent and its subagents, no `prompt_cache_key`)
