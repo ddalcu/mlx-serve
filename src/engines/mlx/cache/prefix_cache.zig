@@ -11831,7 +11831,7 @@ test "a count eviction preserves the evicted tip's export; a state its own conve
         try testing.expectEqual(@as(usize, if (replacement) 1 else 0), old.frees);
         try testing.expectEqual(@as(u64, if (replacement) 40 else 80), hc.residentBytes());
         try testing.expectEqual(@as(u64, 40), hc.current_kv_bytes);
-        try testing.expectEqual(@as(u64, 40), hc.reclaimableBytes());
+        try testing.expectEqual(@as(u64, if (replacement) 0 else 40), hc.reclaimableBytes());
         try ModuleDiskTest.finish(&hc, cpu);
         try testing.expectEqual(!replacement, hc.disk.?.entryWholeOnDisk(disk_id));
         try testing.expect(hc.disk.?.entryWholeOnDisk(hc.entries.items[0].module.?.disk_id.?));
