@@ -529,6 +529,7 @@ pub fn handleAnthropicMessages(
             }
         }
     }
+    if (forced_tool) |ft| forced_tool = chat_mod.narrowForced(ft, root.get("tools"));
     if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
         const msg = try std.fmt.allocPrint(allocator, "tool_choice names tool \"{s}\", which is not in tools", .{ft.name});
         defer allocator.free(msg);

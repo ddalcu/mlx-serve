@@ -525,7 +525,7 @@ fn handleResponsesInner(
     };
     var has_tools = root.get("tools") != null;
 
-    const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"));
+    const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"), root.get("tools"));
     defer if (tool_choice.instruction) |ins| allocator.free(ins);
     if (!tool_choice.include_tools) has_tools = false;
     if (tool_choice.forced) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {

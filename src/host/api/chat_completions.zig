@@ -463,6 +463,7 @@ pub fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", speech_api.TEXT_TOOLS, 400);
         return;
     }
+    if (forced_tool) |ft| forced_tool = chat_mod.narrowForced(ft, root.get("tools"));
     if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
         const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
         defer allocator.free(msg);

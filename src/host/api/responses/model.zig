@@ -1033,13 +1033,14 @@ pub const ToolChoice = struct {
     forced: ?chat_mod.ForcedTool = null,
 };
 
-pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value) !ToolChoice {
+pub fn parseToolChoice(allocator: std.mem.Allocator, choice_val: ?std.json.Value, tools: ?std.json.Value) !ToolChoice {
     const v = choice_val orelse return .{ .include_tools = true, .instruction = null };
     switch (v) {
         .string => |s| {
             if (std.mem.eql(u8, s, "none")) return .{ .include_tools = false, .instruction = null };
             if (std.mem.eql(u8, s, "required")) {
-                return .{ .include_tools = true, .instruction = try chat_mod.toolChoiceInstruction(allocator, .any), .forced = .any };
+                const forced = chat_mod.narrowForced(.any, tools);
+                return .{ .include_tools = true, .instruction = try chat_mod.toolChoiceInstruction(allocator, forced), .forced = forced };
             }
             return .{ .include_tools = true, .instruction = null }; // "auto" default
         },
@@ -1850,13 +1851,13 @@ test "compaction with malformed envelope is silently skipped" {
 test "parseToolChoice none drops tools, required emits instruction" {
     {
         const v: std.json.Value = .{ .string = "none" };
-        const tc = try parseToolChoice(testing.allocator, v);
+        const tc = try parseToolChoice(testing.allocator, v, null);
         defer if (tc.instruction) |i| testing.allocator.free(i);
         try testing.expectEqual(false, tc.include_tools);
     }
     {
         const v: std.json.Value = .{ .string = "required" };
-        const tc = try parseToolChoice(testing.allocator, v);
+        const tc = try parseToolChoice(testing.allocator, v, null);
         defer if (tc.instruction) |i| testing.allocator.free(i);
         try testing.expectEqual(true, tc.include_tools);
         try testing.expect(tc.instruction != null);

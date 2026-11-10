@@ -68,6 +68,7 @@ pub const appendJsonString = @import("../../sdk/util/json_text.zig").appendJsonS
 pub const ForcedTool = @import("tools/tool_choice.zig").ForcedTool;
 pub const toolChoiceInstruction = @import("tools/tool_choice.zig").toolChoiceInstruction;
 pub const toolsDeclare = @import("tools/tool_choice.zig").toolsDeclare;
+pub const narrowForced = @import("tools/tool_choice.zig").narrowForced;
 pub const forcedToolOpener = @import("tools/tool_choice.zig").forcedToolOpener;
 
 test {
