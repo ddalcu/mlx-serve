@@ -524,7 +524,10 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     self.queue_mu.lockUncancelable(self.io);
     defer self.queue_mu.unlock(self.io);
 
+    var blocked: Blocked = .{};
+    defer blocked.leave(&self.submit_waiting);
     while (self.in_flight >= self.queue_cap and !self.shutdown.load(.acquire)) {
+        blocked.enter(&self.submit_waiting);
         self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
     }
     if (self.shutdown.load(.acquire)) return error.Shutdown;
@@ -534,6 +537,7 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     // then claim it (released in `complete`).
     if (params.model.sessionCapacity()) |cap| {
         while (params.model.session_claims >= cap and !self.shutdown.load(.acquire)) {
+            blocked.enter(&self.submit_waiting);
             self.session_cond.waitUncancelable(self.io, &self.queue_mu);
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
@@ -566,6 +570,39 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     self.in_flight += 1;
     self.queue_cond.broadcast(self.io);
     return slot;
+}
+
+/// One `submit` call's share of `submit_waiting`: counted at its first wait, however many waits follow, and given
+/// back when the call returns.
+const Blocked = struct {
+    counted: bool = false,
+
+    fn enter(self: *Blocked, waiting: *u32) void {
+        if (self.counted) return;
+        self.counted = true;
+        waiting.* += 1;
+    }
+
+    fn leave(self: *Blocked, waiting: *u32) void {
+        if (self.counted) waiting.* -= 1;
+    }
+};
+
+test "a submit blocked for queue room and then for a session counts as one waiting request until it returns" {
+    var waiting: u32 = 0;
+    var a: Blocked = .{};
+    a.enter(&waiting);
+    a.enter(&waiting);
+    var b: Blocked = .{};
+    b.enter(&waiting);
+    try std.testing.expectEqual(@as(u32, 2), waiting);
+    a.leave(&waiting);
+    try std.testing.expectEqual(@as(u32, 1), waiting);
+    // A call that never waited gives nothing back.
+    var c: Blocked = .{};
+    c.leave(&waiting);
+    b.leave(&waiting);
+    try std.testing.expectEqual(@as(u32, 0), waiting);
 }
 
 /// Give back the slot's session claim. Caller holds `queue_mu`.

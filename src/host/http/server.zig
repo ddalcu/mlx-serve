@@ -767,7 +767,7 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
     const running = @as(u64, ctx.scheduler.in_flight);
-    const waiting = @as(u64, ctx.scheduler.pending.items.len);
+    const waiting = @as(u64, ctx.scheduler.pending.items.len) + ctx.scheduler.submit_waiting;
     ctx.scheduler.queue_mu.unlock(ctx.scheduler.io);
     ctx.metrics.requests_running.set(running);
     ctx.metrics.requests_waiting.set(waiting);

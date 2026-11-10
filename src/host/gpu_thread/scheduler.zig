@@ -255,6 +255,9 @@ pub const Scheduler = struct {
     requests_prefilling: std.atomic.Value(u64),
     /// Counts `pending.len + decoding.len` for back-pressure.
     in_flight: u32,
+    /// Callers blocked in `submit` for queue room or an engine session: waiting requests the pending list
+    /// never held, so the queue gauges add them. Guarded by `queue_mu`.
+    submit_waiting: u32 = 0,
     /// Capacity for back-pressure. `submit` waits when in_flight >= cap.
     /// `cap = max_concurrent + queue_depth`. queue_depth = 32 hardcoded
     /// (matches the legacy `max_queue_size`).
