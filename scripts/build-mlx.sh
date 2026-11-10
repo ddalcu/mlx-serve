@@ -47,7 +47,8 @@ while read -r dir patch || [ -n "$dir" ]; do
   PATCH_DIRS+=("$REPO_ROOT/$dir")
   PATCH_FILES+=("$REPO_ROOT/$patch")
 done < "$SCRIPT_DIR/build-mlx-patches.txt"
-PATCH_SHA="$(cat "${PATCH_FILES[@]}" | shasum | cut -c1-12)"
+# An empty list hashes nothing: unguarded, bash 3.2 dies on the unset array and a newer one leaves `cat` on stdin.
+PATCH_SHA="$(cat /dev/null ${PATCH_FILES[@]+"${PATCH_FILES[@]}"} | shasum | cut -c1-12)"
 WANT="mlx=$MLX_SHA mlxc=$MLXC_SHA patch=$PATCH_SHA target=$DEPLOYMENT_TARGET"
 
 # Idempotent: skip when the staged build already matches the pinned SHAs.
@@ -77,7 +78,7 @@ NCPU="$(sysctl -n hw.ncpu)"
 
 # The files a patch touches are reset first, so an edited patch replaces the old one; local edits anywhere else in the
 # submodule are kept.
-for i in "${!PATCH_FILES[@]}"; do
+for i in ${PATCH_FILES[@]+"${!PATCH_FILES[@]}"}; do
   src="${PATCH_DIRS[$i]}" patch="${PATCH_FILES[$i]}"
   git -C "$src" checkout -- $(git -C "$src" apply --numstat -p1 "$patch" | cut -f3)
   git -C "$src" apply -p1 "$patch"

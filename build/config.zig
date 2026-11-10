@@ -336,6 +336,9 @@ test "build config: patch= covers each patch the list names, hashed as `cat <pat
     const edited_a: MapReader = .{ .files = &.{ .{ "list", list }, .{ "patches/a.patch", "a2\n" }, .{ "patches/b.patch", "b\n" } } };
     const edited_b: MapReader = .{ .files = &.{ .{ "list", list }, .{ "patches/a.patch", "a\n" }, .{ "patches/b.patch", "b2\n" } } };
     const dropped_b: MapReader = .{ .files = &.{ .{ "list", "lib/mlx-src patches/a.patch\n" }, .{ "patches/a.patch", "a\n" } } };
+    // A list with no patch left is SHA-1 of nothing, as `cat /dev/null | shasum` prints.
+    const none: MapReader = .{ .files = &.{.{ "list", "# <submodule> <patch>\n" }} };
+    try std.testing.expectEqualStrings("da39a3ee5e6b", patchesSha1(a, none, "list").?);
     for ([_]MapReader{ staged, edited_a, edited_b, dropped_b }, [_]bool{ false, true, true, true }) |r, stale| {
         const in: StageInput = .{ .key = "patch=", .path = "list", .have = patchesSha1(a, r, "list") };
         try std.testing.expectEqual(stale, staleStageInput(stamp, &.{in}) != null);
