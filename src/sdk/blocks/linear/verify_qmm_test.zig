@@ -308,6 +308,7 @@ test "verifyQmm: the plain-SIMD tiles match stock qmm at 5/6/8-bit affine too" {
     // reference, never kernel-vs-kernel. Parity is asserted independently of
     // the PROFITABILITY predicate — `vqmm_mixed_plain_test_force` opens the
     // gate so a shape the measurement later declines is still proven correct.
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0xB175);

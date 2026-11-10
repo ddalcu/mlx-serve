@@ -44,7 +44,7 @@ test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row ker
 }
 
 test "msv_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape, width and group" {
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     std.debug.print("[msv_qmv_rows] hermetic start\n", .{});
     var prng = std.Random.DefaultPrng.init(0x51500A01);
