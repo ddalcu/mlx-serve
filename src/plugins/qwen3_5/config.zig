@@ -42,7 +42,7 @@ pub const Config = struct {
     /// Qwen3-Next (`qwen3_next`): flat `model.*` weights, q|k|v|z and b|a projections combined per key head, its own
     /// pipelined-prefill table, serial decode.
     next: bool = false,
-    /// A Prism pack's Hadamard block (`modules[].block`): f16 activations, an f32 GDN state; 0 = not rotated.
+    /// A Prism pack's Hadamard block: f16 activations, an f32 GDN state; 0 = not rotated.
     hadamard_block: u32 = 0,
     vocab_size: u32,
     hidden_size: u32,
@@ -118,7 +118,7 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     const types: []const []const u8 = switch (variant) {
         .qwen3_5 => &model_types,
         .next => &.{"qwen3_next"},
-        .prism => &.{"prism_hadamard_qwen35"},
+        .prism => &.{ "prism_hadamard_qwen35", "qwen3_5" },
     };
     if (span != null) return unsupported("a layer span (the cluster split)");
     var arena = std.heap.ArenaAllocator.init(gpa);
@@ -188,7 +188,16 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     if (!c.moe() and c.intermediate_size == 0) return unsupported("intermediate_size");
     c.quant = q3.quantizationOf(root, prism) catch return unsupported("quantization");
     if (prism) {
-        c.hadamard_block = hadamardBlock(root) orelse return unsupported("modules without one shared rotation block");
+        // A stray block must not retarget a 4-bit `qwen3_5` pack. The official type is not re-checked.
+        if (std.mem.eql(u8, d.model_type, "qwen3_5") and !(c.quant.bits == 2 and c.quant.group_size == 128 and c.quant.mode == .affine))
+            return unsupported("quantization");
+        if (jangAffineExpansion(dir)) return unsupported("a JANG affine expansion");
+        // `unsupported` takes a comptime string, so the two misses stay separate returns.
+        if (rotationBlock(root, dir)) |block| {
+            c.hadamard_block = block;
+        } else if (field(root, "modules") != null) {
+            return unsupported("modules without one shared rotation block");
+        } else return unsupported("no Hadamard block");
         // The format refuses rotated expert banks.
         if (c.moe()) return unsupported("a routed-expert Hadamard pack");
     }
@@ -272,11 +281,24 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     return .ok;
 }
 
-/// The rotation block every listed module shares (Prism's `modules[].block`), as the engine's parse reads it; null
-/// when there is no list or the modules disagree.
-fn hadamardBlock(root: std.json.ObjectMap) ?u32 {
+/// The rotation block: `hadamard.block_size`, else one shared `modules[].block`, else `hadamard.json`'s
+/// `prism.hadamard.block_size`. Null when the pack names none, or its modules disagree.
+pub fn rotationBlock(root: std.json.ObjectMap, dir: *const abi.PackDir) ?u32 {
+    if (objectBlock(root)) |b| return b;
+    // A modules list that disagrees is not "no list": do not fall through to the sidecar.
+    if (field(root, "modules") != null) return modulesBlock(root);
+    return sidecarBlock(dir);
+}
+
+fn objectBlock(root: std.json.ObjectMap) ?u32 {
+    const h = field(root, "hadamard") orelse return null;
+    if (h != .object) return null;
+    return nonzero(int(field(h.object, "block_size")));
+}
+
+fn modulesBlock(root: std.json.ObjectMap) ?u32 {
     const mods = field(root, "modules") orelse return null;
-    if (mods != .array) return null;
+    if (mods != .array or mods.array.items.len == 0) return null;
     var blk: u32 = 0;
     for (mods.array.items) |m| {
         if (m != .object) return null;
@@ -285,6 +307,60 @@ fn hadamardBlock(root: std.json.ObjectMap) ?u32 {
         blk = v;
     }
     return if (blk == 0) null else blk;
+}
+
+fn nonzero(v: ?u32) ?u32 {
+    const n = v orelse return null;
+    return if (n == 0) null else n;
+}
+
+/// `hadamard.json` is the sign payload. The block is a header field; a full parse would copy the signs twice.
+fn sidecarBlock(dir: *const abi.PackDir) ?u32 {
+    const bytes = readWhole(dir, "hadamard.json", 8 << 20) orelse return null;
+    defer gpa.free(bytes);
+    const key = "\"prism.hadamard.block_size\"";
+    const at = std.mem.indexOf(u8, bytes, key) orelse return null;
+    if (at > 4096) return null;
+    const i = valueAt(bytes, at + key.len) orelse return null;
+    var end = i;
+    while (end < bytes.len and std.ascii.isDigit(bytes[end])) end += 1;
+    if (end == i) return null;
+    const v = std.fmt.parseInt(u32, bytes[i..end], 10) catch return null;
+    return if (v == 0) null else v;
+}
+
+/// `jang_config.json` asks for an expansion this loader does not do. Absent or false is the CRACK affine repack.
+fn jangAffineExpansion(dir: *const abi.PackDir) bool {
+    const bytes = readWhole(dir, "jang_config.json", 8 << 20) orelse return false;
+    defer gpa.free(bytes);
+    const i = valueAtKey(bytes, "\"requires_jang_affine1_expansion\"") orelse return false;
+    return std.mem.startsWith(u8, bytes[i..], "true");
+}
+
+fn valueAtKey(bytes: []const u8, key: []const u8) ?usize {
+    const at = std.mem.indexOf(u8, bytes, key) orelse return null;
+    return valueAt(bytes, at + key.len);
+}
+
+fn valueAt(bytes: []const u8, start: usize) ?usize {
+    var i = start;
+    while (i < bytes.len and std.ascii.isWhitespace(bytes[i])) i += 1;
+    if (i >= bytes.len or bytes[i] != ':') return null;
+    i += 1;
+    while (i < bytes.len and std.ascii.isWhitespace(bytes[i])) i += 1;
+    return i;
+}
+
+fn readWhole(dir: *const abi.PackDir, name: []const u8, cap: u64) ?[]u8 {
+    const n = dir.fileBytes(name);
+    if (n == 0 or n > cap) return null;
+    const buf = gpa.alloc(u8, @intCast(n)) catch return null;
+    var why: abi.Verdict = .{};
+    const bytes = dir.readFile(name, buf, &why) orelse {
+        gpa.free(buf);
+        return null;
+    };
+    return bytes;
 }
 
 /// One snapshot of every linear layer's recurrent state and conv window (`ModelConfig.ssmCheckpointBytes`).

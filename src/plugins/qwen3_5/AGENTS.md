@@ -36,7 +36,7 @@ run by the engine). `qwen3_next` reuses this plugin's load and forward (`plugins
 - Parse declines: an image tower without M-RoPE sections, rope scaling, no output gate,
   `mlp_only_layers`, pooling, `quantization_config.quant_method` / `expert_quant` / `modules` (ModelOpt, EXL3; Hadamard
   outside `prism_hadamard_qwen35`),
-  2-bit group-128.
+  2-bit group-128 that does not name a rotation block.
 - ANE prefill (`Caps.ane_prefill`, not Qwen3-Next or Prism): `WeightHooks.layer_weight` lends each dense MLP and
   joined q|k|v / z to the engine's build; a prompt chunk's `Forward.offload` takes them at the legacy seams
   (`GatedMlp`, the GDN projections). `ane_test.zig` proves the build's inputs and the seam against the legacy shell.
