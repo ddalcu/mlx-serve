@@ -13,7 +13,7 @@ source "$(dirname "$0")/_lib_models.sh"
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11364}"
-MODEL="${FLASH_MODEL:-$(find_model ddalcu/HyperFlow-H3-Flash-FL2VA-MLX-Serve-8bit || echo "$HOME/.mlx-serve/models/ddalcu/HyperFlow-H3-Flash-FL2VA-MLX-Serve-8bit")}"
+MODEL="${FLASH_MODEL:-$(find_model hancheng-ai/HyperFlow-H3-Flash-FL2VA-MLX-Serve-8bit ddalcu/HyperFlow-H3-Flash-FL2VA-MLX-Serve-8bit || echo "$HOME/.mlx-serve/models/ddalcu/HyperFlow-H3-Flash-FL2VA-MLX-Serve-8bit")}"
 [ -f "$MODEL/transformer.safetensors" ] || { echo "SKIP: no HyperFlow H3 Flash pack at $MODEL (set FLASH_MODEL)"; exit 0; }
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="${MLX_SERVE_BIN:-$ROOT/zig-out/bin/mlx-serve}"
