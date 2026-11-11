@@ -354,10 +354,21 @@ pub const Parsed = extern struct {
     /// sizes and bills the pack as it does that type, so the plugin must match the engine's layout for that type.
     /// A pack the engine cannot parse keeps the generic config. Read through `wantsEngineConfig`.
     engine_config: bool = false,
+    /// Rotation width of a Hadamard pack; 0 = this pack is not rotated.
+    hadamard_block: u32 = 0,
+    /// Language RMS weights are stored as `w - 1`. The engine adds the one before the f16 narrow.
+    centred_language_norms: bool = false,
 
     /// `engine_config`; false for a plugin built before it (its `size` ends before the field).
     pub fn wantsEngineConfig(p: *const Parsed) bool {
         return p.size >= @offsetOf(Parsed, "engine_config") + @sizeOf(bool) and p.engine_config;
+    }
+
+    /// Both fields, or zeros when an older plugin's `size` ends before them.
+    pub fn rotation(p: *const Parsed) struct { block: u32, centred: bool } {
+        const end = @offsetOf(Parsed, "centred_language_norms") + @sizeOf(bool);
+        if (p.size < end) return .{ .block = 0, .centred = false };
+        return .{ .block = p.hadamard_block, .centred = p.centred_language_norms };
     }
 };
 
