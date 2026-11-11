@@ -21,9 +21,13 @@ Owns `prism_hadamard_qwen35` (prism-ml Bonsai 2 packs). Table = `plugins/qwen3_5
   projections, as the legacy shell's.
 - A DFlash drafter reads the trunk's layers and its rotated table and head through the shell (`lmHeadForeign`).
 - Not served: routed experts (the format refuses rotated banks).
+- A `qwen3_5` pack claims by marker when it is affine 2-bit group 128 and names one rotation block
+  (`hadamard.block_size`, one shared `modules[].block`, or `hadamard.json`). Without that block it stays with
+  `qwen3_5` and is declined. A `jang_config.json` zero-centred language norm is loaded as `1 + w` (not the GDN norm).
+- A tower linear that ships `.scales` is not loaded, so an image request is the no-tower refusal.
 
 ## The row from the root architecture table
 
 prism-ml Bonsai 2 = qwen3_5 behind Hadamard rotations (block 512-4096 per pack: `sdk/quant/hadamard/rht.zig`,
-`hadamard_block` from `modules[].block`); in the pack's numerics: f16 activations over f16 scales, f32 GDN state;
-fused QKV declines; MTP depth 2
+`hadamard_block` from `hadamard.block_size`, `modules[].block`, or `hadamard.json`); in the pack's numerics: f16
+activations over f16 scales, f32 GDN state; fused QKV declines; MTP depth 2
