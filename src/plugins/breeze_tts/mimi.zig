@@ -264,6 +264,7 @@ const TtsLinear = struct {
             _ = mlx.mlx_array_free(self.biases);
         }
         if (self.add_bias) |b| _ = mlx.mlx_array_free(b);
+        self.* = std.mem.zeroes(TtsLinear); // re-freeing a loaded codec is safe
     }
 
     fn forward(self: *const TtsLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -1021,6 +1022,7 @@ pub fn loadCodecDecoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_di
 /// or Breeze `audio_tokenizer/`.
 pub fn loadCodecDecoderFrom(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer_dir: []const u8) !CodecDecoder {
     var b = try Bundle.open(io, allocator, tokenizer_dir);
+    defer b.close();
     return b.decoder(s);
 }
 
@@ -1536,6 +1538,7 @@ fn hostNlc(samples: []const f32, channels: u32, alloc: std.mem.Allocator, s: S) 
 /// Load the `audio_tokenizer` encoder weights into a `MimiEncoder`.
 pub fn loadMimiEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer_dir: []const u8) !MimiEncoder {
     var b = try Bundle.open(io, allocator, tokenizer_dir);
+    defer b.close();
     return b.encoder(s);
 }
 

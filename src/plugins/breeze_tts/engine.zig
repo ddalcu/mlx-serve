@@ -18,6 +18,7 @@ const model_mod = @import("../../sdk/weights/load.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/load.zig");
 const tts = @import("mimi.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
+const os_mutex = @import("../../sdk/util/os_mutex.zig");
 const env = @import("../../env.zig");
 
 const Weights = model_mod.Weights;
@@ -333,7 +334,47 @@ fn ownF16(w: *const Weights, s: S, key: []const u8) !mlx.mlx_array {
     return out;
 }
 
+/// A host buffer MLX owns: `mlx_array_new_data_managed_payload` runs the dtor
+/// when the array's last reference dies. The run is page-aligned so the dtor
+/// can free it straight back to the page allocator; `assertDrained` is the
+/// bar that every such run is gone by teardown.
+const ManagedF32 = struct {
+    run: ?*anyopaque,
+    len: usize,
+
+    fn freeRun(p: ?*anyopaque) callconv(.c) void {
+        const h: *ManagedF32 = @ptrCast(@alignCast(p));
+        const run = @as([*]u8, @ptrCast(h.run))[0..h.len];
+        std.heap.page_allocator.rawFree(run, .@"16", @returnAddress());
+    }
+
+    var live: usize = 0;
+
+    fn countUp() void {
+        runLock().lock();
+        defer runLock().unlock();
+        live += 1;
+    }
+
+    /// Debug builds: every owned run must be gone at teardown.
+    pub fn assertDrained() void {
+        if (comptime std.debug.runtime_safety) {
+            runLock().lock();
+            defer runLock().unlock();
+            std.debug.assert(live == 0);
+        }
+    }
+};
+
+fn runLock() *os_mutex.Mutex {
+    const m = struct {
+        var l: os_mutex.Mutex = .{};
+    };
+    return &m.l;
+}
+
 fn ownF16Plus1(w: *const Weights, s: S, alloc: std.mem.Allocator, key: []const u8) !mlx.mlx_array {
+    _ = alloc;
     const arr = w.get(key) orelse {
         log.err("[breeze] MISSING WEIGHT: {s}\n", .{key});
         return error.MissingBreezeWeight;
@@ -346,10 +387,26 @@ fn ownF16Plus1(w: *const Weights, s: S, alloc: std.mem.Allocator, key: []const u
     const shape = mlx.getShape(f32arr);
     var n: usize = 1;
     for (shape) |d| n *= @intCast(d);
-    const buf = try alloc.alloc(f32, n);
-    defer alloc.free(buf);
-    for (0..n) |i| buf[i] = data[i] + 1.0;
-    return hostF32(buf, shape);
+    const hdr_bytes = std.mem.alignForward(usize, @sizeOf(ManagedF32), @alignOf(f32));
+    const total = hdr_bytes + n * @sizeOf(f32);
+    const al: std.mem.Alignment = .@"16";
+    const run = std.heap.page_allocator.alignedAlloc(u8, al, total) catch return error.OutOfMemory;
+    errdefer std.heap.page_allocator.rawFree(run, al, @returnAddress());
+    const hdr: *ManagedF32 = @ptrCast(@alignCast(run.ptr));
+    hdr.* = .{ .run = run.ptr, .len = total };
+    const payload: [*]f32 = @alignCast(@ptrCast(run.ptr[hdr_bytes..]));
+    for (0..n) |i| payload[i] = data[i] + 1.0;
+    const out = mlx.mlx_array_new_data_managed_payload(
+        @ptrCast(payload),
+        shape.ptr,
+        @intCast(shape.len),
+        .float32,
+        hdr,
+        ManagedF32.freeRun,
+    );
+    if (out.ctx == null) return error.MLXOpFailed;
+    ManagedF32.countUp();
+    return out;
 }
 
 fn hostF32(data: []const f32, shape: []const c_int) mlx.mlx_array {
@@ -471,6 +528,13 @@ const QLayer = struct {
     in_ln: mlx.mlx_array,
     post_ln: mlx.mlx_array,
     pre_ff: mlx.mlx_array, // NULL on backbone/depth; TE carries the 4th norm
+
+    fn freeHandles(l: *QLayer) void {
+        inline for (.{ l.q, l.k, l.v, l.o, l.qn, l.kn, l.gate, l.up, l.down, l.in_ln, l.post_ln, l.pre_ff }) |x| {
+            if (x.ctx != null) _ = mlx.mlx_array_free(x);
+        }
+        l.* = std.mem.zeroes(QLayer);
+    }
 };
 
 /// Full re-forward over a host [L, hidden] f32 embedding span. `pos_scale`
@@ -748,27 +812,28 @@ const Te = struct {
         for (layers, 0..) |*L, i| {
             const p = try std.fmt.allocPrint(alloc, "text_encoder.layers.{d}.", .{i});
             defer alloc.free(p);
+            var k: [256]u8 = undefined;
             L.* = .{
                 .q_heads = cfg.te_heads,
                 .kv_heads = cfg.te_kv,
                 .head_dim = cfg.te_head_dim,
                 .eps = cfg.te_rms_eps,
                 .theta = cfg.te_theta_slide,
-                .q = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.q_proj.weight", .{p})),
-                .k = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_proj.weight", .{p})),
-                .v = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.v_proj.weight", .{p})),
-                .o = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.o_proj.weight", .{p})),
-                .qn = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}self_attn.q_norm.weight", .{p})),
-                .kn = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}self_attn.k_norm.weight", .{p})),
-                .gate = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.gate_proj.weight", .{p})),
-                .up = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.up_proj.weight", .{p})),
-                .down = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.down_proj.weight", .{p})),
-                .in_ln = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}pre_self_attn_layernorm.weight", .{p})),
-                .post_ln = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}post_feedforward_layernorm.weight", .{p})),
-                .pre_ff = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}pre_feedforward_layernorm.weight", .{p})),
+                .q = try ownT16(w, s, layerKey(&k, "{s}self_attn.q_proj.weight", p)),
+                .k = try ownT16(w, s, layerKey(&k, "{s}self_attn.k_proj.weight", p)),
+                .v = try ownT16(w, s, layerKey(&k, "{s}self_attn.v_proj.weight", p)),
+                .o = try ownT16(w, s, layerKey(&k, "{s}self_attn.o_proj.weight", p)),
+                .qn = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}self_attn.q_norm.weight", p)),
+                .kn = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}self_attn.k_norm.weight", p)),
+                .gate = try ownT16(w, s, layerKey(&k, "{s}mlp.gate_proj.weight", p)),
+                .up = try ownT16(w, s, layerKey(&k, "{s}mlp.up_proj.weight", p)),
+                .down = try ownT16(w, s, layerKey(&k, "{s}mlp.down_proj.weight", p)),
+                .in_ln = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}pre_self_attn_layernorm.weight", p)),
+                .post_ln = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}post_feedforward_layernorm.weight", p)),
+                .pre_ff = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}pre_feedforward_layernorm.weight", p)),
             };
             // post_self_attn_layernorm rides alongside as the attn post norm.
-            const ps = try ownF16Plus1(w, s, alloc, try std.fmt.allocPrint(alloc, "{s}post_self_attn_layernorm.weight", .{p}));
+            const ps = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}post_self_attn_layernorm.weight", p));
             te_post_attn = appendHandle(te_post_attn, alloc, ps);
         }
         return .{
@@ -1041,10 +1106,19 @@ pub const Request = struct {
 
 pub const Synthesis = struct {
     pcm: []f32,
-    /// Generated frames, each `[num_codebooks]` wide. The host frees every row
-    /// and the slice when the job's WAV is encoded.
+    /// Generated frames, each `[num_codebooks]` wide: views into `backing`,
+    /// the flat buffer the frame loop grew. The host frees the row views and
+    /// their buffer together (`freeSynthesisFrames`) when the job's WAV lands.
     frames: []const []const u32,
+    backing: []const u32,
 };
+
+/// Free a `Synthesis`'s frame storage: the row-view slice and the flat
+/// buffer they point into.
+pub fn freeSynthesisFrames(alloc: std.mem.Allocator, syn: Synthesis) void {
+    alloc.free(@constCast(syn.frames));
+    alloc.free(@constCast(syn.backing));
+}
 
 /// Streaming synthesis controls. `emit` receives f32 PCM slices in
 /// completion order, non-overlapping, covering the full utterance once;
@@ -1095,7 +1169,10 @@ pub const Engine = struct {
             return e;
         };
         const cb_lm = @as(usize, cfg.cbLm());
-        _hist_seen = allocator.alloc(bool, cb_lm) catch _hist_seen;
+        if (_hist_seen.len < cb_lm) {
+            if (_hist_seen.len > 0) allocator.free(_hist_seen);
+            _hist_seen = allocator.alloc(bool, cb_lm) catch _hist_seen;
+        }
 
         var self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
@@ -1180,7 +1257,14 @@ pub const Engine = struct {
             .lm_host = lm_host,
             .heads_host = heads_host,
             .audio_table = audio_table,
-            .codec = try tts.loadCodecDecoderFrom(io, allocator, s, try std.fmt.allocPrint(allocator, "{s}/audio_tokenizer", .{model_dir})),
+            .codec = blk: {
+                const tok_dir = try std.fmt.allocPrint(allocator, "{s}/audio_tokenizer", .{model_dir});
+                defer allocator.free(tok_dir);
+                break :blk tts.loadCodecDecoderFrom(io, allocator, s, tok_dir) catch |e| {
+                    allocator.free(tok_dir); // the defer above would double-free on the error path
+                    return e;
+                };
+            },
             .scratch = try allocator.alloc(f32, cb_lm),
             .order = try allocator.alloc(usize, cb_lm),
             .bkv_len = 0,
@@ -1200,6 +1284,7 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
+        const a = self.alloc;
         self.tok.deinit();
         self.codec.deinit();
         for (self.bkv) |*e| {
@@ -1208,17 +1293,34 @@ pub const Engine = struct {
             e.k.ctx = null;
             e.v.ctx = null;
         }
-        self.alloc.free(self.bkv);
-        self.alloc.free(self.te.table);
-        self.alloc.free(self.te.layers);
-        self.alloc.free(self.lm_host);
-        self.alloc.free(self.heads_host);
-        self.alloc.free(self.audio_table);
-        if (self.mimi) |m| { m.deinit(); self.alloc.destroy(m); }
-        self.alloc.free(self.model_dir);
-        self.alloc.free(self.scratch);
-        self.alloc.free(self.order);
-        self.alloc.destroy(self);
+        a.free(self.bkv);
+        a.free(self.te.table);
+        for (self.te.layers) |*l| l.freeHandles();
+        a.free(self.te.layers);
+        for (self.b_layers) |*l| l.freeHandles();
+        a.free(self.b_layers);
+        for (self.d_layers) |*l| l.freeHandles();
+        a.free(self.d_layers);
+        _ = mlx.mlx_array_free(self.b_norm);
+        _ = mlx.mlx_array_free(self.d_norm);
+        _ = mlx.mlx_array_free(self.d_inp);
+        _ = mlx.mlx_array_free(self.te_proj);
+        for (te_post_attn) |ps| _ = mlx.mlx_array_free(ps);
+        a.free(te_post_attn);
+        te_post_attn = &[_]mlx.mlx_array{};
+        if (d_inp_cache.len > 0) a.free(d_inp_cache);
+        d_inp_cache = &[_]f32{};
+        d_inp_key = .{ 0, 0 };
+        if (_hist_seen.len > 0) a.free(_hist_seen);
+        _hist_seen = &[_]bool{};
+        a.free(self.lm_host);
+        a.free(self.heads_host);
+        a.free(self.audio_table);
+        if (self.mimi) |m| { m.deinit(); a.destroy(m); }
+        a.free(self.model_dir);
+        a.free(self.scratch);
+        a.free(self.order);
+        a.destroy(self);
     }
 
     pub fn sampleRate(self: *const Engine) u32 {
@@ -1377,11 +1479,8 @@ pub const Engine = struct {
         const max_seq: usize = @intCast(self.cfg.max_seq);
         const max_code = self.cfg.codebook_size;
 
-        var frames: std.ArrayList([]u32) = .empty; // stitched across segments; each row [n_cb]
-        errdefer {
-            for (frames.items) |f| allocator.free(f);
-            frames.deinit(allocator);
-        }
+        var frames: std.ArrayListUnmanaged(u32) = .empty; // stitched across segments; frame t is items[t*n_cb..][0..n_cb]
+        defer frames.deinit(allocator);
         var hist: std.ArrayList(u32) = .empty; // repetition-penalty history, spans segments
         defer hist.deinit(allocator);
 
@@ -1394,6 +1493,7 @@ pub const Engine = struct {
         const logits = allocator.alloc(f32, cb_lm) catch return error.OutOfMemory;
         defer allocator.free(logits);
         const frame_row = allocator.alloc(u32, n_cb) catch return error.OutOfMemory;
+        defer allocator.free(frame_row);
         @memset(frame_row, 0);
         var depth_span = allocator.alloc(f32, (n_cb + 1) * dh) catch return error.OutOfMemory;
         defer allocator.free(depth_span);
@@ -1510,7 +1610,7 @@ pub const Engine = struct {
                 }
                 headLogits(self.lm_host, h_row, logits, cb_lm, bh, 0);
                 const frame = try allocator.alloc(u32, n_cb);
-                errdefer allocator.free(frame);
+                errdefer allocator.free(frame); // freed after it folds into `frames`
                 frame[0] = @intCast(sampleToken(&rng, logits, .{}, self.scratch, self.order, .{ .suppress_from = max_code, .suppress_to = @intCast(cbv), .history = hist.items, .rep = 1.1 }));
                 if (frame[0] == cb_eos) {
                     allocator.free(frame);
@@ -1538,14 +1638,18 @@ pub const Engine = struct {
                 // frame embed row into the stream
                 frameEmbed(self.audio_table, bh, stride, frame, max_code, emb_row);
                 @memcpy(stream[(text_len + frame_i) * bh ..][0..bh], emb_row);
-                try frames.append(allocator, frame);
+                try frames.appendSlice(allocator, frame);
+                allocator.free(frame);
                 if (st) |spec| {
-                    const n = frames.items.len;
+                    const n = frames.items.len / n_cb;
                     const k = if (spec.chunk_frames == 0) 12 else spec.chunk_frames;
                     if (n % k == 0) {
                         // Prefix-exact under the causal codec decoder: this
                         // decode's tail equals the final decode's same region.
-                        const dec = try self.codec.decode(frames.items);
+                        const views = allocator.alloc([]const u32, n) catch return error.OutOfMemory;
+                        defer allocator.free(views);
+                        for (0..n) |t| views[t] = frames.items[t * n_cb ..][0..n_cb];
+                        const dec = try self.codec.decodeSlice(views);
                         defer allocator.free(dec);
                         const dec_total = @min(dec.len, n * self.samples_per_frame);
                         const from = @min(dec_total, (n - k) * self.samples_per_frame);
@@ -1555,19 +1659,23 @@ pub const Engine = struct {
             }
         }
 
-        const out_frames = allocator.dupe([]const u32, frames.items) catch return error.OutOfMemory;
-        allocator.free(frames.items);
-        if (out_frames.len == 0) {
-            allocator.free(out_frames);
-            return error.NoFramesEmitted;
-        }
+        // The flat frame buffer the list grew into rides straight into the
+        // Synthesis; the row views are borrowed slices of it. The caller
+        // frees both through `freeSynthesisFrames`.
+        const n_total = frames.items.len / n_cb;
+        if (n_total == 0) return error.NoFramesEmitted;
+        const backing = frames.toOwnedSlice(allocator) catch return error.OutOfMemory;
+        errdefer allocator.free(backing);
+        const out_frames = allocator.alloc([]const u32, n_total) catch return error.OutOfMemory;
+        errdefer allocator.free(out_frames);
+        for (0..n_total) |t| out_frames[t] = backing[t * n_cb ..][0..n_cb];
 
         if (st) |spec| {
             const n = out_frames.len;
             const k = if (spec.chunk_frames == 0) 12 else spec.chunk_frames;
             const rem = n % k;
             if (k > 0 and rem > 0) {
-                const dec = try self.codec.decode(out_frames);
+                const dec = try self.codec.decodeSlice(out_frames);
                 defer allocator.free(dec);
                 const dec_total = @min(dec.len, n * self.samples_per_frame);
                 const from = @min(dec_total, (n - rem) * self.samples_per_frame);
@@ -1576,12 +1684,12 @@ pub const Engine = struct {
         }
 
         if (st == null) {
-            const pcm = try self.codec.decode(out_frames);
-            return .{ .pcm = pcm, .frames = out_frames };
+            const pcm = try self.codec.decodeSlice(out_frames);
+            return .{ .pcm = pcm, .frames = out_frames, .backing = backing };
         }
         // Stream mode: PCM already emitted in chunks; Synthesis.pcm is empty
         // and must not be freed.
-        return .{ .pcm = &[_]f32{}, .frames = out_frames };
+        return .{ .pcm = &[_]f32{}, .frames = out_frames, .backing = backing };
     }
 };
 
@@ -1608,6 +1716,7 @@ var d_inp_key: [2]usize = .{ 0, 0 };
 
 fn projHostCached(alloc: std.mem.Allocator, s: S, w: mlx.mlx_array, x: []const f32, in: usize, out_ch: usize, out: []f32) !void {
     if (d_inp_key[0] != in or d_inp_key[1] != out_ch) {
+        if (d_inp_cache.len > 0) alloc.free(d_inp_cache);
         d_inp_cache = alloc.alloc(f32, in * out_ch) catch return error.OutOfMemory;
         try evalHost(s, w, d_inp_cache);
         d_inp_key = .{ in, out_ch };
@@ -1631,28 +1740,36 @@ const LayerDims = struct {
     theta: f64,
 };
 
+/// One weight key for layer `i`, formatted through `buf` so the caller frees
+/// ONE string per layer instead of one per tensor.
+fn layerKey(buf: *[256]u8, comptime fmt: []const u8, p: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, fmt, .{p}) catch unreachable;
+}
+
 fn loadQLayers(comptime prefix_fmt: []const u8, w: *const Weights, alloc: std.mem.Allocator, s: S, d: LayerDims) ![]QLayer {
     const layers = try alloc.alloc(QLayer, d.count);
+    errdefer alloc.free(layers);
     for (layers, 0..) |*L, i| {
         const p = try std.fmt.allocPrint(alloc, prefix_fmt, .{i});
         defer alloc.free(p);
+        var k: [256]u8 = undefined;
         L.* = .{
             .q_heads = d.q_heads,
             .kv_heads = d.kv_heads,
             .head_dim = d.head_dim,
             .eps = d.eps,
             .theta = d.theta,
-            .q = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.q_proj.weight", .{p})),
-            .k = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_proj.weight", .{p})),
-            .v = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.v_proj.weight", .{p})),
-            .o = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.o_proj.weight", .{p})),
-            .qn = if (d.qk_norm) try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.q_norm.weight", .{p})) else null_arr,
-            .kn = if (d.qk_norm) try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_norm.weight", .{p})) else null_arr,
-            .gate = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.gate_proj.weight", .{p})),
-            .up = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.up_proj.weight", .{p})),
-            .down = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.down_proj.weight", .{p})),
-            .in_ln = try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}input_layernorm.weight", .{p})),
-            .post_ln = try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}post_attention_layernorm.weight", .{p})),
+            .q = try ownT16(w, s, layerKey(&k, "{s}self_attn.q_proj.weight", p)),
+            .k = try ownT16(w, s, layerKey(&k, "{s}self_attn.k_proj.weight", p)),
+            .v = try ownT16(w, s, layerKey(&k, "{s}self_attn.v_proj.weight", p)),
+            .o = try ownT16(w, s, layerKey(&k, "{s}self_attn.o_proj.weight", p)),
+            .qn = if (d.qk_norm) try ownF16(w, s, layerKey(&k, "{s}self_attn.q_norm.weight", p)) else null_arr,
+            .kn = if (d.qk_norm) try ownF16(w, s, layerKey(&k, "{s}self_attn.k_norm.weight", p)) else null_arr,
+            .gate = try ownT16(w, s, layerKey(&k, "{s}mlp.gate_proj.weight", p)),
+            .up = try ownT16(w, s, layerKey(&k, "{s}mlp.up_proj.weight", p)),
+            .down = try ownT16(w, s, layerKey(&k, "{s}mlp.down_proj.weight", p)),
+            .in_ln = try ownF16(w, s, layerKey(&k, "{s}input_layernorm.weight", p)),
+            .post_ln = try ownF16(w, s, layerKey(&k, "{s}post_attention_layernorm.weight", p)),
             .pre_ff = null_arr,
         };
     }
@@ -1761,5 +1878,6 @@ test "live synthesize (BREEZE_MODEL)" {
     defer engine.deinit();
     const synth = try engine.synthesize(alloc, .{ .text = "Hello world, this is Breeze speaking.", .voice = "S0", .seed = 1 });
     try std.testing.expect(synth.pcm.len > 0);
+    defer freeSynthesisFrames(alloc, synth);
     alloc.free(synth.pcm);
 }

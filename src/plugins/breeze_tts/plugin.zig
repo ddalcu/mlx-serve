@@ -208,11 +208,9 @@ fn step(e: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) c
             return job.failure(err, "breeze_tts synthesis");
         },
     };
-    // Stream mode: Synthesis.pcm is empty and must not be freed; the frame table is ours.
-    defer {
-        for (syn.frames) |f| gpa.free(f);
-        gpa.free(syn.frames);
-    }
+    // Stream mode: Synthesis.pcm is empty and must not be freed; the frame
+    // table is ours: the row views and their flat buffer.
+    defer engine.freeSynthesisFrames(gpa, syn);
 
     if (sink.failed) return job.failure(error.OutOfMemory, "breeze_tts output buffer");
     if (sink.buf.items.len == 0) return job.failure(error.NoFramesEmitted, "breeze_tts synthesis");
