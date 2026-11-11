@@ -289,9 +289,10 @@ Modified by: mlx-serve (https://github.com/ddalcu/mlx-serve)
 What changed:
 
 * `transformer.safetensors` is QUANTIZED from the original `transformer/`
-  release to MLX affine {bits}-bit, group size 64. Its output head is replaced by
-  the six per-step heads of `pdd_fused_heads.safetensors`, stacked as
-  `final_layer.video_out` ([6 x 96, 5376]). Embeddings, the time embedder, the
+  release to MLX affine {bits}-bit, group size 64. Each attention's fused
+  Q/K/V rows are reordered from per-head interleaved to [q | k | v]. Its output
+  head is replaced by the six per-step heads of `pdd_fused_heads.safetensors`,
+  stacked as `final_layer.video_out` ([6 x 96, 5376]). Embeddings, the time embedder, the
   patch projection, the heads and the rope frequencies stay dense.
 * `text_encoder.safetensors` is the MiniMax-H3 text encoder (which
   MiniMax-H3-Image uses unchanged), quantized to MLX affine and truncated to
@@ -303,7 +304,7 @@ What changed:
   sampling grid of `pdd_config.json`.
 
 No weights were retrained, distilled, pruned or otherwise altered beyond the
-numeric quantization described above.
+row reordering and numeric quantization described above.
 """
 
 IMAGE_README = """---
@@ -350,12 +351,18 @@ jurisdiction permits you to use these files before downloading them.
 
 def image_dit(src):
     """The MiniMax-H3-Image DiT as lazy tensors under the names this engine reads: the release's `transformer/` is
-    already in ComfyUI's MiniMax-H3 names; its single output head gives way to the six PDD heads, stacked."""
+    in ComfyUI's MiniMax-H3 names but interleaves Q/K/V per head, which become the [q | k | v] blocks the engine
+    splits; its single output head gives way to the six PDD heads, stacked."""
     out = {}
     for shard in sorted(glob.glob(os.path.join(src, "transformer", "*.safetensors"))):
         out.update(mx.load(shard))
     if any(k.startswith(("audio_patch_proj.", "final_layer.audio_out.")) for k in out):
         raise SystemExit("an image DiT with an audio stream: not the MiniMax-H3-Image release")
+    cfg = json.load(open(os.path.join(src, "transformer", "config.json")))
+    heads, hd = cfg["num_attention_heads"], cfg["attention_head_dim"]
+    for k in [k for k in out if k.endswith(".attn.qkv_proj.weight")]:
+        w = out[k]
+        out[k] = w.reshape(heads, 3, hd, w.shape[-1]).transpose(1, 0, 2, 3).reshape(3 * heads * hd, w.shape[-1])
     heads = mx.load(os.path.join(src, "pdd_fused_heads.safetensors"))
     w, b = heads["video_out.weight"], heads["video_out.bias"]
     steps = len(json.load(open(os.path.join(src, "pdd_config.json")))["sigmas"]) - 1
