@@ -509,6 +509,8 @@ pub const Dsv41Model = struct {
     pair: ?Pair = null,
     /// This process's slice of every expert (`cfg.moe_intermediate_size` is already its width).
     tp: ?Shard = null,
+    /// How the tensor sums carry their parts (`TpSumMode`): rank 0's choice on every rank.
+    tp_sum: TpSumMode = .auto,
     /// `moeFused`'s unit expand at rows 1..`dkern.max_rows` (`.pre` the zero stream), made once at load.
     tp_units: [dkern.max_rows]Split = undefined,
     /// `dec_state`'s identity: a snapshot names the state it was taken of. Set from `gens` whenever `dec_state` is
@@ -1658,6 +1660,8 @@ pub const InitOpts = struct {
     /// rank runs the whole forward and sums its attention and MoE outputs with the others (`ClusterHooksState.tp_sum`);
     /// rank 0 hands each step's ids to the others (`tp_step`, `tpWorkerStep`) and alone projects the logits.
     tp: ?Shard = null,
+    /// How the tensor sums carry their parts: rank 0's `tpSumWanted`, the same on every rank.
+    tp_sum: TpSumMode = .auto,
     /// A dense head served 8-bit (affine, g64): half the bytes every token reads. Lossy.
     head_8bit: bool = false,
     /// The routed experts stream from the pack's bank (`Dsv41Model.streamed`, bound after the load).
@@ -1730,6 +1734,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     };
     m.pair = opts.pair;
     m.tp = opts.tp;
+    m.tp_sum = opts.tp_sum;
     m.streamed_experts = opts.streamed_experts;
     m.quant = opts.quant;
     defer m.quant = null;
@@ -4313,13 +4318,29 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
     return if (li < m.n_layers) tpSum(sc, m, y) else sc.astype(y, m.act);
 }
 
-/// `x` summed over the tensor-parallel ranks (itself unsplit), in `m.act`: f32 at decode width, so the sum rounds once.
+/// How a tensor group's sums carry their parts: `auto` keeps a pair's rule and sums past a pair in the activation dtype
+/// (JACCL accumulates in f32 and rounds once); `bf16` does so at any size; `f32` sums a wider part wider past a pair.
+pub const TpSumMode = enum(u8) { auto, bf16, f32 };
+
+/// Rank 0's `DSV41_TP_SUM`; its plan carries the mode to the workers, so every rank hands the collective one dtype.
+pub fn tpSumWanted() TpSumMode {
+    const raw = env.get(.DSV41_TP_SUM) orelse return .auto;
+    return std.meta.stringToEnum(TpSumMode, std.mem.span(raw)) orelse .auto;
+}
+
+/// `x` summed over the tensor-parallel ranks (itself unsplit), in `m.act`: f32 at decode width, so the sum rounds once,
+/// unless `m.tp_sum` sums it as it is.
 pub fn tpSum(sc: *Scope, m: *const Dsv41Model, x: A) !A {
     if (m.tp == null) return sc.astype(x, m.act);
     const sum = clusterHooks().tp_sum orelse return error.DsvTpNotJoined;
     // Two ranks' bf16 parts sum as they are: one rounding of their f32 sum, as the cast back makes (JACCL rounds on the
     // CPU, so a tie can land apart). A wider part sums wider at decode width.
-    const as_is = mlx.mlx_array_dtype(x) == m.act and m.tp.?.size == 2;
+    const pair_rule = mlx.mlx_array_dtype(x) == m.act and m.tp.?.size == 2;
+    const as_is = switch (m.tp_sum) {
+        .bf16 => true,
+        .auto => pair_rule or m.tp.?.size > 2,
+        .f32 => pair_rule,
+    };
     const part = if (as_is or dim(x, 0) > region_rows) try sc.astype(x, m.act) else try sc.astype(x, .float32);
     return sc.astype(try sc.keep(try sum(part)), m.act);
 }
@@ -9874,6 +9895,7 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var m: Dsv41Model = undefined;
     m.tp = .{ .rank = 0, .size = 2 };
+    m.tp_sum = .auto;
     m.act = .bfloat16;
     const Seen = struct {
         var dt: mlx.mlx_dtype = .int8;
@@ -9893,6 +9915,15 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
         try testing.expectEqual(dt, Seen.dt);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
     }
+    // Past two ranks every part sums in the activation dtype (JACCL accumulates in f32, one rounding); rank 0's
+    // plan can say f32, which widens every part at decode width.
+    m.tp = .{ .rank = 0, .size = 4 };
+    for ([_]TpSumMode{ .auto, .f32 }) |mode| for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |dt| {
+        m.tp_sum = mode;
+        const y = try tpSum(&sc, &m, try sc.zeros(&.{ 2, 64 }, dt));
+        try testing.expectEqual(if (mode == .f32) mlx.mlx_dtype.float32 else mlx.mlx_dtype.bfloat16, Seen.dt);
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
+    };
 }
 
 test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps the head as the pack ships it" {

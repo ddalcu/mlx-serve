@@ -464,7 +464,7 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 6: a worker names its rank on the bell, and the group may hold more than two Macs.
+/// 6: a worker names its rank on the bell, the group may hold more than two Macs, and the plan carries the tensor sums' mode.
 const VERSION: i32 = 6;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
@@ -584,6 +584,8 @@ const Plan = struct {
     span: LayerSpan,
     hidden: i32,
     experts: i32,
+    /// DeepSeek-V4.1 tensor: how the sums carry their parts (`TpSumMode`), rank 0's choice.
+    sum: u8 = 0,
 
     fn msg(p: Plan, name_len: usize) Msg {
         return .{ MAGIC, @backingInt(p.mode), @intCast(p.span.start), @intCast(p.span.end), @intCast(p.span.total), @intCast(name_len), p.hidden, p.experts };
@@ -605,7 +607,7 @@ const Plan = struct {
             const dst: u32 = @intCast(k);
             try sendMsg(link, p.msg(name.len), dst);
             try sendBytes(link, name, dst);
-            try sendMsg(link, .{ MAGIC, @bitCast(@as(u32, @truncate(id))), @bitCast(@as(u32, @truncate(id >> 32))), 0, 0, 0, 0, 0 }, dst);
+            try sendMsg(link, .{ MAGIC, @bitCast(@as(u32, @truncate(id))), @bitCast(@as(u32, @truncate(id >> 32))), 0, p.sum, 0, 0, 0 }, dst);
         }
         return id;
     }
@@ -1213,7 +1215,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
         .tensor => {
             self.shard = .{ .rank = 0, .size = self.link.size };
             log.info("[dist] tensor: every expert and attention head of {s} split across {d} Macs\n", .{ std.fs.path.basename(self.model), self.link.size });
-            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts) };
+            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .sum = @intFromEnum(dsv41_mod.tpSumWanted()) };
             self.plan_id = try pl.send(&self.link, model_dir);
             self.planned = true;
             cluster().tp_link = &self.link;
@@ -1439,7 +1441,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     };
     defer w.deinit();
     const binding = config.plugin orelse return error.NotPluginServed;
-    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
+    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .tp_sum = @enumFromInt(pl.sum), .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;
@@ -1844,7 +1846,7 @@ fn watchHost(b: Bell) void {
 /// One plan: finds and loads this Mac's part, then serves until rank 0 stops it (false) or
 /// releases it (true: the host unloaded the model and may plan again).
 fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots: []const []const u8, pmsg: Msg) !bool {
-    const pl = try Plan.parse(pmsg);
+    var pl = try Plan.parse(pmsg);
     var name_buf: [256]u8 = undefined;
     const name_len: usize = @intCast(pmsg[5]);
     if (name_len == 0 or name_len > name_buf.len) return error.DistBadMessage;
@@ -1853,6 +1855,8 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     const idm = try recvMsg(link, 0);
     if (idm[0] != MAGIC) return error.DistProtocolMismatch;
     const id = @as(u64, @as(u32, @bitCast(idm[1]))) | @as(u64, @as(u32, @bitCast(idm[2]))) << 32;
+    if (idm[4] < 0 or idm[4] >= std.enums.values(dsv41_mod.TpSumMode).len) return error.DistBadMessage;
+    pl.sum = @intCast(idm[4]);
     switch (pl.mode) {
         .pipeline => log.info("[dist] worker: {s} layers {d}..{d} of {d} (pipeline)\n", .{ name, pl.span.start, pl.span.end, pl.span.total }),
         .tensor => log.info("[dist] worker rank {d}: {s}, 1/{d} of every expert (tensor)\n", .{ link.rank, name, link.size }),
