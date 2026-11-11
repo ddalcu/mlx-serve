@@ -366,7 +366,7 @@ class DownloadManager: ObservableObject {
     nonisolated static func requiredMediaMarker(modelType: String) -> String? {
         switch modelType {
         case "AudioVideo": return "connector.safetensors"
-        case "minimax_h3": return "transformer.safetensors"
+        case "minimax_h3", "minimax_h3_image": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
         case "yue2": return "vae.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
