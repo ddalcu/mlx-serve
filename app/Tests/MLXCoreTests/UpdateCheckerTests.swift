@@ -4,9 +4,9 @@ import XCTest
 /// Pins the pure logic behind the in-app updater (Services/UpdateChecker.swift):
 /// CalVer tag parsing/comparison, GitHub `releases/latest` JSON → `AppUpdate`
 /// extraction (DMG asset pick, draft/prerelease skip), the daily auto-check
-/// throttle, and the mounted-DMG app-bundle discovery used by the installer.
-/// The network fetch, hdiutil mount, and bundle swap are exercised live; the
-/// decisions they act on are all pinned here.
+/// throttle, what a check keeps across a relaunch (fetch stubbed), and the
+/// mounted-DMG app-bundle discovery used by the installer. The hdiutil mount
+/// and bundle swap are exercised live.
 final class UpdateCheckerTests: XCTestCase {
 
     // MARK: - CalVer parsing
