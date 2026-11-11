@@ -1244,7 +1244,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             const stages = dsv41DraftShard(config, self.link.size);
             self.shard = .{ .rank = 0, .size = self.link.size, .stages = stages };
             log.info("[dist] tensor: every expert and attention head of {s} split across {d} Macs; DSpark drafts on {s}\n", .{ std.fs.path.basename(self.model), self.link.size, if (stages) "every rank" else "rank 0 alone" });
-            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .stages = stages, .sum = @intFromEnum(dsv41_mod.tpSumWanted()), .head8 = dsv41_mod.head8Wanted() };
+            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .stages = stages, .sum = @intFromEnum(try dsv41_mod.tpSumWanted()), .head8 = dsv41_mod.head8Wanted() };
             self.plan_id = try pl.send(&self.link, model_dir);
             self.planned = true;
             cluster().tp_link = &self.link;

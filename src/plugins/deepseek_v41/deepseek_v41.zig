@@ -4458,9 +4458,17 @@ pub fn moe(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, img: A) !A {
 pub const TpSumMode = enum(u8) { auto, bf16, f32 };
 
 /// Rank 0's `DSV41_TP_SUM`; its plan carries the mode to the workers, so every rank hands the collective one dtype.
-pub fn tpSumWanted() TpSumMode {
-    const raw = env.get(.DSV41_TP_SUM) orelse return .auto;
-    return std.meta.stringToEnum(TpSumMode, std.mem.span(raw)) orelse .auto;
+/// A value it does not know refuses the load, as a worker refuses a mode it does not know.
+pub fn tpSumWanted() !TpSumMode {
+    return tpSumFrom(env.get(.DSV41_TP_SUM));
+}
+
+fn tpSumFrom(v: ?[*:0]const u8) !TpSumMode {
+    const raw = std.mem.span(v orelse return .auto);
+    return std.meta.stringToEnum(TpSumMode, raw) orelse {
+        log.err("deepseek_v41: DSV41_TP_SUM={s} is not a mode (auto, bf16, f32)\n", .{raw});
+        return error.DsvTpSumUnknown;
+    };
 }
 
 /// `x` summed over the tensor-parallel ranks (itself unsplit), in `m.act`: f32 at decode width, so the sum rounds once,
@@ -10210,6 +10218,14 @@ test "dsv41 tensor parallel: two ranks sum a bf16 part as it is, a wider part at
         try testing.expectEqual(if (mode == .f32) mlx.mlx_dtype.float32 else mlx.mlx_dtype.bfloat16, Seen.dt);
         try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(y));
     };
+}
+
+test "dsv41 tp sum: unset is auto, a known mode passes, an unknown one refuses the load" {
+    try testing.expectEqual(TpSumMode.auto, try tpSumFrom(null));
+    try testing.expectEqual(TpSumMode.bf16, try tpSumFrom("bf16"));
+    try testing.expectEqual(TpSumMode.f32, try tpSumFrom("f32"));
+    try testing.expectError(error.DsvTpSumUnknown, tpSumFrom("off"));
+    try testing.expectError(error.DsvTpSumUnknown, tpSumFrom("fp32"));
 }
 
 test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps the head as the pack ships it" {
