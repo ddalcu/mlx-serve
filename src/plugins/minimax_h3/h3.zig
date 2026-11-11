@@ -2103,6 +2103,8 @@ pub const Model = struct {
         m.cfg = cfg;
         m.dtype = dt;
         m.ablate = .none;
+        m.split = null;
+        m.vsa = null;
         m.ane_eng = null;
         m.ane_rest = &.{};
 
