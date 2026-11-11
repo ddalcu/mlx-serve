@@ -2257,6 +2257,10 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
         }
     }
     const cfg = try parseArgs(rest[0..n_rest]);
+    if (soak > 0 and cfg.size > 2) {
+        log.err("[dist-probe] --soak times a pair's hop: it takes --size 2\n", .{});
+        return error.InvalidArgs;
+    }
     var link = try Link.open(io, cfg);
     defer link.deinit();
     const s = mlx.mlx_default_gpu_stream_new();
@@ -2265,8 +2269,10 @@ pub fn cmdProbe(io: std.Io, args: []const []const u8) !void {
     if (soak > 0) return soakLink(io, &link, other, soak, s);
     if (chain) return chainProbe(io, &link, s);
 
+    // Round trips pair rank 0 with rank 1; the all_sum below is the part every rank of a larger group joins.
     const sizes = [_]c_int{ 1, 5120, 10240, 262144, 6553600 }; // f32 elements: 4 B .. 25 MB
-    for (sizes) |n| {
+    const pair_rounds = if (link.size == 2) sizes[0..] else sizes[0..0];
+    for (pair_rounds) |n| {
         const shape = [_]c_int{n};
         var x = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_ones(&x, &shape, 1, .float32, s));
