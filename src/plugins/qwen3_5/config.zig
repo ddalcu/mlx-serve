@@ -195,8 +195,9 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
         const jang = jangNotes(dir) catch return unsupported("jang_config.json");
         if (jang.expand) return unsupported("a JANG affine expansion");
         // `unsupported` takes a comptime string, so the two misses stay separate returns.
-        if (rotationBlock(root, dir)) |block| {
-            c.hadamard_block = block;
+        const block = rotationBlock(root, dir) catch return unsupported("hadamard.json");
+        if (block) |found| {
+            c.hadamard_block = found;
             c.centred_language_norms = jang.centred;
         } else if (field(root, "modules") != null) {
             return unsupported("modules without one shared rotation block");
@@ -300,7 +301,7 @@ pub fn ternaryAffine(root: std.json.ObjectMap) bool {
 
 /// The rotation block: `hadamard.block_size`, else one shared `modules[].block`, else `hadamard.json`'s
 /// `prism.hadamard.block_size`. Null when the pack names none, or its modules disagree.
-pub fn rotationBlock(root: std.json.ObjectMap, dir: *const abi.PackDir) ?u32 {
+pub fn rotationBlock(root: std.json.ObjectMap, dir: *const abi.PackDir) error{TooLarge}!?u32 {
     if (objectBlock(root)) |b| return b;
     // A modules list that disagrees is not "no list": do not fall through to the sidecar.
     if (field(root, "modules") != null) return modulesBlock(root);
@@ -331,8 +332,8 @@ fn nonzero(v: ?u32) ?u32 {
     return if (n == 0) null else n;
 }
 
-fn sidecarBlock(dir: *const abi.PackDir) ?u32 {
-    const bytes = readWhole(dir, "hadamard.json") orelse return null;
+fn sidecarBlock(dir: *const abi.PackDir) error{TooLarge}!?u32 {
+    const bytes = try readWhole(dir, "hadamard.json") orelse return null;
     defer gpa.free(bytes);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -345,7 +346,8 @@ const JangNotes = struct { expand: bool = false, centred: bool = false };
 
 /// Top-level `requires_jang_affine1_expansion` and `layout.language_norms`. A missing file is neither.
 fn jangNotes(dir: *const abi.PackDir) error{Broken}!JangNotes {
-    const bytes = readWhole(dir, "jang_config.json") orelse return .{};
+    const found = readWhole(dir, "jang_config.json") catch return error.Broken;
+    const bytes = found orelse return .{};
     defer gpa.free(bytes);
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -359,16 +361,29 @@ fn jangNotes(dir: *const abi.PackDir) error{Broken}!JangNotes {
     return .{ .expand = expand, .centred = centred };
 }
 
-fn readWhole(dir: *const abi.PackDir, name: []const u8) ?[]u8 {
+/// `hadamard.json` is the sign payload. Past this the file is not a note we parse.
+const note_cap: u64 = 8 << 20;
+
+fn readWhole(dir: *const abi.PackDir, name: []const u8) error{TooLarge}!?[]u8 {
     const n = dir.fileBytes(name);
     if (n == 0) return null;
-    const buf = gpa.alloc(u8, @intCast(n)) catch return null;
+    if (n > note_cap) return error.TooLarge;
+    const buf = gpa.alloc(u8, @intCast(n)) catch return error.TooLarge;
     var why: abi.Verdict = .{};
-    const bytes = dir.readFile(name, buf, &why) orelse {
+    const got = dir.readFile(name, buf, &why) orelse {
+        gpa.free(buf);
+        return if (why.code == .too_large) error.TooLarge else null;
+    };
+    // `readFile` returns `buf[0..len]`. A shorter fill is shrunk so the free is the allocation.
+    if (got.len == buf.len) return buf;
+    if (got.len == 0) {
         gpa.free(buf);
         return null;
+    }
+    return gpa.realloc(buf, got.len) catch {
+        gpa.free(buf);
+        return error.TooLarge;
     };
-    return bytes;
 }
 
 /// One snapshot of every linear layer's recurrent state and conv window (`ModelConfig.ssmCheckpointBytes`).
