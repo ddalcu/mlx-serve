@@ -681,7 +681,12 @@ pub const CodecDecoder = struct {
     }
 
     /// Decode codes [T][16] → waveform samples (f32, owned).
-    pub fn decode(self: *CodecDecoder, codes: []const []const u32) ![]f32 {
+    pub fn decode(self: *CodecDecoder, codes: []const [16]u32) ![]f32 {
+        return self.decodeSlice(@ptrCast(codes));
+    }
+
+    /// `decode` for a frame table whose width the caller knows at runtime.
+    pub fn decodeSlice(self: *CodecDecoder, codes: []const []const u32) ![]f32 {
         const s = self.s;
         const T: u32 = @intCast(codes.len);
 
@@ -965,6 +970,46 @@ fn computeCodebook(w: *const Weights, a: std.mem.Allocator, s: S, comptime base_
     return embed_w;
 }
 
+/// The codec config (both halves' geometry), the tokenizer dir's `config.json`
+/// read once, and its weights opened once. A caller that decodes AND encodes
+/// holds one `Bundle` instead of two weight loads of the same file.
+pub const Bundle = struct {
+    allocator: std.mem.Allocator,
+    cfg: CodecConfig,
+    w: Weights,
+
+    /// `tokenizer_dir` holds `model.safetensors` with this codec layout
+    /// (Qwen3-TTS `speech_tokenizer/`, Breeze `audio_tokenizer/`). A missing
+    /// `config.json` keeps the published geometry.
+    pub fn open(io: std.Io, allocator: std.mem.Allocator, tokenizer_dir: []const u8) !Bundle {
+        var w = try model_mod.loadWeights(io, allocator, tokenizer_dir);
+        errdefer w.deinit();
+        var cfg = readCodecConfig(io, allocator, tokenizer_dir) catch CodecConfig{};
+        cfg.rvq_codebook_dim = cfg.codebook_dim / 2;
+        if (!cfg.supported()) return error.UnsupportedCodecGeometry;
+        return .{ .allocator = allocator, .cfg = cfg, .w = w };
+    }
+
+    pub fn close(self: *Bundle) void {
+        self.w.deinit();
+    }
+
+    /// The decoder half, on stream `s`.
+    pub fn decoder(self: *Bundle, s: S) !CodecDecoder {
+        return loadCodecDecoderWith(self.allocator, s, &self.cfg, &self.w);
+    }
+
+    /// The encoder half, on stream `s`.
+    pub fn encoder(self: *Bundle, s: S) !MimiEncoder {
+        return loadMimiEncoderWith(self.allocator, s, &self.cfg, &self.w);
+    }
+};
+
+/// Load the decoder from an open `Bundle`.
+pub fn loadDecoder(b: *Bundle, s: S) !CodecDecoder {
+    return b.decoder(s);
+}
+
 pub fn loadCodecDecoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !CodecDecoder {
     const dir = try std.fmt.allocPrint(allocator, "{s}/speech_tokenizer", .{model_dir});
     defer allocator.free(dir);
@@ -975,73 +1020,75 @@ pub fn loadCodecDecoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_di
 /// `model.safetensors` with this decoder layout): Qwen3-TTS `speech_tokenizer/`
 /// or Breeze `audio_tokenizer/`.
 pub fn loadCodecDecoderFrom(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer_dir: []const u8) !CodecDecoder {
-    var w = try model_mod.loadWeights(io, allocator, tokenizer_dir);
-    defer w.deinit();
+    var b = try Bundle.open(io, allocator, tokenizer_dir);
+    return b.decoder(s);
+}
+
+fn loadCodecDecoderWith(allocator: std.mem.Allocator, s: S, cfg: *const CodecConfig, w: *Weights) !CodecDecoder {
 
     var d: CodecDecoder = undefined;
-    d.cfg = readCodecConfig(io, allocator, tokenizer_dir) catch CodecConfig{};
-    if (!d.cfg.supported()) return error.UnsupportedCodecGeometry;
+    d.cfg = cfg.*;
     d.allocator = allocator;
     d.s = s;
 
     // Quantizer.
-    d.rvq_first_cb = try computeCodebook(&w, allocator, s, "decoder.quantizer.rvq_first.vq.layers.0._codebook", .{});
-    d.rvq_first_oproj = try ownConvW(&w, "decoder.quantizer.rvq_first.output_proj.weight", s);
+    d.rvq_first_cb = try computeCodebook(w, allocator, s, "decoder.quantizer.rvq_first.vq.layers.0._codebook", .{});
+    d.rvq_first_oproj = try ownConvW(w, "decoder.quantizer.rvq_first.output_proj.weight", s);
     d.rvq_rest_cb = try allocator.alloc(mlx.mlx_array, d.cfg.num_quant - d.cfg.num_sem);
     for (0..d.rvq_rest_cb.len) |i| {
-        d.rvq_rest_cb[i] = try computeCodebook(&w, allocator, s, "decoder.quantizer.rvq_rest.vq.layers.{d}._codebook", .{i});
+        d.rvq_rest_cb[i] = try computeCodebook(w, allocator, s, "decoder.quantizer.rvq_rest.vq.layers.{d}._codebook", .{i});
     }
-    d.rvq_rest_oproj = try ownConvW(&w, "decoder.quantizer.rvq_rest.output_proj.weight", s);
+    d.rvq_rest_oproj = try ownConvW(w, "decoder.quantizer.rvq_rest.output_proj.weight", s);
 
     // pre_conv.
-    d.pre_conv_w = try ownConvW(&w, "decoder.pre_conv.conv.weight", s);
-    d.pre_conv_b = try ownWeight(&w, "decoder.pre_conv.conv.bias");
+    d.pre_conv_w = try ownConvW(w, "decoder.pre_conv.conv.weight", s);
+    d.pre_conv_b = try ownWeight(w, "decoder.pre_conv.conv.bias");
 
     // pre_transformer.
-    d.pt_in_t = try ownT(&w, "decoder.pre_transformer.input_proj.weight", s);
-    d.pt_in_b = try ownWeight(&w, "decoder.pre_transformer.input_proj.bias");
-    d.pt_out_t = try ownT(&w, "decoder.pre_transformer.output_proj.weight", s);
-    d.pt_out_b = try ownWeight(&w, "decoder.pre_transformer.output_proj.bias");
-    d.pt_norm = try ownWeight(&w, "decoder.pre_transformer.norm.weight");
+    d.pt_in_t = try ownT(w, "decoder.pre_transformer.input_proj.weight", s);
+    d.pt_in_b = try ownWeight(w, "decoder.pre_transformer.input_proj.bias");
+    d.pt_out_t = try ownT(w, "decoder.pre_transformer.output_proj.weight", s);
+    d.pt_out_b = try ownWeight(w, "decoder.pre_transformer.output_proj.bias");
+    d.pt_norm = try ownWeight(w, "decoder.pre_transformer.norm.weight");
     d.pt_layers = try allocator.alloc(CodecTfLayer, d.cfg.layers);
     for (d.pt_layers, 0..) |*layer, i| {
         const p = "decoder.pre_transformer.layers.{d}.{s}";
         layer.* = .{
-            .input_ln = try ownWfmt(&w, allocator, p, .{ i, "input_layernorm.weight" }),
-            .post_ln = try ownWfmt(&w, allocator, p, .{ i, "post_attention_layernorm.weight" }),
-            .q_t = try ownTfmt(&w, s, allocator, p, .{ i, "self_attn.q_proj.weight" }),
-            .k_t = try ownTfmt(&w, s, allocator, p, .{ i, "self_attn.k_proj.weight" }),
-            .v_t = try ownTfmt(&w, s, allocator, p, .{ i, "self_attn.v_proj.weight" }),
-            .o_t = try ownTfmt(&w, s, allocator, p, .{ i, "self_attn.o_proj.weight" }),
-            .attn_scale = try ownWfmt(&w, allocator, p, .{ i, "self_attn_layer_scale.scale" }),
-            .mlp_scale = try ownWfmt(&w, allocator, p, .{ i, "mlp_layer_scale.scale" }),
-            .gate_t = try ownTfmt(&w, s, allocator, p, .{ i, "mlp.gate_proj.weight" }),
-            .up_t = try ownTfmt(&w, s, allocator, p, .{ i, "mlp.up_proj.weight" }),
-            .down_t = try ownTfmt(&w, s, allocator, p, .{ i, "mlp.down_proj.weight" }),
+            .input_ln = try ownWfmt(w, allocator, p, .{ i, "input_layernorm.weight" }),
+            .post_ln = try ownWfmt(w, allocator, p, .{ i, "post_attention_layernorm.weight" }),
+            .q_t = try ownTfmt(w, s, allocator, p, .{ i, "self_attn.q_proj.weight" }),
+            .k_t = try ownTfmt(w, s, allocator, p, .{ i, "self_attn.k_proj.weight" }),
+            .v_t = try ownTfmt(w, s, allocator, p, .{ i, "self_attn.v_proj.weight" }),
+            .o_t = try ownTfmt(w, s, allocator, p, .{ i, "self_attn.o_proj.weight" }),
+            .attn_scale = try ownWfmt(w, allocator, p, .{ i, "self_attn_layer_scale.scale" }),
+            .mlp_scale = try ownWfmt(w, allocator, p, .{ i, "mlp_layer_scale.scale" }),
+            .gate_t = try ownTfmt(w, s, allocator, p, .{ i, "mlp.gate_proj.weight" }),
+            .up_t = try ownTfmt(w, s, allocator, p, .{ i, "mlp.up_proj.weight" }),
+            .down_t = try ownTfmt(w, s, allocator, p, .{ i, "mlp.down_proj.weight" }),
         };
     }
 
     // upsample blocks.
     for (0..2) |i| {
-        d.up_conv_w[i] = try ownConvTWfmt(&w, s, allocator, "decoder.upsample.{d}.0.conv.weight", .{i});
-        d.up_conv_b[i] = try ownWfmt(&w, allocator, "decoder.upsample.{d}.0.conv.bias", .{i});
+        d.up_conv_w[i] = try ownConvTWfmt(w, s, allocator, "decoder.upsample.{d}.0.conv.weight", .{i});
+        d.up_conv_b[i] = try ownWfmt(w, allocator, "decoder.upsample.{d}.0.conv.bias", .{i});
         const cp = "decoder.upsample.{d}.1.{s}";
         d.up_cnext[i] = .{
-            .dwconv_w = try ownConvWfmt(&w, s, allocator, "decoder.upsample.{d}.1.dwconv.conv.weight", .{i}),
-            .dwconv_b = try ownWfmt(&w, allocator, "decoder.upsample.{d}.1.dwconv.conv.bias", .{i}),
-            .ln_w = try ownWfmt(&w, allocator, cp, .{ i, "norm.weight" }),
-            .ln_b = try ownWfmt(&w, allocator, cp, .{ i, "norm.bias" }),
-            .pw1_t = try ownTfmt(&w, s, allocator, cp, .{ i, "pwconv1.weight" }),
-            .pw1_b = try ownWfmt(&w, allocator, cp, .{ i, "pwconv1.bias" }),
-            .pw2_t = try ownTfmt(&w, s, allocator, cp, .{ i, "pwconv2.weight" }),
-            .pw2_b = try ownWfmt(&w, allocator, cp, .{ i, "pwconv2.bias" }),
-            .gamma = try ownWfmt(&w, allocator, cp, .{ i, "gamma" }),
+            .dwconv_w = try ownConvWfmt(w, s, allocator, "decoder.upsample.{d}.1.dwconv.conv.weight", .{i}),
+            .dwconv_b = try ownWfmt(w, allocator, "decoder.upsample.{d}.1.dwconv.conv.bias", .{i}),
+            .ln_w = try ownWfmt(w, allocator, cp, .{ i, "norm.weight" }),
+            .ln_b = try ownWfmt(w, allocator, cp, .{ i, "norm.bias" }),
+            .pw1_t = try ownTfmt(w, s, allocator, cp, .{ i, "pwconv1.weight" }),
+            .pw1_b = try ownWfmt(w, allocator, cp, .{ i, "pwconv1.bias" }),
+            .pw2_t = try ownTfmt(w, s, allocator, cp, .{ i, "pwconv2.weight" }),
+            .pw2_b = try ownWfmt(w, allocator, cp, .{ i, "pwconv2.bias" }),
+            .gamma = try ownWfmt(w, allocator, cp, .{ i, "gamma" }),
         };
     }
 
     // decoder: init conv.
-    d.dec_init_w = try ownConvW(&w, "decoder.decoder.0.conv.weight", s);
-    d.dec_init_b = try ownWeight(&w, "decoder.decoder.0.conv.bias");
+    d.dec_init_w = try ownConvW(w, "decoder.decoder.0.conv.weight", s);
+    d.dec_init_b = try ownWeight(w, "decoder.decoder.0.conv.bias");
     // 4 decoder blocks (keys decoder.decoder.1..4).
     for (0..4) |bi| {
         const layer_idx = bi + 1;
@@ -1052,33 +1099,33 @@ pub fn loadCodecDecoderFrom(io: std.Io, allocator: std.mem.Allocator, s: S, toke
         blk.in_dim = in_dim;
         blk.out_dim = out_dim;
         blk.rate = rate;
-        blk.snake_a = try ownWfmt(&w, allocator, "decoder.decoder.{d}.block.0.alpha", .{layer_idx});
-        blk.snake_b = try ownWfmt(&w, allocator, "decoder.decoder.{d}.block.0.beta", .{layer_idx});
-        blk.up_w = try ownConvTWfmt(&w, s, allocator, "decoder.decoder.{d}.block.1.conv.weight", .{layer_idx});
-        blk.up_b = try ownWfmt(&w, allocator, "decoder.decoder.{d}.block.1.conv.bias", .{layer_idx});
+        blk.snake_a = try ownWfmt(w, allocator, "decoder.decoder.{d}.block.0.alpha", .{layer_idx});
+        blk.snake_b = try ownWfmt(w, allocator, "decoder.decoder.{d}.block.0.beta", .{layer_idx});
+        blk.up_w = try ownConvTWfmt(w, s, allocator, "decoder.decoder.{d}.block.1.conv.weight", .{layer_idx});
+        blk.up_b = try ownWfmt(w, allocator, "decoder.decoder.{d}.block.1.conv.bias", .{layer_idx});
         const dils = [_]u32{ 1, 3, 9 };
         for (0..3) |ui| {
             const bidx = ui + 2; // block.2/3/4
             const up = "decoder.decoder.{d}.block.{d}.{s}";
             blk.units[ui] = .{
-                .a1 = try ownWfmt(&w, allocator, up, .{ layer_idx, bidx, "act1.alpha" }),
-                .b1 = try ownWfmt(&w, allocator, up, .{ layer_idx, bidx, "act1.beta" }),
-                .c1_w = try ownConvWfmt(&w, s, allocator, up, .{ layer_idx, bidx, "conv1.conv.weight" }),
-                .c1_b = try ownWfmt(&w, allocator, up, .{ layer_idx, bidx, "conv1.conv.bias" }),
-                .a2 = try ownWfmt(&w, allocator, up, .{ layer_idx, bidx, "act2.alpha" }),
-                .b2 = try ownWfmt(&w, allocator, up, .{ layer_idx, bidx, "act2.beta" }),
-                .c2_w = try ownConvWfmt(&w, s, allocator, up, .{ layer_idx, bidx, "conv2.conv.weight" }),
-                .c2_b = try ownWfmt(&w, allocator, up, .{ layer_idx, bidx, "conv2.conv.bias" }),
+                .a1 = try ownWfmt(w, allocator, up, .{ layer_idx, bidx, "act1.alpha" }),
+                .b1 = try ownWfmt(w, allocator, up, .{ layer_idx, bidx, "act1.beta" }),
+                .c1_w = try ownConvWfmt(w, s, allocator, up, .{ layer_idx, bidx, "conv1.conv.weight" }),
+                .c1_b = try ownWfmt(w, allocator, up, .{ layer_idx, bidx, "conv1.conv.bias" }),
+                .a2 = try ownWfmt(w, allocator, up, .{ layer_idx, bidx, "act2.alpha" }),
+                .b2 = try ownWfmt(w, allocator, up, .{ layer_idx, bidx, "act2.beta" }),
+                .c2_w = try ownConvWfmt(w, s, allocator, up, .{ layer_idx, bidx, "conv2.conv.weight" }),
+                .c2_b = try ownWfmt(w, allocator, up, .{ layer_idx, bidx, "conv2.conv.bias" }),
                 .dilation = dils[ui],
             };
         }
         d.dec_blocks[bi] = blk;
     }
     // output snake + conv (keys decoder.decoder.5 / .6).
-    d.out_snake_a = try ownWeight(&w, "decoder.decoder.5.alpha");
-    d.out_snake_b = try ownWeight(&w, "decoder.decoder.5.beta");
-    d.out_conv_w = try ownConvW(&w, "decoder.decoder.6.conv.weight", s);
-    d.out_conv_b = try ownWeight(&w, "decoder.decoder.6.conv.bias");
+    d.out_snake_a = try ownWeight(w, "decoder.decoder.5.alpha");
+    d.out_snake_b = try ownWeight(w, "decoder.decoder.5.beta");
+    d.out_conv_w = try ownConvW(w, "decoder.decoder.6.conv.weight", s);
+    d.out_conv_b = try ownWeight(w, "decoder.decoder.6.conv.bias");
 
     return d;
 }
@@ -1240,7 +1287,6 @@ fn recomputeCodebookEncode(w: *const Weights, a: std.mem.Allocator, s: S, compti
 pub const MimiEncoder = struct {
     cfg: CodecConfig,
     allocator: std.mem.Allocator,
-    io: std.Io,
     s: S,
 
     enc_convs: [6]mlx.mlx_array,
@@ -1489,63 +1535,65 @@ fn hostNlc(samples: []const f32, channels: u32, alloc: std.mem.Allocator, s: S) 
 
 /// Load the `audio_tokenizer` encoder weights into a `MimiEncoder`.
 pub fn loadMimiEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer_dir: []const u8) !MimiEncoder {
-    var w = try model_mod.loadWeights(io, allocator, tokenizer_dir);
-    defer w.deinit();
+    var b = try Bundle.open(io, allocator, tokenizer_dir);
+    return b.encoder(s);
+}
+
+fn loadMimiEncoderWith(allocator: std.mem.Allocator, s: S, cfg: *const CodecConfig, w: *Weights) !MimiEncoder {
 
     var e: MimiEncoder = undefined;
-    e.cfg = .{};
+    e.cfg = cfg.*;
     // Encoder transformer geometry (encoder_transformer_config): heads 8 /
     // kv 8, NOT the decoder's 16. head_dim 64 from q_proj [512,512] / 8.
     e.cfg.heads = 8;
     e.cfg.kv = 8;
     e.allocator = allocator;
-    e.io = io;
     e.s = s;
 
-    e.enc_convs[0] = try ownConvW(&w, "encoder.encoder.layers.0.conv.weight", s);
-    e.enc_biases[0] = try ownWeight(&w, "encoder.encoder.layers.0.conv.bias");
+    e.enc_convs[0] = try ownConvW(w, "encoder.encoder.layers.0.conv.weight", s);
+    e.enc_biases[0] = try ownWeight(w, "encoder.encoder.layers.0.conv.bias");
     // resnet + ratio conv pairs (layers.1=res, layers.3=conv; layers.4=res, layers.6=conv; ...)
     const res_pairs = [_]usize{ 1, 4, 7, 10 };
     const conv_pairs = [_]usize{ 3, 6, 9, 12 };
     for (0..4) |i| {
         e.enc_resnets[i] = .{
-            .c1_w = try ownConvWfmt(&w, s, allocator, "encoder.encoder.layers.{d}.block.1.conv.weight", .{res_pairs[i]}),
-            .c1_b = try ownWfmt(&w, allocator, "encoder.encoder.layers.{d}.block.1.conv.bias", .{res_pairs[i]}),
-            .c2_w = try ownConvWfmt(&w, s, allocator, "encoder.encoder.layers.{d}.block.3.conv.weight", .{res_pairs[i]}),
-            .c2_b = try ownWfmt(&w, allocator, "encoder.encoder.layers.{d}.block.3.conv.bias", .{res_pairs[i]}),
+            .c1_w = try ownConvWfmt(w, s, allocator, "encoder.encoder.layers.{d}.block.1.conv.weight", .{res_pairs[i]}),
+            .c1_b = try ownWfmt(w, allocator, "encoder.encoder.layers.{d}.block.1.conv.bias", .{res_pairs[i]}),
+            .c2_w = try ownConvWfmt(w, s, allocator, "encoder.encoder.layers.{d}.block.3.conv.weight", .{res_pairs[i]}),
+            .c2_b = try ownWfmt(w, allocator, "encoder.encoder.layers.{d}.block.3.conv.bias", .{res_pairs[i]}),
         };
-        e.enc_convs[i + 1] = try ownConvWfmt(&w, s, allocator, "encoder.encoder.layers.{d}.conv.weight", .{conv_pairs[i]});
-        e.enc_biases[i + 1] = try ownWfmt(&w, allocator, "encoder.encoder.layers.{d}.conv.bias", .{conv_pairs[i]});
+        e.enc_convs[i + 1] = try ownConvWfmt(w, s, allocator, "encoder.encoder.layers.{d}.conv.weight", .{conv_pairs[i]});
+        e.enc_biases[i + 1] = try ownWfmt(w, allocator, "encoder.encoder.layers.{d}.conv.bias", .{conv_pairs[i]});
     }
-    e.enc_convs[5] = try ownConvW(&w, "encoder.encoder.layers.14.conv.weight", s);
-    e.enc_biases[5] = try ownWeight(&w, "encoder.encoder.layers.14.conv.bias");
+    e.enc_convs[5] = try ownConvW(w, "encoder.encoder.layers.14.conv.weight", s);
+    e.enc_biases[5] = try ownWeight(w, "encoder.encoder.layers.14.conv.bias");
 
-    e.ds_w = try ownConvW(&w, "encoder.downsample.conv.weight", s);
+    e.ds_w = try ownConvW(w, "encoder.downsample.conv.weight", s);
 
     e.et_layers = try allocator.alloc(EncTfLayer, 8);
     for (e.et_layers, 0..) |*layer, i| {
         const p = "encoder.encoder_transformer.layers.{d}.{s}";
         layer.* = .{
-            .input_ln_w = try ownWfmt(&w, allocator, p, .{ i, "input_layernorm.weight" }),
-            .input_ln_b = try ownWfmt(&w, allocator, p, .{ i, "input_layernorm.bias" }),
-            .post_ln_w = try ownWfmt(&w, allocator, p, .{ i, "post_attention_layernorm.weight" }),
-            .post_ln_b = try ownWfmt(&w, allocator, p, .{ i, "post_attention_layernorm.bias" }),
-            .q_t = try ownTfmt(&w, s, allocator, p, .{ i, "self_attn.q_proj.weight" }),
-            .k_t = try ownTfmt(&w, s, allocator, p, .{ i, "self_attn.k_proj.weight" }),
-            .v_t = try ownTfmt(&w, s, allocator, p, .{ i, "self_attn.v_proj.weight" }),
-            .o_t = try ownTfmt(&w, s, allocator, p, .{ i, "self_attn.o_proj.weight" }),
-            .attn_scale = try ownWfmt(&w, allocator, p, .{ i, "self_attn_layer_scale.scale" }),
-            .mlp_scale = try ownWfmt(&w, allocator, p, .{ i, "mlp_layer_scale.scale" }),
-            .fc1_t = try ownTfmt(&w, s, allocator, "encoder.encoder_transformer.layers.{d}.mlp.fc1.weight", .{i}),
-            .fc2_t = try ownTfmt(&w, s, allocator, "encoder.encoder_transformer.layers.{d}.mlp.fc2.weight", .{i}),
+            .input_ln_w = try ownWfmt(w, allocator, p, .{ i, "input_layernorm.weight" }),
+            .input_ln_b = try ownWfmt(w, allocator, p, .{ i, "input_layernorm.bias" }),
+            .post_ln_w = try ownWfmt(w, allocator, p, .{ i, "post_attention_layernorm.weight" }),
+            .post_ln_b = try ownWfmt(w, allocator, p, .{ i, "post_attention_layernorm.bias" }),
+            .q_t = try ownTfmt(w, s, allocator, p, .{ i, "self_attn.q_proj.weight" }),
+            .k_t = try ownTfmt(w, s, allocator, p, .{ i, "self_attn.k_proj.weight" }),
+            .v_t = try ownTfmt(w, s, allocator, p, .{ i, "self_attn.v_proj.weight" }),
+            .o_t = try ownTfmt(w, s, allocator, p, .{ i, "self_attn.o_proj.weight" }),
+            .attn_scale = try ownWfmt(w, allocator, p, .{ i, "self_attn_layer_scale.scale" }),
+            .mlp_scale = try ownWfmt(w, allocator, p, .{ i, "mlp_layer_scale.scale" }),
+            .fc1_t = try ownTfmt(w, s, allocator, "encoder.encoder_transformer.layers.{d}.mlp.fc1.weight", .{i}),
+            .fc2_t = try ownTfmt(w, s, allocator, "encoder.encoder_transformer.layers.{d}.mlp.fc2.weight", .{i}),
         };
     }
 
-    e.sem_in = try ownConvW(&w, "encoder.quantizer.semantic_residual_vector_quantizer.input_proj.weight", s);
-    e.sem_cb = try recomputeCodebookEncode(&w, allocator, s, "encoder.quantizer.semantic_residual_vector_quantizer.layers.0.codebook", .{});
-    e.ac_in = try ownConvW(&w, "encoder.quantizer.acoustic_residual_vector_quantizer.input_proj.weight", s);
+    e.sem_in = try ownConvW(w, "encoder.quantizer.semantic_residual_vector_quantizer.input_proj.weight", s);
+    e.sem_cb = try recomputeCodebookEncode(w, allocator, s, "encoder.quantizer.semantic_residual_vector_quantizer.layers.0.codebook", .{});
+    e.ac_in = try ownConvW(w, "encoder.quantizer.acoustic_residual_vector_quantizer.input_proj.weight", s);
     e.ac_cbs = try allocator.alloc(mlx.mlx_array, 15);
-    for (e.ac_cbs, 0..) |*cb, i| cb.* = try recomputeCodebookEncode(&w, allocator, s, "encoder.quantizer.acoustic_residual_vector_quantizer.layers.{d}.codebook", .{i});
+    for (e.ac_cbs, 0..) |*cb, i| cb.* = try recomputeCodebookEncode(w, allocator, s, "encoder.quantizer.acoustic_residual_vector_quantizer.layers.{d}.codebook", .{i});
     return e;
 }
 
