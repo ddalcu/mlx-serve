@@ -256,7 +256,6 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
     const verify_ms = msSince(&verify_watch);
-    self.dspark_stats.recordVerifyMs(@intCast(d.len + 1), verify_ms);
     if (d.len == 0) samplePlainMs(self, verify_ms);
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;

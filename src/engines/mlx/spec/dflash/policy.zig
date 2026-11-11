@@ -313,9 +313,6 @@ pub const PositionStats = struct {
     accepted: [MAX_DRAFTS]u64 = @splat(0),
     /// Rounds by verify rows; index = rows.
     rows: [MAX_ROWS + 1]u64 = @splat(0),
-    /// Verify ms summed by rows, and the rounds timed.
-    verify_ms: [MAX_ROWS + 1]f32 = @splat(0),
-    timed: [MAX_ROWS + 1]u32 = @splat(0),
 
     /// A round that verified `drafts` drafts and kept `accepted` of them: it reached every position
     /// up to the first rejection and no further.
@@ -336,25 +333,6 @@ pub const PositionStats = struct {
             if (reached == 0) break;
             if (k > 0) w.writeAll("/") catch break;
             w.print("{d:.2}", .{@as(f32, @floatFromInt(kept)) / @as(f32, @floatFromInt(reached))}) catch break;
-        }
-        return w.buffered();
-    }
-
-    pub fn recordVerifyMs(self: *PositionStats, rows: u32, ms: f32) void {
-        if (rows == 0 or rows > MAX_ROWS or !std.math.isFinite(ms)) return;
-        self.verify_ms[rows] += ms;
-        self.timed[rows] += 1;
-    }
-
-    /// `1:12.1,4:14.3`: mean verify ms by rows.
-    pub fn formatVerifyMs(self: *const PositionStats, buf: []u8) []const u8 {
-        var w = std.Io.Writer.fixed(buf);
-        var first = true;
-        for (self.verify_ms, self.timed, 0..) |ms, n, rows| {
-            if (n == 0) continue;
-            if (!first) w.writeAll(",") catch break;
-            first = false;
-            w.print("{d}:{d:.1}", .{ rows, ms / @as(f32, @floatFromInt(n)) }) catch break;
         }
         return w.buffered();
     }
