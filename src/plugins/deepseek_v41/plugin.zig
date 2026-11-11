@@ -503,7 +503,7 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
 fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array) !mlx.mlx_array {
     const mdl = m.mdl;
     var one: [1]u32 = undefined;
-    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and mdl.tp == null;
+    const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and (mdl.tp == null or dsv41.tpPipeOn());
     const ids = if (dev.ctx != null and !gpu_decode) blk: {
         one[0] = try v4plugin.hostToken(dev);
         if (one[0] >= m.cfg.vocab_size) return error.TokenPastVocabulary;

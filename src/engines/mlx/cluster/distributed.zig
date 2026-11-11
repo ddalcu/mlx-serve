@@ -261,9 +261,13 @@ pub const Link = struct {
 /// A plain TCP connection beside the RDMA link, on the coordinator's port + 1, one per worker. Rank 0
 /// writes one byte before each control message to a worker and the worker sleeps on it before receiving
 /// one: JACCL waits by polling the link in a loop, which held a core at 100% while a worker idled. A worker
-/// names its rank in the first byte it writes.
+/// names its rank in the first byte it writes. A `pipe_byte` alone is a DeepSeek-V4.1 tensor pipe step: no message
+/// follows it (`OP_DSV41_TP_PIPE`).
 const Bell = struct {
     fd: std.c.fd_t = none,
+
+    const msg_byte: u8 = 1;
+    const pipe_byte: u8 = 2;
 
     /// No connection. `fd_t` is a HANDLE on Windows, where a cluster never forms.
     const none: std.c.fd_t = if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else -1;
@@ -339,12 +343,21 @@ const Bell = struct {
     }
 
     fn ring(b: Bell) !void {
-        if (!b.open()) return;
-        if (std.c.write(b.fd, &[_]u8{1}, 1) != 1) return error.DistPeerGone;
+        return b.ringWith(msg_byte);
     }
 
-    fn wait(b: Bell) !void {
+    fn pipe(b: Bell) !void {
+        return b.ringWith(pipe_byte);
+    }
+
+    fn ringWith(b: Bell, byte: u8) !void {
         if (!b.open()) return;
+        if (std.c.write(b.fd, &[_]u8{byte}, 1) != 1) return error.DistPeerGone;
+    }
+
+    /// The byte rank 0 rang (`msg_byte` without a bell: a message follows on the link).
+    fn wait(b: Bell) !u8 {
+        if (!b.open()) return msg_byte;
         // Steps come a decode tick apart: poll that long before sleeping, so a step does not wait for the kernel to
         // wake this thread.
         if (comptime builtin.os.tag == .macos) {
@@ -354,7 +367,7 @@ const Bell = struct {
         var x: [1]u8 = undefined;
         while (true) {
             const n = std.c.read(b.fd, &x, 1);
-            if (n == 1) return;
+            if (n == 1) return x[0];
             if (n < 0 and std.c._errno().* == @backingInt(std.c.E.INTR)) continue;
             return error.DistPeerGone;
         }
@@ -465,7 +478,8 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 
 pub const MAGIC = wire.MAGIC;
 /// 6: a worker names its rank on the bell, the group may hold more than two Macs, and a DeepSeek-V4.1 tensor plan carries
-/// the sums' mode, the head's precision and whether the DSpark stages split (every rank then drafts, OP_DSV41_TP_DRAFT).
+/// the sums' mode, the head's precision and whether the DSpark stages split (every rank then drafts, OP_DSV41_TP_DRAFT);
+/// a tensor decode step can come as a bell byte alone, its token gathered on the GPU (OP_DSV41_TP_PIPE).
 const VERSION: i32 = 6;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
@@ -486,6 +500,8 @@ const OP_DSV41_TP_SNAP: i32 = 12;
 const OP_DSV41_TP_LOAD: i32 = 13;
 /// Tensor parallel, a sharded DSpark draft: its states' gens, positions and first tokens (`dsv41.tpWorkerDraft`).
 const OP_DSV41_TP_DRAFT: i32 = 14;
+/// Never sent: what a worker's `recvMsg` returns for a `Bell.pipe_byte` (`dsv41.tpWorkerPipe`).
+const OP_DSV41_TP_PIPE: i32 = 15;
 pub const OP_RELEASE = wire.OP_RELEASE;
 
 /// `link` as a plugin's split job talks over it (`sdk/util/wire.zig`).
@@ -537,7 +553,10 @@ pub fn recvNow(link: *const Link, shape: []const c_int, dtype: mlx.mlx_dtype, sr
 }
 
 fn sendMsg(link: *const Link, m: Msg, dst: u32) !void {
-    if (link.rank == 0) try link.bells[dst].ring();
+    if (link.rank == 0) {
+        cluster().tp_live = null;
+        try link.bells[dst].ring();
+    }
     const shape = [_]c_int{8};
     const a = mlx.mlx_array_new_data(&m, &shape, 1, .int32);
     defer _ = mlx.mlx_array_free(a);
@@ -547,7 +566,7 @@ fn sendMsg(link: *const Link, m: Msg, dst: u32) !void {
 }
 
 fn recvMsg(link: *const Link, src: u32) !Msg {
-    if (link.rank != 0) try link.bells[0].wait();
+    if (link.rank != 0 and try link.bells[0].wait() == Bell.pipe_byte) return .{ OP_DSV41_TP_PIPE, 0, 0, 0, 0, 0, 0, 0 };
     const r = try link.recv(&.{8}, .int32, src);
     defer _ = mlx.mlx_array_free(r);
     try evalOne(r);
@@ -845,6 +864,8 @@ const ClusterState = struct {
     /// Values summed this step: the ranks agree on it as on the count, or their sums pair up wrong.
     tp_values: usize = 0,
     tp_last: struct { p0: usize = 0, rows: usize = 0 } = .{},
+    /// Rank 0: the state the workers last stepped, while no other message has reached them since (`sendMsg` clears it).
+    tp_live: ?TpLive = null,
     /// What each worker (by rank) said about the group's model when it joined: 0 has it, else NOT_FOUND or
     /// MISMATCH (-1 = not asked: no bell connection).
     copies: [max_ranks]std.atomic.Value(i32) = @splat(.init(-1)),
@@ -1230,6 +1251,8 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
             dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
             dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
             dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
+            dsv41_mod.clusterHooks().tp_pipe = if (tpPipeWanted(&self.link)) &dsv41TpPipe else null;
+            log.info("[dist] tensor: decode steps {s}\n", .{if (dsv41_mod.tpPipeOn()) "keep their token on the GPU, each rung on the bells alone" else "each send their id in a header (a worker has no bell)"});
             dsv41_mod.clusterHooks().tp_batch = &dsv41TpBatch;
             dsv41_mod.clusterHooks().tp_draft = &dsv41TpDraft;
             dsv41_mod.clusterHooks().tp_free = &dsv41TpFree;
@@ -1297,6 +1320,44 @@ fn dsv41TpStep(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool,
         if (ids.len > 1) try sendNow(&self.link, a, dst);
         if (images) |r| try sendNow(&self.link, r, dst);
     }
+    cluster().tp_live = TpLive.after(gen, p0 + ids.len, verify);
+}
+
+/// What rank 0 last told the workers of a DeepSeek-V4.1 tensor state: the one they stepped and where it now stands.
+/// A step that opens a verify leaves none: the workers follow it only with the next header (`followVerify`).
+const TpLive = struct {
+    gen: u64,
+    n: usize,
+
+    fn after(gen: u64, end: usize, verify: bool) ?TpLive {
+        return if (verify) null else .{ .gen = gen, .n = end };
+    }
+
+    fn follows(live: ?TpLive, gen: u64, n: usize) bool {
+        const l = live orelse return false;
+        return l.gen == gen and l.n == n;
+    }
+};
+
+/// Host, DeepSeek-V4.1 tensor: the next decode step on the state the workers last stepped, rung on each bell alone;
+/// every rank takes the step's token from rank 0 in its graph (`dsv41.tpToken`). False when the workers did not last
+/// step `gen` to `n`, or heard anything since: the step goes with its header.
+fn dsv41TpPipe(gen: u64, n: usize) anyerror!bool {
+    const self = peer() orelse return error.DistWorkerNotJoined;
+    const c = cluster();
+    if (!TpLive.follows(c.tp_live, gen, n)) return false;
+    noteTpStep(n, 1);
+    self.exchanges += 1;
+    for (1..self.link.size) |k| try self.link.bells[k].pipe();
+    c.tp_live = .{ .gen = gen, .n = n + 1 };
+    return true;
+}
+
+/// Rank 0 hands plain decode steps over by bell alone when every worker has its bell. Workers follow whatever their
+/// bell says.
+fn tpPipeWanted(link: *const Link) bool {
+    var mb: [64]u8 = undefined;
+    return missingRanks(link.bellMask(), link.size, &mb).len == 0;
 }
 
 /// Host: one batched step over the states `gens`, each at its position `p0s[k]` with its ids `chunks[k]`.
@@ -1422,6 +1483,15 @@ test "tensor step header: one id and the state's gen ride in it" {
     try std.testing.expectEqual(@as(u64, (1 << 33) + 5), joined(m[2], m[3]));
     try std.testing.expectEqual(@as(u64, (1 << 40) + 3), joined(m[6], m[7]));
     try std.testing.expectEqual(@as(i32, 0), tpHeader(&.{ 1, 2 }, 0, 0, 1)[5]);
+}
+
+test "dist N-rank: rank 0 pipes a decode step only on the state the workers last stepped, where they left it" {
+    const live = TpLive.after(7, 40, false);
+    try std.testing.expect(TpLive.follows(live, 7, 40));
+    try std.testing.expect(!TpLive.follows(live, 7, 39));
+    try std.testing.expect(!TpLive.follows(live, 8, 40));
+    try std.testing.expect(TpLive.after(7, 40, true) == null);
+    try std.testing.expect(!TpLive.follows(null, 7, 40));
 }
 
 test "tensor batched step body: every state's gen, position and ids come back in order" {
@@ -1560,6 +1630,11 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
                 if (msg[4] & 8 != 0) images = try queuedRecv(link, &.{ @intCast(m.imageRows(ids)), @intCast(m.cfg.hidden_size) }, m.act, 0);
                 noteTpStep(p0, L);
                 try dsv41_mod.tpWorkerStep(m, allocator, &parked, joined(msg[6], msg[7]), ids, p0, msg[4] & 1 != 0, if (msg[4] & 2 != 0) .all else .last, msg[4] & 4 != 0, if (images.ctx != null) images else null);
+                steps += 1;
+            },
+            OP_DSV41_TP_PIPE => {
+                noteTpStep(if (m.dec_state) |st| st.n else 0, 1);
+                try dsv41_mod.tpWorkerPipe(m, allocator);
                 steps += 1;
             },
             OP_DSV41_TP_BATCH => {
@@ -1875,13 +1950,13 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     const short = host[0..@min(host.len, 64)];
     if (!try answerModel(io, allocator, &link, roots.items)) {
         // The host refuses to use this worker; sleep until it leaves (unpair, restart).
-        while (true) try link.bells[0].wait();
+        while (true) _ = try link.bells[0].wait();
     }
     log.info("[dist] worker: joined, waiting for the host to load a model\n", .{});
     // Past a pair a worker can wait in a sum on a rank that died, where no bell reaches it: it leaves with rank 0.
     if (link.size > 2) if (std.Thread.spawn(.{ .stack_size = 1 << 16 }, watchHost, .{link.bells[0]})) |t| t.detach() else |_| {};
     // The host rings when it reads the hello, which it does when it first loads the model.
-    try link.bells[0].wait();
+    _ = try link.bells[0].wait();
     try sendMsg(&link, Hello.here(short.len).msg(), 0);
     if (short.len > 0) try sendBytes(&link, short, 0);
     while (true) {
@@ -2579,7 +2654,7 @@ test "parseCoordinator reads the host's address and port" {
     try std.testing.expectError(error.DistBadCoordinator, parseCoordinator("10.254.77.1"));
 }
 
-test "the bell wakes rank 1 once per ring and reports a host that left" {
+test "the bell wakes rank 1 once per ring, says which ring, and reports a host that left" {
     if (comptime builtin.os.tag != .macos) return error.SkipZigTest;
     const coord: Coordinator = .{ .ip4 = .{ 127, 0, 0, 1 }, .port = 39411 };
     const listener = Bell.listen(coord, 1);
@@ -2591,9 +2666,11 @@ test "the bell wakes rank 1 once per ring and reports a host that left" {
     try std.testing.expectEqual(@as(u32, 1), got.rank);
     const host = got.bell;
     try host.ring();
+    try host.pipe();
     try host.ring();
-    try worker.wait();
-    try worker.wait();
+    try std.testing.expectEqual(Bell.msg_byte, try worker.wait());
+    try std.testing.expectEqual(Bell.pipe_byte, try worker.wait());
+    try std.testing.expectEqual(Bell.msg_byte, try worker.wait());
     _ = std.c.close(host.fd);
     try std.testing.expectError(error.DistPeerGone, worker.wait());
     _ = std.c.close(worker.fd);
@@ -2716,9 +2793,9 @@ test "dist N-rank: rank 0 files each worker's bell under the rank it names, and 
         _ = std.c.close(link.bells[k].fd);
     };
     try link.bells[1].ring();
-    try w1b.wait();
-    try link.bells[3].ring();
-    try w3.wait();
+    try std.testing.expectEqual(Bell.msg_byte, try w1b.wait());
+    try link.bells[3].pipe();
+    try std.testing.expectEqual(Bell.pipe_byte, try w3.wait());
     try std.testing.expectEqual(@as(u32, 0b1110), link.bellMask());
 }
 

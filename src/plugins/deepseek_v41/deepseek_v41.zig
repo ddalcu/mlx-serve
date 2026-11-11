@@ -1665,6 +1665,10 @@ const ClusterHooksState = struct {
     /// step ends at the armed snapshot; `all`: every row's logits; `images`: the rows its image positions take
     /// (`chunkImageRows`, evaluated). Set by distributed.zig.
     tp_step: ?*const fn (ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A) anyerror!void = null,
+    /// Tensor parallel, rank 0: true once the other ranks will run one more decode step on the state `gen` they last
+    /// stepped, standing at `n`, its token rank 0's gathered on the GPU (`tpToken`); false when they cannot follow it
+    /// and the step goes with its id (`tp_step`). Set by distributed.zig when every worker has a bell.
+    tp_pipe: ?*const fn (gen: u64, n: usize) anyerror!bool = null,
     /// Tensor parallel, rank 0, a sharded draft: the states `gens` at `p0s[k]` draft from `t1s[k]`.
     tp_draft: ?*const fn (gens: []const u64, p0s: []const usize, t1s: []const u32) anyerror!void = null,
     /// Tensor parallel, rank 0: one batched step over the states `gens`, each from `p0s[k]` with `chunks[k]`.
@@ -4980,15 +4984,71 @@ pub fn spliceImages(sc: *Scope, m: *const Dsv41Model, emb: A, id_arr: A, ids: []
     return sc.where(try sc.expand(mask.*, -1), picked, emb);
 }
 
+/// Under `tp` a decode token still on the GPU steps every rank without a round trip when the other ranks can follow
+/// (`tpPipeStep`); otherwise rank 0 reads it back and sends it with the step, as a host id goes.
 fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want: Want, vision: ?VisionRows) !A {
+    if (ids == .gpu and m.tp != null and !try tpPipeStep(m, st, want)) {
+        const one = [_]u32{try hostToken(ids.gpu)};
+        return extendChunk(m, gpa, st, .{ .host = &one }, want, vision);
+    }
+    return extendChunk(m, gpa, st, ids, want, vision);
+}
+
+/// Whether a tensor rank's decode step keeps its token on the GPU: a worker's always does (rank 0 handed it over as
+/// one); rank 0's when the other ranks last stepped this live state to where it stands and the step needs nothing a
+/// header carries (a snapshot, a verify, every row's logits).
+fn tpPipeStep(m: *const Dsv41Model, st: *const State, want: Want) !bool {
+    if (m.tp.?.rank != 0) return true;
+    const pipe = clusterHooks().tp_pipe orelse return false;
+    if (want != .last or st.verify != null or m.dec_state == null or st != &m.dec_state.?) return false;
+    if (st.snap_at) |at| if (at == st.n + 1) return false;
+    return pipe(m.state_gen, st.n);
+}
+
+/// Whether rank 0 of a tensor split hands decode steps over with their token on the GPU (`ClusterHooksState.tp_pipe`).
+pub fn tpPipeOn() bool {
+    return clusterHooks().tp_pipe != null;
+}
+
+/// Tensor parallel: rank 0's decode token `t` `[1]` int32 on every rank, gathered on the GPU; a worker's `t` only
+/// takes its place in the gather (caller frees).
+fn tpToken(m: *const Dsv41Model, gpa: std.mem.Allocator, t: A) !A {
+    const gather = clusterHooks().tp_gather orelse return error.DsvTpNotJoined;
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    const mine = try sc.astype(try sc.reshape(t, &.{1}), .int32);
+    return sc.out(try sc.slice(try sc.keep(try gather(mine)), 0, 0, 1));
+}
+
+/// Tensor-parallel rank past 0: one decode step on the state it stepped last, its token rank 0's (`tpToken`). Rank 0
+/// hands one over only when nothing has moved that state since (`ClusterHooksState.tp_pipe`).
+pub fn tpWorkerPipe(m: *Dsv41Model, gpa: std.mem.Allocator) !void {
+    const st = if (m.dec_state) |*s| s else return error.DistPeerDiverged;
+    if (st.verify != null) return error.DistPeerDiverged;
+    const zero: i32 = 0;
+    const t = mlx.mlx_array_new_data(&zero, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(t);
+    _ = mlx.mlx_array_free(try extendIds(m, gpa, st, .{ .gpu = t }, .last, null));
+}
+
+fn extendChunk(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, given: Ids, want: Want, vision: ?VisionRows) !A {
     const c = &m.cfg;
-    const L = switch (ids) {
+    const L = switch (given) {
         .host => |h| h.len,
         .gpu => |t| mlx.mlx_array_size(t),
     };
     const p0 = st.n;
     const hc = c.dsv4_hc_mult;
     const d = c.hidden_size;
+    var rank0_tok: A = none;
+    defer if (rank0_tok.ctx != null) {
+        _ = mlx.mlx_array_free(rank0_tok);
+    };
+    if (given == .gpu) {
+        if (L != 1 or m.pair != null) return error.Dsv41GpuIdsUnsupported;
+        if (m.tp != null) rank0_tok = try tpToken(m, gpa, given.gpu);
+    }
+    const ids: Ids = if (rank0_tok.ctx != null) .{ .gpu = rank0_tok } else given;
     // a prompt chunk's Engram row ids hashed and their read thread started first, before the phase
     // change, the embedding and the spans' setup (a decode-sized chunk: after them, below). The thread copies the ids
     // and the tables it is handed, so nothing it reads depends on what follows.
@@ -5014,7 +5074,6 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     if (L <= region_rows) sat.releaseAll();
     if (m.streamed) |src| try src.phase(promptPhase(L, c.num_experts_per_tok, src.decode_ids));
     if (ids == .gpu) {
-        if (L != 1 or m.pair != null or m.tp != null) return error.Dsv41GpuIdsUnsupported;
         const tv = mlx.mlx_vector_array_new_value(ids.gpu);
         defer _ = mlx.mlx_vector_array_free(tv);
         try mlx.check(mlx.mlx_async_eval(tv));
@@ -5028,7 +5087,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         defer sc.deinit();
         if (try chunkImageRows(&sc, m, ids.host, vr)) |r| img_rows = sc.out(r);
     };
-    if (m.tp) |t| if (t.rank == 0) {
+    if (m.tp) |t| if (t.rank == 0 and ids == .host) {
         const step = clusterHooks().tp_step orelse return error.DsvTpNotJoined;
         // The other ranks know a state by its gen: only the module's own state steps alone.
         if (m.dec_state == null or st != &m.dec_state.?) return error.Dsv41TpStateNotLive;
