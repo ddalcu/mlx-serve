@@ -47,6 +47,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   both ranks run every layer and `tpSum` each attention and MoE output. Every rank must build the same sums in the same
   order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`). DSpark drafts on rank 0 alone: its stages
   load whole and sum nothing, and the worker follows each verify's rollback.
+- A 1-row decode step's Engram rows for every layer are read at once on GCD before its first Engram layer is built
+  (`Prefetch.readNow`), and each Engram stage goes to the GPU as soon as it is built; a prompt's and a DSpark verify
+  chunk's rows stay on the prefetch thread.
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken

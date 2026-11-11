@@ -4777,6 +4777,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
         return a;
     }
     const cur_spec: engram.Prefetch.Spec = .{ .at = p0, .len = L, .ids = rows };
+    if (next.len == 0 and L == 1) return engram.Prefetch.readNow(gpa, tables, cur_spec, hs.cols(), span);
     const pf = try engram.Prefetch.start(gpa, tables, if (next.len > 0) &.{ cur_spec, ahead_spec } else &.{cur_spec}, hs.cols(), span);
     if (next.len > 0) m.ahead = pf;
     return pf;
@@ -5661,6 +5662,7 @@ pub fn spanIn(sc: *Scope, m: *Dsv41Model, gpa: std.mem.Allocator, sp: *const Spa
         // An image span's rows get no Engram write (the reference shuts their gate).
         x = if (sp.img.ctx != null) try sc.where(try sc.expand(try sc.expand(try sp.imgSlice(sc, lo, hi), -1), -1), x, y) else y;
         if (m.trace) |t| try t.put("engram_{d}", .{li}, x);
+        if (sp.xs.len == 1 and sp.L == 1) try asyncEval(x);
     }
     if (m.n_mtp > 0) if (m.dsparkTarget(li)) |t| {
         hold(&sp.mh[k * m.cfg.dsv4_n_dspark_target_layers + t], try sc.astype(try sc.mean(try sc.astype(x, .float32), 1, false), m.act));

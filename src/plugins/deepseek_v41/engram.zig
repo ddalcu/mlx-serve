@@ -800,7 +800,36 @@ pub const Prefetch = struct {
         return startOrdered(gpa, tables, specs, nc, span, true);
     }
 
+    pub fn readNow(gpa: std.mem.Allocator, tables: []const *const Table, spec: Spec, nc: usize, span: usize) !*Prefetch {
+        const self = try make(gpa, tables, &.{spec}, nc, span, false);
+        const n = self.grids[0].items.len;
+        if (comptime builtin.os.tag.isDarwin()) {
+            dispatch_apply_f(n, dispatch_get_global_queue(qos_user_initiated, 0), self, readItem);
+        } else for (0..n) |i| readItem(self, i);
+        return self;
+    }
+
+    fn readItem(ctx: ?*anyopaque, i: usize) callconv(.c) void {
+        const self: *Prefetch = @ptrCast(@alignCast(ctx.?));
+        const g = &self.grids[0];
+        const n_spans = g.items.len / self.tables.len;
+        self.readItemAt(g, i / n_spans, i % n_spans);
+    }
+
+    fn readItemAt(self: *Prefetch, g: *Grid, layer: usize, k: usize) void {
+        const item = &g.items[layer * (g.items.len / self.tables.len) + k];
+        item.raw = self.readSpan(g, self.tables[layer], layer, k) catch null;
+        item.state.store(if (item.raw != null) done else failed, .release);
+    }
+
     fn startOrdered(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize, across: bool) !*Prefetch {
+        const self = try make(gpa, tables, specs, nc, span, across);
+        errdefer self.finish();
+        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
+
+    fn make(gpa: std.mem.Allocator, tables: []const *const Table, specs: []const Spec, nc: usize, span: usize, across: bool) !*Prefetch {
         const self = try gpa.create(Prefetch);
         errdefer gpa.destroy(self);
         const own_tables = try gpa.dupe(*const Table, tables);
@@ -820,7 +849,6 @@ pub const Prefetch = struct {
             made += 1;
         }
         self.* = .{ .gpa = gpa, .tables = own_tables, .grids = grids, .span = span, .nc = nc, .across = across };
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
 
@@ -847,9 +875,7 @@ pub const Prefetch = struct {
         }
         for (0..n_spans) |k| {
             if (self.stop.load(.acquire)) return false;
-            const item = &g.items[layer * n_spans + k];
-            item.raw = self.readSpan(g, self.tables[layer], layer, k) catch null;
-            item.state.store(if (item.raw != null) done else failed, .release);
+            self.readItemAt(g, layer, k);
         }
         return true;
     }
@@ -1313,14 +1339,16 @@ test "dsv41 engram: a prefetch hands each span's rows as a gather of the same id
     var pf = try Prefetch.start(testing.allocator, &tables, &.{ .{ .at = 0, .len = 5, .ids = &ids }, .{ .at = 5, .len = 2, .ids = ids[0..8] } }, 2, 2);
     defer pf.finish();
     try testing.expect(pf.covers(5, 2) and pf.covers(0, 3) and !pf.covers(0, 6) and !pf.covers(4, 1));
-    for (0..2) |layer| for (0..3) |k| {
+    var now = try Prefetch.readNow(testing.allocator, &tables, .{ .at = 0, .len = 5, .ids = &ids }, 2, 2);
+    defer now.finish();
+    for ([_]*Prefetch{ pf, now }) |p| for (0..2) |layer| for (0..3) |k| {
         const lo = k * 2;
         const hi = @min(5, lo + 2);
         var mine: [4]u32 = undefined;
         for (lo..hi) |tok| @memcpy(mine[(tok - lo) * 2 ..][0..2], ids[(tok * 2 + layer) * 2 ..][0..2]);
         const want = try t.gather(testing.allocator, mine[0 .. (hi - lo) * 2], s);
         defer _ = mlx.mlx_array_free(want);
-        const raw = try pf.take(0, layer, k);
+        const raw = try p.take(0, layer, k);
         defer raw.deinit(testing.allocator);
         const got = try t.dequant(raw, (hi - lo) * 2, s);
         defer _ = mlx.mlx_array_free(got);
