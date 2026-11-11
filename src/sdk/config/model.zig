@@ -1862,10 +1862,11 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     }
 
     // A sidecar block is not in config.json. The plugin parse already read it, and the centred-norm flag.
-    if (binding) |b| if (plugin_config.hadamardTrunk(b)) |t| {
-        if (config.hadamard_block == 0) config.hadamard_block = t.block;
-        if (t.centred) config.centred_language_norms = true;
-    };
+    if (binding) |b| {
+        const rot = b.parsed.rotation();
+        if (config.hadamard_block == 0) config.hadamard_block = rot.block;
+        if (rot.centred) config.centred_language_norms = true;
+    }
 
     config.plugin = binding;
     return config;

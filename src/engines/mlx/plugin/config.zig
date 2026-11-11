@@ -16,7 +16,6 @@ const outside = @import("../../../host/plugins/loader.zig");
 const model_settings = @import("../../../host/registry/model_settings.zig");
 
 const ModelConfig = model.ModelConfig;
-const q35 = @import("../../../plugins/qwen3_5/config.zig");
 
 /// A served pack's plugin and what its parse produced; owned by the `ModelConfig` it rides (`ModelConfig.deinit`).
 pub const Binding = struct {
@@ -30,14 +29,6 @@ pub const Binding = struct {
         a.destroy(b);
     }
 };
-
-/// The Prism parse's rotation block and centred-norm flag. Null for every other table.
-pub fn hadamardTrunk(b: *const Binding) ?struct { block: u32, centred: bool } {
-    if (!std.mem.eql(u8, b.table.name.slice(), "prism_hadamard_qwen35")) return null;
-    const c = q35.of(&b.parsed);
-    if (c.hadamard_block == 0) return null;
-    return .{ .block = c.hadamard_block, .centred = c.centred_language_norms };
-}
 
 /// The pack's claimant: a loaded outside plugin that wins it over the built-ins, else the registry's when its type is
 /// served; null otherwise (two claimants at one rank too).
@@ -68,10 +59,6 @@ pub fn adapted(b: *Binding) ModelConfig {
     applyLayout(&cfg, b.table, &b.parsed);
     // An outside plugin's images ride the host's patch-grid path (`host/media/plugin_media.zig`).
     if (!b.outside) applyMedia(&cfg, b.table, &b.parsed);
-    if (hadamardTrunk(b)) |t| {
-        cfg.hadamard_block = t.block;
-        cfg.centred_language_norms = t.centred;
-    }
     cfg.plugin = b;
     return cfg;
 }
@@ -245,6 +232,9 @@ pub fn modelConfig(p: *const abi.Parsed) ModelConfig {
             .last_token => .last_token,
         },
     };
+    const rot = p.rotation();
+    c.hadamard_block = rot.block;
+    c.centred_language_norms = rot.centred;
     if (s.quant.bits > 0) {
         c.quant_bits = s.quant.bits;
         if (s.quant.group_size > 0) c.quant_group_size = s.quant.group_size;
@@ -365,6 +355,19 @@ test "plugin config: a served model's facts layer on the legacy config; an unset
     // Unbound, the legacy parse's caps answer.
     c.plugin = null;
     try testing.expect(c.longCtxGated() and !c.isMoe());
+}
+
+test "plugin config: the rotation block is the parsed tail, and a short size leaves it unset" {
+    var p: abi.Parsed = .{};
+    p.hadamard_block = 512;
+    p.centred_language_norms = true;
+    const c = modelConfig(&p);
+    try testing.expectEqual(@as(u32, 512), c.hadamard_block);
+    try testing.expect(c.centred_language_norms);
+    p.size = @intCast(@offsetOf(abi.Parsed, "hadamard_block"));
+    const old = modelConfig(&p);
+    try testing.expectEqual(@as(u32, 0), old.hadamard_block);
+    try testing.expect(!old.centred_language_norms);
 }
 
 test "plugin config: sampling defaults fill the knobs the pack left null; a wild signature takes the reference temperature" {

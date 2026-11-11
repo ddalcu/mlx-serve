@@ -75,6 +75,7 @@ test "prism config: a Bonsai pack parses as the dense trunk in f16 with an f32 G
     defer freeParsed(&p);
     const c = q35.of(&p);
     try testing.expectEqual(@as(u32, 1024), c.hadamard_block);
+    try testing.expectEqual(@as(u32, 1024), p.hadamard_block);
     try testing.expect(p.caps.batches_decode and !p.caps.moe and !p.caps.exact_drafted and p.caps.dflash_capture);
     try testing.expect(p.shell.act_dtype == .f16 and p.shell.state_dtype == .f32 and p.cache.ssm_state.dtype == .f32);
     try testing.expectEqual(@as(u8, 2), p.spec.mtp_default_depth);
@@ -90,6 +91,7 @@ fn expectPrism(json: []const u8, files: []const sdk.fixture.File) !void {
     defer freeParsed(&p);
     const c = q35.of(&p);
     try testing.expectEqual(@as(u32, 1024), c.hadamard_block);
+    try testing.expectEqual(@as(u32, 1024), p.hadamard_block);
     try testing.expect(p.shell.act_dtype == .f16 and p.shell.state_dtype == .f32);
     try testing.expectEqual(@as(u8, 2), p.spec.mtp_default_depth);
 }
@@ -184,6 +186,7 @@ test "prism config: a 2-bit qwen3_5 pack with no rotation block, and a 4-bit pac
     try testing.expect(parseFiles(&nested_files, object, &centred).isOk());
     defer freeParsed(&centred);
     try testing.expect(q35.of(&centred).centred_language_norms);
+    try testing.expect(centred.centred_language_norms);
 
     const broken = "{";
     const broken_files = [_]sdk.fixture.File{

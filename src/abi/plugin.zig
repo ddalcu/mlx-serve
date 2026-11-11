@@ -344,6 +344,17 @@ pub const Parsed = extern struct {
     /// The plugin's own parsed config, read by its `bill` and `load`.
     private: ?*anyopaque = null,
     speech: SpeechFacts = .{},
+    /// Rotation width of a Hadamard pack; 0 = this pack is not rotated.
+    hadamard_block: u32 = 0,
+    /// Language RMS weights are stored as `w - 1`. The engine adds the one before the f16 narrow.
+    centred_language_norms: bool = false,
+
+    /// Both fields, or zeros when an older plugin's `size` ends before them.
+    pub fn rotation(p: *const Parsed) struct { block: u32, centred: bool } {
+        const end = @offsetOf(Parsed, "centred_language_norms") + @sizeOf(bool);
+        if (p.size < end) return .{ .block = 0, .centred = false };
+        return .{ .block = p.hadamard_block, .centred = p.centred_language_norms };
+    }
 };
 
 // ── Bill ──

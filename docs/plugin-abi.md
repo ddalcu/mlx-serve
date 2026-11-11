@@ -433,6 +433,8 @@ Every `Str` here points at static text or at memory the plugin owns until `Model
 | `mrope` | `MropeFacts` | `.{}` |  |
 | `private` | `?*anyopaque` | `null` | The plugin's own parsed config, read by its `bill` and `load`. |
 | `speech` | `SpeechFacts` | `.{}` |  |
+| `hadamard_block` | `u32` | `0` | Rotation width of a Hadamard pack; 0 = this pack is not rotated. |
+| `centred_language_norms` | `bool` | `false` | Language RMS weights are stored as `w - 1`. The engine adds the one before the f16 narrow. |
 
 ### `Shape` (extern struct)
 
