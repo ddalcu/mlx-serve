@@ -26,8 +26,8 @@ const STAGE_OUTS = [_][*:0]const u8{"h"};
 /// The first Apple GPU family (M3) that runs its 640-thread groups at every row count: M1 and M2 cap a pipeline's
 /// threads by its registers, and R = 6 with bf16 rows compiles for fewer.
 const first_gen = 15;
-/// The most rows whose stream every threadgroup re-reads and collapses: past two the re-reads cost more than the stage launch.
-const fuse_rows = 2;
+/// The most rows whose stream every threadgroup re-reads and collapses: past one the re-reads cost more than the stage launch.
+const fuse_rows = 1;
 /// Output rows a threadgroup: q_kv's mxfp8 rows, and the bf16 rows of weights_proj and the compressor.
 const rt = 4;
 /// The stream's copies, and the hc mixes the layer makes (`(2 + hc) * hc`).
@@ -682,8 +682,8 @@ const Stage = struct {
 };
 
 const nan_rule: spec.Nan = .{ .stated = "classes as float64 gives them; the normed rows within the intervals of their roundings, the dots and mixes within their sums' allowance" };
-const fused_shapes: []const Shape = &.{ .{ .rows = 1, .n = NQ, .k = DIM }, .{ .rows = fuse_rows, .n = NQ, .k = DIM } };
-const staged_shapes: []const Shape = &.{ .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
+const fused_shapes: []const Shape = &.{.{ .rows = fuse_rows, .n = NQ, .k = DIM }};
+const staged_shapes: []const Shape = &.{ .{ .rows = fuse_rows + 1, .n = NQ, .k = DIM }, .{ .rows = 3, .n = NQ, .k = DIM }, .{ .rows = decode.max_rows, .n = NQ, .k = DIM } };
 
 fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: usize, comptime cf32: bool, comptime name: []const u8) !void {
     const T = Main(fuse, nw, nc, cf32);
@@ -701,12 +701,12 @@ fn addMain(set: *kc.Set, comptime fuse: bool, comptime nw: usize, comptime nc: u
 }
 
 pub fn register(set: *kc.Set) !void {
-    try addMain(set, true, 0, 0, false, "dsv41 dec in_proj, 1..2 rows (q_kv, hc mixes)");
-    try addMain(set, true, 8, 16, true, "dsv41 dec in_proj, 1..2 rows (+ weights_proj, f32 compressor)");
-    try addMain(set, true, 8, 16, false, "dsv41 dec in_proj, 1..2 rows (+ weights_proj, bf16 compressor)");
-    try addMain(set, false, 0, 0, false, "dsv41 dec in_proj, 3..6 rows (q_kv, hc mixes)");
-    try addMain(set, false, 8, 16, true, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, f32 compressor)");
-    try addMain(set, false, 8, 16, false, "dsv41 dec in_proj, 3..6 rows (+ weights_proj, bf16 compressor)");
+    try addMain(set, true, 0, 0, false, "dsv41 dec in_proj, 1 row (q_kv, hc mixes)");
+    try addMain(set, true, 8, 16, true, "dsv41 dec in_proj, 1 row (+ weights_proj, f32 compressor)");
+    try addMain(set, true, 8, 16, false, "dsv41 dec in_proj, 1 row (+ weights_proj, bf16 compressor)");
+    try addMain(set, false, 0, 0, false, "dsv41 dec in_proj, 2..6 rows (q_kv, hc mixes)");
+    try addMain(set, false, 8, 16, true, "dsv41 dec in_proj, 2..6 rows (+ weights_proj, f32 compressor)");
+    try addMain(set, false, 8, 16, false, "dsv41 dec in_proj, 2..6 rows (+ weights_proj, bf16 compressor)");
     try kit.add(set, Stage, &stage_l, .{}, .{
         .name = "dsv41 dec in_proj_stage (normed collapse)",
         .accum = .f32,
@@ -715,7 +715,7 @@ pub fn register(set: *kc.Set) !void {
         .mids = 2,
         .out = .bf16,
         .nan = nan_rule,
-        .served = &.{ .{ .rows = fuse_rows + 1, .n = DIM, .k = DIM }, .{ .rows = decode.max_rows, .n = DIM, .k = DIM } },
+        .served = &.{ .{ .rows = fuse_rows + 1, .n = DIM, .k = DIM }, .{ .rows = 3, .n = DIM, .k = DIM }, .{ .rows = decode.max_rows, .n = DIM, .k = DIM } },
         .sums = .{ .f16 = 0, .bf16 = 0, .why = "a sum of squares cannot cancel" },
     });
 }
@@ -727,7 +727,7 @@ test "dsv41 dec in_proj: the declared launches are the shipped wrapper's, byte f
     defer kn.deinit();
     var sc = v41.Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();
-    inline for (.{ .{ true, 0, 0, false, 1 }, .{ true, 8, 16, true, 2 }, .{ true, 8, 16, false, 1 }, .{ false, 0, 0, false, 3 }, .{ false, 8, 16, true, 6 }, .{ false, 8, 16, false, 4 } }) |v| {
+    inline for (.{ .{ true, 0, 0, false, 1 }, .{ true, 8, 16, true, 1 }, .{ true, 8, 16, false, 1 }, .{ false, 0, 0, false, 2 }, .{ false, 8, 16, true, 6 }, .{ false, 8, 16, false, 4 } }) |v| {
         const T = Main(v[0], v[1], v[2], v[3]);
         const shape: Shape = .{ .rows = v[4], .n = NQ, .k = DIM };
         var c = kit.Case(T).init(gpa, &main_l, .{});
