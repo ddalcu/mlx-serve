@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const ops = @import("../../mlx/ops.zig");
 const log = @import("../../sdk/util/log.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
@@ -159,14 +160,13 @@ pub fn generate(a: std.mem.Allocator, io: std.Io, paths: Paths, g: *const config
             defer plan.deinit();
             var heads = try model.pddHeads(&pdd, @intCast(i), 1.0, 1.0, s);
             defer heads.deinit();
-            const rows_in = if (cond_rows) |c| try concat2(c, x, s) else x;
-            defer if (cond_rows != null) {
-                _ = mlx.mlx_array_free(rows_in);
-            };
+            var sg = ops.Graph.init(a, s);
+            defer sg.deinit();
+            const rows_in = if (cond_rows) |c| try sg.concat(&.{ c, x }, 0) else x;
             var out = try model.forward(&layout, &plan, refined, rows_in, .{ .ctx = null }, rope, heads, 1.0, null, true, s);
             defer out.deinit();
             // `forward` hands back the denoise direction (-v): x += -v * (sigma_next - sigma), the velocity form.
-            const nx = try axpy(x, out.video, @floatCast(sigmas[i + 1] - sigmas[i]), s);
+            const nx = sg.escape(try sg.add(x, try sg.mul(out.video, try sg.scalar(@floatCast(sigmas[i + 1] - sigmas[i]), .float32))));
             _ = mlx.mlx_array_free(x);
             x = nx;
             try mlx.check(mlx.mlx_array_eval(x));
@@ -229,187 +229,45 @@ fn encodeReferences(a: std.mem.Allocator, paths: Paths, req: Request, blocks: []
     defer vw.deinit();
     var enc = try vae.Encoder.load(a, &vw, s);
     defer enc.deinit();
-    var rows: std.ArrayList(A) = .empty;
-    defer {
-        for (rows.items) |r| _ = mlx.mlx_array_free(r);
-        rows.deinit(a);
-    }
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    var rows: [config.edit_ref_cap]A = undefined;
     for (req.refs, blocks, 0..) |r, *b, i| {
-        const full = try enc.imageMoments(r.pixels, a, s);
-        defer _ = mlx.mlx_array_free(full);
+        // A scope per reference: its moments and sample are freed before the next one encodes.
+        var rg = g.scope();
+        defer rg.deinit();
+        const full = try rg.adopt(try enc.imageMoments(r.pixels, a, s));
         // Cropped top-left to whole 2x2 patches, as the release crops its sample.
-        const fs = mlx.getShape(full);
+        const fs = ops.shape(full);
         const lh = fs[3] - @mod(fs[3], 2);
         const lw = fs[4] - @mod(fs[4], 2);
-        var m = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(m);
-        try mlx.check(mlx.mlx_slice(&m, full, &[_]c_int{ 0, 0, 0, 0, 0 }, 5, &[_]c_int{ fs[0], fs[1], fs[2], lh, lw }, 5, &[_]c_int{ 1, 1, 1, 1, 1 }, 5, s));
+        const m = try rg.slice(full, &.{ 0, 0, 0, 0, 0 }, &.{ fs[0], fs[1], fs[2], lh, lw });
         b.* = .{ .kind = .image, .latent_h = @intCast(lh), .latent_w = @intCast(lw) };
-        const lat = try samplePosterior(m, req.seed +% 2 +% i, s);
-        defer _ = mlx.mlx_array_free(lat);
-        const norm = try enc.normalize(lat, s);
-        defer _ = mlx.mlx_array_free(norm);
-        try rows.append(a, try h3.patchifyVideo(norm, s));
+        const lat = try samplePosterior(&rg, m, req.seed +% 2 +% i);
+        const norm = try rg.adopt(try enc.normalize(lat, s));
+        rows[i] = try g.keep(try rg.adopt(try h3.patchifyVideo(norm, s)));
     }
-    const cat = if (rows.items.len == 1) try copy(rows.items[0], s) else try concatN(rows.items, s);
-    defer _ = mlx.mlx_array_free(cat);
+    const cat = try g.concat(rows[0..req.refs.len], 0);
     // x_t = t * x0 + (1 - t) * noise at t = 0.999, constant for the whole run.
-    const noise = try h3.randomNormal(mlx.getShape(cat), req.seed +% 1, mlx.mlx_dtype.float32, s);
-    defer _ = mlx.mlx_array_free(noise);
-    const kept = try scale(cat, @floatCast(REFERENCE_T), s);
-    defer _ = mlx.mlx_array_free(kept);
-    const out = try axpy(kept, noise, @floatCast(1.0 - REFERENCE_T), s);
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_array_eval(out));
-    return out;
+    const noise = try g.adopt(try h3.randomNormal(ops.shape(cat), req.seed +% 1, mlx.mlx_dtype.float32, s));
+    const out = try g.add(try g.mul(cat, try g.scalar(@floatCast(REFERENCE_T), .float32)), try g.mul(noise, try g.scalar(@floatCast(1.0 - REFERENCE_T), .float32)));
+    try ops.eval(out);
+    return g.escape(out);
 }
 
 /// `mean + exp(0.5 * clamp(logvar, -30, 20)) * eps` over [1, 48, ...] moments, rounded through f16 like the
-/// release, returned f32 [1, 24, ...].
-fn samplePosterior(moments: A, seed: u64, s: S) !A {
-    var halves = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(halves);
-    try mlx.check(mlx.mlx_split(&halves, moments, 2, 1, s));
-    var mean = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mean);
-    var logvar = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(logvar);
-    try mlx.check(mlx.mlx_vector_array_get(&mean, halves, 0));
-    try mlx.check(mlx.mlx_vector_array_get(&logvar, halves, 1));
-    const lo = mlx.mlx_array_new_float(-30.0);
-    defer _ = mlx.mlx_array_free(lo);
-    const hi = mlx.mlx_array_new_float(20.0);
-    defer _ = mlx.mlx_array_free(hi);
-    var lv = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(lv);
-    try mlx.check(mlx.mlx_clip(&lv, logvar, lo, hi, s));
-    const half_lv = try scale(lv, 0.5, s);
-    defer _ = mlx.mlx_array_free(half_lv);
-    var std_ = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(std_);
-    try mlx.check(mlx.mlx_exp(&std_, half_lv, s));
-    const eps = try h3.randomNormal(mlx.getShape(mean), seed, mlx.mlx_dtype.float32, s);
-    defer _ = mlx.mlx_array_free(eps);
-    var noise = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(noise);
-    try mlx.check(mlx.mlx_multiply(&noise, std_, eps, s));
-    var z = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(z);
-    try mlx.check(mlx.mlx_add(&z, mean, noise, s));
-    var z16 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(z16);
-    try mlx.check(mlx.mlx_astype(&z16, z, mlx.mlx_dtype.float16, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&out, z16, mlx.mlx_dtype.float32, s));
-    return out;
-}
-
-// ── tiny op helpers (owned results) ──
-
-fn scale(x: A, k: f32, s: S) !A {
-    const kk = mlx.mlx_array_new_float(k);
-    defer _ = mlx.mlx_array_free(kk);
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_multiply(&o, x, kk, s));
-    return o;
-}
-
-/// `x + y * k`.
-fn axpy(x: A, y: A, k: f32, s: S) !A {
-    const yk = try scale(y, k, s);
-    defer _ = mlx.mlx_array_free(yk);
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&o, x, yk, s));
-    return o;
-}
-
-fn copy(x: A, s: S) !A {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_contiguous(&o, x, false, s));
-    return o;
-}
-
-fn concat2(x: A, y: A, s: S) !A {
-    return concatN(&.{ x, y }, s);
-}
-
-fn concatN(xs: []const A, s: S) !A {
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    for (xs) |x| _ = mlx.mlx_vector_array_append_value(vec, x);
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 0, s));
-    return o;
-}
-
-// ── output resize ──
-
-/// [1, 3, H, W] f32 -> [1, 3, oh, ow] by area averaging (each output pixel the coverage-weighted mean of the source
-/// pixels under it): the canvas is only ever scaled DOWN to the requested size. Caller frees.
-pub fn resizeArea(a: std.mem.Allocator, img: A, oh: u32, ow: u32, s: S) !A {
-    const c = try copy(img, s);
-    defer _ = mlx.mlx_array_free(c);
-    try mlx.check(mlx.mlx_array_eval(c));
-    const shp = mlx.getShape(c);
-    const ih: usize = @intCast(shp[2]);
-    const iw: usize = @intCast(shp[3]);
-    const src = (mlx.mlx_array_data_float32(c) orelse return error.NoData)[0 .. 3 * ih * iw];
-    const tmp = try a.alloc(f32, 3 * ih * ow);
-    defer a.free(tmp);
-    const out = try a.alloc(f32, 3 * @as(usize, oh) * ow);
-    defer a.free(out);
-    for (0..3 * ih) |row| areaLine(src[row * iw ..][0..iw], 1, tmp[row * ow ..][0..ow], 1);
-    for (0..3) |ch| for (0..ow) |x| areaLine(tmp[ch * ih * ow + x ..][0 .. (ih - 1) * ow + 1], ow, out[ch * oh * ow + x ..][0 .. (oh - 1) * ow + 1], ow);
-    const arr = mlx.mlx_array_new_data(out.ptr, &[_]c_int{ 1, 3, @intCast(oh), @intCast(ow) }, 4, .float32);
-    return arr;
-}
-
-/// One strided line resampled by area: `src` has (len-1)/ss+1 samples, `dst` (len-1)/ds+1.
-fn areaLine(src: []const f32, ss: usize, dst: []f32, ds: usize) void {
-    const n_in = (src.len - 1) / ss + 1;
-    const n_out = (dst.len - 1) / ds + 1;
-    const k = @as(f64, @floatFromInt(n_in)) / @as(f64, @floatFromInt(n_out));
-    for (0..n_out) |o| {
-        const lo = @as(f64, @floatFromInt(o)) * k;
-        const hi = lo + k;
-        var acc: f64 = 0;
-        var i: usize = @intFromFloat(@floor(lo));
-        while (i < n_in and @as(f64, @floatFromInt(i)) < hi) : (i += 1) {
-            const fi: f64 = @floatFromInt(i);
-            const cover = @min(hi, fi + 1) - @max(lo, fi);
-            if (cover > 0) acc += cover * src[i * ss];
-        }
-        dst[o * ds] = @floatCast(acc / k);
-    }
-}
-
-test "minimax_h3_image: area resize averages the pixels under each output pixel" {
-    const a = std.testing.allocator;
-    const s = mlx.mlx_default_cpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    // 2x4 per channel -> 1x2: each output is the mean of a 2x2 block.
-    var px: [24]f32 = undefined;
-    for (&px, 0..) |*v, i| v.* = @floatFromInt(i);
-    const img = mlx.mlx_array_new_data(&px, &[_]c_int{ 1, 3, 2, 4 }, 4, .float32);
-    defer _ = mlx.mlx_array_free(img);
-    const r = try resizeArea(a, img, 1, 2, s);
-    defer _ = mlx.mlx_array_free(r);
-    try mlx.check(mlx.mlx_array_eval(r));
-    const d = mlx.mlx_array_data_float32(r).?;
-    // channel 0: rows [0 1 2 3], [4 5 6 7] -> (0+1+4+5)/4, (2+3+6+7)/4
-    try std.testing.expectApproxEqAbs(@as(f32, 2.5), d[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 4.5), d[1], 1e-6);
-    // channel 2 starts at 16.
-    try std.testing.expectApproxEqAbs(@as(f32, 18.5), d[4], 1e-6);
-    // A non-integer ratio still preserves a flat field.
-    var flat: [3 * 3 * 5]f32 = undefined;
-    @memset(&flat, 0.25);
-    const f = mlx.mlx_array_new_data(&flat, &[_]c_int{ 1, 3, 3, 5 }, 4, .float32);
-    defer _ = mlx.mlx_array_free(f);
-    const rf = try resizeArea(a, f, 2, 3, s);
-    defer _ = mlx.mlx_array_free(rf);
-    try mlx.check(mlx.mlx_array_eval(rf));
-    for (mlx.mlx_array_data_float32(rf).?[0..18]) |v| try std.testing.expectApproxEqAbs(@as(f32, 0.25), v, 1e-6);
+/// release: f32 [1, 24, ...], owned by `g`.
+fn samplePosterior(g: *ops.Graph, moments: A, seed: u64) !A {
+    var sg = g.scope();
+    defer sg.deinit();
+    const half = @divExact(ops.shape(moments)[1], 2);
+    const mean = try sg.sliceAxis(moments, 1, 0, half);
+    const logvar = try sg.sliceAxis(moments, 1, half, 2 * half);
+    const lv = try sg.call(mlx.mlx_clip, .{ logvar, try sg.scalar(-30, .float32), try sg.scalar(20, .float32) });
+    const sd = try sg.exp(try sg.mul(lv, try sg.scalar(0.5, .float32)));
+    const eps = try sg.adopt(try h3.randomNormal(ops.shape(mean), seed, mlx.mlx_dtype.float32, sg.s));
+    const z = try sg.add(mean, try sg.mul(sd, eps));
+    return g.keep(try sg.astype(try sg.astype(z, .float16), .float32));
 }
 
 test "minimax_h3_image: the image VAE reconstructs a smooth picture through its posterior mean (MINIMAX_H3_IMAGE_MODEL)" {
@@ -433,15 +291,10 @@ test "minimax_h3_image: the image VAE reconstructs a smooth picture through its 
         px[1 * H * W + y * W + x] = fy / H;
         px[2 * H * W + y * W + x] = fx / W;
     };
-    const unit = mlx.mlx_array_new_data(&px, &[_]c_int{ 1, 3, 1, H, W }, 5, .float32);
-    defer _ = mlx.mlx_array_free(unit);
-    const pm1 = try scale(unit, 2, s);
-    defer _ = mlx.mlx_array_free(pm1);
-    const one = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one);
-    var pixels = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(pixels);
-    try mlx.check(mlx.mlx_subtract(&pixels, pm1, one, s));
+    var og = ops.Graph.init(a, s);
+    defer og.deinit();
+    const unit = try og.fromSlice(f32, &px, &.{ 1, 3, 1, H, W });
+    const pixels = try og.addScalar(try og.mulScalar(unit, 2), -1);
 
     const vae_path = try std.fs.path.join(a, &.{ dir, "image_vae.safetensors" });
     defer a.free(vae_path);
@@ -449,20 +302,12 @@ test "minimax_h3_image: the image VAE reconstructs a smooth picture through its 
     defer vw.deinit();
     var enc = try vae.Encoder.load(a, &vw, s);
     defer enc.deinit();
-    const m = try enc.imageMoments(pixels, a, s);
-    defer _ = mlx.mlx_array_free(m);
-    var mean = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mean);
-    try mlx.check(mlx.mlx_slice(&mean, m, &[_]c_int{ 0, 0, 0, 0, 0 }, 5, &[_]c_int{ 1, 24, 1, H / 16, W / 16 }, 5, &[_]c_int{ 1, 1, 1, 1, 1 }, 5, s));
-    const z = try enc.normalize(mean, s);
-    defer _ = mlx.mlx_array_free(z);
+    const m = try og.adopt(try enc.imageMoments(pixels, a, s));
+    const z = try og.adopt(try enc.normalize(try og.sliceAxis(m, 1, 0, 24), s));
     var dec = try vae.Decoder.load(a, &vw, g.h3.vae, mlx.mlx_dtype.float32, s);
     defer dec.deinit();
-    const rgb = try vae.decodeImage(&dec, z, a, s);
-    defer _ = mlx.mlx_array_free(rgb);
-    const c = try copy(rgb, s);
-    defer _ = mlx.mlx_array_free(c);
-    try mlx.check(mlx.mlx_array_eval(c));
+    const c = try og.contiguous(try og.adopt(try vae.decodeImage(&dec, z, a, s)));
+    try ops.eval(c);
     const out = mlx.mlx_array_data_float32(c).?[0 .. 3 * H * W];
     var err: f64 = 0;
     for (out, px) |o, p| err += @abs(o - p);

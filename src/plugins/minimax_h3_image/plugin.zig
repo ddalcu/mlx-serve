@@ -11,6 +11,7 @@ const log = @import("../../sdk/util/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const image_request = @import("../../sdk/media/image_request.zig");
 const image_pixels = @import("../../sdk/media/image_pixels.zig");
+const qvis = @import("../../sdk/vision/qwen_vision.zig");
 const frame_in = @import("../../sdk/media/frame_in.zig");
 const h3_plugin = @import("../minimax_h3/plugin.zig");
 const h3_bill = @import("../minimax_h3/config.zig");
@@ -212,17 +213,22 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         return job.failure(err, "MiniMax-H3-Image generation failed");
     };
     defer _ = mlx.mlx_array_free(rgb);
-    const sized = if (canvas.w != out_w or canvas.h != out_h)
-        image.resizeArea(gpa, rgb, out_h, out_w, s) catch |err| return job.failure(err, "MiniMax-H3-Image generation failed")
-    else
-        rgb;
-    defer if (sized.ctx != rgb.ctx) {
-        _ = mlx.mlx_array_free(sized);
-    };
-    const png = image_pixels.toPng(gpa, sized, s) catch |err| return job.failure(err, "MiniMax-H3-Image generation failed");
+    const png = encodeOutput(gpa, rgb, out_w, out_h, s) catch |err| return job.failure(err, "MiniMax-H3-Image generation failed");
     gpa.free(e.png);
     e.png = png;
     return .ok;
+}
+
+/// The canvas as PNG at the requested size: truncated to u8 first and Lanczos-resized as the release's processor does.
+fn encodeOutput(a: std.mem.Allocator, rgb: mlx.mlx_array, out_w: u32, out_h: u32, s: mlx.mlx_stream) ![]u8 {
+    var p = try image_pixels.toPixels8(a, rgb, s);
+    defer p.deinit(a);
+    if (p.w != out_w or p.h != out_h) {
+        const sized = try qvis.resizeInterleavedPil(a, p.px, p.h, p.w, out_h, out_w, p.channels, .lanczos);
+        a.free(p.px);
+        p = .{ .px = sized, .w = out_w, .h = out_h, .channels = p.channels };
+    }
+    return image_pixels.encodePng(a, p);
 }
 
 fn encode(ep: *anyopaque, out: *abi.Str) callconv(.c) Verdict {

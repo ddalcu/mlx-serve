@@ -9,7 +9,7 @@ Pack: `ddalcu/MiniMax-H3-Image-MLX-Serve-4bit`, converter `tests/convert_minimax
 ## Files
 - `plugin.zig`: the media table (request parse, reference decode, the canvas and its bill), the tiny conformance pack.
 - `config.zig`: claims, `geometry()` (H3's plus `image_vae` and `pdd_sigmas`), canvas and reference sizes, the bill.
-- `image.zig`: `generate` (references -> text encoder -> DiT -> VAE, each stage freed before the next), `resizeArea`.
+- `image.zig`: `generate` (references -> text encoder -> DiT -> VAE, each stage freed before the next).
   Everything else is `minimax_h3`'s: `h3.zig` (encoder, DiT, layout, PDD), `vae.zig` (`imageMoments`, `decodeImage`).
 
 ## Request contract
@@ -24,7 +24,8 @@ Pack: `ddalcu/MiniMax-H3-Image-MLX-Serve-4bit`, converter `tests/convert_minimax
   for every step; the reference label is `Picture i: ` (no brackets), unlike the video packs' `<Picture i>: `.
 - A reference keeps its own size inside short-edge bounds [1024, 2048] (the tower sees it at 1024), cropped
   top-left to whole VAE cells, its latent to whole patches; its posterior is SAMPLED and rounded through f16.
-- A request smaller than `min_generation_area` is generated on a larger canvas at its aspect and area-resized back.
+- A request smaller than `min_generation_area` is generated on a larger canvas at its aspect and resized back as the
+  release does: truncated to u8, then Pillow Lanczos (`qwen_vision.resizeInterleavedPil`).
 - The DiT stage is priced on its own rows (`requestRows`) before any stage loads, as H3's staged plan is.
 
 ## Fixtures
