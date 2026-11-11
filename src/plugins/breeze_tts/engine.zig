@@ -25,78 +25,24 @@ const S = mlx.mlx_stream;
 
 pub const model_type = "breeze_tts";
 
-// ── token ids (fixed by the published pack) ────────────────────────────────
-pub const AUDIO_TOKEN_ID: u32 = 262144;
+pub const cfg_mod = @import("config.zig");
+pub const Config = cfg_mod.Config;
+
+// Geometry and token ids come from the pack's config.json (cfg_mod.Config); the
+// defaults below ride with the published Breeze-TTS-2 pack. A fixture override
+// is a smaller config.json, not an env lever.
+
 pub const MIMI_RATE: u32 = 24000;
-pub const AUDIO_EOS_ID: u32 = 262145;
-pub const SPEAKER_BASE: u32 = 262146; // [S0]..[S9]
-pub const INS_BOS_ID: u32 = 262156;
-pub const INS_EOS_ID: u32 = 262157;
-pub const EOI_TOKEN_ID: u32 = 256000; // TE row zeroed at gather
-pub const TE_VOCAB: usize = 262158;
-pub const NUM_CODEBOOKS: usize = 16;
-pub const CB_VOCAB: usize = 2051;
-pub const CB_PAD: u32 = 2050; // frame-end code (lm_head row 2050)
-pub const CB_LM: usize = 2052; // lm_head rows: codes [0,2048), pad 2048..2050, eos 2051
-pub const CODEBOOK_SIZE: u32 = 2048; // mimi codebook_size; ids >= this never sample
-pub const CB_EOS: u32 = 2051;
-pub const CB_STRIDE: usize = 2051; // audio-table stride per codebook
 
-// ── geometry (Breeze-TTS-2 / Qwen3-0.6B flavor) ────────────────────────────
-pub const TE_HIDDEN: usize = 1152;
-pub const TE_HEADS: usize = 4;
-pub const TE_KV: usize = 1;
-pub const TE_HEAD_DIM: usize = 256;
-pub const TE_INTER: usize = 6912;
-pub const TE_LAYERS: usize = 26;
-pub const TE_WINDOW: usize = 512;
-pub const TE_THETA_FULL: f64 = 1_000_000;
-pub const TE_THETA_SLIDE: f64 = 10_000;
-pub const TE_FACTOR_FULL: f64 = 8.0;
-
-pub const B_HIDDEN: usize = 2048;
-pub const B_Q_DIM: usize = 2048;
-pub const B_KV_DIM: usize = 1024;
-pub const B_HEAD_DIM: usize = 128;
-pub const B_INTER: usize = 6144;
-pub const B_LAYERS: usize = 28;
-pub const B_THETA: f64 = 1_000_000;
-
-pub const D_HIDDEN: usize = 1024;
-pub const D_HEADS: usize = 8;
-pub const D_KV: usize = 2;
-pub const D_HEAD_DIM: usize = 128;
-pub const D_INTER: usize = 8192;
-pub const D_LAYERS: usize = 12;
-pub const D_THETA: f64 = 500_000;
-
-pub const MAX_SEQ: usize = 2048; // span guard: text + frame budget
-// generation_config max_new_tokens (750 = 60 s at 12.5 Hz) is a sampling
-// default, not a model limit: the true ceiling is the MAX_SEQ position span.
-// 1500 matches the legacy Python bridge (max_new_tokens=1500, max_seq_len=2048)
-// so speech isn't truncated at 60 s; the real stop is CB_EOS.
-pub const MAX_FRAMES: u32 = 1500;
-pub const SAMPLE_RATE: u32 = 24000;
-pub const FRAME_RATE: f64 = 12.5;
-pub const CHARS_PER_SEC: f64 = 15.0;
-pub const FRAME_EST_DIV: f64 = 3.0; // model keeps generating ~4.5+ frames per text token; generous ceiling, true stop comes from eos
-
-pub fn isFullAttentionLayer(layer: u32) bool {
-    return layer == 5 or layer == 11 or layer == 17 or layer == 23;
-}
-
-pub const Config = struct {};
-
-pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) !Config {
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return Config{};
-    defer parsed.deinit();
-    return Config{};
-}
+// Frame-rate estimation constants (how many frames a text is likely to speak).
+const FRAME_RATE: f64 = 12.5;
+const CHARS_PER_SEC: f64 = 15.0;
+const FRAME_EST_DIV: f64 = 3.0; // the model keeps generating ~4.5+ frames per text token; the true stop is eos
 
 /// Voice-design speaker slot: `index` 0..9 maps to the pack's `[S0]..[S9]` ids.
-pub fn speakerToken(index: u32) ?u32 {
+pub fn speakerToken(base: u32, index: u32) ?u32 {
     if (index >= 10) return null;
-    return SPEAKER_BASE + index;
+    return base + index;
 }
 
 /// A request `voice` names a slot S0..S9 (case-insensitive), nothing else.
@@ -107,13 +53,14 @@ pub fn voiceSlotValid(name: []const u8) bool {
 }
 
 /// Frame budget from speak units (see speakUnits): units / CHARS_PER_SEC ×
-/// FRAME_RATE, with a headroom factor, clamped by a request cap and
-/// MAX_FRAMES. The true stop is always CB_EOS; this is a runaway ceiling.
-pub fn estimateFrames(units: usize, req_max: ?u32) u32 {
+/// FRAME_RATE, with a headroom factor, clamped by a request cap and the
+/// config's frame ceiling. The true stop is always the codebook EOS; this is
+/// a runaway ceiling.
+pub fn estimateFrames(units: usize, req_max: ?u32, max_frames: u32) u32 {
     const est: f64 = @as(f64, @floatFromInt(units)) / CHARS_PER_SEC * FRAME_RATE * FRAME_EST_DIV + 4.0;
     var frames: u32 = @intFromFloat(@ceil(est));
     if (req_max) |m| frames = @min(frames, m);
-    return @min(frames, MAX_FRAMES);
+    return @min(frames, max_frames);
 }
 
 /// Speakable-character units: 1 per ASCII char, 3 per non-ASCII. CJK speech
@@ -139,9 +86,9 @@ fn needFrames(units: usize) u32 {
 /// Whether a segment's exact prompt tokens plus its estimated speech frames
 /// (plus per-request prompt overhead) fit the KV window and frame cap with
 /// margin. Used to pack sentences into turn-sized segments.
-fn segmentFits(overhead: usize, toks: usize, units: usize) bool {
+fn segmentFits(overhead: usize, toks: usize, units: usize, max_seq: usize, max_frames: u32) bool {
     const need = needFrames(units);
-    return overhead + toks + need + 16 <= MAX_SEQ and need <= MAX_FRAMES;
+    return overhead + toks + need + 16 <= max_seq and need <= max_frames;
 }
 
 /// Sentence pieces above this unit count (one giant unpunctuated run) are
@@ -470,42 +417,16 @@ fn ropeApply(x: mlx.mlx_array, theta: f64, scale: f64, hd: c_int, s: S) mlx.mlx_
     return r;
 }
 
-pub const D_HD: usize = 128;
-
 fn ropeApplyFreqs(x: mlx.mlx_array, freqs: mlx.mlx_array, hd: c_int, s: S) mlx.mlx_array {
     var r = mlx.mlx_array_new();
     _ = mlx.mlx_fast_rope(&r, x, hd, false, .{}, 1.0, 0, freqs, s);
     return r;
 }
 
-// Empirical: the pack config declares llama3 scaling (factor 32, orig_ctx 16) on the
-// depth rope, but sampled audio is word-accurate only with plain theta; the scaled
-// table garbles it. Scaled-path parity against the oracle is still open (early eos).
-fn depthInvFreqs() [D_HD / 2]f32 {
-    _ = 0; // kept as oracle note
-
-    var t: [D_HD / 2]f32 = undefined;
-    const factor: f64 = 32.0;
-    const low_f: f64 = 0.001953125;
-    const high_f: f64 = 0.0078125;
-    const old_ctx: f64 = 16.0;
-    const low_wl = old_ctx / low_f;
-    const high_wl = old_ctx / high_f;
-    var i: usize = 0;
-    while (i < D_HD / 2) : (i += 1) {
-        const f0 = 1.0 / std.math.pow(f64, D_THETA, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(D_HD)));
-        const wl = 2.0 * std.math.pi / f0;
-        var f = f0;
-        if (wl >= high_wl) {
-            f = f0 / factor;
-        } else if (wl > low_wl) {
-            const smooth = (high_wl / wl - 1.0) / (high_wl / low_wl - 1.0);
-            f = (1.0 - smooth) * f0 + smooth * (f0 / factor);
-        }
-        t[i] = @floatCast(f);
-    }
-    return t;
-}
+// The depth decoder's rope: the pack config declares llama3 scaling (factor 32,
+// orig_ctx 16), but sampled audio is word-accurate only with plain theta; the
+// scaled table garbles it. Scaled-path parity against the oracle is still open
+// (early eos), so the scaled arm stays unimplemented.
 
 fn sdpa(q4: mlx.mlx_array, k4: mlx.mlx_array, v4: mlx.mlx_array, scale: f32, mask: mlx.mlx_array, s: S) mlx.mlx_array {
     var r = mlx.mlx_array_new();
@@ -533,6 +454,11 @@ fn concat2(s: S, a: mlx.mlx_array, b: mlx.mlx_array, axis: c_int) mlx.mlx_array 
 }
 
 const QLayer = struct {
+    q_heads: usize, // from the pack config
+    kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    theta: f64,
     q: mlx.mlx_array, // [in, q_dim] f16 (pre-transposed)
     k: mlx.mlx_array,
     v: mlx.mlx_array,
@@ -550,7 +476,10 @@ const QLayer = struct {
 /// Full re-forward over a host [L, hidden] f32 embedding span. `pos_scale`
 /// scales RoPE positions (TE full layers), optional causal local-window mask
 /// (`window` 0 = plain causal). qk-norm applies when qn has data.
-fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, x_host: []const f32, L: usize, hidden: usize, pos_scale: f64, window: usize, freqs: mlx.mlx_array, kv_save: ?[]KV, out_last: []f32) !void {
+fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, x_host: []const f32, L: usize, hidden: usize, pos_scale: f64, window: usize, freqs: mlx.mlx_array, kv_save: ?[]KV, out_last: []f32) !void {
+    if (layers.len == 0) return;
+    const eps = layers[0].eps;
+    const theta = layers[0].theta;
     const sh = [_]c_int{ 1, @intCast(L), @intCast(hidden) };
     var x = hostF32(x_host, &sh);
     var x16 = mlx.mlx_array_new();
@@ -567,15 +496,15 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
         defer _ = mlx.mlx_array_free(k);
         const v = mm(xn, lw.v, s);
         defer _ = mlx.mlx_array_free(v);
-        const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], 128));
-        const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], 128));
-        var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, 128 }, s);
-        var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, 128 }, s);
-        const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, 128 }, s);
+        const hd: c_int = @intCast(lw.head_dim);
+        const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], @as(c_int, hd)));
+        const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], @as(c_int, hd)));
+        var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+        var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+        const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
         const lq: usize = L * @as(usize, @intCast(qh));
         const lk: usize = L * @as(usize, @intCast(kh));
-        const hd: c_int = 128;
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
             const q4f = reshape(q4, &[_]c_int{ @intCast(lq), hd }, s);
             const q4n1 = rmsn(q4f, lw.qn, eps, s);
@@ -599,12 +528,12 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
         const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(kt);
         const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        const qr = if (freqs.ctx != null) ropeApplyFreqs(qt, freqs, 128, s) else ropeApply(qt, theta, pos_scale, 128, s);
+        const qr = if (freqs.ctx != null) ropeApplyFreqs(qt, freqs, hd, s) else ropeApply(qt, theta, pos_scale, hd, s);
         defer _ = mlx.mlx_array_free(qr);
-        const kr = if (freqs.ctx != null) ropeApplyFreqs(kt, freqs, 128, s) else ropeApply(kt, theta, pos_scale, 128, s);
+        const kr = if (freqs.ctx != null) ropeApplyFreqs(kt, freqs, hd, s) else ropeApply(kt, theta, pos_scale, hd, s);
         const has_mask = window > 0;
         const mask = if (has_mask) windowMask(s, L, window) else null_arr;
-        const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(128))))), mask, s);
+        const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(lw.head_dim))))), mask, s);
         defer _ = mlx.mlx_array_free(att);
         if (has_mask) _ = mlx.mlx_array_free(mask);
         if (kv_save) |ks| {
@@ -663,7 +592,10 @@ fn ropeApplyOff(x: mlx.mlx_array, theta: f64, off: c_int, hd: c_int, s: S) mlx.m
     return r;
 }
 
-fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, xrow: []const f32, hidden: usize, pos: c_int, kv: []KV, out_last: []f32) !void {
+fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, xrow: []const f32, hidden: usize, pos: c_int, kv: []KV, out_last: []f32) !void {
+    if (layers.len == 0) return;
+    const eps = layers[0].eps;
+    const theta = layers[0].theta;
     const sh = [_]c_int{ 1, 1, @intCast(hidden) };
     var x = hostF32(xrow, &sh);
     var x16 = mlx.mlx_array_new();
@@ -680,24 +612,25 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: 
         defer _ = mlx.mlx_array_free(k);
         const v = mm(xn, lw.v, s);
         defer _ = mlx.mlx_array_free(v);
-        const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], 128));
-        const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], 128));
-        var q4 = reshape(q, &[_]c_int{ 1, 1, qh, 128 }, s);
-        var k4 = reshape(k, &[_]c_int{ 1, 1, kh, 128 }, s);
-        const v4 = reshape(v, &[_]c_int{ 1, 1, kh, 128 }, s);
+        const hd: c_int = @intCast(lw.head_dim);
+        const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], @as(c_int, hd)));
+        const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], @as(c_int, hd)));
+        var q4 = reshape(q, &[_]c_int{ 1, 1, qh, hd }, s);
+        var k4 = reshape(k, &[_]c_int{ 1, 1, kh, hd }, s);
+        const v4 = reshape(v, &[_]c_int{ 1, 1, kh, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
-            const q4f = reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), 128 }, s);
+            const q4f = reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), hd }, s);
             const q4n1 = rmsn(q4f, lw.qn, eps, s);
             _ = mlx.mlx_array_free(q4f);
-            const q4n = reshape(q4n1, &[_]c_int{ 1, 1, qh, 128 }, s);
+            const q4n = reshape(q4n1, &[_]c_int{ 1, 1, qh, hd }, s);
             _ = mlx.mlx_array_free(q4n1);
             _ = mlx.mlx_array_free(q4);
             q4 = q4n;
-            const k4f = reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), 128 }, s);
+            const k4f = reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), hd }, s);
             const k4n1 = rmsn(k4f, lw.kn, eps, s);
             _ = mlx.mlx_array_free(k4f);
-            const k4n = reshape(k4n1, &[_]c_int{ 1, 1, kh, 128 }, s);
+            const k4n = reshape(k4n1, &[_]c_int{ 1, 1, kh, hd }, s);
             _ = mlx.mlx_array_free(k4n1);
             _ = mlx.mlx_array_free(k4);
             k4 = k4n;
@@ -709,9 +642,9 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: 
         const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(kt);
         const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        const qr = ropeApplyOff(qt, theta, pos, 128, s);
+        const qr = ropeApplyOff(qt, theta, pos, hd, s);
         defer _ = mlx.mlx_array_free(qr);
-        const kr = ropeApplyOff(kt, theta, pos, 128, s);
+        const kr = ropeApplyOff(kt, theta, pos, hd, s);
         const pk = kv[lidx].k;
         const pv = kv[lidx].v;
         const kc = concat2(s, kv[lidx].k, kr, 2);
@@ -722,7 +655,7 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: 
         if (pv.ctx != null) _ = mlx.mlx_array_free(pv);
         _ = eval1(kv[lidx].k);
         _ = eval1(kv[lidx].v);
-        const att = sdpa(qr, kv[lidx].k, kv[lidx].v, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(128))))), null_arr, s);
+        const att = sdpa(qr, kv[lidx].k, kv[lidx].v, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(lw.head_dim))))), null_arr, s);
         defer _ = mlx.mlx_array_free(att);
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
@@ -791,14 +724,36 @@ var te_buf: []f32 = &[_]f32{};
 const Te = struct {
     layers: []QLayer, // reuse layout (q [in,1024] etc via ownT16)
     norm: mlx.mlx_array,
-    table: []const f32, // HOST [TE_VOCAB, TE_HIDDEN] ×√hidden, eoi zeroed
+    table: []const f32, // HOST [te_vocab, te_hidden] ×√hidden, eoi zeroed
+    hidden: usize,
+    vocab: usize,
+    head_dim: usize,
+    window: usize,
+    theta_full: f64,
+    theta_slide: f64,
+    factor_full: f64,
+    eps: f32,
+    full_layers: [16]u32,
 
-    fn load(w: *const Weights, s: S, alloc: std.mem.Allocator) !Te {
-        const layers = try alloc.alloc(QLayer, TE_LAYERS);
+    /// TE layer `i` attends globally when its `layer_types` entry is
+    /// `full_attention` (the published pack: 5/11/17/23 of 26).
+    fn isFullLayer(te: *const Te, i: usize) bool {
+        const n: u32 = @intCast(i);
+        for (te.full_layers) |f| if (f == n) return true;
+        return false;
+    }
+
+    fn load(cfg: *const Config, w: *const Weights, s: S, alloc: std.mem.Allocator) !Te {
+        const layers = try alloc.alloc(QLayer, cfg.te_layers);
         for (layers, 0..) |*L, i| {
             const p = try std.fmt.allocPrint(alloc, "text_encoder.layers.{d}.", .{i});
             defer alloc.free(p);
             L.* = .{
+                .q_heads = cfg.te_heads,
+                .kv_heads = cfg.te_kv,
+                .head_dim = cfg.te_head_dim,
+                .eps = cfg.te_rms_eps,
+                .theta = cfg.te_theta_slide,
                 .q = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.q_proj.weight", .{p})),
                 .k = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_proj.weight", .{p})),
                 .v = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.v_proj.weight", .{p})),
@@ -820,22 +775,33 @@ const Te = struct {
             .layers = layers,
             .norm = try ownF16Plus1(w, s, alloc, "text_encoder.norm.weight"),
             .table = &[_]f32{},
+            .hidden = cfg.te_hidden,
+            .vocab = cfg.te_vocab,
+            .head_dim = cfg.te_head_dim,
+            .window = cfg.te_window,
+            .theta_full = cfg.te_theta_full,
+            .theta_slide = cfg.te_theta_slide,
+            .factor_full = cfg.te_factor_full,
+            .eps = cfg.te_rms_eps,
+            .full_layers = cfg.te_full_layers,
         };
     }
 
-    fn loadTable(w: *const Weights, s: S, alloc: std.mem.Allocator) ![]const f32 {
+    fn loadTable(cfg: *const Config, w: *const Weights, s: S, alloc: std.mem.Allocator) ![]const f32 {
         const arr = w.get("text_encoder.embed_tokens.weight") orelse return error.MissingBreezeWeight;
         var f32arr = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f32arr);
         try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
         try mlx.check(mlx.mlx_array_eval(f32arr));
         const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
-        const out = try alloc.alloc(f32, TE_VOCAB * TE_HIDDEN);
-        const scale: f32 = @floatCast(@sqrt(@as(f64, @floatFromInt(TE_HIDDEN))));
-        for (0..TE_VOCAB) |r| {
-            const src = data[r * TE_HIDDEN ..][0..TE_HIDDEN];
-            const dst = out[r * TE_HIDDEN ..][0..TE_HIDDEN];
-            if (r == EOI_TOKEN_ID) {
+        const n: usize = @intCast(cfg.te_vocab);
+        const h: usize = @intCast(cfg.te_hidden);
+        const out = try alloc.alloc(f32, n * h);
+        const scale: f32 = @floatCast(@sqrt(@as(f64, @floatFromInt(h))));
+        for (0..n) |r| {
+            const src = data[r * h ..][0..h];
+            const dst = out[r * h ..][0..h];
+            if (r == cfg.eoi_token_id) {
                 @memset(dst, 0);
             } else {
                 for (src, dst) |sv, *dv| dv.* = sv * scale;
@@ -860,18 +826,18 @@ fn appendHandle(buf: []mlx.mlx_array, alloc: std.mem.Allocator, h: mlx.mlx_array
 /// TE conditioning over text ids → host rows [L, TE_HIDDEN].
 fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: []f32) !void {
     const L = ids.len;
-    var buf = alloc.alloc(f32, L * TE_HIDDEN) catch return error.OutOfMemory;
+    var buf = alloc.alloc(f32, L * te.hidden) catch return error.OutOfMemory;
     defer alloc.free(buf);
     for (ids, 0..) |id, i| {
-        if (id >= TE_VOCAB) return error.TokenBeyondTeVocab;
-        @memcpy(buf[i * TE_HIDDEN ..][0..TE_HIDDEN], te.table[@as(usize, id) * TE_HIDDEN ..][0..TE_HIDDEN]);
+        if (id >= te.vocab) return error.TokenBeyondTeVocab;
+        @memcpy(buf[i * te.hidden ..][0..te.hidden], te.table[@as(usize, id) * te.hidden ..][0..te.hidden]);
     }
-    const sh = [_]c_int{ 1, @intCast(L), @intCast(TE_HIDDEN) };
+    const sh = [_]c_int{ 1, @intCast(L), @intCast(te.hidden) };
     var x = hostF32(buf, &sh);
 
     for (te.layers, te_post_attn, 0..) |lw, ps, li| {
-        const full = isFullAttentionLayer(@intCast(li));
-        const xn = rmsn(x, lw.in_ln, 1e-6, s);
+        const full = te.isFullLayer(li);
+        const xn = rmsn(x, lw.in_ln, te.eps, s);
         defer _ = mlx.mlx_array_free(xn);
         const q = mm(xn, lw.q, s);
         defer _ = mlx.mlx_array_free(q);
@@ -879,25 +845,25 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
         defer _ = mlx.mlx_array_free(k);
         const v = mm(xn, lw.v, s);
         defer _ = mlx.mlx_array_free(v);
-        const qh: c_int = @divExact(mlx.getShape(lw.q)[1], @as(c_int, @intCast(TE_HEAD_DIM)));
-        const kh: c_int = @divExact(mlx.getShape(lw.k)[1], @as(c_int, @intCast(TE_HEAD_DIM)));
-        var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, @intCast(TE_HEAD_DIM) }, s);
-        var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, @intCast(TE_HEAD_DIM) }, s);
-        const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, @intCast(TE_HEAD_DIM) }, s);
+        const qh: c_int = @divExact(mlx.getShape(lw.q)[1], @as(c_int, @intCast(te.head_dim)));
+        const kh: c_int = @divExact(mlx.getShape(lw.k)[1], @as(c_int, @intCast(te.head_dim)));
+        const hd: c_int = @intCast(te.head_dim);
+        var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+        var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+        const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
         const lq: usize = L * @as(usize, @intCast(qh));
         const lk: usize = L * @as(usize, @intCast(kh));
-        const hd: c_int = @intCast(TE_HEAD_DIM);
         {
             const q4f = reshape(q4, &[_]c_int{ @intCast(lq), hd }, s);
-            const q4n1 = rmsn(q4f, lw.qn, 1e-6, s);
+            const q4n1 = rmsn(q4f, lw.qn, te.eps, s);
             _ = mlx.mlx_array_free(q4f);
             const q4n = reshape(q4n1, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
             _ = mlx.mlx_array_free(q4n1);
             _ = mlx.mlx_array_free(q4);
             q4 = q4n;
             const k4f = reshape(k4, &[_]c_int{ @intCast(lk), hd }, s);
-            const k4n1 = rmsn(k4f, lw.kn, 1e-6, s);
+            const k4n1 = rmsn(k4f, lw.kn, te.eps, s);
             _ = mlx.mlx_array_free(k4f);
             const k4n = reshape(k4n1, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
             _ = mlx.mlx_array_free(k4n1);
@@ -912,30 +878,30 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
         defer _ = mlx.mlx_array_free(kt);
         const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(vt);
-        const theta = if (full) TE_THETA_FULL else TE_THETA_SLIDE;
-        const p_scale = if (full) (1.0 / TE_FACTOR_FULL) else 1.0;
-        const qr = ropeApply(qt, theta, p_scale, @intCast(TE_HEAD_DIM), s);
+        const theta = if (full) te.theta_full else te.theta_slide;
+        const p_scale = if (full) (1.0 / te.factor_full) else 1.0;
+        const qr = ropeApply(qt, theta, p_scale, @intCast(te.head_dim), s);
         defer _ = mlx.mlx_array_free(qr);
-        const kr = ropeApply(kt, theta, p_scale, @intCast(TE_HEAD_DIM), s);
+        const kr = ropeApply(kt, theta, p_scale, @intCast(te.head_dim), s);
         defer _ = mlx.mlx_array_free(kr);
-        const mask = if (full) teFullMask(s, L) else teLocalMask(s, L);
+        const mask = if (full) teFullMask(s, L) else teLocalMask(s, L, te.window);
         const mask_live = mask.ctx != null;
         defer {
             if (mask_live) _ = mlx.mlx_array_free(mask);
         }
-        const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(TE_HEAD_DIM))))), mask, s);
+        const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(te.head_dim))))), mask, s);
         defer _ = mlx.mlx_array_free(att);
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
-        const af = reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(TE_HEADS * TE_HEAD_DIM) }, s);
+        const af = reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(te.layers[0].q_heads * te.head_dim) }, s);
         defer _ = mlx.mlx_array_free(af);
         const o = mm(af, lw.o, s);
         defer _ = mlx.mlx_array_free(o);
-        const on = rmsn(o, ps, 1e-6, s);
+        const on = rmsn(o, ps, te.eps, s);
         defer _ = mlx.mlx_array_free(on);
         const h1 = addM(x, on, s);
         defer _ = mlx.mlx_array_free(h1);
-        const hn = rmsn(h1, lw.pre_ff, 1e-6, s);
+        const hn = rmsn(h1, lw.pre_ff, te.eps, s);
         defer _ = mlx.mlx_array_free(hn);
         const g = mm(hn, lw.gate, s);
         defer _ = mlx.mlx_array_free(g);
@@ -947,17 +913,17 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
         defer _ = mlx.mlx_array_free(gu);
         const dn = mm(gu, lw.down, s);
         defer _ = mlx.mlx_array_free(dn);
-        const dnn = rmsn(dn, lw.post_ln, 1e-6, s);
+        const dnn = rmsn(dn, lw.post_ln, te.eps, s);
         defer _ = mlx.mlx_array_free(dnn);
         const x_prev = x;
         x = addM(h1, dnn, s);
         _ = mlx.mlx_array_free(x_prev);
     }
     const x_norm_prev = x;
-    const xn = rmsn(x, te.norm, 1e-6, s);
+    const xn = rmsn(x, te.norm, te.eps, s);
     defer _ = mlx.mlx_array_free(xn);
     _ = mlx.mlx_array_free(x_norm_prev);
-    const last = reshape(xn, &[_]c_int{ @intCast(L), @intCast(TE_HIDDEN) }, s);
+    const last = reshape(xn, &[_]c_int{ @intCast(L), @intCast(te.hidden) }, s);
     defer _ = mlx.mlx_array_free(last);
     try evalHost(s, last, out);
 }
@@ -973,11 +939,11 @@ fn teFullMask(s: S, L: usize) mlx.mlx_array {
     return r;
 }
 
-fn teLocalMask(s: S, L: usize) mlx.mlx_array {
+fn teLocalMask(s: S, L: usize, window: usize) mlx.mlx_array {
     const buf = std.heap.page_allocator.alloc(f32, L * L) catch return null_arr;
     defer std.heap.page_allocator.free(buf);
-    const left = (TE_WINDOW + 1) / 2;
-    const right = TE_WINDOW / 2 + 1;
+    const left = (window + 1) / 2;
+    const right = window / 2 + 1;
     for (0..L) |i| {
         for (0..L) |j| {
             const allowed = (j <= i and i - j < left) or (j > i and j - i < right);
@@ -1032,11 +998,16 @@ fn geluTanhArr(x: mlx.mlx_array, s: S) mlx.mlx_array {
 
 // ───────────────────────── heads (host) ──────────────────────────────────────
 
-fn readTable(s: S, w: *const Weights, key: []const u8, out: []f32) !void {
+fn readTable(s: S, w: *const Weights, key: []const u8, out: []f32, expect_rows: usize, expect_cols: usize) !void {
     const arr = w.get(key) orelse {
         log.err("[breeze] MISSING WEIGHT: {s}\n", .{key});
         return error.MissingBreezeWeight;
     };
+    const shp = mlx.getShape(arr);
+    if (shp.len != 2 or @as(usize, @intCast(shp[0])) != expect_rows or @as(usize, @intCast(shp[1])) != expect_cols) {
+        log.err("[breeze] {s} is {d}x{d}, the config asks for {d}x{d}\n", .{ key, shp[0], shp[1], expect_rows, expect_cols });
+        return error.BadPackConfig;
+    }
     var f32arr = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f32arr);
     try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
@@ -1070,7 +1041,9 @@ pub const Request = struct {
 
 pub const Synthesis = struct {
     pcm: []f32,
-    frames: []const [NUM_CODEBOOKS]u32,
+    /// Generated frames, each `[num_codebooks]` wide. The host frees every row
+    /// and the slice when the job's WAV is encoded.
+    frames: []const []const u32,
 };
 
 /// Streaming synthesis controls. `emit` receives f32 PCM slices in
@@ -1089,6 +1062,7 @@ pub const StreamSpec = struct {
 
 pub const Engine = struct {
     alloc: std.mem.Allocator,
+    cfg: Config,
     tok: @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer,
     te: Te,
     te_proj: mlx.mlx_array, // [1152, 2048] f16 pre-transposed
@@ -1097,12 +1071,11 @@ pub const Engine = struct {
     d_layers: []QLayer,
     d_norm: mlx.mlx_array,
     d_inp: mlx.mlx_array, // depth input projection [2048, 1024] f16
-    lm_host: []f32, // [CB_LM, B_HIDDEN] canonical (codes + pad rows + eos row)
-    d_freqs: mlx.mlx_array = null_arr,
-    heads_host: []f32, // [15, CB_VOCAB, D_HIDDEN]
-    bkv: [B_LAYERS]KV = undefined,
+    lm_host: []f32, // [cbLm, b_hidden] canonical (codes + pad rows + eos row)
+    heads_host: []f32, // [num_codebooks-1, cbVocab, d_hidden]
+    bkv: []KV,
     bkv_len: usize = 0,
-    audio_table: []f32, // HOST [NUM_CODEBOOKS*CB_STRIDE, B_HIDDEN]
+    audio_table: []f32, // HOST [num_codebooks*cbStride, b_hidden]
     codec: tts.CodecDecoder,
     samples_per_frame: usize = 0, // codec total upsample ratio (1920 = 12.5 fps @ 24 kHz)
     scratch: []f32,
@@ -1116,7 +1089,13 @@ pub const Engine = struct {
         // The host owns the inference stream; MLX work (and the load itself) runs on it.
         g_stream = s;
         mlx_allocator = allocator;
-        _hist_seen = allocator.alloc(bool, CB_LM) catch _hist_seen;
+
+        const cfg = cfg_mod.readPackConfig(io, allocator, model_dir) catch |e| {
+            log.err("[breeze] {s} config.json refused: {s}\n", .{ model_dir, @errorName(e) });
+            return e;
+        };
+        const cb_lm = @as(usize, cfg.cbLm());
+        _hist_seen = allocator.alloc(bool, cb_lm) catch _hist_seen;
 
         var self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
@@ -1124,14 +1103,14 @@ pub const Engine = struct {
         var w = try model_mod.loadWeights(io, allocator, model_dir);
         defer w.deinit();
 
-        var te = try Te.load(&w, s, allocator);
+        var te = try Te.load(&cfg, &w, s, allocator);
         errdefer allocator.free(te.layers);
-        te.table = try Te.loadTable(&w, s, allocator);
+        te.table = try Te.loadTable(&cfg, &w, s, allocator);
         errdefer allocator.free(te.table);
 
-        const lm_host = try allocator.alloc(f32, CB_LM * B_HIDDEN);
+        const lm_host = try allocator.alloc(f32, cb_lm * cfg.b_hidden);
         errdefer allocator.free(lm_host);
-        // lm_head: torch [2052, 2048] audio rows 0..CB_VOCAB-1, canonical.
+        // lm_head: torch [cbLm, hidden] audio rows 0..cbVocab-1, canonical.
         {
             const arr = w.get("lm_head.weight") orelse return error.MissingBreezeWeight;
             var f32arr = mlx.mlx_array_new();
@@ -1139,12 +1118,16 @@ pub const Engine = struct {
             try mlx.check(mlx.mlx_astype(&f32arr, arr, .float32, s));
             try mlx.check(mlx.mlx_array_eval(f32arr));
             const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
-            for (0..CB_LM) |r| @memcpy(lm_host[r * B_HIDDEN ..][0..B_HIDDEN], data[r * B_HIDDEN ..][0..B_HIDDEN]);
+            const lh: usize = @intCast(mlx.getShape(arr)[1]);
+            if (lh != cfg.b_hidden) return error.BadPackConfig;
+            for (0..cb_lm) |r| @memcpy(lm_host[r * lh ..][0..lh], data[r * lh ..][0..lh]);
         }
 
-        const heads_host = try allocator.alloc(f32, (NUM_CODEBOOKS - 1) * CB_VOCAB * D_HIDDEN);
+        const n_cb: usize = @intCast(cfg.num_codebooks);
+        const cbv: usize = @intCast(cfg.cbVocab());
+        const heads_host = try allocator.alloc(f32, (n_cb - 1) * cbv * cfg.d_hidden);
         errdefer allocator.free(heads_host);
-        // codebooks_head [15, 1024, 2051] — canonicalize to [15, out, in].
+        // codebooks_head [15, hidden, vocab] — canonicalize to [15, out, in].
         {
             const arr = w.get("depth_decoder.codebooks_head.weight") orelse return error.MissingBreezeWeight;
             var f32arr = mlx.mlx_array_new();
@@ -1153,51 +1136,57 @@ pub const Engine = struct {
             try mlx.check(mlx.mlx_array_eval(f32arr));
             const data = mlx.mlx_array_data_float32(f32arr) orelse return error.NoData;
             const shp = mlx.getShape(arr);
-            if (shp.len == 3 and shp[1] == CB_VOCAB) {
+            if (shp.len != 3 or @as(usize, @intCast(shp[0])) != n_cb - 1 or
+                (@as(usize, @intCast(shp[1])) != cbv and @as(usize, @intCast(shp[2])) != cbv)) return error.BadPackConfig;
+            if (shp[1] == cbv) {
                 @memcpy(heads_host, data[0..heads_host.len]);
             } else {
+                const dh: usize = @intCast(shp[1]);
                 var h: usize = 0;
-                while (h < NUM_CODEBOOKS - 1) : (h += 1) {
-                    for (0..D_HIDDEN) |i| {
-                        for (0..CB_VOCAB) |o| {
-                            heads_host[h * CB_VOCAB * D_HIDDEN + o * D_HIDDEN + i] = data[h * D_HIDDEN * CB_VOCAB + i * CB_VOCAB + o];
+                while (h < n_cb - 1) : (h += 1) {
+                    for (0..dh) |i| {
+                        for (0..cbv) |o| {
+                            heads_host[h * cbv * dh + o * dh + i] = data[h * dh * cbv + i * cbv + o];
                         }
                     }
                 }
             }
         }
 
-        const audio_table = try allocator.alloc(f32, NUM_CODEBOOKS * CB_STRIDE * B_HIDDEN);
+        const audio_table = try allocator.alloc(f32, n_cb * cbv * cfg.b_hidden);
         errdefer allocator.free(audio_table);
-        try readTable(s, &w, "depth_decoder.model.embed_tokens.weight", audio_table);
+        try readTable(s, &w, "depth_decoder.model.embed_tokens.weight", audio_table, n_cb * cbv, cfg.b_hidden);
 
         self.* = .{
             .alloc = allocator,
+            .cfg = cfg,
             .tok = try tokenizer_mod.loadTokenizer(io, allocator, model_dir),
             .te = te,
             .te_proj = undefined,
             .model_dir = try allocator.dupe(u8, model_dir),
             .io = io,
             .mimi = null,
-            .b_layers = try loadQLayers("backbone_model.layers.{d}.", &w, allocator, s, B_LAYERS, true),
+            .b_layers = try loadQLayers("backbone_model.layers.{d}.", &w, allocator, s, .{
+                .count = cfg.b_layers, .qk_norm = true, .q_heads = cfg.b_heads, .kv_heads = cfg.b_kv,
+                .head_dim = cfg.b_head_dim, .eps = cfg.b_rms_eps, .theta = cfg.b_theta,
+            }),
             .b_norm = try ownF16(&w, s, "backbone_model.norm.weight"),
-            .d_layers = try loadQLayers("depth_decoder.model.layers.{d}.", &w, allocator, s, D_LAYERS, false),
+            .d_layers = try loadQLayers("depth_decoder.model.layers.{d}.", &w, allocator, s, .{
+                .count = cfg.d_layers, .q_heads = cfg.d_heads, .kv_heads = cfg.d_kv,
+                .head_dim = cfg.d_head_dim, .eps = cfg.d_rms_eps, .theta = cfg.d_theta,
+            }),
             .d_norm = try ownF16(&w, s, "depth_decoder.model.norm.weight"),
             .d_inp = try ownT16(&w, s, "depth_decoder.model.inputs_embeds_projector.weight"),
             .lm_host = lm_host,
             .heads_host = heads_host,
             .audio_table = audio_table,
             .codec = try tts.loadCodecDecoderFrom(io, allocator, s, try std.fmt.allocPrint(allocator, "{s}/audio_tokenizer", .{model_dir})),
-            .scratch = try allocator.alloc(f32, CB_LM),
-            .order = try allocator.alloc(usize, CB_LM),
+            .scratch = try allocator.alloc(f32, cb_lm),
+            .order = try allocator.alloc(usize, cb_lm),
             .bkv_len = 0,
-            .d_freqs = blk: {
-                d_freqs_buf = depthInvFreqs();
-                break :blk hostF32(&d_freqs_buf, &[_]c_int{D_HD / 2});
-            },
             .bkv = blk: {
-                var tmp: [B_LAYERS]KV = undefined;
-                for (&tmp) |*e| e.* = .{ .k = null_arr, .v = null_arr };
+                const tmp = allocator.alloc(KV, @as(usize, cfg.b_layers)) catch return error.OutOfMemory;
+                for (tmp) |*e| e.* = .{ .k = null_arr, .v = null_arr };
                 break :blk tmp;
             },
         };
@@ -1213,12 +1202,13 @@ pub const Engine = struct {
     pub fn deinit(self: *Engine) void {
         self.tok.deinit();
         self.codec.deinit();
-        for (&self.bkv) |*e| {
+        for (self.bkv) |*e| {
             if (e.k.ctx != null) _ = mlx.mlx_array_free(e.k);
             if (e.v.ctx != null) _ = mlx.mlx_array_free(e.v);
             e.k.ctx = null;
             e.v.ctx = null;
         }
+        self.alloc.free(self.bkv);
         self.alloc.free(self.te.table);
         self.alloc.free(self.te.layers);
         self.alloc.free(self.lm_host);
@@ -1232,8 +1222,7 @@ pub const Engine = struct {
     }
 
     pub fn sampleRate(self: *const Engine) u32 {
-        _ = self;
-        return SAMPLE_RATE;
+        return self.codec.cfg.sampling_rate;
     }
 
     fn enc(self: *Engine, out: *std.ArrayList(u32), text: []const u8) !void {
@@ -1275,7 +1264,7 @@ pub const Engine = struct {
         try seg1.append(allocator, 2); // BOS on the first text segment
         if (req.voice) |v| {
             if (!voiceSlotValid(v)) return error.UnknownVoice;
-            try seg1.append(allocator, SPEAKER_BASE + @as(u32, v[1] - '0'));
+            try seg1.append(allocator, self.cfg.speaker_base + @as(u32, v[1] - '0'));
         }
         if (clone) {
             try self.enc(&seg1, req.ref_text.?);
@@ -1287,18 +1276,18 @@ pub const Engine = struct {
             try seg2.append(allocator, 2); // BOS on the second text segment
             if (req.voice) |v| {
                 if (!voiceSlotValid(v)) return error.UnknownVoice;
-                try seg2.append(allocator, SPEAKER_BASE + @as(u32, v[1] - '0'));
+                try seg2.append(allocator, self.cfg.speaker_base + @as(u32, v[1] - '0'));
             }
             if (req.instruction) |ins| {
-                try seg2.append(allocator, INS_BOS_ID);
+                try seg2.append(allocator, self.cfg.ins_bos_id);
                 try self.enc(&seg2, ins);
-                try seg2.append(allocator, INS_EOS_ID);
+                try seg2.append(allocator, self.cfg.ins_eos_id);
             }
         } else {
             if (req.instruction) |ins| {
-                try seg1.append(allocator, INS_BOS_ID);
+                try seg1.append(allocator, self.cfg.ins_bos_id);
                 try self.enc(&seg1, ins);
-                try seg1.append(allocator, INS_EOS_ID);
+                try seg1.append(allocator, self.cfg.ins_eos_id);
             }
         }
 
@@ -1312,7 +1301,7 @@ pub const Engine = struct {
                 const m = try allocator.alloc(f32, d.pcm.len / 2);
                 defer allocator.free(m);
                 for (0..m.len) |i| m[i] = (d.pcm[i * 2] + d.pcm[i * 2 + 1]) / 2;
-                if (d.sample_rate != MIMI_RATE) return error.UnsupportedRefRate; // mixed resample skipped
+                if (d.sample_rate != self.sampleRate()) return error.UnsupportedRefRate; // resample skipped
                 pcm = m;
             }
             if (self.mimi == null) {
@@ -1350,7 +1339,7 @@ pub const Engine = struct {
         var whole_toks: std.ArrayList(u32) = .empty;
         defer whole_toks.deinit(allocator);
         try self.enc(&whole_toks, trimmed);
-        if (segmentFits(overhead, whole_toks.items.len, speakUnits(trimmed))) {
+        if (segmentFits(overhead, whole_toks.items.len, speakUnits(trimmed), self.cfg.max_seq, self.cfg.max_frames)) {
             try seg_texts.append(allocator, try allocator.dupe(u8, trimmed));
         } else {
             var sentences: std.ArrayList([]const u8) = .empty;
@@ -1365,7 +1354,7 @@ pub const Engine = struct {
                 pack.clearRetainingCapacity();
                 try self.enc(&pack, sent);
                 const s_units = speakUnits(sent);
-                if (si > p_start and !segmentFits(overhead, p_toks + pack.items.len, p_units + s_units)) {
+                if (si > p_start and !segmentFits(overhead, p_toks + pack.items.len, p_units + s_units, self.cfg.max_seq, self.cfg.max_frames)) {
                     try seg_texts.append(allocator, try joinSentences(allocator, sentences.items[p_start..si]));
                     p_start = si;
                     p_toks = 0;
@@ -1377,20 +1366,36 @@ pub const Engine = struct {
             try seg_texts.append(allocator, try joinSentences(allocator, sentences.items[p_start..]));
         }
 
-        var frames: std.ArrayList([NUM_CODEBOOKS]u32) = .empty; // stitched across segments
-        errdefer frames.deinit(allocator);
+        const bh: usize = self.cfg.b_hidden;
+        const dh: usize = self.cfg.d_hidden;
+        const th: usize = self.cfg.te_hidden;
+        const n_cb: usize = self.cfg.numCodebooks();
+        const cbv: usize = @intCast(self.cfg.cbVocab());
+        const cb_lm: usize = @intCast(self.cfg.cbLm());
+        const stride: usize = @intCast(self.cfg.cbStride());
+        const cb_eos: u32 = self.cfg.cbEos();
+        const max_seq: usize = @intCast(self.cfg.max_seq);
+        const max_code = self.cfg.codebook_size;
+
+        var frames: std.ArrayList([]u32) = .empty; // stitched across segments; each row [n_cb]
+        errdefer {
+            for (frames.items) |f| allocator.free(f);
+            frames.deinit(allocator);
+        }
         var hist: std.ArrayList(u32) = .empty; // repetition-penalty history, spans segments
         defer hist.deinit(allocator);
 
-        const h_row = allocator.alloc(f32, B_HIDDEN) catch return error.OutOfMemory;
+        const h_row = allocator.alloc(f32, bh) catch return error.OutOfMemory;
         defer allocator.free(h_row);
-        var h_proj = allocator.alloc(f32, D_HIDDEN) catch return error.OutOfMemory;
+        var h_proj = allocator.alloc(f32, dh) catch return error.OutOfMemory;
         defer allocator.free(h_proj);
-        const emb_row = allocator.alloc(f32, B_HIDDEN) catch return error.OutOfMemory;
+        const emb_row = allocator.alloc(f32, bh) catch return error.OutOfMemory;
         defer allocator.free(emb_row);
-        const logits = allocator.alloc(f32, CB_LM) catch return error.OutOfMemory;
+        const logits = allocator.alloc(f32, cb_lm) catch return error.OutOfMemory;
         defer allocator.free(logits);
-        var depth_span = allocator.alloc(f32, (NUM_CODEBOOKS + 1) * D_HIDDEN) catch return error.OutOfMemory;
+        const frame_row = allocator.alloc(u32, n_cb) catch return error.OutOfMemory;
+        @memset(frame_row, 0);
+        var depth_span = allocator.alloc(f32, (n_cb + 1) * dh) catch return error.OutOfMemory;
         defer allocator.free(depth_span);
 
         var seg_i: usize = 0;
@@ -1412,8 +1417,8 @@ pub const Engine = struct {
                 try s2.appendSlice(allocator, seg2.items);
                 try s2.appendSlice(allocator, toks.items); // clone: text rides in seg2
                 try ids.appendSlice(allocator, s1.items);
-                for (0..ref_frames.items.len) |_| try ids.append(allocator, AUDIO_TOKEN_ID);
-                try ids.append(allocator, AUDIO_EOS_ID);
+                for (0..ref_frames.items.len) |_| try ids.append(allocator, self.cfg.audio_token_id);
+                try ids.append(allocator, self.cfg.audio_eos_id);
                 try ids.appendSlice(allocator, s2.items);
             } else {
                 try s1.appendSlice(allocator, toks.items); // plain: text rides in seg1
@@ -1421,68 +1426,68 @@ pub const Engine = struct {
             }
 
             const text_len = ids.items.len;
-            var frames_cap = estimateFrames(speakUnits(seg_text), req.max_frames);
+            var frames_cap = estimateFrames(speakUnits(seg_text), req.max_frames, self.cfg.max_frames);
             // The packer keeps segments window-safe; this clamp is the safety
             // net so even a model that never emits EOS stays in the span.
-            if (text_len < MAX_SEQ and frames_cap > MAX_SEQ - text_len)
-                frames_cap = @intCast(MAX_SEQ - text_len);
+            if (text_len < max_seq and frames_cap > max_seq - text_len)
+                frames_cap = @intCast(max_seq - text_len);
             const total = text_len + frames_cap;
-            if (total > MAX_SEQ) return error.PromptTooLongForFrameBudget;
+            if (total > max_seq) return error.PromptTooLongForFrameBudget;
 
             // TE conditioning → backbone-width stream rows.
-            var cond = allocator.alloc(f32, @max(s1.items.len, s2.items.len) * TE_HIDDEN) catch return error.OutOfMemory;
+            var cond = allocator.alloc(f32, @max(s1.items.len, s2.items.len) * th) catch return error.OutOfMemory;
             defer allocator.free(cond);
-            var stream = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
+            var stream = allocator.alloc(f32, total * bh) catch return error.OutOfMemory;
             defer allocator.free(stream);
             @memset(stream, 0);
             {
-                const wt = allocator.alloc(f32, TE_HIDDEN * B_HIDDEN) catch return error.OutOfMemory;
+                const wt = allocator.alloc(f32, th * bh) catch return error.OutOfMemory;
                 defer allocator.free(wt);
                 try evalHost(g_stream, self.te_proj, wt);
                 var row: usize = 0;
-                try teCond(allocator, g_stream, &self.te, s1.items, cond[0 .. s1.items.len * TE_HIDDEN]);
+                try teCond(allocator, g_stream, &self.te, s1.items, cond[0 .. s1.items.len * th]);
                 for (0..s1.items.len) |t| {
-                    const r = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
-                    for (0..B_HIDDEN) |o| {
+                    const r = cond[t * th ..][0..th];
+                    for (0..bh) |o| {
                         var acc: f32 = 0;
                         var i: usize = 0;
-                        while (i < TE_HIDDEN) : (i += 1) acc += r[i] * wt[o * TE_HIDDEN + i];
-                        stream[row * B_HIDDEN + o] = acc;
+                        while (i < th) : (i += 1) acc += r[i] * wt[o * th + i];
+                        stream[row * bh + o] = acc;
                     }
                     row += 1;
                 }
                 if (clone) {
                     for (ref_frames.items) |f| {
-                        frameEmbed(self.audio_table, B_HIDDEN, f, emb_row);
-                        @memcpy(stream[row * B_HIDDEN ..][0..B_HIDDEN], emb_row);
+                        frameEmbed(self.audio_table, bh, stride, f, max_code, emb_row);
+                        @memcpy(stream[row * bh ..][0..bh], emb_row);
                         row += 1;
                     }
-                    var zframe: [NUM_CODEBOOKS]u32 = undefined;
-                    @memset(&zframe, 0);
-                    frameEmbed(self.audio_table, B_HIDDEN, &zframe, emb_row);
-                    @memcpy(stream[row * B_HIDDEN ..][0..B_HIDDEN], emb_row);
+                    const zframe = frame_row;
+                    @memset(zframe, 0);
+                    frameEmbed(self.audio_table, bh, stride, zframe, max_code, emb_row);
+                    @memcpy(stream[row * bh ..][0..bh], emb_row);
                     row += 1;
-                    try teCond(allocator, g_stream, &self.te, s2.items, cond[0 .. s2.items.len * TE_HIDDEN]);
+                    try teCond(allocator, g_stream, &self.te, s2.items, cond[0 .. s2.items.len * th]);
                     for (0..s2.items.len) |t| {
-                        const r = cond[t * TE_HIDDEN ..][0..TE_HIDDEN];
-                        for (0..B_HIDDEN) |o| {
+                        const r = cond[t * th ..][0..th];
+                        for (0..bh) |o| {
                             var acc: f32 = 0;
                             var i: usize = 0;
-                            while (i < TE_HIDDEN) : (i += 1) acc += r[i] * wt[o * TE_HIDDEN + i];
-                            stream[row * B_HIDDEN + o] = acc;
+                            while (i < th) : (i += 1) acc += r[i] * wt[o * th + i];
+                            stream[row * bh + o] = acc;
                         }
                         row += 1;
                     }
                 }
             }
 
-            for (&self.bkv) |*e| {
+            for (self.bkv) |*e| {
                 if (e.k.ctx != null) _ = mlx.mlx_array_free(e.k);
                 if (e.v.ctx != null) _ = mlx.mlx_array_free(e.v);
                 e.k.ctx = null;
                 e.v.ctx = null;
             }
-            var span = allocator.alloc(f32, total * B_HIDDEN) catch return error.OutOfMemory;
+            var span = allocator.alloc(f32, total * bh) catch return error.OutOfMemory;
             defer allocator.free(span);
 
             var frame_i: usize = 0;
@@ -1496,39 +1501,43 @@ pub const Engine = struct {
                 }
                 if (frame_i == 0) {
                     const L = text_len + frame_i;
-                    @memcpy(span[0 .. L * B_HIDDEN], stream[0 .. L * B_HIDDEN]);
-                    try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, null_arr, self.bkv[0 .. B_LAYERS], h_row);
+                    @memcpy(span[0 .. L * bh], stream[0 .. L * bh]);
+                    try qwenForward(g_stream, self.b_layers, self.b_norm, span[0 .. L * bh], L, bh, 1.0, 0, null_arr, self.bkv, h_row);
                     self.bkv_len = text_len;
                 } else {
-                    try qwenStep(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, stream[(text_len + frame_i - 1) * B_HIDDEN ..][0..B_HIDDEN], B_HIDDEN, @intCast(self.bkv_len), self.bkv[0 .. B_LAYERS], h_row);
+                    try qwenStep(g_stream, self.b_layers, self.b_norm, stream[(text_len + frame_i - 1) * bh ..][0..bh], bh, @intCast(self.bkv_len), self.bkv, h_row);
                     self.bkv_len += 1;
                 }
-                headLogits(self.lm_host, h_row, logits, CB_LM, B_HIDDEN, 0);
-                var frame: [NUM_CODEBOOKS]u32 = undefined;
-                frame[0] = @intCast(sampleToken(&rng, logits, .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB, .history = hist.items, .rep = 1.1 }));
-                if (frame[0] == CB_EOS) break;
+                headLogits(self.lm_host, h_row, logits, cb_lm, bh, 0);
+                const frame = try allocator.alloc(u32, n_cb);
+                errdefer allocator.free(frame);
+                frame[0] = @intCast(sampleToken(&rng, logits, .{}, self.scratch, self.order, .{ .suppress_from = max_code, .suppress_to = @intCast(cbv), .history = hist.items, .rep = 1.1 }));
+                if (frame[0] == cb_eos) {
+                    allocator.free(frame);
+                    break;
+                }
 
                 // depth span: [backbone_hidden_proj, emb(cb0), emb(cb1), ...]
-                try projHostCached(allocator, g_stream, self.d_inp, h_row, B_HIDDEN, D_HIDDEN, h_proj[0..D_HIDDEN]);
-                @memcpy(depth_span[0..D_HIDDEN], h_proj);
+                try projHostCached(allocator, g_stream, self.d_inp, h_row, bh, dh, h_proj[0..dh]);
+                @memcpy(depth_span[0..dh], h_proj);
                 var dl: usize = 1;
                 var cb: usize = 1;
-                while (cb < NUM_CODEBOOKS) : (cb += 1) {
+                while (cb < n_cb) : (cb += 1) {
                     const code = frame[cb - 1];
-                    tableRow(self.audio_table, B_HIDDEN, cb - 1, @min(code, @as(u32, CB_VOCAB - 1)), emb_row);
-                    try projHostCached(allocator, g_stream, self.d_inp, emb_row, B_HIDDEN, D_HIDDEN, depth_span[dl * D_HIDDEN ..][0..D_HIDDEN]);
+                    tableRow(self.audio_table, bh, stride, cb - 1, @min(code, @as(u32, @intCast(cbv - 1))), emb_row);
+                    try projHostCached(allocator, g_stream, self.d_inp, emb_row, bh, dh, depth_span[dl * dh ..][0..dh]);
                     dl += 1;
-                    const d_last = allocator.alloc(f32, D_HIDDEN) catch return error.OutOfMemory;
+                    const d_last = allocator.alloc(f32, dh) catch return error.OutOfMemory;
                     defer allocator.free(d_last);
-                    try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, null_arr, null, d_last);
-                    headLogits(self.heads_host, d_last, logits, CB_VOCAB, D_HIDDEN, cb - 1);
-                    frame[cb] = @intCast(sampleToken(&rng, logits[0..CB_VOCAB], .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB }));
+                    try qwenForward(g_stream, self.d_layers, self.d_norm, depth_span[0 .. dl * dh], dl, dh, 1.0, 0, null_arr, null, d_last);
+                    headLogits(self.heads_host, d_last, logits, cbv, dh, cb - 1);
+                    frame[cb] = @intCast(sampleToken(&rng, logits[0..cbv], .{}, self.scratch, self.order, .{ .suppress_from = max_code, .suppress_to = @intCast(cbv) }));
                 }
                 if (frame_i % 4 == 3) { _ = mlx.mlx_clear_cache(); }
                 try hist.append(allocator, frame[0]);
                 // frame embed row into the stream
-                frameEmbed(self.audio_table, B_HIDDEN, &frame, emb_row);
-                @memcpy(stream[(text_len + frame_i) * B_HIDDEN ..][0..B_HIDDEN], emb_row);
+                frameEmbed(self.audio_table, bh, stride, frame, max_code, emb_row);
+                @memcpy(stream[(text_len + frame_i) * bh ..][0..bh], emb_row);
                 try frames.append(allocator, frame);
                 if (st) |spec| {
                     const n = frames.items.len;
@@ -1546,8 +1555,12 @@ pub const Engine = struct {
             }
         }
 
-        const out_frames = frames.items;
-        if (out_frames.len == 0) return error.NoFramesEmitted;
+        const out_frames = allocator.dupe([]const u32, frames.items) catch return error.OutOfMemory;
+        allocator.free(frames.items);
+        if (out_frames.len == 0) {
+            allocator.free(out_frames);
+            return error.NoFramesEmitted;
+        }
 
         if (st) |spec| {
             const n = out_frames.len;
@@ -1573,19 +1586,18 @@ pub const Engine = struct {
 };
 
 var _hist_seen: []bool = &[_]bool{};
-var d_freqs_buf: [D_HD / 2]f32 = undefined;
 var mlx_allocator: std.mem.Allocator = undefined;
 var g_stream: S = undefined;
 
-fn tableRow(table: []const f32, width: usize, cb: usize, code: u32, out: []f32) void {
-    @memcpy(out, table[(@as(usize, cb) * CB_STRIDE + @as(usize, code)) * width ..][0..width]);
+fn tableRow(table: []const f32, width: usize, stride: usize, cb: usize, code: u32, out: []f32) void {
+    @memcpy(out, table[(@as(usize, cb) * stride + @as(usize, code)) * width ..][0..width]);
 }
 
-fn frameEmbed(table: []const f32, width: usize, codes: []const u32, out: []f32) void {
+fn frameEmbed(table: []const f32, width: usize, stride: usize, codes: []const u32, max_code: u32, out: []f32) void {
     @memset(out, 0);
     for (codes, 0..) |code, cb| {
-        const c = @min(code, @as(u32, CB_VOCAB - 1));
-        const row = table[(@as(usize, cb) * CB_STRIDE + @as(usize, c)) * width ..][0..width];
+        const c = @min(code, max_code);
+        const row = table[(@as(usize, cb) * stride + @as(usize, c)) * width ..][0..width];
         for (out, row) |*o, rv| o.* += rv;
     }
 }
@@ -1608,31 +1620,34 @@ fn projHostCached(alloc: std.mem.Allocator, s: S, w: mlx.mlx_array, x: []const f
     }
 }
 
-fn projHost(alloc: std.mem.Allocator, s: S, w: mlx.mlx_array, x: []const f32, in: usize, out_ch: usize, out: []f32) !void {
-    // w is [in, out] f16 on-device; eval to host once
-    const host = alloc.alloc(f32, in * out_ch) catch return error.OutOfMemory;
-    defer alloc.free(host);
-    try evalHost(s, w, host);
-    for (0..out_ch) |o| {
-        var acc: f32 = 0;
-        var i: usize = 0;
-        while (i < in) : (i += 1) acc += x[i] * host[i * out_ch + o];
-        out[o] = acc;
-    }
-}
+/// One decoder stack's shape, read from the pack config by `Engine.load`.
+const LayerDims = struct {
+    count: usize,
+    qk_norm: bool = false,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    theta: f64,
+};
 
-fn loadQLayers(comptime prefix_fmt: []const u8, w: *const Weights, alloc: std.mem.Allocator, s: S, count: usize, qk_norm: bool) ![]QLayer {
-    const layers = try alloc.alloc(QLayer, count);
+fn loadQLayers(comptime prefix_fmt: []const u8, w: *const Weights, alloc: std.mem.Allocator, s: S, d: LayerDims) ![]QLayer {
+    const layers = try alloc.alloc(QLayer, d.count);
     for (layers, 0..) |*L, i| {
         const p = try std.fmt.allocPrint(alloc, prefix_fmt, .{i});
         defer alloc.free(p);
         L.* = .{
+            .q_heads = d.q_heads,
+            .kv_heads = d.kv_heads,
+            .head_dim = d.head_dim,
+            .eps = d.eps,
+            .theta = d.theta,
             .q = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.q_proj.weight", .{p})),
             .k = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_proj.weight", .{p})),
             .v = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.v_proj.weight", .{p})),
             .o = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.o_proj.weight", .{p})),
-            .qn = if (qk_norm) try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.q_norm.weight", .{p})) else null_arr,
-            .kn = if (qk_norm) try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_norm.weight", .{p})) else null_arr,
+            .qn = if (d.qk_norm) try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.q_norm.weight", .{p})) else null_arr,
+            .kn = if (d.qk_norm) try ownF16(w, s, try std.fmt.allocPrint(alloc, "{s}self_attn.k_norm.weight", .{p})) else null_arr,
             .gate = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.gate_proj.weight", .{p})),
             .up = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.up_proj.weight", .{p})),
             .down = try ownT16(w, s, try std.fmt.allocPrint(alloc, "{s}mlp.down_proj.weight", .{p})),
@@ -1647,9 +1662,10 @@ fn loadQLayers(comptime prefix_fmt: []const u8, w: *const Weights, alloc: std.me
 // ───────────────────────────── tests ─────────────────────────────────────────
 
 test "voice slot ids" {
-    try std.testing.expectEqual(@as(?u32, SPEAKER_BASE), speakerToken(0));
-    try std.testing.expectEqual(@as(?u32, SPEAKER_BASE + 9), speakerToken(9));
-    try std.testing.expectEqual(@as(?u32, null), speakerToken(10));
+    const base: u32 = 262146;
+    try std.testing.expectEqual(@as(?u32, base), speakerToken(base, 0));
+    try std.testing.expectEqual(@as(?u32, base + 9), speakerToken(base, 9));
+    try std.testing.expectEqual(@as(?u32, null), speakerToken(base, 10));
 }
 
 test "voice slot validation" {
@@ -1661,10 +1677,10 @@ test "voice slot validation" {
 }
 
 test "estimateFrames clamp" {
-    const a = estimateFrames(300, null);
+    const a = estimateFrames(300, null, 1500);
     try std.testing.expect(a > 0);
-    try std.testing.expect(a <= MAX_FRAMES);
-    const b = estimateFrames(300, 50);
+    try std.testing.expect(a <= 1500);
+    const b = estimateFrames(300, 50, 1500);
     try std.testing.expectEqual(@as(u32, 50), @min(b, 50));
 }
 
@@ -1703,11 +1719,11 @@ test "splitSentences latin, cjk, hard split" {
 
 test "segmentFits window + cap" {
     // ~73 s passage (1178 ascii chars, ~300 tok) fits one turn
-    try std.testing.expect(segmentFits(4, 300, 1178));
-    // > MAX_FRAMES of speech on its own must not fit
-    try std.testing.expect(!segmentFits(4, 400, 2500));
+    try std.testing.expect(segmentFits(4, 300, 1178, 2048, 1500));
+    // > frame cap of speech on its own must not fit
+    try std.testing.expect(!segmentFits(4, 400, 2500, 2048, 1500));
     // token span exhaustion must not fit
-    try std.testing.expect(!segmentFits(4, 2045, 1));
+    try std.testing.expect(!segmentFits(4, 2045, 1, 2048, 1500));
 }
 
 test "sampler deterministic + temp0 argmax" {

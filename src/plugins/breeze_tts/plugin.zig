@@ -169,7 +169,8 @@ fn step(e: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) c
     const max_frames = body.whole("max_frames") catch
         return bad("'max_frames' must be a whole number");
 
-    const total = engine.estimateFrames(engine.speakUnits(text), if (max_frames) |m| @intCast(@min(m, @as(u64, std.math.maxInt(u32)))) else null);
+    const cap_frames: u32 = @intCast(@min(@as(u64, eng.eng.cfg.max_frames), std.math.maxInt(u32)));
+    const total = engine.estimateFrames(engine.speakUnits(text), if (max_frames) |m| @intCast(@min(m, @as(u64, std.math.maxInt(u32)))) else null, cap_frames);
 
     var sink = Sink{
         .p = job.progressOf(progress),
@@ -208,7 +209,10 @@ fn step(e: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) c
         },
     };
     // Stream mode: Synthesis.pcm is empty and must not be freed; the frame table is ours.
-    defer if (syn.frames.len > 0) gpa.free(@constCast(syn.frames));
+    defer {
+        for (syn.frames) |f| gpa.free(f);
+        gpa.free(syn.frames);
+    }
 
     if (sink.failed) return job.failure(error.OutOfMemory, "breeze_tts output buffer");
     if (sink.buf.items.len == 0) return job.failure(error.NoFramesEmitted, "breeze_tts synthesis");
@@ -227,97 +231,110 @@ fn encode(e: *anyopaque, out: *abi.Str) callconv(.c) Verdict {
     return .ok;
 }
 
-/// The engine pins its widths (hidden 2048/1152/1024, the 262158-row text-encoder table, the 16×2051
-/// audio table, the real Mimi decoder), so a loadable fixture is ~2.5 GB and a CPU-stream job peaks
-/// near 14 GiB; the suite skips on smaller machines. Layer counts are pinned too (28/26/12 — they
-/// index KV arrays), but the MLP intermediate widths are tensor-driven, so the fixture ships 512-wide
-/// MLPs. Config-driven dims are a possible later polish.
-pub const test_min_ram_gib = 24;
+/// The fixture's geometry: a toy Breeze-TTS-2 the suite runs anywhere. The engine reads every
+/// width from the pack's config.json and the tensors, so this is a smaller model, not a cut-down
+/// one — the codec keeps its published 1920-sample ladder (the frame loop floors on it).
+const fx_te_vocab: u64 = 256;
+const fx_te_layers: u64 = 4;
+const fx_te_heads: u64 = 2;
+const fx_te_head_dim: u64 = 32;
+const fx_bh: u64 = 64; // backbone hidden
+const fx_b_layers: u64 = 2;
+const fx_b_heads: u64 = 2;
+const fx_b_kv: u64 = 1;
+const fx_b_head_dim: u64 = 32;
+const fx_dh: u64 = 32; // depth decoder hidden
+const fx_d_layers: u64 = 2;
+const fx_d_heads: u64 = 2;
+const fx_d_head_dim: u64 = 16;
+const fx_cb_vocab: u64 = 2051; // codes + pad + eos (Mimi's real ladder)
+const fx_cb_stride: u64 = fx_cb_vocab;
+const fx_codebooks: u64 = 16;
+const fx_cb_lm: u64 = fx_cb_vocab + 1;
+const fx_cb_eos: u64 = fx_cb_vocab - 1;
 
-/// A generated Breeze-TTS-2 at the published widths with random weights: the full 262158-row text
-/// encoder embedding table, the pinned 28/26/12 transformer layers with 512-wide MLPs, a byte-level
-/// tokenizer, and the full-size Mimi codec decoder (the encoder loads lazily for clone requests,
-/// which the conformance body never sends). "hi" budgets 9 frames; lm_head's tall negative EOS
-/// column on dim 0 keeps frame 0 from sampling EOS (that column's sign is deterministic for this
-/// fixture), so the job always synthesizes at least one frame. Everything a seeded run produces is
-/// reproducible, which is all the suite asks of it.
+/// A generated toy Breeze-TTS-2 with random weights: a 64-row text-encoder table, 2/4/2
+/// transformer layers at 64/32-wide hiddens, a byte-level tokenizer, and the full-size Mimi
+/// codec decoder (the encoder loads lazily for clone requests, which the conformance body never
+/// sends). "hi" budgets a handful of frames; lm_head's tall negative EOS column on dim 0 keeps
+/// frame 0 from sampling EOS (that column's sign is deterministic for this fixture), so the job
+/// always synthesizes at least one frame. Everything a seeded run produces is reproducible,
+/// which is all the suite asks of it.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     const T = sdk.tensors.Tensors;
-    const bh: u64 = 2048; // backbone hidden
-    const th: u64 = 1152; // text encoder hidden
-    const dh: u64 = 1024; // depth decoder hidden
-    const inter: u64 = 512; // fixture MLP intermediate (the engine reads it from the tensors)
+    const th: u64 = fx_te_heads * fx_te_head_dim;
+    const inter: u64 = 32;
 
     var t = T.init(a, 7);
-    try t.rand("text_encoder.embed_tokens.weight", .{}, &.{ engine.TE_VOCAB, th }, .BF16, 0.02);
+    try t.rand("text_encoder.embed_tokens.weight", .{}, &.{ fx_te_vocab, th }, .BF16, 0.02);
     try t.fill("text_encoder.norm.weight", .{}, &.{th}, .BF16, 1);
     inline for (.{
-        .{ "self_attn.q_proj.weight", engine.TE_HEADS * engine.TE_HEAD_DIM, th, @as(f32, 0.02) },
-        .{ "self_attn.k_proj.weight", engine.TE_KV * engine.TE_HEAD_DIM, th, @as(f32, 0.02) },
-        .{ "self_attn.v_proj.weight", engine.TE_KV * engine.TE_HEAD_DIM, th, @as(f32, 0.02) },
-        .{ "self_attn.o_proj.weight", th, engine.TE_HEADS * engine.TE_HEAD_DIM, @as(f32, 0.02) },
+        .{ "self_attn.q_proj.weight", fx_te_heads * fx_te_head_dim, th, @as(f32, 0.02) },
+        .{ "self_attn.k_proj.weight", fx_te_head_dim, th, @as(f32, 0.02) },
+        .{ "self_attn.v_proj.weight", fx_te_head_dim, th, @as(f32, 0.02) },
+        .{ "self_attn.o_proj.weight", th, fx_te_heads * fx_te_head_dim, @as(f32, 0.02) },
         .{ "mlp.gate_proj.weight", inter, th, @as(f32, 0.05) },
         .{ "mlp.up_proj.weight", inter, th, @as(f32, 0.05) },
         .{ "mlp.down_proj.weight", th, inter, @as(f32, 0.05) },
-    }) |w| for (0..engine.TE_LAYERS) |i|
+    }) |w| for (0..fx_te_layers) |i|
         try t.rand("{s}" ++ w[0], .{te_layer(a, i)}, &.{ w[1], w[2] }, .BF16, w[3]);
-    for (0..engine.TE_LAYERS) |i| {
+    for (0..fx_te_layers) |i| {
         const p = te_layer(a, i);
-        try t.fill("{s}self_attn.q_norm.weight", .{p}, &.{engine.TE_HEAD_DIM}, .BF16, 0); // loaded as +1
-        try t.fill("{s}self_attn.k_norm.weight", .{p}, &.{engine.TE_HEAD_DIM}, .BF16, 0);
+        try t.fill("{s}self_attn.q_norm.weight", .{p}, &.{fx_te_head_dim}, .BF16, 0); // loaded as +1
+        try t.fill("{s}self_attn.k_norm.weight", .{p}, &.{fx_te_head_dim}, .BF16, 0);
         inline for (.{ "pre_self_attn", "post_self_attn", "pre_feedforward", "post_feedforward" }) |ln|
             try t.fill("{s}" ++ ln ++ "_layernorm.weight", .{p}, &.{th}, .BF16, 1);
     }
-    try t.rand("text_encoder_proj.weight", .{}, &.{ bh, th }, .BF16, 0.05);
+    try t.rand("text_encoder_proj.weight", .{}, &.{ th, fx_bh }, .BF16, 0.05);
     inline for (.{
-        .{ "self_attn.q_proj.weight", bh, bh, @as(f32, 0.02) },
-        .{ "self_attn.k_proj.weight", engine.B_KV_DIM, bh, @as(f32, 0.02) },
-        .{ "self_attn.v_proj.weight", engine.B_KV_DIM, bh, @as(f32, 0.02) },
-        .{ "self_attn.o_proj.weight", bh, bh, @as(f32, 0.02) },
-        .{ "mlp.gate_proj.weight", inter, bh, @as(f32, 0.05) },
-        .{ "mlp.up_proj.weight", inter, bh, @as(f32, 0.05) },
-        .{ "mlp.down_proj.weight", bh, inter, @as(f32, 0.05) },
-    }) |w| for (0..engine.B_LAYERS) |i|
+        .{ "self_attn.q_proj.weight", fx_bh, fx_bh, @as(f32, 0.02) },
+        .{ "self_attn.k_proj.weight", fx_b_head_dim, fx_bh, @as(f32, 0.02) },
+        .{ "self_attn.v_proj.weight", fx_b_head_dim, fx_bh, @as(f32, 0.02) },
+        .{ "self_attn.o_proj.weight", fx_bh, fx_bh, @as(f32, 0.02) },
+        .{ "mlp.gate_proj.weight", inter, fx_bh, @as(f32, 0.05) },
+        .{ "mlp.up_proj.weight", inter, fx_bh, @as(f32, 0.05) },
+        .{ "mlp.down_proj.weight", fx_bh, inter, @as(f32, 0.05) },
+    }) |w| for (0..fx_b_layers) |i|
         try t.rand("{s}" ++ w[0], .{bb_layer(a, i)}, &.{ w[1], w[2] }, .BF16, w[3]);
-    for (0..engine.B_LAYERS) |i| {
+    for (0..fx_b_layers) |i| {
         const p = bb_layer(a, i);
-        try t.fill("{s}self_attn.q_norm.weight", .{p}, &.{128}, .BF16, 0); // loaded as +1
-        try t.fill("{s}self_attn.k_norm.weight", .{p}, &.{128}, .BF16, 0);
-        try t.fill("{s}input_layernorm.weight", .{p}, &.{bh}, .BF16, 1);
-        try t.fill("{s}post_attention_layernorm.weight", .{p}, &.{bh}, .BF16, 1);
+        try t.fill("{s}self_attn.q_norm.weight", .{p}, &.{fx_b_head_dim}, .BF16, 0); // loaded as +1
+        try t.fill("{s}self_attn.k_norm.weight", .{p}, &.{fx_b_head_dim}, .BF16, 0);
+        try t.fill("{s}input_layernorm.weight", .{p}, &.{fx_bh}, .BF16, 1);
+        try t.fill("{s}post_attention_layernorm.weight", .{p}, &.{fx_bh}, .BF16, 1);
     }
-    try t.fill("backbone_model.norm.weight", .{}, &.{bh}, .BF16, 1);
-    try t.rand("depth_decoder.model.embed_tokens.weight", .{}, &.{ engine.NUM_CODEBOOKS * engine.CB_STRIDE, bh }, .BF16, 0.3);
-    try t.rand("depth_decoder.model.inputs_embeds_projector.weight", .{}, &.{ dh, bh }, .BF16, 0.05);
-    try t.fill("depth_decoder.model.norm.weight", .{}, &.{dh}, .BF16, 1);
+    try t.fill("backbone_model.norm.weight", .{}, &.{fx_bh}, .BF16, 1);
+    try t.rand("depth_decoder.model.embed_tokens.weight", .{}, &.{ fx_codebooks * fx_cb_stride, fx_bh }, .BF16, 0.3);
+    try t.rand("depth_decoder.model.inputs_embeds_projector.weight", .{}, &.{ fx_dh, fx_bh }, .BF16, 0.05);
+    try t.fill("depth_decoder.model.norm.weight", .{}, &.{fx_dh}, .BF16, 1);
     inline for (.{
-        .{ "self_attn.q_proj.weight", dh, dh, @as(f32, 0.02) },
-        .{ "self_attn.k_proj.weight", 256, dh, @as(f32, 0.02) },
-        .{ "self_attn.v_proj.weight", 256, dh, @as(f32, 0.02) },
-        .{ "self_attn.o_proj.weight", dh, dh, @as(f32, 0.02) },
-        .{ "mlp.gate_proj.weight", inter, dh, @as(f32, 0.05) },
-        .{ "mlp.up_proj.weight", inter, dh, @as(f32, 0.05) },
-        .{ "mlp.down_proj.weight", dh, inter, @as(f32, 0.05) },
-    }) |w| for (0..engine.D_LAYERS) |i|
+        .{ "self_attn.q_proj.weight", fx_dh, fx_dh, @as(f32, 0.02) },
+        .{ "self_attn.k_proj.weight", fx_d_heads * fx_d_head_dim / 2, fx_dh, @as(f32, 0.02) },
+        .{ "self_attn.v_proj.weight", fx_d_heads * fx_d_head_dim / 2, fx_dh, @as(f32, 0.02) },
+        .{ "self_attn.o_proj.weight", fx_dh, fx_dh, @as(f32, 0.02) },
+        .{ "mlp.gate_proj.weight", inter, fx_dh, @as(f32, 0.05) },
+        .{ "mlp.up_proj.weight", inter, fx_dh, @as(f32, 0.05) },
+        .{ "mlp.down_proj.weight", fx_dh, inter, @as(f32, 0.05) },
+    }) |w| for (0..fx_d_layers) |i|
         try t.rand("{s}" ++ w[0], .{dd_layer(a, i)}, &.{ w[1], w[2] }, .BF16, w[3]);
-    for (0..engine.D_LAYERS) |i| {
+    for (0..fx_d_layers) |i| {
         const p = dd_layer(a, i);
-        try t.fill("{s}input_layernorm.weight", .{p}, &.{dh}, .BF16, 1);
-        try t.fill("{s}post_attention_layernorm.weight", .{p}, &.{dh}, .BF16, 1);
+        try t.fill("{s}input_layernorm.weight", .{p}, &.{fx_dh}, .BF16, 1);
+        try t.fill("{s}post_attention_layernorm.weight", .{p}, &.{fx_dh}, .BF16, 1);
     }
-    // The depth head reads rows [o][v] of a flat [15, 1024, 2051] table.
-    try t.rand("depth_decoder.codebooks_head.weight", .{}, &.{ engine.NUM_CODEBOOKS - 1, dh, engine.CB_VOCAB }, .BF16, 0.02);
+    // The depth head reads rows [o][v] of a flat [15, d_hidden, cb_vocab] table.
+    try t.rand("depth_decoder.codebooks_head.weight", .{}, &.{ fx_codebooks - 1, fx_dh, fx_cb_vocab }, .BF16, 0.02);
     // Noise everywhere, plus a tall negative column on the EOS row: frame 0 cannot sample EOS
     // (every run synthesizes at least one frame); a later EOS is as deterministic as anything else.
     {
-        const v = try a.alloc(f32, engine.CB_LM * bh);
+        const v = try a.alloc(f32, fx_cb_lm * fx_bh);
         var prng = std.Random.DefaultPrng.init(99);
         for (v) |*x| x.* = prng.random().floatNorm(f32) * 0.02;
         // EOS must lose frame 0 for THIS fixture's hidden state (whose sign at dim 0 is what the
         // run deterministically produces): one tall negative column, so logit_eos = -1e6·h[0].
-        @memset(v[engine.CB_EOS * bh ..], 0);
-        v[engine.CB_EOS * bh] = -1e6;
-        try t.values("lm_head.weight", .{}, &.{ engine.CB_LM, bh }, .BF16, v);
+        @memset(v[fx_cb_eos * fx_bh ..], 0);
+        v[fx_cb_eos * fx_bh] = -1e6;
+        try t.values("lm_head.weight", .{}, &.{ fx_cb_lm, fx_bh }, .BF16, v);
     }
 
     // The full Mimi codec decoder at published dims (latent 1024, codebook 512/RVQ 256, decoder
@@ -328,8 +345,8 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     const rd: u64 = 256; // RVQ codebook dim
     const ph: u64 = 512; // pre-transformer hidden
     const dd: u64 = 1536;
-    inline for (.{ "rvq_first", "rvq_rest" }, .{ 1, engine.NUM_CODEBOOKS - 1 }) |q, n| {
-        for (0..n) |i| {
+    inline for (.{ "rvq_first", "rvq_rest" }, .{ 1, fx_codebooks - 1 }) |q, n| {
+        for (0..@intCast(n)) |i| {
             try c.rand("decoder.quantizer." ++ q ++ ".vq.layers.{d}._codebook.embedding_sum", .{i}, &.{ 2048, rd }, .F32, 1);
             try c.fill("decoder.quantizer." ++ q ++ ".vq.layers.{d}._codebook.cluster_usage", .{i}, &.{2048}, .F32, 1);
         }
@@ -389,14 +406,33 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     try c.rand("decoder.decoder.6.conv.weight", .{}, &.{ 1, dd >> 4, 7 }, .F32, 0.2);
     try c.rand("decoder.decoder.6.conv.bias", .{}, &.{1}, .F32, 0.1);
 
+    const toy_config = std.fmt.comptimePrint(
+     \\{{"model_type":"breeze_tts","audio_token_id":262144,"audio_eos_token_id":262145,
+     \\ "audio_vocab_size":{d},"codebook_pad_token_id":{d},"num_codebooks":{d},
+     \\ "text_vocab_size":{d},"max_position_embeddings":512,
+     \\ "text_encoder_config":{{"hidden_size":{d},"num_attention_heads":{d},"num_key_value_heads":1,
+     \\  "head_dim":{d},"intermediate_size":32,"num_hidden_layers":{d},"sliding_window":512,
+     \\  "rms_norm_eps":1e-6,"eoi_token_index":255,
+     \\  "layer_types":["sliding_attention","full_attention","sliding_attention","sliding_attention"]}},
+     \\ "backbone_config":{{"hidden_size":{d},"num_attention_heads":{d},"num_key_value_heads":{d},
+     \\  "head_dim":{d},"intermediate_size":32,"num_hidden_layers":{d},"rms_norm_eps":1e-6}},
+     \\ "depth_decoder_config":{{"hidden_size":{d},"num_attention_heads":{d},"num_key_value_heads":1,
+     \\  "head_dim":{d},"intermediate_size":32,"num_hidden_layers":{d},"rms_norm_eps":1e-5,
+     \\  "num_codebooks":{d}}}}}
+    , .{ fx_cb_vocab, fx_cb_vocab - 1, fx_codebooks, fx_te_vocab,
+        fx_te_heads * fx_te_head_dim, fx_te_heads, fx_te_head_dim, fx_te_layers,
+        fx_bh, fx_b_heads, fx_b_kv, fx_b_head_dim, fx_b_layers,
+        fx_dh, fx_d_heads, fx_d_head_dim, fx_d_layers, fx_codebooks });
+
     return .{
         .files = try a.dupe(sdk.fixture.File, &.{
-            .{ .name = "config.json", .bytes =
-            \\{"model_type":"breeze_tts"}
-            },
+            .{ .name = "config.json", .bytes = toy_config },
             .{ .name = "tokenizer.json", .bytes = try sdk.byte_tokenizer.json(a, &.{}) },
             .{ .name = "model.safetensors", .bytes = try t.bytes() },
             .{ .name = "audio_tokenizer/model.safetensors", .bytes = try c.bytes() },
+            .{ .name = "audio_tokenizer/config.json", .bytes =
+            \\{"model_type":"mimi"}
+            },
         }),
         // The conformance body: two units budget ~5 frames, which is the whole job.
         .body = "{\"input\":\"hi\"}",

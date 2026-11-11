@@ -24,6 +24,9 @@ pub const required_file = "audio_tokenizer/model.safetensors";
 /// The pack's geometry and ids, read from `config.json`. Defaults are the
 /// published Breeze-TTS-2 values; an omitted field keeps them, a present one
 /// must be parseable and inside the shapes the engine implements.
+/// Config defaults are the published Breeze-TTS-2 geometry.
+const SENT: u32 = std.math.maxInt(u32);
+
 pub const Config = struct {
     // token ids (fixed by the published pack, read from the pack's config)
     audio_token_id: u32 = 262144,
@@ -49,6 +52,8 @@ pub const Config = struct {
     te_inter: u32 = 6912,
     te_layers: u32 = 26,
     te_window: u32 = 512,
+    /// `full_attention` layers in the `layer_types` ladder (published pack: 5/11/17/23)
+    te_full_layers: [16]u32 = .{ 5, 11, 17, 23, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT },
     te_theta_full: f64 = 1_000_000,
     te_theta_slide: f64 = 10_000,
     te_factor_full: f64 = 8.0,
@@ -79,7 +84,13 @@ pub const Config = struct {
 
     // the position window both decoders share
     max_seq: u32 = 2048,
+    /// Runaway frame ceiling (generation max_new_tokens is a sampling default,
+    /// not a model limit; 1500 matches the reference bridge at 12.5 Hz).
+    max_frames: u32 = 1500,
 
+    pub inline fn numCodebooks(self: *const Config) usize {
+        return @intCast(self.num_codebooks);
+    }
     pub inline fn cbVocab(self: *const Config) u32 {
         return self.audio_vocab_size;
     }
@@ -105,11 +116,15 @@ pub const Config = struct {
 /// Read the geometry from `config.json`. A value outside the layout the engine
 /// implements is refused by name, never computed wrong.
 pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) (error{ BadPackConfig } || error{ UnsupportedBreezeGeometry })!Config {
-    var cfg = Config{};
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return error.BadPackConfig;
     defer parsed.deinit();
-    if (parsed.value != .object) return error.BadPackConfig;
-    const o = parsed.value.object;
+    return parseFromValue(parsed.value);
+}
+
+fn parseFromValue(value: std.json.Value) (error{ BadPackConfig } || error{ UnsupportedBreezeGeometry })!Config {
+    var cfg = Config{};
+    if (value != .object) return error.BadPackConfig;
+    const o = value.object;
 
     try fields.fill(Config, .{
         .{ "audio_token_id", "audio_token_id" },
@@ -145,6 +160,19 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) (error{ 
         .{ "sliding_window", "te_window" },
         .{ "rms_norm_eps", "te_rms_eps" },
     }, te, &cfg);
+    if (te.get("layer_types")) |lt| if (lt == .array) {
+        var n: usize = 0;
+        for (lt.array.items, 0..) |v, i| {
+            if (v != .string) return error.BadPackConfig;
+            if (std.mem.eql(u8, v.string, "full_attention")) {
+                if (n == cfg.te_full_layers.len - 1) return error.UnsupportedBreezeGeometry;
+                cfg.te_full_layers[n] = @intCast(i);
+                n += 1;
+            }
+        }
+        cfg.te_full_layers[n] = SENT;
+        @memset(cfg.te_full_layers[n + 1 ..], SENT);
+    } else return error.BadPackConfig;
     if (te.get("rope_parameters")) |rp| if (rp == .object) {
         if (rp.object.get("full_attention")) |fa| if (fa == .object) {
             try fields.fill(Config, .{
@@ -197,14 +225,54 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) (error{ 
     return cfg;
 }
 
-/// Parse the pack's `config.json` through `dir` (the MLX-free read the host allows).
-pub fn readPackConfig(dir: *const abi.PackDir) ?Config {
-    var buf: [256 << 10]u8 = undefined;
-    var why: abi.Verdict = .{};
-    const txt = dir.readFile("config.json", &buf, &why) orelse return null;
-    var fba_buf: [512 << 10]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
-    return parseConfig(fba.allocator(), txt) catch null;
+/// Read and parse `model_dir/config.json` (the engine's own file read; a
+/// missing file is the published geometry, a broken one is refused by name).
+pub fn readPackConfig(io: std.Io, alloc: std.mem.Allocator, model_dir: []const u8) !Config {
+    var cfg = try readRootConfig(io, alloc, model_dir);
+    // generation_config's max_new_tokens (750 = 60 s) is a sampling default,
+    // not a model limit; the bridge's 1500 keeps speech under the window.
+    const gp = std.fmt.allocPrint(alloc, "{s}/generation_config.json", .{model_dir}) catch return cfg;
+    defer alloc.free(gp);
+    if (std.Io.Dir.openFileAbsolute(io, gp, .{})) |f| {
+        defer f.close(io);
+        var gbuf: [4096]u8 = undefined;
+        var grs = f.reader(io, &gbuf);
+        const gtxt = grs.interface.allocRemaining(alloc, .limited(1 << 16)) catch return cfg;
+        defer alloc.free(gtxt);
+        var gparsed = std.json.parseFromSlice(std.json.Value, alloc, gtxt, .{}) catch return cfg;
+        defer gparsed.deinit();
+        if (gparsed.value == .object) {
+            var tmp = cfg;
+            fields.fill(Config, .{.{ "max_new_tokens", "max_frames" }}, gparsed.value.object, &tmp) catch {};
+            cfg = tmp;
+        }
+    } else |_| {}
+    return cfg;
+}
+
+/// `config.json` alone (what `billRequest` reads): missing = published defaults.
+pub fn readRootConfig(io: std.Io, alloc: std.mem.Allocator, model_dir: []const u8) !Config {
+    const path = try std.fmt.allocPrint(alloc, "{s}/config.json", .{model_dir});
+    defer alloc.free(path);
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return Config{};
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const txt = try rs.interface.allocRemaining(alloc, .limited(4 << 20));
+    defer alloc.free(txt);
+    return parseConfig(alloc, txt);
+}
+
+/// The host's view of the same read, through the PackDir seam.
+fn readDirConfig(dir: *const abi.PackDir) !Config {
+    var buf: [1 << 20]u8 = undefined;
+    var len: usize = 0;
+    const v = dir.read(dir.ctx, abi.Str.of("config.json"), &buf, buf.len, &len);
+    if (v.code != .ok) return error.BadPackConfig;
+    const gpa = std.heap.c_allocator;
+    var parsed = try std.json.parseFromSlice(std.json.Value, gpa, buf[0..len], .{});
+    defer parsed.deinit();
+    return parseFromValue(parsed.value);
 }
 
 /// What a request holds above the resident weights: the frame-loop host rows
@@ -213,19 +281,26 @@ pub fn readPackConfig(dir: *const abi.PackDir) ?Config {
 /// the body's `text` length and its `max_frames` cap; the engine refuses a
 /// request past the window at step time, this keeps admission honest.
 pub fn billRequest(dir: *const abi.PackDir, m: *const abi.Machine, body: abi.Str) callconv(.c) u64 {
-    _ = .{ dir, m };
-    const hints = parseBodyHints(body.slice()) orelse BodyHints{ .max_frames = 1500, .text_len = 2048 };
+    _ = m;
+    // Config reads go through the host's PackDir seam; the engine reads the
+    // same file directly at load (MLX code may not import the host).
+    const cfg = readDirConfig(dir) catch Config{};
+    const hints = parseBodyHints(body.slice(), cfg.max_frames) orelse
+        BodyHints{ .max_frames = cfg.max_frames, .text_len = cfg.max_seq };
     const hf: u64 = hints.max_frames;
     const ht: u64 = hints.text_len;
-    const window: u64 = 2048;
+    const window: u64 = cfg.max_seq;
     const seq: u64 = @min(window, ht + hf);
-    const frames: u64 = @min(@as(u64, 1500), hf);
-    // Backbone rows ride stream + span (2 × f32[2048]); the depth span is
-    // (16+1) rows at f32[1024] per frame; the codec decode holds a latent
-    // chain (f32[1024] per frame) plus the waveform (2 × f32[1920]).
-    const seq_bytes = seq * @as(u64, 16384); // stream + span: 2 × f32[2048]
-    const depth_bytes = frames * @as(u64, 69632); // (16+1) × f32[1024]
-    const codec_bytes = frames * @as(u64, 19456); // latent + waveform chain
+    const frames: u64 = @min(@as(u64, cfg.max_frames), hf);
+    const bh: u64 = cfg.b_hidden;
+    const dh: u64 = cfg.d_hidden;
+    const spp: u64 = 1920; // codec samples per frame
+    // Backbone rows ride stream + span (2 × f32[b_hidden]); the depth span is
+    // (num_codebooks+1) rows at f32[d_hidden] per frame; the codec decode holds
+    // a latent chain (f32[1024] per frame) plus the waveform (2 × f32[spp]).
+    const seq_bytes = seq * (bh * 8); // stream + span: 2 × f32[b_hidden]
+    const depth_bytes = frames * ((@as(u64, cfg.num_codebooks) + 1) * dh * 4);
+    const codec_bytes = frames * (4096 + spp * 8); // latent + waveform chain
     const row_bytes = seq_bytes + depth_bytes + codec_bytes;
     // Margin for the TE cond buffer, evalHost staging and allocator slack.
     return row_bytes + (row_bytes / 4) + (128 << 20);
@@ -236,7 +311,7 @@ const BodyHints = struct { max_frames: u64, text_len: u64 };
 /// A cheap read of the body's `max_frames` and text length; null if the JSON
 /// is unparseable (the engine refuses it by name inside `step`; the bill
 /// defaults to the worst-case frame budget).
-fn parseBodyHints(body: []const u8) ?BodyHints {
+fn parseBodyHints(body: []const u8, default_max: u32) ?BodyHints {
     if (body.len == 0) return null;
     var fba_buf: [256 << 10]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&fba_buf);
@@ -245,8 +320,10 @@ fn parseBodyHints(body: []const u8) ?BodyHints {
     const o = v.object;
     const text = o.get("text") orelse o.get("input") orelse return null;
     if (text != .string) return null;
-    var max_frames: u64 = 1500;
-    if (o.get("max_frames")) |f| { if (f == .integer and f.integer > 0) max_frames = @min(1500, @as(u64, @intCast(f.integer))); }
+    var max_frames: u64 = default_max;
+    if (o.get("max_frames")) |f| {
+        if (f == .integer and f.integer > 0) max_frames = @min(default_max, @as(u64, @intCast(f.integer)));
+    }
     return .{ .max_frames = max_frames, .text_len = text.string.len };
 }
 

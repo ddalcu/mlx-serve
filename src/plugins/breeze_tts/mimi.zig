@@ -12,6 +12,7 @@ const env = @import("../../env.zig");
 const model_mod = weights_mod;
 const wav_mod = @import("../../sdk/media/wav.zig");
 const transformer_mod = @import("../../sdk/blocks/mlp/fused_activations.zig");
+const cf = @import("../../sdk/media/config_fields.zig");
 
 const Weights = weights_mod.Weights;
 const S = mlx.mlx_stream;
@@ -321,7 +322,82 @@ pub const CodecConfig = struct {
     layer_scale: f32 = 0.01,
     upsample_rates: [4]u32 = .{ 8, 5, 4, 3 },
     upsampling_ratios: [2]u32 = .{ 2, 2 },
+    sampling_rate: u32 = 24000,
+
+    /// The frame loop is 16-wide on the published 1920-sample ladder.
+    pub fn supported(self: *const CodecConfig) bool {
+        return codecSupported(self.*);
+    }
 };
+
+/// The frame loop is 16-wide with the published upsample ladder; every
+/// width the rows carry comes from the tensors and the config.
+fn codecSupported(cfg: CodecConfig) bool {
+    var n: u32 = 1;
+    for (cfg.upsample_rates) |r| n *= r;
+    for (cfg.upsampling_ratios) |r| n *= r;
+    return n == 1920 and cfg.num_quant == 16 and cfg.num_sem == 1;
+}
+
+/// `codec_config` / `decoder_config` from the tokenizer dir's `config.json`;
+/// an omitted field keeps the published geometry.
+fn readCodecConfig(io: std.Io, alloc: std.mem.Allocator, tokenizer_dir: []const u8) !CodecConfig {
+    const path = try std.fmt.allocPrint(alloc, "{s}/config.json", .{tokenizer_dir});
+    defer alloc.free(path);
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.MissingCodecConfig;
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const txt = try rs.interface.allocRemaining(alloc, .limited(4 << 20));
+    defer alloc.free(txt);
+    var cfg = CodecConfig{};
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, txt, .{}) catch return error.BadCodecConfig;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadCodecConfig;
+    const o = parsed.value.object;
+    var src = o;
+    if (o.get("codec_config")) |v| {
+        if (v != .object) return error.BadCodecConfig;
+        src = v.object;
+    } else if (o.get("decoder_config")) |v| {
+        if (v != .object) return error.BadCodecConfig;
+        src = v.object;
+    }
+    try cf.fill(CodecConfig, .{
+        .{ "codebook_dim", "codebook_dim" },
+        .{ "latent_dim", "latent_dim" },
+        .{ "decoder_dim", "decoder_dim" },
+        .{ "hidden_size", "hidden" },
+        .{ "num_hidden_layers", "layers" },
+        .{ "num_attention_heads", "heads" },
+        .{ "num_key_value_heads", "kv" },
+        .{ "head_dim", "head_dim" },
+        .{ "intermediate_size", "inter" },
+        .{ "norm_eps", "rms_eps" },
+        .{ "rms_norm_eps", "rms_eps" },
+        .{ "rope_theta", "rope_theta" },
+        .{ "codebook_size", "codebook_size" },
+        .{ "num_quantizers", "num_quant" },
+        .{ "num_semantic_quantizers", "num_sem" },
+        .{ "sampling_rate", "sampling_rate" },
+    }, src, &cfg);
+    cfg.rvq_codebook_dim = cfg.codebook_dim / 2;
+    if (src.get("upsampling_ratios")) |v| {
+        if (v != .array or v.array.items.len != cfg.upsampling_ratios.len) return error.BadCodecConfig;
+        for (v.array.items, &cfg.upsampling_ratios) |it, *dst| {
+            if (it != .integer or it.integer < 1 or it.integer > 64) return error.BadCodecConfig;
+            dst.* = @intCast(it.integer);
+        }
+    }
+    if (src.get("upsample_rates")) |v| {
+        if (v != .array or v.array.items.len != cfg.upsample_rates.len) return error.BadCodecConfig;
+        for (v.array.items, &cfg.upsample_rates) |it, *dst| {
+            if (it != .integer or it.integer < 1 or it.integer > 64) return error.BadCodecConfig;
+            dst.* = @intCast(it.integer);
+        }
+    }
+    return cfg;
+}
 
 /// gelu(x) = 0.5*x*(1+erf(x/√2)) (exact, matches nn.gelu).
 fn gelu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -605,7 +681,7 @@ pub const CodecDecoder = struct {
     }
 
     /// Decode codes [T][16] → waveform samples (f32, owned).
-    pub fn decode(self: *CodecDecoder, codes: []const [16]u32) ![]f32 {
+    pub fn decode(self: *CodecDecoder, codes: []const []const u32) ![]f32 {
         const s = self.s;
         const T: u32 = @intCast(codes.len);
 
@@ -692,7 +768,7 @@ pub const CodecDecoder = struct {
     }
 
     /// Sum a single codebook's embedding over codebook index `start` (NLC [1,T,256]).
-    fn codebookSum(self: *CodecDecoder, cb: mlx.mlx_array, codes: []const [16]u32, start: u32, count: u32, T: u32) !mlx.mlx_array {
+    fn codebookSum(self: *CodecDecoder, cb: mlx.mlx_array, codes: []const []const u32, start: u32, count: u32, T: u32) !mlx.mlx_array {
         const s = self.s;
         const ids = try self.allocator.alloc(i32, T);
         defer self.allocator.free(ids);
@@ -712,7 +788,7 @@ pub const CodecDecoder = struct {
     }
 
     /// Sum 15 acoustic codebooks (each its own embed table) starting at index 1.
-    fn codebookSumMulti(self: *CodecDecoder, cbs: []const mlx.mlx_array, codes: []const [16]u32, start: u32, T: u32) !mlx.mlx_array {
+    fn codebookSumMulti(self: *CodecDecoder, cbs: []const mlx.mlx_array, codes: []const []const u32, start: u32, T: u32) !mlx.mlx_array {
         const s = self.s;
         const ids = try self.allocator.alloc(i32, T);
         defer self.allocator.free(ids);
@@ -903,7 +979,8 @@ pub fn loadCodecDecoderFrom(io: std.Io, allocator: std.mem.Allocator, s: S, toke
     defer w.deinit();
 
     var d: CodecDecoder = undefined;
-    d.cfg = .{};
+    d.cfg = readCodecConfig(io, allocator, tokenizer_dir) catch CodecConfig{};
+    if (!d.cfg.supported()) return error.UnsupportedCodecGeometry;
     d.allocator = allocator;
     d.s = s;
 

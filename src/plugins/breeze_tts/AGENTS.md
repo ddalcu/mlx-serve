@@ -6,17 +6,25 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
 
 ## Files
 
-- `config.zig` — claims, caps, bills. MLX-free by rule. `required_file` gates discovery on the Mimi
-  codec landing (`audio_tokenizer/model.safetensors`).
+- `config.zig` — claims, caps, bills and the pack's `Config`: every width, id, theta and eps from
+  `config.json` (defaults are the published Breeze-TTS-2 values, `layer_types` gives the TE's
+  full-attention ladder); `supportedLayout` refuses anything the engine doesn't implement BY NAME
+  (`error.UnsupportedBreezeGeometry`). MLX-free by rule; `billRequest` reads the same config through
+  the PackDir seam. `required_file` gates discovery on the Mimi codec landing
+  (`audio_tokenizer/model.safetensors`).
 - `plugin.zig` — `MediaTable` wiring. Job body parsing, refuse-by-name for every unhonored field,
   base64/ref validation, the f32 chunk sink, WAV encode.
-- `engine.zig` — the model: Qwen3-1B backbone (codebook 0 + text), llama-100M depth decoder
-  (codebooks 1..15), T5Gemma2 text encoder, instruction wrapping. Host-gathered audio/TE table
-  boundaries; forwards run on-device; sampling keyed off a counter for seed determinism.
+- `engine.zig` — the model: backbone (codebook 0 + text), depth decoder (codebooks 1..15), text
+  encoder, instruction wrapping — all built from `Config` (layer counts, hiddens, head geometry,
+  rope thetas, rms eps come from the pack; only the 16-codebook frame loop is pinned).
+  Host-gathered audio/TE table boundaries; forwards run on-device; sampling keyed off a counter
+  for seed determinism.
 - `mimi.zig` — Kyutai Mimi codec, 16 codebooks @ 12.5 Hz: the RVQ decoder the frame loop streams
-  through and the encoder that folds the reference clip into clone frames. Self-contained (plugins do
-  not import plugins); the low-level mlx helpers ride along. If a second codec consumer appears this
-  moves to `src/sdk/media/` and `qwen3_tts` re-imports it.
+  through and the encoder that folds the reference clip into clone frames. Its own geometry rides
+  `audio_tokenizer/config.json` (`readCodecConfig` + `CodecConfig.supported`); the 1920-sample
+  upsample ladder is the floor. Self-contained (plugins do not import plugins); the low-level mlx
+  helpers ride along. If a second codec consumer appears this moves to `src/sdk/media/` and
+  `qwen3_tts` re-imports it.
 
 ## Rules this plugin honors
 
@@ -30,15 +38,23 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
 - Unknown body fields are refused by name (`'language' is not supported...`), never ignored. Host-
   consumed keys (`model`, `stream`, `response_format`, `speed`) pass through; `language` is refused
   because Breeze detects it itself.
-- `bill_request` returns 0 (all state is resident at load; the per-request working set is the frame
-  history + codec decode, small against the load bill).
+- `billRequest` prices the frame loop's host rows (stream + span + depth span + codec chain) from
+  the pack's config and the body's frame budget, with margin; the engine refuses a request past
+  the window at step time, this keeps admission honest.
+- Every debug lever that shipped with the port was deleted; the only env vars left are the
+  fixture-gated ones (`BREEZE_MODEL`, `MIMI_*`, registered in `src/env.zig`). A smaller model is
+  a smaller `config.json`, never an env override.
 
 ## Gaps
 
-- `conformanceFixture` generates the engine's widths at their published values (they are compile
-  constants, not config-driven): the full 262,158-row TE table and real Mimi decoder, with 512-wide
-  MLPs (intermediates are tensor-driven) — ~2.5 GB of tensors, so `test_min_ram_gib = 24` gates the
-  suite on small machines. Config-driven dims would let the pack shrink to yue2 sizes; follow-up.
+- `conformanceFixture` ships a toy pack (2/4/2 layers at 64/32 hiddens, a 256-row TE table, a real
+  codebook ladder) whose config.json states its geometry — the same code path the published pack
+  takes. The published pack itself has no oracle end-to-end yet: the Mimi encoder parity test is
+  the only numerical bar. `fixtures/mimi_clip.wav` + `fixtures/mimi_codes.bin` are that oracle:
+  u16-LE codes from the `qwen_tts` reference tokenizer pointed at a real pack's `audio_tokenizer/`;
+  `MLX_SERVE_MIMI_ENCODE` must still name a real pack (the encoder is real-sized). Regenerate with
+  `qwen_tts.Qwen3TTSTokenizer.encode` on an exact multiple of 1920 samples — partial trailing
+  frames floor on this side and ceil in torch.
 - `fixtures/mimi_clip.wav` + `fixtures/mimi_codes.bin` are the encoder-parity oracle: u16-LE codes
   from the `qwen_tts` reference tokenizer pointed at a real pack's `audio_tokenizer/`. The parity
   test defaults to these; `MLX_SERVE_MIMI_ENCODE` must still name a real pack (the encoder is
