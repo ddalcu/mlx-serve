@@ -21,6 +21,7 @@ const mtpCrowdThresholdFor = @import("spec/mtp_groups.zig").mtpCrowdThresholdFor
 const SpecTickMode = @import("spec/wiring.zig").SpecTickMode;
 const dspark_group = @import("spec/dspark_group.zig");
 const slotSpecMode = @import("spec/wiring.zig").slotSpecMode;
+const finishSlot = @import("finish.zig").finishSlot;
 const prefillAdmitted = @import("step.zig").prefillAdmitted;
 const publishLiveKvResidency = @import("step.zig").publishLiveKvResidency;
 const scheduler_mod = @import("scheduler.zig");
@@ -308,10 +309,12 @@ fn admitSmallAtBoundary(ic: *InterleaveCtx, share: f32, budget: *BoundaryBudget)
         const wait = outcome == .held or outcome == .tail_too_large;
         // Back to the head of `pending` before `in_pass` drops, so `complete` never sees a slot that
         // is in no list.
+        var gone: [1]*Slot = undefined;
         sch.queue_mu.lockUncancelable(sch.io);
         sch.boundary_slot = null;
-        if (wait) sch.pending.insert(sch.allocator, 0, slot) catch slot.markError("OutOfMemory");
+        const n_gone = if (wait) scheduler_mod.requeueLocked(sch, &.{slot}, &gone) else 0;
         sch.queue_mu.unlock(sch.io);
+        if (n_gone > 0) finishSlot(sch, slot, "cancelled");
         _ = slot.in_pass.fetchSub(1, .acq_rel);
         if (wait) break;
         if (outcome == .decoding) log.info("[boundary] admitted a {d}-token request beside a {d}-token prefill\n", .{ slot.prompt_tokens, ic.slot.full_prompt.len });

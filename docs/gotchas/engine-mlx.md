@@ -1466,3 +1466,10 @@ preflight refuses the setting without it) and two SDK calls every MoE on the sha
 no error): `openPack` takes GPU streams only. Guard: `residentModelDiskBytes: with stream_experts ...`, the
 conformance suite's streamed check, `mlx pack: a pack opened on a CPU stream is refused by name`.
 
+### A cancelled slot a pass put back in `pending` was freed while still listed
+Defect: a DeepSeek-V4.1 server crashed in `logSpecStats` reading a freed slot. Cause: `complete` marks the slot
+cancelled, scans `pending` and `decoding` once, then waits for `in_pass` to drop. A pass that held the slot put it back
+(a `.held` batch, a boundary `.held`/`.tail_too_large`) or moved it into `decoding` after that scan, so cleanup freed a
+listed slot and the next pass read it. Fix: every relist of a slot in a pass goes through `requeueLocked` or
+`startDecodingLocked`, which leave a cancelled slot out under `queue_mu`; the pass finishes it before it drops
+`in_pass`. Guard: the `requeueLocked` and `startDecodingLocked` race tests in `scheduler.zig`.

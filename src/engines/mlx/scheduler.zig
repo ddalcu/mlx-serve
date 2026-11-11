@@ -681,6 +681,33 @@ pub fn complete(self: *Scheduler, slot: *Slot) void {
     self.queue_mu.unlock(self.io);
 }
 
+/// Put slots a pass took back at the head of `pending`, in order. A cancelled slot stays out, since
+/// `complete` may have scanned `pending` already: it lands in `gone`, and the caller finishes it
+/// before it drops the slot's `in_pass`. Caller holds `queue_mu`.
+pub fn requeueLocked(self: *Scheduler, slots: []const *Slot, gone: []*Slot) usize {
+    var n_gone: usize = 0;
+    var r = slots.len;
+    while (r > 0) {
+        r -= 1;
+        const s = slots[r];
+        if (s.cancelled.load(.acquire)) {
+            gone[n_gone] = s;
+            n_gone += 1;
+            continue;
+        }
+        self.pending.insert(self.allocator, 0, s) catch s.markError("OutOfMemory");
+    }
+    return n_gone;
+}
+
+/// Move a prefilled slot into `decoding`. False for a cancelled slot, for the reason
+/// `requeueLocked` gives. Caller holds `queue_mu`.
+pub fn startDecodingLocked(self: *Scheduler, slot: *Slot) !bool {
+    if (slot.cancelled.load(.acquire)) return false;
+    try self.decoding.append(self.allocator, slot);
+    return true;
+}
+
 /// Shutdown helper: signal every in-flight slot (pending + decoding) to
 /// cancel so their owning connection threads unblock from `waitNext` and
 /// run their `defer complete(...)` promptly. `server.serve` calls this when
@@ -1388,4 +1415,99 @@ test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancel
     sch.boundary_slot = &slot;
     cancelAllInFlight(&sch);
     try testing.expect(slot.cancelled.load(.acquire));
+}
+
+/// A scheduler whose pass holds `left` while `left`'s reader runs `complete`.
+const LeftMidPass = struct {
+    sch: Scheduler,
+    model: LoadedModel,
+    reader: std.Thread,
+
+    fn init(self: *LeftMidPass) void {
+        self.sch = undefined;
+        self.sch.io = testing.io;
+        self.sch.allocator = testing.allocator;
+        self.sch.queue_mu = .init;
+        self.sch.queue_cond = .init;
+        self.sch.submit_cond = .init;
+        self.sch.session_cond = .init;
+        self.sch.in_flight = 3;
+        self.sch.pending = .empty;
+        self.sch.decoding = .empty;
+        self.sch.offloaded = .empty;
+        self.sch.cleanup_queue = .empty;
+        self.model = undefined;
+        self.model.session_claims = 1;
+    }
+
+    fn deinit(self: *LeftMidPass) void {
+        self.sch.pending.deinit(testing.allocator);
+        self.sch.decoding.deinit(testing.allocator);
+        self.sch.cleanup_queue.deinit(testing.allocator);
+    }
+
+    /// Returns once `complete` has scanned the lists and is waiting out `left.in_pass`.
+    fn leave(self: *LeftMidPass, left: *Slot) !void {
+        left.model = &self.model;
+        left.holds_session = true;
+        self.reader = try std.Thread.spawn(.{}, complete, .{ &self.sch, left });
+        while (true) {
+            self.sch.queue_mu.lockUncancelable(self.sch.io);
+            const released = self.model.session_claims == 0;
+            self.sch.queue_mu.unlock(self.sch.io);
+            if (released) break;
+            std.Thread.yield() catch {};
+        }
+    }
+};
+
+fn passSlot(s: *Slot) void {
+    s.cancelled = .init(false);
+    s.in_pass = .init(1);
+    s.holds_session = false;
+}
+
+test "requeueLocked: a held slot whose reader left mid-pass never goes back to pending, so complete frees nothing still listed" {
+    var rig: LeftMidPass = undefined;
+    rig.init();
+    defer rig.deinit();
+    var slots: [3]Slot = undefined;
+    for (&slots) |*s| passSlot(s);
+    const held, const left, const queued = .{ &slots[0], &slots[1], &slots[2] };
+    queued.in_pass = .init(0);
+    try rig.sch.pending.append(testing.allocator, queued);
+    try rig.leave(left);
+
+    var gone: [2]*Slot = undefined;
+    rig.sch.queue_mu.lockUncancelable(rig.sch.io);
+    const n_gone = requeueLocked(&rig.sch, &.{ held, left }, &gone);
+    rig.sch.queue_mu.unlock(rig.sch.io);
+    held.in_pass.store(0, .release);
+    left.in_pass.store(0, .release);
+    rig.reader.join();
+
+    try testing.expect(std.mem.eql(*Slot, rig.sch.cleanup_queue.items, &.{left}));
+    try testing.expect(std.mem.eql(*Slot, rig.sch.pending.items, &.{ held, queued }));
+    try testing.expect(std.mem.eql(*Slot, gone[0..n_gone], &.{left}));
+}
+
+test "startDecodingLocked: a slot whose reader left during its prefill never joins decoding" {
+    var rig: LeftMidPass = undefined;
+    rig.init();
+    defer rig.deinit();
+    var slots: [2]Slot = undefined;
+    for (&slots) |*s| passSlot(s);
+    const kept, const left = .{ &slots[0], &slots[1] };
+    try rig.leave(left);
+
+    rig.sch.queue_mu.lockUncancelable(rig.sch.io);
+    const left_listed = try startDecodingLocked(&rig.sch, left);
+    const kept_listed = try startDecodingLocked(&rig.sch, kept);
+    rig.sch.queue_mu.unlock(rig.sch.io);
+    left.in_pass.store(0, .release);
+    rig.reader.join();
+
+    try testing.expect(std.mem.eql(*Slot, rig.sch.cleanup_queue.items, &.{left}));
+    try testing.expect(std.mem.eql(*Slot, rig.sch.decoding.items, &.{kept}));
+    try testing.expect(!left_listed and kept_listed);
 }

@@ -28,6 +28,8 @@ const emptySlotCache = @import("prefill_interleave.zig").emptySlotCache;
 const slotUncachedTail = @import("prefill_interleave.zig").slotUncachedTail;
 const interleaveDecodeTick = @import("prefill_interleave.zig").interleaveDecodeTick;
 const Scheduler = @import("scheduler.zig").Scheduler;
+const requeueLocked = @import("scheduler.zig").requeueLocked;
+const startDecodingLocked = @import("scheduler.zig").startDecodingLocked;
 const promiseMaterialized = @import("scheduler/params.zig").promiseMaterialized;
 const Slot = @import("slot.zig").Slot;
 const publishFirstToken = @import("spec/wiring.zig").publishFirstToken;
@@ -109,13 +111,13 @@ pub fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
     // slot that finishes mid-tick can't skew it (metrics TTFT fix).
     slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
     sch.queue_mu.lockUncancelable(sch.io);
-    sch.decoding.append(sch.allocator, slot) catch |err| {
+    const listed = startDecodingLocked(sch, slot) catch |err| {
         sch.queue_mu.unlock(sch.io);
         slot.markError(@errorName(err));
         return .errored;
     };
     sch.queue_mu.unlock(sch.io);
-    return .decoding;
+    return if (listed) .decoding else .errored;
 }
 
 /// One admission -> prefill -> decode tick -> cull pass. `.main` parks while there is no
@@ -248,17 +250,13 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             switch (prefillAdmitted(sch, slot)) {
                 .held => {
                     // Back to the head of `pending`, in order; the decode tick below runs first.
+                    var gone: [to_prefill.len]*Slot = undefined;
                     sch.queue_mu.lockUncancelable(sch.io);
-                    defer sch.queue_mu.unlock(sch.io);
                     sch.n_prefilling = pi; // back in `pending`, which `cancelAllInFlight` walks
-                    var r = n_prefill;
-                    while (r > pi) {
-                        r -= 1;
-                        sch.pending.insert(sch.allocator, 0, to_prefill[r]) catch {
-                            to_prefill[r].markError("OutOfMemory");
-                        };
-                        if (r > pi) _ = to_prefill[r].in_pass.fetchSub(1, .acq_rel);
-                    }
+                    const n_gone = requeueLocked(sch, to_prefill[pi..n_prefill], &gone);
+                    sch.queue_mu.unlock(sch.io);
+                    for (gone[0..n_gone]) |s| finishSlot(sch, s, "cancelled");
+                    for (to_prefill[pi + 1 .. n_prefill]) |s| _ = s.in_pass.fetchSub(1, .acq_rel);
                     break;
                 },
                 .decoding, .finished, .errored, .tail_too_large => ran = true,
