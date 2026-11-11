@@ -130,24 +130,29 @@ pub fn moeDown(sc: *dsv41.Scope, kern: Kernels, ly: *const dsv41.Layer, act: A, 
     if (mlx.mlx_array_dtype(sp.post) != .float32 or mlx.mlx_array_dtype(sp.comb) != .float32 or mlx.mlx_array_size(sp.post) != R * hc or mlx.mlx_array_size(sp.comb) != R * hc * hc) return null;
     if (mlx.getShape(down.w).len != 3 or mlx.getShape(down.s).len != 3 or dims(down.w, 1) != N or dims(down.w, 2) != K / 8 or dims(down.s, 1) != N or dims(down.s, 2) != K / 32) return null;
     if (mlx.getShape(shared.w).len != 2 or mlx.getShape(shared.s).len != 2 or dims(shared.w, 0) != N or dims(shared.w, 1) != K / 4 or dims(shared.s, 0) != N or dims(shared.s, 1) != K / 32) return null;
+    const nc = downCols(K, N, hc) orelse return null;
+    return try runDown(sc, kern, R, K, N, hc, nc, topk, act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb);
+}
+
+/// The down launch over arrays already checked, `nc` from `downCols`.
+pub fn runDown(sc: *dsv41.Scope, kern: Kernels, R: usize, K: usize, N: usize, hc: usize, nc: usize, topk: usize, act: A, w: A, scales: A, sw: A, sscales: A, idx: A, x1: A, post: A, comb: A) !A {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
     const shape = [_]c_int{ ci(R), ci(hc), ci(N) };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, shape.len, .bfloat16));
-    const nc = downCols(K, N, hc) orelse return null;
     const tg = 32 * (topk + 1);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, ci(N / nc * tg), ci(R), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, ci(tg), 1, 1));
     inline for (.{ .{ "K", K }, .{ "N", N }, .{ "TOPK", topk }, .{ "HC", hc }, .{ "NC", nc } }) |t| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, t[0], ci(t[1])));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16));
-    const ins = [_]A{ act, down.w, down.s, shared.w, shared.s, idx, x1, sp.post, sp.comb };
+    const ins = [_]A{ act, w, scales, sw, sscales, idx, x1, post, comb };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
     var ov = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ov);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, kern.down, iv, cfg, sc.s));
     var o = mlx.mlx_array_new();
-    return try sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
+    return sc.res(mlx.mlx_vector_array_get(&o, ov, 0), &o);
 }
 
 // ── the kernel contract ──
@@ -892,4 +897,204 @@ test "dsv41 dec moe_fp4: the registered kernels pass the contract's gates 1-4" {
     var tally: kc.gates.Tally = .{};
     try kc.gates.runAll(testing.allocator, set.kernels.items, 0xc0de, &tally);
     try testing.expectEqual(@as(usize, 0), tally.problems());
+}
+
+// ── the ubench ──
+
+/// The stream's width and the routed picks a row: the release's.
+const bench_hidden = 4096;
+/// Experts a bank holds and shared copies the steps rotate through: at a quarter width a bank is still 302 MB, past
+/// the system cache, so every step reads its weights from DRAM.
+const bench_experts = 128;
+const bench_copies = 24;
+const bench_steps = 64;
+
+/// e8m0 bytes 120..127 (weights near 2^-4) of `shape`.
+fn benchScales(shape: []const c_int, seed: u64) !A {
+    const eb = try moe_up.randomBits(shape, 1, seed);
+    defer _ = mlx.mlx_array_free(eb);
+    const eight = mlx.mlx_array_new_data(&[_]u8{8}, &[_]c_int{1}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(eight);
+    const base = mlx.mlx_array_new_data(&[_]u8{120}, &[_]c_int{1}, 1, .uint8);
+    defer _ = mlx.mlx_array_free(base);
+    var rem = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rem);
+    try mlx.check(mlx.mlx_remainder(&rem, eb, eight, mlx.gpuStream()));
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&o, rem, base, mlx.gpuStream()));
+    return o;
+}
+
+/// e4m3 words with no NaN code (bit 6 of each byte clear) of `shape`.
+fn benchE4m3(shape: []const c_int, seed: u64) !A {
+    const raw = try moe_up.randomBits(shape, 4, seed);
+    defer _ = mlx.mlx_array_free(raw);
+    const mask = mlx.mlx_array_new_data(&[_]u32{0xBFBFBFBF}, &[_]c_int{1}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(mask);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_bitwise_and(&o, raw, mask, mlx.gpuStream()));
+    return o;
+}
+
+/// One rank's MoE at the intermediate width `w` (2304 whole, 1152 at two ranks, 576 at four), one decode row: the two
+/// launches over random banks, each step fed by the one before through a one-scalar add.
+const FpBench = struct {
+    gpa: std.mem.Allocator,
+    w: usize,
+    hc: usize,
+    kern: Kernels,
+    held: std.ArrayList(A) = .empty,
+    gu: A = none,
+    gs: A = none,
+    dw: A = none,
+    ds: A = none,
+    sgu: [bench_copies][2]A = undefined,
+    sdn: [bench_copies][2]A = undefined,
+    ids: [bench_steps]A = undefined,
+    wts: [bench_steps]A = undefined,
+    x0: A = none,
+    act0: A = none,
+    x1: A = none,
+    post: A = none,
+    comb: A = none,
+    zero: A = none,
+
+    fn hold(b: *FpBench, a: A) !A {
+        try b.held.append(b.gpa, a);
+        return a;
+    }
+
+    fn init(gpa: std.mem.Allocator, w: usize, hc: usize) !*FpBench {
+        const b = try gpa.create(FpBench);
+        errdefer gpa.destroy(b);
+        b.* = .{ .gpa = gpa, .w = w, .hc = hc, .kern = try build(10) };
+        const H: c_int = bench_hidden;
+        const W: c_int = @intCast(w);
+        const E: c_int = bench_experts;
+        b.gu = try b.hold(try moe_up.randomBits(&.{ E, 2 * W, @divExact(H, 8) }, 4, 1));
+        b.gs = try b.hold(try benchScales(&.{ E, 2 * W, @divExact(H, 32) }, 2));
+        b.dw = try b.hold(try moe_up.randomBits(&.{ E, H, @divExact(W, 8) }, 4, 3));
+        b.ds = try b.hold(try benchScales(&.{ E, H, @divExact(W, 32) }, 4));
+        for (&b.sgu, &b.sdn, 0..) |*g, *d, i| {
+            g.* = .{ try b.hold(try benchE4m3(&.{ 2 * W, @divExact(H, 4) }, 100 + i)), try b.hold(try benchScales(&.{ 2 * W, @divExact(H, 32) }, 200 + i)) };
+            d.* = .{ try b.hold(try benchE4m3(&.{ H, @divExact(W, 4) }, 300 + i)), try b.hold(try benchScales(&.{ H, @divExact(W, 32) }, 400 + i)) };
+        }
+        var prng = std.Random.DefaultPrng.init(42);
+        const rnd = prng.random();
+        for (&b.ids, &b.wts) |*idx, *wt| {
+            var ids: [TOPK]u32 = undefined;
+            var ws: [TOPK]f32 = undefined;
+            for (0..TOPK) |j| {
+                ids[j] = while (true) {
+                    const e = rnd.uintLessThan(u32, bench_experts);
+                    if (std.mem.indexOfScalar(u32, ids[0..j], e) == null) break e;
+                };
+                ws[j] = 0.05 + 0.3 * rnd.float(f32);
+            }
+            idx.* = try b.hold(mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, TOPK }, 2, .uint32));
+            wt.* = try b.hold(mlx.mlx_array_new_data(&ws, &[_]c_int{ 1, TOPK }, 2, .float32));
+        }
+        b.x0 = try b.hold(try normal(&.{ 1, H }, 0));
+        b.act0 = try b.hold(try normal(&.{ 1, TOPK + 1, W }, 1));
+        b.x1 = try b.hold(try normal(&.{ 1, @intCast(hc), H }, 2));
+        var post: [32]f32 = undefined;
+        var comb: [32 * 32]f32 = undefined;
+        for (post[0..hc], 0..) |*p, i| p.* = 0.5 + 0.1 * @as(f32, @floatFromInt(i));
+        for (comb[0 .. hc * hc], 0..) |*c, i| c.* = 1.0 / @as(f32, @floatFromInt(hc + i % 3));
+        b.post = try b.hold(mlx.mlx_array_new_data(&post, &[_]c_int{ 1, @intCast(hc) }, 2, .float32));
+        b.comb = try b.hold(mlx.mlx_array_new_data(&comb, &[_]c_int{ 1, @intCast(hc), @intCast(hc) }, 3, .float32));
+        b.zero = try b.hold(mlx.mlx_array_new_data(&[_]f32{0}, &[_]c_int{1}, 1, .float32));
+        try moe_up.evalAll(b.held.items);
+        return b;
+    }
+
+    fn normal(shape: []const c_int, seed: u64) !A {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 500 + seed));
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&o, shape.ptr, shape.len, .bfloat16, 0, 1, key, mlx.gpuStream()));
+        return o;
+    }
+
+    fn deinit(b: *FpBench) void {
+        b.kern.deinit();
+        for (b.held.items) |a| _ = mlx.mlx_array_free(a);
+        b.held.deinit(b.gpa);
+        b.gpa.destroy(b);
+    }
+
+    /// `base` plus zero times `prev`'s first value: the next step waits on the last without changing its input.
+    fn dep(sc: *dsv41.Scope, base: A, prev: A, zero: A) !A {
+        const first = try sc.slice(try sc.reshape(prev, &.{-1}), 0, 0, 1);
+        return sc.astype(try sc.add(base, try sc.mul(try sc.astype(first, .float32), zero)), .bfloat16);
+    }
+
+    /// Bytes the gate/up launch's weights read: six experts' 2w rows and the shared expert's, codes and scales. The
+    /// down launch reads half that (`hidden` rows of w inputs).
+    fn upBytes(b: *const FpBench) f64 {
+        const fp4: f64 = @floatFromInt(2 * b.w * bench_hidden / 2 + 2 * b.w * bench_hidden / 32);
+        const fp8: f64 = @floatFromInt(2 * b.w * bench_hidden + 2 * b.w * bench_hidden / 32);
+        return TOPK * fp4 + fp8;
+    }
+};
+
+const UpCtx = struct {
+    b: *FpBench,
+    sc: *dsv41.Scope,
+    prev: A,
+    pub fn step(c: *UpCtx, i: usize) !A {
+        const b = c.b;
+        const s = b.sgu[i % bench_copies];
+        c.prev = try runUp(c.sc, b.kern, 1, bench_hidden, b.w, TOPK, try FpBench.dep(c.sc, b.x0, c.prev, b.zero), b.gu, b.gs, s[0], s[1], b.ids[i % bench_steps], b.wts[i % bench_steps]);
+        return c.prev;
+    }
+};
+
+const DownCtx = struct {
+    b: *FpBench,
+    sc: *dsv41.Scope,
+    prev: A,
+    pub fn step(c: *DownCtx, i: usize) !A {
+        const b = c.b;
+        const s = b.sdn[i % bench_copies];
+        const nc = downCols(b.w, bench_hidden, b.hc).?;
+        c.prev = try runDown(c.sc, b.kern, 1, b.w, bench_hidden, b.hc, nc, TOPK, try FpBench.dep(c.sc, b.act0, c.prev, b.zero), b.dw, b.ds, s[0], s[1], b.ids[i % bench_steps], b.x1, b.post, b.comb);
+        return c.prev;
+    }
+};
+
+/// The dependency op alone, which both launches' chains carry.
+const DepOnly = struct {
+    b: *FpBench,
+    sc: *dsv41.Scope,
+    prev: A,
+    pub fn step(c: *DepOnly, _: usize) !A {
+        c.prev = try FpBench.dep(c.sc, c.b.x0, c.prev, c.b.zero);
+        return c.prev;
+    }
+};
+
+test "dsv41 dec moe_fp4: ubench, one row at widths 2304 1152 576, hc 4 and 1 (DSV41_DEC_UBENCH)" {
+    if (!decode.ubenchOn() or !mlx.metalKernelsAvailable() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    for ([_]usize{ 2304, 1152, 576 }) |w| for ([_]usize{ 4, 1 }) |hc| {
+        const b = try FpBench.init(gpa, w, hc);
+        defer b.deinit();
+        var sc = dsv41.Scope.init(gpa, mlx.gpuStream());
+        defer sc.deinit();
+        var dep: DepOnly = .{ .b = b, .sc = &sc, .prev = b.x0 };
+        var up: UpCtx = .{ .b = b, .sc = &sc, .prev = b.x0 };
+        var down: DownCtx = .{ .b = b, .sc = &sc, .prev = b.x0 };
+        const first_ms = try moe_up.firstCallMs(&up) + try moe_up.firstCallMs(&down);
+        const dep_us = try moe_up.deviceUs(&dep, bench_steps);
+        var up_us: f64 = std.math.inf(f64);
+        var down_us: f64 = std.math.inf(f64);
+        for (0..3) |_| {
+            up_us = @min(up_us, try moe_up.deviceUs(&up, bench_steps) - dep_us);
+            down_us = @min(down_us, try moe_up.deviceUs(&down, bench_steps) - dep_us);
+        }
+        const up_floor = b.upBytes() / decode.stream_bytes_per_us;
+        std.debug.print("[dec-ubench] moe_fp4 w={d} hc={d} R=1 (dependency op {d:.1} us taken off, first calls {d:.0} ms): up {d:.1} us ({d:.0}% of floor {d:.1}), down {d:.1} us ({d:.0}% of floor {d:.1})\n", .{ w, hc, dep_us, first_ms, up_us, 100 * up_floor / up_us, up_floor, down_us, 50 * up_floor / down_us, up_floor / 2 });
+    };
 }
