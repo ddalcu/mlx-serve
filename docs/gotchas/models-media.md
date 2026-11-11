@@ -798,3 +798,11 @@ Defect: ISTA-DASLab's Q2_0 Flash Next pack answered `!!` on the MLX GGUF path wh
 split-layout types (`packedRows`), so two Q6_K `ssm_out` layers fed the kernels a wrong layout; any qwen35 GGUF with a
 split-type out_proj and r > 1 had it too. Found by loading one tensor class raw at a time, the rest as 8-bit affine.
 Fix: the branch packs too. Guard: `a tiled-input weight of a split-layout type loads in the kernels' layout`.
+
+### MiniMax-H3-Image decoded noise from a pack that loaded cleanly
+Defect: the first MiniMax-H3-Image pack generated a texture of 16-px tiles for every prompt, at the right size and in
+the right time. Cause: the release's `transformer/` interleaves each attention's fused Q/K/V per head
+(`[h0 q | h0 k | h0 v | h1 q ...]`) while H3's engine splits `[q | k | v]` (the video packs come from Comfy-Org's
+repack); the converter passed it through, so every head attended with another head's keys. Found by matching rows of
+the release's diffusers copy against the original. Fix: `image_dit` reorders the rows. Guards:
+`tests/test_convert_minimax_h3_image.py` and the seam check in `tests/test_minimax_h3_image.sh`.

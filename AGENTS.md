@@ -145,7 +145,7 @@ DSpark arms with `--dspark` when a `-DSpark-` GGUF sits beside the model (`mtpDr
 | `qwen3_asr` | `qwen3_asr` | `/v1/audio/transcriptions` only, + the forced aligner (`qwen3_forced_aligner`) |
 | `nemotron_diarization` | `nemotron_diarization` | `diarized_json` speakers, run once over the whole clip |
 | `*.gguf` | engines | ds4 / llama.cpp (above); GGUF presence WINS over a stray config.json |
-| media | `flux2`, `krea`, `mage_flow`, `qwen_image`, `moss_image`, `ltx`, `minimax_h3`, `hunyuan3d`, `trellis2`, `pixal3d`, `idol`, `acestep`, `music3`, `stable_audio3`, `yue2`, `qwen3_tts`, `kokoro` | Media plugins (`abi/media.zig`); configless packs are claimed from `model_index.json` / `pipeline.json` / `model_config.json` (`sdk/media/pack_claims.zig`) |
+| media | `flux2`, `krea`, `mage_flow`, `qwen_image`, `moss_image`, `ltx`, `minimax_h3`, `minimax_h3_image`, `hunyuan3d`, `trellis2`, `pixal3d`, `idol`, `acestep`, `music3`, `stable_audio3`, `yue2`, `qwen3_tts`, `kokoro` | Media plugins (`abi/media.zig`); configless packs are claimed from `model_index.json` / `pipeline.json` / `model_config.json` (`sdk/media/pack_claims.zig`) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
 
