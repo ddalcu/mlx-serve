@@ -1811,7 +1811,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
     errdefer gpa.destroy(m);
     const n_layers = cfg.num_hidden_layers;
     // A tensor split's rank 0 holds the DSpark stages whole and drafts alone, unless every rank holds its slice of them.
-    const n_stages: usize = if (opts.dspark and (opts.tp == null or opts.tp.?.rank == 0 or opts.draft_shard) and cfg.dsv4_dspark_block_size > 0 and (getOpt(w, "mtp.0.main_proj.weight", .{}) != null or (opts.quant != null and getOpt(w, "mtp.0.main_norm.weight", .{}) != null)))
+    const n_stages: usize = if (opts.dspark and (opts.tp == null or opts.tp.?.rank == 0 or opts.draft_shard) and cfg.dsv4_dspark_block_size > 0 and stagesShipped(LoadedHas{ .w = w }, opts.quant != null))
         cfg.dsv4_n_compress_ratios - n_layers
     else
         0;
@@ -2098,6 +2098,43 @@ pub fn dsparkWanted(cfg: *const Config, pair: ?Pair, mtp: ?bool) bool {
     }
     const ds = env.get(.MLX_SERVE_DSV4_DSPARK);
     return (mtp orelse true) or (ds != null and ds.?[0] != '0');
+}
+
+/// Whether a pack's weights hold DSpark's stages: the first stage's projection, or its norm when an outside quant
+/// stores the projection in its own format. A load and a tensor plan share this test.
+fn stagesShipped(names: anytype, quant: bool) bool {
+    return names.has("mtp.0.main_proj.weight") or (quant and names.has("mtp.0.main_norm.weight"));
+}
+
+const LoadedHas = struct {
+    w: *const Weights,
+
+    fn has(self: LoadedHas, key: []const u8) bool {
+        return self.w.get(key) != null;
+    }
+};
+
+const IndexHas = struct {
+    owners: *const weights_load.Owners,
+
+    fn has(self: IndexHas, key: []const u8) bool {
+        if (self.owners.contains(key)) return true;
+        var buf: [96]u8 = undefined;
+        const prefixed = std.fmt.bufPrint(&buf, "{s}{s}", .{ weights_load.dsv41_text_prefix, key }) catch return false;
+        return self.owners.contains(prefixed);
+    }
+};
+
+/// Whether the pack in `dir` ships the stages, read off its index before any weight loads (rank 0's tensor plan, which
+/// must match what its load will find). A pack with no readable index loads every shard: the plan trusts its config.
+/// The norm counts as well as the projection: whether an outside quant holds the pack is not known yet.
+pub fn packShipsStages(io: std.Io, dir_path: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return true;
+    defer dir.close(io);
+    const owners = weights_load.indexOwners(io, arena.allocator(), dir) orelse return true;
+    return stagesShipped(IndexHas{ .owners = &owners }, true);
 }
 
 /// What a load holds of the pack: its safetensors bytes less the Engram tables it preads and the tensors it

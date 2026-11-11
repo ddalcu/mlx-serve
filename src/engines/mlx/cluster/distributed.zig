@@ -1250,7 +1250,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
     switch (self.mode) {
         .pipeline => {},
         .tensor => {
-            const stages = dsv41DraftShard(config, self.link.size);
+            const stages = dsv41DraftShard(cluster().group.?.io, config, self.link.size, model_dir);
             self.shard = .{ .rank = 0, .size = self.link.size, .stages = stages };
             log.info("[dist] tensor: every expert and attention head of {s} split across {d} Macs; DSpark {s}\n", .{ std.fs.path.basename(self.model), self.link.size, if (stages) "drafts on every rank" else "is off (turned off, or the pack ships no stages)" });
             const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .stages = stages, .sum = @intFromEnum(try dsv41_mod.tpSumWanted()), .head8 = dsv41_mod.head8Wanted() };
@@ -1388,12 +1388,12 @@ fn dsv41TpBatch(gens: []const u64, p0s: []const usize, chunks: []const []const u
     }
 }
 
-/// Whether rank 0's DSpark stages load and split across the group: the pack declares them and the plugin loads them
-/// (`dsparkWanted`).
-fn dsv41DraftShard(config: *const model_mod.ModelConfig, size: u32) bool {
+/// Whether rank 0's DSpark stages load and split across the group: the pack declares them, ships their weights and the
+/// plugin loads them (`dsparkWanted`).
+fn dsv41DraftShard(io: std.Io, config: *const model_mod.ModelConfig, size: u32, model_dir: []const u8) bool {
     const binding = config.plugin orelse return false;
     const cfg = @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed);
-    return size > 1 and cfg.dsparkStages() > 0 and dsv41_mod.dsparkWanted(cfg, null, config.mtp_override);
+    return size > 1 and cfg.dsparkStages() > 0 and dsv41_mod.dsparkWanted(cfg, null, config.mtp_override) and dsv41_mod.packShipsStages(io, model_dir);
 }
 
 /// Host: a sharded DSpark draft over the states `gens`, each at `p0s[k]` drafting from `t1s[k]` (a batch body with one
@@ -2914,19 +2914,31 @@ test "dist N-rank: each of four Macs bills a quarter of a tensor split, plus the
     try std.testing.expectEqual(@as(u64, 400 + 80), shareFor(pair, &q, 800, 60, 40));
 }
 
-test "dist N-rank: tensor DSpark stages split only when the pack ships them and they are wanted" {
+test "dist N-rank: tensor DSpark stages split only when the pack declares and ships them and they are wanted" {
+    const io = std.testing.io;
     const v41 = @import("../../../plugins/deepseek_v41/config.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.safetensors", .data = "" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = pbuf[0..try tmp.dir.realPath(io, &pbuf)];
     var table: @import("../../../abi/plugin.zig").ModelTable = undefined;
     var cfg: v41.Config = .{ .num_hidden_layers = 4 };
     var b: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .private = &cfg } };
     var c: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .plugin = &b };
-    try std.testing.expect(!dsv41DraftShard(&c, 4));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.0.main_proj.weight\":\"a.safetensors\"}}" });
+    try std.testing.expect(!dsv41DraftShard(io, &c, 4, dir));
     cfg.dsv4_dspark_block_size = 5;
     cfg.dsv4_n_compress_ratios = 7;
-    try std.testing.expect(dsv41DraftShard(&c, 4));
-    try std.testing.expect(!dsv41DraftShard(&c, 1));
+    try std.testing.expect(dsv41DraftShard(io, &c, 4, dir));
+    try std.testing.expect(!dsv41DraftShard(io, &c, 1, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"language_model.mtp.0.main_proj.weight\":\"a.safetensors\"}}" });
+    try std.testing.expect(dsv41DraftShard(io, &c, 4, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"layers.0.attn.wkv.weight\":\"a.safetensors\"}}" });
+    try std.testing.expect(!dsv41DraftShard(io, &c, 4, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.0.main_proj.weight\":\"a.safetensors\"}}" });
     c.mtp_override = false;
-    try std.testing.expect(!dsv41DraftShard(&c, 4));
+    try std.testing.expect(!dsv41DraftShard(io, &c, 4, dir));
 }
 
 test "dist N-rank: past a pair only DeepSeek-V4.1's tensor split forms a group, and only one its heads divide" {
