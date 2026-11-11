@@ -633,7 +633,6 @@ pub const QwenVision = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Geometry, weights: *const Weights) !QwenVision {
-        const s = mlx.mlx_default_gpu_stream_new();
         var buf: [256]u8 = undefined;
         var kbuf: [256]u8 = undefined;
 
@@ -641,7 +640,13 @@ pub const QwenVision = struct {
             log.warn("MISSING QWEN VISION WEIGHT: {s}patch_embed.proj.weight\n", .{VISION_PREFIXES[0]});
             return error.MissingVisionWeights;
         };
+        // A packed linear is U32 codes plus `.scales`. Matmul of the codes is not the tower.
+        if (packedTower(weights, prefix)) {
+            log.warn("QWEN VISION: a tower linear is quantized ({s}blocks.0); images stay off\n", .{prefix});
+            return error.QuantizedVisionTower;
+        }
         log.info("[vision] qwen tower prefix: {s}\n", .{prefix});
+        const s = mlx.mlx_default_gpu_stream_new();
 
         const must = struct {
             fn f(w: *const Weights, b: *[256]u8, name: []const u8) !mlx.mlx_array {
@@ -1186,7 +1191,9 @@ pub const QwenVision = struct {
         var parts = try self.allocator.alloc(mlx.mlx_array, grid_t);
         defer self.allocator.free(parts);
         var built: usize = 0;
-        errdefer for (parts[0..built]) |p| { _ = mlx.mlx_array_free(p); };
+        errdefer for (parts[0..built]) |p| {
+            _ = mlx.mlx_array_free(p);
+        };
 
         var t: u32 = 0;
         while (t < grid_t) : (t += 1) {
@@ -1200,7 +1207,9 @@ pub const QwenVision = struct {
             parts[t] = try self.forward(group, grid_h, grid_w);
             built += 1;
         }
-        defer for (parts) |p| { _ = mlx.mlx_array_free(p); };
+        defer for (parts) |p| {
+            _ = mlx.mlx_array_free(p);
+        };
 
         const cat_vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
         defer _ = mlx.mlx_vector_array_free(cat_vec);
@@ -1290,6 +1299,22 @@ pub fn patchProjLayout(shape: []const c_int, temporal_patch: u32, patch: u32) ?P
     return null;
 }
 
+fn packedTower(weights: *const Weights, prefix: []const u8) bool {
+    const leaves = [_][]const u8{
+        "blocks.0.attn.qkv.scales",
+        "blocks.0.attn.proj.scales",
+        "blocks.0.mlp.linear_fc1.scales",
+        "merger.linear_fc1.scales",
+        "merger.linear_fc2.scales",
+    };
+    var buf: [256]u8 = undefined;
+    for (leaves) |leaf| {
+        const name = std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, leaf }) catch return false;
+        if (weights.get(name) != null) return true;
+    }
+    return false;
+}
+
 /// Resolve the tower prefix by PROBING the loaded weights (model.resolveWeightPrefix
 /// pattern) — null when no spelling is present, which is what disables vision.
 pub fn resolveVisionPrefix(weights: *const Weights) ?[]const u8 {
@@ -1360,6 +1385,22 @@ pub fn resizeToUnitChw(allocator: std.mem.Allocator, rgb: []const u8, sh: u32, s
 pub fn budgetPixels(allocator: std.mem.Allocator, rgb: []const u8, h: u32, w: u32, patch: u32, merge: u32, max_tokens: u32) !UnitImage {
     const size = budgetSize(h, w, patch, merge, max_tokens) orelse return error.InvalidImageDimensions;
     return resizeToUnitChw(allocator, rgb, h, w, size.h, size.w);
+}
+
+test "prism config: a packed qkv leaves the qwen tower off" {
+    const allocator = std.testing.allocator;
+    var w = Weights.init(allocator);
+    defer w.deinit();
+    const put = struct {
+        fn add(map: *Weights, alloc: std.mem.Allocator, key: []const u8) !void {
+            const k = try alloc.dupe(u8, key);
+            try map.map.put(k, mlx.mlx_array_new());
+        }
+    }.add;
+    try put(&w, allocator, "vision_tower.patch_embed.proj.weight");
+    try put(&w, allocator, "vision_tower.blocks.0.attn.qkv.scales");
+    const g = QwenVision.Geometry{ .patch = 16, .temporal_patch = 2, .depth = 1, .hidden = 1152, .heads = 16, .head_dim = 72, .merge = 2, .num_pos_emb = 2304, .out_hidden = 5120 };
+    try std.testing.expectError(error.QuantizedVisionTower, QwenVision.init(allocator, g, &w));
 }
 
 test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded" {
@@ -1467,9 +1508,9 @@ test "qwen smart_resize honors checkpoint processor pixel bounds" {
 
 test "qwen bicubic RGB preprocessing preserves colors and interpolates" {
     const rgb = [_]u8{
-        255, 0,   0, // red
-        0,   255, 0, // green
-        0,   0,   255, // blue
+        255, 0, 0, // red
+        0, 255, 0, // green
+        0, 0, 255, // blue
         255, 255, 255, // white
     };
     var same: [3 * 2 * 2]f32 = undefined;
@@ -1502,8 +1543,8 @@ test "resizeInterleavedPil: identity copy, channel independence, u8 domain" {
     const a = std.testing.allocator;
     // Same dims: the resampler is an exact copy (identity taps, u8 in/out).
     const rgba = [_]u8{
-        10, 20, 30, 255, 200, 100, 50, 128,
-        0, 255, 0, 255, 255, 255, 255, 0,
+        10, 20,  30, 255, 200, 100, 50,  128,
+        0,  255, 0,  255, 255, 255, 255, 0,
     };
     const same = try resizeInterleavedPil(a, &rgba, 2, 2, 2, 2, 4, .lanczos);
     defer a.free(same);
@@ -1601,10 +1642,10 @@ test "qwen buildPixelValues merge-order + [C,tps,py,px] feature layout" {
     buildPixelValues(pv, &img, C, rh, rw, 1, 2, 2);
     // 4 tokens (merge-block order over a single 2x2 block) × feat 6 (=C*tps*1*1).
     const expect = [_]f32{
-        0,   0,   100, 100, 200, 200, // token0 row0col0
-        1,   1,   101, 101, 201, 201, // token1 row0col1
-        10,  10,  110, 110, 210, 210, // token2 row1col0
-        11,  11,  111, 111, 211, 211, // token3 row1col1
+        0, 0, 100, 100, 200, 200, // token0 row0col0
+        1, 1, 101, 101, 201, 201, // token1 row0col1
+        10, 10, 110, 110, 210, 210, // token2 row1col0
+        11, 11, 111, 111, 211, 211, // token3 row1col1
     };
     try std.testing.expectEqualSlices(f32, &expect, pv);
 }
@@ -1627,10 +1668,10 @@ test "qwen buildPixelValuesVideo reads REAL per-frame data, not one frame duplic
     // [frame0_px, frame1_px] — proving both real frames land in the output,
     // not one frame duplicated tps times (that would make both slots equal).
     const expect = [_]f32{
-        0,    1000, // token0 row0col0
-        1,    1001, // token1 row0col1
-        10,   1010, // token2 row1col0
-        11,   1011, // token3 row1col1
+        0, 1000, // token0 row0col0
+        1, 1001, // token1 row0col1
+        10, 1010, // token2 row1col0
+        11, 1011, // token3 row1col1
     };
     try std.testing.expectEqualSlices(f32, &expect, pv);
 }
@@ -1873,7 +1914,9 @@ test "qwen forwardVideo == per-group forward()+concat (self-consistency)" {
         defer _ = mlx.mlx_array_free(group_arr);
         manual_parts[g] = try qv.forward(group_arr, 2, 2);
     }
-    defer for (manual_parts) |p| { _ = mlx.mlx_array_free(p); };
+    defer for (manual_parts) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
     const cat_vec = mlx.mlx_vector_array_new_data(&manual_parts, manual_parts.len);
     defer _ = mlx.mlx_vector_array_free(cat_vec);
     var out_manual = mlx.mlx_array_new();
