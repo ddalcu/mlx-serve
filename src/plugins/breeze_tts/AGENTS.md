@@ -24,7 +24,14 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
   `audio_tokenizer/config.json` (`readCodecConfig` + `CodecConfig.supported`); the 1920-sample
   upsample ladder is the floor. Self-contained (plugins do not import plugins); the low-level mlx
   helpers ride along. If a second codec consumer appears this moves to `src/sdk/media/` and
-  `qwen3_tts` re-imports it.
+  `qwen3_tts` re-imports it. The codec is a separate file on purpose: qwen3_tts's copy lives
+  inside `tts.zig`, and merging means promoting it whole, which is a qwen3_tts change with its
+  own parity bar.
+- A `Bundle` (one safetensors file + handle map, `openBundle`) serves the decoder and the encoder
+  from one weight load; every load path that opens one `defer b.close()` — the parse phase
+  duplicates key strings and leaves nothing mapped after it.
+- Frame rows the engine returns are views into one flat buffer (`Synthesis.backing`); the caller
+  frees it through `freeSynthesisFrames` and never the rows.
 
 ## Rules this plugin honors
 
