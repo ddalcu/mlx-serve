@@ -42,6 +42,13 @@ Usage:
         --tokenizer ~/claude-tmp/h3-build/src_orig/FL2VA/processor \
         --out ~/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit
 
+    # MiniMax-H3-Image: the `MiniMaxAI/MiniMax-H3-Image` snapshot (transformer/, vae/,
+    # pdd_*, tokenizer/, LICENSE; its text_encoder/ is H3's, cloned from an H3 pack)
+    uv run --with mlx tests/convert_minimax_h3_weights.py --partition image --bits 4 \\
+        --src <MiniMax-H3-Image snapshot> \\
+        --reuse-from ~/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit \\
+        --out ~/.mlx-serve/models/ddalcu/MiniMax-H3-Image-MLX-Serve-4bit
+
     # the reference-conditioning checkpoint
     uv run --with mlx --with safetensors --with numpy \
         tests/convert_minimax_h3_weights.py --partition ref2va \
@@ -166,7 +173,7 @@ def fastvideo_dit(dit_dir):
     return out
 
 
-def convert_file(src_path, dst_path, label):
+def convert_file(src_path, dst_path, label, tensors=None):
     t0 = time.time()
     out = {}
     n_q = n_d = 0
@@ -175,7 +182,10 @@ def convert_file(src_path, dst_path, label):
     # RAM as a whole. (safetensors' numpy framework cannot represent bfloat16 at
     # all — `data type 'bfloat16' not understood` — so this is not just faster,
     # it is the only path that reads these files.)
-    src = fastvideo_dit(src_path) if os.path.isdir(src_path) else mx.load(src_path)
+    if tensors is not None:
+        src = tensors
+    else:
+        src = fastvideo_dit(src_path) if os.path.isdir(src_path) else mx.load(src_path)
     keys = list(src.keys())
     for i, k in enumerate(keys):
         arr = src.pop(k)
@@ -211,7 +221,7 @@ def convert_file(src_path, dst_path, label):
         "modified_from": PARTITIONS[CONFIG["partition"]]["upstream"],
         "modified_by": "mlx-serve tests/convert_minimax_h3_weights.py",
         "modification": f"quantized to MLX affine {BITS}-bit group size {GROUP_SIZE}",
-        "license": "MiniMax H3 Community License Agreement",
+        "license": PARTITIONS[CONFIG["partition"]].get("license", "MiniMax H3 Community License Agreement"),
     })
     total = (q_bytes + d_bytes) / 1e9
     print(f"  [{label}] {n_q} quantized / {n_d} dense -> {total:.1f} GB "
@@ -254,7 +264,164 @@ PARTITIONS = {
                   "input halves reordered to (gate, value). All 32 PDD output heads "
                   "and the sparse-attention `to_gate_compress` projections are kept.\n"),
     },
+    # MiniMax-H3-Image: the H3 DiT without its audio stream, a 6-step PDD student, its own 2D image VAE, and the H3
+    # text encoder unchanged (cloned from an H3 pack). Built by `build_image`, not the video flow below.
+    "image": {
+        "tasks": ["t2i", "edit"],
+        "upstream": "MiniMaxAI/MiniMax-H3-Image",
+        "license": "MiniMax-H3-Image Community License Agreement",
+    },
 }
+
+IMAGE_NOTICE = (
+    "MiniMax-H3-Image is licensed under the MiniMax-H3-Image Community License Agreement, "
+    "Copyright © 2026 MiniMax. All Rights Reserved.\n"
+)
+
+IMAGE_MODIFICATIONS = """# Modifications to MiniMax-H3-Image
+
+These files are MODIFIED versions of the MiniMax-H3-Image Works
+(MiniMaxAI/MiniMax-H3-Image), redistributed under the MiniMax-H3-Image Community
+License Agreement (see LICENSE and NOTICE).
+
+Modified by: mlx-serve (https://github.com/ddalcu/mlx-serve)
+
+What changed:
+
+* `transformer.safetensors` is QUANTIZED from the original `transformer/`
+  release to MLX affine {bits}-bit, group size 64. Each attention's fused
+  Q/K/V rows are reordered from per-head interleaved to [q | k | v]. Its output
+  head is replaced by the six per-step heads of `pdd_fused_heads.safetensors`,
+  stacked as `final_layer.video_out` ([6 x 96, 5376]). Embeddings, the time embedder, the
+  patch projection, the heads and the rope frequencies stay dense.
+* `text_encoder.safetensors` is the MiniMax-H3 text encoder (which
+  MiniMax-H3-Image uses unchanged), quantized to MLX affine and truncated to
+  the 50 layers the DiT reads.
+* `image_vae.safetensors` holds the original `vae/` tensors unmodified, plus
+  `latents_mean` / `latents_std` copied from `vae/config.json`.
+* The tokenizer files are byte-for-byte copies of `tokenizer/`.
+* `config.json` is new, written by mlx-serve's converter; it carries the
+  sampling grid of `pdd_config.json`.
+
+No weights were retrained, distilled, pruned or otherwise altered beyond the
+row reordering and numeric quantization described above.
+"""
+
+IMAGE_README = """---
+license: other
+license_name: minimax-h3-image-community-license-agreement
+license_link: https://huggingface.co/MiniMaxAI/MiniMax-H3-Image/blob/main/LICENSE
+base_model: MiniMaxAI/MiniMax-H3-Image
+base_model_relation: quantized
+library_name: mlx
+tags:
+- mlx-serve
+- text-to-image
+- image-to-image
+- image-editing
+---
+
+# MiniMax-H3-Image — MLX-Serve {bits}-bit
+
+{bits}-bit affine (group size 64) conversion of MiniMaxAI/MiniMax-H3-Image for
+[mlx-serve](https://github.com/ddalcu/mlx-serve), running natively on Apple
+Silicon: text-to-image and editing with up to 16 reference images, in six
+transformer forwards and no classifier-free guidance.
+
+Self-contained: the DiT with its six per-step output heads, the MiniMax-H3 text
+encoder (which the upstream release loads from MiniMaxAI/MiniMax-H3), the image
+VAE and the tokenizer in one directory.
+
+## Modifications
+
+These are MODIFIED files: see MODIFICATIONS.md.
+
+## License
+
+Powered by MiniMax-H3-Image. Licensed under the MiniMax-H3-Image Community
+License Agreement -- see LICENSE and NOTICE, both included here.
+
+**Territorial restriction.** The Agreement defines the Applicable Territory as
+worldwide EXCLUDING the European Union, the United Kingdom, the Republic of
+Korea and the United States of America, and prohibits use, reproduction,
+modification, distribution and display outside it. Check whether your
+jurisdiction permits you to use these files before downloading them.
+"""
+
+
+def image_dit(src):
+    """The MiniMax-H3-Image DiT as lazy tensors under the names this engine reads: the release's `transformer/` is
+    in ComfyUI's MiniMax-H3 names but interleaves Q/K/V per head, which become the [q | k | v] blocks the engine
+    splits; its single output head gives way to the six PDD heads, stacked."""
+    out = {}
+    for shard in sorted(glob.glob(os.path.join(src, "transformer", "*.safetensors"))):
+        out.update(mx.load(shard))
+    if any(k.startswith(("audio_patch_proj.", "final_layer.audio_out.")) for k in out):
+        raise SystemExit("an image DiT with an audio stream: not the MiniMax-H3-Image release")
+    cfg = json.load(open(os.path.join(src, "transformer", "config.json")))
+    heads, hd = cfg["num_attention_heads"], cfg["attention_head_dim"]
+    for k in [k for k in out if k.endswith(".attn.qkv_proj.weight")]:
+        w = out[k]
+        out[k] = w.reshape(heads, 3, hd, w.shape[-1]).transpose(1, 0, 2, 3).reshape(3 * heads * hd, w.shape[-1])
+    heads = mx.load(os.path.join(src, "pdd_fused_heads.safetensors"))
+    w, b = heads["video_out.weight"], heads["video_out.bias"]
+    steps = len(json.load(open(os.path.join(src, "pdd_config.json")))["sigmas"]) - 1
+    if w.shape[0] != steps or w.shape[1:] != out["final_layer.video_out.weight"].shape:
+        raise SystemExit(f"PDD heads {w.shape} do not fit a {steps}-step grid on this DiT")
+    out["final_layer.video_out.weight"] = w.reshape(-1, w.shape[-1])
+    out["final_layer.video_out.bias"] = b.reshape(-1)
+    return out
+
+
+def build_image(args):
+    """MiniMax-H3-Image -> `<out>/` with transformer, text_encoder (cloned from `--reuse-from`, an H3 pack: the image
+    model uses the H3 encoder unchanged), image_vae, tokenizer, LICENSE, NOTICE, MODIFICATIONS.md, config.json."""
+    src, out = os.path.expanduser(args.src), os.path.expanduser(args.out)
+    if not args.reuse_from:
+        raise SystemExit("--partition image needs --reuse-from <an H3 pack> for its text encoder")
+    os.makedirs(out, exist_ok=True)
+    te = os.path.join(out, "text_encoder.safetensors")
+    if not os.path.exists(te):
+        reuse = os.path.join(os.path.expanduser(args.reuse_from), "text_encoder.safetensors")
+        print(f"[text_encoder] cloning from {reuse}", flush=True)
+        if subprocess.run(["cp", "-c", reuse, te]).returncode != 0:
+            shutil.copyfile(reuse, te)
+
+    dit = os.path.join(out, "transformer.safetensors")
+    if os.path.exists(dit):
+        print("[transformer] exists, skipping", flush=True)
+    else:
+        convert_file(None, dit, "transformer", tensors=image_dit(src))
+
+    vae = os.path.join(out, "image_vae.safetensors")
+    if not os.path.exists(vae):
+        vcfg = json.load(open(os.path.join(src, "vae", "config.json")))
+        tensors = mx.load(os.path.join(src, "vae", "diffusion_pytorch_model.safetensors"))
+        tensors["latents_mean"] = mx.array(vcfg["latents_mean"], dtype=mx.float32)
+        tensors["latents_std"] = mx.array(vcfg["latents_std"], dtype=mx.float32)
+        mx.save_safetensors(vae, tensors, metadata={
+            "modified_from": "MiniMaxAI/MiniMax-H3-Image (vae/)",
+            "modification": "latents_mean / latents_std added from vae/config.json",
+            "license": PARTITIONS["image"]["license"],
+        })
+        print("[image_vae] written", flush=True)
+
+    for fn in ("tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt"):
+        shutil.copyfile(os.path.join(src, "tokenizer", fn), os.path.join(out, fn))
+    shutil.copyfile(os.path.join(src, "LICENSE"), os.path.join(out, "LICENSE"))
+    with open(os.path.join(out, "NOTICE"), "w") as f:
+        f.write(IMAGE_NOTICE)
+    with open(os.path.join(out, "MODIFICATIONS.md"), "w") as f:
+        f.write(IMAGE_MODIFICATIONS.replace("{bits}", str(BITS)))
+    with open(os.path.join(out, "README.md"), "w") as f:
+        f.write(IMAGE_README.replace("{bits}", str(BITS)))
+    cfg = {k: v for k, v in CONFIG.items() if k not in ("sigma_shift_scales", "fps")}
+    cfg.update(model_type="minimax_h3_image", partition="image", tasks=PARTITIONS["image"]["tasks"],
+               pdd_sigmas=json.load(open(os.path.join(src, "pdd_config.json")))["sigmas"])
+    with open(os.path.join(out, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"\nDONE -> {out}", flush=True)
+    return 0
 
 CONFIG = {
     "model_type": "minimax_h3",
@@ -383,6 +550,8 @@ def main():
     CONFIG["tasks"] = part["tasks"]
     if args.cpu:
         mx.set_default_device(mx.cpu)
+    if args.partition == "image":
+        return build_image(args)
 
     src = os.path.expanduser(args.src)
     out = os.path.expanduser(args.out)

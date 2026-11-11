@@ -59,6 +59,13 @@ final class MediaModalityParityTests: XCTestCase {
         XCTAssertTrue(isMediaModelType("mage_flow_turbo"))
     }
 
+    func testMiniMaxH3ImageIsAnImagePackNotAVideoOne() {
+        // The image pack shares H3's DiT and its file names, never its pane.
+        XCTAssertEqual(MediaModality(modelType: "minimax_h3_image"), .image)
+        XCTAssertEqual(MediaModality(modelType: "minimax_h3"), .video)
+        XCTAssertEqual(DownloadManager.requiredMediaMarker(modelType: "minimax_h3_image"), "transformer.safetensors")
+    }
+
     func testChatArchitecturesStillDoNotReadAsMedia() {
         for t in ["qwen3", "llama", "gemma3", "bailing_hybrid", "bert", "minimax_text"] {
             XCTAssertFalse(isMediaModelType(t), "\(t) must not read as media")

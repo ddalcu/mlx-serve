@@ -1749,6 +1749,13 @@ pub const TimestepPlan = struct {
     pub fn deinit(self: *TimestepPlan) void {
         self.allocator.free(self.runs);
     }
+
+    /// The timestep row of the run that starts `seg`. A target segment is one run, but a text span carrying vision
+    /// blocks splits into several, so a run's INDEX is not its segment's.
+    pub fn timestepRow(self: *const TimestepPlan, seg: Segment) u32 {
+        for (self.runs) |r| if (r.start == seg.start and r.end > r.start) return r.mod_row / 3;
+        return 0;
+    }
 };
 
 /// How a step's video sigma becomes row timesteps: condition rows ride at
@@ -1789,7 +1796,7 @@ pub fn buildTimestepPlan(
         else => {},
     };
     add(&uniq, &n, t_v);
-    add(&uniq, &n, t_a);
+    if (layout.audio_update.len > 0) add(&uniq, &n, t_a);
     if (has_vis_cond) add(&uniq, &n, @max(t_v, aug.visual));
     if (has_aud_cond) add(&uniq, &n, @max(t_a, aug.audio));
     std.mem.sort(f64, uniq[0..n], {}, std.sort.asc(f64));
@@ -1809,6 +1816,7 @@ pub fn buildTimestepPlan(
     errdefer allocator.free(runs);
     var nr: usize = 0;
     for (layout.segments) |seg| {
+        if (seg.end == seg.start) continue; // an image layout's empty audio segment
         const t = switch (seg.kind) {
             .text, .video => t_v,
             .audio => t_a,
@@ -2095,6 +2103,8 @@ pub const Model = struct {
         m.cfg = cfg;
         m.dtype = dt;
         m.ablate = .none;
+        m.split = null;
+        m.vsa = null;
         m.ane_eng = null;
         m.ane_rest = &.{};
 
@@ -2104,8 +2114,11 @@ pub const Model = struct {
         // them is the MageFlow precision class.
         m.video_patch_w = try ownWeightAs(w, allocator, "video_patch_proj", ".weight", f32t, s);
         m.video_patch_b = try ownWeightAs(w, allocator, "video_patch_proj", ".bias", f32t, s);
-        m.audio_patch_w = try ownWeightAs(w, allocator, "audio_patch_proj", ".weight", f32t, s);
-        m.audio_patch_b = try ownWeightAs(w, allocator, "audio_patch_proj", ".bias", f32t, s);
+        // MiniMax-H3-Image is this DiT without the audio stream: its four audio arrays stay null.
+        const audio = w.get("audio_patch_proj.weight") != null;
+        const none = mlx.mlx_array{ .ctx = null };
+        m.audio_patch_w = if (audio) try ownWeightAs(w, allocator, "audio_patch_proj", ".weight", f32t, s) else none;
+        m.audio_patch_b = if (audio) try ownWeightAs(w, allocator, "audio_patch_proj", ".bias", f32t, s) else none;
         m.condition_proj = try MfLinear.load(w, allocator, "condition_proj", cfg.text_dim, dt, s);
         m.condition_bias = try ownWeightAs(w, allocator, "condition_proj", ".bias", dt, s);
 
@@ -2133,9 +2146,13 @@ pub const Model = struct {
         m.adaln_tables = null;
         m.video_out_w = try ownWeightAs(w, allocator, "final_layer.video_out", ".weight", f32t, s);
         m.video_out_b = try ownWeightAs(w, allocator, "final_layer.video_out", ".bias", f32t, s);
-        m.audio_out_w = try ownWeightAs(w, allocator, "final_layer.audio_out", ".weight", f32t, s);
-        m.audio_out_b = try ownWeightAs(w, allocator, "final_layer.audio_out", ".bias", f32t, s);
+        m.audio_out_w = if (audio) try ownWeightAs(w, allocator, "final_layer.audio_out", ".weight", f32t, s) else none;
+        m.audio_out_b = if (audio) try ownWeightAs(w, allocator, "final_layer.audio_out", ".bias", f32t, s) else none;
         return m;
+    }
+
+    pub fn hasAudio(self: *const Model) bool {
+        return self.audio_patch_w.ctx != null;
     }
 
     pub fn deinit(self: *Model) void {
@@ -2516,6 +2533,8 @@ pub const Model = struct {
         errdefer for (v) |x| {
             _ = mlx.mlx_array_free(x);
         };
+        const none = mlx.mlx_array{ .ctx = null };
+        if (!self.hasAudio()) return .{ .video_w = v[0], .video_b = v[1], .audio_w = none, .audio_b = none };
         const a = try fusePddHead(self.audio_out_w, self.audio_out_b, p.grid, p.nodes[k], p.blockWeights(k, shift_a, &buf), s);
         return .{ .video_w = v[0], .video_b = v[1], .audio_w = a[0], .audio_b = a[1] };
     }
@@ -2524,7 +2543,7 @@ pub const Model = struct {
         /// Velocity for the video stream, [n_video_rows, videoPatchDim].
         video: mlx.mlx_array,
         /// Velocity for the audio stream, [n_audio_rows, audio_latents_dim],
-        /// ALREADY scaled by d(sigma_a)/d(sigma_v).
+        /// ALREADY scaled by d(sigma_a)/d(sigma_v). Null when the layout has no audio rows.
         audio: mlx.mlx_array,
 
         pub fn deinit(self: *Output) void {
@@ -2575,10 +2594,15 @@ pub const Model = struct {
         defer _ = mlx.mlx_array_free(ve32);
         const video_embed = try astype(ve32, self.dtype, s);
         defer _ = mlx.mlx_array_free(video_embed);
-        const ae32 = try denseLinear(audio_rows, self.audio_patch_w, self.audio_patch_b, s);
-        defer _ = mlx.mlx_array_free(ae32);
-        const audio_embed = try astype(ae32, self.dtype, s);
+        // An image layout has no audio rows (and an image DiT no audio stream).
+        const aseg = layout.audioSegment();
+        var audio_embed = mlx.mlx_array{ .ctx = null };
         defer _ = mlx.mlx_array_free(audio_embed);
+        if (layout.audio_update.len > 0) {
+            const ae32 = try denseLinear(audio_rows, self.audio_patch_w, self.audio_patch_b, s);
+            defer _ = mlx.mlx_array_free(ae32);
+            audio_embed = try astype(ae32, self.dtype, s);
+        }
 
         // Assemble the packed stream segment by segment. Segments are
         // contiguous and each draws from exactly one embedding stream.
@@ -2590,23 +2614,25 @@ pub const Model = struct {
         errdefer for (pieces[0..built]) |p| {
             _ = mlx.mlx_array_free(p);
         };
-        for (layout.segments, 0..) |seg, i| {
+        for (layout.segments) |seg| {
             const n: c_int = @intCast(seg.end - seg.start);
+            if (n == 0) continue;
             switch (seg.kind.stream()) {
-                .text => pieces[i] = try contig(text_states, s),
+                .text => pieces[built] = try contig(text_states, s),
                 .video => {
-                    pieces[i] = try sliceRows(video_embed, voff, voff + n, s);
+                    pieces[built] = try sliceRows(video_embed, voff, voff + n, s);
                     voff += n;
                 },
                 .audio => {
-                    pieces[i] = try sliceRows(audio_embed, aoff, aoff + n, s);
+                    pieces[built] = try sliceRows(audio_embed, aoff, aoff + n, s);
                     aoff += n;
                 },
             }
             built += 1;
         }
-        var h = try concat(pieces, 0, s);
-        for (pieces) |p| _ = mlx.mlx_array_free(p);
+        var h = try concat(pieces[0..built], 0, s);
+        for (pieces[0..built]) |p| _ = mlx.mlx_array_free(p);
+        built = 0;
         errdefer _ = mlx.mlx_array_free(h);
 
         // t_emb is only needed when modulation still runs from weights; with
@@ -2661,14 +2687,8 @@ pub const Model = struct {
             _ = mlx.mlx_array_free(p.*);
         };
         const vseg = layout.videoSegment();
-        const aseg = layout.audioSegment();
-        const v_row = plan.runs[layout.segments.len - 1].mod_row / 3;
-        const a_row = plan.runs[layout.segments.len - 2].mod_row / 3;
-
-        const vout = try self.finalHead(h, fmods[0], fmods[1], vseg, v_row, heads.video_w, heads.video_b, s);
+        const vout = try self.finalHead(h, fmods[0], fmods[1], vseg, plan.timestepRow(vseg), heads.video_w, heads.video_b, s);
         errdefer _ = mlx.mlx_array_free(vout);
-        const aout_raw = try self.finalHead(h, fmods[0], fmods[1], aseg, a_row, heads.audio_w, heads.audio_b, s);
-        defer _ = mlx.mlx_array_free(aout_raw);
 
         // The sampler integrates a flat ODE on the VIDEO schedule. Scaling the
         // audio velocity by d(sigma_a)/d(sigma_v) makes that equal the audio
@@ -2679,6 +2699,10 @@ pub const Model = struct {
         const video = try mulA(vout, negv, s);
         _ = mlx.mlx_array_free(vout);
         errdefer _ = mlx.mlx_array_free(video);
+        if (aseg.end == aseg.start) return .{ .video = video, .audio = .{ .ctx = null } };
+
+        const aout_raw = try self.finalHead(h, fmods[0], fmods[1], aseg, plan.timestepRow(aseg), heads.audio_w, heads.audio_b, s);
+        defer _ = mlx.mlx_array_free(aout_raw);
         const nega = try scalarLike(@floatCast(-audio_slope), aout_raw, s);
         defer _ = mlx.mlx_array_free(nega);
         const audio = try mulA(aout_raw, nega, s);
@@ -3297,8 +3321,21 @@ pub const Pdd = struct {
     nodes: [MAX_NODES]u32,
     n_nodes: u32,
     max_t: f64,
+    /// A student distilled on an explicit grid (MiniMax-H3-Image: one head per step) carries its sigmas here and
+    /// ignores the shift; empty for FastVideo's shifted grid.
+    table: []const f64 = &.{},
 
     pub const MAX_NODES = 65;
+
+    /// One head per step on `grid` (sigmas descending from `grid[0]` to 0). Borrows `grid`.
+    pub fn fromSigmas(grid: []const f64) !Pdd {
+        if (grid.len < 2 or grid.len > MAX_NODES or !(grid[0] > 0 and grid[0] <= 1) or grid[grid.len - 1] != 0)
+            return error.BadPddContract;
+        for (grid[1..], grid[0 .. grid.len - 1]) |b, a| if (!(b < a)) return error.BadPddContract;
+        var p = Pdd{ .grid = @intCast(grid.len - 1), .nodes = undefined, .n_nodes = @intCast(grid.len), .max_t = grid[0], .table = grid };
+        for (0..grid.len) |i| p.nodes[i] = @intCast(i);
+        return p;
+    }
 
     /// Transformer forwards per generation: one per trained block.
     pub fn steps(self: *const Pdd) u32 {
@@ -3308,6 +3345,7 @@ pub const Pdd = struct {
     /// Noise level of fine-grid node `j` on a modality's clock:
     /// `max_t * g_shift(1 - j/grid)`, the rational shift scaled to the grid top.
     pub fn sigmaAt(self: *const Pdd, j: u32, shift: f64) f64 {
+        if (self.table.len > 0) return self.table[j];
         const base = 1.0 - @as(f64, @floatFromInt(j)) / @as(f64, @floatFromInt(self.grid));
         return self.max_t * timeShiftSigma(base, 1.0, shift);
     }
@@ -3368,7 +3406,8 @@ pub const Pdd = struct {
 pub fn checkPddHeads(video_rows: u32, audio_rows: u32, cfg: Config, pdd: ?*const Pdd) !void {
     const gv = video_rows / cfg.videoPatchDim();
     const ga = audio_rows / cfg.audio_latents_dim;
-    if (gv * cfg.videoPatchDim() != video_rows or ga * cfg.audio_latents_dim != audio_rows or gv != ga)
+    // `audio_rows` 0: a DiT without the audio stream.
+    if (gv * cfg.videoPatchDim() != video_rows or ga * cfg.audio_latents_dim != audio_rows or (audio_rows != 0 and gv != ga))
         return error.PddGridMismatch;
     if (pdd) |p| {
         if (gv == 1) return error.PddContractWithoutHeads;
@@ -3661,7 +3700,7 @@ const LapClock = struct {
     }
 };
 
-fn randomNormal(shape: []const c_int, seed: u64, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
+pub fn randomNormal(shape: []const c_int, seed: u64, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_key(&key, seed));
@@ -3692,7 +3731,7 @@ pub fn patchifyVideo(x: mlx.mlx_array, s: S) !mlx.mlx_array {
 }
 
 /// Inverse of `patchifyVideo`: `[T*(H/2)*(W/2), C*2*2]` → `[1, C, T, H, W]`.
-fn unpatchifyVideoRows(video_x: mlx.mlx_array, latent_t: u32, lat_h: u32, lat_w: u32, s: S) !mlx.mlx_array {
+pub fn unpatchifyVideoRows(video_x: mlx.mlx_array, latent_t: u32, lat_h: u32, lat_w: u32, s: S) !mlx.mlx_array {
     const lh2: c_int = @intCast(lat_h / PATCH_H);
     const lw2: c_int = @intCast(lat_w / PATCH_W);
     const c24: c_int = 24;
@@ -5473,6 +5512,74 @@ test "minimax h3: PDD heads and the pack's contract must agree" {
     try testing.expectError(error.PddContractWithoutHeads, checkPddHeads(cfg.videoPatchDim(), cfg.audio_latents_dim, cfg, &p));
     try testing.expectError(error.PddGridMismatch, checkPddHeads(16 * cfg.videoPatchDim(), 16 * cfg.audio_latents_dim, cfg, &p));
     try testing.expectError(error.PddGridMismatch, checkPddHeads(32 * cfg.videoPatchDim(), 16 * cfg.audio_latents_dim, cfg, &p));
+    // A DiT without the audio stream (MiniMax-H3-Image) is held to its video heads alone.
+    const img = try Pdd.fromSigmas(&IMAGE_SIGMAS);
+    try checkPddHeads(6 * cfg.videoPatchDim(), 0, cfg, &img);
+    try testing.expectError(error.PddGridMismatch, checkPddHeads(5 * cfg.videoPatchDim(), 0, cfg, &img));
+}
+
+/// MiniMax-H3-Image's `pdd_config.json` grid.
+const IMAGE_SIGMAS = [_]f64{ 1.0, 0.9675236940383911, 0.8875485062599182, 0.75, 0.5327739119529724, 0.23200887441635132, 0.0 };
+
+test "minimax h3: an explicit-grid PDD student runs one head per step on its own sigmas" {
+    const p = try Pdd.fromSigmas(&IMAGE_SIGMAS);
+    try testing.expectEqual(@as(u32, 6), p.steps());
+    const sig = try p.sigmas(testing.allocator, SIGMA_SHIFT_VIDEO);
+    defer testing.allocator.free(sig);
+    try testing.expectEqualSlices(f64, &IMAGE_SIGMAS, sig);
+    var buf: [Pdd.MAX_NODES]f32 = undefined;
+    for (0..6) |k| try testing.expectEqualSlices(f32, &.{1.0}, p.blockWeights(@intCast(k), SIGMA_SHIFT_VIDEO, &buf));
+    try testing.expectError(error.BadPddContract, Pdd.fromSigmas(&.{ 1.0, 0.5 }));
+    try testing.expectError(error.BadPddContract, Pdd.fromSigmas(&.{ 1.0, 0.5, 0.6, 0.0 }));
+}
+
+test "minimax h3: an image layout is text, one t slot per reference, then the target" {
+    const a = testing.allocator;
+    // diffusers `build_image_packed_sequence`: 4 text rows, a 4x6 reference latent, a 4x4 target, no audio.
+    const refs = [_]RefBlock{.{ .kind = .image, .latent_h = 4, .latent_w = 6 }};
+    var l = try PackedLayout.initFull(a, 4, 1, 4, 4, 0, &.{}, 1, &refs);
+    defer l.deinit();
+    try testing.expectEqual(@as(u32, 4 + 6 + 4), l.seq_len);
+    const pos = l.position_ids;
+    for (0..4) |i| try testing.expectEqualSlices(f64, &.{ @floatFromInt(i), 0, 0 }, pos[i * 3 ..][0..3]);
+    // The reference's own grid: ratio dim/sqrt(24), centred, x32.
+    const rh = [_]f64{ 2.936055, 16.0 };
+    const rw = [_]f64{ -3.595917, 9.468027, 22.531973 };
+    for (0..6) |r| {
+        const row = pos[(4 + r) * 3 ..][0..3];
+        try testing.expectEqual(@as(f64, 4), row[0]);
+        try testing.expectApproxEqAbs(rh[r / 3], row[1], 1e-5);
+        try testing.expectApproxEqAbs(rw[r % 3], row[2], 1e-5);
+    }
+    // The target takes the slot after the last reference, on a square grid [0, 16].
+    const tw = [_]f64{ 0, 16 };
+    for (0..4) |r| try testing.expectEqualSlices(f64, &.{ 5, tw[r / 2], tw[r % 2] }, pos[(10 + r) * 3 ..][0..3]);
+
+    // No audio rows: no audio run, no audio timestep, and the references held at 0.999.
+    var p = try buildTimestepPlan(a, &l, 0.75, 1.0, 1.0, .{});
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 2), p.n_unique);
+    try testing.expectEqual(@as(usize, 3), p.runs.len);
+    try testing.expectEqual(ModRun{ .start = 0, .end = 4, .mod_row = 1 }, p.runs[0]);
+    try testing.expectEqual(ModRun{ .start = 4, .end = 10, .mod_row = 3 }, p.runs[1]);
+    try testing.expectEqual(ModRun{ .start = 10, .end = 14, .mod_row = 0 }, p.runs[2]);
+}
+
+test "minimax h3: the final layer reads the target's own timestep when the text span splits" {
+    const a = testing.allocator;
+    const refs = [_]RefBlock{.{ .kind = .image, .latent_h = 4, .latent_w = 4 }};
+    var l = try PackedLayout.initFull(a, 6, 2, 8, 8, 3, &.{}, 5, &refs);
+    defer l.deinit();
+    const tags = [_]u8{ 1, 1, 0, 0, 0, 1 };
+    l.text_tags = &tags;
+    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+    defer p.deinit();
+    const t_v = 0.5;
+    const t_a = 1.0 - timeShiftSigma(0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO);
+    try testing.expectEqual(t_v, p.unique_t[p.timestepRow(l.videoSegment())]);
+    try testing.expectEqual(t_a, p.unique_t[p.timestepRow(l.audioSegment())]);
+    // The run at the segment's INDEX is the reference's, held at 0.999: not the target's clock.
+    try testing.expectEqual(VISUAL_COND_TIMESTEP, p.unique_t[p.runs[l.segments.len - 1].mod_row / 3]);
 }
 
 test "minimax h3: the timestep plan reads a PDD student's 0.999 clock" {
