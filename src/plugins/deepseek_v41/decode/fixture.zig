@@ -385,6 +385,34 @@ test "dsv41 tensor parallel: two ranks on half the heads and experts, summing ea
     }
 }
 
+test "dist N-rank: four ranks on a quarter of the heads and experts, summing each attention and MoE, give the whole model's stream" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const base: Opts = .{ .lo = 20, .hi = 22, .experts = 8, .ctx = 0, .act = .float32, .experts_fp4 = true };
+    const whole = try Fixture.init(gpa, base);
+    defer whole.deinit();
+    var quarter = base;
+    quarter.tp = .{ .rank = 3, .size = 4 };
+    const rank3 = try Fixture.init(gpa, quarter);
+    defer rank3.deinit();
+    try std.testing.expectEqual(whole.m.cfg.num_attention_heads / 4, rank3.m.cfg.num_attention_heads);
+    try std.testing.expectEqual(whole.m.cfg.dsv4_o_groups / 4, rank3.m.cfg.dsv4_o_groups);
+    try std.testing.expectEqual(whole.m.cfg.moe_intermediate_size / 4, rank3.m.cfg.moe_intermediate_size);
+    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;
+    for ([_]usize{ 1, dsv41.region_rows + 9 }) |rows| {
+        const in = try Input.of(whole, rows);
+        defer in.deinit();
+        const want = try streamOf(gpa, whole, in);
+        defer gpa.free(want);
+        const got = try tpStreamN(gpa, base, in, 4);
+        defer gpa.free(got);
+        var peak: f32 = 0;
+        for (want) |v| peak = @max(peak, @abs(v));
+        try std.testing.expect(peak > 0);
+        for (want, got) |u, v| try std.testing.expect(@abs(u - v) <= tol * peak);
+    }
+}
+
 test "dsv41 tensor parallel: the ranks on the fused decode kernels decode no further from an f32 model than one model's chain" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const gpa = std.testing.allocator;
@@ -695,35 +723,56 @@ fn streamOf(gpa: std.mem.Allocator, fx: *Fixture, in: Input) ![]f32 {
 /// the ranks in lockstep: each pass runs one rank against the other's partials from its latest pass, and a sum depends
 /// only on the sums before it, so passes fix them one by one; the last pass changes none.
 fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input) ![]f32 {
-    var ranks: [2]*Fixture = undefined;
+    return tpStreamN(gpa, base, in, 2);
+}
+
+/// The stream `n` ranks give, each on its 1/n of the heads and experts, their sums met by a fixed point: every pass
+/// runs each rank on the others' parts from the pass before, until no sum changes.
+fn tpStreamN(gpa: std.mem.Allocator, base: Opts, in: Input, n: usize) ![]f32 {
+    const max = 4;
+    var ranks: [max]*Fixture = undefined;
     var made: usize = 0;
     defer for (ranks[0..made]) |r| r.deinit();
-    for (&ranks, 0..) |*r, i| {
+    for (ranks[0..n], 0..) |*r, i| {
         var o = base;
-        o.tp = .{ .rank = @intCast(i), .size = 2 };
+        o.tp = .{ .rank = @intCast(i), .size = @intCast(n) };
         r.* = try Fixture.init(gpa, o);
         made += 1;
     }
     const Sums = struct {
         var rank: usize = 0;
-        var parts: [2]std.ArrayList(A) = .{ .empty, .empty };
-        var prev: [2]std.ArrayList(A) = .{ .empty, .empty };
+        var size: usize = 2;
+        var parts: [max]std.ArrayList(A) = @splat(.empty);
+        var prev: [max]std.ArrayList(A) = @splat(.empty);
         fn sum(x: A) anyerror!A {
             try mlx.check(mlx.mlx_array_eval(x));
             var kept = mlx.mlx_array_new();
             _ = mlx.mlx_array_set(&kept, x);
             const k = parts[rank].items.len;
             try parts[rank].append(std.testing.allocator, kept);
-            const other = &parts[1 - rank];
-            var out = mlx.mlx_array_new();
-            if (k < other.items.len) try mlx.check(mlx.mlx_add(&out, x, other.items[k], mlx.gpuStream())) else _ = mlx.mlx_array_set(&out, x);
-            return out;
+            // Summed in rank order, as every rank sums: the ranks then agree to the bit.
+            var acc = mlx.mlx_array_new();
+            var first = true;
+            for (0..size) |r| {
+                const p = if (r == rank) x else if (k < parts[r].items.len) parts[r].items[k] else continue;
+                if (first) {
+                    _ = mlx.mlx_array_set(&acc, p);
+                    first = false;
+                    continue;
+                }
+                var next = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&next, acc, p, mlx.gpuStream()));
+                _ = mlx.mlx_array_free(acc);
+                acc = next;
+            }
+            return acc;
         }
         fn clear(l: *std.ArrayList(A)) void {
             for (l.items) |a| _ = mlx.mlx_array_free(a);
             l.clearRetainingCapacity();
         }
     };
+    Sums.size = n;
     dsv41.clusterHooks().tp_sum = &Sums.sum;
     defer {
         dsv41.clusterHooks().tp_sum = null;
@@ -736,12 +785,12 @@ fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input) ![]f32 {
             b.* = .empty;
         }
     }
-    var got: [2][]f32 = .{ &.{}, &.{} };
+    var got: [max][]f32 = @splat(&.{});
     defer for (got) |g| gpa.free(g);
     // A pass fixes at least one more sum; the last pass changes none. A wide chunk sums each span's attention.
     const spans = (@as(usize, @intCast(mlx.getShape(in.x)[0])) + dsv41.SPAN - 1) / dsv41.SPAN;
     const sums = (spans + 1) * (base.hi - base.lo);
-    for (0..sums + 2) |_| for (0..2) |r| {
+    for (0..sums + 2) |_| for (0..n) |r| {
         Sums.clear(&Sums.prev[r]);
         std.mem.swap(std.ArrayList(A), &Sums.prev[r], &Sums.parts[r]);
         Sums.rank = r;
@@ -753,7 +802,7 @@ fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input) ![]f32 {
         got[r] = &.{};
         got[r] = try dsv41.hostF32(out[0]);
     };
-    for (Sums.parts, Sums.prev) |now, before| {
+    for (Sums.parts[0..n], Sums.prev[0..n]) |now, before| {
         try std.testing.expectEqual(sums, now.items.len);
         for (now.items, before.items) |a, b| {
             const u = try dsv41.hostF32(a);
@@ -763,13 +812,15 @@ fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input) ![]f32 {
             try std.testing.expectEqualSlices(f32, u, v);
         }
     }
-    try std.testing.expectEqualSlices(f32, got[0], got[1]);
-    // The ranks' caches come off the same summed stream through whole KV weights: rank 0's snapshot is the worker's.
-    for (ranks[0].m.dec_state.?.layers, ranks[1].m.dec_state.?.layers) |a, b| {
-        try expectSameArray(gpa, a.win.buf, b.win.buf);
-        if (a.comp) |r| try expectSameArray(gpa, r.buf, b.comp.?.buf);
-        if (a.idx_k) |r| try expectSameArray(gpa, r.buf, b.idx_k.?.buf);
-        if (a.pend_kv.ctx != null) try expectSameArray(gpa, a.pend_kv, b.pend_kv);
+    for (1..n) |r| {
+        try std.testing.expectEqualSlices(f32, got[0], got[r]);
+        // The ranks' caches come off the same summed stream through whole KV weights: rank 0's snapshot is every worker's.
+        for (ranks[0].m.dec_state.?.layers, ranks[r].m.dec_state.?.layers) |a, b| {
+            try expectSameArray(gpa, a.win.buf, b.win.buf);
+            if (a.comp) |c| try expectSameArray(gpa, c.buf, b.comp.?.buf);
+            if (a.idx_k) |c| try expectSameArray(gpa, c.buf, b.idx_k.?.buf);
+            if (a.pend_kv.ctx != null) try expectSameArray(gpa, a.pend_kv, b.pend_kv);
+        }
     }
     const out = got[0];
     got[0] = &.{};

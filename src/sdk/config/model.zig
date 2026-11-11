@@ -893,10 +893,24 @@ pub const ModelConfig = struct {
         self.dist_span = span;
     }
 
+    /// The dimension a `size`-way tensor split cannot cut evenly, null when every one divides: the expert widths in
+    /// 64-wide parts (every shipped group size divides one), and DeepSeek-V4.1's heads and output groups, which it cuts too.
+    pub fn shardUneven(self: *const ModelConfig, size: u32) ?[]const u8 {
+        const quantum = size * 64;
+        if (self.moe_intermediate_size % quantum != 0) return "moe_intermediate_size";
+        if (self.shared_expert_intermediate_size % quantum != 0) return "shared_expert_intermediate_size";
+        if (!self.isDsv41()) return null;
+        if (self.num_attention_heads % size != 0) return "num_attention_heads";
+        if (self.dsv4_o_groups % size != 0) return "dsv4_o_groups";
+        return null;
+    }
+
     /// The expert widths one tensor-parallel rank holds.
     pub fn applyShard(self: *ModelConfig, sh: distributed.Shard) !void {
-        const quantum = sh.size * 64; // every shipped group size divides a 64-aligned part
-        if (self.moe_intermediate_size % quantum != 0 or self.shared_expert_intermediate_size % quantum != 0) return error.DistShardOffGroup;
+        if (self.shardUneven(sh.size)) |dim| {
+            log.err("[dist] {d} ranks cannot split {s} evenly\n", .{ sh.size, dim });
+            return error.DistShardUneven;
+        }
         self.moe_intermediate_size /= sh.size;
         self.shared_expert_intermediate_size /= sh.size;
         self.dist_shard = sh;
@@ -4933,6 +4947,51 @@ fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !v
         const owned = try @import("../../engines/mlx/transformer.zig").materializedOwnedCopy(s, view);
         _ = mlx.mlx_array_free(kv.value_ptr.*);
         kv.value_ptr.* = owned;
+    }
+}
+
+test "dist N-rank: a tensor split refuses a size that does not divide the heads, the output groups or the widths" {
+    var c: ModelConfig = .{ .model_type = "deepseek_v41", .num_attention_heads = 64, .dsv4_o_groups = 8, .moe_intermediate_size = 2304, .shared_expert_intermediate_size = 2304 };
+    try std.testing.expect(c.shardUneven(2) == null);
+    try std.testing.expect(c.shardUneven(4) == null);
+    // 2304 is 36 blocks of 64, so three ranks fit the widths; the heads and groups do not.
+    try std.testing.expectEqualStrings("num_attention_heads", c.shardUneven(3).?);
+    try std.testing.expectEqualStrings("moe_intermediate_size", c.shardUneven(8).?);
+    c.num_attention_heads = 66;
+    try std.testing.expectEqualStrings("num_attention_heads", c.shardUneven(4).?);
+    c.num_attention_heads = 64;
+    c.dsv4_o_groups = 6;
+    try std.testing.expectEqualStrings("dsv4_o_groups", c.shardUneven(4).?);
+    try std.testing.expectError(error.DistShardUneven, c.applyShard(.{ .rank = 0, .size = 3 }));
+    try std.testing.expectEqual(@as(u32, 2304), c.moe_intermediate_size); // a refused split changes nothing
+    // Qwen's tensor split cuts only the experts: its heads need not divide.
+    var q: ModelConfig = .{ .model_type = "qwen4_exp", .num_attention_heads = 3, .moe_intermediate_size = 512, .shared_expert_intermediate_size = 512 };
+    try std.testing.expect(q.shardUneven(2) == null);
+    try q.applyShard(.{ .rank = 1, .size = 2 });
+    try std.testing.expectEqual(@as(u32, 256), q.moe_intermediate_size);
+}
+
+test "dist N-rank: shardExperts gives rank 2 and rank 3 of four their quarter of each expert and head" {
+    const vals = [_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
+    const names = [_][]const u8{ "layers.0.ffn.experts.w1.weight", "layers.0.ffn.experts.w2.weight", "layers.0.attn.wo_b.weight", "layers.0.attn.attn_sink", "layers.0.ffn.gate.weight" };
+    const shapes = [_][]const c_int{ &.{ 2, 8, 1 }, &.{ 2, 1, 8 }, &.{ 2, 8 }, &.{16}, &.{ 4, 4 } };
+    // [expert, rows, 1] keeps 2 rows of each expert; [expert, 1, cols] 2 columns; [2, 8] 2 columns of each row; the sink 4 heads.
+    const want = [2][5][]const f32{
+        .{ &.{ 4, 5, 12, 13 }, &.{ 4, 5, 12, 13 }, &.{ 4, 5, 12, 13 }, &.{ 8, 9, 10, 11 }, &vals },
+        .{ &.{ 6, 7, 14, 15 }, &.{ 6, 7, 14, 15 }, &.{ 6, 7, 14, 15 }, &.{ 12, 13, 14, 15 }, &vals },
+    };
+    for ([_]u32{ 2, 3 }, want) |rank, expect_rank| {
+        var w = Weights.init(std.testing.allocator);
+        defer w.deinit();
+        for (names, shapes) |n, sh| try w.put(n, mlx.mlx_array_new_data(&vals, sh.ptr, @intCast(sh.len), .float32));
+        try shardExperts(&w, .{ .rank = rank, .size = 4 }, false);
+        for (names, expect_rank) |n, expect| {
+            const a = w.get(n).?;
+            try mlx.check(mlx.mlx_array_eval(a));
+            try std.testing.expectEqual(expect.len, mlx.mlx_array_size(a));
+            const got = (mlx.mlx_array_data_float32(a) orelse return error.NoData)[0..expect.len];
+            try std.testing.expectEqualSlices(f32, expect, got);
+        }
     }
 }
 
