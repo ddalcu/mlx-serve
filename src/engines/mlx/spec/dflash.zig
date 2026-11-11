@@ -806,12 +806,9 @@ pub fn dflashCopyRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, 
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, DFLASH_COPY_MAX) orelse return null;
     if (found.suffix < mtp_lookup.MIN_SUFFIX or found.draft.len == 0) return null;
-    var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
-    const avail: usize = @min(found.draft.len, p.len, @as(usize, self.max_tokens -| self.completion_tokens -| 1));
+    const avail: usize = @min(found.draft.len, DFLASH_COPY_MAX, @as(usize, self.max_tokens -| self.completion_tokens -| 1));
     if (avail == 0) return null;
-    @memset(p[0..avail], pol.copy.probability(found.suffix));
-    const costs = dflash_policy.priorCosts(pol.plain.ms);
-    const rows = self.dflashRowsFor(p[0..avail], &costs);
+    const rows = if (pol.pin_rows > 0) @min(pol.pin_rows, @as(u32, @intCast(avail)) + 1) else pol.copy.rowsFor(found.suffix, avail, pol.plain.ms);
     if (rows < 2) return null;
     const m: u32 = rows - 1;
     var ids: [dflash_policy.MAX_DRAFTS]i32 = undefined;

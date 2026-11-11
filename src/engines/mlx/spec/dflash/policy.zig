@@ -164,6 +164,16 @@ pub const CopyStats = struct {
         self.hit[c] = self.hit[c] * KEEP + @as(f32, @floatFromInt(accepted));
         self.tries[c] = self.tries[c] * KEEP + @as(f32, @floatFromInt(@min(accepted + 1, drafts)));
     }
+
+    /// Verify rows (t1 included) for a copy of up to `avail` drafts: each priced at this match's survival
+    /// against the verify ladder scaled to `plain_ms`.
+    pub fn rowsFor(self: *const CopyStats, suffix: u32, avail: usize, plain_ms: f32) u32 {
+        var p: [MAX_DRAFTS]f32 = undefined;
+        const n = @min(avail, p.len);
+        @memset(p[0..n], self.probability(suffix));
+        const costs = priorCosts(plain_ms);
+        return chooseRows(p[0..n], &costs).rows;
+    }
 };
 
 /// Whether this round drafts at all. Drafting costs a forward whether or not its rows are kept, so
@@ -475,6 +485,19 @@ test "Drafting: one cold-kernel round moves the average wall at most twofold" {
     d.record(30, 2000);
     try testing.expect(d.wall < 20 + 0.3 * 20 + 0.01);
     try testing.expect(d.shouldDraft());
+}
+
+test "CopyStats.rowsFor: the rows chooseRows picks for a flat survival, t1 alone when the match has failed" {
+    const c = CopyStats{};
+    const costs = priorCosts(17.7);
+    const p: [8]f32 = @splat(c.probability(20));
+    try testing.expectEqual(chooseRows(&p, &costs).rows, c.rowsFor(20, 8, 17.7));
+    try testing.expect(c.rowsFor(20, 8, 17.7) > 1);
+    try testing.expectEqual(@as(u32, 1), c.rowsFor(20, 0, 17.7));
+    var failing = CopyStats{};
+    for (0..40) |_| failing.observe(20, 8, 0);
+    try testing.expectEqual(@as(u32, 1), failing.rowsFor(20, 8, 17.7));
+    try testing.expect(c.rowsFor(20, 100, 17.7) <= MAX_ROWS);
 }
 
 test "CopyStats: a strong match starts trusted, and misses teach it otherwise" {

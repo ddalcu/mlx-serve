@@ -186,11 +186,7 @@ pub fn dsparkCopyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *dsv4
 fn sizedCopyLen(self: *Generator, longest: usize, suffix: u32) usize {
     const pol = if (self.dspark_pol) |*p| p else return longest;
     if (!copySizing()) return longest;
-    var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
-    const m = @min(longest, p.len);
-    @memset(p[0..m], pol.copy.probability(suffix));
-    const costs = dflash_policy.priorCosts(pol.plain.ms);
-    return dflash_policy.chooseRows(p[0..m], &costs).rows - 1;
+    return pol.copy.rowsFor(suffix, longest, pol.plain.ms) - 1;
 }
 
 var copy_sizing: ?bool = null;
