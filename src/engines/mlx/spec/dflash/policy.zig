@@ -116,18 +116,21 @@ pub const Calibration = struct {
     }
 };
 
-/// What a plain round costs, learned from the plain rounds themselves and nothing else. The first samples replace
-/// the prior (another model on another machine) whatever they read, keeping the fastest, since a stall only reads
-/// slower. After that it moves slowly, by at most a quarter per sample, so a stall cannot pose as the machine's speed.
+/// What a plain round costs, learned from the plain rounds themselves and nothing else: slowly, and by at
+/// most a quarter per sample, so a stall or a foreign GPU job cannot pose as the machine's speed. With
+/// `seed_samples` the first samples replace the prior (another model on another machine) whatever they read,
+/// keeping the fastest, since a stall only reads slower.
 pub const PlainCost = struct {
-    const SEED_SAMPLES: u32 = 3;
+    /// DSpark's: learned from the first three plain rounds on this machine.
+    pub const seeded: PlainCost = .{ .seed_samples = 3 };
 
     ms: f32 = PRIOR_PLAIN_MS,
+    seed_samples: u32 = 0,
     measured: u32 = 0,
 
     pub fn sample(self: *PlainCost, ms: f32) void {
         if (!std.math.isFinite(ms) or ms <= 0) return;
-        if (self.measured < SEED_SAMPLES) return self.seed(ms);
+        if (self.measured < self.seed_samples) return self.seed(ms);
         const bounded = std.math.clamp(ms, self.ms * 0.8, self.ms * 1.25);
         self.ms += 0.1 * (bounded - self.ms);
     }
@@ -180,6 +183,9 @@ pub const CopyStats = struct {
 /// a stretch where it does not pay is skipped with a probe backoff: each probe that loses doubles
 /// the plain rounds before the next, a probe that wins clears the debt.
 pub const Drafting = struct {
+    /// DSpark's: a round's wall moves the average at most twofold.
+    pub const clamped: Drafting = .{ .clamp_wall = true };
+
     /// Longest stretch of plain rounds between two probes.
     const MAX_PERIOD: u32 = 32;
     const ALPHA: f32 = 0.3;
@@ -197,6 +203,8 @@ pub const Drafting = struct {
     /// Drafted rounds that followed a skip stretch.
     probes: u64 = 0,
     after_skip: bool = false,
+    /// Bound a round's wall to twice or half the average, so one cold-kernel round cannot stop drafting.
+    clamp_wall: bool = false,
 
     pub fn shouldDraft(self: *Drafting) bool {
         if (self.owed > 0) {
@@ -210,14 +218,13 @@ pub const Drafting = struct {
         return true;
     }
 
-    /// A drafted round: `gain` = the ms of plain rounds its tokens would have cost, `wall` = what it took, at most
-    /// doubling or halving the average so one cold-kernel round cannot stop drafting.
+    /// A drafted round: `gain` = the ms of plain rounds its tokens would have cost, `wall` = what it took.
     pub fn record(self: *Drafting, gain: f32, wall_in: f32) void {
         if (self.wall <= 0) {
             self.gain = gain;
             self.wall = wall_in;
         } else {
-            const wall = std.math.clamp(wall_in, self.wall * 0.5, self.wall * 2);
+            const wall = if (self.clamp_wall) std.math.clamp(wall_in, self.wall * 0.5, self.wall * 2) else wall_in;
             self.gain += ALPHA * (gain - self.gain);
             self.wall += ALPHA * (wall - self.wall);
         }
@@ -448,8 +455,7 @@ test "Calibration: an old regime fades" {
 
 test "PlainCost: a stall moves it little, a steady new speed is reached" {
     var c = PlainCost{};
-    for (0..3) |_| c.sample(PRIOR_PLAIN_MS);
-    c.sample(400);
+    c.sample(400); // a compile stall, a foreign GPU job
     try testing.expect(c.ms > PRIOR_PLAIN_MS and c.ms < 18.5);
     var faster = PlainCost{};
     for (0..80) |_| faster.sample(14.0);
@@ -459,8 +465,24 @@ test "PlainCost: a stall moves it little, a steady new speed is reached" {
     try testing.expect(slower.ms > 21.0 and slower.ms <= 22.0);
 }
 
-test "PlainCost: the first samples replace the prior, the fastest of them kept" {
+test "PlainCost: unseeded (DFlash) keeps the prior and walks from it, whatever the first samples read" {
     var c = PlainCost{};
+    for (0..3) |_| c.sample(13.0);
+    try testing.expect(c.ms > 16.5 and c.ms < PRIOR_PLAIN_MS);
+    var slow = PlainCost{};
+    for (0..3) |_| slow.sample(120.0);
+    try testing.expect(slow.ms < 20.0);
+    var ref = PlainCost{};
+    var walked: f32 = PRIOR_PLAIN_MS;
+    for ([_]f32{ 400, 13.0, 13.5, 14.0 }) |ms| {
+        ref.sample(ms);
+        walked += 0.1 * (std.math.clamp(ms, walked * 0.8, walked * 1.25) - walked);
+        try approx(ref.ms, walked);
+    }
+}
+
+test "PlainCost.seeded (DSpark): the first samples replace the prior, the fastest of them kept" {
+    var c = PlainCost.seeded;
     c.sample(13.0);
     try approx(c.ms, 13.0);
     c.sample(19.0); // a slow tick among the seeds
@@ -468,22 +490,30 @@ test "PlainCost: the first samples replace the prior, the fastest of them kept" 
     try approx(c.ms, 12.2);
     c.sample(30.0); // seeded: back to the slow, bounded walk
     try testing.expect(c.ms > 12.2 and c.ms < 12.6);
-    var stalled = PlainCost{};
+    var stalled = PlainCost.seeded;
     for ([_]f32{ 400, 13.0, 13.5 }) |ms| stalled.sample(ms);
     try approx(stalled.ms, 13.0);
 }
 
-test "PlainCost: a machine far slower than the prior is learned" {
-    var c = PlainCost{};
+test "PlainCost.seeded (DSpark): a machine far slower than the prior is learned" {
+    var c = PlainCost.seeded;
     for (0..80) |_| c.sample(120.0);
     try approx(c.ms, 120.0);
 }
 
-test "Drafting: one cold-kernel round moves the average wall at most twofold" {
+test "Drafting: unseeded by the clamp (DFlash), a slow round moves the wall as it always did" {
     var d = Drafting{};
     for (0..4) |_| d.record(30, 20);
     d.record(30, 2000);
-    try testing.expect(d.wall < 20 + 0.3 * 20 + 0.01);
+    try approx(d.wall, 20 + 0.3 * 1980);
+    try testing.expect(!d.shouldDraft());
+}
+
+test "Drafting.clamped (DSpark): one cold-kernel round moves the average wall at most twofold" {
+    var d = Drafting.clamped;
+    for (0..4) |_| d.record(30, 20);
+    d.record(30, 2000);
+    try approx(d.wall, 20 + 0.3 * 20);
     try testing.expect(d.shouldDraft());
 }
 

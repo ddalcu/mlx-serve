@@ -9,6 +9,7 @@ const tokenizer_mod = @import("../../../sdk/tokenizer/tokenizer.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
 const dflash_policy = @import("dflash/policy.zig");
+const DflashPol = @import("dflash.zig").DflashPol;
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const testing = std.testing;
@@ -219,6 +220,12 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     if (pol.plain_watch) |*w| samplePlainMs(self, msSince(w));
     pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
     return try mtpSerialOneToken(allocator, tok);
+}
+
+/// A DSpark request's round policy: the plain step and the wall of a drafted round are measured on this machine
+/// (`PlainCost.seeded`, `Drafting.clamped`), where DFlash keeps the prior and the unbounded wall.
+pub fn dsparkPolicy(plain: dflash_policy.PlainCost, pin_rows: u32) DflashPol {
+    return .{ .calib = .{ .head = true }, .drafting = dflash_policy.Drafting.clamped, .plain = plain, .pin_rows = pin_rows };
 }
 
 /// The first drafted rounds after a load run on cold kernels and would judge drafting a loss for the whole request.
@@ -898,4 +905,19 @@ test "dspark drafting backoff: prose rounds that lose to the plain step are skip
     try testing.expect(echo.shouldDraft());
     echo.record(5.5 * 17.6, 70);
     try testing.expect(echo.shouldDraft());
+}
+
+test "dsparkPolicy: DSpark measures the plain step and bounds the wall, a DFlash policy keeps the prior rule" {
+    var dspark = dsparkPolicy(dflash_policy.PlainCost.seeded, 0);
+    var dflash = DflashPol{};
+    dspark.plain.sample(40);
+    dflash.plain.sample(40);
+    try testing.expectEqual(@as(f32, 40), dspark.plain.ms);
+    try testing.expect(dflash.plain.ms < 25);
+    for ([_]*DflashPol{ &dspark, &dflash }) |pol| {
+        for (0..4) |_| pol.drafting.record(30, 20);
+        pol.drafting.record(30, 2000);
+    }
+    try testing.expect(dspark.drafting.shouldDraft());
+    try testing.expect(!dflash.drafting.shouldDraft());
 }
