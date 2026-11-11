@@ -280,6 +280,8 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
         p.mrope = .{ .sections = sections, .rope_dims = rd, .inv_freq = .of(cfg_out.inv_freq), .mscale = rope_scaling.mscale(c.rope) };
     }
     p.private = cfg_out;
+    p.hadamard_block = c.hadamard_block;
+    p.centred_language_norms = c.centred_language_norms;
     out.* = p;
     return .ok;
 }
