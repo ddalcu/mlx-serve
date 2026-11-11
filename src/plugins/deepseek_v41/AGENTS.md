@@ -49,8 +49,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
 - A tensor pair (`InitOpts.tp`, `--dist tensor`) halves the experts and attention heads at load (the sliced `cfg` says so);
   both ranks run every layer and `tpSum` each attention and MoE output. Every rank must build the same sums in the same
-  order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`). DSpark drafts on rank 0 alone: its stages
-  load whole and sum nothing, and the worker follows each verify's rollback.
+  order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`).
+- DSpark under `tp` (rank 0's plan decides whether the stages load): every rank drafts on its slice of the stages and rows
+  of both heads, after rank 0's `tp_draft`; each Markov step gathers every rank's best `[value, id]`. A worker's verify
+  follow commits the kept main rows to its windows (`finishVerify`), or its next draft reads stale rows.
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken

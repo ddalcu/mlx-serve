@@ -37,12 +37,29 @@ pub const LayerSpan = struct {
 pub const Shard = struct {
     rank: u32,
     size: u32,
+    /// DeepSeek-V4.1's DSpark stages (`mtp.`) split as the trunk's layers do, on every rank (`axisOf`).
+    stages: bool = false,
 
     /// Which axis of `key` a rank cuts (null: every rank holds it whole): an expert's gate/up (V4.1: w1/w3) rows and
     /// down (w2) columns; V4.1's attention by heads: `wq_b` and `wo_a` rows (whole output groups), `wo_b` columns, the
     /// per-head `attn_sink`.
     pub fn axis(key: []const u8) ?Axis {
         if (headOnly(key)) return null;
+        return cut(key);
+    }
+
+    /// `axis`, with the DSpark stages' tensors cut by the trunk's rules when `stages`.
+    pub fn axisOf(self: Shard, key: []const u8) ?Axis {
+        if (self.stages and stage(key)) return cut(key);
+        return axis(key);
+    }
+
+    /// A tensor of DeepSeek-V4.1's DSpark stages.
+    pub fn stage(key: []const u8) bool {
+        return std.mem.startsWith(u8, key, "mtp.");
+    }
+
+    fn cut(key: []const u8) ?Axis {
         if (std.mem.endsWith(u8, key, ".attn.attn_sink")) return .vec;
         const tail = for ([_][]const u8{ ".weight", ".scales", ".biases" }) |sfx| {
             if (std.mem.endsWith(u8, key, sfx)) break key[0 .. key.len - sfx.len];
@@ -102,4 +119,19 @@ fn trunkLayerAt(key: []const u8) ?struct { lo: usize, hi: usize } {
         if (hi > lo and hi < key.len and key[hi] == '.') return .{ .lo = lo, .hi = hi };
     }
     return null;
+}
+
+test "Shard: with the stages split, DeepSeek-V4.1's DSpark stages cut as its trunk layers, their heads and routers whole" {
+    const sh: Shard = .{ .rank = 1, .size = 4, .stages = true };
+    try std.testing.expect(sh.axisOf("mtp.0.ffn.experts.w1.weight").? == .rows);
+    try std.testing.expect(sh.axisOf("mtp.2.ffn.experts.7.w2.scales").? == .cols);
+    try std.testing.expect(sh.axisOf("mtp.1.ffn.shared_experts.w3.weight").? == .rows);
+    try std.testing.expect(sh.axisOf("mtp.0.attn.wq_b.weight").? == .rows);
+    try std.testing.expect(sh.axisOf("mtp.0.attn.wo_a.weight").? == .rows);
+    try std.testing.expect(sh.axisOf("mtp.0.attn.wo_b.weight").? == .cols);
+    try std.testing.expect(sh.axisOf("mtp.0.attn.attn_sink").? == .vec);
+    for ([_][]const u8{ "mtp.0.attn.wkv.weight", "mtp.0.attn.wq_a.weight", "mtp.0.ffn.gate.weight", "mtp.0.main_proj.weight", "mtp.2.markov_head.head.weight", "mtp.2.confidence_head.proj.weight", "vision.blocks.0.attn.wo_b.weight" }) |k| try std.testing.expect(sh.axisOf(k) == null);
+    const off: Shard = .{ .rank = 1, .size = 4 };
+    try std.testing.expect(off.axisOf("mtp.0.ffn.experts.w1.weight") == null);
+    try std.testing.expect(off.axisOf("layers.3.ffn.experts.w1.weight").? == .rows);
 }
