@@ -873,6 +873,8 @@ const ClusterState = struct {
     free_mib: [max_ranks]std.atomic.Value(u32) = @splat(.init(0)),
     /// Bit `k` set once worker `k`'s bell has come, while the group forms (the join names the rest).
     bells_seen: std.atomic.Value(u32) = .init(0),
+    /// The group is ending on purpose (`shutdown`, or a worker that read its stop): a bell that closes now is no loss.
+    stopping: std.atomic.Value(bool) = .init(false),
     /// The worker whose bell closed (0: none).
     lost_rank: std.atomic.Value(u32) = .init(0),
     /// The worker's compute time for its last step (µs), sent over the bell after each one.
@@ -1006,6 +1008,7 @@ fn noteJob(split: [2]u32, line: []const u8) void {
 pub fn shutdown() void {
     const p = peer() orelse return;
     if (!p.ready) return;
+    cluster().stopping.store(true, .release);
     // The stopped workers post no more receives: a later message (the model's unload) would wait forever.
     p.ready = false;
     // Every worker gets its stop, even past one it did not reach.
@@ -1589,7 +1592,10 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     while (true) {
         const msg = try recvMsg(link, 0);
         switch (msg[0]) {
-            OP_STOP => break,
+            OP_STOP => {
+                cluster().stopping.store(true, .release);
+                break;
+            },
             OP_RELEASE => return true,
             OP_DSV41 => {
                 const p0: usize = @as(usize, @intCast(msg[2])) | (@as(usize, @intCast(msg[3])) << 31);
@@ -1810,7 +1816,7 @@ fn watchBells(link: *const Link, last_us: *u32) u32 {
 /// Waits on the bells for a worker to leave: a read returns only at its end.
 fn watchWorker(link: *const Link) void {
     const lost = watchBells(link, &cluster().worker_us.raw);
-    if (lost == 0) return;
+    if (lost == 0 or cluster().stopping.load(.acquire)) return;
     cluster().lost_rank.store(lost, .release);
     worker_gone.store(true, .release);
     cluster().joined.store(false, .release);
@@ -1962,6 +1968,7 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     if (short.len > 0) try sendBytes(&link, short, 0);
     while (true) {
         const pmsg = try recvMsg(&link, 0);
+        if (pmsg[0] == OP_STOP) cluster().stopping.store(true, .release);
         if (pmsg[0] == OP_STOP or !try servePlan(io, allocator, &link, roots.items, pmsg)) break;
         log.info("[dist] worker: released its part, waiting for the host to load a model\n", .{});
     }
@@ -1985,6 +1992,10 @@ fn watchHost(b: Bell) void {
         if (n == 0) break;
         crt.sleepMs(20); // a ring the inference thread has yet to read
     }
+    // Rank 0 exits right behind its stop message, which this worker's loop may not have read yet.
+    var waited: u32 = 0;
+    while (waited < 2000 and !cluster().stopping.load(.acquire)) : (waited += 20) crt.sleepMs(20);
+    if (cluster().stopping.load(.acquire)) return;
     log.err("[dist] rank 0 left; this worker exits\n", .{});
     std.process.exit(1);
 }
@@ -2065,7 +2076,10 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     while (true) {
         const m = try recvMsg(link, 0);
         switch (m[0]) {
-            OP_STOP => break,
+            OP_STOP => {
+                cluster().stopping.store(true, .release);
+                break;
+            },
             OP_RELEASE => return true,
             OP_FORWARD => {
                 const offset: usize = @as(usize, @intCast(m[3])) | (@as(usize, @intCast(m[4])) << 31);
