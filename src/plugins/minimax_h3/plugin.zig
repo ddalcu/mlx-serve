@@ -354,14 +354,20 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     const turbo = b.flag("turbo");
     const pdd_steps: ?u32 = if (e.pdd) |p| p.steps() else null;
-    if (turbo and pdd_steps != null) return bad("'turbo' is the base model's few-step adapter — this pack is already a distilled student and runs its own trained steps");
+    const two_time = if (e.geometry.two_time) |*tt| tt else null;
+    if (turbo and (pdd_steps != null or two_time != null)) return bad("'turbo' is the base model's few-step adapter — this pack is already a distilled student and runs its own trained steps");
+    if (two_time != null and e.lora_n > 0) return bad("'lora_paths' targets the base model's blocks — a two-time pack has dropped and factored some of them");
     if (turbo and dir.fileBytes("turbo_lora.safetensors") == 0) return bad("this pack has no turbo_lora.safetensors — download minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora (Apache-2.0) into the model folder as turbo_lora.safetensors");
 
     const width = u32Field(&b, "width", 256);
     const height = u32Field(&b, "height", 256);
     const steps = if (pdd_steps) |n|
         stepsIn(&b, n, n, n) orelse return req.refuseFmt(.unsupported, "this pack runs a fixed step count — omit 'steps'", "this pack is a distilled student that runs exactly {d} steps — omit 'steps' or send {d}", .{ n, n })
-    else
+    else if (two_time) |tt| tts: {
+        const n = stepsIn(&b, tt.default_steps, 1, h3.TwoTime.MAX_STEPS) orelse 0;
+        if (tt.grid(n) == null) return req.refuseFmt(.unsupported, "this pack samples only the step counts it was trained for", "this pack samples only the step counts it was trained for ({any}) — omit 'steps' for {d}", .{ tt.steps[0..tt.n_grids], tt.default_steps });
+        break :tts n;
+    } else
         stepsIn(&b, if (turbo) 4 else 30, 1, 100) orelse return bad("'steps' must be in [1,100]");
     const seed = b.uint("seed") orelse 0;
     const requested_frames = u32Field(&b, "num_frames", 56);
@@ -401,7 +407,7 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
 
     // The request's own activations price the resident plan; when it does not fit, the staged DiT stage is checked
     // here, before any stage loads, since a Metal OOM mid-step is uncatchable.
-    const distilled = turbo or pdd_steps != null;
+    const distilled = turbo or pdd_steps != null or two_time != null;
     const fast: ?bool = if (b.get("fast")) |v| (if (v == .bool) v.bool else null) else null;
     const speed = h3.resolveSpeed(fast, distilled);
     const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, e.geometry.dit.num_layers) * e.geometry.dit.hidden_size * 2 else 0;
@@ -410,7 +416,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     const mem = memNow(req);
     const plan = residentFor(e, dir, activations, mem);
     if (plan == null) {
-        const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), true) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);
+        // A two-time DiT's AdaLN takes a 16-wide embedding: precompute frees next to nothing of it.
+        const dit = config.ditResidentBytes(config.ditFileBytes(dir, &e.machine), two_time == null) + (if (turbo) dir.fileBytes("turbo_lora.safetensors") else 0);
         const bill = config.canvasBill(dit, activations, mem.host_avail, mem.gpu_limit, mem.gpu_active, mlx.cudaAvailable());
         if (dit > 0 and bill.avail > 0 and bill.need > bill.avail) {
             const gb = 1024.0 * 1024.0 * 1024.0;

@@ -159,7 +159,7 @@ pub fn calibrate(model: *const h3.Model, io: std.Io, s: S) !u64 {
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
     try mlx.check(mlx.mlx_random_key(&key, 0));
-    const t_emb = try model.timeEmbedAs(&.{500.0}, s);
+    const t_emb = try model.timeEmbedAs(&.{.same(500.0)}, s);
     defer _ = mlx.mlx_array_free(t_emb);
     var rope: h3.RopeTables = .{ .cos = mlx.mlx_array_new(), .sin = mlx.mlx_array_new() };
     defer rope.deinit();

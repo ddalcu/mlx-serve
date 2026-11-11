@@ -64,6 +64,12 @@ pub fn geometry(a: std.mem.Allocator, config_json: []const u8) !h3.Geometry {
         .{ "theta", "theta" },
     }, try config_fields.section(root, "text_encoder"), &g.te);
     try config_fields.fill(@TypeOf(g.vae), .{ .{ "layers", "layers" }, .{ "heads", "heads" }, .{ "head_dim", "head_dim" } }, try config_fields.section(root, "video_vae"), &g.vae);
+    if (root.get("two_time")) |v| {
+        if (v != .object) return error.BadPackConfig;
+        g.two_time = try h3.TwoTime.parse(v.object);
+        try config_fields.fill(h3.Config, .{.{ "gate", "two_time_gate" }}, v.object, &g.dit);
+        if (!(g.dit.two_time_gate > 0)) return error.BadPackConfig;
+    }
     const d = g.dit;
     if (d.rotDim() > d.attention_head_dim or d.timestep_input_dim % 2 != 0 or d.text_dim != @as(u32, @intCast(g.te.hidden)) or
         @rem(g.te.heads, g.te.kv_heads) != 0 or g.vae.in_channels != d.latents_dim) return error.BadPackConfig;
@@ -321,4 +327,20 @@ test "declaresTask reads the pack's own task list" {
     // A substring match on the whole file would pass on the README-ish text a
     // config can legally carry; only the task LIST counts.
     try std.testing.expect(!declaresTask(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}", "ref2va"));
+}
+
+test "h3 two-time packs: the schedule and gate come from config.json, and a grid that cannot be sampled is refused" {
+    const a = std.testing.allocator;
+    const good = "{\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.0],\"4\":[1,0.7,0.3,0.1,0]}}}";
+    const g = try geometry(a, good);
+    try std.testing.expectEqual(@as(f32, 0.25), g.dit.two_time_gate);
+    try std.testing.expectEqualSlices(f64, &.{ 1.0, 0.4, 0.0 }, g.two_time.?.grid(2).?);
+    try std.testing.expect(g.two_time.?.grid(3) == null);
+    try std.testing.expect((try geometry(a, "{}")).two_time == null);
+    for ([_][]const u8{
+        "{\"two_time\":{\"gate\":0.25,\"default_steps\":6,\"sigma_grids\":{\"2\":[1.0,0.4,0.0]}}}",
+        "{\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.1]}}}",
+        "{\"two_time\":{\"gate\":0.25,\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.0,0.4]}}}",
+        "{\"two_time\":{\"default_steps\":2,\"sigma_grids\":{\"2\":[1.0,0.4,0.0]}}}",
+    }) |bad| try std.testing.expectError(error.BadPackConfig, geometry(a, bad));
 }
