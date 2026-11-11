@@ -894,9 +894,9 @@ pub const ModelConfig = struct {
     }
 
     /// The dimension a `size`-way tensor split cannot cut evenly, null when every one divides: the expert widths in
-    /// 64-wide parts (every shipped group size divides one), and DeepSeek-V4.1's heads and output groups, which it cuts too.
+    /// quantization groups (64 wide at least), and DeepSeek-V4.1's heads and output groups, which it cuts too.
     pub fn shardUneven(self: *const ModelConfig, size: u32) ?[]const u8 {
-        const quantum = size * 64;
+        const quantum = size * @max(64, self.quant_group_size);
         if (self.moe_intermediate_size % quantum != 0) return "moe_intermediate_size";
         if (self.shared_expert_intermediate_size % quantum != 0) return "shared_expert_intermediate_size";
         if (!self.isDsv41()) return null;
@@ -4950,6 +4950,10 @@ fn shardExperts(weights: *Weights, sh: distributed.Shard, banks_sliced: bool) !v
         if (banks_sliced and std.mem.indexOf(u8, kv.key_ptr.*, ".switch_mlp.") != null) continue;
         const shape = mlx.getShape(kv.value_ptr.*);
         const ax = axis.of(shape.len);
+        if (@rem(shape[ax], @as(c_int, @intCast(sh.size))) != 0) {
+            log.err("[dist] {d} ranks cannot split {s} ({d} wide) evenly\n", .{ sh.size, kv.key_ptr.*, shape[ax] });
+            return error.DistShardUneven;
+        }
         const part: c_int = @divExact(shape[ax], @as(c_int, @intCast(sh.size)));
         var start: [4]c_int = @splat(0);
         var stop: [4]c_int = undefined;
@@ -4987,6 +4991,12 @@ test "dist N-rank: a tensor split refuses a size that does not divide the heads,
     try std.testing.expectEqual(@as(u32, 256), q.moe_intermediate_size);
 }
 
+test "dist N-rank: a g128 pack splits its experts in whole groups, which 2304 is not at four ranks" {
+    const c: ModelConfig = .{ .model_type = "deepseek_v41", .num_attention_heads = 64, .dsv4_o_groups = 8, .moe_intermediate_size = 2304, .shared_expert_intermediate_size = 2304, .quant_group_size = 128 };
+    try std.testing.expect(c.shardUneven(2) == null);
+    try std.testing.expectEqualStrings("moe_intermediate_size", c.shardUneven(4).?);
+}
+
 test "dist N-rank: shardExperts gives rank 2 and rank 3 of four their quarter of each expert and head" {
     const vals = [_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 };
     const names = [_][]const u8{ "layers.0.ffn.experts.w1.weight", "layers.0.ffn.experts.w2.weight", "layers.0.attn.wo_b.weight", "layers.0.attn.attn_sink", "layers.0.ffn.gate.weight" };
@@ -5009,6 +5019,15 @@ test "dist N-rank: shardExperts gives rank 2 and rank 3 of four their quarter of
             try std.testing.expectEqualSlices(f32, expect, got);
         }
     }
+}
+
+test "dist N-rank: shardExperts refuses a tensor its ranks cannot cut evenly, where it once panicked" {
+    var w = Weights.init(std.testing.allocator);
+    defer w.deinit();
+    const vals = std.mem.zeroes([18]f32);
+    const shape = [_]c_int{ 1, 1, 18 };
+    try w.put("layers.0.ffn.experts.w2.scales", mlx.mlx_array_new_data(&vals, &shape, 3, .float32));
+    try std.testing.expectError(error.DistShardUneven, shardExperts(&w, .{ .rank = 1, .size = 4 }, false));
 }
 
 test "shardExperts cuts DeepSeek-V4.1's experts (gate/up rows, down columns) and attention heads, not the router" {
