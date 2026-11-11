@@ -501,7 +501,7 @@ test "PlainCost.seeded (DSpark): a machine far slower than the prior is learned"
     try approx(c.ms, 120.0);
 }
 
-test "Drafting: unseeded by the clamp (DFlash), a slow round moves the wall as it always did" {
+test "Drafting{} (DFlash): unclamped, a slow round moves the average wall by its full share" {
     var d = Drafting{};
     for (0..4) |_| d.record(30, 20);
     d.record(30, 2000);
@@ -527,7 +527,7 @@ test "CopyStats.rowsFor: the rows chooseRows picks for a flat survival, t1 alone
     var failing = CopyStats{};
     for (0..40) |_| failing.observe(20, 8, 0);
     try testing.expectEqual(@as(u32, 1), failing.rowsFor(20, 8, 17.7));
-    try testing.expect(c.rowsFor(20, 100, 17.7) <= MAX_ROWS);
+    try testing.expectEqual(c.rowsFor(20, MAX_DRAFTS, 17.7), c.rowsFor(20, 100, 17.7));
 }
 
 test "CopyStats: a strong match starts trusted, and misses teach it otherwise" {

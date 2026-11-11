@@ -222,8 +222,8 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     return try mtpSerialOneToken(allocator, tok);
 }
 
-/// A DSpark request's round policy: the plain step and the wall of a drafted round are measured on this machine
-/// (`PlainCost.seeded`, `Drafting.clamped`), where DFlash keeps the prior and the unbounded wall.
+/// A DSpark request's round policy: a drafted round's wall moves the average at most twofold (`Drafting.clamped`),
+/// and `plain` is the model's own `dspark_plain`, seeded from this machine's first steps (`PlainCost.seeded`).
 pub fn dsparkPolicy(plain: dflash_policy.PlainCost, pin_rows: u32) DflashPol {
     return .{ .calib = .{ .head = true }, .drafting = dflash_policy.Drafting.clamped, .plain = plain, .pin_rows = pin_rows };
 }
@@ -897,14 +897,24 @@ test "dsparkVerifyDrafts: a sure head verifies the block, an unsure one t1 alone
 
 test "dspark drafting backoff: prose rounds that lose to the plain step are skipped, copy-like rounds are not" {
     // A round that commits few tokens for its cost loses to the plain step (costs in ms).
-    var prose = dflash_policy.Drafting{};
+    var prose = dflash_policy.Drafting.clamped;
     try testing.expect(prose.shouldDraft());
     prose.record(3.2 * 17.6, 66);
     try testing.expect(!prose.shouldDraft());
-    var echo = dflash_policy.Drafting{};
+    var echo = dflash_policy.Drafting.clamped;
     try testing.expect(echo.shouldDraft());
     echo.record(5.5 * 17.6, 70);
     try testing.expect(echo.shouldDraft());
+}
+
+test "Transformer.dspark_plain starts seeded, so every DSpark request measures the plain step" {
+    const info = @typeInfo(Transformer).@"struct";
+    const i = comptime for (info.field_names, 0..) |name, k| {
+        if (std.mem.eql(u8, name, "dspark_plain")) break k;
+    } else unreachable;
+    const plain = comptime info.field_attrs[i].defaultValue(dflash_policy.PlainCost).?;
+    try testing.expectEqual(dflash_policy.PlainCost.seeded.seed_samples, plain.seed_samples);
+    try testing.expect(dflash_policy.PlainCost.seeded.seed_samples > 0);
 }
 
 test "dsparkPolicy: DSpark measures the plain step and bounds the wall, a DFlash policy keeps the prior rule" {
