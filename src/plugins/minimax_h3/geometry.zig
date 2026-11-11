@@ -133,21 +133,26 @@ pub const DecCfg = struct {
     patch_size_t: u32 = VAE_RATIO_T,
     rope_theta: f64 = 100.0,
     rope_dim_ratio: f64 = 0.75,
+    /// (t, h, w) for the video decoder; the image decoder's 2D ViT ropes (h, w) only.
+    rope_axes: u32 = 3,
     num_register_tokens: u32 = 4,
     eps: f32 = 1e-5,
+
+    /// MiniMax-H3-Image's 2D ViT decoder (`AutoencoderKLMiniMaxH3Image`).
+    pub const image: DecCfg = .{ .layers = 24, .heads = 16, .head_dim = 64, .patch_size_t = 1, .rope_dim_ratio = 0.5, .rope_axes = 2 };
 
     pub fn dim(self: DecCfg) u32 {
         return self.heads * self.head_dim;
     }
-    /// RotaryEmbeddingND(dim_head * rope_dim_ratio) with n_dim=3: the inv_freq
+    /// RotaryEmbeddingND(dim_head * rope_dim_ratio) over `rope_axes` axes: the inv_freq
     /// arange step is 2*n_dim/dim, so the count is ceil(dim / (2*n_dim)).
     pub fn ropeFreqs(self: DecCfg) u32 {
         const rd: u32 = @intFromFloat(@as(f64, @floatFromInt(self.head_dim)) * self.rope_dim_ratio);
-        return (rd + 5) / 6;
+        return (rd + 2 * self.rope_axes - 1) / (2 * self.rope_axes);
     }
-    /// Rotated width per head: 3 axes x freqs x 2 (split-half pairing).
+    /// Rotated width per head: axes x freqs x 2 (split-half pairing).
     pub fn rotDim(self: DecCfg) u32 {
-        return self.ropeFreqs() * 3 * 2;
+        return self.ropeFreqs() * self.rope_axes * 2;
     }
     pub fn outPatchDim(self: DecCfg) u32 {
         return self.out_channels * self.patch_size_t * self.patch_size * self.patch_size;
