@@ -25,14 +25,7 @@ pub fn claims(model_type: abi.Str, config_json: abi.Str, dir: *const abi.PackDir
     var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
     const d = q3.doc(arena.allocator(), config_json.slice()) catch return .no;
-    const q = q3.field(d.root, "quantization") orelse return .no;
-    if (q != .object) return .no;
-    const bits = q3.int(q3.field(q.object, "bits")) orelse return .no;
-    const gs = q3.int(q3.field(q.object, "group_size")) orelse 64;
-    if (bits != 2 or gs != 128) return .no;
-    if (q3.field(q.object, "mode")) |m| {
-        if (m != .string or !std.mem.eql(u8, m.string, "affine")) return .no;
-    }
+    if (!q35.ternaryAffine(d.root)) return .no;
     if (q35.rotationBlock(d.root, dir) == null) return .no;
     return .by_marker;
 }
@@ -135,18 +128,17 @@ test "prism config: a qwen3_5 pack claims by marker from hadamard.block_size or 
     try expectPrism(stripped, &files);
     try testing.expectEqual(abi.Claim.by_marker, claimFiles(&files, "qwen3_5", stripped));
 
-    var late = try testing.allocator.alloc(u8, 4200);
-    defer testing.allocator.free(late);
-    @memset(late, ' ');
-    const key = "\"prism.hadamard.block_size\":1024";
-    @memcpy(late[4100..][0..key.len], key);
+    var late: std.ArrayList(u8) = .empty;
+    defer late.deinit(testing.allocator);
+    try late.appendSlice(testing.allocator, "{\"pad\":\"");
+    try late.appendNTimes(testing.allocator, ' ', 4200);
+    try late.appendSlice(testing.allocator, "\",\"prism.hadamard.block_size\":1024}");
     const late_files = [_]sdk.fixture.File{
         .{ .name = "config.json", .bytes = stripped },
-        .{ .name = "hadamard.json", .bytes = late },
+        .{ .name = "hadamard.json", .bytes = late.items },
     };
-    var missed: abi.Parsed = .{};
-    try testing.expectEqual(abi.Verdict.Code.unsupported, parseFiles(&late_files, stripped, &missed).code);
-    try testing.expectEqual(abi.Claim.no, claimFiles(&late_files, "qwen3_5", stripped));
+    try expectPrism(stripped, &late_files);
+    try testing.expectEqual(abi.Claim.by_marker, claimFiles(&late_files, "qwen3_5", stripped));
 }
 
 test "prism config: a 2-bit qwen3_5 pack with no rotation block, and a 4-bit pack with one, are not claimed" {
@@ -175,4 +167,28 @@ test "prism config: a 2-bit qwen3_5 pack with no rotation block, and a 4-bit pac
         .{ .name = "jang_config.json", .bytes = expand },
     };
     try testing.expectEqual(abi.Verdict.Code.unsupported, parseFiles(&files, object, &p).code);
+
+    const quoted = "{\"requires_jang_affine1_expansion\":\"true\"}";
+    const quoted_files = [_]sdk.fixture.File{
+        .{ .name = "config.json", .bytes = object },
+        .{ .name = "jang_config.json", .bytes = quoted },
+    };
+    try expectPrism(object, &quoted_files);
+
+    const nested = "{\"note\":{\"requires_jang_affine1_expansion\":true},\"layout\":{\"language_norms\":\"zero-centered-runtime-plus-one\"}}";
+    const nested_files = [_]sdk.fixture.File{
+        .{ .name = "config.json", .bytes = object },
+        .{ .name = "jang_config.json", .bytes = nested },
+    };
+    var centred: abi.Parsed = .{};
+    try testing.expect(parseFiles(&nested_files, object, &centred).isOk());
+    defer freeParsed(&centred);
+    try testing.expect(q35.of(&centred).centred_language_norms);
+
+    const broken = "{";
+    const broken_files = [_]sdk.fixture.File{
+        .{ .name = "config.json", .bytes = object },
+        .{ .name = "jang_config.json", .bytes = broken },
+    };
+    try testing.expectEqual(abi.Verdict.Code.unsupported, parseFiles(&broken_files, object, &p).code);
 }

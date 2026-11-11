@@ -44,6 +44,8 @@ pub const Config = struct {
     next: bool = false,
     /// A Prism pack's Hadamard block: f16 activations, an f32 GDN state; 0 = not rotated.
     hadamard_block: u32 = 0,
+    /// JANG language RMS weights are stored as `w - 1`. The engine adds the one before the f16 narrow.
+    centred_language_norms: bool = false,
     vocab_size: u32,
     hidden_size: u32,
     intermediate_size: u32 = 0,
@@ -189,12 +191,13 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     c.quant = q3.quantizationOf(root, prism) catch return unsupported("quantization");
     if (prism) {
         // A stray block must not retarget a 4-bit `qwen3_5` pack. The official type is not re-checked.
-        if (std.mem.eql(u8, d.model_type, "qwen3_5") and !(c.quant.bits == 2 and c.quant.group_size == 128 and c.quant.mode == .affine))
-            return unsupported("quantization");
-        if (jangAffineExpansion(dir)) return unsupported("a JANG affine expansion");
+        if (std.mem.eql(u8, d.model_type, "qwen3_5") and !ternaryAffine(root)) return unsupported("quantization");
+        const jang = jangNotes(dir) catch return unsupported("jang_config.json");
+        if (jang.expand) return unsupported("a JANG affine expansion");
         // `unsupported` takes a comptime string, so the two misses stay separate returns.
         if (rotationBlock(root, dir)) |block| {
             c.hadamard_block = block;
+            c.centred_language_norms = jang.centred;
         } else if (field(root, "modules") != null) {
             return unsupported("modules without one shared rotation block");
         } else return unsupported("no Hadamard block");
@@ -281,6 +284,18 @@ pub fn parseAs(comptime variant: Variant, dir: *const abi.PackDir, config_json: 
     return .ok;
 }
 
+/// Affine 2-bit group 128. A missing `mode` is affine. The only `qwen3_5` width Prism claims.
+pub fn ternaryAffine(root: std.json.ObjectMap) bool {
+    const q = field(root, "quantization") orelse return false;
+    if (q != .object) return false;
+    if ((int(field(q.object, "bits")) orelse return false) != 2) return false;
+    if ((int(field(q.object, "group_size")) orelse 64) != 128) return false;
+    if (field(q.object, "mode")) |m| {
+        if (m != .string or !std.mem.eql(u8, m.string, "affine")) return false;
+    }
+    return true;
+}
+
 /// The rotation block: `hadamard.block_size`, else one shared `modules[].block`, else `hadamard.json`'s
 /// `prism.hadamard.block_size`. Null when the pack names none, or its modules disagree.
 pub fn rotationBlock(root: std.json.ObjectMap, dir: *const abi.PackDir) ?u32 {
@@ -314,46 +329,37 @@ fn nonzero(v: ?u32) ?u32 {
     return if (n == 0) null else n;
 }
 
-/// `hadamard.json` is the sign payload. The block is a header field; a full parse would copy the signs twice.
 fn sidecarBlock(dir: *const abi.PackDir) ?u32 {
-    const bytes = readWhole(dir, "hadamard.json", 8 << 20) orelse return null;
+    const bytes = readWhole(dir, "hadamard.json") orelse return null;
     defer gpa.free(bytes);
-    const key = "\"prism.hadamard.block_size\"";
-    const at = std.mem.indexOf(u8, bytes, key) orelse return null;
-    if (at > 4096) return null;
-    const i = valueAt(bytes, at + key.len) orelse return null;
-    var end = i;
-    while (end < bytes.len and std.ascii.isDigit(bytes[end])) end += 1;
-    if (end == i) return null;
-    const v = std.fmt.parseInt(u32, bytes[i..end], 10) catch return null;
-    return if (v == 0) null else v;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes, .{}) catch return null;
+    if (v != .object) return null;
+    return nonzero(int(field(v.object, "prism.hadamard.block_size")));
 }
 
-/// `jang_config.json` asks for an expansion this loader does not do. Absent or false is the CRACK affine repack.
-fn jangAffineExpansion(dir: *const abi.PackDir) bool {
-    const bytes = readWhole(dir, "jang_config.json", 8 << 20) orelse return false;
+const JangNotes = struct { expand: bool = false, centred: bool = false };
+
+/// Top-level `requires_jang_affine1_expansion` and `layout.language_norms`. A missing file is neither.
+fn jangNotes(dir: *const abi.PackDir) error{Broken}!JangNotes {
+    const bytes = readWhole(dir, "jang_config.json") orelse return .{};
     defer gpa.free(bytes);
-    const i = valueAtKey(bytes, "\"requires_jang_affine1_expansion\"") orelse return false;
-    return std.mem.startsWith(u8, bytes[i..], "true");
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const v = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), bytes, .{}) catch return error.Broken;
+    if (v != .object) return error.Broken;
+    const expand = if (field(v.object, "requires_jang_affine1_expansion")) |e| e == .bool and e.bool else false;
+    var centred = false;
+    if (field(v.object, "layout")) |lay| if (lay == .object) {
+        if (field(lay.object, "language_norms")) |n| centred = n == .string and std.mem.eql(u8, n.string, "zero-centered-runtime-plus-one");
+    };
+    return .{ .expand = expand, .centred = centred };
 }
 
-fn valueAtKey(bytes: []const u8, key: []const u8) ?usize {
-    const at = std.mem.indexOf(u8, bytes, key) orelse return null;
-    return valueAt(bytes, at + key.len);
-}
-
-fn valueAt(bytes: []const u8, start: usize) ?usize {
-    var i = start;
-    while (i < bytes.len and std.ascii.isWhitespace(bytes[i])) i += 1;
-    if (i >= bytes.len or bytes[i] != ':') return null;
-    i += 1;
-    while (i < bytes.len and std.ascii.isWhitespace(bytes[i])) i += 1;
-    return i;
-}
-
-fn readWhole(dir: *const abi.PackDir, name: []const u8, cap: u64) ?[]u8 {
+fn readWhole(dir: *const abi.PackDir, name: []const u8) ?[]u8 {
     const n = dir.fileBytes(name);
-    if (n == 0 or n > cap) return null;
+    if (n == 0) return null;
     const buf = gpa.alloc(u8, @intCast(n)) catch return null;
     var why: abi.Verdict = .{};
     const bytes = dir.readFile(name, buf, &why) orelse {
