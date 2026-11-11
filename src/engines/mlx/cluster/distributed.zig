@@ -1379,11 +1379,12 @@ fn dsv41TpBatch(gens: []const u64, p0s: []const usize, chunks: []const []const u
     }
 }
 
-/// Whether rank 0's DSpark stages load and split across the group (the plugin loads them as `dsparkWanted` says).
+/// Whether rank 0's DSpark stages load and split across the group: the pack declares them and the plugin loads them
+/// (`dsparkWanted`).
 fn dsv41DraftShard(config: *const model_mod.ModelConfig, size: u32) bool {
     const binding = config.plugin orelse return false;
     const cfg = @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed);
-    return size > 1 and dsv41_mod.dsparkWanted(cfg, null, config.mtp_override);
+    return size > 1 and cfg.dsparkStages() > 0 and dsv41_mod.dsparkWanted(cfg, null, config.mtp_override);
 }
 
 /// Host: a sharded DSpark draft over the states `gens`, each at `p0s[k]` drafting from `t1s[k]` (a batch body with one
@@ -2885,6 +2886,21 @@ test "dist N-rank: each of four Macs bills a quarter of a tensor split, plus the
     try std.testing.expectEqual(@as(u64, 400 + 80), shareFor(pair, &c, 800, 60, 40));
     var q: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .legacy = .{ .caps = .{ .long_ctx = true } }, .num_hidden_layers = 8 };
     try std.testing.expectEqual(@as(u64, 400 + 80), shareFor(pair, &q, 800, 60, 40));
+}
+
+test "dist N-rank: tensor DSpark stages split only when the pack ships them and they are wanted" {
+    const v41 = @import("../../../plugins/deepseek_v41/config.zig");
+    var table: @import("../../../abi/plugin.zig").ModelTable = undefined;
+    var cfg: v41.Config = .{ .num_hidden_layers = 4 };
+    var b: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .private = &cfg } };
+    var c: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .plugin = &b };
+    try std.testing.expect(!dsv41DraftShard(&c, 4));
+    cfg.dsv4_dspark_block_size = 5;
+    cfg.dsv4_n_compress_ratios = 7;
+    try std.testing.expect(dsv41DraftShard(&c, 4));
+    try std.testing.expect(!dsv41DraftShard(&c, 1));
+    c.mtp_override = false;
+    try std.testing.expect(!dsv41DraftShard(&c, 4));
 }
 
 test "dist N-rank: past a pair only DeepSeek-V4.1's tensor split forms a group, and only one its heads divide" {
