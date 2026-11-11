@@ -586,6 +586,8 @@ const Plan = struct {
     experts: i32,
     /// DeepSeek-V4.1 tensor: how the sums carry their parts (`TpSumMode`), rank 0's choice.
     sum: u8 = 0,
+    /// DeepSeek-V4.1 tensor: rank 0 serves its dense LM head 8-bit, so each worker's rows of it are too.
+    head8: bool = false,
 
     fn msg(p: Plan, name_len: usize) Msg {
         return .{ MAGIC, @backingInt(p.mode), @intCast(p.span.start), @intCast(p.span.end), @intCast(p.span.total), @intCast(name_len), p.hidden, p.experts };
@@ -607,7 +609,7 @@ const Plan = struct {
             const dst: u32 = @intCast(k);
             try sendMsg(link, p.msg(name.len), dst);
             try sendBytes(link, name, dst);
-            try sendMsg(link, .{ MAGIC, @bitCast(@as(u32, @truncate(id))), @bitCast(@as(u32, @truncate(id >> 32))), 0, p.sum, 0, 0, 0 }, dst);
+            try sendMsg(link, .{ MAGIC, @bitCast(@as(u32, @truncate(id))), @bitCast(@as(u32, @truncate(id >> 32))), 0, p.sum, @intFromBool(p.head8), 0, 0 }, dst);
         }
         return id;
     }
@@ -1215,11 +1217,12 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
         .tensor => {
             self.shard = .{ .rank = 0, .size = self.link.size };
             log.info("[dist] tensor: every expert and attention head of {s} split across {d} Macs\n", .{ std.fs.path.basename(self.model), self.link.size });
-            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .sum = @intFromEnum(dsv41_mod.tpSumWanted()) };
+            const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .sum = @intFromEnum(dsv41_mod.tpSumWanted()), .head8 = dsv41_mod.head8Wanted() };
             self.plan_id = try pl.send(&self.link, model_dir);
             self.planned = true;
             cluster().tp_link = &self.link;
             dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
+            dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
             dsv41_mod.clusterHooks().tp_step = &dsv41TpStep;
             dsv41_mod.clusterHooks().tp_batch = &dsv41TpBatch;
             dsv41_mod.clusterHooks().tp_free = &dsv41TpFree;
@@ -1249,6 +1252,13 @@ fn dsv41TpSum(x: mlx.mlx_array) anyerror!mlx.mlx_array {
     cluster().tp_sums += 1;
     cluster().tp_values += mlx.mlx_array_size(x);
     return link.allSum(x);
+}
+
+/// DeepSeek-V4.1 tensor, every rank: every rank's `x` stacked on axis 0 in rank order, lazily on this thread's CPU
+/// stream (each rank's slice of the logits, `deepseek_v41.headLogits`).
+fn dsv41TpGather(x: mlx.mlx_array) anyerror!mlx.mlx_array {
+    const link = cluster().tp_link orelse return error.DistWorkerNotJoined;
+    return link.allGather(x);
 }
 
 /// The sums the step before this one built, logged where a prompt step ends or the count is not a decode step's.
@@ -1441,7 +1451,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     };
     defer w.deinit();
     const binding = config.plugin orelse return error.NotPluginServed;
-    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .tp_sum = @enumFromInt(pl.sum), .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
+    const m = dsv41_mod.init(allocator, @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed), &w, mlx.gpuStream(), .{ .pair = config.dist_dsv41, .tp = config.dist_shard, .tp_sum = @enumFromInt(pl.sum), .head_8bit = pl.head8, .pack_dir = if (pl.mode == .tensor) dir else null }) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         sendMsg(link, .{ MAGIC, LOAD_FAILED, 0, 0, 0, 0, 0, 0 }, 0) catch {};
         return err;
@@ -1449,8 +1459,10 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     defer m.deinit();
     cluster().tp_link = link;
     dsv41_mod.clusterHooks().tp_sum = &dsv41TpSum;
+    dsv41_mod.clusterHooks().tp_gather = &dsv41TpGather;
     defer {
         dsv41_mod.clusterHooks().tp_sum = null;
+        dsv41_mod.clusterHooks().tp_gather = null;
         cluster().tp_link = null;
     }
     // Rank 0's other live states (its parked slots and idle state), by gen; the module holds the one it advances.
@@ -1857,6 +1869,7 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     const id = @as(u64, @as(u32, @bitCast(idm[1]))) | @as(u64, @as(u32, @bitCast(idm[2]))) << 32;
     if (idm[4] < 0 or idm[4] >= std.enums.values(dsv41_mod.TpSumMode).len) return error.DistBadMessage;
     pl.sum = @intCast(idm[4]);
+    pl.head8 = idm[5] != 0;
     switch (pl.mode) {
         .pipeline => log.info("[dist] worker: {s} layers {d}..{d} of {d} (pipeline)\n", .{ name, pl.span.start, pl.span.end, pl.span.total }),
         .tensor => log.info("[dist] worker rank {d}: {s}, 1/{d} of every expert (tensor)\n", .{ link.rank, name, link.size }),
