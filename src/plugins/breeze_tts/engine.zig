@@ -18,6 +18,7 @@ const model_mod = @import("../../sdk/weights/load.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/load.zig");
 const tts = @import("mimi.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
+const env = @import("../../env.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -549,34 +550,7 @@ const QLayer = struct {
 /// Full re-forward over a host [L, hidden] f32 embedding span. `pos_scale`
 /// scales RoPE positions (TE full layers), optional causal local-window mask
 /// (`window` 0 = plain causal). qk-norm applies when qn has data.
-var dbg_layer0 = false;
-
-fn dumpFirst(s: S, a: mlx.mlx_array, tag: [*:0]const u8) void {
-    var idx_arr: [12]u32 = undefined;
-    for (&idx_arr, 0..) |*v, i| v.* = @intCast(i);
-    var taken = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(taken);
-    if (mlx.mlx_take_axis(&taken, a, hostU32(&idx_arr, &[_]c_int{1}), 0, s) != 0) return;
-    var buf: [12]f32 = undefined;
-    evalHost(s, taken, &buf) catch return;
-    log.err("[breeze-dump] {s} {any}\n", .{ tag, buf });
-}
-
-fn dumpLast(s: S, a: mlx.mlx_array, tag: [*:0]const u8) void {
-    const shape = mlx.getShape(a);
-    var n: usize = 1;
-    for (shape) |d| n *= @intCast(d);
-    var buf: [4096]f32 = undefined;
-    const m = @min(n, buf.len);
-    const flat = reshape(a, &[_]c_int{@intCast(m)}, s);
-    defer _ = mlx.mlx_array_free(flat);
-    evalHost(s, flat, buf[0..m]) catch return;
-    log.err("[breeze-dump] {s} {any}\n", .{ tag, buf[0..@min(12, m)] });
-}
-
 fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, x_host: []const f32, L: usize, hidden: usize, pos_scale: f64, window: usize, freqs: mlx.mlx_array, kv_save: ?[]KV, out_last: []f32) !void {
-    const dbg_l = std.c.getenv("BREEZE_LAYER0") != null;
-    if (dbg_l) dbg_layer0 = true;
     const sh = [_]c_int{ 1, @intCast(L), @intCast(hidden) };
     var x = hostF32(x_host, &sh);
     var x16 = mlx.mlx_array_new();
@@ -585,7 +559,6 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
     x = x16;
 
     for (layers, 0..) |lw, lidx| {
-        if (dbg_l) log.err("[breeze-dump] LAYER {d} qn={any} in={d}\n", .{ lidx, lw.qn.ctx != null, hidden });
         const xn = rmsn(x, lw.in_ln, eps, s);
         defer _ = mlx.mlx_array_free(xn);
         const q = mm(xn, lw.q, s);
@@ -611,7 +584,6 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
             _ = mlx.mlx_array_free(q4n1);
             _ = mlx.mlx_array_free(q4);
             q4 = q4n;
-            if (dbg_layer0) dumpFirst(s, reshape(q4, &[_]c_int{ @intCast(lq * 128) }, s), "QNOTH");
             const k4f = reshape(k4, &[_]c_int{ @intCast(lk), hd }, s);
             const k4n1 = rmsn(k4f, lw.kn, eps, s);
             _ = mlx.mlx_array_free(k4f);
@@ -629,7 +601,6 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
         const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
         const qr = if (freqs.ctx != null) ropeApplyFreqs(qt, freqs, 128, s) else ropeApply(qt, theta, pos_scale, 128, s);
         defer _ = mlx.mlx_array_free(qr);
-        if (dbg_layer0) dumpFirst(s, reshape(qr, &[_]c_int{ @intCast(L * @as(usize, @intCast(qh)) * 128) }, s), "QR");
         const kr = if (freqs.ctx != null) ropeApplyFreqs(kt, freqs, 128, s) else ropeApply(kt, theta, pos_scale, 128, s);
         const has_mask = window > 0;
         const mask = if (has_mask) windowMask(s, L, window) else null_arr;
@@ -650,7 +621,6 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, thet
         defer _ = mlx.mlx_array_free(o);
         const h1 = addM(x, o, s);
         defer _ = mlx.mlx_array_free(h1);
-        if (dbg_layer0) dumpLast(s, h1, "H1");
         const hn = rmsn(h1, lw.post_ln, eps, s);
         defer _ = mlx.mlx_array_free(hn);
         const g = mm(hn, lw.gate, s);
@@ -694,34 +664,26 @@ fn ropeApplyOff(x: mlx.mlx_array, theta: f64, off: c_int, hd: c_int, s: S) mlx.m
 }
 
 fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: f64, xrow: []const f32, hidden: usize, pos: c_int, kv: []KV, out_last: []f32) !void {
-    if (std.c.getenv("BREEZE_STEP_TRACE") != null) log.err("[bstep] enter pos={d} kv0.k={any} kv0.v={any}\n", .{ pos, kv[0].k.ctx != null, kv[0].v.ctx != null });
     const sh = [_]c_int{ 1, 1, @intCast(hidden) };
     var x = hostF32(xrow, &sh);
     var x16 = mlx.mlx_array_new();
     _ = mlx.mlx_astype(&x16, x, .bfloat16, s);
     _ = mlx.mlx_array_free(x); // x16's graph owns the impl now
     x = x16;
-    if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(x); log.err("[beval] x shape={d},{d},{d}\n", .{ mlx.getShape(x)[0], mlx.getShape(x)[1], mlx.getShape(x)[2] }); }
 
     for (layers, 0..) |lw, lidx| {
         const xn = rmsn(x, lw.in_ln, eps, s);
         defer _ = mlx.mlx_array_free(xn);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(xn); log.err("[beval] l{d} xn\n", .{lidx}); }
         const q = mm(xn, lw.q, s);
         defer _ = mlx.mlx_array_free(q);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q); log.err("[beval] l{d} q shape={d}\n", .{lidx, mlx.getShape(q)[0]}); }
         const k = mm(xn, lw.k, s);
         defer _ = mlx.mlx_array_free(k);
         const v = mm(xn, lw.v, s);
         defer _ = mlx.mlx_array_free(v);
         const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], 128));
         const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], 128));
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k); log.err("[beval] l{d} k shape={d}\n", .{lidx, mlx.getShape(k)[0]}); }
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(v); log.err("[beval] l{d} v shape={d}\n", .{lidx, mlx.getShape(v)[0]}); }
         var q4 = reshape(q, &[_]c_int{ 1, 1, qh, 128 }, s);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q4); log.err("[beval] l{d} q4 shape={d},{d},{d}\n", .{lidx, mlx.getShape(q4)[0], mlx.getShape(q4)[2], mlx.getShape(q4)[3]}); }
         var k4 = reshape(k, &[_]c_int{ 1, 1, kh, 128 }, s);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k4); log.err("[beval] l{d} k4\n", .{lidx}); }
         const v4 = reshape(v, &[_]c_int{ 1, 1, kh, 128 }, s);
         defer _ = mlx.mlx_array_free(v4);
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
@@ -732,7 +694,6 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: 
             _ = mlx.mlx_array_free(q4n1);
             _ = mlx.mlx_array_free(q4);
             q4 = q4n;
-            if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(q4); log.err("[beval] l{d} qnorm\n", .{lidx}); }
             const k4f = reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), 128 }, s);
             const k4n1 = rmsn(k4f, lw.kn, eps, s);
             _ = mlx.mlx_array_free(k4f);
@@ -740,7 +701,6 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: 
             _ = mlx.mlx_array_free(k4n1);
             _ = mlx.mlx_array_free(k4);
             k4 = k4n;
-            if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(k4); log.err("[beval] l{d} knorm\n", .{lidx}); }
         }
         defer _ = mlx.mlx_array_free(q4);
         defer _ = mlx.mlx_array_free(k4);
@@ -762,21 +722,16 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: 
         if (pv.ctx != null) _ = mlx.mlx_array_free(pv);
         _ = eval1(kv[lidx].k);
         _ = eval1(kv[lidx].v);
-        if (std.c.getenv("BREEZE_STEP_TRACE") != null and lidx == 0) log.err("[bstep] L0 k/v ok att=\n", .{});
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(kr); _ = eval1(vt); log.err("[beval] l{d} kr vt\n", .{lidx}); }
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(qr); _ = eval1(kr); log.err("[beval] l{d} ropes kL={d}\n", .{lidx, mlx.getShape(kv[lidx].k)[2]}); }
         const att = sdpa(qr, kv[lidx].k, kv[lidx].v, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(128))))), null_arr, s);
         defer _ = mlx.mlx_array_free(att);
         const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
         const af = reshape(at, &[_]c_int{ 1, 1, @intCast(mlx.getShape(lw.q)[1]) }, s);
         defer _ = mlx.mlx_array_free(af);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(att); log.err("[beval] l{d} att shape={d}\n", .{lidx, mlx.getShape(att)[0]}); }
         const o = mm(af, lw.o, s);
         defer _ = mlx.mlx_array_free(o);
         const h1 = addM(x, o, s);
         defer _ = mlx.mlx_array_free(h1);
-        if (std.c.getenv("BREEZE_STEP_EVAL") != null) { _ = eval1(h1); log.err("[beval] l{d} h1\n", .{lidx}); }
         const hn = rmsn(h1, lw.post_ln, eps, s);
         defer _ = mlx.mlx_array_free(hn);
         const g = mm(hn, lw.gate, s);
@@ -798,7 +753,6 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, eps: f32, theta: 
         if (kc.ctx != kr.ctx) _ = mlx.mlx_array_free(kr);
         if (vc.ctx != vt.ctx) _ = mlx.mlx_array_free(vt);
     }
-    if (std.c.getenv("BREEZE_STEP_TRACE") != null) log.err("[bstep] done normed\n", .{});
     const x_norm_prev = x;
     x = rmsn(x, norm, eps, s);
     _ = mlx.mlx_array_free(x_norm_prev);
@@ -1239,7 +1193,6 @@ pub const Engine = struct {
             .bkv_len = 0,
             .d_freqs = blk: {
                 d_freqs_buf = depthInvFreqs();
-                if (std.c.getenv("BREEZE_FREQS") != null) log.err("[breeze-dump] FR {any}\n", .{d_freqs_buf[0..8]});
                 break :blk hostF32(&d_freqs_buf, &[_]c_int{D_HD / 2});
             },
             .bkv = blk: {
@@ -1439,7 +1392,6 @@ pub const Engine = struct {
         defer allocator.free(logits);
         var depth_span = allocator.alloc(f32, (NUM_CODEBOOKS + 1) * D_HIDDEN) catch return error.OutOfMemory;
         defer allocator.free(depth_span);
-        const span_mode = std.c.getenv("BREEZE_SPAN") != null;
 
         var seg_i: usize = 0;
         while (seg_i < seg_texts.items.len) : (seg_i += 1) {
@@ -1469,7 +1421,6 @@ pub const Engine = struct {
             }
 
             const text_len = ids.items.len;
-            if (std.c.getenv("BREEZE_IDS") != null) log.err("[breeze-dump] IDS {any}\n", .{ids.items});
             var frames_cap = estimateFrames(speakUnits(seg_text), req.max_frames);
             // The packer keeps segments window-safe; this clamp is the safety
             // net so even a model that never emits EOS stays in the span.
@@ -1525,23 +1476,6 @@ pub const Engine = struct {
                 }
             }
 
-            if (std.c.getenv("BREEZE_DUMP") != null) {
-                log.err("[breeze-dump] ids={any}\n", .{ids.items});
-                var row: usize = 0;
-                while (row < text_len) : (row += 1) {
-                    var buf: [32768]u8 = undefined;
-                    var pos: usize = 0;
-                    const r = stream[row * B_HIDDEN ..][0..B_HIDDEN];
-                    for (r, 0..) |v, i| {
-                        if (i > 0) buf[pos] = ',';
-                        pos += 1;
-                        const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
-                        pos += sres.len;
-                    }
-                    log.err("[breeze-dump] row={d} {s}\n", .{ row, buf[0..pos] });
-                }
-            }
-
             for (&self.bkv) |*e| {
                 if (e.k.ctx != null) _ = mlx.mlx_array_free(e.k);
                 if (e.v.ctx != null) _ = mlx.mlx_array_free(e.v);
@@ -1560,68 +1494,36 @@ pub const Engine = struct {
                         }
                     }
                 }
-                if (span_mode or frame_i == 0) {
+                if (frame_i == 0) {
                     const L = text_len + frame_i;
                     @memcpy(span[0 .. L * B_HIDDEN], stream[0 .. L * B_HIDDEN]);
-                    try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, null_arr, if (frame_i == 0 and !span_mode) self.bkv[0 .. B_LAYERS] else null, h_row);
-                    if (!span_mode) self.bkv_len = text_len;
+                    try qwenForward(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, span[0 .. L * B_HIDDEN], L, B_HIDDEN, 1.0, 0, null_arr, self.bkv[0 .. B_LAYERS], h_row);
+                    self.bkv_len = text_len;
                 } else {
                     try qwenStep(g_stream, self.b_layers, self.b_norm, 1e-6, B_THETA, stream[(text_len + frame_i - 1) * B_HIDDEN ..][0..B_HIDDEN], B_HIDDEN, @intCast(self.bkv_len), self.bkv[0 .. B_LAYERS], h_row);
                     self.bkv_len += 1;
                 }
                 headLogits(self.lm_host, h_row, logits, CB_LM, B_HIDDEN, 0);
                 var frame: [NUM_CODEBOOKS]u32 = undefined;
-                const dbg_depth = std.c.getenv("BREEZE_DEPTH") != null;
-                const greedy = std.c.getenv("BREEZE_GREEDY") != null;
-                const first_tok = sampleToken(&rng, logits, if (greedy) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB, .history = if (std.c.getenv("BREEZE_NOREP") != null) &[_]u32{} else hist.items, .rep = 1.1 });
-                frame[0] = if (dbg_depth and frame_i == 0) @as(u32, 1221) else @intCast(first_tok);
-                if (greedy) log.err("[breeze-dump] F{d} {d}\n", .{ frame_i, frame[0] });
-                if (std.c.getenv("BREEZE_DUMP") != null and frame_i == 0) {
-                    var buf: [65536]u8 = undefined;
-                    var pos: usize = 0;
-                    for (logits[0..CB_LM], 0..) |v, i| {
-                        if (i > 0) buf[pos] = ',';
-                        pos += 1;
-                        const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
-                        pos += sres.len;
-                    }
-                    log.err("[breeze-dump] lm0 {s}\n", .{buf[0..pos]});
-                }
+                frame[0] = @intCast(sampleToken(&rng, logits, .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB, .history = hist.items, .rep = 1.1 }));
                 if (frame[0] == CB_EOS) break;
 
                 // depth span: [backbone_hidden_proj, emb(cb0), emb(cb1), ...]
                 try projHostCached(allocator, g_stream, self.d_inp, h_row, B_HIDDEN, D_HIDDEN, h_proj[0..D_HIDDEN]);
                 @memcpy(depth_span[0..D_HIDDEN], h_proj);
-                if (dbg_depth) log.err("[breeze-dump] HPROJ {any}\nHR {any}\n", .{ h_proj[0..12], h_row[0..12] });
                 var dl: usize = 1;
                 var cb: usize = 1;
                 while (cb < NUM_CODEBOOKS) : (cb += 1) {
                     const code = frame[cb - 1];
                     tableRow(self.audio_table, B_HIDDEN, cb - 1, @min(code, @as(u32, CB_VOCAB - 1)), emb_row);
-                    if (dbg_depth and cb == 1) log.err("[breeze-dump] FEROW {any}\n", .{emb_row[0..12]});
-                    if (std.c.getenv("BREEZE_ROW2") != null and cb == 3) log.err("[breeze-dump] ROW3 {any}\n", .{emb_row[0..12]});
                     try projHostCached(allocator, g_stream, self.d_inp, emb_row, B_HIDDEN, D_HIDDEN, depth_span[dl * D_HIDDEN ..][0..D_HIDDEN]);
                     dl += 1;
                     const d_last = allocator.alloc(f32, D_HIDDEN) catch return error.OutOfMemory;
                     defer allocator.free(d_last);
-                    try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, (if (std.c.getenv("BREEZE_DROPE") != null and std.c.getenv("BREEZE_DROPE").?[0] == 104) self.d_freqs else null_arr), null, d_last);
+                    try qwenForward(g_stream, self.d_layers, self.d_norm, 1e-5, D_THETA, depth_span[0 .. dl * D_HIDDEN], dl, D_HIDDEN, 1.0, 0, null_arr, null, d_last);
                     headLogits(self.heads_host, d_last, logits, CB_VOCAB, D_HIDDEN, cb - 1);
-                    if (dbg_depth) {
-                        var buf: [16384]u8 = undefined;
-                        var pos: usize = 0;
-                        for (logits[0..12], 0..) |v, i| {
-                            if (i > 0) buf[pos] = ',';
-                            pos += 1;
-                            const sres = std.fmt.bufPrint(buf[pos..], "{d}", .{v}) catch break;
-                            pos += sres.len;
-                        }
-                        log.err("[breeze-dump] H{d} {s}\n", .{ cb, buf[0..pos] });
-                    }
-                    frame[cb] = @intCast(sampleToken(&rng, logits[0..CB_VOCAB], if (dbg_depth or greedy) .{ .t = 0 } else .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB }));
-                    if (dbg_depth) log.err("[breeze-dump] CODE {d} {d}\n", .{ cb, frame[cb] });
+                    frame[cb] = @intCast(sampleToken(&rng, logits[0..CB_VOCAB], .{}, self.scratch, self.order, .{ .suppress_from = CODEBOOK_SIZE, .suppress_to = CB_VOCAB }));
                 }
-
-                if (dbg_depth and frame_i == 0) break;
                 if (frame_i % 4 == 3) { _ = mlx.mlx_clear_cache(); }
                 try hist.append(allocator, frame[0]);
                 // frame embed row into the stream
@@ -1835,8 +1737,8 @@ test "frameEmbed sums table rows" {
     try std.testing.expectEqual(@as(f32, 6), out[1]);
 }
 
-test "live synthesize (MLX_SERVE_BREEZE_MODEL)" {
-    const dir = std.mem.span(std.c.getenv("MLX_SERVE_BREEZE_MODEL") orelse return error.SkipZigTest);
+test "live synthesize (BREEZE_MODEL)" {
+    const dir = env.span(.BREEZE_MODEL) orelse return error.SkipZigTest;
     const alloc = std.testing.allocator;
     // Standalone gated test: no host, so this test owns its stream.
     var engine = try Engine.load(std.Io.Threaded.global_single_threaded.io(), alloc, mlx.mlx_default_gpu_stream_new(), dir);
