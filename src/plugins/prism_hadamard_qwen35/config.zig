@@ -26,7 +26,8 @@ pub fn claims(model_type: abi.Str, config_json: abi.Str, dir: *const abi.PackDir
     defer arena.deinit();
     const d = q3.doc(arena.allocator(), config_json.slice()) catch return .no;
     if (!q35.ternaryAffine(d.root)) return .no;
-    if (q35.rotationBlock(d.root, dir) == null) return .no;
+    const block = q35.rotationBlock(d.root, dir) catch return .by_marker;
+    if (block == null) return .no;
     return .by_marker;
 }
 
@@ -194,4 +195,90 @@ test "prism config: a 2-bit qwen3_5 pack with no rotation block, and a 4-bit pac
         .{ .name = "jang_config.json", .bytes = broken },
     };
     try testing.expectEqual(abi.Verdict.Code.unsupported, parseFiles(&broken_files, object, &p).code);
+}
+
+/// `file_bytes` reports one named file past the 8 MiB note cap. A read of that name is counted and refused.
+const CapLie = struct {
+    mem: sdk.fixture.MemDir,
+    huge: []const u8,
+    reads: usize = 0,
+
+    fn packDir(self: *CapLie) abi.PackDir {
+        return .{
+            .ctx = self,
+            .exists = exists,
+            .read = read,
+            .safetensors_header = header,
+            .list = list,
+            .file_bytes = fileBytes,
+        };
+    }
+
+    fn fileBytes(ctx: ?*anyopaque, rel: abi.Str) callconv(.c) u64 {
+        const self: *CapLie = @ptrCast(@alignCast(ctx.?));
+        if (std.mem.eql(u8, rel.slice(), self.huge)) return (8 << 20) + 1;
+        const dir = self.mem.packDir();
+        return dir.file_bytes(dir.ctx, rel);
+    }
+
+    fn read(ctx: ?*anyopaque, rel: abi.Str, buf: [*]u8, cap: usize, len: *usize) callconv(.c) abi.Verdict {
+        const self: *CapLie = @ptrCast(@alignCast(ctx.?));
+        if (std.mem.eql(u8, rel.slice(), self.huge)) {
+            self.reads += 1;
+            return abi.Verdict.refuse(.failed, "over-cap file was read");
+        }
+        const dir = self.mem.packDir();
+        return dir.read(dir.ctx, rel, buf, cap, len);
+    }
+
+    fn exists(ctx: ?*anyopaque, rel: abi.Str) callconv(.c) bool {
+        const self: *const CapLie = @ptrCast(@alignCast(ctx.?));
+        const dir = self.mem.packDir();
+        return dir.exists(dir.ctx, rel);
+    }
+
+    fn header(ctx: ?*anyopaque, rel: abi.Str, buf: [*]u8, cap: usize, len: *usize) callconv(.c) abi.Verdict {
+        const self: *const CapLie = @ptrCast(@alignCast(ctx.?));
+        const dir = self.mem.packDir();
+        return dir.safetensors_header(dir.ctx, rel, buf, cap, len);
+    }
+
+    fn list(ctx: ?*anyopaque, rel: abi.Str, buf: [*]u8, cap: usize, len: *usize) callconv(.c) abi.Verdict {
+        const self: *const CapLie = @ptrCast(@alignCast(ctx.?));
+        const dir = self.mem.packDir();
+        return dir.list(dir.ctx, rel, buf, cap, len);
+    }
+};
+
+test "prism config: a sidecar past the read cap is refused, and is not read" {
+    const renamed = try std.mem.replaceOwned(u8, testing.allocator, bonsai, "\"prism_hadamard_qwen35\"", "\"qwen3_5\"");
+    defer testing.allocator.free(renamed);
+    const stripped = try std.mem.replaceOwned(u8, testing.allocator, renamed, "\"modules\":[{\"path\":\"lm_head\",\"block\":1024},{\"path\":\"model.layers.0.mlp.up_proj\",\"block\":1024}],", "");
+    defer testing.allocator.free(stripped);
+
+    var side = CapLie{ .mem = .{ .files = &.{
+        .{ .name = "config.json", .bytes = stripped },
+        .{ .name = "hadamard.json", .bytes = "{\"prism.hadamard.block_size\":1024}" },
+    } }, .huge = "hadamard.json" };
+    const side_dir = side.packDir();
+    try testing.expectEqual(abi.Claim.by_marker, claims(.of("qwen3_5"), .of(stripped), &side_dir));
+    var p: abi.Parsed = .{};
+    const v = parse(&side_dir, abi.Str.of(stripped), .{}, null, true, &p);
+    try testing.expectEqual(abi.Verdict.Code.unsupported, v.code);
+    try testing.expectEqualStrings("qwen3_5: hadamard.json", v.why.slice());
+    try testing.expectEqual(@as(usize, 0), side.reads);
+
+    const marked = try std.mem.replaceOwned(u8, testing.allocator, stripped, "\"quantization\"", "\"hadamard\":{\"block_size\":1024},\"quantization\"");
+    defer testing.allocator.free(marked);
+    var jang = CapLie{ .mem = .{ .files = &.{
+        .{ .name = "config.json", .bytes = marked },
+        .{ .name = "jang_config.json", .bytes = "{\"layout\":{\"language_norms\":\"zero-centered-runtime-plus-one\"}}" },
+    } }, .huge = "jang_config.json" };
+    const jang_dir = jang.packDir();
+    var centred: abi.Parsed = .{};
+    const jv = parse(&jang_dir, abi.Str.of(marked), .{}, null, true, &centred);
+    try testing.expectEqual(abi.Verdict.Code.unsupported, jv.code);
+    try testing.expectEqualStrings("qwen3_5: jang_config.json", jv.why.slice());
+    try testing.expect(!centred.centred_language_norms);
+    try testing.expectEqual(@as(usize, 0), jang.reads);
 }
