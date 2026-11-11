@@ -199,9 +199,23 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     const tok = (try self.next(allocator)) orelse return null;
     self.dspark_plain += 1;
     const pol = &self.dspark_pol.?;
-    if (pol.plain_watch) |*w| pol.plain.sample(@as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms));
+    if (pol.plain_watch) |*w| samplePlainMs(self, msSince(w));
     pol.plain_watch = io_util.Stopwatch.init(self.timer.io);
     return try mtpSerialOneToken(allocator, tok);
+}
+
+/// The first drafted rounds after a load run on cold kernels and would judge drafting a loss for the whole request.
+const DSPARK_WARMUP_ROUNDS: u32 = 16;
+
+/// A plain step's cost, learned per model: the next request starts from it instead of the prior.
+fn samplePlainMs(self: *Generator, ms: f32) void {
+    const pol = &self.dspark_pol.?;
+    pol.plain.sample(ms);
+    self.xfm.dspark_plain = pol.plain;
+}
+
+fn msSince(w: *const io_util.Stopwatch) f32 {
+    return @as(f32, @floatFromInt(w.read())) / @as(f32, std.time.ns_per_ms);
 }
 
 /// One DeepSeek-V4.1 stage round under `dspark_pol`: draft, verify the prefix the calibrated confidence pays
@@ -215,17 +229,22 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
     defer d.deinit(allocator);
     d.len = if (pol.pin_rows > 0) @min(d.len, pol.pin_rows - 1) else dsparkVerifyDrafts(d.confidence[0..d.len], &pol.calib, pol.plain.ms);
     const cap = capAcceptedForTokenBudget(std.math.maxInt(u32), self.completion_tokens, self.max_tokens);
+    const verify_watch = io_util.Stopwatch.init(self.timer.io);
     const round = if (self.dspark_stochastic)
         try self.dsparkStochasticRound(allocator, dsv41_mod, mdl, t1, cap, &d)
     else
         try dsv41_mod.dsparkRoundWith(mdl, allocator, st, t1, &d, cap);
+    const verify_ms = msSince(&verify_watch);
+    self.dspark_stats.recordVerifyMs(@intCast(d.len + 1), verify_ms);
+    if (d.len == 0) samplePlainMs(self, verify_ms);
     for (d.confidence[0..d.len], 0..) |c, k| {
         if (k > round.accepted) break;
         pol.calib.observe(sigmoid(c), k < round.accepted);
     }
     self.dspark_stats.record(@intCast(d.len), round.accepted);
-    const wall_ms = @as(f32, @floatFromInt(watch.read())) / @as(f32, std.time.ns_per_ms);
-    pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, wall_ms);
+    if (self.xfm.dspark_warm_rounds < DSPARK_WARMUP_ROUNDS) {
+        self.xfm.dspark_warm_rounds += 1;
+    } else pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, msSince(&watch));
     return self.commitDsparkRound(allocator, round, st.n);
 }
 

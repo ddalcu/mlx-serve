@@ -971,7 +971,7 @@ pub fn initWithOptions(
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
             // A streamed EXL3 bank verifies the whole block on a greedy request: its verify costs about a plain tick.
-            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
+            .dspark_pol = if (dspark_active) if (intree.dsv41(xfm)) |dm| .{ .calib = .{ .head = true }, .plain = xfm.dspark_plain, .pin_rows = if (!dspark_stochastic and dm.cfg.dsv41_exl3_bank) std.math.maxInt(u32) else 0 } else null else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,

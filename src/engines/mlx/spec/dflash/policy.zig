@@ -116,15 +116,25 @@ pub const Calibration = struct {
     }
 };
 
-/// What a plain round costs, learned from the plain rounds themselves and nothing else: slowly, and by at
-/// most a quarter per sample, so a stall or a foreign GPU job cannot pose as the machine's speed.
+/// What a plain round costs, learned from the plain rounds themselves and nothing else. The first samples replace
+/// the prior (another model on another machine) whatever they read, keeping the fastest, since a stall only reads
+/// slower. After that it moves slowly, by at most a quarter per sample, so a stall cannot pose as the machine's speed.
 pub const PlainCost = struct {
+    const SEED_SAMPLES: u32 = 3;
+
     ms: f32 = PRIOR_PLAIN_MS,
+    measured: u32 = 0,
 
     pub fn sample(self: *PlainCost, ms: f32) void {
         if (!std.math.isFinite(ms) or ms <= 0) return;
+        if (self.measured < SEED_SAMPLES) return self.seed(ms);
         const bounded = std.math.clamp(ms, self.ms * 0.8, self.ms * 1.25);
         self.ms += 0.1 * (bounded - self.ms);
+    }
+
+    fn seed(self: *PlainCost, ms: f32) void {
+        self.ms = if (self.measured == 0) ms else @min(self.ms, ms);
+        self.measured += 1;
     }
 };
 
@@ -190,12 +200,14 @@ pub const Drafting = struct {
         return true;
     }
 
-    /// A drafted round: `gain` = the ms of plain rounds its tokens would have cost, `wall` = what it took.
-    pub fn record(self: *Drafting, gain: f32, wall: f32) void {
+    /// A drafted round: `gain` = the ms of plain rounds its tokens would have cost, `wall` = what it took, at most
+    /// doubling or halving the average so one cold-kernel round cannot stop drafting.
+    pub fn record(self: *Drafting, gain: f32, wall_in: f32) void {
         if (self.wall <= 0) {
             self.gain = gain;
-            self.wall = wall;
+            self.wall = wall_in;
         } else {
+            const wall = std.math.clamp(wall_in, self.wall * 0.5, self.wall * 2);
             self.gain += ALPHA * (gain - self.gain);
             self.wall += ALPHA * (wall - self.wall);
         }
@@ -301,6 +313,9 @@ pub const PositionStats = struct {
     accepted: [MAX_DRAFTS]u64 = @splat(0),
     /// Rounds by verify rows; index = rows.
     rows: [MAX_ROWS + 1]u64 = @splat(0),
+    /// Verify ms summed by rows, and the rounds timed.
+    verify_ms: [MAX_ROWS + 1]f32 = @splat(0),
+    timed: [MAX_ROWS + 1]u32 = @splat(0),
 
     /// A round that verified `drafts` drafts and kept `accepted` of them: it reached every position
     /// up to the first rejection and no further.
@@ -321,6 +336,25 @@ pub const PositionStats = struct {
             if (reached == 0) break;
             if (k > 0) w.writeAll("/") catch break;
             w.print("{d:.2}", .{@as(f32, @floatFromInt(kept)) / @as(f32, @floatFromInt(reached))}) catch break;
+        }
+        return w.buffered();
+    }
+
+    pub fn recordVerifyMs(self: *PositionStats, rows: u32, ms: f32) void {
+        if (rows == 0 or rows > MAX_ROWS or !std.math.isFinite(ms)) return;
+        self.verify_ms[rows] += ms;
+        self.timed[rows] += 1;
+    }
+
+    /// `1:12.1,4:14.3`: mean verify ms by rows.
+    pub fn formatVerifyMs(self: *const PositionStats, buf: []u8) []const u8 {
+        var w = std.Io.Writer.fixed(buf);
+        var first = true;
+        for (self.verify_ms, self.timed, 0..) |ms, n, rows| {
+            if (n == 0) continue;
+            if (!first) w.writeAll(",") catch break;
+            first = false;
+            w.print("{d}:{d:.1}", .{ rows, ms / @as(f32, @floatFromInt(n)) }) catch break;
         }
         return w.buffered();
     }
@@ -426,7 +460,8 @@ test "Calibration: an old regime fades" {
 
 test "PlainCost: a stall moves it little, a steady new speed is reached" {
     var c = PlainCost{};
-    c.sample(400); // a compile stall, a foreign GPU job
+    for (0..3) |_| c.sample(PRIOR_PLAIN_MS);
+    c.sample(400);
     try testing.expect(c.ms > PRIOR_PLAIN_MS and c.ms < 18.5);
     var faster = PlainCost{};
     for (0..80) |_| faster.sample(14.0);
@@ -434,6 +469,34 @@ test "PlainCost: a stall moves it little, a steady new speed is reached" {
     var slower = PlainCost{};
     for (0..80) |_| slower.sample(22.0);
     try testing.expect(slower.ms > 21.0 and slower.ms <= 22.0);
+}
+
+test "PlainCost: the first samples replace the prior, the fastest of them kept" {
+    var c = PlainCost{};
+    c.sample(13.0);
+    try approx(c.ms, 13.0);
+    c.sample(19.0); // a slow tick among the seeds
+    c.sample(12.2);
+    try approx(c.ms, 12.2);
+    c.sample(30.0); // seeded: back to the slow, bounded walk
+    try testing.expect(c.ms > 12.2 and c.ms < 12.6);
+    var stalled = PlainCost{};
+    for ([_]f32{ 400, 13.0, 13.5 }) |ms| stalled.sample(ms);
+    try approx(stalled.ms, 13.0);
+}
+
+test "PlainCost: a machine far slower than the prior is learned" {
+    var c = PlainCost{};
+    for (0..80) |_| c.sample(120.0);
+    try approx(c.ms, 120.0);
+}
+
+test "Drafting: one cold-kernel round moves the average wall at most twofold" {
+    var d = Drafting{};
+    for (0..4) |_| d.record(30, 20);
+    d.record(30, 2000);
+    try testing.expect(d.wall < 20 + 0.3 * 20 + 0.01);
+    try testing.expect(d.shouldDraft());
 }
 
 test "CopyStats: a strong match starts trusted, and misses teach it otherwise" {
