@@ -1052,6 +1052,14 @@ pub fn peer() ?*Peer {
     return if (cluster().peer_slot) |*p| p else null;
 }
 
+/// A plan kept past a failed load fixes what the workers hold: they loaded the DSpark stages, or not, as it said, so a
+/// load that now wants the other (the model's `mtp` setting changed) is refused rather than meet workers without them.
+fn samePlannedStages(planned: Shard, wants: bool) !void {
+    if (planned.stages == wants) return;
+    log.err("[dist] the workers loaded their part with DSpark stages {s}, this load wants them {s}; restart the server to change `mtp` for the group\n", .{ if (planned.stages) "split" else "off", if (wants) "split" else "off" });
+    return error.DistPlanStale;
+}
+
 /// What this rank holds of `model_dir`'s model when it is the group's model: on the first
 /// load the split is chosen and the worker told to load its part; reloads reuse it.
 pub const Part = union(enum) { span: LayerSpan, shard: Shard, remote: LayerSpan };
@@ -1059,7 +1067,10 @@ pub const Part = union(enum) { span: LayerSpan, shard: Shard, remote: LayerSpan 
 pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Part {
     if (!serves(model_dir)) return null;
     const p = try join();
-    if (p.planned) try p.samePlannedCopy(model_dir) else try plan(p, config, model_dir);
+    if (p.planned) {
+        try p.samePlannedCopy(model_dir);
+        if (p.shard) |sh| if (config.isDsv41()) try samePlannedStages(sh, dsv41DraftShard(cluster().group.?.io, config, sh.size, model_dir));
+    } else try plan(p, config, model_dir);
     if (p.remote) |r| return .{ .remote = r };
     return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
 }
@@ -2939,6 +2950,15 @@ test "dist N-rank: tensor DSpark stages split only when the pack declares and sh
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.0.main_proj.weight\":\"a.safetensors\"}}" });
     c.mtp_override = false;
     try std.testing.expect(!dsv41DraftShard(io, &c, 4, dir));
+}
+
+test "dist N-rank: a plan kept past a failed load refuses a load that wants other DSpark stages" {
+    const on: Shard = .{ .rank = 0, .size = 4, .stages = true };
+    const off: Shard = .{ .rank = 0, .size = 4 };
+    try samePlannedStages(on, true);
+    try samePlannedStages(off, false);
+    try std.testing.expectError(error.DistPlanStale, samePlannedStages(off, true));
+    try std.testing.expectError(error.DistPlanStale, samePlannedStages(on, false));
 }
 
 test "dist N-rank: past a pair only DeepSeek-V4.1's tensor split forms a group, and only one its heads divide" {
