@@ -1029,16 +1029,22 @@ pub fn shutdown() void {
 pub fn release() void {
     const p = peer() orelse return;
     if (!p.ready) return;
-    for (1..p.link.size) |k| sendMsg(&p.link, .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 }, @intCast(k)) catch |err| {
-        log.warn("[dist] the release did not reach worker rank {d} ({s})\n", .{ k, @errorName(err) });
-        return;
-    };
+    // Cleared first, and kept cleared past a worker the release missed: the ranks it did reach wait for a plan, and a
+    // control message sent as if the model were still loaded would meet that plan's magic word.
     p.planned = false;
     p.ready = false;
     p.remote = null;
     p.shard = null;
     p.peer_pos = 0;
-    log.info("[dist] {s} unloaded: the worker released its part\n", .{std.fs.path.basename(p.model)});
+    var released: u32 = 0;
+    for (1..p.link.size) |k| {
+        sendMsg(&p.link, .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 }, @intCast(k)) catch |err| {
+            log.warn("[dist] the release did not reach worker rank {d} ({s})\n", .{ k, @errorName(err) });
+            continue;
+        };
+        released += 1;
+    }
+    log.info("[dist] {s} unloaded: {d} of {d} workers released their part\n", .{ std.fs.path.basename(p.model), released, p.link.size - 1 });
 }
 
 /// Rank 0's peer, once `connect` has run.
