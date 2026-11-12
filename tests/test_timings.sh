@@ -2,7 +2,9 @@
 # Integration test: chat completions emit a llama.cpp-style `timings` block
 # alongside `usage`, on both the non-stream JSON body and the final SSE chunk
 # of a streaming response: on the usage chunk when stream_options.include_usage
-# is set, else on the finish_reason chunk. Either way, exactly once.
+# is set, else on the finish_reason chunk. Either way, exactly once. A streamed
+# /v1/responses turn carries the same object at the top level of its
+# response.completed event.
 #
 # Required fields (llama.cpp shape):
 #   prompt_n, prompt_ms, prompt_per_second,
@@ -153,6 +155,66 @@ PY
 
 stream_check "Test 2: streaming usage chunk carries 'timings' alongside 'usage'" usage ', "stream_options": {"include_usage": true}'
 stream_check "Test 3: without include_usage the finish_reason chunk carries 'timings'" finish ''
+
+# ── Test 4: /v1/responses stream — response.completed carries top-level timings
+# The envelope nests timings under `response`; proxies read the top level, so
+# the terminal event repeats the same object beside `response`, and no other
+# event carries a top-level `timings`.
+echo
+echo "--- Test 4: Responses stream: response.completed carries top-level 'timings' ---"
+RSTREAM=$(curl -sN "$BASE/v1/responses" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "mlx-serve",
+    "input": "Say hi in five words.",
+    "max_output_tokens": 16,
+    "temperature": 0.0,
+    "stream": true
+  }')
+if [ -z "$RSTREAM" ]; then
+    echo "  FAIL: empty stream"
+    FAIL=1
+else
+    RAW="$RSTREAM" python3 - <<'PY'
+import json, os, sys
+events = []
+for line in os.environ["RAW"].splitlines():
+    if not line.startswith("data: "):
+        continue
+    payload = line[len("data: "):].strip()
+    if payload == "[DONE]" or not payload:
+        continue
+    try:
+        events.append(json.loads(payload))
+    except json.JSONDecodeError:
+        pass
+done = [e for e in events if e.get("type") == "response.completed"]
+if len(done) != 1:
+    print(f"  FAIL: expected one response.completed, got {len(done)}")
+    sys.exit(1)
+ev = done[0]
+t = ev.get("timings")
+if not isinstance(t, dict):
+    print(f"  FAIL: response.completed has no top-level 'timings'. keys={list(ev.keys())}")
+    sys.exit(1)
+if t != ev["response"].get("timings"):
+    print(f"  FAIL: top-level timings {t} != response.timings {ev['response'].get('timings')}")
+    sys.exit(1)
+u = ev["response"].get("usage", {})
+if u.get("input_tokens") != t.get("prompt_n") or u.get("output_tokens") != t.get("predicted_n"):
+    print(f"  FAIL: usage/timings token counts disagree: usage={u} timings={t}")
+    sys.exit(1)
+if t["predicted_n"] > 0 and t["predicted_per_second"] <= 0:
+    print(f"  FAIL: predicted_n={t['predicted_n']} but predicted_per_second={t['predicted_per_second']}")
+    sys.exit(1)
+n = sum(1 for e in events if "timings" in e)
+if n != 1:
+    print(f"  FAIL: top-level timings appears on {n} events; expected once, on response.completed")
+    sys.exit(1)
+print(f"  PASS  timings={json.dumps(t)}")
+PY
+    [ $? -ne 0 ] && FAIL=1
+fi
 
 echo
 if [ $FAIL -ne 0 ]; then

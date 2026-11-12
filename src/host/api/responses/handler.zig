@@ -79,6 +79,7 @@ const utf8TrailingIncomplete = @import("../format.zig").utf8TrailingIncomplete;
 const thinkHoldBackLen = @import("../format.zig").thinkHoldBackLen;
 const cachedFormatChat = @import("../format.zig").cachedFormatChat;
 const jsonEscape = @import("../format.zig").jsonEscape;
+const formatTimingsObject = @import("../format.zig").formatTimingsObject;
 const parseKvQuantOverride = @import("../sampling.zig").parseKvQuantOverride;
 const MultimodalPrompt = @import("../../media/encode.zig").MultimodalPrompt;
 const prepareMultimodalPrompt = @import("../../media/encode.zig").prepareMultimodalPrompt;
@@ -1449,7 +1450,13 @@ fn handleResponsesInner(
     }
 
     if (is_stream) {
-        const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
+        // Rate-metering proxies such as llama-swap read a top-level
+        // llama.cpp-style `timings` object off the stream; the envelope nests
+        // it under `response`, so the terminal event repeats it beside
+        // `response`, as chat completions and /v1/messages already do.
+        const completed_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
+        defer allocator.free(completed_timings);
+        const completed_payload = try completedEventPayload(allocator, envelope, completed_timings);
         defer allocator.free(completed_payload);
         try sendResponsesEvent(allocator, stream, seq_num, "response.completed", completed_payload);
         // OpenAI terminates the Responses HTTP SSE stream with the same
@@ -1465,6 +1472,14 @@ fn handleResponsesInner(
     } else {
         try sendResponse(stream, "200 OK", "application/json", envelope);
     }
+}
+
+/// The `response.completed` SSE payload. A non-empty `timings` object (the
+/// one the envelope nests under `response`) is repeated at the top level,
+/// where rate-metering proxies read it; with none, the key is left out.
+fn completedEventPayload(allocator: std.mem.Allocator, envelope: []const u8, timings: []const u8) ![]u8 {
+    if (timings.len == 0) return std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
+    return std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s},\"timings\":{s}}}", .{ envelope, timings });
 }
 
 // ─── WebSocket transport for /v1/responses ────────────────────────────────
@@ -1525,4 +1540,36 @@ test "isJsonObjectString only accepts JSON objects" {
     try testing.expect(isJsonObjectString(testing.allocator, "{\"destination\":\"CARIBBEAN\"}"));
     try testing.expect(!isJsonObjectString(testing.allocator, "[]"));
     try testing.expect(!isJsonObjectString(testing.allocator, "not-json"));
+}
+
+test "completedEventPayload repeats the envelope's timings at the top level" {
+    const a = testing.allocator;
+    const timings = try formatTimingsObject(a, 1000, 200, 50, 2 * std.time.ns_per_s, std.time.ns_per_s, 0);
+    defer a.free(timings);
+    const envelope = try std.fmt.allocPrint(a, "{{\"id\":\"resp_1\",\"status\":\"completed\",\"timings\":{s}}}", .{timings});
+    defer a.free(envelope);
+    const payload = try completedEventPayload(a, envelope, timings);
+    defer a.free(payload);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("response.completed", root.get("type").?.string);
+    try testing.expectEqualStrings("resp_1", root.get("response").?.object.get("id").?.string);
+    const top = root.get("timings").?.object;
+    const nested = root.get("response").?.object.get("timings").?.object;
+    try testing.expectEqual(nested.get("prompt_n").?.integer, top.get("prompt_n").?.integer);
+    try testing.expectEqual(nested.get("predicted_n").?.integer, top.get("predicted_n").?.integer);
+    try testing.expect(top.get("prompt_per_second").?.float > 0);
+    try testing.expect(top.get("predicted_per_second").?.float > 0);
+}
+
+test "completedEventPayload leaves timings out when there are none" {
+    const a = testing.allocator;
+    const payload = try completedEventPayload(a, "{\"id\":\"resp_1\"}", "");
+    defer a.free(payload);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, payload, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("timings") == null);
+    try testing.expectEqualStrings("response.completed", parsed.value.object.get("type").?.string);
 }
