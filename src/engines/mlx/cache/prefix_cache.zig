@@ -1948,7 +1948,10 @@ pub const HotPrefixCache = struct {
         if (!plugin_driver.auxDescribe(binding.xfm, snapshot, &info).isOk()) return .declined;
         if (info.n != ids.len or info.prefix_key != prefix_key or !std.mem.eql(u32, info.ids.slice(), ids)) return .declined;
         const aux_bytes = plugin_driver.auxBytes(binding.xfm, snapshot);
-        if (self.max_kv_bytes > 0 and aux_bytes > self.max_kv_bytes) return .declined;
+        if (self.max_kv_bytes > 0 and aux_bytes > self.max_kv_bytes) {
+            self.logModuleDecline(ids.len, aux_bytes, "larger than the budget, raise --prefix-cache-mem");
+            return .declined;
+        }
         const eff_media = spansBelow(media, ids.len);
         const keys = try dupeEntryKeys(self.allocator, ids, eff_media);
         defer if (!retained) {
@@ -1963,7 +1966,10 @@ pub const HotPrefixCache = struct {
             defer self.incoming_tip = null;
             break :blk self.makeModuleRoom(aux_bytes, cache_key);
         };
-        if (!room) return .declined;
+        if (!room) {
+            self.logModuleDecline(ids.len, aux_bytes, "no entry could be evicted for it");
+            return .declined;
+        }
         // Replacement gets a new ID so an earlier selection cannot consume a different checkpoint.
         self.entries.appendAssumeCapacity(.{
             .tokens = keys[0],
@@ -1983,6 +1989,16 @@ pub const HotPrefixCache = struct {
         self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
         self.logResident();
         return .{ .ok = ids.len };
+    }
+
+    /// A module snapshot is kept whole or not at all, so the next turn of its conversation prefills cold.
+    fn logModuleDecline(self: *const HotPrefixCache, tokens: usize, bytes: u64, why: []const u8) void {
+        log.info("  [hot-cache] skipped module snapshot ({d} tokens, {d:.2} MB; {d:.2} MB budget): {s}\n", .{
+            tokens,
+            @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0),
+            @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
+            why,
+        });
     }
 
     pub const MODULE_QUIET_MS: i64 = 60_000;
@@ -11464,6 +11480,28 @@ test "HotPrefixCache module: oversized disabled and malformed commits free the w
     cache.setBudget(20);
     try testing.expectEqual(@as(usize, 1), kept.frees);
     try testing.expectEqual(@as(u64, 0), cache.current_kv_bytes);
+}
+
+test "HotPrefixCache module: a snapshot over the byte budget is declined with a log line naming its size and the budget" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.Io.Threaded.global_single_threaded.io(), &root_buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s.log", .{root});
+    try log.openFile(path, 0);
+    defer log.closeFile();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var cache = HotPrefixCache.initWithMem(testing.allocator, 2, 3 << 20);
+    defer cache.deinit();
+    var huge: ModuleFake.Snap = .{ .owner = &fake, .ids = &.{ 8, 9 }, .key = 17, .bytes = 4 << 20 };
+    try testing.expectEqual(@as(CommitStatus, .declined), try huge.put(&cache, binding, &.{}));
+    const text = try tmp.dir.readFileAlloc(testing.io, "s.log", testing.allocator, .limited(4096));
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "skipped module snapshot (2 tokens, 4.00 MB; 3.00 MB budget)") != null);
 }
 
 test "HotPrefixCache module: failed restore loses candidate and stale id never selects a swapped entry" {
