@@ -9,6 +9,8 @@ const host = @import("../glm5_next/host.zig");
 const trunk = @import("../glm5_next/trunk.zig");
 const sdk_bill = @import("../../sdk/bill/prefill.zig");
 const dq_gemm = @import("../../sdk/blocks/linear/prefill_dq_gemm.zig");
+const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
+const Family = @import("../glm5_next/config.zig").Config;
 const run = @import("../../sdk/bases/run.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
@@ -102,10 +104,20 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return abi.Verdict.refuse(.unsupported, "bailing_hybrid: forward mode not declared");
     const ops = f.cache_ops orelse return abi.Verdict.refuse(.unsupported, "bailing_hybrid: a forward without cache_ops");
+    m.serial_rows = serialVerify(m.c, f.mode, f.rows);
+    defer m.serial_rows = false;
     // A streaming pack's bank: its phase before the trunk runs, its slot rows settled after the outputs are evaluated.
-    trunk.bankPhase(m, f.rows) catch |e| return abi.Verdict.named(.failed, @errorName(e));
+    // A serial-rows verify calls it a decode lane at a time.
+    trunk.bankPhase(m, if (m.serial_rows) 1 else f.rows) catch |e| return abi.Verdict.named(.failed, @errorName(e));
     const v = host.forwardOne(plugin.name, fwd, m, ops, f, out);
     return if (v.isOk()) host.settleBank(m, f, out) else v;
+}
+
+/// A streaming pack's verify runs serial rows (`Model.serial_rows`): every row carries the bytes serial decode gives
+/// it, so greedy MTP and PLD drafting emit serial decode's text whatever widths the planner picks. Up to the fused
+/// add+norm's rows: a wider verify takes another norm than a decode step.
+pub fn serialVerify(c: *const Family, mode: abi.Mode, rows: u32) bool {
+    return c.streamed_bank and mode == .verify and @as(i64, rows) <= residual_norm.add_norm_max_rows;
 }
 
 /// The tiny pack the conformance suite runs: KDA, MLA, the dense first layer and the grouped MoE.
@@ -117,6 +129,25 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
+}
+
+test "bailing_hybrid serial verify: a streaming pack's verify of up to 16 rows; never a prompt, a decode or an MLX pack" {
+    const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try std.testing.expect(config.parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
+    defer config.freeParsed(&p);
+    const c = config.of(&p);
+    try std.testing.expect(serialVerify(c, .verify, 1) and serialVerify(c, .verify, 9) and serialVerify(c, .verify, 16));
+    try std.testing.expect(!serialVerify(c, .verify, 17) and !serialVerify(c, .prefill, 9) and !serialVerify(c, .decode, 1));
+    const tiny = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json");
+    const tmem: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = tiny }} };
+    const tdir = tmem.packDir();
+    var q: abi.Parsed = .{};
+    try std.testing.expect(config.parse(&tdir, abi.Str.of(tiny), .{}, null, true, &q).isOk());
+    defer config.freeParsed(&q);
+    try std.testing.expect(!serialVerify(config.of(&q), .verify, 9));
 }
 
 test "bailing_hybrid resident bytes: a streaming pack with a NextN layer adds its draft readout to the shards; Ling 3.0 the shards" {

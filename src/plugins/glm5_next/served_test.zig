@@ -12,6 +12,9 @@ const both = @import("../../engines/mlx/plugin/both.zig");
 const plugin_head = @import("../../engines/mlx/plugin/head.zig");
 const mtpRun = @import("../../engines/mlx/plugin/proof_mtp.zig").mtpRun;
 const MtpHeadRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef;
+const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
+const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
+const driver = @import("../../engines/mlx/plugin/driver.zig");
 const File = @import("../../sdk/root.zig").fixture.File;
 const fixture = @import("fixture.zig");
 const glm = @import("plugin.zig");
@@ -202,7 +205,7 @@ const ToyLing = struct {
         opened += 1;
         layers = geo.n_layers;
         limits = geo.limits_out != null;
-        out.* = .{ .ctx = null, .close = &bankClose, .about = .of("toy"), .decode_ids = 16, .rows = &zeroRows, .settle = &settle, .phase = &phase, .read_ahead = &readAhead };
+        out.* = .{ .ctx = null, .close = &bankClose, .about = .of("toy"), .decode_ids = 16, .rows = &zeroRows, .settle = &settle, .phase = &phase, .read_ahead = &readAhead, .exact_rows = true };
         return .ok;
     }
     fn bankClose(_: ?*anyopaque) callconv(.c) void {}
@@ -266,4 +269,81 @@ test "bailing_hybrid served: a streaming pack's bank takes each forward's phase 
     for (accepted.items) |n| try testing.expect(n <= 2);
     // Every trunk forward told the bank its phase first and settled it after.
     try testing.expect(ToyLing.phases > 0 and ToyLing.settles == ToyLing.phases);
+}
+
+/// The Ling streaming fixture served through `ToyLing` (registered for the call's life).
+fn withToyLing(comptime f: fn (*both.Both) anyerror!void) !void {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const saved = ToyLing.outside.tables.get().*;
+    defer ToyLing.outside.tables.get().* = saved;
+    ToyLing.outside.tables.get().* = .{};
+    ToyLing.outside.register(&ToyLing.table);
+    var p = try packOf(try fixture.lingMtpFiles(arena.allocator(), 11));
+    defer p.deinit();
+    var b = try both.Both.openWith(&ling.table, &p, fixture.ling_stream_config, false, .none, &.{.{ .name = "experts.bin", .bytes = "" }});
+    defer b.close();
+    try f(&b);
+}
+
+// Bar: a streaming pack's verify of 2 to 9 rows (past the bank's 8-row decode lane) gives every row serial decode's
+// logits and leaves serial decode's state, bit for bit.
+test "bailing_hybrid served: a streaming pack's verify rows are serial decode's, bit for bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const prompt = [_]i32{ 3, 17, 42, 99, 7, 250, 1, 8, 66, 31 };
+            const window = [_]i32{ 5, 61, 200, 9, 33, 77, 140, 2, 18 };
+            for ([_]usize{ 2, 3, 5, 9 }) |n| try b.expectVerifyIsSerial(&prompt, window[0..n], 64);
+        }
+    }.run);
+}
+
+/// Greedy tokens after a fixed prompt on a fresh trunk: serial decode (`depth` 0) or MTP rounds through the head.
+fn lingGreedy(b: *both.Both, depth: u32, out: []u32) !void {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var x = try driver.load(io, a, &b.cfg, b.dir, proof_fixture.stream());
+    defer x.deinit();
+    var tok_dummy: Tokenizer = undefined; // never read by the Generator
+    const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+    if (depth == 0) {
+        var gen = try Generator.initWithOptions(io, a, &x, &tok_dummy, &prompt, @intCast(out.len), .{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+        defer gen.deinit(a);
+        for (out) |*t| t.* = (try gen.next(a)) orelse return error.TestStreamEnded;
+        return;
+    }
+    const served = plugin_head.load(io, a, &x, b.dir) orelse return error.TestHeadNotLoaded;
+    defer plugin_head.destroy(served, a);
+    var gen = try Generator.initWithOptions(io, a, &x, &tok_dummy, &prompt, @intCast(out.len), .{ .temperature = 0.0 }, &.{}, .{
+        .mtp_enabled = true,
+        .mtp = .{ .plugin = served },
+        .model_has_mtp = true,
+        .mtp_depth = depth,
+    });
+    defer gen.deinit(a);
+    var n: usize = 0;
+    while (try gen.nextMtp(a)) |res| {
+        defer a.free(res.tokens);
+        @memcpy(out[n..][0..res.tokens.len], res.tokens);
+        n += res.tokens.len;
+    }
+    try testing.expectEqual(out.len, n);
+    try testing.expect(gen.mtp_attempted > 0);
+}
+
+// Bar: on a streaming pack greedy MTP drafting at depth 2 and 4 emits the stream greedy decode with MTP off emits.
+test "bailing_hybrid served: a streaming pack's greedy MTP stream equals its greedy stream with MTP off" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            var plain: [24]u32 = undefined;
+            try lingGreedy(b, 0, &plain);
+            for ([_]u32{ 2, 4 }) |depth| {
+                var drafted: [24]u32 = undefined;
+                try lingGreedy(b, depth, &drafted);
+                try testing.expectEqualSlices(u32, &plain, &drafted);
+            }
+        }
+    }.run);
 }

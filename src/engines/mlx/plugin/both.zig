@@ -148,6 +148,31 @@ pub const Both = struct {
         }
     }
 
+    /// A verify of `window` after `prompt` gives every row the logits serial decode gives its token, and leaves the
+    /// state serial decode leaves (a decode of `next` after both), bit for bit: an exact verify's bar.
+    pub fn expectVerifyIsSerial(b: *Both, prompt: []const i32, window: []const i32, next: i32) !void {
+        var serial: Slot = undefined;
+        try serial.init(b, &b.xfm);
+        defer serial.deinit();
+        var verify: Slot = undefined;
+        try verify.init(b, &b.xfm);
+        defer verify.deinit();
+        var g = ops.Graph.init(testing.allocator, b.xfm.s);
+        defer g.deinit();
+        for ([_]*Slot{ &serial, &verify }) |s| _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, prompt)));
+        const rows = try testing.allocator.alloc(Array, window.len);
+        defer testing.allocator.free(rows);
+        for (rows, window) |*r, t| r.* = try g.adopt(try b.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{t})));
+        verify.ctx.spec_verify = true;
+        verify.ctx.capture_ssm_seq = true;
+        const got = try g.adopt(try b.xfm.forwardWith(&verify.ctx, try fixture.tokens(&g, window)));
+        verify.ctx.spec_verify = false;
+        verify.ctx.capture_ssm_seq = false;
+        try ops.expectBitEqual(got, try g.concat(rows, 1));
+        const after = try g.adopt(try b.xfm.forwardWith(&verify.ctx, try fixture.tokens(&g, &.{next})));
+        try ops.expectBitEqual(after, try g.adopt(try b.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{next}))));
+    }
+
     /// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens equal.
     pub fn expectGreedy(b: *Both) !void {
         // Off Metal the tiny pack's pipelined generation can stall in MLX's CUDA wait; served packs complete.

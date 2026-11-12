@@ -5,6 +5,7 @@
 const mlx = @import("../../mlx/ffi.zig");
 const Slots = @import("../glm5_next/slots.zig").Slots;
 const trunk = @import("../glm5_next/trunk.zig");
+const rowByRowSdpa = @import("../../sdk/blocks/attention/sdpa.zig").rowByRowSdpa;
 
 pub fn mlaAttn(
     self: *const trunk.Model,
@@ -145,7 +146,12 @@ pub fn mlaAttn(
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
     const sel_mode: [*:0]const u8 = if (is_prefill) "causal" else "";
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, sel_mode, none_mask, .{ .ctx = null }, false, self.s));
+    // Serial rows: each query row the one-row call a decode step makes over the keys up to it (the vector kernel
+    // splits a row's sum by the call's query rows).
+    if (self.serial_rows and seq_len > 1)
+        try rowByRowSdpa(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, seq_len, self.s)
+    else
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, sel_mode, none_mask, .{ .ctx = null }, false, self.s));
 
     // [B,H,S,Dv] → [B,S,H,Dv]; the gate is per (token, head).
     var attn_t = mlx.mlx_array_new();

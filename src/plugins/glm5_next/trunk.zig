@@ -192,6 +192,9 @@ pub const Model = struct {
     bank: ?*outside.Bank = null,
     /// The bank as the routed layers read it.
     routed: ?routed_mod.Routed = null,
+    /// Set for one forward whose rows must each carry a one-row decode step's bytes (bailing_hybrid's exact verify):
+    /// `mm` runs rows in calls of their projection's row-exact width, KDA, MLA and the MoE row by row.
+    serial_rows: bool = false,
 
     pub fn deinit(m: *Model) void {
         if (m.experts) |*x| x.close();
@@ -213,8 +216,21 @@ pub const Model = struct {
         return if (m.c.isGlm5()) .float32 else .bfloat16;
     }
 
-    /// `x @ l^T` at `l`'s own quant geometry.
+    /// `x @ l^T` at `l`'s own quant geometry; under `serial_rows` in calls of `l`'s row-exact width.
     pub fn mm(m: *const Model, l: *const Linear, x: Array) !Array {
+        if (m.serial_rows) return linear.eachRows(x, l.exactRows(), m.s, MmCall{ .m = m, .l = l }, MmCall.run);
+        return m.mmAll(l, x);
+    }
+
+    const MmCall = struct {
+        m: *const Model,
+        l: *const Linear,
+        fn run(c: MmCall, x: Array) anyerror!Array {
+            return c.m.mmAll(c.l, x);
+        }
+    };
+
+    fn mmAll(m: *const Model, l: *const Linear, x: Array) !Array {
         if (l.ext) |*e| return e.matmul(x, m.s);
         return qmatmulBits(x, l.w, l.s, l.b, l.bits, l.group_size, l.mode, m.s);
     }
@@ -286,7 +302,8 @@ pub const Model = struct {
         defer _ = mlx.mlx_array_free(gate);
         var up = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up);
-        if (dw.gu.built() and rows <= fused_rows.FUSED_ROWS_MAX_M) {
+        // Serial rows take the one-row arm: wider rows clamp where it does not.
+        if (dw.gu.built() and (rows <= fused_rows.FUSED_ROWS_MAX_M or m.serial_rows)) {
             const both = try m.mm(&dw.gu.lin, x);
             defer _ = mlx.mlx_array_free(both);
             if (dw.gu.widths[0] == dw.gu.widths[1]) {
