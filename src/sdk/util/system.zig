@@ -218,7 +218,7 @@ fn returnedNotShown(os_free: u64) u64 {
     _ = mlx.mlx_get_cache_memory(&pool);
     var footprint: u64 = @as(u64, active) +| pool;
     var now_ms = crt.monotonicMs();
-    if (test_reading) |r| {
+    if (reading_override) |r| {
         footprint = r.footprint;
         now_ms = r.now_ms;
     }
@@ -229,7 +229,7 @@ fn returnedNotShown(os_free: u64) u64 {
 }
 
 /// Test seam: the kernel's counts, MLX's footprint and the clock, read in place of the machine's.
-pub var test_reading: ?struct { vm: DarwinVm, footprint: u64, now_ms: i64 } = null;
+pub var reading_override: ?struct { vm: DarwinVm, footprint: u64, now_ms: i64 } = null;
 
 /// `getAvailableMemBytes` for a model load (`computeLoadAvailableBytes`). Other hosts' readings
 /// already count what their OS reclaims (Linux `MemAvailable`, Windows `ullAvailPhys`).
@@ -312,7 +312,7 @@ const DarwinVm = struct { total: u64, page: u64, vm: VmStats64 };
 
 /// Total RAM, page size and the kernel's page counts; null on a failed query.
 fn darwinVm() ?DarwinVm {
-    if (test_reading) |r| return r.vm;
+    if (reading_override) |r| return r.vm;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
     if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return null;
@@ -451,21 +451,21 @@ test "the load figure carries what MLX just returned, and a free-figure reading 
     st.lag = .{};
     defer {
         st.lag = .{};
-        test_reading = null;
+        reading_override = null;
     }
     var vm = std.mem.zeroes(VmStats64);
     vm.free_count = @intCast(20 * GB / page);
     vm.wire_count = @intCast(80 * GB / page);
-    test_reading = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = vm }, .footprint = 70 * GB, .now_ms = 1000 };
+    reading_override = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = vm }, .footprint = 70 * GB, .now_ms = 1000 };
     const load_before = getLoadAvailableMemBytes();
     const free_before = getAvailableMemBytes();
     // An eviction returned 4 GB; the kernel's counts have not moved yet.
-    test_reading.?.footprint = 66 * GB;
-    test_reading.?.now_ms = 1001;
+    reading_override.?.footprint = 66 * GB;
+    reading_override.?.now_ms = 1001;
     try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
-    test_reading.?.now_ms = 1002;
+    reading_override.?.now_ms = 1002;
     try std.testing.expectEqual(free_before + 4 * GB, getAvailableMemBytes());
-    test_reading.?.now_ms = 1003;
+    reading_override.?.now_ms = 1003;
     try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
 }
 
