@@ -14,6 +14,9 @@ const log = @import("../util/log.zig");
 const model_mod = weights_mod;
 const wav_mod = @import("wav.zig");
 const transformer_mod = @import("../blocks/mlp/fused_activations.zig");
+const ops = @import("../../mlx/ops.zig");
+const gelu_block = @import("../blocks/mlp/gelu.zig");
+const snake_block = @import("../blocks/vae/snake.zig");
 const cf = @import("config_fields.zig");
 
 const Weights = weights_mod.Weights;
@@ -221,7 +224,7 @@ fn inferQuantGeometry(w_cols: usize, s_cols: usize) QuantGeometry {
 /// additive `<prefix>.bias` rides along in both branches (the 8-bit repos keep
 /// `.bias` on text_projection/small_to_mtp even where `.biases` are the quant
 /// zero-points).
-const TtsLinear = struct {
+const CodecLinear = struct {
     quantized: bool,
     w: mlx.mlx_array, // quantized: packed u32 [out, in*bits/32]; dense: pre-transposed [in, out]
     scales: mlx.mlx_array = .{ .ctx = null },
@@ -230,7 +233,7 @@ const TtsLinear = struct {
     bits: u32 = 0,
     group_size: u32 = 0,
 
-    fn load(w: *const Weights, alloc: std.mem.Allocator, prefix: []const u8, s: S) !TtsLinear {
+    fn load(w: *const Weights, alloc: std.mem.Allocator, prefix: []const u8, s: S) !CodecLinear {
         const wk = try std.fmt.allocPrint(alloc, "{s}.weight", .{prefix});
         defer alloc.free(wk);
         const sk = try std.fmt.allocPrint(alloc, "{s}.scales", .{prefix});
@@ -259,17 +262,17 @@ const TtsLinear = struct {
         return .{ .quantized = false, .w = try ownT(w, wk, s), .add_bias = ownOpt(w, ak) };
     }
 
-    fn deinit(self: *TtsLinear) void {
+    fn deinit(self: *CodecLinear) void {
         _ = mlx.mlx_array_free(self.w);
         if (self.quantized) {
             _ = mlx.mlx_array_free(self.scales);
             _ = mlx.mlx_array_free(self.biases);
         }
         if (self.add_bias) |b| _ = mlx.mlx_array_free(b);
-        self.* = std.mem.zeroes(TtsLinear); // re-freeing a loaded codec is safe
+        self.* = std.mem.zeroes(CodecLinear); // re-freeing a loaded codec is safe
     }
 
-    fn forward(self: *const TtsLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    fn forward(self: *const CodecLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
         var o = mlx.mlx_array_new();
         if (self.quantized) {
             try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
@@ -285,13 +288,13 @@ const TtsLinear = struct {
     }
 };
 
-fn loadLinearFmt(w: *const Weights, alloc: std.mem.Allocator, s: S, comptime fmt: []const u8, args: anytype) !TtsLinear {
+fn loadLinearFmt(w: *const Weights, alloc: std.mem.Allocator, s: S, comptime fmt: []const u8, args: anytype) !CodecLinear {
     const prefix = try std.fmt.allocPrint(alloc, fmt, args);
     defer alloc.free(prefix);
-    return TtsLinear.load(w, alloc, prefix, s);
+    return CodecLinear.load(w, alloc, prefix, s);
 }
 
-const QwenDims = struct {
+const CodecDims = struct {
     hidden: u32,
     heads: u32,
     kv: u32,
@@ -410,58 +413,18 @@ fn readCodecConfig(io: std.Io, alloc: std.mem.Allocator, tokenizer_dir: []const 
     return parseCodecConfig(alloc, txt);
 }
 
-/// gelu(x) = 0.5*x*(1+erf(x/√2)) (exact, matches nn.gelu).
+/// Exact GELU (`nn.gelu`): sdk's `geluErf`.
 fn gelu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const inv_sqrt2 = mlx.mlx_array_new_float(0.7071067811865476);
-    defer _ = mlx.mlx_array_free(inv_sqrt2);
-    const half = mlx.mlx_array_new_float(0.5);
-    defer _ = mlx.mlx_array_free(half);
-    const one = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one);
-    var scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_multiply(&scaled, x, inv_sqrt2, s));
-    var erf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(erf);
-    try mlx.check(mlx.mlx_erf(&erf, scaled, s));
-    var one_plus = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(one_plus);
-    try mlx.check(mlx.mlx_add(&one_plus, erf, one, s));
-    var hx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(hx);
-    try mlx.check(mlx.mlx_multiply(&hx, x, half, s));
-    return mulA(hx, one_plus, s);
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    return g.escape(try gelu_block.geluErf(&g, x));
 }
 
-/// SnakeBeta(x) = x + (1/(exp(beta)+1e-9)) * sin(x*exp(alpha))^2. Channel-wise
-/// alpha/beta broadcast over the NLC last dim.
+/// SnakeBeta with log-stored alpha/beta, channels last: sdk's `snakeBetaLog`.
 fn snakeBeta(x: mlx.mlx_array, alpha: mlx.mlx_array, beta: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var ea = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ea);
-    try mlx.check(mlx.mlx_exp(&ea, alpha, s));
-    var eb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eb);
-    try mlx.check(mlx.mlx_exp(&eb, beta, s));
-    const eps = mlx.mlx_array_new_float(1e-9);
-    defer _ = mlx.mlx_array_free(eps);
-    var eb_eps = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eb_eps);
-    try mlx.check(mlx.mlx_add(&eb_eps, eb, eps, s));
-    // sin(x*alpha)^2
-    var xa = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xa);
-    try mlx.check(mlx.mlx_multiply(&xa, x, ea, s));
-    var sinxa = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sinxa);
-    try mlx.check(mlx.mlx_sin(&sinxa, xa, s));
-    var sin2 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sin2);
-    try mlx.check(mlx.mlx_multiply(&sin2, sinxa, sinxa, s));
-    // (1/(eb+eps)) * sin2
-    var inv = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(inv);
-    try mlx.check(mlx.mlx_divide(&inv, sin2, eb_eps, s));
-    return addA(x, inv, s);
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    return g.escape(try snake_block.snakeBetaLog(&g, x, alpha, beta));
 }
 
 /// Causal Conv1d on NLC input: left-pad by `(k-1)*dil+1-stride`, then conv,
@@ -833,7 +796,7 @@ pub const CodecDecoder = struct {
         const c = self.cfg;
         // input_proj 1024→512
         var x = try linearBias(x_in, self.pt_in_t, self.pt_in_b, s);
-        const d = QwenDims{ .hidden = c.hidden, .heads = c.heads, .kv = c.kv, .head_dim = c.head_dim, .eps = c.rms_eps, .theta = c.rope_theta };
+        const d = CodecDims{ .hidden = c.hidden, .heads = c.heads, .kv = c.kv, .head_dim = c.head_dim, .eps = c.rms_eps, .theta = c.rope_theta };
         for (self.pt_layers) |*layer| {
             const nx = try self.codecTfLayer(x, layer, d);
             _ = mlx.mlx_array_free(x);
@@ -846,7 +809,7 @@ pub const CodecDecoder = struct {
         return linearBias(normed, self.pt_out_t, self.pt_out_b, s);
     }
 
-    fn codecTfLayer(self: *CodecDecoder, x: mlx.mlx_array, layer: *const CodecTfLayer, d: QwenDims) !mlx.mlx_array {
+    fn codecTfLayer(self: *CodecDecoder, x: mlx.mlx_array, layer: *const CodecTfLayer, d: CodecDims) !mlx.mlx_array {
         const s = self.s;
         const L: c_int = mlx.getShape(x)[1];
         const heads: c_int = @intCast(d.heads);
