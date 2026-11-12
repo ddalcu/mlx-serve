@@ -24,8 +24,11 @@ with GLM-5.3-Flash's readers and loads through `glm5_next/trunk.zig`; its own pa
   and `share_expert_swiglu_limit_list` (shared, `moe.Moe.Weights.shared_limit_out`); GLM's clamp is BEFORE it.
 
 Served, legacy forward deleted (`engines/mlx/plugin/served.zig`; `glm5_next/served_test.zig`: steps and greedy through the driver). DFlash via
-`trunk_weight` + captures. No MTP head: the legacy path serves none (a NextN `eh_proj` head binds to hy_v3/nemotron_h
-only, `MtpModel.bind`), so a Ling-flash head is a new feature with no oracle yet.
+`trunk_weight` + captures.
+- MTP head (`head.zig`, streaming packs only): the NextN layer at `num_hidden_layers` (`trunk.lingHead`), one
+  MLA + MoE block over `cat[enorm(embed), hnorm(h)]`, `final_layernorm` out; no legacy oracle (the served test runs it).
+- A head the outside plugin runs (EXL3) is no `trunk_weight`: drafts read a 4-bit affine copy of its rows
+  (`trunk.draftReadout`); the trunk's logits keep the plugin's head.
 
 ## Rules (from root AGENTS.md)
 - KDA = GDN with a PER-CHANNEL gate (the `_vec` kernel); per-head vs per-channel gating is an INDEXING contract.

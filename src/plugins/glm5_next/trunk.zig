@@ -139,6 +139,20 @@ pub const Head = struct {
     moe: moe.Moe.Weights,
 };
 
+/// Ling-3.1's NextN (MTP) layer, `<prefix>.layers.<num_hidden_layers>` (bailing_hybrid/head.zig):
+/// `eh_proj(cat[enorm(embed(x)), hnorm(h)])` through one MLA + MoE block, then `final_layernorm`. A streaming pack's
+/// layer is resident: its experts are the claiming plugin's format banks (`Load.experts`), not the bank's.
+pub const LingHead = struct {
+    enorm: Array,
+    hnorm: Array,
+    final_norm: Array,
+    input_norm: Array,
+    post_norm: Array,
+    eh_proj: Linear,
+    mla: Mla,
+    moe: moe.Moe.Weights,
+};
+
 /// The KDA layers' constants, built on first use in the projections' dtype (the legacy `gdn_*` caches).
 pub const KdaConsts = struct {
     q_scale: Array = .{},
@@ -160,6 +174,12 @@ pub const Model = struct {
     /// The `mtp.0` head's weights, read at load; served once `HeadHooks.load` evaluated them.
     mtp: ?Head = null,
     mtp_ready: bool = false,
+    /// Ling's NextN layer (`LingHead`); served once `readyLingHead` evaluated it.
+    ling_mtp: ?LingHead = null,
+    /// The head drafts read (`host.trunkWeight(.head)`) where the trunk's runs on the outside plugin (`Linear.ext`,
+    /// which the engine cannot read): its rows as MLX affine 4-bit (`draftReadout`). The trunk's logits keep the
+    /// plugin's head, so a verify's text is unchanged.
+    draft_head: Linear = .{},
     kda: KdaConsts = .{},
     /// `rms_norm_eps` as an array (the add+norm kernel's).
     rms_eps: Array = .{},
@@ -179,6 +199,7 @@ pub const Model = struct {
         m.quant.deinit();
         for (m.layers) |*l| if (l.mlp == .moe) compiled.free(&l.mlp.moe.route_fn);
         if (m.mtp) |*h| compiled.free(&h.moe.route_fn);
+        if (m.ling_mtp) |*h| compiled.free(&h.moe.route_fn);
         inline for (.{ m.kda.q_scale, m.kda.k_scale, m.kda.ones, m.kda.eps, m.rms_eps }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
@@ -818,6 +839,28 @@ const Loader = struct {
     }
 
     /// `<root>.mtp.0`, the head beside the trunk's `.model`; null when the pack ships none.
+    /// Ling's NextN layer at `num_hidden_layers`; null when the pack ships none (no `eh_proj`). Its routed layer stays
+    /// resident (`banked` false): a streaming pack's experts load as the claiming plugin's format banks.
+    fn lingHead(l: *Loader) !?LingHead {
+        const c = l.c;
+        const idx: u32 = c.num_hidden_layers;
+        var bb: [112]u8 = undefined;
+        const base = try std.fmt.bufPrint(&bb, "{s}.layers.{d}", .{ l.prefix, idx });
+        var nb: [256]u8 = undefined;
+        var eh = (try l.tripleOpt(try std.fmt.bufPrint(&nb, "{s}.eh_proj", .{base}))) orelse return null;
+        try l.transposed(&eh);
+        return .{
+            .enorm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.enorm.weight", .{base})),
+            .hnorm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.hnorm.weight", .{base})),
+            .final_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.final_layernorm.weight", .{base})),
+            .input_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.input_layernorm.weight", .{base})),
+            .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{base})),
+            .eh_proj = try l.lin(eh, 2 * c.hidden_size),
+            .mla = try l.mla(idx),
+            .moe = try l.routed(base, false),
+        };
+    }
+
     fn head(l: *Loader) !?Head {
         const c = l.c;
         var bb: [96]u8 = undefined;
@@ -872,7 +915,8 @@ const Loader = struct {
                 L.mlp.moe.shared_limit_out = @floatFromInt(c.shared_limit_out[i]);
                 if (c.expert_limit_out[i] != 0) {
                     L.mlp.moe.limit_out = @floatFromInt(c.expert_limit_out[i]);
-                    if (!c.streamed_bank) L.mlp.moe.clamp = null;
+                    // the composed chain's arm: no kernel claims the layer (a format bank takes `Swiglu.limit_out`)
+                    if (!c.streamed_bank and L.mlp.moe.format_banks == null) L.mlp.moe.clamp = null;
                 }
             }
             built += 1;
@@ -999,6 +1043,13 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
         log.warn("GLM MTP head: {s} — MTP off\n", .{@errorName(e)});
         break :blk null;
     };
+    // Ling's NextN head on the streaming pack only: an MLX Ling pack loads as before.
+    if (!c.isGlm5() and c.streamed_bank and c.nextn_layers > 0) m.ling_mtp = l.lingHead() catch |e| blk: {
+        log.warn("Ling MTP head: {s} — MTP off\n", .{@errorName(e)});
+        break :blk null;
+    };
+    // The drafts' readout before the bank takes its room: the engine borrows it at the bind (`trunk_weight`).
+    if (m.ling_mtp != null and m.head.ext != null) try draftReadout(m);
     if (c.streamed_bank) try bindBank(m, ctx.stream_room);
     return m;
 }
@@ -1048,6 +1099,73 @@ fn evalTrunk(m: *const Model) !void {
     for (m.owned.items) |a| _ = mlx.mlx_vector_array_append_value(vec, a);
     try mlx.check(mlx.mlx_eval(vec));
     try m.quant.eval();
+}
+
+extern "c" fn mlx_eye(res: *Array, n: c_int, m: c_int, k: c_int, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) c_int;
+
+/// The draft readout of a head the outside plugin runs (`Model.draft_head`): its rows read once through the plugin
+/// (`I @ W^T`, the identity's rows), stored as MLX affine 4-bit at group 64, the dense copy freed.
+fn draftReadout(m: *Model) !void {
+    const s = m.s;
+    const h: c_int = @intCast(m.c.hidden_size);
+    var eye = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eye);
+    try mlx.check(mlx_eye(&eye, h, h, 0, .bfloat16, s));
+    var eye3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eye3);
+    try mlx.check(mlx.mlx_reshape(&eye3, eye, &[_]c_int{ 1, h, h }, 3, s));
+    const wt = try m.mm(&m.head, eye3);
+    defer _ = mlx.mlx_array_free(wt);
+    const vocab = mlx.getShape(wt)[2];
+    var wt2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt2);
+    try mlx.check(mlx.mlx_reshape(&wt2, wt, &[_]c_int{ h, vocab }, 2, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_transpose(&w, wt2, s));
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_astype(&dense, w, .bfloat16, s));
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, dense, mlx.mlx_optional_int.some(@intCast(draft_head_group)), mlx.mlx_optional_int.some(@intCast(draft_head_bits)), "affine", .{}, s));
+    var parts: [3]Array = @splat(mlx.mlx_array_new());
+    for (&parts, 0..) |*a, i| {
+        try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
+        try m.owned.append(gpa, a.*);
+    }
+    const vec = mlx.mlx_vector_array_new_data(&parts, 3);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+    m.draft_head = .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = draft_head_bits, .group_size = draft_head_group, .mode = .affine };
+    var held: u64 = 0;
+    for (parts) |a| held += mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+    const billed = draftReadoutBytes(@intCast(vocab), m.c.hidden_size);
+    log.info("MTP draft readout: the EXL3 head as affine {d}-bit g{d}, {d} MiB resident (billed {d} MiB)\n", .{ draft_head_bits, draft_head_group, held >> 20, billed >> 20 });
+    if (held != billed) return error.DraftReadoutUnbilled;
+}
+
+/// The draft readout's width and group (`draftReadout`).
+pub const draft_head_bits: u32 = 4;
+pub const draft_head_group: u32 = 64;
+
+/// The draft readout's resident bytes at `vocab` x `hidden` (`draftReadout`; the load's `resident_bytes` bills them):
+/// the packed 4-bit words and a bf16 scale and bias per group.
+pub fn draftReadoutBytes(vocab: u64, hidden: u64) u64 {
+    return vocab * hidden * draft_head_bits / 8 + 2 * 2 * vocab * (hidden / draft_head_group);
+}
+
+test "glm5_next trunk: the draft readout bills Ling-3.1-flash's head at 345 MiB" {
+    try std.testing.expectEqual(@as(u64, 362_151_936), draftReadoutBytes(157_184, 4096));
+}
+
+/// Makes Ling's NextN layer resident (bailing_hybrid's `HeadHooks.load`).
+pub fn readyLingHead(m: *Model) !void {
+    if (m.mtp_ready) return;
+    const h = m.ling_mtp orelse return error.NoMtpHead;
+    try mlx.evalFields(h);
+    try m.quant.eval();
+    m.mtp_ready = true;
 }
 
 /// Makes the MTP head resident (`HeadHooks.load`).

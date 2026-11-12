@@ -380,9 +380,13 @@ fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_d
 /// The format's routed SwiGLU over the top-k, weighted and summed (the engine's exl3 arm).
 fn formatSwiglu(w: *const Moe.Weights, fb: *const FormatBanks, g: *Graph, x: Array, r: Routed) !Array {
     const swiglu = fb.table.swiglu orelse return error.QuantFormatHasNoSwiglu;
-    const limit = w.clamp orelse return error.QuantFormatClampUnsupported;
+    // A clamp after the SiLU goes only to a table that reads it (`QuantTable.clampsOut`).
+    const opts: quant_abi.Swiglu = if (w.limit_out > 0)
+        (if (fb.table.clampsOut()) .{ .limit_out = w.limit_out } else return error.QuantFormatClampUnsupported)
+    else
+        .{ .limit = @intCast(w.clamp orelse return error.QuantFormatClampUnsupported) };
     var y: quant_abi.Array = .{};
-    const v = swiglu(&fb.gate, &fb.up, &fb.down, .{ .ctx = x.ctx }, .{ .ctx = r.inds.ctx }, .{ .ctx = r.scores.ctx }, &.{ .limit = @intCast(limit) }, .{ .ctx = g.s.ctx }, &y);
+    const v = swiglu(&fb.gate, &fb.up, &fb.down, .{ .ctx = x.ctx }, .{ .ctx = r.inds.ctx }, .{ .ctx = r.scores.ctx }, &opts, .{ .ctx = g.s.ctx }, &y);
     if (!v.isOk()) return error.QuantFormatSwigluFailed;
     return g.adopt(.{ .ctx = y.ctx });
 }

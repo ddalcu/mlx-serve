@@ -95,6 +95,7 @@ fn readLing(c: *Config, o: Objects) ParseError!void {
     // Ling-3.1's clamps after the SiLU, one entry a trunk layer (0 = none).
     try limitList(cfg, "expert_swiglu_limit_list", &c.expert_limit_out);
     try limitList(cfg, "share_expert_swiglu_limit_list", &c.shared_limit_out);
+    try intIf(cfg, "num_nextn_predict_layers", &c.nextn_layers);
 
     // A Ling streaming pack (the EXL3 repack beside its `experts.bin`) keeps the release's config.json, so it names no
     // `expert_streaming`: its EXL3 `quantization_config` marks it. The family parse refuses it without `experts.bin`, and
@@ -125,6 +126,8 @@ fn lingFacts(c: *const Config, p: *abi.Parsed) void {
         p.caps.prompt_last_row = true;
     }
     p.chat.thinking_default = .on;
+    // A streaming pack's NextN layer drafts one token a round over the trunk's final-normed hidden (`head.zig`).
+    if (c.streamed_bank and c.nextn_layers > 0) p.spec = .{ .mtp_default_depth = 1, .mtp_layout = .in_checkpoint, .head_reads_final_norm = true };
     p.cache.ssm_state = .{ .entries = c.num_hidden_layers, .dtype = .bf16 };
     p.weights.prefix = abi.Str.of(c.weight_prefix);
 }
@@ -230,4 +233,22 @@ test "bailing_hybrid config: a limit list past 128 layers, past 255 or not a lis
     var p: abi.Parsed = .{};
     const v = parseJson(long.items, &p);
     try testing.expect(!v.isOk() and p.private == null);
+}
+
+test "bailing_hybrid config: a streaming pack's NextN layer declares the MTP head (one draft a round over the final-normed hidden); an MLX pack none" {
+    const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expectEqual(@as(u32, 1), of(&p).nextn_layers);
+    try testing.expect(p.spec.mtp_layout == .in_checkpoint and p.spec.mtp_default_depth == 1 and p.spec.head_reads_final_norm);
+    // MLX packs keep their facts: no head, a NextN layer or not.
+    inline for (.{ "bailing_hybrid-ling-3.0-tiny-4bit.json", "bailing_hybrid-ling-3.0-flash-oq4e-mtp.json" }) |name| {
+        var q: abi.Parsed = .{};
+        try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/" ++ name), &q).isOk());
+        defer freeParsed(&q);
+        try testing.expect(q.spec.mtp_layout == .none and q.spec.mtp_default_depth == 0 and !of(&q).streamed_bank);
+    }
 }

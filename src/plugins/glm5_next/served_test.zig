@@ -157,3 +157,113 @@ test "glm5_next served: the MTP head through MtpHeadRef.plugin equals the legacy
     try b.check(got_a, true);
     try b.expectDone();
 }
+
+/// A quant table claiming the Ling streaming fixture: every projection stays the pack's own (`.weight`), and its bank's
+/// routed sum is zero; it counts the phases, settles and geometry the trunk hands it.
+const ToyLing = struct {
+    const outside = @import("../../sdk/quant/outside.zig");
+    const qa = @import("../../abi/quant.zig");
+    const common = @import("../../abi/common.zig");
+    var phases: u32 = 0;
+    var settles: u32 = 0;
+    var opened: u32 = 0;
+    var layers: u32 = 0;
+    var limits: bool = false;
+    fn claims(block: qa.Str, _: qa.Str) callconv(.c) common.Claim {
+        return if (std.mem.indexOf(u8, block.slice(), "\"exl3\"") != null) .by_marker else .no;
+    }
+    fn validate(_: qa.Str, _: qa.Str, _: *const common.PackDir) callconv(.c) common.Verdict {
+        return .ok;
+    }
+    fn bill(_: qa.Str, _: qa.Str, stored: u64) callconv(.c) u64 {
+        return stored;
+    }
+    fn open(_: *qa.LoadCtx) callconv(.c) common.Verdict {
+        return .ok;
+    }
+    fn close(_: *qa.LoadCtx) callconv(.c) void {}
+    fn load(_: *const qa.LoadCtx, _: qa.Str, _: u32, _: *qa.Weight) callconv(.c) common.Verdict {
+        return common.Verdict.refuse(.failed, "MissingWeight");
+    }
+    fn release(w: *qa.Weight) callconv(.c) void {
+        w.* = .{};
+    }
+    fn matmul(_: *const qa.Weight, _: qa.Array, _: qa.Stream, _: *qa.Array) callconv(.c) common.Verdict {
+        return common.Verdict.refuse(.unsupported, "toy");
+    }
+    fn moe(_: *const qa.Weight, _: qa.Array, _: qa.Array, _: qa.Array, _: bool, _: qa.Stream, _: *qa.Array) callconv(.c) common.Verdict {
+        return common.Verdict.refuse(.unsupported, "toy");
+    }
+    fn bankRows(_: *const qa.LoadCtx, _: *const qa.BankGeometry, _: qa.BankBudget, out: *qa.BankRows) callconv(.c) common.Verdict {
+        out.* = .{ .prompt = 8, .decode = 8, .row_bytes = 1 };
+        return .ok;
+    }
+    fn openBank(_: *const qa.LoadCtx, geo: *const qa.BankGeometry, _: qa.BankBudget, out: *qa.Bank) callconv(.c) common.Verdict {
+        opened += 1;
+        layers = geo.n_layers;
+        limits = geo.limits_out != null;
+        out.* = .{ .ctx = null, .close = &bankClose, .about = .of("toy"), .decode_ids = 16, .rows = &zeroRows, .settle = &settle, .phase = &phase, .read_ahead = &readAhead };
+        return .ok;
+    }
+    fn bankClose(_: ?*anyopaque) callconv(.c) void {}
+    fn zeroRows(_: ?*anyopaque, _: u32, x: qa.Array, _: qa.Array, _: qa.Array, out: *qa.Array) callconv(.c) common.Verdict {
+        const xa: mlx.mlx_array = .{ .ctx = x.ctx };
+        var z = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_zeros(&z, mlx.getShape(xa).ptr, mlx.getShape(xa).len, .float32, mlx.gpuStream())) catch return common.Verdict.refuse(.failed, "zeros");
+        out.* = .{ .ctx = z.ctx };
+        return .ok;
+    }
+    fn settle(_: ?*anyopaque) callconv(.c) common.Verdict {
+        settles += 1;
+        return .ok;
+    }
+    fn phase(_: ?*anyopaque, _: bool) callconv(.c) common.Verdict {
+        phases += 1;
+        return .ok;
+    }
+    fn readAhead(_: ?*anyopaque, _: u32, _: [*]const u16, _: usize) callconv(.c) common.Verdict {
+        return .ok;
+    }
+    const table: qa.QuantTable = .{ .name = .of("toy-ling"), .claims = &claims, .validate = &validate, .bill = &bill, .open = &open, .close = &close, .load_tensor = &load, .load_bank = &load, .release = &release, .matmul = &matmul, .moe = &moe, .bank_rows = &bankRows, .open_bank = &openBank };
+};
+
+// Bar: a Ling streaming pack loads through the table that claims it (its bank bound to every routed layer, one phase
+// before and one settle after each forward) and serves its NextN layer as the engine's MTP head; an MLX pack loads no
+// head. No legacy oracle exists for the head (the legacy path serves none).
+test "bailing_hybrid served: a streaming pack's bank takes each forward's phase and settle, and its NextN layer is its MTP head; an MLX pack has none" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    {
+        const files = try fixture.lingMtpFiles(arena.allocator(), 11);
+        var p = try packOf(files);
+        defer p.deinit();
+        var b = try both.Both.openAs(&ling.table, &p, files[0].bytes, false, .none);
+        defer b.close();
+        try testing.expect(plugin_head.load(io, a, &b.xfm, b.dir) == null);
+    }
+    const saved = ToyLing.outside.tables.get().*;
+    defer ToyLing.outside.tables.get().* = saved;
+    ToyLing.outside.tables.get().* = .{};
+    ToyLing.outside.register(&ToyLing.table);
+    const files = try fixture.lingMtpFiles(arena.allocator(), 11);
+    var p = try packOf(files);
+    defer p.deinit();
+    var b = try both.Both.openWith(&ling.table, &p, fixture.ling_stream_config, false, .none, &.{.{ .name = "experts.bin", .bytes = "" }});
+    defer b.close();
+    try testing.expectEqual(@as(u32, 1), ToyLing.opened);
+    try testing.expectEqual(@as(u32, 4), ToyLing.layers);
+    try testing.expect(!ToyLing.limits);
+    const served = plugin_head.load(io, a, &b.xfm, b.dir) orelse return error.TestHeadNotLoaded;
+    defer plugin_head.destroy(served, a);
+    var tokens: [16]u32 = undefined;
+    var accepted: std.ArrayList(u32) = .empty;
+    defer accepted.deinit(a);
+    try mtpRun(&b.xfm, .{ .plugin = served }, &tokens, &accepted);
+    try testing.expect(accepted.items.len > 0);
+    for (accepted.items) |n| try testing.expect(n <= 2);
+    // Every trunk forward told the bank its phase first and settled it after.
+    try testing.expect(ToyLing.phases > 0 and ToyLing.settles == ToyLing.phases);
+}

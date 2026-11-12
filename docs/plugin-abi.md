@@ -1248,6 +1248,7 @@ A quant plugin's table, exported as `exportName(name, version)`. `claims`, `vali
 | `swiglu` | `?*const fn (gate: *const Weight, up: *const Weight, down: *const Weight, x: Array, inds: Array, scores: Array, opts: *const Swiglu, s: Stream, out: *Array) callconv(.c) Verdict` | `null` | Routed SwiGLU experts in one dispatch, for a format whose kernels fuse the three projections (EXL3): `x` [B, S, D] through the banks' experts `inds` [B, S, K], weighted by `scores`. Null: compose `moe` per projection. |
 | `bank_rows` | `?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *BankRows) callconv(.c) Verdict` | `null` | The slot rows per routed layer `budget` buys over the pack's streamed expert bank, no memory taken (`open_bank`'s rows); refused by name when none fit. Null: the format streams no bank. |
 | `open_bank` | `?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *Bank) callconv(.c) Verdict` | `null` | The pack's streamed expert bank at the rows `budget` buys; it outlives `close`. |
+| `swiglu_limit_out` | `bool` | `false` | `swiglu` reads `Swiglu.limit_out`. Appended: the host passes a post-SiLU limit only to a table whose `size` reaches this flag and sets it (`clampsOut`), and refuses the call by name otherwise, so a table built before the field is never asked a clamp it would skip. |
 
 ### `BankGate` (extern struct)
 
@@ -1320,6 +1321,7 @@ A streamed bank of routed experts, as the trunk's MoE reads one whose math it do
 | `size` | `u32` | `@sizeOf(Swiglu)` |  |
 | `limit` | `i32` | `0` | > 0: the SwiGLU's clamp (GLM's `swiglu_limit`). |
 | `verify_rows` | `bool` | `false` | Spec-verify rows: the decode chain at any width. |
+| `limit_out` | `f32` | `0` | > 0: the SwiGLU clamped AFTER the SiLU, min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's; `limit` is then 0). Appended: read only by a table that declares it (`QuantTable.clampsOut`). |
 
 ## `host.zig`
 

@@ -146,6 +146,8 @@ pub const Config = struct {
     /// `shared_limit_out`).
     expert_limit_out: [128]u8 = @splat(0),
     shared_limit_out: [128]u8 = @splat(0),
+    /// NextN layers past the trunk (`num_nextn_predict_layers`; bailing_hybrid's MTP head, `trunk.lingHead`).
+    nextn_layers: u32 = 0,
 
     /// Pack-owned sampling recommendations (`generation_config.json`).
     gen: abi.GenDefaults = .{},

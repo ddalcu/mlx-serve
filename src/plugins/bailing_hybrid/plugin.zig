@@ -10,6 +10,7 @@ const trunk = @import("../glm5_next/trunk.zig");
 const toModelConfig = @import("../glm5_next/model_config.zig").toModelConfig;
 const prefillNeededAtChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").prefillNeededAtChunk;
 const fwd = @import("table_forward.zig");
+const head = @import("head.zig");
 const fixture = @import("../glm5_next/fixture.zig");
 pub const config = @import("config.zig");
 
@@ -25,8 +26,8 @@ pub const table = abi.ModelTable{
     .unload = &host.unload,
     .forward = &forward,
     .cache = &.{ .layout = &layout },
-    .weights = &.{},
-    .spec = &.{ .trunk_weight = &host.trunkWeight },
+    .weights = &.{ .resident_bytes = &residentBytes },
+    .spec = &.{ .trunk_weight = &host.trunkWeight, .head = &head.hooks },
 };
 
 /// KDA layers keep a recurrent state; an MLA layer caches every head's expanded key (nope | rope) and value.
@@ -53,6 +54,14 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
         .prefill_score_width = qk,
         .prefill_bytes = if (c.streamed_bank) &prefillBytes else null,
     };
+}
+
+/// The pack's shards, and for a streaming pack with a NextN layer its draft readout (`trunk.draftReadout`), built at
+/// load from the plugin's EXL3 head.
+fn residentBytes(p: *const abi.Parsed, _: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) abi.Verdict {
+    const c = config.of(p);
+    out.* = shards + if (c.streamed_bank and c.nextn_layers > 0) trunk.draftReadoutBytes(c.vocab_size, c.hidden_size) else 0;
+    return .ok;
 }
 
 /// A streaming pack's prompt: the engine's own prompt bill of the pack's config as an unstreamed model's (one output
@@ -111,4 +120,24 @@ test "bailing_hybrid bill: a streaming pack bills its prompt as the engine bills
     var bq: abi.Bill = .{};
     bill(&q, &.{ .context = 32768 }, &bq);
     try std.testing.expect(bq.prefill_bytes == null and !q.caps.prompt_last_row);
+}
+
+test "bailing_hybrid resident bytes: a streaming pack with a NextN layer adds its draft readout to the shards; Ling 3.0 the shards" {
+    const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try std.testing.expect(config.parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
+    defer config.freeParsed(&p);
+    var got: u64 = 0;
+    try std.testing.expect(residentBytes(&p, .{}, .{}, 1000, &got).isOk());
+    try std.testing.expectEqual(@as(u64, 1000 + 362_151_936), got);
+    const tiny = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json");
+    const tmem: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = tiny }} };
+    const tdir = tmem.packDir();
+    var q: abi.Parsed = .{};
+    try std.testing.expect(config.parse(&tdir, abi.Str.of(tiny), .{}, null, true, &q).isOk());
+    defer config.freeParsed(&q);
+    try std.testing.expect(residentBytes(&q, .{}, .{}, 1000, &got).isOk());
+    try std.testing.expectEqual(@as(u64, 1000), got);
 }
