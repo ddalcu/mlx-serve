@@ -434,7 +434,7 @@ test "nax attention 256 int8 QK: causal prefill tracks fp32 attention, tails and
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(256008);
     const rnd = prng.random();
-    for ([_][2]c_int{ .{ 128, 512 }, .{ 100, 300 }, .{ 64, 64 } }) |cs| {
+    for ([_][2]c_int{ .{ 128, 512 }, .{ 100, 300 }, .{ 64, 64 }, .{ 64, 300 } }) |cs| {
         const q = try randBf16(rnd, &.{ 1, 6, cs[0], 256 }, s);
         defer _ = mlx.mlx_array_free(q);
         const k0 = try randBf16(rnd, &.{ 1, 1, cs[1], 256 }, s);
