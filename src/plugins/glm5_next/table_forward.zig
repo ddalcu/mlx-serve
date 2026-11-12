@@ -16,6 +16,7 @@ const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows
 const axisView = @import("../../mlx/array.zig").axisView;
 const concatAxis1 = @import("../../mlx/array.zig").concatAxis1;
 const glm_moe = @import("moe.zig");
+const dsa_prompt = @import("dsa_prompt.zig");
 const env = @import("../../env.zig");
 const log = @import("../../sdk/util/log.zig");
 
@@ -570,18 +571,25 @@ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trun
         }
         parts[1] = try m.headMm(o_lat, &d.unembed, true);
     }
-    var o = mlx.mlx_array_new(); // [B, H, S, hd]
+    var o = mlx.mlx_array_new(); // [B, H, S, hd]; [B, S, H, hd] where `rows_first`
     defer _ = mlx.mlx_array_free(o);
+    // MLX_SERVE_GLM_DSA_PROMPT_INDEXER: both parts in the output's row order in one copy (no transpose below).
+    var rows_first = false;
     if (parts[0].ctx != null and parts[1].ctx != null) {
-        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
-        defer _ = mlx.mlx_vector_array_free(vec);
-        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 2, s));
+        rows_first = try dsa_prompt.assemble(&o, s, parts[0], parts[1]);
+        if (!rows_first) {
+            const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 2, s));
+        }
     } else {
         try mlx.check(mlx.mlx_array_set(&o, if (parts[0].ctx != null) parts[0] else parts[1]));
     }
     var ot = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ot);
-    try mlx.check(mlx.mlx_transpose_axes(&ot, o, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+    if (rows_first) {
+        try mlx.check(mlx.mlx_array_set(&ot, o));
+    } else try mlx.check(mlx.mlx_transpose_axes(&ot, o, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
     var flat = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(flat);
     try mlx.check(mlx.mlx_reshape(&flat, ot, &[_]c_int{ batch, seq_len, heads * hd }, 3, s));

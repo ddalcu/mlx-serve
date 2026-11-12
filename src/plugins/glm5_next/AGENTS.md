@@ -28,6 +28,8 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
   `route_scale`, Sushi's EXL3 banks its `format_banks`.
 - MTP head (`head.zig`, MLX_SERVE_GLM_HEAD_LAST_ROW; the stock bytes): its merged first draft step's routed experts
   for the last row alone (`moe.mlpLastRow`).
+- DSA levers (MLX_SERVE_GLM_DSA_*, each the stock bytes at GLM-5.3-Flash's indexer and attention dims, declining
+  elsewhere): a prompt pass's indexer in one launch and its output in one copy (`dsa_prompt.zig`).
 - Router: the load keeps each routed layer's router as stored (`raw_router`), so 1-4 row calls ride
   `sdk/blocks/moe/router_nax.zig` (MLX's split-K chains or gemv, then the stock router text: same bytes).
 - Forward (`table_forward.zig`): the [B,S,4,D] stream through KDA / DSA sublayers inside mHC; KV and recurrent state
@@ -71,6 +73,8 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 - Kernel contracts for the 20 `kernels/*.metal` rows are not registered.
 - Kernel contracts for `router_nax`'s kernels (`kernels/moe/router_nax_*`) are not registered; its byte tests hold them
   to the stock route.
+- Kernel contracts for the DSA levers' texts (`kernels/dsa_*.metal` past `dsa_nax.zig`'s) are not registered; their byte
+  tests hold them to the stock ops.
 - No `[dtype-trace]` or layer-cap diagnostics on the table forward.
 - The dense layer's one-row decode takes the unclamped joined SwiGLU (`Model.denseMlp`), as the legacy forward did,
   though the config declares `swiglu_limit`; wider rows clamp. Kept for bit-equality; unverified against the reference.

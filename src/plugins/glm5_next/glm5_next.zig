@@ -7,6 +7,7 @@ const std = @import("std");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const dsa = @import("dsa_nax.zig");
+const dsa_prompt = @import("dsa_prompt.zig");
 const Scope = @import("../../mlx/scope.zig").Scope;
 
 pub const HC: c_int = 4;
@@ -831,6 +832,8 @@ fn selectRows(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, idx_cac
         try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
         return out;
     } else {
+        // MLX_SERVE_GLM_DSA_PROMPT_INDEXER: the scores, their top-k and its expansion in one launch (the same tokens).
+        if (try dsa_prompt.selectRows(s, q_idx, w, idx_cache, q_start, p, select_k, ix)) |tokens| return tokens;
         // Scores: sum_h w_h * relu(q_h . pool_key) * Dh^-0.5, f32; pools a query cannot see lose.
         const pk = try storedPoolKeys(s, idx_cache, p, ix);
         defer _ = mlx.mlx_array_free(pk);
