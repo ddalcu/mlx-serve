@@ -284,7 +284,7 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
         break :blk .{ .x = x, .w = se.gate_vec };
     };
     var r = try route(w, g, logits, fold);
-    const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x) else null;
+    const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x, false) else null;
     // The group-limited chain hands its weights back in f32; they land in the activation dtype.
     if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
     if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
@@ -295,10 +295,71 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     const y = try routedExperts(w, g, x, r, shared_down, null);
     if (y.shared_fused) return parent.keep(y.sum);
     const se = w.shared orelse return parent.keep(y.sum);
-    if (!se.gated()) return parent.keep(try g.add(y.sum, try sharedDown(w, g, &se, x)));
-    const down = shared_down orelse try sharedDown(w, g, &se, x);
+    if (!se.gated()) return parent.keep(try g.add(y.sum, try sharedDown(w, g, &se, x, false)));
+    const down = shared_down orelse try sharedDown(w, g, &se, x, false);
     const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
     return parent.keep(try g.add(y.sum, try g.mul(try g.sigmoid(logit), down)));
+}
+
+/// `mlp` with each row of one sequence's `x` `[1, S, D]` given its own one-row call's bytes (a verify that must equal
+/// serial decode). Over a streamed source (`Routed.math == .source`): the router and the shared expert through
+/// `Linear.forwardRows`, the routes over every row, the source called a decode lane of rows at a time where it declares
+/// them exact (`Routed.exact_rows`), else a row at a time; the caller keeps its bank in the decode phase. Anything else
+/// runs `mlp` a row at a time.
+pub fn mlpRows(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
+    const xs = ops.shape(x);
+    if (xs[0] * xs[1] <= 1) return mlp(w, parent, x);
+    if (xs[0] != 1) return error.MoeRowsOneSequence;
+    const st = if (w.streamed) |*v| v else null;
+    // One row's softmax router folds a gated shared expert in, and a model's one-kernel arm sums its own way.
+    if (st == null or st.?.routed.math != .source or w.fused != null or w.route == .softmax) return eachRowMlp(w, parent, x);
+    var t = parent.scope();
+    defer t.deinit();
+    const g = &t;
+    var r = try route(w, g, try w.router.forwardRows(g, x), null);
+    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+    if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
+    const sum = try sourceRows(w, st.?, g, x, r);
+    const se = w.shared orelse return parent.keep(sum);
+    const down = try sharedDown(w, g, &se, x, true);
+    if (!se.gated()) return parent.keep(try g.add(sum, down));
+    return parent.keep(try g.add(sum, try g.mul(try g.sigmoid(try se.gate_logit.forwardRows(g, x)), down)));
+}
+
+/// `mlp` on each row alone; a streamed row evaluated before the next row's fetch rewrites its slots.
+fn eachRowMlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
+    const Call = struct {
+        w: *const Moe.Weights,
+        g: *const Graph,
+        fn run(c: @This(), row: Array) anyerror!Array {
+            var t = c.g.scope();
+            defer t.deinit();
+            const y = try mlp(c.w, &t, row);
+            if (c.w.streamed != null) try ops.eval(y);
+            return t.escape(y);
+        }
+    };
+    return parent.adopt(try linear.eachRows(x, 1, parent.s, Call{ .w = w, .g = parent }, Call.run));
+}
+
+/// A streamed source's routed sum with each row given its own call's bytes: calls of the source's decode lane where it
+/// declares them exact, else of one row, each evaluated before the next call's fetch.
+fn sourceRows(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r: Routed) !Array {
+    const S = ops.shape(x)[1];
+    const K: usize = @intCast(ops.shape(r.inds)[ops.shape(r.inds).len - 1]);
+    const lane: c_int = @intCast(@min(st.routed.decode_ids / K, 1 << 16));
+    const per: c_int = if (st.routed.exact_rows) @max(1, lane) else 1;
+    var outs: std.ArrayList(Array) = .empty;
+    defer outs.deinit(g.a);
+    var lo: c_int = 0;
+    while (lo < S) : (lo += per) {
+        const hi = @min(S, lo + per);
+        const rc: Routed = .{ .inds = try g.sliceAxis(r.inds, 1, lo, hi), .scores = try g.sliceAxis(r.scores, 1, lo, hi) };
+        const y = try streamedRouted(w, st, g, try g.sliceAxis(x, 1, lo, hi), rc, null, null, false);
+        if (hi < S) try ops.eval(y.out);
+        try outs.append(g.a, y.out);
+    }
+    return g.concat(outs.items, 1);
 }
 
 /// The routed experts' weighted sum `[B, S, D]` for routes `inds` and their weights `scores` (in `x`'s dtype), no
@@ -391,11 +452,13 @@ fn formatSwiglu(w: *const Moe.Weights, fb: *const FormatBanks, g: *Graph, x: Arr
     return g.adopt(.{ .ctx = y.ctx });
 }
 
-fn sharedDown(w: *const Moe.Weights, parent: *Graph, se: *const SharedExpert, x: Array) !Array {
+/// The shared expert's rows; `rows`: each row its one-row call's bytes (`Linear.forwardRows`).
+fn sharedDown(w: *const Moe.Weights, parent: *Graph, se: *const SharedExpert, x: Array, rows: bool) !Array {
     var t = parent.scope();
     defer t.deinit();
     const g = &t;
-    return parent.keep(try se.down.forward(g, try swigluAct(w, g, try se.gate.forward(g, x), try se.up.forward(g, x), w.shared_limit_out)));
+    if (!rows) return parent.keep(try se.down.forward(g, try swigluAct(w, g, try se.gate.forward(g, x), try se.up.forward(g, x), w.shared_limit_out)));
+    return parent.keep(try se.down.forwardRows(g, try swigluAct(w, g, try se.gate.forwardRows(g, x), try se.up.forwardRows(g, x), w.shared_limit_out)));
 }
 
 /// min(silu(g), L) * clamp(u, -L, L) in f32, cast back to `gate`'s dtype: Ling-3.1's SwiGLU on a clamped layer
@@ -1060,5 +1123,86 @@ test "moe: swigluClampOut is min(silu(g), L) * clamp(u, -L, L) at Ling-3.1's L =
         const silu = gd / (1 + @exp(-gd));
         const want = @min(silu, 10.0) * std.math.clamp(@as(f64, uv), -10.0, 10.0);
         try std.testing.expectApproxEqAbs(want, @as(f64, yv), 1e-4 * @max(1.0, @abs(want)));
+    }
+}
+
+/// A streamed source whose routed sum is each row times its routing weights' sum; it counts its calls and their rows.
+const RowsSource = struct {
+    var calls: u32 = 0;
+    var widest: c_int = 0;
+    fn rows(_: *anyopaque, _: u32, x: Array, _: Array, wts: Array) routed.Ret(Array) {
+        return routed.Ret(Array).of(sum(x, wts));
+    }
+    fn sum(x: Array, wts: Array) !Array {
+        calls += 1;
+        widest = @max(widest, ops.shape(x)[0]);
+        var g = Graph.init(std.testing.allocator, mlx.gpuStream());
+        defer g.deinit();
+        return g.escape(try g.mul(try g.astype(x, .float32), try g.sum(try g.astype(wts, .float32), -1, true)));
+    }
+    fn settle(_: *anyopaque) routed.Ret(void) {
+        return .{};
+    }
+    fn of(exact: bool) routed.Routed {
+        return .{ .ctx = @ptrCast(&calls), .math = .{ .source = &rows }, .settle_fn = &settle, .decode_ids = 4, .exact_rows = exact };
+    }
+};
+
+fn testAffine(g: *Graph, prng: *std.Random.DefaultPrng, out: c_int, in: c_int) !Linear {
+    const buf = try g.a.alloc(f32, @intCast(out * in));
+    defer g.a.free(buf);
+    for (buf) |*v| v.* = prng.random().floatNorm(f32) * 0.05;
+    var q = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(q);
+    try mlx.check(mlx.mlx_quantize(&q, try g.astype(try g.fromSlice(f32, buf, &.{ out, in }), .bfloat16), mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, g.s));
+    var parts: [3]Array = undefined;
+    for (&parts, 0..) |*p, i| {
+        var t = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&t, q, i));
+        p.* = try g.adopt(t);
+    }
+    return .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = 4, .group_size = 64 };
+}
+
+test "moe: mlpRows over a streamed source gives each row its one-row mlp's bytes, the source called a lane at a time only where it declares the lane exact" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const testing = std.testing;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(5);
+    const D = 128;
+    const E = 8;
+    const S = 5;
+    var router: [D * E]f32 = @splat(0);
+    for (&router) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    var bias: [E]f32 = @splat(0);
+    for (&bias) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    const unbuilt: Bank = .{ .w = .{ .ctx = null }, .qp = .{ .bits = 4, .group_size = 64 } };
+    var w: Moe.Weights = .{
+        .router = .{ .w = try g.astype(try g.fromSlice(f32, &router, &.{ D, E }), .bfloat16) },
+        .route = .{ .sigmoid_bias = .{ .expert_bias = try g.fromSlice(f32, &bias, &.{E}), .norm = true, .scale = 2.5 } },
+        .gate = unbuilt,
+        .up = unbuilt,
+        .down = unbuilt,
+        .shared = .{ .gate = try testAffine(&g, &prng, 64, D), .up = try testAffine(&g, &prng, 64, D), .down = try testAffine(&g, &prng, D, 64) },
+        .top_k = 2,
+        .experts = E,
+        .streamed = .{ .routed = RowsSource.of(false), .layer = 0 },
+    };
+    var xbuf: [S * D]f32 = @splat(0);
+    for (&xbuf) |*v| v.* = prng.random().floatNorm(f32);
+    const x = try g.astype(try g.fromSlice(f32, &xbuf, &.{ 1, S, D }), .bfloat16);
+    // Each want row from a buffer of its own, through the one-row mlp a serial decode step runs.
+    var want: [S]Array = undefined;
+    for (&want, 0..) |*o, r| o.* = try mlp(&w, &g, try g.astype(try g.fromSlice(f32, xbuf[r * D ..][0..D], &.{ 1, 1, D }), .bfloat16));
+    const all = try g.concat(&want, 1);
+    // A lane of 4 ids at top-2 is 2 rows: 5 rows in calls of 2, 2 and 1 where declared exact, else 5 calls of one.
+    for ([_]bool{ false, true }) |exact| {
+        w.streamed = .{ .routed = RowsSource.of(exact), .layer = 0 };
+        RowsSource.calls = 0;
+        RowsSource.widest = 0;
+        try ops.expectBitEqual(try mlpRows(&w, &g, x), all);
+        try testing.expectEqual(@as(u32, if (exact) 3 else S), RowsSource.calls);
+        try testing.expectEqual(@as(c_int, if (exact) 2 else 1), RowsSource.widest);
     }
 }
