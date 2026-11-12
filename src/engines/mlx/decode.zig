@@ -381,6 +381,7 @@ fn runSingleDecodeTickInner(sch: *Scheduler, slot: *Slot) !void {
 
 test "single MTP slot reaches the round entry through runDecodeTick" {
     var xfm: @import("../../plugins/qwen4_exp/trunk.zig").Trunk = undefined;
+    xfm.outside = null;
     var model: model_registry_mod.LoadedModel = undefined;
     model.transformer = null;
     var gen: Generator = undefined;

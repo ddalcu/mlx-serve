@@ -217,7 +217,6 @@ pub const ParseError = error{
     InvalidQwen4PleGeometry,
     InvalidQwen4Indexer,
     InvalidTrunkQuant,
-    UnsupportedNgramTableFormat,
     InvalidNgramTableFile,
     /// A shape this plugin does not serve yet (the legacy path keeps it).
     Unsupported,
@@ -423,12 +422,13 @@ pub fn parseJson(c: *Config, outer: std.json.ObjectMap) ParseError!void {
     }
 }
 
-/// The pack's `ngram_table` block: the file holding its n-gram rows and their format. Only `exl3_ngram_trellis`
-/// (`NgramTable`'s trellis arm) is read; another format is refused by name.
+/// The pack's `ngram_table` block when it names `exl3_ngram_trellis` (`NgramTable`'s trellis arm): the file holding
+/// its rows. Any other block (an MLX pack's affine table: `ngram_table.bin`, read as before) is left as the base
+/// parse leaves it.
 fn parseNgramTable(c: *Config, v: std.json.Value) ParseError!void {
-    if (v != .object) return error.InvalidConfigField;
-    const fmt = field(v.object, "format") orelse return error.UnsupportedNgramTableFormat;
-    if (fmt != .string or !std.mem.eql(u8, fmt.string, "exl3_ngram_trellis")) return error.UnsupportedNgramTableFormat;
+    if (v != .object) return;
+    const fmt = field(v.object, "format") orelse return;
+    if (fmt != .string or !std.mem.eql(u8, fmt.string, "exl3_ngram_trellis")) return;
     const file = field(v.object, "file") orelse return error.InvalidNgramTableFile;
     if (file != .string) return error.InvalidNgramTableFile;
     // A name in the pack's own folder: no separator, no parent.
@@ -873,7 +873,7 @@ test "qwen4_exp config: a bad bound is refused by name, another family's key is 
     try testing.expectEqual(abi.Verdict.Code.unsupported, parse(&dir, .of(tiny_text), .{}, &.{ .first = 0, .count = 2 }, true, &p).code);
 }
 
-test "qwen4_exp config: a K pack's trunk_quant and trellis n-gram table parse; another table format or a path is refused by name" {
+test "qwen4_exp config: a K pack's trunk_quant and trellis n-gram table parse; an MLX pack's table parses as before; a path is refused by name" {
     const k_pack = "{\"trunk_quant\":{\"format\":\"exl3\"},\"expert_quant\":{\"format\":\"exl3\",\"k\":5,\"codebook\":\"mul1\"}," ++
         "\"ngram_table\":{\"file\":\"ngram_embedding.safetensors\",\"format\":\"exl3_ngram_trellis\",\"k\":6}," ++ tiny_text[1..];
     const c = try parseOk(k_pack);
@@ -884,11 +884,15 @@ test "qwen4_exp config: a K pack's trunk_quant and trellis n-gram table parse; a
     defer gpa.destroy(plain);
     try testing.expect(!plain.trunk_quant);
     try testing.expectEqualStrings("ngram_table.bin", plain.ngramTableFile());
+    // An MLX pack's affine table (the iQ-MLX packs: file, bits, group_size, no format) parses as the base parse did.
+    inline for (.{ "{\"ngram_table\":{\"file\":\"ngram_table.bin\",\"bits\":4,\"group_size\":32},", "{\"ngram_table\":{\"file\":\"t.bin\",\"format\":\"affine\"}," }) |mlx_table| {
+        const m = try parseOk(mlx_table ++ tiny_text[1..]);
+        defer gpa.destroy(m);
+        try testing.expectEqualStrings("ngram_table.bin", m.ngramTableFile());
+    }
     const mem: fixture.MemDir = .{ .files = &.{} };
     const dir = mem.packDir();
     inline for (.{
-        .{ "{\"ngram_table\":{\"file\":\"t.bin\",\"format\":\"affine\"},", "UnsupportedNgramTableFormat" },
-        .{ "{\"ngram_table\":{\"file\":\"t.bin\"},", "UnsupportedNgramTableFormat" },
         .{ "{\"ngram_table\":{\"file\":\"../t.bin\",\"format\":\"exl3_ngram_trellis\"},", "InvalidNgramTableFile" },
         .{ "{\"trunk_quant\":\"exl3\",", "InvalidTrunkQuant" },
     }) |bad| {

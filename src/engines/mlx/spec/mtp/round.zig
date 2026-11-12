@@ -847,6 +847,7 @@ test "qwen4: the coarse rerank head is READY before any draft has run" {
     var fx = try @import("../mtp_test.zig").RerankFixture.init(s, mtp_mod.TOP32_MIN_ROWS + 96, 256, 8, 64, 0xC0DE);
     defer fx.deinit();
     var t: Qwen4Trunk = undefined;
+    t.outside = null;
     t.config = fx.xfm.config;
     t.s = s;
     t.lm_head_w = fx.xfm.lm_head_w;
@@ -989,6 +990,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
     xfm.config = .{};
     xfm.s = s;
     var trunk: Qwen4Trunk = undefined;
+    trunk.outside = null;
     trunk.s = s;
     trunk.qwen4_mtp = null;
     var state: Qwen4MtpState = undefined;
@@ -1027,6 +1029,7 @@ test "MTP continuation releases its owned chain when drafting fails" {
 test "batched MTP state includes the last row activated by round begin" {
     const allocator = testing.allocator;
     var xfm: Qwen4Trunk = undefined;
+    xfm.outside = null;
     xfm.qwen4_mtp_owner = null;
     var head: Qwen4Mtp = undefined;
     head.cache = try KVCache.init(allocator, 1);

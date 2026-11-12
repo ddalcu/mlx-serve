@@ -324,6 +324,7 @@ test "trunk qmatmul: a ternary 2-bit pack routes through qmv2; without the flag 
     @import("../../../mlx/device.zig").device_gen_override = .{ .gen = 13, .phone = false };
     defer @import("../../../mlx/device.zig").device_gen_override = null;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.bits_cache = .{};
     xfm.config = std.mem.zeroes(@TypeOf(xfm.config));

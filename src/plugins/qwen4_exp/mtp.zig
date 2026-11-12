@@ -1121,6 +1121,7 @@ test "qwen4 MTP head: two explicit states with different origins and stash lengt
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.qwen4_mtp_owner = null;
@@ -1176,6 +1177,7 @@ test "qwen4 MTP head: two requests keep their own state through activate/release
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     xfm.qwen4_mtp_owner = null;
@@ -1760,6 +1762,7 @@ test "qwen4 MTP head: a clamp below the raw ring is named, not an emptied histor
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1832,6 +1835,7 @@ test "qwen4 MTP head: a warm clamp restores exactly from the leftover marked at 
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -1934,6 +1938,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -2020,6 +2025,7 @@ test "qwen4 MTP head: a clamp whose retained ring is shorter than the kept lefto
 test "qwen4MtpResetOwned: a non-MTP request leaves the head untouched" {
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = mlx.gpuStream();
     xfm.allocator = t.allocator;
     const head_cache = try KVCache.init(t.allocator, 1);
@@ -2147,6 +2153,7 @@ test "qwen4 MTP head: last-row and no-logits projections match the full block (Q
 test "qwen4 MTP head KV: the head cache is rebuilt under the scheme it is handed" {
     const t = std.testing;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.config = .{};
     xfm.config.num_hidden_layers = 4;
     xfm.config.head_dim = 64;
@@ -2384,6 +2391,7 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
     defer ssmSnapshotDeinit(&aux);
 
     var xfm: Trunk = undefined;
+    xfm.outside = null;
 
     xfm.allocator = allocator;
     xfm.s = mlx.mlx_default_cpu_stream_new();
@@ -2417,6 +2425,7 @@ test "qwen4 MTP adopt rejects a negative origin before mutating nonempty state" 
 
 test "single-stream verify feature selection excludes prefill and ordinary decoding" {
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     const old_features = verify_projection.single_verify_test_features;
     defer verify_projection.single_verify_test_features = old_features;
     verify_projection.single_verify_test_features = @splat(true);
