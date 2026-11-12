@@ -261,6 +261,7 @@ pub fn init(
         .gguf_ctx_size = params.ctx_size,
         .prefix_cache_capacity = params.prefix_cache_capacity,
         .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
+        .memory_pressure = .{ .enabled = !env.present(.MLX_SERVE_PREFIX_CACHE_PRESSURE) or env.on(.MLX_SERVE_PREFIX_CACHE_PRESSURE) },
         .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = if (params.prefix_cache_clamp) &@import("admission/hot_cache_plan.zig").prefixCacheMemForLoad else null,
         .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
