@@ -2924,6 +2924,8 @@ test "dist N-rank: each of four Macs bills a quarter of a tensor split, plus the
 }
 
 test "dist N-rank: tensor DSpark stages split only when the pack declares and ships them and they are wanted" {
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, null);
+    defer ds.restore();
     const io = std.testing.io;
     const v41 = @import("../../../plugins/deepseek_v41/config.zig");
     var tmp = std.testing.tmpDir(.{});
