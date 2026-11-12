@@ -25,6 +25,7 @@ The model plugin table (`ModelTable`) and every struct that crosses it. Extern l
 | `version` | `u32 = 1` |  |
 | `Handle` | `?*anyopaque` | An object the engine owns and the plugin only passes back (a slot's KV cache): opaque until P3 types it. |
 | `max_eos` | `16` |  |
+| `stream_room_cell` | `u64 = 16_384 + 1_024` | The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell. |
 | `max_round_tokens` | `32` | The most tokens a native drafter's round commits (`Round.tokens`). |
 
 ### `LayerSpan` (extern struct)
@@ -485,6 +486,8 @@ Valid during `load` only: the model keeps none of its pointers.
 | `tp_size` | `u32` | `0` |  |
 | `stream_room_decode` | `u64` | `0` | GPU bytes a streamed bank may fill in the decode phase: the GPU ceiling less the decode phase's bill at 16K + 1K and the wired margin; 0 = the host has none (`decodeRoom`). |
 | `gpu_ceiling_bytes` | `u64` | `0` | The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown. |
+| `stream_grow_prompt` | `u64` | `0` | Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank calibrated at the cell gives up for a longer context; 0 = none or unknown. |
+| `stream_grow_decode` | `u64` | `0` |  |
 
 ### `Mode` (enum(u8))
 

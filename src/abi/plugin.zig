@@ -403,6 +403,10 @@ pub const LoadCtx = extern struct {
     stream_room_decode: u64 = 0,
     /// The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown.
     gpu_ceiling_bytes: u64 = 0,
+    /// Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank
+    /// calibrated at the cell gives up for a longer context; 0 = none or unknown.
+    stream_grow_prompt: u64 = 0,
+    stream_grow_decode: u64 = 0,
 
     /// The decode phase's room: `stream_room_decode`, or `stream_room` from a host that sets none or predates it.
     pub fn decodeRoom(c: *const LoadCtx) u64 {
@@ -414,7 +418,15 @@ pub const LoadCtx = extern struct {
         if (c.size < @offsetOf(LoadCtx, "gpu_ceiling_bytes") + @sizeOf(u64)) return 0;
         return c.gpu_ceiling_bytes;
     }
+    /// The bills' growth past the cell (`stream_grow_prompt`, `stream_grow_decode`), 0s from a host that predates it.
+    pub fn streamGrowth(c: *const LoadCtx) struct { prompt: u64, decode: u64 } {
+        if (c.size < @offsetOf(LoadCtx, "stream_grow_decode") + @sizeOf(u64)) return .{ .prompt = 0, .decode = 0 };
+        return .{ .prompt = c.stream_grow_prompt, .decode = c.stream_grow_decode };
+    }
 };
+
+/// The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell.
+pub const stream_room_cell: u64 = 16_384 + 1_024;
 
 test "abi plugin: LoadCtx's decode room and ceiling read past an older host's struct as its prompt room and 0" {
     const dir: PackDir = undefined;
@@ -425,6 +437,11 @@ test "abi plugin: LoadCtx's decode room and ceiling read past an older host's st
     c.stream_room_decode = 0;
     try std.testing.expectEqual(@as(u64, 50), c.decodeRoom());
     c.stream_room_decode = 70;
+    c.stream_grow_prompt = 3;
+    c.stream_grow_decode = 4;
+    try std.testing.expectEqual(@as(u64, 4), c.streamGrowth().decode);
+    c.size = @offsetOf(LoadCtx, "stream_grow_prompt");
+    try std.testing.expectEqual(@as(u64, 0), c.streamGrowth().prompt);
     c.size = @offsetOf(LoadCtx, "stream_room_decode");
     try std.testing.expectEqual(@as(u64, 50), c.decodeRoom());
     try std.testing.expectEqual(@as(u64, 0), c.gpuCeiling());

@@ -1060,7 +1060,8 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
 /// The bank's per-phase fit (`outside_model.Fit`): the host's prompt and decode rooms, and the pack's measured
 /// calibration (`bank-fit.json`) when it names this ceiling and reaches the server's context; the bills otherwise.
 fn bankFit(ctx: *const abi.LoadCtx) outside_model.Fit {
-    var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom() };
+    const grow = ctx.streamGrowth();
+    var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom(), .grow_prompt = grow.prompt, .grow_decode = grow.decode };
     if (!ctx.dir.has(outside_model.bank_fit_file)) return fit;
     var buf: [4096]u8 = undefined;
     var why: abi.Verdict = .ok;
@@ -1068,15 +1069,11 @@ fn bankFit(ctx: *const abi.LoadCtx) outside_model.Fit {
         log.warn("glm5_next: {s} does not read ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, why.why.slice() });
         return fit;
     };
-    const S = struct { ctx_size: u64 = 0 };
-    var sbuf: [1024]u8 = undefined;
-    var fba = std.heap.FixedBufferAllocator.init(&sbuf);
-    const context: u64 = if (std.json.parseFromSliceLeaky(S, fba.allocator(), ctx.settings_json.slice(), .{ .ignore_unknown_fields = true })) |st| st.ctx_size else |_| 0;
-    fit.calibration = outside_model.parseBankFit(text, ctx.gpuCeiling(), if (context == 0) std.math.maxInt(u64) else context) catch |e| {
+    fit.calibration = outside_model.parseBankFit(text, ctx.gpuCeiling(), abi.stream_room_cell) catch |e| {
         log.warn("glm5_next: {s} not applied ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, @errorName(e) });
         return fit;
     };
-    log.info("glm5_next: the bank fits by {s} (ceiling {d} MiB, context {d})\n", .{ outside_model.bank_fit_file, fit.calibration.?.ceiling >> 20, fit.calibration.?.context });
+    log.info("glm5_next: the bank fits by {s} (ceiling {d} MiB; the bills' growth past its {d}-token cell {d} / {d} MiB)\n", .{ outside_model.bank_fit_file, fit.calibration.?.ceiling >> 20, fit.calibration.?.cell, grow.prompt >> 20, grow.decode >> 20 });
     return fit;
 }
 

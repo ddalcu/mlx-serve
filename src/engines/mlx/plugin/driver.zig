@@ -181,24 +181,28 @@ fn streamRoomDecode(config: *const ModelConfig) u64 {
         @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
-fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
-    const b = config.plugin orelse return 0;
-    if (!b.parsed.caps.streamed_weights or !config.isGlm5()) return 0;
+/// Whether the engine bills this model's decode phase apart (a built-in GLM on a streamed plugin that prices no prompt
+/// of its own: a plugin that does keeps one room).
+fn decodeBilled(config: *const ModelConfig) bool {
+    const b = config.plugin orelse return false;
+    if (!b.parsed.caps.streamed_weights or !config.isGlm5()) return false;
     var bill: abi.Bill = .{};
-    b.table.bill(&b.parsed, &.{ .context = 16_384 + 1_024 }, &bill);
-    // A plugin that prices its own prompt keeps one room; the built-in GLM's decode bill is the engine's.
-    if (bill.prefill_bytes != null) return 0;
-    const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(config, 16_384 + 1_024, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
+    b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
+    return bill.prefill_bytes == null;
+}
+
+fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
+    if (!decodeBilled(config)) return 0;
+    const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(config, abi.stream_room_cell, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
     // The MTP bind's coarse head, built after the bank opens, is resident in decode too.
     const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(config, false);
     return ceiling -| need -| coarse -| margin;
 }
 
-fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
-    const seq = 16_384 + 1_024;
-    // The widest chunk the engine runs for this model (`total_ctx = 0`, as the context sizer bills it): an explicit
-    // `--prefill-chunk`, else the default, never past `prefillChunkMax`.
-    const chunk: u32 = @intCast(config.cappedPrefillChunk(@import("../generate/prefill_chunk.zig").effectivePrefillChunk(
+/// The widest chunk the engine runs for this model (`total_ctx = 0`, as the context sizer bills it): an explicit
+/// `--prefill-chunk`, else the default, never past `prefillChunkMax`.
+fn roomChunk(config: *const ModelConfig) u32 {
+    return @intCast(config.cappedPrefillChunk(@import("../generate/prefill_chunk.zig").effectivePrefillChunk(
         config.prefillScoreHeadDim(),
         config.num_attention_heads,
         0,
@@ -207,15 +211,40 @@ fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
         config.longCtxGated(),
         config.pinned_prefill_chunk,
     )));
-    const b = config.plugin orelse return 0;
-    if (!b.parsed.caps.streamed_weights) return 0;
+}
+
+/// A streamed plugin's prompt bill for a `seq`-token request at `chunk`: its own term, or a built-in GLM's engine bill
+/// (`glm5PrefillMemoryNeeded`); null for a model with neither.
+fn streamPromptNeed(config: *const ModelConfig, seq: u64, chunk: u32) ?u64 {
+    const b = config.plugin orelse return null;
+    if (!b.parsed.caps.streamed_weights) return null;
     var bill: abi.Bill = .{};
     b.table.bill(&b.parsed, &.{ .context = seq }, &bill);
-    // A built-in GLM's prompt is the engine's bill (`glm5PrefillMemoryNeeded`), not a plugin term.
-    const need = if (bill.prefill_bytes) |prefill| prefill(&b.parsed, seq, chunk, 16, 0) else if (config.isGlm5())
-        @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, seq, 1, 16, chunk, .{})
+    if (bill.prefill_bytes) |prefill| return prefill(&b.parsed, seq, chunk, 16, 0);
+    if (config.isGlm5()) return @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, seq, 1, 16, chunk, .{});
+    return null;
+}
+
+/// Each phase's bill growth from the rooms' cell to the context limit (`LoadCtx.stream_grow_*`): a prompt that fills
+/// the limit less one reply token, against the cell. The decode growth is a built-in GLM's (its decode room's bill).
+fn streamGrowAt(config: *const ModelConfig) struct { prompt: u64, decode: u64 } {
+    const cell = abi.stream_room_cell;
+    const limit: u64 = @import("../admission/context.zig").getEffectiveContextLength(config);
+    if (limit <= cell) return .{ .prompt = 0, .decode = 0 };
+    const chunk = roomChunk(config);
+    const p0 = streamPromptNeed(config, cell, chunk) orelse return .{ .prompt = 0, .decode = 0 };
+    const p1 = streamPromptNeed(config, limit - 1, chunk) orelse return .{ .prompt = 0, .decode = 0 };
+    const glm = @import("../admission/glm5_bill.zig");
+    const wide = @import("../generate.zig").WIDE_PREFILL_CHUNK;
+    const decode = if (decodeBilled(config))
+        glm.glm5DecodeMemoryNeeded(config, limit - 1, 1, 16, wide) -| glm.glm5DecodeMemoryNeeded(config, cell, 1, 16, wide)
     else
-        return 0;
+        0;
+    return .{ .prompt = p1 -| p0, .decode = decode };
+}
+
+fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
+    const need = streamPromptNeed(config, abi.stream_room_cell, roomChunk(config)) orelse return 0;
     // The MTP bind's coarse head is built after the bank opens: the room leaves it.
     const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(config, false);
     return ceiling -| need -| coarse -| margin;
@@ -343,6 +372,30 @@ test "driver: a streamed built-in GLM's decode room is the ceiling less the engi
     try std.testing.expectEqual((64 << 30) - need - coarse - (1 << 30), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
 }
 
+test "driver: a streamed built-in GLM's bills grow from the rooms' cell to its context limit, and not below the cell" {
+    const Probe = struct {
+        fn empty(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{};
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.empty;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    cfg.pinned_context = 32_768;
+    const glm = @import("../admission/glm5_bill.zig");
+    const chunk = roomChunk(&cfg);
+    const wide = @import("../generate.zig").WIDE_PREFILL_CHUNK;
+    const g = streamGrowAt(&cfg);
+    try std.testing.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, chunk, .{}), g.prompt);
+    try std.testing.expectEqual(glm.glm5DecodeMemoryNeeded(&cfg, 32_767, 1, 16, wide) - glm.glm5DecodeMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, wide), g.decode);
+    try std.testing.expect(g.prompt > 0 and g.decode > 0);
+    cfg.pinned_context = 16_384;
+    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg).prompt);
+    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg).decode);
+}
+
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
     var cfg = ModelConfig{};
     cfg.legacy.caps.owns_decode_state = true;
@@ -409,6 +462,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
     var settings_buf: [128]u8 = undefined;
+    const grow = streamGrowAt(config);
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
@@ -419,6 +473,8 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .weights = if (lend) &src else null,
         .stream_room = streamRoom(config),
         .stream_room_decode = streamRoomDecode(config),
+        .stream_grow_prompt = grow.prompt,
+        .stream_grow_decode = grow.decode,
         .gpu_ceiling_bytes = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},
