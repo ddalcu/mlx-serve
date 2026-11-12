@@ -225,11 +225,11 @@ fn streamPromptNeed(config: *const ModelConfig, seq: u64, chunk: u32) ?u64 {
     return null;
 }
 
-/// Each phase's bill growth from the rooms' cell to the context limit (`LoadCtx.stream_grow_*`): a prompt that fills
-/// the limit less one reply token, against the cell. The decode growth is a built-in GLM's (its decode room's bill).
-fn streamGrowAt(config: *const ModelConfig) struct { prompt: u64, decode: u64 } {
+/// Each phase's bill growth from the rooms' cell to the context limit `limit` (`LoadCtx.stream_grow_*`; the load passes
+/// the server's, `getEffectiveContextLength`): a prompt that fills the limit less one reply token, against the cell. The
+/// decode growth is a built-in GLM's (its decode room's bill).
+fn streamGrowAt(config: *const ModelConfig, limit: u64) struct { prompt: u64, decode: u64 } {
     const cell = abi.stream_room_cell;
-    const limit: u64 = @import("../admission/context.zig").getEffectiveContextLength(config);
     if (limit <= cell) return .{ .prompt = 0, .decode = 0 };
     const chunk = roomChunk(config);
     const p0 = streamPromptNeed(config, cell, chunk) orelse return .{ .prompt = 0, .decode = 0 };
@@ -383,17 +383,16 @@ test "driver: a streamed built-in GLM's bills grow from the rooms' cell to its c
     var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
     var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
     cfg.plugin = &binding;
-    cfg.pinned_context = 32_768;
     const glm = @import("../admission/glm5_bill.zig");
     const chunk = roomChunk(&cfg);
     const wide = @import("../generate.zig").WIDE_PREFILL_CHUNK;
-    const g = streamGrowAt(&cfg);
+    // The limit is the caller's: the server's own (`getEffectiveContextLength`) reads process state other tests set.
+    const g = streamGrowAt(&cfg, 32_768);
     try std.testing.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, chunk, .{}), g.prompt);
     try std.testing.expectEqual(glm.glm5DecodeMemoryNeeded(&cfg, 32_767, 1, 16, wide) - glm.glm5DecodeMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, wide), g.decode);
     try std.testing.expect(g.prompt > 0 and g.decode > 0);
-    cfg.pinned_context = 16_384;
-    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg).prompt);
-    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg).decode);
+    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, 16_384).prompt);
+    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, abi.stream_room_cell).decode);
 }
 
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
@@ -462,7 +461,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
     var settings_buf: [128]u8 = undefined;
-    const grow = streamGrowAt(config);
+    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config));
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
