@@ -579,7 +579,7 @@ pub const Table = struct {
         errdefer gpa.free(sc);
         const bi = try gpa.alignedAlloc(u8, .@"4", if (self.mode == .affine) n * self.slen else 0);
         errdefer gpa.free(bi);
-        const job: Job = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
+        var job: Job = .{ .t = self, .ids = ids, .w = w, .s = sc, .b = bi };
         if (builtin.os.tag.isDarwin() and n <= GCD_ROWS) {
             // a decode token's or verify's rows wait at the first Engram layer while the GPU idles: the
             // rows the LRU holds copied out of it, the others read on its pool.
@@ -603,7 +603,7 @@ pub const Table = struct {
 
     /// `job`'s rows (at most `GCD_ROWS`) the LRU holds copied out of it, the others read on the LRU's
     /// pool, each read (a repacked table's record, else a row's codes, scales or biases) a work item, then put in the LRU.
-    fn readHeld(self: *const Table, job: *const Job) !void {
+    fn readHeld(self: *const Table, job: *Job) !void {
         const n = job.ids.len;
         const bl: usize = if (self.mode == .affine) self.slen else 0;
         const parts: usize = if (self.records()) 1 else if (self.mode == .affine) 3 else 2;
@@ -628,8 +628,8 @@ pub const Table = struct {
     /// `ids`' rows into `w`, `s` and `b` (`Table.read`'s layout), a row a GCD work item; false on a failed read.
     fn readInto(ctx: *const anyopaque, ids: []const u32, w: []u8, s: []u8, b: []u8) bool {
         const self: *const Table = @ptrCast(@alignCast(ctx));
-        const job: Job = .{ .t = self, .ids = ids, .w = w, .s = s, .b = b };
-        dispatch_apply_f(ids.len, dispatch_get_global_queue(qos_user_initiated, 0), @constCast(&job), Job.applyOne);
+        var job: Job = .{ .t = self, .ids = ids, .w = w, .s = s, .b = b };
+        dispatch_apply_f(ids.len, dispatch_get_global_queue(qos_user_initiated, 0), &job, Job.applyOne);
         return !job.bad.load(.acquire);
     }
     /// The first `n` rows of `raw` dequantized: f32 `[n, head_dim]` (caller frees).
@@ -695,17 +695,17 @@ pub const Table = struct {
         bad: std.atomic.Value(bool) = .init(false),
 
         fn applyOne(ctx: ?*anyopaque, i: usize) callconv(.c) void {
-            const job: *const Job = @ptrCast(@alignCast(ctx.?));
+            const job: *Job = @ptrCast(@alignCast(ctx.?));
             _ = job.run(i, job.ids.len);
         }
 
-        fn runVoid(self: *const Job, first: usize, stride: usize) void {
+        fn runVoid(self: *Job, first: usize, stride: usize) void {
             _ = self.run(first, stride);
         }
         /// one read of the job's rows at `pos`, a work item of the LRU's pool: item `i` is
         /// row `pos[i / parts]`'s record (a repacked table, `parts` 1), else its codes, scales or biases (`i % parts`).
         const Parts = struct {
-            job: *const Job,
+            job: *Job,
             pos: []const u32,
             parts: usize,
             fn one(ctx: *const anyopaque, i: usize) void {
@@ -715,7 +715,7 @@ pub const Table = struct {
                 const k: usize = p.pos[i / p.parts];
                 const r: u64 = j.ids[k];
                 const part = i % p.parts;
-                if (!(r < t.rows and readPart(t, j, k, r, part))) @constCast(&j.bad).store(true, .release);
+                if (!(r < t.rows and readPart(t, j, k, r, part))) j.bad.store(true, .release);
             }
             /// Row `r`'s read `part` into the job's row `k`: a repacked table's record (`records`), its codes then its
             /// scales, in one read; else its codes, scales or biases.
@@ -730,7 +730,7 @@ pub const Table = struct {
         };
         /// Every `stride`-th row from `first`, read past the page cache: preads run in parallel where faults on one
         /// mapping would serialize.
-        fn run(self: *const Job, first: usize, stride: usize) bool {
+        fn run(self: *Job, first: usize, stride: usize) bool {
 
             const t = self.t;
             const rec = t.records();
@@ -740,7 +740,7 @@ pub const Table = struct {
                 if (rec) {
                     // a repacked table: the row's record, its codes then its scales, in one read
                     if (r >= t.rows or !edir.readRecord(t.fd, self.w[i * t.wlen ..][0..t.wlen], self.s[i * t.slen ..][0..t.slen], t.w_off + r * t.w_stride)) {
-                        @constCast(&self.bad).store(true, .release);
+                        self.bad.store(true, .release);
                         return false;
                     }
                     continue;
@@ -750,7 +750,7 @@ pub const Table = struct {
                     !edir.readRow(t.fd, self.s[i * t.slen ..][0..t.slen], t.s_off + r * t.s_stride) or
                     (t.mode == .affine and !edir.readRow(t.fd, self.b[i * t.slen ..][0..t.slen], t.b_off + r * t.s_stride)))
                 {
-                    @constCast(&self.bad).store(true, .release);
+                    self.bad.store(true, .release);
                     return false;
                 }
             }
