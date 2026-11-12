@@ -25,7 +25,7 @@ BINARY="${MLX_SERVE_BINARY:-${BINARY:-./zig-out/bin/mlx-serve}}"
 BASE="http://127.0.0.1:$PORT"
 CACHE_ENTRIES="${PRESSURE_CACHE_ENTRIES:-4}"
 CACHE_MB="${PRESSURE_CACHE_MB:-256}"
-CTX_SIZE="${PRESSURE_CTX_SIZE:-8192}"
+CTX_SIZE="${PRESSURE_CTX_SIZE:-32768}"
 FILL_REQS="${PRESSURE_FILL_REQS:-5}"
 PROMPT_WORDS="${PRESSURE_PROMPT_WORDS:-900}"
 ON_WAIT_SECS="${PRESSURE_ON_WAIT_SECS:-25}"
@@ -107,6 +107,7 @@ check_port_free() {
     python3 - "$PORT" <<'PY' || fail "port $PORT is already in use"
 import socket, sys
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 try:
     sock.bind(("127.0.0.1", int(sys.argv[1])))
 except OSError:
