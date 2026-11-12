@@ -62,15 +62,23 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
 }
 
 /// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored (a streaming pack's bank
-/// is its outside plugin's bill).
+/// is its outside plugin's bill), plus a streaming pack's draft readout (`draftReadoutBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const c = config.of(p);
-    out.* = shards;
+    out.* = shards + draftReadoutBytes(c);
     if (c.expert_quant_json.len == 0) return .ok;
     const io = std.Io.Threaded.global_single_threaded.io();
     out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers, .kv_lora_rank = c.dsa_kv_lora_rank }) catch |e|
         return Verdict.named(.failed, @errorName(e));
+    out.* += draftReadoutBytes(c);
     return .ok;
+}
+
+/// The MTP drafts' readout a GLM streaming pack lends (`trunk.draftReadout`, at `trunk.readoutBits`), as
+/// bailing_hybrid bills its own. An upper bound: the load builds it only when the outside plugin runs the head.
+pub fn draftReadoutBytes(c: *const config.Config) u64 {
+    if (!c.streamed_bank or !c.isGlm5()) return 0;
+    return trunk.draftReadoutBytes(c.vocab_size, c.hidden_size, trunk.readoutBits(c));
 }
 
 /// A Sushi GLM tensor as the load holds it: the vision tower and the EXL3 MTP layer past the trunk not at all, the
@@ -214,6 +222,13 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 }
 
 // ── tests ──
+
+test "glm5_next resident bill: a GLM streaming pack bills its 8-bit draft readout, 643 MiB at GLM-5.3-Flash's head" {
+    var c: config.Config = .{ .model_type = "glm5_next", .vocab_size = 154880, .hidden_size = 4096, .streamed_bank = true };
+    try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(&c));
+    c.streamed_bank = false;
+    try std.testing.expectEqual(@as(u64, 0), draftReadoutBytes(&c));
+}
 
 test {
     _ = config;
