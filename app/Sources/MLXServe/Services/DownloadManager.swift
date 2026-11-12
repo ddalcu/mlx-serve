@@ -2201,7 +2201,12 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        return Self.markingInFlight(out, activeDirs: inputs.inFlightDirs)
+        var seenPaths = Set<String>()
+        let unique = out.filter {
+            seenPaths.insert(URL(fileURLWithPath: $0.path).resolvingSymlinksInPath().standardizedFileURL.path).inserted
+        }
+
+        return Self.markingInFlight(unique, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.
