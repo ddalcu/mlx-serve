@@ -433,6 +433,14 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
             free(e.spec_state_seq);
             e.spec_state_seq = r.state_seq;
         }
+    } else if (verify_rows and switchOn(.MLX_SERVE_GLM_KDA_LAZY_SEQ)) {
+        const r = try kda_verify.captureLazy(s, .{ q_scaled, k_scaled, v_heads, g, beta, e.ssm_state, T_scalar }, in_dtype, out_dtype, num_k_heads, num_v_heads, dk, dv, batch, seq_len);
+        _ = mlx.mlx_array_free(y_bthd);
+        y_bthd = r.y;
+        free(e.spec_state_seq);
+        e.spec_state_seq = r.state_seq;
+        _ = mlx.mlx_array_free(e.ssm_state);
+        e.ssm_state = r.state;
     } else if (capture) {
         // Per-row states for rollback: state_seq [T, B, Hv, Dv, Dk] (its last row unwritten), the final state its
         // own output.
@@ -528,7 +536,7 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     return outProj(m, la, out_flat, given != null);
 }
 
-fn templateArgs(kcfg: mlx.mlx_fast_metal_kernel_config, in_dt: mlx.mlx_dtype, st_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, dk: c_int, dv: c_int, hk: c_int, hv: c_int) !void {
+pub fn templateArgs(kcfg: mlx.mlx_fast_metal_kernel_config, in_dt: mlx.mlx_dtype, st_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, dk: c_int, dv: c_int, hk: c_int, hv: c_int) !void {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "InT", in_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "StT", st_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "OutT", out_dt));

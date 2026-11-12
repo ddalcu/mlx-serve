@@ -1,16 +1,19 @@
 //! GLM-5.3-Flash's KDA verify rows that the joined decode step leaves to the op chain (a pack without the row-joined
-//! projection, or gates it does not take): the bounded gate in one launch (exp(A_log) in it too) and the capture's
-//! conv input. kda.zig runs them with the packed prework and the norm-gate epilogue; each is the chain's bytes.
+//! projection, or gates it does not take): the bounded gate in one launch (exp(A_log) in it too), the capture's conv
+//! input, and the per-row states as a launch MLX runs only when a rollback reads them. kda.zig runs them with the
+//! packed prework and the norm-gate epilogue; each is the chain's bytes.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const log = @import("../../sdk/util/log.zig");
+const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
+const kda = @import("kda.zig");
 
 const Array = mlx.mlx_array;
 
 /// The verify pieces that ran since the load (the tests read them).
-pub const Runs = struct { prework: u64 = 0, gate: u64 = 0, normgate: u64 = 0, expsig: u64 = 0 };
+pub const Runs = struct { prework: u64 = 0, gate: u64 = 0, normgate: u64 = 0, expsig: u64 = 0, lazy: u64 = 0 };
 pub var runs: Runs = .{};
 
 fn free(a: Array) void {
@@ -110,13 +113,68 @@ pub fn convInput(s: mlx.mlx_stream, window: Array, qkv: Array) !Array {
     return out;
 }
 
+pub const Lazy = struct { y: Array, state: Array, state_seq: Array };
+var lazy_said = false;
+
+/// kda.zig's capture branch as two launches over its inputs (q, k, v, the gate, beta, the state, T): y and the final
+/// state from the stock recurrence (the capture text without its per-row stores, so the same bits), and the per-row
+/// states [T, B, Hv, Dv, Dk] from the capture launch, kept alone: MLX runs it only when a rollback reads them.
+pub fn captureLazy(s: mlx.mlx_stream, ins: [7]Array, in_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, hk: c_int, hv: c_int, dk: c_int, dv: c_int, batch: c_int, rows: c_int) !Lazy {
+    const st_dt = mlx.mlx_array_dtype(ins[5]);
+    const y_shape = [_]c_int{ batch, rows, hv, dv };
+    const st_shape = [_]c_int{ batch, hv, dv, dk };
+    var out: Lazy = .{ .y = mlx.mlx_array_new(), .state = mlx.mlx_array_new(), .state_seq = mlx.mlx_array_new() };
+    errdefer inline for (.{ out.y, out.state, out.state_seq }) |a| free(a);
+    {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 4, out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &st_shape, 4, st_dt));
+        try kernels.gdnSetGrid(cfg, .stock, dv, hv, batch);
+        try kda.templateArgs(cfg, in_dt, st_dt, out_dt, dk, dv, hk, hv);
+        const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_array_free(iv);
+        var ov = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ov);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try kernels.gdnRouteKernel(.stock, 0, true), iv, cfg, s));
+        if (mlx.mlx_vector_array_size(ov) != 2) return error.MetalKernelBadOutputCount;
+        try mlx.check(mlx.mlx_vector_array_get(&out.y, ov, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&out.state, ov, 1));
+    }
+    {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 4, out_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ rows, batch, hv, dv, dk }, 5, st_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &st_shape, 4, st_dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, dv, batch * hv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 4, 1));
+        try kda.templateArgs(cfg, in_dt, st_dt, out_dt, dk, dv, hk, hv);
+        const seq_stride = mlx.mlx_array_new_int(batch * hv * dv * dk);
+        defer _ = mlx.mlx_array_free(seq_stride);
+        const seq_ins = ins ++ [_]Array{seq_stride};
+        const iv = mlx.mlx_vector_array_new_data(&seq_ins, seq_ins.len);
+        defer _ = mlx.mlx_vector_array_free(iv);
+        var ov = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ov);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, try kernels.getGdnKernelSeq(true), iv, cfg, s));
+        if (mlx.mlx_vector_array_size(ov) != 3) return error.MetalKernelBadOutputCount;
+        try mlx.check(mlx.mlx_vector_array_get(&out.state_seq, ov, 1));
+    }
+    runs.lazy += 1;
+    if (!lazy_said) {
+        lazy_said = true;
+        log.info("[kda] verify lazy per-row states engaged: S={d} Hv={d}\n", .{ rows, hv });
+    }
+    return out;
+}
+
 // ── tests ──
 
 const testing = std.testing;
 const env = @import("../../env.zig");
 const config = @import("config.zig");
 const trunk = @import("trunk.zig");
-const kda = @import("kda.zig");
 
 /// A GLM-5.3-Flash KDA layer at 4 heads of 128 (the texts take any head count), 4 conv taps, the low-rank gates.
 const t_hidden: c_int = 512;
@@ -127,29 +185,33 @@ const t_prompt: c_int = 17;
 /// Verify widths: 1 + the drafted rows.
 const verify_widths = [_]c_int{ 1, 2, 3, 4 };
 
-const Switches = struct { verify: bool = false, expsig: bool = false };
+const Switches = struct { verify: bool = false, expsig: bool = false, lazy: bool = false };
 
 /// The switches as a run sets them, the process's own values put back by `restore`.
 const Saved = struct {
     verify: env.Override(.MLX_SERVE_GLM_KDA_VERIFY),
     expsig: env.Override(.MLX_SERVE_GLM_KDA_EXPSIG),
+    lazy: env.Override(.MLX_SERVE_GLM_KDA_LAZY_SEQ),
 
     fn init() Saved {
         return .{
             .verify = env.override(.MLX_SERVE_GLM_KDA_VERIFY, null),
             .expsig = env.override(.MLX_SERVE_GLM_KDA_EXPSIG, null),
+            .lazy = env.override(.MLX_SERVE_GLM_KDA_LAZY_SEQ, null),
         };
     }
 
     fn restore(sv: *const Saved) void {
         sv.verify.restore();
         sv.expsig.restore();
+        sv.lazy.restore();
     }
 };
 
 fn setSwitches(sw: Switches) void {
     env.set(.MLX_SERVE_GLM_KDA_VERIFY, if (sw.verify) "1" else "0");
     env.set(.MLX_SERVE_GLM_KDA_EXPSIG, if (sw.expsig) "1" else "0");
+    env.set(.MLX_SERVE_GLM_KDA_LAZY_SEQ, if (sw.lazy) "1" else "0");
 }
 
 /// Seeded normal values of `dtype` at `scale`, evaluated.
@@ -296,8 +358,47 @@ fn verifies(r: *Rig, x0: Array, xs: []const Array, rows: c_int, sw: Switches, ou
         o[2] = newRef(e.ssm_state);
         o[3] = newRef(e.spec_conv_input);
         o[4] = newRef(e.spec_state_seq);
+        if (sw.lazy) {
+            // Read as a full accept reads it: the per-row states stay unrun.
+            try evalAll(o[0..4]);
+            var avail = true;
+            try mlx.check(mlx._mlx_array_is_available(&avail, o[4]));
+            try testing.expect(!avail);
+        }
         try evalAll(o);
     }
+}
+
+/// A cold prompt chunk, a verify of `xa` with its output, window, state and conv input read (not its per-row states),
+/// the rollback of a partial accept of `acc` drafts (per-row state `acc` as the layer's state, the window kept), then
+/// a verify of `xb` from it: the rolled state and the second verify's output, state and per-row states, evaluated.
+fn rollback(r: *Rig, x0: Array, xa: Array, xb: Array, rows: c_int, acc: c_int, sw: Switches) ![4]Array {
+    const s = r.m.s;
+    setSwitches(sw);
+    var e: kda.Entry = .{};
+    defer e.deinit();
+    const y0 = try kda.forward(&r.m, x0, &r.la, &e, 1, t_prompt, true, false);
+    defer free(y0);
+    try evalAll(&.{ y0, e.conv_state, e.ssm_state });
+    const y1 = try kda.forward(&r.m, xa, &r.la, &e, 1, rows, rows > 1, true);
+    defer free(y1);
+    try evalAll(&.{ y1, e.conv_state, e.ssm_state, e.spec_conv_input });
+    const sh = mlx.getShape(e.spec_state_seq);
+    try testing.expect(sh.len == 5 and acc + 1 < sh[0]);
+    var out: [4]Array = @splat(.{ .ctx = null });
+    errdefer for (out) |a| free(a);
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    try mlx.check(mlx.mlx_slice(&row, e.spec_state_seq, &[_]c_int{ acc, 0, 0, 0, 0 }, 5, &[_]c_int{ acc + 1, sh[1], sh[2], sh[3], sh[4] }, 5, &[_]c_int{ 1, 1, 1, 1, 1 }, 5, s));
+    out[0] = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out[0], row, &[_]c_int{ sh[1], sh[2], sh[3], sh[4] }, 4, s));
+    free(e.ssm_state);
+    e.ssm_state = newRef(out[0]);
+    out[1] = try kda.forward(&r.m, xb, &r.la, &e, 1, rows, rows > 1, true);
+    out[2] = newRef(e.ssm_state);
+    out[3] = newRef(e.spec_state_seq);
+    try evalAll(&out);
+    return out;
 }
 
 fn bytesOf(a: Array) ![]const u8 {
@@ -354,13 +455,16 @@ fn expectOuts(s: mlx.mlx_stream, want: []const Out, got: []const Out, rows: c_in
 }
 
 fn runsSince(before: Runs) Runs {
-    return .{ .prework = runs.prework - before.prework, .gate = runs.gate - before.gate, .normgate = runs.normgate - before.normgate, .expsig = runs.expsig - before.expsig };
+    return .{ .prework = runs.prework - before.prework, .gate = runs.gate - before.gate, .normgate = runs.normgate - before.normgate, .expsig = runs.expsig - before.expsig, .lazy = runs.lazy - before.lazy };
 }
 
-/// The verify sets held to the chain: the texts alone, and with exp(A_log) in the gate's launch.
+/// The verify sets held to the chain: the texts alone, with exp(A_log) in the gate's launch, the lazy per-row states
+/// alone, and everything.
 const verify_sets = [_]Switches{
     .{ .verify = true },
     .{ .verify = true, .expsig = true },
+    .{ .lazy = true },
+    .{ .verify = true, .expsig = true, .lazy = true },
 };
 
 test "glm5_next kda verify: the prework, gate and norm-gate give the chain's output, window, state, conv input and per-row states bit for bit at 1 to 4 rows" {
@@ -388,9 +492,11 @@ test "glm5_next kda verify: the prework, gate and norm-gate give the chain's out
             const before = runs;
             try verifies(&r, x0, &xs, rows, sw, &got);
             const ran = runsSince(before);
-            try testing.expectEqual(@as(u64, if (rows <= 9) 2 else 0), ran.prework);
-            try testing.expectEqual(@as(u64, 2), ran.gate);
-            try testing.expectEqual(@as(u64, 2), ran.normgate);
+            const texts: u64 = if (sw.verify) 2 else 0;
+            try testing.expectEqual(if (rows <= 9) texts else 0, ran.prework);
+            try testing.expectEqual(texts, ran.gate);
+            try testing.expectEqual(texts, ran.normgate);
+            try testing.expectEqual(@as(u64, if (sw.lazy) 2 else 0), ran.lazy);
             try testing.expectEqual(@as(u64, if (sw.expsig) 2 else 0), ran.expsig);
             try expectOuts(s, &want, &got, rows);
         }
@@ -402,7 +508,7 @@ test "glm5_next kda verify: Ling's KDA layer and two slots keep the chain" {
     const s = mlx.gpuStream();
     const saved = Saved.init();
     defer saved.restore();
-    setSwitches(.{ .verify = true, .expsig = true });
+    setSwitches(.{ .verify = true, .expsig = true, .lazy = true });
     var r: Rig = undefined;
     try r.init(s, "bailing_hybrid");
     defer r.deinit();
@@ -414,7 +520,7 @@ test "glm5_next kda verify: Ling's KDA layer and two slots keep the chain" {
         defer free(xs[0]);
         var out: [1]Out = @splat(@splat(.{ .ctx = null }));
         defer freeOuts(&out);
-        try verifies(&r, x0, &xs, 2, .{ .verify = true, .expsig = true }, &out);
+        try verifies(&r, x0, &xs, 2, .{ .verify = true, .expsig = true, .lazy = true }, &out);
     }
     r.cfg.model_type = "glm5_next";
     {
@@ -427,4 +533,33 @@ test "glm5_next kda verify: Ling's KDA layer and two slots keep the chain" {
         try evalAll(&.{ y, e.conv_state, e.ssm_state, e.spec_conv_input, e.spec_state_seq });
     }
     try testing.expectEqual(Runs{}, runsSince(before));
+}
+
+test "glm5_next kda verify: after each partial accept's rollback the lazy per-row states and the texts give the chain's bits" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const saved = Saved.init();
+    defer saved.restore();
+    var r: Rig = undefined;
+    try r.init(s, "glm5_next");
+    defer r.deinit();
+    const x0 = try r.input(1, t_prompt);
+    defer free(x0);
+    for (verify_widths) |rows| {
+        const xa = try r.input(1, rows);
+        defer free(xa);
+        const xb = try r.input(1, rows);
+        defer free(xb);
+        var acc: c_int = 0;
+        while (acc + 1 < rows) : (acc += 1) {
+            const want = try rollback(&r, x0, xa, xb, rows, acc, .{});
+            defer for (want) |a| free(a);
+            for ([_]Switches{ .{ .lazy = true }, .{ .verify = true, .expsig = true, .lazy = true } }) |sw| {
+                const got = try rollback(&r, x0, xa, xb, rows, acc, sw);
+                defer for (got) |a| free(a);
+                for (want[0..3], got[0..3]) |w, g| try expectBits(s, w, g, null);
+                try expectBits(s, want[3], got[3], rows - 1);
+            }
+        }
+    }
 }
