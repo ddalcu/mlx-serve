@@ -7,8 +7,9 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const host = @import("../glm5_next/host.zig");
 const trunk = @import("../glm5_next/trunk.zig");
-const toModelConfig = @import("../glm5_next/model_config.zig").toModelConfig;
-const prefillNeededAtChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").prefillNeededAtChunk;
+const sdk_bill = @import("../../sdk/bill/prefill.zig");
+const dq_gemm = @import("../../sdk/blocks/linear/prefill_dq_gemm.zig");
+const run = @import("../../sdk/bases/run.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
 const fixture = @import("../glm5_next/fixture.zig");
@@ -64,11 +65,32 @@ fn residentBytes(p: *const abi.Parsed, _: abi.Str, _: abi.Str, shards: u64, out:
     return .ok;
 }
 
-/// A streaming pack's prompt: the engine's own prompt bill of the pack's config as an unstreamed model's (one output
-/// token past the prompt; the bank's slot rows are its plugin's bill, apart).
-fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64 {
-    const cfg = toModelConfig(config.of(p)) catch return std.math.maxInt(u64);
-    return prefillNeededAtChunk(&cfg, seq, 1, kv_bits, chunk, .{ .matched_tokens = warm });
+/// A streaming pack's prompt: the engine's prompt bill of the pack's config as an unstreamed model's (one output token
+/// past the prompt, no warm restore credited; the bank's slot rows are its plugin's bill, apart), priced from
+/// `sdk/bill/prefill.zig` so the plugin's closure stays in sdk/. `bill_test.zig` pins it to the engine's
+/// `prefillNeededAtChunk` of the same config.
+pub fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, _: u64) callconv(.c) u64 {
+    const c = config.of(p);
+    const mla = c.mla_kv_lora_rank > 0;
+    const qk: u64 = @as(u64, c.mla_qk_nope_head_dim) + c.mla_qk_rope_head_dim;
+    const attn: u64 = c.attnLayerCount();
+    // ModelConfig.kvBytesPerToken: MLA caches every head's expanded key and value, other attention its KV heads.
+    const kv_per_tok: u64 = if (mla) attn * c.num_attention_heads * (qk + c.mla_v_head_dim) * 2 else attn * c.num_key_value_heads * 2 * c.head_dim * 2;
+    // bills.prefillFfnWidth.
+    const moe_w: u64 = @as(u64, c.moe_intermediate_size) * @max(@as(u64, c.num_experts_per_tok), 1) + c.shared_expert_intermediate_size;
+    const dense_w: u64 = if (c.intermediate_size_declared) c.intermediate_size else 0;
+    const ffn: u64 = if (@max(dense_w, moe_w) > 0) @max(dense_w, moe_w) else c.intermediate_size;
+    // bills.prefillStreamBytesPerToken off GLM: the KDA layers' q/k/v inside one eval window, the MoE gather's top_k replica.
+    const cadence: u64 = run.PREFILL_EVAL_CADENCE_DEFAULT;
+    var stream: u64 = 0;
+    const linear: u64 = @as(u64, c.num_hidden_layers) -| attn;
+    if (c.linear_num_value_heads > 0 and linear > 0)
+        stream += @min(linear, cadence + 1) * (2 * @as(u64, c.linear_num_key_heads) * c.linear_key_head_dim + @as(u64, c.linear_num_value_heads) * c.linear_value_head_dim) * 2;
+    if (c.num_experts > 0)
+        stream += cadence * @max(@as(u64, c.num_experts_per_tok), 1) * 2 * (@as(u64, c.hidden_size) + c.moe_intermediate_size) * 2;
+    // bills.prefillDequantWeightBytes.
+    const dq: u64 = if (c.quant_bits == 0 or c.quant_mode != .affine or !dq_gemm.prefillDqGemmEnabled()) 0 else 3 * ffn * c.hidden_size * 2;
+    return sdk_bill.prefillMemoryNeeded(seq, c.num_attention_heads, c.num_key_value_heads, kv_per_tok, c.head_dim, if (mla) qk else c.head_dim, c.hidden_size, ffn, kv_bits, chunk, seq, stream, dq, .{ .dq_min_rows = dq_gemm.prefillDqGemmMinRows(c.quant_bits) });
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
@@ -94,32 +116,6 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
-}
-
-test "bailing_hybrid bill: a streaming pack bills its prompt as the engine bills the same config unstreamed; another pack leaves it to the engine" {
-    const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
-    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
-    const dir = mem.packDir();
-    var p: abi.Parsed = .{};
-    try std.testing.expect(config.parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
-    defer config.freeParsed(&p);
-    var b: abi.Bill = .{};
-    bill(&p, &.{ .context = 32768 }, &b);
-    const cfg = try toModelConfig(config.of(&p));
-    const want = prefillNeededAtChunk(&cfg, 18_380, 1, 16, 4096, .{});
-    try std.testing.expect(want > 0);
-    try std.testing.expectEqual(want, b.prefill_bytes.?(&p, 18_380, 4096, 16, 0));
-    try std.testing.expect(p.caps.prompt_last_row and p.caps.streamed_weights);
-
-    const tiny = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json");
-    const tmem: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = tiny }} };
-    const tdir = tmem.packDir();
-    var q: abi.Parsed = .{};
-    try std.testing.expect(config.parse(&tdir, abi.Str.of(tiny), .{}, null, true, &q).isOk());
-    defer config.freeParsed(&q);
-    var bq: abi.Bill = .{};
-    bill(&q, &.{ .context = 32768 }, &bq);
-    try std.testing.expect(bq.prefill_bytes == null and !q.caps.prompt_last_row);
 }
 
 test "bailing_hybrid resident bytes: a streaming pack with a NextN layer adds its draft readout to the shards; Ling 3.0 the shards" {

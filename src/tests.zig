@@ -245,6 +245,7 @@ test {
     _ = @import("plugins/glm5_next/model_config.zig");
     _ = @import("plugins/glm5_next/proof_test.zig");
     _ = @import("plugins/glm5_next/served_test.zig");
+    _ = @import("plugins/bailing_hybrid/bill_test.zig");
     _ = @import("engines/mlx/plugin/deepseek_test.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");
