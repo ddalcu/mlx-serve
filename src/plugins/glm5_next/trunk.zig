@@ -17,6 +17,7 @@ const array = @import("../../mlx/array.zig");
 const log = @import("../../sdk/util/log.zig");
 const linear = @import("../../sdk/bases/blocks/linear.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
+const router_nax = @import("../../sdk/blocks/moe/router_nax.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const outside = @import("../../sdk/quant/outside.zig");
 const outside_model = @import("../../sdk/quant/outside_model.zig");
@@ -764,8 +765,9 @@ const Loader = struct {
     /// The routed MoE under `<base>.mlp` (a trunk layer, or the MTP head's block) as the shared block reads it: the
     /// sigmoid router with its selection bias, the ungated shared expert, ModelOpt's per-expert scales, a Sushi
     /// pack's EXL3 banks through the format table, GLM's one-kernel decode as the `fused` arm.
-    /// `banked`: the layer's experts are the streaming pack's bank's, bound after the load (`bindBank`).
-    fn routed(l: *Loader, base: []const u8, banked: bool) !moe.Moe.Weights {
+    /// `banked`: the layer's experts are the streaming pack's bank's, bound after the load (`bindBank`). `nax`: GLM's
+    /// router as stored is kept for the NAX router plan (`router_nax`) where the plan takes it.
+    fn routed(l: *Loader, base: []const u8, banked: bool, nax: bool) !moe.Moe.Weights {
         const c = l.c;
         const glm = c.isGlm5();
         var nb: [256]u8 = undefined;
@@ -800,6 +802,7 @@ const Loader = struct {
         const per_expert = try l.keep(try l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.expert_scale", .{base})));
         const gate_scale = try l.keep(try l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.gate_proj.expert_scale", .{base})));
         const up_scale = try l.keep(try l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.up_proj.expert_scale", .{base})));
+        const raw_router: Array = if (glm and nax and router.s.ctx == null and router.ext == null and try router_nax.admit(router.w)) try l.keep(router.w) else .{};
         try l.transposed(&router);
         // GLM routes in f32 (`moe_router_dtype`).
         if (glm and router.s.ctx == null) router.w = try l.f32Table(router.w, false);
@@ -841,6 +844,7 @@ const Loader = struct {
             .clamp = clampOf(c),
             .clamp_limit = if (c.swiglu_clamp) c.swiglu_limit else 0,
             .route_scale = per_expert,
+            .raw_router = raw_router,
         };
         if (stream) |x| {
             try moe.bindStreamed(&w, x, mlp_prefix);
@@ -874,7 +878,7 @@ const Loader = struct {
             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{base})),
             .eh_proj = try l.lin(eh, 2 * c.hidden_size),
             .mla = try l.mla(idx),
-            .moe = try l.routed(base, false),
+            .moe = try l.routed(base, false, false),
         };
     }
 
@@ -896,7 +900,7 @@ const Loader = struct {
             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{block})),
             .eh_proj = try l.lin(eh, 2 * c.hidden_size),
             .dsa = try l.dsa(block),
-            .moe = try l.routed(block, false),
+            .moe = try l.routed(block, false, false),
         };
     }
 
@@ -925,7 +929,7 @@ const Loader = struct {
                 L.ffn_hc = try l.mhc(base, "ffn_hc");
             }
             L.mixer = if (c.isLinearLayer(i)) .{ .kda = try l.kda(i) } else if (c.isGlm5()) .{ .dsa = try l.dsa(base) } else .{ .mla = try l.mla(i) };
-            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank) } else .{ .dense = try l.dense(i) };
+            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank, router_nax.enabled()) } else .{ .dense = try l.dense(i) };
             if (L.mlp == .moe and i < c.expert_limit_out.len) {
                 // Ling-3.1's clamps after the SiLU: the shared expert's in the block; the routed experts' in the composed
                 // chain (no kernel serves it), or in the bound bank's own arithmetic (`BankGeometry.limits_out`, `bindBank`).
