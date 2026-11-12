@@ -172,6 +172,12 @@ fn one(comptime fwd: type, m: *Model, ops: *const abi.CacheOps, f: *const abi.Fo
     }
 }
 
+/// The request's summary lines (`ModelTable.meters`): a streaming pack's bank's (`[stream-stats]`); none otherwise.
+pub fn meters(mp: *anyopaque, _: u32, out: *abi.Str) callconv(.c) void {
+    const m = of(mp);
+    out.* = if (m.bank) |b| abi.Str.of(b.meters()) else .{};
+}
+
 /// A streaming pack's bank after a forward: its outputs evaluated, then the calls' slot rows settled for the next
 /// forward's reads.
 pub fn settleBank(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) abi.Verdict {

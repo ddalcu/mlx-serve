@@ -231,6 +231,14 @@ pub const Bank = struct {
         };
     }
 
+    /// The bank's summary lines for the request (`abi.Bank.meters`); empty when it offers none.
+    pub fn meters(self: *Bank) []const u8 {
+        if (!offers(&self.b, .meters)) return "";
+        var out: abi.Str = .{};
+        self.b.meters.?(self.b.ctx, &out);
+        return out.slice();
+    }
+
     /// Whether the bank sets optional member `field`, read only when its `size` reaches it.
     fn offers(b: *const abi.Bank, comptime field: @EnumLiteral()) bool {
         const name = @tagName(field);
@@ -375,8 +383,11 @@ const ToyBank = struct {
         out.* = .{ .prompt = @intCast(budget.prompt / 100), .decode = geo.n_experts, .row_bytes = 100 };
         return .ok;
     }
+    fn meters(_: ?*anyopaque, out: *abi.Str) callconv(.c) void {
+        out.* = .of("[stream-stats] toy: routes=1");
+    }
     fn open(_: *const abi.LoadCtx, geo: *const abi.BankGeometry, _: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
-        out.* = .{ .ctx = @constCast(@ptrCast(geo.gates.?)), .close = &close, .about = .of("toy"), .decode_ids = 48, .rows = &routedRows, .settle = &ok0, .phase = &phase, .read_ahead = &readAhead, .rows_shared = &shared };
+        out.* = .{ .ctx = @constCast(@ptrCast(geo.gates.?)), .close = &close, .about = .of("toy"), .decode_ids = 48, .rows = &routedRows, .settle = &ok0, .phase = &phase, .read_ahead = &readAhead, .rows_shared = &shared, .meters = &meters };
         return .ok;
     }
     /// A bank built before its optional members: whatever lies past its `size` is not read.
@@ -430,6 +441,7 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     const r = b.routed();
     try testing.expectEqual(@as(usize, 48), r.decode_ids);
     try testing.expect(r.source_shared != null and r.source_expand == null and r.next_fn == null);
+    try testing.expectEqualStrings("[stream-stats] toy: routes=1", b.meters());
     const none: mlx.mlx_array = .{ .ctx = null };
     try testing.expectEqual(@as(?*anyopaque, &ToyBank.sum), (try r.math.source(r.ctx, 0, none, none, none).get()).ctx);
     try testing.expectError(error.EngineFailed, r.math.source(r.ctx, 1, none, none, none).get());
@@ -446,6 +458,7 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     table.open_bank = &ToyBank.openOlder;
     const older = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
     try testing.expect(older.routed().source_shared == null);
+    try testing.expectEqualStrings("", older.meters());
     older.close();
     table.open_bank = &ToyBank.openShort;
     try testing.expectError(error.OutsideQuantRefused, f.openBank(geo, .{ .prompt = 1000, .decode = 1000 }));

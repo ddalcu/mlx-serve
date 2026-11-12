@@ -180,6 +180,9 @@ pub const Bank = extern struct {
     rows_expand_into: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict = null,
     rows_decode_expand: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict = null,
     next_ahead: ?*const fn (ctx: ?*anyopaque, layer: u32, ids: Array) callconv(.c) Verdict = null,
+    /// The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next
+    /// call; the model logs them beside `[spec-stats]` at the request's end. Null: none.
+    meters: ?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void = null,
 };
 
 pub const Swiglu = extern struct {

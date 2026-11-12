@@ -28,6 +28,7 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = &layout },
     .weights = &.{ .resident_bytes = &residentBytes },
     .spec = &.{ .trunk_weight = &host.trunkWeight, .head = &head.hooks },
+    .meters = &host.meters,
 };
 
 const Verdict = abi.Verdict;
