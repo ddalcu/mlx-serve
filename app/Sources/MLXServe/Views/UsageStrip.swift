@@ -25,11 +25,12 @@ struct UsageStrip: View {
             .padding(.top, 8)
             .padding(.bottom, 10)
         }
+        .background(WindowVisibility { system.windowVisible = $0 })
         .onAppear {
-            system.start()
+            system.onScreen = true
             usage.load()
         }
-        .onDisappear { system.stop() }
+        .onDisappear { system.onScreen = false }
     }
 
     @ViewBuilder private var gauges: some View {

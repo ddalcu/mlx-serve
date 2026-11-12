@@ -34,14 +34,32 @@ final class SystemLoadSampler: ObservableObject {
     private static let queue = DispatchQueue(label: "mlx-serve.system-load", qos: .utility)
     private var timer: DispatchSourceTimer?
 
-    func start() {
+    /// The temperature and Neural Engine reads are many kernel calls each, the rest a few: they run on every third
+    /// tick, after two at the start that give the Neural Engine its first span.
+    nonisolated static func readsSensors(tick: Int) -> Bool { tick < 2 || tick % 3 == 0 }
+
+    /// Its gauges are laid out, and their window can be seen: it samples while both hold. Each has its own
+    /// reporter, and a sidebar that closes and opens again moves only the first.
+    var onScreen = false { didSet { gate() } }
+    var windowVisible = false { didSet { gate() } }
+    var isSampling: Bool { timer != nil }
+
+    private func gate() { onScreen && windowVisible ? start() : stop() }
+
+    private func start() {
         guard timer == nil else { return }
         let sensors = HardwareSensors.shared   // opens its private interfaces on first use, on `queue`
         let source = DispatchSource.makeTimerSource(queue: Self.queue)
         source.schedule(deadline: .now(), repeating: 2, leeway: .milliseconds(500))
+        var tick = 0, temperature: Double?, ane: Double?
         source.setEventHandler { [weak self] in
-            let load = SystemLoad(gpu: Int(SystemMetrics.gpuUtilization()), gpuTemperature: sensors.gpuTemperature(),
-                                  ane: sensors.aneLoad(), memoryUsed: SystemMetrics.memoryUsedBytes(),
+            if Self.readsSensors(tick: tick) {
+                temperature = sensors.gpuTemperature()
+                ane = sensors.aneLoad()
+            }
+            tick += 1
+            let load = SystemLoad(gpu: Int(SystemMetrics.gpuUtilization()), gpuTemperature: temperature,
+                                  ane: ane, memoryUsed: SystemMetrics.memoryUsedBytes(),
                                   memoryTotal: ProcessInfo.processInfo.physicalMemory)
             Task { @MainActor in self?.load = load }
         }
@@ -49,7 +67,7 @@ final class SystemLoadSampler: ObservableObject {
         timer = source
     }
 
-    func stop() {
+    private func stop() {
         timer?.cancel()
         timer = nil
     }

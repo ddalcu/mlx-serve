@@ -646,12 +646,17 @@ class ServerManager: ObservableObject {
             memoryInfo = memory
             specCost = props.specCost
             batching = props.batching
-            cluster = props.cluster
+            noteCluster(props.cluster)
             await noteRegistryGeneration(props.registryGeneration)
         }
         // `/v1/models` reads every model's config, so it is re-read only when
         // `registry_generation` says a load, unload or eviction (from any
         // client) has changed it.
+    }
+
+    /// Takes `/props`' pair state, stored only when it moved (as `noteLoadProgress`).
+    func noteCluster(_ reading: ClusterInfo?) {
+        if reading != cluster { cluster = reading }
     }
 
     private func noteRegistryGeneration(_ reported: UInt64?) async {
@@ -665,7 +670,7 @@ class ServerManager: ObservableObject {
     /// where the tray's `/props` ticker does not.
     func refreshPairState() async {
         guard status == .running, let props = try? await api.fetchProps(port: port) else { return }
-        cluster = props.cluster
+        noteCluster(props.cluster)
         await noteRegistryGeneration(props.registryGeneration)
     }
 
@@ -756,15 +761,21 @@ class ServerManager: ObservableObject {
             while !Task.isCancelled {
                 guard let self else { return }
                 if let p = try? await self.api.loadProgress(port: self.port), !Task.isCancelled {
-                    let ended = !self.loadProgress.isEmpty && p.isEmpty
-                    self.loadProgress = p
                     // Another client's load ended: the model list moved.
-                    if ended, self.loadsInFlight == 0, self.status == .running { await self.refreshModels() }
+                    if self.noteLoadProgress(p), self.loadsInFlight == 0, self.status == .running { await self.refreshModels() }
                 }
                 let loading = !self.loadProgress.isEmpty || self.loadsInFlight > 0
                 try? await Task.sleep(for: Self.loadProgressInterval(loading: loading))
             }
         }
+    }
+
+    /// Takes one reading of `/v1/load-progress`; true when the last load just ended. Stored only when it moved:
+    /// `@Published` announces every assignment, and `AppState` passes each one on to every view.
+    func noteLoadProgress(_ reading: [String: LoadProgress]) -> Bool {
+        let ended = !loadProgress.isEmpty && reading.isEmpty
+        if reading != loadProgress { loadProgress = reading }
+        return ended
     }
 
     private func stopLoadProgressPolling() {
