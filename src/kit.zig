@@ -132,6 +132,7 @@ pub const blocks = struct {
         pub const moe_affine4 = @import("sdk/blocks/moe/moe_affine4.zig");
         pub const moe_fp4 = @import("sdk/blocks/moe/moe_fp4.zig");
         pub const router_kernel = @import("sdk/blocks/moe/router_kernel.zig");
+        pub const router_nax = @import("sdk/blocks/moe/router_nax.zig");
         pub const routing = @import("sdk/blocks/moe/routing.zig");
         pub const verify_kernels = @import("sdk/blocks/moe/verify_kernels.zig");
         pub const weights = @import("sdk/blocks/moe/weights.zig");

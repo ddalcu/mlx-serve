@@ -18,6 +18,7 @@ const QuantParams = @import("../../quant/params.zig").QuantParams;
 const quant_abi = @import("../../../abi/quant.zig");
 const routing = @import("../../blocks/moe/routing.zig");
 const router_kernel = @import("../../blocks/moe/router_kernel.zig");
+const router_nax = @import("../../blocks/moe/router_nax.zig");
 const moe_decode = @import("../../blocks/moe/decode.zig");
 const moe_fp4 = @import("../../blocks/moe/moe_fp4.zig");
 const moe_cuda = @import("../../blocks/moe/moe_cuda.zig");
@@ -125,6 +126,9 @@ pub const Moe = struct {
         route_scale: Array = .{ .ctx = null },
         /// A model's own kernel for the routed and shared experts together; tried before the block's arms.
         fused: ?Fused = null,
+        /// The router as stored (`[experts, hidden]` f16 or bf16, `router_nax.admit`) for the NAX router plan; null =
+        /// the stock route only.
+        raw_router: Array = .{ .ctx = null },
     };
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
@@ -218,6 +222,20 @@ fn adoptRouting(g: *Graph, r: anytype) !Routed {
     return .{ .inds = inds, .scores = scores, .gate_logit = gl };
 }
 
+/// The routes on the NAX router plan (`router_nax`), or null: the stock route.
+fn naxRouted(w: *const Moe.Weights, g: *Graph, x: Array) !?Routed {
+    if (w.raw_router.ctx == null) return null;
+    const sb = switch (w.route) {
+        .sigmoid_bias => |r| r,
+        else => return null,
+    };
+    if (sb.n_group > 1) return null;
+    const l = &w.router;
+    const plain = l.s.ctx == null and l.bias.ctx == null and l.ext == null and l.rht == null and !l.ternary;
+    const r = (try router_nax.route(g.s, x, .{ .raw = w.raw_router, .table = l.w, .plain = plain, .bias = sb.expert_bias, .k = w.top_k, .norm = sb.norm, .scale = sb.scale })) orelse return null;
+    return try adoptRouting(g, r);
+}
+
 fn routerLogits(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     if (w.route != .logit_bias) return w.router.forward(parent, x);
     var t = parent.scope();
@@ -271,19 +289,21 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     var t = parent.scope();
     defer t.deinit();
     const g = &t;
-    const logits = try routerLogits(w, g, x);
+    var r = (try naxRouted(w, g, x)) orelse stock: {
+        const logits = try routerLogits(w, g, x);
 
-    // At one row the shared expert's gate logit rides the softmax router kernel.
-    const fold: ?router_kernel.RouterGate = blk: {
-        const se = w.shared orelse break :blk null;
-        if (w.route != .softmax or !se.gated() or se.gate_vec.ctx == null) break :blk null;
-        const lsh = ops.shape(logits);
-        var rows: usize = 1;
-        for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
-        if (rows != 1 or mlx.mlx_array_size(x) != mlx.mlx_array_size(se.gate_vec)) break :blk null;
-        break :blk .{ .x = x, .w = se.gate_vec };
+        // At one row the shared expert's gate logit rides the softmax router kernel.
+        const fold: ?router_kernel.RouterGate = blk: {
+            const se = w.shared orelse break :blk null;
+            if (w.route != .softmax or !se.gated() or se.gate_vec.ctx == null) break :blk null;
+            const lsh = ops.shape(logits);
+            var rows: usize = 1;
+            for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
+            if (rows != 1 or mlx.mlx_array_size(x) != mlx.mlx_array_size(se.gate_vec)) break :blk null;
+            break :blk .{ .x = x, .w = se.gate_vec };
+        };
+        break :stock try route(w, g, logits, fold);
     };
-    var r = try route(w, g, logits, fold);
     const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x, false) else null;
     // The group-limited chain hands its weights back in f32; they land in the activation dtype.
     if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));

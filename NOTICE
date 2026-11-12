@@ -460,6 +460,12 @@ with the headers it includes, embedded from the pinned submodule (Copyright
 (`steel/gemm/kernels/steel_gemm_fused_nax.h`) by way of turboexl3's copy
 (Copyright (c) 2023-2025 Apple Inc., MIT License).
 
+`src/sdk/blocks/moe/router_nax.zig` runs MLX's `GEMVKernel` from `gemv.h`,
+embedded from the pinned submodule with its operand types and its output
+store edited at compile time, and `src/kernels/moe/router_nax_p1.metal`
+reproduces MLX's split-K NAX GEMM (`steel_gemm_splitk_nax`) over the inlined
+`steel/gemm/nax.h` (Copyright (c) 2023-2025 Apple Inc., MIT License).
+
 --------------------------------------------------------------------------------
 mlx-lm
 https://github.com/ml-explore/mlx-lm
