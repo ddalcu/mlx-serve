@@ -176,7 +176,17 @@ fn streamRoom(config: *const ModelConfig) u64 {
 
 fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
     const seq = 16_384 + 1_024;
-    const chunk = @import("../generate.zig").WIDE_PREFILL_CHUNK;
+    // The widest chunk the engine runs for this model (`total_ctx = 0`, as the context sizer bills it): an explicit
+    // `--prefill-chunk`, else the default, never past `prefillChunkMax`.
+    const chunk: u32 = @intCast(config.cappedPrefillChunk(@import("../generate/prefill_chunk.zig").effectivePrefillChunk(
+        config.prefillScoreHeadDim(),
+        config.num_attention_heads,
+        0,
+        config.has_sliding_window,
+        config.isMoe(),
+        config.longCtxGated(),
+        config.pinned_prefill_chunk,
+    )));
     const b = config.plugin orelse return 0;
     if (!b.parsed.caps.streamed_weights) return 0;
     var bill: abi.Bill = .{};
@@ -227,9 +237,58 @@ test "driver: a streamed built-in GLM's room is the ceiling less the engine's GL
     var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
     var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
     cfg.plugin = &binding;
-    const need = @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(&cfg, 16_384 + 1_024, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK, .{});
-    try std.testing.expect(need > 0);
-    try std.testing.expectEqual((64 << 30) - need - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    const gen = @import("../generate.zig");
+    const saved = gen.prefillCli().*;
+    defer gen.prefillCli().* = saved;
+    // GLM forms no score sheet (`prefillScoreHeadDim` 0): billed at the wide default, or at an explicit chunk.
+    for ([_]PrefillCliCase{ .{ .cli = .{}, .chunk = gen.WIDE_PREFILL_CHUNK }, .{ .cli = .{ .override = 16384, .explicit = true }, .chunk = 16384 }, .{ .cli = .{ .override = 4096, .explicit = true }, .chunk = 4096 } }) |c| {
+        gen.prefillCli().* = c.cli;
+        const need = @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(&cfg, 16_384 + 1_024, 1, 16, c.chunk, .{});
+        try std.testing.expect(need > 0);
+        try std.testing.expectEqual((64 << 30) - need - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    }
+}
+
+const PrefillCliCase = struct { cli: @import("../generate.zig").PrefillCli, chunk: u64 };
+
+test "driver: a streamed plugin's room bills the widest chunk the engine runs: an explicit --prefill-chunk, else the default, never past the model's max" {
+    const t = std.testing;
+    const Probe = struct {
+        fn prefill(_: *const abi.Parsed, _: u64, chunk: u32, _: u8, _: u64) callconv(.c) u64 {
+            return @as(u64, chunk) << 20;
+        }
+        fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill };
+        }
+    };
+    const gen = @import("../generate.zig");
+    const saved = gen.prefillCli().*;
+    defer gen.prefillCli().* = saved;
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.bill;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    // A model with a score sheet (Ling's MLA): the default 8192, an explicit 4096, an explicit 16384.
+    var cfg = ModelConfig{ .plugin = &binding, .head_dim = 128, .num_attention_heads = 64 };
+    gen.prefillCli().* = .{};
+    try t.expectEqual((64 << 30) - (8192 << 20) - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    gen.prefillCli().* = .{ .override = 4096, .explicit = true };
+    try t.expectEqual((64 << 30) - (4096 << 20) - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    gen.prefillCli().* = .{ .override = 16384, .explicit = true };
+    try t.expectEqual((64 << 30) - (16384 << 20) - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    // No score sheet (GLM's indexed rows): the wide default, as before.
+    cfg.head_dim = 0;
+    gen.prefillCli().* = .{};
+    try t.expectEqual((64 << 30) - (@as(u64, gen.WIDE_PREFILL_CHUNK) << 20) - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    // DeepSeek-V4.1 runs at most 8192 rows (`prefillChunkMax`), an explicit 16384 included.
+    var ds = try model.parseConfigFromJson(t.allocator, model.dsv41_release_config);
+    const own = ds.plugin;
+    defer {
+        ds.plugin = own;
+        ds.deinit(t.allocator);
+    }
+    ds.plugin = &binding;
+    gen.prefillCli().* = .{ .override = 16384, .explicit = true };
+    try t.expectEqual((64 << 30) - (8192 << 20) - (1 << 30), streamRoomAt(&ds, 64 << 30, 1 << 30));
 }
 
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
