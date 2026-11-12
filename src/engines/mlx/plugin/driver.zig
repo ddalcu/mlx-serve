@@ -189,7 +189,9 @@ fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64
     // A plugin that prices its own prompt keeps one room; the built-in GLM's decode bill is the engine's.
     if (bill.prefill_bytes != null) return 0;
     const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(config, 16_384 + 1_024, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
-    return ceiling -| need -| margin;
+    // The MTP bind's coarse head, built after the bank opens, is resident in decode too.
+    const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(config, false);
+    return ceiling -| need -| coarse -| margin;
 }
 
 fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
@@ -334,6 +336,11 @@ test "driver: a streamed built-in GLM's decode room is the ceiling less the engi
     try std.testing.expect(streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30) > streamRoomAt(&cfg, 64 << 30, 1 << 30));
     var other = ModelConfig{ .plugin = &binding };
     try std.testing.expectEqual(@as(u64, 0), streamRoomDecodeAt(&other, 64 << 30, 1 << 30));
+    // A GLM whose facts declare an MTP head leaves the coarse head in decode too.
+    binding.parsed.spec.mtp_layout = .in_checkpoint;
+    const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(&cfg, false);
+    try std.testing.expectEqual(@as(u64, 277_544_960), coarse);
+    try std.testing.expectEqual((64 << 30) - need - coarse - (1 << 30), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
 }
 
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
