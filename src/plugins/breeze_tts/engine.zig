@@ -20,6 +20,9 @@ const tts = @import("../../sdk/media/mimi_codec.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
 const os_mutex = @import("../../sdk/util/os_mutex.zig");
 const env = @import("../../env.zig");
+const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
+const fused_activations = @import("../../sdk/blocks/mlp/fused_activations.zig");
+const qk_norm_rope = @import("../../sdk/blocks/rope/qk_norm_rope.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -528,9 +531,10 @@ const QLayer = struct {
     in_ln: mlx.mlx_array,
     post_ln: mlx.mlx_array,
     pre_ff: mlx.mlx_array, // NULL on backbone/depth; TE carries the 4th norm
+    eps_arr: mlx.mlx_array = null_arr, // 0-d f32 for the sdk fused add-norm / qk kernels
 
     fn freeHandles(l: *QLayer) void {
-        inline for (.{ l.q, l.k, l.v, l.o, l.qn, l.kn, l.gate, l.up, l.down, l.in_ln, l.post_ln, l.pre_ff }) |x| {
+        inline for (.{ l.q, l.k, l.v, l.o, l.qn, l.kn, l.gate, l.up, l.down, l.in_ln, l.post_ln, l.pre_ff, l.eps_arr }) |x| {
             if (x.ctx != null) _ = mlx.mlx_array_free(x);
         }
         l.* = std.mem.zeroes(QLayer);
@@ -612,17 +616,25 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, x_host: []cons
         defer _ = mlx.mlx_array_free(af);
         const o = mm(af, lw.o, s);
         defer _ = mlx.mlx_array_free(o);
-        const h1 = addM(x, o, s);
+        const ar = blk: {
+            if (lw.eps_arr.ctx != null) {
+                if (try residual_norm.fusedAddRmsNorm(s, x, o, lw.post_ln, lw.eps_arr)) |r| break :blk r;
+            }
+            const h1n = addM(x, o, s);
+            break :blk residual_norm.AddNormResult{ .sum = h1n, .normed = rmsn(h1n, lw.post_ln, eps, s) };
+        };
+        const h1 = ar.sum;
         defer _ = mlx.mlx_array_free(h1);
-        const hn = rmsn(h1, lw.post_ln, eps, s);
+        const hn = ar.normed;
         defer _ = mlx.mlx_array_free(hn);
         const g = mm(hn, lw.gate, s);
         defer _ = mlx.mlx_array_free(g);
         const u = mm(hn, lw.up, s);
         defer _ = mlx.mlx_array_free(u);
-        const gs = siluArr(g, s);
-        defer _ = mlx.mlx_array_free(gs);
-        const gu = mulEl(s, gs, u);
+        const gu = if (try fused_activations.fusedSwiGLU(s, g, u)) |sg| sg else blk: {
+            const gs = siluArr(g, s);
+            break :blk mulEl(s, gs, u);
+        };
         defer _ = mlx.mlx_array_free(gu);
         const mlp = mm(gu, lw.down, s);
         defer _ = mlx.mlx_array_free(mlp);
@@ -679,36 +691,50 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, xrow: []const f32
         const hd: c_int = @intCast(lw.head_dim);
         const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], @as(c_int, hd)));
         const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], @as(c_int, hd)));
-        var q4 = reshape(q, &[_]c_int{ 1, 1, qh, hd }, s);
-        var k4 = reshape(k, &[_]c_int{ 1, 1, kh, hd }, s);
         const v4 = reshape(v, &[_]c_int{ 1, 1, kh, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
+        const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s); // freed at the loop tail: kv may alias it
+        // The sdk fused decode kernel: q/k per-head RMSNorm + RoPE + transpose
+        // in one dispatch (bit-identical to the chain below; qwen3_tts's shape),
+        // composed chain when it declines.
+        var qr = null_arr;
+        var kr = null_arr;
+        var fused = false;
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
-            const q4f = reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), hd }, s);
-            const q4n1 = rmsn(q4f, lw.qn, eps, s);
-            _ = mlx.mlx_array_free(q4f);
-            const q4n = reshape(q4n1, &[_]c_int{ 1, 1, qh, hd }, s);
-            _ = mlx.mlx_array_free(q4n1);
-            _ = mlx.mlx_array_free(q4);
-            q4 = q4n;
-            const k4f = reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), hd }, s);
-            const k4n1 = rmsn(k4f, lw.kn, eps, s);
-            _ = mlx.mlx_array_free(k4f);
-            const k4n = reshape(k4n1, &[_]c_int{ 1, 1, kh, hd }, s);
-            _ = mlx.mlx_array_free(k4n1);
-            _ = mlx.mlx_array_free(k4);
-            k4 = k4n;
+            const angles = try qk_norm_rope.ropeAngleRow(s, hd, .{ .value = @floatCast(theta), .has_value = true }, null_arr, pos, std.heap.c_allocator);
+            defer _ = mlx.mlx_array_free(angles);
+            if (try qk_norm_rope.fusedQkNormRope(s, q, k, lw.qn, lw.kn, angles, null, lw.eps_arr, qh, kh, hd)) |pair| {
+                qr = pair[0];
+                kr = pair[1];
+                fused = true;
+            }
         }
-        defer _ = mlx.mlx_array_free(q4);
-        defer _ = mlx.mlx_array_free(k4);
-        const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        defer _ = mlx.mlx_array_free(qt);
-        const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        defer _ = mlx.mlx_array_free(kt);
-        const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        const qr = ropeApplyOff(qt, theta, pos, hd, s);
-        defer _ = mlx.mlx_array_free(qr);
-        const kr = ropeApplyOff(kt, theta, pos, hd, s);
+        if (!fused) {
+            var q4 = reshape(q, &[_]c_int{ 1, 1, qh, hd }, s);
+            var k4 = reshape(k, &[_]c_int{ 1, 1, kh, hd }, s);
+            if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
+                const q4f = reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), hd }, s);
+                const q4n1 = rmsn(q4f, lw.qn, eps, s);
+                _ = mlx.mlx_array_free(q4f);
+                _ = mlx.mlx_array_free(q4);
+                q4 = reshape(q4n1, &[_]c_int{ 1, 1, qh, hd }, s);
+                _ = mlx.mlx_array_free(q4n1);
+                const k4f = reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), hd }, s);
+                const k4n1 = rmsn(k4f, lw.kn, eps, s);
+                _ = mlx.mlx_array_free(k4f);
+                _ = mlx.mlx_array_free(k4);
+                k4 = reshape(k4n1, &[_]c_int{ 1, 1, kh, hd }, s);
+                _ = mlx.mlx_array_free(k4n1);
+            }
+            const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+            defer _ = mlx.mlx_array_free(qt);
+            const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+            defer _ = mlx.mlx_array_free(kt);
+            qr = ropeApplyOff(qt, theta, pos, hd, s);
+            kr = ropeApplyOff(kt, theta, pos, hd, s);
+            _ = mlx.mlx_array_free(q4);
+            _ = mlx.mlx_array_free(k4);
+        }
         const pk = kv[lidx].k;
         const pv = kv[lidx].v;
         const kc = concat2(s, kv[lidx].k, kr, 2);
@@ -727,17 +753,25 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, xrow: []const f32
         defer _ = mlx.mlx_array_free(af);
         const o = mm(af, lw.o, s);
         defer _ = mlx.mlx_array_free(o);
-        const h1 = addM(x, o, s);
+        const ar = blk: {
+            if (lw.eps_arr.ctx != null) {
+                if (try residual_norm.fusedAddRmsNorm(s, x, o, lw.post_ln, lw.eps_arr)) |r| break :blk r;
+            }
+            const h1n = addM(x, o, s);
+            break :blk residual_norm.AddNormResult{ .sum = h1n, .normed = rmsn(h1n, lw.post_ln, eps, s) };
+        };
+        const h1 = ar.sum;
         defer _ = mlx.mlx_array_free(h1);
-        const hn = rmsn(h1, lw.post_ln, eps, s);
+        const hn = ar.normed;
         defer _ = mlx.mlx_array_free(hn);
         const g = mm(hn, lw.gate, s);
         defer _ = mlx.mlx_array_free(g);
         const u = mm(hn, lw.up, s);
         defer _ = mlx.mlx_array_free(u);
-        const gs = siluArr(g, s);
-        defer _ = mlx.mlx_array_free(gs);
-        const gu = mulEl(s, gs, u);
+        const gu = if (try fused_activations.fusedSwiGLU(s, g, u)) |sg| sg else blk: {
+            const gs = siluArr(g, s);
+            break :blk mulEl(s, gs, u);
+        };
         defer _ = mlx.mlx_array_free(gu);
         const mlp = mm(gu, lw.down, s);
         defer _ = mlx.mlx_array_free(mlp);
@@ -831,6 +865,7 @@ const Te = struct {
                 .in_ln = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}pre_self_attn_layernorm.weight", p)),
                 .post_ln = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}post_feedforward_layernorm.weight", p)),
                 .pre_ff = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}pre_feedforward_layernorm.weight", p)),
+                .eps_arr = mlx.mlx_array_new_float(cfg.te_rms_eps),
             };
             // post_self_attn_layernorm rides alongside as the attn post norm.
             const ps = try ownF16Plus1(w, s, alloc, layerKey(&k, "{s}post_self_attn_layernorm.weight", p));
@@ -913,21 +948,28 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
         const qh: c_int = @divExact(mlx.getShape(lw.q)[1], @as(c_int, @intCast(te.head_dim)));
         const kh: c_int = @divExact(mlx.getShape(lw.k)[1], @as(c_int, @intCast(te.head_dim)));
         const hd: c_int = @intCast(te.head_dim);
-        var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
-        var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
         const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
-        const lq: usize = L * @as(usize, @intCast(qh));
-        const lk: usize = L * @as(usize, @intCast(kh));
+        const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(vt);
+        const theta = if (full) te.theta_full else te.theta_slide;
+        const p_scale = if (full) (1.0 / te.factor_full) else 1.0;
+        // TE's rope carries a per-layer position scale (YaRN-style on the full
+        // layers) the fused QK kernel has no arm for, so the chain stays
+        // composed here; the fused decode kernel covers the frame loop.
+        var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+        var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+        defer _ = mlx.mlx_array_free(q4);
+        defer _ = mlx.mlx_array_free(k4);
         {
-            const q4f = reshape(q4, &[_]c_int{ @intCast(lq), hd }, s);
+            const q4f = reshape(q4, &[_]c_int{ @intCast(L * @as(usize, @intCast(qh))), hd }, s);
             const q4n1 = rmsn(q4f, lw.qn, te.eps, s);
             _ = mlx.mlx_array_free(q4f);
             const q4n = reshape(q4n1, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
             _ = mlx.mlx_array_free(q4n1);
             _ = mlx.mlx_array_free(q4);
             q4 = q4n;
-            const k4f = reshape(k4, &[_]c_int{ @intCast(lk), hd }, s);
+            const k4f = reshape(k4, &[_]c_int{ @intCast(L * @as(usize, @intCast(kh))), hd }, s);
             const k4n1 = rmsn(k4f, lw.kn, te.eps, s);
             _ = mlx.mlx_array_free(k4f);
             const k4n = reshape(k4n1, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
@@ -935,16 +977,10 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
             _ = mlx.mlx_array_free(k4);
             k4 = k4n;
         }
-        defer _ = mlx.mlx_array_free(q4);
-        defer _ = mlx.mlx_array_free(k4);
         const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(qt);
         const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(kt);
-        const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        defer _ = mlx.mlx_array_free(vt);
-        const theta = if (full) te.theta_full else te.theta_slide;
-        const p_scale = if (full) (1.0 / te.factor_full) else 1.0;
         const qr = ropeApply(qt, theta, p_scale, @intCast(te.head_dim), s);
         defer _ = mlx.mlx_array_free(qr);
         const kr = ropeApply(kt, theta, p_scale, @intCast(te.head_dim), s);
@@ -1771,6 +1807,7 @@ fn loadQLayers(comptime prefix_fmt: []const u8, w: *const Weights, alloc: std.me
             .in_ln = try ownF16(w, s, layerKey(&k, "{s}input_layernorm.weight", p)),
             .post_ln = try ownF16(w, s, layerKey(&k, "{s}post_attention_layernorm.weight", p)),
             .pre_ff = null_arr,
+            .eps_arr = mlx.mlx_array_new_float(d.eps),
         };
     }
     return layers;
