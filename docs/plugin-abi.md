@@ -1254,6 +1254,7 @@ A quant plugin's table, exported as `exportName(name, version)`. `claims`, `vali
 | `bank_rows` | `?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *BankRows) callconv(.c) Verdict` | `null` | The slot rows per routed layer `budget` buys over the pack's streamed expert bank, no memory taken (`open_bank`'s rows); refused by name when none fit. Null: the format streams no bank. |
 | `open_bank` | `?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *Bank) callconv(.c) Verdict` | `null` | The pack's streamed expert bank at the rows `budget` buys; it outlives `close`. |
 | `swiglu_limit_out` | `bool` | `false` | `swiglu` reads `Swiglu.limit_out`. Appended: the host passes a post-SiLU limit only to a table whose `size` reaches this flag and sets it (`clampsOut`), and refuses the call by name otherwise, so a table built before the field is never asked a clamp it would skip. |
+| `exact_rows` | `u32` | `0` | `matmul` over up to this many rows gives each row the bytes of its own one-row call; 0 = not declared, so a host that needs a row's one-row bytes calls one row at a time. Appended: read through `exactRows`. |
 
 ### `BankGate` (extern struct)
 
@@ -1319,6 +1320,7 @@ A streamed bank of routed experts, as the trunk's MoE reads one whose math it do
 | `rows_decode_expand` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict` | `null` |  |
 | `next_ahead` | `?*const fn (ctx: ?*anyopaque, layer: u32, ids: Array) callconv(.c) Verdict` | `null` |  |
 | `meters` | `?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void` | `null` | The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next call; the model logs them beside `[spec-stats]` at the request's end. Null: none. |
+| `exact_rows` | `bool` | `false` | A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets. Appended: read only where `size` reaches it. |
 
 ### `Swiglu` (extern struct)
 

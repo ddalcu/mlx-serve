@@ -106,10 +106,18 @@ pub const QuantTable = extern struct {
     /// reaches this flag and sets it (`clampsOut`), and refuses the call by name otherwise, so a table built before the
     /// field is never asked a clamp it would skip.
     swiglu_limit_out: bool = false,
+    /// `matmul` over up to this many rows gives each row the bytes of its own one-row call; 0 = not declared, so a host
+    /// that needs a row's one-row bytes calls one row at a time. Appended: read through `exactRows`.
+    exact_rows: u32 = 0,
 
     /// Whether the table's `swiglu` honours `Swiglu.limit_out` (a table of any size).
     pub fn clampsOut(t: *const QuantTable) bool {
         return t.size >= @offsetOf(QuantTable, "swiglu_limit_out") + @sizeOf(bool) and t.swiglu_limit_out;
+    }
+
+    /// `exact_rows`, 0 on a table whose `size` ends before it.
+    pub fn exactRows(t: *const QuantTable) u32 {
+        return if (t.size >= @offsetOf(QuantTable, "exact_rows") + @sizeOf(u32)) t.exact_rows else 0;
     }
 
     /// The smallest table the loader admits: one built before `swiglu_limit_out`, whose appended members read as absent
@@ -187,6 +195,9 @@ pub const Bank = extern struct {
     /// The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next
     /// call; the model logs them beside `[spec-stats]` at the request's end. Null: none.
     meters: ?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void = null,
+    /// A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets.
+    /// Appended: read only where `size` reaches it.
+    exact_rows: bool = false,
 };
 
 pub const Swiglu = extern struct {
@@ -223,6 +234,16 @@ test "abi quant: a geometry's post-SiLU limits are read only where its size reac
     g.size = @sizeOf(BankGeometry);
     g.limits_out = null;
     try testing.expectEqual(@as(f32, 0), g.limitOut(1));
+}
+
+test "abi quant: a table's row-exact matmul width is read only where its size reaches it" {
+    var t: QuantTable = undefined;
+    t.size = @sizeOf(QuantTable);
+    t.exact_rows = 16;
+    try testing.expectEqual(@as(u32, 16), t.exactRows());
+    // A table built before the field (at the loader's minimum): not declared.
+    t.size = QuantTable.min_size;
+    try testing.expectEqual(@as(u32, 0), t.exactRows());
 }
 
 test "abi quant: a post-SiLU SwiGLU limit reaches only a table that declares it" {

@@ -294,6 +294,13 @@ test "abi dylib: negotiation accepts its own build and refuses each mismatch by 
     mo.table = &older;
     try testing.expect(negotiate(&mo, pin).isOk());
     try testing.expect(!older.clampsOut());
+    // A table built before the row-exact width: it loads, and declares none.
+    var pre_rows = quantTable("fmt_x");
+    pre_rows.exact_rows = 16;
+    pre_rows.size = @offsetOf(quant_abi.QuantTable, "exact_rows");
+    mo.table = &pre_rows;
+    try testing.expect(negotiate(&mo, pin).isOk());
+    try testing.expectEqual(@as(u32, 0), pre_rows.exactRows());
 }
 
 test "abi dylib: a model table with a hook table older than the host's is refused" {
