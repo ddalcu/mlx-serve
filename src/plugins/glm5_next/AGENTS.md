@@ -26,6 +26,8 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
 - MoE (`moe.zig`, Ling's too, the MTP head's): the shared `sdk/bases/blocks/moe.zig` block; GLM's one-kernel decode
   (`glm5.moeDecode`, affine, up to 16 rows) is the block's `fused` arm, ModelOpt's per-expert up x down scale its
   `route_scale`, Sushi's EXL3 banks its `format_banks`.
+- MTP head (`head.zig`, MLX_SERVE_GLM_HEAD_LAST_ROW; the stock bytes): its merged first draft step's routed experts
+  for the last row alone (`moe.mlpLastRow`).
 - Forward (`table_forward.zig`): the [B,S,4,D] stream through KDA / DSA sublayers inside mHC; KV and recurrent state
   only through `CacheOps` (`slots.kda` writes conv, ssm and a verify's per-row capture back); positions from
   `Forward.positions`; captures = the stream MEAN; batched rows in groups of 8 (`MOE_DECODE_BATCH_MAX`), each slot's

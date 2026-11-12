@@ -362,6 +362,31 @@ fn sourceRows(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r
     return g.concat(outs.items, 1);
 }
 
+/// `mlp`'s output at `x`'s last row alone ([1, S, D], S >= 2, gives [1, 1, D]), for a call whose other rows are never
+/// read: the routing and the ungated shared expert over every row as `mlp` runs them, the format bank's routed experts
+/// over the last row only, then `mlp`'s add. Exact where the format sums each row by itself at up to `max_rows` rows
+/// (its decode chain); null where `mlp` takes another arm or the call is wider, and the caller runs `mlp`.
+pub fn mlpLastRow(w: *const Moe.Weights, parent: *Graph, x: Array, max_rows: c_int) !?Array {
+    const fb = w.format_banks orelse return null;
+    if (w.fused != null or w.streamed != null or w.route_scale.ctx != null) return null;
+    const se = w.shared orelse return null;
+    if (se.gated()) return null;
+    const xs = ops.shape(x);
+    if (xs.len != 3 or xs[0] != 1 or xs[1] < 2 or xs[1] > max_rows) return null;
+    var t = parent.scope();
+    defer t.deinit();
+    const g = &t;
+    // More than one row: `mlp`'s route takes no gate fold.
+    var r = try route(w, g, try routerLogits(w, g, x), null);
+    if (r.gate_logit != null) return null;
+    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+    const n = xs[1];
+    const last: Routed = .{ .inds = try g.sliceAxis(r.inds, 1, n - 1, n), .scores = try g.sliceAxis(r.scores, 1, n - 1, n) };
+    const routed1 = try formatSwiglu(w, &fb, g, try g.sliceAxis(x, 1, n - 1, n), last);
+    const sd = try sharedDown(w, g, &se, x, false);
+    return try parent.keep(try g.add(routed1, try g.sliceAxis(sd, 1, n - 1, n)));
+}
+
 /// Whether `mlp` runs both spans of a split prompt forward (`rows_a`, `rows_b` rows) on a streamed bank's `.source` arm
 /// whose rows are independent (`Routed.rows_independent`) and neither on the `fused` arm: what `mlpSplit` serves. MLX-free: the caller checks every layer before a split
 /// forward runs one.

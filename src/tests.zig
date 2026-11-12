@@ -212,6 +212,7 @@ test {
     _ = @import("sdk/blocks/attention/nax_attention.zig");
     _ = @import("plugins/glm5_next/glm5_next.zig");
     _ = @import("plugins/glm5_next/dsa_nax.zig");
+    _ = @import("plugins/glm5_next/moe.zig");
     _ = @import("sdk/blocks/kda/recurrence.zig");
     _ = @import("sdk/blocks/gdn/decode.zig");
     _ = @import("sdk/blocks/attention/row_attn.zig");
