@@ -29,6 +29,7 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = &layout },
     .weights = &.{ .resident_bytes = &residentBytes },
     .spec = &.{ .trunk_weight = &host.trunkWeight, .head = &head.hooks },
+    .meters = &host.meters,
 };
 
 /// KDA layers keep a recurrent state; an MLA layer caches every head's expanded key (nope | rope) and value.

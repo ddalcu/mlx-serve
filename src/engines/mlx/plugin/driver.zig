@@ -174,21 +174,23 @@ fn streamRoom(config: *const ModelConfig) u64 {
         @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
-/// The decode phase's room (`LoadCtx.stream_room_decode`): a built-in GLM's decode bill in place of its prompt bill;
-/// 0 for every other model, whose decode room stays its prompt room (`LoadCtx.decodeRoom`).
+/// The decode phase's room (`LoadCtx.stream_room_decode`): a built-in GLM's or Ling's decode bill in place of its prompt
+/// bill; 0 for every other model, whose decode room stays its prompt room (`LoadCtx.decodeRoom`).
 fn streamRoomDecode(config: *const ModelConfig) u64 {
     return streamRoomDecodeAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
         @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
-/// Whether the engine bills this model's decode phase apart (a built-in GLM on a streamed plugin that prices no prompt
-/// of its own: a plugin that does keeps one room).
+/// Whether the engine bills this model's decode phase apart: a built-in GLM on a streamed plugin that prices no prompt
+/// of its own, and Ling (bailing_hybrid), which runs GLM's trunk (KDA layers, attention caches, the same checkpoints)
+/// though its plugin prices its prompt. Another plugin that prices its own prompt keeps one room.
 fn decodeBilled(config: *const ModelConfig) bool {
     const b = config.plugin orelse return false;
-    if (!b.parsed.caps.streamed_weights or !config.isGlm5()) return false;
+    const ling = std.mem.eql(u8, config.model_type, "bailing_hybrid");
+    if (!b.parsed.caps.streamed_weights or !(config.isGlm5() or ling)) return false;
     var bill: abi.Bill = .{};
     b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
-    return bill.prefill_bytes == null;
+    return bill.prefill_bytes == null or ling;
 }
 
 fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
@@ -393,6 +395,67 @@ test "driver: a streamed built-in GLM's bills grow from the rooms' cell to its c
     try std.testing.expect(g.prompt > 0 and g.decode > 0);
     try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, 16_384).prompt);
     try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, abi.stream_room_cell).decode);
+}
+
+test "driver: a streamed Ling's decode room is the ceiling less the engine's decode bill, the coarse head and the margin" {
+    const t = std.testing;
+    const Probe = struct {
+        fn prefill(_: *const abi.Parsed, _: u64, _: u32, _: u8, _: u64) callconv(.c) u64 {
+            return 3 << 30;
+        }
+        fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill };
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.bill;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true }, .spec = .{ .mtp_layout = .in_checkpoint } } };
+    var cfg = try model.parseConfigFromJson(t.allocator, @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json"));
+    const own = cfg.plugin;
+    const mt = cfg.model_type;
+    defer {
+        cfg.plugin = own;
+        cfg.model_type = mt;
+        cfg.deinit(t.allocator);
+    }
+    cfg.plugin = &binding;
+    const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(&cfg, 16_384 + 1_024, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
+    const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(&cfg, false);
+    try t.expect(need > 0 and coarse > 0);
+    try t.expectEqual((64 << 30) - need - coarse - (1 << 30), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+    // A model outside GLM's trunk that prices its own prompt keeps one room.
+    cfg.model_type = "qwen3";
+    try t.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+}
+
+test "driver: Ling's decode room leaves GLM's rooms as they were: the built-in's own bills, a plugin-priced GLM one room" {
+    const t = std.testing;
+    const Probe = struct {
+        fn prefill(_: *const abi.Parsed, _: u64, _: u32, _: u8, _: u64) callconv(.c) u64 {
+            return 3 << 30;
+        }
+        fn priced(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill };
+        }
+        fn empty(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{};
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.empty;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true }, .spec = .{ .mtp_layout = .in_checkpoint } } };
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    // the built-in GLM: its decode room is its own decode bill, the coarse head and the margin, as before Ling's
+    const glm = @import("../admission/glm5_bill.zig");
+    const need = glm.glm5DecodeMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
+    const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(&cfg, false);
+    try t.expectEqual((64 << 30) - need - coarse - (1 << 30), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+    const prompt_room = streamRoomAt(&cfg, 64 << 30, 1 << 30);
+    try t.expectEqual((64 << 30) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, roomChunk(&cfg), .{}) - coarse - (1 << 30), prompt_room);
+    // a GLM whose plugin prices its own prompt keeps one room (only Ling's trunk is exempt)
+    table.bill = &Probe.priced;
+    try t.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
 }
 
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
