@@ -722,12 +722,6 @@ pub const DRAFT_HEAD_BITS: u32 = 3;
 /// Group size every coarse head is packed at.
 pub const RERANK_COARSE_GROUP: u32 = 64;
 
-/// Resident bytes of the coarse head built for a `vocab` x `hidden` head at `bits` (`buildRerankCoarse`, or the
-/// draft-only head `buildDraftHead` keeps where no rerank is built): packed words plus a bf16 scale and bias a group.
-pub fn rerankCoarseBytes(vocab: u64, hidden: u64, bits: u32) u64 {
-    return vocab * hidden * bits / 8 + 2 * 2 * vocab * (hidden / RERANK_COARSE_GROUP);
-}
-
 /// A BUILT coarse readout head: the packed weights plus the geometry they
 /// were packed with. Both live together because `mlx_quantized_matmul` needs
 /// all three and only the build knows them.

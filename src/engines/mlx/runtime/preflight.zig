@@ -286,7 +286,7 @@ pub fn mtpSidecarDiskBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: 
 /// facts declare one (`SpecFacts.mtp_layout`), a legacy model whose pack ships one.
 pub fn mtpCoarseBytes(config: *const model_mod.ModelConfig, legacy_head: bool) u64 {
     const head = if (config.plugin) |b| b.parsed.spec.mtp_layout != .none else legacy_head;
-    return if (head) mtp_mod.rerankCoarseBytes(config.vocab_size, config.hidden_size, mtp_mod.DRAFT_HEAD_BITS) else 0;
+    return if (head) mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mtp_mod.DRAFT_HEAD_BITS) else 0;
 }
 
 /// Resident bytes a sidecar takes once loaded: `bits` per weight plus a bf16
