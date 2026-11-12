@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
-const env = @import("../../../env.zig");
 const resident = @import("../../../sdk/weights/resident.zig");
 const sdk_fixture = @import("../../../sdk/testing/fixture.zig");
 const config = @import("../config.zig");
@@ -43,18 +42,8 @@ pub const DraftOpts = struct {
     vocab: u32 = 129280,
     /// Committed positions the stages' windows hold.
     ctx: usize = 1024,
-    seed: u64 = 1,
     act: mlx.mlx_dtype = .bfloat16,
     /// This rank's slice of the stages and its rows of the heads, the draft sharded (`InitOpts.draft_shard`).
-    tp: ?Shard = null,
-};
-
-pub const WholeOpts = struct {
-    layers: u32 = 2,
-    experts: u32 = 8,
-    vocab: u32 = 1024,
-    seed: u64 = 1,
-    /// This rank of a tensor group: its slice of every expert and head, its rows of the LM head (`head_part`).
     tp: ?Shard = null,
 };
 
@@ -104,7 +93,7 @@ pub const Fixture = struct {
         cfg.dsv41_dspark_experts = opts.experts;
         cfg.vocab_size = opts.vocab;
         cfg.dsv4_dspark_noise_token_id = @min(cfg.dsv4_dspark_noise_token_id, opts.vocab - 1);
-        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed };
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = 1 };
         errdefer fx.w.deinit();
         try fx.putDraftHeads(&cfg);
         for (0..cfg.dsparkStages()) |si| try fx.putLayer(&cfg, "mtp.{d}.", si, opts.experts, true, null);
@@ -118,26 +107,28 @@ pub const Fixture = struct {
         return fx;
     }
 
-    /// A whole model at the release's widths, `layers` trunk layers deep over a small vocabulary (its embedding, head
-    /// and final norm; no Engram, no DSpark), with no state yet: what a tensor group's decode runs on.
-    pub fn initWhole(gpa: std.mem.Allocator, opts: WholeOpts) !*Fixture {
+    /// Rank `tp` of a whole model at the release's widths, two trunk layers deep over a small vocabulary (its
+    /// embedding, head and final norm; no Engram, no DSpark), with no state yet: what a tensor group's decode runs on.
+    pub fn initWhole(gpa: std.mem.Allocator, tp: Shard) !*Fixture {
+        const layers = 2;
+        const experts = 8;
         const fx = try gpa.create(Fixture);
         errdefer gpa.destroy(fx);
         var cfg = try releaseConfig();
-        cfg.num_experts = opts.experts;
-        cfg.num_hidden_layers = opts.layers;
-        cfg.vocab_size = opts.vocab;
+        cfg.num_experts = experts;
+        cfg.num_hidden_layers = layers;
+        cfg.vocab_size = 1024;
         cfg.dsv41_n_engram_layers = 0;
-        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = opts.seed };
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = 1 };
         errdefer fx.w.deinit();
         const d: c_int = @intCast(cfg.hidden_size);
         const v: c_int = @intCast(cfg.vocab_size);
         try fx.putVec("embed.weight", .{}, &.{ v, d }, .bfloat16, 0, 1);
         try fx.putVec("head.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.05);
         try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
-        for (0..opts.layers) |li| try fx.putLayer(&cfg, "layers.{d}.", li, opts.experts, true, null);
-        if (opts.tp) |t| try fx.sliceShard(t);
-        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .tp = opts.tp });
+        for (0..layers) |li| try fx.putLayer(&cfg, "layers.{d}.", li, experts, true, null);
+        try fx.sliceShard(tp);
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .tp = tp });
         return fx;
     }
 
@@ -471,7 +462,7 @@ test "dsv41 tensor parallel: two ranks on half the heads and experts, summing ea
         defer in.deinit();
         const want = try streamOf(gpa, whole, in);
         defer gpa.free(want);
-        const got = try tpStream(gpa, base, in);
+        const got = try tpStream(gpa, base, in, 2);
         defer gpa.free(got);
         var peak: f32 = 0;
         for (want) |v| peak = @max(peak, @abs(v));
@@ -499,7 +490,7 @@ test "dist N-rank: four ranks on a quarter of the heads and experts, summing eac
         defer in.deinit();
         const want = try streamOf(gpa, whole, in);
         defer gpa.free(want);
-        const got = try tpStreamN(gpa, base, in, 4);
+        const got = try tpStream(gpa, base, in, 4);
         defer gpa.free(got);
         var peak: f32 = 0;
         for (want) |v| peak = @max(peak, @abs(v));
@@ -532,11 +523,11 @@ test "dsv41 tensor parallel: the ranks on the fused decode kernels decode no fur
             defer gpa.free(c);
             o = base;
             o.fused = true;
-            const g = try tpStream(gpa, o, in);
+            const g = try tpStream(gpa, o, in, 2);
             defer gpa.free(g);
             if (seed == 1) {
                 // The kernels ran: the ranks on the chain alone land elsewhere.
-                const g_chain = try tpStream(gpa, base, in);
+                const g_chain = try tpStream(gpa, base, in, 2);
                 defer gpa.free(g_chain);
                 try std.testing.expect(!std.mem.eql(f32, g, g_chain));
             }
@@ -814,18 +805,10 @@ fn streamOf(gpa: std.mem.Allocator, fx: *Fixture, in: Input) ![]f32 {
     return dsv41.hostF32(out[0]);
 }
 
-/// The stream two tensor ranks built from `base` reach over `in` (caller frees). One process cannot run
-/// the ranks in lockstep: each pass runs one rank against the other's partials from its latest pass, and a sum depends
-/// only on the sums before it, so passes fix them one by one; the last pass changes none.
-fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input) ![]f32 {
-    return tpStreamN(gpa, base, in, 2);
-}
-
-/// The stream `n` ranks give, each on its 1/n of the heads and experts, their sums met by a fixed point: every pass
-/// runs each rank on the others' parts from the pass before, until no sum changes.
-fn tpStreamN(gpa: std.mem.Allocator, base: Opts, in: Input, n: usize) ![]f32 {
-    const max = 4;
-    var ranks: [max]*Fixture = undefined;
+/// The stream `n` tensor ranks built from `base` reach over `in`, each on its 1/n of the heads and experts (caller
+/// frees), their sums met by `Group`'s fixed point.
+fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input, n: usize) ![]f32 {
+    var ranks: [Group.max]*Fixture = undefined;
     var made: usize = 0;
     defer for (ranks[0..made]) |r| r.deinit();
     for (ranks[0..n], 0..) |*r, i| {
@@ -834,61 +817,15 @@ fn tpStreamN(gpa: std.mem.Allocator, base: Opts, in: Input, n: usize) ![]f32 {
         r.* = try Fixture.init(gpa, o);
         made += 1;
     }
-    const Sums = struct {
-        var rank: usize = 0;
-        var size: usize = 2;
-        var parts: [max]std.ArrayList(A) = @splat(.empty);
-        var prev: [max]std.ArrayList(A) = @splat(.empty);
-        fn sum(x: A) anyerror!A {
-            try mlx.check(mlx.mlx_array_eval(x));
-            var kept = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&kept, x);
-            const k = parts[rank].items.len;
-            try parts[rank].append(std.testing.allocator, kept);
-            // Summed in rank order, as every rank sums: the ranks then agree to the bit.
-            var acc = mlx.mlx_array_new();
-            var first = true;
-            for (0..size) |r| {
-                const p = if (r == rank) x else if (k < parts[r].items.len) parts[r].items[k] else continue;
-                if (first) {
-                    _ = mlx.mlx_array_set(&acc, p);
-                    first = false;
-                    continue;
-                }
-                var next = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&next, acc, p, mlx.gpuStream()));
-                _ = mlx.mlx_array_free(acc);
-                acc = next;
-            }
-            return acc;
-        }
-        fn clear(l: *std.ArrayList(A)) void {
-            for (l.items) |a| _ = mlx.mlx_array_free(a);
-            l.clearRetainingCapacity();
-        }
-    };
-    Sums.size = n;
-    dsv41.clusterHooks().tp_sum = &Sums.sum;
-    defer {
-        dsv41.clusterHooks().tp_sum = null;
-        for (&Sums.parts, &Sums.prev) |*a, *b| {
-            Sums.clear(a);
-            Sums.clear(b);
-            a.deinit(gpa);
-            b.deinit(gpa);
-            a.* = .empty;
-            b.* = .empty;
-        }
-    }
-    var got: [max][]f32 = @splat(&.{});
+    Group.join(n);
+    defer Group.leave();
+    var got: [Group.max][]f32 = @splat(&.{});
     defer for (got) |g| gpa.free(g);
     // A pass fixes at least one more sum; the last pass changes none. A wide chunk sums each span's attention.
     const spans = (@as(usize, @intCast(mlx.getShape(in.x)[0])) + dsv41.SPAN - 1) / dsv41.SPAN;
     const sums = (spans + 1) * (base.hi - base.lo);
     for (0..sums + 2) |_| for (0..n) |r| {
-        Sums.clear(&Sums.prev[r]);
-        std.mem.swap(std.ArrayList(A), &Sums.prev[r], &Sums.parts[r]);
-        Sums.rank = r;
+        Group.begin(r);
         const out = try in.step(gpa, ranks[r].m);
         defer for (out) |a| {
             _ = mlx.mlx_array_free(a);
@@ -897,16 +834,8 @@ fn tpStreamN(gpa: std.mem.Allocator, base: Opts, in: Input, n: usize) ![]f32 {
         got[r] = &.{};
         got[r] = try dsv41.hostF32(out[0]);
     };
-    for (Sums.parts[0..n], Sums.prev[0..n]) |now, before| {
-        try std.testing.expectEqual(sums, now.items.len);
-        for (now.items, before.items) |a, b| {
-            const u = try dsv41.hostF32(a);
-            defer gpa.free(u);
-            const v = try dsv41.hostF32(b);
-            defer gpa.free(v);
-            try std.testing.expectEqualSlices(f32, u, v);
-        }
-    }
+    for (0..n) |r| try std.testing.expectEqual(sums, Group.parts[r].items.len);
+    try Group.expectSettled();
     for (1..n) |r| {
         try std.testing.expectEqualSlices(f32, got[0], got[r]);
         // The ranks' caches come off the same summed stream through whole KV weights: rank 0's snapshot is every worker's.
@@ -964,42 +893,44 @@ fn expectSameF32s(a: []const []f32, b: []const []f32) !void {
 
 /// Tensor ranks in one process: a collective meets the other ranks' parts from their latest run of the same program,
 /// and each pass reruns every rank's whole program until no part changes (a part depends only on those before it, so a
-/// pass fixes at least one more). A part not yet shaped as the caller's stands as zeros.
-const Group = struct {
-    const max = 4;
-    const Kind = enum { sum, gather };
+/// pass fixes at least one more). A part not yet shaped as the caller's stands as zeros. Sums add in rank order, as
+/// every rank sums, so the ranks agree to the bit.
+pub const Group = struct {
+    pub const max = 4;
+    const Call = struct { gather: bool, shape: [8]c_int = @splat(0), ndim: usize, dtype: mlx.mlx_dtype };
     var rank: usize = 0;
     var size: usize = max;
     var parts: [max]std.ArrayList(A) = @splat(.empty);
     var prev: [max]std.ArrayList(A) = @splat(.empty);
-    var kinds: [max]std.ArrayList(Kind) = @splat(.empty);
+    var calls: [max]std.ArrayList(Call) = @splat(.empty);
 
-    fn join(n: usize) void {
+    pub fn join(n: usize) void {
         size = n;
         dsv41.clusterHooks().tp_sum = &sum;
         dsv41.clusterHooks().tp_gather = &gather;
     }
 
-    fn leave() void {
+    pub fn leave() void {
         dsv41.clusterHooks().tp_sum = null;
         dsv41.clusterHooks().tp_gather = null;
-        for (&parts, &prev, &kinds) |*a, *b, *k| {
+        for (&parts, &prev, &calls) |*a, *b, *c| {
             clear(a);
             clear(b);
             a.deinit(std.testing.allocator);
             b.deinit(std.testing.allocator);
-            k.deinit(std.testing.allocator);
+            c.deinit(std.testing.allocator);
             a.* = .empty;
             b.* = .empty;
-            k.* = .empty;
+            c.* = .empty;
         }
     }
 
-    fn begin(r: usize) void {
+    /// Rank `r` starts its program again.
+    pub fn begin(r: usize) void {
         rank = r;
         clear(&prev[r]);
         std.mem.swap(std.ArrayList(A), &prev[r], &parts[r]);
-        kinds[r].clearRetainingCapacity();
+        calls[r].clearRetainingCapacity();
     }
 
     fn clear(l: *std.ArrayList(A)) void {
@@ -1007,12 +938,15 @@ const Group = struct {
         l.clearRetainingCapacity();
     }
 
-    fn keep(x: A, kind: Kind) !usize {
+    fn keep(x: A, is_gather: bool) !usize {
         try mlx.check(mlx.mlx_array_eval(x));
         var kept = mlx.mlx_array_new();
         _ = mlx.mlx_array_set(&kept, x);
         try parts[rank].append(std.testing.allocator, kept);
-        try kinds[rank].append(std.testing.allocator, kind);
+        const sh = mlx.getShape(x);
+        var c: Call = .{ .gather = is_gather, .ndim = sh.len, .dtype = mlx.mlx_array_dtype(x) };
+        @memcpy(c.shape[0..sh.len], sh);
+        try calls[rank].append(std.testing.allocator, c);
         return parts[rank].items.len - 1;
     }
 
@@ -1024,9 +958,8 @@ const Group = struct {
         return p;
     }
 
-    /// Summed in rank order, as every rank sums: the ranks then agree to the bit.
     fn sum(x: A) anyerror!A {
-        const k = try keep(x, .sum);
+        const k = try keep(x, false);
         var acc: A = none;
         for (0..size) |r| {
             const p = partOf(r, k, x) orelse continue;
@@ -1044,7 +977,7 @@ const Group = struct {
     }
 
     fn gather(x: A) anyerror!A {
-        const k = try keep(x, .gather);
+        const k = try keep(x, true);
         var xs: [max]A = undefined;
         var zeros: [max]A = @splat(none);
         defer for (zeros) |z| if (z.ctx != null) {
@@ -1063,7 +996,8 @@ const Group = struct {
         return o;
     }
 
-    fn settled() !bool {
+    /// Whether no rank's part moved in the last pass.
+    pub fn settled() !bool {
         for (0..size) |r| {
             if (parts[r].items.len != prev[r].items.len) return false;
             for (parts[r].items, prev[r].items) |a, b| {
@@ -1076,6 +1010,12 @@ const Group = struct {
             }
         }
         return true;
+    }
+
+    /// The group settled, and every rank issued the same collectives (kind, shape and dtype) in the same order.
+    pub fn expectSettled() !void {
+        try std.testing.expect(try settled());
+        for (1..size) |r| try std.testing.expectEqualDeep(calls[0].items, calls[r].items);
     }
 };
 
@@ -1237,10 +1177,9 @@ fn decodeGroup(ranks: []const *Fixture, prompt: []const u32, max: usize, eos: ?u
         }
         if (pass > 0 and try Group.settled()) break;
     }
+    try Group.expectSettled();
     const lead = ranks[0].m;
-    for (ranks[1..], 1..) |r, i| {
-        try std.testing.expectEqualSlices(Group.Kind, Group.kinds[0].items, Group.kinds[i].items);
-        for (Group.parts[0].items, Group.parts[i].items) |a, b| try std.testing.expectEqualSlices(c_int, mlx.getShape(a), mlx.getShape(b));
+    for (ranks[1..]) |r| {
         try std.testing.expectEqual(lead.dec_state.?.n, r.m.dec_state.?.n);
         try expectSameCaches(gpa, lead, r.m);
     }
@@ -1256,7 +1195,7 @@ test "dist N-rank: four ranks decode with the token on the GPU as with its id in
     var made: usize = 0;
     defer for (ranks[0..made]) |r| r.deinit();
     for (&ranks, 0..) |*r, i| {
-        r.* = try Fixture.initWhole(gpa, .{ .tp = .{ .rank = @intCast(i), .size = 4 } });
+        r.* = try Fixture.initWhole(gpa, .{ .rank = @intCast(i), .size = 4 });
         made += 1;
     }
     const prompt = [_]u32{ 11, 400, 7, 901, 55 };
@@ -1287,61 +1226,4 @@ test "dist N-rank: four ranks decode with the token on the GPU as with its id in
     try std.testing.expectEqual(@as(usize, 2), piped_eos.steps);
     try std.testing.expectEqual(ref_eos.steps - 2, piped_eos.pipes);
     try expectSameF32s(ref_eos.caches, piped_eos.caches);
-}
-
-/// Collectives that cost nothing: one rank's timing without the network.
-const Stub = struct {
-    fn sum(x: A) anyerror!A {
-        var o = mlx.mlx_array_new();
-        _ = mlx.mlx_array_set(&o, x);
-        return o;
-    }
-
-    fn gather(x: A) anyerror!A {
-        const xs = [_]A{ x, x, x, x };
-        const vec = mlx.mlx_vector_array_new_data(&xs, xs.len);
-        defer _ = mlx.mlx_vector_array_free(vec);
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 0, mlx.gpuStream()));
-        return o;
-    }
-};
-
-test "dsv41 tp pipe ubench: rank 0's decode steps with the token on the GPU against an id header each, stub collectives (DSV41_TP_PIPE_UBENCH)" {
-    if (env.get(.DSV41_TP_PIPE_UBENCH) == null or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const gpa = std.testing.allocator;
-    const fx = try Fixture.initWhole(gpa, .{ .layers = 8, .experts = 32, .vocab = 32768, .tp = .{ .rank = 0, .size = 4 } });
-    defer fx.deinit();
-    dsv41.clusterHooks().tp_sum = &Stub.sum;
-    dsv41.clusterHooks().tp_gather = &Stub.gather;
-    dsv41.clusterHooks().tp_step = &Ops.step;
-    defer {
-        dsv41.clusterHooks().tp_sum = null;
-        dsv41.clusterHooks().tp_gather = null;
-        dsv41.clusterHooks().tp_step = null;
-        dsv41.clusterHooks().tp_pipe = null;
-        Ops.deinit();
-    }
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const iou = @import("../../../sdk/util/io_util.zig");
-    const prompt = [_]u32{ 11, 400, 7, 901, 55 };
-    const short = 16;
-    const long = 144;
-    // A step's time is the best long run's less the best short run's, over the steps between them (the prompt and the
-    // first token cancel); one untimed run of each arm warms the kernels.
-    var us: [2]f64 = undefined;
-    for ([_]bool{ false, true }, &us) |pipes, *per| {
-        dsv41.clusterHooks().tp_pipe = if (pipes) &Ops.pipe else null;
-        var best: [2]i64 = .{ std.math.maxInt(i64), std.math.maxInt(i64) };
-        for (0..4) |rep| for ([_]usize{ short, long }, &best) |n, *b| {
-            var out: std.ArrayList(u32) = .empty;
-            defer out.deinit(gpa);
-            Ops.reset();
-            const t0 = iou.nowUsMonotonic(io);
-            try leadDecode(fx.m, &prompt, n, null, null, &out);
-            if (rep > 0) b.* = @min(b.*, iou.nowUsMonotonic(io) - t0);
-        };
-        per.* = @as(f64, @floatFromInt(best[1] - best[0])) / (long - short);
-    }
-    std.debug.print("[tp-pipe] rank 0, 8 layers at the release's widths, stub collectives: id header {d:.0} us/step ({d:.1} steps/s), token on the GPU {d:.0} us/step ({d:.1} steps/s), x{d:.3}\n", .{ us[0], 1e6 / us[0], us[1], 1e6 / us[1], us[0] / us[1] });
 }

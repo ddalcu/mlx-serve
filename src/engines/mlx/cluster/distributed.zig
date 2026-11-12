@@ -191,7 +191,7 @@ pub const Link = struct {
         }
         if (link.rank == 0) {
             var mb: [64]u8 = undefined;
-            const missing = missingRanks(link.bellMask(), link.size, &mb);
+            const missing = missingRanks(bellMask(&link.bells, link.size), link.size, &mb);
             if (missing.len > 0 and link.size > 2) {
                 log.err("[dist] no bell connection from rank {s}: is that worker an older mlx-serve?\n", .{missing});
                 link.deinit();
@@ -209,15 +209,6 @@ pub const Link = struct {
             b.* = .{};
         };
         _ = mlx.mlx_distributed_group_free(self.group);
-    }
-
-    /// Bit `k` set for each worker `k` rank 0 has a bell to.
-    fn bellMask(self: *const Link) u32 {
-        var m: u32 = 0;
-        for (1..self.size) |k| if (self.bells[k].open()) {
-            m |= @as(u32, 1) << @intCast(k);
-        };
-        return m;
     }
 
     // The collectives have CPU kernels only, so every op runs on this thread's CPU stream
@@ -379,7 +370,7 @@ const Bell = struct {
 const Rendezvous = struct {
     listener: std.c.fd_t,
     size: u32,
-    fds: [max_ranks]std.c.fd_t = @splat(Bell.none),
+    bells: [max_ranks]Bell = @splat(.{}),
     mu: std.atomic.Mutex = .unlocked,
     stop: std.atomic.Value(bool) = .init(false),
 
@@ -397,32 +388,23 @@ const Rendezvous = struct {
             }
             self.lock();
             defer self.mu.unlock();
-            if (self.fds[got.rank] != Bell.none) _ = std.c.close(self.fds[got.rank]);
-            self.fds[got.rank] = got.bell.fd;
-            cluster().bells_seen.store(self.seenLocked(), .release);
+            if (self.bells[got.rank].open()) _ = std.c.close(self.bells[got.rank].fd);
+            self.bells[got.rank] = got.bell;
+            cluster().bells_seen.store(bellMask(&self.bells, self.size), .release);
         }
     }
 
-    fn seenLocked(self: *const Rendezvous) u32 {
-        var m: u32 = 0;
-        for (1..self.size) |k| if (self.fds[k] != Bell.none) {
-            m |= @as(u32, 1) << @intCast(k);
-        };
-        return m;
-    }
-
-    /// Bit `k` set for each worker `k` whose bell has come.
+    /// `bellMask` of the bells that have come.
     fn seen(self: *Rendezvous) u32 {
         self.lock();
         defer self.mu.unlock();
-        return self.seenLocked();
+        return bellMask(&self.bells, self.size);
     }
 
     /// Whether every worker's bell came within `ms`.
     fn waitAll(self: *Rendezvous, ms: u32) bool {
-        const all: u32 = ((@as(u32, 1) << @intCast(self.size)) - 1) & ~@as(u32, 1);
         var waited: u32 = 0;
-        while (self.seen() != all) : (waited += 20) {
+        while (self.seen() != allBells(self.size)) : (waited += 20) {
             if (waited >= ms) return false;
             crt.sleepMs(20);
         }
@@ -433,21 +415,33 @@ const Rendezvous = struct {
     fn handOver(self: *Rendezvous, link: *Link) void {
         self.lock();
         defer self.mu.unlock();
-        for (1..self.size) |k| {
-            link.bells[k] = .{ .fd = self.fds[k] };
-            self.fds[k] = Bell.none;
-        }
+        link.bells = self.bells;
+        self.bells = @splat(.{});
     }
 
     fn close(self: *Rendezvous) void {
-        for (&self.fds) |*fd| if (fd.* != Bell.none) {
-            _ = std.c.close(fd.*);
-            fd.* = Bell.none;
+        for (&self.bells) |*b| if (b.open()) {
+            _ = std.c.close(b.fd);
+            b.* = .{};
         };
         if (self.listener != Bell.none) _ = std.c.close(self.listener);
         self.listener = Bell.none;
     }
 };
+
+/// Bit `k` set for each worker `k` of a `size`-Mac group with a bell in `bells`.
+fn bellMask(bells: *const [max_ranks]Bell, size: u32) u32 {
+    var m: u32 = 0;
+    for (1..size) |k| if (bells[k].open()) {
+        m |= @as(u32, 1) << @intCast(k);
+    };
+    return m;
+}
+
+/// `bellMask` with every worker's bell.
+fn allBells(size: u32) u32 {
+    return ((@as(u32, 1) << @intCast(size)) - 1) & ~@as(u32, 1);
+}
 
 /// The workers of a `size`-Mac group missing from `mask` (bit `k` = rank `k`), as "2, 3".
 fn missingRanks(mask: u32, size: u32, out: []u8) []const u8 {
@@ -477,9 +471,6 @@ fn parseCoordinator(text: []const u8) !Coordinator {
 // ── Wire protocol: fixed int32[8] control messages, then any payload tensor ──
 
 pub const MAGIC = wire.MAGIC;
-/// 6: a worker names its rank on the bell, the group may hold more than two Macs, and a DeepSeek-V4.1 tensor plan carries
-/// the sums' mode, the head's precision and whether the DSpark stages split (every rank then drafts, OP_DSV41_TP_DRAFT);
-/// a tensor decode step can come as a bell byte alone, its token gathered on the GPU (OP_DSV41_TP_PIPE).
 const VERSION: i32 = 6;
 pub const Msg = wire.Msg;
 const OP_FORWARD: i32 = 1;
@@ -573,6 +564,7 @@ fn recvMsg(link: *const Link, src: u32) !Msg {
     const d = mlx.mlx_array_data_int32(r) orelse return error.DistBadMessage;
     var m: Msg = undefined;
     @memcpy(&m, d[0..8]);
+    if (link.rank != 0 and m[0] == OP_STOP) cluster().stopping.store(true, .release);
     return m;
 }
 
@@ -873,7 +865,8 @@ const ClusterState = struct {
     free_mib: [max_ranks]std.atomic.Value(u32) = @splat(.init(0)),
     /// Bit `k` set once worker `k`'s bell has come, while the group forms (the join names the rest).
     bells_seen: std.atomic.Value(u32) = .init(0),
-    /// The group is ending on purpose (`shutdown`, or a worker that read its stop): a bell that closes now is no loss.
+    /// The group is ending on purpose (`shutdown`, or a worker that read its stop in `recvMsg`): a bell that closes
+    /// now is no loss.
     stopping: std.atomic.Value(bool) = .init(false),
     /// The worker whose bell closed (0: none).
     lost_rank: std.atomic.Value(u32) = .init(0),
@@ -904,7 +897,7 @@ const Group = struct {
     started_us: i64 = 0,
 };
 
-pub const JoinState = enum { joined, forming, late };
+const JoinState = enum { joined, forming, late };
 
 /// Whether the group has joined, is still forming `waited_ms` after startup, or is past its join timeout.
 fn joinState(joined_now: bool, waited_ms: u64, timeout_s: u32) JoinState {
@@ -1069,7 +1062,7 @@ pub fn planFor(model_dir: []const u8, config: *const model_mod.ModelConfig) !?Pa
     const p = try join();
     if (p.planned) {
         try p.samePlannedCopy(model_dir);
-        if (p.shard) |sh| if (config.isDsv41()) try samePlannedStages(sh, dsv41DraftShard(cluster().group.?.io, config, sh.size, model_dir));
+        if (p.shard) |sh| if (config.isDsv41()) try samePlannedStages(sh, dsv41DraftShard(cluster().group.?.io, config, model_dir));
     } else try plan(p, config, model_dir);
     if (p.remote) |r| return .{ .remote = r };
     return if (p.shard) |sh| .{ .shard = sh } else .{ .span = p.span };
@@ -1237,7 +1230,7 @@ fn plan(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []const u8
     switch (self.mode) {
         .tensor => {
             if (config.num_experts == 0) return error.DistTensorNeedsMoe;
-            self.shard = .{ .rank = 0, .size = self.link.size };
+            self.shard = .{ .rank = 0, .size = 2 };
             log.info("[dist] tensor: each expert of {s} split across this Mac and the worker\n", .{std.fs.path.basename(self.model)});
         },
         .rows => return error.DistArchUnsupported,
@@ -1261,7 +1254,7 @@ fn planDsv41(self: *Peer, config: *const model_mod.ModelConfig, model_dir: []con
     switch (self.mode) {
         .pipeline => {},
         .tensor => {
-            const stages = dsv41DraftShard(cluster().group.?.io, config, self.link.size, model_dir);
+            const stages = dsv41DraftShard(cluster().group.?.io, config, model_dir);
             self.shard = .{ .rank = 0, .size = self.link.size, .stages = stages };
             log.info("[dist] tensor: every expert and attention head of {s} split across {d} Macs; DSpark {s}\n", .{ std.fs.path.basename(self.model), self.link.size, if (stages) "drafts on every rank" else "is off (turned off, or the pack ships no stages)" });
             const pl: Plan = .{ .mode = .tensor, .span = .{ .start = 0, .end = n, .total = n }, .hidden = @intCast(config.hidden_size), .experts = @intCast(config.num_experts), .stages = stages, .sum = @intFromEnum(try dsv41_mod.tpSumWanted()), .head8 = dsv41_mod.head8Wanted() };
@@ -1376,8 +1369,7 @@ fn dsv41TpPipe(gen: u64, n: usize) anyerror!bool {
 /// Rank 0 hands plain decode steps over by bell alone when every worker has its bell. Workers follow whatever their
 /// bell says.
 fn tpPipeWanted(link: *const Link) bool {
-    var mb: [64]u8 = undefined;
-    return missingRanks(link.bellMask(), link.size, &mb).len == 0;
+    return bellMask(&link.bells, link.size) == allBells(link.size);
 }
 
 /// Host: one batched step over the states `gens`, each at its position `p0s[k]` with its ids `chunks[k]`.
@@ -1401,10 +1393,10 @@ fn dsv41TpBatch(gens: []const u64, p0s: []const usize, chunks: []const []const u
 
 /// Whether rank 0's DSpark stages load and split across the group: the pack declares them, ships their weights and the
 /// plugin loads them (`dsparkWanted`).
-fn dsv41DraftShard(io: std.Io, config: *const model_mod.ModelConfig, size: u32, model_dir: []const u8) bool {
+fn dsv41DraftShard(io: std.Io, config: *const model_mod.ModelConfig, model_dir: []const u8) bool {
     const binding = config.plugin orelse return false;
     const cfg = @import("../../../plugins/deepseek_v41/config.zig").of(&binding.parsed);
-    return size > 1 and cfg.dsparkStages() > 0 and dsv41_mod.dsparkWanted(cfg, null, config.mtp_override) and dsv41_mod.packShipsStages(io, model_dir);
+    return cfg.dsparkStages() > 0 and dsv41_mod.dsparkWanted(cfg, null, config.mtp_override) and dsv41_mod.packShipsStages(io, model_dir);
 }
 
 /// Host: a sharded DSpark draft over the states `gens`, each at `p0s[k]` drafting from `t1s[k]` (a batch body with one
@@ -1609,10 +1601,7 @@ fn serveDsv41(io: std.Io, allocator: std.mem.Allocator, link: *const Link, dir: 
     while (true) {
         const msg = try recvMsg(link, 0);
         switch (msg[0]) {
-            OP_STOP => {
-                cluster().stopping.store(true, .release);
-                break;
-            },
+            OP_STOP => break,
             OP_RELEASE => return true,
             OP_DSV41 => {
                 const p0: usize = @as(usize, @intCast(msg[2])) | (@as(usize, @intCast(msg[3])) << 31);
@@ -1985,7 +1974,6 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     if (short.len > 0) try sendBytes(&link, short, 0);
     while (true) {
         const pmsg = try recvMsg(&link, 0);
-        if (pmsg[0] == OP_STOP) cluster().stopping.store(true, .release);
         if (pmsg[0] == OP_STOP or !try servePlan(io, allocator, &link, roots.items, pmsg)) break;
         log.info("[dist] worker: released its part, waiting for the host to load a model\n", .{});
     }
@@ -2076,7 +2064,7 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
         log.err("[dist] worker: {s}\n", .{@errorName(err)});
         return err;
     };
-    var xfm = load(io, allocator, dir, &config, pl.mode, pl.span, .{ .rank = link.rank, .size = link.size }) catch |err| {
+    var xfm = load(io, allocator, dir, &config, pl.mode, pl.span) catch |err| {
         log.err("[dist] worker load failed: {s}\n", .{@errorName(err)});
         fail.send(link, LOAD_FAILED);
         return err;
@@ -2093,10 +2081,7 @@ fn servePlan(io: std.Io, allocator: std.mem.Allocator, link: *const Link, roots:
     while (true) {
         const m = try recvMsg(link, 0);
         switch (m[0]) {
-            OP_STOP => {
-                cluster().stopping.store(true, .release);
-                break;
-            },
+            OP_STOP => break,
             OP_RELEASE => return true,
             OP_FORWARD => {
                 const offset: usize = @as(usize, @intCast(m[3])) | (@as(usize, @intCast(m[4])) << 31);
@@ -2189,11 +2174,11 @@ const Loaded = struct {
     }
 };
 
-fn load(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, config: *model_mod.ModelConfig, mode: Mode, span: LayerSpan, sh: Shard) !Loaded {
+fn load(io: std.Io, allocator: std.mem.Allocator, dir: []const u8, config: *model_mod.ModelConfig, mode: Mode, span: LayerSpan) !Loaded {
     if (!config.isQwen4()) return error.DistArchUnsupported;
     switch (mode) {
         .pipeline => try config.applyLayerSpan(span),
-        .tensor => try config.applyShard(sh),
+        .tensor => try config.applyShard(.{ .rank = 1, .size = 2 }),
         .rows => return error.DistArchUnsupported,
     }
     var w = try model_mod.loadModelWeights(io, allocator, dir, config, false);
@@ -2834,7 +2819,7 @@ test "dist N-rank: rank 0 files each worker's bell under the rank it names, and 
     try std.testing.expectEqual(Bell.msg_byte, try w1b.wait());
     try link.bells[3].pipe();
     try std.testing.expectEqual(Bell.pipe_byte, try w3.wait());
-    try std.testing.expectEqual(@as(u32, 0b1110), link.bellMask());
+    try std.testing.expectEqual(@as(u32, 0b1110), bellMask(&link.bells, 4));
 }
 
 test "dist N-rank: the watcher names the worker whose bell closed, after reading the others' step times" {
@@ -2869,7 +2854,7 @@ test "dist N-rank: a load before every worker joined fails at once, as forming u
     try std.testing.expectEqual(JoinState.joined, joinState(true, 0, 600));
     try std.testing.expectEqual(JoinState.forming, joinState(false, 599_999, 600));
     try std.testing.expectEqual(JoinState.late, joinState(false, 600_000, 600));
-    // A pair's timeout is 0: late at once, today's refusal.
+    // A pair's timeout is 0: late at once.
     try std.testing.expectEqual(JoinState.late, joinState(false, 0, 0));
 }
 
@@ -2938,18 +2923,17 @@ test "dist N-rank: tensor DSpark stages split only when the pack declares and sh
     var b: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .private = &cfg } };
     var c: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .plugin = &b };
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.0.main_proj.weight\":\"a.safetensors\"}}" });
-    try std.testing.expect(!dsv41DraftShard(io, &c, 4, dir));
+    try std.testing.expect(!dsv41DraftShard(io, &c, dir));
     cfg.dsv4_dspark_block_size = 5;
     cfg.dsv4_n_compress_ratios = 7;
-    try std.testing.expect(dsv41DraftShard(io, &c, 4, dir));
-    try std.testing.expect(!dsv41DraftShard(io, &c, 1, dir));
+    try std.testing.expect(dsv41DraftShard(io, &c, dir));
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"language_model.mtp.0.main_proj.weight\":\"a.safetensors\"}}" });
-    try std.testing.expect(dsv41DraftShard(io, &c, 4, dir));
+    try std.testing.expect(dsv41DraftShard(io, &c, dir));
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"layers.0.attn.wkv.weight\":\"a.safetensors\"}}" });
-    try std.testing.expect(!dsv41DraftShard(io, &c, 4, dir));
+    try std.testing.expect(!dsv41DraftShard(io, &c, dir));
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.0.main_proj.weight\":\"a.safetensors\"}}" });
     c.mtp_override = false;
-    try std.testing.expect(!dsv41DraftShard(io, &c, 4, dir));
+    try std.testing.expect(!dsv41DraftShard(io, &c, dir));
 }
 
 test "dist N-rank: a plan kept past a failed load refuses a load that wants other DSpark stages" {

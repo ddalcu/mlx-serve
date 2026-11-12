@@ -19,119 +19,7 @@ fn gpuUnavailable() bool {
     return !mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu();
 }
 
-const Call = struct { gather: bool, shape: [4]c_int = @splat(0), ndim: usize, dtype: mlx.mlx_dtype };
-
-/// Ranks in one process, their collectives met by a fixed point: each pass runs every rank on the others' parts from
-/// their latest pass, and a collective depends only on the ones before it, so each pass settles one more and the last
-/// changes none. Sums add in rank order, as every rank sums, so the ranks agree to the bit.
-const Group = struct {
-    var rank: usize = 0;
-    var size: usize = ranks;
-    var parts: [ranks]std.ArrayList(A) = @splat(.empty);
-    var prev: [ranks]std.ArrayList(A) = @splat(.empty);
-    var calls: [ranks]std.ArrayList(Call) = @splat(.empty);
-
-    fn join(n: usize) void {
-        size = n;
-        dsv41.clusterHooks().tp_sum = &sum;
-        dsv41.clusterHooks().tp_gather = &gather;
-    }
-
-    fn leave() void {
-        dsv41.clusterHooks().tp_sum = null;
-        dsv41.clusterHooks().tp_gather = null;
-        for (&parts, &prev, &calls) |*a, *b, *c| {
-            clear(a);
-            clear(b);
-            a.deinit(testing.allocator);
-            b.deinit(testing.allocator);
-            c.deinit(testing.allocator);
-            a.* = .empty;
-            b.* = .empty;
-            c.* = .empty;
-        }
-    }
-
-    fn begin(r: usize) void {
-        rank = r;
-        clear(&prev[r]);
-        std.mem.swap(std.ArrayList(A), &prev[r], &parts[r]);
-        calls[r].clearRetainingCapacity();
-    }
-
-    fn clear(l: *std.ArrayList(A)) void {
-        for (l.items) |a| _ = mlx.mlx_array_free(a);
-        l.clearRetainingCapacity();
-    }
-
-    fn note(is_gather: bool, x: A) !usize {
-        try mlx.check(mlx.mlx_array_eval(x));
-        var kept = mlx.mlx_array_new();
-        _ = mlx.mlx_array_set(&kept, x);
-        try parts[rank].append(testing.allocator, kept);
-        const sh = mlx.getShape(x);
-        var c: Call = .{ .gather = is_gather, .ndim = sh.len, .dtype = mlx.mlx_array_dtype(x) };
-        @memcpy(c.shape[0..sh.len], sh);
-        try calls[rank].append(testing.allocator, c);
-        return parts[rank].items.len - 1;
-    }
-
-    /// Rank `r`'s part of collective `k`; a part unlike this rank's is a group that diverged.
-    fn partOf(r: usize, k: usize, x: A) !?A {
-        if (r == rank) return x;
-        if (k >= parts[r].items.len) return null;
-        const p = parts[r].items[k];
-        if (!std.mem.eql(c_int, mlx.getShape(p), mlx.getShape(x)) or mlx.mlx_array_dtype(p) != mlx.mlx_array_dtype(x)) return error.CollectiveDiverged;
-        return p;
-    }
-
-    fn sum(x: A) anyerror!A {
-        const k = try note(false, x);
-        var acc = mlx.mlx_array_new();
-        _ = mlx.mlx_array_set(&acc, x);
-        var first = true;
-        for (0..size) |r| {
-            const p = try partOf(r, k, x) orelse continue;
-            if (first) {
-                _ = mlx.mlx_array_set(&acc, p);
-                first = false;
-                continue;
-            }
-            var next = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&next, acc, p, mlx.gpuStream()));
-            _ = mlx.mlx_array_free(acc);
-            acc = next;
-        }
-        return acc;
-    }
-
-    fn gather(x: A) anyerror!A {
-        const k = try note(true, x);
-        var xs: [ranks]A = undefined;
-        for (xs[0..size], 0..) |*o, r| o.* = try partOf(r, k, x) orelse x;
-        const v = mlx.mlx_vector_array_new_data(&xs, size);
-        defer _ = mlx.mlx_vector_array_free(v);
-        var o = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, mlx.gpuStream()));
-        return o;
-    }
-
-    /// Every rank issued the same collectives, kind, shape and dtype, in the same order, and none moved in the last pass.
-    fn expectSettled() !void {
-        for (0..size) |r| {
-            try testing.expectEqual(calls[0].items.len, calls[r].items.len);
-            for (calls[0].items, calls[r].items) |a, b| try testing.expectEqualDeep(a, b);
-            try testing.expectEqual(parts[r].items.len, prev[r].items.len);
-            for (parts[r].items, prev[r].items) |a, b| {
-                const u = try dsv41.hostF32(a);
-                defer testing.allocator.free(u);
-                const v = try dsv41.hostF32(b);
-                defer testing.allocator.free(v);
-                try testing.expectEqualSlices(f32, u, v);
-            }
-        }
-    }
-};
+const Group = fixture.Group;
 
 const Opts = struct { experts: u32 = 16, vocab: u32 = 4096, ctx: usize = 120, act: mlx.mlx_dtype = .float32 };
 
@@ -420,18 +308,17 @@ fn median(xs: []f64) f64 {
     return xs[xs.len / 2];
 }
 
-/// A rank alone: each sum returns its own part and each gather its own part `size` times, so the time is the rank's
+/// A rank alone: each sum returns its own part and each gather its own part once a rank, so the time is the rank's
 /// own work at its shapes, without the link.
 const Alone = struct {
-    var size: usize = 1;
     fn sum(x: A) anyerror!A {
         var o = mlx.mlx_array_new();
         _ = mlx.mlx_array_set(&o, x);
         return o;
     }
     fn gather(x: A) anyerror!A {
-        var xs: [ranks]A = @splat(x);
-        const v = mlx.mlx_vector_array_new_data(&xs, size);
+        const xs: [ranks]A = @splat(x);
+        const v = mlx.mlx_vector_array_new_data(&xs, ranks);
         defer _ = mlx.mlx_vector_array_free(v);
         var o = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_concatenate_axis(&o, v, 0, mlx.gpuStream()));
@@ -469,7 +356,6 @@ test "dsv41 draft ubench: one draft of the release's DSpark stages whole, and as
         dsv41.clusterHooks().tp_gather = null;
         dsv41.clusterHooks().tp_draft = null;
     }
-    Alone.size = ranks;
     for ([_]?u32{ null, 0, 3 }) |rank| {
         const fx = try fixture.Fixture.initDraft(gpa, .{ .tp = if (rank) |r| .{ .rank = r, .size = ranks } else null });
         defer fx.deinit();

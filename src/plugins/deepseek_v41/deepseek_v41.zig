@@ -544,7 +544,7 @@ pub const Dsv41Model = struct {
     tp: ?Shard = null,
     /// How the tensor sums carry their parts (`TpSumMode`): rank 0's choice on every rank.
     tp_sum: TpSumMode = .auto,
-    /// Tensor parallel with the vocabulary split (`vocabSplit`): this rank's rows of the LM head. Every rank projects
+    /// Tensor parallel: this rank's rows of the LM head (`vocabRange`). Every rank projects
     /// its part of each step's logits and the parts are gathered (`headLogits`); rank 0 still holds the whole head.
     head_part: ?HeadPart = null,
     /// Tensor parallel: every rank holds its slice of the DSpark stages and its rows of the Markov head, and drafts with
@@ -621,7 +621,7 @@ pub const Dsv41Model = struct {
         self.quant_weights.deinit(self.gpa);
     }
 
-    /// Whether the model projects logits (a tensor split's other ranks hold no head).
+    /// Whether the model holds the whole head (a tensor split's other ranks hold only their rows, `head_part`).
     pub fn hasHead(self: *const Dsv41Model) bool {
         return self.head.w.ctx != null or self.head.ext != null;
     }
@@ -751,12 +751,6 @@ fn head8From(v: ?[*:0]const u8) bool {
     return v == null or v.?[0] != '0';
 }
 
-/// The split a tensor rank's LM head takes: every rank its rows of the vocabulary (`vocabRange`).
-fn vocabSplit(tp: ?Shard) ?Shard {
-    const t = tp orelse return null;
-    return if (t.size < 2) null else t;
-}
-
 /// The Markov head `[vocab, rank]` in the activation dtype: whole, or under a sharded draft this rank's rows of it
 /// (`vocabRange`, as `head_part`).
 fn markovHead(m: *Dsv41Model, w: *Weights, in_dim: usize, comptime base: []const u8, args: anytype) !A {
@@ -807,7 +801,7 @@ fn ownRows(m: *Dsv41Model, x: A, lo: usize, hi: usize, copy: bool) !A {
 }
 
 /// The logits `[L, vocab]` f32 of the collapsed rows `h`: the head over the final norm, or under a vocabulary split this
-/// rank's part gathered with every other rank's. A tensor rank past 0 without a split holds no head: `h` stands in.
+/// rank's part gathered with every other rank's. A rank that holds no head has `h` stand in.
 fn headLogits(sc: *Scope, m: *const Dsv41Model, h: A) !A {
     const eps = m.cfg.rms_norm_eps;
     if (m.head_part) |*p| {
@@ -1912,17 +1906,16 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             if (getOpt(w, "embed.weight", .{})) |x| release(m, w, x);
             log.info("deepseek_v41: embedding rows read from the pack at each lookup, not resident\n", .{});
         } else m.embed = try getLin(m, w, cfg.hidden_size, "embed", .{});
-        const split = vocabSplit(opts.tp);
-        m.head = if (tp_worker and split == null) .{ .w = none } else try getLin(m, w, cfg.hidden_size, "head", .{});
-        if (tp_worker and split != null) {
-            m.head_part = try headPart(m, w, m.head, split.?, false, opts.head_8bit);
+        m.head = try getLin(m, w, cfg.hidden_size, "head", .{});
+        if (tp_worker) {
+            m.head_part = try headPart(m, w, m.head, opts.tp.?, false, opts.head_8bit);
             m.head = .{ .w = none };
-        } else if (m.head.ext != null) log.info("deepseek_v41: lm head on {s}, as shipped\n", .{opts.quant.?.name()}) else if (!tp_worker) {
+        } else if (m.head.ext != null) log.info("deepseek_v41: lm head on {s}, as shipped\n", .{opts.quant.?.name()}) else {
             if (m.head.s.ctx == null) {
                 if (opts.head_8bit) m.head = try quantizeLin(m, w, m.head, 8, 64);
                 log.info("deepseek_v41: lm head {s}\n", .{if (opts.head_8bit) "requantized to 8-bit (MLX_SERVE_DSV41_HEAD8=0 keeps it dense)" else "dense, as shipped"});
             }
-            if (split) |t| m.head_part = try headPart(m, w, m.head, t, true, opts.head_8bit);
+            if (opts.tp) |t| m.head_part = try headPart(m, w, m.head, t, true, opts.head_8bit);
         }
         if (opts.tp) |t| if (m.head_part) |p| {
             const bits: u32 = if (p.lin.s.ctx != null) p.lin.qp.bits else 16;
@@ -1959,7 +1952,7 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
             .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
         m.n_mtp = n_stages;
-        if (opts.tp) |t| log.info("deepseek_v41: tensor rank {d} of {d}: DSpark {s}\n", .{ t.rank, t.size, if (m.draft_shard) "stages and Markov head split, every rank drafts" else if (n_stages > 0) "drafts on rank 0 alone" else "is off" });
+        if (opts.tp) |t| log.info("deepseek_v41: tensor rank {d} of {d}: DSpark {s}\n", .{ t.rank, t.size, if (m.draft_shard) "stages and Markov head split, every rank drafts" else "drafts on rank 0 alone" });
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};
         m.ds_block = cfg.dsv4_dspark_block_size;
     }
@@ -10271,11 +10264,7 @@ test "dsv41 head: the 8-bit head is the default, MLX_SERVE_DSV41_HEAD8=0 keeps t
     try testing.expect(!head8From("0"));
 }
 
-test "dsv41 vocab head: tensor ranks split the head; uneven vocabularies pad the last part" {
-    const t: Shard = .{ .rank = 1, .size = 4 };
-    try testing.expectEqual(t, vocabSplit(t).?);
-    try testing.expect(vocabSplit(.{ .rank = 0, .size = 1 }) == null);
-    try testing.expect(vocabSplit(null) == null);
+test "dsv41 vocab head: each tensor rank takes ceil(vocab / size) rows, the last rank what remains" {
     // The release's 129280 rows: a quarter each at four ranks; at three the last part is two rows short.
     const q = vocabRange(129280, 3, 4);
     try testing.expectEqual([3]usize{ 96960, 129280, 32320 }, [3]usize{ q.lo, q.hi, q.rows });
@@ -10387,49 +10376,6 @@ test "dsv41 vocab head: every rank's rows of the head, gathered, give the whole 
                     defer gpa.free(got);
                     try testing.expectEqualSlices(f32, want, got);
                 }
-            }
-        }
-    }
-}
-
-test "dsv41 bench: the release's LM head whole, as rank 0's view of a quarter, and as a worker's own quarter (DSV41_BENCH_VOCAB)" {
-    if (env.get(.DSV41_BENCH_VOCAB) == null or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    const gpa = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const iou = @import("../../sdk/util/io_util.zig");
-    var sc = Scope.init(gpa, mlx.gpuStream());
-    defer sc.deinit();
-    const dense = try bfRandom(&sc, 1, &.{ 129280, 5120 }, 0, 0.02);
-    const norm = try bfRandom(&sc, 2, &.{5120}, 1, 0.1);
-    const hs = try bfRandom(&sc, 3, &.{ 16, 5120 }, 0, 1);
-    const iters = 100;
-    for ([_]bool{ true, false }) |q8| {
-        var r0: HeadShell = undefined;
-        try r0.init(dense, norm, q8);
-        defer r0.deinit();
-        var r3: HeadShell = undefined;
-        try r3.init(dense, norm, false);
-        defer r3.deinit();
-        const view = try headPart(&r0.m, &r0.w, r0.m.head, .{ .rank = 0, .size = 4 }, true, q8);
-        const own = try headPart(&r3.m, &r3.w, r3.m.head, .{ .rank = 3, .size = 4 }, false, q8);
-        for ([_]usize{ 1, 16 }) |L| {
-            const h = try sc.rms(try sc.slice(hs, 0, 0, L), norm, 1e-6);
-            try evalAll(&.{h});
-            for ([_][]const u8{ "whole", "rank-0 view", "worker own" }, 0..) |name, arm| {
-                var us: f64 = 0;
-                for (0..iters + 10) |it| {
-                    var inner = Scope.init(gpa, mlx.gpuStream());
-                    defer inner.deinit();
-                    const t0 = iou.nowUsMonotonic(io);
-                    const y = switch (arm) {
-                        0 => try r0.m.head.apply(&inner, h),
-                        1 => try vocabPart(&inner, &view, h),
-                        else => try vocabPart(&inner, &own, h),
-                    };
-                    try evalAll(&.{y});
-                    if (it >= 10) us += @floatFromInt(iou.nowUsMonotonic(io) - t0);
-                }
-                std.debug.print("[vocab] {s} head, {d} rows, {s}: {d:.1} us\n", .{ if (q8) "8-bit" else "dense bf16", L, name, us / iters });
             }
         }
     }
