@@ -4,9 +4,9 @@ import XCTest
 /// Pins the pure logic behind the in-app updater (Services/UpdateChecker.swift):
 /// CalVer tag parsing/comparison, GitHub `releases/latest` JSON → `AppUpdate`
 /// extraction (DMG asset pick, draft/prerelease skip), the daily auto-check
-/// throttle, and the mounted-DMG app-bundle discovery used by the installer.
-/// The network fetch, hdiutil mount, and bundle swap are exercised live; the
-/// decisions they act on are all pinned here.
+/// throttle, what a check keeps across a relaunch (fetch stubbed), and the
+/// mounted-DMG app-bundle discovery used by the installer. The hdiutil mount
+/// and bundle swap are exercised live.
 final class UpdateCheckerTests: XCTestCase {
 
     // MARK: - CalVer parsing
@@ -237,5 +237,56 @@ final class UpdateCheckerTests: XCTestCase {
         let old = URL(fileURLWithPath: "/Applications/MLX-Serve.app")
         XCTAssertEqual(UpdateChecker.installDestination(replacing: old, newAppName: "MLX-Serve.app").path,
                        "/Applications/MLX-Serve.app")
+    }
+
+    // MARK: - Relaunch and failed checks
+
+    /// The check runs once a day, so a relaunch inside that day still shows what it found.
+    @MainActor
+    func testAFoundUpdateSurvivesARelaunch() async throws {
+        let body = releaseJSON(tag: "v99.1.1", assets: [("MLX-Serve.dmg", "https://example.invalid/MLX-Serve.dmg")])
+        try await withStubbedRelease(status: 200, body: body) {
+            let found = await UpdateChecker().check()
+            XCTAssertNotNil(found)
+            XCTAssertEqual(UpdateChecker().available, found)
+        }
+    }
+
+    /// A check that got no answer must not close the daily throttle.
+    @MainActor
+    func testAFailedCheckLeavesTheDailyThrottleOpen() async throws {
+        try await withStubbedRelease(status: 503, body: Data()) {
+            await UpdateChecker().check()
+            XCTAssertNil(UserDefaults.standard.object(forKey: UpdateChecker.lastCheckKey))
+        }
+    }
+
+    @MainActor
+    private func withStubbedRelease(status: Int, body: Data, _ run: () async throws -> Void) async throws {
+        let keys = [UpdateChecker.lastCheckKey, UpdateChecker.lastReleaseKey]
+        let saved = keys.map { UserDefaults.standard.object(forKey: $0) }
+        keys.forEach { UserDefaults.standard.removeObject(forKey: $0) }
+        ReleaseStub.status = status
+        ReleaseStub.body = body
+        URLProtocol.registerClass(ReleaseStub.self)
+        defer {
+            URLProtocol.unregisterClass(ReleaseStub.self)
+            for (key, value) in zip(keys, saved) { UserDefaults.standard.set(value, forKey: key) }
+        }
+        try await run()
+    }
+}
+
+private final class ReleaseStub: URLProtocol {
+    nonisolated(unsafe) static var status = 200
+    nonisolated(unsafe) static var body = Data()
+    override class func canInit(with request: URLRequest) -> Bool { request.url == UpdateChecker.latestReleaseURL }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+    override func stopLoading() {}
+    override func startLoading() {
+        let response = HTTPURLResponse(url: request.url!, statusCode: Self.status, httpVersion: nil, headerFields: nil)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: Self.body)
+        client?.urlProtocolDidFinishLoading(self)
     }
 }
