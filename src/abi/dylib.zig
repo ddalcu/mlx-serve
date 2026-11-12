@@ -177,7 +177,7 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
         },
         .quant => {
             if (head.version != quant_abi.version) return Verdict.refuse(.unsupported, "quant table version is not this host's");
-            if (head.size < @sizeOf(quant_abi.QuantTable)) return Verdict.refuse(.unsupported, "quant table is older than this host's");
+            if (head.size < quant_abi.QuantTable.min_size) return Verdict.refuse(.unsupported, "quant table is older than this host's");
         },
         .engine => {
             if (head.version != engine_abi.version) return Verdict.refuse(.unsupported, "engine table version is not this host's");
@@ -265,7 +265,7 @@ test "abi dylib: negotiation accepts its own build and refuses each mismatch by 
         }.f },
         .{ "quant table is older than this host's", struct {
             fn f(_: *Manifest, q: *quant_abi.QuantTable) void {
-                q.size -= 8;
+                q.size = quant_abi.QuantTable.min_size - 1;
             }
         }.f },
         .{ "plugin table is named otherwise than its manifest", struct {
@@ -286,6 +286,14 @@ test "abi dylib: negotiation accepts its own build and refuses each mismatch by 
     // A newer plugin's larger manifest is read up to the host's size.
     m.size += 16;
     try testing.expect(negotiate(&m, pin).isOk());
+    // A table built before `swiglu_limit_out` (CommunityServe #46's) loads, the appended flag read as absent.
+    var older = quantTable("fmt_x");
+    older.swiglu_limit_out = true;
+    older.size = quant_abi.QuantTable.min_size;
+    var mo = m;
+    mo.table = &older;
+    try testing.expect(negotiate(&mo, pin).isOk());
+    try testing.expect(!older.clampsOut());
 }
 
 test "abi dylib: a model table with a hook table older than the host's is refused" {

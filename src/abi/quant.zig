@@ -111,6 +111,10 @@ pub const QuantTable = extern struct {
     pub fn clampsOut(t: *const QuantTable) bool {
         return t.size >= @offsetOf(QuantTable, "swiglu_limit_out") + @sizeOf(bool) and t.swiglu_limit_out;
     }
+
+    /// The smallest table the loader admits: one built before `swiglu_limit_out`, whose appended members read as absent
+    /// through their size-gated readers (`clampsOut`).
+    pub const min_size: u32 = @offsetOf(QuantTable, "swiglu_limit_out");
 };
 
 /// A layer's router as the trunk loaded it. The `gates` list is valid for the call only; the arrays it names live
