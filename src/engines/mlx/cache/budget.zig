@@ -55,6 +55,22 @@ pub fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
     publishHotCacheResidency(sch);
 }
 
+/// The budgets are clamped against free memory when a model loads or unloads; another app taking that memory later
+/// moves nothing here. The kernel's memory-pressure level says when it has: a worse level re-clamps every budget as
+/// a load does, a better one may raise them again. Returns how long the idle loop may park before the next reading:
+/// null (until work arrives) where nothing is clamped or the OS has no level, 1 s while the level is high or
+/// changing, else 5 s.
+pub fn followMemoryPressure(sch: *Scheduler) ?u32 {
+    if (sch.prefix_cache_mem_resolver == null) return null;
+    const gauge = &sch.memory_pressure;
+    if (gauge.sample()) |move| {
+        log.info("[hot-cache] memory pressure {s}: {s}, re-clamping the budgets\n", .{ @tagName(move), gauge.levelName() });
+        reviseHotCacheBudgets(sch, move == .eased);
+    }
+    if (!gauge.readable) return null;
+    return if (gauge.level != 0 or gauge.settling()) 1000 else 5000;
+}
+
 /// Active, parked and pending-capture state, counted once per model. Cache-owned snapshots bill separately.
 /// Inference thread only; the caller must not hold registry.mutex.
 pub fn moduleStateBytes(sch: *Scheduler) u64 {
