@@ -23,8 +23,8 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
 - KDA (`kda.zig`): the per-channel-gate arms of the legacy `gatedDeltaNetProjected` on a slot's `Entry`: GLM's
   one-dispatch decode/verify (`kda_recurrence.decodeStep`), low-rank gates, the fused prework, the per-core prompt
   recurrence; Ling's softplus gate (compiled at load) and the stock vector-gate kernels.
-- KDA verify rows the joined step declines (`kda_verify.zig`, GLM, one slot; MLX_SERVE_GLM_KDA_VERIFY; the chain's
-  bytes): the packed prework (beta too), the bounded gate in one launch, the norm-gate epilogue.
+- KDA verify rows the joined step declines (`kda_verify.zig`, GLM, one slot; MLX_SERVE_GLM_KDA_VERIFY, _EXPSIG; the
+  chain's bytes): the packed prework (beta too), the bounded gate in one launch (exp(A_log) in it), the norm-gate.
 - MoE (`moe.zig`, Ling's too, the MTP head's): the shared `sdk/bases/blocks/moe.zig` block; GLM's one-kernel decode
   (`glm5.moeDecode`, affine, up to 16 rows) is the block's `fused` arm, ModelOpt's per-expert up x down scale its
   `route_scale`, Sushi's EXL3 banks its `format_banks`.

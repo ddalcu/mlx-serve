@@ -388,7 +388,7 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     // softplus chain over `A_log` expanded per channel. The per-core recurrence builds the gate itself.
     var verify_gate = false;
     const g = if (kda_fused) Array{ .ctx = null } else if (bounded) pick: {
-        if (verify_texts) if (try kda_verify.gate(s, a_proj, la.dt_bias, la.A_log, c.kda_gate_lower_bound)) |vg| {
+        if (verify_texts) if (try kda_verify.gate(s, a_proj, la.dt_bias, la.A_log, c.kda_gate_lower_bound, switchOn(.MLX_SERVE_GLM_KDA_EXPSIG))) |vg| {
             verify_gate = true;
             break :pick vg;
         };

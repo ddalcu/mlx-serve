@@ -1,15 +1,16 @@
 //! GLM-5.3-Flash's KDA verify rows that the joined decode step leaves to the op chain (a pack without the row-joined
-//! projection, or gates it does not take): the bounded gate in one launch and the capture's conv input. kda.zig runs
-//! them with the packed prework and the norm-gate epilogue; each is the chain's bytes.
+//! projection, or gates it does not take): the bounded gate in one launch (exp(A_log) in it too) and the capture's
+//! conv input. kda.zig runs them with the packed prework and the norm-gate epilogue; each is the chain's bytes.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
+const log = @import("../../sdk/util/log.zig");
 
 const Array = mlx.mlx_array;
 
 /// The verify pieces that ran since the load (the tests read them).
-pub const Runs = struct { prework: u64 = 0, gate: u64 = 0, normgate: u64 = 0 };
+pub const Runs = struct { prework: u64 = 0, gate: u64 = 0, normgate: u64 = 0, expsig: u64 = 0 };
 pub var runs: Runs = .{};
 
 fn free(a: Array) void {
@@ -30,6 +31,7 @@ const GATE_SOURCE = kernelSource("plugins/glm5_next/kernels/kda_verify_gate.meta
 /// The gate's threadgroup: a row's channels are a whole number of them.
 const gate_tg: c_int = 256;
 var gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var expsig_said = false;
 
 fn gateKernel() !mlx.mlx_fast_metal_kernel {
     if (gate_kernel) |k| return k;
@@ -46,8 +48,9 @@ fn gateKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 /// `kdaGateChain(a_log, a, dt_bias, bound)` over one slot's rows `a` [1, rows, n] in one launch: the f32 gate
-/// [1, rows, n]. Null off the GPU or on a shape or dtype it does not take (the caller runs the chain).
-pub fn gate(s: mlx.mlx_stream, a: Array, dt_bias: Array, a_log: Array, bound: f32) !?Array {
+/// [1, rows, n]. `in_exp`: exp(A_log) made in the launch, else by the chain's ops. Null off the GPU or on a shape or
+/// dtype it does not take (the caller runs the chain).
+pub fn gate(s: mlx.mlx_stream, a: Array, dt_bias: Array, a_log: Array, bound: f32, in_exp: bool) !?Array {
     if (!mlx.streamIsGpu(s)) return null;
     const sh = mlx.getShape(a);
     if (sh.len != 3 or sh[0] != 1 or sh[1] < 1 or sh[2] < gate_tg or @rem(sh[2], gate_tg) != 0) return null;
@@ -55,13 +58,15 @@ pub fn gate(s: mlx.mlx_stream, a: Array, dt_bias: Array, a_log: Array, bound: f3
     if (mlx.mlx_array_size(dt_bias) != n or mlx.mlx_array_size(a_log) != n) return null;
     const add_t = promote(mlx.mlx_array_dtype(a), mlx.mlx_array_dtype(dt_bias)) orelse return null;
     if (!isFloat(mlx.mlx_array_dtype(a_log))) return null;
-    // The chain's exp(astype(A_log, f32)), made by its ops.
-    var alf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(alf);
-    try mlx.check(mlx.mlx_astype(&alf, a_log, .float32, s));
+    // Without `in_exp`, the chain's exp(astype(A_log, f32)), made by its ops.
     var ea = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ea);
-    try mlx.check(mlx.mlx_exp(&ea, alf, s));
+    if (in_exp) _ = mlx.mlx_array_set(&ea, a_log) else {
+        var alf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(alf);
+        try mlx.check(mlx.mlx_astype(&alf, a_log, .float32, s));
+        try mlx.check(mlx.mlx_exp(&ea, alf, s));
+    }
     const bound_arr = mlx.mlx_array_new_float(bound);
     defer _ = mlx.mlx_array_free(bound_arr);
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -71,6 +76,7 @@ pub fn gate(s: mlx.mlx_stream, a: Array, dt_bias: Array, a_log: Array, bound: f3
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, gate_tg, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "AddT", add_t));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "N", sh[2]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "EXP", @intFromBool(in_exp)));
     const ins = [_]Array{ a, dt_bias, ea, bound_arr };
     const iv = mlx.mlx_vector_array_new_data(&ins, ins.len);
     defer _ = mlx.mlx_vector_array_free(iv);
@@ -82,6 +88,13 @@ pub fn gate(s: mlx.mlx_stream, a: Array, dt_bias: Array, a_log: Array, bound: f3
     errdefer _ = mlx.mlx_array_free(g);
     try mlx.check(mlx.mlx_vector_array_get(&g, ov, 0));
     runs.gate += 1;
+    if (in_exp) {
+        runs.expsig += 1;
+        if (!expsig_said) {
+            expsig_said = true;
+            log.info("[kda] verify gate exp(A_log) in its launch engaged: S={d} N={d}\n", .{ sh[1], sh[2] });
+        }
+    }
     return g;
 }
 
@@ -114,23 +127,29 @@ const t_prompt: c_int = 17;
 /// Verify widths: 1 + the drafted rows.
 const verify_widths = [_]c_int{ 1, 2, 3, 4 };
 
-const Switches = struct { verify: bool = false };
+const Switches = struct { verify: bool = false, expsig: bool = false };
 
 /// The switches as a run sets them, the process's own values put back by `restore`.
 const Saved = struct {
     verify: env.Override(.MLX_SERVE_GLM_KDA_VERIFY),
+    expsig: env.Override(.MLX_SERVE_GLM_KDA_EXPSIG),
 
     fn init() Saved {
-        return .{ .verify = env.override(.MLX_SERVE_GLM_KDA_VERIFY, null) };
+        return .{
+            .verify = env.override(.MLX_SERVE_GLM_KDA_VERIFY, null),
+            .expsig = env.override(.MLX_SERVE_GLM_KDA_EXPSIG, null),
+        };
     }
 
     fn restore(sv: *const Saved) void {
         sv.verify.restore();
+        sv.expsig.restore();
     }
 };
 
 fn setSwitches(sw: Switches) void {
     env.set(.MLX_SERVE_GLM_KDA_VERIFY, if (sw.verify) "1" else "0");
+    env.set(.MLX_SERVE_GLM_KDA_EXPSIG, if (sw.expsig) "1" else "0");
 }
 
 /// Seeded normal values of `dtype` at `scale`, evaluated.
@@ -335,8 +354,14 @@ fn expectOuts(s: mlx.mlx_stream, want: []const Out, got: []const Out, rows: c_in
 }
 
 fn runsSince(before: Runs) Runs {
-    return .{ .prework = runs.prework - before.prework, .gate = runs.gate - before.gate, .normgate = runs.normgate - before.normgate };
+    return .{ .prework = runs.prework - before.prework, .gate = runs.gate - before.gate, .normgate = runs.normgate - before.normgate, .expsig = runs.expsig - before.expsig };
 }
+
+/// The verify sets held to the chain: the texts alone, and with exp(A_log) in the gate's launch.
+const verify_sets = [_]Switches{
+    .{ .verify = true },
+    .{ .verify = true, .expsig = true },
+};
 
 test "glm5_next kda verify: the prework, gate and norm-gate give the chain's output, window, state, conv input and per-row states bit for bit at 1 to 4 rows" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
@@ -357,15 +382,18 @@ test "glm5_next kda verify: the prework, gate and norm-gate give the chain's out
         const before_chain = runs;
         try verifies(&r, x0, &xs, rows, .{}, &want);
         try testing.expectEqual(Runs{}, runsSince(before_chain));
-        var got: [2]Out = @splat(@splat(.{ .ctx = null }));
-        defer freeOuts(&got);
-        const before = runs;
-        try verifies(&r, x0, &xs, rows, .{ .verify = true }, &got);
-        const ran = runsSince(before);
-        try testing.expectEqual(@as(u64, if (rows <= 9) 2 else 0), ran.prework);
-        try testing.expectEqual(@as(u64, 2), ran.gate);
-        try testing.expectEqual(@as(u64, 2), ran.normgate);
-        try expectOuts(s, &want, &got, rows);
+        for (verify_sets) |sw| {
+            var got: [2]Out = @splat(@splat(.{ .ctx = null }));
+            defer freeOuts(&got);
+            const before = runs;
+            try verifies(&r, x0, &xs, rows, sw, &got);
+            const ran = runsSince(before);
+            try testing.expectEqual(@as(u64, if (rows <= 9) 2 else 0), ran.prework);
+            try testing.expectEqual(@as(u64, 2), ran.gate);
+            try testing.expectEqual(@as(u64, 2), ran.normgate);
+            try testing.expectEqual(@as(u64, if (sw.expsig) 2 else 0), ran.expsig);
+            try expectOuts(s, &want, &got, rows);
+        }
     }
 }
 
@@ -374,7 +402,7 @@ test "glm5_next kda verify: Ling's KDA layer and two slots keep the chain" {
     const s = mlx.gpuStream();
     const saved = Saved.init();
     defer saved.restore();
-    setSwitches(.{ .verify = true });
+    setSwitches(.{ .verify = true, .expsig = true });
     var r: Rig = undefined;
     try r.init(s, "bailing_hybrid");
     defer r.deinit();
@@ -386,7 +414,7 @@ test "glm5_next kda verify: Ling's KDA layer and two slots keep the chain" {
         defer free(xs[0]);
         var out: [1]Out = @splat(@splat(.{ .ctx = null }));
         defer freeOuts(&out);
-        try verifies(&r, x0, &xs, 2, .{ .verify = true }, &out);
+        try verifies(&r, x0, &xs, 2, .{ .verify = true, .expsig = true }, &out);
     }
     r.cfg.model_type = "glm5_next";
     {
