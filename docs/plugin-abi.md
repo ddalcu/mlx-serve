@@ -1272,6 +1272,7 @@ The trunk's routed MoE a streamed bank serves.
 | `n_layers` | `u32` |  | The trunk's layers: `gates` and a call's `layer` index them alike. |
 | `swiglu_limit` | `f32` | `0` | > 0: the SwiGLU's clamp. |
 | `gates` | `?[*]const BankGate` | `null` | Every layer's router (`n_layers`); null for `bank_rows`. |
+| `limits_out` | `?[*]const f32` | `null` | Every layer's routed SwiGLU clamped AFTER the SiLU (`n_layers`, as `gates`; valid for the call only): > 0 the limit L of min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's `expert_swiglu_limit_list`), 0 none; null: no layer clamps so. Appended: read it through `limitOut`, which a geometry from a host built before it (a smaller `size`) answers 0, so a plugin built with it loads on an older host, and a plugin built before it loads as before. |
 
 ### `BankBudget` (extern struct)
 

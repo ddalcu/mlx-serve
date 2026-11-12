@@ -121,6 +121,18 @@ pub const BankGeometry = extern struct {
     swiglu_limit: f32 = 0,
     /// Every layer's router (`n_layers`); null for `bank_rows`.
     gates: ?[*]const BankGate = null,
+    /// Every layer's routed SwiGLU clamped AFTER the SiLU (`n_layers`, as `gates`; valid for the call only): > 0 the
+    /// limit L of min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's `expert_swiglu_limit_list`), 0 none; null: no layer
+    /// clamps so. Appended: read it through `limitOut`, which a geometry from a host built before it (a smaller `size`)
+    /// answers 0, so a plugin built with it loads on an older host, and a plugin built before it loads as before.
+    limits_out: ?[*]const f32 = null,
+
+    /// Layer `layer`'s post-SiLU limit (`limits_out`), 0 where the geometry does not reach the field or gives none.
+    pub fn limitOut(g: *const BankGeometry, layer: u32) f32 {
+        if (g.size < @offsetOf(BankGeometry, "limits_out") + @sizeOf(?[*]const f32)) return 0;
+        const l = g.limits_out orelse return 0;
+        return if (layer < g.n_layers) l[layer] else 0;
+    }
 };
 
 /// Bytes the slot rows and the bank's own buffers may hold in each phase (a prompt pass, decode).
@@ -178,4 +190,18 @@ test "abi quant: every struct opens with its size" {
     try testing.expectEqual(@as(u32, @sizeOf(Weight)), w.size);
     inline for (.{ Source, Weight, LoadCtx, QuantTable, Swiglu, BankGeometry, BankRows, Bank }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
+}
+
+test "abi quant: a geometry's post-SiLU limits are read only where its size reaches them" {
+    const lim = [_]f32{ 0, 10, 0 };
+    var g: BankGeometry = .{ .hidden = 8, .inter = 4, .top_k = 1, .n_experts = 2, .n_layers = 3, .limits_out = &lim };
+    try testing.expectEqual(@as(f32, 10), g.limitOut(1));
+    try testing.expectEqual(@as(f32, 0), g.limitOut(0));
+    try testing.expectEqual(@as(f32, 0), g.limitOut(3));
+    // A host built before the field: its geometry ends at `gates`.
+    g.size = @offsetOf(BankGeometry, "limits_out");
+    try testing.expectEqual(@as(f32, 0), g.limitOut(1));
+    g.size = @sizeOf(BankGeometry);
+    g.limits_out = null;
+    try testing.expectEqual(@as(f32, 0), g.limitOut(1));
 }

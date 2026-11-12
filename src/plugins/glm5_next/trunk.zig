@@ -868,7 +868,7 @@ const Loader = struct {
             L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank) } else .{ .dense = try l.dense(i) };
             if (L.mlp == .moe and i < c.expert_limit_out.len) {
                 // Ling-3.1's clamps after the SiLU: the shared expert's in the block; the routed experts' in the composed
-                // chain (no kernel serves it), or in the bound bank's own arithmetic (its plugin reads the pack's list).
+                // chain (no kernel serves it), or in the bound bank's own arithmetic (`BankGeometry.limits_out`, `bindBank`).
                 L.mlp.moe.shared_limit_out = @floatFromInt(c.shared_limit_out[i]);
                 if (c.expert_limit_out[i] != 0) {
                     L.mlp.moe.limit_out = @floatFromInt(c.expert_limit_out[i]);
@@ -1010,7 +1010,15 @@ fn bindBank(m: *Model, room: u64) !void {
     const gates = try gpa.alloc(quant_abi.BankGate, m.layers.len);
     defer gpa.free(gates);
     for (gates, m.layers) |*g, *ly| g.* = if (ly.mlp == .moe) .{ .w = .{ .ctx = ly.mlp.moe.router.w.ctx }, .bias = .{ .ctx = ly.mlp.moe.route.sigmoid_bias.expert_bias.ctx } } else .{};
-    const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(m.layers.len), .swiglu_limit = if (c.swiglu_clamp) c.swiglu_limit else 0, .gates = gates.ptr };
+    // Ling-3.1's routed clamps after the SiLU, per layer (null where no layer clamps so).
+    const limits = try gpa.alloc(f32, m.layers.len);
+    defer gpa.free(limits);
+    var any_limit = false;
+    for (limits, 0..) |*l, li| {
+        l.* = if (li < c.expert_limit_out.len) @floatFromInt(c.expert_limit_out[li]) else 0;
+        if (l.* > 0) any_limit = true;
+    }
+    const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(m.layers.len), .swiglu_limit = if (c.swiglu_clamp) c.swiglu_limit else 0, .gates = gates.ptr, .limits_out = if (any_limit) limits.ptr else null };
     const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fixed = outside_model.roomBudget(room) }, m.s);
     m.bank = o.bank;
     log.info("glm5_next: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
