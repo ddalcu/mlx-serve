@@ -612,6 +612,23 @@ fn releaseSessionLocked(self: *Scheduler, slot: *Slot) void {
     self.session_cond.broadcast(self.io);
 }
 
+/// Take the slot out of every list a pass reads. Caller holds `queue_mu`.
+fn unlistLocked(self: *Scheduler, slot: *Slot) void {
+    for (self.pending.items, 0..) |s, i| if (s == slot) {
+        _ = self.pending.orderedRemove(i);
+        break;
+    };
+    for (self.decoding.items, 0..) |s, i| if (s == slot) {
+        _ = self.decoding.orderedRemove(i);
+        break;
+    };
+    for (self.offloaded.items, 0..) |s, i| if (s == slot) {
+        _ = self.offloaded.swapRemove(i);
+        engine_requests.cancel(slot);
+        break;
+    };
+}
+
 /// Hand the slot off to the inference thread for cleanup, and notify any
 /// submitter waiting for queue space. Must be called once per slot
 /// returned by `submit`. Safe whether or not the slot finished normally.
@@ -629,42 +646,21 @@ pub fn complete(self: *Scheduler, slot: *Slot) void {
     slot.cancelled.store(true, .release);
 
     self.queue_mu.lockUncancelable(self.io);
-
-    // Remove from pending (rare — only if conn thread cancels before
-    // prefill) and from decoding (the common case). After this, only the
-    // cleanup queue references the slot, so the next inference-thread
-    // cleanup drain can safely deinit it.
-    var i: usize = 0;
-    while (i < self.pending.items.len) : (i += 1) {
-        if (self.pending.items[i] == slot) {
-            _ = self.pending.orderedRemove(i);
-            break;
-        }
-    }
-    i = 0;
-    while (i < self.decoding.items.len) : (i += 1) {
-        if (self.decoding.items[i] == slot) {
-            _ = self.decoding.orderedRemove(i);
-            break;
-        }
-    }
-    for (self.offloaded.items, 0..) |s, j| if (s == slot) {
-        _ = self.offloaded.swapRemove(j);
-        engine_requests.cancel(slot);
-        break;
-    };
+    unlistLocked(self, slot);
 
     // Release the session claim (if this slot held it) so the next queued
     // request can claim it AND reuse the KV prefix it now holds. Done before
     // enqueueing cleanup so a waiting submitter can proceed immediately.
     if (slot.holds_session) releaseSessionLocked(self, slot);
 
-    // Out of every list, so no new pass can take it; wait out the one that has it,
-    // before the cleanup queue owns (and may free) the slot.
-    if (slot.in_pass.load(.acquire) != 0) {
+    // Wait out a pass that has the slot, before the cleanup queue owns (and may free) it. A pass
+    // can put a held slot back in `pending` before it lets go, so unlist again each time: a pass
+    // takes a slot from a list under `queue_mu`, so unlisted with `in_pass` at 0 means no one has it.
+    while (slot.in_pass.load(.acquire) != 0) {
         self.queue_mu.unlock(self.io);
         while (slot.in_pass.load(.acquire) != 0) std.Io.sleep(self.io, .fromMilliseconds(1), .real) catch {};
         self.queue_mu.lockUncancelable(self.io);
+        unlistLocked(self, slot);
     }
 
     self.cleanup_queue.append(self.allocator, slot) catch {
@@ -1368,6 +1364,42 @@ test "failInFlight: a decoding request ends with the error by name, its stuck pa
     try testing.expectEqualStrings("DistWorkerLeft", slot.error_code.?);
     // The stuck pass's hold is dropped, so the reader's `complete` returns.
     try testing.expectEqual(@as(u32, 0), slot.in_pass.load(.acquire));
+}
+
+test "complete: a slot its pass puts back in pending while complete waits is unlisted before cleanup owns it" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.allocator = testing.allocator;
+    sch.queue_mu = .init;
+    sch.queue_cond = .init;
+    sch.submit_cond = .init;
+    sch.pending = .empty;
+    sch.decoding = .empty;
+    sch.offloaded = .empty;
+    sch.cleanup_queue = .empty;
+    sch.in_flight = 1;
+    defer sch.pending.deinit(testing.allocator);
+    defer sch.cleanup_queue.deinit(testing.allocator);
+    var slot: Slot = undefined;
+    slot.cancelled = .init(false);
+    slot.holds_session = false;
+    slot.in_pass = .init(1);
+    // A pass that holds the slot outside every list, then requeues it as a held prefill does and lets go.
+    const Pass = struct {
+        fn requeue(s: *Scheduler, sl: *Slot) void {
+            while (!sl.cancelled.load(.acquire)) testing.io.sleep(.fromMilliseconds(1), .awake) catch {};
+            testing.io.sleep(.fromMilliseconds(20), .awake) catch {}; // past `complete`'s first look
+            s.queue_mu.lockUncancelable(s.io);
+            s.pending.insert(s.allocator, 0, sl) catch {};
+            s.queue_mu.unlock(s.io);
+            _ = sl.in_pass.fetchSub(1, .acq_rel);
+        }
+    };
+    const pass = try std.Thread.spawn(.{}, Pass.requeue, .{ &sch, &slot });
+    complete(&sch, &slot);
+    pass.join();
+    try testing.expectEqual(@as(usize, 0), sch.pending.items.len);
+    try testing.expectEqual(@as(usize, 1), sch.cleanup_queue.items.len);
 }
 
 test "cancelAllInFlight: a request being prefilled at a chunk boundary is cancelled too" {

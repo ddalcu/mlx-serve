@@ -1466,3 +1466,12 @@ preflight refuses the setting without it) and two SDK calls every MoE on the sha
 no error): `openPack` takes GPU streams only. Guard: `residentModelDiskBytes: with stream_experts ...`, the
 conformance suite's streamed check, `mlx pack: a pack opened on a CPU stream is refused by name`.
 
+
+### A request cancelled while its prefill was held crashed the server
+Defect: with several agents on DeepSeek-V4.1, a client that disconnected while its request waited for memory took the
+whole server down (SIGSEGV in `logSpecStats`, #1163). Cause: `complete` looked for the slot in `pending` and
+`decoding`, found it in neither because a pass held it, and waited for the pass. The pass then put the held slot back
+in `pending` and let go; `complete` queued the slot for cleanup without looking again, so `pending` named freed
+memory and the next pass ran it. Fix: `complete` unlists again after every wait (`unlistLocked`); a pass takes a slot
+from a list only under `queue_mu`, so unlisted with `in_pass` at 0 means nothing holds it. Guard: `complete: a slot
+its pass puts back in pending while complete waits is unlisted before cleanup owns it`.
