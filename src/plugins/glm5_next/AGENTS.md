@@ -74,7 +74,7 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 ## Known issues
 - With a vocab under 16384 rows the engine's served-head readout builds a 3-bit
   draft head the legacy GLM head never built (drafts only, never output): needs a `SpecFacts` fact.
-- Kernel contracts for the 20 `kernels/*.metal` rows are not registered.
+- Kernel contracts for 21 `kernels/*.metal` rows (the DSA levers' apart, below) are not registered.
 - Kernel contracts for `router_nax`'s kernels (`kernels/moe/router_nax_*`) are not registered; its byte tests hold them
   to the stock route.
 - Kernel contracts for the DSA levers' texts (`kernels/dsa_*.metal` past `dsa_nax.zig`'s) are not registered; their byte
