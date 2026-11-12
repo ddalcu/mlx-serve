@@ -1007,6 +1007,12 @@ pub const ModelConfig = struct {
         return if (self.isDsv41()) 8192 else 0;
     }
 
+    /// `width` no wider than `prefillChunkMax`, an explicit `--prefill-chunk` included.
+    pub fn cappedPrefillChunk(self: *const ModelConfig, width: usize) usize {
+        const max = self.prefillChunkMax();
+        return if (max == 0) width else @min(width, max);
+    }
+
     /// Rows a sliding layer keeps past its window on an arch that caches only the window
     /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
     pub const SLIDING_RING_SLACK: u32 = 2048;
@@ -10257,3 +10263,4 @@ test "applyLayerSpan: the PLE stays at its absolute layer and is local only to t
     try std.testing.expectEqual(@as(u32, 1), head.pleLocalLayer().?);
     try std.testing.expectError(error.DistSplitOffInterval, c.applyLayerSpan(.{ .start = 30, .end = 48, .total = 48 }));
 }
+

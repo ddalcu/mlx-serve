@@ -341,7 +341,7 @@ pub fn requestPrefillChunkNow(
 ) u32 {
     const pin: u32 = config.pinned_prefill_chunk;
     const explicit: u32 = explicitPrefillChunk();
-    if (explicit > 0) return explicit;
+    if (explicit > 0) return @intCast(config.cappedPrefillChunk(explicit));
     if (!perRequestPrefillChunkEnabled(config)) return pin;
 
     const seq: u64 = @intCast(prompt_len);
