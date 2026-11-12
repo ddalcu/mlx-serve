@@ -181,8 +181,11 @@ fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
     if (!b.parsed.caps.streamed_weights) return 0;
     var bill: abi.Bill = .{};
     b.table.bill(&b.parsed, &.{ .context = seq }, &bill);
-    const prefill = bill.prefill_bytes orelse return 0;
-    const need = prefill(&b.parsed, seq, chunk, 16, 0);
+    // A built-in GLM's prompt is the engine's bill (`glm5PrefillMemoryNeeded`), not a plugin term.
+    const need = if (bill.prefill_bytes) |prefill| prefill(&b.parsed, seq, chunk, 16, 0) else if (config.isGlm5())
+        @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, seq, 1, 16, chunk, .{})
+    else
+        return 0;
     return ceiling -| need -| margin;
 }
 
@@ -211,6 +214,22 @@ test "driver: streamed plugin room follows its own bill and preserves the margin
     try std.testing.expectEqual(@as(u64, 0), streamRoomAt(&cfg, 20 << 30, 1 << 30));
     cfg.plugin = null;
     try std.testing.expectEqual(@as(u64, 0), streamRoomAt(&cfg, 20 << 30, 1 << 30));
+}
+
+test "driver: a streamed built-in GLM's room is the ceiling less the engine's GLM prompt bill and the margin" {
+    const Probe = struct {
+        fn empty(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{};
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.empty;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    const need = @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(&cfg, 16_384 + 1_024, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK, .{});
+    try std.testing.expect(need > 0);
+    try std.testing.expectEqual((64 << 30) - need - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
 }
 
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {

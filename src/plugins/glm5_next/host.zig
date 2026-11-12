@@ -44,7 +44,7 @@ pub fn trunkWeight(mp: *anyopaque, which: abi.TrunkWeight, out: *quant_abi.Weigh
         .embed => &m.embed,
         .head => &m.head,
     };
-    if (l.w.ctx == null) return abi.Verdict.refuse(.unsupported, "the trunk has no such weight");
+    if (l.w.ctx == null or l.ext != null) return abi.Verdict.refuse(.unsupported, "the trunk has no such weight");
     out.* = .{ .w = .{ .ctx = l.w.ctx }, .scales = .{ .ctx = l.s.ctx }, .biases = .{ .ctx = l.b.ctx } };
     if (l.s.ctx == null) return .ok;
     out.bits = @intCast(l.bits);

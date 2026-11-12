@@ -60,7 +60,8 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     return host.load(plugin.name, ctx, out);
 }
 
-/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored.
+/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored (a streaming pack's bank
+/// is its outside plugin's bill).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const c = config.of(p);
     out.* = shards;
@@ -130,6 +131,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "glm5_next: forward mode not declared");
     const ops = f.cache_ops orelse return Verdict.refuse(.unsupported, "glm5_next: a forward without cache_ops");
+    trunk.bankPhase(m, if (f.mode == .batched_rows) @min(f.caches.len, fwd.MOE_DECODE_BATCH_MAX) else f.rows) catch |e| return Verdict.named(.failed, @errorName(e));
     if (f.mode == .batched_rows) {
         if (f.rows != 1 or f.tokens.len != f.caches.len or f.positions.len != f.caches.len) return Verdict.refuse(.unsupported, "glm5_next: batched rows take one host token per slot");
         if (f.capture_layers.len > 0 or f.media.ctx != null) return Verdict.refuse(.unsupported, "glm5_next: no captures or media on batched rows");
@@ -137,9 +139,33 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
             host.clear(out, 0);
             return Verdict.named(.failed, @errorName(e));
         };
-        return .ok;
+        return settleBank(m, f, out);
     }
-    return host.forwardOne(plugin.name, fwd, m, ops, f, out);
+    const v = host.forwardOne(plugin.name, fwd, m, ops, f, out);
+    return if (v.isOk()) settleBank(m, f, out) else v;
+}
+
+/// A streaming pack's bank after a forward: its outputs evaluated, then the calls' slot rows settled for the next
+/// forward's reads.
+fn settleBank(m: *host.Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdict {
+    const r = m.routed orelse return .ok;
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for ([_]abi.Array{ out.logits, out.hidden }) |a| if (a.ctx != null) {
+        _ = mlx.mlx_vector_array_append_value(vec, .{ .ctx = a.ctx });
+    };
+    if (out.captured) |c| for (c[0..f.capture_layers.len]) |a| if (a.ctx != null) {
+        _ = mlx.mlx_vector_array_append_value(vec, .{ .ctx = a.ctx });
+    };
+    mlx.check(mlx.mlx_eval(vec)) catch |e| {
+        host.clear(out, f.capture_layers.len);
+        return Verdict.named(.failed, @errorName(e));
+    };
+    r.settle() catch |e| {
+        host.clear(out, f.capture_layers.len);
+        return Verdict.named(.failed, @errorName(e));
+    };
+    return .ok;
 }
 
 /// N slots' next tokens in as few trunk forwards as the MoE row limit allows, each slot's token a row of one window:
@@ -171,7 +197,7 @@ fn batched(m: *host.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out:
         try rows2d(m, logits, &parts[made - 1][0]);
         try rows2d(m, hidden, &parts[made - 1][1]);
         // Streamed experts: the next group's fetches rewrite the slot rows this group's last MoE layer reads.
-        if (m.experts != null and end < n) try evalParts(&parts[made - 1]);
+        if ((m.experts != null or m.bank != null) and end < n) try evalParts(&parts[made - 1]);
     }
     out.logits = .{ .ctx = (try joinRows(m, parts[0..made], 0)).ctx };
     if (f.want_hidden) out.hidden = .{ .ctx = (try joinRows(m, parts[0..made], 1)).ctx };

@@ -337,6 +337,9 @@ pub const ModelConfig = struct {
     exl3: ?exl3.Spec = null,
     /// An NVIDIA ModelOpt checkpoint served as published (`modelopt_pack`).
     modelopt: bool = false,
+    /// A GLM streaming pack (`expert_streaming`): the release's tensor names beside a bank its outside quant plugin
+    /// streams, the trunk moved as a Sushi pack's (`sushi_adapt.adapt`). Set by `parseConfig`.
+    expert_bank: bool = false,
     /// The TEXT config's own eos (its first entry): the n-gram hash's segment
     /// reset token, independent of the generation-time stop set.
     ngram_eos: u32 = 0,
@@ -1674,6 +1677,14 @@ pub const ModelConfig = struct {
     }
 };
 
+fn declaresExpertStreaming(allocator: std.mem.Allocator, content: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const v = parsed.value.object.get("expert_streaming") orelse return false;
+    return v == .object;
+}
+
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
     return parseConfigWith(io, allocator, model_dir, true);
 }
@@ -1718,6 +1729,11 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     };
     errdefer config.deinit(allocator);
     if (config.isDsv41()) config.pack_dir = try allocator.dupe(u8, model_dir);
+    // Its outside plugin reads no vision tower.
+    if (config.isGlm5() and declaresExpertStreaming(allocator, content)) {
+        config.expert_bank = true;
+        config.has_vision = false;
+    }
     // A GGUF's table is inside the file (the qwen4_exp plugin finds it there).
     if (config.isQwen4() and !std.mem.endsWith(u8, model_dir, ".gguf")) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
@@ -4995,7 +5011,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         defer _ = mlx.mlx_stream_free(s);
         try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
     }
-    if (config.exl3 != null or config.modelopt) {
+    if (config.exl3 != null or config.modelopt or config.expert_bank) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
         try sushi_pack.adapt(config, &weights, s);

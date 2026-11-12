@@ -137,6 +137,9 @@ pub const Config = struct {
 
     /// A Sushi pack's `expert_quant` block as JSON (EXL3 routed experts); empty = none. Read by the engine side.
     expert_quant_json: []const u8 = "",
+    /// A streaming pack (`expert_streaming` beside `experts.bin`): the routed experts stream from the bank of the outside
+    /// quant plugin that claims the pack, which also runs the projections it stores (`sdk/quant/outside_model.zig`).
+    streamed_bank: bool = false,
 
     /// Pack-owned sampling recommendations (`generation_config.json`).
     gen: abi.GenDefaults = .{},
@@ -525,13 +528,14 @@ pub fn parseWith(
     for (types) |t| {
         if (std.mem.eql(u8, t, mt.string)) break;
     } else return abi.Verdict.refuse(.unsupported, name ++ ": a model_type this plugin does not serve");
-    if (field(root, "expert_streaming") != null) return abi.Verdict.refuse(.unsupported, name ++ ": a streaming pack (expert_streaming): its experts.bin bank is not streamed in-tree");
+    const streaming = field(root, "expert_streaming") != null;
+    if (streaming and !dir.has("experts.bin")) return abi.Verdict.refuse(.unsupported, name ++ ": a streaming pack (expert_streaming) without its experts.bin bank");
     if (field(root, "residents_format")) |rf| if (rf != .string or !std.mem.eql(u8, rf.string, "fp8_block128"))
         return abi.Verdict.refuse(.unsupported, name ++ ": a residents_format other than fp8_block128");
     const tc = field(root, "text_config");
     if (tc != null and tc.? != .object) return abi.Verdict.refuse(.failed, name ++ ": text_config is not an object");
     const o: Objects = .{ .root = root, .cfg = if (tc) |t| t.object else root };
-    var c: Config = .{};
+    var c: Config = .{ .streamed_bank = streaming };
     readCommon(&c, o) catch |e| return refusal(name, e);
     arm(&c, o) catch |e| return refusal(name, e);
     if (field(root, "expert_quant")) |eq| {
@@ -569,6 +573,11 @@ pub fn parseWith(
     }
     c.gen = s.gen;
     facts(&c, &p);
+    // A family serves a bank only where its facts stream it.
+    if (c.streamed_bank and !p.caps.streamed_weights) {
+        if (c.expert_quant_json.len > 0) gpa.free(c.expert_quant_json);
+        return abi.Verdict.refuse(.unsupported, name ++ ": a streaming pack (expert_streaming): its experts.bin bank is not streamed by this plugin");
+    }
 
     const cp = gpa.create(Config) catch {
         if (c.expert_quant_json.len > 0) gpa.free(c.expert_quant_json);
@@ -599,6 +608,7 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
         .dflash_policy = true,
         .images = c.advertises_images,
     };
+    if (c.streamed_bank) bankFacts(p);
     p.shell.state_dtype = .f32;
     p.chat.thinking_default = .on;
     p.chat.effort_vocab = .glm5;
@@ -610,6 +620,14 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
     p.placeholder_ids.image = c.image_token_id;
     p.weights.prefix = abi.Str.of(c.weight_prefix);
     if (c.modelopt) p.weights.quant_layout = abi.Str.of("modelopt") else if (c.expert_quant_json.len > 0) p.weights.quant_layout = abi.Str.of("exl3");
+}
+
+/// A streaming pack's facts: the experts stream from the bank (its slot rows billed at load, not per prompt), one
+/// request decodes at a time (the bank's decode lane takes a few rows a call), and no vision tower is read.
+pub fn bankFacts(p: *abi.Parsed) void {
+    p.caps.streamed_weights = true;
+    p.caps.batches_decode = false;
+    p.caps.images = false;
 }
 
 pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.Str, span: ?*const abi.LayerSpan, stub: bool, out: *abi.Parsed) callconv(.c) abi.Verdict {
@@ -652,6 +670,26 @@ test "glm5_next config: the mlx-community pack parses into the shell, its facts 
     try testing.expectEqualStrings("glm5-pooled-keys-v2", p.cache.layout_namespace.slice());
     try testing.expectEqualStrings("language_model.model", c.weight_prefix);
     try testing.expectEqual(@as(f32, -5.0), c.kda_gate_lower_bound);
+}
+
+test "glm5_next config: a streaming pack beside its bank parses streamed, serially decoded, without images" {
+    const base = @embedFile("../../fixtures/model-configs/glm5_next-mlx-community-4bit.json");
+    const bank = "{\"expert_streaming\":{\"family\":\"turboexl3\",\"manifest\":\"expert-manifest-v2.json\"},";
+    const json = try std.mem.concat(testing.allocator, u8, &.{ bank, std.mem.trimStart(u8, base, " \n{") });
+    defer testing.allocator.free(json);
+    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expect(of(&p).streamed_bank and p.caps.streamed_weights and !p.caps.batches_decode and !p.caps.images);
+    // Ling's facts stream no bank: its parse refuses the pack by name.
+    const ling_base = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json");
+    const ling = try std.mem.concat(testing.allocator, u8, &.{ bank, std.mem.trimStart(u8, ling_base, " \n{") });
+    defer testing.allocator.free(ling);
+    var q: abi.Parsed = .{};
+    const v = @import("../bailing_hybrid/config.zig").parse(&dir, abi.Str.of(ling), .{}, null, true, &q);
+    try testing.expect(v.code == .unsupported and q.private == null);
 }
 
 test "glm5_next config: a streamed pack, a RoPE'd sparse attention and broken JSON are refused by name" {
