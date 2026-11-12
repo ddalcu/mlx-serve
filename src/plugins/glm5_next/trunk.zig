@@ -1097,6 +1097,8 @@ fn bindBank(m: *Model, ctx: *const abi.LoadCtx) !void {
     const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fit = bankFit(ctx) }, m.s);
     m.bank = o.bank;
     log.info("glm5_next: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
+    // the budget and the memory read at the open: a bank-fit.json's evidence (`rest = in use - server footprint`)
+    if (o.reading) |r| log.info("glm5_next: bank budget {d} MiB prompt / {d} MiB decode: in use {d} MiB, server footprint {d} MiB at the open\n", .{ o.budget.prompt >> 20, o.budget.decode >> 20, r.in_use >> 20, r.footprint >> 20 });
     const r = o.bank.routed();
     m.routed = r;
     for (m.layers, 0..) |*ly, li| if (ly.mlp == .moe) try moe.bindRouted(&ly.mlp.moe, r, @intCast(li));

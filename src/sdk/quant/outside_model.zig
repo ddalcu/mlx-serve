@@ -209,6 +209,10 @@ pub const Opened = struct {
     rows: quant_abi.BankRows,
     /// The context the rows were budgeted for (`Rungs`); 0 for a fixed budget.
     context: u64 = 0,
+    /// The budget the rows were planned from, and for a `fit` the memory read at the open (a calibration's evidence:
+    /// `rest = in_use - footprint`).
+    budget: quant_abi.BankBudget = .{ .prompt = 0, .decode = 0 },
+    reading: ?Reading = null,
 };
 
 /// The pack's streamed bank over `geo` at the rows `budget` buys, after the load's freed buffers go back to the system
@@ -217,6 +221,7 @@ pub fn openBank(f: *const outside.Format, geo: quant_abi.BankGeometry, budget: B
     _ = mlx.mlx_synchronize(s);
     _ = mlx.mlx_clear_cache();
     var context: u64 = 0;
+    var reading: ?Reading = null;
     const at: quant_abi.BankBudget = switch (budget) {
         .fixed => |b| b,
         .rungs => |r| blk: {
@@ -226,11 +231,14 @@ pub fn openBank(f: *const outside.Format, geo: quant_abi.BankGeometry, budget: B
             } else r.fallback;
             break :blk r.at(r.ctx, context);
         },
-        .fit => |fit| fitBudget(fit, readMemory()),
+        .fit => |fit| blk: {
+            reading = readMemory();
+            break :blk fitBudget(fit, reading.?);
+        },
     };
     const rows = (try f.bankRows(geo, at)) orelse return error.StreamedBankUnclaimed;
     const b = (try f.openBank(geo, at)) orelse return error.StreamedBankUnclaimed;
-    return .{ .bank = b, .rows = rows, .context = context };
+    return .{ .bank = b, .rows = rows, .context = context, .budget = at, .reading = reading };
 }
 
 // ── tests ──
@@ -398,6 +406,9 @@ test "outside model: a bank opens at a fixed budget, or at the largest rung keep
     try testing.expectEqual(@as(u32, 7), fixed.rows.prompt);
     try testing.expectEqual(@as(u32, 9), fixed.rows.decode);
     try testing.expectEqual(@as(u64, 0), fixed.context);
+    // The budget the rows came from; no memory reading but a fit's.
+    try testing.expectEqual(quant_abi.BankBudget{ .prompt = 700, .decode = 900 }, fixed.budget);
+    try testing.expect(fixed.reading == null);
     fixed.bank.close();
     var r: Rungs = .{ .ctx = undefined, .at = &ToyRungs.at, .ctx_size = null, .rungs = &.{ 57600, 32000, 6400 }, .min_rows = 4, .fallback = 640 };
     // 57600 leaves 100 bytes (1 row), 32000 leaves 500 (5 rows): the first to keep 4.
