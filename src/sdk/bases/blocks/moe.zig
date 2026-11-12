@@ -139,14 +139,30 @@ pub const Streamed = struct {
 /// keep their quant params; their arrays stay the caller's, never read. What the streamed arm does not run (a format's
 /// or a model's own expert kernel, one-expert views, non-affine or per-expert-scaled banks) is refused by name.
 pub fn bindStreamed(w: *Moe.Weights, x: *streamed.Streamed, prefix: []const u8) !void {
+    try admitRouted(w, true);
+    const layer = x.layerOf(prefix) orelse return error.StreamedLayerMissing;
+    bind(w, x.routedSource(), layer);
+}
+
+/// Routes `w`'s experts through model layer `layer` of `r` (an outside quant plugin's bank, `outside.Bank.routed`): the
+/// banks keep their quant params, their arrays are never read. Refused by name as `bindStreamed`; a `source` bank runs
+/// its own math, so its banks' quant layout is not asked.
+pub fn bindRouted(w: *Moe.Weights, r: routed.Routed, layer: u32) !void {
+    try admitRouted(w, r.math == .trunk);
+    bind(w, r, layer);
+}
+
+fn admitRouted(w: *const Moe.Weights, gathers: bool) !void {
     if (w.format_banks != null or w.fused != null or w.bank_views != null or w.route_scale.ctx != null) return error.StreamedExpertsUnsupported;
-    inline for (.{ &w.gate, &w.up, &w.down }) |bk| {
+    if (gathers) inline for (.{ &w.gate, &w.up, &w.down }) |bk| {
         if (bk.qp.mode != .affine) return error.StreamedPackNotAffine;
         if (bk.expert_scale.ctx != null) return error.StreamedExpertScales;
-    }
-    const layer = x.layerOf(prefix) orelse return error.StreamedLayerMissing;
+    };
+}
+
+fn bind(w: *Moe.Weights, r: routed.Routed, layer: u32) void {
     inline for (.{ &w.gate, &w.up, &w.down }) |bk| bk.* = .{ .w = .{ .ctx = null }, .qp = bk.qp };
-    w.streamed = .{ .routed = x.routedSource(), .layer = layer };
+    w.streamed = .{ .routed = r, .layer = layer };
 }
 
 /// A model's one-kernel MoE at up to `rows` rows (GLM's `moeDecode`): the routed sum plus the shared expert in `x`'s

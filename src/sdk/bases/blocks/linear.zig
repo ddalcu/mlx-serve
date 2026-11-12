@@ -10,6 +10,7 @@ const qmv2 = @import("../../blocks/qmm/qmv2.zig");
 const qmv_nax2 = @import("../../blocks/qmm/qmv_nax2.zig");
 const qmm_int8 = @import("../../blocks/qmm/qmm_int8.zig");
 const rht = @import("../../quant/hadamard/rht.zig");
+const outside = @import("../../quant/outside.zig");
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -30,6 +31,9 @@ pub const Linear = struct {
     /// `H_block(signs * x)` through the registry's memo (`signs` pooled there; null = an unrotated weight).
     rht: ?*rht.Registry = null,
     signs: Array = .{},
+    /// A projection an outside quant plugin loaded (`sdk/quant/outside_model.zig`): its table runs the matmul. `w` is
+    /// then the plugin's first array, so a presence check holds; `s` stays unset.
+    ext: ?outside.Weight = null,
 
     pub fn forward(l: *const Linear, g: *Graph, x: Array) !Array {
         if (l.bias.ctx == null) return g.adopt(try l.matmul(g, x));
@@ -39,6 +43,7 @@ pub const Linear = struct {
     }
 
     fn matmul(l: *const Linear, g: *Graph, x: Array) !Array {
+        if (l.ext) |*e| return e.matmul(x, g.s);
         if (l.rht) |reg| return l.rotated(reg, x, g.s);
         if (l.ternary) {
             if (try qmv_nax2.qmm(x, l.w, l.s, l.b, l.bits, l.group_size, g.s)) |y| return y;
