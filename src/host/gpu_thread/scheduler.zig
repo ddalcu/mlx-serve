@@ -75,10 +75,14 @@ pub const PressureGauge = struct {
     /// Which way the level moved, or null when it did not or no reading is due: the caller then has nothing to do.
     pub fn sample(self: *PressureGauge) ?Move {
         if (!self.enabled) return null;
-        const now_ms = crt.monotonicMs();
+        return self.sampleAt(crt.monotonicMs());
+    }
+
+    pub fn sampleAt(self: *PressureGauge, now_ms: i64) ?Move {
+        if (!self.enabled) return null;
         if (self.read_ms) |t| if (now_ms - t < READ_EVERY_MS) return null;
         self.read_ms = now_ms;
-        const kernel = system.memoryPressureLevel();
+        const kernel = system.pressureOverrideLevel() orelse system.memoryPressureLevel();
         self.readable = self.readable or kernel != 0;
         return if (self.readable) self.observe(kernel, now_ms) else null;
     }
