@@ -77,6 +77,11 @@ pub const Slots = struct {
 
     /// Evaluates `h` with every recurrent state the slots hold (a prompt chunk's memory bound).
     pub fn evalWith(self: Slots, h: Array, layers: u32) !void {
+        return self.evalWithAsync(h, layers, false);
+    }
+
+    /// `evalWith`; `async_eval` hands the same arrays to the GPU without the host's wait.
+    pub fn evalWithAsync(self: Slots, h: Array, layers: u32, async_eval: bool) !void {
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
         _ = mlx.mlx_vector_array_append_value(vec, h);
@@ -84,7 +89,7 @@ pub const Slots = struct {
             const c = self.state(i, @intCast(li), .conv);
             if (c.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, c);
         };
-        try mlx.check(mlx.mlx_eval(vec));
+        try mlx.check(if (async_eval) mlx.mlx_async_eval(vec) else mlx.mlx_eval(vec));
     }
 };
 

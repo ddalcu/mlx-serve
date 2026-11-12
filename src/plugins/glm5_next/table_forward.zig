@@ -16,6 +16,8 @@ const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows
 const axisView = @import("../../mlx/array.zig").axisView;
 const concatAxis1 = @import("../../mlx/array.zig").concatAxis1;
 const glm_moe = @import("moe.zig");
+const env = @import("../../env.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const Array = mlx.mlx_array;
 const Slots = slots_mod.Slots;
@@ -89,7 +91,7 @@ pub fn hidden(m: *Model, st: *const Step, token_ids: Array) !Array {
             _ = mlx.mlx_array_set(slot, mean);
         };
         if (is_prefill and st.eval_every > 0 and ((li + 1) % st.eval_every == 0 or li + 1 == n_layers)) {
-            try st.slots.evalWith(stream, @intCast(li + 1));
+            try st.slots.evalWithAsync(stream, @intCast(li + 1), asyncEval());
         }
     }
     if (deferred) |*df| {
@@ -191,7 +193,7 @@ pub fn hiddenSplit(m: *Model, st_a: *const Step, st_b: *const Step, ids_a: Array
         try mlpSublayerSplit(m, &streams, &deferred, lw);
         for (steps, streams) |st, stream| {
             if (st.eval_every > 0 and ((li + 1) % st.eval_every == 0 or li + 1 == n_layers)) {
-                try st.slots.evalWith(stream, @intCast(li + 1));
+                try st.slots.evalWithAsync(stream, @intCast(li + 1), asyncEval());
             }
         }
     }
@@ -598,6 +600,21 @@ fn rowsFrom(a: Array, axis: usize, from: c_int, s: mlx.mlx_stream) !Array {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_slice(&out, a, &lo, sh.len, &hi, sh.len, &[_]c_int{ 1, 1, 1, 1 }, sh.len, s));
     return out;
+}
+
+// ── a prompt forward's evals ──
+
+var async_eval_said = false;
+
+/// MLX_SERVE_GLM_PROMPT_ASYNC_EVAL: a prompt forward's cadence eval hands its arrays to the GPU without the host's wait
+/// (the same arrays, kernels and order; a tail's buffers can outlive the next sublayer's start).
+fn asyncEval() bool {
+    const on = if (env.get(.MLX_SERVE_GLM_PROMPT_ASYNC_EVAL)) |v| v[0] != '0' else true;
+    if (on and !async_eval_said) {
+        async_eval_said = true;
+        log.info("[glm5_next] prompt async eval engaged: the cadence's evals without the host's wait\n", .{});
+    }
+    return on;
 }
 
 // ── tests ──
