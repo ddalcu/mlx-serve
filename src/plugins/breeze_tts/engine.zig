@@ -16,7 +16,7 @@ const log = @import("../../sdk/util/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../sdk/weights/load.zig");
 const tokenizer_mod = @import("../../sdk/tokenizer/load.zig");
-const tts = @import("mimi.zig");
+const tts = @import("../../sdk/media/mimi_codec.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
 const os_mutex = @import("../../sdk/util/os_mutex.zig");
 const env = @import("../../env.zig");
@@ -1880,4 +1880,49 @@ test "live synthesize (BREEZE_MODEL)" {
     try std.testing.expect(synth.pcm.len > 0);
     defer freeSynthesisFrames(alloc, synth);
     alloc.free(synth.pcm);
+}
+
+// The shared sdk codec's encoder parity bar, kept here with the fixtures. Clip + oracle are the
+// first frames of a real utterance (u16-LE codes from qwen_tts's tokenizer on the same pack);
+// MIMI_ENCODE still names a real pack, the encoder is real-sized.
+test "mimi encoder parity vs oracle (MIMI_ENCODE)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tok_dir = env.span(.MIMI_ENCODE) orelse return error.SkipZigTest;
+    const wav_path = env.span(.MIMI_WAV) orelse "src/plugins/breeze_tts/fixtures/mimi_clip.wav";
+    const oracle_path = env.span(.MIMI_ORACLE) orelse "src/plugins/breeze_tts/fixtures/mimi_codes.bin";
+
+    const alloc = std.testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    const wav_bytes = try tts.readBytes(io, alloc, wav_path, 1 << 30);
+    defer alloc.free(wav_bytes);
+    const d = try wav_mod.decode(alloc, wav_bytes);
+    defer alloc.free(d.pcm);
+
+    var enc = try tts.loadMimiEncoder(io, alloc, s, tok_dir);
+    defer enc.deinit();
+    const frames = try enc.encodeSamples(d.pcm);
+    defer {
+        for (frames) |f| alloc.free(f);
+        alloc.free(frames);
+    }
+
+    const oracle = try tts.readBytes(io, alloc, oracle_path, 1 << 20);
+    defer alloc.free(oracle);
+    const n_frames = oracle.len / (16 * 2);
+    try std.testing.expectEqual(n_frames, frames.len);
+    // Frames t>=1 must be byte-exact; frame 0 rides the left-pad edge where torch/MLX
+    // accumulation order can flip near-tie codebook picks (≤ 16 cells).
+    var mism: usize = 0;
+    var mism_t0: usize = 0;
+    for (frames, 0..) |row, t| {
+        for (0..16) |q| {
+            const ov = @as(u16, oracle[t * 32 + q * 2]) | (@as(u16, oracle[t * 32 + q * 2 + 1]) << 8);
+            if (ov != row[q]) {
+                if (t == 0) mism_t0 += 1 else mism += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), mism);
+    try std.testing.expectEqual(@as(u32, 259), frames[0][0]);
 }

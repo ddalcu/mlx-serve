@@ -1,18 +1,20 @@
-//! Mimi codec (Kyutai mimi: 16 codebooks at 12.5 Hz, 24 kHz output): the residual-VQ decoder Breeze
-//! streams frames through, plus the encoder that folds a reference clip into frames for voice cloning.
-//! Extracted from the shared tts engine so the breeze_tts plugin stays self-contained (plugins do not
-//! import plugins); the low-level mlx helpers ride along.
+//! Mimi codec (Kyutai mimi: 16 codebooks at 12.5 Hz, 24 kHz output), shared by the tts media
+//! plugins: the residual-VQ decoder a frame loop streams codebook rows through, plus the SEANet
+//! encoder that folds a reference clip into frames for voice cloning. Both halves read one
+//! safetensors bundle (`Bundle`) so a pack loads its codec weights once. The geometry rides the
+//! tokenizer's `config.json`; the 1920-sample upsample ladder and 16 codebooks are the floor
+//! (`CodecConfig.supported`). qwen3_tts's decoder and breeze_tts's decoder + encoder both run on
+//! this; the encoder parity oracle is the numerical bar.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const weights_mod = @import("../../sdk/weights/load.zig");
-const log = @import("../../sdk/util/log.zig");
-const env = @import("../../env.zig");
+const weights_mod = @import("../weights/load.zig");
+const log = @import("../util/log.zig");
 
 const model_mod = weights_mod;
-const wav_mod = @import("../../sdk/media/wav.zig");
-const transformer_mod = @import("../../sdk/blocks/mlp/fused_activations.zig");
-const cf = @import("../../sdk/media/config_fields.zig");
+const wav_mod = @import("wav.zig");
+const transformer_mod = @import("../blocks/mlp/fused_activations.zig");
+const cf = @import("config_fields.zig");
 
 const Weights = weights_mod.Weights;
 const S = mlx.mlx_stream;
@@ -341,18 +343,13 @@ fn codecSupported(cfg: CodecConfig) bool {
 }
 
 /// `codec_config` / `decoder_config` from the tokenizer dir's `config.json`;
-/// an omitted field keeps the published geometry.
-fn readCodecConfig(io: std.Io, alloc: std.mem.Allocator, tokenizer_dir: []const u8) !CodecConfig {
-    const path = try std.fmt.allocPrint(alloc, "{s}/config.json", .{tokenizer_dir});
-    defer alloc.free(path);
-    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.MissingCodecConfig;
-    defer f.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = f.reader(io, &rb);
-    const txt = try rs.interface.allocRemaining(alloc, .limited(4 << 20));
-    defer alloc.free(txt);
+/// an omitted field keeps the published geometry. A `num_quantizers` other than
+/// 16, a `num_semantic_quantizers` other than 1, or a published shape the frame
+/// loop is not built for (a decoder_dim not divisible by 16, no attention heads)
+/// is a named error; the 1920-sample ladder floor is `openBundle`'s job.
+pub fn parseCodecConfig(allocator: std.mem.Allocator, json_text: []const u8) !CodecConfig {
     var cfg = CodecConfig{};
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, txt, .{}) catch return error.BadCodecConfig;
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return error.BadCodecConfig;
     defer parsed.deinit();
     if (parsed.value != .object) return error.BadCodecConfig;
     const o = parsed.value.object;
@@ -383,6 +380,7 @@ fn readCodecConfig(io: std.Io, alloc: std.mem.Allocator, tokenizer_dir: []const 
         .{ "sampling_rate", "sampling_rate" },
     }, src, &cfg);
     cfg.rvq_codebook_dim = cfg.codebook_dim / 2;
+    if (cfg.num_quant != 16 or cfg.num_sem != 1 or cfg.decoder_dim >> 4 == 0 or cfg.heads == 0 or cfg.kv == 0) return error.BadCodecConfig;
     if (src.get("upsampling_ratios")) |v| {
         if (v != .array or v.array.items.len != cfg.upsampling_ratios.len) return error.BadCodecConfig;
         for (v.array.items, &cfg.upsampling_ratios) |it, *dst| {
@@ -398,6 +396,18 @@ fn readCodecConfig(io: std.Io, alloc: std.mem.Allocator, tokenizer_dir: []const 
         }
     }
     return cfg;
+}
+
+fn readCodecConfig(io: std.Io, alloc: std.mem.Allocator, tokenizer_dir: []const u8) !CodecConfig {
+    const path = try std.fmt.allocPrint(alloc, "{s}/config.json", .{tokenizer_dir});
+    defer alloc.free(path);
+    const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.MissingCodecConfig;
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const txt = try rs.interface.allocRemaining(alloc, .limited(4 << 20));
+    defer alloc.free(txt);
+    return parseCodecConfig(alloc, txt);
 }
 
 /// gelu(x) = 0.5*x*(1+erf(x/√2)) (exact, matches nn.gelu).
@@ -683,10 +693,15 @@ pub const CodecDecoder = struct {
 
     /// Decode codes [T][16] → waveform samples (f32, owned).
     pub fn decode(self: *CodecDecoder, codes: []const [16]u32) ![]f32 {
-        return self.decodeSlice(@ptrCast(codes));
+        const rows = try self.allocator.alloc([]const u32, codes.len);
+        defer self.allocator.free(rows);
+        for (codes, 0..) |fr, t| rows[t] = &fr;
+        return self.decodeSlice(rows);
     }
 
-    /// `decode` for a frame table whose width the caller knows at runtime.
+    /// `decode` for a frame table whose width the caller knows at runtime. `codes`
+    /// is a strided matrix: `codes[q][t]` is frame t's codebook q, the table
+    /// read column-major (the qwen3_tts frame loop's `[T, 16]` pun).
     pub fn decodeSlice(self: *CodecDecoder, codes: []const []const u32) ![]f32 {
         const s = self.s;
         const T: u32 = @intCast(codes.len);
@@ -979,18 +994,6 @@ pub const Bundle = struct {
     cfg: CodecConfig,
     w: Weights,
 
-    /// `tokenizer_dir` holds `model.safetensors` with this codec layout
-    /// (Qwen3-TTS `speech_tokenizer/`, Breeze `audio_tokenizer/`). A missing
-    /// `config.json` keeps the published geometry.
-    pub fn open(io: std.Io, allocator: std.mem.Allocator, tokenizer_dir: []const u8) !Bundle {
-        var w = try model_mod.loadWeights(io, allocator, tokenizer_dir);
-        errdefer w.deinit();
-        var cfg = readCodecConfig(io, allocator, tokenizer_dir) catch CodecConfig{};
-        cfg.rvq_codebook_dim = cfg.codebook_dim / 2;
-        if (!cfg.supported()) return error.UnsupportedCodecGeometry;
-        return .{ .allocator = allocator, .cfg = cfg, .w = w };
-    }
-
     pub fn close(self: *Bundle) void {
         self.w.deinit();
     }
@@ -1006,6 +1009,30 @@ pub const Bundle = struct {
     }
 };
 
+/// Open a codec bundle: weights + config, with the frame-loop floor checked —
+/// the published 1920-sample ladder, 16 codebooks and 1 semantic codebook (the
+/// ladder's widths come from the tensors and the config; the toy fixture
+/// shares the published upsampling at scaled widths). A missing `config.json`
+/// keeps the published geometry.
+fn openBundleAt(io: std.Io, allocator: std.mem.Allocator, tokenizer_dir: []const u8) !Bundle {
+    var w = try model_mod.loadWeights(io, allocator, tokenizer_dir);
+    errdefer w.deinit();
+    var cfg = readCodecConfig(io, allocator, tokenizer_dir) catch CodecConfig{};
+    cfg.rvq_codebook_dim = cfg.codebook_dim / 2;
+    if (!cfg.supported()) return error.UnsupportedCodecGeometry;
+    return .{ .allocator = allocator, .cfg = cfg, .w = w };
+}
+
+/// The live-pack seam: the same open at the real widths the frame loop is
+/// built for (codebook 512, latent 1024, decoder 1536).
+pub fn openBundle(io: std.Io, allocator: std.mem.Allocator, tokenizer_dir: []const u8) !Bundle {
+    const b = try openBundleAt(io, allocator, tokenizer_dir);
+    const c = b.cfg;
+    if (c.codebook_dim != 512 or c.latent_dim != 1024 or c.decoder_dim != 1536) return error.UnsupportedCodecGeometry;
+    return b;
+}
+
+
 /// Load the decoder from an open `Bundle`.
 pub fn loadDecoder(b: *Bundle, s: S) !CodecDecoder {
     return b.decoder(s);
@@ -1014,6 +1041,11 @@ pub fn loadDecoder(b: *Bundle, s: S) !CodecDecoder {
 pub fn loadCodecDecoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !CodecDecoder {
     const dir = try std.fmt.allocPrint(allocator, "{s}/speech_tokenizer", .{model_dir});
     defer allocator.free(dir);
+    // The published floor is the frame loop's; a pack whose codec config is
+    // readable but not the published ladder is refused BY NAME here, at load.
+    if (readCodecConfig(io, allocator, dir)) |cfg| {
+        if (!cfg.supported()) return error.UnsupportedCodecGeometry;
+    } else |_| {}
     return loadCodecDecoderFrom(io, allocator, s, dir);
 }
 
@@ -1021,7 +1053,7 @@ pub fn loadCodecDecoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_di
 /// `model.safetensors` with this decoder layout): Qwen3-TTS `speech_tokenizer/`
 /// or Breeze `audio_tokenizer/`.
 pub fn loadCodecDecoderFrom(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer_dir: []const u8) !CodecDecoder {
-    var b = try Bundle.open(io, allocator, tokenizer_dir);
+    var b = try openBundleAt(io, allocator, tokenizer_dir);
     defer b.close();
     return b.decoder(s);
 }
@@ -1537,7 +1569,7 @@ fn hostNlc(samples: []const f32, channels: u32, alloc: std.mem.Allocator, s: S) 
 
 /// Load the `audio_tokenizer` encoder weights into a `MimiEncoder`.
 pub fn loadMimiEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, tokenizer_dir: []const u8) !MimiEncoder {
-    var b = try Bundle.open(io, allocator, tokenizer_dir);
+    var b = try openBundle(io, allocator, tokenizer_dir);
     defer b.close();
     return b.encoder(s);
 }
@@ -1612,75 +1644,7 @@ fn readPath(io: std.Io, alloc: std.mem.Allocator, path: []const u8, limit: usize
     return try rs.interface.allocRemaining(alloc, .limited(limit));
 }
 
-
-test "mimi encoder parity vs oracle (MIMI_ENCODE)" {
-    log.enableStderr();
-    // Clip + oracle ship in fixtures/ (the first 24 frames of a 24 kHz mono reference utterance;
-    // codes are u16 LE, 16 per frame, from the qwen_tts reference tokenizer pointed at the same
-    // pack's audio_tokenizer). MIMI_ENCODE still names a real pack — the encoder is real-sized.
-    const tok_dir = env.span(.MIMI_ENCODE) orelse return error.SkipZigTest;
-    const wav_path = env.span(.MIMI_WAV) orelse "src/plugins/breeze_tts/fixtures/mimi_clip.wav";
-    const oracle_path = env.span(.MIMI_ORACLE) orelse "src/plugins/breeze_tts/fixtures/mimi_codes.bin";
-
-    const alloc = std.testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const s = mlx.mlx_default_gpu_stream_new();
-
-    // Load wav → mono f32 at 24 kHz.
-    const wav_bytes = try readPath(io, alloc, wav_path, 1 << 30);
-    defer alloc.free(wav_bytes);
-    const d = try wav_mod.decode(alloc, wav_bytes);
-    defer alloc.free(d.pcm);
-    std.debug.assert(d.channels == 1 or d.channels == 2);
-
-    var enc = try loadMimiEncoder(io, alloc, s, tok_dir);
-    defer enc.deinit();
-    std.debug.print("mimi-start T={d}\n", .{d.pcm.len});
-    const frames = enc.encodeSamples(d.pcm) catch |e| { std.debug.print("encodeSamples ERR {s}\n", .{@errorName(e)}); return e; };
-    defer {
-        for (frames) |f| alloc.free(f);
-        alloc.free(frames);
-    }
-    std.debug.print("mimi: {d} frames\n", .{frames.len});
-
-    // Load oracle codes via a raw-bytes read.
-    const oracle = try readPath(io, alloc, oracle_path, 1 << 20);
-    defer alloc.free(oracle);
-    const n_frames = oracle.len / (16 * 2);
-    try std.testing.expectEqual(n_frames, frames.len);
-    // Frames t>=1 must be byte-exact; frame 0 rides the left-pad edge where
-    // torch/MLX accumulation order can flip near-tie codebook picks (≤ 16 cells).
-    var mism: usize = 0;
-    var first_mm: usize = 0;
-    var mism_t0: usize = 0;
-    for (frames, 0..) |row, t| {
-        for (0..16) |q| {
-            const ov = @as(u16, oracle[t * 32 + q * 2]) | (@as(u16, oracle[t * 32 + q * 2 + 1]) << 8);
-            if (ov != row[q]) {
-                if (mism == 0) first_mm = t * 16 + q;
-                if (t == 0) mism_t0 += 1 else mism += 1;
-            }
-        }
-    }
-    std.debug.print("mimi parity: t>0 {d}/{d} mismatched (first at {d}); t0 {d}/16\n", .{ mism, (frames.len - 1) * 16, first_mm, mism_t0 });
-    try std.testing.expectEqual(@as(usize, 0), mism);
-    try std.testing.expectEqual(@as(u32, 259), frames[0][0]);
-    // Little-endian raw dump for external diffing.
-    if (env.get(.MIMI_DUMP)) |dump_prefix| {
-        const buf = try alloc.alloc(u8, frames.len * 16 * 2);
-        defer alloc.free(buf);
-        for (frames, 0..) |row, t| for (0..16) |q| {
-            const v: u16 = @intCast(row[q]);
-            buf[t * 32 + q * 2] = @truncate(v);
-            buf[t * 32 + q * 2 + 1] = @truncate(v >> 8);
-        };
-        const p = std.mem.span(dump_prefix);
-        const f = try std.Io.Dir.createFileAbsolute(io, p, .{});
-        defer f.close(io);
-        var wb: [8192]u8 = undefined;
-        var fw = f.writer(io, &wb);
-        try fw.interface.writeAll(buf);
-        try fw.interface.flush();
-    }
-    try std.testing.expectEqual(@as(usize, 0), mism);
+/// A raw-bytes read (a codec oracle clip / code table), shared by the codec plugins' parity tests.
+pub fn readBytes(io: std.Io, alloc: std.mem.Allocator, path: []const u8, limit: usize) ![]u8 {
+    return readPath(io, alloc, path, limit);
 }
