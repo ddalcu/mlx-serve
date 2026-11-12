@@ -7,6 +7,7 @@ const std = @import("std");
 const abi = @import("../../abi/engine.zig");
 const logprob = @import("../../sdk/request/logprob.zig");
 const ConstraintSpan = @import("../../sdk/grammar/protocol.zig").ConstraintSpan;
+const PrefillProgress = @import("../../sdk/request/prefill_progress.zig").PrefillProgress;
 
 pub const LogprobResult = logprob.LogprobResult;
 pub const TokenLogprob = logprob.TokenLogprob;
@@ -50,6 +51,9 @@ pub const Stream = struct {
     constraint_payload_at: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
     constraint_payload_offset: std.atomic.Value(u32) = .init(0),
 
+    /// Live prefill progress for a `return_progress` request: the engine writes it while the
+    /// prefill runs; the connection thread reads it between chunks.
+    prefill_progress: PrefillProgress = .{},
     /// The whole prompt's length as submitted: a refusal before prefill quotes it.
     prompt_len: usize = 0,
     prompt_tokens: u32 = 0,

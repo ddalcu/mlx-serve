@@ -1,5 +1,6 @@
 //! Generator.InitOptions and the hooks the scheduler hands a generator.
 const std = @import("std");
+const prefill_progress = @import("../../../sdk/request/prefill_progress.zig");
 const transformer_mod = @import("../transformer.zig");
 const drafter_mod = @import("../../../plugins/gemma4/assistant_drafter.zig");
 const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
@@ -17,7 +18,6 @@ const LogprobResult = @import("../sampling/logprobs.zig").LogprobResult;
 const MtpHeadRef = @import("../spec/mtp_head_ref.zig").MtpHeadRef;
 const MtpRestored = @import("../spec/mtp_head_ref.zig").MtpRestored;
 const deinit = @import("generator.zig").Generator.deinit;
-
 
 /// Receiver for SSM checkpoints salvaged out of a cancelled prefill.
 /// `initWithOptions` captures stride checkpoints into a local list that
@@ -219,6 +219,9 @@ pub const InitOptions = struct {
     /// Total tokens this prefill will forward (post-cache tail, same scale
     /// as `prefill_progress`), published once; null on the bypass engines.
     prefill_expected: ?*std.atomic.Value(u64) = null,
+    /// The request's own live prefill progress (`return_progress`), absolute prompt position on the
+    /// host stream the pointer targets. Written at prefill start and once per chunk; null = not asked.
+    live_progress: ?*prefill_progress.PrefillProgress = null,
 
     /// Called once per completed prefill chunk boundary (chunk state
     /// evaluated, allocator cache cleared), except the final one. The
@@ -260,7 +263,6 @@ pub const ChunkWidthHook = struct {
 };
 
 // ── tests ──
-
 
 test "InitOptions.lookup_prompt overrides prompt_ids_owned source" {
     // When the server's cache-reuse path forwards only a trailing-tail

@@ -11,6 +11,7 @@ const model_registry_mod = @import("../registry/registry.zig");
 const ModelConfig = @import("../../sdk/config/model.zig").ModelConfig;
 const KVQuantConfig = @import("../../sdk/blocks/attention/kv_quant.zig").KVQuantConfig;
 const SamplingParams = @import("../../sdk/request/sampling.zig").SamplingParams;
+const prefill_progress = @import("../../sdk/request/prefill_progress.zig");
 const MediaSpan = @import("../../sdk/kv/media_span.zig").MediaSpan;
 const LlamaSettings = @import("../../sdk/quant/gguf/llama_settings.zig").Settings;
 const GgufRoute = @import("../../sdk/quant/gguf/engine_pick.zig").Route;
@@ -169,6 +170,11 @@ pub const SubmitParams = struct {
     prompt_ids: []const u32,
     /// Where the request's events go (`abi.Event`): the host's stream. Null = the slot's own buffer only.
     sink: ?abi.Sink = null,
+    /// The request asked to watch the prefill (`return_progress`). `Running.submit` resolves it to
+    /// the host stream's progress; null = the engine reports nothing and the stream stays bare.
+    return_progress: bool = false,
+    /// Set by `Running.submit` from `return_progress`; the engine's prefill writes it per chunk.
+    prefill_progress: ?*prefill_progress.PrefillProgress = null,
     /// Full original prompt for PLD lookup. When null, defaults to
     /// `prompt_ids` (PLD's lookup table = full_prompt + generated).
     full_prompt: ?[]const u32 = null,
