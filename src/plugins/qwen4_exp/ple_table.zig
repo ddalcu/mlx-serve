@@ -8,7 +8,8 @@ pub const EmbeddedInfo = struct { payload_bytes: u64 };
 const prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.";
 /// oMLX's affine shards and NVIDIA ModelOpt's NVFP4 shards (e2m1 codes, e4m3 scale per 16); `ggml` is a GGUF's
 /// table read in place (whole ggml blocks per row, `NgramTable.openGguf`).
-pub const Format = enum { affine, nvfp4, ggml };
+/// `trellis`: an `exl3_ngram_trellis` table file (`NgramTable.parseTrellis`), never embedded.
+pub const Format = enum { affine, nvfp4, ggml, trellis };
 const Spelling = struct { layer_prefix: []const u8, shard_marker: []const u8, scale_marker: []const u8, fmt: Format };
 const spellings = [_]Spelling{
     .{ .layer_prefix = "language_model.model.layers.", .shard_marker = ".ple.ple_embedding.ngram_embedding.shards.", .scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale", .fmt = .affine },
@@ -59,7 +60,7 @@ pub fn partCount(fmt: Format) usize {
     return switch (fmt) {
         .affine => 3,
         .nvfp4 => 2,
-        .ggml => 1,
+        .ggml, .trellis => 1,
     };
 }
 

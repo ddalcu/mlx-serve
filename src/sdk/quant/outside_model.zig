@@ -74,6 +74,54 @@ pub const Load = struct {
     }
 };
 
+/// The `[out, in]` rows a projection the table loaded computes (`in_dim` its inputs): its matmul over the identity,
+/// `chunk` input columns a call (identity row i reads column i of W), in `dtype`. For a model that needs a weight's
+/// rows (a requantized copy) where the pack stores none MLX reads; a load-time transient of out x in.
+pub fn denseRows(w: *const outside.Weight, in_dim: u32, dtype: mlx.mlx_dtype, chunk: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const n: c_int = @intCast(in_dim);
+    const step: c_int = @intCast(@max(chunk, 1));
+    var cols = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cols);
+    try mlx.check(mlx.mlx_arange(&cols, 0, @floatFromInt(n), 1, .int32, s));
+    const parts = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(parts);
+    var c0: c_int = 0;
+    while (c0 < n) : (c0 += step) {
+        const c = @min(step, n - c0);
+        var idx = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(idx);
+        try mlx.check(mlx.mlx_arange(&idx, @floatFromInt(c0), @floatFromInt(c0 + c), 1, .int32, s));
+        var col = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(col);
+        try mlx.check(mlx.mlx_reshape(&col, idx, &[_]c_int{ c, 1 }, 2, s));
+        var hit = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(hit);
+        try mlx.check(mlx.mlx_equal(&hit, col, cols, s));
+        var eye = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eye);
+        try mlx.check(mlx.mlx_astype(&eye, hit, dtype, s));
+        // One chunk of rows, as a prompt reaches the projection: [1, c, in].
+        var eye3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eye3);
+        try mlx.check(mlx.mlx_reshape(&eye3, eye, &[_]c_int{ 1, c, n }, 3, s));
+        const y = try w.matmul(eye3, s);
+        defer _ = mlx.mlx_array_free(y);
+        const out_dim = mlx.getShape(y)[mlx.getShape(y).len - 1];
+        var part = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(part);
+        try mlx.check(mlx.mlx_reshape(&part, y, &[_]c_int{ c, out_dim }, 2, s));
+        try mlx.check(mlx.mlx_array_eval(part));
+        _ = mlx.mlx_vector_array_append_value(parts, part);
+    }
+    var cols_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cols_t);
+    try mlx.check(mlx.mlx_concatenate_axis(&cols_t, parts, 0, s));
+    var rows = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_transpose(&rows, cols_t, s));
+    return rows;
+}
+
 /// The bytes a bank's slot rows may take: one budget, or the model's at a context it picks.
 pub const Budget = union(enum) {
     fixed: quant_abi.BankBudget,
@@ -233,6 +281,43 @@ test "outside model: routed experts are the block's format banks at their input 
     try testing.expect(try l.experts("none", 16, 4) == null);
     try testing.expectError(error.MissingWeight, l.experts("half", 16, 4));
     try testing.expectEqual(@as(usize, 4), l.kept.items.len);
+}
+
+/// `x @ W^T` over the weight's own array W.
+const DenseToy = struct {
+    fn matmul(w: *const quant_abi.Weight, x: quant_abi.Array, s: quant_abi.Stream, out: *quant_abi.Array) callconv(.c) common.Verdict {
+        var wt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt);
+        var y = mlx.mlx_array_new();
+        if (mlx.mlx_transpose(&wt, .{ .ctx = w.w.ctx }, .{ .ctx = s.ctx }) != 0 or mlx.mlx_matmul(&y, .{ .ctx = x.ctx }, wt, .{ .ctx = s.ctx }) != 0) return common.Verdict.refuse(.failed, "DenseToy");
+        out.* = .{ .ctx = y.ctx };
+        return .ok;
+    }
+    const table: quant_abi.QuantTable = blk: {
+        var t = Toy.table;
+        t.matmul = &matmul;
+        break :blk t;
+    };
+};
+
+test "outside model: a stored projection's rows are its matmul over the identity, a chunk of columns at a time" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_arange(&flat, 0, 15, 1, .float32, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_reshape(&w, flat, &[_]c_int{ 3, 5 }, 2, s));
+    const weight: outside.Weight = .{ .t = &DenseToy.table, .w = .{ .w = .{ .ctx = w.ctx } } };
+    const rows = try denseRows(&weight, 5, .float32, 2, s);
+    defer _ = mlx.mlx_array_free(rows);
+    var got = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_contiguous(&got, rows, false, s));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try testing.expectEqualSlices(c_int, &.{ 3, 5 }, mlx.getShape(got));
+    for (mlx.mlx_array_data_float32(got).?[0..15], 0..) |v, i| try testing.expectEqual(@as(f32, @floatFromInt(i)), v);
 }
 
 const ToyRungs = struct {

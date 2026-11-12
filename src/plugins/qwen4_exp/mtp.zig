@@ -6,6 +6,8 @@ const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
+const outside_quant = @import("../../sdk/quant/outside.zig");
+const outside_model = @import("../../sdk/quant/outside_model.zig");
 const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const KVQuantConfig = @import("../../engines/mlx/cache/kv_quant.zig").KVQuantConfig;
 const model_mod = @import("../../sdk/config/model.zig");
@@ -143,14 +145,16 @@ pub const Qwen4Mtp = struct {
     }
 };
 
+/// The prefix the pack's MTP head sits under; null when it ships none.
+pub fn headPrefix(weights: *const Weights) ?[]const u8 {
+    if (weights.get("language_model.mtp.fc_hidden.weight") != null) return "language_model.mtp";
+    if (weights.get("mtp.fc_hidden.weight") != null) return "mtp";
+    return null;
+}
+
 /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
 pub fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
-    const mtp_prefix = if (weights.get("language_model.mtp.fc_hidden.weight") != null)
-        "language_model.mtp"
-    else if (weights.get("mtp.fc_hidden.weight") != null)
-        "mtp"
-    else
-        return null;
+    const mtp_prefix = headPrefix(weights) orelse return null;
     var mcfg = config;
     // The head's experts stay whole on a tensor-parallel rank 0 (`distributed.headOnly`).
     if (mcfg.dist_shard) |sh| {
@@ -1019,7 +1023,7 @@ pub fn qwen4BuildDraftRerank(self: *Trunk) bool {
     const io = std.Io.Threaded.global_single_threaded.io();
     const t0 = std.Io.Timestamp.now(io, .awake);
     // The ONE env read: the built head carries its width from here on.
-    const rc = mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.DRAFT_HEAD_BITS) orelse return false;
+    const rc = (if (self.outsideLinear(self.lm_head_w)) |ext| outsideRerank(self, ext) else mtp_mod.buildRerankCoarse(self.s, self, mtp_mod.DRAFT_HEAD_BITS)) orelse return false;
     m.rerank = rc;
     const bytes = mtp_mod.rerankCoarseBytes(rc.rows, @intCast(self.config.hidden_size), rc.bits);
     const ms: u64 = @intCast(@divTrunc(t0.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
@@ -1028,6 +1032,18 @@ pub fn qwen4BuildDraftRerank(self: *Trunk) bool {
         .{ rc.bits, bytes / (1024 * 1024), ms },
     );
     return true;
+}
+
+/// The coarse head over an outside quant plugin's lm_head, which stores no rows MLX reads: the rows its matmul computes
+/// over the identity (`outside_model.denseRows`) in one call of `hidden` rows, as a prefill chunk reaches the head,
+/// requantized once and dropped. Null keeps the full readout.
+fn outsideRerank(self: *Trunk, ext: *const outside_quant.Weight) ?mtp_mod.RerankCoarse {
+    const rows = outside_model.denseRows(ext, self.config.hidden_size, self.actDtype(), self.config.hidden_size, self.s) catch |err| {
+        log.warn("[qwen4] MTP draft rerank: the outside head's rows failed ({s}) - keeping the full readout\n", .{@errorName(err)});
+        return null;
+    };
+    defer _ = mlx.mlx_array_free(rows);
+    return mtp_mod.buildRerankCoarseRows(self.s, rows, mtp_mod.DRAFT_HEAD_BITS);
 }
 
 /// Is the qwen4_exp head's draft rerank available? A pure read once the
