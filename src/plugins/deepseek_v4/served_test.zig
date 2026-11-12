@@ -1000,6 +1000,35 @@ test "deepseek_v41 served: DSpark rounds (greedy, then seeded sampling) equal th
     try expectDspark(@import("../deepseek_v41/plugin.zig"), files, .{ .temperature = 0.8, .top_p = 0.95, .seed = 4 }, 4, @embedFile("../deepseek_v41/fixtures/dspark-sampled.tape"));
 }
 
+test "deepseek_v41 served: a pack that quantized its DSpark heads drafts from them dequantized" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const dsv41 = @import("../deepseek_v41/deepseek_v41.zig");
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const ds = env.override(.MLX_SERVE_DSV4_DSPARK, "1");
+    defer ds.restore();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41DsparkQuantHeadFiles(arena.allocator(), 7), "");
+    defer p.close();
+    const a = testing.allocator;
+    const m = intree.dsv41(&p.xfm).?;
+    // hidden 128, vocab 96, rank 64: the weights' own shapes, not their packed words'.
+    const heads = m.dspark.?;
+    try testing.expectEqualSlices(c_int, &.{ 1, 128 + 64 }, mlx.getShape(heads.conf));
+    try testing.expectEqualSlices(c_int, &.{ 96, 64 }, mlx.getShape(heads.markov_embed));
+    try testing.expectEqualSlices(c_int, &.{ 96, 64 }, mlx.getShape(heads.markov_head));
+    var g = ops.Graph.init(a, mlx.gpuStream());
+    defer g.deinit();
+    var st = try dsv41.initState(m, a);
+    defer st.deinit();
+    _ = try g.adopt(try dsv41.extend(m, a, &st, &.{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90 }, .last));
+    var d = try dsv41.dsparkDraft(m, a, &st, 5);
+    defer d.deinit(a);
+    try testing.expectEqual(@as(usize, 4), d.ids.len);
+    try testing.expectEqual(@as(u32, 5), d.ids[0]);
+    for (d.ids) |id| try testing.expect(id < 96);
+}
+
 /// The largest gap between two `[rows, V]` logit sets, against the reference's largest magnitude.
 fn relGap(g: *ops.Graph, got: Array, want: Array) !f32 {
     const x = try g.contiguous(try g.astype(got, .float32));

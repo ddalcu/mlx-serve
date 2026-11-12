@@ -890,6 +890,19 @@ fn ownCast(m: *Dsv41Model, x: A, dt: mlx.mlx_dtype) !A {
     return o;
 }
 
+/// A weight the forward reads dense, owned by the model: as stored (cast to `dt` when given), or dequantized here
+/// when the pack quantized it (to `dt`, else the activation dtype).
+fn ownDense(m: *Dsv41Model, w: *const Weights, in_dim: usize, comptime base: []const u8, args: anytype, dt: ?mlx.mlx_dtype) !A {
+    const l = try getLin(m, w, in_dim, base, args);
+    if (l.ext != null or l.qp.mode == .gguf) return error.Dsv41QuantGeometry;
+    if (l.s.ctx == null) return if (dt) |d| ownCast(m, l.w, d) else l.w;
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_dequantize(&o, l.w, l.s, l.b, mlx.mlx_optional_int.some(@intCast(l.qp.group_size)), mlx.mlx_optional_int.some(@intCast(l.qp.bits)), l.qp.mode.cstr(), none, .{ .value = dt orelse m.act, .has_value = true }, m.s));
+    _ = try m.own(o);
+    try mlx.check(mlx.mlx_array_eval(o));
+    return o;
+}
+
 fn ownReshape(m: *Dsv41Model, x: A, shape: []const c_int) !A {
     var o = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&o, x, shape.ptr, shape.len, m.s));
@@ -1796,14 +1809,15 @@ pub fn init(gpa: std.mem.Allocator, whole: *const Config, w: *Weights, s: S, opt
         for (0..n_stages) |si| m.layers[n_layers + si] = try loadLayer(m, w, "mtp", si, null);
         const last = n_stages - 1;
         const targets = cfg.dsv4_n_dspark_target_layers;
+        const rank = cfg.dsv4_dspark_markov_rank;
         m.dspark = .{
             .main_proj = try getLin(m, w, cfg.hidden_size * targets, "mtp.0.main_proj", .{}),
             .main_norm = try ownCast(m, try getW(w, "mtp.0.main_norm.weight", .{}), m.act),
             .norm = try ownCast(m, try getW(w, "mtp.{d}.norm.weight", .{last}), m.act),
             // The release's names (`markov_w1`, the bigram embedding; `markov_w2`, its head) where the pack keeps them.
-            .markov_embed = getOpt(w, "mtp.{d}.markov_head.markov_w1.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.embed.weight", .{last}),
-            .markov_head = try ownCast(m, getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) orelse try getW(w, "mtp.{d}.markov_head.head.weight", .{last}), m.act),
-            .conf = try ownCast(m, try getW(w, "mtp.{d}.confidence_head.proj.weight", .{last}), .float32),
+            .markov_embed = if (getOpt(w, "mtp.{d}.markov_head.markov_w1.weight", .{last}) != null) try ownDense(m, w, rank, "mtp.{d}.markov_head.markov_w1", .{last}, null) else try ownDense(m, w, rank, "mtp.{d}.markov_head.embed", .{last}, null),
+            .markov_head = if (getOpt(w, "mtp.{d}.markov_head.markov_w2.weight", .{last}) != null) try ownDense(m, w, rank, "mtp.{d}.markov_head.markov_w2", .{last}, m.act) else try ownDense(m, w, rank, "mtp.{d}.markov_head.head", .{last}, m.act),
+            .conf = try ownDense(m, w, cfg.hidden_size + rank, "mtp.{d}.confidence_head.proj", .{last}, .float32),
         };
         m.n_mtp = n_stages;
         if (env.get(.DSPARK_PROFILE) != null) m.ds_prof = .{};

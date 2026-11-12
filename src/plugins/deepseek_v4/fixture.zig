@@ -330,6 +330,13 @@ const v41_vocab = 96;
 
 /// The V4.1 pipe layout with `stages` DSpark stages (`v41_dspark_keys`): stage layers and the drafter's head.
 pub fn v41WeightsWith(a: std.mem.Allocator, seed: u64, stages: usize) ![]u8 {
+    return v41Pack(a, seed, stages, false);
+}
+
+/// The Markov rank of a pack whose drafter heads are quantized: a whole group.
+const quant_rank = 64;
+
+fn v41Pack(a: std.mem.Allocator, seed: u64, stages: usize, quant_heads: bool) ![]u8 {
     const r41 = [_]u8{ 0, 0, 2, 2, 2, 1, 1, 1 };
     const kv_sources = [_]usize{ 2, 5 };
     const index_sources = [_]usize{ 2, 5, 7 };
@@ -354,6 +361,12 @@ pub fn v41WeightsWith(a: std.mem.Allocator, seed: u64, stages: usize) ![]u8 {
         try p.affine("mtp.0.main_proj", &.{v41_d}, v41_d * ds_targets.len, 8, 64);
         try p.norm("mtp.0.main_norm.weight", v41_d);
         try p.norm(try std.fmt.bufPrint(&buf, "mtp.{d}.norm.weight", .{last}), v41_d);
+        if (quant_heads) {
+            try p.affine(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.embed", .{last}), &.{v41_vocab}, quant_rank, 8, 64);
+            try p.affine(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.head", .{last}), &.{v41_vocab}, quant_rank, 8, 64);
+            try p.affine(try std.fmt.bufPrint(&buf, "mtp.{d}.confidence_head.proj", .{last}), &.{1}, v41_d + quant_rank, 8, 64);
+            return p.bytes();
+        }
         try p.dense(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.embed.weight", .{last}), &.{ v41_vocab, ds_rank }, 0.01, 0, true);
         try p.dense(try std.fmt.bufPrint(&buf, "mtp.{d}.markov_head.head.weight", .{last}), &.{ v41_vocab, ds_rank }, 0.01, 0, true);
         try p.dense(try std.fmt.bufPrint(&buf, "mtp.{d}.confidence_head.proj.weight", .{last}), &.{ 1, v41_d + ds_rank }, 0.1, 0, true);
@@ -431,6 +444,16 @@ pub fn v41DsparkFiles(a: std.mem.Allocator, seed: u64) ![]const File {
     return a.dupe(File, &.{
         .{ .name = "config.json", .bytes = cfg },
         .{ .name = "model.safetensors", .bytes = try v41WeightsWith(a, seed, 2) },
+    });
+}
+
+/// `v41DsparkFiles` with the drafter's Markov and confidence heads quantized (8-bit, groups of 64).
+pub fn v41DsparkQuantHeadFiles(a: std.mem.Allocator, seed: u64) ![]const File {
+    const keys = try std.mem.replaceOwned(u8, a, v41_dspark_keys, "\"dspark_markov_rank\": 16", std.fmt.comptimePrint("\"dspark_markov_rank\": {d}", .{quant_rank}));
+    const cfg = try std.mem.replaceOwned(u8, a, v41_config, "\"compress_ratios\": [0, 0, 2, 2, 2, 1, 1, 1]", keys);
+    return a.dupe(File, &.{
+        .{ .name = "config.json", .bytes = cfg },
+        .{ .name = "model.safetensors", .bytes = try v41Pack(a, seed, 2, true) },
     });
 }
 
