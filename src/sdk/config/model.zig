@@ -5021,7 +5021,7 @@ test "dist N-rank: shardExperts gives rank 2 and rank 3 of four their quarter of
     }
 }
 
-test "dist N-rank: shardExperts refuses a tensor its ranks cannot cut evenly, where it once panicked" {
+test "dist N-rank: shardExperts refuses a tensor its ranks cannot cut into whole quant groups with DistShardUneven" {
     var w = Weights.init(std.testing.allocator);
     defer w.deinit();
     const vals = std.mem.zeroes([18]f32);
