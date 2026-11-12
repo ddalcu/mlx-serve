@@ -109,6 +109,12 @@ pub const Moe = struct {
         clamp: ?u32 = 0,
         /// The clamp as the composed chain applies it (`swiglu_limit` with `swiglu_clamp`); 0 = none.
         clamp_limit: f32 = 0,
+        /// The routed experts' SwiGLU clamped after the SiLU, min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's
+        /// `expert_swiglu_limit_list`); 0 = none. The composed chain applies it (set `clamp` null so no kernel claims the
+        /// layer); a bound bank (`streamed`) applies its own.
+        limit_out: f32 = 0,
+        /// The shared expert's SwiGLU clamped after the SiLU (Ling-3.1's `share_expert_swiglu_limit_list`); 0 = none.
+        shared_limit_out: f32 = 0,
         /// The routing chain compiled (`compileRouting`); null = op by op.
         route_fn: compiled.Closure = .{ .ctx = null },
         /// Set: the experts are the format's (`gate`/`up`/`down` unread).
@@ -243,7 +249,14 @@ fn route(w: *const Moe.Weights, g: *Graph, logits: Array, fold: ?router_kernel.R
 
 /// `act(gate) * up`: SiLU, clamped where the pack clamps.
 fn geglu(w: *const Moe.Weights, parent: *Graph, gate: Array, up: Array) !Array {
+    return swigluAct(w, parent, gate, up, w.limit_out);
+}
+
+/// `geglu` with a clamp after the SiLU at `limit_out` (0 = the layer's own SwiGLU): the routed experts' at `w.limit_out`,
+/// the shared expert's at `w.shared_limit_out`.
+fn swigluAct(w: *const Moe.Weights, parent: *Graph, gate: Array, up: Array, limit_out: f32) !Array {
     const s = parent.s;
+    if (limit_out > 0) return parent.adopt(try swigluClampOut(s, gate, up, limit_out));
     if (w.clamp_limit > 0) {
         if (try fused_act.fusedClampedSwiGLU(s, gate, up, w.clamp_limit)) |y| return parent.adopt(y);
         return parent.adopt(try clampedSwiGLU(s, gate, up, w.clamp_limit));
@@ -378,7 +391,30 @@ fn sharedDown(w: *const Moe.Weights, parent: *Graph, se: *const SharedExpert, x:
     var t = parent.scope();
     defer t.deinit();
     const g = &t;
-    return parent.keep(try se.down.forward(g, try geglu(w, g, try se.gate.forward(g, x), try se.up.forward(g, x))));
+    return parent.keep(try se.down.forward(g, try swigluAct(w, g, try se.gate.forward(g, x), try se.up.forward(g, x), w.shared_limit_out)));
+}
+
+/// min(silu(g), L) * clamp(u, -L, L) in f32, cast back to `gate`'s dtype: Ling-3.1's SwiGLU on a clamped layer
+/// (inclusionAI's modeling_bailing_moe_v3.py; exllamav3's `act_limit` with SiLU). A NaN passes through.
+pub fn swigluClampOut(s: mlx.mlx_stream, gate: Array, up: Array, limit: f32) !Array {
+    const dt = mlx.mlx_array_dtype(gate);
+    var tmp: [10]Array = @splat(mlx.mlx_array_new());
+    defer for (tmp) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    try mlx.check(mlx.mlx_astype(&tmp[0], gate, .float32, s));
+    try mlx.check(mlx.mlx_astype(&tmp[1], up, .float32, s));
+    try mlx.check(mlx.mlx_sigmoid(&tmp[2], tmp[0], s));
+    try mlx.check(mlx.mlx_multiply(&tmp[3], tmp[0], tmp[2], s));
+    tmp[4] = mlx.mlx_array_new_float(limit);
+    tmp[5] = mlx.mlx_array_new_float(-limit);
+    try mlx.check(mlx.mlx_minimum(&tmp[6], tmp[3], tmp[4], s));
+    try mlx.check(mlx.mlx_clip(&tmp[7], tmp[1], tmp[5], tmp[4], s));
+    try mlx.check(mlx.mlx_multiply(&tmp[8], tmp[6], tmp[7], s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, tmp[8], dt, s));
+    return out;
 }
 
 /// An ungated shared expert the affine-4 kernels carry: 3- or 4-bit affine at the routed bit-width and group size.
@@ -998,3 +1034,27 @@ fn slotDown(w: *const Moe.Weights, g: *Graph, x_flat: Array, sl: *const Slots, p
 
 var route_pack_logged = false;
 var prefill_reduce_logged = false;
+
+test "moe: swigluClampOut is min(silu(g), L) * clamp(u, -L, L) at Ling-3.1's L = 10, a NaN passing through" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    const g = [_]f32{ -20, -1, 0, 0.5, 3, 12, 40, std.math.nan(f32) };
+    const u = [_]f32{ -30, -10, 7, 2, -11, 9, 30, 1 };
+    const ga = mlx.mlx_array_new_data(&g, &[_]c_int{g.len}, 1, .float32);
+    defer _ = mlx.mlx_array_free(ga);
+    const ua = mlx.mlx_array_new_data(&u, &[_]c_int{u.len}, 1, .float32);
+    defer _ = mlx.mlx_array_free(ua);
+    const y = try swigluClampOut(s, ga, ua, 10);
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_array_eval(y));
+    const got = mlx.mlx_array_data_float32(y).?[0..g.len];
+    for (g, u, got) |gv, uv, yv| {
+        if (std.math.isNan(gv)) {
+            try std.testing.expect(std.math.isNan(yv));
+            continue;
+        }
+        const gd: f64 = gv;
+        const silu = gd / (1 + @exp(-gd));
+        const want = @min(silu, 10.0) * std.math.clamp(@as(f64, uv), -10.0, 10.0);
+        try std.testing.expectApproxEqAbs(want, @as(f64, yv), 1e-4 * @max(1.0, @abs(want)));
+    }
+}

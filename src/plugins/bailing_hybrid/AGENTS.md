@@ -17,6 +17,11 @@ with GLM-5.3-Flash's readers and loads through `glm5_next/trunk.zig`; its own pa
   captures bit-equal to the deleted legacy forward's tape (`fixtures/steps.tape`). Conformance passes on the same pack.
 - Bill: `kv_per_token` per attention head (MLA expands the latent before the write), bf16 `ssm_checkpoint`,
   `prefill_score_width` = nope + rope.
+- Ling-3.1 streaming pack (the EXL3 repack beside `experts.bin`): it keeps the release's config, so its EXL3
+  `quantization_config` (not `expert_streaming`) sets `streamed_bank`; glm5_next's streaming rules then apply. Its prompt
+  bill is `prefill_bytes` (the engine's arithmetic, unstreamed); `prompt_last_row` reads the head's last 32 rows only.
+- Ling-3.1's clamps AFTER the SiLU, per layer: `expert_swiglu_limit_list` (routed, the bank's or the composed chain's)
+  and `share_expert_swiglu_limit_list` (shared, `moe.Moe.Weights.shared_limit_out`); GLM's clamp is BEFORE it.
 
 Served, legacy forward deleted (`engines/mlx/plugin/served.zig`; `glm5_next/served_test.zig`: steps and greedy through the driver). DFlash via
 `trunk_weight` + captures. No MTP head: the legacy path serves none (a NextN `eh_proj` head binds to hy_v3/nemotron_h

@@ -866,6 +866,15 @@ const Loader = struct {
             }
             L.mixer = if (c.isLinearLayer(i)) .{ .kda = try l.kda(i) } else if (c.isGlm5()) .{ .dsa = try l.dsa(base) } else .{ .mla = try l.mla(i) };
             L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank) } else .{ .dense = try l.dense(i) };
+            if (L.mlp == .moe and i < c.expert_limit_out.len) {
+                // Ling-3.1's clamps after the SiLU: the shared expert's in the block; the routed experts' in the composed
+                // chain (no kernel serves it), or in the bound bank's own arithmetic (its plugin reads the pack's list).
+                L.mlp.moe.shared_limit_out = @floatFromInt(c.shared_limit_out[i]);
+                if (c.expert_limit_out[i] != 0) {
+                    L.mlp.moe.limit_out = @floatFromInt(c.expert_limit_out[i]);
+                    if (!c.streamed_bank) L.mlp.moe.clamp = null;
+                }
+            }
             built += 1;
         }
         return out;

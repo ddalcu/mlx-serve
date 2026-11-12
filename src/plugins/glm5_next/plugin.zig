@@ -139,33 +139,10 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
             host.clear(out, 0);
             return Verdict.named(.failed, @errorName(e));
         };
-        return settleBank(m, f, out);
+        return host.settleBank(m, f, out);
     }
     const v = host.forwardOne(plugin.name, fwd, m, ops, f, out);
-    return if (v.isOk()) settleBank(m, f, out) else v;
-}
-
-/// A streaming pack's bank after a forward: its outputs evaluated, then the calls' slot rows settled for the next
-/// forward's reads.
-fn settleBank(m: *host.Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdict {
-    const r = m.routed orelse return .ok;
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    for ([_]abi.Array{ out.logits, out.hidden }) |a| if (a.ctx != null) {
-        _ = mlx.mlx_vector_array_append_value(vec, .{ .ctx = a.ctx });
-    };
-    if (out.captured) |c| for (c[0..f.capture_layers.len]) |a| if (a.ctx != null) {
-        _ = mlx.mlx_vector_array_append_value(vec, .{ .ctx = a.ctx });
-    };
-    mlx.check(mlx.mlx_eval(vec)) catch |e| {
-        host.clear(out, f.capture_layers.len);
-        return Verdict.named(.failed, @errorName(e));
-    };
-    r.settle() catch |e| {
-        host.clear(out, f.capture_layers.len);
-        return Verdict.named(.failed, @errorName(e));
-    };
-    return .ok;
+    return if (v.isOk()) host.settleBank(m, f, out) else v;
 }
 
 /// N slots' next tokens in as few trunk forwards as the MoE row limit allows, each slot's token a row of one window:
