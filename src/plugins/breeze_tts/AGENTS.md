@@ -19,17 +19,15 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
   rope thetas, rms eps come from the pack; only the 16-codebook frame loop is pinned).
   Host-gathered audio/TE table boundaries; forwards run on-device; sampling keyed off a counter
   for seed determinism.
-- `mimi.zig` — Kyutai Mimi codec, 16 codebooks @ 12.5 Hz: the RVQ decoder the frame loop streams
-  through and the encoder that folds the reference clip into clone frames. Its own geometry rides
-  `audio_tokenizer/config.json` (`readCodecConfig` + `CodecConfig.supported`); the 1920-sample
-  upsample ladder is the floor. Self-contained (plugins do not import plugins); the low-level mlx
-  helpers ride along. If a second codec consumer appears this moves to `src/sdk/media/` and
-  `qwen3_tts` re-imports it. The codec is a separate file on purpose: qwen3_tts's copy lives
-  inside `tts.zig`, and merging means promoting it whole, which is a qwen3_tts change with its
-  own parity bar.
-- A `Bundle` (one safetensors file + handle map, `openBundle`) serves the decoder and the encoder
-  from one weight load; every load path that opens one `defer b.close()` — the parse phase
-  duplicates key strings and leaves nothing mapped after it.
+- The codec is `sdk/media/mimi_codec.zig` (shared with qwen3_tts): Kyutai Mimi, 16 codebooks
+  @ 12.5 Hz — the RVQ decoder the frame loop streams through and the encoder that folds the
+  reference clip into clone frames. Its geometry rides `audio_tokenizer/config.json`
+  (`readCodecConfig` + `CodecConfig.supported`); the 1920-sample upsample ladder is the floor.
+- A `Bundle` (one safetensors file + handle map, `openBundle`/`openBundleAt`) serves the decoder
+  and the encoder from one weight load; every load path that opens one `defer b.close()` — the
+  parse phase duplicates key strings and leaves nothing mapped after it. `openBundle` is the
+  live-pack seam (published widths); the toy fixture shares the published upsampling at
+  scaled widths and loads through the same path.
 - Frame rows the engine returns are views into one flat buffer (`Synthesis.backing`); the caller
   frees it through `freeSynthesisFrames` and never the rows.
 
