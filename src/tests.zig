@@ -266,6 +266,7 @@ test {
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");
     _ = @import("host/registry/discovery.zig");
+    _ = @import("host/registry/stub_cache.zig");
     _ = @import("host/registry/pack_dir.zig");
     _ = @import("sdk/quant/gguf/engine_pick.zig");
     _ = @import("host/registry/registry.zig");

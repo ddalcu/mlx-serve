@@ -13,6 +13,7 @@ const mlx_engine = @import("../engines/mlx.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
+const stubMeta = @import("../registry/stub_cache.zig").stubMeta;
 const model_settings_mod = @import("../registry/model_settings.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const gguf_files = @import("../../sdk/quant/gguf/files.zig");
@@ -320,7 +321,7 @@ pub fn renderModelEntry(
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
-            if (mtp_loaded or model_discovery.readStubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
+            if (mtp_loaded or stubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
             if (config.rowExactDecode()) "true" else "false",
             configuredKvQuantFor(config).wireName(),
             gen_temp_str,
@@ -354,8 +355,7 @@ pub fn renderModelEntry(
     defer if (err_part.len > 0) allocator.free(err_part);
     // Stub metadata sourced from config.json (+ chat-template presence) WITHOUT
     // faulting in weights: dims, context window, MoE-ness, and capabilities.
-    // `/v1/models` isn't hot, so reading a small JSON per unloaded entry is fine.
-    const sm = model_discovery.readStubMeta(io, allocator, entry.path);
+    const sm = stubMeta(io, allocator, entry.path);
 
     // Capabilities. Encoder-only models advertise "embeddings"; chat models get
     // chat/tool_use/streaming/json_schema (gated on chat-template presence, the

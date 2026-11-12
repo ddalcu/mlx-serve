@@ -924,8 +924,8 @@ fn applyServedStub(meta: *StubMeta, st: mlx_engine.PluginStub) void {
 
 /// Read `StubMeta` for the model directory at `abs_path` (config.json + a
 /// chat-template-presence check). Best-effort: any I/O / parse failure yields
-/// `.found=false`. Called per unloaded entry from `/v1/models` — cheap (small
-/// JSON files) and that endpoint isn't hot.
+/// `.found=false`. `/v1/models` asks through `stub_cache.zig`, which keeps the
+/// answer while the dir's files stand.
 pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) StubMeta {
     const trimmed = trimTrailingSlash(abs_path);
     const base = std.fs.path.basename(trimmed);
