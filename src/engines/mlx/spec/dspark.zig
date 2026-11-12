@@ -222,14 +222,11 @@ pub fn dsparkPlainPipelined(self: *Generator, allocator: std.mem.Allocator) !?Dr
     return try mtpSerialOneToken(allocator, tok);
 }
 
-/// A DSpark request's round policy: a drafted round's wall moves the average at most twofold (`Drafting.clamped`),
-/// and `plain` is the model's own `dspark_plain`, seeded from this machine's first steps (`PlainCost.seeded`).
+/// A DSpark request's round policy: `plain` is the model's own `dspark_plain`, seeded from this machine's first
+/// steps (`PlainCost.seeded`).
 pub fn dsparkPolicy(plain: dflash_policy.PlainCost, pin_rows: u32) DflashPol {
-    return .{ .calib = .{ .head = true }, .drafting = dflash_policy.Drafting.clamped, .plain = plain, .pin_rows = pin_rows };
+    return .{ .calib = .{ .head = true }, .plain = plain, .pin_rows = pin_rows };
 }
-
-/// The first drafted rounds after a load run on cold kernels and would judge drafting a loss for the whole request.
-const DSPARK_WARMUP_ROUNDS: u32 = 16;
 
 /// A plain step's cost, learned per model: the next request starts from it instead of the prior.
 fn samplePlainMs(self: *Generator, ms: f32) void {
@@ -265,9 +262,7 @@ pub fn dsparkPolicyStep(self: *Generator, allocator: std.mem.Allocator, mdl: *ds
         pol.calib.observe(sigmoid(c), k < round.accepted);
     }
     self.dspark_stats.record(@intCast(d.len), round.accepted);
-    if (self.xfm.dspark_warm_rounds < DSPARK_WARMUP_ROUNDS) {
-        self.xfm.dspark_warm_rounds += 1;
-    } else pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, msSince(&watch));
+    pol.drafting.record(@as(f32, @floatFromInt(round.tokens.len)) * pol.plain.ms, msSince(&watch));
     return self.commitDsparkRound(allocator, round, st.n);
 }
 
@@ -897,11 +892,11 @@ test "dsparkVerifyDrafts: a sure head verifies the block, an unsure one t1 alone
 
 test "dspark drafting backoff: prose rounds that lose to the plain step are skipped, copy-like rounds are not" {
     // A round that commits few tokens for its cost loses to the plain step (costs in ms).
-    var prose = dflash_policy.Drafting.clamped;
+    var prose = dflash_policy.Drafting{};
     try testing.expect(prose.shouldDraft());
     prose.record(3.2 * 17.6, 66);
     try testing.expect(!prose.shouldDraft());
-    var echo = dflash_policy.Drafting.clamped;
+    var echo = dflash_policy.Drafting{};
     try testing.expect(echo.shouldDraft());
     echo.record(5.5 * 17.6, 70);
     try testing.expect(echo.shouldDraft());
@@ -917,17 +912,11 @@ test "Transformer.dspark_plain starts seeded, so every DSpark request measures t
     try testing.expect(dflash_policy.PlainCost.seeded.seed_samples > 0);
 }
 
-test "dsparkPolicy: DSpark measures the plain step and bounds the wall, a DFlash policy keeps the prior rule" {
+test "dsparkPolicy: DSpark measures the plain step, a DFlash policy keeps the prior" {
     var dspark = dsparkPolicy(dflash_policy.PlainCost.seeded, 0);
     var dflash = DflashPol{};
     dspark.plain.sample(40);
     dflash.plain.sample(40);
     try testing.expectEqual(@as(f32, 40), dspark.plain.ms);
     try testing.expect(dflash.plain.ms < 25);
-    for ([_]*DflashPol{ &dspark, &dflash }) |pol| {
-        for (0..4) |_| pol.drafting.record(30, 20);
-        pol.drafting.record(30, 2000);
-    }
-    try testing.expect(dspark.drafting.shouldDraft());
-    try testing.expect(!dflash.drafting.shouldDraft());
 }
