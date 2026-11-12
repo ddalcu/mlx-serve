@@ -214,17 +214,16 @@ fn waitForUnload(need: u64, avail: u64, mark: model_registry_mod.UnloadMark, now
 }
 
 fn loadAvail(_: std.Io) u64 {
-    return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+    return effectiveAvailableBytes(status.getLoadAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
 }
 
-/// RAM a load can still take beside everything resident: what the OS grants less the reserve it
-/// keeps (iOS's per-process headroom already is what the process may take). Null when unreadable.
+/// RAM a load can still take beside everything resident (`getLoadRoomBytes`; iOS's per-process headroom
+/// already is what the process may take). Null when unreadable.
 pub fn loadRamRoom() ?u64 {
     const proc = status.getProcAvailableMemBytes();
     if (proc > 0) return proc;
-    const host = status.getAvailableMemBytes();
-    if (host == 0) return null;
-    return host -| status.osReserveBytes(status.getTotalMemBytes(), mlx.weightsInDeviceMemory());
+    if (status.getLoadAvailableMemBytes() == 0) return null;
+    return status.getLoadRoomBytes();
 }
 
 fn pauseLoadAvail(io: std.Io) void {
@@ -643,6 +642,26 @@ test "a sidecar bills its loaded width, and only an in-dir one is dropped to fit
     try std.testing.expectEqual(PreflightVerdict.refuse, preflightVerdict(20 * GB, 3 * GB, 25 * GB, false));
     try std.testing.expectEqual(PreflightVerdict.refuse, preflightVerdict(20 * GB, 3 * GB, 20 * GB, true));
     try std.testing.expectEqual(PreflightVerdict.fits, preflightVerdict(20 * GB, 0, 25 * GB, true));
+}
+
+test "load preflight: a load macOS can make room for is admitted; one beside another resident model is refused" {
+    const system = @import("../../../sdk/util/system.zig");
+    const GB: u64 = 1024 * 1024 * 1024;
+    const page: u64 = 16384;
+    const total: u64 = 128 * GB;
+    const reserve = system.osReserveBytes(total, false);
+    const weights: u64 = @intFromFloat(70.13 * @as(f64, @floatFromInt(GB)));
+    const pages = struct {
+        fn of(gb: f64) u64 {
+            return @intFromFloat(gb * @as(f64, @floatFromInt(GB / page)));
+        }
+    }.of;
+    // A 128 GB Mac holding 36 GB of idle app memory: free 12.5, file-backed 19.4, wired 8.3, compressor 2.5 GB.
+    // The base figure reads ~31.9 GB, yet the 70.13 GB pack (needs ~77.1) loads there.
+    try testing.expect(memInsufficientForLoad(weights, system.computeAvailableBytes(total, pages(12.5), 0, pages(19.4), 0, pages(8.3), pages(2.5), page)));
+    try testing.expect(!memInsufficientForLoad(weights, system.computeLoadAvailableBytes(total, pages(8.3), pages(2.5), page, reserve)));
+    // The same pack already resident in another server (wired 77.6, compressor 9.6 GB) is refused.
+    try testing.expect(memInsufficientForLoad(weights, system.computeLoadAvailableBytes(total, pages(77.6), pages(9.6), page, reserve)));
 }
 
 test "memInsufficientForLoad: headroom + unknown-query guards" {

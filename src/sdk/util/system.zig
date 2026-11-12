@@ -134,11 +134,20 @@ pub fn getAppMemFootprintMb() u32 {
 /// already contains them and `external` carries them back) plus file-backed plus
 /// purgeable (anonymous caches macOS drops before it compresses anything), capped
 /// by the RAM outside wired + compressor. 0 on a failed query.
-fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, purgeable_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
+pub fn computeAvailableBytes(total_mem: u64, free_pages: u64, speculative_pages: u64, external_pages: u64, purgeable_pages: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
     if (total_mem == 0) return 0;
     const reclaimable: u64 = (free_pages -| speculative_pages) +| external_pages +| purgeable_pages;
     const outside: u64 = total_mem -| (wire_pages +| compressor_pages) *| page;
     return @min(reclaimable *| page, outside);
+}
+
+/// What a model LOAD can count on: the RAM outside wired and compressor memory, less the OS reserve. macOS
+/// compresses or swaps any app's pages to make room for a wiring, so only wired memory (another loaded
+/// model, the kernel) and the compressor's own pages bind. Loads and request admission read it on macOS
+/// (`getLoadRoomBytes`); the hot cache and the app's meter keep `computeAvailableBytes`. 0 on a failed query.
+pub fn computeLoadAvailableBytes(total_mem: u64, wire_pages: u64, compressor_pages: u64, page: u64, reserve: u64) u64 {
+    if (total_mem == 0) return 0;
+    return (total_mem -| (wire_pages +| compressor_pages) *| page) -| reserve;
 }
 
 extern "c" fn os_proc_available_memory() usize;
@@ -207,10 +216,33 @@ fn returnedNotShown(os_free: u64) u64 {
     var pool: usize = 0;
     _ = mlx.mlx_get_active_memory(&active);
     _ = mlx.mlx_get_cache_memory(&pool);
+    var footprint: u64 = @as(u64, active) +| pool;
+    var now_ms = crt.monotonicMs();
+    if (test_reading) |r| {
+        footprint = r.footprint;
+        now_ms = r.now_ms;
+    }
     const st = return_lag_shared.get();
     st.mtx.lock();
     defer st.mtx.unlock();
-    return st.lag.credit(crt.monotonicMs(), @as(u64, active) +| pool, os_free);
+    return st.lag.credit(now_ms, footprint, os_free);
+}
+
+/// Test seam: the kernel's counts, MLX's footprint and the clock, read in place of the machine's.
+pub var test_reading: ?struct { vm: DarwinVm, footprint: u64, now_ms: i64 } = null;
+
+/// `getAvailableMemBytes` for a model load (`computeLoadAvailableBytes`). Other hosts' readings
+/// already count what their OS reclaims (Linux `MemAvailable`, Windows `ullAvailPhys`).
+pub fn getLoadAvailableMemBytes() u64 {
+    return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), hostLoadAvailableMemBytes());
+}
+
+/// RAM a new wiring or allocation can take beside everything resident: `getLoadAvailableMemBytes` less the
+/// OS reserve, which macOS's figure already leaves out.
+pub fn getLoadRoomBytes() u64 {
+    const avail = getLoadAvailableMemBytes();
+    if (comptime builtin.os.tag == .macos) return avail;
+    return avail -| osReserveBytes(getTotalMemBytes(), mlx.weightsInDeviceMemory());
 }
 
 /// The kernel's memory-pressure level: 1 normal, 2 warning, 4 critical; 0 where the OS has no such reading.
@@ -260,18 +292,38 @@ pub fn parseOsReserveGib(raw: []const u8) error{InvalidOsReserve}!u64 {
 fn hostAvailableMemBytes() u64 {
     if (comptime builtin.os.tag == .windows) return windowsMemStatus().ullAvailPhys;
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemAvailable:") * 1024;
+    return darwinFree(darwinVm() orelse return 0);
+}
+
+fn darwinFree(v: DarwinVm) u64 {
+    return computeAvailableBytes(v.total, v.vm.free_count, v.vm.speculative_count, v.vm.external_page_count, v.vm.purgeable_count, v.vm.wire_count, v.vm.compressor_page_count, v.page);
+}
+
+fn hostLoadAvailableMemBytes() u64 {
+    if (comptime builtin.os.tag != .macos) return hostAvailableMemBytes();
+    const v = darwinVm() orelse return 0;
+    const room = computeLoadAvailableBytes(v.total, v.vm.wire_count, v.vm.compressor_page_count, v.page, osReserveBytes(v.total, false));
+    // MLX's buffers are wired, so this figure shows a return as late as the free one. The credit follows the free
+    // figure from every reader: fed this one here and the free one elsewhere, each reading would wipe the other's.
+    return room +| returnedNotShown(darwinFree(v));
+}
+
+const DarwinVm = struct { total: u64, page: u64, vm: VmStats64 };
+
+/// Total RAM, page size and the kernel's page counts; null on a failed query.
+fn darwinVm() ?DarwinVm {
+    if (test_reading) |r| return r.vm;
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return null;
 
     var page: usize = 0;
-    if (host_page_size(mach_host_self(), &page) != 0) return 0;
+    if (host_page_size(mach_host_self(), &page) != 0) return null;
 
     var vm = std.mem.zeroes(VmStats64);
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
-    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
-
-    return computeAvailableBytes(total_mem, vm.free_count, vm.speculative_count, vm.external_page_count, vm.purgeable_count, vm.wire_count, vm.compressor_page_count, page);
+    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return null;
+    return .{ .total = total_mem, .page = page, .vm = vm };
 }
 
 const MemoryStatusEx = extern struct {
@@ -391,6 +443,32 @@ test "ReturnLag sees a buffer MLX frees past its pool as returned" {
     try std.testing.expect(lag.credit(1001, footprint(), 8 << 30) >= bytes - bytes / 8);
 }
 
+test "the load figure carries what MLX just returned, and a free-figure reading between does not wipe it" {
+    if (!is_macos) return error.SkipZigTest;
+    const GB: u64 = 1 << 30;
+    const page: u64 = 16384;
+    const st = return_lag_shared.get();
+    st.lag = .{};
+    defer {
+        st.lag = .{};
+        test_reading = null;
+    }
+    var vm = std.mem.zeroes(VmStats64);
+    vm.free_count = @intCast(20 * GB / page);
+    vm.wire_count = @intCast(80 * GB / page);
+    test_reading = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = vm }, .footprint = 70 * GB, .now_ms = 1000 };
+    const load_before = getLoadAvailableMemBytes();
+    const free_before = getAvailableMemBytes();
+    // An eviction returned 4 GB; the kernel's counts have not moved yet.
+    test_reading.?.footprint = 66 * GB;
+    test_reading.?.now_ms = 1001;
+    try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
+    test_reading.?.now_ms = 1002;
+    try std.testing.expectEqual(free_before + 4 * GB, getAvailableMemBytes());
+    test_reading.?.now_ms = 1003;
+    try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
+}
+
 test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {
     const GB: u64 = 1024 * 1024 * 1024;
     try std.testing.expectEqual(15 * GB, memoryPool(true, 15 * GB, 9 * GB)); // Windows: 13 GB fits the card
@@ -437,6 +515,21 @@ test "computeAvailableBytes sums the reclaimable classes, capped by wired headro
     // Purgeable pages are anonymous caches the OS discards before compressing
     // anything: a laptop's browsers park gigabytes there (#932).
     try std.testing.expectEqual(@as(u64, 7 * GB), computeAvailableBytes(16 * GB, 2 * ppg, 0, 1 * ppg, 4 * ppg, 3 * ppg, 1 * ppg, page));
+}
+
+test "computeLoadAvailableBytes is the RAM outside wired and compressor memory, less the OS reserve" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const page: u64 = 16384;
+    const ppg: u64 = GB / page;
+
+    // 128 GB box, 8 wired + 2 compressor, 8 reserved: 110 GB, whatever the apps hold, since macOS moves them for a wiring.
+    try std.testing.expectEqual(@as(u64, 110 * GB), computeLoadAvailableBytes(128 * GB, 8 * ppg, 2 * ppg, page, 8 * GB));
+    // Another model wired at 70 GB leaves 40: wired memory is the one thing nothing moves.
+    try std.testing.expectEqual(@as(u64, 40 * GB), computeLoadAvailableBytes(128 * GB, 78 * ppg, 2 * ppg, page, 8 * GB));
+    // Past the RAM: 0, never a wrapped figure.
+    try std.testing.expectEqual(@as(u64, 0), computeLoadAvailableBytes(16 * GB, 13 * ppg, 2 * ppg, page, 2 * GB));
+    // A failed query reads 0.
+    try std.testing.expectEqual(@as(u64, 0), computeLoadAvailableBytes(0, 0, 0, page, 8 * GB));
 }
 
 pub fn getSysMemPct() u32 {

@@ -70,8 +70,10 @@ just evicted more than it needed (4204 MB freed, the re-check still read 4607 MB
 went through. Cause: with the buffer pool at its cap an evicted entry goes back to the OS, and macOS shows returned
 memory about a second late (a freed 4 GiB read unchanged at once, a third at 200 ms, all of it by 1.2 s) while a new
 allocation takes it at once. Fix: `system.ReturnLag` credits what MLX returned between two close readings until the OS
-figure shows it or MLX takes it again; `getAvailableMemBytes` adds it, so admission, the load preflight and `/props`
-read one figure. Guard: `ReturnLag` test, `getAvailableMemBytes counts memory MLX has just returned`.
+figure shows it or MLX takes it again. `getAvailableMemBytes` and the load figure (`getLoadAvailableMemBytes`, which
+admission and the load preflight read on macOS) both add it, and both feed it the free figure: fed one figure by one
+reader and the other by the next, each reading wipes the other's credit. Guard: `ReturnLag` tests, `the load figure
+carries what MLX just returned, and a free-figure reading between does not wipe it`.
 
 ### Conversations sharing a cache key evicted each other's latest state (#1125)
 Defect: four DeepSeek-V4.1 conversations with one system prompt (an agent and its subagents, no `prompt_cache_key`)
@@ -1423,6 +1425,19 @@ Defect: under `--dist tensor`, a request that arrived before `mlx-serve worker` 
 failed load parks the entry in `.error_state`, which fails fast; only the memory refusal went back to `.unloaded`.
 Fix: refusals the user fixes outside the pack retry (`failureRetries`), and the absent worker is a named 503
 (`worker_not_joined`). Guard: `a load refused for memory or an absent worker Mac is retried by the next request`.
+
+### A GPU timeout during a reload left the model failed until a restart
+Defect: reloading the 70 GB Qwen3.8-Flash-Next pack while a busy app rewrote 32 GB failed with Metal's
+`kIOGPUCommandBufferCallbackErrorTimeout` on 12 of 28 reloads, and every request after it 500'd with
+`PluginLoadFailed` until the server restarted. Cause: the plugin reports any MLX failure as `PluginLoadFailed`, which
+parks the entry in `.error_state`; and the failed eval's other command buffers kept failing after the load returned,
+latching a second timeout onto the next load a second later. Fix: the load reads its own latched MLX error
+(`loadFailureCause`): a GPU timeout is `GpuTimeout` (503 `gpu_timeout`) and a GPU out-of-memory is
+`InsufficientMemory`, both retried; a failed load waits out the in-flight GPU work (`mlx.drainGpu`) before the latch
+is dropped. Under steady pressure the retry timed out again as often as not, so qwen4_exp evaluates its trunk a layer at
+a time instead of all ~70 GB at once: 0 of 23 of the same reloads timed out, and the eval took 6-24 s where one batch
+took up to 59 s. Guard: `a load the GPU timed out or ran out of memory on fails for that reason, not as a broken pack`;
+live, warm reloads beside a busy 32 GB app after the last model's memory is freed.
 
 ### A DeepSeek-V4.1 GGUF with its DSpark file beside it failed to load on ds4
 Defect: ivanfioravanti's DS4 IQ2 pack died at boot on the ds4 engine (`error: LoadFailed`) unless `--no-ds4-mtp`.

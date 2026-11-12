@@ -1,6 +1,6 @@
 //! Builds the trunk from a pack's loaded map: the embedding and head, the layers (the engine's MoE layer binder),
-//! the final mixer, the n-gram state and table, the MTP head, the YaRN tables, then one batched eval of every
-//! weight. The map stays the caller's (the trunk borrows its arrays).
+//! the final mixer, the n-gram state and table, the MTP head, the YaRN tables, then an eval of every weight, a
+//! layer at a time. The map stays the caller's (the trunk borrows its arrays).
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -193,27 +193,31 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         log.info("[rope] YaRN: factor {d:.4} (window {d} -> {d}), rotary {d} dims, ramp [{d:.0}, {d:.0}], mscale {d:.6}\n", .{ config.yarn_factor, config.yarn_orig_max_pos, config.contextCap(), rotary_dim, cr.low, cr.high, config.yarn_attention_factor });
     }
 
-    // One batched eval of every weight the trunk reads.
+    // Every weight the trunk reads, evaluated a layer at a time: one eval of all ~70 GB can outlast Metal's
+    // GPU watchdog while macOS makes room for it.
     {
         const eval_start = std.Io.Timestamp.now(io, .awake);
-        const all_vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(all_vec);
+        const head_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(head_vec);
         inline for (.{ emb_w, emb_s, emb_b, lm_head_w, lm_head_s, lm_head_b }) |arr| {
-            if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, arr);
+            if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(head_vec, arr);
         }
+        try mlx.check(mlx.mlx_eval(head_vec));
         for (ml.moe_layers) |lw| {
-            if (lw.hc_attn) |*hw| weights_util.appendStructArrays(all_vec, hw);
-            if (lw.hc_mlp) |*hw| weights_util.appendStructArrays(all_vec, hw);
-            if (lw.ple) |*pw| weights_util.appendStructArrays(all_vec, pw);
-            weights_util.appendHybridMlpWeights(all_vec, &lw.mlp);
+            const layer_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(layer_vec);
+            if (lw.hc_attn) |*hw| weights_util.appendStructArrays(layer_vec, hw);
+            if (lw.hc_mlp) |*hw| weights_util.appendStructArrays(layer_vec, hw);
+            if (lw.ple) |*pw| weights_util.appendStructArrays(layer_vec, pw);
+            weights_util.appendHybridMlpWeights(layer_vec, &lw.mlp);
             switch (lw.attn) {
-                .full => |fa| weights_util.appendFullAttnWeights(all_vec, &fa),
-                .linear => |la| weights_util.appendLinearAttnWeights(all_vec, &la),
+                .full => |fa| weights_util.appendFullAttnWeights(layer_vec, &fa),
+                .linear => |la| weights_util.appendLinearAttnWeights(layer_vec, &la),
             }
+            try mlx.check(mlx.mlx_eval(layer_vec));
         }
-        try mlx.check(mlx.mlx_eval(all_vec));
         const eval_ms: i64 = @intCast(@divTrunc(eval_start.untilNow(io, .awake).nanoseconds, std.time.ns_per_ms));
-        log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
+        log.info("Eval all weights, a layer at a time: {d}ms\n", .{eval_ms});
     }
 
     // The final hyper-connection read and the module-owned n-gram hash + mmapped table.

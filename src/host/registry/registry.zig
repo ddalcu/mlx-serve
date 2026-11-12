@@ -1330,8 +1330,9 @@ pub const ModelRegistry = struct {
     /// Merge note: this arm came from the branch's
     /// `scheduler.loadErrorFor`, which this function replaced — the name-based
     /// half survived the refactor, the second name did not.
-    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, DistWorkerNotJoined } {
+    pub fn loadErrorFromName(name: ?[]const u8) error{ LoadFailed, InsufficientMemory, DistWorkerNotJoined, GpuTimeout } {
         if (name) |n| {
+            if (std.mem.eql(u8, n, "GpuTimeout")) return error.GpuTimeout;
             if (std.mem.eql(u8, n, "InsufficientMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "OutOfMemory")) return error.InsufficientMemory;
             if (std.mem.eql(u8, n, "DistWorkerNotJoined")) return error.DistWorkerNotJoined;
@@ -1348,6 +1349,8 @@ pub const ModelRegistry = struct {
         try std.testing.expectEqual(error.InsufficientMemory, loadErrorFromName("OutOfMemory"));
         // So does a worker Mac that has not joined: the user starts it and retries.
         try std.testing.expectEqual(error.DistWorkerNotJoined, loadErrorFromName("DistWorkerNotJoined"));
+        // So does a GPU timeout: the load is retried once memory settles.
+        try std.testing.expectEqual(error.GpuTimeout, loadErrorFromName("GpuTimeout"));
         // Everything else stays a load failure — guessing a diagnosis is worse
         // than reporting the honest generic one.
         try std.testing.expectEqual(error.LoadFailed, loadErrorFromName("FileNotFound"));
