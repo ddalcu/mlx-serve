@@ -49,6 +49,13 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
 - Every debug lever that shipped with the port was deleted; the only env vars left are the
   fixture-gated ones (`BREEZE_MODEL`, `MIMI_*`, registered in `src/env.zig`). A smaller model is
   a smaller `config.json`, never an env override.
+- Shared math rides the sdk blocks where they fit the shape, composed chains where they do not:
+  the frame loop (decode step + prefill) runs `sdk/blocks/rope/qk_norm_rope.fusedQkNormRope`,
+  `sdk/blocks/norms/residual_norm.fusedAddRmsNorm` and `sdk/blocks/mlp/fused_activations.fusedSwiGLU`
+  (all bit-identical to the composed chains, optional-fallback like qwen3_tts's; a `QLayer.eps_arr`
+  0-d f32 gates the norm kernels). The TE keeps its composed chain — its per-layer rope position
+  scale has no fused arm. The decode step's `concat2` aliases kr/vt into the kv entry on the first
+  frame, so those frees sit at the loop tail, never in a `defer`.
 
 ## Gaps
 
@@ -57,14 +64,9 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
   takes. The published pack itself has no oracle end-to-end yet: the Mimi encoder parity test is
   the only numerical bar. `fixtures/mimi_clip.wav` + `fixtures/mimi_codes.bin` are that oracle:
   u16-LE codes from the `qwen_tts` reference tokenizer pointed at a real pack's `audio_tokenizer/`;
-  `MLX_SERVE_MIMI_ENCODE` must still name a real pack (the encoder is real-sized). Regenerate with
-  `qwen_tts.Qwen3TTSTokenizer.encode` on an exact multiple of 1920 samples — partial trailing
-  frames floor on this side and ceil in torch.
-- `fixtures/mimi_clip.wav` + `fixtures/mimi_codes.bin` are the encoder-parity oracle: u16-LE codes
-  from the `qwen_tts` reference tokenizer pointed at a real pack's `audio_tokenizer/`. The parity
-  test defaults to these; `MLX_SERVE_MIMI_ENCODE` must still name a real pack (the encoder is
-  real-sized). Regenerate with `qwen_tts.Qwen3TTSTokenizer.encode` on an exact multiple of 1920
-  samples — partial trailing frames floor on this side and ceil in torch.
+  the parity test defaults to these, `MLX_SERVE_MIMI_ENCODE` must still name a real pack (the
+  encoder is real-sized). Regenerate with `qwen_tts.Qwen3TTSTokenizer.encode` on an exact multiple
+  of 1920 samples — partial trailing frames floor on this side and ceil in torch.
 - Chunked PCM out is not in the media ABI: `encode` hands the host one WAV. Real-time consumers
   (fleet's WS lane) currently re-request short turns; a `step`-side PCM chunk callback would make the
   media ABI cover streaming speech.
