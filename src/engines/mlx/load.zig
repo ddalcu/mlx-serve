@@ -49,6 +49,7 @@ const residentGateBytes = @import("runtime/preflight.zig").residentGateBytes;
 const committedTextBytes = @import("runtime/preflight.zig").committedTextBytes;
 const availForLoad = @import("runtime/preflight.zig").availForLoad;
 const mtpSidecarDiskBytes = @import("runtime/preflight.zig").mtpSidecarDiskBytes;
+const mtpCoarseBytes = @import("runtime/preflight.zig").mtpCoarseBytes;
 const drafterResidentBytes = @import("runtime/preflight.zig").drafterResidentBytes;
 const preflightVerdict = @import("runtime/preflight.zig").preflightVerdict;
 const mlxActiveBytes = @import("runtime/preflight.zig").mlxActiveBytes;
@@ -119,8 +120,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         const gb = 1024.0 * 1024.0 * 1024.0;
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
-        const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
-        const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
+        const mtp_on = params.config.mtp_override orelse params.mtp_enabled;
+        const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, mtp_on);
+        const coarse_bytes = if (mtp_on) mtpCoarseBytes(params.config, mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) else 0;
+        const weights_bytes = model_bytes + drafter_bytes + mtp_bytes + coarse_bytes;
         const avail_bytes = availForLoad(sch.io, weights_bytes);
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
             @as(f64, @floatFromInt(model_bytes)) / gb,
@@ -128,6 +131,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         });
         if (drafter_bytes > 0) log.info("[preflight] drafter ~{d:.2} GB at {s}\n", .{ @as(f64, @floatFromInt(drafter_bytes)) / gb, sidecar });
         if (mtp_bytes > 0) log.info("[preflight] mtp sidecar ~{d:.2} GB\n", .{@as(f64, @floatFromInt(mtp_bytes)) / gb});
+        if (coarse_bytes > 0) log.info("[preflight] mtp coarse head ~{d:.2} GB\n", .{@as(f64, @floatFromInt(coarse_bytes)) / gb});
         switch (preflightVerdict(model_bytes, drafter_bytes, avail_bytes, in_dir_drafter != null)) {
             .fits => {},
             .drop_drafter => {

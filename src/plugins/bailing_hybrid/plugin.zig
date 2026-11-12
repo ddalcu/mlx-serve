@@ -61,7 +61,7 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 /// load from the plugin's EXL3 head.
 fn residentBytes(p: *const abi.Parsed, _: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) abi.Verdict {
     const c = config.of(p);
-    out.* = shards + if (c.streamed_bank and c.nextn_layers > 0) trunk.draftReadoutBytes(c.vocab_size, c.hidden_size) else 0;
+    out.* = shards + if (c.streamed_bank and c.nextn_layers > 0) trunk.draftReadoutBytes(c.vocab_size, c.hidden_size, trunk.readoutBits(c)) else 0;
     return .ok;
 }
 

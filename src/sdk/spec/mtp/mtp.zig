@@ -722,6 +722,12 @@ pub const DRAFT_HEAD_BITS: u32 = 3;
 /// Group size every coarse head is packed at.
 pub const RERANK_COARSE_GROUP: u32 = 64;
 
+/// Resident bytes of the coarse head built for a `vocab` x `hidden` head at `bits` (`buildRerankCoarse`, or the
+/// draft-only head `buildDraftHead` keeps where no rerank is built): packed words plus a bf16 scale and bias a group.
+pub fn rerankCoarseBytes(vocab: u64, hidden: u64, bits: u32) u64 {
+    return vocab * hidden * bits / 8 + 2 * 2 * vocab * (hidden / RERANK_COARSE_GROUP);
+}
+
 /// A BUILT coarse readout head: the packed weights plus the geometry they
 /// were packed with. Both live together because `mlx_quantized_matmul` needs
 /// all three and only the build knows them.
@@ -4789,4 +4795,9 @@ test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
 
     try testing.expect(mtpCtxWithinLimit(1, 1));
     try testing.expect(!mtpCtxWithinLimit(1, 2));
+}
+
+test "mtp: the coarse head's bytes at 3 bits on GLM-5.3-Flash's and Ling-3.1-flash's heads" {
+    try std.testing.expectEqual(@as(u64, 277_544_960), rerankCoarseBytes(154_880, 4096, DRAFT_HEAD_BITS));
+    try std.testing.expectEqual(@as(u64, 281_673_728), rerankCoarseBytes(157_184, 4096, DRAFT_HEAD_BITS));
 }

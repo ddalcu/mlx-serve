@@ -196,7 +196,9 @@ fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
         @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, seq, 1, 16, chunk, .{})
     else
         return 0;
-    return ceiling -| need -| margin;
+    // The MTP bind's coarse head is built after the bank opens: the room leaves it.
+    const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(config, false);
+    return ceiling -| need -| coarse -| margin;
 }
 
 test "driver: streamed plugin room follows its own bill and preserves the margin" {
@@ -289,6 +291,11 @@ test "driver: a streamed plugin's room bills the widest chunk the engine runs: a
     ds.plugin = &binding;
     gen.prefillCli().* = .{ .override = 16384, .explicit = true };
     try t.expectEqual((64 << 30) - (8192 << 20) - (1 << 30), streamRoomAt(&ds, 64 << 30, 1 << 30));
+    // A model whose facts declare an MTP head also leaves the coarse head its bind builds after the bank opens.
+    cfg = .{ .plugin = &binding, .head_dim = 128, .num_attention_heads = 64, .vocab_size = 157_184, .hidden_size = 4096 };
+    binding.parsed.spec.mtp_layout = .in_checkpoint;
+    gen.prefillCli().* = .{};
+    try t.expectEqual((64 << 30) - (8192 << 20) - 281_673_728 - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
 }
 
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {

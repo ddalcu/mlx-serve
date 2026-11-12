@@ -28,8 +28,9 @@ Served, legacy forward deleted (`engines/mlx/plugin/served.zig`; `glm5_next/serv
 `trunk_weight` + captures.
 - MTP head (`head.zig`, streaming packs only): the NextN layer at `num_hidden_layers` (`trunk.lingHead`), one
   MLA + MoE block over `cat[enorm(embed), hnorm(h)]`, `final_layernorm` out; no legacy oracle (the served test runs it).
-- A head the outside plugin runs (EXL3) is no `trunk_weight`: drafts read a 4-bit affine copy of its rows
-  (`trunk.draftReadout`); the trunk's logits keep the plugin's head.
+- A head the outside plugin runs (EXL3) is no `trunk_weight`: drafts re-score on a 4-bit g64 copy of its rows
+  (`trunk.draftReadout`, the evaluated width; billed in `resident_bytes`) after shortlisting on the engine's 3-bit
+  copy of it (billed by the engine). The trunk's logits keep the plugin's head.
 
 ## Rules (from root AGENTS.md)
 - KDA = GDN with a PER-CHANNEL gate (the `_vec` kernel); per-head vs per-channel gating is an INDEXING contract.

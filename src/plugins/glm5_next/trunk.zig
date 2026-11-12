@@ -1048,8 +1048,9 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
         log.warn("Ling MTP head: {s} — MTP off\n", .{@errorName(e)});
         break :blk null;
     };
-    // The drafts' readout before the bank takes its room: the engine borrows it at the bind (`trunk_weight`).
-    if (m.ling_mtp != null and m.head.ext != null) try draftReadout(m);
+    // The drafts' readout of a head the outside plugin runs, before the bank takes its room: the engine borrows it at
+    // the bind (`trunk_weight`).
+    if ((m.mtp != null or m.ling_mtp != null) and m.head.ext != null) try draftReadout(m);
     if (c.streamed_bank) try bindBank(m, ctx.stream_room);
     return m;
 }
@@ -1128,7 +1129,8 @@ fn draftReadout(m: *Model) !void {
     try mlx.check(mlx.mlx_astype(&dense, w, .bfloat16, s));
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
-    try mlx.check(mlx.mlx_quantize(&triple, dense, mlx.mlx_optional_int.some(@intCast(draft_head_group)), mlx.mlx_optional_int.some(@intCast(draft_head_bits)), "affine", .{}, s));
+    const bits = readoutBits(m.c);
+    try mlx.check(mlx.mlx_quantize(&triple, dense, mlx.mlx_optional_int.some(@intCast(draft_head_group)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
     var parts: [3]Array = @splat(mlx.mlx_array_new());
     for (&parts, 0..) |*a, i| {
         try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
@@ -1137,26 +1139,32 @@ fn draftReadout(m: *Model) !void {
     const vec = mlx.mlx_vector_array_new_data(&parts, 3);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_eval(vec));
-    m.draft_head = .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = draft_head_bits, .group_size = draft_head_group, .mode = .affine };
+    m.draft_head = .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = bits, .group_size = draft_head_group, .mode = .affine };
     var held: u64 = 0;
     for (parts) |a| held += mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
-    const billed = draftReadoutBytes(@intCast(vocab), m.c.hidden_size);
-    log.info("MTP draft readout: the EXL3 head as affine {d}-bit g{d}, {d} MiB resident (billed {d} MiB)\n", .{ draft_head_bits, draft_head_group, held >> 20, billed >> 20 });
+    const billed = draftReadoutBytes(@intCast(vocab), m.c.hidden_size, bits);
+    log.info("MTP draft readout: the EXL3 head as affine {d}-bit g{d}, {d} MiB resident (billed {d} MiB)\n", .{ bits, draft_head_group, held >> 20, billed >> 20 });
     if (held != billed) return error.DraftReadoutUnbilled;
 }
 
-/// The draft readout's width and group (`draftReadout`).
-pub const draft_head_bits: u32 = 4;
+/// The draft readout's width: each model's evaluated composition (GLM-5.3-Flash re-scores on an 8-bit copy, Ling-3.1
+/// on a 4-bit one). The engine shortlists on its own 3-bit copy of it and re-scores the shortlist on these rows.
+pub fn readoutBits(c: *const Config) u32 {
+    return if (c.isGlm5()) 8 else 4;
+}
 pub const draft_head_group: u32 = 64;
 
-/// The draft readout's resident bytes at `vocab` x `hidden` (`draftReadout`; the load's `resident_bytes` bills them):
-/// the packed 4-bit words and a bf16 scale and bias per group.
-pub fn draftReadoutBytes(vocab: u64, hidden: u64) u64 {
-    return vocab * hidden * draft_head_bits / 8 + 2 * 2 * vocab * (hidden / draft_head_group);
+/// The draft readout's resident bytes at `vocab` x `hidden` and `bits` (`draftReadout`; the load's `resident_bytes`
+/// bills them): the packed words and a bf16 scale and bias per group of 64. The engine bills its own shortlist head.
+pub fn draftReadoutBytes(vocab: u64, hidden: u64, bits: u32) u64 {
+    return vocab * hidden * bits / 8 + 2 * 2 * vocab * (hidden / draft_head_group);
 }
 
-test "glm5_next trunk: the draft readout bills Ling-3.1-flash's head at 345 MiB" {
-    try std.testing.expectEqual(@as(u64, 362_151_936), draftReadoutBytes(157_184, 4096));
+test "glm5_next trunk: the draft readout bills Ling-3.1-flash's 4-bit head at 345 MiB, GLM-5.3-Flash's 8-bit head at 643 MiB" {
+    try std.testing.expectEqual(@as(u64, 362_151_936), draftReadoutBytes(157_184, 4096, 4));
+    try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(154_880, 4096, 8));
+    try std.testing.expectEqual(@as(u32, 4), readoutBits(&.{ .model_type = "bailing_hybrid" }));
+    try std.testing.expectEqual(@as(u32, 8), readoutBits(&.{ .model_type = "glm5_next" }));
 }
 
 /// Makes Ling's NextN layer resident (bailing_hybrid's `HeadHooks.load`).
