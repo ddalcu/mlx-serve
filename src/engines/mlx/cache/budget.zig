@@ -1,6 +1,8 @@
 //! Hot-cache budgets, residency publishing, SSD flush and shutdown persistence.
 
 const std = @import("std");
+const crt = @import("../../../sdk/util/crt.zig");
+const env = @import("../../../env.zig");
 const model_mod = @import("../../../sdk/config/model.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const metrics_mod = @import("../../../host/metrics/metrics.zig");
@@ -10,6 +12,7 @@ const io_util = @import("../../../sdk/util/io_util.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
+const PressureGauge = @import("../../../host/gpu_thread/scheduler.zig").PressureGauge;
 const testing = std.testing;
 
 const Scheduler = @import("../scheduler.zig").Scheduler;
@@ -55,15 +58,24 @@ pub fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
     publishHotCacheResidency(sch);
 }
 
+pub fn memoryPressureGauge() PressureGauge {
+    return .{ .enabled = !env.present(.MLX_SERVE_PREFIX_CACHE_PRESSURE) or env.on(.MLX_SERVE_PREFIX_CACHE_PRESSURE) };
+}
+
 /// The budgets are clamped against free memory when a model loads or unloads; another app taking that memory later
 /// moves nothing here. The kernel's memory-pressure level says when it has: a worse level re-clamps every budget as
 /// a load does, a better one may raise them again. Returns how long the idle loop may park before the next reading:
 /// null (until work arrives) where nothing is clamped or the OS has no level, 1 s while the level is high or
 /// changing, else 5 s.
 pub fn followMemoryPressure(sch: *Scheduler) ?u32 {
+    if (sch.prefix_cache_mem_resolver == null or !sch.memory_pressure.enabled) return null;
+    return followMemoryPressureAt(sch, crt.monotonicMs());
+}
+
+fn followMemoryPressureAt(sch: *Scheduler, now_ms: i64) ?u32 {
     if (sch.prefix_cache_mem_resolver == null) return null;
     const gauge = &sch.memory_pressure;
-    if (gauge.sample()) |move| {
+    if (gauge.sampleAt(now_ms)) |move| {
         log.info("[hot-cache] memory pressure {s}: {s}, re-clamping the budgets\n", .{ @tagName(move), gauge.levelName() });
         reviseHotCacheBudgets(sch, move == .eased);
     }
@@ -534,4 +546,175 @@ test "module live residency is counted once per model and cannot be credited as 
         try testing.expectEqual(@as(u64, 64), sch.resident_live_kv_bytes.load(.monotonic));
     }
     try testing.expectEqual(@as(u64, 0), sch.resident_hot_cache_bytes.load(.monotonic));
+}
+
+fn writePressureTestFile(path: [*:0]const u8, text: []const u8) !void {
+    const fd = crt.openWrite(path, true);
+    try testing.expect(fd >= 0);
+    try testing.expectEqual(@as(isize, @intCast(text.len)), crt.write(fd, text));
+    crt.close(fd);
+}
+
+fn readPressureTestFile(path: [*:0]const u8, buf: []u8) []const u8 {
+    const fd = crt.openRead(path);
+    if (fd < 0) return "";
+    defer crt.close(fd);
+    const n = crt.read(fd, buf);
+    return if (n > 0) buf[0..@intCast(n)] else "";
+}
+
+fn initPressureTestScheduler(sch: *Scheduler, reg: *ModelRegistry) void {
+    sch.registry = reg;
+    sch.io = reg.io;
+    sch.allocator = testing.allocator;
+    sch.current_model = null;
+    sch.hot_prefix_cache = null;
+    sch.prefix_cache_mem_resolver = budget200Mb;
+    sch.prefix_cache_mem_bytes = 0;
+    sch.memory_pressure = memoryPressureGauge();
+    sch.metrics = null;
+    sch.digest_mu = .init;
+    sch.hot_cache_digests = &.{};
+    sch.digest_residency = 0;
+    sch.resident_hot_cache_bytes = std.atomic.Value(u64).init(0);
+    sch.reclaimable_hot_cache_bytes = std.atomic.Value(u64).init(0);
+    sch.resident_live_kv_bytes = .init(0);
+    sch.queue_mu = .init;
+    sch.decoding = .empty;
+}
+
+test "prefix cache pressure: normal does nothing, warning and critical step the budget and log" {
+    const kill_ov = env.override(.MLX_SERVE_PREFIX_CACHE_PRESSURE, null);
+    defer kill_ov.restore();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [512]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(testing.io, &base_buf)];
+    var press_buf: [600]u8 = undefined;
+    var log_path_buf: [600]u8 = undefined;
+    const press_path = try std.fmt.bufPrintSentinel(&press_buf, "{s}/pressure.level", .{base}, 0);
+    const log_path = try std.fmt.bufPrintSentinel(&log_path_buf, "{s}/server.log", .{base}, 0);
+
+    const press_ov = env.override(.MLX_SERVE_PRESSURE_OVERRIDE, press_path.ptr);
+    defer press_ov.restore();
+
+    const sinks = log.sinks_shared.get();
+    const prev_level = sinks.current_level;
+    const prev_stderr = sinks.stderr_enabled;
+    sinks.current_level = .info;
+    sinks.stderr_enabled = false;
+    defer {
+        log.closeFile();
+        sinks.current_level = prev_level;
+        sinks.stderr_enabled = prev_stderr;
+    }
+    try log.openFile(log_path, 0);
+
+    const reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    const m = try reg.registerStub("m", "/m/m", 64);
+    defer m.config = null;
+    m.config = &cfg;
+    m.state = .ready;
+    m.prefix_cache = try testHotCache();
+    const hc = m.prefix_cache.?;
+
+    var sch: Scheduler = undefined;
+    initPressureTestScheduler(&sch, reg);
+    try testing.expect(sch.memory_pressure.enabled);
+
+    var log_buf: [4096]u8 = undefined;
+    hc.max_kv_bytes = 600 << 20;
+
+    try writePressureTestFile(press_path.ptr, "normal\n");
+    for ([_]i64{ 0, 1_000, 6_000, 40_000 }) |t_ms| {
+        try testing.expectEqual(@as(?u32, 5000), followMemoryPressureAt(&sch, t_ms));
+        try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+    }
+    try testing.expectEqualStrings("", readPressureTestFile(log_path.ptr, &log_buf));
+
+    try writePressureTestFile(press_path.ptr, "warning\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 41_000));
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 45_000));
+    try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+    try testing.expectEqualStrings("", readPressureTestFile(log_path.ptr, &log_buf));
+
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 46_000));
+    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
+    const warn_log = readPressureTestFile(log_path.ptr, &log_buf);
+    try testing.expect(std.mem.indexOf(u8, warn_log, "[hot-cache] memory pressure worse: warning, re-clamping the budgets\n") != null);
+    try testing.expect(std.mem.indexOf(u8, warn_log, "[hot-cache] budget revised 600 -> 200 MB\n") != null);
+
+    hc.max_kv_bytes = 500 << 20;
+    try writePressureTestFile(press_path.ptr, "critical\n");
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 47_000));
+    try testing.expectEqual(@as(u64, 500 << 20), hc.max_kv_bytes);
+    try testing.expectEqual(@as(?u32, 1000), followMemoryPressureAt(&sch, 48_000));
+    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
+    const crit_log = readPressureTestFile(log_path.ptr, &log_buf);
+    try testing.expect(std.mem.indexOf(u8, crit_log, "[hot-cache] memory pressure worse: critical, re-clamping the budgets\n") != null);
+    try testing.expect(std.mem.indexOf(u8, crit_log, "[hot-cache] budget revised 500 -> 200 MB\n") != null);
+}
+
+test "prefix cache pressure: disabling the gauge skips every pressure level" {
+    const kill_ov = env.override(.MLX_SERVE_PREFIX_CACHE_PRESSURE, "0");
+    defer kill_ov.restore();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [512]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(testing.io, &base_buf)];
+    var press_buf: [600]u8 = undefined;
+    var log_path_buf: [600]u8 = undefined;
+    const press_path = try std.fmt.bufPrintSentinel(&press_buf, "{s}/pressure.level", .{base}, 0);
+    const log_path = try std.fmt.bufPrintSentinel(&log_path_buf, "{s}/server.log", .{base}, 0);
+
+    const press_ov = env.override(.MLX_SERVE_PRESSURE_OVERRIDE, press_path.ptr);
+    defer press_ov.restore();
+
+    const sinks = log.sinks_shared.get();
+    const prev_level = sinks.current_level;
+    const prev_stderr = sinks.stderr_enabled;
+    sinks.current_level = .info;
+    sinks.stderr_enabled = false;
+    defer {
+        log.closeFile();
+        sinks.current_level = prev_level;
+        sinks.stderr_enabled = prev_stderr;
+    }
+    try log.openFile(log_path, 0);
+
+    const reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    const m = try reg.registerStub("m", "/m/m", 64);
+    defer m.config = null;
+    m.config = &cfg;
+    m.state = .ready;
+    m.prefix_cache = try testHotCache();
+    const hc = m.prefix_cache.?;
+
+    var sch: Scheduler = undefined;
+    initPressureTestScheduler(&sch, reg);
+    try testing.expect(!sch.memory_pressure.enabled);
+
+    hc.max_kv_bytes = 600 << 20;
+    var now_ms: i64 = 0;
+    for ([_][]const u8{ "normal\n", "warning\n", "critical\n" }) |level_text| {
+        try writePressureTestFile(press_path.ptr, level_text);
+        for (0..10) |_| {
+            try testing.expectEqual(@as(?u32, null), followMemoryPressureAt(&sch, now_ms));
+            try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+            now_ms += 1_000;
+        }
+    }
+    try testing.expectEqual(@as(?u32, null), followMemoryPressure(&sch));
+    try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+
+    var log_buf: [4096]u8 = undefined;
+    try testing.expectEqualStrings("", readPressureTestFile(log_path.ptr, &log_buf));
 }
