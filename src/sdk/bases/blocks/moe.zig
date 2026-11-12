@@ -362,6 +362,77 @@ fn sourceRows(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Array, r
     return g.concat(outs.items, 1);
 }
 
+/// Whether `mlp` runs both spans of a split prompt forward (`rows_a`, `rows_b` rows) on a streamed bank's `.source` arm
+/// whose rows are independent (`Routed.rows_independent`) and neither on the `fused` arm: what `mlpSplit` serves. MLX-free: the caller checks every layer before a split
+/// forward runs one.
+pub fn splitServes(w: *const Moe.Weights, rows_a: c_int, rows_b: c_int) bool {
+    if (rows_a < 1 or rows_b < 1) return false;
+    if (w.format_banks != null) return false;
+    const st = w.streamed orelse return false;
+    if (st.routed.math != .source or !st.routed.rows_independent) return false;
+    if (w.fused) |f| if (rows_a <= f.rows or rows_b <= f.rows) return false;
+    return true;
+}
+
+/// `mlp` over a split prompt forward's two spans, `x_a` `[1, nA, D]` then `x_b` `[1, nB, D]`: each output is `mlp`'s for
+/// that span alone. Each span's router, route, weights and shared expert are `mlp`'s over its own rows; the routed
+/// experts of both run in ONE call of the streamed bank's source over their rows, A's first, split back as
+/// `streamedRouted`'s `.source` arm returns a span's, so a streaming bank reads each record once for both. The source
+/// declares that it runs each routed row by itself (`Routed.rows_independent`), so each span's rows are its own call's. `splitServes` must hold.
+pub fn mlpSplit(w: *const Moe.Weights, parent: *Graph, x_a: Array, x_b: Array) ![2]Array {
+    const xs = [2]Array{ x_a, x_b };
+    var dims: [2][3]c_int = undefined;
+    for (xs, &dims) |x, *d| {
+        const sh = ops.shape(x);
+        if (sh.len != 3) return error.MoeSplitShape;
+        d.* = .{ sh[0], sh[1], sh[2] };
+    }
+    if (!splitServes(w, dims[0][0] * dims[0][1], dims[1][0] * dims[1][1])) return error.MoeSplitArm;
+    var t = parent.scope();
+    defer t.deinit();
+    const g = &t;
+    var rs: [2]Routed = undefined;
+    var shared_downs: [2]?Array = .{ null, null };
+    // `mlp` up to its routed experts, per span (more than one row: no gate fold).
+    for (xs, &rs, &shared_downs) |x, *r, *sd| {
+        r.* = try route(w, g, try routerLogits(w, g, x), null);
+        sd.* = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x, false) else null;
+        if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+        if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
+    }
+    // `streamedRouted`'s `.source` arm over both spans' rows: x [nA + nB, D], the routes and their weights [nA + nB, K].
+    const K = ops.shape(rs[0].inds)[ops.shape(rs[0].inds).len - 1];
+    if (ops.shape(rs[1].inds)[ops.shape(rs[1].inds).len - 1] != K or dims[1][2] != dims[0][2] or ops.dtype(x_b) != ops.dtype(x_a) or
+        ops.dtype(rs[1].inds) != ops.dtype(rs[0].inds) or ops.dtype(rs[1].scores) != ops.dtype(rs[0].scores)) return error.MoeSplitSpans;
+    var rows_x: [2]Array = undefined;
+    var rows_inds: [2]Array = undefined;
+    var rows_scores: [2]Array = undefined;
+    for (xs, rs, dims, &rows_x, &rows_inds, &rows_scores) |x, r, d, *rx, *ri, *rsc| {
+        rx.* = try g.reshape(x, &.{ d[0] * d[1], d[2] });
+        ri.* = try g.reshape(r.inds, &.{ d[0] * d[1], K });
+        rsc.* = try g.reshape(r.scores, &.{ d[0] * d[1], K });
+    }
+    const st = &w.streamed.?;
+    const f = st.routed.math.source;
+    const y = try g.adopt(try f(st.routed.ctx, st.layer, try g.concat(&rows_x, 0), try g.concat(&rows_inds, 0), try g.concat(&rows_scores, 0)).get());
+    var out: [2]Array = undefined;
+    var lo: c_int = 0;
+    for (xs, rs, shared_downs, dims, &out) |x, r, sd, d, *o| {
+        const n = d[0] * d[1];
+        const sum = try g.reshape(try g.astype(try g.sliceAxis(y, 0, lo, lo + n), ops.dtype(x)), &.{ d[0], d[1], d[2] });
+        lo += n;
+        // `mlp`'s shared expert over the span's own rows
+        o.* = try parent.keep(blk: {
+            const se = w.shared orelse break :blk sum;
+            if (!se.gated()) break :blk try g.add(sum, try sharedDown(w, g, &se, x, false));
+            const down = sd orelse try sharedDown(w, g, &se, x, false);
+            const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
+            break :blk try g.add(sum, try g.mul(try g.sigmoid(logit), down));
+        });
+    }
+    return out;
+}
+
 /// The routed experts' weighted sum `[B, S, D]` for routes `inds` and their weights `scores` (in `x`'s dtype), no
 /// shared expert: `mlp`'s arms, as the Routed hook's contract reads them.
 pub fn routedSum(w: *const Moe.Weights, parent: *Graph, x: Array, inds: Array, scores: Array) !Array {
@@ -1205,4 +1276,47 @@ test "moe: mlpRows over a streamed source gives each row its one-row mlp's bytes
         try testing.expectEqual(@as(u32, if (exact) 3 else S), RowsSource.calls);
         try testing.expectEqual(@as(c_int, if (exact) 2 else 1), RowsSource.widest);
     }
+}
+
+/// A streamed layer's seams, never called: `splitServes` reads which arm a layer's weights name.
+const SplitSeams = struct {
+    var ctx: u8 = 0;
+    fn source(_: *anyopaque, _: u32, _: Array, _: Array, _: Array) routed.Ret(Array) {
+        return .{};
+    }
+    fn trunkMath(_: *anyopaque, _: u32, _: []const u16, _: []const f32) routed.Ret(routed.Fetched) {
+        return .{};
+    }
+    fn settle(_: *anyopaque) routed.Ret(void) {
+        return .{};
+    }
+    fn fused(_: *const Fused, _: *const Moe.Weights, _: ops.Stream, _: Array, _: Array, _: Array) anyerror!?Array {
+        return null;
+    }
+};
+
+test "moe: a split prompt forward's spans share a layer's routed call only on a streamed source with independent rows, neither span on the fused arm" {
+    const t = std.testing;
+    const none: Array = .{ .ctx = null };
+    const bank: Bank = .{ .w = none, .qp = .{ .bits = 3, .group_size = 64 } };
+    const source: routed.Routed = .{ .ctx = &SplitSeams.ctx, .math = .{ .source = &SplitSeams.source }, .settle_fn = &SplitSeams.settle, .rows_independent = true };
+    var w: Moe.Weights = .{ .router = .{}, .route = .softmax, .gate = bank, .up = bank, .down = bank, .top_k = 8, .experts = 288, .streamed = .{ .routed = source, .layer = 3 } };
+    // a 16K prompt's spans: the 16,356-row chunk and its 31-row held-back span
+    try t.expect(splitServes(&w, 16_356, 31));
+    try t.expect(!splitServes(&w, 16_356, 0));
+    // a source that does not declare independent rows: its rows may depend on the call's other rows
+    w.streamed.?.routed.rows_independent = false;
+    try t.expect(!splitServes(&w, 16_356, 31));
+    w.streamed.?.routed.rows_independent = true;
+    // a one-kernel arm of up to 16 rows: a span it would take is refused
+    w.fused = .{ .rows = 16, .limit = 10, .run = &SplitSeams.fused };
+    try t.expect(splitServes(&w, 40, 17));
+    try t.expect(!splitServes(&w, 40, 16));
+    try t.expect(!splitServes(&w, 16, 31));
+    w.fused = null;
+    // the trunk's own gathers on the fetched slots, and resident experts: refused
+    w.streamed.?.routed.math = .{ .trunk = &SplitSeams.trunkMath };
+    try t.expect(!splitServes(&w, 40, 31));
+    w.streamed = null;
+    try t.expect(!splitServes(&w, 40, 31));
 }

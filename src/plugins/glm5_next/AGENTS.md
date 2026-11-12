@@ -11,6 +11,9 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
   head's experts (`sdk/quant/outside_model.zig`); its bank opens per phase (`Budget.fit`: `stream_room`, `decodeRoom()`,
   the pack's `bank-fit.json` on its ceiling), binds each routed layer (`moe.bindRouted`), takes each forward's phase
   and settles after its eval. Serial decode, no images (`bankFacts`).
+- Split prompt forward (`Caps.split_prefill`, streaming packs): `table_forward.hiddenSplit` runs the last chunk and its
+  held-back span layer by layer, each MoE layer's routed rows in one call (`moe.mlpSplit`) where the bank declares
+  `rows_independent`; anything else is refused by name before a cache is touched (`splitSpans`): two forwards.
 - Load (`trunk.zig`): reads the driver's resident source (`LoadCtx.weights`: the engine's map with the Sushi and
   ModelOpt adapters applied) in the layout the deleted legacy load built: q|k|v and the convs joined, GLM's decode row
   group `[qkv | z | a | b]`, f32 KDA tables, DSA and MLA projections, the MoE block's weights, the `mtp.0` head.

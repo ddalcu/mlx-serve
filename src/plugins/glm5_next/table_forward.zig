@@ -5,6 +5,7 @@
 //! `glmKdaSlots`, `glmDsaAttn`, `forwardGlmBatchedDecode`), the ForwardCtx reads replaced by `Slots`.
 
 const std = @import("std");
+const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const glm5 = @import("glm5_next.zig");
 const slots_mod = @import("slots.zig");
@@ -99,6 +100,162 @@ pub fn hidden(m: *Model, st: *const Step, token_ids: Array) !Array {
     defer _ = mlx.mlx_array_free(mean);
     try mlx.check(mlx.mlx_mean_axis(&mean, stream, 2, false, m.s));
     return m.rmsNorm(mean, m.final_norm);
+}
+
+/// A split prompt forward's spans (`Forward.split_rows`): span A, `a` rows from position `pos_a`, then span B, `b` rows
+/// from `pos_b` = `pos_a + a`.
+pub const Spans = struct { a: u32, b: u32, pos_a: u32, pos_b: u32 };
+
+/// Why a split prompt forward is refused, before any cache is touched (the host then runs two forwards).
+pub const SplitRefusal = error{ GlmSplitMode, GlmSplitSlots, GlmSplitCapture, GlmSplitMedia, GlmSplitStates, GlmSplitRows, GlmSplitShortSpan, GlmSplitRoutedPath };
+
+/// The spans of a split forward of `f` whose span A is its first `rows_a` rows, or the refusal by name (MLX-free).
+/// Served: one slot's prompt rows (host tokens, or the engine's ids) without captures or media rows, a cache for span
+/// A's states (`has_states`), and two spans of more than `glm5.HC_PRE_MAX_ROWS` rows each: at that many rows or fewer a
+/// sublayer's hyper-connection takes `hcPre`'s one-dispatch arm and defers its expand (`sublayer`), at more it collapses
+/// and expands in place, so both spans take the arm their own forwards take. `routed_source`: every MoE layer runs both
+/// spans' routed experts in one call of the streamed bank's source (`splitServes`).
+pub fn splitSpans(f: *const abi.Forward, rows_a: u32, has_states: bool, routed_source: bool) SplitRefusal!Spans {
+    if (f.mode != .prefill) return error.GlmSplitMode;
+    if (f.caches.len != 1 or f.positions.len != 1) return error.GlmSplitSlots;
+    if (f.capture_layers.len > 0) return error.GlmSplitCapture;
+    if (f.media.ctx != null) return error.GlmSplitMedia;
+    if (!has_states) return error.GlmSplitStates;
+    if (rows_a >= f.rows or (f.ids.ctx == null and f.tokens.len != f.rows)) return error.GlmSplitRows;
+    const b = f.rows - rows_a;
+    const pos_a = f.positions.slice()[0];
+    const pos_b = std.math.add(u32, pos_a, rows_a) catch return error.GlmSplitRows;
+    const short: u32 = glm5.HC_PRE_MAX_ROWS;
+    if (rows_a <= short or b <= short) return error.GlmSplitShortSpan;
+    if (!routed_source) return error.GlmSplitRoutedPath;
+    return .{ .a = rows_a, .b = b, .pos_a = pos_a, .pos_b = pos_b };
+}
+
+/// Whether every MoE layer of `m` runs a split forward's spans of `rows_a` and `rows_b` rows in one call of the
+/// streamed bank's source (`glm_moe.splitServes`), checked before the forward runs any layer.
+pub fn splitServes(m: *const Model, rows_a: u32, rows_b: u32) bool {
+    const ra = std.math.cast(c_int, rows_a) orelse return false;
+    const rb = std.math.cast(c_int, rows_b) orelse return false;
+    var any = false;
+    for (m.layers[0..m.c.num_hidden_layers]) |*lw| switch (lw.mlp) {
+        .moe => |*mw| {
+            if (!glm_moe.splitServes(mw, ra, rb)) return false;
+            any = true;
+        },
+        .dense => {},
+    };
+    return any;
+}
+
+/// A split prompt forward's two spans on one slot's caches (`Forward.split_rows`): span A's rows (`st_a`, `ids_a`), then
+/// span B's (`st_b`, `ids_b`, positioned from A's end); each span's final-normed hidden `[1, S, H]` is what `hidden`
+/// returns for that span's own forward. Layer by layer: span A's attention sublayer, span A's recurrent states of the
+/// layer written to `states` (a KDA layer's `slots.prompt_state_slots`: the states the host snapshots at A's end) before
+/// span B's attention sublayer reads and replaces them in the slot's cache, then both spans' MLP sublayers, a MoE
+/// layer's routed experts in one streamed call over both spans' rows (`mlpSublayerSplit`), then each span's evaluation
+/// at `hidden`'s cadence. Each layer's KV and states are the layer's own (`CacheOps`, per layer), so A then B at every
+/// layer leaves the caches as A's forward then B's. Every op of a span reads that span's rows and those caches only, but
+/// the routed call, whose rows the bank's source runs each by itself. The caller refuses what this does not serve
+/// (`splitSpans`, `splitServes`).
+pub fn hiddenSplit(m: *Model, st_a: *const Step, st_b: *const Step, ids_a: Array, ids_b: Array, states: abi.Handle) ![2]Array {
+    const cfg = m.c;
+    const steps = [2]*const Step{ st_a, st_b };
+    const ids = [2]Array{ ids_a, ids_b };
+    for (steps) |st| if (st.batched or st.capture or st.capture_ids.len > 0 or st.media.ctx != null) return error.GlmSplitStep;
+    var streams: [2]Array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (streams) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var batch: [2]c_int = undefined;
+    var seq_len: [2]c_int = undefined;
+    // Each span's [B, S, HC, D] stream, as `hidden` builds it.
+    for (ids, &streams, &batch, &seq_len) |token_ids, *stream, *bt, *sl| {
+        const emb = try m.embedding(token_ids);
+        defer _ = mlx.mlx_array_free(emb);
+        const x_shape = mlx.getShape(emb);
+        bt.* = x_shape[0];
+        sl.* = x_shape[1];
+        if (sl.* < 2) return error.GlmSplitShortSpan;
+        var e4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(e4);
+        try mlx.check(mlx.mlx_expand_dims(&e4, emb, 2, m.s));
+        try mlx.check(mlx.mlx_broadcast_to(stream, e4, &[_]c_int{ bt.*, sl.*, glm5.HC, x_shape[2] }, 4, m.s));
+    }
+    const n_layers = cfg.num_hidden_layers;
+    var deferred: [2]?glm5.Deferred = .{ null, null };
+    defer for (&deferred) |*d| if (d.*) |*df| df.deinit();
+    for (m.layers[0..n_layers], 0..) |*lw, li| {
+        try sublayer(m, st_a, &streams[0], &deferred[0], lw, true, li, batch[0], seq_len[0], true);
+        if (lw.mixer == .kda) for (slots_mod.prompt_state_slots) |which| try st_a.slots.copyState(0, @intCast(li), which, states);
+        try sublayer(m, st_b, &streams[1], &deferred[1], lw, true, li, batch[1], seq_len[1], true);
+        try mlpSublayerSplit(m, &streams, &deferred, lw);
+        for (steps, streams) |st, stream| {
+            if (st.eval_every > 0 and ((li + 1) % st.eval_every == 0 or li + 1 == n_layers)) {
+                try st.slots.evalWith(stream, @intCast(li + 1));
+            }
+        }
+    }
+    var out: [2]Array = undefined;
+    var made: usize = 0;
+    errdefer for (out[0..made]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&streams, &deferred, &out) |*stream, *d, *o| {
+        if (d.*) |*df| {
+            _ = mlx.mlx_array_free(stream.*);
+            stream.* = try df.materialize(m.s);
+        }
+        var mean = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mean);
+        try mlx.check(mlx.mlx_mean_axis(&mean, stream.*, 2, false, m.s));
+        o.* = try m.rmsNorm(mean, m.final_norm);
+        made += 1;
+    }
+    return out;
+}
+
+/// Both spans' MLP sublayers of a split forward, each inside its hyper-connection as `sublayer` runs it (`attn` false),
+/// but a MoE layer's routed experts, which run in one call over both spans' rows (`glm_moe.forwardSplit`); a dense
+/// layer's MLP runs per span. `sublayer`'s one-dispatch arm (`hcPre`, its expand deferred: spans of
+/// `glm5.HC_PRE_MAX_ROWS` rows or fewer) is not taken here: a split refuses such spans (`splitSpans`).
+fn mlpSublayerSplit(m: *Model, streams: *[2]Array, deferred: *[2]?glm5.Deferred, lw: *const Layer) !void {
+    const cfg = m.c;
+    const w = lw.ffn_hc.?;
+    const norm_w = lw.post_norm;
+    var cs: [2]glm5.Collapsed = undefined;
+    var made: usize = 0;
+    defer for (cs[0..made]) |*c| c.deinit();
+    var normed: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
+    defer for (normed) |a| if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (streams, deferred, &cs, &normed) |*stream, *d, *c, *nrm| {
+        if (glm5.hcRowsServes(m.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w)) return error.GlmSplitShortSpan;
+        if (d.*) |*df| {
+            _ = mlx.mlx_array_free(stream.*);
+            stream.* = try df.materialize(m.s);
+            df.deinit();
+            d.* = null;
+        }
+        c.* = try glm5.collapse(m.s, stream.*, w.fn_rows, w.scale, w.base, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps);
+        made += 1;
+        nrm.* = try m.rmsNorm(c.x, norm_w);
+    }
+    var outs: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
+    defer for (outs) |a| if (a.ctx != null) {
+        _ = mlx.mlx_array_free(a);
+    };
+    switch (lw.mlp) {
+        .moe => |*mw| outs = try glm_moe.forwardSplit(mw, m.s, normed[0], normed[1]),
+        .dense => |*dw| for (normed, &outs) |x, *o| {
+            o.* = try m.denseMlp(dw, x);
+        },
+    }
+    for (streams, &cs, outs) |*stream, *c, o| {
+        const res = try glm5.expand(m.s, o, stream.*, c);
+        _ = mlx.mlx_array_free(stream.*);
+        stream.* = res;
+    }
 }
 
 /// One sublayer (attention when `attn`, else the MLP) inside its hyper-connection. For one token the expand stays
@@ -441,4 +598,63 @@ fn rowsFrom(a: Array, axis: usize, from: c_int, s: mlx.mlx_stream) !Array {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_slice(&out, a, &lo, sh.len, &hi, sh.len, &[_]c_int{ 1, 1, 1, 1 }, sh.len, s));
     return out;
+}
+
+// ── tests ──
+
+/// A prompt forward of `toks` from position `pos[0]` on the one cache `cache[0]`.
+fn promptForward(toks: []const u32, pos: *const [1]u32, cache: *const [1]abi.Handle) abi.Forward {
+    return .{ .mode = .prefill, .rows = @intCast(toks.len), .tokens = abi.Span(u32).of(toks), .positions = abi.Span(u32).of(pos), .caches = abi.Span(abi.Handle).of(cache) };
+}
+
+test "glm5_next split: a split prompt forward is refused by name unless each span takes its own forward's arms; else its spans, span B from span A's end" {
+    const t = std.testing;
+    var toks: [71]u32 = undefined;
+    for (&toks, 0..) |*x, i| x.* = @intCast(i);
+    const pos = [1]u32{100};
+    const cache = [1]abi.Handle{@ptrFromInt(0x1000)};
+    const f = promptForward(&toks, &pos, &cache);
+    // 40 + 31 rows (a 16K prompt's held-back span), span B at 140; then both spans one row past hcPre's
+    try t.expectEqual(Spans{ .a = 40, .b = 31, .pos_a = 100, .pos_b = 140 }, try splitSpans(&f, 40, true, true));
+    const f34 = promptForward(toks[0..34], &pos, &cache);
+    try t.expectEqual(Spans{ .a = 17, .b = 17, .pos_a = 100, .pos_b = 117 }, try splitSpans(&f34, 17, true, true));
+    // the engine's device ids in place of host tokens
+    var ids = f;
+    ids.tokens = .{};
+    ids.ids = .{ .ctx = @ptrFromInt(0x2000) };
+    try t.expectEqual(Spans{ .a = 40, .b = 31, .pos_a = 100, .pos_b = 140 }, try splitSpans(&ids, 40, true, true));
+    // not a prompt
+    for ([_]abi.Mode{ .decode, .verify, .batched_rows }) |mode| {
+        var x = f;
+        x.mode = mode;
+        try t.expectError(error.GlmSplitMode, splitSpans(&x, 40, true, true));
+    }
+    // two slots
+    const caches2 = [2]abi.Handle{ @ptrFromInt(0x1000), @ptrFromInt(0x3000) };
+    var two = f;
+    two.caches = abi.Span(abi.Handle).of(&caches2);
+    try t.expectError(error.GlmSplitSlots, splitSpans(&two, 40, true, true));
+    // DFlash captures, media rows, no cache for span A's states
+    const layers = [_]u32{10};
+    var cap = f;
+    cap.capture_layers = abi.Span(u32).of(&layers);
+    try t.expectError(error.GlmSplitCapture, splitSpans(&cap, 40, true, true));
+    var media = f;
+    media.media = .{ .ctx = @ptrFromInt(0x4000) };
+    try t.expectError(error.GlmSplitMedia, splitSpans(&media, 40, true, true));
+    try t.expectError(error.GlmSplitStates, splitSpans(&f, 40, false, true));
+    // no span B, host tokens other than the rows, span B past the last position
+    try t.expectError(error.GlmSplitRows, splitSpans(&f, 71, true, true));
+    var less = f;
+    less.tokens = abi.Span(u32).of(toks[0..70]);
+    try t.expectError(error.GlmSplitRows, splitSpans(&less, 40, true, true));
+    const pos_hi = [1]u32{std.math.maxInt(u32) - 10};
+    const hi = promptForward(&toks, &pos_hi, &cache);
+    try t.expectError(error.GlmSplitRows, splitSpans(&hi, 40, true, true));
+    // a span of 16 rows or fewer: its sublayers would take hcPre's deferred arm
+    try t.expectError(error.GlmSplitShortSpan, splitSpans(&f, 16, true, true));
+    const f56 = promptForward(toks[0..56], &pos, &cache);
+    try t.expectError(error.GlmSplitShortSpan, splitSpans(&f56, 40, true, true));
+    // a MoE layer off the streamed source arm
+    try t.expectError(error.GlmSplitRoutedPath, splitSpans(&f, 40, true, false));
 }

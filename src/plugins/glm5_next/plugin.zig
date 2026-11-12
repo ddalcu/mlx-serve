@@ -140,6 +140,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "glm5_next: forward mode not declared");
     const ops = f.cache_ops orelse return Verdict.refuse(.unsupported, "glm5_next: a forward without cache_ops");
+    // A split prompt forward the trunk does not serve is refused before the bank's phase sees it (two forwards follow).
+    if (host.splitRefusal(plugin.name, fwd, m, f)) |v| return v;
     trunk.bankPhase(m, if (f.mode == .batched_rows) @min(f.caches.len, fwd.MOE_DECODE_BATCH_MAX) else f.rows) catch |e| return Verdict.named(.failed, @errorName(e));
     if (f.mode == .batched_rows) {
         if (f.rows != 1 or f.tokens.len != f.caches.len or f.positions.len != f.caches.len) return Verdict.refuse(.unsupported, "glm5_next: batched rows take one host token per slot");

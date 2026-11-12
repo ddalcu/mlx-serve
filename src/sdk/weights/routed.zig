@@ -37,6 +37,9 @@ pub const Routed = struct {
     decode_ids: usize = max_call_ids,
     /// A `source` call of at most `decode_ids` ids gives each row the bytes that row's call alone gets.
     exact_rows: bool = false,
+    /// A prompt call of `source` (more ids than `decode_ids`) sums each routed row by itself (its bytes do not depend on
+    /// the call's other rows): two prompt forwards' rows may share one call (`moe.mlpSplit`).
+    rows_independent: bool = false,
 
     /// A wide call's routed sum plus the shared expert's rows (`[n, hidden]` f32, the last argument) as one combine over
     /// the call's unjoined outputs: `source`'s sum + the shared rows, word for word. A narrower call (a replaying chunk's

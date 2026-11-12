@@ -56,3 +56,16 @@ pub fn forwardRows(w: *const moe.Moe.Weights, s: mlx.mlx_stream, x: Array) !Arra
     defer g.deinit();
     return g.escape(try moe.mlpRows(w, &g, x));
 }
+
+/// Whether a split prompt forward's spans of `rows_a` and `rows_b` rows run this layer's routed experts in one call
+/// (`moe.splitServes`).
+pub const splitServes = moe.splitServes;
+
+/// The block over a split prompt forward's two spans, `x_a` then `x_b` (`moe.mlpSplit`: their routed experts in one
+/// call of the streamed bank's source), each output as `forward` gives it for that span alone (both owned by the caller).
+pub fn forwardSplit(w: *const moe.Moe.Weights, s: mlx.mlx_stream, x_a: Array, x_b: Array) ![2]Array {
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    const ys = try moe.mlpSplit(w, &g, x_a, x_b);
+    return .{ g.escape(ys[0]), g.escape(ys[1]) };
+}
