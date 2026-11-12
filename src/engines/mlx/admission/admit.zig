@@ -63,7 +63,7 @@ pub fn prefillAdmissionBill(config: *const model_mod.ModelConfig, prompt_len: us
         explicitPrefillChunk(),
         warm,
     );
-    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen));
+    const chunk: u64 = @intCast(config.cappedPrefillChunk(generate_mod.effectivePrefillChunk(config.prefillScoreHeadDim(), config.num_attention_heads, prompt_len, config.has_sliding_window, config.isMoe(), config.longCtxGated(), chosen)));
     // RAM hot-cache restores rebind MLX array handles by refcount; they do not
     // allocate another copy of the cached buffers. `active_mem` above already
     // includes the resident entry, while `prefillMemoryNeeded` bills the full

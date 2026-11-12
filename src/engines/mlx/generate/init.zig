@@ -191,7 +191,7 @@ pub fn initWithOptions(
     // start at ssm_checkpoint_pos_offset, so the final KV length is that
     // offset plus everything we're about to forward.
     const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
-    const PREFILL_CHUNK: usize = decodeShareCapped(effectivePrefillChunk(
+    const PREFILL_CHUNK: usize = decodeShareCapped(xfm.config.cappedPrefillChunk(effectivePrefillChunk(
         xfm.config.prefillScoreHeadDim(),
         xfm.config.num_attention_heads,
         total_ctx_for_chunk,
@@ -199,7 +199,7 @@ pub fn initWithOptions(
         xfm.config.isMoe(),
         xfm.config.longCtxGated(),
         options.pinned_prefill_chunk,
-    ), options.decode_share_width_cap);
+    )), options.decode_share_width_cap);
     // Phase-level prefill instrumentation. Enabled at debug level OR via
     // diag prefill-trace (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill

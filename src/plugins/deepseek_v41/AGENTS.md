@@ -129,8 +129,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the
   compiled MoE there); `moe_fp4` is the non-NAX one.
-- Prefill is chunked at 8192 (`prefillChunkMax`), one MoE call per chunk: each chunk still reads every expert bank
-  once (the CED replay runs the decoder layers), so a narrower chunk pays that read twice as often.
+- Prefill is chunked at 8192 at most (`prefillChunkMax`, an explicit `--prefill-chunk` included), one MoE call per
+  chunk: each chunk still reads every expert bank once (the CED replay runs the decoder layers), so a narrower chunk
+  pays that read twice as often.
 - Past 0.95 x Metal's working set MLX's allocator evicts its buffer cache on every miss (two residency commits per
   allocation): DSpark at 8192 crosses it on a 256 GB Mac at the default `iogpu.wired_limit_mb`; raise it to bench.
 - DSpark on prose falls back to plain (acceptance 1.04/round): correct, prose runs ~54 tok/s.
