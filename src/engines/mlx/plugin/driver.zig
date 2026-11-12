@@ -174,6 +174,24 @@ fn streamRoom(config: *const ModelConfig) u64 {
         @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
+/// The decode phase's room (`LoadCtx.stream_room_decode`): a built-in GLM's decode bill in place of its prompt bill;
+/// 0 for every other model, whose decode room stays its prompt room (`LoadCtx.decodeRoom`).
+fn streamRoomDecode(config: *const ModelConfig) u64 {
+    return streamRoomDecodeAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
+        @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
+}
+
+fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
+    const b = config.plugin orelse return 0;
+    if (!b.parsed.caps.streamed_weights or !config.isGlm5()) return 0;
+    var bill: abi.Bill = .{};
+    b.table.bill(&b.parsed, &.{ .context = 16_384 + 1_024 }, &bill);
+    // A plugin that prices its own prompt keeps one room; the built-in GLM's decode bill is the engine's.
+    if (bill.prefill_bytes != null) return 0;
+    const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(config, 16_384 + 1_024, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
+    return ceiling -| need -| margin;
+}
+
 fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
     const seq = 16_384 + 1_024;
     // The widest chunk the engine runs for this model (`total_ctx = 0`, as the context sizer bills it): an explicit
@@ -298,6 +316,26 @@ test "driver: a streamed plugin's room bills the widest chunk the engine runs: a
     try t.expectEqual((64 << 30) - (8192 << 20) - 281_673_728 - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
 }
 
+test "driver: a streamed built-in GLM's decode room is the ceiling less the engine's GLM decode bill; another model has none" {
+    const Probe = struct {
+        fn empty(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{};
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.empty;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    const chunk = @import("../generate.zig").WIDE_PREFILL_CHUNK;
+    const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(&cfg, 16_384 + 1_024, 1, 16, chunk);
+    try std.testing.expectEqual((64 << 30) - need - (1 << 30), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+    // The decode room is the larger: no prefill scratch.
+    try std.testing.expect(streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30) > streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    var other = ModelConfig{ .plugin = &binding };
+    try std.testing.expectEqual(@as(u64, 0), streamRoomDecodeAt(&other, 64 << 30, 1 << 30));
+}
+
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
     var cfg = ModelConfig{};
     cfg.legacy.caps.owns_decode_state = true;
@@ -373,6 +411,8 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .host = @import("../../../host/host_table.zig").get(),
         .weights = if (lend) &src else null,
         .stream_room = streamRoom(config),
+        .stream_room_decode = streamRoomDecode(config),
+        .gpu_ceiling_bytes = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},
         .tp_rank = if (config.dist_shard) |sh| sh.rank else 0,

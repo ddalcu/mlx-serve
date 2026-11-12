@@ -1051,13 +1051,36 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
     // The drafts' readout of a head the outside plugin runs, before the bank takes its room: the engine borrows it at
     // the bind (`trunk_weight`).
     if ((m.mtp != null or m.ling_mtp != null) and m.head.ext != null) try draftReadout(m);
-    if (c.streamed_bank) try bindBank(m, ctx.stream_room);
+    if (c.streamed_bank) try bindBank(m, ctx);
     return m;
 }
 
 /// The streaming pack's bank, opened by its outside plugin at the host's room past the loaded residents, bound to every
 /// routed layer (the trunk's layer index, as `BankGeometry.gates`).
-fn bindBank(m: *Model, room: u64) !void {
+/// The bank's per-phase fit (`outside_model.Fit`): the host's prompt and decode rooms, and the pack's measured
+/// calibration (`bank-fit.json`) when it names this ceiling and reaches the server's context; the bills otherwise.
+fn bankFit(ctx: *const abi.LoadCtx) outside_model.Fit {
+    var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom() };
+    if (!ctx.dir.has(outside_model.bank_fit_file)) return fit;
+    var buf: [4096]u8 = undefined;
+    var why: abi.Verdict = .ok;
+    const text = ctx.dir.readFile(outside_model.bank_fit_file, &buf, &why) orelse {
+        log.warn("glm5_next: {s} does not read ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, why.why.slice() });
+        return fit;
+    };
+    const S = struct { ctx_size: u64 = 0 };
+    var sbuf: [1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&sbuf);
+    const context: u64 = if (std.json.parseFromSliceLeaky(S, fba.allocator(), ctx.settings_json.slice(), .{ .ignore_unknown_fields = true })) |st| st.ctx_size else |_| 0;
+    fit.calibration = outside_model.parseBankFit(text, ctx.gpuCeiling(), if (context == 0) std.math.maxInt(u64) else context) catch |e| {
+        log.warn("glm5_next: {s} not applied ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, @errorName(e) });
+        return fit;
+    };
+    log.info("glm5_next: the bank fits by {s} (ceiling {d} MiB, context {d})\n", .{ outside_model.bank_fit_file, fit.calibration.?.ceiling >> 20, fit.calibration.?.context });
+    return fit;
+}
+
+fn bindBank(m: *Model, ctx: *const abi.LoadCtx) !void {
     const c = m.c;
     const gates = try gpa.alloc(quant_abi.BankGate, m.layers.len);
     defer gpa.free(gates);
@@ -1071,7 +1094,7 @@ fn bindBank(m: *Model, room: u64) !void {
         if (l.* > 0) any_limit = true;
     }
     const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(m.layers.len), .swiglu_limit = if (c.swiglu_clamp) c.swiglu_limit else 0, .gates = gates.ptr, .limits_out = if (any_limit) limits.ptr else null };
-    const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fixed = outside_model.roomBudget(room) }, m.s);
+    const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fit = bankFit(ctx) }, m.s);
     m.bank = o.bank;
     log.info("glm5_next: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
     const r = o.bank.routed();

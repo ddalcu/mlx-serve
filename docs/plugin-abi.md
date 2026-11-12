@@ -483,6 +483,8 @@ Valid during `load` only: the model keeps none of its pointers.
 | `wired_margin_bytes` | `u64` | `8 << 30` | The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned. |
 | `tp_rank` | `u32` | `0` | Tensor parallel (DeepSeek-V4.1): this rank's slice of every expert and attention head, the weights already sliced; `tp_size` 0 = whole. |
 | `tp_size` | `u32` | `0` |  |
+| `stream_room_decode` | `u64` | `0` | GPU bytes a streamed bank may fill in the decode phase: the GPU ceiling less the decode phase's bill at 16K + 1K and the wired margin; 0 = the host has none (`decodeRoom`). |
+| `gpu_ceiling_bytes` | `u64` | `0` | The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown. |
 
 ### `Mode` (enum(u8))
 

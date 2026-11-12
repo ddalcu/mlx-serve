@@ -398,7 +398,37 @@ pub const LoadCtx = extern struct {
     /// `tp_size` 0 = whole.
     tp_rank: u32 = 0,
     tp_size: u32 = 0,
+    /// GPU bytes a streamed bank may fill in the decode phase: the GPU ceiling less the decode phase's bill at 16K + 1K
+    /// and the wired margin; 0 = the host has none (`decodeRoom`).
+    stream_room_decode: u64 = 0,
+    /// The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown.
+    gpu_ceiling_bytes: u64 = 0,
+
+    /// The decode phase's room: `stream_room_decode`, or `stream_room` from a host that sets none or predates it.
+    pub fn decodeRoom(c: *const LoadCtx) u64 {
+        if (c.size < @offsetOf(LoadCtx, "stream_room_decode") + @sizeOf(u64) or c.stream_room_decode == 0) return c.stream_room;
+        return c.stream_room_decode;
+    }
+    /// `gpu_ceiling_bytes`, or 0 from a host that predates it.
+    pub fn gpuCeiling(c: *const LoadCtx) u64 {
+        if (c.size < @offsetOf(LoadCtx, "gpu_ceiling_bytes") + @sizeOf(u64)) return 0;
+        return c.gpu_ceiling_bytes;
+    }
 };
+
+test "abi plugin: LoadCtx's decode room and ceiling read past an older host's struct as its prompt room and 0" {
+    const dir: PackDir = undefined;
+    const parsed: Parsed = .{};
+    var c: LoadCtx = .{ .model_dir = .{}, .dir = &dir, .parsed = &parsed, .stream_room = 50, .stream_room_decode = 70, .gpu_ceiling_bytes = 110 };
+    try std.testing.expectEqual(@as(u64, 70), c.decodeRoom());
+    try std.testing.expectEqual(@as(u64, 110), c.gpuCeiling());
+    c.stream_room_decode = 0;
+    try std.testing.expectEqual(@as(u64, 50), c.decodeRoom());
+    c.stream_room_decode = 70;
+    c.size = @offsetOf(LoadCtx, "stream_room_decode");
+    try std.testing.expectEqual(@as(u64, 50), c.decodeRoom());
+    try std.testing.expectEqual(@as(u64, 0), c.gpuCeiling());
+}
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };
 pub const Logits = enum(u8) { last_row, all_rows, none };

@@ -8,8 +8,9 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
   refusals, and the file parse with processor + generation config). Refuses: a streaming pack without its
   `experts.bin`, `qk_rope_head_dim`, any Gemma/BERT/sliding key (`foreign_keys`).
 - Streaming pack (`Config.streamed_bank`): its claiming outside quant plugin runs the projections it stores and the
-  head's experts (`sdk/quant/outside_model.zig`); its bank opens at `LoadCtx.stream_room`, binds each routed layer
-  (`moe.bindRouted`), takes each forward's phase and settles after its eval. Serial decode, no images (`bankFacts`).
+  head's experts (`sdk/quant/outside_model.zig`); its bank opens per phase (`Budget.fit`: `stream_room`, `decodeRoom()`,
+  the pack's `bank-fit.json` on its ceiling), binds each routed layer (`moe.bindRouted`), takes each forward's phase
+  and settles after its eval. Serial decode, no images (`bankFacts`).
 - Load (`trunk.zig`): reads the driver's resident source (`LoadCtx.weights`: the engine's map with the Sushi and
   ModelOpt adapters applied) in the layout the deleted legacy load built: q|k|v and the convs joined, GLM's decode row
   group `[qkv | z | a | b]`, f32 KDA tables, DSA and MLA projections, the MoE block's weights, the `mtp.0` head.
