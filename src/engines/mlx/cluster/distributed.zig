@@ -1029,16 +1029,29 @@ pub fn release() void {
     p.remote = null;
     p.shard = null;
     p.peer_pos = 0;
+    const released = releaseEach(p.link.size, LinkRelease{ .link = &p.link });
+    log.info("[dist] {s} unloaded: {d} of {d} workers released their part\n", .{ std.fs.path.basename(p.model), released, p.link.size - 1 });
+}
+
+/// Tells every worker to release its part, past any it cannot reach; returns how many it reached.
+fn releaseEach(size: u32, sender: anytype) u32 {
     var released: u32 = 0;
-    for (1..p.link.size) |k| {
-        sendMsg(&p.link, .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 }, @intCast(k)) catch |err| {
+    for (1..size) |k| {
+        sender.send(@intCast(k)) catch |err| {
             log.warn("[dist] the release did not reach worker rank {d} ({s})\n", .{ k, @errorName(err) });
             continue;
         };
         released += 1;
     }
-    log.info("[dist] {s} unloaded: {d} of {d} workers released their part\n", .{ std.fs.path.basename(p.model), released, p.link.size - 1 });
+    return released;
 }
+
+const LinkRelease = struct {
+    link: *const Link,
+    fn send(self: LinkRelease, rank: u32) !void {
+        return sendMsg(self.link, .{ OP_RELEASE, 0, 0, 0, 0, 0, 0, 0 }, rank);
+    }
+};
 
 /// Rank 0's peer, once `connect` has run.
 pub fn peer() ?*Peer {
@@ -2934,6 +2947,19 @@ test "dist N-rank: tensor DSpark stages split only when the pack declares and sh
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"mtp.0.main_proj.weight\":\"a.safetensors\"}}" });
     c.mtp_override = false;
     try std.testing.expect(!dsv41DraftShard(io, &c, dir));
+}
+
+test "dist N-rank: an unload tells every worker to release, past one it cannot reach" {
+    const Sender = struct {
+        tried: *[max_ranks]bool,
+        fn send(self: @This(), rank: u32) !void {
+            self.tried[rank] = true;
+            if (rank == 2) return error.DistPeerGone;
+        }
+    };
+    var tried: [max_ranks]bool = @splat(false);
+    try std.testing.expectEqual(@as(u32, 2), releaseEach(4, Sender{ .tried = &tried }));
+    try std.testing.expect(!tried[0] and tried[1] and tried[2] and tried[3]);
 }
 
 test "dist N-rank: a plan kept past a failed load refuses a load that wants other DSpark stages" {
