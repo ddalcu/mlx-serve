@@ -20,6 +20,7 @@ const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
 const env = @import("../../env.zig");
 const sliceQkvPart = @import("../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
 const trunk = @import("trunk.zig");
+const kda_verify = @import("kda_verify.zig");
 
 const Array = mlx.mlx_array;
 const Model = trunk.Model;
@@ -53,6 +54,7 @@ fn switchOn(comptime name: @EnumLiteral()) bool {
 }
 
 var prompt_normgate_said = false;
+var verify_said = false;
 
 fn free(a: Array) void {
     if (a.ctx != null) _ = mlx.mlx_array_free(a);
@@ -281,8 +283,13 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     const prefill_fused = kda_fused and is_prefill and decode_fused.gdnPrefillFusedFor(seq_len, batch);
     // GLM's prompt rows: where the per-core route declines they take the norm-gate epilogue below.
     const prompt_rows = c.isGlm5() and bounded and is_prefill and !capture and batch == 1 and seq_len >= 17;
-    if (kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
-        kernel == 4 and (e.initialized or prefill_fused))
+    // GLM's verify rows the joined decode step left to the chain: the same packed prework, the gate in one launch and
+    // the norm-gate epilogue (MLX_SERVE_GLM_KDA_VERIFY), with the capture's conv input as the chain makes it.
+    const verify_rows = c.isGlm5() and bounded and capture and batch == 1;
+    const verify_texts = verify_rows and switchOn(.MLX_SERVE_GLM_KDA_VERIFY);
+    const verify_prework = verify_texts and kernel == 4;
+    if ((kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
+        kernel == 4 and (e.initialized or prefill_fused)) or verify_prework)
     blk: {
         var zero_conv: Array = .{ .ctx = null };
         defer free(zero_conv);
@@ -318,6 +325,12 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
             .gate = false,
             .g_dtype = gdn_decode.gateDtype(mlx.mlx_array_dtype(qkv), m.ssmStateDtype()),
         }) catch null) orelse break :blk;
+        if (verify_prework) {
+            free(e.spec_conv_input);
+            e.spec_conv_input = .{ .ctx = null };
+            e.spec_conv_input = try kda_verify.convInput(s, incoming_conv, qkv);
+            kda_verify.runs.prework += 1;
+        }
         free(e.conv_state);
         e.conv_state = pre.conv_state;
         e.initialized = true;
@@ -373,10 +386,14 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
 
     // One gate value per key channel: the bounded sigmoid where the config bounds it (fla's two arms), else the
     // softplus chain over `A_log` expanded per channel. The per-core recurrence builds the gate itself.
-    const g = if (kda_fused) Array{ .ctx = null } else if (bounded)
-        try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s)
-    else
-        try softplusGate(m, la.A_log, a_proj, la.dt_bias);
+    var verify_gate = false;
+    const g = if (kda_fused) Array{ .ctx = null } else if (bounded) pick: {
+        if (verify_texts) if (try kda_verify.gate(s, a_proj, la.dt_bias, la.A_log, c.kda_gate_lower_bound)) |vg| {
+            verify_gate = true;
+            break :pick vg;
+        };
+        break :pick try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s);
+    } else try softplusGate(m, la.A_log, a_proj, la.dt_bias);
     defer free(g);
 
     const beta = beta_fused orelse blk: {
@@ -470,12 +487,19 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     // rms_norm(y) * sigmoid(z) straight to the out projection's input (decode and verify widths, the per-core route's
     // prompt rows, and any prompt's rows under MLX_SERVE_KDA_PROMPT_NORMGATE).
     const prompt_normgate = !kda_fused and prompt_rows and switchOn(.MLX_SERVE_KDA_PROMPT_NORMGATE);
-    if (fused_prework or prompt_normgate) {
+    if (fused_prework or prompt_normgate or verify_texts) {
         if (m.kda.eps.ctx == null) m.kda.eps = mlx.mlx_array_new_float(c.rms_norm_eps);
         const fused = if (prompt_normgate)
             try decode_fused.gdnNormGatePrompt(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, seq_len)
         else
             try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len);
+        if (verify_texts) {
+            if (fused != null) kda_verify.runs.normgate += 1;
+            if (!verify_said) {
+                verify_said = true;
+                log.info("[kda] verify engaged: S={d} Hv={d} prework={} gate={} norm-gate={}\n", .{ seq_len, num_v_heads, fused_prework, verify_gate, fused != null });
+            }
+        }
         if (fused) |flat| {
             if (prompt_normgate and !prompt_normgate_said) {
                 prompt_normgate_said = true;
