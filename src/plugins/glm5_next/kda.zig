@@ -17,6 +17,7 @@ const gate_mod = @import("../../sdk/blocks/gdn/gate.zig");
 const gdn_decode = @import("../../sdk/blocks/gdn/decode.zig");
 const decode_fused = @import("../../sdk/blocks/gdn/decode_fused.zig");
 const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
+const env = @import("../../env.zig");
 const sliceQkvPart = @import("../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
 const trunk = @import("trunk.zig");
 
@@ -45,6 +46,13 @@ pub fn low(m: *const Model, l: *const trunk.Linear) kda_recurrence.Low {
     const dense = l.s.ctx == null;
     return .{ .w = l.w, .s = l.s, .b = l.b, .bits = if (dense) m.c.quant_bits else l.bits, .gs = if (dense) m.c.quant_group_size else l.group_size };
 }
+
+/// A kill switch: on unless set to `0`.
+fn switchOn(comptime name: @EnumLiteral()) bool {
+    return if (env.get(name)) |v| v[0] != '0' else true;
+}
+
+var prompt_normgate_said = false;
 
 fn free(a: Array) void {
     if (a.ctx != null) _ = mlx.mlx_array_free(a);
@@ -271,6 +279,8 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         kda_recurrence.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype());
     // Wide prework is token-local; a cold chunk supplies the same zero history as the composed conv.
     const prefill_fused = kda_fused and is_prefill and decode_fused.gdnPrefillFusedFor(seq_len, batch);
+    // GLM's prompt rows: where the per-core route declines they take the norm-gate epilogue below.
+    const prompt_rows = c.isGlm5() and bounded and is_prefill and !capture and batch == 1 and seq_len >= 17;
     if (kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
         kernel == 4 and (e.initialized or prefill_fused))
     blk: {
@@ -457,11 +467,22 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         e.ssm_state = new_state;
     }
 
-    // rms_norm(y) * sigmoid(z) straight to the out projection's input (decode and verify widths).
-    if (fused_prework) {
+    // rms_norm(y) * sigmoid(z) straight to the out projection's input (decode and verify widths, the per-core route's
+    // prompt rows, and any prompt's rows under MLX_SERVE_KDA_PROMPT_NORMGATE).
+    const prompt_normgate = !kda_fused and prompt_rows and switchOn(.MLX_SERVE_KDA_PROMPT_NORMGATE);
+    if (fused_prework or prompt_normgate) {
         if (m.kda.eps.ctx == null) m.kda.eps = mlx.mlx_array_new_float(c.rms_norm_eps);
-        if (try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)) |flat|
+        const fused = if (prompt_normgate)
+            try decode_fused.gdnNormGatePrompt(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, seq_len)
+        else
+            try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len);
+        if (fused) |flat| {
+            if (prompt_normgate and !prompt_normgate_said) {
+                prompt_normgate_said = true;
+                log.info("[kda] prompt norm-gate engaged: S={d} Hv={d}\n", .{ seq_len, num_v_heads });
+            }
             return outProj(m, la, flat, given != null);
+        }
     }
     var z_heads = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(z_heads);

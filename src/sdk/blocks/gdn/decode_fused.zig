@@ -112,6 +112,12 @@ pub fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     return gdn_prefill_fused_override orelse true;
 }
 
+/// A prompt arm (`gdnNormGatePrompt`): one slot's 17 rows or more, past hc_prefill's cap too (the kernels read
+/// any row count).
+fn promptRows(prompt: bool, seq: c_int, batch: c_int) bool {
+    return prompt and batch == 1 and seq >= 17;
+}
+
 /// Inputs of the packed prework. `qkv`/`b`/`a` are read at `(off, stride)`
 /// per row, so they may all alias one folded in_proj output.
 pub const GdnPreworkArgs = struct {
@@ -264,7 +270,16 @@ fn getGdnNormGateKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 /// `rms_norm(y) * silu(z)` flattened to [B, S, Hv*Dv]. Null → composed chain.
-pub fn gdnNormGateFused(
+pub fn gdnNormGateFused(s: mlx.mlx_stream, y: mlx.mlx_array, z: mlx.mlx_array, z_off: c_int, z_stride: c_int, norm_w: mlx.mlx_array, eps: mlx.mlx_array, swish: bool, hv: c_int, dv: c_int, batch: c_int, seq: c_int) !?mlx.mlx_array {
+    return normGate(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, batch, seq, false);
+}
+
+/// `gdnNormGateFused` over one slot's prompt rows (`promptRows`), served whatever `gdnPrefillFusedFor` says.
+pub fn gdnNormGatePrompt(s: mlx.mlx_stream, y: mlx.mlx_array, z: mlx.mlx_array, z_off: c_int, z_stride: c_int, norm_w: mlx.mlx_array, eps: mlx.mlx_array, swish: bool, hv: c_int, dv: c_int, seq: c_int) !?mlx.mlx_array {
+    return normGate(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, 1, seq, true);
+}
+
+fn normGate(
     s: mlx.mlx_stream,
     y: mlx.mlx_array, // [B, S, Hv, Dv] bf16
     z: mlx.mlx_array, // rows of [.. ZOFF + Hv*Dv ..] bf16
@@ -277,9 +292,10 @@ pub fn gdnNormGateFused(
     dv: c_int,
     batch: c_int,
     seq: c_int,
+    prompt: bool,
 ) !?mlx.mlx_array {
     if (dv != 128 or !mlx.streamIsGpu(s)) return null;
-    const prefill = gdnPrefillFusedFor(seq, batch);
+    const prefill = promptRows(prompt, seq, batch) or gdnPrefillFusedFor(seq, batch);
     if (!prefill and !gdnDecodeFusedEnabled()) return null;
     if (!prefill and (seq < 1 or seq > GDN_FUSED_MAX_ROWS or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
     const dt = mlx.mlx_array_dtype(y);
