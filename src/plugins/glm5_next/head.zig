@@ -13,6 +13,7 @@ const trunk = @import("trunk.zig");
 const table_forward = @import("table_forward.zig");
 const glm_moe = @import("moe.zig");
 const Slots = @import("slots.zig").Slots;
+const dsa_append = @import("dsa_append.zig");
 const env = @import("../../env.zig");
 const log = @import("../../sdk/util/log.zig");
 
@@ -46,6 +47,10 @@ fn step(m: *host.Model, h: *const trunk.Head, ops: *const abi.CacheOps, f: *cons
     // The legacy head attends at its cache's own length, never the trunk's position.
     const pos = [_]u32{@intCast(ops.len(f.caches.slice()[0], 0))};
     const sl: Slots = .{ .ops = ops, .caches = f.caches.slice(), .positions = &pos };
+    // MLX_SERVE_GLM_DSA_TAILS: the step's DSA layer's indexer tail rows read first (its cache append then reuses the
+    // buffer), dropped at the step's end.
+    try dsa_append.begin(s, sl, false, mlx.getShape(ids), &.{0});
+    defer dsa_append.end();
 
     const emb = try m.embedding(ids);
     defer _ = mlx.mlx_array_free(emb);

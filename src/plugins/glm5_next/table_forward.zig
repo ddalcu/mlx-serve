@@ -17,6 +17,7 @@ const axisView = @import("../../mlx/array.zig").axisView;
 const concatAxis1 = @import("../../mlx/array.zig").concatAxis1;
 const glm_moe = @import("moe.zig");
 const dsa_prompt = @import("dsa_prompt.zig");
+const dsa_append = @import("dsa_append.zig");
 const env = @import("../../env.zig");
 const log = @import("../../sdk/util/log.zig");
 
@@ -49,6 +50,11 @@ pub const Step = struct {
 pub fn hidden(m: *Model, st: *const Step, token_ids: Array) !Array {
     const cfg = m.c;
     const s = m.s;
+    // MLX_SERVE_GLM_DSA_TAILS: a window's DSA layers' indexer tail rows read first, in a command buffer of their own
+    // (each layer's cache append then reuses its buffer), dropped at the forward's end.
+    var dsa_layers: [dsa_append.trunk_layers]u32 = undefined;
+    try dsa_append.begin(s, st.slots, st.batched, mlx.getShape(token_ids), dsa_append.trunkDsaLayers(m, &dsa_layers));
+    defer dsa_append.end();
 
     var emb = try m.embedding(token_ids);
     {
@@ -452,7 +458,11 @@ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trun
         const n_prev: c_int = @min(@as(c_int, @intCast(offset)), kpool - 1);
         var prev = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(prev);
-        if (n_prev > 0) {
+        // MLX_SERVE_GLM_DSA_TAILS: the rows the forward read at its start (null: the cache view's).
+        const early: ?Array = if (n_prev > 0) dsa_append.take(sl, slot, layer, n_prev) else null;
+        if (early) |tail_rows| {
+            _ = mlx.mlx_array_set(&prev, tail_rows);
+        } else if (n_prev > 0) {
             var cached = try sl.view(slot, layer, s);
             defer cached.deinit();
             const vsh = mlx.getShape(cached.v);
