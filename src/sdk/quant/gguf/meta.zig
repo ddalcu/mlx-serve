@@ -320,7 +320,7 @@ test "DeepSeek-V4.1's image placeholder stays one token when the DS4 converter t
 
 test "derived merges follow HF's order: score, then longer pieces, user-defined tokens as score 0" {
     // vocab: a b ab abb bb "  " (user-defined, spaces) with scores
-    const w = TestArrays{ .tokens = &.{ "a", "b", "\xe2\x96\x81", "ab", "abb", "bb", "  " }, .types = &.{ 1, 1, 1, 1, 1, 1, TOKEN_USER_DEFINED }, .scores = &.{ -1, -1, -1, -3, -2, -3, -1000 } };
+    var w = TestArrays{ .tokens = &.{ "a", "b", "\xe2\x96\x81", "ab", "abb", "bb", "  " }, .types = &.{ 1, 1, 1, 1, 1, 1, TOKEN_USER_DEFINED }, .scores = &.{ -1, -1, -1, -3, -2, -3, -1000 } };
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(std.testing.allocator);
     try appendDerivedMerges(std.testing.allocator, &out, w.tokens_arr(), w.types_arr(), w.scores_arr());
@@ -337,8 +337,8 @@ const TestArrays = struct {
     buf_y: [64]u8 = undefined,
     buf_s: [64]u8 = undefined,
 
-    fn tokens_arr(self: *const TestArrays) gguf.Array {
-        const buf = @constCast(&self.buf_t);
+    fn tokens_arr(self: *TestArrays) gguf.Array {
+        const buf = &self.buf_t;
         var n: usize = 0;
         for (self.tokens) |t| {
             std.mem.writeInt(u64, buf[n..][0..8], t.len, .little);
@@ -347,13 +347,13 @@ const TestArrays = struct {
         }
         return .{ .elem_type = .string, .len = self.tokens.len, .bytes = buf[0..n] };
     }
-    fn types_arr(self: *const TestArrays) gguf.Array {
-        const buf = @constCast(&self.buf_y);
+    fn types_arr(self: *TestArrays) gguf.Array {
+        const buf = &self.buf_y;
         for (self.types, 0..) |t, i| std.mem.writeInt(i32, buf[4 * i ..][0..4], @intCast(t), .little);
         return .{ .elem_type = .i32, .len = self.types.len, .bytes = buf[0 .. 4 * self.types.len] };
     }
-    fn scores_arr(self: *const TestArrays) gguf.Array {
-        const buf = @constCast(&self.buf_s);
+    fn scores_arr(self: *TestArrays) gguf.Array {
+        const buf = &self.buf_s;
         for (self.scores, 0..) |v, i| std.mem.writeInt(u32, buf[4 * i ..][0..4], @bitCast(v), .little);
         return .{ .elem_type = .f32, .len = self.scores.len, .bytes = buf[0 .. 4 * self.scores.len] };
     }
