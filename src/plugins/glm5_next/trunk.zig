@@ -1070,7 +1070,12 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
     // The drafts' readout of a head the outside plugin runs, before the bank takes its room: the engine borrows it at
     // the bind (`trunk_weight`).
     if ((m.mtp != null or m.ling_mtp != null) and m.head.ext != null) try draftReadout(m);
-    if (c.streamed_bank) try bindBank(m, ctx, start);
+    if (c.streamed_bank) {
+        // The head resident before the bank's open reads the memory (else lazy until `HeadHooks.load`, past the open).
+        if (m.mtp != null) try readyHead(m);
+        if (m.ling_mtp != null) try readyLingHead(m);
+        try bindBank(m, ctx, start);
+    }
     return m;
 }
 

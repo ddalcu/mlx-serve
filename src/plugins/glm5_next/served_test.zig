@@ -18,6 +18,7 @@ const driver = @import("../../engines/mlx/plugin/driver.zig");
 const File = @import("../../sdk/root.zig").fixture.File;
 const fixture = @import("fixture.zig");
 const glm = @import("plugin.zig");
+const host = @import("host.zig");
 const ling = @import("../bailing_hybrid/plugin.zig");
 const tape_compact_over = @import("proof_test.zig").tape_compact_over;
 
@@ -269,6 +270,19 @@ test "bailing_hybrid served: a streaming pack's bank takes each forward's phase 
     for (accepted.items) |n| try testing.expect(n <= 2);
     // Every trunk forward told the bank its phase first and settled it after.
     try testing.expect(ToyLing.phases > 0 and ToyLing.settles == ToyLing.phases);
+}
+
+// Bar: a streaming pack's load leaves its NextN layer resident (the bank's open reads the memory it takes), before any
+// `HeadHooks.load`.
+test "bailing_hybrid served: a streaming pack's load makes its NextN layer resident before the bank opens" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const m = host.of(b.xfm.plugin.?.model);
+            try testing.expect(m.ling_mtp != null and m.bank != null);
+            try testing.expect(m.mtp_ready);
+        }
+    }.run);
 }
 
 /// The Ling streaming fixture served through `ToyLing` (registered for the call's life).
