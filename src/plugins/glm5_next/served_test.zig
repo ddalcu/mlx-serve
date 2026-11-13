@@ -21,6 +21,7 @@ const glm = @import("plugin.zig");
 const host = @import("host.zig");
 const ling = @import("../bailing_hybrid/plugin.zig");
 const tape_compact_over = @import("proof_test.zig").tape_compact_over;
+const kda_rows = @import("../../sdk/blocks/kda/verify_rows.zig");
 
 const testing = std.testing;
 
@@ -301,14 +302,19 @@ fn withToyLing(comptime f: fn (*both.Both) anyerror!void) !void {
 }
 
 // Bar: a streaming pack's verify of 2 to 9 rows (past the bank's 8-row decode lane) gives every row serial decode's
-// logits and leaves serial decode's state, bit for bit.
+// logits and leaves serial decode's state, bit for bit; up to 8 rows its KDA layers take the one-launch rows.
 test "bailing_hybrid served: a streaming pack's verify rows are serial decode's, bit for bit" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try withToyLing(struct {
         fn run(b: *both.Both) anyerror!void {
             const prompt = [_]i32{ 3, 17, 42, 99, 7, 250, 1, 8, 66, 31 };
             const window = [_]i32{ 5, 61, 200, 9, 33, 77, 140, 2, 18 };
-            for ([_]usize{ 2, 3, 5, 9 }) |n| try b.expectVerifyIsSerial(&prompt, window[0..n], 64);
+            for ([_]usize{ 2, 3, 5, 9 }) |n| {
+                const before = kda_rows.launches;
+                try b.expectVerifyIsSerial(&prompt, window[0..n], 64);
+                // The fixture's 3 KDA layers, one launch each, while the rows fit one.
+                try testing.expectEqual(before + @as(usize, if (n <= @as(usize, @intCast(kda_rows.max_rows))) 3 else 0), kda_rows.launches);
+            }
         }
     }.run);
 }

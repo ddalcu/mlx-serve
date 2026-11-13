@@ -2,7 +2,8 @@
 //! lower bound -5): oMLX's per-core prefill recurrence (the per-channel bounded-sigmoid gate evaluated while staging)
 //! and its decode step (short conv + SiLU, the low-rank gates' quantized second stage, q/k l2 norms, the gate, the
 //! delta rule, the gated RMSNorm; 4- and 8-bit gates up to 8 rows, 5-bit at one row, with or without the per-row
-//! state capture). Both meet the float64 bound with the gdn area's forward-error allowance (`host.Val`, `gdn.step`).
+//! state capture); and Ling's exact verify rows in one launch (full-rank gates, a bf16 state stored after every row).
+//! Each meets the float64 bound with the gdn area's forward-error allowance (`host.Val`, `gdn.step`).
 //! Each launch's thread count is probed by its wrapper (`adapts`); the per-core plan follows the GPU's core count
 //! (80 cores: 80 threadgroups of 104 rows, 64 cores: 64 of 128).
 
@@ -12,6 +13,8 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const kc = @import("../../testing/kernel_contract/root.zig");
 const gdn = @import("../gdn/contract.zig");
 const kr = @import("recurrence.zig");
+const vr = @import("verify_rows.zig");
+const fa = @import("../mlp/fused_activations.zig");
 
 const spec = kc.spec;
 const metal = kc.metal;
@@ -535,6 +538,242 @@ const Step = struct {
     }
 };
 
+// ── the exact verify's rows in one launch (verify_rows.zig: Ling's full-rank gates, a bf16 state) ──
+
+const ROWS_C = 3 * QKV;
+
+const rows_launch = metal.Launch{
+    .name = "msv_kda_verify_rows",
+    .inputs = &vr.INPUTS,
+    .outputs = &vr.OUTPUTS,
+    .source = vr.SOURCE,
+    // qs, ks, vs, ys [8][128] bf16, gs [8][128] f32, betas [8] bf16.
+    .tg_bytes = 4 * 8 * D * 2 + 8 * D * 4 + 8 * 2,
+    // Not yet derived with the offline M1/M2 check.
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+/// A shape's rows are the verify's rows. Outputs: y, the next window, the state, the state after every row.
+const Rows = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    qkv: []f64 = &.{},
+    z: []f64 = &.{},
+    a_in: []f64 = &.{},
+    b_in: []f64 = &.{},
+    cs: []f64 = &.{},
+    cw: []f64 = &.{},
+    alog: []f64 = &.{},
+    dtb: []f64 = &.{},
+    nw: []f64 = &.{},
+    s0: []f64 = &.{},
+    qsc: f64 = 0,
+    ksc: f64 = 0,
+    args: [16]mlx.mlx_array = undefined,
+
+    fn init(a: std.mem.Allocator, launch: *const metal.Launch) Rows {
+        return .{ .rig = metal.Rig.init(a), .launch = launch, .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *Rows) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const Rows, shape: Shape) ?metal.Geometry {
+        const T = shape.rows;
+        if (T < 1 or T > @as(usize, @intCast(vr.max_rows))) return null;
+        const t: c_int = @intCast(T);
+        var g = metal.Geometry{ .grid = .{ 1024 * H, 1, 1 }, .tg = .{ 1024, 1, 1 } };
+        g.out(&.{ 1, t, QKV }, .bfloat16);
+        g.out(&.{ 1, 3, ROWS_C }, .bfloat16);
+        g.out(&.{ 1, H, D, D }, .bfloat16);
+        g.out(&.{ t, H, D, D }, .bfloat16);
+        g.dtype("T", .bfloat16);
+        g.dtype("StT", .bfloat16);
+        g.int("TOK", t);
+        inline for (.{ .{ "HK", H }, .{ "HV", H }, .{ "DK", D }, .{ "DV", D }, .{ "C", ROWS_C }, .{ "NKEEP", 3 } }) |kv| g.int(kv[0], kv[1]);
+        return g;
+    }
+
+    pub fn prepare(self: *Rows, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const T = shape.rows;
+        const bf: mlx.mlx_dtype = .bfloat16;
+        self.qkv = try host.uniform(a, rng, T * ROWS_C, -2, 2, bf);
+        self.z = try host.uniform(a, rng, T * QKV, -3, 3, bf);
+        self.a_in = try host.uniform(a, rng, T * QKV, -2, 2, bf);
+        self.b_in = try host.uniform(a, rng, T * H, -3, 3, bf);
+        self.cs = try host.uniform(a, rng, 3 * ROWS_C, -2, 2, bf);
+        self.cw = try host.uniform(a, rng, ROWS_C * 4, -0.6, 0.6, bf);
+        // A_log per head, expanded per key channel as the loader keeps it.
+        self.alog = try a.alloc(f64, QKV);
+        for (0..H) |h| @memset(self.alog[h * D ..][0..D], host.rt(.float32, @log(1 + 15 * rng.float(f64))));
+        self.dtb = try host.uniform(a, rng, QKV, -0.2, 0.2, .float32);
+        self.nw = try host.uniform(a, rng, D, 0.5, 1.5, bf);
+        self.s0 = try host.uniform(a, rng, PLANE, -0.3, 0.3, bf);
+        self.qsc = host.rt(bf, 1.0 / 128.0);
+        self.ksc = host.rt(bf, 1 / @sqrt(@as(f64, 128)));
+        switch (fill) {
+            .random => {},
+            .nonfinite => {
+                const vals = [_]f64{ std.math.nan(f64), std.math.inf(f64), -std.math.inf(f64), std.math.inf(f64), -std.math.inf(f64) };
+                const sites = [_][2]usize{ .{ 0, 5 }, .{ 1, 7 }, .{ 2, 9 }, .{ 3, 11 }, .{ 3, 12 } };
+                for (sites, vals) |s, x| self.qkv[2 * QKV + s[0] * D + s[1]] = x;
+                self.a_in[5 * D + 3] = std.math.nan(f64);
+                self.b_in[6] = std.math.nan(f64);
+                self.s0[(9 * D + 3) * D + 17] = std.math.nan(f64);
+            },
+            .stress => {
+                // Gate 4: conv weights [0, 0, 0, 1] and inputs 16 make SiLU, q and k exact (the sigmoid rounds to 1);
+                // b = z = 16 a unit beta and output gate; dt_bias -100 makes every gate 1; a positive state of 8-bit
+                // multiples of 256 (exact in bf16) drives k.S past fp16's range.
+                for (0..ROWS_C) |c| self.cw[c * 4 ..][0..4].* = .{ 0, 0, 0, 1 };
+                @memset(self.qkv, 16);
+                @memset(self.b_in, 16);
+                @memset(self.z, 16);
+                @memset(self.a_in, 0);
+                @memset(self.dtb, -100);
+                @memset(self.alog, 0);
+                @memset(self.nw, 1);
+                for (self.s0) |*x| x.* = @floatFromInt(rng.intRangeAtMost(i32, 1, 255) * 256);
+            },
+        }
+        const rig = &self.rig;
+        rig.reset();
+        const t: c_int = @intCast(T);
+        self.args = .{
+            try rig.input(bf, &.{ 1, t, ROWS_C }, self.qkv),
+            try rig.input(bf, &.{ 1, t, QKV }, self.z),
+            try rig.input(bf, &.{ 1, t, QKV }, self.a_in),
+            try rig.input(bf, &.{ 1, t, H }, self.b_in),
+            try rig.input(bf, &.{ 1, 3, ROWS_C }, self.cs),
+            try rig.input(bf, &.{ ROWS_C, 4, 1 }, self.cw),
+            try rig.input(.float32, &.{QKV}, self.alog),
+            try rig.input(.float32, &.{QKV}, self.dtb),
+            try rig.input(bf, &.{ 1, H, D, D }, self.s0),
+            try rig.input(bf, &.{D}, self.nw),
+            try rig.input(bf, &.{}, &.{self.qsc}),
+            try rig.input(bf, &.{}, &.{self.ksc}),
+            try rig.scalar(1e-6),
+            try rig.scalar(NORM_EPS),
+            try rig.scalar(LB),
+            try rig.input(bf, &.{65536}, try host.read(a, try fa.sigmoidTableFor(rig.stream(), bf), rig.stream())),
+        };
+        return true;
+    }
+
+    pub fn run(self: *Rows) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const Rows) usize {
+        const T = self.shape.rows;
+        return T * QKV + 3 * ROWS_C + PLANE + T * PLANE;
+    }
+
+    /// Row r of concat(conv_state, qkv).
+    fn win(self: *const Rows, r: usize, col: usize) f64 {
+        return if (r < 3) self.cs[r * ROWS_C + col] else self.qkv[(r - 3) * ROWS_C + col];
+    }
+
+    fn emit(self: *const Rows, want: []f64, mag: ?[]f64, acc: ?spec.Accum, order: spec.Order) !void {
+        var arena = std.heap.ArenaAllocator.init(self.rig.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const T = self.shape.rows;
+        const bf: mlx.mlx_dtype = .bfloat16;
+        // The conv and SiLU (the table's sigmoid is MLX's), each a bf16 rounding.
+        const act = try a.alloc(Val, T * ROWS_C);
+        for (0..T) |t| for (0..ROWS_C) |col| {
+            var sum: f64 = 0;
+            var m: f64 = 0;
+            for (0..4) |j| {
+                const p = self.win(t + j, col) * self.cw[col * 4 + j];
+                sum += p;
+                m += @abs(p);
+            }
+            const conv = host.round(bf, .{ .v = sum, .e = spec.gamma(3, U) * m });
+            act[t * ROWS_C + col] = host.round(bf, host.mul(conv, host.mlxSig(bf, conv)));
+        };
+        // q and k: rms_norm over a weight of ones, then the scale, each a bf16 rounding; beta; the gate.
+        const qn = try a.alloc(Val, T * QKV);
+        const kn = try a.alloc(Val, T * QKV);
+        const g = try a.alloc(Val, T * QKV);
+        const beta = try a.alloc(Val, T * H);
+        const terms = try a.alloc(f64, D);
+        for (0..T) |t| {
+            for (0..2 * H) |hh| {
+                const xs = act[t * ROWS_C + hh * D ..][0..D];
+                const inv = gdn.rmsInv(xs, 1.0 / @as(f64, D), 1e-6, null, order, terms);
+                const scale = if (hh < H) self.qsc else self.ksc;
+                const dst = if (hh < H) qn[t * QKV + hh * D ..][0..D] else kn[t * QKV + (hh - H) * D ..][0..D];
+                for (dst, xs) |*o, x| {
+                    const r = host.round(bf, host.mul(x, inv));
+                    o.* = host.round(bf, .{ .v = scale * r.v, .e = @abs(scale) * r.e });
+                }
+            }
+            for (0..H) |h| beta[t * H + h] = host.mlxSig(bf, .exact(self.b_in[t * H + h]));
+            for (0..QKV) |c| g[t * QKV + c] = gateOf(.exact(self.a_in[t * QKV + c]), self.dtb[c], self.alog[c]);
+        }
+        // The delta rule row by row, the state rounded to bf16 after every row; [0] the final state, [1 + t] row t's.
+        const ys = try a.alloc(Val, T * QKV);
+        const states = try a.alloc(Val, (T + 1) * PLANE);
+        const st = try a.alloc(Val, D);
+        for (0..H) |h| for (0..D) |r| {
+            const row = (h * D + r) * D;
+            for (st, self.s0[row..][0..D]) |*o, x| o.* = .exact(x);
+            for (0..T) |t| {
+                const at = t * QKV + h * D;
+                const v = act[t * ROWS_C + 2 * QKV + h * D + r];
+                const y = gdn.step(st, kn[at..][0..D], qn[at..][0..D], v, g[at..][0..D], beta[t * H + h], 9, acc, order, terms);
+                ys[at + r] = host.round(bf, y);
+                for (st) |*s| s.* = host.round(bf, s.*);
+                @memcpy(states[(1 + t) * PLANE + row ..][0..D], st);
+            }
+            @memcpy(states[row..][0..D], st);
+        };
+        var at: usize = 0;
+        const put = struct {
+            fn one(w: []f64, mg: ?[]f64, i: *usize, x: Val) void {
+                w[i.*] = x.v;
+                if (mg) |m| m[i.*] = host.allowance(x.e);
+                i.* += 1;
+            }
+        };
+        // The gated RMSNorm: norm_w * bf16(y * rsqrt(mean(y^2) + eps)), times the table's sigmoid of z.
+        for (0..T) |t| for (0..H) |h| {
+            const xs = ys[t * QKV + h * D ..][0..D];
+            const inv = gdn.rmsInv(xs, 1.0 / @as(f64, D), NORM_EPS, acc, order, terms);
+            for (xs, 0..) |x, c| {
+                const rn = host.round(bf, host.mul(x, inv));
+                const w = self.nw[c];
+                const normed = host.round(bf, .{ .v = w * rn.v, .e = @abs(w) * rn.e });
+                put.one(want, mag, &at, host.round(bf, host.mul(normed, host.mlxSig(bf, .exact(self.z[t * QKV + h * D + c])))));
+            }
+        };
+        for (0..3) |r| for (0..ROWS_C) |col| put.one(want, mag, &at, .exact(self.win(T + r, col)));
+        for (states) |x| put.one(want, mag, &at, x);
+        std.debug.assert(at == want.len);
+    }
+
+    pub fn reference(self: *const Rows, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null, .sequential);
+    }
+
+    pub fn simulate(self: *const Rows, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, acc, order);
+    }
+};
+
 fn tokens(comptime list: []const usize) []const Shape {
     comptime var out: [list.len]Shape = undefined;
     inline for (list, 0..) |r, i| out[i] = .{ .rows = r, .n = H, .k = D };
@@ -579,6 +818,14 @@ pub fn register(set: *kc.Set) !void {
         try set.add(Step, .init(a, c[0], c[1], c[2], .act), kdaSpec("kda_decode bf16, " ++ c[4] ++ " (y, conv)", .act, c[3], 0), null);
         try set.add(Step, .init(a, c[0], c[1], c[2], .state), kdaSpec("kda_decode bf16, " ++ c[4] ++ " (states)", .state, c[3], 0), null);
     }
+    try set.add(Rows, .init(a, &rows_launch), .{
+        .name = "kda_verify_rows bf16, bf16 state",
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .bf16,
+        .served = tokens(&.{ 2, 4, 8 }),
+        .sums = .{ .f16 = 0, .bf16 = 0, .exact = false, .why = "every output leaves in bf16, the state too, whose rounding is the size of a 16-bit sum's error here" },
+    }, null);
 }
 
 // ── tests ──
@@ -631,6 +878,17 @@ test "kernel contract kda: each declared launch is the shipped wrapper's, byte f
             }
             try expectSame(k.spec.name, 0, t.rig.output(0), r.y, t.rig.stream());
             try expectSame(k.spec.name, 1, t.rig.output(1), r.state, t.rig.stream());
+        } else if (std.mem.startsWith(u8, k.spec.name, "kda_verify_rows")) {
+            const t: *Rows = @ptrCast(@alignCast(k.ctx));
+            try std.testing.expect(try t.prepare(shape, .random, 7));
+            try t.run();
+            const g = t.args;
+            const r = (try vr.verifyRows(t.rig.stream(), .{ .qkv = g[0], .z = g[1], .a = g[2], .b = g[3], .conv_state = g[4], .conv_w = g[5], .A_log = g[6], .dt_bias = g[7], .state = g[8], .norm_w = g[9], .q_scale = g[10], .k_scale = g[11], .qk_eps = 1e-6, .norm_eps = NORM_EPS, .bound = LB, .hk = H, .hv = H, .dk = D, .dv = D })) orelse return error.WrapperDeclined;
+            const outs = [_]mlx.mlx_array{ r.y, r.conv_state, r.state, r.state_seq, r.conv_input };
+            defer for (outs) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            for (outs[0..4], 0..) |x, i| try expectSame(k.spec.name, i, t.rig.output(i), x, t.rig.stream());
         } else {
             const t: *Step = @ptrCast(@alignCast(k.ctx));
             try std.testing.expect(try t.prepare(shape, .random, 7));
