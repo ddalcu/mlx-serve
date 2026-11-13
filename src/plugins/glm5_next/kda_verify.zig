@@ -179,6 +179,8 @@ const trunk = @import("trunk.zig");
 const ops = @import("../../mlx/ops.zig");
 const conv1d = @import("../../sdk/bases/blocks/conv1d.zig");
 const kda_prologue = @import("kda_prologue.zig");
+const kda_percore = @import("kda_percore.zig");
+const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
 
 /// A GLM-5.3-Flash KDA layer at its served 64 heads of 128 (conv width 24576, gate width 8192), 4 conv taps, the
 /// low-rank gates. At 4 heads a verify's sigmoids met none of the bf16 roundings the formula's fast exp moves.
@@ -779,4 +781,122 @@ test "glm5_next kda prologue: a layer's prompt gives the chain's output, window 
         try testing.expectEqual(if (on[0] == '1') before + 2 else before, kda_prologue.runs);
     }
     for (outs[0], outs[1]) |w, g| try expectBits(s, w, g, null);
+}
+
+/// Whether the two-a-core route takes the served heads here: it does where the stock per-core route declines (fewer
+/// than 64 cores) and this GPU has a plan (32 cores or more) it launches.
+fn percoreHere(s: mlx.mlx_stream) bool {
+    if (kda_recurrence.serves(s, t_heads, t_heads, t_head, t_head, .bfloat16, .float32)) return false;
+    return kda_percore.serves(s, t_heads, t_heads, t_head, t_head, .bfloat16, .float32);
+}
+
+/// A layer's prompt under the switches as set: a cold 16,356-row chunk, then a warm 31-row chunk, each chunk's output,
+/// conv window and state, evaluated.
+fn promptChunks(r: *Rig, xa: Array, xb: Array, o: *[6]Array) !void {
+    var e: kda.Entry = .{};
+    defer e.deinit();
+    o[0] = try kda.forward(&r.m, xa, &r.la, &e, 1, 16_356, true, false);
+    o[1] = newRef(e.conv_state);
+    o[2] = newRef(e.ssm_state);
+    try evalAll(o[0..3]);
+    o[3] = try kda.forward(&r.m, xb, &r.la, &e, 1, 31, true, false);
+    o[4] = newRef(e.conv_state);
+    o[5] = newRef(e.ssm_state);
+    try evalAll(o[3..6]);
+}
+
+/// ||got - want|| / ||want|| (L2, in f64) over two float arrays of one shape; a nonfinite `got` is an error.
+fn normApart(s: mlx.mlx_stream, want: Array, got: Array) !f64 {
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    var parts: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
+    defer for (parts) |a| free(a);
+    for ([_]Array{ want, got }, &parts) |a, *p| {
+        var wide = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wide);
+        try mlx.check(mlx.mlx_astype(&wide, a, .float32, s));
+        p.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_contiguous(p, wide, false, s));
+    }
+    try evalAll(&parts);
+    const n = mlx.mlx_array_size(parts[0]);
+    const w = mlx.mlx_array_data_float32(parts[0]) orelse return error.TestNoData;
+    const g = mlx.mlx_array_data_float32(parts[1]) orelse return error.TestNoData;
+    var num: f64 = 0;
+    var den: f64 = 0;
+    for (w[0..n], g[0..n]) |wv, gv| {
+        if (!std.math.isFinite(gv)) return error.TestNonFinite;
+        const d = @as(f64, gv) - @as(f64, wv);
+        num += d * d;
+        den += @as(f64, wv) * @as(f64, wv);
+    }
+    return @sqrt(num / den);
+}
+
+// Bar: with MLX_SERVE_KDA_PROMPT_PERCORE a layer's prompt (the other prompt switches at their defaults) keeps the stock
+// path's conv window bit for bit and its output and state within the bound, the route run once a chunk.
+test "glm5_next kda percore: rounding-class: a layer's prompt stays within 2^-5 of the stock prompt path, 16,356 rows cold then 31 warm" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!percoreHere(s)) return error.SkipZigTest;
+    const pc = env.override(.MLX_SERVE_KDA_PROMPT_PERCORE, null);
+    defer pc.restore();
+    const pro = env.override(.MLX_SERVE_KDA_PROMPT_PROLOGUE, null);
+    defer pro.restore();
+    const ng = env.override(.MLX_SERVE_KDA_PROMPT_NORMGATE, null);
+    defer ng.restore();
+    var r: Rig = undefined;
+    try r.init(s, "glm5_next");
+    defer r.deinit();
+    const xa = try r.input(1, 16_356);
+    defer free(xa);
+    const xb = try r.input(1, 31);
+    defer free(xb);
+    var outs: [2][6]Array = @splat(@splat(.{ .ctx = null }));
+    defer for (&outs) |*o| for (o) |a| free(a);
+    for ([_][*:0]const u8{ "0", "1" }, &outs) |on, *o| {
+        env.set(.MLX_SERVE_KDA_PROMPT_PERCORE, on);
+        const before = kda_percore.runs;
+        try promptChunks(&r, xa, xb, o);
+        try testing.expectEqual(if (on[0] == '1') before + 2 else before, kda_percore.runs);
+    }
+    for ([_]usize{ 1, 4 }) |i| try expectBits(s, outs[0][i], outs[1][i], null);
+    // 2^-5: three bf16 roundings (y, the norm-gate, the out projection) each move an element by one ulp (2^-7) at most.
+    const bound: f64 = 0x1p-5;
+    for ([_]usize{ 0, 2, 3, 5 }) |i| {
+        const apart = try normApart(s, outs[0][i], outs[1][i]);
+        std.debug.print("kda percore: output {d} is {e} of the stock path's norm away from it\n", .{ i, apart });
+        try testing.expect(apart <= bound);
+    }
+}
+
+// Bar: the route gives the same bytes run after run, and whichever makes its q, k, v and beta (the prologue or the chain,
+// each the chain's bytes) gives those bytes too.
+test "glm5_next kda percore: deterministic: two runs give the same bytes, as does the prologue or the chain feeding it" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (!percoreHere(s)) return error.SkipZigTest;
+    const pc = env.override(.MLX_SERVE_KDA_PROMPT_PERCORE, "1");
+    defer pc.restore();
+    const pro = env.override(.MLX_SERVE_KDA_PROMPT_PROLOGUE, null);
+    defer pro.restore();
+    const ng = env.override(.MLX_SERVE_KDA_PROMPT_NORMGATE, null);
+    defer ng.restore();
+    var r: Rig = undefined;
+    try r.init(s, "glm5_next");
+    defer r.deinit();
+    const xa = try r.input(1, 16_356);
+    defer free(xa);
+    const xb = try r.input(1, 31);
+    defer free(xb);
+    // PROLOGUE: the prologue twice, then the chain.
+    const arms = [_][*:0]const u8{ "1", "1", "0" };
+    var outs: [arms.len][6]Array = @splat(@splat(.{ .ctx = null }));
+    defer for (&outs) |*o| for (o) |a| free(a);
+    for (arms, &outs) |arm, *o| {
+        env.set(.MLX_SERVE_KDA_PROMPT_PROLOGUE, arm);
+        const before = kda_percore.runs;
+        try promptChunks(&r, xa, xb, o);
+        try testing.expectEqual(before + 2, kda_percore.runs);
+    }
+    for (outs[1..]) |o| for (outs[0], o) |w, g| try expectBits(s, w, g, null);
 }

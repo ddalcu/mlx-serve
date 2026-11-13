@@ -28,6 +28,8 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
   norm-gate; the per-row states a launch run only when a rollback reads them (it holds the old state).
 - KDA prompt prologue (`kda_prologue.zig`, MLX_SERVE_KDA_PROMPT_PROLOGUE; GLM's prompt rows): conv, SiLU, q/k norms
   and scales and v in one launch, eight heads a threadgroup, the chain's bytes.
+- KDA prompt per-core (`kda_percore.zig`, MLX_SERVE_KDA_PROMPT_PERCORE, off; rounding-class): where the stock per-core
+  route declines (under 64 cores), its kernel at two threadgroups a core, the gate in it; the prologue or chain feeds it.
 - MoE (`moe.zig`, Ling's too, the MTP head's): the shared `sdk/bases/blocks/moe.zig` block; GLM's one-kernel decode
   (`glm5.moeDecode`, affine, up to 16 rows) is the block's `fused` arm, ModelOpt's per-expert up x down scale its
   `route_scale`, Sushi's EXL3 banks its `format_banks`.

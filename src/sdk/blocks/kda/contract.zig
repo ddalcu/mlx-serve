@@ -4,7 +4,8 @@
 //! delta rule, the gated RMSNorm; 4- and 8-bit gates up to 8 rows, 5-bit at one row, with or without the per-row
 //! state capture). Both meet the float64 bound with the gdn area's forward-error allowance (`host.Val`, `gdn.step`).
 //! Each launch's thread count is probed by its wrapper (`adapts`); the per-core plan follows the GPU's core count
-//! (80 cores: 80 threadgroups of 104 rows, 64 cores: 64 of 128).
+//! (80 cores: 80 threadgroups of 104 rows, 64 cores: 64 of 128; glm5_next's two-a-core route, `kda_percore.zig`, runs
+//! the 80-threadgroup plan on 40 cores).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -610,21 +611,21 @@ test "kernel contract kda: each declared launch is the shipped wrapper's, byte f
     var set = kc.Set.init(a);
     defer set.deinit();
     try register(&set);
-    const cores: c_int = @intCast(@import("../../util/system.zig").gpuCoreCount());
     for (set.kernels.items) |k| {
         const shape = k.spec.served[k.spec.served.len - 1];
         if (std.mem.startsWith(u8, k.spec.name, "kda_percore")) {
             const t: *Core = @ptrCast(@alignCast(k.ctx));
-            const plan = kr.planFor(H, D, cores) orelse continue;
-            if (plan.ntg != t.plan.ntg or plan.rows != t.plan.mr) continue; // this GPU's wrapper takes another plan
-            if (!kr.serves(t.rig.stream(), H, H, D, D, .bfloat16, .float32)) continue;
+            // Each registered plan through the wrappers' launch (`recurAt`: `recur` at this GPU's plan, glm5_next's
+            // two-a-core route at its own), whatever this GPU's core count.
+            const plan = kr.Plan{ .ntg = t.plan.ntg, .rows = t.plan.mr };
+            if (!(kr.probe(t.rig.stream(), H, .bfloat16, plan) catch false)) continue;
             try std.testing.expect(try t.prepare(shape, .random, 7));
             var geo = t.geometry(shape).?;
             geo.unread = 0;
             // A GPU that caps this pipeline below the launch (M1/M2) never runs it: the wrapper declines there too.
             t.rig.launch(t.launch, geo, &t.args) catch |e| if (e == error.ThreadgroupCap) continue else return e;
             const g = t.args;
-            const r = try kr.recur(t.rig.stream(), g[0], g[1], g[2], g[3], g[4], g[5], g[6], LB, g[8]);
+            const r = try kr.recurAt(t.rig.stream(), g[0], g[1], g[2], g[3], g[4], g[5], g[6], LB, g[8], plan);
             defer {
                 _ = mlx.mlx_array_free(r.y);
                 _ = mlx.mlx_array_free(r.state);

@@ -217,6 +217,7 @@ test {
     _ = @import("plugins/glm5_next/moe.zig");
     _ = @import("plugins/glm5_next/kda_verify.zig");
     _ = @import("plugins/glm5_next/kda_prologue.zig");
+    _ = @import("plugins/glm5_next/kda_percore.zig");
     _ = @import("sdk/blocks/kda/recurrence.zig");
     _ = @import("sdk/blocks/gdn/decode.zig");
     _ = @import("sdk/blocks/attention/row_attn.zig");
