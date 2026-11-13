@@ -177,6 +177,8 @@ const ToyLing = struct {
     var opened: u32 = 0;
     var layers: u32 = 0;
     var limits: bool = false;
+    var aheads: u32 = 0;
+    var ahead_ids: usize = 0;
     fn claims(block: qa.Str, _: qa.Str) callconv(.c) common.Claim {
         return if (std.mem.indexOf(u8, block.slice(), "\"exl3\"") != null) .by_marker else .no;
     }
@@ -229,7 +231,9 @@ const ToyLing = struct {
         phases += 1;
         return .ok;
     }
-    fn readAhead(_: ?*anyopaque, _: u32, _: [*]const u16, _: usize) callconv(.c) common.Verdict {
+    fn readAhead(_: ?*anyopaque, _: u32, _: [*]const u16, n: usize) callconv(.c) common.Verdict {
+        aheads += 1;
+        ahead_ids += n;
         return .ok;
     }
     const table: qa.QuantTable = .{ .name = .of("toy-ling"), .claims = &claims, .validate = &validate, .bill = &bill, .open = &open, .close = &close, .load_tensor = &load, .load_bank = &load, .release = &release, .matmul = &matmul, .moe = &moe, .bank_rows = &bankRows, .open_bank = &openBank };
@@ -270,8 +274,8 @@ const ToyLing = struct {
 };
 
 // Bar: a Ling streaming pack loads through the table that claims it (its bank bound to every routed layer, one phase
-// before and one settle after each forward) and serves its NextN layer as the engine's MTP head; an MLX pack loads no
-// head. No legacy oracle exists for the head (the legacy path serves none).
+// before and one settle after each forward, a prompt's routes read ahead) and serves its NextN layer as the engine's
+// MTP head; an MLX pack loads no head. No legacy oracle exists for the head (the legacy path serves none).
 test "bailing_hybrid served: a streaming pack's bank takes each forward's phase and settle, and its NextN layer is its MTP head; an MLX pack has none" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
@@ -308,6 +312,8 @@ test "bailing_hybrid served: a streaming pack's bank takes each forward's phase 
     for (accepted.items) |n| try testing.expect(n <= 2);
     // Every trunk forward told the bank its phase first and settled it after.
     try testing.expect(ToyLing.phases > 0 and ToyLing.settles == ToyLing.phases);
+    // The prompt read each routed layer's predicted experts ahead: its rows times top_k ids a call.
+    try testing.expect(ToyLing.aheads > 0 and ToyLing.ahead_ids % b.xfm.config.num_experts_per_tok == 0);
 }
 
 // Bar: a streaming pack's load leaves its NextN layer resident (the bank's open reads the memory it takes), before any
@@ -411,8 +417,9 @@ test "bailing_hybrid served: a streaming pack's greedy MTP stream equals its gre
 }
 
 /// A whole-prompt plan of the span-major proof: the span ends and checkpoint positions the engine hands the forward,
-/// the routed calls' width, and the routed calls each MoE layer then makes.
-const SpanCase = struct { ends: []const u64, cps: []const u64, calls: trunk.PromptCalls = .{}, routed: u32 };
+/// the routed calls' width, the routed calls each MoE layer then makes, and its read-aheads (the calls over wider spans)
+/// and their rows.
+const SpanCase = struct { ends: []const u64, cps: []const u64, calls: trunk.PromptCalls = .{}, routed: u32, ahead: u32, ahead_rows: u32 };
 
 /// `cs`'s whole prompt in one forward against the chunk loop's forward a span: every row's logits and hidden, each KDA
 /// layer's state after the prompt and at each checkpoint, and a next-token decode, bit for bit; each checkpoint filed
@@ -436,6 +443,7 @@ fn expectSpanMajor(b: *both.Both, prompt: []const i32, cs: SpanCase) !void {
     var want_cp: [4][2][8]mlx.mlx_array = undefined;
     var lo: u64 = 0;
     ToyLing.row_calls = 0;
+    ToyLing.aheads = 0;
     for (cs.ends, 0..) |hi, k| {
         var last = mlx.mlx_array_new();
         var all = mlx.mlx_array_new();
@@ -449,6 +457,7 @@ fn expectSpanMajor(b: *both.Both, prompt: []const i32, cs: SpanCase) !void {
         lo = hi;
     }
     const loop_calls = ToyLing.row_calls;
+    try testing.expectEqual(@as(u32, 0), ToyLing.aheads);
 
     var whole: both.Slot = undefined;
     try whole.init(b, &b.xfm);
@@ -466,6 +475,8 @@ fn expectSpanMajor(b: *both.Both, prompt: []const i32, cs: SpanCase) !void {
     whole.ctx.cp_sink = &sink;
     whole.ctx.prefill_progress = &progress;
     ToyLing.row_calls = 0;
+    ToyLing.aheads = 0;
+    ToyLing.ahead_ids = 0;
     var w_last = mlx.mlx_array_new();
     var w_all = mlx.mlx_array_new();
     const got = try g.adopt(try b.xfm.forwardWithCaptureAll(&whole.ctx, try proof_fixture.tokens(&g, prompt[0..lo]), &w_last, &w_all));
@@ -478,6 +489,9 @@ fn expectSpanMajor(b: *both.Both, prompt: []const i32, cs: SpanCase) !void {
     // Three routed layers, each in its calls over whole spans; the chunk loop calls each layer once a span.
     try testing.expectEqual(3 * cs.routed, ToyLing.row_calls);
     try testing.expectEqual(@as(u32, @intCast(3 * cs.ends.len)), loop_calls);
+    // Each routed layer reads ahead once a call over wider spans, before its attention: the call's rows x top_k ids.
+    try testing.expectEqual(3 * cs.ahead, ToyLing.aheads);
+    try testing.expectEqual(@as(usize, 3 * 2 * cs.ahead_rows), ToyLing.ahead_ids);
     try testing.expectEqual(lo, progress.load(.monotonic));
 
     try ops.expectBitEqual(got, try g.concat(logits_parts[0..cs.ends.len], 1));
@@ -522,9 +536,9 @@ test "bailing_hybrid served: a streaming pack's span-major prompt is the chunk l
             for (&prompt, 0..) |*t, i| t.* = @intCast(3 + (i * 53) % 500);
             // The toy's decode lane holds 8 rows: an 8-row span and a 1-row span run as forwards of their own.
             const cases = [_]SpanCase{
-                .{ .ends = &.{ 32, 40 }, .cps = &.{32}, .routed = 2 },
-                .{ .ends = &.{ 12, 30, 40 }, .cps = &.{ 12, 30 }, .calls = .{ .rows = 30, .tail = 4 }, .routed = 2 },
-                .{ .ends = &.{ 10, 20, 21, 33, 40 }, .cps = &.{ 20, 21, 33 }, .routed = 4 },
+                .{ .ends = &.{ 32, 40 }, .cps = &.{32}, .routed = 2, .ahead = 1, .ahead_rows = 32 },
+                .{ .ends = &.{ 12, 30, 40 }, .cps = &.{ 12, 30 }, .calls = .{ .rows = 30, .tail = 4 }, .routed = 2, .ahead = 2, .ahead_rows = 40 },
+                .{ .ends = &.{ 10, 20, 21, 33, 40 }, .cps = &.{ 20, 21, 33 }, .routed = 4, .ahead = 2, .ahead_rows = 32 },
             };
             for (cases) |cs| try expectSpanMajor(b, &prompt, cs);
         }

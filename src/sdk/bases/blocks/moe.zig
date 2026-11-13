@@ -245,6 +245,25 @@ fn route(w: *const Moe.Weights, g: *Graph, logits: Array, fold: ?router_kernel.R
     }
 }
 
+/// A prompt call's predicted routes for `w`'s streamed layer from `x` (the rows normed as this MoE's input would be),
+/// read ahead into the bank while the layer's attention runs (`Routed.read_ahead_fn`, as deepseek_v41's `readAhead`). A
+/// prediction only: it never decides which experts are routed. Without a streamed bank or a read-ahead it does nothing.
+pub fn readAhead(w: *const Moe.Weights, s: ops.Stream, x: Array) !void {
+    const st = w.streamed orelse return;
+    const ra = st.routed.read_ahead_fn orelse return;
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    const r = try route(w, &g, try routerLogits(w, &g, x), null);
+    const host = try g.astype(r.inds, .uint32);
+    try mlx.check(mlx.mlx_array_eval(host));
+    const n = mlx.mlx_array_size(host);
+    const src = (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n];
+    const ids = try g.a.alloc(u16, n);
+    defer g.a.free(ids);
+    for (ids, src) |*d, v| d.* = @intCast(v);
+    try ra(st.routed.ctx, st.layer, ids).get();
+}
+
 // ── the MLP ──
 
 /// `act(gate) * up`: SiLU, clamped where the pack clamps.

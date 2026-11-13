@@ -1,6 +1,7 @@
 //! Ling 3.0's forward behind the model table: KDA layers on the slot's recurrent state and MLA layers on its KV, both
 //! through `CacheOps`, then the MoE (or the dense first layer). One slot's rows per call; a verify captures its KDA
-//! rows. `hiddenSpans` runs a whole prompt's spans layer by layer, each span's bytes `hidden`'s.
+//! rows. `hiddenSpans` runs a whole prompt's spans layer by layer, each span's bytes `hidden`'s, each routed layer's
+//! predicted experts read ahead while its attention runs.
 //! copied_from: engines/mlx/forward/layered.zig (`forwardMoeWith`, its bailing arms).
 
 const std = @import("std");
@@ -162,6 +163,10 @@ pub fn hiddenSpans(m: *trunk.Model, sp: *const Spans, token_ids: Array, out: []A
         const li: u32 = @intCast(layer_idx);
         const last = layer_idx + 1 == n_layers;
         const next_norm = if (last) m.final_norm else m.layers[layer_idx + 1].input_norm;
+        switch (lw.mlp) {
+            .moe => |*mw| try readAhead(m, mw, lw.post_norm, h, sp.rows),
+            .dense => {},
+        }
         for (0..n) |j| {
             const span_sl: slots_mod.Slots = .{ .ops = sp.slots.ops, .caches = sp.slots.caches, .positions = pos[j .. j + 1] };
             const normed = if (carried[j].ctx != null) carried[j] else try m.rmsNorm(h[j], lw.input_norm);
@@ -205,6 +210,22 @@ pub fn hiddenSpans(m: *trunk.Model, sp: *const Spans, token_ids: Array, out: []A
             o.* = c.*;
             c.* = .{ .ctx = null };
         } else o.* = try m.rmsNorm(x, m.final_norm);
+    }
+}
+
+/// The layer's predicted experts read ahead while its spans' attention runs, a bank call at a time: each routed call's
+/// layer inputs `h` under the FFN's norm through the layer's router (`moe_block.readAhead`). A prediction only: it never
+/// decides the routes.
+fn readAhead(m: *trunk.Model, mw: *const moe_block.Moe.Weights, norm: Array, h: []const Array, rows: []const u32) !void {
+    var j0: usize = 0;
+    while (j0 < rows.len) {
+        const j1 = span_plan.callEnd(rows, j0, m.prompt_calls.rows, m.prompt_calls.tail);
+        const x = try join(h[j0..j1], m.s);
+        defer _ = mlx.mlx_array_free(x);
+        const pred = try m.rmsNorm(x, norm);
+        defer _ = mlx.mlx_array_free(pred);
+        try moe_block.readAhead(mw, m.s, pred);
+        j0 = j1;
     }
 }
 
