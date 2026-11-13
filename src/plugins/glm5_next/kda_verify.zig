@@ -178,6 +178,7 @@ const config = @import("config.zig");
 const trunk = @import("trunk.zig");
 const ops = @import("../../mlx/ops.zig");
 const conv1d = @import("../../sdk/bases/blocks/conv1d.zig");
+const kda_prologue = @import("kda_prologue.zig");
 
 /// A GLM-5.3-Flash KDA layer at its served 64 heads of 128 (conv width 24576, gate width 8192), 4 conv taps, the
 /// low-rank gates. At 4 heads a verify's sigmoids met none of the bf16 roundings the formula's fast exp moves.
@@ -744,4 +745,38 @@ test "glm5_next kda verify: at the served shape the prework and the norm-gate gi
     }
     std.debug.print("kda verify sweep: the formula arm missed MLX's sigmoid at {d} prework and {d} norm-gate elements\n", .{ missed[0], missed[1] });
     try testing.expect(missed[0] + missed[1] > 0);
+}
+
+// Bar: a GLM layer's prompt with the prologue gives the chain's output, window and state bit for bit at the served
+// heads: a cold 16,356-row chunk, then a warm 31-row chunk.
+test "glm5_next kda prologue: a layer's prompt gives the chain's output, window and state, 16,356 rows cold then 31 warm" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const pro = env.override(.MLX_SERVE_KDA_PROMPT_PROLOGUE, null);
+    defer pro.restore();
+    var r: Rig = undefined;
+    try r.init(s, "glm5_next");
+    defer r.deinit();
+    const xa = try r.input(1, 16_356);
+    defer free(xa);
+    const xb = try r.input(1, 31);
+    defer free(xb);
+    var outs: [2][6]Array = @splat(@splat(.{ .ctx = null }));
+    defer for (&outs) |*o| for (o) |a| free(a);
+    for ([_][*:0]const u8{ "0", "1" }, &outs) |on, *o| {
+        env.set(.MLX_SERVE_KDA_PROMPT_PROLOGUE, on);
+        const before = kda_prologue.runs;
+        var e: kda.Entry = .{};
+        defer e.deinit();
+        o[0] = try kda.forward(&r.m, xa, &r.la, &e, 1, 16_356, true, false);
+        o[1] = newRef(e.conv_state);
+        o[2] = newRef(e.ssm_state);
+        try evalAll(o[0..3]);
+        o[3] = try kda.forward(&r.m, xb, &r.la, &e, 1, 31, true, false);
+        o[4] = newRef(e.conv_state);
+        o[5] = newRef(e.ssm_state);
+        try evalAll(o[3..6]);
+        try testing.expectEqual(if (on[0] == '1') before + 2 else before, kda_prologue.runs);
+    }
+    for (outs[0], outs[1]) |w, g| try expectBits(s, w, g, null);
 }

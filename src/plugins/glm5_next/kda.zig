@@ -21,6 +21,7 @@ const env = @import("../../env.zig");
 const sliceQkvPart = @import("../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
 const trunk = @import("trunk.zig");
 const kda_verify = @import("kda_verify.zig");
+const kda_prologue = @import("kda_prologue.zig");
 
 const Array = mlx.mlx_array;
 const Model = trunk.Model;
@@ -288,6 +289,22 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     const verify_rows = c.isGlm5() and bounded and capture and batch == 1;
     const verify_texts = verify_rows and switchOn(.MLX_SERVE_GLM_KDA_VERIFY);
     const verify_prework = verify_texts and kernel == 4;
+    // GLM's prompt rows: the prologue in one launch (MLX_SERVE_KDA_PROMPT_PROLOGUE).
+    const prologue = if (!kda_fused and prompt_rows and kernel == 4 and switchOn(.MLX_SERVE_KDA_PROMPT_PROLOGUE))
+        try kda_prologue.prologue(s, qkv, if (e.initialized) e.conv_state else null, la.conv_w, inv_scale_sq, inv_sqrt_sc, qkNormEps(m), num_k_heads, dk, num_v_heads, dv, kernel)
+    else
+        null;
+    if (prologue) |p| {
+        free(e.conv_state);
+        e.conv_state = p.window;
+        e.initialized = true;
+        _ = mlx.mlx_array_free(q_scaled);
+        _ = mlx.mlx_array_free(k_scaled);
+        _ = mlx.mlx_array_free(v_heads);
+        q_scaled = p.q;
+        k_scaled = p.k;
+        v_heads = p.v;
+    }
     if ((kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
         kernel == 4 and (e.initialized or prefill_fused)) or verify_prework)
     blk: {
@@ -351,7 +368,7 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         beta_fused = pre.beta;
     }
 
-    if (!fused_prework) {
+    if (!fused_prework and prologue == null) {
         var g = ops.Graph.init(std.heap.c_allocator, s);
         defer g.deinit();
         const conv = try conv1d.run(&g, qkv, if (e.initialized) e.conv_state else null, la.conv_w, null, batch, conv_dim, kernel, true);

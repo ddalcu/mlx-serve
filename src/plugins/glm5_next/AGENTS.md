@@ -26,6 +26,8 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
 - KDA verify rows the joined step declines (`kda_verify.zig`, GLM, one slot; MLX_SERVE_GLM_KDA_VERIFY, _EXPSIG,
   _LAZY_SEQ; the chain's bytes): the packed prework (beta too), the gate in one launch (exp(A_log) in it), the
   norm-gate; the per-row states a launch run only when a rollback reads them (it holds the old state).
+- KDA prompt prologue (`kda_prologue.zig`, MLX_SERVE_KDA_PROMPT_PROLOGUE; GLM's prompt rows): conv, SiLU, q/k norms
+  and scales and v in one launch, eight heads a threadgroup, the chain's bytes.
 - MoE (`moe.zig`, Ling's too, the MTP head's): the shared `sdk/bases/blocks/moe.zig` block; GLM's one-kernel decode
   (`glm5.moeDecode`, affine, up to 16 rows) is the block's `fused` arm, ModelOpt's per-expert up x down scale its
   `route_scale`, Sushi's EXL3 banks its `format_banks`.
@@ -74,7 +76,7 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 ## Known issues
 - With a vocab under 16384 rows the engine's served-head readout builds a 3-bit
   draft head the legacy GLM head never built (drafts only, never output): needs a `SpecFacts` fact.
-- Kernel contracts for 21 `kernels/*.metal` rows (the DSA levers' apart, below) are not registered.
+- Kernel contracts for 23 `kernels/*.metal` rows (the DSA levers' apart, below) are not registered.
 - Kernel contracts for `router_nax`'s kernels (`kernels/moe/router_nax_*`) are not registered; its byte tests hold them
   to the stock route.
 - Kernel contracts for the DSA levers' texts (`kernels/dsa_*.metal` past `dsa_nax.zig`'s) are not registered; their byte
