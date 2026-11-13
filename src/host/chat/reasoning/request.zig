@@ -580,7 +580,7 @@ test "resolveChatThinking: an explicit request value outranks the arch default, 
 
 test "resolveChatThinking: the request decides, the generation-defaults rules fill its silence or force it, then the arch" {
     const allocator = std.testing.allocator;
-    const Case = struct { body: []const u8, model_on: ?bool = null, model_effort: ?generation_settings.Effort = null, force: bool = false, arch: bool = false, want: bool, effort: ?[]const u8 = null };
+    const Case = struct { body: []const u8, global_on: ?bool = null, model_on: ?bool = null, model_effort: ?generation_settings.Effort = null, force: bool = false, arch: bool = false, want: bool, effort: ?[]const u8 = null };
     const cases = [_]Case{
         .{ .body = "{}", .arch = true, .want = true },
         .{ .body = "{}", .model_on = true, .want = true },
@@ -595,6 +595,9 @@ test "resolveChatThinking: the request decides, the generation-defaults rules fi
         .{ .body = "{}", .model_on = true, .model_effort = .none, .want = true },
         .{ .body = "{\"enable_thinking\":true}", .model_on = false, .model_effort = .medium, .want = true, .effort = "medium" },
         .{ .body = "{\"reasoning_effort\":\"low\"}", .model_on = false, .model_effort = .medium, .want = true, .effort = "low" },
+        // The more specific layer decides: a model's effort rule beats a global thinking rule.
+        .{ .body = "{}", .global_on = false, .model_effort = .high, .want = true, .effort = "high" },
+        .{ .body = "{}", .global_on = false, .arch = true, .want = false },
         // A forced rule replaces the request's switches, effort word included.
         .{ .body = "{\"enable_thinking\":false,\"reasoning_effort\":\"none\"}", .model_on = true, .force = true, .want = true },
         .{ .body = "{\"enable_thinking\":true,\"reasoning_effort\":\"high\"}", .model_on = false, .force = true, .arch = true, .want = false },
@@ -607,10 +610,12 @@ test "resolveChatThinking: the request decides, the generation-defaults rules fi
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        var gen = generation_settings.Profile{};
-        if (case.model_on) |on| gen.set(.enable_thinking, .{ .boolean = on }, case.force);
-        if (case.model_effort) |e| gen.set(.reasoning_effort, .{ .effort = e }, case.force);
-        const got = resolveChatThinking(parsed.value.object, gen, case.arch, -1);
+        var global = generation_settings.Profile{};
+        if (case.global_on) |on| global.set(.enable_thinking, .{ .boolean = on }, false);
+        var model = generation_settings.Profile{};
+        if (case.model_on) |on| model.set(.enable_thinking, .{ .boolean = on }, case.force);
+        if (case.model_effort) |e| model.set(.reasoning_effort, .{ .effort = e }, case.force);
+        const got = resolveChatThinking(parsed.value.object, .overlay(global, model), case.arch, -1);
         try std.testing.expectEqual(case.want, got.enable);
         if (case.effort) |w| try std.testing.expectEqualStrings(w, got.effort.?.effort.?) else try std.testing.expect(got.effort == null);
     }

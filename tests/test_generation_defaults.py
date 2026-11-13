@@ -155,6 +155,14 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
             start = len(log_path.read_text())
             post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message, 'enable_thinking': True})
             check('thinking=true' in log_path.read_text()[start:], 'client enable_thinking still beats the thinking-off default')
+            write(global_file, {'temperature': {'value': 0}, 'max_tokens': {'value': 8}, 'enable_thinking': {'value': False}})
+            write(model_file, {str(model): {'generation_defaults': {'reasoning_effort': {'value': 'high'}}}})
+            for route, body in silent:
+                start = len(log_path.read_text())
+                post(route, body)
+                lines = [line for line in log_path.read_text()[start:].splitlines() if f'POST {route} (' in line]
+                check(bool(lines) and all('thinking=true' in line for line in lines),
+                      f'{route}: model effort high beats an inherited thinking-off default')
             write(model_file, {})
             write(global_file, {
                 'temperature': {'value': 0.25},
