@@ -148,6 +148,8 @@ run_unit() {
     # boot. Same idiom as bench.sh's LADDER_ARGS.
     local -a spec_arr=()
     [[ -n "$spec" ]] && eval "spec_arr=($spec)"
+    # Else a build's first pass on a model carries its one-time kernel compiles. Older binaries refuse the flag.
+    if [[ "$("$bin" --help 2>&1)" == *--warmup-full* ]]; then spec_arr+=(--warmup-full); fi
     "$bin" --serve --model "$path" --port "$PORT" "${spec_arr[@]+"${spec_arr[@]}"}" >"$slog" 2>&1 &
     local pid=$!
 
