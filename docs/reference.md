@@ -695,6 +695,7 @@ The controls are shared with the prefix cache:
 | `--prefix-cache-mem <size>` | Caps retained RAM state, including detached export sources. |
 | `--no-prefix-cache-ram` | Disables module history even with disk configured; module SSD-only retention is unsupported. |
 | `--shutdown-persist-secs <n>` | Gives SIGTERM persistence a deadline (default 45 seconds); zero disables the shutdown flush. |
+| `MLX_SERVE_PREFIX_CACHE_PRESSURE=0` | Hot-cache budgets are re-clamped only when a model loads or unloads. On by default: when the macOS memory-pressure level reaches warning (held 5 s) or critical (two readings), every budget is clamped again against the memory nobody holds, as after a load, and entries past it are evicted; once the level has stayed lower for 30 s the budgets may rise again. The level is read at most once a second. A budget sized on the static ceiling (qwen4_exp) does not move. |
 
 A disk restore requires an exact boundary strictly inside the new prompt, matching
 IDs, tools, quant settings, covered media, and a recomputed prefix key. The engine

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const crt = @import("crt.zig");
+const env = @import("../../env.zig");
 const os_mutex = @import("os_mutex.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
@@ -269,6 +270,23 @@ pub fn getLoadRoomBytes() u64 {
     const avail = getLoadAvailableMemBytes();
     if (comptime builtin.os.tag == .macos) return avail;
     return avail -| osReserveBytes(getTotalMemBytes(), mlx.weightsInDeviceMemory());
+}
+
+pub fn parsePressureOverride(raw: []const u8) ?u32 {
+    const s = std.mem.trim(u8, raw, " \t\r\n");
+    if (std.mem.eql(u8, s, "0") or std.mem.eql(u8, s, "none")) return 0;
+    if (std.mem.eql(u8, s, "1") or std.mem.eql(u8, s, "normal")) return 1;
+    if (std.mem.eql(u8, s, "2") or std.mem.eql(u8, s, "warn") or std.mem.eql(u8, s, "warning")) return 2;
+    if (std.mem.eql(u8, s, "4") or std.mem.eql(u8, s, "crit") or std.mem.eql(u8, s, "critical")) return 4;
+    return null;
+}
+
+pub fn pressureOverrideLevel() ?u32 {
+    const path = env.span(.MLX_SERVE_PRESSURE_OVERRIDE) orelse return null;
+    if (path.len == 0) return null;
+    var buf: [64]u8 = undefined;
+    const n = readProcFile(path, &buf) orelse return 0;
+    return parsePressureOverride(buf[0..n]) orelse 0;
 }
 
 /// The kernel's memory-pressure level: 1 normal, 2 warning, 4 critical; 0 where the OS has no such reading.
@@ -740,4 +758,53 @@ test "memoryPressureLevel reads the kernel's level on macOS" {
     if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
     const level = memoryPressureLevel();
     try std.testing.expect(level == 1 or level == 2 or level == 4);
+}
+
+test "prefix cache pressure: override file stays inert until set, then supplies the level" {
+    const t = std.testing;
+    const unset_ov = env.override(.MLX_SERVE_PRESSURE_OVERRIDE, null);
+    defer unset_ov.restore();
+    try t.expectEqual(@as(?u32, null), pressureOverrideLevel());
+
+    const empty_ov = env.override(.MLX_SERVE_PRESSURE_OVERRIDE, "");
+    defer empty_ov.restore();
+    try t.expectEqual(@as(?u32, null), pressureOverrideLevel());
+
+    try t.expectEqual(@as(?u32, 0), parsePressureOverride("none\n"));
+    try t.expectEqual(@as(?u32, 1), parsePressureOverride("1\n"));
+    try t.expectEqual(@as(?u32, 1), parsePressureOverride(" normal "));
+    try t.expectEqual(@as(?u32, 2), parsePressureOverride("2"));
+    try t.expectEqual(@as(?u32, 2), parsePressureOverride("warn\n"));
+    try t.expectEqual(@as(?u32, 2), parsePressureOverride("warning"));
+    try t.expectEqual(@as(?u32, 4), parsePressureOverride("4"));
+    try t.expectEqual(@as(?u32, 4), parsePressureOverride("crit"));
+    try t.expectEqual(@as(?u32, 4), parsePressureOverride("critical\r\n"));
+    try t.expectEqual(@as(?u32, null), parsePressureOverride("bogus"));
+
+    var tmp = t.tmpDir(.{});
+    defer tmp.cleanup();
+    var base_buf: [512]u8 = undefined;
+    const base = base_buf[0..try tmp.dir.realPath(t.io, &base_buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/pressure.level", .{base}, 0);
+
+    const file_ov = env.override(.MLX_SERVE_PRESSURE_OVERRIDE, path.ptr);
+    defer file_ov.restore();
+    try t.expectEqual(@as(?u32, 0), pressureOverrideLevel());
+    if (comptime builtin.os.tag.isDarwin()) {
+        const real = memoryPressureLevel();
+        try t.expect(real == 1 or real == 2 or real == 4);
+    }
+
+    inline for (.{ .{ "none\n", @as(u32, 0) }, .{ "normal\n", @as(u32, 1) }, .{ "warning\n", @as(u32, 2) }, .{ "critical\n", @as(u32, 4) } }) |case| {
+        const fd = crt.openWrite(path.ptr, true);
+        try t.expect(fd >= 0);
+        try t.expectEqual(@as(isize, @intCast(case[0].len)), crt.write(fd, case[0]));
+        crt.close(fd);
+        try t.expectEqual(@as(?u32, case[1]), pressureOverrideLevel());
+        if (comptime builtin.os.tag.isDarwin()) {
+            const real = memoryPressureLevel();
+            try t.expect(real == 1 or real == 2 or real == 4);
+        }
+    }
 }
