@@ -7,6 +7,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const log = @import("../../sdk/util/log.zig");
+const decode_fused = @import("../../sdk/blocks/gdn/decode_fused.zig");
 const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
 const kda = @import("kda.zig");
 
@@ -175,10 +176,13 @@ const testing = std.testing;
 const env = @import("../../env.zig");
 const config = @import("config.zig");
 const trunk = @import("trunk.zig");
+const ops = @import("../../mlx/ops.zig");
+const conv1d = @import("../../sdk/bases/blocks/conv1d.zig");
 
-/// A GLM-5.3-Flash KDA layer at 4 heads of 128 (the texts take any head count), 4 conv taps, the low-rank gates.
+/// A GLM-5.3-Flash KDA layer at its served 64 heads of 128 (conv width 24576, gate width 8192), 4 conv taps, the
+/// low-rank gates. At 4 heads a verify's sigmoids met none of the bf16 roundings the formula's fast exp moves.
 const t_hidden: c_int = 512;
-const t_heads: c_int = 4;
+const t_heads: c_int = 64;
 const t_head: c_int = 128;
 const t_rank: c_int = 128;
 const t_prompt: c_int = 17;
@@ -565,4 +569,179 @@ test "glm5_next kda verify: after each partial accept's rollback the lazy per-ro
             }
         }
     }
+}
+
+/// `n` values: the finite bf16 patterns (65,280: exponent not all ones) in order, from `from`, cycling.
+fn finiteBf16(allocator: std.mem.Allocator, n: usize, from: usize) ![]f32 {
+    const buf = try allocator.alloc(f32, n);
+    var p: u32 = 0;
+    var k: usize = 0;
+    var seen: usize = 0;
+    while (k < n) : (p = (p + 1) & 0xffff) {
+        if ((p >> 7) & 0xff == 0xff) continue;
+        if (seen >= from) {
+            buf[k] = @bitCast(p << 16);
+            k += 1;
+        }
+        seen += 1;
+    }
+    return buf;
+}
+
+/// `vals` as a bf16 array of `shape` (each an exact bf16, so the cast relabels).
+fn bf16Of(s: mlx.mlx_stream, vals: []const f32, shape: []const c_int) !Array {
+    const v32 = mlx.mlx_array_new_data(vals.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(v32);
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, v32, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+/// Elements of `want` and `got` (same shape and dtype, both contiguous after the copy) whose bits differ.
+fn bitsApart(s: mlx.mlx_stream, want: Array, got: Array) !usize {
+    var parts: [2]Array = .{ .{ .ctx = null }, .{ .ctx = null } };
+    defer for (parts) |a| free(a);
+    for ([_]Array{ want, got }, &parts) |a, *p| {
+        p.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_contiguous(p, a, false, s));
+    }
+    try evalAll(&parts);
+    const wb = try bytesOf(parts[0]);
+    const gb = try bytesOf(parts[1]);
+    try testing.expectEqual(wb.len, gb.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < wb.len) : (i += 2) {
+        if (!std.mem.eql(u8, wb[i .. i + 2], gb[i .. i + 2])) n += 1;
+    }
+    return n;
+}
+
+// Bar: at the served shape (64 heads, conv width 24576, 3 rows) a verify's launches give MLX's sigmoid op's bytes at
+// every finite bf16 pattern (the conv's SiLU, beta, the norm-gate's sigmoid(z)): the chain's. The planted control is
+// the formula arm the verify ran before (its bare `metal::exp` the fast exp in a runtime-compiled kernel): it must
+// miss some, or the sweep sees nothing.
+test "glm5_next kda verify: at the served shape the prework and the norm-gate give MLX's sigmoid at every finite bf16 pattern; the formula arm misses some" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const hk: c_int = 64;
+    const hv: c_int = 64;
+    const d: c_int = 128;
+    const rows: c_int = 3;
+    const c_dim: c_int = (2 * hk + hv) * d;
+    const n_finite: usize = 65_280;
+    var seed: u64 = 20261113;
+    // The conv's newest tap alone, the window zeros: each conv output is its qkv value, so the 73,728 SiLU inputs
+    // are every finite pattern.
+    const w_buf = try a.alloc(f32, @intCast(c_dim * 4));
+    defer a.free(w_buf);
+    for (w_buf, 0..) |*v, i| v.* = if (i % 4 == 3) 1.0 else 0.0;
+    const conv_w = try bf16Of(s, w_buf, &.{ c_dim, 4, 1 });
+    defer free(conv_w);
+    const q_vals = try finiteBf16(a, @intCast(rows * c_dim), 0);
+    defer a.free(q_vals);
+    const qkv = try bf16Of(s, q_vals, &.{ 1, rows, c_dim });
+    defer free(qkv);
+    var zero = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zero);
+    try mlx.check(mlx.mlx_zeros(&zero, &[_]c_int{ 1, 3, c_dim }, 3, .bfloat16, s));
+    var qs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qs);
+    var ks = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ks);
+    const qs32 = mlx.mlx_array_new_float(1.0 / 128.0);
+    defer _ = mlx.mlx_array_free(qs32);
+    const ks32 = mlx.mlx_array_new_float(@sqrt(1.0 / 128.0));
+    defer _ = mlx.mlx_array_free(ks32);
+    try mlx.check(mlx.mlx_astype(&qs, qs32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&ks, ks32, .bfloat16, s));
+    const eps: f32 = 1e-6 / 128.0;
+
+    // The chain kda.forward runs for these rows: conv1d.run with its SiLU, q/k rms_norm over ones then the scale.
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    const conv = try conv1d.run(&g, qkv, zero, conv_w, null, 1, c_dim, 4, true);
+    const kd = hk * d;
+    var ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{d}, 1, .bfloat16, s));
+    var ref: [3]Array = @splat(.{ .ctx = null });
+    defer for (ref) |x| free(x);
+    for ([_][2]c_int{ .{ 0, kd }, .{ kd, 2 * kd } }, 0..) |span, i| {
+        const part = try g.reshape(try g.slice(conv.y, &.{ 0, 0, span[0] }, &.{ 1, rows, span[1] }), &.{ 1, rows, hk, d });
+        var nrm = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(nrm);
+        try mlx.check(mlx.mlx_fast_rms_norm(&nrm, part, ones, eps, s));
+        ref[i] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&ref[i], nrm, if (i == 0) qs else ks, s));
+    }
+    ref[2] = g.escape(try g.reshape(try g.slice(conv.y, &.{ 0, 0, 2 * kd }, &.{ 1, rows, c_dim }), &.{ 1, rows, hv, d }));
+
+    // beta: every finite pattern of b, 192 a launch (340 launches), against mlx_sigmoid; q, k and v at the first.
+    var missed: [2]usize = .{ 0, 0 };
+    var from: usize = 0;
+    var first = true;
+    while (from < n_finite) : (from += @intCast(rows * hv)) {
+        const b_vals = try finiteBf16(a, @intCast(rows * hv), from);
+        defer a.free(b_vals);
+        const b = try bf16Of(s, b_vals, &.{ 1, rows, hv });
+        defer free(b);
+        var beta_ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(beta_ref);
+        try mlx.check(mlx.mlx_sigmoid(&beta_ref, b, s));
+        const args: decode_fused.GdnPreworkArgs = .{ .qkv = qkv, .qkv_off = 0, .qkv_stride = c_dim, .b = b, .b_off = 0, .b_stride = hv, .a = b, .a_off = 0, .a_stride = hv, .A_log = b, .dt_bias = b, .conv_state = zero, .conv_w = conv_w, .q_scale = qs, .k_scale = ks, .qk_eps = eps, .hk = hk, .hv = hv, .dk = d, .dv = d, .seq = rows, .batch = 1, .gate = false, .table = true };
+        var formula_args = args;
+        formula_args.table = false;
+        // the verify's prework
+        const p = (try decode_fused.gdnPreworkFused(s, args)) orelse return error.TestPreworkDeclined;
+        defer inline for (.{ p.q, p.k, p.v, p.conv_state, p.g, p.beta }) |x| free(x);
+        try testing.expectEqual(@as(usize, 0), try bitsApart(s, beta_ref, p.beta));
+        if (first) for ([_]Array{ p.q, p.k, p.v }, ref) |x, want| try testing.expectEqual(@as(usize, 0), try bitsApart(s, want, x));
+        const f = (try decode_fused.gdnPreworkFused(s, formula_args)) orelse return error.TestPreworkDeclined;
+        defer inline for (.{ f.q, f.k, f.v, f.conv_state, f.g, f.beta }) |x| free(x);
+        missed[0] += try bitsApart(s, beta_ref, f.beta);
+        if (first) missed[0] += try bitsApart(s, ref[2], f.v);
+        first = false;
+    }
+
+    // The norm-gate: every finite pattern of z, 24,576 a launch, against rms_norm(y) * sigmoid(z).
+    const norm_w = try uniform(s, &seed, &.{d}, .bfloat16, 0.5, 1.5);
+    defer free(norm_w);
+    const eps_arr = mlx.mlx_array_new_float(1e-5);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    from = 0;
+    while (from < n_finite) : (from += @intCast(rows * hv * d)) {
+        const y = try normal(s, &seed, &.{ 1, rows, hv, d }, .bfloat16, 1.0);
+        defer free(y);
+        const z_vals = try finiteBf16(a, @intCast(rows * hv * d), from);
+        defer a.free(z_vals);
+        const z = try bf16Of(s, z_vals, &.{ 1, rows, hv * d });
+        defer free(z);
+        var nrm = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(nrm);
+        try mlx.check(mlx.mlx_fast_rms_norm(&nrm, y, norm_w, 1e-5, s));
+        var zh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zh);
+        try mlx.check(mlx.mlx_reshape(&zh, z, &[_]c_int{ 1, rows, hv, d }, 4, s));
+        var sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sig);
+        try mlx.check(mlx.mlx_sigmoid(&sig, zh, s));
+        var prod = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(prod);
+        try mlx.check(mlx.mlx_multiply(&prod, nrm, sig, s));
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_reshape(&want, prod, &[_]c_int{ 1, rows, hv * d }, 3, s));
+        const got = (try decode_fused.gdnNormGateChain(s, y, z, 0, hv * d, norm_w, eps_arr, false, hv, d, 1, rows)) orelse return error.TestNormGateDeclined;
+        defer free(got);
+        try testing.expectEqual(@as(usize, 0), try bitsApart(s, want, got));
+        const formula = (try decode_fused.gdnNormGateFused(s, y, z, 0, hv * d, norm_w, eps_arr, false, hv, d, 1, rows)) orelse return error.TestNormGateDeclined;
+        defer free(formula);
+        missed[1] += try bitsApart(s, want, formula);
+    }
+    std.debug.print("kda verify sweep: the formula arm missed MLX's sigmoid at {d} prework and {d} norm-gate elements\n", .{ missed[0], missed[1] });
+    try testing.expect(missed[0] + missed[1] > 0);
 }

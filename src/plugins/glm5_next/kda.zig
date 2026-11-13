@@ -324,6 +324,8 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
             .batch = batch,
             .gate = false,
             .g_dtype = gdn_decode.gateDtype(mlx.mlx_array_dtype(qkv), m.ssmStateDtype()),
+            // A verify is held to the composed chain: MLX's sigmoid op, not the formula's fast exp.
+            .table = verify_prework,
         }) catch null) orelse break :blk;
         if (verify_prework) {
             free(e.spec_conv_input);
@@ -499,6 +501,8 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         if (m.kda.eps.ctx == null) m.kda.eps = mlx.mlx_array_new_float(c.rms_norm_eps);
         const fused = if (prompt_normgate)
             try decode_fused.gdnNormGatePrompt(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, seq_len)
+        else if (verify_texts)
+            try decode_fused.gdnNormGateChain(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)
         else
             try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len);
         if (verify_texts) {
