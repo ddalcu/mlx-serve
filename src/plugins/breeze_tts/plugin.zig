@@ -249,7 +249,7 @@ const fx_cb_vocab: u64 = 2051; // codes + pad + eos (Mimi's real ladder)
 const fx_cb_stride: u64 = fx_cb_vocab;
 const fx_codebooks: u64 = 16;
 const fx_cb_lm: u64 = fx_cb_vocab + 1;
-const fx_cb_eos: u64 = fx_cb_vocab - 1;
+const fx_cb_eos: u64 = fx_cb_lm - 1; // the lm_head's last row, the reference's eos
 
 /// A generated toy Breeze-TTS-2 with random weights: a 64-row text-encoder table, 2/4/2
 /// transformer layers at 64/32-wide hiddens, a byte-level tokenizer, and the full-size Mimi
@@ -322,16 +322,23 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     }
     // The depth head reads rows [o][v] of a flat [15, d_hidden, cb_vocab] table.
     try t.rand("depth_decoder.codebooks_head.weight", .{}, &.{ fx_codebooks - 1, fx_dh, fx_cb_vocab }, .BF16, 0.02);
-    // Noise everywhere, plus a tall negative column on the EOS row: frame 0 cannot sample EOS
-    // (every run synthesizes at least one frame); a later EOS is as deterministic as anything else.
+    // Noise everywhere, plus a guard on the EOS row: frame 0 cannot sample
+    // EOS (every run synthesizes at least one frame); a later EOS is as
+    // deterministic as anything else.
     {
         const v = try a.alloc(f32, fx_cb_lm * fx_bh);
         var prng = std.Random.DefaultPrng.init(99);
         for (v) |*x| x.* = prng.random().floatNorm(f32) * 0.02;
-        // EOS must lose frame 0 for THIS fixture's hidden state (whose sign at dim 0 is what the
-        // run deterministically produces): one tall negative column, so logit_eos = -1e6·h[0].
-        @memset(v[fx_cb_eos * fx_bh ..], 0);
-        v[fx_cb_eos * fx_bh] = -1e6;
+
+        // EOS must LOSE frame 0 (the run synthesizes ≥1 frame) but stay
+        // REACHABLE later — an unreachable EOS is a generation that runs to
+        // the cap, exactly the #1172 bug (the old guard zeroed the row,
+        // making logit_eos ≡ 0, never the argmax). Keep the row's noise and
+        // zero ONE column: frame 0's hidden is a fixed f32 dot product with
+        // h[0] = -1.22 ≠ 0, so logit_eos = Σ_{i>0} w_i·h_i loses frame 0's
+        // argmax to a noise row; a later hidden whose dot product clears the
+        // noise band wins the draw and EOS fires.
+        v[fx_cb_eos * fx_bh] = 0;
         try t.values("lm_head.weight", .{}, &.{ fx_cb_lm, fx_bh }, .BF16, v);
     }
 

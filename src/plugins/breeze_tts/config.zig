@@ -86,8 +86,10 @@ pub const Config = struct {
 
     // the position window both decoders share
     max_seq: u32 = 2048,
-    /// Runaway frame ceiling (generation max_new_tokens is a sampling default,
-    /// not a model limit; 1500 matches the reference bridge at 12.5 Hz).
+    /// Runaway frame ceiling: a last-resort bound on a request, NOT the end
+    /// of a turn — the codebook EOS row is. Reaching it means the model ran
+    /// past its stop (generation max_new_tokens is a sampling default, not a
+    /// model limit; 1500 matches the reference bridge at 12.5 Hz).
     max_frames: u32 = 1500,
 
     pub inline fn numCodebooks(self: *const Config) usize {
@@ -102,8 +104,11 @@ pub const Config = struct {
     pub inline fn cbStride(self: *const Config) u32 {
         return self.audio_vocab_size;
     }
+    /// The lm_head's EOS row: the row PAST the vocab (`eos_token =
+    /// vocab_size` in the reference), i.e. the last row of `[cbVocab + 1]`.
+    /// NOT `audio_vocab_size - 1` — that row is the PAD token.
     pub inline fn cbEos(self: *const Config) u32 {
-        return self.audio_vocab_size - 1;
+        return self.cbLm() - 1;
     }
 
     /// The frame loop is 16 codebooks wide; every vocab size the rows carry
@@ -423,6 +428,9 @@ test "parseConfig: the published pack's config.json reads as-is" {
     try testing.expectEqual(@as(u32, 262146), cfg.speaker_base);
     try testing.expectEqual(@as(u32, 2051), cfg.cbVocab());
     try testing.expectEqual(@as(u32, 2052), cfg.cbLm());
+    // The stop is the lm_head's LAST row; audio_vocab_size-1 is the PAD row
+    // and comparing it never stopped a generation (field report, #1172).
+    try testing.expectEqual(@as(u32, 2051), cfg.cbEos());
     try testing.expect(cfg.supportedLayout());
 }
 

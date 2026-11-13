@@ -43,6 +43,11 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
 - Unknown body fields are refused by name (`'language' is not supported...`), never ignored. Host-
   consumed keys (`model`, `stream`, `response_format`, `speed`) pass through; `language` is refused
   because Breeze detects it itself.
+- The turn's stop is `Config.cbEos()` — the lm_head's LAST row (`audio_vocab_size`, the
+  reference's `eos_token = vocab_size`). `audio_vocab_size - 1` is the PAD row: a stop
+  compared there can never fire and every request runs to the frame cap (field report: 30 s
+  of babble per line). The toy fixture's frame-0 EOS guard must leave the row otherwise
+  noise-filled — a zeroed row is an unreachable EOS, the same failure mode in fixture form.
 - `billRequest` prices the frame loop's host rows (stream + span + depth span + codec chain) from
   the pack's config and the body's frame budget, with margin; the engine refuses a request past
   the window at step time, this keeps admission honest.
