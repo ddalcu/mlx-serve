@@ -136,7 +136,8 @@ pub const Fit = struct {
     decode_room: u64,
     /// Growth of the box's memory outside the server between the load and the peak (a calibration's allowance).
     inuse_margin: u64 = 1 << 30,
-    /// The bills' growth from the calibration's cell to the server's context limit (`LoadCtx.streamGrowth`).
+    /// The bills' growth from the calibration's evidence (`Calibration.evidence`) to the server's context limit
+    /// (`LoadCtx.streamGrowth`).
     grow_prompt: u64 = 0,
     grow_decode: u64 = 0,
     calibration: ?Calibration = null,
@@ -144,10 +145,12 @@ pub const Fit = struct {
 
 /// A pack's measured fit on one ceiling (`bank-fit.json`): each phase's base is the evidence run's peak of the box's
 /// non-file memory less the bank's bytes there, at the rooms' cell (a 16K + 1K request); `rest` the box's non-file memory
-/// outside the server at that run's bank open (`Reading`).
+/// outside the server at that run's bank open (`Reading`). `evidence` is the tokens that run's request held (prompt +
+/// reply): its bases already hold their KV, so the host's growth starts there (the cell when the file names none).
 pub const Calibration = struct {
     ceiling: u64,
     cell: u64,
+    evidence: u64,
     base_prompt: u64,
     base_decode: u64,
     rest: u64,
@@ -179,7 +182,7 @@ pub const bank_fit_format_v1 = "mlx-serve-bank-fit-v1";
 /// ran the rooms' cell (`cell`, the bills' growth past it is the host's); a named reason otherwise (logged by the caller;
 /// the bills stand).
 pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64) error{ BankFitInvalid, BankFitFormat, BankFitV1Rest, BankFitOtherCeiling, BankFitOtherCell }!Calibration {
-    const F = struct { format: []const u8 = "", ceiling_bytes: u64 = 0, cell_tokens: u64 = 0, base_prompt_bytes: u64 = 0, base_decode_bytes: u64 = 0, rest_bytes: u64 = 0 };
+    const F = struct { format: []const u8 = "", ceiling_bytes: u64 = 0, cell_tokens: u64 = 0, evidence_tokens: u64 = 0, base_prompt_bytes: u64 = 0, base_decode_bytes: u64 = 0, rest_bytes: u64 = 0 };
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const f = std.json.parseFromSliceLeaky(F, fba.allocator(), json, .{ .ignore_unknown_fields = true }) catch return error.BankFitInvalid;
@@ -188,7 +191,7 @@ pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64) error{ BankFitInv
     if (f.ceiling_bytes == 0 or f.cell_tokens == 0 or f.base_prompt_bytes == 0 or f.base_decode_bytes == 0) return error.BankFitInvalid;
     if (ceiling == 0 or f.ceiling_bytes != ceiling) return error.BankFitOtherCeiling;
     if (f.cell_tokens != cell) return error.BankFitOtherCell;
-    return .{ .ceiling = f.ceiling_bytes, .cell = f.cell_tokens, .base_prompt = f.base_prompt_bytes, .base_decode = f.base_decode_bytes, .rest = f.rest_bytes };
+    return .{ .ceiling = f.ceiling_bytes, .cell = f.cell_tokens, .evidence = if (f.evidence_tokens > 0) f.evidence_tokens else f.cell_tokens, .base_prompt = f.base_prompt_bytes, .base_decode = f.base_decode_bytes, .rest = f.rest_bytes };
 }
 
 /// The memory in use now and the server's footprint (`fitBudget`'s reading).
@@ -476,7 +479,7 @@ test "outside model: a fit's bills-only budget is each phase's room past the mem
 }
 
 test "outside model: a calibrated fit gives each phase the ceiling less its base and growth, the evidence's rest back and what is outside the server now" {
-    const cal: Calibration = .{ .ceiling = 110 << 30, .cell = 17_408, .base_prompt = 40 << 30, .base_decode = 28 << 30, .rest = 14 << 30 };
+    const cal: Calibration = .{ .ceiling = 110 << 30, .cell = 17_408, .evidence = 17_408, .base_prompt = 40 << 30, .base_decode = 28 << 30, .rest = 14 << 30 };
     // 9 GiB outside the server now, a 1 GiB margin: 110 + 14 - 40 - 10 = 74 GiB, and 86 GiB for decode.
     const r: Reading = .{ .in_use = 60 << 30, .footprint = 51 << 30 };
     try testing.expectEqual(quant_abi.BankBudget{ .prompt = 74 << 30, .decode = 86 << 30 }, fitBudget(.{ .prompt_room = 1, .decode_room = 1, .calibration = cal }, r));
@@ -489,7 +492,7 @@ test "outside model: a calibrated fit gives each phase the ceiling less its base
 test "outside model: a calibrated budget reads the same with more file pages on the box (the non-file reading)" {
     if (!@import("builtin").os.tag.isDarwin()) return error.SkipZigTest;
     const GB: u64 = 1 << 30;
-    const cal: Calibration = .{ .ceiling = 110 * GB, .cell = 17_408, .base_prompt = 40 * GB, .base_decode = 28 * GB, .rest = 12 * GB };
+    const cal: Calibration = .{ .ceiling = 110 * GB, .cell = 17_408, .evidence = 17_408, .base_prompt = 40 * GB, .base_decode = 28 * GB, .rest = 12 * GB };
     const fit: Fit = .{ .prompt_room = 1, .decode_room = 1, .calibration = cal };
     const foot: u64 = 19 * GB;
     defer system.reading_override = null;
@@ -508,6 +511,10 @@ test "outside model: bank-fit.json applies on its own ceiling and cell; another 
     const c = try parseBankFit(good, 118111600640, 17_408);
     try testing.expectEqual(@as(u64, 40000000000), c.base_prompt);
     try testing.expectEqual(@as(u64, 15000000000), c.rest);
+    // No evidence_tokens: the growth starts at the cell; named: at the evidence request's prompt + reply.
+    try testing.expectEqual(@as(u64, 17_408), c.evidence);
+    const named = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"evidence_tokens\":18380,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
+    try testing.expectEqual(@as(u64, 18_380), (try parseBankFit(named, 118111600640, 17_408)).evidence);
     try testing.expectError(error.BankFitOtherCeiling, parseBankFit(good, 112 << 30, 17_408));
     try testing.expectError(error.BankFitOtherCeiling, parseBankFit(good, 0, 17_408));
     try testing.expectError(error.BankFitOtherCell, parseBankFit(good, 118111600640, 33_792));

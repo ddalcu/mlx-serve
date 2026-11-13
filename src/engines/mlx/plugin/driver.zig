@@ -38,6 +38,7 @@ const hadamard = @import("../../../sdk/quant/hadamard/format.zig");
 const intree = @import("intree.zig");
 const distributed = @import("../cluster/distributed.zig");
 const weights_load = @import("../../../sdk/weights/load.zig");
+const outside_model = @import("../../../sdk/quant/outside_model.zig");
 const group = @import("../ssm/group.zig");
 const entry_mod = @import("../ssm/entry.zig");
 
@@ -248,21 +249,36 @@ fn streamPromptPeak(config: *const ModelConfig, lo: u64, hi: u64) ?u64 {
     return best;
 }
 
-/// Each phase's bill growth from the rooms' cell to the context limit `limit` (`LoadCtx.stream_grow_*`; the load passes
-/// the server's, `getEffectiveContextLength`): the largest prompt up to the limit less one reply token, against the
-/// cell, each at the chunk the engine runs for it. The decode growth is a built-in GLM's (its decode room's bill).
-fn streamGrowAt(config: *const ModelConfig, limit: u64) struct { prompt: u64, decode: u64 } {
-    const cell = abi.stream_room_cell;
-    if (limit <= cell) return .{ .prompt = 0, .decode = 0 };
-    const p0 = streamPromptNeed(config, cell, promptChunkAt(config, cell)) orelse return .{ .prompt = 0, .decode = 0 };
-    const p1 = streamPromptPeak(config, cell, limit - 1) orelse return .{ .prompt = 0, .decode = 0 };
+/// Each phase's bill growth from `from` tokens to the context limit `limit` (`LoadCtx.stream_grow_*`; the load passes
+/// the server's, `getEffectiveContextLength`, and `growthStart`'s): the largest prompt up to the limit less one reply
+/// token, against the request the bank was fitted at, each at the chunk the engine runs for it. The decode growth is a
+/// built-in GLM's (its decode room's bill).
+fn streamGrowAt(config: *const ModelConfig, limit: u64, from: u64) struct { prompt: u64, decode: u64 } {
+    if (limit <= from) return .{ .prompt = 0, .decode = 0 };
+    const p0 = streamPromptNeed(config, from, promptChunkAt(config, from)) orelse return .{ .prompt = 0, .decode = 0 };
+    const p1 = streamPromptPeak(config, from, limit - 1) orelse return .{ .prompt = 0, .decode = 0 };
     const glm = @import("../admission/glm5_bill.zig");
     const wide = @import("../generate.zig").WIDE_PREFILL_CHUNK;
     const decode = if (decodeBilled(config))
-        glm.glm5DecodeMemoryNeeded(config, limit - 1, 1, 16, wide) -| glm.glm5DecodeMemoryNeeded(config, cell, 1, 16, wide)
+        glm.glm5DecodeMemoryNeeded(config, limit - 1, 1, 16, wide) -| glm.glm5DecodeMemoryNeeded(config, from, 1, 16, wide)
     else
         0;
     return .{ .prompt = p1 -| p0, .decode = decode };
+}
+
+/// Where the bills' growth starts: the tokens the pack's calibration (`bank-fit.json`, its text or null) measured its
+/// bases at when it applies at `ceiling` (`outside_model.parseBankFit`, as the plugin reads it), else the rooms' cell.
+fn growthStartOf(text: ?[]const u8, ceiling: u64) u64 {
+    const cell = abi.stream_room_cell;
+    const c = outside_model.parseBankFit(text orelse return cell, ceiling, cell) catch return cell;
+    return c.evidence;
+}
+
+fn growthStart(dir: *const abi.PackDir, ceiling: u64) u64 {
+    var buf: [4096]u8 = undefined;
+    var why: abi.Verdict = .{};
+    const text = if (dir.has(outside_model.bank_fit_file)) dir.readFile(outside_model.bank_fit_file, &buf, &why) else null;
+    return growthStartOf(text, ceiling);
 }
 
 fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
@@ -409,12 +425,27 @@ test "driver: a streamed built-in GLM's bills grow from the rooms' cell to its c
     const chunk = promptChunkAt(&cfg, abi.stream_room_cell);
     const wide = @import("../generate.zig").WIDE_PREFILL_CHUNK;
     // The limit is the caller's: the server's own (`getEffectiveContextLength`) reads process state other tests set.
-    const g = streamGrowAt(&cfg, 32_768);
+    const g = streamGrowAt(&cfg, 32_768, abi.stream_room_cell);
     try std.testing.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, chunk, .{}), g.prompt);
     try std.testing.expectEqual(glm.glm5DecodeMemoryNeeded(&cfg, 32_767, 1, 16, wide) - glm.glm5DecodeMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, wide), g.decode);
     try std.testing.expect(g.prompt > 0 and g.decode > 0);
-    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, 16_384).prompt);
-    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, abi.stream_room_cell).decode);
+    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, 16_384, abi.stream_room_cell).prompt);
+    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, abi.stream_room_cell, abi.stream_room_cell).decode);
+    // Measured from a longer evidence request: its bases hold those tokens' KV, so the growth starts there.
+    const ev = streamGrowAt(&cfg, 32_768, 18_380);
+    try std.testing.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, 18_380, 1, 16, chunk, .{}), ev.prompt);
+    try std.testing.expectEqual(glm.glm5DecodeMemoryNeeded(&cfg, 32_767, 1, 16, wide) - glm.glm5DecodeMemoryNeeded(&cfg, 18_380, 1, 16, wide), ev.decode);
+    try std.testing.expect(ev.prompt < g.prompt and ev.decode < g.decode);
+}
+
+test "driver: the bills' growth starts at the calibration's evidence tokens when the plugin applies it, the cell otherwise" {
+    const fit = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"evidence_tokens\":18380,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
+    try std.testing.expectEqual(@as(u64, 18_380), growthStartOf(fit, 118111600640));
+    // Not applied (another ceiling, no file) or no evidence_tokens: the cell.
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 112 << 30));
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(null, 118111600640));
+    const unnamed = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(unnamed, 118111600640));
 }
 
 test "driver: a streamed Ling's prompt is billed at the chunk the engine runs for its length, and its growth at the largest of them" {
@@ -461,18 +492,20 @@ test "driver: a streamed Ling's prompt is billed at the chunk the engine runs fo
     const cell_need = Probe.scores(&binding.parsed, abi.stream_room_cell, 1536, 16, 0);
     try t.expectEqual((64 << 30) - cell_need - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
     // The growth to a 32K limit: the scores at 1024 x 32767 against 1536 x 17408, and the cache rows between.
-    const g32 = streamGrowAt(&cfg, 32_768);
+    const g32 = streamGrowAt(&cfg, 32_768, abi.stream_room_cell);
     try t.expectEqual(Probe.scores(&binding.parsed, 32_767, 1024, 16, 0) - cell_need, g32.prompt);
     try t.expect(g32.prompt < 7 << 30);
+    // From a calibration's evidence request (18,380 tokens, its own 1536 chunk), the growth starts there.
+    try t.expectEqual(Probe.scores(&binding.parsed, 32_767, 1024, 16, 0) - Probe.scores(&binding.parsed, 18_380, 1536, 16, 0), streamGrowAt(&cfg, 32_768, 18_380).prompt);
     // At a 128K limit the 512 floor lets one layer's scores pass 4 GiB (about 8 GiB at 131071), and the growth bills it.
-    const g128 = streamGrowAt(&cfg, 131_072);
+    const g128 = streamGrowAt(&cfg, 131_072, abi.stream_room_cell);
     try t.expect(64 * 512 * 131_071 * 2 > (4 << 30));
     try t.expectEqual(Probe.scores(&binding.parsed, 131_071, 512, 16, 0) - cell_need, g128.prompt);
     // A bill whose largest point is between the cell and the limit: the last length that runs 1536 (21845).
     table.bill = &Probe.byChunkBill;
     try t.expectEqual(@as(u32, 1536), promptChunkAt(&cfg, 21_845));
     try t.expectEqual(@as(u32, 1024), promptChunkAt(&cfg, 21_846));
-    try t.expectEqual(@as(u64, 21_845 - abi.stream_room_cell), streamGrowAt(&cfg, 32_768).prompt);
+    try t.expectEqual(@as(u64, 21_845 - abi.stream_room_cell), streamGrowAt(&cfg, 32_768, abi.stream_room_cell).prompt);
 }
 
 test "driver: a streamed GLM, which forms no score sheet, keeps the base chunk at every length: its rooms and growth as before" {
@@ -496,7 +529,7 @@ test "driver: a streamed GLM, which forms no score sheet, keeps the base chunk a
         for ([_]u64{ 8_192, abi.stream_room_cell, 32_767, 131_071 }) |seq| try t.expectEqual(@as(u32, @intCast(c.chunk)), promptChunkAt(&cfg, seq));
         // the room and the growth at the base chunk, as they were billed before the per-length chunk
         try t.expectEqual((64 << 30) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}) - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
-        try t.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, c.chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}), streamGrowAt(&cfg, 32_768).prompt);
+        try t.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, c.chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}), streamGrowAt(&cfg, 32_768, abi.stream_room_cell).prompt);
     }
 }
 
@@ -627,7 +660,8 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     // A placeholder only the tokenizer names (RADIO's `<image>`) comes from the engine config, which read it.
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
     var settings_buf: [128]u8 = undefined;
-    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config));
+    const ceiling = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling();
+    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling));
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
@@ -640,7 +674,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .stream_room_decode = streamRoomDecode(config),
         .stream_grow_prompt = grow.prompt,
         .stream_grow_decode = grow.decode,
-        .gpu_ceiling_bytes = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
+        .gpu_ceiling_bytes = ceiling,
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},
         .tp_rank = if (config.dist_shard) |sh| sh.rank else 0,

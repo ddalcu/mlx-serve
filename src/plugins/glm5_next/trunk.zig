@@ -1090,7 +1090,7 @@ fn bankFit(ctx: *const abi.LoadCtx) outside_model.Fit {
         log.warn("glm5_next: {s} not applied ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, @errorName(e) });
         return fit;
     };
-    log.info("glm5_next: the bank fits by {s} (ceiling {d} MiB; the bills' growth past its {d}-token cell {d} / {d} MiB)\n", .{ outside_model.bank_fit_file, fit.calibration.?.ceiling >> 20, fit.calibration.?.cell, grow.prompt >> 20, grow.decode >> 20 });
+    log.info("glm5_next: the bank fits by {s} (ceiling {d} MiB; the bills' growth past its {d}-token evidence {d} / {d} MiB)\n", .{ outside_model.bank_fit_file, fit.calibration.?.ceiling >> 20, fit.calibration.?.evidence, grow.prompt >> 20, grow.decode >> 20 });
     return fit;
 }
 
