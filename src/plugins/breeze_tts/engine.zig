@@ -483,10 +483,8 @@ fn ropeApplyFreqs(x: mlx.mlx_array, freqs: mlx.mlx_array, hd: c_int, s: S) !mlx.
     return r;
 }
 
-// The depth decoder's rope: the pack declares llama3 scaling (factor 32,
-// orig_ctx 16) and plain theta is what the sampled oracle reproduces, so this
-// engine ropes with plain theta. config.zig reads `rope_scaling` and refuses
-// any OTHER declared arm by name — the reason lives there, not as a comment.
+// Plain theta: config.zig reads `rope_scaling` and loads only the published
+// arms, which the sampled oracle shows plain theta reproduces.
 
 fn sdpa(q4: mlx.mlx_array, k4: mlx.mlx_array, v4: mlx.mlx_array, scale: f32, mask: mlx.mlx_array, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
@@ -505,11 +503,11 @@ pub const KV = struct {
 fn concat2(s: S, a: mlx.mlx_array, b: mlx.mlx_array, axis: c_int) !mlx.mlx_array {
     if (a.ctx == null) return b;
     const vec = mlx.mlx_vector_array_new();
-    _ = mlx.mlx_vector_array_append_value(vec, a);
-    _ = mlx.mlx_vector_array_append_value(vec, b);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_vector_array_append_value(vec, a));
+    try mlx.check(mlx.mlx_vector_array_append_value(vec, b));
     var r = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_concatenate_axis(&r, vec, axis, s));
-    _ = mlx.mlx_vector_array_free(vec);
     return r;
 }
 

@@ -56,7 +56,9 @@ pub const Config = struct {
     te_full_layers: [16]u32 = .{ 5, 11, 17, 23, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT },
     te_theta_full: f64 = 1_000_000,
     te_theta_slide: f64 = 10_000,
-    te_factor_full: f64 = 8.0,
+    /// The TE's full-attention rope position scale (`1/factor` on positions).
+    /// Absent in a pack = 1.0 (plain positions); 8.0 is the published pack.
+    te_factor_full: f64 = 1.0,
     te_rms_eps: f32 = 1e-6,
 
     // backbone (Qwen3)
@@ -121,17 +123,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) (error{ 
     return parseFromValue(parsed.value);
 }
 
-/// `rope_scaling` on the two qwen stacks (the engine ropes with plain theta).
-/// A missing or null arm is plain theta and loads. A declared arm must be the
-/// published llama3 arm EXACTLY — factor 32 with `original_max_position_
-/// embeddings` at the section's published value (depth decoder 16, root 1024)
-/// — which is the shape the sampled oracle reproduces at plain theta (within
-/// the depth span positions never pass 16/16; the oracle shows early eos on
-/// the scaled table). ANY other arm (yarn, linear, a different factor, an
-/// original_max off the published value) is a rotation this engine does not
-/// implement and is refused BY NAME. The TE's `rope_parameters` are separate:
-/// read into `te_theta_*`/`te_factor_full` above, implemented as a position
-/// scale, and their factors checked to the published values.
+/// `rope_scaling` on the two qwen stacks. The engine ropes with plain theta;
+/// the published arms are llama3 scalings the sampled oracle shows plain
+/// theta reproduces, so the exact published shape loads and anything else is
+/// a rotation we would decode wrong — refused by name.
 fn checkRopeScaling(v: ?std.json.Value, comptime published_ompe: i64) (error{ BadPackConfig } || error{ UnsupportedBreezeGeometry })!void {
     const s = v orelse return;
     if (s == .null) return;
@@ -139,15 +134,19 @@ fn checkRopeScaling(v: ?std.json.Value, comptime published_ompe: i64) (error{ Ba
     const o = s.object;
     const rt = o.get("rope_type") orelse return error.UnsupportedBreezeGeometry;
     if (!(rt == .string and std.mem.eql(u8, rt.string, "llama3"))) return error.UnsupportedBreezeGeometry;
-    const factor = o.get("factor") orelse return error.UnsupportedBreezeGeometry;
-    const f: f64 = switch (factor) {
-        .float => |x| x,
-        .integer => |x| @floatFromInt(x),
-        else => return error.UnsupportedBreezeGeometry,
-    };
+    const f = jsonF64(o.get("factor") orelse return error.UnsupportedBreezeGeometry) orelse return error.UnsupportedBreezeGeometry;
     if (f != 32.0) return error.UnsupportedBreezeGeometry;
     const ompe = o.get("original_max_position_embeddings") orelse return error.UnsupportedBreezeGeometry;
     if (ompe != .integer or ompe.integer != published_ompe) return error.UnsupportedBreezeGeometry;
+}
+
+/// A JSON number as f64 (an integer and a float are the same value here).
+fn jsonF64(v: std.json.Value) ?f64 {
+    return switch (v) {
+        .integer => |x| @floatFromInt(x),
+        .float => |x| x,
+        else => null,
+    };
 }
 
 fn parseFromValue(value: std.json.Value) (error{ BadPackConfig } || error{ UnsupportedBreezeGeometry })!Config {
@@ -248,35 +247,24 @@ fn parseFromValue(value: std.json.Value) (error{ BadPackConfig } || error{ Unsup
     };
 
     // Each stack's OWN arm governs that stack (mlx-lm's apply_rope_scaling
-    // rewrites per section). The depth decoder's arm must be the published
-    // llama3 arm exactly (original_max 16: inert across the 32-token depth
-    // span, plain theta matches the oracle); the backbone's is null, and the
-    // published root block (llama3, factor 32, original_max 1024) must be
-    // that exact shape too — the engine ropes both with plain theta and the
-    // sampled oracle reproduces it. A missing arm declares nothing and loads.
-    // The TE's `rope_parameters` are separate: the arms it implements are the
-    // theta pair plus the published full-attention linear factor; any other
-    // declared rotation is refused by name, never decoded wrong.
+    // rewrites per section); the published values are depth 16, root 1024.
     try checkRopeScaling(dd.get("rope_scaling"), 16);
     try checkRopeScaling(o.get("rope_scaling"), 1024);
+    // The TE applies its factor as a general position scale, so ANY linear
+    // factor implements: only a rope_type we do not rotate with is refused.
+    // An absent factor is 1.0 (plain positions); every pack fills it from its
+    // own `factor` (the published one is 8.0).
     if (te.get("rope_parameters")) |rp| if (rp == .object) {
-        // the TE's implemented arms: a full-attention block declares the
-        // published linear factor (a block that declares none is plain
-        // theta, the same arm the defaults carry) and a sliding block
-        // declares plain theta only.
-        const want: f64 = 8.0; // the published full-attention linear factor
         if (rp.object.get("full_attention")) |fa| if (fa == .object) {
-            if (fa.object.get("factor")) |f| {
-                const ok = (f == .float and f.float == want) or (f == .integer and @as(f64, @floatFromInt(f.integer)) == want);
-                if (!ok) return error.UnsupportedBreezeGeometry;
-            } else {
-                if (want != 1.0) return error.UnsupportedBreezeGeometry;
+            if (fa.object.get("rope_type")) |t| {
+                if (!(t == .string and (std.mem.eql(u8, t.string, "linear") or std.mem.eql(u8, t.string, "default"))))
+                    return error.UnsupportedBreezeGeometry;
             }
         } else return error.UnsupportedBreezeGeometry;
         if (rp.object.get("sliding_attention")) |sa| if (sa == .object) {
-            if (sa.object.get("factor")) |f| {
-                const ok = (f == .float and f.float == 1.0) or (f == .integer and f.integer == 1);
-                if (!ok) return error.UnsupportedBreezeGeometry;
+            if (sa.object.get("rope_type")) |t| {
+                if (!(t == .string and std.mem.eql(u8, t.string, "default")))
+                    return error.UnsupportedBreezeGeometry;
             }
         };
     };
@@ -532,10 +520,33 @@ test "parseConfig: rope_scaling — the published inert arms load, any other is 
             return head ++ factor ++ tail;
         }
     }.f;
-    // the TE's full-attention factor must be the published 8.0.
-    _ = try parseConfig(testing.allocator, te_json("8.0"));
-    try testing.expectError(error.UnsupportedBreezeGeometry, parseConfig(testing.allocator, te_json("4.0")));
-    try testing.expectError(error.UnsupportedBreezeGeometry, parseConfig(testing.allocator, te_json("16.0")));
+    // The TE applies its factor as a position scale: any linear factor loads
+    // (it is honored), a rope_type we don't rotate with is refused.
+    try testing.expectEqual(@as(f64, 8.0), (try parseConfig(testing.allocator, te_json("8.0"))).te_factor_full);
+    try testing.expectEqual(@as(f64, 4.0), (try parseConfig(testing.allocator, te_json("4.0"))).te_factor_full);
+    try testing.expectEqual(@as(f64, 1.0), (try parseConfig(testing.allocator, base)).te_factor_full);
+    const te_typed = struct {
+        fn f(comptime rope_type: []const u8) []const u8 {
+            const head =
+                \\{"model_type":"breeze","audio_vocab_size":35,"num_codebooks":16,
+                \\ "text_encoder_config":{"hidden_size":64,"num_attention_heads":4,"num_key_value_heads":1,
+                \\   "head_dim":16,"intermediate_size":128,"num_hidden_layers":1,"sliding_window":8,"rms_norm_eps":1e-05,
+                \\   "rope_parameters":{"full_attention":{"rope_theta":1000000,"rope_type":"
+            ;
+            const tail =
+                \\","factor":8.0},"sliding_attention":{"rope_theta":10000}}},
+                \\ "backbone_config":{"hidden_size":128,"num_attention_heads":4,"num_key_value_heads":2,
+                \\   "head_dim":32,"intermediate_size":256,"num_hidden_layers":1,"rope_theta":10000,"rms_norm_eps":1e-06},
+                \\ "depth_decoder_config":{"hidden_size":64,"num_attention_heads":4,"num_key_value_heads":2,
+                \\   "head_dim":16,"intermediate_size":128,"num_hidden_layers":1,"rope_theta":10000,"rms_norm_eps":1e-05}}
+            ;
+            return head ++ rope_type ++ tail;
+        }
+    }.f;
+    _ = try parseConfig(testing.allocator, te_typed("linear"));
+    _ = try parseConfig(testing.allocator, te_typed("default"));
+    try testing.expectError(error.UnsupportedBreezeGeometry, parseConfig(testing.allocator, te_typed("yarn")));
+    try testing.expectError(error.UnsupportedBreezeGeometry, parseConfig(testing.allocator, te_typed("llama3")));
 }
 
 fn noDir() abi.PackDir {
