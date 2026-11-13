@@ -201,13 +201,14 @@ fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64
     return ceiling -| need -| coarse -| margin;
 }
 
-/// The widest chunk the engine runs for this model (`total_ctx = 0`, as the context sizer bills it): an explicit
-/// `--prefill-chunk`, else the default, never past `prefillChunkMax`.
-fn roomChunk(config: *const ModelConfig) u32 {
+/// The chunk the engine runs for a `seq`-token prompt (generate/init.zig's, at the prompt's final KV length): an explicit
+/// `--prefill-chunk`, else the default, never past `prefillChunkMax`, narrowed so one layer's score sheet stays within
+/// `PREFILL_SCORES_BUDGET_BYTES` (`boundedPrefillChunk`). A model that forms no score sheet keeps the base chunk.
+fn promptChunkAt(config: *const ModelConfig, seq: u64) u32 {
     return @intCast(config.cappedPrefillChunk(@import("../generate/prefill_chunk.zig").effectivePrefillChunk(
         config.prefillScoreHeadDim(),
         config.num_attention_heads,
-        0,
+        @intCast(seq),
         config.has_sliding_window,
         config.isMoe(),
         config.longCtxGated(),
@@ -227,15 +228,34 @@ fn streamPromptNeed(config: *const ModelConfig, seq: u64, chunk: u32) ?u64 {
     return null;
 }
 
+/// The largest prompt bill from `lo` to `hi` tokens, each length at the chunk the engine runs for it: the bill at `hi`,
+/// and at the longest prompt of each narrower chunk on the way (the chunk only narrows as the prompt grows, and a
+/// narrower chunk can bill less than the last length of the wider one). Null for a model with no prompt bill.
+fn streamPromptPeak(config: *const ModelConfig, lo: u64, hi: u64) ?u64 {
+    var best = streamPromptNeed(config, hi, promptChunkAt(config, hi)) orelse return null;
+    var seq = lo;
+    while (seq < hi) {
+        const c = promptChunkAt(config, seq);
+        var a = seq;
+        var b = hi;
+        while (a < b) {
+            const m = a + (b - a + 1) / 2;
+            if (promptChunkAt(config, m) == c) a = m else b = m - 1;
+        }
+        best = @max(best, streamPromptNeed(config, a, c) orelse return null);
+        seq = a + 1;
+    }
+    return best;
+}
+
 /// Each phase's bill growth from the rooms' cell to the context limit `limit` (`LoadCtx.stream_grow_*`; the load passes
-/// the server's, `getEffectiveContextLength`): a prompt that fills the limit less one reply token, against the cell. The
-/// decode growth is a built-in GLM's (its decode room's bill).
+/// the server's, `getEffectiveContextLength`): the largest prompt up to the limit less one reply token, against the
+/// cell, each at the chunk the engine runs for it. The decode growth is a built-in GLM's (its decode room's bill).
 fn streamGrowAt(config: *const ModelConfig, limit: u64) struct { prompt: u64, decode: u64 } {
     const cell = abi.stream_room_cell;
     if (limit <= cell) return .{ .prompt = 0, .decode = 0 };
-    const chunk = roomChunk(config);
-    const p0 = streamPromptNeed(config, cell, chunk) orelse return .{ .prompt = 0, .decode = 0 };
-    const p1 = streamPromptNeed(config, limit - 1, chunk) orelse return .{ .prompt = 0, .decode = 0 };
+    const p0 = streamPromptNeed(config, cell, promptChunkAt(config, cell)) orelse return .{ .prompt = 0, .decode = 0 };
+    const p1 = streamPromptPeak(config, cell, limit - 1) orelse return .{ .prompt = 0, .decode = 0 };
     const glm = @import("../admission/glm5_bill.zig");
     const wide = @import("../generate.zig").WIDE_PREFILL_CHUNK;
     const decode = if (decodeBilled(config))
@@ -246,7 +266,7 @@ fn streamGrowAt(config: *const ModelConfig, limit: u64) struct { prompt: u64, de
 }
 
 fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
-    const need = streamPromptNeed(config, abi.stream_room_cell, roomChunk(config)) orelse return 0;
+    const need = streamPromptNeed(config, abi.stream_room_cell, promptChunkAt(config, abi.stream_room_cell)) orelse return 0;
     // The MTP bind's coarse head is built after the bank opens: the room leaves it.
     const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(config, false);
     return ceiling -| need -| coarse -| margin;
@@ -386,7 +406,7 @@ test "driver: a streamed built-in GLM's bills grow from the rooms' cell to its c
     var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
     cfg.plugin = &binding;
     const glm = @import("../admission/glm5_bill.zig");
-    const chunk = roomChunk(&cfg);
+    const chunk = promptChunkAt(&cfg, abi.stream_room_cell);
     const wide = @import("../generate.zig").WIDE_PREFILL_CHUNK;
     // The limit is the caller's: the server's own (`getEffectiveContextLength`) reads process state other tests set.
     const g = streamGrowAt(&cfg, 32_768);
@@ -395,6 +415,89 @@ test "driver: a streamed built-in GLM's bills grow from the rooms' cell to its c
     try std.testing.expect(g.prompt > 0 and g.decode > 0);
     try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, 16_384).prompt);
     try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, abi.stream_room_cell).decode);
+}
+
+test "driver: a streamed Ling's prompt is billed at the chunk the engine runs for its length, and its growth at the largest of them" {
+    const t = std.testing;
+    const Probe = struct {
+        // One MLA layer's score sheet at the chunk the bill is asked (64 heads, bf16), plus a token's cache row.
+        fn scores(_: *const abi.Parsed, seq: u64, chunk: u32, _: u8, _: u64) callconv(.c) u64 {
+            return 64 * @min(@as(u64, chunk), seq) * seq * 2 + seq * 368_640;
+        }
+        fn scoresBill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &scores };
+        }
+        // A bill the chunk dominates: its largest is the last length of the widest chunk past the cell, not the limit.
+        fn byChunk(_: *const abi.Parsed, seq: u64, chunk: u32, _: u8, _: u64) callconv(.c) u64 {
+            return (@as(u64, chunk) << 20) + seq;
+        }
+        fn byChunkBill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &byChunk };
+        }
+    };
+    const gen = @import("../generate.zig");
+    const saved = gen.prefillCli().*;
+    defer gen.prefillCli().* = saved;
+    gen.prefillCli().* = .{ .override = 4096, .explicit = true };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.scoresBill;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var cfg = try model.parseConfigFromJson(t.allocator, @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json"));
+    const own = cfg.plugin;
+    defer {
+        cfg.plugin = own;
+        cfg.deinit(t.allocator);
+    }
+    cfg.plugin = &binding;
+    try t.expectEqual(@as(u32, 192), cfg.prefillScoreHeadDim());
+    try t.expectEqual(@as(u32, 64), cfg.num_attention_heads);
+    // The engine's chunk: 4096 to 8192 tokens, then narrowed to keep 4 GiB of scores, to the 512 floor past 65536.
+    try t.expectEqual(@as(u32, 4096), promptChunkAt(&cfg, 8_192));
+    try t.expectEqual(@as(u32, 1536), promptChunkAt(&cfg, abi.stream_room_cell));
+    try t.expectEqual(@as(u32, 1536), promptChunkAt(&cfg, 18_380));
+    try t.expectEqual(@as(u32, 1024), promptChunkAt(&cfg, 32_767));
+    try t.expectEqual(@as(u32, 512), promptChunkAt(&cfg, 131_071));
+    // The room bills the cell at 1536, not the 4096 base.
+    const cell_need = Probe.scores(&binding.parsed, abi.stream_room_cell, 1536, 16, 0);
+    try t.expectEqual((64 << 30) - cell_need - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    // The growth to a 32K limit: the scores at 1024 x 32767 against 1536 x 17408, and the cache rows between.
+    const g32 = streamGrowAt(&cfg, 32_768);
+    try t.expectEqual(Probe.scores(&binding.parsed, 32_767, 1024, 16, 0) - cell_need, g32.prompt);
+    try t.expect(g32.prompt < 7 << 30);
+    // At a 128K limit the 512 floor lets one layer's scores pass 4 GiB (about 8 GiB at 131071), and the growth bills it.
+    const g128 = streamGrowAt(&cfg, 131_072);
+    try t.expect(64 * 512 * 131_071 * 2 > (4 << 30));
+    try t.expectEqual(Probe.scores(&binding.parsed, 131_071, 512, 16, 0) - cell_need, g128.prompt);
+    // A bill whose largest point is between the cell and the limit: the last length that runs 1536 (21845).
+    table.bill = &Probe.byChunkBill;
+    try t.expectEqual(@as(u32, 1536), promptChunkAt(&cfg, 21_845));
+    try t.expectEqual(@as(u32, 1024), promptChunkAt(&cfg, 21_846));
+    try t.expectEqual(@as(u64, 21_845 - abi.stream_room_cell), streamGrowAt(&cfg, 32_768).prompt);
+}
+
+test "driver: a streamed GLM, which forms no score sheet, keeps the base chunk at every length: its rooms and growth as before" {
+    const t = std.testing;
+    const Probe = struct {
+        fn empty(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{};
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.empty;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    const gen = @import("../generate.zig");
+    const saved = gen.prefillCli().*;
+    defer gen.prefillCli().* = saved;
+    const glm = @import("../admission/glm5_bill.zig");
+    for ([_]PrefillCliCase{ .{ .cli = .{}, .chunk = gen.WIDE_PREFILL_CHUNK }, .{ .cli = .{ .override = 4096, .explicit = true }, .chunk = 4096 } }) |c| {
+        gen.prefillCli().* = c.cli;
+        for ([_]u64{ 8_192, abi.stream_room_cell, 32_767, 131_071 }) |seq| try t.expectEqual(@as(u32, @intCast(c.chunk)), promptChunkAt(&cfg, seq));
+        // the room and the growth at the base chunk, as they were billed before the per-length chunk
+        try t.expectEqual((64 << 30) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}) - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+        try t.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, c.chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}), streamGrowAt(&cfg, 32_768).prompt);
+    }
 }
 
 test "driver: a streamed Ling's decode room is the ceiling less the engine's decode bill, the coarse head and the margin" {
@@ -452,7 +555,7 @@ test "driver: Ling's decode room leaves GLM's rooms as they were: the built-in's
     const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(&cfg, false);
     try t.expectEqual((64 << 30) - need - coarse - (1 << 30), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
     const prompt_room = streamRoomAt(&cfg, 64 << 30, 1 << 30);
-    try t.expectEqual((64 << 30) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, roomChunk(&cfg), .{}) - coarse - (1 << 30), prompt_room);
+    try t.expectEqual((64 << 30) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, promptChunkAt(&cfg, abi.stream_room_cell), .{}) - coarse - (1 << 30), prompt_room);
     // a GLM whose plugin prices its own prompt keeps one room (only Ling's trunk is exempt)
     table.bill = &Probe.priced;
     try t.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
