@@ -343,8 +343,10 @@ fn freeOuts(outs: []Out) void {
 }
 
 /// A cold 17-row prompt chunk, then a verify of `rows` rows for each of `xs` (each from the window and state the one
-/// before it left), every one with capture under `sw`: what each verify leaves, evaluated.
-fn verifies(r: *Rig, x0: Array, xs: []const Array, rows: c_int, sw: Switches, out: []Out) !void {
+/// before it left), every one with capture under `sw`: what each verify leaves, evaluated. With LAZY_SEQ set, `lazy`
+/// says whether its arm takes the call: the per-row states stay unrun after a full accept's reads, else the capture
+/// launch has run them.
+fn verifies(r: *Rig, x0: Array, xs: []const Array, rows: c_int, sw: Switches, lazy: bool, out: []Out) !void {
     setSwitches(sw);
     var e: kda.Entry = .{};
     defer e.deinit();
@@ -359,11 +361,11 @@ fn verifies(r: *Rig, x0: Array, xs: []const Array, rows: c_int, sw: Switches, ou
         o[3] = newRef(e.spec_conv_input);
         o[4] = newRef(e.spec_state_seq);
         if (sw.lazy) {
-            // Read as a full accept reads it: the per-row states stay unrun.
+            // Read as a full accept reads it: unrun where the arm takes the call, run by the capture launch where not.
             try evalAll(o[0..4]);
             var avail = true;
             try mlx.check(mlx._mlx_array_is_available(&avail, o[4]));
-            try testing.expect(!avail);
+            try testing.expectEqual(!lazy, avail);
         }
         try evalAll(o);
     }
@@ -484,13 +486,13 @@ test "glm5_next kda verify: the prework, gate and norm-gate give the chain's out
         var want: [2]Out = @splat(@splat(.{ .ctx = null }));
         defer freeOuts(&want);
         const before_chain = runs;
-        try verifies(&r, x0, &xs, rows, .{}, &want);
+        try verifies(&r, x0, &xs, rows, .{}, false, &want);
         try testing.expectEqual(Runs{}, runsSince(before_chain));
         for (verify_sets) |sw| {
             var got: [2]Out = @splat(@splat(.{ .ctx = null }));
             defer freeOuts(&got);
             const before = runs;
-            try verifies(&r, x0, &xs, rows, sw, &got);
+            try verifies(&r, x0, &xs, rows, sw, sw.lazy, &got);
             const ran = runsSince(before);
             const texts: u64 = if (sw.verify) 2 else 0;
             try testing.expectEqual(if (rows <= 9) texts else 0, ran.prework);
@@ -520,7 +522,8 @@ test "glm5_next kda verify: Ling's KDA layer and two slots keep the chain" {
         defer free(xs[0]);
         var out: [1]Out = @splat(@splat(.{ .ctx = null }));
         defer freeOuts(&out);
-        try verifies(&r, x0, &xs, 2, .{ .verify = true, .expsig = true, .lazy = true }, &out);
+        // every switch on, Ling's layer: the chain's capture launch runs the per-row states with the output
+        try verifies(&r, x0, &xs, 2, .{ .verify = true, .expsig = true, .lazy = true }, false, &out);
     }
     r.cfg.model_type = "glm5_next";
     {
