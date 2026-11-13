@@ -180,6 +180,7 @@ const ops = @import("../../mlx/ops.zig");
 const conv1d = @import("../../sdk/bases/blocks/conv1d.zig");
 const kda_prologue = @import("kda_prologue.zig");
 const kda_percore = @import("kda_percore.zig");
+const kda_chunk = @import("kda_chunk.zig");
 const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
 
 /// A GLM-5.3-Flash KDA layer at its served 64 heads of 128 (conv width 24576, gate width 8192), 4 conv taps, the
@@ -899,4 +900,112 @@ test "glm5_next kda percore: deterministic: two runs give the same bytes, as doe
         try testing.expectEqual(before + 2, kda_percore.runs);
     }
     for (outs[1..]) |o| for (outs[0], o) |w, g| try expectBits(s, w, g, null);
+}
+
+/// A cold prompt chunk `xa` of `rows` rows, then a warm 31-row chunk `xb`, through kda.forward: each one's output, conv
+/// window and state, evaluated.
+fn prompts(r: *Rig, xa: Array, rows: c_int, xb: Array) ![6]Array {
+    var o: [6]Array = @splat(.{ .ctx = null });
+    errdefer for (o) |a| free(a);
+    var e: kda.Entry = .{};
+    defer e.deinit();
+    o[0] = try kda.forward(&r.m, xa, &r.la, &e, 1, rows, true, false);
+    o[1] = newRef(e.conv_state);
+    o[2] = newRef(e.ssm_state);
+    try evalAll(o[0..3]);
+    o[3] = try kda.forward(&r.m, xb, &r.la, &e, 1, 31, true, false);
+    o[4] = newRef(e.conv_state);
+    o[5] = newRef(e.ssm_state);
+    try evalAll(o[3..6]);
+    return o;
+}
+
+/// The largest |got - want| over the largest |want|, both in f32; dtypes and shapes alike.
+fn relApart(s: mlx.mlx_stream, want: Array, got: Array) !f32 {
+    try testing.expectEqual(mlx.mlx_array_dtype(want), mlx.mlx_array_dtype(got));
+    try testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    var t: [7]Array = @splat(.{ .ctx = null });
+    defer for (t) |a| free(a);
+    for (&t) |*a| a.* = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&t[0], want, .float32, s));
+    try mlx.check(mlx.mlx_astype(&t[1], got, .float32, s));
+    try mlx.check(mlx.mlx_subtract(&t[2], t[1], t[0], s));
+    try mlx.check(mlx.mlx_abs(&t[3], t[2], s));
+    try mlx.check(mlx.mlx_max(&t[4], t[3], false, s));
+    try mlx.check(mlx.mlx_abs(&t[5], t[0], s));
+    try mlx.check(mlx.mlx_max(&t[6], t[5], false, s));
+    try evalAll(&.{ t[4], t[6] });
+    var apart: f32 = 0;
+    var scale: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&apart, t[4]));
+    try mlx.check(mlx.mlx_array_item_float32(&scale, t[6]));
+    try testing.expect(scale > 0 and std.math.isFinite(apart));
+    return apart / scale;
+}
+
+// Bound: bf16 outputs round at 2^-8 of their own magnitude and a summation order moves the f32 state far less, while a
+// wrong gate, head or row moves them by their own size.
+const rounding_bound: f32 = 1e-2;
+
+/// The stock prompt route's two chunks (the chunkwise switches off) against `got`'s: the windows bit for bit (no lever
+/// moves them), the outputs and states within `rounding_bound` of their largest magnitude.
+fn expectNearStock(r: *Rig, xa: Array, rows: c_int, xb: Array, got: *const [6]Array) !void {
+    const s = r.m.s;
+    const ch = env.override(.MLX_SERVE_KDA_PROMPT_CHUNK, "0");
+    defer ch.restore();
+    const want = try prompts(r, xa, rows, xb);
+    defer for (want) |a| free(a);
+    for ([_]usize{ 1, 4 }) |i| try expectBits(s, want[i], got[i], null);
+    for ([_]usize{ 0, 2, 3, 5 }) |i| {
+        const apart = try relApart(s, want[i], got[i]);
+        std.debug.print("kda prompt: output {d} apart from the stock route by {e} of its largest magnitude\n", .{ i, apart });
+        try testing.expect(apart <= rounding_bound);
+    }
+}
+
+/// Whether the copy's per-core route takes GLM's prompt rows on this GPU (the chunkwise levers then never run).
+fn percoreTakes(s: mlx.mlx_stream) bool {
+    return kda_recurrence.serves(s, t_heads, t_heads, t_head, t_head, .bfloat16, .float32);
+}
+
+// Bar: the chunkwise route's output and state are the stock route's within the rounding bound and its window theirs bit
+// for bit: a cold 16,356-row chunk, then a warm 31-row chunk.
+test "glm5_next kda chunk: rounding-class: a layer's prompt on the chunkwise route meets the stock route, 16,356 rows cold then 31 warm" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    if (percoreTakes(s)) return error.SkipZigTest;
+    if (!try kda_chunk.probe(s, t_heads, -5.0)) return error.SkipZigTest;
+    const ch = env.override(.MLX_SERVE_KDA_PROMPT_CHUNK, "1");
+    defer ch.restore();
+    var r: Rig = undefined;
+    try r.init(s, "glm5_next");
+    defer r.deinit();
+    const xa = try r.input(1, 16_356);
+    defer free(xa);
+    const xb = try r.input(1, 31);
+    defer free(xb);
+    const before = kda_chunk.runs;
+    const got = try prompts(&r, xa, 16_356, xb);
+    defer for (got) |a| free(a);
+    try testing.expectEqual(before + 2, kda_chunk.runs);
+    try expectNearStock(&r, xa, 16_356, xb, &got);
+}
+
+// Bar: Ling's layer keeps its route with the chunkwise switch on.
+test "glm5_next kda chunk: Ling's layer never takes the chunkwise route" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ch = env.override(.MLX_SERVE_KDA_PROMPT_CHUNK, "1");
+    defer ch.restore();
+    var r: Rig = undefined;
+    try r.init(s, "bailing_hybrid");
+    defer r.deinit();
+    const xa = try r.input(1, t_prompt);
+    defer free(xa);
+    const xb = try r.input(1, 31);
+    defer free(xb);
+    const before = kda_chunk.runs;
+    const got = try prompts(&r, xa, t_prompt, xb);
+    defer for (got) |a| free(a);
+    try testing.expectEqual(before, kda_chunk.runs);
 }

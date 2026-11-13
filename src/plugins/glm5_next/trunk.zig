@@ -18,6 +18,8 @@ const log = @import("../../sdk/util/log.zig");
 const linear = @import("../../sdk/bases/blocks/linear.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
 const router_nax = @import("../../sdk/blocks/moe/router_nax.zig");
+const env = @import("../../env.zig");
+const kda_chunk = @import("kda_chunk.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const outside = @import("../../sdk/quant/outside.zig");
 const outside_model = @import("../../sdk/quant/outside_model.zig");
@@ -1004,6 +1006,8 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
     // Before the trunk: what is outside the server, for the bank's open (`Fit.load_start`).
     const start = outside_model.readMemory();
     const s: mlx.mlx_stream = if (ctx.stream.ctx) |p| .{ .ctx = p } else mlx.gpuStream();
+    // GLM's KDA prompt switches: their refusals by name before a weight is read.
+    if (c.isGlm5()) try kda_chunk.loadCheck(s, c);
     const emb_base: []const u8 = if (std.mem.eql(u8, c.model_type, "bailing_hybrid")) "word_embeddings" else "embed_tokens";
     var eb: [64]u8 = undefined;
     const prefix = probePrefix(src, c.weight_prefix, try std.fmt.bufPrint(&eb, "{s}.weight", .{emb_base}));

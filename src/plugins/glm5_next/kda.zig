@@ -23,6 +23,7 @@ const trunk = @import("trunk.zig");
 const kda_verify = @import("kda_verify.zig");
 const kda_prologue = @import("kda_prologue.zig");
 const kda_percore = @import("kda_percore.zig");
+const kda_chunk = @import("kda_chunk.zig");
 
 const Array = mlx.mlx_array;
 const Model = trunk.Model;
@@ -290,6 +291,10 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     const verify_rows = c.isGlm5() and bounded and capture and batch == 1;
     const verify_texts = verify_rows and switchOn(.MLX_SERVE_GLM_KDA_VERIFY);
     const verify_prework = verify_texts and kernel == 4;
+    // GLM's prompt rows where the per-core route declines: the chunkwise recurrence, the gate built in its launch
+    // (MLX_SERVE_KDA_PROMPT_CHUNK, rounding-class).
+    const sw = if (prompt_rows and !kda_fused) try kda_chunk.switches() else kda_chunk.Switches{};
+    const chunk = sw.chunk and kda_chunk.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype(), la.a_log_h, la.dt_f32, c.kda_gate_lower_bound);
     // GLM's prompt rows: the prologue in one launch (MLX_SERVE_KDA_PROMPT_PROLOGUE).
     const prologue = if (!kda_fused and prompt_rows and kernel == 4 and switchOn(.MLX_SERVE_KDA_PROMPT_PROLOGUE))
         try kda_prologue.prologue(s, qkv, if (e.initialized) e.conv_state else null, la.conv_w, inv_scale_sq, inv_sqrt_sc, qkNormEps(m), num_k_heads, dk, num_v_heads, dv, kernel)
@@ -405,15 +410,16 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     }
 
     // GLM's prompt rows where the stock per-core route declines: its kernel at two threadgroups a core
-    // (MLX_SERVE_KDA_PROMPT_PERCORE, rounding-class) after the prologue or the chain.
-    const percore = !kda_fused and prompt_rows and env.on(.MLX_SERVE_KDA_PROMPT_PERCORE) and
+    // (MLX_SERVE_KDA_PROMPT_PERCORE, rounding-class) after the prologue or the chain; the chunkwise route
+    // takes the rows first where it serves.
+    const percore = !chunk and !kda_fused and prompt_rows and env.on(.MLX_SERVE_KDA_PROMPT_PERCORE) and
         la.a_log_h.ctx != null and la.dt_f32.ctx != null and
         kda_percore.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype());
 
     // One gate value per key channel: the bounded sigmoid where the config bounds it (fla's two arms), else the
-    // softplus chain over `A_log` expanded per channel. The per-core recurrence builds the gate itself.
+    // softplus chain over `A_log` expanded per channel. The per-core and chunkwise recurrences build the gate themselves.
     var verify_gate = false;
-    const g = if (kda_fused or percore) Array{ .ctx = null } else if (bounded) pick: {
+    const g = if (kda_fused or percore or chunk) Array{ .ctx = null } else if (bounded) pick: {
         if (verify_texts) if (try kda_verify.gate(s, a_proj, la.dt_bias, la.A_log, c.kda_gate_lower_bound, switchOn(.MLX_SERVE_GLM_KDA_EXPSIG))) |vg| {
             verify_gate = true;
             break :pick vg;
@@ -498,6 +504,12 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
             try kda_percore.recur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state)
         else
             try kda_recurrence.recur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state);
+        _ = mlx.mlx_array_free(y_bthd);
+        y_bthd = r.y;
+        _ = mlx.mlx_array_free(e.ssm_state);
+        e.ssm_state = r.state;
+    } else if (chunk) {
+        const r = try kda_chunk.recur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state);
         _ = mlx.mlx_array_free(y_bthd);
         y_bthd = r.y;
         _ = mlx.mlx_array_free(e.ssm_state);
