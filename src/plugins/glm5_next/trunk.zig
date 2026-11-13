@@ -997,6 +997,8 @@ fn probePrefix(src: *const quant_abi.Source, declared: []const u8, leaf: []const
 pub fn load(ctx: *const abi.LoadCtx) !*Model {
     const src = ctx.weights orelse return error.UnsupportedWeightSource;
     const c = config.of(ctx.parsed);
+    // Before the trunk: what is outside the server, for the bank's open (`Fit.load_start`).
+    const start = outside_model.readMemory();
     const s: mlx.mlx_stream = if (ctx.stream.ctx) |p| .{ .ctx = p } else mlx.gpuStream();
     const emb_base: []const u8 = if (std.mem.eql(u8, c.model_type, "bailing_hybrid")) "word_embeddings" else "embed_tokens";
     var eb: [64]u8 = undefined;
@@ -1068,7 +1070,7 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
     // The drafts' readout of a head the outside plugin runs, before the bank takes its room: the engine borrows it at
     // the bind (`trunk_weight`).
     if ((m.mtp != null or m.ling_mtp != null) and m.head.ext != null) try draftReadout(m);
-    if (c.streamed_bank) try bindBank(m, ctx);
+    if (c.streamed_bank) try bindBank(m, ctx, start);
     return m;
 }
 
@@ -1076,9 +1078,9 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
 /// routed layer (the trunk's layer index, as `BankGeometry.gates`).
 /// The bank's per-phase fit (`outside_model.Fit`): the host's prompt and decode rooms, and the pack's measured
 /// calibration (`bank-fit.json`) when it names this ceiling and reaches the server's context; the bills otherwise.
-fn bankFit(ctx: *const abi.LoadCtx) outside_model.Fit {
+fn bankFit(ctx: *const abi.LoadCtx, start: outside_model.Reading) outside_model.Fit {
     const grow = ctx.streamGrowth();
-    var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom(), .grow_prompt = grow.prompt, .grow_decode = grow.decode };
+    var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom(), .grow_prompt = grow.prompt, .grow_decode = grow.decode, .load_start = start };
     if (!ctx.dir.has(outside_model.bank_fit_file)) return fit;
     var buf: [4096]u8 = undefined;
     var why: abi.Verdict = .ok;
@@ -1094,7 +1096,7 @@ fn bankFit(ctx: *const abi.LoadCtx) outside_model.Fit {
     return fit;
 }
 
-fn bindBank(m: *Model, ctx: *const abi.LoadCtx) !void {
+fn bindBank(m: *Model, ctx: *const abi.LoadCtx, start: outside_model.Reading) !void {
     const c = m.c;
     const gates = try gpa.alloc(quant_abi.BankGate, m.layers.len);
     defer gpa.free(gates);
@@ -1108,10 +1110,12 @@ fn bindBank(m: *Model, ctx: *const abi.LoadCtx) !void {
         if (l.* > 0) any_limit = true;
     }
     const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(m.layers.len), .swiglu_limit = if (c.swiglu_clamp) c.swiglu_limit else 0, .gates = gates.ptr, .limits_out = if (any_limit) limits.ptr else null };
-    const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fit = bankFit(ctx) }, m.s);
+    const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fit = bankFit(ctx, start) }, m.s);
     m.bank = o.bank;
     log.info("glm5_next: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
     // the budget and the memory read at the open: a bank-fit.json's evidence (`rest = non-file in use - server footprint`)
+    if (o.refused) |e| log.warn("glm5_next: the memory read at the open refused ({s}: non-file in use below the server's footprint): the bank fits by the bills on total - available\n", .{@errorName(e)});
+    if (o.read) |r| if (r.in_use != o.reading.?.in_use) log.info("glm5_next: the open read non-file in use {d} MiB, settled to {d} MiB (outside the server at the load's start {d} MiB, server footprint {d} MiB)\n", .{ r.in_use >> 20, o.reading.?.in_use >> 20, (start.in_use -| start.footprint) >> 20, r.footprint >> 20 });
     if (o.reading) |r| log.info("glm5_next: bank budget {d} MiB prompt / {d} MiB decode: non-file in use {d} MiB, server footprint {d} MiB at the open\n", .{ o.budget.prompt >> 20, o.budget.decode >> 20, r.in_use >> 20, r.footprint >> 20 });
     const r = o.bank.routed();
     m.routed = r;

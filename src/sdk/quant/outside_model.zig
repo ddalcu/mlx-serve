@@ -141,6 +141,9 @@ pub const Fit = struct {
     grow_prompt: u64 = 0,
     grow_decode: u64 = 0,
     calibration: ?Calibration = null,
+    /// The memory read at the load's start, before the trunk (`readMemory`): what was outside the server then settles
+    /// the open's reading (`settled`).
+    load_start: ?Reading = null,
 };
 
 /// A pack's measured fit on one ceiling (`bank-fit.json`): each phase's base is the evidence run's peak of the box's
@@ -172,6 +175,29 @@ pub fn fitBudget(fit: Fit, r: Reading) quant_abi.BankBudget {
     };
 }
 
+/// The open's reading `now`, settled: macOS's page counts show the server's new buffers a second or two late while its
+/// footprint shows them at once, so the memory in use is at least what was outside the server at `start` plus the
+/// server now.
+pub fn settled(now: Reading, start: Reading) Reading {
+    return .{ .in_use = @max(now.in_use, (start.in_use -| start.footprint) +| now.footprint), .footprint = now.footprint };
+}
+
+pub const OpenBudget = struct {
+    budget: quant_abi.BankBudget,
+    /// The reading the budget came from (settled when the fit has a `load_start`).
+    reading: Reading,
+    refused: ?error{BankReadingBelowFootprint} = null,
+};
+
+/// `fit`'s budget at the open's reading `now`. A reading still below the server's own footprint is refused by name: the
+/// bills stand on `fallback_in_use` (`total - available`), never on less than the footprint.
+pub fn openBudget(fit: Fit, now: Reading, fallback_in_use: u64) OpenBudget {
+    const r = if (fit.load_start) |start| settled(now, start) else now;
+    if (r.in_use >= r.footprint) return .{ .budget = fitBudget(fit, r), .reading = r };
+    const in_use = @max(fallback_in_use, r.footprint);
+    return .{ .budget = .{ .prompt = fit.prompt_room -| in_use, .decode = fit.decode_room -| in_use }, .reading = r, .refused = error.BankReadingBelowFootprint };
+}
+
 /// The calibration file's name in a pack and its format.
 pub const bank_fit_file = "bank-fit.json";
 pub const bank_fit_format = "mlx-serve-bank-fit-v2";
@@ -195,7 +221,7 @@ pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64) error{ BankFitInv
 }
 
 /// The memory in use now and the server's footprint (`fitBudget`'s reading).
-fn readMemory() Reading {
+pub fn readMemory() Reading {
     return .{ .in_use = system.getNonFileMemBytes(), .footprint = @as(u64, system.getAppMemFootprintMb()) << 20 };
 }
 
@@ -225,6 +251,9 @@ pub const Opened = struct {
     /// `rest = in_use - footprint`).
     budget: quant_abi.BankBudget = .{ .prompt = 0, .decode = 0 },
     reading: ?Reading = null,
+    /// A `fit`'s reading as read, before `settled`.
+    read: ?Reading = null,
+    refused: ?error{BankReadingBelowFootprint} = null,
 };
 
 /// The pack's streamed bank over `geo` at the rows `budget` buys, after the load's freed buffers go back to the system
@@ -234,6 +263,8 @@ pub fn openBank(f: *const outside.Format, geo: quant_abi.BankGeometry, budget: B
     _ = mlx.mlx_clear_cache();
     var context: u64 = 0;
     var reading: ?Reading = null;
+    var read: ?Reading = null;
+    var refused: ?error{BankReadingBelowFootprint} = null;
     const at: quant_abi.BankBudget = switch (budget) {
         .fixed => |b| b,
         .rungs => |r| blk: {
@@ -244,13 +275,16 @@ pub fn openBank(f: *const outside.Format, geo: quant_abi.BankGeometry, budget: B
             break :blk r.at(r.ctx, context);
         },
         .fit => |fit| blk: {
-            reading = readMemory();
-            break :blk fitBudget(fit, reading.?);
+            read = readMemory();
+            const o = openBudget(fit, read.?, system.getTotalMemBytes() -| system.getAvailableMemBytes());
+            reading = o.reading;
+            refused = o.refused;
+            break :blk o.budget;
         },
     };
     const rows = (try f.bankRows(geo, at)) orelse return error.StreamedBankUnclaimed;
     const b = (try f.openBank(geo, at)) orelse return error.StreamedBankUnclaimed;
-    return .{ .bank = b, .rows = rows, .context = context, .budget = at, .reading = reading };
+    return .{ .bank = b, .rows = rows, .context = context, .budget = at, .reading = reading, .read = read, .refused = refused };
 }
 
 // ── tests ──
@@ -487,6 +521,35 @@ test "outside model: a calibrated fit gives each phase the ceiling less its base
     try testing.expectEqual(quant_abi.BankBudget{ .prompt = 71 << 30, .decode = 85 << 30 }, fitBudget(.{ .prompt_room = 1, .decode_room = 1, .grow_prompt = 3 << 30, .grow_decode = 1 << 30, .calibration = cal }, r));
     // More outside the server than the evidence had: fewer bytes, never below 0.
     try testing.expectEqual(quant_abi.BankBudget{ .prompt = 0, .decode = 0 }, fitBudget(.{ .prompt_room = 1, .decode_room = 1, .calibration = cal }, .{ .in_use = 200 << 30, .footprint = 0 }));
+}
+
+test "outside model: an open reading below the server's footprint settles from the load's start, else is refused, never the whole room" {
+    const MiB: u64 = 1 << 20;
+    // The page counts have not yet shown the server's new buffers: in use reads below its footprint.
+    const lag: Reading = .{ .in_use = 10_703 * MiB, .footprint = 23_582 * MiB };
+    const start: Reading = .{ .in_use = 13_000 * MiB, .footprint = 1_500 * MiB };
+    const bills: Fit = .{ .prompt_room = 100 << 30, .decode_room = 110 << 30, .load_start = start };
+    const o = openBudget(bills, lag, 0);
+    try testing.expect(o.refused == null);
+    try testing.expectEqual(Reading{ .in_use = 11_500 * MiB + 23_582 * MiB, .footprint = 23_582 * MiB }, o.reading);
+    try testing.expectEqual(quant_abi.BankBudget{ .prompt = (100 << 30) - 35_082 * MiB, .decode = (110 << 30) - 35_082 * MiB }, o.budget);
+    // A reading past the start's figure stands as read.
+    const live: Reading = .{ .in_use = 40_000 * MiB, .footprint = 23_582 * MiB };
+    try testing.expectEqual(live, openBudget(bills, live, 0).reading);
+    // Calibrated: what is outside the server is the start's 11,500 MiB, not 0.
+    const cal: Calibration = .{ .ceiling = 110 << 30, .cell = 17_408, .evidence = 17_408, .base_prompt = 40 << 30, .base_decode = 28 << 30, .rest = 11_500 * MiB };
+    var calibrated = bills;
+    calibrated.calibration = cal;
+    try testing.expectEqual(quant_abi.BankBudget{ .prompt = (70 << 30) - calibrated.inuse_margin, .decode = (82 << 30) - calibrated.inuse_margin }, openBudget(calibrated, lag, 0).budget);
+    // No start reading: refused by name; the bills on total - available, or the footprint when that reads lower.
+    for ([_]Fit{ bills, calibrated }) |f0| {
+        var f = f0;
+        f.load_start = null;
+        const r = openBudget(f, lag, 36_000 * MiB);
+        try testing.expectEqual(error.BankReadingBelowFootprint, r.refused.?);
+        try testing.expectEqual(quant_abi.BankBudget{ .prompt = (100 << 30) - 36_000 * MiB, .decode = (110 << 30) - 36_000 * MiB }, r.budget);
+        try testing.expectEqual(quant_abi.BankBudget{ .prompt = (100 << 30) - 23_582 * MiB, .decode = (110 << 30) - 23_582 * MiB }, openBudget(f, lag, 9_000 * MiB).budget);
+    }
 }
 
 test "outside model: a calibrated budget reads the same with more file pages on the box (the non-file reading)" {

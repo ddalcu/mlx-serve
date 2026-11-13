@@ -1490,3 +1490,16 @@ in `pending` and let go; `complete` queued the slot for cleanup without looking 
 memory and the next pass ran it. Fix: `complete` unlists again after every wait (`unlistLocked`); a pass takes a slot
 from a list only under `queue_mu`, so unlisted with `in_pass` at 0 means nothing holds it. Guard: `complete: a slot
 its pass puts back in pending while complete waits is unlisted before cleanup owns it`.
+
+
+### A streamed bank's open read the box before macOS counted the trunk
+Defect: on about one load in six of a glm5_next streaming pack (GLM-5.3, Ling-3.1), the bank's open read the box's
+non-file memory below the server's own footprint, the bank took the trunk's size of extra room, and the box went past
+its GPU ceiling and paged. Cause: the trunk is evaluated and synchronized before the read and the task footprint shows
+its buffers at once, but `host_statistics64`'s page counts show new wired buffers a second or two late (the
+allocation side of `ReturnLag`); `in_use - footprint` saturated to 0, and a bills-only fit took its room less a low
+`in_use`. Fix: the load reads the box before the trunk (`Fit.load_start`); the open's in use is at least what was
+outside the server then plus the footprint now (`outside_model.settled`); a reading still below the footprint is
+refused by name (`BankReadingBelowFootprint`) and the bills stand on `total - available`. The bank-fit fitter voids a
+line whose in use is below its footprint. Guard: `outside model: an open reading below the server's footprint settles
+from the load's start, else is refused, never the whole room`.
