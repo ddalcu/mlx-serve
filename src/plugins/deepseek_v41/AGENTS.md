@@ -29,6 +29,10 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - `decode/moe_fp4.zig`: the MoE's two launches over mxfp4 routed experts (the Lossless pack), rows 1..6, built only
   without NAX (unmeasured on M5); `moe_up` / `moe_down` (NAX only) serve the affine 2/3-bit packs at group 64 or
   128 (the expert-pruned packs are 2-bit g128). Otherwise `routed` runs.
+- Under `tp` each `tpSum` is a CPU-stream JACCL all_sum, two a layer. With `MLX_METAL_FAST_SYNCH` (on in a group) MLX
+  hands off through its fences (`mlx/backend/metal/fence.cpp`): the GPU dispatches `input_coherent` and `fence_update`
+  before the sum and spins in the one-thread `fence_wait` kernel until the CPU finishes it, so the collective's wait
+  counts as GPU busy time. `DSV41_DEC_UBENCH` also times that hand-off without the network (decode.zig).
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
@@ -48,8 +52,13 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
 - A tensor pair (`InitOpts.tp`, `--dist tensor`) halves the experts and attention heads at load (the sliced `cfg` says so);
   both ranks run every layer and `tpSum` each attention and MoE output. Every rank must build the same sums in the same
-  order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`). DSpark drafts on rank 0 alone: its stages
-  load whole and sum nothing, and the worker follows each verify's rollback.
+  order: `blockFused` and `batchedLayer` sum between their stages (`tpFfn`).
+- DSpark under `tp` (rank 0's plan decides whether the stages load): every rank drafts on its slice of the stages and rows
+  of both heads, after rank 0's `tp_draft`; each Markov step gathers every rank's best `[value, id]`. A worker's verify
+  follow commits the kept main rows to its windows (`finishVerify`), or its next draft reads stale rows.
+- Under `tp` a plain decode step whose token is still on the GPU goes by bell alone: every rank gathers
+  rank 0's token in its graph (`tpToken`). Rank 0 pipes only the state the workers last stepped, where they left it
+  (distributed.zig `TpLive`, cleared by any other message), never a step a header carries (snapshot, verify, all rows).
 - Under `tp` the worker knows a state by the gen rank 0 gave it: every state rank 0 drops must reach `tpFree`, or the
   worker keeps it; a step on another state (`st != &dec_state`) is refused.
 - Under `tp` every aux snapshot rank 0 takes, restores, clones or frees reaches the worker by id (`tpSnap`); one taken
