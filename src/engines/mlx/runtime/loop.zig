@@ -21,6 +21,7 @@ const runEmbedRequest = @import("../media_encode.zig").runEmbedRequest;
 const Scheduler = @import("../scheduler.zig").Scheduler;
 const Slot = @import("../slot.zig").Slot;
 const chatPass = @import("../step.zig").chatPass;
+const warm_requests = @import("../warm_requests.zig");
 const runLoadRequest = @import("load_requests.zig").runLoadRequest;
 const runUnloadRequest = @import("load_requests.zig").runUnloadRequest;
 const LoadRequest = @import("../../../host/gpu_thread/requests.zig").LoadRequest;
@@ -41,7 +42,8 @@ pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
         sch.cleanup_queue.items.len > 0 or
         sch.load_queue.items.len > 0 or
         sch.gen_queue.items.len > 0 or
-        sch.unload_queue.items.len > 0;
+        sch.unload_queue.items.len > 0 or
+        warm_requests.owesStepLocked(sch);
 }
 
 pub const idleEvictTickMs = @import("../../../host/http/server.zig").idleEvictTickMs;
@@ -131,8 +133,10 @@ pub fn inferenceLoop(ctx: ThreadCtx) void {
         if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch, load_req == null);
         if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
+        warm_requests.tick(sch);
         if (chatPass(sch, .main) == .shutdown) break;
     }
+    warm_requests.stop(sch);
     persistAtShutdown(sch);
 }
 
@@ -184,14 +188,14 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
         // what makes the refcount-sharing snapshot legal here.
         if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
             commitSlotIfApplicable(sch, s);
-            if (s.model.prefix_cache) |hc| {
+            if (s.prefix_cache) |hc| {
                 if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
             }
         }
         recordSlotCleanup(sch.metrics, s);
         // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
         // record must not outlive the bytes `s.deinit()` frees.
-        if (s.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+        if (s.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
         releasePluginSlot(s);
         if (s.model.transformer) |xfm| if (xfm.qwen4Trunk()) |t| t.resetQsaPooledRope();
         s.deinit();

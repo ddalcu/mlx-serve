@@ -108,7 +108,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = the GPU working-set limit, `0` disables) |
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
 | `--idle-evict-secs N` | off | Unload models nobody is using after this many idle seconds |
-| `--no-warmup-eager` | off | Skip the eager warmup at boot (benchmarking / minimal-footprint deployments) |
+| `--no-warmup-eager` | off | Skip the eager warmup at boot and the warm-up a build owes a model the first time it loads it (the first prompts then compile its Metal kernels) |
+| `--warmup-full` | off | Compile a model's Metal kernels before it reports ready: the first time a build loads a model it serves itself a ladder of prompt sizes first (seconds to a minute, that one load only). **Strongly recommended when benchmarking.** Without it the model is ready at once, a short warm-up runs when the server is idle, and the first long prompts still compile |
 | `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies). Either way, a load that would not fit in free RAM first unloads idle models when that makes it fit |
 | `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |

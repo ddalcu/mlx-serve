@@ -32,6 +32,7 @@ const promiseMaterialized = @import("scheduler/params.zig").promiseMaterialized;
 const Slot = @import("slot.zig").Slot;
 const publishFirstToken = @import("spec/wiring.zig").publishFirstToken;
 const hasWorkPendingLocked = @import("runtime/loop.zig").hasWorkPendingLocked;
+const warm_requests = @import("warm_requests.zig");
 const drainSideQueues = @import("runtime/loop.zig").drainSideQueues;
 
 /// Caller holds queue_mu. Recheck arrivals under the lock before the short, wakeable retry wait.
@@ -79,7 +80,7 @@ pub fn prefillAdmitted(sch: *Scheduler, slot: *Slot) AdmitOutcome {
             }
             if (err == error.BoundaryTailTooLarge) return .tail_too_large;
             if (err == error.QsaHistoryGap and !qsa_gap_retried) {
-                if (slot.model.prefix_cache) |hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
+                if (slot.prefix_cache) |hc| _ = prefix_cache_mod.HotPrefixCache.dropQsaGapEntry(hc);
                 emptySlotCache(slot);
                 if (slot.legacy_gen) |*g| {
                     g.deinit(slot.allocator);
@@ -180,7 +181,16 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             cand_buf[i] = .{ .model = @intFromPtr(s.model), .exclusive = slotExclusiveDecode(s) };
         }
         var admit_idx: [to_prefill.len]usize = undefined;
-        const n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
+        var n_admit: usize = 0;
+        if (warm_requests.liveSlot(sch)) |warm| {
+            // A warm request is the only candidate while it lives: admitted alone, and nothing joins it, so the
+            // others wait the moment it takes to end.
+            if (std.mem.indexOfScalar(*Slot, sch.pending.items, warm)) |i| {
+                const alone = [_]AdmitCand{.{ .model = @intFromPtr(warm.model), .exclusive = slotExclusiveDecode(warm) }};
+                n_admit = admitPendingTick(&alone, live_buf[0..n_live], &admit_idx);
+                admit_idx[0] = i;
+            }
+        } else n_admit = admitPendingTick(cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx);
         for (admit_idx[0..n_admit]) |idx| {
             to_prefill[n_prefill] = sch.pending.items[idx];
             _ = to_prefill[n_prefill].in_pass.fetchAdd(1, .acq_rel);
@@ -483,6 +493,7 @@ test "a busy disk retry parks until its bounded timeout or pending work" {
     sch.load_queue = .empty;
     sch.gen_queue = .empty;
     sch.unload_queue = .empty;
+    sch.warm_queue = .empty;
     sch.queue_mu.lockUncancelable(sch.io);
     defer sch.queue_mu.unlock(sch.io);
     const before = io_util.Stopwatch.init(sch.io);

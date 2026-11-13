@@ -109,6 +109,11 @@ var ane_prefill: bool = false;
 // model runs at once. File-level for the same reason.
 var ane_serve: bool = false;
 var ane_slots: u32 = 1;
+// Pre-fault weights and pre-compile kernels at load: on by default, `--no-warmup-eager` opts out (minimal-footprint
+// deployments). `--warmup-full`: a build's first load of a model serves its whole warm plan before it reports ready.
+// File-level for the same reason.
+var warmup_eager: bool = true;
+var warmup_full: bool = false;
 // `--ane-image/--ane-video/--ane-audio` + `--ane-split`: the media DiTs' MLP
 // offload, published as ONE value (`ane.media_offload`) after the parse.
 var ane_media: ane_mod.MediaOffload = .{};
@@ -205,8 +210,16 @@ fn printUsage(io: std.Io) void {
         \\                        MLX allocates); use this if a load you know fits
         \\                        is being refused. A genuine over-commit can
         \\                        hard-crash the server.
-        \\  --no-warmup-eager   Skip the eager warmup at boot (benchmarking,
-        \\                        minimal-footprint deployments).
+        \\  --no-warmup-eager   Skip the eager warmup at boot and a build's
+        \\                        first warm-up of a model (the first prompts
+        \\                        then compile its Metal kernels).
+        \\  --warmup-full       Compile a model's Metal kernels BEFORE it reports
+        \\                        ready: the first time a build loads a model it
+        \\                        serves itself a ladder of prompt sizes first
+        \\                        (seconds to a minute, that one load only).
+        \\                        Strongly recommended when benchmarking: without
+        \\                        it a short warm-up runs once the server is idle
+        \\                        and the first long prompts still compile.
         \\  --pld               Enable Prompt Lookup Decoding (default: ON).
         \\                        Model-agnostic speculative decoding via n-gram
         \\                        matches in the prompt + generated tokens. Big
@@ -703,10 +716,6 @@ pub fn main(init: std.process.Init) !void {
     var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = null;
     var mtp_tokenv3_raw: ?[]const u8 = null;
-    // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
-    // Default ON in serve mode — small boot-time cost, big cold-prefill win.
-    // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
-    var warmup_eager: bool = true;
     var kv_quant_config: KVQuantConfig = KVQuantConfig.dense;
     // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
@@ -1008,6 +1017,8 @@ pub fn main(init: std.process.Init) !void {
             warmup_eager = true;
         } else if (std.mem.eql(u8, args[i], "--no-warmup-eager")) {
             warmup_eager = false;
+        } else if (std.mem.eql(u8, args[i], "--warmup-full")) {
+            warmup_full = true;
         } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
             i += 1;
             // `explicit` disables the machine-sized pin, so only a real width
@@ -1667,6 +1678,8 @@ pub fn main(init: std.process.Init) !void {
             .ane_resolvers = true,
             .load_vision = load_vision,
             .warmup_eager = warmup_eager,
+            .launch_warmup_eager = warmup_eager,
+            .warmup_full = warmup_full,
             .draft_block_size = draft_block_size,
             .draft_block_size_explicit = draft_block_size_explicit,
             .kv_quant_config = kv_quant_config,
@@ -1817,6 +1830,8 @@ fn runGenServe(
         .ctx_size = ctx_size,
         .load_vision = false,
         .warmup_eager = false,
+        .launch_warmup_eager = warmup_eager,
+        .warmup_full = warmup_full,
         .draft_block_size = 0,
         .draft_block_size_explicit = false,
         .kv_quant_config = KVQuantConfig.dense,
@@ -1945,6 +1960,8 @@ fn runHeadlessServe(
         .no_initial_load = true,
         .load_vision = false,
         .warmup_eager = false,
+        .launch_warmup_eager = warmup_eager,
+        .warmup_full = warmup_full,
         .no_drafter = spec.no_drafter,
         .mtp_enabled = spec.mtp_enabled,
         .mtp_depth = spec.mtp_depth,
@@ -2092,6 +2109,8 @@ fn runGgufServe(
         .drafter_dir = "",
         .load_vision = false,
         .warmup_eager = false,
+        .launch_warmup_eager = warmup_eager,
+        .warmup_full = warmup_full,
         .draft_block_size = 0,
         .draft_block_size_explicit = false,
         .kv_quant_config = KVQuantConfig.dense,

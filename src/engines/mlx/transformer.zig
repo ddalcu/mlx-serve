@@ -719,6 +719,7 @@ pub const Transformer = struct {
     pub const lmHeadRowsForDraft = @import("spec/trunk_hooks.zig").lmHeadRowsForDraft;
     // engines/mlx/warmup.zig
     pub const warmup = @import("warmup.zig").warmup;
+    pub const sweepWidth = @import("warmup.zig").sweepWidth;
     // engines/mlx/capture.zig
     pub const forwardCaptureHidden = @import("capture.zig").forwardCaptureHidden;
     pub const forwardWithCapture = @import("capture.zig").forwardWithCapture;

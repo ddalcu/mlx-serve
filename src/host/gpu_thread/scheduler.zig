@@ -85,6 +85,13 @@ pub const Scheduler = struct {
     /// `LoadParams.ctx_size` — the --ctx-size launch flag, kept for sizing
     /// GGUF stub configs on cold loads (see preloadGgufCpuState).
     gguf_ctx_size: u32,
+    /// `--no-warmup-eager` and `--warmup-full`, retained for cold loads.
+    warmup_eager: bool,
+    warmup_full: bool,
+    /// Warm-ups ready models still owe, first in first served (`warm_requests.tick`). Inference thread only.
+    warm_queue: std.ArrayList(*handles.WarmUp) = .empty,
+    /// 1 while a warm request is in `in_flight`: it is nobody's company. Guarded by `queue_mu`.
+    warm_in_flight: u32 = 0,
     /// Launch-flag prefix-cache settings, retained so COLD-LOADED models
     /// (`ensureLoaded` → /v1/load-model, model switches) get the same
     /// prefix-cache behavior as the `--model` primary. Pre-plumbing these

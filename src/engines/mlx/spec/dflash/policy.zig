@@ -190,8 +190,13 @@ pub const Drafting = struct {
         return true;
     }
 
-    /// A drafted round: `gain` = the ms of plain rounds its tokens would have cost, `wall` = what it took.
-    pub fn record(self: *Drafting, gain: f32, wall: f32) void {
+    /// A round counts for at most this many times the rounds before it (the first: its own gain).
+    const STALL: f32 = 2;
+
+    /// A drafted round: `gain` = the ms of plain rounds its tokens would have cost, `took` = what it took. A stall (a
+    /// kernel's first compile, a foreign GPU job) is not what a round costs, as for `PlainCost`.
+    pub fn record(self: *Drafting, gain: f32, took: f32) void {
+        const wall = @min(took, STALL * if (self.wall > 0) self.wall else gain);
         if (self.wall <= 0) {
             self.gain = gain;
             self.wall = wall;
@@ -552,6 +557,34 @@ test "chooseGroupRows: a poisoned probability is no acceptance, and the cut stay
     var drafts: [1]u32 = undefined;
     _ = chooseGroupRows(&.{&[_]f32{ 0.99, std.math.nan(f32), 0.99, 0.99 }}, &c, &drafts);
     try testing.expect(drafts[0] <= 1);
+}
+
+test "Drafting: a stalled round is not what a round costs" {
+    // A round that emits four tokens in the time of two plain steps.
+    const gain: f32 = 4 * 17.7;
+    var d: Drafting = .{};
+    for (0..20) |_| {
+        try testing.expect(d.shouldDraft());
+        d.record(gain, 35);
+    }
+    // A kernel's first compile, a foreign GPU job: one round takes five seconds. Nothing is owed for it.
+    d.record(gain, 5000);
+    for (0..20) |_| {
+        try testing.expect(d.shouldDraft());
+        d.record(gain, 35);
+    }
+    // The first round of all stalls: a few plain rounds, then drafting again.
+    var cold: Drafting = .{};
+    cold.record(gain, 5000);
+    var rounds: usize = 0;
+    while (cold.skipped < 100 and rounds < 8) {
+        if (cold.shouldDraft()) {
+            cold.record(gain, 35);
+            rounds += 1;
+        }
+    }
+    try testing.expect(cold.skipped < 20);
+    try testing.expect(cold.shouldDraft());
 }
 
 test "GroupCost: rows and states cost more, and a slower machine's rounds scale the prior within bounds" {
