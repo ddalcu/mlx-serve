@@ -68,7 +68,7 @@ pub var g_generation_settings_path: [std.fs.max_path_bytes]u8 = undefined;
 /// A request's generation defaults: the model's rules over the global file's, re-read when
 /// either file changes.
 pub fn requestProfile(io: std.Io, lm: *const LoadedModel) generation_settings.Profile {
-    return .overlay(g_generation_settings.generationDefaults(io, null), request_model.g_model_aliases.generationDefaults(io, lm.path));
+    return .overlay(g_generation_settings.generationDefaults(io, null), request_model.g_model_aliases.generationDefaults(io, .{ .path = lm.path, .real = lm.real_path }));
 }
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
