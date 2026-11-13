@@ -9,6 +9,9 @@
 //!   the rows, then its transpose's reshape copies again. Here each part's transpose is concatenated along the rows:
 //!   one copy into the output projection's layout, the same values.
 //! Each piece declines (null or false: the stock path runs) outside GLM-5.3-Flash's shapes.
+//! MLX_SERVE_GLM_DSA_PROMPT_ONEP (default off, rounding-class): a prompt pass's sparse latent attention (the NAX text,
+//! past 8 rows) meets the values with P as one fp16 piece (`dsa_nax.sparseLatentOneP`), not the stock hi and lo
+//! pieces: half the PV MMAs, P rounded once, so not the stock bytes. Off, nothing changes.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -17,6 +20,7 @@ const env = @import("../../env.zig");
 const log = @import("../../sdk/util/log.zig");
 const naxAvailable = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 const Indexer = @import("glm5_next.zig").Indexer;
+const dsa_nax = @import("dsa_nax.zig");
 
 const Array = mlx.mlx_array;
 
@@ -157,6 +161,30 @@ pub fn selectRows(s: mlx.mlx_stream, q_idx: Array, w: Array, idx_cache: Array, q
     return r.tokens;
 }
 
+/// MLX_SERVE_GLM_DSA_PROMPT_ONEP, read once (tests set it).
+pub var onep_switch: ?bool = null;
+/// One-P launches since the process started (tests read them).
+pub var onep_runs: u64 = 0;
+var onep_said = false;
+
+pub fn onepOn() bool {
+    return env.onCached(&onep_switch, .MLX_SERVE_GLM_DSA_PROMPT_ONEP);
+}
+
+/// `dsa_nax.sparseLatentOneP` for a prompt pass's sparse rows (the caller's gate: more than `HC_PRE_MAX_ROWS` rows in
+/// the pass, more than 8 sparse rows) with the switch on and NAX on the device; null otherwise, the switch read first
+/// (the caller runs the stock `sparseLatentNax`).
+pub fn sparseOneP(s: mlx.mlx_stream, q_abs: Array, latent: Array, idx: Array, scale: f32) !?Array {
+    if (!onepOn() or !naxAvailable()) return null;
+    const out = (try dsa_nax.sparseLatentOneP(s, q_abs, latent, idx, scale)) orelse return null;
+    onep_runs += 1;
+    if (!onep_said) {
+        onep_said = true;
+        log.info("[glm5_next] DSA one-pass engaged\n", .{});
+    }
+    return out;
+}
+
 /// `dsaAttn`'s output from its dense rows' `dense` and sparse rows' `sparse` (each [1, 64, rows, 256], one dtype) in
 /// the output projection's row order, [1, S, 64, 256] in one copy, into `o`; false (nothing set) with the switch off or
 /// outside GLM-5.3-Flash's attention (the stock concatenate and transpose run).
@@ -186,7 +214,6 @@ pub fn assemble(o: *Array, s: mlx.mlx_stream, dense: Array, sparse: Array) !bool
 const testing = std.testing;
 const ops = @import("../../mlx/ops.zig");
 const glm5 = @import("glm5_next.zig");
-const dsa_nax = @import("dsa_nax.zig");
 
 test "glm5_next dsa prompt indexer: plans GLM-5.3-Flash's indexer shapes from 2 rows and more pools than it selects, its scratch 32 MiB of rows at most and at least 256 rows" {
     // a 16K prompt's main call and tail, a 64K and a 128K context
@@ -435,4 +462,165 @@ test "glm5_next dsa prompt indexer: the one-copy output equals the stock concate
     var o = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(o);
     try testing.expect(!try assemble(&o, s, dn, dn));
+}
+
+test "glm5_next dsa prompt one-P: off, it declines before it reads a shape or a stream" {
+    const saved = onep_switch;
+    onep_switch = false;
+    defer onep_switch = saved;
+    const before = onep_runs;
+    const none: Array = .{ .ctx = null };
+    try testing.expect((try sparseOneP(.{ .ctx = null }, none, none, none, 0.0625)) == null);
+    try testing.expectEqual(before, onep_runs);
+}
+
+/// A one-P case's inputs: the selection (the stock tokens) over `c`'s indexer inputs, the absorbed queries
+/// bf16 [1, 64, rows, 512] and the latent rows bf16 [1, 1, t, 512].
+const OnePInputs = struct {
+    sel: Array,
+    q: Array,
+    lat: Array,
+    fn deinit(x: *OnePInputs) void {
+        for ([_]Array{ x.sel, x.q, x.lat }) |a| _ = mlx.mlx_array_free(a);
+    }
+};
+
+fn onePInputs(s: mlx.mlx_stream, seed: *u64, c: SelCase) !OnePInputs {
+    var x = try testSelInputs(s, seed, c);
+    defer x.deinit();
+    const sel = try glm5.selectTokens(s, x.q, x.w, x.cache, test_ix);
+    errdefer _ = mlx.mlx_array_free(sel);
+    try mlx.check(mlx.mlx_array_eval(sel));
+    const q = try testNormal(s, seed, &.{ 1, attn_heads, c.rows, 512 }, .bfloat16, 1.0);
+    errdefer _ = mlx.mlx_array_free(q);
+    const lat = try testNormal(s, seed, &.{ 1, 1, c.t, 512 }, .bfloat16, 1.0);
+    return .{ .sel = sel, .q = q, .lat = lat };
+}
+
+/// The one-P text over `x` with the switch on, evaluated; it must run (one launch counted).
+fn onePWith(s: mlx.mlx_stream, x: OnePInputs) !Array {
+    const saved = onep_switch;
+    onep_switch = true;
+    defer onep_switch = saved;
+    const before = onep_runs;
+    const out = (try sparseOneP(s, x.q, x.lat, x.sel, onep_test_scale)) orelse return error.TestUnexpectedResult;
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_array_eval(out));
+    try testing.expectEqual(before + 1, onep_runs);
+    return out;
+}
+
+/// GLM-5.3-Flash's attention scale (a 256-wide query head: 256^-0.5).
+const onep_test_scale: f32 = 0.0625;
+/// A 16K prompt's last 1,024 rows, its 31-row tail, and a 4K prompt's sparse rows: every query at the 2,051 slots the
+/// stock selection fills.
+const onep_cases = [_]SelCase{
+    .{ .name = "last1k_of_16k", .t = 16356, .rows = 1024 },
+    .{ .name = "tail16k", .t = 16387, .rows = 31 },
+    .{ .name = "cold4k", .t = 4096, .rows = 2045 },
+};
+
+fn f32Of(s: mlx.mlx_stream, a: Array) !Array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_astype(&out, a, .float32, s));
+    return out;
+}
+
+test "glm5_next dsa prompt one-P rounding-class: within the fp16 P bound of the stock two-piece text, every output finite" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (!naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var seed: u64 = 20261113;
+    for (onep_cases) |c| {
+        var x = try onePInputs(s, &seed, c);
+        defer x.deinit();
+        const plain = (try dsa_nax.sparseLatent(s, x.q, x.lat, x.sel, onep_test_scale)) orelse return error.TestUnexpectedResult;
+        defer _ = mlx.mlx_array_free(plain);
+        const onep = try onePWith(s, x);
+        defer _ = mlx.mlx_array_free(onep);
+        const a = try f32Of(s, onep);
+        defer _ = mlx.mlx_array_free(a);
+        const b = try f32Of(s, plain);
+        defer _ = mlx.mlx_array_free(b);
+        const v = try f32Of(s, x.lat);
+        defer _ = mlx.mlx_array_free(v);
+        var v_abs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_abs);
+        try mlx.check(mlx.mlx_abs(&v_abs, v, s));
+        var v_max = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_max);
+        try mlx.check(mlx.mlx_max(&v_max, v_abs, false, s));
+        var d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(d);
+        try mlx.check(mlx.mlx_subtract(&d, a, b, s));
+        var d_abs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(d_abs);
+        try mlx.check(mlx.mlx_abs(&d_abs, d, s));
+        var b_abs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(b_abs);
+        try mlx.check(mlx.mlx_abs(&b_abs, b, s));
+        // P's dropped lo piece is at most 2^-11 P (2^-25 below fp16's normals) and the softmax sum is >= 1, so before the bf16 store |d| <= (2^-11 + 2051 * 2^-25) max|v| < 2^-10 max|v|; the two stores add at most 2^-7 |plain| / (1 - 2^-8) < 0.008 |plain|.
+        const k_v = mlx.mlx_array_new_float(1.0 / 1024.0);
+        defer _ = mlx.mlx_array_free(k_v);
+        const k_b = mlx.mlx_array_new_float(0.008);
+        defer _ = mlx.mlx_array_free(k_b);
+        var tol_v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tol_v);
+        try mlx.check(mlx.mlx_multiply(&tol_v, v_max, k_v, s));
+        var tol_b = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tol_b);
+        try mlx.check(mlx.mlx_multiply(&tol_b, b_abs, k_b, s));
+        var tol = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tol);
+        try mlx.check(mlx.mlx_add(&tol, tol_b, tol_v, s));
+        var within = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(within);
+        try mlx.check(mlx.mlx_less_equal(&within, d_abs, tol, s));
+        var all_within = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(all_within);
+        try mlx.check(mlx.mlx_all(&all_within, within, false, s));
+        var fin = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(fin);
+        try mlx.check(mlx.mlx_isfinite(&fin, a, s));
+        var all_fin = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(all_fin);
+        try mlx.check(mlx.mlx_all(&all_fin, fin, false, s));
+        var d_max = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(d_max);
+        try mlx.check(mlx.mlx_max(&d_max, d_abs, false, s));
+        for ([_]Array{ all_within, all_fin, d_max, v_max }) |r| try mlx.check(mlx.mlx_array_eval(r));
+        var ok_within = false;
+        var ok_fin = false;
+        var dm: f32 = 0;
+        var vm: f32 = 0;
+        try mlx.check(mlx.mlx_array_item_bool(&ok_within, all_within));
+        try mlx.check(mlx.mlx_array_item_bool(&ok_fin, all_fin));
+        try mlx.check(mlx.mlx_array_item_float32(&dm, d_max));
+        try mlx.check(mlx.mlx_array_item_float32(&vm, v_max));
+        if (!ok_within or !ok_fin) std.debug.print("glm5_next dsa prompt one-P: case {s} max|d| {e:.3} max|v| {e:.3} within {d} finite {d}\n", .{ c.name, dm, vm, @intFromBool(ok_within), @intFromBool(ok_fin) });
+        try testing.expect(ok_fin);
+        try testing.expect(ok_within);
+        // the one-P text ran, not the stock one: some output moved
+        try testing.expect(dm > 0);
+    }
+}
+
+test "glm5_next dsa prompt one-P: two runs over the same inputs give the same bytes" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    if (!naxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var seed: u64 = 20261114;
+    for (onep_cases) |c| {
+        var x = try onePInputs(s, &seed, c);
+        defer x.deinit();
+        const first = try onePWith(s, x);
+        defer _ = mlx.mlx_array_free(first);
+        const second = try onePWith(s, x);
+        defer _ = mlx.mlx_array_free(second);
+        ops.expectBitEqual(second, first) catch |e| {
+            std.debug.print("glm5_next dsa prompt one-P: case {s} differs between runs\n", .{c.name});
+            return e;
+        };
+    }
 }

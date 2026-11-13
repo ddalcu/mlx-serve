@@ -574,7 +574,10 @@ pub fn dsaAttn(m: *const Model, sl: Slots, slot: usize, x: Array, d: *const trun
             try mlx.check(mlx.mlx_reshape(&idx_cache, view.v, &[_]c_int{ batch, t, 2 * ihd }, 3, s));
             const sel = try glm5.selectTokens(s, q_idx, wts, idx_cache, ix);
             defer _ = mlx.mlx_array_free(sel);
-            const nax = if (rows > 8) try glm5.sparseLatentNax(s, q_abs, view.k, sel, q_scale orelse 1.0) else null;
+            // MLX_SERVE_GLM_DSA_PROMPT_ONEP: a prompt pass's rows on the one-P text where it serves (null: the stock
+            // NAX text).
+            const onep = if (rows > 8 and seq_len > glm5.HC_PRE_MAX_ROWS) try dsa_prompt.sparseOneP(s, q_abs, view.k, sel, q_scale orelse 1.0) else null;
+            const nax = onep orelse if (rows > 8) try glm5.sparseLatentNax(s, q_abs, view.k, sel, q_scale orelse 1.0) else null;
             const lat_out = nax orelse try glm5.sparseLatentAttention(s, q_abs, view.k, sel, q_scale, 64);
             _ = mlx.mlx_array_free(o_lat);
             o_lat = lat_out;

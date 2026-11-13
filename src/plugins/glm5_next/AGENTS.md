@@ -40,6 +40,8 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
 - DSA levers (MLX_SERVE_GLM_DSA_*, each the stock bytes at GLM-5.3-Flash's indexer and attention dims, declining
   elsewhere): a prompt pass's indexer in one launch and its output in one copy (`dsa_prompt.zig`); a window's tail
   rows read first so the append can reuse the buffer (`dsa_append.zig`).
+- DSA prompt one-P (MLX_SERVE_GLM_DSA_PROMPT_ONEP, default off, rounding-class, not the stock bytes): a prompt pass's
+  sparse attention meets the values with P as one fp16 piece (`dsa_nax.sparseLatentOneP`); composes with the others.
 - Router: the load keeps each routed layer's router as stored (`raw_router`), so 1-4 row calls ride
   `sdk/blocks/moe/router_nax.zig` (MLX's split-K chains or gemv, then the stock router text: same bytes).
 - Forward (`table_forward.zig`): the [B,S,4,D] stream through KDA / DSA sublayers inside mHC; KV and recurrent state
