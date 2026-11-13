@@ -756,6 +756,8 @@ pub fn initWithOptions(
     if (final_start == 0 and tail_len > 1) {
         whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid);
         ctx.prompt_spans = whole_plan.?.spans;
+        // The cache capacity the chunk loop reserves: a model that appends span by span grows it no more often.
+        ctx.cache.reserve(@intCast(reservedPrefillTokens(&xfm.config, total_ctx_for_chunk, max_tokens, PREFILL_CHUNK)));
         if (whole_plan.?.checkpoints.len > 0) {
             prompt_cps = .{
                 .allocator = allocator,
@@ -787,35 +789,56 @@ pub fn initWithOptions(
     // History entries for the held-back span: (hidden[j], token[j+1]) for
     // j in [final_start, prefix_len) — same pairing as the chunk loop.
     // The last row's pair (hidden[last], t1) is appended by the first
-    // nextMtp round, exactly as before.
+    // nextMtp round, exactly as before. A whole-prompt prefill appends its
+    // history over the chunk loop's spans, window rule included, each span
+    // evaluated before the next: one head forward over the whole prompt would
+    // score every row against every key at once.
     if (tail_mtp_capture) {
-        if (!mtp_history_started) {
-            std.debug.assert(mtp_cache.?.step() == 0);
-            mtp_position_base = ssm_cp_offset + final_start;
-            mtp_history_started = true;
+        const prefix_len = prompt_ids.len - 1;
+        const ends: []const u64 = if (whole_plan) |wp| wp.spans else &.{};
+        const hist_window = effectiveMtpHistoryWindow(prefix_len, generate_mod.mtp_history_window_override);
+        var lo: usize = final_start;
+        var k: usize = 0;
+        while (lo < prefix_len) : (k += 1) {
+            const last = k + 1 >= ends.len;
+            const hi: usize = if (last) prefix_len else @intCast(ends[k] - ssm_cp_offset);
+            if (hi <= lo) continue;
+            defer lo = hi;
+            if (!last and !chunkNeedsMtpHistory(lo, hi, prefix_len, hist_window)) continue;
+            if (!mtp_history_started) {
+                std.debug.assert(mtp_cache.?.step() == 0);
+                mtp_position_base = ssm_cp_offset + lo;
+                mtp_history_started = true;
+            }
+            var span_hidden = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(span_hidden);
+            const all_shape = mlx.getShape(tail_hidden_all);
+            const start = [_]c_int{ 0, @intCast(lo - final_start), 0 };
+            const stop = [_]c_int{ all_shape[0], @intCast(hi - final_start), all_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&span_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
+            const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
+                .pos = positions,
+                .total = ctx.mrope_total,
+                .delta = ctx.mrope_delta,
+                .base = mtp_position_base,
+            } else null;
+            try options.mtp.?.appendHistory(
+                xfm,
+                &mtp_cache.?,
+                prompt_ids[lo + 1 .. hi + 1],
+                span_hidden,
+                @intCast(mtp_cache.?.step()),
+                tail_mrope_ctx,
+                allocator,
+            );
+            if (!last) {
+                const eval_vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(eval_vec);
+                mtp_cache.?.appendEvalArrays(eval_vec);
+                try mlx.check(mlx.mlx_eval(eval_vec));
+            }
         }
-        var tail_hist_hidden = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(tail_hist_hidden);
-        const all_shape = mlx.getShape(tail_hidden_all);
-        const start = [_]c_int{ 0, 0, 0 };
-        const stop = [_]c_int{ all_shape[0], @intCast(tail_len - 1), all_shape[2] };
-        const strides = [_]c_int{ 1, 1, 1 };
-        try mlx.check(mlx.mlx_slice(&tail_hist_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
-        const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
-            .pos = positions,
-            .total = ctx.mrope_total,
-            .delta = ctx.mrope_delta,
-            .base = mtp_position_base,
-        } else null;
-        try options.mtp.?.appendHistory(
-            xfm,
-            &mtp_cache.?,
-            prompt_ids[final_start + 1 .. prompt_ids.len],
-            tail_hist_hidden,
-            @intCast(mtp_cache.?.step()),
-            tail_mrope_ctx,
-            allocator,
-        );
     }
     if (dflash_active) {
         ctx.capture_layers = null;
