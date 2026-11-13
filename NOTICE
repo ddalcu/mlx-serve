@@ -460,6 +460,11 @@ with the headers it includes, embedded from the pinned submodule (Copyright
 (`steel/gemm/kernels/steel_gemm_fused_nax.h`) by way of turboexl3's copy
 (Copyright (c) 2023-2025 Apple Inc., MIT License).
 
+`src/kernels/attention/sdpa_rows_{1p,2p1,2p2}.metal` port MLX's `sdpa_vector`,
+`sdpa_vector_2pass_1` and `sdpa_vector_2pass_2` (`sdpa_vector.h`, Copyright (c)
+2024 Apple Inc., MIT License): their statements per query row, several rows in one
+launch, each over its own key count.
+
 --------------------------------------------------------------------------------
 mlx-lm
 https://github.com/ml-explore/mlx-lm

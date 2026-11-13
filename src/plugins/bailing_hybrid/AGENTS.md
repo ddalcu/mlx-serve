@@ -21,9 +21,9 @@ with GLM-5.3-Flash's readers and loads through `glm5_next/trunk.zig`; its own pa
   `quantization_config` (not `expert_streaming`) sets `streamed_bank`; glm5_next's streaming rules then apply. Its prompt
   bill is `prefill_bytes`: the engine's unstreamed arithmetic over `sdk/bill/prefill.zig`, pinned by `bill_test.zig`
   (the closure stays in sdk/); `prompt_last_row` reads the head's last 32 rows only.
-- Exact verify (streaming packs, `serialVerify`, ≤ 16 rows): every verify row carries serial decode's bytes
-  (projections at `QuantTable.exact_rows`, KDA and MLA per row, `moe.mlpRows`), so greedy MTP text equals MTP off;
-  not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.
+- Exact verify (streaming packs, `serialVerify`, ≤ 16 rows): every row carries serial decode's bytes (projections at
+  `QuantTable.exact_rows`, KDA rows in one launch to 8 (`kda/verify_rows.zig`), MLA in one per plan (`sdpa_rows.zig`),
+  `moe.mlpRows`); not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.
 - Ling-3.1's clamps AFTER the SiLU, per layer: `expert_swiglu_limit_list` (routed, the bank's or the composed chain's)
   and `share_expert_swiglu_limit_list` (shared, `moe.Moe.Weights.shared_limit_out`); GLM's clamp is BEFORE it.
 
