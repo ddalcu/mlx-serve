@@ -94,8 +94,8 @@ Attention + KV:
 - **An array-masked prefill SDPA computes EVERY key block, so a sliding layer pays the whole chunk**: sliding layers read a band kernel (`msv_attn_p256` at hd 256, `nax_attention` at q/k 192/128 + v 128); without one the wide prefill chunk loses.
 - **Fused decode QK-norm+RoPE** (`fusedQkNormRope`, laguna): bit-identical; live paired A/B is the bar.
 - **Decode-only dense-attention requant** (`--decode-attn-quant`, default ON, LOSSY): side copies at decode AND verify; prefill dense; tail layers nvfp4-g16 (`attnDqFor`). A/B per newly-adopted dense arch. dsv4 comp_in requant is EXPLICIT opt-in (`decodeAttnQuantExplicit`).
-- **KV invalidation** after tool calls + pad-only gens. Sliding layers keep the full BUFFER (MiMo: a RING, below); the VIEW is sized by the whole BLOCK (`slidingViewFor`, `window + q_len - 1`).
-- **A full-buffer sliding layer caches every token it never reads**: `slidingRing` keeps window + slack rows, billed per slot (`slotFixedKvBytes`), restores above `ringFloor`, never spills.
+- **KV invalidation** after tool calls + pad-only gens. Sliding layers keep the full BUFFER (a RING where the plugin declares `CacheFacts.sliding_ring`, below); the VIEW is sized by the whole BLOCK (`slidingViewFor`, `window + q_len - 1`).
+- **A full-buffer sliding layer caches every token it never reads**: `slidingRing` keeps window + slack rows, billed per slot (`slotFixedKvBytes`), restores above `ringFloor`, spills its ring layers from the first whole chunk they hold (meta v11 `ring`).
 - **Hot-cache restore ALWAYS clamps** (`truncate(final_len)`); a failed restore hands back an EMPTY cache (`errdefer`); every eviction loop needs a no-progress exit (`evictOneLruProgress`). The hybrid DISK arm adopts the spec sidecar of the entry it RESTORED, honours `poisoned`.
 - **kv-quant contract**: attention reads `KVCache.denseView` on EVERY path; schemes extend via enum + two switch arms; `HotEntry` records its scheme; quant snapshots carry 6 handles.
 - **kv8/kv4 attention at hd 256 rides `matmul2d` over a threadgroup tile** (`qkvAttnMppKernel`, window `qkvMppWins`: t_q>=4 from 2K KV, 2-3 from 8K, 1 from 16K).

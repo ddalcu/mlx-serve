@@ -8,6 +8,7 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const generation = @import("../../sdk/config/generation.zig");
 const json = @import("../../sdk/config/json.zig");
+const sliding_ring = @import("../../sdk/config/sliding_ring.zig");
 
 pub const plugin = @import("../../sdk/plugin.zig").Plugin{
     .name = "mimo_v2",
@@ -21,9 +22,6 @@ pub const model_types = [_][]const u8{ "mimo_v2", "mimo_v2_flash" };
 pub const claims = sdk.claimsByType(&model_types);
 
 pub const max_layers = 128;
-
-/// The rows a sliding layer's ring keeps beyond its window (the engine's `SLIDING_RING_SLACK`).
-pub const ring_slack: u32 = 2048;
 
 /// The fields the forward and the load read.
 /// MiMo-V2's MTP heads the plugin serves.
@@ -80,7 +78,7 @@ pub const Config = struct {
     }
 
     pub fn ring(c: *const Config) u32 {
-        return if (c.sliding_window > 0) c.sliding_window + ring_slack else 0;
+        return sliding_ring.rows(c.sliding_window);
     }
 };
 
@@ -294,7 +292,7 @@ test "mimo_v2 config: the pack parses its per-layer geometry, dense prefix and r
     try testing.expectEqual(@as(u32, 8), c.kvHeads(1));
     try testing.expectEqual(@as(u32, 64), c.ropeDims());
     try testing.expectEqual(@as(u32, 1), c.first_k_dense);
-    try testing.expectEqual(@as(u32, 128 + ring_slack), p.cache.sliding_ring);
+    try testing.expectEqual(@as(u32, 128 + sliding_ring.slack), p.cache.sliding_ring);
     var lay: [8]abi.LayerCache = undefined;
     try testing.expectEqual(@as(u32, 6), layout(&p, null, &lay, 8));
     try testing.expect(lay[1].kind == .sliding and lay[1].window == 128 and lay[1].k_dim == 192 and lay[1].v_dim == 128);

@@ -56,7 +56,7 @@ invalidate after tool calls and pad-only generations.
 ### Sliding layers keep the full buffer; the view is what is trimmed
 Defect: (design) Gemma 4 E4B's 512-token window. Fix: the buffer keeps every row, as mlx-lm's `RotatingKVCache` does;
 `slidingViewFor` sizes the view the forward reaches (`window + q_len - 1`), at prefill too (it was once decode-only,
-see below).
+see below). A plugin that declares `CacheFacts.sliding_ring` keeps a ring instead (below).
 
 ### A short restore kept the long donor's KV capacity (#492)
 Defect: a "hi" chat matching only an 80k session's system prompt kept 80k of capacity (1.9 GB), and the byte budget
@@ -1162,8 +1162,12 @@ replay. Guard: `tests/test_mimo_v2.sh` [9].
 Defect: 87% of MiMo's 222 KB/token KV was sliding rows attention never reads; at the app's 1M context the bill left no
 hot cache and an 88k agent turn re-prefilled every turn (~38 s). Fix: `slidingRing` keeps window + slack rows per
 sliding layer (`KVCache.updateSliding`, absolute `offset` via `entry.base`), billed once per slot; a ring cannot
-rewind past dropped rows, so restores stay above `ringFloor` and rings never spill to SSD. Guard: `KVCache sliding
-ring`, the prefix-cache and DiskTier ring tests.
+rewind past dropped rows, so restores stay above `ringFloor`; on SSD a ring's layers go only into the chunks it holds
+whole (meta v11 `ring.from`) and a restore reads their newest `keep` rows.
+MiMo, laguna's family, gpt_oss and gemma4 declare it (`CacheFacts.sliding_ring`). It drops whole 32-row blocks: the
+hd-256 band kernel tiles a whole-buffer view from its first row, and a ring starting off a block boundary summed its
+keys in other groups than the full buffer. Guard: `KVCache sliding ring`, the prefix-cache and DiskTier ring tests,
+each plugin's `keep a ring` proof.
 
 ## GLM-5.3 and Flash Next kernels
 

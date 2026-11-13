@@ -8,6 +8,7 @@ const generation = @import("../../sdk/config/generation.zig");
 const quant_config = @import("../../sdk/config/quantization_config.zig");
 const llama = @import("../llama/config.zig");
 const fam = @import("../laguna/config.zig");
+const sliding_ring = @import("../../sdk/config/sliding_ring.zig");
 
 const field = llama.field;
 const int = llama.int;
@@ -126,6 +127,7 @@ pub fn parse(dir: *const abi.PackDir, config_json: abi.Str, settings_json: abi.S
     };
 
     var p: abi.Parsed = .{ .caps = .{ .dflash_capture = true } };
+    p.cache.sliding_ring = sliding_ring.rows(c.sliding_window);
     p.chat = .{ .thinking_default = .on, .reasoning_dialect = .harmony };
     const s = &p.shell;
     s.* = .{

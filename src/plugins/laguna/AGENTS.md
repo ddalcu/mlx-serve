@@ -21,6 +21,8 @@ the attention-MoE family's shared parse and load: `flint` and `kolibri1` reuse t
 - Proof against a released config: `poolside/Laguna-XS-2.1-NVFP4-mlx`, `RecursiveSI/flint-int4` and
   `here-be-dragons-ai/Kolibri-1-MLX-3bit` (`engines/mlx/plugin/fixtures/mlx_lm/`) at the proof geometry
   (`both.atGeometry`) replay tapes recorded live against the legacy forward; the XS YaRN `beta_fast` 64 fails it.
+- Sliding layers keep a ring of window + 2048 rows (`CacheFacts.sliding_ring`, the family's parse: flint and kolibri1
+  too).
 - Load: router `mlp.gate` or HF-native `mlp.gate.proj` (probe); a missing selection bias is zeros (the reference
   zero-inits it). Decode-attn-quant side copies built at load and read at solo one-row steps through
   `DecodeCopies` (`sdk/bases/blocks/decode_copies.zig`). Refused by name: a dense expert bank in a quantized pack.

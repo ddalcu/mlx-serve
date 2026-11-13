@@ -97,7 +97,8 @@ fn loadModel(ctx: *const abi.LoadCtx) !*Loaded {
     for (m.layers, 0..) |*L, i| {
         const li: u32 = @intCast(i);
         // Gemma 4's q/k norms carry the scale: attention runs at 1.0.
-        const attn = try load_mod.attentionAt(&r, o, c, &sh, li, 1.0, &m.angles);
+        var attn = try load_mod.attentionAt(&r, o, c, &sh, li, 1.0, &m.angles);
+        if (attn.window > 0) attn.ring = ctx.parsed.cache.sliding_ring;
         const scalar = try r.share(try r.name(&nb, "layers.{d}.layer_scalar", .{li}));
         try o.own(scalar);
         L.* = .{

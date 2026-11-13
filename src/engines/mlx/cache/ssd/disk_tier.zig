@@ -237,9 +237,41 @@ pub const IndexEntry = struct {
     /// spans, not the tokens alone: matching, supersede and chunk share clamp at
     /// `mediaSharedBound`. Owned.
     media: []MediaSpan = &.{},
+    /// v11: the sliding-ring layers of the entry (`KVCacheEntry.keep` > 0 at commit).
+    ring: ?RingMeta = null,
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
     last_used: u64,
 };
+
+/// The sliding-ring layers of an entry. A ring holds no row before its `base`, so its layers sit only in the chunks
+/// from `from` on, and a restore reads their newest `keep` rows.
+pub const RingMeta = struct {
+    pub const Layers = std.bit_set.Integer(256);
+    layers: Layers = .empty,
+    from: u32 = 0,
+    keep: u32 = 0,
+    window: u32 = 0,
+
+    /// The shortest prefix a restore serves: a ring layer needs its window behind the match.
+    pub fn floor(r: RingMeta, chunk_tokens: u32) u64 {
+        return @as(u64, r.from) * chunk_tokens + r.window;
+    }
+
+    pub fn holds(r: RingMeta, layer: usize) bool {
+        return layer < Layers.bit_length and r.layers.isSet(layer);
+    }
+
+    pub fn at(r: RingMeta, from: u32) RingMeta {
+        var out = r;
+        out.from = from;
+        return out;
+    }
+};
+
+/// The first chunk of `e` holding its ring layers; an entry without rings holds every layer from chunk 0.
+fn ringFromOf(e: *const IndexEntry) u32 {
+    return if (e.ring) |r| r.from else 0;
+}
 
 const LoadedEntry = struct { e: IndexEntry, mtime: i128 };
 
@@ -1332,6 +1364,8 @@ pub const DiskTier = struct {
             var shared: usize = 0;
             while (shared < max_shared and e.tokens[shared] == prompt_ids[shared]) shared += 1;
             const usable: u32 = @intCast(@min(shared, e.kv_len));
+            // Strict: the caller may restore one row short of a full match.
+            if (e.ring) |r| if (usable <= r.floor(self.chunk_tokens)) continue;
             if (usable > best_usable) {
                 best_usable = usable;
                 best_idx = i;
@@ -1380,6 +1414,7 @@ pub const DiskTier = struct {
                 }
                 continue;
             };
+            if (e.ring) |r| if (cp < r.floor(self.chunk_tokens)) continue;
             if (best == null or cp > best.?.cp) best = .{ .idx = i, .usable = usable, .cp = cp };
         }
         if (deepest_skip) |dd| {
@@ -1561,6 +1596,12 @@ pub const DiskTier = struct {
         if (limit == 0 or limit > e.kv_len) return error.DiskCacheEmptyEntry;
         const n_chunks: u32 = @intCast((@as(u64, limit) + self.chunk_tokens - 1) / self.chunk_tokens);
         if (n_chunks == 0) return error.DiskCacheEmptyEntry;
+        // A ring layer reads its newest `keep` rows from a whole drop block, as the ring itself drops.
+        const ring_start: u64 = if (e.ring) |r| blk: {
+            if (limit < r.floor(self.chunk_tokens)) return error.SlidingRowsDropped;
+            const align_rows = KVCache.ring_drop_align;
+            break :blk @max(@as(u64, r.from) * self.chunk_tokens, (limit -| r.keep) / align_rows * align_rows);
+        } else 0;
         self.chunks_loaded_last = n_chunks;
 
         const load_s = mlx.weightLoadStream();
@@ -1585,6 +1626,9 @@ pub const DiskTier = struct {
         const present = try self.allocator.alloc(bool, n_layers);
         defer self.allocator.free(present);
         @memset(present, false);
+        const loaded = try self.allocator.alloc(u64, n_layers);
+        defer self.allocator.free(loaded);
+        @memset(loaded, 0);
 
         var chunk_i: u32 = 0;
         while (chunk_i < n_chunks) : (chunk_i += 1) {
@@ -1604,16 +1648,22 @@ pub const DiskTier = struct {
             defer _ = mlx.mlx_vector_array_free(chunk_arrays);
 
             for (0..n_layers) |li| {
+                const ring_layer = if (e.ring) |r| r.holds(li) else false;
+                const lo: u64 = if (ring_layer) ring_start -| c0 else 0;
+                if (lo >= need) continue;
                 for (kinds, 0..) |kind, ki| {
                     const key = try std.fmt.allocPrint(self.allocator, "l{d}.{s}\x00", .{ li, kind });
                     defer self.allocator.free(key);
                     var arr = mlx.mlx_array_new();
                     if (mlx.mlx_map_string_to_array_get(&arr, tensor_map, @ptrCast(key.ptr)) != 0) {
                         _ = mlx.mlx_array_free(arr);
-                        if (ki == 0) break; // layer absent from this chunk
+                        if (ki == 0 and !ring_layer) break; // layer absent from this chunk
                         return error.DiskCacheCorruptChunk;
                     }
-                    if (ki == 0) present[li] = true;
+                    if (ki == 0) {
+                        present[li] = true;
+                        loaded[li] += need - lo;
+                    }
                     // Crash-tolerance: a chunk file may hold MORE positions
                     // than meta.json committed to (rewrite raced a crash).
                     // Slice down to the committed range; never trust the file.
@@ -1627,9 +1677,9 @@ pub const DiskTier = struct {
                         _ = mlx.mlx_array_free(arr);
                         return error.DiskCacheCorruptChunk;
                     }
-                    if (have > need) {
+                    if (lo > 0 or have > need) {
                         var sliced = mlx.mlx_array_new();
-                        const st = [_]c_int{ 0, 0, 0, 0 };
+                        const st = [_]c_int{ 0, 0, @intCast(lo), 0 };
                         const sp = [_]c_int{ shape[0], shape[1], @intCast(need), shape[3] };
                         const sd = [_]c_int{ 1, 1, 1, 1 };
                         const rc = mlx.mlx_slice(&sliced, arr, &st, 4, &sp, 4, &sd, 4, s);
@@ -1650,10 +1700,18 @@ pub const DiskTier = struct {
         // step = kv_len.
         // A grow is not in place: leave the room the first grow would add, so the slot's next
         // append writes into this buffer instead of copying the whole restored cache.
-        const room: c_int = @intCast(KVCache.nextCapacity(limit, @as(usize, limit) + 1) - limit);
+        // A layer some chunk lacks would restore short of `limit`.
+        for (present, loaded, 0..) |p, n, li| {
+            const ring_layer = if (e.ring) |r| r.holds(li) else false;
+            if (p and n != limit - (if (ring_layer) ring_start else 0)) return error.DiskCacheCorruptChunk;
+        }
         for (cache.entries, 0..) |*dst, li| {
             transformer_mod.resetKVEntry(dst);
             if (!present[li]) continue;
+            const ring: ?RingMeta = if (e.ring) |r| (if (r.holds(li)) r else null) else null;
+            const first: usize = if (ring != null) @intCast(ring_start) else 0;
+            const rows: usize = limit - first;
+            const room: c_int = @intCast(KVCache.nextCapacity(rows, rows + 1) - rows);
             const base = li * kinds.len;
             for (0..kinds.len) |ki| try appendRoom(vecs[base + ki], room, s);
             try concatInto(&dst.keys, vecs[base + 0], s);
@@ -1666,6 +1724,11 @@ pub const DiskTier = struct {
             }
             dst.offset = limit;
             dst.initialized = true;
+            if (ring) |r| {
+                dst.base = first;
+                dst.keep = r.keep;
+                dst.window = r.window;
+            }
         }
         cache.step = limit;
         // Materialize with a CHECKED eval: a corrupt chunk surfaces its MLX
@@ -1941,13 +2004,19 @@ pub const DiskTier = struct {
         // Every initialized layer must cover the persisted range with B == 1
         // — anything else (mid-spec-decode state, batched cache) is not a
         // persistable snapshot.
-        for (kv_entries) |*entry| {
+        var ring: ?RingMeta = null;
+        var ring_base: usize = 0;
+        for (kv_entries, 0..) |*entry, li| {
             if (!entry.initialized) continue;
-            // The chunk files hold rows from position 0; a sliding ring dropped them.
             if (entry.keep > 0) {
-                log.debug("  [disk-cache] skip: sliding ring layer\n", .{});
-                return .skipped;
-            }
+                if (li >= RingMeta.Layers.bit_length) return .skipped;
+                var r = ring orelse RingMeta{};
+                r.layers.set(li);
+                r.keep = @max(r.keep, @as(u32, @intCast(entry.keep)));
+                r.window = @max(r.window, @as(u32, @intCast(entry.window)));
+                ring = r;
+                ring_base = @max(ring_base, entry.base);
+            } else if (entry.base > 0) return .skipped;
             if (entry.offset < kv_target_u) {
                 log.debug("  [disk-cache] skip: layer offset {d} < kv_len {d}\n", .{ entry.offset, kv_target_u });
                 return .skipped;
@@ -2015,6 +2084,16 @@ pub const DiskTier = struct {
         extend_idx = if (extend_id) |x| self.indexOfId(x) else null;
         ssm_only_idx = if (ssm_only_id) |x| self.indexOfId(x) else null;
         if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, dflash_snap, mtp_snap, s);
+        // Ring layers go only into the chunks their rings still hold whole: a prefix shorter than the first of them
+        // plus the window restores nothing.
+        if (ring) |r| if (ring_base > 0) {
+            const kept: u32 = if (extend_idx) |i| self.entries.items[i].kv_len / self.chunk_tokens else 0;
+            const from = self.ringFromChunk(ring_base, kept, if (extend_idx) |i| ringFromOf(&self.entries.items[i]) else 0);
+            if (r.at(from).floor(self.chunk_tokens) >= kv_target) {
+                log.debug("  [disk-cache] skip: the sliding rings hold no restorable prefix\n", .{});
+                return .skipped;
+            }
+        };
 
         const sw = io_util.Stopwatch.init(self.io);
 
@@ -2037,7 +2116,8 @@ pub const DiskTier = struct {
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
         // turn diverges inside the generated span and used to rewrite every chunk. Off on a synchronous RAM-first tier.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
-        const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
+        // A ring that dropped rows links nothing: the check above read the chunks this commit keeps.
+        const donor = if (extend_idx == null and ring_base == 0) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
         var keep: u32 = if (extend_idx != null) old_kv / self.chunk_tokens else inherited;
         const n_chunks: u32 = @intCast((@as(u64, kv_target) + self.chunk_tokens - 1) / self.chunk_tokens);
@@ -2066,6 +2146,8 @@ pub const DiskTier = struct {
             inherited = keep;
             if (chunk_sizes.items.len > keep) chunk_sizes.shrinkRetainingCapacity(keep);
         }
+        const kept_from: u32 = if (extend_idx) |i| ringFromOf(&self.entries.items[i]) else if (donor) |d| ringFromOf(&self.entries.items[d.idx]) else 0;
+        const ring_from: u32 = if (ring != null) self.ringFromChunk(ring_base, keep, kept_from) else 0;
         if (donor) |d| {
             if (inherited > 0 and self.linkInheritedQsa(d, id)) {
                 inherited_qsa = true;
@@ -2117,7 +2199,7 @@ pub const DiskTier = struct {
             if (written_bytes >= flush_bound and chunk_i > keep) break;
             const c0: u32 = chunk_i * self.chunk_tokens;
             const c1: u32 = @intCast(@min(@as(u64, c0) + self.chunk_tokens, kv_target));
-            const csize = try self.writeChunkFile(kv_entries, config, dir_rel, chunk_i, c0, c1, s);
+            const csize = try self.writeChunkFile(kv_entries, config, dir_rel, chunk_i, c0, c1, chunk_i >= ring_from, s);
             written_bytes += csize;
             try chunk_sizes.append(self.allocator, csize);
         }
@@ -2198,6 +2280,7 @@ pub const DiskTier = struct {
             .qsa_history_rows = if (qsa_res.inherited) inherited_qsa_rows else qsa_res.rows,
             .inherited_qsa = qsa_res.inherited,
             .media = try self.allocator.dupe(MediaSpan, media),
+            .ring = if (ring) |r| r.at(ring_from) else null,
             .last_used = self.bump(),
         };
         errdefer {
@@ -2705,7 +2788,14 @@ pub const DiskTier = struct {
         list.deinit(self.allocator);
     }
 
-    /// Write (or, under SSD-first, stage) one KV chunk. Returns the file's byte size.
+    /// The first chunk holding the ring layers once chunks [0, kept) stay as they are (holding them from `kept_from`)
+    /// and the rest are written from rings whose rows start at `ring_base`.
+    fn ringFromChunk(self: *const DiskTier, ring_base: usize, kept: u32, kept_from: u32) u32 {
+        const first_whole: u32 = @intCast((ring_base + self.chunk_tokens - 1) / self.chunk_tokens);
+        return if (first_whole > kept) first_whole else @min(kept_from, kept);
+    }
+
+    /// Write (or, under SSD-first, stage) one KV chunk; ring layers only `with_rings`. Returns the file's byte size.
     fn writeChunkFile(
         self: *DiskTier,
         kv_entries: []const transformer_mod.KVCacheEntry,
@@ -2714,6 +2804,7 @@ pub const DiskTier = struct {
         chunk_idx: u32,
         c0: u32,
         c1: u32,
+        with_rings: bool,
         s: mlx.mlx_stream,
     ) !u64 {
         var list = std.ArrayList(NamedTensor).empty;
@@ -2722,13 +2813,17 @@ pub const DiskTier = struct {
         const affine = config.scheme != .off;
         for (kv_entries, 0..) |*entry, li| {
             if (!entry.initialized) continue;
-            try self.appendSlice(&list, li, "k", entry.keys, c0, c1, s);
-            try self.appendSlice(&list, li, "v", entry.values, c0, c1, s);
+            if (entry.keep > 0 and !with_rings) continue;
+            if (entry.base > c0) return error.SlidingRowsDropped;
+            const r0: u32 = c0 - @as(u32, @intCast(entry.base));
+            const r1: u32 = c1 - @as(u32, @intCast(entry.base));
+            try self.appendSlice(&list, li, "k", entry.keys, r0, r1, s);
+            try self.appendSlice(&list, li, "v", entry.values, r0, r1, s);
             if (affine) {
-                try self.appendSlice(&list, li, "ks", entry.keys_scales, c0, c1, s);
-                try self.appendSlice(&list, li, "kb", entry.keys_biases, c0, c1, s);
-                try self.appendSlice(&list, li, "vs", entry.values_scales, c0, c1, s);
-                try self.appendSlice(&list, li, "vb", entry.values_biases, c0, c1, s);
+                try self.appendSlice(&list, li, "ks", entry.keys_scales, r0, r1, s);
+                try self.appendSlice(&list, li, "kb", entry.keys_biases, r0, r1, s);
+                try self.appendSlice(&list, li, "vs", entry.values_scales, r0, r1, s);
+                try self.appendSlice(&list, li, "vb", entry.values_biases, r0, r1, s);
             }
         }
 
@@ -3634,6 +3729,8 @@ pub const DiskTier = struct {
     /// downgrade discard the whole tier. v6 = inherited chunks, v5 = the MTP head's QSA half.
     fn metaVersionFor(e: IndexEntry) u8 {
         if (e.kind == .module) return 10;
+        // v11 = ring layers missing from the chunks before `ring.from`: an older reader would restore them short.
+        if (e.ring != null) return 11;
         // v9 = media-keyed identity: an older reader must NOT load these into
         // token-only matching (it would restore past a placeholder under a
         // possibly different image), so a media entry claims a version the old
@@ -3703,6 +3800,14 @@ pub const DiskTier = struct {
                 try out.print(a, "[{d},{d}]", .{ sp.start, @as(i64, @bitCast(sp.key)) });
             }
             try out.appendSlice(a, "]");
+        }
+        // v11: the ring layers and the first chunk holding them.
+        if (e.ring) |r| {
+            try out.print(a, ",\"ring\":{{\"from\":{d},\"keep\":{d},\"window\":{d},\"layers\":[", .{ r.from, r.keep, r.window });
+            var it = r.layers.iterator(.{});
+            var first = true;
+            while (it.next()) |li| : (first = false) try out.print(a, "{s}{d}", .{ if (first) "" else ",", li });
+            try out.appendSlice(a, "]}");
         }
         try out.appendSlice(a, "}");
     }
@@ -3853,7 +3958,8 @@ pub const DiskTier = struct {
         // v9 adds media spans (meta "media"). A v9 entry read by an older binary
         // fails that binary's gate and is dropped — the honest outcome for
         // media-keyed rows, never a token-only restore past a placeholder.
-        if (version < 2 or version > 9) return null;
+        if (version < 2 or version > 11) return null;
+        const ring: ?RingMeta = if (version == 11) (parseRingMeta(obj) orelse return null) else null;
         // v6: the leading `inherited_chunks` chunk files are hard links into a donor's.
         const inherited_rec: u64 = jsonU64(obj, "inherited_chunks") orelse 0;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
@@ -4105,6 +4211,7 @@ pub const DiskTier = struct {
                 .qsa_history_rows = qsa_history_rows,
                 .inherited_qsa = inherited_qsa,
                 .media = media,
+                .ring = ring,
                 .last_used = 0,
             },
             .mtime = stat.mtime.nanoseconds,
@@ -4351,6 +4458,24 @@ fn readFileAlloc(allocator: std.mem.Allocator, io: std.Io, abs_path: []const u8,
     return rs.interface.allocRemaining(allocator, .limited(limit)) catch null;
 }
 
+/// meta.json v11 `ring`; null when absent or malformed.
+fn parseRingMeta(obj: std.json.ObjectMap) ?RingMeta {
+    const v = obj.get("ring") orelse return null;
+    if (v != .object) return null;
+    var r: RingMeta = .{
+        .from = std.math.cast(u32, jsonU64(v.object, "from") orelse return null) orelse return null,
+        .keep = std.math.cast(u32, jsonU64(v.object, "keep") orelse return null) orelse return null,
+        .window = std.math.cast(u32, jsonU64(v.object, "window") orelse return null) orelse return null,
+    };
+    const layers = v.object.get("layers") orelse return null;
+    if (layers != .array or layers.array.items.len == 0 or r.keep < r.window) return null;
+    for (layers.array.items) |l| {
+        if (l != .integer or l.integer < 0 or l.integer >= RingMeta.Layers.bit_length) return null;
+        r.layers.set(@intCast(l.integer));
+    }
+    return r;
+}
+
 fn jsonU64(obj: std.json.ObjectMap, key: []const u8) ?u64 {
     const v = obj.get(key) orelse return null;
     if (v != .integer) return null;
@@ -4444,13 +4569,20 @@ fn parseSpecMeta(obj: std.json.ObjectMap, key: []const u8) ?SpecMeta {
 const testing = std.testing;
 
 fn fillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32, head_dim: u32, seed: f64, dtype: mlx.mlx_dtype) !void {
+    return fillCacheSpan(cache, s, n_layers, 0, tokens, head_dim, seed, dtype, null);
+}
+
+/// A sliding ring at `layer` (`KVCache.updateSliding`).
+const TestRing = struct { layer: u32, window: u32, keep: u32 };
+
+fn fillCacheSpan(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, from: u32, to: u32, head_dim: u32, seed: f64, dtype: mlx.mlx_dtype, ring: ?TestRing) !void {
     // Drive the cache through its real update path with deterministic
     // arange-derived K/V so restored values are checkable. Dense tests use
     // float32 (every position stays exactly distinguishable); the affine test
     // uses bf16, the production dtype the quant write path expects.
-    var written: u32 = 0;
-    while (written < tokens) {
-        const step: u32 = @min(64, tokens - written);
+    var written: u32 = from;
+    while (written < to) {
+        const step: u32 = @min(64, to - written);
         var li: u32 = 0;
         while (li < n_layers) : (li += 1) {
             var flat = mlx.mlx_array_new();
@@ -4469,7 +4601,10 @@ fn fillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32, hea
             var v = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(v);
             try mlx.check(mlx.mlx_negative(&v, k, s));
-            var view = try cache.update(li, k, v, s, 0);
+            var view = if (ring != null and ring.?.layer == li)
+                try cache.updateSliding(li, k, v, s, ring.?.window + step - 1, ring.?.window, ring.?.keep)
+            else
+                try cache.update(li, k, v, s, 0);
             view.deinit();
         }
         written += step;
@@ -4562,7 +4697,90 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
     try testing.expect(tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.affine(4), &.{}) == null);
 }
 
-test "DiskTier: a sliding ring is never persisted (its rows start past position 0)" {
+test "DiskTier: a ring that dropped rows persists its full layers from 0 and its ring from the first chunk it holds whole" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-test", 0, 128);
+    defer tier.deinit();
+
+    // Layer 0 full, layer 1 a 24-row ring over an 8-key window: by 600 tokens it dropped rows 0..416.
+    const ring: TestRing = .{ .layer = 1, .window = 8, .keep = 24 };
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCacheSpan(&cache, s, 2, 0, 600, 8, 0.0, .float32, ring);
+    try testing.expectEqual(@as(usize, 416), cache.entries[1].base);
+    var tokens: [700]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    try testing.expectEqual(PersistOutcome.persisted, try tier.appendCommit(cache.entries, cache.step, cache.config, tokens[0..600], false, null, s));
+
+    // A fresh tier proves the restart path; the ring reads its newest rows from a 32-row block.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-test", 0, 128);
+    defer tier2.deinit();
+    const m = tier2.bestMatch(tokens[0..600], false, kv_quant.KVQuantConfig.dense, &.{}).?;
+    var cache2 = try KVCache.init(testing.allocator, 2);
+    defer cache2.deinit();
+    try tier2.restorePrefixInto(&cache2, m.idx, 599, s);
+    try testing.expectEqual(@as(usize, 0), cache2.entries[0].base);
+    try testing.expectEqual(@as(usize, 599), cache2.entries[0].offset);
+    const r2 = &cache2.entries[1];
+    try testing.expectEqual(@as(usize, 544), r2.base);
+    try testing.expectEqual(@as(usize, 599), r2.offset);
+    try testing.expectEqual(@as(usize, 24), r2.keep);
+    try testing.expectEqual(@as(usize, 8), r2.window);
+    for ([_]u32{ 0, 127, 128, 415, 543, 598 }) |p| try testing.expectEqual(try cacheValueAt(&cache, 0, p, 3, s), try cacheValueAt(&cache2, 0, p, 3, s));
+    for ([_]u32{ 544, 575, 598 }) |p| {
+        const want = try cacheValueAt(&cache, 1, p - 416, 3, s);
+        try testing.expectEqual(want, try cacheValueAt(&cache2, 1, p - 544, 3, s));
+        try testing.expectEqual(-want, try cacheBufValueAt(&cache2, 1, p - 544, 3, s, true));
+    }
+
+    // Below the first ring chunk plus the window nothing restores.
+    var forked = tokens;
+    forked[515] +%= 1;
+    try testing.expect(tier2.bestMatch(forked[0..600], false, kv_quant.KVQuantConfig.dense, &.{}) == null);
+    var cache3 = try KVCache.init(testing.allocator, 2);
+    defer cache3.deinit();
+    try testing.expectError(error.SlidingRowsDropped, tier2.restorePrefixInto(&cache3, m.idx, 519, s));
+
+    // An extension whose ring moved past the kept chunks holds the ring from its new first whole chunk.
+    try fillCacheSpan(&cache, s, 2, 600, 700, 8, 0.0, .float32, ring);
+    try testing.expectEqual(@as(usize, 640), cache.entries[1].base);
+    try testing.expectEqual(PersistOutcome.persisted, try tier2.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s));
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expect(tier2.bestMatch(tokens[0..600], false, kv_quant.KVQuantConfig.dense, &.{}) == null);
+    const m3 = tier2.bestMatch(&tokens, false, kv_quant.KVQuantConfig.dense, &.{}).?;
+    try tier2.restorePrefixInto(&cache3, m3.idx, 699, s);
+    try testing.expectEqual(@as(usize, 672), cache3.entries[1].base);
+    try testing.expectEqual(try cacheValueAt(&cache, 1, 698 - 640, 3, s), try cacheValueAt(&cache3, 1, 698 - 672, 3, s));
+    try testing.expectEqual(try cacheValueAt(&cache, 0, 600, 3, s), try cacheValueAt(&cache3, 0, 600, 3, s));
+}
+
+test "DiskTier: a ring whose first whole chunk plus its window reaches the end persists nothing" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-test", 0, 128);
+    defer tier.deinit();
+
+    // The ring holds rows from 416: chunk 4 (512) is its first whole one, and 512 + 8 is the whole record.
+    var cache = try KVCache.init(testing.allocator, 2);
+    defer cache.deinit();
+    try fillCacheSpan(&cache, s, 2, 0, 520, 8, 0.0, .float32, .{ .layer = 1, .window = 8, .keep = 24 });
+    try testing.expectEqual(@as(usize, 416), cache.entries[1].base);
+    var tokens: [520]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    try testing.expectEqual(PersistOutcome.skipped, try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s));
+    try testing.expectEqual(@as(usize, 0), tier.entryCount());
+}
+
+test "DiskTier: a sliding ring that has dropped no row persists from position 0" {
     const io = std.testing.io;
     const s = mlx.gpuStream();
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -4578,14 +4796,15 @@ test "DiskTier: a sliding ring is never persisted (its rows start past position 
         var k = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k);
         try mlx.check(mlx.mlx_zeros(&k, &[_]c_int{ 1, 2, 150, 8 }, 4, .float32, s));
-        var view = try cache.updateSliding(0, k, k, s, 8 + 150 - 1, 8, 24);
+        var view = try cache.updateSliding(0, k, k, s, 8 + 150 - 1, 8, 1024);
         view.deinit();
     }
+    try testing.expectEqual(@as(usize, 0), cache.entries[0].base);
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
     const out = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
-    try testing.expectEqual(PersistOutcome.skipped, out);
-    try testing.expectEqual(@as(usize, 0), tier.entryCount());
+    try testing.expectEqual(PersistOutcome.persisted, out);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
 }
 
 test "DiskTier: extend commit appends only new chunks (full chunks untouched)" {
