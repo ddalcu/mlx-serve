@@ -431,67 +431,67 @@ fn evalHost(s: S, arr: mlx.mlx_array, out: []f32) !void {
     @memcpy(out, data[0..out.len]);
 }
 
-inline fn mm(x: mlx.mlx_array, w_t: mlx.mlx_array, s: S) mlx.mlx_array {
+inline fn mm(x: mlx.mlx_array, w_t: mlx.mlx_array, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_matmul(&r, x, w_t, s);
+    try mlx.check(mlx.mlx_matmul(&r, x, w_t, s));
     return r;
 }
 
-inline fn addM(a: mlx.mlx_array, b: mlx.mlx_array, s: S) mlx.mlx_array {
+inline fn addM(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_add(&r, a, b, s);
+    try mlx.check(mlx.mlx_add(&r, a, b, s));
     return r;
 }
 
-inline fn rmsn(x: mlx.mlx_array, g: mlx.mlx_array, eps: f32, s: S) mlx.mlx_array {
+inline fn rmsn(x: mlx.mlx_array, g: mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_fast_rms_norm(&r, x, g, eps, s);
+    try mlx.check(mlx.mlx_fast_rms_norm(&r, x, g, eps, s));
     return r;
 }
 
-inline fn reshape(x: mlx.mlx_array, shape: []const c_int, s: S) mlx.mlx_array {
+inline fn reshape(x: mlx.mlx_array, shape: []const c_int, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_reshape(&r, x, shape.ptr, @intCast(shape.len), s);
+    try mlx.check(mlx.mlx_reshape(&r, x, shape.ptr, @intCast(shape.len), s));
     return r;
 }
 
-inline fn transpose(x: mlx.mlx_array, axes: []const c_int, s: S) mlx.mlx_array {
+inline fn transpose(x: mlx.mlx_array, axes: []const c_int, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_transpose_axes(&r, x, axes.ptr, @intCast(axes.len), s);
+    try mlx.check(mlx.mlx_transpose_axes(&r, x, axes.ptr, @intCast(axes.len), s));
     return r;
 }
 
-fn siluArr(x: mlx.mlx_array, s: S) mlx.mlx_array {
+fn siluArr(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     var sig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sig);
-    _ = mlx.mlx_sigmoid(&sig, x, s);
+    try mlx.check(mlx.mlx_sigmoid(&sig, x, s));
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_multiply(&r, x, sig, s);
+    try mlx.check(mlx.mlx_multiply(&r, x, sig, s));
     return r;
 }
 
 /// RoPE via the house fused op (interleaved HF convention).
-fn ropeApply(x: mlx.mlx_array, theta: f64, scale: f64, hd: c_int, s: S) mlx.mlx_array {
+fn ropeApply(x: mlx.mlx_array, theta: f64, scale: f64, hd: c_int, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_fast_rope(&r, x, hd, false, .{ .value = @floatCast(theta), .has_value = true }, @floatCast(scale), 0, null_arr, s);
+    try mlx.check(mlx.mlx_fast_rope(&r, x, hd, false, .{ .value = @floatCast(theta), .has_value = true }, @floatCast(scale), 0, null_arr, s));
     return r;
 }
 
-fn ropeApplyFreqs(x: mlx.mlx_array, freqs: mlx.mlx_array, hd: c_int, s: S) mlx.mlx_array {
+fn ropeApplyFreqs(x: mlx.mlx_array, freqs: mlx.mlx_array, hd: c_int, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_fast_rope(&r, x, hd, false, .{}, 1.0, 0, freqs, s);
+    try mlx.check(mlx.mlx_fast_rope(&r, x, hd, false, .{}, 1.0, 0, freqs, s));
     return r;
 }
 
-// The depth decoder's rope: the pack config declares llama3 scaling (factor 32,
-// orig_ctx 16), but sampled audio is word-accurate only with plain theta; the
-// scaled table garbles it. Scaled-path parity against the oracle is still open
-// (early eos), so the scaled arm stays unimplemented.
+// The depth decoder's rope: the pack declares llama3 scaling (factor 32,
+// orig_ctx 16) and plain theta is what the sampled oracle reproduces, so this
+// engine ropes with plain theta. config.zig reads `rope_scaling` and refuses
+// any OTHER declared arm by name — the reason lives there, not as a comment.
 
-fn sdpa(q4: mlx.mlx_array, k4: mlx.mlx_array, v4: mlx.mlx_array, scale: f32, mask: mlx.mlx_array, s: S) mlx.mlx_array {
+fn sdpa(q4: mlx.mlx_array, k4: mlx.mlx_array, v4: mlx.mlx_array, scale: f32, mask: mlx.mlx_array, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
     const mode: [*:0]const u8 = if (mask.ctx == null) "causal" else "array";
-    _ = mlx.mlx_fast_scaled_dot_product_attention(&r, q4, k4, v4, scale, mode, mask, null_arr, false, s);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&r, q4, k4, v4, scale, mode, mask, null_arr, false, s));
     return r;
 }
 
@@ -502,13 +502,13 @@ pub const KV = struct {
     v: mlx.mlx_array = null_arr,
 };
 
-fn concat2(s: S, a: mlx.mlx_array, b: mlx.mlx_array, axis: c_int) mlx.mlx_array {
+fn concat2(s: S, a: mlx.mlx_array, b: mlx.mlx_array, axis: c_int) !mlx.mlx_array {
     if (a.ctx == null) return b;
     const vec = mlx.mlx_vector_array_new();
     _ = mlx.mlx_vector_array_append_value(vec, a);
     _ = mlx.mlx_vector_array_append_value(vec, b);
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_concatenate_axis(&r, vec, axis, s);
+    try mlx.check(mlx.mlx_concatenate_axis(&r, vec, axis, s));
     _ = mlx.mlx_vector_array_free(vec);
     return r;
 }
@@ -551,57 +551,57 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, x_host: []cons
     const sh = [_]c_int{ 1, @intCast(L), @intCast(hidden) };
     var x = hostF32(x_host, &sh);
     var x16 = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&x16, x, .bfloat16, s);
+    try mlx.check(mlx.mlx_astype(&x16, x, .bfloat16, s));
     _ = mlx.mlx_array_free(x); // x16's graph owns the impl now
     x = x16;
 
     for (layers, 0..) |lw, lidx| {
-        const xn = rmsn(x, lw.in_ln, eps, s);
+        const xn = try rmsn(x, lw.in_ln, eps, s);
         defer _ = mlx.mlx_array_free(xn);
-        const q = mm(xn, lw.q, s);
+        const q = try mm(xn, lw.q, s);
         defer _ = mlx.mlx_array_free(q);
-        const k = mm(xn, lw.k, s);
+        const k = try mm(xn, lw.k, s);
         defer _ = mlx.mlx_array_free(k);
-        const v = mm(xn, lw.v, s);
+        const v = try mm(xn, lw.v, s);
         defer _ = mlx.mlx_array_free(v);
         const hd: c_int = @intCast(lw.head_dim);
         const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], @as(c_int, hd)));
         const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], @as(c_int, hd)));
-        var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
-        var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
-        const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+        var q4 = try reshape(q, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+        var k4 = try reshape(k, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+        const v4 = try reshape(v, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
         const lq: usize = L * @as(usize, @intCast(qh));
         const lk: usize = L * @as(usize, @intCast(kh));
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
-            const q4f = reshape(q4, &[_]c_int{ @intCast(lq), hd }, s);
-            const q4n1 = rmsn(q4f, lw.qn, eps, s);
+            const q4f = try reshape(q4, &[_]c_int{ @intCast(lq), hd }, s);
+            const q4n1 = try rmsn(q4f, lw.qn, eps, s);
             _ = mlx.mlx_array_free(q4f);
-            const q4n = reshape(q4n1, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+            const q4n = try reshape(q4n1, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
             _ = mlx.mlx_array_free(q4n1);
             _ = mlx.mlx_array_free(q4);
             q4 = q4n;
-            const k4f = reshape(k4, &[_]c_int{ @intCast(lk), hd }, s);
-            const k4n1 = rmsn(k4f, lw.kn, eps, s);
+            const k4f = try reshape(k4, &[_]c_int{ @intCast(lk), hd }, s);
+            const k4n1 = try rmsn(k4f, lw.kn, eps, s);
             _ = mlx.mlx_array_free(k4f);
-            const k4n = reshape(k4n1, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+            const k4n = try reshape(k4n1, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
             _ = mlx.mlx_array_free(k4n1);
             _ = mlx.mlx_array_free(k4);
             k4 = k4n;
         }
         defer _ = mlx.mlx_array_free(q4);
         defer _ = mlx.mlx_array_free(k4);
-        const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const qt = try transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(qt);
-        const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const kt = try transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(kt);
-        const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        const qr = if (freqs.ctx != null) ropeApplyFreqs(qt, freqs, hd, s) else ropeApply(qt, theta, pos_scale, hd, s);
+        const vt = try transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const qr = if (freqs.ctx != null) try ropeApplyFreqs(qt, freqs, hd, s) else try ropeApply(qt, theta, pos_scale, hd, s);
         defer _ = mlx.mlx_array_free(qr);
-        const kr = if (freqs.ctx != null) ropeApplyFreqs(kt, freqs, hd, s) else ropeApply(kt, theta, pos_scale, hd, s);
+        const kr = if (freqs.ctx != null) try ropeApplyFreqs(kt, freqs, hd, s) else try ropeApply(kt, theta, pos_scale, hd, s);
         const has_mask = window > 0;
-        const mask = if (has_mask) windowMask(s, L, window) else null_arr;
-        const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(lw.head_dim))))), mask, s);
+        const mask = if (has_mask) try windowMask(s, L, window) else null_arr;
+        const att = try sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(lw.head_dim))))), mask, s);
         defer _ = mlx.mlx_array_free(att);
         if (has_mask) _ = mlx.mlx_array_free(mask);
         if (kv_save) |ks| {
@@ -610,42 +610,42 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, x_host: []cons
             _ = mlx.mlx_array_free(kr);
             _ = mlx.mlx_array_free(vt);
         }
-        const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const at = try transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
-        const af = reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(mlx.getShape(lw.q)[1]) }, s);
+        const af = try reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(mlx.getShape(lw.q)[1]) }, s);
         defer _ = mlx.mlx_array_free(af);
-        const o = mm(af, lw.o, s);
+        const o = try mm(af, lw.o, s);
         defer _ = mlx.mlx_array_free(o);
         const ar = blk: {
             if (lw.eps_arr.ctx != null) {
                 if (try residual_norm.fusedAddRmsNorm(s, x, o, lw.post_ln, lw.eps_arr)) |r| break :blk r;
             }
-            const h1n = addM(x, o, s);
-            break :blk residual_norm.AddNormResult{ .sum = h1n, .normed = rmsn(h1n, lw.post_ln, eps, s) };
+            const h1n = try addM(x, o, s);
+            break :blk residual_norm.AddNormResult{ .sum = h1n, .normed = try rmsn(h1n, lw.post_ln, eps, s) };
         };
         const h1 = ar.sum;
         defer _ = mlx.mlx_array_free(h1);
         const hn = ar.normed;
         defer _ = mlx.mlx_array_free(hn);
-        const g = mm(hn, lw.gate, s);
+        const g = try mm(hn, lw.gate, s);
         defer _ = mlx.mlx_array_free(g);
-        const u = mm(hn, lw.up, s);
+        const u = try mm(hn, lw.up, s);
         defer _ = mlx.mlx_array_free(u);
         const gu = if (try fused_activations.fusedSwiGLU(s, g, u)) |sg| sg else blk: {
-            const gs = siluArr(g, s);
-            break :blk mulEl(s, gs, u);
+            const gs = try siluArr(g, s);
+            break :blk try mulEl(s, gs, u);
         };
         defer _ = mlx.mlx_array_free(gu);
-        const mlp = mm(gu, lw.down, s);
+        const mlp = try mm(gu, lw.down, s);
         defer _ = mlx.mlx_array_free(mlp);
         const x_prev = x;
-        x = addM(h1, mlp, s);
+        x = try addM(h1, mlp, s);
         _ = mlx.mlx_array_free(x_prev);
     }
     const x_norm_prev = x;
-    x = rmsn(x, norm, eps, s);
+    x = try rmsn(x, norm, eps, s);
     _ = mlx.mlx_array_free(x_norm_prev);
-    const last = reshape(x, &[_]c_int{ @intCast(L), @intCast(hidden) }, s);
+    const last = try reshape(x, &[_]c_int{ @intCast(L), @intCast(hidden) }, s);
     defer _ = mlx.mlx_array_free(last);
     var idx = [_]u32{@intCast(L - 1)};
     var taken = mlx.mlx_array_new();
@@ -657,14 +657,19 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, x_host: []cons
 
 fn eval1(a: mlx.mlx_array) c_int {
     const vec = mlx.mlx_vector_array_new_value(a);
-    const r = mlx.mlx_eval(vec);
-    _ = mlx.mlx_vector_array_free(vec);
-    return r;
+    defer _ = mlx.mlx_vector_array_free(vec);
+    return mlx.mlx_eval(vec);
 }
 
-fn ropeApplyOff(x: mlx.mlx_array, theta: f64, off: c_int, hd: c_int, s: S) mlx.mlx_array {
+/// A deferred eval whose failure surfaces: an empty k/v concat is only read
+/// after this point, so a failed command buffer must not slide into the sdpa.
+fn evalChecked(a: mlx.mlx_array) !void {
+    if (eval1(a) != 0) return error.MlxError;
+}
+
+fn ropeApplyOff(x: mlx.mlx_array, theta: f64, off: c_int, hd: c_int, s: S) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_fast_rope(&r, x, hd, false, .{ .value = @floatCast(theta), .has_value = true }, 1.0, off, null_arr, s);
+    try mlx.check(mlx.mlx_fast_rope(&r, x, hd, false, .{ .value = @floatCast(theta), .has_value = true }, 1.0, off, null_arr, s));
     return r;
 }
 
@@ -675,25 +680,25 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, xrow: []const f32
     const sh = [_]c_int{ 1, 1, @intCast(hidden) };
     var x = hostF32(xrow, &sh);
     var x16 = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&x16, x, .bfloat16, s);
+    try mlx.check(mlx.mlx_astype(&x16, x, .bfloat16, s));
     _ = mlx.mlx_array_free(x); // x16's graph owns the impl now
     x = x16;
 
     for (layers, 0..) |lw, lidx| {
-        const xn = rmsn(x, lw.in_ln, eps, s);
+        const xn = try rmsn(x, lw.in_ln, eps, s);
         defer _ = mlx.mlx_array_free(xn);
-        const q = mm(xn, lw.q, s);
+        const q = try mm(xn, lw.q, s);
         defer _ = mlx.mlx_array_free(q);
-        const k = mm(xn, lw.k, s);
+        const k = try mm(xn, lw.k, s);
         defer _ = mlx.mlx_array_free(k);
-        const v = mm(xn, lw.v, s);
+        const v = try mm(xn, lw.v, s);
         defer _ = mlx.mlx_array_free(v);
         const hd: c_int = @intCast(lw.head_dim);
         const qh: c_int = @intCast(@divExact(mlx.getShape(lw.q)[1], @as(c_int, hd)));
         const kh: c_int = @intCast(@divExact(mlx.getShape(lw.k)[1], @as(c_int, hd)));
-        const v4 = reshape(v, &[_]c_int{ 1, 1, kh, hd }, s);
+        const v4 = try reshape(v, &[_]c_int{ 1, 1, kh, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
-        const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s); // freed at the loop tail: kv may alias it
+        const vt = try transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s); // freed at the loop tail: kv may alias it
         // The sdk fused decode kernel: q/k per-head RMSNorm + RoPE + transpose
         // in one dispatch (bit-identical to the chain below; qwen3_tts's shape),
         // composed chain when it declines.
@@ -710,73 +715,73 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, xrow: []const f32
             }
         }
         if (!fused) {
-            var q4 = reshape(q, &[_]c_int{ 1, 1, qh, hd }, s);
-            var k4 = reshape(k, &[_]c_int{ 1, 1, kh, hd }, s);
+            var q4 = try reshape(q, &[_]c_int{ 1, 1, qh, hd }, s);
+            var k4 = try reshape(k, &[_]c_int{ 1, 1, kh, hd }, s);
             if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
-                const q4f = reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), hd }, s);
-                const q4n1 = rmsn(q4f, lw.qn, eps, s);
+                const q4f = try reshape(q4, &[_]c_int{ @intCast(@as(usize, @intCast(qh))), hd }, s);
+                const q4n1 = try rmsn(q4f, lw.qn, eps, s);
                 _ = mlx.mlx_array_free(q4f);
                 _ = mlx.mlx_array_free(q4);
-                q4 = reshape(q4n1, &[_]c_int{ 1, 1, qh, hd }, s);
+                q4 = try reshape(q4n1, &[_]c_int{ 1, 1, qh, hd }, s);
                 _ = mlx.mlx_array_free(q4n1);
-                const k4f = reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), hd }, s);
-                const k4n1 = rmsn(k4f, lw.kn, eps, s);
+                const k4f = try reshape(k4, &[_]c_int{ @intCast(@as(usize, @intCast(kh))), hd }, s);
+                const k4n1 = try rmsn(k4f, lw.kn, eps, s);
                 _ = mlx.mlx_array_free(k4f);
                 _ = mlx.mlx_array_free(k4);
-                k4 = reshape(k4n1, &[_]c_int{ 1, 1, kh, hd }, s);
+                k4 = try reshape(k4n1, &[_]c_int{ 1, 1, kh, hd }, s);
                 _ = mlx.mlx_array_free(k4n1);
             }
-            const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+            const qt = try transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
             defer _ = mlx.mlx_array_free(qt);
-            const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+            const kt = try transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
             defer _ = mlx.mlx_array_free(kt);
-            qr = ropeApplyOff(qt, theta, pos, hd, s);
-            kr = ropeApplyOff(kt, theta, pos, hd, s);
+            qr = try ropeApplyOff(qt, theta, pos, hd, s);
+            kr = try ropeApplyOff(kt, theta, pos, hd, s);
             _ = mlx.mlx_array_free(q4);
             _ = mlx.mlx_array_free(k4);
         }
         const pk = kv[lidx].k;
         const pv = kv[lidx].v;
-        const kc = concat2(s, kv[lidx].k, kr, 2);
-        const vc = concat2(s, kv[lidx].v, vt, 2);
+        const kc = try concat2(s, kv[lidx].k, kr, 2);
+        const vc = try concat2(s, kv[lidx].v, vt, 2);
         kv[lidx].k = kc;
         kv[lidx].v = vc;
         if (pk.ctx != null) _ = mlx.mlx_array_free(pk);
         if (pv.ctx != null) _ = mlx.mlx_array_free(pv);
-        _ = eval1(kv[lidx].k);
-        _ = eval1(kv[lidx].v);
-        const att = sdpa(qr, kv[lidx].k, kv[lidx].v, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(lw.head_dim))))), null_arr, s);
+        try evalChecked(kv[lidx].k);
+        try evalChecked(kv[lidx].v);
+        const att = try sdpa(qr, kv[lidx].k, kv[lidx].v, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(lw.head_dim))))), null_arr, s);
         defer _ = mlx.mlx_array_free(att);
-        const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const at = try transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
-        const af = reshape(at, &[_]c_int{ 1, 1, @intCast(mlx.getShape(lw.q)[1]) }, s);
+        const af = try reshape(at, &[_]c_int{ 1, 1, @intCast(mlx.getShape(lw.q)[1]) }, s);
         defer _ = mlx.mlx_array_free(af);
-        const o = mm(af, lw.o, s);
+        const o = try mm(af, lw.o, s);
         defer _ = mlx.mlx_array_free(o);
         const ar = blk: {
             if (lw.eps_arr.ctx != null) {
                 if (try residual_norm.fusedAddRmsNorm(s, x, o, lw.post_ln, lw.eps_arr)) |r| break :blk r;
             }
-            const h1n = addM(x, o, s);
-            break :blk residual_norm.AddNormResult{ .sum = h1n, .normed = rmsn(h1n, lw.post_ln, eps, s) };
+            const h1n = try addM(x, o, s);
+            break :blk residual_norm.AddNormResult{ .sum = h1n, .normed = try rmsn(h1n, lw.post_ln, eps, s) };
         };
         const h1 = ar.sum;
         defer _ = mlx.mlx_array_free(h1);
         const hn = ar.normed;
         defer _ = mlx.mlx_array_free(hn);
-        const g = mm(hn, lw.gate, s);
+        const g = try mm(hn, lw.gate, s);
         defer _ = mlx.mlx_array_free(g);
-        const u = mm(hn, lw.up, s);
+        const u = try mm(hn, lw.up, s);
         defer _ = mlx.mlx_array_free(u);
         const gu = if (try fused_activations.fusedSwiGLU(s, g, u)) |sg| sg else blk: {
-            const gs = siluArr(g, s);
-            break :blk mulEl(s, gs, u);
+            const gs = try siluArr(g, s);
+            break :blk try mulEl(s, gs, u);
         };
         defer _ = mlx.mlx_array_free(gu);
-        const mlp = mm(gu, lw.down, s);
+        const mlp = try mm(gu, lw.down, s);
         defer _ = mlx.mlx_array_free(mlp);
         const x_prev = x;
-        x = addM(h1, mlp, s);
+        x = try addM(h1, mlp, s);
         _ = mlx.mlx_array_free(x_prev);
         // concat2 returns `b` unchanged when the cache is still empty, in which
         // case the kv entry aliases kr/vt's handles and they must stay alive
@@ -785,21 +790,21 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, xrow: []const f32
         if (vc.ctx != vt.ctx) _ = mlx.mlx_array_free(vt);
     }
     const x_norm_prev = x;
-    x = rmsn(x, norm, eps, s);
+    x = try rmsn(x, norm, eps, s);
     _ = mlx.mlx_array_free(x_norm_prev);
-    const lasth = reshape(x, &[_]c_int{@intCast(hidden)}, s);
+    const lasth = try reshape(x, &[_]c_int{@intCast(hidden)}, s);
     defer _ = mlx.mlx_array_free(lasth);
     try evalHost(s, lasth, out_last);
     _ = mlx.mlx_array_free(x);
 }
 
-fn mulEl(s: S, a: mlx.mlx_array, b: mlx.mlx_array) mlx.mlx_array {
+fn mulEl(s: S, a: mlx.mlx_array, b: mlx.mlx_array) !mlx.mlx_array {
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_multiply(&r, a, b, s);
+    try mlx.check(mlx.mlx_multiply(&r, a, b, s));
     return r;
 }
 
-fn windowMask(s: S, L: usize, w: usize) mlx.mlx_array {
+fn windowMask(s: S, L: usize, w: usize) !mlx.mlx_array {
     const buf = std.heap.page_allocator.alloc(f32, L * L) catch return null_arr;
     defer std.heap.page_allocator.free(buf);
     for (0..L) |i| {
@@ -811,7 +816,7 @@ fn windowMask(s: S, L: usize, w: usize) mlx.mlx_array {
     const h = hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
     defer _ = mlx.mlx_array_free(h);
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&r, h, .bfloat16, s);
+    try mlx.check(mlx.mlx_astype(&r, h, .bfloat16, s));
     return r;
 }
 
@@ -937,110 +942,110 @@ fn teCond(alloc: std.mem.Allocator, s: S, te: *const Te, ids: []const u32, out: 
 
     for (te.layers, te_post_attn, 0..) |lw, ps, li| {
         const full = te.isFullLayer(li);
-        const xn = rmsn(x, lw.in_ln, te.eps, s);
+        const xn = try rmsn(x, lw.in_ln, te.eps, s);
         defer _ = mlx.mlx_array_free(xn);
-        const q = mm(xn, lw.q, s);
+        const q = try mm(xn, lw.q, s);
         defer _ = mlx.mlx_array_free(q);
-        const k = mm(xn, lw.k, s);
+        const k = try mm(xn, lw.k, s);
         defer _ = mlx.mlx_array_free(k);
-        const v = mm(xn, lw.v, s);
+        const v = try mm(xn, lw.v, s);
         defer _ = mlx.mlx_array_free(v);
         const qh: c_int = @divExact(mlx.getShape(lw.q)[1], @as(c_int, @intCast(te.head_dim)));
         const kh: c_int = @divExact(mlx.getShape(lw.k)[1], @as(c_int, @intCast(te.head_dim)));
         const hd: c_int = @intCast(te.head_dim);
-        const v4 = reshape(v, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+        const v4 = try reshape(v, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
         defer _ = mlx.mlx_array_free(v4);
-        const vt = transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const vt = try transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(vt);
         const theta = if (full) te.theta_full else te.theta_slide;
         const p_scale = if (full) (1.0 / te.factor_full) else 1.0;
         // TE's rope carries a per-layer position scale (YaRN-style on the full
         // layers) the fused QK kernel has no arm for, so the chain stays
         // composed here; the fused decode kernel covers the frame loop.
-        var q4 = reshape(q, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
-        var k4 = reshape(k, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+        var q4 = try reshape(q, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+        var k4 = try reshape(k, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
         defer _ = mlx.mlx_array_free(q4);
         defer _ = mlx.mlx_array_free(k4);
         {
-            const q4f = reshape(q4, &[_]c_int{ @intCast(L * @as(usize, @intCast(qh))), hd }, s);
-            const q4n1 = rmsn(q4f, lw.qn, te.eps, s);
+            const q4f = try reshape(q4, &[_]c_int{ @intCast(L * @as(usize, @intCast(qh))), hd }, s);
+            const q4n1 = try rmsn(q4f, lw.qn, te.eps, s);
             _ = mlx.mlx_array_free(q4f);
-            const q4n = reshape(q4n1, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
+            const q4n = try reshape(q4n1, &[_]c_int{ 1, @intCast(L), qh, hd }, s);
             _ = mlx.mlx_array_free(q4n1);
             _ = mlx.mlx_array_free(q4);
             q4 = q4n;
-            const k4f = reshape(k4, &[_]c_int{ @intCast(L * @as(usize, @intCast(kh))), hd }, s);
-            const k4n1 = rmsn(k4f, lw.kn, te.eps, s);
+            const k4f = try reshape(k4, &[_]c_int{ @intCast(L * @as(usize, @intCast(kh))), hd }, s);
+            const k4n1 = try rmsn(k4f, lw.kn, te.eps, s);
             _ = mlx.mlx_array_free(k4f);
-            const k4n = reshape(k4n1, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
+            const k4n = try reshape(k4n1, &[_]c_int{ 1, @intCast(L), kh, hd }, s);
             _ = mlx.mlx_array_free(k4n1);
             _ = mlx.mlx_array_free(k4);
             k4 = k4n;
         }
-        const qt = transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const qt = try transpose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(qt);
-        const kt = transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const kt = try transpose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(kt);
-        const qr = ropeApply(qt, theta, p_scale, @intCast(te.head_dim), s);
+        const qr = try ropeApply(qt, theta, p_scale, @intCast(te.head_dim), s);
         defer _ = mlx.mlx_array_free(qr);
-        const kr = ropeApply(kt, theta, p_scale, @intCast(te.head_dim), s);
+        const kr = try ropeApply(kt, theta, p_scale, @intCast(te.head_dim), s);
         defer _ = mlx.mlx_array_free(kr);
-        const mask = if (full) teFullMask(s, L) else teLocalMask(s, L, te.window);
+        const mask = if (full) try teFullMask(s, L) else try teLocalMask(s, L, te.window);
         const mask_live = mask.ctx != null;
         defer {
             if (mask_live) _ = mlx.mlx_array_free(mask);
         }
-        const att = sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(te.head_dim))))), mask, s);
+        const att = try sdpa(qr, kr, vt, @as(f32, @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(te.head_dim))))), mask, s);
         defer _ = mlx.mlx_array_free(att);
-        const at = transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
+        const at = try transpose(att, &[_]c_int{ 0, 2, 1, 3 }, s);
         defer _ = mlx.mlx_array_free(at);
-        const af = reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(te.layers[0].q_heads * te.head_dim) }, s);
+        const af = try reshape(at, &[_]c_int{ 1, @intCast(L), @intCast(te.layers[0].q_heads * te.head_dim) }, s);
         defer _ = mlx.mlx_array_free(af);
-        const o = mm(af, lw.o, s);
+        const o = try mm(af, lw.o, s);
         defer _ = mlx.mlx_array_free(o);
-        const on = rmsn(o, ps, te.eps, s);
+        const on = try rmsn(o, ps, te.eps, s);
         defer _ = mlx.mlx_array_free(on);
-        const h1 = addM(x, on, s);
+        const h1 = try addM(x, on, s);
         defer _ = mlx.mlx_array_free(h1);
-        const hn = rmsn(h1, lw.pre_ff, te.eps, s);
+        const hn = try rmsn(h1, lw.pre_ff, te.eps, s);
         defer _ = mlx.mlx_array_free(hn);
-        const g = mm(hn, lw.gate, s);
+        const g = try mm(hn, lw.gate, s);
         defer _ = mlx.mlx_array_free(g);
-        const u = mm(hn, lw.up, s);
+        const u = try mm(hn, lw.up, s);
         defer _ = mlx.mlx_array_free(u);
-        const act = geluTanhArr(g, s);
+        const act = try geluTanhArr(g, s);
         defer _ = mlx.mlx_array_free(act);
-        const gu = mulEl(s, act, u);
+        const gu = try mulEl(s, act, u);
         defer _ = mlx.mlx_array_free(gu);
-        const dn = mm(gu, lw.down, s);
+        const dn = try mm(gu, lw.down, s);
         defer _ = mlx.mlx_array_free(dn);
-        const dnn = rmsn(dn, lw.post_ln, te.eps, s);
+        const dnn = try rmsn(dn, lw.post_ln, te.eps, s);
         defer _ = mlx.mlx_array_free(dnn);
         const x_prev = x;
-        x = addM(h1, dnn, s);
+        x = try addM(h1, dnn, s);
         _ = mlx.mlx_array_free(x_prev);
     }
     const x_norm_prev = x;
-    const xn = rmsn(x, te.norm, te.eps, s);
+    const xn = try rmsn(x, te.norm, te.eps, s);
     defer _ = mlx.mlx_array_free(xn);
     _ = mlx.mlx_array_free(x_norm_prev);
-    const last = reshape(xn, &[_]c_int{ @intCast(L), @intCast(te.hidden) }, s);
+    const last = try reshape(xn, &[_]c_int{ @intCast(L), @intCast(te.hidden) }, s);
     defer _ = mlx.mlx_array_free(last);
     try evalHost(s, last, out);
 }
 
-fn teFullMask(s: S, L: usize) mlx.mlx_array {
+fn teFullMask(s: S, L: usize) !mlx.mlx_array {
     const buf = std.heap.page_allocator.alloc(f32, L * L) catch return null_arr;
     defer std.heap.page_allocator.free(buf);
     @memset(buf, 0);
     const h = hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
     defer _ = mlx.mlx_array_free(h);
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&r, h, .bfloat16, s);
+    try mlx.check(mlx.mlx_astype(&r, h, .bfloat16, s));
     return r;
 }
 
-fn teLocalMask(s: S, L: usize, window: usize) mlx.mlx_array {
+fn teLocalMask(s: S, L: usize, window: usize) !mlx.mlx_array {
     const buf = std.heap.page_allocator.alloc(f32, L * L) catch return null_arr;
     defer std.heap.page_allocator.free(buf);
     const left = (window + 1) / 2;
@@ -1054,46 +1059,46 @@ fn teLocalMask(s: S, L: usize, window: usize) mlx.mlx_array {
     const h = hostF32(buf, &[_]c_int{ 1, 1, @intCast(L), @intCast(L) });
     defer _ = mlx.mlx_array_free(h);
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_astype(&r, h, .bfloat16, s);
+    try mlx.check(mlx.mlx_astype(&r, h, .bfloat16, s));
     return r;
 }
 
-fn geluTanhArr(x: mlx.mlx_array, s: S) mlx.mlx_array {
+fn geluTanhArr(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     // 0.5·x·(1+tanh(√(2/π)(x+0.044715x³))) — TE hidden_activation
     var x2 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x2);
-    _ = mlx.mlx_multiply(&x2, x, x, s);
+    try mlx.check(mlx.mlx_multiply(&x2, x, x, s));
     var x3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x3);
-    _ = mlx.mlx_multiply(&x3, x2, x, s);
+    try mlx.check(mlx.mlx_multiply(&x3, x2, x, s));
     const sc1 = mlx.mlx_array_new_float(0.044715);
     defer _ = mlx.mlx_array_free(sc1);
     var k = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k);
-    _ = mlx.mlx_multiply(&k, x3, sc1, s);
+    try mlx.check(mlx.mlx_multiply(&k, x3, sc1, s));
     var inner = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(inner);
-    _ = mlx.mlx_add(&inner, x, k, s);
+    try mlx.check(mlx.mlx_add(&inner, x, k, s));
     const sc2 = mlx.mlx_array_new_float(0.7978845608);
     defer _ = mlx.mlx_array_free(sc2);
     var lin = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(lin);
-    _ = mlx.mlx_multiply(&lin, inner, sc2, s);
+    try mlx.check(mlx.mlx_multiply(&lin, inner, sc2, s));
     var th = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(th);
-    _ = mlx.mlx_tanh(&th, lin, s);
+    try mlx.check(mlx.mlx_tanh(&th, lin, s));
     const sc3 = mlx.mlx_array_new_float(1.0);
     defer _ = mlx.mlx_array_free(sc3);
     var one = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(one);
-    _ = mlx.mlx_add(&one, th, sc3, s);
+    try mlx.check(mlx.mlx_add(&one, th, sc3, s));
     const sc4 = mlx.mlx_array_new_float(0.5);
     defer _ = mlx.mlx_array_free(sc4);
     var half = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(half);
-    _ = mlx.mlx_multiply(&half, one, sc4, s);
+    try mlx.check(mlx.mlx_multiply(&half, one, sc4, s));
     var r = mlx.mlx_array_new();
-    _ = mlx.mlx_multiply(&r, x, half, s);
+    try mlx.check(mlx.mlx_multiply(&r, x, half, s));
     return r;
 }
 
