@@ -251,6 +251,10 @@ pub fn handleAnthropicMessages(
         try sendAnthropicError(allocator, stream, "invalid_request_error", r.msg, r.code);
         return;
     }
+    if (ablation.forModelSetting(stream, lm)) |r| {
+        try sendAnthropicError(allocator, stream, "api_error", r.msg, r.code);
+        return;
+    }
 
     // max_tokens is required in the Anthropic API, but through the one parse helper so a negative
     // value is an omission and the `--max-tokens` launch default reaches this surface too.

@@ -6,9 +6,13 @@ const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("../../sdk/util/log.zig");
 const Request = @import("../../sdk/request/ablation.zig").Request;
+const Prefix = @import("../../sdk/request/ablation.zig").Prefix;
+const field_mod = @import("../../sdk/request/ablation.zig");
 const Conn = @import("../http/conn.zig").Conn;
 const http_server = @import("../http/server.zig");
 const LoadedModel = @import("../registry/registry.zig").LoadedModel;
+const request_model = @import("request_model.zig");
+const AblationSetting = @import("../registry/model_settings.zig").AblationSetting;
 
 const manifest_format = "mlx-serve-ablation";
 const manifest_version = 1;
@@ -273,7 +277,20 @@ pub const Served = struct {
 };
 
 /// A refusal: the HTTP status line and a message that never holds the key.
-pub const Refusal = struct { status: []const u8, code: u16, msg: []const u8 };
+pub const Refusal = struct {
+    status: []const u8,
+    code: u16,
+    msg: []const u8,
+
+    /// The error `type` an OpenAI-shaped surface sends with this refusal.
+    pub fn errorType(self: Refusal) []const u8 {
+        return switch (self.code) {
+            401 => "authentication_error",
+            503 => "internal_error",
+            else => "invalid_request_error",
+        };
+    }
+};
 
 pub const Outcome = union(enum) {
     /// Strength 0 runs as a standard request; the header still reports the profile.
@@ -284,13 +301,17 @@ pub const Outcome = union(enum) {
 pub const Selected = struct {
     profile: *const Profile,
     strength: f32,
+    prefix: Prefix = default_prefix,
 
     pub fn request(self: Selected) Request {
         var h = std.hash.Wyhash.init(self.profile.hash);
         h.update(std.mem.asBytes(&self.strength));
-        return .{ .direction = self.profile.direction, .strength = self.strength, .key = h.final() | 1 };
+        return .{ .direction = self.profile.direction, .strength = self.strength, .key = h.final() | 1, .prefix = self.prefix };
     }
 };
+
+/// The prefix-cache sharing of a request that names none (`Prefix`).
+pub const default_prefix: Prefix = .isolated;
 
 fn bad(msg: []const u8) Outcome {
     return .{ .refused = .{ .status = "400 Bad Request", .code = 400, .msg = msg } };
@@ -306,28 +327,24 @@ pub fn resolve(set: ?*const Set, v: std.json.Value, presented_key: ?[]const u8, 
     const s = set orelse return bad("ablation is not enabled on this server");
     const key = presented_key orelse return unauthorized("ablation key missing (X-Ablation-Key header)");
     if (!s.keyMatches(key)) return unauthorized("ablation key rejected");
-    if (v != .object) return bad("ablation must be an object {\"profile\": string, \"strength\": number}");
-    var it = v.object.iterator();
-    while (it.next()) |kv| {
-        if (!std.mem.eql(u8, kv.key_ptr.*, "profile") and !std.mem.eql(u8, kv.key_ptr.*, "strength"))
-            return bad(std.fmt.bufPrint(msg_buf, "unknown field 'ablation.{s}'", .{clip(kv.key_ptr.*)}) catch "unknown field in ablation");
-    }
-    const name_v = v.object.get("profile") orelse return bad("ablation.profile is required");
-    if (name_v != .string) return bad("ablation.profile must be a string");
-    const strength: f32 = if (v.object.get("strength")) |sv| switch (sv) {
-        .float => |f| @floatCast(f),
-        .integer => |i| if (i >= 0 and i <= 1) @floatFromInt(i) else -1,
-        else => return bad("ablation.strength must be a number in [0, 1]"),
-    } else 1.0;
-    if (!(strength >= 0 and strength <= 1)) return bad("ablation.strength must be a number in [0, 1]");
-    const name = name_v.string;
+    // A request names `profile` and `strength`; `prefix_cache` belongs to a model setting.
+    const f = switch (field_mod.parseField(v, msg_buf, .{})) {
+        .ok => |f| f,
+        .bad => |m| return bad(m),
+    };
+    return select(s, f, served, msg_buf);
+}
+
+fn select(s: *const Set, f: field_mod.Field, served: Served, msg_buf: []u8) Outcome {
+    const name = f.profile;
     const p = s.find(name) orelse return bad(std.fmt.bufPrint(msg_buf, "unknown ablation profile '{s}'", .{clip(name)}) catch "unknown ablation profile");
     if (p.refused) |why| return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' was refused at load: {s}", .{ p.name, why }) catch "ablation profile was refused at load");
     if (!served.serves) return bad("this model does not serve ablation");
     if (p.direction.len != served.hidden) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (hidden size {d}, the model's is {d})", .{ p.name, p.direction.len, served.hidden }) catch "ablation profile is for another model");
     const sha = served.config_sha256 orelse return bad("ablation: the model's config.json could not be read to check the profile");
     if (!std.mem.eql(u8, &sha, &p.config_sha256)) return bad(std.fmt.bufPrint(msg_buf, "ablation profile '{s}' is for another model (config.json digest differs)", .{p.name}) catch "ablation profile is for another model");
-    return .{ .selected = .{ .profile = p, .strength = strength } };
+    // A request's Field carries no prefix, so it lands on the default; a setting's does.
+    return .{ .selected = .{ .profile = p, .strength = f.strength, .prefix = f.prefix orelse default_prefix } };
 }
 
 fn clip(s: []const u8) []const u8 {
@@ -365,7 +382,7 @@ pub fn headerLine(buf: []u8, sel: Selected) []const u8 {
 /// Resolves a parsed body's `ablation` field for `conn`'s request on `lm`: a run or a strength-0 request sets the
 /// conn's response header (and, for a run, `conn.ablation`); a refusal is returned for the caller to send.
 pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *LoadedModel) ?Refusal {
-    const field = root.get("ablation") orelse return null;
+    const field = root.get("ablation") orelse return forModelSetting(conn, lm);
     const set = if (http_server.g_ablation) |*s| s else null;
     const config = lm.config orelse return bad("this model does not serve ablation").refused;
     const serves = if (config.plugin) |pb| pb.parsed.caps.ablation else false;
@@ -387,6 +404,62 @@ pub fn forRequest(conn: *Conn, root: std.json.ObjectMap, lm: *LoadedModel) ?Refu
     if (sel.strength > 0) conn.ablation = sel.request();
     conn.ablation_header_len = headerLine(&conn.ablation_header, sel).len;
     log.info("[ablation] profile={s} strength={d:.3}{s}\n", .{ sel.profile.name, sel.strength, if (sel.strength == 0) " (standard run)" else "" });
+    return null;
+}
+
+/// A model setting the server cannot run fails every request on the model, by name.
+fn unavailable(msg: []const u8) Refusal {
+    return .{ .status = "503 Service Unavailable", .code = 503, .msg = msg };
+}
+
+pub const SettingOutcome = union(enum) { none, selected: Selected, refused: []const u8 };
+
+/// `lm`'s own setting (`model-settings.json` `ablation`), read per request and checked like a request's selection but
+/// without a key: the server's operator wrote it, and it may share the prefix cache. A refusal's message lands in
+/// `msg_buf`.
+pub fn resolveSetting(io: std.Io, lm: *LoadedModel, msg_buf: []u8) SettingOutcome {
+    const entry = request_model.g_model_aliases.ablationSetting(io, lm.path, lm.real_path);
+    if (entry == .none) return .none;
+    return settingFor(&entry, if (http_server.g_ablation) |*g| g else null, servedFor(io, lm), msg_buf);
+}
+
+fn servedFor(io: std.Io, lm: *LoadedModel) Served {
+    const config = lm.config orelse return .{ .hidden = 0, .serves = false, .config_sha256 = null };
+    const serves = if (config.plugin) |pb| pb.parsed.caps.ablation else false;
+    return .{ .hidden = config.hidden_size, .serves = serves, .config_sha256 = if (serves) modelDigest(io, lm) else null };
+}
+
+fn settingFor(entry: *const AblationSetting, set: ?*const Set, served: Served, msg_buf: []u8) SettingOutcome {
+    const setting = switch (entry.*) {
+        .none => return .none,
+        .malformed => |*m| return .{ .refused = std.fmt.bufPrint(msg_buf, "the model's ablation setting is malformed: {s}", .{m.text()}) catch "the model's ablation setting is malformed" },
+        .set => |*v| v,
+    };
+    const s = set orelse return .{ .refused = "the model's ablation setting needs the server started with --ablation-profiles" };
+    var why: [160]u8 = undefined;
+    return switch (select(s, setting.field(), served, &why)) {
+        .selected => |sel| .{ .selected = sel },
+        .refused => |r| .{ .refused = std.fmt.bufPrint(msg_buf, "the model's ablation setting cannot run: {s}", .{r.msg}) catch "the model's ablation setting cannot run" },
+    };
+}
+
+/// A request that names no `ablation` runs under its model's setting, when there is one: no key, every text surface,
+/// the `X-Ablation` header as for a request's field.
+pub fn forModelSetting(conn: *Conn, lm: *LoadedModel) ?Refusal {
+    // A WebSocket's turns share one Conn: what the last turn ran under must not carry over.
+    conn.ablation = null;
+    conn.ablation_header_len = 0;
+    const sel = switch (resolveSetting(conn.io, lm, &conn.ablation_header)) {
+        .none => return null,
+        .refused => |m| {
+            log.warn("[ablation] {s}\n", .{m});
+            return unavailable(m);
+        },
+        .selected => |sel| sel,
+    };
+    if (sel.strength > 0) conn.ablation = sel.request();
+    conn.ablation_header_len = headerLine(&conn.ablation_header, sel).len;
+    log.info("[ablation] profile={s} strength={d:.3} prefix_cache={s} (model setting)\n", .{ sel.profile.name, sel.strength, @tagName(sel.prefix) });
     return null;
 }
 
@@ -502,14 +575,16 @@ test "ablation request: every refusal row of the failure matrix, and the key nev
         .{ .set = &set, .field = "{\"profile\":\"good\",\"strenght\":1}", .key = test_key, .served = served, .code = 400, .says = "unknown field" },
         .{ .set = &set, .field = "{\"strength\":1}", .key = test_key, .served = served, .code = 400, .says = "profile is required" },
         .{ .set = &set, .field = "{\"profile\":7}", .key = test_key, .served = served, .code = 400, .says = "must be a string" },
-        .{ .set = &set, .field = "{\"profile\":\"good\",\"strength\":1.5}", .key = test_key, .served = served, .code = 400, .says = "[0, 1]" },
-        .{ .set = &set, .field = "{\"profile\":\"good\",\"strength\":-0.1}", .key = test_key, .served = served, .code = 400, .says = "[0, 1]" },
-        .{ .set = &set, .field = "{\"profile\":\"good\",\"strength\":\"1\"}", .key = test_key, .served = served, .code = 400, .says = "[0, 1]" },
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"strength\":31}", .key = test_key, .served = served, .code = 400, .says = "[0, 30]" },
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"strength\":-0.1}", .key = test_key, .served = served, .code = 400, .says = "[0, 30]" },
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"strength\":\"1\"}", .key = test_key, .served = served, .code = 400, .says = "[0, 30]" },
         .{ .set = &set, .field = "{\"profile\":\"nope\"}", .key = test_key, .served = served, .code = 400, .says = "unknown ablation profile 'nope'" },
         .{ .set = &set, .field = "{\"profile\":\"broken\"}", .key = test_key, .served = served, .code = 400, .says = "refused at load" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = .{ .hidden = 4, .serves = false, .config_sha256 = sha }, .code = 400, .says = "does not serve" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = .{ .hidden = 8, .serves = true, .config_sha256 = sha }, .code = 400, .says = "hidden size" },
         .{ .set = &set, .field = "{\"profile\":\"good\"}", .key = test_key, .served = other, .code = 400, .says = "digest differs" },
+        // `prefix_cache` is a model setting's field; a request body that names it is an unknown field.
+        .{ .set = &set, .field = "{\"profile\":\"good\",\"prefix_cache\":\"shared\"}", .key = test_key, .served = served, .code = 400, .says = "unknown field 'ablation.prefix_cache'" },
     };
     for (cases) |c| {
         const o = resolve(c.set, try json(a, c.field), c.key, c.served, &buf);
@@ -527,7 +602,47 @@ test "ablation request: every refusal row of the failure matrix, and the key nev
     const zero = resolve(&set, try json(a, "{\"profile\":\"good\",\"strength\":0}"), test_key, served, &buf);
     try testing.expect(zero == .selected and zero.selected.strength == 0);
     const dflt = resolve(&set, try json(a, "{\"profile\":\"good\"}"), test_key, served, &buf);
-    try testing.expect(dflt == .selected and dflt.selected.strength == 1.0);
+    try testing.expect(dflt == .selected and dflt.selected.strength == 1.0 and dflt.selected.request().prefix == default_prefix);
+    // A request that names no cache mode runs isolated, the default (the mode is the model's setting).
+    try testing.expect(run.selected.request().prefix == default_prefix);
+}
+
+fn settingOf(a: std.mem.Allocator, text: []const u8) !AblationSetting {
+    return AblationSetting.fromJson(try json(a, text));
+}
+
+test "ablation model setting: it runs without a key and may share the cache; one that cannot run says why" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var set = try testSet(testing.allocator, test_key);
+    defer set.deinit();
+    var sha: [64]u8 = undefined;
+    @memcpy(&sha, sha_a);
+    const served: Served = .{ .hidden = 4, .serves = true, .config_sha256 = sha };
+    var buf: [256]u8 = undefined;
+    const none: AblationSetting = .none;
+    try testing.expect(settingFor(&none, &set, served, &buf) == .none);
+    const shared = settingFor(&try settingOf(a, "{\"profile\":\"good\",\"strength\":0.5,\"prefix_cache\":\"shared\"}"), &set, served, &buf);
+    try testing.expect(shared.selected.strength == 0.5 and shared.selected.request().prefix == .shared);
+    const plain = settingFor(&try settingOf(a, "{\"profile\":\"good\"}"), &set, served, &buf);
+    try testing.expect(plain.selected.strength == 1 and plain.selected.request().prefix == default_prefix);
+    const cases = [_]struct { entry: []const u8, set: ?*const Set, served: Served, says: []const u8 }{
+        .{ .entry = "{\"strength\":1}", .set = &set, .served = served, .says = "malformed: ablation.profile is required" },
+        .{ .entry = "{\"profile\":\"good\"}", .set = null, .served = served, .says = "--ablation-profiles" },
+        .{ .entry = "{\"profile\":\"nope\"}", .set = &set, .served = served, .says = "cannot run: unknown ablation profile 'nope'" },
+        .{ .entry = "{\"profile\":\"good\"}", .set = &set, .served = .{ .hidden = 4, .serves = false, .config_sha256 = sha }, .says = "cannot run: this model does not serve ablation" },
+    };
+    for (cases) |c| {
+        const got = settingFor(&try settingOf(a, c.entry), c.set, c.served, &buf);
+        try testing.expect(std.mem.indexOf(u8, got.refused, c.says) != null);
+    }
+}
+
+test "ablation refusal: a bad field is the client's error, a bad key an authentication error, a setting that cannot run the server's" {
+    try testing.expectEqualStrings("invalid_request_error", bad("x").refused.errorType());
+    try testing.expectEqualStrings("authentication_error", unauthorized("x").refused.errorType());
+    try testing.expectEqualStrings("internal_error", unavailable("x").errorType());
 }
 
 test "ablation request: the key folds the strength in, never 0" {

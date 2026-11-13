@@ -364,6 +364,10 @@ fn handleResponsesInner(
         try sendErrorResponse(allocator, stream, r.status, "invalid_request_error", r.msg, r.code);
         return;
     }
+    if (ablation.forModelSetting(stream, lm)) |r| {
+        try sendErrorResponse(allocator, stream, r.status, "server_error", r.msg, r.code);
+        return;
+    }
 
     // ── input (required) ──
     const input_val = root.get("input") orelse {
@@ -935,6 +939,7 @@ fn handleResponsesInner(
             .media = mm.media,
             .cache_key = cache_key,
             .client = stream.client,
+            .ablation = stream.ablation,
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,

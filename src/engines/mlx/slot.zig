@@ -23,6 +23,7 @@ const DflashModel = dflash_mod.DflashModel;
 
 const SubmitParams = @import("scheduler/params.zig").SubmitParams;
 const assistantSidecarEnabledForRequest = @import("spec/wiring.zig").assistantSidecarEnabledForRequest;
+const AblationRequest = @import("../../sdk/request/ablation.zig").Request;
 
 pub const SlotState = enum { pending_prefill, decoding, finished, errored };
 
@@ -77,7 +78,8 @@ pub const Slot = struct {
     restored_entry: u64 = 0,
     skip_prefix_cache: bool = false,
     /// What the request changes about the model's state (`ModuleBinding.variant`; a directional ablation's key): a
-    /// module-owned cache keys its entries by it, the KV prefix cache is neither read nor written.
+    /// module-owned cache keys its entries by it, the KV prefix cache is neither read nor written. 0 for a `shared`
+    /// ablation (`ablation.Prefix`), which reads and writes the one cache.
     cache_variant: u64 = 0,
     /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
     /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
@@ -379,7 +381,7 @@ pub const Slot = struct {
             .prompt_logprobs = params.prompt_logprobs,
             .prompt_logprobs_buf = .empty,
             .skip_prefix_cache = params.prompt_logprobs,
-            .cache_variant = if (params.ablation) |a| a.key else 0,
+            .cache_variant = cacheVariant(params.ablation),
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the
@@ -729,6 +731,13 @@ pub const Slot = struct {
     }
 };
 
+/// The prefix-cache variant an ablated request runs under (`Slot.cache_variant`): its key, or 0 when it shares the one
+/// cache.
+pub fn cacheVariant(ablation: ?AblationRequest) u64 {
+    const a = ablation orelse return 0;
+    return if (a.prefix == .shared) 0 else a.key;
+}
+
 // ── tests ──
 
 test "a slot reads and writes its model's prefix cache, or the one its request brought" {
@@ -756,4 +765,13 @@ test "a slot reads and writes its model's prefix cache, or the one its request b
     const none = try Slot.init(testing.allocator, testing.io, &cfg, params, .dense);
     defer none.deinit();
     try testing.expect(none.prefix_cache == null);
+}
+
+test "slot: an ablated request keys the prefix cache by its ablation unless it shares the one cache" {
+    const dir = [_]f32{ 1, 0 };
+    try std.testing.expectEqual(@as(u64, 0), cacheVariant(null));
+    inline for (.{ .{ .isolated, 9 }, .{ .shared, 0 } }) |c| {
+        const r: AblationRequest = .{ .direction = &dir, .strength = 1, .key = 9, .prefix = c[0] };
+        try std.testing.expectEqual(@as(u64, c[1]), cacheVariant(r));
+    }
 }

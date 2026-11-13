@@ -12,6 +12,7 @@ const generation = @import("../api/generation_settings.zig");
 const engine_pick = @import("../../sdk/quant/gguf/engine_pick.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const gguf_files = @import("../../sdk/quant/gguf/files.zig");
+const ablation_field = @import("../../sdk/request/ablation.zig");
 
 /// What can serve a model; the per-model `engine` setting (Model Settings' engine picker) and each
 /// `/v1/models` row's `engines` use these names. No setting leaves the choice to the server.
@@ -274,6 +275,56 @@ pub fn homeFile(buf: []u8, name: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}/.mlx-serve/{s}", .{ home, name }) catch "";
 }
 
+/// A model's `ablation` setting as the request path reads it: the profile name copied out of the parse (the next
+/// refresh frees that), or why an entry that is there cannot be read.
+pub const AblationSetting = union(enum) {
+    none,
+    set: Set,
+    malformed: Msg,
+
+    pub const Set = struct {
+        name_buf: [128]u8 = undefined,
+        name_len: usize = 0,
+        strength: f32 = 1,
+        /// Null is `isolated`. Only a setting may choose `shared` (`ablation.Prefix`): the operator owns the file.
+        prefix: ?ablation_field.Prefix = null,
+
+        pub fn field(self: *const Set) ablation_field.Field {
+            return .{ .profile = self.name_buf[0..self.name_len], .strength = self.strength, .prefix = self.prefix };
+        }
+    };
+
+    pub const Msg = struct {
+        buf: [160]u8 = undefined,
+        len: usize = 0,
+
+        pub fn text(self: *const Msg) []const u8 {
+            return self.buf[0..self.len];
+        }
+    };
+
+    /// A setting's `ablation` object: what a request names (`profile`, `strength`) plus `prefix_cache`.
+    pub fn fromJson(v: std.json.Value) AblationSetting {
+        var tmp: [96]u8 = undefined;
+        const why: []const u8 = switch (ablation_field.parseField(v, &tmp, .{ .prefix_cache = true })) {
+            .ok => |f| if (f.profile.len <= (Set{}).name_buf.len) {
+                var set: Set = .{ .strength = f.strength, .prefix = f.prefix, .name_len = f.profile.len };
+                @memcpy(set.name_buf[0..f.profile.len], f.profile);
+                return .{ .set = set };
+            } else "ablation.profile is too long",
+            .bad => |m| m,
+        };
+        return malformedOf(why);
+    }
+
+    fn malformedOf(why: []const u8) AblationSetting {
+        var msg: Msg = .{};
+        msg.len = @min(why.len, msg.buf.len);
+        @memcpy(msg.buf[0..msg.len], why[0..msg.len]);
+        return .{ .malformed = msg };
+    }
+};
+
 /// The parsed file kept for the request path: re-stats at most once per
 /// `recheck_ms` and re-parses only when size, mtime or inode moved (the app
 /// saves atomically, so a save is a new inode).
@@ -338,6 +389,22 @@ pub const Cache = struct {
             return if (kv.value_ptr.* == .object) generationProfile(kv.value_ptr.object) else .{};
         }
         return .{};
+    }
+
+    /// `model_path`'s `ablation` setting (`api/ablation.zig` resolves it). Read per request, so an edit applies to the
+    /// next one. `real_path` is the registry's realpath for a model registered through a symlink: the app keys
+    /// `model-settings.json` by that spelling, so the entry can sit under either one.
+    pub fn ablationSetting(self: *Cache, io: std.Io, model_path: []const u8, real_path: []const u8) AblationSetting {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        self.refresh(io);
+        const e = self.settings.entry(model_path) orelse blk: {
+            if (real_path.len == 0) return .none;
+            break :blk self.settings.entry(real_path) orelse return .none;
+        };
+        if (e != .object) return .none;
+        const v = e.object.get("ablation") orelse return .none;
+        return if (v == .null) .none else AblationSetting.fromJson(v);
     }
 
     /// Re-read the file if it changed; lookups call it, and a caller that must
@@ -503,6 +570,34 @@ test "model_settings: a GGUF folder answers to the key of the .gguf it serves, b
     const mlx = try std.fs.path.join(t, &.{ root, "mlx" });
     defer t.free(mlx);
     try std.testing.expect(lookupPack(&s, t, io, mlx).isEmpty());
+}
+
+test "model_settings: a model's ablation setting is read per request, its name copied, a bad one named" {
+    const t = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var rbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = rbuf[0..try tmp.dir.realPath(io, &rbuf)];
+    const path = try std.fs.path.join(t, &.{ root, "model-settings.json" });
+    defer t.free(path);
+    var c: Cache = .{ .path = path, .alloc = t, .recheck_ms = 0 };
+    defer c.deinit();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-settings.json", .data =
+        \\{"/m/a": {"ablation": {"profile": "pc1", "strength": 0.5, "prefix_cache": "shared"}},
+        \\ "/m/b": {"ablation": null}, "/m/c": {"ablation": {"strength": 1}}, "/m/d": {"alias": "d"}}
+    });
+    const a = c.ablationSetting(io, "/m/a/", "");
+    try std.testing.expectEqualStrings("pc1", a.set.field().profile);
+    try std.testing.expectEqual(@as(f32, 0.5), a.set.strength);
+    try std.testing.expectEqual(@as(?ablation_field.Prefix, .shared), a.set.prefix);
+    // A model registered through a symlink: the app keys the entry by its real path.
+    try std.testing.expectEqualStrings("pc1", c.ablationSetting(io, "/m/link", "/m/a").set.field().profile);
+    try std.testing.expect(c.ablationSetting(io, "/m/b", "") == .none);
+    try std.testing.expect(c.ablationSetting(io, "/m/d", "") == .none);
+    try std.testing.expect(c.ablationSetting(io, "/m/none", "") == .none);
+    const bad = c.ablationSetting(io, "/m/c", "");
+    try std.testing.expect(std.mem.indexOf(u8, bad.malformed.text(), "profile is required") != null);
 }
 
 test "model_settings: entry is the model's raw object, keys the Override does not read included" {

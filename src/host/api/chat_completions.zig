@@ -149,7 +149,7 @@ pub fn handleChatCompletions(
     const root = parsed.value.object;
     if (ablation.forRequest(stream, root, lm)) |r| {
         log.warn("POST /v1/chat/completions -> {d} (ablation)\n", .{r.code});
-        try sendErrorResponse(allocator, stream, r.status, if (r.code == 401) "authentication_error" else "invalid_request_error", r.msg, r.code);
+        try sendErrorResponse(allocator, stream, r.status, r.errorType(), r.msg, r.code);
         return;
     }
 

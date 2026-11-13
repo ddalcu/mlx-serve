@@ -21,7 +21,7 @@ Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `s
 ### Directional ablation
 
 With `--ablation-profiles <dir>` and `--ablation-key-file <path>`, `/v1/chat/completions` and `/v1/completions` take
-`"ablation": {"profile": "<name>", "strength": 0.0-1.0}` (strength defaults to 1) with the key in the
+`"ablation": {"profile": "<name>", "strength": 0.0-30.0}` (strength defaults to 1) with the key in the
 `X-Ablation-Key` header. For that request only, the model removes the profile's direction from everything it writes to
 its residual stream (Arditi et al. 2024, "Refusal in Language Models Is Mediated by a Single Direction"), and the
 response carries `X-Ablation: profile=<name>; strength=<s>; hash=<hex>`, the only confirmation that it ran ablated.
@@ -29,6 +29,23 @@ A missing or wrong key is a 401. Every other problem is a named 400: an unknown,
 strength or field, a model whose plugin lacks `Caps.ablation`, or the field sent to `/v1/messages`, `/v1/responses`,
 the Ollama routes or a proxied `<id>@<provider>` / `<id>@<peer>` model. Other endpoints ignore it. The key is
 compared with surrounding whitespace trimmed; browsers may send `X-Ablation-Key` and read `X-Ablation` cross-origin.
+
+A request's ablation always runs `isolated`: it restores and commits nothing beside the unablated requests. Sharing is
+the server operator's call, not a request's — `prefix_cache` is a model setting (below), because a request that shares
+would commit KV computed under the ablation for later requests to restore. A request naming `prefix_cache` gets the
+unknown-field 400. With `shared`, entries match by token prefix, tools flag, quant config and media, not by
+conversation: another conversation that opens with the same prefix can restore them. The SSD tier keeps them, so a
+restart does not clear them.
+
+A model's entry in `~/.mlx-serve/model-settings.json` may carry the same object, `"ablation": {"profile", "strength",
+"prefix_cache"}`, read per request: every request to that model that names no `ablation` runs under it, on every
+text surface (`/v1/messages`, `/v1/responses` and the Ollama routes included), with no key (the server's own file).
+Its `prefix_cache` is `"isolated"` (the default) or `"shared"`: shared sets the slot's cache variant to 0, the variant
+an unablated request uses, for the KV prompt cache and a model-owned cache alike, so an ablated turn in the middle of a
+long session reuses its conversation instead of re-prefilling it, and a later request may restore state computed under
+the ablation. Strength 0 keeps the profile but runs standard. A setting the server cannot run (no `--ablation-profiles`,
+an unknown or mismatched profile, a model without `Caps.ablation`) fails each request on that model with a 503 naming
+why.
 
 A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"version": 1`, `hidden_size`,
 `base_config_sha256`: sha256 of the base pack's exact `config.json` bytes) and `direction.safetensors` (one tensor
