@@ -17,5 +17,5 @@ if (u == uint(TOPK * R)) {
 }
 const uint r = u / TOPK;
 float acc[2];
-dec_fp4_up_routed<K, N, T>(w, scales, size_t(inds[u]) * (2 * N) + n_col, x + size_t(r) * K, lane, acc);
+dec_fp4_up_pair<K, N, T>(w, scales, size_t(inds[u]) * (2 * N) + n_col, x + size_t(r) * K, lane, acc);
 if (lane == 0) out[(r * (TOPK + 1) + u % TOPK) * N + n_col] = dec_up_act<T>(acc[0], acc[1], lim[0], wts[u]);
