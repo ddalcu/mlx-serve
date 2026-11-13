@@ -1196,6 +1196,26 @@ test "KVCache dense update: a faulted op leaves no freed view handle in the entr
     try testing.expect(ops[0] >= 4 and ops[1] > ops[0]);
 }
 
+test "a grow holds no slack past the context and the widest verify; a write past that limit keeps the policy" {
+    const t = std.testing;
+    const limit: usize = 32_768 + 17;
+    // The worst grow at a 32K context: 32,512 rows to 40,704 by the policy, 33,024 with the limit.
+    try t.expectEqual(@as(usize, 40_704), KVCache.nextCapacity(32_512, 32_513));
+    try t.expectEqual(@as(usize, 33_024), KVCache.limitedCapacity(40_704, 32_513, limit));
+    try t.expectEqual(@as(usize, 40_704), KVCache.limitedCapacity(40_704, 32_513, 0));
+    try t.expectEqual(@as(usize, 40_704), KVCache.limitedCapacity(40_704, 33_100, limit));
+    const small = KVCache.nextCapacity(1024, 1025);
+    try t.expectEqual(small, KVCache.limitedCapacity(small, 1025, limit));
+    var cache = try KVCache.init(t.allocator, 1);
+    defer cache.deinit();
+    cache.limitGrowth(limit);
+    try t.expectEqual(@as(usize, 33_024), cache.nextCapacityReserved(32_512, 32_513));
+    try t.expectEqual(small, cache.nextCapacityReserved(1024, 1025));
+    // A reservation past the limit is held to it too.
+    cache.reserve(65_536);
+    try t.expectEqual(@as(usize, 33_024), cache.nextCapacityReserved(16_384, 16_385));
+}
+
 test "generation past the reserved headroom takes the +25% growth policy, never a mid-prefill grow" {
     const t = std.testing;
     // The reservation is bounded at `RESERVE_GEN_HEADROOM` tokens of generation; past it the

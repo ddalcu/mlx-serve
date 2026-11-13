@@ -99,7 +99,7 @@ Attention + KV:
 - **A parity loop asserts FINITENESS before it diffs**; additive masks via `mlx_where`. Threadgroup memory is an OCCUPANCY decision (≤ ~10 KiB, `qkvDecBlockFor`).
 - **Every KV buffer is sized from the OPERAND it stores** (K/V widths differ on MLA; an MLA cache is billed per ATTENTION head); a scheme with a shape constraint refuses at LOAD.
 - **A fallible re-init BEHIND a `deinit` leaves a freed object** — build first, then swap (`KVCache.reinit`). A handle freed before a fallible op is reset AT the free (`updateDense`). Guard: `KVCache dense update` fault sweep.
-- **KV growth is PROPORTIONAL** (`nextCapacity` +25%, floor one chunk, cap 8192). `active` flat while phys climbs = the POOL (`/props` `memory.cache_bytes`).
+- **KV growth is PROPORTIONAL** (`nextCapacity` +25%, floor one chunk, cap 8192) and stops at the context plus the widest verify (`limitGrowth`, set per request). `active` flat while phys climbs = the POOL (`/props` `memory.cache_bytes`).
 - **Allocator cache**: `mlx_clear_cache()` per CHUNK and per emitted block, un-skippable (#110): `applyMlxCacheLimit` once in `main()`; cadence interval-based; `Generator.advanceStep` is the one step mover; `finishSlot` clears the tail.
 - **Hybrid-SSM prefix cache retains ~3.4× what it reports** (lever = ENTRY COUNT, `ramCappedPrefixCacheEntries`). SSM-checkpoint stride never sub-divides the chunk; dense hd-256 chunk cap 8192, MoE 4096.
 - **Hybrid prefix candidates rank by RESTORABLE SSM position** (`findBestRestorableMatch`). The always-on SSM snapshot sits `SSM_SNAPSHOT_BACKOFF` (30) tokens BEFORE prompt end.
