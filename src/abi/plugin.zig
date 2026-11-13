@@ -701,7 +701,8 @@ pub const AuxHooks = extern struct {
     snapshot: *const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict,
     /// Accepts only `pos == snap.n`; builds the replacement before installing it. The caller keeps the snapshot.
     restore_at: *const fn (m: *anyopaque, slot: u32, snap: Handle, pos: u64) callconv(.c) Verdict,
-    /// Clones references when `len == snap.n`; any other length returns named `.unsupported`.
+    /// A snapshot of the longest prefix of at most `len` tokens the plugin restores at (`describe` says where): a
+    /// clone at `len == snap.n`, shorter where the plugin can cut its state; named `.unsupported` when it holds none.
     slice: *const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict,
     handoff: *const fn (m: *anyopaque, from_slot: u32, to_slot: u32) callconv(.c) Verdict,
     /// Releases the complete snapshot and its host allocations exactly once.

@@ -1490,3 +1490,59 @@ in `pending` and let go; `complete` queued the slot for cleanup without looking 
 memory and the next pass ran it. Fix: `complete` unlists again after every wait (`unlistLocked`); a pass takes a slot
 from a list only under `queue_mu`, so unlisted with `in_pass` at 0 means nothing holds it. Guard: `complete: a slot
 its pass puts back in pending while complete waits is unlisted before cleanup owns it`.
+
+
+### DeepSeek-V4.1 prefilled again what it had just written, and a changed tail cost the whole context
+Defect: every agent turn prefilled the previous turn's answer again, a second conversation under the same system
+prompt started cold, and a long conversation whose last message changed prefilled all of it.
+Cause: a module snapshot restored only at its exact length, and the only one a request left was at its prompt's
+boundary. Fix: the plugin cuts a snapshot to a shorter prefix and rebuilds its windows by replaying the last one (the
+tech report's SWA bounded replay, `deepseek_v41.rewind`); the cache restores an entry at what the prompt shares with
+it (`restoreModuleCut`) and also commits where decode stopped (`commitModuleDecodeEnd`), an entry that only fills
+spare budget. A cut restore differs from a cold prompt as much as another prefill chunk width does. Guards:
+`deepseek_v41 aux: a snapshot sliced short of its end restores there by replaying its window`, `HotPrefixCache
+module: an entry that outruns the prompt or leaves it is restored at what the plugin cuts it to`, `tests/test_dsv41.sh`
+[7c].
+
+### One slow DSpark round sent a request back to plain decode for hundreds of tokens
+Defect: the first DSpark request of a freshly installed build wrote code far slower than the next one.
+Cause: the drafting backoff averaged the round's wall time as measured, and a round that waited on a kernel
+compile read as "drafting loses" for a run of probes, each doubling the plain stretch. Fix: `Drafting.record`
+counts a round for at most twice the rounds before it, as `PlainCost` already did. Guard: `Drafting: a stalled round
+is not what a round costs`.
+
+### A cold DeepSeek-V4.1 prompt held the GPU at the first Engram layer
+Defect: the first chunk of a prompt whose text was new spent part of its time with the GPU idle. Cause: its
+Engram rows come off the SSD at the drive's pace, a read-ahead hides the next chunk's behind the current one, and the
+first chunk has nothing to hide behind: layer 1 waited until every row of the chunk was read. Fix: a chunk of 4096
+rows or more that nothing read ahead runs as its first half and then the rest (`extendCold`): the rest's rows are read
+while the lead computes, and the lead skips the decoder replay the rest makes at its own end. The answer is the bits
+a narrower prefill chunk gives. Guards: `deepseek_v41 CED: a lead chunk that skips the decoder leaves what the chunk
+after it reads`, `dsv41 lead: ...`; the debug log's `the chunk waited N ms on its Engram rows`.
+
+### DeepSeek-V4.1's full pack waited on the SSD in every prompt chunk
+Defect: with the full pack resident and little memory to spare, every prefill chunk stood at an Engram layer
+waiting on the drive. Cause: a row is two reads, its codes out of a table far larger than free memory and its
+scales out of a small one; both went through the page cache, which had little room left, so each chunk's code
+pages pushed the scale pages out and both reads hit the drive.
+Fix: a resident pack's table opens a second descriptor for the codes and reads them past the page cache while under an
+eighth of RAM is free (`Table.openCodes`, `engram.cacheTight`); the scales stay cached. With memory to spare the
+cache still serves the codes, which is faster there. Guards: `dsv41 engram: codes read past the page cache are the
+rows read through it`; the debug log's `waited N ms on its Engram rows, codes past the page cache`.
+
+### The first prompts of a new build timed its shader compiles
+Defect: the first benchmark pass of a build read like a regression (a cache-hit turn several times slower, a long
+prompt and a first chat at a fraction of their rates), and the second pass did not. Cause: a Metal kernel compiles
+at its first evaluation, and each wrapper builds one variant per row count, prompt size class, cache state and
+speculative mode. The load's warmup ran three bare forwards and reached a fraction of them; the rest compiled
+inside whichever request selected them first. Metal keeps what it compiled per bundle
+id, so only a build's first run on a machine paid, and paid again after every rebuild. Fix: the first time a build
+loads a model it serves requests of its own through the scheduler (`warm_requests.zig`), on a RAM twin of the prefix
+cache and outside every metric. Serving them all before ready made that load several times longer, so by default
+the model is ready first and serves a short plan when the server is idle (a forward at every verify width, a short
+chat, a long prompt, that prompt with other endings), each request admitted alone so a real one never decodes
+beside it, the model never held so it stays evictable (an unload drops the warm-up first); `--warmup-full` serves
+that and a ladder of prompt sizes before ready, which a benchmark needs. A marker per plan beside Metal's cache,
+keyed on the build, the OS build and the pack, makes every later load owe nothing. macOS only. Guards:
+`tests/test_first_request_compiles.sh` (a copy of the binary under another bundle id starts with an empty cache),
+`owed`, `nextStep`, `forget`, `an idle warm-up waits beside a real request without holding its model`.

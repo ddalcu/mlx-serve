@@ -879,6 +879,16 @@ pub fn auxRestoreAt(xfm: *const Transformer, slot: u32, snap: abi.Handle, pos: u
     return b.hooks.restore_at(b.model, slot, snap, pos);
 }
 
+/// A snapshot of the longest prefix of at most `len` tokens the plugin restores `snap` at; null when it holds none.
+/// The caller frees it.
+pub fn auxSlice(xfm: *const Transformer, snap: abi.Handle, len: u64) abi.Handle {
+    const b = auxBinding(xfm) orelse return null;
+    if (snap == null) return null;
+    var out: abi.Handle = null;
+    if (!b.hooks.slice(b.model, snap, len, &out).isOk()) return null;
+    return out;
+}
+
 pub fn auxBytes(xfm: *const Transformer, snap: abi.Handle) u64 {
     const b = auxBinding(xfm) orelse return 0;
     if (snap == null) return 0;

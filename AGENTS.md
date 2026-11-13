@@ -83,6 +83,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 ## Releases & benchmarking
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).
+- **Benchmark with `--warmup-full`** (bench.sh passes it): without it a build's first pass on a model carries its one-time Metal kernel compiles and reads like a regression.
 - Methodology: `/bench` (llmprobe measures; bench.sh drives mlx-serve, `--url` probes another engine). Only diff same-methodology cells; spec cells are variance: same-session ratios only, name the engine in every win, an A/B arm is proven by ENGAGEMENT lines. Record = `benchmarks.md` + `~/claude-tmp/bench-<tag>/`.
 
 ## Conventions

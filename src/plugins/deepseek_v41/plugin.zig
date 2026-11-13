@@ -686,6 +686,10 @@ fn auxRestoreAt(mp: *anyopaque, slot: u32, handle: abi.Handle, pos: u64) callcon
     if (pos != sn.n or sn.n != sn.ids.len) return Verdict.refuse(.unsupported, "deepseek_v41: restore requires the snapshot's exact position");
     const m: *Model = @ptrCast(@alignCast(mp));
     var fresh = dsv41.stateFromSnapshot(m.mdl, gpa, sn) catch |e| return Verdict.named(.failed, @errorName(e));
+    if (!sn.whole) dsv41.rewind(m.mdl, gpa, &fresh, sn.ids) catch |e| {
+        fresh.deinit();
+        return Verdict.named(.failed, @errorName(e));
+    };
     activate(m, slot) catch |e| {
         fresh.deinit();
         return Verdict.named(.failed, @errorName(e));
@@ -705,11 +709,13 @@ fn auxSlice(mp: *anyopaque, handle: abi.Handle, len: u64, out: *abi.Handle) call
     const m: *Model = @ptrCast(@alignCast(mp));
     out.* = null;
     const sn = snapOf(handle) orelse return Verdict.refuse(.unsupported, "deepseek_v41: no snapshot to slice");
-    if (len != sn.n) return Verdict.refuse(.unsupported, "deepseek_v41: a snapshot cannot be shortened through its rings");
     const owned = gpa.create(dsv41.Snap) catch |e| return Verdict.named(.failed, @errorName(e));
-    owned.* = sn.clone(gpa) catch |e| {
+    owned.* = (dsv41.sliceSnap(m.mdl, gpa, sn, len) catch |e| {
         gpa.destroy(owned);
         return Verdict.named(.failed, @errorName(e));
+    }) orelse {
+        gpa.destroy(owned);
+        return Verdict.refuse(.unsupported, "deepseek_v41: the snapshot holds no restorable prefix of that length");
     };
     if (sn.tp_id != 0) {
         m.tp_snaps += 1;

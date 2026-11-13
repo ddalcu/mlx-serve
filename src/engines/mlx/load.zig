@@ -14,6 +14,7 @@ const ane_mod = @import("../../sdk/ane/offload.zig");
 const model_mod = @import("../../sdk/config/model.zig");
 const vision_mod = @import("vision_encoder.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
+const warm_requests = @import("warm_requests.zig");
 const kv_disk_cache = @import("cache/ssd/disk_tier.zig");
 const tokenize_cache_mod = @import("../../host/tokenizer/cache.zig");
 const model_registry_mod = @import("../../host/registry/registry.zig");
@@ -721,10 +722,27 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Eager warmup: faults weight pages + compiles the decode-path kernels
     // on this thread's stream. ~600-900 ms at boot but the first user request
     // skips a cold path — observed savings on Gemma 4 E4B 4-bit.
+    var warm_marker_buf: [1280]u8 = undefined;
+    var warm_marker: ?[:0]const u8 = null;
+    var verify_rows: u32 = 0;
     if (params.warmup_eager) {
         params.entry.load_progress.begin(.warming_up, 0, io_util.nowMsMonotonic(sch.io));
         const warmup_start = std.Io.Timestamp.now(sch.io, .awake);
-        xfm_ptr.warmup() catch |err| {
+        // The widest block a round verifies on this load: a sidecar's, the head's depth, or a lookup's draft.
+        const sidecar_rows: u32 = if (dflash_ptr != null or drafter_ptr != null) sch.drafter_block_size else 0;
+        const head_rows: u32 = if (mtp_enabled and (mtp_ptr != null or plugin_mtp != null))
+            generate_mod.Generator.resolveMtpDepthCapForProfile(params.config.mtpDepth(params.mtp_depth), mtp_cost_profile)
+        else
+            0;
+        verify_rows = @max(8, sidecar_rows, head_rows) + 1;
+        warm_marker = warm_requests.owed(&warm_marker_buf, if (params.warmup_full) .full else .minimal, .{
+            .model_path = params.entry.path,
+            .model_type = params.config.model_type,
+            .verify_rows = verify_rows,
+            .kv_bits = kv_quant_config.bits,
+        });
+        // The sweep runs here only ahead of the full plan; the minimal one runs it once the model is ready.
+        xfm_ptr.warmup(if (params.warmup_full and warm_marker != null) verify_rows else 0) catch |err| {
             log.warn("Warmup failed ({s}); continuing without it — first request may be slow.\n", .{@errorName(err)});
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
@@ -913,10 +931,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // and preflight (zero means no disk estimate), plus a GPU-resident n-gram table.
     const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config);
 
-    sch.registry.mutex.lockUncancelable(sch.io);
-    entry.bytes_live = mlxActiveBytes() -| live_before;
-    sch.registry.markReadyLocked(entry, bytes_resident);
-    sch.registry.mutex.unlock(sch.io);
+    const bytes_live = mlxActiveBytes() -| live_before;
 
     // Set borrowed views for scheduler-internal code (and `current_model`
     // for ensureLoaded → request handlers in Phase C).
@@ -930,6 +945,20 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (entry.prefix_cache) |hc| {
         if (ModelRegistry.chatCapable(entry)) sch.hot_prefix_cache = hc;
     }
+
+    // `--warmup-full`: ready only once it has served its own first requests, so whoever asks next measures the model,
+    // not its compiles. Otherwise it is ready now and owes a short warm-up for when the server is idle.
+    const chat = ModelRegistry.chatCapable(entry);
+    if (params.warmup_full) if (warm_marker) |marker| {
+        if (!chat or warm_requests.run(sch, entry)) warm_requests.remember(marker);
+        warm_marker = null;
+    };
+
+    sch.registry.mutex.lockUncancelable(sch.io);
+    entry.bytes_live = bytes_live;
+    sch.registry.markReadyLocked(entry, bytes_resident);
+    sch.registry.mutex.unlock(sch.io);
+    if (warm_marker) |marker| warm_requests.owe(sch, entry, marker, verify_rows, chat);
     publishHotCacheResidency(sch);
 }
 

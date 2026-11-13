@@ -756,7 +756,7 @@ A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache
 | `commit` | `*const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict` |  |  |
 | `snapshot` | `*const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict` |  | Transfers the slot's completed capture to the caller; null means no checkpoint was reached. |
 | `restore_at` | `*const fn (m: *anyopaque, slot: u32, snap: Handle, pos: u64) callconv(.c) Verdict` |  | Accepts only `pos == snap.n`; builds the replacement before installing it. The caller keeps the snapshot. |
-| `slice` | `*const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict` |  | Clones references when `len == snap.n`; any other length returns named `.unsupported`. |
+| `slice` | `*const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict` |  | A snapshot of the longest prefix of at most `len` tokens the plugin restores at (`describe` says where): a clone at `len == snap.n`, shorter where the plugin can cut its state; named `.unsupported` when it holds none. |
 | `handoff` | `*const fn (m: *anyopaque, from_slot: u32, to_slot: u32) callconv(.c) Verdict` |  |  |
 | `free` | `*const fn (m: *anyopaque, snap: Handle) callconv(.c) void` |  | Releases the complete snapshot and its host allocations exactly once. |
 | `bytes` | `*const fn (m: *anyopaque, snap: Handle) callconv(.c) u64` |  | Resident bytes, including retained buffer capacities; encoded size is a separate quantity. |
