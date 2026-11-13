@@ -1629,7 +1629,7 @@ pub fn pairRange(c: anytype, mine: u64, theirs: u64) ?[2]usize {
 /// from the shard the index names, the vision tower only on `vision` (its unread split copies never), the Engram
 /// projections kept beside its tables.
 pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
-    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true, .skip = &visionUnread });
+    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .skip = &visionUnread });
     errdefer w.deinit();
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
     defer gpa.free(path);

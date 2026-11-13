@@ -4995,7 +4995,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     };
     // A pack an outside quant plugin reads keeps its tensors as stored: the plugin reads its own dtypes.
     const keep_f16 = config.actDtype() == .float16 or @import("../quant/outside.zig").claimsPack(io, allocator, model_dir);
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null or config.pluginHears(), .keep_f16 = keep_f16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .index_owners = config.exl3 != null or config.isDsv41(), .modelopt = config.modelopt });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .audio_tower = config.qwen_audio != null or config.pluginHears(), .keep_f16 = keep_f16, .skip = if (config.isQwen4() and config.embedded_ple_payload_bytes != null) qwen4_exp.embeddedTensorName else null, .defer_qwen4_norms = config.isQwen4(), .dsv41 = config.isDsv41(), .modelopt = config.modelopt });
     errdefer weights.deinit();
     // Still lazy here, so the other ranks' tensors are dropped before any byte is read.
     if (config.dist_span) |sp| try retainPart(&weights, sp);
@@ -5015,6 +5015,17 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
         try sushi_pack.adapt(config, &weights, s);
+    } else if (config.plugin) |b| {
+        // A served pack carries the Sushi and ModelOpt marks in its plugin's
+        // facts, not the engine config the driver hands this function; GLM's
+        // pack ships HF names the trunk cannot read without the adapter.
+        const layout = b.parsed.weights.quant_layout.slice();
+        if (std.mem.eql(u8, layout, "exl3") or std.mem.eql(u8, layout, "modelopt")) {
+            if (std.mem.eql(u8, layout, "modelopt")) config.modelopt = true;
+            const s = mlx.mlx_default_cpu_stream_new();
+            defer _ = mlx.mlx_stream_free(s);
+            try sushi_pack.adapt(config, &weights, s);
+        }
     }
     return weights;
 }
@@ -5574,6 +5585,247 @@ test "loadWeights ignores an index that names no shard on disk (re-sharded uploa
     var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
     defer w.deinit();
     try std.testing.expectEqual(@as(u32, 1), w.count());
+}
+
+/// A two-shard pack with a hand-built header per shard; `index` writes an
+/// index naming the owners. `body` bytes of zero follow each header.
+fn writeShardPack(
+    io: std.Io,
+    dir: std.Io.Dir,
+    files: []const struct { name: []const u8, hdr: []const u8, body: usize },
+    index: ?[]const u8,
+) !void {
+    var st: [8 + 512 + 72]u8 = undefined;
+    for (files) |f| {
+        try testing.expect(f.hdr.len + 8 <= st.len);
+        std.mem.writeInt(u64, st[0..8], f.hdr.len, .little);
+        @memcpy(st[8 .. 8 + f.hdr.len], f.hdr);
+        @memset(st[8 + f.hdr.len .. 8 + f.hdr.len + f.body], 0);
+        try dir.writeFile(io, .{ .sub_path = f.name, .data = st[0 .. 8 + f.hdr.len + f.body] });
+    }
+    if (index) |ix| try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = ix });
+}
+
+/// The path `loadWeightsFromOpenDir` derives from the process cwd; a tmpDir
+/// lives at it.
+fn tmpDirPath(alloc: std.mem.Allocator, sub: []const u8) ![]const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&buf, buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    return std.fmt.allocPrint(alloc, "{s}/.zig-cache/tmp/{s}", .{ cwd, sub });
+}
+
+/// One shard: `l.weight` as a packed triple (U32 + BF16 scales/biases) plus
+/// `x.weight` float. 40 body bytes.
+const packed_triple_hdr = "{\"l.weight\":{\"dtype\":\"U32\",\"shape\":[4,1],\"data_offsets\":[0,16]}," ++
+    "\"l.scales\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[16,24]}," ++
+    "\"l.biases\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[24,32]}," ++
+    "\"x.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[32,40]}}";
+/// One shard: `l.weight` dense BF16 plus `y.weight` float. 16 body bytes.
+const dense_copy_hdr = "{\"l.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[0,8]}," ++
+    "\"y.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[8,16]}}";
+/// One shard: a DENSE l.weight with its OWN scales/biases (a modelopt NVFP4
+/// winner ships the pair it indexes) plus `y.weight`. 32 body bytes.
+const dense_pair_hdr = "{\"l.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[0,8]}," ++
+    "\"l.scales\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[8,16]}," ++
+    "\"l.biases\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[16,24]}," ++
+    "\"y.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[24,32]}}";
+/// One shard: `l.weight` BF16 beside BF16 scales/biases (a stale twin) plus
+/// `x.weight`. 32 body bytes.
+const stale_bf16_hdr = "{\"l.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[0,8]}," ++
+    "\"l.scales\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[8,16]}," ++
+    "\"l.biases\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[16,24]}," ++
+    "\"x.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[24,32]}}";
+/// A float weight that is NOT a `.scales`/.biases name, so a fixture can pin
+/// that the shed frees the leaf too. 16 body bytes.
+const weight_scale_inv_hdr = "{\"l.weight\":{\"dtype\":\"U32\",\"shape\":[4,1],\"data_offsets\":[0,16]}," ++
+    "\"l.weight_scale_inv\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[16,24]}}";
+
+test "loadWeights sheds a retired quant pair beside a float weight a later shard overwrote" {
+    if (std.fs.path.sep == '\\') return error.SkipZigTest; // the dir path below is POSIX
+    // A pack with no index (the indexed path has its own tests below): shard
+    // order decides which `l.weight` wins, and the float winner sheds the
+    // trunk's retired scales/biases, weight_scale_inv included.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const wsci = "{\"l.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[0,8]}," ++
+        "\"l.weight_scale_inv\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[8,16]}}";
+    try writeShardPack(io, tmp.dir, &.{
+        .{ .name = "model-a.safetensors", .hdr = packed_triple_hdr, .body = 40 },
+        .{ .name = "model-b.safetensors", .hdr = wsci, .body = 16 },
+    }, null);
+    const dir = try tmpDirPath(allocator, &tmp.sub_path);
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
+    defer w.deinit();
+    // One of the two l.weight copies wins by directory order. Assert the
+    // invariant the arms ship on: never a float weight beside set scales.
+    const w_after = w.get("l.weight").?;
+    const float_w = switch (mlx.mlx_array_dtype(w_after)) {
+        .bfloat16, .float16, .float32 => true,
+        else => false,
+    };
+    if (float_w) {
+        try testing.expect(w.get("l.scales") == null);
+        try testing.expect(w.get("l.biases") == null);
+        try testing.expect(w.get("l.weight_scale_inv") == null);
+    } else {
+        try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(w_after));
+    }
+}
+
+test "loadWeights sheds a retired quant pair the index adopted, in both directory orders" {
+    if (std.fs.path.sep == '\\') return error.SkipZigTest; // the dir path below is POSIX
+    // The index names the DENSE shard as l.weight's owner: the packed shard's
+    // copy and its pair are retired, in both file-name orders — one order
+    // overwrites no key, so a dtype-only fix at the merge never fires there.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const Arm = struct {
+        packed_shard: []const u8,
+        dense: []const u8,
+        owner: []const u8,
+        keep_pair: bool,
+        keep_dtype: mlx.mlx_dtype,
+        index_pair: bool = false,
+        dense_pair: bool = false,
+    };
+    const arms = [_]Arm{
+        // The DENSE shard owns the key and indexes the PAIR it ships: the
+        // packed shard's copy and its unnamed leaves are retired. This is the
+        // order a dtype-only fix at the merge misses — no key is overwritten.
+        .{ .packed_shard = "model-aaa.safetensors", .dense = "model-dense.safetensors", .owner = "model-dense.safetensors", .keep_pair = false, .keep_dtype = .bfloat16 },
+        // Same owners, and the winner ships AND indexes its own scales/biases
+        // (a modelopt NVFP4 pack does): the named pair stays; the packed
+        // shard's unnamed leaves retire.
+        .{ .packed_shard = "model-aaa.safetensors", .dense = "model-dense.safetensors", .owner = "model-dense.safetensors", .keep_pair = true, .keep_dtype = .bfloat16, .index_pair = true, .dense_pair = true },
+        // The PACKED shard owns the key (a Sushi stale bf16 twin): the packed
+        // copy wins and keeps its pair; the dense copy is the foreign one.
+        .{ .packed_shard = "model-dense.safetensors", .dense = "model-aaa.safetensors", .owner = "model-dense.safetensors", .keep_pair = true, .keep_dtype = .uint32 },
+    };
+    for (arms) |arm| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        const index = if (arm.index_pair) try std.fmt.allocPrint(allocator,
+            \\{{"weight_map":{{"l.weight":"{s}","l.scales":"{s}","l.biases":"{s}","x.weight":"{s}","y.weight":"{s}"}}}}
+        , .{ arm.owner, arm.owner, arm.owner, arm.packed_shard, arm.dense }) else try std.fmt.allocPrint(allocator,
+            \\{{"weight_map":{{"l.weight":"{s}","x.weight":"{s}","y.weight":"{s}"}}}}
+        , .{ arm.owner, arm.packed_shard, arm.dense });
+        defer allocator.free(index);
+        const dense_hdr = if (arm.dense_pair) dense_pair_hdr else dense_copy_hdr;
+        const dense_body: usize = if (arm.dense_pair) 32 else 16;
+        try writeShardPack(io, tmp.dir, &.{
+            .{ .name = arm.packed_shard, .hdr = packed_triple_hdr, .body = 40 },
+            .{ .name = arm.dense, .hdr = dense_hdr, .body = dense_body },
+        }, index);
+        const dir = try tmpDirPath(allocator, &tmp.sub_path);
+        defer allocator.free(dir);
+        var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
+        defer w.deinit();
+        if (arm.keep_pair) {
+            try testing.expectEqual(@as(u32, 5), w.count());
+            const weight = w.get("l.weight") orelse return error.NoWeight;
+            try testing.expectEqual(arm.keep_dtype, mlx.mlx_array_dtype(weight));
+            try testing.expect(w.get("l.scales") != null);
+            try testing.expect(w.get("l.biases") != null);
+        } else {
+            try testing.expectEqual(@as(u32, 3), w.count());
+            const weight = w.get("l.weight") orelse return error.NoWeight;
+            try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weight));
+            try testing.expect(w.get("l.scales") == null);
+            try testing.expect(w.get("l.biases") == null);
+        }
+    }
+}
+
+test "loadWeights keeps a retired pair whose adopted copy is packed (a Sushi stale bf16 twin)" {
+    if (std.fs.path.sep == '\\') return error.SkipZigTest; // the dir path below is POSIX
+    // The inverse of the GLM fork (MiMo-V2.6-Flash-Sushi): the source shard
+    // still carries a bf16 copy beside the affine triple, and the index names
+    // the AFFINE shard. The packed replacement wins the key and keeps its pair.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeShardPack(io, tmp.dir, &.{
+        .{ .name = "model-stale.safetensors", .hdr = stale_bf16_hdr, .body = 32 },
+        .{ .name = "model-affine.safetensors", .hdr = packed_triple_hdr, .body = 40 },
+    },
+        \\{"weight_map":{"l.weight":"model-affine.safetensors","l.scales":"model-affine.safetensors","l.biases":"model-affine.safetensors","x.weight":"model-stale.safetensors"}}
+    );
+    const dir = try tmpDirPath(allocator, &tmp.sub_path);
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
+    defer w.deinit();
+    // l.weight + its pair from the affine shard, x.weight from the stale one.
+    try testing.expectEqual(@as(u32, 4), w.count());
+    const weight = w.get("l.weight") orelse return error.NoWeight;
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(weight));
+    try testing.expect(w.get("l.scales") != null);
+    try testing.expect(w.get("l.biases") != null);
+}
+
+test "loadWeights keeps a key an out-of-place index entry names, when only one shard carries it" {
+    if (std.fs.path.sep == '\\') return error.SkipZigTest; // the dir path below is POSIX
+    // A hand-edited fork's index can name the wrong shard: `l.weight` lives in
+    // model-a while the entry says model-b. A load that trusted the entry
+    // would drop the only copy as foreign and die with MissingWeight; the
+    // carrier map maps the key to its carrier, so it loads.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const shard_a = "{\"l.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[0,8]}," ++
+        "\"x.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[8,16]}}";
+    const shard_b = "{\"y.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[0,8]}}";
+    try writeShardPack(io, tmp.dir, &.{
+        .{ .name = "model-a.safetensors", .hdr = shard_a, .body = 16 },
+        .{ .name = "model-b.safetensors", .hdr = shard_b, .body = 8 },
+    },
+        \\{"weight_map":{"l.weight":"model-b.safetensors","x.weight":"model-a.safetensors","y.weight":"model-b.safetensors"}}
+    );
+    const dir = try tmpDirPath(allocator, &tmp.sub_path);
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 3), w.count());
+    try testing.expect(w.get("l.weight") != null);
+}
+
+test "loadWeights places an index-named weight over a packed copy with different shapes" {
+    if (std.fs.path.sep == '\\') return error.SkipZigTest; // the dir path below is POSIX
+    // GLM-5.3-Flash-Sushi-2bpw: the index names an EXPANDED o_proj (4096x16384
+    // BF16) in its own shard while the trunk still carries the packed one
+    // (4096x2560) with unnamed scales. The load opens shards in directory order,
+    // so the packed copy may place first; the naming shard's copy must win —
+    // the forward matmuls against its shapes, and the trunk's leaves are dead.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const packed_shard = "{\"l.weight\":{\"dtype\":\"U32\",\"shape\":[4,1],\"data_offsets\":[0,16]}," ++
+        "\"l.scales\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[16,24]}," ++
+        "\"l.biases\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[24,32]}," ++
+        "\"x.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[32,40]}}";
+    const expanded_shard = "{\"l.weight\":{\"dtype\":\"BF16\",\"shape\":[4,8],\"data_offsets\":[0,64]}," ++
+        "\"y.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[64,72]}}";
+    try writeShardPack(io, tmp.dir, &.{
+        .{ .name = "model-aaa-packed.safetensors", .hdr = packed_shard, .body = 40 },
+        .{ .name = "model-bbb-expanded.safetensors", .hdr = expanded_shard, .body = 72 },
+    },
+        \\{"weight_map":{"l.weight":"model-bbb-expanded.safetensors","x.weight":"model-aaa-packed.safetensors","y.weight":"model-bbb-expanded.safetensors"}}
+    );
+    const dir = try tmpDirPath(allocator, &tmp.sub_path);
+    defer allocator.free(dir);
+    var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
+    defer w.deinit();
+    try testing.expectEqual(@as(u32, 3), w.count());
+    const weight = w.get("l.weight") orelse return error.NoWeight;
+    try testing.expectEqual(@as(c_int, 8), mlx.getShape(weight)[1]);
+    try testing.expect(w.get("l.scales") == null);
+    try testing.expect(w.get("l.biases") == null);
 }
 
 test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config keys" {
