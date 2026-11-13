@@ -189,14 +189,14 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     publishHotCacheResidency(sch);
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
-    if (slot.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), reason);
+    if (slot.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), reason);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
     // The prefix cache and stream live on the registry-owned LoadedModel,
     // which outlives the slot (unload also runs on this thread).
     const hc_opt: ?*prefix_cache_mod.HotPrefixCache =
-        if (slot.model.prefix_cache) |p| p else null;
+        if (slot.prefix_cache) |p| p else null;
     const stream_opt: ?mlx.mlx_stream =
         if (slot.model.transformer) |x| x.s else null;
     // Record per-request metrics while slot fields are still live (before

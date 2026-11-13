@@ -50,9 +50,11 @@ pub const Slot = struct {
     /// thread holds a refcount (via `scheduler.ensureLoaded`) so the
     /// pointer stays valid until `complete()`. Prefill/decode route forward
     /// passes through `model.transformer.?` (and `model.vision_encoder`,
-    /// `model.drafter`, `model.prefix_cache`). Batched decode groups slots
+    /// `model.drafter`). Batched decode groups slots
     /// by this field so kernels never cross model boundaries.
     model: *model_registry_mod.LoadedModel,
+    /// The prefix cache this request restores from and commits to: the model's, unless the request brought its own.
+    prefix_cache: ?*prefix_cache_mod.HotPrefixCache,
 
     // ── Per-slot model state. Owned by the slot. ──
     cache: KVCache,
@@ -301,6 +303,7 @@ pub const Slot = struct {
             .allocator = allocator,
             .io = io,
             .model = params.model,
+            .prefix_cache = params.prefix_cache orelse params.model.prefix_cache,
             .cache = cache,
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
@@ -725,3 +728,32 @@ pub const Slot = struct {
         self.out_event.set(self.io);
     }
 };
+
+// ── tests ──
+
+test "a slot reads and writes its model's prefix cache, or the one its request brought" {
+    const testing = std.testing;
+    var of_model = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 1);
+    defer of_model.deinit();
+    var of_request = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 1);
+    defer of_request.deinit();
+    var lm: model_registry_mod.LoadedModel = undefined;
+    lm.engine = null;
+    lm.transformer = null;
+    lm.prefix_cache = &of_model;
+    var cfg: ModelConfig = .{};
+    cfg.num_hidden_layers = 0;
+    const params: SubmitParams = .{ .model = &lm, .prompt_ids = &.{ 5, 6, 7 }, .sampling = .{ .temperature = 0 }, .eos_token_ids = &.{}, .max_tokens = 1 };
+    const plain = try Slot.init(testing.allocator, testing.io, &cfg, params, .dense);
+    defer plain.deinit();
+    try testing.expectEqual(&of_model, plain.prefix_cache.?);
+    var with_own = params;
+    with_own.prefix_cache = &of_request;
+    const own = try Slot.init(testing.allocator, testing.io, &cfg, with_own, .dense);
+    defer own.deinit();
+    try testing.expectEqual(&of_request, own.prefix_cache.?);
+    lm.prefix_cache = null;
+    const none = try Slot.init(testing.allocator, testing.io, &cfg, params, .dense);
+    defer none.deinit();
+    try testing.expect(none.prefix_cache == null);
+}

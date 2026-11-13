@@ -259,6 +259,8 @@ pub fn init(
         .drafter_block_size = params.draft_block_size,
         .kv_quant_config = params.kv_quant_config,
         .gguf_ctx_size = params.ctx_size,
+        .warmup_eager = params.launch_warmup_eager,
+        .warmup_full = params.warmup_full,
         .prefix_cache_capacity = params.prefix_cache_capacity,
         .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
         .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
@@ -490,13 +492,27 @@ pub fn decodingCount(self: *Scheduler) usize {
 pub fn hasCompany(self: *Scheduler) bool {
     self.queue_mu.lockUncancelable(self.io);
     defer self.queue_mu.unlock(self.io);
-    return self.in_flight > self.offloaded.items.len;
+    return self.in_flight -| self.warm_in_flight > self.offloaded.items.len;
 }
 
 /// Submit a new request. Builds a Slot, queues it, returns the handle.
 /// Blocks if the queue is full (i.e. `in_flight >= queue_cap`). When
 /// the scheduler is shutting down this returns `error.Shutdown`.
 pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
+    return submitWaiting(self, params, true);
+}
+
+/// `submit` from the inference thread: it is the thread that frees queue room, so a full queue is
+/// `error.QueueFull`, never a wait.
+pub fn submitNow(self: *Scheduler, params: SubmitParams) !*Slot {
+    self.queue_mu.lockUncancelable(self.io);
+    const full = self.in_flight >= self.queue_cap;
+    self.queue_mu.unlock(self.io);
+    if (full) return error.QueueFull;
+    return submitWaiting(self, params, false);
+}
+
+fn submitWaiting(self: *Scheduler, params: SubmitParams, wait: bool) !*Slot {
     // Construct the slot up front so we don't hold the queue mutex
     // through any allocation. Per-request `kv_quant_config` override (Wave
     // 1.A) wins over the process-level default carried on the scheduler.
@@ -527,6 +543,7 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     var blocked: Blocked = .{};
     defer blocked.leave(&self.submit_waiting);
     while (self.in_flight >= self.queue_cap and !self.shutdown.load(.acquire)) {
+        if (!wait) return error.QueueFull;
         blocked.enter(&self.submit_waiting);
         self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
     }
@@ -537,6 +554,7 @@ pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
     // then claim it (released in `complete`).
     if (params.model.sessionCapacity()) |cap| {
         while (params.model.session_claims >= cap and !self.shutdown.load(.acquire)) {
+            if (!wait) return error.QueueFull;
             blocked.enter(&self.submit_waiting);
             self.session_cond.waitUncancelable(self.io, &self.queue_mu);
         }
@@ -603,6 +621,16 @@ test "a submit blocked for queue room and then for a session counts as one waiti
     c.leave(&waiting);
     b.leave(&waiting);
     try std.testing.expectEqual(@as(u32, 0), waiting);
+}
+
+test "submitNow: a full queue is refused at once, where submit would wait for the thread that is calling" {
+    var sch: Scheduler = undefined;
+    sch.io = testing.io;
+    sch.queue_mu = .init;
+    sch.queue_cap = 2;
+    sch.in_flight = 2;
+    // Refused before the request is read: nothing of it is touched.
+    try testing.expectError(error.QueueFull, submitNow(&sch, undefined));
 }
 
 /// Give back the slot's session claim. Caller holds `queue_mu`.
@@ -957,7 +985,8 @@ fn ensureLoadedOnce(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
         .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
         .no_drafter = self.no_drafter,
         .load_vision = coldLoadVision(owned.config.has_vision),
-        .warmup_eager = true,
+        .warmup_eager = self.warmup_eager,
+        .warmup_full = self.warmup_full,
         .draft_block_size = self.draft_block_size,
         .draft_block_size_explicit = self.draft_block_size_explicit,
         .kv_quant_config = self.kv_quant_config,
@@ -1332,9 +1361,15 @@ test "company: a slot on an engine beside MLX never batches, so it does not coun
     defer sch.offloaded.deinit(testing.allocator);
     var ane: Slot = undefined;
     try sch.offloaded.append(testing.allocator, &ane);
+    sch.warm_in_flight = 0;
     sch.in_flight = 1;
     try testing.expect(!hasCompany(&sch));
     sch.in_flight = 2;
+    try testing.expect(hasCompany(&sch));
+    // Nor does the model's own warm request.
+    sch.warm_in_flight = 1;
+    try testing.expect(!hasCompany(&sch));
+    sch.in_flight = 3;
     try testing.expect(hasCompany(&sch));
 }
 

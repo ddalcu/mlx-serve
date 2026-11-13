@@ -115,6 +115,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_memory_pressure_4way.sh` low guard ceiling · `test_oom_preflight.sh` **H** refusal exits cleanly
 - `test_kv_cache_growth_memory.sh` long decode does not ratchet · `test_evict_returns_memory.sh` make-room frees memory
 - `test_idle_evict.sh` --idle-evict-secs · `test_load_progress.sh` /v1/load-progress · `test_cold_load_launch_flags.sh` cold loads keep flags
+- `test_first_request_compiles.sh` a build's first load of a model warms its kernels: when idle by default, before ready with `--warmup-full` (empty shader cache via a re-identified copy)
 - `test_load_failure_no_fallback.sh` a broken pack never falls back · `test_load_model_api.sh`, `test_load_model_default.sh` /v1/load-model
 - `test_model_alias.sh` Model Settings alias · `test_model_settings.sh` per-model settings · `test_model_discovery.sh` discovery
 - `test_model_rescan.sh` **H** rescan · `test_multi_model_dir.sh` **H** repeatable --model-dir

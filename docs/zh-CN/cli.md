@@ -88,7 +88,8 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-resident-mem N{MB,GB}` | 自动 | 已加载模型的内存总上限；它决定一个模型能否加载（auto = MLX wired limit 的 80%，`0` 表示禁用） |
 | `--max-resident-models N` | `3` | 同时保持加载的模型数量（按 LRU 淘汰） |
 | `--idle-evict-secs N` | 关闭 | 闲置超过这么多秒后卸载无人使用的模型 |
-| `--no-warmup-eager` | 关闭 | 跳过启动时的立即预热（用于基准测试 / 最小占用部署） |
+| `--no-warmup-eager` | 关闭 | 跳过启动时的立即预热，以及某个构建首次加载模型时的内核预热（之后的首批请求会编译 Metal 内核） |
+| `--warmup-full` | 关闭 | 在模型就绪之前编译其 Metal 内核：某个构建首次加载模型时，先自行处理一组不同长度的提示（数秒到一分钟，仅该次加载）。**基准测试时强烈建议开启。** 不开启时模型立即就绪，服务器空闲时运行一次简短预热，首批长提示仍需编译 |
 | `--skip-mem-preflight` | 关闭 | 加载时跳过空闲内存预检（上面的上限先检查，并且仍然适用） |
 | `--no-tool-autocorrect` | 关闭 | 关闭对模型输出的工具参数所做的 schema 驱动修复 |
 | `--log-level` | `info` | 日志级别（error、warn、info、debug） |

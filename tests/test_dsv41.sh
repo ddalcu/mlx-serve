@@ -176,6 +176,24 @@ else
     echo "FAIL: resumed or fresh greedy bytes differ"
     for r in "$R1" "$R2" "$R3"; do echo "  $(echo "$r" | head -c 200)"; done; fail=$((fail+1))
 fi
+# [7c] The cache across turns: another question under the same long document resumes at what the two prompts share
+# (a cut of the first one's entry), and a turn after an answer resumes where that answer's decode stopped.
+if [ ! -f "$MODEL/experts.bin" ]; then
+    DOC=$(python3 -c "print(' '.join('Fact %d: the value of item %d is %d.' % (i, i, i * 7 % 1000) for i in range(600)))")
+    q() { post /v1/chat/completions "{\"model\":\"mlx-serve\",\"messages\":$1,\"max_tokens\":$2,\"temperature\":0,\"enable_thinking\":false}"; }
+    cached() { python3 -c 'import json,sys; u=json.load(sys.stdin)["usage"]; print(u["prompt_tokens"], (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0), u["completion_tokens"])'; }
+    C1=$(q "[{\"role\":\"user\",\"content\":\"$DOC What is the value of item 3?\"}]" 24)
+    read -r P1 _ G1 <<<"$(echo "$C1" | cached)"
+    C2=$(q "[{\"role\":\"user\",\"content\":\"$DOC Which item has the value 14?\"}]" 24)
+    read -r P2 H2 _ <<<"$(echo "$C2" | cached)"
+    if [ "$H2" -gt $((P2 - 700)) ]; then echo "PASS: [7c] another question resumes the shared document ($H2 of $P2 cached)"; pass=$((pass+1)); else echo "FAIL: [7c] another question prefilled the document again ($H2 of $P2 cached)"; fail=$((fail+1)); fi
+    check "[7c] the cut restore answers" "$C2" '"finish_reason"'
+    A1=$(echo "$C1" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["choices"][0]["message"]["content"]))')
+    C3=$(q "[{\"role\":\"user\",\"content\":\"$DOC What is the value of item 3?\"},{\"role\":\"assistant\",\"content\":$A1},{\"role\":\"user\",\"content\":\"And of item 4?\"}]" 24)
+    read -r P3 H3 _ <<<"$(echo "$C3" | cached)"
+    if [ "$H3" -ge $((P1 - 1)) ]; then echo "PASS: [7c] the next turn resumes past the first prompt ($H3 cached, prompt $P1 + $G1 generated)"; pass=$((pass+1)); else echo "FAIL: [7c] the next turn resumed short of the first prompt ($H3 cached, prompt $P1)"; fail=$((fail+1)); fi
+    check "[7c] a decode-end checkpoint was taken" "$(grep -q 'decode-end checkpoint at' "$LOG" && echo taken)" 'taken'
+fi
 # The EXL3 repack's routed experts stream from its bank.
 if [ -f "$MODEL/experts.bin" ]; then
     check "the repack streams its experts" "$(grep 'deepseek_v41: streamed experts' "$LOG" || true)" 'slot rows per layer'

@@ -39,8 +39,11 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   attention per state) and `dsparkDraftBatched`. Each State owns its pending capture.
 - `prefix_cache` for unpaired instances whose bank holds every expert; a streaming bank (fewer prompt or decode slot
   rows than `num_experts`, `bankStreams`) and a Thunderbolt pair keep legacy resume.
-  Snapshots retain every buffer and restore only at their exact position; the engine owns finished history. Pairs
+  Snapshots retain every buffer and restore whole only at their own position; the engine owns finished history. Pairs
   keep legacy resume.
+- A snapshot is cut to a shorter prefix (`sliceSnap`: global rows and index keys kept, where every pooling group is
+  closed) and restored by the tech report's SWA bounded replay (`rewind`, `Want.replay`: the last window run again,
+  its band stopped at its first row, no compressor). Text only, no pair or tensor split; a slice is never exported.
 - No spec rollback (DSpark rewinds inside the module); DSpark stages from `native_stages`;
   `spec.trunk_weight` lends the embedding and head; a pair's load re-reads `distributed.planFor` (idempotent).
 - A tensor pair (`InitOpts.tp`, `--dist tensor`) halves the experts and attention heads at load (the sliced `cfg` says so);
@@ -90,12 +93,21 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   about a plain tick, and the adaptive policy's prior ladder cut novel text from 54 to 40 tok/s.
 - A streamed bank's phase follows its decode capacity (`promptPhase`): a call past the decode regions OR past
   `Routed.decode_ids` routed ids runs the prompt phase; a 9-16 token prompt on the EXL3 bank failed `NotPrefill`.
-- Engram tables are read past the page cache only beside a streamed bank (`Table.readDirect`): on a resident MLX pack
-  the direct whole-grid read cost warm prompts 3% (the cache served their rows), and the bank needs that memory.
+- Engram tables are read whole and past the page cache only beside a streamed bank (`Table.readDirect`): on a resident
+  MLX pack the direct whole-grid read slowed warm prompts (the cache served their rows), and the bank needs that memory.
+- A resident pack reads its Engram CODES past the page cache while memory is tight (`Table.openCodes`, `pastCache`,
+  `engram.cacheTight`: under an eighth of RAM free, asked at each prompt chunk), its scales always through it: with
+  no room the cache evicted the scales to hold codes read once and every row cost two reads; with room the cache wins.
 - A fused decode stage is judged against an f32 model (`decode.expectNoWorse`), not against the chain's bits: greedy
   texts diverge from the chain's at bf16 near-ties. Stacked layers judge the median over seeds: one seed lands 1.6x
   either side of the chain (TF32 moves the f32 model itself 8% at the verify step on M5). Two dependent stages merged into one ticket-ordered dispatch
   measured slower than the pair (their threadgroup shapes differ): keep one dispatch a stage.
+- A cut restore is as far from a cold prompt as another prefill chunk width is, never bit-equal past one window: its
+  proof is the state (`proof_test`: a whole-prefix replay is the cold state bit for bit, the global rows are the
+  snapshot's own), its quality a live pair of answers with logprobs.
+- A prompt chunk of 4096 rows or more that nothing read ahead runs as its first half, then the rest (`extendCold`,
+  `leadRows`; the lead is `Want.encode`: no decoder replay, which the rest makes): the drive reads the rest's Engram
+  rows behind the lead. The log's `waited ... ms` is the meter.
 - Construct each MPP cooperative tensor from its owning op; copying one invokes incompatible Metal layout
   interfaces on some SDKs. Fill each operand's independent storage before running the matmul.
 
@@ -124,7 +136,7 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 
 ## Known issues
 - Auxiliary snapshots persist through the disk tensor hooks as exact v10 module records; one-shot serialization
-  and shortened slices still return named unsupported verdicts. SSD-only module retention is unsupported.
+  still returns a named unsupported verdict. SSD-only module retention is unsupported.
 - Serial decode near the memory wall: 720 GB/s of ~1.1 TB/s, so kernel work buys 15-25%, not 2x.
 - Without NAX (M4 and older) `attn`, `idx_score` and the `wo_a` / `ffn_in` fusion behind them stay off: decode runs the
   pre-NAX split kernel and the compiled regions. The affine `moe_up` / `moe_down` stay off too (they lose to the
