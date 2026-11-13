@@ -274,6 +274,8 @@ fn mtpSetting(settings_json: []const u8) ?bool {
 fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const io = std.Io.Threaded.global_single_threaded.io();
     const c = config.of(ctx.parsed);
+    // Before the weights: what is outside the server, for the bank's open (`bill_mod.inUseAt`).
+    const start = bill_mod.reading();
     const m = try gpa.create(Model);
     errdefer gpa.destroy(m);
     m.cfg = c.*;
@@ -303,7 +305,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.idle = null;
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
-        if (c.dsv41_exl3_bank) try openBank(m, quant, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
+        if (c.dsv41_exl3_bank) try openBank(m, quant, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes, start) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
     }
     errdefer closeBank(m);
     m.vision_dir = if (lazy_tower) try gpa.dupeSentinel(u8, ctx.model_dir.slice(), 0) else null;
@@ -316,7 +318,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
 /// The pack's bank, streamed by the outside quant plugin that claims it, at the slot rows the box holds beside the
 /// residents and a request of the model's `ctx_size`, else of the largest `bill.stream_context_rungs` rung that keeps
 /// `bill.stream_min_rows` rows, else of `bill.stream_context`.
-fn openBank(m: *Model, quant: ?*const outside.Format, ctx_size: ?u64, wired_margin: u64) !void {
+fn openBank(m: *Model, quant: ?*const outside.Format, ctx_size: ?u64, wired_margin: u64, start: outside_model.Reading) !void {
     if (comptime !streamed.built) return error.StreamedWeightsUnsupported;
     const q = quant orelse return error.StreamedBankUnclaimed;
     const mdl = m.mdl;
@@ -328,13 +330,17 @@ fn openBank(m: *Model, quant: ?*const outside.Format, ctx_size: ?u64, wired_marg
     const B = struct {
         c: *const config.Config,
         margin: u64,
+        start: outside_model.Reading,
         fn at(p: *const anyopaque, context: u64) quant_abi.BankBudget {
             const self: *const @This() = @ptrCast(@alignCast(p));
-            const b = bill_mod.streamBudget(self.c, context, self.margin);
+            const now = bill_mod.reading();
+            const in_use = bill_mod.inUseAt(now, self.start, mlx.weightsInDeviceMemory());
+            if (in_use != now.in_use) std.log.info("deepseek_v41: the open read in use {d} MiB, settled to {d} MiB (outside the server at the load's start {d} MiB, server footprint {d} MiB)", .{ now.in_use >> 20, in_use >> 20, (self.start.in_use -| self.start.footprint) >> 20, now.footprint >> 20 });
+            const b = bill_mod.streamBudget(self.c, context, self.margin, in_use);
             return .{ .prompt = b.prompt, .decode = b.decode };
         }
     };
-    const by: B = .{ .c = c, .margin = wired_margin };
+    const by: B = .{ .c = c, .margin = wired_margin, .start = start };
     const o = try outside_model.openBank(q, geo, .{ .rungs = .{ .ctx = &by, .at = &B.at, .ctx_size = ctx_size, .rungs = &bill_mod.stream_context_rungs, .min_rows = bill_mod.stream_min_rows, .fallback = bill_mod.stream_context } }, m.s);
     std.log.info("deepseek_v41: streamed experts, {s} for a {d}-token context", .{ o.bank.b.about.slice(), o.context });
     m.bank = .{ .outside = o.bank };
