@@ -13,6 +13,7 @@ const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
 const Family = @import("../glm5_next/config.zig").Config;
 const run = @import("../../sdk/bases/run.zig");
 const fwd = @import("table_forward.zig");
+const prompt = @import("prompt.zig");
 const head = @import("head.zig");
 const fixture = @import("../glm5_next/fixture.zig");
 pub const config = @import("config.zig");
@@ -104,6 +105,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return abi.Verdict.refuse(.unsupported, "bailing_hybrid: forward mode not declared");
     const ops = f.cache_ops orelse return abi.Verdict.refuse(.unsupported, "bailing_hybrid: a forward without cache_ops");
+    // A streaming pack's whole prompt runs layer by layer over the chunk loop's spans, which set its phases and settles.
+    if (m.c.streamed_bank and f.mode == .prefill and f.prompt_spans.len > 0) return prompt.forward(m, ops, f, out);
     m.serial_rows = serialVerify(m.c, f.mode, f.rows);
     defer m.serial_rows = false;
     // A streaming pack's bank: its phase before the trunk runs, its slot rows settled after the outputs are evaluated.
@@ -129,6 +132,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
+    _ = @import("span_plan.zig");
 }
 
 test "bailing_hybrid serial verify: a streaming pack's verify of up to 16 rows; never a prompt, a decode or an MLX pack" {

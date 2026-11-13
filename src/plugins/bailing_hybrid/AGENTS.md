@@ -21,6 +21,9 @@ with GLM-5.3-Flash's readers and loads through `glm5_next/trunk.zig`; its own pa
   `quantization_config` (not `expert_streaming`) sets `streamed_bank`; glm5_next's streaming rules then apply. Its prompt
   bill is `prefill_bytes`: the engine's unstreamed arithmetic over `sdk/bill/prefill.zig`, pinned by `bill_test.zig`
   (the closure stays in sdk/); `prompt_last_row` reads the head's last 32 rows only.
+- Whole prompt (streaming packs, `Caps.whole_prompt_prefill`, `prompt.zig`): layer by layer over the engine's chunk
+  loop spans (`table_forward.hiddenSpans`), every span's ops on its own rows but the routed experts, one bank call over
+  whole spans (up to 16,384 rows, `trunk.PromptCalls`); a decode-lane span is a forward of its own. Bar: `served_test.zig`.
 - Exact verify (streaming packs, `serialVerify`, ≤ 16 rows): every row carries serial decode's bytes (projections at
   `QuantTable.exact_rows`, KDA rows in one launch to 8 (`kda/verify_rows.zig`), MLA in one per plan (`sdpa_rows.zig`),
   `moe.mlpRows`); not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.

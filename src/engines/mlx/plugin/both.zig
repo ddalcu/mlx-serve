@@ -280,20 +280,20 @@ pub fn parse(table: *const abi.ModelTable, dir: []const u8, config_json: []const
 }
 
 /// One slot's cache, recurrent entries (when the model has recurrent layers) and context on `xfm`.
-const Slot = struct {
+pub const Slot = struct {
     kv: KVCache,
     off: usize = 0,
     ssm: ?[]SSMCacheEntry = null,
     xfm: *Transformer,
     ctx: ForwardCtx = undefined,
 
-    fn init(s: *Slot, b: *const Both, xfm: *Transformer) !void {
+    pub fn init(s: *Slot, b: *const Both, xfm: *Transformer) !void {
         s.* = .{ .kv = try KVCache.init(testing.allocator, @intCast(b.layers())), .xfm = xfm };
         errdefer s.kv.deinit();
         if (b.cfg.needsSsmEntries()) s.ssm = try fixture.newEntries(b.layers());
         s.ctx = .{ .cache = &s.kv, .moe_seq_offset = &s.off, .ssm_entries = s.ssm, .capture_hidden = null, .vision_embeddings = null };
     }
-    fn deinit(s: *Slot) void {
+    pub fn deinit(s: *Slot) void {
         if (s.ssm) |e| {
             s.xfm.ssmGroupDrop(e);
             fixture.freeEntries(e);
