@@ -143,8 +143,8 @@ pub const Fit = struct {
 };
 
 /// A pack's measured fit on one ceiling (`bank-fit.json`): each phase's base is the evidence run's peak of the box's
-/// non-file memory less the bank's bytes there, at the rooms' cell (a 16K + 1K request); `rest` the box's memory outside
-/// the server at that run's bank open.
+/// non-file memory less the bank's bytes there, at the rooms' cell (a 16K + 1K request); `rest` the box's non-file memory
+/// outside the server at that run's bank open (`Reading`).
 pub const Calibration = struct {
     ceiling: u64,
     cell: u64,
@@ -153,7 +153,8 @@ pub const Calibration = struct {
     rest: u64,
 };
 
-/// The memory a budget reads: in use on the box (`total - available`) and the server's own footprint within it.
+/// The memory a budget reads: the box's non-file memory in use (`system.getNonFileMemBytes`: a page cache of another
+/// size reads the same) and the server's own footprint within it.
 pub const Reading = struct { in_use: u64, footprint: u64 };
 
 /// `fit`'s budget at `r`. Bills only: each phase's room less the memory in use (equal rooms: `roomBudget`). Calibrated:
@@ -170,16 +171,19 @@ pub fn fitBudget(fit: Fit, r: Reading) quant_abi.BankBudget {
 
 /// The calibration file's name in a pack and its format.
 pub const bank_fit_file = "bank-fit.json";
-pub const bank_fit_format = "mlx-serve-bank-fit-v1";
+pub const bank_fit_format = "mlx-serve-bank-fit-v2";
+/// The first format: its `rest_bytes` read `total - available`, which moves with the page cache; refused by name.
+pub const bank_fit_format_v1 = "mlx-serve-bank-fit-v1";
 
 /// `bank-fit.json`'s calibration when its ceiling is the host's (`ceiling`, 0 = unknown: none applies) and its evidence
 /// ran the rooms' cell (`cell`, the bills' growth past it is the host's); a named reason otherwise (logged by the caller;
 /// the bills stand).
-pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64) error{ BankFitInvalid, BankFitFormat, BankFitOtherCeiling, BankFitOtherCell }!Calibration {
+pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64) error{ BankFitInvalid, BankFitFormat, BankFitV1Rest, BankFitOtherCeiling, BankFitOtherCell }!Calibration {
     const F = struct { format: []const u8 = "", ceiling_bytes: u64 = 0, cell_tokens: u64 = 0, base_prompt_bytes: u64 = 0, base_decode_bytes: u64 = 0, rest_bytes: u64 = 0 };
     var buf: [4096]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const f = std.json.parseFromSliceLeaky(F, fba.allocator(), json, .{ .ignore_unknown_fields = true }) catch return error.BankFitInvalid;
+    if (std.mem.eql(u8, f.format, bank_fit_format_v1)) return error.BankFitV1Rest;
     if (!std.mem.eql(u8, f.format, bank_fit_format)) return error.BankFitFormat;
     if (f.ceiling_bytes == 0 or f.cell_tokens == 0 or f.base_prompt_bytes == 0 or f.base_decode_bytes == 0) return error.BankFitInvalid;
     if (ceiling == 0 or f.ceiling_bytes != ceiling) return error.BankFitOtherCeiling;
@@ -189,7 +193,7 @@ pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64) error{ BankFitInv
 
 /// The memory in use now and the server's footprint (`fitBudget`'s reading).
 fn readMemory() Reading {
-    return .{ .in_use = system.getTotalMemBytes() -| system.getAvailableMemBytes(), .footprint = @as(u64, system.getAppMemFootprintMb()) << 20 };
+    return .{ .in_use = system.getNonFileMemBytes(), .footprint = @as(u64, system.getAppMemFootprintMb()) << 20 };
 }
 
 /// The model's budget at `context` positions (`at`): at `ctx_size` when set, else at the first of `rungs` (largest
@@ -482,8 +486,25 @@ test "outside model: a calibrated fit gives each phase the ceiling less its base
     try testing.expectEqual(quant_abi.BankBudget{ .prompt = 0, .decode = 0 }, fitBudget(.{ .prompt_room = 1, .decode_room = 1, .calibration = cal }, .{ .in_use = 200 << 30, .footprint = 0 }));
 }
 
+test "outside model: a calibrated budget reads the same with more file pages on the box (the non-file reading)" {
+    if (!@import("builtin").os.tag.isDarwin()) return error.SkipZigTest;
+    const GB: u64 = 1 << 30;
+    const cal: Calibration = .{ .ceiling = 110 * GB, .cell = 17_408, .base_prompt = 40 * GB, .base_decode = 28 * GB, .rest = 12 * GB };
+    const fit: Fit = .{ .prompt_room = 1, .decode_room = 1, .calibration = cal };
+    const foot: u64 = 19 * GB;
+    defer system.reading_override = null;
+    var budgets: [2]quant_abi.BankBudget = undefined;
+    // the same wired, anonymous, compressor and purgeable pages; the second box holds 7 GB more file pages
+    for (&budgets, [_]u64{ 4, 11 }) |*b, file_gb| {
+        system.reading_override = system.plantVm(128 * GB, 16384, .{ .wired = 25 * GB, .anonymous = 6 * GB, .compressor = GB, .purgeable = GB / 2, .file = file_gb * GB });
+        b.* = fitBudget(fit, .{ .in_use = system.getNonFileMemBytes(), .footprint = foot });
+    }
+    try testing.expectEqual(budgets[0], budgets[1]);
+    try testing.expectEqual(quant_abi.BankBudget{ .prompt = 110 * GB + 12 * GB - 40 * GB - (31 * GB + GB / 2 - foot) - fit.inuse_margin, .decode = 110 * GB + 12 * GB - 28 * GB - (31 * GB + GB / 2 - foot) - fit.inuse_margin }, budgets[0]);
+}
+
 test "outside model: bank-fit.json applies on its own ceiling and cell; another format, ceiling, cell or a bad file is refused by name" {
-    const good = "{\"format\":\"mlx-serve-bank-fit-v1\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000,\"evidence\":\"g53cpab4\"}";
+    const good = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000,\"evidence\":\"g53cpab4\"}";
     const c = try parseBankFit(good, 118111600640, 17_408);
     try testing.expectEqual(@as(u64, 40000000000), c.base_prompt);
     try testing.expectEqual(@as(u64, 15000000000), c.rest);
@@ -491,6 +512,9 @@ test "outside model: bank-fit.json applies on its own ceiling and cell; another 
     try testing.expectError(error.BankFitOtherCeiling, parseBankFit(good, 0, 17_408));
     try testing.expectError(error.BankFitOtherCell, parseBankFit(good, 118111600640, 33_792));
     try testing.expectError(error.BankFitFormat, parseBankFit("{\"format\":\"other\"}", 118111600640, 17_408));
-    try testing.expectError(error.BankFitInvalid, parseBankFit("{\"format\":\"mlx-serve-bank-fit-v1\",\"ceiling_bytes\":1}", 1, 1));
+    // v1's rest read total - available: refused by name, the same file otherwise
+    const v1 = "{\"format\":\"mlx-serve-bank-fit-v1\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
+    try testing.expectError(error.BankFitV1Rest, parseBankFit(v1, 118111600640, 17_408));
+    try testing.expectError(error.BankFitInvalid, parseBankFit("{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":1}", 1, 1));
     try testing.expectError(error.BankFitInvalid, parseBankFit("{", 1, 1));
 }

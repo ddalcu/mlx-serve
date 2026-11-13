@@ -171,6 +171,32 @@ pub fn getTotalMemBytes() u64 {
     return memoryPool(mlx.weightsInDeviceMemory(), mlx.maxRecommendedWorkingSet(), hostTotalMemBytes());
 }
 
+/// The box's memory in use outside the file cache: wired + anonymous - purgeable + compressor (macOS's counts; the
+/// `memory.tsv` `used_gb` figure). Unlike `total - available`, it does not move with how macOS counts recently read
+/// file pages. Elsewhere `total - available`.
+pub fn getNonFileMemBytes() u64 {
+    if (comptime !builtin.os.tag.isDarwin()) return hostTotalMemBytes() -| hostAvailableMemBytes();
+    const v = darwinVm() orelse return 0;
+    return nonFileBytes(v.vm, v.page);
+}
+
+/// A planted `reading_override` from byte counts (tests): the rest of the box free.
+pub fn plantVm(total: u64, page: u64, b: struct { wired: u64, anonymous: u64, compressor: u64, purgeable: u64, file: u64 }) @TypeOf(reading_override.?) {
+    var vm = std.mem.zeroes(VmStats64);
+    vm.wire_count = @intCast(b.wired / page);
+    vm.internal_page_count = @intCast(b.anonymous / page);
+    vm.compressor_page_count = @intCast(b.compressor / page);
+    vm.purgeable_count = @intCast(b.purgeable / page);
+    vm.external_page_count = @intCast(b.file / page);
+    vm.free_count = @intCast((total -| b.wired -| b.anonymous -| b.compressor -| b.file) / page);
+    return .{ .vm = .{ .total = total, .page = page, .vm = vm }, .footprint = 0, .now_ms = 1000 };
+}
+
+fn nonFileBytes(vm: VmStats64, page: u64) u64 {
+    const pages = (@as(u64, vm.wire_count) +| vm.internal_page_count +| vm.compressor_page_count) -| vm.purgeable_count;
+    return pages *| page;
+}
+
 pub fn getAvailableMemBytes() u64 {
     const host = hostAvailableMemBytes();
     return memoryPool(mlx.weightsInDeviceMemory(), mlx.freeDeviceMemory(), host +| returnedNotShown(host));
@@ -467,6 +493,32 @@ test "the load figure carries what MLX just returned, and a free-figure reading 
     try std.testing.expectEqual(free_before + 4 * GB, getAvailableMemBytes());
     reading_override.?.now_ms = 1003;
     try std.testing.expectEqual(load_before + 4 * GB, getLoadAvailableMemBytes());
+}
+
+test "getNonFileMemBytes: the file pages macOS keeps do not move it; wired, anonymous and compressor do, purgeable not" {
+    if (!is_macos) return error.SkipZigTest;
+    const GB: u64 = 1 << 30;
+    const page: u64 = 16384;
+    defer reading_override = null;
+    // one box state, twice: the second with 7 GB more file-backed pages, taken from free
+    var low = std.mem.zeroes(VmStats64);
+    low.wire_count = @intCast(20 * GB / page);
+    low.internal_page_count = @intCast(10 * GB / page);
+    low.compressor_page_count = @intCast(1 * GB / page);
+    low.purgeable_count = @intCast(GB / 2 / page);
+    low.external_page_count = @intCast(4 * GB / page);
+    low.free_count = @intCast(80 * GB / page);
+    var high = low;
+    high.external_page_count = @intCast(11 * GB / page);
+    high.free_count = @intCast(73 * GB / page);
+    reading_override = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = low }, .footprint = 0, .now_ms = 1000 };
+    const at_low = getNonFileMemBytes();
+    reading_override = .{ .vm = .{ .total = 128 * GB, .page = page, .vm = high }, .footprint = 0, .now_ms = 1000 };
+    try std.testing.expectEqual(at_low, getNonFileMemBytes());
+    try std.testing.expectEqual(20 * GB + 10 * GB + GB - GB / 2, at_low);
+    var more = high;
+    more.internal_page_count += @intCast(GB / page);
+    try std.testing.expectEqual(at_low + GB, nonFileBytes(more, page));
 }
 
 test "memoryPool: device-memory weights bill VRAM, every other platform its host reading" {
