@@ -37,13 +37,10 @@ mkdir -p "$MODELS_ROOT/t"
 ln -s "$MODEL" "$MODELS_ROOT/$ID"
 SRV=""
 cleanup() {
-    [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_stop "$SRV"
     rm -rf "$FAKE_HOME"
 }
 trap cleanup EXIT
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
-sleep 0.5
 
 # Keyed by the real folder, as the app writes it; the server only knows the link.
 cat >"$FAKE_HOME/.mlx-serve/model-settings.json" <<JSON
