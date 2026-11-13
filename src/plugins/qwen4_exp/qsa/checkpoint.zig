@@ -581,6 +581,7 @@ test "QSA checkpoint aux+pooled bytes are O(rows + checkpoints)" {
     try testing.expectEqual(@as(c_int, 46), dest[0].qsa_hist_rows);
 
     var t: Trunk = undefined;
+    t.outside = null;
 
     t.s = s;
     t.allocator = testing.allocator;
@@ -794,6 +795,7 @@ test "handoffQsaHistoryToLatest: the newest snap takes a VIEW of the live buffer
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var t: Trunk = undefined;
+    t.outside = null;
     t.s = s;
     t.allocator = testing.allocator;
     const hd: c_int = 16;
@@ -847,6 +849,7 @@ test "handoffQsaHistoryToLatest materializes when the buffer's slack past the sn
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var t: Trunk = undefined;
+    t.outside = null;
     t.s = s;
     t.allocator = testing.allocator;
     const hd: c_int = 16;
@@ -907,6 +910,7 @@ test "applyQsaHistoryAt: a sliced restore is a VIEW of the entry's history; the 
     try testing.expectEqual(src_ptr, dest_ptr);
 
     var t: Trunk = undefined;
+    t.outside = null;
 
     t.s = s;
     t.allocator = testing.allocator;

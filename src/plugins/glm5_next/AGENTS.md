@@ -5,8 +5,12 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
 
 - Parse: `config.zig` (MLX-free) reads every key the engine's GLM arm reads into `Config`; `model_config.zig` maps it
   to the engine's `ModelConfig` field for field (`expectEngineParse`: equal on the three GLM fixtures, a flat pack, the
-  refusals, and the file parse with processor + generation config). Refuses: a streaming pack (`expert_streaming`: its bank streams through a plugin),
-  `qk_rope_head_dim`, any Gemma/BERT/sliding key (`foreign_keys`).
+  refusals, and the file parse with processor + generation config). Refuses: a streaming pack without its
+  `experts.bin`, `qk_rope_head_dim`, any Gemma/BERT/sliding key (`foreign_keys`).
+- Streaming pack (`Config.streamed_bank`): its claiming outside quant plugin runs the projections it stores and the
+  head's experts (`sdk/quant/outside_model.zig`); its bank opens per phase (`Budget.fit`: `stream_room`, `decodeRoom()`,
+  the pack's `bank-fit.json` on its ceiling), binds each routed layer (`moe.bindRouted`), takes each forward's phase
+  and settles after its eval. Serial decode, no images (`bankFacts`).
 - Load (`trunk.zig`): reads the driver's resident source (`LoadCtx.weights`: the engine's map with the Sushi and
   ModelOpt adapters applied) in the layout the deleted legacy load built: q|k|v and the convs joined, GLM's decode row
   group `[qkv | z | a | b]`, f32 KDA tables, DSA and MLA projections, the MoE block's weights, the `mtp.0` head.
@@ -70,5 +74,4 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 GLM-5.3-Flash: KDA (f32 state) + DSA (absorbed NoPE MLA, indexer past position 2051) inside mHC, 288-expert MoE.
 Thinking ON. Batches decode (`forwardGlmBatchedDecode`); MTP = its `mtp.0` layer. Vision = `vision.zig`, rows spliced
 at `<|image|>` on 1-D positions.
-- Streaming pack (`expert_streaming`, an EXL3 `experts.bin` bank): refused by name at parse (a quant plugin's
-  `open_bank` could serve it).
+- Streaming pack (`expert_streaming`, an `experts.bin` bank): served through the outside quant plugin that claims it.

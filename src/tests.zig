@@ -202,6 +202,7 @@ test {
     _ = @import("sdk/blocks/norms/add_norm.zig");
     _ = @import("sdk/blocks/moe/moe_fp4.zig");
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
+    _ = @import("sdk/quant/outside_model.zig");
     _ = @import("engines/mlx/load/sushi_adapt.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
     _ = @import("sdk/quant/formats.zig");
@@ -244,6 +245,7 @@ test {
     _ = @import("plugins/glm5_next/model_config.zig");
     _ = @import("plugins/glm5_next/proof_test.zig");
     _ = @import("plugins/glm5_next/served_test.zig");
+    _ = @import("plugins/bailing_hybrid/bill_test.zig");
     _ = @import("engines/mlx/plugin/deepseek_test.zig");
     _ = @import("plugins/deepseek_v41/engram.zig");
     _ = @import("sdk/weights/nocache_reader.zig");

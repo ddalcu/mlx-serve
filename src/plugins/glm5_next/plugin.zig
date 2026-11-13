@@ -28,6 +28,7 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = &layout },
     .weights = &.{ .resident_bytes = &residentBytes },
     .spec = &.{ .trunk_weight = &host.trunkWeight, .head = &head.hooks },
+    .meters = &host.meters,
 };
 
 const Verdict = abi.Verdict;
@@ -60,15 +61,24 @@ fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
     return host.load(plugin.name, ctx, out);
 }
 
-/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored.
+/// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored (a streaming pack's bank
+/// is its outside plugin's bill), plus a streaming pack's draft readout (`draftReadoutBytes`).
 fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u64, out: *u64) callconv(.c) Verdict {
     const c = config.of(p);
-    out.* = shards;
+    out.* = shards + draftReadoutBytes(c);
     if (c.expert_quant_json.len == 0) return .ok;
     const io = std.Io.Threaded.global_single_threaded.io();
     out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers, .kv_lora_rank = c.dsa_kv_lora_rank }) catch |e|
         return Verdict.named(.failed, @errorName(e));
+    out.* += draftReadoutBytes(c);
     return .ok;
+}
+
+/// The MTP drafts' readout a GLM streaming pack lends (`trunk.draftReadout`, at `trunk.readoutBits`), as
+/// bailing_hybrid bills its own. An upper bound: the load builds it only when the outside plugin runs the head.
+pub fn draftReadoutBytes(c: *const config.Config) u64 {
+    if (!c.streamed_bank or !c.isGlm5()) return 0;
+    return trunk.draftReadoutBytes(c.vocab_size, c.hidden_size, trunk.readoutBits(c));
 }
 
 /// A Sushi GLM tensor as the load holds it: the vision tower and the EXL3 MTP layer past the trunk not at all, the
@@ -130,6 +140,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return Verdict.refuse(.unsupported, "glm5_next: forward mode not declared");
     const ops = f.cache_ops orelse return Verdict.refuse(.unsupported, "glm5_next: a forward without cache_ops");
+    trunk.bankPhase(m, if (f.mode == .batched_rows) @min(f.caches.len, fwd.MOE_DECODE_BATCH_MAX) else f.rows) catch |e| return Verdict.named(.failed, @errorName(e));
     if (f.mode == .batched_rows) {
         if (f.rows != 1 or f.tokens.len != f.caches.len or f.positions.len != f.caches.len) return Verdict.refuse(.unsupported, "glm5_next: batched rows take one host token per slot");
         if (f.capture_layers.len > 0 or f.media.ctx != null) return Verdict.refuse(.unsupported, "glm5_next: no captures or media on batched rows");
@@ -137,9 +148,10 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
             host.clear(out, 0);
             return Verdict.named(.failed, @errorName(e));
         };
-        return .ok;
+        return host.settleBank(m, f, out);
     }
-    return host.forwardOne(plugin.name, fwd, m, ops, f, out);
+    const v = host.forwardOne(plugin.name, fwd, m, ops, f, out);
+    return if (v.isOk()) host.settleBank(m, f, out) else v;
 }
 
 /// N slots' next tokens in as few trunk forwards as the MoE row limit allows, each slot's token a row of one window:
@@ -171,7 +183,7 @@ fn batched(m: *host.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out:
         try rows2d(m, logits, &parts[made - 1][0]);
         try rows2d(m, hidden, &parts[made - 1][1]);
         // Streamed experts: the next group's fetches rewrite the slot rows this group's last MoE layer reads.
-        if (m.experts != null and end < n) try evalParts(&parts[made - 1]);
+        if ((m.experts != null or m.bank != null) and end < n) try evalParts(&parts[made - 1]);
     }
     out.logits = .{ .ctx = (try joinRows(m, parts[0..made], 0)).ctx };
     if (f.want_hidden) out.hidden = .{ .ctx = (try joinRows(m, parts[0..made], 1)).ctx };
@@ -210,6 +222,13 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 }
 
 // ── tests ──
+
+test "glm5_next resident bill: a GLM streaming pack bills its 8-bit draft readout, 643 MiB at GLM-5.3-Flash's head" {
+    var c: config.Config = .{ .model_type = "glm5_next", .vocab_size = 154880, .hidden_size = 4096, .streamed_bank = true };
+    try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(&c));
+    c.streamed_bank = false;
+    try std.testing.expectEqual(@as(u64, 0), draftReadoutBytes(&c));
+}
 
 test {
     _ = config;

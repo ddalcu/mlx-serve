@@ -69,6 +69,25 @@ pub fn glm5PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, m
     return (gross -| warm.creditedRows(seq) *| kv_tok) * 5 / 4;
 }
 
+/// The host's hot prefix cache at its default cap: it keeps a request's decode-end checkpoint beside the decode, and
+/// neither bill names it otherwise.
+pub const GLM5_HOT_CACHE_BYTES: u64 = 2048 << 20;
+
+/// GLM-5's decode-phase bill at the same cell (`LoadCtx.stream_room_decode`): the prompt's KV and checkpoints, a
+/// generation's growth and the runtime floor at the prompt bill's 5/4, plus the hot prefix cache. No prefill scratch:
+/// the phase change frees it before decode's rows grow.
+pub fn glm5DecodeMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64) u64 {
+    const ctx: u64 = getEffectiveContextLength(config);
+    const output = @min(max_tokens, cache_mod.KVCache.RESERVE_GEN_HEADROOM, if (ctx > 0) ctx -| seq else max_tokens);
+    const end = seq +| output;
+    const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+    const view_tok: u64 = if (kv_bits < 16) glm5DequantWidth(config) else 0;
+    const resident = seq *| kv_tok +| retainedSsmCheckpointBytes(config, seq, 0, chunk) +|
+        4 *| config.ssmCheckpointBytes() +| slotFixedKvBytes(config, kv_bits, chunk);
+    const decode_growth = output *| kv_tok +| end *| kv_tok +| end *| view_tok;
+    return (resident +| decode_growth +| PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4 +| GLM5_HOT_CACHE_BYTES;
+}
+
 // ── tests ──
 
 /// The checkpoint globals a GLM bill reads, pinned for a test and put back by `restore`.
@@ -218,4 +237,20 @@ test "GLM bill: the 96 GB Q8 prompts stay under their admitted ceilings" {
     }) |c| {
         try t.expect(prefillNeededAtChunk(&glm, c.seq, c.max_tokens, 8, 512, .{}) >> 20 <= c.ceiling_mb);
     }
+}
+
+test "GLM bill: the decode phase's bill holds no prefill scratch, so it sits below the prompt bill at the stream room's cell" {
+    const saved = GlmBillGlobals.pin();
+    defer saved.restore();
+    const glm = glm5TestConfig();
+    const seq: u64 = 16_384 + 1_024;
+    const prompt = glm5PrefillMemoryNeeded(&glm, seq, 1, 16, generate_mod.WIDE_PREFILL_CHUNK, .{});
+    const decode = glm5DecodeMemoryNeeded(&glm, seq, 1, 16, generate_mod.WIDE_PREFILL_CHUNK);
+    try std.testing.expect(decode > GLM5_HOT_CACHE_BYTES);
+    try std.testing.expect(decode < prompt + GLM5_HOT_CACHE_BYTES);
+    // Its terms: the prompt's resident set and a generation's growth at 5/4, then the hot cache.
+    const kv_tok = kvBytesPerTokenAtBits(glm.kvBytesPerToken(), 16);
+    const resident = seq * kv_tok + retainedSsmCheckpointBytes(&glm, seq, 0, generate_mod.WIDE_PREFILL_CHUNK) + 4 * glm.ssmCheckpointBytes() + slotFixedKvBytes(&glm, 16, generate_mod.WIDE_PREFILL_CHUNK);
+    const growth = kv_tok + (seq + 1) * kv_tok;
+    try std.testing.expectEqual((resident + growth + PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4 + GLM5_HOT_CACHE_BYTES, decode);
 }

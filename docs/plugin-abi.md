@@ -25,6 +25,7 @@ The model plugin table (`ModelTable`) and every struct that crosses it. Extern l
 | `version` | `u32 = 1` |  |
 | `Handle` | `?*anyopaque` | An object the engine owns and the plugin only passes back (a slot's KV cache): opaque until P3 types it. |
 | `max_eos` | `16` |  |
+| `stream_room_cell` | `u64 = 16_384 + 1_024` | The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell. |
 | `max_round_tokens` | `32` | The most tokens a native drafter's round commits (`Round.tokens`). |
 
 ### `LayerSpan` (extern struct)
@@ -483,6 +484,10 @@ Valid during `load` only: the model keeps none of its pointers.
 | `wired_margin_bytes` | `u64` | `8 << 30` | The host's wired-limit margin (`--wired-margin-gib`): the GPU ceiling's stop a streamed bank leaves unplanned. |
 | `tp_rank` | `u32` | `0` | Tensor parallel (DeepSeek-V4.1): this rank's slice of every expert and attention head, the weights already sliced; `tp_size` 0 = whole. |
 | `tp_size` | `u32` | `0` |  |
+| `stream_room_decode` | `u64` | `0` | GPU bytes a streamed bank may fill in the decode phase: the GPU ceiling less the decode phase's bill at 16K + 1K and the wired margin; 0 = the host has none (`decodeRoom`). |
+| `gpu_ceiling_bytes` | `u64` | `0` | The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown. |
+| `stream_grow_prompt` | `u64` | `0` | Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank calibrated at the cell gives up for a longer context; 0 = none or unknown. |
+| `stream_grow_decode` | `u64` | `0` |  |
 
 ### `Mode` (enum(u8))
 
@@ -1248,6 +1253,8 @@ A quant plugin's table, exported as `exportName(name, version)`. `claims`, `vali
 | `swiglu` | `?*const fn (gate: *const Weight, up: *const Weight, down: *const Weight, x: Array, inds: Array, scores: Array, opts: *const Swiglu, s: Stream, out: *Array) callconv(.c) Verdict` | `null` | Routed SwiGLU experts in one dispatch, for a format whose kernels fuse the three projections (EXL3): `x` [B, S, D] through the banks' experts `inds` [B, S, K], weighted by `scores`. Null: compose `moe` per projection. |
 | `bank_rows` | `?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *BankRows) callconv(.c) Verdict` | `null` | The slot rows per routed layer `budget` buys over the pack's streamed expert bank, no memory taken (`open_bank`'s rows); refused by name when none fit. Null: the format streams no bank. |
 | `open_bank` | `?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *Bank) callconv(.c) Verdict` | `null` | The pack's streamed expert bank at the rows `budget` buys; it outlives `close`. |
+| `swiglu_limit_out` | `bool` | `false` | `swiglu` reads `Swiglu.limit_out`. Appended: the host passes a post-SiLU limit only to a table whose `size` reaches this flag and sets it (`clampsOut`), and refuses the call by name otherwise, so a table built before the field is never asked a clamp it would skip. |
+| `exact_rows` | `u32` | `0` | `matmul` over up to this many rows gives each row the bytes of its own one-row call; 0 = not declared, so a host that needs a row's one-row bytes calls one row at a time. Appended: read through `exactRows`. |
 
 ### `BankGate` (extern struct)
 
@@ -1272,6 +1279,7 @@ The trunk's routed MoE a streamed bank serves.
 | `n_layers` | `u32` |  | The trunk's layers: `gates` and a call's `layer` index them alike. |
 | `swiglu_limit` | `f32` | `0` | > 0: the SwiGLU's clamp. |
 | `gates` | `?[*]const BankGate` | `null` | Every layer's router (`n_layers`); null for `bank_rows`. |
+| `limits_out` | `?[*]const f32` | `null` | Every layer's routed SwiGLU clamped AFTER the SiLU (`n_layers`, as `gates`; valid for the call only): > 0 the limit L of min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's `expert_swiglu_limit_list`), 0 none; null: no layer clamps so. Appended: read it through `limitOut`, which a geometry from a host built before it (a smaller `size`) answers 0, so a plugin built with it loads on an older host, and a plugin built before it loads as before. |
 
 ### `BankBudget` (extern struct)
 
@@ -1311,6 +1319,8 @@ A streamed bank of routed experts, as the trunk's MoE reads one whose math it do
 | `rows_expand_into` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict` | `null` |  |
 | `rows_decode_expand` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict` | `null` |  |
 | `next_ahead` | `?*const fn (ctx: ?*anyopaque, layer: u32, ids: Array) callconv(.c) Verdict` | `null` |  |
+| `meters` | `?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void` | `null` | The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next call; the model logs them beside `[spec-stats]` at the request's end. Null: none. |
+| `exact_rows` | `bool` | `false` | A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets. Appended: read only where `size` reaches it. |
 
 ### `Swiglu` (extern struct)
 
@@ -1319,6 +1329,7 @@ A streamed bank of routed experts, as the trunk's MoE reads one whose math it do
 | `size` | `u32` | `@sizeOf(Swiglu)` |  |
 | `limit` | `i32` | `0` | > 0: the SwiGLU's clamp (GLM's `swiglu_limit`). |
 | `verify_rows` | `bool` | `false` | Spec-verify rows: the decode chain at any width. |
+| `limit_out` | `f32` | `0` | > 0: the SwiGLU clamped AFTER the SiLU, min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's; `limit` is then 0). Appended: read only by a table that declares it (`QuantTable.clampsOut`). |
 
 ## `host.zig`
 

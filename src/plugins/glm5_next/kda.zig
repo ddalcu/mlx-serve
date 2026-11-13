@@ -80,6 +80,82 @@ fn softplusGate(m: *const Model, A_log: Array, a: Array, dt_bias: Array) !Array 
 
 /// The layer over `x` `[B, S, hidden]` on `e`; `capture` keeps every row's state for rollback (a verify).
 pub fn forward(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq_len: c_int, is_prefill: bool, capture: bool) !Array {
+    if (m.serial_rows and capture and batch == 1 and !la.in.built() and e.initialized and e.conv_state.ctx != null and e.ssm_state.ctx != null)
+        return serialRows(m, x, la, e, seq_len);
+    return forwardWith(m, x, la, e, batch, seq_len, is_prefill, capture, null);
+}
+
+/// A row's projections, given in place of the layer's own.
+const Pre = struct { qkv: Array, z: Array, a: Array, b: Array };
+
+/// A serial-rows verify (`Model.serial_rows`): the projections over every row (row-exact through `Model.mm`), then each
+/// row's conv, gates, recurrence and gated norm on the one-row decode path from the row before's state, each row's
+/// state and the window's conv inputs kept as the capture path keeps them for rollback; then the out projection.
+fn serialRows(m: *Model, x: Array, la: *const Kda, e: *Entry, seq_len: c_int) !Array {
+    const s = m.s;
+    var all: [4]Array = @splat(.{ .ctx = null });
+    defer for (all) |t| free(t);
+    all[0] = try qkvProj(m, la, x);
+    for (all[1..], [_]*const trunk.Linear{ &la.z, &la.a, &la.b }) |*o, l| o.* = try m.mm(l, x);
+    var conv_in = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(conv_in);
+    {
+        const parts = [_]Array{ e.conv_state, all[0] };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&conv_in, vec, 1, s));
+    }
+    const ys = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ys);
+    const states = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(states);
+    var r: c_int = 0;
+    while (r < seq_len) : (r += 1) {
+        var row: [4]Array = @splat(.{ .ctx = null });
+        defer for (row) |t| free(t);
+        for (&row, all) |*o, t| o.* = try rowOf(t, r, s);
+        const y = try forwardWith(m, x, la, e, 1, 1, false, false, .{ .qkv = row[0], .z = row[1], .a = row[2], .b = row[3] });
+        defer _ = mlx.mlx_array_free(y);
+        _ = mlx.mlx_vector_array_append_value(ys, y);
+        _ = mlx.mlx_vector_array_append_value(states, e.ssm_state);
+    }
+    free(e.spec_state_seq);
+    e.spec_state_seq = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_stack_axis(&e.spec_state_seq, states, 0, s));
+    free(e.spec_conv_input);
+    e.spec_conv_input = conv_in;
+    conv_in = mlx.mlx_array_new();
+    var y_all = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_all);
+    try mlx.check(mlx.mlx_concatenate_axis(&y_all, ys, 1, s));
+    return m.mm(&la.out, y_all);
+}
+
+/// Row `r` of `a` `[1, S, W]`: `[1, 1, W]`.
+fn rowOf(a: Array, r: c_int, s: mlx.mlx_stream) !Array {
+    const w = mlx.getShape(a)[2];
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_slice(&out, a, &[_]c_int{ 0, r, 0 }, 3, &[_]c_int{ 1, r + 1, w }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    return out;
+}
+
+/// A new reference on `a`.
+fn ref(a: Array) Array {
+    var r = mlx.mlx_array_new();
+    _ = mlx.mlx_array_set(&r, a);
+    return r;
+}
+
+/// The out projection of `y` (consumed), or with `given` projections (a serial-rows verify's row) `y` itself.
+fn outProj(m: *Model, la: *const Kda, y: Array, given: bool) !Array {
+    if (given) return y;
+    defer _ = mlx.mlx_array_free(y);
+    return m.mm(&la.out, y);
+}
+
+/// `forward`'s body; `given`: a row's projections, its out projection left to the caller.
+fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq_len: c_int, is_prefill: bool, capture: bool, given: ?Pre) !Array {
     const s = m.s;
     const c = m.c;
     const num_k_heads: c_int = @intCast(c.linear_num_key_heads);
@@ -104,7 +180,12 @@ pub fn forward(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     defer _ = mlx.mlx_array_free(z_proj);
     defer _ = mlx.mlx_array_free(a_proj);
     defer _ = mlx.mlx_array_free(b_proj);
-    if (la.in.built() and (batch * seq_len <= 1 or (batch == 1 and seq_len <= kda_recurrence.MAX_WINDOW))) {
+    if (given) |p| {
+        qkv = ref(p.qkv);
+        z_proj = ref(p.z);
+        a_proj = ref(p.a);
+        b_proj = ref(p.b);
+    } else if (la.in.built() and (batch * seq_len <= 1 or (batch == 1 and seq_len <= kda_recurrence.MAX_WINDOW))) {
         const all = try m.mm(&la.in.lin, x);
         in_all = all;
         qkv = mlx.mlx_array_new();
@@ -379,10 +460,8 @@ pub fn forward(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     // rms_norm(y) * sigmoid(z) straight to the out projection's input (decode and verify widths).
     if (fused_prework) {
         if (m.kda.eps.ctx == null) m.kda.eps = mlx.mlx_array_new_float(c.rms_norm_eps);
-        if (try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)) |flat| {
-            defer _ = mlx.mlx_array_free(flat);
-            return m.mm(&la.out, flat);
-        }
+        if (try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)) |flat|
+            return outProj(m, la, flat, given != null);
     }
     var z_heads = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(z_heads);
@@ -397,9 +476,11 @@ pub fn forward(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     defer _ = mlx.mlx_array_free(gated);
     try mlx.check(mlx.mlx_multiply(&gated, y_normed, gate, s));
     var out_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(out_flat);
-    try mlx.check(mlx.mlx_reshape(&out_flat, gated, &[_]c_int{ batch, seq_len, value_dim }, 3, s));
-    return m.mm(&la.out, out_flat);
+    mlx.check(mlx.mlx_reshape(&out_flat, gated, &[_]c_int{ batch, seq_len, value_dim }, 3, s)) catch |err| {
+        _ = mlx.mlx_array_free(out_flat);
+        return err;
+    };
+    return outProj(m, la, out_flat, given != null);
 }
 
 fn templateArgs(kcfg: mlx.mlx_fast_metal_kernel_config, in_dt: mlx.mlx_dtype, st_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, dk: c_int, dv: c_int, hk: c_int, hv: c_int) !void {

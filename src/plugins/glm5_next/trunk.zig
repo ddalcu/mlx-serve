@@ -18,6 +18,10 @@ const log = @import("../../sdk/util/log.zig");
 const linear = @import("../../sdk/bases/blocks/linear.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
+const outside = @import("../../sdk/quant/outside.zig");
+const outside_model = @import("../../sdk/quant/outside_model.zig");
+const routed_mod = @import("../../sdk/weights/routed.zig");
+const narrowsLoadedF16 = @import("../../sdk/weights/load.zig").narrowsLoadedF16;
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const gdn_base = @import("../../sdk/bases/blocks/gdn.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
@@ -135,6 +139,20 @@ pub const Head = struct {
     moe: moe.Moe.Weights,
 };
 
+/// Ling-3.1's NextN (MTP) layer, `<prefix>.layers.<num_hidden_layers>` (bailing_hybrid/head.zig):
+/// `eh_proj(cat[enorm(embed(x)), hnorm(h)])` through one MLA + MoE block, then `final_layernorm`. A streaming pack's
+/// layer is resident: its experts are the claiming plugin's format banks (`Load.experts`), not the bank's.
+pub const LingHead = struct {
+    enorm: Array,
+    hnorm: Array,
+    final_norm: Array,
+    input_norm: Array,
+    post_norm: Array,
+    eh_proj: Linear,
+    mla: Mla,
+    moe: moe.Moe.Weights,
+};
+
 /// The KDA layers' constants, built on first use in the projections' dtype (the legacy `gdn_*` caches).
 pub const KdaConsts = struct {
     q_scale: Array = .{},
@@ -156,17 +174,35 @@ pub const Model = struct {
     /// The `mtp.0` head's weights, read at load; served once `HeadHooks.load` evaluated them.
     mtp: ?Head = null,
     mtp_ready: bool = false,
+    /// Ling's NextN layer (`LingHead`); served once `readyLingHead` evaluated it.
+    ling_mtp: ?LingHead = null,
+    /// The head drafts read (`host.trunkWeight(.head)`) where the trunk's runs on the outside plugin (`Linear.ext`,
+    /// which the engine cannot read): its rows as MLX affine 4-bit (`draftReadout`). The trunk's logits keep the
+    /// plugin's head, so a verify's text is unchanged.
+    draft_head: Linear = .{},
     kda: KdaConsts = .{},
     /// `rms_norm_eps` as an array (the add+norm kernel's).
     rms_eps: Array = .{},
     owned: std.ArrayList(Array) = .empty,
     /// The trunk's routed experts streamed from the pack (the `stream_experts` setting); the head's stay resident.
     experts: ?streamed.Streamed = null,
+    /// The weights an outside quant plugin loaded (a pack it claims), held until unload.
+    quant: outside_model.Load = .{ .a = gpa },
+    /// A streaming pack's bank (`Config.streamed_bank`), bound to every routed layer; the head's experts stay resident.
+    bank: ?*outside.Bank = null,
+    /// The bank as the routed layers read it.
+    routed: ?routed_mod.Routed = null,
+    /// Set for one forward whose rows must each carry a one-row decode step's bytes (bailing_hybrid's exact verify):
+    /// `mm` runs rows in calls of their projection's row-exact width, KDA, MLA and the MoE row by row.
+    serial_rows: bool = false,
 
     pub fn deinit(m: *Model) void {
         if (m.experts) |*x| x.close();
+        if (m.bank) |b| b.close();
+        m.quant.deinit();
         for (m.layers) |*l| if (l.mlp == .moe) compiled.free(&l.mlp.moe.route_fn);
         if (m.mtp) |*h| compiled.free(&h.moe.route_fn);
+        if (m.ling_mtp) |*h| compiled.free(&h.moe.route_fn);
         inline for (.{ m.kda.q_scale, m.kda.k_scale, m.kda.ones, m.kda.eps, m.rms_eps }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
@@ -180,8 +216,22 @@ pub const Model = struct {
         return if (m.c.isGlm5()) .float32 else .bfloat16;
     }
 
-    /// `x @ l^T` at `l`'s own quant geometry.
+    /// `x @ l^T` at `l`'s own quant geometry; under `serial_rows` in calls of `l`'s row-exact width.
     pub fn mm(m: *const Model, l: *const Linear, x: Array) !Array {
+        if (m.serial_rows) return linear.eachRows(x, l.exactRows(), m.s, MmCall{ .m = m, .l = l }, MmCall.run);
+        return m.mmAll(l, x);
+    }
+
+    const MmCall = struct {
+        m: *const Model,
+        l: *const Linear,
+        fn run(c: MmCall, x: Array) anyerror!Array {
+            return c.m.mmAll(c.l, x);
+        }
+    };
+
+    fn mmAll(m: *const Model, l: *const Linear, x: Array) !Array {
+        if (l.ext) |*e| return e.matmul(x, m.s);
         return qmatmulBits(x, l.w, l.s, l.b, l.bits, l.group_size, l.mode, m.s);
     }
 
@@ -233,7 +283,7 @@ pub const Model = struct {
     /// The logits of `x`: a dense head `[vocab, hidden]` is read through a transposed view (the embedding it may
     /// alias stays `[vocab, hidden]`).
     pub fn lmHead(m: *const Model, x: Array) !Array {
-        if (m.head.s.ctx != null) return m.mm(&m.head, x);
+        if (m.head.s.ctx != null or m.head.ext != null) return m.mm(&m.head, x);
         const wt = try transposeLast(m.head.w, m.s);
         defer _ = mlx.mlx_array_free(wt);
         var out = mlx.mlx_array_new();
@@ -252,7 +302,8 @@ pub const Model = struct {
         defer _ = mlx.mlx_array_free(gate);
         var up = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up);
-        if (dw.gu.built() and rows <= fused_rows.FUSED_ROWS_MAX_M) {
+        // Serial rows take the one-row arm: wider rows clamp where it does not.
+        if (dw.gu.built() and (rows <= fused_rows.FUSED_ROWS_MAX_M or m.serial_rows)) {
             const both = try m.mm(&dw.gu.lin, x);
             defer _ = mlx.mlx_array_free(both);
             if (dw.gu.widths[0] == dw.gu.widths[1]) {
@@ -387,8 +438,9 @@ fn fpFromGeometry(c: *const Config, w_cols: u32, s_cols: u32, in_dim: u32) ?Quan
 
 // ── load ──
 
-/// A weight triple as stored (`<base>.{weight,scales,biases}`), scales and biases absent on a dense weight.
-const Triple = struct { w: Array, s: Array = .{}, b: Array = .{} };
+/// A weight triple as stored (`<base>.{weight,scales,biases}`), scales and biases absent on a dense weight; or a
+/// projection the pack's outside quant plugin loaded (`ext`, `w` its first array).
+const Triple = struct { w: Array, s: Array = .{}, b: Array = .{}, ext: ?outside.Weight = null };
 
 const Loader = struct {
     src: *const quant_abi.Source,
@@ -398,6 +450,8 @@ const Loader = struct {
     owned: *std.ArrayList(Array),
     exl3: ?exl3.Spec,
     experts: ?*streamed.Streamed = null,
+    /// The outside quant plugin claiming the pack (`format` null: none).
+    quant: *outside_model.Load,
 
     /// Takes `a`, an array this load made.
     fn own(l: *Loader, a: Array) !Array {
@@ -414,17 +468,20 @@ const Loader = struct {
         return l.own(h);
     }
 
-    /// The source's tensor `name`, borrowed for the load; empty when the pack has none.
-    fn get(l: *const Loader, name: []const u8) Array {
-        return .{ .ctx = l.src.tensor(name).ctx };
+    /// The source's tensor `name`, borrowed for the load; empty when the pack has none. A pack an outside plugin
+    /// claims loads as stored: its f16 tables and scales narrow here as the engine narrows every other pack's.
+    fn get(l: *Loader, name: []const u8) !Array {
+        const a: Array = .{ .ctx = l.src.tensor(name).ctx };
+        if (l.quant.format == null or a.ctx == null or !narrowsLoadedF16(name, mlx.mlx_array_ndim(a), mlx.mlx_array_dtype(a))) return a;
+        return l.own(try astypeEval(a, .bfloat16, l.s));
     }
 
     fn has(l: *const Loader, name: []const u8) bool {
-        return l.get(name).ctx != null;
+        return l.src.tensor(name).ctx != null;
     }
 
-    fn need(l: *const Loader, name: []const u8) !Array {
-        const a = l.get(name);
+    fn need(l: *Loader, name: []const u8) !Array {
+        const a = try l.get(name);
         if (a.ctx == null) {
             log.err("MISSING WEIGHT: {s}\n", .{name});
             return error.MissingWeight;
@@ -438,27 +495,45 @@ const Loader = struct {
     }
 
     /// A release's e4m3 projection carries its 64 x 128 scale grid as `weight_scale_inv` (`fp8_block128`).
-    fn triple(l: *const Loader, base: []const u8) !Triple {
+    fn triple(l: *Loader, base: []const u8) !Triple {
+        return (try l.tripleOpt(base)) orelse {
+            log.err("MISSING WEIGHT: {s}.weight\n", .{base});
+            return error.MissingWeight;
+        };
+    }
+
+    /// `triple`, or the pack's outside plugin's projection where the pack stores no `<base>.weight`; null: neither.
+    fn tripleOpt(l: *Loader, base: []const u8) !?Triple {
         var nb: [256]u8 = undefined;
-        const sc = l.get(try std.fmt.bufPrint(&nb, "{s}.scales", .{base}));
+        const w = try l.get(try std.fmt.bufPrint(&nb, "{s}.weight", .{base}));
+        if (w.ctx == null) {
+            const x = (try l.quant.linear(base, 0)) orelse return null;
+            return .{ .w = x.w, .ext = x.ext };
+        }
+        const sc = try l.get(try std.fmt.bufPrint(&nb, "{s}.scales", .{base}));
         return .{
-            .w = try l.need(try std.fmt.bufPrint(&nb, "{s}.weight", .{base})),
-            .s = if (sc.ctx != null) sc else l.get(try std.fmt.bufPrint(&nb, "{s}.weight_scale_inv", .{base})),
-            .b = l.get(try std.fmt.bufPrint(&nb, "{s}.biases", .{base})),
+            .w = w,
+            .s = if (sc.ctx != null) sc else try l.get(try std.fmt.bufPrint(&nb, "{s}.weight_scale_inv", .{base})),
+            .b = try l.get(try std.fmt.bufPrint(&nb, "{s}.biases", .{base})),
         };
     }
 
     /// A dense weight stored `[out, in]` as the `[in, out]` view a plain matmul reads.
     fn transposed(l: *Loader, t: *Triple) !void {
-        if (t.s.ctx != null or t.w.ctx == null) return;
+        if (t.s.ctx != null or t.w.ctx == null or t.ext != null) return;
         t.w = try l.own(try transposeLast(t.w, l.s));
     }
 
     fn kept(l: *Loader, t: Triple) !Triple {
+        if (t.ext != null) return t;
         return .{ .w = try l.keep(t.w), .s = try l.keep(t.s), .b = try l.keep(t.b) };
     }
 
     fn lin(l: *Loader, raw: Triple, in_dim: ?u32) !Linear {
+        if (raw.ext != null) return .{ .w = raw.w, .ext = raw.ext };
+        // A pack an outside plugin claims keeps its plain matrices f16: run in the activation dtype, none promotes.
+        if (l.quant.format != null and raw.s.ctx == null and raw.w.ctx != null and mlx.mlx_array_dtype(raw.w) == .float16 and mlx.getShape(raw.w).len >= 2)
+            return .{ .w = try l.own(try astypeEval(raw.w, .bfloat16, l.s)) };
         const t = try l.kept(raw);
         if (t.s.ctx == null) return .{ .w = t.w };
         // e4m3: the matmul knows it by its dtypes; no affine kernel may claim it.
@@ -535,23 +610,25 @@ const Loader = struct {
         var lb: [128]u8 = undefined;
         const base = try std.fmt.bufPrint(&lb, "{s}.layers.{d}.{s}", .{ l.prefix, i, if (glm) "self_attn" else "attention" });
         // oMLX packs ship the three convs joined (`[C, K, 1]`) and the gate under `forget_gate.`.
-        const fused_conv = l.get(try std.fmt.bufPrint(&nb, "{s}.conv1d.weight", .{base}));
+        const fused_conv = try l.get(try std.fmt.bufPrint(&nb, "{s}.conv1d.weight", .{base}));
         var fb: [160]u8 = undefined;
         const fg = if (l.has(try std.fmt.bufPrint(&nb, "{s}.forget_gate.A_log", .{base}))) try std.fmt.bufPrint(&fb, "{s}.forget_gate", .{base}) else base;
         var parts: [3]Triple = undefined;
         var conv_w: [3]Array = undefined;
         var any_scales = false;
-        for (&parts, &conv_w, [_][]const u8{ "q", "k", "v" }) |*p, *cw, x| {
+        // An outside plugin's pack ships q|k|v as one projection (`qkv_proj`) beside the joined conv.
+        const fused_qkv: ?Triple = if (l.quant.format != null and fused_conv.ctx != null) try l.tripleOpt(try std.fmt.bufPrint(&nb, "{s}.qkv_proj", .{base})) else null;
+        if (fused_qkv == null) for (&parts, &conv_w, [_][]const u8{ "q", "k", "v" }) |*p, *cw, x| {
             p.* = try l.triple(try std.fmt.bufPrint(&nb, "{s}.{s}_proj", .{ base, x }));
             if (p.s.ctx != null) any_scales = true;
             // The reference nests the conv in a module (`<x>_conv1d.conv.weight`); mlx-lm flattens it.
             if (fused_conv.ctx == null) {
-                cw.* = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.conv.weight", .{ base, x }));
+                cw.* = try l.get(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.conv.weight", .{ base, x }));
                 if (cw.ctx == null) cw.* = try l.need(try std.fmt.bufPrint(&nb, "{s}.{s}_conv1d.weight", .{ base, x }));
             }
-        }
+        };
         // q, k and v join only when quantized identically; otherwise each projects alone.
-        const joinable = blk: {
+        const joinable = fused_qkv == null and blk: {
             var w_cols: [3]c_int = undefined;
             var s_cols: [3]c_int = undefined;
             for (parts, 0..) |p, n| {
@@ -561,7 +638,7 @@ const Loader = struct {
             }
             break :blk fused_rows.joinableCols(&w_cols) and fused_rows.joinableCols(&s_cols);
         };
-        var qkv: Triple = .{ .w = .{} };
+        var qkv: Triple = fused_qkv orelse .{ .w = .{} };
         var qkv_parts: [3]Triple = @splat(.{ .w = .{} });
         if (joinable) {
             qkv.w = try l.own(try array.concatRows(&.{ parts[0].w, parts[1].w, parts[2].w }, l.s));
@@ -569,7 +646,7 @@ const Loader = struct {
                 qkv.s = try l.own(try array.concatRows(&.{ parts[0].s, parts[1].s, parts[2].s }, l.s));
                 if (parts[0].b.ctx != null) qkv.b = try l.own(try array.concatRows(&.{ parts[0].b, parts[1].b, parts[2].b }, l.s));
             }
-        } else qkv_parts = parts;
+        } else if (fused_qkv == null) qkv_parts = parts;
         var joined_conv = if (fused_conv.ctx != null) fused_conv else try l.own(try array.concatRows(&conv_w, l.s));
         // HF-layout packs store the depthwise conv `[C, 1, K]`; MLX's conv1d reads `[C, K, 1]`.
         const csh = mlx.getShape(joined_conv);
@@ -687,7 +764,8 @@ const Loader = struct {
     /// The routed MoE under `<base>.mlp` (a trunk layer, or the MTP head's block) as the shared block reads it: the
     /// sigmoid router with its selection bias, the ungated shared expert, ModelOpt's per-expert scales, a Sushi
     /// pack's EXL3 banks through the format table, GLM's one-kernel decode as the `fused` arm.
-    fn routed(l: *Loader, base: []const u8) !moe.Moe.Weights {
+    /// `banked`: the layer's experts are the streaming pack's bank's, bound after the load (`bindBank`).
+    fn routed(l: *Loader, base: []const u8, banked: bool) !moe.Moe.Weights {
         const c = l.c;
         const glm = c.isGlm5();
         var nb: [256]u8 = undefined;
@@ -697,29 +775,31 @@ const Loader = struct {
         const spec: ?exl3.Spec = if (glm) l.exl3 else null;
         const lf: [3][]const u8 = if (spec != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
         var banks: [3]Triple = @splat(.{ .w = .{} });
-        for (&banks, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |*bk, p| {
+        // An outside plugin's resident experts (a streaming pack's head) run as the block's format banks.
+        const outside_banks: ?moe.FormatBanks = if (banked or l.has(try std.fmt.bufPrint(&nb, "{s}.{s}.gate_proj.weight", .{ base, ex }))) null else try l.quant.experts(try std.fmt.bufPrint(&nb, "{s}.mlp.experts", .{base}), c.hidden_size, c.moe_intermediate_size);
+        if (!banked and outside_banks == null) for (&banks, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |*bk, p| {
             bk.* = .{
                 .w = try l.need(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[0] })),
-                .s = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[1] })),
-                .b = l.get(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[2] })),
+                .s = try l.get(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[1] })),
+                .b = try l.get(try std.fmt.bufPrint(&nb, "{s}.{s}.{s}.{s}", .{ base, ex, p, lf[2] })),
             };
-        }
+        };
         var router = try l.triple(try std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, rt }));
         var shared: [3]Triple = undefined;
         for (&shared, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |*t, p| t.* = try l.triple(try std.fmt.bufPrint(&nb, "{s}.mlp.shared_experts.{s}", .{ base, p }));
         const expert_bias = if (glm)
             try l.f32Table(try l.need(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.e_score_correction_bias", .{base})), false)
         else blk: {
-            const eb = l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.expert_bias", .{base}));
+            const eb = try l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.expert_bias", .{base}));
             if (eb.ctx != null) break :blk try l.keep(eb);
             // A pack without the bias routes on plain sigmoid scores (the reference zero-inits it).
             var zeros = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_zeros(&zeros, &[_]c_int{@intCast(c.num_experts)}, 1, .float32, l.s));
             break :blk try l.own(zeros);
         };
-        const per_expert = try l.keep(l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.expert_scale", .{base})));
-        const gate_scale = try l.keep(l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.gate_proj.expert_scale", .{base})));
-        const up_scale = try l.keep(l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.up_proj.expert_scale", .{base})));
+        const per_expert = try l.keep(try l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.expert_scale", .{base})));
+        const gate_scale = try l.keep(try l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.gate_proj.expert_scale", .{base})));
+        const up_scale = try l.keep(try l.get(try std.fmt.bufPrint(&nb, "{s}.mlp.switch_mlp.up_proj.expert_scale", .{base})));
         try l.transposed(&router);
         // GLM routes in f32 (`moe_router_dtype`).
         if (glm and router.s.ctx == null) router.w = try l.f32Table(router.w, false);
@@ -764,6 +844,10 @@ const Loader = struct {
         };
         if (stream) |x| {
             try moe.bindStreamed(&w, x, mlp_prefix);
+        } else if (outside_banks) |fb| {
+            w.format_banks = fb;
+        } else if (banked) {
+            // Bound to the bank after the load.
         } else if (spec) |sp| {
             w.format_banks = .{ .table = &exl3.table, .gate = exl3Weight(banks[0], sp), .up = exl3Weight(banks[1], sp), .down = exl3Weight(banks[2], sp) };
         } else if (glm) w.fused = .{ .rows = glm5.MOE_DECODE_MAX_ROWS, .limit = c.swiglu_limit, .run = &@import("moe.zig").fusedDecode };
@@ -772,13 +856,36 @@ const Loader = struct {
     }
 
     /// `<root>.mtp.0`, the head beside the trunk's `.model`; null when the pack ships none.
+    /// Ling's NextN layer at `num_hidden_layers`; null when the pack ships none (no `eh_proj`). Its routed layer stays
+    /// resident (`banked` false): a streaming pack's experts load as the claiming plugin's format banks.
+    fn lingHead(l: *Loader) !?LingHead {
+        const c = l.c;
+        const idx: u32 = c.num_hidden_layers;
+        var bb: [112]u8 = undefined;
+        const base = try std.fmt.bufPrint(&bb, "{s}.layers.{d}", .{ l.prefix, idx });
+        var nb: [256]u8 = undefined;
+        var eh = (try l.tripleOpt(try std.fmt.bufPrint(&nb, "{s}.eh_proj", .{base}))) orelse return null;
+        try l.transposed(&eh);
+        return .{
+            .enorm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.enorm.weight", .{base})),
+            .hnorm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.hnorm.weight", .{base})),
+            .final_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.final_layernorm.weight", .{base})),
+            .input_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.input_layernorm.weight", .{base})),
+            .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{base})),
+            .eh_proj = try l.lin(eh, 2 * c.hidden_size),
+            .mla = try l.mla(idx),
+            .moe = try l.routed(base, false),
+        };
+    }
+
     fn head(l: *Loader) !?Head {
         const c = l.c;
         var bb: [96]u8 = undefined;
         const root = if (std.mem.endsWith(u8, l.prefix, ".model")) l.prefix[0 .. l.prefix.len - ".model".len] else l.prefix;
         const base = try std.fmt.bufPrint(&bb, "{s}.mtp.0", .{root});
         var nb: [256]u8 = undefined;
-        if (!l.has(try std.fmt.bufPrint(&nb, "{s}.eh_proj.weight", .{base}))) return null;
+        var eh = (try l.tripleOpt(try std.fmt.bufPrint(&nb, "{s}.eh_proj", .{base}))) orelse return null;
+        try l.transposed(&eh);
         var kb: [112]u8 = undefined;
         const block = try std.fmt.bufPrint(&kb, "{s}.block", .{base});
         return .{
@@ -787,9 +894,9 @@ const Loader = struct {
             .norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.norm.weight", .{base})),
             .input_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.input_layernorm.weight", .{block})),
             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{block})),
-            .eh_proj = try l.proj(try std.fmt.bufPrint(&nb, "{s}.eh_proj", .{base}), 2 * c.hidden_size),
+            .eh_proj = try l.lin(eh, 2 * c.hidden_size),
             .dsa = try l.dsa(block),
-            .moe = try l.routed(block),
+            .moe = try l.routed(block, false),
         };
     }
 
@@ -818,7 +925,17 @@ const Loader = struct {
                 L.ffn_hc = try l.mhc(base, "ffn_hc");
             }
             L.mixer = if (c.isLinearLayer(i)) .{ .kda = try l.kda(i) } else if (c.isGlm5()) .{ .dsa = try l.dsa(base) } else .{ .mla = try l.mla(i) };
-            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base) } else .{ .dense = try l.dense(i) };
+            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank) } else .{ .dense = try l.dense(i) };
+            if (L.mlp == .moe and i < c.expert_limit_out.len) {
+                // Ling-3.1's clamps after the SiLU: the shared expert's in the block; the routed experts' in the composed
+                // chain (no kernel serves it), or in the bound bank's own arithmetic (`BankGeometry.limits_out`, `bindBank`).
+                L.mlp.moe.shared_limit_out = @floatFromInt(c.shared_limit_out[i]);
+                if (c.expert_limit_out[i] != 0) {
+                    L.mlp.moe.limit_out = @floatFromInt(c.expert_limit_out[i]);
+                    // the composed chain's arm: no kernel claims the layer (a format bank takes `Swiglu.limit_out`)
+                    if (!c.streamed_bank and L.mlp.moe.format_banks == null) L.mlp.moe.clamp = null;
+                }
+            }
             built += 1;
         }
         return out;
@@ -880,6 +997,8 @@ fn probePrefix(src: *const quant_abi.Source, declared: []const u8, leaf: []const
 pub fn load(ctx: *const abi.LoadCtx) !*Model {
     const src = ctx.weights orelse return error.UnsupportedWeightSource;
     const c = config.of(ctx.parsed);
+    // Before the trunk: what is outside the server, for the bank's open (`Fit.load_start`).
+    const start = outside_model.readMemory();
     const s: mlx.mlx_stream = if (ctx.stream.ctx) |p| .{ .ctx = p } else mlx.gpuStream();
     const emb_base: []const u8 = if (std.mem.eql(u8, c.model_type, "bailing_hybrid")) "word_embeddings" else "embed_tokens";
     var eb: [64]u8 = undefined;
@@ -888,8 +1007,12 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
     errdefer gpa.destroy(m);
     m.* = .{ .c = c, .s = s, .caps = ctx.parsed.caps, .embed = undefined, .head = undefined, .final_norm = undefined };
     errdefer m.deinit();
-    var l: Loader = .{ .src = src, .c = c, .s = s, .prefix = prefix, .owned = &m.owned, .exl3 = null };
-    if (c.num_experts > 0) m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.num_experts, s);
+    m.quant = try outside_model.Load.open(gpa, ctx, src.*, s);
+    // The table is the load's: the weights it loaded stay the model's.
+    defer m.quant.close();
+    if (c.streamed_bank and m.quant.format == null) return error.StreamedBankUnclaimed;
+    var l: Loader = .{ .src = src, .c = c, .s = s, .prefix = prefix, .owned = &m.owned, .exl3 = null, .quant = &m.quant };
+    if (c.num_experts > 0 and !c.streamed_bank) m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.num_experts, s);
     if (m.experts) |*x| l.experts = x;
     if (c.expert_quant_json.len > 0) {
         var arena = std.heap.ArenaAllocator.init(gpa);
@@ -908,21 +1031,23 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
     if (!floatDtype(emb.w)) {
         emb.s = try l.need(try std.fmt.bufPrint(&nb, "{s}.{s}.scales", .{ prefix, emb_base }));
         const bn = try std.fmt.bufPrint(&nb, "{s}.{s}.biases", .{ prefix, emb_base });
-        emb.b = if (bias_mandatory) try l.need(bn) else l.get(bn);
+        emb.b = if (bias_mandatory) try l.need(bn) else try l.get(bn);
     }
     m.final_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.norm.weight", .{prefix}));
     const lm_prefix = if (std.mem.eql(u8, prefix, "language_model.model")) "language_model" else prefix;
-    var head: Triple = .{ .w = l.get(try std.fmt.bufPrint(&nb, "{s}.lm_head.weight", .{lm_prefix})) };
+    var head: Triple = .{ .w = try l.get(try std.fmt.bufPrint(&nb, "{s}.lm_head.weight", .{lm_prefix})) };
     if (head.w.ctx != null) {
         if (!floatDtype(head.w)) {
             head.s = try l.need(try std.fmt.bufPrint(&nb, "{s}.lm_head.scales", .{lm_prefix}));
             const bn = try std.fmt.bufPrint(&nb, "{s}.lm_head.biases", .{lm_prefix});
-            head.b = if (bias_mandatory) try l.need(bn) else l.get(bn);
+            head.b = if (bias_mandatory) try l.need(bn) else try l.get(bn);
         }
     } else if (l.has("lm_head.weight")) {
-        head = .{ .w = l.get("lm_head.weight"), .s = l.get("lm_head.scales"), .b = l.get("lm_head.biases") };
+        head = .{ .w = try l.get("lm_head.weight"), .s = try l.get("lm_head.scales"), .b = try l.get("lm_head.biases") };
         if (head.s.ctx == null) head.s = emb.s;
         if (head.b.ctx == null) head.b = emb.b;
+    } else if (try l.tripleOpt("lm_head")) |t| {
+        head = t;
     } else if (c.tie_word_embeddings) {
         head = emb;
     } else {
@@ -937,7 +1062,76 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
         log.warn("GLM MTP head: {s} — MTP off\n", .{@errorName(e)});
         break :blk null;
     };
+    // Ling's NextN head on the streaming pack only: an MLX Ling pack loads as before.
+    if (!c.isGlm5() and c.streamed_bank and c.nextn_layers > 0) m.ling_mtp = l.lingHead() catch |e| blk: {
+        log.warn("Ling MTP head: {s} — MTP off\n", .{@errorName(e)});
+        break :blk null;
+    };
+    // The drafts' readout of a head the outside plugin runs, before the bank takes its room: the engine borrows it at
+    // the bind (`trunk_weight`).
+    if ((m.mtp != null or m.ling_mtp != null) and m.head.ext != null) try draftReadout(m);
+    if (c.streamed_bank) {
+        // The head resident before the bank's open reads the memory (else lazy until `HeadHooks.load`, past the open).
+        if (m.mtp != null) try readyHead(m);
+        if (m.ling_mtp != null) try readyLingHead(m);
+        try bindBank(m, ctx, start);
+    }
     return m;
+}
+
+/// The streaming pack's bank, opened by its outside plugin at the host's room past the loaded residents, bound to every
+/// routed layer (the trunk's layer index, as `BankGeometry.gates`).
+/// The bank's per-phase fit (`outside_model.Fit`): the host's prompt and decode rooms, and the pack's measured
+/// calibration (`bank-fit.json`) when it names this ceiling and reaches the server's context; the bills otherwise.
+fn bankFit(ctx: *const abi.LoadCtx, start: outside_model.Reading) outside_model.Fit {
+    const grow = ctx.streamGrowth();
+    var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom(), .grow_prompt = grow.prompt, .grow_decode = grow.decode, .load_start = start };
+    if (!ctx.dir.has(outside_model.bank_fit_file)) return fit;
+    var buf: [4096]u8 = undefined;
+    var why: abi.Verdict = .ok;
+    const text = ctx.dir.readFile(outside_model.bank_fit_file, &buf, &why) orelse {
+        log.warn("glm5_next: {s} does not read ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, why.why.slice() });
+        return fit;
+    };
+    fit.calibration = outside_model.parseBankFit(text, ctx.gpuCeiling(), abi.stream_room_cell) catch |e| {
+        log.warn("glm5_next: {s} not applied ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, @errorName(e) });
+        return fit;
+    };
+    log.info("glm5_next: the bank fits by {s} (ceiling {d} MiB; the bills' growth past its {d}-token evidence {d} / {d} MiB)\n", .{ outside_model.bank_fit_file, fit.calibration.?.ceiling >> 20, fit.calibration.?.evidence, grow.prompt >> 20, grow.decode >> 20 });
+    return fit;
+}
+
+fn bindBank(m: *Model, ctx: *const abi.LoadCtx, start: outside_model.Reading) !void {
+    const c = m.c;
+    const gates = try gpa.alloc(quant_abi.BankGate, m.layers.len);
+    defer gpa.free(gates);
+    for (gates, m.layers) |*g, *ly| g.* = if (ly.mlp == .moe) .{ .w = .{ .ctx = ly.mlp.moe.router.w.ctx }, .bias = .{ .ctx = ly.mlp.moe.route.sigmoid_bias.expert_bias.ctx } } else .{};
+    // Ling-3.1's routed clamps after the SiLU, per layer (null where no layer clamps so).
+    const limits = try gpa.alloc(f32, m.layers.len);
+    defer gpa.free(limits);
+    var any_limit = false;
+    for (limits, 0..) |*l, li| {
+        l.* = if (li < c.expert_limit_out.len) @floatFromInt(c.expert_limit_out[li]) else 0;
+        if (l.* > 0) any_limit = true;
+    }
+    const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(m.layers.len), .swiglu_limit = if (c.swiglu_clamp) c.swiglu_limit else 0, .gates = gates.ptr, .limits_out = if (any_limit) limits.ptr else null };
+    const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fit = bankFit(ctx, start) }, m.s);
+    m.bank = o.bank;
+    log.info("glm5_next: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
+    // the budget and the memory read at the open: a bank-fit.json's evidence (`rest = non-file in use - server footprint`)
+    if (o.refused) |e| log.warn("glm5_next: the memory read at the open refused ({s}: non-file in use below the server's footprint): the bank fits by the bills on total - available\n", .{@errorName(e)});
+    if (o.read) |r| if (r.in_use != o.reading.?.in_use) log.info("glm5_next: the open read non-file in use {d} MiB, settled to {d} MiB (outside the server at the load's start {d} MiB, server footprint {d} MiB)\n", .{ r.in_use >> 20, o.reading.?.in_use >> 20, (start.in_use -| start.footprint) >> 20, r.footprint >> 20 });
+    if (o.reading) |r| log.info("glm5_next: bank budget {d} MiB prompt / {d} MiB decode: non-file in use {d} MiB, server footprint {d} MiB at the open\n", .{ o.budget.prompt >> 20, o.budget.decode >> 20, r.in_use >> 20, r.footprint >> 20 });
+    const r = o.bank.routed();
+    m.routed = r;
+    for (m.layers, 0..) |*ly, li| if (ly.mlp == .moe) try moe.bindRouted(&ly.mlp.moe, r, @intCast(li));
+}
+
+/// Tells a streaming pack's bank which phase a forward of `rows` rows a call runs in: a call routing more ids than its
+/// decode lane takes is a prompt pass.
+pub fn bankPhase(m: *const Model, rows: usize) !void {
+    const r = m.routed orelse return;
+    try r.phase(rows * m.c.num_experts_per_tok > r.decode_ids);
 }
 
 fn floatDtype(a: Array) bool {
@@ -953,6 +1147,81 @@ fn evalTrunk(m: *const Model) !void {
     defer _ = mlx.mlx_vector_array_free(vec);
     for (m.owned.items) |a| _ = mlx.mlx_vector_array_append_value(vec, a);
     try mlx.check(mlx.mlx_eval(vec));
+    try m.quant.eval();
+}
+
+extern "c" fn mlx_eye(res: *Array, n: c_int, m: c_int, k: c_int, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) c_int;
+
+/// The draft readout of a head the outside plugin runs (`Model.draft_head`): its rows read once through the plugin
+/// (`I @ W^T`, the identity's rows), stored as MLX affine 4-bit at group 64, the dense copy freed.
+fn draftReadout(m: *Model) !void {
+    const s = m.s;
+    const h: c_int = @intCast(m.c.hidden_size);
+    var eye = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eye);
+    try mlx.check(mlx_eye(&eye, h, h, 0, .bfloat16, s));
+    var eye3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eye3);
+    try mlx.check(mlx.mlx_reshape(&eye3, eye, &[_]c_int{ 1, h, h }, 3, s));
+    const wt = try m.mm(&m.head, eye3);
+    defer _ = mlx.mlx_array_free(wt);
+    const vocab = mlx.getShape(wt)[2];
+    var wt2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt2);
+    try mlx.check(mlx.mlx_reshape(&wt2, wt, &[_]c_int{ h, vocab }, 2, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_transpose(&w, wt2, s));
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_astype(&dense, w, .bfloat16, s));
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    const bits = readoutBits(m.c);
+    try mlx.check(mlx.mlx_quantize(&triple, dense, mlx.mlx_optional_int.some(@intCast(draft_head_group)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
+    var parts: [3]Array = @splat(mlx.mlx_array_new());
+    for (&parts, 0..) |*a, i| {
+        try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
+        try m.owned.append(gpa, a.*);
+    }
+    const vec = mlx.mlx_vector_array_new_data(&parts, 3);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_eval(vec));
+    m.draft_head = .{ .w = parts[0], .s = parts[1], .b = parts[2], .bits = bits, .group_size = draft_head_group, .mode = .affine };
+    var held: u64 = 0;
+    for (parts) |a| held += mlx.mlx_array_size(a) * mlx.mlx_array_itemsize(a);
+    const billed = draftReadoutBytes(@intCast(vocab), m.c.hidden_size, bits);
+    log.info("MTP draft readout: the EXL3 head as affine {d}-bit g{d}, {d} MiB resident (billed {d} MiB)\n", .{ bits, draft_head_group, held >> 20, billed >> 20 });
+    if (held != billed) return error.DraftReadoutUnbilled;
+}
+
+/// The draft readout's width: each model's evaluated composition (GLM-5.3-Flash re-scores on an 8-bit copy, Ling-3.1
+/// on a 4-bit one). The engine shortlists on its own 3-bit copy of it and re-scores the shortlist on these rows.
+pub fn readoutBits(c: *const Config) u32 {
+    return if (c.isGlm5()) 8 else 4;
+}
+pub const draft_head_group: u32 = 64;
+
+/// The draft readout's resident bytes at `vocab` x `hidden` and `bits` (`draftReadout`; the load's `resident_bytes`
+/// bills them): the packed words and a bf16 scale and bias per group of 64. The engine bills its own shortlist head.
+pub fn draftReadoutBytes(vocab: u64, hidden: u64, bits: u32) u64 {
+    return vocab * hidden * bits / 8 + 2 * 2 * vocab * (hidden / draft_head_group);
+}
+
+test "glm5_next trunk: the draft readout bills Ling-3.1-flash's 4-bit head at 345 MiB, GLM-5.3-Flash's 8-bit head at 643 MiB" {
+    try std.testing.expectEqual(@as(u64, 362_151_936), draftReadoutBytes(157_184, 4096, 4));
+    try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(154_880, 4096, 8));
+    try std.testing.expectEqual(@as(u32, 4), readoutBits(&.{ .model_type = "bailing_hybrid" }));
+    try std.testing.expectEqual(@as(u32, 8), readoutBits(&.{ .model_type = "glm5_next" }));
+}
+
+/// Makes Ling's NextN layer resident (bailing_hybrid's `HeadHooks.load`).
+pub fn readyLingHead(m: *Model) !void {
+    if (m.mtp_ready) return;
+    const h = m.ling_mtp orelse return error.NoMtpHead;
+    try mlx.evalFields(h);
+    try m.quant.eval();
+    m.mtp_ready = true;
 }
 
 /// Makes the MTP head resident (`HeadHooks.load`).
@@ -960,5 +1229,6 @@ pub fn readyHead(m: *Model) !void {
     if (m.mtp_ready) return;
     const h = m.mtp orelse return error.NoMtpHead;
     try mlx.evalFields(h);
+    try m.quant.eval();
     m.mtp_ready = true;
 }

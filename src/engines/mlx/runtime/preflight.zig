@@ -281,6 +281,14 @@ pub fn mtpSidecarDiskBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: 
     return @intCast(st.size);
 }
 
+/// The coarse shortlist head an MTP bind builds from the trunk head (`mtp.buildRerankCoarse`, or the draft-only head
+/// `buildDraftHead` keeps instead), billed with the weights when the load carries an MTP head: a served model whose
+/// facts declare one (`SpecFacts.mtp_layout`), a legacy model whose pack ships one.
+pub fn mtpCoarseBytes(config: *const model_mod.ModelConfig, legacy_head: bool) u64 {
+    const head = if (config.plugin) |b| b.parsed.spec.mtp_layout != .none else legacy_head;
+    return if (head) mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mtp_mod.DRAFT_HEAD_BITS) else 0;
+}
+
 /// Resident bytes a sidecar takes once loaded: `bits` per weight plus a bf16
 /// (scale, bias) pair per group of 64 for a dense DFlash assistant quantized
 /// at load; its file size otherwise (`bits == 0`).
@@ -746,4 +754,18 @@ test "residentModelDiskBytes: with stream_experts a pack whose plugin streams th
     try std.testing.expectEqual(modelDiskBytes(io, dir) - on.experts + on.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
     config.stream_experts_override = null;
     try std.testing.expectEqual(modelDiskBytes(io, dir), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+}
+
+test "the preflight bills the MTP bind's coarse head where the load carries a head, and nothing where it does not" {
+    var c: model_mod.ModelConfig = .{};
+    c.vocab_size = 157_184;
+    c.hidden_size = 4096;
+    try std.testing.expectEqual(@as(u64, 281_673_728), mtpCoarseBytes(&c, true));
+    try std.testing.expectEqual(@as(u64, 0), mtpCoarseBytes(&c, false));
+    var table: abi.ModelTable = undefined;
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .spec = .{ .mtp_layout = .in_checkpoint } } };
+    c.plugin = &binding;
+    try std.testing.expectEqual(@as(u64, 281_673_728), mtpCoarseBytes(&c, false));
+    binding.parsed.spec.mtp_layout = .none;
+    try std.testing.expectEqual(@as(u64, 0), mtpCoarseBytes(&c, true));
 }

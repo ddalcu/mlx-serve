@@ -72,6 +72,11 @@ pub const Weight = struct {
         return .{ .ctx = out.ctx };
     }
 
+    /// Rows one `matmul` takes with each row given its one-row call's bytes (`QuantTable.exact_rows`, at least 1).
+    pub fn exactRows(self: *const Weight) u32 {
+        return @max(1, self.t.exactRows());
+    }
+
     /// Its arrays, for a model that evaluates every weight it reads at load.
     pub fn arrays(self: *const Weight) [4]mlx.mlx_array {
         return .{ .{ .ctx = self.w.w.ctx }, .{ .ctx = self.w.scales.ctx }, .{ .ctx = self.w.biases.ctx }, .{ .ctx = self.w.side.ctx } };
@@ -223,12 +228,21 @@ pub const Bank = struct {
             .phase_fn = C.phase,
             .read_ahead_fn = C.readAhead,
             .decode_ids = b.decode_ids,
+            .exact_rows = b.size >= @offsetOf(abi.Bank, "exact_rows") + @sizeOf(bool) and b.exact_rows,
             .source_shared = if (offers(b, .rows_shared)) C.rowsShared else null,
             .source_expand = if (offers(b, .rows_expand)) C.expand(.rows_expand) else null,
             .source_expand_into = if (offers(b, .rows_expand_into)) C.expand(.rows_expand_into) else null,
             .source_decode_expand = if (offers(b, .rows_decode_expand)) C.expand(.rows_decode_expand) else null,
             .next_fn = if (offers(b, .next_ahead)) C.nextAhead else null,
         };
+    }
+
+    /// The bank's summary lines for the request (`abi.Bank.meters`); empty when it offers none.
+    pub fn meters(self: *Bank) []const u8 {
+        if (!offers(&self.b, .meters)) return "";
+        var out: abi.Str = .{};
+        self.b.meters.?(self.b.ctx, &out);
+        return out.slice();
     }
 
     /// Whether the bank sets optional member `field`, read only when its `size` reaches it.
@@ -359,6 +373,14 @@ test "outside quant: the table claiming a pack's quantization_config loads its w
     try testing.expectError(error.OutsideQuantRefused, (try f.tensor("a", 0)).?.matmul(.{ .ctx = null }, .{ .ctx = null }));
 }
 
+test "outside quant: a weight's row-exact width is its table's declaration, one row where it declares none" {
+    var table = Toy.table;
+    const w: Weight = .{ .t = &table, .w = .{} };
+    try testing.expectEqual(@as(u32, 1), w.exactRows());
+    table.exact_rows = 16;
+    try testing.expectEqual(@as(u32, 16), w.exactRows());
+}
+
 test "outside quant: a dense SwiGLU the table declines is null, the routed one's refusal an error" {
     const w: Weight = .{ .t = &Toy.table, .w = .{} };
     const none: mlx.mlx_array = .{ .ctx = null };
@@ -375,8 +397,11 @@ const ToyBank = struct {
         out.* = .{ .prompt = @intCast(budget.prompt / 100), .decode = geo.n_experts, .row_bytes = 100 };
         return .ok;
     }
+    fn meters(_: ?*anyopaque, out: *abi.Str) callconv(.c) void {
+        out.* = .of("[stream-stats] toy: routes=1");
+    }
     fn open(_: *const abi.LoadCtx, geo: *const abi.BankGeometry, _: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
-        out.* = .{ .ctx = @constCast(@ptrCast(geo.gates.?)), .close = &close, .about = .of("toy"), .decode_ids = 48, .rows = &routedRows, .settle = &ok0, .phase = &phase, .read_ahead = &readAhead, .rows_shared = &shared };
+        out.* = .{ .ctx = @constCast(@ptrCast(geo.gates.?)), .close = &close, .about = .of("toy"), .decode_ids = 48, .rows = &routedRows, .settle = &ok0, .phase = &phase, .read_ahead = &readAhead, .rows_shared = &shared, .meters = &meters, .exact_rows = true };
         return .ok;
     }
     /// A bank built before its optional members: whatever lies past its `size` is not read.
@@ -429,7 +454,9 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     const b = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
     const r = b.routed();
     try testing.expectEqual(@as(usize, 48), r.decode_ids);
+    try testing.expect(r.exact_rows);
     try testing.expect(r.source_shared != null and r.source_expand == null and r.next_fn == null);
+    try testing.expectEqualStrings("[stream-stats] toy: routes=1", b.meters());
     const none: mlx.mlx_array = .{ .ctx = null };
     try testing.expectEqual(@as(?*anyopaque, &ToyBank.sum), (try r.math.source(r.ctx, 0, none, none, none).get()).ctx);
     try testing.expectError(error.EngineFailed, r.math.source(r.ctx, 1, none, none, none).get());
@@ -445,7 +472,8 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     try testing.expectEqual(@as(u32, 1), ToyBank.closed);
     table.open_bank = &ToyBank.openOlder;
     const older = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
-    try testing.expect(older.routed().source_shared == null);
+    try testing.expect(older.routed().source_shared == null and !older.routed().exact_rows);
+    try testing.expectEqualStrings("", older.meters());
     older.close();
     table.open_bank = &ToyBank.openShort;
     try testing.expectError(error.OutsideQuantRefused, f.openBank(geo, .{ .prompt = 1000, .decode = 1000 }));

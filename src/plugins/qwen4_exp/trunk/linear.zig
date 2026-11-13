@@ -33,6 +33,7 @@ const fusedSwiGLU = @import("../../../sdk/blocks/mlp/fused_activations.zig").fus
 const spliceVisionRows = @import("../../../sdk/vision/splice.zig").spliceVisionRows;
 
 pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+    if (self.outsideLinear(w)) |ext| return ext.matmul(x, self.s);
     if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, self.s);
     const qp = self.quantParamsHinted(w, sc, lastDim(x));
     // A ternary 2-bit pack (bias == -scale on every weight) reads the 2-bit kernels; they decline other shapes.
@@ -45,6 +46,7 @@ pub inline fn qmatmul(self: *const Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc
 
 /// The logits projection: a dense bf16 head is `[vocab, hidden]`, projected through a transposed view.
 pub inline fn lmHeadProject(self: *const Trunk, x: mlx.mlx_array) !mlx.mlx_array {
+    if (self.outsideLinear(self.lm_head_w)) |ext| return ext.matmul(x, self.s);
     if (self.lm_head_s.ctx == null) {
         const wt = try transposeBf16Weight(self.lm_head_w, self.s);
         defer _ = mlx.mlx_array_free(wt);
@@ -95,7 +97,8 @@ pub fn mtpProjectionRows(self: *Trunk, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
     const n: usize = @intCast(sh[0]);
     var virtual_rows: c_int = 1;
     for (sh[1 .. sh.len - 1]) |d| virtual_rows *= d;
-    if (virtual_rows == 1) {
+    // An outside plugin's weight has no affine rows for the row kernel.
+    if (virtual_rows == 1 and self.outsideLinear(if (lm_head) self.lm_head_w else w) == null) {
         const qp = self.quantParamsHinted(w, sc, lastDim(x));
         if (qp.mode == .affine) {
             if (try msvQmvRows(self.s, x, w, sc, bi, qp.bits, qp.group_size)) |y| return y;
@@ -321,6 +324,7 @@ test "trunk qmatmul: a ternary 2-bit pack routes through qmv2; without the flag 
     @import("../../../mlx/device.zig").device_gen_override = .{ .gen = 13, .phone = false };
     defer @import("../../../mlx/device.zig").device_gen_override = null;
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.bits_cache = .{};
     xfm.config = std.mem.zeroes(@TypeOf(xfm.config));

@@ -14,7 +14,7 @@ fn opt(x: f32) ?f32 {
 pub fn toModelConfig(c: *const Config) !model.ModelConfig {
     var m: model.ModelConfig = .{};
     inline for (@typeInfo(Config).@"struct".field_names) |name| {
-        if (comptime std.mem.eql(u8, name, "gen") or std.mem.eql(u8, name, "expert_quant_json") or std.mem.startsWith(u8, name, "advertises_")) continue;
+        if (comptime std.mem.eql(u8, name, "gen") or std.mem.eql(u8, name, "expert_quant_json") or std.mem.eql(u8, name, "streamed_bank") or std.mem.endsWith(u8, name, "_limit_out") or std.mem.eql(u8, name, "nextn_layers") or std.mem.startsWith(u8, name, "advertises_")) continue;
         const src = @field(c, name);
         const Dst = @TypeOf(@field(m, name));
         @field(m, name) = if (@TypeOf(src) == Dst) src else std.meta.stringToEnum(Dst, @tagName(src)).?;

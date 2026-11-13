@@ -11,6 +11,9 @@ const io_util = @import("../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const mtp_acceptance = @import("../../../sdk/spec/mtp_acceptance.zig");
 const round_cost = @import("../spec/round_cost.zig");
+const context = @import("../admission/context.zig");
+const mtp_group_planner = @import("../spec/mtp_group_planner.zig");
+const dflash_policy = @import("../spec/dflash/policy.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const ForwardCtx = transformer_mod.ForwardCtx;
@@ -59,6 +62,9 @@ const CheckpointSink = @import("../kv/cache_ops.zig").CheckpointSink;
 const intree = @import("../plugin/intree.zig");
 const plugin_driver = @import("../plugin/driver.zig");
 
+/// The most rows a spec round's verify writes past its last accepted token: an MTP chain at its deepest, or a DFlash
+/// block.
+pub const verify_rows_max: usize = @max(mtp_group_planner.MAX_DEPTH + 1, dflash_policy.MAX_ROWS);
 
 pub fn initWithOptions(
     io: std.Io,
@@ -150,6 +156,8 @@ pub fn initWithOptions(
     var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
     // Only an echo of prompt logprobs reads a prompt forward's logits before its last row.
     ctx.last_row_logits = options.prompt_logprobs == null;
+    // A grow allocates no slack past the context and the rows a verify writes past its last token.
+    ctx.cache.limitGrowth(@as(usize, context.getEffectiveContextLength(&xfm.config)) + verify_rows_max);
 
     const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
     defer allocator.free(ids_i32);

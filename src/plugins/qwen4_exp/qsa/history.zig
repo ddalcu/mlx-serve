@@ -474,6 +474,7 @@ test "QSA key history advances by S not 1" {
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
     var entry: SSMCacheEntry = .{ .conv_state = .{ .ctx = null }, .ssm_state = .{ .ctx = null }, .initialized = true };
@@ -491,6 +492,7 @@ test "qsa raw-key ring is O(RING_ROWS) at N rows" {
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -540,6 +542,7 @@ test "qsa leftover: restore at L-30 then append/rollback re-pools bit-identicall
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
 
@@ -628,6 +631,7 @@ test "qsa rollback: a partial accept keeps the raw-key buffer and re-slices to k
     const t = std.testing;
     const s = mlx.gpuStream();
     var xfm: Trunk = undefined;
+    xfm.outside = null;
     xfm.s = s;
     xfm.allocator = t.allocator;
     xfm.qsa_score_bank_builds = 0;
@@ -795,6 +799,7 @@ test "qsa history reservation: a reserved prefill allocates its buffers ONCE (#3
     const total: usize = 409_600;
 
     var t: Trunk = undefined;
+    t.outside = null;
 
     t.s = s;
     t.allocator = ta;
@@ -835,6 +840,7 @@ test "qsa key history: capacity-buffer append equals the concatenated reference,
     const s = mlx.gpuStream();
 
     var t: Trunk = undefined;
+    t.outside = null;
 
     t.s = s;
     t.allocator = testing.allocator;
@@ -941,6 +947,7 @@ test "qsa history: a restore-shaped re-seed lands AT the reservation, so the app
     const reserve: usize = 8192;
 
     var t: Trunk = undefined;
+    t.outside = null;
 
     t.s = s;
     t.allocator = ta;

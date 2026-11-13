@@ -54,6 +54,29 @@ pub fn renameHyperConnections(weights: *Weights) !void {
     }
 }
 
+/// GLM's NextN layer past the trunk (`<prefix>.layers.<trunk_layers>`, as the release names it) under the head's names:
+/// `eh_proj` / `enorm` / `hnorm` and `shared_head.norm` (as `norm`) at `<prefix>.mtp.0`, the rest under `.mtp.0.block`.
+pub fn renameGlmMtp(weights: *Weights, prefix: []const u8, trunk_layers: u32) !void {
+    const a = weights.allocator;
+    var lb: [128]u8 = undefined;
+    const layer = try std.fmt.bufPrint(&lb, "{s}.layers.{d}.", .{ prefix, trunk_layers });
+    var keys: std.ArrayList([]u8) = .empty;
+    defer freeKeys(&keys, a);
+    var it = weights.map.keyIterator();
+    while (it.next()) |k| if (std.mem.startsWith(u8, k.*, layer)) try keys.append(a, try a.dupe(u8, k.*));
+    for (keys.items) |key| {
+        var rest = key[layer.len..];
+        var sub: []const u8 = ".block";
+        for ([_][]const u8{ "eh_proj.", "enorm.", "hnorm.", "shared_head." }) |p| if (std.mem.startsWith(u8, rest, p)) {
+            sub = "";
+            if (p[0] == 's') rest = rest[p.len..];
+        };
+        const to = try std.fmt.allocPrint(a, "{s}.mtp.0{s}.{s}", .{ prefix, sub, rest });
+        defer a.free(to);
+        try rename(weights, key, to);
+    }
+}
+
 const KvB = struct { heads: u32, nope: u32, v: u32, latent: u32 };
 
 fn isKvBKey(key: []const u8) bool {
@@ -682,6 +705,21 @@ test "sushi pack: hyper-connection tensors take the loader's names" {
     for ([_][]const u8{ "attn_hc.fn", "attn_hc.base", "attn_hc.scale", "ffn_hc.fn", "ffn_hc.base", "ffn_hc.scale", "input_layernorm.weight" }) |name| {
         var buf: [96]u8 = undefined;
         try testing.expect(w.get(try std.fmt.bufPrint(&buf, "model.language_model.layers.3.{s}", .{name})) != null);
+    }
+}
+
+test "sushi pack: GLM's NextN layer takes the head's names; the trunk's layers keep theirs" {
+    var w = Weights.init(testing.allocator);
+    defer w.deinit();
+    for ([_][]const u8{ "layers.2.eh_proj.trellis", "layers.2.enorm.weight", "layers.2.shared_head.norm.weight", "layers.2.mlp.gate.weight", "layers.1.mlp.gate.weight" }) |leaf| {
+        var buf: [96]u8 = undefined;
+        try putNew(&w, try std.fmt.bufPrint(&buf, "model.language_model.{s}", .{leaf}), mlx.mlx_array_new_float(1));
+    }
+    try renameGlmMtp(&w, "model.language_model", 2);
+    try testing.expectEqual(@as(u32, 5), w.count());
+    for ([_][]const u8{ "mtp.0.eh_proj.trellis", "mtp.0.enorm.weight", "mtp.0.norm.weight", "mtp.0.block.mlp.gate.weight", "layers.1.mlp.gate.weight" }) |name| {
+        var buf: [96]u8 = undefined;
+        try testing.expect(w.get(try std.fmt.bufPrint(&buf, "model.language_model.{s}", .{name})) != null);
     }
 }
 

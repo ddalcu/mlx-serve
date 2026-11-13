@@ -17,10 +17,23 @@ with GLM-5.3-Flash's readers and loads through `glm5_next/trunk.zig`; its own pa
   captures bit-equal to the deleted legacy forward's tape (`fixtures/steps.tape`). Conformance passes on the same pack.
 - Bill: `kv_per_token` per attention head (MLA expands the latent before the write), bf16 `ssm_checkpoint`,
   `prefill_score_width` = nope + rope.
+- Ling-3.1 streaming pack (the EXL3 repack beside `experts.bin`): it keeps the release's config, so its EXL3
+  `quantization_config` (not `expert_streaming`) sets `streamed_bank`; glm5_next's streaming rules then apply. Its prompt
+  bill is `prefill_bytes`: the engine's unstreamed arithmetic over `sdk/bill/prefill.zig`, pinned by `bill_test.zig`
+  (the closure stays in sdk/); `prompt_last_row` reads the head's last 32 rows only.
+- Exact verify (streaming packs, `serialVerify`, ≤ 16 rows): every verify row carries serial decode's bytes
+  (projections at `QuantTable.exact_rows`, KDA and MLA per row, `moe.mlpRows`), so greedy MTP text equals MTP off;
+  not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.
+- Ling-3.1's clamps AFTER the SiLU, per layer: `expert_swiglu_limit_list` (routed, the bank's or the composed chain's)
+  and `share_expert_swiglu_limit_list` (shared, `moe.Moe.Weights.shared_limit_out`); GLM's clamp is BEFORE it.
 
 Served, legacy forward deleted (`engines/mlx/plugin/served.zig`; `glm5_next/served_test.zig`: steps and greedy through the driver). DFlash via
-`trunk_weight` + captures. No MTP head: the legacy path serves none (a NextN `eh_proj` head binds to hy_v3/nemotron_h
-only, `MtpModel.bind`), so a Ling-flash head is a new feature with no oracle yet.
+`trunk_weight` + captures.
+- MTP head (`head.zig`, streaming packs only): the NextN layer at `num_hidden_layers` (`trunk.lingHead`), one
+  MLA + MoE block over `cat[enorm(embed), hnorm(h)]`, `final_layernorm` out; no legacy oracle (the served test runs it).
+- A head the outside plugin runs (EXL3) is no `trunk_weight`: drafts re-score on a 4-bit g64 copy of its rows
+  (`trunk.draftReadout`, the evaluated width; billed in `resident_bytes`) after shortlisting on the engine's 3-bit
+  copy of it (billed by the engine). The trunk's logits keep the plugin's head.
 
 ## Rules (from root AGENTS.md)
 - KDA = GDN with a PER-CHANNEL gate (the `_vec` kernel); per-head vs per-channel gating is an INDEXING contract.

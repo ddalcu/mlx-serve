@@ -67,6 +67,7 @@ const legacy_fixtures = [_]struct { name: []const u8, why: []const u8, legacy: [
     .{ .name = "nemotron_h_super_drafter.json", .why = "qwen3: a quantization_config naming a quant_method", .legacy = "a LiLiCorr DFlash sidecar: discovery classifies it as a drafter" },
     .{ .name = "mistral.json", .why = "llama: a quantization_config naming a quant_method", .legacy = "bitsandbytes nf4 weights: no MLX scales, the load is MissingWeight" },
     .{ .name = "nemotron-h.json", .why = "nemotron_h: a quantization_config block", .legacy = "compressed-tensors FP8 (weight_scale, not MLX scales)" },
+    .{ .name = "bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json", .why = "bailing_hybrid: a streaming pack without its experts.bin bank", .legacy = "EXL3 trellises (no <name>.weight): the load is MissingWeight; its bank is an outside quant plugin's" },
 };
 
 test "served audit: every fixture config of a served type is claimed, or its decline is listed" {

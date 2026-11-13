@@ -9,7 +9,9 @@
 //! affine table (`weight` U32 [R, dim*bits/32], `scales`/`biases` BF16
 //! [R, dim/gs]) written by `tests/convert_qwen38_flash_next.py`, or one
 //! merged RAW BF16 table (`weight` BF16 [R, dim], no scales/biases,
-//! `"bits":"16"`) for bit-exact PLE lookups.
+//! `"bits":"16"`) for bit-exact PLE lookups. An EXL3 pack names its own file
+//! (`ngram_table.file`): `exl3_ngram_trellis` rows, K-bit MUL1 trellis rings
+//! decoded on the host (`trellisRow`) plus a per-head bias its shards hold.
 
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
@@ -18,6 +20,7 @@ const log = @import("../../sdk/util/log.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const embedded_ple = @import("ple_table.zig");
 const gguf = @import("../../sdk/quant/gguf/core.zig");
+const exl3_codebook = @import("../../sdk/quant/exl3/format.zig").sushi.format;
 pub const EmbeddedSpec = embedded_ple.EmbeddedSpec;
 pub const EmbeddedInfo = embedded_ple.EmbeddedInfo;
 pub const inspectEmbedded = embedded_ple.inspectEmbedded;
@@ -211,9 +214,13 @@ pub const NgramTable = struct {
     gpu_owns_map: bool = false,
     embedded: ?*embedded_ple.EmbeddedTable = null,
     fmt: embedded_ple.Format = .affine,
-    /// A GGUF table (`fmt == .ggml`): its rows' block type and bytes.
+    /// A GGUF table (`fmt == .ggml`): its rows' block type and bytes; a trellis table's row bytes.
     ggml: gguf.quants.GgmlType = .f32,
     row_bytes: u32 = 0,
+    /// A trellis table's per-hash-head bias, `[n_heads][dim]` (`setHeadBias`): row i of a gather adds head
+    /// `i % n_heads`'s, as the rows arrive token-major, head-minor (`NgramHash.rowIds`).
+    head_bias: ?[]f32 = null,
+    n_heads: u32 = 0,
 
     pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !NgramTable {
         var source = (try embedded_ple.openEmbedded(model_dir, expected)) orelse return error.EmbeddedPleMissing;
@@ -318,7 +325,7 @@ pub const NgramTable = struct {
 
     /// Bytes of one row's `part` (weight, scales, biases; a GGUF row is all weight).
     fn partLen(self: *const NgramTable, part: usize) usize {
-        if (self.fmt == .ggml) return if (part == 0) self.row_bytes else 0;
+        if (self.fmt == .ggml or self.fmt == .trellis) return if (part == 0) self.row_bytes else 0;
         return if (part == 0) self.wcols * 4 else self.scols * embedded_ple.scaleBytes(self.fmt);
     }
 
@@ -365,6 +372,7 @@ pub const NgramTable = struct {
         const meta_v = obj.get("__metadata__") orelse return error.NgramTableHeader;
         if (meta_v != .object) return error.NgramTableHeader;
         const meta = meta_v.object;
+        if (meta.get("format")) |f| if (f == .string and std.mem.eql(u8, f.string, "exl3_ngram_trellis")) return parseTrellis(map, obj, meta, data_off);
         if (meta.get("format")) |f| {
             if (f != .string or !std.mem.eql(u8, f.string, "mlx-serve-ngram")) return error.NgramTableHeader;
         } else if (!stamp_warned) {
@@ -424,7 +432,54 @@ pub const NgramTable = struct {
         };
     }
 
+    /// The `exl3_ngram_trellis` format: one I16 tensor `<name>.trellis` [rows, 1 + dim*K/16], each row its ring's
+    /// f16 scale and then its dim*K-bit stream (symbol i at stream bits [i*K, (i+1)*K)). Metadata: `K` 2..8,
+    /// `row_dim`, codebook MUL1.
+    fn parseTrellis(map: []align(std.heap.page_size_min) const u8, obj: std.json.ObjectMap, meta: std.json.ObjectMap, data_off: usize) !NgramTable {
+        const k_v = meta.get("K") orelse return error.NgramTableHeader;
+        const dim_v = meta.get("row_dim") orelse return error.NgramTableHeader;
+        if (k_v != .string or dim_v != .string) return error.NgramTableHeader;
+        const k = std.fmt.parseInt(u32, k_v.string, 10) catch return error.NgramTableHeader;
+        if (k < 2 or k > 8) return error.NgramTableBits;
+        const dim = std.fmt.parseInt(u32, dim_v.string, 10) catch return error.NgramTableHeader;
+        if (dim == 0 or dim > max_trellis_dim or (dim * k) % 16 != 0) return error.NgramTableHeader;
+        if (meta.get("codebook")) |c| if (c != .string or !std.mem.eql(u8, c.string, "mul1")) return error.NgramTableHeader;
+        var key: ?[]const u8 = null;
+        var it = obj.iterator();
+        while (it.next()) |e| if (std.mem.endsWith(u8, e.key_ptr.*, ".trellis")) {
+            if (key != null) return error.NgramTableHeader;
+            key = e.key_ptr.*;
+        };
+        const r = try headerRegion(obj, key orelse return error.NgramTableHeader, "I16", 2, map.len, data_off);
+        if (r.cols != 1 + (dim * k) / 16) return error.NgramTableHeader;
+        return .{
+            .map = map,
+            .rows = r.rows,
+            .dim = dim,
+            .bits = k,
+            .group_size = 0,
+            .w_off = data_off + @as(usize, @intCast(r.start)),
+            .s_off = 0,
+            .b_off = 0,
+            .wcols = @intCast(r.cols),
+            .scols = 0,
+            .fmt = .trellis,
+            .row_bytes = @intCast(r.cols * 2),
+        };
+    }
+
+    /// A trellis table's per-head bias, `n_heads` rows of `dim` (copied).
+    pub fn setHeadBias(self: *NgramTable, bias: []const f32, n_heads: u32) !void {
+        if (self.fmt != .trellis or n_heads == 0 or bias.len != @as(usize, n_heads) * self.dim) return error.NgramTableMismatch;
+        const own = try std.heap.page_allocator.dupe(f32, bias);
+        if (self.head_bias) |old| std.heap.page_allocator.free(old);
+        self.head_bias = own;
+        self.n_heads = n_heads;
+    }
+
     pub fn close(self: *NgramTable) void {
+        if (self.head_bias) |hb| std.heap.page_allocator.free(hb);
+        self.head_bias = null;
         if (self.warm_thread) |th| {
             self.warm_stop.store(true, .release);
             th.join();
@@ -586,7 +641,7 @@ pub const NgramTable = struct {
             self.dequantRow(parts.weight, parts.scales, parts.biases, out);
             return;
         }
-        if (self.fmt == .ggml) return self.dequantRow(self.map[self.w_off + r * self.row_bytes ..][0..self.row_bytes], &.{}, &.{}, out);
+        if (self.fmt == .ggml or self.fmt == .trellis) return self.dequantRow(self.map[self.w_off + r * self.row_bytes ..][0..self.row_bytes], &.{}, &.{}, out);
         // Raw BF16 arm: straight convert, no scales/biases.
         if (self.bits == 16) {
             const raw = self.map[self.w_off + r * self.dim * 2 ..][0 .. self.dim * 2];
@@ -604,6 +659,7 @@ pub const NgramTable = struct {
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
         if (self.fmt == .nvfp4) return dequantNvfp4Row(words, scales, self.embedded.?.scale, out[0..self.dim]);
+        if (self.fmt == .trellis) return trellisRow(words, self.bits, out[0..self.dim]);
         // The type and the row length were proven by a row at open.
         if (self.fmt == .ggml) return gguf.quants.dequantize(self.ggml, words, out[0..self.dim]) catch unreachable;
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
@@ -628,6 +684,7 @@ pub const NgramTable = struct {
     /// `[ids.len / n_heads][n_heads * dim]` row-major. `kv_len` is the context position this
     /// gather runs at and picks the wide arm; the output is byte-identical either way.
     pub fn gather(self: *const NgramTable, row_ids: []const i64, out: []f32, kv_len: u64) void {
+        defer self.addHeadBias(row_ids.len, out);
         // Raw BF16 arm rides no pool (single region, no dequant): serial walk.
         if (self.bits == 16) return self.gatherSerial(row_ids, out);
         const need: usize = self.partLen(0) + 2 * self.partLen(1);
@@ -646,6 +703,16 @@ pub const NgramTable = struct {
         self.gatherSerial(row_ids, out);
     }
 
+    /// Row i of a gather's `rows` rows plus its head's bias (a trellis table's; others carry none).
+    fn addHeadBias(self: *const NgramTable, rows: usize, out: []f32) void {
+        const hb = self.head_bias orelse return;
+        const dim: usize = self.dim;
+        for (0..rows) |i| {
+            const b = hb[(i % self.n_heads) * dim ..][0..dim];
+            for (out[i * dim ..][0..dim], b) |*o, v| o.* += v;
+        }
+    }
+
     /// One (row, region) pread into the pool's row buffer. False on a short read.
     fn preadSite(self: *const NgramTable, r: u64, region: usize, buf: []u8) bool {
         if (comptime @import("builtin").os.tag == .windows) unreachable; // `open` refuses on Windows
@@ -660,6 +727,33 @@ pub const NgramTable = struct {
         return crt.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 };
+
+/// The widest trellis ring a table may have: `trellisRow`'s stack buffer.
+const max_trellis_dim = 1024;
+
+/// One `exl3_ngram_trellis` row (`raw`: its f16 scale, then dim*K bits) into `out` (dim values): value i is the MUL1
+/// codeword of state i times the scale, state i the K-bit symbols i, i-1, ... (circular over the row) stacked from
+/// bit 0 and cut to 16 bits.
+fn trellisRow(raw: []const u8, k: u32, out: []f32) void {
+    const dim = out.len;
+    const scale: f32 = exl3_codebook.f16BitsToF32(std.mem.readInt(u16, raw[0..2], .little));
+    const stream = raw[2..][0 .. dim * k / 8];
+    const mask: u32 = (@as(u32, 1) << @intCast(k)) - 1;
+    var syms: [max_trellis_dim]u32 = undefined;
+    for (syms[0..dim], 0..) |*sym, i| {
+        const bit = i * k;
+        const lo: u32 = stream[bit >> 3];
+        // A symbol spans at most two bytes; the last one may end on the stream's last byte.
+        const hi: u32 = if ((bit >> 3) + 1 < stream.len) stream[(bit >> 3) + 1] else 0;
+        sym.* = ((lo | hi << 8) >> @intCast(bit & 7)) & mask;
+    }
+    const stack: usize = (15 + k) / k;
+    for (out, 0..) |*o, i| {
+        var state: u32 = 0;
+        for (0..stack) |j| state |= syms[(i + dim * stack - j) % dim] << @intCast(j * k);
+        o.* = exl3_codebook.f16BitsToF32(exl3_codebook.decodeMul1(@truncate(state))) * scale;
+    }
+}
 
 const E2M1 = [16]f32{ 0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6 };
 
@@ -1555,6 +1649,73 @@ const NGRAM_GOOD_HEADER =
     "\"scales\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[128,144]}," ++
     "\"biases\":{\"dtype\":\"BF16\",\"shape\":[4,2],\"data_offsets\":[144,160]}}";
 const NGRAM_GOOD_BYTES = 160;
+
+/// A trellis table image: `rows` rows of a scale word and `stream` bytes each, at K `k` and `dim` symbols.
+fn trellisTestTable(comptime k: u32, comptime dim: u32, rows: []const struct { scale: u16, stream: []const u8 }) !NgramTable {
+    const cols = 1 + dim * k / 16;
+    var hb: [384]u8 = undefined;
+    const header = try std.fmt.bufPrint(&hb, "{{\"__metadata__\":{{\"format\":\"exl3_ngram_trellis\",\"K\":\"{d}\",\"row_dim\":\"{d}\",\"codebook\":\"mul1\"}},\"t.ple_embedding.trellis\":{{\"dtype\":\"I16\",\"shape\":[{d},{d}],\"data_offsets\":[0,{d}]}}}}", .{ k, dim, rows.len, cols, rows.len * cols * 2 });
+    const buf = try ngramTestImage(header, rows.len * cols * 2);
+    for (rows, 0..) |r, i| {
+        const at = buf[520 + i * cols * 2 ..];
+        std.mem.writeInt(u16, at[0..2], r.scale, .little);
+        @memcpy(at[2..][0 .. dim * k / 8], r.stream);
+    }
+    return NgramTable.parse(buf, buf[8..520], 520);
+}
+
+fn mul1Value(state: u32) f32 {
+    return exl3_codebook.f16BitsToF32(exl3_codebook.decodeMul1(@truncate(state)));
+}
+
+test "ngram trellis table: each value is MUL1 of the ring's stacked symbols times the row scale, plus its head's bias" {
+    // K 8: a symbol per byte, state i = s[i] | s[i-1] << 8 around the ring.
+    const s8 = [16]u8{ 3, 250, 17, 0, 99, 128, 7, 64, 200, 1, 33, 90, 255, 12, 5, 77 };
+    const s8b = [16]u8{ 9, 8, 7, 6, 5, 4, 3, 2, 1, 0, 11, 22, 33, 44, 55, 66 };
+    var t = try trellisTestTable(8, 16, &.{ .{ .scale = 0x3C00, .stream = &s8 }, .{ .scale = 0x4000, .stream = &s8b } });
+    defer std.heap.page_allocator.free(@constCast(t.map));
+    try testing.expectEqual(embedded_ple.Format.trellis, t.fmt);
+    try testing.expectEqual(@as(u64, 2), t.rows);
+    var row: [16]f32 = undefined;
+    t.row(0, &row);
+    for (row, 0..) |v, i| try testing.expectEqual(mul1Value(@as(u32, s8[i]) | @as(u32, s8[(i + 15) % 16]) << 8), v);
+    // Rows [1, 0] of two heads: the second gathered row takes head 1's bias.
+    var bias: [32]f32 = undefined;
+    for (&bias, 0..) |*b, i| b.* = @floatFromInt(i);
+    try t.setHeadBias(&bias, 2);
+    defer std.heap.page_allocator.free(t.head_bias.?);
+    var out: [32]f32 = undefined;
+    t.gather(&.{ 1, 0 }, &out, 0);
+    for (0..16) |i| {
+        try testing.expectEqual(mul1Value(@as(u32, s8b[i]) | @as(u32, s8b[(i + 15) % 16]) << 8) * 2.0 + bias[i], out[i]);
+        try testing.expectEqual(row[i] + bias[16 + i], out[16 + i]);
+    }
+    try testing.expectError(error.NgramTableMismatch, t.setHeadBias(bias[0..16], 2));
+}
+
+test "ngram trellis table: K 2 stacks eight symbols, across bytes and around the ring" {
+    const stream = [2]u8{ 0b11_10_01_00, 0b00_01_11_10 };
+    const t = try trellisTestTable(2, 8, &.{.{ .scale = 0x3C00, .stream = &stream }});
+    defer std.heap.page_allocator.free(@constCast(t.map));
+    const syms = [8]u32{ 0, 1, 2, 3, 2, 3, 1, 0 };
+    var row: [8]f32 = undefined;
+    t.row(0, &row);
+    for (row, 0..) |v, i| {
+        var state: u32 = 0;
+        for (0..8) |j| state |= syms[(i + 8 - j) % 8] << @intCast(2 * j);
+        try testing.expectEqual(mul1Value(state), v);
+    }
+}
+
+test "ngram trellis table: another codebook, a K past 8 or a row its shape cannot hold is a named error" {
+    const bad = [_][]const u8{
+        "{\"__metadata__\":{\"format\":\"exl3_ngram_trellis\",\"K\":\"8\",\"row_dim\":\"16\",\"codebook\":\"mcg\"},\"t.trellis\":{\"dtype\":\"I16\",\"shape\":[1,9],\"data_offsets\":[0,18]}}",
+        "{\"__metadata__\":{\"format\":\"exl3_ngram_trellis\",\"K\":\"8\",\"row_dim\":\"16\"},\"t.trellis\":{\"dtype\":\"I16\",\"shape\":[1,8],\"data_offsets\":[0,16]}}",
+        "{\"__metadata__\":{\"format\":\"exl3_ngram_trellis\",\"K\":\"8\",\"row_dim\":\"16\"},\"t.weight\":{\"dtype\":\"I16\",\"shape\":[1,9],\"data_offsets\":[0,18]}}",
+    };
+    for (bad) |h| try testing.expectError(error.NgramTableHeader, ngramTestParse(h, 18));
+    try testing.expectError(error.NgramTableBits, ngramTestParse("{\"__metadata__\":{\"format\":\"exl3_ngram_trellis\",\"K\":\"9\",\"row_dim\":\"16\"},\"t.trellis\":{\"dtype\":\"I16\",\"shape\":[1,10],\"data_offsets\":[0,20]}}", 20));
+}
 
 test "ngram table header: a missing or wrong-typed field is a named error, never a trap" {
     const t = try ngramTestParse(NGRAM_GOOD_HEADER, NGRAM_GOOD_BYTES);
