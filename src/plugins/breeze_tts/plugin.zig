@@ -254,10 +254,11 @@ const fx_cb_eos: u64 = fx_cb_lm - 1; // the lm_head's last row, the reference's 
 /// A generated toy Breeze-TTS-2 with random weights: a 64-row text-encoder table, 2/4/2
 /// transformer layers at 64/32-wide hiddens, a byte-level tokenizer, and the full-size Mimi
 /// codec decoder (the encoder loads lazily for clone requests, which the conformance body never
-/// sends). "hi" budgets a handful of frames; lm_head's tall negative EOS column on dim 0 keeps
-/// frame 0 from sampling EOS (that column's sign is deterministic for this fixture), so the job
-/// always synthesizes at least one frame. Everything a seeded run produces is reproducible,
-/// which is all the suite asks of it.
+/// sends). "hi" budgets a handful of frames; the lm_head's EOS row is shaped
+/// so frame 0 cannot sample it but a later frame can — the fixture job
+/// synthesizes a few frames and STOPS on EOS, and the suite asserts the WAV
+/// ends well under the frame cap. Everything a seeded run produces is
+/// reproducible.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     const T = sdk.tensors.Tensors;
     const th: u64 = fx_te_heads * fx_te_head_dim;
@@ -322,23 +323,21 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     }
     // The depth head reads rows [o][v] of a flat [15, d_hidden, cb_vocab] table.
     try t.rand("depth_decoder.codebooks_head.weight", .{}, &.{ fx_codebooks - 1, fx_dh, fx_cb_vocab }, .BF16, 0.02);
-    // Noise everywhere, plus a guard on the EOS row: frame 0 cannot sample
-    // EOS (every run synthesizes at least one frame); a later EOS is as
-    // deterministic as anything else.
     {
+        // The stop must FIRE and LOSE frame 0. The row is −h₀ (the fixture's
+        // pinned frame-0 hidden) plus a +5 hook on dim 6: frame 0's dot is
+        // −‖h₀‖² + 5·h₀[6], deeply under the noise rows, while any later
+        // hidden that decorrelates from h₀ carries the hook to the top and
+        // EOS wins the draw.
         const v = try a.alloc(f32, fx_cb_lm * fx_bh);
         var prng = std.Random.DefaultPrng.init(99);
         for (v) |*x| x.* = prng.random().floatNorm(f32) * 0.02;
-
-        // EOS must LOSE frame 0 (the run synthesizes ≥1 frame) but stay
-        // REACHABLE later — an unreachable EOS is a generation that runs to
-        // the cap, exactly the #1172 bug (the old guard zeroed the row,
-        // making logit_eos ≡ 0, never the argmax). Keep the row's noise and
-        // zero ONE column: frame 0's hidden is a fixed f32 dot product with
-        // h[0] = -1.22 ≠ 0, so logit_eos = Σ_{i>0} w_i·h_i loses frame 0's
-        // argmax to a noise row; a later hidden whose dot product clears the
-        // noise band wins the draw and EOS fires.
-        v[fx_cb_eos * fx_bh] = 0;
+        const fixture_frame0_hidden = [_]f32{
+            -1.2265625, -1.0859375, -0.23730469, -1.6015625, -2.46875, -0.02368164, -0.78125, -1.15625,
+        };
+        @memset(v[fx_cb_eos * fx_bh ..][0..fx_bh], 0);
+        for (fixture_frame0_hidden, 0..) |x, i| v[fx_cb_eos * fx_bh + i] = -x;
+        v[fx_cb_eos * fx_bh + 6] += 5.0;
         try t.values("lm_head.weight", .{}, &.{ fx_cb_lm, fx_bh }, .BF16, v);
     }
 
@@ -477,6 +476,10 @@ test "breeze_tts plugin: a fixture job is a deterministic WAV; misuse is refused
     const first = try arena.allocator().dupe(u8, run1.ok);
     try testing.expectEqualStrings("RIFF", first[0..4]);
     try testing.expect(first.len > 44);
+    // The stop fires: "hi" budgets 6 frames (estimateFrames) = 6·1920 samples
+    // at 24 kHz; a dead EOS runs to that cap instead of stopping under it.
+    const cap_bytes: u64 = 44 + 2 * (6 * 1920);
+    try testing.expect(first.len < cap_bytes);
     try testing.expectEqualSlices(u8, first, (try pack.run(pack.fx.body)).ok);
     try testing.expectEqualStrings("this route needs text in 'input'", (try pack.run("{}")).refused.why.slice());
     // Without the host's message buffer, refuseFmt falls back to its short why; the per-field

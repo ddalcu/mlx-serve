@@ -45,9 +45,9 @@ design, `S0`..`S9` speaker slots, and zero-shot voice cloning (base64 reference 
   because Breeze detects it itself.
 - The turn's stop is `Config.cbEos()` — the lm_head's LAST row (`audio_vocab_size`, the
   reference's `eos_token = vocab_size`). `audio_vocab_size - 1` is the PAD row: a stop
-  compared there can never fire and every request runs to the frame cap (field report: 30 s
-  of babble per line). The toy fixture's frame-0 EOS guard must leave the row otherwise
-  noise-filled — a zeroed row is an unreachable EOS, the same failure mode in fixture form.
+  compared there can never fire and every request runs to the frame cap. The fixture's
+  lm_head shapes the EOS row so frame 0 cannot sample it and a later frame can; the
+  plugin test's WAV-length bar is what catches a dead stop.
 - `billRequest` prices the frame loop's host rows (stream + span + depth span + codec chain) from
   the pack's config and the body's frame budget, with margin; the engine refuses a request past
   the window at step time, this keeps admission honest.

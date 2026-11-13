@@ -428,9 +428,7 @@ test "parseConfig: the published pack's config.json reads as-is" {
     try testing.expectEqual(@as(u32, 262146), cfg.speaker_base);
     try testing.expectEqual(@as(u32, 2051), cfg.cbVocab());
     try testing.expectEqual(@as(u32, 2052), cfg.cbLm());
-    // The stop is the lm_head's LAST row; audio_vocab_size-1 is the PAD row
-    // and comparing it never stopped a generation (field report, #1172).
-    try testing.expectEqual(@as(u32, 2051), cfg.cbEos());
+    try testing.expectEqual(@as(u32, 2051), cfg.cbEos()); // the head's LAST row
     try testing.expect(cfg.supportedLayout());
 }
 

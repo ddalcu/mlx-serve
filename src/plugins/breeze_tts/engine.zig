@@ -1514,10 +1514,6 @@ pub const Engine = struct {
         const cbv: usize = @intCast(self.cfg.cbVocab());
         const cb_lm: usize = @intCast(self.cfg.cbLm());
         const stride: usize = @intCast(self.cfg.cbStride());
-        // The stop is the lm_head's LAST row (2051): the reference's
-        // `eos_token = vocab_size` (breeze-tts-mlx runtime.py). Row
-        // cbVocab-1 (2050) is the PAD token — the stop never fired there
-        // and every request ran to the frame cap. One story: cfg.cbEos().
         const cb_eos: u32 = self.cfg.cbEos();
         const max_seq: usize = @intCast(self.cfg.max_seq);
         const max_code = self.cfg.codebook_size;
