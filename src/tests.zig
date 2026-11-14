@@ -88,6 +88,7 @@ test {
     _ = @import("host/plugin_host_impl.zig");
     _ = @import("host/plugin_ane.zig");
     _ = @import("sdk/util/os_mutex.zig");
+    _ = @import("sdk/util/hf_hub.zig");
     _ = @import("sdk/util/crt.zig");
     _ = @import("sdk/util/rtfmt.zig");
     _ = @import("env.zig");

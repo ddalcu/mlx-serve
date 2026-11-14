@@ -20,6 +20,8 @@ Outside plugins (dylibs built with the plugin kit, [plugins.md](plugins.md)) loa
 
 Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Models land in a shared `~/.mlx-serve/models` store the MLX-Serve app uses too.
 
+Where Hugging Face is slow or blocked, set `HF_ENDPOINT` to a mirror (`export HF_ENDPOINT=https://hf-mirror.com`): `pull`, `run`, `/api/pull` and the app's downloads all fetch from it, including on the server the app starts, which takes the value from your login shell. `HF_TOKEN` is sent to that endpoint too.
+
 ## Driving the server directly
 
 What you want for scripts, launchd, or a headless Mac:
