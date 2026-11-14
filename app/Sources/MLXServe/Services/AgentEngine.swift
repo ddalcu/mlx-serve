@@ -69,6 +69,11 @@ enum AgentEngine {
     /// (Gemma 4 E4B) cannot continue without one. Shared with `TestServer`.
     static let toolRoundNudge = "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."
 
+    /// Ends a tool result the history cut short, so the model knows it reads part of it and can ask again.
+    static func toolResultCutMarker(dropped: Int) -> String {
+        "\n[\(dropped) more characters of this earlier result were cut; call the tool again to read them]"
+    }
+
     /// Build API-ready message history from chat messages with budget-aware truncation.
     ///
     /// Pins all user messages (they carry critical facts — name, preferences, task
@@ -233,10 +238,12 @@ enum AgentEngine {
                 let unanswered = lastReplyIdx.map { i > $0 } ?? true
                 let limit = unanswered ? msg.content.count : (isRecent ? recentLimit : olderLimit)
                 toolResultsSeen += 1
+                let dropped = msg.content.count - limit
                 history.append([
                     "role": "tool",
                     "tool_call_id": callId,
-                    "content": String(msg.content.prefix(limit)),
+                    "content": dropped > 0 ? String(msg.content.prefix(limit)) + Self.toolResultCutMarker(dropped: dropped)
+                                           : msg.content,
                 ])
                 continue
             }

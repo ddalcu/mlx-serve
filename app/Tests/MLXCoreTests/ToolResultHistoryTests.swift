@@ -49,6 +49,18 @@ final class ToolResultHistoryTests: XCTestCase {
 
     func testAnAnsweredResultIsStillCompacted() {
         let msgs = [ChatMessage(role: .user, content: "read it"), call("a"), result("a", 7000), call("b"), result("b", 300)]
-        XCTAssertEqual(toolResultLengths(msgs), [2000, 300])
+        let kept = 2000 + AgentEngine.toolResultCutMarker(dropped: 5000).count
+        XCTAssertEqual(toolResultLengths(msgs), [kept, 300])
+    }
+
+    /// A compacted result says it was cut and by how much (#1085): cut silently, the model works from part of a
+    /// file as if it were the whole.
+    func testACompactedResultSaysItWasCut() {
+        let msgs = [ChatMessage(role: .user, content: "read it"), call("a"), result("a", 7000), call("b"), result("b", 300)]
+        let tools = AgentEngine.buildAgentHistory(messages: msgs, contextLength: 131072, maxTokens: 4096)
+            .filter { ($0["role"] as? String) == "tool" }.compactMap { $0["content"] as? String }
+        XCTAssertTrue(tools[0].hasSuffix(AgentEngine.toolResultCutMarker(dropped: 5000)))
+        XCTAssertTrue(tools[0].contains("5000"))
+        XCTAssertEqual(tools[1], String(repeating: "x", count: 300), "an uncut result carries no marker")
     }
 }
