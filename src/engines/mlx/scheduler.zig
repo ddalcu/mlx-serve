@@ -263,6 +263,7 @@ pub fn init(
         .warmup_full = params.warmup_full,
         .prefix_cache_capacity = params.prefix_cache_capacity,
         .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
+        .memory_pressure = @import("cache/budget.zig").memoryPressureGauge(),
         .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
         .prefix_cache_mem_resolver = if (params.prefix_cache_clamp) &@import("admission/hot_cache_plan.zig").prefixCacheMemForLoad else null,
         .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
