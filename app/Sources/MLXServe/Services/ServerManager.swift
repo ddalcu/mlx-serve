@@ -972,6 +972,10 @@ class ServerManager: ObservableObject {
     /// The app's environment plus the bundled frameworks the engine loads its dylibs from.
     nonisolated static func launchEnvironment() -> [String: String] {
         var env = ProcessInfo.processInfo.environment
+        // The server's own pulls (`/api/pull`, `run`) must reach the hub the user's shell names: a Finder launch
+        // has no shell environment to inherit it from.
+        let hf = LoginShellEnv.huggingFaceEnvironment(process: env)
+        for name in ["HF_ENDPOINT", "HF_TOKEN"] where env[name] == nil { env[name] = hf[name] }
         if let frameworksPath = Bundle.main.privateFrameworksPath {
             let existing = env["DYLD_LIBRARY_PATH"] ?? ""
             env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"

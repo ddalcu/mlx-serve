@@ -13,6 +13,9 @@ mlx-serve launch claude     # configure + launch a coding agent CLI against the 
 mlx-serve plugin new toy    # start a plugin from the plugin kit (--media, --quant, --engine; also: check, fixture, install)
 ```
 
+Downloads come from Hugging Face. Behind a mirror, `HF_ENDPOINT=https://hf-mirror.com` (any hub URL) moves `pull`,
+`run` and the server's own downloads to it; `HF_TOKEN`, for gated repos, is sent to that hub.
+
 Outside plugins (dylibs built with the plugin kit, [plugins.md](plugins.md)) load from `~/.mlx-serve/plugins/` when
 `~/.mlx-serve/plugins.json` says `"enabled": true`; `--no-plugins` turns them off for one run.
 
