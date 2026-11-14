@@ -13,6 +13,7 @@ const kc = @import("../../testing/kernel_contract/root.zig");
 const gates = @import("gates.zig");
 const attn256 = @import("attn256.zig");
 const row_attn = @import("row_attn.zig");
+const sdpa_rows = @import("sdpa_rows.zig");
 const lane_attn = @import("lane_attn.zig");
 const kvq = @import("kv_quant_attn.zig");
 const nax = @import("nax_attention.zig");
@@ -2726,6 +2727,448 @@ const nax_registrations = .{
     .{ "msv_nax_attn_256_q8 bf16 (causal, int8 Q/K)", NaxCfg{ .dk = 256, .q8 = true, .gqa = 4 }, qk(&.{ .{ 2, 128, 300 }, .{ 2, 64, 64 } }), &nax_q8 },
 };
 
+// ── the exact verify's rows on MLX's vector kernels (sdpa_rows.zig: each row its one-row call's words) ──
+
+const VR_QK = 192;
+const VR_V = 128;
+const VR_TK = 4;
+
+// M1/M2 limits: 1024 recorded, not yet derived with the offline check.
+const vr_1p_launch = metal.Launch{
+    .name = "msv_sdpa_rows_1p",
+    .inputs = &sdpa_rows.IN_ROWS,
+    .outputs = &sdpa_rows.OUT_ROWS,
+    .source = sdpa_rows.SOURCE_1P,
+    .contiguous = false,
+    // outputs [32 * 32], max_scores and sum_exp_scores [32], f32.
+    .tg_bytes = (32 * 32 + 2 * 32) * 4,
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+const vr_2p1_launch = metal.Launch{
+    .name = "msv_sdpa_rows_2p1",
+    .inputs = &sdpa_rows.IN_ROWS,
+    .outputs = &sdpa_rows.OUT_PASS1,
+    .source = sdpa_rows.SOURCE_2P1,
+    .contiguous = false,
+    .tg_bytes = 0,
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+const vr_2p2_launch = metal.Launch{
+    .name = "msv_sdpa_rows_2p2",
+    .inputs = &sdpa_rows.IN_PASS2,
+    .outputs = &sdpa_rows.OUT_ROWS,
+    .source = sdpa_rows.SOURCE_2P2,
+    .contiguous = false,
+    // outputs [32 * 32], f32.
+    .tg_bytes = 32 * 32 * 4,
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+/// Pass 2's dispatch over `h` heads, `r` rows and `b` blocks a row.
+fn vrMergeGeometry(h: usize, r: usize, b: usize) ?metal.Geometry {
+    if (r < 1 or r > 16 or b < 32 or b % 32 != 0) return null;
+    var g = metal.Geometry{ .grid = .{ cInt(h * 1024), cInt(r), 1 }, .tg = .{ 1024, 1, 1 } };
+    g.out(&.{ 1, cInt(h), cInt(r), VR_V }, .bfloat16);
+    g.dtype("T", .bfloat16);
+    g.int("V", VR_V);
+    return g;
+}
+
+const VrKind = enum { one, pass1 };
+
+/// The one-pass kernel or pass 1 over q [1, H, R, 192] and the cache views k [1, H, T, 192], v [1, H, T, 128] (the
+/// first T = N0 + R - 1 rows of longer buffers), row r over its own N0 + r keys. rows = heads, n = R, k = N0.
+const VecRows = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch,
+    kind: VrKind,
+    blocks: usize,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    scale: f64 = 0,
+    q: []f64 = &.{},
+    k: []f64 = &.{},
+    v: []f64 = &.{},
+    args: [5]mlx.mlx_array = undefined,
+    owned: [2]mlx.mlx_array = @splat(.{ .ctx = null }),
+
+    fn init(a: std.mem.Allocator, launch: *const metal.Launch, kind: VrKind, blocks: usize) VecRows {
+        return .{ .rig = metal.Rig.init(a), .launch = launch, .kind = kind, .blocks = blocks, .arena = .init(a) };
+    }
+
+    fn freeOwned(self: *VecRows) void {
+        for (&self.owned) |*x| if (x.ctx != null) {
+            _ = mlx.mlx_array_free(x.*);
+            x.* = .{ .ctx = null };
+        };
+    }
+
+    pub fn deinit(self: *VecRows) void {
+        self.freeOwned();
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    fn keys(shape: Shape) usize {
+        return shape.k + shape.n - 1;
+    }
+
+    pub fn geometry(self: *const VecRows, shape: Shape) ?metal.Geometry {
+        if (shape.n < 1 or shape.n > 16 or shape.k < 1) return null;
+        const h = cInt(shape.rows);
+        const r = cInt(shape.n);
+        switch (self.kind) {
+            .one => {
+                var g = metal.Geometry{ .grid = .{ h * 1024, r, 1 }, .tg = .{ 1024, 1, 1 } };
+                g.out(&.{ 1, h, r, VR_V }, .bfloat16);
+                g.dtype("T", .bfloat16);
+                g.int("D", VR_QK);
+                g.int("V", VR_V);
+                return g;
+            },
+            .pass1 => {
+                const b = cInt(self.blocks);
+                var g = metal.Geometry{ .grid = .{ h * 32, 1, b * r }, .tg = .{ 32, 1, r } };
+                g.out(&.{ h, r, b, VR_V }, .bfloat16);
+                g.out(&.{ h, r, b }, .float32);
+                g.out(&.{ h, r, b }, .float32);
+                g.dtype("T", .bfloat16);
+                g.int("D", VR_QK);
+                g.int("V", VR_V);
+                g.int("BLOCKS", b);
+                g.int("TK", VR_TK);
+                return g;
+            },
+        }
+    }
+
+    pub fn prepare(self: *VecRows, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        self.freeOwned();
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rng = prng.random();
+        const h = shape.rows;
+        const t = keys(shape);
+        if (fill == .stress) {
+            // A power-of-two scale keeps the kernel's pre-scaled query exact.
+            self.q = try a.alloc(f64, h * shape.n * VR_QK);
+            self.k = try host.ints(a, rng, h * t * VR_QK, 0, 127);
+            stressRows(rng, self.q, self.k, VR_QK, STRESS_Q);
+            self.scale = 1.0 / 16.0;
+        } else {
+            self.q = try host.uniform(a, rng, h * shape.n * VR_QK, -2, 2, .bfloat16);
+            self.k = try host.uniform(a, rng, h * t * VR_QK, -2, 2, .bfloat16);
+            self.scale = host.rt(.float32, 1 / @sqrt(@as(f64, VR_QK)));
+        }
+        self.v = try host.uniform(a, rng, h * t * VR_V, -2, 2, .bfloat16);
+        if (fill == .nonfinite) {
+            host.plant(self.q, h * shape.n, VR_QK);
+            host.plant(self.v, h * t, VR_V);
+        }
+        self.rig.reset();
+        const rig = &self.rig;
+        const q = try rig.input(.bfloat16, &.{ 1, cInt(h), cInt(shape.n), VR_QK }, self.q);
+        const cap = t + 24;
+        var pad = std.Random.DefaultPrng.init(91);
+        for ([_][]const f64{ self.k, self.v }, [_]usize{ VR_QK, VR_V }, 0..) |src, d, i| {
+            const buf = try host.uniform(a, pad.random(), h * cap * d, -1, 1, .bfloat16);
+            for (0..h) |hh| @memcpy(buf[hh * cap * d ..][0 .. t * d], src[hh * t * d ..][0 .. t * d]);
+            const full = try rig.input(.bfloat16, &.{ 1, cInt(h), cInt(cap), cInt(d) }, buf);
+            self.owned[i] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&self.owned[i], full, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, cInt(h), cInt(t), cInt(d) }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, rig.stream()));
+        }
+        const p = [_]f64{ 0, @floatFromInt(shape.k), @floatFromInt(self.blocks) };
+        self.args = .{ q, self.owned[0], self.owned[1], try rig.input(.int32, &.{3}, &p), try rig.input(.float32, &.{1}, &.{self.scale}) };
+        return true;
+    }
+
+    pub fn run(self: *VecRows) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const VecRows) usize {
+        const hr = self.shape.rows * self.shape.n;
+        return if (self.kind == .one) hr * VR_V else hr * self.blocks * (VR_V + 2);
+    }
+
+    fn kRow(self: *const VecRows, hh: usize, i: usize) []const f64 {
+        return self.k[(hh * keys(self.shape) + i) * VR_QK ..][0..VR_QK];
+    }
+
+    fn vRow(self: *const VecRows, hh: usize, i: usize) []const f64 {
+        return self.v[(hh * keys(self.shape) + i) * VR_V ..][0..VR_V];
+    }
+
+    /// Lane `j` of `stride` lanes over row `n` keys: its online state, keys j, j + stride, ..., each its own update
+    /// from the kernel's finite-min start. The query arrives pre-scaled and rounded to f32, as the kernel reads it.
+    fn lane(self: *const VecRows, hh: usize, qs: []const f64, n: usize, j: usize, stride: usize, ks: []Key, ends: []usize, terms: []f64, sim: Sim, o: []f64, eo: []f64) Row {
+        var c: usize = 0;
+        var i = j;
+        while (i < n) : (i += stride) {
+            const d = dot(qs, self.kRow(hh, i), 1, 13, 0, sim, terms);
+            ks[c] = .{ .s = d.v, .e = d.e, .v = self.vRow(hh, i) };
+            ends[c] = c + 1;
+            c += 1;
+        }
+        return online(.{}, .{ .m = FINITE_MIN }, ks[0..c], ends[0..c], o, eo);
+    }
+
+    fn emit(self: *const VecRows, want: []f64, mag: ?[]f64, sim: Sim) !void {
+        var arena = std.heap.ArenaAllocator.init(self.rig.a);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const sh = self.shape;
+        const R = sh.n;
+        const stride: usize = if (self.kind == .one) 32 else self.blocks;
+        const most = (keys(sh) + stride - 1) / stride + 1;
+        const ks = try a.alloc(Key, most);
+        const ends = try a.alloc(usize, most);
+        const terms = try a.alloc(f64, VR_QK);
+        const qs = try a.alloc(f64, VR_QK);
+        const lo = try a.alloc(f64, stride * VR_V);
+        const leo = try a.alloc(f64, stride * VR_V);
+        const lrow = try a.alloc(Row, stride);
+        const o = try a.alloc(f64, VR_V);
+        const eo = try a.alloc(f64, VR_V);
+        const parts = sh.rows * R * stride;
+        for (0..sh.rows) |hh| for (0..R) |r| {
+            const n = sh.k + r;
+            const row = hh * R + r;
+            for (qs, self.q[row * VR_QK ..][0..VR_QK]) |*d, x| d.* = host.rt(.float32, self.scale * x);
+            for (0..stride) |j| lrow[j] = self.lane(hh, qs, n, j, stride, ks, ends, terms, sim, lo[j * VR_V ..][0..VR_V], leo[j * VR_V ..][0..VR_V]);
+            if (self.kind == .pass1) {
+                for (0..stride) |b| {
+                    const at = row * stride + b;
+                    @memcpy(want[at * VR_V ..][0..VR_V], lo[b * VR_V ..][0..VR_V]);
+                    want[parts * VR_V + at] = lrow[b].l;
+                    want[parts * VR_V + parts + at] = lrow[b].m;
+                    if (mag) |m| {
+                        for (m[at * VR_V ..][0..VR_V], leo[b * VR_V ..][0..VR_V]) |*x, e| x.* = host.allowance(e);
+                        m[parts * VR_V + at] = host.allowance(lrow[b].el);
+                        m[parts * VR_V + parts + at] = host.allowance(lrow[b].em);
+                    }
+                }
+                continue;
+            }
+            // The 32 simdgroups joined as the kernel joins them: each weighed by exp(its max - the max), then o / l.
+            var mx = -inf;
+            for (lrow) |st| mx = @max(mx, st.m);
+            var l: f64 = 0;
+            var el: f64 = 0;
+            @memset(o, 0);
+            @memset(eo, 0);
+            const sums = spec.gamma(33, host.U);
+            for (lrow, 0..) |st, j| {
+                const f = @exp(st.m - mx);
+                const fe = host.fastExp(mx - st.m) + sums;
+                l += st.l * f;
+                el += (st.el + @abs(st.l) * fe) * f;
+                for (o, eo, lo[j * VR_V ..][0..VR_V], leo[j * VR_V ..][0..VR_V]) |*y, *e, x, xe| {
+                    y.* += x * f;
+                    e.* += (xe + @abs(x) * fe) * f;
+                }
+            }
+            normalize(.{ .m = mx, .em = 0, .l = l, .el = el }, o, eo);
+            @memcpy(want[row * VR_V ..][0..VR_V], o);
+            if (mag) |m| for (m[row * VR_V ..][0..VR_V], eo) |*x, e| {
+                x.* = host.allowance(e);
+            };
+        };
+    }
+
+    pub fn reference(self: *const VecRows, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const VecRows, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+
+    /// The declared launch, then (pass 1) the declared pass 2 on its outputs read back: the rows' final bytes.
+    fn declared(self: *VecRows, a: std.mem.Allocator) ![]u8 {
+        try self.run();
+        if (self.kind == .one) return a.dupe(u8, self.rig.outputBytes());
+        const sh = self.shape;
+        const h = cInt(sh.rows);
+        const r = cInt(sh.n);
+        const b = cInt(self.blocks);
+        var vals: [3][]f64 = undefined;
+        for (&vals, 0..) |*x, i| x.* = try host.read(a, self.rig.output(i), self.rig.stream());
+        defer for (vals) |x| a.free(x);
+        const ins = [_]mlx.mlx_array{
+            try self.rig.input(.bfloat16, &.{ h, r, b, VR_V }, vals[0]),
+            try self.rig.input(.float32, &.{ h, r, b }, vals[1]),
+            try self.rig.input(.float32, &.{ h, r, b }, vals[2]),
+            self.args[3],
+        };
+        try self.rig.launch(&vr_2p2_launch, vrMergeGeometry(sh.rows, sh.n, self.blocks).?, &ins);
+        return a.dupe(u8, self.rig.outputBytes());
+    }
+};
+
+/// Pass 2 over pass 1's layout: the partials (bf16), sums and maxs of R rows' blocks. rows = heads, n = R, k = blocks.
+const VecMerge = struct {
+    rig: metal.Rig,
+    launch: *const metal.Launch,
+    arena: std.heap.ArenaAllocator,
+    shape: Shape = undefined,
+    m: []f64 = &.{},
+    l: []f64 = &.{},
+    o: []f64 = &.{},
+    args: [4]mlx.mlx_array = undefined,
+
+    fn init(a: std.mem.Allocator, launch: *const metal.Launch) VecMerge {
+        return .{ .rig = metal.Rig.init(a), .launch = launch, .arena = .init(a) };
+    }
+
+    pub fn deinit(self: *VecMerge) void {
+        self.rig.deinit();
+        self.arena.deinit();
+    }
+
+    pub fn geometry(_: *const VecMerge, shape: Shape) ?metal.Geometry {
+        return vrMergeGeometry(shape.rows, shape.n, shape.k);
+    }
+
+    pub fn prepare(self: *VecMerge, shape: Shape, fill: spec.Fill, seed: u64) !bool {
+        if (self.geometry(shape) == null) return false;
+        self.shape = shape;
+        _ = self.arena.reset(.retain_capacity);
+        const a = self.arena.allocator();
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rows = shape.rows * shape.n;
+        try drawStates(a, prng.random(), rows, shape.k, VR_V, fill, &self.m, &self.l, &self.o);
+        if (fill == .stress) swamped(prng.random(), self.o, rows, shape.k);
+        for (self.o) |*x| x.* = host.rt(.bfloat16, x.*);
+        self.rig.reset();
+        const rig = &self.rig;
+        const h = cInt(shape.rows);
+        const r = cInt(shape.n);
+        const b = cInt(shape.k);
+        self.args = .{
+            try rig.input(.bfloat16, &.{ h, r, b, VR_V }, self.o),
+            try rig.input(.float32, &.{ h, r, b }, self.l),
+            try rig.input(.float32, &.{ h, r, b }, self.m),
+            try rig.input(.int32, &.{3}, &.{ 0, 0, @floatFromInt(shape.k) }),
+        };
+        return true;
+    }
+
+    pub fn run(self: *VecMerge) !void {
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
+    }
+
+    pub fn count(self: *const VecMerge) usize {
+        return self.shape.rows * self.shape.n * VR_V;
+    }
+
+    fn emit(self: *const VecMerge, want: []f64, mag: ?[]f64, sim: Sim) !void {
+        const nb = self.shape.k;
+        const a = self.rig.a;
+        const eo = try a.alloc(f64, VR_V);
+        defer a.free(eo);
+        const t = try a.alloc(f64, nb);
+        defer a.free(t);
+        for (0..self.shape.rows * self.shape.n) |r| {
+            const out = want[r * VR_V ..][0..VR_V];
+            var st = joinMax(self.m[r * nb ..][0..nb], self.l[r * nb ..][0..nb], self.o[r * nb * VR_V ..][0 .. nb * VR_V], VR_V, out, eo);
+            if (sim) |x| {
+                // Gate 4: the sums in its accumulator (the stress fill's weights are all 1).
+                for (t, 0..) |*v, c| v.* = self.l[r * nb + c];
+                st.l = spec.sumIn(x.acc, x.order, t);
+                for (out, 0..) |*y, i| {
+                    for (t, 0..) |*v, c| v.* = self.o[(r * nb + c) * VR_V + i];
+                    y.* = spec.sumIn(x.acc, x.order, t);
+                }
+            }
+            normalize(st, out, eo);
+            if (mag) |m| for (m[r * VR_V ..][0..VR_V], eo) |*x, e| {
+                x.* = host.allowance(e);
+            };
+        }
+    }
+
+    pub fn reference(self: *const VecMerge, want: []f64, mag: []f64) !void {
+        try self.emit(want, mag, null);
+    }
+
+    pub fn simulate(self: *const VecMerge, acc: spec.Accum, order: spec.Order, out: []f64) !void {
+        try self.emit(out, null, .{ .acc = acc, .order = order });
+    }
+};
+
+/// Pass 2's gate-4 partials: a row's blocks in runs of 32 (lane = block % 32); run 0 is B = 2^16 in every lane but
+/// lane 0's 1.5 B, the last run its negation, and one run of B / 256 in each subtree a pairwise sum joins to them
+/// (runs 1, 2, 4, .. and M - 2, M - 4, ..). A run sums to X = 2^21 + 2^15, whose even mantissa keeps X + 2^13 and
+/// X - 2^13 at X: bf16 drops every B / 256 in all three orders, fp16 cannot hold B, fp32 is exact.
+fn swamped(rng: std.Random, o: []f64, rows: usize, nb: usize) void {
+    const big: f64 = 0x1p16;
+    const runs = nb / 32;
+    @memset(o, 0);
+    for (0..rows) |r| for (0..VR_V) |i| {
+        const sign: f64 = if (rng.boolean()) 1 else -1;
+        const row = o[r * nb * VR_V ..][0 .. nb * VR_V];
+        for (0..32) |j| {
+            const v: f64 = if (j == 0) 1.5 * sign * big else sign * big;
+            row[j * VR_V + i] = v;
+            row[((runs - 1) * 32 + j) * VR_V + i] = -v;
+        }
+        var g: usize = 1;
+        while (4 * g <= runs) : (g *= 2) {
+            for (0..32) |j| {
+                row[(g * 32 + j) * VR_V + i] = sign * big / 256;
+                row[((runs - 2 * g) * 32 + j) * VR_V + i] = sign * big / 256;
+            }
+        }
+    };
+}
+
+/// Pass 1's outputs at `b` blocks a row: the partials (bf16), then the sums and the maxs (f32). Comptime, so the
+/// slice a `Spec` keeps is static, not the registering call's stack.
+fn vrPass1Outs(comptime b: usize) *const [2]spec.Part {
+    const counts = struct {
+        fn parts(s: Shape) usize {
+            return s.rows * s.n * b * VR_V;
+        }
+        fn stats(s: Shape) usize {
+            return 2 * s.rows * s.n * b;
+        }
+    };
+    return comptime &[2]spec.Part{ .{ .elem = .bf16, .count = counts.parts }, .{ .elem = .f32, .count = counts.stats } };
+}
+
+fn vrSpec(comptime name: []const u8, outs: []const spec.Part, served: []const Shape, tile: usize, least: usize) spec.Spec {
+    return .{
+        .name = name,
+        .accum = .f32,
+        .depth = host.depthOne,
+        .out = .bf16,
+        .outs = outs,
+        .tiles = .{ .{}, .{}, .{ .size = tile, .min = least } },
+        .served = served,
+        .sums = .{ .exact = false },
+    };
+}
+
+/// Ling-3.1-flash's expanded MLA heads (192, 128), bf16: one-pass rows; pass 1 at the M5 Max's 64 blocks and the
+/// Ultra's 128; pass 2.
+fn registerVerifyRows(set: *kc.Set) !void {
+    const a = set.a;
+    try set.add(VecRows, .init(a, &vr_1p_launch, .one, 0), vrSpec("msv_sdpa_rows_1p (192, 128)", &.{}, qk(&.{ .{ 4, 8, 100 }, .{ 4, 3, 1000 }, .{ 2, 16, 600 } }), 32, 1), null);
+    inline for (.{ 64, 128 }) |b| {
+        try set.add(VecRows, .init(a, &vr_2p1_launch, .pass1, b), vrSpec(std.fmt.comptimePrint("msv_sdpa_rows_2p1 (192, 128), {d} blocks", .{b}), vrPass1Outs(b), qk(&.{ .{ 4, 8, 1024 }, .{ 2, 3, 4093 }, .{ 2, 16, 1100 } }), 4 * b, b), null);
+    }
+    try set.add(VecMerge, .init(a, &vr_2p2_launch), vrSpec("msv_sdpa_rows_2p2 (v 128)", &.{}, qk(&.{ .{ 4, 8, 64 }, .{ 2, 16, 128 }, .{ 4, 3, 1024 } }), 0, 1), null);
+}
+
 pub fn register(set: *kc.Set) !void {
     const a = set.a;
     inline for (gate_registrations) |r| try set.add(Gate, .init(a, r[3], r[1]), gateSpec(r[0], r[1], r[2]), null);
@@ -2739,6 +3182,7 @@ pub fn register(set: *kc.Set) !void {
         sp.nax = r[2] != .merge;
         try set.add(Lane, .init(a, r[1], r[2], r[3], r[4]), sp, null);
     }
+    try registerVerifyRows(set);
 }
 
 // ── tests ──
@@ -2794,5 +3238,85 @@ test "kernel contract attention: each declared launch is the shipped wrapper's, 
             }
         }
         at += fam[1];
+    }
+}
+
+// Bar: each declared verify-rows launch (pass 1 chained into pass 2) is sdpa_rows' group, byte for byte.
+test "kernel contract attention: the verify rows' declared launches are the wrapper's, byte for byte" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var set = kc.Set.init(a);
+    defer set.deinit();
+    try registerVerifyRows(&set);
+    for (set.kernels.items) |k| {
+        // Pass 2 rides pass 1's chain.
+        if (std.mem.startsWith(u8, k.spec.name, "msv_sdpa_rows_2p2")) continue;
+        const t: *VecRows = @ptrCast(@alignCast(k.ctx));
+        const shape = k.spec.served[k.spec.served.len - 1];
+        try std.testing.expect(try t.prepare(shape, .random, 7));
+        const ours = try t.declared(a);
+        defer a.free(ours);
+        const plan: sdpa_rows.Plan = if (t.kind == .one) .{ .kind = .one_pass } else .{ .kind = .two_pass, .blocks = @intCast(t.blocks) };
+        const x = t.args;
+        const got = try sdpa_rows.launchGroup(t.rig.stream(), x[0], x[1], x[2], x[4], cInt(shape.rows), VR_QK, VR_V, 0, cInt(shape.n), cInt(shape.k), plan);
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqualSlices(u8, try t.rig.bytesOf(&.{got}), ours);
+    }
+}
+
+// Bar: read after the registering call returns, each verify-rows kernel's output parts add up to its count.
+test "kernel contract attention: the verify rows' output parts add up to each kernel's count" {
+    var set = kc.Set.init(std.testing.allocator);
+    defer set.deinit();
+    try registerVerifyRows(&set);
+    for (set.kernels.items) |k| {
+        if (k.spec.outs.len == 0) continue;
+        const t: *VecRows = @ptrCast(@alignCast(k.ctx));
+        for (k.spec.served) |shape| {
+            t.shape = shape;
+            var sum: usize = 0;
+            for (k.spec.outs) |p| sum += p.count(shape);
+            try std.testing.expectEqual(t.count(), sum);
+        }
+    }
+}
+
+/// `t` at `shape` launched again with every output one leading slice longer: the declared bytes, then poison only.
+fn expectWritesInside(t: anytype, shape: Shape) !void {
+    const a = std.testing.allocator;
+    if (!try t.prepare(shape, .random, 11)) return;
+    try t.run();
+    const want = try a.dupe(u8, t.rig.outputBytes());
+    defer a.free(want);
+    const base = t.geometry(shape).?;
+    var wide = base;
+    for (wide.outs[0..wide.n_outs]) |*o| o.shape[0] += 1;
+    try t.rig.launch(t.launch, wide, &t.args);
+    var at: usize = 0;
+    for (base.outs[0..base.n_outs], 0..) |o, i| {
+        const e = host.elemOf(o.dtype);
+        var len = spec.size(e);
+        for (o.shape[0..o.ndim]) |d| len *= @intCast(d);
+        const got = try t.rig.bytesOf(&.{t.rig.output(i)});
+        try std.testing.expectEqualSlices(u8, want[at..][0..len], got[0..len]);
+        for (0..(got.len - len) / spec.size(e)) |j| try std.testing.expect(std.math.isNan(spec.read(e, got[len..], j)));
+        at += len;
+    }
+}
+
+// Bar: at every shape the gates run, each verify-rows kernel writes nothing past its declared outputs.
+test "kernel contract attention: the verify rows' kernels write only inside their outputs" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var set = kc.Set.init(a);
+    defer set.deinit();
+    try registerVerifyRows(&set);
+    for (set.kernels.items) |k| {
+        const all = try spec.shapes(a, k.spec);
+        defer a.free(all);
+        const merge = std.mem.startsWith(u8, k.spec.name, "msv_sdpa_rows_2p2");
+        for (all) |shape| {
+            if (merge) try expectWritesInside(@as(*VecMerge, @ptrCast(@alignCast(k.ctx))), shape) else try expectWritesInside(@as(*VecRows, @ptrCast(@alignCast(k.ctx))), shape);
+        }
     }
 }

@@ -12,6 +12,7 @@ const log = @import("../../sdk/util/log.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const conv1d = @import("../../sdk/bases/blocks/conv1d.zig");
 const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
+const kda_rows = @import("../../sdk/blocks/kda/verify_rows.zig");
 const kdaGateChain = @import("../../sdk/blocks/kda/gate.zig").kdaGateChain;
 const gate_mod = @import("../../sdk/blocks/gdn/gate.zig");
 const gdn_decode = @import("../../sdk/blocks/gdn/decode.zig");
@@ -89,14 +90,19 @@ pub fn forward(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
 const Pre = struct { qkv: Array, z: Array, a: Array, b: Array };
 
 /// A serial-rows verify (`Model.serial_rows`): the projections over every row (row-exact through `Model.mm`), then each
-/// row's conv, gates, recurrence and gated norm on the one-row decode path from the row before's state, each row's
-/// state and the window's conv inputs kept as the capture path keeps them for rollback; then the out projection.
+/// row's conv, gates, recurrence and gated norm on the one-row decode path from the row before's state (one launch for
+/// every row where `rowsLaunch` serves), each row's state and the window's conv inputs kept as the capture path keeps
+/// them for rollback; then the out projection.
 fn serialRows(m: *Model, x: Array, la: *const Kda, e: *Entry, seq_len: c_int) !Array {
     const s = m.s;
     var all: [4]Array = @splat(.{ .ctx = null });
     defer for (all) |t| free(t);
     all[0] = try qkvProj(m, la, x);
     for (all[1..], [_]*const trunk.Linear{ &la.z, &la.a, &la.b }) |*o, l| o.* = try m.mm(l, x);
+    if (try rowsLaunch(m, la, e, all)) |y| {
+        defer _ = mlx.mlx_array_free(y);
+        return m.mm(&la.out, y);
+    }
     var conv_in = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(conv_in);
     {
@@ -129,6 +135,52 @@ fn serialRows(m: *Model, x: Array, la: *const Kda, e: *Entry, seq_len: c_int) !A
     defer _ = mlx.mlx_array_free(y_all);
     try mlx.check(mlx.mlx_concatenate_axis(&y_all, ys, 1, s));
     return m.mm(&la.out, y_all);
+}
+
+/// The serial rows in one launch (`kda_rows`), each row's bytes the one-row decode step's: y for the out projection,
+/// the state, window and rollback capture written to `e`. Null where it declines: a low-rank gate (GLM's second
+/// stage), a state the per-core recurrence serves (serial decode takes that arm, not the composed chain), or what
+/// `kda_rows.serves` refuses (past its 8 rows, a softplus gate, another geometry).
+fn rowsLaunch(m: *Model, la: *const Kda, e: *Entry, p: [4]Array) !?Array {
+    const c = m.c;
+    if (la.a2.w.ctx != null or la.z2.w.ctx != null or c.linear_conv_kernel_dim != 4) return null;
+    const act = mlx.mlx_array_dtype(p[0]);
+    if (c.kda_gate_lower_bound != 0.0 and kda_recurrence.serves(m.s, @intCast(c.linear_num_key_heads), @intCast(c.linear_num_value_heads), @intCast(c.linear_key_head_dim), @intCast(c.linear_value_head_dim), act, m.ssmStateDtype())) return null;
+    try ensureScales(m, act);
+    const r = (try kda_rows.verifyRows(m.s, .{
+        .qkv = p[0],
+        .z = p[1],
+        .a = p[2],
+        .b = p[3],
+        .conv_state = e.conv_state,
+        .conv_w = la.conv_w,
+        .A_log = la.A_log,
+        .dt_bias = la.dt_bias,
+        .state = e.ssm_state,
+        .norm_w = la.norm_w,
+        .q_scale = m.kda.q_scale,
+        .k_scale = m.kda.k_scale,
+        .qk_eps = qkNormEps(m),
+        .norm_eps = c.rms_norm_eps,
+        .bound = c.kda_gate_lower_bound,
+        .hk = @intCast(c.linear_num_key_heads),
+        .hv = @intCast(c.linear_num_value_heads),
+        .dk = @intCast(c.linear_key_head_dim),
+        .dv = @intCast(c.linear_value_head_dim),
+    })) orelse return null;
+    inline for (.{ .{ &e.conv_state, r.conv_state }, .{ &e.ssm_state, r.state }, .{ &e.spec_state_seq, r.state_seq }, .{ &e.spec_conv_input, r.conv_input } }) |kv| {
+        free(kv[0].*);
+        kv[0].* = kv[1];
+    }
+    return r.y;
+}
+
+/// The q and k scales (1/dk, 1/sqrt(dk)) in the activation dtype, made once.
+fn ensureScales(m: *Model, dt: mlx.mlx_dtype) !void {
+    if (m.kda.q_scale.ctx != null) return;
+    const inv: f32 = 1.0 / @as(f32, @floatFromInt(m.c.linear_key_head_dim));
+    m.kda.q_scale = try scalarOf(inv, dt, m.s);
+    m.kda.k_scale = try scalarOf(@sqrt(inv), dt, m.s);
 }
 
 /// Row `r` of `a` `[1, S, W]`: `[1, 1, W]`.
@@ -249,11 +301,7 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         free(in_all);
         in_all = .{ .ctx = null };
     }
-    if (m.kda.q_scale.ctx == null) {
-        const inv: f32 = 1.0 / @as(f32, @floatFromInt(c.linear_key_head_dim));
-        m.kda.q_scale = try scalarOf(inv, mlx.mlx_array_dtype(qkv), s);
-        m.kda.k_scale = try scalarOf(@sqrt(inv), mlx.mlx_array_dtype(qkv), s);
-    }
+    try ensureScales(m, mlx.mlx_array_dtype(qkv));
     const inv_scale_sq = m.kda.q_scale;
     const inv_sqrt_sc = m.kda.k_scale;
 
