@@ -34,6 +34,7 @@ Compressed rules. Full war stories: `../docs/gotchas/app.md`. Full service contr
 | `Support/OpenPanel.swift` | The ONE `NSOpenPanel` constructor (hidden files shown everywhere) |
 | `Services/ClonedVoiceSynthesizer.swift` | Voice-clone TTS pipeline behind `SpeechSynthesizing`; per-utterance fallback to system voice, never dead air |
 | `Services/QuickLauncher*.swift` | ⌃Space launcher: Carbon hotkey + non-activating NSPanel; pure `QuickLauncherLogic` |
+| `Services/TextAttachment.swift` | A text or source file attached to a chat (panel, paste, drop): read once (UTF-8/UTF-16, 2 MB, no binary) and sent in the user message as `[File: name]` + a fenced block (`PendingTextDoc.preamble`, PDFs beside it), so it works on any model |
 | `Services/{ImagePreprocessor,BrowserManager,ServerManager,TestServer,AgentMemory}.swift` | Image prep, WKWebView, server lifecycle, test server :8090, agent context |
 | `Services/{LaTeXSegmenter,LaTeXRenderer}.swift` + `Views/ChatView.swift` (`MarkdownText`) | Assistant-response TeX: streaming-safe delimiters, SwaTex native layout, inline attachments + display math, source-preserving copy/fallback |
 | `Services/TaskScheduler.swift` | Scheduled tasks ("claw"): own ChatTurnEngine, durable runs, `reconcileStaleRuns` |
