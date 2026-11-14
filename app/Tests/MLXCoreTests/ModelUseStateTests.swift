@@ -45,6 +45,14 @@ final class ModelUseStateTests: XCTestCase {
         XCTAssertEqual(ModelUseState.resolve(path: q8, selectedPath: q8, serverStatus: .running, rows: evicted), .idle)
     }
 
+    func testAGgufMatchesOnlyItsRepoFolderNotAFolderFurtherUp() {
+        let quant = "/Volumes/org/a/models/other/repo/x-q4_k_m.gguf"
+        let rows = [row("org/a", loaded: true), row("other/repo", loaded: false)]
+        XCTAssertEqual(ModelUseState.resolve(path: quant, selectedPath: b, serverStatus: .running, rows: rows), .idle)
+        let noRepoRow = [row("org/a", loaded: true)]
+        XCTAssertEqual(ModelUseState.resolve(path: quant, selectedPath: b, serverStatus: .running, rows: noRepoRow), .idle)
+    }
+
     func testWithoutAServerRowTheSelectionDecides() {
         XCTAssertEqual(ModelUseState.resolve(path: a, selectedPath: a, serverStatus: .running, rows: []), .inUse)
         XCTAssertEqual(ModelUseState.resolve(path: b, selectedPath: a, serverStatus: .running, rows: []), .idle)

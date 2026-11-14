@@ -157,12 +157,15 @@ enum ModelUseState: Equatable {
         }
     }
 
-    /// The local server's row for `path`. A GGUF quant's path is its FILE, under the repo folder the server names.
+    /// The local server's row for `path`. A GGUF quant's path is its FILE, in the repo folder the server names
+    /// or one sub-folder below it, so its parent then grandparent folder is asked, nearest first.
     private static func servedRow(for path: String, in rows: [ModelInfo]) -> ModelInfo? {
         let local = rows.filter { $0.lanPeer == nil && $0.provider == nil }
         if let row = ModelSettingsApply.row(for: path, in: local) { return row }
         guard path.lowercased().hasSuffix(".gguf") else { return nil }
-        return local.first { path.contains("/" + $0.name + "/") }
+        let parent = (path as NSString).deletingLastPathComponent
+        return ModelSettingsApply.row(for: parent, in: local)
+            ?? ModelSettingsApply.row(for: (parent as NSString).deletingLastPathComponent, in: local)
     }
 
     var label: String {
