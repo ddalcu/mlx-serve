@@ -153,8 +153,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
     }
     const language = languageOf(e, &body) catch return bad("language is not one this model supports (auto, or a name in its codec_language_id)");
     if (voiceFieldRefusal(&body, e.synth.model.cfg.voice_controls)) |field| return field.verdict();
-    e.synth.model.cfg.seed = body.uint("seed") orelse 0;
-    const out = e.synth.synthesizeWav(text, max_frames, job.progressOf(progress), ref, language) catch |err| return switch (err) {
+    const seed = (body.whole("seed") catch return bad("seed must be a whole non-negative number")) orelse 0;
+    const out = e.synth.synthesizeWav(text, max_frames, job.progressOf(progress), ref, language, seed) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
         else => job.failure(err, "synthesis failed"),
     };
@@ -397,6 +397,10 @@ test "qwen3_tts plugin: a voice field no pack honours is refused by name; seed p
     const seeded = try al.dupe(u8, (try pack.run("{\"input\":\"hi there\",\"seed\":7}")).ok);
     try testing.expectEqualSlices(u8, seeded, (try pack.run("{\"input\":\"hi there\",\"seed\":7}")).ok);
     try testing.expect(!std.mem.eql(u8, plain, seeded));
+    for ([_][]const u8{ "\"42\"", "-1", "4.5" }) |bad_seed| {
+        const body = try std.fmt.allocPrint(al, "{{\"input\":\"hi\",\"seed\":{s}}}", .{bad_seed});
+        try testing.expectEqualStrings("seed must be a whole non-negative number", (try pack.run(body)).refused.why.slice());
+    }
 }
 
 test "qwen3_tts plugin: on a CustomVoice or VoiceDesign pack, voice is refused; empty fields read as absent" {

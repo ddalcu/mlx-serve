@@ -91,7 +91,6 @@ pub const TtsConfig = struct {
     rep_penalty: f32 = 1.05, // codebook-0 repetition penalty
     temperature: f32 = 0.9, // 0 → greedy (deterministic); >0 → categorical sampling
     top_k: u32 = 50,
-    seed: u64 = 0,
 
     /// `talker_config.codec_language_id` less its dialects: the reference's supported languages.
     languages: [max_languages]Language = undefined,
@@ -949,7 +948,7 @@ pub const TtsModel = struct {
     /// position in the codec prefix (mirrors the reference). `language` (a
     /// `codec_language_id` value, null = auto) pins the spoken language. Caller
     /// owns the returned slice.
-    pub fn generateCodes(self: *TtsModel, input_ids: []const i32, max_frames: u32, progress: ?sse.Progress, speaker_embed: ?mlx.mlx_array, language: ?i32) ![][16]u32 {
+    pub fn generateCodes(self: *TtsModel, input_ids: []const i32, max_frames: u32, progress: ?sse.Progress, speaker_embed: ?mlx.mlx_array, language: ?i32, seed: u64) ![][16]u32 {
         const s = self.s;
         const cfg = self.cfg;
         const H = cfg.t_hidden;
@@ -1030,7 +1029,7 @@ pub const TtsModel = struct {
         errdefer codes_list.deinit(self.allocator);
         var code0_hist = std.ArrayList(i32).empty; // unique code0s for repetition penalty
         defer code0_hist.deinit(self.allocator);
-        var rng: u64 = self.cfg.seed;
+        var rng: u64 = seed;
 
         const t_dims = self.talkerDims();
         var talker_cache = try StackCache.init(self.allocator, self.talker_layers.len);
@@ -2510,7 +2509,7 @@ pub const Synthesizer = struct {
     /// `ref_audio` (optional, 24 kHz mono f32) clones that voice via the
     /// speaker encoder; ignored (plain voice) when the model has none.
     /// `language` (null = auto) is a `TtsConfig.languageId`.
-    pub fn synthesize(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, ref_audio: ?[]const f32, language: ?i32) ![]f32 {
+    pub fn synthesize(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, ref_audio: ?[]const f32, language: ?i32, seed: u64) ![]f32 {
         const ids = try self.buildInputIds(text);
         defer self.allocator.free(ids);
         var spk_emb: ?mlx.mlx_array = null;
@@ -2525,7 +2524,7 @@ pub const Synthesizer = struct {
             }
         }
         const t1 = std.Io.Timestamp.now(io_t, .boot);
-        const codes = try self.model.generateCodes(ids, max_frames, progress, spk_emb, language);
+        const codes = try self.model.generateCodes(ids, max_frames, progress, spk_emb, language, seed);
         const gen_ns: u64 = @intCast(t1.untilNow(io_t, .boot).nanoseconds);
         defer self.allocator.free(codes);
         if (codes.len == 0) return self.allocator.alloc(f32, 0);
@@ -2538,8 +2537,8 @@ pub const Synthesizer = struct {
     }
 
     /// text → 16-bit PCM mono WAV bytes (owned). `ref_audio` clones a voice.
-    pub fn synthesizeWav(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, ref_audio: ?[]const f32, language: ?i32) ![]u8 {
-        const samples = try self.synthesize(text, max_frames, progress, ref_audio, language);
+    pub fn synthesizeWav(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, ref_audio: ?[]const f32, language: ?i32, seed: u64) ![]u8 {
+        const samples = try self.synthesize(text, max_frames, progress, ref_audio, language, seed);
         defer self.allocator.free(samples);
         return wav_mod.encodePcm16Mono(self.allocator, samples, self.model.cfg.sample_rate);
     }
@@ -3343,7 +3342,7 @@ test "generateCodes yields at frame boundaries and stops on cancel" {
     defer sse.genYield().* = null;
     const ids = [_]i32{ 9707, 11, 1879, 13 };
     const p = sse.Progress{ .ctx = &h, .cb = H.emitCb, .cancelled_cb = H.cancelCb };
-    try std.testing.expectError(error.Cancelled, m.generateCodes(&ids, 2048, p, null, null));
+    try std.testing.expectError(error.Cancelled, m.generateCodes(&ids, 2048, p, null, null, 0));
     try std.testing.expectEqual(@as(u32, 2), h.yields);
 }
 
@@ -3383,7 +3382,7 @@ test "talker+predictor reproduce greedy oracle codes" {
     m.cfg.rep_penalty = 1.0; // match the pure-greedy oracle (rep_pen=1.0)
     m.cfg.temperature = 0.0; // greedy (deterministic) for equivalence
 
-    const codes = try m.generateCodes(ids, @intCast(check_frames), null, null, null);
+    const codes = try m.generateCodes(ids, @intCast(check_frames), null, null, null, 0);
     defer allocator.free(codes);
 
     try std.testing.expect(codes.len >= check_frames);
@@ -3569,7 +3568,7 @@ test "end-to-end native TTS produces non-silent audio" {
     var dec = try loadCodecDecoder(io, allocator, s, model_dir);
     defer dec.deinit();
 
-    const codes = try m.generateCodes(ids, 256, null, null, null);
+    const codes = try m.generateCodes(ids, 256, null, null, null, 0);
     defer allocator.free(codes);
     try std.testing.expect(codes.len > 8);
 
@@ -3623,7 +3622,7 @@ test "Synthesizer: native text to WAV" {
     std.debug.print("[tts-synth] built {d} ids (expected {d})\n", .{ ids.len, expected.len });
     try std.testing.expectEqualSlices(i32, &expected, ids);
 
-    const wav = try synth.synthesizeWav(text, 256, null, null, null);
+    const wav = try synth.synthesizeWav(text, 256, null, null, null, 0);
     defer allocator.free(wav);
     try std.testing.expect(wav.len > 44 + 1000); // real audio, not just a header
     try std.testing.expectEqualSlices(u8, "RIFF", wav[0..4]);
@@ -3650,7 +3649,7 @@ test "8-bit quantized checkpoint loads and produces non-silent audio" {
     // engine." in the reference chat-template shape (same ids the Synthesizer
     // test pins against HF AutoTokenizer).
     const ids = [_]i32{ 151644, 77091, 198, 9707, 1879, 11, 419, 374, 264, 1273, 315, 279, 2205, 1467, 311, 8806, 4712, 13, 151645, 198, 151644, 77091, 198 };
-    const codes = try m.generateCodes(&ids, 64, null, null, null);
+    const codes = try m.generateCodes(&ids, 64, null, null, null, 0);
     defer allocator.free(codes);
     try std.testing.expect(codes.len > 4); // real speech, not an instant EOS
     for (codes) |frame| for (frame) |c| {
@@ -3709,7 +3708,7 @@ test "8-bit checkpoint parity vs bf16 (greedy, cloned voice)" {
             _ = mlx.mlx_array_free(e);
         };
         if (m.speaker) |*sp| spk = try sp.embed(ref);
-        const codes = try m.generateCodes(&ids, 128, null, spk, null);
+        const codes = try m.generateCodes(&ids, 128, null, spk, null, 0);
         defer allocator.free(codes);
         try std.testing.expect(codes.len > 4);
 
@@ -3976,10 +3975,10 @@ test "gpu predict: generateCodes byte-identical to host predictor loop" {
     for ([_]f32{ 0.0, 0.9 }) |temp| {
         m.cfg.temperature = temp;
         gpu_predict_override = false;
-        const host_codes = try m.generateCodes(&ids, 48, null, null, null);
+        const host_codes = try m.generateCodes(&ids, 48, null, null, null, 0);
         defer allocator.free(host_codes);
         gpu_predict_override = true;
-        const gpu_codes = try m.generateCodes(&ids, 48, null, null, null);
+        const gpu_codes = try m.generateCodes(&ids, 48, null, null, null, 0);
         defer allocator.free(gpu_codes);
         gpu_predict_override = null;
         try std.testing.expectEqual(host_codes.len, gpu_codes.len);
@@ -4029,10 +4028,10 @@ test "compiled chain: greedy codes agree with the lazy chain within band" {
     gpu_predict_override = true;
     defer gpu_predict_override = null;
     cp_compile_override = false;
-    const lazy_codes = try m.generateCodes(&ids, 48, null, null, null);
+    const lazy_codes = try m.generateCodes(&ids, 48, null, null, null, 0);
     defer allocator.free(lazy_codes);
     cp_compile_override = true;
-    const compiled_codes = try m.generateCodes(&ids, 48, null, null, null);
+    const compiled_codes = try m.generateCodes(&ids, 48, null, null, null, 0);
     defer allocator.free(compiled_codes);
     cp_compile_override = null;
     try std.testing.expect(m.cp_chain_compiled != null); // compile must have ENGAGED
@@ -4077,10 +4076,10 @@ test "cached predictor: greedy codes agree with full re-forward within band" {
     cp_compile_override = false;
     defer cp_compile_override = null;
     cp_cache_override = false;
-    const full_codes = try m.generateCodes(&ids, 48, null, null, null);
+    const full_codes = try m.generateCodes(&ids, 48, null, null, null, 0);
     defer allocator.free(full_codes);
     cp_cache_override = true;
-    const cached_codes = try m.generateCodes(&ids, 48, null, null, null);
+    const cached_codes = try m.generateCodes(&ids, 48, null, null, null, 0);
     defer allocator.free(cached_codes);
     cp_cache_override = null;
 
