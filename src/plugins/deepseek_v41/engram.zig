@@ -260,6 +260,8 @@ pub const Table = struct {
     s_stride: u64,
     slen: usize,
     b_off: u64 = 0,
+    /// The table sits in a shard the preflight bills (`preflight.modelDiskBytes`), so `shardBytes` takes it back out.
+    in_shards: bool = false,
     /// A prompt grid's rows read whole and past the page cache (`readDirect`); else span by span through it.
     direct: bool = false,
     /// The codes' own descriptor, which reads past the page cache (`openCodes`); -1: none.
@@ -316,10 +318,11 @@ pub const Table = struct {
         return self.mode != .affine and self.w_stride == self.s_stride and self.s_off == self.w_off + self.wlen and
             self.wlen + self.slen <= edir.max_record;
     }
-    /// Bytes this table occupies inside the pack's safetensors shards (read by
+    /// Bytes this table occupies inside the pack's billed safetensors shards (read by
     /// pread, never resident); a repack table lives outside them.
     pub fn shardBytes(self: *const Table) u64 {
-        return if (self.mode == .affine) self.rows * (self.w_stride + 2 * self.s_stride) else 0;
+        if (!self.in_shards) return 0;
+        return self.rows * (self.w_stride + self.s_stride * @as(u64, if (self.mode == .affine) 2 else 1));
     }
 
     /// Layer `layer`'s table in `dir`; `index` is its position among the
@@ -401,6 +404,7 @@ pub const Table = struct {
             .s_stride = scols * 2,
             .slen = @intCast(scols * 2),
             .b_off = base + regions[2].start,
+            .in_shards = true,
         };
     }
 
@@ -489,7 +493,19 @@ pub const Table = struct {
         const s = qwen4_ple.headerRegion(hdr.object, scale_key, "F8_E8M0", 1, size, @intCast(base), .matrix) catch return error.EngramTableHeader;
         if (w.rows != rows or s.rows != rows) return error.EngramTableSize;
         if (w.cols != head_dim or s.cols * 32 != head_dim) return error.EngramTableGeometry;
-        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols };
+        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols, .in_shards = billedShard(a, io, dir, spec.weight_file) };
+    }
+
+    /// Whether the preflight bills `file` (`preflight.modelDiskBytes`): a shard the index names, or with no index a
+    /// top-level one.
+    fn billedShard(a: std.mem.Allocator, io: std.Io, dir: std.Io.Dir, file: []const u8) bool {
+        const top = std.mem.indexOfScalar(u8, file, '/') == null;
+        const raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20)) catch return top;
+        const idx = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch return top;
+        const wm = (if (idx == .object) idx.object.get("weight_map") else null) orelse return top;
+        if (wm != .object) return top;
+        for (wm.object.values()) |v| if (v == .string and std.mem.eql(u8, v.string, file)) return true;
+        return false;
     }
 
     /// Rows `ids` as they sit on disk (host only, any thread).
@@ -1150,6 +1166,11 @@ test "dsv41 engram: a table nested under language_model. (oMLX's packs) opens li
 
 /// oMLX's lossless layout: 4 rows of head_dim 64 as raw e4m3 codes (1.0) with row r's first scale 2^r, its second 0.5.
 fn writeRawFp8Fixture(io: std.Io, dir: std.Io.Dir) !void {
+    return writeRawFp8FixtureAt(io, dir, "engram/model-00002-of-00002.safetensors");
+}
+
+/// `writeRawFp8Fixture` with the table in `file`; a top-level `file` is a shard the index names.
+fn writeRawFp8FixtureAt(io: std.Io, dir: std.Io.Dir, comptime file: []const u8) !void {
     const hdr = "{\"layers.1.engram.embed.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[4,64],\"data_offsets\":[0,256]}," ++
         "\"layers.1.engram.embed.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[4,2],\"data_offsets\":[256,264]}}";
     var shard: [8 + hdr.len + 264]u8 = undefined;
@@ -1161,12 +1182,27 @@ fn writeRawFp8Fixture(io: std.Io, dir: std.Io.Dir) !void {
         data[256 + 2 * r] = @intCast(127 + r); // 2^r for the first 32 columns
         data[256 + 2 * r + 1] = 126; // 0.5 for the rest
     }
-    try dir.createDirPath(io, "engram");
-    try dir.writeFile(io, .{ .sub_path = "engram/model-00002-of-00002.safetensors", .data = &shard });
+    const top = comptime std.mem.indexOfScalar(u8, file, '/') == null;
+    if (!top) try dir.createDirPath(io, std.fs.path.dirname(file).?);
+    try dir.writeFile(io, .{ .sub_path = file, .data = &shard });
     try dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"omlx_deepseek_v41\":{\"version\":1,\"engram_tables\":{" ++
-        "\"language_model.layers.1.engram.embed\":{\"weight_key\":\"layers.1.engram.embed.weight\",\"weight_file\":\"engram/model-00002-of-00002.safetensors\"," ++
-        "\"scale_key\":\"layers.1.engram.embed.scale\",\"scale_file\":\"engram/model-00002-of-00002.safetensors\",\"bias_key\":null,\"bits\":null,\"group_size\":null}}}}" });
-    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{}}" });
+        "\"language_model.layers.1.engram.embed\":{\"weight_key\":\"layers.1.engram.embed.weight\",\"weight_file\":\"" ++ file ++ "\"," ++
+        "\"scale_key\":\"layers.1.engram.embed.scale\",\"scale_file\":\"" ++ file ++ "\",\"bias_key\":null,\"bits\":null,\"group_size\":null}}}}" });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = if (top)
+        "{\"weight_map\":{\"layers.1.engram.embed.weight\":\"" ++ file ++ "\",\"layers.1.engram.embed.scale\":\"" ++ file ++ "\"}}"
+    else
+        "{\"weight_map\":{}}" });
+}
+
+test "dsv41 engram: oMLX's raw fp8 table inside a shard the index names bills its bytes there" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFp8FixtureAt(io, td.dir, "model-00002-of-00002.safetensors");
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+    defer t.close();
+    try testing.expectEqual(@as(u64, 4 * 64 + 4 * 2), t.shardBytes());
 }
 
 test "dsv41 engram: oMLX's lossless pack reads the release's raw fp8 table from the shard its config names" {
