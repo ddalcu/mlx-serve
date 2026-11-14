@@ -19,11 +19,16 @@ with GLM-5.3-Flash's readers and loads through `glm5_next/trunk.zig`; its own pa
   `prefill_score_width` = nope + rope.
 - Ling-3.1 streaming pack (the EXL3 repack beside `experts.bin`): it keeps the release's config, so its EXL3
   `quantization_config` (not `expert_streaming`) sets `streamed_bank`; glm5_next's streaming rules then apply. Its prompt
-  bill is `prefill_bytes`: the engine's unstreamed arithmetic over `sdk/bill/prefill.zig`, pinned by `bill_test.zig`
-  (the closure stays in sdk/); `prompt_last_row` reads the head's last 32 rows only.
-- Exact verify (streaming packs, `serialVerify`, ≤ 16 rows): every verify row carries serial decode's bytes
-  (projections at `QuantTable.exact_rows`, KDA and MLA per row, `moe.mlpRows`), so greedy MTP text equals MTP off;
-  not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.
+  bill is `prefill_bytes`: the engine's unstreamed arithmetic over `sdk/bill/prefill.zig` plus the whole-prompt pass's
+  live set past a chunk's (`wholePromptPassBytes`), pinned by `bill_test.zig` (the closure stays in sdk/); the driver's
+  stream room and growth read it; `prompt_last_row` reads the head's last 32 rows only.
+- Whole prompt (streaming packs, `Caps.whole_prompt_prefill`, `prompt.zig`): layer by layer over the engine's chunk
+  loop spans (`table_forward.hiddenSpans`), every span's ops on its own rows but the routed experts, one bank call over
+  whole spans (up to 16,384 rows, `trunk.PromptCalls`), its predicted experts read ahead a call at a time before the
+  layer's attention (`moe.readAhead`); a decode-lane span is a forward of its own. Bar: `served_test.zig`.
+- Exact verify (streaming packs, `serialVerify`, ≤ 16 rows): every row carries serial decode's bytes (projections at
+  `QuantTable.exact_rows`, KDA rows in one launch to 8 (`kda/verify_rows.zig`), MLA in one per plan (`sdpa_rows.zig`),
+  `moe.mlpRows`); not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.
 - Ling-3.1's clamps AFTER the SiLU, per layer: `expert_swiglu_limit_list` (routed, the bank's or the composed chain's)
   and `share_expert_swiglu_limit_list` (shared, `moe.Moe.Weights.shared_limit_out`); GLM's clamp is BEFORE it.
 

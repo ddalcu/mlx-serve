@@ -6,6 +6,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const Slots = @import("../glm5_next/slots.zig").Slots;
 const trunk = @import("../glm5_next/trunk.zig");
 const rowByRowSdpa = @import("../../sdk/blocks/attention/sdpa.zig").rowByRowSdpa;
+const sdpa_rows = @import("../../sdk/blocks/attention/sdpa_rows.zig");
 
 pub fn mlaAttn(
     self: *const trunk.Model,
@@ -147,10 +148,12 @@ pub fn mlaAttn(
     defer _ = mlx.mlx_array_free(none_mask);
     const sel_mode: [*:0]const u8 = if (is_prefill) "causal" else "";
     // Serial rows: each query row the one-row call a decode step makes over the keys up to it (the vector kernel
-    // splits a row's sum by the call's query rows).
-    if (self.serial_rows and seq_len > 1)
-        try rowByRowSdpa(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, seq_len, self.s)
-    else
+    // splits a row's sum by the call's query rows); one launch per kind of row where `sdpa_rows` serves, else a call
+    // per row (head dims MLX's vector kernel lacks, past its 16 rows).
+    if (self.serial_rows and seq_len > 1) {
+        if (!try sdpa_rows.attend(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, seq_len, self.s))
+            try rowByRowSdpa(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, seq_len, self.s);
+    } else
         try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, sel_mode, none_mask, .{ .ctx = null }, false, self.s));
 
     // [B,H,S,Dv] → [B,S,H,Dv]; the gate is per (token, head).

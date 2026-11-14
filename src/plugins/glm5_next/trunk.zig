@@ -163,6 +163,10 @@ pub const KdaConsts = struct {
     gate_fn: compiled.Closure = .{ .ctx = null },
 };
 
+/// A whole-prompt pass's routed calls (bailing_hybrid `prompt.zig`): whole spans, at most `rows` rows a call, a last
+/// call under `tail` rows joined to the one before (it would read again the experts the call before it read).
+pub const PromptCalls = struct { rows: u32 = 16_384, tail: u32 = 2_048 };
+
 pub const Model = struct {
     c: *const Config,
     s: mlx.mlx_stream,
@@ -195,6 +199,8 @@ pub const Model = struct {
     /// Set for one forward whose rows must each carry a one-row decode step's bytes (bailing_hybrid's exact verify):
     /// `mm` runs rows in calls of their projection's row-exact width, KDA, MLA and the MoE row by row.
     serial_rows: bool = false,
+    /// bailing_hybrid's whole-prompt pass: its routed calls. Tests narrow them to drive several calls.
+    prompt_calls: PromptCalls = .{},
 
     pub fn deinit(m: *Model) void {
         if (m.experts) |*x| x.close();

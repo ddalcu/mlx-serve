@@ -124,6 +124,9 @@ fn lingFacts(c: *const Config, p: *abi.Parsed) void {
         family.bankFacts(p);
         // The outside plugin's head computes a prompt row as the whole prompt's call does (glm5_next/host.zig `finish`).
         p.caps.prompt_last_row = true;
+        // The prompt runs layer by layer over the chunk loop's spans (`prompt.zig`): a routed layer reads each expert
+        // once a call rather than once a chunk.
+        p.caps.whole_prompt_prefill = true;
     }
     p.chat.thinking_default = .on;
     // A streaming pack's NextN layer drafts one token a round over the trunk's final-normed hidden (`head.zig`).
@@ -185,7 +188,7 @@ test "bailing_hybrid config: Ling-3.1-flash's EXL3 repack is a streaming pack by
     try testing.expect(parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
     defer freeParsed(&p);
     const c = of(&p);
-    try testing.expect(c.streamed_bank and p.caps.streamed_weights and !p.caps.batches_decode and !p.caps.images);
+    try testing.expect(c.streamed_bank and p.caps.streamed_weights and p.caps.whole_prompt_prefill and !p.caps.batches_decode and !p.caps.images);
     try testing.expectEqual(@as(u32, 72), p.shell.num_hidden_layers);
     // Without its bank the same config is refused by name.
     const bare: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
@@ -249,6 +252,6 @@ test "bailing_hybrid config: a streaming pack's NextN layer declares the MTP hea
         var q: abi.Parsed = .{};
         try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/" ++ name), &q).isOk());
         defer freeParsed(&q);
-        try testing.expect(q.spec.mtp_layout == .none and q.spec.mtp_default_depth == 0 and !of(&q).streamed_bank);
+        try testing.expect(q.spec.mtp_layout == .none and q.spec.mtp_default_depth == 0 and !of(&q).streamed_bank and !q.caps.whole_prompt_prefill);
     }
 }

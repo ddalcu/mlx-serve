@@ -13,6 +13,7 @@ const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
 const Family = @import("../glm5_next/config.zig").Config;
 const run = @import("../../sdk/bases/run.zig");
 const fwd = @import("table_forward.zig");
+const prompt = @import("prompt.zig");
 const head = @import("head.zig");
 const fixture = @import("../glm5_next/fixture.zig");
 pub const config = @import("config.zig");
@@ -69,10 +70,22 @@ fn residentBytes(p: *const abi.Parsed, _: abi.Str, _: abi.Str, shards: u64, out:
 }
 
 /// A streaming pack's prompt: the engine's prompt bill of the pack's config as an unstreamed model's (one output token
-/// past the prompt, no warm restore credited; the bank's slot rows are its plugin's bill, apart), priced from
-/// `sdk/bill/prefill.zig` so the plugin's closure stays in sdk/. `bill_test.zig` pins it to the engine's
-/// `prefillNeededAtChunk` of the same config.
+/// past the prompt, no warm restore credited; the bank's slot rows are its plugin's bill, apart), plus the whole-prompt
+/// pass's live set past a chunk's where the pack runs one (`prompt.zig`), priced from `sdk/bill/prefill.zig` so the
+/// plugin's closure stays in sdk/. `bill_test.zig` pins it to the engine's `prefillNeededAtChunk` of the same config
+/// and the pass's terms.
 pub fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, _: u64) callconv(.c) u64 {
+    return chunkBytes(p, seq, chunk, kv_bits) + if (p.caps.whole_prompt_prefill) passBytes(p, seq, chunk) * 5 / 4 else 0;
+}
+
+/// The whole-prompt pass's live set past one chunk's (`sdk_bill.wholePromptPassBytes`) at its routed calls' widest.
+pub fn passBytes(p: *const abi.Parsed, seq: u64, chunk: u32) u64 {
+    const c = config.of(p);
+    const calls: trunk.PromptCalls = .{};
+    return sdk_bill.wholePromptPassBytes(seq, chunk, @as(u64, calls.rows) + calls.tail, c.num_experts_per_tok, c.hidden_size, c.ssmCheckpointBytes(2));
+}
+
+fn chunkBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8) u64 {
     const c = config.of(p);
     const mla = c.mla_kv_lora_rank > 0;
     const qk: u64 = @as(u64, c.mla_qk_nope_head_dim) + c.mla_qk_rope_head_dim;
@@ -104,6 +117,8 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     const m = host.of(mp);
     if (!abi.declaresMode(m.caps, f.mode)) return abi.Verdict.refuse(.unsupported, "bailing_hybrid: forward mode not declared");
     const ops = f.cache_ops orelse return abi.Verdict.refuse(.unsupported, "bailing_hybrid: a forward without cache_ops");
+    // A streaming pack's whole prompt runs layer by layer over the chunk loop's spans, which set its phases and settles.
+    if (m.c.streamed_bank and f.mode == .prefill and f.prompt_spans.len > 0) return prompt.forward(m, ops, f, out);
     m.serial_rows = serialVerify(m.c, f.mode, f.rows);
     defer m.serial_rows = false;
     // A streaming pack's bank: its phase before the trunk runs, its slot rows settled after the outputs are evaluated.
@@ -129,6 +144,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
 
 test {
     _ = config;
+    _ = @import("span_plan.zig");
 }
 
 test "bailing_hybrid serial verify: a streaming pack's verify of up to 16 rows; never a prompt, a decode or an MLX pack" {

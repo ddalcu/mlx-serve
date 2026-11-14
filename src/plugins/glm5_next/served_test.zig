@@ -19,8 +19,12 @@ const File = @import("../../sdk/root.zig").fixture.File;
 const fixture = @import("fixture.zig");
 const glm = @import("plugin.zig");
 const host = @import("host.zig");
+const trunk = @import("trunk.zig");
+const checkpoint = @import("../../engines/mlx/ssm/checkpoint.zig");
+const ssmRestore = @import("../../engines/mlx/ssm/entry.zig").ssmRestore;
 const ling = @import("../bailing_hybrid/plugin.zig");
 const tape_compact_over = @import("proof_test.zig").tape_compact_over;
+const kda_rows = @import("../../sdk/blocks/kda/verify_rows.zig");
 
 const testing = std.testing;
 
@@ -173,6 +177,8 @@ const ToyLing = struct {
     var opened: u32 = 0;
     var layers: u32 = 0;
     var limits: bool = false;
+    var aheads: u32 = 0;
+    var ahead_ids: usize = 0;
     fn claims(block: qa.Str, _: qa.Str) callconv(.c) common.Claim {
         return if (std.mem.indexOf(u8, block.slice(), "\"exl3\"") != null) .by_marker else .no;
     }
@@ -225,15 +231,51 @@ const ToyLing = struct {
         phases += 1;
         return .ok;
     }
-    fn readAhead(_: ?*anyopaque, _: u32, _: [*]const u16, _: usize) callconv(.c) common.Verdict {
+    fn readAhead(_: ?*anyopaque, _: u32, _: [*]const u16, n: usize) callconv(.c) common.Verdict {
+        aheads += 1;
+        ahead_ids += n;
         return .ok;
     }
     const table: qa.QuantTable = .{ .name = .of("toy-ling"), .claims = &claims, .validate = &validate, .bill = &bill, .open = &open, .close = &close, .load_tensor = &load, .load_bank = &load, .release = &release, .matmul = &matmul, .moe = &moe, .bank_rows = &bankRows, .open_bank = &openBank };
+
+    var row_calls: u32 = 0;
+    /// A routed sum each row computes alone, from its own input and route weights: x times the weights' sum, f32.
+    fn scaledRows(_: ?*anyopaque, _: u32, x: qa.Array, _: qa.Array, w: qa.Array, out: *qa.Array) callconv(.c) common.Verdict {
+        row_calls += 1;
+        const s = mlx.gpuStream();
+        var xf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xf);
+        var wf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wf);
+        var ws = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ws);
+        var y = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_astype(&xf, .{ .ctx = x.ctx }, .float32, s)) catch return common.Verdict.refuse(.failed, "toy rows");
+        mlx.check(mlx.mlx_astype(&wf, .{ .ctx = w.ctx }, .float32, s)) catch return common.Verdict.refuse(.failed, "toy rows");
+        mlx.check(mlx.mlx_sum_axis(&ws, wf, -1, true, s)) catch return common.Verdict.refuse(.failed, "toy rows");
+        mlx.check(mlx.mlx_multiply(&y, xf, ws, s)) catch {
+            _ = mlx.mlx_array_free(y);
+            return common.Verdict.refuse(.failed, "toy rows");
+        };
+        out.* = .{ .ctx = y.ctx };
+        return .ok;
+    }
+    fn openBankRows(ctx: *const qa.LoadCtx, geo: *const qa.BankGeometry, budget: qa.BankBudget, out: *qa.Bank) callconv(.c) common.Verdict {
+        const v = openBank(ctx, geo, budget, out);
+        out.rows = &scaledRows;
+        return v;
+    }
+    /// `table` whose bank's routed sum is `scaledRows`: a row routed or placed wrong in a call shows in its bytes.
+    const table_rows: qa.QuantTable = blk: {
+        var t = table;
+        t.open_bank = &openBankRows;
+        break :blk t;
+    };
 };
 
 // Bar: a Ling streaming pack loads through the table that claims it (its bank bound to every routed layer, one phase
-// before and one settle after each forward) and serves its NextN layer as the engine's MTP head; an MLX pack loads no
-// head. No legacy oracle exists for the head (the legacy path serves none).
+// before and one settle after each forward, a prompt's routes read ahead) and serves its NextN layer as the engine's
+// MTP head; an MLX pack loads no head. No legacy oracle exists for the head (the legacy path serves none).
 test "bailing_hybrid served: a streaming pack's bank takes each forward's phase and settle, and its NextN layer is its MTP head; an MLX pack has none" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const a = testing.allocator;
@@ -270,6 +312,8 @@ test "bailing_hybrid served: a streaming pack's bank takes each forward's phase 
     for (accepted.items) |n| try testing.expect(n <= 2);
     // Every trunk forward told the bank its phase first and settled it after.
     try testing.expect(ToyLing.phases > 0 and ToyLing.settles == ToyLing.phases);
+    // The prompt read each routed layer's predicted experts ahead: its rows times top_k ids a call.
+    try testing.expect(ToyLing.aheads > 0 and ToyLing.ahead_ids % b.xfm.config.num_experts_per_tok == 0);
 }
 
 // Bar: a streaming pack's load leaves its NextN layer resident (the bank's open reads the memory it takes), before any
@@ -287,12 +331,17 @@ test "bailing_hybrid served: a streaming pack's load makes its NextN layer resid
 
 /// The Ling streaming fixture served through `ToyLing` (registered for the call's life).
 fn withToyLing(comptime f: fn (*both.Both) anyerror!void) !void {
+    return withToy(&ToyLing.table, f);
+}
+
+/// The Ling streaming fixture served through the toy quant table `table` (registered for the call's life).
+fn withToy(table: *const ToyLing.qa.QuantTable, comptime f: fn (*both.Both) anyerror!void) !void {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const saved = ToyLing.outside.tables.get().*;
     defer ToyLing.outside.tables.get().* = saved;
     ToyLing.outside.tables.get().* = .{};
-    ToyLing.outside.register(&ToyLing.table);
+    ToyLing.outside.register(table);
     var p = try packOf(try fixture.lingMtpFiles(arena.allocator(), 11));
     defer p.deinit();
     var b = try both.Both.openWith(&ling.table, &p, fixture.ling_stream_config, false, .none, &.{.{ .name = "experts.bin", .bytes = "" }});
@@ -301,14 +350,19 @@ fn withToyLing(comptime f: fn (*both.Both) anyerror!void) !void {
 }
 
 // Bar: a streaming pack's verify of 2 to 9 rows (past the bank's 8-row decode lane) gives every row serial decode's
-// logits and leaves serial decode's state, bit for bit.
+// logits and leaves serial decode's state, bit for bit; up to 8 rows its KDA layers take the one-launch rows.
 test "bailing_hybrid served: a streaming pack's verify rows are serial decode's, bit for bit" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try withToyLing(struct {
         fn run(b: *both.Both) anyerror!void {
             const prompt = [_]i32{ 3, 17, 42, 99, 7, 250, 1, 8, 66, 31 };
             const window = [_]i32{ 5, 61, 200, 9, 33, 77, 140, 2, 18 };
-            for ([_]usize{ 2, 3, 5, 9 }) |n| try b.expectVerifyIsSerial(&prompt, window[0..n], 64);
+            for ([_]usize{ 2, 3, 5, 9 }) |n| {
+                const before = kda_rows.launches;
+                try b.expectVerifyIsSerial(&prompt, window[0..n], 64);
+                // The fixture's 3 KDA layers, one launch each, while the rows fit one.
+                try testing.expectEqual(before + @as(usize, if (n <= @as(usize, @intCast(kda_rows.max_rows))) 3 else 0), kda_rows.launches);
+            }
         }
     }.run);
 }
@@ -358,6 +412,135 @@ test "bailing_hybrid served: a streaming pack's greedy MTP stream equals its gre
                 try lingGreedy(b, depth, &drafted);
                 try testing.expectEqualSlices(u32, &plain, &drafted);
             }
+        }
+    }.run);
+}
+
+/// A whole-prompt plan of the span-major proof: the span ends and checkpoint positions the engine hands the forward,
+/// the routed calls' width, the routed calls each MoE layer then makes, and its read-aheads (the calls over wider spans)
+/// and their rows.
+const SpanCase = struct { ends: []const u64, cps: []const u64, calls: trunk.PromptCalls = .{}, routed: u32, ahead: u32, ahead_rows: u32 };
+
+/// `cs`'s whole prompt in one forward against the chunk loop's forward a span: every row's logits and hidden, each KDA
+/// layer's state after the prompt and at each checkpoint, and a next-token decode, bit for bit; each checkpoint filed
+/// restores a chunk-loop slot stopped there to the chunk loop's next-token logits.
+fn expectSpanMajor(b: *both.Both, prompt: []const i32, cs: SpanCase) !void {
+    const a = testing.allocator;
+    const m = host.of(b.xfm.plugin.?.model);
+    m.prompt_calls = cs.calls;
+    defer m.prompt_calls = .{};
+    var g = ops.Graph.init(a, b.xfm.s);
+    defer g.deinit();
+    const n_layers = b.layers();
+    const next = [_]i32{77};
+
+    var loop: both.Slot = undefined;
+    try loop.init(b, &b.xfm);
+    defer loop.deinit();
+    var logits_parts: [8]mlx.mlx_array = undefined;
+    var hidden_parts: [8]mlx.mlx_array = undefined;
+    // Each checkpoint's KDA states (conv, ssm) by layer, as the chunk loop leaves them at its span's end.
+    var want_cp: [4][2][8]mlx.mlx_array = undefined;
+    var lo: u64 = 0;
+    ToyLing.row_calls = 0;
+    ToyLing.aheads = 0;
+    for (cs.ends, 0..) |hi, k| {
+        var last = mlx.mlx_array_new();
+        var all = mlx.mlx_array_new();
+        logits_parts[k] = try g.adopt(try b.xfm.forwardWithCaptureAll(&loop.ctx, try proof_fixture.tokens(&g, prompt[lo..hi]), &last, &all));
+        _ = try g.adopt(last);
+        hidden_parts[k] = try g.adopt(all);
+        for (cs.cps, 0..) |cp, c| if (cp == hi) for (m.layers, 0..) |*lw, li| if (lw.mixer == .kda) {
+            want_cp[c][0][li] = try g.keep(loop.ssm.?[li].conv_state);
+            want_cp[c][1][li] = try g.keep(loop.ssm.?[li].ssm_state);
+        };
+        lo = hi;
+    }
+    const loop_calls = ToyLing.row_calls;
+    try testing.expectEqual(@as(u32, 0), ToyLing.aheads);
+
+    var whole: both.Slot = undefined;
+    try whole.init(b, &b.xfm);
+    defer whole.deinit();
+    var filed: std.ArrayList(checkpoint.SSMCheckpoint) = .empty;
+    defer {
+        for (filed.items) |*cp| cp.deinit(a);
+        filed.deinit(a);
+    }
+    var pc: checkpoint.PromptCheckpoints = .{ .allocator = a, .list = &filed, .positions = cs.cps, .layers = n_layers, .s = b.xfm.s };
+    const sink = pc.sink();
+    var progress = std.atomic.Value(u64).init(0);
+    whole.ctx.prompt_spans = cs.ends;
+    whole.ctx.ssm_cp_positions = cs.cps;
+    whole.ctx.cp_sink = &sink;
+    whole.ctx.prefill_progress = &progress;
+    ToyLing.row_calls = 0;
+    ToyLing.aheads = 0;
+    ToyLing.ahead_ids = 0;
+    var w_last = mlx.mlx_array_new();
+    var w_all = mlx.mlx_array_new();
+    const got = try g.adopt(try b.xfm.forwardWithCaptureAll(&whole.ctx, try proof_fixture.tokens(&g, prompt[0..lo]), &w_last, &w_all));
+    _ = try g.adopt(w_last);
+    _ = try g.adopt(w_all);
+    whole.ctx.prompt_spans = &.{};
+    whole.ctx.ssm_cp_positions = &.{};
+    whole.ctx.cp_sink = null;
+    whole.ctx.prefill_progress = null;
+    // Three routed layers, each in its calls over whole spans; the chunk loop calls each layer once a span.
+    try testing.expectEqual(3 * cs.routed, ToyLing.row_calls);
+    try testing.expectEqual(@as(u32, @intCast(3 * cs.ends.len)), loop_calls);
+    // Each routed layer reads ahead once a call over wider spans, before its attention: the call's rows x top_k ids.
+    try testing.expectEqual(3 * cs.ahead, ToyLing.aheads);
+    try testing.expectEqual(@as(usize, 3 * 2 * cs.ahead_rows), ToyLing.ahead_ids);
+    try testing.expectEqual(lo, progress.load(.monotonic));
+
+    try ops.expectBitEqual(got, try g.concat(logits_parts[0..cs.ends.len], 1));
+    try ops.expectBitEqual(w_all, try g.concat(hidden_parts[0..cs.ends.len], 1));
+    for (m.layers, 0..) |*lw, li| if (lw.mixer == .kda) {
+        try ops.expectBitEqual(whole.ssm.?[li].conv_state, loop.ssm.?[li].conv_state);
+        try ops.expectBitEqual(whole.ssm.?[li].ssm_state, loop.ssm.?[li].ssm_state);
+    };
+    try testing.expectEqual(cs.cps.len, filed.items.len);
+    for (filed.items, cs.cps, 0..) |cp, pos, c| {
+        try testing.expectEqual(pos, cp.pos);
+        for (m.layers, 0..) |*lw, li| if (lw.mixer == .kda) {
+            try ops.expectBitEqual(cp.layers[li].conv_state, want_cp[c][0][li]);
+            try ops.expectBitEqual(cp.layers[li].ssm_state, want_cp[c][1][li]);
+        };
+    }
+    const after = try g.adopt(try b.xfm.forwardWith(&loop.ctx, try proof_fixture.tokens(&g, &next)));
+    try ops.expectBitEqual(try g.adopt(try b.xfm.forwardWith(&whole.ctx, try proof_fixture.tokens(&g, &next))), after);
+
+    // A slot the chunk loop stopped at a checkpoint, its KDA states the filed ones, then the rest of the prompt.
+    for (filed.items) |cp| {
+        var rs: both.Slot = undefined;
+        try rs.init(b, &b.xfm);
+        defer rs.deinit();
+        lo = 0;
+        for (cs.ends) |hi| {
+            if (lo == cp.pos) for (m.layers, 0..) |*lw, li| if (lw.mixer == .kda) try ssmRestore(&rs.ssm.?[li], &cp.layers[li]);
+            _ = try g.adopt(try b.xfm.forwardWith(&rs.ctx, try proof_fixture.tokens(&g, prompt[lo..hi])));
+            lo = hi;
+        }
+        try ops.expectBitEqual(try g.adopt(try b.xfm.forwardWith(&rs.ctx, try proof_fixture.tokens(&g, &next))), after);
+    }
+}
+
+// Bar: a streaming pack's whole prompt layer by layer over the chunk loop's spans (2, 3 and 5 spans; decode-lane spans
+// among them; routed calls joined and split) equals the chunk loop bit for bit, and its checkpoints restore.
+test "bailing_hybrid served: a streaming pack's span-major prompt is the chunk loop's, bit for bit, at 2, 3 and 5 spans" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToy(&ToyLing.table_rows, struct {
+        fn run(b: *both.Both) anyerror!void {
+            var prompt: [40]i32 = undefined;
+            for (&prompt, 0..) |*t, i| t.* = @intCast(3 + (i * 53) % 500);
+            // The toy's decode lane holds 8 rows: an 8-row span and a 1-row span run as forwards of their own.
+            const cases = [_]SpanCase{
+                .{ .ends = &.{ 32, 40 }, .cps = &.{32}, .routed = 2, .ahead = 1, .ahead_rows = 32 },
+                .{ .ends = &.{ 12, 30, 40 }, .cps = &.{ 12, 30 }, .calls = .{ .rows = 30, .tail = 4 }, .routed = 2, .ahead = 2, .ahead_rows = 40 },
+                .{ .ends = &.{ 10, 20, 21, 33, 40 }, .cps = &.{ 20, 21, 33 }, .routed = 4, .ahead = 2, .ahead_rows = 32 },
+            };
+            for (cases) |cs| try expectSpanMajor(b, &prompt, cs);
         }
     }.run);
 }

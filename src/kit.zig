@@ -121,6 +121,7 @@ pub const blocks = struct {
         pub const nax_attention = @import("sdk/blocks/attention/nax_attention.zig");
         pub const row_attn = @import("sdk/blocks/attention/row_attn.zig");
         pub const sdpa = @import("sdk/blocks/attention/sdpa.zig");
+        pub const sdpa_rows = @import("sdk/blocks/attention/sdpa_rows.zig");
     };
     pub const moe = struct {
         pub const decode = @import("sdk/blocks/moe/decode.zig");
