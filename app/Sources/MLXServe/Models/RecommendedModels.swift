@@ -167,14 +167,14 @@ struct RecommendedModelPick: Identifiable, Hashable {
     /// `GemmaModelOption.sizeEstimate` budget for elsewhere in the app.
     var approxRAMNeededGB: Double { ramOverrideGB ?? sizeGB * 1.2 }
 
-    /// Whether this Mac's physical RAM covers what the model needs. This is a
-    /// SOFT signal for the UI (dim the row, explain why) — never a hard
-    /// download gate. The rest of the app never blocks on this either
-    /// (Discover just colors a fitness dot; ImageGenView warns and lets the
-    /// user proceed anyway), so a pick that doesn't meet requirements stays
-    /// fully downloadable/usable here too.
-    func meetsSystemRequirements(physicalMemoryBytes: UInt64) -> Bool {
-        Double(physicalMemoryBytes) >= approxRAMNeededGB * bytesPerGiB
+    /// Whether what this Mac can give a model (the GPU's usable budget, not
+    /// physical RAM) covers what the model needs. This is a SOFT signal for the
+    /// UI (dim the row, explain why) — never a hard download gate. The rest of
+    /// the app never blocks on this either (Discover just colors a fitness dot;
+    /// ImageGenView warns and lets the user proceed anyway), so a pick that
+    /// doesn't meet requirements stays fully downloadable/usable here too.
+    func meetsSystemRequirements(memory: SystemMemoryInfo) -> Bool {
+        memory.fit(neededGB: approxRAMNeededGB).fitsAtAll
     }
 }
 
@@ -527,7 +527,7 @@ extension RecommendedModelPick {
     // MARK: - The starter recommendation
 
     /// The ONE model to offer someone who has downloaded nothing yet, chosen
-    /// from this Mac's physical RAM. Total by construction — every input
+    /// from this Mac's memory. Total by construction — every input
     /// returns a pick — and the single source of truth for all three surfaces
     /// that make this recommendation: the Model Browser's "Best for your Mac"
     /// card, the welcome window's starter card, and the chat gate. Two copies
@@ -537,7 +537,7 @@ extension RecommendedModelPick {
     /// anything else (`approxRAMNeededGB` = weights × 1.2, the app's ~20%
     /// runtime overhead), never merely the largest that fits:
     ///
-    /// | Physical RAM | Pick | Disk | RAM needed |
+    /// | Physical RAM (band cap) | Pick | Disk | RAM needed |
     /// |---|---|---|---|
     /// | ≤ 16 GB  | Gemma 4 E4B         |  4.8 GB |  5.8 GB |
     /// | 16–32 GB | Gemma 4 12B         |  6.3 GB |  7.6 GB |
@@ -549,15 +549,21 @@ extension RecommendedModelPick {
     /// 16 GB is upper-inclusive (a 16 GB Mac gets E4B); the bands above are
     /// lower-inclusive, since 32, 36, 48 and 96 GB are the Macs each pick is
     /// chosen for.
-    static func starterPick(physicalMemoryBytes: UInt64) -> RecommendedModelPick {
-        let gib = Double(physicalMemoryBytes) / bytesPerGiB
-        if gib <= 16 { return .gemmaE4B }
-        if gib < 32 { return .gemma12B }
-        if gib < 36 { return .qwen38_27b }
-        if gib < 48 { return .qwen38_27b6bit }
-        if gib < 96 { return .qwen38_27b8bit }
-        return .qwen38FlashNext
+    ///
+    /// The band only caps the pick: it steps down to the largest pick at or
+    /// below it that fits what the GPU can give a model (`usableBytes`, not
+    /// physical RAM): a 36 GB Mac gives models about 28 GB, and the 6-bit 27B
+    /// needs 32.4.
+    static func starterPick(memory: SystemMemoryInfo) -> RecommendedModelPick {
+        let gib = memory.totalGB
+        let band = gib <= 16 ? 0 : gib < 32 ? 1 : gib < 36 ? 2 : gib < 48 ? 3 : gib < 96 ? 4 : 5
+        return starterLadder[...band].last { $0.meetsSystemRequirements(memory: memory) } ?? .gemmaE4B
     }
+
+    /// The starter picks, smallest first, one per RAM band of `starterPick`.
+    static let starterLadder: [RecommendedModelPick] = [
+        .gemmaE4B, .gemma12B, .qwen38_27b, .qwen38_27b6bit, .qwen38_27b8bit, .qwen38FlashNext,
+    ]
 }
 
 extension Array where Element == RecommendedModelPick {
@@ -566,11 +572,11 @@ extension Array where Element == RecommendedModelPick {
     /// Recommended pane shows the first inline and tucks the second behind a
     /// "Requires more RAM" disclosure — nothing is ever dropped, just
     /// deferred until the user asks to see it.
-    func partitionedByRequirements(physicalMemoryBytes: UInt64) -> (fits: [RecommendedModelPick], requiresMoreRAM: [RecommendedModelPick]) {
+    func partitionedByRequirements(memory: SystemMemoryInfo) -> (fits: [RecommendedModelPick], requiresMoreRAM: [RecommendedModelPick]) {
         var fits: [RecommendedModelPick] = []
         var requiresMoreRAM: [RecommendedModelPick] = []
         for pick in self {
-            if pick.meetsSystemRequirements(physicalMemoryBytes: physicalMemoryBytes) {
+            if pick.meetsSystemRequirements(memory: memory) {
                 fits.append(pick)
             } else {
                 requiresMoreRAM.append(pick)

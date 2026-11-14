@@ -92,8 +92,7 @@ struct MediaModelChooser<P: MediaModelSizing>: View {
             // Same warn-don't-block check the featured picks carry — the
             // models most likely to overrun this Mac are exactly the big ones
             // that DIDN'T make the featured list.
-            let fits = p.meetsSystemRequirements(
-                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+            let fits = p.meetsSystemRequirements(memory: .current())
             return (p.name, capabilityOf(p), "· ~\(p.approxRAMGB) GB RAM", fits, p)
         }
         return (selectedId, "", nil, true, nil)
@@ -239,7 +238,7 @@ extension MediaModelChooser {
                      accessory: AnyView? = nil) -> MediaModelChooser<P> {
         let featured = MediaModelPicks.featured(
             all,
-            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            memory: .current(),
             capabilityOf: capabilityOf)
         return MediaModelChooser(
             featured: featured,

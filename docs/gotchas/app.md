@@ -445,3 +445,12 @@ every later class went unrun; CI (a VM, no audio output) stayed green. Cause: 26
 controller starts its loading cue, and their helpers built the controller without `loadingCue:`, so the default
 `SystemLoadingCue` started a real `AVAudioEngine` inside the async test. Fix: every controller the tests build takes
 `FakeCue` and `FakeWakeChime`. Guard: the class runs 69/69 on a Mac with output.
+
+## "Recommended for your Mac" named a model marked "Not enough memory"
+Defect: a 96 GB Mac whose GPU can hold about 72 GB was recommended Flash-Next (78 GB) beside a table row calling it
+"Not enough memory"; a 36 GB Mac (28 GB for models) got the 6-bit 27B (32.4 GB). Cause: the starter pick, the
+"Requires more RAM" split, the media picks and Discover's dot compared a model's need with physical RAM, while the
+table row compared it with the GPU's working set. Fix: every fit check takes a `SystemMemoryInfo` and reads
+`usableBytes`; a RAM band caps the starter pick, which steps down to the largest pick that fits. Guards:
+`RecommendedModelsTests` (bands, a raised wired limit, every tier fits its band's bottom), `RAMFitnessTests`,
+`testMediaPresetRequirementsReadTheUsableBudget`.

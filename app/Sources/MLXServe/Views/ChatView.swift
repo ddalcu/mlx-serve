@@ -430,7 +430,7 @@ struct ChatView: View {
     /// The starter recommendation this Mac gets — same function the welcome
     /// window and the Model Browser read.
     private var starterPick: RecommendedModelPick {
-        RecommendedModelPick.starterPick(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+        RecommendedModelPick.starterPick(memory: .current())
     }
 
     /// Blocking whenever nothing on this Mac can serve a chat. The progress
