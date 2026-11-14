@@ -391,7 +391,9 @@ fn printUsage(io: std.Io) void {
         \\                        (default: 32). 0 disables all prefix reuse.
         \\  --no-prefix-cache-ram
         \\                      Disable idle RAM retention; an enabled SSD tier
-        \\                        still persists and restores reusable prefixes.
+        \\                        still persists and restores reusable prefixes
+        \\                        (not for a model whose plugin owns its cache,
+        \\                        e.g. DeepSeek-V4.1: it keeps no history then).
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB,
         \\                        or one session at the working context on
