@@ -271,6 +271,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             sch.allocator.destroy(v);
             if (err == error.MissingVisionWeights) {
                 log.warn("Vision weights missing — vision disabled (model may have been quantized without vision tower)\n", .{});
+            } else if (err == error.QuantizedVisionTower) {
+                log.warn("Vision tower linears are quantized — images disabled\n", .{});
             } else {
                 return err;
             }

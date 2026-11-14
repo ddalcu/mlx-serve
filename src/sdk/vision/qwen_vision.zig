@@ -633,7 +633,6 @@ pub const QwenVision = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Geometry, weights: *const Weights) !QwenVision {
-        const s = mlx.mlx_default_gpu_stream_new();
         var buf: [256]u8 = undefined;
         var kbuf: [256]u8 = undefined;
 
@@ -641,7 +640,13 @@ pub const QwenVision = struct {
             log.warn("MISSING QWEN VISION WEIGHT: {s}patch_embed.proj.weight\n", .{VISION_PREFIXES[0]});
             return error.MissingVisionWeights;
         };
+        // A packed linear is U32 codes plus `.scales`. Matmul of the codes is not the tower.
+        if (packedTower(weights, prefix)) {
+            log.warn("QWEN VISION: a tower linear is quantized ({s}blocks.0); images stay off\n", .{prefix});
+            return error.QuantizedVisionTower;
+        }
         log.info("[vision] qwen tower prefix: {s}\n", .{prefix});
+        const s = mlx.mlx_default_gpu_stream_new();
 
         const must = struct {
             fn f(w: *const Weights, b: *[256]u8, name: []const u8) !mlx.mlx_array {
@@ -1290,6 +1295,22 @@ pub fn patchProjLayout(shape: []const c_int, temporal_patch: u32, patch: u32) ?P
     return null;
 }
 
+fn packedTower(weights: *const Weights, prefix: []const u8) bool {
+    const leaves = [_][]const u8{
+        "blocks.0.attn.qkv.scales",
+        "blocks.0.attn.proj.scales",
+        "blocks.0.mlp.linear_fc1.scales",
+        "merger.linear_fc1.scales",
+        "merger.linear_fc2.scales",
+    };
+    var buf: [256]u8 = undefined;
+    for (leaves) |leaf| {
+        const name = std.fmt.bufPrint(&buf, "{s}{s}", .{ prefix, leaf }) catch return false;
+        if (weights.get(name) != null) return true;
+    }
+    return false;
+}
+
 /// Resolve the tower prefix by PROBING the loaded weights (model.resolveWeightPrefix
 /// pattern) — null when no spelling is present, which is what disables vision.
 pub fn resolveVisionPrefix(weights: *const Weights) ?[]const u8 {
@@ -1360,6 +1381,22 @@ pub fn resizeToUnitChw(allocator: std.mem.Allocator, rgb: []const u8, sh: u32, s
 pub fn budgetPixels(allocator: std.mem.Allocator, rgb: []const u8, h: u32, w: u32, patch: u32, merge: u32, max_tokens: u32) !UnitImage {
     const size = budgetSize(h, w, patch, merge, max_tokens) orelse return error.InvalidImageDimensions;
     return resizeToUnitChw(allocator, rgb, h, w, size.h, size.w);
+}
+
+test "prism config: a packed qkv leaves the qwen tower off" {
+    const allocator = std.testing.allocator;
+    var w = Weights.init(allocator);
+    defer w.deinit();
+    const put = struct {
+        fn add(map: *Weights, alloc: std.mem.Allocator, key: []const u8) !void {
+            const k = try alloc.dupe(u8, key);
+            try map.map.put(k, mlx.mlx_array_new());
+        }
+    }.add;
+    try put(&w, allocator, "vision_tower.patch_embed.proj.weight");
+    try put(&w, allocator, "vision_tower.blocks.0.attn.qkv.scales");
+    const g = QwenVision.Geometry{ .patch = 16, .temporal_patch = 2, .depth = 1, .hidden = 1152, .heads = 16, .head_dim = 72, .merge = 2, .num_pos_emb = 2304, .out_hidden = 5120 };
+    try std.testing.expectError(error.QuantizedVisionTower, QwenVision.init(allocator, g, &w));
 }
 
 test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded" {

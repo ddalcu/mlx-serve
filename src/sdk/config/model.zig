@@ -167,6 +167,8 @@ pub const ModelConfig = struct {
     norm_groups: u32 = 1,
     /// Prism Hadamard packs: every `<linear>.signs` weight reads `H_block(signs * x)` (rht.zig); 0 = none.
     hadamard_block: u32 = 0,
+    /// JANG repack: language RMS weights are stored as `w - 1` and gain the one before the f16 narrow. The GDN norm does not.
+    centred_language_norms: bool = false,
 
     // RoPE
     rope_theta: f32 = 1000000.0,
@@ -1875,6 +1877,13 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         log.info("[vision] EmbeddingGemma 2 processors: {d} soft tokens per image, {d} per video frame, at most {d} frames\n", .{ config.gv_image_tokens, config.gv_video_tokens, config.gv_video_frames });
     }
 
+    // A sidecar block is not in config.json. The plugin parse already read it, and the centred-norm flag.
+    if (binding) |b| {
+        const rot = b.parsed.rotation();
+        if (config.hadamard_block == 0) config.hadamard_block = rot.block;
+        if (rot.centred) config.centred_language_norms = true;
+    }
+
     config.plugin = binding;
     return config;
 }
@@ -2136,14 +2145,14 @@ pub fn qwen4PleInstalledAt(has_ple: []const bool, ple_layer_idx: i32) bool {
     return true;
 }
 
-/// I/O-free variant for unit tests and for callers that already have the
-/// config.json bytes in memory. The full I/O-bound `parseConfig` delegates here.
-/// Qwen3-VL-family vision + M-RoPE fields, shared by the qwen3_5 and
-/// qwen4_exp arms (same `vision_config` keys, `rope_parameters.mrope_*`,
-/// vision token ids). The generic vision_config block already set
-/// `has_vision`; this reads Qwen's own keys into `qv_*`.
-/// One block for every packed module; mixed blocks are not a layout we serve.
+/// One block for every packed module, or `hadamard.block_size` when the pack names it. Mixed blocks are not a layout we serve.
 fn prismHadamardBlock(root: std.json.ObjectMap) !u32 {
+    if (jsonField(root, "hadamard")) |h| if (h == .object) {
+        if (jsonField(h.object, "block_size")) |v| {
+            const b = try jsonU32(v);
+            if (b > 0) return b;
+        }
+    };
     const modules = (try jsonValue(.array, root.get("modules") orelse return error.UnsupportedHadamardLayout)).items;
     var block: u32 = 0;
     for (modules) |m| {
@@ -3014,7 +3023,9 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         std.mem.eql(u8, model_type, "minicpmv4_7"))
     {
         config.model_type = "qwen3_5_moe";
-        if (std.mem.eql(u8, model_type, "prism_hadamard_qwen35")) config.hadamard_block = try prismHadamardBlock(root);
+        if (std.mem.eql(u8, model_type, "prism_hadamard_qwen35")) {
+            config.hadamard_block = try prismHadamardBlock(root);
+        }
         config.weight_prefix = "language_model.model";
         config.norm_has_offset = false;
         config.scale_embeddings = false;
@@ -4797,18 +4808,45 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 /// contract) and ship the unpacked tensors f32 (norms, conv, the dense GDN a/b
 /// rows, A_log, dt_bias): an f32 table widens the f16 residual, so those
 /// narrow to f16. Signs stay f32: the rotation runs in f32.
+/// Language RMS weights a JANG repack stores one below the folded value. Not the GDN norm, not the tower.
+pub fn centredLanguageNormKey(key: []const u8) bool {
+    return std.mem.endsWith(u8, key, "input_layernorm.weight") or
+        std.mem.endsWith(u8, key, "post_attention_layernorm.weight") or
+        std.mem.endsWith(u8, key, "self_attn.q_norm.weight") or
+        std.mem.endsWith(u8, key, "self_attn.k_norm.weight") or
+        std.mem.endsWith(u8, key, "model.norm.weight");
+}
+
 pub fn narrowHadamardPackTables(config: *const ModelConfig, weights: *Weights, s: mlx.mlx_stream) !void {
     if (config.hadamard_block == 0) return;
     var it = weights.map.iterator();
     while (it.next()) |kv| {
-        const v = kv.value_ptr.*;
-        if (mlx.mlx_array_dtype(v) != .float32) continue;
+        var src = kv.value_ptr.*;
+        if (mlx.mlx_array_dtype(src) != .float32) continue;
         if (std.mem.endsWith(u8, kv.key_ptr.*, ".signs")) continue;
+        // The map owns the folded tensor before the cast, so a failed cast does not leave a freed array behind.
+        if (config.centred_language_norms and centredLanguageNormKey(kv.key_ptr.*)) {
+            src = try addOneF32(src, s);
+            kv.value_ptr.* = src;
+        }
         var cast = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_astype(&cast, v, config.actDtype(), s));
-        _ = mlx.mlx_array_free(v);
+        try mlx.check(mlx.mlx_astype(&cast, src, config.actDtype(), s));
+        _ = mlx.mlx_array_free(src);
         kv.value_ptr.* = cast;
     }
+}
+
+fn addOneF32(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const f = mlx.mlx_array_new_float(1);
+    defer _ = mlx.mlx_array_free(f);
+    var one = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(one);
+    try mlx.check(mlx.mlx_astype(&one, f, .float32, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_add(&out, one, w, s));
+    _ = mlx.mlx_array_free(w);
+    return out;
 }
 
 pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
@@ -7941,6 +7979,81 @@ test "glm5_next without a vision_config serves text only" {
     var config = try parseConfigFromJson(testing.allocator, text_only);
     defer config.deinit(testing.allocator);
     try testing.expect(!config.has_vision and !config.glm_vision);
+}
+
+const prism_qwen35 =
+    \\{"model_type":"qwen3_5","tie_word_embeddings":false,"text_config":{"model_type":"qwen3_5_text",
+    \\ "hidden_size":5120,"intermediate_size":17408,"num_hidden_layers":64,"num_attention_heads":24,
+    \\ "num_key_value_heads":4,"head_dim":256,"vocab_size":248320,"rms_norm_eps":1e-6,"full_attention_interval":4,
+    \\ "linear_num_key_heads":16,"linear_num_value_heads":48,"linear_key_head_dim":128,"linear_value_head_dim":128,
+    \\ "linear_conv_kernel_dim":4,"hidden_act":"silu","eos_token_id":248044,
+    \\ "rope_parameters":{"rope_type":"default","rope_theta":10000000,"partial_rotary_factor":0.25}},
+    \\ "modules":[{"path":"lm_head","block":1024},{"path":"model.layers.0.mlp.up_proj","block":1024}],
+    \\ "quantization":{"group_size":128,"bits":2,"mode":"affine"}}
+;
+
+fn parseServedFiles(files: []const struct { name: []const u8, bytes: []const u8 }) !ModelConfig {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for (files) |f| try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path_buf);
+    return parseConfig(io, testing.allocator, path_buf[0..n]);
+}
+
+test "prism config: a qwen3_5 affine 2-bit pack with a Hadamard block is the Prism trunk" {
+    const json_only =
+        \\{"model_type":"qwen3_5","text_config":{"hidden_size":5120,"num_hidden_layers":64},
+        \\ "hadamard":{"block_size":1024},"quantization":{"bits":2,"group_size":128,"mode":"affine"}}
+    ;
+    var bare_json = try parseConfigFromJson(testing.allocator, json_only);
+    defer bare_json.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), bare_json.hadamard_block);
+
+    var served = try parseServedFiles(&.{.{ .name = "config.json", .bytes = prism_qwen35 }});
+    defer served.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1024), served.hadamard_block);
+    try testing.expect(served.actDtype() == .float16);
+    try testing.expect(!served.centred_language_norms);
+
+    const stripped = try std.mem.replaceOwned(u8, testing.allocator, prism_qwen35, "\"modules\":[{\"path\":\"lm_head\",\"block\":1024},{\"path\":\"model.layers.0.mlp.up_proj\",\"block\":1024}],", "");
+    defer testing.allocator.free(stripped);
+    var side = try parseServedFiles(&.{
+        .{ .name = "config.json", .bytes = stripped },
+        .{ .name = "hadamard.json", .bytes = "{\"prism.hadamard.block_size\":1024}" },
+    });
+    defer side.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1024), side.hadamard_block);
+
+    const marked = try std.mem.replaceOwned(u8, testing.allocator, stripped, "\"quantization\"", "\"hadamard\":{\"block_size\":1024},\"quantization\"");
+    defer testing.allocator.free(marked);
+    var centred = try parseServedFiles(&.{
+        .{ .name = "config.json", .bytes = marked },
+        .{ .name = "jang_config.json", .bytes = "{\"layout\":{\"language_norms\":\"zero-centered-runtime-plus-one\"}}" },
+    });
+    defer centred.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 1024), centred.hadamard_block);
+    try testing.expect(centred.centred_language_norms);
+
+    const wide = try std.mem.replaceOwned(u8, testing.allocator, marked, "\"bits\":2", "\"bits\":4");
+    defer testing.allocator.free(wide);
+    var plain = try parseServedFiles(&.{.{ .name = "config.json", .bytes = wide }});
+    defer plain.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 0), plain.hadamard_block);
+    try testing.expect(!plain.centred_language_norms);
+
+    try testing.expectError(error.PluginDeclinedNoLegacy, parseServedFiles(&.{.{ .name = "config.json", .bytes = stripped }}));
+}
+
+test "prism config: centred language norms are the RMS weights, not the GDN norm or the tower" {
+    try testing.expect(centredLanguageNormKey("language_model.model.norm.weight"));
+    try testing.expect(centredLanguageNormKey("language_model.model.layers.0.input_layernorm.weight"));
+    try testing.expect(centredLanguageNormKey("language_model.model.layers.3.self_attn.q_norm.weight"));
+    try testing.expect(centredLanguageNormKey("language_model.model.layers.3.self_attn.k_norm.weight"));
+    try testing.expect(centredLanguageNormKey("language_model.model.layers.1.post_attention_layernorm.weight"));
+    try testing.expect(!centredLanguageNormKey("language_model.model.layers.0.linear_attn.norm.weight"));
+    try testing.expect(!centredLanguageNormKey("vision_tower.merger.norm.weight"));
 }
 
 test "ModelConfig prism_hadamard_qwen35 is qwen3_5 with the module Hadamard block" {
