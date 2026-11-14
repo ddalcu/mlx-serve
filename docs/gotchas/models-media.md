@@ -831,3 +831,11 @@ and output tensors over the whole matrix, whose offsets are `int`: once an outpu
 past ~75k rows), the full-tile stores wrapped and wrote into other buffers, so every tile came out wrong. Fix: each
 tile's tensors start at its own rows with a 64-bit offset (same speed). Guard: `w8a8 GEMM stores an output past 2^31
 elements where it belongs`.
+
+### A dedupe of duplicate weights dropped the far half of every split quant triple
+Defect: right after #1161's carrier scan landed, gemma-3-12b-it-4bit failed every forward ("Scale type must be uint8"),
+FLUX.2-klein-4B-mflux-4bit refused to load (`MISSING WEIGHT ... .biases`), and GLM-5.3, Qwen3.6-35B, MiniCPM-V-35B and
+Nemotron-Transcribe packs carried the same layout. Cause: the scan resolves a duplicated `.weight` to one shard, and the
+placement dropped any quant leaf whose weight's carrier was another shard; mlx-lm shards by size, so a leaf alone in the
+next shard is its pair's only copy. Fix: a leaf is a retired copy only when its own shard also carries its weight.
+Guard: `loadWeights keeps a quant triple the shards split, with no key duplicated` (valid and stale index).

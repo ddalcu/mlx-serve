@@ -18,6 +18,9 @@ Configs, templates, tokenizers:
 - **Digit GROUPING is per-model** (`Tokenizer.digit_group`; a COMBINED Split regex hides it); the CASED grammar (`\p{Lu}` + attached contractions) is `.llama3` (Muse, `[\r\n/]*` tail) or `.cased` (Flint: `[\p{P}\p{S}]` punct, newline-only tail, an unmatched `\p{C}` run kept whole), the plain Llama-3 regex is `.gpt2` + 3-digit groups; `ignore_merges` emits a vocab word whole; `\s` is Unicode White_Space (U+3000, NBSP), `\s*[\r\n]+` BACKTRACKS to a run's last newline, and a Split entry of its OWN (DeepSeek's and Flint's digits, CJK) cuts the text first under EITHER grammar (`isolated_runs`). Guard: `tests/test_tokenizer_hf_parity.sh`. The degenerate-tail guard has a LONG-period tier (`isDegenerateTailLoopRange`).
 
 Weights, quant, loading:
+- **A quant triple can straddle two shards** (mlx-lm shards by size: a `.biases` in shard 2, its `.weight` in shard 1):
+  per-shard load logic never takes a lone leaf for a duplicate (`shardCarries`). Guard: `loadWeights keeps a quant
+  triple the shards split, with no key duplicated`.
 - **Tree, prefix and axis order are CONVERTER choices — probe** (`resolveWeightPrefix`, `lagunaRouterBase`, `hy3ExpertContainer`, `resolveVisionPrefix` + `patchProjLayout`). A family's geometry comes from the CHECKPOINT once a second size exists (FLUX klein 4B/9B).
 - **Quant resolves PER WEIGHT** (`computeQuantParams`; scales dtype decides fp8 vs affine; overrides can hide inside the fp family, `fpParamsFromGeometry`); affine bits outside {2,3,4,5,6,8} rejected at PARSE; no engine hardcodes a width (`affineParamsFromGeometry`, scan-pinned). A table or projection loaded WITHOUT its input width (hint 0, config gs) reads another group size: Gemma 4 E4B mixed 4/6-bit declares gs 32, stores gs 64 (`tests/test_gemma4_mixed_quant.sh`).
 - **An MoE plugin streams its experts with two SDK calls and one cap** (`Streamed.forLoad`, `moe.bindStreamed`,
