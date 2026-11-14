@@ -144,7 +144,7 @@ pub fn generate(a: std.mem.Allocator, io: std.Io, paths: Paths, g: *const config
         defer model.deinit();
         if (model.hasAudio()) return error.NotAnImageDit;
         try h3.checkPddHeads(@intCast(mlx.getShape(model.video_out_w)[0]), 0, model.cfg, &pdd);
-        const ts = try h3.collectScheduleTs(a, &layout, sigmas[0..steps], 1.0, 1.0, clock_cfg);
+        const ts = try h3.collectScheduleTs(a, &layout, sigmas[0 .. steps + 1], 1.0, 1.0, clock_cfg, false);
         defer a.free(ts);
         try model.precomputeAdaln(ts, s);
         try model.evalWeights();

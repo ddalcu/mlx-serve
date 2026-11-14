@@ -70,6 +70,16 @@ the PDD sampler in src/plugins/minimax_h3/h3.zig follows `fastvideo/layers/pdd.p
 tests/dump_h3_vsa_fixtures.py executes the reference to validate the port.
 
 --------------------------------------------------------------------------------
+HyperFlow H3 Flash
+https://github.com/Video-Rebirth/hyperflow-h3-flash
+Copyright 2026 The HyperFlow authors
+Licensed under the Apache License, Version 2.0.
+
+The two-time DiT path in src/plugins/minimax_h3/h3.zig (the endpoint time embedding and the per-row
+(t, r) plan) follows `hyperflow_h3_flash`, and tests/convert_minimax_h3_weights.py carries its 4/6/8-step
+sigma grids from `schedule.py`.
+
+--------------------------------------------------------------------------------
 SageAttention
 https://github.com/thu-ml/SageAttention
 Licensed under the Apache License, Version 2.0.

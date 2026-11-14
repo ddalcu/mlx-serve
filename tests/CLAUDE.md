@@ -160,7 +160,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_image_gen.sh` FLUX.2 · `test_image_cancel.sh` · `test_flux_lowmem.sh` · `test_krea_gen.sh` · `test_mageflow_edit.sh`
 - `test_qwen_image_gen.sh` · `test_qwen_image_lora.sh` (+ `qwen_image_lora_metrics.py`) · `test_moss_image_gen.sh`
 - `test_multi_lora.sh` stacked LoRAs · `test_real_loras.sh` Hub LoRAs (+ `lora_noise.py`) · `test_media_gen_memory.sh` · `test_media_eviction_gate.sh` **H**
-- `test_video_gen.sh` LTX · `test_video_preview.sh` (part **H**) · `test_minimax_h3.sh`, `test_h3_resident.sh`, `test_fasth3_omni.sh` H3 · `test_minimax_h3_image.sh` H3-Image
+- `test_video_gen.sh` LTX · `test_video_preview.sh` (part **H**) · `test_minimax_h3.sh`, `test_h3_resident.sh`, `test_fasth3_omni.sh`, `test_hyperflow_h3_flash.sh` H3 · `test_minimax_h3_image.sh` H3-Image
 - `test_tts.sh`, `test_tts_quant.sh`, `test_tts_clone_cache.sh`, `test_tts_language.sh` Qwen3-TTS · `test_kokoro_tts.sh`
 - `test_music_gen.sh` ACE-Step · `test_music3_gen.sh` · `test_yue2_gen.sh` · `test_sound_gen.sh` Stable Audio 3
 - `test_3d_gen.sh`, `test_3d_paint.sh` Hunyuan3D · `test_trellis2_3d.sh` · `test_pixal3d_3d.sh` · `test_idol_3d.sh` · `film_skill.test.mjs` **H**
@@ -190,7 +190,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
   embeddinggemma (+ 2, 2 media), flint, glm5_next (+ vision), h3_vsa, hunyuan3d (+ paint), idol, inkling, kev, kokoro, krea,
   laguna, latent_rgb_factors, laya (+ numeric), lfm2_vision, lilicorr, ltx (audio, audio encoder, diffvae, upsampler, vae
   encoder), mageflow (dit, e2e, edit e2e, te, te edit, vae, vae encoder, vit), mimo_v2, minicpmv4_7_vision, minimax_h3
-  (+ layout, vision, vision tower, vae encoder, audio encoder), moss_image, muse_vision, music3, nemotron_diarization,
+  (+ layout, vision, vision tower, vae encoder, audio encoder, flash), moss_image, muse_vision, music3, nemotron_diarization,
   pixal3d, qwen3_aligner, qwen3_asr, qwen3_embedding, qwen4_exp, qwen4_yarn, qwen_image21, radio (full, vision),
   stable_audio, tokenizer_parity, trellis2, yue2
 - `build_qwen_preprocess_fixture.py`, `build_qwen_vision_fixture.py` Qwen3-VL fixtures · `dsv4_mlx_ref.py` MLX reference

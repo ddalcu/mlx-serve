@@ -62,6 +62,21 @@ Usage:
         --src <FastVideo/FastVideo-FastH3-Omni-8-Step-V1 snapshot> \
         --reuse-from ~/.mlx-serve/models/ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit \
         --out ~/.mlx-serve/models/ddalcu/FastH3-Omni-MLX-Serve-8bit
+
+    # HyperFlow H3 Flash REF2VA: Video Rebirth's pruned, low-rank, two-time
+    # 6-step derivative, read from its Q8_0 GGUF; everything else is cloned
+    uv run --with mlx --with numpy --with gguf tests/convert_minimax_h3_weights.py \
+        --partition flash-ref2va \
+        --src <VideoRebirthAI/hyperflow-h3-flash>/ref2va_gguf/minimax_h3_ref2va_hyperflow_flash_14b-Q8_0.gguf \
+        --reuse-from ~/.mlx-serve/models/ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit \
+        --out ~/.mlx-serve/models/ddalcu/HyperFlow-H3-Flash-REF2VA-MLX-Serve-8bit
+
+    # HyperFlow H3 Flash FL2VA (first/last keyframes): the same, from fl2va_gguf/
+    uv run --with mlx --with numpy --with gguf tests/convert_minimax_h3_weights.py \
+        --partition flash-fl2va \
+        --src <VideoRebirthAI/hyperflow-h3-flash>/fl2va_gguf/minimax_h3_fl2va_hyperflow_flash_14b-Q8_0.gguf \
+        --reuse-from ~/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit \
+        --out ~/.mlx-serve/models/ddalcu/HyperFlow-H3-Flash-FL2VA-MLX-Serve-8bit
 """
 
 import argparse
@@ -173,6 +188,74 @@ def fastvideo_dit(dit_dir):
     return out
 
 
+# HyperFlow H3 Flash (`hyperflow_h3_flash/schedule.py`): the raw sigma grids by step count, shifted per modality at
+# sampling time; the GGUF stores only the 6-step grid, already shifted by the video shift.
+FLASH_GRIDS = {
+    "4": [1.0, 0.681872, 0.205019, 0.036496, 0.0],
+    "6": [1.0, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0],
+    "8": [1.0, 0.931506, 0.839236, 0.703462, 0.5, 0.296538, 0.160764, 0.068494, 0.0],
+}
+# Low-rank ranks are kept at multiples of this (the release's own `RANK_MULTIPLE`), so `up` quantizes at group 64.
+RANK_MULTIPLE = 64
+
+
+class FlashGguf:
+    """A HyperFlow H3 Flash GGUF (stable-diffusion.cpp layout, ComfyUI names) as the lazy name -> mx.array map
+    `convert_file` drains: each tensor is dequantized when popped, low-rank factors are trimmed of the zero rank
+    padding the GGUF adds (to multiples of `RANK_MULTIPLE`), and the schedule and gate scalars move to config.json."""
+
+    def __init__(self, path):
+        import numpy as np
+        from gguf import GGUFReader
+        from gguf.quants import dequantize
+        self.np, self.dequantize = np, dequantize
+        self.reader = GGUFReader(path)
+        self.tensors = {t.name: t for t in self.reader.tensors}
+        self.gate = float(self._f32("hyperflow_gate")[0])
+        stored = self._f32("hyperflow_sigmas")
+        shifted = [12.0 * s / (1.0 + 11.0 * s) for s in FLASH_GRIDS["6"]]
+        if len(stored) != len(shifted) or max(abs(a - b) for a, b in zip(stored, shifted)) > 1e-6:
+            raise SystemExit(f"GGUF hyperflow_sigmas {list(stored)} is not the 6-step grid at shift 12")
+        self.ranks = {}
+        for name in self.tensors:
+            if name.endswith(".down.weight"):
+                base = name[: -len(".down.weight")]
+                self.ranks[base] = self._rank(base)
+        self.time_embed_dim = int(self.tensors["time_embedder.proj_out.weight"].shape[1])
+        self.layers = 1 + max(int(n.split(".")[1]) for n in self.tensors if n.startswith("blocks."))
+
+    def _f32(self, name):
+        t = self.tensors[name]
+        return self.dequantize(t.data, t.tensor_type).reshape(-1)
+
+    def _full(self, name):
+        t = self.tensors[name]
+        return self.dequantize(t.data, t.tensor_type).reshape([int(d) for d in reversed(t.shape)])
+
+    def _rank(self, base):
+        down, up = self._full(base + ".down.weight"), self._full(base + ".up.weight")
+        used = self.np.flatnonzero(self.np.any(down != 0, axis=1) | self.np.any(up != 0, axis=0))
+        rank = -(-(int(used[-1]) + 1) // RANK_MULTIPLE) * RANK_MULTIPLE
+        if self.np.any(down[rank:] != 0) or self.np.any(up[:, rank:] != 0):
+            raise SystemExit(f"{base}: padding past rank {rank} is not zero")
+        return rank
+
+    def keys(self):
+        return [n for n in self.tensors if not n.startswith("hyperflow_")]
+
+    def pop(self, name):
+        arr = self._full(name)
+        t = self.tensors.pop(name)
+        base = name.rsplit(".", 1)[0]
+        if name.endswith(".down.weight"):
+            arr = arr[: self.ranks[base[: -len(".down")]]]
+        elif name.endswith(".up.weight"):
+            arr = arr[:, : self.ranks[base[: -len(".up")]]]
+        out = mx.array(self.np.ascontiguousarray(arr))
+        # Q8_0 dequantizes to fp32 and is requantized from it; the GGUF's dense tensors keep their own dtype.
+        return out.astype(mx.float32 if t.tensor_type.name == "F32" else mx.bfloat16)
+
+
 def convert_file(src_path, dst_path, label, tensors=None):
     t0 = time.time()
     out = {}
@@ -271,7 +354,41 @@ PARTITIONS = {
         "upstream": "MiniMaxAI/MiniMax-H3-Image",
         "license": "MiniMax-H3-Image Community License Agreement",
     },
+    "flash-ref2va": {
+        "dit_file": None,
+        "tasks": ["t2va", "ref2va"],
+        "upstream": "VideoRebirthAI/hyperflow-h3-flash (ref2va_gguf, Q8_0)",
+        "base_model": "VideoRebirthAI/hyperflow-h3-flash",
+        "quantized": ("* `transformer.safetensors` is QUANTIZED to MLX affine {bits}-bit, group size 64, from Video\n"
+                      "  Rebirth's Q8_0 GGUF (dequantized first); its fp32 islands are left dense.\n"
+                      "* `text_encoder.safetensors` is the `--reuse-from` pack's, quantized there from the original\n"
+                      "  bfloat16 release at that pack's bits.\n"),
+        "title": "HyperFlow H3 Flash REF2VA",
+        "blurb": ("Video Rebirth's compressed few-step derivative of MiniMax-H3 REF2VA: one of 50 "
+                  "blocks dropped, 114 linears low-rank factored, conditioned on the step's two "
+                  "times (t, r). It samples 4, 6 (default) or 8 steps without guidance."),
+        "extra": ("* The DiT is read from Video Rebirth's Q8_0 GGUF (stable-diffusion.cpp layout, "
+                  "ComfyUI names): dequantized and requantized, the low-rank factors trimmed of the "
+                  "GGUF's zero rank padding to multiples of 64, and the schedule and two-time gate "
+                  "moved into `config.json`. The text encoder, VAEs and tokenizer are cloned from the `--reuse-from` H3 pack (the VAEs are byte-identical to the release's).\n"),
+    },
+    "flash-fl2va": {
+        "dit_file": None,
+        "tasks": ["t2va", "fl2va"],
+        "upstream": "VideoRebirthAI/hyperflow-h3-flash (fl2va_gguf, Q8_0)",
+        "base_model": "VideoRebirthAI/hyperflow-h3-flash",
+        "title": "HyperFlow H3 Flash FL2VA",
+        "blurb": ("Video Rebirth's compressed few-step derivative of MiniMax-H3 FL2VA: three of 50 "
+                  "blocks dropped, 102 linears low-rank factored, conditioned on the step's two "
+                  "times (t, r). Text-to-audio-video with optional first/last keyframes, 4, 6 "
+                  "(default) or 8 steps without guidance."),
+    },
 }
+PARTITIONS["flash-fl2va"].update({k: PARTITIONS["flash-ref2va"][k] for k in ("extra", "quantized")})
+
+# Video Rebirth's compression: the base blocks it removed (the GGUF numbers the rest from 0).
+FLASH_DROPPED = {"flash-ref2va": [9], "flash-fl2va": [6, 21, 22]}
+BASE_LAYERS = 50
 
 IMAGE_NOTICE = (
     "MiniMax-H3-Image is licensed under the MiniMax-H3-Image Community License Agreement, "
@@ -447,6 +564,12 @@ NOTICE = (
     "Copyright \u00a9 2026 MiniMax. All Rights Reserved.\n"
 )
 
+QUANTIZED = """* `transformer.safetensors` and `text_encoder.safetensors` are QUANTIZED from
+  the original bfloat16 releases to MLX affine {bits}-bit, group size 64. Gathered
+  embedding tables and the checkpoint's fp32 islands (patch projections, output
+  heads, time embedder, rope inverse frequencies) are left dense.
+"""
+
 # Section III.2 requires modified files to carry PROMINENT notices saying so.
 # Quantizing the weights modifies them, so this ships alongside them and the
 # same statement goes into each safetensors file's own metadata.
@@ -460,11 +583,7 @@ Modified by: mlx-serve (https://github.com/ddalcu/mlx-serve)
 
 What changed:
 
-* `transformer.safetensors` and `text_encoder.safetensors` are QUANTIZED from
-  the original bfloat16 releases to MLX affine {bits}-bit, group size 64. Gathered
-  embedding tables and the checkpoint's fp32 islands (patch projections, output
-  heads, time embedder, rope inverse frequencies) are left dense.
-* `video_vae.safetensors` and `audio_vae.safetensors` are byte-for-byte copies
+{quantized}* `video_vae.safetensors` and `audio_vae.safetensors` are byte-for-byte copies
   of the originals, unmodified.
 * The tokenizer files are byte-for-byte copies from `MiniMaxAI/MiniMax-H3`
   (`FL2VA/processor/`), relocated into this directory so the model is
@@ -574,8 +693,21 @@ def main():
                     "vsa_sparsity", "vsa_tile_size", "vsa_ref_policy", "vsa_ref_keep_rate"):
             CONFIG[key] = contract[key]
 
+    flash = None
+    if args.partition.startswith("flash"):
+        if not args.reuse_from:
+            raise SystemExit("--reuse-from is required: Flash ships only its DiT")
+        flash = FlashGguf(src)
+        if flash.layers != BASE_LAYERS - len(FLASH_DROPPED[args.partition]):
+            raise SystemExit(f"GGUF has {flash.layers} blocks; {args.partition} drops "
+                             f"{FLASH_DROPPED[args.partition]} of {BASE_LAYERS}: wrong partition's GGUF?")
+        CONFIG["transformer"].update(num_layers=flash.layers, time_embed_dim=flash.time_embed_dim)
+        CONFIG["two_time"] = {"gate": flash.gate, "default_steps": 6, "sigma_grids": FLASH_GRIDS}
+        CONFIG["dropped_blocks"] = FLASH_DROPPED[args.partition]
+        CONFIG["lowrank_ranks"] = flash.ranks
+
     jobs = [
-        ("transformer", os.path.join(src, part["dit_file"]) if args.partition == "omni"
+        ("transformer", src if flash else os.path.join(src, part["dit_file"]) if args.partition == "omni"
          else f"{src}/diffusion_models/{part['dit_file']}",
          f"{out}/transformer.safetensors"),
         ("text_encoder", f"{src}/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
@@ -593,7 +725,7 @@ def main():
         if not os.path.exists(s):
             raise SystemExit(f"missing source: {s}")
         print(f"[{label}] {s} -> {d}", flush=True)
-        total += convert_file(s, d, label)
+        total += convert_file(s, d, label, flash if label == "transformer" else None)
 
     # VAEs are copied verbatim: 5.8 GB combined, and the visual decoder is the
     # component whose output IS the image — not where to spend quality.
@@ -630,8 +762,10 @@ def main():
     with open(os.path.join(out, "NOTICE"), "w") as f:
         f.write(NOTICE)
     def fill(t):
-        return (t.replace("{bits}", str(BITS))
+        return (t.replace("{quantized}", part.get("quantized", QUANTIZED))
+                 .replace("{bits}", str(BITS))
                  .replace("{extra}", part.get("extra", ""))
+
                  .replace("{base_model}", part.get("base_model", "MiniMaxAI/MiniMax-H3"))
                  .replace("{upstream}", part["upstream"])
                  .replace("{title}", part["title"])
