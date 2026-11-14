@@ -25,6 +25,7 @@ const trunk = @import("trunk.zig");
 const checkpoint = @import("../../engines/mlx/ssm/checkpoint.zig");
 const ssmRestore = @import("../../engines/mlx/ssm/entry.zig").ssmRestore;
 const ling = @import("../bailing_hybrid/plugin.zig");
+const span_plan = @import("../bailing_hybrid/span_plan.zig");
 const tape_compact_over = @import("proof_test.zig").tape_compact_over;
 const kda_rows = @import("../../sdk/blocks/kda/verify_rows.zig");
 
@@ -547,8 +548,8 @@ test "bailing_hybrid served: a streaming pack's span-major prompt is the chunk l
     }.run);
 }
 
-/// One prefill of `prompt` through the Generator at chunk and stride 256 and a cap of 16 with `anchors` low anchors: by
-/// the whole-prompt pass (`whole`) or by the chunk loop.
+/// One prefill of `prompt` through the Generator at stride 64 (under the caller's `--prefill-chunk` 64) and a cap of 16
+/// with `anchors` low anchors: by the whole-prompt pass (`whole`) or by the chunk loop.
 fn lingPrefill(x: *Transformer, tok: *const Tokenizer, prompt: []const u32, anchors: usize, whole: bool) !Generator {
     const io = std.Io.Threaded.global_single_threaded.io();
     const caps = &x.config.plugin.?.parsed.caps;
@@ -557,31 +558,36 @@ fn lingPrefill(x: *Transformer, tok: *const Tokenizer, prompt: []const u32, anch
     caps.whole_prompt_prefill = whole;
     return Generator.initWithOptions(io, testing.allocator, x, tok, prompt, 1, .{ .temperature = 0.0 }, &.{}, .{
         .skip_lazy_preforward = true,
-        .ssm_checkpoint_stride = 256,
+        .ssm_checkpoint_stride = 64,
         .ssm_checkpoint_max = 16,
         .ssm_low_anchors = anchors,
         .logprobs_n = 64,
     });
 }
 
-// Bar: the standard 18,380-token prompt at chunk 256 (70 planned checkpoints, one wide segment) prefills whole: it files
+// Bar: a 5,000-token prompt at chunk and stride 64 (70 planned checkpoints, one wide segment) prefills whole: it files
 // the chunk loop's checkpoints, the cap's 16 (low anchors on and off), and its first token's logprobs and the next
 // decode's logits are the chunk loop's, bit for bit.
-test "bailing_hybrid served: an 18,380-token prompt at chunk 256 prefills whole, filing the chunk loop's checkpoints and logits" {
+test "bailing_hybrid served: a 5,000-token prompt at chunk and stride 64 prefills whole, filing the chunk loop's checkpoints and logits" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     try withToyLing(struct {
         fn run(b: *both.Both) anyerror!void {
             const a = testing.allocator;
             const saved = generate.prefillCli().*;
             defer generate.prefillCli().* = saved;
-            generate.prefillCli().* = .{ .override = 256, .explicit = true };
-            const prompt = try a.alloc(u32, 18_380);
+            generate.prefillCli().* = .{ .override = 64, .explicit = true };
+            const prompt = try a.alloc(u32, 5_000);
             defer a.free(prompt);
             for (prompt, 0..) |*t, i| t.* = @intCast(3 + (i * 53) % 500);
             // Uncapped, the plan names 70 checkpoints, every one in the one wide segment.
-            var all = try @import("../../engines/mlx/generate/prefill_chunk.zig").wholePromptPlan(a, prompt.len, 256, true, 256, 0, false, false, .{});
+            var all = try @import("../../engines/mlx/generate/prefill_chunk.zig").wholePromptPlan(a, prompt.len, 64, true, 64, 0, false, false, .{});
             defer all.deinit(a);
             try testing.expectEqual(@as(usize, 70), all.checkpoints.len);
+            var span_rows: [71]u32 = undefined;
+            try testing.expectEqual(@as(usize, span_rows.len), all.spans.len);
+            for (all.spans, &span_rows, 0..) |e, *r, k| r.* = @intCast(e - if (k == 0) 0 else all.spans[k - 1]);
+            // The toy bank's decode lane holds 16 ids at top-2: every span is wider.
+            try testing.expectEqual(@as(usize, span_rows.len), span_plan.segmentEnd(&span_rows, 0, 2, 16));
             const io = std.Io.Threaded.global_single_threaded.io();
             var x = try driver.load(io, a, &b.cfg, b.dir, proof_fixture.stream());
             defer x.deinit();
