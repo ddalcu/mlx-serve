@@ -59,11 +59,7 @@ struct ModelBrowserPane: View {
         }
         // Once per visit, not per section: the rescan sizes every model folder
         // on the main thread, and in-app changes already refresh on their own.
-        .onAppear {
-            appState.refreshModels()
-            appState.server.setLiveView(.models, visible: true)
-        }
-        .onDisappear { appState.server.setLiveView(.models, visible: false) }
+        .onAppear { appState.refreshModels() }
         // Live-refresh on-disk sizes while a disk-state pane is showing and a
         // download is in flight, so completion + growing size show up without
         // the user navigating away and back. The task id flips when the section

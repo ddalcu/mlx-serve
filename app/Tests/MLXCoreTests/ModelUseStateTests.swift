@@ -58,18 +58,3 @@ final class ModelUseStateTests: XCTestCase {
         XCTAssertEqual(ModelUseState.resolve(path: a, selectedPath: a, serverStatus: .stopped, rows: rows), .selected)
     }
 }
-
-/// Bar: the badges' model list is polled while the Models pane is open, with the tray closed.
-final class LiveViewPollingTests: XCTestCase {
-    @MainActor func testTheModelsPaneKeepsTheListPolledWithoutTheTray() {
-        let server = ServerManager()
-        server.status = .running
-        server.setLiveView(.models, visible: true)
-        XCTAssertTrue(server.isPolling)
-        server.setLiveView(.menu, visible: true)
-        server.setLiveView(.models, visible: false)
-        XCTAssertTrue(server.isPolling, "the tray still reads it")
-        server.setLiveView(.menu, visible: false)
-        XCTAssertFalse(server.isPolling)
-    }
-}
