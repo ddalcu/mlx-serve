@@ -2422,7 +2422,7 @@ private struct ActiveDownloadRow: View {
                 .frame(width: 116, alignment: .trailing)
             } else if state.status == .failed {
                 Button {
-                    downloads.start(repoId: repoId) { appState.refreshModels() }
+                    downloads.retry(repoId: repoId) { appState.refreshModels() }
                 } label: { Text(L10n.text(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry"))
                     .font(.app(.body)) }
                 .font(.app(.callout))
