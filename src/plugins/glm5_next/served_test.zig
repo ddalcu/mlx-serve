@@ -13,6 +13,8 @@ const plugin_head = @import("../../engines/mlx/plugin/head.zig");
 const mtpRun = @import("../../engines/mlx/plugin/proof_mtp.zig").mtpRun;
 const MtpHeadRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef;
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
+const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const generate = @import("../../engines/mlx/generate.zig");
 const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const driver = @import("../../engines/mlx/plugin/driver.zig");
 const File = @import("../../sdk/root.zig").fixture.File;
@@ -541,6 +543,75 @@ test "bailing_hybrid served: a streaming pack's span-major prompt is the chunk l
                 .{ .ends = &.{ 10, 20, 21, 33, 40 }, .cps = &.{ 20, 21, 33 }, .routed = 4, .ahead = 2, .ahead_rows = 32 },
             };
             for (cases) |cs| try expectSpanMajor(b, &prompt, cs);
+        }
+    }.run);
+}
+
+/// One prefill of `prompt` through the Generator at chunk and stride 256 and a cap of 16 with `anchors` low anchors: by
+/// the whole-prompt pass (`whole`) or by the chunk loop.
+fn lingPrefill(x: *Transformer, tok: *const Tokenizer, prompt: []const u32, anchors: usize, whole: bool) !Generator {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const caps = &x.config.plugin.?.parsed.caps;
+    const was = caps.whole_prompt_prefill;
+    defer caps.whole_prompt_prefill = was;
+    caps.whole_prompt_prefill = whole;
+    return Generator.initWithOptions(io, testing.allocator, x, tok, prompt, 1, .{ .temperature = 0.0 }, &.{}, .{
+        .skip_lazy_preforward = true,
+        .ssm_checkpoint_stride = 256,
+        .ssm_checkpoint_max = 16,
+        .ssm_low_anchors = anchors,
+        .logprobs_n = 64,
+    });
+}
+
+// Bar: the standard 18,380-token prompt at chunk 256 (70 planned checkpoints, one wide segment) prefills whole: it files
+// the chunk loop's checkpoints, the cap's 16 (low anchors on and off), and its first token's logprobs and the next
+// decode's logits are the chunk loop's, bit for bit.
+test "bailing_hybrid served: an 18,380-token prompt at chunk 256 prefills whole, filing the chunk loop's checkpoints and logits" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const a = testing.allocator;
+            const saved = generate.prefillCli().*;
+            defer generate.prefillCli().* = saved;
+            generate.prefillCli().* = .{ .override = 256, .explicit = true };
+            const prompt = try a.alloc(u32, 18_380);
+            defer a.free(prompt);
+            for (prompt, 0..) |*t, i| t.* = @intCast(3 + (i * 53) % 500);
+            const io = std.Io.Threaded.global_single_threaded.io();
+            var x = try driver.load(io, a, &b.cfg, b.dir, proof_fixture.stream());
+            defer x.deinit();
+            const m = host.of(x.plugin.?.model);
+            var tok_dummy: Tokenizer = undefined; // never read by the Generator
+            var g = ops.Graph.init(a, x.s);
+            defer g.deinit();
+            for ([_]usize{ 0, 2 }) |anchors| {
+                var whole = try lingPrefill(&x, &tok_dummy, prompt, anchors, true);
+                defer whole.deinit(a);
+                var loop = try lingPrefill(&x, &tok_dummy, prompt, anchors, false);
+                defer loop.deinit(a);
+                try testing.expectEqual(@as(usize, 16), whole.ssm_checkpoints.items.len);
+                try testing.expectEqual(loop.ssm_checkpoints.items.len, whole.ssm_checkpoints.items.len);
+                for (whole.ssm_checkpoints.items, loop.ssm_checkpoints.items) |w, l| {
+                    try testing.expectEqual(l.pos, w.pos);
+                    for (m.layers, 0..) |*lw, li| if (lw.mixer == .kda) {
+                        try ops.expectBitEqual(w.layers[li].conv_state, l.layers[li].conv_state);
+                        try ops.expectBitEqual(w.layers[li].ssm_state, l.layers[li].ssm_state);
+                    };
+                }
+                try testing.expectEqual(loop.next_token_id, whole.next_token_id);
+                const wl = whole.pending_logprob.?;
+                const ll = loop.pending_logprob.?;
+                try testing.expectEqual(@as(u32, @bitCast(ll.token_logprob)), @as(u32, @bitCast(wl.token_logprob)));
+                try testing.expectEqual(ll.top_logprobs.len, wl.top_logprobs.len);
+                for (wl.top_logprobs, ll.top_logprobs) |w, l| {
+                    try testing.expectEqual(l.token_id, w.token_id);
+                    try testing.expectEqual(@as(u32, @bitCast(l.logprob)), @as(u32, @bitCast(w.logprob)));
+                }
+                const next = [_]i32{@intCast(loop.next_token_id)};
+                const after = try g.adopt(try x.forwardWith(&loop.ctx, try proof_fixture.tokens(&g, &next)));
+                try ops.expectBitEqual(try g.adopt(try x.forwardWith(&whole.ctx, try proof_fixture.tokens(&g, &next))), after);
+            }
         }
     }.run);
 }
