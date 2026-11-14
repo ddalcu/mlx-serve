@@ -82,6 +82,43 @@ fn refSamples(b: *const job.Body) union(enum) { none, samples: []f32, bad_base64
     return .{ .samples = wav.decodePcm16Mono(gpa, bytes) catch return .bad_wav };
 }
 
+const voice_refusal = "voice: this pack's speakers and voice design are not supported yet; omit voice for its default voice, or use a -Base pack with ref_audio";
+const instructions_refusal = "instructions are not supported for Qwen3-TTS; omit them, or use a -Base pack with ref_audio for a voice";
+const speaker_refusal = "speaker is not supported for Qwen3-TTS; omit it, or use a -Base pack with ref_audio for a voice";
+
+/// A voice field no pack here honours is refused, never answered in the default voice. `voice` only on a pack whose
+/// own voice control (`voice_controls`) it names: OpenAI's API requires it, so a -Base pack keeps its plain voice.
+const VoiceField = enum {
+    voice,
+    instructions,
+    speaker,
+
+    fn verdict(self: VoiceField) Verdict {
+        return switch (self) {
+            .voice => bad(voice_refusal),
+            .instructions => bad(instructions_refusal),
+            .speaker => bad(speaker_refusal),
+        };
+    }
+};
+
+fn voiceFieldRefusal(b: *const job.Body, voice_controls: bool) ?VoiceField {
+    const present = struct {
+        fn of(body: *const job.Body, name: []const u8) bool {
+            const v = body.get(name) orelse return false;
+            return switch (v) {
+                .null => false,
+                .string => |s| s.len > 0,
+                else => true,
+            };
+        }
+    }.of;
+    if (present(b, "instructions")) return .instructions;
+    if (present(b, "speaker")) return .speaker;
+    if (voice_controls and present(b, "voice")) return .voice;
+    return null;
+}
+
 /// `language`: absent or `auto` (null) lets the model infer it from the text; otherwise a name the checkpoint declares.
 fn languageOf(e: *const Engine, b: *const job.Body) error{UnsupportedLanguage}!?i32 {
     const v = b.get("language") orelse return null;
@@ -115,6 +152,8 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .bad_wav => return bad("ref_audio is not a decodable WAV"),
     }
     const language = languageOf(e, &body) catch return bad("language is not one this model supports (auto, or a name in its codec_language_id)");
+    if (voiceFieldRefusal(&body, e.synth.model.cfg.voice_controls)) |field| return field.verdict();
+    e.synth.model.cfg.seed = body.uint("seed") orelse 0;
     const out = e.synth.synthesizeWav(text, max_frames, job.progressOf(progress), ref, language) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
         else => job.failure(err, "synthesis failed"),
@@ -342,6 +381,42 @@ test "qwen3_tts plugin: a named language conditions the codec prefix; auto is th
     try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":\"klingon\"}")).refused.why.slice());
     try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":\"beijing_dialect\"}")).refused.why.slice());
     try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":2071}")).refused.why.slice());
+}
+
+test "qwen3_tts plugin: a voice field no pack honours is refused by name; seed picks the draw" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var pack = try MediaPack.open(al);
+    defer pack.close();
+    try testing.expectEqualStrings(instructions_refusal, (try pack.run("{\"input\":\"hi\",\"instructions\":\"calm\"}")).refused.why.slice());
+    try testing.expectEqualStrings(speaker_refusal, (try pack.run("{\"input\":\"hi\",\"speaker\":\"ryan\"}")).refused.why.slice());
+    // OpenAI's API requires `voice`; a -Base pack keeps its plain voice for one.
+    const plain = try al.dupe(u8, (try pack.run("{\"input\":\"hi there\"}")).ok);
+    try testing.expectEqualSlices(u8, plain, (try pack.run("{\"input\":\"hi there\",\"voice\":\"alloy\"}")).ok);
+    const seeded = try al.dupe(u8, (try pack.run("{\"input\":\"hi there\",\"seed\":7}")).ok);
+    try testing.expectEqualSlices(u8, seeded, (try pack.run("{\"input\":\"hi there\",\"seed\":7}")).ok);
+    try testing.expect(!std.mem.eql(u8, plain, seeded));
+}
+
+test "qwen3_tts plugin: on a CustomVoice or VoiceDesign pack, voice is refused; empty fields read as absent" {
+    const cases = [_]struct { body: []const u8, controls: bool, want: ?VoiceField }{
+        .{ .body = "{\"voice\":\"ryan\"}", .controls = true, .want = .voice },
+        .{ .body = "{\"voice\":\"alloy\"}", .controls = false, .want = null },
+        .{ .body = "{\"voice\":\"\"}", .controls = true, .want = null },
+        .{ .body = "{\"instructions\":\"calm\"}", .controls = false, .want = .instructions },
+        .{ .body = "{\"instructions\":\"\"}", .controls = true, .want = null },
+        .{ .body = "{\"speaker\":\"ryan\"}", .controls = true, .want = .speaker },
+    };
+    for (cases) |c| {
+        var body = job.Body.parse(testing.allocator, c.body).?;
+        defer body.deinit();
+        try testing.expectEqual(c.want, voiceFieldRefusal(&body, c.controls));
+    }
+    try testing.expectEqualStrings(voice_refusal, VoiceField.voice.verdict().why.slice());
+    try testing.expect((try tts.parseConfig(testing.allocator, "{\"tts_model_type\":\"custom_voice\"}")).voice_controls);
+    try testing.expect((try tts.parseConfig(testing.allocator, "{\"tts_model_type\":\"voice_design\"}")).voice_controls);
+    try testing.expect(!(try tts.parseConfig(testing.allocator, "{\"tts_model_type\":\"base\"}")).voice_controls);
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());

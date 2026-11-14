@@ -44,6 +44,9 @@ const Weights = model_mod.Weights;
 // ── Config ──
 
 pub const TtsConfig = struct {
+    /// `tts_model_type` `custom_voice` or `voice_design`: the pack's own voice control (a speaker list, a voice
+    /// description), which this port does not run.
+    voice_controls: bool = false,
     // Talker (Qwen3).
     t_hidden: u32 = 2048,
     t_inter: u32 = 6144,
@@ -129,6 +132,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) !TtsConf
     const root = parsed.value;
     if (root != .object) return cfg;
     const obj = root.object;
+    if (obj.get("tts_model_type")) |v| if (v == .string) {
+        cfg.voice_controls = std.mem.eql(u8, v.string, "custom_voice") or std.mem.eql(u8, v.string, "voice_design");
+    };
 
     if (obj.get("talker_config")) |tc_v| {
         if (tc_v == .object) {
