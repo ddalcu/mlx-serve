@@ -76,13 +76,14 @@ pub fn indexerScores(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, 
 /// oMLX `patches/glm_moe_dsa/sparse_mla_nax.py` (Apache-2.0, see NOTICE): the sparse
 /// latent attention on the tensor units. One threadgroup per (query, 32-head half), 8
 /// simdgroups; per 128-slot tile, scores read key rows through the indices (never gathered),
-/// online exp2 softmax in f32, P as fp16 hi + lo pieces (MSV_DSA_TWO_P; the roped form one
-/// piece) against bf16 values, f32 accumulate.
+/// online exp2 softmax in f32, P as fp16 hi + lo pieces (MSV_DSA_TWO_P; the roped form and
+/// `sparseLatentOneP` one piece) against bf16 values, f32 accumulate.
 const SPARSE_NAX_HEADER = kernelSource("plugins/glm5_next/kernels/dsa_sparse_nax_header.metal");
 const SPARSE_NAX_SOURCE = kernelSource("plugins/glm5_next/kernels/dsa_sparse_nax.metal");
 
 var sparse_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var sparse_rope_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var sparse_onep_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var sparse_engaged = false;
 var sparse_rope_engaged = false;
 
@@ -91,7 +92,14 @@ var sparse_rope_engaged = false;
 /// slot is -1 and unused pools sort last, so whole tiles skip. Null off the GPU or outside the
 /// shape; the caller checks the device has NAX.
 pub fn sparseLatent(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
-    return sparse(s, q_abs, null, latent, null, idx, scale);
+    return sparse(s, q_abs, null, latent, null, idx, scale, false);
+}
+
+/// `sparseLatent` with P meeting the values as one fp16 piece (the text without MSV_DSA_TWO_P):
+/// half the PV MMAs, P rounded once to fp16, so not `sparseLatent`'s bits. Logs nothing; its
+/// caller (`dsa_prompt.sparseOneP`) does.
+pub fn sparseLatentOneP(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
+    return sparse(s, q_abs, null, latent, null, idx, scale, true);
 }
 
 /// `sparseLatent` with a roped part (DeepSeek-V3.2's MLA, GLM-5.3): each score adds the
@@ -99,10 +107,10 @@ pub fn sparseLatent(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_arr
 /// values the latent rows. `q_pe` [1, H, L, 64], `k_pe` [1, 1, K, 64]. P meets the values as
 /// one fp16 piece.
 pub fn sparseLatentRope(s: mlx.mlx_stream, q_lat: mlx.mlx_array, q_pe: mlx.mlx_array, latent: mlx.mlx_array, k_pe: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
-    return sparse(s, q_lat, q_pe, latent, k_pe, idx, scale);
+    return sparse(s, q_lat, q_pe, latent, k_pe, idx, scale, false);
 }
 
-fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent: mlx.mlx_array, k_pe: ?mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
+fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent: mlx.mlx_array, k_pe: ?mlx.mlx_array, idx: mlx.mlx_array, scale: f32, one_p: bool) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
     const qs = mlx.getShape(q_abs);
     const ls = mlx.getShape(latent);
@@ -125,7 +133,7 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
         if (ks.len != 4 or ks[0] != 1 or ks[1] != 1 or ks[2] != k or ks[3] != 64) return null;
         if (mlx.mlx_array_dtype(q_pe.?) != dt or mlx.mlx_array_dtype(k_pe.?) != dt) return null;
     }
-    const slot = if (rope) &sparse_rope_kernel else &sparse_kernel;
+    const slot = if (rope) &sparse_rope_kernel else if (one_p) &sparse_onep_kernel else &sparse_kernel;
     const kern = slot.* orelse blk: {
         const ins_plain = [_][*:0]const u8{ "q", "kv", "idx", "params", "scale" };
         const ins_rope = [_][*:0]const u8{ "q", "qpe", "kv", "pe", "idx", "params", "scale" };
@@ -137,6 +145,8 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
         defer _ = mlx.mlx_vector_string_free(ov);
         const kn = if (rope)
             mlx.mlx_fast_metal_kernel_new("msv_dsa_sparse_mla_rope_nax", iv, ov, "#define MSV_DSA_ROPE\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false)
+        else if (one_p)
+            mlx.mlx_fast_metal_kernel_new("msv_glm5_sparse_mla_nax_onep", iv, ov, SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false)
         else
             mlx.mlx_fast_metal_kernel_new("msv_glm5_sparse_mla_nax", iv, ov, "#define MSV_DSA_TWO_P\n" ++ SPARSE_NAX_SOURCE, SPARSE_NAX_HEADER, true, false);
         if (kn.ctx == null) return error.MetalKernelCompileFailed;
@@ -181,7 +191,7 @@ fn sparse(s: mlx.mlx_stream, q_abs: mlx.mlx_array, q_pe: ?mlx.mlx_array, latent:
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, o3, &[_]c_int{ 1, h, l, 512 }, 4, s));
     const engaged = if (rope) &sparse_rope_engaged else &sparse_engaged;
-    if (!engaged.*) {
+    if (!one_p and !engaged.*) {
         engaged.* = true;
         log.info("[dsa] NAX sparse latent attention{s} engaged\n", .{if (rope) " (roped part)" else ""});
     }

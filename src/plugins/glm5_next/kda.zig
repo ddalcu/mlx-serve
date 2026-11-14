@@ -17,8 +17,13 @@ const gate_mod = @import("../../sdk/blocks/gdn/gate.zig");
 const gdn_decode = @import("../../sdk/blocks/gdn/decode.zig");
 const decode_fused = @import("../../sdk/blocks/gdn/decode_fused.zig");
 const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
+const env = @import("../../env.zig");
 const sliceQkvPart = @import("../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
 const trunk = @import("trunk.zig");
+const kda_verify = @import("kda_verify.zig");
+const kda_prologue = @import("kda_prologue.zig");
+const kda_percore = @import("kda_percore.zig");
+const kda_chunk = @import("kda_chunk.zig");
 
 const Array = mlx.mlx_array;
 const Model = trunk.Model;
@@ -45,6 +50,14 @@ pub fn low(m: *const Model, l: *const trunk.Linear) kda_recurrence.Low {
     const dense = l.s.ctx == null;
     return .{ .w = l.w, .s = l.s, .b = l.b, .bits = if (dense) m.c.quant_bits else l.bits, .gs = if (dense) m.c.quant_group_size else l.group_size };
 }
+
+/// A kill switch: on unless set to `0`.
+fn switchOn(comptime name: @EnumLiteral()) bool {
+    return if (env.get(name)) |v| v[0] != '0' else true;
+}
+
+var prompt_normgate_said = false;
+var verify_said = false;
 
 fn free(a: Array) void {
     if (a.ctx != null) _ = mlx.mlx_array_free(a);
@@ -271,8 +284,35 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         kda_recurrence.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype());
     // Wide prework is token-local; a cold chunk supplies the same zero history as the composed conv.
     const prefill_fused = kda_fused and is_prefill and decode_fused.gdnPrefillFusedFor(seq_len, batch);
-    if (kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
-        kernel == 4 and (e.initialized or prefill_fused))
+    // GLM's prompt rows: where the per-core route declines they take the norm-gate epilogue below.
+    const prompt_rows = c.isGlm5() and bounded and is_prefill and !capture and batch == 1 and seq_len >= 17;
+    // GLM's verify rows the joined decode step left to the chain: the same packed prework, the gate in one launch and
+    // the norm-gate epilogue (MLX_SERVE_GLM_KDA_VERIFY), with the capture's conv input as the chain makes it.
+    const verify_rows = c.isGlm5() and bounded and capture and batch == 1;
+    const verify_texts = verify_rows and switchOn(.MLX_SERVE_GLM_KDA_VERIFY);
+    const verify_prework = verify_texts and kernel == 4;
+    // GLM's prompt rows where the per-core route declines: the chunkwise recurrence, the gate built in its launch
+    // (MLX_SERVE_KDA_PROMPT_CHUNK, rounding-class).
+    const sw = if (prompt_rows and !kda_fused) try kda_chunk.switches() else kda_chunk.Switches{};
+    const chunk = sw.chunk and kda_chunk.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype(), la.a_log_h, la.dt_f32, c.kda_gate_lower_bound);
+    // GLM's prompt rows: the prologue in one launch (MLX_SERVE_KDA_PROMPT_PROLOGUE).
+    const prologue = if (!kda_fused and prompt_rows and kernel == 4 and switchOn(.MLX_SERVE_KDA_PROMPT_PROLOGUE))
+        try kda_prologue.prologue(s, qkv, if (e.initialized) e.conv_state else null, la.conv_w, inv_scale_sq, inv_sqrt_sc, qkNormEps(m), num_k_heads, dk, num_v_heads, dv, kernel)
+    else
+        null;
+    if (prologue) |p| {
+        free(e.conv_state);
+        e.conv_state = p.window;
+        e.initialized = true;
+        _ = mlx.mlx_array_free(q_scaled);
+        _ = mlx.mlx_array_free(k_scaled);
+        _ = mlx.mlx_array_free(v_heads);
+        q_scaled = p.q;
+        k_scaled = p.k;
+        v_heads = p.v;
+    }
+    if ((kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
+        kernel == 4 and (e.initialized or prefill_fused)) or verify_prework)
     blk: {
         var zero_conv: Array = .{ .ctx = null };
         defer free(zero_conv);
@@ -307,7 +347,15 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
             .batch = batch,
             .gate = false,
             .g_dtype = gdn_decode.gateDtype(mlx.mlx_array_dtype(qkv), m.ssmStateDtype()),
+            // A verify is held to the composed chain: MLX's sigmoid op, not the formula's fast exp.
+            .table = verify_prework,
         }) catch null) orelse break :blk;
+        if (verify_prework) {
+            free(e.spec_conv_input);
+            e.spec_conv_input = .{ .ctx = null };
+            e.spec_conv_input = try kda_verify.convInput(s, incoming_conv, qkv);
+            kda_verify.runs.prework += 1;
+        }
         free(e.conv_state);
         e.conv_state = pre.conv_state;
         e.initialized = true;
@@ -326,7 +374,7 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         beta_fused = pre.beta;
     }
 
-    if (!fused_prework) {
+    if (!fused_prework and prologue == null) {
         var g = ops.Graph.init(std.heap.c_allocator, s);
         defer g.deinit();
         const conv = try conv1d.run(&g, qkv, if (e.initialized) e.conv_state else null, la.conv_w, null, batch, conv_dim, kernel, true);
@@ -361,12 +409,23 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, s));
     }
 
+    // GLM's prompt rows where the stock per-core route declines: its kernel at two threadgroups a core
+    // (MLX_SERVE_KDA_PROMPT_PERCORE, rounding-class) after the prologue or the chain; the chunkwise route
+    // takes the rows first where it serves.
+    const percore = !chunk and !kda_fused and prompt_rows and env.on(.MLX_SERVE_KDA_PROMPT_PERCORE) and
+        la.a_log_h.ctx != null and la.dt_f32.ctx != null and
+        kda_percore.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype());
+
     // One gate value per key channel: the bounded sigmoid where the config bounds it (fla's two arms), else the
-    // softplus chain over `A_log` expanded per channel. The per-core recurrence builds the gate itself.
-    const g = if (kda_fused) Array{ .ctx = null } else if (bounded)
-        try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s)
-    else
-        try softplusGate(m, la.A_log, a_proj, la.dt_bias);
+    // softplus chain over `A_log` expanded per channel. The per-core and chunkwise recurrences build the gate themselves.
+    var verify_gate = false;
+    const g = if (kda_fused or percore or chunk) Array{ .ctx = null } else if (bounded) pick: {
+        if (verify_texts) if (try kda_verify.gate(s, a_proj, la.dt_bias, la.A_log, c.kda_gate_lower_bound, switchOn(.MLX_SERVE_GLM_KDA_EXPSIG))) |vg| {
+            verify_gate = true;
+            break :pick vg;
+        };
+        break :pick try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s);
+    } else try softplusGate(m, la.A_log, a_proj, la.dt_bias);
     defer free(g);
 
     const beta = beta_fused orelse blk: {
@@ -406,6 +465,14 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
             free(e.spec_state_seq);
             e.spec_state_seq = r.state_seq;
         }
+    } else if (verify_rows and switchOn(.MLX_SERVE_GLM_KDA_LAZY_SEQ)) {
+        const r = try kda_verify.captureLazy(s, .{ q_scaled, k_scaled, v_heads, g, beta, e.ssm_state, T_scalar }, in_dtype, out_dtype, num_k_heads, num_v_heads, dk, dv, batch, seq_len);
+        _ = mlx.mlx_array_free(y_bthd);
+        y_bthd = r.y;
+        free(e.spec_state_seq);
+        e.spec_state_seq = r.state_seq;
+        _ = mlx.mlx_array_free(e.ssm_state);
+        e.ssm_state = r.state;
     } else if (capture) {
         // Per-row states for rollback: state_seq [T, B, Hv, Dv, Dk] (its last row unwritten), the final state its
         // own output.
@@ -432,8 +499,17 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         try mlx.check(mlx.mlx_vector_array_get(&final_state, out_vec, 2));
         _ = mlx.mlx_array_free(e.ssm_state);
         e.ssm_state = final_state;
-    } else if (kda_fused) {
-        const r = try kda_recurrence.recur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state);
+    } else if (kda_fused or percore) {
+        const r = if (percore)
+            try kda_percore.recur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state)
+        else
+            try kda_recurrence.recur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state);
+        _ = mlx.mlx_array_free(y_bthd);
+        y_bthd = r.y;
+        _ = mlx.mlx_array_free(e.ssm_state);
+        e.ssm_state = r.state;
+    } else if (chunk) {
+        const r = try kda_chunk.recur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state);
         _ = mlx.mlx_array_free(y_bthd);
         y_bthd = r.y;
         _ = mlx.mlx_array_free(e.ssm_state);
@@ -457,11 +533,31 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         e.ssm_state = new_state;
     }
 
-    // rms_norm(y) * sigmoid(z) straight to the out projection's input (decode and verify widths).
-    if (fused_prework) {
+    // rms_norm(y) * sigmoid(z) straight to the out projection's input (decode and verify widths, the per-core route's
+    // prompt rows, and any prompt's rows under MLX_SERVE_KDA_PROMPT_NORMGATE).
+    const prompt_normgate = !kda_fused and prompt_rows and switchOn(.MLX_SERVE_KDA_PROMPT_NORMGATE);
+    if (fused_prework or prompt_normgate or verify_texts) {
         if (m.kda.eps.ctx == null) m.kda.eps = mlx.mlx_array_new_float(c.rms_norm_eps);
-        if (try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)) |flat|
+        const fused = if (prompt_normgate)
+            try decode_fused.gdnNormGatePrompt(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, seq_len)
+        else if (verify_texts)
+            try decode_fused.gdnNormGateChain(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)
+        else
+            try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len);
+        if (verify_texts) {
+            if (fused != null) kda_verify.runs.normgate += 1;
+            if (!verify_said) {
+                verify_said = true;
+                log.info("[kda] verify engaged: S={d} Hv={d} prework={} gate={} norm-gate={}\n", .{ seq_len, num_v_heads, fused_prework, verify_gate, fused != null });
+            }
+        }
+        if (fused) |flat| {
+            if (prompt_normgate and !prompt_normgate_said) {
+                prompt_normgate_said = true;
+                log.info("[kda] prompt norm-gate engaged: S={d} Hv={d}\n", .{ seq_len, num_v_heads });
+            }
             return outProj(m, la, flat, given != null);
+        }
     }
     var z_heads = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(z_heads);
@@ -483,7 +579,7 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     return outProj(m, la, out_flat, given != null);
 }
 
-fn templateArgs(kcfg: mlx.mlx_fast_metal_kernel_config, in_dt: mlx.mlx_dtype, st_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, dk: c_int, dv: c_int, hk: c_int, hv: c_int) !void {
+pub fn templateArgs(kcfg: mlx.mlx_fast_metal_kernel_config, in_dt: mlx.mlx_dtype, st_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, dk: c_int, dv: c_int, hk: c_int, hv: c_int) !void {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "InT", in_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "StT", st_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "OutT", out_dt));

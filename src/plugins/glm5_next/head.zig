@@ -13,6 +13,9 @@ const trunk = @import("trunk.zig");
 const table_forward = @import("table_forward.zig");
 const glm_moe = @import("moe.zig");
 const Slots = @import("slots.zig").Slots;
+const dsa_append = @import("dsa_append.zig");
+const env = @import("../../env.zig");
+const log = @import("../../sdk/util/log.zig");
 
 const Array = mlx.mlx_array;
 const Verdict = abi.Verdict;
@@ -44,6 +47,10 @@ fn step(m: *host.Model, h: *const trunk.Head, ops: *const abi.CacheOps, f: *cons
     // The legacy head attends at its cache's own length, never the trunk's position.
     const pos = [_]u32{@intCast(ops.len(f.caches.slice()[0], 0))};
     const sl: Slots = .{ .ops = ops, .caches = f.caches.slice(), .positions = &pos };
+    // MLX_SERVE_GLM_DSA_TAILS: the step's DSA layer's indexer tail rows read first (its cache append then reuses the
+    // buffer), dropped at the step's end.
+    try dsa_append.begin(s, sl, false, mlx.getShape(ids), &.{0});
+    defer dsa_append.end();
 
     const emb = try m.embedding(ids);
     defer _ = mlx.mlx_array_free(emb);
@@ -72,16 +79,60 @@ fn step(m: *host.Model, h: *const trunk.Head, ops: *const abi.CacheOps, f: *cons
     try mlx.check(mlx.mlx_add(&x1, x, attn, s));
     const m_in = try m.rmsNorm(x1, h.post_norm);
     defer _ = mlx.mlx_array_free(m_in);
+    // Only the last row is returned (a history append's output is never read: it runs whole).
+    if (n > 1 and f.want_hidden and lastRowOn()) if (try glm_moe.forwardLastRow(&h.moe, s, m_in)) |mlp1| {
+        defer _ = mlx.mlx_array_free(mlp1);
+        lastRowEngaged();
+        return tailLast(m, h, x1, mlp1);
+    };
     const mlp = try glm_moe.forward(&h.moe, s, m_in);
     defer _ = mlx.mlx_array_free(mlp);
-    var y = mlx.mlx_array_new();
+    const y = try addOf(s, x1, mlp);
     defer _ = mlx.mlx_array_free(y);
-    try mlx.check(mlx.mlx_add(&y, x1, mlp, s));
-    var last = mlx.mlx_array_new();
+    const last = try lastRow(s, y);
     defer _ = mlx.mlx_array_free(last);
-    const sh = mlx.getShape(y);
-    try mlx.check(mlx.mlx_slice(&last, y, &[_]c_int{ 0, sh[1] - 1, 0 }, 3, &[_]c_int{ 1, sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
     return m.rmsNorm(last, h.norm);
+}
+
+var last_row_switch: ?bool = null;
+var last_row_said = false;
+
+/// MLX_SERVE_GLM_HEAD_LAST_ROW, read once.
+fn lastRowOn() bool {
+    if (last_row_switch == null) last_row_switch = if (env.get(.MLX_SERVE_GLM_HEAD_LAST_ROW)) |v| v[0] != '0' else true;
+    return last_row_switch.?;
+}
+
+fn lastRowEngaged() void {
+    if (last_row_said) return;
+    last_row_said = true;
+    log.info("[glm5_next] MTP head last-row experts engaged\n", .{});
+}
+
+fn addOf(s: mlx.mlx_stream, a: Array, b: Array) !Array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_add(&out, a, b, s));
+    return out;
+}
+
+/// The step's last row of `x1 + mlp` under the final norm, over the MoE's last row alone (`mlp1` [1, 1, D]): the bytes
+/// the whole step makes for that row (the add is elementwise, the norm a row's).
+fn tailLast(m: *host.Model, h: *const trunk.Head, x1: Array, mlp1: Array) !Array {
+    const last = try lastRow(m.s, x1);
+    defer _ = mlx.mlx_array_free(last);
+    const y = try addOf(m.s, last, mlp1);
+    defer _ = mlx.mlx_array_free(y);
+    return m.rmsNorm(y, h.norm);
+}
+
+/// Row S - 1 of `y` [1, S, D]: [1, 1, D].
+fn lastRow(s: mlx.mlx_stream, y: Array) !Array {
+    const sh = mlx.getShape(y);
+    var last = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(last);
+    try mlx.check(mlx.mlx_slice(&last, y, &[_]c_int{ 0, sh[1] - 1, 0 }, 3, &[_]c_int{ 1, sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    return last;
 }
 
 fn noop(_: *anyopaque, _: u32) callconv(.c) Verdict {

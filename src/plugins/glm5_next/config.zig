@@ -616,7 +616,12 @@ fn glmFacts(c: *const Config, p: *abi.Parsed) void {
         .dflash_policy = true,
         .images = c.advertises_images,
     };
-    if (c.streamed_bank) bankFacts(p);
+    if (c.streamed_bank) {
+        bankFacts(p);
+        // A prompt's last chunk and its held-back span in one forward: each MoE layer's streamed records read once for
+        // both (`table_forward.hiddenSplit`), where the bank declares independent rows; else refused, two forwards.
+        p.caps.split_prefill = true;
+    }
     p.shell.state_dtype = .f32;
     p.chat.thinking_default = .on;
     p.chat.effort_vocab = .glm5;

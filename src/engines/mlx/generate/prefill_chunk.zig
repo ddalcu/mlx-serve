@@ -290,6 +290,92 @@ pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize, restored: bool) 
     return SSM_SNAPSHOT_BACKOFF;
 }
 
+/// `MLX_SERVE_PREFILL_SPLIT`: on unless set to `0` (a kill switch). The split runs only where the served plugin declares
+/// `Caps.split_prefill`, so the default reaches no other model.
+pub fn splitSwitchOn() bool {
+    return if (env.get(.MLX_SERVE_PREFILL_SPLIT)) |v| v[0] != '0' else true;
+}
+
+/// A split prompt forward runs only when both spans are wider than this; narrower stays two forwards.
+pub const PREFILL_SPLIT_MIN_ROWS: usize = 16;
+
+/// Whether the prompt loop's last chunk (span A) and the held-back final span (span B: the snapshot backoff and the
+/// last token) run as ONE split forward (`MLX_SERVE_PREFILL_SPLIT`, `Forward.split_rows`), and if not, why not.
+pub const PrefillSplit = enum {
+    split,
+    /// `MLX_SERVE_PREFILL_SPLIT=0`.
+    off,
+    /// No plugin serves the model, or its plugin does not declare `Caps.split_prefill`.
+    undeclared,
+    /// Per-request state lives on the module (`ownsModuleDecodeState`), where no scratch cache sees span A's state.
+    module_state,
+    /// The model takes the whole prompt in one forward (`prefillsWholePrompt`).
+    whole_prompt,
+    /// Nothing is held back (`ssmSnapshotBackoff` is 0: no SSM checkpointing, or a short prompt).
+    no_backoff,
+    /// A chunk before the loop's last one.
+    not_last_chunk,
+    /// Vision or audio rows spliced into the prompt, or an M-RoPE position table.
+    media,
+    /// A DFlash request, or layer capture.
+    dflash,
+    /// The request reads every prompt row's logits (`prompt_logprobs`).
+    prompt_logprobs,
+    /// A spoken reply.
+    speech,
+    /// A batched forward.
+    batched,
+    /// The Neural Engine computes the chunk's projections (`--ane-prefill`).
+    ane,
+    /// A forward feature the split forward does not carry: an encoder or verify forward, a mask, input rows, a
+    /// deferred host input, a capture target already set, a directional ablation.
+    forward_feature,
+    /// A span of `PREFILL_SPLIT_MIN_ROWS` rows or fewer.
+    short_span,
+};
+
+/// What `prefillSplit` decides on, all read before the chunk's forward.
+pub const PrefillSplitIn = struct {
+    switch_on: bool,
+    declared: bool,
+    module_state: bool = false,
+    whole_prompt: bool = false,
+    /// `ssmSnapshotBackoff` for this prompt.
+    backoff: usize,
+    /// The chunk ends at the loop's end.
+    last_chunk: bool,
+    /// The chunk's rows, and the final span's (`backoff + 1`).
+    rows_a: usize,
+    rows_b: usize,
+    media: bool = false,
+    dflash: bool = false,
+    prompt_logprobs: bool = false,
+    speech: bool = false,
+    batched: bool = false,
+    ane: bool = false,
+    forward_feature: bool = false,
+};
+
+/// PURE: `.split` when the chunk and the held-back final span run as one split forward, else the first gate that
+/// keeps them two forwards.
+pub fn prefillSplit(in: PrefillSplitIn) PrefillSplit {
+    if (!in.switch_on) return .off;
+    if (!in.declared) return .undeclared;
+    if (in.module_state) return .module_state;
+    if (in.whole_prompt) return .whole_prompt;
+    if (in.backoff == 0) return .no_backoff;
+    if (!in.last_chunk) return .not_last_chunk;
+    if (in.media) return .media;
+    if (in.dflash) return .dflash;
+    if (in.prompt_logprobs) return .prompt_logprobs;
+    if (in.speech) return .speech;
+    if (in.batched) return .batched;
+    if (in.ane) return .ane;
+    if (in.forward_feature) return .forward_feature;
+    if (in.rows_a <= PREFILL_SPLIT_MIN_ROWS or in.rows_b <= PREFILL_SPLIT_MIN_ROWS) return .short_span;
+    return .split;
+}
+
 /// Under `longCtxGated` the chunk loop lays dense checkpoint anchors every 8192
 /// through the first 65536, whatever stride the request coarsened to (#794): a
 /// deep entry's grid then always answers `highestSsmPosAtOrBelow` for a fork
@@ -993,6 +1079,92 @@ test "ssmSnapshotBackoff: engages only under checkpointing and past the backoff 
     // (seq >= 32 turns it into a "prefill" costing ~450ms of eval bubbles):
     // tail = backoff + 1 <= 31.
     try testing.expect(SSM_SNAPSHOT_BACKOFF + 1 < 32);
+}
+
+/// A 16K prompt's last chunk and its held-back span on a declaring plugin, every other gate open.
+fn splitCase() PrefillSplitIn {
+    return .{
+        .switch_on = true,
+        .declared = true,
+        .backoff = SSM_SNAPSHOT_BACKOFF,
+        .last_chunk = true,
+        .rows_a = 16_356,
+        .rows_b = SSM_SNAPSHOT_BACKOFF + 1,
+    };
+}
+
+test "prefillSplit: the last chunk and the held-back span split only with every gate open" {
+    try testing.expectEqual(PrefillSplit.split, prefillSplit(splitCase()));
+    // The held-back span is always backoff + 1 rows: wide enough to split.
+    try testing.expect(SSM_SNAPSHOT_BACKOFF + 1 > PREFILL_SPLIT_MIN_ROWS);
+    const Gate = struct { tag: PrefillSplit, in: PrefillSplitIn };
+    var cases: [14]Gate = undefined;
+    for (&cases) |*c| c.in = splitCase();
+    cases[0].tag = .off;
+    cases[0].in.switch_on = false;
+    cases[1].tag = .undeclared;
+    cases[1].in.declared = false;
+    cases[2].tag = .module_state;
+    cases[2].in.module_state = true;
+    cases[3].tag = .whole_prompt;
+    cases[3].in.whole_prompt = true;
+    cases[4].tag = .no_backoff;
+    cases[4].in.backoff = 0;
+    cases[5].tag = .not_last_chunk;
+    cases[5].in.last_chunk = false;
+    cases[6].tag = .media;
+    cases[6].in.media = true;
+    cases[7].tag = .dflash;
+    cases[7].in.dflash = true;
+    cases[8].tag = .prompt_logprobs;
+    cases[8].in.prompt_logprobs = true;
+    cases[9].tag = .speech;
+    cases[9].in.speech = true;
+    cases[10].tag = .batched;
+    cases[10].in.batched = true;
+    cases[11].tag = .ane;
+    cases[11].in.ane = true;
+    cases[12].tag = .forward_feature;
+    cases[12].in.forward_feature = true;
+    cases[13].tag = .short_span;
+    cases[13].in.rows_a = PREFILL_SPLIT_MIN_ROWS;
+    for (cases) |c| try testing.expectEqual(c.tag, prefillSplit(c.in));
+}
+
+test "prefillSplit: both spans must be wider than the minimum; the switch outranks every other gate" {
+    var in = splitCase();
+    in.rows_a = PREFILL_SPLIT_MIN_ROWS + 1;
+    try testing.expectEqual(PrefillSplit.split, prefillSplit(in));
+    in.rows_b = PREFILL_SPLIT_MIN_ROWS;
+    try testing.expectEqual(PrefillSplit.short_span, prefillSplit(in));
+    in.rows_b = PREFILL_SPLIT_MIN_ROWS + 1;
+    in.rows_a = 1;
+    try testing.expectEqual(PrefillSplit.short_span, prefillSplit(in));
+    // Off is off whatever else holds: the switch-off path never reads the rest.
+    const off: PrefillSplitIn = .{ .switch_on = false, .declared = false, .backoff = 0, .last_chunk = false, .rows_a = 0, .rows_b = 0, .media = true, .dflash = true };
+    try testing.expectEqual(PrefillSplit.off, prefillSplit(off));
+    // Without SSM checkpointing nothing is held back: the final forward is the last token alone, nothing to split.
+    try testing.expectEqual(PrefillSplit.no_backoff, prefillSplit(.{ .switch_on = true, .declared = true, .backoff = ssmSnapshotBackoff(false, 8192, false), .last_chunk = true, .rows_a = 8191, .rows_b = 1 }));
+}
+
+test "prefill split: the switch is a kill flag, on unless 0, and the check a diag token" {
+    try testing.expectEqual(env.Kind.kill, env.info(.MLX_SERVE_PREFILL_SPLIT).kind);
+    try testing.expectEqual(env.Type.flag, env.info(.MLX_SERVE_PREFILL_SPLIT).type);
+    try testing.expectEqual(env.Kind.diag, env.info(.PREFILL_SPLIT_CHECK).kind);
+    const sw = env.override(.MLX_SERVE_PREFILL_SPLIT, null);
+    defer sw.restore();
+    const dg = env.override(.MLX_SERVE_DIAG, null);
+    defer dg.restore();
+    try testing.expect(splitSwitchOn());
+    try testing.expect(!env.on(.PREFILL_SPLIT_CHECK));
+    env.set(.MLX_SERVE_PREFILL_SPLIT, "1");
+    try testing.expect(splitSwitchOn());
+    env.set(.MLX_SERVE_PREFILL_SPLIT, "0");
+    try testing.expect(!splitSwitchOn());
+    env.set(.MLX_SERVE_DIAG, "step-trace,prefill-split-check");
+    try testing.expect(env.on(.PREFILL_SPLIT_CHECK));
+    env.set(.MLX_SERVE_DIAG, "prefill-split");
+    try testing.expect(!env.on(.PREFILL_SPLIT_CHECK));
 }
 
 test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill chunk (dense AND MoE)" {

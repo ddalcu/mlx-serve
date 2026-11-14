@@ -711,6 +711,7 @@ pub const Transformer = struct {
     pub const moduleStateSpecRollback = @import("dispatch.zig").moduleStateSpecRollback;
     pub const forward = @import("dispatch.zig").forward;
     pub const forwardWith = @import("dispatch.zig").forwardWith;
+    pub const forwardSplit = @import("dispatch.zig").forwardSplit;
     pub const supportsLayerCapture = @import("dispatch.zig").supportsLayerCapture;
     // engines/mlx/spec/trunk_hooks.zig
     pub const lmHeadForDraft = @import("spec/trunk_hooks.zig").lmHeadForDraft;

@@ -67,8 +67,21 @@ pub const Slots = struct {
         try ok(self.ops.set_state(self.caches[i], layer, which, ab(value)));
     }
 
+    /// The state `which` of `layer` in slot `i` written to the cache `dst` (which takes its own reference): a split prompt
+    /// forward's span A states (`Forward.split_states`). Refused when the slot holds none.
+    pub fn copyState(self: Slots, i: usize, layer: u32, which: abi.StateSlot, dst: abi.Handle) !void {
+        const v = self.ops.state(self.caches[i], layer, which);
+        if (v.ctx == null) return error.GlmSplitNoState;
+        try ok(self.ops.set_state(dst, layer, which, v));
+    }
+
     /// Evaluates `h` with every recurrent state the slots hold (a prompt chunk's memory bound).
     pub fn evalWith(self: Slots, h: Array, layers: u32) !void {
+        return self.evalWithAsync(h, layers, false);
+    }
+
+    /// `evalWith`; `async_eval` hands the same arrays to the GPU without the host's wait.
+    pub fn evalWithAsync(self: Slots, h: Array, layers: u32, async_eval: bool) !void {
         const vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(vec);
         _ = mlx.mlx_vector_array_append_value(vec, h);
@@ -76,7 +89,7 @@ pub const Slots = struct {
             const c = self.state(i, @intCast(li), .conv);
             if (c.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, c);
         };
-        try mlx.check(mlx.mlx_eval(vec));
+        try mlx.check(if (async_eval) mlx.mlx_async_eval(vec) else mlx.mlx_eval(vec));
     }
 };
 
@@ -92,6 +105,10 @@ pub fn entryOf(sl: Slots, i: usize, layer: u32) kda_mod.Entry {
     const ssm = sl.state(i, layer, .ssm);
     return .{ .conv_state = takeRef(conv), .ssm_state = takeRef(ssm), .initialized = conv.ctx != null or ssm.ctx != null };
 }
+
+/// The states a KDA layer's prompt rows leave in the cache (`putEntry` without a verify's capture): what a split prompt
+/// forward hands the host for span A (`Forward.split_states`).
+pub const prompt_state_slots = [_]abi.StateSlot{ .conv, .ssm };
 
 /// Writes the entry's state (and a verify's per-row capture) back to slot `i`, then frees the entry.
 pub fn putEntry(sl: Slots, i: usize, layer: u32, e: *kda_mod.Entry) !void {

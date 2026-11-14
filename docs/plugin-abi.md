@@ -156,7 +156,8 @@ Model facts the host keeps once at load. Defaults are the generic model's.
 | `ablation` | `bool` | `false` | The forward honours `Forward.ablation` on every pass that writes the residual stream (a native drafter's rounds included). A plugin that resumes its own state across requests (`CacheHooks.resume_prompt`) resumes only under the same `Ablation.keys` entry. |
 | `prompt_last_row` | `bool` | `false` | A prompt forward asked for `Logits.last_row` returns its last row's logits alone, bit-identical to that row of its `.all_rows` result, and still every hidden and captured row it is asked for. The host asks for it on the prefill's prompt forwards unless the request echoes prompt logprobs. |
 | `experts_stream` | `bool` | `false` | The load streams an MLX pack's routed experts on the `stream_experts` setting (`sdk/weights/streamed.zig`): the preflight bills their slot rows, not the experts. Without it the setting is refused by name. |
-| `_` | `u31` | `0` |  |
+| `split_prefill` | `bool` | `false` | The forward serves a split prompt forward (`Forward.split_rows`, `Forward.split_states`). |
+| `_` | `u30` | `0` |  |
 
 ### `ThinkingDefault` (enum(u8))
 
@@ -544,6 +545,8 @@ One forward. `tokens` holds `rows` tokens per slot, slot after slot; `slots`, `p
 | `ablation` | `?*const Ablation` | `null` | Directional ablation for this forward's slots (`Caps.ablation`); null = none, the forward unchanged. |
 | `prompt_spans` | `Span(u64)` | `.{}` | A prompt forward the engine does not chunk: a whole-prompt prefill (`Caps.whole_prompt_prefill`), or a hybrid's restored tail inside the snapshot backoff. The absolute positions where the engine's chunk loop would end its spans, ascending, the last `positions[0] + rows`; empty = the model chunks as it likes. Read it only when `size` reaches it: an older host's `Forward` ends before it. |
 | `ssm_checkpoints` | `Span(u64)` | `.{}` | The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending, each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it. |
+| `split_rows` | `u32` | `0` | A split prompt forward (mode `.prefill`, one slot, a model declaring `Caps.split_prefill`): the first `split_rows` of `rows` are span A, the rest span B, whose first position is `positions[0] + split_rows`. Every layer runs span A, then span B, and each span's arithmetic is the forward it would be alone (its own row count for every non-routed op). The results are span B's (`ForwardOut`). 0 = an ordinary forward. Read it through `splitRows` (size-gated). |
+| `split_states` | `Handle` | `null` | With `split_rows`: a cache handle whose recurrent-state slots (`CacheOps.state` / `set_state`, every `StateSlot` the model keeps) receive, at each layer, span A's state (the state a forward of span A alone leaves) before span B updates `caches[0]`. Its KV is never appended to or read. Read it through `splitStates`. |
 
 ### `Ablation` (extern struct)
 
@@ -677,7 +680,7 @@ What a native drafter's round committed.
 
 ### `ForwardOut` (extern struct)
 
-The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number of slots (`.last_row`) or of tokens (`.all_rows`).
+The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number of slots (`.last_row`) or of tokens (`.all_rows`). A split forward's (`Forward.split_rows`) `logits` are the ones a forward of span B alone returns (B's rows for `.all_rows`, its last row for `.last_row`), and its `hidden` holds span A's rows, then span B's (`[1, rows, hidden]`), each span's as its own forward returns them; the host never asks a split forward for `capture_layers`.
 
 | Field | Type | Default | |
 |---|---|---|---|
@@ -1321,6 +1324,7 @@ A streamed bank of routed experts, as the trunk's MoE reads one whose math it do
 | `next_ahead` | `?*const fn (ctx: ?*anyopaque, layer: u32, ids: Array) callconv(.c) Verdict` | `null` |  |
 | `meters` | `?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void` | `null` | The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next call; the model logs them beside `[spec-stats]` at the request's end. Null: none. |
 | `exact_rows` | `bool` | `false` | A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets. Appended: read only where `size` reaches it. |
+| `rows_independent` | `bool` | `false` | A prompt call of `rows` (more routed ids than `decode_ids`) sums each routed row by itself: a row's bytes do not depend on the call's other rows, so the model may run two prompt forwards' rows in one call (a split prompt forward, `Forward.split_rows`). False: not declared. |
 
 ### `Swiglu` (extern struct)
 

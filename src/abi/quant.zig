@@ -198,6 +198,10 @@ pub const Bank = extern struct {
     /// A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets.
     /// Appended: read only where `size` reaches it.
     exact_rows: bool = false,
+    /// A prompt call of `rows` (more routed ids than `decode_ids`) sums each routed row by itself: a row's bytes do not
+    /// depend on the call's other rows, so the model may run two prompt forwards' rows in one call (a split prompt
+    /// forward, `Forward.split_rows`). False: not declared.
+    rows_independent: bool = false,
 };
 
 pub const Swiglu = extern struct {

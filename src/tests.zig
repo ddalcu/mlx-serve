@@ -212,6 +212,13 @@ test {
     _ = @import("sdk/blocks/attention/nax_attention.zig");
     _ = @import("plugins/glm5_next/glm5_next.zig");
     _ = @import("plugins/glm5_next/dsa_nax.zig");
+    _ = @import("plugins/glm5_next/dsa_prompt.zig");
+    _ = @import("plugins/glm5_next/dsa_append.zig");
+    _ = @import("plugins/glm5_next/moe.zig");
+    _ = @import("plugins/glm5_next/kda_verify.zig");
+    _ = @import("plugins/glm5_next/kda_prologue.zig");
+    _ = @import("plugins/glm5_next/kda_percore.zig");
+    _ = @import("plugins/glm5_next/kda_chunk.zig");
     _ = @import("sdk/blocks/kda/recurrence.zig");
     _ = @import("sdk/blocks/gdn/decode.zig");
     _ = @import("sdk/blocks/attention/row_attn.zig");

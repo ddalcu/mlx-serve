@@ -1045,6 +1045,229 @@ pub fn forward(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array)
     return shaped;
 }
 
+/// A split prompt forward's results (`forwardSplit`): every array a new reference that `deinit` frees.
+pub const Split = struct {
+    /// Span B's logits `[1, rows_b, vocab]`, as `forward` returns its own forward's.
+    logits: Array = .{ .ctx = null },
+    /// Both spans' final-normed hidden rows `[1, rows_a + rows_b, hidden]`, span A's first; null without `want_hidden`.
+    hidden: Array = .{ .ctx = null },
+    /// Span A's recurrent state, one entry per entry of the slot's `ssm_entries`: what span A's own forward leaves.
+    states: []SSMCacheEntry = &.{},
+    rows_a: u32 = 0,
+    rows_b: u32 = 0,
+
+    /// Span B's logits, which the caller owns from here.
+    pub fn takeLogits(self: *Split) Array {
+        const l = self.logits;
+        self.logits = .{ .ctx = null };
+        return l;
+    }
+
+    /// Frees span A's state, once the snapshots hold their own copies of it.
+    pub fn freeStates(self: *Split, a: std.mem.Allocator) void {
+        freeSplitStates(a, self.states);
+        self.states = &.{};
+    }
+
+    pub fn deinit(self: *Split, a: std.mem.Allocator) void {
+        if (self.logits.ctx != null) _ = mlx.mlx_array_free(self.logits);
+        if (self.hidden.ctx != null) _ = mlx.mlx_array_free(self.hidden);
+        self.freeStates(a);
+        self.* = .{};
+    }
+};
+
+/// A split forward's refusal is logged once per process; the rest go to debug.
+var split_refusal_logged = std.atomic.Value(bool).init(false);
+
+/// `forward` for a prompt's last chunk (span A, the first `rows_a` rows of `token_ids` `[1, rows]`) and the final span
+/// held back behind it (span B, the rest) as ONE split forward (`Forward.split_rows`) of a model whose plugin declares
+/// `Caps.split_prefill`. Span A's recurrent state lands in a scratch entry set shaped like the slot's (`Split.states`,
+/// `Forward.split_states`: a second `cache_ops.Slot` on the same KV cache, never appended), the slot's own cache ends
+/// where span B's forward leaves it, and `moe_seq_offset` moves by both spans, as two forwards move it.
+/// `error.PluginSplitRefused`: the plugin refused before it touched the slot (the contract: a split forward is refused
+/// up front), so the caller forwards the spans apart. A refusal after the slot's KV rows or state moved fails the
+/// forward instead (`error.PluginForwardFailed`).
+pub fn forwardSplit(xfm: *Transformer, b: *Bound, ctx: *ForwardCtx, token_ids: Array, rows_a: u32, want_hidden: bool, a: std.mem.Allocator) !Split {
+    if (unservedFeature(xfm, ctx) orelse splitUncarried(xfm, ctx)) |what| {
+        log.err("[plugin] {s}: a split forward does not carry {s}\n", .{ b.table.name.slice(), what });
+        return error.PluginForwardUnsupported;
+    }
+    const sh = mlx.getShape(token_ids);
+    if (sh.len != 2 or sh[0] != 1) return error.PluginForwardUnsupported;
+    const rows: u32 = @intCast(sh[1]);
+    if (rows_a == 0 or rows_a >= rows) return error.PluginForwardUnsupported;
+    const rows_b = rows - rows_a;
+    const live = ctx.ssm_entries orelse return error.PluginForwardUnsupported;
+    const states = try newSplitStates(a, live.len);
+    var states_owned = true;
+    defer if (states_owned) freeSplitStates(a, states);
+    var slot = slotFor(xfm, ctx);
+    var scratch: cache_ops.Slot = .{ .kv = ctx.cache, .ssm = states, .packed_reads = slot.packed_reads, .batched_append = slot.batched_append };
+    const handles = [_]abi.Handle{slot.handle()};
+    const slot_ids = [_]u32{settle.slotId(b, ctx)};
+    const base: usize = if (b.positions == .kv_step) ctx.cache.step else ctx.moe_seq_offset.*;
+    const pos = [_]u32{ropePosition(ctx, base, false)};
+    const before = SlotMarks.of(ctx);
+    const f: abi.Forward = .{
+        .mode = .prefill,
+        .row_exact = xfm.config.dflash_bound,
+        // What the final span's own forward asks (`forward`): every row's logits, the host slices the last.
+        .logits = .all_rows,
+        .want_hidden = want_hidden,
+        .rows = rows,
+        .tokens = .{},
+        .ids = .{ .ctx = token_ids.ctx },
+        .slots = .of(&slot_ids),
+        .positions = .of(&pos),
+        .caches = .of(&handles),
+        .cache_ops = &cache_ops.ops,
+        // Span A's own cadence (the final span alone sits under the cadence threshold); an eval point never changes
+        // what a span computes.
+        .eval_every = evalEvery(&xfm.config, b.positions, rows_a, base + rows_a, ctx.cache.config.scheme != .off),
+        .pipeline_every = ctx.pipeline_build,
+        .progress = if (ctx.prefill_progress) |p| &p.raw else null,
+        .split_rows = rows_a,
+        .split_states = scratch.handle(),
+    };
+    var out: abi.ForwardOut = .{};
+    intree.enter(ctx);
+    const v = b.table.forward(b.model, &f, &out);
+    intree.leave();
+    if (!v.isOk()) {
+        freeOut(&out, &.{});
+        if (SlotMarks.of(ctx).eql(before)) {
+            if (!split_refusal_logged.swap(true, .monotonic)) {
+                log.warn("[plugin] {s}: split forward refused ({s}): its spans run as two forwards\n", .{ b.table.name.slice(), v.why.slice() });
+            } else {
+                log.debug("[plugin] {s}: split forward refused ({s})\n", .{ b.table.name.slice(), v.why.slice() });
+            }
+            return error.PluginSplitRefused;
+        }
+        log.err("[plugin] {s}: split forward failed after the slot moved: {s}\n", .{ b.table.name.slice(), v.why.slice() });
+        return error.PluginForwardFailed;
+    }
+    // Both spans' rows went in, as two forwards' rows would.
+    ctx.moe_seq_offset.* += rows;
+    const logits: Array = .{ .ctx = out.logits.ctx };
+    defer if (logits.ctx != null) {
+        _ = mlx.mlx_array_free(logits);
+    };
+    const hidden: Array = .{ .ctx = out.hidden.ctx };
+    defer if (hidden.ctx != null) {
+        _ = mlx.mlx_array_free(hidden);
+    };
+    if (logits.ctx == null or leadingRows(logits) != rows_b) {
+        log.err("[plugin] {s}: split forward returned no logits for span B's {d} rows\n", .{ b.table.name.slice(), rows_b });
+        return error.PluginForwardFailed;
+    }
+    if (want_hidden and (hidden.ctx == null or leadingRows(hidden) != rows)) {
+        log.err("[plugin] {s}: split forward returned no hidden rows for its {d} rows\n", .{ b.table.name.slice(), rows });
+        return error.PluginForwardFailed;
+    }
+    if (splitStatesMismatch(live, states)) |layer| {
+        log.err("[plugin] {s}: split forward left span A's state out of layer {d}\n", .{ b.table.name.slice(), layer });
+        return error.PluginForwardFailed;
+    }
+    var res: Split = .{ .states = states, .rows_a = rows_a, .rows_b = rows_b };
+    errdefer {
+        res.states = &.{};
+        res.deinit(a);
+    }
+    res.logits = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&res.logits, logits, &[_]c_int{ 1, @intCast(rows_b), -1 }, 3, xfm.s));
+    if (want_hidden) {
+        res.hidden = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&res.hidden, hidden, &[_]c_int{ 1, @intCast(rows), -1 }, 3, xfm.s));
+    }
+    states_owned = false;
+    return res;
+}
+
+/// The first `ForwardCtx` field a split forward does not carry, beyond `unservedFeature`'s (`prefillSplit` keeps every
+/// one of them away from it); null when it carries them all.
+fn splitUncarried(xfm: *const Transformer, ctx: *const ForwardCtx) ?[]const u8 {
+    if (xfm.config.plugin) |pb| if (pb.parsed.caps.owns_decode_state) return "module-owned state";
+    if (xfm.embedding_mode or ctx.skip_lm_head) return "an encoder forward";
+    if (ctx.capture_layers != null) return "layer capture";
+    if (ctx.capture_hidden != null or ctx.capture_hidden_all != null) return "a hidden-row capture target";
+    if (ctx.vision_embeddings != null or ctx.mrope_pos != null) return "media rows";
+    if (ctx.capture_ssm_seq or ctx.spec_verify or ctx.tree != null) return "a verify";
+    if (ctx.prefill_mask_add != null or ctx.key_pad_mask != null) return "an attention mask";
+    if (ctx.ple_defer) return "a deferred host input";
+    if (ctx.step_embeds != null) return "input rows";
+    if (xfm.ane_prefill != null) return "the Neural Engine's projections";
+    if (ctx.ssm_entries == null) return "a slot without recurrent entries";
+    // Directional ablation applies to every pass that writes the residual stream: the split forward does not carry it.
+    if (ctx.ablation != null) return "an ablated forward";
+    if (ctx.prompt_spans.len != 0 or ctx.ssm_cp_positions.len != 0 or ctx.cp_sink != null) return "a whole-prompt plan";
+    return null;
+}
+
+/// An entry set shaped like a slot's `ssm_entries` with no state yet: a split forward's `Forward.split_states`.
+fn newSplitStates(a: std.mem.Allocator, n: usize) ![]SSMCacheEntry {
+    const es = try a.alloc(SSMCacheEntry, n);
+    for (es) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    return es;
+}
+
+/// Frees every array `CacheOps.set_state` may have written into `es`, then `es`.
+fn freeSplitStates(a: std.mem.Allocator, es: []SSMCacheEntry) void {
+    if (es.len == 0) return;
+    for (es) |*e| {
+        _ = mlx.mlx_array_free(e.conv_state);
+        _ = mlx.mlx_array_free(e.ssm_state);
+        entry_mod.ssmFreeSpecCapture(e);
+        transformer_mod.ssmFreeQsaState(e);
+    }
+    a.free(es);
+}
+
+/// The first layer where span A's state (`states`) and the slot's own (`live`, span B's after a split forward) differ
+/// in which slots hold state: span A's own forward fills exactly the slots span B's fills, so a difference is a layer
+/// the split forward left out of `split_states`.
+fn splitStatesMismatch(live: []const SSMCacheEntry, states: []const SSMCacheEntry) ?usize {
+    for (live, states, 0..) |*l, *s, i| {
+        if (l.initialized != s.initialized) return i;
+        if ((l.conv_state.ctx == null) != (s.conv_state.ctx == null)) return i;
+        if ((l.ssm_state.ctx == null) != (s.ssm_state.ctx == null)) return i;
+    }
+    return null;
+}
+
+/// The rows of `x` `[..., width]`: every axis but the last, multiplied.
+fn leadingRows(x: Array) usize {
+    const sh = mlx.getShape(x);
+    if (sh.len == 0) return 0;
+    var n: usize = 1;
+    for (sh[0 .. sh.len - 1]) |d| n *= @as(usize, @intCast(d));
+    return n;
+}
+
+/// What a forward moves in a slot: its KV rows and its recurrent state's handles. A refusal that moved none of them was
+/// made up front (best effort: a handle freed and remade at the same address reads as unmoved).
+const SlotMarks = struct {
+    step: usize,
+    rows: usize,
+    state: u64,
+
+    fn of(ctx: *const ForwardCtx) SlotMarks {
+        var rows: usize = 0;
+        // A full sliding ring keeps its `offset` and moves its `base`.
+        for (ctx.cache.entries) |*e| rows +%= e.offset +% e.base;
+        var state: u64 = 0;
+        if (ctx.ssm_entries) |es| for (es) |*e| {
+            const words = [_]usize{ @intFromPtr(e.conv_state.ctx), @intFromPtr(e.ssm_state.ctx), @intFromBool(e.initialized) };
+            state = std.hash.Wyhash.hash(state, std.mem.asBytes(&words));
+        };
+        return .{ .step = ctx.cache.step, .rows = rows, .state = state };
+    }
+
+    fn eql(x: SlotMarks, y: SlotMarks) bool {
+        return x.step == y.step and x.rows == y.rows and x.state == y.state;
+    }
+};
+
 /// The served model's own block drafter (`SpecHooks.native_drafter`), null without one.
 pub fn nativeDrafter(xfm: *const Transformer) ?*const abi.NativeDrafter {
     const b = xfm.plugin orelse return null;
@@ -1561,6 +1784,24 @@ test "driver: a DeepSeek-V4.1 pack's vision, aligner and image rows move to the 
     try std.testing.expect(!towerKey(&c, "layers.0.attn.wq_a.weight"));
     c.model_type = "qwen3_5";
     try std.testing.expect(!towerKey(&c, "vision.patch_embed.proj.weight"));
+}
+
+test "driver: a split forward's span-A state fills exactly the layers the slot's state fills" {
+    // Handles are only compared for presence: a non-null one never reaches MLX here.
+    const held: mlx.mlx_array = .{ .ctx = @ptrFromInt(0x1000) };
+    const none: mlx.mlx_array = .{ .ctx = null };
+    const live = [_]SSMCacheEntry{
+        .{ .conv_state = none, .ssm_state = none, .initialized = false },
+        .{ .conv_state = held, .ssm_state = held, .initialized = true },
+        .{ .conv_state = held, .ssm_state = none, .initialized = true },
+    };
+    var states = live;
+    try std.testing.expectEqual(@as(?usize, null), splitStatesMismatch(&live, &states));
+    states[2].ssm_state = held;
+    try std.testing.expectEqual(@as(?usize, 2), splitStatesMismatch(&live, &states));
+    states[2] = live[2];
+    states[1] = .{ .conv_state = none, .ssm_state = none, .initialized = false };
+    try std.testing.expectEqual(@as(?usize, 1), splitStatesMismatch(&live, &states));
 }
 
 // ── tests ──

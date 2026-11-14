@@ -27,7 +27,9 @@ const Generator = @import("generator.zig").Generator;
 const InitOptions = @import("options.zig").InitOptions;
 const MtpCacheRef = @import("../spec/mtp_head_ref.zig").MtpCacheRef;
 const MtpGraphFn = @import("../spec/tree.zig").MtpGraphFn;
+const PrefillSplitIn = @import("prefill_chunk.zig").PrefillSplitIn;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
+const checkpointSha256 = @import("../ssm/checkpoint.zig").checkpointSha256;
 const chunkNeedsMtpHistory = @import("prefill_chunk.zig").chunkNeedsMtpHistory;
 const commitAdaptiveWidth = @import("prefill_chunk.zig").commitAdaptiveWidth;
 const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
@@ -47,11 +49,13 @@ const mtpDraftGreedyFor = @import("../spec/mtp/depth.zig").mtpDraftGreedyFor;
 const mtpEvCosts = @import("../spec/mtp/ev_costs.zig").mtpEvCosts;
 const nextChunkEnd = @import("prefill_chunk.zig").nextChunkEnd;
 const pickLookupPromptSource = @import("../spec/pld.zig").pickLookupPromptSource;
+const prefillSplit = @import("prefill_chunk.zig").prefillSplit;
 const promptLogprobs = @import("../sampling/logprobs.zig").promptLogprobs;
 const reservedPrefillTokens = @import("prefill_chunk.zig").reservedPrefillTokens;
 const resolveMtpDepthCapForProfile = @import("../spec/mtp/ev_plan.zig").resolveMtpDepthCapForProfile;
 const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
+const splitSwitchOn = @import("prefill_chunk.zig").splitSwitchOn;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
 const WholePromptPlan = @import("prefill_chunk.zig").WholePromptPlan;
@@ -349,6 +353,14 @@ pub fn initWithOptions(
         .width_min = @intCast(PREFILL_CHUNK),
         .width_max = @intCast(PREFILL_CHUNK),
     };
+    // MLX_SERVE_PREFILL_SPLIT (on unless =0, `prefillSplit`): the loop's last chunk (span A) and the held-back final span
+    // (span B) run as ONE split forward, so a plugin that streams its experts reads each record once for both. `split`
+    // then holds span A's state (what the end-of-loop snapshot reads) and span B's logits and hidden rows (what the
+    // final forward would have returned). Null = two forwards, as with the switch off.
+    const split_switch = splitSwitchOn();
+    var split: ?plugin_driver.Split = null;
+    defer if (split) |*sp| sp.deinit(allocator);
+    var split_why: []const u8 = "no prompt loop";
 
     if (final_start > 0) {
         const prefix_len = prompt_ids.len - 1;
@@ -462,11 +474,20 @@ pub fn initWithOptions(
             errdefer if (dflash_active) {
                 for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
             };
-            const chunk_logits = if (mtp_capture) blk: {
+            // MLX_SERVE_PREFILL_SPLIT: the last chunk runs with the held-back final span as one split forward when
+            // every gate holds; a closed gate or the plugin's up-front refusal leaves the chunk its own forward.
+            if (split_switch and end == loop_end) {
+                const gate = splitGate(split_switch, xfm, &ctx, &options, snapshot_backoff, pos, end, loop_end, prompt_ids.len, dflash_active);
+                const split_hidden = mtp_active or (options.drafter_enabled and options.drafter != null) or options.speech != null;
+                split = try splitLastChunk(allocator, xfm, &ctx, ids_i32, pos, end, gate, split_hidden, &split_why);
+            }
+            const chunk_logits = if (split != null) mlx.mlx_array_new() else if (mtp_capture) blk: {
                 var last_unused = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(last_unused);
                 break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
             } else try xfm.forwardWith(&ctx, chunk_input);
+            // The split forward's span-A rows are this chunk's hidden rows for the MTP history below.
+            if (split) |*sp| if (mtp_capture) try rowsInto(&chunk_hidden_all, sp.hidden, 0, sp.rows_a, xfm.s);
             if (options.prompt_logprobs) |out| promptLogprobs(allocator, chunk_logits, prompt_ids[pos + 1 .. end + 1], options.logprobs_n, xfm.s, out) catch |err| {
                 _ = mlx.mlx_array_free(chunk_logits);
                 return err;
@@ -546,6 +567,13 @@ pub fn initWithOptions(
                             _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.ssm_state);
                         }
                     }
+                    // After a split forward the slot's entries hold span B's state and span A's sits in the split's
+                    // own entries, which the snapshots below read: materialize them alike.
+                    if (split) |*sp| for (sp.states) |*ssm| {
+                        if (!ssm.initialized) continue;
+                        if (ssm.conv_state.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.conv_state);
+                        if (ssm.ssm_state.ctx != null) _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.ssm_state);
+                    };
                 }
                 _ = mlx.mlx_eval(eval_vec);
             }
@@ -563,7 +591,8 @@ pub fn initWithOptions(
             // already-resident state.
             const abs_end_for_cp2 = end + ssm_cp_offset;
             if (want_ssm_cp and ssmCapturePos(ssm_cp_stride, abs_end_for_cp2, dense_low_grid)) {
-                const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
+                // A split forward's chunk end is span A's state, which its own entries hold.
+                const cp = try captureSsmCheckpoint(allocator, if (split) |sp| sp.states else ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                 fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
                     doomed.deinit(allocator);
@@ -671,8 +700,9 @@ pub fn initWithOptions(
                 // evaluated it at every chunk boundary. The final chunk
                 // may have been a stride-aligned one (already evaluated)
                 // or a partial tail (also evaluated). The snapshot is a
-                // cheap refcount-share.
-                const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs, xfm.s);
+                // cheap refcount-share. After a split forward the state at
+                // the loop's end is span A's, in the split's own entries.
+                const cp = try captureSsmCheckpoint(allocator, if (split) |sp| sp.states else ctx.ssm_entries.?, final_abs, xfm.s);
                 fileCheckpoint(allocator, &ssm_checkpoints, cp, options.ssm_checkpoint_max, cp_thin, options.ssm_low_anchors) catch |e| {
                     var doomed = cp;
                     doomed.deinit(allocator);
@@ -694,8 +724,24 @@ pub fn initWithOptions(
             if (ssm_checkpoints.items.len > 0 and !transformer_mod.qsaHistoryShareEnabled()) {
                 try transformer_mod.attachQsaHistoryToLatest(ssm_checkpoints.items, ctx.ssm_entries.?, xfm.s);
             }
+            // MLX_SERVE_DIAG=prefill-split-check: every checkpoint's state read back and hashed, so a split run's
+            // snapshots compare with an unsplit run's. A diag never fails the request: a read it cannot make is a line.
+            if (env.on(.PREFILL_SPLIT_CHECK)) for (ssm_checkpoints.items) |*cp| {
+                const had_error = mlx.errorPending();
+                const digest = checkpointSha256(cp, xfm.s) catch |e| {
+                    mlx.dropLatchedErrorUnless(had_error);
+                    log.warn("[prefill-split] snapshot pos={d} layers={d} unreadable: {s}\n", .{ cp.pos, cp.layers.len, @errorName(e) });
+                    continue;
+                };
+                const hex = std.fmt.bytesToHex(digest, .lower);
+                const sha: []const u8 = &hex;
+                log.info("[prefill-split] snapshot pos={d} layers={d} sha={s}\n", .{ cp.pos, cp.layers.len, sha });
+            };
         }
+        // Span A's state lives on in the snapshots' own copies.
+        if (split) |*sp| sp.freeStates(allocator);
     }
+    if (split_switch and split == null and env.on(.PREFILL_SPLIT_CHECK)) log.info("[prefill-split] not taken: {s}\n", .{split_why});
 
     // Chunked vision: the final-span forward continues the row scatter
     // where the chunk loop left it (an image ending in the final span
@@ -772,7 +818,17 @@ pub fn initWithOptions(
             ctx.cp_sink = &prompt_cp_sink;
         }
     }
-    const raw_logits = if (tail_mtp_capture) blk: {
+    const raw_logits = if (split) |*sp| blk: {
+        // The final span ran inside the split forward (the loop's last chunk): its logits and hidden rows are the
+        // ones this forward returns, taken as the capture arms below take theirs.
+        if (sp.rows_b != tail_len) return error.PluginForwardFailed;
+        if (need_capture) {
+            has_captured_hidden = true;
+            try rowsInto(&captured_hidden, sp.hidden, sp.rows_a + sp.rows_b - 1, sp.rows_a + sp.rows_b, xfm.s);
+            if (tail_mtp_capture) try rowsInto(&tail_hidden_all, sp.hidden, sp.rows_a, sp.rows_a + sp.rows_b, xfm.s);
+        }
+        break :blk sp.takeLogits();
+    } else if (tail_mtp_capture) blk: {
         has_captured_hidden = true;
         break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
     } else if (need_capture) blk: {
@@ -1155,4 +1211,87 @@ pub fn initWithOptions(
 
     attachCp(&gen, &ssm_checkpoints, allocator);
     return gen;
+}
+
+/// `prefillSplit`'s inputs at the prompt loop's chunk `[pos, end)`: the request's arms and the slot's forward context
+/// as the chunk's own forward sees them.
+fn splitGate(
+    switch_on: bool,
+    xfm: *Transformer,
+    ctx: *const ForwardCtx,
+    options: *const InitOptions,
+    backoff: usize,
+    pos: usize,
+    end: usize,
+    loop_end: usize,
+    prompt_len: usize,
+    dflash_active: bool,
+) PrefillSplitIn {
+    const declared = xfm.plugin != null and (if (xfm.config.plugin) |pb| pb.parsed.caps.split_prefill else false);
+    return .{
+        .switch_on = switch_on,
+        .declared = declared,
+        .module_state = xfm.ownsModuleDecodeState(),
+        .whole_prompt = xfm.prefillsWholePrompt(),
+        .backoff = backoff,
+        .last_chunk = end == loop_end,
+        .rows_a = end - pos,
+        .rows_b = prompt_len - end,
+        .media = ctx.vision_embeddings != null or ctx.mrope_pos != null,
+        .dflash = dflash_active or ctx.capture_layers != null,
+        .prompt_logprobs = options.prompt_logprobs != null,
+        .speech = options.speech != null,
+        .batched = ctx.batch_slots != null,
+        .ane = xfm.ane_prefill != null,
+        .forward_feature = xfm.embedding_mode or ctx.skip_lm_head or ctx.capture_hidden != null or
+            ctx.capture_hidden_all != null or ctx.capture_stream_all != null or ctx.spec_verify or ctx.capture_ssm_seq or
+            ctx.tree != null or ctx.prefill_mask_add != null or ctx.key_pad_mask != null or ctx.ple_defer or
+            ctx.step_embeds != null or ctx.stream_in != null or ctx.head_place != null or ctx.ablation != null,
+    };
+}
+
+/// MLX_SERVE_PREFILL_SPLIT at the prompt loop's last chunk: span A `ids[pos..end]` and the held-back final span
+/// `ids[end..]` (span B) as one split forward when `gate` holds (`prefillSplit`). Null leaves the chunk its own forward,
+/// `why.*` naming the closed gate or the plugin's up-front refusal (`error.PluginSplitRefused`: nothing moved).
+fn splitLastChunk(
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    ctx: *ForwardCtx,
+    ids: []const i32,
+    pos: usize,
+    end: usize,
+    gate: PrefillSplitIn,
+    want_hidden: bool,
+    why: *[]const u8,
+) !?plugin_driver.Split {
+    const verdict = prefillSplit(gate);
+    if (verdict != .split) {
+        why.* = @tagName(verdict);
+        return null;
+    }
+    const shape = [_]c_int{ 1, @intCast(ids.len - pos) };
+    const input = mlx.mlx_array_new_data(@ptrCast(&ids[pos]), &shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(input);
+    const sp = xfm.forwardSplit(ctx, input, @intCast(end - pos), want_hidden, allocator) catch |e| switch (e) {
+        error.PluginSplitRefused => {
+            why.* = "plugin refused";
+            return null;
+        },
+        else => |other| return other,
+    };
+    // Every request the split serves says so: the A/B harness counts this line's prefix.
+    log.info("[prefill-split] split forward A={d} B={d}\n", .{ sp.rows_a, sp.rows_b });
+    return sp;
+}
+
+/// Rows `[start, stop)` of `src` `[1, rows, width]` into `dst`: a reference sharing `src`'s data, as the driver hands
+/// its capture targets theirs.
+fn rowsInto(dst: *mlx.mlx_array, src: mlx.mlx_array, start: u32, stop: u32, s: mlx.mlx_stream) !void {
+    if (src.ctx == null) return error.PluginForwardFailed;
+    const sh = mlx.getShape(src);
+    if (sh.len != 3) return error.PluginForwardFailed;
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_slice(&rows, src, &[_]c_int{ 0, @intCast(start), 0 }, 3, &[_]c_int{ sh[0], @intCast(stop), sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    _ = mlx.mlx_array_set(dst, rows);
 }

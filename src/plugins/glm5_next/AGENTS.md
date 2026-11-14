@@ -11,6 +11,9 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
   head's experts (`sdk/quant/outside_model.zig`); its bank opens per phase (`Budget.fit`: `stream_room`, `decodeRoom()`,
   the pack's `bank-fit.json` on its ceiling), binds each routed layer (`moe.bindRouted`), takes each forward's phase
   and settles after its eval. Serial decode, no images (`bankFacts`).
+- Split prompt forward (`Caps.split_prefill`, streaming packs): `table_forward.hiddenSplit` runs the last chunk and its
+  held-back span layer by layer, each MoE layer's routed rows in one call (`moe.mlpSplit`) where the bank declares
+  `rows_independent`; anything else is refused by name before a cache is touched (`splitSpans`): two forwards.
 - Load (`trunk.zig`): reads the driver's resident source (`LoadCtx.weights`: the engine's map with the Sushi and
   ModelOpt adapters applied) in the layout the deleted legacy load built: q|k|v and the convs joined, GLM's decode row
   group `[qkv | z | a | b]`, f32 KDA tables, DSA and MLA projections, the MoE block's weights, the `mtp.0` head.
@@ -20,9 +23,27 @@ config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.
 - KDA (`kda.zig`): the per-channel-gate arms of the legacy `gatedDeltaNetProjected` on a slot's `Entry`: GLM's
   one-dispatch decode/verify (`kda_recurrence.decodeStep`), low-rank gates, the fused prework, the per-core prompt
   recurrence; Ling's softplus gate (compiled at load) and the stock vector-gate kernels.
+- KDA verify rows the joined step declines (`kda_verify.zig`, GLM, one slot; MLX_SERVE_GLM_KDA_VERIFY, _EXPSIG,
+  _LAZY_SEQ; the chain's bytes): the packed prework (beta too), the gate in one launch (exp(A_log) in it), the
+  norm-gate; the per-row states a launch run only when a rollback reads them (it holds the old state).
+- KDA prompt prologue (`kda_prologue.zig`, MLX_SERVE_KDA_PROMPT_PROLOGUE; GLM's prompt rows): conv, SiLU, q/k norms
+  and scales and v in one launch, eight heads a threadgroup, the chain's bytes.
+- KDA prompt per-core (`kda_percore.zig`, MLX_SERVE_KDA_PROMPT_PERCORE, off; rounding-class): where the stock per-core
+  route declines (under 64 cores), its kernel at two threadgroups a core, the gate in it; the prologue or chain feeds it.
+- KDA prompt chunkwise recurrence (`kda_chunk.zig`, MLX_SERVE_KDA_PROMPT_CHUNK, off; rounding-class): GLM's prompt
+  rows the per-core route declines, 16-row chunks, the gate in the launch; bound (-5..0) and heads checked at load.
 - MoE (`moe.zig`, Ling's too, the MTP head's): the shared `sdk/bases/blocks/moe.zig` block; GLM's one-kernel decode
   (`glm5.moeDecode`, affine, up to 16 rows) is the block's `fused` arm, ModelOpt's per-expert up x down scale its
   `route_scale`, Sushi's EXL3 banks its `format_banks`.
+- MTP head (`head.zig`, MLX_SERVE_GLM_HEAD_LAST_ROW; the stock bytes): its merged first draft step's routed experts
+  for the last row alone (`moe.mlpLastRow`).
+- DSA levers (MLX_SERVE_GLM_DSA_*, each the stock bytes at GLM-5.3-Flash's indexer and attention dims, declining
+  elsewhere): a prompt pass's indexer in one launch and its output in one copy (`dsa_prompt.zig`); a window's tail
+  rows read first so the append can reuse the buffer (`dsa_append.zig`).
+- DSA prompt one-P (MLX_SERVE_GLM_DSA_PROMPT_ONEP, default off, rounding-class, not the stock bytes): a prompt pass's
+  sparse attention meets the values with P as one fp16 piece (`dsa_nax.sparseLatentOneP`); composes with the others.
+- Router: the load keeps each routed layer's router as stored (`raw_router`), so 1-4 row calls ride
+  `sdk/blocks/moe/router_nax.zig` (MLX's split-K chains or gemv, then the stock router text: same bytes).
 - Forward (`table_forward.zig`): the [B,S,4,D] stream through KDA / DSA sublayers inside mHC; KV and recurrent state
   only through `CacheOps` (`slots.kda` writes conv, ssm and a verify's per-row capture back); positions from
   `Forward.positions`; captures = the stream MEAN; batched rows in groups of 8 (`MOE_DECODE_BATCH_MAX`), each slot's
@@ -61,7 +82,11 @@ Batched verify rows (`batched_rows`, rows > 1) are refused by name: the engine k
 ## Known issues
 - With a vocab under 16384 rows the engine's served-head readout builds a 3-bit
   draft head the legacy GLM head never built (drafts only, never output): needs a `SpecFacts` fact.
-- Kernel contracts for the 20 `kernels/*.metal` rows are not registered.
+- Kernel contracts for 24 `kernels/*.metal` rows (the DSA levers' apart, below) are not registered.
+- Kernel contracts for `router_nax`'s kernels (`kernels/moe/router_nax_*`) are not registered; its byte tests hold them
+  to the stock route.
+- Kernel contracts for the DSA levers' texts (`kernels/dsa_*.metal` past `dsa_nax.zig`'s) are not registered; their byte
+  tests hold them to the stock ops.
 - No `[dtype-trace]` or layer-cap diagnostics on the table forward.
 - The dense layer's one-row decode takes the unclamped joined SwiGLU (`Model.denseMlp`), as the legacy forward did,
   though the config declares `swiglu_limit`; wider rows clamp. Kept for bit-equality; unverified against the reference.

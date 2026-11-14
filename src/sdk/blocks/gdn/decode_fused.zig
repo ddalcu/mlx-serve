@@ -89,7 +89,7 @@ fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const GdnPreworkCfgKey = struct { hk: c_int, hv: c_int, seq: c_int, batch: c_int, c: c_int, qs: c_int, qo: c_int, bs: c_int, bo: c_int, as: c_int, ao: c_int, dt: mlx.mlx_dtype, gt: mlx.mlx_dtype, gate: bool };
+const GdnPreworkCfgKey = struct { hk: c_int, hv: c_int, seq: c_int, batch: c_int, c: c_int, qs: c_int, qo: c_int, bs: c_int, bo: c_int, as: c_int, ao: c_int, dt: mlx.mlx_dtype, gt: mlx.mlx_dtype, gate: bool, tab: bool };
 var gdn_prework_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gdn_prework_cfg_key: GdnPreworkCfgKey = std.mem.zeroes(GdnPreworkCfgKey);
 
@@ -110,6 +110,12 @@ pub var gdn_prefill_engaged = false;
 pub fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@import("../hc/hc_prefill.zig").max_seq, batch)) return false;
     return gdn_prefill_fused_override orelse true;
+}
+
+/// A prompt arm (`gdnNormGatePrompt`): one slot's 17 rows or more, past hc_prefill's cap too (the kernels read
+/// any row count).
+fn promptRows(prompt: bool, seq: c_int, batch: c_int) bool {
+    return prompt and batch == 1 and seq >= 17;
 }
 
 /// Inputs of the packed prework. `qkv`/`b`/`a` are read at `(off, stride)`
@@ -141,7 +147,16 @@ pub const GdnPreworkArgs = struct {
     gate: bool = true,
     /// The dtype `g` is computed and stored in: the recurrent state's. Null: the activations'.
     g_dtype: ?mlx.mlx_dtype = null,
+    /// MLX's sigmoid op itself (its table) at any width, for a caller held to the composed chain's bytes (a verify).
+    /// The formula arm's bare `metal::exp` is the fast exp in a runtime-compiled kernel, the metallib's op the precise.
+    table: bool = false,
 };
+
+/// Whether a launch of `seq` rows reads MLX's sigmoid table (`sigmoidTableFor`): a prompt's widths, or a caller
+/// that asks for the op's own bytes.
+fn sigTable(seq: c_int, table: bool) bool {
+    return table or seq >= 17;
+}
 
 /// One fused dispatch for the GDN prework at S 1..9 x B batched slots
 /// (batch*seq <= GDN_FUSED_MAX_ROWS; per-head gate archs only). Null →
@@ -172,7 +187,8 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
 
     const nkeep: c_int = 3;
     const gt = in.g_dtype orelse dt;
-    const key = GdnPreworkCfgKey{ .hk = in.hk, .hv = in.hv, .seq = in.seq, .batch = in.batch, .c = c_dim, .qs = in.qkv_stride, .qo = in.qkv_off, .bs = in.b_stride, .bo = in.b_off, .as = in.a_stride, .ao = in.a_off, .dt = dt, .gt = gt, .gate = in.gate };
+    const tab = sigTable(in.seq, in.table);
+    const key = GdnPreworkCfgKey{ .hk = in.hk, .hv = in.hv, .seq = in.seq, .batch = in.batch, .c = c_dim, .qs = in.qkv_stride, .qo = in.qkv_off, .bs = in.b_stride, .bo = in.b_off, .as = in.a_stride, .ao = in.a_off, .dt = dt, .gt = gt, .gate = in.gate, .tab = tab };
     if (gdn_prework_cfg == null or !std.meta.eql(gdn_prework_cfg_key, key)) {
         if (gdn_prework_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -190,7 +206,7 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "GT", gt));
-        const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "TAB", @as(c_int, @intFromBool(in.seq >= 17)) }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off }, .{ "GATE", @as(c_int, @intFromBool(in.gate)) } };
+        const ints = .{ .{ "HK", in.hk }, .{ "HV", in.hv }, .{ "DK", in.dk }, .{ "DV", in.dv }, .{ "NKEEP", nkeep }, .{ "C", c_dim }, .{ "TAB", @as(c_int, @intFromBool(tab)) }, .{ "QSTRIDE", in.qkv_stride }, .{ "QOFF", in.qkv_off }, .{ "BSTRIDE", in.b_stride }, .{ "BOFF", in.b_off }, .{ "ASTRIDE", in.a_stride }, .{ "AOFF", in.a_off }, .{ "GATE", @as(c_int, @intFromBool(in.gate)) } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
         gdn_prework_cfg = config;
         gdn_prework_cfg_key = key;
@@ -201,7 +217,7 @@ pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
     defer _ = mlx.mlx_array_free(seq_arr);
     const eps_arr = mlx.mlx_array_new_float(in.qk_eps);
     defer _ = mlx.mlx_array_free(eps_arr);
-    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (in.seq >= 17) try sigmoidTableFor(s, dt) else in.qkv, seq_arr, eps_arr };
+    const inputs_arr = [_]mlx.mlx_array{ in.qkv, in.conv_state, in.conv_w, in.q_scale, in.k_scale, in.b, in.a, in.A_log, in.dt_bias, if (tab) try sigmoidTableFor(s, dt) else in.qkv, seq_arr, eps_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
@@ -245,7 +261,7 @@ const GDN_NORMGATE_SOURCE = kernelSource("kernels/gdn/gdn_normgate.metal");
 var gdn_normgate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gdn_normgate_engaged: bool = false;
 var gdn_normgate_declined: bool = false;
-const GdnNormGateCfgKey = struct { hv: c_int, seq: c_int, batch: c_int, zs: c_int, zo: c_int, swish: bool, dt: mlx.mlx_dtype };
+const GdnNormGateCfgKey = struct { hv: c_int, seq: c_int, batch: c_int, zs: c_int, zo: c_int, swish: bool, dt: mlx.mlx_dtype, tab: bool };
 var gdn_normgate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gdn_normgate_cfg_key: GdnNormGateCfgKey = std.mem.zeroes(GdnNormGateCfgKey);
 
@@ -264,7 +280,21 @@ fn getGdnNormGateKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 /// `rms_norm(y) * silu(z)` flattened to [B, S, Hv*Dv]. Null → composed chain.
-pub fn gdnNormGateFused(
+pub fn gdnNormGateFused(s: mlx.mlx_stream, y: mlx.mlx_array, z: mlx.mlx_array, z_off: c_int, z_stride: c_int, norm_w: mlx.mlx_array, eps: mlx.mlx_array, swish: bool, hv: c_int, dv: c_int, batch: c_int, seq: c_int) !?mlx.mlx_array {
+    return normGate(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, batch, seq, false, false);
+}
+
+/// `gdnNormGateFused` with MLX's sigmoid op itself (its table) at any width: the composed chain's bytes (a verify).
+pub fn gdnNormGateChain(s: mlx.mlx_stream, y: mlx.mlx_array, z: mlx.mlx_array, z_off: c_int, z_stride: c_int, norm_w: mlx.mlx_array, eps: mlx.mlx_array, swish: bool, hv: c_int, dv: c_int, batch: c_int, seq: c_int) !?mlx.mlx_array {
+    return normGate(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, batch, seq, false, true);
+}
+
+/// `gdnNormGateFused` over one slot's prompt rows (`promptRows`), served whatever `gdnPrefillFusedFor` says.
+pub fn gdnNormGatePrompt(s: mlx.mlx_stream, y: mlx.mlx_array, z: mlx.mlx_array, z_off: c_int, z_stride: c_int, norm_w: mlx.mlx_array, eps: mlx.mlx_array, swish: bool, hv: c_int, dv: c_int, seq: c_int) !?mlx.mlx_array {
+    return normGate(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, 1, seq, true, false);
+}
+
+fn normGate(
     s: mlx.mlx_stream,
     y: mlx.mlx_array, // [B, S, Hv, Dv] bf16
     z: mlx.mlx_array, // rows of [.. ZOFF + Hv*Dv ..] bf16
@@ -277,9 +307,11 @@ pub fn gdnNormGateFused(
     dv: c_int,
     batch: c_int,
     seq: c_int,
+    prompt: bool,
+    table: bool,
 ) !?mlx.mlx_array {
     if (dv != 128 or !mlx.streamIsGpu(s)) return null;
-    const prefill = gdnPrefillFusedFor(seq, batch);
+    const prefill = promptRows(prompt, seq, batch) or gdnPrefillFusedFor(seq, batch);
     if (!prefill and !gdnDecodeFusedEnabled()) return null;
     if (!prefill and (seq < 1 or seq > GDN_FUSED_MAX_ROWS or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
     const dt = mlx.mlx_array_dtype(y);
@@ -301,7 +333,8 @@ pub fn gdnNormGateFused(
         }
         return null;
     }
-    const key = GdnNormGateCfgKey{ .hv = hv, .seq = seq, .batch = batch, .zs = z_stride, .zo = z_off, .swish = swish, .dt = dt };
+    const tab = sigTable(seq, table);
+    const key = GdnNormGateCfgKey{ .hv = hv, .seq = seq, .batch = batch, .zs = z_stride, .zo = z_off, .swish = swish, .dt = dt, .tab = tab };
     if (gdn_normgate_cfg == null or !std.meta.eql(gdn_normgate_cfg_key, key)) {
         if (gdn_normgate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -310,14 +343,14 @@ pub fn gdnNormGateFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, batch * seq, hv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
-        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "TAB", @as(c_int, @intFromBool(seq >= 17)) } };
+        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "TAB", @as(c_int, @intFromBool(tab)) } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SWISH", @intFromBool(swish)));
         gdn_normgate_cfg = config;
         gdn_normgate_cfg_key = key;
     }
     const kernel = try getGdnNormGateKernel();
-    const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps, if (seq >= 17) try sigmoidTableFor(s, dt) else y };
+    const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps, if (tab) try sigmoidTableFor(s, dt) else y };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();

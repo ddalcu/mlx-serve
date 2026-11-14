@@ -1,5 +1,5 @@
 //! engines/mlx/dispatch.
-//! Owns defaultCtx, module_owned_state_fields, module_shared_readonly_fields, ownsModuleDecodeState, sharesModuleReadonlyState, moduleSpecWiring, and 7 more.
+//! Owns defaultCtx, module_owned_state_fields, module_shared_readonly_fields, ownsModuleDecodeState, sharesModuleReadonlyState, moduleSpecWiring, and 8 more.
 
 const std = @import("std");
 const distributed_mod = @import("cluster/distributed.zig");
@@ -126,6 +126,15 @@ pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arra
     if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
     if (self.plugin) |b| return plugin_driver.forward(self, b, ctx, token_ids);
     return error.PluginDeclinedNoLegacy;
+}
+
+/// `forwardWith` for a prompt's last chunk (the first `rows_a` rows of `token_ids`) and the final span held back
+/// behind it as ONE split forward (`plugin_driver.forwardSplit`, `MLX_SERVE_PREFILL_SPLIT`): a served model only.
+pub fn forwardSplit(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, rows_a: u32, want_hidden: bool, a: std.mem.Allocator) !plugin_driver.Split {
+    const b = self.plugin orelse return error.PluginForwardUnsupported;
+    if (ctx.batch_slots != null) return error.PluginForwardUnsupported;
+    try self.ssmGroupRelease(ctx);
+    return plugin_driver.forwardSplit(self, b, ctx, token_ids, rows_a, want_hidden, a);
 }
 
 /// Does `forwardWith` honor `ForwardCtx.capture_layers`? A served plugin captures layers; a drafter also reads the

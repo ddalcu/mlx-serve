@@ -274,6 +274,39 @@ pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
     return total;
 }
 
+/// The diag `prefill-split-check`'s digest: sha256 over a checkpoint's state, read back from the device. Layer by
+/// layer, each of conv, ssm, aux and pooled-QSA state as a presence byte, then (present) its dtype, its shape and its
+/// row-major bytes. Two checkpoints of the same state hash the same however that state was computed. Syncs the GPU.
+pub fn checkpointSha256(cp: *const SSMCheckpoint, s: mlx.mlx_stream) ![32]u8 {
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    for (cp.layers) |*l| {
+        inline for (.{ l.conv_state, l.ssm_state, l.aux_state, l.qsa_pooled }) |arr| try hashStateArray(&h, arr, s);
+    }
+    return h.finalResult();
+}
+
+fn hashStateArray(h: *std.crypto.hash.sha2.Sha256, arr: mlx.mlx_array, s: mlx.mlx_stream) !void {
+    if (arr.ctx == null) {
+        h.update(&[_]u8{0});
+        return;
+    }
+    h.update(&[_]u8{1});
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    try mlx.check(mlx.mlx_contiguous(&c, arr, false, s));
+    try mlx.check(mlx.mlx_array_eval(c));
+    const dtype: i32 = @intCast(@backingInt(mlx.mlx_array_dtype(c)));
+    h.update(std.mem.asBytes(&dtype));
+    for (mlx.getShape(c)) |d| {
+        const dim: i32 = @intCast(d);
+        h.update(std.mem.asBytes(&dim));
+    }
+    const n = mlx.mlx_array_size(c) * mlx.mlx_array_itemsize(c);
+    if (n == 0) return;
+    const bytes = mlx.mlx_array_data_uint8(c) orelse return error.SsmCheckpointUnreadable;
+    h.update(bytes[0..n]);
+}
+
 /// Which retention policy a checkpoint list is thinned with. The span-preserving thin moves
 /// where a warm turn restores from and was measured on qwen4_exp only, so the policy is chosen
 /// by `longCtxGated()` at each site and the ungated value names that site's previous

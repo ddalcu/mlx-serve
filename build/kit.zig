@@ -86,10 +86,12 @@ fn stage(b: *std.Build, wf: *std.Build.Step.WriteFile, name: []const u8, version
         \\
     , .{version}));
     _ = wf.addCopyFile(b.path("lib/mlx/.version"), b.fmt("{s}/mlx.version", .{name}));
-    // `kit.blocks.qmm` reuses MLX's steel tile matmul in its own kernels: the four headers, as the `mlx_steel_sources` module.
+    // `kit.blocks.qmm` reuses MLX's steel tile matmul in its own kernels: the four headers, as the `mlx_steel_sources` module
+    // (with MLX's gemv.h, `kit.blocks.moe.router_nax`'s).
     _ = wf.addCopyFile(b.path("lib/mlx_steel_sources.zig"), b.fmt("{s}/lib/mlx_steel_sources.zig", .{name}));
     for ([_][]const u8{ "defines.h", "utils/type_traits.h", "utils/integral_constant.h", "gemm/nax.h" }) |h|
         _ = wf.addCopyFile(b.path(b.fmt("lib/mlx-src/mlx/backend/metal/kernels/steel/{s}", .{h})), b.fmt("{s}/lib/mlx-src/mlx/backend/metal/kernels/steel/{s}", .{ name, h }));
+    _ = wf.addCopyFile(b.path("lib/mlx-src/mlx/backend/metal/kernels/gemv.h"), b.fmt("{s}/lib/mlx-src/mlx/backend/metal/kernels/gemv.h", .{name}));
     _ = wf.addCopyFile(b.path("lib/mlx-src/LICENSE"), b.fmt("{s}/lib/mlx-src/LICENSE", .{name}));
     _ = wf.addCopyDirectory(b.path("lib/mlx/include/mlx/c"), b.fmt("{s}/include/mlx/c", .{name}), .{ .include_extensions = &.{".h"} });
     _ = wf.addCopyFile(b.path("lib/mlxc-src/LICENSE"), b.fmt("{s}/include/mlx/LICENSE", .{name}));
