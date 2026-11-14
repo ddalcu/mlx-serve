@@ -29,6 +29,9 @@ with GLM-5.3-Flash's readers and loads through `glm5_next/trunk.zig`; its own pa
 - Exact verify (streaming packs, `serialVerify`, ≤ 16 rows): every row carries serial decode's bytes (projections at
   `QuantTable.exact_rows`, KDA rows in one launch to 8 (`kda/verify_rows.zig`), MLA in one per plan (`sdpa_rows.zig`),
   `moe.mlpRows`); not `exact_drafted` (sampled MTP is not position-keyed). Bar: `served_test.zig`.
+- Rope-once MLA cache (streaming packs, `Model.mlaRopeOnce`): a token's key row holds every head's nope key, then the
+  one roped key; a decode step or serial verify reads it in place (`sdpa_rows.attendRope1`), anything else attends over
+  `denseRope1`'s keys (billed: `rope1DenseBytes`). Namespace `ling-mla-rope1-v1`; host bills `kvPerToken`. Bar: `served_test.zig`.
 - Ling-3.1's clamps AFTER the SiLU, per layer: `expert_swiglu_limit_list` (routed, the bank's or the composed chain's)
   and `share_expert_swiglu_limit_list` (shared, `moe.Moe.Weights.shared_limit_out`); GLM's clamp is BEFORE it.
 
@@ -43,7 +46,8 @@ Served, legacy forward deleted (`engines/mlx/plugin/served.zig`; `glm5_next/serv
 ## Rules (from root AGENTS.md)
 - KDA = GDN with a PER-CHANNEL gate (the `_vec` kernel); per-head vs per-channel gating is an INDEXING contract.
 - A lower bound may REPLACE the formula (`kdaUsesBoundedGate`).
-- MLA = naive DeepSeek-V3 with an ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` serve it.
+- MLA = naive DeepSeek-V3 with an ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` serve it (on a streaming pack the room
+  still bills 16 bits and attention reads dense dequantized views).
 - The depthwise convs ship flat (`<x>_conv1d.weight`) in the public MLX packs, nested in the reference: both bind.
 - Thinking ON; GLM tool tags.
 

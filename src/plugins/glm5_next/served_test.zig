@@ -367,12 +367,14 @@ test "bailing_hybrid served: a streaming pack's verify rows are serial decode's,
     }.run);
 }
 
-/// Greedy tokens after a fixed prompt on a fresh trunk: serial decode (`depth` 0) or MTP rounds through the head.
-fn lingGreedy(b: *both.Both, depth: u32, out: []u32) !void {
+/// Greedy tokens after a fixed prompt on a fresh trunk: serial decode (`depth` 0) or MTP rounds through the head; the
+/// MLA cache's layout `rope1` (null: the pack's).
+fn lingGreedy(b: *both.Both, depth: u32, out: []u32, rope1: ?bool) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var x = try driver.load(io, a, &b.cfg, b.dir, proof_fixture.stream());
     defer x.deinit();
+    host.of(x.plugin.?.model).mla_rope_once = rope1;
     var tok_dummy: Tokenizer = undefined; // never read by the Generator
     const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
     if (depth == 0) {
@@ -406,11 +408,63 @@ test "bailing_hybrid served: a streaming pack's greedy MTP stream equals its gre
     try withToyLing(struct {
         fn run(b: *both.Both) anyerror!void {
             var plain: [24]u32 = undefined;
-            try lingGreedy(b, 0, &plain);
+            try lingGreedy(b, 0, &plain, null);
             for ([_]u32{ 2, 4 }) |depth| {
                 var drafted: [24]u32 = undefined;
-                try lingGreedy(b, depth, &drafted);
+                try lingGreedy(b, depth, &drafted, null);
                 try testing.expectEqualSlices(u32, &plain, &drafted);
+            }
+        }
+    }.run);
+}
+
+/// One slot's logits over the MLA cache's layout `rope1`: a 10-token prompt (the whole-prompt pass over spans 4 and 10,
+/// or the chunk loop), three decode steps, a 4-row serial verify and the step after it, every row in order.
+fn lingTrace(b: *both.Both, g: *ops.Graph, rope1: bool, whole: bool) !mlx.mlx_array {
+    const m = host.of(b.xfm.plugin.?.model);
+    m.mla_rope_once = rope1;
+    defer m.mla_rope_once = null;
+    const prompt = [_]i32{ 3, 17, 42, 99, 7, 250, 1, 8, 66, 31 };
+    const ends = [_]u64{ 4, 10 };
+    var s: both.Slot = undefined;
+    try s.init(b, &b.xfm);
+    defer s.deinit();
+    var parts: [6]mlx.mlx_array = undefined;
+    if (whole) s.ctx.prompt_spans = &ends;
+    var last = mlx.mlx_array_new();
+    var all = mlx.mlx_array_new();
+    parts[0] = try g.adopt(try b.xfm.forwardWithCaptureAll(&s.ctx, try proof_fixture.tokens(g, &prompt), &last, &all));
+    _ = try g.adopt(last);
+    _ = try g.adopt(all);
+    s.ctx.prompt_spans = &.{};
+    for ([_]i32{ 5, 61, 200 }, 1..) |t, i| parts[i] = try g.adopt(try b.xfm.forwardWith(&s.ctx, try proof_fixture.tokens(g, &.{t})));
+    s.ctx.spec_verify = true;
+    s.ctx.capture_ssm_seq = true;
+    parts[4] = try g.adopt(try b.xfm.forwardWith(&s.ctx, try proof_fixture.tokens(g, &.{ 9, 33, 77, 140 })));
+    s.ctx.spec_verify = false;
+    s.ctx.capture_ssm_seq = false;
+    parts[5] = try g.adopt(try b.xfm.forwardWith(&s.ctx, try proof_fixture.tokens(g, &.{2})));
+    return g.concat(&parts, 1);
+}
+
+// Bar: a streaming pack's rope-once MLA cache gives the per-head cache's logits bit for bit (chunk loop and whole-prompt
+// pass, decode steps, a serial verify and the step after it), and the same greedy streams with MTP off and on.
+test "bailing_hybrid served: a streaming pack's rope-once MLA cache is the per-head cache's, bit for bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            var g = ops.Graph.init(testing.allocator, b.xfm.s);
+            defer g.deinit();
+            for ([_]bool{ false, true }) |whole| {
+                const dense = try lingTrace(b, &g, false, whole);
+                try ops.expectBitEqual(try lingTrace(b, &g, true, whole), dense);
+            }
+            for ([_]u32{ 0, 2 }) |depth| {
+                var want: [16]u32 = undefined;
+                try lingGreedy(b, depth, &want, false);
+                var got: [16]u32 = undefined;
+                try lingGreedy(b, depth, &got, true);
+                try testing.expectEqualSlices(u32, &want, &got);
             }
         }
     }.run);

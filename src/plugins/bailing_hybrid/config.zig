@@ -127,6 +127,8 @@ fn lingFacts(c: *const Config, p: *abi.Parsed) void {
         // The prompt runs layer by layer over the chunk loop's spans (`prompt.zig`): a routed layer reads each expert
         // once a call rather than once a chunk.
         p.caps.whole_prompt_prefill = true;
+        // Its MLA caches the rope key once a token (`mla.zig`): stored rows of another meaning, a fresh SSD-cache root.
+        p.cache.layout_namespace = abi.Str.of("ling-mla-rope1-v1");
     }
     p.chat.thinking_default = .on;
     // A streaming pack's NextN layer drafts one token a round over the trunk's final-normed hidden (`head.zig`).

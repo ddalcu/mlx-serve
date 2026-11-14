@@ -47,14 +47,14 @@ pub fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.Lay
     return n;
 }
 
-/// MLA decompresses its latent to every attention head before the write, so the cache bills per head. A streaming pack
-/// (`Config.streamed_bank`) bills its prompt here (`prefillBytes`): the engine bills no streamed model's prompt, and
-/// sizes the bank's room from this term.
+/// MLA decompresses its latent to every attention head before the write, so the cache bills per head; a streaming
+/// pack's rope-once rows bill the rope key once (`kvPerToken`). A streaming pack (`Config.streamed_bank`) bills its
+/// prompt here (`prefillBytes`): the engine bills no streamed model's prompt, and sizes the bank's room from this term.
 fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
     const c = config.of(p);
     const qk: u32 = c.mla_qk_nope_head_dim + c.mla_qk_rope_head_dim;
     out.* = .{
-        .kv_per_token = @as(u64, c.attnLayerCount()) * c.num_attention_heads * (qk + c.mla_v_head_dim) * 2,
+        .kv_per_token = kvPerToken(c),
         .ssm_checkpoint = c.ssmCheckpointBytes(2),
         .prefill_score_width = qk,
         .prefill_bytes = if (c.streamed_bank) &prefillBytes else null,
@@ -75,7 +75,27 @@ fn residentBytes(p: *const abi.Parsed, _: abi.Str, _: abi.Str, shards: u64, out:
 /// plugin's closure stays in sdk/. `bill_test.zig` pins it to the engine's `prefillNeededAtChunk` of the same config
 /// and the pass's terms.
 pub fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, _: u64) callconv(.c) u64 {
-    return chunkBytes(p, seq, chunk, kv_bits) + if (p.caps.whole_prompt_prefill) passBytes(p, seq, chunk) * 5 / 4 else 0;
+    const c = config.of(p);
+    return chunkBytes(p, seq, chunk, kv_bits) + rope1DenseBytes(c, seq) + if (p.caps.whole_prompt_prefill) passBytes(p, seq, chunk) * 5 / 4 else 0;
+}
+
+/// An MLA token's cache bytes over the attention layers: every head's key and value, or a streaming pack's rope-once
+/// row (every head's nope key and value, one roped key: `mla.zig`).
+pub fn kvPerToken(c: *const Family) u64 {
+    const heads: u64 = c.num_attention_heads;
+    const row: u64 = if (c.streamed_bank)
+        heads * (@as(u64, c.mla_qk_nope_head_dim) + c.mla_v_head_dim) + c.mla_qk_rope_head_dim
+    else
+        heads * (@as(u64, c.mla_qk_nope_head_dim) + c.mla_qk_rope_head_dim + c.mla_v_head_dim);
+    return @as(u64, c.attnLayerCount()) * row * 2;
+}
+
+/// The dense keys and values a prompt call's attention reads over a rope-once cache (`sdpa_rows.denseRope1`), one MLA
+/// layer at a time at `seq` keys; 0 for the per-head cache, which attention reads in place.
+pub fn rope1DenseBytes(c: *const Family, seq: u64) u64 {
+    if (!c.streamed_bank) return 0;
+    const qk: u64 = @as(u64, c.mla_qk_nope_head_dim) + c.mla_qk_rope_head_dim;
+    return seq * c.num_attention_heads * (qk + c.mla_v_head_dim) * 2;
 }
 
 /// The whole-prompt pass's live set past one chunk's (`sdk_bill.wholePromptPassBytes`) at its routed calls' widest.
@@ -90,8 +110,8 @@ fn chunkBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8) u64 {
     const mla = c.mla_kv_lora_rank > 0;
     const qk: u64 = @as(u64, c.mla_qk_nope_head_dim) + c.mla_qk_rope_head_dim;
     const attn: u64 = c.attnLayerCount();
-    // ModelConfig.kvBytesPerToken: MLA caches every head's expanded key and value, other attention its KV heads.
-    const kv_per_tok: u64 = if (mla) attn * c.num_attention_heads * (qk + c.mla_v_head_dim) * 2 else attn * c.num_key_value_heads * 2 * c.head_dim * 2;
+    // ModelConfig.kvBytesPerToken: MLA its cache rows (`kvPerToken`), other attention its KV heads.
+    const kv_per_tok: u64 = if (mla) kvPerToken(c) else attn * c.num_key_value_heads * 2 * c.head_dim * 2;
     // bills.prefillFfnWidth.
     const moe_w: u64 = @as(u64, c.moe_intermediate_size) * @max(@as(u64, c.num_experts_per_tok), 1) + c.shared_expert_intermediate_size;
     const dense_w: u64 = if (c.intermediate_size_declared) c.intermediate_size else 0;

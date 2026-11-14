@@ -1,6 +1,7 @@
 //! bailing_hybrid's prompt bill against the engine's. The plugin prices a streaming pack's prompt from
 //! `sdk/bill/prefill.zig` (its closure stays in sdk/); this file, outside that closure, pins the figure to the engine's
-//! `prefillNeededAtChunk` of the same config plus the whole-prompt pass's live set past a chunk's.
+//! `prefillNeededAtChunk` of the same config plus the whole-prompt pass's live set past a chunk's and, over a rope-once
+//! cache, one MLA layer's dense keys and values.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -16,14 +17,17 @@ fn expectEngineBill(json: []const u8, files: []const sdk.fixture.File) !void {
     var p: abi.Parsed = .{};
     try std.testing.expect(config.parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
     defer config.freeParsed(&p);
-    const cfg = try toModelConfig(config.of(&p));
+    var cfg = try toModelConfig(config.of(&p));
+    // The served config bills the plugin's own MLA rows (`ModelConfig.declaredMlaKvBytes`: a streaming pack names its
+    // layout namespace).
+    if (p.cache.layout_namespace.len > 0) cfg.mla_kv_bytes_declared = plugin.kvPerToken(config.of(&p));
     // The stream room's shape (16K + 1K at the wide chunk), the standard prompt, a short one, and 8-bit KV.
     const shapes = [_][3]u64{ .{ 17_408, 8192, 16 }, .{ 18_380, 4096, 16 }, .{ 900, 4096, 16 }, .{ 18_380, 4096, 8 } };
     for (shapes) |s| {
         const want = prefillNeededAtChunk(&cfg, s[0], 1, s[2], s[1], .{});
         try std.testing.expect(want > 0);
         const pass = if (p.caps.whole_prompt_prefill) plugin.passBytes(&p, s[0], @intCast(s[1])) * 5 / 4 else 0;
-        try std.testing.expectEqual(want + pass, plugin.prefillBytes(&p, s[0], @intCast(s[1]), @intCast(s[2]), 0));
+        try std.testing.expectEqual(want + pass + plugin.rope1DenseBytes(config.of(&p), s[0]), plugin.prefillBytes(&p, s[0], @intCast(s[1]), @intCast(s[2]), 0));
     }
 }
 
@@ -71,4 +75,34 @@ test "bailing_hybrid bill: the whole-prompt pass bills its routed call, its span
     try std.testing.expectEqual(2 * cp, plugin.passBytes(&p, 900, 4096));
     // The routed call stops at 16,384 + 2,048 rows: at 32,767 tokens it bills 18,432 - 1,024 of them.
     try std.testing.expectEqual((18_432 - 1024) * 8 * 4096 * 8 + 4 * (32_767 - 1024) * 4096 * 2 + 32 * cp, plugin.passBytes(&p, 32_767, 1024));
+}
+
+// Bar: a streaming pack's rope-once rows bill each head's nope key and value and one roped key (Ling-3.1-flash: 9 MLA
+// layers, 64 heads of 128 | 64, value 128); its prompt adds one layer's dense keys and values; Ling 3.0 bills per head.
+test "bailing_hybrid bill: a streaming pack's MLA rows bill the rope key once and its prompt one layer's dense keys" {
+    const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try std.testing.expect(config.parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
+    defer config.freeParsed(&p);
+    const c = config.of(&p);
+    try std.testing.expectEqual(@as(u64, 9 * (64 * (128 + 128) + 64) * 2), plugin.kvPerToken(c));
+    try std.testing.expectEqual(@as(u64, 18_380 * 64 * (192 + 128) * 2), plugin.rope1DenseBytes(c, 18_380));
+    try std.testing.expectEqualStrings("ling-mla-rope1-v1", p.cache.layout_namespace.slice());
+    var b: abi.Bill = .{};
+    plugin.table.bill(&p, &.{ .context = 32768 }, &b);
+    try std.testing.expectEqual(plugin.kvPerToken(c), b.kv_per_token);
+
+    const tiny = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json");
+    const tmem: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = tiny }} };
+    const tdir = tmem.packDir();
+    var q: abi.Parsed = .{};
+    try std.testing.expect(config.parse(&tdir, abi.Str.of(tiny), .{}, null, true, &q).isOk());
+    defer config.freeParsed(&q);
+    const t = config.of(&q);
+    const qk: u64 = @as(u64, t.mla_qk_nope_head_dim) + t.mla_qk_rope_head_dim;
+    try std.testing.expectEqual(@as(u64, t.attnLayerCount()) * t.num_attention_heads * (qk + t.mla_v_head_dim) * 2, plugin.kvPerToken(t));
+    try std.testing.expectEqual(@as(u64, 0), plugin.rope1DenseBytes(t, 18_380));
+    try std.testing.expectEqual(@as(usize, 0), q.cache.layout_namespace.len);
 }

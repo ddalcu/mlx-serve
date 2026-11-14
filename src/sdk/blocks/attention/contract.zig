@@ -2757,6 +2757,32 @@ const vr_2p1_launch = metal.Launch{
     .m2 = 1024,
 };
 
+const vr_r1_1p_launch = metal.Launch{
+    .name = "msv_sdpa_rows_r1_1p",
+    .inputs = &sdpa_rows.IN_ROWS,
+    .outputs = &sdpa_rows.OUT_ROWS,
+    .source = sdpa_rows.SOURCE_R1_1P,
+    .contiguous = false,
+    // outputs [32 * 32], max_scores and sum_exp_scores [32], f32.
+    .tg_bytes = (32 * 32 + 2 * 32) * 4,
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+const vr_r1_2p1_launch = metal.Launch{
+    .name = "msv_sdpa_rows_r1_2p1",
+    .inputs = &sdpa_rows.IN_ROWS,
+    .outputs = &sdpa_rows.OUT_PASS1,
+    .source = sdpa_rows.SOURCE_R1_2P1,
+    .contiguous = false,
+    .tg_bytes = 0,
+    .m1 = 1024,
+    .m2 = 1024,
+};
+
+/// The rope-once rows' non-positional key dims a head (Ling-3.1-flash's 128 of 192).
+const VR_NOPE = 128;
+
 const vr_2p2_launch = metal.Launch{
     .name = "msv_sdpa_rows_2p2",
     .inputs = &sdpa_rows.IN_PASS2,
@@ -2796,9 +2822,17 @@ const VecRows = struct {
     v: []f64 = &.{},
     args: [5]mlx.mlx_array = undefined,
     owned: [2]mlx.mlx_array = @splat(.{ .ctx = null }),
+    /// 0: the dense cache [1, H, T, D]; else a rope-once cache of `nope` key dims a head (`sdpa_rows.attendRope1`).
+    nope: usize = 0,
 
     fn init(a: std.mem.Allocator, launch: *const metal.Launch, kind: VrKind, blocks: usize) VecRows {
         return .{ .rig = metal.Rig.init(a), .launch = launch, .kind = kind, .blocks = blocks, .arena = .init(a) };
+    }
+
+    fn initRope1(a: std.mem.Allocator, launch: *const metal.Launch, kind: VrKind, blocks: usize) VecRows {
+        var t = init(a, launch, kind, blocks);
+        t.nope = VR_NOPE;
+        return t;
     }
 
     fn freeOwned(self: *VecRows) void {
@@ -2829,6 +2863,7 @@ const VecRows = struct {
                 g.dtype("T", .bfloat16);
                 g.int("D", VR_QK);
                 g.int("V", VR_V);
+                if (self.nope > 0) g.int("NOPE", cInt(self.nope));
                 return g;
             },
             .pass1 => {
@@ -2842,6 +2877,7 @@ const VecRows = struct {
                 g.int("V", VR_V);
                 g.int("BLOCKS", b);
                 g.int("TK", VR_TK);
+                if (self.nope > 0) g.int("NOPE", cInt(self.nope));
                 return g;
             },
         }
@@ -2873,12 +2909,18 @@ const VecRows = struct {
             host.plant(self.q, h * shape.n, VR_QK);
             host.plant(self.v, h * t, VR_V);
         }
+        // A rope-once cache holds one roped key a token: every head's is head 0's.
+        if (self.nope > 0) for (1..h) |hh| for (0..t) |i| {
+            @memcpy(self.k[(hh * t + i) * VR_QK + self.nope ..][0 .. VR_QK - self.nope], self.k[i * VR_QK + self.nope ..][0 .. VR_QK - self.nope]);
+        };
         self.rig.reset();
         const rig = &self.rig;
         const q = try rig.input(.bfloat16, &.{ 1, cInt(h), cInt(shape.n), VR_QK }, self.q);
         const cap = t + 24;
         var pad = std.Random.DefaultPrng.init(91);
-        for ([_][]const f64{ self.k, self.v }, [_]usize{ VR_QK, VR_V }, 0..) |src, d, i| {
+        if (self.nope > 0) {
+            try self.rope1Inputs(a, &pad, h, t, cap);
+        } else for ([_][]const f64{ self.k, self.v }, [_]usize{ VR_QK, VR_V }, 0..) |src, d, i| {
             const buf = try host.uniform(a, pad.random(), h * cap * d, -1, 1, .bfloat16);
             for (0..h) |hh| @memcpy(buf[hh * cap * d ..][0 .. t * d], src[hh * t * d ..][0 .. t * d]);
             const full = try rig.input(.bfloat16, &.{ 1, cInt(h), cInt(cap), cInt(d) }, buf);
@@ -2888,6 +2930,28 @@ const VecRows = struct {
         const p = [_]f64{ 0, @floatFromInt(shape.k), @floatFromInt(self.blocks) };
         self.args = .{ q, self.owned[0], self.owned[1], try rig.input(.int32, &.{3}, &p), try rig.input(.float32, &.{1}, &.{self.scale}) };
         return true;
+    }
+
+    /// The rope-once cache of the same keys and values, `cap` rows of which the first `t` are views: a token's key row
+    /// [h * nope | rope], its value row [h * V].
+    fn rope1Inputs(self: *VecRows, a: std.mem.Allocator, pad: *std.Random.DefaultPrng, h: usize, t: usize, cap: usize) !void {
+        const rope = VR_QK - self.nope;
+        const kw = h * self.nope + rope;
+        const vw = h * VR_V;
+        const kb = try host.uniform(a, pad.random(), cap * kw, -1, 1, .bfloat16);
+        const vb = try host.uniform(a, pad.random(), cap * vw, -1, 1, .bfloat16);
+        for (0..t) |i| {
+            for (0..h) |hh| {
+                @memcpy(kb[i * kw + hh * self.nope ..][0..self.nope], self.k[(hh * t + i) * VR_QK ..][0..self.nope]);
+                @memcpy(vb[i * vw + hh * VR_V ..][0..VR_V], self.v[(hh * t + i) * VR_V ..][0..VR_V]);
+            }
+            @memcpy(kb[i * kw + h * self.nope ..][0..rope], self.k[i * VR_QK + self.nope ..][0..rope]);
+        }
+        for ([_][]const f64{ kb, vb }, [_]usize{ kw, vw }, 0..) |buf, w, i| {
+            const full = try self.rig.input(.bfloat16, &.{ 1, 1, cInt(cap), cInt(w) }, buf);
+            self.owned[i] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&self.owned[i], full, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ 1, 1, cInt(t), cInt(w) }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, self.rig.stream()));
+        }
     }
 
     pub fn run(self: *VecRows) !void {
@@ -3167,6 +3231,11 @@ fn registerVerifyRows(set: *kc.Set) !void {
         try set.add(VecRows, .init(a, &vr_2p1_launch, .pass1, b), vrSpec(std.fmt.comptimePrint("msv_sdpa_rows_2p1 (192, 128), {d} blocks", .{b}), vrPass1Outs(b), qk(&.{ .{ 4, 8, 1024 }, .{ 2, 3, 4093 }, .{ 2, 16, 1100 } }), 4 * b, b), null);
     }
     try set.add(VecMerge, .init(a, &vr_2p2_launch), vrSpec("msv_sdpa_rows_2p2 (v 128)", &.{}, qk(&.{ .{ 4, 8, 64 }, .{ 2, 16, 128 }, .{ 4, 3, 1024 } }), 0, 1), null);
+    // The rope-once cache's rows (128 | 64 a head, value 128): the same statements, keys read from one row a token.
+    try set.add(VecRows, .initRope1(a, &vr_r1_1p_launch, .one, 0), vrSpec("msv_sdpa_rows_r1_1p (128 | 64, 128)", &.{}, qk(&.{ .{ 4, 8, 100 }, .{ 4, 3, 1000 }, .{ 2, 16, 600 } }), 32, 1), null);
+    inline for (.{ 64, 128 }) |b| {
+        try set.add(VecRows, .initRope1(a, &vr_r1_2p1_launch, .pass1, b), vrSpec(std.fmt.comptimePrint("msv_sdpa_rows_r1_2p1 (128 | 64, 128), {d} blocks", .{b}), vrPass1Outs(b), qk(&.{ .{ 4, 8, 1024 }, .{ 2, 3, 4093 }, .{ 2, 16, 1100 } }), 4 * b, b), null);
+    }
 }
 
 pub fn register(set: *kc.Set) !void {
@@ -3258,7 +3327,10 @@ test "kernel contract attention: the verify rows' declared launches are the wrap
         defer a.free(ours);
         const plan: sdpa_rows.Plan = if (t.kind == .one) .{ .kind = .one_pass } else .{ .kind = .two_pass, .blocks = @intCast(t.blocks) };
         const x = t.args;
-        const got = try sdpa_rows.launchGroup(t.rig.stream(), x[0], x[1], x[2], x[4], cInt(shape.rows), VR_QK, VR_V, 0, cInt(shape.n), cInt(shape.k), plan);
+        const got = if (t.nope > 0)
+            try sdpa_rows.launchGroupRope1(t.rig.stream(), x[0], x[1], x[2], x[4], cInt(shape.rows), VR_QK, VR_V, 0, cInt(shape.n), cInt(shape.k), plan, cInt(t.nope))
+        else
+            try sdpa_rows.launchGroup(t.rig.stream(), x[0], x[1], x[2], x[4], cInt(shape.rows), VR_QK, VR_V, 0, cInt(shape.n), cInt(shape.k), plan);
         defer _ = mlx.mlx_array_free(got);
         try std.testing.expectEqualSlices(u8, try t.rig.bytesOf(&.{got}), ours);
     }

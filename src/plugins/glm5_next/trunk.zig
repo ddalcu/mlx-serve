@@ -201,6 +201,13 @@ pub const Model = struct {
     serial_rows: bool = false,
     /// bailing_hybrid's whole-prompt pass: its routed calls. Tests narrow them to drive several calls.
     prompt_calls: PromptCalls = .{},
+    /// bailing_hybrid's MLA cache layout: null = a streaming pack's rope-once rows (`mlaRopeOnce`). Tests pin either.
+    mla_rope_once: ?bool = null,
+
+    /// Whether bailing_hybrid's MLA caches the rope key once a token (bailing_hybrid/mla.zig).
+    pub fn mlaRopeOnce(m: *const Model) bool {
+        return m.mla_rope_once orelse m.c.streamed_bank;
+    }
 
     pub fn deinit(m: *Model) void {
         if (m.experts) |*x| x.close();

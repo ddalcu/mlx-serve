@@ -547,6 +547,8 @@ pub const ModelConfig = struct {
     drafter_override: ?[]const u8 = null,
     /// The plugin serving this pack and its parse (`engines/mlx/plugin/config.zig`); null = the legacy path.
     plugin: ?*plugin_config.Binding = null,
+    /// KV bytes a token takes in an MLA plugin's own cache layout (`declaredMlaKvBytes`); 0 = the per-head formula.
+    mla_kv_bytes_declared: u64 = 0,
     /// The facts the legacy parse declares for its family; a served config reads its plugin's (`caps`,
     /// `defaultEnableThinking`).
     legacy: struct { caps: abi.Caps = .{}, thinking: abi.ThinkingDefault = .unset } = .{},
@@ -1081,6 +1083,7 @@ pub const ModelConfig = struct {
             }
             return sum;
         }
+        if (self.isMla() and self.mla_kv_bytes_declared > 0) return self.mla_kv_bytes_declared;
         const widths: u64 = if (self.isMla())
             @as(u64, self.mlaQkHeadDim()) + @as(u64, self.mla_v_head_dim)
         else
@@ -1876,7 +1879,18 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     }
 
     config.plugin = binding;
+    config.mla_kv_bytes_declared = declaredMlaKvBytes(&config);
     return config;
+}
+
+/// The KV bytes a token takes in an MLA plugin's own cache layout (it names a layout namespace): its bill's
+/// `kv_per_token`; 0 = the per-head formula of `kvBytesPerToken`.
+pub fn declaredMlaKvBytes(config: *const ModelConfig) u64 {
+    const b = config.plugin orelse return 0;
+    if (!config.isMla() or b.parsed.cache.layout_namespace.len == 0) return 0;
+    var bill: abi.Bill = .{};
+    b.table.bill(&b.parsed, &.{ .context = 1 }, &bill);
+    return bill.kv_per_token;
 }
 
 /// Sampling recommendations parsed out of a model's generation_config.json.

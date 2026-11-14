@@ -85,6 +85,8 @@ pub fn admits(qk: c_int, v: c_int) bool {
 pub const SOURCE_1P: [:0]const u8 = kernelSource("kernels/attention/sdpa_rows_1p.metal");
 pub const SOURCE_2P1: [:0]const u8 = kernelSource("kernels/attention/sdpa_rows_2p1.metal");
 pub const SOURCE_2P2: [:0]const u8 = kernelSource("kernels/attention/sdpa_rows_2p2.metal");
+pub const SOURCE_R1_1P: [:0]const u8 = kernelSource("kernels/attention/sdpa_rows_r1_1p.metal");
+pub const SOURCE_R1_2P1: [:0]const u8 = kernelSource("kernels/attention/sdpa_rows_r1_2p1.metal");
 pub const IN_ROWS = [_][*:0]const u8{ "qin", "kin", "vin", "p", "sc" };
 pub const IN_PASS2 = [_][*:0]const u8{ "partials", "sums", "maxs", "p" };
 pub const OUT_ROWS = [_][*:0]const u8{"oout"};
@@ -93,7 +95,10 @@ pub const OUT_PASS1 = [_][*:0]const u8{ "partials", "sums", "maxs" };
 var one_pass_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var pass1_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var pass2_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var r1_one_pass_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var r1_pass1_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
+var r1_engaged = false;
 /// Groups launched (one or two kernels each): a served verify's engagement.
 pub var launches: usize = 0;
 
@@ -131,6 +136,16 @@ fn apply(k: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, s:
 
 /// One group's rows [r0, r0 + rows) of `plan`, n0 the keys of its first row: [1, H, rows, V] in q's dtype.
 pub fn launchGroup(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, sc: mlx.mlx_array, h: c_int, qk: c_int, vd: c_int, r0: c_int, rows: c_int, n0: c_int, plan: Plan) !mlx.mlx_array {
+    return launchGroupAt(s, q, k, v, sc, h, qk, vd, r0, rows, n0, plan, 0);
+}
+
+/// `launchGroup` over a rope-once cache (`attendRope1`): keys [1, 1, T, H * nope + qk - nope], values [1, 1, T, H * vd].
+pub fn launchGroupRope1(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, sc: mlx.mlx_array, h: c_int, qk: c_int, vd: c_int, r0: c_int, rows: c_int, n0: c_int, plan: Plan, nope: c_int) !mlx.mlx_array {
+    return launchGroupAt(s, q, k, v, sc, h, qk, vd, r0, rows, n0, plan, nope);
+}
+
+/// nope 0: the dense kernels; else the rope-once kernels at `nope` non-positional key dims a head.
+fn launchGroupAt(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, sc: mlx.mlx_array, h: c_int, qk: c_int, vd: c_int, r0: c_int, rows: c_int, n0: c_int, plan: Plan, nope: c_int) !mlx.mlx_array {
     const dt = mlx.mlx_array_dtype(q);
     const out_shape = [_]c_int{ 1, h, rows, vd };
     const pv = [_]i32{ r0, n0, @intCast(plan.blocks) };
@@ -138,7 +153,10 @@ pub fn launchGroup(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx
     defer free(p);
     switch (plan.kind) {
         .one_pass => {
-            const kern = try kernel(&one_pass_kernel, "msv_sdpa_rows_1p", &IN_ROWS, &OUT_ROWS, SOURCE_1P);
+            const kern = if (nope == 0)
+                try kernel(&one_pass_kernel, "msv_sdpa_rows_1p", &IN_ROWS, &OUT_ROWS, SOURCE_1P)
+            else
+                try kernel(&r1_one_pass_kernel, "msv_sdpa_rows_r1_1p", &IN_ROWS, &OUT_ROWS, SOURCE_R1_1P);
             const cfg = mlx.mlx_fast_metal_kernel_config_new();
             defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, out_shape.len, dt));
@@ -148,13 +166,17 @@ pub fn launchGroup(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "D", qk));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", vd));
+            if (nope != 0) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NOPE", nope));
             var o: [1]mlx.mlx_array = undefined;
             try apply(kern, cfg, s, &.{ q, k, v, p, sc }, &o);
             return o[0];
         },
         .two_pass => {
             const blocks: c_int = @intCast(plan.blocks);
-            const k1 = try kernel(&pass1_kernel, "msv_sdpa_rows_2p1", &IN_ROWS, &OUT_PASS1, SOURCE_2P1);
+            const k1 = if (nope == 0)
+                try kernel(&pass1_kernel, "msv_sdpa_rows_2p1", &IN_ROWS, &OUT_PASS1, SOURCE_2P1)
+            else
+                try kernel(&r1_pass1_kernel, "msv_sdpa_rows_r1_2p1", &IN_ROWS, &OUT_PASS1, SOURCE_R1_2P1);
             const cfg1 = mlx.mlx_fast_metal_kernel_config_new();
             defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg1);
             const part_shape = [_]c_int{ h, rows, blocks, vd };
@@ -170,6 +192,7 @@ pub fn launchGroup(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg1, "V", vd));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg1, "BLOCKS", blocks));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg1, "TK", @intCast(tk)));
+            if (nope != 0) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg1, "NOPE", nope));
             var po: [3]mlx.mlx_array = undefined;
             try apply(k1, cfg1, s, &.{ q, k, v, p, sc }, &po);
             defer for (po) |a| free(a);
@@ -205,8 +228,76 @@ pub fn attend(out: *mlx.mlx_array, queries: mlx.mlx_array, keys: mlx.mlx_array, 
     if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(keys) != dt or mlx.mlx_array_dtype(values) != dt) return false;
     if (seq_len < 1 or seq_len > max_rows or qs[2] != seq_len or ks[2] < seq_len) return false;
     if (!mlx.streamIsGpu(s)) return false;
+    try attendRows(out, queries, keys, values, scale, seq_len, s, qs[1], ks[2], qs[3], vs[3], 0);
+    return true;
+}
+
+/// `attend` over a rope-once MLA cache: `keys` [1, 1, T, H * nope + D - nope] holds each token's per-head
+/// non-positional keys, then the one roped key every head shares; `values` [1, 1, T, H * V]. Each row's words are
+/// `attend`'s over the dense keys [1, H, T, D] (nope | rope broadcast) and values [1, H, T, V] of the same cache. False
+/// where it does not serve (nothing launched), as `attend`. The rows are read at their token stride, each contiguous.
+pub fn attendRope1(out: *mlx.mlx_array, queries: mlx.mlx_array, keys: mlx.mlx_array, values: mlx.mlx_array, nope: c_int, scale: f32, seq_len: c_int, s: mlx.mlx_stream) !bool {
+    const qs = mlx.getShape(queries);
+    const ks = mlx.getShape(keys);
+    const vs = mlx.getShape(values);
+    if (qs.len != 4 or ks.len != 4 or vs.len != 4) return false;
+    if (qs[0] != 1 or ks[0] != 1 or vs[0] != 1 or ks[1] != 1 or vs[1] != 1) return false;
     const h = qs[1];
+    const d = qs[3];
+    if (nope <= 0 or nope >= d or @rem(vs[3], h) != 0) return false;
+    const vd = @divExact(vs[3], h);
+    if (ks[3] != h * nope + d - nope or vs[2] != ks[2] or !admits(d, vd)) return false;
+    const dt = mlx.mlx_array_dtype(queries);
+    if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(keys) != dt or mlx.mlx_array_dtype(values) != dt) return false;
+    if (seq_len < 1 or seq_len > max_rows or qs[2] != seq_len or ks[2] < seq_len) return false;
+    if (!mlx.streamIsGpu(s)) return false;
+    try attendRows(out, queries, keys, values, scale, seq_len, s, h, ks[2], d, vd, nope);
+    if (!r1_engaged) {
+        r1_engaged = true;
+        log.info("[sdpa-rows] rope-once engaged: {d} heads of {d} | {d}, value {d}\n", .{ h, nope, d - nope, vd });
+    }
+    return true;
+}
+
+/// The dense keys [B, H, T, D] and values [B, H, T, V] of a rope-once cache's `keys` [B, 1, T, H * nope + D - nope]
+/// and `values` [B, 1, T, H * V]: each head's nope keys, then the shared roped key broadcast to every head. The same
+/// elements as the per-head cache holds, so any attention over them gives that cache's words. Caller frees both.
+pub fn denseRope1(keys: mlx.mlx_array, values: mlx.mlx_array, h: c_int, nope: c_int, s: mlx.mlx_stream, k_out: *mlx.mlx_array, v_out: *mlx.mlx_array) !void {
+    const ks = mlx.getShape(keys);
+    const vs = mlx.getShape(values);
+    const b = ks[0];
     const t = ks[2];
+    const rope = ks[3] - h * nope;
+    const vd = @divExact(vs[3], h);
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+    const ones = [_]c_int{ 1, 1, 1, 1 };
+    var np = mlx.mlx_array_new();
+    defer free(np);
+    try mlx.check(mlx.mlx_slice(&np, keys, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ b, 1, t, h * nope }, 4, &ones, 4, s));
+    var np4 = mlx.mlx_array_new();
+    defer free(np4);
+    try mlx.check(mlx.mlx_reshape(&np4, np, &[_]c_int{ b, t, h, nope }, 4, s));
+    var np_t = mlx.mlx_array_new();
+    defer free(np_t);
+    try mlx.check(mlx.mlx_transpose_axes(&np_t, np4, &perm, 4, s));
+    var rp = mlx.mlx_array_new();
+    defer free(rp);
+    try mlx.check(mlx.mlx_slice(&rp, keys, &[_]c_int{ 0, 0, 0, h * nope }, 4, &[_]c_int{ b, 1, t, ks[3] }, 4, &ones, 4, s));
+    var rp_b = mlx.mlx_array_new();
+    defer free(rp_b);
+    try mlx.check(mlx.mlx_broadcast_to(&rp_b, rp, &[_]c_int{ b, h, t, rope }, 4, s));
+    const parts = [_]mlx.mlx_array{ np_t, rp_b };
+    const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_concatenate_axis(k_out, vec, 3, s));
+    var v4 = mlx.mlx_array_new();
+    defer free(v4);
+    try mlx.check(mlx.mlx_reshape(&v4, values, &[_]c_int{ b, t, h, vd }, 4, s));
+    try mlx.check(mlx.mlx_transpose_axes(v_out, v4, &perm, 4, s));
+}
+
+/// The groups of `seq_len` rows over `t` keys, each its one-row plan's kernels (nope 0: the dense layout).
+fn attendRows(out: *mlx.mlx_array, queries: mlx.mlx_array, keys: mlx.mlx_array, values: mlx.mlx_array, scale: f32, seq_len: c_int, s: mlx.mlx_stream, h: c_int, t: c_int, qk: c_int, vd: c_int, nope: c_int) !void {
     const devc = deviceClass();
     const benv = env.int(.MLX_SDPA_BLOCKS, u32, 0);
     const n_rows: usize = @intCast(seq_len);
@@ -223,7 +314,7 @@ pub fn attend(out: *mlx.mlx_array, queries: mlx.mlx_array, keys: mlx.mlx_array, 
         var r1 = r0 + 1;
         while (r1 < n_rows and plans[r1].eql(plans[r0])) r1 += 1;
         const n0: c_int = t - seq_len + @as(c_int, @intCast(r0)) + 1;
-        parts[n_parts] = try launchGroup(s, queries, keys, values, sc, h, qs[3], vs[3], @intCast(r0), @intCast(r1 - r0), n0, plans[r0]);
+        parts[n_parts] = try launchGroupAt(s, queries, keys, values, sc, h, qk, vd, @intCast(r0), @intCast(r1 - r0), n0, plans[r0], nope);
         n_parts += 1;
         r0 = r1;
     }
@@ -239,7 +330,6 @@ pub fn attend(out: *mlx.mlx_array, queries: mlx.mlx_array, keys: mlx.mlx_array, 
         engaged = true;
         log.info("[sdpa-rows] engaged: {d} rows in {d} group(s), device class {c}\n", .{ seq_len, n_parts, if (devc == 0) '?' else devc });
     }
-    return true;
 }
 
 // ── tests ──
@@ -310,6 +400,69 @@ test "sdpa rows: n rows in one launch per plan are n one-row MLX SDPA calls, bit
     try expectRows(4, 192, 128, 3, 2000, 0, .bfloat16, seed);
     try expectRows(4, 192, 128, 4, 1022, 37, .float16, seed + 3);
     try expectRows(4, 128, 128, 5, 1021, 37, .bfloat16, seed + 6);
+}
+
+/// A rope-once cache of `extra` rows past T: keys [1, 1, T, h * nope + rope] and values [1, 1, T, h * vd], as views.
+fn rope1Cache(g: *ops.Graph, h: c_int, nope: c_int, rope: c_int, vd: c_int, t: c_int, extra: c_int, dt: mlx.mlx_dtype, seed: u64) ![2]mlx.mlx_array {
+    const kw = h * nope + rope;
+    const k = try g.slice(try normal(g, seed, &.{ 1, 1, t + extra, kw }, dt), &.{ 0, 0, 0, 0 }, &.{ 1, 1, t, kw });
+    const v = try g.slice(try normal(g, seed + 1, &.{ 1, 1, t + extra, h * vd }, dt), &.{ 0, 0, 0, 0 }, &.{ 1, 1, t, h * vd });
+    return .{ k, v };
+}
+
+/// `attendRope1` against rowByRowSdpa over the same cache's dense keys and values, bit for bit.
+fn expectRope1Rows(h: c_int, rows: c_int, n0: c_int, extra: c_int, dt: mlx.mlx_dtype, seed: u64) !void {
+    var g = ops.Graph.init(std.testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const t = n0 + rows - 1;
+    const q = try normal(&g, seed, &.{ 1, h, rows, 192 }, dt);
+    const kv = try rope1Cache(&g, h, 128, 64, 128, t, extra, dt, seed + 1);
+    var dk = try g.adopt(mlx.mlx_array_new());
+    var dv = try g.adopt(mlx.mlx_array_new());
+    try denseRope1(kv[0], kv[1], h, 128, g.s, &dk, &dv);
+    const scale: f32 = 1.0 / @sqrt(192.0);
+    var want = try g.adopt(mlx.mlx_array_new());
+    try rowByRowSdpa(&want, q, dk, dv, scale, rows, g.s);
+    var got = try g.adopt(mlx.mlx_array_new());
+    try std.testing.expect(try attendRope1(&got, q, kv[0], kv[1], 128, scale, rows, g.s));
+    try ops.expectBitEqual(got, want);
+}
+
+// Bar: over a rope-once cache each row's words are its one-row MLX SDPA call's over the dense keys (nope | rope), at
+// one row (decode) and verify widths, across the one-pass / two-pass and blocks thresholds, bf16 and f16.
+test "sdpa rows: a rope-once cache's rows are n one-row MLX SDPA calls over its dense keys, bit for bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var seed: u64 = 0x5EED_0B12;
+    for ([_]c_int{ 1, 100, 1023, 1024, 4093, 8190, 18380 }) |n0| {
+        try expectRope1Rows(4, 1, n0, 37, .bfloat16, seed);
+        try expectRope1Rows(4, 4, n0, 37, .bfloat16, seed + 2);
+        seed += 4;
+    }
+    for ([_]c_int{ 2, 3, 5, 16 }) |rows| {
+        try expectRope1Rows(4, rows, 1022, 37, .bfloat16, seed);
+        seed += 2;
+    }
+    try expectRope1Rows(64, 3, 2000, 0, .bfloat16, seed);
+    try expectRope1Rows(4, 4, 1022, 37, .float16, seed + 2);
+}
+
+// Bar: a rope-once cache the kernels do not serve (other widths, a batch, past 16 rows) is declined before any launch.
+test "sdpa rows: a rope-once cache of other widths, a batch or past 16 rows is declined" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var g = ops.Graph.init(std.testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    const q = try normal(&g, 21, &.{ 1, 4, 3, 192 }, .bfloat16);
+    const kv = try rope1Cache(&g, 4, 128, 64, 128, 10, 0, .bfloat16, 22);
+    const before = launches;
+    var out = try g.adopt(mlx.mlx_array_new());
+    try std.testing.expect(!try attendRope1(&out, q, kv[0], kv[1], 96, 0.1, 3, g.s));
+    const v64 = try rope1Cache(&g, 4, 128, 64, 64, 10, 0, .bfloat16, 23);
+    try std.testing.expect(!try attendRope1(&out, q, kv[0], v64[1], 128, 0.1, 3, g.s));
+    try std.testing.expect(!try attendRope1(&out, try normal(&g, 24, &.{ 2, 4, 3, 192 }, .bfloat16), kv[0], kv[1], 128, 0.1, 3, g.s));
+    const q17 = try normal(&g, 25, &.{ 1, 4, 17, 192 }, .bfloat16);
+    const kv20 = try rope1Cache(&g, 4, 128, 64, 128, 20, 0, .bfloat16, 26);
+    try std.testing.expect(!try attendRope1(&out, q17, kv20[0], kv20[1], 128, 0.1, 17, g.s));
+    try std.testing.expectEqual(before, launches);
 }
 
 // Bar: what it does not serve is declined before any launch.

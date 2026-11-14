@@ -1,12 +1,17 @@
 //! Ling 3.0's multi-head latent attention (the naive DeepSeek-V3 form: per-head keys and values expanded before the
-//! cache) on one slot through `CacheOps`.
+//! cache) on one slot through `CacheOps`. A streaming pack caches the rope key once (`Model.mlaRopeOnce`): a token's key
+//! row holds every head's nope key, then the one roped key; attention reads it as the dense key's elements.
 //! copied_from: sdk/blocks/attention/mla.zig (`mlaAttnWith`, the cache update replaced by `Slots.append`).
 
 const mlx = @import("../../mlx/ffi.zig");
 const Slots = @import("../glm5_next/slots.zig").Slots;
+const View = @import("../glm5_next/slots.zig").View;
 const trunk = @import("../glm5_next/trunk.zig");
 const rowByRowSdpa = @import("../../sdk/blocks/attention/sdpa.zig").rowByRowSdpa;
 const sdpa_rows = @import("../../sdk/blocks/attention/sdpa_rows.zig");
+const log = @import("../../sdk/util/log.zig");
+
+var rope1_logged = false;
 
 pub fn mlaAttn(
     self: *const trunk.Model,
@@ -107,12 +112,6 @@ pub fn mlaAttn(
     try mlx.check(mlx.mlx_fast_rope(&q_rot, q_rot_raw, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
     try mlx.check(mlx.mlx_fast_rope(&k_rot, k_pe_t, rope_d, traditional, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
 
-    // The rope key is MQA — one head, replicated so the cached K is a
-    // plain [B,H,S,qk_dim] tensor the standard cache path can carry.
-    var k_rot_b = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k_rot_b);
-    try mlx.check(mlx.mlx_broadcast_to(&k_rot_b, k_rot, &[_]c_int{ batch, h_count, seq_len, rope_d }, 4, self.s));
-
     var queries = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(queries);
     {
@@ -121,21 +120,11 @@ pub fn mlaAttn(
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_concatenate_axis(&queries, vec, -1, self.s));
     }
-    var keys = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(keys);
-    {
-        const parts = [_]mlx.mlx_array{ k_nope, k_rot_b };
-        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
-        defer _ = mlx.mlx_vector_array_free(vec);
-        try mlx.check(mlx.mlx_concatenate_axis(&keys, vec, -1, self.s));
-    }
-    // The cache stores views; a strided V slice must own its bytes before
-    // it is written into the buffer (mlx `slice` is a VIEW op).
-    var v_contig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v_contig);
-    try mlx.check(mlx.mlx_contiguous(&v_contig, v_t, false, self.s));
-
-    var kv_view = try sl.append(0, layer, keys, v_contig, self.s);
+    const rope1 = self.mlaRopeOnce();
+    var kv_view = if (rope1)
+        try appendRope1(self, sl, layer, kv_heads, k_rot, batch, seq_len, h_count, nope, rope_d, v_dim)
+    else
+        try appendDense(self, sl, layer, k_nope, k_rot, v_t, batch, seq_len, h_count, rope_d);
     defer kv_view.deinit();
 
     // Plain SDPA: MLX has a fused vector kernel for exactly this
@@ -147,14 +136,35 @@ pub fn mlaAttn(
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
     const sel_mode: [*:0]const u8 = if (is_prefill) "causal" else "";
-    // Serial rows: each query row the one-row call a decode step makes over the keys up to it (the vector kernel
-    // splits a row's sum by the call's query rows); one launch per kind of row where `sdpa_rows` serves, else a call
-    // per row (head dims MLX's vector kernel lacks, past its 16 rows).
-    if (self.serial_rows and seq_len > 1) {
-        if (!try sdpa_rows.attend(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, seq_len, self.s))
-            try rowByRowSdpa(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, seq_len, self.s);
-    } else
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, queries, kv_view.k, kv_view.v, attn_scale, sel_mode, none_mask, .{ .ctx = null }, false, self.s));
+    // A decode step or a serial verify reads the rope-once rows in place, each row the dense call's words; anything
+    // else attends over the dense keys and values built from them.
+    const in_place = rope1 and !is_prefill and (seq_len == 1 or self.serial_rows) and
+        try sdpa_rows.attendRope1(&attn_out, queries, kv_view.k, kv_view.v, nope, attn_scale, seq_len, self.s);
+    if (!in_place) {
+        var dk: mlx.mlx_array = .{ .ctx = null };
+        defer if (dk.ctx != null) {
+            _ = mlx.mlx_array_free(dk);
+        };
+        var dv: mlx.mlx_array = .{ .ctx = null };
+        defer if (dv.ctx != null) {
+            _ = mlx.mlx_array_free(dv);
+        };
+        if (rope1) {
+            dk = mlx.mlx_array_new();
+            dv = mlx.mlx_array_new();
+            try sdpa_rows.denseRope1(kv_view.k, kv_view.v, h_count, nope, self.s, &dk, &dv);
+        }
+        const keys = if (rope1) dk else kv_view.k;
+        const values = if (rope1) dv else kv_view.v;
+        // Serial rows: each query row the one-row call a decode step makes over the keys up to it (the vector kernel
+        // splits a row's sum by the call's query rows); one launch per kind of row where `sdpa_rows` serves, else a
+        // call per row (head dims MLX's vector kernel lacks, past its 16 rows).
+        if (self.serial_rows and seq_len > 1) {
+            if (!try sdpa_rows.attend(&attn_out, queries, keys, values, attn_scale, seq_len, self.s))
+                try rowByRowSdpa(&attn_out, queries, keys, values, attn_scale, seq_len, self.s);
+        } else
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, queries, keys, values, attn_scale, sel_mode, none_mask, .{ .ctx = null }, false, self.s));
+    }
 
     // [B,H,S,Dv] → [B,S,H,Dv]; the gate is per (token, head).
     var attn_t = mlx.mlx_array_new();
@@ -198,4 +208,62 @@ pub fn mlaAttn(
     // shipped mirror) skip the path either way; this only binds a future
     // bf16 mirror, and it can opt in once someone A/Bs it.
     return self.mm(&fa.o, attn_flat);
+}
+
+/// Today's per-head cache: every head's key (nope | the rope key broadcast) [B, H, S, nope + rope] and value.
+fn appendDense(self: *const trunk.Model, sl: Slots, layer: u32, k_nope: mlx.mlx_array, k_rot: mlx.mlx_array, v_t: mlx.mlx_array, batch: c_int, seq_len: c_int, h_count: c_int, rope_d: c_int) !View {
+    var k_rot_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_rot_b);
+    try mlx.check(mlx.mlx_broadcast_to(&k_rot_b, k_rot, &[_]c_int{ batch, h_count, seq_len, rope_d }, 4, self.s));
+    var keys = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(keys);
+    {
+        const parts = [_]mlx.mlx_array{ k_nope, k_rot_b };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&keys, vec, -1, self.s));
+    }
+    // The cache stores views; a strided V slice must own its bytes before
+    // it is written into the buffer (mlx `slice` is a VIEW op).
+    var v_contig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_contig);
+    try mlx.check(mlx.mlx_contiguous(&v_contig, v_t, false, self.s));
+    return sl.append(0, layer, keys, v_contig, self.s);
+}
+
+/// The rope-once cache: a token's key row [B, 1, S, H * nope + rope] (every head's nope key, then the one roped key)
+/// and value row [B, 1, S, H * v], from `kv_heads` [B, S, H, nope + v] and the roped key [B, 1, S, rope].
+fn appendRope1(self: *const trunk.Model, sl: Slots, layer: u32, kv_heads: mlx.mlx_array, k_rot: mlx.mlx_array, batch: c_int, seq_len: c_int, h_count: c_int, nope: c_int, rope_d: c_int, v_dim: c_int) !View {
+    const ones = [_]c_int{ 1, 1, 1, 1 };
+    var nope_h = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(nope_h);
+    try mlx.check(mlx.mlx_slice(&nope_h, kv_heads, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, seq_len, h_count, nope }, 4, &ones, 4, self.s));
+    var nope_row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(nope_row);
+    try mlx.check(mlx.mlx_reshape(&nope_row, nope_h, &[_]c_int{ batch, seq_len, h_count * nope }, 3, self.s));
+    var rope_row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rope_row);
+    try mlx.check(mlx.mlx_reshape(&rope_row, k_rot, &[_]c_int{ batch, seq_len, rope_d }, 3, self.s));
+    var k_row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_row);
+    {
+        const parts = [_]mlx.mlx_array{ nope_row, rope_row };
+        const vec = mlx.mlx_vector_array_new_data(&parts, 2);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&k_row, vec, -1, self.s));
+    }
+    var keys = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(keys);
+    try mlx.check(mlx.mlx_reshape(&keys, k_row, &[_]c_int{ batch, 1, seq_len, h_count * nope + rope_d }, 4, self.s));
+    var v_h = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v_h);
+    try mlx.check(mlx.mlx_slice(&v_h, kv_heads, &[_]c_int{ 0, 0, 0, nope }, 4, &[_]c_int{ batch, seq_len, h_count, nope + v_dim }, 4, &ones, 4, self.s));
+    var values = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(values);
+    try mlx.check(mlx.mlx_reshape(&values, v_h, &[_]c_int{ batch, 1, seq_len, h_count * v_dim }, 4, self.s));
+    if (!rope1_logged) {
+        rope1_logged = true;
+        log.info("[bailing_hybrid] rope-once KV engaged: {d} heads, key row {d} + {d}, value row {d}\n", .{ h_count, h_count * nope, rope_d, h_count * v_dim });
+    }
+    return sl.append(0, layer, keys, values, self.s);
 }
