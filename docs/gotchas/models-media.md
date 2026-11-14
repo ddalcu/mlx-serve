@@ -576,8 +576,25 @@ trims. Fix: `trainedSeconds` and `latentCount`. A condition works only as traini
 Defect: `MiMo-V2.6-Flash-Sushi-2.3bpw` died in warmup on a bf16 `o_proj`; later every boot logged MTP off. Cause: the
 source shard still carries bf16 copies beside the affine triples and the loader kept the last listed; the heads were
 stored like the trunk (fused e4m3 QKV) and never converted. Fix: duplicated tensors load from the shard the index
-names (`indexOwners`); embed/head are dense by dtype; the heads get the trunk's QKV split and MLP decode. Guard:
-`indexOwners: the index names the shard…`, the smoke `mimo_v2_sushi.mtp` cell.
+names (`indexOwners`; the loader resolves every duplicated `.weight` key against its shard headers, so this holds for
+any indexed pack); embed/head are dense by dtype; the heads get the trunk's QKV split and MLP decode. Guard: `indexOwners: the index names the shard…`, the smoke `mimo_v2_sushi.mtp` cell.
+
+### An abliteration fork's dense `o_proj` kept the trunk's retired quant pair
+Defect: `GLM-5.3-Flash-Sushi-2bpw-Abliterated` loaded 81.5 GB then 500'd every request: `[quantized_matmul] The weight
+matrix should be uint32 but received bfloat16`. Cause: the fork ships BF16 replacements in a shard the index names and
+retires the packed triple's entries, but the trunk still carries `weight`+`scales`+`biases`; which `weight` won the key
+was directory order, and the unnamed `scales`/`biases` always survived — a float weight beside set scales routes every
+quantized arm to a kernel that refuses a float weight. Fix: the load scans every shard header twice (a 100-shard pack:
+~1 MB, milliseconds) — once for which `.weight` keys sit packed somewhere, once folded into the carrier map — and a
+duplicated `.weight` resolves to its carrier of record before either shard places: the index's owner when a second
+carrier proves the fork adopted it; the PACKED carrier when the index names no carrier (its copy is the loadable arm
+of the pair); untracked (first copy wins, as an index-less pack) when the index is stale or two float carriers tie.
+Quant leaves ride the carrier of record, except a leaf the index names there — the winner's own pair (a modelopt pack
+indexes its scales) stays. A float winner sheds the pair; a packed winner keeps it. Placement drops run through one
+`foreign_copy` flag: a `continue` nested in the gate skips the rest of the loop body, including the placement itself.
+Guards: `loadWeights sheds a retired quant pair …` (both orders, the modelopt arm, the packed-owner arm),
+`keeps a retired pair whose adopted copy is packed`, `keeps a key an out-of-place index entry names`,
+`places an index-named weight over a packed copy`.
 
 ### MiMo's own DFlash drafter loaded, drafted garbage and outranked MTP
 Defect: Xiaomi's drafter accepted 2-4%, the gate turned it off, and the request ran serial at 32 tok/s against 67 with
