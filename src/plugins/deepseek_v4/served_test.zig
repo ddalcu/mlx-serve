@@ -302,6 +302,7 @@ const Requests = struct {
         h.sch.decoding = .empty;
         h.sch.pending = .empty;
         h.sch.cleanup_queue = .empty;
+        h.sch.offloaded = .empty;
         h.sch.vision_queue = .empty;
         h.sch.embed_queue = .empty;
         h.sch.max_concurrent = 4;
@@ -769,31 +770,54 @@ test "deepseek_v41 served: a prefill cancelled past the commit floor is committe
     defer p.close();
     const h = try Requests.open(p);
     defer h.close();
-    var prompt: [600]u32 = undefined;
+    var prompt: [900]u32 = undefined;
     for (&prompt, 0..) |*id, i| id.* = @intCast((i * 7 + 3) % 90 + 2);
-    const stop = 300;
-
-    const abandoned = try h.newSlot(&prompt);
-    const id = @import("../../engines/mlx/plugin/settle.zig").slotId(p.xfm.plugin.?, &abandoned.ctx);
-    try testing.expect(driver.auxBeginPrompt(&p.xfm, id, abandoned.full_prompt, null, 0, true).isOk());
-    var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
-    defer g.deinit();
-    var first: [stop]i32 = undefined;
-    for (&first, prompt[0..stop]) |*o, t| o.* = @intCast(t);
-    try ops.eval(try g.adopt(try p.xfm.forwardWith(&abandoned.ctx, try g.fromSlice(i32, &first, &.{ 1, stop }))));
-    abandoned.cancelled.store(true, .release);
-    commit_request.commitSlotIfApplicable(&h.sch, abandoned);
-    const hc = h.entry.prefix_cache.?;
-    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
-    try testing.expectEqualSlices(u32, prompt[0..stop], hc.entries.items[0].tokens);
-    finish_request.releasePluginSlot(abandoned);
-    abandoned.deinit();
-    try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
+    p.cfg.pinned_prefill_chunk = 128;
+    // The client leaves after `leave_at` rows: the scheduler sees it at the next chunk.
+    const Leave = struct {
+        var original: *const fn (*anyopaque, *const abi.Forward, *abi.ForwardOut) callconv(.c) abi.Verdict = undefined;
+        var slot: ?*RequestSlot = null;
+        var rows: usize = 0;
+        var leave_at: usize = 0;
+        fn forward(m: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {
+            const v = original(m, f, out);
+            const s = slot orelse return v;
+            rows += f.rows;
+            if (rows >= leave_at) s.cancelled.store(true, .release);
+            return v;
+        }
+    };
+    const bound = p.xfm.plugin.?;
+    const old = bound.table;
+    defer bound.table = old;
+    var table = old.*;
+    Leave.original = old.forward;
+    table.forward = &Leave.forward;
+    bound.table = &table;
+    // Two abandoned tries in a row: the second resumes where the first stopped and moves the committed point on.
+    var stop: usize = 0;
+    for ([_]usize{ prefix_cache.MIN_CANCELLED_COMMIT_TOKENS, 128 }) |leave_at| {
+        const abandoned = try h.newSlot(&prompt);
+        Leave.leave_at = leave_at;
+        Leave.rows = 0;
+        Leave.slot = abandoned;
+        const outcome = @import("../../engines/mlx/step.zig").prefillAdmitted(&h.sch, abandoned);
+        Leave.slot = null;
+        try testing.expectEqual(.finished, outcome);
+        try testing.expectEqual(@as(u32, @intCast(stop)), abandoned.cached_tokens);
+        stop += Leave.rows;
+        try testing.expect(Leave.rows >= leave_at and stop < prompt.len - 1);
+        abandoned.deinit();
+        try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
+        const hit = h.entry.prefix_cache.?.findModuleMatch(prefix_cache.ModuleBinding.init(&p.xfm).?, &prompt, false, &.{}, null, KVQuantConfig.dense).?;
+        try testing.expectEqual(stop, hit.n);
+    }
+    bound.table = old;
 
     // The retry prefills only what the abandoned request had not forwarded.
     const s = try h.prefill(&prompt);
     defer s.deinit();
-    try testing.expectEqual(@as(u32, stop), s.cached_tokens);
+    try testing.expectEqual(@as(u32, @intCast(stop)), s.cached_tokens);
     finish_request.releasePluginSlot(s);
 }
 

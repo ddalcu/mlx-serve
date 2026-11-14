@@ -275,7 +275,9 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     const module_binding = prefix_cache_mod.ModuleBinding.forVariant(xfm_ptr, slot.cache_variant);
-    errdefer if (module_binding != null) {
+    // A cancelled prefill keeps its state for `finishSlot`, which commits what was forwarded and then releases it.
+    var cancelled_prefill = false;
+    errdefer if (module_binding != null and !cancelled_prefill) {
         @import("finish.zig").releasePluginSlot(slot);
         publishHotCacheResidency(sch);
     };
@@ -546,7 +548,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     if (slot.prefix_cache) |hc| hc.donateCheckout(@intFromPtr(slot));
     const graphs_were = mlx.setCudaGraphs(mlx.prefillKeepsCudaGraphs());
     defer _ = mlx.setCudaGraphs(graphs_were);
-    var gen = try Generator.initWithOptions(
+    var gen = Generator.initWithOptions(
         sch.io,
         slot.allocator,
         xfm_ptr,
@@ -629,7 +631,12 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .logprobs_n = slot.logprobs_n,
             .prompt_logprobs = if (slot.prompt_logprobs) slot.freshPromptLogprobs() else null,
         },
-    );
+    ) catch |err| {
+        cancelled_prefill = err == error.Cancelled;
+        // What the slot restored, so the cancelled commit can tell new chunks from the entry it started on.
+        if (cancelled_prefill) slot.cached_tokens = hot_matched;
+        return err;
+    };
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
     gen.timeout_ns = slot.timeout_ns;
     gen.logprobs_n = slot.logprobs_n;
