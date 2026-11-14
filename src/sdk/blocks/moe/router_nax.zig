@@ -113,15 +113,34 @@ const pload_text: []const u8 = kernelSource("kernels/moe/router_nax_pload.metal"
 // and f32 copy's exact values) and its output stored atomically. MLX puts utils.h before every custom kernel.
 const gemv_open = "#define MLX_MTL_CONST static constant constexpr const\n";
 const gemv_close = "///////////////////////////////////////////////////////////////////////////////\n/// Vector matrix multiplication\n";
-const gemv_kernel: [:0]const u8 = blk: {
+const gemv_kernel: [:0]const u8 = gemvKernel(withoutCr(steel.gemv));
+fn gemvKernel(comptime gemv: []const u8) [:0]const u8 {
     @setEvalBranchQuota(200_000_000);
-    break :blk editsOnce(gemv_open ++ between(steel.gemv, gemv_open, gemv_close), &.{
+    return comptime editsOnce(gemv_open ++ between(gemv, gemv_open, gemv_close), &.{
         .{ "template <typename U = T>\n  static METAL_FUNC void\n  load_unsafe(const device T* src,", "template <typename U = T, typename S = T>\n  static METAL_FUNC void\n  load_unsafe(const device S* src," },
         .{ "template <typename U = T>\n  static METAL_FUNC void load_safe(\n      const device T* src,", "template <typename U = T, typename S = T>\n  static METAL_FUNC void load_safe(\n      const device S* src," },
         .{ "  static METAL_FUNC void run(\n      const device T* mat [[buffer(0)]],\n      const device T* in_vec [[buffer(1)]],", "  template <typename MT, typename VT>\n  static METAL_FUNC void run(\n      const device MT* mat [[buffer(0)]],\n      const device VT* in_vec [[buffer(1)]]," },
         .{ "out_vec[out_row + tm] = static_cast<T>(result[tm]);", "atomic_store_explicit(reinterpret_cast<device atomic_uint*>(out_vec + out_row + tm), as_type<uint>(static_cast<T>(result[tm])), memory_order_relaxed);" },
     });
-};
+}
+
+/// `s` without its carriage returns. MLX's gemv.h is a submodule file that .gitattributes does not pin to LF, so a
+/// checkout that converts line endings (Windows) gives it CRLF lines; the searches above are over LF text.
+fn withoutCr(comptime s: []const u8) []const u8 {
+    comptime {
+        @setEvalBranchQuota(20_000_000);
+        var n: usize = 0;
+        for (s) |c| n += @intFromBool(c != '\r');
+        var out: [n]u8 = undefined;
+        var i: usize = 0;
+        for (s) |c| if (c != '\r') {
+            out[i] = c;
+            i += 1;
+        };
+        const final = out;
+        return &final;
+    }
+}
 const one1_header: [:0]const u8 = blk: {
     @setEvalBranchQuota(200_000_000);
     const args = std.fmt.comptimePrint(kernelSource("kernels/moe/router_nax_one1_header.fmt.metal"), .{ hidden, experts, hidden });
@@ -906,5 +925,35 @@ test "router_nax: predict gives the stock predictor's scores bit for bit at 2, 3
         const x = try normal(s, &seed, &.{ rows, hidden }, .bfloat16, 1.0);
         defer _ = mlx.mlx_array_free(x);
         try testing.expect((try predict(s, x, raws[0], corrs[0])) == null);
+    }
+}
+
+// Bar: a checkout with CRLF lines (Windows) gives the one-row launch's text byte for byte, and on an LF checkout the
+// text is the header's own.
+test "router_nax: the one-row text is the same from a CRLF checkout of MLX's gemv.h" {
+    @setEvalBranchQuota(50_000_000);
+    const lf = comptime withoutCr(steel.gemv);
+    const crlf = comptime blk: {
+        var n: usize = 0;
+        for (lf) |c| n += if (c == '\n') 2 else 1;
+        var out: [n]u8 = undefined;
+        var i: usize = 0;
+        for (lf) |c| {
+            if (c == '\n') {
+                out[i] = '\r';
+                i += 1;
+            }
+            out[i] = c;
+            i += 1;
+        }
+        const final = out;
+        break :blk final;
+    };
+    try testing.expect(std.mem.indexOfScalar(u8, &crlf, '\r') != null);
+    try testing.expectEqualStrings(lf, comptime withoutCr(&crlf));
+    try testing.expectEqualStrings(gemv_kernel, comptime gemvKernel(withoutCr(&crlf)));
+    if (comptime std.mem.indexOfScalar(u8, steel.gemv, '\r') == null) {
+        try testing.expectEqualStrings(steel.gemv, lf);
+        try testing.expectEqualStrings(gemv_kernel, comptime gemvKernel(steel.gemv));
     }
 }
