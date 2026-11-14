@@ -226,29 +226,20 @@ fn streamPromptNeed(config: *const ModelConfig, seq: u64, chunk: u32) ?u64 {
     var bill: abi.Bill = .{};
     b.table.bill(&b.parsed, &.{ .context = seq }, &bill);
     if (bill.prefill_bytes) |prefill| {
-        const held: u64 = if (b.parsed.caps.whole_prompt_prefill and bill.ssm_checkpoint > 0) (passCheckpoints(config, seq, chunk) orelse return null) else 0;
+        const held: u64 = if (b.parsed.caps.whole_prompt_prefill) passCheckpoints(config, seq) else 0;
         return prefill(&b.parsed, seq, chunk, 16, 0) + held * bill.ssm_checkpoint * 5 / 4;
     }
     if (config.isGlm5()) return @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, seq, 1, 16, chunk, .{});
     return null;
 }
 
-/// The checkpoints a whole-prompt pass holds for a cold `seq`-token prompt at `chunk`: the engine's plan count
-/// (`wholePromptCheckpointCount`) at the launch's stride and cap and the policy and low anchors the prefill takes for
-/// `config` (`prefill.zig`); 0 with the prefix cache off, null when the plan cannot be allocated.
-fn passCheckpoints(config: *const ModelConfig, seq: u64, chunk: u32) ?u64 {
-    const l = @import("../../../host/http/server.zig").launch();
-    const stride = @import("../admission/hot_cache_plan.zig").effectiveSsmCheckpointStride(l.ssm_checkpoint_stride, l.prefix_cache_capacity, l.prefix_cache_ram_enabled, l.prefix_cache_disk_bytes);
-    const gated = config.longCtxGated();
-    const plan = @import("../generate/prefill_chunk.zig");
-    const keep: plan.CheckpointKeep = .{
-        .max = l.ssm_checkpoint_max,
-        .thin = if (gated) .min_span_recency else .oldest,
-        .low_anchors = if (gated) @import("../cache/ssd/disk_tier.zig").SSM_DISK_LOW_ANCHORS else 0,
-    };
-    const adaptive = @import("../scheduler/params.zig").adaptiveChunkWidthFor(config);
-    const n = plan.wholePromptCheckpointCount(std.heap.c_allocator, @intCast(seq), chunk, stride, adaptive, gated, keep) catch return null;
-    return @intCast(n);
+/// The checkpoints a whole-prompt pass of up to `seq` tokens can hold (`wholePromptCheckpointBound`): at the stride
+/// and cap every load hands the model (`launchSsmCheckpointStride`, `ssm_checkpoint_max`), its dense low grid
+/// `longCtxGated`'s. A load that keeps no prefix cache files none, so this never bills fewer than the engine files.
+fn passCheckpoints(config: *const ModelConfig, seq: u64) u64 {
+    const stride = @import("../admission/hot_cache_plan.zig").launchSsmCheckpointStride();
+    const max = @import("../../../host/http/server.zig").launch().ssm_checkpoint_max;
+    return @import("../generate/prefill_chunk.zig").wholePromptCheckpointBound(@intCast(seq), stride, config.longCtxGated(), max);
 }
 
 /// The largest prompt bill from `lo` to `hi` tokens, each length at the chunk the engine runs for it: the bill at `hi`,
@@ -539,21 +530,35 @@ test "driver: a streamed Ling's prompt is billed at the chunk the engine runs fo
     try t.expectEqual(@as(u64, 21_845 - abi.stream_room_cell), streamGrowAt(&cfg, 32_768, abi.stream_room_cell).prompt);
 }
 
-/// The launch's checkpoint settings as `serve` defaults them: stride 256, a cap of 16, a RAM prefix cache.
+/// The launch's checkpoint settings as `serve` defaults them: stride 256, a cap of 16, a RAM prefix cache, no SSD tier.
 fn defaultCheckpointLaunch() void {
     const l = @import("../../../host/http/server.zig").launch();
     l.ssm_checkpoint_stride = 256;
     l.ssm_checkpoint_max = 16;
     l.prefix_cache_capacity = 32;
     l.prefix_cache_ram_enabled = true;
+    l.prefix_cache_disk_bytes = 0;
 }
 
-// Bar: the checkpoints billed for a whole-prompt pass are the plan the prefill makes for the same request, at the
-// default chunk and at 64 to 4,096; none with the prefix cache off.
-test "driver: a whole-prompt pass is billed the checkpoints the engine's plan files for the same request" {
-    const t = std.testing;
+/// The checkpoints init.zig plans for a `seq`-token prompt restored at `offset`, run at `chunk`, on a model loaded from
+/// the launch settings (`LoadParams` from `launchSsmCheckpointStride`, `prefill.zig`'s options), with a prefix cache.
+fn enginePlanned(cfg: *const ModelConfig, seq: usize, offset: usize, chunk: usize) !usize {
     const gen = @import("../generate.zig");
     const plan = @import("../generate/prefill_chunk.zig");
+    const l = @import("../../../host/http/server.zig").launch();
+    const model_stride = @import("../admission/hot_cache_plan.zig").launchSsmCheckpointStride();
+    const stride = plan.effectiveSsmCheckpointStride(model_stride, @max(chunk, gen.prefillCli().override));
+    var p = try plan.wholePromptPlan(std.testing.allocator, seq - offset, chunk, stride > 0, stride, offset, false, cfg.longCtxGated(), .{ .max = l.ssm_checkpoint_max });
+    defer p.deinit(std.testing.allocator);
+    return p.checkpoints.len;
+}
+
+// Bar: the checkpoints billed for a whole-prompt pass are the plan the prefill makes at the chunk the bill prices
+// (default chunk, 64 to 4,096), and no plan at a narrower chunk or warm offset names more; under every launch setting
+// that moves the stride, the cap or whether the model keeps a prefix cache.
+test "driver: a whole-prompt pass is billed the checkpoints the engine's plan files, and never fewer" {
+    const t = std.testing;
+    const gen = @import("../generate.zig");
     const server = @import("../../../host/http/server.zig");
     const saved = gen.prefillCli().*;
     const saved_launch = server.launch().*;
@@ -561,7 +566,6 @@ test "driver: a whole-prompt pass is billed the checkpoints the engine's plan fi
         gen.prefillCli().* = saved;
         server.launch().* = saved_launch;
     }
-    defaultCheckpointLaunch();
     var cfg = try model.parseConfigFromJson(t.allocator, @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json"));
     defer cfg.deinit(t.allocator);
     const Case = struct { cli: gen.PrefillCli, at_18k: u64, at_32k: u64 };
@@ -572,20 +576,73 @@ test "driver: a whole-prompt pass is billed the checkpoints the engine's plan fi
         .{ .cli = .{ .override = 1024, .explicit = true }, .at_18k = 16, .at_32k = 16 },
         .{ .cli = .{ .override = 4096, .explicit = true }, .at_18k = 5, .at_32k = 8 },
     };
-    for (cases) |c| {
+    const Launch = server.Launch;
+    const Flags = struct { name: []const u8, set: *const fn (*Launch) void, off: bool = false };
+    const flags = [_]Flags{
+        .{ .name = "defaults", .set = struct {
+            fn f(_: *Launch) void {}
+        }.f },
+        .{ .name = "--prefix-cache-entries 0", .off = true, .set = struct {
+            fn f(l: *Launch) void {
+                l.prefix_cache_capacity = 0;
+            }
+        }.f },
+        .{ .name = "--no-prefix-cache-ram", .off = true, .set = struct {
+            fn f(l: *Launch) void {
+                l.prefix_cache_ram_enabled = false;
+            }
+        }.f },
+        .{ .name = "--no-prefix-cache-ram --prefix-cache-disk", .set = struct {
+            fn f(l: *Launch) void {
+                l.prefix_cache_ram_enabled = false;
+                l.prefix_cache_disk_bytes = 64 << 30;
+            }
+        }.f },
+        .{ .name = "--ssm-checkpoint-stride 0", .off = true, .set = struct {
+            fn f(l: *Launch) void {
+                l.ssm_checkpoint_stride = 0;
+            }
+        }.f },
+        .{ .name = "--ssm-checkpoint-stride 3000", .set = struct {
+            fn f(l: *Launch) void {
+                l.ssm_checkpoint_stride = 3000;
+            }
+        }.f },
+        .{ .name = "--ssm-checkpoint-max 4", .set = struct {
+            fn f(l: *Launch) void {
+                l.ssm_checkpoint_max = 4;
+            }
+        }.f },
+        .{ .name = "--ssm-checkpoint-max 0", .set = struct {
+            fn f(l: *Launch) void {
+                l.ssm_checkpoint_max = 0;
+            }
+        }.f },
+    };
+    for (flags) |fl| for (cases) |c| {
+        defaultCheckpointLaunch();
+        fl.set(server.launch());
         gen.prefillCli().* = c.cli;
         for ([_]u64{ 18_380, 32_767 }, [_]u64{ c.at_18k, c.at_32k }) |seq, want| {
+            const billed = passCheckpoints(&cfg, seq);
+            if (fl.off) {
+                try t.expectEqual(@as(u64, 0), billed);
+                continue;
+            }
             const chunk = promptChunkAt(&cfg, seq);
-            const stride = plan.effectiveSsmCheckpointStride(256, @max(chunk, gen.prefillCli().override));
-            var p = try plan.wholePromptPlan(t.allocator, @intCast(seq), chunk, true, stride, 0, false, false, .{ .max = 16 });
-            defer p.deinit(t.allocator);
-            try t.expectEqual(want, passCheckpoints(&cfg, seq, chunk).?);
-            try t.expectEqual(@as(u64, p.checkpoints.len), passCheckpoints(&cfg, seq, chunk).?);
+            const n: usize = @intCast(seq);
+            const planned: u64 = try enginePlanned(&cfg, n, 0, chunk);
+            if (std.mem.eql(u8, fl.name, "defaults")) try t.expectEqual(want, billed);
+            // Under a cap the bill is the plan, or one more where the tail merge runs past the stride's last multiple.
+            try t.expect(planned <= billed);
+            if (server.launch().ssm_checkpoint_max != 0) try t.expect(billed - planned <= 1);
+            if (std.mem.eql(u8, fl.name, "defaults")) try t.expectEqual(@as(u64, planned), billed);
+            // A narrower chunk the prefill may run (the decode share, a pin), and a warm request restored partway.
+            for ([_]usize{ 64, 256, 1024, chunk }) |run| for ([_]usize{ 0, 5_000, n - 40 }) |offset| {
+                try t.expect(try enginePlanned(&cfg, n, offset, @min(run, chunk)) <= billed);
+            };
         }
-        server.launch().prefix_cache_capacity = 0;
-        try t.expectEqual(@as(u64, 0), passCheckpoints(&cfg, 18_380, promptChunkAt(&cfg, 18_380)).?);
-        server.launch().prefix_cache_capacity = 32;
-    }
+    };
 }
 
 // Bar: a whole-prompt plugin's prompt bill is its own term plus the planned checkpoints at its `ssm_checkpoint` in the

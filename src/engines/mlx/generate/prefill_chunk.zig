@@ -7,6 +7,7 @@ const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const testing = std.testing;
 const generate_mod = @import("../generate.zig");
 const WIDE_PREFILL_CHUNK = @import("../generate.zig").WIDE_PREFILL_CHUNK;
+const PrefillCli = @import("../generate.zig").PrefillCli;
 const attn256 = @import("../../../sdk/blocks/attention/attn256.zig");
 const checkpoint = @import("../ssm/checkpoint.zig");
 
@@ -484,13 +485,17 @@ pub fn wholePromptPlan(
     return .{ .spans = span_slice, .checkpoints = try cps.toOwnedSlice(allocator) };
 }
 
-/// The checkpoints a cold `n`-token whole-prompt prefill at width `chunk` files and its pass holds: its plan's
-/// (`wholePromptPlan`), at `base_stride` coarsened as the prefill coarsens it. 0 at `base_stride` 0.
-pub fn wholePromptCheckpointCount(allocator: std.mem.Allocator, n: usize, chunk: usize, base_stride: usize, adaptive_width: bool, dense_low_grid: bool, keep: CheckpointKeep) !usize {
-    const stride = effectiveSsmCheckpointStride(base_stride, @max(chunk, generate_mod.prefillCli().override));
-    var plan = try wholePromptPlan(allocator, n, chunk, stride > 0, stride, 0, adaptive_width, dense_low_grid, keep);
-    defer plan.deinit(allocator);
-    return plan.checkpoints.len;
+/// The most checkpoints a whole-prompt prefill of at most `n` tokens can plan (`wholePromptPlan`) at the model's
+/// `base_stride` and cap `max`, whatever width it runs, warm or cold: the multiples of the narrowest stride it can
+/// coarsen to, up to the snapshot backoff, the dense low anchors, and the backoff point. 0 at `base_stride` 0.
+pub fn wholePromptCheckpointBound(n: usize, base_stride: usize, dense_low_grid: bool, max: usize) usize {
+    const stride = effectiveSsmCheckpointStride(base_stride, generate_mod.prefillCli().override);
+    if (stride == 0) return 0;
+    const prefix_len = n -| 1;
+    const loop_end = prefix_len - ssmSnapshotBackoff(true, prefix_len, false);
+    var k = loop_end / stride + @intFromBool(loop_end % stride != 0);
+    if (dense_low_grid) k += @min(loop_end, SSM_GRID_LOW_DENSE_TOP) / SSM_GRID_LOW_DENSE_STRIDE;
+    return if (max > 0) @min(k, max) else k;
 }
 
 // ── tests ──
@@ -1203,5 +1208,23 @@ test "wholePromptPlan: its checkpoints are the ones the prefill's list keeps" {
         defer first.deinit(testing.allocator);
         const at: usize = @intCast(first.checkpoints[first.checkpoints.len - 1]);
         for ([_]usize{ 4_000, 40_000 }) |more| try expectPlanKeeps(18_380 + more - at, cs[0], cs[1], at, false, 16, .oldest, 0);
+    }
+}
+
+// Bar: no plan the prefill can make for a prompt of up to `n` tokens names more checkpoints than the bill's bound: any
+// width at or past the narrowest stride's coarsening, cold or warm, the dense low grid on and off, capped or not.
+test "wholePromptCheckpointBound: no width, offset or cap plans more checkpoints than the bound" {
+    const saved = generate_mod.prefillCli().*;
+    defer generate_mod.prefillCli().* = saved;
+    const lens = [_]usize{ 2, 31, 32, 33, 300, 4_097, 16_927, 18_380, 32_767, 65_600, 131_071, 300_000 };
+    for ([_]PrefillCli{ .{}, .{ .override = 64, .explicit = true }, .{ .override = 256, .explicit = true }, .{ .override = 4096, .explicit = true } }) |cli| {
+        generate_mod.prefillCli().* = cli;
+        for ([_]usize{ 0, 256, 1024, 8192 }) |base| for ([_]usize{ 64, 256, 1024, 1536, 4096, 16_384 }) |chunk| for (lens) |n| for ([_]usize{ 0, 5_000, n / 2 }) |offset| for ([_]bool{ false, true }) |dense| for ([_]usize{ 0, 4, 16 }) |max| {
+            if (offset >= n) continue;
+            const stride = effectiveSsmCheckpointStride(base, @max(chunk, cli.override));
+            var p = try wholePromptPlan(testing.allocator, n - offset, chunk, stride > 0, stride, offset, false, dense, .{ .max = max });
+            defer p.deinit(testing.allocator);
+            try testing.expect(p.checkpoints.len <= wholePromptCheckpointBound(n, base, dense, max));
+        };
     }
 }

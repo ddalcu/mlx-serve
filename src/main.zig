@@ -28,7 +28,7 @@ const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
 const ablation_api = @import("host/api/ablation.zig");
-const effectiveSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
+const launchSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").launchSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
 const status = @import("host/status.zig");
@@ -1688,7 +1688,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_bytes = server_mod.launch().prefix_cache_mem_bytes,
             .prefix_cache_clamp = true,
             .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
-            .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.launch().ssm_checkpoint_stride, server_mod.launch().prefix_cache_capacity, server_mod.launch().prefix_cache_ram_enabled, server_mod.launch().prefix_cache_disk_bytes),
+            .ssm_checkpoint_stride = launchSsmCheckpointStride(),
             .ssm_checkpoint_max = server_mod.launch().ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama = server_mod.llama_settings,
@@ -1981,7 +1981,7 @@ fn runHeadlessServe(
         .prefix_cache_mem_bytes = server_mod.launch().prefix_cache_mem_bytes,
         .prefix_cache_clamp = true,
         .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
-        .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.launch().ssm_checkpoint_stride, server_mod.launch().prefix_cache_capacity, server_mod.launch().prefix_cache_ram_enabled, server_mod.launch().prefix_cache_disk_bytes),
+        .ssm_checkpoint_stride = launchSsmCheckpointStride(),
         .ssm_checkpoint_max = server_mod.launch().ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         // ds4 spec flags must survive headless/on-demand GGUF loads (the
