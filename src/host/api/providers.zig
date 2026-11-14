@@ -567,8 +567,7 @@ pub const Providers = struct {
         if (!listsModels(p.alloc, answer, cfg.name)) if (v1Candidate(p.alloc, cfg.url) catch null) |v1| {
             var alt = cfg;
             alt.url = v1;
-            var alt_down: Down = .none;
-            const alt_answer = curlProbe(p.alloc, p.io, alt, &alt_down);
+            const alt_answer = curlProbe(p.alloc, p.io, alt, null);
             if (listsModels(p.alloc, alt_answer, cfg.name)) {
                 if (answer) |a| p.alloc.free(a.body);
                 answer = alt_answer;
@@ -647,9 +646,9 @@ fn threadMain(p: *Providers) void {
 
 const CURL_MAX_TIME_PROBE_S = 10;
 
-/// GET `<url>/models`; `null` when curl got no HTTP answer at all.
-fn curlProbe(alloc: std.mem.Allocator, io: std.Io, cfg: Config, down: *Down) ProbeAnswer {
-    down.* = .other;
+/// GET `<url>/models`; `null` when curl got no HTTP answer at all, with why in `down` when given.
+fn curlProbe(alloc: std.mem.Allocator, io: std.Io, cfg: Config, down: ?*Down) ProbeAnswer {
+    if (down) |d| d.* = .other;
     const url = std.fmt.allocPrint(alloc, "{s}/models", .{cfg.url}) catch return null;
     defer alloc.free(url);
     var argv: std.ArrayList([]const u8) = .empty;
@@ -664,7 +663,7 @@ fn curlProbe(alloc: std.mem.Allocator, io: std.Io, cfg: Config, down: *Down) Pro
     errdefer alloc.free(result.stdout);
     switch (result.term) {
         .exited => |code| if (code != 0) {
-            down.* = Down.ofCurlExit(code);
+            if (down) |d| d.* = Down.ofCurlExit(code);
             log.debug("[providers] probe {s}: curl exit {d}: {s}\n", .{ cfg.name, code, std.mem.trim(u8, result.stderr, " \n") });
             alloc.free(result.stdout);
             return null;
