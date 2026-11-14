@@ -168,6 +168,9 @@ Sampling:
 - **`top_p` 0 is GREEDY** (`applyTopP` floors at `floatMin`). Filters cut by RANK with lowest-id tie break (`ranksDescending`, `topRanksDescending`); cumsum in f32; top-k + top-p are ONE pass (`filterTopKTopP`). Block helpers use `_axis` ops.
 
 Kernels + numerics:
+- **A Metal tensor over a whole matrix indexes in `int`**: past 2^31 elements its stores wrap into other memory (w8a8's
+  GEMM washed out frames of H3's long clips, differently every run). Base each tile's tensor at its own rows with a
+  64-bit offset. Guard: `w8a8 GEMM stores an output past 2^31 elements where it belongs`.
 - **A weight tiled in place is read ONLY through `lane_qmm`** (`tileInPlace` at DFlash bind; `PREFILL` past 128 rows gives MLX's qmm bits): MLX would misread its buffer. The caller passes bits and group size, since 8-bit g32 has 4-bit g64's shapes.
 - **Slice-born weights into gather_qmm/quantized_matmul are `mlx_contiguous`-materialized at load**. mlx `Copy`/`contiguous` are VIEW ops: a slice outliving its parent goes through `materializedOwnedCopy` + eval; a raw data-pointer read PROVES row-major contiguity. A view-materializing helper owns the view (`sliceContig`).
 - **`mx.quantize` packs DENSELY** (element i at bit `i*bits`, straddling words at 3/5/6 bits, #305): every hand-rolled unpack is tested at EVERY shipped width. Fused MoE kernels take 3-bit as a BYTE TRIPLE (`mlxserve_qpack`).

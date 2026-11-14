@@ -823,3 +823,11 @@ the right time. Cause: the release's `transformer/` interleaves each attention's
 repack); the converter passed it through, so every head attended with another head's keys. Found by matching rows of
 the release's diffusers copy against the original. Fix: `image_dit` reorders the rows. Guards:
 `tests/test_convert_minimax_h3_image.py` and the seam check in `tests/test_minimax_h3_image.sh`.
+
+### Long, large H3 clips washed out a few frames, at different frames every run (`w8a8`)
+Defect: REF2VA renders at 1152x864x243 showed about five washed-out, blocky frames in a row, at a different place on
+each run of the same seed; smaller jobs were clean and `--no-w8a8` cured it. Cause: the int8 GEMM built its operand
+and output tensors over the whole matrix, whose offsets are `int`: once an output passed 2^31 elements (H3's MLP
+past ~75k rows), the full-tile stores wrapped and wrote into other buffers, so every tile came out wrong. Fix: each
+tile's tensors start at its own rows with a 64-bit offset (same speed). Guard: `w8a8 GEMM stores an output past 2^31
+elements where it belongs`.
