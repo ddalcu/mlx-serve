@@ -207,8 +207,8 @@ struct StatusMenuView: View {
         // (.window style) fires onAppear when the popover shows and
         // onDisappear when it dismisses — perfect hook for "user is or isn't
         // looking at the GPU-memory bar".
-        .onAppear { server.setMenuVisible(true) }
-        .onDisappear { server.setMenuVisible(false) }
+        .onAppear { server.setLiveView(.menu, visible: true) }
+        .onDisappear { server.setLiveView(.menu, visible: false) }
     }
 
     // MARK: - Header

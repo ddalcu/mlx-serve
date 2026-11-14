@@ -59,7 +59,11 @@ struct ModelBrowserPane: View {
         }
         // Once per visit, not per section: the rescan sizes every model folder
         // on the main thread, and in-app changes already refresh on their own.
-        .onAppear { appState.refreshModels() }
+        .onAppear {
+            appState.refreshModels()
+            appState.server.setLiveView(.models, visible: true)
+        }
+        .onDisappear { appState.server.setLiveView(.models, visible: false) }
         // Live-refresh on-disk sizes while a disk-state pane is showing and a
         // download is in flight, so completion + growing size show up without
         // the user navigating away and back. The task id flips when the section
@@ -518,8 +522,8 @@ private struct RecommendedModelTableRow: View {
             HStack(spacing: 6) {
                 if let usable = usableModel {
                     let use = ModelUseState.resolve(
-                        selected: appState.selectedModelPath == usable.path,
-                        serverStatus: server.status
+                        path: usable.path, selectedPath: appState.selectedModelPath,
+                        serverStatus: server.status, rows: server.allModels
                     )
                     if use == .idle {
                         UseModelButton(path: usable.path, name: usable.name)
@@ -1618,8 +1622,8 @@ private struct ModelBrowserRow: View {
                 HStack(spacing: 6) {
                     if let usable = usableModel {
                         let use = ModelUseState.resolve(
-                            selected: appState.selectedModelPath == usable.path,
-                            serverStatus: server.status
+                            path: usable.path, selectedPath: appState.selectedModelPath,
+                            serverStatus: server.status, rows: server.allModels
                         )
                         if use == .idle {
                             UseModelButton(path: usable.path, name: usable.name)
@@ -2032,8 +2036,8 @@ private struct LocalModelRow: View {
 
     private var useState: ModelUseState {
         ModelUseState.resolve(
-            selected: appState.selectedModelPath == model.path,
-            serverStatus: server.status
+            path: model.path, selectedPath: appState.selectedModelPath,
+            serverStatus: server.status, rows: server.allModels
         )
     }
 

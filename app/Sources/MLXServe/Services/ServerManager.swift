@@ -89,12 +89,14 @@ class ServerManager: ObservableObject {
         guard let self else { return nil }
         return try? await self.api.fetchThroughput(port: self.port)
     }
-    /// True while the tray popover is on screen. Drives the live /props
-    /// ticker — when the popover is closed there's nothing to render, so we
-    /// stop polling entirely instead of burning 3 s ticks in the background.
-    /// Toggled via `setMenuVisible(_:)` from `StatusMenuView`'s
-    /// `onAppear`/`onDisappear`.
-    private var menuIsVisible = false
+    /// The views on screen that read the live /props ticker. With none there's
+    /// nothing to render, so we stop polling entirely instead of burning 3 s
+    /// ticks in the background. Toggled via `setLiveView(_:visible:)` from each
+    /// view's `onAppear`/`onDisappear`.
+    enum LiveView { case menu, models }
+    private var liveViews: Set<LiveView> = []
+    /// Whether the /props ticker is installed (it also runs the 1 Hz health check while starting).
+    var isPolling: Bool { pollSource != nil }
 
     /// Off-main raw stderr buffer. **There is no `@Published` mirror.**
     let logBuffer = ThrottledLogBuffer(maxBytes: serverLogMaxBytes)
@@ -574,7 +576,7 @@ class ServerManager: ObservableObject {
                     }
                     // Health handshake done — cancel the 1 Hz health source.
                     // The /props slow-poll is started by transitionToRunning
-                    // (only when the menu is open) or by setMenuVisible(true).
+                    // (only when a live view is open) or by setLiveView.
                     source.cancel()
                 }
             }.resume()
@@ -604,10 +606,10 @@ class ServerManager: ObservableObject {
         // A `--model` launch gets here only once loaded; headless leaves the path empty.
         StartupModelChoice.recordLoaded(path: currentModelPath)
         Task { await self.refreshModels() }
-        // If the user has the menu open at the exact moment the server comes
-        // up, start the live /props ticker now so the GPU-memory bar fills in
-        // immediately. Otherwise it'll start the next time they open the menu.
-        if menuIsVisible {
+        // If a live view is open at the exact moment the server comes up, start
+        // the /props ticker now so it fills in immediately. Otherwise it'll
+        // start the next time one opens.
+        if !liveViews.isEmpty {
             Task { await self.refreshStatus() }
             startSlowPolling()
         }
@@ -618,12 +620,12 @@ class ServerManager: ObservableObject {
         transitionToRunning()
     }
 
-    /// Wire the popover's open/close into the live-polling state. Called
-    /// from `StatusMenuView`'s `onAppear`/`onDisappear`. Drives the /props
-    /// ticker so it only runs when there's a UI on screen to consume it.
-    func setMenuVisible(_ visible: Bool) {
-        guard menuIsVisible != visible else { return }
-        menuIsVisible = visible
+    /// Wire a live view's open/close into the polling state: the tray popover
+    /// (`StatusMenuView`) and the Models pane, whose "In use" badges read the
+    /// model list. The /props ticker runs while at least one is on screen.
+    func setLiveView(_ view: LiveView, visible: Bool) {
+        guard liveViews.contains(view) != visible else { return }
+        if visible { liveViews.insert(view) } else { liveViews.remove(view) }
         guard status == .running else { return }
         if visible {
             Task { await self.refreshStatus() }
@@ -633,7 +635,7 @@ class ServerManager: ObservableObject {
             // refreshStatus for the rationale.
             Task { await self.refreshModels() }
             startSlowPolling()
-        } else {
+        } else if liveViews.isEmpty {
             pollSource?.cancel()
             pollSource = nil
         }

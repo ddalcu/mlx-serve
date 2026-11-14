@@ -129,25 +129,40 @@ enum ModelRowAction: Equatable {
     }
 }
 
-/// Feedback for the model the user picked with "Use".
+/// What a My Models row says about its model: the running server's row decides, the app's selection is the fallback.
 enum ModelUseState: Equatable {
-    /// Not the selected model — offer the Use button.
+    /// Not loaded — offer the Use button.
     case idle
-    /// Selected, and the server is up with it.
+    /// Loaded and serving.
     case inUse
-    /// Selected, and the server is coming up.
+    /// Being loaded.
     case loading
     /// Selected, but the server is stopped — it'll load on next start.
     case selected
 
-    /// `selected` is `appState.selectedModelPath == model.path`.
-    static func resolve(selected: Bool, serverStatus: ServerStatus) -> ModelUseState {
-        guard selected else { return .idle }
+    /// A running server's own row for `path` decides, whoever loaded the model; with no row the selection does.
+    static func resolve(path: String, selectedPath: String, serverStatus: ServerStatus, rows: [ModelInfo]) -> ModelUseState {
+        if serverStatus == .running, let served = servedRow(for: path, in: rows) {
+            if served.state == "loading" { return .loading }
+            guard served.loaded else { return .idle }
+            // One row covers every quant in a GGUF folder: the app's own pick among them is the one loaded.
+            let sibling = selectedPath != path && servedRow(for: selectedPath, in: [served]) != nil
+            return sibling ? .idle : .inUse
+        }
+        guard path == selectedPath else { return .idle }
         switch serverStatus {
         case .running:  return .inUse
         case .starting: return .loading
         case .stopped, .error: return .selected
         }
+    }
+
+    /// The local server's row for `path`. A GGUF quant's path is its FILE, under the repo folder the server names.
+    private static func servedRow(for path: String, in rows: [ModelInfo]) -> ModelInfo? {
+        let local = rows.filter { $0.lanPeer == nil && $0.provider == nil }
+        if let row = ModelSettingsApply.row(for: path, in: local) { return row }
+        guard path.lowercased().hasSuffix(".gguf") else { return nil }
+        return local.first { path.contains("/" + $0.name + "/") }
     }
 
     var label: String {
