@@ -10294,3 +10294,33 @@ test "applyLayerSpan: the PLE stays at its absolute layer and is local only to t
     try std.testing.expectError(error.DistSplitOffInterval, c.applyLayerSpan(.{ .start = 30, .end = 48, .total = 48 }));
 }
 
+
+// Bar: only an MLA config (today bailing_hybrid alone sets `mla_kv_lora_rank`) whose plugin names a layout namespace
+// bills its plugin's KV bytes; no namespace, no plugin or a non-MLA config bills as before.
+test "model config: an MLA plugin's own KV rows bill only where it names a layout namespace" {
+    const T = struct {
+        fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .kv_per_token = 12_345 };
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &T.bill;
+    var named: plugin_config.Binding = .{ .table = &table };
+    named.parsed.cache.layout_namespace = abi.Str.of("ns-v1");
+    var plain: plugin_config.Binding = .{ .table = &table };
+    var c: ModelConfig = .{ .model_type = "bailing_hybrid", .num_hidden_layers = 4, .num_attention_heads = 4, .mla_kv_lora_rank = 64, .mla_qk_nope_head_dim = 64, .mla_qk_rope_head_dim = 64, .mla_v_head_dim = 64 };
+    const per_head = c.kvBytesPerToken();
+    c.plugin = &named;
+    try testing.expectEqual(@as(u64, 12_345), declaredMlaKvBytes(&c));
+    c.mla_kv_bytes_declared = declaredMlaKvBytes(&c);
+    try testing.expectEqual(@as(u64, 12_345), c.kvBytesPerToken());
+    c.mla_kv_bytes_declared = 0;
+    c.plugin = &plain;
+    try testing.expectEqual(@as(u64, 0), declaredMlaKvBytes(&c));
+    c.plugin = null;
+    try testing.expectEqual(@as(u64, 0), declaredMlaKvBytes(&c));
+    try testing.expectEqual(per_head, c.kvBytesPerToken());
+    var g: ModelConfig = .{ .model_type = "glm5_next", .num_hidden_layers = 4, .num_attention_heads = 4 };
+    g.plugin = &named;
+    try testing.expectEqual(@as(u64, 0), declaredMlaKvBytes(&g));
+}
