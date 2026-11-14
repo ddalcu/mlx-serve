@@ -48,9 +48,8 @@ var index_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// MLX_SERVE_GLM_DSA_PROMPT_INDEXER, read once (tests set it).
 pub var switch_on: ?bool = null;
-/// Indexer launches and one-copy outputs since the process started (tests read them).
+/// Indexer launches since the process started (tests read them).
 pub var index_runs: u64 = 0;
-pub var assemble_runs: u64 = 0;
 var said = false;
 
 pub fn on() bool {
@@ -204,7 +203,6 @@ pub fn assemble(o: *Array, s: mlx.mlx_stream, dense: Array, sparse: Array) !bool
     const vec = mlx.mlx_vector_array_new_data(&two, two.len);
     defer _ = mlx.mlx_vector_array_free(vec);
     try mlx.check(mlx.mlx_concatenate_axis(o, vec, 1, s));
-    assemble_runs += 1;
     engaged("the one-copy output");
     return true;
 }

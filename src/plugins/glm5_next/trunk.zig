@@ -18,7 +18,6 @@ const log = @import("../../sdk/util/log.zig");
 const linear = @import("../../sdk/bases/blocks/linear.zig");
 const moe = @import("../../sdk/bases/blocks/moe.zig");
 const router_nax = @import("../../sdk/blocks/moe/router_nax.zig");
-const env = @import("../../env.zig");
 const kda_chunk = @import("kda_chunk.zig");
 const streamed = @import("../../sdk/weights/streamed.zig");
 const outside = @import("../../sdk/quant/outside.zig");
