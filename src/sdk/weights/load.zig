@@ -395,11 +395,13 @@ pub fn loadSafetensorsFile(
         if (opts.carriers) |c| {
             if (scan_base) |base| {
                 var wbuf: [512]u8 = undefined;
-                const wkey = std.fmt.bufPrint(&wbuf, "{s}.weight", .{base}) catch key_str;
+                const wkey = std.fmt.bufPrintSentinel(&wbuf, "{s}.weight", .{base}, 0) catch key_str;
                 if (c.get(wkey)) |carrier| {
                     if (carrier) |shard_of_record| {
                         if (!std.mem.eql(u8, shard_of_record, opts.shard)) {
-                            foreign_copy = true;
+                            // A leaf is a retired pair's only beside a copy of its weight; alone, it is the far half
+                            // of a triple a size-based shard split cut in two.
+                            foreign_copy = baseOf(key_str) == null or shardCarries(tensor_map, wkey);
                         } else if (baseOf(key_str) != null) {
                             // The owner's own indexed pair stays; it rides.
                             const named_here = if (opts.owners) |o|
@@ -475,6 +477,13 @@ pub fn loadSafetensorsFile(
             }
         }
     }
+}
+
+/// Whether this shard's own tensors hold `key`.
+fn shardCarries(tensors: mlx.mlx_map_string_to_array, key: [:0]const u8) bool {
+    var probe = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(probe);
+    return mlx.mlx_map_string_to_array_get(&probe, tensors, key.ptr) == 0;
 }
 
 /// A float weight dtype: every quantized arm routes a float weight to a

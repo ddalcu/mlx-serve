@@ -5828,6 +5828,36 @@ test "loadWeights places an index-named weight over a packed copy with different
     try testing.expect(w.get("l.biases") == null);
 }
 
+test "loadWeights keeps a quant triple the shards split, with no key duplicated" {
+    if (std.fs.path.sep == '\\') return error.SkipZigTest; // the dir path below is POSIX
+    // mlx-lm shards by size, so a triple straddles a shard boundary (gemma-3-12b-it-4bit: a `.biases` in shard 2,
+    // its `.weight` in shard 1): the leaf is the pair's only copy, never a retired one. That pack's index is stale.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const first = "{\"l.weight\":{\"dtype\":\"U32\",\"shape\":[4,1],\"data_offsets\":[0,16]}," ++
+        "\"l.scales\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[16,24]}}";
+    const second = "{\"l.biases\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[0,8]}," ++
+        "\"x.weight\":{\"dtype\":\"BF16\",\"shape\":[4,1],\"data_offsets\":[8,16]}}";
+    for ([_][]const u8{
+        \\{"weight_map":{"l.weight":"model-00001-of-00002.safetensors","l.scales":"model-00001-of-00002.safetensors","l.biases":"model-00002-of-00002.safetensors","x.weight":"model-00002-of-00002.safetensors"}}
+        ,
+        \\{"weight_map":{"l.weight":"model-00001-of-00005.safetensors","l.scales":"model-00001-of-00005.safetensors","l.biases":"model-00004-of-00005.safetensors","x.weight":"model-00005-of-00005.safetensors"}}
+    }) |index| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+        try writeShardPack(io, tmp.dir, &.{
+            .{ .name = "model-00001-of-00002.safetensors", .hdr = first, .body = 24 },
+            .{ .name = "model-00002-of-00002.safetensors", .hdr = second, .body = 16 },
+        }, index);
+        const dir = try tmpDirPath(allocator, &tmp.sub_path);
+        defer allocator.free(dir);
+        var w = try loadWeightsFromOpenDir(io, allocator, tmp.dir, dir, .{});
+        defer w.deinit();
+        try testing.expectEqual(@as(u32, 4), w.count());
+        try testing.expect(w.get("l.biases") != null);
+    }
+}
+
 test "loadSafetensorsFile: a leaf shed beside a float weight leaves no entry behind" {
     if (std.fs.path.sep == '\\') return error.SkipZigTest; // the dir path below is POSIX
     // An untracked key (a stale index entry): this shard's leaves meet the float weight an earlier shard placed.
