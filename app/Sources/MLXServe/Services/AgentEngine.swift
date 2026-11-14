@@ -238,12 +238,13 @@ enum AgentEngine {
                 let unanswered = lastReplyIdx.map { i > $0 } ?? true
                 let limit = unanswered ? msg.content.count : (isRecent ? recentLimit : olderLimit)
                 toolResultsSeen += 1
+                // Cut only where the cut saves more than its marker adds, so a cut result is always shorter.
                 let dropped = msg.content.count - limit
+                let marker = Self.toolResultCutMarker(dropped: max(dropped, 0))
                 history.append([
                     "role": "tool",
                     "tool_call_id": callId,
-                    "content": dropped > 0 ? String(msg.content.prefix(limit)) + Self.toolResultCutMarker(dropped: dropped)
-                                           : msg.content,
+                    "content": dropped > marker.count ? String(msg.content.prefix(limit)) + marker : msg.content,
                 ])
                 continue
             }
