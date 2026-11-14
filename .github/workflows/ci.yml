@@ -21,9 +21,8 @@ concurrency:
 jobs:
   # The Zig graph and the Swift app share nothing on disk (app/ never reads
   # zig-out), so they run as two jobs on two runners instead of one after the
-  # other (#639). The Zig graph itself is two jobs for the same reason (#1021):
-  # `zig build test` needs no ReleaseFast binary, and nothing after the build
-  # needs the test run. `zig` keeps its name for any required check.
+  # other (#639). The Zig build and `zig build test` share no output either, so
+  # they are two jobs too.
   zig:
     runs-on: macos-26
     timeout-minutes: 60
