@@ -629,8 +629,8 @@ test "group round: a row's own argmax and budget decide it, and nothing else doe
     const gctxs = [_]*ForwardCtx{ &slots.group[0].ctx, &slots.group[1].ctx };
     try xfm.forwardRowAxisVerify(&rows, &gctxs, &go, &gl, &ga, null, null);
 
-    var solo_am: [2][]i32 = undefined;
-    var grp_am: [2][]i32 = undefined;
+    var solo_am: [2][]i32 = .{ &.{}, &.{} };
+    var grp_am: [2][]i32 = .{ &.{}, &.{} };
     defer for (0..2) |i| {
         allocator.free(solo_am[i]);
         allocator.free(grp_am[i]);

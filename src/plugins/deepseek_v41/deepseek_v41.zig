@@ -9565,7 +9565,7 @@ test "dsv41 CED: a wide chunk replays its last window through the decoder, the s
     // The full forward, and the chunk replayed as one piece; traced once each.
     var tr: [2]Trace = .{ .{ .gpa = gpa }, .{ .gpa = gpa } };
     defer for (&tr) |*x| x.deinit();
-    var plain: [2][]f32 = undefined;
+    var plain: [2][]f32 = .{ &.{}, &.{} };
     defer for (plain) |p| gpa.free(p);
     for (0..2) |ced| {
         _ = setenv("MLX_SERVE_DSV41_CED", if (ced == 1) "1" else "0", 1);

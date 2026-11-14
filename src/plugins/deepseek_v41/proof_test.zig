@@ -245,12 +245,10 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
     const chunks = [_]usize{ 0, 8, 24, 40 };
     for ([_]bool{ false, true }) |dspark| {
         const files = if (dspark) try fixture.v41DsparkFiles(arena.allocator(), 7) else try fixture.v41Files(arena.allocator(), 7);
-        const t = try Twin.open(files, "");
-        defer t.close();
-        const model: *v41.Model = @ptrCast(@alignCast(t.m));
-        const regions = model.mdl.regions;
-        defer model.mdl.regions = regions;
-        model.mdl.regions = regions[0..0];
+        const wide = try WideTwin.open(files);
+        defer wide.close();
+        const t = wide.t;
+        const model = wide.model();
         const w: usize = model.mdl.cfg.sliding_window;
         const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
         try testing.expect(aux.begin_prompt(t.m, 1, .of(&long), .{}, 0, true).isOk());
@@ -261,7 +259,7 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
         defer aux.free(t.m, sn);
         const src: *const dsv41.Snap = @ptrCast(@alignCast(sn.?));
         v41.table.release_slot.?(t.m, 1);
-        var ends: [2][]f32 = undefined;
+        var ends: [2][]f32 = .{ &.{}, &.{} };
         defer for (ends) |e| testing.allocator.free(e);
         ends[0] = try restoredTail(t, aux, sn, &long, long[40..]);
 
@@ -283,26 +281,38 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
             const ws = &model.mdl.dec_state.?;
             try testing.expectEqual(n, ws.n);
 
-            const r = try Twin.open(files, "");
-            defer r.close();
-            const cold_model: *v41.Model = @ptrCast(@alignCast(r.m));
-            const cold_regions = cold_model.mdl.regions;
-            defer cold_model.mdl.regions = cold_regions;
-            cold_model.mdl.regions = cold_regions[0..0];
+            const cold_twin = try WideTwin.open(files);
+            defer cold_twin.close();
+            const r = cold_twin.t;
+            const cold_model = cold_twin.model();
             for (chunks[0..3], chunks[1..]) |lo, hi| {
                 if (lo < n) testing.allocator.free(try slotForward(r, .prefill, &.{1}, long[lo..@min(hi, n)], &.{@intCast(lo)}));
             }
             const cs = &cold_model.mdl.dec_state.?;
             // Bars: the global rows and index keys are the snapshot's own, cut; the first layer's window is the cold
             // prompt's (nothing below it was truncated), and so is every layer's when the replay is the whole prefix.
-            for (ws.layers, cs.layers, src.layers, 0..) |*wl, *cl, sl, li| {
+            for (ws.layers, cs.layers, src.layers) |*wl, *cl, sl| {
                 try testing.expect(wl.pend_kv.ctx == null and wl.pend_gate.ctx == null);
                 inline for (.{ "comp", "idx_k" }) |f| if (@field(wl, f)) |rows| {
                     try testing.expectEqual(@field(cl, f).?.used, rows.used);
                     try expectRowsEqual(rows.buf, @field(sl, f).?.buf, 0, rows.used, rows.used);
                     if (n <= 24) try expectRowsEqual(rows.buf, @field(cl, f).?.buf, 0, rows.used, rows.used);
                 };
-                if (li == 0 or n == w) try expectRowsEqual(wl.win.buf, cl.win.buf, n - w, n, wl.win.cap) else try expectFinite(wl.win.buf);
+                if (n == w) try expectRowsEqual(wl.win.buf, cl.win.buf, n - w, n, wl.win.cap) else try expectFinite(wl.win.buf);
+            }
+            if (n > w) {
+                // The replay makes the first layer's window in one call of `w` rows; a row's bits can depend on its
+                // call's width, so the cold prompt it is judged against ends with that same call.
+                const split = try WideTwin.open(files);
+                defer split.close();
+                const r2 = split.t;
+                const split_model = split.model();
+                for (chunks[0..3], chunks[1..]) |lo, hi| {
+                    if (lo < n - w) testing.allocator.free(try slotForward(r2, .prefill, &.{1}, long[lo..@min(hi, n - w)], &.{@intCast(lo)}));
+                }
+                testing.allocator.free(try slotForward(r2, .prefill, &.{1}, long[n - w .. n], &.{@intCast(n - w)}));
+                const first = split_model.mdl.dec_state.?.layers[0].win;
+                try expectRowsEqual(ws.layers[0].win.buf, first.buf, n - w, n, ws.layers[0].win.cap);
             }
             if (n == w) {
                 for (ws.ds, cs.ds) |wr, cr| try expectRowsEqual(wr.buf, cr.buf, 0, n, wr.cap);
@@ -388,6 +398,29 @@ fn hostRows(a: mlx.mlx_array) ![]f32 {
     try mlx.check(mlx.mlx_array_eval(f));
     return testing.allocator.dupe(f32, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..mlx.mlx_array_size(f)]);
 }
+
+/// A twin kept on the wide prompt path (its compiled regions set aside until close).
+const WideTwin = struct {
+    t: *Twin,
+    regions: @FieldType(std.meta.Child(@FieldType(v41.Model, "mdl")), "regions"),
+
+    fn open(files: anytype) !WideTwin {
+        const t = try Twin.open(files, "");
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        const regions = m.mdl.regions;
+        m.mdl.regions = regions[0..0];
+        return .{ .t = t, .regions = regions };
+    }
+
+    fn model(self: WideTwin) *v41.Model {
+        return @ptrCast(@alignCast(self.t.m));
+    }
+
+    fn close(self: WideTwin) void {
+        self.model().mdl.regions = self.regions;
+        self.t.close();
+    }
+};
 
 /// Rows of positions [lo, hi) of two `[cap, width]` arrays (a ring's slots, or rows in order when `cap` covers them).
 fn expectRowsEqual(a: mlx.mlx_array, b: mlx.mlx_array, lo: usize, hi: usize, cap: usize) !void {
