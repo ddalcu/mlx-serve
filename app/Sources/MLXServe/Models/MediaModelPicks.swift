@@ -22,7 +22,7 @@ enum MediaModelPicks {
     /// order is the catalogue's order and neither can surprise the other.
     static func featured<P: MediaModelSizing>(
         _ presets: [P],
-        physicalMemoryBytes: UInt64,
+        memory: SystemMemoryInfo,
         capabilityOf: (P) -> String
     ) -> [Pick<P>] {
         var order: [String] = []
@@ -35,7 +35,7 @@ enum MediaModelPicks {
 
         return order.compactMap { capability in
             guard let candidates = grouped[capability], !candidates.isEmpty else { return nil }
-            let fitting = candidates.filter { $0.meetsSystemRequirements(physicalMemoryBytes: physicalMemoryBytes) }
+            let fitting = candidates.filter { $0.meetsSystemRequirements(memory: memory) }
             if let best = fitting.max(by: { $0.approxRAMGB < $1.approxRAMGB }) {
                 return Pick(preset: best, capability: capability, fits: true)
             }

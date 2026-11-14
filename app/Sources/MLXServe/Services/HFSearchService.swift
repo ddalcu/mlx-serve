@@ -46,6 +46,7 @@ class HFSearchService: ObservableObject {
     private let pageSize = 50
     private var currentSkip = 0
     let systemRAM = ProcessInfo.processInfo.physicalMemory
+    private let memory = SystemMemoryInfo.current()
 
     /// All fetched models (unsorted). Sorting is applied client-side on `models`.
     private var fetchedModels: [HFModel] = []
@@ -94,13 +95,7 @@ class HFSearchService: ObservableObject {
     }
 
     func ramFitness(for model: HFModel) -> RAMFitness {
-        let size = model.ramEstimateBytes
-        guard size > 0 else { return .unknown }
-        let ram = Double(systemRAM)
-        let ratio = Double(size) / ram
-        if ratio < 0.60 { return .fits }
-        if ratio < 0.85 { return .tight }
-        return .wontFit
+        RAMFitness.of(bytes: Int64(model.ramEstimateBytes), memory: memory)
     }
 
     /// True when the host has at least 96 GB of physical RAM — gate for surfacing

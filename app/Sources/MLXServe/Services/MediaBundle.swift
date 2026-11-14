@@ -741,12 +741,13 @@ protocol MediaModelSizing: Identifiable where ID == String {
 }
 
 extension MediaModelSizing {
-    /// Whether this Mac's physical RAM covers what the model needs. A soft
-    /// signal for the UI (show a warning, never a download/use gate) — same
-    /// "warn, don't block" policy as `RecommendedModelPick.meetsSystemRequirements`
-    /// and `ImageGenView`'s oversized-model alert.
-    func meetsSystemRequirements(physicalMemoryBytes: UInt64) -> Bool {
-        physicalMemoryBytes >= UInt64(approxRAMGB) * 1_073_741_824
+    /// Whether what this Mac can give a model (the GPU's usable budget, not
+    /// physical RAM) covers what the model needs. A soft signal for the UI
+    /// (show a warning, never a download/use gate) — same "warn, don't block"
+    /// policy as `RecommendedModelPick.meetsSystemRequirements` and
+    /// `ImageGenView`'s oversized-model alert. An unknown budget (0) fits.
+    func meetsSystemRequirements(memory: SystemMemoryInfo) -> Bool {
+        memory.usableBytes == 0 || memory.usableBytes >= UInt64(approxRAMGB) * 1_073_741_824
     }
 }
 

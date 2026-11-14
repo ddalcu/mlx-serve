@@ -4,7 +4,7 @@
 "Next version of this reply" = "이 답변의 다음 버전";
 "Focused" = "집중적";
 "Your workspace ID (T...)" = "작업 공간 ID (T...)";
-"Needs about %lld GB of RAM — your Mac has %@" = "약 %lld GB RAM 필요 — 이 Mac: %@";
+"Needs about %lld GB of RAM — your Mac can give models about %@" = "약 %lld GB RAM 필요 — 이 Mac에서 모델에 약 %@ 사용 가능";
 "No settings match \"%@\"" = "“%@”에 해당하는 설정이 없습니다";
 "Save lyrics" = "가사 저장";
 "75 — downtempo" = "75 — 다운템포";

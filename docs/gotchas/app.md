@@ -438,3 +438,12 @@ Defect: with a model loaded and no requests, `MLXCore` burned CPU while `mlx-ser
 
 ## A poll started at spawn never returned, because the app's session waits for connectivity (2026-10-31)
 Defect: the chat window's usage strip (decode, prefill, Total Tokens) stayed at dashes and zero for a whole run, and `~/.mlx-serve/usage.db` stayed empty, while `/metrics.json` held the counters. Cause: `UsageTracker` starts polling when the server process is spawned, before it listens, and `APIClient.session` sets `waitsForConnectivity`: a request to a closed port stays pending until the one-hour resource timeout and does not complete when the server comes up, so the loop sat on its first `await` for good (a session without the wait fails in 0.0 s on the same port). Every earlier test fed `ingest` directly, so none saw the poll. Fix: `fetchThroughput` reads through `pollSession`, a plain ephemeral session. Guard: `APIClientThroughputTests` (a closed port answers within seconds).
+
+## "Recommended for your Mac" named a model marked "Not enough memory"
+Defect: a 96 GB Mac whose GPU can hold about 72 GB was recommended Flash-Next (78 GB) beside a table row calling it
+"Not enough memory"; a 36 GB Mac (28 GB for models) got the 6-bit 27B (32.4 GB). Cause: the starter pick, the
+"Requires more RAM" split, the media picks and Discover's dot compared a model's need with physical RAM, while the
+table row compared it with the GPU's working set. Fix: every fit check takes a `SystemMemoryInfo` and reads
+`usableBytes`; a RAM band caps the starter pick, which steps down to the largest pick that fits. Guards:
+`RecommendedModelsTests` (bands, a raised wired limit, every tier fits its band's bottom), `RAMFitnessTests`,
+`testMediaPresetRequirementsReadTheUsableBudget`.

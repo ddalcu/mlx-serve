@@ -160,7 +160,7 @@ private struct RecommendedPane: View {
     /// fourteen across four sections.
     private var memory: SystemMemoryInfo { SystemMemoryInfo.current() }
     private var starter: RecommendedModelPick {
-        RecommendedModelPick.starterPick(physicalMemoryBytes: memory.totalBytes)
+        RecommendedModelPick.starterPick(memory: memory)
     }
 
     var body: some View {
@@ -955,7 +955,7 @@ private struct DownloadsPane: View {
 /// Discover-style search, so one scrollable page beats splitting each
 /// modality into its own sidebar row.
 private struct MediaPane: View {
-    private var physicalMemory: UInt64 { ProcessInfo.processInfo.physicalMemory }
+    private var memory: SystemMemoryInfo { SystemMemoryInfo.current() }
 
     var body: some View {
         ScrollView {
@@ -966,7 +966,7 @@ private struct MediaPane: View {
                     systemImage: "photo",
                     tint: .pink
                 ) {
-                    ForEach(ImageModelPreset.all) { MediaModelRow(preset: $0, modality: .image, physicalMemoryBytes: physicalMemory) }
+                    ForEach(ImageModelPreset.all) { MediaModelRow(preset: $0, modality: .image, memory: memory) }
                 }
                 ModelGroupSection(
                     title: "Audio",
@@ -977,7 +977,7 @@ private struct MediaPane: View {
                     // The browser lists the FULL catalog — Kokoro is voice-mode
                     // only (out of `.all`, which the media panes offer) but is
                     // still a model the user can fetch from here.
-                    ForEach(AudioModelPreset.allIncludingVoiceOnly) { MediaModelRow(preset: $0, modality: .voice, physicalMemoryBytes: physicalMemory) }
+                    ForEach(AudioModelPreset.allIncludingVoiceOnly) { MediaModelRow(preset: $0, modality: .voice, memory: memory) }
                 }
                 ModelGroupSection(
                     title: "Video",
@@ -985,7 +985,7 @@ private struct MediaPane: View {
                     systemImage: "film",
                     tint: .indigo
                 ) {
-                    ForEach(VideoModelPreset.all) { MediaModelRow(preset: $0, modality: .video, physicalMemoryBytes: physicalMemory) }
+                    ForEach(VideoModelPreset.all) { MediaModelRow(preset: $0, modality: .video, memory: memory) }
                 }
                 ModelGroupSection(
                     title: "Music",
@@ -993,7 +993,7 @@ private struct MediaPane: View {
                     systemImage: "music.note",
                     tint: .orange
                 ) {
-                    ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, modality: .music, physicalMemoryBytes: physicalMemory) }
+                    ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, modality: .music, memory: memory) }
                 }
                 ModelGroupSection(
                     title: "Sound Effects",
@@ -1001,7 +1001,7 @@ private struct MediaPane: View {
                     systemImage: "speaker.wave.3",
                     tint: .teal
                 ) {
-                    ForEach(SoundModelPreset.all) { MediaModelRow(preset: $0, modality: .sound, physicalMemoryBytes: physicalMemory) }
+                    ForEach(SoundModelPreset.all) { MediaModelRow(preset: $0, modality: .sound, memory: memory) }
                 }
                 ModelGroupSection(
                     title: "3D",
@@ -1009,7 +1009,7 @@ private struct MediaPane: View {
                     systemImage: "cube.transparent",
                     tint: .purple
                 ) {
-                    ForEach(Model3DModelPreset.modelBrowserCatalog) { MediaModelRow(preset: $0, modality: .mesh, physicalMemoryBytes: physicalMemory) }
+                    ForEach(Model3DModelPreset.modelBrowserCatalog) { MediaModelRow(preset: $0, modality: .mesh, memory: memory) }
                 }
             }
             .padding(16)
@@ -1063,7 +1063,7 @@ private struct ModelGroupSection<Content: View>: View {
 private struct MediaModelRow<Preset: MediaModelPreset>: View {
     let preset: Preset
     let modality: MediaModality
-    let physicalMemoryBytes: UInt64
+    let memory: SystemMemoryInfo
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
     @State private var confirmDelete = false
@@ -1078,7 +1078,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
     /// Soft signal only — shows a warning, never blocks downloading or using
     /// it (same "warn, don't gate" policy as the Recommended pane).
     private var meetsRequirements: Bool {
-        preset.meetsSystemRequirements(physicalMemoryBytes: physicalMemoryBytes)
+        preset.meetsSystemRequirements(memory: memory)
     }
 
     var body: some View {
@@ -1101,7 +1101,7 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
 
                 if !meetsRequirements {
                     Label(
-                        "Needs about \(preset.approxRAMGB) GB of RAM — your Mac has \(MemoryInfo.format(Int64(physicalMemoryBytes)))",
+                        "Needs about \(preset.approxRAMGB) GB of RAM — your Mac can give models about \(memory.usableLabel)",
                         systemImage: "exclamationmark.triangle"
                     )
                     .font(.app(.caption2).weight(.medium))

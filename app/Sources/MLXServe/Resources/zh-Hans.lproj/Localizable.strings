@@ -1073,7 +1073,7 @@
 "Nature aerial" = "自然航拍";
 "Needs about %@ GB of RAM — your Mac has %lld" = "需要约 %@ GB 内存 —— 你的 Mac 有 %lld";
 "Needs about %@ — your Mac can use about %@ for a model." = "需要约 %@ —— 你的 Mac 可用于模型的内存约为 %@。";
-"Needs about %lld GB of RAM — your Mac has %@" = "大约需要 %lld GB 内存 —— 这台 Mac 有 %@";
+"Needs about %lld GB of RAM — your Mac can give models about %@" = "大约需要 %lld GB 内存 —— 这台 Mac 约有 %@ 可供模型使用";
 "Needs exactly %lld numbers — one per tapped encoder layer." = "需要正好 %lld 个数字 —— 每个勾选的编码器层一个。";
 "Needs more memory than this Mac has" = "所需内存超过这台 Mac 的容量";
 "Negative prompt" = "负面提示词";

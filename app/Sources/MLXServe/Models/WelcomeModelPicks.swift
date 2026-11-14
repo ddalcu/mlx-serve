@@ -48,7 +48,7 @@ enum WelcomeModelPicks {
         func biggest(_ picks: [RecommendedModelPick]) -> RecommendedModelPick? {
             picks.max { $0.approxRAMNeededGB < $1.approxRAMNeededGB }
         }
-        let starter = RecommendedModelPick.starterPick(physicalMemoryBytes: memory.totalBytes)
+        let starter = RecommendedModelPick.starterPick(memory: memory)
         switch starter.family {
         case .gemma, .liquid: break
         case .qwen:
@@ -72,7 +72,7 @@ enum WelcomeModelPicks {
     /// The row to mark recommended: the app-wide starter pick when it is
     /// listed, else the first row.
     static func recommendedId(in picks: [WelcomeModelPick], memory: SystemMemoryInfo) -> String? {
-        let starter = RecommendedModelPick.starterPick(physicalMemoryBytes: memory.totalBytes)
+        let starter = RecommendedModelPick.starterPick(memory: memory)
         return picks.first { $0.pick.id == starter.id }?.id ?? picks.first?.id
     }
 }
