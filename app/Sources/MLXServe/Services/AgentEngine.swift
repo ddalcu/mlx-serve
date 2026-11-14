@@ -65,9 +65,12 @@ enum AgentEngine {
 
     // MARK: - History Building
 
-    /// User message appended when history ends on a tool result: some models
-    /// (Gemma 4 E4B) cannot continue without one. Shared with `TestServer`.
-    static let toolRoundNudge = "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."
+    /// The request's messages: the system prompt, then the history AS IT IS. A history that ends on a tool result
+    /// is sent that way (the server's template opens the assistant turn after it): a message put there in the user
+    /// role reads to the model as the user speaking. Shared with `TestServer`.
+    static func requestMessages(systemPrompt: String, history: [[String: Any]]) -> [[String: Any]] {
+        [["role": "system", "content": systemPrompt]] + history
+    }
 
     /// Build API-ready message history from chat messages with budget-aware truncation.
     ///

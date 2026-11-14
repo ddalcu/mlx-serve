@@ -458,11 +458,6 @@ def run_once(args, run_idx):
                 "tool_call_id": tc["id"] or f"call_{turn_i}",
                 "content": result,
             })
-        # Replicate the Swift client's nudge after a tool result
-        history.append({
-            "role": "user",
-            "content": "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call.",
-        })
 
     return {"turns": turns, "suspicious_turn": suspicious_turn, "fs_files": list(fs.files.keys())}
 
