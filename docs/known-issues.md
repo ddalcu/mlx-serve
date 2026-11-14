@@ -114,6 +114,8 @@ classes the composed chain treats differently):
 - Quant blocks we ignore are not refused by name (bitsandbytes, compressed-tensors FP8, a modelopt_fp4 drafter).
 - ds4 reasoning budget on the plain path (refused by name).
 - EmbeddingGemma 2 audio; Muse's MoVA; the EigenLabs Nemotron-3.5-Bolt IQ2 pack (`iq2_xxs` is refused).
+- Gemma 3's SigLIP tower (`vision_tower.vision_model.*`, e.g. mlx-community/gemma-3-12b-it-4bit): the plugin has no
+  media hooks, the legacy encoder probes Gemma 4's names, so the pack logs `Vision weights missing` and serves text only.
 - Tokenizer parity: NFC normalization of U+2000-range spaces, DeepSeek's zero-width handling and Spark's blank-line
   shapes differ from HF.
 
