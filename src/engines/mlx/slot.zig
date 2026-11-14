@@ -176,6 +176,8 @@ pub const Slot = struct {
     cancelled: std.atomic.Value(bool),
     /// Inference thread only: the request's outcome has been counted in `Metrics`.
     metrics_recorded: bool = false,
+    /// A kernel warm-up the server serves itself (`warm_requests`): its stats are no client's, so they stay out of the log.
+    warm: bool = false,
     /// Inference-thread passes (a prefill, a decode tick) holding this slot, taken
     /// under `queue_mu`. `complete` waits it out: the handler owns sampling state
     /// the pass reads (`think_bound`, `constraint`) and frees it once `complete` returns.

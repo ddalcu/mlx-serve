@@ -242,6 +242,7 @@ fn submit(sch: *Scheduler, entry: *LoadedModel, cache: ?*prefix_cache_mod.HotPre
         .mtp_depth = entry.mtp_depth,
     });
     slot.metrics_recorded = true;
+    slot.warm = true;
     return slot;
 }
 
