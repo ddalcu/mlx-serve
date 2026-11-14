@@ -117,19 +117,25 @@ fn bf16Rows(l: *const v41.Lin, d: usize) ?usize {
 /// The launch `ly` takes for the stream `x` `[R, hc, D]`, or null where the kernel does not serve it: another dtype,
 /// width or row count, a q_kv, weights_proj or compressor in another format, a layer without q_kv (the DSpark stages).
 pub fn plan(m: *const v41.Dsv41Model, ly: *const v41.Layer, x: A) ?Plan {
-    if (device.deviceGeneration().gen < first_gen) return null;
-    const c = &m.cfg;
     const sh = dims(x);
     if (sh.len != 3 or mlx.mlx_array_dtype(x) != .bfloat16 or sh[0] < 1 or sh[0] > decode.max_rows) return null;
+    if (sh[1] != hc or sh[2] != m.cfg.hidden_size) return null;
+    return planRows(m, ly, @intCast(sh[0]));
+}
+
+/// `plan` for `rows` rows of a bf16 stream of the model's width: what the layer's formats and the config allow.
+pub fn planRows(m: *const v41.Dsv41Model, ly: *const v41.Layer, rows: usize) ?Plan {
+    if (device.deviceGeneration().gen < first_gen) return null;
+    const c = &m.cfg;
     const d: usize = c.hidden_size;
-    if (sh[1] != hc or sh[2] != d or c.dsv4_hc_mult != hc or d % 256 != 0 or d > 8192) return null;
+    if (rows < 1 or rows > decode.max_rows or c.dsv4_hc_mult != hc or d % 256 != 0 or d > 8192) return null;
     const q = ly.q_kv orelse return null;
     if (q.qp.mode != .mxfp8 or q.qp.bits != 8 or q.qp.group_size != 32 or q.b.ctx != null) return null;
     const nq: usize = c.dsv4_q_lora_rank + c.head_dim;
     if (nq % rt != 0 or !is(q.w, .uint32, &.{ nq, d / 4 }) or !is(q.s, .uint8, &.{ nq, d / 32 })) return null;
     const f = ly.hc_attn;
     if (!is(f.fn_w, .float32, &.{ n_mix, hc * d }) or !is(f.scale, .float32, &.{n_mix}) or !is(f.base, .float32, &.{n_mix}) or !is(ly.attn_norm, .bfloat16, &.{d})) return null;
-    var p: Plan = .{ .rows = @intCast(sh[0]), .dim = d, .nq = nq, .qa = c.dsv4_q_lora_rank, .fuse = sh[0] <= fuse_rows };
+    var p: Plan = .{ .rows = rows, .dim = d, .nq = nq, .qa = c.dsv4_q_lora_rank, .fuse = rows <= fuse_rows };
     if (ly.idx) |*iw| p.nw = bf16Rows(&iw.weights_proj, d) orelse return null;
     if (ly.comp) |*cw| {
         p.nc = bf16Rows(&cw.wkv, d) orelse return null;

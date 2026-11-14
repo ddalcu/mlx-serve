@@ -172,5 +172,6 @@ test "dsv41 dec layers ubench: a decode step through layers 20..40, fused vs tod
 
 test {
     _ = fixture;
+    _ = @import("exact_test.zig");
     inline for (.{ in_proj, wq_b, idx_score, topk, attn, wo_a, ffn_in, moe_up, moe_down }) |k| _ = k;
 }

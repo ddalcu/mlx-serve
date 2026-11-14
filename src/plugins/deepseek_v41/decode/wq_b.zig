@@ -59,6 +59,20 @@ pub fn run(sc: *dsv41.Scope, m: *const dsv41.Dsv41Model, kern: mlx.mlx_fast_meta
     return launch(sc, m, kern, ly, li, qa, kv, z, pos, groups());
 }
 
+/// Whether `launch` serves layer `ly` at all: its formats and the config, before any rows (`Dsv41Model.exact`'s check).
+pub fn servesLayer(m: *const dsv41.Dsv41Model, ly: *const dsv41.Layer) bool {
+    const c = &m.cfg;
+    if (m.qat_off or m.act != .bfloat16) return false;
+    const heads = c.num_attention_heads;
+    if (c.head_dim != KV or c.dsv4_rope_head_dim != 64 or c.dsv4_hc_mult != 4) return false;
+    if (c.dsv4_q_lora_rank != K or !mxfp8Rows(ly.wq_b, heads * c.head_dim)) return false;
+    if (ly.idx) |iw| {
+        const idx_n = c.dsv4_index_n_heads * c.dsv4_index_head_dim;
+        if (c.dsv4_index_head_dim != 128 or idx_n % 32 != 0 or !mxfp8Rows(iw.wq_b, idx_n)) return false;
+    }
+    return heads * c.head_dim % (SGS * 2) == 0;
+}
+
 /// The positions p0 .. p0 + rows of one state's rows, from the host (no launch).
 pub fn rowsAt(sc: *dsv41.Scope, p0: usize, rows: usize) !A {
     var v: [decode.max_rows]i32 = undefined;

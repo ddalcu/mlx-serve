@@ -79,6 +79,11 @@ pub fn specYieldTick(active: []const *Slot) void {
         const gen = if (s.legacy_gen) |*g| g else continue;
         if (gen.spec_disabled_runtime) continue;
         const mode = slotSpecMode(s, gen);
+        // An exact-solo model batches no decode (`dspark_group.exactSolo`): its DSpark slots keep drafting beside company.
+        if (mode == .dspark) if (s.model.transformer) |t| if (dspark_group.exactSolo(t)) {
+            s.company_ticks = 0;
+            continue;
+        };
         const company = modelCompany(active, s, dspark_group.slotGroupable);
         if (!yieldsToCompany(mode, mlx.cudaAvailable(), s.model.config.?.isMoe(), company.others, mtpCrowdThresholdFor(s), company.dspark)) {
             s.company_ticks = 0;

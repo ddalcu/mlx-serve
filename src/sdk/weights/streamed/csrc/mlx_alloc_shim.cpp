@@ -166,3 +166,5 @@ int dsv41_command_buffer_limits(int ops, int mb, int* prev_ops, int* prev_mb) {
 // MLX custom kernels' launch cache (`HostGpu.launch`; the pinned MLX rebuilds and rehashes a kernel's source on every
 // apply).
 #include "mlx_launch_cache.inc"
+// deepseek_v41 exact DSpark verify: x @ w.T over up to 16 rows on MLX's own one-row qmv_fast pipeline.
+#include "dsv41_row_qmv.inc"
