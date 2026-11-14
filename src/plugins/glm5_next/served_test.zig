@@ -14,6 +14,7 @@ const mtpRun = @import("../../engines/mlx/plugin/proof_mtp.zig").mtpRun;
 const MtpHeadRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef;
 const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const generate = @import("../../engines/mlx/generate.zig");
 const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const driver = @import("../../engines/mlx/plugin/driver.zig");
@@ -549,14 +550,16 @@ test "bailing_hybrid served: a streaming pack's span-major prompt is the chunk l
 }
 
 /// One prefill of `prompt` through the Generator at stride 64 (under the caller's `--prefill-chunk` 64) and a cap of 16
-/// with `anchors` low anchors: by the whole-prompt pass (`whole`) or by the chunk loop.
-fn lingPrefill(x: *Transformer, tok: *const Tokenizer, prompt: []const u32, anchors: usize, whole: bool) !Generator {
+/// with `anchors` low anchors on `ctx` (a slot's own cache, offset and states): by the whole-prompt pass (`whole`) or
+/// by the chunk loop.
+fn lingPrefill(x: *Transformer, tok: *const Tokenizer, prompt: []const u32, anchors: usize, whole: bool, ctx: ForwardCtx) !Generator {
     const io = std.Io.Threaded.global_single_threaded.io();
     const caps = &x.config.plugin.?.parsed.caps;
     const was = caps.whole_prompt_prefill;
     defer caps.whole_prompt_prefill = was;
     caps.whole_prompt_prefill = whole;
     return Generator.initWithOptions(io, testing.allocator, x, tok, prompt, 1, .{ .temperature = 0.0 }, &.{}, .{
+        .ctx = ctx,
         .skip_lazy_preforward = true,
         .ssm_checkpoint_stride = 64,
         .ssm_checkpoint_max = 16,
@@ -596,9 +599,16 @@ test "bailing_hybrid served: a 5,000-token prompt at chunk and stride 64 prefill
             var g = ops.Graph.init(a, x.s);
             defer g.deinit();
             for ([_]usize{ 0, 2 }) |anchors| {
-                var whole = try lingPrefill(&x, &tok_dummy, prompt, anchors, true);
+                // Each arm on a slot of its own: on the model's one context the second would append to the first's cache.
+                var whole_slot: both.Slot = undefined;
+                try whole_slot.init(b, &x);
+                defer whole_slot.deinit();
+                var loop_slot: both.Slot = undefined;
+                try loop_slot.init(b, &x);
+                defer loop_slot.deinit();
+                var whole = try lingPrefill(&x, &tok_dummy, prompt, anchors, true, whole_slot.ctx);
                 defer whole.deinit(a);
-                var loop = try lingPrefill(&x, &tok_dummy, prompt, anchors, false);
+                var loop = try lingPrefill(&x, &tok_dummy, prompt, anchors, false, loop_slot.ctx);
                 defer loop.deinit(a);
                 try testing.expectEqual(@as(usize, 16), whole.ssm_checkpoints.items.len);
                 try testing.expectEqual(loop.ssm_checkpoints.items.len, whole.ssm_checkpoints.items.len);
