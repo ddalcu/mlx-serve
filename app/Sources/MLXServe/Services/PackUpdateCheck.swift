@@ -196,7 +196,7 @@ extension DownloadManager {
 
     /// The listing with its HTTP status (0 when the request never answered).
     func fetchListingStatus(repoId: String) async -> (Int, [[String: Any]]?) {
-        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true"),
+        guard let url = URL(string: "\(DownloadManager.hfEndpoint())/api/models/\(repoId)/tree/main?recursive=true"),
               let (data, response) = try? await DownloadSession.shared.data(for: Self.hfApiRequest(url)) else { return (0, nil) }
         return ((response as? HTTPURLResponse)?.statusCode ?? 0, try? JSONSerialization.jsonObject(with: data) as? [[String: Any]])
     }

@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const env = @import("../../env.zig");
+const hf_hub = @import("../../sdk/util/hf_hub.zig");
 const build_options = @import("build_options");
 const ollama = @import("../api/ollama/translate.zig");
 const model_discovery = @import("../registry/discovery.zig");
@@ -449,7 +450,11 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         return error.PullUnavailable;
     }
     reporter.say("pulling manifest for {s}", .{resolved.repo});
-    const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
+    const hub = hf_hub.envBase() catch {
+        reporter.say("error: HF_ENDPOINT must be an http(s) URL such as https://hf-mirror.com", .{});
+        return error.PullFailed;
+    };
+    const tree_url = try std.fmt.allocPrint(allocator, "{s}/api/models/{s}/tree/main?recursive=true", .{ hub, resolved.repo });
     defer allocator.free(tree_url);
     const tree_json = curlFetch(allocator, io, tree_url) catch {
         reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
@@ -462,10 +467,10 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
     };
     defer freeRepoFiles(allocator, files);
 
-    const config_json = try fetchListed(allocator, io, resolved.repo, files, "config.json");
+    const config_json = try fetchListed(allocator, io, hub, resolved.repo, files, "config.json");
     defer if (config_json) |c| allocator.free(c);
     const media = isMediaListing(allocator, files, config_json);
-    const index_json = try fetchListed(allocator, io, resolved.repo, files, "model.safetensors.index.json");
+    const index_json = try fetchListed(allocator, io, hub, resolved.repo, files, "model.safetensors.index.json");
     defer if (index_json) |j| allocator.free(j);
     const index = if (index_json) |j| std.json.parseFromSlice(std.json.Value, allocator, j, .{}) catch null else null;
     defer if (index) |p| p.deinit();
@@ -506,7 +511,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
             }
         }
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
+        const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub, resolved.repo, f.path });
         defer allocator.free(url);
         curlDownload(allocator, io, url, dest_path, show_progress) catch {
             reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
@@ -536,10 +541,10 @@ fn indexNames(weight_map: ?std.json.Value, path: []const u8) bool {
 }
 
 /// The body of `name` from the repo's `main`, when the listing has it and it can be fetched.
-fn fetchListed(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, files: []const RepoFile, name: []const u8) !?[]u8 {
+fn fetchListed(allocator: std.mem.Allocator, io: std.Io, hub: []const u8, repo: []const u8, files: []const RepoFile, name: []const u8) !?[]u8 {
     for (files) |f| {
         if (!std.mem.eql(u8, f.path, name)) continue;
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ repo, name });
+        const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub, repo, name });
         defer allocator.free(url);
         return curlFetch(allocator, io, url) catch null;
     }

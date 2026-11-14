@@ -10,7 +10,7 @@ final class ModelCardTests: XCTestCase {
         XCTAssertEqual(ModelCard.pageURL(repoId: "mlx-community/gemma-4-12b-it-4bit")?.absoluteString,
                        "https://huggingface.co/mlx-community/gemma-4-12b-it-4bit")
         XCTAssertEqual(ModelCard.readmeURL(repoId: "mlx-community/gemma-4-12b-it-4bit")?.absoluteString,
-                       "https://huggingface.co/mlx-community/gemma-4-12b-it-4bit/resolve/main/README.md")
+                       "\(DownloadManager.hfEndpoint())/mlx-community/gemma-4-12b-it-4bit/resolve/main/README.md")
     }
 
     /// A local model's name is a repo id in three spellings: `org/repo`

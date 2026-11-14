@@ -67,7 +67,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_providers.sh` **H** upstream providers via stubs · `test_launch_cmd.sh` `mlx-serve launch <agent>`
 - `test_launch_script.sh` **H** GET /launch · `test_website_agent_install.sh` **H** website/agent.sh · `test_opencode_probe.sh` **H**
 - `test_run_quiet.sh` **H** REPL greeting has no discovery noise · `test_partial_download.sh` **H** interrupted pull resumes
-- `test_pull_registers_org_id.sh` **H** `/api/pull org/name` id · `test_lan_share.sh`, `test_lan_peer_key.sh` two servers over LAN
+- `test_pull_registers_org_id.sh` **H** `/api/pull org/name` id · `test_hf_endpoint.sh` **H** `HF_ENDPOINT` moves `pull` and `/api/pull` to a mirror · `test_lan_share.sh`, `test_lan_peer_key.sh` two servers over LAN
 
 **Tool calling, thinking, sampling, formats**
 - `test_tool_args.sh`, `test_tool_parsing.sh`, `test_tool_call_parse.sh` argument parsing · `test_tool_response.sh` Gemma 4 round trip

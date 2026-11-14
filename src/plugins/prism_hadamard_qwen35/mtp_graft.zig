@@ -12,6 +12,7 @@ const build_options = @import("build_options");
 const model_mod = @import("../../sdk/config/model.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/source.zig");
 const log = @import("../../sdk/util/log.zig");
+const hf_hub = @import("../../sdk/util/hf_hub.zig");
 
 const DONOR_REPO = "ddalcu/Qwen3.8-27B-MLX-Serve-4bit";
 const SIDECAR = "mtp.safetensors";
@@ -25,7 +26,7 @@ pub fn wanted(config: *const model_mod.ModelConfig) bool {
 
 const Source = union(enum) {
     local: []const u8, // absolute donor dir
-    remote,
+    remote: []const u8, // hub base URL (`hf_hub.envBase`)
 
     fn read(self: Source, allocator: std.mem.Allocator, io: std.Io, rel: []const u8, off: u64, len: u64) ![]u8 {
         switch (self) {
@@ -45,8 +46,8 @@ const Source = union(enum) {
                 }
                 return buf;
             },
-            .remote => {
-                const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ DONOR_REPO, rel });
+            .remote => |hub| {
+                const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub, DONOR_REPO, rel });
                 defer allocator.free(url);
                 const range = try std.fmt.allocPrint(allocator, "{d}-{d}", .{ off, off + len - 1 });
                 defer allocator.free(range);
@@ -77,8 +78,8 @@ const Source = union(enum) {
                 var rs = f.reader(io, &rb);
                 return rs.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
             },
-            .remote => {
-                const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ DONOR_REPO, rel });
+            .remote => |hub| {
+                const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub, DONOR_REPO, rel });
                 defer allocator.free(url);
                 const result = std.process.run(allocator, io, .{
                     .argv = &.{ "curl", "-fsSL", "--retry", "3", "--retry-delay", "2", url },
@@ -138,7 +139,10 @@ pub fn ensure(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, c
     const donor = localDonor(allocator, io, model_dir);
     defer if (donor) |d| allocator.free(d);
     if (donor == null and build_options.mas) return;
-    const src: Source = if (donor) |d| .{ .local = d } else .remote;
+    const src: Source = if (donor) |d| .{ .local = d } else .{ .remote = hf_hub.envBase() catch {
+        log.warn("[mtp] HF_ENDPOINT is not an http(s) URL; serving without MTP\n", .{});
+        return;
+    } };
     log.info("[mtp] no head in this Hadamard pack; assembling one from {s} ({s}); the load waits on it\n", .{ DONOR_REPO, if (donor != null) "local install" else "Hugging Face, ~314 MB" });
     build(allocator, io, src, model_dir) catch |err| {
         log.warn("[mtp] head graft failed ({s}); serving without MTP\n", .{@errorName(err)});
