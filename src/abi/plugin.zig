@@ -744,7 +744,8 @@ pub const AuxHooks = extern struct {
     size: u32 = @sizeOf(AuxHooks),
     reserve: *const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict,
     commit: *const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict,
-    /// Transfers the slot's completed capture to the caller; null means no checkpoint was reached.
+    /// Transfers the slot's completed capture to the caller; a plugin that can also hands over the state where an
+    /// armed prompt it never finished stopped (`describe` says where). Null means neither.
     snapshot: *const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict,
     /// Accepts only `pos == snap.n`; builds the replacement before installing it. The caller keeps the snapshot.
     restore_at: *const fn (m: *anyopaque, slot: u32, snap: Handle, pos: u64) callconv(.c) Verdict,

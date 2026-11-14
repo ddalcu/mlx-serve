@@ -6,6 +6,7 @@ const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const plugin_driver = @import("plugin/driver.zig");
+const plugin_settle = @import("plugin/settle.zig");
 const plugin_abi = @import("../../abi/plugin.zig");
 const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
@@ -109,6 +110,33 @@ fn commitModuleDecodeEnd(sch: *Scheduler, slot: *Slot, gen: *Generator, binding:
     log.debug("[hot-cache] decode-end checkpoint skipped: the module stands past {d} prompt + {d} generated\n", .{ slot.full_prompt.len, forwarded.len });
 }
 
+/// A cancelled module slot's prompt, as far as it got: its completed boundary when decode had begun, else the last
+/// prefill chunk the plugin forwarded (`AuxHooks.snapshot`). The same prompt then resumes there instead of
+/// prefilling from zero. Nothing is kept under the commit floor, as for a cancelled KV prefill, nor when the slot
+/// forwarded nothing past the entry it restored.
+fn commitCancelledModule(sch: *Scheduler, slot: *Slot, xfm: *transformer_mod.Transformer, binding: prefix_cache_mod.ModuleBinding, hc: *prefix_cache_mod.HotPrefixCache) void {
+    const id = if (slot.legacy_gen) |*g| blk: {
+        if (commitDeclinesPadOnly(g.generated_ids.items.len, slot.was_pad_only)) return;
+        break :blk g.ctx.plugin_slot;
+    } else plugin_settle.slotId(xfm.plugin orelse return, &slot.ctx);
+    const snap = plugin_driver.auxSnapshot(xfm, id) orelse return;
+    var info: plugin_abi.AuxSnapshotInfo = .{};
+    if (!plugin_driver.auxDescribe(xfm, snap, &info).isOk() or
+        info.n < prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS or info.n <= slot.cached_tokens or info.n != info.ids.len or info.n > slot.full_prompt.len or
+        !std.mem.eql(u32, info.ids.slice(), slot.full_prompt[0..@intCast(info.n)]) or mlx.errorPending())
+    {
+        plugin_driver.auxFree(xfm, snap);
+        return;
+    }
+    const n: usize = @intCast(info.n);
+    const st = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key) catch |err| {
+        log.warn("[hot-cache] cancelled module commit failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    if (st == .ok) log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled request\n", .{ n, slot.full_prompt.len });
+    publishHotCacheResidency(sch);
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -122,7 +150,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // tick wrapper reads the latch: an unread latch means the KV under this commit may be garbage.
     if (mlx.errorPending()) return;
     if (slot.model.transformer) |xfm| if (prefix_cache_mod.ModuleBinding.forVariant(xfm, slot.cache_variant)) |binding| {
-        if (slot.cancelled.load(.acquire)) return;
+        if (slot.cancelled.load(.acquire)) return commitCancelledModule(sch, slot, xfm, binding, hc);
         const gen = if (slot.legacy_gen) |*g| g else return;
         if (commitDeclinesPadOnly(gen.generated_ids.items.len, slot.was_pad_only)) return;
         const snap = plugin_driver.auxSnapshot(xfm, gen.ctx.plugin_slot) orelse return;

@@ -6438,6 +6438,20 @@ pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
     st.snap_at = null;
 }
 
+/// The capture an unfinished prompt leaves: the state where its last forwarded chunk ended, keyed by the armed ids up
+/// to there, so an abandoned prefill resumes instead of starting over. Nothing when no capture is armed, nothing
+/// was forwarded, or an image of the prompt lies past that point (the armed key hashes every image row).
+pub fn snapshotStateAtChunk(m: *const Dsv41Model, st: *State, gen: u64) !void {
+    const at = st.snap_at orelse return;
+    if (st.snap != null or st.n == 0 or st.n >= at) return;
+    if (m.imageRows(st.snap_ids[0..st.n]) != m.imageRows(st.snap_ids)) return;
+    const ids = try st.gpa.dupe(u32, st.snap_ids[0..st.n]);
+    st.gpa.free(st.snap_ids);
+    st.snap_ids = ids;
+    st.snap_at = st.n;
+    try snapshotStateIfDue(st, gen);
+}
+
 /// A prompt chunk of at least `LEAD_MIN` rows whose Engram rows nothing read ahead sends its first half ahead of the
 /// rest (0: the chunk runs whole): the drive reads the rest behind it, where the whole chunk holds the GPU at the first
 /// Engram layer until its last row is read. A narrower lead feeds the matrix units too few rows an expert.

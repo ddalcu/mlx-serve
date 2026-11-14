@@ -44,6 +44,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   rows than `num_experts`, `bankStreams`) and a Thunderbolt pair keep legacy resume.
   Snapshots retain every buffer and restore whole only at their own position; the engine owns finished history. Pairs
   keep legacy resume.
+- A prompt abandoned mid-prefill hands over the state where its last forwarded chunk ended (`snapshotStateAtChunk`
+  through `AuxHooks.snapshot`: any chunk end restores whole; not with an image past it, not under a tensor pair).
 - A snapshot is cut to a shorter prefix (`sliceSnap`: global rows and index keys kept, where every pooling group is
   closed) and restored by the tech report's SWA bounded replay (`rewind`, `Want.replay`: the last window run again,
   its band stopped at its first row, no compressor). Text only, no pair or tensor split; a slice is never exported.

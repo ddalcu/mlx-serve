@@ -441,6 +441,60 @@ fn expectFinite(a: mlx.mlx_array) !void {
     for (x) |v| try testing.expect(std.math.isFinite(v));
 }
 
+test "deepseek_v41 aux: a prompt abandoned mid-prefill leaves a snapshot at its last chunk, and a restore there continues the cold prefill bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    var p: [40]u32 = undefined;
+    for (&p, 0..) |*id, i| id.* = @intCast((i * 7 + 3) % 90 + 2);
+    const cut = 23; // inside a pooling group and past the window: any chunk end is a restore point
+    const t = try Twin.open(files, "");
+    defer t.close();
+    const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
+
+    // Armed for its end, forwarded up to `cut`, then abandoned.
+    try testing.expect(aux.begin_prompt(t.m, 1, .of(&p), .{}, 0, true).isOk());
+    var none: abi.Handle = null;
+    try testing.expect(aux.snapshot(t.m, 1, &none).isOk());
+    try testing.expect(none == null); // nothing forwarded yet
+    testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[0..9], &.{0}));
+    testing.allocator.free(try slotForward(t, .prefill, &.{1}, p[9..cut], &.{9}));
+    var sn: abi.Handle = null;
+    defer aux.free(t.m, sn);
+    try testing.expect(aux.snapshot(t.m, 1, &sn).isOk());
+    try testing.expect(sn != null);
+    var info: abi.AuxSnapshotInfo = .{};
+    try testing.expect(aux.describe(t.m, sn, &info).isOk());
+    try testing.expectEqual(@as(u64, cut), info.n);
+    try testing.expectEqualSlices(u32, p[0..cut], info.ids.slice());
+    try testing.expect(aux.snapshot(t.m, 1, &none).isOk());
+    try testing.expect(none == null); // handed over once
+    v41.table.release_slot.?(t.m, 1);
+
+    // The same prompt resumes from it and still captures its own end.
+    try testing.expect(aux.restore_at(t.m, 2, sn, cut).isOk());
+    try testing.expect(aux.begin_prompt(t.m, 2, .of(&p), .{}, cut, true).isOk());
+    testing.allocator.free(try slotForward(t, .prefill, &.{2}, p[cut .. p.len - 1], &.{cut}));
+    const warm = try slotForward(t, .prefill, &.{2}, p[p.len - 1 ..], &.{@intCast(p.len - 1)});
+    defer testing.allocator.free(warm);
+    var end: abi.Handle = null;
+    defer aux.free(t.m, end);
+    try testing.expect(aux.snapshot(t.m, 2, &end).isOk());
+    try testing.expect(aux.describe(t.m, end, &info).isOk());
+    try testing.expectEqual(@as(u64, p.len - 1), info.n);
+
+    const reference = try Twin.open(files, "");
+    defer reference.close();
+    testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[0..9], &.{0}));
+    testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[9..cut], &.{9}));
+    testing.allocator.free(try slotForward(reference, .prefill, &.{1}, p[cut .. p.len - 1], &.{cut}));
+    const cold = try slotForward(reference, .prefill, &.{1}, p[p.len - 1 ..], &.{@intCast(p.len - 1)});
+    defer testing.allocator.free(cold);
+    for (cold) |value| try testing.expect(std.math.isFinite(value));
+    try testing.expectEqualSlices(f32, cold, warm);
+}
+
 test "deepseek_v41 aux: disabled capture and short prompts retain no checkpoint" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

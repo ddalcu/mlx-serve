@@ -11440,6 +11440,10 @@ const ModuleFake = struct {
     fn begin(_: *anyopaque, _: u32, _: plugin_abi.Span(u32), _: plugin_abi.Array, _: u64, _: bool) callconv(.c) plugin_abi.Verdict {
         return .ok;
     }
+    fn noSnapshot(_: *anyopaque, _: u32, out: *plugin_abi.Handle) callconv(.c) plugin_abi.Verdict {
+        out.* = null;
+        return .ok;
+    }
     fn restore(m: *anyopaque, slot: u32, snap: plugin_abi.Handle, n: u64) callconv(.c) plugin_abi.Verdict {
         const f = get(m);
         const s = snapOf(snap);
@@ -11504,7 +11508,7 @@ const ModuleFake = struct {
     const hooks: plugin_abi.AuxHooks = .{
         .reserve = undefined,
         .commit = undefined,
-        .snapshot = undefined,
+        .snapshot = &noSnapshot,
         .restore_at = &restore,
         .slice = &slice,
         .handoff = undefined,
@@ -12707,6 +12711,9 @@ test "failed and cancelled requests keep the restored module entry and its expor
         slot.prefix_cache = &hc;
         slot.error_code = if (cancelled) null else "test_failed_request";
         slot.cancelled = std.atomic.Value(bool).init(cancelled);
+        slot.legacy_gen = null;
+        slot.ctx.plugin_slot = 1;
+        slot.cached_tokens = 512;
         var scheduler: @import("../scheduler.zig").Scheduler = undefined;
         @import("../commit.zig").commitSlotIfApplicable(&scheduler, &slot);
         try testing.expectEqual(@as(usize, 0), snap.frees);
