@@ -382,6 +382,26 @@ pub fn fileCheckpoint(allocator: std.mem.Allocator, list: *std.ArrayList(SSMChec
     }
 }
 
+/// The positions `fileCheckpoint` keeps of `positions` filed in order onto an empty list (`max`, `thin`, `low_anchors`
+/// as it takes them), moved to the front in place: the kept count.
+pub fn thinPositions(positions: []u64, max: usize, thin: ThinPolicy, low_anchors: usize) usize {
+    var n: usize = 0;
+    for (positions) |p| {
+        positions[n] = p;
+        n += 1;
+        if (max > 0 and n > max) {
+            const d = spanPreservingDropIndex(u64, positions[0..n], u64PosOf, thin, null, low_anchors);
+            std.mem.copyForwards(u64, positions[d .. n - 1], positions[d + 1 .. n]);
+            n -= 1;
+        }
+    }
+    return n;
+}
+
+fn u64PosOf(p: *const u64) usize {
+    return @intCast(p.*);
+}
+
 /// `spanPreservingDropIndex` over a bare ascending position list.
 pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
     return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null, 0);

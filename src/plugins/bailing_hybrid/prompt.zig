@@ -17,7 +17,6 @@ const gpa = std.heap.c_allocator;
 const Array = mlx.mlx_array;
 const Parts = std.ArrayList(Array);
 const max_captures = 64;
-const max_checkpoints = 64;
 
 /// The prompt `f` (a prefill naming its spans) into `out`: the logits it asks for, its hidden rows and captures.
 pub fn forward(m: *trunk.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out: *abi.ForwardOut) abi.Verdict {
@@ -103,9 +102,13 @@ const Pass = struct {
         var seg_rows: u32 = 0;
         for (rows) |r| seg_rows += r;
         try trunk.bankPhase(p.m, seg_rows);
-        var after: [max_checkpoints]usize = undefined;
-        var conv: [max_checkpoints][]Array = undefined;
-        var ssm: [max_checkpoints][]Array = undefined;
+        const n_cps = p.f.ssm_checkpoints.len;
+        const after = try gpa.alloc(usize, n_cps);
+        defer gpa.free(after);
+        const conv = try gpa.alloc([]Array, n_cps);
+        defer gpa.free(conv);
+        const ssm = try gpa.alloc([]Array, n_cps);
+        defer gpa.free(ssm);
         var n_after: usize = 0;
         var end: u64 = pos;
         for (rows, 0..) |r, i| {

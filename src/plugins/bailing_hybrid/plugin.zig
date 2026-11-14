@@ -78,11 +78,12 @@ pub fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, _: 
     return chunkBytes(p, seq, chunk, kv_bits) + if (p.caps.whole_prompt_prefill) passBytes(p, seq, chunk) * 5 / 4 else 0;
 }
 
-/// The whole-prompt pass's live set past one chunk's (`sdk_bill.wholePromptPassBytes`) at its routed calls' widest.
+/// The whole-prompt pass's live set past one chunk's (`sdk_bill.wholePromptPassBytes`) at its routed calls' widest; the
+/// host adds the checkpoints it holds (`ssm_checkpoint` each).
 pub fn passBytes(p: *const abi.Parsed, seq: u64, chunk: u32) u64 {
     const c = config.of(p);
     const calls: trunk.PromptCalls = .{};
-    return sdk_bill.wholePromptPassBytes(seq, chunk, @as(u64, calls.rows) + calls.tail, c.num_experts_per_tok, c.hidden_size, c.ssmCheckpointBytes(2));
+    return sdk_bill.wholePromptPassBytes(seq, chunk, @as(u64, calls.rows) + calls.tail, c.num_experts_per_tok, c.hidden_size);
 }
 
 fn chunkBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8) u64 {

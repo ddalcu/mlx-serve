@@ -578,6 +578,10 @@ test "bailing_hybrid served: an 18,380-token prompt at chunk 256 prefills whole,
             const prompt = try a.alloc(u32, 18_380);
             defer a.free(prompt);
             for (prompt, 0..) |*t, i| t.* = @intCast(3 + (i * 53) % 500);
+            // Uncapped, the plan names 70 checkpoints, every one in the one wide segment.
+            var all = try @import("../../engines/mlx/generate/prefill_chunk.zig").wholePromptPlan(a, prompt.len, 256, true, 256, 0, false, false, .{});
+            defer all.deinit(a);
+            try testing.expectEqual(@as(usize, 70), all.checkpoints.len);
             const io = std.Io.Threaded.global_single_threaded.io();
             var x = try driver.load(io, a, &b.cfg, b.dir, proof_fixture.stream());
             defer x.deinit();

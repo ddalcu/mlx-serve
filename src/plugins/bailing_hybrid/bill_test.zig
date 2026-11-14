@@ -53,22 +53,23 @@ test "bailing_hybrid bill: a streaming pack bills its prompt as the engine bills
     try expectEngineBill(tiny, tmem.files);
 }
 
-// Bar: the pass's live set past a chunk's at Ling-3.1-flash's geometry (top-8, hidden 4,096, 63 KDA layers' bf16
-// checkpoints of 141,410,304 B), by term.
-test "bailing_hybrid bill: the whole-prompt pass bills its routed call, its spans' rows and its checkpoints past one chunk's" {
+// Bar: the pass's live set past a chunk's at Ling-3.1-flash's geometry (top-8, hidden 4,096), by term; the checkpoints
+// it holds are the host's, at the 63 KDA layers' bf16 141,410,304 B the bill reports.
+test "bailing_hybrid bill: the whole-prompt pass bills its routed call and its spans' rows past one chunk's" {
     const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
     const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
     const dir = mem.packDir();
     var p: abi.Parsed = .{};
     try std.testing.expect(config.parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
     defer config.freeParsed(&p);
-    const cp: u64 = 141_410_304;
-    try std.testing.expectEqual(cp, config.of(&p).ssmCheckpointBytes(2));
+    var b: abi.Bill = .{};
+    plugin.table.bill(&p, &.{ .context = 32768 }, &b);
+    try std.testing.expectEqual(@as(u64, 141_410_304), b.ssm_checkpoint);
     // The standard prompt at the engine's 1,536-row chunk: 16,844 routed rows past a chunk (each pair's output and its
-    // weighted copy, f32), their residual rows (4 x bf16), and 12 checkpoints (one a span of 18,380 / 1,536, plus one).
-    try std.testing.expectEqual(16_844 * 8 * 4096 * 8 + 4 * 16_844 * 4096 * 2 + 12 * cp, plugin.passBytes(&p, 18_380, 1536));
-    // A one-span prompt holds no rows past its chunk: the backoff's checkpoint and one more.
-    try std.testing.expectEqual(2 * cp, plugin.passBytes(&p, 900, 4096));
+    // weighted copy, f32) and their residual rows (4 x bf16).
+    try std.testing.expectEqual(@as(u64, 16_844 * 8 * 4096 * 8 + 4 * 16_844 * 4096 * 2), plugin.passBytes(&p, 18_380, 1536));
+    // A one-span prompt holds no rows past its chunk.
+    try std.testing.expectEqual(@as(u64, 0), plugin.passBytes(&p, 900, 4096));
     // The routed call stops at 16,384 + 2,048 rows: at 32,767 tokens it bills 18,432 - 1,024 of them.
-    try std.testing.expectEqual((18_432 - 1024) * 8 * 4096 * 8 + 4 * (32_767 - 1024) * 4096 * 2 + 32 * cp, plugin.passBytes(&p, 32_767, 1024));
+    try std.testing.expectEqual(@as(u64, (18_432 - 1024) * 8 * 4096 * 8 + 4 * (32_767 - 1024) * 4096 * 2), plugin.passBytes(&p, 32_767, 1024));
 }

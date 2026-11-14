@@ -747,14 +747,18 @@ pub fn initWithOptions(
         ctx.prefill_progress = options.prefill_progress;
     }
     defer ctx.prefill_progress = null;
-    // It is handed the spans and checkpoint positions the chunk loop would have run, and files its checkpoints onto the
-    // loop's list through `CacheOps.checkpoint`.
+    // It is handed the spans the chunk loop would have run and the checkpoint positions the loop's list would keep, and
+    // files its checkpoints onto that list through `CacheOps.checkpoint`.
     var whole_plan: ?WholePromptPlan = null;
     defer if (whole_plan) |*wp| wp.deinit(allocator);
     var prompt_cps: PromptCheckpoints = undefined;
     var prompt_cp_sink: CheckpointSink = undefined;
     if (final_start == 0 and tail_len > 1) {
-        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid);
+        whole_plan = try wholePromptPlan(allocator, prompt_ids.len, PREFILL_CHUNK, want_ssm_cp, ssm_cp_stride, ssm_cp_offset, options.adaptive_chunk_width, dense_low_grid, .{
+            .max = options.ssm_checkpoint_max,
+            .thin = cp_thin,
+            .low_anchors = options.ssm_low_anchors,
+        });
         ctx.prompt_spans = whole_plan.?.spans;
         // The cache capacity the chunk loop reserves: a model that appends span by span grows it no more often.
         ctx.cache.reserve(@intCast(reservedPrefillTokens(&xfm.config, total_ctx_for_chunk, max_tokens, PREFILL_CHUNK)));

@@ -78,12 +78,11 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
 /// spans, `Caps.whole_prompt_prefill`), at a `seq`-token prompt whose spans are `chunk` wide:
 /// - the routed call's rows past a chunk's (at most `call_rows`): each pair's expert output and its weighted copy, f32;
 /// - every span's residual rows past a chunk's: the hidden, the normed input, the MLP output and the joined output
-///   hidden, bf16;
-/// - the recurrent checkpoints held until the last layer passes them, at most one a span (`checkpoint_bytes` each).
-pub fn wholePromptPassBytes(seq: u64, chunk: u64, call_rows: u64, top_k: u64, hidden: u64, checkpoint_bytes: u64) u64 {
+///   hidden, bf16.
+/// The recurrent checkpoints it holds are the host's term: the engine's plan count of `Bill.ssm_checkpoint`.
+pub fn wholePromptPassBytes(seq: u64, chunk: u64, call_rows: u64, top_k: u64, hidden: u64) u64 {
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const routed = (@min(seq, call_rows) -| fwd) * top_k * hidden * 4 * 2;
     const rows = 4 * (seq -| fwd) * hidden * 2;
-    const checkpoints = (seq / fwd + 1) * checkpoint_bytes;
-    return routed + rows + checkpoints;
+    return routed + rows;
 }

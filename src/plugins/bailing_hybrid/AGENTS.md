@@ -21,7 +21,8 @@ with GLM-5.3-Flash's readers and loads through `glm5_next/trunk.zig`; its own pa
   `quantization_config` (not `expert_streaming`) sets `streamed_bank`; glm5_next's streaming rules then apply. Its prompt
   bill is `prefill_bytes`: the engine's unstreamed arithmetic over `sdk/bill/prefill.zig` plus the whole-prompt pass's
   live set past a chunk's (`wholePromptPassBytes`), pinned by `bill_test.zig` (the closure stays in sdk/); the driver's
-  stream room and growth read it; `prompt_last_row` reads the head's last 32 rows only.
+  stream room and growth read it plus the checkpoints the pass holds (the engine plan's count x `ssm_checkpoint`,
+  `driver.passCheckpoints`); `prompt_last_row` reads the head's last 32 rows only.
 - Whole prompt (streaming packs, `Caps.whole_prompt_prefill`, `prompt.zig`): layer by layer over the engine's chunk
   loop spans (`table_forward.hiddenSpans`), every span's ops on its own rows but the routed experts, one bank call over
   whole spans (up to 16,384 rows, `trunk.PromptCalls`), its predicted experts read ahead a call at a time before the
