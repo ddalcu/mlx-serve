@@ -1279,7 +1279,6 @@ fn splitLastChunk(
         },
         else => |other| return other,
     };
-    // Every request the split serves says so: the A/B harness counts this line's prefix.
     log.info("[prefill-split] split forward A={d} B={d}\n", .{ sp.rows_a, sp.rows_b });
     return sp;
 }
