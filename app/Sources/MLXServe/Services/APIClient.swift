@@ -101,6 +101,24 @@ class APIClient {
     private let pollSession = URLSession(configuration: .ephemeral)
     private let decoder = JSONDecoder()
 
+    /// Tokenizes text with the active local tokenizer. This excludes the chat
+    /// template, so callers also reserve envelope/tool overhead and headroom.
+    func contextTokenCount(port: UInt16, text: String) async throws -> Int {
+        var request = URLRequest(url: serverURL(port: port, path: "/tokenize"))
+        request.httpMethod = "POST"
+        request.timeoutInterval = 60
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("close", forHTTPHeaderField: "Connection")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["content": text])
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw APIError.badStatus(code: (response as? HTTPURLResponse)?.statusCode ?? 0,
+                                     detail: APIError.errorDetail(fromBody: data))
+        }
+        struct Tokens: Decodable { let tokens: [Int] }
+        return try JSONDecoder().decode(Tokens.self, from: data).tokens.count
+    }
+
     /// Build a URL pointing at the server, honouring `host`. The settings
     /// field is free text, so anything that does not form a valid URL falls
     /// back to loopback instead of trapping — a 1 s health poll must be able
