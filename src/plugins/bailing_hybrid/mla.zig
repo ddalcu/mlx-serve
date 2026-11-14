@@ -1,6 +1,6 @@
 //! Ling 3.0's multi-head latent attention (the naive DeepSeek-V3 form: per-head keys and values expanded before the
-//! cache) on one slot through `CacheOps`. A streaming pack caches the rope key once (`Model.mlaRopeOnce`): a token's key
-//! row holds every head's nope key, then the one roped key; attention reads it as the dense key's elements.
+//! cache) on one slot through `CacheOps`. A streaming pack's trunk caches the rope key once (`Model.mlaRopeOnce`): a
+//! token's key row holds every head's nope key, then the one roped key; attention reads it as the dense key's elements.
 //! copied_from: sdk/blocks/attention/mla.zig (`mlaAttnWith`, the cache update replaced by `Slots.append`).
 
 const mlx = @import("../../mlx/ffi.zig");
@@ -13,6 +13,23 @@ const log = @import("../../sdk/util/log.zig");
 
 var rope1_logged = false;
 
+/// Rope-once attention calls since the last `takeCalls`: read in place, declined by the kernels (dense rebuild), and
+/// prompt calls (dense rebuild by design).
+pub const Calls = struct { in_place: u64 = 0, declined: u64 = 0, prompt: u64 = 0 };
+var calls: Calls = .{};
+
+/// The counts since the last call, and a fresh count.
+pub fn takeCalls() Calls {
+    defer calls = .{};
+    return calls;
+}
+
+/// Whether a call reads a rope-once cache in place: a serial verify (whatever its `is_prefill`: the trunk marks every
+/// multi-row call a prefill) or a one-row call. Every other call is a prompt call and attends over the dense rebuild.
+pub fn readsInPlace(serial_rows: bool, seq_len: c_int) bool {
+    return serial_rows or seq_len == 1;
+}
+
 pub fn mlaAttn(
     self: *const trunk.Model,
     sl: Slots,
@@ -23,6 +40,7 @@ pub fn mlaAttn(
     batch: c_int,
     seq_len: c_int,
     is_prefill: bool,
+    rope1: bool,
 ) !mlx.mlx_array {
     const cfg = self.c;
     const h_count: c_int = @intCast(cfg.num_attention_heads);
@@ -120,7 +138,6 @@ pub fn mlaAttn(
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_concatenate_axis(&queries, vec, -1, self.s));
     }
-    const rope1 = self.mlaRopeOnce();
     var kv_view = if (rope1)
         try appendRope1(self, sl, layer, kv_heads, k_rot, batch, seq_len, h_count, nope, rope_d, v_dim)
     else
@@ -138,8 +155,11 @@ pub fn mlaAttn(
     const sel_mode: [*:0]const u8 = if (is_prefill) "causal" else "";
     // A decode step or a serial verify reads the rope-once rows in place, each row the dense call's words; anything
     // else attends over the dense keys and values built from them.
-    const in_place = rope1 and !is_prefill and (seq_len == 1 or self.serial_rows) and
-        try sdpa_rows.attendRope1(&attn_out, queries, kv_view.k, kv_view.v, nope, attn_scale, seq_len, self.s);
+    const try_in_place = rope1 and readsInPlace(self.serial_rows, seq_len);
+    const in_place = try_in_place and try sdpa_rows.attendRope1(&attn_out, queries, kv_view.k, kv_view.v, nope, attn_scale, seq_len, self.s);
+    if (rope1) {
+        if (in_place) calls.in_place += 1 else if (try_in_place) calls.declined += 1 else calls.prompt += 1;
+    }
     if (!in_place) {
         var dk: mlx.mlx_array = .{ .ctx = null };
         defer if (dk.ctx != null) {
@@ -266,4 +286,11 @@ fn appendRope1(self: *const trunk.Model, sl: Slots, layer: u32, kv_heads: mlx.ml
         log.info("[bailing_hybrid] rope-once KV engaged: {d} heads, key row {d} + {d}, value row {d}\n", .{ h_count, h_count * nope, rope_d, h_count * v_dim });
     }
     return sl.append(0, layer, keys, values, self.s);
+}
+
+// Bar: a serial verify (whatever its `is_prefill`) and a one-row call read rope-once rows in place; a prompt call does not.
+test "bailing_hybrid mla: a serial verify and a one-row call read rope-once rows in place; a prompt call does not" {
+    const testing = @import("std").testing;
+    try testing.expect(readsInPlace(true, 4) and readsInPlace(true, 16) and readsInPlace(false, 1));
+    try testing.expect(!readsInPlace(false, 2) and !readsInPlace(false, 1536));
 }

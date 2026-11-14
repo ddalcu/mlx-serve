@@ -82,7 +82,7 @@ fn mixer(m: *trunk.Model, sl: slots_mod.Slots, lw: *const trunk.Layer, li: u32, 
     const is_prefill = seq_len > 1;
     return switch (lw.mixer) {
         .kda => |*la| slots_mod.kda(m, sl, 0, x, la, li, batch, seq_len, is_prefill, capture),
-        .mla => |*w| mla.mlaAttn(m, sl, x, w, li, offset, batch, seq_len, is_prefill),
+        .mla => |*w| mla.mlaAttn(m, sl, x, w, li, offset, batch, seq_len, is_prefill, m.mlaRopeOnce()),
         .dsa => error.LingLayerIsDsa,
     };
 }

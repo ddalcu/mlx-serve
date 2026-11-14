@@ -23,6 +23,7 @@ const trunk = @import("trunk.zig");
 const checkpoint = @import("../../engines/mlx/ssm/checkpoint.zig");
 const ssmRestore = @import("../../engines/mlx/ssm/entry.zig").ssmRestore;
 const ling = @import("../bailing_hybrid/plugin.zig");
+const ling_mla = @import("../bailing_hybrid/mla.zig");
 const tape_compact_over = @import("proof_test.zig").tape_compact_over;
 const kda_rows = @import("../../sdk/blocks/kda/verify_rows.zig");
 
@@ -466,6 +467,39 @@ test "bailing_hybrid served: a streaming pack's rope-once MLA cache is the per-h
                 try lingGreedy(b, depth, &got, true);
                 try testing.expectEqualSlices(u32, &want, &got);
             }
+        }
+    }.run);
+}
+
+// Bar: on a rope-once cache a prompt call rebuilds the dense keys, while a decode step and a serial verify go to the
+// in-place read (the fixture's 64 | 64 heads, value 64, are declined there, so they count as declined); the MTP head's
+// cache never counts. One MLA layer, so one call a forward.
+test "bailing_hybrid served: a rope-once cache's decode step and serial verify read in place; only a prompt call rebuilds" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            var g = ops.Graph.init(testing.allocator, b.xfm.s);
+            defer g.deinit();
+            var s: both.Slot = undefined;
+            try s.init(b, &b.xfm);
+            defer s.deinit();
+            _ = ling_mla.takeCalls();
+            _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try proof_fixture.tokens(&g, &.{ 3, 17, 42, 99, 7, 250 })));
+            var c = ling_mla.takeCalls();
+            try testing.expectEqual(@as(u64, 1), c.prompt);
+            try testing.expectEqual(@as(u64, 0), c.in_place + c.declined);
+            _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try proof_fixture.tokens(&g, &.{5})));
+            c = ling_mla.takeCalls();
+            try testing.expectEqual(@as(u64, 1), c.in_place + c.declined);
+            try testing.expectEqual(@as(u64, 0), c.prompt);
+            s.ctx.spec_verify = true;
+            s.ctx.capture_ssm_seq = true;
+            _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try proof_fixture.tokens(&g, &.{ 9, 33, 77, 140 })));
+            s.ctx.spec_verify = false;
+            s.ctx.capture_ssm_seq = false;
+            c = ling_mla.takeCalls();
+            try testing.expectEqual(@as(u64, 1), c.in_place + c.declined);
+            try testing.expectEqual(@as(u64, 0), c.prompt);
         }
     }.run);
 }

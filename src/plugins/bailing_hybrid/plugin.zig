@@ -15,6 +15,7 @@ const run = @import("../../sdk/bases/run.zig");
 const fwd = @import("table_forward.zig");
 const prompt = @import("prompt.zig");
 const head = @import("head.zig");
+const mla = @import("mla.zig");
 const fixture = @import("../glm5_next/fixture.zig");
 pub const config = @import("config.zig");
 
@@ -32,8 +33,20 @@ pub const table = abi.ModelTable{
     .cache = &.{ .layout = &layout },
     .weights = &.{ .resident_bytes = &residentBytes },
     .spec = &.{ .trunk_weight = &host.trunkWeight, .head = &head.hooks },
-    .meters = &host.meters,
+    .meters = &meters,
 };
+
+var meter_buf: [1024]u8 = undefined;
+
+/// The request's summary lines: the bank's (`host.meters`), then a rope-once cache's attention calls since the last
+/// summary (`mla.takeCalls`): in place, declined by the kernels, and prompt calls.
+fn meters(mp: *anyopaque, slot: u32, out: *abi.Str) callconv(.c) void {
+    host.meters(mp, slot, out);
+    if (!host.of(mp).mlaRopeOnce()) return;
+    const c = mla.takeCalls();
+    const bank = out.slice();
+    out.* = abi.Str.of(std.fmt.bufPrint(&meter_buf, "{s}{s}[bailing_hybrid] rope-once calls: {d} in place, {d} declined (dense rebuild), {d} prompt", .{ bank, if (bank.len > 0) "\n" else "", c.in_place, c.declined, c.prompt }) catch return);
+}
 
 /// KDA layers keep a recurrent state; an MLA layer caches every head's expanded key (nope | rope) and value.
 pub fn layout(p: *const abi.Parsed, span: ?*const abi.LayerSpan, out: [*]abi.LayerCache, cap: u32) callconv(.c) u32 {
@@ -107,11 +120,11 @@ pub fn passBytes(p: *const abi.Parsed, seq: u64, chunk: u32) u64 {
 
 fn chunkBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8) u64 {
     const c = config.of(p);
-    const mla = c.mla_kv_lora_rank > 0;
+    const is_mla = c.mla_kv_lora_rank > 0;
     const qk: u64 = @as(u64, c.mla_qk_nope_head_dim) + c.mla_qk_rope_head_dim;
     const attn: u64 = c.attnLayerCount();
     // ModelConfig.kvBytesPerToken: MLA its cache rows (`kvPerToken`), other attention its KV heads.
-    const kv_per_tok: u64 = if (mla) kvPerToken(c) else attn * c.num_key_value_heads * 2 * c.head_dim * 2;
+    const kv_per_tok: u64 = if (is_mla) kvPerToken(c) else attn * c.num_key_value_heads * 2 * c.head_dim * 2;
     // bills.prefillFfnWidth.
     const moe_w: u64 = @as(u64, c.moe_intermediate_size) * @max(@as(u64, c.num_experts_per_tok), 1) + c.shared_expert_intermediate_size;
     const dense_w: u64 = if (c.intermediate_size_declared) c.intermediate_size else 0;
@@ -126,7 +139,7 @@ fn chunkBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8) u64 {
         stream += cadence * @max(@as(u64, c.num_experts_per_tok), 1) * 2 * (@as(u64, c.hidden_size) + c.moe_intermediate_size) * 2;
     // bills.prefillDequantWeightBytes.
     const dq: u64 = if (c.quant_bits == 0 or c.quant_mode != .affine or !dq_gemm.prefillDqGemmEnabled()) 0 else 3 * ffn * c.hidden_size * 2;
-    return sdk_bill.prefillMemoryNeeded(seq, c.num_attention_heads, c.num_key_value_heads, kv_per_tok, c.head_dim, if (mla) qk else c.head_dim, c.hidden_size, ffn, kv_bits, chunk, seq, stream, dq, .{ .dq_min_rows = dq_gemm.prefillDqGemmMinRows(c.quant_bits) });
+    return sdk_bill.prefillMemoryNeeded(seq, c.num_attention_heads, c.num_key_value_heads, kv_per_tok, c.head_dim, if (is_mla) qk else c.head_dim, c.hidden_size, ffn, kv_bits, chunk, seq, stream, dq, .{ .dq_min_rows = dq_gemm.prefillDqGemmMinRows(c.quant_bits) });
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
