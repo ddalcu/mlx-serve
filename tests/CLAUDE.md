@@ -119,6 +119,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_load_failure_no_fallback.sh` a broken pack never falls back · `test_load_model_api.sh`, `test_load_model_default.sh` /v1/load-model
 - `test_model_alias.sh` Model Settings alias · `test_model_settings.sh` per-model settings · `test_model_settings_symlink.sh` settings through a symlinked folder · `test_model_discovery.sh` discovery
 - `test_model_rescan.sh` **H** rescan · `test_multi_model_dir.sh` **H** repeatable --model-dir
+- `test_gguf_startup_catalog.sh` **E** a `--model x.gguf` boot lists and rescans every discovered model
 - `test_multi_model_{basic,concurrent,lru,load_failure,eviction_with_active_request}.sh` multi-model routing and eviction
 
 **KV and prefix cache**

@@ -40,7 +40,6 @@ const cpu_state_mod = @import("host/registry/cpu_state.zig");
 const ds4_load = @import("engines/ds4/load.zig");
 const llama_load = @import("engines/llama/load.zig");
 const llama_policy = @import("engines/llama/policy.zig");
-const llama_adapter = @import("engines/llama/engine.zig");
 const gen_mod = @import("host/media_jobs/gen.zig");
 const cli_mod = @import("host/cli/cli.zig");
 
@@ -1404,10 +1403,26 @@ pub fn main(init: std.process.Init) !void {
     const mlx_gguf_path = if (gguf_setting == null) mlx_gguf.servablePath(io, allocator, model_dir) else null;
     defer if (mlx_gguf_path) |p| allocator.free(p);
     if (mlx_gguf_path != null) log.info("[gguf] engine: mlx (src/sdk/quant/gguf)\n", .{});
+    // Every text-gen serve path takes the PLD defaults from this ONE value —
+    // see `server.PldDefaults`. Built after arg parsing so it can't capture a
+    // pre-flag default, and passed whole so a path can't honor `--pld` while
+    // dropping the two lengths next to it (which is precisely what headless
+    // mode did).
+    const cli_pld = server_mod.PldDefaults.fromCli(enable_pld, pld_draft_len, pld_key_len);
+    const spec_flags: SpecLoadFlags = .{
+        .no_drafter = no_drafter,
+        .mtp_enabled = enable_mtp,
+        .mtp_depth = engine_flags.mtp_depth_max,
+        .draft_block_size = draft_block_size,
+        .draft_block_size_explicit = draft_block_size_explicit,
+    };
+
     if (mlx_gguf_path == null and isGgufPath(io, model_dir)) {
         const chosen = engines_served.ggufEngine(io, allocator, model_dir, gguf_setting orelse engine_override);
         if (serve_mode) {
-            try runGgufServe(io, allocator, model_dir, chosen, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            const discovery_for_registry = discovery_storage;
+            discovery_storage = null; // ownership moves to the registry
+            try runGgufServe(io, allocator, model_dir, chosen, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld, spec_flags);
             return;
         }
         // Offline mode only runs with --prompt.
@@ -1420,13 +1435,6 @@ pub fn main(init: std.process.Init) !void {
     defer _ = mlx.mlx_string_free(ver);
     try mlx.check(mlx.mlx_version(&ver));
     log.info("mlx-serve {s} (MLX {s})\n", .{ VERSION, mlx.mlx_string_data(ver) });
-
-    // Every text-gen serve path takes the PLD defaults from this ONE value —
-    // see `server.PldDefaults`. Built after arg parsing so it can't capture a
-    // pre-flag default, and passed whole so a path can't honor `--pld` while
-    // dropping the two lengths next to it (which is precisely what headless
-    // mode did).
-    const cli_pld = server_mod.PldDefaults.fromCli(enable_pld, pld_draft_len, pld_key_len);
 
     // Echo the resolved arguments — makes drafter/target mismatches obvious
     // from the log without having to scroll through the whole launch line in
@@ -1497,13 +1505,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld, .{
-                .no_drafter = no_drafter,
-                .mtp_enabled = enable_mtp,
-                .mtp_depth = engine_flags.mtp_depth_max,
-                .draft_block_size = draft_block_size,
-                .draft_block_size_explicit = draft_block_size_explicit,
-            });
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld, spec_flags);
             return;
         }
 
@@ -1515,7 +1517,7 @@ pub fn main(init: std.process.Init) !void {
         if (gen_mod.detectModality(io, allocator, model_dir)) |modality| {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld, spec_flags);
             return;
         }
     }
@@ -1659,7 +1661,7 @@ pub fn main(init: std.process.Init) !void {
             chat_config_owned_by_registry = true;
         };
 
-        const params = LoadParams{
+        const params = withLaunchFlags(.{
             .registry = registry,
             .entry = entry,
             .config = config,
@@ -1668,34 +1670,10 @@ pub fn main(init: std.process.Init) !void {
             .model_dir = model_dir,
             .ctx_size = ctx_size,
             .drafter_dir = drafter_dir orelse "",
-            .no_drafter = no_drafter,
-            .mtp_enabled = enable_mtp,
-            .mtp_head_kv_quant = mtp_head_kv_quant,
-            .mtp_depth = engine_flags.mtp_depth_max,
-            .ane_prefill = ane_prefill,
-            .ane = ane_serve,
-            .ane_slots = ane_slots,
-            .ane_resolvers = true,
             .load_vision = load_vision,
             .warmup_eager = warmup_eager,
-            .launch_warmup_eager = warmup_eager,
-            .warmup_full = warmup_full,
-            .draft_block_size = draft_block_size,
-            .draft_block_size_explicit = draft_block_size_explicit,
-            .kv_quant_config = kv_quant_config,
-            .prefix_cache_capacity = server_mod.launch().prefix_cache_capacity,
-            .prefix_cache_ram_enabled = server_mod.launch().prefix_cache_ram_enabled,
-            .prefix_cache_mem_bytes = server_mod.launch().prefix_cache_mem_bytes,
-            .prefix_cache_clamp = true,
-            .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
-            .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.launch().ssm_checkpoint_stride, server_mod.launch().prefix_cache_capacity, server_mod.launch().prefix_cache_ram_enabled, server_mod.launch().prefix_cache_disk_bytes),
-            .ssm_checkpoint_max = server_mod.launch().ssm_checkpoint_max,
-            .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama = server_mod.llama_settings,
-            .ds4_mtp = ds4_mtp,
-            .ds4_dspark = ds4_dspark,
-            .metrics = server_mod.g_metrics,
-        };
+        }, spec_flags, kv_quant_config);
         try server_mod.serve(io, allocator, params, config, host, port, .{
             .max_context_size = ctx_size,
             .request_timeout_sec = timeout,
@@ -1780,6 +1758,9 @@ fn runGenServe(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
+    kv_quant_config: KVQuantConfig,
+    pld: server_mod.PldDefaults,
+    spec: SpecLoadFlags,
 ) !void {
     log.info("mlx-serve {s} (native {s} engine)\n", .{ VERSION, @tagName(modality) });
     log.info("[args] model: {s}\n", .{model_dir});
@@ -1820,7 +1801,7 @@ fn runGenServe(
         config_owned_by_registry = true;
     };
 
-    const params = LoadParams{
+    const params = withLaunchFlags(.{
         .registry = registry,
         .entry = entry,
         .config = stub.config,
@@ -1830,22 +1811,7 @@ fn runGenServe(
         .ctx_size = ctx_size,
         .load_vision = false,
         .warmup_eager = false,
-        .launch_warmup_eager = warmup_eager,
-        .warmup_full = warmup_full,
-        .draft_block_size = 0,
-        .draft_block_size_explicit = false,
-        .kv_quant_config = KVQuantConfig.dense,
-        .prefix_cache_capacity = 0,
-        .prefix_cache_mem_bytes = 0,
-        .tokenize_cache_entries = 0,
-        .ds4_mtp = ds4_mtp,
-        .ds4_dspark = ds4_dspark,
-        .ane_prefill = ane_prefill,
-        .ane = ane_serve,
-        .ane_slots = ane_slots,
-        .ane_resolvers = true,
-        .metrics = server_mod.g_metrics,
-    };
+    }, spec, kv_quant_config);
 
     try server_mod.serve(io, allocator, params, stub.config, host, port, .{
         .max_context_size = ctx_size,
@@ -1855,18 +1821,15 @@ fn runGenServe(
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
-        // PLD is unreachable on this path (decode never routes through the
-        // PLD-capable generator), so say so once instead of three literals
-        // that read like a decision but drift like a typo.
-        .default_enable_pld = server_mod.PldDefaults.off.enable,
-        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
-        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
+        .default_enable_pld = pld.enable,
+        .default_pld_draft_len = pld.draft_len,
+        .default_pld_key_len = pld.key_len,
         .kv_attn_mode = .auto,
     });
 }
 
-/// Launch flags that shape every on-demand load. Headless takes them as one
-/// value so its LoadParams cannot leave any of them at a struct default.
+/// Launch flags that shape every on-demand load, taken as one value (`withLaunchFlags`) so no boot's LoadParams can
+/// leave one at a struct default.
 const SpecLoadFlags = struct {
     no_drafter: bool,
     mtp_enabled: bool,
@@ -1874,6 +1837,38 @@ const SpecLoadFlags = struct {
     draft_block_size: u32,
     draft_block_size_explicit: bool,
 };
+
+/// `base` with the launch flags every boot hands its loads: the boot model's and every model loaded beside it on
+/// demand. One place, so no boot can serve its siblings without one.
+fn withLaunchFlags(base: LoadParams, spec: SpecLoadFlags, kv: KVQuantConfig) LoadParams {
+    var p = base;
+    const l = server_mod.launch();
+    p.no_drafter = spec.no_drafter;
+    p.mtp_enabled = spec.mtp_enabled;
+    p.mtp_depth = spec.mtp_depth;
+    p.draft_block_size = spec.draft_block_size;
+    p.draft_block_size_explicit = spec.draft_block_size_explicit;
+    p.kv_quant_config = kv;
+    p.mtp_head_kv_quant = mlx_engine.settings().mtp_head_kv_quant;
+    p.prefix_cache_capacity = l.prefix_cache_capacity;
+    p.prefix_cache_ram_enabled = l.prefix_cache_ram_enabled;
+    p.prefix_cache_mem_bytes = l.prefix_cache_mem_bytes;
+    p.prefix_cache_clamp = true;
+    p.prefix_cache_disk_bytes = l.prefix_cache_disk_bytes;
+    p.ssm_checkpoint_stride = effectiveSsmCheckpointStride(l.ssm_checkpoint_stride, l.prefix_cache_capacity, l.prefix_cache_ram_enabled, l.prefix_cache_disk_bytes);
+    p.ssm_checkpoint_max = l.ssm_checkpoint_max;
+    p.tokenize_cache_entries = server_mod.tokenize_cache_entries;
+    p.launch_warmup_eager = warmup_eager;
+    p.warmup_full = warmup_full;
+    p.ane_prefill = ane_prefill;
+    p.ane = ane_serve;
+    p.ane_slots = ane_slots;
+    p.ane_resolvers = true;
+    p.ds4_mtp = ds4_mtp;
+    p.ds4_dspark = ds4_dspark;
+    p.metrics = server_mod.g_metrics;
+    return p;
+}
 
 /// Headless serve mode: start with NO primary model. The registry holds all
 /// discovery stubs; chat AND media models load on demand via `/v1/load-model`
@@ -1949,7 +1944,7 @@ fn runHeadlessServe(
         break :blk &placeholder;
     };
 
-    const params = LoadParams{
+    const params = withLaunchFlags(.{
         .registry = registry,
         .entry = carrier,
         .config = stub.config,
@@ -1960,42 +1955,7 @@ fn runHeadlessServe(
         .no_initial_load = true,
         .load_vision = false,
         .warmup_eager = false,
-        .launch_warmup_eager = warmup_eager,
-        .warmup_full = warmup_full,
-        .no_drafter = spec.no_drafter,
-        .mtp_enabled = spec.mtp_enabled,
-        .mtp_depth = spec.mtp_depth,
-        .draft_block_size = spec.draft_block_size,
-        .draft_block_size_explicit = spec.draft_block_size_explicit,
-        .kv_quant_config = kv_quant_config,
-        .mtp_head_kv_quant = mlx_engine.settings().mtp_head_kv_quant,
-        // Seed the scheduler's prefix-cache config from the server globals so
-        // on-demand (headless/discover-mode) loads get the SAME hot prefix
-        // cache as a `--model` startup load. Previously hardcoded to 0, which
-        // left `Scheduler.prefix_cache_capacity == 0` → every model loaded via
-        // `ensureLoaded` skipped `HotPrefixCache` init → cross-turn KV reuse
-        // was silently dead for the entire headless serving mode (the default
-        // `serve` path). Mirrors the LoadParams built in `main()`.
-        .prefix_cache_capacity = server_mod.launch().prefix_cache_capacity,
-        .prefix_cache_ram_enabled = server_mod.launch().prefix_cache_ram_enabled,
-        .prefix_cache_mem_bytes = server_mod.launch().prefix_cache_mem_bytes,
-        .prefix_cache_clamp = true,
-        .prefix_cache_disk_bytes = server_mod.launch().prefix_cache_disk_bytes,
-        .ssm_checkpoint_stride = effectiveSsmCheckpointStride(server_mod.launch().ssm_checkpoint_stride, server_mod.launch().prefix_cache_capacity, server_mod.launch().prefix_cache_ram_enabled, server_mod.launch().prefix_cache_disk_bytes),
-        .ssm_checkpoint_max = server_mod.launch().ssm_checkpoint_max,
-        .tokenize_cache_entries = server_mod.tokenize_cache_entries,
-        // ds4 spec flags must survive headless/on-demand GGUF loads (the
-        // runHeadlessServe flag-eater class): the app always boots headless
-        // and cold-loads GGUFs, so a LoadParams default here silently eats
-        // --no-ds4-mtp / --dspark for every embedded-engine load.
-        .ds4_mtp = ds4_mtp,
-        .ds4_dspark = ds4_dspark,
-        .ane_prefill = ane_prefill,
-        .ane = ane_serve,
-        .ane_slots = ane_slots,
-        .ane_resolvers = true,
-        .metrics = server_mod.g_metrics,
-    };
+    }, spec, kv_quant_config);
 
     try server_mod.serve(io, allocator, params, stub.config, host, port, .{
         .max_context_size = ctx_size,
@@ -2036,6 +1996,7 @@ fn runGgufServe(
     allocator: std.mem.Allocator,
     model_dir: []const u8,
     engine: gguf_meta.Engine,
+    discovery: ?model_discovery.DiscoveryResult,
     host: []const u8,
     port: u16,
     ctx_size: u32,
@@ -2048,6 +2009,9 @@ fn runGgufServe(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
+    kv_quant_config: KVQuantConfig,
+    pld: server_mod.PldDefaults,
+    spec: SpecLoadFlags,
 ) !void {
     var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
     defer settings.deinit(allocator);
@@ -2072,7 +2036,8 @@ fn runGgufServe(
         break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
     };
 
-    const effective_max_resident_mem: u64 = if (max_resident_mem_explicit) max_resident_mem else 0;
+    // Discovered siblings load beside the GGUF, so they share the gate every other boot uses.
+    const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
     if (effective_max_resident_mem > 0) {
         log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
             max_resident_models,
@@ -2082,13 +2047,13 @@ fn runGgufServe(
         log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
     }
 
-    const registry = try model_registry_mod.ModelRegistry.init(allocator, io, null, max_resident_models, effective_max_resident_mem, idle_evict_secs);
+    const registry = try model_registry_mod.ModelRegistry.init(allocator, io, discovery, max_resident_models, effective_max_resident_mem, idle_evict_secs);
     defer registry.deinit();
 
     // The GGUF's size: /v1/models, /props and the eviction gate read it.
     const gguf_bytes: ?u64 = if (std.Io.Dir.cwd().statFile(io, gguf_path, .{})) |st| st.size else |_| null;
-    const entry = try registry.registerStub(model_id, gguf_path, gguf_bytes);
-    try registry.setDefault(model_id);
+    const entry = try registry.entryForFile(model_id, gguf_path, gguf_bytes);
+    try registry.setDefault(entry.id);
 
     // Once the inference thread hands the stub to the entry, the entry's deinit owns it.
     defer if (entry.config != null) {
@@ -2098,7 +2063,7 @@ fn runGgufServe(
     // ds4's process-wide flock makes >1 in-flight session per process untested; clamp serial.
     if (engine == .ds4) server_mod.max_concurrent = 1;
 
-    const params = LoadParams{
+    const params = withLaunchFlags(.{
         .registry = registry,
         .entry = entry,
         .config = stub.config,
@@ -2109,34 +2074,23 @@ fn runGgufServe(
         .drafter_dir = "",
         .load_vision = false,
         .warmup_eager = false,
-        .launch_warmup_eager = warmup_eager,
-        .warmup_full = warmup_full,
-        .draft_block_size = 0,
-        .draft_block_size_explicit = false,
-        .kv_quant_config = KVQuantConfig.dense,
-        .prefix_cache_capacity = 0,
-        .prefix_cache_mem_bytes = 0,
-        .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .llama = server_mod.llama_settings,
         .gguf = .{ .path = gguf_path, .engine = engine },
         .ds4_ssd_streaming = ds4_ssd_streaming,
-        .ds4_mtp = ds4_mtp,
-        .ds4_dspark = ds4_dspark,
-        .metrics = server_mod.g_metrics,
-    };
+    }, spec, kv_quant_config);
 
     try server_mod.serve(io, allocator, params, stub.config, host, port, .{
-        .max_context_size = if (engine == .ds4 or ctx_size > 0) ctx_size else llama_adapter.default_context,
+        // Process-wide, so siblings read it too; with none set llama.cpp opens at its own default.
+        .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
         .default_max_tokens = serve_default_max_tokens,
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
-        // PLD never runs on an engine beside MLX.
-        .default_enable_pld = server_mod.PldDefaults.off.enable,
-        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
-        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
+        .default_enable_pld = pld.enable,
+        .default_pld_draft_len = pld.draft_len,
+        .default_pld_key_len = pld.key_len,
         .kv_attn_mode = .auto,
     });
 }

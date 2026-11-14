@@ -713,6 +713,16 @@ pub const ModelRegistry = struct {
         return stub;
     }
 
+    /// The entry a `--model` GGUF file boots as: the discovered entry that serves it (its folder, when the folder picks
+    /// this file), else a new stub under `id`, or under the file's own name when `id` is another path's.
+    pub fn entryForFile(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64) !*LoadedModel {
+        if (self.peekByPath(path)) |e| return e;
+        return self.registerStub(id, path, bytes_on_disk) catch |err| switch (err) {
+            error.DuplicateId => self.registerStub(std.fs.path.basename(path), path, bytes_on_disk),
+            else => err,
+        };
+    }
+
     /// Register-by-path (/v1/load-model with an absolute path): validate
     /// `abs_path` exactly like discovery would (config.json, supported
     /// model_type + quant mode) and insert an `.unloaded` stub keyed by the
@@ -2506,6 +2516,43 @@ test "ModelRegistry: rescan clears a failed load so the completed dir can load a
     const fine = reg.peek("org/fine") orelse return error.TestExpectedResult;
     try testing.expectEqual(LoadState.unloaded, fine.state);
     try testing.expectEqual(@as(?u64, 4), fine.bytes_on_disk);
+}
+
+test "ModelRegistry: a GGUF --model file joins the discovered catalog without a second row" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "org/pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/pack/a.gguf", .data = "GGUF" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/pack/b.gguf", .data = "GGUF" });
+    try tmp.dir.createDirPath(io, "org/sibling");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/sibling/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/sibling/model.safetensors", .data = "0123" });
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/model.safetensors", .data = "0123" });
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{root});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    const listed = reg.entries.count();
+
+    // The file its folder serves is that folder's entry.
+    const picked = try std.fs.path.join(testing.allocator, &.{ root, "org", "pack", "a.gguf" });
+    defer testing.allocator.free(picked);
+    try testing.expectEqualStrings("org/pack", (try reg.entryForFile("a", picked, 4)).id);
+    try testing.expectEqual(listed, reg.entries.count());
+    try testing.expect(reg.peek("org/sibling") != null);
+
+    // Another quant is a model of its own; its stem is taken by the dir `b`, so it keeps its file name.
+    const other = try std.fs.path.join(testing.allocator, &.{ root, "org", "pack", "b.gguf" });
+    defer testing.allocator.free(other);
+    const e = try reg.entryForFile("b", other, 4);
+    try testing.expectEqualStrings("b.gguf", e.id);
+    try testing.expectEqualStrings(other, e.path);
+    try testing.expectEqual(listed + 1, reg.entries.count());
 }
 
 test "ModelRegistry: registerByPath registers under the caller's org/name id" {
