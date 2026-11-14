@@ -296,7 +296,7 @@ pub fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
 }
 
 pub const gpu_context_lost_message =
-    "The GPU context was lost (a CUDA kernel faulted) and every GPU call now fails. Restart the server; the server log names the first error.";
+    "The GPU context was lost (a CUDA kernel faulted, or Metal stopped taking this process's work after GPU errors) and every GPU call now fails. Restart the server; the server log names the first error.";
 
 pub const gpu_timeout_load_message =
     "The GPU timed out while loading the model, as it can while macOS makes room in memory. Retry the request; the next one loads it again.";
