@@ -12,7 +12,10 @@ pub fn base(raw: ?[]const u8) error{InvalidHfEndpoint}![]const u8 {
     if (v.len == 0) return default_hub;
     const trimmed = std.mem.trimEnd(u8, v, "/");
     for ([_][]const u8{ "https://", "http://" }) |scheme| {
-        if (std.ascii.startsWithIgnoreCase(trimmed, scheme) and trimmed.len > scheme.len) return trimmed;
+        if (!std.ascii.startsWithIgnoreCase(trimmed, scheme)) continue;
+        const rest = trimmed[scheme.len..];
+        // A host before any port, path, query or fragment.
+        if ((std.mem.indexOfAny(u8, rest, ":/?#") orelse rest.len) > 0) return trimmed;
     }
     return error.InvalidHfEndpoint;
 }
@@ -31,4 +34,6 @@ test "hf_hub.base: HF_ENDPOINT picks the hub, unset or blank is huggingface.co, 
     try testing.expectError(error.InvalidHfEndpoint, base("hf-mirror.com"));
     try testing.expectError(error.InvalidHfEndpoint, base("https://"));
     try testing.expectError(error.InvalidHfEndpoint, base("ftp://hf-mirror.com"));
+    try testing.expectError(error.InvalidHfEndpoint, base("https:///hub"));
+    try testing.expectError(error.InvalidHfEndpoint, base("http://:8080"));
 }

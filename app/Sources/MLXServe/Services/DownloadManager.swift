@@ -2534,10 +2534,22 @@ class DownloadManager: ObservableObject {
         while raw.hasSuffix("/") { raw.removeLast() }
         guard let url = URL(string: raw), let scheme = url.scheme?.lowercased(),
               scheme == "https" || scheme == "http", url.host?.isEmpty == false else {
-            NSLog("HF_ENDPOINT %@ is not an http(s) URL; using %@", raw, fallback)
+            if firstWarning(forEndpoint: raw) { NSLog("HF_ENDPOINT %@ is not an http(s) URL; using %@", raw, fallback) }
             return fallback
         }
         return raw
+    }
+
+    private static let endpointWarningLock = NSLock()
+    nonisolated(unsafe) private static var warnedEndpoint: String?
+
+    /// True the first time a given bad `HF_ENDPOINT` is seen: `hfEndpoint` runs for every URL a download builds.
+    nonisolated static func firstWarning(forEndpoint raw: String) -> Bool {
+        endpointWarningLock.withLock {
+            guard warnedEndpoint != raw else { return false }
+            warnedEndpoint = raw
+            return true
+        }
     }
 
     // MARK: - Hugging Face auth

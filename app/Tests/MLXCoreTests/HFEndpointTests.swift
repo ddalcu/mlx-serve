@@ -18,7 +18,7 @@ final class HFEndpointTests: XCTestCase {
     }
 
     func testAValueThatIsNotAnHttpURLFallsBackToHuggingFace() {
-        for bad in ["hf-mirror.com", "https://", "ftp://hf-mirror.com"] {
+        for bad in ["hf-mirror.com", "https://", "ftp://hf-mirror.com", "https:///hub", "http://:8080"] {
             XCTAssertEqual(DownloadManager.hfEndpoint(environment: ["HF_ENDPOINT": bad]), "https://huggingface.co", bad)
         }
     }
@@ -54,5 +54,13 @@ final class HFEndpointTests: XCTestCase {
         XCTAssertNil(env["HF_HOME"], "only the download settings are handed on")
         let own = ServerManager.launchEnvironment(process: ["HF_ENDPOINT": "https://other.test"], hub: shell)
         XCTAssertEqual(own["HF_ENDPOINT"], "https://other.test")
+    }
+
+    /// A bad value is named once, not once per URL a download builds.
+    func testABadEndpointIsReportedOncePerValue() {
+        let value = "bad-endpoint-\(UUID().uuidString)"
+        XCTAssertTrue(DownloadManager.firstWarning(forEndpoint: value))
+        XCTAssertFalse(DownloadManager.firstWarning(forEndpoint: value))
+        XCTAssertTrue(DownloadManager.firstWarning(forEndpoint: value + "-other"))
     }
 }
