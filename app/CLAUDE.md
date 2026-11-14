@@ -260,6 +260,8 @@ Agent loop: tools → parse → exec → feed back; history builder is budget-aw
 
 ## Debugging
 
+- Tool results admitted by `buildAgentHistory` keep their full stored payload; the backward walk already budgets it. MCP envelopes use their own bounded store cap. Guards: `ToolResultHistoryTests`, `tests/test_agent_result_history.py`.
+
 - `print()` is invisible when launched via `open` — run the binary directly or write to file.
 - Every agent request → `~/.mlx-serve/last-agent-request.json` (replay via curl); history `~/.mlx-serve/mlx-serve.db` (`sqlite3`; a message is JSON in `chat_messages.body`, `json_extract(body, '$.content')`; the sidebar is `sidebar_groups`, `terminal_sessions` and each row's `group_id`/`position`); server stderr tail in the menu-bar log viewer (`ThrottledLogBuffer`, 1 MB; full history in `~/.mlx-serve/logs/`).
 - Headless agent-loop driving: TestServer on :8090 (`TESTING_MODE=1`, `/test/agent` + poll `/test/history`).

@@ -47,8 +47,28 @@ final class ToolResultHistoryTests: XCTestCase {
         XCTAssertTrue(open.isEmpty, "calls \(open) have no result")
     }
 
-    func testAnAnsweredResultIsStillCompacted() {
+    func testAnAnsweredResultWithinTheHistoryBudgetStaysComplete() {
         let msgs = [ChatMessage(role: .user, content: "read it"), call("a"), result("a", 7000), call("b"), result("b", 300)]
-        XCTAssertEqual(toolResultLengths(msgs), [2000, 300])
+        XCTAssertEqual(toolResultLengths(msgs), [7000, 300])
+    }
+
+    func testMCPTaskBodySurvivesStorageAndLaterToolRounds() throws {
+        let id = "test-mcp-history-\(UUID().uuidString)"
+        let overflow = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent(".mlx-serve/tool-output/\(id).txt")
+        defer { try? FileManager.default.removeItem(at: overflow) }
+        let body = "Build the welcome section with the existing components."
+        let output = "{\"metadata\":\"" + String(repeating: "x", count: 5000)
+            + "\",\"body\":\"\(body)\"}"
+        var firstCall = call(id)
+        firstCall.toolCalls = [MLXCore.SerializedToolCall(id: id, name: "github__get_issue", arguments: "{\"issue_number\":6}")]
+        var firstResult = result(id, 0)
+        firstResult.content = AgentEngine.truncateWithOverflow(output, toolCallId: id, toolName: "github__get_issue")
+        let messages = [ChatMessage(role: .user, content: "Explain the task."), firstCall, firstResult,
+                        call("next"), result("next", 300), call("last"), result("last", 300)]
+        let history = AgentEngine.buildAgentHistory(messages: messages, contextLength: 131072, maxTokens: 4096)
+        let stored = try XCTUnwrap(history.first { ($0["tool_call_id"] as? String) == id }?["content"] as? String)
+        let object = try JSONSerialization.jsonObject(with: Data(stored.utf8)) as? [String: Any]
+        XCTAssertEqual(object?["body"] as? String, body)
     }
 }
