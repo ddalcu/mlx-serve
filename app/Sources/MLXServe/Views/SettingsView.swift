@@ -1861,7 +1861,7 @@ private struct ProviderRow: View {
             if let problem {
                 Text(L10n.text(problem)).font(.app(.caption2)).foregroundStyle(.orange)
             } else if let status {
-                Text(L10n.text(statusLine(status))).font(.app(.caption2)).foregroundStyle(.secondary)
+                Text(L10n.text(status.line)).font(.app(.caption2)).foregroundStyle(.secondary)
             }
         }
         .padding(8)
@@ -1872,12 +1872,7 @@ private struct ProviderRow: View {
         Circle()
             .fill(status.map { $0.up ? Color.green : ($0.probed ? Color.red : Color.gray) } ?? Color.gray)
             .frame(width: 8, height: 8)
-            .help(status.map(statusLine) ?? "Not reported by the server yet")
-    }
-
-    private func statusLine(_ s: ProviderStatus) -> String {
-        if !s.probed { return "Checking…" }
-        return s.up ? "Up — \(s.models) model\(s.models == 1 ? "" : "s")" : "Unreachable"
+            .help(status.map(\.line) ?? "Not reported by the server yet")
     }
 }
 
