@@ -329,16 +329,25 @@ test "driver: a streamed built-in GLM's room is the ceiling less the engine's GL
     const gen = @import("../generate.zig");
     const saved = gen.prefillCli().*;
     defer gen.prefillCli().* = saved;
-    // GLM forms no score sheet (`prefillScoreHeadDim` 0): billed at the wide default, or at an explicit chunk.
-    for ([_]PrefillCliCase{ .{ .cli = .{}, .chunk = gen.WIDE_PREFILL_CHUNK }, .{ .cli = .{ .override = 16384, .explicit = true }, .chunk = 16384 }, .{ .cli = .{ .override = 4096, .explicit = true }, .chunk = 4096 } }) |c| {
-        gen.prefillCli().* = c.cli;
-        const need = @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(&cfg, 16_384 + 1_024, 1, 16, c.chunk, .{});
-        try std.testing.expect(need > 0);
-        try std.testing.expectEqual((64 << 30) - need - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
+    const saved_nax = nax_probe.vqmm_nax_probe_override;
+    defer nax_probe.vqmm_nax_probe_override = saved_nax;
+    for ([_]bool{ false, true }) |nax| {
+        nax_probe.vqmm_nax_probe_override = nax;
+        // GLM forms no score sheet (`prefillScoreHeadDim` 0): billed at the wide default, or at an explicit chunk.
+        for ([_]PrefillCliCase{ .{ .cli = .{}, .chunk = gen.WIDE_PREFILL_CHUNK }, .{ .cli = .{ .override = 16384, .explicit = true }, .chunk = 16384 }, .{ .cli = .{ .override = 4096, .explicit = true }, .chunk = 4096 } }) |c| {
+            gen.prefillCli().* = c.cli;
+            const need = @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(&cfg, 16_384 + 1_024, 1, 16, c.chunk, .{});
+            try std.testing.expect(need > 0);
+            try std.testing.expectEqual(glm_ceiling - need - (1 << 30), streamRoomAt(&cfg, glm_ceiling, 1 << 30));
+        }
     }
 }
 
 const PrefillCliCase = struct { cli: @import("../generate.zig").PrefillCli, chunk: u64 };
+/// The GLM bill reads the NAX probe: off NAX it prices the composed indexer scores and the latent gather (about 79 GB
+/// at the rooms' cell), so a GLM room test runs both arms under a ceiling above either.
+const nax_probe = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig");
+const glm_ceiling: u64 = 256 << 30;
 
 test "driver: a streamed plugin's room bills the widest chunk the engine runs: an explicit --prefill-chunk, else the default, never past the model's max" {
     const t = std.testing;
@@ -524,12 +533,17 @@ test "driver: a streamed GLM, which forms no score sheet, keeps the base chunk a
     const saved = gen.prefillCli().*;
     defer gen.prefillCli().* = saved;
     const glm = @import("../admission/glm5_bill.zig");
-    for ([_]PrefillCliCase{ .{ .cli = .{}, .chunk = gen.WIDE_PREFILL_CHUNK }, .{ .cli = .{ .override = 4096, .explicit = true }, .chunk = 4096 } }) |c| {
-        gen.prefillCli().* = c.cli;
-        for ([_]u64{ 8_192, abi.stream_room_cell, 32_767, 131_071 }) |seq| try t.expectEqual(@as(u32, @intCast(c.chunk)), promptChunkAt(&cfg, seq));
-        // the room and the growth at the base chunk, as they were billed before the per-length chunk
-        try t.expectEqual((64 << 30) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}) - (1 << 30), streamRoomAt(&cfg, 64 << 30, 1 << 30));
-        try t.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, c.chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}), streamGrowAt(&cfg, 32_768, abi.stream_room_cell).prompt);
+    const saved_nax = nax_probe.vqmm_nax_probe_override;
+    defer nax_probe.vqmm_nax_probe_override = saved_nax;
+    for ([_]bool{ false, true }) |nax| {
+        nax_probe.vqmm_nax_probe_override = nax;
+        for ([_]PrefillCliCase{ .{ .cli = .{}, .chunk = gen.WIDE_PREFILL_CHUNK }, .{ .cli = .{ .override = 4096, .explicit = true }, .chunk = 4096 } }) |c| {
+            gen.prefillCli().* = c.cli;
+            for ([_]u64{ 8_192, abi.stream_room_cell, 32_767, 131_071 }) |seq| try t.expectEqual(@as(u32, @intCast(c.chunk)), promptChunkAt(&cfg, seq));
+            // the room and the growth at the base chunk, as they were billed before the per-length chunk
+            try t.expectEqual(glm_ceiling - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}) - (1 << 30), streamRoomAt(&cfg, glm_ceiling, 1 << 30));
+            try t.expectEqual(glm.glm5PrefillMemoryNeeded(&cfg, 32_767, 1, 16, c.chunk, .{}) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, c.chunk, .{}), streamGrowAt(&cfg, 32_768, abi.stream_room_cell).prompt);
+        }
     }
 }
 
@@ -587,8 +601,13 @@ test "driver: Ling's decode room leaves GLM's rooms as they were: the built-in's
     const need = glm.glm5DecodeMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
     const coarse = @import("../runtime/preflight.zig").mtpCoarseBytes(&cfg, false);
     try t.expectEqual((64 << 30) - need - coarse - (1 << 30), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
-    const prompt_room = streamRoomAt(&cfg, 64 << 30, 1 << 30);
-    try t.expectEqual((64 << 30) - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, promptChunkAt(&cfg, abi.stream_room_cell), .{}) - coarse - (1 << 30), prompt_room);
+    const saved_nax = nax_probe.vqmm_nax_probe_override;
+    defer nax_probe.vqmm_nax_probe_override = saved_nax;
+    for ([_]bool{ false, true }) |nax| {
+        nax_probe.vqmm_nax_probe_override = nax;
+        const prompt_room = streamRoomAt(&cfg, glm_ceiling, 1 << 30);
+        try t.expectEqual(glm_ceiling - glm.glm5PrefillMemoryNeeded(&cfg, abi.stream_room_cell, 1, 16, promptChunkAt(&cfg, abi.stream_room_cell), .{}) - coarse - (1 << 30), prompt_room);
+    }
     // a GLM whose plugin prices its own prompt keeps one room (only Ling's trunk is exempt)
     table.bill = &Probe.priced;
     try t.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
