@@ -286,7 +286,7 @@ test "abi dylib: negotiation accepts its own build and refuses each mismatch by 
     // A newer plugin's larger manifest is read up to the host's size.
     m.size += 16;
     try testing.expect(negotiate(&m, pin).isOk());
-    // A table built before `swiglu_limit_out` (CommunityServe #46's) loads, the appended flag read as absent.
+    // A table built before `swiglu_limit_out` loads, the appended flag read as absent.
     var older = quantTable("fmt_x");
     older.swiglu_limit_out = true;
     older.size = quant_abi.QuantTable.min_size;

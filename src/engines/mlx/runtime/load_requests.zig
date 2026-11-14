@@ -19,6 +19,7 @@ const UnloadRequest = @import("../../../host/gpu_thread/requests.zig").UnloadReq
 const loadRamRoom = @import("preflight.zig").loadRamRoom;
 const loadRequirementBytes = @import("preflight.zig").loadRequirementBytes;
 const scheduler_mod = @import("../scheduler.zig");
+const warm_requests = @import("../warm_requests.zig");
 
 /// Plan 05 Phase D: service a cold-load work item on the inference thread.
 /// Conn thread has already:
@@ -48,6 +49,7 @@ fn evictResident(sch: *Scheduler, victims: []const *LoadedModel) void {
             @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
         moveHotCacheViewOff(sch, victim);
+        warm_requests.forget(sch, victim);
         victim.unloadResident();
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
@@ -196,6 +198,7 @@ pub fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
     });
     moveHotCacheViewOff(sch, entry);
+    warm_requests.forget(sch, entry);
     entry.unloadResident();
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
