@@ -261,7 +261,7 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
         defer aux.free(t.m, sn);
         const src: *const dsv41.Snap = @ptrCast(@alignCast(sn.?));
         v41.table.release_slot.?(t.m, 1);
-        var ends: [2][]f32 = undefined;
+        var ends: [2][]f32 = .{ &.{}, &.{} };
         defer for (ends) |e| testing.allocator.free(e);
         ends[0] = try restoredTail(t, aux, sn, &long, long[40..]);
 
@@ -295,14 +295,30 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
             const cs = &cold_model.mdl.dec_state.?;
             // Bars: the global rows and index keys are the snapshot's own, cut; the first layer's window is the cold
             // prompt's (nothing below it was truncated), and so is every layer's when the replay is the whole prefix.
-            for (ws.layers, cs.layers, src.layers, 0..) |*wl, *cl, sl, li| {
+            for (ws.layers, cs.layers, src.layers) |*wl, *cl, sl| {
                 try testing.expect(wl.pend_kv.ctx == null and wl.pend_gate.ctx == null);
                 inline for (.{ "comp", "idx_k" }) |f| if (@field(wl, f)) |rows| {
                     try testing.expectEqual(@field(cl, f).?.used, rows.used);
                     try expectRowsEqual(rows.buf, @field(sl, f).?.buf, 0, rows.used, rows.used);
                     if (n <= 24) try expectRowsEqual(rows.buf, @field(cl, f).?.buf, 0, rows.used, rows.used);
                 };
-                if (li == 0 or n == w) try expectRowsEqual(wl.win.buf, cl.win.buf, n - w, n, wl.win.cap) else try expectFinite(wl.win.buf);
+                if (n == w) try expectRowsEqual(wl.win.buf, cl.win.buf, n - w, n, wl.win.cap) else try expectFinite(wl.win.buf);
+            }
+            if (n > w) {
+                // The replay makes the first layer's window in one call of `w` rows; a row's bits can depend on its
+                // call's width, so the cold prompt it is judged against ends with that same call.
+                const r2 = try Twin.open(files, "");
+                defer r2.close();
+                const split_model: *v41.Model = @ptrCast(@alignCast(r2.m));
+                const split_regions = split_model.mdl.regions;
+                defer split_model.mdl.regions = split_regions;
+                split_model.mdl.regions = split_regions[0..0];
+                for (chunks[0..3], chunks[1..]) |lo, hi| {
+                    if (lo < n - w) testing.allocator.free(try slotForward(r2, .prefill, &.{1}, long[lo..@min(hi, n - w)], &.{@intCast(lo)}));
+                }
+                testing.allocator.free(try slotForward(r2, .prefill, &.{1}, long[n - w .. n], &.{@intCast(n - w)}));
+                const first = split_model.mdl.dec_state.?.layers[0].win;
+                try expectRowsEqual(ws.layers[0].win.buf, first.buf, n - w, n, ws.layers[0].win.cap);
             }
             if (n == w) {
                 for (ws.ds, cs.ds) |wr, cr| try expectRowsEqual(wr.buf, cr.buf, 0, n, wr.cap);
