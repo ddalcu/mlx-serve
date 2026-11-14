@@ -27,6 +27,7 @@ const spec_gate_threshold = @import("request_options.zig").spec_gate_threshold;
 const parseKvAttnExplicit = @import("request_options.zig").parseKvAttnExplicit;
 const resolveSampling = @import("sampling.zig").resolveSampling;
 const parseLogitBias = @import("sampling.zig").parseLogitBias;
+const parseSuppressCjk = @import("sampling.zig").parseSuppressCjk;
 const generationMaxTokens = @import("sampling.zig").generationMaxTokens;
 const requestProfile = @import("sampling.zig").requestProfile;
 const defaultEnableMtp = @import("request_options.zig").defaultEnableMtp;
@@ -150,6 +151,12 @@ pub fn handleChatCompletions(
     if (ablation.forRequest(stream, root, lm)) |r| {
         log.warn("POST /v1/chat/completions -> {d} (ablation)\n", .{r.code});
         try sendErrorResponse(allocator, stream, r.status, if (r.code == 401) "authentication_error" else "invalid_request_error", r.msg, r.code);
+        return;
+    }
+    var suppress_cjk = false;
+    if (parseSuppressCjk(root, lm, &suppress_cjk)) |msg| {
+        log.warn("POST /v1/chat/completions -> 400 ({s})\n", .{msg});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
         return;
     }
 
@@ -864,6 +871,7 @@ pub fn handleChatCompletions(
         .frequency_penalty = sampled.frequency_penalty,
         .logit_bias = logit_bias,
         .seed = seed,
+        .suppress_cjk = suppress_cjk,
     };
 
     // Build grammar-constrained sampling state if a JSON schema was supplied.

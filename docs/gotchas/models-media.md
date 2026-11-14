@@ -214,6 +214,14 @@ true` tokens minus EOS ids minus specials the chat template uses (derived, never
 to the logits (`unpadded_vocab_size`), riding `SamplingParams.suppress_mask` into both samplers and the stochastic
 verify; logprobs stay raw, so rank 1 may differ from the emitted token by design. `[suppress]` logs engagement.
 
+### `suppress_cjk` rides the reserved mask, and PLD's greedy verify skipped it
+Defect: PLD's greedy verify compared each draft with the raw argmax, so a masked id copied from the prompt was
+committed. Fix: it reads `verifyArgmax` like every other block decoder. `suppress_cjk` takes the same chokepoint with a
+second mask (reserved plus every token that writes CJK, `installCjkMask`); a lane group whose rows differ stacks
+per-row masks `[N,1,V]` (`GroupMask`, `mtp.maskRows`); the host refuses the field by name where the generator's sampler
+does not draw (`Facts.suppress_cjk`). Guard: `tests/test_suppress_cjk.sh`, the `cjkBytes`, `fillCjkMask` and
+`GroupMask` tests.
+
 ### The degenerate-tail loop guard needs a long-period tier
 Defect: a two-sentence 58-token cycle repeated 26 times passed the period-≤8 scan. Fix: `isDegenerateTailLoopRange`
 also convicts periods 9..64 at 10 exact reps (long lines in real code repeat a handful of times, not ten), on span.
