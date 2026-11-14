@@ -95,7 +95,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 wait_port_closed || true
 
 BASELINE_FREE_MB=$(free_mb)

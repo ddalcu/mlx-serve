@@ -378,7 +378,7 @@ pub fn renderModelEntry(
     const gguf_context = if (is_gguf_stub) ggufContextCap(io, entry) else 0;
     const native_context = if (gguf_context > 0) gguf_context else if (sm.found) sm.max_position_embeddings else 0;
     const stub_context = if (gguf_context == 0 and sm.found)
-        advertisedStubContext(native_context, http_server.manualContextFor(request_model.g_model_aliases.ctxSizeFor(io, entry.path)))
+        advertisedStubContext(native_context, http_server.manualContextFor(request_model.g_model_aliases.ctxSizeFor(io, .{ .path = entry.path, .real = entry.real_path })))
     else
         native_context;
     // Native media-gen stub (image/audio/video) — advertise the modality from
@@ -552,7 +552,7 @@ pub fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: 
             if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
             const json = try renderModelEntry(allocator, io, entry);
             defer allocator.free(json);
-            try appendAliasedRow(allocator, &entries_buf, json, request_model.g_model_aliases.aliasForPath(io, entry.path, &alias_buf));
+            try appendAliasedRow(allocator, &entries_buf, json, request_model.g_model_aliases.aliasForPath(io, .{ .path = entry.path, .real = entry.real_path }, &alias_buf));
         }
     }
 

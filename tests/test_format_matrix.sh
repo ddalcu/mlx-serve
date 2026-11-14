@@ -159,7 +159,7 @@ run_model() {
     fi
 
     local log="/tmp/test_format_matrix_$logical.log"
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     sleep 1
     "$BINARY" --model "$path" --serve --port "$PORT" --ctx-size 8192 \
         --log-level debug > "$log" 2>&1 &
@@ -326,12 +326,12 @@ print(f"{name_ok}|{int(json_ok)}|{path_ok}|{leak}")')
     return 0
 }
 
-trap 'pkill -f "mlx-serve.*--port $PORT" 2>/dev/null' EXIT
+trap 'srv_preclean "$PORT"' EXIT
 
 for entry in "${MODELS[@]}"; do
     IFS='|' read -r logical display path engine has_thinking <<< "$entry"
     run_model "$logical" "$display" "$path" "$engine" "$has_thinking"
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     sleep 2
 done
 

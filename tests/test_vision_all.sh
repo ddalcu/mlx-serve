@@ -8,6 +8,7 @@
 # names, so it serves text-only). Depth stays in the per-arch scripts.
 #
 #   tests/test_vision_all.sh [port] [arch-filter-substring]
+source "$(dirname "$0")/lib/server.sh"
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -61,7 +62,7 @@ for spec in "${ARCHS[@]}"; do
   if ! model_fits "$MODEL"; then RESULTS+=("SKIP $NAME ($(model_gb "$MODEL") GB past this box's $(max_model_gb) GB budget)"); continue; fi
   echo "== $NAME =="
   LOG=$(mktemp)
-  pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
+  srv_preclean "$PORT"
   ./zig-out/bin/mlx-serve --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" --log-level info > "$LOG" 2>&1 &
   SRV=$!
   for i in $(seq 1 900); do curl -sf "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done  # the 75 GB qwen4 pack loads in minutes

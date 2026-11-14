@@ -938,19 +938,29 @@ final class MediaBundleTests: XCTestCase {
     /// weight size), so the comparison needs no extra overhead multiplier —
     /// unlike `RecommendedModelPick.meetsSystemRequirements`.
     func testMediaPresetMeetsRequirementsWhenRamCoversTheFootprint() {
-        XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.meetsSystemRequirements(physicalMemoryBytes: 16 * 1_073_741_824))
+        let mac16 = SystemMemoryInfo(totalBytes: 16 * 1_073_741_824, usableBytes: 12 * 1_073_741_824)
+        XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.meetsSystemRequirements(memory: mac16))
     }
 
     func testMediaPresetDoesNotMeetRequirementsWhenTooBig() {
         // LTX: approxRAMGB 24 — an 8 GB Mac falls short.
-        XCTAssertFalse(VideoModelPreset.ltx23Q4.meetsSystemRequirements(physicalMemoryBytes: 8 * 1_073_741_824))
+        let mac8 = SystemMemoryInfo(totalBytes: 8 * 1_073_741_824, usableBytes: 6 * 1_073_741_824)
+        XCTAssertFalse(VideoModelPreset.ltx23Q4.meetsSystemRequirements(memory: mac8))
     }
 
     /// The boundary is exact (`>=`), not a soft margin — a Mac with exactly
     /// the footprint's RAM counts as meeting it.
     func testMediaPresetRequirementsBoundaryIsInclusive() {
         let bytes = UInt64(ImageModelPreset.krea2Turbo.approxRAMGB) * 1_073_741_824
-        XCTAssertTrue(ImageModelPreset.krea2Turbo.meetsSystemRequirements(physicalMemoryBytes: bytes))
+        XCTAssertTrue(ImageModelPreset.krea2Turbo.meetsSystemRequirements(memory: SystemMemoryInfo(totalBytes: bytes * 2, usableBytes: bytes)))
+    }
+
+    /// The budget is what the GPU can give a model, never physical RAM: a Mac whose RAM covers the footprint
+    /// while its GPU cannot hold it does not meet it.
+    func testMediaPresetRequirementsReadTheUsableBudget() {
+        let gib: UInt64 = 1_073_741_824
+        let need = UInt64(VideoModelPreset.ltx23Q4.approxRAMGB) * gib
+        XCTAssertFalse(VideoModelPreset.ltx23Q4.meetsSystemRequirements(memory: SystemMemoryInfo(totalBytes: need, usableBytes: need - gib)))
     }
     func testMiniMaxH3FourBitPresetIsALowRAMAlternative() {
         let all = VideoModelPreset.all

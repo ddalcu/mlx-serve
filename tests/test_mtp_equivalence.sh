@@ -91,7 +91,7 @@ FAIL=0
 LOG=/tmp/mtp_equiv_server.log
 
 start_server() { # $1 = extra flags
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     sleep 1
     # --prefix-cache-entries 0: byte-stable greedy on a HYBRID needs the
     # prefix cache off (CLAUDE.md) — a warm restore re-runs the recurrence in

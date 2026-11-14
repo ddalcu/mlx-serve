@@ -1,6 +1,7 @@
 //! Zig 0.17's test runner (lib/compiler/test_runner.zig) with one change: `MLX_SERVE_TEST_SHARD=k/n` keeps every
 //! n-th test from index k, and every test named `sharded: …` (which splits its own work by the same variable), so
-//! `zig build test` runs n copies of one binary in parallel. Unset = every test, as std's runner.
+//! `zig build test` runs n copies of one binary in parallel. Unset = every test, as std's runner. And it runs the
+//! test root's process setup (`msv_test_process_init`) before the first test.
 const builtin = @import("builtin");
 
 const std = @import("std");
@@ -57,7 +58,11 @@ fn shardTests() void {
     tests = mine[0..len];
 }
 
+/// The test root's process setup (`src/tests.zig`).
+extern fn msv_test_process_init() void;
+
 pub fn main(init: std.process.Init.Minimal) void {
+    msv_test_process_init();
     @disableInstrumentation();
     shardTests();
 

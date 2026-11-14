@@ -17,6 +17,7 @@ const slotExclusiveDecode = @import("batching/verdict.zig").slotExclusiveDecode;
 const BUDGET_REVISE_WINDOW_NS = @import("cache/budget.zig").BUDGET_REVISE_WINDOW_NS;
 const reviseHotCacheBudgets = @import("cache/budget.zig").reviseHotCacheBudgets;
 const flushOwedDiskSlices = @import("cache/budget.zig").flushOwedDiskSlices;
+const noteIdle = @import("cache/budget.zig").noteIdle;
 const holdsSleepWhileParked = @import("cache/budget.zig").holdsSleepWhileParked;
 const runDecodeTick = @import("decode.zig").runDecodeTick;
 const finishSlot = @import("finish.zig").finishSlot;
@@ -145,6 +146,10 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                     if (flushed == .quiet) waitForDiskRetryLocked(sch, 1000);
                     continue;
                 }
+                sch.queue_mu.unlock(sch.io);
+                noteIdle(sch);
+                sch.queue_mu.lockUncancelable(sch.io);
+                if (hasWorkPendingLocked(sch) or sch.shutdown.load(.acquire)) continue;
                 // No later tick runs while parked, so release here.
                 sleep_inhibit.setActive(holdsSleepWhileParked(sch));
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);

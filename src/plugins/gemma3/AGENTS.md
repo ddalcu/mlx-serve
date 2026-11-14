@@ -31,6 +31,8 @@ Owns `gemma3` and `gemma3_text` (mlx-lm's layouts): the decoders, with SigLIP im
   engine keeps one per process, built by whichever model asks first).
 
 ## Known issues
+- Vision is not served: no media hooks, and the legacy encoder probes Gemma 4's `patch_embedder` names, not Gemma 3's
+  SigLIP `vision_tower.vision_model.*` (docs/known-issues.md "Not served yet").
 - The engine's config of a served pack is the legacy parse with the binding attached; `bill` returns the defaults
   until the engine prices from the layout (P8).
 - mlx-lm writes `quantization` twice (also as `quantization_config`): only a `quantization_config` naming a

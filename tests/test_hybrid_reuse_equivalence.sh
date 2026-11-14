@@ -20,7 +20,7 @@ BASE="http://127.0.0.1:$PORT"
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }
 
 # Ensure no other server is running on the port.
-pkill -9 -f "mlx-serve.*port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 
 LOG="$(mktemp)"

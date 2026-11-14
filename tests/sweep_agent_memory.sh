@@ -9,6 +9,7 @@
 # Output: AGENT_MEMORY_RESULTS.md (one row per arch).
 #
 # Override which archs are tested via SWEEP_MODELS=<csv of logical names>.
+source "$(dirname "$0")/lib/server.sh"
 
 set -uo pipefail
 
@@ -46,7 +47,7 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-pkill -f "mlx-serve.*--port $PORT" >/dev/null 2>&1 || true
+srv_preclean "$PORT"
 sleep 1
 
 echo "# 11-turn agent memory sweep — $(date '+%Y-%m-%d %H:%M')" > "$RESULTS"
@@ -149,12 +150,12 @@ run_one() {
     return 0
 }
 
-trap 'pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true' EXIT
+trap 'srv_preclean "$PORT"' EXIT
 
 for entry in "${MODELS[@]}"; do
     IFS='|' read -r name display path type <<< "$entry"
     run_one "$name" "$display" "$path" "$type" || true
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+    srv_preclean "$PORT"
     sleep 3
 done
 

@@ -12,6 +12,7 @@
 #
 # Exit 0 only when every prompt parses cleanly. Skips quietly when the model
 # isn't found locally so CI on smaller hosts doesn't fail.
+source "$(dirname "$0")/lib/server.sh"
 
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -33,7 +34,7 @@ if [[ ! -x "$BINARY" ]]; then
     exit 1
 fi
 
-pkill -f "mlx-serve --serve --port $PORT" >/dev/null 2>&1 || true
+srv_preclean "$PORT"
 sleep 1
 
 LOG=$(mktemp)

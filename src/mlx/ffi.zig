@@ -1338,10 +1338,11 @@ pub fn mlxErrorIsMemory(msg: []const u8) bool {
     return false;
 }
 
-/// CUDA's sticky errors: once one is raised, every later call in the context fails the same
-/// way, so the process can serve nothing until it restarts.
+/// CUDA's sticky errors, and Metal ignoring a process whose command buffers caused GPU errors: once
+/// one is raised, every later call fails the same way, so the process can serve nothing until it restarts.
 pub fn mlxErrorIsContextLost(msg: []const u8) bool {
     const needles = [_][]const u8{
+        "kIOGPUCommandBufferCallbackErrorSubmissionsIgnored",
         "an illegal memory access was encountered",
         "an illegal instruction was encountered",
         "misaligned address",
@@ -1643,6 +1644,8 @@ test "a sticky CUDA error marks the GPU context lost; any other error does not" 
 
     try t.expect(mlxErrorIsContextLost("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered at array.cpp:352"));
     try t.expect(mlxErrorIsContextLost("cuLaunchKernelEx(&config, func, params, nullptr) failed: unspecified launch failure"));
+    try t.expect(mlxErrorIsContextLost("[METAL] Command buffer execution failed: Ignored (for causing prior/excessive GPU errors) (00000004:kIOGPUCommandBufferCallbackErrorSubmissionsIgnored)"));
+    try t.expect(!mlxErrorIsContextLost("[METAL] Command buffer execution failed: Caused GPU Timeout Error (00000002:kIOGPUCommandBufferCallbackErrorTimeout)"));
     try t.expect(!mlxErrorIsContextLost("[METAL] Command buffer execution failed: Insufficient Memory. at transforms.cpp:15"));
     try t.expect(!mlxErrorIsContextLost("cudaMallocAsync(&data, size, stream) failed: out of memory"));
 

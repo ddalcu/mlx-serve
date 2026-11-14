@@ -761,6 +761,42 @@ test "deepseek_v41 served: cancel, pad-only, failed forward and mismatched snaps
     try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
 }
 
+test "deepseek_v41 served: a prefill cancelled past the commit floor is committed where it stopped, and the same prompt resumes there" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try Served.open(&@import("../deepseek_v41/plugin.zig").table, try fixture.v41Files(arena.allocator(), 7), "");
+    defer p.close();
+    const h = try Requests.open(p);
+    defer h.close();
+    var prompt: [600]u32 = undefined;
+    for (&prompt, 0..) |*id, i| id.* = @intCast((i * 7 + 3) % 90 + 2);
+    const stop = 300;
+
+    const abandoned = try h.newSlot(&prompt);
+    const id = @import("../../engines/mlx/plugin/settle.zig").slotId(p.xfm.plugin.?, &abandoned.ctx);
+    try testing.expect(driver.auxBeginPrompt(&p.xfm, id, abandoned.full_prompt, null, 0, true).isOk());
+    var g = ops.Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var first: [stop]i32 = undefined;
+    for (&first, prompt[0..stop]) |*o, t| o.* = @intCast(t);
+    try ops.eval(try g.adopt(try p.xfm.forwardWith(&abandoned.ctx, try g.fromSlice(i32, &first, &.{ 1, stop }))));
+    abandoned.cancelled.store(true, .release);
+    commit_request.commitSlotIfApplicable(&h.sch, abandoned);
+    const hc = h.entry.prefix_cache.?;
+    try testing.expectEqual(@as(usize, 1), hc.entries.items.len);
+    try testing.expectEqualSlices(u32, prompt[0..stop], hc.entries.items[0].tokens);
+    finish_request.releasePluginSlot(abandoned);
+    abandoned.deinit();
+    try testing.expectEqual(@as(u64, 0), driver.stateBytes(&p.xfm));
+
+    // The retry prefills only what the abandoned request had not forwarded.
+    const s = try h.prefill(&prompt);
+    defer s.deinit();
+    try testing.expectEqual(@as(u32, stop), s.cached_tokens);
+    finish_request.releasePluginSlot(s);
+}
+
 test "deepseek_v41 served: restored state is discarded once when only cold prefill fits" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

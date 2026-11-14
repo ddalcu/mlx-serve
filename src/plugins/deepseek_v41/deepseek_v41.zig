@@ -1629,7 +1629,7 @@ pub fn pairRange(c: anytype, mine: u64, theirs: u64) ?[2]usize {
 /// from the shard the index names, the vision tower only on `vision` (its unread split copies never), the Engram
 /// projections kept beside its tables.
 pub fn loadPack(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, vision: bool) !Weights {
-    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .index_owners = true, .skip = &visionUnread });
+    var w = try weights_load.loadWeightsOpt(io, gpa, dir, .{ .vision = vision, .dsv41 = true, .skip = &visionUnread });
     errdefer w.deinit();
     const path = try std.fmt.allocPrintSentinel(gpa, "{s}/engram/engram-residents.safetensors", .{dir}, 0);
     defer gpa.free(path);
@@ -6438,6 +6438,20 @@ pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
     st.snap_at = null;
 }
 
+/// The capture an unfinished prompt leaves: the state where its last forwarded chunk ended, keyed by the armed ids up
+/// to there, so an abandoned prefill resumes instead of starting over. Nothing when no capture is armed, nothing
+/// was forwarded, or an image of the prompt lies past that point (the armed key hashes every image row).
+pub fn snapshotStateAtChunk(m: *const Dsv41Model, st: *State, gen: u64) !void {
+    const at = st.snap_at orelse return;
+    if (st.snap != null or st.n == 0 or st.n >= at) return;
+    if (m.imageRows(st.snap_ids[0..st.n]) != m.imageRows(st.snap_ids)) return;
+    const ids = try st.gpa.dupe(u32, st.snap_ids[0..st.n]);
+    st.gpa.free(st.snap_ids);
+    st.snap_ids = ids;
+    st.snap_at = st.n;
+    try snapshotStateIfDue(st, gen);
+}
+
 /// A prompt chunk of at least `LEAD_MIN` rows whose Engram rows nothing read ahead sends its first half ahead of the
 /// rest (0: the chunk runs whole): the drive reads the rest behind it, where the whole chunk holds the GPU at the first
 /// Engram layer until its last row is read. A narrower lead feeds the matrix units too few rows an expert.
@@ -9565,7 +9579,7 @@ test "dsv41 CED: a wide chunk replays its last window through the decoder, the s
     // The full forward, and the chunk replayed as one piece; traced once each.
     var tr: [2]Trace = .{ .{ .gpa = gpa }, .{ .gpa = gpa } };
     defer for (&tr) |*x| x.deinit();
-    var plain: [2][]f32 = undefined;
+    var plain: [2][]f32 = .{ &.{}, &.{} };
     defer for (plain) |p| gpa.free(p);
     for (0..2) |ced| {
         _ = setenv("MLX_SERVE_DSV41_CED", if (ced == 1) "1" else "0", 1);

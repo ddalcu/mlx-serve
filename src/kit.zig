@@ -70,6 +70,7 @@ pub const blocks = struct {
         pub const timestep = @import("sdk/blocks/dit/timestep.zig");
         pub const rope = @import("sdk/blocks/dit/rope.zig");
         pub const linear = @import("sdk/blocks/dit/linear.zig");
+        pub const mixed_linear = @import("sdk/blocks/dit/mixed_linear.zig");
         pub const dit_kernels = @import("sdk/blocks/dit/dit_kernels.zig");
         pub const int8_attn = @import("sdk/blocks/dit/int8_attn.zig");
         pub const w8a8 = @import("sdk/blocks/dit/w8a8.zig");

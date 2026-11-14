@@ -32,6 +32,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - GGUF expert banks (`--mlx-gguf`, ISTA's GSQ-RCO sets) decode up to `region_rows` through `ffnDecodeGguf`
   (`moe_gu_gguf` + `moe_dn_gguf`, built per ggml type by `gguf.pluginKernel`) and prefill on the matrix units
   (`gguf.gatherNaxSwiGLU`), a K-quant bank a 32-weight slice at a time (`deq_<type>_s`); Q3_K decodes `routed`.
+- Outside the routed experts a GGUF tensor must be in an MLX layout (the forward has no raw-block read there): Q6_K
+  is requantized to 8-bit g32 at load (`gguf.Arch.loadsMlx`); the in-set Engram table is read as IQ4_NL only and
+  another type is declined at the claim (`Arch.readsInPlace`), never at the load.
 
 ## Facts the table declares
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
@@ -41,6 +44,8 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   rows than `num_experts`, `bankStreams`) and a Thunderbolt pair keep legacy resume.
   Snapshots retain every buffer and restore whole only at their own position; the engine owns finished history. Pairs
   keep legacy resume.
+- A prompt abandoned mid-prefill hands over the state where its last forwarded chunk ended (`snapshotStateAtChunk`
+  through `AuxHooks.snapshot`: any chunk end restores whole; not with an image past it, not under a tensor pair).
 - A snapshot is cut to a shorter prefix (`sliceSnap`: global rows and index keys kept, where every pooling group is
   closed) and restored by the tech report's SWA bounded replay (`rewind`, `Want.replay`: the last window run again,
   its band stopped at its first row, no compressor). Text only, no pair or tensor split; a slice is never exported.

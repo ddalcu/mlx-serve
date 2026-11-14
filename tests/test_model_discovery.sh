@@ -24,10 +24,10 @@ BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 [[ -d "$MODELS_ROOT" ]] || { echo "SKIP: root not found: $MODELS_ROOT"; exit 0; }
 [[ -d "$MODELS_ROOT/$LOADED_MODEL" ]] || { echo "SKIP: no checkpoint at $MODELS_ROOT/$LOADED_MODEL"; exit 0; }
 
-trap 'pkill -9 -f "mlx-serve.*--port $PORT" 2>/dev/null; true' EXIT
+trap 'srv_preclean "$PORT"; true' EXIT
 
 # Test 1: --model + --model-dir → discovery enriches /v1/models
-pkill -9 -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
+srv_preclean "$PORT"
 "$BINARY" --model "$MODELS_ROOT/$LOADED_MODEL" --model-dir "$MODELS_ROOT" \
     --serve --port "$PORT" --ctx-size 4096 --log-level warn \
     --no-warmup-eager > /tmp/test_disc.log 2>&1 &
@@ -88,7 +88,7 @@ if [[ "$sibling_bytes" -le 0 ]]; then
 fi
 echo "  PASS"
 
-pkill -9 -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 
 # Test 3: --model-dir alone (no --model) auto-selects first discovered
@@ -119,6 +119,6 @@ fi
 echo "  headless: 0 loaded, $stub_count stub(s) registered on demand"
 echo "  PASS"
 
-pkill -9 -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 echo
 echo "=== ALL DISCOVERY TESTS PASSED ==="

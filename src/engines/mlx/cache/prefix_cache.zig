@@ -409,6 +409,8 @@ const Entry = struct {
     /// Has the slot's append donated these buffers in place (`donateCheckout`)? Until then the
     /// entry's handles are live and a slot that ends hands the entry back; only a donated checkout is dropped.
     checkout_donated: bool = false,
+    /// A module state larger than the byte budget, resident only until the SSD tier has it (`dropWrittenOverBudget`).
+    over_budget: bool = false,
 };
 
 /// What a spec-snap adoption may do, decided before any mlx call.
@@ -716,6 +718,12 @@ pub const HotPrefixCache = struct {
     /// An earlier session's pending snapshot a newer commit displaced before it landed whole;
     /// flushes finish it first, one slice each, so no commit pays for its write.
     finishing_disk: ?PendingDiskFlush = null,
+    /// What every eviction since load was billed, and what the allocator returned for it. They part ways when an
+    /// evicted entry's buffers live on in another holder (a restored slot, an heir's checkpoints, a disk holder).
+    evicted_billed_bytes: u64 = 0,
+    evicted_live_bytes: u64 = 0,
+    /// Checked-out entries the last idle check found (`noteIdle`), so it speaks once per change.
+    idle_checked_out: u32 = 0,
     /// Registered exports that failed or were cancelled, including after metadata submission.
     module_export_losses_total: u64 = 0,
     /// Byte floor for `restoreWouldPinEntry`; a field so a test can reproduce the live shape.
@@ -2048,7 +2056,10 @@ pub const HotPrefixCache = struct {
         if (!plugin_driver.auxDescribe(binding.xfm, snapshot, &info).isOk()) return .declined;
         if (info.n != ids.len or info.prefix_key != prefix_key or !std.mem.eql(u32, info.ids.slice(), ids)) return .declined;
         const aux_bytes = plugin_driver.auxBytes(binding.xfm, snapshot);
-        if (self.max_kv_bytes > 0 and aux_bytes > self.max_kv_bytes) {
+        // A state over the budget is kept whole or lost: with an SSD tier to write it to, it is held past the budget
+        // until the writer has it, so the next turn restores instead of prefilling the conversation cold.
+        const over = self.max_kv_bytes > 0 and aux_bytes > self.max_kv_bytes;
+        if (over and (tail_from > 0 or !self.moduleExportable(ids.len))) {
             self.logModuleDecline(ids.len, aux_bytes, "larger than the budget, raise --prefix-cache-mem");
             return .declined;
         }
@@ -2065,7 +2076,8 @@ pub const HotPrefixCache = struct {
         const room = blk: {
             self.incoming_tip = .{ .binding = binding, .ids = ids, .media = eff_media, .has_tools = has_tools, .quant_config = quant_config };
             defer self.incoming_tip = null;
-            break :blk self.makeModuleRoom(aux_bytes, cache_key, tail_from > 0);
+            // An over-budget state takes the whole budget: everything else goes first, so only it overshoots.
+            break :blk self.makeModuleRoom(if (over) self.max_kv_bytes else aux_bytes, cache_key, tail_from > 0);
         };
         if (!room) {
             self.logModuleDecline(ids.len, aux_bytes, if (tail_from > 0) "a decode-end checkpoint takes no prompt boundary's room" else "no entry could be evicted for it");
@@ -2087,9 +2099,41 @@ pub const HotPrefixCache = struct {
         });
         retained = true;
         self.current_kv_bytes += aux_bytes;
-        if (tail_from == 0) self.registerModuleEntry(&self.entries.items[self.entries.items.len - 1]);
+        const last = self.entries.items.len - 1;
+        if (tail_from == 0) self.registerModuleEntry(&self.entries.items[last]);
+        if (over) {
+            // Held for the writer only: a state the tier did not take would overshoot for good.
+            if (!self.entries.items[last].disk_dirty) {
+                self.evictAt(last, "over the byte budget and the SSD tier did not take it");
+                return .declined;
+            }
+            self.entries.items[last].over_budget = true;
+            log.info("  [hot-cache] module snapshot ({d} tokens, {d:.2} MB) is over the {d:.2} MB budget: held until the SSD tier has it\n", .{
+                ids.len,
+                @as(f64, @floatFromInt(aux_bytes)) / (1024.0 * 1024.0),
+                @as(f64, @floatFromInt(self.max_kv_bytes)) / (1024.0 * 1024.0),
+            });
+        }
         self.logResident();
         return .{ .ok = ids.len };
+    }
+
+    /// Whether the SSD tier writes a module state of `tokens` tokens.
+    fn moduleExportable(self: *const HotPrefixCache, tokens: usize) bool {
+        const d = if (self.disk) |*dd| dd else return false;
+        return d.module_context != null and tokens >= kv_disk_cache.MIN_PERSIST_TOKENS;
+    }
+
+    /// An entry held past the byte budget leaves RAM once its export is on the SSD tier, which serves it from then on.
+    fn dropWrittenOverBudget(self: *HotPrefixCache, d: *const kv_disk_cache.DiskTier) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            const e = &self.entries.items[i];
+            const id = if (e.over_budget and e.checked_out_by == null) (if (e.module) |m| m.disk_id else null) else null;
+            if (id != null and d.moduleState(id.?) == .committed) {
+                self.evictAt(i, "over the byte budget, now on the SSD tier");
+            } else i += 1;
+        }
     }
 
     /// A module snapshot is kept whole or not at all, so the next turn of its conversation prefills cold.
@@ -3334,6 +3378,7 @@ pub const HotPrefixCache = struct {
         d.pollModuleWrites();
         d.cleanupModules();
         self.syncModuleLosses();
+        self.dropWrittenOverBudget(d);
         if (!self.diskOwed()) {
             self.disk_dirty = false;
             return null;
@@ -3785,8 +3830,21 @@ pub const HotPrefixCache = struct {
         const had_ssm = evicted.ssm_checkpoints != null;
         const ssm_mb = @as(f64, @floatFromInt(evicted.ssm_bytes)) / (1024.0 * 1024.0);
         const key = evicted.cache_key;
-        self.current_kv_bytes -|= evicted.kv_bytes;
+        const billed = evicted.kv_bytes;
+        self.current_kv_bytes -|= billed;
+        var live_before: usize = 0;
+        _ = mlx.mlx_get_active_memory(&live_before);
+        const parked_before = self.parkedBytes();
         self.releaseModuleEntry(&evicted, cancellation);
+        var live_after: usize = 0;
+        _ = mlx.mlx_get_active_memory(&live_after);
+        const freed_live: u64 = @as(u64, live_before) -| @as(u64, live_after);
+        self.evicted_billed_bytes +|= billed;
+        self.evicted_live_bytes +|= freed_live;
+        log.debug("  [hot-cache] eviction ({s}) returned {d} MB live of {d} MB billed, {d} MB parked for the SSD tier; since load {d} of {d} MB\n", .{
+            reason,                                  freed_live >> 20,                 billed >> 20,
+            (self.parkedBytes() -| parked_before) >> 20, self.evicted_live_bytes >> 20, self.evicted_billed_bytes >> 20,
+        });
         if (had_ssm) {
             log.info("  [hot-cache] evicted LRU entry ({s}; key={x}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
                 reason, key, tokens_len, kv_mb, ssm_mb,
@@ -3816,6 +3874,43 @@ pub const HotPrefixCache = struct {
             bytes +|= m.aux_bytes;
         };
         return bytes;
+    }
+
+    /// KV, checkpoint and spec bytes the two disk holders keep until their SSD flush lands. `residentBytes` bills a
+    /// holder's module state only, so these are in no other figure (they may share buffers with a live slot).
+    pub fn parkedBytes(self: *const HotPrefixCache) u64 {
+        var bytes: u64 = 0;
+        for ([_]*const ?PendingDiskFlush{ &self.finishing_disk, &self.pending_disk }) |holder| {
+            const p = if (holder.*) |*h| h else continue;
+            bytes += snapshotBytes(&p.snapshot);
+            if (p.ssm_cps) |cps| for (cps) |*cp| {
+                bytes += ssmCheckpointBytes(cp);
+            };
+            if (p.dflash) |*d| bytes += specSnapBytes(d);
+            if (p.mtp) |*m| bytes += specSnapBytes(m);
+        }
+        return bytes;
+    }
+
+    pub const CheckedOut = struct { entries: u32 = 0, bytes: u64 = 0 };
+
+    /// Entries a slot took by move: out of reach of every match, eviction and flush until that slot commits or ends.
+    pub fn checkedOut(self: *const HotPrefixCache) CheckedOut {
+        var out: CheckedOut = .{};
+        for (self.entries.items) |*e| if (e.checked_out_by != null) {
+            out.entries += 1;
+            out.bytes += e.kv_bytes;
+        };
+        return out;
+    }
+
+    /// Call when no request is alive. An entry still checked out then has no slot left to commit or drop it and
+    /// stays out of every match, eviction and flush for good; says so once per change in their count.
+    pub fn noteIdle(self: *HotPrefixCache) void {
+        const out = self.checkedOut();
+        if (out.entries == self.idle_checked_out) return;
+        self.idle_checked_out = out.entries;
+        if (out.entries > 0) log.warn("  [hot-cache] {d} entries ({d} MB) are still checked out with no request alive\n", .{ out.entries, out.bytes >> 20 });
     }
 
     /// Additional host/readback scratch before the next module slice, beyond stagedHostBytes.
@@ -8515,6 +8610,89 @@ test "a PROPORTIONATE share still restores, and is still protected" {
     try t.expectEqual(@as(usize, 11), hit2.matched);
 }
 
+test "probes: every eviction records its bill and what the allocator returned; a shared entry returns nothing; a checkout is counted" {
+    const s = mlx.gpuStream();
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    var toks_a: [4096]u32 = undefined;
+    for (&toks_a, 0..) |*t, i| t.* = @intCast(i + 1);
+    var toks_b: [4096]u32 = undefined;
+    for (&toks_b, 0..) |*t, i| t.* = @intCast(i + 1_000_001);
+    inline for (.{ &toks_a, &toks_b }) |toks| {
+        var cache = try KVCache.init(testing.allocator, 8);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 8, 4096);
+        for (cache.entries) |*e| {
+            if (e.keys.ctx != null) _ = mlx.mlx_array_eval(e.keys);
+            if (e.values.ctx != null) _ = mlx.mlx_array_eval(e.values);
+        }
+        _ = try hc.commit(&cache, toks, false);
+    }
+    try testing.expectEqual(@as(u64, 0), hc.evicted_billed_bytes);
+
+    // A is exclusive: the commit path's evictor gets its bytes back.
+    hc.evictOneLru("byte budget", null);
+    const billed_a = hc.evicted_billed_bytes;
+    try testing.expect(billed_a > 1 << 20);
+    try testing.expect(hc.evicted_live_bytes * HotPrefixCache.SHARED_RETURN_DIVISOR >= billed_a);
+
+    // B is restored into a live cache first: its eviction is billed in full and returns nothing.
+    var live_b = try KVCache.init(testing.allocator, 8);
+    defer live_b.deinit();
+    var moe_off: usize = 0;
+    try testing.expect((try hc.lookupAndRestore(&live_b, &moe_off, null, s, &toks_b, false, &.{}, null, null)).full_match);
+    const live_a = hc.evicted_live_bytes;
+    hc.evictOneLru("byte budget", null);
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    try testing.expect(hc.evicted_billed_bytes - billed_a > 1 << 20);
+    try testing.expect((hc.evicted_live_bytes - live_a) * HotPrefixCache.SHARED_RETURN_DIVISOR < hc.evicted_billed_bytes - billed_a);
+
+    // A checkout is counted with its bytes, and an idle check remembers it.
+    restore_move_override = true;
+    defer restore_move_override = null;
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var prompt: [608]u32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(i + 7);
+    var moved = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    moved.ssd_first = true;
+    defer moved.deinit();
+    try testCheckoutCache(&moved, s, &tokens, 4096);
+    try testing.expectEqual(HotPrefixCache.CheckedOut{}, moved.checkedOut());
+    var slot = try KVCache.init(testing.allocator, 1);
+    defer slot.deinit();
+    var off: usize = 0;
+    _ = try moved.lookupAndRestoreForSlot(&slot, &off, null, s, &prompt, false, &.{}, null, null, 42);
+    try testing.expectEqual(HotPrefixCache.CheckedOut{ .entries = 1, .bytes = moved.entries.items[0].kv_bytes }, moved.checkedOut());
+    moved.noteIdle();
+    try testing.expectEqual(@as(u32, 1), moved.idle_checked_out);
+}
+
+test "probes: a snapshot parked for the SSD tier is counted while it waits and gone once it lands" {
+    const s = mlx.gpuStream();
+    var a_tokens: [1200]u32 = undefined;
+    for (&a_tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 1200);
+    var probe = try cache.snapshot();
+    const row_bytes = HotPrefixCache.snapshotRowBytes(&probe);
+    probe.deinit();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    var hc = try testBoundedSsdFirst(&tmp, &buf, row_bytes);
+    defer hc.deinit();
+    try testing.expectEqual(@as(u64, 0), hc.parkedBytes());
+    _ = try hc.commit(&cache, &a_tokens, false);
+    // The holder keeps the whole live snapshot, and `residentBytes` bills none of it.
+    try testing.expect(hc.pending_disk != null);
+    try testing.expect(hc.parkedBytes() >= row_bytes * 1200);
+    var flushes: usize = 0;
+    while ((hc.pending_disk != null or hc.finishing_disk != null) and flushes < 64) : (flushes += 1) hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(u64, 0), hc.parkedBytes());
+}
+
 test "a 0-token outcome is not a restore: no LRU bump, no protection, and the entry stays evictable" {
     // A 0-token restore outcome used to leave `last_restored_used` set, shielding a fully
     // reclaimable entry from the admission pass trying to admit the request its miss condemned.
@@ -11262,6 +11440,10 @@ const ModuleFake = struct {
     fn begin(_: *anyopaque, _: u32, _: plugin_abi.Span(u32), _: plugin_abi.Array, _: u64, _: bool) callconv(.c) plugin_abi.Verdict {
         return .ok;
     }
+    fn noSnapshot(_: *anyopaque, _: u32, out: *plugin_abi.Handle) callconv(.c) plugin_abi.Verdict {
+        out.* = null;
+        return .ok;
+    }
     fn restore(m: *anyopaque, slot: u32, snap: plugin_abi.Handle, n: u64) callconv(.c) plugin_abi.Verdict {
         const f = get(m);
         const s = snapOf(snap);
@@ -11326,7 +11508,7 @@ const ModuleFake = struct {
     const hooks: plugin_abi.AuxHooks = .{
         .reserve = undefined,
         .commit = undefined,
-        .snapshot = undefined,
+        .snapshot = &noSnapshot,
         .restore_at = &restore,
         .slice = &slice,
         .handoff = undefined,
@@ -12095,6 +12277,52 @@ test "a turn's commit drops the unwritten export of the state it supersedes" {
     try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
 }
 
+test "a module snapshot over the byte budget is held for the SSD tier: served from RAM until it is written, from disk after" {
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var fake: ModuleFake = .{};
+    var bound: plugin_driver.Bound = undefined;
+    var xfm: transformer_mod.Transformer = undefined;
+    const binding = fake.bind(&bound, &xfm);
+    var hc = try ModuleDiskTest.init(&tmp, 4);
+    defer hc.deinit();
+    hc.max_kv_bytes = 3 << 20;
+    const cpu = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const ids = ModuleDiskTest.ids(7);
+    var small = ModuleDiskTest.snap(&fake, ids[0..512]);
+    small.bytes = 1 << 20;
+    _ = try small.put(&hc, binding, &.{});
+
+    // Over the budget: it takes the cache whole, is billed (admission sees it) and the next turn restores it.
+    var huge = ModuleDiskTest.snap(&fake, &ids);
+    huge.bytes = 4 << 20;
+    try testing.expectEqual(CommitStatus{ .ok = 513 }, try huge.put(&hc, binding, &.{}));
+    try testing.expectEqual(@as(usize, 1), hc.entryCount());
+    try testing.expectEqual(@as(u64, 4 << 20), hc.residentBytes());
+    var longer: [520]u32 = undefined;
+    for (&longer, 0..) |*id, i| id.* = 7 + @as(u32, @intCast(i));
+    const ram = hc.findModuleMatch(binding, &longer, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.ram, ram.source);
+    try testing.expectEqual(@as(usize, 513), ram.n);
+
+    // Once the writer has it the RAM copy goes, and the SSD tier serves the same prefix.
+    try ModuleDiskTest.finish(&hc, cpu);
+    _ = hc.flushOwedSlice(cpu);
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    const disk = hc.findModuleMatch(binding, &longer, false, &.{}, null, kv_quant.KVQuantConfig.dense).?;
+    try testing.expectEqual(.disk, disk.source);
+    try testing.expectEqual(@as(usize, 513), disk.n);
+    try testing.expectEqual(@as(u64, 0), hc.module_export_losses_total);
+
+    // Under the tier's persist floor there is nowhere to hold it for: declined, as without a tier.
+    var stub = ModuleDiskTest.snap(&fake, ids[0..8]);
+    stub.bytes = 4 << 20;
+    try testing.expectEqual(@as(CommitStatus, .declined), try stub.put(&hc, binding, &.{}));
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+}
+
 test "under-floor module commits remain RAM-only" {
     var tmp = testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -12483,6 +12711,9 @@ test "failed and cancelled requests keep the restored module entry and its expor
         slot.prefix_cache = &hc;
         slot.error_code = if (cancelled) null else "test_failed_request";
         slot.cancelled = std.atomic.Value(bool).init(cancelled);
+        slot.legacy_gen = null;
+        slot.ctx.plugin_slot = 1;
+        slot.cached_tokens = 512;
         var scheduler: @import("../scheduler.zig").Scheduler = undefined;
         @import("../commit.zig").commitSlotIfApplicable(&scheduler, &slot);
         try testing.expectEqual(@as(usize, 0), snap.frees);

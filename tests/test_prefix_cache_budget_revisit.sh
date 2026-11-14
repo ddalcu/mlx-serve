@@ -25,7 +25,7 @@ done
 [ -x "$BIN" ] || { echo -e "${RED}FAIL${NC} $BIN missing"; exit 1; }
 
 LOG=$(mktemp)
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 0.5
+srv_preclean "$PORT"
 "$BIN" --serve --model "$MODEL_A" --model-dir "$HOME/.mlx-serve/models" --host 127.0.0.1 --port "$PORT" \
     --ctx-size 8192 --prefix-cache-mem 0 --prefix-cache-disk off --log-level info >"$LOG" 2>&1 &
 SRV=$!

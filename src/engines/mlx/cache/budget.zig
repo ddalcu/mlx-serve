@@ -94,6 +94,12 @@ pub fn publishHotCacheResidency(sch: *Scheduler) void {
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
+    if (sch.hot_prefix_cache) |hc| {
+        sch.hot_cache_parked_bytes.store(hc.parkedBytes(), .monotonic);
+        sch.hot_cache_checked_out_bytes.store(hc.checkedOut().bytes, .monotonic);
+        sch.hot_cache_evicted_billed_bytes.store(hc.evicted_billed_bytes, .monotonic);
+        sch.hot_cache_evicted_live_bytes.store(hc.evicted_live_bytes, .monotonic);
+    } else for ([_]*std.atomic.Value(u64){ &sch.hot_cache_parked_bytes, &sch.hot_cache_checked_out_bytes }) |gauge| gauge.store(0, .monotonic);
     // Live module state is published with the live KV (`publishLiveKvResidency`, per pass and per chunk), never here:
     // it is not evictable, and republishing live sessions here would drop the slot being prefilled.
     publishHotCacheDigests(sch);
@@ -155,6 +161,12 @@ pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) 
         sch.digest_residency,
         fp,
     );
+}
+
+/// The loop is about to park with no request alive: refresh the probes and let the cache say what is still checked out.
+pub fn noteIdle(sch: *Scheduler) void {
+    if (sch.hot_prefix_cache) |hc| hc.noteIdle();
+    publishHotCacheResidency(sch);
 }
 
 /// One bounded SSD slice per resident model that still owes one (its oldest owed session first);

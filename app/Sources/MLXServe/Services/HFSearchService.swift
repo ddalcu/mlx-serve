@@ -46,6 +46,7 @@ class HFSearchService: ObservableObject {
     private let pageSize = 50
     private var currentSkip = 0
     let systemRAM = ProcessInfo.processInfo.physicalMemory
+    private let memory = SystemMemoryInfo.current()
 
     /// All fetched models (unsorted). Sorting is applied client-side on `models`.
     private var fetchedModels: [HFModel] = []
@@ -94,13 +95,7 @@ class HFSearchService: ObservableObject {
     }
 
     func ramFitness(for model: HFModel) -> RAMFitness {
-        let size = model.ramEstimateBytes
-        guard size > 0 else { return .unknown }
-        let ram = Double(systemRAM)
-        let ratio = Double(size) / ram
-        if ratio < 0.60 { return .fits }
-        if ratio < 0.85 { return .tight }
-        return .wontFit
+        RAMFitness.of(bytes: Int64(model.ramEstimateBytes), memory: memory)
     }
 
     /// True when the host has at least 96 GB of physical RAM — gate for surfacing
@@ -191,7 +186,7 @@ class HFSearchService: ObservableObject {
 
     /// Build the HF API query URL for the given page parameters. Exposed for tests.
     nonisolated static func searchURL(query: String, filter: String, skip: Int, limit: Int) -> URL? {
-        var components = URLComponents(string: "https://huggingface.co/api/models")!
+        var components = URLComponents(string: DownloadManager.hubBase() + "/api/models")!
         var items: [URLQueryItem] = [
             URLQueryItem(name: "filter", value: filter),
             URLQueryItem(name: "sort", value: "downloads"),
@@ -222,7 +217,7 @@ class HFSearchService: ObservableObject {
                     // `?recursive=true` so a sharded GGUF's nested shards are
                     // listed — `parseFallbackSize` sums each quant's shards, so
                     // a subfoldered repo reports a real size instead of "—".
-                    guard let url = URL(string: "https://huggingface.co/api/models/\(model.id)/tree/main?recursive=true") else { return nil }
+                    guard let url = DownloadManager.hubURL("/api/models/\(model.id)/tree/main?recursive=true") else { return nil }
                     guard let (data, response) = try? await DownloadSession.shared.data(for: DownloadManager.hfApiRequest(url)),
                           let http = response as? HTTPURLResponse, http.statusCode == 200,
                           let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }

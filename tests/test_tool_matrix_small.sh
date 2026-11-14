@@ -157,7 +157,7 @@ run_model() {
     if [ ! -d "$path" ]; then echo -e "${YELLOW}SKIP${NC}: not on any model root"; return 0; fi
 
     local log="/tmp/test_tool_matrix_$logical.log"
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
+    srv_preclean "$PORT"
     "$BINARY" --model "$path" --serve --port "$PORT" --ctx-size 8192 --log-level debug > "$log" 2>&1 &
     local sp=$!
     local up=0
@@ -226,13 +226,13 @@ run_model() {
     kill "$sp" 2>/dev/null; wait "$sp" 2>/dev/null; return 0
 }
 
-trap 'pkill -f "mlx-serve.*--port $PORT" 2>/dev/null' EXIT
+trap 'srv_preclean "$PORT"' EXIT
 
 for entry in "${MODELS[@]}"; do
     IFS='|' read -r logical display rest <<< "$entry"
     IFS='|' read -r -a cands <<< "$rest"
     run_model "$logical" "$display" "$(find_model "${cands[@]}")"
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 2
+    srv_preclean "$PORT"
 done
 
 echo

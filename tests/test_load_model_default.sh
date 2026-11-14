@@ -47,11 +47,11 @@ LOG="$(mktemp)"
 SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     rm -f "$LOG"
 }
 trap cleanup EXIT
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 0.5
 
 "$BIN" --serve --model "$BOOT_MODEL" --model-dir "$MODELS_ROOT" --port "$PORT" --log-file off >"$LOG" 2>&1 &

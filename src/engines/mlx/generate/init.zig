@@ -87,7 +87,10 @@ pub fn initWithOptions(
     // stochastic-verify filters, batched decode via `gen.sampling`)
     // inherits the model's mask without per-site wiring.
     var sampling = sampling_in;
-    sampling.suppress_mask = xfm.suppress_mask;
+    sampling.suppress_mask = if (sampling_in.suppress_cjk)
+        xfm.suppress_mask_cjk orelse return error.SuppressCjkUnavailable
+    else
+        xfm.suppress_mask;
     // MLX_SERVE_KEYED_SAMPLING: every clean sampled request keyed, not only a row-exact trunk's; DSpark's stochastic
     // arm then takes the serial verdict (spec/dspark.zig `serialVerdict`).
     sampling.keyed = (xfm.config.rowExactDecode() or (env.on(.MLX_SERVE_KEYED_SAMPLING) and !sampling.shapesLogits())) and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
@@ -1293,4 +1296,36 @@ fn rowsInto(dst: *mlx.mlx_array, src: mlx.mlx_array, start: u32, stop: u32, s: m
     defer _ = mlx.mlx_array_free(rows);
     try mlx.check(mlx.mlx_slice(&rows, src, &[_]c_int{ 0, @intCast(start), 0 }, 3, &[_]c_int{ sh[0], @intCast(stop), sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
     _ = mlx.mlx_array_set(dst, rows);
+}
+
+// ── tests ──
+
+const testing = std.testing;
+const model_mod = @import("../../../sdk/config/model.zig");
+
+test "initWithOptions: suppress_cjk wires the CJK mask and fails without one" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try dflash_mod.TinyFix.writeTrunk(io, tmp.dir, path, s);
+    var cfg = try model_mod.parseConfig(io, a, path);
+    defer cfg.deinit(a);
+    var xfm = try plugin_driver.load(io, a, &cfg, path, s);
+    defer xfm.deinit();
+    var tok: Tokenizer = undefined;
+    const prompt = [_]u32{ 3, 7, 1 };
+    const cjk: SamplingParams = .{ .temperature = 0, .suppress_cjk = true };
+    try testing.expectError(error.SuppressCjkUnavailable, initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{}));
+    const mask_buf = try a.alloc(bool, cfg.vocab_size);
+    defer a.free(mask_buf);
+    @memset(mask_buf, false);
+    xfm.suppress_mask_cjk = mlx.mlx_array_new_data(mask_buf.ptr, &[_]c_int{@intCast(cfg.vocab_size)}, 1, .bool_);
+    var gen = try initWithOptions(io, a, &xfm, &tok, &prompt, 4, cjk, &.{}, .{ .skip_lazy_preforward = true });
+    defer gen.deinit(a);
+    try testing.expectEqual(xfm.suppress_mask_cjk.?.ctx, gen.sampling.suppress_mask.?.ctx);
 }

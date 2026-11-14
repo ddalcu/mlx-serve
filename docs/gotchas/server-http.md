@@ -862,3 +862,10 @@ cold. Guard: `tests/test_llama_persistent_session.sh`.
 Defect: plugin-served packs with dense attention projections reported the requant off while it ran. Cause: only the
 legacy load set the shell's `dense_attn_proj`. Fix: one predicate (`load/init.denseAttnProj`) feeds both loads.
 Guard: `laguna plugin: a served pack reports its dense attention projections to /props`.
+
+### Model Settings never applied to a model in a symlinked folder (#1184)
+Defect: a locked temperature, a `ctx_size` and a `kv_quant` saved in Model Settings were ignored. Cause: the app keys
+`model-settings.json` by the folder's real path, discovery registers the symlink, and every settings lookup compared
+the two spellings byte for byte. Fix: request-path lookups take the entry's `real_path`, stored at registration, and a
+load resolves the path in `lookupPack`, the one load-time lookup. Guard: `tests/test_model_settings_symlink.sh`,
+`model_settings: a folder reached through a symlink answers to its real path's key…`.

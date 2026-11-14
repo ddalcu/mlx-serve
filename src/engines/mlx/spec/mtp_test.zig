@@ -1058,6 +1058,25 @@ test "mtp: a suppressed id is never drafted, through the coarse shortlist or the
     try testing.expect((try readIdScalar(full)) != want);
 }
 
+test "maskAndArgmax: a per-row [N,1,V] mask masks each row by its own row, 2-D and 3-D readouts" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    // Both rows peak at id 1; only row 0 masks it, so row 0 falls to id 2 and row 1 keeps id 1.
+    const logits_data = [_]f32{ 0, 9, 5, 1, 0, 9, 1, 5 };
+    const mask_data = [_]bool{ false, true, false, false, false, false, false, false };
+    const mask = mlx.mlx_array_new_data(&mask_data, &[_]c_int{ 2, 1, 4 }, 3, .bool_);
+    defer _ = mlx.mlx_array_free(mask);
+    for ([_][]const c_int{ &.{ 2, 4 }, &.{ 2, 1, 4 } }) |shape| {
+        const logits = mlx.mlx_array_new_data(&logits_data, shape.ptr, @intCast(shape.len), .float32);
+        defer _ = mlx.mlx_array_free(logits);
+        const ids = try mtp.maskAndArgmax(s, logits, mask);
+        defer _ = mlx.mlx_array_free(ids);
+        try mlx.check(mlx.mlx_array_eval(ids));
+        const got = mlx.mlx_array_data_int32(ids) orelse return error.MlxArrayDataNull;
+        try testing.expectEqualSlices(i32, &.{ 2, 1 }, got[0..2]);
+    }
+}
+
 test "mtp: row-axis coarse logits equal each solo readout" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();

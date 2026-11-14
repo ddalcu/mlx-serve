@@ -219,39 +219,55 @@ final class RecommendedModelsTests: XCTestCase {
 
     // MARK: - Starter recommendation (RAM tiers)
 
-    /// Each band, sampled in the middle.
+    /// A Mac of `gib` GB that gives models `usable` GB, by default 3/4 of RAM (the app's own fallback).
+    private func mac(_ gib: Double, usable: Double? = nil) -> SystemMemoryInfo {
+        SystemMemoryInfo(totalBytes: UInt64(gib * Double(GiB)), usableBytes: UInt64((usable ?? gib * 3 / 4) * Double(GiB)))
+    }
+
+    /// Each band, sampled in the middle: the band's pick, or the largest below it the GPU can hold.
     func testStarterPickPerRamTier() {
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 8 * GiB).id, "gemma-4-e4b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 24 * GiB).id, "gemma-4-12b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 32 * GiB).id, "qwen38-27b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 36 * GiB).id, "qwen38-27b-6bit")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 64 * GiB).id, "qwen38-27b-8bit")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 128 * GiB).id, "qwen38-flash-next")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(8)).id, "gemma-4-e4b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(24)).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(32)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(36)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(64)).id, "qwen38-27b-8bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(128)).id, "qwen38-flash-next")
     }
 
     /// Bands at 32, 36, 48 and 96 GB are LOWER-inclusive: those are real Mac
-    /// sizes, each the one its pick is chosen for. 16 GB stays upper-inclusive.
+    /// sizes. 16 GB stays upper-inclusive. A band caps the pick; what the GPU
+    /// can give decides it.
     func testStarterPickBoundariesAreExact() {
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 16 * GiB).id, "gemma-4-e4b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 17 * GiB).id, "gemma-4-12b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 31 * GiB).id, "gemma-4-12b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 32 * GiB).id, "qwen38-27b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 35 * GiB).id, "qwen38-27b")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 36 * GiB).id, "qwen38-27b-6bit")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 47 * GiB).id, "qwen38-27b-6bit")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 48 * GiB).id, "qwen38-27b-8bit")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 95 * GiB).id, "qwen38-27b-8bit")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 96 * GiB).id, "qwen38-flash-next")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(16)).id, "gemma-4-e4b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(17)).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(31)).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(32)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(35)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(47)).id, "qwen38-27b-6bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(95)).id, "qwen38-27b-8bit")
     }
 
-    /// Every tier's pick actually runs on the SMALLEST Mac in its band — a
-    /// recommendation the machine can't load is worse than no recommendation.
+    /// A band's own pick needs a GPU that can hold it. A 36 GB Mac gives models
+    /// about 28 GB (measured on an M3 Pro), so the 6-bit 27B (32.4 GB) steps
+    /// down; a 96 GB Mac at 3/4 (72 GB) cannot hold Flash-Next (78 GB), at the
+    /// large-Mac working set (~84%) or a raised `iogpu.wired_limit_mb` it can.
+    func testABandsPickNeedsAGpuThatCanHoldIt() {
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(36, usable: 28)).id, "qwen38-27b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(36, usable: 33)).id, "qwen38-27b-6bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(48)).id, "qwen38-27b-6bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(96)).id, "qwen38-27b-8bit")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(96, usable: 96 * 0.84)).id, "qwen38-flash-next")
+    }
+
+    /// Every tier's pick fits what the GPU of the SMALLEST Mac in its band can
+    /// give a model, not its physical RAM — a recommendation the machine can't
+    /// load is worse than no recommendation.
     func testEveryStarterTierFitsTheBottomOfItsBand() {
-        let bottoms: [UInt64] = [8 * GiB, 16 * GiB + 1, 32 * GiB, 36 * GiB, 48 * GiB, 96 * GiB]
-        for bytes in bottoms {
-            let pick = RecommendedModelPick.starterPick(physicalMemoryBytes: bytes)
-            XCTAssertTrue(pick.meetsSystemRequirements(physicalMemoryBytes: bytes),
-                          "\(pick.id) needs \(pick.approxRAMNeededGB) GB but was recommended at \(bytes / GiB) GB")
+        let bottoms = [mac(8), mac(16), mac(17), mac(32), mac(36), mac(36, usable: 28), mac(48), mac(96)]
+        for memory in bottoms {
+            let pick = RecommendedModelPick.starterPick(memory: memory)
+            XCTAssertTrue(pick.meetsSystemRequirements(memory: memory),
+                          "\(pick.id) needs \(pick.approxRAMNeededGB) GB but was recommended where models get \(memory.usableGB) GB")
         }
     }
 
@@ -270,7 +286,10 @@ final class RecommendedModelsTests: XCTestCase {
     /// degenerate ones a `physicalMemory` read could theoretically hand back.
     func testStarterPickIsTotal() {
         for bytes: UInt64 in [0, 1, 2 * GiB, 96 * GiB, 512 * GiB, UInt64.max] {
-            XCTAssertFalse(RecommendedModelPick.starterPick(physicalMemoryBytes: bytes).repoId.isEmpty)
+            for usable: UInt64 in [0, bytes / 4 * 3] {
+                let memory = SystemMemoryInfo(totalBytes: bytes, usableBytes: usable)
+                XCTAssertFalse(RecommendedModelPick.starterPick(memory: memory).repoId.isEmpty)
+            }
         }
     }
 
@@ -278,34 +297,34 @@ final class RecommendedModelsTests: XCTestCase {
     /// a GGUF pick (`ggufFilename` → the quant download path) because it must
     /// not assume otherwise, but nothing routes there today.
     func testNoStarterTierIsAGgufPick() {
-        for bytes: UInt64 in [8 * GiB, 16 * GiB, 32 * GiB, 36 * GiB, 48 * GiB, 128 * GiB] {
-            XCTAssertNil(RecommendedModelPick.starterPick(physicalMemoryBytes: bytes).ggufFilename)
+        for gib: Double in [8, 16, 32, 36, 48, 128] {
+            XCTAssertNil(RecommendedModelPick.starterPick(memory: mac(gib)).ggufFilename)
         }
     }
 
     // MARK: - Meets-system-requirements (reduced opacity, never hidden)
 
-    /// A model well within this Mac's RAM meets requirements.
+    /// A model well within what this Mac gives models meets requirements.
     func testMeetsSystemRequirementsWhenPlentyOfHeadroom() {
-        XCTAssertTrue(RecommendedModelPick.gemmaE4B.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
+        XCTAssertTrue(RecommendedModelPick.gemmaE4B.meetsSystemRequirements(memory: mac(16)))
     }
 
-    /// A model bigger than this Mac's total RAM does not meet requirements —
+    /// A model bigger than what this Mac gives models does not meet requirements —
     /// this is the signal that sorts it behind the "Requires more RAM"
     /// disclosure, never a reason to drop it from the list.
     func testDoesNotMeetSystemRequirementsWhenTooBig() {
-        XCTAssertFalse(RecommendedModelPick.gemma31B.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
+        XCTAssertFalse(RecommendedModelPick.gemma31B.meetsSystemRequirements(memory: mac(16)))
     }
 
     /// The threshold includes the same ~20% overhead the rest of the app
     /// budgets for RAM-vs-disk-weight, so a model whose weights alone are
-    /// just under total RAM still correctly reads as "won't fit".
+    /// just under the usable budget still correctly reads as "won't fit".
     func testRequirementsThresholdIncludesOverhead() {
-        // gemma31B: 17.2 GB weights -> ~20.64 GB needed. 18 GB of RAM covers
+        // gemma31B: 17.2 GB weights -> ~20.64 GB needed. 18 GB for models covers
         // the raw weights but not the overhead.
         let pick = RecommendedModelPick.gemma31B
-        XCTAssertFalse(pick.meetsSystemRequirements(physicalMemoryBytes: 18 * GiB))
-        XCTAssertTrue(pick.meetsSystemRequirements(physicalMemoryBytes: 32 * GiB))
+        XCTAssertFalse(pick.meetsSystemRequirements(memory: mac(32, usable: 18)))
+        XCTAssertTrue(pick.meetsSystemRequirements(memory: mac(32, usable: 24)))
     }
 
     /// The Sushi pack fits a stock 64 GB Mac's GPU working set (3/4 of RAM) and not a stock 48 GB one.
@@ -325,8 +344,8 @@ final class RecommendedModelsTests: XCTestCase {
     /// set there), behind "Requires more RAM" on 64 GB.
     func testFlashNextFitsOn96GBButNotBelow() {
         let fn = RecommendedModelPick.qwen38FlashNext
-        XCTAssertTrue(fn.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
-        XCTAssertFalse(fn.meetsSystemRequirements(physicalMemoryBytes: 64 * GiB))
+        XCTAssertTrue(fn.meetsSystemRequirements(memory: mac(96, usable: 96 * 0.84)))
+        XCTAssertFalse(fn.meetsSystemRequirements(memory: mac(64)))
         XCTAssertTrue(fn.blurb.contains("96 GB"), "blurb must name the 96 GB target")
         let mac96 = SystemMemoryInfo(totalBytes: 96 * GiB, usableBytes: UInt64(96 * 0.84) * GiB)
         XCTAssertEqual(mac96.fit(neededGB: fn.approxRAMNeededGB), .tight)
@@ -339,7 +358,7 @@ final class RecommendedModelsTests: XCTestCase {
         let ds = RecommendedModelPick.deepseekV41Pruned
         let mac128 = SystemMemoryInfo(totalBytes: 128 * GiB, usableBytes: UInt64(107.5 * Double(GiB)))
         XCTAssertEqual(mac128.fit(neededGB: ds.approxRAMNeededGB), .tight)
-        XCTAssertFalse(ds.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
+        XCTAssertFalse(ds.meetsSystemRequirements(memory: mac(96, usable: 96 * 0.84)))
     }
 
     // MARK: - Partitioning (inline vs "Requires more RAM" disclosure)
@@ -347,7 +366,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// On a big enough Mac, everything in a family fits — the disclosure
     /// never appears (nothing goes into `requiresMoreRAM`).
     func testPartitionPutsEverythingInFitsOnAHighRamMac() {
-        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(physicalMemoryBytes: 128 * GiB)
+        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(memory: mac(128))
         XCTAssertEqual(split.fits.count, RecommendedModelPick.gemmaCatalog.count)
         XCTAssertTrue(split.requiresMoreRAM.isEmpty)
     }
@@ -356,7 +375,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// while the small ones stay in `fits` — and nothing is dropped: the two
     /// buckets together must reconstruct the original catalog.
     func testPartitionSplitsBySizeOnALowRamMac() {
-        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(physicalMemoryBytes: 16 * GiB)
+        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(memory: mac(16))
         XCTAssertTrue(split.fits.contains(.gemmaE4B))
         XCTAssertTrue(split.requiresMoreRAM.contains(.gemma31B))
         XCTAssertEqual(Set(split.fits + split.requiresMoreRAM), Set(RecommendedModelPick.gemmaCatalog))
@@ -365,7 +384,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// Each bucket preserves the catalog's ascending-size order — the
     /// partition must not reshuffle, only split.
     func testPartitionPreservesAscendingOrderWithinEachBucket() {
-        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(physicalMemoryBytes: 16 * GiB)
+        let split = RecommendedModelPick.gemmaCatalog.partitionedByRequirements(memory: mac(16))
         XCTAssertEqual(split.fits.map(\.sizeGB), split.fits.map(\.sizeGB).sorted())
         XCTAssertEqual(split.requiresMoreRAM.map(\.sizeGB), split.requiresMoreRAM.map(\.sizeGB).sorted())
     }
@@ -405,8 +424,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(p.contextTokens, 262_144)
         XCTAssertEqual(p.activeParamsB, 9.7)
         XCTAssertEqual(p.quantLabel, "4-bit")
-        XCTAssertTrue(p.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
-        XCTAssertFalse(p.meetsSystemRequirements(physicalMemoryBytes: 8 * GiB))
+        XCTAssertTrue(p.meetsSystemRequirements(memory: mac(16)))
+        XCTAssertFalse(p.meetsSystemRequirements(memory: mac(8)))
     }
 
     /// Bonsai 2 is the Qwen 3.8 27B squeezed to 2 bits so it fits a 16 GB Mac.
@@ -415,12 +434,12 @@ final class RecommendedModelsTests: XCTestCase {
         let b = RecommendedModelPick.bonsai2_27b
         XCTAssertEqual(b.repoId, "prism-ml/Ternary-Bonsai-2-27B-mlx-2bit")
         XCTAssertTrue(RecommendedModelPick.qwenCatalog.contains(b))
-        XCTAssertTrue(b.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
-        XCTAssertFalse(RecommendedModelPick.qwen38_27b.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
+        XCTAssertTrue(b.meetsSystemRequirements(memory: mac(16)))
+        XCTAssertFalse(RecommendedModelPick.qwen38_27b.meetsSystemRequirements(memory: mac(16)))
         XCTAssertLessThan(b.intelligence, RecommendedModelPick.qwen38_27b.intelligence, "a 2-bit squeeze is never smarter")
         XCTAssertEqual(b.contextTokens, 262_144)
         XCTAssertEqual(b.quantLabel, "2-bit")
-        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 16 * GiB).id, "gemma-4-e4b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(memory: mac(16)).id, "gemma-4-e4b")
     }
 
     func testGemma4EverydayPicksArePresent() {
@@ -453,8 +472,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(ds.repoId, "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-Pruned192-2.25bpw")
         XCTAssertEqual(ds.quantLabel, "iQ-MLX Pruned192 2.25 bpw")
         XCTAssertEqual(ds.intelligence, RecommendedModelPick.deepseekV41Flash.intelligence)
-        XCTAssertTrue(ds.meetsSystemRequirements(physicalMemoryBytes: 128 * GiB))
-        XCTAssertFalse(ds.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
+        XCTAssertTrue(ds.meetsSystemRequirements(memory: mac(128, usable: 107.5)))
+        XCTAssertFalse(ds.meetsSystemRequirements(memory: mac(96, usable: 96 * 0.84)))
         XCTAssertFalse(RecommendedModelPick.allCatalogs.contains { $0.repoId.hasPrefix("ddalcu/DeepSeek-V4-Flash") },
                        "the V4.1 pruned pack replaces the V4-Flash pick")
     }
@@ -466,8 +485,8 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(ds.repoId, "ddalcu/DeepSeek-V4.1-Flash-1017-MLX-Serve-iQ-MLX-3.0bpw")
         XCTAssertEqual(ds.quantLabel, "iQ-MLX 3.0 bpw")
         XCTAssertEqual(ds.contextTokens, 1_048_576)
-        XCTAssertTrue(ds.meetsSystemRequirements(physicalMemoryBytes: 256 * GiB))
-        XCTAssertFalse(ds.meetsSystemRequirements(physicalMemoryBytes: 192 * GiB))
+        XCTAssertTrue(ds.meetsSystemRequirements(memory: mac(256, usable: 256 * 0.84)))
+        XCTAssertFalse(ds.meetsSystemRequirements(memory: mac(192, usable: 192 * 0.84)))
     }
 
     /// The Liquid section is the small text model and the Omni, nothing else.

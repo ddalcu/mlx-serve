@@ -11,6 +11,11 @@ comptime {
     @import("plugin_host_check.zig").reexports(@This());
 }
 
+/// The test process caps MLX's buffer pool as the server's `main` does; `build/test_runner.zig` calls it first.
+export fn msv_test_process_init() void {
+    @import("mlx/state.zig").applyMlxCacheLimit();
+}
+
 test {
     _ = @import("sdk/blocks/hc/hc_cuda_test.zig");
     _ = @import("plugins/stable_audio3/plugin.zig");

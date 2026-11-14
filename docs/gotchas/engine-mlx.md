@@ -1558,3 +1558,10 @@ outside the server then plus the footprint now (`outside_model.settled`); a read
 refused by name (`BankReadingBelowFootprint`) and the bills stand on `total - available`. The bank-fit fitter voids a
 line whose in use is below its footprint. Guard: `outside model: an open reading below the server's footprint settles
 from the load's start, else is refused, never the whole room`.
+
+### A model Metal stopped taking work from answered 500 forever while /health said 200
+Defect: a pack read over SMB faulted pages inside a command buffer during warm-up; Metal's watchdog cancelled it and
+then ignored every later submission from the process ("Ignored (for causing prior/excessive GPU errors)"). Each
+request answered a bare 500 and `/health` stayed 200, so nothing restarted the server. Cause: the latch's sticky-error
+list knew CUDA's faults only. Fix: `SubmissionsIgnored` marks the GPU context lost like a CUDA fault (named 503,
+`/health` 503 `gpu context lost`). Guard: `a sticky CUDA error marks the GPU context lost; any other error does not`.

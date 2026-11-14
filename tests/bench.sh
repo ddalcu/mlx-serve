@@ -72,7 +72,7 @@ TARGETS=(
 # Only ever called on the path that STARTED a server: --url may be pointed at
 # a local mlx-serve someone else is using, and a bench must not kill it.
 stop_server() {
-    pkill -f "mlx-serve --serve .*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     for _ in $(seq 1 30); do
         lsof -ti tcp:"$PORT" >/dev/null 2>&1 || return 0
         sleep 1

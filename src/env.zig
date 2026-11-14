@@ -279,6 +279,7 @@ pub const vars = struct {
     // ── public ──
     pub const CUDA_HOME: Var = .{ .kind = .public, .type = .text, .default = "/usr/local/cuda or /opt/cuda when present", .owner = "mlx", .since = "26.10.2", .doc = "CUDA toolkit root for MLX's JIT on Linux; exported when unset" };
     pub const CUDA_PATH: Var = .{ .kind = .public, .type = .text, .default = "unset", .owner = "mlx", .since = "26.10.2", .doc = "Windows CUDA toolkit: its bin goes first on PATH, and it counts as CUDA_HOME" };
+    pub const HF_ENDPOINT: Var = .{ .kind = .public, .type = .text, .default = "https://huggingface.co", .owner = "sdk/util", .since = "26.11.3", .doc = "hub base URL for `pull` and every model download (a mirror such as https://hf-mirror.com); HF_TOKEN is sent to it" };
     pub const HF_TOKEN: Var = .{ .kind = .public, .type = .text, .default = "unset", .owner = "host/cli", .since = "26.7.1", .doc = "Hugging Face token sent by `pull`" };
     pub const HOME: Var = .{ .kind = .public, .type = .text, .default = "/tmp where a caller needs one", .owner = "host", .since = "-", .doc = "the user's home: ~/.mlx-serve (models, settings, logs, caches)" };
     pub const HY3D_PAINT_DIR: Var = .{ .kind = .public, .type = .text, .default = "the pack's paint/ dir", .owner = "host/media_jobs", .since = "26.7.2", .doc = "Hunyuan3D paint-stage model dir override (absolute, with a config.json)" };
@@ -808,6 +809,8 @@ pub const vars = struct {
     pub const TTS_SPK_MEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/qwen3_tts", .since = "26.6.13", .doc = "speaker encoder (ECAPA-TDNN) matches the Python oracle" };
     pub const TTS_SPK_REF: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/qwen3_tts", .since = "26.6.13", .doc = "speaker encoder (ECAPA-TDNN) matches the Python oracle" };
     pub const TTS_TEST_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/qwen3_tts", .since = "26.6.13", .doc = "generateCodes yields at frame boundaries and stops on cancel" };
+    pub const TTS_VOICE_FIXTURE: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/qwen3_tts", .since = "26.11.3", .doc = "a voice prefix matches the reference" };
+    pub const TTS_VOICE_MODEL: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/qwen3_tts", .since = "26.11.3", .doc = "a voice prefix matches the reference" };
     pub const TTS_WAV_OUT: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/qwen3_tts", .since = "26.6.13", .doc = "end-to-end native TTS produces non-silent audio" };
     pub const YUE2_AR_LOGITS0: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/yue2", .since = "26.10.2", .doc = "yue2 AR path: prefill and a cached decode step match the reference logits" };
     pub const YUE2_AR_LOGITS1: Var = .{ .kind = .fixture, .type = .text, .default = "unset: the test skips", .owner = "plugins/yue2", .since = "26.10.2", .doc = "yue2 AR path: prefill and a cached decode step match the reference logits" };

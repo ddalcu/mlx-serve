@@ -277,6 +277,7 @@ RESULT=$(curl -sf "$BASE/v1/messages" \
   -d '{
     "model": "mlx-serve",
     "max_tokens": 128,
+    "temperature": 0,
     "messages": [
       {"role": "user", "content": "What day is it?"},
       {"role": "assistant", "content": [

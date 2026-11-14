@@ -41,7 +41,7 @@ if [ ! -d "$MODEL" ]; then
     exit 0
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --metrics --no-pld --ctx-size 1024 --log-level warn > "$LOG" 2>&1 &

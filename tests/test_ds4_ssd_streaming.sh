@@ -11,6 +11,7 @@
 #
 # Usage: DS4_GGUF_MODEL=/path/to/DeepSeek-V4-Flash-*.gguf ./tests/test_ds4_ssd_streaming.sh [port]
 #   Needs a DeepSeek-V4-Flash GGUF + a machine where the ds4 engine runs (Metal).
+source "$(dirname "$0")/lib/server.sh"
 
 set -u
 
@@ -38,7 +39,7 @@ if [ ! -x "$BINARY" ]; then
     exit 0
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 echo ""

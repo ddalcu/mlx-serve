@@ -672,6 +672,8 @@ fn auxSnapshot(mp: *anyopaque, slot: u32, out: *abi.Handle) callconv(.c) Verdict
     if (!auxEnabled(mp)) return Verdict.refuse(.unsupported, "deepseek_v41: auxiliary cache requires an unpaired instance");
     const m: *Model = @ptrCast(@alignCast(mp));
     const live = stateOf(m, slot) orelse return .ok;
+    // A prompt that never reached its boundary hands over where it stopped; a tensor pair's worker holds no twin of it.
+    if (live.st.snap == null and m.mdl.tp == null) dsv41.snapshotStateAtChunk(m.mdl, live.st, live.gen) catch |e| return Verdict.named(.failed, @errorName(e));
     const sn = live.st.snap orelse return .ok;
     if (sn.n != sn.ids.len) return Verdict.refuse(.failed, "deepseek_v41: snapshot boundary differs from its ids");
     const owned = gpa.create(dsv41.Snap) catch |e| return Verdict.named(.failed, @errorName(e));

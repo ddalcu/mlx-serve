@@ -38,12 +38,12 @@ check() {
 
 LOG="$(mktemp)"
 cleanup() {
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     rm -f "$LOG"
 }
 trap cleanup EXIT
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 0.5
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --log-file off --log-level info > "$LOG" 2>&1 &
 SRV=$!

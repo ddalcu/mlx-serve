@@ -5,6 +5,7 @@
 #   DRAFTER_TEST_TARGET=<gemma-4 dir> DRAFTER_TEST_DRAFTER=<assistant dir> ./tests/test_drafter_equivalence.sh [port]
 #
 # Defaults gemma-4-e4b-it-8bit + gemma-4-E4B-it-assistant-bf16; SKIPs when either is missing.
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 
 set -e
@@ -126,7 +127,7 @@ echo "  prompt:  <echo-heavy code rename>"
 echo
 
 # Pre-emptively kill any stale server on the test port.
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 OUT_NODRAFTER=$(run_request "without --drafter") || exit 1

@@ -4,6 +4,7 @@
 # reuses a prefix committed under the other scheme (`[hot-cache] reused 0/…`).
 #
 #   ./tests/test_kv_quant_per_request.sh [/path/to/model] [port]   # default gemma-4-e4b-it-4bit, port 8094
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 
 set -e
@@ -31,7 +32,7 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 LOGFILE=$(mktemp)

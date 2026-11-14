@@ -162,6 +162,14 @@ pub const Scheduler = struct {
     cached_sessions: [metrics_mod.MAX_SESSIONS]metrics_mod.Session = undefined,
     cached_session_count: usize = 0,
 
+    /// Hot-cache probes, published with the residency: bytes its two SSD holders keep (in no other figure), bytes
+    /// slots hold by checkout (billed above AND as live KV), and what every eviction since load was billed against
+    /// what the allocator returned for it.
+    hot_cache_parked_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    hot_cache_checked_out_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    hot_cache_evicted_billed_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    hot_cache_evicted_live_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
     /// The part of the above an eviction can prove it will return (residency minus the largest entry).
     reclaimable_hot_cache_bytes: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Set on unload: the OS hands freed pages back lazily, so the budget revise repeats

@@ -12,6 +12,7 @@ const build_options = @import("build_options");
 const model_mod = @import("../../sdk/config/model.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/source.zig");
 const log = @import("../../sdk/util/log.zig");
+const hub = @import("../../sdk/util/hub.zig");
 
 const DONOR_REPO = "ddalcu/Qwen3.8-27B-MLX-Serve-4bit";
 const SIDECAR = "mtp.safetensors";
@@ -46,7 +47,7 @@ const Source = union(enum) {
                 return buf;
             },
             .remote => {
-                const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ DONOR_REPO, rel });
+                const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub.base(), DONOR_REPO, rel });
                 defer allocator.free(url);
                 const range = try std.fmt.allocPrint(allocator, "{d}-{d}", .{ off, off + len - 1 });
                 defer allocator.free(range);
@@ -78,7 +79,7 @@ const Source = union(enum) {
                 return rs.interface.allocRemaining(allocator, .limited(16 * 1024 * 1024));
             },
             .remote => {
-                const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ DONOR_REPO, rel });
+                const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub.base(), DONOR_REPO, rel });
                 defer allocator.free(url);
                 const result = std.process.run(allocator, io, .{
                     .argv = &.{ "curl", "-fsSL", "--retry", "3", "--retry-delay", "2", url },

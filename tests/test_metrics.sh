@@ -45,7 +45,7 @@ if [ ! -d "$MODEL" ]; then
     exit 0
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 wait_health() {
@@ -75,7 +75,7 @@ STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics.json")
 check "GET /metrics.json without --metrics → 503" "$([ "$STATUS" = "503" ] && echo 1 || echo 0)"
 
 kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null || true
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true; sleep 1
+srv_preclean "$PORT"
 
 # ════════════════════════════════════════════════════════════════════════════
 # Phase 2: With --metrics, the endpoints answer

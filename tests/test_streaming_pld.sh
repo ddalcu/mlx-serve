@@ -3,6 +3,7 @@
 # stream without it (the streaming adapter must not drop, duplicate or reorder tokens across multi-token verifies).
 #
 #   PLD_TEST_MODEL=<dir> ./tests/test_streaming_pld.sh [port]   # default gemma-4-e4b-it-8bit; SKIP without one
+source "$(dirname "$0")/lib/server.sh"
 source "$(dirname "$0")/_lib_models.sh"
 
 set -e
@@ -137,7 +138,7 @@ echo "  model: $MODEL"
 echo "  prompt: <echo-heavy code rename>"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 # Reference run: regular streaming, no PLD. This is what the streamed bytes

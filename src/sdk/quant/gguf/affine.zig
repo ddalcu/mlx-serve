@@ -2,7 +2,8 @@
 //! w = scale * q + bias for an unsigned q. Such a tensor moves into MLX's affine layout (`mx.quantize` packing) without
 //! requantizing: the codes stay, only the scales round to bf16. The loader does it where `Arch.transcodes` says (Q8_0
 //! only where the fused kernels are affine-keyed), so those tensors run on MLX's own affine kernels; every other type
-//! keeps its ggml blocks.
+//! keeps its ggml blocks. Q6_K is the one type REQUANTIZED into the layout (`layoutBits`): its scales cover 16 weights
+//! and MLX's smallest group is 32, so each 32 take a fresh 8-bit code.
 const std = @import("std");
 const quants = @import("quants.zig");
 const GgmlType = quants.GgmlType;
@@ -16,6 +17,12 @@ pub fn bitsOf(ty: GgmlType) ?u32 {
         .q8_0 => 8,
         else => null,
     };
+}
+
+/// The code width `ty` takes in an MLX affine layout: its own (`bitsOf`), or 8 for Q6_K, requantized per 32 weights
+/// (two of its 6-bit sub-blocks) to within half an 8-bit step of ggml's decode.
+pub fn layoutBits(ty: GgmlType) ?u32 {
+    return bitsOf(ty) orelse if (ty == .q6_k) 8 else null;
 }
 
 /// Weights per scale and bias of `ty`'s affine layout.
@@ -94,9 +101,43 @@ pub fn decodeRow(ty: GgmlType, src: []const u8, q: []u8, scale: []f32, bias: []f
                     }
                 }
             },
+            .q6_k => {
+                var y: [256]f32 = undefined;
+                quants.dequantize(.q6_k, b, &y) catch unreachable;
+                for (0..8) |j| requant8(y[32 * j ..][0..32], qs[32 * j ..][0..32], &scale[g + j], &bias[g + j]);
+            },
             else => unreachable,
         }
     }
+}
+
+/// 32 weights as one 8-bit affine group: `w` is within `scale / 2` of `scale * q + bias`, with a scale and bias that
+/// are exact in bf16 (the layout stores them there), the bias at or below the smallest weight.
+fn requant8(w: *const [32]f32, q: *[32]u8, scale: *f32, bias: *f32) void {
+    var lo = w[0];
+    var hi = w[0];
+    for (w) |v| {
+        lo = @min(lo, v);
+        hi = @max(hi, v);
+    }
+    var b = fromBf16(bf16(lo));
+    if (b > lo) b = fromBf16(bf16Step(bf16(lo), false));
+    var s = fromBf16(bf16((hi - b) / 255));
+    if (b + 255 * s < hi) s = fromBf16(bf16Step(bf16((hi - b) / 255), true));
+    for (w, q) |v, *o| o.* = if (s == 0) 0 else @intFromFloat(@min(255, @max(0, @round((v - b) / s))));
+    scale.* = s;
+    bias.* = b;
+}
+
+fn fromBf16(u: u16) f32 {
+    return @bitCast(@as(u32, u) << 16);
+}
+
+/// The next bf16 above (`up`) or below `u`.
+fn bf16Step(u: u16, up: bool) u16 {
+    const neg = u & 0x8000 != 0;
+    if (u & 0x7FFF == 0) return if (up) 0x0001 else 0x8001;
+    return if (neg == up) u - 1 else u + 1;
 }
 
 fn scaleMinK4(j: usize, q: []const u8) struct { f32, f32 } {
@@ -164,6 +205,43 @@ test "every affine-coded GGUF type decodes to ggml's own weights" {
     try expectAffineMatchesGgml(.q2_0, "q2_0.bin");
     try std.testing.expect(bitsOf(.q6_k) == null and bitsOf(.iq4_nl) == null);
     try std.testing.expect(groupOf(.q2_0) == 64 and groupOf(.q4_k) == 32);
+}
+
+test "Q6_K requantizes to 8-bit groups of 32 within half a step of ggml's weights, on bf16 scales and biases" {
+    const ty: GgmlType = .q6_k;
+    const data = @embedFile("fixtures/q6_k.bin");
+    const n_blocks = data.len / (ty.blockBytes() + 4 * ty.blockElems());
+    const n = n_blocks * ty.blockElems();
+    const src = data[0 .. n_blocks * ty.blockBytes()];
+    const want = data[src.len..];
+    var q: [4 * 256]u8 = undefined;
+    var sc: [4 * 8]f32 = undefined;
+    var bi: [4 * 8]f32 = undefined;
+    try std.testing.expect(n <= q.len and layoutBits(ty).? == 8 and layoutBits(.q5_k).? == 5 and layoutBits(.iq4_nl) == null);
+    decodeRow(ty, src, q[0..n], sc[0 .. n / 32], bi[0 .. n / 32]);
+    var widest: f32 = 0;
+    for (0..n / 32) |g| {
+        try std.testing.expectEqual(sc[g], fromBf16(bf16(sc[g])));
+        try std.testing.expectEqual(bi[g], fromBf16(bf16(bi[g])));
+        var lo = std.math.inf(f32);
+        var hi = -std.math.inf(f32);
+        for (0..32) |k| {
+            const w: f32 = @bitCast(std.mem.readInt(u32, want[4 * (32 * g + k) ..][0..4], .little));
+            lo = @min(lo, w);
+            hi = @max(hi, w);
+            const got = sc[g] * @as(f32, @floatFromInt(q[32 * g + k])) + bi[g];
+            try std.testing.expect(@abs(w - got) <= 0.5 * sc[g] * 1.001);
+        }
+        // The step is the group's range over 255, widened only by the bf16 rounding of its ends.
+        try std.testing.expect(sc[g] <= (hi - lo) / 255 * 1.02 + 1e-12);
+        widest = @max(widest, hi - lo);
+    }
+    try std.testing.expect(widest > 0);
+
+    try std.testing.expectEqual(@as(u16, 0x0001), bf16Step(0, true));
+    try std.testing.expectEqual(@as(u16, 0x8001), bf16Step(0, false));
+    try std.testing.expect(fromBf16(bf16Step(bf16(-1.5), false)) < -1.5 and fromBf16(bf16Step(bf16(-1.5), true)) > -1.5);
+    try std.testing.expect(fromBf16(bf16Step(bf16(1.5), false)) < 1.5 and fromBf16(bf16Step(bf16(1.5), true)) > 1.5);
 }
 
 test "packCodes packs densely, straddling words at 5 bits" {

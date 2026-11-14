@@ -73,6 +73,11 @@ fn bad(comptime why: []const u8) Verdict {
     return Verdict.refuse(.unsupported, why);
 }
 
+const no_voices = "this model has no built-in voices: leave 'voice' out (a Base pack clones 'ref_audio', a VoiceDesign pack takes 'instructions')";
+const unknown_voice = "'voice' must be one of this model's voices";
+const no_instructions = "this model takes no 'instructions' (VoiceDesign and 1.7B CustomVoice checkpoints do)";
+const needs_instructions = "a VoiceDesign model needs 'instructions' describing the voice";
+
 /// `ref_audio` as samples: a base64 24 kHz mono PCM16 WAV (the app normalizes it). Null when absent or empty.
 fn refSamples(b: *const job.Body) union(enum) { none, samples: []f32, bad_base64, bad_wav } {
     const b64 = b.str("ref_audio") orelse return .none;
@@ -90,6 +95,19 @@ fn languageOf(e: *const Engine, b: *const job.Body) error{UnsupportedLanguage}!?
     const name = v.string;
     if (std.ascii.eqlIgnoreCase(name, "auto")) return null;
     return e.synth.model.cfg.languageId(name) orelse error.UnsupportedLanguage;
+}
+
+/// `voice` (or `speaker`): a CustomVoice checkpoint's built-in voice, required there; elsewhere only absent, empty or
+/// `default`, since no other pack has voices to pick.
+fn voiceOf(cfg: *const tts.TtsConfig, b: *const job.Body) union(enum) { voice: ?*const tts.TtsConfig.Speaker, no_voices, unknown: []const u8 } {
+    const v = b.get("voice") orelse b.get("speaker") orelse std.json.Value{ .null = {} };
+    const name: []const u8 = switch (v) {
+        .null => "",
+        .string => |n| n,
+        else => "?",
+    };
+    if (cfg.kind == .custom_voice) return if (cfg.speaker(name)) |sp| .{ .voice = sp } else .{ .unknown = name };
+    return if (name.len == 0 or std.mem.eql(u8, name, "default")) .{ .voice = null } else .no_voices;
 }
 
 fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) callconv(.c) Verdict {
@@ -115,7 +133,31 @@ fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) 
         .bad_wav => return bad("ref_audio is not a decodable WAV"),
     }
     const language = languageOf(e, &body) catch return bad("language is not one this model supports (auto, or a name in its codec_language_id)");
-    const out = e.synth.synthesizeWav(text, max_frames, job.progressOf(progress), ref, language) catch |err| return switch (err) {
+    const cfg = &e.synth.model.cfg;
+    const speaker = switch (voiceOf(cfg, &body)) {
+        .voice => |sp| sp,
+        .no_voices => return bad(no_voices),
+        .unknown => |name| {
+            var names: [tts.TtsConfig.max_speakers * 26]u8 = undefined;
+            var w = std.Io.Writer.fixed(&names);
+            for (cfg.speakers[0..cfg.n_speakers], 0..) |*sp, i| w.print("{s}{s}", .{ if (i == 0) "" else ", ", sp.name[0..sp.len] }) catch break;
+            return req.refuseFmt(.unsupported, unknown_voice, "'voice' must be one of this model's voices ({s}), got '{s}'", .{ w.buffered(), name });
+        },
+    };
+    const instruct: ?[]const u8 = if (body.get("instructions")) |v| switch (v) {
+        .null => null,
+        .string => |text_| if (text_.len == 0) null else text_,
+        else => return bad("'instructions' must be a string"),
+    } else null;
+    if (instruct != null and !cfg.takesInstruct()) return bad(no_instructions);
+    if (instruct == null and cfg.kind == .voice_design) return bad(needs_instructions);
+    const out = e.synth.synthesizeWav(text, max_frames, job.progressOf(progress), .{
+        .ref_audio = ref,
+        .speaker = speaker,
+        .instruct = instruct,
+        .language = language,
+        .seed = body.uint("seed") orelse 0,
+    }) catch |err| return switch (err) {
         error.Cancelled => job.client_left,
         else => job.failure(err, "synthesis failed"),
     };
@@ -342,6 +384,107 @@ test "qwen3_tts plugin: a named language conditions the codec prefix; auto is th
     try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":\"klingon\"}")).refused.why.slice());
     try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":\"beijing_dialect\"}")).refused.why.slice());
     try testing.expectEqualStrings(why, (try pack.run("{\"input\":\"hi\",\"language\":2071}")).refused.why.slice());
+}
+
+/// The tiny pack as another checkpoint kind: `top` joins the config's root keys, `talker` its `talker_config`.
+fn openAs(a: std.mem.Allocator, comptime top: []const u8, comptime talker: []const u8) !MediaPack {
+    var fx = try conformanceFixture(a);
+    const files = try a.dupe(sdk.fixture.File, fx.files);
+    for (files) |*f| if (std.mem.eql(u8, f.name, "config.json")) {
+        const rooted = try std.mem.replaceOwned(u8, a, f.bytes, "{\"model_type\":\"qwen3_tts\",", "{\"model_type\":\"qwen3_tts\"," ++ top);
+        f.bytes = try std.mem.replaceOwned(u8, a, rooted, "\"talker_config\":{", "\"talker_config\":{" ++ talker);
+    };
+    fx.files = files;
+    return MediaPack.openFixture(a, fx);
+}
+
+const custom_voice_talker = "\"spk_id\":{\"ryan\":2861,\"dylan\":2878},\"spk_is_dialect\":{\"ryan\":false,\"dylan\":\"beijing_dialect\"},";
+
+fn wavOf(a: std.mem.Allocator, pack: *MediaPack, body: []const u8) ![]const u8 {
+    const out = try pack.run(body);
+    if (out == .refused) {
+        std.debug.print("refused: {s} ({s})\n", .{ out.refused.why.slice(), body });
+        return error.Refused;
+    }
+    try testing.expectEqualStrings("RIFF", out.ok[0..4]);
+    return a.dupe(u8, out.ok);
+}
+
+fn whyOf(pack: *MediaPack, body: []const u8) ![]const u8 {
+    const out = try pack.run(body);
+    try testing.expect(out == .refused);
+    return out.refused.why.slice();
+}
+
+test "qwen3_tts plugin: a seed picks the draw" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var pack = try MediaPack.open(al);
+    defer pack.close();
+    const zero = try wavOf(al, &pack, "{\"input\":\"hi there\"}");
+    try testing.expectEqualSlices(u8, zero, try wavOf(al, &pack, "{\"input\":\"hi there\",\"seed\":0}"));
+    const seeded = try wavOf(al, &pack, "{\"input\":\"hi there\",\"seed\":7}");
+    try testing.expect(!std.mem.eql(u8, zero, seeded));
+    try testing.expectEqualSlices(u8, seeded, try wavOf(al, &pack, "{\"input\":\"hi there\",\"seed\":7}"));
+}
+
+test "qwen3_tts plugin: a Base pack refuses a voice name and instructions by name" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var pack = try MediaPack.open(al);
+    defer pack.close();
+    const plain = try wavOf(al, &pack, "{\"input\":\"hi there\"}");
+    try testing.expectEqualSlices(u8, plain, try wavOf(al, &pack, "{\"input\":\"hi there\",\"voice\":\"default\"}"));
+    try testing.expectEqualSlices(u8, plain, try wavOf(al, &pack, "{\"input\":\"hi there\",\"voice\":\"\",\"instructions\":\"\"}"));
+    for ([_][]const u8{ "{\"input\":\"hi\",\"voice\":\"ryan\"}", "{\"input\":\"hi\",\"speaker\":\"ryan\"}", "{\"input\":\"hi\",\"voice\":7}" }) |body|
+        try testing.expectEqualStrings(no_voices, try whyOf(&pack, body));
+    try testing.expectEqualStrings(no_instructions, try whyOf(&pack, "{\"input\":\"hi\",\"instructions\":\"Speak slowly.\"}"));
+}
+
+test "qwen3_tts plugin: a CustomVoice pack speaks in the named voice, styled by instructions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var pack = try openAs(al, "\"tts_model_type\":\"custom_voice\",\"tts_model_size\":\"1b7\",", custom_voice_talker);
+    defer pack.close();
+    const ryan = try wavOf(al, &pack, "{\"input\":\"hi there\",\"voice\":\"Ryan\"}");
+    try testing.expectEqualSlices(u8, ryan, try wavOf(al, &pack, "{\"input\":\"hi there\",\"speaker\":\"ryan\"}"));
+    const dylan = try wavOf(al, &pack, "{\"input\":\"hi there\",\"voice\":\"dylan\"}");
+    try testing.expect(!std.mem.eql(u8, ryan, dylan));
+    const angry = try wavOf(al, &pack, "{\"input\":\"hi there\",\"voice\":\"ryan\",\"instructions\":\"Speak very angrily and loudly.\"}");
+    try testing.expect(!std.mem.eql(u8, ryan, angry));
+    // A dialect voice speaks its dialect under auto; a named language is kept.
+    try testing.expect(!std.mem.eql(u8, dylan, try wavOf(al, &pack, "{\"input\":\"hi there\",\"voice\":\"dylan\",\"language\":\"english\"}")));
+
+    try testing.expectEqualStrings(unknown_voice, try whyOf(&pack, "{\"input\":\"hi\"}"));
+    try testing.expectEqualStrings(unknown_voice, try whyOf(&pack, "{\"input\":\"hi\",\"voice\":\"alloy\"}"));
+    try testing.expectEqualStrings("'instructions' must be a string", try whyOf(&pack, "{\"input\":\"hi\",\"voice\":\"ryan\",\"instructions\":3}"));
+}
+
+test "qwen3_tts plugin: a 0.6B CustomVoice pack refuses instructions" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var pack = try openAs(al, "\"tts_model_type\":\"custom_voice\",\"tts_model_size\":\"0b6\",", custom_voice_talker);
+    defer pack.close();
+    _ = try wavOf(al, &pack, "{\"input\":\"hi there\",\"voice\":\"ryan\"}");
+    try testing.expectEqualStrings(no_instructions, try whyOf(&pack, "{\"input\":\"hi\",\"voice\":\"ryan\",\"instructions\":\"Speak slowly.\"}"));
+}
+
+test "qwen3_tts plugin: a VoiceDesign pack speaks in the described voice and needs the description" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const al = arena.allocator();
+    var pack = try openAs(al, "\"tts_model_type\":\"voice_design\",\"tts_model_size\":\"1b7\",", "\"spk_id\":{},\"spk_is_dialect\":{},");
+    defer pack.close();
+    const old = try wavOf(al, &pack, "{\"input\":\"hi there\",\"instructions\":\"A deep, gravelly voice of an elderly man.\"}");
+    const young = try wavOf(al, &pack, "{\"input\":\"hi there\",\"instructions\":\"A bright, energetic young woman.\"}");
+    try testing.expect(!std.mem.eql(u8, old, young));
+    try testing.expectEqualStrings(needs_instructions, try whyOf(&pack, "{\"input\":\"hi\"}"));
+    try testing.expectEqualStrings(needs_instructions, try whyOf(&pack, "{\"input\":\"hi\",\"instructions\":\"\"}"));
+    try testing.expectEqualStrings(no_voices, try whyOf(&pack, "{\"input\":\"hi\",\"voice\":\"ryan\",\"instructions\":\"A calm man.\"}"));
 }
 
 const MediaPack = @import("../../sdk/testing/media_pack.zig").MediaPack(@This());

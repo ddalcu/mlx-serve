@@ -62,7 +62,7 @@ echo "  health interval:    ${HEALTH_INTERVAL_SEC}s"
 echo "  log:                $SAMPLE_LOG"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 2
 
 SERVER_LOG=$(mktemp)

@@ -193,7 +193,7 @@ echo "== batched-kernel byte-equivalence test =="
 echo "  model: $MODEL"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 OUT_SINGLE=$(run_request "single-slot path (default)" "0") || exit 1

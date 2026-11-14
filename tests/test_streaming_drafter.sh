@@ -136,7 +136,7 @@ echo "  drafter: $DRAFTER"
 echo "  prompt:  <echo-heavy code rename>"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 # Reference: regular streaming, no drafter — what the streamed bytes SHOULD look like.

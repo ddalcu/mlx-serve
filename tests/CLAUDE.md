@@ -7,12 +7,12 @@ plus the rules for running them. What a script checks, what it needs and how to 
 
 - **Binary**: scripts run `./zig-out/bin/mlx-serve` (most take `BINARY` or `MLX_SERVE_BIN`). Build
   `zig build -Doptimize=ReleaseFast` first; `zig build test` does not refresh it, and Debug is 2-4x slower.
-- **Boot and wait through `tests/lib/server.sh`** (`srv_wait_health`, `srv_wait_log`, `srv_stop`; Python twin
-  `tests/lib/server.py`, `from lib.server import wait_health`). Readiness is the STATUS: `/health` answers 503
-  `loading` while a model loads, so a bare socket or `curl -s` check lies.
-- **Kill only the server you started** (`srv_stop "$PID"` or `pkill -f "mlx-serve.*--port $PORT"`), never by name or
-  binary path: that kills the app's server and other sessions' runs. The app's server is 11234 (11240/11250 are
-  taken too); every script has its own default port, pass one when running several.
+- **Boot and wait through `tests/lib/server.sh`** (`srv_wait_health`, `srv_wait_log`, `srv_stop`, `srv_preclean`;
+  Python twin `tests/lib/server.py`, `from lib.server import wait_health`). Readiness is the STATUS: `/health` answers
+  503 `loading` while a model loads, so a bare socket or `curl -s` check lies.
+- **Kill only the server you started**: `srv_stop "$PID"`, or `srv_preclean "$PORT"` for a leftover (the mlx-serve
+  listening on the port, started from this checkout). Never `pkill` by name, flags or path: a `--port $PORT` pattern
+  takes a production server on that port. The app's is 11234 (11240/11250 too); pass a port when running several.
 - **Scratch HOME** for anything that lists, picks or configures models: a real `~/.mlx-serve/model-settings.json`
   attaches drafters and pins KV schemes, `providers.json` adds `@provider` rows. A test asserting one spec mode passes
   `--no-drafter` / `--no-mtp` for the arms it does not test.
@@ -67,6 +67,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_providers.sh` **H** upstream providers via stubs · `test_launch_cmd.sh` `mlx-serve launch <agent>`
 - `test_launch_script.sh` **H** GET /launch · `test_website_agent_install.sh` **H** website/agent.sh · `test_opencode_probe.sh` **H**
 - `test_run_quiet.sh` **H** REPL greeting has no discovery noise · `test_partial_download.sh` **H** interrupted pull resumes
+- `test_hf_endpoint.sh` **H** `pull` through `HF_ENDPOINT` (a stub hub): files land, the token rides to it, a non-URL is ignored
 - `test_pull_registers_org_id.sh` **H** `/api/pull org/name` id · `test_lan_share.sh`, `test_lan_peer_key.sh` two servers over LAN
 
 **Tool calling, thinking, sampling, formats**
@@ -82,6 +83,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_hot_switch_state.sh` per-model tokenizer/template/grammar · `test_tokenizer_hf_parity.sh` /tokenize == HF
 - `test_logprobs.sh` logprobs contract · `test_repeat_penalty.sh` penalties on every path · `test_sampling_defaults.py` min_p
 - `test_generation_defaults.py` defaults files + `ignore_client` · `glm_exactness.py` **R** greedy/seed/logprob exactness
+- `test_suppress_cjk.sh` `suppress_cjk` on four surfaces, greedy PLD included
 - `harvest_tool_traffic.py` capture real tool traffic into the replay fixture
 
 **Agents**
@@ -117,8 +119,9 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_idle_evict.sh` --idle-evict-secs · `test_load_progress.sh` /v1/load-progress · `test_cold_load_launch_flags.sh` cold loads keep flags
 - `test_first_request_compiles.sh` a build's first load of a model warms its kernels: when idle by default, before ready with `--warmup-full` (empty shader cache via a re-identified copy)
 - `test_load_failure_no_fallback.sh` a broken pack never falls back · `test_load_model_api.sh`, `test_load_model_default.sh` /v1/load-model
-- `test_model_alias.sh` Model Settings alias · `test_model_settings.sh` per-model settings · `test_model_discovery.sh` discovery
+- `test_model_alias.sh` Model Settings alias · `test_model_settings.sh` per-model settings · `test_model_settings_symlink.sh` settings through a symlinked folder · `test_model_discovery.sh` discovery
 - `test_model_rescan.sh` **H** rescan · `test_multi_model_dir.sh` **H** repeatable --model-dir
+- `test_gguf_startup_catalog.sh` **E** a `--model x.gguf` boot lists and rescans every discovered model
 - `test_multi_model_{basic,concurrent,lru,load_failure,eviction_with_active_request}.sh` multi-model routing and eviction
 
 **KV and prefix cache**
@@ -129,7 +132,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
 - `test_tokenize_cache.sh`, `test_tokenize_ms_present.sh` tokenize cache · `diff_restore_dump.py` diff restore dumps
 
 **Engines and runtime**
-- `test_llama_gguf.sh` **E**, `test_llama_concurrent.sh` **E**, `test_llama_multi_session.sh`, `test_llama_persistent_session.sh` llama.cpp
+- `test_llama_gguf.sh` **E**, `test_llama_concurrent.sh` **E**, `test_llama_multi_session.sh`, `test_llama_persistent_session.sh` llama.cpp · `test_llama_q2_0.sh` **E** a Q2_0 GGUF answers correctly
 - `test_ds4_serve.sh`, `test_ds4_smoke.sh`, `test_ds4_ssd_streaming.sh` ds4 · `test_mlx_gguf.sh` MLX GGUF · `test_qwen4exp_gguf_route.sh`
 - `test_ane_prefill.sh`, `test_ane_engine.sh` Neural Engine · `test_mlx_staged_nax.sh` **H** NAX-enabled mlx stage
 - `test_phase2_forward_equivalence.sh` forward pinned vs a baseline · `test_decode_graph_dump.sh` graph dump guard
@@ -190,7 +193,7 @@ Marks: **H** no model needed; **E** env-gated on a pack (SKIP without); **R** ne
   laguna, latent_rgb_factors, laya (+ numeric), lfm2_vision, lilicorr, ltx (audio, audio encoder, diffvae, upsampler, vae
   encoder), mageflow (dit, e2e, edit e2e, te, te edit, vae, vae encoder, vit), mimo_v2, minicpmv4_7_vision, minimax_h3
   (+ layout, vision, vision tower, vae encoder, audio encoder), moss_image, muse_vision, music3, nemotron_diarization,
-  pixal3d, qwen3_aligner, qwen3_asr, qwen3_embedding, qwen4_exp, qwen4_yarn, qwen_image21, radio (full, vision),
+  pixal3d, qwen3_aligner, qwen3_asr, qwen3_embedding, qwen3_tts (voice), qwen4_exp, qwen4_yarn, qwen_image21, radio (full, vision),
   stable_audio, tokenizer_parity, trellis2, yue2
 - `build_qwen_preprocess_fixture.py`, `build_qwen_vision_fixture.py` Qwen3-VL fixtures · `dsv4_mlx_ref.py` MLX reference
 - `dsv4_template_ab.py`, `dsv41_template_ab.py` byte-exact template A/B · `dsv4_task_compare.py` **R** native vs GGUF tasks

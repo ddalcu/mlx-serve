@@ -6,6 +6,7 @@ const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../util/log.zig");
 const resident = @import("resident.zig");
+const pd = @import("../util/pack_dir.zig");
 const modelopt_pack = @import("../quant/nvfp4/modelopt_pack.zig");
 const affineParamsFromGeometry = @import("../quant/params.zig").affineParamsFromGeometry;
 pub const Weights = resident.Weights;
@@ -22,11 +23,33 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
 /// `dsv41` also reads past the page cache (`nocache_reader`): its weights all load at init, and a pack near the
 /// RAM size would have them compressed under the file cache.
-/// `index_owners`: a tensor two shards carry loads from the shard the index names.
 /// `skip`: a tensor it names never enters the map (qwen4's embedded n-gram table, read from disk per lookup).
-pub const LoadOpts = struct { vision: bool = false, modelopt: bool = false, audio_tower: bool = false, keep_f16: bool = false, skip: ?*const fn (key: []const u8) bool = null, defer_qwen4_norms: bool = false, dsv41: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+pub const LoadOpts = struct {
+    vision: bool = false,
+    modelopt: bool = false,
+    audio_tower: bool = false,
+    keep_f16: bool = false,
+    skip: ?*const fn (key: []const u8) bool = null,
+    defer_qwen4_norms: bool = false,
+    dsv41: bool = false,
+    shard: []const u8 = "",
+    owners: ?*const Owners = null,
+    carriers: ?*const Carriers = null,
+};
 
 pub const Owners = std.StringHashMapUnmanaged([]const u8);
+
+/// `.weight` key -> the shard of record allowed to place it; null = untracked,
+/// placed from any carrier, first copy wins. The fold that fills it: one
+/// carrier owns its own key; the index's owner wins when a second carrier
+/// proves the fork adopted it; a stale naming entry nulls the key — it never
+/// deletes the only copy; with no naming entry a PACKED carrier owns the key
+/// (its copy is the loadable arm of the pair beside it) and a float twin
+/// retires; two float carriers tie and leave it untracked. Quant leaves ride
+/// their weight's carrier of record, except one the index names there — the
+/// owner's own pair, which stays whatever the weight proves. A float winner
+/// sheds the pair it retired; a packed winner keeps its own.
+pub const Carriers = std.StringHashMapUnmanaged(?[]const u8);
 
 /// tensor -> shard from the index's `weight_map`, strings owned by `arena`.
 pub fn indexOwners(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) ?Owners {
@@ -44,6 +67,51 @@ pub fn indexOwners(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) ?Owner
         out.put(arena, e.key_ptr.*, e.value_ptr.string) catch return null;
     }
     return out;
+}
+
+const HeaderEntry = struct {
+    key: []const u8,
+    is_packed: bool,
+};
+
+/// One shard header's `.weight` keys parsed out, names leaked to `arena`.
+fn headerWeights(arena: std.mem.Allocator, raw: []const u8) []const HeaderEntry {
+    var parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch return &.{};
+    if (parsed != .object) return &.{};
+    var out: std.ArrayList(HeaderEntry) = .empty;
+    var it = parsed.object.iterator();
+    while (it.next()) |e| {
+        const k = e.key_ptr.*;
+        if (!std.mem.endsWith(u8, k, ".weight")) continue;
+        const dt = if (e.value_ptr.* == .object) e.value_ptr.object.get("dtype") else null;
+        const affine = dt != null and dt.? == .string and
+            (std.mem.eql(u8, dt.?.string, "U32") or std.mem.eql(u8, dt.?.string, "U8"));
+        out.append(arena, .{ .key = k, .is_packed = affine }) catch return out.items;
+    }
+    return out.items;
+}
+
+/// One header's `.weight` key folded into `car` per `Carriers`' rules.
+fn foldCarrier(arena: std.mem.Allocator, car: *Carriers, e: HeaderEntry, shard: []const u8, owners: *const Owners) void {
+    const k = e.key;
+    const gce = car.getOrPut(arena, k) catch return;
+    if (!gce.found_existing) {
+        gce.key_ptr.* = arena.dupe(u8, k) catch return;
+        gce.value_ptr.* = arena.dupe(u8, shard) catch return;
+        return;
+    }
+    if (gce.value_ptr.* == null) return;
+    const prior = gce.value_ptr.*.?;
+    if (std.mem.eql(u8, prior, shard)) return;
+    if (owners.get(k)) |own| {
+        gce.value_ptr.* = if (std.mem.eql(u8, own, shard) or std.mem.eql(u8, prior, own)) own else null;
+        return;
+    }
+    if (e.is_packed) {
+        gce.value_ptr.* = arena.dupe(u8, shard) catch return;
+        return;
+    }
+    gce.value_ptr.* = prior;
 }
 
 /// deepseek_v41 reads its Engram tables from disk per lookup (~100 GB a layer), so they never enter
@@ -105,9 +173,32 @@ pub fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std
     var referenced = resident.indexShardSet(io, dir);
     defer if (referenced) |*r| resident.freeShardSet(r);
 
-    var owners_arena = std.heap.ArenaAllocator.init(allocator);
-    defer owners_arena.deinit();
-    var owners: ?Owners = if (opts.index_owners) indexOwners(io, owners_arena.allocator(), dir) else null;
+    var scan_arena = std.heap.ArenaAllocator.init(allocator);
+    defer scan_arena.deinit();
+    var owners: ?Owners = indexOwners(io, scan_arena.allocator(), dir);
+    var carriers: Carriers = .empty;
+    var hbuf: []u8 = &.{};
+    if (owners) |_| hbuf = scan_arena.allocator().alloc(u8, 1 << 20) catch hbuf;
+    var pack = pd.FsPackDir{ .io = io, .root = dir };
+
+    // Pass 1: every shard the load will actually open, headers only — each
+    // parsed once — so a duplicated key resolves to its carrier before either
+    // shard places. An extra shard the index never names contributes nothing:
+    // it never loads, so its keys are not competition for a carrier slot.
+    if (owners) |_| {
+        var hd = dir.iterate();
+        while (hd.next(io) catch null) |entry| {
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+            if (referenced) |r| if (!r.contains(entry.name)) continue;
+            var hlen: usize = 0;
+            if (hbuf.len > 0 and pack.packDir().safetensors_header(pack.packDir().ctx, .of(entry.name), hbuf.ptr, hbuf.len, &hlen).isOk()) {
+                for (headerWeights(scan_arena.allocator(), hbuf[0..hlen])) |e| {
+                    foldCarrier(scan_arena.allocator(), &carriers, e, entry.name, &owners.?);
+                }
+            }
+        }
+    }
 
     var file_count: u32 = 0;
     var it = dir.iterate();
@@ -130,7 +221,10 @@ pub fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std
         log.info("Loading {s}...\n", .{entry.name});
         var shard_opts = opts;
         shard_opts.shard = entry.name;
-        if (owners) |*o| shard_opts.owners = o;
+        if (owners) |*o| {
+            shard_opts.owners = o;
+            shard_opts.carriers = &carriers;
+        }
         try loadSafetensorsFile(allocator, &weights, path, s, shard_opts);
         file_count += 1;
     }
@@ -144,7 +238,7 @@ pub fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std
             log.info("Loading {s}...\n", .{name.*});
             var shard_opts = opts;
             shard_opts.shard = name.*;
-            if (owners) |*o| shard_opts.owners = o;
+            if (owners) |_| shard_opts.carriers = &carriers;
             try loadSafetensorsFile(allocator, &weights, path, s, shard_opts);
             file_count += 1;
         }
@@ -289,8 +383,45 @@ pub fn loadSafetensorsFile(
 
         const key_str = std.mem.span(key.?);
 
-        const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
-        if (foreign or !keepsTensor(key_str, opts) or (if (opts.skip) |skip| skip(key_str) else false) or
+        // Placement follows the scan's carrier of record (`Carriers`' rules):
+        // a foreign copy drops, a retired leaf is shed below once the placed
+        // weight proves float, the owner's own indexed pair stays.
+        var shed_leaf_key: ?[]const u8 = null;
+        var foreign_copy = false;
+        const scan_base: ?[]const u8 = if (baseOf(key_str)) |b| b else if (std.mem.endsWith(u8, key_str, ".weight"))
+            key_str[0 .. key_str.len - ".weight".len]
+        else
+            null;
+        if (opts.carriers) |c| {
+            if (scan_base) |base| {
+                var wbuf: [512]u8 = undefined;
+                const wkey = std.fmt.bufPrintSentinel(&wbuf, "{s}.weight", .{base}, 0) catch key_str;
+                if (c.get(wkey)) |carrier| {
+                    if (carrier) |shard_of_record| {
+                        if (!std.mem.eql(u8, shard_of_record, opts.shard)) {
+                            // A leaf is a retired pair's only beside a copy of its weight; alone, it is the far half
+                            // of a triple a size-based shard split cut in two.
+                            foreign_copy = baseOf(key_str) == null or shardCarries(tensor_map, wkey);
+                        } else if (baseOf(key_str) != null) {
+                            // The owner's own indexed pair stays; it rides.
+                            const named_here = if (opts.owners) |o|
+                                (o.get(key_str) != null and std.mem.eql(u8, o.get(key_str).?, opts.shard))
+                            else
+                                false;
+                            if (!named_here) shed_leaf_key = base;
+                        }
+                    } else if (baseOf(key_str) != null) {
+                        // An untracked key's leaf rides the first carrier too.
+                        shed_leaf_key = base;
+                    }
+                }
+            }
+        }
+        if (foreign_copy) {
+            _ = mlx.mlx_array_free(value);
+            continue;
+        }
+        if (!keepsTensor(key_str, opts) or (if (opts.skip) |skip| skip(key_str) else false) or
             (opts.dsv41 and dsv41DropsKey(key_str, opts.vision)))
         {
             _ = mlx.mlx_array_free(value);
@@ -315,7 +446,85 @@ pub fn loadSafetensorsFile(
         // oMLX's V4.1 packs nest the text model under `language_model.`: kept under the release's names.
         const name = if (opts.dsv41 and std.mem.startsWith(u8, key_str, dsv41_text_prefix)) key_str[dsv41_text_prefix.len..] else key_str;
         const owned_key = try allocator.dupe(u8, name);
-        try weights.map.put(owned_key, final_value);
+        const gpe = weights.map.getOrPut(owned_key) catch |e| {
+            allocator.free(owned_key);
+            return e;
+        };
+        const was_packed = if (gpe.found_existing) isPacked(mlx.mlx_array_dtype(gpe.value_ptr.*)) else false;
+        if (gpe.found_existing) {
+            _ = mlx.mlx_array_free(gpe.value_ptr.*);
+            // The slot keeps its key (same name by construction); the fresh dupe goes.
+            allocator.free(owned_key);
+        } else {
+            gpe.key_ptr.* = owned_key;
+        }
+        gpe.value_ptr.* = final_value;
+
+        if (std.mem.endsWith(u8, name, ".weight")) {
+            // A float winner over a packed copy sheds the pair it retired.
+            if (gpe.found_existing and was_packed) shedQuantPairIfFloat(weights, name, opts.owners);
+        } else if (shed_leaf_key) |base| {
+            // A retired leaf beside a float winner is out, in both orders.
+            var float_winner = false;
+            var wbuf: [512]u8 = undefined;
+            const wkey_buf = std.fmt.bufPrint(&wbuf, "{s}.weight", .{base}) catch name;
+            if (weights.map.get(wkey_buf)) |w| {
+                if (isFloat(mlx.mlx_array_dtype(w))) float_winner = true;
+            }
+            if (float_winner) {
+                weights.remove(name);
+                continue;
+            }
+        }
+    }
+}
+
+/// Whether this shard's own tensors hold `key`.
+fn shardCarries(tensors: mlx.mlx_map_string_to_array, key: [:0]const u8) bool {
+    var probe = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(probe);
+    return mlx.mlx_map_string_to_array_get(&probe, tensors, key.ptr) == 0;
+}
+
+/// A float weight dtype: every quantized arm routes a float weight to a
+/// kernel that refuses it, so a pair beside a float weight is dead weight.
+fn isFloat(dt: mlx.mlx_dtype) bool {
+    return switch (dt) {
+        .bfloat16, .float16, .float32 => true,
+        else => false,
+    };
+}
+
+/// A packed weight's dtype: the affine layouts an overwrite sheds a pair for.
+fn isPacked(dt: mlx.mlx_dtype) bool {
+    return switch (dt) {
+        .uint32, .uint8 => true,
+        else => false,
+    };
+}
+
+/// The `.weight` a leaf belongs to, when `key` is one.
+fn baseOf(key: []const u8) ?[]const u8 {
+    for (quant_leaves) |leaf| if (std.mem.endsWith(u8, key, leaf)) return key[0 .. key.len - leaf.len];
+    return null;
+}
+
+const quant_leaves = [_][]const u8{ ".scales", ".biases", ".weight_scale_inv" };
+
+/// A float `.weight` placement that overwrote a packed copy frees the pair it
+/// retired (`Carriers`' rules); the winner's own indexed pair stays.
+fn shedQuantPairIfFloat(weights: *Weights, weight_key: []const u8, owners: ?*const Owners) void {
+    const w = weights.map.get(weight_key) orelse return;
+    if (!isFloat(mlx.mlx_array_dtype(w))) return;
+    var buf: [512]u8 = undefined;
+    const base = weight_key[0 .. weight_key.len - ".weight".len];
+    for (quant_leaves) |leaf| {
+        const side = std.fmt.bufPrint(&buf, "{s}{s}", .{ base, leaf }) catch continue;
+        // The winner's own indexed pair stays.
+        if (owners) |o| if (o.get(weight_key)) |wn| if (o.get(side)) |ln| {
+            if (std.mem.eql(u8, ln, wn)) continue;
+        };
+        weights.remove(side);
     }
 }
 

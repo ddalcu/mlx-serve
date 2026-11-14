@@ -170,11 +170,13 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
     if (slot.legacy_gen) |*g| {
-        g.logSpecStats();
-        // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
-        // wiring it only beside generate.zig's own logSpecStats() calls (the
-        // legacy/CLI path) makes it dead on every served request.
-        g.logQsaArms();
+        if (!slot.warm) {
+            g.logSpecStats();
+            // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
+            // wiring it only beside generate.zig's own logSpecStats() calls (the
+            // legacy/CLI path) makes it dead on every served request.
+            g.logQsaArms();
+        }
         g.persistRoundCost();
         // The cache commit below snapshots the n-gram history: settle the pipelined step's owed advance first.
         g.xfm.flushDeferredPle(&g.ctx) catch g.xfm.discardDeferredPle(&g.ctx);
@@ -183,7 +185,7 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (latched) |name| {
         log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
-    if (slot.completion_tokens <= 2) logShortGen(slot, reason);
+    if (slot.completion_tokens <= 2 and !slot.warm) logShortGen(slot, reason);
     commitSlotIfApplicable(sch, slot);
     releasePluginSlot(slot);
     publishHotCacheResidency(sch);

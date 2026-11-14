@@ -62,6 +62,7 @@
 "%@ has no download yet — convert the weights on-device with the matching script in the repo (see its README). They install to ~/.mlx-serve/models/local/." = "%@ 目前还没有可下载版本 —— 请用仓库中匹配的脚本在本机转换权重（见其 README）。转换后的权重会安装到 ~/.mlx-serve/models/local/。";
 "%@ in Sandbox" = "在沙盒中 %@";
 "%@ is empty, encrypted, or contains only scanned images (no extractable text)." = "%@ 为空、已加密，或仅包含扫描图片（无法提取文字）。";
+"%@ is empty, binary, or larger than %@." = "%@ 为空、为二进制文件，或大于 %@。";
 "%@ is taken by another app — kept %@." = "%@ 已被其他应用占用 —— 已保留 %@。";
 "%@ isn't on the network right now — the peer sharing it is offline or LAN discovery is off." = "%@ 目前不在网络上 —— 共享它的对等端已离线，或局域网发现已关闭。";
 "%@ model%@ on disk" = "磁盘上有 %@ 个模型";
@@ -495,6 +496,7 @@
 "Couldn't Load Results" = "无法加载结果";
 "Couldn't convert the reference audio to 24 kHz mono." = "无法将参考音频转换为 24 kHz 单声道。";
 "Couldn't read PDF" = "无法读取 PDF";
+"Couldn't read text file" = "无法读取文本文件";
 "Couldn't read audio" = "无法读取音频";
 "Couldn't read video" = "无法读取视频";
 "Couldn't read the picture %@." = "无法读取图片 %@。";
@@ -1073,7 +1075,7 @@
 "Nature aerial" = "自然航拍";
 "Needs about %@ GB of RAM — your Mac has %lld" = "需要约 %@ GB 内存 —— 你的 Mac 有 %lld";
 "Needs about %@ — your Mac can use about %@ for a model." = "需要约 %@ —— 你的 Mac 可用于模型的内存约为 %@。";
-"Needs about %lld GB of RAM — your Mac has %@" = "大约需要 %lld GB 内存 —— 这台 Mac 有 %@";
+"Needs about %lld GB of RAM — your Mac can give models about %@" = "大约需要 %lld GB 内存 —— 这台 Mac 约有 %@ 可供模型使用";
 "Needs exactly %lld numbers — one per tapped encoder layer." = "需要正好 %lld 个数字 —— 每个勾选的编码器层一个。";
 "Needs more memory than this Mac has" = "所需内存超过这台 Mac 的容量";
 "Negative prompt" = "负面提示词";
@@ -1213,6 +1215,7 @@
 "Other Models" = "其他模型";
 "Out of GPU memory while loading the model — free memory (close other models/apps) and try again." = "加载模型时 GPU 内存不足 —— 请释放内存（关闭其他模型/应用）后重试。";
 "PDF · %lld chars" = "PDF · %lld 字符";
+"Text · %lld chars" = "文本 · %lld 字符";
 "PLD draft len" = "PLD 草稿长度";
 "PLD draft length" = "PLD 草稿长度";
 "PLD key len" = "PLD 键长度";

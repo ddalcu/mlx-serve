@@ -23,8 +23,8 @@ final class WelcomeModelPicksTests: XCTestCase {
     /// one the sheet after it offers.
     func testFrom32GBTheWelcomeListsOnlyTheStarterPick() {
         let expected: [(UInt64, String)] = [
-            (32, "qwen38-27b"), (36, "qwen38-27b-6bit"), (48, "qwen38-27b-8bit"),
-            (64, "qwen38-27b-8bit"), (96, "qwen38-flash-next"), (256, "qwen38-flash-next"),
+            (32, "qwen38-27b"), (36, "qwen38-27b"), (48, "qwen38-27b-6bit"),
+            (64, "qwen38-27b-8bit"), (96, "qwen38-27b-8bit"), (256, "qwen38-flash-next"),
         ]
         for (total, id) in expected {
             let memory = mac(total: total, usable: total * 3 / 4)

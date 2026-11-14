@@ -8,6 +8,7 @@
 # Pins the invariant, never the model's choice: the switch line or a measured serial cell with the switch on,
 # speculation still engaging, no `-> serial` on a short-request burst, and an empty round-cost dir after a --no-mtp
 # boot.
+source "$(dirname "$0")/lib/server.sh"
 
 set -u
 PORT="${1:-11316}"
@@ -108,7 +109,7 @@ RC_DIR="$ISO_HOME/.mlx-serve/round-cost"
 
 start_server() { # $1 = log path
     local log="$1"
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     for _ in $(seq 1 30); do
         lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
         sleep 1
@@ -262,7 +263,7 @@ echo "== boot C: --no-mtp, persistence ON, isolated HOME =="
 LOG_C=/tmp/mtp_adaptive_nomtp.log
 mkdir -p "$ISO_HOME"
 rm -rf "$RC_DIR"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 for _ in $(seq 1 30); do
     lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
     sleep 1
