@@ -4,9 +4,10 @@
 # gates the siblings' loads by memory and leaves them their own context like every other boot.
 #
 # With SIBLING_MLX_MODEL (an MLX chat model dir) it also loads that model beside the GGUF and checks it runs with the
-# settings a headless boot gives it (PLD, prefix cache, spec flags).
+# settings a headless boot gives it (PLD, prefix cache, spec flags); with MEDIA_BOOT_MODEL (a media pack) the same
+# beside a server started on that pack.
 #
-#   LLAMA_GGUF_MODEL=/path/to/model.gguf [SIBLING_MLX_MODEL=/path/to/mlx-model] \
+#   LLAMA_GGUF_MODEL=/path/to/model.gguf [SIBLING_MLX_MODEL=/path/to/mlx-model] [MEDIA_BOOT_MODEL=/path/to/pack] \
 #       ./tests/test_gguf_startup_catalog.sh [port]   # LLAMA_GGUF_MODEL unset = SKIP
 set -uo pipefail
 source "$(dirname "$0")/lib/server.sh"
@@ -89,12 +90,22 @@ sibling_settings() {
         python3 -I -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["settings"], sort_keys=True, indent=1))'
     srv_stop "$SERVER_PID"; SERVER_PID=""
 }
-ON_GGUF="$(sibling_settings --model "$WORK/models/testorg/pack-GGUF/model.gguf")"
 ON_HEADLESS="$(sibling_settings)"
-if [ -n "$ON_GGUF" ] && [ "$ON_GGUF" = "$ON_HEADLESS" ]; then
-    echo "PASS a model loaded beside the GGUF runs with the settings a headless boot gives it"
+SIB_FAIL=0
+same_as_headless() {
+    if [ -n "$2" ] && [ "$2" = "$ON_HEADLESS" ]; then
+        echo "PASS a model loaded beside $1 runs with the settings a headless boot gives it"
+    else
+        echo "FAIL a model loaded beside $1 runs with the settings a headless boot gives it"
+        diff <(echo "$2") <(echo "$ON_HEADLESS")
+        SIB_FAIL=1
+    fi
+}
+same_as_headless "the GGUF" "$(sibling_settings --model "$WORK/models/testorg/pack-GGUF/model.gguf")"
+MEDIA="${MEDIA_BOOT_MODEL:-}"
+if [ -n "$MEDIA" ] && [ -d "$MEDIA" ]; then
+    same_as_headless "a media pack" "$(sibling_settings --model "$(cd "$MEDIA" && pwd)")"
 else
-    echo "FAIL a model loaded beside the GGUF runs with the settings a headless boot gives it"
-    diff <(echo "$ON_GGUF") <(echo "$ON_HEADLESS")
-    exit 1
+    echo "SKIP media boot: set MEDIA_BOOT_MODEL to run"
 fi
+exit "$SIB_FAIL"
