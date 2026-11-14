@@ -245,12 +245,10 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
     const chunks = [_]usize{ 0, 8, 24, 40 };
     for ([_]bool{ false, true }) |dspark| {
         const files = if (dspark) try fixture.v41DsparkFiles(arena.allocator(), 7) else try fixture.v41Files(arena.allocator(), 7);
-        const t = try Twin.open(files, "");
-        defer t.close();
-        const model: *v41.Model = @ptrCast(@alignCast(t.m));
-        const regions = model.mdl.regions;
-        defer model.mdl.regions = regions;
-        model.mdl.regions = regions[0..0];
+        const wide = try WideTwin.open(files);
+        defer wide.close();
+        const t = wide.t;
+        const model = wide.model();
         const w: usize = model.mdl.cfg.sliding_window;
         const aux = v41.table.cache.aux orelse return error.MissingAuxHooks;
         try testing.expect(aux.begin_prompt(t.m, 1, .of(&long), .{}, 0, true).isOk());
@@ -283,12 +281,10 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
             const ws = &model.mdl.dec_state.?;
             try testing.expectEqual(n, ws.n);
 
-            const r = try Twin.open(files, "");
-            defer r.close();
-            const cold_model: *v41.Model = @ptrCast(@alignCast(r.m));
-            const cold_regions = cold_model.mdl.regions;
-            defer cold_model.mdl.regions = cold_regions;
-            cold_model.mdl.regions = cold_regions[0..0];
+            const cold_twin = try WideTwin.open(files);
+            defer cold_twin.close();
+            const r = cold_twin.t;
+            const cold_model = cold_twin.model();
             for (chunks[0..3], chunks[1..]) |lo, hi| {
                 if (lo < n) testing.allocator.free(try slotForward(r, .prefill, &.{1}, long[lo..@min(hi, n)], &.{@intCast(lo)}));
             }
@@ -307,12 +303,10 @@ test "deepseek_v41 aux: a snapshot sliced short of its end restores there by rep
             if (n > w) {
                 // The replay makes the first layer's window in one call of `w` rows; a row's bits can depend on its
                 // call's width, so the cold prompt it is judged against ends with that same call.
-                const r2 = try Twin.open(files, "");
-                defer r2.close();
-                const split_model: *v41.Model = @ptrCast(@alignCast(r2.m));
-                const split_regions = split_model.mdl.regions;
-                defer split_model.mdl.regions = split_regions;
-                split_model.mdl.regions = split_regions[0..0];
+                const split = try WideTwin.open(files);
+                defer split.close();
+                const r2 = split.t;
+                const split_model = split.model();
                 for (chunks[0..3], chunks[1..]) |lo, hi| {
                     if (lo < n - w) testing.allocator.free(try slotForward(r2, .prefill, &.{1}, long[lo..@min(hi, n - w)], &.{@intCast(lo)}));
                 }
@@ -404,6 +398,29 @@ fn hostRows(a: mlx.mlx_array) ![]f32 {
     try mlx.check(mlx.mlx_array_eval(f));
     return testing.allocator.dupe(f32, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..mlx.mlx_array_size(f)]);
 }
+
+/// A twin kept on the wide prompt path (its compiled regions set aside until close).
+const WideTwin = struct {
+    t: *Twin,
+    regions: @FieldType(std.meta.Child(@FieldType(v41.Model, "mdl")), "regions"),
+
+    fn open(files: anytype) !WideTwin {
+        const t = try Twin.open(files, "");
+        const m: *v41.Model = @ptrCast(@alignCast(t.m));
+        const regions = m.mdl.regions;
+        m.mdl.regions = regions[0..0];
+        return .{ .t = t, .regions = regions };
+    }
+
+    fn model(self: WideTwin) *v41.Model {
+        return @ptrCast(@alignCast(self.t.m));
+    }
+
+    fn close(self: WideTwin) void {
+        self.model().mdl.regions = self.regions;
+        self.t.close();
+    }
+};
 
 /// Rows of positions [lo, hi) of two `[cap, width]` arrays (a ring's slots, or rows in order when `cap` covers them).
 fn expectRowsEqual(a: mlx.mlx_array, b: mlx.mlx_array, lo: usize, hi: usize, cap: usize) !void {
