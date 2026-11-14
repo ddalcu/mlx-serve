@@ -7,10 +7,8 @@
 //!   order over the router as stored; phase 2 is the stock router text with its one logits read summing the partials.
 //! - One row (`MLX_SERVE_MOE_ROUTER_ONE1`): MLX's own `GEMVKernel` (the pinned MLX's gemv.h, its operand types and its
 //!   store edited), then the stock router text in the threadgroup that arrives last.
-//! - `predict` (an outside plugin's lookahead, no switch): the stock predictor's scores, sigmoid(x @ router^T) +
-//!   correction over an f16 router, on phase 1 and the stock router text's sigmoid.
 //! Every edit to a stock text is found exactly once at compile time. A call outside the plan returns null: the caller
-//! routes (or scores) as before.
+//! routes as before.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -65,20 +63,11 @@ pub fn enabled() bool {
 
 const p1_source: [:0]const u8 = kernelSource("kernels/moe/router_nax_p1.metal");
 const sigmoid_text: [:0]const u8 = router_kernel.ROUTER_SOURCES[@backingInt(router_kernel.RouterMode.sigmoid_bias)];
-const score_text: [:0]const u8 = kernelSource("kernels/moe/router_sigmoid_score.metal");
 
 /// The stock router text's logits read and phase 2's: MLX's split-K accumulate (`out = 0; out += C0; out += C1`).
 const stock_read = "float l = float(logits[rbase + e]);";
 const sum_read = "float l = (0.0f + float(logits[rbase + e])) + float(logits[PSTRIDE + rbase + e]);";
 const p2_source: [:0]const u8 = replaceOnce(sigmoid_text, stock_read, sum_read);
-
-/// The predictor's phase 2: the stock router text's sigmoid (MLX's `Sigmoid`) over the summed partials, then the
-/// correction added as MLX's add adds it.
-const predict_p2_source: [:0]const u8 = std.fmt.comptimePrint("{s}{s}{s}", .{
-    "uint e = thread_position_in_grid.x;\nuint row = thread_position_in_grid.y;\nsize_t rbase = (size_t)row * (size_t)NE;\n",
-    replaceOnce(score_text, stock_read, sum_read),
-    "\n  scores[rbase + e] = sg + correction[e];\n",
-});
 
 fn replaceOnce(comptime s: []const u8, comptime old: []const u8, comptime new: []const u8) [:0]const u8 {
     @setEvalBranchQuota(1_000_000);
@@ -254,7 +243,6 @@ pub fn admit(raw: Array) !bool {
 var declined_said: [@typeInfo(Reason).@"enum".field_names.len]bool = @splat(false);
 var nax_said = false;
 var one1_said = false;
-var predict_said = false;
 
 /// The routes of `x` (the MoE block's input) by `r` on the plan, or null: the caller routes as before. The arrays are
 /// new (the caller adopts them as the stock route's).
@@ -295,27 +283,6 @@ fn naxSaid(rows: c_int) void {
     if (nax_said) return;
     nax_said = true;
     log.info("[moe] router NAX engaged: rows={d} K={d} N={d}\n", .{ rows, hidden, experts });
-}
-
-/// The stock predictor's scores, `sigmoid(astype(x @ router^T, f32)) + correction` (f32 of x's leading dimensions by
-/// 288), for x bf16 at 2 to 4 rows and `router` f16 [288, 4096] as stored, or null outside the plan (the caller scores
-/// as before). A bf16 router keeps MLX's matmul bf16, which phase 1 is not. The array is new.
-pub fn predict(s: mlx.mlx_stream, x: Array, router: Array, correction: Array) !?Array {
-    const xsh = mlx.getShape(x);
-    const rows = rowsOf(xsh) orelse return null;
-    if (rows < min_rows or rows > max_rows) return null;
-    if (mlx.mlx_array_dtype(x) != .bfloat16 or !rowContiguous(x)) return null;
-    if (router.ctx == null or mlx.mlx_array_dtype(router) != .float16 or !std.mem.eql(c_int, mlx.getShape(router), &.{ experts, hidden }) or !rowContiguous(router)) return null;
-    const addr = @intFromPtr(mlx.mlx_array_data_float16(router) orelse return null);
-    if (addr % 16 != 0) return null;
-    if (correction.ctx == null or mlx.mlx_array_dtype(correction) != .float32 or mlx.mlx_array_size(correction) != @as(usize, @intCast(experts)) or !rowContiguous(correction)) return null;
-    if (!device.tf32Matmul() or !mlx.streamIsGpu(s)) return null;
-    const out = try predictTwo(s, x, router, correction);
-    if (!predict_said) {
-        predict_said = true;
-        log.info("[moe] router NAX predict engaged: rows={d} K={d} N={d}\n", .{ rows, hidden, experts });
-    }
-    return out;
 }
 
 // ── the launches ──
@@ -514,33 +481,6 @@ fn routeOne1(s: mlx.mlx_stream, x: Array, raw: Array, bias: Array, k: c_int, nor
     var outs: [3]Array = undefined;
     try applyKernel(s, kern, f.slot.cfg.?, &.{ x, raw, bias, f.slot.scale, cnt }, &outs);
     return .{ .logits = outs[0], .routing = .{ .inds = outs[1], .norm_scores = outs[2] } };
-}
-
-var pp2_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var pp2_cfgs: Cache = .{};
-
-/// The predictor in two launches: phase 1, then the stock sigmoid and the correction over the summed partials.
-fn predictTwo(s: mlx.mlx_stream, x: Array, router: Array, correction: Array) !Array {
-    const xsh = mlx.getShape(x);
-    const rows = rowsOf(xsh) orelse return error.RouterNaxRows;
-    const p = try partials(s, x, router, rows);
-    defer _ = mlx.mlx_array_free(p);
-    const f = pp2_cfgs.find(keyOf(.float32, xsh, 0, false, 0));
-    if (!f.hit) {
-        const cfg = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-        const out_shape = shapeWith(xsh, experts);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &out_shape, xsh.len, .float32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, experts, rows, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 1, 1));
-        try templateInt(cfg, "NE", experts);
-        try templateInt(cfg, "PSTRIDE", rows * experts);
-        f.slot.* = .{ .key = keyOf(.float32, xsh, 0, false, 0), .cfg = cfg };
-    }
-    const kern = try kernelOf(&pp2_kernel, "mlxserve_moe_router_nax_predict_p2", &.{ "logits", "correction" }, &.{"scores"}, predict_p2_source, "", true);
-    var outs: [1]Array = undefined;
-    try applyKernel(s, kern, f.slot.cfg.?, &.{ p, correction }, &outs);
-    return outs[0];
 }
 
 // ── tests ──
@@ -861,70 +801,6 @@ test "router_nax: the one-row launch gives the stock one-row route's logits, rou
         const x2 = try normal(s, &seed, &.{ 1, 2, hidden }, .bfloat16, 1.0);
         defer _ = mlx.mlx_array_free(x2);
         try testing.expectError(error.RouterNaxRows, routeOne1(s, x2, rs.raws[0], rs.biases[0], test_k, test_norm, test_scale));
-    }
-}
-
-/// The stock predictor: `add(sigmoid(astype(x @ transpose(router), f32)), correction)`, MLX promoting bf16 x and the
-/// f16 router to f32.
-fn stockPredict(s: mlx.mlx_stream, x: Array, router: Array, correction: Array) !Array {
-    var t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(t);
-    try mlx.check(mlx.mlx_transpose(&t, router, s));
-    var lg = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(lg);
-    try mlx.check(mlx.mlx_matmul(&lg, x, t, s));
-    var l32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(l32);
-    try mlx.check(mlx.mlx_astype(&l32, lg, .float32, s));
-    var sg = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sg);
-    try mlx.check(mlx.mlx_sigmoid(&sg, l32, s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    try mlx.check(mlx.mlx_add(&out, sg, correction, s));
-    return out;
-}
-
-test "router_nax: predict gives the stock predictor's scores bit for bit at 2, 3 and 4 rows over an f16 router; a bf16 router and 1 or 5 rows score as before" {
-    try skipOffNax();
-    const s = mlx.gpuStream();
-    var seed: u64 = 20261108;
-    var raws: [test_routers]Array = @splat(.{ .ctx = null });
-    var corrs: [test_routers]Array = @splat(.{ .ctx = null });
-    defer for ([_][]Array{ &raws, &corrs }) |set| freeAll(set);
-    for (0..test_routers) |i| {
-        raws[i] = try normal(s, &seed, &.{ experts, hidden }, .float16, 1.0 / 64.0);
-        corrs[i] = try normal(s, &seed, &.{experts}, .float32, 0.1);
-    }
-    for ([_]c_int{ 2, 3, 4 }) |rows| {
-        var sc: Count = .{};
-        var c: usize = 0;
-        while (c < test_calls) : (c += test_batch) {
-            var xs: [test_batch]Array = @splat(.{ .ctx = null });
-            var want: [test_batch]Array = @splat(.{ .ctx = null });
-            var got: [test_batch]Array = @splat(.{ .ctx = null });
-            defer for ([_][]Array{ &xs, &want, &got }) |set| freeAll(set);
-            for (0..test_batch) |b| {
-                const r = (c + b) % test_routers;
-                xs[b] = try xOf(s, &seed, rows, c + b);
-                want[b] = try stockPredict(s, xs[b], raws[r], corrs[r]);
-                got[b] = try predictTwo(s, xs[b], raws[r], corrs[r]);
-            }
-            try evalAll(&got);
-            for (0..test_batch) |b| try countBits(s, want[b], got[b], &sc);
-        }
-        try expectBitEqual("predict", .float16, rows, sc, test_calls * @as(usize, @intCast(rows * experts)));
-    }
-    // the calls the plan does not take
-    const bf = try normal(s, &seed, &.{ experts, hidden }, .bfloat16, 1.0 / 64.0);
-    defer _ = mlx.mlx_array_free(bf);
-    const x3 = try normal(s, &seed, &.{ 3, hidden }, .bfloat16, 1.0);
-    defer _ = mlx.mlx_array_free(x3);
-    try testing.expect((try predict(s, x3, bf, corrs[0])) == null);
-    for ([_]c_int{ 1, 5 }) |rows| {
-        const x = try normal(s, &seed, &.{ rows, hidden }, .bfloat16, 1.0);
-        defer _ = mlx.mlx_array_free(x);
-        try testing.expect((try predict(s, x, raws[0], corrs[0])) == null);
     }
 }
 
