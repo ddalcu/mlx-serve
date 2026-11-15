@@ -1247,7 +1247,7 @@ pub const Model = struct {
     }
 
     /// cfmSampleRaw on the fused kernels: per Euler step one embed dispatch,
-    /// 4 per DiT block, one for final layer + CFG + Euler. The cond embedding
+    /// 5 per DiT block, one for final layer + CFG + Euler. The cond embedding
     /// and x_embed(hist) are fixed across the 10 steps, so they run once.
     fn cfmSampleFused(m: *Model, g: *G, z: Arr, hist: Arr, noise: Arr, sde: Arr, cfg: f32, shift_k: f32) !Arr {
         const ce = try m.c_emb.f(g, try g.concat(&.{ z, try g.zeros(mlx.getShape(z), mlx.mlx_array_dtype(z)) }, 0));

@@ -35,8 +35,7 @@ used is a named 400, never another voice.
 - No parity test against the reference in this tree; `tests/test_ming_tts.sh` proves the HTTP surface on a real pack.
 
 ## Levers
-`MLX_SERVE_MING_FUSED=0`: the op chain, the control arm for the fused kernels. The kernels run from GPU generation 16
-(M4, `fused.zig` `first_gen`); older chips run the op chain.
+`MLX_SERVE_MING_FUSED=0`: the op chain, the control arm for the fused kernels.
 
 ## Fixtures
 - `conformanceFixture`: every stack one layer at hidden 32, no CAM++ (a clone is refused by name), a stop head biased

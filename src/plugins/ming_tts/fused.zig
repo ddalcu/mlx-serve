@@ -2,9 +2,10 @@
 //! one-token step. Sources: `kernels/`.
 //!
 //! The DiT runs on 6 rows (CFG batch 2 x seq 3) or 2 rows (aggregator), so every linear is a bandwidth-bound GEMV. One
-//! DiT block becomes 4 dispatches, each reading its weights once:
+//! DiT block becomes 5 dispatches, each linear reading its weights once:
 //!
-//!   A  rmsnorm1 + q/k/v linear + bias + rotary, then per head attention   -> QKV [3, R, 1024], ATT [R, 1024]
+//!   A  rmsnorm1 + q/k/v linear + bias + rotary                            -> QKV [3, R, 1024]
+//!   A2 per head attention                                                 -> ATT [R, 1024]
 //!   B  out linear + residual
 //!   C  rmsnorm2 + ff1 linear + bias + gelu_approx                         -> [R, 4096]
 //!   D  ff2 linear + bias + residual
@@ -19,13 +20,12 @@
 //!
 //! GEMV layout: a threadgroup of SG simdgroups owns NO output columns for all R rows; the simdgroups take 128-wide
 //! blocks of K round robin, lanes read 4 consecutive bf16 per block (one 8-byte load per weight row), and partial sums
-//! meet in threadgroup memory. R is capped at 6 (attention output in threadgroup memory, and register pressure).
+//! meet in threadgroup memory. R is capped at 6 (register pressure).
 
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const kernels = @import("../../mlx/kernels.zig");
-const device = @import("../../mlx/device.zig");
 
 const Arr = mlx.mlx_array;
 const S = mlx.mlx_stream;
@@ -38,15 +38,11 @@ const Tile = struct { no: c_int, sg: c_int };
 
 var enabled_cache: ?bool = null;
 
-/// The first GPU generation the kernels are verified on (M4). An M3 Ultra (g15) gave unintelligible bf16 speech on
-/// them (#1121); the kernel contract still runs there, so the cause can be found and the floor lowered.
-const first_gen = 16;
-
-/// On from `first_gen` unless `MLX_SERVE_MING_FUSED=0`.
+/// Default on: only `MLX_SERVE_MING_FUSED=0` turns the kernels off.
 pub fn enabled() bool {
     if (enabled_cache) |v| return v;
     const raw = env.span(.MLX_SERVE_MING_FUSED);
-    const v = device.deviceGeneration().gen >= first_gen and (raw == null or !std.mem.startsWith(u8, raw.?, "0"));
+    const v = raw == null or !std.mem.startsWith(u8, raw.?, "0");
     enabled_cache = v;
     return v;
 }
@@ -72,6 +68,7 @@ fn gemv(comptime k: usize, comptime wrow: []const u8, comptime xv: []const u8, c
 }
 
 pub const SRC_QKV = PRELUDE ++ src("dit_qkv_head") ++ gemv(1024, "W + (col0 + n) * 1024", "LDW(X, r * 1024 + i)", true) ++ src("dit_qkv_tail");
+pub const SRC_SDPA = src("dit_sdpa");
 pub const SRC_ATTN = PRELUDE ++ gemv(1024, "WO + (ob + n) * 1024", "LDW(ATT, r * 1024 + i)", false) ++ src("dit_attn_out");
 pub const SRC_FF1 = PRELUDE ++ gemv(1024, "W1 + (ob + n) * 1024", "LDW(X, r * 1024 + i)", true) ++ src("dit_ff1");
 pub const SRC_FF2 = PRELUDE ++ gemv(4096, "W2 + (ob + n) * 4096", "LDW(HH, r * 4096 + i)", false) ++ src("dit_ff2");
@@ -87,8 +84,6 @@ const Kernel = struct {
     name: [*:0]const u8,
     ins: []const [*:0]const u8,
     outs: []const [*:0]const u8 = &.{"OUT"},
-    /// The last output is a u32 counter of `counter` elements that MLX zeroes before the dispatch; it is not returned.
-    counter: ?c_int = null,
     src: [*:0]const u8,
     tile: Tile = .{ .no = 8, .sg = 4 },
     k: ?mlx.mlx_fast_metal_kernel = null,
@@ -106,7 +101,8 @@ const Kernel = struct {
     }
 };
 
-var k_qkv: Kernel = .{ .name = "ming_dit_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, .outs = &.{ "OUT", "ATT", "CNT" }, .counter = D / 64, .src = SRC_QKV, .tile = .{ .no = 2, .sg = 4 } };
+var k_qkv: Kernel = .{ .name = "ming_dit_qkv", .ins = &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, .src = SRC_QKV, .tile = .{ .no = 2, .sg = 4 } };
+var k_sdpa: Kernel = .{ .name = "ming_dit_sdpa", .ins = &.{"QKV"}, .src = SRC_SDPA };
 var k_attn: Kernel = .{ .name = "ming_dit_attn_out", .ins = &.{ "ATT", "X", "WO", "BO" }, .src = SRC_ATTN, .tile = .{ .no = 2, .sg = 4 } };
 var k_ff1: Kernel = .{ .name = "ming_dit_ff1", .ins = &.{ "X", "NW", "W1", "B1" }, .src = SRC_FF1, .tile = .{ .no = 2, .sg = 4 } };
 var k_ff2: Kernel = .{ .name = "ming_dit_ff2", .ins = &.{ "HH", "X", "W2", "B2" }, .src = SRC_FF2, .tile = .{ .no = 2, .sg = 4 } };
@@ -128,10 +124,6 @@ fn runN(kr: *Kernel, inputs: []const Arr, shapes: []const []const c_int, n_cols:
     const c = mlx.mlx_fast_metal_kernel_config_new();
     defer _ = mlx.mlx_fast_metal_kernel_config_free(c);
     for (shapes) |sh| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, sh.ptr, sh.len, .bfloat16));
-    if (kr.counter) |n| {
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{n}, 1, .uint32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_init_value(c, 0));
-    }
     var n_tg = tgs;
     var tg = tg_threads;
     if (n_cols) |n| {
@@ -188,33 +180,25 @@ pub fn eligible(x: Arr, s: S) bool {
 
 pub const BlockOut = struct { qkv: Arr, att: Arr, x1: Arr, hh: Arr, x2: Arr };
 
-fn qkvAtt(b: *const Block, x: Arr, cos: Arr, sin: Arr, t: []const Tmpl, s: S) ![2]Arr {
-    const sh = mlx.getShape(x);
-    const R = sh[0] * sh[1];
-    const tl = k_qkv.tile;
-    const ta: []const Tmpl = &.{ t[0], t[1], .{ "NTG", @divExact(3 * 64, tl.no) } };
-    var o: [2]Arr = undefined;
-    try runN(&k_qkv, &.{ x, b.norm1, b.wq, b.wk, b.wv, b.bq, b.bk, b.bv, cos, sin }, &.{ &.{ 3, R, D }, &.{ R, D } }, 3 * D, 0, 128, ta, s, &o);
-    return o;
-}
-
-/// One DiT block, 4 dispatches. Intermediates are returned so the caller's
+/// One DiT block, 5 dispatches. Intermediates are returned so the caller's
 /// graph scope frees them; `x2` is the block output [B, L, 1024].
 pub fn block(b: *const Block, x: Arr, cos: Arr, sin: Arr, s: S) !BlockOut {
     const sh = mlx.getShape(x);
     const L = sh[1];
     const R = sh[0] * L;
     const t: []const Tmpl = &.{ .{ "R", R }, .{ "L", L } };
-    const qa = try qkvAtt(b, x, cos, sin, t, s);
-    errdefer for (qa) |y| {
-        _ = mlx.mlx_array_free(y);
-    };
-    const x1 = try run(&k_attn, &.{ qa[1], x, b.wo, b.bo }, sh, D, 0, t, s);
+    const qkv = try run(&k_qkv, &.{ x, b.norm1, b.wq, b.wk, b.wv, b.bq, b.bk, b.bv, cos, sin }, &.{ 3, R, D }, 3 * D, 0, t, s);
+    errdefer _ = mlx.mlx_array_free(qkv);
+    // Attention reads q/k/v from A's output, so it is its own dispatch: the stream orders it after A.
+    var att: [1]Arr = undefined;
+    try runN(&k_sdpa, &.{qkv}, &.{&.{ R, D }}, null, D / 64, 64, t, s, &att);
+    errdefer _ = mlx.mlx_array_free(att[0]);
+    const x1 = try run(&k_attn, &.{ att[0], x, b.wo, b.bo }, sh, D, 0, t, s);
     errdefer _ = mlx.mlx_array_free(x1);
     const hh = try run(&k_ff1, &.{ x1, b.norm2, b.w1, b.b1 }, &.{ R, FF }, FF, 0, t, s);
     errdefer _ = mlx.mlx_array_free(hh);
     const x2 = try run(&k_ff2, &.{ hh, x1, b.w2, b.b2 }, sh, D, 0, t, s);
-    return .{ .qkv = qa[0], .att = qa[1], .x1 = x1, .hh = hh, .x2 = x2 };
+    return .{ .qkv = qkv, .att = att[0], .x1 = x1, .hh = hh, .x2 = x2 };
 }
 
 /// CFM input rows h [2, 3, 1024] from latent y [1, 1, 64].
@@ -277,13 +261,6 @@ pub fn lmLayer(l: *const LmLayer, x: Arr, pos: Arr, kc: Arr, vc: Arr, log2_theta
 
 // ── tests ──
 
-test "ming_tts fused: on from first_gen unless the switch says 0" {
-    defer device.device_gen_override = null;
-    defer enabled_cache = null;
-    device.device_gen_override = .{ .gen = 15, .phone = false }; // M3
-    enabled_cache = null;
-    try std.testing.expect(!enabled());
-    device.device_gen_override = .{ .gen = first_gen, .phone = false };
-    enabled_cache = null;
+test "ming_tts fused: on unless the switch says 0" {
     try std.testing.expect(env.span(.MLX_SERVE_MING_FUSED) != null or enabled());
 }

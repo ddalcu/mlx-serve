@@ -3,7 +3,7 @@
 //! The kernels round to bf16 at the op chain's points but fold rmsnorm into the GEMV and sum in their own order, so no
 //! chain is bit-equal: each output is held to float64 with its forward error carried value by value (`host.Val`).
 //! Shapes: DiT `rows` R and `n` B (L = R / B); `lm_attn` `rows` Lc; `lm_qkv` `n` POS; the rest are fixed geometry and
-//! ignore `rows`. A's ATT is checked against attention over the OUT the same dispatch wrote; OUT has its own check.
+//! ignore `rows`.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -22,13 +22,11 @@ const FF = 4096;
 const WL = 896;
 const MLP = 4864;
 const HEADS = D / 64;
-/// Threadgroups per head of `ming_dit_qkv` (NTG): 3 * 64 columns, 2 per threadgroup.
-const QKV_TGS = 3 * 64 / 2;
 const CFG: f32 = 2;
 const STEP = 3;
 const LOG2_THETA: f32 = @log2(@as(f32, 10000));
 
-const Kind = enum { dit_qkv, dit_out, dit_ff1, dit_ff2, embed, final, lm_qkv, lm_attn, lm_o, lm_up, lm_down };
+const Kind = enum { dit_qkv, dit_sdpa, dit_out, dit_ff1, dit_ff2, embed, final, lm_qkv, lm_attn, lm_o, lm_up, lm_down };
 
 /// GEMV threadgroup bytes: `red[SG * NO * R]` and `ssr[SG * R]` floats.
 fn gemvBytes(no: u32, r: u32) u32 {
@@ -40,14 +38,15 @@ fn launchOf(comptime name: [:0]const u8, comptime inputs: []const [*:0]const u8,
     return .{ .name = name, .inputs = inputs, .outputs = outputs, .source = source, .header = fused.HEADER, .tg_bytes = tg_bytes, .m1 = limit, .m2 = limit };
 }
 
-// A adds `hq[3 * R * 32]` uints and a bool at R 6; LB `q[64]`, `sc[512]`, `rd[256]` floats.
-const qkv_launch = launchOf("ming_dit_qkv", &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, &.{ "OUT", "ATT", "CNT" }, fused.SRC_QKV, gemvBytes(2, 6) + 2304 + 4, 640);
+const qkv_launch = launchOf("ming_dit_qkv", &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "COS", "SIN" }, &.{"OUT"}, fused.SRC_QKV, gemvBytes(2, 6), 640);
+const sdpa_launch = launchOf("ming_dit_sdpa", &.{"QKV"}, &.{"OUT"}, fused.SRC_SDPA, 0, 1024);
 const attn_launch = launchOf("ming_dit_attn_out", &.{ "ATT", "X", "WO", "BO" }, &.{"OUT"}, fused.SRC_ATTN, gemvBytes(2, 6), 1024);
 const ff1_launch = launchOf("ming_dit_ff1", &.{ "X", "NW", "W1", "B1" }, &.{"OUT"}, fused.SRC_FF1, gemvBytes(2, 6), 640);
 const ff2_launch = launchOf("ming_dit_ff2", &.{ "HH", "X", "W2", "B2" }, &.{"OUT"}, fused.SRC_FF2, gemvBytes(2, 6), 1024);
 const embed_launch = launchOf("ming_cfm_embed", &.{ "Y", "WX", "BX", "TE", "CE", "XH" }, &.{"OUT"}, fused.SRC_EMBED, 0, 1024);
 const final_launch = launchOf("ming_cfm_final", &.{ "X", "NW", "WF", "BF", "Y", "DTT", "SQ", "SDE" }, &.{"OUT"}, fused.SRC_FINAL, 0, 1024);
 const lm_qkv_launch = launchOf("ming_lm_qkv", &.{ "X", "NW", "WQ", "WK", "WV", "BQ", "BK", "BV", "POS" }, &.{"OUT"}, fused.SRC_LM_QKV, gemvBytes(2, 1), 1024);
+// LB: `q[64]`, `sc[512]`, `rd[256]` floats.
 const lm_attn_launch = launchOf("ming_lm_attn", &.{ "QKV", "KC", "VC" }, &.{ "OUT", "KN", "VN" }, fused.SRC_LM_ATTN, 4 * (64 + 512 + 256), 1024);
 const lm_o_launch = launchOf("ming_lm_o", &.{ "O", "X", "WO" }, &.{"OUT"}, fused.SRC_LM_O, gemvBytes(2, 1), 1024);
 const lm_up_launch = launchOf("ming_lm_up", &.{ "X", "NW", "WG", "WU" }, &.{"OUT"}, fused.SRC_LM_UP, gemvBytes(4, 1), 1024);
@@ -56,7 +55,7 @@ const lm_down_launch = launchOf("ming_lm_down", &.{ "HH", "X", "WD" }, &.{"OUT"}
 /// What an input holds, which decides how `.random`, `.nonfinite` and `.stress` fill it. `act`: activations a
 /// non-finite row may hit (DiT); `fixed`: the same but kept finite (one row, or a row every output reads); `res`: the
 /// residual x.
-const Role = enum { act, fixed, res, norm, w, bias, cos, sin, y, dtt, sq, sde, qkv, kv_k, kv_v, pos };
+const Role = enum { act, fixed, res, norm, w, bias, cos, sin, y, dtt, sq, sde, dit_qkv, qkv, kv_k, kv_v, pos };
 
 const In = struct {
     role: Role,
@@ -110,6 +109,7 @@ fn layout(kind: Kind, shape: Shape) Layout {
             l.add(.cos, &.{ 1, 1, seq, 32 });
             l.add(.sin, &.{ 1, 1, seq, 32 });
         },
+        .dit_sdpa => l.add(.dit_qkv, &.{ 3, r, D }),
         .dit_out => {
             l.add(.act, &.{ r, D });
             l.add(.res, &.{ b, seq, D });
@@ -278,7 +278,7 @@ const Ming = struct {
         const b: c_int = @intCast(@max(shape.n, 1));
         const seq = @divTrunc(r, b);
         const dit = switch (self.kind) {
-            .dit_qkv, .dit_out, .dit_ff1, .dit_ff2, .final => true,
+            .dit_qkv, .dit_sdpa, .dit_out, .dit_ff1, .dit_ff2, .final => true,
             else => false,
         };
         if (dit and (r == 0 or r > 6 or @rem(r, b) != 0)) return null;
@@ -286,11 +286,15 @@ const Ming = struct {
             .dit_qkv => {
                 gemv(&g, 3 * D, 2);
                 g.out(&.{ 3, r, D }, .bfloat16);
-                g.out(&.{ r, D }, .bfloat16);
-                g.out(&.{HEADS}, .uint32);
                 g.int("R", r);
                 g.int("L", seq);
-                g.int("NTG", QKV_TGS);
+            },
+            .dit_sdpa => {
+                g.grid = .{ HEADS * 64, 1, 1 };
+                g.tg = .{ 64, 1, 1 };
+                g.out(&.{ r, D }, .bfloat16);
+                g.int("R", r);
+                g.int("L", seq);
             },
             .dit_out, .dit_ff2 => {
                 gemv(&g, D, 2);
@@ -372,7 +376,7 @@ const Ming = struct {
         const x = self.v[i];
         const r = struct { lo: f64, hi: f64 };
         const span: r = switch (in.role) {
-            .act, .fixed, .res, .qkv, .kv_k, .kv_v => .{ .lo = -2, .hi = 2 },
+            .act, .fixed, .res, .dit_qkv, .qkv, .kv_k, .kv_v => .{ .lo = -2, .hi = 2 },
             .norm => .{ .lo = 0.5, .hi = 1.5 },
             .w => .{ .lo = -0.05, .hi = 0.05 },
             .bias => .{ .lo = -0.1, .hi = 0.1 },
@@ -409,6 +413,12 @@ const Ming = struct {
                 s.* = q[1];
             },
             // Keys rotated across their halves against q at +-251: dots a few levels apart, partial sums past fp16.
+            .dit_qkv => {
+                const n = x.len / 3;
+                signedRows(x[0..n], 64, 8 * 251, rng);
+                keyRows(x[n .. 2 * n], rng);
+                host.intsInto(rng, x[2 * n ..], -8, 8);
+            },
             .qkv => {
                 signedRows(x[0 .. 14 * 64], 64, 8 * 251, rng);
                 keyRows(x[14 * 64 .. 16 * 64], rng);
@@ -444,6 +454,13 @@ const Ming = struct {
             .res => host.plant(x, @min(rows, 3), width),
             .y => host.plant(x, 1, width),
             .qkv => host.plant(x[7 * 64 ..], 4, 64),
+            // q of row 0 in heads 3-6, k of row 1 in heads 9-10, v of row 0 in heads 12-14.
+            .dit_qkv => {
+                const n = x.len / 3;
+                host.plant(x[3 * 64 ..], 4, 64);
+                host.plant(x[n + D + 9 * 64 ..], 2, 64);
+                host.plant(x[2 * n + 12 * 64 ..], 3, 64);
+            },
             .kv_v => host.plant(x, @min(rows, 3), width),
             else => {},
         }
@@ -472,14 +489,14 @@ const Ming = struct {
             try rig.input(in.dtype(), in.dims[0..in.nd], self.v[i]);
         const width = ins[0].width();
         self.xn = try a.dupe(f64, self.v[0]);
-        if (ins[1].role == .norm) {
+        if (ins.len > 1 and ins[1].role == .norm) {
             var r: usize = 0;
             while (r < self.xn.len) : (r += width) for (self.xn[r..][0..width], self.v[1]) |*x, w| {
                 x.* *= w;
             };
         }
         self.terms = try a.alloc(f64, @max(MLP, 512));
-        if (self.kind == .dit_qkv or self.kind == .lm_attn) {
+        if (self.kind == .dit_sdpa or self.kind == .lm_attn) {
             self.keys = try a.alloc(f64, 512 * 64);
             self.vals = try a.alloc(f64, 512 * 64);
             for (&self.aux) |*x| x.* = try a.alloc(f64, 512);
@@ -494,7 +511,8 @@ const Ming = struct {
     pub fn count(self: *const Ming) usize {
         const r = self.shape.rows;
         return switch (self.kind) {
-            .dit_qkv => 4 * r * D + HEADS,
+            .dit_qkv => 3 * r * D,
+            .dit_sdpa => r * D,
             .dit_out, .dit_ff2 => r * D,
             .dit_ff1 => r * FF,
             .embed => 6 * D,
@@ -588,6 +606,7 @@ const Ming = struct {
         const v = &self.v;
         switch (self.kind) {
             .dit_qkv => self.emitQkv(want, mag, sim),
+            .dit_sdpa => self.emitSdpa(want, mag, sim),
             .dit_out, .dit_ff2, .lm_o, .lm_down => {
                 const r = if (self.kind == .lm_o or self.kind == .lm_down) 1 else self.shape.rows;
                 const k = self.v[2].len / self.outWidth();
@@ -660,22 +679,25 @@ const Ming = struct {
                 put(want, mag, at + 1, t[1]);
             };
         }
-        if (sim != null) return;
-        const bytes = self.rig.out_bytes.items;
+    }
+
+    /// Per head and row, attention over the row's batch: q scaled by 1/8, its batch's L keys and values.
+    fn emitSdpa(self: *const Ming, want: []f64, mag: ?[]f64, sim: Sim) void {
+        const x = self.v[0];
+        const r = self.shape.rows;
+        const seq = r / self.shape.n;
         var q: [64]f64 = undefined;
         var o: [64]Val = undefined;
-        for (0..16) |h| for (0..r) |ri| {
+        for (0..HEADS) |h| for (0..r) |ri| {
             const b = ri / seq;
-            for (&q, 0..) |*e, d| e.* = 0.125 * spec.read(.bf16, bytes, ri * D + h * 64 + d);
+            for (&q, 0..) |*e, d| e.* = 0.125 * x[ri * D + h * 64 + d];
             for (0..seq) |j| for (0..64) |d| {
-                self.keys[j * 64 + d] = spec.read(.bf16, bytes, (r + b * seq + j) * D + h * 64 + d);
-                self.vals[j * 64 + d] = spec.read(.bf16, bytes, (2 * r + b * seq + j) * D + h * 64 + d);
+                self.keys[j * 64 + d] = x[(r + b * seq + j) * D + h * 64 + d];
+                self.vals[j * 64 + d] = x[(2 * r + b * seq + j) * D + h * 64 + d];
             };
-            self.attend(&q, seq, &o, null);
-            for (o, 0..) |y, d| put(want, mag, 3 * r * D + ri * D + h * 64 + d, y);
+            self.attend(&q, seq, &o, sim);
+            for (o, 0..) |y, d| put(want, mag, ri * D + h * 64 + d, y);
         };
-        // CNT: each head's threadgroups, counted from MLX's zero fill.
-        for (0..HEADS) |h| put(want, mag, 4 * r * D + h, .exact(QKV_TGS));
     }
 
     fn emitFinal(self: *const Ming, want: []f64, mag: ?[]f64, sim: Sim) void {
@@ -771,14 +793,6 @@ const Ming = struct {
     }
 };
 
-fn qkvRows(s: Shape) usize {
-    return 4 * s.rows * D;
-}
-
-fn qkvHeads(_: Shape) usize {
-    return HEADS;
-}
-
 fn mingSpec(comptime name: []const u8, served: []const Shape) spec.Spec {
     return .{ .name = name, .accum = .f32, .depth = host.depthOne, .out = .bf16, .served = served, .sums = .{ .exact = false } };
 }
@@ -787,9 +801,8 @@ const dit_served: []const Shape = &.{ .{ .rows = 6, .n = 2, .k = D }, .{ .rows =
 
 pub fn register(set: *kc.Set) !void {
     const a = set.a;
-    var qkv = mingSpec("ming_dit_qkv", dit_served);
-    qkv.outs = &.{ .{ .elem = .bf16, .count = qkvRows }, .{ .elem = .u32, .count = qkvHeads } };
-    try set.add(Ming, .init(a, &qkv_launch, .dit_qkv, 0), qkv, null);
+    try set.add(Ming, .init(a, &qkv_launch, .dit_qkv, 0), mingSpec("ming_dit_qkv", dit_served), null);
+    try set.add(Ming, .init(a, &sdpa_launch, .dit_sdpa, 0), mingSpec("ming_dit_sdpa", &.{ .{ .rows = 6, .n = 2, .k = 64 }, .{ .rows = 2, .n = 1, .k = 64 } }), null);
     try set.add(Ming, .init(a, &attn_launch, .dit_out, 0), mingSpec("ming_dit_attn_out", dit_served), null);
     try set.add(Ming, .init(a, &ff1_launch, .dit_ff1, 0), mingSpec("ming_dit_ff1", dit_served), null);
     try set.add(Ming, .init(a, &ff2_launch, .dit_ff2, 0), mingSpec("ming_dit_ff2", dit_served), null);
@@ -812,13 +825,11 @@ pub fn register(set: *kc.Set) !void {
 
 const testing = std.testing;
 
-/// The wrapper's outputs lead the launch's: `ming_dit_qkv`'s CNT comes last, and the wrapper drops it.
 fn expectLaunch(t: *Ming, theirs: []const mlx.mlx_array) !void {
     try t.run();
     const ours = try testing.allocator.dupe(u8, t.rig.outputBytes());
     defer testing.allocator.free(ours);
-    const want = try t.rig.bytesOf(theirs);
-    try testing.expectEqualSlices(u8, want, ours[0..want.len]);
+    try testing.expectEqualSlices(u8, try t.rig.bytesOf(theirs), ours);
 }
 
 test "kernel contract ming_tts: the DiT launches are the shipped block's, byte for byte" {
@@ -827,13 +838,15 @@ test "kernel contract ming_tts: the DiT launches are the shipped block's, byte f
     const shape = Shape{ .rows = 6, .n = 2, .k = D };
     var ta = Ming.init(a, &qkv_launch, .dit_qkv, 0);
     defer ta.deinit();
+    var ts = Ming.init(a, &sdpa_launch, .dit_sdpa, 0);
+    defer ts.deinit();
     var tb = Ming.init(a, &attn_launch, .dit_out, 0);
     defer tb.deinit();
     var tc = Ming.init(a, &ff1_launch, .dit_ff1, 0);
     defer tc.deinit();
     var td = Ming.init(a, &ff2_launch, .dit_ff2, 0);
     defer td.deinit();
-    for ([_]*Ming{ &ta, &tb, &tc, &td }, 1..) |t, seed| try testing.expect(try t.prepare(shape, .random, seed));
+    for ([_]*Ming{ &ta, &ts, &tb, &tc, &td }, 1..) |t, seed| try testing.expect(try t.prepare(shape, .random, seed));
     const s = ta.rig.stream();
     const x = ta.args;
     const b = fused.Block{ .norm1 = x[1], .wq = x[2], .wk = x[3], .wv = x[4], .bq = x[5], .bk = x[6], .bv = x[7], .norm2 = tc.args[1], .wo = tb.args[2], .bo = tb.args[3], .w1 = tc.args[2], .b1 = tc.args[3], .w2 = td.args[2], .b2 = td.args[3] };
@@ -841,7 +854,9 @@ test "kernel contract ming_tts: the DiT launches are the shipped block's, byte f
     defer for ([_]mlx.mlx_array{ o.qkv, o.att, o.x1, o.hh, o.x2 }) |y| {
         _ = mlx.mlx_array_free(y);
     };
-    try expectLaunch(&ta, &.{ o.qkv, o.att });
+    try expectLaunch(&ta, &.{o.qkv});
+    ts.args[0] = o.qkv;
+    try expectLaunch(&ts, &.{o.att});
     tb.args[0] = o.att;
     tb.args[1] = x[0];
     try expectLaunch(&tb, &.{o.x1});
