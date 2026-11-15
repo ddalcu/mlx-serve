@@ -81,6 +81,13 @@ pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enable
     return stride;
 }
 
+/// The stride every load hands its model (`LoadParams.ssm_checkpoint_stride`) from the launch settings, and the one a
+/// streamed bill counts checkpoints at.
+pub fn launchSsmCheckpointStride() u32 {
+    const l = http_server.launch();
+    return effectiveSsmCheckpointStride(l.ssm_checkpoint_stride, l.prefix_cache_capacity, l.prefix_cache_ram_enabled, l.prefix_cache_disk_bytes);
+}
+
 /// PURE: clamp the hot prefix cache's byte budget to what the loaded weights
 /// leave under the GPU ceiling after the serving context's KV and the prefill
 /// transient reserve. A 40 GB `--prefix-cache-mem` beside a ~70 GB pack was
