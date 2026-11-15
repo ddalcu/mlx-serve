@@ -289,6 +289,13 @@ fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
     return worst;
 }
 
+/// `testing.expect` that names what it expected.
+fn expectWhy(ok: bool, comptime what: []const u8, args: anytype) !void {
+    if (ok) return;
+    std.debug.print("expected " ++ what ++ "\n", args);
+    return error.TestUnexpectedResult;
+}
+
 /// The largest magnitude in column `col`, and anywhere, of the rows a tap kept.
 const Peaks = struct {
     col: f32 = 0,
@@ -430,9 +437,17 @@ test "deepseek_v41 ablation forward: a decode step at strength 1 leaves the stre
     try tp.attach(t);
     defer tp.detach();
     const mdl = tp.model.mdl;
-    // One row runs `dsv41.block`'s region path: the fused decode kernels decline the fixture (no `in_proj`), and no
-    // bank streams.
-    try testing.expect(dsv41.compiledAt(mdl, 1) and mdl.dec.in_proj == null and mdl.streamed == null);
+    // One row runs `dsv41.block`'s region path. The fused decode kernels are built on every GPU stream (`Dec.init`), but
+    // `blockFused` hands the row back before any state moves: `dkern.in_proj.plan` declines each of the fixture's layers
+    // (its hidden size, 128, is no multiple of 256). No bank streams.
+    try expectWhy(dsv41.compiledAt(mdl, 1), "one row within the compiled regions (`dsv41.compiledAt`)", .{});
+    try expectWhy(mdl.streamed == null, "no streamed bank", .{});
+    var row = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row);
+    const shape = [_]c_int{ 1, @intCast(mdl.cfg.dsv4_hc_mult), @intCast(mdl.cfg.hidden_size) };
+    try mlx.check(mlx.mlx_zeros(&row, &shape, shape.len, .bfloat16, mlx.gpuStream()));
+    for (mdl.layers[0..mdl.n_layers], 0..) |*ly, li|
+        try expectWhy(dkern.in_proj.plan(mdl, ly, row) == null, "the fused decode kernels to decline layer {d} (`in_proj.plan`), so `blockFused` falls back to the region path", .{li});
     const table = try Table.init(&.{1}, &.{key}, tp.model.cfg.hidden_size);
     defer table.deinit();
     var peaks: [2]Peaks = .{ .{}, .{} };
@@ -449,8 +464,9 @@ test "deepseek_v41 ablation forward: a decode step at strength 1 leaves the stre
             tp.tap.clear();
         }
     }
-    try testing.expect(peaks[1].col > 0 and peaks[0].all > 0);
-    try testing.expectEqual(@as(f32, 0), peaks[0].col);
+    try expectWhy(peaks[0].all > 0, "the ablated decode's tap to record the stream", .{});
+    try expectWhy(peaks[1].col > 0, "the plain decode's stream to carry column {d}, so a missed write would show", .{col});
+    try expectWhy(peaks[0].col == 0, "the ablated decode to leave column {d} of the stream 0 at every layer; its peak is {e}", .{ col, peaks[0].col });
 }
 
 test "deepseek_v41 ablation forward: a batched tick of an ablated slot and a plain one is each slot's own decode step, bit for bit" {
