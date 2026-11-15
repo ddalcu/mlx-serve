@@ -132,7 +132,8 @@ const Staged = struct {
 const Closure = union(enum) { staged: Staged, refused: []const u8 };
 
 /// `start`'s import closure for the kit: `@import`ed sources, `@embedFile`d files and every kernel file a source names
-/// by path. Refuses a file that leaves `src/` or reaches `kit_denied`. `reader.read(path)` gives a source's text.
+/// by path. Refuses a source that leaves `src/` or reaches `kit_denied`, and a kernel under `kit_denied`.
+/// `reader.read(path)` gives a source's text.
 fn kitClosure(a: std.mem.Allocator, reader: anytype, start: []const u8) !Closure {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var queue: std.ArrayList([]const u8) = .empty;
@@ -160,8 +161,10 @@ fn kitClosure(a: std.mem.Allocator, reader: anytype, start: []const u8) !Closure
     var digests: std.ArrayList(u8) = .empty;
     var lines = std.mem.tokenizeScalar(u8, try reader.read("src/kernels/digests.txt"), '\n');
     while (lines.next()) |line| {
-        if (!kernels.contains(line[66..])) continue;
-        try files.append(a, try std.fmt.allocPrint(a, "src/{s}", .{line[66..]}));
+        const by = kernels.get(line[66..]) orelse continue;
+        const file = try std.fmt.allocPrint(a, "src/{s}", .{line[66..]});
+        if (kitDenied(file)) return refuse(a, "{s} names the kernel {s}: the kit must not ship the engine's, the host's or the plugins' files", .{ by, file });
+        try files.append(a, file);
         try digests.print(a, "{s}\n", .{line});
     }
     std.mem.sort([]const u8, files.items, {}, struct {
