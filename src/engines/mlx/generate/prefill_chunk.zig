@@ -8,6 +8,7 @@ const testing = std.testing;
 const generate_mod = @import("../generate.zig");
 const WIDE_PREFILL_CHUNK = @import("../generate.zig").WIDE_PREFILL_CHUNK;
 const attn256 = @import("../../../sdk/blocks/attention/attn256.zig");
+const checkpoint = @import("../ssm/checkpoint.zig");
 
 
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
@@ -1154,4 +1155,54 @@ test "wholePromptPlan: a whole-prompt prefill's spans are the chunk loop's ends 
         try testing.expectEqualSlices(u64, c.spans, p.spans);
         try testing.expectEqualSlices(u64, c.cps, p.checkpoints);
     }
+}
+
+/// An `n`-token prompt's plan at `offset` against the same plan's checkpoints filed one at a time through
+/// `fileCheckpoint` (`max`, `thin`, `anchors`), as the chunk loop files them.
+fn expectPlanKeeps(n: usize, chunk: usize, stride: usize, offset: usize, dense: bool, max: usize, thin: checkpoint.ThinPolicy, anchors: usize) !void {
+    const a = testing.allocator;
+    var all = try wholePromptPlan(a, n, chunk, true, stride, offset, false, dense);
+    defer all.deinit(a);
+    var list: std.ArrayList(checkpoint.SSMCheckpoint) = .empty;
+    defer {
+        for (list.items) |*cp| cp.deinit(a);
+        list.deinit(a);
+    }
+    for (all.checkpoints) |pos| try checkpoint.fileCheckpoint(a, &list, .{ .pos = @intCast(pos), .layers = &.{} }, max, thin, anchors);
+    var kept = try wholePromptPlan(a, n, chunk, true, stride, offset, false, dense);
+    defer kept.deinit(a);
+    try testing.expectEqual(list.items.len, kept.checkpoints.len);
+    for (list.items, kept.checkpoints) |cp, pos| try testing.expectEqual(@as(u64, cp.pos), pos);
+}
+
+// Bar: the plan's checkpoints are the list the prefill keeps past its cap (each policy, low anchors on and off) at
+// strides 256 to 16,384, prompts to 300,000 tokens, cold and warm, and on a second turn restored from the first.
+test "wholePromptPlan: its checkpoints are the ones the prefill's list keeps" {
+    const lens = [_]usize{ 2, 31, 32, 33, 300, 4_097, 16_927, 18_380, 32_767, 65_600, 131_071, 300_000 };
+    for ([_]usize{ 256, 512, 1024, 2048, 4096, 8192, 16_384 }) |stride| for ([_]usize{ 256, stride }) |chunk| for (lens) |n| for ([_]usize{ 0, 5_000 }) |offset| for ([_]checkpoint.ThinPolicy{ .oldest, .min_span_recency }) |thin| for ([_]usize{ 0, 2 }) |anchors| {
+        try expectPlanKeeps(n, chunk, stride, offset, thin == .min_span_recency, 16, thin, anchors);
+    };
+    // A second turn extending the first restores at the first's last checkpoint and plans its tail from there.
+    for ([_][2]usize{ .{ 1536, 8192 }, .{ 256, 256 } }) |cs| {
+        var first = try wholePromptPlan(testing.allocator, 18_380, cs[0], true, cs[1], 0, false, false);
+        defer first.deinit(testing.allocator);
+        const at: usize = @intCast(first.checkpoints[first.checkpoints.len - 1]);
+        for ([_]usize{ 4_000, 40_000 }) |more| try expectPlanKeeps(18_380 + more - at, cs[0], cs[1], at, false, 16, .oldest, 0);
+    }
+}
+
+// Bar: 5,000 tokens at chunk and stride 64 plan 70 checkpoints; the pass is handed the list's keep over the same spans.
+test "wholePromptPlan: a plan of more than 64 checkpoints hands the pass only the ones the list keeps, over the same spans" {
+    const a = testing.allocator;
+    var all = try wholePromptPlan(a, 5_000, 64, true, 64, 0, false, false);
+    defer all.deinit(a);
+    try testing.expectEqual(@as(usize, 70), all.checkpoints.len);
+    for ([_]usize{ 0, 4, 16 }) |max| for ([_]checkpoint.ThinPolicy{ .oldest, .min_span_recency }) |thin| for ([_]usize{ 0, 2 }) |anchors| {
+        var kept = try wholePromptPlan(a, 5_000, 64, true, 64, 0, false, false);
+        defer kept.deinit(a);
+        try testing.expectEqualSlices(u64, all.spans, kept.spans);
+        try testing.expectEqual(if (max == 0) all.checkpoints.len else max, kept.checkpoints.len);
+        for (kept.checkpoints) |pos| try testing.expect(std.mem.indexOfScalar(u64, kept.spans, pos) != null);
+        try expectPlanKeeps(5_000, 64, 64, 0, false, max, thin, anchors);
+    };
 }
