@@ -297,12 +297,12 @@ fn nextTapSeq(gpa: std.mem.Allocator, d: std.Io.Dir, io: std.Io) !u64 {
 /// `keep` rows its passes recorded, in prompt order, the last one the prompt's last token) and a line in
 /// `<dir>/index.jsonl` (`pos` the forward's first position, `ids` its tokens). The dir is the owner's only (0700), its
 /// files 0600. The `seq` comes from the directory, never from memory, so a restart cannot overwrite an earlier file.
-/// Returns that seq (0 when nothing was written). Clears the tap; a site no pass recorded (a layer another Mac ran)
-/// writes nothing.
-pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: usize, ids: []const u32, s: S) !u64 {
+/// Returns that seq, or null when nothing was written. Clears the tap; a site no pass recorded (a layer another Mac
+/// ran) writes nothing.
+pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: usize, ids: []const u32, s: S) !?u64 {
     defer tap.clear();
     const sites = tap.sites.len;
-    if (sites == 0 or tap.sites[0].items.len == 0) return 0;
+    if (sites == 0 or tap.sites[0].items.len == 0) return null;
     var sc = Scope.init(gpa, s);
     defer sc.deinit();
     const per_site = try gpa.alloc(A, sites);

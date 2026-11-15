@@ -590,11 +590,10 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
     } else try runPrompt(m, ids, rows);
     defer _ = mlx.mlx_array_free(logits);
     if (tap) |t| {
-        const seq = ablation.dumpTap(gpa, t, m.tap_dir.?, pos, ids, m.s) catch |e| blk: {
+        if (ablation.dumpTap(gpa, t, m.tap_dir.?, pos, ids, m.s) catch |e| blk: {
             std.log.err("deepseek_v41: the calibration tap's dump failed: {t}", .{e});
-            break :blk 0;
-        };
-        if (seq != 0) std.log.info("deepseek_v41: the calibration tap wrote tap-{d:0>6}.npy", .{seq});
+            break :blk null;
+        }) |seq| std.log.info("deepseek_v41: the calibration tap wrote tap-{d:0>6}.npy", .{seq});
     }
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
