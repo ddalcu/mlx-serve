@@ -79,17 +79,22 @@ fn kitModule(b: *std.Build, kit: *std.Build.Dependency, target: std.Build.Resolv
 }
 
 /// Builds an object compiled from the build folder's `check.zig` over the kit (`checks/blocks`): the kit's own proof that
-/// every public function of `kit.blocks` builds from what the kit ships.
+/// every public function of `kit.blocks` builds from what the kit ships, and every header `mlx_steel_sources` embeds is
+/// staged.
 pub fn blocksCheck(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const kit = b.dependency("mlx_serve_kit", .{});
+    const mlx_serve = kitModule(b, kit, target, optimize);
     const obj = b.addObject(.{ .name = "blocks_check", .root_module = b.createModule(.{
         .root_source_file = b.path("check.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "mlx_serve", .module = kitModule(b, kit, target, optimize) }},
+        .imports = &.{
+            .{ .name = "mlx_serve", .module = mlx_serve },
+            .{ .name = "mlx_steel_sources", .module = mlx_serve.import_table.get("mlx_steel_sources").? },
+        },
     }) });
     b.getInstallStep().dependOn(&obj.step);
 }

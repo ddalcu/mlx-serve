@@ -39,6 +39,30 @@ pub const streamed = @import("sdk/weights/streamed.zig");
 /// Register a quant layout of your own (`foreign.register`) so the blocks' `qmatmul` and expert matmul read it.
 pub const foreign = @import("sdk/quant/foreign.zig");
 
+/// The language-model bases' blocks a model plugin's own forward composes (`sdk/bases/blocks/`: the routed MLP, the
+/// gated-delta layer and its conv and state, the compiled-graph helpers), and the bases' eval cadence (`run`).
+pub const bases = struct {
+    pub const run = @import("sdk/bases/run.zig");
+    pub const blocks = struct {
+        pub const compiled = @import("sdk/bases/blocks/compiled.zig");
+        pub const conv1d = @import("sdk/bases/blocks/conv1d.zig");
+        pub const gdn = @import("sdk/bases/blocks/gdn.zig");
+        pub const moe = @import("sdk/bases/blocks/moe.zig");
+        pub const state = @import("sdk/bases/blocks/state.zig");
+    };
+};
+/// The prompt pass's memory bill a model plugin reports in `Bill.prefill_bytes`.
+pub const bill = struct {
+    pub const prefill = @import("sdk/bill/prefill.zig");
+};
+/// A model plugin's side of an outside quant plugin's pack: its stored projections, resident experts and the bank's fit.
+pub const outside_model = @import("sdk/quant/outside_model.zig");
+/// The kernel contract (`sdk/testing/kernel_contract/REGISTERING.md`): a plugin registers its own kernels' specs and runs
+/// the gates in its own test step.
+pub const testing = struct {
+    pub const kernel_contract = @import("sdk/testing/kernel_contract/root.zig");
+};
+
 /// Layer blocks the server's own plugins are built from, for a plugin that would rather call them than write the layer
 /// on mlx-c. They are versioned with the kit: build against one kit version and pin it, a newer kit may rename or
 /// change them. They run on the same MLX the server loads (the plugin's mlx-c calls resolve against it at load).
@@ -147,6 +171,10 @@ pub const blocks = struct {
         pub const gate = @import("sdk/blocks/gdn/gate.zig");
         pub const gated_delta_net = @import("sdk/blocks/gdn/gated_delta_net.zig");
         pub const kernels = @import("sdk/blocks/gdn/kernels.zig");
+    };
+    pub const kda = struct {
+        pub const gate = @import("sdk/blocks/kda/gate.zig");
+        pub const recurrence = @import("sdk/blocks/kda/recurrence.zig");
     };
 };
 

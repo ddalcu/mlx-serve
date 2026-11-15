@@ -5,10 +5,12 @@ An outside plugin that runs its own forward should import the server's blocks, n
 | Part | Home | State |
 |---|---|---|
 | mlx bindings | `kit.mlx` | done |
-| norms, conv, ssm, schedulers, vae, dit, embedding, linear, qmm, mlp, rope, attention, moe, hc, gdn | `kit.blocks` | done (Metal; versioned with the kit) |
+| norms, conv, ssm, schedulers, vae, dit, embedding, linear, qmm, mlp, rope, attention, moe, hc, gdn, kda | `kit.blocks` | done (Metal; versioned with the kit) |
+| the language-model bases' blocks (routed MLP, gated-delta layer) and eval cadence | `kit.bases` | done |
+| the prompt pass's bill; an outside quant pack's model side | `kit.bill`, `kit.outside_model` | done |
 | a weight layout of its own | `kit.foreign.register` (`sdk/quant/foreign.zig`) | done |
 | the MTP round policy | `kit.spec`, pure parts only | not started |
-| kernel contract and parity harness | `kit.testing` | not started |
+| kernel contract and parity harness | `kit.testing` | kernel contract done (`kit.testing.kernel_contract`); parity harness not started |
 | config helpers, kv, mrope, util | `kit.sdk` | partly (`kit.sdk`, `kit.generation`) |
 
 ## Rules
@@ -20,6 +22,7 @@ An outside plugin that runs its own forward should import the server's blocks, n
   between kits, and a plugin pins one.
 - Every public function of `kit.blocks` builds from the staged kit (`build/kit/blocks_check`, run by `zig build test`), and
   every block file of an exposed area is listed in `src/kit.zig` or is a test, contract or CUDA file (`kit_test.zig`).
+  The kit stages no file under the engine, the host or the plugins, kernels included (`build/kit.zig`'s tests).
 
 ## MTP: native rounds stay, the policy ships as a library
 

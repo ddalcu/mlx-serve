@@ -1,9 +1,11 @@
-//! Compiles every public function of `kit.blocks`, `kit.foreign` and `kit.streamed` into an object, so a block that no longer builds from
-//! the staged kit (a file or module the kit lacks, a format a block still imports) fails here, not in a plugin author's
-//! build. Nothing links or runs it.
+//! Compiles every public function of `kit.blocks`, `kit.bases`, `kit.bill`, `kit.outside_model`, `kit.testing`,
+//! `kit.foreign` and `kit.streamed` into an object, and every MLX header `mlx_steel_sources` embeds, so a block that no
+//! longer builds from the staged kit (a file, header or module the kit lacks, a format a block still imports) fails
+//! here, not in a plugin author's build. Nothing links or runs it.
 
 const std = @import("std");
 const kit = @import("mlx_serve");
+const steel = @import("mlx_steel_sources");
 
 /// Public helpers of the blocks' own tests that sit in non-test files and call `std.testing`: not part of the surface.
 const test_helpers = [_][]const u8{ "attn256RandBf16", "attn256RandBf16Scaled", "errVsTruth", "gdnParityRand" };
@@ -30,6 +32,12 @@ fn touch(comptime T: type, comptime depth: u8) void {
 
 comptime {
     touch(kit.blocks, 0);
+    touch(kit.bases.blocks, 1);
+    touch(kit.bases.run, 2);
+    touch(kit.bill, 1);
+    touch(kit.outside_model, 2);
+    touch(kit.testing.kernel_contract, 1);
     touch(kit.foreign, 2);
     touch(kit.streamed, 1);
+    inline for (comptime std.meta.declarations(steel)) |name| _ = @field(steel, name);
 }
