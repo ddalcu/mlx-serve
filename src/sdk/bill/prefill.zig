@@ -73,3 +73,20 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
     return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
+
+// ── tests ──
+
+const testing = @import("std").testing;
+
+// Bar: the pass's live set past a chunk's, by term, at Ling-3.1-flash's geometry (top-8, hidden 4,096) and its routed
+// calls' widest (16,384 rows, a 2,048-row tail joined).
+test "wholePromptPassBytes bills the routed call's rows and every span's residual rows past one chunk's" {
+    const call_rows: u64 = 16_384 + 2_048;
+    // The standard prompt at the engine's 1,536-row chunk: 16,844 routed rows past a chunk (each pair's output and its
+    // weighted copy, f32) and their residual rows (4 x bf16).
+    try testing.expectEqual(@as(u64, 16_844 * 8 * 4096 * 8 + 4 * 16_844 * 4096 * 2), wholePromptPassBytes(18_380, 1536, call_rows, 8, 4096));
+    // A one-span prompt holds no rows past its chunk.
+    try testing.expectEqual(@as(u64, 0), wholePromptPassBytes(900, 4096, call_rows, 8, 4096));
+    // The routed call stops at its widest: at 32,767 tokens it bills 18,432 - 1,024 rows, the residual rows all 31,743.
+    try testing.expectEqual(@as(u64, (18_432 - 1024) * 8 * 4096 * 8 + 4 * (32_767 - 1024) * 4096 * 2), wholePromptPassBytes(32_767, 1024, call_rows, 8, 4096));
+}
