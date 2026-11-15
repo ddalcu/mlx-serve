@@ -1,12 +1,18 @@
 //! The directional ablation's spec (`ablation.zig`): the forward's table read slot by slot, the ops that take the
-//! direction out of a write against host math, the armed arrays, the batching and resume rules, and the calibration
-//! tap's records and file header.
+//! direction out of a write against host math, the armed arrays, the batching and resume rules, the calibration tap's
+//! records and file header; and the plugin's forward on the fixture pack, where an ablated prompt, decode step and
+//! DSpark draft leave the stream nothing along the direction at any layer, a strength of 0 changes no bit, and a
+//! batched tick runs each slot as its own decode step.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const dsv41 = @import("deepseek_v41.zig");
 const ablation = @import("ablation.zig");
+const v41 = @import("plugin.zig");
+const sdk = @import("../../sdk/root.zig");
+const fixture = @import("../deepseek_v4/fixture.zig");
+const Twin = @import("../deepseek_v4/proof_test.zig").Twin(v41);
 
 const testing = std.testing;
 const A = mlx.mlx_array;
@@ -221,4 +227,320 @@ test "deepseek_v41 ablation: the npy header is a 64-byte multiple that names the
     try testing.expect(std.mem.indexOf(u8, h, "'shape': (44, 5, 7168)") != null);
     try testing.expectEqual(@as(u8, '\n'), h[h.len - 1]);
     try testing.expectEqual(@as(u16, @intCast(h.len - 10)), std.mem.readInt(u16, h[8..10], .little));
+}
+
+// ── the plugin's forward on the fixture pack ──────────────────────────────────
+//
+// `fixture.v41Files` (8 layers of hidden 128, no Engram) and `v41DsparkFiles` (two DSpark stages more), loaded by the
+// plugin's table. A table row is the unit vector along stream column `col`: a pass that ablates every write to the
+// stream at strength 1 leaves that column exactly 0 (a write's product with the unit column is its own value there,
+// subtracted whole, and the hyper-connection mixes only scale and sum the column), and a write it misses leaves the
+// column nonzero. The calibration tap (`ablation.StreamTap`) reads the column at every layer of a trunk pass, a probe
+// confidence head at a DSpark draft's last stage.
+
+const dkern = @import("decode/decode.zig");
+
+const col = 5;
+const key: u64 = 0x7e57;
+/// The last rows of a pass the tap keeps.
+const keep = 5;
+/// One span each: 11 rows run every layer's compiled region path (`dsv41.block`: within `region_rows`, past the decode
+/// kernels' `max_rows`), 21 rows the plain path (`blockAttn` and the MoE).
+const short_prompt = [_]u32{ 3, 17, 42, 9, 7, 25, 1, 60, 11, 2, 90 };
+const long_prompt = short_prompt ++ [_]u32{ 44, 2, 71, 8, 55, 5, 61, 20, 12, 4 };
+
+/// A forward's table: per slot the unit vector along `col` (`[slots, dim]` f32), with the slots' strengths and keys
+/// (borrowed: they outlive the table).
+const Table = struct {
+    dirs: A,
+    abl: abi.Ablation,
+
+    fn init(strengths: []const f32, keys: []const u64, dim: usize) !Table {
+        const host = try testing.allocator.alloc(f32, strengths.len * dim);
+        defer testing.allocator.free(host);
+        @memset(host, 0);
+        for (0..strengths.len) |i| host[i * dim + col] = 1;
+        const dirs = mlx.mlx_array_new_data(host.ptr, &[_]c_int{ @intCast(strengths.len), @intCast(dim) }, 2, .float32);
+        return .{ .dirs = dirs, .abl = .{ .directions = .{ .ctx = dirs.ctx }, .strengths = .of(strengths), .keys = .of(keys) } };
+    }
+
+    fn deinit(self: Table) void {
+        _ = mlx.mlx_array_free(self.dirs);
+    }
+};
+
+/// The plugin's logits `[rows, V]` (host f32, the caller frees) for `toks` of `slots` at `positions`, under `abl`.
+fn forwardUnder(t: *Twin, mode: abi.Mode, slots: []const u32, toks: []const u32, positions: []const u32, abl: ?*const abi.Ablation) ![]f32 {
+    var out: abi.ForwardOut = .{};
+    const rows: u32 = if (mode == .batched_rows) 1 else @intCast(toks.len);
+    const v = v41.table.forward(t.m, &.{ .mode = mode, .rows = rows, .tokens = .of(toks), .slots = .of(slots), .positions = .of(positions), .ablation = abl }, &out);
+    if (!v.isOk()) {
+        std.debug.print("forward: {s}\n", .{v.why.slice()});
+        return error.PluginForward;
+    }
+    const l: A = .{ .ctx = out.logits.ctx };
+    defer _ = mlx.mlx_array_free(l);
+    return dsv41.hostF32(l);
+}
+
+fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
+    var worst: f32 = 0;
+    for (a, b) |x, y| worst = @max(worst, @abs(x - y));
+    return worst;
+}
+
+/// The largest magnitude in column `col`, and anywhere, of the rows a tap kept.
+const Peaks = struct {
+    col: f32 = 0,
+    all: f32 = 0,
+
+    fn add(p: *Peaks, rows: []const f32, dim: usize) void {
+        for (rows, 0..) |v, i| {
+            p.all = @max(p.all, @abs(v));
+            if (i % dim == col) p.col = @max(p.col, @abs(v));
+        }
+    }
+};
+
+/// The calibration tap on a twin's model (what `MLX_SERVE_DSV41_TAP_DIR` turns on), writing into a directory of its
+/// own. Detached before the twin closes: the model frees only a tap of its own allocator.
+const Tapped = struct {
+    tap: ablation.StreamTap,
+    tmp: testing.TmpDir,
+    path: [512]u8,
+    model: *v41.Model,
+
+    fn attach(self: *Tapped, t: *Twin) !void {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        self.model = @ptrCast(@alignCast(t.m));
+        self.tmp = testing.tmpDir(.{});
+        errdefer self.tmp.cleanup();
+        const dir = self.path[0..try self.tmp.dir.realPath(io, &self.path)];
+        self.tap = try ablation.StreamTap.init(testing.allocator, self.model.mdl.n_layers, keep);
+        self.model.tap_dir = dir;
+        self.model.mdl.stream_tap = &self.tap;
+    }
+
+    fn detach(self: *Tapped) void {
+        self.model.mdl.stream_tap = null;
+        self.model.tap_dir = null;
+        self.tap.deinit();
+        self.tmp.cleanup();
+    }
+
+    /// The last prompt forward's file: `[layers + 1, rows, dim]` f32 past its header.
+    fn lastDump(self: *Tapped, rows: usize) !Peaks {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var name: [32]u8 = undefined;
+        const bytes = try self.tmp.dir.readFileAlloc(io, try std.fmt.bufPrint(&name, "tap-{d:0>6}.npy", .{self.model.tap_seq - 1}), testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(bytes);
+        const dim: usize = self.model.cfg.hidden_size;
+        const data = bytes[10 + @as(usize, std.mem.readInt(u16, bytes[8..10], .little)) ..];
+        try testing.expectEqual((self.model.mdl.n_layers + 1) * rows * dim * 4, data.len);
+        const v = try testing.allocator.alloc(f32, data.len / 4);
+        defer testing.allocator.free(v);
+        for (v, 0..) |*x, i| x.* = @bitCast(std.mem.readInt(u32, data[i * 4 ..][0..4], .little));
+        var p: Peaks = .{};
+        p.add(v, dim);
+        return p;
+    }
+
+    /// Into `p`, the one pass every site recorded since the last `clear`: `rows` rows apiece.
+    fn recorded(self: *Tapped, rows: usize, p: *Peaks) !void {
+        const dim: usize = self.model.cfg.hidden_size;
+        for (self.tap.sites) |list| {
+            try testing.expectEqual(@as(usize, 1), list.items.len);
+            const v = try dsv41.hostF32(list.items[0]);
+            defer testing.allocator.free(v);
+            try testing.expectEqual(rows * dim, v.len);
+            p.add(v, dim);
+        }
+    }
+};
+
+const Run = struct { logits: []f32, peaks: Peaks };
+
+/// A fresh twin's prompt forward of slot 1 at strength `s` (null: no table) with the tap on: its logits (the caller
+/// frees) and the peaks of the tap's file. `region`: whether the prompt's rows take the compiled region path.
+fn promptRun(files: []const sdk.fixture.File, prompt: []const u32, s: ?f32, region: bool) !Run {
+    const t = try Twin.open(files, "");
+    defer t.close();
+    var tp: Tapped = undefined;
+    try tp.attach(t);
+    defer tp.detach();
+    try testing.expect(dsv41.compiledAt(tp.model.mdl, prompt.len) == region and tp.model.mdl.streamed == null);
+    const strengths = [_]f32{s orelse 0};
+    const table = try Table.init(&strengths, &.{key}, tp.model.cfg.hidden_size);
+    defer table.deinit();
+    const logits = try forwardUnder(t, .prefill, &.{1}, prompt, &.{0}, if (s != null) &table.abl else null);
+    errdefer testing.allocator.free(logits);
+    return .{ .logits = logits, .peaks = try tp.lastDump(@min(prompt.len, keep)) };
+}
+
+test "deepseek_v41 ablation forward: a prompt at strength 1 leaves the stream nothing along r at any layer, on the region path and the plain path" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    try testing.expect(short_prompt.len > dkern.max_rows and short_prompt.len <= dsv41.region_rows and long_prompt.len > dsv41.region_rows);
+    for ([_][]const u32{ &short_prompt, &long_prompt }, [_]bool{ true, false }) |prompt, region| {
+        const plain = try promptRun(files, prompt, null, region);
+        defer testing.allocator.free(plain.logits);
+        const ablated = try promptRun(files, prompt, 1, region);
+        defer testing.allocator.free(ablated.logits);
+        // The tap read the stream at every site; only the ablated pass's column is empty.
+        try testing.expect(plain.peaks.col > 0 and ablated.peaks.all > 0);
+        try testing.expectEqual(@as(f32, 0), ablated.peaks.col);
+        try testing.expect(maxAbsDiff(plain.logits, ablated.logits) > 0);
+    }
+}
+
+test "deepseek_v41 ablation forward: a table at strength 0 runs the prompt and its decode bit for bit as none does" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const none = try Twin.open(files, "");
+    defer none.close();
+    const zero = try Twin.open(files, "");
+    defer zero.close();
+    const m: *v41.Model = @ptrCast(@alignCast(zero.m));
+    const table = try Table.init(&.{0}, &.{key}, m.cfg.hidden_size);
+    defer table.deinit();
+    const want = try forwardUnder(none, .prefill, &.{1}, &short_prompt, &.{0}, null);
+    defer testing.allocator.free(want);
+    const got = try forwardUnder(zero, .prefill, &.{1}, &short_prompt, &.{0}, &table.abl);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(f32, want, got);
+    const pos: u32 = short_prompt.len;
+    const want_step = try forwardUnder(none, .decode, &.{1}, &.{44}, &.{pos}, null);
+    defer testing.allocator.free(want_step);
+    const got_step = try forwardUnder(zero, .decode, &.{1}, &.{44}, &.{pos}, &table.abl);
+    defer testing.allocator.free(got_step);
+    try testing.expectEqualSlices(f32, want_step, got_step);
+}
+
+test "deepseek_v41 ablation forward: a decode step at strength 1 leaves the stream nothing along r at any layer (the region path at one row)" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    var tp: Tapped = undefined;
+    try tp.attach(t);
+    defer tp.detach();
+    const mdl = tp.model.mdl;
+    // One row runs `dsv41.block`'s region path: the fused decode kernels decline the fixture (no `in_proj`), and no
+    // bank streams.
+    try testing.expect(dsv41.compiledAt(mdl, 1) and mdl.dec.in_proj == null and mdl.streamed == null);
+    const table = try Table.init(&.{1}, &.{key}, tp.model.cfg.hidden_size);
+    defer table.deinit();
+    var peaks: [2]Peaks = .{ .{}, .{} };
+    for ([_]?*const abi.Ablation{ &table.abl, null }, &peaks) |abl, *pk| {
+        // A request each: position 0 resets the slot's state, so the plain one is plain from its first row.
+        testing.allocator.free(try forwardUnder(t, .prefill, &.{1}, &short_prompt, &.{0}, abl));
+        for ([_]u32{ 44, 2 }, 0..) |tok, i| {
+            // A decode forward leaves the tap as it is (`run`): it records while switched on here.
+            tp.tap.on = true;
+            const logits = forwardUnder(t, .decode, &.{1}, &.{tok}, &.{@intCast(short_prompt.len + i)}, abl);
+            tp.tap.on = false;
+            testing.allocator.free(try logits);
+            try tp.recorded(1, pk);
+            tp.tap.clear();
+        }
+    }
+    try testing.expect(peaks[1].col > 0 and peaks[0].all > 0);
+    try testing.expectEqual(@as(f32, 0), peaks[0].col);
+}
+
+test "deepseek_v41 ablation forward: a batched tick of an ablated slot and a plain one is each slot's own decode step, bit for bit" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const files = try fixture.v41Files(arena.allocator(), 7);
+    const prompts = [2][]const u32{ &short_prompt, &.{ 5, 8, 13, 21, 34, 55, 89, 4, 6, 10, 12, 14, 16, 18 } };
+    const toks = [2]u32{ 44, 9 };
+    const pos = [2]u32{ @intCast(prompts[0].len), @intCast(prompts[1].len) };
+    const solo = try Twin.open(files, "");
+    defer solo.close();
+    const batch = try Twin.open(files, "");
+    defer batch.close();
+    const m: *v41.Model = @ptrCast(@alignCast(solo.m));
+    const one = try Table.init(&.{1}, &.{key}, m.cfg.hidden_size);
+    defer one.deinit();
+    // Slot 1 at strength 1, slot 2 at 0: the tick runs them one at a time, each under its own (`extendBatched`).
+    const two = try Table.init(&.{ 1, 0 }, &.{ key, 0 }, m.cfg.hidden_size);
+    defer two.deinit();
+    for ([_]*Twin{ solo, batch }) |t| {
+        testing.allocator.free(try forwardUnder(t, .prefill, &.{1}, prompts[0], &.{0}, &one.abl));
+        testing.allocator.free(try forwardUnder(t, .prefill, &.{2}, prompts[1], &.{0}, null));
+    }
+    const want0 = try forwardUnder(solo, .decode, &.{1}, toks[0..1], pos[0..1], &one.abl);
+    defer testing.allocator.free(want0);
+    const want1 = try forwardUnder(solo, .decode, &.{2}, toks[1..2], pos[1..2], null);
+    defer testing.allocator.free(want1);
+    const got = try forwardUnder(batch, .batched_rows, &.{ 1, 2 }, &toks, &pos, &two.abl);
+    defer testing.allocator.free(got);
+    try testing.expectEqual(want0.len + want1.len, got.len);
+    try testing.expectEqualSlices(f32, want0, got[0..want0.len]);
+    try testing.expectEqualSlices(f32, want1, got[want0.len..]);
+}
+
+/// A draft's probe confidences, every position of the block computed: all 0 for an ablated state's draft, not all 0 for
+/// a plain state's.
+fn expectProbe(mdl: *const dsv41.Dsv41Model, d: dsv41.DsparkDraft, ablated: bool) !void {
+    try testing.expectEqual(mdl.ds_block, d.confidence.len);
+    var peak: f32 = 0;
+    for (d.confidence) |c| peak = @max(peak, @abs(c));
+    if (ablated) try testing.expectEqual(@as(f32, 0), peak) else try testing.expect(peak > 0);
+}
+
+test "deepseek_v41 ablation forward: a DSpark draft of an ablated state leaves its last stage's stream nothing along r, alone and batched" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41DsparkFiles(arena.allocator(), 7), "");
+    defer t.close();
+    const m: *v41.Model = @ptrCast(@alignCast(t.m));
+    const mdl = m.mdl;
+    try testing.expectEqual(@as(usize, 2), mdl.n_mtp);
+    const table = try Table.init(&.{1}, &.{key}, m.cfg.hidden_size);
+    defer table.deinit();
+    // Slot 1's state ablated, slot 2's plain.
+    testing.allocator.free(try forwardUnder(t, .prefill, &.{1}, &short_prompt, &.{0}, &table.abl));
+    testing.allocator.free(try forwardUnder(t, .prefill, &.{2}, &short_prompt, &.{0}, null));
+    var sts: [2]*dsv41.State = undefined;
+    var gens: [2]u64 = undefined;
+    try testing.expect(v41.slotStates(t.m, &.{ 1, 2 }, &sts, &gens));
+    // The confidence head is linear in the draft's collapsed last-stage stream (and the Markov row): a probe head along
+    // `col` reads that column, exactly 0 when the draft ablated every write. `DsparkW.conf` is f32 `[1, dim + rank]`.
+    const ds = &mdl.dspark.?;
+    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(ds.conf));
+    const host = try testing.allocator.alloc(f32, mlx.mlx_array_size(ds.conf));
+    defer testing.allocator.free(host);
+    @memset(host, 0);
+    host[col] = 1;
+    const shape = mlx.getShape(ds.conf);
+    const probe = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(probe);
+    const head = ds.conf;
+    ds.conf = probe;
+    defer ds.conf = head;
+    mdl.ds_want_conf = true;
+    const t1s = [2]u32{ 5, 5 };
+    // Each alone (`draftGraph`), both in one call (`dsparkDraftBatched`: each under its own), and the ablated one in a
+    // batch of its own (one batch under its ablation).
+    for (sts, 0..) |st, k| {
+        var d = try dsv41.dsparkDraft(mdl, testing.allocator, st, t1s[k]);
+        defer d.deinit(testing.allocator);
+        try expectProbe(mdl, d, k == 0);
+    }
+    var both: [2]dsv41.DsparkDraft = undefined;
+    try dsv41.dsparkDraftBatched(mdl, testing.allocator, &sts, &t1s, false, &both);
+    defer for (&both) |*d| d.deinit(testing.allocator);
+    for (both, 0..) |d, k| try expectProbe(mdl, d, k == 0);
+    var own: [1]dsv41.DsparkDraft = undefined;
+    try dsv41.dsparkDraftBatched(mdl, testing.allocator, sts[0..1], t1s[0..1], false, &own);
+    defer own[0].deinit(testing.allocator);
+    try expectProbe(mdl, own[0], true);
 }
