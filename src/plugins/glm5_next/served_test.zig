@@ -620,13 +620,36 @@ const ProbeStages = struct {
     var recur_out: ?kda.RecurOut = null;
     var gate_out: ?mlx.mlx_array = null;
     var capture_out: ?kda.CaptureOut = null;
+    var prework_calls: usize = 0;
+    var epilogue_calls: usize = 0;
+    var epilogue_verify = false;
+    var pw_conv_in: mlx.mlx_array = .{};
+    var beta_in: mlx.mlx_array = .{};
+    var prework_out: ?kda.PreworkOut = null;
+    var epilogue_out: ?mlx.mlx_array = null;
 
     const all: kda.Stages = .{
         .prologue = &prologue,
         .recurrence = .{ .serves = &serves, .run = &run },
         .verify_gate = &gate,
         .verify_capture = &capture,
+        .verify_prework = &prework,
+        .epilogue = &epilogue,
     };
+
+    fn prework(_: mlx.mlx_stream, in: kda.PreworkIn) anyerror!?kda.PreworkOut {
+        prework_calls += 1;
+        if (in.conv_state) |c| ProbeRows.keep(&pw_conv_in, c);
+        const o = prework_out orelse return null;
+        return .{ .q = ProbeRows.ref(o.q), .k = ProbeRows.ref(o.k), .v = ProbeRows.ref(o.v), .beta = ProbeRows.ref(o.beta), .window = ProbeRows.ref(o.window), .conv_input = ProbeRows.ref(o.conv_input) };
+    }
+
+    fn epilogue(_: mlx.mlx_stream, in: kda.EpilogueIn) anyerror!?mlx.mlx_array {
+        epilogue_calls += 1;
+        epilogue_verify = in.verify;
+        const o = epilogue_out orelse return null;
+        return ProbeRows.ref(o);
+    }
 
     fn prologue(_: mlx.mlx_stream, in: kda.PrologueIn) anyerror!?kda.PrologueOut {
         prologue_calls += 1;
@@ -659,6 +682,8 @@ const ProbeStages = struct {
 
     fn capture(_: mlx.mlx_stream, in: kda.CaptureIn) anyerror!?kda.CaptureOut {
         capture_calls += 1;
+        for (&heads_in, [_]mlx.mlx_array{ in.q, in.k, in.v }) |*h, x| ProbeRows.keep(h, x);
+        ProbeRows.keep(&beta_in, in.beta);
         ProbeRows.keep(&g_in, in.g);
         ProbeRows.keep(&state_in, in.state);
         const o = capture_out orelse return null;
@@ -666,7 +691,7 @@ const ProbeStages = struct {
     }
 
     fn reset() void {
-        for ([_]*mlx.mlx_array{ &conv_in, &heads_in[0], &heads_in[1], &heads_in[2], &state_in, &a_in, &g_in }) |a| if (a.ctx != null) {
+        for ([_]*mlx.mlx_array{ &conv_in, &heads_in[0], &heads_in[1], &heads_in[2], &state_in, &a_in, &g_in, &pw_conv_in, &beta_in }) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a.*);
             a.* = .{};
         };
@@ -680,6 +705,11 @@ const ProbeStages = struct {
         recur_out = null;
         gate_out = null;
         capture_out = null;
+        prework_calls = 0;
+        epilogue_calls = 0;
+        epilogue_verify = false;
+        prework_out = null;
+        epilogue_out = null;
     }
 };
 
@@ -739,6 +769,8 @@ test "glm5_next kda: a model's stages that decline leave a prompt's and a verify
             defer p.deinit();
             const got_p = try g.adopt(try kda.forward(m, xp, la, &p, 1, np, true, false));
             try testing.expectEqual([5]usize{ 1, 1, 0, 0, 0 }, [5]usize{ ProbeStages.prologue_calls, ProbeStages.serves_calls, ProbeStages.run_calls, ProbeStages.gate_calls, ProbeStages.capture_calls });
+            try testing.expectEqual([2]usize{ 0, 1 }, [2]usize{ ProbeStages.prework_calls, ProbeStages.epilogue_calls });
+            try testing.expect(!ProbeStages.epilogue_verify);
             try testing.expect(!ProbeStages.cold);
             try ops.expectBitEqual(ProbeStages.conv_in, base.conv_state);
             try ops.expectBitEqual(got_p, want_p);
@@ -748,6 +780,9 @@ test "glm5_next kda: a model's stages that decline leave a prompt's and a verify
             defer v.deinit();
             const got_v = try g.adopt(try kda.forward(m, xv, la, &v, 1, nv, false, true));
             try testing.expectEqual([5]usize{ 1, 1, 0, 1, 1 }, [5]usize{ ProbeStages.prologue_calls, ProbeStages.serves_calls, ProbeStages.run_calls, ProbeStages.gate_calls, ProbeStages.capture_calls });
+            try testing.expectEqual([2]usize{ 1, 2 }, [2]usize{ ProbeStages.prework_calls, ProbeStages.epilogue_calls });
+            try testing.expect(ProbeStages.epilogue_verify);
+            try ops.expectBitEqual(ProbeStages.pw_conv_in, base.conv_state);
             try ops.expectBitEqual(ProbeStages.state_in, base.ssm_state);
             try ops.expectBitEqual(got_v, want_v);
             try expectSameEntry(&v, &stock_v);
@@ -863,6 +898,112 @@ test "glm5_next kda: a model's verify stages serve a verify's rows, and the laye
             try ops.expectBitEqual(served.spec_state_seq, cap.state_seq);
             try ops.expectBitEqual(served.conv_state, stock.conv_state);
             try ops.expectBitEqual(served.spec_conv_input, stock.spec_conv_input);
+        }
+    }.run);
+}
+
+// Bar: a model's verify prework that serves a verify's rows takes the conv's, the norms' and beta's places: the capture
+// gets its q, k, v and beta, the slot takes its conv window and conv input, and the layer's output is the epilogue over
+// the capture's y.
+test "glm5_next kda: a model's verify prework serves a verify's rows, and the capture and the slot take its outputs" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const m = host.of(b.xfm.plugin.?.model);
+            const c = m.c;
+            const la = try kdaLayer(m);
+            var g = ops.Graph.init(testing.allocator, m.s);
+            defer g.deinit();
+            var base = try primed(m, la, &g);
+            defer base.deinit();
+            const x = try g.adopt(try m.embedding(try proof_fixture.tokens(&g, &stage_window)));
+            const n: c_int = stage_window.len;
+            const hk: c_int = @intCast(c.linear_num_key_heads);
+            const hv: c_int = @intCast(c.linear_num_value_heads);
+            const dk: c_int = @intCast(c.linear_key_head_dim);
+            const dv: c_int = @intCast(c.linear_value_head_dim);
+            const act = ops.dtype(base.conv_state);
+            const st = ops.dtype(base.ssm_state);
+            ProbeStages.reset();
+            defer ProbeStages.reset();
+            ProbeStages.prework_out = .{
+                .q = try noise(&g, &.{ 1, n, hk, dk }, act, 31),
+                .k = try noise(&g, &.{ 1, n, hk, dk }, act, 32),
+                .v = try noise(&g, &.{ 1, n, hv, dv }, act, 33),
+                .beta = try noise(&g, &.{ 1, n, hv }, act, 34),
+                .window = try noise(&g, mlx.getShape(base.conv_state), act, 35),
+                .conv_input = try noise(&g, &.{ 1, n + 3, 2 * hk * dk + hv * dv }, act, 36),
+            };
+            ProbeStages.capture_out = .{
+                .y = try noise(&g, &.{ 1, n, hv, dv }, act, 37),
+                .state = try noise(&g, mlx.getShape(base.ssm_state), st, 38),
+                .state_seq = try noise(&g, &.{ n, 1, hv, dv, dk }, st, 39),
+            };
+            const pw = ProbeStages.prework_out.?;
+            const cap = ProbeStages.capture_out.?;
+            m.kda.stages = ProbeStages.all;
+            defer m.kda.stages = .{};
+
+            var served = copyOf(&base);
+            defer served.deinit();
+            const y = try g.adopt(try kda.forward(m, x, la, &served, 1, n, false, true));
+
+            try testing.expectEqual([3]usize{ 1, 1, 1 }, [3]usize{ ProbeStages.prework_calls, ProbeStages.capture_calls, ProbeStages.epilogue_calls });
+            try ops.expectBitEqual(ProbeStages.pw_conv_in, base.conv_state);
+            for (ProbeStages.heads_in, [_]mlx.mlx_array{ pw.q, pw.k, pw.v }) |got, want| try ops.expectBitEqual(got, want);
+            try ops.expectBitEqual(ProbeStages.beta_in, pw.beta);
+            try ops.expectBitEqual(ProbeStages.state_in, base.ssm_state);
+
+            try ops.expectBitEqual(y, try epilogueOf(m, la, &g, x, cap.y));
+            try ops.expectBitEqual(served.conv_state, pw.window);
+            try ops.expectBitEqual(served.spec_conv_input, pw.conv_input);
+            try ops.expectBitEqual(served.ssm_state, cap.state);
+            try ops.expectBitEqual(served.spec_state_seq, cap.state_seq);
+        }
+    }.run);
+}
+
+// Bar: a model's epilogue that serves a prompt's or a verify's rows gives the out projection's input: the layer's output
+// is the out projection of what it gave, and it changes no slot state.
+test "glm5_next kda: a model's epilogue serves a prompt's and a verify's rows, and the out projection takes its output" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const m = host.of(b.xfm.plugin.?.model);
+            const c = m.c;
+            const la = try kdaLayer(m);
+            var g = ops.Graph.init(testing.allocator, m.s);
+            defer g.deinit();
+            var base = try primed(m, la, &g);
+            defer base.deinit();
+            const hv: c_int = @intCast(c.linear_num_value_heads);
+            const dv: c_int = @intCast(c.linear_value_head_dim);
+            const act = ops.dtype(base.conv_state);
+            for ([_]struct { ids: []const i32, prefill: bool, capture: bool }{
+                .{ .ids = &stage_prompt, .prefill = true, .capture = false },
+                .{ .ids = &stage_window, .prefill = false, .capture = true },
+            }, 0..) |case, i| {
+                const x = try g.adopt(try m.embedding(try proof_fixture.tokens(&g, case.ids)));
+                const n: c_int = @intCast(case.ids.len);
+                var stock = copyOf(&base);
+                defer stock.deinit();
+                _ = try g.adopt(try kda.forward(m, x, la, &stock, 1, n, case.prefill, case.capture));
+
+                ProbeStages.reset();
+                defer ProbeStages.reset();
+                ProbeStages.epilogue_out = try noise(&g, &.{ 1, n, hv * dv }, act, 41 + i);
+                const flat = ProbeStages.epilogue_out.?;
+                m.kda.stages = .{ .epilogue = &ProbeStages.epilogue };
+                defer m.kda.stages = .{};
+                var served = copyOf(&base);
+                defer served.deinit();
+                const y = try g.adopt(try kda.forward(m, x, la, &served, 1, n, case.prefill, case.capture));
+
+                try testing.expectEqual(@as(usize, 1), ProbeStages.epilogue_calls);
+                try testing.expectEqual(case.capture, ProbeStages.epilogue_verify);
+                try ops.expectBitEqual(y, try g.adopt(try m.mm(&la.out, flat)));
+                try expectSameEntry(&served, &stock);
+            }
         }
     }.run);
 }
