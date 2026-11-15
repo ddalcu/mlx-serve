@@ -20,6 +20,8 @@ const fixture = @import("../../sdk/bases/kda_hybrid/fixture.zig");
 const glm = @import("plugin.zig");
 const host = @import("../../sdk/bases/kda_hybrid/host.zig");
 const ling = @import("../bailing_hybrid/plugin.zig");
+const kda = @import("../../sdk/bases/kda_hybrid/kda.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
 const tape_compact_over = @import("proof_test.zig").tape_compact_over;
 
 const testing = std.testing;
@@ -357,6 +359,241 @@ test "bailing_hybrid served: a streaming pack's greedy MTP stream equals its gre
                 var drafted: [24]u32 = undefined;
                 try lingGreedy(b, depth, &drafted);
                 try testing.expectEqualSlices(u32, &plain, &drafted);
+            }
+        }
+    }.run);
+}
+
+/// A model plugin's verify rows: counts each call and keeps its operands; declines while `out` is null, else hands
+/// back new references on `out`; fails while `fail` is set.
+const ProbeRows = struct {
+    var calls: usize = 0;
+    var seen: kda.VerifyRowsIn = undefined;
+    var rows_seen: c_int = 0;
+    var state_in: mlx.mlx_array = .{};
+    var conv_in: mlx.mlx_array = .{};
+    var out: ?kda.VerifyRowsOut = null;
+    var fail = false;
+
+    fn run(_: mlx.mlx_stream, in: kda.VerifyRowsIn) anyerror!?kda.VerifyRowsOut {
+        calls += 1;
+        seen = in;
+        rows_seen = mlx.getShape(in.qkv)[1];
+        keep(&state_in, in.state);
+        keep(&conv_in, in.conv_state);
+        if (fail) return error.TestProbeFailed;
+        const o = out orelse return null;
+        return .{ .y = ref(o.y), .conv_state = ref(o.conv_state), .state = ref(o.state), .state_seq = ref(o.state_seq) };
+    }
+
+    fn ref(a: mlx.mlx_array) mlx.mlx_array {
+        var r = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&r, a);
+        return r;
+    }
+
+    fn keep(slot: *mlx.mlx_array, a: mlx.mlx_array) void {
+        if (slot.ctx != null) _ = mlx.mlx_array_free(slot.*);
+        slot.* = ref(a);
+    }
+
+    fn reset() void {
+        for ([_]*mlx.mlx_array{ &state_in, &conv_in }) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a.*);
+            a.* = .{};
+        };
+        calls = 0;
+        rows_seen = 0;
+        out = null;
+        fail = false;
+    }
+};
+
+/// The first KDA layer of the trunk.
+fn kdaLayer(m: *trunk.Model) !*const trunk.Kda {
+    for (m.layers) |*l| if (l.mixer == .kda) return &l.mixer.kda;
+    return error.TestNoKdaLayer;
+}
+
+/// A slot's state at `la` after a 10-token prompt, as a prefill leaves it.
+fn primed(m: *trunk.Model, la: *const trunk.Kda, g: *ops.Graph) !kda.Entry {
+    var e: kda.Entry = .{};
+    errdefer e.deinit();
+    const prompt = [_]i32{ 3, 17, 42, 99, 7, 250, 1, 8, 66, 31 };
+    const x = try g.adopt(try m.embedding(try proof_fixture.tokens(g, &prompt)));
+    _ = try g.adopt(try kda.forward(m, x, la, &e, 1, prompt.len, true, false));
+    return e;
+}
+
+/// A second reference on every array of `e`.
+fn copyOf(e: *const kda.Entry) kda.Entry {
+    var c: kda.Entry = .{ .initialized = e.initialized };
+    inline for (.{ "conv_state", "ssm_state", "spec_conv_input", "spec_state_seq" }) |f| if (@field(e.*, f).ctx != null) {
+        @field(c, f) = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&@field(c, f), @field(e.*, f));
+    };
+    return c;
+}
+
+/// normal(0, 1) of shape `sh` in `dt`.
+fn noise(g: *ops.Graph, sh: []const c_int, dt: mlx.mlx_dtype, seed: u64) !mlx.mlx_array {
+    const key = try g.call(mlx.mlx_random_key, .{seed});
+    return g.astype(try g.call(mlx.mlx_random_normal, .{ sh.ptr, sh.len, @as(mlx.mlx_dtype, .float32), @as(f32, 0), @as(f32, 1), key }), dt);
+}
+
+// Bar: a serial-rows verify hands a KDA layer's rows to the model's verify rows once, on the slot's state and the
+// layer's geometry; y goes through the out projection and the window, state and every row's state into the slot.
+test "glm5_next kda: a model's verify rows serve a serial-rows verify, and the layer and the slot take their outputs" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const m = host.of(b.xfm.plugin.?.model);
+            const c = m.c;
+            const la = try kdaLayer(m);
+            var g = ops.Graph.init(testing.allocator, m.s);
+            defer g.deinit();
+            var base = try primed(m, la, &g);
+            defer base.deinit();
+            const window = [_]i32{ 5, 61, 200, 9 };
+            const n: c_int = window.len;
+            const x = try g.adopt(try m.embedding(try proof_fixture.tokens(&g, &window)));
+            m.serial_rows = true;
+            defer m.serial_rows = false;
+            // The trunk's own rows, for the window's conv inputs it captures on either path.
+            var stock = copyOf(&base);
+            defer stock.deinit();
+            _ = try g.adopt(try kda.forward(m, x, la, &stock, 1, n, false, true));
+
+            const hk: c_int = @intCast(c.linear_num_key_heads);
+            const hv: c_int = @intCast(c.linear_num_value_heads);
+            const dk: c_int = @intCast(c.linear_key_head_dim);
+            const dv: c_int = @intCast(c.linear_value_head_dim);
+            const act = ops.dtype(stock.conv_state);
+            const st = ops.dtype(base.ssm_state);
+            ProbeRows.reset();
+            defer ProbeRows.reset();
+            ProbeRows.out = kda.VerifyRowsOut{
+                .y = try noise(&g, &.{ 1, n, hv * dv }, act, 1),
+                .conv_state = try noise(&g, &.{ 1, 3, 2 * hk * dk + hv * dv }, act, 2),
+                .state = try noise(&g, &.{ 1, hv, dv, dk }, st, 3),
+                .state_seq = try noise(&g, &.{ n, 1, hv, dv, dk }, st, 4),
+            };
+            const want = ProbeRows.out.?;
+            m.kda_verify_rows = &ProbeRows.run;
+            defer m.kda_verify_rows = null;
+            var served = copyOf(&base);
+            defer served.deinit();
+            const y = try g.adopt(try kda.forward(m, x, la, &served, 1, n, false, true));
+
+            try testing.expectEqual(@as(usize, 1), ProbeRows.calls);
+            try testing.expectEqual(n, ProbeRows.rows_seen);
+            const in = ProbeRows.seen;
+            try testing.expectEqual([4]c_int{ hk, hv, dk, dv }, [4]c_int{ in.hk, in.hv, in.dk, in.dv });
+            try testing.expectEqual(c.kda_gate_lower_bound, in.bound);
+            try testing.expectEqual(c.rms_norm_eps, in.norm_eps);
+            try testing.expectEqual(@as(f32, 1e-6), in.qk_eps);
+            try ops.expectBitEqual(ProbeRows.state_in, base.ssm_state);
+            try ops.expectBitEqual(ProbeRows.conv_in, base.conv_state);
+
+            try ops.expectBitEqual(y, try g.adopt(try m.mm(&la.out, want.y)));
+            try ops.expectBitEqual(served.conv_state, want.conv_state);
+            try ops.expectBitEqual(served.ssm_state, want.state);
+            try ops.expectBitEqual(served.spec_state_seq, want.state_seq);
+            try ops.expectBitEqual(served.spec_conv_input, stock.spec_conv_input);
+        }
+    }.run);
+}
+
+// Bar: an error from the model's verify rows is the forward's, and the slot keeps the state it had.
+test "glm5_next kda: a model's verify rows that fail leave the slot's state as it was" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const m = host.of(b.xfm.plugin.?.model);
+            const la = try kdaLayer(m);
+            var g = ops.Graph.init(testing.allocator, m.s);
+            defer g.deinit();
+            var base = try primed(m, la, &g);
+            defer base.deinit();
+            const window = [_]i32{ 5, 61 };
+            const x = try g.adopt(try m.embedding(try proof_fixture.tokens(&g, &window)));
+            ProbeRows.reset();
+            defer ProbeRows.reset();
+            ProbeRows.fail = true;
+            m.kda_verify_rows = &ProbeRows.run;
+            defer m.kda_verify_rows = null;
+            m.serial_rows = true;
+            defer m.serial_rows = false;
+            var failed = copyOf(&base);
+            defer failed.deinit();
+            try testing.expectError(error.TestProbeFailed, kda.forward(m, x, la, &failed, 1, window.len, false, true));
+            try testing.expectEqual(@as(usize, 1), ProbeRows.calls);
+            try ops.expectBitEqual(failed.conv_state, base.conv_state);
+            try ops.expectBitEqual(failed.ssm_state, base.ssm_state);
+            try testing.expect(failed.spec_state_seq.ctx == null and failed.spec_conv_input.ctx == null);
+        }
+    }.run);
+}
+
+// Bar: with no verify rows set, a serial-rows verify's rows, final state, conv window and every row's state are the
+// one-row decode steps', bit for bit.
+test "glm5_next kda: without a model's verify rows a serial-rows verify steps each row as one-row decode does" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const m = host.of(b.xfm.plugin.?.model);
+            try testing.expect(m.kda_verify_rows == null);
+            const la = try kdaLayer(m);
+            var g = ops.Graph.init(testing.allocator, m.s);
+            defer g.deinit();
+            var base = try primed(m, la, &g);
+            defer base.deinit();
+            const window = [_]i32{ 5, 61, 200, 9 };
+            var verify = copyOf(&base);
+            defer verify.deinit();
+            m.serial_rows = true;
+            const got = kda.forward(m, try g.adopt(try m.embedding(try proof_fixture.tokens(&g, &window))), la, &verify, 1, window.len, false, true);
+            m.serial_rows = false;
+            const y = try g.adopt(try got);
+            var serial = copyOf(&base);
+            defer serial.deinit();
+            var ys: [window.len]mlx.mlx_array = undefined;
+            var states: [window.len]mlx.mlx_array = undefined;
+            for (&ys, &states, window) |*yr, *sr, t| {
+                const xr = try g.adopt(try m.embedding(try proof_fixture.tokens(&g, &.{t})));
+                yr.* = try g.adopt(try kda.forward(m, xr, la, &serial, 1, 1, false, false));
+                sr.* = try g.keep(serial.ssm_state);
+            }
+            try ops.expectBitEqual(y, try g.concat(&ys, 1));
+            try ops.expectBitEqual(verify.ssm_state, serial.ssm_state);
+            try ops.expectBitEqual(verify.conv_state, serial.conv_state);
+            for (states, 0..) |sr, r| {
+                const row = try g.sliceAxis(verify.spec_state_seq, 0, @intCast(r), @intCast(r + 1));
+                try ops.expectBitEqual(try g.reshape(row, ops.shape(sr)), sr);
+            }
+        }
+    }.run);
+}
+
+// Bar: a streaming pack's verify offers every KDA layer's rows to the model's verify rows, at any width; where they
+// decline, every row is still serial decode's, bit for bit.
+test "bailing_hybrid served: a streaming pack's verify offers each KDA layer's rows to the model's verify rows; a decline keeps serial decode's bytes" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const m = host.of(b.xfm.plugin.?.model);
+            ProbeRows.reset();
+            defer ProbeRows.reset();
+            m.kda_verify_rows = &ProbeRows.run;
+            defer m.kda_verify_rows = null;
+            const prompt = [_]i32{ 3, 17, 42, 99, 7, 250, 1, 8, 66, 31 };
+            const window = [_]i32{ 5, 61, 200, 9, 33, 77, 140, 2, 18 };
+            for ([_]usize{ 2, 5, 9 }) |n| {
+                const before = ProbeRows.calls;
+                try b.expectVerifyIsSerial(&prompt, window[0..n], 64);
+                // The fixture's 3 KDA layers, each offered the verify's rows once; decode steps are never offered.
+                try testing.expectEqual(before + 3, ProbeRows.calls);
+                try testing.expectEqual(@as(c_int, @intCast(n)), ProbeRows.rows_seen);
             }
         }
     }.run);
