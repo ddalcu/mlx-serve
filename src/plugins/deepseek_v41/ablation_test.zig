@@ -229,19 +229,29 @@ test "deepseek_v41 ablation: states batch together only unablated or under one k
 }
 
 test "deepseek_v41 ablation: a state takes a forward of its own variant; a fresh or disk-tier state takes any" {
-    try testing.expectEqual(@as(u64, 0), ablation.variantOf(null));
-    try testing.expectEqual(@as(u64, 7), ablation.variantOf(.{ .directions = .{}, .strength = 1, .key = 7 }));
-    try testing.expectEqual(ablation.unkeyed, ablation.variantOf(.{ .directions = .{}, .strength = 1 }));
+    const none: ablation.Variant = .none;
+    const k7: ablation.Variant = .{ .keyed = 7 };
+    const plain: ablation.Spec = .{ .directions = .{}, .strength = 1 };
+    const seven: ablation.Spec = .{ .directions = .{}, .strength = 1, .key = 7 };
+    try testing.expect(std.meta.eql(none, ablation.variantOf(null)));
+    try testing.expect(std.meta.eql(k7, ablation.variantOf(seven)));
+    try testing.expect(std.meta.eql(ablation.Variant.unkeyed, ablation.variantOf(plain)));
     // Nothing computed yet.
-    try testing.expect(ablation.fits(0, 7, 0));
+    try testing.expect(ablation.fits(0, k7, plain));
     // Read back from the disk tier: the host keyed the entry by its variant.
-    try testing.expect(ablation.fits(12, null, 7));
-    try testing.expect(ablation.fits(12, 7, 7));
+    try testing.expect(ablation.fits(12, null, seven));
+    try testing.expect(ablation.fits(12, k7, seven));
     // An unablated request on an ablated state, and the reverse.
-    try testing.expect(!ablation.fits(12, 7, 0));
-    try testing.expect(!ablation.fits(12, 0, 7));
+    try testing.expect(!ablation.fits(12, k7, null));
+    try testing.expect(!ablation.fits(12, none, seven));
+    // The host's own keys, including its odd hash and a caller's even one, continue their own rows.
+    const odd: u64 = std.math.maxInt(u64);
+    const even: u64 = 2;
+    try testing.expect(ablation.fits(12, .{ .keyed = odd }, .{ .directions = .{}, .strength = 1, .key = odd }));
+    try testing.expect(ablation.fits(12, .{ .keyed = even }, .{ .directions = .{}, .strength = 1, .key = even }));
+    try testing.expect(!ablation.fits(12, .{ .keyed = odd }, .{ .directions = .{}, .strength = 1, .key = even }));
     // An unkeyed ablation matches only itself, so no state continues rows under it.
-    try testing.expect(!ablation.fits(12, ablation.unkeyed, ablation.unkeyed));
+    try testing.expect(!ablation.fits(12, ablation.Variant.unkeyed, plain));
 }
 
 test "deepseek_v41 ablation: a tap directory's next seq is one past its index, so a restart cannot reuse a file" {

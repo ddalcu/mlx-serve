@@ -308,13 +308,19 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.idle = null;
     m.tap_dir = null;
     // Calibration (MLX_SERVE_DSV41_TAP_DIR): every prompt forward's stream at each layer, written there owner-only.
+    // Only a model that runs every layer at full width here: a Thunderbolt pair runs some layers on the other Mac and a
+    // tensor split holds a shard, so either one's dump has no site to write for the rest.
     if (env.span(.MLX_SERVE_DSV41_TAP_DIR)) |tap_dir| if (tap_dir.len > 0) {
-        const tap = try gpa.create(ablation.StreamTap);
-        errdefer gpa.destroy(tap);
-        tap.* = try ablation.StreamTap.init(gpa, m.mdl.n_layers, tap_rows);
-        m.mdl.stream_tap = tap;
-        m.tap_dir = tap_dir;
-        std.log.warn("deepseek_v41: the calibration tap is on: every prompt's per-layer stream and last ids go to {s} (owner-only files)", .{tap_dir});
+        if (m.mdl.pair != null or m.mdl.tp != null)
+            std.log.warn("deepseek_v41: the calibration tap is off for this load: a split model records only part of each prompt's stream", .{})
+        else {
+            const tap = try gpa.create(ablation.StreamTap);
+            errdefer gpa.destroy(tap);
+            tap.* = try ablation.StreamTap.init(gpa, m.mdl.n_layers, tap_rows);
+            m.mdl.stream_tap = tap;
+            m.tap_dir = tap_dir;
+            std.log.warn("deepseek_v41: the calibration tap is on: every prompt's per-layer stream and last ids go to {s} (owner-only files)", .{tap_dir});
+        }
     };
     errdefer freeTap(m);
     if (c.dsv41_streamed) {
@@ -448,7 +454,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     defer in.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
     if (pos != 0 and (m.mdl.dec_state == null or m.mdl.dec_state.?.n != pos)) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the model's state");
-    if (pos != 0 and !ablation.fits(pos, m.mdl.dec_state.?.variant, ablation.variantOf(spec))) return variantRefused();
+    if (pos != 0 and !ablation.fits(pos, m.mdl.dec_state.?.variant, spec)) return variantRefused();
     for (in.host) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");
     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
@@ -501,7 +507,7 @@ fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdic
         states[k] = live.st;
         gens[k] = live.gen;
         if (f.positions.len == n and f.positions.slice()[k] != states[k].n) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the slot's state");
-        if (!ablation.fits(states[k].n, states[k].variant, ablation.variantOf(specs[k]))) return variantRefused();
+        if (!ablation.fits(states[k].n, states[k].variant, specs[k])) return variantRefused();
         if (states[k].verify != null) alone = true;
     }
     for (f.tokens.slice()) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");

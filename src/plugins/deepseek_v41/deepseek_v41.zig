@@ -2372,9 +2372,9 @@ pub const State = struct {
     /// The request's directional ablation (`abl.stateArm`), owned: every pass over the state runs under it, the DSpark
     /// rounds the engine runs between forwards included.
     ablation: ?abl.Ablation = null,
-    /// The ablation key the state's rows were computed under (`abl.variantOf`; 0: none); null where nothing says: a
-    /// snapshot read back from the disk tier, whose entry the host keys by its variant.
-    variant: ?u64 = 0,
+    /// The ablation key the state's rows were computed under (`abl.variantOf`; `.none` for none); null where nothing
+    /// says: a snapshot read back from the disk tier, whose entry the host keys by its variant.
+    variant: ?abl.Variant = .none,
 
     pub fn deinit(self: *State) void {
         abl.stateDisarm(self);
@@ -2423,7 +2423,7 @@ pub fn stateBytes(st: *const State) u64 {
     }
     for (st.ds) |r| bytes += arrayBytes(r.buf);
     if (st.snap) |*sn| bytes += sn.bytes();
-    return bytes + arrayBytes(st.mh);
+    return bytes + arrayBytes(st.mh) + abl.retainedBytes(st.ablation);
 }
 
 pub fn initState(m: *const Dsv41Model, gpa: std.mem.Allocator) !State {
@@ -6321,7 +6321,7 @@ pub const Snap = struct {
     /// The state's ablation when it was taken (retained), so a restore's `rewind` replays under it; null: none.
     ablation: ?abl.Ablation = null,
     /// `State.variant` when it was taken.
-    variant: ?u64 = 0,
+    variant: ?abl.Variant = .none,
 
     const LSnap = struct { win: A, comp: ?Rows, idx_k: ?Rows, pend_kv: A, pend_gate: A };
 
@@ -6352,7 +6352,7 @@ pub const Snap = struct {
             if (l.idx_k) |r| n += arrayBytes(r.buf);
         }
         for (self.ds) |a| n += arrayBytes(a);
-        return n;
+        return n + abl.retainedBytes(self.ablation);
     }
 
     pub fn clone(self: *const Snap, gpa: std.mem.Allocator) !Snap {
@@ -6425,7 +6425,7 @@ pub fn rewind(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
     st.n = s;
     _ = try extendIds(m, gpa, st, .{ .host = ids[s..] }, .replay, null);
     // A disk-tier snapshot carries no ablation: its replayed windows are plain, whatever variant its entry holds.
-    if (st.ablation == null and st.variant == null) st.variant = 0;
+    if (st.ablation == null and st.variant == null) st.variant = .none;
 }
 
 fn cacheSetting(h: *std.hash.Wyhash, value: anytype) void {
@@ -6715,7 +6715,10 @@ fn restore(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
     const st = if (m.dec_state) |*st| st else return 0;
     // Rows an ablation wrote (or a disk-tier entry of unknown variant) resume no request: the host resumes only
     // unablated prompts (`abl.fits`).
-    if ((st.variant orelse return 0) != 0) return 0;
+    switch (st.variant orelse return 0) {
+        .none => {},
+        .keyed, .unkeyed => return 0,
+    }
     const sn = if (st.snap) |*sn| sn else return 0;
     if (sn.gen != m.state_gen or sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
     if (sn.vision_key != try visionKey(vision_rows, m.imageRows(sn.ids))) return 0;

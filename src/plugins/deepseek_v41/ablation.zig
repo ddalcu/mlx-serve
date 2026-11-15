@@ -97,6 +97,17 @@ pub fn retain(a: ?Ablation) ?Ablation {
     return .{ .r = ref(x.r), .col = ref(x.col), .s = ref(x.s), .key = x.key };
 }
 
+/// The resident bytes of an ablation's arrays: `r` `[dim]`, `col` `[dim, 1]` and `s` `[1]`, all f32. What a state or
+/// a snapshot retains, and therefore what it bills.
+pub fn retainedBytes(a: ?Ablation) u64 {
+    const x = a orelse return 0;
+    var n: u64 = 0;
+    for ([_]A{ x.r, x.col, x.s }) |v| {
+        if (v.ctx != null) n += @as(u64, mlx.mlx_array_size(v)) * @as(u64, mlx.mlx_array_itemsize(v));
+    }
+    return n;
+}
+
 fn ref(x: A) A {
     var o = mlx.mlx_array_new();
     _ = mlx.mlx_array_set(&o, x);
@@ -111,26 +122,41 @@ pub fn same(a: ?Ablation, b: ?Ablation) bool {
     return x.key != 0 and x.key == y.key;
 }
 
-/// The variant of an ablated slot whose host gave no key: it matches only itself.
-pub const unkeyed: u64 = std.math.maxInt(u64);
+/// The ablation a state's rows were computed under. A union, not a sentinel value: every nonzero u64 is a key a host
+/// may hand out (`abi.Ablation.keys` reserves only 0), so any magic value would sit inside the input domain.
+pub const Variant = union(enum) { none, unkeyed, keyed: u64 };
 
-/// The variant a forward under `a` computes its state's rows in (`State.variant`): the host's key, `unkeyed` without
-/// one, 0 for none.
-pub fn variantOf(a: ?Spec) u64 {
-    const x = a orelse return 0;
-    return if (x.key != 0) x.key else unkeyed;
+/// The variant a forward under `a` computes its state's rows in (`State.variant`).
+pub fn variantOf(a: ?Spec) Variant {
+    const x = a orelse return .none;
+    return if (x.key != 0) .{ .keyed = x.key } else .unkeyed;
 }
 
-/// Whether a forward of variant `key` may run on a state of `n` rows computed under `variant`: a fresh state takes any,
+/// Whether a forward under `spec` may run on a state of `n` rows computed under `variant`: a fresh state takes any,
 /// a state read back from the disk tier (null) takes the host's word (it keys those entries by variant), any other only
 /// its own.
-pub fn fits(n: usize, variant: ?u64, key: u64) bool {
+pub fn fits(n: usize, variant: ?Variant, spec: ?Spec) bool {
     if (n == 0) return true;
+    const want = variantOf(spec);
     // An unkeyed ablation names no direction in the host's cache key, so two of them are indistinguishable: never
     // continue rows under one (the same rule `same` applies to a batch).
-    if (key == unkeyed) return false;
-    const v = variant orelse return true;
-    return v == key;
+    switch (want) {
+        .unkeyed => return false,
+        .none => {
+            const v = variant orelse return true;
+            return switch (v) {
+                .none => true,
+                .keyed, .unkeyed => false,
+            };
+        },
+        .keyed => |k| {
+            const v = variant orelse return true;
+            return switch (v) {
+                .keyed => |held| held == k,
+                .none, .unkeyed => false,
+            };
+        },
+    }
 }
 
 /// Arms slot ablation `a` (null: none) on `st` for every pass over it until the next `stateArm` or `stateDisarm`, the
@@ -307,10 +333,12 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     defer sc.deinit();
     const per_site = try gpa.alloc(A, sites);
     defer gpa.free(per_site);
-    // Every site keeps the same last rows: the fewest any site recorded, at most `keep`.
+    // Every site keeps the same last rows: the fewest any site recorded, at most `keep`. A site no pass recorded (a
+    // pair runs some layers on the other Mac) leaves this dump no aligned matrix: write nothing, exactly as when site 0
+    // was empty, rather than stack an axis that silently drops layers.
     var rows = tap.keep;
     for (tap.sites, per_site) |list, *o| {
-        if (list.items.len == 0) return error.TapIncomplete;
+        if (list.items.len == 0) return null;
         o.* = try sc.concat(list.items, 0); // [rows, dim]
         rows = @min(rows, @as(usize, @intCast(mlx.getShape(o.*)[0])));
     }
