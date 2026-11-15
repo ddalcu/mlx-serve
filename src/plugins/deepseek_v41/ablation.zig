@@ -366,12 +366,27 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
     try line.writer.writeAll("]}\n");
     const idx_flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
-        .{ .truncate = false, .lock = .exclusive }
+        .{ .read = true, .truncate = false, .lock = .exclusive }
     else
-        .{ .truncate = false, .lock = .exclusive, .permissions = .fromMode(0o600) };
+        .{ .read = true, .truncate = false, .lock = .exclusive, .permissions = .fromMode(0o600) };
     var idx = try d.createFile(io, "index.jsonl", idx_flags);
     defer idx.close(io);
-    const end = (try idx.stat(io)).size;
+    var end = (try idx.stat(io)).size;
+    if (end > 0) {
+        // A crash can leave a half-written last record; a JSONL reader cannot parse it and the append below would
+        // extend it. Cut it back to the last newline (its tensor stays on disk, unindexed) before writing ours.
+        const win: usize = @intCast(@min(end, 4096));
+        var tail_buf: [4096]u8 = undefined;
+        const got = try idx.readPositionalAll(io, tail_buf[0..win], end - win);
+        if (got > 0 and tail_buf[got - 1] != '\n') {
+            const cut: u64 = if (std.mem.lastIndexOfScalar(u8, tail_buf[0..got], '\n')) |i|
+                end - win + i + 1
+            else
+                end - win;
+            try idx.setLength(io, cut);
+            end = cut;
+        }
+    }
     try idx.writePositionalAll(io, line.written(), end);
     return seq;
 }
