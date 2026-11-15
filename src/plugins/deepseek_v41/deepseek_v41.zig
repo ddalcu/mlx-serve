@@ -77,6 +77,8 @@ const acore = @import("prompt/attn_core.zig");
 /// a wide span's attention as one flash
 /// kernel (an online softmax; the scores and probabilities never leave a threadgroup), not exact.
 const fa = @import("prompt/flash_attn.zig");
+/// Directional ablation (ablation.zig): every write to the residual stream loses the direction of the pass's state.
+const abl = @import("ablation.zig");
 const Shard = @import("../../sdk/weights/shard.zig").Shard;
 
 const A = mlx.mlx_array;
@@ -537,6 +539,11 @@ pub const Dsv41Model = struct {
     /// The serial sampler's suppress mask `[V]` bool (the engine's `Transformer.suppress_mask`, not owned), set by the
     /// engine before a DSpark round: an exact greedy accept masks the same ids. None: no mask.
     suppress: A = none,
+    /// The directional ablation of the pass being built (`abl.ablate`): its state's, set by the pass's entry
+    /// (`extendIds`, `draftGraph`, `extendBatched`, `dsparkDraftBatched`) and put back at its exit; null = none.
+    ablation: ?abl.Ablation = null,
+    /// Calibration: the stream entering each layer of every prompt pass (`abl.StreamTap`), the plugin's; null = none.
+    stream_tap: ?*abl.StreamTap = null,
 
     fn dropAhead(self: *Dsv41Model) void {
         if (self.ahead) |a| a.finish();
@@ -2363,8 +2370,15 @@ pub const State = struct {
     snap_at: ?usize = null,
     snap_ids: []u32 = &.{},
     snap_vision_key: u64 = 0,
+    /// The request's directional ablation (`abl.stateArm`), owned: every pass over the state runs under it, the DSpark
+    /// rounds the engine runs between forwards included.
+    ablation: ?abl.Ablation = null,
+    /// The ablation key the state's rows were computed under (`abl.variantOf`; 0: none); null where nothing says: a
+    /// snapshot read back from the disk tier, whose entry the host keys by its variant.
+    variant: ?u64 = 0,
 
     pub fn deinit(self: *State) void {
+        abl.stateDisarm(self);
         if (self.snap) |*sn| sn.deinit(self.gpa);
         self.gpa.free(self.snap_ids);
         for (self.layers) |*l| l.deinit();
@@ -4605,8 +4619,9 @@ fn routedOutside(sc: *Scope, m: *const Dsv41Model, e: *const [3]outside.Weight, 
 /// The gated write of the n-gram rows into the stream `[L, hc, dim]`: `wkv`
 /// turns the rows into one key per copy plus a shared value, and the gate is
 /// sigmoid of the signed sqrt of a per-copy normalized stream-key dot.
+/// Under an ablation the value loses the pass's direction first (`abl.ablateValue`).
 pub fn engramApply(sc: *Scope, m: *const Dsv41Model, e: *const EngramLayer, x: A, rows: A) !A {
-    const kv = try engramWkv(sc, e, try sc.astype(rows, m.act));
+    const kv = try abl.ablateValue(sc, m, try engramWkv(sc, e, try sc.astype(rows, m.act)));
     if (mlx.streamIsGpu(sc.s)) return engramGate(sc, m, e.qk, x, kv);
     return engramGateOps(sc, m, e.qk, x, kv);
 }
@@ -4719,7 +4734,7 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     if (sh.floor == null and sh.img.ctx == null and li < m.regions.len and compiledAt(m, dim(x, 0)) and fetchServes(m, dim(x, 0))) {
         var a: [4]A = undefined; // the attention's pre, post, comb; its input
         try runRegion(sc, m, li, .attn_in, &.{ x, pre.* }, &a);
-        const ao = try attention(sc, m, st, li, a[3], p0, sh, null);
+        const ao = try abl.ablate(sc, m, try attention(sc, m, st, li, a[3], p0, sh, null));
         if (m.streamed) |src| {
             var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
             try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, a[0], a[1], a[2] }, &p);
@@ -4734,7 +4749,7 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
                 const pc = try sc.concat(&.{ p[2], try sc.reshape(p[3], &.{ ci(dim(p[3], 0)), -1 }) }, 1);
                 const yf = try sc.keep(try fx(src.ctx, @intCast(li), p[4], p[5], p[6], s[0], p[0], pc).get());
                 pre.* = p[1];
-                return yf;
+                return abl.ablateExpanded(sc, m, p[0], yf, p[3]);
             };
             const ro = switch (src.math) {
                 .source => |f| try sc.keep(try f(src.ctx, @intCast(li), p[4], p[5], p[6]).get()),
@@ -4754,17 +4769,14 @@ pub fn block(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
                 try runRegion(sc, m, li, .ffn_post_shared, &.{ p[0], p[2], p[3], ro, s[0] }, &y);
             } else try runRegion(sc, m, li, .ffn_post, &.{ p[0], p[2], p[3], p[4], ro }, &y);
             pre.* = p[1];
-            return y[0];
+            return abl.ablateExpanded(sc, m, p[0], y[0], p[3]);
         }
         if (m.tp != null) return tpFfn(sc, m, li, x, ao, &.{ .pre = a[0], .post = a[1], .comb = a[2] }, pre);
-        var o: [2]A = undefined;
-        try runRegion(sc, m, li, .ffn, &.{ x, ao, a[0], a[1], a[2] }, &o);
-        pre.* = o[1];
-        return o[0];
+        return ffnStretch(sc, m, li, x, ao, &.{ .pre = a[0], .post = a[1], .comb = a[2] }, pre);
     }
     const mid = try blockAttn(sc, m, st, li, x, pre.*, p0, sh);
     // the replaying chunk's last decoder layer routes its last row only.
-    const y = if (sh.last_row and li < m.n_layers) try moeLast(sc, m, li, mid.h, sh.img) else try moe(sc, m, li, mid.h, sh.img);
+    const y = try abl.ablate(sc, m, if (sh.last_row and li < m.n_layers) try moeLast(sc, m, li, mid.h, sh.img) else try moe(sc, m, li, mid.h, sh.img));
     if (m.trace) |t| try t.put("ffn_{d}", .{li}, y);
     pre.* = mid.sf.pre;
     const out = try hcExpand(sc, mid.x1, y, &mid.sf);
@@ -4806,18 +4818,15 @@ fn blockTail(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: *A, p
     if (m.dec.attn) |ka| if (m.dec.wo_a) |kw| if (try dkern.attn.partials(sc, ka, m, q, ls.win, comp_rows, topk, p0, scale)) |p| {
         oa = try dkern.wo_a.apply(sc, m, ly, kw, m.dec.wo_a_counter, inv, try attnMeta(sc, m, q, ls.win, comp_rows, topk, p0), p.acc, p.m, p.l);
     };
-    // `ffn_in` routes off wo_b's output, which a tensor split sums first.
-    if (m.tp == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
+    // `ffn_in` routes off wo_b's output, which a tensor split sums first and an ablation ablates before its expand.
+    if (m.tp == null and m.ablation == null) if (oa) |v| if (try ffnInFused(sc, m, ly, v, x, &sa)) |f| {
         pre.* = f.sf.pre;
         return try ffnDecode(sc, m, ly, f.h2, f.idx, f.wts, f.x1, &f.sf) orelse try hcExpand(sc, f.x1, try withShared(sc, m, ly, f.h2, try routed(sc, m, ly, f.h2, f.idx, f.wts)), &f.sf);
     };
     var ao: [1]A = undefined;
     if (oa) |v| ao[0] = try ly.wo_b.apply(sc, v) else try runRegion(sc, m, li, .attn_out, &.{try attnDecode(sc, m, ly, q, ls.win, comp_rows, topk, p0, scale, inv)}, &ao);
     if (m.tp != null) return try tpFfn(sc, m, li, x, try tpSum(sc, m, ao[0]), &sa, pre);
-    var out: [2]A = undefined;
-    try runRegion(sc, m, li, .ffn, &.{ x, ao[0], sa.pre, sa.post, sa.comb }, &out);
-    pre.* = out[1];
-    return out[0];
+    return try ffnStretch(sc, m, li, x, try abl.ablate(sc, m, ao[0]), &sa, pre);
 }
 
 /// Row `l`'s compressed rows and picks as the plain step at `p0 + l` reads them (`blockFusedRows`): none, none where it
@@ -4957,6 +4966,25 @@ fn tpFfn(sc: *Scope, m: *Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, p
     return hcExpand(sc, p[0], try tpSum(sc, m, part), &.{ .pre = p[1], .post = p[2], .comb = p[3] });
 }
 
+/// A block's FFN stretch at decode width from the attention's output `ao` and mix `sa`: the new stream, `pre` set to the
+/// FFN's mix. Under an ablation it runs cut at the router (`ffn_pre`) so the FFN output is ablated before its hc
+/// expand: a compiled stretch keeps the arrays it was traced with, so none holds an ablation.
+fn ffnStretch(sc: *Scope, m: *const Dsv41Model, li: usize, x: A, ao: A, sa: *const Split, pre: *A) !A {
+    if (m.ablation == null) {
+        var o: [2]A = undefined; // the new stream, the FFN's mix
+        try runRegion(sc, m, li, .ffn, &.{ x, ao, sa.pre, sa.post, sa.comb }, &o);
+        pre.* = o[1];
+        return o[0];
+    }
+    const ly = &m.layers[li];
+    var p: [7]A = undefined; // the new stream, the FFN's pre, post, comb, normed input, routes, weights
+    try runRegion(sc, m, li, .ffn_pre, &.{ x, ao, sa.pre, sa.post, sa.comb }, &p);
+    pre.* = p[1];
+    const ro = if (ly.experts.ext) |*e| try routedOutside(sc, m, e, p[4], p[5], p[6]) else try routed(sc, m, ly, p[4], p[5], p[6]);
+    const y = try abl.ablate(sc, m, try withShared(sc, m, ly, p[4], ro));
+    return hcExpand(sc, p[0], y, &.{ .pre = p[1], .post = p[2], .comb = p[3] });
+}
+
 /// The routed and shared rows this rank holds on the fused mxfp4 launches (`[R, dim]`), or null where they decline:
 /// the down launch's hc expand over one copy with no residual and a unit post is the MoE output itself.
 fn moeFused(sc: *Scope, m: *const Dsv41Model, ly: *const Layer, h: A, idx: A, wts: A) !?A {
@@ -4994,7 +5022,7 @@ pub fn blockAttn(sc: *Scope, m: *Dsv41Model, st: *State, li: usize, x: A, pre: A
         try t.put("hc_comb_{d}", .{li}, sa.comb);
         try t.put("attn_in_{d}", .{li}, h);
     }
-    h = try attention(sc, m, st, li, h, p0, sh, null);
+    h = try abl.ablate(sc, m, try attention(sc, m, st, li, h, p0, sh, null));
     if (m.trace) |t| try t.put("attn_{d}", .{li}, h);
     const pf = try hcExpandPreNorm(sc, m, x, h, &sa, sa.pre, &ly.hc_ffn, ly.ffn_norm);
     return .{ .x1 = pf.x1, .sf = pf.sp, .h = pf.h };
@@ -5149,6 +5177,10 @@ pub fn spliceImages(sc: *Scope, m: *const Dsv41Model, emb: A, id_arr: A, ids: []
 }
 
 fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want: Want, vision: ?VisionRows) !A {
+    // The pass runs under its state's ablation (`abl.ablate`), the caller's put back at its exit.
+    const ablation_was = m.ablation;
+    m.ablation = st.ablation;
+    defer m.ablation = ablation_was;
     const c = &m.cfg;
     const L = switch (ids) {
         .host => |h| h.len,
@@ -5259,6 +5291,8 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
             emb = try spliceImages(&sc, m, emb, id_arr, ids.host, img_rows, &img_mask);
             sp.img = img_mask;
         }
+        // The embedding is the stream's first write.
+        emb = try abl.ablate(&sc, m, emb);
         for (0..n_spans) |k| {
             const lo, const hi = sp.bounds(k);
             hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, lo, hi), 1), &.{ ci(hi - lo), ci(hc), ci(d) }));
@@ -5386,6 +5420,8 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
     // The kept projection outputs: a kept set no wide layer of this pass took is let go at its end.
     defer tkeep.drop();
     for (lo..hi) |li| {
+        // Calibration (`abl.StreamTap`): the stream entering the layer, and after the last layer the stream leaving it.
+        if (m.stream_tap) |t| try t.record(m.s, li, sp.xs);
         if (wide) try wideLayer(m, gpa, st, sp, li, li + 1 < hi, li > lo) else for (0..n_spans) |k| {
             // A span's intermediates are dropped as soon as it is built, so the
             // layer's evaluation frees each one when its consumers are done.
@@ -5402,6 +5438,7 @@ pub fn runLayers(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const 
             hold(&sp.topks[k], sh.topk);
             hold(&sp.cands[k], sh.cand);
         }
+        if (li + 1 == m.n_layers) if (m.stream_tap) |t| try t.record(m.s, m.n_layers, sp.xs);
         const decode = n_spans == 1 and sp.L <= region_rows;
         if (n_spans > 1 or (decode and li + 1 < hi)) {
             var ev: std.ArrayList(A) = .empty;
@@ -5837,10 +5874,11 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
             ig_start = k + 1;
         }
     }
-    const y = if (m.tp != null) try sc.concat(heads[0..n_heads], 0) else try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0));
+    const y = try abl.ablate(&sc, m, if (m.tp != null) try sc.concat(heads[0..n_heads], 0) else try ly.wo_b.apply(&sc, try sc.concat(heads[0..n_heads], 0)));
     // scratch_x1.zig: the streams after the attention into the prompt's x1 region (a streamed bank runs one MoE
-    // group, so that group's output is the region's last reader's).
-    const x1_scratch = m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s);
+    // group, so that group's output is the region's last reader's). Not under an ablation: the FFN's output is then
+    // ablated against x1 after the call that would end the region's reads.
+    const x1_scratch = m.streamed != null and sp.L >= scratch_rows and mlx.streamIsGpu(m.s) and m.ablation == null;
     const pf = if (x1_scratch) try hcExpandPreNormScratch(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm) else try hcExpandPreNorm(&sc, m, x, y, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
     // A streamed bank reads each layer's experts once per call: one MoE over all of its rows.
     const group = if (m.streamed != null) n_spans else @max(1, m.moe_rows / sp.span);
@@ -5869,7 +5907,7 @@ fn wideLayer(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, sp: *const Span
         // the region. The call's last wide layer keeps the fresh buffer: its
         // streams are read after the call's last eval (the CED replay, the head, the next chunk).
         const into = pf.in_region and k0 == 0 and k1 == n_spans and next_wide and (m.n_mtp == 0 or m.dsparkTarget(li + 1) == null);
-        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| v else try hcExpand(&gsc, x1g, try moe(&gsc, m, li, hg, img), &sf);
+        const xg = if (try moeExpand(&gsc, m, li, hg, img, if (into) pf.x1 else x1g, &sf, .{ .next = next_ids, .ls = &st.layers[li] }, into)) |v| try abl.ablateExpanded(&gsc, m, x1g, v, sf.comb) else try hcExpand(&gsc, x1g, try abl.ablate(&gsc, m, try moe(&gsc, m, li, hg, img)), &sf);
         // scratch_x1.zig: the region's next writer waits for this, its last reader.
         if (x1_scratch and k1 == n_spans) try sx1.ps().x1.released(xg);
         for (k0..k1) |k| {
@@ -6283,6 +6321,10 @@ pub const Snap = struct {
     /// False: a slice (`sliceSnap`). Its global rows and index keys stop at `n`; its windows, open groups and DSpark
     /// rows are the longer run's and `rewind` rebuilds them when it is restored.
     whole: bool = true,
+    /// The state's ablation when it was taken (retained), so a restore's `rewind` replays under it; null: none.
+    ablation: ?abl.Ablation = null,
+    /// `State.variant` when it was taken.
+    variant: ?u64 = 0,
 
     const LSnap = struct { win: A, comp: ?Rows, idx_k: ?Rows, pend_kv: A, pend_gate: A };
 
@@ -6298,6 +6340,7 @@ pub const Snap = struct {
             _ = mlx.mlx_array_free(a);
         };
         if (self.mh.ctx != null) _ = mlx.mlx_array_free(self.mh);
+        if (self.ablation) |ab| ab.deinit();
         gpa.free(self.layers);
         gpa.free(self.ds);
         gpa.free(self.hist);
@@ -6341,6 +6384,8 @@ pub const Snap = struct {
             .mh = ref(self.mh),
             .hist = hist,
             .whole = self.whole,
+            .ablation = abl.retain(self.ablation),
+            .variant = self.variant,
         };
     }
 };
@@ -6375,12 +6420,15 @@ pub fn sliceSnap(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *const Snap, 
 /// last window of `ids`, the state's own tokens, is run again from its first row, which rebuilds every layer's
 /// window and the DSpark stages' and leaves the global rows as they are. Approximate where the window was cut: the
 /// replay's first rows attend none of the rows before them.
+/// The replay runs under the ablation the snapshot was taken with (`Snap.ablation`).
 pub fn rewind(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32) !void {
     if (ids.len != st.n) return error.Dsv41SnapshotGeometry;
     const s = st.n -| m.cfg.sliding_window;
     if (st.hist.items.len > s) st.hist.shrinkRetainingCapacity(s);
     st.n = s;
     _ = try extendIds(m, gpa, st, .{ .host = ids[s..] }, .replay, null);
+    // A disk-tier snapshot carries no ablation: its replayed windows are plain, whatever variant its entry holds.
+    if (st.ablation == null and st.variant == null) st.variant = 0;
 }
 
 fn cacheSetting(h: *std.hash.Wyhash, value: anytype) void {
@@ -6573,7 +6621,7 @@ pub fn importSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, ids: []const
     for (ids) |id| if (id >= m.vocab) return error.TokenPastVocabulary;
     const order = try p.validateArrays(arrays);
     const sn = try gpa.create(Snap);
-    sn.* = .{ .gen = 0, .vision_key = p.vision_key, .n = p.n, .ids = &.{}, .layers = &.{}, .ds = &.{}, .mh = none, .hist = &.{} };
+    sn.* = .{ .gen = 0, .vision_key = p.vision_key, .n = p.n, .ids = &.{}, .layers = &.{}, .ds = &.{}, .mh = none, .hist = &.{}, .variant = null };
     errdefer {
         sn.deinit(gpa);
         gpa.destroy(sn);
@@ -6668,6 +6716,9 @@ pub fn visionKey(rows: ?A, n: usize) !u64 {
 
 fn restore(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize {
     const st = if (m.dec_state) |*st| st else return 0;
+    // Rows an ablation wrote (or a disk-tier entry of unknown variant) resume no request: the host resumes only
+    // unablated prompts (`abl.fits`).
+    if ((st.variant orelse return 0) != 0) return 0;
     const sn = if (st.snap) |*sn| sn else return 0;
     if (sn.gen != m.state_gen or sn.ids.len >= prompt.len or !std.mem.eql(u32, sn.ids, prompt[0..sn.ids.len])) return 0;
     if (sn.vision_key != try visionKey(vision_rows, m.imageRows(sn.ids))) return 0;
@@ -6720,7 +6771,7 @@ pub fn stateFromSnapshot(m: *const Dsv41Model, gpa: std.mem.Allocator, sn: *cons
         .pend_gate = ref(saved.pend_gate),
     };
     for (ds, sn.ds) |*r, saved| r.* = .{ .buf = ref(saved), .cap = dim(saved, 0), .width = dim(saved, 1) };
-    return .{ .gpa = gpa, .n = sn.n, .layers = layers, .ds = ds, .hist = hist, .mh = ref(sn.mh) };
+    return .{ .gpa = gpa, .n = sn.n, .layers = layers, .ds = ds, .hist = hist, .mh = ref(sn.mh), .ablation = abl.retain(sn.ablation), .variant = sn.variant };
 }
 
 /// Takes the armed snapshot once the state stands at its position.
@@ -6755,6 +6806,8 @@ pub fn snapshotStateIfDue(st: *State, gen: u64) !void {
         .ds = ds,
         .mh = ref(st.mh),
         .hist = hist,
+        .ablation = abl.retain(st.ablation),
+        .variant = st.variant,
     };
     st.snap_ids = &.{};
     st.snap_at = null;
@@ -6832,6 +6885,39 @@ pub fn extendResumable(m: *Dsv41Model, gpa: std.mem.Allocator, ids: []const u32,
 /// is one decode token a state; with `verify` each chunk is a DSpark verify `[t1, drafts…]` (`dsparkBeginWith`'s
 /// rollback anchors, kept by `finishVerify`). Returns every row's `[R, V]` f32 logits, state by state (caller frees).
 pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, chunks: []const []const u32, verify: bool) !A {
+    const N = chunks.len;
+    if (N == 0 or N > region_rows or states.len != N or gens.len != N) return error.Dsv41BatchUnsupported;
+    for (states, 0..) |st, k| for (states[0..k]) |o| if (o == st) return error.Dsv41BatchUnsupported;
+    if (agreed(states)) return extendBatchedUnder(m, gpa, states, gens, chunks, verify, states[0].ablation);
+    // States under different ablations run one at a time, each under its own: the same rows' logits, state by state.
+    const parts = try gpa.alloc(A, N);
+    defer gpa.free(parts);
+    var done: usize = 0;
+    defer for (parts[0..done]) |part| {
+        _ = mlx.mlx_array_free(part);
+    };
+    errdefer if (verify) for (states) |st| st.dropVerify();
+    for (0..N) |k| {
+        parts[k] = try extendBatchedUnder(m, gpa, states[k..][0..1], gens[k..][0..1], chunks[k..][0..1], verify, states[k].ablation);
+        done += 1;
+    }
+    var sc = Scope.init(gpa, m.s);
+    defer sc.deinit();
+    return sc.out(try sc.concat(parts, 0));
+}
+
+/// Whether `states` ablate alike (`abl.same`): one batch runs them under one ablation.
+fn agreed(states: []const *State) bool {
+    if (states.len < 2) return true;
+    for (states[1..]) |st| if (!abl.same(states[0].ablation, st.ablation)) return false;
+    return true;
+}
+
+/// `extendBatched` of states that ablate alike, under their `ablation`.
+fn extendBatchedUnder(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, gens: []const u64, chunks: []const []const u32, verify: bool, ablation: ?abl.Ablation) !A {
+    const ablation_was = m.ablation;
+    m.ablation = ablation;
+    defer m.ablation = ablation_was;
     const c = &m.cfg;
     const N = chunks.len;
     if (N == 0 or N > region_rows or states.len != N or gens.len != N or m.pair != null or m.streamed != null) return error.Dsv41BatchUnsupported;
@@ -6908,7 +6994,7 @@ pub fn extendBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *St
         const all = try gpa.alloc(u32, R);
         defer gpa.free(all);
         for (chunks, 0..) |ch, k| @memcpy(all[offs[k]..offs[k + 1]], ch);
-        const emb = try embedIds(m, &sc, all, m.act);
+        const emb = try abl.ablate(&sc, m, try embedIds(m, &sc, all, m.act));
         for (0..N) |k| {
             const lo, const hi = sp.bounds(k);
             hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, lo, hi), 1), &.{ ci(hi - lo), ci(c.dsv4_hc_mult), ci(c.hidden_size) }));
@@ -7000,7 +7086,7 @@ fn batchedLayer(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, 
     var o: [2]A = undefined; // the new stream, the FFN's mix
     if (m.tp != null) {
         o[0] = try tpFfn(&sc, m, li, x, try tpSum(&sc, m, ao[0]), &.{ .pre = a[0], .post = a[1], .comb = a[2] }, &o[1]);
-    } else try runRegion(&sc, m, li, .ffn, &.{ x, ao[0], a[0], a[1], a[2] }, &o);
+    } else o[0] = try ffnStretch(&sc, m, li, x, try abl.ablate(&sc, m, ao[0]), &.{ .pre = a[0], .post = a[1], .comb = a[2] }, &o[1]);
     for (0..N) |k| {
         const lo, const hi = sp.bounds(k);
         hold(&sp.xs[k], try sc.slice(o[0], 0, lo, hi));
@@ -7175,6 +7261,10 @@ fn draftRows(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, t1: u32, keep_l
 /// reads (the ids again otherwise).
 const DraftGraph = struct { ev: [3]A, want_conf: bool };
 fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool) !DraftGraph {
+    // The draft runs under its state's ablation (`abl.ablate`), the caller's put back at its exit.
+    const ablation_was = m.ablation;
+    m.ablation = st.ablation;
+    defer m.ablation = ablation_was;
     const c = &m.cfg;
     const B = m.ds_block;
     const hc = c.dsv4_hc_mult;
@@ -7184,7 +7274,7 @@ fn draftGraph(sc: *Scope, m: *Dsv41Model, st: *State, t1: u32, keep_logits: bool
     for (0..B) |k| ids[k] = @intCast(if (k == 0) t1 else c.dsv4_dspark_noise_token_id);
     var uids: [16]u32 = undefined;
     for (uids[0..B], ids[0..B]) |*u, v| u.* = @intCast(v);
-    const emb = try embedIds(m, sc, uids[0..B], m.act);
+    const emb = try abl.ablate(sc, m, try embedIds(m, sc, uids[0..B], m.act));
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(B), ci(hc), ci(d) });
     var pre = try onehotPre(sc, m, B);
     for (0..m.n_mtp) |si| x = try stageBlock(sc, m, &.{st}, m.n_layers + si, x, &pre, B);
@@ -7258,6 +7348,21 @@ fn draftRead(sc: *Scope, m: *const Dsv41Model, gpa: std.mem.Allocator, t1: u32, 
 /// stages run once over every state's block, attention per state against its own window of committed main rows, and
 /// the Markov chain steps every state's row at once. `keep_logits` also copies the Markov-biased rows to the host.
 pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft) !void {
+    if (agreed(states)) return draftBatchedUnder(m, gpa, states, t1s, keep_logits, out, if (states.len > 0) states[0].ablation else null);
+    // States under different ablations draft one at a time, each under its own.
+    var made: usize = 0;
+    errdefer for (out[0..made]) |*o| o.deinit(gpa);
+    for (0..states.len) |k| {
+        try draftBatchedUnder(m, gpa, states[k..][0..1], t1s[k..][0..1], keep_logits, out[k..][0..1], states[k].ablation);
+        made += 1;
+    }
+}
+
+/// `dsparkDraftBatched` of states that ablate alike, under their `ablation`.
+fn draftBatchedUnder(m: *Dsv41Model, gpa: std.mem.Allocator, states: []const *State, t1s: []const u32, keep_logits: bool, out: []DsparkDraft, ablation: ?abl.Ablation) !void {
+    const ablation_was = m.ablation;
+    m.ablation = ablation;
+    defer m.ablation = ablation_was;
     var sc = Scope.init(gpa, m.s);
     defer sc.deinit();
     const c = &m.cfg;
@@ -7275,7 +7380,7 @@ pub fn dsparkDraftBatched(m: *Dsv41Model, gpa: std.mem.Allocator, states: []cons
     const uids = try gpa.alloc(u32, N * B);
     defer gpa.free(uids);
     for (uids, ids) |*u, v| u.* = @intCast(v);
-    const emb = try embedIds(m, &sc, uids, m.act);
+    const emb = try abl.ablate(&sc, m, try embedIds(m, &sc, uids, m.act));
     var x = try sc.broadcast(try sc.expand(emb, 1), &.{ ci(N * B), ci(hc), ci(d) });
     var pre = try onehotPre(&sc, m, N * B);
     for (0..m.n_mtp) |si| x = try stageBlock(&sc, m, states, m.n_layers + si, x, &pre, B);
@@ -7348,9 +7453,9 @@ fn stageBlock(sc: *Scope, m: *Dsv41Model, states: []const *State, li: usize, x: 
         const mine: Proj = if (states.len == 1) rows else .{ .q = try sc.slice(rows.q, 0, k * B, (k + 1) * B), .kv = try sc.slice(rows.kv, 0, k * B, (k + 1) * B), .qr = rows.qr };
         o.* = try dsparkHeads(sc, m, ly, mine, keys, st.n);
     }
-    const h = try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0));
+    const h = try abl.ablate(sc, m, try attnOutRoped(sc, m, ly, if (states.len == 1) heads[0] else try sc.concat(heads[0..states.len], 0)));
     const pf = try hcExpandPreNorm(sc, m, x, h, &pa.sp, pa.sp.pre, &ly.hc_ffn, ly.ffn_norm);
-    const y = try moe(sc, m, li, pf.h, none);
+    const y = try abl.ablate(sc, m, try moe(sc, m, li, pf.h, none));
     pre.* = pf.sp.pre;
     return hcExpand(sc, pf.x1, y, &pf.sp);
 }

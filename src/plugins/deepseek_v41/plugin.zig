@@ -25,6 +25,7 @@ const env = @import("../../env.zig");
 const engram_decode = @import("decode/engram_decode.zig");
 const flash_attn = @import("prompt/flash_attn.zig");
 const scratch_attn = @import("prompt/scratch_attn.zig");
+const ablation = @import("ablation.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -103,6 +104,9 @@ pub const Model = struct {
     idle: ?Kept = null,
     /// The last id a snapshot was given for the other tensor ranks (`Snap.tp_id`).
     tp_snaps: u64 = 0,
+    /// Calibration (MLX_SERVE_DSV41_TAP_DIR): where each prompt forward's stream tap is written, and how many were.
+    tap_dir: ?[]const u8 = null,
+    tap_seq: u64 = 0,
 };
 
 /// A state off the module, with its identity (`Dsv41Model.state_gen`).
@@ -303,6 +307,18 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.owner = 0;
     m.parked = .empty;
     m.idle = null;
+    m.tap_dir = null;
+    m.tap_seq = 0;
+    // Calibration (MLX_SERVE_DSV41_TAP_DIR): every prompt forward's stream at each layer, written there owner-only.
+    if (env.span(.MLX_SERVE_DSV41_TAP_DIR)) |tap_dir| if (tap_dir.len > 0) {
+        const tap = try gpa.create(ablation.StreamTap);
+        errdefer gpa.destroy(tap);
+        tap.* = try ablation.StreamTap.init(gpa, m.mdl.n_layers, tap_rows);
+        m.mdl.stream_tap = tap;
+        m.tap_dir = tap_dir;
+        std.log.warn("deepseek_v41: the calibration tap is on: every prompt's per-layer stream and last ids go to {s} (owner-only files)", .{tap_dir});
+    };
+    errdefer freeTap(m);
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
         if (c.dsv41_exl3_bank) try openBank(m, quant, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes, start) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
@@ -313,6 +329,17 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.tower = if (c.dsv41_vision and taken == null and !lazy_tower) try vision.Dsv41Vision.init(gpa, m.cfg, &m.weights) else null;
     if (lazy_tower) std.log.info("deepseek_v41: the vision tower is read from the pack for each image, not resident", .{});
     return m;
+}
+
+/// Rows the calibration tap keeps per prompt: its last five positions, the last one the prompt's last token.
+const tap_rows = 5;
+
+/// Frees the calibration tap (`loadModel`) and its records.
+fn freeTap(m: *Model) void {
+    const t = m.mdl.stream_tap orelse return;
+    t.deinit();
+    gpa.destroy(t);
+    m.mdl.stream_tap = null;
 }
 
 /// The pack's bank, streamed by the outside quant plugin that claims it, at the slot rows the box holds beside the
@@ -402,6 +429,7 @@ fn unload(mp: *anyopaque) callconv(.c) void {
     while (it.next()) |k| k.deinit();
     m.parked.deinit(gpa);
     if (m.idle) |*k| k.deinit();
+    freeTap(m);
     m.mdl.deinit();
     m.weights.deinit();
     gpa.destroy(m);
@@ -415,21 +443,43 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (f.want_hidden) return Verdict.refuse(.unsupported, "deepseek_v41: no hidden-state output (embeddings)");
     if (f.mode == .batched_rows) return forwardBatched(m, f, out);
     if (f.slots.len > 1 or f.rows == 0) return Verdict.refuse(.unsupported, "deepseek_v41: one slot's rows at a time");
+    var spec: ?ablation.Spec = null;
+    if (slotAblation(m, f, 0, &spec)) |refused| return refused;
     if (f.slots.len == 1) activate(m, f.slots.slice()[0]) catch return Verdict.refuse(.failed, "deepseek_v41: out of memory parking a slot's state");
     const in = v4plugin.Ids.of(f) catch return Verdict.refuse(.failed, "deepseek_v41: the token ids do not read back");
     defer in.deinit();
     const pos: usize = if (f.positions.len > 0) f.positions.slice()[0] else 0;
     if (pos != 0 and (m.mdl.dec_state == null or m.mdl.dec_state.?.n != pos)) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the model's state");
+    if (pos != 0 and !ablation.fits(pos, m.mdl.dec_state.?.variant, ablation.variantOf(spec))) return variantRefused();
     for (in.host) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");
     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
-    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev) catch |e| {
+    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev, spec) catch |e| {
         std.log.err("deepseek_v41: the forward failed: {s}", .{if (e == error.EngineFailed) @import("../../sdk/util/err_name.zig").last() else @errorName(e)});
         return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
     };
     if (f.logits == .none) _ = mlx.mlx_array_free(logits) else out.logits = .{ .ctx = logits.ctx };
     return .ok;
+}
+
+/// Slot `k`'s ablation (`out`, null: none), or the refusal of a table this plugin does not run: a bad strength or slot
+/// count, directions that are not `[slots, hidden]` f32, or a model split across two Macs (the other Mac would run its
+/// layers unablated). Before any state moves.
+fn slotAblation(m: *const Model, f: *const abi.Forward, k: usize, out: *?ablation.Spec) ?Verdict {
+    out.* = ablation.ofSlot(f, k) catch |e| return switch (e) {
+        error.AblationStrength => Verdict.refuse(.unsupported, "deepseek_v41: ablation strength is not in [0, 1]"),
+        error.AblationSlots => Verdict.refuse(.unsupported, "deepseek_v41: one ablation entry per slot"),
+    };
+    const a = out.* orelse return null;
+    if (m.mdl.pair != null or m.mdl.tp != null) return Verdict.refuse(.unsupported, "deepseek_v41: ablation does not run split across two Macs (the other Mac's layers would run unablated)");
+    if (!ablation.shapeOk(a, f.slots.len, m.cfg.hidden_size)) return Verdict.refuse(.unsupported, "deepseek_v41: ablation directions are not [slots, hidden] f32");
+    return null;
+}
+
+/// A forward under another ablation (or none) than the one its slot's state was computed under (`ablation.fits`).
+fn variantRefused() Verdict {
+    return Verdict.refuse(.unsupported, "deepseek_v41: the slot's state was computed under another ablation (or none)");
 }
 
 /// One decode token per slot, each at its state's position: one batch of rows (`extendBatched`), or each slot alone
@@ -438,6 +488,8 @@ fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdic
     const n = f.slots.len;
     if (n == 0 or n > max_batch or f.rows != 1 or f.tokens.len != n or f.logits == .all_rows or f.want_hidden)
         return Verdict.refuse(.unsupported, "deepseek_v41: a batch is one host token per slot");
+    var specs = [_]?ablation.Spec{null} ** max_batch;
+    for (specs[0..n], 0..) |*spec, k| if (slotAblation(m, f, k, spec)) |refused| return refused;
     var states: [max_batch]*dsv41.State = undefined;
     var gens: [max_batch]u64 = undefined;
     var alone = m.mdl.pair != null or m.mdl.streamed != null;
@@ -450,12 +502,14 @@ fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdic
         states[k] = live.st;
         gens[k] = live.gen;
         if (f.positions.len == n and f.positions.slice()[k] != states[k].n) return Verdict.refuse(.failed, "deepseek_v41: the position does not follow the slot's state");
+        if (!ablation.fits(states[k].n, states[k].variant, ablation.variantOf(specs[k]))) return variantRefused();
         if (states[k].verify != null) alone = true;
     }
     for (f.tokens.slice()) |t| if (t >= m.cfg.vocab_size) return Verdict.refuse(.failed, "deepseek_v41: token id past the vocabulary");
     var chunks: [max_batch][]const u32 = undefined;
     for (chunks[0..n], f.tokens.slice()) |*ch, *t| ch.* = t[0..1];
-    const logits = if (alone) eachAlone(m, f) else dsv41.extendBatched(m.mdl, gpa, states[0..n], gens[0..n], chunks[0..n], false);
+    if (!alone) for (states[0..n], specs[0..n]) |st, spec| ablation.stateArm(st, spec, m.cfg.hidden_size, m.s) catch return Verdict.refuse(.failed, "deepseek_v41: the ablation could not be armed");
+    const logits = if (alone) eachAlone(m, f, specs[0..n]) else dsv41.extendBatched(m.mdl, gpa, states[0..n], gens[0..n], chunks[0..n], false);
     out.logits = .{ .ctx = (logits catch return Verdict.refuse(.failed, "deepseek_v41: the batched forward failed")).ctx };
     return .ok;
 }
@@ -483,8 +537,8 @@ pub fn slotStates(mp: *anyopaque, slots: []const u32, states: []*dsv41.State, ge
     return true;
 }
 
-/// `forwardBatched`'s rows one slot at a time, as each slot's own decode step.
-fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
+/// `forwardBatched`'s rows one slot at a time, as each slot's own decode step under its own ablation (`specs`).
+fn eachAlone(m: *Model, f: *const abi.Forward, specs: []const ?ablation.Spec) !mlx.mlx_array {
     var rows: [max_batch]mlx.mlx_array = undefined;
     var done: usize = 0;
     defer for (rows[0..done]) |r| {
@@ -493,7 +547,7 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
     for (f.slots.slice(), f.tokens.slice(), 0..) |slot, t, k| {
         try activate(m, slot);
         const pos = if (f.positions.len == f.slots.len) f.positions.slice()[k] else if (m.mdl.dec_state) |st| st.n else 0;
-        rows[done] = try run(m, &.{t}, pos, false, null, .{ .ctx = null });
+        rows[done] = try run(m, &.{t}, pos, false, null, .{ .ctx = null }, specs[k]);
         done += 1;
     }
     var o = mlx.mlx_array_new();
@@ -504,8 +558,10 @@ fn eachAlone(m: *Model, f: *const abi.Forward) !mlx.mlx_array {
 }
 
 /// The legacy seam's arms: position 0 starts a request (a resumed one arrives past 0); a decode token stays on the
-/// GPU (`dev`, or the host id uploaded); everything else extends the state. `all` returns every row's logits.
-fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array) !mlx.mlx_array {
+/// GPU (`dev`, or the host id uploaded); everything else extends the state. `all` returns every row's logits. The
+/// slot's ablation `spec` is armed on the state the forward runs (`ablation.stateArm`): the DSpark rounds the engine
+/// runs on the module between forwards ablate under it too.
+fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array, spec: ?ablation.Spec) !mlx.mlx_array {
     const mdl = m.mdl;
     var one: [1]u32 = undefined;
     const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and mdl.tp == null;
@@ -514,18 +570,30 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
         if (one[0] >= m.cfg.vocab_size) return error.TokenPastVocabulary;
         break :blk one[0..];
     } else host_ids;
-    const logits = if (all) blk: {
-        if (pos == 0) try dsv41.reset(mdl, gpa);
-        break :blk try dsv41.extendAllResumable(mdl, gpa, ids);
-    } else if (gpu_decode) blk: {
+    if (pos == 0) try dsv41.reset(mdl, gpa);
+    if (mdl.dec_state) |*st| try ablation.stateArm(st, spec, m.cfg.hidden_size, m.s);
+    // Calibration: a prompt forward records the stream at every layer (`ablation.StreamTap`), dumped once it is done.
+    const tap = if (gpu_decode) null else mdl.stream_tap;
+    if (tap) |t| {
+        t.clear();
+        t.on = true;
+    }
+    defer if (tap) |t| {
+        t.on = false;
+    };
+    const logits = if (all) try dsv41.extendAllResumable(mdl, gpa, ids) else if (gpu_decode) blk: {
         const tok = if (dev.ctx != null) try v4plugin.deviceToken(dev, &.{ 1, 1 }, m.s) else blk2: {
             const id: i32 = @intCast(ids[0]);
             break :blk2 mlx.mlx_array_new_data(&id, &[_]c_int{ 1, 1 }, 2, .int32);
         };
         defer _ = mlx.mlx_array_free(tok);
         break :blk try dsv41.extendResumableGpu(mdl, gpa, tok);
-    } else try runPrompt(m, ids, pos, rows);
+    } else try runPrompt(m, ids, rows);
     defer _ = mlx.mlx_array_free(logits);
+    if (tap) |t| {
+        ablation.dumpTap(gpa, t, m.tap_dir.?, m.tap_seq, pos, ids, m.s) catch |e| std.log.err("deepseek_v41: the calibration tap's dump failed: {t}", .{e});
+        m.tap_seq += 1;
+    }
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_reshape(&o, logits, &[_]c_int{ -1, @intCast(mdl.vocab) }, 2, m.s));
@@ -543,10 +611,9 @@ fn callRows(m: *const Model, n: usize) usize {
     };
 }
 
-/// A prompt from `pos` (0: a new request), in calls of at most `callRows`.
-fn runPrompt(m: *Model, ids: []const u32, pos: usize, rows: ?dsv41.VisionRows) !mlx.mlx_array {
+/// A prompt from the state's position (a new request's reset first, in `run`), in calls of at most `callRows`.
+fn runPrompt(m: *Model, ids: []const u32, rows: ?dsv41.VisionRows) !mlx.mlx_array {
     const mdl = m.mdl;
-    if (pos == 0) try dsv41.reset(mdl, gpa);
     const call = callRows(m, ids.len);
     var vr = rows;
     var at: usize = 0;
