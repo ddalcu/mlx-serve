@@ -242,12 +242,14 @@ test "promptLogprobs: no vocab-wide array outlives its use, so the top-k sort is
     const allocator = testing.allocator;
     const rows = 64;
     const vocab = 65536;
-    var key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, 7));
-    var logits = mlx.mlx_array_new();
+    // The logits from host data (bf16 bits of a seeded normal draw), so no GPU temporary of their own making is
+    // still waiting to be freed when `base` is read.
+    const host = try allocator.alloc(u16, rows * vocab);
+    defer allocator.free(host);
+    var prng: std.Random.DefaultPrng = .init(7);
+    for (host) |*v| v.* = @truncate(@as(u32, @bitCast(prng.random().floatNorm(f32))) >> 16);
+    const logits = mlx.mlx_array_new_data(@ptrCast(host.ptr), &[_]c_int{ 1, rows, vocab }, 3, .bfloat16);
     defer _ = mlx.mlx_array_free(logits);
-    try mlx.check(mlx.mlx_random_normal(&logits, &[_]c_int{ 1, rows, vocab }, 3, .bfloat16, 0, 1, key, s));
     try mlx.check(mlx.mlx_array_eval(logits));
     var ids: [rows]u32 = undefined;
     for (&ids, 0..) |*v, i| v.* = @intCast(i * 997 % vocab);
@@ -257,14 +259,18 @@ test "promptLogprobs: no vocab-wide array outlives its use, so the top-k sort is
         out.deinit(allocator);
     }
 
+    // Every earlier command buffer done, so their completion handlers' frees are not inside the measured window.
+    try mlx.check(mlx.mlx_synchronize(s));
     var base: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&base));
     _ = mlx.mlx_reset_peak_memory();
     try promptLogprobs(allocator, logits, &ids, 5, s, &out);
     var peak: usize = 0;
     try mlx.check(mlx.mlx_get_peak_memory(&peak));
+    const bar: usize = 6 * rows * vocab * 4;
+    std.debug.print("promptLogprobs peak - base {d} B, bar {d} B\n", .{ peak - base, bar });
     // Bar: under six [rows, vocab] 4-byte arrays above what was live before (the sort alone holds five).
-    try testing.expect(peak - base < 6 * rows * vocab * 4);
+    try testing.expect(peak - base < bar);
     try testing.expectEqual(@as(usize, rows), out.items.len);
 }
 
