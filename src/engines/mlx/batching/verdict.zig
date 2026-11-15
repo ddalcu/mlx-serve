@@ -659,3 +659,40 @@ test "S21: a released module head drops the slot's exclusivity, and the MODEL bi
     try testing.expect(headExclusiveFor(true, false, false, true));
     try testing.expect(headExclusiveFor(true, true, true, true));
 }
+
+test "a streamed bank's slot is exclusive on GLM and Ling; unstreamed, or a plugin keeping per-slot state, it is not" {
+    // Bar: the bank's rooms are billed for one live request, so a second waits in `pending`.
+    const abi = @import("../../../abi/plugin.zig");
+    var table: abi.ModelTable = undefined;
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table };
+    var glm = @import("../admission/bills_test.zig").glm5TestConfig();
+    glm.plugin = &binding;
+    var ling = try model_mod.parseConfigFromJson(testing.allocator, @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json"));
+    const own = ling.plugin;
+    defer {
+        ling.plugin = own;
+        ling.deinit(testing.allocator);
+    }
+    ling.plugin = &binding;
+    const xfm = try testing.allocator.create(transformer_mod.Transformer);
+    defer testing.allocator.destroy(xfm);
+    xfm.plugin = null;
+    const lm = try testing.allocator.create(model_registry_mod.LoadedModel);
+    defer testing.allocator.destroy(lm);
+    lm.transformer = xfm;
+    lm.mtp = null;
+    const slot = try testing.allocator.create(Slot);
+    defer testing.allocator.destroy(slot);
+    slot.model = lm;
+    slot.enable_mtp = false;
+    slot.legacy_gen = null;
+    for ([_]*const model_mod.ModelConfig{ &glm, &ling }) |cfg| {
+        xfm.config = cfg.*;
+        binding.parsed.caps = .{ .streamed_weights = true };
+        try testing.expect(slotExclusiveDecode(slot));
+        binding.parsed.caps = .{};
+        try testing.expect(!slotExclusiveDecode(slot));
+        binding.parsed.caps = .{ .slot_state = true };
+        try testing.expect(!slotExclusiveDecode(slot));
+    }
+}

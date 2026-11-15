@@ -578,6 +578,28 @@ test "driver: a streamed Ling's decode room is the ceiling less the engine's dec
     try t.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
 }
 
+test "driver: Ling's streaming pack, whose plugin prices its prompt, is decode-billed through its own table" {
+    const t = std.testing;
+    const ling_plugin = @import("../../../plugins/bailing_hybrid/plugin.zig");
+    const json = @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    const mem: @import("../../../sdk/testing/fixture.zig").MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var binding: plugin_config.Binding = .{ .table = &ling_plugin.table };
+    try t.expect(ling_plugin.config.parse(&dir, abi.Str.of(json), .{}, null, true, &binding.parsed).isOk());
+    defer ling_plugin.config.freeParsed(&binding.parsed);
+    var cfg = try model.parseConfigFromJson(t.allocator, json);
+    const own = cfg.plugin;
+    defer {
+        cfg.plugin = own;
+        cfg.deinit(t.allocator);
+    }
+    cfg.plugin = &binding;
+    var bill: abi.Bill = .{};
+    binding.table.bill(&binding.parsed, &.{ .context = abi.stream_room_cell }, &bill);
+    try t.expect(binding.parsed.caps.streamed_weights and bill.prefill_bytes != null);
+    try t.expect(decodeBilled(&cfg));
+}
+
 test "driver: Ling's decode room leaves GLM's rooms as they were: the built-in's own bills, a plugin-priced GLM one room" {
     const t = std.testing;
     const Probe = struct {

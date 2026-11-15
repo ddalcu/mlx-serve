@@ -25,6 +25,7 @@ const sizerCtxKvBytes = @import("prefill_chunk.zig").sizerCtxKvBytes;
 const pinPrefillChunk = @import("prefill_chunk.zig").pinPrefillChunk;
 const longCtxTestConfig = @import("bills_test.zig").longCtxTestConfig;
 const qwen4DeployedTestConfig = @import("bills_test.zig").qwen4DeployedTestConfig;
+const glm5TestConfig = @import("bills_test.zig").glm5TestConfig;
 const ctxSizingCacheReserve = @import("context.zig").ctxSizingCacheReserve;
 const slotFixedKvBytes = @import("bills.zig").slotFixedKvBytes;
 const kvBytesPerTokenAtBits = @import("bills.zig").kvBytesPerTokenAtBits;
@@ -624,4 +625,145 @@ test "the hot cache is sized against memory nobody holds, while requests may cou
         memory_ceiling.idleCacheGpuMemoryCeiling(&cfg, 0) + 60 * GB,
         memory_ceiling.currentGpuMemoryCeiling(&cfg, 0),
     );
+}
+
+/// A streamed plugin's bill whose prompt the engine prices (a built-in GLM's) or its plugin does (`Bill.prefill_bytes`).
+const StreamedProbe = struct {
+    const abi = @import("../../../abi/plugin.zig");
+    fn empty(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{};
+    }
+    fn prefill(_: *const abi.Parsed, _: u64, _: u32, _: u8, _: u64) callconv(.c) u64 {
+        return 3 << 30;
+    }
+    fn priced(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .prefill_bytes = &prefill };
+    }
+};
+
+const ling_streaming_json = @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+
+test "ungatedHotCacheAsk: a streamed bank's GLM or Ling asks no more than the hot-cache term its decode room holds" {
+    const t = std.testing;
+    const term = @import("glm5_bill.zig").GLM5_HOT_CACHE_BYTES;
+    var table: StreamedProbe.abi.ModelTable = undefined;
+    table.bill = &StreamedProbe.empty;
+    table.cache = &.{};
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var glm = glm5TestConfig();
+    glm.plugin = &binding;
+    // GLM at 262144 tokens: one session is about 6.3 GiB.
+    try t.expect(oneSessionEntryBytes(&glm, 16, 262_144, 16_384) > term);
+    try t.expectEqual(term, ungatedHotCacheAsk(&glm, PREFIX_CACHE_MEM_DEFAULT, false, 16, 262_144, 16_384));
+    // An operator's larger ask, and an uncapped one (0), are held to the term; a smaller one stands.
+    try t.expectEqual(term, ungatedHotCacheAsk(&glm, 8 << 30, true, 16, 262_144, 16_384));
+    try t.expectEqual(term, ungatedHotCacheAsk(&glm, 0, true, 16, 262_144, 16_384));
+    try t.expectEqual(@as(u64, 1 << 30), ungatedHotCacheAsk(&glm, 1 << 30, true, 16, 262_144, 16_384));
+
+    // Ling's own streaming parse and table: its plugin prices its prompt (`prefill_bytes`).
+    const ling_plugin = @import("../../../plugins/bailing_hybrid/plugin.zig");
+    const mem: @import("../../../sdk/testing/fixture.zig").MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = ling_streaming_json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var ling_binding: @import("../plugin/config.zig").Binding = .{ .table = &ling_plugin.table };
+    try t.expect(ling_plugin.config.parse(&dir, StreamedProbe.abi.Str.of(ling_streaming_json), .{}, null, true, &ling_binding.parsed).isOk());
+    defer ling_plugin.config.freeParsed(&ling_binding.parsed);
+    try t.expect(ling_binding.parsed.caps.streamed_weights);
+    var ling = try model_mod.parseConfigFromJson(t.allocator, ling_streaming_json);
+    const own = ling.plugin;
+    defer {
+        ling.plugin = own;
+        ling.deinit(t.allocator);
+    }
+    ling.plugin = &ling_binding;
+    try t.expectEqual(@as(u64, 368_640), ling.kvBytesPerToken());
+    try t.expect(oneSessionEntryBytes(&ling, 16, 32_768, 1024) > term);
+    try t.expectEqual(term, ungatedHotCacheAsk(&ling, PREFIX_CACHE_MEM_DEFAULT, false, 16, 32_768, 1024));
+}
+
+test "ungatedHotCacheAsk: a streamed plugin that prices its own prompt is held to the term; a module-path one keeps its own" {
+    const t = std.testing;
+    const term = @import("glm5_bill.zig").GLM5_HOT_CACHE_BYTES;
+    var table: StreamedProbe.abi.ModelTable = undefined;
+    table.bill = &StreamedProbe.priced;
+    table.cache = &.{};
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    // A streamed GLM, and a streamed hybrid of no family the host bills, each pricing its prompt.
+    var glm = glm5TestConfig();
+    glm.plugin = &binding;
+    try t.expect(oneSessionEntryBytes(&glm, 16, 262_144, 16_384) > term);
+    try t.expectEqual(term, ungatedHotCacheAsk(&glm, PREFIX_CACHE_MEM_DEFAULT, false, 16, 262_144, 16_384));
+    var other: model_mod.ModelConfig = .{ .model_type = "qwen3_5", .num_hidden_layers = 64, .head_dim = 256, .num_attention_heads = 24, .num_key_value_heads = 4, .full_attention_interval = 4 };
+    other.plugin = &binding;
+    try t.expect(oneSessionEntryBytes(&other, 16, 262_144, 8192) > term);
+    try t.expectEqual(term, ungatedHotCacheAsk(&other, PREFIX_CACHE_MEM_DEFAULT, false, 16, 262_144, 8192));
+    try t.expectEqual(term, ungatedHotCacheAsk(&other, 0, true, 16, 262_144, 8192));
+
+    // DeepSeek-V4.1 streams too and prices its prompt, but commits through its module (`CacheHooks.aux`): it sizes its
+    // own bank and makes its cache's room before it appends, so its ask stands. Its real table, a streamed pack's caps.
+    var ds = try model_mod.parseConfigFromJson(t.allocator, model_mod.dsv41_release_config);
+    const own = ds.plugin;
+    defer {
+        ds.plugin = own;
+        ds.deinit(t.allocator);
+    }
+    var streamed_ds: @import("../plugin/config.zig").Binding = .{
+        .table = &@import("../../../plugins/deepseek_v41/plugin.zig").table,
+        .parsed = .{ .caps = .{ .streamed_weights = true, .owns_decode_state = true } },
+    };
+    ds.plugin = &streamed_ds;
+    try t.expect(streamed_ds.table.cache.aux != null);
+    try t.expectEqual(@as(u64, 8 << 30), ungatedHotCacheAsk(&ds, 8 << 30, true, 16, 262_144, 8192));
+    try t.expectEqual(@as(u64, 0), ungatedHotCacheAsk(&ds, 0, true, 16, 262_144, 8192));
+}
+
+test "ungatedHotCacheAsk: an unstreamed GLM or Ling keeps one session" {
+    const t = std.testing;
+    var table: StreamedProbe.abi.ModelTable = undefined;
+    table.bill = &StreamedProbe.empty;
+    table.cache = &.{};
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table };
+    var glm = glm5TestConfig();
+    glm.plugin = &binding;
+    try t.expectEqual(oneSessionEntryBytes(&glm, 16, 262_144, 16_384), ungatedHotCacheAsk(&glm, PREFIX_CACHE_MEM_DEFAULT, false, 16, 262_144, 16_384));
+    try t.expectEqual(@as(u64, 8 << 30), ungatedHotCacheAsk(&glm, 8 << 30, true, 16, 262_144, 16_384));
+
+    var ling = try model_mod.parseConfigFromJson(t.allocator, ling_streaming_json);
+    const own = ling.plugin;
+    defer {
+        ling.plugin = own;
+        ling.deinit(t.allocator);
+    }
+    table.bill = &StreamedProbe.priced;
+    ling.plugin = &binding;
+    try t.expectEqual(oneSessionEntryBytes(&ling, 16, 32_768, 1024), ungatedHotCacheAsk(&ling, PREFIX_CACHE_MEM_DEFAULT, false, 16, 32_768, 1024));
+}
+
+test "a streamed GLM's load-time hot-cache budget fits the bill's hot-cache term; an unstreamed one keeps one session" {
+    // Bar: with entries at the budget, a second request's live set (its billed KV + the resident entry) stays in the decode room.
+    const t = std.testing;
+    const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
+    const term = @import("glm5_bill.zig").GLM5_HOT_CACHE_BYTES;
+    const GB: u64 = 1 << 30;
+    const saved = memory_ceiling.overrides().*;
+    defer memory_ceiling.overrides().* = saved;
+    defer clearResolvedPrefixCacheMem();
+    memory_ceiling.overrides().static_ceiling = 400 * GB;
+    memory_ceiling.overrides().machine_free = .{ .idle = 300 * GB, .request = 300 * GB };
+
+    var table: StreamedProbe.abi.ModelTable = undefined;
+    table.bill = &StreamedProbe.empty;
+    table.cache = &.{};
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var glm = glm5TestConfig();
+    glm.ctx_override = 262_144;
+    glm.plugin = &binding;
+    const session = oneSessionEntryBytes(&glm, defaultKvBits(&glm), getEffectiveContextLength(&glm), pinPrefillChunk(&glm));
+    try t.expect(session > term);
+    var idle: u64 = 0;
+    const streamed = prefixCacheMemForLoad(&glm, PREFIX_CACHE_MEM_DEFAULT, .{ .quiet = true }, &idle);
+    try t.expect(streamed <= term);
+    try t.expectEqual(streamed, resolvedPrefixCacheMem());
+
+    binding.parsed.caps.streamed_weights = false;
+    try t.expectEqual(session, prefixCacheMemForLoad(&glm, PREFIX_CACHE_MEM_DEFAULT, .{ .quiet = true }, &idle));
 }
