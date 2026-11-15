@@ -47,6 +47,7 @@ pub const Builtin = struct {
             .memory_ceiling = memoryCeiling,
             .gpu = &gpu_table,
             .ane = @import("plugin_ane.zig").table(),
+            .quant_claimant = quantClaimant,
         } };
     }
 
@@ -80,6 +81,11 @@ pub fn processHost() *const abi.Host {
     }
     @import("host_table.zig").published.get().host = p.builtin.host();
     return p.builtin.host();
+}
+
+/// The quant plugins the host loaded (`outside.register`, at startup): the one claiming `block_json`.
+fn quantClaimant(_: ?*anyopaque, block_json: abi.Str, config_json: abi.Str) callconv(.c) ?*const @import("../abi/quant.zig").QuantTable {
+    return @import("../sdk/quant/outside.zig").claimant(block_json.slice(), config_json.slice());
 }
 
 fn self_(ctx: ?*anyopaque) *Builtin {

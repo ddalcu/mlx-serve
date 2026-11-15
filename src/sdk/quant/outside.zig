@@ -22,26 +22,57 @@ pub fn register(t: *const abi.QuantTable) void {
     s.n += 1;
 }
 
-/// The loaded table that claims `block_json` of `config_json`: the highest claim; null when none claims or two tie.
+/// The loaded table that claims `block_json` of `config_json`: the highest claim; null when none claims or two tie (a
+/// tie is logged with both names).
 pub fn claimant(block_json: []const u8, config_json: []const u8) ?*const abi.QuantTable {
     const s = tables.get();
     var claims: [max_tables]common.Claim = undefined;
     for (s.items[0..s.n], claims[0..s.n]) |t, *c| c.* = t.claims(.of(block_json), .of(config_json));
-    const i = (common.pick(claims[0..s.n]) catch return null) orelse return null;
+    const i = (common.pick(claims[0..s.n]) catch {
+        var top: u8 = 0;
+        for (claims[0..s.n]) |c| top = @max(top, @backingInt(c));
+        var first: ?usize = null;
+        for (claims[0..s.n], 0..) |c, k| if (@backingInt(c) == top) {
+            const f = first orelse {
+                first = k;
+                continue;
+            };
+            log.warn("[plugins] two quant plugins claim {s} equally ({s}, {s}): none serves it\n", .{ block_json, s.items[f].name.slice(), s.items[k].name.slice() });
+            break;
+        };
+        return null;
+    }) orelse return null;
     return s.items[i];
 }
 
-/// The loaded table claiming `config_json`'s `quantization_config` or `quantization` block, with that block's JSON (in
-/// `a`); null when none claims either.
-fn claimed(a: std.mem.Allocator, config_json: []const u8) !?struct { t: *const abi.QuantTable, block: []u8 } {
-    if (tables.get().n == 0) return null;
+/// The table claiming `block_json`: the loaded ones (`claimant`) where this copy of the SDK has any (the host, an
+/// in-tree plugin); otherwise the host's (`Host.quant_claimant`), as a model plugin's own dylib, whose list is empty,
+/// reaches them. Null when none claims or neither has a table.
+fn claimantVia(host: ?*const Host, block_json: []const u8, config_json: []const u8) ?*const abi.QuantTable {
+    if (tables.get().n > 0) return claimant(block_json, config_json);
+    const h = host orelse return null;
+    const f = @import("../../abi/host.zig").quantClaimantOf(h) orelse return null;
+    return f(h.ctx, .of(block_json), .of(config_json));
+}
+
+/// Whether a load can reach any table: one of its own, or the host's claimant.
+fn reaches(host: ?*const Host) bool {
+    if (tables.get().n > 0) return true;
+    const h = host orelse return false;
+    return @import("../../abi/host.zig").quantClaimantOf(h) != null;
+}
+
+/// The table claiming `config_json`'s `quantization_config` or `quantization` block (`claimantVia`), with that block's
+/// JSON (in `a`); null when none claims either.
+fn claimed(a: std.mem.Allocator, config_json: []const u8, host: ?*const Host) !?struct { t: *const abi.QuantTable, block: []u8 } {
+    if (!reaches(host)) return null;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config_json, .{}) catch return null;
     if (root != .object) return null;
     for ([_][]const u8{ "quantization_config", "quantization" }) |key| {
         const block = try std.json.Stringify.valueAlloc(a, root.object.get(key) orelse continue, .{});
-        if (claimant(block, config_json)) |t| return .{ .t = t, .block = block };
+        if (claimantVia(host, block, config_json)) |t| return .{ .t = t, .block = block };
         a.free(block);
     }
     return null;
@@ -55,7 +86,7 @@ pub fn claimsPack(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) bool 
     defer dir.close(io);
     const config = dir.readFileAlloc(io, "config.json", a, .limited(4 << 20)) catch return false;
     defer a.free(config);
-    const c = (claimed(a, config) catch return false) orelse return false;
+    const c = (claimed(a, config, null) catch return false) orelse return false;
     a.free(c.block);
     return true;
 }
@@ -119,17 +150,18 @@ pub const Format = struct {
     source: abi.Source,
     ctx: abi.LoadCtx,
 
-    /// The load through the table claiming the pack's `quantization_config` or `quantization` block over `source`; null
-    /// when no loaded table claims either. A refusal is logged and named.
+    /// The load through the table claiming the pack's `quantization_config` or `quantization` block over `source`: a
+    /// table this copy of the SDK loaded, else the one `host` names (`Host.quant_claimant`); null when none claims
+    /// either. A refusal is logged and named.
     pub fn open(a: std.mem.Allocator, dir: *const common.PackDir, model_dir: []const u8, source: abi.Source, s: mlx.mlx_stream, host: ?*const Host) !?*Format {
-        if (tables.get().n == 0) return null;
+        if (!reaches(host)) return null;
         const n = dir.fileBytes("config.json");
         if (n == 0 or n > 4 << 20) return null;
         const config = try a.alloc(u8, @intCast(n));
         errdefer a.free(config);
         var why: common.Verdict = .{};
         _ = dir.readFile("config.json", config, &why) orelse return error.OutsideQuantRefused;
-        const c = (try claimed(a, config)) orelse {
+        const c = (try claimed(a, config, host)) orelse {
             a.free(config);
             return null;
         };

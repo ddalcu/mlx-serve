@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const common = @import("common.zig");
+const quant = @import("quant.zig");
 pub const Span = common.Span;
 pub const Str = common.Str;
 pub const Verdict = common.Verdict;
@@ -88,7 +89,19 @@ pub const Host = extern struct {
 
     /// The Neural Engine; read it through `aneOf`, which also answers null for a host older than this field.
     ane: ?*const HostAne = null,
+
+    /// The outside quant table the host loaded that claims a pack's quantization block `block_json` of `config_json`:
+    /// the highest claim; null when none claims or two tie (the host logs a tie by name). A model plugin's own dylib
+    /// holds no quant table, so its loads ask here (`outside.Format.open`). Read it through `quantClaimantOf`, which
+    /// also answers null for a host older than this field. Any thread.
+    quant_claimant: ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable = null,
 };
+
+/// `h.quant_claimant`, or null where the host has none or predates it (its `size` ends before the field).
+pub fn quantClaimantOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable {
+    if (h.size < @offsetOf(Host, "quant_claimant") + @sizeOf(@FieldType(Host, "quant_claimant"))) return null;
+    return h.quant_claimant;
+}
 
 /// `h.ane`, or null where the host has none or predates it (its `size` ends before the field).
 pub fn aneOf(h: *const Host) ?*const HostAne {

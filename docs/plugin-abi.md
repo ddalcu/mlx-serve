@@ -1432,10 +1432,15 @@ One custom kernel as mlx-c's `mlx_fast_{metal,cuda}_kernel_new` takes it. The ca
 | `memory_ceiling` | `*const fn (ctx: ?*anyopaque) callconv(.c) u64` |  | Bytes the plugin may still allocate on the GPU right now: the host's ceiling less what is resident. |
 | `gpu` | `*const HostGpu` |  |  |
 | `ane` | `?*const HostAne` | `null` | The Neural Engine; read it through `aneOf`, which also answers null for a host older than this field. |
+| `quant_claimant` | `?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable` | `null` | The outside quant table the host loaded that claims a pack's quantization block `block_json` of `config_json`: the highest claim; null when none claims or two tie (the host logs a tie by name). A model plugin's own dylib holds no quant table, so its loads ask here (`outside.Format.open`). Read it through `quantClaimantOf`, which also answers null for a host older than this field. Any thread. |
 
 ### `aneOf(h: *const Host) ?*const HostAne`
 
 `h.ane`, or null where the host has none or predates it (its `size` ends before the field).
+
+### `quantClaimantOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable`
+
+`h.quant_claimant`, or null where the host has none or predates it (its `size` ends before the field).
 
 ### `EventKind` (enum(u8))
 
