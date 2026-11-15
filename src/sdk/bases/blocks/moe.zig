@@ -76,6 +76,15 @@ pub const FormatBanks = struct {
     down: quant_abi.Weight,
 };
 
+/// A model's own router for a MoE layer (`Moe.Weights.router_hook`), for a kernel the block does not hold: `run` gives
+/// the layer's routes for `x`, the routed ids and their weights as the stock route gives them (bit for bit, its gate
+/// logit included where the stock route folds one), each a new array the block adopts; or null where it does not serve
+/// the call, and the block's own route runs.
+pub const RouterHook = struct {
+    ctx: ?*const anyopaque = null,
+    run: *const fn (ctx: ?*const anyopaque, w: *const Moe.Weights, s: ops.Stream, x: Array) anyerror!?routing.MoeRouting,
+};
+
 /// The shared expert; `gate_logit` unset = always added.
 pub const SharedExpert = struct {
     gate: Linear,
@@ -125,6 +134,8 @@ pub const Moe = struct {
         route_scale: Array = .{ .ctx = null },
         /// A model's own kernel for the routed and shared experts together; tried before the block's arms.
         fused: ?Fused = null,
+        /// A model's own router for the layer, tried before the block's route (`RouterHook`); null = the block's.
+        router_hook: ?RouterHook = null,
     };
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
@@ -218,6 +229,13 @@ fn adoptRouting(g: *Graph, r: anytype) !Routed {
     return .{ .inds = inds, .scores = scores, .gate_logit = gl };
 }
 
+/// The layer's routes from its router hook (`Moe.Weights.router_hook`), or null: the block's route runs.
+fn hookRouted(w: *const Moe.Weights, g: *Graph, x: Array) !?Routed {
+    const h = w.router_hook orelse return null;
+    const r = (try h.run(h.ctx, w, g.s, x)) orelse return null;
+    return try adoptRouting(g, r);
+}
+
 fn routerLogits(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     if (w.route != .logit_bias) return w.router.forward(parent, x);
     var t = parent.scope();
@@ -301,9 +319,10 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     var t = parent.scope();
     defer t.deinit();
     const g = &t;
-    const logits = try routerLogits(w, g, x);
-    const fold = routerFold(w, x, logits);
-    var r = try route(w, g, logits, fold);
+    var r = (try hookRouted(w, g, x)) orelse stock: {
+        const logits = try routerLogits(w, g, x);
+        break :stock try route(w, g, logits, routerFold(w, x, logits));
+    };
     const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x, false) else null;
     // The group-limited chain hands its weights back in f32; they land in the activation dtype.
     if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
@@ -328,13 +347,19 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
 pub const SpanRoute = struct { inds: Array, scores: Array };
 
 pub fn mlpRoute(w: *const Moe.Weights, parent: *Graph, x: Array) !SpanRoute {
-    if (w.fused != null) return error.MoeSpanFusedArm;
+    // `mlp` tries the layer's own kernel at up to `rows` rows: a span it may take is not this split's
+    if (w.fused) |f| {
+        const xs = ops.shape(x);
+        if (xs[0] * xs[1] <= f.rows) return error.MoeSpanFusedArm;
+    }
     var t = parent.scope();
     defer t.deinit();
     const g = &t;
-    const logits = try routerLogits(w, g, x);
-    if (routerFold(w, x, logits) != null) return error.MoeSpanRouterFold;
-    var r = try route(w, g, logits, null);
+    var r = (try hookRouted(w, g, x)) orelse stock: {
+        const logits = try routerLogits(w, g, x);
+        if (routerFold(w, x, logits) != null) return error.MoeSpanRouterFold;
+        break :stock try route(w, g, logits, null);
+    };
     if (r.gate_logit != null) return error.MoeSpanGateLogit;
     if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
     if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
@@ -351,6 +376,51 @@ pub fn mlpFinish(w: *const Moe.Weights, parent: *Graph, x: Array, sum: Array) !A
     const down = try sharedDown(w, g, &se, x, false);
     const logit = try se.gate_logit.forward(g, x);
     return parent.keep(try g.add(sum, try g.mul(try g.sigmoid(logit), down)));
+}
+
+/// Whether one `routedSum` call may take several prompt spans' rows joined (`rows`: each span's row count, in order)
+/// and give each span its own call's bytes, so `mlpRoute`, one `routedSum` over the joined rows and `mlpFinish` per span
+/// equal `mlp` span by span: the layer's experts are a streamed bank's `.source` arm that declares each prompt row
+/// summed by itself (`Routed.rows_independent`, the bank's `Bank.rows_independent`); every span is a prompt call alone
+/// (more routed ids than `decode_ids`: a decode-lane span gets the decode kernels' bytes on its own call); and no span is
+/// narrow enough for the layer's `fused` arm. MLX-free: a model checks every layer before it joins one.
+pub fn joinServes(w: *const Moe.Weights, rows: []const c_int) bool {
+    if (rows.len < 2 or w.format_banks != null) return false;
+    const st = w.streamed orelse return false;
+    if (st.routed.math != .source or !st.routed.rows_independent) return false;
+    const k: usize = @intCast(w.top_k);
+    for (rows) |n| {
+        if (n < 1) return false;
+        if (@as(usize, @intCast(n)) * k <= st.routed.decode_ids) return false;
+        if (w.fused) |f| if (n <= f.rows) return false;
+    }
+    return true;
+}
+
+/// `mlp`'s output at `x`'s last row alone (`[1, S, D]`, S >= 2, gives `[1, 1, D]`), for a call whose other rows are never
+/// read (an MTP head's draft step): the route and the ungated shared expert over every row as `mlp` runs them, the
+/// format bank's routed experts over the last row only, then `mlp`'s add. Exact where the format sums each row by
+/// itself at up to `max_rows` rows (its decode chain); null where `mlp` takes another arm or the call is wider, and the
+/// caller runs `mlp`.
+pub fn mlpLastRow(w: *const Moe.Weights, parent: *Graph, x: Array, max_rows: c_int) !?Array {
+    const fb = w.format_banks orelse return null;
+    if (w.fused != null or w.streamed != null or w.route_scale.ctx != null) return null;
+    const se = w.shared orelse return null;
+    if (se.gated()) return null;
+    const xs = ops.shape(x);
+    if (xs.len != 3 or xs[0] != 1 or xs[1] < 2 or xs[1] > max_rows) return null;
+    var t = parent.scope();
+    defer t.deinit();
+    const g = &t;
+    // More than one row: `mlp`'s route takes no gate fold.
+    var r = (try hookRouted(w, g, x)) orelse try route(w, g, try routerLogits(w, g, x), null);
+    if (r.gate_logit != null) return null;
+    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+    const n = xs[1];
+    const last: Routed = .{ .inds = try g.sliceAxis(r.inds, 1, n - 1, n), .scores = try g.sliceAxis(r.scores, 1, n - 1, n) };
+    const routed1 = try formatSwiglu(w, &fb, g, try g.sliceAxis(x, 1, n - 1, n), last);
+    const sd = try sharedDown(w, g, &se, x, false);
+    return try parent.keep(try g.add(routed1, try g.sliceAxis(sd, 1, n - 1, n)));
 }
 
 /// `mlp` with each row of one sequence's `x` `[1, S, D]` given its own one-row call's bytes (a verify that must equal
