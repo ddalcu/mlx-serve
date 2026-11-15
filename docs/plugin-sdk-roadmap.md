@@ -7,6 +7,8 @@ An outside plugin that runs its own forward should import the server's blocks, n
 | mlx bindings, the blocks' `Graph` and array helpers | `kit.mlx`, `kit.mlx_ops`, `kit.mlx_array` | done |
 | norms, conv, ssm, schedulers, vae, dit, embedding, linear, qmm, mlp, rope, attention, moe, hc, gdn, kda | `kit.blocks` | done (Metal; versioned with the kit) |
 | the language-model bases' blocks (routed MLP, gated-delta layer) and eval cadence | `kit.bases` | done |
+| the KDA-hybrid base (GLM-5.3-Flash's and Ling 3.0's config, trunk, KDA layer, slots, table glue, MoE, fixtures) | `kit.bases.kda_hybrid` | done (no Sushi EXL3 experts: `builtin_formats.zig` stays in the server) |
+| the op scope over mlx-c; the machine's memory, load and GPU cores | `kit.mlx_scope`, `kit.system` | done |
 | the prompt pass's bill; an outside quant pack's model side | `kit.bill`, `kit.outside_model` | done |
 | a weight layout of its own | `kit.foreign.register` (`sdk/quant/foreign.zig`) | done |
 | the MTP round policy | `kit.spec`, pure parts only | not started |

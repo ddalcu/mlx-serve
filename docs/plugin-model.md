@@ -82,7 +82,7 @@ A plugin is a table (`abi.ModelTable`) of C-ABI functions. The host calls them i
   `mlx_fast_scaled_dot_product_attention`, `mlx_matmul`. A plugin can write its layers on mlx-c, or call the
   server's own blocks through `kit.blocks`: norms, conv, ssm, schedulers, vae, dit pieces, embedding, and the
   transformer blocks (linear, qmm, mlp, rope, attention, moe, hc, gdn, kda; Metal only, no CUDA files), and the
-  language-model bases' routed MLP and gated-delta layer (`kit.bases`). Blocks are
+  language-model bases' routed MLP and gated-delta layer and the KDA-hybrid base (`kit.bases`). Blocks are
   compiled into your dylib and take `kit.mlx` handles (`{ ctx }`, like mlx-c's: convert with `.{ .ctx = x.ctx }`).
   They are versioned with the kit and a newer kit may rename or change them: build against one kit and pin it.
   A block that does not apply returns null and the caller keeps its own ops (`_example`'s `addNorm`).

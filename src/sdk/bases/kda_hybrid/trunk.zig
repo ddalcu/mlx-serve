@@ -7,7 +7,7 @@
 //! engines/mlx/load/weights.zig (`loadRoutedMoeAt`, `f32Table`), engines/mlx/load/init.zig (the embedding and the
 //! head), sdk/quant/params.zig (`computeQuantParams`), plugins/glm5_next/load.zig, plugins/glm5_next/mtp.zig
 //! (`Head.load`), sdk/blocks/embedding.zig (`rawEmbedding`), sdk/blocks/linear/qmatmul.zig (`lmHeadProject`),
-//! sdk/blocks/mlp/dense.zig (`denseMLP`), plugins/glm5_next/forward.zig (`glmHeadMm`).
+//! sdk/blocks/mlp/dense.zig (`denseMLP`).
 
 const std = @import("std");
 const abi = @import("../../../abi/plugin.zig");
