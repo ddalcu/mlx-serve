@@ -74,7 +74,8 @@ fn rankedBefore(_: void, a: TokenLogprob, b: TokenLogprob) bool {
 /// the vocab scores -100. log_softmax is a per-row shift, so ranks and gathers read the f32
 /// logits and only the gathered values subtract the row's logsumexp. Every intermediate
 /// handle is gone before the one eval, so the peak is the top-k argpartition: its f32
-/// input, its indices and the sort's scratch, five [rows, V] 4-byte arrays (none at top_n 0).
+/// input, its output and the sort's four scratch arrays, six [rows, V] 4-byte arrays (none
+/// at top_n 0).
 fn rowLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen: []const u32, top_n: u32, s: mlx.mlx_stream, out: *std.ArrayList(LogprobResult)) !void {
     const shape = mlx.getShape(logits);
     const rows: c_int = @intCast(chosen.len);
@@ -267,10 +268,11 @@ test "promptLogprobs: no vocab-wide array outlives its use, so the top-k sort is
     try promptLogprobs(allocator, logits, &ids, 5, s, &out);
     var peak: usize = 0;
     try mlx.check(mlx.mlx_get_peak_memory(&peak));
-    const bar: usize = 6 * rows * vocab * 4;
+    // Bar: the sort's six [rows, vocab] 4-byte arrays (its f32 input, its output, four scratch) and 1 MiB for its small
+    // arrays above what was live before; one more vocab-wide array kept alive is 15 MiB over it.
+    const bar: usize = 6 * rows * vocab * 4 + (1 << 20);
     std.debug.print("promptLogprobs peak - base {d} B, bar {d} B\n", .{ peak - base, bar });
-    // Bar: under six [rows, vocab] 4-byte arrays above what was live before (the sort alone holds five).
-    try testing.expect(peak - base < bar);
+    try testing.expect(peak - base <= bar);
     try testing.expectEqual(@as(usize, rows), out.items.len);
 }
 
