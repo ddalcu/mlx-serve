@@ -57,6 +57,7 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
         .ssm_checkpoint = c.ssmCheckpointBytes(2),
         .prefill_score_width = qk,
         .prefill_bytes = if (c.streamed_bank) &prefillBytes else null,
+        .flags = .{ .decode_room = if (c.streamed_bank) .billed else .by_name },
     };
 }
 

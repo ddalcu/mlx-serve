@@ -74,17 +74,20 @@ pub fn glm5PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, m
 /// neither bill names it otherwise. A streamed bank's hot-cache budget never passes it (`streamedHotCacheCapped`).
 pub const GLM5_HOT_CACHE_BYTES: u64 = 2048 << 20;
 
-/// Whether the engine bills this model's decode phase apart (`LoadCtx.stream_room_decode`): a built-in GLM on a streamed
-/// plugin that prices no prompt of its own, and Ling (bailing_hybrid), which runs GLM's trunk (KDA layers, attention
-/// caches, the same checkpoints) though its plugin prices its prompt. Another plugin that prices its own prompt keeps
-/// one room.
+/// Whether the engine bills a streamed model's decode phase apart (`LoadCtx.stream_room_decode`): its bill's
+/// `decode_room`. Unset (or a Bill that predates it) is the name rule: a built-in GLM on a streamed plugin that prices
+/// no prompt of its own, and Ling (bailing_hybrid), which runs GLM's trunk though its plugin prices its prompt.
 pub fn decodeBilled(config: *const model_mod.ModelConfig) bool {
     const b = config.plugin orelse return false;
-    const ling = std.mem.eql(u8, config.model_type, "bailing_hybrid");
-    if (!b.parsed.caps.streamed_weights or !(config.isGlm5() or ling)) return false;
+    if (!b.parsed.caps.streamed_weights) return false;
     var bill: abi.Bill = .{};
     b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
-    return bill.prefill_bytes == null or ling;
+    const room: abi.DecodeRoom = if (bill.billFlags()) |f| f.decode_room else .by_name;
+    return switch (room) {
+        .billed => true,
+        .unbilled => false,
+        else => std.mem.eql(u8, config.model_type, "bailing_hybrid") or (config.isGlm5() and bill.prefill_bytes == null),
+    };
 }
 
 /// Whether a streamed plugin's hot cache is held to `GLM5_HOT_CACHE_BYTES` (`ungatedHotCacheAsk`): admission bills a

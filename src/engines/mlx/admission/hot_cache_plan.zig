@@ -720,18 +720,26 @@ test "ungatedHotCacheAsk: a streamed plugin that prices its own prompt is held t
     try t.expectEqual(term, ungatedHotCacheAsk(&other, 0, true, 16, 262_144, 8192));
 
     // DeepSeek-V4.1 streams too and prices its prompt, but commits through its module (`CacheHooks.aux`): it sizes its
-    // own bank and makes its cache's room before it appends, so its ask stands. Its real table, a streamed pack's caps.
+    // own bank and makes its cache's room before it appends, so its ask stands. Its real table over its real parse (its
+    // bill reads the parse), with a streamed pack's caps.
     var ds = try model_mod.parseConfigFromJson(t.allocator, model_mod.dsv41_release_config);
     const own = ds.plugin;
     defer {
         ds.plugin = own;
         ds.deinit(t.allocator);
     }
-    var streamed_ds: @import("../plugin/config.zig").Binding = .{
-        .table = &@import("../../../plugins/deepseek_v41/plugin.zig").table,
-        .parsed = .{ .caps = .{ .streamed_weights = true, .owns_decode_state = true } },
-    };
+    const v41_config = @import("../../../plugins/deepseek_v41/config.zig");
+    const ds_json = model_mod.dsv41_release_config;
+    const ds_mem: @import("../../../sdk/testing/fixture.zig").MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = ds_json }} };
+    const ds_dir = ds_mem.packDir();
+    var streamed_ds: @import("../plugin/config.zig").Binding = .{ .table = &@import("../../../plugins/deepseek_v41/plugin.zig").table };
+    try t.expect(v41_config.parse(&ds_dir, StreamedProbe.abi.Str.of(ds_json), .{}, null, true, &streamed_ds.parsed).isOk());
+    defer v41_config.freeParsed(&streamed_ds.parsed);
+    streamed_ds.parsed.caps.streamed_weights = true;
+    streamed_ds.parsed.caps.owns_decode_state = true;
     ds.plugin = &streamed_ds;
+    // Its bill leaves decode_room unset (by_name), so the host's rule gives it no decode room, as before the flag.
+    try t.expect(!@import("glm5_bill.zig").decodeBilled(&ds));
     try t.expect(streamed_ds.table.cache.aux != null);
     try t.expectEqual(@as(u64, 8 << 30), ungatedHotCacheAsk(&ds, 8 << 30, true, 16, 262_144, 8192));
     try t.expectEqual(@as(u64, 0), ungatedHotCacheAsk(&ds, 0, true, 16, 262_144, 8192));

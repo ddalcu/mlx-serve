@@ -474,7 +474,7 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 
 ### `DecodeRoom` (enum(u2))
 
-Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`), priced by the engine's kda_hybrid decode bill.
+Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`). `billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not, since that bill is not its own.
 
 | Member | Value | |
 |---|---|---|

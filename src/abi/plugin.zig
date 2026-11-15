@@ -385,8 +385,9 @@ pub const BillFlags = packed struct(u32) {
     _: u30 = 0,
 };
 
-/// Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`),
-/// priced by the engine's kda_hybrid decode bill.
+/// Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`).
+/// `billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk
+/// (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not, since that bill is not its own.
 pub const DecodeRoom = enum(u2) {
     /// The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed value 3 reads as this.
     by_name = 0,
