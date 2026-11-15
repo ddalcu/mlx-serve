@@ -24,17 +24,15 @@ const routed_mod = @import("../../weights/routed.zig");
 const narrowsLoadedF16 = @import("../../weights/load.zig").narrowsLoadedF16;
 const compiled = @import("../blocks/compiled.zig");
 const gdn_base = @import("../blocks/gdn.zig");
-const exl3 = @import("../../quant/exl3/format.zig");
 const params = @import("../../quant/params.zig");
-const fp8_block128 = @import("../../quant/fp8_block128.zig");
+const fp8_claim = @import("../../quant/fp8_block128_claim.zig");
 const fused_rows = @import("../../blocks/linear/fused_rows.zig");
 const qmatmulBits = @import("../../blocks/linear/qmatmul.zig").qmatmulBits;
 const fused_act = @import("../../blocks/mlp/fused_activations.zig");
 const clampedSwiGLU = @import("../../blocks/mlp/activations.zig").clampedSwiGLU;
 const add_norm = @import("../../blocks/norms/add_norm.zig");
 const residual_norm = @import("../../blocks/norms/residual_norm.zig");
-const config = @import("../../../plugins/glm5_next/config.zig");
-const glm5 = @import("../../../plugins/glm5_next/glm5_next.zig");
+const config = @import("config.zig");
 
 const Array = mlx.mlx_array;
 pub const Linear = linear.Linear;
@@ -340,28 +338,6 @@ pub const Model = struct {
         try mlx.check(mlx.mlx_multiply(&out, act, up, s));
         return out;
     }
-
-    /// Per-head projection over `q` `[H, out, in]`: `x @ w^T` when `transpose`, else `x @ w`.
-    pub fn headMm(m: *const Model, x: Array, q: *const Linear, transpose: bool) !Array {
-        const s = m.s;
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        if (q.s.ctx == null) {
-            if (transpose) {
-                var wt = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(wt);
-                try mlx.check(mlx.mlx_swapaxes(&wt, q.w, -1, -2, s));
-                try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
-            } else try mlx.check(mlx.mlx_matmul(&out, x, q.w, s));
-            return out;
-        }
-        if (transpose and q.mode == .affine) if (try glm5.headQmv(s, x, q.w, q.s, q.b, q.bits, q.group_size, 1.0)) |y| {
-            _ = mlx.mlx_array_free(out);
-            return y;
-        };
-        try mlx.check(mlx.mlx_quantized_matmul(&out, x, q.w, q.s, q.b, transpose, mlx.mlx_optional_int.some(@intCast(q.group_size)), mlx.mlx_optional_int.some(@intCast(q.bits)), q.mode.cstr(), s));
-        return out;
-    }
 };
 
 /// `w` with its last two axes swapped (a view).
@@ -440,6 +416,42 @@ fn fpFromGeometry(c: *const Config, w_cols: u32, s_cols: u32, in_dim: u32) ?Quan
 
 /// A weight triple as stored (`<base>.{weight,scales,biases}`), scales and biases absent on a dense weight; or a
 /// projection the pack's outside quant plugin loaded (`ext`, `w` its first array).
+/// The pack formats and the model's own kernels the trunk calls but does not import (a base imports no format), given
+/// at load (`load`). Null fields: the trunk's own arms; a pack that needs a missing one is refused by name.
+pub const Hooks = struct {
+    /// A Sushi pack's EXL3 routed experts (`expert_quant`).
+    exl3: ?*const Exl3 = null,
+    /// The model's own one-kernel routed decode: each routed layer's `fused` arm, up to `rows` rows (GLM's).
+    fused_decode: ?FusedDecode = null,
+
+    pub const FusedDecode = struct { rows: c_int, run: @FieldType(moe.Fused, "run") };
+
+    /// EXL3 routed experts through their format, which the trunk never names: the spec rides inline in `Spec`, written
+    /// and read by the hook alone.
+    pub const Exl3 = struct {
+        pub const spec_bytes = 64;
+        pub const Spec = struct { bytes: [spec_bytes]u8 align(16) = undefined };
+        /// The pack's `expert_quant` block (JSON) for `top_k` routed experts, once per load.
+        parse: *const fn (gpa: std.mem.Allocator, expert_quant_json: []const u8, top_k: u32, out: *Spec) anyerror!void,
+        /// One bank (its trellis, suh, svh) checked against the spec at its geometry.
+        admit: *const fn (spec: *const Spec, trellis: Array, suh: Array, svh: Array, experts: u32, in_dim: u32, out_dim: u32) anyerror!void,
+        /// The bank as the format's table loads one.
+        wrap: *const fn (spec: *const Spec, trellis: Array, suh: Array, svh: Array) quant_abi.Weight,
+        /// The format's table the banks run through.
+        table: *const quant_abi.QuantTable,
+    };
+};
+
+/// The pack's EXL3 spec from its `expert_quant` block (empty: none); a pack that declares one without the format's
+/// hook is refused by name.
+pub fn exl3Spec(hooks: Hooks, expert_quant_json: []const u8, top_k: u32) !?Hooks.Exl3.Spec {
+    if (expert_quant_json.len == 0) return null;
+    const x = hooks.exl3 orelse return error.Exl3ExpertsNeedTheBuiltinFormat;
+    var sp: Hooks.Exl3.Spec = .{};
+    try x.parse(gpa, expert_quant_json, top_k, &sp);
+    return sp;
+}
+
 const Triple = struct { w: Array, s: Array = .{}, b: Array = .{}, ext: ?outside.Weight = null };
 
 const Loader = struct {
@@ -448,7 +460,8 @@ const Loader = struct {
     s: mlx.mlx_stream,
     prefix: []const u8,
     owned: *std.ArrayList(Array),
-    exl3: ?exl3.Spec,
+    exl3: ?Hooks.Exl3.Spec,
+    hooks: Hooks = .{},
     experts: ?*streamed.Streamed = null,
     /// The outside quant plugin claiming the pack (`format` null: none).
     quant: *outside_model.Load,
@@ -537,7 +550,7 @@ const Loader = struct {
         const t = try l.kept(raw);
         if (t.s.ctx == null) return .{ .w = t.w };
         // e4m3: the matmul knows it by its dtypes; no affine kernel may claim it.
-        if (fp8_block128.isBlockScaled(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = fp8_block128.block_cols };
+        if (fp8_claim.isBlockScaled(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = fp8_claim.block_cols };
         const qp = resolve(l.c, t.w, t.s, in_dim);
         return .{ .w = t.w, .s = t.s, .b = t.b, .bits = qp.bits, .group_size = qp.group_size, .mode = qp.mode };
     }
@@ -772,7 +785,7 @@ const Loader = struct {
         // mlx-lm quantizes the router under its module (`mlp.gate.gate_proj`); the reference keeps `mlp.gate`.
         const rt = if (!l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.weight", .{base})) and l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.gate_proj.weight", .{base}))) "mlp.gate.gate_proj" else "mlp.gate";
         const ex = if (l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.experts.gate_proj.weight", .{base}))) "mlp.experts" else "mlp.switch_mlp";
-        const spec: ?exl3.Spec = if (glm) l.exl3 else null;
+        const spec: ?Hooks.Exl3.Spec = if (glm) l.exl3 else null;
         const lf: [3][]const u8 = if (spec != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
         var banks: [3]Triple = @splat(.{ .w = .{} });
         // An outside plugin's resident experts (a streaming pack's head) run as the block's format banks.
@@ -815,7 +828,7 @@ const Loader = struct {
         };
         for (&shared) |*t| try l.transposed(t);
         if (spec) |sp| for (banks, [_][2]u32{ .{ c.hidden_size, c.moe_intermediate_size }, .{ c.hidden_size, c.moe_intermediate_size }, .{ c.moe_intermediate_size, c.hidden_size } }) |t, io|
-            try exl3.admit(.{ .trellis = t.w, .suh = t.s, .svh = t.b }, c.num_experts, io[0], io[1], sp);
+            try l.hooks.exl3.?.admit(&sp, t.w, t.s, t.b, c.num_experts, io[0], io[1]);
 
         const inter: ?u32 = if (c.moe_intermediate_size > 0) c.moe_intermediate_size else null;
         const shared_inter: ?u32 = if (c.shared_expert_intermediate_size > 0) c.shared_expert_intermediate_size else null;
@@ -849,8 +862,11 @@ const Loader = struct {
         } else if (banked) {
             // Bound to the bank after the load.
         } else if (spec) |sp| {
-            w.format_banks = .{ .table = &exl3.table, .gate = exl3Weight(banks[0], sp), .up = exl3Weight(banks[1], sp), .down = exl3Weight(banks[2], sp) };
-        } else if (glm) w.fused = .{ .rows = glm5.MOE_DECODE_MAX_ROWS, .limit = c.swiglu_limit, .run = &@import("moe.zig").fusedDecode };
+            const x = l.hooks.exl3.?;
+            w.format_banks = .{ .table = x.table, .gate = x.wrap(&sp, banks[0].w, banks[0].s, banks[0].b), .up = x.wrap(&sp, banks[1].w, banks[1].s, banks[1].b), .down = x.wrap(&sp, banks[2].w, banks[2].s, banks[2].b) };
+        } else if (glm) {
+            if (l.hooks.fused_decode) |fd| w.fused = .{ .rows = fd.rows, .limit = c.swiglu_limit, .run = fd.run };
+        }
         w.route_fn = moe.compileRouting(&w, l.s);
         return w;
     }
@@ -968,20 +984,6 @@ fn clampOf(c: *const Config) ?u32 {
     return @intFromFloat(c.swiglu_limit);
 }
 
-/// A Sushi bank as the EXL3 format table loads one: trellis, suh, svh and the pack's decode.
-fn exl3Weight(t: Triple, spec: exl3.Spec) quant_abi.Weight {
-    const d = exl3.decode(spec);
-    return .{
-        .w = .{ .ctx = t.w.ctx },
-        .scales = .{ .ctx = t.s.ctx },
-        .biases = .{ .ctx = t.b.ctx },
-        .layout = @backingInt(d.codebook),
-        .flags = @intCast(d.window.bits()),
-        .block = @intCast(mlx.getShape(t.w)[3]),
-        .state = if (d.table) |i| @ptrFromInt(@as(usize, i) + 1) else null,
-    };
-}
-
 /// The weight prefix the pack uses: the config's, else the other nesting that holds the embedding.
 fn probePrefix(src: *const quant_abi.Source, declared: []const u8, leaf: []const u8) []const u8 {
     var nb: [160]u8 = undefined;
@@ -994,7 +996,7 @@ fn probePrefix(src: *const quant_abi.Source, declared: []const u8, leaf: []const
 }
 
 /// The trunk from `ctx.weights`, and GLM's head when the pack ships one (a head that fails to load is dropped).
-pub fn load(ctx: *const abi.LoadCtx) !*Model {
+pub fn load(ctx: *const abi.LoadCtx, hooks: Hooks) !*Model {
     const src = ctx.weights orelse return error.UnsupportedWeightSource;
     const c = config.of(ctx.parsed);
     // Before the trunk: what is outside the server, for the bank's open (`Fit.load_start`).
@@ -1011,16 +1013,10 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
     // The table is the load's: the weights it loaded stay the model's.
     defer m.quant.close();
     if (c.streamed_bank and m.quant.format == null) return error.StreamedBankUnclaimed;
-    var l: Loader = .{ .src = src, .c = c, .s = s, .prefix = prefix, .owned = &m.owned, .exl3 = null, .quant = &m.quant };
+    var l: Loader = .{ .src = src, .c = c, .s = s, .prefix = prefix, .owned = &m.owned, .exl3 = null, .hooks = hooks, .quant = &m.quant };
     if (c.num_experts > 0 and !c.streamed_bank) m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.num_experts, s);
     if (m.experts) |*x| l.experts = x;
-    if (c.expert_quant_json.len > 0) {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        defer arena.deinit();
-        const text = try std.fmt.allocPrint(arena.allocator(), "{{\"expert_quant\":{s}}}", .{c.expert_quant_json});
-        const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
-        l.exl3 = try exl3.parse(root.object, c.num_experts_per_tok);
-    }
+    l.exl3 = try exl3Spec(hooks, c.expert_quant_json, c.num_experts_per_tok);
     var nb: [256]u8 = undefined;
     m.rms_eps = mlx.mlx_array_new_float(c.rms_norm_eps);
     m.kda.gate_fn = gdn_base.compileGate(m.ssmStateDtype(), s);

@@ -12,6 +12,9 @@ const head = @import("head.zig");
 const fixture = @import("../../sdk/bases/kda_hybrid/fixture.zig");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const builtin_formats = @import("../../sdk/bases/kda_hybrid/builtin_formats.zig");
+const moe_fused = @import("moe_fused.zig");
+const glm5 = @import("glm5_next.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -58,7 +61,7 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
-    return host.load(plugin.name, ctx, out);
+    return host.load(plugin.name, ctx, .{ .exl3 = &builtin_formats.exl3, .fused_decode = .{ .rows = glm5.MOE_DECODE_MAX_ROWS, .run = &moe_fused.fusedDecode } }, out);
 }
 
 /// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored (a streaming pack's bank

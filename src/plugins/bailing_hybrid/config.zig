@@ -5,7 +5,7 @@
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
-const family = @import("../glm5_next/config.zig");
+const family = @import("../../sdk/bases/kda_hybrid/config.zig");
 
 const Config = family.Config;
 const Objects = family.Objects;

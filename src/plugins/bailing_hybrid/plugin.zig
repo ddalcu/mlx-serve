@@ -7,10 +7,11 @@ const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const host = @import("../../sdk/bases/kda_hybrid/host.zig");
 const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const builtin_formats = @import("../../sdk/bases/kda_hybrid/builtin_formats.zig");
 const sdk_bill = @import("../../sdk/bill/prefill.zig");
 const dq_gemm = @import("../../sdk/blocks/linear/prefill_dq_gemm.zig");
 const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
-const Family = @import("../glm5_next/config.zig").Config;
+const Family = @import("../../sdk/bases/kda_hybrid/config.zig").Config;
 const run = @import("../../sdk/bases/run.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
@@ -97,7 +98,7 @@ pub fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, _: 
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
-    return host.load(plugin.name, ctx, out);
+    return host.load(plugin.name, ctx, .{ .exl3 = &builtin_formats.exl3 }, out);
 }
 
 pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {

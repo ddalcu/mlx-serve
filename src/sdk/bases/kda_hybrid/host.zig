@@ -6,7 +6,7 @@ const std = @import("std");
 const abi = @import("../../../abi/plugin.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const quant_abi = @import("../../../abi/quant.zig");
-const Layout = @import("../../quant/native.zig").Layout;
+const Layout = @import("../../quant/layout.zig").Layout;
 const trunk = @import("trunk.zig");
 
 const gpa = std.heap.c_allocator;
@@ -14,8 +14,8 @@ const Array = mlx.mlx_array;
 
 pub const Model = trunk.Model;
 
-pub fn load(comptime name: []const u8, ctx: *const abi.LoadCtx, out: *abi.Verdict) ?*anyopaque {
-    return trunk.load(ctx) catch |e| {
+pub fn load(comptime name: []const u8, ctx: *const abi.LoadCtx, hooks: trunk.Hooks, out: *abi.Verdict) ?*anyopaque {
+    return trunk.load(ctx, hooks) catch |e| {
         out.* = switch (e) {
             error.OutOfMemory => abi.Verdict.refuse(.failed, name ++ ": out of memory"),
             // The driver maps this name to the engine's own refusal.
