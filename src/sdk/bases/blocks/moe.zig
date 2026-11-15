@@ -1206,3 +1206,294 @@ test "moe: mlpRows over a streamed source gives each row its one-row mlp's bytes
         try testing.expectEqual(@as(c_int, if (exact) 2 else 1), RowsSource.widest);
     }
 }
+
+test "moe: spans routed apart, one routed call over their joined rows, then each span's finish equal mlp span by span" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const testing = std.testing;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(9);
+    const D = 128;
+    const E = 8;
+    var router: [D * E]f32 = @splat(0);
+    for (&router) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    var bias: [E]f32 = @splat(0);
+    for (&bias) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    const unbuilt: Bank = .{ .w = .{ .ctx = null }, .qp = .{ .bits = 4, .group_size = 64 } };
+    const w: Moe.Weights = .{
+        .router = .{ .w = try g.astype(try g.fromSlice(f32, &router, &.{ D, E }), .bfloat16) },
+        .route = .{ .sigmoid_bias = .{ .expert_bias = try g.fromSlice(f32, &bias, &.{E}), .norm = true, .scale = 2.5 } },
+        .gate = unbuilt,
+        .up = unbuilt,
+        .down = unbuilt,
+        .shared = .{ .gate = try testAffine(&g, &prng, 64, D), .up = try testAffine(&g, &prng, 64, D), .down = try testAffine(&g, &prng, D, 64) },
+        .top_k = 2,
+        .experts = E,
+        .streamed = .{ .routed = RowsSource.of(false), .layer = 0 },
+    };
+    const spans = [_]c_int{ 3, 9, 20 };
+    var xs: [spans.len]Array = undefined;
+    var want: [spans.len]Array = undefined;
+    var routes: [spans.len]SpanRoute = undefined;
+    for (&xs, &want, &routes, spans) |*x, *o, *r, n| {
+        const buf = try g.a.alloc(f32, @intCast(n * D));
+        defer g.a.free(buf);
+        for (buf) |*v| v.* = prng.random().floatNorm(f32);
+        x.* = try g.astype(try g.fromSlice(f32, buf, &.{ 1, n, D }), .bfloat16);
+        o.* = try mlp(&w, &g, x.*);
+        r.* = try mlpRoute(&w, &g, x.*);
+    }
+    var inds: [spans.len]Array = undefined;
+    var scores: [spans.len]Array = undefined;
+    for (routes, &inds, &scores) |r, *i, *s| {
+        i.* = r.inds;
+        s.* = r.scores;
+    }
+    RowsSource.calls = 0;
+    const sum = try routedSum(&w, &g, try g.concat(&xs, 1), try g.concat(&inds, 1), try g.concat(&scores, 1));
+    try testing.expectEqual(@as(u32, 1), RowsSource.calls);
+    var at: c_int = 0;
+    for (xs, want, spans) |x, o, n| {
+        try ops.expectBitEqual(try mlpFinish(&w, &g, x, try g.sliceAxis(sum, 1, at, at + n)), o);
+        at += n;
+    }
+}
+
+/// A streamed layer's seams, never called: `joinServes` reads which arm a layer's weights name.
+const JoinSeams = struct {
+    var ctx: u8 = 0;
+    fn source(_: *anyopaque, _: u32, _: Array, _: Array, _: Array) routed.Ret(Array) {
+        return .{};
+    }
+    fn trunkMath(_: *anyopaque, _: u32, _: []const u16, _: []const f32) routed.Ret(routed.Fetched) {
+        return .{};
+    }
+    fn settle(_: *anyopaque) routed.Ret(void) {
+        return .{};
+    }
+    fn fused(_: *const Fused, _: *const Moe.Weights, _: ops.Stream, _: Array, _: Array, _: Array) anyerror!?Array {
+        return null;
+    }
+};
+
+test "moe: prompt spans join one routed call only on a streamed source that declares independent rows, every span a prompt call off the fused arm" {
+    const t = std.testing;
+    const none: Array = .{ .ctx = null };
+    const bank: Bank = .{ .w = none, .qp = .{ .bits = 3, .group_size = 64 } };
+    const source: routed.Routed = .{ .ctx = &JoinSeams.ctx, .math = .{ .source = &JoinSeams.source }, .settle_fn = &JoinSeams.settle, .decode_ids = 128, .rows_independent = true };
+    var w: Moe.Weights = .{ .router = .{}, .route = .softmax, .gate = bank, .up = bank, .down = bank, .top_k = 8, .experts = 288, .streamed = .{ .routed = source, .layer = 3 } };
+    // a 16K prompt's last chunk and its 31-row held-back span; three spans of a whole-prompt pass
+    try t.expect(joinServes(&w, &.{ 16_356, 31 }));
+    try t.expect(joinServes(&w, &.{ 2048, 2048, 512 }));
+    // one span is no join; an empty span is no span
+    try t.expect(!joinServes(&w, &.{16_356}));
+    try t.expect(!joinServes(&w, &.{ 16_356, 0 }));
+    // a span the bank's decode lane takes alone (16 rows x 8 ids = decode_ids) gets the decode kernels' bytes there
+    try t.expect(!joinServes(&w, &.{ 16_356, 16 }));
+    try t.expect(joinServes(&w, &.{ 16_356, 17 }));
+    // a source that does not declare independent rows: a row's bytes may depend on the call's other rows
+    w.streamed.?.routed.rows_independent = false;
+    try t.expect(!joinServes(&w, &.{ 16_356, 31 }));
+    w.streamed.?.routed.rows_independent = true;
+    // a model kernel of up to 20 rows: a span it would take is not `mlpRoute`'s
+    w.fused = .{ .rows = 20, .limit = 10, .run = &JoinSeams.fused };
+    try t.expect(joinServes(&w, &.{ 40, 21 }));
+    try t.expect(!joinServes(&w, &.{ 40, 20 }));
+    w.fused = null;
+    // the trunk's own gathers on fetched slots, and resident experts: no joined source call
+    w.streamed.?.routed.math = .{ .trunk = &JoinSeams.trunkMath };
+    try t.expect(!joinServes(&w, &.{ 40, 31 }));
+    w.streamed = null;
+    try t.expect(!joinServes(&w, &.{ 40, 31 }));
+}
+
+test "moe: mlpRoute serves a span wider than the layer's fused arm, and refuses one it would take" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const testing = std.testing;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(13);
+    const D = 128;
+    const E = 8;
+    var router: [D * E]f32 = @splat(0);
+    for (&router) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    var bias: [E]f32 = @splat(0);
+    const unbuilt: Bank = .{ .w = .{ .ctx = null }, .qp = .{ .bits = 4, .group_size = 64 } };
+    const w: Moe.Weights = .{
+        .router = .{ .w = try g.astype(try g.fromSlice(f32, &router, &.{ D, E }), .bfloat16) },
+        .route = .{ .sigmoid_bias = .{ .expert_bias = try g.fromSlice(f32, &bias, &.{E}), .norm = true, .scale = 2.5 } },
+        .gate = unbuilt,
+        .up = unbuilt,
+        .down = unbuilt,
+        .shared = .{ .gate = try testAffine(&g, &prng, 64, D), .up = try testAffine(&g, &prng, 64, D), .down = try testAffine(&g, &prng, D, 64) },
+        .top_k = 2,
+        .experts = E,
+        .streamed = .{ .routed = RowsSource.of(false), .layer = 0 },
+        .fused = .{ .rows = 4, .limit = 10, .run = &JoinSeams.fused },
+    };
+    for ([_]c_int{ 4, 9 }) |n| {
+        const buf = try g.a.alloc(f32, @intCast(n * D));
+        defer g.a.free(buf);
+        for (buf) |*v| v.* = prng.random().floatNorm(f32);
+        const x = try g.astype(try g.fromSlice(f32, buf, &.{ 1, n, D }), .bfloat16);
+        if (n <= 4) {
+            try testing.expectError(error.MoeSpanFusedArm, mlpRoute(&w, &g, x));
+            continue;
+        }
+        const r = try mlpRoute(&w, &g, x);
+        try ops.expectBitEqual(try mlpFinish(&w, &g, x, try routedSum(&w, &g, x, r.inds, r.scores)), try mlp(&w, &g, x));
+    }
+}
+
+/// A router hook that hands back fixed routes (`inds`, `scores`), or declines; `calls` counts its calls.
+const FixedRouter = struct {
+    var calls: u32 = 0;
+    var serve = true;
+    var inds: Array = .{ .ctx = null };
+    var scores: Array = .{ .ctx = null };
+    fn run(_: ?*const anyopaque, _: *const Moe.Weights, _: ops.Stream, _: Array) anyerror!?routing.MoeRouting {
+        calls += 1;
+        if (!serve) return null;
+        var i = mlx.mlx_array_new();
+        var s = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&i, inds));
+        try mlx.check(mlx.mlx_array_set(&s, scores));
+        return .{ .inds = i, .norm_scores = s };
+    }
+};
+
+test "moe: a layer's router hook decides its routes in mlp and mlpRoute, and a declining hook leaves the stock route" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const testing = std.testing;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(17);
+    const D = 128;
+    const E = 8;
+    const S = 6;
+    var router: [D * E]f32 = @splat(0);
+    for (&router) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    var bias: [E]f32 = @splat(0);
+    const unbuilt: Bank = .{ .w = .{ .ctx = null }, .qp = .{ .bits = 4, .group_size = 64 } };
+    var w: Moe.Weights = .{
+        .router = .{ .w = try g.astype(try g.fromSlice(f32, &router, &.{ D, E }), .bfloat16) },
+        .route = .{ .sigmoid_bias = .{ .expert_bias = try g.fromSlice(f32, &bias, &.{E}), .norm = true, .scale = 2.5 } },
+        .gate = unbuilt,
+        .up = unbuilt,
+        .down = unbuilt,
+        .shared = .{ .gate = try testAffine(&g, &prng, 64, D), .up = try testAffine(&g, &prng, 64, D), .down = try testAffine(&g, &prng, D, 64) },
+        .top_k = 2,
+        .experts = E,
+        .streamed = .{ .routed = RowsSource.of(false), .layer = 0 },
+    };
+    var xb: [S * D]f32 = undefined;
+    for (&xb) |*v| v.* = prng.random().floatNorm(f32);
+    const x = try g.astype(try g.fromSlice(f32, &xb, &.{ 1, S, D }), .bfloat16);
+    const stock = try mlp(&w, &g, x);
+    // routes no stock router gives: experts 7 and 0 on every row, weights 0.75 and 0.25
+    var ib: [S * 2]i32 = undefined;
+    var sb: [S * 2]f32 = undefined;
+    for (0..S) |i| {
+        ib[2 * i] = 7;
+        ib[2 * i + 1] = 0;
+        sb[2 * i] = 0.75;
+        sb[2 * i + 1] = 0.25;
+    }
+    FixedRouter.inds = try g.astype(try g.fromSlice(i32, &ib, &.{ 1, S, 2 }), .uint32);
+    FixedRouter.scores = try g.astype(try g.fromSlice(f32, &sb, &.{ 1, S, 2 }), .bfloat16);
+    w.router_hook = .{ .run = &FixedRouter.run };
+    FixedRouter.calls = 0;
+    FixedRouter.serve = true;
+    const hooked = try mlp(&w, &g, x);
+    try ops.expectBitEqual(hooked, try mlpFinish(&w, &g, x, try routedSum(&w, &g, x, FixedRouter.inds, FixedRouter.scores)));
+    const r = try mlpRoute(&w, &g, x);
+    try ops.expectBitEqual(r.inds, FixedRouter.inds);
+    try ops.expectBitEqual(r.scores, FixedRouter.scores);
+    try testing.expectEqual(@as(u32, 2), FixedRouter.calls);
+    // a hook that declines: mlp is the stock route's, bit for bit
+    FixedRouter.serve = false;
+    try ops.expectBitEqual(try mlp(&w, &g, x), stock);
+    try testing.expectEqual(@as(u32, 3), FixedRouter.calls);
+}
+
+/// A format's bank whose routed sum is row-local (each row's input times its routes' summed weights): `swiglu` alone
+/// is read; the table's other entries are never called.
+const RowLocalFormat = struct {
+    var rows_seen: c_int = 0;
+    fn swiglu(_: *const quant_abi.Weight, _: *const quant_abi.Weight, _: *const quant_abi.Weight, x: quant_abi.Array, _: quant_abi.Array, scores: quant_abi.Array, _: *const quant_abi.Swiglu, _: quant_abi.Stream, out: *quant_abi.Array) callconv(.c) quant_abi.Verdict {
+        const xa: Array = .{ .ctx = x.ctx };
+        const sh = ops.shape(xa);
+        rows_seen = sh[sh.len - 2];
+        const y = rowLocal(xa, .{ .ctx = scores.ctx }) catch return .{ .code = .failed };
+        out.* = .{ .ctx = y.ctx };
+        return .ok;
+    }
+    fn rowLocal(x: Array, scores: Array) !Array {
+        var g = Graph.init(std.testing.allocator, mlx.gpuStream());
+        defer g.deinit();
+        return g.escape(try g.mul(try g.astype(x, .float32), try g.sum(try g.astype(scores, .float32), -1, true)));
+    }
+    fn claims(_: quant_abi.Str, _: quant_abi.Str) callconv(.c) quant_abi.Claim {
+        return .no;
+    }
+    fn validate(_: quant_abi.Str, _: quant_abi.Str, _: *const quant_abi.PackDir) callconv(.c) quant_abi.Verdict {
+        return .ok;
+    }
+    fn bill(_: quant_abi.Str, _: quant_abi.Str, _: u64) callconv(.c) u64 {
+        return 0;
+    }
+    fn open(_: *quant_abi.LoadCtx) callconv(.c) quant_abi.Verdict {
+        return .ok;
+    }
+    fn close(_: *quant_abi.LoadCtx) callconv(.c) void {}
+    fn load(_: *const quant_abi.LoadCtx, _: quant_abi.Str, _: u32, _: *quant_abi.Weight) callconv(.c) quant_abi.Verdict {
+        return .ok;
+    }
+    fn release(_: *quant_abi.Weight) callconv(.c) void {}
+    fn matmul(_: *const quant_abi.Weight, _: quant_abi.Array, _: quant_abi.Stream, _: *quant_abi.Array) callconv(.c) quant_abi.Verdict {
+        return .{ .code = .failed };
+    }
+    fn moeCall(_: *const quant_abi.Weight, _: quant_abi.Array, _: quant_abi.Array, _: quant_abi.Array, _: bool, _: quant_abi.Stream, _: *quant_abi.Array) callconv(.c) quant_abi.Verdict {
+        return .{ .code = .failed };
+    }
+    const table: quant_abi.QuantTable = .{ .name = .of("row-local"), .claims = &claims, .validate = &validate, .bill = &bill, .open = &open, .close = &close, .load_tensor = &load, .load_bank = &load, .release = &release, .matmul = &matmul, .moe = &moeCall, .swiglu = &swiglu };
+};
+
+test "moe: mlpLastRow over a format bank that sums each row by itself is mlp's last row, the bank called on that row alone" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const testing = std.testing;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(23);
+    const D = 128;
+    const E = 8;
+    const S = 5;
+    var router: [D * E]f32 = @splat(0);
+    for (&router) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    var bias: [E]f32 = @splat(0);
+    for (&bias) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    const unbuilt: Bank = .{ .w = .{ .ctx = null }, .qp = .{ .bits = 4, .group_size = 64 } };
+    var w: Moe.Weights = .{
+        .router = .{ .w = try g.astype(try g.fromSlice(f32, &router, &.{ D, E }), .bfloat16) },
+        .route = .{ .sigmoid_bias = .{ .expert_bias = try g.fromSlice(f32, &bias, &.{E}), .norm = true, .scale = 2.5 } },
+        .gate = unbuilt,
+        .up = unbuilt,
+        .down = unbuilt,
+        .shared = .{ .gate = try testAffine(&g, &prng, 64, D), .up = try testAffine(&g, &prng, 64, D), .down = try testAffine(&g, &prng, D, 64) },
+        .top_k = 2,
+        .experts = E,
+        .format_banks = .{ .table = &RowLocalFormat.table, .gate = .{}, .up = .{}, .down = .{} },
+    };
+    var xb: [S * D]f32 = undefined;
+    for (&xb) |*v| v.* = prng.random().floatNorm(f32);
+    const x = try g.astype(try g.fromSlice(f32, &xb, &.{ 1, S, D }), .bfloat16);
+    const full = try mlp(&w, &g, x);
+    const last = (try mlpLastRow(&w, &g, x, 8)).?;
+    try testing.expectEqual(@as(c_int, 1), RowLocalFormat.rows_seen);
+    try ops.expectBitEqual(last, try g.sliceAxis(full, 1, S - 1, S));
+    // wider than the decode chain's rows, one row, or another arm: the caller runs mlp
+    try testing.expect((try mlpLastRow(&w, &g, x, 4)) == null);
+    try testing.expect((try mlpLastRow(&w, &g, try g.sliceAxis(x, 1, 0, 1), 8)) == null);
+    w.route_scale = try g.fromSlice(f32, &bias, &.{E});
+    try testing.expect((try mlpLastRow(&w, &g, x, 8)) == null);
+}
