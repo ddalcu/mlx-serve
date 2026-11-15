@@ -33,6 +33,8 @@ const statePerTokenBilled = @import("bills.zig").statePerTokenBilled;
 const retainedSsmCheckpointBytes = @import("bills.zig").retainedSsmCheckpointBytes;
 const sessionBytesPerToken = @import("bills.zig").sessionBytesPerToken;
 const perRequestPrefillChunkEnabled = @import("prefill_chunk.zig").perRequestPrefillChunkEnabled;
+const streamedHotCacheCapped = @import("glm5_bill.zig").streamedHotCacheCapped;
+const GLM5_HOT_CACHE_BYTES = @import("glm5_bill.zig").GLM5_HOT_CACHE_BYTES;
 
 const PREFIX_CACHE_MEM_DEFAULT = http_server.PREFIX_CACHE_MEM_DEFAULT;
 
@@ -276,9 +278,18 @@ pub const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// The ungated arm's ask. A sliding-ring entry cannot be trimmed below its ring (`ringFloor`) and a
 /// hybrid entry restores only at a checkpoint, so a budget under one session keeps a stale prefix of
 /// the longest conversations: those ask for one session at the working context.
+/// A streamed bank's hot cache is held to `GLM5_HOT_CACHE_BYTES` (`streamedHotCacheCapped`) since no live read evicts
+/// beside a streamed request: every ask there, an operator's and an uncapped 0 included.
 fn ungatedHotCacheAsk(config: *const model_mod.ModelConfig, requested: u64, explicit: bool, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    if (!config.slidingRing() and !config.hasSsmLayers()) return requested;
-    return defaultPrefixCacheAsk(requested, explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, chunk));
+    const ask = if (!config.slidingRing() and !config.hasSsmLayers())
+        requested
+    else
+        defaultPrefixCacheAsk(requested, explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, chunk));
+    if (!streamedHotCacheCapped(config)) return ask;
+    // Decode-billed is where the cap is safe: the host's decode room holds this term (`glm5DecodeMemoryNeeded`). A
+    // streamed plugin that prices its own prompt (`Bill.prefill_bytes`) gets no such room, so its own bill must hold
+    // the term twice (the entry and an oversized commit's copy, made before the entry is evicted).
+    return if (ask == 0) GLM5_HOT_CACHE_BYTES else @min(ask, GLM5_HOT_CACHE_BYTES);
 }
 
 pub fn legacyPrefixCacheAsk() u64 {
@@ -330,6 +341,8 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         if (revise.quiet) return clamped;
         if (ask > 0 and clamped < ask) {
             log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ ask >> 20, clamped >> 20 });
+        } else if (streamedHotCacheCapped(config)) {
+            log.info("[hot-cache] budget {d} MB (a streamed bank holds the hot cache at {d} MB)\n", .{ clamped >> 20, GLM5_HOT_CACHE_BYTES >> 20 });
         } else if (ask != requested) {
             log.info("[hot-cache] budget {d} MB (one session at the working context: a sliding-ring or hybrid entry restores whole or at a checkpoint)\n", .{clamped >> 20});
         } else if (requested == 0) {
@@ -675,6 +688,7 @@ test "ungatedHotCacheAsk: a streamed bank's GLM or Ling asks no more than the ho
         ling.deinit(t.allocator);
     }
     ling.plugin = &ling_binding;
+    try t.expect(@import("glm5_bill.zig").decodeBilled(&ling));
     try t.expectEqual(@as(u64, 368_640), ling.kvBytesPerToken());
     try t.expect(oneSessionEntryBytes(&ling, 16, 32_768, 1024) > term);
     try t.expectEqual(term, ungatedHotCacheAsk(&ling, PREFIX_CACHE_MEM_DEFAULT, false, 16, 32_768, 1024));

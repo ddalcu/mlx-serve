@@ -3,6 +3,7 @@
 //! until `Bill.prefill_bytes` carries max_tokens and the warm prefix.
 
 const std = @import("std");
+const abi = @import("../../../abi/plugin.zig");
 const cache_mod = @import("../kv/cache.zig");
 const prefill_dq_gemm = @import("../../../sdk/blocks/linear/prefill_dq_gemm.zig");
 const verify_qmm_nax = @import("../../../sdk/blocks/linear/verify_qmm_nax.zig");
@@ -70,8 +71,33 @@ pub fn glm5PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, m
 }
 
 /// The host's hot prefix cache at its default cap: it keeps a request's decode-end checkpoint beside the decode, and
-/// neither bill names it otherwise.
+/// neither bill names it otherwise. A streamed bank's hot-cache budget never passes it (`streamedHotCacheCapped`).
 pub const GLM5_HOT_CACHE_BYTES: u64 = 2048 << 20;
+
+/// Whether the engine bills this model's decode phase apart (`LoadCtx.stream_room_decode`): a built-in GLM on a streamed
+/// plugin that prices no prompt of its own, and Ling (bailing_hybrid), which runs GLM's trunk (KDA layers, attention
+/// caches, the same checkpoints) though its plugin prices its prompt. Another plugin that prices its own prompt keeps
+/// one room.
+pub fn decodeBilled(config: *const model_mod.ModelConfig) bool {
+    const b = config.plugin orelse return false;
+    const ling = std.mem.eql(u8, config.model_type, "bailing_hybrid");
+    if (!b.parsed.caps.streamed_weights or !(config.isGlm5() or ling)) return false;
+    var bill: abi.Bill = .{};
+    b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
+    return bill.prefill_bytes == null or ling;
+}
+
+/// Whether a streamed plugin's hot cache is held to `GLM5_HOT_CACHE_BYTES` (`ungatedHotCacheAsk`): admission bills a
+/// streamed pack at 0, so nothing evicts beside its next request. A plugin that commits through its module
+/// (`CacheHooks.aux`, DeepSeek-V4.1) sizes its own bank and makes its cache's room before it appends
+/// (`makeModuleRoom`), and keeps its own accounting.
+pub fn streamedHotCacheCapped(config: *const model_mod.ModelConfig) bool {
+    if (decodeBilled(config)) return true;
+    const b = config.plugin orelse return false;
+    if (!b.parsed.caps.streamed_weights) return false;
+    const hooks = b.table.cache;
+    return hooks.size < @sizeOf(abi.CacheHooks) or hooks.aux == null;
+}
 
 /// GLM-5's decode-phase bill at the same cell (`LoadCtx.stream_room_decode`): the prompt's KV and checkpoints, a
 /// generation's growth and the runtime floor at the prompt bill's 5/4, plus the hot prefix cache. No prefill scratch:

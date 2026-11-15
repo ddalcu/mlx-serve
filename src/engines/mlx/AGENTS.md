@@ -52,6 +52,8 @@ Memory bills + admission:
 Prefix cache (RAM + SSD):
 - Disabled prefix retention reserves zero bytes in context sizing, chunk sizing and reported cache budgets; the configured byte cap is not proof that the cache exists.
 - **The hot-cache budget is CLAMPED at load, a HARD cap, and FOLLOWS residency** (#364, `clampedPrefixCacheMem`, `reviseHotCacheBudgets`). Guard: `tests/test_prefix_cache_budget_revisit.sh`.
+- **A streamed bank's hot cache stays in the term its decode room holds** (`GLM5_HOT_CACHE_BYTES`, `streamedHotCacheCapped`;
+  a module-path plugin keeps its own): admission bills a streamed pack at 0, so nothing evicts beside the next request.
 - **An oversized candidate is TRIMMED to the longest restorable prefix** (#330, `trimLenForBudget`, `trimmedCopy` a real copy; QSA bank priced via `trimmedCheckpointBytes`); the replace path sheds inherited checkpoints first; commit owns `ssm_cps` on EVERY outcome.
 - **A disk restore leaves the first grow's ROOM** (`DiskTier.restoreKvInto` + `KVCache.nextCapacity`): an exact-size restore made the re-forwarded token grow every layer (a grow COPIES), and the honest bill refused a restored 38k prompt on 16 GB.
 - **A restored cache shares its donor's buffer; a SHORT restore regrows from the prefix** (`KVCache.restoredOversized`, #492), never copies the donor's capacity.

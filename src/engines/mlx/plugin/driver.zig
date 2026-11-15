@@ -38,6 +38,7 @@ const hadamard = @import("../../../sdk/quant/hadamard/format.zig");
 const intree = @import("intree.zig");
 const distributed = @import("../cluster/distributed.zig");
 const weights_load = @import("../../../sdk/weights/load.zig");
+const decodeBilled = @import("../admission/glm5_bill.zig").decodeBilled;
 const outside_model = @import("../../../sdk/quant/outside_model.zig");
 const group = @import("../ssm/group.zig");
 const entry_mod = @import("../ssm/entry.zig");
@@ -180,18 +181,6 @@ fn streamRoom(config: *const ModelConfig) u64 {
 fn streamRoomDecode(config: *const ModelConfig) u64 {
     return streamRoomDecodeAt(config, @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling(),
         @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
-}
-
-/// Whether the engine bills this model's decode phase apart: a built-in GLM on a streamed plugin that prices no prompt
-/// of its own, and Ling (bailing_hybrid), which runs GLM's trunk (KDA layers, attention caches, the same checkpoints)
-/// though its plugin prices its prompt. Another plugin that prices its own prompt keeps one room.
-fn decodeBilled(config: *const ModelConfig) bool {
-    const b = config.plugin orelse return false;
-    const ling = std.mem.eql(u8, config.model_type, "bailing_hybrid");
-    if (!b.parsed.caps.streamed_weights or !(config.isGlm5() or ling)) return false;
-    var bill: abi.Bill = .{};
-    b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
-    return bill.prefill_bytes == null or ling;
 }
 
 fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
