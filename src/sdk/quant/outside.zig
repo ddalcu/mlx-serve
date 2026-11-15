@@ -229,6 +229,7 @@ pub const Bank = struct {
             .read_ahead_fn = C.readAhead,
             .decode_ids = b.decode_ids,
             .exact_rows = b.size >= @offsetOf(abi.Bank, "exact_rows") + @sizeOf(bool) and b.exact_rows,
+            .rows_independent = b.size >= @offsetOf(abi.Bank, "rows_independent") + @sizeOf(bool) and b.rows_independent,
             .source_shared = if (offers(b, .rows_shared)) C.rowsShared else null,
             .source_expand = if (offers(b, .rows_expand)) C.expand(.rows_expand) else null,
             .source_expand_into = if (offers(b, .rows_expand_into)) C.expand(.rows_expand_into) else null,
