@@ -40,6 +40,7 @@ const QuantMode = @FieldType(Linear, "mode");
 const QuantParams = params.QuantParams;
 const Config = config.Config;
 const gpa = std.heap.c_allocator;
+const VerifyRows = @import("kda.zig").VerifyRows;
 
 /// One DeepSeek-V4 Sinkhorn hyper-connection (`attn_hc` / `ffn_hc`), f32 tables.
 pub const Mhc = struct {
@@ -193,6 +194,8 @@ pub const Model = struct {
     /// Set for one forward whose rows must each carry a one-row decode step's bytes (bailing_hybrid's exact verify):
     /// `mm` runs rows in calls of their projection's row-exact width, KDA, MLA and the MoE row by row.
     serial_rows: bool = false,
+    /// A model plugin's own rows for a serial-rows verify's KDA layers, set after load; null: the trunk steps each row.
+    kda_verify_rows: ?VerifyRows = null,
 
     pub fn deinit(m: *Model) void {
         if (m.experts) |*x| x.close();
