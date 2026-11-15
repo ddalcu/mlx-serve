@@ -185,6 +185,8 @@ test "deepseek_v41 config: the release pack parses with its sources, Engram, DSp
     try testing.expect(c.dsv41_vision and p.caps.images and !p.caps.spec_rollback);
     try testing.expect(p.caps.slot_state and p.caps.batches_decode and p.caps.owns_decode_state);
     try testing.expect(p.caps.prefix_cache);
+    // Every pass that writes the residual stream ablates (plugin.zig, ablation.zig).
+    try testing.expect(p.caps.ablation);
     try testing.expectEqual(@as(u32, 129264), p.placeholder_ids.image);
     try testing.expectEqual(abi.ThinkingDefault.on, p.chat.thinking_default);
     try testing.expectEqual(abi.EffortVocab.dsv41, p.chat.effort_vocab);
