@@ -246,6 +246,14 @@ test "abi quant: a table's row-exact matmul width is read only where its size re
     try testing.expectEqual(@as(u32, 0), t.exactRows());
 }
 
+test "abi quant: a bank's independent prompt rows are declared after every earlier member" {
+    // Appended: a bank built before it ends at `rows_independent`, and the host reads it as not declared.
+    try testing.expect(@offsetOf(Bank, "rows_independent") > @offsetOf(Bank, "exact_rows"));
+    try testing.expect(@offsetOf(Bank, "rows_independent") > @offsetOf(Bank, "meters"));
+    const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
+    try testing.expect(!b.rows_independent);
+}
+
 test "abi quant: a post-SiLU SwiGLU limit reaches only a table that declares it" {
     var t: QuantTable = undefined;
     t.size = @sizeOf(QuantTable);

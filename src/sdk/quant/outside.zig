@@ -401,13 +401,19 @@ const ToyBank = struct {
         out.* = .of("[stream-stats] toy: routes=1");
     }
     fn open(_: *const abi.LoadCtx, geo: *const abi.BankGeometry, _: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
-        out.* = .{ .ctx = @constCast(@ptrCast(geo.gates.?)), .close = &close, .about = .of("toy"), .decode_ids = 48, .rows = &routedRows, .settle = &ok0, .phase = &phase, .read_ahead = &readAhead, .rows_shared = &shared, .meters = &meters, .exact_rows = true };
+        out.* = .{ .ctx = @constCast(@ptrCast(geo.gates.?)), .close = &close, .about = .of("toy"), .decode_ids = 48, .rows = &routedRows, .settle = &ok0, .phase = &phase, .read_ahead = &readAhead, .rows_shared = &shared, .meters = &meters, .exact_rows = true, .rows_independent = true };
         return .ok;
     }
     /// A bank built before its optional members: whatever lies past its `size` is not read.
     fn openOlder(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
         const v = open(ctx, geo, budget, out);
         out.size = @offsetOf(abi.Bank, "rows_shared");
+        return v;
+    }
+    /// A bank built before `rows_independent`: its size ends there, so the flag it wrote is not read.
+    fn openBeforeIndependent(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
+        const v = open(ctx, geo, budget, out);
+        out.size = @offsetOf(abi.Bank, "rows_independent");
         return v;
     }
     fn openShort(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
@@ -455,6 +461,7 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     const r = b.routed();
     try testing.expectEqual(@as(usize, 48), r.decode_ids);
     try testing.expect(r.exact_rows);
+    try testing.expect(r.rows_independent);
     try testing.expect(r.source_shared != null and r.source_expand == null and r.next_fn == null);
     try testing.expectEqualStrings("[stream-stats] toy: routes=1", b.meters());
     const none: mlx.mlx_array = .{ .ctx = null };
@@ -473,9 +480,15 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     table.open_bank = &ToyBank.openOlder;
     const older = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
     try testing.expect(older.routed().source_shared == null and !older.routed().exact_rows);
+    try testing.expect(!older.routed().rows_independent);
     try testing.expectEqualStrings("", older.meters());
     older.close();
+    // A bank that ends just before the flag keeps every earlier member and reads the flag as not declared.
+    table.open_bank = &ToyBank.openBeforeIndependent;
+    const before = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
+    try testing.expect(before.routed().exact_rows and !before.routed().rows_independent);
+    before.close();
     table.open_bank = &ToyBank.openShort;
     try testing.expectError(error.OutsideQuantRefused, f.openBank(geo, .{ .prompt = 1000, .decode = 1000 }));
-    try testing.expectEqual(@as(u32, 3), ToyBank.closed); // the refused bank is closed too
+    try testing.expectEqual(@as(u32, 4), ToyBank.closed); // the refused bank is closed too
 }
