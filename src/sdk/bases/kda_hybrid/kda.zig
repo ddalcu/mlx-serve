@@ -145,7 +145,23 @@ pub const Stages = struct {
     /// Verify rows on a GPU stream: the capture recurrence's output, final state and every row's state (what a partial
     /// accept's rollback reads) in place of the stock capture kernel.
     verify_capture: ?*const fn (s: mlx.mlx_stream, in: CaptureIn) anyerror!?CaptureOut = null,
+    /// Verify rows with a 4-tap conv: the conv window, the scaled heads, beta and the capture's conv input in place of
+    /// the composed conv, q/k norms, scales and beta sigmoid. Asked before the conv, so no slot state has changed then.
+    verify_prework: ?*const fn (s: mlx.mlx_stream, in: PreworkIn) anyerror!?PreworkOut = null,
+    /// Prompt rows and verify rows off the fused prework: the gated norm's flat output `[B, S, hv dv]` (the out
+    /// projection's input) in place of the composed `rms_norm(y) * sigmoid(z)`.
+    epilogue: ?*const fn (s: mlx.mlx_stream, in: EpilogueIn) anyerror!?Array = null,
 };
+
+/// The verify prework's operands, borrowed: as `PrologueIn`, with the beta projection `b` and the row count.
+pub const PreworkIn = struct { qkv: Array, b: Array, conv_state: ?Array, conv_w: Array, q_scale: Array, k_scale: Array, qk_eps: f32, hk: c_int, dk: c_int, hv: c_int, dv: c_int, taps: c_int, rows: c_int };
+/// New references the trunk owns: q, k `[1, S, hk, dk]`, v `[1, S, hv, dv]`, beta, the conv window after the last row
+/// and the conv input the capture keeps (`Entry.spec_conv_input`).
+pub const PreworkOut = struct { q: Array, k: Array, v: Array, beta: Array, window: Array, conv_input: Array };
+
+/// The epilogue's operands, borrowed: the recurrence's y `[B, S, hv, dv]`, the z projection, the norm's weight and its
+/// 0-dim epsilon; `verify`: the rows are a verify's.
+pub const EpilogueIn = struct { y: Array, z: Array, norm_w: Array, eps: Array, hv: c_int, dv: c_int, batch: c_int, rows: c_int, verify: bool };
 
 /// The prologue's operands, borrowed for the call: `[1, S, C]` q|k|v (`C = 2 hk dk + hv dv`), the conv window before
 /// the first row (null: a cold slot), the depthwise conv's weight, the 0-dim q and k scales, the q/k norm's epsilon.
@@ -435,6 +451,25 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         k_scaled = p.k;
         v_heads = p.v;
     }
+    // A model's own verify prework: beta rides `beta_fused`; the stock fused epilogue stays the fused prework's.
+    const vprework: ?PreworkOut = if (verify_rows and kernel == 4) if (stages.verify_prework) |f|
+        try f(s, .{ .qkv = qkv, .b = b_proj, .conv_state = if (e.initialized) e.conv_state else null, .conv_w = la.conv_w, .q_scale = inv_scale_sq, .k_scale = inv_sqrt_sc, .qk_eps = qkNormEps(m), .hk = num_k_heads, .dk = dk, .hv = num_v_heads, .dv = dv, .taps = kernel, .rows = seq_len })
+    else
+        null else null;
+    if (vprework) |p| {
+        free(e.conv_state);
+        e.conv_state = p.window;
+        e.initialized = true;
+        free(e.spec_conv_input);
+        e.spec_conv_input = p.conv_input;
+        _ = mlx.mlx_array_free(q_scaled);
+        _ = mlx.mlx_array_free(k_scaled);
+        _ = mlx.mlx_array_free(v_heads);
+        q_scaled = p.q;
+        k_scaled = p.k;
+        v_heads = p.v;
+        beta_fused = p.beta;
+    }
     if (kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
         kernel == 4 and (e.initialized or prefill_fused))
     blk: {
@@ -490,7 +525,7 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         beta_fused = pre.beta;
     }
 
-    if (!fused_prework and prologue == null) {
+    if (!fused_prework and prologue == null and vprework == null) {
         var g = ops.Graph.init(std.heap.c_allocator, s);
         defer g.deinit();
         const conv = try conv1d.run(&g, qkv, if (e.initialized) e.conv_state else null, la.conv_w, null, batch, conv_dim, kernel, true);
@@ -646,6 +681,12 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         if (try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)) |flat|
             return outProj(m, la, flat, given != null);
     }
+    // A model's own epilogue (`!fused_prework` holds on these rows already: kept to say so).
+    if (!fused_prework and (prompt_rows or verify_rows)) if (stages.epilogue) |f| {
+        if (m.kda.eps.ctx == null) m.kda.eps = mlx.mlx_array_new_float(c.rms_norm_eps);
+        if (try f(s, .{ .y = y_bthd, .z = z_proj, .norm_w = la.norm_w, .eps = m.kda.eps, .hv = num_v_heads, .dv = dv, .batch = batch, .rows = seq_len, .verify = verify_rows })) |flat|
+            return outProj(m, la, flat, given != null);
+    };
     var z_heads = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(z_heads);
     try mlx.check(mlx.mlx_reshape(&z_heads, z_proj, &y_shape, 4, s));
