@@ -23,6 +23,7 @@ const prefillDequantWeightBytes = @import("bills.zig").prefillDequantWeightBytes
 const prefillFfnWidth = @import("bills.zig").prefillFfnWidth;
 const retainedSsmCheckpointBytes = @import("bills.zig").retainedSsmCheckpointBytes;
 const prefillNeededAtChunk = @import("prefill_chunk.zig").prefillNeededAtChunk;
+const mtpHeadBilled = @import("bills.zig").mtpHeadBilled;
 
 /// Bytes per (query, key pool) GLM's DSA indexer holds while it selects (`selectRows`):
 /// f32 scores, their negation and the argpartition result.
@@ -78,10 +79,27 @@ pub const GLM5_HOT_CACHE_BYTES: u64 = 2048 << 20;
 /// `decode_room`. Unset (or a Bill that predates it) is the name rule: a built-in GLM on a streamed plugin that prices
 /// no prompt of its own, and Ling (bailing_hybrid), which runs GLM's trunk though its plugin prices its prompt.
 pub fn decodeBilled(config: *const model_mod.ModelConfig) bool {
+    var bill: abi.Bill = .{};
+    return streamedBill(config, &bill) and decodeRoomOf(config, &bill);
+}
+
+/// Whether a decode-billed request reserves its whole KV at its prompt (`reservedPrefillTokens`) and its decode bill
+/// prices that KV once: its bill's `reserves_request`.
+pub fn reservesRequest(config: *const model_mod.ModelConfig) bool {
+    var bill: abi.Bill = .{};
+    if (!streamedBill(config, &bill) or !decodeRoomOf(config, &bill)) return false;
+    return if (bill.billFlags()) |f| f.reserves_request else false;
+}
+
+/// A streamed plugin's bill at the rooms' cell into `out`; false for a model that does not stream.
+fn streamedBill(config: *const model_mod.ModelConfig, out: *abi.Bill) bool {
     const b = config.plugin orelse return false;
     if (!b.parsed.caps.streamed_weights) return false;
-    var bill: abi.Bill = .{};
-    b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
+    b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, out);
+    return true;
+}
+
+fn decodeRoomOf(config: *const model_mod.ModelConfig, bill: *const abi.Bill) bool {
     const room: abi.DecodeRoom = if (bill.billFlags()) |f| f.decode_room else .by_name;
     return switch (room) {
         .billed => true,
@@ -106,6 +124,7 @@ pub fn streamedHotCacheCapped(config: *const model_mod.ModelConfig) bool {
 /// generation's growth and the runtime floor at the prompt bill's 5/4, plus the hot prefix cache. No prefill scratch:
 /// the phase change frees it before decode's rows grow.
 pub fn glm5DecodeMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64) u64 {
+    if (reservesRequest(config)) return reservedDecodeMemoryNeeded(config, seq, max_tokens, kv_bits, chunk);
     const ctx: u64 = getEffectiveContextLength(config);
     const output = @min(max_tokens, cache_mod.KVCache.RESERVE_GEN_HEADROOM, if (ctx > 0) ctx -| seq else max_tokens);
     const end = seq +| output;
@@ -115,6 +134,30 @@ pub fn glm5DecodeMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, ma
         4 *| config.ssmCheckpointBytes() +| slotFixedKvBytes(config, kv_bits, chunk);
     const decode_growth = output *| kv_tok +| end *| kv_tok +| end *| view_tok;
     return (resident +| decode_growth +| PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4 +| GLM5_HOT_CACHE_BYTES;
+}
+
+/// The decode bill of a request that reserved its whole KV at its prompt (`reservedPrefillTokens`): that KV once, at the
+/// reserved rows, with the MTP head's rows beside it. No decode grow, so no old buffer sits beside the new. The hot
+/// cache holds its resident entry and, while it commits, that entry's copy: two terms.
+fn reservedDecodeMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64) u64 {
+    const rows = generate_mod.reservedPrefillTokens(config, seq, max_tokens, chunk);
+    const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+    const view_tok: u64 = if (kv_bits < 16) glm5DequantWidth(config) else 0;
+    const fixed = retainedSsmCheckpointBytes(config, seq, 0, chunk) +| 4 *| config.ssmCheckpointBytes() +|
+        slotFixedKvBytes(config, kv_bits, chunk);
+    const kv = rows *| (kv_tok +| view_tok +| mtpHeadRowBytes(config));
+    return (fixed +| kv +| PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4 +| 2 *| GLM5_HOT_CACHE_BYTES;
+}
+
+/// Bytes a token takes in the MTP head's own cache, a dense bf16 layer of the head's kind: GLM-5's mtp.0 a DSA layer
+/// (its latent row and the indexer's key and gate), an MLA head (Ling's NextN layer) every head's key and value, any
+/// other one attention layer at the KV heads; 0 without a head the bill counts.
+fn mtpHeadRowBytes(config: *const model_mod.ModelConfig) u64 {
+    const b = config.plugin orelse return 0;
+    if (b.parsed.spec.mtp_layout == .none or !mtpHeadBilled(config)) return 0;
+    if (config.isGlm5()) return (@as(u64, config.dsa_kv_lora_rank) + 2 * @as(u64, config.dsa_index_head_dim)) * 2;
+    if (config.isMla()) return @as(u64, config.num_attention_heads) * (@as(u64, config.mlaQkHeadDim()) + config.mla_v_head_dim) * 2;
+    return 2 * @as(u64, config.num_key_value_heads) * config.head_dim * 2;
 }
 
 // ── tests ──

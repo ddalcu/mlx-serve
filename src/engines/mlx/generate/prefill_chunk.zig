@@ -10,6 +10,9 @@ const WIDE_PREFILL_CHUNK = @import("../generate.zig").WIDE_PREFILL_CHUNK;
 const PrefillCli = @import("../generate.zig").PrefillCli;
 const attn256 = @import("../../../sdk/blocks/attention/attn256.zig");
 const checkpoint = @import("../ssm/checkpoint.zig");
+const glm5_bill = @import("../admission/glm5_bill.zig");
+const getEffectiveContextLength = @import("../admission/context.zig").getEffectiveContextLength;
+const verify_rows_max = @import("init.zig").verify_rows_max;
 
 
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
@@ -351,16 +354,25 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 
 /// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
 /// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
-/// cache; generation headroom is pre-bought only under `longCtxGated`.
+/// cache; generation headroom is pre-bought only under `longCtxGated`. A request whose bill reserves it
+/// (`glm5_bill.reservesRequest`) reserves it all, so its decode never grows.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
     max_tokens: u64,
     chunk: u64,
 ) u64 {
+    if (glm5_bill.reservesRequest(config)) return wholeRequestTokens(seq, max_tokens, getEffectiveContextLength(config));
     const prompt = if (seq > chunk) seq +| chunk else 0;
     if (!config.longCtxGated()) return prompt;
     return @max(prompt, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
+}
+
+/// PURE: the rows a whole request writes: the prompt, its reply held to the context `ctx` (none past it), and the rows
+/// a verify writes past the last token. Not `KVCache.reservedTokens`, which caps the reply and skips a short prompt.
+pub fn wholeRequestTokens(seq: u64, max_tokens: u64, ctx: u64) u64 {
+    const reply = if (ctx > seq) @min(max_tokens, ctx - seq) else 0;
+    return seq +| reply +| verify_rows_max;
 }
 
 /// A prompt checkpoints SSM state at its chunk boundaries, a vision prompt included (it chunks like text, #197):
