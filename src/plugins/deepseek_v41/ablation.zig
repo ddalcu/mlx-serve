@@ -330,23 +330,6 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     const dir_z = try gpa.dupeSentinel(u8, dir, 0);
     defer gpa.free(dir_z);
     if (builtin.os.tag != .windows) _ = std.c.chmod(dir_z, 0o700);
-    var seq = try nextTapSeq(gpa, d, io);
-    var name_buf: [64]u8 = undefined;
-    var name: []const u8 = undefined;
-    var tries: usize = 0;
-    while (tries < 1000) : (tries += 1) {
-        name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
-        const taken = blk: {
-            const f = d.openFile(io, name, .{ .mode = .read_only }) catch |e| switch (e) {
-                error.FileNotFound => break :blk false,
-                else => return e,
-            };
-            f.close(io);
-            break :blk true;
-        };
-        if (!taken) break;
-        seq += 1;
-    } else return error.TapSeqExhausted;
     var header_buf: [256]u8 = undefined;
     const npy = try npyHeader(&header_buf, @intCast(shape[0]), @intCast(shape[1]), @intCast(shape[2]));
     const body = std.mem.sliceAsBytes(data);
@@ -354,10 +337,27 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     defer gpa.free(file_bytes);
     @memcpy(file_bytes[0..npy.len], npy);
     @memcpy(file_bytes[npy.len..], body);
-    if (builtin.os.tag == .windows)
-        try d.writeFile(io, .{ .sub_path = name, .data = file_bytes })
-    else
-        try d.writeFile(io, .{ .sub_path = name, .data = file_bytes, .flags = .{ .permissions = .fromMode(0o600) } });
+    // The name is claimed by an exclusive create, not by a check then a write: two servers sharing the directory race
+    // for `tap-<seq>.npy`, the loser takes the next seq.
+    var seq = try nextTapSeq(gpa, d, io);
+    var name_buf: [64]u8 = undefined;
+    var name: []const u8 = undefined;
+    var tries: usize = 0;
+    while (tries < 1000) : (tries += 1) {
+        name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
+        const flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
+            .{ .exclusive = true }
+        else
+            .{ .exclusive = true, .permissions = .fromMode(0o600) };
+        d.writeFile(io, .{ .sub_path = name, .data = file_bytes, .flags = flags }) catch |e| switch (e) {
+            error.PathAlreadyExists => {
+                seq += 1;
+                continue;
+            },
+            else => return e,
+        };
+        break;
+    } else return error.TapSeqExhausted;
 
     var line: std.Io.Writer.Allocating = .init(gpa);
     defer line.deinit();
@@ -365,10 +365,11 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     const tail = ids[ids.len - @min(ids.len, 8) ..];
     for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
     try line.writer.writeAll("]}\n");
-    var idx = d.openFile(io, "index.jsonl", .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => try d.createFile(io, "index.jsonl", if (builtin.os.tag == .windows) .{} else .{ .permissions = .fromMode(0o600) }),
-        else => return e,
-    };
+    const idx_flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
+        .{ .truncate = false, .lock = .exclusive }
+    else
+        .{ .truncate = false, .lock = .exclusive, .permissions = .fromMode(0o600) };
+    var idx = try d.createFile(io, "index.jsonl", idx_flags);
     defer idx.close(io);
     const end = (try idx.stat(io)).size;
     try idx.writePositionalAll(io, line.written(), end);
