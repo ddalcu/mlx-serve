@@ -378,22 +378,29 @@ pub fn mlpFinish(w: *const Moe.Weights, parent: *Graph, x: Array, sum: Array) !A
     return parent.keep(try g.add(sum, try g.mul(try g.sigmoid(logit), down)));
 }
 
-/// Whether one `routedSum` call may take several prompt spans' rows joined (`rows`: each span's row count, in order)
-/// and give each span its own call's bytes, so `mlpRoute`, one `routedSum` over the joined rows and `mlpFinish` per span
-/// equal `mlp` span by span: the layer's experts are a streamed bank's `.source` arm that declares each prompt row
-/// summed by itself (`Routed.rows_independent`, the bank's `Bank.rows_independent`); every span is a prompt call alone
-/// (more routed ids than `decode_ids`: a decode-lane span gets the decode kernels' bytes on its own call); and no span is
-/// narrow enough for the layer's `fused` arm. MLX-free: a model checks every layer before it joins one.
-pub fn joinServes(w: *const Moe.Weights, rows: []const c_int) bool {
-    if (rows.len < 2 or w.format_banks != null) return false;
+/// Whether a prompt span of `rows` rows may share one `routedSum` call with other such spans and keep its own call's
+/// bytes: the layer's experts are a streamed bank's `.source` arm that declares each prompt row summed by itself
+/// (`Routed.rows_independent`, the bank's `Bank.rows_independent`); the span is a prompt call alone (more routed ids
+/// than `decode_ids`: a decode-lane span gets the decode kernels' bytes on its own call); and it is too wide for the
+/// layer's `fused` arm, so `mlpRoute` serves it. A model joins the spans that pass and runs each other span on its own
+/// call. MLX-free.
+pub fn spanJoins(w: *const Moe.Weights, rows: c_int) bool {
+    if (w.format_banks != null) return false;
     const st = w.streamed orelse return false;
     if (st.routed.math != .source or !st.routed.rows_independent) return false;
-    const k: usize = @intCast(w.top_k);
-    for (rows) |n| {
-        if (n < 1) return false;
-        if (@as(usize, @intCast(n)) * k <= st.routed.decode_ids) return false;
-        if (w.fused) |f| if (n <= f.rows) return false;
-    }
+    if (rows < 1) return false;
+    if (@as(usize, @intCast(rows)) * @as(usize, @intCast(w.top_k)) <= st.routed.decode_ids) return false;
+    if (w.fused) |f| if (rows <= f.rows) return false;
+    return true;
+}
+
+/// Whether one `routedSum` call may take all of several prompt spans' rows joined (`rows`: each span's row count, in
+/// order) and give each span its own call's bytes, so `mlpRoute`, one `routedSum` over the joined rows and `mlpFinish`
+/// per span equal `mlp` span by span: two spans or more, each of which `spanJoins`. MLX-free: a model checks every layer
+/// before it joins one.
+pub fn joinServes(w: *const Moe.Weights, rows: []const c_int) bool {
+    if (rows.len < 2) return false;
+    for (rows) |n| if (!spanJoins(w, n)) return false;
     return true;
 }
 
