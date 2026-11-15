@@ -346,11 +346,18 @@ const Tapped = struct {
         self.tmp.cleanup();
     }
 
-    /// The last prompt forward's file: `[layers + 1, rows, dim]` f32 past its header.
+    /// The last prompt forward's file: `[layers + 1, rows, dim]` f32 past its header. Names come from the directory's
+    /// own index, the way a restart continues it.
     fn lastDump(self: *Tapped, rows: usize) !Peaks {
         const io = std.Io.Threaded.global_single_threaded.io();
-        var name: [32]u8 = undefined;
-        const bytes = try self.tmp.dir.readFileAlloc(io, try std.fmt.bufPrint(&name, "tap-{d:0>6}.npy", .{self.model.tap_seq - 1}), testing.allocator, .limited(1 << 20));
+        const idx = try self.tmp.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(1 << 20));
+        defer testing.allocator.free(idx);
+        const trimmed = std.mem.trimRight(u8, idx, "\r\n");
+        const last = if (std.mem.lastIndexOfScalar(u8, trimmed, '\n')) |i| trimmed[i + 1 ..] else trimmed;
+        const at = std.mem.indexOf(u8, last, "\"file\":\"") orelse return error.NoTapRecord;
+        const rest = last[at + "\"file\":\"".len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse return error.NoTapRecord;
+        const bytes = try self.tmp.dir.readFileAlloc(io, rest[0..end], testing.allocator, .limited(1 << 20));
         defer testing.allocator.free(bytes);
         const dim: usize = self.model.cfg.hidden_size;
         const data = bytes[10 + @as(usize, std.mem.readInt(u16, bytes[8..10], .little)) ..];
