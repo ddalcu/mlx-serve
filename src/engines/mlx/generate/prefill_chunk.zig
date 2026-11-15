@@ -444,9 +444,13 @@ pub const WholePromptPlan = struct {
     }
 };
 
+/// How a prefill's list keeps its checkpoints: `fileCheckpoint`'s cap (0 = none), policy and low anchors.
+pub const CheckpointKeep = struct { max: usize = 0, thin: checkpoint.ThinPolicy = .oldest, low_anchors: usize = 0 };
+
 /// The spans the chunk loop would run over an `n`-token prompt at width `chunk`, ending each where `nextChunkEnd`
-/// does up to the snapshot backoff, then at `n`; and the positions it would checkpoint after (`ssmCapturePos`,
-/// then the backoff point). One forward cannot re-price its width, so every span keeps `chunk`.
+/// does up to the snapshot backoff, then at `n`; and of the positions it would checkpoint after (`ssmCapturePos`,
+/// then the backoff point), the ones its list keeps (`keep`). One forward cannot re-price its width, so every span
+/// keeps `chunk`.
 pub fn wholePromptPlan(
     allocator: std.mem.Allocator,
     n: usize,
@@ -456,6 +460,7 @@ pub fn wholePromptPlan(
     ssm_cp_offset: usize,
     adaptive_width: bool,
     dense_low_grid: bool,
+    keep: CheckpointKeep,
 ) !WholePromptPlan {
     var spans: std.ArrayList(u64) = .empty;
     errdefer spans.deinit(allocator);
@@ -472,6 +477,7 @@ pub fn wholePromptPlan(
     }
     if (want_ssm_cp and loop_end > 0 and (cps.items.len == 0 or cps.items[cps.items.len - 1] != loop_end + ssm_cp_offset))
         try cps.append(allocator, loop_end + ssm_cp_offset);
+    cps.shrinkRetainingCapacity(checkpoint.thinPositions(cps.items, keep.max, keep.thin, keep.low_anchors));
     if (n > loop_end) try spans.append(allocator, n + ssm_cp_offset);
     const span_slice = try spans.toOwnedSlice(allocator);
     errdefer allocator.free(span_slice);
@@ -1150,7 +1156,7 @@ test "wholePromptPlan: a whole-prompt prefill's spans are the chunk loop's ends 
         .{ .n = 20_000, .want = true, .stride = 16_384, .offset = 0, .dense = true, .spans = &.{ 4096, 8192, 12_288, 16_384, 19_969, 20_000 }, .cps = &.{ 8192, 16_384, 19_969 } },
     };
     for (cases) |c| {
-        var p = try wholePromptPlan(testing.allocator, c.n, 4096, c.want, c.stride, c.offset, false, c.dense);
+        var p = try wholePromptPlan(testing.allocator, c.n, 4096, c.want, c.stride, c.offset, false, c.dense, .{});
         defer p.deinit(testing.allocator);
         try testing.expectEqualSlices(u64, c.spans, p.spans);
         try testing.expectEqualSlices(u64, c.cps, p.checkpoints);
@@ -1161,7 +1167,7 @@ test "wholePromptPlan: a whole-prompt prefill's spans are the chunk loop's ends 
 /// `fileCheckpoint` (`max`, `thin`, `anchors`), as the chunk loop files them.
 fn expectPlanKeeps(n: usize, chunk: usize, stride: usize, offset: usize, dense: bool, max: usize, thin: checkpoint.ThinPolicy, anchors: usize) !void {
     const a = testing.allocator;
-    var all = try wholePromptPlan(a, n, chunk, true, stride, offset, false, dense);
+    var all = try wholePromptPlan(a, n, chunk, true, stride, offset, false, dense, .{});
     defer all.deinit(a);
     var list: std.ArrayList(checkpoint.SSMCheckpoint) = .empty;
     defer {
@@ -1169,7 +1175,7 @@ fn expectPlanKeeps(n: usize, chunk: usize, stride: usize, offset: usize, dense: 
         list.deinit(a);
     }
     for (all.checkpoints) |pos| try checkpoint.fileCheckpoint(a, &list, .{ .pos = @intCast(pos), .layers = &.{} }, max, thin, anchors);
-    var kept = try wholePromptPlan(a, n, chunk, true, stride, offset, false, dense);
+    var kept = try wholePromptPlan(a, n, chunk, true, stride, offset, false, dense, .{ .max = max, .thin = thin, .low_anchors = anchors });
     defer kept.deinit(a);
     try testing.expectEqual(list.items.len, kept.checkpoints.len);
     for (list.items, kept.checkpoints) |cp, pos| try testing.expectEqual(@as(u64, cp.pos), pos);
@@ -1184,7 +1190,7 @@ test "wholePromptPlan: its checkpoints are the ones the prefill's list keeps" {
     };
     // A second turn extending the first restores at the first's last checkpoint and plans its tail from there.
     for ([_][2]usize{ .{ 1536, 8192 }, .{ 256, 256 } }) |cs| {
-        var first = try wholePromptPlan(testing.allocator, 18_380, cs[0], true, cs[1], 0, false, false);
+        var first = try wholePromptPlan(testing.allocator, 18_380, cs[0], true, cs[1], 0, false, false, .{ .max = 16 });
         defer first.deinit(testing.allocator);
         const at: usize = @intCast(first.checkpoints[first.checkpoints.len - 1]);
         for ([_]usize{ 4_000, 40_000 }) |more| try expectPlanKeeps(18_380 + more - at, cs[0], cs[1], at, false, 16, .oldest, 0);
@@ -1194,11 +1200,11 @@ test "wholePromptPlan: its checkpoints are the ones the prefill's list keeps" {
 // Bar: 5,000 tokens at chunk and stride 64 plan 70 checkpoints; the pass is handed the list's keep over the same spans.
 test "wholePromptPlan: a plan of more than 64 checkpoints hands the pass only the ones the list keeps, over the same spans" {
     const a = testing.allocator;
-    var all = try wholePromptPlan(a, 5_000, 64, true, 64, 0, false, false);
+    var all = try wholePromptPlan(a, 5_000, 64, true, 64, 0, false, false, .{});
     defer all.deinit(a);
     try testing.expectEqual(@as(usize, 70), all.checkpoints.len);
     for ([_]usize{ 0, 4, 16 }) |max| for ([_]checkpoint.ThinPolicy{ .oldest, .min_span_recency }) |thin| for ([_]usize{ 0, 2 }) |anchors| {
-        var kept = try wholePromptPlan(a, 5_000, 64, true, 64, 0, false, false);
+        var kept = try wholePromptPlan(a, 5_000, 64, true, 64, 0, false, false, .{ .max = max, .thin = thin, .low_anchors = anchors });
         defer kept.deinit(a);
         try testing.expectEqualSlices(u64, all.spans, kept.spans);
         try testing.expectEqual(if (max == 0) all.checkpoints.len else max, kept.checkpoints.len);
