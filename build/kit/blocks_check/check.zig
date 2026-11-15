@@ -42,5 +42,5 @@ comptime {
     touch(kit.log, 2);
     touch(kit.foreign, 2);
     touch(kit.streamed, 1);
-    inline for (comptime std.meta.declarations(steel)) |name| _ = @field(steel, name);
+    for (std.meta.declarations(steel)) |name| _ = @field(steel, name);
 }
