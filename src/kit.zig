@@ -30,6 +30,12 @@ pub const ane = struct {
 /// The MLX bindings `blocks` are written on: their `mlx_array` and `mlx_stream` are `{ ctx }` like mlx-c's, so a
 /// plugin converts at the call (`.{ .ctx = x.ctx }`).
 pub const mlx = @import("mlx/ffi.zig");
+/// The `Graph` the blocks build their layers in (it owns every array it makes until it ends; `call` runs any mlx-c op),
+/// and the array helpers beside it (`materializedOwnedCopy`, the axis views and concatenations).
+pub const mlx_ops = @import("mlx/ops.zig");
+pub const mlx_array = @import("mlx/array.zig");
+/// The server's leveled log: a plugin's lines go to stderr and the server's log file like the blocks' own.
+pub const log = @import("sdk/util/log.zig");
 /// The expert stream (`sdk/weights/streamed.zig`): routed experts read from SSD into slot rows, its residency policy and
 /// read pool, for a plugin's own bank format (`expert.stream.StreamOf` over the plugin's bank) or an MLX pack's experts
 /// as downloaded (`Streamed.openPack`). macOS only. The read pool is C a plugin compiles in (`build.zig`
