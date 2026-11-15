@@ -1056,6 +1056,8 @@ pub const ModelConfig = struct {
     /// memory estimate that sizes a KV cache reads this one helper so the
     /// auto-context sizer and the prefill admission guard cannot disagree.
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
+        const declared = declaredKvBytes(self);
+        if (declared > 0) return declared;
         // DeepSeek-V4.1 grows only its KV sources' compressed latents and index
         // keys (bf16); the window is a fixed ring per slot.
         if (self.isDsv41()) {
