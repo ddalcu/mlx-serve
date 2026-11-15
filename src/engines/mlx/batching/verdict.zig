@@ -701,3 +701,24 @@ test "a streamed bank's slot is exclusive on GLM and Ling; unstreamed, or a plug
         try testing.expect(!slotExclusiveDecode(slot));
     }
 }
+
+test "a streamed bank's slot stays exclusive when its plugin also keeps per-slot state" {
+    // Bar: the streamed-bank rule is read before `slot_state`, which would otherwise interleave the slots.
+    const abi = @import("../../../abi/plugin.zig");
+    var table: abi.ModelTable = undefined;
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true, .slot_state = true } } };
+    const xfm = try testing.allocator.create(transformer_mod.Transformer);
+    defer testing.allocator.destroy(xfm);
+    xfm.plugin = null;
+    xfm.config = .{ .plugin = &binding };
+    const lm = try testing.allocator.create(model_registry_mod.LoadedModel);
+    defer testing.allocator.destroy(lm);
+    lm.transformer = xfm;
+    lm.mtp = null;
+    const slot = try testing.allocator.create(Slot);
+    defer testing.allocator.destroy(slot);
+    slot.model = lm;
+    slot.enable_mtp = false;
+    slot.legacy_gen = null;
+    try testing.expect(slotExclusiveDecode(slot));
+}
