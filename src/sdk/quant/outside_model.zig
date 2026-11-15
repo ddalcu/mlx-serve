@@ -136,8 +136,8 @@ pub const Fit = struct {
     decode_room: u64,
     /// Growth of the box's memory outside the server between the load and the peak (a calibration's allowance).
     inuse_margin: u64 = 1 << 30,
-    /// The bills' growth from the calibration's evidence (`Calibration.evidence`) to the server's context limit
-    /// (`LoadCtx.streamGrowth`).
+    /// The bills' growth from the calibration's evidence (`Calibration.evidence`), else the rooms' cell, to the server's
+    /// context limit (`LoadCtx.streamGrowth`); both arms give it up.
     grow_prompt: u64 = 0,
     grow_decode: u64 = 0,
     calibration: ?Calibration = null,
@@ -163,11 +163,11 @@ pub const Calibration = struct {
 /// size reads the same) and the server's own footprint within it.
 pub const Reading = struct { in_use: u64, footprint: u64 };
 
-/// `fit`'s budget at `r`. Bills only: each phase's room less the memory in use (equal rooms: `roomBudget`). Calibrated:
-/// each phase's bytes are the ceiling less its base and its bills' growth to the context limit, the evidence's rest
-/// given back and what is outside the server now (plus the margin) taken. Every term saturates at 0.
+/// `fit`'s budget at `r`. Bills only: each phase's room less its bills' growth to the context limit and the memory in
+/// use. Calibrated: each phase's bytes are the ceiling less its base and its bills' growth, the evidence's rest given
+/// back and what is outside the server now (plus the margin) taken. Every term saturates at 0.
 pub fn fitBudget(fit: Fit, r: Reading) quant_abi.BankBudget {
-    const c = fit.calibration orelse return .{ .prompt = fit.prompt_room -| r.in_use, .decode = fit.decode_room -| r.in_use };
+    const c = fit.calibration orelse return billsBudget(fit, r.in_use);
     // Each base already holds the hot cache's resident entry, which the fitter's fresh-server evidence did not: it adds
     // the host's 2 GiB hot-cache term to each phase's peak less the bank (`g53_fit_bank.py`).
     const allow = (r.in_use -| r.footprint) +| fit.inuse_margin;
@@ -175,6 +175,11 @@ pub fn fitBudget(fit: Fit, r: Reading) quant_abi.BankBudget {
         .prompt = (c.ceiling +| c.rest) -| c.base_prompt -| fit.grow_prompt -| allow,
         .decode = (c.ceiling +| c.rest) -| c.base_decode -| fit.grow_decode -| allow,
     };
+}
+
+/// The rooms are billed at the cell: a context past it gives each phase's growth up, as a calibration does.
+fn billsBudget(fit: Fit, in_use: u64) quant_abi.BankBudget {
+    return .{ .prompt = fit.prompt_room -| fit.grow_prompt -| in_use, .decode = fit.decode_room -| fit.grow_decode -| in_use };
 }
 
 /// The open's reading `now`, settled: macOS's page counts show the server's new buffers a second or two late while its
@@ -197,7 +202,7 @@ pub fn openBudget(fit: Fit, now: Reading, fallback_in_use: u64) OpenBudget {
     const r = if (fit.load_start) |start| settled(now, start) else now;
     if (r.in_use >= r.footprint) return .{ .budget = fitBudget(fit, r), .reading = r };
     const in_use = @max(fallback_in_use, r.footprint);
-    return .{ .budget = .{ .prompt = fit.prompt_room -| in_use, .decode = fit.decode_room -| in_use }, .reading = r, .refused = error.BankReadingBelowFootprint };
+    return .{ .budget = billsBudget(fit, in_use), .reading = r, .refused = error.BankReadingBelowFootprint };
 }
 
 /// The calibration file's name in a pack and its format.
