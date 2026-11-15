@@ -374,6 +374,92 @@ test "outside quant: the table claiming a pack's quantization_config loads its w
     try testing.expectError(error.OutsideQuantRefused, (try f.tensor("a", 0)).?.matmul(.{ .ctx = null }, .{ .ctx = null }));
 }
 
+/// A host whose `quant_claimant` names `Toy.table` for a block naming "toy", counting its asks; `size` and the member
+/// are all a load reads of it.
+const ToyHost = struct {
+    var asks: u32 = 0;
+    fn answer(_: ?*anyopaque, block: abi.Str, config: abi.Str) callconv(.c) ?*const abi.QuantTable {
+        asks += 1;
+        return if (Toy.claims(block, config) != .no) &Toy.table else null;
+    }
+    fn of(size: usize, member: bool) Host {
+        var h: Host = undefined;
+        h.size = @intCast(size);
+        h.quant_claimant = if (member) &answer else null;
+        return h;
+    }
+};
+
+test "outside quant: with no table of its own, a load opens through the table the host's quant_claimant names; an older host or a null member gives none" {
+    const fixture = @import("../testing/fixture.zig");
+    const saved = tables.get().*;
+    defer tables.get().* = saved;
+    tables.get().* = .{};
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = "{\"model_type\":\"x\",\"quantization_config\":{\"quant_method\":\"toy\"}}" }} };
+    const dir = mem.packDir();
+    const none: abi.Source = .{ .ctx = null, .get = struct {
+        fn get(_: ?*anyopaque, _: abi.Str) callconv(.c) abi.Array {
+            return .{};
+        }
+    }.get };
+    ToyHost.asks = 0;
+    var h = ToyHost.of(@sizeOf(Host), true);
+    const f = (try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, &h)).?;
+    defer f.close();
+    try testing.expectEqualStrings("toy", f.name());
+    try testing.expectEqualStrings("{\"quant_method\":\"toy\"}", f.ctx.block_json.slice());
+    try testing.expectEqual(@as(u32, 7), (try f.tensor("a", 0)).?.w.block);
+    try testing.expect(ToyHost.asks >= 1);
+    var older = ToyHost.of(@offsetOf(Host, "quant_claimant"), true);
+    try testing.expect(try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, &older) == null);
+    var bare = ToyHost.of(@sizeOf(Host), false);
+    try testing.expect(try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, &bare) == null);
+    try testing.expect(try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, null) == null);
+}
+
+test "outside quant: a load with a table of its own never asks the host" {
+    const fixture = @import("../testing/fixture.zig");
+    const saved = tables.get().*;
+    defer tables.get().* = saved;
+    tables.get().* = .{};
+    register(&Toy.table);
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = "{\"model_type\":\"x\",\"quantization_config\":{\"quant_method\":\"toy\"}}" }} };
+    const dir = mem.packDir();
+    const none: abi.Source = .{ .ctx = null, .get = struct {
+        fn get(_: ?*anyopaque, _: abi.Str) callconv(.c) abi.Array {
+            return .{};
+        }
+    }.get };
+    ToyHost.asks = 0;
+    var h = ToyHost.of(@sizeOf(Host), true);
+    const f = (try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, &h)).?;
+    defer f.close();
+    try testing.expectEqualStrings("toy", f.name());
+    try testing.expectEqual(@as(u32, 0), ToyHost.asks);
+}
+
+test "outside quant: two tables claiming a block equally give none, and the line names both" {
+    const saved = tables.get().*;
+    defer tables.get().* = saved;
+    tables.get().* = .{};
+    var twin = Toy.table;
+    twin.name = .of("toy-twin");
+    register(&Toy.table);
+    register(&twin);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [512]u8 = undefined;
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/q.log", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    try log.openFile(path, 0);
+    const got = claimant("{\"quant_method\":\"toy\"}", "{}");
+    log.closeFile();
+    try testing.expect(got == null);
+    const text = try tmp.dir.readFileAlloc(testing.io, "q.log", testing.allocator, .limited(4096));
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "two quant plugins claim {\"quant_method\":\"toy\"} equally (toy, toy-twin)") != null);
+}
+
 test "outside quant: a weight's row-exact width is its table's declaration, one row where it declares none" {
     var table = Toy.table;
     const w: Weight = .{ .t = &table, .w = .{} };

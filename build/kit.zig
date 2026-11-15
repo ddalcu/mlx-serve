@@ -11,6 +11,11 @@ const plugins = @import("plugins.zig");
 /// The example plugins (`src/plugins/<name>/`, each with its own build.zig): `plugin new` copies them.
 pub const examples = [_][]const u8{ "_example", "_example_media", "_example_quant", "_example_engine" };
 
+/// The kit's own check plugins (`build/kit/<folder>/`, shipped as `checks/<folder>`): built from the staged kit for the
+/// unit tests beside the examples, never copied by `plugin new`. `_outside_probe` opens its pack through the outside
+/// quant table the host names (`host/plugins/kit_test.zig`).
+const check_plugins = [_]struct { folder: []const u8, name: []const u8 }{.{ .folder = "outside_probe", .name = "_outside_probe" }};
+
 pub fn add(b: *std.Build, version: []const u8, test_runs: []const *std.Build.Step.Run) void {
     const name = b.fmt("mlx-serve-plugin-kit-{s}", .{version});
     const gen = b.addRunArtifact(b.addExecutable(.{ .name = "kit_header", .root_module = b.createModule(.{
@@ -34,15 +39,18 @@ pub fn add(b: *std.Build, version: []const u8, test_runs: []const *std.Build.Ste
     var root_buf: [std.fs.max_path_bytes]u8 = undefined;
     const root = root_buf[0 .. b.root.root_dir.handle.realPath(b.graph.io, &root_buf) catch |e| std.process.fatal("kit: build root: {t}", .{e})];
     const out = b.fmt("{s}/.zig-cache/kit-plugins", .{root});
-    for (examples) |ex| {
+    var built: [examples.len + check_plugins.len]struct { file: []const u8, name: []const u8 } = undefined;
+    for (examples, built[0..examples.len]) |ex, *x| x.* = .{ .file = b.fmt("{s}/examples/{s}/build.zig", .{ name, ex }), .name = ex };
+    for (check_plugins, built[examples.len..]) |c, *x| x.* = .{ .file = b.fmt("{s}/checks/{s}/build.zig", .{ name, c.folder }), .name = c.name };
+    for (built) |x| {
         const build = b.addSystemCommand(&.{ b.graph.zig_exe, "build", "--build-file" });
-        build.addFileArg(dir.path(b, b.fmt("{s}/examples/{s}/build.zig", .{ name, ex })));
-        build.addArgs(&.{ "--prefix", b.fmt("{s}/{s}", .{ out, ex }), "--cache-dir", b.fmt("{s}/.zig-cache/kit-nested", .{root}) });
+        build.addFileArg(dir.path(b, x.file));
+        build.addArgs(&.{ "--prefix", b.fmt("{s}/{s}", .{ out, x.name }), "--cache-dir", b.fmt("{s}/.zig-cache/kit-nested", .{root}) });
         // The nested build is incremental itself; the tests rerun only when a dylib's bytes change.
         build.has_side_effects = true;
         for (test_runs) |r| {
             r.step.dependOn(&build.step);
-            r.addFileInput(.{ .cwd_relative = b.fmt("{s}/{s}/lib/lib{s}.dylib", .{ out, ex, ex }) });
+            r.addFileInput(.{ .cwd_relative = b.fmt("{s}/{s}/lib/lib{s}.dylib", .{ out, x.name, x.name }) });
         }
     }
     // Every public function of `kit.blocks` builds from the staged kit.
@@ -117,6 +125,7 @@ fn stage(b: *std.Build, wf: *std.Build.Step.WriteFile, name: []const u8, version
     for ([_][]const u8{ "LICENSE", "LICENSE-APACHE-2.0", "NOTICE" }) |f| _ = wf.addCopyFile(b.path(f), b.fmt("{s}/{s}", .{ name, f }));
     for (examples) |ex| _ = wf.addCopyDirectory(b.path(b.fmt("src/plugins/{s}", .{ex})), b.fmt("{s}/examples/{s}", .{ name, ex }), .{ .include_extensions = &.{ ".zig", ".zon" } });
     _ = wf.addCopyDirectory(b.path("build/kit/blocks_check"), b.fmt("{s}/checks/blocks", .{name}), .{});
+    for (check_plugins) |c| _ = wf.addCopyDirectory(b.path(b.fmt("build/kit/{s}", .{c.folder})), b.fmt("{s}/checks/{s}", .{ name, c.folder }), .{ .include_extensions = &.{ ".zig", ".zon" } });
 }
 
 /// What the kit's module may never reach: the engine, the host and the plugins. `mlx/` and `kernels/` ride along for

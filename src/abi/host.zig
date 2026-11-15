@@ -296,6 +296,24 @@ test "abi host: aneOf answers null for a host that predates the field, or a tabl
     try t.expect(aneOf(&h) == null);
 }
 
+test "abi host: quantClaimantOf answers null for a host that predates the field or leaves it null" {
+    const t = std.testing;
+    const S = struct {
+        fn claimant(_: ?*anyopaque, _: Str, _: Str) callconv(.c) ?*const quant.QuantTable {
+            return null;
+        }
+    };
+    var h: Host = undefined;
+    h.size = @sizeOf(Host);
+    h.quant_claimant = &S.claimant;
+    try t.expect(quantClaimantOf(&h) == &S.claimant);
+    h.size = @offsetOf(Host, "quant_claimant");
+    try t.expect(quantClaimantOf(&h) == null);
+    h.size = @sizeOf(Host);
+    h.quant_claimant = null;
+    try t.expect(quantClaimantOf(&h) == null);
+}
+
 test "abi host: the table layouts are pinned (size first, offsets fixed, growth only at the end)" {
     const t = std.testing;
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
@@ -306,10 +324,10 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
         .{ "latch_pending", 64 },    .{ "latch_check", 72 },     .{ "latch_drop_unless", 80 },
         .{ "gpu_context_lost", 88 }, .{ "kernel", 96 },          .{ "lever", 104 },
         .{ "counter", 112 },         .{ "memory_ceiling", 120 }, .{ "gpu", 128 },
-        .{ "ane", 136 },
+        .{ "ane", 136 },             .{ "quant_claimant", 144 },
     };
     inline for (host_fields) |f| try t.expectEqual(f[1], @offsetOf(Host, f[0]));
-    try t.expectEqual(@as(usize, 144), @sizeOf(Host));
+    try t.expectEqual(@as(usize, 152), @sizeOf(Host));
     try t.expectEqual(host_fields.len, @typeInfo(Host).@"struct".field_names.len);
 
     const gpu_fields = [_]struct { []const u8, usize }{

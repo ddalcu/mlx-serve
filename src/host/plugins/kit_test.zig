@@ -283,3 +283,104 @@ test "kit examples: the engine example serves the model it names, passes the eng
     try @import("../../abi/contract_test.zig").run(@ptrCast(@alignCast(p.manifest.table)), .{ .model_dir = pack, .model_type = "", .config_json = cfg, .prompt = &.{ 258, 'h', 'i', 256, 259 } });
 }
 
+
+/// The host's own quant table for the outside probe: it claims a block naming "_outside_toy" and counts its opens and
+/// closes; it loads nothing.
+const OutsideToy = struct {
+    const quant = @import("../../abi/quant.zig");
+    var opens: u32 = 0;
+    var closes: u32 = 0;
+    fn claims(block: quant.Str, _: quant.Str) callconv(.c) quant.Claim {
+        return if (std.mem.indexOf(u8, block.slice(), "_outside_toy") != null) .by_type else .no;
+    }
+    fn validate(_: quant.Str, _: quant.Str, _: *const quant.PackDir) callconv(.c) quant.Verdict {
+        return .ok;
+    }
+    fn bill(_: quant.Str, _: quant.Str, stored: u64) callconv(.c) u64 {
+        return stored;
+    }
+    fn open(_: *quant.LoadCtx) callconv(.c) quant.Verdict {
+        opens += 1;
+        return .ok;
+    }
+    fn close(_: *quant.LoadCtx) callconv(.c) void {
+        closes += 1;
+    }
+    fn load(_: *const quant.LoadCtx, _: quant.Str, _: u32, _: *quant.Weight) callconv(.c) quant.Verdict {
+        return quant.Verdict.refuse(.unsupported, "_outside_toy");
+    }
+    fn release(_: *quant.Weight) callconv(.c) void {}
+    fn matmul(_: *const quant.Weight, _: quant.Array, _: quant.Stream, _: *quant.Array) callconv(.c) quant.Verdict {
+        return quant.Verdict.refuse(.unsupported, "_outside_toy");
+    }
+    fn moe(_: *const quant.Weight, _: quant.Array, _: quant.Array, _: quant.Array, _: bool, _: quant.Stream, _: *quant.Array) callconv(.c) quant.Verdict {
+        return quant.Verdict.refuse(.unsupported, "_outside_toy");
+    }
+    const table: quant.QuantTable = .{ .name = .of("_outside_toy"), .claims = &claims, .validate = &validate, .bill = &bill, .open = &open, .close = &close, .load_tensor = &load, .load_bank = &load, .release = &release, .matmul = &matmul, .moe = &moe };
+};
+
+test "kit outside quant: a kit-built model dylib, its own quant tables empty, opens its pack through the host's quant_claimant; with the member null nothing claims it" {
+    const built = std.mem.span(env.get(.MLX_SERVE_KIT_PLUGINS) orelse return error.SkipZigTest);
+    const outside = @import("../../sdk/quant/outside.zig");
+    const host_impl = @import("../plugin_host_impl.zig");
+    const FsPackDir = @import("../../sdk/util/pack_dir.zig").FsPackDir;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(testing.io, &root_buf)];
+
+    // The probe, installed and loaded as any outside model plugin.
+    const plugins_dir = try std.fs.path.join(a, &.{ root, "plugins" });
+    const src = try std.fmt.allocPrint(a, "{s}/_outside_probe/lib/lib_outside_probe.dylib", .{built});
+    switch (try cli.install(testing.io, a, src, plugins_dir, &Installed.yes)) {
+        .ok => {},
+        .refused => |why| {
+            std.debug.print("install _outside_probe: {s}\n", .{why});
+            return error.Refused;
+        },
+    }
+    var set = try loader.loadDir(testing.io, testing.allocator, plugins_dir, .{ .enabled = true }, @import("mlx_stamp").bytes);
+    defer set.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 1), set.plugins.items.len);
+    const model = set.plugins.items[0].entry().model.?;
+
+    // A pack the toy claims, and the toy registered with the host (the probe's own list stays empty).
+    try tmp.dir.createDirPath(testing.io, "pack");
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "pack/config.json", .data = "{\"model_type\":\"_outside_probe\",\"quantization_config\":{\"quant_method\":\"_outside_toy\"}}" });
+    const pack = try std.fs.path.join(a, &.{ root, "pack" });
+    var fs = try FsPackDir.open(testing.io, pack);
+    defer fs.close();
+    const pd = fs.packDir();
+    const saved = outside.tables.get().*;
+    defer outside.tables.get().* = saved;
+    outside.tables.get().* = .{};
+    outside.register(&OutsideToy.table);
+    OutsideToy.opens = 0;
+    OutsideToy.closes = 0;
+
+    var b: host_impl.Builtin = undefined;
+    b.init(.{ .allocator = testing.allocator });
+    defer b.deinit();
+    var parsed: model_abi.Parsed = .{};
+    var ctx: model_abi.LoadCtx = .{ .model_dir = .of(pack), .dir = &pd, .parsed = &parsed, .host = b.host() };
+    var v: model_abi.Verdict = .{};
+    const h = model.load(&ctx, &v) orelse {
+        std.debug.print("_outside_probe load: {s}\n", .{v.why.slice()});
+        return error.ProbeRefused;
+    };
+    model.unload(h);
+    try testing.expectEqual(@as(u32, 1), OutsideToy.opens);
+    try testing.expectEqual(@as(u32, 1), OutsideToy.closes);
+
+    // The same host with its member null: the probe's own empty list is all it has.
+    var bare = b.table;
+    bare.quant_claimant = null;
+    ctx.host = &bare;
+    v = .{};
+    try testing.expect(model.load(&ctx, &v) == null);
+    try testing.expectEqualStrings("_outside_probe: no outside quant table claims the pack", v.why.slice());
+    try testing.expectEqual(@as(u32, 1), OutsideToy.opens);
+}

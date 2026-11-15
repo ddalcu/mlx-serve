@@ -1,0 +1,9 @@
+.{
+    .name = ._outside_probe,
+    .version = "0.0.0",
+    .fingerprint = 0xf78038205e2b91d7,
+    .minimum_zig_version = "0.17.0",
+    // The kit's root: this folder ships as <kit>/checks/outside_probe.
+    .dependencies = .{ .mlx_serve_kit = .{ .path = "../.." } },
+    .paths = .{ "build.zig", "build.zig.zon", "plugin.zig", "config.zig" },
+}
