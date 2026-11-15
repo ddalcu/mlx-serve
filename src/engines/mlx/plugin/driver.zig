@@ -217,16 +217,29 @@ fn promptChunkAt(config: *const ModelConfig, seq: u64) u32 {
     )));
 }
 
-/// A streamed plugin's prompt bill for a `seq`-token request at `chunk`: its own term, or a built-in GLM's engine bill
+/// A streamed plugin's prompt bill for a `seq`-token request at `chunk`: its own term, plus the checkpoints a
+/// whole-prompt pass holds (`ssm_checkpoint` each, in the prompt bill's 5/4), or a built-in GLM's engine bill
 /// (`glm5PrefillMemoryNeeded`); null for a model with neither.
 fn streamPromptNeed(config: *const ModelConfig, seq: u64, chunk: u32) ?u64 {
     const b = config.plugin orelse return null;
     if (!b.parsed.caps.streamed_weights) return null;
     var bill: abi.Bill = .{};
     b.table.bill(&b.parsed, &.{ .context = seq }, &bill);
-    if (bill.prefill_bytes) |prefill| return prefill(&b.parsed, seq, chunk, 16, 0);
+    if (bill.prefill_bytes) |prefill| {
+        const held: u64 = if (b.parsed.caps.whole_prompt_prefill) passCheckpoints(config, seq) else 0;
+        return prefill(&b.parsed, seq, chunk, 16, 0) + held * bill.ssm_checkpoint * 5 / 4;
+    }
     if (config.isGlm5()) return @import("../admission/glm5_bill.zig").glm5PrefillMemoryNeeded(config, seq, 1, 16, chunk, .{});
     return null;
+}
+
+/// The checkpoints a whole-prompt pass of up to `seq` tokens can hold (`wholePromptCheckpointBound`): at the stride
+/// and cap every load hands the model (`launchSsmCheckpointStride`, `ssm_checkpoint_max`), its dense low grid
+/// `longCtxGated`'s. A load that keeps no prefix cache files none, so this never bills fewer than the engine files.
+fn passCheckpoints(config: *const ModelConfig, seq: u64) u64 {
+    const stride = @import("../admission/hot_cache_plan.zig").launchSsmCheckpointStride();
+    const max = @import("../../../host/http/server.zig").launch().ssm_checkpoint_max;
+    return @import("../generate/prefill_chunk.zig").wholePromptCheckpointBound(@intCast(seq), stride, config.longCtxGated(), max);
 }
 
 /// The largest prompt bill from `lo` to `hi` tokens, each length at the chunk the engine runs for it: the bill at `hi`,

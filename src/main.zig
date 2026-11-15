@@ -28,7 +28,7 @@ const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
 const chat_mod = @import("host/chat/chat.zig");
 const server_mod = @import("host/http/server.zig");
 const ablation_api = @import("host/api/ablation.zig");
-const effectiveSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").effectiveSsmCheckpointStride;
+const launchSsmCheckpointStride = @import("engines/mlx/admission/hot_cache_plan.zig").launchSsmCheckpointStride;
 const scheduler_mod = @import("engines/mlx/scheduler.zig");
 const ane_lm = @import("engines/ane/lm.zig");
 const status = @import("host/status.zig");
@@ -1857,7 +1857,7 @@ fn withLaunchFlags(base: LoadParams, spec: SpecLoadFlags, kv: KVQuantConfig) Loa
     p.prefix_cache_mem_bytes = l.prefix_cache_mem_bytes;
     p.prefix_cache_clamp = true;
     p.prefix_cache_disk_bytes = l.prefix_cache_disk_bytes;
-    p.ssm_checkpoint_stride = effectiveSsmCheckpointStride(l.ssm_checkpoint_stride, l.prefix_cache_capacity, l.prefix_cache_ram_enabled, l.prefix_cache_disk_bytes);
+    p.ssm_checkpoint_stride = launchSsmCheckpointStride();
     p.ssm_checkpoint_max = l.ssm_checkpoint_max;
     p.tokenize_cache_entries = server_mod.tokenize_cache_entries;
     p.launch_warmup_eager = warmup_eager;
