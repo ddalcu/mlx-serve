@@ -226,8 +226,8 @@ fn expectAreaExposed(comptime area: []const u8) !void {
 test "kit: the module names the sdk files the Ling and GLM runners import, each as that file" {
     // (the name a plugin reaches, its path from `kit`, the file the runner imports: the KDA-hybrid base's trunk, kda.zig
     // and moe.zig, and the base itself, for both runners; bailing_hybrid's plugin.zig, mla.zig and table_forward.zig for
-    // Ling; mlx_scope (glm5_next.zig) and system (GLM's per-core lever) for GLM's outside plugin; the kernel contract
-    // for a plugin's own kernel gates)
+    // Ling; mlx_scope (glm5_next.zig), system (GLM's per-core lever) and mlx_device (the NAX router's naxAvailable and
+    // tf32Matmul) for GLM's outside plugin; the kernel contract for a plugin's own kernel gates)
     const want = .{
         .{ "bases.run", .{ "bases", "run" }, @import("../../sdk/bases/run.zig") },
         .{ "bases.blocks.compiled", .{ "bases", "blocks", "compiled" }, @import("../../sdk/bases/blocks/compiled.zig") },
@@ -245,6 +245,7 @@ test "kit: the module names the sdk files the Ling and GLM runners import, each 
         .{ "mlx_array", .{"mlx_array"}, @import("../../mlx/array.zig") },
         .{ "mlx_scope", .{"mlx_scope"}, @import("../../mlx/scope.zig") },
         .{ "system", .{"system"}, @import("../../sdk/util/system.zig") },
+        .{ "mlx_device", .{"mlx_device"}, @import("../../mlx/device.zig") },
         .{ "bases.kda_hybrid.config", .{ "bases", "kda_hybrid", "config" }, @import("../../sdk/bases/kda_hybrid/config.zig") },
         .{ "bases.kda_hybrid.trunk", .{ "bases", "kda_hybrid", "trunk" }, @import("../../sdk/bases/kda_hybrid/trunk.zig") },
         .{ "bases.kda_hybrid.kda", .{ "bases", "kda_hybrid", "kda" }, @import("../../sdk/bases/kda_hybrid/kda.zig") },

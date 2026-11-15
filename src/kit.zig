@@ -41,6 +41,9 @@ pub const mlx_scope = @import("mlx/scope.zig");
 /// What the machine has and how loaded it is (`sdk/util/system.zig`): memory, memory pressure, CPU and GPU load, GPU
 /// cores.
 pub const system = @import("sdk/util/system.zig");
+/// What the GPU is (`mlx/device.zig`): its generation, whether the NAX matrix units serve (`naxAvailable`) and
+/// whether a matmul runs in TF32 (`tf32Matmul`), as the server's own kernels choose their paths.
+pub const mlx_device = @import("mlx/device.zig");
 /// The expert stream (`sdk/weights/streamed.zig`): routed experts read from SSD into slot rows, its residency policy and
 /// read pool, for a plugin's own bank format (`expert.stream.StreamOf` over the plugin's bank) or an MLX pack's experts
 /// as downloaded (`Streamed.openPack`). macOS only. The read pool is C a plugin compiles in (`build.zig`
