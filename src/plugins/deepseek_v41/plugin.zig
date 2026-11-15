@@ -488,7 +488,8 @@ fn forwardBatched(m: *Model, f: *const abi.Forward, out: *abi.ForwardOut) Verdic
     const n = f.slots.len;
     if (n == 0 or n > max_batch or f.rows != 1 or f.tokens.len != n or f.logits == .all_rows or f.want_hidden)
         return Verdict.refuse(.unsupported, "deepseek_v41: a batch is one host token per slot");
-    var specs = [_]?ablation.Spec{null} ** max_batch;
+    var specs: [max_batch]?ablation.Spec = undefined;
+    for (&specs) |*sp| sp.* = null;
     for (specs[0..n], 0..) |*spec, k| if (slotAblation(m, f, k, spec)) |refused| return refused;
     var states: [max_batch]*dsv41.State = undefined;
     var gens: [max_batch]u64 = undefined;

@@ -367,7 +367,6 @@ pub const Bank = struct {
 /// in their place (they address experts from the buffer pointer): MLX bills
 /// a command buffer for each bound array's size, and a whole bank forced a
 /// commit at every kernel.
-
 /// `ext`: banks (w1, w3, w2) an outside quant plugin loaded and runs (the DSpark stages'); the MLX banks are then unset.
 pub const Experts = struct { gate: Bank, up: Bank, down: Bank, gu: ?Bank = null, views: ?[2]Bank = null, ext: ?[3]outside.Weight = null };
 pub const Layer = struct {
@@ -3539,7 +3538,6 @@ pub fn attnSplits(rows: usize) c_int {
     return @intCast(@max(1, @min(8, rows / 160)));
 }
 
-
 /// `qt` (q_tail.zig): the heads' roped last channels [L, H, rope dims]; `q` is then the unroped heads.
 pub const Proj = struct { q: A, kv: A, qr: A, qt: A = none };
 /// Rows at `pos` -> the roped query heads, the window row (roped, fp8
@@ -6090,7 +6088,6 @@ pub const region_rows = 16;
 
 /// With a streamed bank the FFN stretch runs as three (`ffn_pre`, `ffn_act`, `ffn_post`) around the source's host
 /// barrier, cut where `ffn` has no fusable op across the cut.
-
 pub const Region = enum { attn_in, q_kv, q_rows, attn_out, ffn, ffn_pre, ffn_act, ffn_post, ffn_shared, ffn_post_shared };
 const LayerRegions = struct {
     m: *Dsv41Model,
@@ -9788,11 +9785,11 @@ test "dsv41 group: greedy DSpark group rounds against batched plain steps, by st
         const plain_ms = @as(f64, @floatFromInt(plain_us)) / rounds / 1000;
         const round_ms = @as(f64, @floatFromInt(us[0] + us[1] + us[2])) / rounds / 1000;
         std.debug.print("[group] ctx {d} states {d}: plain step {d:.2} ms = {d:.1} tok/s | round {d:.2} ms (draft {d:.2}, verify {d:.2} of {d:.1} rows, finish {d:.2}), {d:.2} tokens a state = {d:.1} tok/s\n", .{
-            ctx,                                                          n,
-            plain_ms,                                                     @as(f64, @floatFromInt(n)) * 1000 / plain_ms,
-            round_ms,                                                     @as(f64, @floatFromInt(us[0])) / rounds / 1000,
-            @as(f64, @floatFromInt(us[1])) / rounds / 1000,               @as(f64, @floatFromInt(rows)) / rounds,
-            @as(f64, @floatFromInt(us[2])) / rounds / 1000,               @as(f64, @floatFromInt(tokens)) / rounds / @as(f64, @floatFromInt(n)),
+            ctx,                                                        n,
+            plain_ms,                                                   @as(f64, @floatFromInt(n)) * 1000 / plain_ms,
+            round_ms,                                                   @as(f64, @floatFromInt(us[0])) / rounds / 1000,
+            @as(f64, @floatFromInt(us[1])) / rounds / 1000,             @as(f64, @floatFromInt(rows)) / rounds,
+            @as(f64, @floatFromInt(us[2])) / rounds / 1000,             @as(f64, @floatFromInt(tokens)) / rounds / @as(f64, @floatFromInt(n)),
             @as(f64, @floatFromInt(tokens)) * 1000 / rounds / round_ms,
         });
     }
