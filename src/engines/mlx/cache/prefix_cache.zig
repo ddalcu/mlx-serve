@@ -711,7 +711,7 @@ pub const HotPrefixCache = struct {
     /// SSD-first mode; set by the scheduler at load.
     ssd_first: bool = false,
     /// A streamed bank's capped hot cache (`streamedHotCacheCapped`), set at load: nothing evicts on live memory beside
-    /// its requests, so an oversized commit makes its copy's room before it copies.
+    /// its requests, so an oversized commit makes its copy's room before it copies (`roomBeforeCopy`).
     evict_before_copy: bool = false,
     /// SSD-first: the RAM allowance for idle entries (the resolved `--prefix-cache-mem`).
     /// `spillIdleEntries` evicts only past it; 0 = nothing idle stays resident.
@@ -2609,6 +2609,8 @@ pub const HotPrefixCache = struct {
                         return .{ .kept_resident = self.entries.items[idx].tokens.len };
                     }
                 }
+                // A capped bank: the copy is live beside the cache, and nothing evicts on live memory.
+                if (self.evict_before_copy) replace_idx = self.roomBeforeCopy(trimmedEntryBytes(tl, row_bytes, eff_cps), replace_idx, cache_key);
                 const trimmed = new_snap.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
                     // A copy that failed at this width is not a verdict on the entry: retry at the next-lower checkpoint.
                     decline = .snapshot_copy_failed;
@@ -3783,6 +3785,36 @@ pub const HotPrefixCache = struct {
         }
         self.shedCheckpointsToFit();
         self.logResident();
+    }
+
+    /// What a trim to `len` rows will hold: its rows and the checkpoints at or below them, before any shed.
+    fn trimmedEntryBytes(len: usize, row_bytes: u64, cps: ?[]const SSMCheckpoint) u64 {
+        var bytes = @as(u64, len) *| row_bytes;
+        const list = cps orelse return bytes;
+        for (list) |*cp| {
+            if (cp.pos <= len) bytes +|= ssmCheckpointBytes(cp);
+        }
+        return bytes;
+    }
+
+    /// `evict_before_copy`: evicts until a `copy_bytes` copy fits the budget beside the cache, the entry the commit
+    /// replaces (`replace_idx`) last. Returns that entry's index, which an eviction moves, or null once it went too.
+    fn roomBeforeCopy(self: *HotPrefixCache, copy_bytes: u64, replace_idx: ?usize, incoming_key: u64) ?usize {
+        const target: ?u64 = if (replace_idx) |i| self.entries.items[i].last_used else null;
+        var protect = target;
+        while (self.current_kv_bytes +| copy_bytes > self.max_kv_bytes) {
+            const idx = self.lruIndexExcluding(protect, incoming_key) orelse {
+                if (protect == null) break;
+                protect = null;
+                continue;
+            };
+            self.evictAt(idx, "byte budget, before the commit copy");
+        }
+        const kept = target orelse return null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.last_used == kept) return i;
+        }
+        return null;
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {

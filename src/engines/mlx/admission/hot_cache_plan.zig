@@ -286,9 +286,9 @@ fn ungatedHotCacheAsk(config: *const model_mod.ModelConfig, requested: u64, expl
     else
         defaultPrefixCacheAsk(requested, explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, chunk));
     if (!streamedHotCacheCapped(config)) return ask;
-    // Decode-billed is where the cap is safe: the host's decode room holds this term (`glm5DecodeMemoryNeeded`). A
-    // streamed plugin that prices its own prompt (`Bill.prefill_bytes`) gets no such room, so its own bill must hold
-    // the term twice (the entry and an oversized commit's copy, made before the entry is evicted).
+    // Decode-billed is where the cap is safe: the host's decode room holds this term (`glm5DecodeMemoryNeeded`), and a
+    // capped commit evicts before it copies (`evict_before_copy`), so the entry and its copy never both stand. A
+    // streamed plugin that prices its own prompt (`Bill.prefill_bytes`) gets no such room: its own bill must hold it.
     return if (ask == 0) GLM5_HOT_CACHE_BYTES else @min(ask, GLM5_HOT_CACHE_BYTES);
 }
 
