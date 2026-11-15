@@ -1244,3 +1244,43 @@ test "wholePromptCheckpointBound: no width, offset or cap plans more checkpoints
         };
     }
 }
+
+// Bar: a decode-billed model that sets reserves_request reserves its prompt, its reply to the context and the verify
+// rows, a reply past 8,192 and a prompt under 32,768 included; a model without it keeps the prompt and a chunk.
+test "reservedPrefillTokens: a reserving model reserves its whole request to the context; the others as before" {
+    const t = std.testing;
+    const abi = @import("../../../abi/plugin.zig");
+    const plugin_config = @import("../plugin/config.zig");
+    const verify_rows = @import("init.zig").verify_rows_max;
+    const Probe = struct {
+        fn prefill(_: *const abi.Parsed, _: u64, _: u32, _: u8, _: u64) callconv(.c) u64 {
+            return 3 << 30;
+        }
+        fn reserving(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill, .flags = .{ .decode_room = .billed, .reserves_request = true } };
+        }
+        fn billed(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .flags = .{ .decode_room = .billed } };
+        }
+        fn unbilled(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill, .flags = .{ .decode_room = .unbilled, .reserves_request = true } };
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Probe.reserving;
+    var binding: plugin_config.Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true } } };
+    var ling = model_mod.ModelConfig{ .model_type = "bailing_hybrid", .plugin = &binding, .ctx_override = 49_975, .max_position_embeddings = 262_144 };
+    // A 33,591-token prompt and an 11,198-token reply: past the 8,192 tokens `KVCache.reservedTokens` pre-buys.
+    try t.expectEqual(33_591 + 11_198 + verify_rows, reservedPrefillTokens(&ling, 33_591, 11_198, 512));
+    // An 18,380-token prompt: under the 32,768 below which `KVCache.reservedTokens` reserves nothing.
+    try t.expectEqual(18_380 + 1_024 + verify_rows, reservedPrefillTokens(&ling, 18_380, 1_024, 1536));
+    // An omitted max_tokens on a one-chunk prompt: the reply runs to the context.
+    try t.expectEqual(49_975 + verify_rows, reservedPrefillTokens(&ling, 900, std.math.maxInt(u32) / 4, 4096));
+    // Decode-billed without the flag (a streamed GLM's shape), or the flag without a decode room: as before.
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next", .plugin = &binding, .ctx_override = 49_975, .max_position_embeddings = 262_144 };
+    table.bill = &Probe.billed;
+    try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&glm, 33_591, 11_198, 512));
+    try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&glm, 900, std.math.maxInt(u32) / 4, 4096));
+    table.bill = &Probe.unbilled;
+    try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&ling, 33_591, 11_198, 512));
+}

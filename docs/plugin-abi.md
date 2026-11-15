@@ -470,7 +470,8 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 | Field | Type | Default | |
 |---|---|---|---|
 | `decode_room` | `DecodeRoom` | `.by_name` |  |
-| `_` | `u30` | `0` |  |
+| `reserves_request` | `bool` | `false` | A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`). |
+| `_` | `u29` | `0` |  |
 
 ### `DecodeRoom` (enum(u2))
 

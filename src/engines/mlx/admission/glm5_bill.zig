@@ -283,3 +283,112 @@ test "GLM bill: the decode phase's bill holds no prefill scratch, so it sits bel
     const growth = kv_tok + (seq + 1) * kv_tok;
     try std.testing.expectEqual((resident + growth + PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4 + GLM5_HOT_CACHE_BYTES, decode);
 }
+
+/// A streamed plugin binding whose bill sets `flags` (decode room and reservation), with an MTP head; `priced` also
+/// prices its prompt.
+fn reserveBinding(table: *abi.ModelTable, comptime flags: abi.BillFlags, comptime priced: bool) @import("../plugin/config.zig").Binding {
+    const Probe = struct {
+        fn prefill(_: *const abi.Parsed, _: u64, _: u32, _: u8, _: u64) callconv(.c) u64 {
+            return 3 << 30;
+        }
+        fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = if (priced) &prefill else null, .flags = flags };
+        }
+    };
+    table.bill = &Probe.bill;
+    return .{ .table = table, .parsed = .{ .caps = .{ .streamed_weights = true }, .spec = .{ .mtp_layout = .in_checkpoint } } };
+}
+
+// Bar: a request that reserves its KV once grows its decode bill by the KV once a token (at 5/4) and the MTP head's
+// rows, from a 19,404-token request to each limit, and bills a reply past 8,192 whole.
+test "GLM bill: a reserving Ling's decode bills its reserved KV once, beside its MTP head's dense MLA rows" {
+    const t = std.testing;
+    const saved = GlmBillGlobals.pin();
+    defer saved.restore();
+    http_server.launch().ssm_checkpoint_stride = 0;
+    var table: abi.ModelTable = undefined;
+    var binding = reserveBinding(&table, .{ .decode_room = .billed, .reserves_request = true }, true);
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json"));
+    const own = cfg.plugin;
+    defer {
+        cfg.plugin = own;
+        cfg.deinit(t.allocator);
+    }
+    cfg.plugin = &binding;
+    const wide = generate_mod.WIDE_PREFILL_CHUNK;
+    const kv = cfg.kvBytesPerToken();
+    // The head's one MLA layer, dense at every head: 64 x (192 + 128) bf16.
+    const head: u64 = 40_960;
+    const from: u64 = 19_404;
+    for ([_]u64{ 49_975, 83_694, 150_999 }) |limit| {
+        cfg.ctx_override = @intCast(limit);
+        const grow = glm5DecodeMemoryNeeded(&cfg, limit - 1, 1, 16, wide) - glm5DecodeMemoryNeeded(&cfg, from, 1, 16, wide);
+        try t.expectEqual((limit - 1 - from) * (kv + head) * 5 / 4, grow);
+    }
+    cfg.ctx_override = 49_975;
+    try t.expectEqual(11_197 * (kv + head) * 5 / 4, glm5DecodeMemoryNeeded(&cfg, 33_591, 11_198, 16, wide) - glm5DecodeMemoryNeeded(&cfg, 33_591, 1, 16, wide));
+}
+
+// Bar: the head's rows are its own layer kind's: GLM-5's mtp.0 is a DSA layer (its latent row and the indexer's key
+// and gate), another model's one attention layer at its KV heads.
+test "GLM bill: a reserving model's MTP head rows are its own layer kind's" {
+    const t = std.testing;
+    const saved = GlmBillGlobals.pin();
+    defer saved.restore();
+    http_server.launch().ssm_checkpoint_stride = 0;
+    const wide = generate_mod.WIDE_PREFILL_CHUNK;
+    var table: abi.ModelTable = undefined;
+    var binding = reserveBinding(&table, .{ .decode_room = .billed, .reserves_request = true }, false);
+    var glm = glm5TestConfig();
+    glm.plugin = &binding;
+    glm.ctx_override = 83_694;
+    const glm_head: u64 = (512 + 2 * 128) * 2;
+    try t.expectEqual((83_693 - 19_404) * (glm.kvBytesPerToken() + glm_head) * 5 / 4, glm5DecodeMemoryNeeded(&glm, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&glm, 19_404, 1, 16, wide));
+    var toy: model_mod.ModelConfig = .{ .model_type = "toy_hybrid", .num_hidden_layers = 4, .num_attention_heads = 8, .num_key_value_heads = 2, .head_dim = 64, .hidden_size = 512, .max_position_embeddings = 131_072 };
+    toy.plugin = &binding;
+    toy.ctx_override = 83_694;
+    const toy_head: u64 = 2 * 2 * 64 * 2;
+    try t.expectEqual((83_693 - 19_404) * (toy.kvBytesPerToken() + toy_head) * 5 / 4, glm5DecodeMemoryNeeded(&toy, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&toy, 19_404, 1, 16, wide));
+    // Without a head, the KV alone.
+    binding.parsed.spec.mtp_layout = .none;
+    try t.expectEqual((83_693 - 19_404) * toy.kvBytesPerToken() * 5 / 4, glm5DecodeMemoryNeeded(&toy, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&toy, 19_404, 1, 16, wide));
+}
+
+// Bar: a reserving request holds the hot cache's resident entry and, while it commits, that entry's copy: two hot-cache
+// terms beside the reserved KV, the head's rows, the checkpoints, the slot's fixed rows and the runtime floor.
+test "GLM bill: a reserving request's decode bill holds two hot-cache terms beside its KV once" {
+    const t = std.testing;
+    const saved = GlmBillGlobals.pin();
+    defer saved.restore();
+    http_server.launch().ssm_checkpoint_stride = 0;
+    const wide = generate_mod.WIDE_PREFILL_CHUNK;
+    var table: abi.ModelTable = undefined;
+    var binding = reserveBinding(&table, .{ .decode_room = .billed, .reserves_request = true }, false);
+    var glm = glm5TestConfig();
+    glm.plugin = &binding;
+    glm.ctx_override = 32_768;
+    const rows: u64 = 18_380 + 1_024 + @import("../generate/init.zig").verify_rows_max;
+    const fixed = 4 * glm.ssmCheckpointBytes() + slotFixedKvBytes(&glm, 16, wide);
+    const kv = rows * (glm.kvBytesPerToken() + (512 + 2 * 128) * 2);
+    try t.expectEqual((fixed + kv + PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4 + 2 * GLM5_HOT_CACHE_BYTES, glm5DecodeMemoryNeeded(&glm, 18_380, 1_024, 16, wide));
+}
+
+// Bar: a decode-billed model that does not set reserves_request keeps the grow term: a grow's old buffers beside the
+// new rows; so does one that sets it without its own decode room.
+test "GLM bill: without reserves_request, or without a decode room, the decode bill keeps its grow term" {
+    const t = std.testing;
+    const saved = GlmBillGlobals.pin();
+    defer saved.restore();
+    http_server.launch().ssm_checkpoint_stride = 0;
+    const wide = generate_mod.WIDE_PREFILL_CHUNK;
+    var table: abi.ModelTable = undefined;
+    var binding = reserveBinding(&table, .{ .decode_room = .billed }, false);
+    var glm = glm5TestConfig();
+    glm.plugin = &binding;
+    glm.ctx_override = 83_694;
+    const kv = glm.kvBytesPerToken();
+    try t.expectEqual((83_693 - 19_404) * 2 * kv * 5 / 4, glm5DecodeMemoryNeeded(&glm, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&glm, 19_404, 1, 16, wide));
+    var unbilled = reserveBinding(&table, .{ .decode_room = .unbilled, .reserves_request = true }, false);
+    glm.plugin = &unbilled;
+    try t.expectEqual((83_693 - 19_404) * 2 * kv * 5 / 4, glm5DecodeMemoryNeeded(&glm, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&glm, 19_404, 1, 16, wide));
+}

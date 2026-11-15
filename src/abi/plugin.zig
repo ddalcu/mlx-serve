@@ -382,7 +382,10 @@ pub const Bill = extern struct {
 
 pub const BillFlags = packed struct(u32) {
     decode_room: DecodeRoom = .by_name,
-    _: u30 = 0,
+    /// A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and
+    /// its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`).
+    reserves_request: bool = false,
+    _: u29 = 0,
 };
 
 /// Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`).
