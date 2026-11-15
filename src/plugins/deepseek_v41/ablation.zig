@@ -8,6 +8,7 @@
 //! continues rows that another ablation (or none) wrote.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const dsv41 = @import("deepseek_v41.zig");
@@ -283,7 +284,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, seq: u6
     // Prompt activations and ids: the owner's only.
     const dir_z = try gpa.dupeSentinel(u8, dir, 0);
     defer gpa.free(dir_z);
-    _ = std.c.chmod(dir_z, 0o700);
+    if (builtin.os.tag != .windows) _ = std.c.chmod(dir_z, 0o700);
     var name_buf: [64]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
     var header_buf: [256]u8 = undefined;
@@ -293,7 +294,10 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, seq: u6
     defer gpa.free(file_bytes);
     @memcpy(file_bytes[0..npy.len], npy);
     @memcpy(file_bytes[npy.len..], body);
-    try d.writeFile(io, .{ .sub_path = name, .data = file_bytes, .flags = .{ .permissions = .fromMode(0o600) } });
+    if (builtin.os.tag == .windows)
+        try d.writeFile(io, .{ .sub_path = name, .data = file_bytes })
+    else
+        try d.writeFile(io, .{ .sub_path = name, .data = file_bytes, .flags = .{ .permissions = .fromMode(0o600) } });
 
     var line: std.Io.Writer.Allocating = .init(gpa);
     defer line.deinit();
@@ -302,7 +306,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, seq: u6
     for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
     try line.writer.writeAll("]}\n");
     var idx = d.openFile(io, "index.jsonl", .{ .mode = .write_only }) catch |e| switch (e) {
-        error.FileNotFound => try d.createFile(io, "index.jsonl", .{ .permissions = .fromMode(0o600) }),
+        error.FileNotFound => try d.createFile(io, "index.jsonl", if (builtin.os.tag == .windows) .{} else .{ .permissions = .fromMode(0o600) }),
         else => return e,
     };
     defer idx.close(io);
