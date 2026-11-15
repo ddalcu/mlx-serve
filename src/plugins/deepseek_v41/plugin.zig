@@ -104,9 +104,8 @@ pub const Model = struct {
     idle: ?Kept = null,
     /// The last id a snapshot was given for the other tensor ranks (`Snap.tp_id`).
     tp_snaps: u64 = 0,
-    /// Calibration (MLX_SERVE_DSV41_TAP_DIR): where each prompt forward's stream tap is written, and how many were.
+    /// Calibration (MLX_SERVE_DSV41_TAP_DIR): where each prompt forward's stream tap is written.
     tap_dir: ?[]const u8 = null,
-    tap_seq: u64 = 0,
 };
 
 /// A state off the module, with its identity (`Dsv41Model.state_gen`).
@@ -308,7 +307,6 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.parked = .empty;
     m.idle = null;
     m.tap_dir = null;
-    m.tap_seq = 0;
     // Calibration (MLX_SERVE_DSV41_TAP_DIR): every prompt forward's stream at each layer, written there owner-only.
     if (env.span(.MLX_SERVE_DSV41_TAP_DIR)) |tap_dir| if (tap_dir.len > 0) {
         const tap = try gpa.create(ablation.StreamTap);
@@ -592,8 +590,11 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
     } else try runPrompt(m, ids, rows);
     defer _ = mlx.mlx_array_free(logits);
     if (tap) |t| {
-        ablation.dumpTap(gpa, t, m.tap_dir.?, m.tap_seq, pos, ids, m.s) catch |e| std.log.err("deepseek_v41: the calibration tap's dump failed: {t}", .{e});
-        m.tap_seq += 1;
+        const seq = ablation.dumpTap(gpa, t, m.tap_dir.?, pos, ids, m.s) catch |e| blk: {
+            std.log.err("deepseek_v41: the calibration tap's dump failed: {t}", .{e});
+            break :blk 0;
+        };
+        if (seq != 0) std.log.info("deepseek_v41: the calibration tap wrote tap-{d:0>6}.npy", .{seq});
     }
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);

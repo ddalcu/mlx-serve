@@ -43,11 +43,9 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
 - `owns_decode_state`, `slot_state` + `batches_decode` (streamed: single-flight): active state in `dec_state`, other
   live slots in `parked`; decode and DSpark rounds batch through `extendBatched` (rows a state, projections shared,
   attention per state) and `dsparkDraftBatched`. Each State owns its pending capture.
-- `ablation`: a request's `Forward.ablation` is armed on the slot's state (`stateArm`) and freed with it; the
-  embedding, attention, FFN, MoE, Engram value and every snapshot rewind replay ablates, DSpark rounds and batched
-  passes included. Batched states with differing ablation keys run one at a time; a pair/tensor split refuses ablation
-  by name; resuming an ablated state is refused (that prompt starts cold); a snapshot keeps its state's ablation and
-  key. A disk-tier rewind replay carries no ablation, so its state is marked unablated and refuses ablated forwards.
+- `ablation`: a request's `Forward.ablation` is armed on the slot's state (`stateArm`) and freed with it; embedding,
+  attention, FFN/MoE, Engram value and rewind replays ablate, DSpark rounds included. Pair/tensor splits refuse it;
+  a snapshot keeps its ablation and key and resumes that variant; an unkeyed ablation never continues rows.
 - `prefix_cache` for unpaired instances whose bank holds every expert; a streaming bank (fewer prompt or decode slot
   rows than `num_experts`, `bankStreams`) and a Thunderbolt pair keep legacy resume.
   Snapshots retain every buffer and restore whole only at their own position; the engine owns finished history. Pairs

@@ -126,6 +126,9 @@ pub fn variantOf(a: ?Spec) u64 {
 /// its own.
 pub fn fits(n: usize, variant: ?u64, key: u64) bool {
     if (n == 0) return true;
+    // An unkeyed ablation names no direction in the host's cache key, so two of them are indistinguishable: never
+    // continue rows under one (the same rule `same` applies to a batch).
+    if (key == unkeyed) return false;
     const v = variant orelse return true;
     return v == key;
 }
@@ -250,14 +253,56 @@ pub const StreamTap = struct {
     }
 };
 
+/// The next free `seq` for a tap directory: one past the highest in `index.jsonl`'s bytes, 0 when there is none.
+/// The counter lives in the directory, not in memory, so a server restart continues the campaign instead of
+/// overwriting `tap-000000.npy` and leaving two index lines for one file.
+pub fn seqFromIndex(bytes: []const u8) u64 {
+    var best: u64 = 0;
+    var seen = false;
+    var it = std.mem.splitScalar(u8, bytes, '\n');
+    while (it.next()) |line| {
+        const at = std.mem.indexOf(u8, line, "\"seq\":") orelse continue;
+        var i = at + 6;
+        var v: u64 = 0;
+        var any = false;
+        while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {
+            v = v * 10 + (line[i] - '0');
+            any = true;
+        }
+        if (any) {
+            best = @max(best, v);
+            seen = true;
+        }
+    }
+    return if (seen) best + 1 else 0;
+}
+
+/// `seqFromIndex` over the directory's `index.jsonl` (0 when the file is absent or empty).
+fn nextTapSeq(gpa: std.mem.Allocator, d: std.Io.Dir, io: std.Io) !u64 {
+    var f = d.openFile(io, "index.jsonl", .{ .mode = .read_only }) catch |e| switch (e) {
+        error.FileNotFound => return 0,
+        else => return e,
+    };
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    if (size == 0) return 0;
+    const len: usize = @intCast(@min(size, 1 << 20));
+    const buf = try gpa.alloc(u8, len);
+    defer gpa.free(buf);
+    const n = try f.readPositionalAll(io, buf, @intCast(size - len));
+    return seqFromIndex(buf[0..n]);
+}
+
 /// The tap's rows for one prompt forward as `<dir>/tap-<seq>.npy` (f32 `[layers + 1, rows, dim]`: per site the last
 /// `keep` rows its passes recorded, in prompt order, the last one the prompt's last token) and a line in
 /// `<dir>/index.jsonl` (`pos` the forward's first position, `ids` its tokens). The dir is the owner's only (0700), its
-/// files 0600. Clears the tap; a site no pass recorded (a layer another Mac ran) writes nothing.
-pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, seq: u64, pos: usize, ids: []const u32, s: S) !void {
+/// files 0600. The `seq` comes from the directory, never from memory, so a restart cannot overwrite an earlier file.
+/// Returns that seq (0 when nothing was written). Clears the tap; a site no pass recorded (a layer another Mac ran)
+/// writes nothing.
+pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: usize, ids: []const u32, s: S) !u64 {
     defer tap.clear();
     const sites = tap.sites.len;
-    if (sites == 0 or tap.sites[0].items.len == 0) return;
+    if (sites == 0 or tap.sites[0].items.len == 0) return 0;
     var sc = Scope.init(gpa, s);
     defer sc.deinit();
     const per_site = try gpa.alloc(A, sites);
@@ -285,8 +330,23 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, seq: u6
     const dir_z = try gpa.dupeSentinel(u8, dir, 0);
     defer gpa.free(dir_z);
     if (builtin.os.tag != .windows) _ = std.c.chmod(dir_z, 0o700);
+    var seq = try nextTapSeq(gpa, d, io);
     var name_buf: [64]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
+    var name: []const u8 = undefined;
+    var tries: usize = 0;
+    while (tries < 1000) : (tries += 1) {
+        name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
+        const taken = blk: {
+            const f = d.openFile(io, name, .{ .mode = .read_only }) catch |e| switch (e) {
+                error.FileNotFound => break :blk false,
+                else => return e,
+            };
+            f.close(io);
+            break :blk true;
+        };
+        if (!taken) break;
+        seq += 1;
+    } else return error.TapSeqExhausted;
     var header_buf: [256]u8 = undefined;
     const npy = try npyHeader(&header_buf, @intCast(shape[0]), @intCast(shape[1]), @intCast(shape[2]));
     const body = std.mem.sliceAsBytes(data);
@@ -312,6 +372,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, seq: u6
     defer idx.close(io);
     const end = (try idx.stat(io)).size;
     try idx.writePositionalAll(io, line.written(), end);
+    return seq;
 }
 
 /// A version 1.0 `.npy` header for little-endian f32 `[a, b, c]`, padded to a multiple of 64 bytes.

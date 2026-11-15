@@ -192,6 +192,17 @@ test "deepseek_v41 ablation: a state takes a forward of its own variant; a fresh
     // An unablated request on an ablated state, and the reverse.
     try testing.expect(!ablation.fits(12, 7, 0));
     try testing.expect(!ablation.fits(12, 0, 7));
+    // An unkeyed ablation matches only itself, so no state continues rows under it.
+    try testing.expect(!ablation.fits(12, ablation.unkeyed, ablation.unkeyed));
+}
+
+test "deepseek_v41 ablation: a tap directory's next seq is one past its index, so a restart cannot reuse a file" {
+    try testing.expectEqual(@as(u64, 0), ablation.seqFromIndex(""));
+    try testing.expectEqual(@as(u64, 1), ablation.seqFromIndex("{\"seq\":0,\"file\":\"tap-000000.npy\"}\n"));
+    const two = "{\"seq\":0,\"file\":\"tap-000000.npy\"}\n{\"seq\":1,\"file\":\"tap-000001.npy\"}\n";
+    try testing.expectEqual(@as(u64, 2), ablation.seqFromIndex(two));
+    // A torn last line (a crash mid-write) gives the highest complete seq.
+    try testing.expectEqual(@as(u64, 2), ablation.seqFromIndex(two ++ "{\"seq\":"));
 }
 
 test "deepseek_v41 ablation: the stream tap keeps the hc mean of a pass's last rows across its spans, only while on" {
