@@ -160,6 +160,8 @@ pub const KdaConsts = struct {
     eps: Array = .{},
     /// The softplus gate chain compiled (`gdn.compileGate`), for a gate without a lower bound (Ling).
     gate_fn: compiled.Closure = .{ .ctx = null },
+    /// A model plugin's own KDA stages, set after load (`kda.Stages`); none: the trunk's.
+    stages: @import("kda.zig").Stages = .{},
 };
 
 pub const Model = struct {
@@ -427,7 +429,12 @@ pub const Hooks = struct {
     /// The model's own one-kernel routed decode: each routed layer's `fused` arm, up to `rows` rows (GLM's).
     fused_decode: ?FusedDecode = null,
 
+    /// A routed layer's own router (`moe.RouterHook`) from its router weight as stored (`[experts, hidden]`,
+    /// unquantized), for the trunk's routed layers (a head's keeps the block's route); null from `fill`: the block's.
+    router: ?Router = null,
+
     pub const FusedDecode = struct { rows: c_int, run: @FieldType(moe.Fused, "run") };
+    pub const Router = struct { ctx: ?*anyopaque = null, fill: *const fn (ctx: ?*anyopaque, stored: Array) anyerror!?moe.RouterHook };
 
     /// EXL3 routed experts through their format, which the trunk never names: the spec rides inline in `Spec`, written
     /// and read by the hook alone.
@@ -781,7 +788,7 @@ const Loader = struct {
     /// sigmoid router with its selection bias, the ungated shared expert, ModelOpt's per-expert scales, a Sushi
     /// pack's EXL3 banks through the format table, GLM's one-kernel decode as the `fused` arm.
     /// `banked`: the layer's experts are the streaming pack's bank's, bound after the load (`bindBank`).
-    fn routed(l: *Loader, base: []const u8, banked: bool) !moe.Moe.Weights {
+    fn routed(l: *Loader, base: []const u8, banked: bool, trunk_layer: bool) !moe.Moe.Weights {
         const c = l.c;
         const glm = c.isGlm5();
         var nb: [256]u8 = undefined;
@@ -801,6 +808,12 @@ const Loader = struct {
             };
         };
         var router = try l.triple(try std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, rt }));
+        // A model's own router reads the weight as stored, before the trunk transposes it and widens GLM's to f32; it
+        // keeps its own reference.
+        const router_hook: ?moe.RouterHook = if (glm and trunk_layer and router.s.ctx == null and router.ext == null)
+            (if (l.hooks.router) |h| try h.fill(h.ctx, router.w) else null)
+        else
+            null;
         var shared: [3]Triple = undefined;
         for (&shared, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |*t, p| t.* = try l.triple(try std.fmt.bufPrint(&nb, "{s}.mlp.shared_experts.{s}", .{ base, p }));
         const expert_bias = if (glm)
@@ -870,6 +883,7 @@ const Loader = struct {
         } else if (glm) {
             if (l.hooks.fused_decode) |fd| w.fused = .{ .rows = fd.rows, .limit = c.swiglu_limit, .run = fd.run };
         }
+        w.router_hook = router_hook;
         w.route_fn = moe.compileRouting(&w, l.s);
         return w;
     }
@@ -893,7 +907,7 @@ const Loader = struct {
             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{base})),
             .eh_proj = try l.lin(eh, 2 * c.hidden_size),
             .mla = try l.mla(idx),
-            .moe = try l.routed(base, false),
+            .moe = try l.routed(base, false, false),
         };
     }
 
@@ -915,7 +929,7 @@ const Loader = struct {
             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{block})),
             .eh_proj = try l.lin(eh, 2 * c.hidden_size),
             .dsa = try l.dsa(block),
-            .moe = try l.routed(block, false),
+            .moe = try l.routed(block, false, false),
         };
     }
 
@@ -944,7 +958,7 @@ const Loader = struct {
                 L.ffn_hc = try l.mhc(base, "ffn_hc");
             }
             L.mixer = if (c.isLinearLayer(i)) .{ .kda = try l.kda(i) } else if (c.isGlm5()) .{ .dsa = try l.dsa(base) } else .{ .mla = try l.mla(i) };
-            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank) } else .{ .dense = try l.dense(i) };
+            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank, true) } else .{ .dense = try l.dense(i) };
             if (L.mlp == .moe and i < c.expert_limit_out.len) {
                 // Ling-3.1's clamps after the SiLU: the shared expert's in the block; the routed experts' in the composed
                 // chain (no kernel serves it), or in the bound bank's own arithmetic (`BankGeometry.limits_out`, `bindBank`).
