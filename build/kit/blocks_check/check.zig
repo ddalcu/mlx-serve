@@ -1,7 +1,8 @@
 //! Compiles every public function of `kit.blocks`, `kit.bases`, `kit.bill`, `kit.outside_model`, `kit.testing`,
-//! `kit.mlx_ops`, `kit.mlx_array`, `kit.log`, `kit.foreign` and `kit.streamed` into an object, and every MLX header
-//! `mlx_steel_sources` embeds, so a block that no longer builds from the staged kit (a file, header or module the kit
-//! lacks, a format a block still imports) fails here, not in a plugin author's build. Nothing links or runs it.
+//! `kit.mlx_ops`, `kit.mlx_array`, `kit.log`, `kit.mlx_scope`, `kit.system`, `kit.foreign` and `kit.streamed` into an
+//! object, and every MLX header `mlx_steel_sources` embeds, so a block that no longer builds from the staged kit (a
+//! file, header or module the kit lacks, a format a block still imports) fails here, not in a plugin author's build.
+//! Nothing links or runs it.
 
 const std = @import("std");
 const kit = @import("mlx_serve");
@@ -34,12 +35,15 @@ comptime {
     touch(kit.blocks, 0);
     touch(kit.bases.blocks, 1);
     touch(kit.bases.run, 2);
+    touch(kit.bases.kda_hybrid, 1);
     touch(kit.bill, 1);
     touch(kit.outside_model, 2);
     touch(kit.testing.kernel_contract, 1);
     touch(kit.mlx_ops, 2);
     touch(kit.mlx_array, 2);
     touch(kit.log, 2);
+    touch(kit.mlx_scope, 2);
+    touch(kit.system, 2);
     touch(kit.foreign, 2);
     touch(kit.streamed, 1);
     for (std.meta.declarations(steel)) |name| _ = @field(steel, name);

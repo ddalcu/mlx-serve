@@ -36,6 +36,11 @@ pub const mlx_ops = @import("mlx/ops.zig");
 pub const mlx_array = @import("mlx/array.zig");
 /// The server's leveled log: a plugin's lines go to stderr and the server's log file like the blocks' own.
 pub const log = @import("sdk/util/log.zig");
+/// The op scope over mlx-c (`mlx/scope.zig`): a forward's intermediates kept in the scope and freed together.
+pub const mlx_scope = @import("mlx/scope.zig");
+/// What the machine has and how loaded it is (`sdk/util/system.zig`): memory, memory pressure, CPU and GPU load, GPU
+/// cores.
+pub const system = @import("sdk/util/system.zig");
 /// The expert stream (`sdk/weights/streamed.zig`): routed experts read from SSD into slot rows, its residency policy and
 /// read pool, for a plugin's own bank format (`expert.stream.StreamOf` over the plugin's bank) or an MLX pack's experts
 /// as downloaded (`Streamed.openPack`). macOS only. The read pool is C a plugin compiles in (`build.zig`
@@ -46,9 +51,11 @@ pub const streamed = @import("sdk/weights/streamed.zig");
 pub const foreign = @import("sdk/quant/foreign.zig");
 
 /// The language-model bases' blocks a model plugin's own forward composes (`sdk/bases/blocks/`: the routed MLP, the
-/// gated-delta layer and its conv and state, the compiled-graph helpers), and the bases' eval cadence (`run`).
+/// gated-delta layer and its conv and state, the compiled-graph helpers), the bases' eval cadence (`run`), and the
+/// KDA-hybrid base (`kda_hybrid`: GLM-5.3-Flash's and Ling 3.0's trunk, KDA layer, slots and table glue).
 pub const bases = struct {
     pub const run = @import("sdk/bases/run.zig");
+    pub const kda_hybrid = @import("sdk/bases/kda_hybrid/kda_hybrid.zig");
     pub const blocks = struct {
         pub const compiled = @import("sdk/bases/blocks/compiled.zig");
         pub const conv1d = @import("sdk/bases/blocks/conv1d.zig");

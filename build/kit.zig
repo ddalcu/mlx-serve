@@ -262,19 +262,22 @@ fn refusalOf(c: Closure) ![]const u8 {
     };
 }
 
-test "build kit: the kit stages the blocks, bills and kernels the Ling and GLM runners reach, and the kernel contract" {
+test "build kit: the kit stages the blocks, bills and kernels the Ling and GLM runners reach, the KDA-hybrid base, and the kernel contract" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
     const staged = try stagedOf(try kitClosure(a, TreeReader{ .a = a }, "src/kit.zig"));
-    // glm5_next's trunk, kda.zig, moe.zig and table_forward.zig reach these (both runners); bailing_hybrid/plugin.zig
-    // bills its prompt pass with prefill.zig (Ling); a plugin's kernels gate on the contract in its own test step.
+    // The KDA-hybrid base (sdk/bases/kda_hybrid/: trunk, kda.zig, moe.zig) and glm5_next's table_forward.zig reach these
+    // (both runners); bailing_hybrid/plugin.zig bills its prompt pass with prefill.zig (Ling); a plugin's kernels gate on
+    // the contract in its own test step.
     for ([_][]const u8{
         "src/sdk/bases/blocks/compiled.zig",
         "src/sdk/bases/blocks/conv1d.zig",
         "src/sdk/bases/blocks/gdn.zig",
         "src/sdk/bases/blocks/moe.zig",
         "src/sdk/bases/blocks/state.zig",
+        "src/sdk/bases/kda_hybrid/kda_hybrid.zig",
+        "src/sdk/bases/kda_hybrid/trunk.zig",
         "src/sdk/bill/prefill.zig",
         "src/sdk/blocks/kda/recurrence.zig",
         "src/sdk/quant/outside_model.zig",
@@ -291,6 +294,8 @@ test "build kit: the kit stages the blocks, bills and kernels the Ling and GLM r
         }
     }
     for (staged.files) |f| try testing.expect(std.mem.startsWith(u8, f, "src/") and !kitDenied(f));
+    // The KDA-hybrid base ships without its Sushi format hook, which reaches the `sushi_exl3` module.
+    for (staged.files) |f| try testing.expect(!std.mem.eql(u8, f, "src/sdk/bases/kda_hybrid/builtin_formats.zig"));
     // A staged kernel ships with its digest line (`mlx/kernels.zig` embeds every file the list names).
     try testing.expect(std.mem.indexOf(u8, staged.digests, "  kernels/kda/qmv_header.metal\n") != null);
 }

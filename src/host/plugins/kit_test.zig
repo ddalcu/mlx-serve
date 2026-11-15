@@ -224,9 +224,10 @@ fn expectAreaExposed(comptime area: []const u8) !void {
 }
 
 test "kit: the module names the sdk files the Ling and GLM runners import, each as that file" {
-    // (the name a plugin reaches, its path from `kit`, the file the runner imports: glm5_next's trunk, kda.zig and moe.zig
-    // for both runners; bailing_hybrid's plugin.zig, mla.zig and table_forward.zig for Ling; the kernel contract for a
-    // plugin's own kernel gates)
+    // (the name a plugin reaches, its path from `kit`, the file the runner imports: the KDA-hybrid base's trunk, kda.zig
+    // and moe.zig, and the base itself, for both runners; bailing_hybrid's plugin.zig, mla.zig and table_forward.zig for
+    // Ling; mlx_scope (glm5_next.zig) and system (GLM's per-core lever) for GLM's outside plugin; the kernel contract
+    // for a plugin's own kernel gates)
     const want = .{
         .{ "bases.run", .{ "bases", "run" }, @import("../../sdk/bases/run.zig") },
         .{ "bases.blocks.compiled", .{ "bases", "blocks", "compiled" }, @import("../../sdk/bases/blocks/compiled.zig") },
@@ -242,6 +243,15 @@ test "kit: the module names the sdk files the Ling and GLM runners import, each 
         .{ "log", .{"log"}, @import("../../sdk/util/log.zig") },
         .{ "mlx_ops", .{"mlx_ops"}, @import("../../mlx/ops.zig") },
         .{ "mlx_array", .{"mlx_array"}, @import("../../mlx/array.zig") },
+        .{ "mlx_scope", .{"mlx_scope"}, @import("../../mlx/scope.zig") },
+        .{ "system", .{"system"}, @import("../../sdk/util/system.zig") },
+        .{ "bases.kda_hybrid.config", .{ "bases", "kda_hybrid", "config" }, @import("../../sdk/bases/kda_hybrid/config.zig") },
+        .{ "bases.kda_hybrid.trunk", .{ "bases", "kda_hybrid", "trunk" }, @import("../../sdk/bases/kda_hybrid/trunk.zig") },
+        .{ "bases.kda_hybrid.kda", .{ "bases", "kda_hybrid", "kda" }, @import("../../sdk/bases/kda_hybrid/kda.zig") },
+        .{ "bases.kda_hybrid.slots", .{ "bases", "kda_hybrid", "slots" }, @import("../../sdk/bases/kda_hybrid/slots.zig") },
+        .{ "bases.kda_hybrid.host", .{ "bases", "kda_hybrid", "host" }, @import("../../sdk/bases/kda_hybrid/host.zig") },
+        .{ "bases.kda_hybrid.moe", .{ "bases", "kda_hybrid", "moe" }, @import("../../sdk/bases/kda_hybrid/moe.zig") },
+        .{ "bases.kda_hybrid.fixture", .{ "bases", "kda_hybrid", "fixture" }, @import("../../sdk/bases/kda_hybrid/fixture.zig") },
     };
     var missing: usize = 0;
     inline for (want) |w| {
