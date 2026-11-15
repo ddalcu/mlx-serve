@@ -174,9 +174,14 @@ pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
 /// !modelBatchable, and never name ONE arch here: when a second module-owned
 /// arch arrived, this function's hardcoded `dsv4` check silently never
 /// reached the gate for it.
+/// A streamed bank is single-flight too: its rooms are billed for one live request (`LoadCtx.stream_room`) and its
+/// admission bills the pack at 0, so a second slot's KV and transients would sit outside them.
 fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     const t = model.transformer orelse return false;
-    if (t.config.plugin) |p| if (p.parsed.caps.slot_state) return false;
+    if (t.config.plugin) |p| {
+        if (p.parsed.caps.streamed_weights) return true;
+        if (p.parsed.caps.slot_state) return false;
+    }
     return t.ownsModuleDecodeState();
 }
 

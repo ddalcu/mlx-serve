@@ -48,6 +48,7 @@ Memory bills + admission:
 - **A video response is ONE JSON body**: the transport cap bills DELIVERED frames incl. chain windows (#283, `videoRgbTransportReason`, 768 MB).
 - **A resident H3 DiT must skip the AdaLN precompute and keep its adapters in the cache** (`minimax_h3.Resident`): precompute frees the modulation weights and bakes tables for ONE schedule, and a LoRA stack's refs point into the stack that bound them. Residency is all-or-nothing against LIVE memory and every other load releases it before refusing (`availForLoad`).
 - **Serial ≠ exclusive**: module-owned decode state needs admission single-flight (`admitPendingTick` on `modelExclusiveDecode`); held slots stay in `pending`.
+  A streamed bank (`Caps.streamed_weights`) is single-flight too: its rooms bill one live request and its admission bills 0.
 
 Prefix cache (RAM + SSD):
 - Disabled prefix retention reserves zero bytes in context sizing, chunk sizing and reported cache budgets; the configured byte cap is not proof that the cache exists.
