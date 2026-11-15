@@ -22,6 +22,8 @@ const getGdnKernel = @import("kernels.zig").getGdnKernel;
 const getGdnKernelSeq = @import("kernels.zig").getGdnKernelSeq;
 const GdnPreworkArgs = decode_fused.GdnPreworkArgs;
 const gdnNormGateFused = decode_fused.gdnNormGateFused;
+const gdnNormGatePrompt = decode_fused.gdnNormGatePrompt;
+const hc_max_seq = @import("../hc/hc_prefill.zig").max_seq;
 const gdnParityRand = decode_fused.gdnParityRand;
 const gdnPreworkFused = decode_fused.gdnPreworkFused;
 const ModelConfig = @import("../../config/model.zig").ModelConfig;
@@ -365,7 +367,7 @@ test "gdn packed prework: bit-identical to the composed chain at decode and pref
         decode_fused.gdn_prefill_fused_override = false;
         try std.testing.expect((try gdnPreworkFused(s, args)) == null);
         decode_fused.gdn_prefill_fused_override = true;
-        args.seq = @import("../hc/hc_prefill.zig").max_seq + 1;
+        args.seq = hc_max_seq + 1;
         try std.testing.expect((try gdnPreworkFused(s, args)) == null);
         args.seq = 17;
         args.batch = 3;
@@ -1564,7 +1566,7 @@ fn gdnDecodeParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, 
     try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(state_ref, rec.ssm_state, s));
 }
 
-test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and prefill widths, z at a folded offset" {
+test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode, prefill and prompt widths, z at a folded offset" {
     const s = mlx.gpuStream();
     decode_fused.gdn_prefill_fused_override = true;
     defer decode_fused.gdn_prefill_fused_override = null;
@@ -1582,7 +1584,8 @@ test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and
     const eps_arr = mlx.mlx_array_new_float(eps);
     defer _ = mlx.mlx_array_free(eps_arr);
 
-    for ([_]c_int{ 1, 4, 9, 16, 17, 65, 513, 8703 }) |seq| {
+    for ([_]c_int{ 1, 4, 9, 16, 17, 65, 513, 8703, 16387 }) |seq| {
+        const prompt = seq > hc_max_seq;
         const y_shape = [_]c_int{ 1, seq, hv, dv };
         const y = try attn256RandBf16Scaled(rnd, &y_shape, 8.0, s);
         defer _ = mlx.mlx_array_free(y);
@@ -1598,6 +1601,7 @@ test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and
             try testing.expect((try gdnNormGateFused(s, y, raw, z_off, width, norm_w, eps_arr, false, hv, dv, 1, seq)) == null);
             decode_fused.gdn_prefill_fused_override = true;
         }
+        if (prompt) try testing.expect((try gdnNormGateFused(s, y, raw, z_off, width, norm_w, eps_arr, false, hv, dv, 1, seq)) == null);
 
         // Composed: rms_norm(y, w), then either silu(z) * normed (swish) or
         // normed * sigmoid(z) (sigmoid gate), flattened.
@@ -1613,7 +1617,10 @@ test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and
         defer _ = mlx.mlx_array_free(sig);
         try mlx.check(mlx.mlx_sigmoid(&sig, z_heads, s));
         for ([_]bool{ true, false }) |swish| {
-            const fused = (try gdnNormGateFused(s, y, raw, z_off, width, norm_w, eps_arr, swish, hv, dv, 1, seq)) orelse return error.FusedDeclined;
+            const fused = (if (prompt)
+                try gdnNormGatePrompt(s, y, raw, z_off, width, norm_w, eps_arr, swish, hv, dv, seq)
+            else
+                try gdnNormGateFused(s, y, raw, z_off, width, norm_w, eps_arr, swish, hv, dv, 1, seq)) orelse return error.FusedDeclined;
             defer _ = mlx.mlx_array_free(fused);
             var gated = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gated);
@@ -1630,7 +1637,27 @@ test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and
             defer _ = mlx.mlx_array_free(ref);
             try mlx.check(mlx.mlx_reshape(&ref, gated, &flat_shape, 3, s));
             try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(fused, ref, s));
+            if (seq >= 17 and !prompt) {
+                // the prompt arm, with the prefill seam off: the same bytes
+                decode_fused.gdn_prefill_fused_override = false;
+                const p = (try gdnNormGatePrompt(s, y, raw, z_off, width, norm_w, eps_arr, swish, hv, dv, seq)) orelse return error.FusedDeclined;
+                defer _ = mlx.mlx_array_free(p);
+                decode_fused.gdn_prefill_fused_override = true;
+                try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(p, ref, s));
+            }
         }
+    }
+    // a prompt arm is 17 rows or more
+    {
+        const y_shape = [_]c_int{ 1, 16, hv, dv };
+        const y = try attn256RandBf16(rnd, &y_shape, s);
+        defer _ = mlx.mlx_array_free(y);
+        const z_shape = [_]c_int{ 1, 16, value_dim };
+        const z = try attn256RandBf16(rnd, &z_shape, s);
+        defer _ = mlx.mlx_array_free(z);
+        decode_fused.gdn_decode_fused_override = false;
+        try std.testing.expect((try gdnNormGatePrompt(s, y, z, 0, value_dim, norm_w, eps_arr, false, hv, dv, 16)) == null);
+        decode_fused.gdn_decode_fused_override = true;
     }
     // Decline: fusions off.
     decode_fused.gdn_decode_fused_override = false;
