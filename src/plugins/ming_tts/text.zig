@@ -15,6 +15,7 @@
 //! - Input arrives NFC: `plugin.zig` normalizes `input` and `ref_text` (`sdk/tokenizer/nfc.zig`).
 
 const std = @import("std");
+const number_words = @import("../../sdk/media/number_words.zig");
 
 pub const Cp = u21;
 pub const Cps = std.ArrayList(Cp);
@@ -139,9 +140,7 @@ fn isAsciiSpace(c: Cp) bool {
     return c == ' ' or c == '\t' or c == '\n' or c == '\r' or c == 0x0b or c == 0x0c;
 }
 
-pub fn isCjk(c: Cp) bool {
-    return c >= 0x4e00 and c <= 0x9fff;
-}
+pub const isCjk = @import("../../sdk/tokenizer/pretokenize.zig").isCjk;
 
 /// Python `str.isalpha` for the scripts the model speaks (see ceilings).
 pub fn isAlpha(c: Cp) bool {
@@ -262,73 +261,11 @@ fn replaceAll(a: std.mem.Allocator, s: *Cps, from: []const u8, to: []const u8) !
 // English numbers (inflect.number_to_words / ordinal)
 // ─────────────────────────────────────────────────────────────────────────
 
-const ONES = [_][]const u8{ "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen" };
-const TENS = [_][]const u8{ "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety" };
-const SCALES = [_][]const u8{ "", "thousand", "million", "billion", "trillion", "quadrillion", "quintillion", "sextillion", "septillion", "octillion", "nonillion", "decillion" };
-
-fn under100(a: std.mem.Allocator, out: *std.ArrayList(u8), n: u32) !void {
-    if (n < 20) return out.appendSlice(a, ONES[n]);
-    try out.appendSlice(a, TENS[n / 10]);
-    if (n % 10 != 0) {
-        try out.append(a, '-');
-        try out.appendSlice(a, ONES[n % 10]);
-    }
-}
-
-fn under1000(a: std.mem.Allocator, out: *std.ArrayList(u8), n: u32, and_word: bool) !void {
-    if (n >= 100) {
-        try out.appendSlice(a, ONES[n / 100]);
-        try out.appendSlice(a, " hundred");
-        if (n % 100 != 0) {
-            try out.appendSlice(a, if (and_word) " and " else " ");
-            try under100(a, out, n % 100);
-        }
-    } else try under100(a, out, n);
-}
-
 /// inflect `number_to_words(n)` (and_word) or `(n, andword="")`.
 pub fn numberToWords(a: std.mem.Allocator, digits: []const u8, and_word: bool) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(a);
-    var d = digits;
-    while (d.len > 1 and d[0] == '0') d = d[1..];
-    if (d.len > 3 * SCALES.len) {
-        // Beyond the scale names: read digit by digit.
-        for (d, 0..) |c, i| {
-            if (i > 0) try out.append(a, ' ');
-            try out.appendSlice(a, ONES[c - '0']);
-        }
-        return out.toOwnedSlice(a);
-    }
-    if (d.len == 1 and d[0] == '0') {
-        try out.appendSlice(a, "zero");
-        return out.toOwnedSlice(a);
-    }
-    var groups: [SCALES.len]u32 = @splat(0);
-    var ng: usize = 0;
-    var end = d.len;
-    while (end > 0) : (ng += 1) {
-        const start = if (end >= 3) end - 3 else 0;
-        groups[ng] = std.fmt.parseInt(u32, d[start..end], 10) catch 0;
-        end = start;
-    }
-    var first = true;
-    var gi = ng;
-    while (gi > 0) {
-        gi -= 1;
-        const v = groups[gi];
-        if (v == 0) continue;
-        if (!first) {
-            // The last group under 100 joins with "and" (or a space), others with ", ".
-            if (gi == 0 and v < 100) try out.appendSlice(a, if (and_word) " and " else " ") else try out.appendSlice(a, ", ");
-        }
-        try under1000(a, &out, v, and_word);
-        if (gi > 0) {
-            try out.append(a, ' ');
-            try out.appendSlice(a, SCALES[gi]);
-        }
-        first = false;
-    }
+    try number_words.append(a, &out, digits, if (and_word) .inflect_and else .inflect);
     return out.toOwnedSlice(a);
 }
 
@@ -375,7 +312,7 @@ fn decimalWords(a: std.mem.Allocator, num: []const Cp, and_word: bool, zero_word
         try out.appendSlice(a, " point");
         for (dpd) |c| {
             try out.append(a, ' ');
-            try out.appendSlice(a, ONES[c - '0']);
+            try out.appendSlice(a, number_words.ONES[c - '0']);
         }
         return try out.toOwnedSlice(a);
     }
@@ -1954,7 +1891,7 @@ pub fn detectLanguage(text_utf8: []const u8) ?[]const u8 {
         const cp: u21 = cp_opt orelse ' ';
         if ((cp >= 0x3040 and cp <= 0x30FF) or (cp >= 0x31F0 and cp <= 0x31FF)) kana += 1;
         if ((cp >= 0xAC00 and cp <= 0xD7A3) or (cp >= 0x1100 and cp <= 0x11FF) or (cp >= 0x3130 and cp <= 0x318F)) hangul += 1;
-        if (cp >= 0x4E00 and cp <= 0x9FFF) han += 1;
+        if (isCjk(cp)) han += 1;
         switch (cp) {
             'é', 'è', 'ê', 'à', 'ù', 'ç', 'œ', 'â', 'î', 'ô', 'û', 'ë', 'ï', 'É', 'È', 'À', 'Ç' => score[1] += 2,
             'ä', 'ö', 'ü', 'ß', 'Ä', 'Ö', 'Ü' => score[2] += 2,

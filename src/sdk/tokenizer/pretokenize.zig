@@ -482,6 +482,19 @@ fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
     return CpInfo{ .cp = cp, .len = end - pos };
 }
 
+/// CJK Unified Ideographs, U+4E00..U+9FFF: the `'\u4e00' <= c <= '\u9fff'` test of most text frontends.
+pub fn isCjk(cp: u21) bool {
+    return cp >= 0x4E00 and cp <= 0x9FFF;
+}
+
+/// `isCjk` plus Extension A, Extensions B-F and the compatibility ideographs: Qwen3-ASR's `is_cjk_char`.
+pub fn isCjkExtended(cp: u21) bool {
+    return switch (cp) {
+        0x4E00...0x9FFF, 0x3400...0x4DBF, 0x20000...0x2A6DF, 0x2A700...0x2B73F, 0x2B740...0x2B81F, 0x2B820...0x2CEAF, 0xF900...0xFAFF => true,
+        else => false,
+    };
+}
+
 pub fn isLetter(cp: u21) bool {
     // The script ranges below are whole blocks; their digits are \p{N}, not letters.
     if (cp >= 0x80 and isDigit(cp)) return false;
@@ -491,7 +504,7 @@ pub fn isLetter(cp: u21) bool {
     // Common Unicode letter ranges
     if (cp >= 0xC0 and cp <= 0x024F) return true; // Latin Extended
     if (cp >= 0x0400 and cp <= 0x04FF) return true; // Cyrillic
-    if (cp >= 0x4E00 and cp <= 0x9FFF) return true; // CJK
+    if (isCjk(cp)) return true;
     if (cp >= 0x3040 and cp <= 0x30FF) return true; // Hiragana/Katakana
     if (cp >= 0xAC00 and cp <= 0xD7AF) return true; // Korean
     if (cp >= 0x0600 and cp <= 0x06FF) return true; // Arabic

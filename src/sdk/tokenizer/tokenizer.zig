@@ -3,6 +3,7 @@ const std = @import("std");
 pub const isWhitespaceCp = @import("pretokenize.zig").isWhitespaceCp;
 pub const isLetter = @import("pretokenize.zig").isLetter;
 pub const isDigit = @import("pretokenize.zig").isDigit;
+pub const isCjkExtended = @import("pretokenize.zig").isCjkExtended;
 pub const loadTokenizer = @import("load.zig").loadTokenizer;
 pub const loadTiktoken = @import("load.zig").loadTiktoken;
 pub const loadTokenizerAny = @import("load.zig").loadTokenizerAny;

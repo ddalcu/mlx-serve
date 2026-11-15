@@ -23,6 +23,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const log = @import("../../sdk/util/log.zig");
+const number_words = @import("../../sdk/media/number_words.zig");
 
 pub const Phonemizer = struct {
     allocator: std.mem.Allocator,
@@ -488,41 +489,9 @@ fn parseGrouped(allocator: std.mem.Allocator, raw: []const u8) !u64 {
     return std.fmt.parseInt(u64, digits.items, 10);
 }
 
-const ONES = [_][]const u8{ "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen" };
-const TENS = [_][]const u8{ "", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety" };
-
 pub fn appendNumberWords(allocator: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), n: u64) !void {
-    if (n < 20) {
-        try out.appendSlice(allocator, ONES[@intCast(n)]);
-        return;
-    }
-    if (n < 100) {
-        try out.appendSlice(allocator, TENS[@intCast(n / 10)]);
-        if (n % 10 != 0) {
-            try out.append(allocator, ' ');
-            try out.appendSlice(allocator, ONES[@intCast(n % 10)]);
-        }
-        return;
-    }
-    const scales = [_]struct { v: u64, name: []const u8 }{
-        .{ .v = 1_000_000_000_000, .name = "trillion" },
-        .{ .v = 1_000_000_000, .name = "billion" },
-        .{ .v = 1_000_000, .name = "million" },
-        .{ .v = 1_000, .name = "thousand" },
-        .{ .v = 100, .name = "hundred" },
-    };
-    for (scales) |s| {
-        if (n >= s.v) {
-            try appendNumberWords(allocator, out, n / s.v);
-            try out.append(allocator, ' ');
-            try out.appendSlice(allocator, s.name);
-            if (n % s.v != 0) {
-                try out.append(allocator, ' ');
-                try appendNumberWords(allocator, out, n % s.v);
-            }
-            return;
-        }
-    }
+    var buf: [20]u8 = undefined;
+    try number_words.append(allocator, out, std.fmt.bufPrint(&buf, "{d}", .{n}) catch unreachable, .plain);
 }
 
 // ════════════════════════════════════════════════════════════════════════
