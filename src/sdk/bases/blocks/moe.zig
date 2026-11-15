@@ -1429,6 +1429,82 @@ test "moe: prompt spans join one routed call only on a streamed source that decl
     try t.expect(!joinServes(&w, &.{ 40, 31 }));
 }
 
+test "moe: in a list of prompt spans one short span alone fails spanJoins, and joinServes over the whole list stays false" {
+    const t = std.testing;
+    const none: Array = .{ .ctx = null };
+    const bank: Bank = .{ .w = none, .qp = .{ .bits = 3, .group_size = 64 } };
+    const source: routed.Routed = .{ .ctx = &JoinSeams.ctx, .math = .{ .source = &JoinSeams.source }, .settle_fn = &JoinSeams.settle, .decode_ids = 64, .rows_independent = true };
+    var w: Moe.Weights = .{ .router = .{}, .route = .softmax, .gate = bank, .up = bank, .down = bank, .top_k = 8, .experts = 288, .streamed = .{ .routed = source, .layer = 3 } };
+    // a whole-prompt pass's spans: two chunks, a remainder of 5 rows (5 x 8 ids = 40, a decode-lane call alone), the tail
+    const spans = [_]c_int{ 16_384, 16_384, 5, 31 };
+    for (spans) |n| try t.expectEqual(n != 5, spanJoins(&w, n));
+    try t.expect(!joinServes(&w, &spans));
+    // the eligible spans join; the short one runs on its own call
+    try t.expect(joinServes(&w, &.{ 16_384, 16_384, 31 }));
+    // 8 rows x 8 ids = decode_ids: still the decode lane's
+    try t.expect(!spanJoins(&w, 8) and spanJoins(&w, 9));
+    // a layer that cannot join: no span joins
+    w.streamed.?.routed.rows_independent = false;
+    for (spans) |n| try t.expect(!spanJoins(&w, n));
+}
+
+test "moe: a mixed span list, joined where spans join and alone where they do not, equals one routed call per span bit for bit" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const testing = std.testing;
+    var g = Graph.init(testing.allocator, mlx.gpuStream());
+    defer g.deinit();
+    var prng = std.Random.DefaultPrng.init(29);
+    const D = 128;
+    const E = 8;
+    var router: [D * E]f32 = @splat(0);
+    for (&router) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    var bias: [E]f32 = @splat(0);
+    for (&bias) |*v| v.* = prng.random().floatNorm(f32) * 0.1;
+    const unbuilt: Bank = .{ .w = .{ .ctx = null }, .qp = .{ .bits = 4, .group_size = 64 } };
+    var src = RowsSource.of(false);
+    src.rows_independent = true;
+    const w: Moe.Weights = .{
+        .router = .{ .w = try g.astype(try g.fromSlice(f32, &router, &.{ D, E }), .bfloat16) },
+        .route = .{ .sigmoid_bias = .{ .expert_bias = try g.fromSlice(f32, &bias, &.{E}), .norm = true, .scale = 2.5 } },
+        .gate = unbuilt,
+        .up = unbuilt,
+        .down = unbuilt,
+        .shared = .{ .gate = try testAffine(&g, &prng, 64, D), .up = try testAffine(&g, &prng, 64, D), .down = try testAffine(&g, &prng, D, 64) },
+        .top_k = 2,
+        .experts = E,
+        .streamed = .{ .routed = src, .layer = 0 },
+    };
+    // [long, short, long]: the 2-row span's 4 routed ids are the source's decode lane (decode_ids 4)
+    const spans = [_]c_int{ 9, 2, 7 };
+    var xs: [spans.len]Array = undefined;
+    var routes: [spans.len]SpanRoute = undefined;
+    for (&xs, &routes, spans) |*x, *r, n| {
+        const buf = try g.a.alloc(f32, @intCast(n * D));
+        defer g.a.free(buf);
+        for (buf) |*v| v.* = prng.random().floatNorm(f32);
+        x.* = try g.astype(try g.fromSlice(f32, buf, &.{ 1, n, D }), .bfloat16);
+        r.* = try mlpRoute(&w, &g, x.*);
+    }
+    try testing.expect(spanJoins(&w, spans[0]) and !spanJoins(&w, spans[1]) and spanJoins(&w, spans[2]));
+    try testing.expect(joinServes(&w, &.{ spans[0], spans[2] }) and !joinServes(&w, &spans));
+    // arm 2: one routed call per span
+    RowsSource.calls = 0;
+    var apart: [spans.len]Array = undefined;
+    for (&apart, xs, routes) |*o, x, r| o.* = try routedSum(&w, &g, x, r.inds, r.scores);
+    const calls_apart = RowsSource.calls;
+    // arm 1: the joinable spans in one call, the short one alone
+    RowsSource.calls = 0;
+    const joined = try routedSum(&w, &g, try g.concat(&.{ xs[0], xs[2] }, 1), try g.concat(&.{ routes[0].inds, routes[2].inds }, 1), try g.concat(&.{ routes[0].scores, routes[2].scores }, 1));
+    const short = try routedSum(&w, &g, xs[1], routes[1].inds, routes[1].scores);
+    try testing.expectEqual(calls_apart - 1, RowsSource.calls);
+    try ops.expectBitEqual(try g.sliceAxis(joined, 1, 0, spans[0]), apart[0]);
+    try ops.expectBitEqual(short, apart[1]);
+    try ops.expectBitEqual(try g.sliceAxis(joined, 1, spans[0], spans[0] + spans[2]), apart[2]);
+    // and each span's mlp, finished on its rows of the sum
+    try ops.expectBitEqual(try mlpFinish(&w, &g, xs[1], short), try mlp(&w, &g, xs[1]));
+    try ops.expectBitEqual(try mlpFinish(&w, &g, xs[2], try g.sliceAxis(joined, 1, spans[0], spans[0] + spans[2])), try mlp(&w, &g, xs[2]));
+}
+
 test "moe: mlpRoute serves a span wider than the layer's fused arm, and refuses one it would take" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     const testing = std.testing;
