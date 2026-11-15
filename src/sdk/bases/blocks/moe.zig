@@ -245,6 +245,25 @@ fn route(w: *const Moe.Weights, g: *Graph, logits: Array, fold: ?router_kernel.R
     }
 }
 
+/// A prompt call's predicted routes for `w`'s streamed layer from `x` (the rows normed as this MoE's input would be),
+/// read ahead into the bank while the layer's attention runs (`Routed.read_ahead_fn`, as deepseek_v41's `readAhead`). A
+/// prediction only: it never decides which experts are routed. Without a streamed bank or a read-ahead it does nothing.
+pub fn readAhead(w: *const Moe.Weights, s: ops.Stream, x: Array) !void {
+    const st = w.streamed orelse return;
+    const ra = st.routed.read_ahead_fn orelse return;
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    const r = try route(w, &g, try routerLogits(w, &g, x), null);
+    const host = try g.astype(r.inds, .uint32);
+    try mlx.check(mlx.mlx_array_eval(host));
+    const n = mlx.mlx_array_size(host);
+    const src = (mlx.mlx_array_data_uint32(host) orelse return error.NoData)[0..n];
+    const ids = try g.a.alloc(u16, n);
+    defer g.a.free(ids);
+    for (ids, src) |*d, v| d.* = @intCast(v);
+    try ra(st.routed.ctx, st.layer, ids).get();
+}
+
 // ── the MLP ──
 
 /// `act(gate) * up`: SiLU, clamped where the pack clamps.
@@ -267,22 +286,23 @@ fn swigluAct(w: *const Moe.Weights, parent: *Graph, gate: Array, up: Array, limi
     return parent.keep(try t.mul(try t.mul(gate, try t.sigmoid(gate)), up));
 }
 
+/// At one row the shared expert's gate logit rides the softmax router kernel.
+fn routerFold(w: *const Moe.Weights, x: Array, logits: Array) ?router_kernel.RouterGate {
+    const se = w.shared orelse return null;
+    if (w.route != .softmax or !se.gated() or se.gate_vec.ctx == null) return null;
+    const lsh = ops.shape(logits);
+    var rows: usize = 1;
+    for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
+    if (rows != 1 or mlx.mlx_array_size(x) != mlx.mlx_array_size(se.gate_vec)) return null;
+    return .{ .x = x, .w = se.gate_vec };
+}
+
 pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     var t = parent.scope();
     defer t.deinit();
     const g = &t;
     const logits = try routerLogits(w, g, x);
-
-    // At one row the shared expert's gate logit rides the softmax router kernel.
-    const fold: ?router_kernel.RouterGate = blk: {
-        const se = w.shared orelse break :blk null;
-        if (w.route != .softmax or !se.gated() or se.gate_vec.ctx == null) break :blk null;
-        const lsh = ops.shape(logits);
-        var rows: usize = 1;
-        for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
-        if (rows != 1 or mlx.mlx_array_size(x) != mlx.mlx_array_size(se.gate_vec)) break :blk null;
-        break :blk .{ .x = x, .w = se.gate_vec };
-    };
+    const fold = routerFold(w, x, logits);
     var r = try route(w, g, logits, fold);
     const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x, false) else null;
     // The group-limited chain hands its weights back in f32; they land in the activation dtype.
@@ -299,6 +319,38 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     const down = shared_down orelse try sharedDown(w, g, &se, x, false);
     const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
     return parent.keep(try g.add(y.sum, try g.mul(try g.sigmoid(logit), down)));
+}
+
+/// `mlp` split around its routed call, for a prompt whose spans route and finish one at a time while one call takes
+/// several spans' rows: `mlpRoute` (the routes, their weights in `x`'s dtype), `routedSum` over the joined rows, then
+/// `mlpFinish` on each span's rows of that sum. Op for op `mlp` wherever no router fold, gate logit or model kernel
+/// applies; `mlpRoute` refuses where one does.
+pub const SpanRoute = struct { inds: Array, scores: Array };
+
+pub fn mlpRoute(w: *const Moe.Weights, parent: *Graph, x: Array) !SpanRoute {
+    if (w.fused != null) return error.MoeSpanFusedArm;
+    var t = parent.scope();
+    defer t.deinit();
+    const g = &t;
+    const logits = try routerLogits(w, g, x);
+    if (routerFold(w, x, logits) != null) return error.MoeSpanRouterFold;
+    var r = try route(w, g, logits, null);
+    if (r.gate_logit != null) return error.MoeSpanGateLogit;
+    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+    if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
+    return .{ .inds = try parent.keep(r.inds), .scores = try parent.keep(r.scores) };
+}
+
+/// `mlp`'s end over `x`'s rows of the routed sum (`sum`, `[B, S, D]`): the shared expert, gated or not, added.
+pub fn mlpFinish(w: *const Moe.Weights, parent: *Graph, x: Array, sum: Array) !Array {
+    var t = parent.scope();
+    defer t.deinit();
+    const g = &t;
+    const se = w.shared orelse return parent.keep(sum);
+    if (!se.gated()) return parent.keep(try g.add(sum, try sharedDown(w, g, &se, x, false)));
+    const down = try sharedDown(w, g, &se, x, false);
+    const logit = try se.gate_logit.forward(g, x);
+    return parent.keep(try g.add(sum, try g.mul(try g.sigmoid(logit), down)));
 }
 
 /// `mlp` with each row of one sequence's `x` `[1, S, D]` given its own one-row call's bytes (a verify that must equal
