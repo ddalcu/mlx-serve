@@ -847,6 +847,134 @@ test "driver: Ling's decode room leaves GLM's rooms as they were: the built-in's
     try t.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
 }
 
+/// Streamed bills for the decode-room tests, each as a plugin writes it: `out.* = .{ ... }` at the current size, or an
+/// older plugin's struct (sized before `flags`).
+const FlagProbe = struct {
+    fn prefill(_: *const abi.Parsed, _: u64, _: u32, _: u8, _: u64) callconv(.c) u64 {
+        return 3 << 30;
+    }
+    fn termsOnly(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .kv_per_token = 368_640, .ssm_checkpoint = 1 << 20 };
+    }
+    fn priced(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .kv_per_token = 368_640, .prefill_bytes = &prefill };
+    }
+    fn pricedBilled(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .prefill_bytes = &prefill, .flags = .{ .decode_room = .billed } };
+    }
+    fn unbilled(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .flags = .{ .decode_room = .unbilled } };
+    }
+    /// The unnamed value 3.
+    fn unnamed(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .flags = .{ .decode_room = @enumFromInt(3) } };
+    }
+    fn olderTerms(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .size = @offsetOf(abi.Bill, "flags") };
+    }
+    /// An older plugin leaves the bytes past its struct alone: a flag there is not its own.
+    fn olderPriced(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .size = @offsetOf(abi.Bill, "flags"), .prefill_bytes = &prefill, .flags = .{ .decode_room = .billed } };
+    }
+};
+
+/// The tiny Ling fixture served through a test binding under any `model_type`; `deinit` gives back its own fields first.
+const FlagCfg = struct {
+    cfg: ModelConfig,
+    own_plugin: @FieldType(ModelConfig, "plugin"),
+    own_type: []const u8,
+
+    fn init(binding: *plugin_config.Binding, model_type: []const u8) !FlagCfg {
+        const cfg = try model.parseConfigFromJson(std.testing.allocator, @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json"));
+        var f: FlagCfg = .{ .cfg = cfg, .own_plugin = cfg.plugin, .own_type = cfg.model_type };
+        f.cfg.plugin = binding;
+        f.cfg.model_type = model_type;
+        return f;
+    }
+    fn deinit(f: *FlagCfg) void {
+        f.cfg.plugin = f.own_plugin;
+        f.cfg.model_type = f.own_type;
+        f.cfg.deinit(std.testing.allocator);
+    }
+};
+
+fn decodeRoomOf(cfg: *const ModelConfig) u64 {
+    const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(cfg, abi.stream_room_cell, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
+    return (64 << 30) - need - @import("../runtime/preflight.zig").mtpCoarseBytes(cfg, false) - (1 << 30);
+}
+
+fn streamedBinding(table: *abi.ModelTable, bill: @FieldType(abi.ModelTable, "bill")) plugin_config.Binding {
+    table.bill = bill;
+    return .{ .table = table, .parsed = .{ .caps = .{ .streamed_weights = true }, .spec = .{ .mtp_layout = .in_checkpoint } } };
+}
+
+test "driver: a streamed model outside GLM's and Ling's names whose bill sets decode_room billed gets its own decode room" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.pricedBilled);
+    var toy = try FlagCfg.init(&binding, "toy_hybrid");
+    defer toy.deinit();
+    try std.testing.expect(decodeBilled(&toy.cfg));
+    try std.testing.expectEqual(decodeRoomOf(&toy.cfg), streamRoomDecodeAt(&toy.cfg, 64 << 30, 1 << 30));
+    // Only a streamed model is read.
+    binding.parsed.caps.streamed_weights = false;
+    try std.testing.expect(!decodeBilled(&toy.cfg));
+}
+
+test "driver: a streamed GLM that prices its own prompt and sets decode_room billed gets its own decode room" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.pricedBilled);
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    try std.testing.expect(decodeBilled(&cfg));
+    try std.testing.expectEqual(decodeRoomOf(&cfg), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+}
+
+test "driver: a streamed GLM set to decode_room unbilled gets no decode room of its own" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.unbilled);
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    try std.testing.expect(!decodeBilled(&cfg));
+    try std.testing.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, 32_768, abi.stream_room_cell).decode);
+}
+
+test "driver: a plugin's bill at the current size that leaves its flags alone keeps the by-name decode rule" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.termsOnly);
+    // GLM's shape (no prompt bill of its own): decode-billed by name.
+    var glm = @import("../admission/bills_test.zig").glm5TestConfig();
+    glm.plugin = &binding;
+    try std.testing.expect(decodeBilled(&glm));
+    try std.testing.expectEqual(decodeRoomOf(&glm), streamRoomDecodeAt(&glm, 64 << 30, 1 << 30));
+    // Ling's shape (its prompt priced): decode-billed by name; the same bill on another model is not.
+    table.bill = &FlagProbe.priced;
+    var ling = try FlagCfg.init(&binding, "bailing_hybrid");
+    defer ling.deinit();
+    try std.testing.expect(decodeBilled(&ling.cfg));
+    try std.testing.expect(!decodeBilled(&glm));
+    ling.cfg.model_type = "toy_hybrid";
+    try std.testing.expect(!decodeBilled(&ling.cfg));
+    // The unnamed value 3 reads as by_name.
+    table.bill = &FlagProbe.unnamed;
+    try std.testing.expect(decodeBilled(&glm) and !decodeBilled(&ling.cfg));
+}
+
+test "driver: an older plugin's bill, sized before its flags, keeps the by-name decode rule" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.olderTerms);
+    var glm = @import("../admission/bills_test.zig").glm5TestConfig();
+    glm.plugin = &binding;
+    try std.testing.expect(decodeBilled(&glm));
+    table.bill = &FlagProbe.olderPriced;
+    try std.testing.expect(!decodeBilled(&glm));
+    var ling = try FlagCfg.init(&binding, "bailing_hybrid");
+    defer ling.deinit();
+    try std.testing.expect(decodeBilled(&ling.cfg));
+    ling.cfg.model_type = "toy_hybrid";
+    try std.testing.expect(!decodeBilled(&ling.cfg));
+}
+
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
     var cfg = ModelConfig{};
     cfg.legacy.caps.owns_decode_state = true;

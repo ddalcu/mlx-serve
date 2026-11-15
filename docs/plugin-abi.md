@@ -463,6 +463,25 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 | `prefill_attn_keys` | `?*const fn (p: *const Parsed, seq: u64) callconv(.c) u64` | `null` |  |
 | `prefill_bytes` | `?*const fn (p: *const Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64` | `null` |  |
 | `batched_kv_len` | `?*const fn (p: *const Parsed, kv: u32, gather_on: bool, min: u32) callconv(.c) u32` | `null` |  |
+| `flags` | `BillFlags` | `.{}` | A u32 at offset 88, read through `billFlags`. Zero keeps the host's rules from before it. |
+
+### `BillFlags` (packed struct(u32))
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `decode_room` | `DecodeRoom` | `.by_name` |  |
+| `_` | `u30` | `0` |  |
+
+### `DecodeRoom` (enum(u2))
+
+Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`), priced by the engine's kda_hybrid decode bill.
+
+| Member | Value | |
+|---|---|---|
+| `by_name` | `0` | The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed value 3 reads as this. |
+| `billed` | `1` |  |
+| `unbilled` | `2` |  |
+| `_` | |  |
 
 ### `LoadCtx` (extern struct)
 
