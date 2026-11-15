@@ -6,12 +6,12 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const host = @import("host.zig");
+const host = @import("../../sdk/bases/kda_hybrid/host.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
-const fixture = @import("fixture.zig");
+const fixture = @import("../../sdk/bases/kda_hybrid/fixture.zig");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
-const trunk = @import("trunk.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;

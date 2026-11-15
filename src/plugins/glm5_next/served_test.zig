@@ -16,9 +16,9 @@ const Generator = @import("../../engines/mlx/generate/generator.zig").Generator;
 const Tokenizer = @import("../../sdk/tokenizer/tokenizer.zig").Tokenizer;
 const driver = @import("../../engines/mlx/plugin/driver.zig");
 const File = @import("../../sdk/root.zig").fixture.File;
-const fixture = @import("fixture.zig");
+const fixture = @import("../../sdk/bases/kda_hybrid/fixture.zig");
 const glm = @import("plugin.zig");
-const host = @import("host.zig");
+const host = @import("../../sdk/bases/kda_hybrid/host.zig");
 const ling = @import("../bailing_hybrid/plugin.zig");
 const tape_compact_over = @import("proof_test.zig").tape_compact_over;
 

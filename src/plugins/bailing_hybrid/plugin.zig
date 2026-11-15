@@ -5,8 +5,8 @@
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
-const host = @import("../glm5_next/host.zig");
-const trunk = @import("../glm5_next/trunk.zig");
+const host = @import("../../sdk/bases/kda_hybrid/host.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
 const sdk_bill = @import("../../sdk/bill/prefill.zig");
 const dq_gemm = @import("../../sdk/blocks/linear/prefill_dq_gemm.zig");
 const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
@@ -14,7 +14,7 @@ const Family = @import("../glm5_next/config.zig").Config;
 const run = @import("../../sdk/bases/run.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
-const fixture = @import("../glm5_next/fixture.zig");
+const fixture = @import("../../sdk/bases/kda_hybrid/fixture.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;

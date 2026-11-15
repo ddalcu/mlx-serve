@@ -8,11 +8,11 @@
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const host = @import("host.zig");
-const trunk = @import("trunk.zig");
+const host = @import("../../sdk/bases/kda_hybrid/host.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
 const table_forward = @import("table_forward.zig");
-const glm_moe = @import("moe.zig");
-const Slots = @import("slots.zig").Slots;
+const glm_moe = @import("../../sdk/bases/kda_hybrid/moe.zig");
+const Slots = @import("../../sdk/bases/kda_hybrid/slots.zig").Slots;
 
 const Array = mlx.mlx_array;
 const Verdict = abi.Verdict;

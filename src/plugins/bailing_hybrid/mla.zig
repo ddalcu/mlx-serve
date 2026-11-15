@@ -3,8 +3,8 @@
 //! copied_from: sdk/blocks/attention/mla.zig (`mlaAttnWith`, the cache update replaced by `Slots.append`).
 
 const mlx = @import("../../mlx/ffi.zig");
-const Slots = @import("../glm5_next/slots.zig").Slots;
-const trunk = @import("../glm5_next/trunk.zig");
+const Slots = @import("../../sdk/bases/kda_hybrid/slots.zig").Slots;
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
 const rowByRowSdpa = @import("../../sdk/blocks/attention/sdpa.zig").rowByRowSdpa;
 
 pub fn mlaAttn(

@@ -6,18 +6,18 @@
 //! sdk/blocks/gdn/gate.zig (`computeGdnGate`).
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const ops = @import("../../mlx/ops.zig");
-const log = @import("../../sdk/util/log.zig");
-const compiled = @import("../../sdk/bases/blocks/compiled.zig");
-const conv1d = @import("../../sdk/bases/blocks/conv1d.zig");
-const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
-const kdaGateChain = @import("../../sdk/blocks/kda/gate.zig").kdaGateChain;
-const gate_mod = @import("../../sdk/blocks/gdn/gate.zig");
-const gdn_decode = @import("../../sdk/blocks/gdn/decode.zig");
-const decode_fused = @import("../../sdk/blocks/gdn/decode_fused.zig");
-const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
-const sliceQkvPart = @import("../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
+const mlx = @import("../../../mlx/ffi.zig");
+const ops = @import("../../../mlx/ops.zig");
+const log = @import("../../util/log.zig");
+const compiled = @import("../blocks/compiled.zig");
+const conv1d = @import("../blocks/conv1d.zig");
+const kda_recurrence = @import("../../blocks/kda/recurrence.zig");
+const kdaGateChain = @import("../../blocks/kda/gate.zig").kdaGateChain;
+const gate_mod = @import("../../blocks/gdn/gate.zig");
+const gdn_decode = @import("../../blocks/gdn/decode.zig");
+const decode_fused = @import("../../blocks/gdn/decode_fused.zig");
+const kernels = @import("../../blocks/gdn/kernels.zig");
+const sliceQkvPart = @import("../../blocks/linear/fused_rows.zig").sliceQkvPart;
 const trunk = @import("trunk.zig");
 
 const Array = mlx.mlx_array;

@@ -3,10 +3,10 @@
 //! `ForwardOut`. Per-request state lives in the slots' caches, never here.
 
 const std = @import("std");
-const abi = @import("../../abi/plugin.zig");
-const mlx = @import("../../mlx/ffi.zig");
-const quant_abi = @import("../../abi/quant.zig");
-const Layout = @import("../../sdk/quant/native.zig").Layout;
+const abi = @import("../../../abi/plugin.zig");
+const mlx = @import("../../../mlx/ffi.zig");
+const quant_abi = @import("../../../abi/quant.zig");
+const Layout = @import("../../quant/native.zig").Layout;
 const trunk = @import("trunk.zig");
 
 const gpa = std.heap.c_allocator;

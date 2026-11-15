@@ -8,10 +8,10 @@
 
 const abi = @import("../../abi/plugin.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const host = @import("../glm5_next/host.zig");
-const trunk = @import("../glm5_next/trunk.zig");
-const glm_moe = @import("../glm5_next/moe.zig");
-const Slots = @import("../glm5_next/slots.zig").Slots;
+const host = @import("../../sdk/bases/kda_hybrid/host.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const glm_moe = @import("../../sdk/bases/kda_hybrid/moe.zig");
+const Slots = @import("../../sdk/bases/kda_hybrid/slots.zig").Slots;
 const mla = @import("mla.zig");
 
 const Array = mlx.mlx_array;

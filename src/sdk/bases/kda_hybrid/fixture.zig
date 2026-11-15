@@ -3,8 +3,8 @@
 //! routing), every linear 4-bit affine in groups of 64, norms bf16, the reference's f32 tables f32.
 
 const std = @import("std");
-const sdk = @import("../../sdk/root.zig");
-const Tensors = @import("../../sdk/testing/tensors.zig").Tensors;
+const sdk = @import("../../root.zig");
+const Tensors = @import("../../testing/tensors.zig").Tensors;
 
 const File = sdk.fixture.File;
 

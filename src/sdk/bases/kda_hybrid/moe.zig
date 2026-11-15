@@ -2,11 +2,11 @@
 //! one-kernel decode (`glm5.moeDecode`, affine banks, up to `MOE_DECODE_MAX_ROWS` rows) is the block's `fused` arm.
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const ops = @import("../../mlx/ops.zig");
-const moe = @import("../../sdk/bases/blocks/moe.zig");
-const Linear = @import("../../sdk/bases/blocks/linear.zig").Linear;
-const glm5 = @import("glm5_next.zig");
+const mlx = @import("../../../mlx/ffi.zig");
+const ops = @import("../../../mlx/ops.zig");
+const moe = @import("../blocks/moe.zig");
+const Linear = @import("../blocks/linear.zig").Linear;
+const glm5 = @import("../../../plugins/glm5_next/glm5_next.zig");
 
 const Array = mlx.mlx_array;
 
