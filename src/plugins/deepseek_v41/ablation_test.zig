@@ -80,6 +80,7 @@ test "deepseek_v41 ablation: a batch reads each slot's own row, strength and key
 }
 
 test "deepseek_v41 ablation: a write loses s times its component along r, in its own dtype" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const r = [_]f32{ 0.5, 0.5, 0.5, 0.5 };
@@ -97,6 +98,7 @@ test "deepseek_v41 ablation: a write loses s times its component along r, in its
 }
 
 test "deepseek_v41 ablation: a stream the FFN output was expanded into loses that output's share along r only" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     // x2 = post y + comb^T x1 over one row, hc = 2 copies of dim 4; the old stream x1's share along r stays.
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
@@ -123,6 +125,7 @@ test "deepseek_v41 ablation: a stream the FFN output was expanded into loses tha
 }
 
 test "deepseek_v41 ablation: an Engram row keeps its per-copy keys and loses the value's share along r" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     const r = [_]f32{ 0, 0.6, 0, 0.8 };
@@ -137,6 +140,7 @@ test "deepseek_v41 ablation: an Engram row keeps its per-copy keys and loses the
 }
 
 test "deepseek_v41 ablation: arming takes the slot's row of the table as r and as a column, and its strength" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     // [slots, dim]: slot 1's direction is (0, 0.6, 0, 0.8).
@@ -185,6 +189,7 @@ test "deepseek_v41 ablation: a state takes a forward of its own variant; a fresh
 }
 
 test "deepseek_v41 ablation: the stream tap keeps the hc mean of a pass's last rows across its spans, only while on" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
     defer sc.deinit();
     var tap = try ablation.StreamTap.init(testing.allocator, 1, 3);
