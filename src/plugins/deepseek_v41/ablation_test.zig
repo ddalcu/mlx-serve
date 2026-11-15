@@ -352,7 +352,7 @@ const Tapped = struct {
         const io = std.Io.Threaded.global_single_threaded.io();
         const idx = try self.tmp.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(1 << 20));
         defer testing.allocator.free(idx);
-        const trimmed = std.mem.trimRight(u8, idx, "\r\n");
+        const trimmed = std.mem.trimEnd(u8, idx, "\r\n");
         const last = if (std.mem.lastIndexOfScalar(u8, trimmed, '\n')) |i| trimmed[i + 1 ..] else trimmed;
         const at = std.mem.indexOf(u8, last, "\"file\":\"") orelse return error.NoTapRecord;
         const rest = last[at + "\"file\":\"".len ..];
