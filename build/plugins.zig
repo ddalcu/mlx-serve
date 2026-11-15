@@ -268,9 +268,10 @@ fn writeIfChanged(io: std.Io, root: std.Io.Dir, path: []const u8, bytes: []const
 
 const testing = std.testing;
 
-const MapReader = struct {
+/// A source tree in memory (path, text), for the closure tests here and in `build/kit.zig`.
+pub const MapReader = struct {
     files: []const [2][]const u8,
-    fn read(self: MapReader, path: []const u8) ![]const u8 {
+    pub fn read(self: MapReader, path: []const u8) ![]const u8 {
         for (self.files) |f| if (std.mem.eql(u8, f[0], path)) return f[1];
         return error.FileNotFound;
     }

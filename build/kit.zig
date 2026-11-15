@@ -63,9 +63,25 @@ pub fn add(b: *std.Build, version: []const u8, test_runs: []const *std.Build.Ste
     }
 }
 
+/// The build's own tests of this file (the kit's closure and what it refuses), on the host. They read the tree from its
+/// root, which the run's cache key does not see: they rerun every time.
+pub fn addTests(b: *std.Build, step: *std.Build.Step) void {
+    const t = b.addTest(.{ .name = "build-kit-test", .root_module = b.createModule(.{
+        .root_source_file = b.path("build/kit.zig"),
+        .target = b.graph.host,
+    }) });
+    const run = b.addRunArtifact(t);
+    run.setCwd(b.path("."));
+    run.has_side_effects = true;
+    step.dependOn(&run.step);
+}
+
 fn stage(b: *std.Build, wf: *std.Build.Step.WriteFile, name: []const u8, version: []const u8, header: std.Build.LazyPath) void {
     const reader: plugins.FsReader = .{ .b = b, .dir = b.root.root_dir.handle, .io = b.graph.io };
-    const staged = kitClosure(b.allocator, reader, "src/kit.zig") catch |e| std.process.fatal("kit: reading src/kit.zig's imports: {t}", .{e});
+    const staged = switch (kitClosure(b.allocator, reader, "src/kit.zig") catch |e| std.process.fatal("kit: reading src/kit.zig's imports: {t}", .{e})) {
+        .staged => |s| s,
+        .refused => |why| std.process.fatal("kit: {s}", .{why}),
+    };
     for (staged.files) |f| {
         const dst = b.fmt("{s}/{s}", .{ name, f });
         if (stagedInstead(f)) |text| _ = wf.add(dst, text) else _ = wf.addCopyFile(b.path(f), dst);
@@ -112,24 +128,28 @@ const Staged = struct {
     digests: []const u8,
 };
 
+/// What `kitClosure` stages, or the first edge it refuses and why (`zig build kit` stops on it).
+const Closure = union(enum) { staged: Staged, refused: []const u8 };
+
 /// `start`'s import closure for the kit: `@import`ed sources, `@embedFile`d files and every kernel file a source names
-/// by path. Refuses a file that leaves `src/` or reaches `kit_denied`.
-fn kitClosure(a: std.mem.Allocator, reader: plugins.FsReader, start: []const u8) !Staged {
+/// by path. Refuses a file that leaves `src/` or reaches `kit_denied`. `reader.read(path)` gives a source's text.
+fn kitClosure(a: std.mem.Allocator, reader: anytype, start: []const u8) !Closure {
     var seen: std.StringHashMapUnmanaged(void) = .empty;
     var queue: std.ArrayList([]const u8) = .empty;
-    var kernels: std.StringHashMapUnmanaged(void) = .empty;
+    // A kernel's path from `src/`, and the first source that names it.
+    var kernels: std.StringHashMapUnmanaged([]const u8) = .empty;
     try seen.put(a, start, {});
     try queue.append(a, start);
     while (queue.pop()) |path| {
         const src = if (stagedInstead(path)) |text| text else try reader.read(path);
-        try namedKernels(a, src, &kernels);
+        try namedKernels(a, src, path, &kernels);
         for (try plugins.importsOf(a, src)) |imp| {
             if (std.mem.eql(u8, imp, "std") or std.mem.eql(u8, imp, "builtin") or std.mem.eql(u8, imp, "root")) continue;
             if (isKitModule(imp)) continue;
-            if (!std.mem.endsWith(u8, imp, ".zig")) std.process.fatal("kit: {s} imports the module \"{s}\"; the kit's module reaches src/ files only", .{ path, imp });
+            if (!std.mem.endsWith(u8, imp, ".zig")) return refuse(a, "{s} imports the module \"{s}\"; the kit's module reaches src/ files only", .{ path, imp });
             const next = try std.fs.path.resolveAllocPosix(a, &.{ std.fs.path.dirnamePosix(path) orelse ".", imp });
-            if (!std.mem.startsWith(u8, next, "src/")) std.process.fatal("kit: {s} -> {s} leaves src/", .{ path, next });
-            for (kit_denied) |d| if (std.mem.startsWith(u8, next, d)) std.process.fatal("kit: {s} -> {s}: the kit must not reach the engine, the host or the plugins", .{ path, next });
+            if (!std.mem.startsWith(u8, next, "src/")) return refuse(a, "{s} -> {s} leaves src/", .{ path, next });
+            if (kitDenied(next)) return refuse(a, "{s} -> {s}: the kit must not reach the engine, the host or the plugins", .{ path, next });
             if ((try seen.getOrPut(a, next)).found_existing) continue;
             try queue.append(a, next);
         }
@@ -149,18 +169,32 @@ fn kitClosure(a: std.mem.Allocator, reader: plugins.FsReader, start: []const u8)
             return std.mem.lessThan(u8, x, y);
         }
     }.lt);
-    return .{ .files = files.items, .digests = digests.items };
+    return .{ .staged = .{ .files = files.items, .digests = digests.items } };
 }
 
-/// Every string literal in `src` that names a kernel file (`.metal` / `.cu`, optionally `.fmt.`), as a path from `src/`.
-fn namedKernels(a: std.mem.Allocator, src: []const u8, out: *std.StringHashMapUnmanaged(void)) !void {
+fn refuse(a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !Closure {
+    return .{ .refused = try std.fmt.allocPrint(a, fmt, args) };
+}
+
+fn kitDenied(path: []const u8) bool {
+    for (kit_denied) |d| if (std.mem.startsWith(u8, path, d)) return true;
+    return false;
+}
+
+/// Every string literal in `src` that names a kernel file (`.metal` / `.cu`, optionally `.fmt.`), as a path from `src/`,
+/// mapped to the first source (`by`) that names it.
+fn namedKernels(a: std.mem.Allocator, src: []const u8, by: []const u8, out: *std.StringHashMapUnmanaged([]const u8)) !void {
     var at: usize = 0;
     while (std.mem.indexOfScalarPos(u8, src, at, '"')) |open| {
         const close = std.mem.indexOfScalarPos(u8, src, open + 1, '"') orelse return;
         at = close + 1;
         const lit = src[open + 1 .. close];
         if (std.mem.indexOfScalar(u8, lit, '\n') != null) continue;
-        if (std.mem.endsWith(u8, lit, ".metal") or std.mem.endsWith(u8, lit, ".cu")) try out.put(a, try a.dupe(u8, lit), {});
+        if (!std.mem.endsWith(u8, lit, ".metal") and !std.mem.endsWith(u8, lit, ".cu")) continue;
+        const gop = try out.getOrPut(a, lit);
+        if (gop.found_existing) continue;
+        gop.key_ptr.* = try a.dupe(u8, lit);
+        gop.value_ptr.* = by;
     }
 }
 
@@ -183,4 +217,120 @@ fn stagedInstead(path: []const u8) ?[]const u8 {
 fn isKitModule(name: []const u8) bool {
     for ([_][]const u8{ "mlx_steel_sources", "build_options" }) |m| if (std.mem.eql(u8, name, m)) return true;
     return false;
+}
+
+// ── tests ──
+
+const testing = std.testing;
+
+/// The tree as `zig build kit` reads it, from the repository root (the test's working directory).
+const TreeReader = struct {
+    a: std.mem.Allocator,
+    fn read(self: TreeReader, path: []const u8) ![]const u8 {
+        return std.Io.Dir.cwd().readFileAlloc(testing.io, path, self.a, .limited(16 << 20));
+    }
+};
+
+fn stagedOf(c: Closure) !Staged {
+    switch (c) {
+        .staged => |s| return s,
+        .refused => |why| {
+            std.debug.print("kit: {s}\n", .{why});
+            return error.KitRefused;
+        },
+    }
+}
+
+fn refusalOf(c: Closure) ![]const u8 {
+    return switch (c) {
+        .staged => error.NotRefused,
+        .refused => |why| why,
+    };
+}
+
+test "build kit: the kit stages the blocks, bills and kernels the Ling and GLM runners reach, and the kernel contract" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const staged = try stagedOf(try kitClosure(a, TreeReader{ .a = a }, "src/kit.zig"));
+    // glm5_next's trunk, kda.zig, moe.zig and table_forward.zig reach these (both runners); bailing_hybrid/plugin.zig
+    // bills its prompt pass with prefill.zig (Ling); a plugin's kernels gate on the contract in its own test step.
+    for ([_][]const u8{
+        "src/sdk/bases/blocks/compiled.zig",
+        "src/sdk/bases/blocks/conv1d.zig",
+        "src/sdk/bases/blocks/gdn.zig",
+        "src/sdk/bases/blocks/moe.zig",
+        "src/sdk/bases/blocks/state.zig",
+        "src/sdk/bill/prefill.zig",
+        "src/sdk/blocks/kda/recurrence.zig",
+        "src/sdk/quant/outside_model.zig",
+        "src/sdk/testing/kernel_contract/root.zig",
+        "src/kernels/kda/kda_decode.metal",
+        "src/kernels/kda/kda_percore.metal",
+        "src/kernels/kda/qmv_header.metal",
+    }) |want| {
+        for (staged.files) |f| {
+            if (std.mem.eql(u8, f, want)) break;
+        } else {
+            std.debug.print("the kit does not stage {s}\n", .{want});
+            return error.NotStaged;
+        }
+    }
+    for (staged.files) |f| try testing.expect(std.mem.startsWith(u8, f, "src/") and !kitDenied(f));
+    // A staged kernel ships with its digest line (`mlx/kernels.zig` embeds every file the list names).
+    try testing.expect(std.mem.indexOf(u8, staged.digests, "  kernels/kda/qmv_header.metal\n") != null);
+}
+
+test "build kit: a source that reaches the plugins, the engine, the host or a module is refused, with the edge" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const deep: plugins.MapReader = .{ .files = &.{
+        .{ "src/kit.zig", "pub const t = @import(\"sdk/trunk.zig\");" },
+        .{ "src/sdk/trunk.zig", "const std = @import(\"std\");\nconst m = @import(\"../plugins/glm5_next/moe.zig\");" },
+        .{ "src/kernels/digests.txt", "" },
+    } };
+    try testing.expectEqualStrings(
+        "src/sdk/trunk.zig -> src/plugins/glm5_next/moe.zig: the kit must not reach the engine, the host or the plugins",
+        try refusalOf(try kitClosure(a, deep, "src/kit.zig")),
+    );
+    const engine: plugins.MapReader = .{ .files = &.{.{ "src/kit.zig", "const d = @import(\"engines/mlx/plugin/driver.zig\");" }} };
+    try testing.expectEqualStrings(
+        "src/kit.zig -> src/engines/mlx/plugin/driver.zig: the kit must not reach the engine, the host or the plugins",
+        try refusalOf(try kitClosure(a, engine, "src/kit.zig")),
+    );
+    // `sdk/quant/exl3/format.zig` is such a source: Sushi is a module the kit does not ship.
+    const module: plugins.MapReader = .{ .files = &.{.{ "src/kit.zig", "pub const sushi = @import(\"sushi_exl3\");" }} };
+    try testing.expectEqualStrings(
+        "src/kit.zig imports the module \"sushi_exl3\"; the kit's module reaches src/ files only",
+        try refusalOf(try kitClosure(a, module, "src/kit.zig")),
+    );
+    const outside: plugins.MapReader = .{ .files = &.{.{ "src/kit.zig", "const x = @import(\"../lib/x.zig\");" }} };
+    try testing.expectEqualStrings("src/kit.zig -> lib/x.zig leaves src/", try refusalOf(try kitClosure(a, outside, "src/kit.zig")));
+}
+
+test "build kit: a kernel file under the plugins is refused, with the source that names it; a shared one is staged" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const decode_line = "a701fbad42356f0b01ab7a76d143ebe8d94fdf8f4c4e63514acd223fe00cb6fc  kernels/kda/kda_decode.metal\n";
+    const digests = "78fac0ed60016ff8b92fb6354288449dccefa2640960006bd214158636bdd147  plugins/glm5_next/kernels/qmv_header.metal\n" ++ decode_line;
+    const plugin_kernel: plugins.MapReader = .{ .files = &.{
+        .{ "src/kit.zig", "pub const r = @import(\"sdk/blocks/kda/recurrence.zig\");" },
+        .{ "src/sdk/blocks/kda/recurrence.zig", "const d = kernelSource(\"kernels/kda/kda_decode.metal\");\nconst h = kernelSource(\"plugins/glm5_next/kernels/qmv_header.metal\");" },
+        .{ "src/kernels/digests.txt", digests },
+    } };
+    try testing.expectEqualStrings(
+        "src/sdk/blocks/kda/recurrence.zig names the kernel src/plugins/glm5_next/kernels/qmv_header.metal: the kit must not ship the engine's, the host's or the plugins' files",
+        try refusalOf(try kitClosure(a, plugin_kernel, "src/kit.zig")),
+    );
+    const shared: plugins.MapReader = .{ .files = &.{
+        .{ "src/kit.zig", "pub const r = @import(\"sdk/blocks/kda/recurrence.zig\");" },
+        .{ "src/sdk/blocks/kda/recurrence.zig", "const d = kernelSource(\"kernels/kda/kda_decode.metal\");" },
+        .{ "src/kernels/digests.txt", digests },
+    } };
+    const staged = try stagedOf(try kitClosure(a, shared, "src/kit.zig"));
+    try testing.expectEqual(@as(usize, 3), staged.files.len);
+    try testing.expectEqualStrings("src/kernels/kda/kda_decode.metal", staged.files[0]);
+    try testing.expectEqualStrings(decode_line, staged.digests);
 }
