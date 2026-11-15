@@ -12,7 +12,55 @@ const ablation = @import("ablation.zig");
 const v41 = @import("plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const fixture = @import("../deepseek_v4/fixture.zig");
-const Twin = @import("../deepseek_v4/proof_test.zig").Twin(v41);
+
+/// The plugin's table over the tiny fixture pack, without the proof tape. The shared harness in
+/// `../deepseek_v4/proof_test.zig` pulls `engines/mlx/plugin/tape.zig`, which would leave this plugin's unit closure;
+/// this keeps the same surface the tests use (`open`, `close`, `m`, `s`, `plugin`).
+const Twin = struct {
+    tmp: testing.TmpDir,
+    parsed: abi.Parsed = .{},
+    m: *anyopaque,
+    s: mlx.mlx_stream,
+
+    fn open(files: []const sdk.fixture.File, _: []const u8) !*Twin {
+        const a = testing.allocator;
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const t = try a.create(Twin);
+        errdefer a.destroy(t);
+        t.tmp = testing.tmpDir(.{});
+        errdefer t.tmp.cleanup();
+        for (files) |f| try t.tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
+        var buf: [512]u8 = undefined;
+        const dir = buf[0..try t.tmp.dir.realPath(io, &buf)];
+        t.s = mlx.gpuStream();
+        const mem: sdk.fixture.MemDir = .{ .files = files };
+        const pd = mem.packDir();
+        try testing.expect(v41.table.parse(&pd, .of(files[0].bytes), .{}, null, false, &t.parsed).isOk());
+        var why: abi.Verdict = .{};
+        t.m = v41.table.load(&.{ .model_dir = .of(dir), .dir = &pd, .parsed = &t.parsed, .stream = .{ .ctx = t.s.ctx } }, &why) orelse {
+            std.debug.print("load: {s}\n", .{why.why.slice()});
+            return error.PluginLoad;
+        };
+        return t;
+    }
+
+    fn close(t: *Twin) void {
+        v41.table.unload(t.m);
+        v41.table.free_parsed(&t.parsed);
+        t.tmp.cleanup();
+        testing.allocator.destroy(t);
+    }
+
+    fn plugin(t: *Twin, mode: abi.Mode, ids: []const u32, pos: u32) !mlx.mlx_array {
+        var out: abi.ForwardOut = .{};
+        const v = v41.table.forward(t.m, &.{ .mode = mode, .logits = if (mode == .verify) .all_rows else .last_row, .rows = @intCast(ids.len), .tokens = .of(ids), .positions = .of(&.{pos}) }, &out);
+        if (!v.isOk()) {
+            std.debug.print("forward: {s}\n", .{v.why.slice()});
+            return error.PluginForward;
+        }
+        return .{ .ctx = out.logits.ctx };
+    }
+};
 
 const testing = std.testing;
 const A = mlx.mlx_array;
