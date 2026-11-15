@@ -234,7 +234,7 @@ fn stepLaunch(comptime bits: Bits) metal.Launch {
         .inputs = &.{ "proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts", "conv_state", "state_in", "fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b" },
         .outputs = &.{ "y", "conv_state_out", "state_out", "state_seq" },
         .source = (if (bits == .b5) "#define GATE5 1\n" else "#define GATE5 0\n") ++ body,
-        .header = kernelSource("plugins/glm5_next/kernels/qmv_header.metal"),
+        .header = kernelSource("kernels/kda/qmv_header.metal"),
         // qs, ks, vs, as_, gates, ys [8][128] bf16, gs [8][128] f32, betas [8] bf16.
         .tg_bytes = 6 * 8 * D * 2 + 8 * D * 4 + 8 * 2,
         // M1/M2 build the 4-bit launch for 96..448 threads past one row, the 8-bit one for 640..832 (captured or not
