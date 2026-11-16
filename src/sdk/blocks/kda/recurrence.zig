@@ -249,7 +249,7 @@ fn decodeRows(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa: c_i
         defer _ = mlx.mlx_vector_string_free(ov);
         const body = kernelSource("kernels/kda/kda_decode.metal");
         const source = if (gate5) "#define GATE5 1\n" ++ body else "#define GATE5 0\n" ++ body;
-        const k = mlx.mlx_fast_metal_kernel_new(if (gate5) "msv_kda_decode_q5" else "msv_kda_decode", iv, ov, source, kernelSource("plugins/glm5_next/kernels/qmv_header.metal"), true, false);
+        const k = mlx.mlx_fast_metal_kernel_new(if (gate5) "msv_kda_decode_q5" else "msv_kda_decode", iv, ov, source, kernelSource("kernels/kda/qmv_header.metal"), true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         decode_kernels[slot] = k;
         break :blk k;

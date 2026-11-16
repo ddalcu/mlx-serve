@@ -223,6 +223,48 @@ fn expectAreaExposed(comptime area: []const u8) !void {
     }
 }
 
+test "kit: the module names the sdk files the Ling and GLM runners import, each as that file" {
+    // (the name a plugin reaches, its path from `kit`, the file the runner imports: glm5_next's trunk, kda.zig and moe.zig
+    // for both runners; bailing_hybrid's plugin.zig, mla.zig and table_forward.zig for Ling; the kernel contract for a
+    // plugin's own kernel gates)
+    const want = .{
+        .{ "bases.run", .{ "bases", "run" }, @import("../../sdk/bases/run.zig") },
+        .{ "bases.blocks.compiled", .{ "bases", "blocks", "compiled" }, @import("../../sdk/bases/blocks/compiled.zig") },
+        .{ "bases.blocks.conv1d", .{ "bases", "blocks", "conv1d" }, @import("../../sdk/bases/blocks/conv1d.zig") },
+        .{ "bases.blocks.gdn", .{ "bases", "blocks", "gdn" }, @import("../../sdk/bases/blocks/gdn.zig") },
+        .{ "bases.blocks.moe", .{ "bases", "blocks", "moe" }, @import("../../sdk/bases/blocks/moe.zig") },
+        .{ "bases.blocks.state", .{ "bases", "blocks", "state" }, @import("../../sdk/bases/blocks/state.zig") },
+        .{ "bill.prefill", .{ "bill", "prefill" }, @import("../../sdk/bill/prefill.zig") },
+        .{ "outside_model", .{"outside_model"}, @import("../../sdk/quant/outside_model.zig") },
+        .{ "blocks.kda.gate", .{ "blocks", "kda", "gate" }, @import("../../sdk/blocks/kda/gate.zig") },
+        .{ "blocks.kda.recurrence", .{ "blocks", "kda", "recurrence" }, @import("../../sdk/blocks/kda/recurrence.zig") },
+        .{ "testing.kernel_contract", .{ "testing", "kernel_contract" }, @import("../../sdk/testing/kernel_contract/root.zig") },
+        .{ "log", .{"log"}, @import("../../sdk/util/log.zig") },
+        .{ "mlx_ops", .{"mlx_ops"}, @import("../../mlx/ops.zig") },
+        .{ "mlx_array", .{"mlx_array"}, @import("../../mlx/array.zig") },
+    };
+    var missing: usize = 0;
+    inline for (want) |w| {
+        const ok = if (comptime named(w[1])) |T| T == w[2] else false;
+        if (!ok) {
+            std.debug.print("kit.{s} does not name the file the runners import\n", .{w[0]});
+            missing += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), missing);
+}
+
+/// The declaration a plugin reaches as `kit.<path[0]>.<path[1]>...`, where each step is a type; null where the kit has
+/// no such name.
+fn named(comptime path: anytype) ?type {
+    comptime var T: type = @import("../../kit.zig");
+    inline for (path) |d| {
+        if (!@hasDecl(T, d) or @TypeOf(@field(T, d)) != type) return null;
+        T = @field(T, d);
+    }
+    return T;
+}
+
 test "kit examples: the engine example serves the model it names, passes the engine contract and claims no pack" {
     var inst = try Installed.init();
     defer inst.deinit();
