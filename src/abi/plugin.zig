@@ -496,6 +496,10 @@ test "abi plugin: a Bill's flag word is one u32 at its offset, read past an olde
     try testing.expect((BillFlags{}).decode_room == .by_name and @as(u32, @bitCast(BillFlags{})) == 0);
 }
 
+test "abi plugin: a decode room is named by_name or billed; every other value is the host's rule" {
+    try testing.expectEqual(@as(usize, 2), @typeInfo(DecodeRoom).@"enum".field_names.len);
+}
+
 test "abi plugin: LoadCtx's bank fit key reads null past an older host's struct and when empty" {
     const dir: PackDir = undefined;
     const parsed: Parsed = .{};

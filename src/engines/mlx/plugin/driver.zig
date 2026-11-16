@@ -872,8 +872,9 @@ const FlagProbe = struct {
     fn pricedBilled(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
         out.* = .{ .prefill_bytes = &prefill, .flags = .{ .decode_room = .billed } };
     }
-    fn unbilled(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-        out.* = .{ .flags = .{ .decode_room = .unbilled } };
+    /// The unnamed value 2.
+    fn unnamed2(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .flags = .{ .decode_room = @enumFromInt(2) } };
     }
     /// The unnamed value 3.
     fn unnamed(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
@@ -939,14 +940,13 @@ test "driver: a streamed GLM that prices its own prompt and sets decode_room bil
     try std.testing.expectEqual(decodeRoomOf(&cfg), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
 }
 
-test "driver: a streamed GLM set to decode_room unbilled gets no decode room of its own" {
+test "driver: a streamed GLM whose decode_room holds the unnamed value 2 keeps the by-name decode rule" {
     var table: abi.ModelTable = undefined;
-    var binding = streamedBinding(&table, &FlagProbe.unbilled);
+    var binding = streamedBinding(&table, &FlagProbe.unnamed2);
     var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
     cfg.plugin = &binding;
-    try std.testing.expect(!decodeBilled(&cfg));
-    try std.testing.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
-    try std.testing.expectEqual(@as(u64, 0), streamGrowAt(&cfg, 32_768, abi.stream_room_cell).decode);
+    try std.testing.expect(decodeBilled(&cfg));
+    try std.testing.expectEqual(decodeRoomOf(&cfg), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
 }
 
 test "driver: a plugin's bill at the current size that leaves its flags alone keeps the by-name decode rule" {

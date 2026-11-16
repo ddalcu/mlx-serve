@@ -431,7 +431,8 @@ test "GLM bill: without reserves_request, or without a decode room, the decode b
     glm.ctx_override = 83_694;
     const kv = glm.kvBytesPerToken();
     try t.expectEqual((83_693 - 19_404) * 2 * kv * 5 / 4, glm5DecodeMemoryNeeded(&glm, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&glm, 19_404, 1, 16, wide));
-    var unbilled = reserveBinding(&table, .{ .decode_room = .unbilled, .reserves_request = true }, false);
-    glm.plugin = &unbilled;
+    // The flag on a GLM that prices its own prompt: the name rule gives it no decode room.
+    var no_room = reserveBinding(&table, .{ .reserves_request = true }, true);
+    glm.plugin = &no_room;
     try t.expectEqual((83_693 - 19_404) * 2 * kv * 5 / 4, glm5DecodeMemoryNeeded(&glm, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&glm, 19_404, 1, 16, wide));
 }

@@ -1274,8 +1274,8 @@ test "reservedPrefillTokens: a reserving model reserves its whole request to the
         fn billed(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
             out.* = .{ .flags = .{ .decode_room = .billed } };
         }
-        fn unbilled(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-            out.* = .{ .prefill_bytes = &prefill, .flags = .{ .decode_room = .unbilled, .reserves_request = true } };
+        fn byName(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            out.* = .{ .prefill_bytes = &prefill, .flags = .{ .reserves_request = true } };
         }
     };
     var table: abi.ModelTable = undefined;
@@ -1293,6 +1293,9 @@ test "reservedPrefillTokens: a reserving model reserves its whole request to the
     table.bill = &Probe.billed;
     try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&glm, 33_591, 11_198, 512));
     try t.expectEqual(@as(u64, 0), reservedPrefillTokens(&glm, 900, std.math.maxInt(u32) / 4, 4096));
-    table.bill = &Probe.unbilled;
-    try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&ling, 33_591, 11_198, 512));
+    // The flag on a model the name rule gives no decode room.
+    table.bill = &Probe.byName;
+    var toy = ling;
+    toy.model_type = "toy_hybrid";
+    try t.expectEqual(@as(u64, 33_591 + 512), reservedPrefillTokens(&toy, 33_591, 11_198, 512));
 }
