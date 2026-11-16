@@ -344,6 +344,19 @@ pub const Parsed = extern struct {
     /// The plugin's own parsed config, read by its `bill` and `load`.
     private: ?*anyopaque = null,
     speech: SpeechFacts = .{},
+    /// Ends the struct at the size a plugin built before `engine_config` writes (728 bytes: `speech` ends at 724, the
+    /// rest was padding it may have left unset), so `engine_config` lies past it and the size gate reads it unset.
+    _pre_engine_config: u32 = 0,
+    /// This plugin serves a `model_type` the engine parses and wants the engine's own config (family fields, weight
+    /// renames, bills) with its binding attached, instead of the generic config of its facts alone. The engine then
+    /// sizes and bills the pack as it does that type, so the plugin must match the engine's layout for that type.
+    /// A pack the engine cannot parse keeps the generic config. Read through `wantsEngineConfig`.
+    engine_config: bool = false,
+
+    /// `engine_config`; false for a plugin built before it (its `size` ends before the field).
+    pub fn wantsEngineConfig(p: *const Parsed) bool {
+        return p.size >= @offsetOf(Parsed, "engine_config") + @sizeOf(bool) and p.engine_config;
+    }
 };
 
 // ── Bill ──
@@ -1038,6 +1051,17 @@ test "abi plugin: an older plugin's caps word ends before prompt_last_row, which
     try testing.expectEqual(@bitOffsetOf(Caps, "ablation") + 1, @bitOffsetOf(Caps, "prompt_last_row"));
     const older: Caps = @bitCast((@as(u64, 1) << @bitOffsetOf(Caps, "prompt_last_row")) - 1);
     try testing.expect(older.ablation and !older.prompt_last_row);
+}
+
+test "abi plugin: a Parsed of an older size ends before engine_config, which it reads unset" {
+    // A plugin built before the field writes a 728-byte Parsed, its tail padding unset: the field lies past it.
+    try testing.expectEqual(@as(usize, 728), @offsetOf(Parsed, "engine_config"));
+    var p: Parsed = .{ .engine_config = true };
+    try testing.expect(p.wantsEngineConfig());
+    p.size = @offsetOf(Parsed, "engine_config");
+    try testing.expect(!p.wantsEngineConfig());
+    p = .{};
+    try testing.expect(!p.wantsEngineConfig());
 }
 
 test "abi plugin: every struct opens with its size, set by default" {
