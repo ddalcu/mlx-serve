@@ -152,6 +152,9 @@ kill $STUB_PID; wait $STUB_PID 2>/dev/null
 curl -s -X POST "$BASE/v1/providers/reload" >/dev/null
 wait_rows '[.data[] | select(.provider=="stub")] | length' "0" && r=PASS || r=FAIL
 check "a dead provider drops its rows after reload" $r
+st=$(curl -s "$BASE/v1/providers")
+[ "$(echo "$st" | jq -r '.providers[] | select(.name=="stub") | .down')" = "refused" ] && r=PASS || r=FAIL
+check "GET /v1/providers names why a dead provider is down (nothing listening)" $r "$st"
 start_stub; sleep 0.5
 curl -s -X POST "$BASE/v1/providers/reload" >/dev/null
 wait_rows '[.data[] | select(.provider=="stub") | .id] | join(",")' "stub-model@stub" && r=PASS || r=FAIL
