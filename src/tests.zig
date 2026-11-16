@@ -209,6 +209,7 @@ test {
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
     _ = @import("sdk/quant/outside_model.zig");
     _ = @import("sdk/quant/bank_fit_key.zig");
+    _ = @import("engines/mlx/plugin/fit_key.zig");
     _ = @import("engines/mlx/load/sushi_adapt.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
     _ = @import("sdk/quant/formats.zig");

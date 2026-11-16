@@ -47,6 +47,13 @@ fn claimed(a: std.mem.Allocator, config_json: []const u8) !?struct { t: *const a
     return null;
 }
 
+/// The loaded table claiming `config_json`, if any.
+pub fn claimingTable(a: std.mem.Allocator, config_json: []const u8) ?*const abi.QuantTable {
+    const c = (claimed(a, config_json) catch return null) orelse return null;
+    a.free(c.block);
+    return c.t;
+}
+
 /// Whether a loaded table claims the pack at `model_dir`: its tensors then load as stored, in the dtypes the plugin
 /// reads.
 pub fn claimsPack(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) bool {

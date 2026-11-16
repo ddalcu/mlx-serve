@@ -282,9 +282,8 @@ fn streamGrowAt(config: *const ModelConfig, limit: u64, from: u64) struct { prom
 /// Where the bills' growth starts: the tokens the pack's calibration (its text or null) measured its bases at when it
 /// applies at `ceiling` under the host's `key` (`outside_model.parseBankFit`, as the plugin reads it), else the cell.
 fn growthStartOf(text: ?[]const u8, ceiling: u64, key: ?[]const u8) u64 {
-    _ = key;
     const cell = abi.stream_room_cell;
-    const c = outside_model.parseBankFit(text orelse return cell, ceiling, cell, null) catch return cell;
+    const c = outside_model.parseBankFit(text orelse return cell, ceiling, cell, key) catch return cell;
     return c.evidence;
 }
 
@@ -914,7 +913,10 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
     var settings_buf: [128]u8 = undefined;
     const ceiling = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling();
-    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling, null));
+    // A streamed bank's calibration applies only under this server's key; a key that cannot be read is none.
+    const fit_key: ?[]u8 = if (b.parsed.caps.streamed_weights) @import("fit_key.zig").hostKey(a, config, &dir) catch null else null;
+    defer if (fit_key) |k| a.free(k);
+    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling, fit_key));
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
@@ -927,6 +929,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .stream_room_decode = streamRoomDecode(config),
         .stream_grow_prompt = grow.prompt,
         .stream_grow_decode = grow.decode,
+        .bank_fit_key = if (fit_key) |k| abi.Str.of(k) else .{},
         .gpu_ceiling_bytes = ceiling,
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},

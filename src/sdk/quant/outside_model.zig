@@ -8,6 +8,7 @@ const quant_abi = @import("../../abi/quant.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const system = @import("../util/system.zig");
 const outside = @import("outside.zig");
+pub const fit_key = @import("bank_fit_key.zig");
 const Linear = @import("../bases/blocks/linear.zig").Linear;
 const moe = @import("../bases/blocks/moe.zig");
 
@@ -200,7 +201,9 @@ pub fn openBudget(fit: Fit, now: Reading, fallback_in_use: u64) OpenBudget {
 
 /// The calibration file's name in a pack and its format.
 pub const bank_fit_file = "bank-fit.json";
-pub const bank_fit_format = "mlx-serve-bank-fit-v2";
+pub const bank_fit_format = "mlx-serve-bank-fit-v3";
+/// The keyless format: a fit from another build, machine, plugin or pack applied unseen; refused by name.
+pub const bank_fit_format_v2 = "mlx-serve-bank-fit-v2";
 /// The first format: its `rest_bytes` read `total - available`, which moves with the page cache; refused by name.
 pub const bank_fit_format_v1 = "mlx-serve-bank-fit-v1";
 
@@ -219,18 +222,26 @@ pub const BankFitError = error{
     BankFitOtherCell,
 };
 
-/// `bank-fit.json`'s calibration when its ceiling is the host's (`ceiling`, 0 = unknown: none applies) and its evidence
-/// ran the rooms' cell (`cell`, the bills' growth past it is the host's); a named reason otherwise (logged by the caller;
-/// the bills stand). `key`: the host's (`LoadCtx.fitKey`).
+/// The calibration a fit file holds when it carries the host's `key` (`LoadCtx.fitKey`, part by part), its ceiling is the
+/// host's (`ceiling`, 0 = unknown: none applies) and its evidence ran the rooms' cell (`cell`, the bills' growth past it
+/// is the host's); a named reason otherwise (logged by the caller; the bills stand).
 pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64, key: ?[]const u8) BankFitError!Calibration {
-    _ = key;
-    const F = struct { format: []const u8 = "", ceiling_bytes: u64 = 0, cell_tokens: u64 = 0, evidence_tokens: u64 = 0, base_prompt_bytes: u64 = 0, base_decode_bytes: u64 = 0, rest_bytes: u64 = 0 };
+    const K = struct { build: []const u8 = "", machine: []const u8 = "", quant_plugin: []const u8 = "", model_plugin: []const u8 = "", pack: []const u8 = "" };
+    const F = struct { format: []const u8 = "", key: ?K = null, ceiling_bytes: u64 = 0, cell_tokens: u64 = 0, evidence_tokens: u64 = 0, base_prompt_bytes: u64 = 0, base_decode_bytes: u64 = 0, rest_bytes: u64 = 0 };
     var buf: [16384]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const f = std.json.parseFromSliceLeaky(F, fba.allocator(), json, .{ .ignore_unknown_fields = true }) catch return error.BankFitInvalid;
     if (std.mem.eql(u8, f.format, bank_fit_format_v1)) return error.BankFitV1Rest;
+    if (std.mem.eql(u8, f.format, bank_fit_format_v2)) return error.BankFitUnkeyed;
     if (!std.mem.eql(u8, f.format, bank_fit_format)) return error.BankFitFormat;
     if (f.ceiling_bytes == 0 or f.cell_tokens == 0 or f.base_prompt_bytes == 0 or f.base_decode_bytes == 0) return error.BankFitInvalid;
+    const fk = f.key orelse return error.BankFitUnkeyed;
+    const host = fit_key.parse(key orelse return error.BankFitNoHostKey) orelse return error.BankFitNoHostKey;
+    if (!std.mem.eql(u8, fk.build, host.build)) return error.BankFitOtherBuild;
+    if (!std.mem.eql(u8, fk.machine, host.machine)) return error.BankFitOtherMachine;
+    if (!std.mem.eql(u8, fk.quant_plugin, host.quant_plugin)) return error.BankFitOtherQuantPlugin;
+    if (!std.mem.eql(u8, fk.model_plugin, host.model_plugin)) return error.BankFitOtherModelPlugin;
+    if (!std.mem.eql(u8, fk.pack, host.pack)) return error.BankFitOtherPack;
     if (ceiling == 0 or f.ceiling_bytes != ceiling) return error.BankFitOtherCeiling;
     if (f.cell_tokens != cell) return error.BankFitOtherCell;
     return .{ .ceiling = f.ceiling_bytes, .cell = f.cell_tokens, .evidence = if (f.evidence_tokens > 0) f.evidence_tokens else f.cell_tokens, .base_prompt = f.base_prompt_bytes, .base_decode = f.base_decode_bytes, .rest = f.rest_bytes };
@@ -250,13 +261,14 @@ pub const FoundFit = struct {
 /// The pack's calibration for the host's `key`: `bank-fit/<id>.json` (`bank_fit_key.fileName`), else the top-level
 /// `bank-fit.json` (a local evidence run's), read into `buf`; null when the pack holds neither.
 pub fn readBankFit(dir: *const plugin_abi.PackDir, key: ?[]const u8, buf: []u8) ?FoundFit {
-    _ = key;
     var f: FoundFit = .{ .text = &.{} };
-    if (!dir.has(bank_fit_file)) return null;
+    var nb: [32]u8 = undefined;
+    const own = if (key) |k| fit_key.fileName(&nb, k) else "";
+    const name = if (own.len > 0 and dir.has(own)) own else if (dir.has(bank_fit_file)) bank_fit_file else return null;
+    @memcpy(f.name_buf[0..name.len], name);
+    f.name_len = name.len;
     var why: plugin_abi.Verdict = .{};
-    f.text = dir.readFile(bank_fit_file, buf, &why) orelse return null;
-    @memcpy(f.name_buf[0..bank_fit_file.len], bank_fit_file);
-    f.name_len = bank_fit_file.len;
+    f.text = dir.readFile(f.name(), buf, &why) orelse return null;
     return f;
 }
 
@@ -608,8 +620,6 @@ test "outside model: a calibrated budget reads the same with more file pages on 
     try testing.expectEqual(budgets[0], budgets[1]);
     try testing.expectEqual(quant_abi.BankBudget{ .prompt = 110 * GB + 12 * GB - 40 * GB - (31 * GB + GB / 2 - foot) - fit.inuse_margin, .decode = 110 * GB + 12 * GB - 28 * GB - (31 * GB + GB / 2 - foot) - fit.inuse_margin }, budgets[0]);
 }
-
-const fit_key = @import("bank_fit_key.zig");
 
 /// A key's canonical text in `buf` (tests).
 pub fn testFitKey(buf: []u8, p: fit_key.Parts) []const u8 {
