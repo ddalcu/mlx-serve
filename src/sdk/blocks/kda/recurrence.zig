@@ -127,7 +127,8 @@ pub fn recur(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_a
     return out;
 }
 
-/// `recur` at a caller's plan (one `probe` launched): its row ranges, not a row's arithmetic, follow the plan.
+/// `recur` at a caller's plan, which the caller probes (`probe`) before it calls: its row ranges, not a row's
+/// arithmetic, follow the plan.
 pub fn recurAt(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, a: mlx.mlx_array, beta: mlx.mlx_array, a_log: mlx.mlx_array, dt_bias: mlx.mlx_array, lower_bound: f32, state: mlx.mlx_array, plan: Plan) !Out {
     const dt = mlx.mlx_array_dtype(q);
     var a_c = mlx.mlx_array_new();
