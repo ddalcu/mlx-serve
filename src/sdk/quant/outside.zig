@@ -78,9 +78,9 @@ fn claimed(a: std.mem.Allocator, config_json: []const u8, host: ?*const Host) !?
     return null;
 }
 
-/// The loaded table claiming `config_json`, if any.
+/// The host's loaded table claiming `config_json`, if any.
 pub fn claimingTable(a: std.mem.Allocator, config_json: []const u8) ?*const abi.QuantTable {
-    const c = (claimed(a, config_json) catch return null) orelse return null;
+    const c = (claimed(a, config_json, null) catch return null) orelse return null;
     a.free(c.block);
     return c.t;
 }
