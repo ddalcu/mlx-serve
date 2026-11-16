@@ -453,7 +453,7 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 | Field | Type | Default | |
 |---|---|---|---|
 | `size` | `u32` | `@sizeOf(Bill)` |  |
-| `kv_per_token` | `u64` | `0` |  |
+| `kv_per_token` | `u64` | `0` | The trunk's attention rows a token takes; the engine bills an MTP head's own rows. The host honours it only when the parse names a layout namespace, the plugin's statement that the value is its whole cache layout. |
 | `fixed_slot_bytes` | `u64` | `0` |  |
 | `state_per_token` | `u64` | `0` |  |
 | `prefill_streams` | `u64` | `0` |  |

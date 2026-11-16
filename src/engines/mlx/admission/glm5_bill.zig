@@ -148,15 +148,13 @@ fn reservedDecodeMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, ma
     return (fixed +| kv +| PREFILL_RUNTIME_FLOOR_BYTES) * 5 / 4 +| 2 *| GLM5_HOT_CACHE_BYTES;
 }
 
-/// Bytes a token takes in the MTP head's own cache, a dense bf16 layer of the head's kind: GLM-5's mtp.0 a DSA layer
-/// (its latent row and the indexer's key and gate), an MLA head (Ling's NextN layer) every head's key and value, any
-/// other one attention layer at the KV heads; 0 without a head the bill counts.
+/// Bytes a token takes in the MTP head's own cache, one dense bf16 trunk layer's row (GLM-5's mtp.0 a DSA layer, Ling's
+/// NextN layer an MLA one); 0 without a head the bill counts.
 fn mtpHeadRowBytes(config: *const model_mod.ModelConfig) u64 {
     const b = config.plugin orelse return 0;
     if (b.parsed.spec.mtp_layout == .none or !mtpHeadBilled(config)) return 0;
-    if (config.isGlm5()) return (@as(u64, config.dsa_kv_lora_rank) + 2 * @as(u64, config.dsa_index_head_dim)) * 2;
-    if (config.isMla()) return @as(u64, config.num_attention_heads) * (@as(u64, config.mlaQkHeadDim()) + config.mla_v_head_dim) * 2;
-    return 2 * @as(u64, config.num_key_value_heads) * config.head_dim * 2;
+    const n = config.attnCacheLayerCount();
+    return if (n == 0) 0 else config.kvBytesPerToken() / n;
 }
 
 // ── tests ──
