@@ -159,3 +159,31 @@ test "bank fit key: the pack's digest reads config.json, its bank manifests and 
     try tmp.dir.writeFile(io, .{ .sub_path = "expert-manifest-v2.json", .data = "{}" });
     try testing.expect(!std.mem.eql(u8, &d2, &(try packDigest(testing.allocator, &dir))));
 }
+
+test "bank fit key: the pack's digest streams the bank's manifests, allocating none of them, and equals the whole-file digest" {
+    const io = testing.io;
+    const pack_dir = @import("../util/pack_dir.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const config = "{\"expert_streaming\":{\"manifest\":\"m.json\"}}";
+    const manifest = try testing.allocator.alloc(u8, 256 << 10);
+    defer testing.allocator.free(manifest);
+    for (manifest, 0..) |*b, i| b.* = @truncate(i *% 131);
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "m.json", .data = manifest });
+    try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "0123" });
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var fs = try pack_dir.FsPackDir.open(io, path[0..n]);
+    defer fs.close();
+    const dir = fs.packDir();
+    var h = std.crypto.hash.sha2.Sha256.init(.{});
+    mix(&h, "config.json", config);
+    mix(&h, "m.json", manifest);
+    mix(&h, "experts.bin", "4");
+    const want = std.fmt.bytesToHex(h.finalResult(), .lower);
+    // Bar: a heap far smaller than the manifest still digests the pack, to the whole-file digest's bytes.
+    var heap: [16 << 10]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&heap);
+    try testing.expectEqualStrings(&want, &(try packDigest(fba.allocator(), &dir)));
+}
