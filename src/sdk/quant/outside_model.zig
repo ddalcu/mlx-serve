@@ -136,8 +136,8 @@ pub const Fit = struct {
     decode_room: u64,
     /// Growth of the box's memory outside the server between the load and the peak (a calibration's allowance).
     inuse_margin: u64 = 1 << 30,
-    /// The bills' growth from the calibration's evidence (`Calibration.evidence`) to the server's context limit
-    /// (`LoadCtx.streamGrowth`).
+    /// The bills' growth from the calibration's evidence (`Calibration.evidence`), else the rooms' cell, to the server's
+    /// context limit (`LoadCtx.streamGrowth`); both arms give it up.
     grow_prompt: u64 = 0,
     grow_decode: u64 = 0,
     calibration: ?Calibration = null,
@@ -163,16 +163,23 @@ pub const Calibration = struct {
 /// size reads the same) and the server's own footprint within it.
 pub const Reading = struct { in_use: u64, footprint: u64 };
 
-/// `fit`'s budget at `r`. Bills only: each phase's room less the memory in use (equal rooms: `roomBudget`). Calibrated:
-/// each phase's bytes are the ceiling less its base and its bills' growth to the context limit, the evidence's rest
-/// given back and what is outside the server now (plus the margin) taken. Every term saturates at 0.
+/// `fit`'s budget at `r`. Bills only: each phase's room less its bills' growth to the context limit and the memory in
+/// use. Calibrated: each phase's bytes are the ceiling less its base and its bills' growth, the evidence's rest given
+/// back and what is outside the server now (plus the margin) taken. Every term saturates at 0.
 pub fn fitBudget(fit: Fit, r: Reading) quant_abi.BankBudget {
-    const c = fit.calibration orelse return .{ .prompt = fit.prompt_room -| r.in_use, .decode = fit.decode_room -| r.in_use };
+    const c = fit.calibration orelse return billsBudget(fit, r.in_use);
+    // Each base already holds the hot cache's resident entry, which the fitter's fresh-server evidence did not: it adds
+    // the host's 2 GiB hot-cache term to each phase's peak less the bank (`g53_fit_bank.py`).
     const allow = (r.in_use -| r.footprint) +| fit.inuse_margin;
     return .{
         .prompt = (c.ceiling +| c.rest) -| c.base_prompt -| fit.grow_prompt -| allow,
         .decode = (c.ceiling +| c.rest) -| c.base_decode -| fit.grow_decode -| allow,
     };
+}
+
+/// The rooms are billed at the cell: a context past it gives each phase's growth up, as a calibration does.
+fn billsBudget(fit: Fit, in_use: u64) quant_abi.BankBudget {
+    return .{ .prompt = fit.prompt_room -| fit.grow_prompt -| in_use, .decode = fit.decode_room -| fit.grow_decode -| in_use };
 }
 
 /// The open's reading `now`, settled: macOS's page counts show the server's new buffers a second or two late while its
@@ -195,7 +202,7 @@ pub fn openBudget(fit: Fit, now: Reading, fallback_in_use: u64) OpenBudget {
     const r = if (fit.load_start) |start| settled(now, start) else now;
     if (r.in_use >= r.footprint) return .{ .budget = fitBudget(fit, r), .reading = r };
     const in_use = @max(fallback_in_use, r.footprint);
-    return .{ .budget = .{ .prompt = fit.prompt_room -| in_use, .decode = fit.decode_room -| in_use }, .reading = r, .refused = error.BankReadingBelowFootprint };
+    return .{ .budget = billsBudget(fit, in_use), .reading = r, .refused = error.BankReadingBelowFootprint };
 }
 
 /// The calibration file's name in a pack and its format.
@@ -510,6 +517,32 @@ test "outside model: a fit's bills-only budget is each phase's room past the mem
     // DECODE_ROOM: decode's own room (no prompt scratch) buys it more.
     try testing.expectEqual(quant_abi.BankBudget{ .prompt = 70 << 30, .decode = 82 << 30 }, fitBudget(.{ .prompt_room = 100 << 30, .decode_room = 112 << 30 }, r));
     try testing.expectEqual(quant_abi.BankBudget{ .prompt = 0, .decode = 0 }, fitBudget(.{ .prompt_room = 1 << 30, .decode_room = 1 << 30 }, r));
+}
+
+test "outside model: a bills-only fit gives each phase's bills' growth to the context limit up, the open's fallback too" {
+    const r: Reading = .{ .in_use = 30 << 30, .footprint = 20 << 30 };
+    const fit: Fit = .{ .prompt_room = 100 << 30, .decode_room = 112 << 30, .grow_prompt = 3 << 30, .grow_decode = 5 << 30 };
+    try testing.expectEqual(quant_abi.BankBudget{ .prompt = 67 << 30, .decode = 77 << 30 }, fitBudget(fit, r));
+    // A reading below the footprint falls back to the same bills on total - available.
+    const o = openBudget(fit, .{ .in_use = 10 << 30, .footprint = 20 << 30 }, 36 << 30);
+    try testing.expectEqual(error.BankReadingBelowFootprint, o.refused.?);
+    try testing.expectEqual(quant_abi.BankBudget{ .prompt = 61 << 30, .decode = 71 << 30 }, o.budget);
+    // Growth past the room leaves 0, never a wrap.
+    try testing.expectEqual(quant_abi.BankBudget{ .prompt = 0, .decode = 0 }, fitBudget(.{ .prompt_room = 4 << 30, .decode_room = 4 << 30, .grow_prompt = 5 << 30, .grow_decode = 5 << 30 }, .{ .in_use = 0, .footprint = 0 }));
+}
+
+test "outside model: a fitted base carries the hot cache's resident entry its fresh-server evidence did not hold" {
+    // Bar: each base is at least the phase's peak less its bank plus the host's 2 GiB term (`GLM5_HOT_CACHE_BYTES`).
+    const json = @embedFile("../../fixtures/bank_fit_ling-3.1-flash-exl3-2.60bpw.json");
+    const Line = struct { peak_prompt: u64, peak_decode: u64, bank_prompt: u64, bank_decode: u64 };
+    const F = struct { ceiling_bytes: u64, cell_tokens: u64, fit_line: Line };
+    const f = try std.json.parseFromSlice(F, testing.allocator, json, .{ .ignore_unknown_fields = true });
+    defer f.deinit();
+    const c = try parseBankFit(json, f.value.ceiling_bytes, f.value.cell_tokens);
+    const hot: u64 = 2048 << 20;
+    const l = f.value.fit_line;
+    try testing.expect(c.base_prompt >= l.peak_prompt - l.bank_prompt + hot);
+    try testing.expect(c.base_decode >= l.peak_decode - l.bank_decode + hot);
 }
 
 test "outside model: a calibrated fit gives each phase the ceiling less its base and growth, the evidence's rest back and what is outside the server now" {
