@@ -268,19 +268,18 @@ fn streamGrowAt(config: *const ModelConfig, limit: u64, from: u64) struct { prom
     return .{ .prompt = p1 -| p0, .decode = decode };
 }
 
-/// Where the bills' growth starts: the tokens the pack's calibration (`bank-fit.json`, its text or null) measured its
-/// bases at when it applies at `ceiling` (`outside_model.parseBankFit`, as the plugin reads it), else the rooms' cell.
-fn growthStartOf(text: ?[]const u8, ceiling: u64) u64 {
+/// Where the bills' growth starts: the tokens the pack's calibration (its text or null) measured its bases at when it
+/// applies at `ceiling` under the host's `key` (`outside_model.parseBankFit`, as the plugin reads it), else the cell.
+fn growthStartOf(text: ?[]const u8, ceiling: u64, key: ?[]const u8) u64 {
     const cell = abi.stream_room_cell;
-    const c = outside_model.parseBankFit(text orelse return cell, ceiling, cell) catch return cell;
+    const c = outside_model.parseBankFit(text orelse return cell, ceiling, cell, key) catch return cell;
     return c.evidence;
 }
 
-fn growthStart(dir: *const abi.PackDir, ceiling: u64) u64 {
-    var buf: [4096]u8 = undefined;
-    var why: abi.Verdict = .{};
-    const text = if (dir.has(outside_model.bank_fit_file)) dir.readFile(outside_model.bank_fit_file, &buf, &why) else null;
-    return growthStartOf(text, ceiling);
+fn growthStart(dir: *const abi.PackDir, ceiling: u64, key: ?[]const u8) u64 {
+    var buf: [16384]u8 = undefined;
+    const f = outside_model.readBankFit(dir, key, &buf);
+    return growthStartOf(if (f) |x| x.text else null, ceiling, key);
 }
 
 fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
@@ -449,14 +448,25 @@ test "driver: a streamed built-in GLM's bills grow from the rooms' cell to its c
     try std.testing.expect(ev.prompt < g.prompt and ev.decode < g.decode);
 }
 
-test "driver: the bills' growth starts at the calibration's evidence tokens when the plugin applies it, the cell otherwise" {
-    const fit = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"evidence_tokens\":18380,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
-    try std.testing.expectEqual(@as(u64, 18_380), growthStartOf(fit, 118111600640));
-    // Not applied (another ceiling, no file) or no evidence_tokens: the cell.
-    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 112 << 30));
-    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(null, 118111600640));
-    const unnamed = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
-    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(unnamed, 118111600640));
+test "driver: the bills' growth starts at a bank fit's evidence tokens when the plugin applies it under the host's key, the cell otherwise" {
+    var kb: [512]u8 = undefined;
+    const key = outside_model.testFitKey(&kb, outside_model.test_fit_parts);
+    var fb: [1024]u8 = undefined;
+    const fit = outside_model.testFitV3(&fb, outside_model.test_fit_parts, "\"evidence_tokens\":18380,");
+    try std.testing.expectEqual(@as(u64, 18_380), growthStartOf(fit, 118111600640, key));
+    // Not applied (another ceiling, another machine, no host key, no file) or no evidence_tokens: the cell.
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 112 << 30, key));
+    var ob: [512]u8 = undefined;
+    var other = outside_model.test_fit_parts;
+    other.machine = "Apple M4 Max 128GB";
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 118111600640, outside_model.testFitKey(&ob, other)));
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 118111600640, null));
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(null, 118111600640, key));
+    var ub: [1024]u8 = undefined;
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(outside_model.testFitV3(&ub, outside_model.test_fit_parts, ""), 118111600640, key));
+    // A v2 file is not applied: the trunk refuses it (BankFitUnkeyed), so the host's growth starts at the cell too.
+    const v2 = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"evidence_tokens\":18380,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(v2, 118111600640, key));
 }
 
 test "driver: a streamed Ling's prompt is billed at the chunk the engine runs for its length, and its growth at the largest of them" {
@@ -1042,7 +1052,10 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
     var settings_buf: [128]u8 = undefined;
     const ceiling = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling();
-    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling));
+    // A streamed bank's calibration applies only under this server's key; a key that cannot be read is none.
+    const fit_key: ?[]u8 = if (b.parsed.caps.streamed_weights) @import("fit_key.zig").hostKey(a, config, &dir) catch null else null;
+    defer if (fit_key) |k| a.free(k);
+    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling, fit_key));
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
@@ -1055,6 +1068,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .stream_room_decode = streamRoomDecode(config),
         .stream_grow_prompt = grow.prompt,
         .stream_grow_decode = grow.decode,
+        .bank_fit_key = if (fit_key) |k| abi.Str.of(k) else .{},
         .gpu_ceiling_bytes = ceiling,
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},

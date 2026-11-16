@@ -434,6 +434,9 @@ pub const LoadCtx = extern struct {
     /// calibrated at the cell gives up for a longer context; 0 = none or unknown.
     stream_grow_prompt: u64 = 0,
     stream_grow_decode: u64 = 0,
+    /// The key a bank calibration must carry to apply on this server (`bank-fit.json` v3): the canonical key text
+    /// (`sdk/quant/bank_fit_key.zig`), empty when the host has none.
+    bank_fit_key: Str = .{},
 
     /// The decode phase's room: `stream_room_decode`, or `stream_room` from a host that sets none or predates it.
     pub fn decodeRoom(c: *const LoadCtx) u64 {
@@ -449,6 +452,12 @@ pub const LoadCtx = extern struct {
     pub fn streamGrowth(c: *const LoadCtx) struct { prompt: u64, decode: u64 } {
         if (c.size < @offsetOf(LoadCtx, "stream_grow_decode") + @sizeOf(u64)) return .{ .prompt = 0, .decode = 0 };
         return .{ .prompt = c.stream_grow_prompt, .decode = c.stream_grow_decode };
+    }
+    /// `bank_fit_key`, or null from a host that sets none or predates it.
+    pub fn fitKey(c: *const LoadCtx) ?[]const u8 {
+        if (c.size < @offsetOf(LoadCtx, "bank_fit_key") + @sizeOf(Str)) return null;
+        const k = c.bank_fit_key.slice();
+        return if (k.len == 0) null else k;
     }
 };
 
@@ -483,6 +492,18 @@ test "abi plugin: a Bill's flag word is one u32 at its offset, read past an olde
     b.size = @offsetOf(Bill, "flags");
     try testing.expect(b.billFlags() == null);
     try testing.expect((BillFlags{}).decode_room == .by_name and @as(u32, @bitCast(BillFlags{})) == 0);
+}
+
+test "abi plugin: LoadCtx's bank fit key reads null past an older host's struct and when empty" {
+    const dir: PackDir = undefined;
+    const parsed: Parsed = .{};
+    var c: LoadCtx = .{ .model_dir = .{}, .dir = &dir, .parsed = &parsed, .bank_fit_key = .of("build=x\n") };
+    try std.testing.expectEqualStrings("build=x\n", c.fitKey().?);
+    c.size = @offsetOf(LoadCtx, "bank_fit_key");
+    try std.testing.expect(c.fitKey() == null);
+    c.size = @sizeOf(LoadCtx);
+    c.bank_fit_key = .{};
+    try std.testing.expect(c.fitKey() == null);
 }
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };

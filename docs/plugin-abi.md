@@ -508,6 +508,7 @@ Valid during `load` only: the model keeps none of its pointers.
 | `gpu_ceiling_bytes` | `u64` | `0` | The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown. |
 | `stream_grow_prompt` | `u64` | `0` | Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank calibrated at the cell gives up for a longer context; 0 = none or unknown. |
 | `stream_grow_decode` | `u64` | `0` |  |
+| `bank_fit_key` | `Str` | `.{}` | The key a bank calibration must carry to apply on this server (`bank-fit.json` v3): the canonical key text (`sdk/quant/bank_fit_key.zig`), empty when the host has none. |
 
 ### `Mode` (enum(u8))
 
