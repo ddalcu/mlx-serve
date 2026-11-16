@@ -518,8 +518,8 @@ private struct RecommendedModelTableRow: View {
             HStack(spacing: 6) {
                 if let usable = usableModel {
                     let use = ModelUseState.resolve(
-                        selected: appState.selectedModelPath == usable.path,
-                        serverStatus: server.status
+                        path: usable.path, selectedPath: appState.selectedModelPath,
+                        serverStatus: server.status, rows: server.allModels
                     )
                     if use == .idle {
                         UseModelButton(path: usable.path, name: usable.name)
@@ -1618,8 +1618,8 @@ private struct ModelBrowserRow: View {
                 HStack(spacing: 6) {
                     if let usable = usableModel {
                         let use = ModelUseState.resolve(
-                            selected: appState.selectedModelPath == usable.path,
-                            serverStatus: server.status
+                            path: usable.path, selectedPath: appState.selectedModelPath,
+                            serverStatus: server.status, rows: server.allModels
                         )
                         if use == .idle {
                             UseModelButton(path: usable.path, name: usable.name)
@@ -2032,8 +2032,8 @@ private struct LocalModelRow: View {
 
     private var useState: ModelUseState {
         ModelUseState.resolve(
-            selected: appState.selectedModelPath == model.path,
-            serverStatus: server.status
+            path: model.path, selectedPath: appState.selectedModelPath,
+            serverStatus: server.status, rows: server.allModels
         )
     }
 
