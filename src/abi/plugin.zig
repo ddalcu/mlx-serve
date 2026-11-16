@@ -16,7 +16,9 @@ pub const Stream = common.Stream;
 pub const Claim = common.Claim;
 pub const PackDir = common.PackDir;
 
-pub const version: u32 = 1;
+/// Moves when a struct the plugin writes whole (`Parsed`, `Bill`) grows: an older host refuses the newer table, so a
+/// plugin never writes past the host's shorter struct; this host takes every older table, whose structs it reads by size.
+pub const version: u32 = 2;
 
 const nan = std.math.nan(f32);
 
