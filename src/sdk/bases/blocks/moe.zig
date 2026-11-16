@@ -324,20 +324,30 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
         break :stock try route(w, g, logits, routerFold(w, x, logits));
     };
     const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x, false) else null;
-    // The group-limited chain hands its weights back in f32; they land in the activation dtype.
-    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
-    if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
+    try routeWeights(w, g, &r, x);
     if (w.fused) |*f| {
         const xs = ops.shape(x);
         if (xs[0] * xs[1] <= f.rows) if (try f.run(f, w, g.s, x, r.inds, r.scores)) |y| return parent.keep(try g.adopt(y));
     }
     const y = try routedExperts(w, g, x, r, shared_down, null);
     if (y.shared_fused) return parent.keep(y.sum);
-    const se = w.shared orelse return parent.keep(y.sum);
-    if (!se.gated()) return parent.keep(try g.add(y.sum, try sharedDown(w, g, &se, x, false)));
-    const down = shared_down orelse try sharedDown(w, g, &se, x, false);
-    const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
-    return parent.keep(try g.add(y.sum, try g.mul(try g.sigmoid(logit), down)));
+    return parent.keep(try sharedFinish(w, g, x, y.sum, shared_down, r.gate_logit));
+}
+
+/// The routes' weights as `mlp` applies them: in `x`'s dtype (the group-limited chain hands them back in f32), times
+/// the pack's `route_scale` where it has one.
+fn routeWeights(w: *const Moe.Weights, g: *Graph, r: *Routed, x: Array) !void {
+    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+    if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
+}
+
+/// `sum` plus the shared expert, gated or not, as `mlp` ends; `down` and `logit` where the caller has them already.
+fn sharedFinish(w: *const Moe.Weights, g: *Graph, x: Array, sum: Array, down: ?Array, logit: ?Array) !Array {
+    const se = w.shared orelse return sum;
+    if (!se.gated()) return g.add(sum, try sharedDown(w, g, &se, x, false));
+    const d = down orelse try sharedDown(w, g, &se, x, false);
+    const l = logit orelse try se.gate_logit.forward(g, x);
+    return g.add(sum, try g.mul(try g.sigmoid(l), d));
 }
 
 /// `mlp` split around its routed call, for a prompt whose spans route and finish one at a time while one call takes
@@ -361,8 +371,7 @@ pub fn mlpRoute(w: *const Moe.Weights, parent: *Graph, x: Array) !SpanRoute {
         break :stock try route(w, g, logits, null);
     };
     if (r.gate_logit != null) return error.MoeSpanGateLogit;
-    if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
-    if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
+    try routeWeights(w, g, &r, x);
     return .{ .inds = try parent.keep(r.inds), .scores = try parent.keep(r.scores) };
 }
 
@@ -370,12 +379,7 @@ pub fn mlpRoute(w: *const Moe.Weights, parent: *Graph, x: Array) !SpanRoute {
 pub fn mlpFinish(w: *const Moe.Weights, parent: *Graph, x: Array, sum: Array) !Array {
     var t = parent.scope();
     defer t.deinit();
-    const g = &t;
-    const se = w.shared orelse return parent.keep(sum);
-    if (!se.gated()) return parent.keep(try g.add(sum, try sharedDown(w, g, &se, x, false)));
-    const down = try sharedDown(w, g, &se, x, false);
-    const logit = try se.gate_logit.forward(g, x);
-    return parent.keep(try g.add(sum, try g.mul(try g.sigmoid(logit), down)));
+    return parent.keep(try sharedFinish(w, &t, x, sum, null, null));
 }
 
 /// Whether a prompt span of `rows` rows may share one `routedSum` call with other such spans and keep its own call's
