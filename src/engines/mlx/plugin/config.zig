@@ -24,6 +24,29 @@ pub const Binding = struct {
     /// An outside plugin's (`host/plugins`): its config is its facts alone (`adapted`) unless its parse asks for the
     /// legacy parse's (`Parsed.engine_config`).
     outside: bool = false,
+    /// The bill's shape-free terms, read once where a load binds the table (`readBillTerms`); null on a binding made
+    /// without it, which reads the bill at each use.
+    bill_terms: ?BillTerms = null,
+
+    /// The bill terms admission reads at every request; none depends on the shape.
+    pub const BillTerms = struct {
+        kv_per_token: u64,
+        /// null from a plugin whose Bill predates them.
+        flags: ?abi.BillFlags,
+        prices_prompt: bool,
+    };
+
+    pub fn billTerms(b: *const Binding) BillTerms {
+        if (b.bill_terms) |t| return t;
+        var bill: abi.Bill = .{};
+        b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
+        return .{ .kv_per_token = bill.kv_per_token, .flags = bill.billFlags(), .prices_prompt = bill.prefill_bytes != null };
+    }
+
+    /// Called once, after the parse and before any other thread reads the binding.
+    pub fn readBillTerms(b: *Binding) void {
+        b.bill_terms = b.billTerms();
+    }
 
     pub fn destroy(b: *Binding, a: std.mem.Allocator) void {
         b.table.free_parsed(&b.parsed);
@@ -104,6 +127,7 @@ pub fn bindTableWith(io: std.Io, a: std.mem.Allocator, dir: []const u8, table: *
         a.destroy(b);
         return null;
     }
+    b.readBillTerms();
     return b;
 }
 
@@ -156,6 +180,7 @@ pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json
         b.destroy(a);
         return .{ .declined = "an embedding pack by its folder name" };
     }
+    b.readBillTerms();
     return .{ .bound = b };
 }
 

@@ -163,6 +163,7 @@ test {
     _ = @import("sdk/kv/media_span.zig");
     _ = @import("host/api/generation_settings.zig");
     _ = @import("sdk/config/model.zig");
+    _ = @import("sdk/bill/prefill.zig");
     _ = @import("engines/mlx/generate.zig");
     _ = @import("engines/mlx/transformer.zig");
     _ = @import("engines/mlx/vision_encoder.zig");
@@ -208,6 +209,8 @@ test {
     _ = @import("sdk/blocks/moe/moe_fp4.zig");
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
     _ = @import("sdk/quant/outside_model.zig");
+    _ = @import("sdk/quant/bank_fit_key.zig");
+    _ = @import("engines/mlx/plugin/fit_key.zig");
     _ = @import("engines/mlx/load/sushi_adapt.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
     _ = @import("sdk/quant/formats.zig");

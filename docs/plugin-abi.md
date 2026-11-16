@@ -448,12 +448,12 @@ The load-time shape `bill` prices.
 
 ### `Bill` (extern struct)
 
-The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
+The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `kv_per_token`, `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 
 | Field | Type | Default | |
 |---|---|---|---|
 | `size` | `u32` | `@sizeOf(Bill)` |  |
-| `kv_per_token` | `u64` | `0` |  |
+| `kv_per_token` | `u64` | `0` | The trunk's attention rows a token takes; the engine bills an MTP head's own rows. The host honours it only when the parse names a layout namespace, the plugin's statement that the value is its whole cache layout. |
 | `fixed_slot_bytes` | `u64` | `0` |  |
 | `state_per_token` | `u64` | `0` |  |
 | `prefill_streams` | `u64` | `0` |  |
@@ -463,6 +463,25 @@ The plugin's memory terms. A zero or null term is the engine's default arithmeti
 | `prefill_attn_keys` | `?*const fn (p: *const Parsed, seq: u64) callconv(.c) u64` | `null` |  |
 | `prefill_bytes` | `?*const fn (p: *const Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64` | `null` |  |
 | `batched_kv_len` | `?*const fn (p: *const Parsed, kv: u32, gather_on: bool, min: u32) callconv(.c) u32` | `null` |  |
+| `flags` | `BillFlags` | `.{}` | A u32 at offset 88, read through `billFlags`. Zero keeps the host's rules from before it. |
+
+### `BillFlags` (packed struct(u32))
+
+| Field | Type | Default | |
+|---|---|---|---|
+| `decode_room` | `DecodeRoom` | `.by_name` |  |
+| `reserves_request` | `bool` | `false` | A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`). |
+| `_` | `u29` | `0` |  |
+
+### `DecodeRoom` (enum(u2))
+
+Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`). `billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not, since that bill is not its own.
+
+| Member | Value | |
+|---|---|---|
+| `by_name` | `0` | The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed values 2 and 3 read as this. |
+| `billed` | `1` |  |
+| `_` | |  |
 
 ### `LoadCtx` (extern struct)
 
@@ -488,6 +507,7 @@ Valid during `load` only: the model keeps none of its pointers.
 | `gpu_ceiling_bytes` | `u64` | `0` | The GPU ceiling both rooms were taken from (a bank calibration's key); 0 = unknown. |
 | `stream_grow_prompt` | `u64` | `0` | Each phase's bill growth from the rooms' cell (`stream_room_cell`) to the server's context limit: what a bank calibrated at the cell gives up for a longer context; 0 = none or unknown. |
 | `stream_grow_decode` | `u64` | `0` |  |
+| `bank_fit_key` | `Str` | `.{}` | The key a bank calibration must carry to apply on this server (`bank-fit.json` v3): the canonical key text (`sdk/quant/bank_fit_key.zig`), empty when the host has none. |
 
 ### `Mode` (enum(u8))
 

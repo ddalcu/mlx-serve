@@ -57,6 +57,7 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
     out.* = .{
         .kv_per_token = @as(u64, c.attnLayerCount()) * (c.dsa_kv_lora_rank + 2 * c.dsa_index_head_dim) * 2,
         .ssm_checkpoint = c.ssmCheckpointBytes(4),
+        .flags = .{ .decode_room = if (c.streamed_bank) .billed else .by_name },
     };
 }
 
@@ -231,6 +232,17 @@ test "glm5_next resident bill: a GLM streaming pack bills its 8-bit draft readou
     try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(&c));
     c.streamed_bank = false;
     try std.testing.expectEqual(@as(u64, 0), draftReadoutBytes(&c));
+}
+
+test "glm5_next bill: a streaming pack bills its own decode room, a resident one leaves it to the host's rule" {
+    var c: config.Config = .{ .model_type = "glm5_next", .streamed_bank = true };
+    const p: abi.Parsed = .{ .private = &c };
+    var b: abi.Bill = .{};
+    bill(&p, &.{}, &b);
+    try std.testing.expect(b.billFlags().?.decode_room == .billed);
+    c.streamed_bank = false;
+    bill(&p, &.{}, &b);
+    try std.testing.expect(b.billFlags().?.decode_room == .by_name);
 }
 
 test {

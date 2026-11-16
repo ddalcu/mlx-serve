@@ -1094,23 +1094,31 @@ pub fn load(ctx: *const abi.LoadCtx, hooks: Hooks) !*Model {
 
 /// The streaming pack's bank, opened by its outside plugin at the host's room past the loaded residents, bound to every
 /// routed layer (the trunk's layer index, as `BankGeometry.gates`).
+/// The name the bank's log lines start with: the model plugin's.
+fn bankLogName(ctx: *const abi.LoadCtx) []const u8 {
+    const t = ctx.parsed.shell.model_type.slice();
+    return if (t.len > 0) t else "glm5_next";
+}
+
 /// The bank's per-phase fit (`outside_model.Fit`): the host's prompt and decode rooms, and the pack's measured
-/// calibration (`bank-fit.json`) when it names this ceiling and reaches the server's context; the bills otherwise.
+/// calibration (`bank-fit/<id>.json`, else `bank-fit.json`) when it carries this server's key, names this ceiling and
+/// reaches the server's context; the bills otherwise. Logs the key once, for the fitter to copy.
 fn bankFit(ctx: *const abi.LoadCtx, start: outside_model.Reading) outside_model.Fit {
+    const name = bankLogName(ctx);
     const grow = ctx.streamGrowth();
     var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom(), .grow_prompt = grow.prompt, .grow_decode = grow.decode, .load_start = start };
-    if (!ctx.dir.has(outside_model.bank_fit_file)) return fit;
-    var buf: [4096]u8 = undefined;
-    var why: abi.Verdict = .ok;
-    const text = ctx.dir.readFile(outside_model.bank_fit_file, &buf, &why) orelse {
-        log.warn("glm5_next: {s} does not read ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, why.why.slice() });
+    const key = ctx.fitKey();
+    if (key) |k| if (outside_model.fit_key.parse(k)) |p| {
+        const id = outside_model.fit_key.id(k);
+        log.info("{s}: bank fit key id={s} build={s} | machine={s} | quant_plugin={s} | model_plugin={s} | pack={s}\n", .{ name, &id, p.build, p.machine, p.quant_plugin, p.model_plugin, p.pack });
+    };
+    var buf: [16384]u8 = undefined;
+    const found = outside_model.readBankFit(ctx.dir, key, &buf) orelse return fit;
+    fit.calibration = outside_model.parseBankFit(found.text, ctx.gpuCeiling(), abi.stream_room_cell, key) catch |e| {
+        log.warn("{s}: {s} not applied ({s}): the bank fits by the bills\n", .{ name, found.name(), @errorName(e) });
         return fit;
     };
-    fit.calibration = outside_model.parseBankFit(text, ctx.gpuCeiling(), abi.stream_room_cell) catch |e| {
-        log.warn("glm5_next: {s} not applied ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, @errorName(e) });
-        return fit;
-    };
-    log.info("glm5_next: the bank fits by {s} (ceiling {d} MiB; the bills' growth past its {d}-token evidence {d} / {d} MiB)\n", .{ outside_model.bank_fit_file, fit.calibration.?.ceiling >> 20, fit.calibration.?.evidence, grow.prompt >> 20, grow.decode >> 20 });
+    log.info("{s}: the bank fits by {s} (ceiling {d} MiB; the bills' growth past its {d}-token evidence {d} / {d} MiB)\n", .{ name, found.name(), fit.calibration.?.ceiling >> 20, fit.calibration.?.evidence, grow.prompt >> 20, grow.decode >> 20 });
     return fit;
 }
 
@@ -1130,11 +1138,12 @@ fn bindBank(m: *Model, ctx: *const abi.LoadCtx, start: outside_model.Reading) !v
     const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(m.layers.len), .swiglu_limit = if (c.swiglu_clamp) c.swiglu_limit else 0, .gates = gates.ptr, .limits_out = if (any_limit) limits.ptr else null };
     const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fit = bankFit(ctx, start) }, m.s);
     m.bank = o.bank;
-    log.info("glm5_next: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
+    const name = bankLogName(ctx);
+    log.info("{s}: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ name, o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
     // the budget and the memory read at the open: a bank-fit.json's evidence (`rest = non-file in use - server footprint`)
-    if (o.refused) |e| log.warn("glm5_next: the memory read at the open refused ({s}: non-file in use below the server's footprint): the bank fits by the bills on total - available\n", .{@errorName(e)});
-    if (o.read) |r| if (r.in_use != o.reading.?.in_use) log.info("glm5_next: the open read non-file in use {d} MiB, settled to {d} MiB (outside the server at the load's start {d} MiB, server footprint {d} MiB)\n", .{ r.in_use >> 20, o.reading.?.in_use >> 20, (start.in_use -| start.footprint) >> 20, r.footprint >> 20 });
-    if (o.reading) |r| log.info("glm5_next: bank budget {d} MiB prompt / {d} MiB decode: non-file in use {d} MiB, server footprint {d} MiB at the open\n", .{ o.budget.prompt >> 20, o.budget.decode >> 20, r.in_use >> 20, r.footprint >> 20 });
+    if (o.refused) |e| log.warn("{s}: the memory read at the open refused ({s}: non-file in use below the server's footprint): the bank fits by the bills on total - available\n", .{ name, @errorName(e) });
+    if (o.read) |r| if (r.in_use != o.reading.?.in_use) log.info("{s}: the open read non-file in use {d} MiB, settled to {d} MiB (outside the server at the load's start {d} MiB, server footprint {d} MiB)\n", .{ name, r.in_use >> 20, o.reading.?.in_use >> 20, (start.in_use -| start.footprint) >> 20, r.footprint >> 20 });
+    if (o.reading) |r| log.info("{s}: bank budget {d} MiB prompt / {d} MiB decode: non-file in use {d} MiB, server footprint {d} MiB at the open\n", .{ name, o.budget.prompt >> 20, o.budget.decode >> 20, r.in_use >> 20, r.footprint >> 20 });
     const r = o.bank.routed();
     m.routed = r;
     for (m.layers, 0..) |*ly, li| if (ly.mlp == .moe) try moe.bindRouted(&ly.mlp.moe, r, @intCast(li));
@@ -1226,6 +1235,15 @@ test "glm5_next trunk: the draft readout bills Ling-3.1-flash's 4-bit head at 34
     try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(154_880, 4096, 8));
     try std.testing.expectEqual(@as(u32, 4), readoutBits(&.{ .model_type = "bailing_hybrid" }));
     try std.testing.expectEqual(@as(u32, 8), readoutBits(&.{ .model_type = "glm5_next" }));
+}
+
+test "glm5_next trunk: the bank fit's log lines name the model plugin that loads the bank" {
+    const dir: abi.PackDir = undefined;
+    for ([_][]const u8{ "bailing_hybrid", "glm5_next" }) |t| {
+        const parsed: abi.Parsed = .{ .shell = .{ .model_type = .of(t) } };
+        const ctx: abi.LoadCtx = .{ .model_dir = .{}, .dir = &dir, .parsed = &parsed };
+        try std.testing.expectEqualStrings(t, bankLogName(&ctx));
+    }
 }
 
 /// Makes Ling's NextN layer resident (bailing_hybrid's `HeadHooks.load`).

@@ -14,8 +14,8 @@ server's own plugins pass (the kit does not ship it). Below, those six file name
   Gemma/BERT/sliding key (`foreign_keys`).
 - Streaming pack (`Config.streamed_bank`): its claiming outside quant plugin runs the projections it stores and the
   head's experts (`sdk/quant/outside_model.zig`); its bank opens per phase (`Budget.fit`: `stream_room`, `decodeRoom()`,
-  the pack's `bank-fit.json` on its ceiling), binds each routed layer (`moe.bindRouted`), takes each forward's phase
-  and settles after its eval. Serial decode, no images (`bankFacts`).
+  the pack's fit for this server's key, `bank-fit/<id>.json`, on its ceiling), binds each routed layer
+  (`moe.bindRouted`), takes each forward's phase and settles after its eval. Serial decode, no images (`bankFacts`).
 - Load (`trunk.zig`): reads the driver's resident source (`LoadCtx.weights`: the engine's map with the Sushi and
   ModelOpt adapters applied) in the layout the deleted legacy load built: q|k|v and the convs joined, GLM's decode row
   group `[qkv | z | a | b]`, f32 KDA tables, DSA and MLA projections, the MoE block's weights, the `mtp.0` head.

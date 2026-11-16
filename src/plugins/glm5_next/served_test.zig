@@ -318,6 +318,41 @@ test "bailing_hybrid served: a streaming pack's verify rows are serial decode's,
     }.run);
 }
 
+// Bar: a streaming pack reserves its whole request at the prompt pass (prompt, reply to the context limit and the
+// verify rows), so a greedy decode to the limit, past the 256 rows a first grow takes, never grows the cache.
+test "bailing_hybrid served: a streaming pack's KV is reserved once at the prompt pass and never grows in decode" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    try withToyLing(struct {
+        fn run(b: *both.Both) anyerror!void {
+            const a = testing.allocator;
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const KVCache = @import("../../sdk/kv/cache.zig").KVCache;
+            const verify_rows = @import("../../engines/mlx/generate/init.zig").verify_rows_max;
+            var x = try driver.load(io, a, &b.cfg, b.dir, proof_fixture.stream());
+            defer x.deinit();
+            const prompt = [_]u32{ 3, 7, 1, 12, 30, 5, 9, 22, 4, 17, 2, 28 };
+            const reply: u32 = 260;
+            const limit: usize = prompt.len + reply;
+            x.config.ctx_override = @intCast(limit);
+            var tok_dummy: Tokenizer = undefined; // never read by the Generator
+            var gen = try Generator.initWithOptions(io, a, &x, &tok_dummy, &prompt, reply, .{ .temperature = 0.0 }, &.{}, .{ .skip_lazy_preforward = true });
+            defer gen.deinit(a);
+            try testing.expectEqual(limit + verify_rows, gen.ctx.cache.reserve_tokens);
+            var layers: usize = 0;
+            for (gen.ctx.cache.entries) |e| if (e.initialized) {
+                layers += 1;
+                try testing.expect(KVCache.bufferCapacity(e.keys) >= limit + verify_rows);
+            };
+            try testing.expect(layers > 0);
+            const grows = KVCache.kv_cap_buf_grows;
+            var n: usize = 0;
+            while (try gen.next(a)) |_| n += 1;
+            try testing.expectEqual(@as(usize, reply), n);
+            try testing.expectEqual(grows, KVCache.kv_cap_buf_grows);
+        }
+    }.run);
+}
+
 /// Greedy tokens after a fixed prompt on a fresh trunk: serial decode (`depth` 0) or MTP rounds through the head.
 fn lingGreedy(b: *both.Both, depth: u32, out: []u32) !void {
     const a = testing.allocator;

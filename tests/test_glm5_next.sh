@@ -141,7 +141,13 @@ check "[9] 30-count stream correct under batching" "$CONC" "count30=True"
 check "[9] 45-count stream correct under batching" "$CONC" "count45=True"
 check "[9] 60-count stream correct under batching" "$CONC" "count60=True"
 check "[9] needle recovered under batching" "$CONC" "needle=741952"
-check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] gdn batched decode engaged"
+# A streamed bank serves one request at a time (`modelExclusiveDecode`): its four streams run serialized, so only the
+# engaged line is skipped there.
+if grep -qF "glm5_next: streamed experts," "$LOG"; then
+    echo "SKIP [9] batched forward engaged: a streamed bank serves one request at a time"
+else
+    check "[9] batched forward engaged" "$(cat "$SCRATCH_HOME"/.mlx-serve/logs/*.log 2>/dev/null)" "[batched] gdn batched decode engaged"
+fi
 
 # [11] Images. The grid and token accounting come from the log: a run of pads that missed the
 # splice still answers plausibly, so the signs' names (only the pixels carry them) are the bar.

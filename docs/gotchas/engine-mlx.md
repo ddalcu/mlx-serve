@@ -1565,3 +1565,18 @@ then ignored every later submission from the process ("Ignored (for causing prio
 request answered a bare 500 and `/health` stayed 200, so nothing restarted the server. Cause: the latch's sticky-error
 list knew CUDA's faults only. Fix: `SubmissionsIgnored` marks the GPU context lost like a CUDA fault (named 503,
 `/health` 503 `gpu context lost`). Guard: `a sticky CUDA error marks the GPU context lost; any other error does not`.
+
+### A streamed bank's second request ran outside the room the bank was sized against
+Defect: on a glm5_next streaming pack (GLM-5.3, Ling-3.1) a request could end past the GPU ceiling the bank was sized
+for: beside a hot-cache entry from an earlier turn, beside a second live request, or near the context limit on a
+bills-only bank. Cause: the bank leaves the hot cache 2 GiB (`GLM5_HOT_CACHE_BYTES` in the decode bill; the fitter,
+`g53_fit_bank.py`, adds the same 2 GiB to each fitted base), and admission bills a streamed pack at 0, so nothing evicts
+or holds on live memory. Yet the hot cache asked for one whole session at the working context (over 11 GiB for Ling at
+32K), an oversized commit's `trimmedCopy` was made before the entry it replaces was evicted, a second request
+interleaved in its own slot, and the bills-only fit ignored the bills' growth past the cell. Fix: a streamed bank's
+hot-cache budget is held to the term (`streamedHotCacheCapped`; a module-path plugin keeps its own accounting), its
+oversized commit evicts before it copies (`evict_before_copy`), a streamed bank is single-flight
+(`modelExclusiveDecode`), and every fit gives up the growth (`billsBudget`). Guards: `ungatedHotCacheAsk: a streamed
+bank's GLM or Ling asks no more than the hot-cache term its decode room holds`, `HotPrefixCache: a capped streamed
+bank's oversized commit evicts before it copies`, `outside model: a fitted base carries the hot cache's resident entry`,
+`a streamed bank's slot is exclusive on GLM and Ling`, `outside model: a bills-only fit gives each phase's bills' growth`.

@@ -373,8 +373,11 @@ pub const Shape = extern struct {
 };
 
 /// The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
+/// `kv_per_token`, `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 pub const Bill = extern struct {
     size: u32 = @sizeOf(Bill),
+    /// The trunk's attention rows a token takes; the engine bills an MTP head's own rows. The host honours it only when
+    /// the parse names a layout namespace, the plugin's statement that the value is its whole cache layout.
     kv_per_token: u64 = 0,
     fixed_slot_bytes: u64 = 0,
     state_per_token: u64 = 0,
@@ -385,6 +388,32 @@ pub const Bill = extern struct {
     prefill_attn_keys: ?*const fn (p: *const Parsed, seq: u64) callconv(.c) u64 = null,
     prefill_bytes: ?*const fn (p: *const Parsed, seq: u64, chunk: u32, kv_bits: u8, warm: u64) callconv(.c) u64 = null,
     batched_kv_len: ?*const fn (p: *const Parsed, kv: u32, gather_on: bool, min: u32) callconv(.c) u32 = null,
+    /// A u32 at offset 88, read through `billFlags`. Zero keeps the host's rules from before it.
+    flags: BillFlags = .{},
+
+    /// `flags`, or null from a plugin whose Bill predates it.
+    pub fn billFlags(b: *const Bill) ?BillFlags {
+        if (b.size < @offsetOf(Bill, "flags") + @sizeOf(BillFlags)) return null;
+        return b.flags;
+    }
+};
+
+pub const BillFlags = packed struct(u32) {
+    decode_room: DecodeRoom = .by_name,
+    /// A decode-billed request reserves its whole KV (prompt, reply to the context, verify rows) at its prompt and
+    /// its decode bill prices that KV once (`reservedPrefillTokens`, `glm5DecodeMemoryNeeded`).
+    reserves_request: bool = false,
+    _: u29 = 0,
+};
+
+/// Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_room_decode`, `stream_grow_decode`).
+/// `billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk
+/// (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not, since that bill is not its own.
+pub const DecodeRoom = enum(u2) {
+    /// The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed values 2 and 3 read as this.
+    by_name = 0,
+    billed = 1,
+    _,
 };
 
 // ── Load and forward ──
@@ -422,6 +451,9 @@ pub const LoadCtx = extern struct {
     /// calibrated at the cell gives up for a longer context; 0 = none or unknown.
     stream_grow_prompt: u64 = 0,
     stream_grow_decode: u64 = 0,
+    /// The key a bank calibration must carry to apply on this server (`bank-fit.json` v3): the canonical key text
+    /// (`sdk/quant/bank_fit_key.zig`), empty when the host has none.
+    bank_fit_key: Str = .{},
 
     /// The decode phase's room: `stream_room_decode`, or `stream_room` from a host that sets none or predates it.
     pub fn decodeRoom(c: *const LoadCtx) u64 {
@@ -437,6 +469,12 @@ pub const LoadCtx = extern struct {
     pub fn streamGrowth(c: *const LoadCtx) struct { prompt: u64, decode: u64 } {
         if (c.size < @offsetOf(LoadCtx, "stream_grow_decode") + @sizeOf(u64)) return .{ .prompt = 0, .decode = 0 };
         return .{ .prompt = c.stream_grow_prompt, .decode = c.stream_grow_decode };
+    }
+    /// `bank_fit_key`, or null from a host that sets none or predates it.
+    pub fn fitKey(c: *const LoadCtx) ?[]const u8 {
+        if (c.size < @offsetOf(LoadCtx, "bank_fit_key") + @sizeOf(Str)) return null;
+        const k = c.bank_fit_key.slice();
+        return if (k.len == 0) null else k;
     }
 };
 
@@ -460,6 +498,33 @@ test "abi plugin: LoadCtx's decode room and ceiling read past an older host's st
     c.size = @offsetOf(LoadCtx, "stream_room_decode");
     try std.testing.expectEqual(@as(u64, 50), c.decodeRoom());
     try std.testing.expectEqual(@as(u64, 0), c.gpuCeiling());
+}
+
+test "abi plugin: a Bill's flag word is one u32 at its offset, read past an older plugin's struct as absent" {
+    try testing.expectEqual(@as(usize, 4), @sizeOf(BillFlags));
+    try testing.expectEqual(@as(usize, 32), @bitSizeOf(BillFlags));
+    try testing.expectEqual(@as(usize, 88), @offsetOf(Bill, "flags"));
+    var b: Bill = .{ .flags = .{ .decode_room = .billed } };
+    try testing.expect(b.billFlags().?.decode_room == .billed);
+    b.size = @offsetOf(Bill, "flags");
+    try testing.expect(b.billFlags() == null);
+    try testing.expect((BillFlags{}).decode_room == .by_name and @as(u32, @bitCast(BillFlags{})) == 0);
+}
+
+test "abi plugin: a decode room is named by_name or billed; every other value is the host's rule" {
+    try testing.expectEqual(@as(usize, 2), @typeInfo(DecodeRoom).@"enum".field_names.len);
+}
+
+test "abi plugin: LoadCtx's bank fit key reads null past an older host's struct and when empty" {
+    const dir: PackDir = undefined;
+    const parsed: Parsed = .{};
+    var c: LoadCtx = .{ .model_dir = .{}, .dir = &dir, .parsed = &parsed, .bank_fit_key = .of("build=x\n") };
+    try std.testing.expectEqualStrings("build=x\n", c.fitKey().?);
+    c.size = @offsetOf(LoadCtx, "bank_fit_key");
+    try std.testing.expect(c.fitKey() == null);
+    c.size = @sizeOf(LoadCtx);
+    c.bank_fit_key = .{};
+    try std.testing.expect(c.fitKey() == null);
 }
 
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows };
