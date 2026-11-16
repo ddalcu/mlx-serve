@@ -1886,9 +1886,7 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 pub fn declaredKvBytes(config: *const ModelConfig) u64 {
     const b = config.plugin orelse return 0;
     if (b.parsed.cache.layout_namespace.len == 0) return 0;
-    var bill: abi.Bill = .{};
-    b.table.bill(&b.parsed, &.{ .context = 1 }, &bill);
-    return bill.kv_per_token;
+    return b.billTerms().kv_per_token;
 }
 
 /// Sampling recommendations parsed out of a model's generation_config.json.

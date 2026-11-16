@@ -360,6 +360,7 @@ pub const Shape = extern struct {
 };
 
 /// The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
+/// `kv_per_token`, `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 pub const Bill = extern struct {
     size: u32 = @sizeOf(Bill),
     /// The trunk's attention rows a token takes; the engine bills an MTP head's own rows. The host honours it only when

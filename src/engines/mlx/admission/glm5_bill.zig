@@ -24,6 +24,7 @@ const prefillFfnWidth = @import("bills.zig").prefillFfnWidth;
 const retainedSsmCheckpointBytes = @import("bills.zig").retainedSsmCheckpointBytes;
 const prefillNeededAtChunk = @import("prefill_chunk.zig").prefillNeededAtChunk;
 const mtpHeadBilled = @import("bills.zig").mtpHeadBilled;
+const BillTerms = @import("../plugin/config.zig").Binding.BillTerms;
 
 /// Bytes per (query, key pool) GLM's DSA indexer holds while it selects (`selectRows`):
 /// f32 scores, their negation and the argpartition result.
@@ -79,31 +80,30 @@ pub const GLM5_HOT_CACHE_BYTES: u64 = 2048 << 20;
 /// `decode_room`. Unset (or a Bill that predates it) is the name rule: a built-in GLM on a streamed plugin that prices
 /// no prompt of its own, and Ling (bailing_hybrid), which runs GLM's trunk though its plugin prices its prompt.
 pub fn decodeBilled(config: *const model_mod.ModelConfig) bool {
-    var bill: abi.Bill = .{};
-    return streamedBill(config, &bill) and decodeRoomOf(config, &bill);
+    const terms = streamedTerms(config) orelse return false;
+    return decodeRoomOf(config, terms);
 }
 
 /// Whether a decode-billed request reserves its whole KV at its prompt (`reservedPrefillTokens`) and its decode bill
 /// prices that KV once: its bill's `reserves_request`.
 pub fn reservesRequest(config: *const model_mod.ModelConfig) bool {
-    var bill: abi.Bill = .{};
-    if (!streamedBill(config, &bill) or !decodeRoomOf(config, &bill)) return false;
-    return if (bill.billFlags()) |f| f.reserves_request else false;
+    const terms = streamedTerms(config) orelse return false;
+    if (!decodeRoomOf(config, terms)) return false;
+    return if (terms.flags) |f| f.reserves_request else false;
 }
 
-/// A streamed plugin's bill at the rooms' cell into `out`; false for a model that does not stream.
-fn streamedBill(config: *const model_mod.ModelConfig, out: *abi.Bill) bool {
-    const b = config.plugin orelse return false;
-    if (!b.parsed.caps.streamed_weights) return false;
-    b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, out);
-    return true;
+/// A streamed plugin's bill terms; null for a model that does not stream.
+fn streamedTerms(config: *const model_mod.ModelConfig) ?BillTerms {
+    const b = config.plugin orelse return null;
+    if (!b.parsed.caps.streamed_weights) return null;
+    return b.billTerms();
 }
 
-fn decodeRoomOf(config: *const model_mod.ModelConfig, bill: *const abi.Bill) bool {
-    const room: abi.DecodeRoom = if (bill.billFlags()) |f| f.decode_room else .by_name;
+fn decodeRoomOf(config: *const model_mod.ModelConfig, terms: BillTerms) bool {
+    const room: abi.DecodeRoom = if (terms.flags) |f| f.decode_room else .by_name;
     return switch (room) {
         .billed => true,
-        else => std.mem.eql(u8, config.model_type, "bailing_hybrid") or (config.isGlm5() and bill.prefill_bytes == null),
+        else => std.mem.eql(u8, config.model_type, "bailing_hybrid") or (config.isGlm5() and !terms.prices_prompt),
     };
 }
 

@@ -448,7 +448,7 @@ The load-time shape `bill` prices.
 
 ### `Bill` (extern struct)
 
-The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout.
+The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `kv_per_token`, `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 
 | Field | Type | Default | |
 |---|---|---|---|
