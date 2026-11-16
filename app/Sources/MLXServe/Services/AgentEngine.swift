@@ -72,6 +72,11 @@ enum AgentEngine {
         [["role": "system", "content": systemPrompt]] + history
     }
 
+    /// Ends a tool result the history cut short, so the model knows it reads part of it and can ask again.
+    static func toolResultCutMarker(dropped: Int) -> String {
+        "\n[\(dropped) more characters of this earlier result were cut; call the tool again to read them]"
+    }
+
     /// Build API-ready message history from chat messages with budget-aware truncation.
     ///
     /// Pins all user messages (they carry critical facts — name, preferences, task
@@ -236,10 +241,13 @@ enum AgentEngine {
                 let unanswered = lastReplyIdx.map { i > $0 } ?? true
                 let limit = unanswered ? msg.content.count : (isRecent ? recentLimit : olderLimit)
                 toolResultsSeen += 1
+                // Cut only where the cut saves more than its marker adds, so a cut result is always shorter.
+                let dropped = msg.content.count - limit
+                let marker = Self.toolResultCutMarker(dropped: max(dropped, 0))
                 history.append([
                     "role": "tool",
                     "tool_call_id": callId,
-                    "content": String(msg.content.prefix(limit)),
+                    "content": dropped > marker.count ? String(msg.content.prefix(limit)) + marker : msg.content,
                 ])
                 continue
             }
