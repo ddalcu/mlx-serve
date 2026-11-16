@@ -204,12 +204,28 @@ pub const bank_fit_format = "mlx-serve-bank-fit-v2";
 /// The first format: its `rest_bytes` read `total - available`, which moves with the page cache; refused by name.
 pub const bank_fit_format_v1 = "mlx-serve-bank-fit-v1";
 
+pub const BankFitError = error{
+    BankFitInvalid,
+    BankFitFormat,
+    BankFitV1Rest,
+    BankFitUnkeyed,
+    BankFitNoHostKey,
+    BankFitOtherBuild,
+    BankFitOtherMachine,
+    BankFitOtherQuantPlugin,
+    BankFitOtherModelPlugin,
+    BankFitOtherPack,
+    BankFitOtherCeiling,
+    BankFitOtherCell,
+};
+
 /// `bank-fit.json`'s calibration when its ceiling is the host's (`ceiling`, 0 = unknown: none applies) and its evidence
 /// ran the rooms' cell (`cell`, the bills' growth past it is the host's); a named reason otherwise (logged by the caller;
-/// the bills stand).
-pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64) error{ BankFitInvalid, BankFitFormat, BankFitV1Rest, BankFitOtherCeiling, BankFitOtherCell }!Calibration {
+/// the bills stand). `key`: the host's (`LoadCtx.fitKey`).
+pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64, key: ?[]const u8) BankFitError!Calibration {
+    _ = key;
     const F = struct { format: []const u8 = "", ceiling_bytes: u64 = 0, cell_tokens: u64 = 0, evidence_tokens: u64 = 0, base_prompt_bytes: u64 = 0, base_decode_bytes: u64 = 0, rest_bytes: u64 = 0 };
-    var buf: [4096]u8 = undefined;
+    var buf: [16384]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&buf);
     const f = std.json.parseFromSliceLeaky(F, fba.allocator(), json, .{ .ignore_unknown_fields = true }) catch return error.BankFitInvalid;
     if (std.mem.eql(u8, f.format, bank_fit_format_v1)) return error.BankFitV1Rest;
@@ -218,6 +234,30 @@ pub fn parseBankFit(json: []const u8, ceiling: u64, cell: u64) error{ BankFitInv
     if (ceiling == 0 or f.ceiling_bytes != ceiling) return error.BankFitOtherCeiling;
     if (f.cell_tokens != cell) return error.BankFitOtherCell;
     return .{ .ceiling = f.ceiling_bytes, .cell = f.cell_tokens, .evidence = if (f.evidence_tokens > 0) f.evidence_tokens else f.cell_tokens, .base_prompt = f.base_prompt_bytes, .base_decode = f.base_decode_bytes, .rest = f.rest_bytes };
+}
+
+/// A calibration file read from the pack: its name there and its text (in the caller's buffer).
+pub const FoundFit = struct {
+    name_buf: [32]u8 = undefined,
+    name_len: usize = 0,
+    text: []const u8,
+
+    pub fn name(f: *const FoundFit) []const u8 {
+        return f.name_buf[0..f.name_len];
+    }
+};
+
+/// The pack's calibration for the host's `key`: `bank-fit/<id>.json` (`bank_fit_key.fileName`), else the top-level
+/// `bank-fit.json` (a local evidence run's), read into `buf`; null when the pack holds neither.
+pub fn readBankFit(dir: *const plugin_abi.PackDir, key: ?[]const u8, buf: []u8) ?FoundFit {
+    _ = key;
+    var f: FoundFit = .{ .text = &.{} };
+    if (!dir.has(bank_fit_file)) return null;
+    var why: plugin_abi.Verdict = .{};
+    f.text = dir.readFile(bank_fit_file, buf, &why) orelse return null;
+    @memcpy(f.name_buf[0..bank_fit_file.len], bank_fit_file);
+    f.name_len = bank_fit_file.len;
+    return f;
 }
 
 /// The memory in use now and the server's footprint (`fitBudget`'s reading).
@@ -569,22 +609,87 @@ test "outside model: a calibrated budget reads the same with more file pages on 
     try testing.expectEqual(quant_abi.BankBudget{ .prompt = 110 * GB + 12 * GB - 40 * GB - (31 * GB + GB / 2 - foot) - fit.inuse_margin, .decode = 110 * GB + 12 * GB - 28 * GB - (31 * GB + GB / 2 - foot) - fit.inuse_margin }, budgets[0]);
 }
 
-test "outside model: bank-fit.json applies on its own ceiling and cell; another format, ceiling, cell or a bad file is refused by name" {
-    const good = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000,\"evidence\":\"g53cpab4\"}";
-    const c = try parseBankFit(good, 118111600640, 17_408);
+const fit_key = @import("bank_fit_key.zig");
+
+/// A key's canonical text in `buf` (tests).
+pub fn testFitKey(buf: []u8, p: fit_key.Parts) []const u8 {
+    var w: std.Io.Writer = .fixed(buf);
+    fit_key.write(&w, p) catch unreachable;
+    return w.buffered();
+}
+
+/// A v3 calibration carrying `p`, with `extra` JSON members before the bases (tests).
+pub fn testFitV3(buf: []u8, p: fit_key.Parts, extra: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{{\"format\":\"mlx-serve-bank-fit-v3\",\"key\":{{\"build\":\"{s}\",\"machine\":\"{s}\",\"quant_plugin\":\"{s}\",\"model_plugin\":\"{s}\",\"pack\":\"{s}\"}},\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,{s}\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}}", .{ p.build, p.machine, p.quant_plugin, p.model_plugin, p.pack, extra }) catch unreachable;
+}
+
+pub const test_fit_parts: fit_key.Parts = .{ .build = "26.11.3+e285ab55 mlx=c69303b00f5f ReleaseFast kv16", .machine = "Apple M5 Max 128GB", .quant_plugin = "turboexl3_ling 1.0.0 ab12", .model_plugin = "in-tree", .pack = "cd34" };
+
+test "outside model: a v3 bank fit carrying the host's key applies on its ceiling and cell; a part that differs, a v2 file or a host with no key is refused by name" {
+    var kb: [512]u8 = undefined;
+    const key = testFitKey(&kb, test_fit_parts);
+    var fb: [1024]u8 = undefined;
+    const good = testFitV3(&fb, test_fit_parts, "");
+    const c = try parseBankFit(good, 118111600640, 17_408, key);
     try testing.expectEqual(@as(u64, 40000000000), c.base_prompt);
     try testing.expectEqual(@as(u64, 15000000000), c.rest);
     // No evidence_tokens: the growth starts at the cell; named: at the evidence request's prompt + reply.
     try testing.expectEqual(@as(u64, 17_408), c.evidence);
-    const named = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"evidence_tokens\":18380,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
-    try testing.expectEqual(@as(u64, 18_380), (try parseBankFit(named, 118111600640, 17_408)).evidence);
-    try testing.expectError(error.BankFitOtherCeiling, parseBankFit(good, 112 << 30, 17_408));
-    try testing.expectError(error.BankFitOtherCeiling, parseBankFit(good, 0, 17_408));
-    try testing.expectError(error.BankFitOtherCell, parseBankFit(good, 118111600640, 33_792));
-    try testing.expectError(error.BankFitFormat, parseBankFit("{\"format\":\"other\"}", 118111600640, 17_408));
+    var nb: [1024]u8 = undefined;
+    try testing.expectEqual(@as(u64, 18_380), (try parseBankFit(testFitV3(&nb, test_fit_parts, "\"evidence_tokens\":18380,"), 118111600640, 17_408, key)).evidence);
+    // Each part the host's key names differs: refused by that part's name.
+    const Case = struct { part: []const u8, want: BankFitError };
+    for ([_]Case{ .{ .part = "build", .want = error.BankFitOtherBuild }, .{ .part = "machine", .want = error.BankFitOtherMachine }, .{ .part = "quant_plugin", .want = error.BankFitOtherQuantPlugin }, .{ .part = "model_plugin", .want = error.BankFitOtherModelPlugin }, .{ .part = "pack", .want = error.BankFitOtherPack } }) |case| {
+        var p = test_fit_parts;
+        inline for (fit_key.names) |n| {
+            if (std.mem.eql(u8, n, case.part)) @field(p, n) = "other";
+        }
+        var ob: [1024]u8 = undefined;
+        try testing.expectError(case.want, parseBankFit(testFitV3(&ob, p, ""), 118111600640, 17_408, key));
+    }
+    // A v2 file names no key; a host with none applies no fit.
+    const v2 = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
+    try testing.expectError(error.BankFitUnkeyed, parseBankFit(v2, 118111600640, 17_408, key));
+    try testing.expectError(error.BankFitNoHostKey, parseBankFit(good, 118111600640, 17_408, null));
+    try testing.expectError(error.BankFitOtherCeiling, parseBankFit(good, 112 << 30, 17_408, key));
+    try testing.expectError(error.BankFitOtherCeiling, parseBankFit(good, 0, 17_408, key));
+    try testing.expectError(error.BankFitOtherCell, parseBankFit(good, 118111600640, 33_792, key));
+    try testing.expectError(error.BankFitFormat, parseBankFit("{\"format\":\"other\"}", 118111600640, 17_408, key));
     // v1's rest read total - available: refused by name, the same file otherwise
     const v1 = "{\"format\":\"mlx-serve-bank-fit-v1\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
-    try testing.expectError(error.BankFitV1Rest, parseBankFit(v1, 118111600640, 17_408));
-    try testing.expectError(error.BankFitInvalid, parseBankFit("{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":1}", 1, 1));
-    try testing.expectError(error.BankFitInvalid, parseBankFit("{", 1, 1));
+    try testing.expectError(error.BankFitV1Rest, parseBankFit(v1, 118111600640, 17_408, key));
+    try testing.expectError(error.BankFitInvalid, parseBankFit("{\"format\":\"mlx-serve-bank-fit-v3\",\"ceiling_bytes\":1}", 1, 1, key));
+    try testing.expectError(error.BankFitInvalid, parseBankFit("{", 1, 1, key));
+}
+
+test "outside model: a bank fit for the host's key is read from bank-fit/<id>.json; with none for it, from the top-level bank-fit.json" {
+    const io = testing.io;
+    const pack_dir = @import("../util/pack_dir.zig");
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var kb: [512]u8 = undefined;
+    const key = testFitKey(&kb, test_fit_parts);
+    var nb: [32]u8 = undefined;
+    const own = fit_key.fileName(&nb, key);
+    try tmp.dir.createDirPath(io, "bank-fit");
+    try tmp.dir.writeFile(io, .{ .sub_path = own, .data = "{\"own\":1}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "bank-fit/0000000000000000.json", .data = "{\"other\":1}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = bank_fit_file, .data = "{\"local\":1}" });
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const n = try tmp.dir.realPath(io, &path);
+    var fs = try pack_dir.FsPackDir.open(io, path[0..n]);
+    defer fs.close();
+    const dir = fs.packDir();
+    var buf: [256]u8 = undefined;
+    const f = readBankFit(&dir, key, &buf).?;
+    try testing.expectEqualStrings(own, f.name());
+    try testing.expectEqualStrings("{\"own\":1}", f.text);
+    // Another key, or a host with none: the top-level file, which the parse then checks by the key.
+    var ob: [512]u8 = undefined;
+    var other = test_fit_parts;
+    other.machine = "Apple M4 Max 128GB";
+    try testing.expectEqualStrings(bank_fit_file, readBankFit(&dir, testFitKey(&ob, other), &buf).?.name());
+    try testing.expectEqualStrings(bank_fit_file, readBankFit(&dir, null, &buf).?.name());
+    try tmp.dir.deleteFile(io, bank_fit_file);
+    try testing.expect(readBankFit(&dir, testFitKey(&ob, other), &buf) == null);
 }

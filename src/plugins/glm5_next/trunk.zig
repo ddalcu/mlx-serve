@@ -1083,17 +1083,19 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
 /// routed layer (the trunk's layer index, as `BankGeometry.gates`).
 /// The bank's per-phase fit (`outside_model.Fit`): the host's prompt and decode rooms, and the pack's measured
 /// calibration (`bank-fit.json`) when it names this ceiling and reaches the server's context; the bills otherwise.
+/// The name the bank's log lines start with: the model plugin's.
+fn bankLogName(ctx: *const abi.LoadCtx) []const u8 {
+    _ = ctx;
+    return "glm5_next";
+}
+
 fn bankFit(ctx: *const abi.LoadCtx, start: outside_model.Reading) outside_model.Fit {
     const grow = ctx.streamGrowth();
     var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom(), .grow_prompt = grow.prompt, .grow_decode = grow.decode, .load_start = start };
-    if (!ctx.dir.has(outside_model.bank_fit_file)) return fit;
-    var buf: [4096]u8 = undefined;
-    var why: abi.Verdict = .ok;
-    const text = ctx.dir.readFile(outside_model.bank_fit_file, &buf, &why) orelse {
-        log.warn("glm5_next: {s} does not read ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, why.why.slice() });
-        return fit;
-    };
-    fit.calibration = outside_model.parseBankFit(text, ctx.gpuCeiling(), abi.stream_room_cell) catch |e| {
+    var buf: [16384]u8 = undefined;
+    const found = outside_model.readBankFit(ctx.dir, ctx.fitKey(), &buf) orelse return fit;
+    const text = found.text;
+    fit.calibration = outside_model.parseBankFit(text, ctx.gpuCeiling(), abi.stream_room_cell, ctx.fitKey()) catch |e| {
         log.warn("glm5_next: {s} not applied ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, @errorName(e) });
         return fit;
     };
@@ -1213,6 +1215,15 @@ test "glm5_next trunk: the draft readout bills Ling-3.1-flash's 4-bit head at 34
     try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(154_880, 4096, 8));
     try std.testing.expectEqual(@as(u32, 4), readoutBits(&.{ .model_type = "bailing_hybrid" }));
     try std.testing.expectEqual(@as(u32, 8), readoutBits(&.{ .model_type = "glm5_next" }));
+}
+
+test "glm5_next trunk: the bank fit's log lines name the model plugin that loads the bank" {
+    const dir: abi.PackDir = undefined;
+    for ([_][]const u8{ "bailing_hybrid", "glm5_next" }) |t| {
+        const parsed: abi.Parsed = .{ .shell = .{ .model_type = .of(t) } };
+        const ctx: abi.LoadCtx = .{ .model_dir = .{}, .dir = &dir, .parsed = &parsed };
+        try std.testing.expectEqualStrings(t, bankLogName(&ctx));
+    }
 }
 
 /// Makes Ling's NextN layer resident (bailing_hybrid's `HeadHooks.load`).
