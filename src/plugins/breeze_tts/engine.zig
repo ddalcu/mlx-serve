@@ -631,6 +631,7 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, x_host: []cons
         defer _ = mlx.mlx_array_free(u);
         const gu = if (try fused_activations.fusedSwiGLU(s, g, u)) |sg| sg else blk: {
             const gs = try siluArr(g, s);
+            defer _ = mlx.mlx_array_free(gs);
             break :blk try mulEl(s, gs, u);
         };
         defer _ = mlx.mlx_array_free(gu);
@@ -648,7 +649,9 @@ fn qwenForward(s: S, layers: []const QLayer, norm: mlx.mlx_array, x_host: []cons
     var idx = [_]u32{@intCast(L - 1)};
     var taken = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(taken);
-    try mlx.check(mlx.mlx_take_axis(&taken, last, hostU32(&idx, &[_]c_int{1}), 0, s));
+    const indices = hostU32(&idx, &[_]c_int{1});
+    defer _ = mlx.mlx_array_free(indices);
+    try mlx.check(mlx.mlx_take_axis(&taken, last, indices, 0, s));
     try evalHost(s, taken, out_last);
     _ = mlx.mlx_array_free(x);
 }
@@ -701,6 +704,9 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, xrow: []const f32
         // in one dispatch (bit-identical to the chain below; qwen3_tts's shape),
         // composed chain when it declines.
         var qr = null_arr;
+        defer {
+            if (qr.ctx != null) _ = mlx.mlx_array_free(qr);
+        }
         var kr = null_arr;
         var fused = false;
         if (lw.qn.ctx != null and mlx.getShape(lw.qn)[0] > 0) {
@@ -773,6 +779,7 @@ fn qwenStep(s: S, layers: []const QLayer, norm: mlx.mlx_array, xrow: []const f32
         defer _ = mlx.mlx_array_free(u);
         const gu = if (try fused_activations.fusedSwiGLU(s, g, u)) |sg| sg else blk: {
             const gs = try siluArr(g, s);
+            defer _ = mlx.mlx_array_free(gs);
             break :blk try mulEl(s, gs, u);
         };
         defer _ = mlx.mlx_array_free(gu);
@@ -1908,6 +1915,58 @@ test "frameEmbed sums table rows" {
     }
     try std.testing.expectEqual(@as(f32, 4), out[0]);
     try std.testing.expectEqual(@as(f32, 6), out[1]);
+}
+
+test "breeze forward releases temporary device arrays" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const values: [32]f32 = @splat(1);
+    const norm = hostF32(&values, &.{32});
+    defer _ = mlx.mlx_array_free(norm);
+    const weights: [32 * 32]f32 = @splat(0.01);
+    const matrix = hostF32(&weights, &.{ 32, 32 });
+    defer _ = mlx.mlx_array_free(matrix);
+    const layer: QLayer = .{
+        .q_heads = 1,
+        .kv_heads = 1,
+        .head_dim = 32,
+        .eps = 1e-6,
+        .theta = 10000,
+        .q = matrix,
+        .k = matrix,
+        .v = matrix,
+        .o = matrix,
+        .qn = null_arr,
+        .kn = null_arr,
+        .gate = matrix,
+        .up = matrix,
+        .down = matrix,
+        .in_ln = norm,
+        .post_ln = norm,
+        .pre_ff = null_arr,
+    };
+    var out: [32]f32 = undefined;
+    for ([_]bool{ false, true }) |decode| {
+        var before: usize = 0;
+        for (0..33) |i| {
+            if (decode) {
+                var kv = [_]KV{.{}};
+                defer {
+                    if (kv[0].k.ctx != null) _ = mlx.mlx_array_free(kv[0].k);
+                    if (kv[0].v.ctx != null) _ = mlx.mlx_array_free(kv[0].v);
+                }
+                try qwenStep(s, &.{layer}, norm, &values, 32, 0, &kv, &out);
+            } else {
+                try qwenForward(s, &.{layer}, norm, &values, 1, 32, 1, 0, null_arr, null, &out);
+            }
+            try mlx.check(mlx.mlx_synchronize(s));
+            if (i == 0) try mlx.check(mlx.mlx_get_active_memory(&before));
+        }
+        var after: usize = 0;
+        try mlx.check(mlx.mlx_get_active_memory(&after));
+        try std.testing.expectEqual(before, after);
+    }
 }
 
 test "live synthesize (BREEZE_MODEL)" {
