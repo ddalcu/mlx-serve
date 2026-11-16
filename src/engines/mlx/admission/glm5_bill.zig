@@ -396,6 +396,32 @@ test "GLM bill: a reserving model's MTP head rows are its own layer kind's" {
     try t.expectEqual((83_693 - 19_404) * toy.kvBytesPerToken() * 5 / 4, glm5DecodeMemoryNeeded(&toy, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&toy, 19_404, 1, 16, wide));
 }
 
+// Bar: the head's row is one trunk layer's KV row, to the byte: GLM-5's DSA row, Ling's MLA row at every head, a GQA row.
+test "GLM bill: an MTP head's row is one trunk layer's KV row on GLM-5, Ling and a GQA model" {
+    const t = std.testing;
+    var table: abi.ModelTable = undefined;
+    var binding = reserveBinding(&table, .{ .decode_room = .billed, .reserves_request = true }, false);
+    var glm = glm5TestConfig();
+    glm.plugin = &binding;
+    try t.expectEqual(@as(u64, (512 + 2 * 128) * 2), mtpHeadRowBytes(&glm));
+    try t.expectEqual(glm.kvBytesPerToken() / glm.attnCacheLayerCount(), mtpHeadRowBytes(&glm));
+    var ling = try model_mod.parseConfigFromJson(t.allocator, @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json"));
+    const own = ling.plugin;
+    defer {
+        ling.plugin = own;
+        ling.deinit(t.allocator);
+    }
+    ling.plugin = &binding;
+    try t.expectEqual(@as(u64, 40_960), mtpHeadRowBytes(&ling));
+    try t.expectEqual(ling.kvBytesPerToken() / ling.attnCacheLayerCount(), mtpHeadRowBytes(&ling));
+    var toy: model_mod.ModelConfig = .{ .model_type = "toy_hybrid", .num_hidden_layers = 4, .num_attention_heads = 8, .num_key_value_heads = 2, .head_dim = 64, .hidden_size = 512, .max_position_embeddings = 131_072 };
+    toy.plugin = &binding;
+    try t.expectEqual(@as(u64, 2 * 2 * 64 * 2), mtpHeadRowBytes(&toy));
+    // No head the bill counts: none.
+    binding.parsed.spec.mtp_layout = .none;
+    try t.expectEqual(@as(u64, 0), mtpHeadRowBytes(&ling));
+}
+
 // Bar: a reserving request holds the hot cache's resident entry and, while it commits, that entry's copy: two hot-cache
 // terms beside the reserved KV, the head's rows, the checkpoints, the slot's fixed rows and the runtime floor.
 test "GLM bill: a reserving request's decode bill holds two hot-cache terms beside its KV once" {
