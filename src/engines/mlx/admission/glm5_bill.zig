@@ -459,3 +459,23 @@ test "GLM bill: without reserves_request, or without a decode room, the decode b
     glm.plugin = &no_room;
     try t.expectEqual((83_693 - 19_404) * 2 * kv * 5 / 4, glm5DecodeMemoryNeeded(&glm, 83_693, 1, 16, wide) - glm5DecodeMemoryNeeded(&glm, 19_404, 1, 16, wide));
 }
+
+// Bar: a load reads its plugin's bill once, however many admission helpers ask.
+test "GLM bill: a bound plugin's bill is read once for its decode room, reservation, hot-cache cap and KV row" {
+    const t = std.testing;
+    const Count = struct {
+        var calls: u32 = 0;
+        fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+            calls += 1;
+            out.* = .{ .kv_per_token = 368_640, .flags = .{ .decode_room = .billed, .reserves_request = true } };
+        }
+    };
+    var table: abi.ModelTable = undefined;
+    table.bill = &Count.bill;
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .caps = .{ .streamed_weights = true }, .cache = .{ .layout_namespace = abi.Str.of("ns-v1") } } };
+    binding.readBillTerms();
+    var ling: model_mod.ModelConfig = .{ .model_type = "bailing_hybrid", .plugin = &binding };
+    try t.expect(decodeBilled(&ling) and reservesRequest(&ling) and streamedHotCacheCapped(&ling));
+    try t.expectEqual(@as(u64, 368_640), ling.kvBytesPerToken());
+    try t.expectEqual(@as(u32, 1), Count.calls);
+}
