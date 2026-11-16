@@ -57,7 +57,7 @@ A plugin is a table (`abi.ModelTable`) of C-ABI functions. The host calls them i
 | `claims(model_type, config_json, dir)` | discovery, no GPU | return `.no`, `.by_type` or `.by_marker` |
 | `parse(dir, config_json, settings_json, span, stub, out)` | discovery (`stub` true: `config.json` only) and load | fill `out.shell` and `out.caps`; keep your own config in `out.private`; refuse by name |
 | `free_parsed` | after | free `private` |
-| `bill(parsed, shape, out)` | admission | `load_bytes`, `kv_per_token` (zero = engine default arithmetic); `shape` has context, slots, KV bits. A streamed model's decode room: `flags.decode_room` `.billed` opts in, `.unbilled` out; the default `.by_name` keeps the host's rule (GLM-5 without a prompt bill, and Ling). `.billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not |
+| `bill(parsed, shape, out)` | admission | `load_bytes`, `kv_per_token` (zero = engine default arithmetic); `shape` has context, slots, KV bits. A streamed model's decode room: `flags.decode_room` `.billed` opts in; the default `.by_name` keeps the host's rule (GLM-5 without a prompt bill, and Ling). `.billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not |
 | `load(ctx, out_verdict)` | once | return your model pointer, or null with a refusal |
 | `forward(model, fwd, out)` | per step | write `out.logits` (and `out.hidden` when `fwd.want_hidden`) |
 | `unload` | end | free everything `load` made |

@@ -479,9 +479,8 @@ Whether a streamed model's decode phase gets a room of its own (`LoadCtx.stream_
 
 | Member | Value | |
 |---|---|---|
-| `by_name` | `0` | The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed value 3 reads as this. |
+| `by_name` | `0` | The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed values 2 and 3 read as this. |
 | `billed` | `1` |  |
-| `unbilled` | `2` |  |
 | `_` | |  |
 
 ### `LoadCtx` (extern struct)

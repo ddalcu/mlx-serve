@@ -394,10 +394,9 @@ pub const BillFlags = packed struct(u32) {
 /// `billed` prices it with the KDA-hybrid trunk's decode bill (`glm5DecodeMemoryNeeded`), so only a model on that trunk
 /// (GLM-5, Ling) sets it: another streamed family (DeepSeek) must not, since that bill is not its own.
 pub const DecodeRoom = enum(u2) {
-    /// The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed value 3 reads as this.
+    /// The host's rule: a GLM-5 whose plugin prices no prompt, and Ling. The unnamed values 2 and 3 read as this.
     by_name = 0,
     billed = 1,
-    unbilled = 2,
     _,
 };
 

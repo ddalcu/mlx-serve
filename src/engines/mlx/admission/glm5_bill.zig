@@ -103,7 +103,6 @@ fn decodeRoomOf(config: *const model_mod.ModelConfig, bill: *const abi.Bill) boo
     const room: abi.DecodeRoom = if (bill.billFlags()) |f| f.decode_room else .by_name;
     return switch (room) {
         .billed => true,
-        .unbilled => false,
         else => std.mem.eql(u8, config.model_type, "bailing_hybrid") or (config.isGlm5() and bill.prefill_bytes == null),
     };
 }
