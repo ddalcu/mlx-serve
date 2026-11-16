@@ -157,7 +157,7 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
     const head: *const Head = @ptrCast(@alignCast(m.table));
     switch (m.kind) {
         .model => {
-            if (head.version != model_abi.version) return Verdict.refuse(.unsupported, "model table version is not this host's");
+            if (head.version == 0 or head.version > model_abi.version) return Verdict.refuse(.unsupported, "model table is newer than this host's: a newer mlx-serve serves it");
             if (head.size < @sizeOf(model_abi.ModelTable)) return Verdict.refuse(.unsupported, "model table is older than this host's");
             const t: *const model_abi.ModelTable = @ptrCast(@alignCast(m.table));
             if (nullWord(t, "cache") or nullWord(t, "weights"))
@@ -313,6 +313,13 @@ test "abi dylib: a model table with a hook table older than the host's is refuse
     cache.size -= 1;
     try testing.expectEqualStrings("a model hook table is older than this host's", negotiate(&m, pin).why.slice());
     cache.size += 1;
+    // Bar: a table one version older loads (its shorter structs read by size); one newer is refused, so the plugin
+    // never writes a grown `Parsed` or `Bill` past this host's.
+    t.version = model_abi.version - 1;
+    try testing.expect(negotiate(&m, pin).isOk());
+    t.version = model_abi.version + 1;
+    try testing.expectEqualStrings("model table is newer than this host's: a newer mlx-serve serves it", negotiate(&m, pin).why.slice());
+    t.version = model_abi.version;
     const spec: model_abi.SpecHooks = .{ .size = 8 };
     t.spec = &spec;
     try testing.expect(!negotiate(&m, pin).isOk());
