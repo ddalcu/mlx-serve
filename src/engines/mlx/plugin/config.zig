@@ -21,7 +21,8 @@ const ModelConfig = model.ModelConfig;
 pub const Binding = struct {
     table: *const abi.ModelTable,
     parsed: abi.Parsed = .{},
-    /// An outside plugin's (`host/plugins`): the legacy parse knows nothing of its packs.
+    /// An outside plugin's (`host/plugins`): its config is its facts alone (`adapted`) unless its parse asks for the
+    /// legacy parse's (`Parsed.engine_config`).
     outside: bool = false,
 
     pub fn destroy(b: *Binding, a: std.mem.Allocator) void {
