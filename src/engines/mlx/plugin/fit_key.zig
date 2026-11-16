@@ -37,8 +37,8 @@ fn pluginOf(table: *const anyopaque) ?loader.Plugin {
     return null;
 }
 
-/// The key for `config`'s pack at `dir`, in `a`.
-pub fn hostKey(a: std.mem.Allocator, config: *const ModelConfig, dir: *const common.PackDir) ![]u8 {
+/// The key for `config`'s pack at `dir` (whose folder is `root`), in `a`.
+pub fn hostKey(a: std.mem.Allocator, io: std.Io, root: std.Io.Dir, config: *const ModelConfig, dir: *const common.PackDir) ![]u8 {
     var parts: [4]std.Io.Writer.Allocating = .{ .init(a), .init(a), .init(a), .init(a) };
     defer for (&parts) |*p| p.deinit();
     const kv = @import("../../../host/http/server.zig").configuredKvQuantFor(config);
@@ -56,7 +56,7 @@ pub fn hostKey(a: std.mem.Allocator, config: *const ModelConfig, dir: *const com
     if (b != null and b.?.outside) {
         if (pluginOf(b.?.table)) |p| try pluginPart(&parts[3].writer, p) else try parts[3].writer.writeAll("unknown");
     } else try parts[3].writer.writeAll("in-tree");
-    const pack = try key.packDigest(a, dir);
+    const pack = try key.packDigest(a, io, root, dir);
     var out: std.Io.Writer.Allocating = .init(a);
     errdefer out.deinit();
     try key.write(&out.writer, .{ .build = parts[0].written(), .machine = parts[1].written(), .quant_plugin = parts[2].written(), .model_plugin = parts[3].written(), .pack = &pack });

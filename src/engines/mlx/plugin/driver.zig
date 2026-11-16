@@ -914,7 +914,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     var settings_buf: [128]u8 = undefined;
     const ceiling = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling();
     // A streamed bank's calibration applies only under this server's key; a key that cannot be read is none.
-    const fit_key: ?[]u8 = if (b.parsed.caps.streamed_weights) @import("fit_key.zig").hostKey(a, config, &dir) catch null else null;
+    const fit_key: ?[]u8 = if (b.parsed.caps.streamed_weights) @import("fit_key.zig").hostKey(a, io, fs.root, config, &dir) catch null else null;
     defer if (fit_key) |k| a.free(k);
     const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling, fit_key));
     const m = b.table.load(&.{

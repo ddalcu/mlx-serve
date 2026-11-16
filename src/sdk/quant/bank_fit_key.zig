@@ -54,8 +54,9 @@ pub fn fileName(buf: *[32]u8, text: []const u8) []const u8 {
 const manifest_files = [_][]const u8{ "expert-manifest-v2.json", "expert-manifest.json", "mtp-expert-manifest-v2.json", "mtp-expert-manifest.json" };
 
 /// The pack's part: the sha256 of `config.json`, every bank manifest (`expert_streaming`'s `*manifest` fields and the
-/// files above, each once, by name) and the bank's size (`experts.bin`), hex.
-pub fn packDigest(a: std.mem.Allocator, dir: *const common.PackDir) ![64]u8 {
+/// files above, each once, by name) and the bank's size (`experts.bin`), hex. `folder` is `dir`'s: a manifest (tens
+/// of MB on a large pack) is hashed from it in pieces, so the heap holds only `config.json`.
+pub fn packDigest(a: std.mem.Allocator, io: std.Io, folder: std.Io.Dir, dir: *const common.PackDir) ![64]u8 {
     var h = std.crypto.hash.sha2.Sha256.init(.{});
     const config = try readAll(a, dir, "config.json");
     defer a.free(config);
@@ -75,9 +76,7 @@ pub fn packDigest(a: std.mem.Allocator, dir: *const common.PackDir) ![64]u8 {
     for (files.items) |f| {
         if (std.mem.eql(u8, f, last)) continue;
         last = f;
-        const bytes = try readAll(a, dir, f);
-        defer a.free(bytes);
-        mix(&h, f, bytes);
+        try mixFile(&h, io, folder, f, dir.fileBytes(f));
     }
     var size: [20]u8 = undefined;
     mix(&h, "experts.bin", std.fmt.bufPrint(&size, "{d}", .{dir.fileBytes("experts.bin")}) catch unreachable);
@@ -93,6 +92,26 @@ fn mix(h: *std.crypto.hash.sha2.Sha256, name: []const u8, bytes: []const u8) voi
     h.update(&[_]u8{0});
     h.update(std.mem.asBytes(&@as(u64, bytes.len)));
     h.update(bytes);
+}
+
+/// `mix` over the `len` bytes of `rel`, read in 64 KiB pieces.
+fn mixFile(h: *std.crypto.hash.sha2.Sha256, io: std.Io, root: std.Io.Dir, rel: []const u8, len: u64) !void {
+    h.update(rel);
+    h.update(&[_]u8{0});
+    h.update(std.mem.asBytes(&len));
+    var file = root.openFile(io, rel, .{}) catch return error.BankFitKeyUnreadable;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    var piece: [64 << 10]u8 = undefined;
+    var got: u64 = 0;
+    while (true) {
+        const n = rs.interface.readSliceShort(&piece) catch return error.BankFitKeyUnreadable;
+        h.update(piece[0..n]);
+        got += n;
+        if (n < piece.len) break;
+    }
+    if (got != len) return error.BankFitKeyUnreadable;
 }
 
 fn readAll(a: std.mem.Allocator, dir: *const common.PackDir, rel: []const u8) ![]u8 {
@@ -146,18 +165,18 @@ test "bank fit key: the pack's digest reads config.json, its bank manifests and 
     var fs = try pack_dir.FsPackDir.open(io, path[0..n]);
     defer fs.close();
     const dir = fs.packDir();
-    const d0 = try packDigest(testing.allocator, &dir);
+    const d0 = try packDigest(testing.allocator, io, fs.root, &dir);
     // A file outside the bank's set leaves it; the MTP manifest, the bank's size and an unnamed manifest move it.
     try tmp.dir.writeFile(io, .{ .sub_path = "README.md", .data = "b" });
-    try testing.expectEqualStrings(&d0, &(try packDigest(testing.allocator, &dir)));
+    try testing.expectEqualStrings(&d0, &(try packDigest(testing.allocator, io, fs.root, &dir)));
     try tmp.dir.writeFile(io, .{ .sub_path = "mtp.json", .data = "{\"rows\":3}" });
-    const d1 = try packDigest(testing.allocator, &dir);
+    const d1 = try packDigest(testing.allocator, io, fs.root, &dir);
     try testing.expect(!std.mem.eql(u8, &d0, &d1));
     try tmp.dir.writeFile(io, .{ .sub_path = "experts.bin", .data = "01234" });
-    const d2 = try packDigest(testing.allocator, &dir);
+    const d2 = try packDigest(testing.allocator, io, fs.root, &dir);
     try testing.expect(!std.mem.eql(u8, &d1, &d2));
     try tmp.dir.writeFile(io, .{ .sub_path = "expert-manifest-v2.json", .data = "{}" });
-    try testing.expect(!std.mem.eql(u8, &d2, &(try packDigest(testing.allocator, &dir))));
+    try testing.expect(!std.mem.eql(u8, &d2, &(try packDigest(testing.allocator, io, fs.root, &dir))));
 }
 
 test "bank fit key: the pack's digest streams the bank's manifests, allocating none of them, and equals the whole-file digest" {
@@ -185,5 +204,5 @@ test "bank fit key: the pack's digest streams the bank's manifests, allocating n
     // Bar: a heap far smaller than the manifest still digests the pack, to the whole-file digest's bytes.
     var heap: [16 << 10]u8 = undefined;
     var fba = std.heap.FixedBufferAllocator.init(&heap);
-    try testing.expectEqualStrings(&want, &(try packDigest(fba.allocator(), &dir)));
+    try testing.expectEqualStrings(&want, &(try packDigest(fba.allocator(), io, fs.root, &dir)));
 }
