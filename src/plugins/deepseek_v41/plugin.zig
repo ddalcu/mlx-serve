@@ -983,8 +983,9 @@ test "deepseek_v41 tap: a diag value that names no directory is off, not a direc
     try std.testing.expectEqual(@as(?[]const u8, null), tapDir("0"));
     try std.testing.expectEqual(@as(?[]const u8, null), tapDir("1"));
     // A value at the diag buffer's width may be a path the buffer cut, so it decides no directory.
-    const wide = "x"** env.diag_value_max;
-    try std.testing.expectEqual(@as(?[]const u8, null), tapDir(wide));
+    var wide: [env.diag_value_max]u8 = undefined;
+    @memset(&wide, 'x');
+    try std.testing.expectEqual(@as(?[]const u8, null), tapDir(&wide));
     // A path whose first segment starts with 0 or 1 is still a path.
     try std.testing.expectEqualStrings("/tmp/tap", tapDir("/tmp/tap").?);
     try std.testing.expectEqualStrings("0/tap", tapDir("0/tap").?);
