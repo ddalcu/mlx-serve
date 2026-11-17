@@ -312,11 +312,16 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
         .{ .exclusive = true, .permissions = .fromMode(0o600) };
     var name_buf: [80]u8 = undefined;
     var stem_buf: [64]u8 = undefined;
+    // `std.c.pid_t` is a HANDLE (a pointer) on Windows, so it formats as a number only through its address.
+    const pid: u64 = switch (builtin.os.tag) {
+        .windows => @intFromPtr(std.c.getpid()),
+        else => @intCast(std.c.getpid()),
+    };
     // The stamp and the counter separate this process's writes, but the pid is per namespace (two containers sharing the
     // directory, or a shared mount, both read pid 1): the exclusive create answers a taken name, the counter moves on,
     // and no record is ever written over another.
     const stem = claim: for (0..1000) |_| {
-        const s = try std.fmt.bufPrint(&stem_buf, "tap-{d}-{d}-{d}", .{ stamp, std.c.getpid(), tap_tie.fetchAdd(1, .monotonic) });
+        const s = try std.fmt.bufPrint(&stem_buf, "tap-{d}-{d}-{d}", .{ stamp, pid, tap_tie.fetchAdd(1, .monotonic) });
         d.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name_buf, "{s}.npy", .{s}), .data = file_bytes, .flags = flags }) catch |e| switch (e) {
             error.PathAlreadyExists => continue,
             else => return e,
