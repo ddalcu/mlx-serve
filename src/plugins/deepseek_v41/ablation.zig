@@ -418,7 +418,8 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     if (nruns == 0) return null;
     var sc = Scope.init(gpa, s);
     defer sc.deinit();
-    const per_site = try gpa.alloc(A, nruns);
+    // Sized by the sites, filled by the recorded ones: adjacent sites make one run but each still stacks.
+    const per_site = try gpa.alloc(A, sites);
     defer gpa.free(per_site);
     // Every recorded site keeps the same last rows: the fewest any of them recorded, at most `keep`.
     var rows = tap.keep;
@@ -430,11 +431,12 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
         per_site[nrec] = o;
         nrec += 1;
     }
-    for (per_site) |*o| {
+    const recorded = per_site[0..nrec];
+    for (recorded) |*o| {
         const n: usize = @intCast(mlx.getShape(o.*)[0]);
         o.* = try sc.slice(o.*, 0, n - rows, n);
     }
-    const all = try sc.stack(per_site, 0); // [recorded sites, rows, dim]
+    const all = try sc.stack(recorded, 0); // [recorded sites, rows, dim]
     try mlx.check(mlx.mlx_array_eval(all));
     const shape = mlx.getShape(all);
     const data = (mlx.mlx_array_data_float32(all) orelse return error.TapNotF32)[0..mlx.mlx_array_size(all)];
