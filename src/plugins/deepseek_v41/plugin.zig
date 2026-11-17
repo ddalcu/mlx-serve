@@ -320,22 +320,26 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     // A Thunderbolt pair's leader is fine: it records the layers it runs and the sidecar names their runs (the worker runs
     // the module directly and records nothing). A tensor split is not: it holds a shard of each layer's stream, which
     // is not the residual a direction is measured from.
+    errdefer freeTap(m);
     if (env.span(.DSV41_TAP_DIR)) |setting| {
         if (tapDir(setting)) |tap_dir| {
             if (m.mdl.tp != null)
                 std.log.warn("deepseek_v41: the calibration tap is off for this load: a tensor split holds a shard of each layer's stream", .{})
             else {
                 const tap = try gpa.create(ablation.StreamTap);
-                errdefer gpa.destroy(tap);
-                tap.* = try ablation.StreamTap.init(gpa, m.mdl.n_layers, tap_rows);
+                tap.* = ablation.StreamTap.init(gpa, m.mdl.n_layers, tap_rows) catch |e| {
+                    gpa.destroy(tap);
+                    return e;
+                };
                 m.mdl.stream_tap = tap;
-                m.tap_dir = tap_dir;
+                // The diag buffer is one static slot per registration: a later load of this plugin rewrites it, so the
+                // model keeps its own copy rather than a path that can change under it.
+                m.tap_dir = try gpa.dupe(u8, tap_dir);
                 std.log.warn("deepseek_v41: the calibration tap is on: every prompt's per-layer stream and last ids go to {s} (owner-only files)", .{tap_dir});
             }
         } else if (setting.len > 0 and !std.mem.eql(u8, setting, "0"))
             std.log.warn("deepseek_v41: the calibration tap is off: MLX_SERVE_DIAG=dsv41-tap-dir needs `=<dir>` (the bare token reads 1, and a value at the buffer's width may be a cut path), so this setting names no directory", .{});
     }
-    errdefer freeTap(m);
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
         if (c.dsv41_exl3_bank) try openBank(m, quant, ctxSetting(ctx.settings_json.slice()), ctx.wired_margin_bytes, start) else try openPackBank(m, dir, ctxSetting(ctx.settings_json.slice()), ctx.settings_json.slice());
@@ -353,6 +357,10 @@ const tap_rows = 5;
 
 /// Frees the calibration tap (`loadModel`) and its records.
 fn freeTap(m: *Model) void {
+    if (m.tap_dir) |d| {
+        gpa.free(d);
+        m.tap_dir = null;
+    }
     const t = m.mdl.stream_tap orelse return;
     t.deinit();
     gpa.destroy(t);
@@ -600,7 +608,10 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
         t.on = true;
     }
     defer if (tap) |t| {
+        // A failed forward leaves the sites pinned; the next forward clears them, but a long stall in between holds
+        // every layer's kept rows, so clear here too (dumpTap already cleared a dumped pass).
         t.on = false;
+        t.clear();
     };
     const logits = if (all) try dsv41.extendAllResumable(mdl, gpa, ids) else if (gpu_decode) blk: {
         const tok = if (dev.ctx != null) try v4plugin.deviceToken(dev, &.{ 1, 1 }, m.s) else blk2: {
