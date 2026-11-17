@@ -104,7 +104,7 @@ pub const Model = struct {
     idle: ?Kept = null,
     /// The last id a snapshot was given for the other tensor ranks (`Snap.tp_id`).
     tp_snaps: u64 = 0,
-    /// Calibration (MLX_SERVE_DSV41_TAP_DIR): where each prompt forward's stream tap is written.
+    /// Calibration (MLX_SERVE_DIAG=dsv41-tap-dir): where each prompt forward's stream tap is written.
     tap_dir: ?[]const u8 = null,
 };
 
@@ -307,11 +307,11 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.parked = .empty;
     m.idle = null;
     m.tap_dir = null;
-    // Calibration (MLX_SERVE_DSV41_TAP_DIR): every prompt forward's stream at each layer, written there owner-only.
-    // A Thunderbolt pair's leader is fine: it records the layers it runs and the index names their runs (the worker runs
+    // Calibration (MLX_SERVE_DIAG=dsv41-tap-dir): every prompt forward's stream at each layer, written there owner-only.
+    // A Thunderbolt pair's leader is fine: it records the layers it runs and the sidecar names their runs (the worker runs
     // the module directly and records nothing). A tensor split is not: it holds a shard of each layer's stream, which
     // is not the residual a direction is measured from.
-    if (env.span(.MLX_SERVE_DSV41_TAP_DIR)) |tap_dir| if (tap_dir.len > 0) {
+    if (env.span(.DSV41_TAP_DIR)) |tap_dir| if (tap_dir.len > 0) {
         if (m.mdl.tp != null)
             std.log.warn("deepseek_v41: the calibration tap is off for this load: a tensor split holds a shard of each layer's stream", .{})
         else {
@@ -601,17 +601,17 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
     defer _ = mlx.mlx_array_free(logits);
     if (tap) |t| {
         // The split prefill's final-token span is one row, so `Ids.of` leaves its id on the device (`host_ids` empty):
-        // read it back, or the index names the prompt one position short and its `tail_ids` empty.
+        // read it back, or the sidecar names the prompt one position short and its `tail_ids` empty.
         var span: [1]u32 = undefined;
         var tap_ids: []const u32 = ids;
         if (ids.len == 0 and dev.ctx != null) {
             span[0] = try v4plugin.hostToken(dev);
             tap_ids = span[0..];
         }
-        if (ablation.dumpTap(gpa, t, m.tap_dir.?, pos, tap_ids, m.s) catch |e| blk: {
+        _ = ablation.dumpTap(gpa, t, m.tap_dir.?, pos, tap_ids, m.s) catch |e| blk: {
             std.log.err("deepseek_v41: the calibration tap's dump failed: {t}", .{e});
-            break :blk null;
-        }) |seq| std.log.info("deepseek_v41: the calibration tap wrote tap-{d:0>6}.npy", .{seq});
+            break :blk false;
+        };
     }
     var o = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(o);
