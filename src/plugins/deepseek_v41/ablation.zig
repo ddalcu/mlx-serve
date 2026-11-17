@@ -393,8 +393,9 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
 /// `<dir>/index.jsonl` (`pos` the forward's first position, `ids` its tokens, `site_ranges` the layers the recorded sites
 /// stand for). The dir is the owner's only (0700), its files 0600. The `seq` comes from the directory, never from
 /// memory, so a restart cannot overwrite an earlier file. Returns that seq, or null when no site recorded anything.
-/// Clears the tap. A Thunderbolt pair records the layers it runs on this Mac, in runs, and the file names them, so the
-/// two Macs' dumps can be merged layer by layer.
+/// Clears the tap. A Thunderbolt pair's leader records the layers it runs, in runs ([0, p.lo) and [p.hi, n)), and the
+/// file names them. The pair's worker runs the module directly (`cluster/distributed.zig` `serveDsv41`) and records
+/// nothing: its dump needs the step's ids, which its protocol does not carry.
 pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: usize, ids: []const u32, s: S) !?u64 {
     defer tap.clear();
     const sites = tap.sites.len;

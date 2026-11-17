@@ -308,8 +308,9 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.idle = null;
     m.tap_dir = null;
     // Calibration (MLX_SERVE_DSV41_TAP_DIR): every prompt forward's stream at each layer, written there owner-only.
-    // A Thunderbolt pair is fine: each Mac records the layers it runs and the index line names those runs. A tensor
-    // split is not: it holds a shard of each layer's stream, which is not the residual a direction is measured from.
+    // A Thunderbolt pair's leader is fine: it records the layers it runs and the index names their runs (the worker runs
+    // the module directly and records nothing). A tensor split is not: it holds a shard of each layer's stream, which
+    // is not the residual a direction is measured from.
     if (env.span(.MLX_SERVE_DSV41_TAP_DIR)) |tap_dir| if (tap_dir.len > 0) {
         if (m.mdl.tp != null)
             std.log.warn("deepseek_v41: the calibration tap is off for this load: a tensor split holds a shard of each layer's stream", .{})
