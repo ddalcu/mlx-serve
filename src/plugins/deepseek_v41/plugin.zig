@@ -308,11 +308,11 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.idle = null;
     m.tap_dir = null;
     // Calibration (MLX_SERVE_DSV41_TAP_DIR): every prompt forward's stream at each layer, written there owner-only.
-    // Only a model that runs every layer at full width here: a Thunderbolt pair runs some layers on the other Mac and a
-    // tensor split holds a shard, so either one's dump has no site to write for the rest.
+    // A Thunderbolt pair is fine: each Mac records the layers it runs and the index line names those runs. A tensor
+    // split is not: it holds a shard of each layer's stream, which is not the residual a direction is measured from.
     if (env.span(.MLX_SERVE_DSV41_TAP_DIR)) |tap_dir| if (tap_dir.len > 0) {
-        if (m.mdl.pair != null or m.mdl.tp != null)
-            std.log.warn("deepseek_v41: the calibration tap is off for this load: a split model records only part of each prompt's stream", .{})
+        if (m.mdl.tp != null)
+            std.log.warn("deepseek_v41: the calibration tap is off for this load: a tensor split holds a shard of each layer's stream", .{})
         else {
             const tap = try gpa.create(ablation.StreamTap);
             errdefer gpa.destroy(tap);

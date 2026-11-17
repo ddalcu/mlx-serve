@@ -291,7 +291,7 @@ test "deepseek_v41 ablation: two writers racing in one tap directory claim disti
         failed: ?anyerror = null,
         fn run(w: *@This()) void {
             for (&w.seqs, 0..) |*seq, i| {
-                seq.* = ablation.writeTapRecord(testing.allocator, w.dir, w.tag, i * 4, &.{ 10, 11, 12 }, 2) catch |e| {
+                seq.* = ablation.writeTapRecord(testing.allocator, w.dir, w.tag, i * 4, &.{ 10, 11, 12 }, 2, &.{.{ 0, 2 }}) catch |e| {
                     w.failed = e;
                     return;
                 };
@@ -328,6 +328,10 @@ test "deepseek_v41 ablation: two writers racing in one tap directory claim disti
         const file = rec.get("file").?.string;
         const tail = rec.get("tail_ids").?.array;
         try testing.expectEqual(@as(usize, 3), tail.items.len);
+        const ranges = rec.get("site_ranges").?.array;
+        try testing.expectEqual(@as(usize, 1), ranges.items.len);
+        try testing.expectEqual(@as(i64, 0), ranges.items[0].array.items[0].integer);
+        try testing.expectEqual(@as(i64, 2), ranges.items[0].array.items[1].integer);
         const bytes = try td.dir.readFileAlloc(io, file, testing.allocator, .unlimited);
         defer testing.allocator.free(bytes);
         if (std.mem.eql(u8, bytes, a.tag)) by_tag[0] += 1 else if (std.mem.eql(u8, bytes, b.tag)) by_tag[1] += 1 else return error.TestUnexpectedResult;
@@ -338,6 +342,41 @@ test "deepseek_v41 ablation: two writers racing in one tap directory claim disti
     // Every record of both writers landed once, on its own file, with its own seq.
     try testing.expectEqual(@as(usize, 16), n);
     try testing.expectEqualSlices(usize, &.{ 8, 8 }, &by_tag);
+}
+
+test "deepseek_v41 ablation: a partial tap dump writes the sites it recorded and names their layer runs" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    var tap = try ablation.StreamTap.init(testing.allocator, 3, 2); // sites 0..3, one more than layers
+    defer tap.deinit();
+    tap.on = true;
+    const row = [_]f32{ 1, 2, 3, 4 }; // [rows, hc, dim]
+    const span = try f32s(&sc, &row, &.{ 1, 1, 4 });
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = path_buf[0..try td.dir.realPath(io, &path_buf)];
+
+    // The middle layers only, as a pair's worker records them: the dump holds those sites and names the run.
+    try tap.record(sc.s, 1, &.{span});
+    try tap.record(sc.s, 2, &.{span});
+    try testing.expectEqual(@as(?u64, 0), try ablation.dumpTap(testing.allocator, &tap, dir, 0, &.{ 7, 8 }, sc.s));
+    const first = try td.dir.readFileAlloc(io, "tap-000000.npy", testing.allocator, .unlimited);
+    defer testing.allocator.free(first);
+    try testing.expect(std.mem.indexOf(u8, first, "'shape': (2, 1, 4)") != null);
+    var index = try td.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(index);
+    try testing.expect(std.mem.indexOf(u8, index, "\"site_ranges\":[[1,3]]") != null);
+    testing.allocator.free(index);
+
+    // The outer layers only, as a pair's leader records them: two runs, named in order.
+    try tap.record(sc.s, 0, &.{span});
+    try tap.record(sc.s, 3, &.{span});
+    try testing.expectEqual(@as(?u64, 1), try ablation.dumpTap(testing.allocator, &tap, dir, 2, &.{9}, sc.s));
+    index = try td.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .unlimited);
+    try testing.expect(std.mem.indexOf(u8, index, "\"site_ranges\":[[0,1],[3,4]]") != null);
 }
 
 test "deepseek_v41 ablation: the stream tap keeps the hc mean of a pass's last rows across its spans, only while on" {

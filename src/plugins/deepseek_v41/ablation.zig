@@ -320,11 +320,11 @@ fn nextTapSeq(gpa: std.mem.Allocator, d: std.Io.Dir, io: std.Io) !u64 {
 }
 
 /// One record in a tap directory, filesystem only (no MLX): `file_bytes` written as `<dir>/tap-<seq>.npy`, claimed by
-/// an exclusive create, and a line for `pos`/`ids` appended to `<dir>/index.jsonl` under an exclusive lock. The seq
-/// comes from the directory, never from memory, so a restart cannot overwrite an earlier file; a writer that loses the
-/// race for `tap-<seq>.npy` takes the next seq; an append cuts a torn last record back to its last newline first. The
-/// dir is the owner's only (0700), its files 0600. Returns the seq it claimed.
-pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []const u8, pos: usize, ids: []const u32, rows: usize) !u64 {
+/// an exclusive create, and a line for `pos`/`ids`/`runs` appended to `<dir>/index.jsonl` under an exclusive lock. The
+/// seq comes from the directory, never from memory, so a restart cannot overwrite an earlier file; a writer that loses
+/// the race for `tap-<seq>.npy` takes the next seq; an append cuts a torn last record back to its last newline first.
+/// The dir is the owner's only (0700), its files 0600. Returns the seq it claimed.
+pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []const u8, pos: usize, ids: []const u32, rows: usize, runs: []const [2]usize) !u64 {
     const io = std.Io.Threaded.global_single_threaded.io();
     var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     defer d.close(io);
@@ -356,7 +356,9 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
 
     var line: std.Io.Writer.Allocating = .init(gpa);
     defer line.deinit();
-    try line.writer.print("{{\"seq\":{d},\"file\":\"{s}\",\"position\":{d},\"prompt_tokens\":{d},\"rows\":{d},\"tail_ids\":[", .{ seq, name, pos, pos + ids.len, rows });
+    try line.writer.print("{{\"seq\":{d},\"file\":\"{s}\",\"position\":{d},\"prompt_tokens\":{d},\"rows\":{d},\"site_ranges\":[", .{ seq, name, pos, pos + ids.len, rows });
+    for (runs, 0..) |r, i| try line.writer.print("{s}[{d},{d}]", .{ if (i == 0) "" else ",", r[0], r[1] });
+    try line.writer.writeAll("],\"tail_ids\":[");
     const tail = ids[ids.len - @min(ids.len, 8) ..];
     for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
     try line.writer.writeAll("]}\n");
@@ -386,34 +388,53 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
     return seq;
 }
 
-/// The tap's rows for one prompt forward as `<dir>/tap-<seq>.npy` (f32 `[layers + 1, rows, dim]`: per site the last
-/// `keep` rows its passes recorded, in prompt order, the last one the prompt's last token) and a line in
-/// `<dir>/index.jsonl` (`pos` the forward's first position, `ids` its tokens). The dir is the owner's only (0700), its
-/// files 0600. The `seq` comes from the directory, never from memory, so a restart cannot overwrite an earlier file.
-/// Returns that seq, or null when nothing was written. Clears the tap; a site no pass recorded (a layer another Mac
-/// ran) writes nothing.
+/// The tap's rows for one prompt forward as `<dir>/tap-<seq>.npy` (f32 `[recorded sites, rows, dim]`: per recorded site
+/// the last `keep` rows its passes recorded, in prompt order, the last one the prompt's last token) and a line in
+/// `<dir>/index.jsonl` (`pos` the forward's first position, `ids` its tokens, `site_ranges` the layers the recorded sites
+/// stand for). The dir is the owner's only (0700), its files 0600. The `seq` comes from the directory, never from
+/// memory, so a restart cannot overwrite an earlier file. Returns that seq, or null when no site recorded anything.
+/// Clears the tap. A Thunderbolt pair records the layers it runs on this Mac, in runs, and the file names them, so the
+/// two Macs' dumps can be merged layer by layer.
 pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: usize, ids: []const u32, s: S) !?u64 {
     defer tap.clear();
     const sites = tap.sites.len;
-    if (sites == 0 or tap.sites[0].items.len == 0) return null;
+    // The runs of consecutive sites a pass recorded, in order: [0, p.lo) and [p.hi, n) on a pair's leader, [p.lo, p.hi)
+    // on its worker, one run for a model that runs every layer here.
+    const runs = try gpa.alloc([2]usize, sites + 1);
+    defer gpa.free(runs);
+    var nruns: usize = 0;
+    var open = false;
+    for (tap.sites, 0..) |list, i| {
+        if (list.items.len == 0) {
+            open = false;
+            continue;
+        }
+        if (open) runs[nruns - 1][1] = i + 1 else {
+            runs[nruns] = .{ i, i + 1 };
+            nruns += 1;
+        }
+        open = true;
+    }
+    if (nruns == 0) return null;
     var sc = Scope.init(gpa, s);
     defer sc.deinit();
-    const per_site = try gpa.alloc(A, sites);
+    const per_site = try gpa.alloc(A, nruns);
     defer gpa.free(per_site);
-    // Every site keeps the same last rows: the fewest any site recorded, at most `keep`. A site no pass recorded (a
-    // pair runs some layers on the other Mac) leaves this dump no aligned matrix: write nothing, exactly as when site 0
-    // was empty, rather than stack an axis that silently drops layers.
+    // Every recorded site keeps the same last rows: the fewest any of them recorded, at most `keep`.
     var rows = tap.keep;
-    for (tap.sites, per_site) |list, *o| {
-        if (list.items.len == 0) return null;
-        o.* = try sc.concat(list.items, 0); // [rows, dim]
-        rows = @min(rows, @as(usize, @intCast(mlx.getShape(o.*)[0])));
+    var nrec: usize = 0;
+    for (tap.sites) |list| {
+        if (list.items.len == 0) continue;
+        const o = try sc.concat(list.items, 0); // [rows, dim]
+        rows = @min(rows, @as(usize, @intCast(mlx.getShape(o)[0])));
+        per_site[nrec] = o;
+        nrec += 1;
     }
     for (per_site) |*o| {
         const n: usize = @intCast(mlx.getShape(o.*)[0]);
         o.* = try sc.slice(o.*, 0, n - rows, n);
     }
-    const all = try sc.stack(per_site, 0); // [sites, rows, dim]
+    const all = try sc.stack(per_site, 0); // [recorded sites, rows, dim]
     try mlx.check(mlx.mlx_array_eval(all));
     const shape = mlx.getShape(all);
     const data = (mlx.mlx_array_data_float32(all) orelse return error.TapNotF32)[0..mlx.mlx_array_size(all)];
@@ -425,7 +446,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     defer gpa.free(file_bytes);
     @memcpy(file_bytes[0..npy.len], npy);
     @memcpy(file_bytes[npy.len..], body);
-    return writeTapRecord(gpa, dir, file_bytes, pos, ids, @intCast(shape[1]));
+    return try writeTapRecord(gpa, dir, file_bytes, pos, ids, @intCast(shape[1]), runs[0..nruns]);
 }
 
 /// A version 1.0 `.npy` header for little-endian f32 `[a, b, c]`, padded to a multiple of 64 bytes.
