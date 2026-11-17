@@ -460,7 +460,7 @@ pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) call
     if (m.bank != null and in.host.len > 1 and f.logits != .all_rows and pos + in.host.len > m.bank_context)
         return Verdict.refuse(.failed, "deepseek_v41: the prompt is longer than the streamed bank's billed context (ctx_size)");
     const rows: ?dsv41.VisionRows = if (f.media.ctx != null) .{ .rows = .{ .ctx = f.media.ctx }, .offset = f.media_offset } else null;
-    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev, spec) catch |e| {
+    const logits = run(m, in.host, pos, f.logits == .all_rows, rows, in.dev, spec, f.mode) catch |e| {
         std.log.err("deepseek_v41: the forward failed: {s}", .{if (e == error.EngineFailed) @import("../../sdk/util/err_name.zig").last() else @errorName(e)});
         return Verdict.refuse(.failed, "deepseek_v41: the forward failed");
     };
@@ -553,7 +553,7 @@ fn eachAlone(m: *Model, f: *const abi.Forward, specs: []const ?ablation.Spec) !m
     for (f.slots.slice(), f.tokens.slice(), 0..) |slot, t, k| {
         try activate(m, slot);
         const pos = if (f.positions.len == f.slots.len) f.positions.slice()[k] else if (m.mdl.dec_state) |st| st.n else 0;
-        rows[done] = try run(m, &.{t}, pos, false, null, .{ .ctx = null }, specs[k]);
+        rows[done] = try run(m, &.{t}, pos, false, null, .{ .ctx = null }, specs[k], .batched_rows);
         done += 1;
     }
     var o = mlx.mlx_array_new();
@@ -567,7 +567,7 @@ fn eachAlone(m: *Model, f: *const abi.Forward, specs: []const ?ablation.Spec) !m
 /// GPU (`dev`, or the host id uploaded); everything else extends the state. `all` returns every row's logits. The
 /// slot's ablation `spec` is armed on the state the forward runs (`ablation.stateArm`): the DSpark rounds the engine
 /// runs on the module between forwards ablate under it too.
-fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array, spec: ?ablation.Spec) !mlx.mlx_array {
+fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.VisionRows, dev: mlx.mlx_array, spec: ?ablation.Spec, mode: abi.Mode) !mlx.mlx_array {
     const mdl = m.mdl;
     var one: [1]u32 = undefined;
     const gpu_decode = !all and pos > 0 and (dev.ctx != null or host_ids.len == 1) and mdl.pair == null and mdl.tp == null;
@@ -579,7 +579,9 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
     if (pos == 0) try dsv41.reset(mdl, gpa);
     if (mdl.dec_state) |*st| try ablation.stateArm(st, spec, m.cfg.hidden_size, m.s);
     // Calibration: a prompt forward records the stream at every layer (`ablation.StreamTap`), dumped once it is done.
-    const tap = if (gpu_decode) null else mdl.stream_tap;
+    // By mode, not by the kernel path: a pair runs its decode steps through the prompt path, and a verify block is all
+    // rows, so either would dump a tensor per step.
+    const tap = if (mode == .prefill) mdl.stream_tap else null;
     if (tap) |t| {
         t.clear();
         t.on = true;

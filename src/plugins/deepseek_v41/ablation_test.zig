@@ -379,6 +379,29 @@ test "deepseek_v41 ablation: a partial tap dump writes the sites it recorded and
     try testing.expect(std.mem.indexOf(u8, index, "\"site_ranges\":[[0,1],[3,4]]") != null);
 }
 
+test "deepseek_v41 ablation: the tap dumps a prompt forward, not a decode step or a verify block" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    var tp: Tapped = undefined;
+    try tp.attach(t);
+    defer tp.detach();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // A prompt forward records and dumps one tensor.
+    const prompt = try t.plugin(.prefill, &short_prompt, 0);
+    defer _ = mlx.mlx_array_free(prompt);
+    try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
+    // A decode step and a verify block record nothing and dump nothing. Gating by mode is what keeps them off: a pair
+    // runs its decode steps through the prompt path, and a verify block is all rows, so both reach `runPrompt`.
+    const step = try t.plugin(.decode, &.{44}, @intCast(short_prompt.len));
+    defer _ = mlx.mlx_array_free(step);
+    const verify = try t.plugin(.verify, &.{ 44, 2 }, @intCast(short_prompt.len));
+    defer _ = mlx.mlx_array_free(verify);
+    try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
+}
+
 test "deepseek_v41 ablation: the stream tap keeps the hc mean of a pass's last rows across its spans, only while on" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
@@ -556,6 +579,21 @@ const Tapped = struct {
         }
     }
 };
+
+/// The tap directory's records: every line of its index, 0 when there is none.
+fn tapRecords(td: testing.TmpDir, io: std.Io) !usize {
+    const idx = td.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(1 << 20)) catch |e| switch (e) {
+        error.FileNotFound => return 0,
+        else => return e,
+    };
+    defer testing.allocator.free(idx);
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, idx, '\n');
+    while (it.next()) |line| if (line.len > 0) {
+        n += 1;
+    };
+    return n;
+}
 
 const Run = struct { logits: []f32, peaks: Peaks };
 
