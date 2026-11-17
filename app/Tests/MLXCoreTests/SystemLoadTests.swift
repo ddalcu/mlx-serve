@@ -34,4 +34,37 @@ final class SystemLoadTests: XCTestCase {
     func testABarFillsByTheClampedFraction() {
         XCTAssertEqual([-5, 0, 50, 100, 140].map(SystemLoad.fraction), [0, 0, 0.5, 1, 1])
     }
+
+    func testThePrivateSensorsAreReadTwiceAtTheStartThenEveryThirdTick() {
+        XCTAssertEqual((0..<8).filter(SystemLoadSampler.readsSensors), [0, 1, 3, 6])
+    }
+
+    /// A sidebar that closes and opens again says nothing about its window.
+    @MainActor
+    func testTheGaugesSampleOnlyOnScreenInAWindowThatCanBeSeen() {
+        let sampler = SystemLoadSampler()
+        sampler.onScreen = true
+        XCTAssertFalse(sampler.isSampling)
+        sampler.windowVisible = true
+        XCTAssertTrue(sampler.isSampling)
+        sampler.onScreen = false
+        XCTAssertFalse(sampler.isSampling)
+        sampler.onScreen = true
+        XCTAssertTrue(sampler.isSampling)
+        sampler.windowVisible = false
+        XCTAssertFalse(sampler.isSampling)
+    }
+
+    @MainActor
+    func testAWindowNobodyCanSeeReportsHiddenAndSoDoesLeavingIt() {
+        var seen: [Bool] = []
+        let probe = WindowVisibility.Probe()
+        probe.onChange = { seen.append($0) }
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 10, height: 10), styleMask: [], backing: .buffered, defer: true)
+        window.isReleasedWhenClosed = false
+        window.contentView?.addSubview(probe)
+        XCTAssertEqual(seen, [false], "never ordered in")
+        probe.removeFromSuperview()
+        XCTAssertEqual(seen, [false, false])
+    }
 }

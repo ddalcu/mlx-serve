@@ -22,7 +22,7 @@ BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 
 WORK=$(mktemp -d "$HOME/claude-tmp/stop-reasoning.XXXXXX" 2>/dev/null || mktemp -d)
 mkdir -p "$WORK/home"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 0.5
+srv_preclean "$PORT"
 HOME="$WORK/home" "$BINARY" --serve --host 127.0.0.1 --port "$PORT" --model "$MODEL" \
     --log-level debug > "$WORK/server.log" 2>&1 &
 SERVER_PID=$!

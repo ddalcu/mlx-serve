@@ -14,6 +14,7 @@ const autoContextFrom = @import("context.zig").autoContextFrom;
 const getEffectiveContextLength = @import("context.zig").getEffectiveContextLength;
 const staticGpuMemoryCeiling = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling;
 const currentGpuMemoryCeiling = @import("../../../host/registry/memory_ceiling.zig").currentGpuMemoryCeiling;
+const idleCacheGpuMemoryCeiling = @import("../../../host/registry/memory_ceiling.zig").idleCacheGpuMemoryCeiling;
 const safeContextForBudget = @import("context.zig").safeContextForBudget;
 const defaultKvBits = @import("bills.zig").defaultKvBits;
 const prefillTransientReserve = @import("bills.zig").prefillTransientReserve;
@@ -78,6 +79,13 @@ pub fn clearResolvedPrefixCacheMem() void {
 pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enabled: bool, disk_bytes: u64) u32 {
     if (cache_capacity == 0 or (!ram_enabled and disk_bytes == 0)) return 0;
     return stride;
+}
+
+/// The stride every load hands its model (`LoadParams.ssm_checkpoint_stride`) from the launch settings, and the one a
+/// streamed bill counts checkpoints at.
+pub fn launchSsmCheckpointStride() u32 {
+    const l = http_server.launch();
+    return effectiveSsmCheckpointStride(l.ssm_checkpoint_stride, l.prefix_cache_capacity, l.prefix_cache_ram_enabled, l.prefix_cache_disk_bytes);
 }
 
 /// PURE: clamp the hot prefix cache's byte budget to what the loaded weights
@@ -318,7 +326,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const ask = ungatedHotCacheAsk(config, requested, http_server.launch().prefix_cache_mem_explicit, kv_bits, getEffectiveContextLength(config), chunk);
         const clamped = clampedPrefixCacheMem(
             ask,
-            currentGpuMemoryCeiling(config, active_mem),
+            idleCacheGpuMemoryCeiling(config, active_mem),
             active_mem,
             ctx_kv,
             prefillTransientReserve(config, kv_bits, chunk),
@@ -586,4 +594,41 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(http_server.launch().prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(http_server.launch().prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+}
+
+test "the hot cache is sized against memory nobody holds, while requests may count what macOS can move" {
+    // Bar: the idle cache's budget follows the idle figure; admission's ceiling keeps the request figure.
+    const t = std.testing;
+    const memory_ceiling = @import("../../../host/registry/memory_ceiling.zig");
+    const GB: u64 = 1 << 30;
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "llama"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 28;
+    cfg.num_attention_heads = 24;
+    cfg.num_key_value_heads = 8;
+    cfg.head_dim = 128;
+    cfg.hidden_size = 3072;
+    cfg.intermediate_size = 8192;
+    cfg.max_position_embeddings = 131072;
+    try t.expect(!cfg.longCtxGated());
+
+    const saved = memory_ceiling.overrides().*;
+    defer memory_ceiling.overrides().* = saved;
+    const orig_ctx = http_server.serverState().server_config.max_context_size;
+    defer http_server.serverState().server_config.max_context_size = orig_ctx;
+    http_server.serverState().server_config.max_context_size = 8192;
+    defer clearResolvedPrefixCacheMem();
+    memory_ceiling.overrides().static_ceiling = 400 * GB;
+
+    var idle: u64 = 0;
+    memory_ceiling.overrides().machine_free = .{ .idle = 80 * GB, .request = 80 * GB };
+    const unheld = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    memory_ceiling.overrides().machine_free = .{ .idle = 20 * GB, .request = 80 * GB };
+    const held = prefixCacheMemForLoad(&cfg, 0, .{ .quiet = true }, &idle);
+    try t.expect(unheld > 50 * GB);
+    try t.expectEqual(unheld - 60 * GB, held);
+    try t.expectEqual(
+        memory_ceiling.idleCacheGpuMemoryCeiling(&cfg, 0) + 60 * GB,
+        memory_ceiling.currentGpuMemoryCeiling(&cfg, 0),
+    );
 }

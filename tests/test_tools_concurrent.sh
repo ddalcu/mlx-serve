@@ -26,7 +26,7 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; shift; for l in "$@"; do echo "        $
 
 LOG=$(mktemp /tmp/tools_conc.XXXXXX)
 OUTDIR=$(mktemp -d /tmp/tools_conc_out.XXXXXX)
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
+srv_preclean "$PORT"
 ./zig-out/bin/mlx-serve --model "$MODEL" --serve --port "$PORT" \
     --max-concurrent 8 --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!

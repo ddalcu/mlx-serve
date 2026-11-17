@@ -186,7 +186,7 @@ pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const per_tok: u64 = sessionBytesPerToken(config, kv_bits);
 
     // `total_ctx = 0` asks for the unshrunk cap: the widest forward any prompt can run.
-    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(
+    const chunk: u64 = @intCast(config.cappedPrefillChunk(generate_mod.effectivePrefillChunk(
         config.prefillScoreHeadDim(),
         config.num_attention_heads,
         0,
@@ -194,7 +194,7 @@ pub fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
         config.isMoe(),
         config.longCtxGated(),
         config.pinned_prefill_chunk,
-    ));
+    )));
 
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);

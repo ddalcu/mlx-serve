@@ -25,6 +25,7 @@ const ollama = @import("../api/ollama/translate.zig");
 const model_discovery = @import("../registry/discovery.zig");
 const served_media = @import("../media_jobs/plugin/served.zig");
 const log = @import("../../sdk/util/log.zig");
+const hub = @import("../../sdk/util/hub.zig");
 
 // ── Unparsed-argument reporting ─────────────────────────────────────────
 
@@ -449,7 +450,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
         return error.PullUnavailable;
     }
     reporter.say("pulling manifest for {s}", .{resolved.repo});
-    const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
+    const tree_url = try std.fmt.allocPrint(allocator, "{s}/api/models/{s}/tree/main?recursive=true", .{ hub.base(), resolved.repo });
     defer allocator.free(tree_url);
     const tree_json = curlFetch(allocator, io, tree_url) catch {
         reporter.say("error: could not list {s} (check the name, your network, or HF_TOKEN for gated repos)", .{resolved.repo});
@@ -506,7 +507,7 @@ pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, de
             }
         }
         reporter.say("[{d}/{d}] pulling {s} ({d} MB)", .{ idx, wanted, f.path, f.size / (1024 * 1024) });
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ resolved.repo, f.path });
+        const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub.base(), resolved.repo, f.path });
         defer allocator.free(url);
         curlDownload(allocator, io, url, dest_path, show_progress) catch {
             reporter.say("error: download failed for {s} (partial kept — rerun to resume)", .{f.path});
@@ -539,7 +540,7 @@ fn indexNames(weight_map: ?std.json.Value, path: []const u8) bool {
 fn fetchListed(allocator: std.mem.Allocator, io: std.Io, repo: []const u8, files: []const RepoFile, name: []const u8) !?[]u8 {
     for (files) |f| {
         if (!std.mem.eql(u8, f.path, name)) continue;
-        const url = try std.fmt.allocPrint(allocator, "https://huggingface.co/{s}/resolve/main/{s}", .{ repo, name });
+        const url = try std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ hub.base(), repo, name });
         defer allocator.free(url);
         return curlFetch(allocator, io, url) catch null;
     }

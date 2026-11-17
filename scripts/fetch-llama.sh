@@ -24,8 +24,8 @@
 # Bump LLAMA_TAG to upgrade; CI and local builds re-fetch automatically.
 set -euo pipefail
 
-# Release v0.6.0 is commit b11429; its tag ships no binaries, the build tag does.
-LLAMA_TAG="${LLAMA_TAG:-b11429}"
+# Release v0.9.0 is commit b12110; its tag ships no binaries, the build tag does.
+LLAMA_TAG="${LLAMA_TAG:-b12110}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

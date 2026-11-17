@@ -8,7 +8,7 @@ const KVQuantConfig = @import("../../sdk/blocks/attention/kv_quant.zig").KVQuant
 const LoadedModel = @import("../registry/registry.zig").LoadedModel;
 const Conn = @import("../http/conn.zig").Conn;
 const errors = @import("../http/errors.zig");
-const sendAnthropicError = @import("anthropic.zig").sendAnthropicError;
+const sendAnthropicErrorWithReason = @import("anthropic.zig").sendAnthropicErrorWithReason;
 
 const ModelConfig = model_mod.ModelConfig;
 const mlx_engine = @import("../engines/mlx.zig");
@@ -62,9 +62,9 @@ pub fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_
     defer allocator.free(msg);
     errors.countRejected();
     if (is_anthropic) {
-        try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+        try sendAnthropicErrorWithReason(allocator, stream, "invalid_request_error", msg, 400, errors.MEMORY_REFUSAL_REASON);
     } else {
-        try errors.sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        try errors.sendErrorResponseWithReason(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400, errors.MEMORY_REFUSAL_REASON);
     }
     return false;
 }

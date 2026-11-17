@@ -22,7 +22,7 @@ BASE="http://127.0.0.1:$PORT"
 [ -x "$BIN" ]   || { echo "fail: build mlx-serve first"; exit 1; }
 
 LOG="$(mktemp)"
-pkill -f "mlx-serve --serve.*port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 for _ in $(seq 1 30); do lsof -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break; sleep 1; done
 "$BIN" --serve --model "$MODEL" --host 127.0.0.1 --port "$PORT" >"$LOG" 2>&1 &
 SRV=$!

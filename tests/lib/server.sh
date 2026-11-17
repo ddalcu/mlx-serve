@@ -39,3 +39,30 @@ srv_stop() {
     kill "$1" 2>/dev/null || true
     wait "$1" 2>/dev/null || true
 }
+
+# The checkout this helper lives in. Read at source time: inside a zsh function $0 is the function's name.
+_SRV_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/../.." && pwd -P)"
+
+# srv_preclean <port>: free <port> for this script's server. Stops the mlx-serve LISTENING on it when that server was
+# started from this checkout (a leftover run, or this script's own) and waits for it to exit, so its memory is back.
+# Any other holder ends the script: it would answer /health in our server's place. Never matches by name or flags,
+# which also takes a server on another port.
+srv_preclean() {
+    local pid cmd cwd _
+    for pid in $(lsof -nP -tiTCP:"$1" -sTCP:LISTEN 2>/dev/null); do
+        cmd="$(ps -p "$pid" -o comm= 2>/dev/null)"
+        cwd="$(lsof -a -p "$pid" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p')"
+        case "${cmd##*/}:$cwd/" in
+            mlx-serve:"$_SRV_ROOT"/*) kill "$pid" 2>/dev/null || true ;;
+            *) echo "FAIL: port $1 is held by pid $pid ($cmd, started in ${cwd:-?}), not a server from this checkout:" \
+                    "stop it or pass another port" >&2; exit 1 ;;
+        esac
+        for _ in $(seq 1 300); do
+            # Our own child stays a zombie (kill -0 succeeds) until the script reaps it.
+            case "$(ps -p "$pid" -o stat= 2>/dev/null)" in "" | Z*) continue 2 ;; esac
+            sleep 0.1
+        done
+        kill -9 "$pid" 2>/dev/null || true
+    done
+    return 0
+}

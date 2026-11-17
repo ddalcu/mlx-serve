@@ -88,7 +88,6 @@ classes the composed chain treats differently):
   on M1/M2, then probe per arm and width.
 - `msv_qmm_int8_prefill` accepts bf16 but the bf16 build fails when N % 128 == 0 (unreachable today: Hadamard packs
   are f16).
-- `msv_nax_attn_256_q8` (`--int8-qk`) fails to compile when exactly one scale input has fewer than 8 elements.
 - `mxfp8_qmv` and the NVFP4 kernels read e4m3 `0x7F`/`0xFF` (NaN) as 480; converters never write it.
 - `msv_keyed_sample` ignores the nucleus when a logit is NaN and `top_k` is 0.
 - The GELU tables (`gelu_erf_tables`, `gelu_tanh_tables` in `src/sdk/blocks/mlp/fused_activations.zig`) and the
@@ -115,6 +114,8 @@ classes the composed chain treats differently):
 - Quant blocks we ignore are not refused by name (bitsandbytes, compressed-tensors FP8, a modelopt_fp4 drafter).
 - ds4 reasoning budget on the plain path (refused by name).
 - EmbeddingGemma 2 audio; Muse's MoVA; the EigenLabs Nemotron-3.5-Bolt IQ2 pack (`iq2_xxs` is refused).
+- Gemma 3's SigLIP tower (`vision_tower.vision_model.*`, e.g. mlx-community/gemma-3-12b-it-4bit): the plugin has no
+  media hooks, the legacy encoder probes Gemma 4's names, so the pack logs `Vision weights missing` and serves text only.
 - Tokenizer parity: NFC normalization of U+2000-range spaces, DeepSeek's zero-width handling and Spark's blank-line
   shapes differ from HF.
 

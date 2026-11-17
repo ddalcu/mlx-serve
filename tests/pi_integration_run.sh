@@ -21,6 +21,7 @@
 #
 # Writes per-run logs into tests/pi-results/ and appends a
 # summary line to tests/pi_integration_run.summary.tsv.
+source "$(dirname "$0")/lib/server.sh"
 
 set -u
 REPO="${REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -53,17 +54,8 @@ MODELS=(
 )
 
 kill_mlx_serve() {
-    # Match by --port, not by binary path — MLX_BIN may point at the app
-    # bundle OR a dev build; a path-based pattern silently leaves the other
-    # one running and the next case reuses the wrong model.
-    pkill -f "mlx-serve.*--serve.*--port $PORT" 2>/dev/null || true
-    for _ in $(seq 1 10); do
-        if ! pgrep -f "mlx-serve.*--serve.*--port $PORT" >/dev/null; then
-            return 0
-        fi
-        sleep 0.5
-    done
-    return 1
+    # By port, not by binary path: MLX_BIN may be the app bundle's or a dev build.
+    srv_preclean "$PORT"
 }
 
 start_mlx_serve() {

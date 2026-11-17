@@ -34,14 +34,13 @@ export MLX_SERVE_ANE_CACHE_DIR="${MLX_SERVE_ANE_CACHE_DIR:-$HOME/.mlx-serve/ane-
 LOG="$FAKE_HOME/server.log"
 SRV=""
 stop() {
-    [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
-    for _ in $(seq 1 40); do pgrep -f "mlx-serve.*--port $PORT" >/dev/null || break; sleep 0.5; done
+    srv_stop "$SRV"
+    srv_preclean "$PORT"
     SRV=""
 }
 cleanup() { stop; rm -rf "$FAKE_HOME"; }
 trap cleanup EXIT
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 
 boot() { # boot <model> [flags...] — a cold ANE compile takes minutes, a cached load seconds
     local m="$1"; shift

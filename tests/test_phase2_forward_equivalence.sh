@@ -29,14 +29,14 @@ SERVER_PID=""
 LOG="$(mktemp)"
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    pkill -9 -f "mlx-serve.*port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     rm -f "$LOG"
 }
 trap cleanup EXIT INT TERM
 
 start_server() {
     local model="$1"
-    pkill -9 -f "mlx-serve.*port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     sleep 1
     "$BIN" --model "$model" --serve --port "$PORT" --ctx-size 8192 \
         --prefix-cache-entries 4 --log-level warn > "$LOG" 2>&1 &

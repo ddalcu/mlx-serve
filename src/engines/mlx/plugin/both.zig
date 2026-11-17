@@ -12,6 +12,7 @@ const model = @import("../../../sdk/config/model.zig");
 const driver = @import("driver.zig");
 const plugin_config = @import("config.zig");
 const fixture = @import("../../../sdk/bases/proof/fixture.zig");
+const sdk_fixture = @import("../../../sdk/testing/fixture.zig");
 const lazyForward = @import("../generate/step.zig").lazyForward;
 const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
 const KVCache = @import("../kv/cache.zig").KVCache;
@@ -63,6 +64,11 @@ pub const Both = struct {
     }
 
     pub fn openAs(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, oracle: Oracle) !Both {
+        return openWith(table, pack, config_json, legacy_config, oracle, &.{});
+    }
+
+    /// `openAs` with `extra` files written beside the pack before its parse (a streaming pack's `experts.bin`).
+    pub fn openWith(table: *const abi.ModelTable, pack: *fixture.Pack, config_json: []const u8, legacy_config: bool, oracle: Oracle, extra: []const sdk_fixture.File) !Both {
         const a = testing.allocator;
         const io = std.Io.Threaded.global_single_threaded.io();
         // First: a tape that skips here (off Metal) must do so before anything is allocated.
@@ -73,6 +79,7 @@ pub const Both = struct {
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
+        for (extra) |f| try tmp.dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
         var path_buf: [512]u8 = undefined;
         const dir = try a.dupe(u8, path_buf[0..try tmp.dir.realPath(io, &path_buf)]);
         errdefer a.free(dir);
@@ -139,6 +146,31 @@ pub const Both = struct {
             try b.check(hidden, false);
             for (caps) |c| try b.check(try g.adopt(c), false);
         }
+    }
+
+    /// A verify of `window` after `prompt` gives every row the logits serial decode gives its token, and leaves the
+    /// state serial decode leaves (a decode of `next` after both), bit for bit: an exact verify's bar.
+    pub fn expectVerifyIsSerial(b: *Both, prompt: []const i32, window: []const i32, next: i32) !void {
+        var serial: Slot = undefined;
+        try serial.init(b, &b.xfm);
+        defer serial.deinit();
+        var verify: Slot = undefined;
+        try verify.init(b, &b.xfm);
+        defer verify.deinit();
+        var g = ops.Graph.init(testing.allocator, b.xfm.s);
+        defer g.deinit();
+        for ([_]*Slot{ &serial, &verify }) |s| _ = try g.adopt(try b.xfm.forwardWith(&s.ctx, try fixture.tokens(&g, prompt)));
+        const rows = try testing.allocator.alloc(Array, window.len);
+        defer testing.allocator.free(rows);
+        for (rows, window) |*r, t| r.* = try g.adopt(try b.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{t})));
+        verify.ctx.spec_verify = true;
+        verify.ctx.capture_ssm_seq = true;
+        const got = try g.adopt(try b.xfm.forwardWith(&verify.ctx, try fixture.tokens(&g, window)));
+        verify.ctx.spec_verify = false;
+        verify.ctx.capture_ssm_seq = false;
+        try ops.expectBitEqual(got, try g.concat(rows, 1));
+        const after = try g.adopt(try b.xfm.forwardWith(&verify.ctx, try fixture.tokens(&g, &.{next})));
+        try ops.expectBitEqual(after, try g.adopt(try b.xfm.forwardWith(&serial.ctx, try fixture.tokens(&g, &.{next}))));
     }
 
     /// Greedy decode through the pipelined step (`lazyForward`: the next token stays a lazy argmax), tokens equal.

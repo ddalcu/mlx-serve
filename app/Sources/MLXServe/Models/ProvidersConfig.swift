@@ -154,6 +154,24 @@ struct ProviderStatus: Decodable, Equatable {
     var up: Bool
     var probed: Bool
     var models: Int
+    /// Why a probed provider gave no answer (`refused`, `dns`, `timeout`, `tls`, `other`); absent from older servers.
+    var down: String? = nil
+
+    /// The row's status line. A provider that does not answer says why: "Unreachable" alone read like a bad key.
+    var line: String {
+        if !probed { return "Checking…" }
+        if up { return "Up — \(models) model\(models == 1 ? "" : "s")" }
+        let parts = URL(string: url)
+        let host = parts?.host ?? url
+        let hostPort = parts?.port.map { "\(host):\($0)" } ?? host
+        switch down {
+        case "refused": return L10n.format("Unreachable — nothing is listening at %@", hostPort)
+        case "dns": return L10n.format("Unreachable — %@ does not resolve", host)
+        case "timeout": return L10n.format("Unreachable — no answer from %@ in time", hostPort)
+        case "tls": return L10n.format("Unreachable — the secure connection to %@ failed", hostPort)
+        default: return "Unreachable"
+        }
+    }
 
     static func decodeList(_ data: Data) -> [ProviderStatus] {
         struct Wrapper: Decodable { let providers: [ProviderStatus] }

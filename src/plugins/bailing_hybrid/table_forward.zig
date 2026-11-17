@@ -65,7 +65,7 @@ pub fn hidden(m: *trunk.Model, st: *const Step, token_ids: Array) !Array {
             ff_normed = try m.rmsNorm(h, lw.post_norm);
         }
         const mlp_out = switch (lw.mlp) {
-            .moe => |*mw| try glm_moe.forward(mw, m.s, ff_normed),
+            .moe => |*mw| if (m.serial_rows) try glm_moe.forwardRows(mw, m.s, ff_normed) else try glm_moe.forward(mw, m.s, ff_normed),
             .dense => |*dw| try m.denseMlp(dw, ff_normed),
         };
         defer _ = mlx.mlx_array_free(mlp_out);

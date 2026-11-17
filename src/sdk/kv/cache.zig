@@ -107,6 +107,9 @@ pub const KVCache = struct {
     /// `reservedCacheTokens`). A grow is not in place, so a long prefill's peak carried a
     /// second copy of ~6 GB of KV at 458k; reserving on the first grow removes the transient.
     reserve_tokens: usize = 0,
+    /// The most tokens a grow allocates for: the context plus the widest verify (0: no limit). The proportional
+    /// policy's slack past it would never be written.
+    grow_limit: usize = 0,
 
     pub fn init(allocator: std.mem.Allocator, num_layers: u32) !KVCache {
         return initWithConfig(allocator, num_layers, KVQuantConfig.dense);
@@ -277,13 +280,26 @@ pub const KVCache = struct {
         if (tokens > self.reserve_tokens) self.reserve_tokens = tokens;
     }
 
-    /// The capacity a grow takes: the proportional policy, raised to the reservation when there is one.
+    /// Hold every grow to `tokens` (the context plus the widest verify), rounded up to a chunk.
+    pub fn limitGrowth(self: *KVCache, tokens: usize) void {
+        self.grow_limit = tokens;
+    }
+
+    /// The capacity a grow takes: the proportional policy, raised to the reservation when there is one, and held to
+    /// `grow_limit` (`limitedCapacity`).
     pub fn nextCapacityReserved(self: *const KVCache, current_cap: usize, needed: usize) usize {
         const policy = nextCapacity(current_cap, needed);
-        if (self.reserve_tokens <= policy) return policy;
+        if (self.reserve_tokens <= policy) return limitedCapacity(policy, needed, self.grow_limit);
         // Round the reservation the same way the policy rounds.
         const n_chunks = (self.reserve_tokens + chunk_step - 1) / chunk_step;
-        return n_chunks * chunk_step;
+        return limitedCapacity(n_chunks * chunk_step, needed, self.grow_limit);
+    }
+
+    /// PURE: a grow's capacity `want` held to `limit` rounded up to a chunk (0: no limit); a write past the limit
+    /// keeps `want`.
+    pub fn limitedCapacity(want: usize, needed: usize, limit: usize) usize {
+        if (limit == 0 or needed > limit) return want;
+        return @min(want, (limit + chunk_step - 1) / chunk_step * chunk_step);
     }
 
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {

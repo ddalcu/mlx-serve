@@ -6,6 +6,7 @@ const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const prefix_cache_mod = @import("cache/prefix_cache.zig");
 const plugin_driver = @import("plugin/driver.zig");
+const plugin_settle = @import("plugin/settle.zig");
 const plugin_abi = @import("../../abi/plugin.zig");
 const log = @import("../../sdk/util/log.zig");
 const Generator = generate_mod.Generator;
@@ -64,6 +65,78 @@ fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usiz
     return true;
 }
 
+/// The tokens a finished slot's state holds: its prompt, what it generated and forwarded, then `stop` (the stop
+/// token and lookahead a plain pipelined step forwarded before it saw the stop), with `spare` zeros after them.
+/// Caller frees.
+fn heldTokens(a: std.mem.Allocator, prompt: []const u32, forwarded: []const u32, stop: []const u32, spare: usize) ![]u32 {
+    const out = try a.alloc(u32, prompt.len + forwarded.len + stop.len + spare);
+    @memcpy(out[0..prompt.len], prompt);
+    @memcpy(out[prompt.len..][0..forwarded.len], forwarded);
+    @memcpy(out[prompt.len + forwarded.len ..][0..stop.len], stop);
+    @memset(out[prompt.len + forwarded.len + stop.len ..], 0);
+    return out;
+}
+
+/// A module-owned slot's state where decode stopped, committed beside its prompt boundary so the next turn resumes
+/// after the generated tail. A plugin captures at a prompt's last token: the slot is handed its own tokens and one
+/// more as a prompt it already stands at the end of, and refuses when it stands elsewhere.
+fn commitModuleDecodeEnd(sch: *Scheduler, slot: *Slot, gen: *Generator, binding: prefix_cache_mod.ModuleBinding, hc: *prefix_cache_mod.HotPrefixCache) void {
+    const forwarded = gen.generated_ids.items[0 .. gen.generated_ids.items.len - gen.unforwarded_tail];
+    if (forwarded.len == 0) return;
+    // A plain pipelined step leaves its stop and lookahead forwarded; a draft round leaves neither.
+    const stops = [_][]const u32{ gen.forwarded_stop[0..gen.forwarded_stop_len], &.{} };
+    for (stops[if (gen.forwarded_stop_len > 0) 0 else 1..]) |stop| {
+        const held = heldTokens(sch.allocator, slot.full_prompt, forwarded, stop, 1) catch return;
+        defer sch.allocator.free(held);
+        const ids = held[0 .. held.len - 1];
+        const had_error = mlx.errorPending();
+        if (!plugin_driver.auxBeginPrompt(binding.xfm, gen.ctx.plugin_slot, held, slot.vision_embeddings, ids.len, true).isOk()) {
+            mlx.dropLatchedErrorUnless(had_error);
+            continue;
+        }
+        const snap = plugin_driver.auxSnapshot(binding.xfm, gen.ctx.plugin_slot) orelse return;
+        var info: plugin_abi.AuxSnapshotInfo = .{};
+        if (!plugin_driver.auxDescribe(binding.xfm, snap, &info).isOk() or !std.mem.eql(u32, info.ids.slice(), ids) or mlx.errorPending()) {
+            plugin_driver.auxFree(binding.xfm, snap);
+            return;
+        }
+        const st = hc.commitModuleTail(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key, slot.full_prompt.len) catch |err| {
+            log.warn("[hot-cache] module decode-end commit failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        if (st == .ok) log.info("  [hot-cache] decode-end checkpoint at {d} ({d} prompt + {d} generated)\n", .{ ids.len, slot.full_prompt.len, ids.len - slot.full_prompt.len });
+        return;
+    }
+    log.debug("[hot-cache] decode-end checkpoint skipped: the module stands past {d} prompt + {d} generated\n", .{ slot.full_prompt.len, forwarded.len });
+}
+
+/// A cancelled module slot's prompt, as far as it got: its completed boundary when decode had begun, else the last
+/// prefill chunk the plugin forwarded (`AuxHooks.snapshot`). The same prompt then resumes there instead of
+/// prefilling from zero. Nothing is kept under the commit floor, as for a cancelled KV prefill, nor when the slot
+/// forwarded nothing past the entry it restored.
+fn commitCancelledModule(sch: *Scheduler, slot: *Slot, xfm: *transformer_mod.Transformer, binding: prefix_cache_mod.ModuleBinding, hc: *prefix_cache_mod.HotPrefixCache) void {
+    const id = if (slot.legacy_gen) |*g| blk: {
+        if (commitDeclinesPadOnly(g.generated_ids.items.len, slot.was_pad_only)) return;
+        break :blk g.ctx.plugin_slot;
+    } else plugin_settle.slotId(xfm.plugin orelse return, &slot.ctx);
+    const snap = plugin_driver.auxSnapshot(xfm, id) orelse return;
+    var info: plugin_abi.AuxSnapshotInfo = .{};
+    if (!plugin_driver.auxDescribe(xfm, snap, &info).isOk() or
+        info.n < prefix_cache_mod.MIN_CANCELLED_COMMIT_TOKENS or info.n <= slot.cached_tokens or info.n != info.ids.len or info.n > slot.full_prompt.len or
+        !std.mem.eql(u32, info.ids.slice(), slot.full_prompt[0..@intCast(info.n)]) or mlx.errorPending())
+    {
+        plugin_driver.auxFree(xfm, snap);
+        return;
+    }
+    const n: usize = @intCast(info.n);
+    const st = hc.commitModule(binding, snap, info.ids.slice(), info.prefix_key, slot.media, slot.has_tools, slot.cache.config, slot.cache_key) catch |err| {
+        log.warn("[hot-cache] cancelled module commit failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    if (st == .ok) log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled request\n", .{ n, slot.full_prompt.len });
+    publishHotCacheResidency(sch);
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -71,13 +144,13 @@ fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usiz
 /// (stale embeddings would be reused), and slots with no generated tokens.
 pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // Phase D: per-model prefix cache — read off the slot's LoadedModel.
-    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |p| p else return;
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.prefix_cache) |p| p else return;
     if (slot.error_code != null) return;
     // `finishSlot` can be reached on an EOS the failing forward itself produced, before the
     // tick wrapper reads the latch: an unread latch means the KV under this commit may be garbage.
     if (mlx.errorPending()) return;
     if (slot.model.transformer) |xfm| if (prefix_cache_mod.ModuleBinding.forVariant(xfm, slot.cache_variant)) |binding| {
-        if (slot.cancelled.load(.acquire)) return;
+        if (slot.cancelled.load(.acquire)) return commitCancelledModule(sch, slot, xfm, binding, hc);
         const gen = if (slot.legacy_gen) |*g| g else return;
         if (commitDeclinesPadOnly(gen.generated_ids.items.len, slot.was_pad_only)) return;
         const snap = plugin_driver.auxSnapshot(xfm, gen.ctx.plugin_slot) orelse return;
@@ -94,6 +167,7 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             log.warn("[hot-cache] module commit failed: {s}\n", .{@errorName(err)});
             return;
         };
+        commitModuleDecodeEnd(sch, slot, gen, binding, hc);
         publishHotCacheResidency(sch);
         return;
     };
@@ -119,14 +193,12 @@ pub fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // generated this turn that the cache holds — Generator forwarded each
     // emitted token into slot.cache as it was sampled, except an
     // `unforwarded_tail` the key must not claim.
-    const gen_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len - gen_ptr.unforwarded_tail;
+    const forwarded = gen_ptr.generated_ids.items[0 .. gen_ptr.generated_ids.items.len - gen_ptr.unforwarded_tail];
+    const gen_len = slot.full_prompt.len + forwarded.len;
     const stop_tail = gen_ptr.forwarded_stop[0..if (slot.moe_seq_offset == gen_len + gen_ptr.forwarded_stop_len) gen_ptr.forwarded_stop_len else 0];
-    const total_len = gen_len + stop_tail.len;
-    const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
+    const total_tokens = heldTokens(sch.allocator, slot.full_prompt, forwarded, stop_tail, 0) catch return;
     defer sch.allocator.free(total_tokens);
-    @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
-    @memcpy(total_tokens[slot.full_prompt.len..gen_len], gen_ptr.generated_ids.items[0 .. gen_len - slot.full_prompt.len]);
-    @memcpy(total_tokens[gen_len..], stop_tail);
+    const total_len = total_tokens.len;
 
     // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
     // loop and hand them to the cache alongside the KV snapshot. For plain-
@@ -320,6 +392,15 @@ test "prefix-cache commit declines a pad-only generation, never a zero-token one
     try testing.expect(!commitDeclinesPadOnly(0, false));
     try testing.expect(commitDeclinesPadOnly(3, true));
     try testing.expect(!commitDeclinesPadOnly(3, false));
+}
+
+test "heldTokens: prompt, forwarded tokens, the forwarded stop pair, then the spare" {
+    const got = try heldTokens(testing.allocator, &.{ 1, 2 }, &.{ 3, 4, 5 }, &.{ 9, 8 }, 1);
+    defer testing.allocator.free(got);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4, 5, 9, 8, 0 }, got);
+    const bare = try heldTokens(testing.allocator, &.{7}, &.{}, &.{}, 0);
+    defer testing.allocator.free(bare);
+    try testing.expectEqualSlices(u32, &.{7}, bare);
 }
 
 test "decode-end checkpoint: taken only where the live state is the committed prefix" {

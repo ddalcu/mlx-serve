@@ -374,9 +374,10 @@ fn modelEffortIfThinking(model: ?ReasoningEffort, thinking: bool) ?ReasoningEffo
 const ChatThinking = struct { enable: bool, effort: ?ReasoningEffort };
 
 /// An EXPLICIT client signal wins (`enable_thinking`, or an effort word, "none" being an
-/// explicit OFF; the two stay OR'd). The generation-defaults rules (the model's
-/// `chat_template_kwargs` thinking keys among them) act as a default request, consulted only
-/// when the request names neither; then the arch. A forced thinking or effort rule replaces the
+/// explicit OFF; the two stay OR'd). When the request names neither, the generation-defaults
+/// rules (the model's `chat_template_kwargs` thinking keys among them) decide: the thinking
+/// rule sets on/off and the effort rule only its level, the effort rule deciding on/off only
+/// without a thinking rule; then the arch. A forced thinking or effort rule replaces the
 /// request's switches.
 pub fn resolveThinking(gen: generation_settings.Profile, enable: ?bool, request: ?ReasoningEffort, arch_default: bool, default_budget: i32) ChatThinking {
     const ignore = gen.forced(.enable_thinking) or gen.forced(.reasoning_effort);
@@ -390,7 +391,7 @@ pub fn resolveThinking(gen: generation_settings.Profile, enable: ?bool, request:
     else if (gen.forced(.reasoning_effort))
         model.?.enable
     else
-        thinkingFrom(enable, req_effort, thinkingFrom(gen.value(bool, .enable_thinking), model, arch_default));
+        thinkingFrom(enable, req_effort, gen.value(bool, .enable_thinking) orelse if (model) |m| m.enable else arch_default);
     return .{ .enable = on, .effort = req_effort orelse modelEffortIfThinking(model, on) };
 }
 
@@ -579,7 +580,7 @@ test "resolveChatThinking: an explicit request value outranks the arch default, 
 
 test "resolveChatThinking: the request decides, the generation-defaults rules fill its silence or force it, then the arch" {
     const allocator = std.testing.allocator;
-    const Case = struct { body: []const u8, model_on: ?bool = null, model_effort: ?generation_settings.Effort = null, force: bool = false, arch: bool = false, want: bool, effort: ?[]const u8 = null };
+    const Case = struct { body: []const u8, global_on: ?bool = null, model_on: ?bool = null, model_effort: ?generation_settings.Effort = null, force: bool = false, arch: bool = false, want: bool, effort: ?[]const u8 = null };
     const cases = [_]Case{
         .{ .body = "{}", .arch = true, .want = true },
         .{ .body = "{}", .model_on = true, .want = true },
@@ -589,6 +590,14 @@ test "resolveChatThinking: the request decides, the generation-defaults rules fi
         .{ .body = "{\"enable_thinking\":false}", .model_effort = .high, .want = false },
         .{ .body = "{\"enable_thinking\":true}", .model_effort = .high, .want = true, .effort = "high" },
         .{ .body = "{\"reasoning_effort\":\"low\"}", .model_effort = .high, .want = true, .effort = "low" },
+        // The thinking rule decides on/off; the effort rule only picks the level.
+        .{ .body = "{}", .model_on = false, .model_effort = .medium, .arch = true, .want = false },
+        .{ .body = "{}", .model_on = true, .model_effort = .none, .want = true },
+        .{ .body = "{\"enable_thinking\":true}", .model_on = false, .model_effort = .medium, .want = true, .effort = "medium" },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .model_on = false, .model_effort = .medium, .want = true, .effort = "low" },
+        // The more specific layer decides: a model's effort rule beats a global thinking rule.
+        .{ .body = "{}", .global_on = false, .model_effort = .high, .want = true, .effort = "high" },
+        .{ .body = "{}", .global_on = false, .arch = true, .want = false },
         // A forced rule replaces the request's switches, effort word included.
         .{ .body = "{\"enable_thinking\":false,\"reasoning_effort\":\"none\"}", .model_on = true, .force = true, .want = true },
         .{ .body = "{\"enable_thinking\":true,\"reasoning_effort\":\"high\"}", .model_on = false, .force = true, .arch = true, .want = false },
@@ -601,10 +610,12 @@ test "resolveChatThinking: the request decides, the generation-defaults rules fi
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        var gen = generation_settings.Profile{};
-        if (case.model_on) |on| gen.set(.enable_thinking, .{ .boolean = on }, case.force);
-        if (case.model_effort) |e| gen.set(.reasoning_effort, .{ .effort = e }, case.force);
-        const got = resolveChatThinking(parsed.value.object, gen, case.arch, -1);
+        var global = generation_settings.Profile{};
+        if (case.global_on) |on| global.set(.enable_thinking, .{ .boolean = on }, false);
+        var model = generation_settings.Profile{};
+        if (case.model_on) |on| model.set(.enable_thinking, .{ .boolean = on }, case.force);
+        if (case.model_effort) |e| model.set(.reasoning_effort, .{ .effort = e }, case.force);
+        const got = resolveChatThinking(parsed.value.object, .overlay(global, model), case.arch, -1);
         try std.testing.expectEqual(case.want, got.enable);
         if (case.effort) |w| try std.testing.expectEqualStrings(w, got.effort.?.effort.?) else try std.testing.expect(got.effort == null);
     }

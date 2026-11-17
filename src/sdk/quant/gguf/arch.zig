@@ -128,11 +128,30 @@ pub const Arch = union(enum) {
     }
 
     /// Whether the loader serves the mapped tensor `name` at `ty`; the affine-coded types load in MLX's affine layout
-    /// (`transcodes`). DeepSeek-V4.1's forward reads raw ggml blocks only in its routed-expert gathers, so another
+    /// (`loadsMlx`). DeepSeek-V4.1's forward reads raw ggml blocks only in its routed-expert gathers, so another
     /// tensor of a type that stays raw is refused here, by name, instead of failing the first request.
     pub fn serves(self: Arch, name: []const u8, ty: @import("quants.zig").GgmlType) bool {
         if (!ty.supported()) return false;
-        if (self != .deepseek41 or !ty.isQuantized() or self.transcodes(ty)) return true;
+        if (self != .deepseek41 or !ty.isQuantized() or self.loadsMlx(name, ty)) return true;
+        return routedExpert(name);
+    }
+
+    /// Whether the mapped tensor `name` of type `ty` loads in an MLX layout: a type that `transcodes`, and
+    /// DeepSeek-V4.1's Q6_K outside the routed experts, requantized to 8-bit affine (`affine.layoutBits`). Unsloth's
+    /// dynamic quants put Q6_K on the head, the shared experts and the Engram projections, where the forward has no
+    /// raw-block read; a routed expert bank keeps its Q6_K blocks and their gather kernel.
+    pub fn loadsMlx(self: Arch, name: []const u8, ty: @import("quants.zig").GgmlType) bool {
+        return self.transcodes(ty) or (self == .deepseek41 and ty == .q6_k and !routedExpert(name));
+    }
+
+    /// Whether a tensor the loader leaves in the file is one the model can read there at `ty`. DeepSeek-V4.1 reads
+    /// its in-set Engram table (`ple_table`) row by row as IQ4_NL blocks (`plugins/deepseek_v41/engram.zig`): a set
+    /// that carries it at another type (Unsloth's Q5_K, Q6_K, MXFP8 tables) is declined here, not at its load.
+    pub fn readsInPlace(self: Arch, gguf_name: []const u8, ty: @import("quants.zig").GgmlType) bool {
+        return self != .deepseek41 or !std.mem.eql(u8, gguf_name, deepseek41.ple_table) or ty == .iq4_nl;
+    }
+
+    fn routedExpert(name: []const u8) bool {
         return std.mem.indexOf(u8, name, ".ffn.experts.") != null;
     }
 
@@ -185,7 +204,17 @@ test "DeepSeek-V4.1 reads raw ggml blocks only in its routed experts: another te
     const ds: Arch = .{ .deepseek41 = std.mem.zeroes(deepseek41.Hparams) };
     try std.testing.expect(ds.serves("layers.0.ffn.experts.w1.weight", .iq2_xxs) and ds.serves("layers.0.ffn.experts.w2.weight", .q6_k));
     try std.testing.expect(ds.serves("layers.0.attn.wq_a.weight", .q5_k) and ds.serves("layers.0.attn.wq_b.weight", .bf16));
-    try std.testing.expect(!ds.serves("head.weight", .q6_k) and !ds.serves("layers.0.ffn.shared_experts.w1.weight", .iq2_xxs));
+    try std.testing.expect(!ds.serves("head.weight", .iq4_nl) and !ds.serves("layers.0.ffn.shared_experts.w1.weight", .iq2_xxs));
+}
+
+test "DeepSeek-V4.1's Q6_K outside the routed experts loads requantized; a routed bank and other archs keep its blocks" {
+    const ds: Arch = .{ .deepseek41 = std.mem.zeroes(deepseek41.Hparams) };
+    const qwen4: Arch = .{ .qwen4exp = std.mem.zeroes(qwen4exp.Hparams) };
+    for ([_][]const u8{ "head.weight", "embed.weight", "layers.0.ffn.shared_experts.w1.weight", "layers.1.engram.key_proj.weight" }) |name|
+        try std.testing.expect(ds.serves(name, .q6_k) and ds.loadsMlx(name, .q6_k));
+    try std.testing.expect(ds.serves("layers.0.ffn.experts.w2.weight", .q6_k) and !ds.loadsMlx("layers.0.ffn.experts.w2.weight", .q6_k));
+    try std.testing.expect(!ds.transcodes(.q6_k) and !qwen4.loadsMlx("head.weight", .q6_k) and qwen4.serves("head.weight", .q6_k));
+    try std.testing.expect(ds.loadsMlx("head.weight", .q5_k) and ds.loadsMlx("layers.0.ffn.experts.w2.weight", .q5_k));
 }
 
 test {

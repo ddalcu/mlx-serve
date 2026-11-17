@@ -112,7 +112,7 @@ fn parseSettings(a: std.mem.Allocator, io: std.Io, buf: []u8, model_dir: []const
     var path: [std.fs.max_path_bytes]u8 = undefined;
     var s = model_settings.load(a, io, model_settings.defaultPath(&path));
     defer s.deinit();
-    var o = s.lookup(a, model_dir);
+    var o = model_settings.lookupPack(&s, a, io, model_dir);
     defer o.deinit(a);
     return switch (o.stream_experts orelse return "") {
         .on => "{\"stream_experts\":true}",

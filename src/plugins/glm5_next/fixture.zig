@@ -223,47 +223,103 @@ pub const ling_config =
 ;
 
 pub fn lingTensors(a: std.mem.Allocator, seed: u64) ![]u8 {
+    var t = Tensors.init(a, seed);
+    try lingTrunk(&t);
+    return t.bytes();
+}
+
+/// `ling_config` with one NextN (MTP) layer past the trunk.
+pub const ling_mtp_config =
+    \\{"model_type":"bailing_hybrid","vocab_size":512,"hidden_size":256,"intermediate_size":256,"num_hidden_layers":4,
+    \\ "num_attention_heads":4,"num_key_value_heads":4,"head_dim":128,"rms_norm_eps":1e-6,"rope_theta":600000,
+    \\ "max_position_embeddings":4096,"layer_group_size":4,"short_conv_kernel_size":4,"kda_lower_bound":-5,
+    \\ "no_kda_lora":true,"q_lora_rank":64,"kv_lora_rank":64,"qk_nope_head_dim":64,"qk_rope_head_dim":64,
+    \\ "qk_head_dim":128,"v_head_dim":64,"gated_attention_proj_granularity_type":"head_wise","rope_interleave":true,
+    \\ "first_k_dense_replace":1,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":64,
+    \\ "num_shared_experts":1,"moe_shared_expert_intermediate_size":64,"n_group":4,"topk_group":2,
+    \\ "norm_topk_prob":true,"routed_scaling_factor":2.5,"score_function":"sigmoid","eos_token_id":1,
+    \\ "tie_word_embeddings":false,"num_nextn_predict_layers":1,"quantization":{"group_size":64,"bits":4}}
+;
+
+/// `ling_mtp_config` as a Ling streaming pack marks itself: an EXL3 `quantization_config` (bailing_hybrid's parse).
+pub const ling_stream_config =
+    \\{"model_type":"bailing_hybrid","vocab_size":512,"hidden_size":256,"intermediate_size":256,"num_hidden_layers":4,
+    \\ "num_attention_heads":4,"num_key_value_heads":4,"head_dim":128,"rms_norm_eps":1e-6,"rope_theta":600000,
+    \\ "max_position_embeddings":4096,"layer_group_size":4,"short_conv_kernel_size":4,"kda_lower_bound":-5,
+    \\ "no_kda_lora":true,"q_lora_rank":64,"kv_lora_rank":64,"qk_nope_head_dim":64,"qk_rope_head_dim":64,
+    \\ "qk_head_dim":128,"v_head_dim":64,"gated_attention_proj_granularity_type":"head_wise","rope_interleave":true,
+    \\ "first_k_dense_replace":1,"num_experts":8,"num_experts_per_tok":2,"moe_intermediate_size":64,
+    \\ "num_shared_experts":1,"moe_shared_expert_intermediate_size":64,"n_group":4,"topk_group":2,
+    \\ "norm_topk_prob":true,"routed_scaling_factor":2.5,"score_function":"sigmoid","eos_token_id":1,
+    \\ "tie_word_embeddings":false,"num_nextn_predict_layers":1,"quantization":{"group_size":64,"bits":4},
+    \\ "quantization_config":{"quant_method":"exl3"}}
+;
+
+/// The Ling pack with its NextN layer (`model.layers.4`: `eh_proj`, its norms, one MLA + MoE block) after the trunk's
+/// tensors, which keep `lingTensors`' bytes.
+pub fn lingMtpFiles(a: std.mem.Allocator, seed: u64) ![]const File {
     const g = ling;
     var t = Tensors.init(a, seed);
-    try q4(&t, "model.word_embeddings", .{}, &.{g.V}, g.H);
-    try norm(&t, "model.norm.weight", .{}, g.H);
-    try q4(&t, "lm_head", .{}, &.{g.V}, g.H);
+    try lingTrunk(&t);
+    const li: usize = g.LAYERS;
+    try q4(&t, "model.layers.{d}.eh_proj", .{li}, &.{g.H}, 2 * g.H);
+    inline for (.{ "enorm", "hnorm", "final_layernorm", "input_layernorm", "post_attention_layernorm" }) |n|
+        try norm(&t, "model.layers.{d}." ++ n ++ ".weight", .{li}, g.H);
+    try lingMla(&t, li);
+    try t.rand("model.layers.{d}.mlp.gate.weight", .{li}, &.{ g.E, g.H }, .BF16, 0.1);
+    try t.rand("model.layers.{d}.mlp.gate.expert_bias", .{li}, &.{g.E}, .F32, 0.1);
+    try routed(&t, "model.layers.{d}.mlp", .{li}, g.E, g.M, g.H, false);
+    const files = try a.alloc(File, 2);
+    files[0] = .{ .name = "config.json", .bytes = ling_mtp_config };
+    files[1] = .{ .name = "model.safetensors", .bytes = try t.bytes() };
+    return files;
+}
+
+fn lingMla(t: *Tensors, li: usize) !void {
+    const g = ling;
+    const qk = g.NOPE + g.ROPE;
+    try q4(t, "model.layers.{d}.attention.q_a_proj", .{li}, &.{g.Q_LORA}, g.H);
+    try norm(t, "model.layers.{d}.attention.q_a_layernorm.weight", .{li}, g.Q_LORA);
+    try q4(t, "model.layers.{d}.attention.q_b_proj", .{li}, &.{g.HEADS * qk}, g.Q_LORA);
+    try q4(t, "model.layers.{d}.attention.kv_a_proj_with_mqa", .{li}, &.{g.KV_LORA + g.ROPE}, g.H);
+    try norm(t, "model.layers.{d}.attention.kv_a_layernorm.weight", .{li}, g.KV_LORA);
+    try q4(t, "model.layers.{d}.attention.kv_b_proj", .{li}, &.{g.HEADS * (g.NOPE + g.VD)}, g.KV_LORA);
+    try q4(t, "model.layers.{d}.attention.dense", .{li}, &.{g.H}, g.HEADS * g.VD);
+    try q4(t, "model.layers.{d}.attention.g_proj", .{li}, &.{g.HEADS}, g.H);
+}
+
+fn lingTrunk(t: *Tensors) !void {
+    const g = ling;
+    try q4(t, "model.word_embeddings", .{}, &.{g.V}, g.H);
+    try norm(t, "model.norm.weight", .{}, g.H);
+    try q4(t, "lm_head", .{}, &.{g.V}, g.H);
     for (0..g.LAYERS) |li| {
-        try norm(&t, "model.layers.{d}.input_layernorm.weight", .{li}, g.H);
-        try norm(&t, "model.layers.{d}.post_attention_layernorm.weight", .{li}, g.H);
+        try norm(t, "model.layers.{d}.input_layernorm.weight", .{li}, g.H);
+        try norm(t, "model.layers.{d}.post_attention_layernorm.weight", .{li}, g.H);
         if (li == 3) {
-            const qk = g.NOPE + g.ROPE;
-            try q4(&t, "model.layers.{d}.attention.q_a_proj", .{li}, &.{g.Q_LORA}, g.H);
-            try norm(&t, "model.layers.{d}.attention.q_a_layernorm.weight", .{li}, g.Q_LORA);
-            try q4(&t, "model.layers.{d}.attention.q_b_proj", .{li}, &.{g.HEADS * qk}, g.Q_LORA);
-            try q4(&t, "model.layers.{d}.attention.kv_a_proj_with_mqa", .{li}, &.{g.KV_LORA + g.ROPE}, g.H);
-            try norm(&t, "model.layers.{d}.attention.kv_a_layernorm.weight", .{li}, g.KV_LORA);
-            try q4(&t, "model.layers.{d}.attention.kv_b_proj", .{li}, &.{g.HEADS * (g.NOPE + g.VD)}, g.KV_LORA);
-            try q4(&t, "model.layers.{d}.attention.dense", .{li}, &.{g.H}, g.HEADS * g.VD);
-            try q4(&t, "model.layers.{d}.attention.g_proj", .{li}, &.{g.HEADS}, g.H);
+            try lingMla(t, li);
         } else {
             const C = g.HEADS * g.HD;
             inline for (.{ "q", "k", "v" }) |p| {
-                try q4(&t, "model.layers.{d}.attention." ++ p ++ "_proj", .{li}, &.{C}, g.H);
+                try q4(t, "model.layers.{d}.attention." ++ p ++ "_proj", .{li}, &.{C}, g.H);
                 try t.rand("model.layers.{d}.attention." ++ p ++ "_conv1d.weight", .{li}, &.{ C, 1, 4 }, .BF16, 0.3);
             }
-            try q4(&t, "model.layers.{d}.attention.f_proj", .{li}, &.{C}, g.H);
-            try q4(&t, "model.layers.{d}.attention.g_proj", .{li}, &.{C}, g.H);
-            try q4(&t, "model.layers.{d}.attention.b_proj", .{li}, &.{g.HEADS}, g.H);
-            try q4(&t, "model.layers.{d}.attention.o_proj", .{li}, &.{g.H}, C);
-            try norm(&t, "model.layers.{d}.attention.o_norm.weight", .{li}, g.HD);
+            try q4(t, "model.layers.{d}.attention.f_proj", .{li}, &.{C}, g.H);
+            try q4(t, "model.layers.{d}.attention.g_proj", .{li}, &.{C}, g.H);
+            try q4(t, "model.layers.{d}.attention.b_proj", .{li}, &.{g.HEADS}, g.H);
+            try q4(t, "model.layers.{d}.attention.o_proj", .{li}, &.{g.H}, C);
+            try norm(t, "model.layers.{d}.attention.o_norm.weight", .{li}, g.HD);
             try t.rand("model.layers.{d}.attention.A_log", .{li}, &.{g.HEADS}, .F32, 0.5);
             try t.rand("model.layers.{d}.attention.dt_bias", .{li}, &.{C}, .F32, 0.5);
         }
         if (li == 0) {
-            try dense(&t, li, g.INTER, g.H);
+            try dense(t, li, g.INTER, g.H);
         } else {
             try t.rand("model.layers.{d}.mlp.gate.weight", .{li}, &.{ g.E, g.H }, .BF16, 0.1);
             try t.rand("model.layers.{d}.mlp.gate.expert_bias", .{li}, &.{g.E}, .F32, 0.1);
-            try routed(&t, "model.layers.{d}.mlp", .{li}, g.E, g.M, g.H, false);
+            try routed(t, "model.layers.{d}.mlp", .{li}, g.E, g.M, g.H, false);
         }
     }
-    return t.bytes();
 }
 
 pub fn lingFiles(a: std.mem.Allocator, seed: u64) ![]const File {

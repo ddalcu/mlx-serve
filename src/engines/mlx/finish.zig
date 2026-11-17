@@ -170,11 +170,13 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // The legacy generate() path logs this itself; scheduler-driven slots
     // finalize here instead.
     if (slot.legacy_gen) |*g| {
-        g.logSpecStats();
-        // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
-        // wiring it only beside generate.zig's own logSpecStats() calls (the
-        // legacy/CLI path) makes it dead on every served request.
-        g.logQsaArms();
+        if (!slot.warm) {
+            g.logSpecStats();
+            // `[qsa-arms]` rides the same seam: the SERVE path finalizes here, so
+            // wiring it only beside generate.zig's own logSpecStats() calls (the
+            // legacy/CLI path) makes it dead on every served request.
+            g.logQsaArms();
+        }
         g.persistRoundCost();
         // The cache commit below snapshots the n-gram history: settle the pipelined step's owed advance first.
         g.xfm.flushDeferredPle(&g.ctx) catch g.xfm.discardDeferredPle(&g.ctx);
@@ -183,20 +185,20 @@ pub fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (latched) |name| {
         log.err("[scheduler] finish suppressed: the last forward failed ({s}) but produced a \"{s}\" — failing this request rather than answering 200 with what Metal never wrote\n", .{ name, reason });
     }
-    if (slot.completion_tokens <= 2) logShortGen(slot, reason);
+    if (slot.completion_tokens <= 2 and !slot.warm) logShortGen(slot, reason);
     commitSlotIfApplicable(sch, slot);
     releasePluginSlot(slot);
     publishHotCacheResidency(sch);
     // Restore by move: a slot that ended without committing still holds its checkout, and
     // the record now describes bytes that die with `slot.cache`. Above every early return.
-    if (slot.model.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), reason);
+    if (slot.prefix_cache) |hc| hc.releaseCheckout(@intFromPtr(slot), reason);
     // SSD flush runs AFTER markFinished so the client never waits on the
     // chunk-append — but everything it needs must be captured BEFORE the
     // broadcast: the conn thread may complete()+free the slot immediately.
     // The prefix cache and stream live on the registry-owned LoadedModel,
     // which outlives the slot (unload also runs on this thread).
     const hc_opt: ?*prefix_cache_mod.HotPrefixCache =
-        if (slot.model.prefix_cache) |p| p else null;
+        if (slot.prefix_cache) |p| p else null;
     const stream_opt: ?mlx.mlx_stream =
         if (slot.model.transformer) |x| x.s else null;
     // Record per-request metrics while slot fields are still live (before

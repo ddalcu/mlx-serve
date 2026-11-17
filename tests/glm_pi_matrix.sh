@@ -13,6 +13,7 @@
 # work/ (the agent's project), turn{1,2}.{out,err}, cell.json, outcome.json. Needs pi on PATH.
 # `max` maps pi's max level to reasoning_effort "max" in the generated models.json: the launch
 # config maps only `off`, so pi would otherwise clamp max to high.
+source "$(dirname "$0")/lib/server.sh"
 set -uo pipefail
 cd "$(dirname "$0")/.."
 REPO=$PWD
@@ -88,7 +89,7 @@ PY
 SERVER_PID=""
 stop() {
     [[ -n "$SERVER_PID" ]] && { kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null; SERVER_PID=""; }
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+    srv_preclean "$PORT"
 }
 trap stop EXIT
 

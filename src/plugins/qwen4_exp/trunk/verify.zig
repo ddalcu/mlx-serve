@@ -58,6 +58,8 @@ pub fn verifyRowsJoined(
         .gdn => *const LinearAttnWeights,
     },
 ) !?[]mlx.mlx_array {
+    // The joined projections read affine rows; an outside plugin's linears run per row.
+    if (self.outside != null) return null;
     if (inputs.len < 2 or inputs.len > 8) return null;
     var widths: [MAX_BATCH_ROWS]c_int = undefined;
     var total: c_int = 0;

@@ -604,6 +604,25 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
     }
 
+    /// Carry on a transcript that ends on a tool result (a scheduled run resumed after its approval): the model
+    /// answers the result itself, and no user message is added.
+    func resumeTurn(sessionId: UUID, config: TurnConfig,
+                    approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard Self.endsOnToolResult(session(sessionId)?.messages ?? []),
+              Self.canRunTurn(serverRunning: server.status == .running,
+                              apple: appState.useAppleModel) else { return }
+        stop(sessionId: sessionId)
+        let token = ledger.begin(session: sessionId)
+        publishTurnState()
+        runAgentTurn(sessionId: sessionId, text: nil, images: nil, audio: nil,
+                     config: config, token: token, approval: approval)
+    }
+
+    /// Whether the last message the MODEL will see is a tool result (display-only summaries aside).
+    nonisolated static func endsOnToolResult(_ messages: [ChatMessage]) -> Bool {
+        messages.last { !$0.isAgentSummary }?.toolCallId != nil
+    }
+
     /// Regenerate the last reply: drop the last user turn (and whatever
     /// followed it — the old assistant reply, any tool-call chain) and
     /// resubmit that same user text as a fresh turn. Reuses `runTurn` rather
@@ -841,15 +860,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     // MARK: - Agent mode (native tool calling)
 
-    private func runAgentTurn(sessionId: UUID, text: String,
+    /// - Parameter text: the user's message; nil resumes a transcript that already ends on a tool result.
+    private func runAgentTurn(sessionId: UUID, text: String?,
                               images: [ChatImage]?, videos: [ChatVideo]? = nil, audio: [ChatAudio]?,
                               config: TurnConfig, token: UUID,
                               approval: @escaping (APIClient.ToolCall) async -> Bool) {
-        var userMsg = ChatMessage(role: .user, content: text)
-        userMsg.images = images
-        userMsg.videos = videos
-        userMsg.audio = audio
-        appState.appendMessage(to: sessionId, message: userMsg)
+        if let text {
+            var userMsg = ChatMessage(role: .user, content: text)
+            userMsg.images = images
+            userMsg.videos = videos
+            userMsg.audio = audio
+            appState.appendMessage(to: sessionId, message: userMsg)
+        }
 
         let api = APIClient()
         let workDir = config.workingDirectory
@@ -965,7 +987,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 apple: appState.useAppleModel
             )
             let useServerPreprocess = wantsServerImagePreprocess
-            var history = AgentEngine.buildAgentHistory(
+            let history = AgentEngine.buildAgentHistory(
                 messages: session(sessionId)?.messages ?? [],
                 contextLength: contextLength,
                 maxTokens: turnMax,
@@ -1066,11 +1088,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
                     hasPersona: !config.systemPromptPrefix.isEmpty)
             }
-            var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
-            if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": AgentEngine.toolRoundNudge])
-            }
-            messages.append(contentsOf: history)
+            let messages = AgentEngine.requestMessages(systemPrompt: systemPrompt, history: history)
 
             AgentEngine.dumpDebugRequest(messages: messages, maxTokens: turnMax)
 

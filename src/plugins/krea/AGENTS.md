@@ -10,7 +10,7 @@ is assembled: `transformer_*.safetensors` + `text_encoder/` + `vae/` + `tokenize
 |---|---|
 | `config.zig` | MLX-free: claims (`krea*`), caps (variation when `vae/` holds the encoder), bills |
 | `plugin.zig` | the media table: the job (body via `sdk/media/image_request`), LoRA, PNG, the tiny pack |
-| `krea.zig` | `MixedLinear` (bf16 or affine, bits/group from geometry), encoder on `sdk/blocks/text_encoders/qwen3` (`.table`, bf16 −1), DiT on `sdk/bases/dit` (`Hooks`, adaLN `.plus_one(f32)`), VAE on `sdk/blocks/vae` (RMS 1e-12), schedule, ANE MLP seam, the engine |
+| `krea.zig` | linears on `sdk/blocks/dit/mixed_linear` (bf16 or affine, input cast to bf16), encoder on `sdk/blocks/text_encoders/qwen3` (`.table`, bf16 −1), DiT on `sdk/bases/dit` (`Hooks`, adaLN `.plus_one(f32)`), VAE on `sdk/blocks/vae` (RMS 1e-12), schedule, ANE MLP seam, the engine |
 
 ## Rules
 

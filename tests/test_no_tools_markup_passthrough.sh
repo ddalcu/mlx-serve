@@ -30,7 +30,7 @@ if [ ! -d "$MODEL" ]; then
 fi
 
 mkdir -p "$(dirname "$LOG")"
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 --ctx-size 8192 > "$LOG" 2>&1 &
 SERVER_PID=$!

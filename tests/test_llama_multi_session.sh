@@ -19,14 +19,14 @@ BASE="http://127.0.0.1:$PORT"
 [ -x "$BIN" ]   || { echo "fail: build mlx-serve first ($BIN)"; exit 1; }
 command -v jq >/dev/null || { echo "needs jq"; exit 1; }
 
-pkill -9 -f "mlx-serve.*port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 
 LOG="$(mktemp)"
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null
-    pkill -9 -f "mlx-serve.*port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     rm -f "$LOG"
 }
 trap cleanup EXIT INT TERM

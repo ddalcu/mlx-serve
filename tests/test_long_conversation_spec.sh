@@ -54,7 +54,7 @@ echo "  drafter: $([ "$USE_DRAFTER" = "1" ] && echo "$DRAFTER" || echo "(none)")
 echo "  turns:   $N_TURNS"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 LOGFILE=$(mktemp)

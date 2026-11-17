@@ -76,6 +76,8 @@ pub const LoadRequest = struct {
 
     load_vision: bool = false,
     warmup_eager: bool = true,
+    /// Mirrors `LoadParams.warmup_full`.
+    warmup_full: bool = false,
     draft_block_size: u32 = 4,
     draft_block_size_explicit: bool = false,
     kv_quant_config: kv_quant.KVQuantConfig = kv_quant.KVQuantConfig.dense,

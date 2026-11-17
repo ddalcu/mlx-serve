@@ -953,6 +953,7 @@ test "qsa visibility skip: bit-identical selection where it is an identity, and 
     const s = mlx.gpuStream();
 
     var t: Trunk = undefined;
+    t.outside = null;
 
     t.s = s;
     t.allocator = testing.allocator;

@@ -58,7 +58,7 @@ echo "  model:   $MODEL  (model_type=$TARGET_TYPE)"
 echo "  drafter: $([ "$USE_DRAFTER" = "1" ] && echo "$DRAFTER" || echo "(none)")"
 echo
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 
 LOGFILE=$(mktemp)

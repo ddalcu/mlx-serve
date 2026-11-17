@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 @testable import MLXCore
 
 /// `GET /v1/load-progress` as the app reads and words it (`LoadProgress`).
@@ -84,5 +85,42 @@ final class ModelListRefreshTests: XCTestCase {
         XCTAssertFalse(ServerManager.modelListMoved(seen: 5, reported: 5))
         XCTAssertFalse(ServerManager.modelListMoved(seen: nil, reported: 5))
         XCTAssertFalse(ServerManager.modelListMoved(seen: 5, reported: nil))
+    }
+}
+
+@MainActor
+final class LoadProgressPublishTests: XCTestCase {
+    /// The poll runs for as long as the server does, and `AppState` forwards every announcement to every view.
+    func testAReadingThatDidNotMoveAnnouncesNothing() {
+        let server = ServerManager()
+        var announced = 0
+        let watch = server.objectWillChange.sink { announced += 1 }
+        defer { watch.cancel() }
+        let loading = ["/m/a": LoadProgress(phase: .readingWeights, done: 1, total: 4, compiling: false, eta: nil)]
+
+        XCTAssertFalse(server.noteLoadProgress([:]))
+        XCTAssertEqual(announced, 0)
+        XCTAssertFalse(server.noteLoadProgress(loading))
+        XCTAssertFalse(server.noteLoadProgress(loading))
+        XCTAssertEqual(announced, 1)
+        XCTAssertTrue(server.noteLoadProgress([:]), "the last load ended")
+        XCTAssertEqual(announced, 2)
+        XCTAssertEqual(server.loadProgress, [:])
+    }
+
+    /// The pair state is read every ten seconds on a Mac that is not paired at all.
+    func testAPairStateThatDidNotMoveAnnouncesNothing() {
+        let server = ServerManager()
+        var announced = 0
+        let watch = server.objectWillChange.sink { announced += 1 }
+        defer { watch.cancel() }
+        let pair = ClusterInfo(mode: "rows", model: "H3", joined: true, planned: true, workerReady: true, layers: 0, here: 0)
+
+        server.noteCluster(nil)
+        XCTAssertEqual(announced, 0)
+        server.noteCluster(pair)
+        server.noteCluster(pair)
+        XCTAssertEqual(announced, 1)
+        XCTAssertEqual(server.cluster, pair)
     }
 }

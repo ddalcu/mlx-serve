@@ -10,14 +10,11 @@ struct WelcomeRecommendation: Equatable {
     /// One plain-English line on why this pick fits, naming the RAM.
     let rationale: String
 
-    private static let bytesPerGiB: Double = 1_073_741_824
-
-    static func forPhysicalMemory(bytes: UInt64) -> WelcomeRecommendation {
-        let gib = Double(bytes) / bytesPerGiB
-        let text = formatMemory(gib)
+    static func forMemory(_ memory: SystemMemoryInfo) -> WelcomeRecommendation {
+        let text = formatMemory(memory.totalGB)
         return WelcomeRecommendation(
             memoryText: text,
-            pick: RecommendedModelPick.starterPick(physicalMemoryBytes: bytes),
+            pick: RecommendedModelPick.starterPick(memory: memory),
             rationale: rationale(memoryText: text)
         )
     }

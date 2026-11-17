@@ -117,7 +117,7 @@ final class VoiceModeControllerTests: XCTestCase {
 
     private func make() -> (VoiceModeController, FakeRecognizer, FakeSynth) {
         let rec = FakeRecognizer(); let syn = FakeSynth()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, chime: FakeWakeChime())
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, loadingCue: FakeCue(), chime: FakeWakeChime())
         c.requireWakeWord = false
         return (c, rec, syn)
     }
@@ -126,7 +126,7 @@ final class VoiceModeControllerTests: XCTestCase {
     /// `bind(appState:)` does in production.
     private func makeRunnable() -> (VoiceModeController, FakeRecognizer, FakeSynth, FakeRunner, UUID) {
         let rec = FakeRecognizer(); let syn = FakeSynth(); let runner = FakeRunner()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, chime: FakeWakeChime())
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, loadingCue: FakeCue(), chime: FakeWakeChime())
         c.requireWakeWord = false
         let sid = UUID()
         c.runner = runner
@@ -139,7 +139,7 @@ final class VoiceModeControllerTests: XCTestCase {
     private func makeTimed() -> (VoiceModeController, FakeRecognizer, FakeSynth, FakeRunner, FakeFollowUpTimer) {
         let rec = FakeRecognizer(); let syn = FakeSynth(); let runner = FakeRunner(); let timer = FakeFollowUpTimer()
         let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices,
-                                    followUpTimer: timer, chime: FakeWakeChime())
+                                    loadingCue: FakeCue(), followUpTimer: timer, chime: FakeWakeChime())
         c.requireWakeWord = true
         c.runner = runner
         c.turnContext = { (UUID(), nil) }
@@ -150,7 +150,7 @@ final class VoiceModeControllerTests: XCTestCase {
     /// audible "Hey Loki" acknowledgement.
     private func makeChimed() -> (VoiceModeController, FakeRecognizer, FakeRunner, FakeWakeChime) {
         let rec = FakeRecognizer(); let syn = FakeSynth(); let runner = FakeRunner(); let chime = FakeWakeChime()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, chime: chime)
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, loadingCue: FakeCue(), chime: chime)
         c.requireWakeWord = true
         c.runner = runner
         c.turnContext = { (UUID(), nil) }
@@ -276,7 +276,7 @@ final class VoiceModeControllerTests: XCTestCase {
     /// A controller whose chat model hears the recording itself (LFM3-Audio / Omni).
     private func makeHearing() -> (VoiceModeController, FakeRecognizer, FakeSynth, FakeRunner) {
         let rec = FakeRecognizer(); let syn = FakeSynth(); let runner = FakeRunner()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, chime: FakeWakeChime())
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, loadingCue: FakeCue(), chime: FakeWakeChime())
         c.requireWakeWord = false
         c.runner = runner
         c.turnContext = { (UUID(), nil) }
@@ -305,7 +305,7 @@ final class VoiceModeControllerTests: XCTestCase {
     func testChatVoiceNeedsNoWakeWord() async {
         let rec = FakeRecognizer(); let runner = FakeRunner()
         let c = VoiceModeController(recognizer: rec, synthesizer: FakeSynth(), voices: Self.testVoices,
-                                    chime: FakeWakeChime(), chatMode: true)
+                                    loadingCue: FakeCue(), chime: FakeWakeChime(), chatMode: true)
         c.requireWakeWord = true
         c.runner = runner
         c.turnContext = { (UUID(), nil) }
@@ -315,7 +315,7 @@ final class VoiceModeControllerTests: XCTestCase {
 
     func testChatVoiceNeverAsksForTheWakeWord() {
         let c = VoiceModeController(recognizer: FakeRecognizer(), synthesizer: FakeSynth(), voices: Self.testVoices,
-                                    chime: FakeWakeChime(), chatMode: true)
+                                    loadingCue: FakeCue(), chime: FakeWakeChime(), chatMode: true)
         c.requireWakeWord = true
         XCTAssertEqual(c.listeningPrompt, "Listening…")
     }
@@ -572,7 +572,7 @@ final class VoiceModeControllerTests: XCTestCase {
         // A fresh controller with no stored preference requires the wake word.
         UserDefaults.standard.removeObject(forKey: "voiceModeRequireWakeWord")
         let rec = FakeRecognizer(); let syn = FakeSynth()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices)
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, loadingCue: FakeCue(), chime: FakeWakeChime())
         XCTAssertTrue(c.requireWakeWord)
     }
 
@@ -832,7 +832,7 @@ final class VoiceModeControllerTests: XCTestCase {
     func testDefaultsToHighestQualityVoice() {
         UserDefaults.standard.removeObject(forKey: "voiceModeVoiceId")
         let rec = FakeRecognizer(); let syn = FakeSynth()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices)
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, loadingCue: FakeCue(), chime: FakeWakeChime())
         XCTAssertEqual(c.selectedVoiceId, "premium")          // not the robotic compact voice
         XCTAssertEqual(syn.voiceIdentifier, "premium")
         XCTAssertEqual(c.availableVoices.first?.id, "premium")
@@ -841,7 +841,7 @@ final class VoiceModeControllerTests: XCTestCase {
     func testSelectVoiceAppliesAndPersists() {
         UserDefaults.standard.removeObject(forKey: "voiceModeVoiceId")
         let rec = FakeRecognizer(); let syn = FakeSynth()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices)
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, loadingCue: FakeCue(), chime: FakeWakeChime())
         c.selectVoice("compact")
         XCTAssertEqual(c.selectedVoiceId, "compact")
         XCTAssertEqual(syn.voiceIdentifier, "compact")
@@ -850,7 +850,7 @@ final class VoiceModeControllerTests: XCTestCase {
 
     func testPreviewPausesMicAndResumesOnDrain() async {
         let rec = FakeRecognizer(); let syn = FakeSynth()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices)
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, loadingCue: FakeCue(), chime: FakeWakeChime())
         _ = await c.begin()                                   // listening
         let startsBefore = rec.startCount
         let stopsBefore = rec.stopCount
@@ -908,7 +908,7 @@ final class VoiceModeControllerTests: XCTestCase {
 
     func testSelectingVoiceWhileSpeakingDoesNotPreview() async {
         let rec = FakeRecognizer(); let syn = FakeSynth()
-        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices)
+        let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, loadingCue: FakeCue(), chime: FakeWakeChime())
         c.requireWakeWord = false
         _ = await c.begin()
         rec.onFinalTranscript?("hi")

@@ -49,3 +49,10 @@ pub fn forward(w: *const moe.Moe.Weights, s: mlx.mlx_stream, x: Array) !Array {
     defer g.deinit();
     return g.escape(try moe.mlp(w, &g, x));
 }
+
+/// `forward` with each row given its own one-row call's bytes (`moe.mlpRows`).
+pub fn forwardRows(w: *const moe.Moe.Weights, s: mlx.mlx_stream, x: Array) !Array {
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    return g.escape(try moe.mlpRows(w, &g, x));
+}

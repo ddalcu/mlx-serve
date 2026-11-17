@@ -224,6 +224,11 @@ fn midBlock(t: *sdk.tensors.Tensors, comptime side: []const u8, c: u64) !void {
 /// of one double and one single block (inner 128, one 128-wide head), and the VAE at 64 channels with its encoder.
 /// A 256x256 canvas is 16x16 latent tokens beside the 512 text tokens.
 pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
+    return fixtureOf(a, false);
+}
+
+/// `dense`: the same weights as a bf16 build stores them (no affine triple anywhere).
+fn fixtureOf(a: std.mem.Allocator, dense: bool) !sdk.fixture.Fixture {
     const T = sdk.tensors.Tensors;
     const te_h = 64;
     const hd = 32;
@@ -287,6 +292,7 @@ pub fn conformanceFixture(a: std.mem.Allocator) !sdk.fixture.Fixture {
     try midBlock(&vae, "encoder", c);
     try conv(&vae, "encoder.conv_out", .{}, 64, 3, c);
     try conv(&vae, "quant_conv", .{}, 64, 1, 64);
+    if (dense) for ([_]*T{ &te, &dit, &vae }) |t| try t.affineToDense(4, 64);
 
     return .{
         .files = try a.dupe(sdk.fixture.File, &.{
@@ -347,6 +353,28 @@ test "flux2: a job on the tiny pack is a 256x256 PNG; an edit keeps the referenc
 
     const bad = (try pack.run("{\"prompt\":\"a\",\"cond_weights\":[1,2]}")).refused;
     try testing.expect(bad.code == .unsupported);
+}
+
+test "flux2: a bf16 pack (dense linears and embed table) loads and draws what its affine twin draws" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var images: [2]mlx.mlx_array = undefined;
+    for (&images, [_]bool{ false, true }) |*image, dense| {
+        var pack = try MediaPack(@This()).openFixture(a, try fixtureOf(a, dense));
+        defer pack.close();
+        const e: *Engine = @ptrCast(@alignCast(pack.engine));
+        image.* = try e.f.generateImage(a, "a red cat", 256, 256, 3, 2, .{}, null);
+        try mlx.check(mlx.mlx_array_eval(image.*));
+    }
+    defer for (images) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const diff = try @import("../../sdk/testing/parity.zig").maxAbsDiffF32(images[0], images[1], s);
+    std.debug.print("flux2 bf16 twin: max |affine - dense| = {d:.5}\n", .{diff});
+    try testing.expect(diff < 0.1);
 }
 
 test "flux2: the tiny pack's pipeline (CFG, cond rebalance, an edit) is bit-equal to its golden run" {

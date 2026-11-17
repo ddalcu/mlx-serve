@@ -42,7 +42,7 @@ if [ ! -x "$BINARY" ]; then
 fi
 
 LOGFILE=$(mktemp)
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null || true
+srv_preclean "$PORT"
 sleep 1
 "$BINARY" --model "$MODEL" --serve --port "$PORT" > "$LOGFILE" 2>&1 &
 SERVER_PID=$!

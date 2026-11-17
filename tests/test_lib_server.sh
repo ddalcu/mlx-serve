@@ -1,7 +1,8 @@
 #!/bin/bash
 # Hermetic tests for tests/lib/server.sh and its Python twin tests/lib/server.py: the /health wait
-# (200 ready, 503 loading keeps waiting, a dead pid stops it), the log-line wait, and srv_stop.
-# Python stub servers on ports 11391-11392, no model, no mlx-serve binary.
+# (200 ready, 503 loading keeps waiting, a dead pid stops it), the log-line wait, srv_stop and srv_preclean.
+# Python stub servers on ports 11391-11392 and `nc` listeners named mlx-serve on 11394-11396; no model, no mlx-serve
+# binary.
 #
 # Run: bash tests/test_lib_server.sh   (a failure means a helper's verdict changed; every live script inherits it)
 set -u
@@ -63,6 +64,27 @@ echo "── srv_stop ──"
 srv_stop "$LIVE"; kill -0 "$LIVE" 2>/dev/null; ok "the server is gone" "$?" 1
 srv_stop ""; ok "an empty pid is a no-op" "$?" 0
 bash -c "set -e; source lib/server.sh; trap 'srv_stop $DEAD' EXIT; true"; ok "an EXIT trap under set -e keeps the exit status on a reaped pid" "$?" 0
+
+echo "── srv_preclean ──"
+ln -s "$(command -v nc)" "$TMP/mlx-serve"
+listener() { # listener <dir to start in> <program> <port>: sets L to its pid once it listens
+    ( cd "$1" && exec "$2" -l 127.0.0.1 "$3" ) & L=$!; STUBS+=($L)
+    for _ in $(seq 1 50); do lsof -nP -tiTCP:"$3" -sTCP:LISTEN >/dev/null 2>&1 && return 0; sleep 0.1; done
+    echo "FAIL: no listener on $3"; exit 1
+}
+alive() { kill -0 "$1" 2>/dev/null && echo alive || echo gone; }
+listener "$PWD" "$TMP/mlx-serve" 11394; OURS=$L
+listener "$PWD" "$TMP/mlx-serve" 11395; OTHER_PORT=$L
+listener "$TMP" "$TMP/mlx-serve" 11396; FOREIGN=$L
+( srv_preclean 11394 ); ok "a leftover server on the port is cleared" "$?" 0
+ok "the leftover is gone" "$(alive "$OURS")" gone
+ok "a server on another port survives" "$(alive "$OTHER_PORT")" alive
+( srv_preclean 1139 ); ok "a free port is a no-op" "$?" 0
+ok "a server on a port this one prefixes survives" "$(alive "$OTHER_PORT")" alive
+( srv_preclean 11396 ) 2>/dev/null; ok "a server started outside the checkout is refused" "$?" 1
+ok "and is left running" "$(alive "$FOREIGN")" alive
+( srv_preclean 11391 ) 2>/dev/null; ok "a listener that is not mlx-serve is refused" "$?" 1
+curl -s -m 1 "$OK_URL/health" >/dev/null; ok "and is left running" "$?" 0
 
 echo "── lib/server.py ──"
 py() { python3 -c "

@@ -20,7 +20,7 @@ BIN="${BIN:-./zig-out/bin/mlx-serve}"
 
 run_arm() {
   local val="$1" out="$2"
-  pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+  srv_preclean "$PORT"
   sleep 2
   if [ -n "$val" ]; then
     env "$VAR=$val" "$BIN" --model "$MODEL" --serve --port "$PORT" >/tmp/greedy-ab-$PORT.log 2>&1 &

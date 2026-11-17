@@ -4,8 +4,7 @@
 //! rounds it): msv_attn_p256 (causal, band, QSA mask, MiMo's 192/128 with sinks, and the carried-state chunk
 //! passes), the decode windows (row_attn and lane_attn: partial, tail, merge), the packed-KV kernels (dec, verify,
 //! the matmul2d page kernel) and the NAX prefill kernel (one pass, key-range passes, the int8 Q/K entry). Rows are
-//! KV heads. M1 and up but the tensor-unit kernels (M4 / M5, declared per launch). Known issue:
-//! msv_nax_attn_256_q8's scale inputs (`q8_scales_known`).
+//! KV heads. M1 and up but the tensor-unit kernels (M4 / M5, declared per launch).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -2696,11 +2695,6 @@ const NaxAttn = struct {
     }
 };
 
-/// The int8 entry's two scale inputs share one template parameter, but MLX binds an input under 8 elements in the
-/// constant address space and a larger one in device: when one of the Q tile scales (B x H x tiles) and the K block
-/// scales (B x Hkv x blocks) is under 8 and the other is not, the instantiation does not compile.
-const q8_scales_known = spec.Known{ .gate = .shapes, .finding = "msv_nax_attn_256_q8 does not compile when exactly one of its scale inputs has under 8 elements (qs = H x q tiles, ks = Hkv x key blocks): MLX binds that one `constant`, the other `device`, and `attention_nax_bdv_qt` takes both as one ScalePtr. 8 q / 2 kv heads (Qwen3.5-2B) at a 64-token first prefill: qs 8, ks 4, MLX error; also 4 q / 1 kv heads (Gemma 3 1B) at 64..127 rows past 224 cached keys. Opt-in (--int8-qk), M5 only" };
-
 fn naxSpec(comptime name: []const u8, cfg: NaxCfg, served: []const Shape) spec.Spec {
     return .{
         .name = name,
@@ -2711,7 +2705,6 @@ fn naxSpec(comptime name: []const u8, cfg: NaxCfg, served: []const Shape) spec.S
         .tiles = .{ .{}, .{ .size = if (cfg.q8 or cfg.phase == .single) 64 else 32, .min = 9 }, .{ .size = NAX_BK, .min = 9 } },
         .served = served,
         .sums = .{ .exact = false },
-        .known = if (cfg.q8) q8_scales_known else null,
     };
 }
 

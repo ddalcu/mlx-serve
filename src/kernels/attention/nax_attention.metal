@@ -100,7 +100,8 @@ template <
     typename StridePtr,
     typename SinkPtr,
     typename StatePtr,
-    typename ScalePtr>
+    typename QScalePtr,
+    typename KScalePtr>
 METAL_FUNC void attention_nax_bdv_qt(
     const device T* Q,
     const device T* K,
@@ -119,8 +120,8 @@ METAL_FUNC void attention_nax_bdv_qt(
     uint3 tid,
     const device QT* Qq,
     const device QT* Kq,
-    ScalePtr q_scale,
-    ScalePtr k_scale) {
+    QScalePtr q_scale,
+    KScalePtr k_scale) {
   ulong3 tidl{tid.x, tid.y, tid.z};
   // int8 Q / K (SageAttention): row-contiguous [B, H, qL, BD] / [B, Hkv, kL,
   // BD] copies; scores accumulate in int32 and are scaled by the Q tile's and

@@ -133,6 +133,38 @@ with tempfile.TemporaryDirectory(prefix='mlx-generation-defaults-') as home:
                     check(bool(lines) and all('thinking=false' in line for line in lines),
                           f'{route} stream={stream}: forced effort none beats unforced thinking on')
             write(global_file, {
+                'temperature': {'value': 0},
+                'max_tokens': {'value': 8},
+                'enable_thinking': {'value': True},
+                'reasoning_effort': {'value': 'low'},
+            })
+            write(model_file, {str(model): {'generation_defaults': {'enable_thinking': {'value': False}}}})
+            silent = [
+                ('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message, 'stream_options': {'include_usage': True}}),
+                ('/v1/messages', {'model': 'mlx-serve', 'messages': message, 'max_tokens': 8}),
+                ('/v1/responses', {'model': 'mlx-serve', 'input': message}),
+            ]
+            for route, body in silent:
+                for stream in (False, True):
+                    start = len(log_path.read_text())
+                    post(route, {**body, 'stream': stream})
+                    lines = [line for line in log_path.read_text()[start:].splitlines()
+                             if f'POST {route} (' in line]
+                    check(bool(lines) and all('thinking=false' in line for line in lines),
+                          f'{route} stream={stream}: model thinking off beats an inherited effort default')
+            start = len(log_path.read_text())
+            post('/v1/chat/completions', {'model': 'mlx-serve', 'messages': message, 'enable_thinking': True})
+            check('thinking=true' in log_path.read_text()[start:], 'client enable_thinking still beats the thinking-off default')
+            write(global_file, {'temperature': {'value': 0}, 'max_tokens': {'value': 8}, 'enable_thinking': {'value': False}})
+            write(model_file, {str(model): {'generation_defaults': {'reasoning_effort': {'value': 'high'}}}})
+            for route, body in silent:
+                start = len(log_path.read_text())
+                post(route, body)
+                lines = [line for line in log_path.read_text()[start:].splitlines() if f'POST {route} (' in line]
+                check(bool(lines) and all('thinking=true' in line for line in lines),
+                      f'{route}: model effort high beats an inherited thinking-off default')
+            write(model_file, {})
+            write(global_file, {
                 'temperature': {'value': 0.25},
                 'max_tokens': {'value': 2, 'ignore_client': True},
             })

@@ -279,6 +279,49 @@ pub fn mtpChainBuildBatched(gens: []const *Generator, chains: []MtpPreDraft, fro
     }
 }
 
+/// The mask of a group's batched draft readout. Rows of one group may
+/// differ in `suppress_cjk`, so differing masks go per row, `[N,1,V]`.
+const GroupMask = struct {
+    arr: ?mlx.mlx_array = null,
+    owned: bool = false,
+
+    fn of(gens: []const *Generator) !GroupMask {
+        const m0 = gens[0].sampling.suppress_mask;
+        const same = for (gens[1..]) |g| {
+            const m = g.sampling.suppress_mask;
+            if ((m == null) != (m0 == null)) break false;
+            if (m != null and m.?.ctx != m0.?.ctx) break false;
+        } else true;
+        if (same) return .{ .arr = m0 };
+        const s = gens[0].xfm.s;
+        var vocab: c_int = 0;
+        for (gens) |g| {
+            if (g.sampling.suppress_mask) |m| {
+                vocab = mlx.getShape(m)[0];
+                break;
+            }
+        }
+        var open = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(open);
+        try mlx.check(mlx.mlx_zeros(&open, &[_]c_int{vocab}, 1, .bool_, s));
+        var rows: [32]mlx.mlx_array = undefined;
+        for (gens, 0..) |g, k| rows[k] = g.sampling.suppress_mask orelse open;
+        const vec = mlx.mlx_vector_array_new_data(rows[0..gens.len].ptr, gens.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var stacked = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(stacked);
+        try mlx.check(mlx.mlx_stack_axis(&stacked, vec, 0, s));
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_reshape(&out, stacked, &[_]c_int{ @intCast(gens.len), 1, vocab }, 3, s));
+        return .{ .arr = out, .owned = true };
+    }
+
+    fn deinit(self: GroupMask) void {
+        if (self.owned) _ = mlx.mlx_array_free(self.arr.?);
+    }
+};
+
 /// One draft step for a group whose rerank rows include sampled chains:
 /// per-row shortlists off ONE coarse readout, then one batched proposal
 /// over the rows that sample this depth when they share a sampler and none
@@ -294,7 +337,9 @@ pub fn mtpGroupSampledDrafts(
     const s = xfm.s;
     const n = gens.len;
     var shortlists: [32]mtp_mod.Shortlist = undefined;
-    const have = try gens[0].mtp.?.draftShortlistsBatched(xfm, stacked_x, gens[0].sampling.suppress_mask, shortlists[0..n]);
+    const mask = try GroupMask.of(gens);
+    defer mask.deinit();
+    const have = try gens[0].mtp.?.draftShortlistsBatched(xfm, stacked_x, mask.arr, shortlists[0..n]);
     if (!have) {
         // No coarse head: every row proposes greedily and hands the verify
         // the one-hot q that proposal really has.
@@ -411,7 +456,9 @@ pub fn mtpChainBuildLanes(gens: []const *Generator, chains: []MtpPreDraft, from:
         if (any_sampled) {
             try mtpGroupSampledDrafts(gens, chains, stacked_x, i);
         } else {
-            const ids = try head.draftSelectBatched(xfm, stacked_x, gens[0].sampling.suppress_mask);
+            const mask = try GroupMask.of(gens);
+            defer mask.deinit();
+            const ids = try head.draftSelectBatched(xfm, stacked_x, mask.arr);
             defer _ = mlx.mlx_array_free(ids);
             for (chains, 0..) |*c, k| {
                 c.draft_arrs[i] = try Transformer.axisView(s, ids, 0, k);
@@ -533,7 +580,9 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
             if (any_sampled) {
                 try mtpGroupSampledDrafts(gens, chains, stacked_x, i);
             } else {
-                const ids = try modules.call("qwen4_draft_select_batched", .{ xfm, stacked_x, gens[0].sampling.suppress_mask });
+                const mask = try GroupMask.of(gens);
+                defer mask.deinit();
+                const ids = try modules.call("qwen4_draft_select_batched", .{ xfm, stacked_x, mask.arr });
                 defer _ = mlx.mlx_array_free(ids);
                 for (chains, 0..) |*c, k| {
                     const k_c: c_int = @intCast(k);
@@ -570,4 +619,40 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
             }
         }
     }
+}
+
+// ── tests ──
+
+const testing = std.testing;
+
+test "GroupMask: a shared mask stays one handle, differing rows stack to [N,1,V]" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    const a_data = [_]bool{ true, false, false, false };
+    const b_data = [_]bool{ false, true, true, false };
+    const a = mlx.mlx_array_new_data(&a_data, &[_]c_int{4}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(a);
+    const b = mlx.mlx_array_new_data(&b_data, &[_]c_int{4}, 1, .bool_);
+    defer _ = mlx.mlx_array_free(b);
+    var g: [3]Generator = undefined;
+    for (&g) |*x| x.xfm = &xfm;
+    g[0].sampling = .{ .suppress_mask = a };
+    g[1].sampling = .{ .suppress_mask = a };
+    g[2].sampling = .{};
+    const same = try GroupMask.of(&[_]*Generator{ &g[0], &g[1] });
+    defer same.deinit();
+    try testing.expect(!same.owned and same.arr.?.ctx == a.ctx);
+    g[1].sampling = .{ .suppress_mask = b };
+    const mixed = try GroupMask.of(&[_]*Generator{ &g[0], &g[1], &g[2] });
+    defer mixed.deinit();
+    try testing.expect(mixed.owned);
+    try testing.expectEqualSlices(c_int, &.{ 3, 1, 4 }, mlx.getShape(mixed.arr.?));
+    var rows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_astype(&rows, mixed.arr.?, .int32, s));
+    try mlx.check(mlx.mlx_array_eval(rows));
+    const got = mlx.mlx_array_data_int32(rows) orelse return error.MlxArrayDataNull;
+    try testing.expectEqualSlices(i32, &.{ 1, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0 }, got[0..12]);
 }

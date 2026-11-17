@@ -25,7 +25,7 @@ bad() { echo -e "  ${RED}FAIL${NC} $1"; shift; for l in "$@"; do echo "        $
 [ -x ./zig-out/bin/mlx-serve ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
 
 LOG=$(mktemp /tmp/hot_switch.XXXXXX)
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
+srv_preclean "$PORT"
 ./zig-out/bin/mlx-serve serve --port "$PORT" --host 127.0.0.1 --model-dir "$ROOT" \
     --log-level debug > "$LOG" 2>&1 &
 SERVER_PID=$!

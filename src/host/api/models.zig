@@ -13,6 +13,7 @@ const mlx_engine = @import("../engines/mlx.zig");
 const log = @import("../../sdk/util/log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const model_discovery = @import("../registry/discovery.zig");
+const stubMeta = @import("../registry/stub_cache.zig").stubMeta;
 const model_settings_mod = @import("../registry/model_settings.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
 const gguf_files = @import("../../sdk/quant/gguf/files.zig");
@@ -320,7 +321,7 @@ pub fn renderModelEntry(
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
-            if (mtp_loaded or model_discovery.readStubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
+            if (mtp_loaded or stubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
             if (config.rowExactDecode()) "true" else "false",
             configuredKvQuantFor(config).wireName(),
             gen_temp_str,
@@ -354,8 +355,7 @@ pub fn renderModelEntry(
     defer if (err_part.len > 0) allocator.free(err_part);
     // Stub metadata sourced from config.json (+ chat-template presence) WITHOUT
     // faulting in weights: dims, context window, MoE-ness, and capabilities.
-    // `/v1/models` isn't hot, so reading a small JSON per unloaded entry is fine.
-    const sm = model_discovery.readStubMeta(io, allocator, entry.path);
+    const sm = stubMeta(io, allocator, entry.path);
 
     // Capabilities. Encoder-only models advertise "embeddings"; chat models get
     // chat/tool_use/streaming/json_schema (gated on chat-template presence, the
@@ -378,7 +378,7 @@ pub fn renderModelEntry(
     const gguf_context = if (is_gguf_stub) ggufContextCap(io, entry) else 0;
     const native_context = if (gguf_context > 0) gguf_context else if (sm.found) sm.max_position_embeddings else 0;
     const stub_context = if (gguf_context == 0 and sm.found)
-        advertisedStubContext(native_context, http_server.manualContextFor(request_model.g_model_aliases.ctxSizeFor(io, entry.path)))
+        advertisedStubContext(native_context, http_server.manualContextFor(request_model.g_model_aliases.ctxSizeFor(io, .{ .path = entry.path, .real = entry.real_path })))
     else
         native_context;
     // Native media-gen stub (image/audio/video) — advertise the modality from
@@ -552,7 +552,7 @@ pub fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: 
             if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
             const json = try renderModelEntry(allocator, io, entry);
             defer allocator.free(json);
-            try appendAliasedRow(allocator, &entries_buf, json, request_model.g_model_aliases.aliasForPath(io, entry.path, &alias_buf));
+            try appendAliasedRow(allocator, &entries_buf, json, request_model.g_model_aliases.aliasForPath(io, .{ .path = entry.path, .real = entry.real_path }, &alias_buf));
         }
     }
 

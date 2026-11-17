@@ -730,11 +730,47 @@ pub const RerankCoarse = struct {
     bits: u32,
     group_size: u32,
     rows: c_int,
+    /// The head's rows at `RERANK_EXACT_BITS`/gs64 for the re-score, where its own cannot be gathered (an outside
+    /// quant plugin's head); null: the target head's own rows.
+    exact: ?QLinear = null,
 
     pub fn deinit(self: *RerankCoarse) void {
         self.q.deinit();
+        if (self.exact) |*e| e.deinit();
     }
 };
+
+/// Width of the re-score copy of a head whose own rows cannot be gathered.
+pub const RERANK_EXACT_BITS: u32 = 8;
+
+/// `buildRerankCoarse` over a head given as its dense `[V, H]` rows (an outside quant plugin's head, which stores no
+/// rows MLX reads): the coarse copy plus the re-score copy (`exact`). Infallible as `buildRerankCoarse`.
+pub fn buildRerankCoarseRows(s: mlx.mlx_stream, rows: mlx.mlx_array, bits: u32) ?RerankCoarse {
+    if (bits == 0 or bits >= RERANK_EXACT_BITS) return null;
+    const shape = mlx.getShape(rows);
+    if (shape.len != 2 or shape[0] < TOP32_MIN_ROWS) return null;
+    const had_error = mlx.errorPending();
+    var parts: [2]QLinear = undefined;
+    var built: usize = 0;
+    for (&parts, [_]u32{ bits, RERANK_EXACT_BITS }) |*p, b| {
+        p.* = requantizeRows(s, rows, .{ .ctx = null }, .{ .ctx = null }, 0, 16, "affine", RERANK_COARSE_GROUP, b, 32768) catch |err| {
+            for (parts[0..built]) |*q| q.deinit();
+            mlx.dropLatchedErrorUnless(had_error);
+            log.warn("[mtp] draft rerank coarse build failed ({s}) - keeping the full-readout path\n", .{@errorName(err)});
+            return null;
+        };
+        built += 1;
+        const vec = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ p.w, p.s, p.b }, 3);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        mlx.check(mlx.mlx_eval(vec)) catch {
+            for (parts[0..built]) |*q| q.deinit();
+            mlx.dropLatchedErrorUnless(had_error);
+            log.warn("[mtp] draft rerank coarse eval failed - keeping the full-readout path\n", .{});
+            return null;
+        };
+    }
+    return .{ .q = parts[0], .bits = bits, .group_size = RERANK_COARSE_GROUP, .rows = shape[0], .exact = parts[1] };
+}
 
 /// The coarse readout head: a low-bit/gs64 requantized copy of the target's
 /// lm_head, materialized so the first draft does not pay for it. Infallible —
@@ -803,10 +839,8 @@ pub fn maskAndArgmax(s: mlx.mlx_stream, logits_in: mlx.mlx_array, suppress_mask:
     defer _ = mlx.mlx_array_free(logits);
     try mlx.check(mlx.mlx_array_set(&logits, logits_in));
     if (suppress_mask) |m| {
-        const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-        defer _ = mlx.mlx_array_free(neg_inf);
         var masked = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits, s));
+        try maskRows(s, &masked, m, logits);
         _ = mlx.mlx_array_free(logits);
         logits = masked;
     }
@@ -869,12 +903,26 @@ fn rerankMaskCoarse(s: mlx.mlx_stream, logits: *mlx.mlx_array, suppress_mask: ?m
     // The mask goes on the COARSE row: a reserved id that never enters the
     // shortlist cannot be re-scored back into the draft.
     const m = suppress_mask orelse return;
-    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
-    defer _ = mlx.mlx_array_free(neg_inf);
     var masked = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_where(&masked, m, neg_inf, logits.*, s));
+    try maskRows(s, &masked, m, logits.*);
     _ = mlx.mlx_array_free(logits.*);
     logits.* = masked;
+}
+
+/// `where(mask, -inf, logits)`. A group's per-row mask is `[N,1,V]`; against a
+/// 2-D `[N,V]` readout it must drop its middle axis, or broadcasting pairs
+/// every row with every row's mask.
+fn maskRows(s: mlx.mlx_stream, out: *mlx.mlx_array, mask: mlx.mlx_array, logits: mlx.mlx_array) !void {
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+    const msh = mlx.getShape(mask);
+    if (msh.len == 3 and mlx.getShape(logits).len == 2) {
+        var rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows);
+        try mlx.check(mlx.mlx_reshape(&rows, mask, &[_]c_int{ msh[0], msh[2] }, 2, s));
+        return mlx.check(mlx.mlx_where(out, rows, neg_inf, logits, s));
+    }
+    try mlx.check(mlx.mlx_where(out, mask, neg_inf, logits, s));
 }
 
 /// The exact re-scored shortlist behind every rerank draft: the coarse head's
@@ -919,7 +967,9 @@ fn rerankShortlistRow(
     // [V, K/gs]), so a 32-row quantized matmul is exact; dense rows are a plain matmul.
     var w32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(w32);
-    if (target.lm_head_s.ctx == null) {
+    // A head whose own rows cannot be gathered re-scores on its copy.
+    const copy = coarse.*.?.exact;
+    if (copy == null and target.lm_head_s.ctx == null) {
         try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
         var wt = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(wt);
@@ -929,15 +979,16 @@ fn rerankShortlistRow(
         try mlx.check(mlx.mlx_matmul(&dense, x_row, wt, s));
         return .{ .cands = cands, .exact = dense, .rows = rows };
     }
-    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    const head: QLinear = copy orelse .{ .w = target.lm_head_w, .s = target.lm_head_s, .b = target.lm_head_b };
+    const qp: params_mod.QuantParams = if (copy != null) .{ .bits = RERANK_EXACT_BITS, .group_size = RERANK_COARSE_GROUP, .mode = .affine } else headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
     var s32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(s32);
     var b32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(b32);
-    try mlx.check(mlx.mlx_take_axis(&w32, target.lm_head_w, cands, 0, s));
-    try mlx.check(mlx.mlx_take_axis(&s32, target.lm_head_s, cands, 0, s));
-    if (target.lm_head_b.ctx != null)
-        try mlx.check(mlx.mlx_take_axis(&b32, target.lm_head_b, cands, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&w32, head.w, cands, 0, s));
+    try mlx.check(mlx.mlx_take_axis(&s32, head.s, cands, 0, s));
+    if (head.b.ctx != null)
+        try mlx.check(mlx.mlx_take_axis(&b32, head.b, cands, 0, s));
 
     var exact = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(exact);
@@ -4789,4 +4840,36 @@ test "mtpCtxWithinLimit: 0 is unlimited and the ceiling is inclusive" {
 
     try testing.expect(mtpCtxWithinLimit(1, 1));
     try testing.expect(!mtpCtxWithinLimit(1, 2));
+}
+
+test "mtp: the coarse head's bytes at 3 bits on GLM-5.3-Flash's and Ling-3.1-flash's heads" {
+    try std.testing.expectEqual(@as(u64, 277_544_960), rerankCoarseBytes(154_880, 4096, DRAFT_HEAD_BITS));
+    try std.testing.expectEqual(@as(u64, 281_673_728), rerankCoarseBytes(157_184, 4096, DRAFT_HEAD_BITS));
+}
+
+test "mtp: a head given as its dense rows builds the coarse head and an 8-bit re-score copy of the same rows" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const rows: usize = @intCast(TOP32_MIN_ROWS);
+    const cols: usize = 64;
+    var prng = std.Random.DefaultPrng.init(3);
+    const buf = try testing.allocator.alloc(f32, rows * cols);
+    defer testing.allocator.free(buf);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+    const dense = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ @intCast(rows), @intCast(cols) }, 2, .float32);
+    defer _ = mlx.mlx_array_free(dense);
+    var rc = buildRerankCoarseRows(s, dense, DRAFT_HEAD_BITS).?;
+    defer rc.deinit();
+    try testing.expectEqual(DRAFT_HEAD_BITS, rc.bits);
+    try testing.expectEqual(@as(c_int, @intCast(rows)), rc.rows);
+    try testing.expectEqualSlices(c_int, &.{ @intCast(rows), @intCast(cols * DRAFT_HEAD_BITS / 32) }, mlx.getShape(rc.q.w));
+    const exact = rc.exact.?;
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    try mlx.check(mlx.mlx_dequantize(&deq, exact.w, exact.s, exact.b, mlx.mlx_optional_int.some(@intCast(RERANK_COARSE_GROUP)), mlx.mlx_optional_int.some(@intCast(RERANK_EXACT_BITS)), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(deq));
+    // 8 bits over a gs64 range of normals: within a few hundredths of the bf16 rows.
+    for (mlx.mlx_array_data_float32(deq).?[0..cols], buf[0..cols]) |got, want| try testing.expectApproxEqAbs(want, got, 0.05);
+    // No coarse head is wider than its re-score copy.
+    try testing.expect(buildRerankCoarseRows(s, dense, RERANK_EXACT_BITS) == null);
 }

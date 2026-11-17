@@ -23,6 +23,8 @@ const AttnDqCopy = @import("../../sdk/blocks/attention/decode_attn_quant.zig").A
 const QkAngleSlot = @import("../../sdk/blocks/rope/qk_norm_rope.zig").QkAngleSlot;
 const DtypeCastCache = @import("../../mlx/dtype.zig").DtypeCastCache;
 const lane_qmm = @import("../../sdk/blocks/qmm/lane_qmm.zig");
+const Outside = @import("outside.zig").Outside;
+const outside_quant = @import("../../sdk/quant/outside.zig");
 
 pub const Trunk = struct {
     /// Borrowed: its owner (the plugin's model, or the engine's legacy shell) frees it after the trunk.
@@ -107,6 +109,8 @@ pub const Trunk = struct {
     /// The MTP cost profile's trunk fingerprints (homogeneous affine-4/gs-64; the oQ4e mixed layout).
     mtp_uniform_affine_trunk: bool = false,
     mtp_oqe_affine_trunk: bool = false,
+    /// The outside quant plugin claiming the pack: the linears and routed banks it runs (null: none claims it).
+    outside: ?*Outside = null,
 
     pub var qwen4_trace: ?*mtp.Qwen4Trace = null;
     pub var qsa_engaged_logged: bool = false;
@@ -348,6 +352,12 @@ pub const Trunk = struct {
         return @import("trunk_load.zig").load(io, a, &config, weights, .{});
     }
 
+    /// The outside quant plugin's weight bound as `w`; null for a linear the trunk runs itself.
+    pub fn outsideLinear(self: *const Trunk, w: mlx.mlx_array) ?*const outside_quant.Weight {
+        const o = self.outside orelse return null;
+        return o.linearOf(w);
+    }
+
     pub fn actDtype(self: *const Trunk) mlx.mlx_dtype {
         return self.config.actDtype();
     }
@@ -409,5 +419,7 @@ pub const Trunk = struct {
         }
         for (self.moe_owned_bf16) |a| _ = mlx.mlx_array_free(a);
         self.allocator.free(self.moe_owned_bf16);
+        if (self.outside) |o| o.destroy();
+        self.outside = null;
     }
 };

@@ -5,8 +5,8 @@ for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
   dT[i] = T(float(cT[i]) * xs[m] * ws[n]);
 }
 if (m0 + BM <= M && n0 + BN <= N) {
-  tensor<device T, dextents<int, 2>, tensor_inline> D((device T*)y, dextents<int, 2>(N, M));
-  auto dS = D.template slice<BN, BM>(n0, m0);
+  tensor<device T, dextents<int, 2>, tensor_inline> D((device T*)y + (size_t)m0 * N + n0, dextents<int, 2>(N - n0, M - m0), array<int, 2>({1, N}));
+  auto dS = D.template slice<BN, BM>(0, 0);
   dT.store(dS);
 } else {
   for (uint16_t i = 0; i < cT.get_capacity(); ++i) {

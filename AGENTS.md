@@ -83,6 +83,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 ## Releases & benchmarking
 
 - Process/CalVer/CHANGELOG: `/release`. Per-release perf gate = `./tests/bench.sh` on the FINAL tree vs the previous column in `benchmarks.md` (ONE new column per release).
+- **Benchmark with `--warmup-full`** (bench.sh passes it): without it a build's first pass on a model carries its one-time Metal kernel compiles and reads like a regression.
 - Methodology: `/bench` (llmprobe measures; bench.sh drives mlx-serve, `--url` probes another engine). Only diff same-methodology cells; spec cells are variance: same-session ratios only, name the engine in every win, an A/B arm is proven by ENGAGEMENT lines. Record = `benchmarks.md` + `~/claude-tmp/bench-<tag>/`.
 
 ## Conventions
@@ -165,7 +166,7 @@ One server, one registry — image/audio/video/3D coexist with chat. Engine slot
 
 - Product skills: `~/.mlx-serve/skills/*.md` (frontmatter trigger substring → body into system prompt; `SkillManager` rescans on mtime).
 - `DownloadManager`: streams to `.partial`, Range resume, 3 retries, cancel preserves partial, size-matching files skipped.
-- Server log `~/.mlx-serve/logs/mlx-serve-<port>.log` is THE post-mortem file (`--log-level debug`). Grep: `jinja error:`, `[cache]`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `spec-gate:`, `[loop-stop]`, `[lan] proxy`, `[disk-cache]`, `[hot-cache]`, `[admission]`, `[providers]`. Capture: `MLX_SERVE_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; `pkill -f mlx-serve` between KV-poison tests.
+- Server log `~/.mlx-serve/logs/mlx-serve-<port>.log` is THE post-mortem file (`--log-level debug`). Grep: `jinja error:`, `[cache]`, `<- N+M tokens`, `tool_msgs=`, `[spec-stats]`, `spec-gate:`, `[loop-stop]`, `[lan] proxy`, `[disk-cache]`, `[hot-cache]`, `[admission]`, `[providers]`. Capture: `MLX_SERVE_RAW_DUMP_FILE=<abs>` → `tests/harvest_tool_traffic.py`. Reproduce tool bugs `stream:false` first; restart YOUR server between KV-poison tests (never `pkill -f mlx-serve`).
 
 ## Rules
 

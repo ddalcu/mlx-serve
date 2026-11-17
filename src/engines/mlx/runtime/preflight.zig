@@ -214,17 +214,16 @@ fn waitForUnload(need: u64, avail: u64, mark: model_registry_mod.UnloadMark, now
 }
 
 fn loadAvail(_: std.Io) u64 {
-    return effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
+    return effectiveAvailableBytes(status.getLoadAvailableMemBytes(), status.getProcAvailableMemBytes(), loadGpuLimit());
 }
 
-/// RAM a load can still take beside everything resident: what the OS grants less the reserve it
-/// keeps (iOS's per-process headroom already is what the process may take). Null when unreadable.
+/// RAM a load can still take beside everything resident (`getLoadRoomBytes`; iOS's per-process headroom
+/// already is what the process may take). Null when unreadable.
 pub fn loadRamRoom() ?u64 {
     const proc = status.getProcAvailableMemBytes();
     if (proc > 0) return proc;
-    const host = status.getAvailableMemBytes();
-    if (host == 0) return null;
-    return host -| status.osReserveBytes(status.getTotalMemBytes(), mlx.weightsInDeviceMemory());
+    if (status.getLoadAvailableMemBytes() == 0) return null;
+    return status.getLoadRoomBytes();
 }
 
 fn pauseLoadAvail(io: std.Io) void {
@@ -280,6 +279,14 @@ pub fn mtpSidecarDiskBytes(io: std.Io, allocator: std.mem.Allocator, model_dir: 
     const rel = mtp_mod.resolveMtpSidecarInDir(io, allocator, dir) orelse return 0;
     const st = dir.statFile(io, rel, .{}) catch return 0;
     return @intCast(st.size);
+}
+
+/// The coarse shortlist head an MTP bind builds from the trunk head (`mtp.buildRerankCoarse`, or the draft-only head
+/// `buildDraftHead` keeps instead), billed with the weights when the load carries an MTP head: a served model whose
+/// facts declare one (`SpecFacts.mtp_layout`), a legacy model whose pack ships one.
+pub fn mtpCoarseBytes(config: *const model_mod.ModelConfig, legacy_head: bool) u64 {
+    const head = if (config.plugin) |b| b.parsed.spec.mtp_layout != .none else legacy_head;
+    return if (head) mtp_mod.rerankCoarseBytes(@intCast(config.vocab_size), @intCast(config.hidden_size), mtp_mod.DRAFT_HEAD_BITS) else 0;
 }
 
 /// Resident bytes a sidecar takes once loaded: `bits` per weight plus a bf16
@@ -645,6 +652,26 @@ test "a sidecar bills its loaded width, and only an in-dir one is dropped to fit
     try std.testing.expectEqual(PreflightVerdict.fits, preflightVerdict(20 * GB, 0, 25 * GB, true));
 }
 
+test "load preflight: a load macOS can make room for is admitted; one beside another resident model is refused" {
+    const system = @import("../../../sdk/util/system.zig");
+    const GB: u64 = 1024 * 1024 * 1024;
+    const page: u64 = 16384;
+    const total: u64 = 128 * GB;
+    const reserve = system.osReserveBytes(total, false);
+    const weights: u64 = @intFromFloat(70.13 * @as(f64, @floatFromInt(GB)));
+    const pages = struct {
+        fn of(gb: f64) u64 {
+            return @intFromFloat(gb * @as(f64, @floatFromInt(GB / page)));
+        }
+    }.of;
+    // A 128 GB Mac holding 36 GB of idle app memory: free 12.5, file-backed 19.4, wired 8.3, compressor 2.5 GB.
+    // The base figure reads ~31.9 GB, yet the 70.13 GB pack (needs ~77.1) loads there.
+    try testing.expect(memInsufficientForLoad(weights, system.computeAvailableBytes(total, pages(12.5), 0, pages(19.4), 0, pages(8.3), pages(2.5), page)));
+    try testing.expect(!memInsufficientForLoad(weights, system.computeLoadAvailableBytes(total, pages(8.3), pages(2.5), page, reserve)));
+    // The same pack already resident in another server (wired 77.6, compressor 9.6 GB) is refused.
+    try testing.expect(memInsufficientForLoad(weights, system.computeLoadAvailableBytes(total, pages(77.6), pages(9.6), page, reserve)));
+}
+
 test "memInsufficientForLoad: headroom + unknown-query guards" {
     const GB: u64 = 1024 * 1024 * 1024;
     const MB: u64 = 1024 * 1024;
@@ -727,4 +754,18 @@ test "residentModelDiskBytes: with stream_experts a pack whose plugin streams th
     try std.testing.expectEqual(modelDiskBytes(io, dir) - on.experts + on.slots, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
     config.stream_experts_override = null;
     try std.testing.expectEqual(modelDiskBytes(io, dir), try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+}
+
+test "the preflight bills the MTP bind's coarse head where the load carries a head, and nothing where it does not" {
+    var c: model_mod.ModelConfig = .{};
+    c.vocab_size = 157_184;
+    c.hidden_size = 4096;
+    try std.testing.expectEqual(@as(u64, 281_673_728), mtpCoarseBytes(&c, true));
+    try std.testing.expectEqual(@as(u64, 0), mtpCoarseBytes(&c, false));
+    var table: abi.ModelTable = undefined;
+    var binding: @import("../plugin/config.zig").Binding = .{ .table = &table, .parsed = .{ .spec = .{ .mtp_layout = .in_checkpoint } } };
+    c.plugin = &binding;
+    try std.testing.expectEqual(@as(u64, 281_673_728), mtpCoarseBytes(&c, false));
+    binding.parsed.spec.mtp_layout = .none;
+    try std.testing.expectEqual(@as(u64, 0), mtpCoarseBytes(&c, true));
 }

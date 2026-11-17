@@ -46,7 +46,7 @@ fn loadTensor(allocator: std.mem.Allocator, f: *const gguf.File, key: []const u8
     defer if (uncached) |r| allocator.free(r.buf);
     if (uncached) |r| t.data = r.data;
     if (t.ty.isQuantized()) {
-        if (mlx_layouts and arch.transcodes(t.ty) and try (if (t.ty == .mxfp4) loadMxfp4(allocator, t, mapped, out) else loadAffine(allocator, t, mapped, hp, out))) return;
+        if (mlx_layouts and arch.loadsMlx(mapped.name, t.ty) and try (if (t.ty == .mxfp4) loadMxfp4(allocator, t, mapped, out) else loadAffine(allocator, t, mapped, hp, out))) return;
         try loadQuantized(allocator, t, mapped, hp, out, s);
     } else {
         try put(allocator, out, mapped.name, try loadFloat(allocator, t, mapped.transform, hp, s));
@@ -76,7 +76,7 @@ pub fn dsparkResidentBytes(f: *const gguf.File, hp: arch_mod.deepseek41.Hparams)
     var it = f.tensors.iterator();
     while (it.next()) |e| {
         const mapped = arch_mod.deepseek41.mapDsparkTensor(&name_buf, e.key_ptr.*, ds) orelse return error.UnsupportedTensor;
-        if (mapped.name.len != 0) total += loadedBytes(e.value_ptr.*, arch.transcodes(e.value_ptr.ty));
+        if (mapped.name.len != 0) total += loadedBytes(e.value_ptr.*, arch.loadsMlx(mapped.name, e.value_ptr.ty));
     }
     return total;
 }
@@ -206,7 +206,7 @@ pub fn loadMtp(allocator: std.mem.Allocator, f: *const gguf.File, out: *WeightMa
             // The trunk's injects are dense: the head's quantized ones join them as bf16.
             try put(allocator, out, mapped.name, try dequantized(allocator, t));
         } else if (t.ty.isQuantized()) {
-            if (try loadAffine(allocator, t, mapped, base, out)) {
+            if (affine.bitsOf(t.ty) != null and try loadAffine(allocator, t, mapped, base, out)) {
                 if (headBits(mapped.name, t)) |bits| try requantHead(out, mapped.name, t, bits, s);
                 continue;
             }
@@ -372,7 +372,7 @@ pub fn residentBytes(f: *const gguf.File) !u64 {
     var it = f.tensors.iterator();
     while (it.next()) |e| {
         const mapped = arch.mapTensor(&name_buf, e.key_ptr.*) orelse return error.UnsupportedTensor;
-        if (mapped.name.len != 0) total += loadedBytes(e.value_ptr.*, arch.transcodes(e.value_ptr.ty));
+        if (mapped.name.len != 0) total += loadedBytes(e.value_ptr.*, arch.loadsMlx(mapped.name, e.value_ptr.ty));
     }
     return total;
 }
@@ -394,14 +394,14 @@ pub fn mtpResidentBytes(f: *const gguf.File) !u64 {
 
 /// A tensor's bytes as loaded: an affine copy is the codes plus a bf16 scale and bias per group.
 fn loadedBytes(t: gguf.Tensor, transcoded: bool) u64 {
-    const bits = if (transcoded) affine.bitsOf(t.ty) else null;
+    const bits = if (transcoded) affine.layoutBits(t.ty) else null;
     return if (bits) |b| t.elems() * b / 8 + t.elems() / affine.groupOf(t.ty) * 4 else t.data.len;
 }
 
 /// A tensor of an affine-coded type (affine.zig) in MLX's layout: `<base>.weight` u32 codes, `.scales` and `.biases`
 /// bf16, one per `affine.groupOf` weights. False when its type or transform keeps the ggml blocks.
 fn loadAffine(allocator: std.mem.Allocator, t: gguf.Tensor, mapped: arch_mod.Mapped, hp: qwen35.Hparams, out: *WeightMap) !bool {
-    const bits = affine.bitsOf(t.ty) orelse return false;
+    const bits = affine.layoutBits(t.ty) orelse return false;
     if (!std.mem.endsWith(u8, mapped.name, ".weight") or t.n_dims < 2 or t.n_dims > 3) return false;
     const in: usize = @intCast(t.dims[0]);
     const rows: usize = @intCast(t.elems() / t.dims[0]);
@@ -1037,7 +1037,7 @@ test "an affine-coded tensor loads as MLX affine: mlx's dequant equals ggml's, v
     var hp = std.mem.zeroes(qwen35.Hparams);
     hp.nk = 2;
     hp.nv = 4;
-    inline for ([_]Case{ .{ .ty = .q4_k, .fixture = "q4_k.bin", .in = 256 }, .{ .ty = .q5_1, .fixture = "q5_1.bin", .in = 128 }, .{ .ty = .q8_0, .fixture = "q8_0.bin", .in = 128 }, .{ .ty = .q2_0, .fixture = "q2_0.bin", .in = 256 } }) |c| {
+    inline for ([_]Case{ .{ .ty = .q4_k, .fixture = "q4_k.bin", .in = 256 }, .{ .ty = .q5_1, .fixture = "q5_1.bin", .in = 128 }, .{ .ty = .q8_0, .fixture = "q8_0.bin", .in = 128 }, .{ .ty = .q2_0, .fixture = "q2_0.bin", .in = 256 }, .{ .ty = .q6_k, .fixture = "q6_k.bin", .in = 256 } }) |c| {
         const g = affine.groupOf(c.ty);
         hp.dv = @intCast(c.in / hp.nv);
         const data = @embedFile("fixtures/" ++ c.fixture);
@@ -1048,7 +1048,7 @@ test "an affine-coded tensor loads as MLX affine: mlx's dequant equals ggml's, v
         const ref = try a.alloc(f32, rows * c.in);
         defer a.free(ref);
         try quants.dequantize(c.ty, t.data, ref);
-        // The bound bf16 scales and biases allow: half a bf16 ulp of each term.
+        // The bound bf16 scales and biases allow: half a bf16 ulp of each term. Q6_K is requantized: half its step.
         const tol = try a.alloc(f32, rows * c.in);
         defer a.free(tol);
         {
@@ -1059,7 +1059,7 @@ test "an affine-coded tensor loads as MLX affine: mlx's dequant equals ggml's, v
             const bi = try a.alloc(f32, rows * c.in / g);
             defer a.free(bi);
             affine.decodeRow(c.ty, t.data, q, sc, bi);
-            for (tol, q, 0..) |*o, code, i| o.* = (@abs(sc[i / g] * @as(f32, @floatFromInt(code))) + @abs(bi[i / g])) / 256 + 1e-6;
+            for (tol, q, 0..) |*o, code, i| o.* = if (c.ty == .q6_k) 0.5 * sc[i / g] * 1.001 + 1e-6 else (@abs(sc[i / g] * @as(f32, @floatFromInt(code))) + @abs(bi[i / g])) / 256 + 1e-6;
         }
         for ([_]arch_mod.Transform{ .none, .tiled_input }) |tr| {
             var map = WeightMap.init(a);
@@ -1081,7 +1081,7 @@ test "an affine-coded tensor loads as MLX affine: mlx's dequant equals ggml's, v
             try mlx.check(mlx.mlx_astype(&bi32, map.get("x.biases").?, .float32, s));
             var y = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(y);
-            try mlx.check(mlx.mlx_dequantize(&y, map.get("x.weight").?, sc32, bi32, mlx.mlx_optional_int.some(@intCast(g)), mlx.mlx_optional_int.some(@intCast(affine.bitsOf(c.ty).?)), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+            try mlx.check(mlx.mlx_dequantize(&y, map.get("x.weight").?, sc32, bi32, mlx.mlx_optional_int.some(@intCast(g)), mlx.mlx_optional_int.some(@intCast(affine.layoutBits(c.ty).?)), "affine", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
             try mlx.check(mlx.mlx_array_eval(y));
             const got = mlx.mlx_array_data_float32(y).?[0 .. rows * c.in];
             for (0..rows) |r| for (0..c.in) |col| {

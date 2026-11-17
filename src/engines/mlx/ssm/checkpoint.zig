@@ -382,6 +382,26 @@ pub fn fileCheckpoint(allocator: std.mem.Allocator, list: *std.ArrayList(SSMChec
     }
 }
 
+/// The positions `fileCheckpoint` keeps of `positions` filed in order onto an empty list (`max`, `thin`, `low_anchors`
+/// as it takes them), moved to the front in place: the kept count.
+pub fn thinPositions(positions: []u64, max: usize, thin: ThinPolicy, low_anchors: usize) usize {
+    var n: usize = 0;
+    for (positions) |p| {
+        positions[n] = p;
+        n += 1;
+        if (max > 0 and n > max) {
+            const d = spanPreservingDropIndex(u64, positions[0..n], u64PosOf, thin, null, low_anchors);
+            std.mem.copyForwards(u64, positions[d .. n - 1], positions[d + 1 .. n]);
+            n -= 1;
+        }
+    }
+    return n;
+}
+
+fn u64PosOf(p: *const u64) usize {
+    return @intCast(p.*);
+}
+
 /// `spanPreservingDropIndex` over a bare ascending position list.
 pub fn positionDropIndex(positions: []const u32, policy: ThinPolicy) usize {
     return spanPreservingDropIndex(u32, positions, u32PosOf, policy, null, 0);
@@ -845,5 +865,13 @@ test "prompt checkpoints: fileCheckpoint thins past the cap by the policy, low a
         var kept: [8]usize = undefined;
         for (list.items, &kept) |cp, *k| k.* = cp.pos;
         try testing.expectEqualSlices(usize, &c.kept, &kept);
+        // The same positions thinned as a bare list keep the same survivors, in order.
+        var positions: [12]u64 = undefined;
+        for (&positions, 1..) |*p, i| p.* = 1000 * i;
+        const n = thinPositions(&positions, 8, c.thin, c.low_anchors);
+        try testing.expectEqual(@as(usize, 8), n);
+        var thinned: [8]usize = undefined;
+        for (positions[0..n], &thinned) |p, *k| k.* = @intCast(p);
+        try testing.expectEqualSlices(usize, &c.kept, &thinned);
     }
 }

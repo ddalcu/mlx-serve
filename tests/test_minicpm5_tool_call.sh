@@ -41,7 +41,7 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 # MLX_SERVE_RAW_DUMP_FILE records the PRE-PARSE model output. Without it this
 # whole script only ever inspects the NORMALISED client response, which raw

@@ -35,6 +35,8 @@ pub const Routed = struct {
     read_ahead_fn: ?*const fn (*anyopaque, u32, []const u16) Ret(void) = null,
     /// Routed ids a decode-phase call takes: a wider call is a prompt pass, which a source refuses in decode.
     decode_ids: usize = max_call_ids,
+    /// A `source` call of at most `decode_ids` ids gives each row the bytes that row's call alone gets.
+    exact_rows: bool = false,
 
     /// A wide call's routed sum plus the shared expert's rows (`[n, hidden]` f32, the last argument) as one combine over
     /// the call's unjoined outputs: `source`'s sum + the shared rows, word for word. A narrower call (a replaying chunk's

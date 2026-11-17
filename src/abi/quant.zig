@@ -102,6 +102,27 @@ pub const QuantTable = extern struct {
     bank_rows: ?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *BankRows) callconv(.c) Verdict = null,
     /// The pack's streamed expert bank at the rows `budget` buys; it outlives `close`.
     open_bank: ?*const fn (ctx: *const LoadCtx, geo: *const BankGeometry, budget: BankBudget, out: *Bank) callconv(.c) Verdict = null,
+    /// `swiglu` reads `Swiglu.limit_out`. Appended: the host passes a post-SiLU limit only to a table whose `size`
+    /// reaches this flag and sets it (`clampsOut`), and refuses the call by name otherwise, so a table built before the
+    /// field is never asked a clamp it would skip.
+    swiglu_limit_out: bool = false,
+    /// `matmul` over up to this many rows gives each row the bytes of its own one-row call; 0 = not declared, so a host
+    /// that needs a row's one-row bytes calls one row at a time. Appended: read through `exactRows`.
+    exact_rows: u32 = 0,
+
+    /// Whether the table's `swiglu` honours `Swiglu.limit_out` (a table of any size).
+    pub fn clampsOut(t: *const QuantTable) bool {
+        return t.size >= @offsetOf(QuantTable, "swiglu_limit_out") + @sizeOf(bool) and t.swiglu_limit_out;
+    }
+
+    /// `exact_rows`, 0 on a table whose `size` ends before it.
+    pub fn exactRows(t: *const QuantTable) u32 {
+        return if (t.size >= @offsetOf(QuantTable, "exact_rows") + @sizeOf(u32)) t.exact_rows else 0;
+    }
+
+    /// The smallest table the loader admits: one built before `swiglu_limit_out`, whose appended members read as absent
+    /// through their size-gated readers (`clampsOut`).
+    pub const min_size: u32 = @offsetOf(QuantTable, "swiglu_limit_out");
 };
 
 /// A layer's router as the trunk loaded it. The `gates` list is valid for the call only; the arrays it names live
@@ -121,6 +142,18 @@ pub const BankGeometry = extern struct {
     swiglu_limit: f32 = 0,
     /// Every layer's router (`n_layers`); null for `bank_rows`.
     gates: ?[*]const BankGate = null,
+    /// Every layer's routed SwiGLU clamped AFTER the SiLU (`n_layers`, as `gates`; valid for the call only): > 0 the
+    /// limit L of min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's `expert_swiglu_limit_list`), 0 none; null: no layer
+    /// clamps so. Appended: read it through `limitOut`, which a geometry from a host built before it (a smaller `size`)
+    /// answers 0, so a plugin built with it loads on an older host, and a plugin built before it loads as before.
+    limits_out: ?[*]const f32 = null,
+
+    /// Layer `layer`'s post-SiLU limit (`limits_out`), 0 where the geometry does not reach the field or gives none.
+    pub fn limitOut(g: *const BankGeometry, layer: u32) f32 {
+        if (g.size < @offsetOf(BankGeometry, "limits_out") + @sizeOf(?[*]const f32)) return 0;
+        const l = g.limits_out orelse return 0;
+        return if (layer < g.n_layers) l[layer] else 0;
+    }
 };
 
 /// Bytes the slot rows and the bank's own buffers may hold in each phase (a prompt pass, decode).
@@ -159,6 +192,12 @@ pub const Bank = extern struct {
     rows_expand_into: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict = null,
     rows_decode_expand: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, shared: Array, res: Array, pc: Array, out: *Array) callconv(.c) Verdict = null,
     next_ahead: ?*const fn (ctx: ?*anyopaque, layer: u32, ids: Array) callconv(.c) Verdict = null,
+    /// The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next
+    /// call; the model logs them beside `[spec-stats]` at the request's end. Null: none.
+    meters: ?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void = null,
+    /// A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets.
+    /// Appended: read only where `size` reaches it.
+    exact_rows: bool = false,
 };
 
 pub const Swiglu = extern struct {
@@ -167,6 +206,9 @@ pub const Swiglu = extern struct {
     limit: i32 = 0,
     /// Spec-verify rows: the decode chain at any width.
     verify_rows: bool = false,
+    /// > 0: the SwiGLU clamped AFTER the SiLU, min(silu(g), L) * clamp(u, -L, L) (Ling-3.1's; `limit` is then 0).
+    /// Appended: read only by a table that declares it (`QuantTable.clampsOut`).
+    limit_out: f32 = 0,
 };
 
 // ── tests ──
@@ -178,4 +220,41 @@ test "abi quant: every struct opens with its size" {
     try testing.expectEqual(@as(u32, @sizeOf(Weight)), w.size);
     inline for (.{ Source, Weight, LoadCtx, QuantTable, Swiglu, BankGeometry, BankRows, Bank }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
+}
+
+test "abi quant: a geometry's post-SiLU limits are read only where its size reaches them" {
+    const lim = [_]f32{ 0, 10, 0 };
+    var g: BankGeometry = .{ .hidden = 8, .inter = 4, .top_k = 1, .n_experts = 2, .n_layers = 3, .limits_out = &lim };
+    try testing.expectEqual(@as(f32, 10), g.limitOut(1));
+    try testing.expectEqual(@as(f32, 0), g.limitOut(0));
+    try testing.expectEqual(@as(f32, 0), g.limitOut(3));
+    // A host built before the field: its geometry ends at `gates`.
+    g.size = @offsetOf(BankGeometry, "limits_out");
+    try testing.expectEqual(@as(f32, 0), g.limitOut(1));
+    g.size = @sizeOf(BankGeometry);
+    g.limits_out = null;
+    try testing.expectEqual(@as(f32, 0), g.limitOut(1));
+}
+
+test "abi quant: a table's row-exact matmul width is read only where its size reaches it" {
+    var t: QuantTable = undefined;
+    t.size = @sizeOf(QuantTable);
+    t.exact_rows = 16;
+    try testing.expectEqual(@as(u32, 16), t.exactRows());
+    // A table built before the field (at the loader's minimum): not declared.
+    t.size = QuantTable.min_size;
+    try testing.expectEqual(@as(u32, 0), t.exactRows());
+}
+
+test "abi quant: a post-SiLU SwiGLU limit reaches only a table that declares it" {
+    var t: QuantTable = undefined;
+    t.size = @sizeOf(QuantTable);
+    t.swiglu_limit_out = true;
+    try testing.expect(t.clampsOut());
+    t.swiglu_limit_out = false;
+    try testing.expect(!t.clampsOut());
+    // A table built before the flag: its size ends before it.
+    t.swiglu_limit_out = true;
+    t.size = @offsetOf(QuantTable, "swiglu_limit_out");
+    try testing.expect(!t.clampsOut());
 }

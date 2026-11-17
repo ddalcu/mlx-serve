@@ -65,9 +65,17 @@ enum AgentEngine {
 
     // MARK: - History Building
 
-    /// User message appended when history ends on a tool result: some models
-    /// (Gemma 4 E4B) cannot continue without one. Shared with `TestServer`.
-    static let toolRoundNudge = "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."
+    /// The request's messages: the system prompt, then the history AS IT IS. A history that ends on a tool result
+    /// is sent that way (the server's template opens the assistant turn after it): a message put there in the user
+    /// role reads to the model as the user speaking. Shared with `TestServer`.
+    static func requestMessages(systemPrompt: String, history: [[String: Any]]) -> [[String: Any]] {
+        [["role": "system", "content": systemPrompt]] + history
+    }
+
+    /// Ends a tool result the history cut short, so the model knows it reads part of it and can ask again.
+    static func toolResultCutMarker(dropped: Int) -> String {
+        "\n[\(dropped) more characters of this earlier result were cut; call the tool again to read them]"
+    }
 
     /// Build API-ready message history from chat messages with budget-aware truncation.
     ///
@@ -233,10 +241,13 @@ enum AgentEngine {
                 let unanswered = lastReplyIdx.map { i > $0 } ?? true
                 let limit = unanswered ? msg.content.count : (isRecent ? recentLimit : olderLimit)
                 toolResultsSeen += 1
+                // Cut only where the cut saves more than its marker adds, so a cut result is always shorter.
+                let dropped = msg.content.count - limit
+                let marker = Self.toolResultCutMarker(dropped: max(dropped, 0))
                 history.append([
                     "role": "tool",
                     "tool_call_id": callId,
-                    "content": String(msg.content.prefix(limit)),
+                    "content": dropped > marker.count ? String(msg.content.prefix(limit)) + marker : msg.content,
                 ])
                 continue
             }

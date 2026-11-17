@@ -92,12 +92,42 @@ fn readLing(c: *Config, o: Objects) ParseError!void {
         c.shared_expert_intermediate_size = std.math.mul(u32, width, n_shared) catch return error.InvalidConfigField;
     }
     if (field(cfg, "score_function")) |v| if (v == .string and !std.mem.eql(u8, v.string, "sigmoid")) return error.Unsupported;
+    // Ling-3.1's clamps after the SiLU, one entry a trunk layer (0 = none).
+    try limitList(cfg, "expert_swiglu_limit_list", &c.expert_limit_out);
+    try limitList(cfg, "share_expert_swiglu_limit_list", &c.shared_limit_out);
+    try intIf(cfg, "num_nextn_predict_layers", &c.nextn_layers);
+
+    // A Ling streaming pack (the EXL3 repack beside its `experts.bin`) keeps the release's config.json, so it names no
+    // `expert_streaming`: its EXL3 `quantization_config` marks it. The family parse refuses it without `experts.bin`, and
+    // the outside quant plugin that claims the block runs its projections and streams the bank.
+    if (field(o.root, "quantization_config")) |qc| if (qc == .object) if (qc.object.get("quant_method")) |m|
+        if (m == .string and std.mem.eql(u8, m.string, "exl3")) {
+            c.streamed_bank = true;
+        };
+}
+
+/// A per-layer SwiGLU limit list (`key`) into `out`: whole numbers 0 to 255, at most `out.len` layers.
+fn limitList(cfg: std.json.ObjectMap, key: []const u8, out: *[128]u8) ParseError!void {
+    const v = field(cfg, key) orelse return;
+    if (v != .array) return error.InvalidConfigField;
+    if (v.array.items.len > out.len) return error.Unsupported;
+    for (v.array.items, 0..) |item, i| {
+        const n = try u32v(item);
+        out[i] = std.math.cast(u8, n) orelse return error.Unsupported;
+    }
 }
 
 /// Ling 3.0's `Parsed` facts beside the shell.
 fn lingFacts(c: *const Config, p: *abi.Parsed) void {
     p.caps = .{ .moe = c.num_experts > 0, .dflash_capture = true, .experts_stream = c.num_experts > 0 };
+    if (c.streamed_bank) {
+        family.bankFacts(p);
+        // The outside plugin's head computes a prompt row as the whole prompt's call does (glm5_next/host.zig `finish`).
+        p.caps.prompt_last_row = true;
+    }
     p.chat.thinking_default = .on;
+    // A streaming pack's NextN layer drafts one token a round over the trunk's final-normed hidden (`head.zig`).
+    if (c.streamed_bank and c.nextn_layers > 0) p.spec = .{ .mtp_default_depth = 1, .mtp_layout = .in_checkpoint, .head_reads_final_norm = true };
     p.cache.ssm_state = .{ .entries = c.num_hidden_layers, .dtype = .bf16 };
     p.weights.prefix = abi.Str.of(c.weight_prefix);
 }
@@ -142,5 +172,83 @@ test "bailing_hybrid config: a NoPE MLA, low-rank KDA gates and a non-sigmoid ro
         var p: abi.Parsed = .{};
         const v = parseJson(json, &p);
         try testing.expect(v.code == .unsupported and p.private == null);
+    }
+}
+
+test "bailing_hybrid config: Ling-3.1-flash's EXL3 repack is a streaming pack by its quantization_config, beside experts.bin" {
+    const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    // The repack keeps the release's config.json: no `expert_streaming`, an EXL3 `quantization_config`.
+    try testing.expect(std.mem.indexOf(u8, json, "expert_streaming") == null);
+    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
+    defer freeParsed(&p);
+    const c = of(&p);
+    try testing.expect(c.streamed_bank and p.caps.streamed_weights and !p.caps.batches_decode and !p.caps.images);
+    try testing.expectEqual(@as(u32, 72), p.shell.num_hidden_layers);
+    // Without its bank the same config is refused by name.
+    const bare: sdk.fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+    const bare_dir = bare.packDir();
+    var q: abi.Parsed = .{};
+    const v = parse(&bare_dir, abi.Str.of(json), .{}, null, true, &q);
+    try testing.expect(v.code == .unsupported and q.private == null);
+}
+
+test "bailing_hybrid config: Ling-3.1-flash's SwiGLU limit lists, routed (layers 65-71) and shared (64-71), clamp after the SiLU at 10" {
+    const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
+    defer freeParsed(&p);
+    const c = of(&p);
+    for (0..72) |i| {
+        try testing.expectEqual(@as(u8, if (i >= 65) 10 else 0), c.expert_limit_out[i]);
+        try testing.expectEqual(@as(u8, if (i >= 64) 10 else 0), c.shared_limit_out[i]);
+    }
+    for (c.expert_limit_out[72..]) |l| try testing.expectEqual(@as(u8, 0), l);
+    // Ling 3.0 lists none.
+    var q: abi.Parsed = .{};
+    try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json"), &q).isOk());
+    defer freeParsed(&q);
+    for (of(&q).shared_limit_out) |l| try testing.expectEqual(@as(u8, 0), l);
+}
+
+test "bailing_hybrid config: a limit list past 128 layers, past 255 or not a list is refused" {
+    inline for (.{
+        "{\"model_type\":\"bailing_hybrid\",\"kv_lora_rank\":64,\"expert_swiglu_limit_list\":[256]}",
+        "{\"model_type\":\"bailing_hybrid\",\"kv_lora_rank\":64,\"share_expert_swiglu_limit_list\":7}",
+    }) |json| {
+        var p: abi.Parsed = .{};
+        const v = parseJson(json, &p);
+        try testing.expect(!v.isOk() and p.private == null);
+    }
+    // 129 layers
+    var long: std.ArrayList(u8) = .empty;
+    defer long.deinit(testing.allocator);
+    try long.appendSlice(testing.allocator, "{\"model_type\":\"bailing_hybrid\",\"kv_lora_rank\":64,\"share_expert_swiglu_limit_list\":[0");
+    for (0..128) |_| try long.appendSlice(testing.allocator, ",0");
+    try long.appendSlice(testing.allocator, "]}");
+    var p: abi.Parsed = .{};
+    const v = parseJson(long.items, &p);
+    try testing.expect(!v.isOk() and p.private == null);
+}
+
+test "bailing_hybrid config: a streaming pack's NextN layer declares the MTP head (one draft a round over the final-normed hidden); an MLX pack none" {
+    const json = @embedFile("../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    const mem: sdk.fixture.MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try testing.expect(parse(&dir, abi.Str.of(json), .{}, null, true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expectEqual(@as(u32, 1), of(&p).nextn_layers);
+    try testing.expect(p.spec.mtp_layout == .in_checkpoint and p.spec.mtp_default_depth == 1 and p.spec.head_reads_final_norm);
+    // MLX packs keep their facts: no head, a NextN layer or not.
+    inline for (.{ "bailing_hybrid-ling-3.0-tiny-4bit.json", "bailing_hybrid-ling-3.0-flash-oq4e-mtp.json" }) |name| {
+        var q: abi.Parsed = .{};
+        try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/" ++ name), &q).isOk());
+        defer freeParsed(&q);
+        try testing.expect(q.spec.mtp_layout == .none and q.spec.mtp_default_depth == 0 and !of(&q).streamed_bank);
     }
 }

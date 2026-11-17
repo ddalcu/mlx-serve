@@ -630,6 +630,17 @@ enum HFSortField: String {
 
 enum RAMFitness {
     case fits, tight, wontFit, unknown
+
+    /// A Discover row's dot: a model needing `bytes` against what the GPU can give a model, by the Recommended
+    /// pane's rule (`SystemMemoryInfo.fit`).
+    static func of(bytes: Int64, memory: SystemMemoryInfo) -> RAMFitness {
+        guard bytes > 0 else { return .unknown }
+        switch memory.fit(neededGB: Double(bytes) / 1_073_741_824) {
+        case .comfortable: return .fits
+        case .tight: return .tight
+        case .exceeds: return .wontFit
+        }
+    }
 }
 
 func formatCount(_ n: Int) -> String {

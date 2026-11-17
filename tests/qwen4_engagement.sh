@@ -17,7 +17,7 @@ BIN="${BIN:-./zig-out/bin/mlx-serve}"
 LOG="${LOG:-/tmp/qwen4-engagement-$PORT.log}"
 URL="http://127.0.0.1:$PORT"
 
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 1
 "$BIN" --model "$MODEL" --serve --port "$PORT" --log-level info "$@" >"$LOG" 2>&1 &
 SRV=$!

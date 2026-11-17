@@ -41,11 +41,11 @@ ID="t/main"
 SRV=""
 cleanup() {
     [ -n "$SRV" ] && kill "$SRV" 2>/dev/null
-    pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+    srv_preclean "$PORT"
     rm -rf "$FAKE_HOME"
 }
 trap cleanup EXIT
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+srv_preclean "$PORT"
 sleep 0.5
 
 cat >"$FAKE_HOME/.mlx-serve/model-settings.json" <<JSON

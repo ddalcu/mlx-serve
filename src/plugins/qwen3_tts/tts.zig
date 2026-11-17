@@ -88,11 +88,29 @@ pub const TtsConfig = struct {
     rep_penalty: f32 = 1.05, // codebook-0 repetition penalty
     temperature: f32 = 0.9, // 0 → greedy (deterministic); >0 → categorical sampling
     top_k: u32 = 50,
-    seed: u64 = 0,
+
+    /// `tts_model_type`: what sets the voice (a reference clip, a built-in speaker, a description).
+    kind: Kind = .base,
+    /// `tts_model_size` `0b6`: its CustomVoice was not trained with instructions (the reference drops them).
+    small: bool = false,
 
     /// `talker_config.codec_language_id` less its dialects: the reference's supported languages.
     languages: [max_languages]Language = undefined,
     n_languages: u8 = 0,
+    /// `talker_config.spk_id`: a CustomVoice checkpoint's built-in voices.
+    speakers: [max_speakers]Speaker = undefined,
+    n_speakers: u8 = 0,
+
+    pub const Kind = enum { base, custom_voice, voice_design };
+    pub const max_speakers = 32;
+    pub const Speaker = struct {
+        name: [24]u8 = undefined,
+        len: u8 = 0,
+        /// Its row in the talker's codec table.
+        id: i32,
+        /// `spk_is_dialect`: the codec language this voice speaks under `auto` or Chinese.
+        dialect: ?i32 = null,
+    };
 
     pub const max_languages = 32;
     pub const Language = struct {
@@ -107,6 +125,25 @@ pub const TtsConfig = struct {
             if (std.ascii.eqlIgnoreCase(l.name[0..l.len], name)) return l.id;
         }
         return null;
+    }
+
+    /// A built-in voice by name (any case).
+    pub fn speaker(self: *const TtsConfig, name: []const u8) ?*const Speaker {
+        for (self.speakers[0..self.n_speakers]) |*sp| {
+            if (std.ascii.eqlIgnoreCase(sp.name[0..sp.len], name)) return sp;
+        }
+        return null;
+    }
+
+    /// The language a request speaks in: a dialect voice keeps its dialect unless another language is named.
+    pub fn spokenLanguage(self: *const TtsConfig, voice: ?*const Speaker, language: ?i32) ?i32 {
+        const dialect = (voice orelse return language).dialect orelse return language;
+        return if (language == null or language == self.languageId("chinese")) dialect else language;
+    }
+
+    /// Whether `instructions` condition this checkpoint: a VoiceDesign description, a 1.7B CustomVoice style.
+    pub fn takesInstruct(self: *const TtsConfig) bool {
+        return self.kind == .voice_design or (self.kind == .custom_voice and !self.small);
     }
 
     /// The codec prefill before the speaker and [pad, bos]: the reference's auto prefix, or its language prefix.
@@ -166,6 +203,30 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) !TtsConf
                     cfg.n_languages += 1;
                 }
             };
+            if (tc.get("spk_id")) |sv| if (sv == .object) {
+                var it = sv.object.iterator();
+                while (it.next()) |kv| {
+                    const name = kv.key_ptr.*;
+                    const id = switch (kv.value_ptr.*) {
+                        .integer => |i| i,
+                        else => continue,
+                    };
+                    if (id < 0 or id >= cfg.codec_vocab or name.len > 24 or cfg.n_speakers == TtsConfig.max_speakers) continue;
+                    var sp: TtsConfig.Speaker = .{ .len = @intCast(name.len), .id = @intCast(id) };
+                    @memcpy(sp.name[0..name.len], name);
+                    sp.dialect = dialect: {
+                        const dialects = tc.get("spk_is_dialect") orelse break :dialect null;
+                        const languages = tc.get("codec_language_id") orelse break :dialect null;
+                        if (dialects != .object or languages != .object) break :dialect null;
+                        const d = dialects.object.get(name) orelse break :dialect null;
+                        if (d != .string) break :dialect null;
+                        const lang = languages.object.get(d.string) orelse break :dialect null;
+                        break :dialect if (lang == .integer and lang.integer >= 0 and lang.integer < cfg.codec_vocab) @intCast(lang.integer) else null;
+                    };
+                    cfg.speakers[cfg.n_speakers] = sp;
+                    cfg.n_speakers += 1;
+                }
+            };
 
             if (tc.get("code_predictor_config")) |cp_v| {
                 if (cp_v == .object) {
@@ -189,6 +250,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, json_text: []const u8) !TtsConf
     setI32(&cfg.im_start, obj, "im_start_token_id");
     setI32(&cfg.im_end, obj, "im_end_token_id");
     setI32(&cfg.assistant_tok, obj, "assistant_token_id");
+    if (obj.get("tts_model_type")) |v| if (v == .string) {
+        cfg.kind = std.meta.stringToEnum(TtsConfig.Kind, v.string) orelse .base;
+    };
+    if (obj.get("tts_model_size")) |v| cfg.small = v == .string and std.mem.eql(u8, v.string, "0b6");
     return cfg;
 }
 
@@ -937,24 +1002,40 @@ pub const TtsModel = struct {
         return .{ .hidden = self.cfg.cp_hidden, .heads = self.cfg.cp_heads, .kv = self.cfg.cp_kv, .head_dim = self.cfg.cp_head_dim, .eps = self.cfg.cp_rms_eps, .theta = self.cfg.cp_rope_theta, .eps_arr = self.cp_eps_arr };
     }
 
-    /// Generate the `[T, 16]` codebook matrix from text token ids (greedy).
-    /// `speaker_embed` (optional, `[1, t_hidden]`) is the ECAPA-TDNN embedding
-    /// of a reference clip for zero-shot voice cloning — inserted as one extra
-    /// position in the codec prefix (mirrors the reference). `language` (a
-    /// `codec_language_id` value, null = auto) pins the spoken language. Caller
-    /// owns the returned slice.
-    pub fn generateCodes(self: *TtsModel, input_ids: []const i32, max_frames: u32, progress: ?sse.Progress, speaker_embed: ?mlx.mlx_array, language: ?i32) ![][16]u32 {
+    /// What conditions one generation besides its text.
+    pub const Cond = struct {
+        /// A cloned voice: the reference clip's ECAPA embedding `[1, t_hidden]`.
+        speaker_embed: ?mlx.mlx_array = null,
+        /// A built-in voice: its row in the codec table (`TtsConfig.Speaker.id`).
+        speaker_id: ?i32 = null,
+        /// A `codec_language_id` value; null = auto.
+        language: ?i32 = null,
+        /// The instruct turn's token ids (`Synthesizer.buildInstructIds`).
+        instruct_ids: ?[]const i32 = null,
+        seed: u64 = 0,
+    };
+
+    /// The talker's first input and the text it still has to read.
+    const Prefill = struct {
+        seq: mlx.mlx_array,
+        /// Text fed one position a frame after the prefix, `[1, n, H]` (n = 0 when the prefix holds all of it).
+        trailing: mlx.mlx_array,
+        tts_pad: mlx.mlx_array,
+    };
+
+    /// The reference's input layout: `[instruct] role, codec prefix (+ voice) under tts_pad/tts_bos, text`. A Base
+    /// checkpoint streams its text (first token in the prefix, the rest a position a frame); VoiceDesign and
+    /// CustomVoice read all of it in the prefix, as the reference runs them.
+    fn prefill(self: *const TtsModel, input_ids: []const i32, cond: Cond) !Prefill {
         const s = self.s;
-        const cfg = self.cfg;
+        const cfg = &self.cfg;
         const H = cfg.t_hidden;
         const hc: c_int = @intCast(H);
 
-        // text_embed for the full prompt.
         const text_embed = try self.projectText(input_ids);
         defer _ = mlx.mlx_array_free(text_embed);
         const n_ids: c_int = @intCast(input_ids.len);
 
-        // tts special embeds.
         const tts_ids = [_]i32{ cfg.tts_bos, cfg.tts_eos, cfg.tts_pad };
         const tts_embeds = try self.projectText(&tts_ids);
         defer _ = mlx.mlx_array_free(tts_embeds);
@@ -963,58 +1044,107 @@ pub const TtsModel = struct {
         const tts_eos = try sliceSeq(tts_embeds, 1, 2, hc, s);
         defer _ = mlx.mlx_array_free(tts_eos);
         const tts_pad = try sliceSeq(tts_embeds, 2, 3, hc, s);
-        defer _ = mlx.mlx_array_free(tts_pad);
+        errdefer _ = mlx.mlx_array_free(tts_pad);
 
         var prefill_buf: [4]i32 = undefined;
-        const codec_pre = try embed(self.codec_embedding, cfg.codecPrefill(language, &prefill_buf), H, s);
+        const codec_pre = try embed(self.codec_embedding, cfg.codecPrefill(cond.language, &prefill_buf), H, s);
         defer _ = mlx.mlx_array_free(codec_pre);
         const suffix = [_]i32{ cfg.codec_pad, cfg.codec_bos };
         const codec_suf = try embed(self.codec_embedding, &suffix, H, s);
         defer _ = mlx.mlx_array_free(codec_suf);
-        // Voice cloning: splice the speaker embedding between the think-prefix
-        // and the pad/bos suffix → codec stream grows 5 → 6 positions. The
-        // downstream assembly is `codec_len`-relative, so it flows unchanged.
-        const codec_embed = if (speaker_embed) |spk| blk: {
-            const spk3 = try reshape(spk, &[_]c_int{ 1, 1, hc }, s); // [1,1,H]
-            defer _ = mlx.mlx_array_free(spk3);
-            break :blk try concat(&[_]mlx.mlx_array{ codec_pre, spk3, codec_suf }, 1, s); // [1,6,H]
-        } else try concat(&[_]mlx.mlx_array{ codec_pre, codec_suf }, 1, s); // [1,5,H]
+        // The voice is ONE position between the think prefix and [pad, bos]: a clone's embedding or a built-in
+        // speaker's codec row. The rest is `codec_len`-relative.
+        const voice: ?mlx.mlx_array = if (cond.speaker_embed) |spk|
+            try reshape(spk, &[_]c_int{ 1, 1, hc }, s)
+        else if (cond.speaker_id) |id|
+            try embed(self.codec_embedding, &[_]i32{id}, H, s)
+        else
+            null;
+        defer if (voice) |v| {
+            _ = mlx.mlx_array_free(v);
+        };
+        const codec_embed = if (voice) |v|
+            try concat(&[_]mlx.mlx_array{ codec_pre, v, codec_suf }, 1, s)
+        else
+            try concat(&[_]mlx.mlx_array{ codec_pre, codec_suf }, 1, s);
         defer _ = mlx.mlx_array_free(codec_embed);
-        const codec_len: c_int = mlx.getShape(codec_embed)[1]; // 5 (plain) or 6 (cloned), one more with a language
+        const codec_len: c_int = mlx.getShape(codec_embed)[1];
 
         // role_embed = text_embed[:, :3, :]
         const role = try sliceSeq(text_embed, 0, 3, hc, s);
         defer _ = mlx.mlx_array_free(role);
 
-        // pad_embeds = broadcast(tts_pad, [1, codec_len-2, H]); combined = concat([pad, bos]) + codec_embed[:, :-1, :]
+        // combined = concat([tts_pad x (codec_len-2), tts_bos]) + codec_embed[:, :-1, :]
         const pad_count: c_int = codec_len - 2;
         var pad_b = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pad_b);
         try mlx.check(mlx.mlx_broadcast_to(&pad_b, tts_pad, &[_]c_int{ 1, pad_count, hc }, 3, s));
-        const combined_a = try concat(&[_]mlx.mlx_array{ pad_b, tts_bos }, 1, s); // [1, pad_count+1, H]
+        const combined_a = try concat(&[_]mlx.mlx_array{ pad_b, tts_bos }, 1, s);
         defer _ = mlx.mlx_array_free(combined_a);
-        const codec_head_slice = try sliceSeq(codec_embed, 0, codec_len - 1, hc, s); // [1,4,H]
+        const codec_head_slice = try sliceSeq(codec_embed, 0, codec_len - 1, hc, s);
         defer _ = mlx.mlx_array_free(codec_head_slice);
         const combined = try addA(combined_a, codec_head_slice, s);
         defer _ = mlx.mlx_array_free(combined);
+        const codec_bos = try sliceSeq(codec_embed, codec_len - 1, codec_len, hc, s);
+        defer _ = mlx.mlx_array_free(codec_bos);
 
-        // input = concat([role, combined]); first_text = text_embed[:,3:4,:] + codec_embed[:,-1:,:]; input += first_text
-        const input_a = try concat(&[_]mlx.mlx_array{ role, combined }, 1, s);
-        defer _ = mlx.mlx_array_free(input_a);
-        const text3 = try sliceSeq(text_embed, 3, 4, hc, s);
-        defer _ = mlx.mlx_array_free(text3);
-        const codec_last = try sliceSeq(codec_embed, codec_len - 1, codec_len, hc, s);
-        defer _ = mlx.mlx_array_free(codec_last);
-        const first_text = try addA(text3, codec_last, s);
-        defer _ = mlx.mlx_array_free(first_text);
-        const seq = try concat(&[_]mlx.mlx_array{ input_a, first_text }, 1, s); // [1,8,H]
+        const instruct: ?mlx.mlx_array = if (cond.instruct_ids) |ids| try self.projectText(ids) else null;
+        defer if (instruct) |i| {
+            _ = mlx.mlx_array_free(i);
+        };
+        var parts: [5]mlx.mlx_array = undefined;
+        var n: usize = 0;
+        if (instruct) |i| {
+            parts[n] = i;
+            n += 1;
+        }
+        parts[n..][0..2].* = .{ role, combined };
+        n += 2;
 
-        // trailing_text_hidden = concat([text_embed[:, 4:-5, :], tts_eos])
-        const text_mid = try sliceSeq(text_embed, 4, n_ids - 5, hc, s);
+        if (cfg.kind == .base) {
+            // first_text = text_embed[:, 3:4, :] + codec_bos; trailing = concat([text_embed[:, 4:-5, :], tts_eos])
+            const text3 = try sliceSeq(text_embed, 3, 4, hc, s);
+            defer _ = mlx.mlx_array_free(text3);
+            const first_text = try addA(text3, codec_bos, s);
+            defer _ = mlx.mlx_array_free(first_text);
+            parts[n] = first_text;
+            const seq = try concat(parts[0 .. n + 1], 1, s);
+            errdefer _ = mlx.mlx_array_free(seq);
+            const text_mid = try sliceSeq(text_embed, 4, n_ids - 5, hc, s);
+            defer _ = mlx.mlx_array_free(text_mid);
+            return .{ .seq = seq, .trailing = try concat(&[_]mlx.mlx_array{ text_mid, tts_eos }, 1, s), .tts_pad = tts_pad };
+        }
+        // concat([text_embed[:, 3:-5, :], tts_eos]) + codec_pad, then tts_pad + codec_bos
+        const text_mid = try sliceSeq(text_embed, 3, n_ids - 5, hc, s);
         defer _ = mlx.mlx_array_free(text_mid);
-        const trailing = try concat(&[_]mlx.mlx_array{ text_mid, tts_eos }, 1, s);
+        const text_all = try concat(&[_]mlx.mlx_array{ text_mid, tts_eos }, 1, s);
+        defer _ = mlx.mlx_array_free(text_all);
+        const codec_pad = try sliceSeq(codec_embed, codec_len - 2, codec_len - 1, hc, s);
+        defer _ = mlx.mlx_array_free(codec_pad);
+        const text_on_pad = try addA(text_all, codec_pad, s);
+        defer _ = mlx.mlx_array_free(text_on_pad);
+        const last = try addA(tts_pad, codec_bos, s);
+        defer _ = mlx.mlx_array_free(last);
+        parts[n..][0..2].* = .{ text_on_pad, last };
+        const seq = try concat(parts[0 .. n + 2], 1, s);
+        errdefer _ = mlx.mlx_array_free(seq);
+        return .{ .seq = seq, .trailing = try sliceSeq(text_embed, 0, 0, hc, s), .tts_pad = tts_pad };
+    }
+
+    /// Generate the `[T, 16]` codebook matrix from text token ids under `cond`. Caller owns the returned slice.
+    pub fn generateCodes(self: *TtsModel, input_ids: []const i32, max_frames: u32, progress: ?sse.Progress, cond: Cond) ![][16]u32 {
+        const s = self.s;
+        const cfg = self.cfg;
+        const hc: c_int = @intCast(cfg.t_hidden);
+
+        const pf = try self.prefill(input_ids, cond);
+        const tts_pad = pf.tts_pad;
+        defer _ = mlx.mlx_array_free(tts_pad);
+        const trailing = pf.trailing;
         defer _ = mlx.mlx_array_free(trailing);
         const trailing_len: u32 = @intCast(mlx.getShape(trailing)[1]);
+        // The current talker input: the full prefix on frame 0, then one new position per frame.
+        var input = pf.seq;
 
         // Suppress mask for codebook-0: [codec_vocab-1024, codec_vocab) except eos → -inf.
         const suppress_mask = try self.buildSuppressMask();
@@ -1024,17 +1154,11 @@ pub const TtsModel = struct {
         errdefer codes_list.deinit(self.allocator);
         var code0_hist = std.ArrayList(i32).empty; // unique code0s for repetition penalty
         defer code0_hist.deinit(self.allocator);
-        var rng: u64 = self.cfg.seed;
+        var rng: u64 = cond.seed;
 
         const t_dims = self.talkerDims();
         var talker_cache = try StackCache.init(self.allocator, self.talker_layers.len);
         defer talker_cache.deinit(self.allocator);
-
-        // `input` is the current talker input: the full prefix on frame 0, then
-        // one new position per frame (matching the mlx_audio KV-cache path).
-        var input = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&input, seq));
-        _ = mlx.mlx_array_free(seq);
 
         var trailing_idx: u32 = 0;
         var frame: u32 = 0;
@@ -2476,6 +2600,20 @@ pub const Synthesizer = struct {
         return ids;
     }
 
+    /// The reference's instruct turn, `<|im_start|>user\n{instruct}<|im_end|>\n`, as ids (owned).
+    pub fn buildInstructIds(self: *const Synthesizer, instruct: []const u8) ![]i32 {
+        const turn = try std.fmt.allocPrint(self.allocator, "user\n{s}", .{instruct});
+        defer self.allocator.free(turn);
+        const body = try self.tokenizer.encode(self.allocator, turn);
+        defer self.allocator.free(body);
+        const cfg = self.model.cfg;
+        var ids = try self.allocator.alloc(i32, body.len + 3);
+        ids[0] = cfg.im_start;
+        for (body, 1..) |b, i| ids[i] = @intCast(b);
+        ids[body.len + 1 ..][0..2].* = .{ cfg.im_end, cfg.newline_tok };
+        return ids;
+    }
+
     /// True when this checkpoint can do zero-shot voice cloning (ships a
     /// speaker encoder). The `-Base` models do; others fall back to plain TTS.
     pub fn supportsCloning(self: *const Synthesizer) bool {
@@ -2500,26 +2638,44 @@ pub const Synthesizer = struct {
         return false;
     }
 
+    /// What a request asks of the voice; the plugin has checked each field against the checkpoint's kind.
+    pub const Request = struct {
+        /// 24 kHz mono samples to clone (a checkpoint with a speaker encoder).
+        ref_audio: ?[]const f32 = null,
+        /// A built-in voice (CustomVoice).
+        speaker: ?*const TtsConfig.Speaker = null,
+        /// A voice description (VoiceDesign) or a style (1.7B CustomVoice).
+        instruct: ?[]const u8 = null,
+        /// A `TtsConfig.languageId`; null = auto.
+        language: ?i32 = null,
+        seed: u64 = 0,
+    };
+
     /// text → waveform samples (f32, owned). `max_frames` caps generation.
-    /// `ref_audio` (optional, 24 kHz mono f32) clones that voice via the
-    /// speaker encoder; ignored (plain voice) when the model has none.
-    /// `language` (null = auto) is a `TtsConfig.languageId`.
-    pub fn synthesize(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, ref_audio: ?[]const f32, language: ?i32) ![]f32 {
+    pub fn synthesize(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, req: Request) ![]f32 {
         const ids = try self.buildInputIds(text);
         defer self.allocator.free(ids);
+        const instruct_ids: ?[]i32 = if (req.instruct) |i| try self.buildInstructIds(i) else null;
+        defer if (instruct_ids) |i| self.allocator.free(i);
         var spk_emb: ?mlx.mlx_array = null;
         defer {
             if (spk_emb) |e| _ = mlx.mlx_array_free(e);
         }
         const io_t = std.Io.Threaded.global_single_threaded.io();
-        if (ref_audio) |ref| {
+        if (req.ref_audio) |ref| {
             if (self.model.speaker) |*sp| {
                 if (progress) |p| p.emit("Encoding reference voice", 0, 0);
                 spk_emb = try resolveSpeakerEmbedding(sp, &self.spk_cache, ref);
             }
         }
         const t1 = std.Io.Timestamp.now(io_t, .boot);
-        const codes = try self.model.generateCodes(ids, max_frames, progress, spk_emb, language);
+        const codes = try self.model.generateCodes(ids, max_frames, progress, .{
+            .speaker_embed = spk_emb,
+            .speaker_id = if (req.speaker) |sp| sp.id else null,
+            .language = self.model.cfg.spokenLanguage(req.speaker, req.language),
+            .instruct_ids = instruct_ids,
+            .seed = req.seed,
+        });
         const gen_ns: u64 = @intCast(t1.untilNow(io_t, .boot).nanoseconds);
         defer self.allocator.free(codes);
         if (codes.len == 0) return self.allocator.alloc(f32, 0);
@@ -2531,9 +2687,9 @@ pub const Synthesizer = struct {
         return wav;
     }
 
-    /// text → 16-bit PCM mono WAV bytes (owned). `ref_audio` clones a voice.
-    pub fn synthesizeWav(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, ref_audio: ?[]const f32, language: ?i32) ![]u8 {
-        const samples = try self.synthesize(text, max_frames, progress, ref_audio, language);
+    /// text → 16-bit PCM mono WAV bytes (owned).
+    pub fn synthesizeWav(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, req: Request) ![]u8 {
+        const samples = try self.synthesize(text, max_frames, progress, req);
         defer self.allocator.free(samples);
         return wav_mod.encodePcm16Mono(self.allocator, samples, self.model.cfg.sample_rate);
     }
@@ -3293,6 +3449,31 @@ test "parseConfig reads talker dims" {
     try std.testing.expectEqual(@as(i32, 151673), cfg.tts_eos);
 }
 
+test "voices: the kind, the speakers and their dialects come from the config; a dialect voice keeps its dialect" {
+    const cfg = try parseConfig(std.testing.allocator,
+        \\{"tts_model_type":"custom_voice","tts_model_size":"1b7","talker_config":{"vocab_size":3072,
+        \\   "codec_language_id":{"chinese":2055,"english":2050,"beijing_dialect":2074},
+        \\   "spk_id":{"ryan":3061,"dylan":2878,"bogus":9999},"spk_is_dialect":{"ryan":false,"dylan":"beijing_dialect"}}}
+    );
+    try std.testing.expect(cfg.kind == .custom_voice and cfg.takesInstruct() and cfg.n_speakers == 2);
+    const ryan = cfg.speaker("Ryan").?;
+    const dylan = cfg.speaker("dylan").?;
+    try std.testing.expect(ryan.id == 3061 and ryan.dialect == null and dylan.dialect.? == 2074);
+    try std.testing.expect(cfg.speaker("bogus") == null and cfg.speaker("") == null);
+    try std.testing.expectEqual(@as(?i32, 2074), cfg.spokenLanguage(dylan, null));
+    try std.testing.expectEqual(@as(?i32, 2074), cfg.spokenLanguage(dylan, cfg.languageId("chinese")));
+    try std.testing.expectEqual(@as(?i32, 2050), cfg.spokenLanguage(dylan, cfg.languageId("english")));
+    try std.testing.expectEqual(@as(?i32, null), cfg.spokenLanguage(ryan, null));
+    try std.testing.expectEqual(@as(?i32, 2050), cfg.spokenLanguage(null, 2050));
+
+    var small = try parseConfig(std.testing.allocator, "{\"tts_model_type\":\"custom_voice\",\"tts_model_size\":\"0b6\"}");
+    try std.testing.expect(!small.takesInstruct());
+    small.kind = .voice_design;
+    try std.testing.expect(small.takesInstruct());
+    const base = try parseConfig(std.testing.allocator, "{\"tts_model_type\":\"something_new\"}");
+    try std.testing.expect(base.kind == .base and !base.takesInstruct());
+}
+
 test "language: the table skips dialects and out-of-vocab ids; the prefill is the reference's auto or language prefix" {
     const json =
         \\{"talker_config":{"vocab_size":3072,"codec_think_id":2154,
@@ -3337,7 +3518,7 @@ test "generateCodes yields at frame boundaries and stops on cancel" {
     defer sse.genYield().* = null;
     const ids = [_]i32{ 9707, 11, 1879, 13 };
     const p = sse.Progress{ .ctx = &h, .cb = H.emitCb, .cancelled_cb = H.cancelCb };
-    try std.testing.expectError(error.Cancelled, m.generateCodes(&ids, 2048, p, null, null));
+    try std.testing.expectError(error.Cancelled, m.generateCodes(&ids, 2048, p, .{}));
     try std.testing.expectEqual(@as(u32, 2), h.yields);
 }
 
@@ -3377,7 +3558,7 @@ test "talker+predictor reproduce greedy oracle codes" {
     m.cfg.rep_penalty = 1.0; // match the pure-greedy oracle (rep_pen=1.0)
     m.cfg.temperature = 0.0; // greedy (deterministic) for equivalence
 
-    const codes = try m.generateCodes(ids, @intCast(check_frames), null, null, null);
+    const codes = try m.generateCodes(ids, @intCast(check_frames), null, .{});
     defer allocator.free(codes);
 
     try std.testing.expect(codes.len >= check_frames);
@@ -3412,6 +3593,68 @@ test "talker+predictor reproduce greedy oracle codes" {
 
     try std.testing.expectEqual(@as(usize, 0), f0_mism); // frame 0 bit-exact
     try std.testing.expect(code0_match >= 1); // talker code0 reproduced
+}
+
+// The voice paths against mlx-audio (tests/dump_qwen3_tts_voice_fixture.py): the talker's first input by cosine AND
+// rms, then frame 0 of a greedy run exactly.
+//   TTS_VOICE_MODEL = a CustomVoice or VoiceDesign pack; TTS_VOICE_FIXTURE = the dump's folder
+test "a voice prefix matches the reference" {
+    const model_dir = std.mem.span(std.c.getenv("TTS_VOICE_MODEL") orelse return error.SkipZigTest);
+    const fx = std.mem.span(std.c.getenv("TTS_VOICE_FIXTURE") orelse return error.SkipZigTest);
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ids = try readI32File(io, a, try std.fmt.allocPrint(a, "{s}/input_ids.i32", .{fx}));
+    const instruct: ?[]i32 = readI32File(io, a, try std.fmt.allocPrint(a, "{s}/instruct_ids.i32", .{fx})) catch null;
+    const ref_codes = try readI32File(io, a, try std.fmt.allocPrint(a, "{s}/codes.i32", .{fx}));
+    const want = try readF32File(io, a, try std.fmt.allocPrint(a, "{s}/prefill.f32", .{fx}));
+    const speaker_name: ?[]u8 = std.Io.Dir.cwd().readFileAlloc(io, try std.fmt.allocPrint(a, "{s}/speaker.txt", .{fx}), a, .limited(64)) catch null;
+
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var m = try loadModel(io, std.testing.allocator, s, model_dir);
+    defer m.deinit();
+    m.cfg.rep_penalty = 1.0;
+    m.cfg.temperature = 0.0;
+    const speaker = if (speaker_name) |n| m.cfg.speaker(n).? else null;
+    const cond: TtsModel.Cond = .{
+        .speaker_id = if (speaker) |sp| sp.id else null,
+        .language = m.cfg.spokenLanguage(speaker, null),
+        .instruct_ids = instruct,
+    };
+
+    const pf = try m.prefill(ids, cond);
+    defer for ([_]mlx.mlx_array{ pf.seq, pf.trailing, pf.tts_pad }) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    try std.testing.expectEqual(@as(c_int, 0), mlx.getShape(pf.trailing)[1]);
+    var seq32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(seq32);
+    try mlx.check(mlx.mlx_astype(&seq32, pf.seq, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(seq32));
+    const got = mlx.mlx_array_data_float32(seq32).?[0..mlx.mlx_array_size(seq32)];
+    try std.testing.expectEqual(want.len, got.len);
+    var dot: f64 = 0;
+    var gg: f64 = 0;
+    var ww: f64 = 0;
+    for (got, want) |g, w| {
+        dot += @as(f64, g) * w;
+        gg += @as(f64, g) * g;
+        ww += @as(f64, w) * w;
+    }
+    const cos = dot / @sqrt(gg * ww);
+    const rms_ratio = @sqrt(gg / ww);
+
+    const frames: u32 = @intCast(@min(ref_codes.len / 16, 24));
+    const codes = try m.generateCodes(ids, frames, null, cond);
+    defer std.testing.allocator.free(codes);
+    var chain: usize = 0;
+    while (chain < codes.len and codes[chain][0] == @as(u32, @intCast(ref_codes[chain * 16]))) chain += 1;
+    std.debug.print("[tts-test] voice prefix {d} positions: cos {d:.6}, rms ratio {d:.5}; greedy code0 chain {d}/{d}\n", .{ mlx.getShape(pf.seq)[1], cos, rms_ratio, chain, frames });
+    try std.testing.expect(cos > 0.9999);
+    try std.testing.expect(@abs(rms_ratio - 1) < 1e-3);
+    for (codes[0], ref_codes[0..16]) |c, r| try std.testing.expectEqual(@as(u32, @intCast(r)), c);
 }
 
 // Codec decoder equivalence (oracle B): decode the EXACT reference codes and
@@ -3563,7 +3806,7 @@ test "end-to-end native TTS produces non-silent audio" {
     var dec = try loadCodecDecoder(io, allocator, s, model_dir);
     defer dec.deinit();
 
-    const codes = try m.generateCodes(ids, 256, null, null, null);
+    const codes = try m.generateCodes(ids, 256, null, .{});
     defer allocator.free(codes);
     try std.testing.expect(codes.len > 8);
 
@@ -3617,7 +3860,7 @@ test "Synthesizer: native text to WAV" {
     std.debug.print("[tts-synth] built {d} ids (expected {d})\n", .{ ids.len, expected.len });
     try std.testing.expectEqualSlices(i32, &expected, ids);
 
-    const wav = try synth.synthesizeWav(text, 256, null, null, null);
+    const wav = try synth.synthesizeWav(text, 256, null, .{});
     defer allocator.free(wav);
     try std.testing.expect(wav.len > 44 + 1000); // real audio, not just a header
     try std.testing.expectEqualSlices(u8, "RIFF", wav[0..4]);
@@ -3644,7 +3887,7 @@ test "8-bit quantized checkpoint loads and produces non-silent audio" {
     // engine." in the reference chat-template shape (same ids the Synthesizer
     // test pins against HF AutoTokenizer).
     const ids = [_]i32{ 151644, 77091, 198, 9707, 1879, 11, 419, 374, 264, 1273, 315, 279, 2205, 1467, 311, 8806, 4712, 13, 151645, 198, 151644, 77091, 198 };
-    const codes = try m.generateCodes(&ids, 64, null, null, null);
+    const codes = try m.generateCodes(&ids, 64, null, .{});
     defer allocator.free(codes);
     try std.testing.expect(codes.len > 4); // real speech, not an instant EOS
     for (codes) |frame| for (frame) |c| {
@@ -3703,7 +3946,7 @@ test "8-bit checkpoint parity vs bf16 (greedy, cloned voice)" {
             _ = mlx.mlx_array_free(e);
         };
         if (m.speaker) |*sp| spk = try sp.embed(ref);
-        const codes = try m.generateCodes(&ids, 128, null, spk, null);
+        const codes = try m.generateCodes(&ids, 128, null, .{ .speaker_embed = spk });
         defer allocator.free(codes);
         try std.testing.expect(codes.len > 4);
 
@@ -3970,10 +4213,10 @@ test "gpu predict: generateCodes byte-identical to host predictor loop" {
     for ([_]f32{ 0.0, 0.9 }) |temp| {
         m.cfg.temperature = temp;
         gpu_predict_override = false;
-        const host_codes = try m.generateCodes(&ids, 48, null, null, null);
+        const host_codes = try m.generateCodes(&ids, 48, null, .{});
         defer allocator.free(host_codes);
         gpu_predict_override = true;
-        const gpu_codes = try m.generateCodes(&ids, 48, null, null, null);
+        const gpu_codes = try m.generateCodes(&ids, 48, null, .{});
         defer allocator.free(gpu_codes);
         gpu_predict_override = null;
         try std.testing.expectEqual(host_codes.len, gpu_codes.len);
@@ -4023,10 +4266,10 @@ test "compiled chain: greedy codes agree with the lazy chain within band" {
     gpu_predict_override = true;
     defer gpu_predict_override = null;
     cp_compile_override = false;
-    const lazy_codes = try m.generateCodes(&ids, 48, null, null, null);
+    const lazy_codes = try m.generateCodes(&ids, 48, null, .{});
     defer allocator.free(lazy_codes);
     cp_compile_override = true;
-    const compiled_codes = try m.generateCodes(&ids, 48, null, null, null);
+    const compiled_codes = try m.generateCodes(&ids, 48, null, .{});
     defer allocator.free(compiled_codes);
     cp_compile_override = null;
     try std.testing.expect(m.cp_chain_compiled != null); // compile must have ENGAGED
@@ -4071,10 +4314,10 @@ test "cached predictor: greedy codes agree with full re-forward within band" {
     cp_compile_override = false;
     defer cp_compile_override = null;
     cp_cache_override = false;
-    const full_codes = try m.generateCodes(&ids, 48, null, null, null);
+    const full_codes = try m.generateCodes(&ids, 48, null, .{});
     defer allocator.free(full_codes);
     cp_cache_override = true;
-    const cached_codes = try m.generateCodes(&ids, 48, null, null, null);
+    const cached_codes = try m.generateCodes(&ids, 48, null, .{});
     defer allocator.free(cached_codes);
     cp_cache_override = null;
 
