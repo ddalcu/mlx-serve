@@ -857,11 +857,18 @@ pub const ModelRegistry = struct {
         if (roots.len == 0) return 0;
         var found = try model_discovery.discoverModelsMany(self.io, self.allocator, roots);
         defer found.deinit();
+        // Resolved before the lock: a registered spelling of the folder may differ.
+        const reals = try self.allocator.alloc([]const u8, found.models.len);
+        defer {
+            for (reals) |r| if (r.len > 0) self.allocator.free(r);
+            self.allocator.free(reals);
+        }
+        for (found.models, reals) |m, *r| r.* = model_discovery.realPathOrEmpty(self.io, self.allocator, m.path);
         var added: u32 = 0;
         var cleared: u32 = 0;
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
-        for (found.models) |m| {
+        for (found.models, reals) |m, real| {
             if (self.entries.get(m.id)) |e| {
                 if (e.state == .error_state and std.mem.eql(u8, e.path, m.path)) {
                     self.markUnloadedLocked(e);
@@ -870,12 +877,19 @@ pub const ModelRegistry = struct {
                 }
                 continue;
             }
-            if (self.peekByPathLocked(m.path) != null) continue;
+            if (self.hasDirLocked(m.path, real)) continue;
             _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
             added += 1;
         }
         if (cleared > 0) log.info("[registry] rescan cleared {d} failed load(s)\n", .{cleared});
         return added;
+    }
+
+    /// An entry already holds this folder under another spelling. Caller holds `mutex`.
+    fn hasDirLocked(self: *ModelRegistry, path: []const u8, real: []const u8) bool {
+        var it = self.entries.valueIterator();
+        while (it.next()) |e| if (model_discovery.sameDir(e.*.path, e.*.real_path, path, real)) return true;
+        return false;
     }
 
     /// Look up an entry by id without taking a refcount. Returns null if
@@ -2494,6 +2508,31 @@ test "ModelRegistry: rescan absorbs newly downloaded dirs as stubs (add-only, id
     // Idempotent: nothing new on disk, nothing added, the boot entry untouched.
     try testing.expectEqual(@as(u32, 0), try reg.rescan());
     try testing.expect(reg.peek("org/first") != null);
+}
+
+test "ModelRegistry: rescan adds no second entry for a folder registered through a symlink" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "lib");
+    try tmp.dir.symLink(io, "lib", "link", .{ .is_directory = true });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const base = buf[0..try tmp.dir.realPath(io, &buf)];
+    const lib = try std.fs.path.join(testing.allocator, &.{ base, "lib" });
+    defer testing.allocator.free(lib);
+    const via_link = try std.fs.path.join(testing.allocator, &.{ base, "link", "org", "m" });
+    defer testing.allocator.free(via_link);
+
+    const discovery = try model_discovery.discoverModelsMany(io, testing.allocator, &.{lib});
+    var reg = try ModelRegistry.init(testing.allocator, io, discovery, 3, 0, null);
+    defer reg.deinit();
+    try tmp.dir.createDirPath(io, "lib/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/org/m/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/org/m/model.safetensors", .data = "0123" });
+
+    _ = try reg.registerByPath(io, via_link, null);
+    try testing.expectEqual(@as(u32, 0), try reg.rescan());
+    try testing.expectEqual(@as(u32, 1), reg.entries.count());
 }
 
 test "ModelRegistry: rescan clears a failed load so the completed dir can load again" {
