@@ -397,7 +397,8 @@ test "deepseek_v41 ablation: the tap dumps a prompt forward, not a decode step o
     // runs its decode steps through the prompt path, and a verify block is all rows, so both reach `runPrompt`.
     const step = try t.plugin(.decode, &.{44}, @intCast(short_prompt.len));
     defer _ = mlx.mlx_array_free(step);
-    const verify = try t.plugin(.verify, &.{ 44, 2 }, @intCast(short_prompt.len));
+    // The verify block sits where the decode step left the state.
+    const verify = try t.plugin(.verify, &.{ 45, 2 }, @intCast(short_prompt.len + 1));
     defer _ = mlx.mlx_array_free(verify);
     try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
 }
