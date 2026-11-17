@@ -276,6 +276,70 @@ test "deepseek_v41 ablation: a tap directory's next seq is one past its index, s
     try testing.expectEqual(@as(u64, 2), ablation.seqFromIndex(two ++ "{\"seq\":"));
 }
 
+test "deepseek_v41 ablation: two writers racing in one tap directory claim distinct files and leave whole records" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir = path_buf[0..try td.dir.realPath(io, &path_buf)];
+    // Eight records each, in two threads, so the two writers meet in the directory: each must claim its own seq (the
+    // exclusive create steps past a name the other took), and the two appends must not interleave inside a line.
+    const Writer = struct {
+        dir: []const u8,
+        tag: []const u8,
+        seqs: [8]u64 = undefined,
+        failed: ?anyerror = null,
+        fn run(w: *@This()) void {
+            for (&w.seqs, 0..) |*seq, i| {
+                seq.* = ablation.writeTapRecord(testing.allocator, w.dir, w.tag, i * 4, &.{ 10, 11, 12 }, 2) catch |e| {
+                    w.failed = e;
+                    return;
+                };
+            }
+        }
+    };
+    var a: Writer = .{ .dir = dir, .tag = "writer-a's tensor" };
+    var b: Writer = .{ .dir = dir, .tag = "writer-b's tensor" };
+    // A tensor the index does not name: both writers read seq 0 from the empty index and must step past this name
+    // (exclusive create), so the claim fallback runs deterministically, not only when the threads happen to collide.
+    try td.dir.writeFile(io, .{ .sub_path = "tap-000000.npy", .data = "sentinel-not-a-tensor" });
+    const ta = try std.Thread.spawn(.{}, Writer.run, .{&a});
+    const tb = try std.Thread.spawn(.{}, Writer.run, .{&b});
+    ta.join();
+    tb.join();
+    const sentinel = try td.dir.readFileAlloc(io, "tap-000000.npy", testing.allocator, .unlimited);
+    defer testing.allocator.free(sentinel);
+    try testing.expectEqualStrings("sentinel-not-a-tensor", sentinel);
+    try testing.expectEqual(@as(?anyerror, null), a.failed);
+    try testing.expectEqual(@as(?anyerror, null), b.failed);
+
+    const index = try td.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .unlimited);
+    defer testing.allocator.free(index);
+    var by_tag = [_]usize{ 0, 0 };
+    var seqs: [16]u64 = undefined;
+    var n: usize = 0;
+    var lines = std.mem.splitScalar(u8, index, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+        defer parsed.deinit();
+        const rec = parsed.value.object;
+        const seq: u64 = @intCast(rec.get("seq").?.integer);
+        const file = rec.get("file").?.string;
+        const tail = rec.get("tail_ids").?.array;
+        try testing.expectEqual(@as(usize, 3), tail.items.len);
+        const bytes = try td.dir.readFileAlloc(io, file, testing.allocator, .unlimited);
+        defer testing.allocator.free(bytes);
+        if (std.mem.eql(u8, bytes, a.tag)) by_tag[0] += 1 else if (std.mem.eql(u8, bytes, b.tag)) by_tag[1] += 1 else return error.TestUnexpectedResult;
+        for (seqs[0..n]) |seen| try testing.expect(seen != seq);
+        seqs[n] = seq;
+        n += 1;
+    }
+    // Every record of both writers landed once, on its own file, with its own seq.
+    try testing.expectEqual(@as(usize, 16), n);
+    try testing.expectEqualSlices(usize, &.{ 8, 8 }, &by_tag);
+}
+
 test "deepseek_v41 ablation: the stream tap keeps the hc mean of a pass's last rows across its spans, only while on" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());

@@ -319,6 +319,73 @@ fn nextTapSeq(gpa: std.mem.Allocator, d: std.Io.Dir, io: std.Io) !u64 {
     return seqFromIndex(buf[0..n]);
 }
 
+/// One record in a tap directory, filesystem only (no MLX): `file_bytes` written as `<dir>/tap-<seq>.npy`, claimed by
+/// an exclusive create, and a line for `pos`/`ids` appended to `<dir>/index.jsonl` under an exclusive lock. The seq
+/// comes from the directory, never from memory, so a restart cannot overwrite an earlier file; a writer that loses the
+/// race for `tap-<seq>.npy` takes the next seq; an append cuts a torn last record back to its last newline first. The
+/// dir is the owner's only (0700), its files 0600. Returns the seq it claimed.
+pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []const u8, pos: usize, ids: []const u32, rows: usize) !u64 {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
+    defer d.close(io);
+    // Prompt activations and ids: the owner's only.
+    const dir_z = try gpa.dupeSentinel(u8, dir, 0);
+    defer gpa.free(dir_z);
+    if (builtin.os.tag != .windows) _ = std.c.chmod(dir_z, 0o700);
+    // The name is claimed by an exclusive create, not by a check then a write: two writers sharing the directory race
+    // for `tap-<seq>.npy`, the loser takes the next seq.
+    var seq = try nextTapSeq(gpa, d, io);
+    var name_buf: [64]u8 = undefined;
+    var name: []const u8 = undefined;
+    var tries: usize = 0;
+    while (tries < 1000) : (tries += 1) {
+        name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
+        const flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
+            .{ .exclusive = true }
+        else
+            .{ .exclusive = true, .permissions = .fromMode(0o600) };
+        d.writeFile(io, .{ .sub_path = name, .data = file_bytes, .flags = flags }) catch |e| switch (e) {
+            error.PathAlreadyExists => {
+                seq += 1;
+                continue;
+            },
+            else => return e,
+        };
+        break;
+    } else return error.TapSeqExhausted;
+
+    var line: std.Io.Writer.Allocating = .init(gpa);
+    defer line.deinit();
+    try line.writer.print("{{\"seq\":{d},\"file\":\"{s}\",\"position\":{d},\"prompt_tokens\":{d},\"rows\":{d},\"tail_ids\":[", .{ seq, name, pos, pos + ids.len, rows });
+    const tail = ids[ids.len - @min(ids.len, 8) ..];
+    for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
+    try line.writer.writeAll("]}\n");
+    const idx_flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
+        .{ .read = true, .truncate = false, .lock = .exclusive }
+    else
+        .{ .read = true, .truncate = false, .lock = .exclusive, .permissions = .fromMode(0o600) };
+    var idx = try d.createFile(io, "index.jsonl", idx_flags);
+    defer idx.close(io);
+    var end = (try idx.stat(io)).size;
+    if (end > 0) {
+        // A crash can leave a half-written last record; a JSONL reader cannot parse it and the append below would
+        // extend it. Cut it back to the last newline (its tensor stays on disk, unindexed) before writing ours.
+        const win: usize = @intCast(@min(end, 4096));
+        var tail_buf: [4096]u8 = undefined;
+        const got = try idx.readPositionalAll(io, tail_buf[0..win], end - win);
+        if (got > 0 and tail_buf[got - 1] != '\n') {
+            const cut: u64 = if (std.mem.lastIndexOfScalar(u8, tail_buf[0..got], '\n')) |i|
+                end - win + i + 1
+            else
+                end - win;
+            try idx.setLength(io, cut);
+            end = cut;
+        }
+    }
+    try idx.writePositionalAll(io, line.written(), end);
+    return seq;
+}
+
 /// The tap's rows for one prompt forward as `<dir>/tap-<seq>.npy` (f32 `[layers + 1, rows, dim]`: per site the last
 /// `keep` rows its passes recorded, in prompt order, the last one the prompt's last token) and a line in
 /// `<dir>/index.jsonl` (`pos` the forward's first position, `ids` its tokens). The dir is the owner's only (0700), its
@@ -351,13 +418,6 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     const shape = mlx.getShape(all);
     const data = (mlx.mlx_array_data_float32(all) orelse return error.TapNotF32)[0..mlx.mlx_array_size(all)];
 
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
-    defer d.close(io);
-    // Prompt activations and ids: the owner's only.
-    const dir_z = try gpa.dupeSentinel(u8, dir, 0);
-    defer gpa.free(dir_z);
-    if (builtin.os.tag != .windows) _ = std.c.chmod(dir_z, 0o700);
     var header_buf: [256]u8 = undefined;
     const npy = try npyHeader(&header_buf, @intCast(shape[0]), @intCast(shape[1]), @intCast(shape[2]));
     const body = std.mem.sliceAsBytes(data);
@@ -365,58 +425,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     defer gpa.free(file_bytes);
     @memcpy(file_bytes[0..npy.len], npy);
     @memcpy(file_bytes[npy.len..], body);
-    // The name is claimed by an exclusive create, not by a check then a write: two servers sharing the directory race
-    // for `tap-<seq>.npy`, the loser takes the next seq.
-    var seq = try nextTapSeq(gpa, d, io);
-    var name_buf: [64]u8 = undefined;
-    var name: []const u8 = undefined;
-    var tries: usize = 0;
-    while (tries < 1000) : (tries += 1) {
-        name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
-        const flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
-            .{ .exclusive = true }
-        else
-            .{ .exclusive = true, .permissions = .fromMode(0o600) };
-        d.writeFile(io, .{ .sub_path = name, .data = file_bytes, .flags = flags }) catch |e| switch (e) {
-            error.PathAlreadyExists => {
-                seq += 1;
-                continue;
-            },
-            else => return e,
-        };
-        break;
-    } else return error.TapSeqExhausted;
-
-    var line: std.Io.Writer.Allocating = .init(gpa);
-    defer line.deinit();
-    try line.writer.print("{{\"seq\":{d},\"file\":\"{s}\",\"position\":{d},\"prompt_tokens\":{d},\"rows\":{d},\"tail_ids\":[", .{ seq, name, pos, pos + ids.len, shape[1] });
-    const tail = ids[ids.len - @min(ids.len, 8) ..];
-    for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
-    try line.writer.writeAll("]}\n");
-    const idx_flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
-        .{ .read = true, .truncate = false, .lock = .exclusive }
-    else
-        .{ .read = true, .truncate = false, .lock = .exclusive, .permissions = .fromMode(0o600) };
-    var idx = try d.createFile(io, "index.jsonl", idx_flags);
-    defer idx.close(io);
-    var end = (try idx.stat(io)).size;
-    if (end > 0) {
-        // A crash can leave a half-written last record; a JSONL reader cannot parse it and the append below would
-        // extend it. Cut it back to the last newline (its tensor stays on disk, unindexed) before writing ours.
-        const win: usize = @intCast(@min(end, 4096));
-        var tail_buf: [4096]u8 = undefined;
-        const got = try idx.readPositionalAll(io, tail_buf[0..win], end - win);
-        if (got > 0 and tail_buf[got - 1] != '\n') {
-            const cut: u64 = if (std.mem.lastIndexOfScalar(u8, tail_buf[0..got], '\n')) |i|
-                end - win + i + 1
-            else
-                end - win;
-            try idx.setLength(io, cut);
-            end = cut;
-        }
-    }
-    try idx.writePositionalAll(io, line.written(), end);
-    return seq;
+    return writeTapRecord(gpa, dir, file_bytes, pos, ids, @intCast(shape[1]));
 }
 
 /// A version 1.0 `.npy` header for little-endian f32 `[a, b, c]`, padded to a multiple of 64 bytes.
