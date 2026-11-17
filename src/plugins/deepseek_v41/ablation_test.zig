@@ -393,14 +393,18 @@ test "deepseek_v41 ablation: the tap dumps a prompt forward, not a decode step o
     const prompt = try t.plugin(.prefill, &short_prompt, 0);
     defer _ = mlx.mlx_array_free(prompt);
     try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
-    // A decode step and a verify block record nothing and dump nothing. Gating by mode is what keeps them off: a pair
-    // runs its decode steps through the prompt path, and a verify block is all rows, so both reach `runPrompt`.
+    // A decode step and a verify block record nothing and dump nothing: a pair runs its decode steps through the prompt
+    // path and a verify block is all rows, so both reach `runPrompt` and the shape gate keeps them off.
     const step = try t.plugin(.decode, &.{44}, @intCast(short_prompt.len));
     defer _ = mlx.mlx_array_free(step);
     // The verify block sits where the decode step left the state.
     const verify = try t.plugin(.verify, &.{ 45, 2 }, @intCast(short_prompt.len + 1));
     defer _ = mlx.mlx_array_free(verify);
     try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
+    // A fresh one-token prompt starts at position 0, so it records and dumps too (the host sends it as Mode.decode).
+    const fresh = try t.plugin(.decode, &.{9}, 0);
+    defer _ = mlx.mlx_array_free(fresh);
+    try testing.expectEqual(@as(usize, 2), try tapRecords(tp.tmp, io));
 }
 
 test "deepseek_v41 ablation: the stream tap keeps the hc mean of a pass's last rows across its spans, only while on" {

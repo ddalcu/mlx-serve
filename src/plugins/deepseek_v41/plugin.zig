@@ -579,9 +579,11 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
     if (pos == 0) try dsv41.reset(mdl, gpa);
     if (mdl.dec_state) |*st| try ablation.stateArm(st, spec, m.cfg.hidden_size, m.s);
     // Calibration: a prompt forward records the stream at every layer (`ablation.StreamTap`), dumped once it is done.
-    // By mode, not by the kernel path: a pair runs its decode steps through the prompt path, and a verify block is all
-    // rows, so either would dump a tensor per step.
-    const tap = if (mode == .prefill) mdl.stream_tap else null;
+    // Gated by the forward's shape, not by the kernel path: a pair runs its decode steps through the prompt path and a
+    // verify block is all rows, so neither may dump. A prompt chunk of one row past position 0 arrives as `Mode.decode`
+    // like a decode step (the host decides by row count), so it cannot be told apart here and is not captured; every
+    // multi-row prompt chunk and any prompt starting at position 0 is.
+    const tap = if (mode == .prefill or (mode == .decode and pos == 0)) mdl.stream_tap else null;
     if (tap) |t| {
         t.clear();
         t.on = true;
