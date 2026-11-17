@@ -361,7 +361,7 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
         }
         open = true;
     }
-    if (nruns == 0) return null;
+    if (nruns == 0) return false;
     var sc = Scope.init(gpa, s);
     defer sc.deinit();
     // Sized by the sites, filled by the recorded ones: adjacent sites make one run but each still stacks.
@@ -394,7 +394,8 @@ pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: us
     defer gpa.free(file_bytes);
     @memcpy(file_bytes[0..npy.len], npy);
     @memcpy(file_bytes[npy.len..], body);
-    return try writeTapRecord(gpa, dir, file_bytes, pos, ids, @intCast(shape[1]), runs[0..nruns]);
+    try writeTapRecord(gpa, dir, file_bytes, pos, ids, @intCast(shape[1]), runs[0..nruns]);
+    return true;
 }
 
 /// A version 1.0 `.npy` header for little-endian f32 `[a, b, c]`, padded to a multiple of 64 bytes.

@@ -257,16 +257,34 @@ test "deepseek_v41 ablation: a state takes a forward of its own variant; a fresh
     try testing.expect(!ablation.fits(12, ablation.Variant.unkeyed, plain));
 }
 
-test "deepseek_v41 ablation: a tap directory's next seq is one past its index, so a restart cannot reuse a file" {
-    try testing.expectEqual(@as(u64, 0), ablation.seqFromIndex(""));
-    try testing.expectEqual(@as(u64, 1), ablation.seqFromIndex("{\"seq\":0,\"file\":\"tap-000000.npy\"}\n"));
-    const two = "{\"seq\":0,\"file\":\"tap-000000.npy\"}\n{\"seq\":1,\"file\":\"tap-000001.npy\"}\n";
-    try testing.expectEqual(@as(u64, 2), ablation.seqFromIndex(two));
-    // A torn last line (a crash mid-write) gives the highest complete seq.
-    try testing.expectEqual(@as(u64, 2), ablation.seqFromIndex(two ++ "{\"seq\":"));
+test "deepseek_v41 ablation: two tap records in one directory take distinct names, and each sidecar names its own tensor" {
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = path_buf[0..try td.dir.realPath(io, &path_buf)];
+    try ablation.writeTapRecord(testing.allocator, dir, "first", 0, &.{ 7, 8 }, 1, &.{.{ 0, 1 }});
+    try ablation.writeTapRecord(testing.allocator, dir, "second", 9, &.{10}, 1, &.{.{ 0, 1 }});
+    const sides = try tapNames(testing.allocator, dir, io, ".json");
+    defer freeNames(testing.allocator, sides);
+    try testing.expectEqual(@as(usize, 2), sides.len);
+    try testing.expect(!std.mem.eql(u8, sides[0], sides[1]));
+    var seen = [_]bool{ false, false };
+    for (sides) |name| {
+        const side = try td.dir.readFileAlloc(io, name, testing.allocator, .limited(1 << 16));
+        defer testing.allocator.free(side);
+        const at = std.mem.indexOf(u8, side, "\"file\":\"") orelse return error.NoTapRecord;
+        const rest = side[at + "\"file\":\"".len ..];
+        const end = std.mem.indexOfScalar(u8, rest, '"') orelse return error.NoTapRecord;
+        // The sidecar sits beside the tensor it names.
+        try testing.expectEqualStrings(name[0 .. name.len - ".json".len], rest[0 .. end - ".npy".len]);
+        const bytes = try td.dir.readFileAlloc(io, rest[0..end], testing.allocator, .unlimited);
+        defer testing.allocator.free(bytes);
+        if (std.mem.eql(u8, bytes, "first")) seen[0] = true else if (std.mem.eql(u8, bytes, "second")) seen[1] = true else return error.TestUnexpectedResult;
+    }
+    try testing.expect(seen[0] and seen[1]);
 }
 
-test "deepseek_v41 ablation: two writers racing in one tap directory claim distinct files and leave whole records" {
 test "deepseek_v41 ablation: a torn sidecar temporary is ignored, and the record's own sidecar parses" {
     var td = testing.tmpDir(.{});
     defer td.cleanup();
@@ -288,54 +306,49 @@ test "deepseek_v41 ablation: a torn sidecar temporary is ignored, and the record
     try testing.expectEqualStrings("whole", bytes);
 }
 
+test "deepseek_v41 ablation: two writers in one tap directory take distinct names and leave a whole sidecar apiece" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = testing.tmpDir(.{});
     defer td.cleanup();
     var path_buf: [512]u8 = undefined;
     const dir = path_buf[0..try td.dir.realPath(io, &path_buf)];
-    // Eight records each, in two threads, so the two writers meet in the directory: each must claim its own seq (the
-    // exclusive create steps past a name the other took), and the two appends must not interleave inside a line.
+    // Eight records each, in two threads: the name's per-process counter never hands both writers one file.
     const Writer = struct {
         dir: []const u8,
         tag: []const u8,
-        seqs: [8]u64 = undefined,
         failed: ?anyerror = null,
         fn run(w: *@This()) void {
-            for (&w.seqs, 0..) |*seq, i| {
-                seq.* = ablation.writeTapRecord(testing.allocator, w.dir, w.tag, i * 4, &.{ 10, 11, 12 }, 2, &.{.{ 0, 2 }}) catch |e| {
-                    w.failed = e;
-                    return;
-                };
-            }
+            for (0..8) |i| ablation.writeTapRecord(testing.allocator, w.dir, w.tag, i * 4, &.{ 10, 11, 12 }, 2, &.{.{ 0, 2 }}) catch |e| {
+                w.failed = e;
+                return;
+            };
         }
     };
     var a: Writer = .{ .dir = dir, .tag = "writer-a's tensor" };
     var b: Writer = .{ .dir = dir, .tag = "writer-b's tensor" };
-    // A tensor the index does not name: both writers read seq 0 from the empty index and must step past this name
-    // (exclusive create), so the claim fallback runs deterministically, not only when the threads happen to collide.
-    try td.dir.writeFile(io, .{ .sub_path = "tap-000000.npy", .data = "sentinel-not-a-tensor" });
     const ta = try std.Thread.spawn(.{}, Writer.run, .{&a});
     const tb = try std.Thread.spawn(.{}, Writer.run, .{&b});
     ta.join();
     tb.join();
-    const sentinel = try td.dir.readFileAlloc(io, "tap-000000.npy", testing.allocator, .unlimited);
-    defer testing.allocator.free(sentinel);
-    try testing.expectEqualStrings("sentinel-not-a-tensor", sentinel);
     try testing.expectEqual(@as(?anyerror, null), a.failed);
     try testing.expectEqual(@as(?anyerror, null), b.failed);
 
-    const index = try td.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .unlimited);
-    defer testing.allocator.free(index);
+    const sides = try tapNames(testing.allocator, dir, io, ".json");
+    defer freeNames(testing.allocator, sides);
+    const tensors = try tapNames(testing.allocator, dir, io, ".npy");
+    defer freeNames(testing.allocator, tensors);
+    try testing.expectEqual(@as(usize, 16), sides.len);
+    try testing.expectEqual(@as(usize, 16), tensors.len);
     var by_tag = [_]usize{ 0, 0 };
-    var seqs: [16]u64 = undefined;
-    var n: usize = 0;
-    var lines = std.mem.splitScalar(u8, index, '\n');
-    while (lines.next()) |line| {
-        if (line.len == 0) continue;
-        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, line, .{});
+    var names: [16][]u8 = undefined;
+    for (sides, 0..) |name, k| {
+        for (names[0..k]) |seen| try testing.expect(!std.mem.eql(u8, seen, name));
+        names[k] = name;
+        const side = try td.dir.readFileAlloc(io, name, testing.allocator, .limited(1 << 16));
+        defer testing.allocator.free(side);
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, side, .{});
         defer parsed.deinit();
         const rec = parsed.value.object;
-        const seq: u64 = @intCast(rec.get("seq").?.integer);
         const file = rec.get("file").?.string;
         const tail = rec.get("tail_ids").?.array;
         try testing.expectEqual(@as(usize, 3), tail.items.len);
@@ -346,12 +359,8 @@ test "deepseek_v41 ablation: a torn sidecar temporary is ignored, and the record
         const bytes = try td.dir.readFileAlloc(io, file, testing.allocator, .unlimited);
         defer testing.allocator.free(bytes);
         if (std.mem.eql(u8, bytes, a.tag)) by_tag[0] += 1 else if (std.mem.eql(u8, bytes, b.tag)) by_tag[1] += 1 else return error.TestUnexpectedResult;
-        for (seqs[0..n]) |seen| try testing.expect(seen != seq);
-        seqs[n] = seq;
-        n += 1;
     }
-    // Every record of both writers landed once, on its own file, with its own seq.
-    try testing.expectEqual(@as(usize, 16), n);
+    // Every record of both writers landed once, on its own file, with a whole sidecar.
     try testing.expectEqualSlices(usize, &.{ 8, 8 }, &by_tag);
 }
 
@@ -373,21 +382,30 @@ test "deepseek_v41 ablation: a partial tap dump writes the sites it recorded and
     // The middle layers only, as a pair's worker records them: the dump holds those sites and names the run.
     try tap.record(sc.s, 1, &.{span});
     try tap.record(sc.s, 2, &.{span});
-    try testing.expectEqual(@as(?u64, 0), try ablation.dumpTap(testing.allocator, &tap, dir, 0, &.{ 7, 8 }, sc.s));
-    const first = try td.dir.readFileAlloc(io, "tap-000000.npy", testing.allocator, .unlimited);
+    try testing.expect(try ablation.dumpTap(testing.allocator, &tap, dir, 0, &.{ 7, 8 }, sc.s));
+    const npy = try tapNames(testing.allocator, dir, io, ".npy");
+    defer freeNames(testing.allocator, npy);
+    try testing.expectEqual(@as(usize, 1), npy.len);
+    const first = try td.dir.readFileAlloc(io, npy[0], testing.allocator, .unlimited);
     defer testing.allocator.free(first);
     try testing.expect(std.mem.indexOf(u8, first, "'shape': (2, 1, 4)") != null);
-    var index = try td.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .unlimited);
-    defer testing.allocator.free(index);
-    try testing.expect(std.mem.indexOf(u8, index, "\"site_ranges\":[[1,3]]") != null);
-    testing.allocator.free(index);
+    const inner = try tapNames(testing.allocator, dir, io, ".json");
+    defer freeNames(testing.allocator, inner);
+    try testing.expectEqual(@as(usize, 1), inner.len);
+    const inner_side = try td.dir.readFileAlloc(io, inner[0], testing.allocator, .limited(1 << 16));
+    defer testing.allocator.free(inner_side);
+    try testing.expect(std.mem.indexOf(u8, inner_side, "\"site_ranges\":[[1,3]]") != null);
 
     // The outer layers only, as a pair's leader records them: two runs, named in order.
     try tap.record(sc.s, 0, &.{span});
     try tap.record(sc.s, 3, &.{span});
-    try testing.expectEqual(@as(?u64, 1), try ablation.dumpTap(testing.allocator, &tap, dir, 2, &.{9}, sc.s));
-    index = try td.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .unlimited);
-    try testing.expect(std.mem.indexOf(u8, index, "\"site_ranges\":[[0,1],[3,4]]") != null);
+    try testing.expect(try ablation.dumpTap(testing.allocator, &tap, dir, 2, &.{9}, sc.s));
+    const outer = try tapNames(testing.allocator, dir, io, ".json");
+    defer freeNames(testing.allocator, outer);
+    try testing.expectEqual(@as(usize, 2), outer.len);
+    const outer_side = try td.dir.readFileAlloc(io, outer[1], testing.allocator, .limited(1 << 16));
+    defer testing.allocator.free(outer_side);
+    try testing.expect(std.mem.indexOf(u8, outer_side, "\"site_ranges\":[[0,1],[3,4]]") != null);
 }
 
 test "deepseek_v41 ablation: the tap reads a device-id span back, so its sidecar names the prompt's last token" {
@@ -434,44 +452,12 @@ test "deepseek_v41 ablation: the tap dumps prompt forwards, the split prefill's 
     try tp.attach(t);
     defer tp.detach();
     const io = std.Io.Threaded.global_single_threaded.io();
-    // A prompt chunk puts the state at the prompt's length.
-    testing.allocator.free(try forwardUnder(t, .prefill, &.{1}, &short_prompt, &.{0}, null));
-    try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
-    // The split prefill's final token as the real host sends it: device ids, one row, `Mode.decode`.
-    const id: i32 = 44;
-    const dev = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
-    defer _ = mlx.mlx_array_free(dev);
-    const slots = [_]u32{1};
-    const pos: u32 = @intCast(short_prompt.len);
-    var out: abi.ForwardOut = .{};
-    const v = v41.table.forward(t.m, &.{ .mode = .decode, .logits = .last_row, .rows = 1, .tokens = .{}, .ids = .{ .ctx = dev.ctx }, .slots = .of(&slots), .positions = .of(&.{pos}), .prefill = true }, &out);
-    try testing.expect(v.isOk());
-    const l: A = .{ .ctx = out.logits.ctx };
-    defer _ = mlx.mlx_array_free(l);
-    // Its record ends at the span: the prompt is one token longer than `pos`, and `tail_ids` names it.
-    const idx = try tp.tmp.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(1 << 20));
-    defer testing.allocator.free(idx);
-    const trimmed = std.mem.trimEnd(u8, idx, "\r\n");
-    const last = trimmed[std.mem.lastIndexOfScalar(u8, trimmed, '\n').? + 1 ..];
-    try testing.expect(std.mem.indexOf(u8, last, "\"prompt_tokens\":12") != null);
-    try testing.expect(std.mem.indexOf(u8, last, "\"tail_ids\":[44]") != null);
-}
-
-test "deepseek_v41 ablation: the tap dumps prompt forwards, the split prefill's last token included, and no decode step or verify block" {
-    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
-    defer t.close();
-    var tp: Tapped = undefined;
-    try tp.attach(t);
-    defer tp.detach();
-    const io = std.Io.Threaded.global_single_threaded.io();
     // A prompt chunk records and dumps one tensor.
     testing.allocator.free(try forwardUnderPhase(t, .prefill, &short_prompt, 0, true));
+    try testing.expectEqual(@as(usize, 1), try tapRecords(&tp, io));
     // The split prefill's final token: one row, `Mode.decode`, but a prompt forward (the host's `prefill` says so).
     testing.allocator.free(try forwardUnderPhase(t, .decode, &.{44}, @intCast(short_prompt.len), true));
-    try testing.expectEqual(@as(usize, 2), try tapRecords(tp.tmp, io));
+    try testing.expectEqual(@as(usize, 2), try tapRecords(&tp, io));
     // A decode step and a verify block are not prompt forwards: nothing records, nothing dumps.
     testing.allocator.free(try forwardUnderPhase(t, .decode, &.{45}, @intCast(short_prompt.len + 1), false));
     testing.allocator.free(try forwardUnderPhase(t, .verify, &.{ 46, 2 }, @intCast(short_prompt.len + 2), false));
@@ -614,6 +600,7 @@ const Tapped = struct {
     tap: ablation.StreamTap,
     tmp: testing.TmpDir,
     path: [512]u8,
+    len: usize = 0,
     model: *v41.Model,
 
     fn attach(self: *Tapped, t: *Twin) !void {
@@ -621,7 +608,8 @@ const Tapped = struct {
         self.model = @ptrCast(@alignCast(t.m));
         self.tmp = testing.tmpDir(.{});
         errdefer self.tmp.cleanup();
-        const dir = self.path[0..try self.tmp.dir.realPath(io, &self.path)];
+        self.len = try self.tmp.dir.realPath(io, &self.path);
+        const dir = self.path[0..self.len];
         self.tap = try ablation.StreamTap.init(testing.allocator, self.model.mdl.n_layers, keep);
         self.model.tap_dir = dir;
         self.model.mdl.stream_tap = &self.tap;
@@ -634,16 +622,17 @@ const Tapped = struct {
         self.tmp.cleanup();
     }
 
-    /// The last prompt forward's file: `[layers + 1, rows, dim]` f32 past its header. Names come from the directory's
-    /// own index, the way a restart continues it.
+    /// The last prompt forward's file: `[layers + 1, rows, dim]` f32 past its header. The record's sidecar names it,
+    /// and the stamps in the names sort oldest first, so the last sidecar is the last write.
     fn lastDump(self: *Tapped, rows: usize) !Peaks {
         const io = std.Io.Threaded.global_single_threaded.io();
-        const idx = try self.tmp.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(1 << 20));
-        defer testing.allocator.free(idx);
-        const trimmed = std.mem.trimEnd(u8, idx, "\r\n");
-        const last = if (std.mem.lastIndexOfScalar(u8, trimmed, '\n')) |i| trimmed[i + 1 ..] else trimmed;
-        const at = std.mem.indexOf(u8, last, "\"file\":\"") orelse return error.NoTapRecord;
-        const rest = last[at + "\"file\":\"".len ..];
+        const sides = try tapNames(testing.allocator, self.path[0..self.len], io, ".json");
+        defer freeNames(testing.allocator, sides);
+        if (sides.len == 0) return error.NoTapRecord;
+        const side = try self.tmp.dir.readFileAlloc(io, sides[sides.len - 1], testing.allocator, .limited(1 << 16));
+        defer testing.allocator.free(side);
+        const at = std.mem.indexOf(u8, side, "\"file\":\"") orelse return error.NoTapRecord;
+        const rest = side[at + "\"file\":\"".len ..];
         const end = std.mem.indexOfScalar(u8, rest, '"') orelse return error.NoTapRecord;
         const bytes = try self.tmp.dir.readFileAlloc(io, rest[0..end], testing.allocator, .limited(1 << 20));
         defer testing.allocator.free(bytes);
@@ -671,19 +660,39 @@ const Tapped = struct {
     }
 };
 
-/// The tap directory's records: every line of its index, 0 when there is none.
-fn tapRecords(td: testing.TmpDir, io: std.Io) !usize {
-    const idx = td.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(1 << 20)) catch |e| switch (e) {
-        error.FileNotFound => return 0,
-        else => return e,
-    };
-    defer testing.allocator.free(idx);
-    var n: usize = 0;
-    var it = std.mem.splitScalar(u8, idx, '\n');
-    while (it.next()) |line| if (line.len > 0) {
-        n += 1;
-    };
-    return n;
+/// The directory's record file names with `ext`, sorted: a stamp's digits lead each name, so the last one is the last
+/// write (a record is a tensor beside its sidecar).
+fn tapNames(gpa: std.mem.Allocator, dir: []const u8, io: std.Io, ext: []const u8) ![][]u8 {
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
+    defer d.close(io);
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |n| gpa.free(n);
+        out.deinit(gpa);
+    }
+    var it = d.iterate();
+    while (try it.next(io)) |e| {
+        if (!std.mem.endsWith(u8, e.name, ext)) continue;
+        try out.append(gpa, try gpa.dupe(u8, e.name));
+    }
+    std.mem.sortUnstable([]u8, out.items, {}, struct {
+        fn lt(_: void, x: []u8, y: []u8) bool {
+            return std.mem.lessThan(u8, x, y);
+        }
+    }.lt);
+    return out.toOwnedSlice(gpa);
+}
+
+fn freeNames(gpa: std.mem.Allocator, names: [][]u8) void {
+    for (names) |n| gpa.free(n);
+    gpa.free(names);
+}
+
+/// The tap directory's records: its sidecars, 0 when there is none.
+fn tapRecords(tp: *Tapped, io: std.Io) !usize {
+    const sides = try tapNames(testing.allocator, tp.path[0..tp.len], io, ".json");
+    defer freeNames(testing.allocator, sides);
+    return sides.len;
 }
 
 const Run = struct { logits: []f32, peaks: Peaks };
