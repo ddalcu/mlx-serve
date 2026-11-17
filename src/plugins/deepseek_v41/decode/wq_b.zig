@@ -27,13 +27,13 @@ pub fn build() !mlx.mlx_fast_metal_kernel {
 
 pub const Out = struct { q: A, q_idx: ?A, kv_row: A, sa: dsv41.Split };
 
-/// Simdgroups a threadgroup holds, and the threadgroups that walk the units: two a GPU core (one where the GPU's
-/// cores are unknown).
+/// Simdgroups a threadgroup holds, and the threadgroups that walk the units: four a GPU core, so a core's units
+/// overlap more weight reads (320 where the GPU's cores are unknown).
 const SGS = 8;
 
 pub fn groups() usize {
     const cores = system.gpuCoreCount();
-    return if (cores > 0) 2 * cores else 160;
+    return if (cores > 0) 4 * cores else 320;
 }
 
 fn ci(v: usize) c_int {

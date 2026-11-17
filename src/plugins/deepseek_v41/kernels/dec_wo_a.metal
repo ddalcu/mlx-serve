@@ -2,7 +2,8 @@
 // outputs of one wo_a group and ONE head of its HPG: it merges that head's splits (the sink, the inverse rope) into
 // threadgroup memory, contracts its rows' 512 weights against every row's head and publishes the partial sums; the last
 // of a tile's HPG threadgroups to arrive adds them in head order. NAX: a simdgroup takes 32 rows on the matrix units
-// against the head rounded to bf16 (as the chain hands it to wo_a); else NR rows on the vector units against the f32 head.
+// against the head rounded to bf16 (as the chain hands it to wo_a); else NR rows on the vector units against the f32 head,
+// each row's split weights and total computed once into threadgroup memory and a thread's split loads issued first.
 const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
 const int tid = int(thread_position_in_threadgroup.x);
 const int h = int(threadgroup_position_in_grid.y), g = h / HPG, hh = h % HPG;
@@ -77,19 +78,30 @@ if constexpr (NAX) {
   uint ce[NR];
   for (int r = 0; r < NR; ++r) { cq[r] = w4[r * (KW / 4)]; ce[r] = uint(s0[r * KG]); }
 
-  for (int it = tid; it < R * D4; it += NTHR) {
-    const int m = it / D4, q = it % D4;
-    const uint base = (uint(m) * H + h) * S;
+  if (tid < R) {
+    const uint base = (uint(tid) * H + h) * S;
     float mx = sink[h];
     for (int j = 0; j < S; ++j) mx = metal::max(mx, pm[base + j]);
     float total = metal::exp(sink[h] - mx);
-    float4 o = float4(0.0f);
     for (int j = 0; j < S; ++j) {
       const float wj = pl[base + j] > 0.0f ? metal::exp(pm[base + j] - mx) : 0.0f;
       total += pl[base + j] * wj;
-      o += ((const device float4*)(pacc + (base + j) * D))[q] * wj;
+      coef[tid * (S + 1) + j] = wj;
     }
-    o /= total;
+    coef[tid * (S + 1) + S] = total;
+  }
+  float4 pv[(R * D4 + NTHR - 1) / NTHR][S];
+  for (int it = tid, n = 0; it < R * D4; it += NTHR, ++n) {
+    const int m = it / D4, q = it % D4;
+    const uint base = (uint(m) * H + h) * S;
+    for (int j = 0; j < S; ++j) pv[n][j] = ((const device float4*)(pacc + (base + j) * D))[q];
+  }
+  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+  for (int it = tid, n = 0; it < R * D4; it += NTHR, ++n) {
+    const int m = it / D4, q = it % D4;
+    float4 o = float4(0.0f);
+    for (int j = 0; j < S; ++j) o += pv[n][j] * coef[m * (S + 1) + j];
+    o /= coef[m * (S + 1) + S];
     if (q >= (D - RD) / 4) {
       const int p = 2 * q - (D - RD) / 2;
       const float pos = float(meta[0] + m);
