@@ -15,7 +15,7 @@ OpensourceWTF's EXL3 streaming repacks through the `turboexl3_ds41` quant plugin
   refused by name (`load/init.zig`).
 - `streamed_test.zig`: the trunk with its experts streamed from the pack (`stream_experts`) bit-equal to the in-memory banks.
 - `ablation.zig`: per-slot directional ablation (`Caps.ablation`, `Forward.ablation`) armed on the slot's `State` so
-  every pass that writes the residual stream ablates, DSpark rounds and batched passes included; `MLX_SERVE_DIAG=dsv41-tap-dir`
+  every pass that writes the residual stream ablates, DSpark rounds and batched passes included; `MLX_SERVE_DIAG=dsv41-tap-dir=<dir>`
   arms the calibration tap (f32 `[layers + 1, rows, dim]` npy plus a `.json` sidecar apiece, dir 0700, files 0600).
 - `fixtures/`: proof tapes recorded from the legacy forward (`fixtures/MANIFEST.md`).
 - `contract.zig`: kernel contract registrations of `kernels/*.metal`.

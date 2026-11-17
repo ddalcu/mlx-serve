@@ -104,7 +104,7 @@ pub const Model = struct {
     idle: ?Kept = null,
     /// The last id a snapshot was given for the other tensor ranks (`Snap.tp_id`).
     tp_snaps: u64 = 0,
-    /// Calibration (MLX_SERVE_DIAG=dsv41-tap-dir): where each prompt forward's stream tap is written.
+    /// Calibration (`MLX_SERVE_DIAG=dsv41-tap-dir=<dir>`): where each prompt forward's stream tap is written.
     tap_dir: ?[]const u8 = null,
 };
 
@@ -316,7 +316,7 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     m.parked = .empty;
     m.idle = null;
     m.tap_dir = null;
-    // Calibration (MLX_SERVE_DIAG=dsv41-tap-dir): every prompt forward's stream at each layer, written there owner-only.
+    // Calibration (`MLX_SERVE_DIAG=dsv41-tap-dir=<dir>`): every prompt forward's stream at each layer, written there owner-only.
     // A Thunderbolt pair's leader is fine: it records the layers it runs and the sidecar names their runs (the worker runs
     // the module directly and records nothing). A tensor split is not: it holds a shard of each layer's stream, which
     // is not the residual a direction is measured from.
@@ -332,8 +332,8 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
                 m.tap_dir = tap_dir;
                 std.log.warn("deepseek_v41: the calibration tap is on: every prompt's per-layer stream and last ids go to {s} (owner-only files)", .{tap_dir});
             }
-        } else if (setting.len > 0 and !std.mem.eql(u8, setting, "0") and !std.mem.eql(u8, setting, "1"))
-            std.log.warn("deepseek_v41: the calibration tap is off: the diag value holds {d} bytes, short enough to be a truncated directory, so it is refused", .{setting.len});
+        } else if (setting.len > 0 and !std.mem.eql(u8, setting, "0"))
+            std.log.warn("deepseek_v41: the calibration tap is off: MLX_SERVE_DIAG=dsv41-tap-dir needs `=<dir>` (the bare token reads 1, and a value at the buffer's width may be a cut path), so this setting names no directory", .{});
     }
     errdefer freeTap(m);
     if (c.dsv41_streamed) {

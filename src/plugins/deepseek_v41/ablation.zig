@@ -306,11 +306,23 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
     defer gpa.free(dir_z);
     if (builtin.os.tag != .windows) _ = std.c.chmod(dir_z, 0o700);
     const stamp = std.Io.Timestamp.now(io, .real).toMicroseconds();
-    var stem_buf: [64]u8 = undefined;
-    const stem = try std.fmt.bufPrint(&stem_buf, "tap-{d}-{d}-{d}", .{ stamp, std.c.getpid(), tap_tie.fetchAdd(1, .monotonic) });
+    const flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
+        .{ .exclusive = true }
+    else
+        .{ .exclusive = true, .permissions = .fromMode(0o600) };
     var name_buf: [80]u8 = undefined;
-    const flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows) .{} else .{ .permissions = .fromMode(0o600) };
-    try d.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name_buf, "{s}.npy", .{stem}), .data = file_bytes, .flags = flags });
+    var stem_buf: [64]u8 = undefined;
+    // The stamp and the counter separate this process's writes, but the pid is per namespace (two containers sharing the
+    // directory, or a shared mount, both read pid 1): the exclusive create answers a taken name, the counter moves on,
+    // and no record is ever written over another.
+    const stem = claim: for (0..1000) |_| {
+        const s = try std.fmt.bufPrint(&stem_buf, "tap-{d}-{d}-{d}", .{ stamp, std.c.getpid(), tap_tie.fetchAdd(1, .monotonic) });
+        d.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name_buf, "{s}.npy", .{s}), .data = file_bytes, .flags = flags }) catch |e| switch (e) {
+            error.PathAlreadyExists => continue,
+            else => return e,
+        };
+        break :claim s;
+    } else return error.TapNameTaken;
 
     var side: std.Io.Writer.Allocating = .init(gpa);
     defer side.deinit();
