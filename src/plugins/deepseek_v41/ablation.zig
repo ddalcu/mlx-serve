@@ -320,8 +320,14 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
     const tail = ids[ids.len - @min(ids.len, 8) ..];
     for (tail, 0..) |t, i| try side.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
     try side.writer.writeAll("]}\n");
-    // Last: a sidecar vouches for a whole tensor beside it.
-    try d.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name_buf, "{s}.json", .{stem}), .data = side.written(), .flags = flags });
+    // Last, and never in place: the sidecar is written under a name no glob matches and renamed, so a crash leaves
+    // either a whole record or a temporary the offline tool ignores, never half a JSON.
+    var tmp_buf: [96]u8 = undefined;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "{s}.json.tmp", .{stem});
+    try d.writeFile(io, .{ .sub_path = tmp, .data = side.written(), .flags = flags });
+    var final_buf: [80]u8 = undefined;
+    const final = try std.fmt.bufPrint(&final_buf, "{s}.json", .{stem});
+    try d.rename(tmp, d, final, io);
     std.log.info("deepseek_v41: the calibration tap wrote {s}.npy", .{stem});
 }
 

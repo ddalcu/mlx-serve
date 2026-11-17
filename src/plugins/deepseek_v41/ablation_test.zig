@@ -267,6 +267,27 @@ test "deepseek_v41 ablation: a tap directory's next seq is one past its index, s
 }
 
 test "deepseek_v41 ablation: two writers racing in one tap directory claim distinct files and leave whole records" {
+test "deepseek_v41 ablation: a torn sidecar temporary is ignored, and the record's own sidecar parses" {
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const dir = path_buf[0..try td.dir.realPath(io, &path_buf)];
+    // A crash's half-written sidecar: a name no glob matches, and JSON no reader can parse.
+    try td.dir.writeFile(io, .{ .sub_path = "tap-1-2-3.json.tmp", .data = "{\"file\":\"tap-1-2-3.npy\",\"pos" });
+    try ablation.writeTapRecord(testing.allocator, dir, "whole", 0, &.{5}, 1, &.{.{ 0, 1 }});
+    const sides = try tapNames(testing.allocator, dir, io, ".json");
+    defer freeNames(testing.allocator, sides);
+    try testing.expectEqual(@as(usize, 1), sides.len);
+    const side = try td.dir.readFileAlloc(io, sides[0], testing.allocator, .limited(1 << 16));
+    defer testing.allocator.free(side);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, side, .{});
+    defer parsed.deinit();
+    const bytes = try td.dir.readFileAlloc(io, parsed.value.object.get("file").?.string, testing.allocator, .unlimited);
+    defer testing.allocator.free(bytes);
+    try testing.expectEqualStrings("whole", bytes);
+}
+
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = testing.tmpDir(.{});
     defer td.cleanup();
