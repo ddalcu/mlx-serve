@@ -189,10 +189,7 @@ fn expectBill(json: []const u8, comptime P: type) !void {
     defer P.table.free_parsed(&p);
     var b: abi.Bill = .{};
     P.table.bill(&p, &.{}, &b);
-    // The engine's own formula: a parse naming a layout namespace would bill the plugin's term back to it.
-    var bare = want;
-    bare.plugin = null;
-    try testing.expectEqual(bare.kvBytesPerToken(), b.kv_per_token);
+    try testing.expectEqual(want.kvBytesPerToken(), b.kv_per_token);
     try testing.expectEqual(want.ssmCheckpointBytes(), b.ssm_checkpoint);
     try testing.expectEqual(want.prefillScoreHeadDim(), b.prefill_score_width);
 }

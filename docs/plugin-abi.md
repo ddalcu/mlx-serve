@@ -22,7 +22,7 @@ The model plugin table (`ModelTable`) and every struct that crosses it. Extern l
 | `Stream` | `common.Stream` |  |
 | `Claim` | `common.Claim` |  |
 | `PackDir` | `common.PackDir` |  |
-| `version` | `u32 = 1` |  |
+| `version` | `u32 = 2` | Moves when a struct the plugin writes whole (`Parsed`, `Bill`) grows: an older host refuses the newer table, so a plugin never writes past the host's shorter struct; this host takes every older table, whose structs it reads by size. |
 | `Handle` | `?*anyopaque` | An object the engine owns and the plugin only passes back (a slot's KV cache): opaque until P3 types it. |
 | `max_eos` | `16` |  |
 | `stream_room_cell` | `u64 = 16_384 + 1_024` | The request the stream rooms are billed at (16K prompt + 1K reply): a bank calibration's evidence cell. |
@@ -434,6 +434,8 @@ Every `Str` here points at static text or at memory the plugin owns until `Model
 | `mrope` | `MropeFacts` | `.{}` |  |
 | `private` | `?*anyopaque` | `null` | The plugin's own parsed config, read by its `bill` and `load`. |
 | `speech` | `SpeechFacts` | `.{}` |  |
+| `_pre_engine_config` | `u32` | `0` | Ends the struct at the size a plugin built before `engine_config` writes (728 bytes: `speech` ends at 724, the rest was padding it may have left unset), so `engine_config` lies past it and the size gate reads it unset. |
+| `engine_config` | `bool` | `false` | This plugin serves a `model_type` the engine parses and wants the engine's own config (family fields, weight renames, bills) with its binding attached, instead of the generic config of its facts alone. The engine then sizes and bills the pack as it does that type, so the plugin must match the engine's layout for that type. A pack the engine cannot parse keeps the generic config. Read through `wantsEngineConfig`. |
 
 ### `Shape` (extern struct)
 
@@ -448,12 +450,12 @@ The load-time shape `bill` prices.
 
 ### `Bill` (extern struct)
 
-The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `kv_per_token`, `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
+The plugin's memory terms. A zero or null term is the engine's default arithmetic over the shell and layout. `flags` and whether `prefill_bytes` is set hold at every shape: the host reads them once a load.
 
 | Field | Type | Default | |
 |---|---|---|---|
 | `size` | `u32` | `@sizeOf(Bill)` |  |
-| `kv_per_token` | `u64` | `0` | The trunk's attention rows a token takes; the engine bills an MTP head's own rows. The host honours it only when the parse names a layout namespace, the plugin's statement that the value is its whole cache layout. |
+| `kv_per_token` | `u64` | `0` |  |
 | `fixed_slot_bytes` | `u64` | `0` |  |
 | `state_per_token` | `u64` | `0` |  |
 | `prefill_streams` | `u64` | `0` |  |
@@ -779,7 +781,7 @@ A plugin's opaque per-slot state beside the KV cache, under the RAM prefix cache
 | `size` | `u32` | `@sizeOf(AuxHooks)` |  |
 | `reserve` | `*const fn (m: *anyopaque, slot: u32, tokens: u64) callconv(.c) Verdict` |  |  |
 | `commit` | `*const fn (m: *anyopaque, slot: u32, len: u64) callconv(.c) Verdict` |  |  |
-| `snapshot` | `*const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict` |  | Transfers the slot's completed capture to the caller; null means no checkpoint was reached. |
+| `snapshot` | `*const fn (m: *anyopaque, slot: u32, out: *Handle) callconv(.c) Verdict` |  | Transfers the slot's completed capture to the caller; a plugin that can also hands over the state where an armed prompt it never finished stopped (`describe` says where). Null means neither. |
 | `restore_at` | `*const fn (m: *anyopaque, slot: u32, snap: Handle, pos: u64) callconv(.c) Verdict` |  | Accepts only `pos == snap.n`; builds the replacement before installing it. The caller keeps the snapshot. |
 | `slice` | `*const fn (m: *anyopaque, snap: Handle, len: u64, out: *Handle) callconv(.c) Verdict` |  | A snapshot of the longest prefix of at most `len` tokens the plugin restores at (`describe` says where): a clone at `len == snap.n`, shorter where the plugin can cut its state; named `.unsupported` when it holds none. |
 | `handoff` | `*const fn (m: *anyopaque, from_slot: u32, to_slot: u32) callconv(.c) Verdict` |  |  |
@@ -1454,13 +1456,13 @@ One custom kernel as mlx-c's `mlx_fast_{metal,cuda}_kernel_new` takes it. The ca
 | `ane` | `?*const HostAne` | `null` | The Neural Engine; read it through `aneOf`, which also answers null for a host older than this field. |
 | `quant_claimant` | `?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable` | `null` | The outside quant table the host loaded that claims a pack's quantization block `block_json` of `config_json`: the highest claim; null when none claims or two tie (the host logs a tie by name). A model plugin's own dylib holds no quant table, so its loads ask here (`outside.Format.open`). Read it through `quantClaimantOf`, which also answers null for a host older than this field. Any thread. |
 
-### `aneOf(h: *const Host) ?*const HostAne`
-
-`h.ane`, or null where the host has none or predates it (its `size` ends before the field).
-
 ### `quantClaimantOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable`
 
 `h.quant_claimant`, or null where the host has none or predates it (its `size` ends before the field).
+
+### `aneOf(h: *const Host) ?*const HostAne`
+
+`h.ane`, or null where the host has none or predates it (its `size` ends before the field).
 
 ### `EventKind` (enum(u8))
 

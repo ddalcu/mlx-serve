@@ -23,8 +23,7 @@ server's own plugins pass (the kit does not ship it). Below, those six file name
   `Model` carries the helpers the forwards took from `Transformer` (`mm`, `rmsNorm`, `narrowAddNorm`, `embedding`,
   `lmHead`, `denseMlp`), same op order; `headMm` is `table_forward.zig`'s. The load takes `trunk.Hooks`: this plugin
   passes `exl3` (Sushi packs, `builtin_formats.zig`) and `fused_decode` (`moe_fused.zig`); `router` (a routed layer's
-  own router) and the model's KDA stages (`KdaConsts.stages`) and verify rows (`Model.kda_verify_rows`) are for an
-  outside plugin's own kernels.
+  own router) and the model's KDA stages (`KdaConsts.stages`) are for an outside plugin's own kernels.
 - KDA (`kda.zig`): the per-channel-gate arms of the legacy `gatedDeltaNetProjected` on a slot's `Entry`: GLM's
   one-dispatch decode/verify (`kda_recurrence.decodeStep`), low-rank gates, the fused prework, the per-core prompt
   recurrence; Ling's softplus gate (compiled at load) and the stock vector-gate kernels.

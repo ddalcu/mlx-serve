@@ -1,8 +1,7 @@
 //! A KDA layer (GatedDeltaNet with a per-channel gate) on one slot's recurrent state: GLM-5.3-Flash's (low-rank
 //! gates, the row-joined decode projection, the fused one-dispatch decode and verify, the per-core prompt recurrence,
 //! a bounded-sigmoid gate) and Ling 3.0's (full-rank gates, the softplus gate, the stock vector-gate kernels). A
-//! verify captures every row's state and conv input for a partial accept's rollback. A model plugin may serve a
-//! serial-rows verify's rows itself (`VerifyRows`).
+//! verify captures every row's state and conv input for a partial accept's rollback.
 //! copied_from: sdk/blocks/gdn/gated_delta_net.zig (`gatedDeltaNetProjected`, its arms a per-channel gate reaches),
 //! sdk/blocks/gdn/gate.zig (`computeGdnGate`).
 
@@ -40,47 +39,6 @@ pub const Entry = struct {
         e.* = .{};
     }
 };
-
-/// A model plugin's serial-rows verify of one KDA layer (`Model.kda_verify_rows`): every row's conv, gates, recurrence
-/// and gated norm with the bytes the trunk's one-row step gives that row on `s`, from the row before's state. Null
-/// declines before it makes anything, and the trunk steps the rows itself. On an error it frees what it made.
-pub const VerifyRows = *const fn (s: mlx.mlx_stream, in: VerifyRowsIn) anyerror!?VerifyRowsOut;
-
-/// One KDA layer's operands for `S` rows, borrowed for the call; `C = 2 hk dk + hv dv`, `K` the conv's taps.
-pub const VerifyRowsIn = struct {
-    /// `[1, S, C]` q|k|v, `[1, S, hv dv]` the output gate, `[1, S, hv dk]` the gate input, `[1, S, hv]` beta's input:
-    /// the layer's projections of every row (row-exact through `Model.mm`), in the activation dtype.
-    qkv: Array,
-    z: Array,
-    a: Array,
-    b: Array,
-    /// `[1, K - 1, C]` the conv window before the first row; the depthwise conv as the loader keeps it.
-    conv_state: Array,
-    conv_w: Array,
-    /// `A_log` expanded per key channel and `dt_bias`, as the loader keeps them.
-    A_log: Array,
-    dt_bias: Array,
-    /// `[1, hv, dv, dk]` the state before the first row, in the state dtype.
-    state: Array,
-    /// `[dv]` the gated norm's weight.
-    norm_w: Array,
-    /// 0-dim, the activation dtype: the scales the one-row step multiplies the normed q and k by.
-    q_scale: Array,
-    k_scale: Array,
-    qk_eps: f32,
-    norm_eps: f32,
-    /// The gate's lower bound: nonzero for the bounded sigmoid gate, zero for the softplus gate.
-    bound: f32,
-    hk: c_int,
-    hv: c_int,
-    dk: c_int,
-    dv: c_int,
-};
-
-/// New references the trunk owns once returned: `y` `[1, S, hv dv]` (the out projection's input), the conv window
-/// `[1, K - 1, C]` and the state after the last row, and the state after every row `[S, 1, hv, dv, dk]` (what a partial
-/// accept's rollback reads).
-pub const VerifyRowsOut = struct { y: Array, conv_state: Array, state: Array, state_seq: Array };
 
 /// A low-rank gate's second stage as the fused KDA step reads it (a dense one at the pack's declared params).
 pub fn low(m: *const Model, l: *const trunk.Linear) kda_recurrence.Low {
@@ -196,9 +154,8 @@ pub const CaptureOut = struct { y: Array, state: Array, state_seq: Array };
 const Pre = struct { qkv: Array, z: Array, a: Array, b: Array };
 
 /// A serial-rows verify (`Model.serial_rows`): the projections over every row (row-exact through `Model.mm`), then each
-/// row's conv, gates, recurrence and gated norm from the row before's state (through the model plugin's `VerifyRows`
-/// where it serves, else on the one-row decode path), each row's state and the window's conv inputs kept as the
-/// capture path keeps them for rollback; then the out projection.
+/// row's conv, gates, recurrence and gated norm on the one-row decode path from the row before's state, each row's
+/// state and the window's conv inputs kept as the capture path keeps them for rollback; then the out projection.
 fn serialRows(m: *Model, x: Array, la: *const Kda, e: *Entry, seq_len: c_int) !Array {
     const s = m.s;
     var all: [4]Array = @splat(.{ .ctx = null });
@@ -212,15 +169,6 @@ fn serialRows(m: *Model, x: Array, la: *const Kda, e: *Entry, seq_len: c_int) !A
         const vec = mlx.mlx_vector_array_new_data(&parts, 2);
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_concatenate_axis(&conv_in, vec, 1, s));
-    }
-    if (m.kda_verify_rows) |rows| {
-        if (try pluginRows(m, rows, la, e, all)) |y| {
-            defer _ = mlx.mlx_array_free(y);
-            free(e.spec_conv_input);
-            e.spec_conv_input = conv_in;
-            conv_in = mlx.mlx_array_new();
-            return m.mm(&la.out, y);
-        }
     }
     const ys = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(ys);
@@ -246,55 +194,6 @@ fn serialRows(m: *Model, x: Array, la: *const Kda, e: *Entry, seq_len: c_int) !A
     defer _ = mlx.mlx_array_free(y_all);
     try mlx.check(mlx.mlx_concatenate_axis(&y_all, ys, 1, s));
     return m.mm(&la.out, y_all);
-}
-
-/// The rows through the model plugin's `rows`: y for the out projection, the conv window, state and every row's state
-/// written to `e`. Null, `e` untouched, where the one-row step is not the full-gate composed chain (a low-rank gate's
-/// second stage; a state the per-core recurrence serves, the arm serial decode takes) or where `rows` declines.
-fn pluginRows(m: *Model, rows: VerifyRows, la: *const Kda, e: *Entry, p: [4]Array) !?Array {
-    const c = m.c;
-    if (la.a2.w.ctx != null or la.z2.w.ctx != null) return null;
-    const hk: c_int = @intCast(c.linear_num_key_heads);
-    const hv: c_int = @intCast(c.linear_num_value_heads);
-    const dk: c_int = @intCast(c.linear_key_head_dim);
-    const dv: c_int = @intCast(c.linear_value_head_dim);
-    const act = mlx.mlx_array_dtype(p[0]);
-    if (c.kda_gate_lower_bound != 0.0 and kda_recurrence.serves(m.s, hk, hv, dk, dv, act, m.ssmStateDtype())) return null;
-    try ensureScales(m, act);
-    const r = (try rows(m.s, .{
-        .qkv = p[0],
-        .z = p[1],
-        .a = p[2],
-        .b = p[3],
-        .conv_state = e.conv_state,
-        .conv_w = la.conv_w,
-        .A_log = la.A_log,
-        .dt_bias = la.dt_bias,
-        .state = e.ssm_state,
-        .norm_w = la.norm_w,
-        .q_scale = m.kda.q_scale,
-        .k_scale = m.kda.k_scale,
-        .qk_eps = qkNormEps(m),
-        .norm_eps = c.rms_norm_eps,
-        .bound = c.kda_gate_lower_bound,
-        .hk = hk,
-        .hv = hv,
-        .dk = dk,
-        .dv = dv,
-    })) orelse return null;
-    inline for (.{ .{ &e.conv_state, r.conv_state }, .{ &e.ssm_state, r.state }, .{ &e.spec_state_seq, r.state_seq } }) |kv| {
-        free(kv[0].*);
-        kv[0].* = kv[1];
-    }
-    return r.y;
-}
-
-/// The q and k scales (1/dk, 1/sqrt(dk)) in the activation dtype, made once.
-fn ensureScales(m: *Model, dt: mlx.mlx_dtype) !void {
-    if (m.kda.q_scale.ctx != null) return;
-    const inv: f32 = 1.0 / @as(f32, @floatFromInt(m.c.linear_key_head_dim));
-    m.kda.q_scale = try scalarOf(inv, dt, m.s);
-    m.kda.k_scale = try scalarOf(@sqrt(inv), dt, m.s);
 }
 
 /// Row `r` of `a` `[1, S, W]`: `[1, 1, W]`.
@@ -415,7 +314,11 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         free(in_all);
         in_all = .{ .ctx = null };
     }
-    try ensureScales(m, mlx.mlx_array_dtype(qkv));
+    if (m.kda.q_scale.ctx == null) {
+        const inv: f32 = 1.0 / @as(f32, @floatFromInt(c.linear_key_head_dim));
+        m.kda.q_scale = try scalarOf(inv, mlx.mlx_array_dtype(qkv), s);
+        m.kda.k_scale = try scalarOf(@sqrt(inv), mlx.mlx_array_dtype(qkv), s);
+    }
     const inv_scale_sq = m.kda.q_scale;
     const inv_sqrt_sc = m.kda.k_scale;
 

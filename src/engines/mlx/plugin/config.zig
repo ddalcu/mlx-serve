@@ -30,7 +30,6 @@ pub const Binding = struct {
 
     /// The bill terms admission reads at every request; none depends on the shape.
     pub const BillTerms = struct {
-        kv_per_token: u64,
         /// null from a plugin whose Bill predates them.
         flags: ?abi.BillFlags,
         prices_prompt: bool,
@@ -40,7 +39,7 @@ pub const Binding = struct {
         if (b.bill_terms) |t| return t;
         var bill: abi.Bill = .{};
         b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
-        return .{ .kv_per_token = bill.kv_per_token, .flags = bill.billFlags(), .prices_prompt = bill.prefill_bytes != null };
+        return .{ .flags = bill.billFlags(), .prices_prompt = bill.prefill_bytes != null };
     }
 
     /// Called once, after the parse and before any other thread reads the binding.

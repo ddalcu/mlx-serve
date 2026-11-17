@@ -1056,8 +1056,6 @@ pub const ModelConfig = struct {
     /// memory estimate that sizes a KV cache reads this one helper so the
     /// auto-context sizer and the prefill admission guard cannot disagree.
     pub fn kvBytesPerToken(self: *const ModelConfig) u64 {
-        const declared = declaredKvBytes(self);
-        if (declared > 0) return declared;
         // DeepSeek-V4.1 grows only its KV sources' compressed latents and index
         // keys (bf16); the window is a fixed ring per slot.
         if (self.isDsv41()) {
@@ -1880,14 +1878,6 @@ fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 
     config.plugin = binding;
     return config;
-}
-
-/// The KV bytes a token takes in a plugin's own cache layout: its bill's `kv_per_token` where its parse names a layout
-/// namespace (`CacheFacts.layout_namespace`, the SSD root of that layout); 0 = the engine's formula.
-pub fn declaredKvBytes(config: *const ModelConfig) u64 {
-    const b = config.plugin orelse return 0;
-    if (b.parsed.cache.layout_namespace.len == 0) return 0;
-    return b.billTerms().kv_per_token;
 }
 
 /// Sampling recommendations parsed out of a model's generation_config.json.
@@ -10602,83 +10592,3 @@ test "applyLayerSpan: the PLE stays at its absolute layer and is local only to t
     try std.testing.expectError(error.DistSplitOffInterval, c.applyLayerSpan(.{ .start = 30, .end = 48, .total = 48 }));
 }
 
-test "model config: a plugin naming a layout namespace bills its own KV rows, on any arch; without one the formula" {
-    const T = struct {
-        fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-            out.* = .{ .kv_per_token = 12_345 };
-        }
-        fn unpriced(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
-            out.* = .{};
-        }
-    };
-    var table: abi.ModelTable = undefined;
-    table.bill = &T.bill;
-    var named: plugin_config.Binding = .{ .table = &table };
-    named.parsed.cache.layout_namespace = abi.Str.of("ns-v1");
-    var plain: plugin_config.Binding = .{ .table = &table };
-    const configs = [_]ModelConfig{
-        .{ .model_type = "bailing_hybrid", .num_hidden_layers = 4, .num_attention_heads = 4, .mla_kv_lora_rank = 64, .mla_qk_nope_head_dim = 64, .mla_qk_rope_head_dim = 64, .mla_v_head_dim = 64 },
-        .{ .model_type = "llama", .num_hidden_layers = 4, .num_attention_heads = 8, .num_key_value_heads = 2, .head_dim = 64 },
-        .{ .model_type = "glm5_next", .num_hidden_layers = 4, .num_attention_heads = 4, .dsa_kv_lora_rank = 64, .dsa_index_head_dim = 32 },
-    };
-    for (configs) |base| {
-        var c = base;
-        const formula = c.kvBytesPerToken();
-        c.plugin = &named;
-        try testing.expectEqual(@as(u64, 12_345), declaredKvBytes(&c));
-        try testing.expectEqual(@as(u64, 12_345), c.kvBytesPerToken());
-        // No namespace, no plugin, or a namespace whose bill leaves the term to the engine: the formula.
-        c.plugin = &plain;
-        try testing.expectEqual(formula, c.kvBytesPerToken());
-        c.plugin = null;
-        try testing.expectEqual(formula, c.kvBytesPerToken());
-        table.bill = &T.unpriced;
-        c.plugin = &named;
-        try testing.expectEqual(formula, c.kvBytesPerToken());
-        table.bill = &T.bill;
-    }
-}
-
-// The in-tree plugins that name a namespace for another reason (llama's llama3 rope, Nemotron-H's NoPE) bill no
-// `kv_per_token`, so their KV stays the engine's formula: the bill a config without its plugin gets.
-test "model config: llama's and Nemotron-H's namespaces leave their KV bill to the engine's formula" {
-    const llama32 =
-        \\{"model_type":"llama","hidden_size":3072,"intermediate_size":8192,"num_hidden_layers":28,
-        \\ "num_attention_heads":24,"num_key_value_heads":8,"head_dim":128,"vocab_size":128256,"rms_norm_eps":1e-5,
-        \\ "rope_theta":500000.0,"max_position_embeddings":131072,"hidden_act":"silu","tie_word_embeddings":true,
-        \\ "bos_token_id":128000,"eos_token_id":[128001,128008,128009],
-        \\ "rope_scaling":{"factor":32.0,"high_freq_factor":4.0,"low_freq_factor":1.0,
-        \\   "original_max_position_embeddings":8192,"rope_type":"llama3"},
-        \\ "quantization":{"group_size":64,"bits":4}}
-    ;
-    // A pattern-list Nemotron-H the plugin serves (the Nano fixture's compressed-tensors names keep the legacy path).
-    const nemotron =
-        \\{"model_type":"nemotron_h","hidden_size":2688,"num_hidden_layers":4,"num_attention_heads":32,
-        \\ "num_key_value_heads":2,"head_dim":128,"vocab_size":131072,"mamba_num_heads":64,"mamba_head_dim":64,
-        \\ "layers_block_type":["mamba","moe","full_attention","mlp"],"n_routed_experts":128,"num_experts_per_tok":6,
-        \\ "time_step_limit":[0.0,{"__float__":"Infinity"}]}
-    ;
-    const Case = struct { json: []const u8, table: *const abi.ModelTable };
-    const cases = [_]Case{
-        .{ .json = llama32, .table = &@import("../../plugins/llama/plugin.zig").table },
-        .{ .json = nemotron, .table = &@import("../../plugins/nemotron_h/plugin.zig").table },
-    };
-    for (cases) |case| {
-        // The plugin's own parse bound to the engine's config, as a served load binds them.
-        const mem: @import("../testing/fixture.zig").MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = case.json }} };
-        const dir = mem.packDir();
-        var b: plugin_config.Binding = .{ .table = case.table };
-        try testing.expect(case.table.parse(&dir, abi.Str.of(case.json), .{}, null, true, &b.parsed).isOk());
-        defer case.table.free_parsed(&b.parsed);
-        var c = try parseConfigFromJson(testing.allocator, case.json);
-        defer c.deinit(testing.allocator);
-        const bare_kv = c.kvBytesPerToken();
-        const own = c.plugin;
-        defer c.plugin = own;
-        c.plugin = &b;
-        try testing.expect(b.parsed.cache.layout_namespace.len > 0);
-        try testing.expectEqual(@as(u64, 0), declaredKvBytes(&c));
-        try testing.expect(bare_kv > 0);
-        try testing.expectEqual(bare_kv, c.kvBytesPerToken());
-    }
-}

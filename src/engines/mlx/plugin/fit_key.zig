@@ -1,6 +1,7 @@
 //! The host's bank-fit key (`LoadCtx.bank_fit_key`, `sdk/quant/bank_fit_key.zig`): what a calibration measured on must
 //! match this server for it to apply. A release build (`-Dgit-sha`) keys on its version, commit and MLX build, so a
-//! fit shipped with a pack applies to every server of that release on that machine; a dev build on its executable.
+//! fit shipped with a pack applies to every server of that release with the same chip, RAM and plugin builds; a dev
+//! build keys on its executable.
 
 const std = @import("std");
 const builtin = @import("builtin");

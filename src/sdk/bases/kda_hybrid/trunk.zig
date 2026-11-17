@@ -40,7 +40,6 @@ const QuantMode = @FieldType(Linear, "mode");
 const QuantParams = params.QuantParams;
 const Config = config.Config;
 const gpa = std.heap.c_allocator;
-const VerifyRows = @import("kda.zig").VerifyRows;
 
 /// One DeepSeek-V4 Sinkhorn hyper-connection (`attn_hc` / `ffn_hc`), f32 tables.
 pub const Mhc = struct {
@@ -196,8 +195,6 @@ pub const Model = struct {
     /// Set for one forward whose rows must each carry a one-row decode step's bytes (bailing_hybrid's exact verify):
     /// `mm` runs rows in calls of their projection's row-exact width, KDA, MLA and the MoE row by row.
     serial_rows: bool = false,
-    /// A model plugin's own rows for a serial-rows verify's KDA layers, set after load; null: the trunk steps each row.
-    kda_verify_rows: ?VerifyRows = null,
 
     pub fn deinit(m: *Model) void {
         if (m.experts) |*x| x.close();
@@ -419,8 +416,6 @@ fn fpFromGeometry(c: *const Config, w_cols: u32, s_cols: u32, in_dim: u32) ?Quan
 
 // ── load ──
 
-/// A weight triple as stored (`<base>.{weight,scales,biases}`), scales and biases absent on a dense weight; or a
-/// projection the pack's outside quant plugin loaded (`ext`, `w` its first array).
 /// The pack formats and the model's own kernels the trunk calls but does not import (a base imports no format), given
 /// at load (`load`). Null fields: the trunk's own arms; a pack that needs a missing one is refused by name.
 pub const Hooks = struct {
@@ -462,6 +457,8 @@ pub fn exl3Spec(hooks: Hooks, expert_quant_json: []const u8, top_k: u32) !?Hooks
     return sp;
 }
 
+/// A weight triple as stored (`<base>.{weight,scales,biases}`), scales and biases absent on a dense weight; or a
+/// projection the pack's outside quant plugin loaded (`ext`, `w` its first array).
 const Triple = struct { w: Array, s: Array = .{}, b: Array = .{}, ext: ?outside.Weight = null };
 
 const Loader = struct {
