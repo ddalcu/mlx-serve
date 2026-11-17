@@ -369,7 +369,41 @@ test "deepseek_v41 ablation: a partial tap dump writes the sites it recorded and
     try testing.expect(std.mem.indexOf(u8, index, "\"site_ranges\":[[0,1],[3,4]]") != null);
 }
 
-test "deepseek_v41 ablation: the tap reads a device-id span back, so its index names the prompt's last token" {
+test "deepseek_v41 ablation: the tap reads a device-id span back, so its sidecar names the prompt's last token" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    var tp: Tapped = undefined;
+    try tp.attach(t);
+    defer tp.detach();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // A prompt chunk puts the state at the prompt's length.
+    testing.allocator.free(try forwardUnder(t, .prefill, &.{1}, &short_prompt, &.{0}, null));
+    try testing.expectEqual(@as(usize, 1), try tapRecords(&tp, io));
+    // The split prefill's final token as the real host sends it: device ids, one row, `Mode.decode`.
+    const id: i32 = 44;
+    const dev = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(dev);
+    const slots = [_]u32{1};
+    const pos: u32 = @intCast(short_prompt.len);
+    var out: abi.ForwardOut = .{};
+    const v = v41.table.forward(t.m, &.{ .mode = .decode, .logits = .last_row, .rows = 1, .tokens = .{}, .ids = .{ .ctx = dev.ctx }, .slots = .of(&slots), .positions = .of(&.{pos}), .prefill = true }, &out);
+    try testing.expect(v.isOk());
+    const l: A = .{ .ctx = out.logits.ctx };
+    defer _ = mlx.mlx_array_free(l);
+    // Its record ends at the span: the prompt is one token longer than `pos`, and `tail_ids` names it.
+    const sides = try tapNames(testing.allocator, tp.path[0..tp.len], io, ".json");
+    defer freeNames(testing.allocator, sides);
+    try testing.expectEqual(@as(usize, 2), sides.len);
+    const side = try tp.tmp.dir.readFileAlloc(io, sides[1], testing.allocator, .limited(1 << 16));
+    defer testing.allocator.free(side);
+    try testing.expect(std.mem.indexOf(u8, side, "\"prompt_tokens\":12") != null);
+    try testing.expect(std.mem.indexOf(u8, side, "\"tail_ids\":[44]") != null);
+}
+
+test "deepseek_v41 ablation: the tap dumps prompt forwards, the split prefill's last token included, and no decode step or verify block" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -414,14 +448,13 @@ test "deepseek_v41 ablation: the tap dumps prompt forwards, the split prefill's 
     const io = std.Io.Threaded.global_single_threaded.io();
     // A prompt chunk records and dumps one tensor.
     testing.allocator.free(try forwardUnderPhase(t, .prefill, &short_prompt, 0, true));
-    try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
     // The split prefill's final token: one row, `Mode.decode`, but a prompt forward (the host's `prefill` says so).
     testing.allocator.free(try forwardUnderPhase(t, .decode, &.{44}, @intCast(short_prompt.len), true));
     try testing.expectEqual(@as(usize, 2), try tapRecords(tp.tmp, io));
     // A decode step and a verify block are not prompt forwards: nothing records, nothing dumps.
     testing.allocator.free(try forwardUnderPhase(t, .decode, &.{45}, @intCast(short_prompt.len + 1), false));
     testing.allocator.free(try forwardUnderPhase(t, .verify, &.{ 46, 2 }, @intCast(short_prompt.len + 2), false));
-    try testing.expectEqual(@as(usize, 2), try tapRecords(tp.tmp, io));
+    try testing.expectEqual(@as(usize, 2), try tapRecords(&tp, io));
 }
 
 test "deepseek_v41 ablation: the stream tap keeps the hc mean of a pass's last rows across its spans, only while on" {

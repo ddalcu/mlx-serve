@@ -287,52 +287,17 @@ pub const StreamTap = struct {
     }
 };
 
-/// The next free `seq` for a tap directory: one past the highest in `index.jsonl`'s bytes, 0 when there is none.
-/// The counter lives in the directory, not in memory, so a server restart continues the campaign instead of
-/// overwriting `tap-000000.npy` and leaving two index lines for one file.
-pub fn seqFromIndex(bytes: []const u8) u64 {
-    var best: u64 = 0;
-    var seen = false;
-    var it = std.mem.splitScalar(u8, bytes, '\n');
-    while (it.next()) |line| {
-        const at = std.mem.indexOf(u8, line, "\"seq\":") orelse continue;
-        var i = at + 6;
-        var v: u64 = 0;
-        var any = false;
-        while (i < line.len and line[i] >= '0' and line[i] <= '9') : (i += 1) {
-            v = v * 10 + (line[i] - '0');
-            any = true;
-        }
-        if (any) {
-            best = @max(best, v);
-            seen = true;
-        }
-    }
-    return if (seen) best + 1 else 0;
-}
+/// The per-process half of a tap record's name: two writes in one microsecond (or a clock stepped back) still take
+/// distinct names.
+var tap_tie: std.atomic.Value(u64) = .init(0);
 
-/// `seqFromIndex` over the directory's `index.jsonl` (0 when the file is absent or empty).
-fn nextTapSeq(gpa: std.mem.Allocator, d: std.Io.Dir, io: std.Io) !u64 {
-    var f = d.openFile(io, "index.jsonl", .{ .mode = .read_only }) catch |e| switch (e) {
-        error.FileNotFound => return 0,
-        else => return e,
-    };
-    defer f.close(io);
-    const size = (try f.stat(io)).size;
-    if (size == 0) return 0;
-    const len: usize = @intCast(@min(size, 1 << 20));
-    const buf = try gpa.alloc(u8, len);
-    defer gpa.free(buf);
-    const n = try f.readPositionalAll(io, buf, @intCast(size - len));
-    return seqFromIndex(buf[0..n]);
-}
-
-/// One record in a tap directory, filesystem only (no MLX): `file_bytes` written as `<dir>/tap-<seq>.npy`, claimed by
-/// an exclusive create, and a line for `pos`/`ids`/`runs` appended to `<dir>/index.jsonl` under an exclusive lock. The
-/// seq comes from the directory, never from memory, so a restart cannot overwrite an earlier file; a writer that loses
-/// the race for `tap-<seq>.npy` takes the next seq; an append cuts a torn last record back to its last newline first.
-/// The dir is the owner's only (0700), its files 0600. Returns the seq it claimed.
-pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []const u8, pos: usize, ids: []const u32, rows: usize, runs: []const [2]usize) !u64 {
+/// One record in a tap directory, filesystem only (no MLX): the tensor as `<dir>/tap-<stamp>.npy` and its sidecar
+/// `<dir>/tap-<stamp>.json`, which names that file and the forward's `position`, `prompt_tokens`, `rows`,
+/// `site_ranges` and `tail_ids`. The stamp is the real clock in microseconds, the pid and a per-process counter, so a
+/// restart, or two writers sharing a directory, never take an earlier record's name; there is no index, sequence
+/// number or lock, and the offline tool globs the sidecars. The sidecar is written last, so a torn tensor has none and
+/// is ignored. The dir is the owner's only (0700), its files 0600.
+pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []const u8, pos: usize, ids: []const u32, rows: usize, runs: []const [2]usize) !void {
     const io = std.Io.Threaded.global_single_threaded.io();
     var d = try std.Io.Dir.cwd().createDirPathOpen(io, dir, .{});
     defer d.close(io);
@@ -340,74 +305,37 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
     const dir_z = try gpa.dupeSentinel(u8, dir, 0);
     defer gpa.free(dir_z);
     if (builtin.os.tag != .windows) _ = std.c.chmod(dir_z, 0o700);
-    // The name is claimed by an exclusive create, not by a check then a write: two writers sharing the directory race
-    // for `tap-<seq>.npy`, the loser takes the next seq.
-    var seq = try nextTapSeq(gpa, d, io);
-    var name_buf: [64]u8 = undefined;
-    var name: []const u8 = undefined;
-    var tries: usize = 0;
-    while (tries < 1000) : (tries += 1) {
-        name = try std.fmt.bufPrint(&name_buf, "tap-{d:0>6}.npy", .{seq});
-        const flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
-            .{ .exclusive = true }
-        else
-            .{ .exclusive = true, .permissions = .fromMode(0o600) };
-        d.writeFile(io, .{ .sub_path = name, .data = file_bytes, .flags = flags }) catch |e| switch (e) {
-            error.PathAlreadyExists => {
-                seq += 1;
-                continue;
-            },
-            else => return e,
-        };
-        break;
-    } else return error.TapSeqExhausted;
+    const stamp = std.Io.Timestamp.now(io, .real).toMicroseconds();
+    var stem_buf: [64]u8 = undefined;
+    const stem = try std.fmt.bufPrint(&stem_buf, "tap-{d}-{d}-{d}", .{ stamp, std.c.getpid(), tap_tie.fetchAdd(1, .monotonic) });
+    var name_buf: [80]u8 = undefined;
+    const flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows) .{} else .{ .permissions = .fromMode(0o600) };
+    try d.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name_buf, "{s}.npy", .{stem}), .data = file_bytes, .flags = flags });
 
-    var line: std.Io.Writer.Allocating = .init(gpa);
-    defer line.deinit();
-    try line.writer.print("{{\"seq\":{d},\"file\":\"{s}\",\"position\":{d},\"prompt_tokens\":{d},\"rows\":{d},\"site_ranges\":[", .{ seq, name, pos, pos + ids.len, rows });
-    for (runs, 0..) |r, i| try line.writer.print("{s}[{d},{d}]", .{ if (i == 0) "" else ",", r[0], r[1] });
-    try line.writer.writeAll("],\"tail_ids\":[");
+    var side: std.Io.Writer.Allocating = .init(gpa);
+    defer side.deinit();
+    try side.writer.print("{{\"file\":\"{s}.npy\",\"position\":{d},\"prompt_tokens\":{d},\"rows\":{d},\"site_ranges\":[", .{ stem, pos, pos + ids.len, rows });
+    for (runs, 0..) |r, i| try side.writer.print("{s}[{d},{d}]", .{ if (i == 0) "" else ",", r[0], r[1] });
+    try side.writer.writeAll("],\"tail_ids\":[");
     const tail = ids[ids.len - @min(ids.len, 8) ..];
-    for (tail, 0..) |t, i| try line.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
-    try line.writer.writeAll("]}\n");
-    const idx_flags: std.Io.Dir.CreateFileOptions = if (builtin.os.tag == .windows)
-        .{ .read = true, .truncate = false, .lock = .exclusive }
-    else
-        .{ .read = true, .truncate = false, .lock = .exclusive, .permissions = .fromMode(0o600) };
-    var idx = try d.createFile(io, "index.jsonl", idx_flags);
-    defer idx.close(io);
-    var end = (try idx.stat(io)).size;
-    if (end > 0) {
-        // A crash can leave a half-written last record; a JSONL reader cannot parse it and the append below would
-        // extend it. Cut it back to the last newline (its tensor stays on disk, unindexed) before writing ours.
-        const win: usize = @intCast(@min(end, 4096));
-        var tail_buf: [4096]u8 = undefined;
-        const got = try idx.readPositionalAll(io, tail_buf[0..win], end - win);
-        if (got > 0 and tail_buf[got - 1] != '\n') {
-            const cut: u64 = if (std.mem.lastIndexOfScalar(u8, tail_buf[0..got], '\n')) |i|
-                end - win + i + 1
-            else
-                end - win;
-            try idx.setLength(io, cut);
-            end = cut;
-        }
-    }
-    try idx.writePositionalAll(io, line.written(), end);
-    return seq;
+    for (tail, 0..) |t, i| try side.writer.print("{s}{d}", .{ if (i == 0) "" else ",", t });
+    try side.writer.writeAll("]}\n");
+    // Last: a sidecar vouches for a whole tensor beside it.
+    try d.writeFile(io, .{ .sub_path = try std.fmt.bufPrint(&name_buf, "{s}.json", .{stem}), .data = side.written(), .flags = flags });
+    std.log.info("deepseek_v41: the calibration tap wrote {s}.npy", .{stem});
 }
 
-/// The tap's rows for one prompt forward as `<dir>/tap-<seq>.npy` (f32 `[recorded sites, rows, dim]`: per recorded site
-/// the last `keep` rows its passes recorded, in prompt order, the last one the prompt's last token) and a line in
-/// `<dir>/index.jsonl` (`pos` the forward's first position, `ids` its tokens, `site_ranges` the layers the recorded sites
-/// stand for). The dir is the owner's only (0700), its files 0600. The `seq` comes from the directory, never from
-/// memory, so a restart cannot overwrite an earlier file. Returns that seq, or null when no site recorded anything.
-/// Clears the tap. A Thunderbolt pair's leader records the layers it runs, in runs ([0, p.lo) and [p.hi, n)), and the
-/// file names them. The pair's worker runs the module directly (`cluster/distributed.zig` `serveDsv41`) and records
-/// nothing: its dump needs the step's ids, which its protocol does not carry. The host's `Forward.prefill` says which
-/// forwards are prompt forwards, so the split prefill's final-token span is captured too although it arrives as one row
-/// of `Mode.decode`; an older host without the field masks its prompt chunks by mode and cannot tell that span apart
-/// (see `prefillPhase`).
-pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: usize, ids: []const u32, s: S) !?u64 {
+/// The tap's rows for one prompt forward as `<dir>/tap-<stamp>.npy` (f32 `[recorded sites, rows, dim]`: per recorded
+/// site the last `keep` rows its passes recorded, in prompt order, the last one the prompt's last token) and its
+/// `<dir>/tap-<stamp>.json` sidecar (`position` the forward's first position, `prompt_tokens` its tokens,
+/// `site_ranges` the layers the recorded sites stand for). The dir is the owner's only (0700), its files 0600. Returns
+/// whether a record was written, false when no site recorded anything. Clears the tap. A Thunderbolt pair's leader
+/// records the layers it runs, in runs ([0, p.lo) and [p.hi, n)), and the sidecar names them. The pair's worker runs
+/// the module directly (`cluster/distributed.zig` `serveDsv41`) and records nothing: its dump needs the step's ids,
+/// which its protocol does not carry. The host's `Forward.prefill` says which forwards are prompt forwards, so the
+/// split prefill's final-token span is captured too although it arrives as one row of `Mode.decode`; an older host
+/// without the field masks its prompt chunks by mode and cannot tell that span apart (see `prefillPhase`).
+pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: usize, ids: []const u32, s: S) !bool {
     defer tap.clear();
     const sites = tap.sites.len;
     // The runs of consecutive sites a pass recorded, in order: [0, p.lo) and [p.hi, n) on a pair's leader, [p.lo, p.hi)
