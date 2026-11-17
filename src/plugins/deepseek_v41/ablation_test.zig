@@ -50,16 +50,6 @@ const Twin = struct {
         t.tmp.cleanup();
         testing.allocator.destroy(t);
     }
-
-    fn plugin(t: *Twin, mode: abi.Mode, ids: []const u32, pos: u32) !mlx.mlx_array {
-        var out: abi.ForwardOut = .{};
-        const v = v41.table.forward(t.m, &.{ .mode = mode, .logits = if (mode == .verify) .all_rows else .last_row, .rows = @intCast(ids.len), .tokens = .of(ids), .positions = .of(&.{pos}) }, &out);
-        if (!v.isOk()) {
-            std.debug.print("forward: {s}\n", .{v.why.slice()});
-            return error.PluginForward;
-        }
-        return .{ .ctx = out.logits.ctx };
-    }
 };
 
 const testing = std.testing;
@@ -379,6 +369,39 @@ test "deepseek_v41 ablation: a partial tap dump writes the sites it recorded and
     try testing.expect(std.mem.indexOf(u8, index, "\"site_ranges\":[[0,1],[3,4]]") != null);
 }
 
+test "deepseek_v41 ablation: the tap reads a device-id span back, so its index names the prompt's last token" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const t = try Twin.open(try fixture.v41Files(arena.allocator(), 7), "");
+    defer t.close();
+    var tp: Tapped = undefined;
+    try tp.attach(t);
+    defer tp.detach();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // A prompt chunk puts the state at the prompt's length.
+    testing.allocator.free(try forwardUnder(t, .prefill, &.{1}, &short_prompt, &.{0}, null));
+    try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
+    // The split prefill's final token as the real host sends it: device ids, one row, `Mode.decode`.
+    const id: i32 = 44;
+    const dev = mlx.mlx_array_new_data(&id, &[_]c_int{1}, 1, .int32);
+    defer _ = mlx.mlx_array_free(dev);
+    const slots = [_]u32{1};
+    const pos: u32 = @intCast(short_prompt.len);
+    var out: abi.ForwardOut = .{};
+    const v = v41.table.forward(t.m, &.{ .mode = .decode, .logits = .last_row, .rows = 1, .tokens = .{}, .ids = .{ .ctx = dev.ctx }, .slots = .of(&slots), .positions = .of(&.{pos}), .prefill = true }, &out);
+    try testing.expect(v.isOk());
+    const l: A = .{ .ctx = out.logits.ctx };
+    defer _ = mlx.mlx_array_free(l);
+    // Its record ends at the span: the prompt is one token longer than `pos`, and `tail_ids` names it.
+    const idx = try tp.tmp.dir.readFileAlloc(io, "index.jsonl", testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(idx);
+    const trimmed = std.mem.trimEnd(u8, idx, "\r\n");
+    const last = trimmed[std.mem.lastIndexOfScalar(u8, trimmed, '\n').? + 1 ..];
+    try testing.expect(std.mem.indexOf(u8, last, "\"prompt_tokens\":12") != null);
+    try testing.expect(std.mem.indexOf(u8, last, "\"tail_ids\":[44]") != null);
+}
+
 test "deepseek_v41 ablation: the tap dumps prompt forwards, the split prefill's last token included, and no decode step or verify block" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
@@ -480,7 +503,7 @@ const Table = struct {
 fn forwardUnder(t: *Twin, mode: abi.Mode, slots: []const u32, toks: []const u32, positions: []const u32, abl: ?*const abi.Ablation) ![]f32 {
     var out: abi.ForwardOut = .{};
     const rows: u32 = if (mode == .batched_rows) 1 else @intCast(toks.len);
-    const v = v41.table.forward(t.m, &.{ .mode = mode, .rows = rows, .tokens = .of(toks), .slots = .of(slots), .positions = .of(positions), .ablation = abl }, &out);
+    const v = v41.table.forward(t.m, &.{ .mode = mode, .rows = rows, .tokens = .of(toks), .slots = .of(slots), .positions = .of(positions), .ablation = abl, .prefill = mode == .prefill }, &out);
     if (!v.isOk()) {
         std.debug.print("forward: {s}\n", .{v.why.slice()});
         return error.PluginForward;

@@ -600,7 +600,15 @@ fn run(m: *Model, host_ids: []const u32, pos: usize, all: bool, rows: ?dsv41.Vis
     } else try runPrompt(m, ids, rows);
     defer _ = mlx.mlx_array_free(logits);
     if (tap) |t| {
-        if (ablation.dumpTap(gpa, t, m.tap_dir.?, pos, ids, m.s) catch |e| blk: {
+        // The split prefill's final-token span is one row, so `Ids.of` leaves its id on the device (`host_ids` empty):
+        // read it back, or the index names the prompt one position short and its `tail_ids` empty.
+        var span: [1]u32 = undefined;
+        var tap_ids: []const u32 = ids;
+        if (ids.len == 0 and dev.ctx != null) {
+            span[0] = try v4plugin.hostToken(dev);
+            tap_ids = span[0..];
+        }
+        if (ablation.dumpTap(gpa, t, m.tap_dir.?, pos, tap_ids, m.s) catch |e| blk: {
             std.log.err("deepseek_v41: the calibration tap's dump failed: {t}", .{e});
             break :blk null;
         }) |seq| std.log.info("deepseek_v41: the calibration tap wrote tap-{d:0>6}.npy", .{seq});

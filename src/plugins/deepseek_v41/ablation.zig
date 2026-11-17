@@ -403,9 +403,10 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
 /// memory, so a restart cannot overwrite an earlier file. Returns that seq, or null when no site recorded anything.
 /// Clears the tap. A Thunderbolt pair's leader records the layers it runs, in runs ([0, p.lo) and [p.hi, n)), and the
 /// file names them. The pair's worker runs the module directly (`cluster/distributed.zig` `serveDsv41`) and records
-/// nothing: its dump needs the step's ids, which its protocol does not carry. A prompt chunk of one row past position 0
-/// arrives as `Mode.decode` (the host decides by row count) and is not captured; every multi-row chunk and any prompt
-/// starting at position 0 is.
+/// nothing: its dump needs the step's ids, which its protocol does not carry. The host's `Forward.prefill` says which
+/// forwards are prompt forwards, so the split prefill's final-token span is captured too although it arrives as one row
+/// of `Mode.decode`; an older host without the field masks its prompt chunks by mode and cannot tell that span apart
+/// (see `prefillPhase`).
 pub fn dumpTap(gpa: std.mem.Allocator, tap: *StreamTap, dir: []const u8, pos: usize, ids: []const u32, s: S) !?u64 {
     defer tap.clear();
     const sites = tap.sites.len;
