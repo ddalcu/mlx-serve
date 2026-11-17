@@ -193,6 +193,19 @@ test "deepseek_v41 ablation: an Engram row keeps its per-copy keys and loses the
     try expectClose(&want, got);
 }
 
+test "deepseek_v41 ablation: an armed ablation bills its r, col and s arrays" {
+    if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    var sc = Scope.init(testing.allocator, mlx.gpuStream());
+    defer sc.deinit();
+    const table = [_]f32{ 0.6, 0.8 };
+    const dirs = try f32s(&sc, &table, &.{ 1, 2 });
+    const ab = try ablation.armed(.{ .directions = .{ .ctx = dirs.ctx }, .strength = 1 }, 2, sc.s);
+    defer ab.deinit();
+    // r [2], col [2, 1] and s [1] as f32: a state or snapshot that retains them bills these bytes.
+    try testing.expectEqual(@as(u64, 2 * 4 + 2 * 4 + 4), ablation.retainedBytes(ab));
+    try testing.expectEqual(@as(u64, 0), ablation.retainedBytes(null));
+}
+
 test "deepseek_v41 ablation: arming takes the slot's row of the table as r and as a column, and its strength" {
     if (mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var sc = Scope.init(testing.allocator, mlx.gpuStream());
