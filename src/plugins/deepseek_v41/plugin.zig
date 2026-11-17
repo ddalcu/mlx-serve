@@ -274,6 +274,15 @@ fn mtpSetting(settings_json: []const u8) ?bool {
     return parsed.value.mtp;
 }
 
+/// The tap directory `setting` names, or null for off: `MLX_SERVE_DIAG`'s bare token reads `1` and `=0` is off, so
+/// neither names a directory (arming on one writes a prompt's stream into `./1` or `./0`), and a value at the diag
+/// buffer's width may be a truncated path, which must not decide a directory either.
+pub fn tapDir(setting: []const u8) ?[]const u8 {
+    if (setting.len == 0 or setting.len >= env.diag_value_max) return null;
+    if (std.mem.eql(u8, setting, "0") or std.mem.eql(u8, setting, "1")) return null;
+    return setting;
+}
+
 fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     const io = std.Io.Threaded.global_single_threaded.io();
     const c = config.of(ctx.parsed);
@@ -311,18 +320,21 @@ fn loadModel(ctx: *const abi.LoadCtx, s: mlx.mlx_stream) !*Model {
     // A Thunderbolt pair's leader is fine: it records the layers it runs and the sidecar names their runs (the worker runs
     // the module directly and records nothing). A tensor split is not: it holds a shard of each layer's stream, which
     // is not the residual a direction is measured from.
-    if (env.span(.DSV41_TAP_DIR)) |tap_dir| if (tap_dir.len > 0) {
-        if (m.mdl.tp != null)
-            std.log.warn("deepseek_v41: the calibration tap is off for this load: a tensor split holds a shard of each layer's stream", .{})
-        else {
-            const tap = try gpa.create(ablation.StreamTap);
-            errdefer gpa.destroy(tap);
-            tap.* = try ablation.StreamTap.init(gpa, m.mdl.n_layers, tap_rows);
-            m.mdl.stream_tap = tap;
-            m.tap_dir = tap_dir;
-            std.log.warn("deepseek_v41: the calibration tap is on: every prompt's per-layer stream and last ids go to {s} (owner-only files)", .{tap_dir});
-        }
-    };
+    if (env.span(.DSV41_TAP_DIR)) |setting| {
+        if (tapDir(setting)) |tap_dir| {
+            if (m.mdl.tp != null)
+                std.log.warn("deepseek_v41: the calibration tap is off for this load: a tensor split holds a shard of each layer's stream", .{})
+            else {
+                const tap = try gpa.create(ablation.StreamTap);
+                errdefer gpa.destroy(tap);
+                tap.* = try ablation.StreamTap.init(gpa, m.mdl.n_layers, tap_rows);
+                m.mdl.stream_tap = tap;
+                m.tap_dir = tap_dir;
+                std.log.warn("deepseek_v41: the calibration tap is on: every prompt's per-layer stream and last ids go to {s} (owner-only files)", .{tap_dir});
+            }
+        } else if (setting.len > 0 and !std.mem.eql(u8, setting, "0") and !std.mem.eql(u8, setting, "1"))
+            std.log.warn("deepseek_v41: the calibration tap is off: the diag value holds {d} bytes, short enough to be a truncated directory, so it is refused", .{setting.len});
+    }
     errdefer freeTap(m);
     if (c.dsv41_streamed) {
         const dir = ctx.model_dir.slice();
@@ -963,6 +975,20 @@ test "deepseek_v41 resident bill: neither the vision tower nor DSpark stages tha
     // The stages load by default; the tower never does.
     try std.testing.expectEqual(10_000 - 288 - 32 + lru(), try engramResident(dir, "", 10_000));
     try std.testing.expectEqual(10_000 - 288 - 32 - 64 + lru(), try engramResident(dir, "{\"mtp\":false}", 10_000));
+}
+
+test "deepseek_v41 tap: a diag value that names no directory is off, not a directory in the server's cwd" {
+    // `=0` is off and the bare token reads `1`: arming on either writes a prompt's stream into ./0 or ./1.
+    try std.testing.expectEqual(@as(?[]const u8, null), tapDir(""));
+    try std.testing.expectEqual(@as(?[]const u8, null), tapDir("0"));
+    try std.testing.expectEqual(@as(?[]const u8, null), tapDir("1"));
+    // A value at the diag buffer's width may be a path the buffer cut, so it decides no directory.
+    const wide = "x"** env.diag_value_max;
+    try std.testing.expectEqual(@as(?[]const u8, null), tapDir(wide));
+    // A path whose first segment starts with 0 or 1 is still a path.
+    try std.testing.expectEqualStrings("/tmp/tap", tapDir("/tmp/tap").?);
+    try std.testing.expectEqualStrings("0/tap", tapDir("0/tap").?);
+    try std.testing.expectEqualStrings("1/tap", tapDir("1/tap").?);
 }
 
 test {

@@ -594,7 +594,7 @@ const Peaks = struct {
     }
 };
 
-/// The calibration tap on a twin's model (what `MLX_SERVE_DSV41_TAP_DIR` turns on), writing into a directory of its
+/// The calibration tap on a twin's model (what `MLX_SERVE_DIAG=dsv41-tap-dir=<dir>` turns on), writing into a directory of its
 /// own. Detached before the twin closes: the model frees only a tap of its own allocator.
 const Tapped = struct {
     tap: ablation.StreamTap,

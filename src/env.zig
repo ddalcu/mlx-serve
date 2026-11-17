@@ -249,11 +249,15 @@ fn diagToken(comptime n: []const u8) []const u8 {
     return &final;
 }
 
+/// The longest value a diag token carries (`DiagValue.buf` less its NUL): a longer one is cut, so a consumer that turns
+/// a diag value into a path must refuse a value this long rather than use a truncated one.
+pub const diag_value_max = 255;
+
 /// A diag's value, NUL-terminated for `get`: one buffer per registration.
 fn DiagValue(comptime n: []const u8) type {
     return struct {
         const of = &@field(vars, n);
-        var buf: [256]u8 = undefined;
+        var buf: [diag_value_max + 1]u8 = undefined;
     };
 }
 
@@ -265,7 +269,7 @@ fn diagFind(list: []const u8, token: []const u8, out: []u8) ?[*:0]const u8 {
         if (std.mem.eql(u8, item, token)) return "1";
         if (item.len > token.len and item[token.len] == '=' and std.mem.startsWith(u8, item, token)) {
             const v = item[token.len + 1 ..];
-            const len = @min(v.len, out.len - 1);
+            const len = @min(v.len, diag_value_max);
             @memcpy(out[0..len], v[0..len]);
             out[len] = 0;
             return out[0..len :0].ptr;
@@ -343,7 +347,7 @@ pub const vars = struct {
     pub const DISPATCH_PROBE: Var = .{ .kind = .diag, .type = .int, .default = "0", .owner = "engines/mlx/diag", .since = "26.7.12", .doc = "count the dispatches of N decode steps" };
     pub const DSPARK_PROFILE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark per-round profile" };
     pub const DSPARK_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.7.12", .doc = "DeepSeek-V4 DSpark draft trace" };
-    pub const DSV41_TAP_DIR: Var = .{ .kind = .diag, .type = .text, .default = "unset (no tap)", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "calibration tap directory for the built-in DeepSeek-V4.1 ablation stream tap: each prompt forward's per-layer stream means (its last rows) as tap-<stamp>.npy beside its .json sidecar, the dir 0700, the files 0600" };
+    pub const DSV41_TAP_DIR: Var = .{ .kind = .diag, .type = .text, .default = "unset (no tap)", .owner = "plugins/deepseek_v41", .since = "unreleased", .doc = "calibration tap directory for the built-in DeepSeek-V4.1 ablation stream tap: each prompt forward's per-layer stream means (its last rows) as tap-<stamp>.npy beside its .json sidecar, the dir 0700, the files 0600; a bare token or =0 leaves it off" };
     pub const DSV4_SKIP_MOE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.8.1", .doc = "set: DeepSeek-V4 decode skips the MoE (timing only, garbage output)" };
     pub const DSV4_TRACE: Var = .{ .kind = .diag, .type = .flag, .default = "off", .owner = "plugins/deepseek_v4", .since = "26.8.1", .doc = "DeepSeek-V4 decode trace (exactly 1)" };
     pub const DUMP_RESTORE: Var = .{ .kind = .diag, .type = .text, .default = "unset", .owner = "engines/mlx/cache", .since = "26.9.3", .doc = "dir: dump restored prefix-cache state" };
