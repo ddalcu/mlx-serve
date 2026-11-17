@@ -162,6 +162,7 @@ pub fn negotiate(m: *const Manifest, host_mlx: []const u8) Verdict {
             const t: *const model_abi.ModelTable = @ptrCast(@alignCast(m.table));
             if (nullWord(t, "cache") or nullWord(t, "weights"))
                 return Verdict.refuse(.failed, "model table has no cache or weight hook table: both are required, even empty");
+            if (nullWord(t, "bill")) return Verdict.refuse(.failed, "model table has no bill: the host reads it where it binds the table");
             if (!sized(model_abi.CacheHooks, t.cache) or !sized(model_abi.WeightHooks, t.weights) or
                 !sized(model_abi.SpecHooks, t.spec) or !sized(model_abi.MediaHooks, t.media) or
                 !sized(model_abi.EmbedHooks, t.embed) or !sized(model_abi.DistHooks, t.dist) or
@@ -337,6 +338,18 @@ test "abi dylib: a model table without its cache or weight hook table is refused
         const m: Manifest = .{ .name = .of("toy"), .kind = .model, .mlx = .of(pin), .table = &raw, .fixture = noFixture, .fixture_free = noFree };
         try testing.expectEqualStrings("model table has no cache or weight hook table: both are required, even empty", negotiate(&m, pin).why.slice());
     }
+}
+
+test "abi dylib: a model table without a bill is refused by name, never called" {
+    const pin = "p";
+    var cache: model_abi.CacheHooks = .{};
+    var weights: model_abi.WeightHooks = .{};
+    const t: model_abi.ModelTable = .{ .name = .of("toy"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .weights = &weights };
+    var raw: [@sizeOf(model_abi.ModelTable)]u8 align(@alignOf(model_abi.ModelTable)) = undefined;
+    @memcpy(&raw, std.mem.asBytes(&t));
+    @memset(raw[@offsetOf(model_abi.ModelTable, "bill")..][0..@sizeOf(usize)], 0);
+    const m: Manifest = .{ .name = .of("toy"), .kind = .model, .mlx = .of(pin), .table = &raw, .fixture = noFixture, .fixture_free = noFree };
+    try testing.expectEqualStrings("model table has no bill: the host reads it where it binds the table", negotiate(&m, pin).why.slice());
 }
 
 test "abi dylib: plugin names are lower-case words, never paths" {
