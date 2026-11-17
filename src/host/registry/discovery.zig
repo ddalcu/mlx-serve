@@ -485,12 +485,18 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
     return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator, .roots = roots_owned };
 }
 
-/// `path` with every symlink resolved, allocator-owned; "" when it cannot be resolved.
-pub fn realPathOrEmpty(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []const u8 {
+/// `path` with every symlink resolved, in `buf`; "" when it cannot be resolved.
+pub fn realPathInto(io: std.Io, path: []const u8, buf: *[std.fs.max_path_bytes]u8) []const u8 {
     if (!std.fs.path.isAbsolute(path)) return "";
+    return buf[0 .. std.Io.Dir.realPathFileAbsolute(io, path, buf) catch return ""];
+}
+
+/// `realPathInto`, allocator-owned.
+pub fn realPathOrEmpty(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []const u8 {
     var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const n = std.Io.Dir.realPathFileAbsolute(io, path, &buf) catch return "";
-    return allocator.dupe(u8, buf[0..n]) catch "";
+    const real = realPathInto(io, path, &buf);
+    if (real.len == 0) return "";
+    return allocator.dupe(u8, real) catch "";
 }
 
 /// One folder under two spellings: equal real paths, else equal paths.

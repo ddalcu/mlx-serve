@@ -678,7 +678,7 @@ pub const ModelRegistry = struct {
         errdefer self.allocator.free(path_owned);
         const arch_owned: []const u8 = if (arch_hint.len > 0) try self.allocator.dupe(u8, arch_hint) else "";
         errdefer if (arch_owned.len > 0) self.allocator.free(arch_owned);
-        const real_owned = try self.realPathDupe(path);
+        const real_owned = model_discovery.realPathOrEmpty(self.io, self.allocator, path);
         errdefer if (real_owned.len > 0) self.allocator.free(real_owned);
 
         stub.* = .{
@@ -789,11 +789,12 @@ pub const ModelRegistry = struct {
     /// two ids for one path would let the same weights load twice.
     pub fn peekByPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
         {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const real = model_discovery.realPathInto(self.io, path, &buf);
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
-            if (self.peekByPathLocked(path)) |e| return e;
+            if (self.findDirLocked(path, real)) |e| return e;
         }
-        if (self.peekByRealPath(path)) |e| return e;
         // A GGUF pack is registered by its folder; a client (the app) names the `.gguf` inside it. Only the file the
         // folder serves: another quant beside it is a model of its own.
         if (std.mem.endsWith(u8, path, ".gguf")) if (std.fs.path.dirname(path)) |dir| if (self.peekByPath(dir)) |e| {
@@ -812,35 +813,12 @@ pub const ModelRegistry = struct {
         return std.mem.eql(u8, ra, rb);
     }
 
-    /// The same directory under another spelling: a symlink, either way round.
-    fn peekByRealPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
-        if (!std.fs.path.isAbsolute(path)) return null;
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const real = buf[0 .. std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return null];
-        self.mutex.lockUncancelable(self.io);
-        defer self.mutex.unlock(self.io);
+    /// The entry holding this folder under any spelling: the same path, or a symlink either way round
+    /// (`real` from `realPathInto`). Caller holds `mutex`.
+    fn findDirLocked(self: *ModelRegistry, path: []const u8, real: []const u8) ?*LoadedModel {
+        if (std.mem.trimEnd(u8, path, "/").len == 0) return null;
         var it = self.entries.valueIterator();
-        while (it.next()) |e| if (e.*.real_path.len > 0 and std.mem.eql(u8, e.*.real_path, real)) return e.*;
-        return null;
-    }
-
-    fn realPathDupe(self: *ModelRegistry, path: []const u8) ![]const u8 {
-        if (!std.fs.path.isAbsolute(path)) return "";
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const n = std.Io.Dir.realPathFileAbsolute(self.io, path, &buf) catch return "";
-        return try self.allocator.dupe(u8, buf[0..n]);
-    }
-
-    fn peekByPathLocked(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
-        var trimmed = path;
-        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
-        if (trimmed.len == 0) return null;
-        var it = self.entries.valueIterator();
-        while (it.next()) |entry_ptr| {
-            var entry_path: []const u8 = entry_ptr.*.path;
-            while (entry_path.len > 0 and entry_path[entry_path.len - 1] == '/') entry_path = entry_path[0 .. entry_path.len - 1];
-            if (std.mem.eql(u8, entry_path, trimmed)) return entry_ptr.*;
-        }
+        while (it.next()) |e| if (model_discovery.sameDir(e.*.path, e.*.real_path, path, real)) return e.*;
         return null;
     }
 
@@ -877,19 +855,12 @@ pub const ModelRegistry = struct {
                 }
                 continue;
             }
-            if (self.hasDirLocked(m.path, real)) continue;
+            if (self.findDirLocked(m.path, real) != null) continue;
             _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
             added += 1;
         }
         if (cleared > 0) log.info("[registry] rescan cleared {d} failed load(s)\n", .{cleared});
         return added;
-    }
-
-    /// An entry already holds this folder under another spelling. Caller holds `mutex`.
-    fn hasDirLocked(self: *ModelRegistry, path: []const u8, real: []const u8) bool {
-        var it = self.entries.valueIterator();
-        while (it.next()) |e| if (model_discovery.sameDir(e.*.path, e.*.real_path, path, real)) return true;
-        return false;
     }
 
     /// Look up an entry by id without taking a refcount. Returns null if
