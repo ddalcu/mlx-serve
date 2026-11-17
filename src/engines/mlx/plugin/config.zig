@@ -408,8 +408,12 @@ const ToyOutside = struct {
     fn freeParsed(_: *abi.Parsed) callconv(.c) void {
         freed += 1;
     }
+    /// Every term the engine's: a load reads the bill where it binds the table.
+    fn bill(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{};
+    }
     const cache: abi.CacheHooks = .{};
-    const table: abi.ModelTable = .{ .name = .of("toy_outside"), .claims = sdk_plugin.claimsByType(&.{ "glm5_next", "bailing_hybrid", "toy_outside_arch" }), .parse = &parse, .free_parsed = &freeParsed, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .weights = undefined };
+    const table: abi.ModelTable = .{ .name = .of("toy_outside"), .claims = sdk_plugin.claimsByType(&.{ "glm5_next", "bailing_hybrid", "toy_outside_arch" }), .parse = &parse, .free_parsed = &freeParsed, .bill = &bill, .load = undefined, .unload = undefined, .forward = undefined, .cache = &cache, .weights = undefined };
     const manifest: @import("../../../abi/dylib.zig").Manifest = .{ .name = .of("toy_outside"), .kind = .model, .mlx = .of(""), .table = &table, .fixture = undefined, .fixture_free = undefined };
 
     /// `model.parseConfig` of a pack whose config.json is `json`, with this plugin the process's one outside plugin
