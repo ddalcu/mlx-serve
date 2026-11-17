@@ -159,6 +159,9 @@ pub fn initWithOptions(
     var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
     // Only an echo of prompt logprobs reads a prompt forward's logits before its last row.
     ctx.last_row_logits = options.prompt_logprobs == null;
+    // What plugins read as `Forward.prefill`: the chunk loop and the final-token span are prompt forwards, the decode
+    // steps after them are not (the span is one row, so the host calls it `Mode.decode`).
+    ctx.prefill = true;
     // A grow allocates no slack past the context and the rows a verify writes past its last token.
     ctx.cache.limitGrowth(@as(usize, context.getEffectiveContextLength(&xfm.config)) + verify_rows_max);
 
@@ -793,6 +796,9 @@ pub fn initWithOptions(
     ctx.ssm_cp_positions = &.{};
     ctx.cp_sink = null;
     ctx.last_row_logits = false;
+    // The prompt is forwarded: from here on the generator's forwards are decode steps, and a plugin's prompt tap must
+    // not dump one per token.
+    ctx.prefill = false;
     // History entries for the held-back span: (hidden[j], token[j+1]) for
     // j in [final_start, prefix_len) — same pairing as the chunk loop.
     // The last row's pair (hidden[last], t1) is appended by the first

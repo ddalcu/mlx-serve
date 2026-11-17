@@ -159,6 +159,14 @@ pub fn fits(n: usize, variant: ?Variant, spec: ?Spec) bool {
     }
 }
 
+/// Whether `f` is part of a prompt forward, the only forwards the calibration tap records: the host's `prefill` when
+/// its `Forward` carries it (the split prefill's final-token span is one row and so arrives as `Mode.decode`), else
+/// what an older host's mode and position say: a prompt chunk, or a prompt starting at position 0.
+pub fn prefillPhase(f: *const abi.Forward) bool {
+    if (f.size >= @offsetOf(abi.Forward, "prefill") + @sizeOf(bool)) return f.prefill;
+    return f.mode == .prefill or (f.mode == .decode and f.positions.len > 0 and f.positions.slice()[0] == 0);
+}
+
 /// Arms slot ablation `a` (null: none) on `st` for every pass over it until the next `stateArm` or `stateDisarm`, the
 /// DSpark rounds the engine runs between forwards included; `State.deinit` frees it. A state already under the same
 /// keyed ablation keeps its arrays; a fresh state, or one read back from the disk tier, takes the forward's variant

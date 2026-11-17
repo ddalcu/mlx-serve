@@ -601,6 +601,10 @@ pub const Forward = extern struct {
     /// The absolute positions after which the engine files recurrent-state checkpoints for its prefix cache, ascending,
     /// each one of `prompt_spans` (`CacheOps.checkpoint`); empty = none wanted. Read it only when `size` reaches it.
     ssm_checkpoints: Span(u64) = .{},
+    /// The engine's prompt forwarding, whatever `mode` says: the split prefill's final-token span is one row and so
+    /// arrives as `Mode.decode`. False on decode steps and verify blocks. Read it only when `size` reaches it: an older
+    /// host's `Forward` ends before it.
+    prefill: bool = false,
 };
 
 /// Directional ablation (Arditi et al. 2024): slot i's forward removes `strengths[i]` times the component along its

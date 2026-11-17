@@ -379,7 +379,7 @@ test "deepseek_v41 ablation: a partial tap dump writes the sites it recorded and
     try testing.expect(std.mem.indexOf(u8, index, "\"site_ranges\":[[0,1],[3,4]]") != null);
 }
 
-test "deepseek_v41 ablation: the tap dumps a prompt forward, not a decode step or a verify block" {
+test "deepseek_v41 ablation: the tap dumps prompt forwards, the split prefill's last token included, and no decode step or verify block" {
     if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -389,21 +389,15 @@ test "deepseek_v41 ablation: the tap dumps a prompt forward, not a decode step o
     try tp.attach(t);
     defer tp.detach();
     const io = std.Io.Threaded.global_single_threaded.io();
-    // A prompt forward records and dumps one tensor.
-    const prompt = try t.plugin(.prefill, &short_prompt, 0);
-    defer _ = mlx.mlx_array_free(prompt);
+    // A prompt chunk records and dumps one tensor.
+    testing.allocator.free(try forwardUnderPhase(t, .prefill, &short_prompt, 0, true));
     try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
-    // A decode step and a verify block record nothing and dump nothing: a pair runs its decode steps through the prompt
-    // path and a verify block is all rows, so both reach `runPrompt` and the shape gate keeps them off.
-    const step = try t.plugin(.decode, &.{44}, @intCast(short_prompt.len));
-    defer _ = mlx.mlx_array_free(step);
-    // The verify block sits where the decode step left the state.
-    const verify = try t.plugin(.verify, &.{ 45, 2 }, @intCast(short_prompt.len + 1));
-    defer _ = mlx.mlx_array_free(verify);
-    try testing.expectEqual(@as(usize, 1), try tapRecords(tp.tmp, io));
-    // A fresh one-token prompt starts at position 0, so it records and dumps too (the host sends it as Mode.decode).
-    const fresh = try t.plugin(.decode, &.{9}, 0);
-    defer _ = mlx.mlx_array_free(fresh);
+    // The split prefill's final token: one row, `Mode.decode`, but a prompt forward (the host's `prefill` says so).
+    testing.allocator.free(try forwardUnderPhase(t, .decode, &.{44}, @intCast(short_prompt.len), true));
+    try testing.expectEqual(@as(usize, 2), try tapRecords(tp.tmp, io));
+    // A decode step and a verify block are not prompt forwards: nothing records, nothing dumps.
+    testing.allocator.free(try forwardUnderPhase(t, .decode, &.{45}, @intCast(short_prompt.len + 1), false));
+    testing.allocator.free(try forwardUnderPhase(t, .verify, &.{ 46, 2 }, @intCast(short_prompt.len + 2), false));
     try testing.expectEqual(@as(usize, 2), try tapRecords(tp.tmp, io));
 }
 
@@ -487,6 +481,21 @@ fn forwardUnder(t: *Twin, mode: abi.Mode, slots: []const u32, toks: []const u32,
     var out: abi.ForwardOut = .{};
     const rows: u32 = if (mode == .batched_rows) 1 else @intCast(toks.len);
     const v = v41.table.forward(t.m, &.{ .mode = mode, .rows = rows, .tokens = .of(toks), .slots = .of(slots), .positions = .of(positions), .ablation = abl }, &out);
+    if (!v.isOk()) {
+        std.debug.print("forward: {s}\n", .{v.why.slice()});
+        return error.PluginForward;
+    }
+    const l: A = .{ .ctx = out.logits.ctx };
+    defer _ = mlx.mlx_array_free(l);
+    return dsv41.hostF32(l);
+}
+
+/// `forwardUnder` of one slot with the host's phase set (`Forward.prefill`): the split prefill's final-token span is
+/// one row and arrives as `Mode.decode`, so the phase, not the mode, says whether the tap records it.
+fn forwardUnderPhase(t: *Twin, mode: abi.Mode, toks: []const u32, pos: u32, prefill: bool) ![]f32 {
+    var out: abi.ForwardOut = .{};
+    const slots = [_]u32{1};
+    const v = v41.table.forward(t.m, &.{ .mode = mode, .logits = if (mode == .verify) .all_rows else .last_row, .rows = @intCast(toks.len), .tokens = .of(toks), .slots = .of(&slots), .positions = .of(&.{pos}), .prefill = prefill }, &out);
     if (!v.isOk()) {
         std.debug.print("forward: {s}\n", .{v.why.slice()});
         return error.PluginForward;
