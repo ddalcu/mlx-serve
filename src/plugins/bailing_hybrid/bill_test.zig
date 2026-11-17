@@ -35,7 +35,7 @@ test "bailing_hybrid bill: a streaming pack bills its prompt as the engine bills
     defer config.freeParsed(&p);
     var b: abi.Bill = .{};
     plugin.table.bill(&p, &.{ .context = 32768 }, &b);
-    try std.testing.expect(b.prefill_bytes.? == &plugin.prefillBytes);
+    try std.testing.expect(b.prefill_bytes.? == &plugin.prefillBytes and b.billFlags().?.decode_room == .billed);
     try std.testing.expect(p.caps.prompt_last_row and p.caps.streamed_weights);
     try expectEngineBill(json, mem.files);
 
@@ -47,7 +47,7 @@ test "bailing_hybrid bill: a streaming pack bills its prompt as the engine bills
     defer config.freeParsed(&q);
     var bq: abi.Bill = .{};
     plugin.table.bill(&q, &.{ .context = 32768 }, &bq);
-    try std.testing.expect(bq.prefill_bytes == null and !q.caps.prompt_last_row);
+    try std.testing.expect(bq.prefill_bytes == null and bq.billFlags().?.decode_room == .by_name and !q.caps.prompt_last_row);
     // The same arithmetic on an affine 4-bit pack (the dequant-weights term) still equals the engine's.
     try expectEngineBill(tiny, tmem.files);
 }

@@ -1,22 +1,29 @@
 # glm5_next plugin
 
-Owns `glm5_next`, `glm5_next_text` (GLM-5.3-Flash: mlx-community, NVIDIA ModelOpt FP4 and Sushi EXL3 packs). Ling 3.0 (`plugins/bailing_hybrid`) shares this plugin's
-config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.zig`) and fixture writer.
+Owns `glm5_next`, `glm5_next_text` (GLM-5.3-Flash: mlx-community, NVIDIA ModelOpt FP4 and Sushi EXL3 packs). It and
+Ling 3.0 (`plugins/bailing_hybrid`) run on the KDA-hybrid base, `sdk/bases/kda_hybrid/` (the kit's
+`kit.bases.kda_hybrid`): the family config and readers (`config.zig`), the trunk (`trunk.zig`), the KDA layer
+(`kda.zig`), slot access (`slots.zig`), the table glue (`host.zig`), the MoE layers (`moe.zig`) and the fixture writer
+(`fixture.zig`). `builtin_formats.zig` beside them is the trunk's `Hooks.exl3` for Sushi packs, which only the
+server's own plugins pass (the kit does not ship it). Below, those six file names are the base's.
 
-- Parse: `config.zig` (MLX-free) reads every key the engine's GLM arm reads into `Config`; `model_config.zig` maps it
-  to the engine's `ModelConfig` field for field (`expectEngineParse`: equal on the three GLM fixtures, a flat pack, the
-  refusals, and the file parse with processor + generation config). Refuses: a streaming pack without its
-  `experts.bin`, `qk_rope_head_dim`, any Gemma/BERT/sliding key (`foreign_keys`).
+- Parse: this plugin's `config.zig` (MLX-free) claims GLM packs and reads every key the engine's GLM arm reads into
+  the family's `Config`; `model_config.zig` maps it to the engine's `ModelConfig` field for field
+  (`expectEngineParse`: equal on the three GLM fixtures, a flat pack, the refusals, and the file parse with processor
+  + generation config). Refuses: a streaming pack without its `experts.bin`, `qk_rope_head_dim`, any
+  Gemma/BERT/sliding key (`foreign_keys`).
 - Streaming pack (`Config.streamed_bank`): its claiming outside quant plugin runs the projections it stores and the
   head's experts (`sdk/quant/outside_model.zig`); its bank opens per phase (`Budget.fit`: `stream_room`, `decodeRoom()`,
-  the pack's `bank-fit.json` on its ceiling), binds each routed layer (`moe.bindRouted`), takes each forward's phase
-  and settles after its eval. Serial decode, no images (`bankFacts`).
+  the pack's fit for this server's key, `bank-fit/<id>.json`, on its ceiling), binds each routed layer
+  (`moe.bindRouted`), takes each forward's phase and settles after its eval. Serial decode, no images (`bankFacts`).
 - Load (`trunk.zig`): reads the driver's resident source (`LoadCtx.weights`: the engine's map with the Sushi and
   ModelOpt adapters applied) in the layout the deleted legacy load built: q|k|v and the convs joined, GLM's decode row
   group `[qkv | z | a | b]`, f32 KDA tables, DSA and MLA projections, the MoE block's weights, the `mtp.0` head.
   Quant params resolve per weight at load (`resolve`, the legacy `computeQuantParams` over known input widths).
   `Model` carries the helpers the forwards took from `Transformer` (`mm`, `rmsNorm`, `narrowAddNorm`, `embedding`,
-  `lmHead`, `denseMlp`, `headMm`), same op order.
+  `lmHead`, `denseMlp`), same op order; `headMm` is `table_forward.zig`'s. The load takes `trunk.Hooks`: this plugin
+  passes `exl3` (Sushi packs, `builtin_formats.zig`) and `fused_decode` (`moe_fused.zig`); `router` (a routed layer's
+  own router) and the model's KDA stages (`KdaConsts.stages`) are for an outside plugin's own kernels.
 - KDA (`kda.zig`): the per-channel-gate arms of the legacy `gatedDeltaNetProjected` on a slot's `Entry`: GLM's
   one-dispatch decode/verify (`kda_recurrence.decodeStep`), low-rank gates, the fused prework, the per-core prompt
   recurrence; Ling's softplus gate (compiled at load) and the stock vector-gate kernels.

@@ -1,20 +1,22 @@
 //! Ling 3.0 (`bailing_hybrid`, BailingMoeV3): KDA linear attention (a per-channel bounded-sigmoid gate) beside
 //! naive MLA every `layer_group_size`-th layer, a grouped sigmoid MoE with one ungated shared expert. Its own forward
-//! (`table_forward.zig`) over the trunk GLM-5.3-Flash's plugin loads (`glm5_next/trunk.zig`).
+//! (`table_forward.zig`) over the KDA-hybrid base's trunk it shares with GLM-5.3-Flash
+//! (`sdk/bases/kda_hybrid/trunk.zig`).
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
-const host = @import("../glm5_next/host.zig");
-const trunk = @import("../glm5_next/trunk.zig");
+const host = @import("../../sdk/bases/kda_hybrid/host.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const builtin_formats = @import("../../sdk/bases/kda_hybrid/builtin_formats.zig");
 const sdk_bill = @import("../../sdk/bill/prefill.zig");
 const dq_gemm = @import("../../sdk/blocks/linear/prefill_dq_gemm.zig");
 const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
-const Family = @import("../glm5_next/config.zig").Config;
+const Family = @import("../../sdk/bases/kda_hybrid/config.zig").Config;
 const run = @import("../../sdk/bases/run.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
-const fixture = @import("../glm5_next/fixture.zig");
+const fixture = @import("../../sdk/bases/kda_hybrid/fixture.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -57,6 +59,7 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
         .ssm_checkpoint = c.ssmCheckpointBytes(2),
         .prefill_score_width = qk,
         .prefill_bytes = if (c.streamed_bank) &prefillBytes else null,
+        .flags = .{ .decode_room = if (c.streamed_bank) .billed else .by_name, .reserves_request = c.streamed_bank },
     };
 }
 
@@ -97,7 +100,7 @@ pub fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, kv_bits: u8, _: 
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *abi.Verdict) callconv(.c) ?*anyopaque {
-    return host.load(plugin.name, ctx, out);
+    return host.load(plugin.name, ctx, .{ .exl3 = &builtin_formats.exl3 }, out);
 }
 
 pub fn forward(mp: *anyopaque, f: *const abi.Forward, out: *abi.ForwardOut) callconv(.c) abi.Verdict {

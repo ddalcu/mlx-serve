@@ -7,6 +7,7 @@
 const std = @import("std");
 
 const common = @import("common.zig");
+const quant = @import("quant.zig");
 pub const Span = common.Span;
 pub const Str = common.Str;
 pub const Verdict = common.Verdict;
@@ -88,7 +89,19 @@ pub const Host = extern struct {
 
     /// The Neural Engine; read it through `aneOf`, which also answers null for a host older than this field.
     ane: ?*const HostAne = null,
+
+    /// The outside quant table the host loaded that claims a pack's quantization block `block_json` of `config_json`:
+    /// the highest claim; null when none claims or two tie (the host logs a tie by name). A model plugin's own dylib
+    /// holds no quant table, so its loads ask here (`outside.Format.open`). Read it through `quantClaimantOf`, which
+    /// also answers null for a host older than this field. Any thread.
+    quant_claimant: ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable = null,
 };
+
+/// `h.quant_claimant`, or null where the host has none or predates it (its `size` ends before the field).
+pub fn quantClaimantOf(h: *const Host) ?*const fn (ctx: ?*anyopaque, block_json: Str, config_json: Str) callconv(.c) ?*const quant.QuantTable {
+    if (h.size < @offsetOf(Host, "quant_claimant") + @sizeOf(@FieldType(Host, "quant_claimant"))) return null;
+    return h.quant_claimant;
+}
 
 /// `h.ane`, or null where the host has none or predates it (its `size` ends before the field).
 pub fn aneOf(h: *const Host) ?*const HostAne {
@@ -296,6 +309,24 @@ test "abi host: aneOf answers null for a host that predates the field, or a tabl
     try t.expect(aneOf(&h) == null);
 }
 
+test "abi host: quantClaimantOf answers null for a host that predates the field or leaves it null" {
+    const t = std.testing;
+    const S = struct {
+        fn claimant(_: ?*anyopaque, _: Str, _: Str) callconv(.c) ?*const quant.QuantTable {
+            return null;
+        }
+    };
+    var h: Host = undefined;
+    h.size = @sizeOf(Host);
+    h.quant_claimant = &S.claimant;
+    try t.expect(quantClaimantOf(&h) == &S.claimant);
+    h.size = @offsetOf(Host, "quant_claimant");
+    try t.expect(quantClaimantOf(&h) == null);
+    h.size = @sizeOf(Host);
+    h.quant_claimant = null;
+    try t.expect(quantClaimantOf(&h) == null);
+}
+
 test "abi host: the table layouts are pinned (size first, offsets fixed, growth only at the end)" {
     const t = std.testing;
     if (@sizeOf(usize) != 8) return error.SkipZigTest;
@@ -306,10 +337,10 @@ test "abi host: the table layouts are pinned (size first, offsets fixed, growth 
         .{ "latch_pending", 64 },    .{ "latch_check", 72 },     .{ "latch_drop_unless", 80 },
         .{ "gpu_context_lost", 88 }, .{ "kernel", 96 },          .{ "lever", 104 },
         .{ "counter", 112 },         .{ "memory_ceiling", 120 }, .{ "gpu", 128 },
-        .{ "ane", 136 },
+        .{ "ane", 136 },             .{ "quant_claimant", 144 },
     };
     inline for (host_fields) |f| try t.expectEqual(f[1], @offsetOf(Host, f[0]));
-    try t.expectEqual(@as(usize, 144), @sizeOf(Host));
+    try t.expectEqual(@as(usize, 152), @sizeOf(Host));
     try t.expectEqual(host_fields.len, @typeInfo(Host).@"struct".field_names.len);
 
     const gpu_fields = [_]struct { []const u8, usize }{

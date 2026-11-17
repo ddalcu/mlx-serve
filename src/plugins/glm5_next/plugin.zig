@@ -6,12 +6,15 @@ const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const host = @import("host.zig");
+const host = @import("../../sdk/bases/kda_hybrid/host.zig");
 const fwd = @import("table_forward.zig");
 const head = @import("head.zig");
-const fixture = @import("fixture.zig");
+const fixture = @import("../../sdk/bases/kda_hybrid/fixture.zig");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
-const trunk = @import("trunk.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const builtin_formats = @import("../../sdk/bases/kda_hybrid/builtin_formats.zig");
+const moe_fused = @import("moe_fused.zig");
+const glm5 = @import("glm5_next.zig");
 pub const config = @import("config.zig");
 
 pub const plugin = config.plugin;
@@ -54,11 +57,12 @@ fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) 
     out.* = .{
         .kv_per_token = @as(u64, c.attnLayerCount()) * (c.dsa_kv_lora_rank + 2 * c.dsa_index_head_dim) * 2,
         .ssm_checkpoint = c.ssmCheckpointBytes(4),
+        .flags = .{ .decode_room = if (c.streamed_bank) .billed else .by_name },
     };
 }
 
 fn load(ctx: *const abi.LoadCtx, out: *Verdict) callconv(.c) ?*anyopaque {
-    return host.load(plugin.name, ctx, out);
+    return host.load(plugin.name, ctx, .{ .exl3 = &builtin_formats.exl3, .fused_decode = .{ .rows = glm5.MOE_DECODE_MAX_ROWS, .run = &moe_fused.fusedDecode } }, out);
 }
 
 /// A Sushi pack is held as its adapter leaves it (`SushiBill`); every other pack as stored (a streaming pack's bank
@@ -228,6 +232,17 @@ test "glm5_next resident bill: a GLM streaming pack bills its 8-bit draft readou
     try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(&c));
     c.streamed_bank = false;
     try std.testing.expectEqual(@as(u64, 0), draftReadoutBytes(&c));
+}
+
+test "glm5_next bill: a streaming pack bills its own decode room, a resident one leaves it to the host's rule" {
+    var c: config.Config = .{ .model_type = "glm5_next", .streamed_bank = true };
+    const p: abi.Parsed = .{ .private = &c };
+    var b: abi.Bill = .{};
+    bill(&p, &.{}, &b);
+    try std.testing.expect(b.billFlags().?.decode_room == .billed);
+    c.streamed_bank = false;
+    bill(&p, &.{}, &b);
+    try std.testing.expect(b.billFlags().?.decode_room == .by_name);
 }
 
 test {

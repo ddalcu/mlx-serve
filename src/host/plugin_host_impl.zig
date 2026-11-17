@@ -47,6 +47,7 @@ pub const Builtin = struct {
             .memory_ceiling = memoryCeiling,
             .gpu = &gpu_table,
             .ane = @import("plugin_ane.zig").table(),
+            .quant_claimant = quantClaimant,
         } };
     }
 
@@ -80,6 +81,11 @@ pub fn processHost() *const abi.Host {
     }
     @import("host_table.zig").published.get().host = p.builtin.host();
     return p.builtin.host();
+}
+
+/// The quant plugins the host loaded (`outside.register`, at startup): the one claiming `block_json`.
+fn quantClaimant(_: ?*anyopaque, block_json: abi.Str, config_json: abi.Str) callconv(.c) ?*const @import("../abi/quant.zig").QuantTable {
+    return @import("../sdk/quant/outside.zig").claimant(block_json.slice(), config_json.slice());
 }
 
 fn self_(ctx: ?*anyopaque) *Builtin {
@@ -414,6 +420,36 @@ test "builtin host: the allocator round-trips through the table (std.mem.Allocat
     try testing.expect(std.mem.isAligned(@intFromPtr(p.ptr), 64));
     a.free(p);
     // testing.allocator reports a leak or a mismatched free at the end of the test
+}
+
+test "builtin host: quant_claimant answers the registered table that claims a block, null for none or a tie" {
+    const outside = @import("../sdk/quant/outside.zig");
+    const quant = @import("../abi/quant.zig");
+    const Q = struct {
+        fn claims(block: quant.Str, _: quant.Str) callconv(.c) quant.Claim {
+            return if (std.mem.indexOf(u8, block.slice(), "\"q\"") != null) .by_type else .no;
+        }
+    };
+    // A claim reads only `claims`, and a tie's line the names.
+    var one: quant.QuantTable = undefined;
+    one.name = .of("q-one");
+    one.claims = &Q.claims;
+    var two = one;
+    two.name = .of("q-two");
+    const saved = outside.tables.get().*;
+    defer outside.tables.get().* = saved;
+    outside.tables.get().* = .{};
+    outside.register(&one);
+
+    var b: Builtin = undefined;
+    b.init(.{ .allocator = testing.allocator });
+    defer b.deinit();
+    const h = b.host();
+    const claimant = abi.quantClaimantOf(h).?;
+    try testing.expectEqual(@as(?*const quant.QuantTable, &one), claimant(h.ctx, .of("{\"mode\":\"q\"}"), .of("{}")));
+    try testing.expect(claimant(h.ctx, .of("{\"mode\":\"affine\"}"), .of("{}")) == null);
+    outside.register(&two);
+    try testing.expect(claimant(h.ctx, .of("{\"mode\":\"q\"}"), .of("{}")) == null);
 }
 
 test "builtin host: a log line reaches the log sink at its level" {

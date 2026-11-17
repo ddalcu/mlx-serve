@@ -4,9 +4,9 @@
 //! copied_from: engines/mlx/forward/layered.zig (`forwardMoeWith`, its bailing arms).
 
 const mlx = @import("../../mlx/ffi.zig");
-const slots_mod = @import("../glm5_next/slots.zig");
-const trunk = @import("../glm5_next/trunk.zig");
-const glm_moe = @import("../glm5_next/moe.zig");
+const slots_mod = @import("../../sdk/bases/kda_hybrid/slots.zig");
+const trunk = @import("../../sdk/bases/kda_hybrid/trunk.zig");
+const glm_moe = @import("../../sdk/bases/kda_hybrid/moe.zig");
 const mla = @import("mla.zig");
 
 const Array = mlx.mlx_array;

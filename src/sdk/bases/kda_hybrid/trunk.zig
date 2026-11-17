@@ -7,34 +7,32 @@
 //! engines/mlx/load/weights.zig (`loadRoutedMoeAt`, `f32Table`), engines/mlx/load/init.zig (the embedding and the
 //! head), sdk/quant/params.zig (`computeQuantParams`), plugins/glm5_next/load.zig, plugins/glm5_next/mtp.zig
 //! (`Head.load`), sdk/blocks/embedding.zig (`rawEmbedding`), sdk/blocks/linear/qmatmul.zig (`lmHeadProject`),
-//! sdk/blocks/mlp/dense.zig (`denseMLP`), plugins/glm5_next/forward.zig (`glmHeadMm`).
+//! sdk/blocks/mlp/dense.zig (`denseMLP`).
 
 const std = @import("std");
-const abi = @import("../../abi/plugin.zig");
-const quant_abi = @import("../../abi/quant.zig");
-const mlx = @import("../../mlx/ffi.zig");
-const array = @import("../../mlx/array.zig");
-const log = @import("../../sdk/util/log.zig");
-const linear = @import("../../sdk/bases/blocks/linear.zig");
-const moe = @import("../../sdk/bases/blocks/moe.zig");
-const streamed = @import("../../sdk/weights/streamed.zig");
-const outside = @import("../../sdk/quant/outside.zig");
-const outside_model = @import("../../sdk/quant/outside_model.zig");
-const routed_mod = @import("../../sdk/weights/routed.zig");
-const narrowsLoadedF16 = @import("../../sdk/weights/load.zig").narrowsLoadedF16;
-const compiled = @import("../../sdk/bases/blocks/compiled.zig");
-const gdn_base = @import("../../sdk/bases/blocks/gdn.zig");
-const exl3 = @import("../../sdk/quant/exl3/format.zig");
-const params = @import("../../sdk/quant/params.zig");
-const fp8_block128 = @import("../../sdk/quant/fp8_block128.zig");
-const fused_rows = @import("../../sdk/blocks/linear/fused_rows.zig");
-const qmatmulBits = @import("../../sdk/blocks/linear/qmatmul.zig").qmatmulBits;
-const fused_act = @import("../../sdk/blocks/mlp/fused_activations.zig");
-const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampedSwiGLU;
-const add_norm = @import("../../sdk/blocks/norms/add_norm.zig");
-const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
+const abi = @import("../../../abi/plugin.zig");
+const quant_abi = @import("../../../abi/quant.zig");
+const mlx = @import("../../../mlx/ffi.zig");
+const array = @import("../../../mlx/array.zig");
+const log = @import("../../util/log.zig");
+const linear = @import("../blocks/linear.zig");
+const moe = @import("../blocks/moe.zig");
+const streamed = @import("../../weights/streamed.zig");
+const outside = @import("../../quant/outside.zig");
+const outside_model = @import("../../quant/outside_model.zig");
+const routed_mod = @import("../../weights/routed.zig");
+const narrowsLoadedF16 = @import("../../weights/load.zig").narrowsLoadedF16;
+const compiled = @import("../blocks/compiled.zig");
+const gdn_base = @import("../blocks/gdn.zig");
+const params = @import("../../quant/params.zig");
+const fp8_claim = @import("../../quant/fp8_block128_claim.zig");
+const fused_rows = @import("../../blocks/linear/fused_rows.zig");
+const qmatmulBits = @import("../../blocks/linear/qmatmul.zig").qmatmulBits;
+const fused_act = @import("../../blocks/mlp/fused_activations.zig");
+const clampedSwiGLU = @import("../../blocks/mlp/activations.zig").clampedSwiGLU;
+const add_norm = @import("../../blocks/norms/add_norm.zig");
+const residual_norm = @import("../../blocks/norms/residual_norm.zig");
 const config = @import("config.zig");
-const glm5 = @import("glm5_next.zig");
 
 const Array = mlx.mlx_array;
 pub const Linear = linear.Linear;
@@ -161,6 +159,8 @@ pub const KdaConsts = struct {
     eps: Array = .{},
     /// The softplus gate chain compiled (`gdn.compileGate`), for a gate without a lower bound (Ling).
     gate_fn: compiled.Closure = .{ .ctx = null },
+    /// A model plugin's own KDA stages, set after load (`kda.Stages`); none: the trunk's.
+    stages: @import("kda.zig").Stages = .{},
 };
 
 pub const Model = struct {
@@ -340,28 +340,6 @@ pub const Model = struct {
         try mlx.check(mlx.mlx_multiply(&out, act, up, s));
         return out;
     }
-
-    /// Per-head projection over `q` `[H, out, in]`: `x @ w^T` when `transpose`, else `x @ w`.
-    pub fn headMm(m: *const Model, x: Array, q: *const Linear, transpose: bool) !Array {
-        const s = m.s;
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        if (q.s.ctx == null) {
-            if (transpose) {
-                var wt = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(wt);
-                try mlx.check(mlx.mlx_swapaxes(&wt, q.w, -1, -2, s));
-                try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
-            } else try mlx.check(mlx.mlx_matmul(&out, x, q.w, s));
-            return out;
-        }
-        if (transpose and q.mode == .affine) if (try glm5.headQmv(s, x, q.w, q.s, q.b, q.bits, q.group_size, 1.0)) |y| {
-            _ = mlx.mlx_array_free(out);
-            return y;
-        };
-        try mlx.check(mlx.mlx_quantized_matmul(&out, x, q.w, q.s, q.b, transpose, mlx.mlx_optional_int.some(@intCast(q.group_size)), mlx.mlx_optional_int.some(@intCast(q.bits)), q.mode.cstr(), s));
-        return out;
-    }
 };
 
 /// `w` with its last two axes swapped (a view).
@@ -438,6 +416,47 @@ fn fpFromGeometry(c: *const Config, w_cols: u32, s_cols: u32, in_dim: u32) ?Quan
 
 // ── load ──
 
+/// The pack formats and the model's own kernels the trunk calls but does not import (a base imports no format), given
+/// at load (`load`). Null fields: the trunk's own arms; a pack that needs a missing one is refused by name.
+pub const Hooks = struct {
+    /// A Sushi pack's EXL3 routed experts (`expert_quant`).
+    exl3: ?*const Exl3 = null,
+    /// The model's own one-kernel routed decode: each routed layer's `fused` arm, up to `rows` rows (GLM's).
+    fused_decode: ?FusedDecode = null,
+
+    /// A routed layer's own router (`moe.RouterHook`) from its router weight as stored (`[experts, hidden]`,
+    /// unquantized), for the trunk's routed layers (a head's keeps the block's route); null from `fill`: the block's.
+    router: ?Router = null,
+
+    pub const FusedDecode = struct { rows: c_int, run: @FieldType(moe.Fused, "run") };
+    pub const Router = struct { ctx: ?*anyopaque = null, fill: *const fn (ctx: ?*anyopaque, stored: Array) anyerror!?moe.RouterHook };
+
+    /// EXL3 routed experts through their format, which the trunk never names: the spec rides inline in `Spec`, written
+    /// and read by the hook alone.
+    pub const Exl3 = struct {
+        pub const spec_bytes = 64;
+        pub const Spec = struct { bytes: [spec_bytes]u8 align(16) = undefined };
+        /// The pack's `expert_quant` block (JSON) for `top_k` routed experts, once per load.
+        parse: *const fn (gpa: std.mem.Allocator, expert_quant_json: []const u8, top_k: u32, out: *Spec) anyerror!void,
+        /// One bank (its trellis, suh, svh) checked against the spec at its geometry.
+        admit: *const fn (spec: *const Spec, trellis: Array, suh: Array, svh: Array, experts: u32, in_dim: u32, out_dim: u32) anyerror!void,
+        /// The bank as the format's table loads one.
+        wrap: *const fn (spec: *const Spec, trellis: Array, suh: Array, svh: Array) quant_abi.Weight,
+        /// The format's table the banks run through.
+        table: *const quant_abi.QuantTable,
+    };
+};
+
+/// The pack's EXL3 spec from its `expert_quant` block (empty: none); a pack that declares one without the format's
+/// hook is refused by name.
+pub fn exl3Spec(hooks: Hooks, expert_quant_json: []const u8, top_k: u32) !?Hooks.Exl3.Spec {
+    if (expert_quant_json.len == 0) return null;
+    const x = hooks.exl3 orelse return error.Exl3ExpertsNeedTheBuiltinFormat;
+    var sp: Hooks.Exl3.Spec = .{};
+    try x.parse(gpa, expert_quant_json, top_k, &sp);
+    return sp;
+}
+
 /// A weight triple as stored (`<base>.{weight,scales,biases}`), scales and biases absent on a dense weight; or a
 /// projection the pack's outside quant plugin loaded (`ext`, `w` its first array).
 const Triple = struct { w: Array, s: Array = .{}, b: Array = .{}, ext: ?outside.Weight = null };
@@ -448,7 +467,8 @@ const Loader = struct {
     s: mlx.mlx_stream,
     prefix: []const u8,
     owned: *std.ArrayList(Array),
-    exl3: ?exl3.Spec,
+    exl3: ?Hooks.Exl3.Spec,
+    hooks: Hooks = .{},
     experts: ?*streamed.Streamed = null,
     /// The outside quant plugin claiming the pack (`format` null: none).
     quant: *outside_model.Load,
@@ -537,7 +557,7 @@ const Loader = struct {
         const t = try l.kept(raw);
         if (t.s.ctx == null) return .{ .w = t.w };
         // e4m3: the matmul knows it by its dtypes; no affine kernel may claim it.
-        if (fp8_block128.isBlockScaled(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = fp8_block128.block_cols };
+        if (fp8_claim.isBlockScaled(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = fp8_claim.block_cols };
         const qp = resolve(l.c, t.w, t.s, in_dim);
         return .{ .w = t.w, .s = t.s, .b = t.b, .bits = qp.bits, .group_size = qp.group_size, .mode = qp.mode };
     }
@@ -765,14 +785,14 @@ const Loader = struct {
     /// sigmoid router with its selection bias, the ungated shared expert, ModelOpt's per-expert scales, a Sushi
     /// pack's EXL3 banks through the format table, GLM's one-kernel decode as the `fused` arm.
     /// `banked`: the layer's experts are the streaming pack's bank's, bound after the load (`bindBank`).
-    fn routed(l: *Loader, base: []const u8, banked: bool) !moe.Moe.Weights {
+    fn routed(l: *Loader, base: []const u8, banked: bool, trunk_layer: bool) !moe.Moe.Weights {
         const c = l.c;
         const glm = c.isGlm5();
         var nb: [256]u8 = undefined;
         // mlx-lm quantizes the router under its module (`mlp.gate.gate_proj`); the reference keeps `mlp.gate`.
         const rt = if (!l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.weight", .{base})) and l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.gate.gate_proj.weight", .{base}))) "mlp.gate.gate_proj" else "mlp.gate";
         const ex = if (l.has(try std.fmt.bufPrint(&nb, "{s}.mlp.experts.gate_proj.weight", .{base}))) "mlp.experts" else "mlp.switch_mlp";
-        const spec: ?exl3.Spec = if (glm) l.exl3 else null;
+        const spec: ?Hooks.Exl3.Spec = if (glm) l.exl3 else null;
         const lf: [3][]const u8 = if (spec != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
         var banks: [3]Triple = @splat(.{ .w = .{} });
         // An outside plugin's resident experts (a streaming pack's head) run as the block's format banks.
@@ -785,6 +805,12 @@ const Loader = struct {
             };
         };
         var router = try l.triple(try std.fmt.bufPrint(&nb, "{s}.{s}", .{ base, rt }));
+        // A model's own router reads the weight as stored, before the trunk transposes it and widens GLM's to f32; it
+        // keeps its own reference.
+        const router_hook: ?moe.RouterHook = if (glm and trunk_layer and router.s.ctx == null and router.ext == null)
+            (if (l.hooks.router) |h| try h.fill(h.ctx, router.w) else null)
+        else
+            null;
         var shared: [3]Triple = undefined;
         for (&shared, [_][]const u8{ "gate_proj", "up_proj", "down_proj" }) |*t, p| t.* = try l.triple(try std.fmt.bufPrint(&nb, "{s}.mlp.shared_experts.{s}", .{ base, p }));
         const expert_bias = if (glm)
@@ -815,7 +841,7 @@ const Loader = struct {
         };
         for (&shared) |*t| try l.transposed(t);
         if (spec) |sp| for (banks, [_][2]u32{ .{ c.hidden_size, c.moe_intermediate_size }, .{ c.hidden_size, c.moe_intermediate_size }, .{ c.moe_intermediate_size, c.hidden_size } }) |t, io|
-            try exl3.admit(.{ .trellis = t.w, .suh = t.s, .svh = t.b }, c.num_experts, io[0], io[1], sp);
+            try l.hooks.exl3.?.admit(&sp, t.w, t.s, t.b, c.num_experts, io[0], io[1]);
 
         const inter: ?u32 = if (c.moe_intermediate_size > 0) c.moe_intermediate_size else null;
         const shared_inter: ?u32 = if (c.shared_expert_intermediate_size > 0) c.shared_expert_intermediate_size else null;
@@ -849,8 +875,12 @@ const Loader = struct {
         } else if (banked) {
             // Bound to the bank after the load.
         } else if (spec) |sp| {
-            w.format_banks = .{ .table = &exl3.table, .gate = exl3Weight(banks[0], sp), .up = exl3Weight(banks[1], sp), .down = exl3Weight(banks[2], sp) };
-        } else if (glm) w.fused = .{ .rows = glm5.MOE_DECODE_MAX_ROWS, .limit = c.swiglu_limit, .run = &@import("moe.zig").fusedDecode };
+            const x = l.hooks.exl3.?;
+            w.format_banks = .{ .table = x.table, .gate = x.wrap(&sp, banks[0].w, banks[0].s, banks[0].b), .up = x.wrap(&sp, banks[1].w, banks[1].s, banks[1].b), .down = x.wrap(&sp, banks[2].w, banks[2].s, banks[2].b) };
+        } else if (glm) {
+            if (l.hooks.fused_decode) |fd| w.fused = .{ .rows = fd.rows, .limit = c.swiglu_limit, .run = fd.run };
+        }
+        w.router_hook = router_hook;
         w.route_fn = moe.compileRouting(&w, l.s);
         return w;
     }
@@ -874,7 +904,7 @@ const Loader = struct {
             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{base})),
             .eh_proj = try l.lin(eh, 2 * c.hidden_size),
             .mla = try l.mla(idx),
-            .moe = try l.routed(base, false),
+            .moe = try l.routed(base, false, false),
         };
     }
 
@@ -896,7 +926,7 @@ const Loader = struct {
             .post_norm = try l.tensor(try std.fmt.bufPrint(&nb, "{s}.post_attention_layernorm.weight", .{block})),
             .eh_proj = try l.lin(eh, 2 * c.hidden_size),
             .dsa = try l.dsa(block),
-            .moe = try l.routed(block, false),
+            .moe = try l.routed(block, false, false),
         };
     }
 
@@ -925,7 +955,7 @@ const Loader = struct {
                 L.ffn_hc = try l.mhc(base, "ffn_hc");
             }
             L.mixer = if (c.isLinearLayer(i)) .{ .kda = try l.kda(i) } else if (c.isGlm5()) .{ .dsa = try l.dsa(base) } else .{ .mla = try l.mla(i) };
-            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank) } else .{ .dense = try l.dense(i) };
+            L.mlp = if (c.num_experts > 0 and i >= c.first_k_dense_replace) .{ .moe = try l.routed(base, c.streamed_bank, true) } else .{ .dense = try l.dense(i) };
             if (L.mlp == .moe and i < c.expert_limit_out.len) {
                 // Ling-3.1's clamps after the SiLU: the shared expert's in the block; the routed experts' in the composed
                 // chain (no kernel serves it), or in the bound bank's own arithmetic (`BankGeometry.limits_out`, `bindBank`).
@@ -968,20 +998,6 @@ fn clampOf(c: *const Config) ?u32 {
     return @intFromFloat(c.swiglu_limit);
 }
 
-/// A Sushi bank as the EXL3 format table loads one: trellis, suh, svh and the pack's decode.
-fn exl3Weight(t: Triple, spec: exl3.Spec) quant_abi.Weight {
-    const d = exl3.decode(spec);
-    return .{
-        .w = .{ .ctx = t.w.ctx },
-        .scales = .{ .ctx = t.s.ctx },
-        .biases = .{ .ctx = t.b.ctx },
-        .layout = @backingInt(d.codebook),
-        .flags = @intCast(d.window.bits()),
-        .block = @intCast(mlx.getShape(t.w)[3]),
-        .state = if (d.table) |i| @ptrFromInt(@as(usize, i) + 1) else null,
-    };
-}
-
 /// The weight prefix the pack uses: the config's, else the other nesting that holds the embedding.
 fn probePrefix(src: *const quant_abi.Source, declared: []const u8, leaf: []const u8) []const u8 {
     var nb: [160]u8 = undefined;
@@ -994,7 +1010,7 @@ fn probePrefix(src: *const quant_abi.Source, declared: []const u8, leaf: []const
 }
 
 /// The trunk from `ctx.weights`, and GLM's head when the pack ships one (a head that fails to load is dropped).
-pub fn load(ctx: *const abi.LoadCtx) !*Model {
+pub fn load(ctx: *const abi.LoadCtx, hooks: Hooks) !*Model {
     const src = ctx.weights orelse return error.UnsupportedWeightSource;
     const c = config.of(ctx.parsed);
     // Before the trunk: what is outside the server, for the bank's open (`Fit.load_start`).
@@ -1011,16 +1027,10 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
     // The table is the load's: the weights it loaded stay the model's.
     defer m.quant.close();
     if (c.streamed_bank and m.quant.format == null) return error.StreamedBankUnclaimed;
-    var l: Loader = .{ .src = src, .c = c, .s = s, .prefix = prefix, .owned = &m.owned, .exl3 = null, .quant = &m.quant };
+    var l: Loader = .{ .src = src, .c = c, .s = s, .prefix = prefix, .owned = &m.owned, .exl3 = null, .hooks = hooks, .quant = &m.quant };
     if (c.num_experts > 0 and !c.streamed_bank) m.experts = try streamed.Streamed.forLoad(gpa, ctx, c.num_experts, s);
     if (m.experts) |*x| l.experts = x;
-    if (c.expert_quant_json.len > 0) {
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        defer arena.deinit();
-        const text = try std.fmt.allocPrint(arena.allocator(), "{{\"expert_quant\":{s}}}", .{c.expert_quant_json});
-        const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), text, .{});
-        l.exl3 = try exl3.parse(root.object, c.num_experts_per_tok);
-    }
+    l.exl3 = try exl3Spec(hooks, c.expert_quant_json, c.num_experts_per_tok);
     var nb: [256]u8 = undefined;
     m.rms_eps = mlx.mlx_array_new_float(c.rms_norm_eps);
     m.kda.gate_fn = gdn_base.compileGate(m.ssmStateDtype(), s);
@@ -1081,23 +1091,31 @@ pub fn load(ctx: *const abi.LoadCtx) !*Model {
 
 /// The streaming pack's bank, opened by its outside plugin at the host's room past the loaded residents, bound to every
 /// routed layer (the trunk's layer index, as `BankGeometry.gates`).
+/// The name the bank's log lines start with: the model plugin's.
+fn bankLogName(ctx: *const abi.LoadCtx) []const u8 {
+    const t = ctx.parsed.shell.model_type.slice();
+    return if (t.len > 0) t else "glm5_next";
+}
+
 /// The bank's per-phase fit (`outside_model.Fit`): the host's prompt and decode rooms, and the pack's measured
-/// calibration (`bank-fit.json`) when it names this ceiling and reaches the server's context; the bills otherwise.
+/// calibration (`bank-fit/<id>.json`, else `bank-fit.json`) when it carries this server's key, names this ceiling and
+/// reaches the server's context; the bills otherwise. Logs the key once, for the fitter to copy.
 fn bankFit(ctx: *const abi.LoadCtx, start: outside_model.Reading) outside_model.Fit {
+    const name = bankLogName(ctx);
     const grow = ctx.streamGrowth();
     var fit: outside_model.Fit = .{ .prompt_room = ctx.stream_room, .decode_room = ctx.decodeRoom(), .grow_prompt = grow.prompt, .grow_decode = grow.decode, .load_start = start };
-    if (!ctx.dir.has(outside_model.bank_fit_file)) return fit;
-    var buf: [4096]u8 = undefined;
-    var why: abi.Verdict = .ok;
-    const text = ctx.dir.readFile(outside_model.bank_fit_file, &buf, &why) orelse {
-        log.warn("glm5_next: {s} does not read ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, why.why.slice() });
+    const key = ctx.fitKey();
+    if (key) |k| if (outside_model.fit_key.parse(k)) |p| {
+        const id = outside_model.fit_key.id(k);
+        log.info("{s}: bank fit key id={s} build={s} | machine={s} | quant_plugin={s} | model_plugin={s} | pack={s}\n", .{ name, &id, p.build, p.machine, p.quant_plugin, p.model_plugin, p.pack });
+    };
+    var buf: [16384]u8 = undefined;
+    const found = outside_model.readBankFit(ctx.dir, key, &buf) orelse return fit;
+    fit.calibration = outside_model.parseBankFit(found.text, ctx.gpuCeiling(), abi.stream_room_cell, key) catch |e| {
+        log.warn("{s}: {s} not applied ({s}): the bank fits by the bills\n", .{ name, found.name(), @errorName(e) });
         return fit;
     };
-    fit.calibration = outside_model.parseBankFit(text, ctx.gpuCeiling(), abi.stream_room_cell) catch |e| {
-        log.warn("glm5_next: {s} not applied ({s}): the bank fits by the bills\n", .{ outside_model.bank_fit_file, @errorName(e) });
-        return fit;
-    };
-    log.info("glm5_next: the bank fits by {s} (ceiling {d} MiB; the bills' growth past its {d}-token evidence {d} / {d} MiB)\n", .{ outside_model.bank_fit_file, fit.calibration.?.ceiling >> 20, fit.calibration.?.evidence, grow.prompt >> 20, grow.decode >> 20 });
+    log.info("{s}: the bank fits by {s} (ceiling {d} MiB; the bills' growth past its {d}-token evidence {d} / {d} MiB)\n", .{ name, found.name(), fit.calibration.?.ceiling >> 20, fit.calibration.?.evidence, grow.prompt >> 20, grow.decode >> 20 });
     return fit;
 }
 
@@ -1117,11 +1135,12 @@ fn bindBank(m: *Model, ctx: *const abi.LoadCtx, start: outside_model.Reading) !v
     const geo: quant_abi.BankGeometry = .{ .hidden = c.hidden_size, .inter = c.moe_intermediate_size, .top_k = c.num_experts_per_tok, .n_experts = c.num_experts, .n_layers = @intCast(m.layers.len), .swiglu_limit = if (c.swiglu_clamp) c.swiglu_limit else 0, .gates = gates.ptr, .limits_out = if (any_limit) limits.ptr else null };
     const o = try outside_model.openBank(m.quant.format.?, geo, .{ .fit = bankFit(ctx, start) }, m.s);
     m.bank = o.bank;
-    log.info("glm5_next: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
+    const name = bankLogName(ctx);
+    log.info("{s}: streamed experts, {s}: {d} prompt / {d} decode slot rows per layer\n", .{ name, o.bank.b.about.slice(), o.rows.prompt, o.rows.decode });
     // the budget and the memory read at the open: a bank-fit.json's evidence (`rest = non-file in use - server footprint`)
-    if (o.refused) |e| log.warn("glm5_next: the memory read at the open refused ({s}: non-file in use below the server's footprint): the bank fits by the bills on total - available\n", .{@errorName(e)});
-    if (o.read) |r| if (r.in_use != o.reading.?.in_use) log.info("glm5_next: the open read non-file in use {d} MiB, settled to {d} MiB (outside the server at the load's start {d} MiB, server footprint {d} MiB)\n", .{ r.in_use >> 20, o.reading.?.in_use >> 20, (start.in_use -| start.footprint) >> 20, r.footprint >> 20 });
-    if (o.reading) |r| log.info("glm5_next: bank budget {d} MiB prompt / {d} MiB decode: non-file in use {d} MiB, server footprint {d} MiB at the open\n", .{ o.budget.prompt >> 20, o.budget.decode >> 20, r.in_use >> 20, r.footprint >> 20 });
+    if (o.refused) |e| log.warn("{s}: the memory read at the open refused ({s}: non-file in use below the server's footprint): the bank fits by the bills on total - available\n", .{ name, @errorName(e) });
+    if (o.read) |r| if (r.in_use != o.reading.?.in_use) log.info("{s}: the open read non-file in use {d} MiB, settled to {d} MiB (outside the server at the load's start {d} MiB, server footprint {d} MiB)\n", .{ name, r.in_use >> 20, o.reading.?.in_use >> 20, (start.in_use -| start.footprint) >> 20, r.footprint >> 20 });
+    if (o.reading) |r| log.info("{s}: bank budget {d} MiB prompt / {d} MiB decode: non-file in use {d} MiB, server footprint {d} MiB at the open\n", .{ name, o.budget.prompt >> 20, o.budget.decode >> 20, r.in_use >> 20, r.footprint >> 20 });
     const r = o.bank.routed();
     m.routed = r;
     for (m.layers, 0..) |*ly, li| if (ly.mlp == .moe) try moe.bindRouted(&ly.mlp.moe, r, @intCast(li));
@@ -1213,6 +1232,15 @@ test "glm5_next trunk: the draft readout bills Ling-3.1-flash's 4-bit head at 34
     try std.testing.expectEqual(@as(u64, 674_037_760), draftReadoutBytes(154_880, 4096, 8));
     try std.testing.expectEqual(@as(u32, 4), readoutBits(&.{ .model_type = "bailing_hybrid" }));
     try std.testing.expectEqual(@as(u32, 8), readoutBits(&.{ .model_type = "glm5_next" }));
+}
+
+test "glm5_next trunk: the bank fit's log lines name the model plugin that loads the bank" {
+    const dir: abi.PackDir = undefined;
+    for ([_][]const u8{ "bailing_hybrid", "glm5_next" }) |t| {
+        const parsed: abi.Parsed = .{ .shell = .{ .model_type = .of(t) } };
+        const ctx: abi.LoadCtx = .{ .model_dir = .{}, .dir = &dir, .parsed = &parsed };
+        try std.testing.expectEqualStrings(t, bankLogName(&ctx));
+    }
 }
 
 /// Makes Ling's NextN layer resident (bailing_hybrid's `HeadHooks.load`).

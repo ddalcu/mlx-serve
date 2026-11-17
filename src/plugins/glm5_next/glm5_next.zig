@@ -1152,7 +1152,7 @@ pub fn headQmv(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, scales: ml
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        const kn = mlx.mlx_fast_metal_kernel_new("msv_glm5_head_qmv", iv, ov, HEAD_QMV_SOURCE, kernelSource("plugins/glm5_next/kernels/qmv_header.metal"), true, false);
+        const kn = mlx.mlx_fast_metal_kernel_new("msv_glm5_head_qmv", iv, ov, HEAD_QMV_SOURCE, kernelSource("kernels/kda/qmv_header.metal"), true, false);
         if (kn.ctx == null) return error.MetalKernelCompileFailed;
         head_qmv_kernel = kn;
         break :blk kn;
@@ -1177,7 +1177,7 @@ fn moeKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []cons
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, kernelSource("plugins/glm5_next/kernels/qmv_header.metal"), true, false);
+    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, kernelSource("kernels/kda/qmv_header.metal"), true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = k;
     return k;

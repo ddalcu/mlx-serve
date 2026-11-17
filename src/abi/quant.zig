@@ -198,6 +198,10 @@ pub const Bank = extern struct {
     /// A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets.
     /// Appended: read only where `size` reaches it.
     exact_rows: bool = false,
+    /// A prompt-phase `rows` call (more ids than `decode_ids`) sums each routed row by itself: a row's bytes do not
+    /// depend on the call's other rows, so a model may join several prompt spans' rows into one call. False: not
+    /// declared. Appended: read only where `size` reaches it.
+    rows_independent: bool = false,
 };
 
 pub const Swiglu = extern struct {
@@ -244,6 +248,14 @@ test "abi quant: a table's row-exact matmul width is read only where its size re
     // A table built before the field (at the loader's minimum): not declared.
     t.size = QuantTable.min_size;
     try testing.expectEqual(@as(u32, 0), t.exactRows());
+}
+
+test "abi quant: a bank's independent prompt rows are declared after every earlier member" {
+    // Appended: a bank built before it ends at `rows_independent`, and the host reads it as not declared.
+    try testing.expect(@offsetOf(Bank, "rows_independent") > @offsetOf(Bank, "exact_rows"));
+    try testing.expect(@offsetOf(Bank, "rows_independent") > @offsetOf(Bank, "meters"));
+    const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
+    try testing.expect(!b.rows_independent);
 }
 
 test "abi quant: a post-SiLU SwiGLU limit reaches only a table that declares it" {

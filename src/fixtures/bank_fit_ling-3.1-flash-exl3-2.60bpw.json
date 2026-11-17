@@ -1,0 +1,24 @@
+{
+ "format": "mlx-serve-bank-fit-v3",
+ "key": {
+  "build": "26.11.3+e285ab55 mlx=c69303b00f5f ReleaseFast kv16",
+  "machine": "Apple M5 Max 128GB",
+  "quant_plugin": "turboexl3_ling 1.0.0 ab12",
+  "model_plugin": "in-tree",
+  "pack": "cd34"
+ },
+ "ceiling_bytes": 120259084288,
+ "cell_tokens": 17408,
+ "evidence_tokens": 19404,
+ "base_prompt_bytes": 48480492928,
+ "base_decode_bytes": 45262890944,
+ "rest_bytes": 13906214912,
+ "evidence": "Ling-3.1-flash EXL3 2.60bpw, the standard 16K + 1K request",
+ "fit_line": {
+  "peak_prompt": 97734000000,
+  "peak_decode": 98791000000,
+  "bank_prompt": 51400990720,
+  "bank_decode": 55675592704,
+  "hot_cache": 2147483648
+ }
+}

@@ -6,18 +6,18 @@
 //! sdk/blocks/gdn/gate.zig (`computeGdnGate`).
 
 const std = @import("std");
-const mlx = @import("../../mlx/ffi.zig");
-const ops = @import("../../mlx/ops.zig");
-const log = @import("../../sdk/util/log.zig");
-const compiled = @import("../../sdk/bases/blocks/compiled.zig");
-const conv1d = @import("../../sdk/bases/blocks/conv1d.zig");
-const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
-const kdaGateChain = @import("../../sdk/blocks/kda/gate.zig").kdaGateChain;
-const gate_mod = @import("../../sdk/blocks/gdn/gate.zig");
-const gdn_decode = @import("../../sdk/blocks/gdn/decode.zig");
-const decode_fused = @import("../../sdk/blocks/gdn/decode_fused.zig");
-const kernels = @import("../../sdk/blocks/gdn/kernels.zig");
-const sliceQkvPart = @import("../../sdk/blocks/linear/fused_rows.zig").sliceQkvPart;
+const mlx = @import("../../../mlx/ffi.zig");
+const ops = @import("../../../mlx/ops.zig");
+const log = @import("../../util/log.zig");
+const compiled = @import("../blocks/compiled.zig");
+const conv1d = @import("../blocks/conv1d.zig");
+const kda_recurrence = @import("../../blocks/kda/recurrence.zig");
+const kdaGateChain = @import("../../blocks/kda/gate.zig").kdaGateChain;
+const gate_mod = @import("../../blocks/gdn/gate.zig");
+const gdn_decode = @import("../../blocks/gdn/decode.zig");
+const decode_fused = @import("../../blocks/gdn/decode_fused.zig");
+const kernels = @import("../../blocks/gdn/kernels.zig");
+const sliceQkvPart = @import("../../blocks/linear/fused_rows.zig").sliceQkvPart;
 const trunk = @import("trunk.zig");
 
 const Array = mlx.mlx_array;
@@ -84,6 +84,71 @@ pub fn forward(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         return serialRows(m, x, la, e, seq_len);
     return forwardWith(m, x, la, e, batch, seq_len, is_prefill, capture, null);
 }
+
+/// A model plugin's own stages of a KDA layer's forward (`trunk.KdaConsts.stages`, set after load). Each runs where its
+/// rows fall and takes the stock stage's place, or gives null where it does not serve the call, and the stock stage
+/// runs. A stage that gives null has changed none of its inputs and no slot state; when it is asked, only the stock
+/// stages before it have run (for recurrence and verify rows, the conv, which advances the conv window). Prompt rows
+/// are one slot's 17 rows or more of a bounded gate, not captured and not on the per-core recurrence's arm; verify rows
+/// are one slot's captured rows of a bounded gate.
+pub const Stages = struct {
+    /// Prompt rows with a 4-tap conv: the conv window and the scaled q, k and v heads in place of the conv, the q/k
+    /// norms and the scales.
+    prologue: ?*const fn (s: mlx.mlx_stream, in: PrologueIn) anyerror!?PrologueOut = null,
+    /// Prompt rows on a GPU stream, after the prologue: the recurrence's output and final state. It makes its own gate,
+    /// so the stock gate is not made where `serves` holds, and `run` then serves.
+    recurrence: ?Recurrence = null,
+    /// Verify rows: the gate in place of the composed gate chain.
+    verify_gate: ?*const fn (s: mlx.mlx_stream, in: GateIn) anyerror!?Array = null,
+    /// Verify rows on a GPU stream: the capture recurrence's output, final state and every row's state (what a partial
+    /// accept's rollback reads) in place of the stock capture kernel.
+    verify_capture: ?*const fn (s: mlx.mlx_stream, in: CaptureIn) anyerror!?CaptureOut = null,
+    /// Verify rows with a 4-tap conv: the conv window, the scaled heads, beta and the capture's conv input in place of
+    /// the composed conv, q/k norms, scales and beta sigmoid. Asked before the conv, so no slot state has changed then.
+    verify_prework: ?*const fn (s: mlx.mlx_stream, in: PreworkIn) anyerror!?PreworkOut = null,
+    /// Prompt rows and verify rows off the fused prework: the gated norm's flat output `[B, S, hv dv]` (the out
+    /// projection's input) in place of the composed `rms_norm(y) * sigmoid(z)`.
+    epilogue: ?*const fn (s: mlx.mlx_stream, in: EpilogueIn) anyerror!?Array = null,
+};
+
+/// The verify prework's operands, borrowed: as `PrologueIn`, with the beta projection `b` and the row count.
+pub const PreworkIn = struct { qkv: Array, b: Array, conv_state: ?Array, conv_w: Array, q_scale: Array, k_scale: Array, qk_eps: f32, hk: c_int, dk: c_int, hv: c_int, dv: c_int, taps: c_int, rows: c_int };
+/// New references the trunk owns: q, k `[1, S, hk, dk]`, v `[1, S, hv, dv]`, beta, the conv window after the last row
+/// and the conv input the capture keeps (`Entry.spec_conv_input`).
+pub const PreworkOut = struct { q: Array, k: Array, v: Array, beta: Array, window: Array, conv_input: Array };
+
+/// The epilogue's operands, borrowed: the recurrence's y `[B, S, hv, dv]`, the z projection, the norm's weight and its
+/// 0-dim epsilon; `verify`: the rows are a verify's.
+pub const EpilogueIn = struct { y: Array, z: Array, norm_w: Array, eps: Array, hv: c_int, dv: c_int, batch: c_int, rows: c_int, verify: bool };
+
+/// The prologue's operands, borrowed for the call: `[1, S, C]` q|k|v (`C = 2 hk dk + hv dv`), the conv window before
+/// the first row (null: a cold slot), the depthwise conv's weight, the 0-dim q and k scales, the q/k norm's epsilon.
+pub const PrologueIn = struct { qkv: Array, conv_state: ?Array, conv_w: Array, q_scale: Array, k_scale: Array, qk_eps: f32, hk: c_int, dk: c_int, hv: c_int, dv: c_int, taps: c_int };
+/// New references the trunk owns: q, k `[1, S, hk, dk]`, v `[1, S, hv, dv]` and the conv window after the last row.
+pub const PrologueOut = struct { q: Array, k: Array, v: Array, window: Array };
+
+/// The recurrence's operands, borrowed: the scaled heads, the gate's input `a`, beta, the gate's per-head `A_log` and
+/// `dt_bias` in f32 (as the loader keeps them for GLM; empty where it keeps none), its lower bound, and the state
+/// before the first row.
+pub const RecurIn = struct { q: Array, k: Array, v: Array, a: Array, beta: Array, a_log_h: Array, dt_f32: Array, lower_bound: f32, state: Array };
+/// New references the trunk owns: y `[1, S, hv, dv]` and the state after the last row.
+pub const RecurOut = struct { y: Array, state: Array };
+/// `serves` sees the stream, the geometry, the dtypes and the f32 gate operands (empty where the loader keeps none) and
+/// holds where `run` serves these rows.
+pub const Recurrence = struct {
+    serves: *const fn (s: mlx.mlx_stream, hk: c_int, hv: c_int, dk: c_int, dv: c_int, act: mlx.mlx_dtype, state: mlx.mlx_dtype, a_log_h: Array, dt_f32: Array, lower_bound: f32) bool,
+    run: *const fn (s: mlx.mlx_stream, in: RecurIn) anyerror!RecurOut,
+};
+
+/// The gate's operands, borrowed: `a` (the gate's input), `dt_bias`, `A_log` expanded per key channel, its lower bound.
+pub const GateIn = struct { a: Array, dt_bias: Array, A_log: Array, lower_bound: f32 };
+
+/// The capture recurrence's operands, borrowed: the scaled heads, the gate, beta, the state before the first row and
+/// the row count as a 0-dim int, with the kernels' dtypes and geometry.
+pub const CaptureIn = struct { q: Array, k: Array, v: Array, g: Array, beta: Array, state: Array, rows_scalar: Array, in_dtype: mlx.mlx_dtype, out_dtype: mlx.mlx_dtype, hk: c_int, hv: c_int, dk: c_int, dv: c_int, batch: c_int, rows: c_int };
+/// New references the trunk owns: y `[B, S, hv, dv]`, the state after the last row, every row's state
+/// `[S, B, hv, dv, dk]`.
+pub const CaptureOut = struct { y: Array, state: Array, state_seq: Array };
 
 /// A row's projections, given in place of the layer's own.
 const Pre = struct { qkv: Array, z: Array, a: Array, b: Array };
@@ -271,6 +336,43 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         kda_recurrence.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype());
     // Wide prework is token-local; a cold chunk supplies the same zero history as the composed conv.
     const prefill_fused = kda_fused and is_prefill and decode_fused.gdnPrefillFusedFor(seq_len, batch);
+    const stages = m.kda.stages;
+    const prompt_rows = bounded and is_prefill and !capture and batch == 1 and seq_len >= 17 and !kda_fused;
+    const verify_rows = bounded and capture and batch == 1;
+    const prologue: ?PrologueOut = if (prompt_rows and kernel == 4) if (stages.prologue) |f|
+        try f(s, .{ .qkv = qkv, .conv_state = if (e.initialized) e.conv_state else null, .conv_w = la.conv_w, .q_scale = inv_scale_sq, .k_scale = inv_sqrt_sc, .qk_eps = qkNormEps(m), .hk = num_k_heads, .dk = dk, .hv = num_v_heads, .dv = dv, .taps = kernel })
+    else
+        null else null;
+    if (prologue) |p| {
+        free(e.conv_state);
+        e.conv_state = p.window;
+        e.initialized = true;
+        _ = mlx.mlx_array_free(q_scaled);
+        _ = mlx.mlx_array_free(k_scaled);
+        _ = mlx.mlx_array_free(v_heads);
+        q_scaled = p.q;
+        k_scaled = p.k;
+        v_heads = p.v;
+    }
+    // A model's own verify prework: beta rides `beta_fused`; the stock fused epilogue stays the fused prework's.
+    const vprework: ?PreworkOut = if (verify_rows and kernel == 4) if (stages.verify_prework) |f|
+        try f(s, .{ .qkv = qkv, .b = b_proj, .conv_state = if (e.initialized) e.conv_state else null, .conv_w = la.conv_w, .q_scale = inv_scale_sq, .k_scale = inv_sqrt_sc, .qk_eps = qkNormEps(m), .hk = num_k_heads, .dk = dk, .hv = num_v_heads, .dv = dv, .taps = kernel, .rows = seq_len })
+    else
+        null else null;
+    if (vprework) |p| {
+        free(e.conv_state);
+        e.conv_state = p.window;
+        e.initialized = true;
+        free(e.spec_conv_input);
+        e.spec_conv_input = p.conv_input;
+        _ = mlx.mlx_array_free(q_scaled);
+        _ = mlx.mlx_array_free(k_scaled);
+        _ = mlx.mlx_array_free(v_heads);
+        q_scaled = p.q;
+        k_scaled = p.k;
+        v_heads = p.v;
+        beta_fused = p.beta;
+    }
     if (kda_fused and (batch * seq_len <= decode_fused.GDN_FUSED_MAX_ROWS or prefill_fused) and
         kernel == 4 and (e.initialized or prefill_fused))
     blk: {
@@ -326,7 +428,7 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         beta_fused = pre.beta;
     }
 
-    if (!fused_prework) {
+    if (!fused_prework and prologue == null and vprework == null) {
         var g = ops.Graph.init(std.heap.c_allocator, s);
         defer g.deinit();
         const conv = try conv1d.run(&g, qkv, if (e.initialized) e.conv_state else null, la.conv_w, null, batch, conv_dim, kernel, true);
@@ -361,12 +463,18 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, s));
     }
 
-    // One gate value per key channel: the bounded sigmoid where the config bounds it (fla's two arms), else the
-    // softplus chain over `A_log` expanded per channel. The per-core recurrence builds the gate itself.
-    const g = if (kda_fused) Array{ .ctx = null } else if (bounded)
-        try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s)
+    // A model's own prompt recurrence where it serves these rows; it makes the gate itself.
+    const recur_stage: ?Recurrence = if (prompt_rows and mlx.streamIsGpu(s)) if (stages.recurrence) |r|
+        (if (r.serves(s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), m.ssmStateDtype(), la.a_log_h, la.dt_f32, c.kda_gate_lower_bound)) r else null)
     else
-        try softplusGate(m, la.A_log, a_proj, la.dt_bias);
+        null else null;
+    // One gate value per key channel: the bounded sigmoid where the config bounds it (fla's two arms), else the
+    // softplus chain over `A_log` expanded per channel. The per-core recurrence and a model's own one build the gate
+    // themselves; a model's own verify gate goes first where it serves.
+    const g = if (kda_fused or recur_stage != null) Array{ .ctx = null } else if (bounded) pick: {
+        if (verify_rows) if (stages.verify_gate) |f| if (try f(s, .{ .a = a_proj, .dt_bias = la.dt_bias, .A_log = la.A_log, .lower_bound = c.kda_gate_lower_bound })) |vg| break :pick vg;
+        break :pick try kdaGateChain(la.A_log, a_proj, la.dt_bias, c.kda_gate_lower_bound, s);
+    } else try softplusGate(m, la.A_log, a_proj, la.dt_bias);
     defer free(g);
 
     const beta = beta_fused orelse blk: {
@@ -406,6 +514,13 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
             free(e.spec_state_seq);
             e.spec_state_seq = r.state_seq;
         }
+    } else if (if (verify_rows) if (stages.verify_capture) |f| try f(s, .{ .q = q_scaled, .k = k_scaled, .v = v_heads, .g = g, .beta = beta, .state = e.ssm_state, .rows_scalar = T_scalar, .in_dtype = in_dtype, .out_dtype = out_dtype, .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv, .batch = batch, .rows = seq_len }) else null else null) |r| {
+        _ = mlx.mlx_array_free(y_bthd);
+        y_bthd = r.y;
+        free(e.spec_state_seq);
+        e.spec_state_seq = r.state_seq;
+        _ = mlx.mlx_array_free(e.ssm_state);
+        e.ssm_state = r.state;
     } else if (capture) {
         // Per-row states for rollback: state_seq [T, B, Hv, Dv, Dk] (its last row unwritten), the final state its
         // own output.
@@ -432,6 +547,12 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         try mlx.check(mlx.mlx_vector_array_get(&final_state, out_vec, 2));
         _ = mlx.mlx_array_free(e.ssm_state);
         e.ssm_state = final_state;
+    } else if (recur_stage) |rs| {
+        const r = try rs.run(s, .{ .q = q_scaled, .k = k_scaled, .v = v_heads, .a = a_proj, .beta = beta, .a_log_h = la.a_log_h, .dt_f32 = la.dt_f32, .lower_bound = c.kda_gate_lower_bound, .state = e.ssm_state });
+        _ = mlx.mlx_array_free(y_bthd);
+        y_bthd = r.y;
+        _ = mlx.mlx_array_free(e.ssm_state);
+        e.ssm_state = r.state;
     } else if (kda_fused) {
         const r = try kda_recurrence.recur(s, q_scaled, k_scaled, v_heads, a_proj, beta, la.a_log_h, la.dt_f32, c.kda_gate_lower_bound, e.ssm_state);
         _ = mlx.mlx_array_free(y_bthd);
@@ -463,6 +584,12 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
         if (try decode_fused.gdnNormGateFused(s, y_bthd, z_proj, 0, value_dim, la.norm_w, m.kda.eps, false, num_v_heads, dv, batch, seq_len)) |flat|
             return outProj(m, la, flat, given != null);
     }
+    // A model's own epilogue (`!fused_prework` holds on these rows already: kept to say so).
+    if (!fused_prework and (prompt_rows or verify_rows)) if (stages.epilogue) |f| {
+        if (m.kda.eps.ctx == null) m.kda.eps = mlx.mlx_array_new_float(c.rms_norm_eps);
+        if (try f(s, .{ .y = y_bthd, .z = z_proj, .norm_w = la.norm_w, .eps = m.kda.eps, .hv = num_v_heads, .dv = dv, .batch = batch, .rows = seq_len, .verify = verify_rows })) |flat|
+            return outProj(m, la, flat, given != null);
+    };
     var z_heads = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(z_heads);
     try mlx.check(mlx.mlx_reshape(&z_heads, z_proj, &y_shape, 4, s));
@@ -483,7 +610,8 @@ fn forwardWith(m: *Model, x: Array, la: *const Kda, e: *Entry, batch: c_int, seq
     return outProj(m, la, out_flat, given != null);
 }
 
-fn templateArgs(kcfg: mlx.mlx_fast_metal_kernel_config, in_dt: mlx.mlx_dtype, st_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, dk: c_int, dv: c_int, hk: c_int, hv: c_int) !void {
+/// The KDA capture and route kernels' template arguments (a model's own capture kernel shares them).
+pub fn templateArgs(kcfg: mlx.mlx_fast_metal_kernel_config, in_dt: mlx.mlx_dtype, st_dt: mlx.mlx_dtype, out_dt: mlx.mlx_dtype, dk: c_int, dv: c_int, hk: c_int, hv: c_int) !void {
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "InT", in_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "StT", st_dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(kcfg, "OutT", out_dt));

@@ -22,29 +22,67 @@ pub fn register(t: *const abi.QuantTable) void {
     s.n += 1;
 }
 
-/// The loaded table that claims `block_json` of `config_json`: the highest claim; null when none claims or two tie.
+/// The loaded table that claims `block_json` of `config_json`: the highest claim; null when none claims or two tie (a
+/// tie is logged with both names).
 pub fn claimant(block_json: []const u8, config_json: []const u8) ?*const abi.QuantTable {
     const s = tables.get();
     var claims: [max_tables]common.Claim = undefined;
     for (s.items[0..s.n], claims[0..s.n]) |t, *c| c.* = t.claims(.of(block_json), .of(config_json));
-    const i = (common.pick(claims[0..s.n]) catch return null) orelse return null;
+    const i = (common.pick(claims[0..s.n]) catch {
+        var top: u8 = 0;
+        for (claims[0..s.n]) |c| top = @max(top, @backingInt(c));
+        var first: ?usize = null;
+        for (claims[0..s.n], 0..) |c, k| if (@backingInt(c) == top) {
+            const f = first orelse {
+                first = k;
+                continue;
+            };
+            log.warn("[plugins] two quant plugins claim {s} equally ({s}, {s}): none serves it\n", .{ block_json, s.items[f].name.slice(), s.items[k].name.slice() });
+            break;
+        };
+        return null;
+    }) orelse return null;
     return s.items[i];
 }
 
-/// The loaded table claiming `config_json`'s `quantization_config` or `quantization` block, with that block's JSON (in
-/// `a`); null when none claims either.
-fn claimed(a: std.mem.Allocator, config_json: []const u8) !?struct { t: *const abi.QuantTable, block: []u8 } {
-    if (tables.get().n == 0) return null;
+/// The table claiming `block_json`: the loaded ones (`claimant`) where this copy of the SDK has any (the host, an
+/// in-tree plugin); otherwise the host's (`Host.quant_claimant`), as a model plugin's own dylib, whose list is empty,
+/// reaches them. Null when none claims or neither has a table.
+fn claimantVia(host: ?*const Host, block_json: []const u8, config_json: []const u8) ?*const abi.QuantTable {
+    if (tables.get().n > 0) return claimant(block_json, config_json);
+    const h = host orelse return null;
+    const f = @import("../../abi/host.zig").quantClaimantOf(h) orelse return null;
+    return f(h.ctx, .of(block_json), .of(config_json));
+}
+
+/// Whether a load can reach any table: one of its own, or the host's claimant.
+fn reaches(host: ?*const Host) bool {
+    if (tables.get().n > 0) return true;
+    const h = host orelse return false;
+    return @import("../../abi/host.zig").quantClaimantOf(h) != null;
+}
+
+/// The table claiming `config_json`'s `quantization_config` or `quantization` block (`claimantVia`), with that block's
+/// JSON (in `a`); null when none claims either.
+fn claimed(a: std.mem.Allocator, config_json: []const u8, host: ?*const Host) !?struct { t: *const abi.QuantTable, block: []u8 } {
+    if (!reaches(host)) return null;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const root = std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(), config_json, .{}) catch return null;
     if (root != .object) return null;
     for ([_][]const u8{ "quantization_config", "quantization" }) |key| {
         const block = try std.json.Stringify.valueAlloc(a, root.object.get(key) orelse continue, .{});
-        if (claimant(block, config_json)) |t| return .{ .t = t, .block = block };
+        if (claimantVia(host, block, config_json)) |t| return .{ .t = t, .block = block };
         a.free(block);
     }
     return null;
+}
+
+/// The host's loaded table claiming `config_json`, if any.
+pub fn claimingTable(a: std.mem.Allocator, config_json: []const u8) ?*const abi.QuantTable {
+    const c = (claimed(a, config_json, null) catch return null) orelse return null;
+    a.free(c.block);
+    return c.t;
 }
 
 /// Whether a loaded table claims the pack at `model_dir`: its tensors then load as stored, in the dtypes the plugin
@@ -55,7 +93,7 @@ pub fn claimsPack(io: std.Io, a: std.mem.Allocator, model_dir: []const u8) bool 
     defer dir.close(io);
     const config = dir.readFileAlloc(io, "config.json", a, .limited(4 << 20)) catch return false;
     defer a.free(config);
-    const c = (claimed(a, config) catch return false) orelse return false;
+    const c = (claimed(a, config, null) catch return false) orelse return false;
     a.free(c.block);
     return true;
 }
@@ -119,17 +157,18 @@ pub const Format = struct {
     source: abi.Source,
     ctx: abi.LoadCtx,
 
-    /// The load through the table claiming the pack's `quantization_config` or `quantization` block over `source`; null
-    /// when no loaded table claims either. A refusal is logged and named.
+    /// The load through the table claiming the pack's `quantization_config` or `quantization` block over `source`: a
+    /// table this copy of the SDK loaded, else the one `host` names (`Host.quant_claimant`); null when none claims
+    /// either. A refusal is logged and named.
     pub fn open(a: std.mem.Allocator, dir: *const common.PackDir, model_dir: []const u8, source: abi.Source, s: mlx.mlx_stream, host: ?*const Host) !?*Format {
-        if (tables.get().n == 0) return null;
+        if (!reaches(host)) return null;
         const n = dir.fileBytes("config.json");
         if (n == 0 or n > 4 << 20) return null;
         const config = try a.alloc(u8, @intCast(n));
         errdefer a.free(config);
         var why: common.Verdict = .{};
         _ = dir.readFile("config.json", config, &why) orelse return error.OutsideQuantRefused;
-        const c = (try claimed(a, config)) orelse {
+        const c = (try claimed(a, config, host)) orelse {
             a.free(config);
             return null;
         };
@@ -229,6 +268,7 @@ pub const Bank = struct {
             .read_ahead_fn = C.readAhead,
             .decode_ids = b.decode_ids,
             .exact_rows = b.size >= @offsetOf(abi.Bank, "exact_rows") + @sizeOf(bool) and b.exact_rows,
+            .rows_independent = b.size >= @offsetOf(abi.Bank, "rows_independent") + @sizeOf(bool) and b.rows_independent,
             .source_shared = if (offers(b, .rows_shared)) C.rowsShared else null,
             .source_expand = if (offers(b, .rows_expand)) C.expand(.rows_expand) else null,
             .source_expand_into = if (offers(b, .rows_expand_into)) C.expand(.rows_expand_into) else null,
@@ -373,6 +413,92 @@ test "outside quant: the table claiming a pack's quantization_config loads its w
     try testing.expectError(error.OutsideQuantRefused, (try f.tensor("a", 0)).?.matmul(.{ .ctx = null }, .{ .ctx = null }));
 }
 
+/// A host whose `quant_claimant` names `Toy.table` for a block naming "toy", counting its asks; `size` and the member
+/// are all a load reads of it.
+const ToyHost = struct {
+    var asks: u32 = 0;
+    fn answer(_: ?*anyopaque, block: abi.Str, config: abi.Str) callconv(.c) ?*const abi.QuantTable {
+        asks += 1;
+        return if (Toy.claims(block, config) != .no) &Toy.table else null;
+    }
+    fn of(size: usize, member: bool) Host {
+        var h: Host = undefined;
+        h.size = @intCast(size);
+        h.quant_claimant = if (member) &answer else null;
+        return h;
+    }
+};
+
+test "outside quant: with no table of its own, a load opens through the table the host's quant_claimant names; an older host or a null member gives none" {
+    const fixture = @import("../testing/fixture.zig");
+    const saved = tables.get().*;
+    defer tables.get().* = saved;
+    tables.get().* = .{};
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = "{\"model_type\":\"x\",\"quantization_config\":{\"quant_method\":\"toy\"}}" }} };
+    const dir = mem.packDir();
+    const none: abi.Source = .{ .ctx = null, .get = struct {
+        fn get(_: ?*anyopaque, _: abi.Str) callconv(.c) abi.Array {
+            return .{};
+        }
+    }.get };
+    ToyHost.asks = 0;
+    var h = ToyHost.of(@sizeOf(Host), true);
+    const f = (try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, &h)).?;
+    defer f.close();
+    try testing.expectEqualStrings("toy", f.name());
+    try testing.expectEqualStrings("{\"quant_method\":\"toy\"}", f.ctx.block_json.slice());
+    try testing.expectEqual(@as(u32, 7), (try f.tensor("a", 0)).?.w.block);
+    try testing.expect(ToyHost.asks >= 1);
+    var older = ToyHost.of(@offsetOf(Host, "quant_claimant"), true);
+    try testing.expect(try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, &older) == null);
+    var bare = ToyHost.of(@sizeOf(Host), false);
+    try testing.expect(try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, &bare) == null);
+    try testing.expect(try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, null) == null);
+}
+
+test "outside quant: a load with a table of its own never asks the host" {
+    const fixture = @import("../testing/fixture.zig");
+    const saved = tables.get().*;
+    defer tables.get().* = saved;
+    tables.get().* = .{};
+    register(&Toy.table);
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = "{\"model_type\":\"x\",\"quantization_config\":{\"quant_method\":\"toy\"}}" }} };
+    const dir = mem.packDir();
+    const none: abi.Source = .{ .ctx = null, .get = struct {
+        fn get(_: ?*anyopaque, _: abi.Str) callconv(.c) abi.Array {
+            return .{};
+        }
+    }.get };
+    ToyHost.asks = 0;
+    var h = ToyHost.of(@sizeOf(Host), true);
+    const f = (try Format.open(testing.allocator, &dir, "/m", none, .{ .ctx = null }, &h)).?;
+    defer f.close();
+    try testing.expectEqualStrings("toy", f.name());
+    try testing.expectEqual(@as(u32, 0), ToyHost.asks);
+}
+
+test "outside quant: two tables claiming a block equally give none, and the line names both" {
+    const saved = tables.get().*;
+    defer tables.get().* = saved;
+    tables.get().* = .{};
+    var twin = Toy.table;
+    twin.name = .of("toy-twin");
+    register(&Toy.table);
+    register(&twin);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root: [512]u8 = undefined;
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&path_buf, "{s}/q.log", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    try log.openFile(path, 0);
+    const got = claimant("{\"quant_method\":\"toy\"}", "{}");
+    log.closeFile();
+    try testing.expect(got == null);
+    const text = try tmp.dir.readFileAlloc(testing.io, "q.log", testing.allocator, .limited(4096));
+    defer testing.allocator.free(text);
+    try testing.expect(std.mem.indexOf(u8, text, "two quant plugins claim {\"quant_method\":\"toy\"} equally (toy, toy-twin)") != null);
+}
+
 test "outside quant: a weight's row-exact width is its table's declaration, one row where it declares none" {
     var table = Toy.table;
     const w: Weight = .{ .t = &table, .w = .{} };
@@ -401,13 +527,19 @@ const ToyBank = struct {
         out.* = .of("[stream-stats] toy: routes=1");
     }
     fn open(_: *const abi.LoadCtx, geo: *const abi.BankGeometry, _: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
-        out.* = .{ .ctx = @constCast(@ptrCast(geo.gates.?)), .close = &close, .about = .of("toy"), .decode_ids = 48, .rows = &routedRows, .settle = &ok0, .phase = &phase, .read_ahead = &readAhead, .rows_shared = &shared, .meters = &meters, .exact_rows = true };
+        out.* = .{ .ctx = @constCast(@ptrCast(geo.gates.?)), .close = &close, .about = .of("toy"), .decode_ids = 48, .rows = &routedRows, .settle = &ok0, .phase = &phase, .read_ahead = &readAhead, .rows_shared = &shared, .meters = &meters, .exact_rows = true, .rows_independent = true };
         return .ok;
     }
     /// A bank built before its optional members: whatever lies past its `size` is not read.
     fn openOlder(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
         const v = open(ctx, geo, budget, out);
         out.size = @offsetOf(abi.Bank, "rows_shared");
+        return v;
+    }
+    /// A bank built before `rows_independent`: its size ends there, so the flag it wrote is not read.
+    fn openBeforeIndependent(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
+        const v = open(ctx, geo, budget, out);
+        out.size = @offsetOf(abi.Bank, "rows_independent");
         return v;
     }
     fn openShort(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
@@ -455,6 +587,7 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     const r = b.routed();
     try testing.expectEqual(@as(usize, 48), r.decode_ids);
     try testing.expect(r.exact_rows);
+    try testing.expect(r.rows_independent);
     try testing.expect(r.source_shared != null and r.source_expand == null and r.next_fn == null);
     try testing.expectEqualStrings("[stream-stats] toy: routes=1", b.meters());
     const none: mlx.mlx_array = .{ .ctx = null };
@@ -473,9 +606,15 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     table.open_bank = &ToyBank.openOlder;
     const older = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
     try testing.expect(older.routed().source_shared == null and !older.routed().exact_rows);
+    try testing.expect(!older.routed().rows_independent);
     try testing.expectEqualStrings("", older.meters());
     older.close();
+    // A bank that ends just before the flag keeps every earlier member and reads the flag as not declared.
+    table.open_bank = &ToyBank.openBeforeIndependent;
+    const before = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
+    try testing.expect(before.routed().exact_rows and !before.routed().rows_independent);
+    before.close();
     table.open_bank = &ToyBank.openShort;
     try testing.expectError(error.OutsideQuantRefused, f.openBank(geo, .{ .prompt = 1000, .decode = 1000 }));
-    try testing.expectEqual(@as(u32, 3), ToyBank.closed); // the refused bank is closed too
+    try testing.expectEqual(@as(u32, 4), ToyBank.closed); // the refused bank is closed too
 }

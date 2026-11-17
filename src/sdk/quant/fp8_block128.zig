@@ -16,23 +16,15 @@ const kernelSource = @import("../../mlx/kernels.zig").source;
 const Str = abi.Str;
 const Verdict = abi.Verdict;
 
-pub const block_rows: u32 = plan.scale_rows;
-pub const block_cols: u32 = plan.scale_cols;
+const claim = @import("fp8_block128_claim.zig");
+pub const block_rows: u32 = claim.block_rows;
+pub const block_cols: u32 = claim.block_cols;
 
 const header = kernelSource("kernels/linear/fp8_block128_header.metal");
 const gemv_source = kernelSource("kernels/linear/fp8_block128_gemv.metal");
 const dequant_source = kernelSource("kernels/linear/fp8_block128_dequant.metal");
 
-/// U8 e4m3 codes `[out, in]` beside an F32 scale grid `[ceil(out / 64), ceil(in / 128)]` (Sushi's row-scaled e4m3 has
-/// one scale row per code row).
-pub fn isBlockScaled(w: mlx.mlx_array, sc: mlx.mlx_array) bool {
-    if (w.ctx == null or sc.ctx == null) return false;
-    if (mlx.mlx_array_dtype(w) != .uint8 or mlx.mlx_array_dtype(sc) != .float32) return false;
-    const ws = mlx.getShape(w);
-    const ss = mlx.getShape(sc);
-    return ws.len == 2 and ss.len == 2 and ws[0] > 1 and
-        ss[0] == @divFloor(ws[0] + block_rows - 1, block_rows) and ss[1] == @divFloor(ws[1] + block_cols - 1, block_cols);
-}
+pub const isBlockScaled = claim.isBlockScaled;
 
 /// The kernels read the scale grid as `device` memory; MLX binds an input under 8 elements as `constant`.
 fn kernelsTake(sc: mlx.mlx_array, s: mlx.mlx_stream) bool {

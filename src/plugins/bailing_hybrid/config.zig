@@ -1,11 +1,11 @@
-//! Ling 3.0's (`bailing_hybrid`, BailingMoeV3) claim and parse onto the KDA-hybrid family config GLM-5.3-Flash
-//! defines (`glm5_next/config.zig`). MLX-free. Three KDA layers per Multi-head Latent Attention layer, grouped
-//! sigmoid routing with an expert bias, one ungated shared expert.
+//! Ling 3.0's (`bailing_hybrid`, BailingMoeV3) claim and parse onto the KDA-hybrid family config it shares with
+//! GLM-5.3-Flash (`sdk/bases/kda_hybrid/config.zig`). MLX-free. Three KDA layers per Multi-head Latent Attention
+//! layer, grouped sigmoid routing with an expert bias, one ungated shared expert.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const sdk = @import("../../sdk/root.zig");
-const family = @import("../glm5_next/config.zig");
+const family = @import("../../sdk/bases/kda_hybrid/config.zig");
 
 const Config = family.Config;
 const Objects = family.Objects;
@@ -122,7 +122,8 @@ fn lingFacts(c: *const Config, p: *abi.Parsed) void {
     p.caps = .{ .moe = c.num_experts > 0, .dflash_capture = true, .experts_stream = c.num_experts > 0 };
     if (c.streamed_bank) {
         family.bankFacts(p);
-        // The outside plugin's head computes a prompt row as the whole prompt's call does (glm5_next/host.zig `finish`).
+        // The outside plugin's head computes a prompt row as the whole prompt's call does
+        // (sdk/bases/kda_hybrid/host.zig `finish`).
         p.caps.prompt_last_row = true;
     }
     p.chat.thinking_default = .on;

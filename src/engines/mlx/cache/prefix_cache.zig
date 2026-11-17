@@ -710,6 +710,9 @@ pub const HotPrefixCache = struct {
     ram_enabled: bool = true,
     /// SSD-first mode; set by the scheduler at load.
     ssd_first: bool = false,
+    /// A streamed bank's capped hot cache (`streamedHotCacheCapped`), set at load: nothing evicts on live memory beside
+    /// its requests, so an oversized commit makes its copy's room before it copies (`roomBeforeCopy`).
+    evict_before_copy: bool = false,
     /// SSD-first: the RAM allowance for idle entries (the resolved `--prefix-cache-mem`).
     /// `spillIdleEntries` evicts only past it; 0 = nothing idle stays resident.
     ssd_idle_mem: u64 = 0,
@@ -2606,6 +2609,8 @@ pub const HotPrefixCache = struct {
                         return .{ .kept_resident = self.entries.items[idx].tokens.len };
                     }
                 }
+                // A capped bank: the copy is live beside the cache, and nothing evicts on live memory.
+                if (self.evict_before_copy) replace_idx = self.roomBeforeCopy(trimmedEntryBytes(tl, row_bytes, eff_cps), replace_idx, cache_key);
                 const trimmed = new_snap.trimmedCopy(tl, mlx.gpuStream()) catch |err| {
                     // A copy that failed at this width is not a verdict on the entry: retry at the next-lower checkpoint.
                     decline = .snapshot_copy_failed;
@@ -3780,6 +3785,36 @@ pub const HotPrefixCache = struct {
         }
         self.shedCheckpointsToFit();
         self.logResident();
+    }
+
+    /// What a trim to `len` rows will hold: its rows and the checkpoints at or below them, before any shed.
+    fn trimmedEntryBytes(len: usize, row_bytes: u64, cps: ?[]const SSMCheckpoint) u64 {
+        var bytes = @as(u64, len) *| row_bytes;
+        const list = cps orelse return bytes;
+        for (list) |*cp| {
+            if (cp.pos <= len) bytes +|= ssmCheckpointBytes(cp);
+        }
+        return bytes;
+    }
+
+    /// `evict_before_copy`: evicts until a `copy_bytes` copy fits the budget beside the cache, the entry the commit
+    /// replaces (`replace_idx`) last. Returns that entry's index, which an eviction moves, or null once it went too.
+    fn roomBeforeCopy(self: *HotPrefixCache, copy_bytes: u64, replace_idx: ?usize, incoming_key: u64) ?usize {
+        const target: ?u64 = if (replace_idx) |i| self.entries.items[i].last_used else null;
+        var protect = target;
+        while (self.current_kv_bytes +| copy_bytes > self.max_kv_bytes) {
+            const idx = self.lruIndexExcluding(protect, incoming_key) orelse {
+                if (protect == null) break;
+                protect = null;
+                continue;
+            };
+            self.evictAt(idx, "byte budget, before the commit copy");
+        }
+        const kept = target orelse return null;
+        for (self.entries.items, 0..) |*e, i| {
+            if (e.last_used == kept) return i;
+        }
+        return null;
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8, incoming_key: ?u64) void {
@@ -6321,6 +6356,96 @@ test "HotPrefixCache: oversized entry trims to the longest prefix that fits (#33
         // serves a wrong prefix as a cache hit.
         try pcExpectRowsEqual(s, d.keys, e.keys, 400);
         try pcExpectRowsEqual(s, d.values, e.values, 400);
+    }
+}
+
+/// Peak MLX bytes over one commit of `src` into `hc`, above what was live before it.
+fn pcCommitPeakAbove(hc: *HotPrefixCache, src: *const KVCache, toks: []const u32) !u64 {
+    _ = mlx.mlx_synchronize(mlx.gpuStream());
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+    _ = mlx.mlx_reset_peak_memory();
+    _ = try hc.commit(src, toks, false);
+    var peak: usize = 0;
+    _ = mlx.mlx_get_peak_memory(&peak);
+    return @as(u64, peak) -| @as(u64, before);
+}
+
+/// Two layers of `tokens` rows, 8 heads of 128 f32 (4 KiB a row per array), EVALUATED: a peak test measures against
+/// live buffers, not a lazy graph that the commit's copy would materialize inside the window it measures.
+fn pcFillWideEvaluated(cache: *KVCache, s: mlx.mlx_stream, tokens: u32) !void {
+    var written: u32 = 0;
+    while (written < tokens) {
+        const step: u32 = @min(64, tokens - written);
+        var li: u32 = 0;
+        while (li < 2) : (li += 1) {
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const base: f64 = @floatFromInt(written * 1024 + li * 1_000_000);
+            try mlx.check(mlx.mlx_arange(&flat, base, base + @as(f64, @floatFromInt(step * 1024)), 1.0, .float32, s));
+            var k = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k);
+            const shape = [_]c_int{ 1, 8, @intCast(step), 128 };
+            try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s));
+            var view = try cache.update(li, k, k, s, 0);
+            view.deinit();
+        }
+        written += step;
+    }
+    for (cache.entries) |e| {
+        if (!e.initialized) continue;
+        try mlx.check(mlx.mlx_array_eval(e.keys));
+        try mlx.check(mlx.mlx_array_eval(e.values));
+    }
+}
+
+test "HotPrefixCache: a capped streamed bank's oversized commit evicts before it copies: the cache and the copy stay in the budget" {
+    // Bar, from the commit's own allocations: r = one row across both layers' K and V (16 KiB), budget b = 400 r. The
+    // commit shares the live cache (0 B), frees the resident entry first when capped (400 r, or 300 r for the replaced
+    // prefix), then `trimmedCopy` adds four 400-row outputs (b) and four zero scalars. MLX rounds an allocation up to a
+    // page and reuses a cached buffer up to two pages longer: 16 pages of slack. Capped: at most b - resident + slack
+    // (0.04 b, or 0.29 b). Copy first, as every uncapped cache does: at least b.
+    const s = mlx.gpuStream();
+    var first = try KVCache.init(testing.allocator, 2);
+    defer first.deinit();
+    try pcFillWideEvaluated(&first, s, 600);
+    var second = try KVCache.init(testing.allocator, 2);
+    defer second.deinit();
+    try pcFillWideEvaluated(&second, s, 600);
+    var other: [600]u32 = undefined;
+    for (&other, 0..) |*t, i| t.* = @intCast(i + 1);
+    var toks: [600]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 5000);
+    var probe = try first.snapshot();
+    const row = pcRowBytes(&probe);
+    probe.deinit();
+    try testing.expectEqual(@as(u64, 16 << 10), row);
+    const budget = row * 400;
+    const slack: u64 = 16 * (16 << 10);
+
+    const Case = struct { capped: bool, resident: []const u32 };
+    for ([_]Case{
+        .{ .capped = true, .resident = &other },
+        .{ .capped = true, .resident = toks[0..300] },
+        .{ .capped = false, .resident = &other },
+    }) |c| {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, budget);
+        defer hc.deinit();
+        hc.evict_before_copy = c.capped;
+        // The resident entry is its own trimmed copy, 400 or 300 rows.
+        _ = try hc.commit(&first, c.resident, false);
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        const resident = hc.current_kv_bytes;
+        try testing.expectEqual(@as(u64, @min(c.resident.len, 400)) * row, resident);
+        const above = try pcCommitPeakAbove(&hc, &second, &toks);
+        try testing.expectEqual(@as(usize, 1), hc.entryCount());
+        try testing.expectEqual(@as(usize, 400), hc.entries.items[0].tokens.len);
+        try testing.expectEqual(@as(u32, 5000), hc.entries.items[0].tokens[0]);
+        const ok = if (c.capped) above <= budget - resident + slack else above >= budget;
+        if (!ok) {
+            std.debug.print("capped={} resident={d} B: {d} B above the live set, budget {d} B\n", .{ c.capped, resident, above, budget });
+            return error.TestUnexpectedResult;
+        }
     }
 }
 

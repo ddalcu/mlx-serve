@@ -4,7 +4,8 @@
 //! delta rule, the gated RMSNorm; 4- and 8-bit gates up to 8 rows, 5-bit at one row, with or without the per-row
 //! state capture). Both meet the float64 bound with the gdn area's forward-error allowance (`host.Val`, `gdn.step`).
 //! Each launch's thread count is probed by its wrapper (`adapts`); the per-core plan follows the GPU's core count
-//! (80 cores: 80 threadgroups of 104 rows, 64 cores: 64 of 128).
+//! (80 cores: 80 threadgroups of 104 rows, 64 cores: 64 of 128; a model's own route through `recurAt` may run the
+//! 80-threadgroup plan on 40 cores, two threadgroups a core).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -234,7 +235,7 @@ fn stepLaunch(comptime bits: Bits) metal.Launch {
         .inputs = &.{ "proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts", "conv_state", "state_in", "fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b" },
         .outputs = &.{ "y", "conv_state_out", "state_out", "state_seq" },
         .source = (if (bits == .b5) "#define GATE5 1\n" else "#define GATE5 0\n") ++ body,
-        .header = kernelSource("plugins/glm5_next/kernels/qmv_header.metal"),
+        .header = kernelSource("kernels/kda/qmv_header.metal"),
         // qs, ks, vs, as_, gates, ys [8][128] bf16, gs [8][128] f32, betas [8] bf16.
         .tg_bytes = 6 * 8 * D * 2 + 8 * D * 4 + 8 * 2,
         // M1/M2 build the 4-bit launch for 96..448 threads past one row, the 8-bit one for 640..832 (captured or not
@@ -610,21 +611,21 @@ test "kernel contract kda: each declared launch is the shipped wrapper's, byte f
     var set = kc.Set.init(a);
     defer set.deinit();
     try register(&set);
-    const cores: c_int = @intCast(@import("../../util/system.zig").gpuCoreCount());
     for (set.kernels.items) |k| {
         const shape = k.spec.served[k.spec.served.len - 1];
         if (std.mem.startsWith(u8, k.spec.name, "kda_percore")) {
             const t: *Core = @ptrCast(@alignCast(k.ctx));
-            const plan = kr.planFor(H, D, cores) orelse continue;
-            if (plan.ntg != t.plan.ntg or plan.rows != t.plan.mr) continue; // this GPU's wrapper takes another plan
-            if (!kr.serves(t.rig.stream(), H, H, D, D, .bfloat16, .float32)) continue;
+            // Each registered plan through the wrappers' launch (`recurAt`: `recur` at this GPU's plan, a model's own
+            // route at its own), whatever this GPU's core count.
+            const plan = kr.Plan{ .ntg = t.plan.ntg, .rows = t.plan.mr };
+            if (!(kr.probe(t.rig.stream(), H, .bfloat16, plan) catch false)) continue;
             try std.testing.expect(try t.prepare(shape, .random, 7));
             var geo = t.geometry(shape).?;
             geo.unread = 0;
             // A GPU that caps this pipeline below the launch (M1/M2) never runs it: the wrapper declines there too.
             t.rig.launch(t.launch, geo, &t.args) catch |e| if (e == error.ThreadgroupCap) continue else return e;
             const g = t.args;
-            const r = try kr.recur(t.rig.stream(), g[0], g[1], g[2], g[3], g[4], g[5], g[6], LB, g[8]);
+            const r = try kr.recurAt(t.rig.stream(), g[0], g[1], g[2], g[3], g[4], g[5], g[6], LB, g[8], plan);
             defer {
                 _ = mlx.mlx_array_free(r.y);
                 _ = mlx.mlx_array_free(r.state);

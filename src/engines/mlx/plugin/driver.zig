@@ -38,6 +38,7 @@ const hadamard = @import("../../../sdk/quant/hadamard/format.zig");
 const intree = @import("intree.zig");
 const distributed = @import("../cluster/distributed.zig");
 const weights_load = @import("../../../sdk/weights/load.zig");
+const decodeBilled = @import("../admission/glm5_bill.zig").decodeBilled;
 const outside_model = @import("../../../sdk/quant/outside_model.zig");
 const group = @import("../ssm/group.zig");
 const entry_mod = @import("../ssm/entry.zig");
@@ -182,18 +183,6 @@ fn streamRoomDecode(config: *const ModelConfig) u64 {
         @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes);
 }
 
-/// Whether the engine bills this model's decode phase apart: a built-in GLM on a streamed plugin that prices no prompt
-/// of its own, and Ling (bailing_hybrid), which runs GLM's trunk (KDA layers, attention caches, the same checkpoints)
-/// though its plugin prices its prompt. Another plugin that prices its own prompt keeps one room.
-fn decodeBilled(config: *const ModelConfig) bool {
-    const b = config.plugin orelse return false;
-    const ling = std.mem.eql(u8, config.model_type, "bailing_hybrid");
-    if (!b.parsed.caps.streamed_weights or !(config.isGlm5() or ling)) return false;
-    var bill: abi.Bill = .{};
-    b.table.bill(&b.parsed, &.{ .context = abi.stream_room_cell }, &bill);
-    return bill.prefill_bytes == null or ling;
-}
-
 fn streamRoomDecodeAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
     if (!decodeBilled(config)) return 0;
     const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(config, abi.stream_room_cell, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
@@ -279,19 +268,18 @@ fn streamGrowAt(config: *const ModelConfig, limit: u64, from: u64) struct { prom
     return .{ .prompt = p1 -| p0, .decode = decode };
 }
 
-/// Where the bills' growth starts: the tokens the pack's calibration (`bank-fit.json`, its text or null) measured its
-/// bases at when it applies at `ceiling` (`outside_model.parseBankFit`, as the plugin reads it), else the rooms' cell.
-fn growthStartOf(text: ?[]const u8, ceiling: u64) u64 {
+/// Where the bills' growth starts: the tokens the pack's calibration (its text or null) measured its bases at when it
+/// applies at `ceiling` under the host's `key` (`outside_model.parseBankFit`, as the plugin reads it), else the cell.
+fn growthStartOf(text: ?[]const u8, ceiling: u64, key: ?[]const u8) u64 {
     const cell = abi.stream_room_cell;
-    const c = outside_model.parseBankFit(text orelse return cell, ceiling, cell) catch return cell;
+    const c = outside_model.parseBankFit(text orelse return cell, ceiling, cell, key) catch return cell;
     return c.evidence;
 }
 
-fn growthStart(dir: *const abi.PackDir, ceiling: u64) u64 {
-    var buf: [4096]u8 = undefined;
-    var why: abi.Verdict = .{};
-    const text = if (dir.has(outside_model.bank_fit_file)) dir.readFile(outside_model.bank_fit_file, &buf, &why) else null;
-    return growthStartOf(text, ceiling);
+fn growthStart(dir: *const abi.PackDir, ceiling: u64, key: ?[]const u8) u64 {
+    var buf: [16384]u8 = undefined;
+    const f = outside_model.readBankFit(dir, key, &buf);
+    return growthStartOf(if (f) |x| x.text else null, ceiling, key);
 }
 
 fn streamRoomAt(config: *const ModelConfig, ceiling: u64, margin: u64) u64 {
@@ -460,14 +448,25 @@ test "driver: a streamed built-in GLM's bills grow from the rooms' cell to its c
     try std.testing.expect(ev.prompt < g.prompt and ev.decode < g.decode);
 }
 
-test "driver: the bills' growth starts at the calibration's evidence tokens when the plugin applies it, the cell otherwise" {
-    const fit = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"evidence_tokens\":18380,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
-    try std.testing.expectEqual(@as(u64, 18_380), growthStartOf(fit, 118111600640));
-    // Not applied (another ceiling, no file) or no evidence_tokens: the cell.
-    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 112 << 30));
-    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(null, 118111600640));
-    const unnamed = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
-    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(unnamed, 118111600640));
+test "driver: the bills' growth starts at a bank fit's evidence tokens when the plugin applies it under the host's key, the cell otherwise" {
+    var kb: [512]u8 = undefined;
+    const key = outside_model.testFitKey(&kb, outside_model.test_fit_parts);
+    var fb: [1024]u8 = undefined;
+    const fit = outside_model.testFitV3(&fb, outside_model.test_fit_parts, "\"evidence_tokens\":18380,");
+    try std.testing.expectEqual(@as(u64, 18_380), growthStartOf(fit, 118111600640, key));
+    // Not applied (another ceiling, another machine, no host key, no file) or no evidence_tokens: the cell.
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 112 << 30, key));
+    var ob: [512]u8 = undefined;
+    var other = outside_model.test_fit_parts;
+    other.machine = "Apple M4 Max 128GB";
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 118111600640, outside_model.testFitKey(&ob, other)));
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(fit, 118111600640, null));
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(null, 118111600640, key));
+    var ub: [1024]u8 = undefined;
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(outside_model.testFitV3(&ub, outside_model.test_fit_parts, ""), 118111600640, key));
+    // A v2 file is not applied: the trunk refuses it (BankFitUnkeyed), so the host's growth starts at the cell too.
+    const v2 = "{\"format\":\"mlx-serve-bank-fit-v2\",\"ceiling_bytes\":118111600640,\"cell_tokens\":17408,\"evidence_tokens\":18380,\"base_prompt_bytes\":40000000000,\"base_decode_bytes\":28000000000,\"rest_bytes\":15000000000}";
+    try std.testing.expectEqual(abi.stream_room_cell, growthStartOf(v2, 118111600640, key));
 }
 
 test "driver: a streamed Ling's prompt is billed at the chunk the engine runs for its length, and its growth at the largest of them" {
@@ -801,6 +800,28 @@ test "driver: a streamed Ling's decode room is the ceiling less the engine's dec
     try t.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
 }
 
+test "driver: Ling's streaming pack, whose plugin prices its prompt, is decode-billed through its own table" {
+    const t = std.testing;
+    const ling_plugin = @import("../../../plugins/bailing_hybrid/plugin.zig");
+    const json = @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.1-flash-exl3-2.60bpw.json");
+    const mem: @import("../../../sdk/testing/fixture.zig").MemDir = .{ .files = &.{ .{ .name = "config.json", .bytes = json }, .{ .name = "experts.bin", .bytes = "" } } };
+    const dir = mem.packDir();
+    var binding: plugin_config.Binding = .{ .table = &ling_plugin.table };
+    try t.expect(ling_plugin.config.parse(&dir, abi.Str.of(json), .{}, null, true, &binding.parsed).isOk());
+    defer ling_plugin.config.freeParsed(&binding.parsed);
+    var cfg = try model.parseConfigFromJson(t.allocator, json);
+    const own = cfg.plugin;
+    defer {
+        cfg.plugin = own;
+        cfg.deinit(t.allocator);
+    }
+    cfg.plugin = &binding;
+    var bill: abi.Bill = .{};
+    binding.table.bill(&binding.parsed, &.{ .context = abi.stream_room_cell }, &bill);
+    try t.expect(binding.parsed.caps.streamed_weights and bill.prefill_bytes != null);
+    try t.expect(decodeBilled(&cfg));
+}
+
 test "driver: Ling's decode room leaves GLM's rooms as they were: the built-in's own bills, a plugin-priced GLM one room" {
     const t = std.testing;
     const Probe = struct {
@@ -834,6 +855,134 @@ test "driver: Ling's decode room leaves GLM's rooms as they were: the built-in's
     // a GLM whose plugin prices its own prompt keeps one room (only Ling's trunk is exempt)
     table.bill = &Probe.priced;
     try t.expectEqual(@as(u64, 0), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+}
+
+/// Streamed bills for the decode-room tests, each as a plugin writes it: `out.* = .{ ... }` at the current size, or an
+/// older plugin's struct (sized before `flags`).
+const FlagProbe = struct {
+    fn prefill(_: *const abi.Parsed, _: u64, _: u32, _: u8, _: u64) callconv(.c) u64 {
+        return 3 << 30;
+    }
+    fn termsOnly(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .kv_per_token = 368_640, .ssm_checkpoint = 1 << 20 };
+    }
+    fn priced(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .kv_per_token = 368_640, .prefill_bytes = &prefill };
+    }
+    fn pricedBilled(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .prefill_bytes = &prefill, .flags = .{ .decode_room = .billed } };
+    }
+    /// The unnamed value 2.
+    fn unnamed2(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .flags = .{ .decode_room = @enumFromInt(2) } };
+    }
+    /// The unnamed value 3.
+    fn unnamed(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .flags = .{ .decode_room = @enumFromInt(3) } };
+    }
+    fn olderTerms(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .size = @offsetOf(abi.Bill, "flags") };
+    }
+    /// An older plugin leaves the bytes past its struct alone: a flag there is not its own.
+    fn olderPriced(_: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+        out.* = .{ .size = @offsetOf(abi.Bill, "flags"), .prefill_bytes = &prefill, .flags = .{ .decode_room = .billed } };
+    }
+};
+
+/// The tiny Ling fixture served through a test binding under any `model_type`; `deinit` gives back its own fields first.
+const FlagCfg = struct {
+    cfg: ModelConfig,
+    own_plugin: @FieldType(ModelConfig, "plugin"),
+    own_type: []const u8,
+
+    fn init(binding: *plugin_config.Binding, model_type: []const u8) !FlagCfg {
+        const cfg = try model.parseConfigFromJson(std.testing.allocator, @embedFile("../../../fixtures/model-configs/bailing_hybrid-ling-3.0-tiny-4bit.json"));
+        var f: FlagCfg = .{ .cfg = cfg, .own_plugin = cfg.plugin, .own_type = cfg.model_type };
+        f.cfg.plugin = binding;
+        f.cfg.model_type = model_type;
+        return f;
+    }
+    fn deinit(f: *FlagCfg) void {
+        f.cfg.plugin = f.own_plugin;
+        f.cfg.model_type = f.own_type;
+        f.cfg.deinit(std.testing.allocator);
+    }
+};
+
+fn decodeRoomOf(cfg: *const ModelConfig) u64 {
+    const need = @import("../admission/glm5_bill.zig").glm5DecodeMemoryNeeded(cfg, abi.stream_room_cell, 1, 16, @import("../generate.zig").WIDE_PREFILL_CHUNK);
+    return (64 << 30) - need - @import("../runtime/preflight.zig").mtpCoarseBytes(cfg, false) - (1 << 30);
+}
+
+fn streamedBinding(table: *abi.ModelTable, bill: @FieldType(abi.ModelTable, "bill")) plugin_config.Binding {
+    table.bill = bill;
+    return .{ .table = table, .parsed = .{ .caps = .{ .streamed_weights = true }, .spec = .{ .mtp_layout = .in_checkpoint } } };
+}
+
+test "driver: a streamed model outside GLM's and Ling's names whose bill sets decode_room billed gets its own decode room" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.pricedBilled);
+    var toy = try FlagCfg.init(&binding, "toy_hybrid");
+    defer toy.deinit();
+    try std.testing.expect(decodeBilled(&toy.cfg));
+    try std.testing.expectEqual(decodeRoomOf(&toy.cfg), streamRoomDecodeAt(&toy.cfg, 64 << 30, 1 << 30));
+    // Only a streamed model is read.
+    binding.parsed.caps.streamed_weights = false;
+    try std.testing.expect(!decodeBilled(&toy.cfg));
+}
+
+test "driver: a streamed GLM that prices its own prompt and sets decode_room billed gets its own decode room" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.pricedBilled);
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    try std.testing.expect(decodeBilled(&cfg));
+    try std.testing.expectEqual(decodeRoomOf(&cfg), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+}
+
+test "driver: a streamed GLM whose decode_room holds the unnamed value 2 keeps the by-name decode rule" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.unnamed2);
+    var cfg = @import("../admission/bills_test.zig").glm5TestConfig();
+    cfg.plugin = &binding;
+    try std.testing.expect(decodeBilled(&cfg));
+    try std.testing.expectEqual(decodeRoomOf(&cfg), streamRoomDecodeAt(&cfg, 64 << 30, 1 << 30));
+}
+
+test "driver: a plugin's bill at the current size that leaves its flags alone keeps the by-name decode rule" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.termsOnly);
+    // GLM's shape (no prompt bill of its own): decode-billed by name.
+    var glm = @import("../admission/bills_test.zig").glm5TestConfig();
+    glm.plugin = &binding;
+    try std.testing.expect(decodeBilled(&glm));
+    try std.testing.expectEqual(decodeRoomOf(&glm), streamRoomDecodeAt(&glm, 64 << 30, 1 << 30));
+    // Ling's shape (its prompt priced): decode-billed by name; the same bill on another model is not.
+    table.bill = &FlagProbe.priced;
+    var ling = try FlagCfg.init(&binding, "bailing_hybrid");
+    defer ling.deinit();
+    try std.testing.expect(decodeBilled(&ling.cfg));
+    try std.testing.expect(!decodeBilled(&glm));
+    ling.cfg.model_type = "toy_hybrid";
+    try std.testing.expect(!decodeBilled(&ling.cfg));
+    // The unnamed value 3 reads as by_name.
+    table.bill = &FlagProbe.unnamed;
+    try std.testing.expect(decodeBilled(&glm) and !decodeBilled(&ling.cfg));
+}
+
+test "driver: an older plugin's bill, sized before its flags, keeps the by-name decode rule" {
+    var table: abi.ModelTable = undefined;
+    var binding = streamedBinding(&table, &FlagProbe.olderTerms);
+    var glm = @import("../admission/bills_test.zig").glm5TestConfig();
+    glm.plugin = &binding;
+    try std.testing.expect(decodeBilled(&glm));
+    table.bill = &FlagProbe.olderPriced;
+    try std.testing.expect(!decodeBilled(&glm));
+    var ling = try FlagCfg.init(&binding, "bailing_hybrid");
+    defer ling.deinit();
+    try std.testing.expect(decodeBilled(&ling.cfg));
+    ling.cfg.model_type = "toy_hybrid";
+    try std.testing.expect(!decodeBilled(&ling.cfg));
 }
 
 test "driver: a module-owned streamed plugin receives the configured KV precision in its load settings" {
@@ -903,7 +1052,10 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
     if (b.parsed.caps.images and b.parsed.placeholder_ids.image == 0) b.parsed.placeholder_ids.image = config.image_token_id;
     var settings_buf: [128]u8 = undefined;
     const ceiling = @import("../../../host/registry/memory_ceiling.zig").staticGpuMemoryCeiling();
-    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling));
+    // A streamed bank's calibration applies only under this server's key; a key that cannot be read is none.
+    const fit_key: ?[]u8 = if (b.parsed.caps.streamed_weights) @import("fit_key.zig").hostKey(a, io, fs.root, config, &dir) catch null else null;
+    defer if (fit_key) |k| a.free(k);
+    const grow = streamGrowAt(config, @import("../admission/context.zig").getEffectiveContextLength(config), growthStart(&dir, ceiling, fit_key));
     const m = b.table.load(&.{
         .model_dir = abi.Str.of(model_dir),
         .dir = &dir,
@@ -916,6 +1068,7 @@ fn loadTensors(io: std.Io, a: std.mem.Allocator, config: *ModelConfig, model_dir
         .stream_room_decode = streamRoomDecode(config),
         .stream_grow_prompt = grow.prompt,
         .stream_grow_decode = grow.decode,
+        .bank_fit_key = if (fit_key) |k| abi.Str.of(k) else .{},
         .gpu_ceiling_bytes = ceiling,
         .wired_margin_bytes = @import("../../../host/http/server.zig").serverState().wired_limit_margin_bytes,
         .pair_remote = if (config.dist_dsv41) |p| .{ .first = @intCast(p.lo), .count = @intCast(p.hi - p.lo) } else .{},

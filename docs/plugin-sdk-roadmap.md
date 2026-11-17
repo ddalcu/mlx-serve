@@ -4,12 +4,16 @@ An outside plugin that runs its own forward should import the server's blocks, n
 
 | Part | Home | State |
 |---|---|---|
-| mlx bindings | `kit.mlx` | done |
-| norms, conv, ssm, schedulers, vae, dit, embedding, linear, qmm, mlp, rope, attention, moe, hc, gdn | `kit.blocks` | done (Metal; versioned with the kit) |
+| mlx bindings, the blocks' `Graph` and array helpers | `kit.mlx`, `kit.mlx_ops`, `kit.mlx_array` | done |
+| norms, conv, ssm, schedulers, vae, dit, embedding, linear, qmm, mlp, rope, attention, moe, hc, gdn, kda | `kit.blocks` | done (Metal; versioned with the kit) |
+| the language-model bases' blocks (routed MLP, gated-delta layer) and eval cadence | `kit.bases` | done |
+| the KDA-hybrid base (GLM-5.3-Flash's and Ling 3.0's config, trunk, KDA layer, slots, table glue, MoE, fixtures) | `kit.bases.kda_hybrid` | done (no Sushi EXL3 experts: `builtin_formats.zig` stays in the server) |
+| the op scope over mlx-c; the machine's memory, load and GPU cores | `kit.mlx_scope`, `kit.system` | done |
+| the prompt pass's bill; an outside quant pack's model side | `kit.bill`, `kit.outside_model` | done |
 | a weight layout of its own | `kit.foreign.register` (`sdk/quant/foreign.zig`) | done |
 | the MTP round policy | `kit.spec`, pure parts only | not started |
-| kernel contract and parity harness | `kit.testing` | not started |
-| config helpers, kv, mrope, util | `kit.sdk` | partly (`kit.sdk`, `kit.generation`) |
+| kernel contract and parity harness | `kit.testing` | kernel contract done (`kit.testing.kernel_contract`); parity harness not started |
+| config helpers, kv, mrope, util | `kit.sdk` | partly (`kit.sdk`, `kit.generation`, `kit.log`) |
 
 ## Rules
 
@@ -20,6 +24,7 @@ An outside plugin that runs its own forward should import the server's blocks, n
   between kits, and a plugin pins one.
 - Every public function of `kit.blocks` builds from the staged kit (`build/kit/blocks_check`, run by `zig build test`), and
   every block file of an exposed area is listed in `src/kit.zig` or is a test, contract or CUDA file (`kit_test.zig`).
+  The kit stages no file under the engine, the host or the plugins, kernels included (`build/kit.zig`'s tests).
 
 ## MTP: native rounds stay, the policy ships as a library
 
