@@ -547,6 +547,10 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             prompt_relocate: bool = false,
             /// The rate tally (`expert.tally`, `LayerPolicy.setTally`) on every layer: null, off.
             tally: ?Tally = null,
+            /// No prompt-phase admission evicts a resident (every layer's `LayerPolicy.prompt_keep`): decode's residents
+            /// stay through a prompt pass. Only residency moves: a miss served from a transient row reads the record a
+            /// persistent load would, and the same kernels read it.
+            prompt_keep: bool = false,
             /// both phases' rows over one buffer (`BankPool`); null: each phase's rows
             /// allocated at its change, as before. MLX slot memory and the transient release only.
             bank_pool: ?PoolOptions = null,
@@ -1225,6 +1229,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         const experts = if (t.layer_experts) |le| le[li] else bank.n_experts;
                         policy.setTally(expert.tally.pinLimit(t.ratio, experts), expert.tally.alphaOf(t.window));
                     }
+                    policy.prompt_keep = opt.prompt_keep;
                     var base = try Rows.init(geom, rows, opt.slot_memory);
                     errdefer base.deinit();
                     const meta = try a.alloc(SlotMeta, bank.n_experts);

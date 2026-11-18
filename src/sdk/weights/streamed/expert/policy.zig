@@ -131,6 +131,10 @@ pub const LayerPolicy = struct {
     pin_limit: u32 = 0,
     seeded: bool = false,
     pin_scratch: []u16,
+    /// No prompt-phase admission evicts a resident (`Stream.Options.prompt_keep`, set at construction): a prefill miss
+    /// takes an empty row, else a transient row, and is no seed; the read-ahead and a seed promotion take empty rows
+    /// only. Off: the plans are those without it.
+    prompt_keep: bool = false,
 
     /// decode's window 0 rows, the transient loads a decode plan keeps;
     /// past them its declined misses are admitted over the lowest-ranked residents the route does not use (`admitPast`).
@@ -350,7 +354,7 @@ pub const LayerPolicy = struct {
     /// With the tally seeded, a prefill miss that is not pinned takes only an empty row (it evicts nothing, and no seed
     /// promotion copies it): the residents the tally's preload and pins chose stay.
     fn mayEvictInPrefill(p: *const LayerPolicy, e: u16) bool {
-        return !p.seeded or p.pin_limit == 0 or p.pinned.isSet(e);
+        return !p.prompt_keep and (!p.seeded or p.pin_limit == 0 or p.pinned.isSet(e));
     }
 
     /// prepare_prefill_seed: counts the prompt's routed ids, then re-protects
@@ -474,7 +478,7 @@ pub const LayerPolicy = struct {
         for (experts, 0..) |e, i| {
             if (n == out.len) break;
             if (e >= p.n_experts or p.expert_to_slot[e] != no_slot) continue;
-            const slot = p.emptySlot() orelse p.freeSeedVictim(@intCast(i)) orelse p.aheadVictim() orelse break;
+            const slot = p.emptySlot() orelse (if (p.prompt_keep) null else (p.freeSeedVictim(@intCast(i)) orelse p.aheadVictim())) orelse break;
             const victim = p.slot_to_expert[slot];
             if (victim != no_expert) {
                 p.expert_to_slot[victim] = no_slot;
@@ -717,7 +721,7 @@ pub const LayerPolicy = struct {
         std.debug.assert(p.seed.isSet(e) and p.expert_to_slot[e] == no_slot);
         for (held) |s| p.held.set(s);
         defer for (held) |s| p.held.unset(s);
-        const slot = p.emptySlot() orelse p.probationVictim() orelse return null;
+        const slot = p.emptySlot() orelse (if (p.prompt_keep) null else p.probationVictim()) orelse return null;
         const victim = p.slot_to_expert[slot];
         if (victim != no_expert) {
             p.expert_to_slot[victim] = no_slot;
