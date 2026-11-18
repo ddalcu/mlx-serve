@@ -37,6 +37,17 @@ A profile is a directory: `manifest.json` (`"format": "mlx-serve-ablation"`, `"v
 `direction`, `[hidden]`, F32/F16/BF16, normalized at load). Make the key with
 `openssl rand -hex 32 > key && chmod 600 key` and serve only over TLS or loopback: the header is a bearer secret.
 
+### Request priority
+
+`X-MLX-Priority: high` on a request to any of the chat, completion, messages, responses, speech or Ollama routes lets
+it start between the chunks of a long prompt another request is reading with up to 8192 prompt tokens the cache does not
+hold, instead of 1024, so a short call does not wait for the whole long prompt. Any client on this machine (loopback,
+as for LoRA paths) may claim it; from another machine the header is ignored. Such a request starts only once the long
+prompt has read for as long as the priority requests it already hosted plus this one cost (about one chunk per 1024
+tokens): the long prompt keeps at least half its speed, and a shorter one never hosts it. A small request arriving
+meanwhile waits for it, up to about eight chunks. `--prefill-decode-share 0` turns it off with the rest of the
+chunk-boundary admission; any other value of the header is a normal request.
+
 ## POST /v1/messages (Anthropic)
 
 ```bash

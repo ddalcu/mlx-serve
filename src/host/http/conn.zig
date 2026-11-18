@@ -17,6 +17,7 @@ const sendResponseFramed = @import("respond.zig").sendResponseFramed;
 const SSE_ALLOW_HEADERS_DEFAULT = @import("respond.zig").SSE_ALLOW_HEADERS_DEFAULT;
 const sendSseHeaders = @import("respond.zig").sendSseHeaders;
 const findHeaderValue = @import("request.zig").findHeaderValue;
+const peerIsLoopback = @import("auth.zig").peerIsLoopback;
 const AblationRequest = @import("../../sdk/request/ablation.zig").Request;
 const readRequestOver = @import("request.zig").readRequestOver;
 
@@ -89,11 +90,16 @@ pub const Conn = struct {
     ablation: ?AblationRequest = null,
     ablation_header: [192]u8 = undefined,
     ablation_header_len: usize = 0,
+    /// The current request's `X-MLX-Priority: high`, from loopback only, like a LoRA path: it may be prefilled at a
+    /// running prefill's chunk boundaries with a longer uncached tail (`engines/mlx/prefill_interleave.zig`
+    /// `PRIORITY_MAX_TAIL`). From another machine the header is ignored, not refused: it changes no output.
+    priority: bool = false,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
         c.client = .other;
+        c.priority = false;
         c.clearAblation();
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
@@ -107,6 +113,7 @@ pub const Conn = struct {
     /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
     pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
         c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
+        c.priority = if (findHeaderValue(headers, "x-mlx-priority")) |v| std.ascii.eqlIgnoreCase(v, "high") and peerIsLoopback(c) else false;
         c.clearAblation();
         c.ablation_key = findHeaderValue(headers, "x-ablation-key");
     }
@@ -422,6 +429,26 @@ test "Conn names the client from each request's User-Agent and keeps no header t
     try std.testing.expectEqual(instr.Client.other, conn.client);
 }
 
+test "Conn: X-MLX-Priority: high from this machine marks its own request only" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const local: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 4242 } };
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = local } }, io);
+    try testing.expect(!conn.priority);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nx-mlx-priority: High\r\n\r\n");
+    try testing.expect(conn.priority);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nX-MLX-Priority: low\r\n\r\n");
+    try testing.expect(!conn.priority);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nX-MLX-Priority: high\r\n\r\n");
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
+    try testing.expect(!conn.priority);
+    // From another machine the header is a normal request, the trust a LoRA path needs.
+    const remote: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = remote } }, io);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nX-MLX-Priority: high\r\n\r\n");
+    try testing.expect(!conn.priority);
+}
+
 test "Conn: a request's X-Ablation line rides both response heads, and the next request starts without it or the key" {
     const io = std.Io.Threaded.global_single_threaded.io();
     for ([_]bool{ false, true }) |sse| {
@@ -443,8 +470,8 @@ test "Conn: a request's X-Ablation line rides both response heads, and the next 
         const got = buf[0..@intCast(n)];
         const head = got[0 .. std.mem.indexOf(u8, got, "\r\n\r\n").? + 4];
         try testing.expect(std.mem.indexOf(u8, head, "\r\n" ++ line) != null);
-        // A browser may send the key cross-origin and read the X-Ablation line back.
-        try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, X-Ablation-Key\r\n") != null);
+        // A browser may send the key and the priority cross-origin and read the X-Ablation line back.
+        try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Allow-Headers: " ++ SSE_ALLOW_HEADERS_DEFAULT ++ "\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, head, "\r\nAccess-Control-Expose-Headers: X-Ablation\r\n") != null);
         try testing.expect(std.mem.indexOf(u8, got, "secret-value") == null);
         conn.noteRequestHeaders("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\n\r\n");

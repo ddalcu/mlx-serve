@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const chat_mod = @import("../../chat/chat.zig");
+const ALLOW_HEADERS = @import("../../http/respond.zig").ALLOW_HEADERS;
 
 // ── Request translation ─────────────────────────────────────────────────
 
@@ -902,7 +903,7 @@ pub const Sink = struct {
             "Connection: close\r\n" ++
             "Access-Control-Allow-Origin: *\r\n" ++
             "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
-            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
+            "Access-Control-Allow-Headers: " ++ ALLOW_HEADERS ++ "\r\n" ++
             "\r\n");
     }
 

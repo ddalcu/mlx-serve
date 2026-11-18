@@ -82,6 +82,8 @@ pub const Slot = struct {
     /// Set while the slot is prefilled at another prefill's chunk boundary: the most uncached tokens it
     /// may forward there. A restore that covers less than the pre-filter peeked hands the request back.
     boundary_max_tail: ?usize = null,
+    /// `X-MLX-Priority: high`: may be prefilled at another prefill's chunk boundary up to `PRIORITY_MAX_TAIL`.
+    priority: bool = false,
     /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
     /// Owned by the slot; `mrope_pos` freed on deinit.
     mrope_pos: ?[]const i32,
@@ -382,6 +384,7 @@ pub const Slot = struct {
             .prompt_logprobs_buf = .empty,
             .skip_prefix_cache = params.prompt_logprobs,
             .cache_variant = if (params.ablation) |a| a.key else 0,
+            .priority = params.priority,
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the

@@ -46,7 +46,7 @@ const ChatPassMode = enum { main, yield };
 pub const ChatPassResult = enum { shutdown, idle, ran };
 
 /// What became of a slot `prefillAdmitted` took through admission and prefill.
-const AdmitOutcome = enum {
+pub const AdmitOutcome = enum {
     /// Prefilled and appended to `decoding`.
     decoding,
     /// Finished before or during its prefill (cancelled).

@@ -33,6 +33,7 @@ const request_model = @import("request_model.zig");
 const row_facts = @import("model_row_facts.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
+const ALLOW_HEADERS = @import("../http/respond.zig").ALLOW_HEADERS;
 const configuredKvQuantFor = @import("../http/server.zig").configuredKvQuantFor;
 const parseModelFromBody = @import("request_model.zig").parseModelFromBody;
 const resolveRequestModelId = @import("request_model.zig").resolveRequestModelId;
@@ -629,7 +630,7 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
     const l = http_server.g_lan orelse return sendResponseFramed(stream, "200 OK", "application/json", body);
     if (stream.ws_mode != null) return sendResponseFramed(stream, "200 OK", "application/json", body);
     var hdr_buf: [512]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nX-MLX-LAN-Token: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nX-MLX-LAN-Token: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: " ++ ALLOW_HEADERS ++ "\r\n\r\n", .{
         body.len,
         &l.token_hex,
     }) catch return error.Overflow;

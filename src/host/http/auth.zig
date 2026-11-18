@@ -9,6 +9,7 @@ const queryDecoded = @import("../api/request_model.zig").queryDecoded;
 const pairValue = @import("../api/request_model.zig").pairValue;
 const percentDecoded = @import("../api/request_model.zig").percentDecoded;
 const logHttpResponse = @import("respond.zig").logHttpResponse;
+const UNAUTHORIZED_ALLOW_HEADERS = @import("respond.zig").UNAUTHORIZED_ALLOW_HEADERS;
 
 /// True if the connection's peer is a loopback address (127.0.0.0/8, ::1, or an
 /// IPv4-mapped-IPv6 loopback). Loopback is the local machine → trusted and
@@ -212,7 +213,7 @@ pub fn sendUnauthorized(stream: *Conn) !void {
         return;
     }
     var hdr_buf: [512]u8 = undefined;
-    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nWWW-Authenticate: Basic realm=\"mlx-serve\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n\r\n", .{body.len}) catch return error.Overflow;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nWWW-Authenticate: Basic realm=\"mlx-serve\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: " ++ UNAUTHORIZED_ALLOW_HEADERS ++ "\r\n\r\n", .{body.len}) catch return error.Overflow;
     try stream.writeAll(hdr);
     stream.length_framed = true;
     try stream.writeAll(body);
