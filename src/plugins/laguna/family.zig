@@ -140,6 +140,7 @@ pub fn loadFamily(comptime D: type, ctx: *const abi.LoadCtx) !*Loaded(D) {
             },
             .mscale = if (yl) yarn.?.mscale else .{},
             .window = if (full) 0 else c.sliding_window,
+            .ring = if (full) 0 else ctx.parsed.cache.sliding_ring,
         };
         var dqs: [4]Linear = undefined;
         for (&dqs, [_]Linear{ q, k, v, ow }) |*d, l| {
@@ -226,7 +227,7 @@ fn attnOf(comptime W: type, r: *loader.Reader, o: *loader.Owned, c: *const confi
 
 /// `a` (any `LagunaAttention(...)` weights) as `W`'s; the extras stay unset.
 fn copyAttn(comptime W: type, a: anytype) W {
-    return .{ .q = a.q, .k = a.k, .v = a.v, .o = a.o, .q_norm = a.q_norm, .k_norm = a.k_norm, .geo = a.geo, .mscale = a.mscale, .window = a.window };
+    return .{ .q = a.q, .k = a.k, .v = a.v, .o = a.o, .q_norm = a.q_norm, .k_norm = a.k_norm, .geo = a.geo, .mscale = a.mscale, .window = a.window, .ring = a.ring };
 }
 
 /// The MLP slot of `D`: the family's `Mlp`, or Kolibri's routed experts behind their output norm.

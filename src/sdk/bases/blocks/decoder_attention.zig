@@ -97,6 +97,9 @@ pub fn DecoderAttention(comptime opts: Options) type {
             geo: Geo,
             /// Keys a sliding layer attends; 0 = every key (a global layer).
             window: u32 = 0,
+            /// Rows a sliding layer's cache keeps (>= the widest view); 0 = every row. Batched rows append
+            /// through the ring the slot's own prefill opened (`KVCacheEntry.keep`).
+            ring: u32 = 0,
             kv_source: ?u32 = null,
             /// A sliding layer whose keys all fit its window prefills as plain causal: the kernel and reduction order
             /// mlx-lm takes for short prompts, which Gemma 4's MoE forward keeps so near-tie routes do not flip.
@@ -176,10 +179,12 @@ pub fn DecoderAttention(comptime opts: Options) type {
                     [2]Array{ f[1], if (f[2].ctx != null) f[2] else try g.transpose(try g.reshape(own_v, &kv_shape), &perm) }
                 else
                     try ownKv(w, c, 1, own_k, own_v, Roper{ .geo = geo, .offset = offset });
-                break :blk try kv.append(c, kvs[0], kvs[1], if (window > 0) sv.span else 0);
+                break :blk try kv.appendSliding(c, c.cache(), kvs[0], kvs[1], if (window > 0) sv.span else 0, window, w.ring);
             };
             defer kv.release(c, &view);
             const dv = kv.dense(view);
+            // The keys the view holds: a ring's whole-buffer view starts past position 0.
+            const kv_len: c_int = mlx.getShape(dv.k)[2];
 
             // The mode and mask the dense arms and the packed kernels share.
             var mode: [:0]const u8 = if (c.wide()) "causal" else "";
@@ -188,7 +193,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
                 const w_c: c_int = @intCast(window);
                 if (c.wide()) {
                     mode = "array";
-                    if (!sv.band_in_kernel) mask = try sliding.bandOnce(c, s, sv.kv_len, w_c);
+                    if (!sv.band_in_kernel) mask = try sliding.bandOnce(c, s, kv_len, w_c);
                 } else {
                     const held: c_int = @intCast((try c.cacheOps()).len(c.cache(), src orelse c.layer));
                     if (held > w_c) {
@@ -203,12 +208,12 @@ pub fn DecoderAttention(comptime opts: Options) type {
             const extra = c.wide() and c.mask_add.ctx != null;
             if (extra) {
                 mode = "array";
-                mask = if (window > 0) try g.add(try sliding.bandOnce(c, s, sv.kv_len, @intCast(window)), c.mask_add) else c.mask_add;
+                mask = if (window > 0) try g.add(try sliding.bandOnce(c, s, kv_len, @intCast(window)), c.mask_add) else c.mask_add;
             }
 
             var out: ?Array = null;
             if (extra) {} else if (view.packed_reads and kvq.kvAttnFusedEligible(&dv, s)) {
-                if (std.mem.eql(u8, mode, "array") and mask.ctx == null) mask = try sliding.bandOnce(c, s, sv.kv_len, @intCast(window));
+                if (std.mem.eql(u8, mode, "array") and mask.ctx == null) mask = try sliding.bandOnce(c, s, kv_len, @intCast(window));
                 out = try own(g, try kvq.qkvAttnDecodeKernel(g.s, q_rope, &dv, geo.scale, mode, mask));
                 if (out != null) kvq.logKvAttnFusedEngaged(&dv, q_rope, s);
             } else if (view.packed_reads and kvq.kvAttnVerifyEligible(&dv, s)) {
@@ -222,7 +227,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
                 } else if (std.mem.eql(u8, mode, "array")) {
                     if (c.wide() and !extra) out = try own(g, try attn256.fusedSdpa256Prefill(g.s, q_rope, dv.k, dv.v, geo.scale, @intCast(window)));
                     if (out == null) {
-                        if (mask.ctx == null) mask = try sliding.bandOnce(c, s, sv.kv_len, @intCast(window));
+                        if (mask.ctx == null) mask = try sliding.bandOnce(c, s, kv_len, @intCast(window));
                         out = try sdpaRaw(g, q_rope, dv.k, dv.v, geo.scale, "array", mask, false);
                     }
                 } else {

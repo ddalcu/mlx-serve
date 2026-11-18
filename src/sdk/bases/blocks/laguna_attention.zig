@@ -134,6 +134,8 @@ pub fn LagunaAttention(comptime opts: Options) type {
             var view = try append(w, c, c.cache(), k, v, if (window > 0) sv.span else 0);
             defer kv.release(c, &view);
             const dv = kv.dense(view);
+            // The keys the view holds: a ring's whole-buffer view starts past position 0.
+            const kv_len: c_int = mlx.getShape(dv.k)[2];
             const sinks = sinksOf(w);
             const w_c: c_int = @intCast(window);
             const short = window == 0 or total <= w_c;
@@ -145,7 +147,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
                     mode = "causal";
                 } else if (c.wide()) {
                     mode = "array";
-                    mask = try sliding.bandOnce(c, s, sv.kv_len, w_c);
+                    mask = try sliding.bandOnce(c, s, kv_len, w_c);
                 }
                 if (try da.own(g, try kvq.qkvAttnDecodeKernel(g.s, q, &dv, geo.scale, mode, mask))) |o| {
                     kvq.logKvAttnFusedEngaged(&dv, q, s);
@@ -157,7 +159,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
             }
             if (!c.wide()) return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "", .{}, sinks, false);
             if (short) return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "causal", .{}, sinks, sinks.ctx == null and sdpa.sdpaForceFused(q, dv.k));
-            return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandOnce(c, s, sv.kv_len, w_c), sinks, false);
+            return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandOnce(c, s, kv_len, w_c), sinks, false);
         }
 
         /// Each batched slot's row of q/k/v appended at the slot's own length and read through its own view.
@@ -174,13 +176,13 @@ pub fn LagunaAttention(comptime opts: Options) type {
                 const sv = sliding.view(w.window, geo.head_dim, offset + s, s);
                 var view = try append(w, c, h, try g.sliceAxis(k, 0, at, at + 1), try g.sliceAxis(v, 0, at, at + 1), if (w.window > 0) sv.span else 0);
                 defer kv.release(c, &view);
-                outs[i] = try core(w, c, try g.sliceAxis(q, 0, at, at + 1), kv.dense(view), offset, sv.kv_len);
+                outs[i] = try core(w, c, try g.sliceAxis(q, 0, at, at + 1), kv.dense(view), offset);
             }
             return g.concat(outs[0..c.caches.len], 0);
         }
 
         /// One slot's attention over its view, keys before this block numbering `offset`.
-        fn core(w: *const Weights, c: *Ctx, q: Array, dv: DenseKVView, offset: c_int, kv_len: c_int) !Array {
+        fn core(w: *const Weights, c: *Ctx, q: Array, dv: DenseKVView, offset: c_int) !Array {
             const g = c.g;
             const geo = &w.geo;
             const s = c.rows;
@@ -197,20 +199,11 @@ pub fn LagunaAttention(comptime opts: Options) type {
             const w_c: c_int = @intCast(w.window);
             if (full or !prefill or offset + s <= w_c)
                 return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, if (prefill) "causal" else "", .{}, sinks, false);
-            return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandOnce(c, s, kv_len, w_c), sinks, false);
+            return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandOnce(c, s, mlx.getShape(dv.k)[2], w_c), sinks, false);
         }
 
-        /// Appends to `h` at the current layer: a sliding layer with a ring keeps only its ring.
         fn append(w: *const Weights, c: *Ctx, h: abi.Handle, k: Array, v: Array, keep: u32) !abi.KvView {
-            const o = try c.cacheOps();
-            const s: abi.Stream = .{ .ctx = c.stream().ctx };
-            var out: abi.KvView = .{};
-            const verdict = if (keep > 0 and w.ring > 0)
-                o.append_ring(h, c.layer, .{ .ctx = k.ctx }, .{ .ctx = v.ctx }, keep, w.window, w.ring, s, &out)
-            else
-                o.append(h, c.layer, .{ .ctx = k.ctx }, .{ .ctx = v.ctx }, keep, s, &out);
-            if (!verdict.isOk()) return error.CacheOpFailed;
-            return out;
+            return kv.appendSliding(c, h, k, v, keep, w.window, w.ring);
         }
 
         /// `flat * softplus(gate(x))` per head: the f32 softplus rounded to bf16 before the multiply.

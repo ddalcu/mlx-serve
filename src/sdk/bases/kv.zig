@@ -27,6 +27,20 @@ pub fn append(c: *const Ctx, k: Array, v: Array, keep: u32) !abi.KvView {
     return out;
 }
 
+/// `append` to `cache` for a layer attending its last `window` keys: with a `ring` (rows >= the widest view) the
+/// cache keeps only its newest `ring` rows, also through a whole-buffer view (`keep` 0), so the ring holds from the
+/// slot's first chunk; 0 = every row.
+pub fn appendSliding(c: *const Ctx, cache: abi.Handle, k: Array, v: Array, keep: u32, window: u32, ring: u32) !abi.KvView {
+    const o = try c.cacheOps();
+    const s: abi.Stream = .{ .ctx = c.stream().ctx };
+    var out: abi.KvView = .{};
+    if (ring > 0)
+        try ok(o.append_ring(cache, c.layer, ab(k), ab(v), keep, window, ring, s, &out))
+    else
+        try ok(o.append(cache, c.layer, ab(k), ab(v), keep, s, &out));
+    return out;
+}
+
 /// The rows `layer` of `cache` holds.
 pub fn view(c: *const Ctx, cache: abi.Handle, layer: u32) !abi.KvView {
     const o = try c.cacheOps();

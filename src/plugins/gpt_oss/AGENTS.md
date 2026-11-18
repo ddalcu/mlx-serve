@@ -21,6 +21,7 @@ Served (see "Served").
   `mlx-community/gpt-oss-20b-MXFP4-Q8` config at the proof geometry replays a live-recorded tape.
 - Decode-attn-quant side copies through laguna's `DecodeCopies`. Load refuses by name: missing per-expert biases (only
   the biased sorted path is here).
+- Sliding layers keep a ring of window + 2048 rows (`CacheFacts.sliding_ring`, `kv.appendSliding`).
 - Legacy quirk mirrored: the config's YaRN `truncate: false` is NOT read (the engine reads `truncate` only from
   `rope_parameters`), so the frequencies are the truncated ones. Worth checking against mlx-lm before flipping.
 - Proof (`proof_test.zig`): 4-bit, and bf16 with decode-attn-quant off and on, bit-equal to the recorded
