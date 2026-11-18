@@ -4,17 +4,49 @@
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const generate_mod = @import("../generate.zig");
+const log = @import("../../../sdk/util/log.zig");
 const Generator = @import("../generate/generator.zig").Generator;
+const applyGrammarMask = @import("../sampling/sampler.zig").applyGrammarMask;
 const MAX_BATCH_GROUP = @import("verdict.zig").MAX_BATCH_GROUP;
 
-/// One token per row into `out`: row i is `rows[i]`, drawn with `gens[i]`'s sampling (its `draw` advances).
+var engaged_logged = false;
+
+/// One token per row into `out`: row i is `rows[i]`, drawn with `gens[i]`'s sampling (its `draw` advances). A row
+/// whose generator carries a grammar draws under that grammar's mask for this position.
 pub fn sampleBatchRows(allocator: std.mem.Allocator, out: []i32, gens: []const *Generator, rows: []const mlx.mlx_array, s: mlx.mlx_stream) !void {
-    _ = allocator;
     const n = rows.len;
     std.debug.assert(out.len == n and gens.len == n and n <= MAX_BATCH_GROUP);
     var params: [MAX_BATCH_GROUP]generate_mod.SamplingParams = undefined;
-    for (gens, 0..) |g, i| params[i] = g.sampling;
-    try generate_mod.sampleRows(out, rows, params[0..n], s);
+    var drawn: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var masked: [MAX_BATCH_GROUP]mlx.mlx_array = undefined;
+    var masked_n: usize = 0;
+    defer for (masked[0..masked_n]) |m| {
+        _ = mlx.mlx_array_free(m);
+    };
+    var grammar_n: usize = 0;
+    for (gens) |g| grammar_n += @intFromBool(g.sampling.constraint != null);
+    if (grammar_n > 0) {
+        // Start the forward now: the masks below are built on the CPU while it runs.
+        const vec = mlx.mlx_vector_array_new_data(rows.ptr, n);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_async_eval(vec));
+        // Output equality alone cannot tell a batched grammar row from a serial one: the guards grep this marker.
+        if (!engaged_logged) {
+            engaged_logged = true;
+            log.info("[batched] grammar rows engaged (slots={d}, grammar={d})\n", .{ n, grammar_n });
+        }
+    }
+    for (gens, rows, 0..) |g, row, i| {
+        params[i] = g.sampling;
+        drawn[i] = row;
+        const c = g.sampling.constraint orelse continue;
+        try c.fillPayloadMask(g.eos_token_ids);
+        masked[masked_n] = mlx.mlx_array_new();
+        masked_n += 1;
+        try applyGrammarMask(allocator, &masked[masked_n - 1], row, c.mask_buf, s);
+        drawn[i] = masked[masked_n - 1];
+    }
+    try generate_mod.sampleRows(out, drawn[0..n], params[0..n], s);
     for (gens, params[0..n]) |g, p| g.sampling.draw = p.draw;
 }
 
@@ -159,6 +191,7 @@ const Row = struct {
 
     fn destroy(r: *Row) void {
         const a = testing.allocator;
+        r.m.xfm.ssmGroupRelease(&r.gen.ctx) catch {};
         r.gen.deinit(a);
         if (r.schema != null) r.sc.deinit();
         r.out.deinit(a);
@@ -173,8 +206,10 @@ const Row = struct {
         try testing.expectEqual(r.prompt_len + r.out.items.len + @intFromBool(r.gen.has_pending_token), pos);
     }
 
+    /// One serial decode step, as `runSingleDecodeTick` takes it: out of the batch's SSM group first.
     fn serialStep(r: *Row) !void {
         if (r.ended) return;
+        try r.m.xfm.ssmGroupRelease(&r.gen.ctx);
         if (try r.gen.next(testing.allocator)) |t| try r.out.append(testing.allocator, t) else r.ended = true;
     }
 

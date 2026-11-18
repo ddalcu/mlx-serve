@@ -455,6 +455,7 @@ pub fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
 }
 
 pub fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+    if (self.batched_unforwarded) return try commitBatchedToken(self, allocator);
     if (!self.has_pending_logits) {
         self.done = true;
         return null;
@@ -540,24 +541,39 @@ pub fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u3
     if (next_logits) |nl| {
         self.pending_logits = nl;
         self.has_pending_logits = true;
-    } else if (self.step < self.max_tokens) {
-        // Pipeline miss: forward the realized token.
-        const tok_i32: i32 = @intCast(token);
-        const tok_shape = [_]c_int{ 1, 1 };
-        const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(tok_input);
-        const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
-        const arr = [_]mlx.mlx_array{nl};
-        const vec = mlx.mlx_vector_array_new_data(&arr, 1);
-        _ = mlx.mlx_async_eval(vec);
-        _ = mlx.mlx_vector_array_free(vec);
-        self.pending_logits = nl;
-        self.has_pending_logits = true;
-    } else {
+    } else try forwardRealized(self, token);
+
+    return token;
+}
+
+/// Pipeline miss: forward the realized `token` so its successor's logits are pending, or end at the cap.
+fn forwardRealized(self: *Generator, token: u32) !void {
+    if (self.step >= self.max_tokens) {
         self.done = true;
         self.finish_reason = "length";
+        return;
     }
+    const tok_i32: i32 = @intCast(token);
+    const tok_shape = [_]c_int{ 1, 1 };
+    const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(tok_input);
+    const nl = try self.xfm.forwardWith(&self.ctx, tok_input);
+    const arr = [_]mlx.mlx_array{nl};
+    const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+    _ = mlx.mlx_async_eval(vec);
+    _ = mlx.mlx_vector_array_free(vec);
+    self.pending_logits = nl;
+    self.has_pending_logits = true;
+}
 
+/// A batched tick drew `next_token_id` under the grammar and already advanced the grammar by it: emit and forward
+/// it here, so a slot that left the batch picks up where the tick stopped.
+fn commitBatchedToken(self: *Generator, allocator: std.mem.Allocator) !u32 {
+    self.batched_unforwarded = false;
+    const token = self.next_token_id;
+    self.advanceStep(1);
+    try self.generated_ids.append(allocator, token);
+    try forwardRealized(self, token);
     return token;
 }
 
