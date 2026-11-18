@@ -2191,7 +2191,7 @@ private struct LocalModelRow: View {
                     }
                 } else if isDecisionModelType(model.modelType) {
                     UseDecisionModelButton(path: model.path, name: model.name)
-                } else if let modality = MediaModality.of(modelType: model.modelType, path: model.path, rows: appState.server.allModels) {
+                } else if let modality = MediaModality.of(modelType: model.mediaModelType, path: model.path, rows: appState.server.allModels) {
                     // A media checkpoint is a real, loadable, servable model —
                     // it just is not a CHAT model, and until now that meant the
                     // only verb the browser offered for it was Delete. This

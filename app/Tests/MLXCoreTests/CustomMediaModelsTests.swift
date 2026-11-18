@@ -31,6 +31,7 @@ final class CustomMediaModelsTests: XCTestCase {
             info("me/ltx-finetune", arch: "AudioVideo", caps: ["video"]),
             info("me/h3-requant", arch: "minimax_h3", caps: ["video"]),
             info("me/tts-finetune", arch: "qwen3_tts", caps: ["audio"]),
+            info("me/ming-requant", arch: "dense", caps: ["audio"]),
             info("me/kokoro-custom", arch: "kokoro", caps: ["audio"]),
             info("me/acestep-custom", arch: "acestep", caps: ["audio", "music"]),
             info("me/mesh-custom", arch: "hunyuan3d_2_1", caps: ["3d"]),
@@ -57,7 +58,7 @@ final class CustomMediaModelsTests: XCTestCase {
         // Audio pane: cloning-capable TTS only — no Kokoro, no ACE-Step (music
         // advertises "audio" too, but it answers a different endpoint).
         XCTAssertEqual(CustomMediaModels.audioPresets(from: models).map(\.id),
-                       ["me/tts-finetune"])
+                       ["me/ming-requant", "me/tts-finetune"])
         XCTAssertEqual(CustomMediaModels.musicPresets(from: models).map(\.id),
                        ["me/acestep-custom"])
         XCTAssertEqual(CustomMediaModels.meshPresets(from: models).map(\.id),

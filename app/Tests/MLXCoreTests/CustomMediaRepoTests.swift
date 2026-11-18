@@ -101,6 +101,20 @@ final class CustomMediaRepoTests: XCTestCase {
 
     // MARK: - Tree verification
 
+    func testMingPacksPassTheirOwnMarkersAndAnotherDenseRepoDoesNot() {
+        let tree: [HFSearchService.TreeFileEntry] = ["config.json", "model.safetensors", "tokenizer.json", "campplus.safetensors"]
+            .map { .init(path: $0, size: 9) }
+        for bundle in [AudioModelPreset.mingTTS8bit.bundle, AudioModelPreset.mingTTS.bundle,
+                       CustomMediaModels.bundle(arch: "dense", repoId: "me/ming-requant")!] {
+            XCTAssertTrue(bundle.components[0].selection.recursive)
+            XCTAssertTrue(HFSearchService.mediaStructureSatisfied(markers: bundle.components[0].readyMarkers, files: tree))
+            // A `dense` repo without the speaker encoder, such as one with only campplus.onnx.
+            XCTAssertFalse(HFSearchService.mediaStructureSatisfied(
+                markers: bundle.components[0].readyMarkers,
+                files: tree.filter { $0.path != "campplus.safetensors" }))
+        }
+    }
+
     func testStructureCheckIsTheFamilyBundlesOwnMarkers() {
         let markers = CustomMediaModels.bundle(
             arch: "minimax_h3", repoId: "antocorr/x")!.components[0].readyMarkers

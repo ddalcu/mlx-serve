@@ -1974,7 +1974,10 @@ class DownloadManager: ObservableObject {
         let defect = weightDefect(inDir: resolved, entries: entries)
 
         var meta = parseConfigMetadata(atPath: configPath)
-        if let marked { meta.modelType = marked }
+        if let marked {
+            meta.modelType = marked
+            meta.lacksMediaMarkers = false
+        }
         let modelType = meta.modelType
 
         let size = directorySize(resolved)
@@ -2000,7 +2003,8 @@ class DownloadManager: ObservableObject {
             activeExperts: meta.activeExperts,
             hasMtpHead: dirHasMtpHead(atDir: resolved),
             sizeBytes: Int64(size),
-            defect: defect
+            defect: defect,
+            lacksMediaMarkers: meta.lacksMediaMarkers
         )]
     }
 
@@ -2101,6 +2105,7 @@ class DownloadManager: ObservableObject {
     /// reliably carries the headline param count, which isn't a config field).
     struct ConfigMetadata: Equatable {
         var modelType = "unknown"
+        var lacksMediaMarkers = false
         var hasVision = false
         var quantBits: Int? = nil
         var contextLength: Int? = nil
@@ -2115,7 +2120,10 @@ class DownloadManager: ObservableObject {
         var meta = ConfigMetadata()
         guard let data = FileManager.default.contents(atPath: configPath),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return meta }
-        if let mt = cfg["model_type"] as? String { meta.modelType = mt }
+        if let mt = cfg["model_type"] as? String {
+            meta.modelType = mt
+            meta.lacksMediaMarkers = !mediaMarkersHold(modelType: mt, config: cfg)
+        }
         // Vision: a NON-EMPTY `vision_config` block on a non-`_text` arch. Both
         // guards earn their place — `_text` skips text-only quantized
         // checkpoints with a vestigial block, and the emptiness check catches

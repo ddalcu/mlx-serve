@@ -514,13 +514,16 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(b.primaryRepo, "ddalcu/Kokoro-82M-MLX-Serve")
     }
 
-    /// Class guard: the `.audio` slot hosts two architectures with different
-    /// repo shapes, and `supportsCloning` is the discriminator. A third audio
-    /// backend must not silently inherit the wrong bundle.
+    /// Class guard: the `.audio` slot hosts three architectures with different
+    /// repo shapes, and `isMing` and `supportsCloning` are the discriminators.
+    /// Another audio backend must not silently inherit the wrong bundle.
     func testAudioBundleDispatchFollowsTheDeclaredCapability() {
         for p in AudioModelPreset.allIncludingVoiceOnly {
             let m = p.bundle.components[0].readyMarkers
-            if p.supportsCloning {
+            if p.isMing {
+                XCTAssertTrue(m.contains("campplus.safetensors"), "\(p.id) clones with CAM++")
+                XCTAssertFalse(m.contains("speech_tokenizer"), "\(p.id) has no codec tokenizer: it would never read as ready")
+            } else if p.supportsCloning {
                 XCTAssertTrue(m.contains("speech_tokenizer"), "\(p.id) clones — it needs the codec tokenizer")
             } else {
                 XCTAssertTrue(m.contains("g2p"), "\(p.id) can't clone — it needs the phonemizer dictionaries")
