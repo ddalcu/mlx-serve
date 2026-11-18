@@ -154,6 +154,58 @@ test "expert stream: prompt_keep reaches every layer's policy; its prompt routes
     try testing.expectEqual(@as(u64, 0), evictions[1]);
 }
 
+test "expert stream: speculateAhead reads a routed layer's likely records before its route, in decode only; the route claims them with the file's bytes" {
+    var layers = [_]MxBank.Layer{ MxBank.layerOf(256, 128), MxBank.layerOf(256, 128) };
+    const rec = layers[0].logical_bytes;
+    const n_experts: u32 = 24;
+    const image = try testing.allocator.alloc(u8, rec * n_experts * layers.len);
+    defer testing.allocator.free(image);
+    for (image, 0..) |*b, k| b.* = @truncate(k *% 2654435761 >> 9);
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "experts.bin", .data = image });
+    var root: [512]u8 = undefined;
+    const path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/experts.bin", .{root[0..try tmp.dir.realPath(testing.io, &root)]}, 0);
+    defer testing.allocator.free(path);
+    const fd = try contract.openUncached(path.ptr, null);
+    defer fd.close();
+    const bank: MxBank.Bank = .{ .layers = &layers, .n_experts = n_experts, .sidecar = fd, .record_bytes = rec };
+    const opt: StreamOf(MxBank, false).Options = .{ .rows = &.{ 4, 3 }, .max_route_ids = 8, .transient_rows = 8, .lookahead = .{ .budget = 2 }, .pool = .{ .workers = 2, .staging_bytes = 65536, .tickets = 256 } };
+    // One row's scores, expert e scoring 24 - e: the selector's head is 0, then 1.
+    var row: [24]f32 = undefined;
+    for (&row, 0..) |*v, e| v.* = 24 - @as(f32, @floatFromInt(e));
+    // A stream without the lookahead reads nothing ahead (the process has one read pool: one stream at a time).
+    {
+        var plain_opt = opt;
+        plain_opt.lookahead = null;
+        const plain = try MxStream.init(testing.allocator, &bank, plain_opt);
+        defer plain.deinit();
+        try plain.grow(&.{ 4, 3 });
+        try testing.expectEqual(@as(usize, 0), try plain.speculateAhead(0, &row));
+    }
+    const s = try MxStream.init(testing.allocator, &bank, opt);
+    defer s.deinit();
+    // The prompt phase reads nothing ahead.
+    try testing.expectEqual(@as(usize, 0), try s.speculateAhead(0, &row));
+    try s.grow(&.{ 4, 3 });
+    // Past the last routed layer, or with no scores: nothing.
+    try testing.expectEqual(@as(usize, 0), try s.speculateAhead(2, &row));
+    try testing.expectEqual(@as(usize, 0), try s.speculateAhead(0, &.{}));
+    try testing.expectEqual(@as(usize, 2), try s.speculateAhead(0, &row));
+    const r = try s.serve(0, &.{ 0, 1, 5 });
+    try s.expectServed(r, &.{ 0, 1, 5 }, image);
+    s.release(r);
+    // Both records read ahead counted at the route they were read for, both routed by it.
+    var read: u64 = 0;
+    var routed: u64 = 0;
+    for (s.lookaheadByRank()[0]) |x| {
+        read += x[0];
+        routed += x[1];
+    }
+    try testing.expectEqual(@as(u64, 2), read);
+    try testing.expectEqual(@as(u64, 2), routed);
+}
+
 test "dsv41 bank contract: a top-8 arch's lookahead measures tau from each row's eighth score, a top-6 arch's from its sixth" {
     const a = testing.allocator;
     // One row over 16 experts, scores 15 - e: the 6th score is 10, the 8th is 8. With tau 1 and k 10, a top-6 selector keeps

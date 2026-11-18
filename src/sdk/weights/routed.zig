@@ -63,6 +63,12 @@ pub const Routed = struct {
     /// not read, the model's shared expert over its rows), which the source may commit while the call waits for its
     /// reads: `source`'s sum word for word; the model adds the hoist itself. Null: not offered.
     source_hoist: ?*const fn (*anyopaque, u32, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array, mlx.mlx_array) Ret(mlx.mlx_array) = null,
+    /// A decode window's read-ahead of model layer `layer`, a routed layer no routed call comes before (the first):
+    /// `ahead_score_fn` scores its router on the window's normed input to the MLP before it and commits the scores (no
+    /// host wait); `ahead_issue_fn`, once the model committed `layer`'s attention behind them, reads them back and reads
+    /// the layer's likely records ahead of its route. Reads only. Null: not offered.
+    ahead_score_fn: ?*const fn (*anyopaque, u32, mlx.mlx_array) Ret(void) = null,
+    ahead_issue_fn: ?*const fn (*anyopaque, u32) Ret(void) = null,
 
     pub fn settle(r: Routed) !void {
         return r.settle_fn(r.ctx).get();
