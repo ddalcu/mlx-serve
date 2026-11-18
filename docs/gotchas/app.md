@@ -454,3 +454,10 @@ table row compared it with the GPU's working set. Fix: every fit check takes a `
 `usableBytes`; a RAM band caps the starter pick, which steps down to the largest pick that fits. Guards:
 `RecommendedModelsTests` (bands, a raised wired limit, every tier fits its band's bottom), `RAMFitnessTests`,
 `testMediaPresetRequirementsReadTheUsableBudget`.
+
+## The console's MP4 lost frames, or failed with "no decoder configuration" (#1115)
+Defect: a console video came out with fewer frames than the server sent, and under load the save failed with "H.264
+encoder returned no decoder configuration." Cause: `encode-video.ts` configured WebCodecs with `latencyMode:
+"realtime"`, which lets the encoder drop frames it cannot keep up with (Chrome kept 17 of 25 noisy 512x288 frames);
+when it drops every frame, no chunk carries the `decoderConfig`. Fix: the default `quality` mode, which drops none.
+Guard: `openShotEncoder` "keeps every frame…" in `app-web/test/shot-encoder.test.ts`.

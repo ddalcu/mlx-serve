@@ -45,7 +45,6 @@ async function support(raw: RawVideo): Promise<"aac" | "opus" | "silent" | null>
       bitrate: 1_000_000,
       framerate: raw.fps,
       avc: { format: "avc" },
-      latencyMode: "realtime",
     });
     if (!video.supported) return null;
     if (!raw.audio) return "silent";
@@ -132,7 +131,6 @@ function mp4Writer(shape: RawVideo, signal: AbortSignal, audioCodec: "aac" | "op
     bitrate: 1_000_000,
     framerate: shape.fps,
     avc: { format: "avc" },
-    latencyMode: "realtime",
   });
   if (a && ae)
     ae.configure({
