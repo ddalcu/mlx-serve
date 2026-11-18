@@ -434,6 +434,12 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
         }
         merged.deinit(allocator);
     }
+    // `merged.items[i]`'s real path ("" when it cannot be resolved).
+    var reals = std.ArrayList([]const u8).empty;
+    defer {
+        for (reals.items) |r| if (r.len > 0) allocator.free(r);
+        reals.deinit(allocator);
+    }
 
     for (roots) |root| {
         const one = discoverModels(io, allocator, root) catch |err| {
@@ -443,26 +449,69 @@ pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []con
         // Transfer ownership per model, freeing only the ones we drop — the
         // whole result's `deinit` would free the strings we just handed over.
         defer allocator.free(one.models);
-        for (one.models) |m| {
+        for (one.models) |*m| {
+            const real = realPathOrEmpty(io, allocator, m.path);
+            errdefer if (real.len > 0) allocator.free(real);
             var dup = false;
-            for (merged.items) |seen| {
+            for (merged.items, reals.items) |*seen, seen_real| {
+                // Nested or symlinked roots reach one folder under two ids, and
+                // the same weights would load twice. The org/name id wins.
+                if (sameDir(seen.path, seen_real, m.path, real)) {
+                    if (idDepth(m.id) > idDepth(seen.id) and !idTaken(merged.items, m.id))
+                        std.mem.swap([]const u8, &seen.id, &m.id);
+                    dup = true;
+                    break;
+                }
                 if (std.mem.eql(u8, seen.id, m.id)) {
+                    log.warn("[discovery] {s}: already found in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
                     dup = true;
                     break;
                 }
             }
             if (dup) {
-                log.warn("[discovery] {s}: already found in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
+                if (real.len > 0) allocator.free(real);
                 allocator.free(m.id);
                 allocator.free(m.path);
                 if (m.model_type.len > 0) allocator.free(m.model_type);
                 continue;
             }
-            try merged.append(allocator, m);
+            try merged.ensureUnusedCapacity(allocator, 1);
+            try reals.ensureUnusedCapacity(allocator, 1);
+            merged.appendAssumeCapacity(m.*);
+            reals.appendAssumeCapacity(real);
         }
     }
 
     return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator, .roots = roots_owned };
+}
+
+/// `path` with every symlink resolved, in `buf`; "" when it cannot be resolved.
+pub fn realPathInto(io: std.Io, path: []const u8, buf: *[std.fs.max_path_bytes]u8) []const u8 {
+    if (!std.fs.path.isAbsolute(path)) return "";
+    return buf[0 .. std.Io.Dir.realPathFileAbsolute(io, path, buf) catch return ""];
+}
+
+/// `realPathInto`, allocator-owned.
+pub fn realPathOrEmpty(io: std.Io, allocator: std.mem.Allocator, path: []const u8) []const u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const real = realPathInto(io, path, &buf);
+    if (real.len == 0) return "";
+    return allocator.dupe(u8, real) catch "";
+}
+
+/// One folder under two spellings: equal real paths, else equal paths.
+pub fn sameDir(a_path: []const u8, a_real: []const u8, b_path: []const u8, b_real: []const u8) bool {
+    if (a_real.len > 0 and b_real.len > 0) return std.mem.eql(u8, a_real, b_real);
+    return std.mem.eql(u8, trimTrailingSlash(a_path), trimTrailingSlash(b_path));
+}
+
+fn idDepth(id: []const u8) usize {
+    return std.mem.count(u8, id, "/");
+}
+
+fn idTaken(models: []const DiscoveredModel, id: []const u8) bool {
+    for (models) |m| if (std.mem.eql(u8, m.id, id)) return true;
+    return false;
 }
 
 /// Core scan over an already-open root. Two layouts are recognized:
@@ -1169,6 +1218,48 @@ test "discoverModelsMany merges roots in order and de-dups by id" {
     var none = try discoverModelsMany(io, allocator, &.{});
     defer none.deinit();
     try std.testing.expectEqual(@as(usize, 0), none.models.len);
+}
+
+test "discoverModelsMany lists a folder two roots reach once, under its org/name id" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "lib/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "lib/org/m/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.symLink(io, "lib", "link", .{ .is_directory = true });
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const base = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, tmp.sub_path });
+    defer allocator.free(base);
+    const lib = try std.fmt.allocPrint(allocator, "{s}/lib", .{base});
+    defer allocator.free(lib);
+    const org = try std.fmt.allocPrint(allocator, "{s}/lib/org", .{base});
+    defer allocator.free(org);
+    const link = try std.fmt.allocPrint(allocator, "{s}/link", .{base});
+    defer allocator.free(link);
+
+    // Nested roots in either order, and a symlinked root beside the real folder.
+    const cases = [_][2][]const u8{ .{ lib, org }, .{ org, lib }, .{ link, org }, .{ org, link } };
+    for (cases) |roots| {
+        var result = try discoverModelsMany(io, allocator, &roots);
+        defer result.deinit();
+        try testing.expectEqual(@as(usize, 1), result.models.len);
+        try testing.expectEqualStrings("org/m", result.models[0].id);
+    }
+
+    // The org/name id already names another folder: the bare id stays, ids stay unique.
+    try tmp.dir.createDirPath(io, "other/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "other/org/m/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    const other = try std.fmt.allocPrint(allocator, "{s}/other", .{base});
+    defer allocator.free(other);
+    var taken = try discoverModelsMany(io, allocator, &.{ org, other, lib });
+    defer taken.deinit();
+    try testing.expectEqual(@as(usize, 2), taken.models.len);
+    try testing.expectEqualStrings("m", taken.models[0].id);
+    try testing.expectEqualStrings("org/m", taken.models[1].id);
 }
 
 test "discovery measures a SYMLINKED (HF hub cache) model dir's real bytes" {

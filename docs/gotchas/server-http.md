@@ -869,3 +869,12 @@ Defect: a locked temperature, a `ctx_size` and a `kv_quant` saved in Model Setti
 the two spellings byte for byte. Fix: request-path lookups take the entry's `real_path`, stored at registration, and a
 load resolves the path in `lookupPack`, the one load-time lookup. Guard: `tests/test_model_settings_symlink.sh`,
 `model_settings: a folder reached through a symlink answers to its real path's key…`.
+
+### One folder loaded twice when two `--model-dir` roots reached it (#1232)
+Defect: a model started by path listed as both `repo` and `org/repo`; a request naming the other id loaded a second
+resident copy, and on a 100 GB model the two copies evicted each other. Cause: the app adds the model's parent folder
+as a root when its covered check misses (a library root spelled through a symlink, say), and discovery deduped roots
+by id only, so the nested root registered the same folder under its bare name. Fix: `discoverModelsMany` keeps one
+entry per folder by real path, under the `org/name` id, and `rescan` compares real paths. Guard:
+`tests/test_multi_model_dir.sh` [5][6], `discoverModelsMany lists a folder two roots reach once…`,
+`ModelRegistry: rescan adds no second entry…`.
