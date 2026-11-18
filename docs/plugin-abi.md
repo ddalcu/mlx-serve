@@ -1219,6 +1219,7 @@ Where a format reads a pack's tensors: the resident source (`sdk/weights/residen
 | `ctx` | `?*anyopaque` |  |  |
 | `get` | `*const fn (ctx: ?*anyopaque, name: Str) callconv(.c) Array` |  | The tensor `name` (the full key, `<base>.weight`) as the source holds it, borrowed for the source's life; an empty array when the pack has none. |
 | `resident` | `bool` | `false` | `ctx` is an SDK `Resident` whose map an in-tree model may take (`Resident.take`). A flag, not `get`'s address: every compile unit holds its own copy of the function. |
+| `release` | `?*const fn (ctx: ?*anyopaque, a: Array) callconv(.c) bool` | `null` | Lets go of the source's own handle `a` (a tensor `get` handed out) before the source's life ends: `get` and the engine's reads after the load no longer see it, and the caller holds no borrowed handle of it. True when the source held it. Null = every tensor kept for the source's life. Appended: called only where `size` reaches it. |
 
 ### `Weight` (extern struct)
 

@@ -26,9 +26,20 @@ pub const Source = extern struct {
     /// `ctx` is an SDK `Resident` whose map an in-tree model may take (`Resident.take`). A flag, not `get`'s address:
     /// every compile unit holds its own copy of the function.
     resident: bool = false,
+    /// Lets go of the source's own handle `a` (a tensor `get` handed out) before the source's life ends: `get` and the
+    /// engine's reads after the load no longer see it, and the caller holds no borrowed handle of it. True when the
+    /// source held it. Null = every tensor kept for the source's life. Appended: called only where `size` reaches it.
+    release: ?*const fn (ctx: ?*anyopaque, a: Array) callconv(.c) bool = null,
 
     pub fn tensor(self: *const Source, name: []const u8) Array {
         return self.get(self.ctx, Str.of(name));
+    }
+
+    /// `release`; false on a source without it.
+    pub fn releaseTensor(self: *const Source, a: Array) bool {
+        if (self.size < @offsetOf(Source, "release") + @sizeOf(?*const anyopaque)) return false;
+        const f = self.release orelse return false;
+        return f(self.ctx, a);
     }
 };
 
@@ -285,6 +296,29 @@ test "abi quant: a bank's decode read-ahead pair is declared after every earlier
     try testing.expect(@offsetOf(Bank, "ahead_issue") > @offsetOf(Bank, "ahead_score"));
     const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
     try testing.expect(b.ahead_score == null and b.ahead_issue == null);
+}
+
+test "abi quant: a source's release is called only where its size reaches it" {
+    const F = struct {
+        var calls: u32 = 0;
+        fn get(_: ?*anyopaque, _: Str) callconv(.c) Array {
+            return .{};
+        }
+        fn release(_: ?*anyopaque, a: Array) callconv(.c) bool {
+            calls += 1;
+            return a.ctx != null;
+        }
+    };
+    var x: u8 = 0;
+    var src: Source = .{ .ctx = null, .get = &F.get, .release = &F.release };
+    try testing.expect(src.releaseTensor(.{ .ctx = &x }));
+    // A host built before the field: its source ends before `release`.
+    src.size = @offsetOf(Source, "release");
+    try testing.expect(!src.releaseTensor(.{ .ctx = &x }));
+    // A source without it keeps every tensor.
+    src = .{ .ctx = null, .get = &F.get };
+    try testing.expect(!src.releaseTensor(.{ .ctx = &x }));
+    try testing.expectEqual(@as(u32, 1), F.calls);
 }
 
 test "abi quant: a post-SiLU SwiGLU limit reaches only a table that declares it" {
