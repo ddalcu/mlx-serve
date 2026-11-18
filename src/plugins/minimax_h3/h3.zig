@@ -58,6 +58,7 @@ pub const temporalShape = geometry.temporalShape;
 pub const Config = geometry.Config;
 pub const TeConfig = geometry.TeConfig;
 pub const Geometry = geometry.Geometry;
+pub const TwoTime = geometry.TwoTime;
 pub const SpeedConfig = geometry.SpeedConfig;
 pub const resolveSpeed = geometry.resolveSpeed;
 pub const envStr = geometry.envStr;
@@ -1035,26 +1036,128 @@ fn denseLinear(x: mlx.mlx_array, w: mlx.mlx_array, bias: ?mlx.mlx_array, s: S) !
 
 // ── Weights ─────────────────────────────────────────────────────────────────
 
+/// A block linear: one weight, or a compressed DiT's factors `up(down(x))`, stored as `<p>.down` [rank, in] and
+/// `<p>.up` [out, rank].
+const Proj = union(enum) {
+    full: MfLinear,
+    low: struct { down: MfLinear, up: MfLinear },
+
+    fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, dt: mlx.mlx_dtype, s: S) !Proj {
+        const down_w = try std.fmt.allocPrint(a, "{s}.down.weight", .{prefix});
+        defer a.free(down_w);
+        const dw = w.get(down_w) orelse return .{ .full = try MfLinear.load(w, a, prefix, in_features, dt, s) };
+        const pd = try std.fmt.allocPrint(a, "{s}.down", .{prefix});
+        defer a.free(pd);
+        const pu = try std.fmt.allocPrint(a, "{s}.up", .{prefix});
+        defer a.free(pu);
+        var down = try MfLinear.load(w, a, pd, in_features, dt, s);
+        errdefer down.deinit();
+        return .{ .low = .{ .down = down, .up = try MfLinear.load(w, a, pu, @intCast(mlx.getShape(dw)[0]), dt, s) } };
+    }
+    fn forward(self: *const Proj, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        switch (self.*) {
+            .full => |*l| return l.forward(x, null, s),
+            .low => |*l| {
+                const h = try l.down.forward(x, null, s);
+                defer _ = mlx.mlx_array_free(h);
+                return l.up.forward(h, null, s);
+            },
+        }
+    }
+    fn toW8a8(self: *Proj, s: S) !void {
+        switch (self.*) {
+            .full => |*l| try l.toW8a8(s),
+            .low => |*l| {
+                try l.down.toW8a8(s);
+                try l.up.toW8a8(s);
+            },
+        }
+    }
+    fn deinit(self: *Proj) void {
+        switch (self.*) {
+            .full => |*l| l.deinit(),
+            .low => |*l| {
+                l.down.deinit();
+                l.up.deinit();
+            },
+        }
+    }
+};
+
+/// The Q/K/V projection: fused `qkv_proj` [3*inner, hidden], or `q_proj`/`k_proj`/`v_proj` apart (a compressed DiT
+/// factors them one by one); either way the output is [S, q | k | v].
+const Qkv = union(enum) {
+    fused: MfLinear,
+    split: [3]Proj,
+
+    fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !Qkv {
+        const fused_w = try std.fmt.allocPrint(a, "{s}.qkv_proj.weight", .{prefix});
+        defer a.free(fused_w);
+        if (w.get(fused_w) != null) {
+            const p = try std.fmt.allocPrint(a, "{s}.qkv_proj", .{prefix});
+            defer a.free(p);
+            return .{ .fused = try MfLinear.load(w, a, p, cfg.hidden_size, dt, s) };
+        }
+        var parts: [3]Proj = undefined;
+        var built: usize = 0;
+        errdefer for (parts[0..built]) |*p| p.deinit();
+        for ([_][]const u8{ "q", "k", "v" }, 0..) |name, i| {
+            const p = try std.fmt.allocPrint(a, "{s}.{s}_proj", .{ prefix, name });
+            defer a.free(p);
+            parts[i] = try Proj.load(w, a, p, cfg.hidden_size, dt, s);
+            built += 1;
+        }
+        return .{ .split = parts };
+    }
+    fn forward(self: *const Qkv, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        switch (self.*) {
+            .fused => |*l| return l.forward(x, null, s),
+            .split => |*parts| {
+                var outs: [3]mlx.mlx_array = undefined;
+                var built: usize = 0;
+                defer for (outs[0..built]) |o| {
+                    _ = mlx.mlx_array_free(o);
+                };
+                for (parts, 0..) |*p, i| {
+                    outs[i] = try p.forward(x, s);
+                    built += 1;
+                }
+                return concat(&outs, 1, s);
+            },
+        }
+    }
+    fn toW8a8(self: *Qkv, s: S) !void {
+        switch (self.*) {
+            .fused => |*l| try l.toW8a8(s),
+            .split => |*parts| for (parts) |*p| try p.toW8a8(s),
+        }
+    }
+    fn deinit(self: *Qkv) void {
+        switch (self.*) {
+            .fused => |*l| l.deinit(),
+            .split => |*parts| for (parts) |*p| p.deinit(),
+        }
+    }
+};
+
 const AttnW = struct {
-    qkv: MfLinear,
+    qkv: Qkv,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
-    out: MfLinear,
+    out: Proj,
     /// VSA students' `to_gate_compress` projection (FastH3 Omni).
     gate: ?MfLinear = null,
     qkv_lora: lora_mod.Slot = .{},
     out_lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !AttnW {
-        const qkv_p = try std.fmt.allocPrint(a, "{s}.qkv_proj", .{prefix});
-        defer a.free(qkv_p);
         const out_p = try std.fmt.allocPrint(a, "{s}.out_proj", .{prefix});
         defer a.free(out_p);
         var r: AttnW = .{
-            .qkv = try MfLinear.load(w, a, qkv_p, cfg.hidden_size, dt, s),
+            .qkv = try Qkv.load(w, a, prefix, cfg, dt, s),
             .q_norm = try ownWeightAs(w, a, prefix, ".q_norm.weight", dt, s),
             .k_norm = try ownWeightAs(w, a, prefix, ".k_norm.weight", dt, s),
-            .out = try MfLinear.load(w, a, out_p, cfg.innerDim(), dt, s),
+            .out = try Proj.load(w, a, out_p, cfg.innerDim(), dt, s),
         };
         errdefer r.deinit();
         const gate_p = try std.fmt.allocPrint(a, "{s}.to_gate_compress", .{prefix});
@@ -1079,8 +1182,8 @@ const AttnW = struct {
 };
 
 const MlpW = struct {
-    fc1: MfLinear, // [2*ffn, hidden] — gate and up FUSED
-    fc2: MfLinear,
+    fc1: Proj, // [2*ffn, hidden] — gate and up FUSED
+    fc2: Proj,
     fc1_lora: lora_mod.Slot = .{},
     fc2_lora: lora_mod.Slot = .{},
 
@@ -1090,8 +1193,8 @@ const MlpW = struct {
         const p2 = try std.fmt.allocPrint(a, "{s}.fc2", .{prefix});
         defer a.free(p2);
         var r: MlpW = .{
-            .fc1 = try MfLinear.load(w, a, p1, cfg.hidden_size, dt, s),
-            .fc2 = try MfLinear.load(w, a, p2, cfg.ffn_hidden_size, dt, s),
+            .fc1 = try Proj.load(w, a, p1, cfg.hidden_size, dt, s),
+            .fc2 = try Proj.load(w, a, p2, cfg.ffn_hidden_size, dt, s),
         };
         errdefer r.deinit();
         if (!ane.aneState().media_offload.video) {
@@ -1186,14 +1289,14 @@ fn aneRestFc2(ml: *const MfLinear, k: u32, s: S) !MfLinear {
 
 /// `k` is the TOTAL width the ANE units hold, out of `ffn`.
 fn aneBuildRest(mw: *const MlpW, k: u32, ffn: u32, s: S) !AneRestMlp {
-    const f2 = &mw.fc2;
+    const f2 = &mw.fc2.full;
     if (f2.group_size == 0 or k % f2.group_size != 0 or (k * f2.bits) % 32 != 0) return error.AneChanAlignment;
     const kk: c_int = @intCast(k);
     const ff: c_int = @intCast(ffn);
     var rest: AneRestMlp = undefined;
-    rest.gate = try aneRestHalf(&mw.fc1, kk, ff, s);
+    rest.gate = try aneRestHalf(&mw.fc1.full, kk, ff, s);
     errdefer rest.gate.deinit();
-    rest.up = try aneRestHalf(&mw.fc1, ff + kk, 2 * ff, s);
+    rest.up = try aneRestHalf(&mw.fc1.full, ff + kk, 2 * ff, s);
     errdefer rest.up.deinit();
     rest.fc2 = try aneRestFc2(f2, k, s);
     return rest;
@@ -1516,7 +1619,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     const h: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.attention_head_dim);
 
-    const qkv_base = try aw.qkv.forward(x, null, s);
+    const qkv_base = try aw.qkv.forward(x, s);
     const qkv = try lora_mod.addSlot(qkv_base, x, &aw.qkv_lora, s);
     defer _ = mlx.mlx_array_free(qkv);
     var t = try qkvHeadMajor(aw, qkv, cfg, rope, s);
@@ -1534,7 +1637,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
     if (w8a8.w8a8State().enabled and vsa == null and ablate == .none) if (try int8_attn.attention(t[0], t[1], t[2], scale, s)) |flat8| {
         defer _ = mlx.mlx_array_free(flat8);
-        const out8 = try aw.out.forward(flat8, null, s);
+        const out8 = try aw.out.forward(flat8, s);
         return lora_mod.addSlot(out8, flat8, &aw.out_lora, s);
     };
     if (vsa) |plan| {
@@ -1542,7 +1645,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
         defer _ = mlx.mlx_array_free(g);
         const flat_v = try h3_vsa.attend(plan, t[0], t[1], t[2], g, scale, s);
         defer _ = mlx.mlx_array_free(flat_v);
-        const out_v = try aw.out.forward(flat_v, null, s);
+        const out_v = try aw.out.forward(flat_v, s);
         return lora_mod.addSlot(out_v, flat_v, &aw.out_lora, s);
     }
     var attn: mlx.mlx_array = undefined;
@@ -1572,7 +1675,7 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     defer _ = mlx.mlx_array_free(bc);
     const flat = try reshape(bc, &[_]c_int{ n, h * hd }, s);
     defer _ = mlx.mlx_array_free(flat);
-    const out_base = try aw.out.forward(flat, null, s);
+    const out_base = try aw.out.forward(flat, s);
     return lora_mod.addSlot(out_base, flat, &aw.out_lora, s);
 }
 
@@ -1591,12 +1694,12 @@ fn swigluAct(y: mlx.mlx_array, s: S) !mlx.mlx_array {
 
 /// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
 fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const y_base = try mw.fc1.forward(x, null, s);
+    const y_base = try mw.fc1.forward(x, s);
     const y = try lora_mod.addSlot(y_base, x, &mw.fc1_lora, s);
     defer _ = mlx.mlx_array_free(y);
     const act = try swigluAct(y, s);
     defer _ = mlx.mlx_array_free(act);
-    const o_base = try mw.fc2.forward(act, null, s);
+    const o_base = try mw.fc2.forward(act, s);
     return lora_mod.addSlot(o_base, act, &mw.fc2_lora, s);
 }
 
@@ -1741,7 +1844,7 @@ pub const MAX_UNIQUE_T = 4;
 /// shifted one, and condition rows pin near 1 (they are re-injected clean every
 /// step, never denoised).
 pub const TimestepPlan = struct {
-    unique_t: [MAX_UNIQUE_T]f64,
+    unique_t: [MAX_UNIQUE_T]TimePair,
     n_unique: usize,
     runs: []ModRun,
     allocator: std.mem.Allocator,
@@ -1765,6 +1868,25 @@ pub const StepClock = struct {
     visual: f64 = VISUAL_COND_TIMESTEP,
     audio: f64 = AUDIO_COND_TIMESTEP,
     max_t: f64 = 1.0,
+    /// A two-time DiT's endpoint: the video sigma this step lands on. Null keeps every row's `r` at its `t`.
+    endpoint: ?f64 = null,
+};
+
+/// A row's modulation time: `t`, and the endpoint `r` a two-time DiT also embeds (`r == t` otherwise, and for the
+/// condition rows, which stay where they are).
+pub const TimePair = struct {
+    t: f64,
+    r: f64,
+
+    pub fn same(t: f64) TimePair {
+        return .{ .t = t, .r = t };
+    }
+    fn lessThan(_: void, a: TimePair, b: TimePair) bool {
+        return a.t < b.t or (a.t == b.t and a.r < b.r);
+    }
+    fn eql(a: TimePair, b: TimePair) bool {
+        return a.t == b.t and a.r == b.r;
+    }
 };
 
 pub fn buildTimestepPlan(
@@ -1777,12 +1899,16 @@ pub fn buildTimestepPlan(
 ) !TimestepPlan {
     const t_v = 1.0 - sigma_v;
     const t_a = 1.0 - aug.max_t * timeShiftSigma(sigma_v / aug.max_t, shift_v, shift_a);
+    const video: TimePair = if (aug.endpoint) |e| .{ .t = t_v, .r = 1.0 - e } else .same(t_v);
+    const audio: TimePair = if (aug.endpoint) |e| .{ .t = t_a, .r = 1.0 - aug.max_t * timeShiftSigma(e / aug.max_t, shift_v, shift_a) } else .same(t_a);
+    const vis_cond = TimePair.same(@max(t_v, aug.visual));
+    const aud_cond = TimePair.same(@max(t_a, aug.audio));
 
-    var uniq: [MAX_UNIQUE_T]f64 = undefined;
+    var uniq: [MAX_UNIQUE_T]TimePair = undefined;
     var n: usize = 0;
     const add = struct {
-        fn f(buf: *[MAX_UNIQUE_T]f64, cnt: *usize, v: f64) void {
-            for (buf[0..cnt.*]) |e| if (e == v) return;
+        fn f(buf: *[MAX_UNIQUE_T]TimePair, cnt: *usize, v: TimePair) void {
+            for (buf[0..cnt.*]) |e| if (e.eql(v)) return;
             buf[cnt.*] = v;
             cnt.* += 1;
         }
@@ -1795,15 +1921,15 @@ pub fn buildTimestepPlan(
         .ref_audio => has_aud_cond = true,
         else => {},
     };
-    add(&uniq, &n, t_v);
-    if (layout.audio_update.len > 0) add(&uniq, &n, t_a);
-    if (has_vis_cond) add(&uniq, &n, @max(t_v, aug.visual));
-    if (has_aud_cond) add(&uniq, &n, @max(t_a, aug.audio));
-    std.mem.sort(f64, uniq[0..n], {}, std.sort.asc(f64));
+    add(&uniq, &n, video);
+    if (layout.audio_update.len > 0) add(&uniq, &n, audio);
+    if (has_vis_cond) add(&uniq, &n, vis_cond);
+    if (has_aud_cond) add(&uniq, &n, aud_cond);
+    std.mem.sort(TimePair, uniq[0..n], {}, TimePair.lessThan);
 
     const rowOf = struct {
-        fn f(buf: []const f64, v: f64) u32 {
-            for (buf, 0..) |e, i| if (e == v) return @intCast(i);
+        fn f(buf: []const TimePair, v: TimePair) u32 {
+            for (buf, 0..) |e, i| if (e.eql(v)) return @intCast(i);
             unreachable;
         }
     }.f;
@@ -1818,10 +1944,10 @@ pub fn buildTimestepPlan(
     for (layout.segments) |seg| {
         if (seg.end == seg.start) continue; // an image layout's empty audio segment
         const t = switch (seg.kind) {
-            .text, .video => t_v,
-            .audio => t_a,
-            .cond, .ref_img => @max(t_v, aug.visual),
-            .ref_audio => @max(t_a, aug.audio),
+            .text, .video => video,
+            .audio => audio,
+            .cond, .ref_img => vis_cond,
+            .ref_audio => aud_cond,
         };
         // Row = t_row * modalities + tag. The `* 3` is the AdaLN reshape's
         // modality stride, not an arbitrary constant.
@@ -1915,7 +2041,7 @@ pub fn buildTimestepPlanGlobal(
     shift_v: f64,
     shift_a: f64,
     aug: StepClock,
-    global_ts: []const f64,
+    global_ts: []const TimePair,
 ) !TimestepPlan {
     var p = try buildTimestepPlan(allocator, layout, sigma_v, shift_v, shift_a, aug);
     errdefer p.deinit();
@@ -1923,7 +2049,7 @@ pub fn buildTimestepPlanGlobal(
         const t = p.unique_t[r.mod_row / 3];
         const tag = r.mod_row % 3;
         const gi = for (global_ts, 0..) |g, i| {
-            if (g == t) break i;
+            if (g.eql(t)) break i;
         } else return error.TimestepNotInSchedule;
         r.mod_row = @as(u32, @intCast(gi)) * 3 + tag;
     }
@@ -1933,6 +2059,7 @@ pub fn buildTimestepPlanGlobal(
 /// The union of every step's unique timesteps, sorted ascending — computed by
 /// running the SAME per-step plan arithmetic, so the f64s are bit-identical to
 /// what the sampling loop will look up.
+/// `sigmas` is the whole schedule (`steps + 1` points); `two_time` gives each step its endpoint, the next sigma.
 pub fn collectScheduleTs(
     allocator: std.mem.Allocator,
     layout: *const PackedLayout,
@@ -1940,21 +2067,24 @@ pub fn collectScheduleTs(
     shift_v: f64,
     shift_a: f64,
     aug: StepClock,
-) ![]f64 {
-    var list: std.ArrayList(f64) = .empty;
+    two_time: bool,
+) ![]TimePair {
+    var list: std.ArrayList(TimePair) = .empty;
     errdefer list.deinit(allocator);
-    for (sigmas) |sig| {
-        var p = try buildTimestepPlan(allocator, layout, sig, shift_v, shift_a, aug);
+    for (sigmas[0 .. sigmas.len - 1], sigmas[1..]) |sig, next| {
+        var clock = aug;
+        clock.endpoint = if (two_time) next else null;
+        var p = try buildTimestepPlan(allocator, layout, sig, shift_v, shift_a, clock);
         defer p.deinit();
         for (p.unique_t[0..p.n_unique]) |t| {
             const seen = for (list.items) |e| {
-                if (e == t) break true;
+                if (e.eql(t)) break true;
             } else false;
             if (!seen) try list.append(allocator, t);
         }
     }
     const out = try list.toOwnedSlice(allocator);
-    std.mem.sort(f64, out, {}, std.sort.asc(f64));
+    std.mem.sort(TimePair, out, {}, TimePair.lessThan);
     return out;
 }
 
@@ -2037,7 +2167,7 @@ pub fn attnBroadcastRefresh(i: usize, steps: u32, k: u32, after_skip: bool) bool
 /// AdaLN cost measured ~0 in the Phase-0 ladder.
 pub const AdalnTables = struct {
     allocator: std.mem.Allocator,
-    ts: []f64,
+    ts: []TimePair,
     blocks: [][6]mlx.mlx_array,
     final: [2]mlx.mlx_array,
 
@@ -2075,6 +2205,8 @@ pub const Model = struct {
     te_in_b: mlx.mlx_array,
     te_out_w: mlx.mlx_array,
     te_out_b: mlx.mlx_array,
+    /// A two-time DiT's `endpoint_time_embedder` (proj_in w, b, proj_out w, b), fp32 island; null for one time.
+    endpoint_embedder: ?[4]mlx.mlx_array,
     inv_freq: mlx.mlx_array,
 
     refiner: []RefinerBlockW,
@@ -2126,6 +2258,15 @@ pub const Model = struct {
         m.te_in_b = try ownWeightAs(w, allocator, "time_embedder.proj_in", ".bias", f32t, s);
         m.te_out_w = try ownWeightAs(w, allocator, "time_embedder.proj_out", ".weight", f32t, s);
         m.te_out_b = try ownWeightAs(w, allocator, "time_embedder.proj_out", ".bias", f32t, s);
+        m.endpoint_embedder = null;
+        // A gate without the embedder, or the embedder without a gate, would modulate every block from the wrong time.
+        if ((cfg.two_time_gate > 0) != (w.get("endpoint_time_embedder.proj_in.weight") != null)) return error.TwoTimeContractMismatch;
+        if (cfg.two_time_gate > 0) m.endpoint_embedder = .{
+            try ownWeightAs(w, allocator, "endpoint_time_embedder.proj_in", ".weight", f32t, s),
+            try ownWeightAs(w, allocator, "endpoint_time_embedder.proj_in", ".bias", f32t, s),
+            try ownWeightAs(w, allocator, "endpoint_time_embedder.proj_out", ".weight", f32t, s),
+            try ownWeightAs(w, allocator, "endpoint_time_embedder.proj_out", ".bias", f32t, s),
+        };
         m.inv_freq = try ownWeightAs(w, allocator, "rope", ".inv_freq", f32t, s);
 
         m.refiner = try allocator.alloc(RefinerBlockW, cfg.token_refiner_num_layers);
@@ -2163,6 +2304,9 @@ pub const Model = struct {
             self.video_out_b,    self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
         }) |a| _ = mlx.mlx_array_free(a);
         self.condition_proj.deinit();
+        if (self.endpoint_embedder) |ee| for (ee) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
         for (self.refiner) |*b| b.deinit();
         self.allocator.free(self.refiner);
         for (self.blocks) |*b| b.deinit();
@@ -2193,7 +2337,14 @@ pub const Model = struct {
         const lora_bound = for (self.blocks) |*b| {
             if (b.mlp.fc1_lora.active().len > 0 or b.mlp.fc2_lora.active().len > 0) break true;
         } else false;
-        const fc1 = &self.blocks[0].mlp.fc1;
+        const low_rank = for (self.blocks) |*b| {
+            if (b.mlp.fc1 != .full or b.mlp.fc2 != .full) break true;
+        } else false;
+        if (low_rank) {
+            log.warn("[ane] video offload declined: low-rank MLPs — GPU only\n", .{});
+            return;
+        }
+        const fc1 = &self.blocks[0].mlp.fc1.full;
         if (!aneBlockEligible(rows, fc1.quantized, lora_bound)) {
             log.warn("[ane] video offload declined: {d} rows (seq {d}), quantized={}, lora={} — GPU only\n", .{ rows, seq_len, fc1.quantized, lora_bound });
             return;
@@ -2230,9 +2381,9 @@ pub const Model = struct {
             rests[i] = try aneBuildRest(&b.mlp, k * units, ffn, s);
             built = i + 1;
             // fc1 is [2*ffn, hidden]: gate rows [0..ffn), up rows [ffn..2*ffn).
-            const fused = try aneDequantHostF32(a, &b.mlp.fc1, hidden, 2 * ffn, s);
+            const fused = try aneDequantHostF32(a, &b.mlp.fc1.full, hidden, 2 * ffn, s);
             defer a.free(fused);
-            const fc2 = try aneDequantHostF32(a, &b.mlp.fc2, ffn, hidden, s);
+            const fc2 = try aneDequantHostF32(a, &b.mlp.fc2.full, ffn, hidden, s);
             defer a.free(fc2);
             const up_base: usize = @as(usize, ffn) * hidden;
             for (0..units) |u| {
@@ -2281,17 +2432,29 @@ pub const Model = struct {
                 arr(v, l.scales);
                 arr(v, l.biases);
             }
+            fn proj(v: mlx.mlx_vector_array, p: *const Proj) void {
+                switch (p.*) {
+                    .full => |*l| lin(v, l),
+                    .low => |*l| {
+                        lin(v, &l.down);
+                        lin(v, &l.up);
+                    },
+                }
+            }
             fn at(v: mlx.mlx_vector_array, w: *const AttnW) void {
-                lin(v, &w.qkv);
+                switch (w.qkv) {
+                    .fused => |*l| lin(v, l),
+                    .split => |*parts| for (parts) |*p| proj(v, p),
+                }
                 arr(v, w.q_norm);
                 arr(v, w.k_norm);
-                lin(v, &w.out);
+                proj(v, &w.out);
                 lp(v, w.qkv_lora);
                 lp(v, w.out_lora);
             }
             fn ml(v: mlx.mlx_vector_array, w: *const MlpW) void {
-                lin(v, &w.fc1);
-                lin(v, &w.fc2);
+                proj(v, &w.fc1);
+                proj(v, &w.fc2);
                 lp(v, w.fc1_lora);
                 lp(v, w.fc2_lora);
             }
@@ -2414,7 +2577,7 @@ pub const Model = struct {
     /// NOT bit-identical to per-step modulation: the AdaLN GEMM runs at
     /// M = n_ts instead of M = 2-3, and kernel selection differs by shape
     /// (the sanctioned qmv-vs-qmm class).
-    pub fn precomputeAdaln(self: *Model, ts: []const f64, s: S) !void {
+    pub fn precomputeAdaln(self: *Model, ts: []const TimePair, s: S) !void {
         std.debug.assert(self.adaln_tables == null);
         const a = self.allocator;
         const t_emb32 = try self.timeEmbed(ts, s);
@@ -2451,7 +2614,7 @@ pub const Model = struct {
         self.final_adaln = null;
         _ = mlx.mlx_clear_cache();
 
-        const ts_copy = try a.dupe(f64, ts);
+        const ts_copy = try a.dupe(TimePair, ts);
         errdefer a.free(ts_copy);
         self.adaln_tables = .{ .allocator = a, .ts = ts_copy, .blocks = tables, .final = fmods };
     }
@@ -2460,26 +2623,42 @@ pub const Model = struct {
     /// The concat order is not cosmetic: swapping the halves silently shifts
     /// every modulation the model produces.
     /// `timeEmbed` in the model's dtype, as `forward` feeds the blocks.
-    pub fn timeEmbedAs(self: *const Model, t_vals: []const f64, s: S) !mlx.mlx_array {
-        const t32 = try self.timeEmbed(t_vals, s);
+    pub fn timeEmbedAs(self: *const Model, pairs: []const TimePair, s: S) !mlx.mlx_array {
+        const t32 = try self.timeEmbed(pairs, s);
         defer _ = mlx.mlx_array_free(t32);
         return astype(t32, self.dtype, s);
     }
 
-    fn timeEmbed(self: *const Model, t_vals: []const f64, s: S) !mlx.mlx_array {
+    /// A two-time DiT mixes in its endpoint embedder: `te(t) + gate * (ee(r) - te(t))`, fp32.
+    fn timeEmbed(self: *const Model, pairs: []const TimePair, s: S) !mlx.mlx_array {
+        const te = try self.embedTimes(pairs, false, self.te_in_w, self.te_in_b, self.te_out_w, self.te_out_b, s);
+        const ee = self.endpoint_embedder orelse return te;
+        defer _ = mlx.mlx_array_free(te);
+        const er = try self.embedTimes(pairs, true, ee[0], ee[1], ee[2], ee[3], s);
+        defer _ = mlx.mlx_array_free(er);
+        const d = try subA(er, te, s);
+        defer _ = mlx.mlx_array_free(d);
+        const g = try scalarLike(self.cfg.two_time_gate, d, s);
+        defer _ = mlx.mlx_array_free(g);
+        const gd = try mulA(d, g, s);
+        defer _ = mlx.mlx_array_free(gd);
+        return addA(te, gd, s);
+    }
+
+    fn embedTimes(self: *const Model, pairs: []const TimePair, endpoint: bool, w_in: mlx.mlx_array, b_in: mlx.mlx_array, w_out: mlx.mlx_array, b_out: mlx.mlx_array, s: S) !mlx.mlx_array {
         const half = self.cfg.timestep_input_dim / 2;
-        const m = t_vals.len;
+        const m = pairs.len;
         const buf = try self.allocator.alloc(f32, m * @as(usize, half) * 2);
         defer self.allocator.free(buf);
-        for (t_vals, 0..) |t, i| timestep_blk.sinusoid(f64, buf[i * half * 2 ..][0 .. half * 2], t, .cos_first);
+        for (pairs, 0..) |p, i| timestep_blk.sinusoid(f64, buf[i * half * 2 ..][0 .. half * 2], if (endpoint) p.r else p.t, .cos_first);
         const shape = [_]c_int{ @intCast(m), @intCast(half * 2) };
         const emb = mlx.mlx_array_new_data(buf.ptr, &shape, 2, mlx.mlx_dtype.float32);
         defer _ = mlx.mlx_array_free(emb);
-        const h1 = try denseLinear(emb, self.te_in_w, self.te_in_b, s);
+        const h1 = try denseLinear(emb, w_in, b_in, s);
         defer _ = mlx.mlx_array_free(h1);
         const a1 = try siluA(h1, s);
         defer _ = mlx.mlx_array_free(a1);
-        return denseLinear(a1, self.te_out_w, self.te_out_b, s);
+        return denseLinear(a1, w_out, b_out, s);
     }
 
     /// Qwen states [L, text_dim] -> refined [L, hidden].
@@ -3301,6 +3480,13 @@ fn causalMask(seq: c_int, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
 /// `sigmas[i] = shift*b / (1 + (shift-1)*b)` for `b = 1 - i/steps`, i.e. the
 /// base grid pushed through the same time shift the DiT inverts internally.
 /// Caller owns the returned slice (length steps+1, ending at 0).
+/// A trained raw grid shifted onto one modality's clock. Caller owns.
+pub fn gridSchedule(allocator: std.mem.Allocator, grid: []const f64, shift: f64) ![]f64 {
+    const out = try allocator.alloc(f64, grid.len);
+    for (out, grid) |*o, b| o.* = timeShiftSigma(b, 1.0, shift);
+    return out;
+}
+
 pub fn sigmaSchedule(allocator: std.mem.Allocator, steps: u32, shift: f64) ![]f64 {
     const out = try allocator.alloc(f64, steps + 1);
     errdefer allocator.free(out);
@@ -4247,9 +4433,18 @@ fn generateOne(
     defer _ = mlx.mlx_array_free(audio_x);
 
     const max_t: f64 = if (req.pdd) |p| p.max_t else 1.0;
-    const sigmas = if (req.pdd) |*p| try p.sigmas(allocator, req.shift_video) else try sigmaSchedule(allocator, req.steps, req.shift_video);
+    const two_time = req.geometry.two_time != null;
+    // Few-step samplers integrate the audio stream on its exact mapped clock (`audioStepFactor`).
+    const distilled = req.turbo or req.pdd != null or two_time;
+    const sigmas = if (req.pdd) |*p|
+        try p.sigmas(allocator, req.shift_video)
+    else if (req.geometry.two_time) |*tt|
+        try gridSchedule(allocator, tt.grid(req.steps) orelse return error.TwoTimeStepsUntrained, req.shift_video)
+    else
+        try sigmaSchedule(allocator, req.steps, req.shift_video);
     defer allocator.free(sigmas);
     if (req.pdd) |p| log.info("[minimax-h3] PDD student: {d} fused blocks over {d} heads, max_t {d}\n", .{ p.steps(), p.grid, p.max_t });
+    if (two_time) log.info("[minimax-h3] two-time DiT: {d} steps on its trained grid, gate {d}\n", .{ req.steps, req.geometry.dit.two_time_gate });
     // A PDD student starts at its first node's noise level, max_t on both clocks.
     if (req.pdd != null) {
         for ([_]*mlx.mlx_array{ &video_x, &audio_x }) |x| {
@@ -4308,7 +4503,7 @@ fn generateOne(
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
         if (req.resident == null) {
-            const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{ .max_t = max_t });
+            const ts = try collectScheduleTs(allocator, &layout, sigmas[0 .. req.steps + 1], req.shift_video, req.shift_audio, .{ .max_t = max_t }, two_time);
             defer allocator.free(ts);
             try model.precomputeAdaln(ts, s);
             log.info("[minimax-h3] adaln precomputed for {d} timesteps; 13B modulation weights released\n", .{ts.len});
@@ -4428,7 +4623,7 @@ fn generateOne(
                 const nv = try addA(video_x, stepv, s);
                 _ = mlx.mlx_array_free(video_x);
                 video_x = nv;
-                const askip = cachedAudioAdvance(req.turbo or req.pdd != null, sc_a_slope, sigma, sigmas[i + 1], max_t, req.shift_video, req.shift_audio);
+                const askip = cachedAudioAdvance(distilled, sc_a_slope, sigma, sigmas[i + 1], max_t, req.shift_video, req.shift_audio);
                 const da = try scalarLike(@floatCast(askip), sc_a.?, s);
                 defer _ = mlx.mlx_array_free(da);
                 const stepa = try mulA(sc_a.?, da, s);
@@ -4447,10 +4642,11 @@ fn generateOne(
                 log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
                 continue;
             }
+            const clock: StepClock = .{ .max_t = max_t, .endpoint = if (two_time) sigmas[i + 1] else null };
             var plan = if (model.adaln_tables) |tt|
-                try buildTimestepPlanGlobal(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{ .max_t = max_t }, tt.ts)
+                try buildTimestepPlanGlobal(allocator, &layout, sigma, req.shift_video, req.shift_audio, clock, tt.ts)
             else
-                try buildTimestepPlan(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{ .max_t = max_t });
+                try buildTimestepPlan(allocator, &layout, sigma, req.shift_video, req.shift_audio, clock);
             defer plan.deinit();
 
             // The forward consumes EVERY video-stream row in packed order:
@@ -4505,7 +4701,7 @@ fn generateOne(
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
 
-            const da = try scalarLike(@floatCast(max_t * audioStepFactor(req.turbo or req.pdd != null, unit, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio)), out.audio, s);
+            const da = try scalarLike(@floatCast(max_t * audioStepFactor(distilled, unit, sigmas[i + 1] / max_t, req.shift_video, req.shift_audio)), out.audio, s);
             defer _ = mlx.mlx_array_free(da);
             const stepa = try mulA(out.audio, da, s);
             defer _ = mlx.mlx_array_free(stepa);
@@ -5289,7 +5485,7 @@ test "minimax h3: timestep plan can index a GLOBAL schedule table" {
     // A global table containing the step's ts plus others, sorted.
     const t_v = 1.0 - sigma;
     const t_a = 1.0 - timeShiftSigma(sigma, 12.0, 3.0);
-    const global = [_]f64{ 0.1, t_a, 0.3, t_v, 0.9 };
+    const global = [_]TimePair{ .same(0.1), .same(t_a), .same(0.3), .same(t_v), .same(0.9) };
     var g = try buildTimestepPlanGlobal(a, &layout, sigma, 12.0, 3.0, .{}, &global);
     defer g.deinit();
 
@@ -5302,7 +5498,7 @@ test "minimax h3: timestep plan can index a GLOBAL schedule table" {
         const tag = lr.mod_row % 3;
         const local_t = local.unique_t[lr.mod_row / 3];
         try testing.expectEqual(tag, gr.mod_row % 3);
-        try testing.expectEqual(local_t, global[gr.mod_row / 3]);
+        try testing.expect(local_t.eql(global[gr.mod_row / 3]));
     }
 }
 
@@ -5312,12 +5508,12 @@ test "minimax h3: schedule t-set collects every step's unique timesteps" {
     defer layout.deinit();
     const sigmas = try sigmaSchedule(a, 4, 12.0);
     defer a.free(sigmas);
-    const ts = try collectScheduleTs(a, &layout, sigmas[0..4], 12.0, 3.0, .{});
+    const ts = try collectScheduleTs(a, &layout, sigmas, 12.0, 3.0, .{}, false);
     defer a.free(ts);
     // 4 steps x 2 timesteps (video, audio) minus the sigma=1 step, where both
     // schedules coincide at t=0: 7 distinct values, sorted ascending.
     try testing.expectEqual(@as(usize, 7), ts.len);
-    for (1..ts.len) |i| try testing.expect(ts[i] > ts[i - 1]);
+    for (1..ts.len) |i| try testing.expect(ts[i].t > ts[i - 1].t);
     // Every step's plan resolves inside the collected set.
     for (0..4) |i| {
         var p = try buildTimestepPlanGlobal(a, &layout, sigmas[i], 12.0, 3.0, .{}, ts);
@@ -5576,10 +5772,10 @@ test "minimax h3: the final layer reads the target's own timestep when the text 
     defer p.deinit();
     const t_v = 0.5;
     const t_a = 1.0 - timeShiftSigma(0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO);
-    try testing.expectEqual(t_v, p.unique_t[p.timestepRow(l.videoSegment())]);
-    try testing.expectEqual(t_a, p.unique_t[p.timestepRow(l.audioSegment())]);
+    try testing.expectEqual(t_v, p.unique_t[p.timestepRow(l.videoSegment())].t);
+    try testing.expectEqual(t_a, p.unique_t[p.timestepRow(l.audioSegment())].t);
     // The run at the segment's INDEX is the reference's, held at 0.999: not the target's clock.
-    try testing.expectEqual(VISUAL_COND_TIMESTEP, p.unique_t[p.runs[l.segments.len - 1].mod_row / 3]);
+    try testing.expectEqual(VISUAL_COND_TIMESTEP, p.unique_t[p.runs[l.segments.len - 1].mod_row / 3].t);
 }
 
 test "minimax h3: the timestep plan reads a PDD student's 0.999 clock" {
@@ -5592,7 +5788,7 @@ test "minimax h3: the timestep plan reads a PDD student's 0.999 clock" {
     defer plan.deinit();
     const t_a = 1.0 - p.sigmaAt(p.nodes[k], SIGMA_SHIFT_AUDIO);
     const found = for (plan.unique_t[0..plan.n_unique]) |t| {
-        if (@abs(t - t_a) < 1e-12) break true;
+        if (@abs(t.t - t_a) < 1e-12) break true;
     } else false;
     try testing.expect(found);
 }
@@ -6313,9 +6509,9 @@ test "minimax h3: timestep plan assigns modulation rows" {
     try testing.expectEqual(l1.segments.len, p1.runs.len);
     // unique_t is sorted ascending, and the audio schedule runs AHEAD of the
     // video one (sigma_a 0.2 < sigma_v 0.5 => t_a 0.8 > t_v 0.5).
-    try testing.expect(p1.unique_t[0] < p1.unique_t[1]);
-    try testing.expectApproxEqAbs(@as(f64, 0.5), p1.unique_t[0], 1e-12);
-    try testing.expectApproxEqAbs(@as(f64, 0.8), p1.unique_t[1], 1e-12);
+    try testing.expect(p1.unique_t[0].t < p1.unique_t[1].t);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), p1.unique_t[0].t, 1e-12);
+    try testing.expectApproxEqAbs(@as(f64, 0.8), p1.unique_t[1].t, 1e-12);
     // text (tag 1) and video (tag 0) share the video timestep row 0;
     // audio (tag 2) sits on row 1.
     try testing.expectEqual(@as(u32, 0 * 3 + 1), p1.runs[0].mod_row); // text
@@ -6329,7 +6525,7 @@ test "minimax h3: timestep plan assigns modulation rows" {
     var p2 = try buildTimestepPlan(a, &l2, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
     defer p2.deinit();
     try testing.expectEqual(@as(usize, 3), p2.n_unique);
-    try testing.expectApproxEqAbs(VISUAL_COND_TIMESTEP, p2.unique_t[2], 1e-12);
+    try testing.expectApproxEqAbs(VISUAL_COND_TIMESTEP, p2.unique_t[2].t, 1e-12);
     // The cond segment carries the VIDEO modality tag but the condition
     // timestep — mixing those up modulates clean rows as if they were noisy.
     const cond_run = p2.runs[1];
@@ -6527,8 +6723,8 @@ test "minimax h3: DiT block linears under w8a8 stay within their bar of the pack
         defer attn.deinit();
         var mlp_w = try MlpW.load(&w, a, "mlp", cfg, .bfloat16, s);
         defer mlp_w.deinit();
-        try testing.expectEqual(on, attn.qkv.w8 != null and mlp_w.fc1.w8 != null);
-        try testing.expect(attn.out.w8 == null and mlp_w.fc2.w8 == null);
+        try testing.expectEqual(on, attn.qkv.fused.w8 != null and mlp_w.fc1.full.w8 != null);
+        try testing.expect(attn.out.full.w8 == null and mlp_w.fc2.full.w8 == null);
         o[0] = try attnForward(&attn, x, cfg, rope, .none, null, null, s);
         o[1] = try mlpForward(&mlp_w, x, s);
         try mlx.check(mlx.mlx_array_eval(o[0]));
@@ -7264,10 +7460,10 @@ test "minimax h3: turbo lora — runtime bypass equals a W_eff-folded forward" {
     attn.out_lora.set(refs[1..2]);
     mlp_l.fc1_lora.set(refs[2..3]);
     mlp_l.fc2_lora.set(refs[3..4]);
-    try mk.fold(&attn_folded.qkv, refs[0], s);
-    try mk.fold(&attn_folded.out, refs[1], s);
-    try mk.fold(&mlp_folded.fc1, refs[2], s);
-    try mk.fold(&mlp_folded.fc2, refs[3], s);
+    try mk.fold(&attn_folded.qkv.fused, refs[0], s);
+    try mk.fold(&attn_folded.out.full, refs[1], s);
+    try mk.fold(&mlp_folded.fc1.full, refs[2], s);
+    try mk.fold(&mlp_folded.fc2.full, refs[3], s);
 
     const x = try ownWeight(&w, "x.attn_in");
     defer _ = mlx.mlx_array_free(x);
@@ -7481,5 +7677,304 @@ test "add_norm: fused gate + rmsnorm + modulation is bit-equal to modGate -> rms
         defer _ = mlx.mlx_array_free(got.normed);
         try expectBitEqual(got.normed, want, if (with_add) "gated norm+mod" else "norm+mod", s);
         if (with_add) try expectBitEqual(got.h, h1, "gated residual", s);
+    }
+}
+
+test "minimax h3: a two-time plan keys rows by (t, r), so video and audio stay apart where their t meet" {
+    const a = testing.allocator;
+    var l = try PackedLayout.init(a, 512, 17, 30, 54, 93, &.{.first}, 56);
+    defer l.deinit();
+    // Step 0: both clocks start at t = 0 but aim at different endpoints; the keyframe stays put (r == t).
+    const next = 0.98265594;
+    var p = try buildTimestepPlan(a, &l, 1.0, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .endpoint = next });
+    defer p.deinit();
+    try testing.expectEqual(@as(usize, 3), p.n_unique);
+    const video = p.unique_t[p.timestepRow(l.videoSegment())];
+    const audio = p.unique_t[p.timestepRow(l.audioSegment())];
+    const cond = p.unique_t[p.runs[1].mod_row / 3];
+    try testing.expectEqual(@as(f64, 0), video.t);
+    try testing.expectEqual(video.t, audio.t);
+    try testing.expectApproxEqAbs(1.0 - next, video.r, 1e-12);
+    try testing.expectApproxEqAbs(1.0 - timeShiftSigma(next, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO), audio.r, 1e-12);
+    try testing.expectEqual(cond.t, cond.r);
+    // Without an endpoint the same step has one row fewer: the base model's two streams share t = 0.
+    var q = try buildTimestepPlan(a, &l, 1.0, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+    defer q.deinit();
+    try testing.expectEqual(@as(usize, 2), q.n_unique);
+}
+
+test "minimax h3: a two-time FL2VA plan holds both keyframes at r == t over the whole trained grid" {
+    const a = testing.allocator;
+    var l = try PackedLayout.init(a, 64, 5, 8, 12, 17, &.{ .first, .last }, 17);
+    defer l.deinit();
+    const grid = [_]f64{ 1.0, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0 };
+    const sigmas = try gridSchedule(a, &grid, 12.0);
+    defer a.free(sigmas);
+    for (0..grid.len - 1) |i| {
+        var p = try buildTimestepPlan(a, &l, sigmas[i], 12.0, 3.0, .{ .endpoint = sigmas[i + 1] });
+        defer p.deinit();
+        const video = p.unique_t[p.timestepRow(l.videoSegment())];
+        try testing.expectApproxEqAbs(1.0 - sigmas[i + 1], video.r, 1e-12);
+        for (l.segments, p.runs) |seg, run| if (seg.kind == .cond) {
+            const c = p.unique_t[run.mod_row / 3];
+            try testing.expectEqual(c.t, c.r);
+            try testing.expectEqual(@max(1.0 - sigmas[i], VISUAL_COND_TIMESTEP), c.t);
+        };
+    }
+}
+
+test "minimax h3: a two-time schedule table holds every step's pairs and each step finds its own" {
+    const a = testing.allocator;
+    var l = try PackedLayout.init(a, 4, 2, 4, 4, 3, &.{}, 5);
+    defer l.deinit();
+    const grid = [_]f64{ 1.0, 0.825217, 0.471725, 0.147401, 0.049626, 0.015517, 0.0 };
+    const sigmas = try gridSchedule(a, &grid, 12.0);
+    defer a.free(sigmas);
+    try testing.expectApproxEqAbs(@as(f64, 0.98265594), sigmas[1], 1e-6);
+    const ts = try collectScheduleTs(a, &l, sigmas, 12.0, 3.0, .{}, true);
+    defer a.free(ts);
+    try testing.expectEqual(@as(usize, 12), ts.len);
+    for (0..6) |i| {
+        const clock: StepClock = .{ .endpoint = sigmas[i + 1] };
+        var local = try buildTimestepPlan(a, &l, sigmas[i], 12.0, 3.0, clock);
+        defer local.deinit();
+        var g = try buildTimestepPlanGlobal(a, &l, sigmas[i], 12.0, 3.0, clock, ts);
+        defer g.deinit();
+        for (local.runs, g.runs) |lr, gr| try testing.expect(local.unique_t[lr.mod_row / 3].eql(ts[gr.mod_row / 3]));
+    }
+}
+
+/// max |got - want| below `tol` of max |want|: GPU float32 matmuls round like TF32 on NAX parts.
+fn expectClose(got: mlx.mlx_array, want: mlx.mlx_array, tol: f32, s: S) !void {
+    const d = try subA(got, want, s);
+    defer _ = mlx.mlx_array_free(d);
+    var m = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m);
+    try mlx.check(mlx.mlx_abs(&m, d, s));
+    var mx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mx);
+    try mlx.check(mlx.mlx_max(&mx, m, false, s));
+    try mlx.check(mlx.mlx_array_eval(mx));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, mx));
+    var wa = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wa);
+    try mlx.check(mlx.mlx_abs(&wa, want, s));
+    var wm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wm);
+    try mlx.check(mlx.mlx_max(&wm, wa, false, s));
+    try mlx.check(mlx.mlx_array_eval(wm));
+    var top: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&top, wm));
+    try testing.expect(v <= tol * top);
+}
+
+/// x @ (q | k | v)^T with each factored weight multiplied out, as a dense reference.
+fn qkvDenseRef(w: *const Weights, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var parts: [3]mlx.mlx_array = undefined;
+    var built: usize = 0;
+    defer for (parts[0..built]) |p| {
+        _ = mlx.mlx_array_free(p);
+    };
+    for ([_][]const u8{ "attn.q_proj", "attn.k_proj", "attn.v_proj" }) |p| {
+        var buf: [64]u8 = undefined;
+        const wd = if (w.get(try std.fmt.bufPrint(&buf, "{s}.down.weight", .{p}))) |down| blk: {
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_matmul(&o, w.get(try std.fmt.bufPrint(&buf, "{s}.up.weight", .{p})).?, down, s));
+            break :blk o;
+        } else try contig(w.get(try std.fmt.bufPrint(&buf, "{s}.weight", .{p})).?, s);
+        defer _ = mlx.mlx_array_free(wd);
+        parts[built] = try denseLinear(x, wd, null, s);
+        built += 1;
+    }
+    return concat(&parts, 1, s);
+}
+
+test "minimax h3: split Q/K/V runs each projection, factored or not, and lands in q | k | v order" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const cfg = Config{ .hidden_size = 64, .num_attention_heads = 2, .attention_head_dim = 32 };
+    var w = model_mod.Weights.init(a);
+    defer w.deinit();
+    const shapes = [_]struct { name: []const u8, shape: [2]c_int }{
+        .{ .name = "attn.q_proj.down.weight", .shape = .{ 16, 64 } }, .{ .name = "attn.q_proj.up.weight", .shape = .{ 64, 16 } },
+        .{ .name = "attn.k_proj.weight", .shape = .{ 64, 64 } },
+        .{ .name = "attn.v_proj.down.weight", .shape = .{ 32, 64 } }, .{ .name = "attn.v_proj.up.weight", .shape = .{ 64, 32 } },
+    };
+    for (shapes, 0..) |e, i| try w.map.put(try a.dupe(u8, e.name), try randomNormal(&e.shape, 40 + i, .float32, s));
+    const x = try randomNormal(&[_]c_int{ 5, 64 }, 7, .float32, s);
+    defer _ = mlx.mlx_array_free(x);
+    // k dense, then k factored too.
+    for ([_]bool{ false, true }) |k_low| {
+        if (k_low) {
+            try w.map.put(try a.dupe(u8, "attn.k_proj.down.weight"), try randomNormal(&[_]c_int{ 8, 64 }, 50, .float32, s));
+            try w.map.put(try a.dupe(u8, "attn.k_proj.up.weight"), try randomNormal(&[_]c_int{ 64, 8 }, 51, .float32, s));
+        }
+        var qkv = try Qkv.load(&w, a, "attn", cfg, .float32, s);
+        defer qkv.deinit();
+        try testing.expect(qkv == .split and (qkv.split[1] == .low) == k_low);
+        const got = try qkv.forward(x, s);
+        defer _ = mlx.mlx_array_free(got);
+        const want = try qkvDenseRef(&w, x, s);
+        defer _ = mlx.mlx_array_free(want);
+        try expectClose(got, want, 1e-2, s);
+    }
+}
+
+test "minimax h3: a two-time embedding moves from te(t) toward the endpoint embedder's ee(r) by the gate" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    var m: Model = undefined;
+    m.allocator = a;
+    m.cfg = .{ .timestep_input_dim = 8, .time_embed_hidden_size = 6, .time_embed_dim = 4, .two_time_gate = 0.25 };
+    m.te_in_w = try randomNormal(&[_]c_int{ 6, 8 }, 1, .float32, s);
+    m.te_in_b = try randomNormal(&[_]c_int{6}, 2, .float32, s);
+    m.te_out_w = try randomNormal(&[_]c_int{ 4, 6 }, 3, .float32, s);
+    m.te_out_b = try randomNormal(&[_]c_int{4}, 4, .float32, s);
+    m.endpoint_embedder = .{
+        try randomNormal(&[_]c_int{ 6, 8 }, 5, .float32, s), try randomNormal(&[_]c_int{6}, 6, .float32, s),
+        try randomNormal(&[_]c_int{ 4, 6 }, 7, .float32, s), try randomNormal(&[_]c_int{4}, 8, .float32, s),
+    };
+    defer for ([_]mlx.mlx_array{ m.te_in_w, m.te_in_b, m.te_out_w, m.te_out_b } ++ m.endpoint_embedder.?) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    const pairs = [_]TimePair{ .{ .t = 0.0, .r = 0.017 }, .{ .t = 0.4, .r = 0.6 } };
+    const got = try m.timeEmbed(&pairs, s);
+    defer _ = mlx.mlx_array_free(got);
+    const ee = m.endpoint_embedder.?;
+    const te = try m.embedTimes(&pairs, false, m.te_in_w, m.te_in_b, m.te_out_w, m.te_out_b, s);
+    defer _ = mlx.mlx_array_free(te);
+    const er = try m.embedTimes(&pairs, true, ee[0], ee[1], ee[2], ee[3], s);
+    defer _ = mlx.mlx_array_free(er);
+    // 0.75 * te(t) + 0.25 * ee(r)
+    const g = try scalarLike(0.25, er, s);
+    defer _ = mlx.mlx_array_free(g);
+    const k = try scalarLike(0.75, te, s);
+    defer _ = mlx.mlx_array_free(k);
+    const ge = try mulA(er, g, s);
+    defer _ = mlx.mlx_array_free(ge);
+    const kt = try mulA(te, k, s);
+    defer _ = mlx.mlx_array_free(kt);
+    const want = try addA(ge, kt, s);
+    defer _ = mlx.mlx_array_free(want);
+    try expectClose(got, want, 1e-5, s);
+}
+
+// One DiT forward of a two-time pack against stable-diffusion.cpp's, on the reference's own inputs (written by
+// tests/dump_minimax_h3_flash_fixture.py from an sd.cpp tensor dump):
+//   MINIMAX_H3_DIR=<Flash pack> MINIMAX_H3_FLASH_FIXTURE=<fixture.safetensors> \
+//   zig build test -Doptimize=ReleaseFast -Dtest-filter="minimax h3 flash parity"
+test "minimax h3 flash parity: one DiT forward matches the stable-diffusion.cpp reference" {
+    const fix = envStr("MINIMAX_H3_FLASH_FIXTURE") orelse return error.SkipZigTest;
+    const dir = envStr("MINIMAX_H3_DIR") orelse return error.SkipZigTest;
+    log.enableStderr();
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+    var cbuf: [1 << 16]u8 = undefined;
+    const g = try @import("config.zig").geometry(a, try @import("../../sdk/media/config_fields.zig").read(io, &cbuf, dir, "config.json"));
+    var fw = try model_mod.loadWeightsSingleFile(a, fix);
+    defer fw.deinit();
+    const meta_a = try ownWeight(&fw, "meta");
+    defer _ = mlx.mlx_array_free(meta_a);
+    const meta = try copyArrayF32(a, meta_a, s);
+    defer a.free(meta);
+    const sigma: f64 = meta[0];
+    const next: f64 = meta[1];
+    const lt: u32 = @intFromFloat(meta[2]);
+    const lh: u32 = @intFromFloat(meta[3]);
+    const lw: u32 = @intFromFloat(meta[4]);
+    const at: u32 = @intFromFloat(meta[5]);
+    const frames: u32 = @intFromFloat(meta[6]);
+    const ctx32 = try ownWeight(&fw, "context");
+    defer _ = mlx.mlx_array_free(ctx32);
+    const ctx = try astype(ctx32, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(ctx);
+    const video_rows = try ownWeight(&fw, "video_rows");
+    defer _ = mlx.mlx_array_free(video_rows);
+    const audio_rows = try ownWeight(&fw, "audio_rows");
+    defer _ = mlx.mlx_array_free(audio_rows);
+
+    const dit = try std.fmt.allocPrint(a, "{s}/transformer.safetensors", .{dir});
+    defer a.free(dit);
+    var model = try loadDit(a, dit, g.dit, .bfloat16, s);
+    defer model.deinit();
+    // An FL2VA fixture carries its keyframes: `cond_rows` (their patch rows, as fed) and `keyframes` (0 = first, 1 = last).
+    var anchors: [2]KeyframeAnchor = undefined;
+    var n_kf: usize = 0;
+    if (fw.get("keyframes") != null) {
+        const kf_a = try ownWeight(&fw, "keyframes");
+        defer _ = mlx.mlx_array_free(kf_a);
+        const kf = try copyArrayF32(a, kf_a, s);
+        defer a.free(kf);
+        for (kf) |k| {
+            anchors[n_kf] = if (k == 0) .first else .last;
+            n_kf += 1;
+        }
+    }
+    const video_in = if (n_kf > 0) blk: {
+        const cond = try ownWeight(&fw, "cond_rows");
+        defer _ = mlx.mlx_array_free(cond);
+        break :blk try concat(&[_]mlx.mlx_array{ cond, video_rows }, 0, s);
+    } else video_rows;
+    defer if (n_kf > 0) {
+        _ = mlx.mlx_array_free(video_in);
+    };
+    var layout = try PackedLayout.init(a, @intCast(mlx.getShape(ctx)[0]), lt, lh, lw, at, anchors[0..n_kf], frames);
+    defer layout.deinit();
+    var tags: []u8 = &.{};
+    defer a.free(tags);
+    if (fw.get("text_tags") != null) {
+        const tags_a = try ownWeight(&fw, "text_tags");
+        defer _ = mlx.mlx_array_free(tags_a);
+        const t32 = try copyArrayF32(a, tags_a, s);
+        defer a.free(t32);
+        tags = try a.alloc(u8, t32.len);
+        for (t32, tags) |x, *t| t.* = @intFromFloat(x);
+        layout.text_tags = tags;
+    }
+    var plan = try buildTimestepPlan(a, &layout, sigma, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{ .endpoint = next });
+    defer plan.deinit();
+    const refined = try model.refineText(ctx, s);
+    defer _ = mlx.mlx_array_free(refined);
+    var rope = try buildRope(a, &layout, model.inv_freq, .bfloat16, s);
+    defer rope.deinit();
+    const slope = timeShiftSlope(sigma, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO);
+    var out = try model.forward(&layout, &plan, refined, video_in, audio_rows, rope, model.ownHeads(), slope, null, true, s);
+    defer out.deinit();
+    // Both return the sampler's direction (sd.cpp's flow output); ours carries the audio clock slope on top.
+    for ([_]struct { name: []const u8, got: mlx.mlx_array, scale: f32 }{
+        .{ .name = "video_v", .got = out.video, .scale = 1.0 },
+        .{ .name = "audio_v", .got = out.audio, .scale = @floatCast(1.0 / slope) },
+    }) |c| {
+        const want = try ownWeight(&fw, c.name);
+        defer _ = mlx.mlx_array_free(want);
+        const k = try scalarLike(c.scale, c.got, s);
+        defer _ = mlx.mlx_array_free(k);
+        const got = try mulA(c.got, k, s);
+        defer _ = mlx.mlx_array_free(got);
+        const g32 = try copyArrayF32(a, got, s);
+        defer a.free(g32);
+        const w32 = try copyArrayF32(a, want, s);
+        defer a.free(w32);
+        var max_err: f64 = 0;
+        var sum_err: f64 = 0;
+        var dot: f64 = 0;
+        var gg: f64 = 0;
+        var ww: f64 = 0;
+        for (g32, w32) |x, y| {
+            const e = @abs(@as(f64, x) - y);
+            max_err = @max(max_err, e);
+            sum_err += e;
+            dot += @as(f64, x) * y;
+            gg += @as(f64, x) * x;
+            ww += @as(f64, y) * y;
+        }
+        const n: f64 = @floatFromInt(g32.len);
+        const cos = dot / @sqrt(gg * ww);
+        std.debug.print("[flash-parity] {s}: max abs {d:.5} mean abs {d:.5} ref rms {d:.5} cos {d:.6} ({d} values)\n", .{ c.name, max_err, sum_err / n, @sqrt(ww / n), cos, g32.len });
+        try testing.expect(cos > 0.99);
     }
 }
