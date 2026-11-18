@@ -791,6 +791,9 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// demand jobs run (0 = demand idle).
             idle_busy: u32 = 0,
             preread: bool = true,
+            /// A range adopted from a lookahead record is copied into its rows in up to this many pieces, the pool's idle
+            /// workers taking some (`expert_io.Spec.adopt_pieces`; 0, one memcpy). Only who copies moves.
+            adopt_pieces: u32 = 0,
         };
 
         pub const Event = struct {
@@ -1173,7 +1176,7 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
                         la.budget == 0 or la.budget > expert_lookahead.max_budget) return error.InvalidOptions;
                     const page = std.heap.pageSize();
                     const record = spanOf(&bank.layers[widest]);
-                    spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy };
+                    spec = .{ .threads = @min(la.budget, 2), .slots = 2 * la.budget, .record_bytes = record, .chunk_bytes = expert_io.chunkBytes(la.chunks, record, page), .idle_busy = la.idle_busy, .adopt_pieces = la.adopt_pieces };
                     // A pre-read range is the record's gate/up span or its down span,
                     // back to back, each no larger than a staging buffer.
                     if (la.preread) for (bank.layers) |l| {
@@ -3881,6 +3884,11 @@ pub fn StreamOf(comptime B: type, comptime probed: bool) type {
             /// the read pool's demand-first order for the reads from here on (`expert_io.Pool.demandFirst`).
             pub fn demandFirst(self: *Stream, mode: u32) void {
                 self.pool.demandFirst(mode);
+            }
+            /// Since the pool's start (`Lookahead.adopt_pieces`): adopted ranges copied in pieces, and the pieces a worker
+            /// other than the adopting one copied.
+            pub fn adoptStats(self: *const Stream) [2]i64 {
+                return .{ self.pool.counter(.adopt_split), self.pool.counter(.adopt_helped) };
             }
 
             pub fn stats(self: *Stream) Stats {

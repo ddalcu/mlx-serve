@@ -148,6 +148,14 @@ DSV41_LOOKAHEAD2 pool (2026-09-25, q3-lookahead2-20260925.md): lookahead/q3_look
  *   then read the stock way).  A record whose pieces are all taken while others still read it is released by its
  *   speculative thread; its last reader lands it.  Exact: the same file bytes into the same staging and the same rows;
  *   only which thread reads a piece, and when.  Counters of its own (q3ld_df_stats, DF_*): SC_N stays.
+ *
+ * ADOPT PIECES: q3ld_adopt_pieces(n), on a STOPPED pool.  With n >= 2 a demand range adopted from a speculative record
+ *   copies its bytes into its rows in up to n pieces (each at least CP_PIECE_MIN, CP_ALIGN aligned) instead of one
+ *   memcpy: the adopting worker posts the copy (cp_post), workers with no job queued take pieces of it ahead of the
+ *   pre-ranges (cp_pick, cp_run), and the adopting worker copies the pieces left itself, then waits for the pieces others
+ *   are copying (cp_own) before it drops the record's `readers` and publishes the range.  The record is held for every
+ *   piece, so no piece reads a reissued slot; a copy too short for two pieces is the one memcpy.  Exact: the same bytes
+ *   into the same rows; only which threads copy them.  0 or 1: the one memcpy.  Counters SC_ADOPT_SPLIT, SC_ADOPT_HELPED.
  */
 #include <errno.h>
 #include <mach/mach_time.h>
@@ -257,6 +265,9 @@ enum {
     SC_SPLIT_PRE_ISSUED,  /* half pre-ranges queued */
     SC_SPLIT_SPAN_NS,     /* the split tickets' spans: the earlier half's start to the later half's end */
     SC_SPLIT_OVERLAP_NS,  /* the time both halves of a ticket were in flight at once */
+    /* ADOPT PIECES (q3ld_adopt_pieces) */
+    SC_ADOPT_SPLIT,       /* adopted ranges copied in pieces */
+    SC_ADOPT_HELPED,      /* ... pieces a worker other than the adopting one copied */
     SC_N
 };
 
@@ -548,8 +559,22 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
     do { r = preadv(fd, iov, n, off); } while (r < 0 && errno == EINTR);   /* code 1: EINTR retried inside */
     return r;
 }
+/* ADOPT PIECES: a sleep before each piece copied (any copier), so a test sees idle workers take pieces */
+static int64_t cp_delay_ns = 0;
+void q3ld_test_copy_delay(int64_t ns) {
+    pthread_mutex_lock(&mu);
+    cp_delay_ns = ns;
+    pthread_mutex_unlock(&mu);
+}
+static void cp_delay(void) {
+    pthread_mutex_lock(&mu);
+    const int64_t d = cp_delay_ns;
+    pthread_mutex_unlock(&mu);
+    if (d > 0) sleep_ns(d);
+}
 #define RANGE_DELAY() range_delay()
 #define SPEC_DELAY() spec_delay()
+#define CP_DELAY() cp_delay()
 #define EV(kind, arg) ev((kind), (arg))
 #define SPEC_HOLD(s) spec_hold_wait(s)
 #define SPEC_MAY_START(s) (spec_hold != 0 || (s)->state != SP_QUEUED)
@@ -562,6 +587,7 @@ static ssize_t do_preadv(int fd, const struct iovec *iov, int n, off_t off) {
 }
 #define RANGE_DELAY() ((void)0)
 #define SPEC_DELAY() ((void)0)
+#define CP_DELAY() ((void)0)
 #define EV(kind, arg) ((void)0)
 #define SPEC_HOLD(s) ((void)0)
 #define SPEC_MAY_START(s) 1
@@ -1124,6 +1150,103 @@ static int df_help(spec_t *s, int64_t off, int64_t total) {
     return 1;
 }
 
+/* ---------------------------------------------------------------- ADOPT PIECES: an adopted range's copy in pieces */
+#define CP_PIECE_MIN ((int64_t)1 << 20)
+#define CP_ALIGN ((int64_t)64 << 10)
+typedef struct {
+    int live;
+    const char *src;          /* the range's bytes in the record's staging (held by the adopter's `readers`) */
+    const range_t *rg;        /* its rows: ndst parts back to back */
+    int64_t total, piece;
+    int32_t npieces, next, busy;
+} cp_task_t;
+static int adopt_pieces = 0;                 /* q3ld_adopt_pieces: pieces a copy (0 or 1: the one memcpy) */
+static cp_task_t cp_tasks[MAX_WORKERS];      /* at most one live task an adopting worker */
+static pthread_cond_t cp_cv = PTHREAD_COND_INITIALIZER;   /* a piece another worker copied ended */
+
+/* bytes [a, b) of the range's parts taken back to back, from src into their rows */
+static void cp_span(const char *src, const range_t *rg, int64_t a, int64_t b) {
+    int64_t at = 0;
+    for (int32_t d = 0; d < rg->ndst && at < b; d++) {
+        const int64_t len = rg->len[d];
+        const int64_t lo = a > at ? a : at, hi = b < at + len ? b : at + len;
+        if (hi > lo) memcpy((char *)(uintptr_t)rg->dst[d] + (lo - at), src + lo, (size_t)(hi - lo));
+        at += len;
+    }
+}
+
+/* piece k of task t (no lock: a live task's fields stay put until its adopting worker ends it) */
+static void cp_piece(const cp_task_t *t, int32_t k) {
+    const int64_t a = (int64_t)k * t->piece;
+    const int64_t b = a + t->piece < t->total ? a + t->piece : t->total;
+    CP_DELAY();
+    cp_span(t->src, t->rg, a, b);
+}
+
+/* the adopting worker's copy as a task of pieces, or -1 (too short for two pieces, or no task slot: the caller copies it
+ * whole); wakes the idle workers (caller holds mu) */
+static int cp_post(const char *src, const range_t *rg, int64_t total) {
+    int64_t piece = (total + adopt_pieces - 1) / adopt_pieces;
+    piece = (piece + CP_ALIGN - 1) / CP_ALIGN * CP_ALIGN;
+    if (piece < CP_PIECE_MIN) piece = CP_PIECE_MIN;
+    const int64_t np = (total + piece - 1) / piece;
+    if (np < 2) return -1;
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        cp_task_t *t = &cp_tasks[i];
+        if (t->live) continue;
+        t->live = 1;
+        t->src = src;
+        t->rg = rg;
+        t->total = total;
+        t->piece = piece;
+        t->npieces = (int32_t)np;
+        t->next = 0;
+        t->busy = 0;
+        sc[SC_ADOPT_SPLIT] += 1;
+        pthread_cond_broadcast(&work_cv);
+        return i;
+    }
+    return -1;
+}
+
+/* the adopting worker: the task's pieces left, then the wait for the pieces others copy; ends the task.  Takes mu and
+ * returns without it: once it returns no thread reads the record's bytes for this range. */
+static void cp_own(int ci) {
+    cp_task_t *t = &cp_tasks[ci];
+    pthread_mutex_lock(&mu);
+    while (t->next < t->npieces) {
+        const int32_t k = t->next++;
+        pthread_mutex_unlock(&mu);
+        cp_piece(t, k);
+        pthread_mutex_lock(&mu);
+    }
+    while (t->busy > 0) pthread_cond_wait(&cp_cv, &mu);
+    t->live = 0;
+    pthread_mutex_unlock(&mu);
+}
+
+/* a live task with a piece left, or -1 (caller holds mu) */
+static int cp_pick(void) {
+    if (adopt_pieces < 2) return -1;
+    for (int i = 0; i < MAX_WORKERS; i++) {
+        if (cp_tasks[i].live && cp_tasks[i].next < cp_tasks[i].npieces) return i;
+    }
+    return -1;
+}
+
+/* an idle worker copies one piece of task ci (caller holds mu; drops it for the copy) */
+static void cp_run(int ci) {
+    cp_task_t *t = &cp_tasks[ci];
+    const int32_t k = t->next++;
+    t->busy += 1;
+    pthread_mutex_unlock(&mu);
+    cp_piece(t, k);
+    pthread_mutex_lock(&mu);
+    t->busy -= 1;
+    sc[SC_ADOPT_HELPED] += 1;
+    pthread_cond_broadcast(&cp_cv);
+}
+
 /* ---------------------------------------------------------------- speculative: demand-side adoption */
 /* Serve one demand range from a speculative record.  Returns -1 when no record serves it (the caller reads
  * it the stock way), else the range status (ST_OK, or ST_DEADLINE when the deadline passed while waiting). */
@@ -1173,11 +1296,17 @@ static int try_adopt(const job_t *job, const range_t *rg, int64_t *out) {
     if (waited) sc[SC_ADOPT_WAIT_NS] += q3ld_monotonic_ns() - t0;
     EV(5, rg->offset);
     const char *src = s->buf + (s->base - s->aligned) + (rg->offset - s->base);
+    /* ADOPT PIECES: the copy in pieces, idle workers taking some; cp_own returns once every piece landed (-1: one memcpy) */
+    const int ci = adopt_pieces > 1 ? cp_post(src, rg, total) : -1;
     pthread_mutex_unlock(&mu);
     int64_t t_start = q3ld_monotonic_ns();
-    for (int32_t d = 0; d < rg->ndst; d++) {
-        if (rg->len[d]) memcpy((char *)(uintptr_t)rg->dst[d], src, (size_t)rg->len[d]);
-        src += rg->len[d];
+    if (ci >= 0) {
+        cp_own(ci);
+    } else {
+        for (int32_t d = 0; d < rg->ndst; d++) {
+            if (rg->len[d]) memcpy((char *)(uintptr_t)rg->dst[d], src, (size_t)rg->len[d]);
+            src += rg->len[d];
+        }
     }
     pthread_mutex_lock(&mu);
     s->readers -= 1;
@@ -1354,9 +1483,14 @@ static void *worker(void *arg) {
     char *stage = staging[w];
     for (;;) {
         pthread_mutex_lock(&mu);
-        int pi = -1;
-        while (!stopping && qlen == 0 && (pi = pre_pick()) < 0) pthread_cond_wait(&work_cv, &mu);
+        int pi = -1, ci = -1;
+        while (!stopping && qlen == 0 && (ci = cp_pick()) < 0 && (pi = pre_pick()) < 0) pthread_cond_wait(&work_cv, &mu);
         if (qlen == 0 && stopping) { pthread_mutex_unlock(&mu); return 0; }
+        if (qlen == 0 && ci >= 0) {                   /* ADOPT PIECES: no job queued -> a piece of an adopted copy */
+            cp_run(ci);
+            pthread_mutex_unlock(&mu);
+            continue;
+        }
         if (qlen == 0 && pi >= 0) {                   /* PRE: no job queued -> the oldest pre-range */
             run_pre(pi, w, stage);
             pthread_mutex_unlock(&mu);
@@ -1755,6 +1889,7 @@ int q3ld_start(int32_t nw, const uint64_t *staging_ptrs, int64_t sbytes, int64_t
     gu_split = 0;                                     /* GU SPLIT: a new pool reads ranges whole until told */
     demand_first = 0;                                 /* DEMAND FIRST: the lane's rule until told */
     memset(df_stats, 0, sizeof(df_stats));
+    memset(cp_tasks, 0, sizeof(cp_tasks));            /* ADOPT PIECES: no copy live */
     res = res_arr; nt = n_tickets; logbuf = log_arr; logn = n_log; gauge = gauge_arr;
     staging_bytes = sbytes; page_size = psize;
     __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); busy = 0; seq = 0;
@@ -2273,6 +2408,7 @@ int q3ld_stop(void) {
     }
     running = 0; nworkers = 0; nspec_started = 0; __atomic_store_n(&stopping, 0, __ATOMIC_RELAXED); nspec = 0; nspec_threads = 0; spec_configured = 0;
     spec_idle_busy = SPEC_MAX_DEMAND_BUSY;
+    adopt_pieces = 0;
     direct_reads = 0;
     parts_block = 0;
     parts_live = 1;
@@ -2651,7 +2787,17 @@ int32_t q3ld_df_stats(int64_t *out, int32_t n) {
     return DF_N;
 }
 
-int32_t q3ld_abi(void) { return 2026110203; }              /* df1: DEMAND FIRST (q3ld_demand_first, q3ld_df_stats); 2026110202 dq1b: GU SPLIT (q3ld_gu_split, the SC_SPLIT_* counters), RES_W 10 (dq1a's lookahead flags and wait); 2026110101 PARTS route; 2026102401 SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
+/* ADOPT PIECES: an adopted range's copy in up to n pieces (n >= 2; 0 or 1: the one memcpy), on a STOPPED pool (the
+ * ADOPT PIECES paragraph above).  Returns 0 or -1. */
+int q3ld_adopt_pieces(int32_t n) {
+    pthread_mutex_lock(&mu);
+    if (running || n < 0 || n > MAX_WORKERS) { pthread_mutex_unlock(&mu); return -1; }
+    adopt_pieces = n;
+    pthread_mutex_unlock(&mu);
+    return 0;
+}
+
+int32_t q3ld_abi(void) { return 2026111801; }              /* ADOPT PIECES (q3ld_adopt_pieces, SC_ADOPT_SPLIT, SC_ADOPT_HELPED); 2026110203 df1: DEMAND FIRST (q3ld_demand_first, q3ld_df_stats); 2026110202 dq1b: GU SPLIT (q3ld_gu_split, the SC_SPLIT_* counters), RES_W 10 (dq1a's lookahead flags and wait); 2026110101 PARTS route; 2026102401 SCATTER ranges; 2026101401 DIRECT as a construction route; 2026101201 WITHDRAW over range jobs; 2026101101 range jobs, 2026101001 WITHDRAW, EXL3_LANE_PORT 2026092704, original 2026092504 */
 int32_t q3ld_max_gates(void) { return MAX_GATES; }
 int32_t q3ld_max_gate_tickets(void) { return MAX_GATE_TICKETS; }
 int32_t q3ld_max_pre(void) { return MAX_PRE; }

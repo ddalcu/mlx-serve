@@ -1685,3 +1685,55 @@ test "glm io: with direct reads every range lands straight in its rows (aligned 
     try testing.expectEqual(@as(i64, 2 * n), pool.counter(.direct_ranges));
     try testing.expectEqual(@as(i64, 2), pool.result(first + 1).preadv_calls);
 }
+
+// The adopted copy in pieces (`Spec.adopt_pieces`): a record whose gate/up range is four pieces of a little over 1 MiB at
+// four pieces a copy, its down range too short for two (one memcpy).
+const ap_lens = [n_components]u64{ 1 << 20, 1 << 20, 1 << 20, 1 << 20, 100, 200, 3000, 200, 100 };
+const ap_gu_len = 4 * (1 << 20) + 300;
+const ap_rec_len = ap_gu_len + 3300;
+
+fn apSpec(pieces: u32) Spec {
+    return .{ .threads = 1, .slots = 2, .record_bytes = ap_rec_len, .chunk_bytes = chunkBytes(4, ap_rec_len, std.heap.pageSize()), .adopt_pieces = pieces };
+}
+
+test "io adopt pieces: a range adopted in pieces lands the file's bytes as the one memcpy does, idle workers copying some; the setting's bounds" {
+    const page = std.heap.pageSize();
+    var f = try PatternFile.init(std.mem.alignForward(usize, 3 * page + 100 + ap_rec_len, page) + page);
+    defer f.deinit();
+    const base: u64 = 3 * page + 100;
+    defer c.q3ld_test_copy_delay(0);
+    for ([_]u32{ 0, 4 }) |pieces| {
+        // a sleep before each piece, so the idle workers are seen taking some
+        const delay: i64 = if (pieces > 1) 30 * std.time.ns_per_ms else 0;
+        c.q3ld_test_copy_delay(delay);
+        const pool = try Pool.start(testing.allocator, .{ .workers = 4, .staging_bytes = 4 * page, .tickets = 128, .spec = apSpec(pieces) });
+        defer pool.stop();
+        try testing.expectEqual(@as(u32, 1), try pool.specStep(f.ufd, 1, &.{@intCast(base)}, ap_rec_len));
+        try waitFor(@as(i64, @intCast(base)), landedAt);
+        const d = try Dests.init(1, &ap_lens);
+        defer testing.allocator.free(d.buf);
+        const first = try R96.submit(pool, f.ufd, &.{base}, &.{base + ap_gu_len}, d.rows[0..1], &ap_lens);
+        try pool.wait(first, 2, 10 * std.time.ns_per_s);
+        try d.expectRecord(0, f.image, base, base + ap_gu_len, &ap_lens);
+        for (0..2) |k| {
+            const r = pool.result(first + @as(u32, @intCast(k)));
+            try testing.expectEqual(Status.ok, r.status);
+            try testing.expectEqual(@as(i64, 0), r.preadv_calls);
+        }
+        try testing.expectEqual(@as(i64, 2), pool.counter(.adopt_ranges));
+        if (pieces == 0) {
+            try testing.expectEqual(@as(i64, 0), pool.counter(.adopt_split));
+            try testing.expectEqual(@as(i64, 0), pool.counter(.adopt_helped));
+        } else {
+            try testing.expectEqual(@as(i64, 1), pool.counter(.adopt_split));
+            const helped = pool.counter(.adopt_helped);
+            try testing.expect(helped >= 1 and helped <= 4);
+        }
+    }
+    // At most `max_workers` pieces, set on a stopped pool only.
+    try testing.expectError(error.InvalidOptions, Pool.start(testing.allocator, .{ .workers = 4, .staging_bytes = 4 * page, .tickets = 128, .spec = apSpec(io.max_workers + 1) }));
+    for ([_]i32{ -1, io.max_workers + 1 }) |n| try testing.expectEqual(@as(c_int, -1), c.q3ld_adopt_pieces(n));
+    const running = try Pool.start(testing.allocator, .{ .workers = 4, .staging_bytes = 4 * page, .tickets = 128, .spec = apSpec(2) });
+    defer running.stop();
+    try testing.expectEqual(@as(c_int, -1), c.q3ld_adopt_pieces(0));
+}
