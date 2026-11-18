@@ -117,14 +117,27 @@ pub const Calibration = struct {
 };
 
 /// What a plain round costs, learned from the plain rounds themselves and nothing else: slowly, and by at
-/// most a quarter per sample, so a stall or a foreign GPU job cannot pose as the machine's speed.
+/// most a quarter per sample, so a stall or a foreign GPU job cannot pose as the machine's speed. With
+/// `seed_samples` the first samples replace the prior (another model on another machine) whatever they read,
+/// keeping the fastest, since a stall only reads slower.
 pub const PlainCost = struct {
+    /// DSpark's: learned from the first three plain rounds on this machine.
+    pub const seeded: PlainCost = .{ .seed_samples = 3 };
+
     ms: f32 = PRIOR_PLAIN_MS,
+    seed_samples: u32 = 0,
+    measured: u32 = 0,
 
     pub fn sample(self: *PlainCost, ms: f32) void {
         if (!std.math.isFinite(ms) or ms <= 0) return;
+        if (self.measured < self.seed_samples) return self.seed(ms);
         const bounded = std.math.clamp(ms, self.ms * 0.8, self.ms * 1.25);
         self.ms += 0.1 * (bounded - self.ms);
+    }
+
+    fn seed(self: *PlainCost, ms: f32) void {
+        self.ms = if (self.measured == 0) ms else @min(self.ms, ms);
+        self.measured += 1;
     }
 };
 
@@ -153,6 +166,16 @@ pub const CopyStats = struct {
         const c = class(suffix);
         self.hit[c] = self.hit[c] * KEEP + @as(f32, @floatFromInt(accepted));
         self.tries[c] = self.tries[c] * KEEP + @as(f32, @floatFromInt(@min(accepted + 1, drafts)));
+    }
+
+    /// Verify rows (t1 included) for a copy of up to `avail` drafts: each priced at this match's survival
+    /// against the verify ladder scaled to `plain_ms`.
+    pub fn rowsFor(self: *const CopyStats, suffix: u32, avail: usize, plain_ms: f32) u32 {
+        var p: [MAX_DRAFTS]f32 = undefined;
+        const n = @min(avail, p.len);
+        @memset(p[0..n], self.probability(suffix));
+        const costs = priorCosts(plain_ms);
+        return chooseRows(p[0..n], &costs).rows;
     }
 };
 
@@ -439,6 +462,63 @@ test "PlainCost: a stall moves it little, a steady new speed is reached" {
     var slower = PlainCost{};
     for (0..80) |_| slower.sample(22.0);
     try testing.expect(slower.ms > 21.0 and slower.ms <= 22.0);
+}
+
+test "PlainCost: unseeded (DFlash) keeps the prior and walks from it, whatever the first samples read" {
+    var c = PlainCost{};
+    for (0..3) |_| c.sample(13.0);
+    try testing.expect(c.ms > 16.5 and c.ms < PRIOR_PLAIN_MS);
+    var slow = PlainCost{};
+    for (0..3) |_| slow.sample(120.0);
+    try testing.expect(slow.ms < 20.0);
+    var ref = PlainCost{};
+    var walked: f32 = PRIOR_PLAIN_MS;
+    for ([_]f32{ 400, 13.0, 13.5, 14.0 }) |ms| {
+        ref.sample(ms);
+        walked += 0.1 * (std.math.clamp(ms, walked * 0.8, walked * 1.25) - walked);
+        try approx(ref.ms, walked);
+    }
+}
+
+test "PlainCost.seeded (DSpark): the first samples replace the prior, the fastest of them kept" {
+    var c = PlainCost.seeded;
+    c.sample(13.0);
+    try approx(c.ms, 13.0);
+    c.sample(19.0); // a slow tick among the seeds
+    c.sample(12.2);
+    try approx(c.ms, 12.2);
+    c.sample(30.0); // seeded: back to the slow, bounded walk
+    try testing.expect(c.ms > 12.2 and c.ms < 12.6);
+    var stalled = PlainCost.seeded;
+    for ([_]f32{ 400, 13.0, 13.5 }) |ms| stalled.sample(ms);
+    try approx(stalled.ms, 13.0);
+}
+
+test "PlainCost.seeded (DSpark): a machine far slower than the prior is learned" {
+    var c = PlainCost.seeded;
+    for (0..80) |_| c.sample(120.0);
+    try approx(c.ms, 120.0);
+}
+
+test "Drafting: a slow round moves the average wall by its full share" {
+    var d = Drafting{};
+    for (0..4) |_| d.record(30, 20);
+    d.record(30, 2000);
+    try approx(d.wall, 20 + 0.3 * 1980);
+    try testing.expect(!d.shouldDraft());
+}
+
+test "CopyStats.rowsFor: the rows chooseRows picks for a flat survival, t1 alone when the match has failed" {
+    const c = CopyStats{};
+    const costs = priorCosts(17.7);
+    const p: [8]f32 = @splat(c.probability(20));
+    try testing.expectEqual(chooseRows(&p, &costs).rows, c.rowsFor(20, 8, 17.7));
+    try testing.expect(c.rowsFor(20, 8, 17.7) > 1);
+    try testing.expectEqual(@as(u32, 1), c.rowsFor(20, 0, 17.7));
+    var failing = CopyStats{};
+    for (0..40) |_| failing.observe(20, 8, 0);
+    try testing.expectEqual(@as(u32, 1), failing.rowsFor(20, 8, 17.7));
+    try testing.expectEqual(c.rowsFor(20, MAX_DRAFTS, 17.7), c.rowsFor(20, 100, 17.7));
 }
 
 test "CopyStats: a strong match starts trusted, and misses teach it otherwise" {

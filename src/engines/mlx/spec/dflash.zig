@@ -806,12 +806,9 @@ pub fn dflashCopyRound(self: *Generator, allocator: std.mem.Allocator, t1: u32, 
     const idx = try self.mtpLookupIndex(allocator);
     const found = idx.matchBest(t1, DFLASH_COPY_MAX) orelse return null;
     if (found.suffix < mtp_lookup.MIN_SUFFIX or found.draft.len == 0) return null;
-    var p: [dflash_policy.MAX_DRAFTS]f32 = undefined;
-    const avail: usize = @min(found.draft.len, p.len, @as(usize, self.max_tokens -| self.completion_tokens -| 1));
+    const avail: usize = @min(found.draft.len, DFLASH_COPY_MAX, @as(usize, self.max_tokens -| self.completion_tokens -| 1));
     if (avail == 0) return null;
-    @memset(p[0..avail], pol.copy.probability(found.suffix));
-    const costs = dflash_policy.priorCosts(pol.plain.ms);
-    const rows = self.dflashRowsFor(p[0..avail], &costs);
+    const rows = pinnedRows(pol, avail) orelse pol.copy.rowsFor(found.suffix, avail, pol.plain.ms);
     if (rows < 2) return null;
     const m: u32 = rows - 1;
     var ids: [dflash_policy.MAX_DRAFTS]i32 = undefined;
@@ -1045,8 +1042,13 @@ pub fn dflashPlainMs(self: *const Generator) f32 {
 /// Rows to verify (t1 included) for drafts with acceptance probabilities `p`: the pin, else the best tokens per ms.
 pub fn dflashRowsFor(self: *const Generator, p: []const f32, costs: *const dflash_policy.Costs) u32 {
     const pol = &self.dflash_pol.?;
-    if (pol.pin_rows > 0) return @min(pol.pin_rows, @as(u32, @intCast(p.len)) + 1);
-    return dflash_policy.chooseRows(p, costs).rows;
+    return pinnedRows(pol, p.len) orelse dflash_policy.chooseRows(p, costs).rows;
+}
+
+/// The pinned row count (t1 included) for a round with `drafts` drafts, or null when the policy chooses.
+fn pinnedRows(pol: *const DflashPol, drafts: usize) ?u32 {
+    if (pol.pin_rows == 0) return null;
+    return @min(pol.pin_rows, @as(u32, @intCast(drafts)) + 1);
 }
 
 /// Rows to verify (t1 included) for a draft whose per-position confidence the selector reports.
