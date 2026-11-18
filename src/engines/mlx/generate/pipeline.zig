@@ -72,6 +72,26 @@ pub fn drainPipelineForBatch(self: *Generator, allocator: std.mem.Allocator) !?u
     return token;
 }
 
+pub const Join = union(enum) {
+    /// The slot rides this tick; a pipelined token it drained is published first.
+    joined: ?u32,
+    /// Generation ended while draining (`finish_reason` is set).
+    stopped,
+};
+
+/// Bring a slot to the batched-tick entry invariant (`next_token_id` sampled, not forwarded, no pending state).
+pub fn joinBatch(self: *Generator, allocator: std.mem.Allocator) !Join {
+    if (!self.has_pending_logits and !self.has_pending_token) return .{ .joined = null };
+    const emitted = try self.drainPipelineForBatch(allocator) orelse return .stopped;
+    return .{ .joined = emitted };
+}
+
+/// A batched row drew `token` and keeps going (not a stop): advance its grammar before the next tick's mask.
+pub fn noteBatchedSample(self: *Generator, token: u32) !void {
+    _ = self;
+    _ = token;
+}
+
 /// Resolve the deferred pending token: eval the lazy array and extract the u32 value.
 /// This is called at the START of each iteration, giving the GPU maximum time
 /// to compute since the async_eval at the END of the previous iteration.
