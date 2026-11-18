@@ -269,7 +269,10 @@ fn diagFind(list: []const u8, token: []const u8, out: []u8) ?[*:0]const u8 {
         if (std.mem.eql(u8, item, token)) return "1";
         if (item.len > token.len and item[token.len] == '=' and std.mem.startsWith(u8, item, token)) {
             const v = item[token.len + 1 ..];
-            const len = @min(v.len, diag_value_max);
+            if (out.len == 0) return null;
+            // `out` is the caller's buffer: a value wider than it is cut to what it holds, and to what a diag token
+            // promises to carry.
+            const len = @min(v.len, @min(diag_value_max, out.len - 1));
             @memcpy(out[0..len], v[0..len]);
             out[len] = 0;
             return out[0..len :0].ptr;
@@ -852,6 +855,9 @@ test "MLX_SERVE_DIAG: a bare token reads 1, token=value reads the value, a prefi
     try testing.expectEqualStrings("1", std.mem.span(diagFind(list, "step-trace", &buf).?));
     try testing.expectEqualStrings("/tmp/g", std.mem.span(diagFind(list, "decode-graph-dump", &buf).?));
     try testing.expectEqualStrings("", std.mem.span(diagFind(list, "empty", &buf).?));
+    // A value wider than the caller's buffer is cut to what it holds, never written past it.
+    var small: [4]u8 = undefined;
+    try testing.expectEqualStrings("/tm", std.mem.span(diagFind(list, "decode-graph-dump", &small).?));
     try testing.expect(diagFind(list, "step", &buf) == null);
     try testing.expect(diagFind(list, "decode-graph", &buf) == null);
     try testing.expect(diagFind("", "step-trace", &buf) == null);

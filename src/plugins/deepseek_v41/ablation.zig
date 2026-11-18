@@ -287,6 +287,12 @@ pub const StreamTap = struct {
     }
 };
 
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
+fn WindowsPid() u64 {
+    return GetCurrentProcessId();
+}
+
 /// The per-process half of a tap record's name: two writes in one microsecond (or a clock stepped back) still take
 /// distinct names.
 var tap_tie: std.atomic.Value(u64) = .init(0);
@@ -312,9 +318,10 @@ pub fn writeTapRecord(gpa: std.mem.Allocator, dir: []const u8, file_bytes: []con
         .{ .exclusive = true, .permissions = .fromMode(0o600) };
     var name_buf: [80]u8 = undefined;
     var stem_buf: [64]u8 = undefined;
-    // `std.c.pid_t` is a HANDLE (a pointer) on Windows, so it formats as a number only through its address.
+    // `std.c.pid_t` is a HANDLE on Windows but the CRT's getpid returns an int, so the Windows pid comes from
+    // kernel32; elsewhere the CRT pid is an int and formats as one.
     const pid: u64 = switch (builtin.os.tag) {
-        .windows => @intFromPtr(std.c.getpid()),
+        .windows => WindowsPid(),
         else => @intCast(std.c.getpid()),
     };
     // The stamp and the counter separate this process's writes, but the pid is per namespace (two containers sharing the
