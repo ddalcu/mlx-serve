@@ -36,6 +36,17 @@ pub const Opts = struct {
     experts_affine: ?u32 = null,
 };
 
+pub const DraftOpts = struct {
+    /// The DSpark stages' routed experts (the release has 128).
+    experts: u32 = 128,
+    vocab: u32 = 129280,
+    /// Committed positions the stages' windows hold.
+    ctx: usize = 1024,
+    act: mlx.mlx_dtype = .bfloat16,
+    /// This rank's slice of the stages and its rows of the heads, the draft sharded (`InitOpts.draft_shard`).
+    tp: ?Shard = null,
+};
+
 pub const Fixture = struct {
     gpa: std.mem.Allocator,
     m: *dsv41.Dsv41Model,
@@ -72,12 +83,87 @@ pub const Fixture = struct {
         return fx;
     }
 
-    /// Every tensor `Shard.axis` names cut to `t`'s part of its axis, in a buffer of its own.
+    /// A whole-model host at the release's shapes holding only the embedding, head and DSpark stages (the trunk's
+    /// layers are empty), its state at `ctx` positions with random rows in every stage's window ring: what a draft runs
+    /// on. With `tp` it is that rank of a sharded draft, its weights cut as the loader cuts them.
+    pub fn initDraft(gpa: std.mem.Allocator, opts: DraftOpts) !*Fixture {
+        const fx = try gpa.create(Fixture);
+        errdefer gpa.destroy(fx);
+        var cfg = try releaseConfig();
+        cfg.dsv41_dspark_experts = opts.experts;
+        cfg.vocab_size = opts.vocab;
+        cfg.dsv4_dspark_noise_token_id = @min(cfg.dsv4_dspark_noise_token_id, opts.vocab - 1);
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = 1 };
+        errdefer fx.w.deinit();
+        try fx.putDraftHeads(&cfg);
+        for (0..cfg.dsparkStages()) |si| try fx.putLayer(&cfg, "mtp.{d}.", si, opts.experts, true, null);
+        if (opts.tp) |t| try fx.sliceShard(.{ .rank = t.rank, .size = t.size, .stages = true });
+        const holds_nothing: dsv41.Pair = .{ .lo = 0, .hi = cfg.num_hidden_layers, .worker = false };
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .pair = holds_nothing, .act = opts.act, .dspark = true, .head_8bit = true, .tp = opts.tp, .draft_shard = opts.tp != null });
+        errdefer fx.m.deinit();
+        fx.m.dec.deinit();
+        fx.m.dec_state = try dsv41.initState(fx.m, gpa);
+        try fx.fillWindows(fx.state(), opts.ctx);
+        return fx;
+    }
+
+    /// Rank `tp` of a whole model at the release's widths, two trunk layers deep over a small vocabulary (its
+    /// embedding, head and final norm; no Engram, no DSpark), with no state yet: what a tensor group's decode runs on.
+    pub fn initWhole(gpa: std.mem.Allocator, tp: Shard) !*Fixture {
+        const layers = 2;
+        const experts = 8;
+        const fx = try gpa.create(Fixture);
+        errdefer gpa.destroy(fx);
+        var cfg = try releaseConfig();
+        cfg.num_experts = experts;
+        cfg.num_hidden_layers = layers;
+        cfg.vocab_size = 1024;
+        cfg.dsv41_n_engram_layers = 0;
+        fx.* = .{ .gpa = gpa, .m = undefined, .w = resident.Weights.init(gpa), .seed = 1 };
+        errdefer fx.w.deinit();
+        const d: c_int = @intCast(cfg.hidden_size);
+        const v: c_int = @intCast(cfg.vocab_size);
+        try fx.putVec("embed.weight", .{}, &.{ v, d }, .bfloat16, 0, 1);
+        try fx.putVec("head.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.05);
+        try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        for (0..layers) |li| try fx.putLayer(&cfg, "layers.{d}.", li, experts, true, null);
+        try fx.sliceShard(tp);
+        fx.m = try dsv41.init(gpa, &cfg, &fx.w, mlx.gpuStream(), .{ .tp = tp });
+        return fx;
+    }
+
+    /// `st` at `n` committed positions, random rows in every stage's window ring.
+    pub fn fillWindows(fx: *Fixture, st: *dsv41.State, n: usize) !void {
+        st.n = n;
+        for (st.ds) |*ring| {
+            _ = mlx.mlx_array_free(ring.buf);
+            ring.buf = try fx.normal(&.{ @intCast(ring.cap), @intCast(ring.width) }, fx.m.act, 0, 1);
+        }
+    }
+
+    fn putDraftHeads(fx: *Fixture, c: *const config.Config) !void {
+        const d: c_int = @intCast(c.hidden_size);
+        const v: c_int = @intCast(c.vocab_size);
+        const rank: c_int = @intCast(c.dsv4_dspark_markov_rank);
+        const targets: c_int = @intCast(c.dsv4_n_dspark_target_layers);
+        const last = c.dsparkStages() - 1;
+        try fx.putVec("embed.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.02);
+        try fx.putVec("head.weight", .{}, &.{ v, d }, .bfloat16, 0, 0.02);
+        try fx.putVec("norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putVec("mtp.0.main_proj.weight", .{}, &.{ d, targets * d }, .bfloat16, 0, 0.02);
+        try fx.putVec("mtp.0.main_norm.weight", .{}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putVec("mtp.{d}.norm.weight", .{last}, &.{d}, .bfloat16, 1, 0.1);
+        try fx.putVec("mtp.{d}.markov_head.embed.weight", .{last}, &.{ v, rank }, .bfloat16, 0, 0.5);
+        try fx.putVec("mtp.{d}.markov_head.head.weight", .{last}, &.{ v, rank }, .bfloat16, 0, 0.5);
+        try fx.putVec("mtp.{d}.confidence_head.proj.weight", .{last}, &.{ 1, d + rank }, .bfloat16, 0, 0.02);
+    }
+
+    /// Every tensor `t.axisOf` names cut to `t`'s part of its axis, in a buffer of its own.
     fn sliceShard(fx: *Fixture, t: Shard) !void {
         const s = mlx.gpuStream();
         var it = fx.w.map.iterator();
         while (it.next()) |kv| {
-            const axis = Shard.axis(kv.key_ptr.*) orelse continue;
+            const axis = t.axisOf(kv.key_ptr.*) orelse continue;
             const shape = mlx.getShape(kv.value_ptr.*);
             const ax = axis.of(shape.len);
             const part: c_int = @divExact(shape[ax], @as(c_int, @intCast(t.size)));
@@ -376,7 +462,35 @@ test "dsv41 tensor parallel: two ranks on half the heads and experts, summing ea
         defer in.deinit();
         const want = try streamOf(gpa, whole, in);
         defer gpa.free(want);
-        const got = try tpStream(gpa, base, in);
+        const got = try tpStream(gpa, base, in, 2);
+        defer gpa.free(got);
+        var peak: f32 = 0;
+        for (want) |v| peak = @max(peak, @abs(v));
+        try std.testing.expect(peak > 0);
+        for (want, got) |u, v| try std.testing.expect(@abs(u - v) <= tol * peak);
+    }
+}
+
+test "dist N-rank: four ranks on a quarter of the heads and experts, summing each attention and MoE, give the whole model's stream" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const base: Opts = .{ .lo = 20, .hi = 22, .experts = 8, .ctx = 0, .act = .float32, .experts_fp4 = true };
+    const whole = try Fixture.init(gpa, base);
+    defer whole.deinit();
+    var quarter = base;
+    quarter.tp = .{ .rank = 3, .size = 4 };
+    const rank3 = try Fixture.init(gpa, quarter);
+    defer rank3.deinit();
+    try std.testing.expectEqual(whole.m.cfg.num_attention_heads / 4, rank3.m.cfg.num_attention_heads);
+    try std.testing.expectEqual(whole.m.cfg.dsv4_o_groups / 4, rank3.m.cfg.dsv4_o_groups);
+    try std.testing.expectEqual(whole.m.cfg.moe_intermediate_size / 4, rank3.m.cfg.moe_intermediate_size);
+    const tol: f32 = if (device.naxAvailable()) 1e-2 else 1e-3;
+    for ([_]usize{ 1, dsv41.region_rows + 9 }) |rows| {
+        const in = try Input.of(whole, rows);
+        defer in.deinit();
+        const want = try streamOf(gpa, whole, in);
+        defer gpa.free(want);
+        const got = try tpStream(gpa, base, in, 4);
         defer gpa.free(got);
         var peak: f32 = 0;
         for (want) |v| peak = @max(peak, @abs(v));
@@ -409,11 +523,11 @@ test "dsv41 tensor parallel: the ranks on the fused decode kernels decode no fur
             defer gpa.free(c);
             o = base;
             o.fused = true;
-            const g = try tpStream(gpa, o, in);
+            const g = try tpStream(gpa, o, in, 2);
             defer gpa.free(g);
             if (seed == 1) {
                 // The kernels ran: the ranks on the chain alone land elsewhere.
-                const g_chain = try tpStream(gpa, base, in);
+                const g_chain = try tpStream(gpa, base, in, 2);
                 defer gpa.free(g_chain);
                 try std.testing.expect(!std.mem.eql(f32, g, g_chain));
             }
@@ -691,60 +805,27 @@ fn streamOf(gpa: std.mem.Allocator, fx: *Fixture, in: Input) ![]f32 {
     return dsv41.hostF32(out[0]);
 }
 
-/// The stream two tensor ranks built from `base` reach over `in` (caller frees). One process cannot run
-/// the ranks in lockstep: each pass runs one rank against the other's partials from its latest pass, and a sum depends
-/// only on the sums before it, so passes fix them one by one; the last pass changes none.
-fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input) ![]f32 {
-    var ranks: [2]*Fixture = undefined;
+/// The stream `n` tensor ranks built from `base` reach over `in`, each on its 1/n of the heads and experts (caller
+/// frees), their sums met by `Group`'s fixed point.
+fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input, n: usize) ![]f32 {
+    var ranks: [Group.max]*Fixture = undefined;
     var made: usize = 0;
     defer for (ranks[0..made]) |r| r.deinit();
-    for (&ranks, 0..) |*r, i| {
+    for (ranks[0..n], 0..) |*r, i| {
         var o = base;
-        o.tp = .{ .rank = @intCast(i), .size = 2 };
+        o.tp = .{ .rank = @intCast(i), .size = @intCast(n) };
         r.* = try Fixture.init(gpa, o);
         made += 1;
     }
-    const Sums = struct {
-        var rank: usize = 0;
-        var parts: [2]std.ArrayList(A) = .{ .empty, .empty };
-        var prev: [2]std.ArrayList(A) = .{ .empty, .empty };
-        fn sum(x: A) anyerror!A {
-            try mlx.check(mlx.mlx_array_eval(x));
-            var kept = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&kept, x);
-            const k = parts[rank].items.len;
-            try parts[rank].append(std.testing.allocator, kept);
-            const other = &parts[1 - rank];
-            var out = mlx.mlx_array_new();
-            if (k < other.items.len) try mlx.check(mlx.mlx_add(&out, x, other.items[k], mlx.gpuStream())) else _ = mlx.mlx_array_set(&out, x);
-            return out;
-        }
-        fn clear(l: *std.ArrayList(A)) void {
-            for (l.items) |a| _ = mlx.mlx_array_free(a);
-            l.clearRetainingCapacity();
-        }
-    };
-    dsv41.clusterHooks().tp_sum = &Sums.sum;
-    defer {
-        dsv41.clusterHooks().tp_sum = null;
-        for (&Sums.parts, &Sums.prev) |*a, *b| {
-            Sums.clear(a);
-            Sums.clear(b);
-            a.deinit(gpa);
-            b.deinit(gpa);
-            a.* = .empty;
-            b.* = .empty;
-        }
-    }
-    var got: [2][]f32 = .{ &.{}, &.{} };
+    Group.join(n);
+    defer Group.leave();
+    var got: [Group.max][]f32 = @splat(&.{});
     defer for (got) |g| gpa.free(g);
     // A pass fixes at least one more sum; the last pass changes none. A wide chunk sums each span's attention.
     const spans = (@as(usize, @intCast(mlx.getShape(in.x)[0])) + dsv41.SPAN - 1) / dsv41.SPAN;
     const sums = (spans + 1) * (base.hi - base.lo);
-    for (0..sums + 2) |_| for (0..2) |r| {
-        Sums.clear(&Sums.prev[r]);
-        std.mem.swap(std.ArrayList(A), &Sums.prev[r], &Sums.parts[r]);
-        Sums.rank = r;
+    for (0..sums + 2) |_| for (0..n) |r| {
+        Group.begin(r);
         const out = try in.step(gpa, ranks[r].m);
         defer for (out) |a| {
             _ = mlx.mlx_array_free(a);
@@ -753,23 +834,12 @@ fn tpStream(gpa: std.mem.Allocator, base: Opts, in: Input) ![]f32 {
         got[r] = &.{};
         got[r] = try dsv41.hostF32(out[0]);
     };
-    for (Sums.parts, Sums.prev) |now, before| {
-        try std.testing.expectEqual(sums, now.items.len);
-        for (now.items, before.items) |a, b| {
-            const u = try dsv41.hostF32(a);
-            defer gpa.free(u);
-            const v = try dsv41.hostF32(b);
-            defer gpa.free(v);
-            try std.testing.expectEqualSlices(f32, u, v);
-        }
-    }
-    try std.testing.expectEqualSlices(f32, got[0], got[1]);
-    // The ranks' caches come off the same summed stream through whole KV weights: rank 0's snapshot is the worker's.
-    for (ranks[0].m.dec_state.?.layers, ranks[1].m.dec_state.?.layers) |a, b| {
-        try expectSameArray(gpa, a.win.buf, b.win.buf);
-        if (a.comp) |r| try expectSameArray(gpa, r.buf, b.comp.?.buf);
-        if (a.idx_k) |r| try expectSameArray(gpa, r.buf, b.idx_k.?.buf);
-        if (a.pend_kv.ctx != null) try expectSameArray(gpa, a.pend_kv, b.pend_kv);
+    for (0..n) |r| try std.testing.expectEqual(sums, Group.parts[r].items.len);
+    try Group.expectSettled();
+    for (1..n) |r| {
+        try std.testing.expectEqualSlices(f32, got[0], got[r]);
+        // The ranks' caches come off the same summed stream through whole KV weights: rank 0's snapshot is every worker's.
+        try expectSameCaches(gpa, ranks[0].m, ranks[r].m);
     }
     const out = got[0];
     got[0] = &.{};
@@ -784,4 +854,376 @@ fn expectSameArray(gpa: std.mem.Allocator, a: A, b: A) !void {
     const v = try dsv41.hostF32(b);
     defer gpa.free(v);
     try std.testing.expectEqualSlices(f32, u, v);
+}
+
+fn expectSameCaches(gpa: std.mem.Allocator, a: *const dsv41.Dsv41Model, b: *const dsv41.Dsv41Model) !void {
+    for (a.dec_state.?.layers, b.dec_state.?.layers) |x, y| {
+        try expectSameArray(gpa, x.win.buf, y.win.buf);
+        if (x.comp) |c| try expectSameArray(gpa, c.buf, y.comp.?.buf);
+        if (x.idx_k) |c| try expectSameArray(gpa, c.buf, y.idx_k.?.buf);
+        if (x.pend_kv.ctx != null) try expectSameArray(gpa, x.pend_kv, y.pend_kv);
+    }
+}
+
+/// `m`'s caches as f32, layer by layer (caller frees with `freeF32s`).
+fn cachesOf(gpa: std.mem.Allocator, m: *const dsv41.Dsv41Model) ![][]f32 {
+    var out: std.ArrayList([]f32) = .empty;
+    errdefer {
+        for (out.items) |x| gpa.free(x);
+        out.deinit(gpa);
+    }
+    for (m.dec_state.?.layers) |ls| {
+        try out.append(gpa, try dsv41.hostF32(ls.win.buf));
+        if (ls.comp) |c| try out.append(gpa, try dsv41.hostF32(c.buf));
+        if (ls.idx_k) |c| try out.append(gpa, try dsv41.hostF32(c.buf));
+        if (ls.pend_kv.ctx != null) try out.append(gpa, try dsv41.hostF32(ls.pend_kv));
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+fn freeF32s(gpa: std.mem.Allocator, xs: [][]f32) void {
+    for (xs) |x| gpa.free(x);
+    gpa.free(xs);
+}
+
+fn expectSameF32s(a: []const []f32, b: []const []f32) !void {
+    try std.testing.expectEqual(a.len, b.len);
+    for (a, b) |x, y| try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(x), std.mem.sliceAsBytes(y));
+}
+
+/// Tensor ranks in one process: a collective meets the other ranks' parts from their latest run of the same program,
+/// and each pass reruns every rank's whole program until no part changes (a part depends only on those before it, so a
+/// pass fixes at least one more). A part not yet shaped as the caller's stands as zeros. Sums add in rank order, as
+/// every rank sums, so the ranks agree to the bit.
+pub const Group = struct {
+    pub const max = 4;
+    const Call = struct { gather: bool, shape: [8]c_int = @splat(0), ndim: usize, dtype: mlx.mlx_dtype };
+    var rank: usize = 0;
+    var size: usize = max;
+    var parts: [max]std.ArrayList(A) = @splat(.empty);
+    var prev: [max]std.ArrayList(A) = @splat(.empty);
+    var calls: [max]std.ArrayList(Call) = @splat(.empty);
+
+    pub fn join(n: usize) void {
+        size = n;
+        dsv41.clusterHooks().tp_sum = &sum;
+        dsv41.clusterHooks().tp_gather = &gather;
+    }
+
+    pub fn leave() void {
+        dsv41.clusterHooks().tp_sum = null;
+        dsv41.clusterHooks().tp_gather = null;
+        for (&parts, &prev, &calls) |*a, *b, *c| {
+            clear(a);
+            clear(b);
+            a.deinit(std.testing.allocator);
+            b.deinit(std.testing.allocator);
+            c.deinit(std.testing.allocator);
+            a.* = .empty;
+            b.* = .empty;
+            c.* = .empty;
+        }
+    }
+
+    /// Rank `r` starts its program again.
+    pub fn begin(r: usize) void {
+        rank = r;
+        clear(&prev[r]);
+        std.mem.swap(std.ArrayList(A), &prev[r], &parts[r]);
+        calls[r].clearRetainingCapacity();
+    }
+
+    fn clear(l: *std.ArrayList(A)) void {
+        for (l.items) |a| _ = mlx.mlx_array_free(a);
+        l.clearRetainingCapacity();
+    }
+
+    fn keep(x: A, is_gather: bool) !usize {
+        try mlx.check(mlx.mlx_array_eval(x));
+        var kept = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&kept, x);
+        try parts[rank].append(std.testing.allocator, kept);
+        const sh = mlx.getShape(x);
+        var c: Call = .{ .gather = is_gather, .ndim = sh.len, .dtype = mlx.mlx_array_dtype(x) };
+        @memcpy(c.shape[0..sh.len], sh);
+        try calls[rank].append(std.testing.allocator, c);
+        return parts[rank].items.len - 1;
+    }
+
+    fn partOf(r: usize, k: usize, like: A) ?A {
+        if (r == rank) return like;
+        if (k >= parts[r].items.len) return null;
+        const p = parts[r].items[k];
+        if (mlx.mlx_array_dtype(p) != mlx.mlx_array_dtype(like) or !std.mem.eql(c_int, mlx.getShape(p), mlx.getShape(like))) return null;
+        return p;
+    }
+
+    fn sum(x: A) anyerror!A {
+        const k = try keep(x, false);
+        var acc: A = none;
+        for (0..size) |r| {
+            const p = partOf(r, k, x) orelse continue;
+            if (acc.ctx == null) {
+                acc = mlx.mlx_array_new();
+                _ = mlx.mlx_array_set(&acc, p);
+                continue;
+            }
+            var next = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&next, acc, p, mlx.gpuStream()));
+            _ = mlx.mlx_array_free(acc);
+            acc = next;
+        }
+        return acc;
+    }
+
+    fn gather(x: A) anyerror!A {
+        const k = try keep(x, true);
+        var xs: [max]A = undefined;
+        var zeros: [max]A = @splat(none);
+        defer for (zeros) |z| if (z.ctx != null) {
+            _ = mlx.mlx_array_free(z);
+        };
+        for (xs[0..size], zeros[0..size], 0..) |*o, *z, r| o.* = partOf(r, k, x) orelse blk: {
+            const sh = mlx.getShape(x);
+            z.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(z, sh.ptr, sh.len, mlx.mlx_array_dtype(x), mlx.gpuStream()));
+            break :blk z.*;
+        };
+        const vec = mlx.mlx_vector_array_new_data(&xs, size);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 0, mlx.gpuStream()));
+        return o;
+    }
+
+    /// Whether no rank's part moved in the last pass.
+    pub fn settled() !bool {
+        for (0..size) |r| {
+            if (parts[r].items.len != prev[r].items.len) return false;
+            for (parts[r].items, prev[r].items) |a, b| {
+                if (!std.mem.eql(c_int, mlx.getShape(a), mlx.getShape(b))) return false;
+                const u = try dsv41.hostF32(a);
+                defer std.testing.allocator.free(u);
+                const v = try dsv41.hostF32(b);
+                defer std.testing.allocator.free(v);
+                if (!std.mem.eql(u8, std.mem.sliceAsBytes(u), std.mem.sliceAsBytes(v))) return false;
+            }
+        }
+        return true;
+    }
+
+    /// The group settled, and every rank issued the same collectives (kind, shape and dtype) in the same order.
+    pub fn expectSettled() !void {
+        try std.testing.expect(try settled());
+        for (1..size) |r| try std.testing.expectEqualDeep(calls[0].items, calls[r].items);
+    }
+};
+
+/// What rank 0 hands the other ranks in order (its `tp_step` and `tp_pipe` hooks), for them to replay, and the state
+/// they last stepped as distributed.zig keeps it (`TpLive`).
+const Ops = struct {
+    const Step = struct { ids: []u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64 };
+    const Op = union(enum) { step: Step, pipe };
+    var list: std.ArrayList(Op) = .empty;
+    var live: ?struct { gen: u64, n: usize } = null;
+
+    fn step(ids: []const u32, p0: usize, snap: bool, all: bool, verify: bool, gen: u64, images: ?A) anyerror!void {
+        if (images != null) return error.TestUnexpectedResult;
+        const own = try std.testing.allocator.dupe(u32, ids);
+        errdefer std.testing.allocator.free(own);
+        try list.append(std.testing.allocator, .{ .step = .{ .ids = own, .p0 = p0, .snap = snap, .all = all, .verify = verify, .gen = gen } });
+        live = if (verify) null else .{ .gen = gen, .n = p0 + ids.len };
+    }
+
+    fn pipe(gen: u64, n: usize) anyerror!bool {
+        const l = live orelse return false;
+        if (l.gen != gen or l.n != n) return false;
+        try list.append(std.testing.allocator, .pipe);
+        live = .{ .gen = gen, .n = n + 1 };
+        return true;
+    }
+
+    fn count(tag: std.meta.Tag(Op)) usize {
+        var c: usize = 0;
+        for (list.items) |op| c += @intFromBool(op == tag);
+        return c;
+    }
+
+    fn reset() void {
+        for (list.items) |op| if (op == .step) std.testing.allocator.free(op.step.ids);
+        list.clearRetainingCapacity();
+        live = null;
+    }
+
+    fn deinit() void {
+        reset();
+        list.deinit(std.testing.allocator);
+        list = .empty;
+    }
+};
+
+fn argmaxOf(logits: A) !A {
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_argmax_axis(&o, logits, -1, false, mlx.gpuStream()));
+    return o;
+}
+
+fn readToken(t: A) !u32 {
+    try mlx.check(mlx.mlx_array_eval(t));
+    return (mlx.mlx_array_data_uint32(t) orelse return error.NoData)[0];
+}
+
+fn asyncEval(xs: []const A) !void {
+    const vec = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    try mlx.check(mlx.mlx_async_eval(vec));
+}
+
+/// Rank 0 as the engine's pipelined greedy decode drives it (`generate/step.zig` `next`): each step's forward is built
+/// on the still-lazy argmax of the last logits before the token before it is read, so a stop (`eos`, the last of `max`
+/// tokens) leaves the forwards already built. `snap_after`: a snapshot armed that many tokens past the prompt.
+fn leadDecode(m: *dsv41.Dsv41Model, prompt: []const u32, max: usize, eos: ?u32, snap_after: ?usize, out: *std.ArrayList(u32)) !void {
+    const gpa = std.testing.allocator;
+    try dsv41.reset(m, gpa);
+    m.dec_state.?.snap_at = if (snap_after) |k| prompt.len + k else null;
+    const first = try dsv41.extendResumable(m, gpa, prompt, null);
+    defer _ = mlx.mlx_array_free(first);
+    const t1 = try argmaxOf(first);
+    defer _ = mlx.mlx_array_free(t1);
+    var logits = try dsv41.extendResumableGpu(m, gpa, t1);
+    var pending: A = none;
+    defer {
+        _ = mlx.mlx_array_free(logits);
+        if (pending.ctx != null) _ = mlx.mlx_array_free(pending);
+    }
+    try asyncEval(&.{ t1, logits });
+    var next = try readToken(t1);
+    while (out.items.len + 1 < max) {
+        const t = try argmaxOf(logits);
+        const nl = dsv41.extendResumableGpu(m, gpa, t) catch |e| {
+            _ = mlx.mlx_array_free(t);
+            return e;
+        };
+        _ = mlx.mlx_array_free(logits);
+        logits = nl;
+        try asyncEval(&.{ t, logits });
+        if (pending.ctx != null) {
+            next = try readToken(pending);
+            _ = mlx.mlx_array_free(pending);
+        }
+        pending = t;
+        if (eos != null and next == eos.?) return;
+        try out.append(gpa, next);
+    }
+    if (pending.ctx != null) next = try readToken(pending);
+    if (eos == null or next != eos.?) try out.append(gpa, next);
+}
+
+/// A worker replaying what rank 0 handed it, from a fresh state.
+fn followDecode(m: *dsv41.Dsv41Model) !void {
+    const gpa = std.testing.allocator;
+    if (m.dec_state) |*st| st.deinit();
+    m.dec_state = null;
+    var parked: dsv41.Parked = .init(gpa);
+    defer dsv41.dropParked(&parked);
+    for (Ops.list.items) |op| switch (op) {
+        .step => |s| try dsv41.tpWorkerStep(m, gpa, &parked, s.gen, s.ids, s.p0, s.snap, @as(dsv41.Want, if (s.all) .all else .last), s.verify, null),
+        .pipe => try dsv41.tpWorkerPipe(m, gpa),
+    };
+}
+
+const Decoded = struct {
+    tokens: []u32,
+    /// Where every rank's state ends.
+    n: usize,
+    /// Rank 0's steps with their header, and those it piped.
+    steps: usize,
+    pipes: usize,
+    /// Rank 0's caches at the end.
+    caches: [][]f32,
+
+    fn deinit(d: Decoded, gpa: std.mem.Allocator) void {
+        gpa.free(d.tokens);
+        freeF32s(gpa, d.caches);
+    }
+};
+
+/// `ranks` (rank 0 first) decoding `prompt` as one tensor group, rank 0 piping its steps when `pipes` lets it; every
+/// rank meets every collective in the same order and shape, and ends where rank 0 does with its caches.
+fn decodeGroup(ranks: []const *Fixture, prompt: []const u32, max: usize, eos: ?u32, snap_after: ?usize, pipes: bool) !Decoded {
+    const gpa = std.testing.allocator;
+    dsv41.clusterHooks().tp_step = &Ops.step;
+    dsv41.clusterHooks().tp_pipe = if (pipes) &Ops.pipe else null;
+    Group.join(ranks.len);
+    defer {
+        dsv41.clusterHooks().tp_step = null;
+        dsv41.clusterHooks().tp_pipe = null;
+        Group.leave();
+        Ops.deinit();
+    }
+    var tokens: std.ArrayList(u32) = .empty;
+    defer tokens.deinit(gpa);
+    var pass: usize = 0;
+    while (true) : (pass += 1) {
+        if (pass == 300) return error.TestNoFixedPoint;
+        for (ranks, 0..) |r, i| {
+            Group.begin(i);
+            if (i == 0) {
+                Ops.reset();
+                tokens.clearRetainingCapacity();
+                try leadDecode(r.m, prompt, max, eos, snap_after, &tokens);
+            } else try followDecode(r.m);
+        }
+        if (pass > 0 and try Group.settled()) break;
+    }
+    try Group.expectSettled();
+    const lead = ranks[0].m;
+    for (ranks[1..]) |r| {
+        try std.testing.expectEqual(lead.dec_state.?.n, r.m.dec_state.?.n);
+        try expectSameCaches(gpa, lead, r.m);
+    }
+    const caches = try cachesOf(gpa, lead);
+    errdefer freeF32s(gpa, caches);
+    return .{ .tokens = try gpa.dupe(u32, tokens.items), .n = lead.dec_state.?.n, .steps = Ops.count(.step), .pipes = Ops.count(.pipe), .caches = caches };
+}
+
+test "dist N-rank: four ranks decode with the token on the GPU as with its id in a header each step, bit for bit, and end where rank 0 stops" {
+    if (!mlx.metalKernelsAvailable() or mlx.noGpuBackend() or mlx.virtualGpu()) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    var ranks: [4]*Fixture = undefined;
+    var made: usize = 0;
+    defer for (ranks[0..made]) |r| r.deinit();
+    for (&ranks, 0..) |*r, i| {
+        r.* = try Fixture.initWhole(gpa, .{ .rank = @intCast(i), .size = 4 });
+        made += 1;
+    }
+    const prompt = [_]u32{ 11, 400, 7, 901, 55 };
+    const max = 6;
+    const ref = try decodeGroup(&ranks, &prompt, max, null, null, false);
+    defer ref.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, max), ref.tokens.len);
+    try std.testing.expectEqual(@as(usize, 0), ref.pipes);
+    // The last of `max` tokens: every decode step after the prompt's goes by bell alone.
+    const piped = try decodeGroup(&ranks, &prompt, max, null, null, true);
+    defer piped.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, ref.tokens, piped.tokens);
+    try std.testing.expectEqual(ref.n, piped.n);
+    try std.testing.expectEqual(@as(usize, 1), piped.steps);
+    try std.testing.expectEqual(ref.steps - 1, piped.pipes);
+    try expectSameF32s(ref.caches, piped.caches);
+    // An EOS mid-stream (the first id not seen before it); piped, a snapshot armed mid-stream sends its step's header.
+    const k = for (ref.tokens[1..], 1..) |t, i| {
+        if (std.mem.indexOfScalar(u32, ref.tokens[0..i], t) == null) break i;
+    } else return error.TestUnexpectedResult;
+    const ref_eos = try decodeGroup(&ranks, &prompt, k + 4, ref.tokens[k], null, false);
+    defer ref_eos.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, ref.tokens[0..k], ref_eos.tokens);
+    const piped_eos = try decodeGroup(&ranks, &prompt, k + 4, ref.tokens[k], 2, true);
+    defer piped_eos.deinit(gpa);
+    try std.testing.expectEqualSlices(u32, ref_eos.tokens, piped_eos.tokens);
+    try std.testing.expectEqual(ref_eos.n, piped_eos.n);
+    try std.testing.expectEqual(@as(usize, 2), piped_eos.steps);
+    try std.testing.expectEqual(ref_eos.steps - 2, piped_eos.pipes);
+    try expectSameF32s(ref_eos.caches, piped_eos.caches);
 }

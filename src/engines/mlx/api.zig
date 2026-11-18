@@ -85,8 +85,8 @@ fn clusterProbe(io: std.Io, args: []const []const u8) ?[]const u8 {
     return null;
 }
 
-fn clusterConnect(io: std.Io, gpa: std.mem.Allocator, coordinator: []const u8, device: []const u8, mode: u8, model: []const u8, split: ?u32) ?[]const u8 {
-    distributed.connect(local(io), gpa, .{ .rank = 0, .coordinator = coordinator, .device = device }, @enumFromInt(mode), model, split) catch |e| return @errorName(e);
+fn clusterConnect(io: std.Io, gpa: std.mem.Allocator, coordinator: []const u8, device: []const u8, mode: u8, model: []const u8, split: ?u32, size: u32, join_timeout_s: ?u32) ?[]const u8 {
+    distributed.connect(local(io), gpa, .{ .rank = 0, .size = size, .coordinator = coordinator, .device = device }, @enumFromInt(mode), model, split, join_timeout_s) catch |e| return @errorName(e);
     return null;
 }
 

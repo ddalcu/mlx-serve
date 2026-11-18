@@ -183,12 +183,14 @@ pub fn moduleGroupRound(gens: []const *Generator, allocs: []const std.mem.Alloca
         defer draft_ms = msOf(draft_watch.read());
         var sts: [MAX_SLOTS]*dsv41_mod.State = undefined;
         var t1s: [MAX_SLOTS]u32 = undefined;
+        var sids: [MAX_SLOTS]u64 = undefined;
         for (staged[0..n_stage], 0..) |k, i| {
             sts[i] = states[k];
+            sids[i] = ids[k];
             t1s[i] = gens[k].next_token_id;
         }
         var blocks: [MAX_SLOTS]dsv41_mod.DsparkDraft = undefined;
-        try dsv41_mod.dsparkDraftBatched(mdl, gpa, sts[0..n_stage], t1s[0..n_stage], false, blocks[0..n_stage]);
+        try dsv41_mod.dsparkDraftBatched(mdl, gpa, sts[0..n_stage], sids[0..n_stage], t1s[0..n_stage], false, blocks[0..n_stage]);
         for (staged[0..n_stage], blocks[0..n_stage]) |k, b| {
             drafts[k].deinit(gpa);
             drafts[k] = b;
