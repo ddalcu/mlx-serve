@@ -112,6 +112,9 @@ pub const Generator = struct {
     // Deferred token: lazy array from async pipeline, eval'd at start of next iteration
     pending_token: mlx.mlx_array = .{},
     has_pending_token: bool = false,
+    /// A batched tick drew `next_token_id` under the grammar and advanced the grammar by it; the token is
+    /// neither forwarded nor emitted. A serial constrained step commits it before sampling again.
+    batched_unforwarded: bool = false,
 
     // ── Spec-decode shared state (PLD + drafter) ──
     // Post-final-norm hidden state at the last produced token's position.
@@ -680,6 +683,9 @@ pub const Generator = struct {
         return out;
     }
     pub const drainPipelineForBatch = @import("pipeline.zig").drainPipelineForBatch;
+    pub const Join = @import("pipeline.zig").Join;
+    pub const joinBatch = @import("pipeline.zig").joinBatch;
+    pub const noteBatchedSample = @import("pipeline.zig").noteBatchedSample;
     pub const sampleLazy = @import("pipeline.zig").sampleLazy;
     pub const upcomingToken = @import("pipeline.zig").upcomingToken;
     pub const resolvePendingToken = @import("pipeline.zig").resolvePendingToken;

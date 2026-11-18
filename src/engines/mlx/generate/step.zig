@@ -475,21 +475,7 @@ pub fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u3
     }
     const s = self.xfm.s;
 
-    var allowed = (try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf)).allowed;
-    // The tokenizer's EOS is not necessarily the model's only stop id.
-    if (constraint.grammar.isComplete()) {
-        for (self.eos_token_ids) |eos_id| {
-            if (eos_id < constraint.mask_buf.len and !constraint.mask_buf[eos_id]) {
-                constraint.mask_buf[eos_id] = true;
-                allowed += 1;
-            }
-        }
-    }
-    if (allowed == 0) {
-        log.warn("[grammar] no token satisfies the schema at this position — disabling further mask enforcement\n", .{});
-        constraint.grammar.dead = true;
-        @memset(constraint.mask_buf, true);
-    }
+    try constraint.fillPayloadMask(self.eos_token_ids);
 
     const step_logits = self.pending_logits;
     self.has_pending_logits = false;
@@ -546,21 +532,7 @@ pub fn nextConstrainedToken(self: *Generator, allocator: std.mem.Allocator) !?u3
         self.consecutive_pad = 0;
     }
 
-    // Advance the grammar by the sampled token's byte sequence. The mask
-    // guarantees every byte is accepted (or the token has no byte form, e.g. a
-    // special tag) — so a rejection here means a bug we want to surface.
-    if (token < constraint.token_bytes.bytes.len) {
-        if (constraint.token_bytes.bytes[token]) |bytes| {
-            for (bytes) |b| {
-                const ok = try constraint.grammar.acceptByte(b);
-                if (!ok) {
-                    log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
-                    constraint.grammar.dead = true;
-                    break;
-                }
-            }
-        }
-    }
+    try constraint.acceptPayloadToken(token);
 
     self.advanceStep(1);
     try self.generated_ids.append(allocator, token);
