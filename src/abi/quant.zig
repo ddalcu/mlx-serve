@@ -202,6 +202,11 @@ pub const Bank = extern struct {
     /// depend on the call's other rows, so a model may join several prompt spans' rows into one call. False: not
     /// declared. Appended: read only where `size` reaches it.
     rows_independent: bool = false,
+    /// `rows` for a decode-phase call (at most `decode_ids` ids) with `hoist`, an array the call does not read (the
+    /// model's shared expert over the same rows): the bank may commit it while the call waits for its reads. `out` is
+    /// `rows`' sum word for word; the model adds `hoist` itself. Null: not offered. Appended: read only where `size`
+    /// reaches it.
+    rows_hoist: ?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, hoist: Array, out: *Array) callconv(.c) Verdict = null,
 };
 
 pub const Swiglu = extern struct {
@@ -256,6 +261,13 @@ test "abi quant: a bank's independent prompt rows are declared after every earli
     try testing.expect(@offsetOf(Bank, "rows_independent") > @offsetOf(Bank, "meters"));
     const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
     try testing.expect(!b.rows_independent);
+}
+
+test "abi quant: a bank's hoisted decode call is declared after every earlier member" {
+    // Appended: a bank built before it ends at `rows_hoist`, and the host reads it as not offered.
+    try testing.expect(@offsetOf(Bank, "rows_hoist") > @offsetOf(Bank, "rows_independent"));
+    const b: Bank = .{ .close = undefined, .decode_ids = 1, .rows = undefined, .settle = undefined, .phase = undefined, .read_ahead = undefined };
+    try testing.expect(b.rows_hoist == null);
 }
 
 test "abi quant: a post-SiLU SwiGLU limit reaches only a table that declares it" {

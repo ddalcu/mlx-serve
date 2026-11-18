@@ -1344,6 +1344,7 @@ A streamed bank of routed experts, as the trunk's MoE reads one whose math it do
 | `meters` | `?*const fn (ctx: ?*anyopaque, out: *Str) callconv(.c) void` | `null` | The bank's lines for the request's summary (`[stream-stats]` by phase, newline-separated), valid until the next call; the model logs them beside `[spec-stats]` at the request's end. Null: none. |
 | `exact_rows` | `bool` | `false` | A decode-phase `rows` call (at most `decode_ids` ids) gives each row the bytes that row's call alone gets. Appended: read only where `size` reaches it. |
 | `rows_independent` | `bool` | `false` | A prompt-phase `rows` call (more ids than `decode_ids`) sums each routed row by itself: a row's bytes do not depend on the call's other rows, so a model may join several prompt spans' rows into one call. False: not declared. Appended: read only where `size` reaches it. |
+| `rows_hoist` | `?*const fn (ctx: ?*anyopaque, layer: u32, x: Array, idx: Array, wts: Array, hoist: Array, out: *Array) callconv(.c) Verdict` | `null` | `rows` for a decode-phase call (at most `decode_ids` ids) with `hoist`, an array the call does not read (the model's shared expert over the same rows): the bank may commit it while the call waits for its reads. `out` is `rows`' sum word for word; the model adds `hoist` itself. Null: not offered. Appended: read only where `size` reaches it. |
 
 ### `Swiglu` (extern struct)
 

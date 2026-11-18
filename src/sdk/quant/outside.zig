@@ -274,6 +274,7 @@ pub const Bank = struct {
             .source_expand_into = if (offers(b, .rows_expand_into)) C.expand(.rows_expand_into) else null,
             .source_decode_expand = if (offers(b, .rows_decode_expand)) C.expand(.rows_decode_expand) else null,
             .next_fn = if (offers(b, .next_ahead)) C.nextAhead else null,
+            .source_hoist = if (offers(b, .rows_hoist)) C.rowsHoist else null,
         };
     }
 
@@ -315,6 +316,11 @@ pub const Bank = struct {
             const b = &of(ctx).b;
             var out: abi.Array = .{};
             return arr(b.rows_shared.?(b.ctx, layer, .{ .ctx = x.ctx }, .{ .ctx = idx.ctx }, .{ .ctx = wts.ctx }, .{ .ctx = shared.ctx }, &out), out);
+        }
+        fn rowsHoist(ctx: *anyopaque, layer: u32, x: A, idx: A, wts: A, hoist: A) routed_mod.Ret(A) {
+            const b = &of(ctx).b;
+            var out: abi.Array = .{};
+            return arr(b.rows_hoist.?(b.ctx, layer, .{ .ctx = x.ctx }, .{ .ctx = idx.ctx }, .{ .ctx = wts.ctx }, .{ .ctx = hoist.ctx }, &out), out);
         }
         fn expand(comptime field: @EnumLiteral()) fn (*anyopaque, u32, A, A, A, A, A, A) routed_mod.Ret(A) {
             return struct {
@@ -542,6 +548,24 @@ const ToyBank = struct {
         out.size = @offsetOf(abi.Bank, "rows_independent");
         return v;
     }
+    /// A bank that offers the hoisted decode call.
+    fn openHoist(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
+        const v = open(ctx, geo, budget, out);
+        out.rows_hoist = &rowsHoist;
+        return v;
+    }
+    /// A bank built before `rows_hoist`: its size ends there, so the member it wrote is not read.
+    fn openBeforeHoist(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
+        const v = openHoist(ctx, geo, budget, out);
+        out.size = @offsetOf(abi.Bank, "rows_hoist");
+        return v;
+    }
+    var hoisted: ?*anyopaque = null;
+    fn rowsHoist(_: ?*anyopaque, _: u32, _: abi.Array, _: abi.Array, _: abi.Array, hoist: abi.Array, out: *abi.Array) callconv(.c) common.Verdict {
+        hoisted = hoist.ctx;
+        out.* = .{ .ctx = &sum };
+        return .ok;
+    }
     fn openShort(ctx: *const abi.LoadCtx, geo: *const abi.BankGeometry, budget: abi.BankBudget, out: *abi.Bank) callconv(.c) common.Verdict {
         const v = open(ctx, geo, budget, out);
         out.size = @offsetOf(abi.Bank, "rows");
@@ -617,4 +641,29 @@ test "outside quant: a table's streamed bank reads as a Routed source; its refus
     table.open_bank = &ToyBank.openShort;
     try testing.expectError(error.OutsideQuantRefused, f.openBank(geo, .{ .prompt = 1000, .decode = 1000 }));
     try testing.expectEqual(@as(u32, 4), ToyBank.closed); // the refused bank is closed too
+}
+
+test "outside quant: a bank's hoisted decode call reads as Routed.source_hoist, the hoist passed through; a bank built before it offers none" {
+    var table = Toy.table;
+    table.bank_rows = &ToyBank.rows;
+    table.open_bank = &ToyBank.openHoist;
+    const f: Format = .{ .a = testing.allocator, .t = &table, .config = &.{}, .block = &.{}, .source = undefined, .ctx = undefined };
+    const gates = [2]abi.BankGate{ .{}, .{} };
+    const geo: abi.BankGeometry = .{ .hidden = 8, .inter = 4, .top_k = 2, .n_experts = 16, .n_layers = 2, .gates = &gates };
+    const none: mlx.mlx_array = .{ .ctx = null };
+    var shared: u8 = 0;
+    const b = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
+    const r = b.routed();
+    try testing.expectEqual(@as(?*anyopaque, &ToyBank.sum), (try r.source_hoist.?(r.ctx, 0, none, none, none, .{ .ctx = &shared }).get()).ctx);
+    try testing.expectEqual(@as(?*anyopaque, &shared), ToyBank.hoisted);
+    b.close();
+    // The default bank and one whose size ends before the member: the trunk builds its shared expert after the call.
+    table.open_bank = &ToyBank.open;
+    const plain = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
+    try testing.expect(plain.routed().source_hoist == null);
+    plain.close();
+    table.open_bank = &ToyBank.openBeforeHoist;
+    const before = (try f.openBank(geo, .{ .prompt = 1000, .decode = 1000 })).?;
+    try testing.expect(before.routed().source_hoist == null and before.routed().rows_independent);
+    before.close();
 }
